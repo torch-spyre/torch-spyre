@@ -779,7 +779,10 @@ class TestNegativeScalarOperations:
             pytest.xfail(reason=f"Nested compile unsupported on Spyre path: {err}")
 
     def test_cpu_scalar_tensor_with_spyre_tensor(self, execution_mode):
-        """CPU scalar tensor × Spyre tensor should raise device mismatch error."""
+        """CPU scalar tensor x Spyre tensor should compute successfully: a single
+        non-write 0-dim CPU tensor is exempt from the device-mismatch check
+        (mirrors TensorIterator's ``allow_cpu_scalars_``; see
+        ``test_cross_device_scalar_op_allowed`` in ``tests/test_spyre.py``)."""
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1598
         if execution_mode == "compiled":
             pytest.xfail(
@@ -792,18 +795,7 @@ class TestNegativeScalarOperations:
 
         x = cached_randn((128, 128), dtype=torch.float16)
 
-        with pytest.raises(
-            (RuntimeError, torch._inductor.exc.InductorError)
-        ) as exc_info:
-            _compare_modes(
-                execution_mode, cpu_scalar_spyre_tensor, x, atol=1e-3, rtol=1e-3
-            )
-
-        error_msg = str(exc_info.value)
-        print(error_msg)
-        assert any(
-            kw in error_msg.lower() for kw in ["device", "layout", "cpu", "spyre"]
-        )
+        _compare_modes(execution_mode, cpu_scalar_spyre_tensor, x, atol=1e-3, rtol=1e-3)
 
     def test_cpu_tensor_with_spyre_tensor(self, execution_mode):
         """CPU regular tensor × Spyre tensor should raise device mismatch error."""

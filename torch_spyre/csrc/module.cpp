@@ -154,8 +154,8 @@ void _startRuntime() {
               "Device index out of bounds. logical_device_id=",
               logical_device_id, ", number of visible devices=", num_devices);
 
-  std::shared_ptr<flex::RuntimeContext> runtime;
-  auto s = flex::initializeRuntime(&runtime, logical_device_id);
+  flex::RuntimeContext* runtime =
+      flex::RuntimeContext::create(logical_device_id);
   init_from_env();
   if (runtime) {
     GlobalRuntime::set(runtime);
@@ -164,7 +164,6 @@ void _startRuntime() {
     // track_hazards = get_hazard_tracker_enabled() (see spyre_stream.cpp), so
     // flex registers exactly the streams torch-spyre owns. Nothing to toggle on
     // the runtime here.
-    DEBUGINFO(s);
     DEBUGINFO("runtime started with logical_device_id ", logical_device_id);
   } else {
     DEBUGINFO("runtime FAILED TO START.");

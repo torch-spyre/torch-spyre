@@ -53,7 +53,7 @@ emitted file is one kernel, not one operation. The softmax above is six.
 | Option | Use it when |
 |---|---|
 | `--kernel NAME` | Only emit kernels whose name contains `NAME` |
-| `--save-inputs` | Dump recorded argument values to a `.pt`, for a replay whose inputs are the real ones. Pool contents are not captured; integer args otherwise replay as zeros |
+| `--save-inputs` | Dump recorded argument values to a `.pt`, for a replay whose inputs are the real ones. Without it, integer args replay as zeros |
 | `--no-execute` | Stub the backend compile and launch, so no device is needed |
 | `--no-explain-header` | Omit the decoded explanation from each emitted file |
 
@@ -204,7 +204,7 @@ capture time, so `KERNEL ARGS` shows them in the frozen header but not under
 | Field | Meaning |
 |---|---|
 | `is_input` | Read or written by *this op*. The same `arg_index` can be both across a kernel. |
-| `arg_index` | Position in the kernel's argument list. Negative means it is not a kernel arg. Not the `.run()` position when there is a pool: the pool is prepended and uncounted, so `arg0` is `.run()`'s second argument. |
+| `arg_index` | Position in the kernel's argument list, and in `.run()`'s, including when the kernel uses an HBM pool -- the pool is allocated inside the bundle, not passed in. Negative means it is not a kernel arg. |
 | `device_dtype` | On-device format, e.g. `SEN169_FP16`. This is what sets the stick size. |
 | `device_size` | The tiled device shape, `[..., sticks, rows, elems_per_stick]`. The last dim is always elements per stick. |
 | `device_coordinates` | One sympy expression per device dim, mapping an iteration point to a position. An `IndirectAccess` here means the coordinate is a runtime-loaded value. |
@@ -489,7 +489,7 @@ a line the first three do not have:
 
 ```
 # Kernel args:     4 in the spec, 4 observed at .run()
-# Pool:            32768 bytes, passed to .run() ahead of the args
+# Pool:            32768 bytes, allocated by the bundle
 ```
 
 **3. Read the header.** Seven OpSpecs this time, and the intermediates that could
@@ -542,10 +542,11 @@ the tensors buys a smaller pool rather than no pool.
 
 **What to notice**
 
-- *Ahead of* is the part to internalise: the pool is `.run()`'s first argument and
-  is **not** `arg0`. The kernel args keep their own numbering.
-- A replay needs only `POOL_BYTES`, never the offset map. `make_pool` allocates a
-  flat 1-D uint8 tensor of that size and the offsets take care of themselves.
+- The pool is **not** an argument. The bundle allocates it itself, as
+  `%pool = sdscbundle.device_mem_allocate 32768 bytes` on the first line of
+  `bundle.mlir`, so `.run()` receives the four kernel args and nothing else.
+- A replay needs only `POOL_SIZE`, never the offset map: the size reaches
+  `sdsc()` and the offsets in the spec take care of themselves.
 - Three allocation kinds have now appeared across the four examples: `hbm @ n` for
   a kernel arg (01), `lx @ offset` for a scratchpad intermediate (02), and
   `hbm_pool @ offset` for one that spilled (04).

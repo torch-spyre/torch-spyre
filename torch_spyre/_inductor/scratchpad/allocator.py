@@ -68,6 +68,7 @@ from torch_spyre._inductor.scratchpad.simulated_annealing import (
 from torch_spyre._inductor.scratchpad.exhaustive_search import (
     ExhaustiveSearchSolver,
 )
+from torch_spyre._inductor.scratchpad.sa_cooptimizer import SaCoOptimizingSolver
 from torch_spyre._inductor.scratchpad.passes import (
     ScratchpadOptimizationPass,
 )
@@ -85,10 +86,10 @@ from torch_spyre._inductor.scratchpad.utils import (
     _is_read_advancing_anywhere,
     _get_buffer_user_deps,
     _would_produce_lx_back_gap,
-    OP_OUTPUT_GOOD_FOR_LX_REUSE,
+    OP_OUTPUT_NOT_GOOD_FOR_LX_REUSE,
 )
 from torch_spyre._inductor.scratchpad.graph_editor import GraphEditor
-from torch_spyre._inductor.ir import FixedTiledLayout
+from torch_spyre._inductor.ir import FixedTiledLayout, SpyreEmptyFallback
 
 from torch_spyre._inductor import config
 from torch_spyre._inductor.logging_utils import get_inductor_logger
@@ -141,6 +142,7 @@ def _extern_kernel_in_live_range(graph: GraphLowering, uses: list[int]) -> bool:
         return False
     return any(
         isinstance(graph.operations[i], ExternKernel)
+        and not isinstance(graph.operations[i], SpyreEmptyFallback)
         for i in range(min(uses), max(uses) + 1)
     )
 
@@ -334,10 +336,10 @@ class ScratchpadAllocator:
         # with no device_layout and can never be LX-pinned.
         if not isinstance(op.layout, FixedTiledLayout):
             return False
-        # A planned source intentionally bypasses the profitability allowlist:
+        # A planned source intentionally bypasses the profitability denylist:
         # the relayout planner has already applied its stricter structural gates.
         return config.allow_all_ops_in_lx_planning or (
-            self._get_op_name(op) in OP_OUTPUT_GOOD_FOR_LX_REUSE
+            self._get_op_name(op) not in OP_OUTPUT_NOT_GOOD_FOR_LX_REUSE
             or op.get_name() in planned_lx_buffers
         )
 
@@ -1131,7 +1133,12 @@ def _output_stride_to_device_size(op: Operation) -> dict[int, int]:
     splittable size for an output dim by its coefficient in the write index.
     (Mirrors _per_core_view_on_buf's stride→device-dim placement.)
     """
-    dev_layout = op.layout.device_layout
+    layout = op.layout
+    if isinstance(layout, MutationLayoutSHOULDREMOVE):
+        # In-place mutations keep the mutation wrapper at pre-scheduler time;
+        # the committed device layout lives on the mutation target.
+        layout = layout.real_layout()
+    dev_layout = layout.device_layout
     device_size = dev_layout.device_size
     stride_map = dev_layout.stride_map
     elems_per_stick = dev_layout.device_dtype.elems_per_stick()
@@ -2210,10 +2217,21 @@ def select_allocator() -> ScratchpadAllocator:
     * Without ``co_optimizing_lx_planning``, returns a :class:`ScratchpadAllocator`
       instance that solves for LX placement only.
     * With ``co_optimizing_lx_planning``, returns a :class:`CoOptimizingAllocator`
-      instance. A core-division-capable factory (currently only ``"cpsat"``, and
+      instance. ``"simulated_annealing"`` is served by
+      :class:`SaCoOptimizingSolver`, the joint work-division + LX engine.
+      Otherwise a core-division-capable factory (currently only ``"cpsat"``, and
       only when ortools is available) is used directly; every other factory is
       wrapped in an :class:`ExhaustiveSearchSolver` that does an exhaustive
       search of all the core division options.
+
+    The annealer is deliberately not wrapped in :class:`ExhaustiveSearchSolver`:
+    that wrapper solves the layout once per enumerated division candidate, so
+    nesting a full anneal there would cost one anneal per candidate. It is also a
+    separate class from :class:`SimulatedAnnealingLayoutSolver` rather than one
+    class in two modes (unlike the cpsat pair, where the same solver simply does
+    less work): the layout-only annealer stays a usable
+    :class:`MemoryPlanSolver`, while the joint engine composes the same packer
+    and adds the division moves. Do not merge them.
     """
     size = _lx_planning_size()
 
@@ -2229,6 +2247,10 @@ def select_allocator() -> ScratchpadAllocator:
             logger.warning(
                 "LX relayout is not supported by CoOptimizingAllocator; "
                 "continuing without relayout"
+            )
+        if config.layout_solver == "simulated_annealing":
+            return CoOptimizingAllocator(
+                layout_planning=SaCoOptimizingSolver, size=size
             )
         # Throwaway empty-buffer probe: cheap (no real solving happens in
         # __init__) and the only way to know whether this factory's solver is

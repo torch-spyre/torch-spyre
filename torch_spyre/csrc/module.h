@@ -30,14 +30,15 @@ namespace spyre {
 
 class GlobalRuntime {
  public:
-  static void set(const std::shared_ptr<flex::RuntimeContext>& runtime) {
+  static void set(flex::RuntimeContext* runtime) {
     instance() = runtime;
   }
+
   static void reset() {
-    instance().reset();  // sets the shared_ptr to nullptr
+    instance() = nullptr;
   }
 
-  static const std::shared_ptr<flex::RuntimeContext>& get() {
+  static flex::RuntimeContext* get() {
     return instance();
   }
 
@@ -45,8 +46,8 @@ class GlobalRuntime {
   GlobalRuntime() = delete;
   ~GlobalRuntime() = delete;
 
-  static std::shared_ptr<flex::RuntimeContext>& instance() {
-    static std::shared_ptr<flex::RuntimeContext> s;
+  static flex::RuntimeContext*& instance() {
+    static flex::RuntimeContext* s = nullptr;
     return s;
   }
 };

@@ -134,7 +134,9 @@ class TestNormalizationScalarOperations:
             (1e-5, 2, 12, 4096),
         ],
     )
-    def test_rmsnorm_fp32_upcast(self, execution_mode, eps, batch, seq, hidden):
+    def test_rmsnorm_fp32_upcast_downcast_before_mul(
+        self, execution_mode, eps, batch, seq, hidden
+    ):
         """RMSNorm with explicit FP16→FP32 upcast for numerical stability (issue #2508).
 
         Pattern: x.to(fp32) → pow(2) → mean(-1) → rsqrt → mul → weight * result.to(fp16)
@@ -150,6 +152,41 @@ class TestNormalizationScalarOperations:
             variance = x_fp32.pow(2).mean(-1, keepdim=True)
             x_normed = x_fp32 * torch.rsqrt(variance + eps)
             return weight * x_normed.to(x.dtype)
+
+        x = cached_randn((batch, seq, hidden), dtype=torch.float16)
+        weight = cached_randn((hidden,), differentiation="weight")
+        _compare_modes(
+            execution_mode, rmsnorm_fp32_upcast, x, weight, atol=1e-2, rtol=1e-2
+        )
+
+    @pytest.mark.parametrize(
+        "eps,batch,seq,hidden",
+        [
+            (1e-5, 1, 1, 4096),
+            (1e-5, 1, 12, 4096),
+            (1e-5, 1, 64, 4096),
+            (1e-5, 2, 1, 4096),
+            (1e-5, 2, 12, 4096),
+        ],
+    )
+    def test_rmsnorm_fp32_upcast_downcast_after_mul(
+        self, execution_mode, eps, batch, seq, hidden
+    ):
+        """RMSNorm with explicit FP16→FP32 upcast for numerical stability (issue #3580).
+
+        Pattern: x.to(fp32) → pow(2) → mean(-1) → rsqrt → mul → (weight * result).to(fp16)
+        This relies on EA propagation tracking DL16_TO_FP32 through the compute graph.
+        """
+        # EA propagation is a compile-time feature; eager runs the ops but without
+        # the layout-awareness that this pattern requires.
+        if execution_mode == "eager":
+            pytest.skip(reason="EA propagation is compile-time only")
+
+        def rmsnorm_fp32_upcast(x, weight):
+            x_fp32 = x.to(torch.float32)
+            variance = x_fp32.pow(2).mean(-1, keepdim=True)
+            x_normed = x_fp32 * torch.rsqrt(variance + eps)
+            return (weight * x_normed).to(x.dtype)
 
         x = cached_randn((batch, seq, hidden), dtype=torch.float16)
         weight = cached_randn((hidden,), differentiation="weight")

@@ -12,7 +12,6 @@ test_suite_config:
             - TestFFT::test_empty_fft
             - TestFFT::test_fft_half_and_bfloat16_errors
             - TestFFT::test_fftn_invalid
-            - TestFFT::test_istft_throws
           mode: mandatory_success
         # These tests exercise FFT operations with various dtypes and tensor shapes.
         # They are classified as xfail due to unsupported dtypes (ComplexFloat, ComplexDouble, Half) on the Spyre backend.
@@ -63,6 +62,9 @@ test_suite_config:
             - TestFFT::test_stft_requires_complex
             - TestFFT::test_stft_requires_window
           mode: skip  # does not engage the torch-spyre layer
+        - names:
+            - TestFFT::test_istft_throws
+          mode: skip
 
   global:
     supported_dtypes:

@@ -176,23 +176,51 @@ class RestickNodeCost(abc.ABC):
 
 
 class AllSameNode(RestickNodeCost):
-    """Cost node for ops that require all inputs and the output to be stick compatible (eg pointwise ops)."""
+    """Cost node for ops that require all inputs and outputs to share the same stick layout.
+
+    Accepts multiple output deps via out_deps (e.g. mutation ops where two ops
+    write the same buffer). Restickify may only be inserted on input edges;
+    co-output edges enforce layout equality but never trigger restickify insertion.
+    """
 
     @classmethod
-    def from_args(cls, args, out_layouts, out_dep, op):
+    def from_args(cls, args, out_layouts, out_deps, op):
+        """Build an AllSameNode from input PropArgs and output dep(s).
+
+        out_deps is either a single MemoryDep (normal ops) or a list whose first
+        entry is the primary output dep and whose remaining entries are co-output
+        MemoryDeps (e.g. the shared mutation buffer in copy_forced). Co-output deps
+        must agree on the same layout but are not eligible for restickify insertion.
+        """
         assert out_layouts, "AllSameNode.from_args: out_layouts is empty"
-        edge_costs = [
+        if not isinstance(out_deps, list):
+            out_deps = [out_deps]
+        out_dep = out_deps[0]  # reference output dep for stick-compatibility checks
+        co_output_deps = out_deps[1:]
+        input_edge_costs = [
             EdgeCostMap(arg.dep, arg.layouts, out_layouts, out_dep, op) for arg in args
         ]
-        return cls(edge_costs)
+        output_edge_costs = [
+            EdgeCostMap(
+                dep, V.graph.get_buffer(dep.name).layouts, out_layouts, out_dep, op
+            )
+            for dep in co_output_deps
+        ]
+        return cls(input_edge_costs, output_edge_costs)
+
+    def __init__(self, input_edge_costs: list, output_edge_costs: "list | None" = None):
+        super().__init__(input_edge_costs + (output_edge_costs or []))
+        self._input_edge_costs = input_edge_costs
 
     def cost(
         self, in_layouts: "list[SpyreTensorLayout]", out_stl: "SpyreTensorLayout"
     ) -> float:
+        # edge_costs includes both input and co-output edges; co-output entries enforce
+        # layout equality (0 if matching, INF if not) but never trigger restickify insertion.
         return sum(ec.cost(lk, out_stl) for ec, lk in zip(self.edge_costs, in_layouts))
 
     def required_input_stls(self, out_stl):
-        return [(ec, out_stl) for ec in self.edge_costs]
+        return [(ec, out_stl) for ec in self._input_edge_costs]
 
     def min_input_cost(self, dep_name, in_stl, out_stl):
         # next() takes the first match; if dep_name appears twice (x+x), both edges
@@ -400,14 +428,13 @@ def greedy_local_min_cost(operations: list) -> None:
 
         # Collect each input arg's committed layout (finalized by earlier topo iterations).
         in_layouts = []
-        for dep in op.get_read_writes().reads:
-            if isinstance(dep, MemoryDep):
-                buf = V.graph.get_buffer(dep.name)
-                assert hasattr(buf, "committed_stl"), (
-                    f"buffer {dep.name} has no committed_stl — "
-                    "topological order violated or input not committed"
-                )
-                in_layouts.append(buf.committed_stl)
+        for ec in cost_fn.edge_costs:
+            buf = V.graph.get_buffer(ec.dep.name)
+            assert hasattr(buf, "committed_stl"), (
+                f"buffer {ec.dep.name} has no committed_stl — "
+                "topological order violated or input not committed"
+            )
+            in_layouts.append(buf.committed_stl)
 
         assert op.layouts, (
             f"op {op.get_name()} has restick_cost_fn but no candidate output layouts"
@@ -521,11 +548,9 @@ def compute_future_min_cost(
     for op in operations:
         if not hasattr(op, "layouts"):
             continue
-        for dep in op.get_read_writes().reads:
-            if (
-                isinstance(dep, MemoryDep)
-                and op.get_name() not in downstream_seen[dep.name]
-            ):
+        for ec in op.restick_cost_fn.edge_costs:
+            dep = ec.dep
+            if op.get_name() not in downstream_seen[dep.name]:
                 downstream[dep.name].append(op)
                 downstream_seen[dep.name].add(op.get_name())
 
@@ -570,11 +595,11 @@ def _compute_last_use(operations: list, step_of: "dict[str, int]") -> "dict[str,
     for op in operations:
         if not hasattr(op, "layouts"):
             continue
-        for dep in op.get_read_writes().reads:
-            if isinstance(dep, MemoryDep) and dep.name in step_of:
+        for ec in op.restick_cost_fn.edge_costs:
+            if ec.dep.name in step_of:
                 consumer_step = step_of[op.get_name()]
-                if last_use.get(dep.name, -1) < consumer_step:
-                    last_use[dep.name] = consumer_step
+                if last_use.get(ec.dep.name, -1) < consumer_step:
+                    last_use[ec.dep.name] = consumer_step
     return last_use
 
 
@@ -648,7 +673,7 @@ def beam_global_min_cost(operations: list) -> None:
             f"op {op.get_name()} has layouts but no restick_cost_fn"
         )
         cost_fn = op.restick_cost_fn
-        deps = [dep for dep in op.get_read_writes().reads if isinstance(dep, MemoryDep)]
+        deps = [ec.dep for ec in op.restick_cost_fn.edge_costs]
 
         op_future = future_min_cost.get(op.get_name(), {})
         next_states = []

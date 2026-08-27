@@ -138,6 +138,77 @@ class LifetimeBoundBuffer:
         return self.start_time < other.end_time and other.start_time < self.end_time
 
 
+@dataclass(frozen=True)
+class TileAxis:
+    """One coarse-tiling level.
+
+    ``host_dim`` is a *positional* index: into ``op_out_coords(op)`` for an
+    output axis, or into the op's ordered reduction loop variables (see
+    :func:`wsr.coarse_tile.reduction_loop_vars`) for a reduction axis.
+    ``is_reduction`` selects which frame ``host_dim`` indexes. ``count`` is the
+    split factor -- how many equal tiles the axis is cut into.
+    """
+
+    host_dim: int
+    count: int
+    is_reduction: bool = False
+
+
+@dataclass(frozen=True)
+class TileSpec:
+    """An ordered, outermost-first tuple of :class:`TileAxis` levels.
+
+    Ordered -- where the core-division splits are dicts and so order-free --
+    because tile levels *nest*: swapping two levels is a different plan. Frozen
+    and hashable so ``==`` is exactly the "same tiling shape" test the group
+    derivation keys on. The empty spec is *untiled*, and is the inert default
+    every :class:`CoreDivision` carries while ``auto_coarse_tiling`` is off.
+    """
+
+    axes: tuple[TileAxis, ...] = ()
+
+    @property
+    def is_untiled(self) -> bool:
+        return not self.axes
+
+    @property
+    def depth(self) -> int:
+        """Number of nested tile levels."""
+        return len(self.axes)
+
+    @property
+    def tile_count(self) -> int:
+        """Total number of loop tiles across every level (all axes)."""
+        return math.prod(a.count for a in self.axes)
+
+    @property
+    def output_tile_count(self) -> int:
+        """Product of the split factors over output (non-reduction) axes only.
+
+        This is the factor by which a tiled op's own per-tile scratch shrinks,
+        and so the factor :attr:`CoreDivisionBuffer.min_footprint` divides by. A
+        reduction-tiled level does *not* shrink that buffer -- the op's own
+        output is the accumulator, which keeps the full output extent -- so
+        reduction axes are excluded here even though they count in
+        :attr:`tile_count`.
+        """
+        return math.prod(a.count for a in self.axes if not a.is_reduction)
+
+    @property
+    def is_clean(self) -> bool:
+        """True when no reduction axis is tiled (mirrors
+        :attr:`CoreDivision.is_clean`)."""
+        return not any(a.is_reduction for a in self.axes)
+
+    @property
+    def label(self) -> str:
+        if not self.axes:
+            return "untiled"
+        return "/".join(
+            f"{'~' if a.is_reduction else ''}d{a.host_dim}:{a.count}" for a in self.axes
+        )
+
+
 @dataclass
 class CoreDivision:
     """One permissible core-division of a buffer's producing op.
@@ -146,10 +217,16 @@ class CoreDivision:
     produced by :func:`pass_utils.splits_by_index_coeff` -- exactly the shape
     stored in ``op.op_it_space_splits``. Solvers are expected to use these to size
     the buffer (per-core footprint = total / ``output_partition``).
+
+    ``tiling`` pairs a coarse tiling onto this division as *one* candidate rather
+    than a parallel list. A division is only meaningful relative to a tiling
+    (the legal set and the coeff encoding both move with it), so the two must be
+    chosen together. The empty :class:`TileSpec` is untiled and inert.
     """
 
     output_splits: dict[int, int] = field(default_factory=dict)
     reduction_splits: dict[int, int] = field(default_factory=dict)
+    tiling: TileSpec = field(default_factory=TileSpec)
 
     @property
     def cores_used(self) -> int:
@@ -206,11 +283,19 @@ class CoreDivisionBuffer(LifetimeBoundBuffer):
     def min_footprint(self) -> int:
         """Smallest per-core footprint any candidate division allows. With no
         candidates there is nothing to divide by, so it falls back to ``size``
-        (the placement-only case ``_wrap`` also dispatches on)."""
+        (the placement-only case ``_wrap`` also dispatches on).
+
+        A tiled candidate's own buffer is per-tile scratch, so its footprint
+        shrinks by the output tile count as well as the core count -- this is
+        the LX-residency win entering the footprint math. Reduction tile levels
+        are excluded (see :attr:`TileSpec.output_tile_count`); with
+        ``auto_coarse_tiling`` off every ``cd.tiling`` is empty and this reduces
+        to the previous ``ceil_div(size, output_partition)`` exactly."""
         if not self.core_divisions:
             return self.size
         return min(
-            ceil_div(self.size, cd.output_partition) for cd in self.core_divisions
+            ceil_div(self.size, cd.output_partition * cd.tiling.output_tile_count)
+            for cd in self.core_divisions
         )
 
 

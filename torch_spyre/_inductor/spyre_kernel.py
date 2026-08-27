@@ -38,13 +38,13 @@ from .constants import (
     SPYRE_FP32_OPS,
     BATCH_MATMUL_OP,
     BATCH_MATMUL_FP8_OP,
-    CONV2D_FWD_OP,
     CONV_OPS,
+    DEPTHWISE_CONV_REDUCTION_OPS,
     IDENTITY_OP,
     POOL_OPS,
     RESTICKIFY_OP,
     SEGMENT_OFFSETS,
-    DEPTHWISE_CONV2D_OP,
+    TWO_INPUT_REDUCTION_OPS,
     SHARED_WEIGHT_UNIT_BMM_INFO_KEY,
 )
 from . import config as _spyre_config
@@ -285,6 +285,10 @@ class SpyreOpFuncs:
     @staticmethod
     def gt(a, b):
         return PointwiseOp("greaterthan", [a, b])
+
+    @staticmethod
+    def keep_by_index(x, indices):
+        return ReductionOp("keepbyindex", [x, indices])
 
     @staticmethod
     def layernormnorm(*args):
@@ -863,17 +867,38 @@ class SpyreKernel(Kernel[CSEVariable]):
         ir_node = self.current_node.node  # ComputedBuffer
         work_division: dict[sympy.Symbol, int] = {}
         if hasattr(ir_node, "op_it_space_splits"):
+            from .pass_utils import is_keep_by_index, read_with_max_reduction_overlap
+
             write_index = next(iter(self.current_node.read_writes.writes)).index
-            # Match the encoding in work_division.apply_splits: an indirect
-            # (gather) read carries data-dependent symbols whose coefficients are
-            # not a stable identity key, so prefer the first non-indirect read as
-            # the reduction-split reference index.
             reads = self.current_node.read_writes.reads
-            read_dep = next(
-                (d for d in reads if isinstance(d, MemoryDep) and not d.is_indirect()),
-                next(iter(reads), None),
-            )
-            read_index = read_dep.index if read_dep is not None else write_index
+
+            # For keep_by_index, the indices tensor (not values) carries the k
+            # (reduction) dimension, so pick whichever read overlaps
+            # reduction_vars the most instead of just taking the first
+            # non-indirect read.
+            if is_keep_by_index(ir_node):
+                coord_vars = {v for v in write_index.free_symbols}
+                reduction_vars = set(it_space.keys()) - coord_vars
+                read_index = write_index
+                if reduction_vars:
+                    best_read = read_with_max_reduction_overlap(reads, reduction_vars)
+                    if best_read is not None:
+                        read_index = best_read
+            else:
+                # Match the encoding in work_division.apply_splits: an indirect
+                # (gather) read carries data-dependent symbols whose coefficients are
+                # not a stable identity key, so prefer the first non-indirect read as
+                # the reduction-split reference index.
+                read_dep = next(
+                    (
+                        d
+                        for d in reads
+                        if isinstance(d, MemoryDep) and not d.is_indirect()
+                    ),
+                    next(iter(reads), None),
+                )
+                read_index = read_dep.index if read_dep is not None else write_index
+
             work_division = apply_splits_from_index_coeff(
                 ir_node.op_it_space_splits,
                 write_index,
@@ -964,23 +989,6 @@ class SpyreKernel(Kernel[CSEVariable]):
                 exc_info=True,
             )
             debug_handle = None
-
-        if not is_reduction and op != "ReStickifyOpHBM" and not indirect_var_names:
-            stick_vars = {
-                next(iter(arg.device_coordinates[-1].free_symbols))
-                for arg in args
-                if arg.device_coordinates and arg.device_coordinates[-1].free_symbols
-            }
-            assert len(stick_vars) <= 1, (
-                f"create_op_spec: stick mismatch for op={op!r} "
-                f"ir_chain={getattr(debug_handle, 'ir_chain', '?')}: "
-                f"args have different stick loop variables: "
-                + ", ".join(
-                    str(arg.device_coordinates[-1])
-                    for arg in args
-                    if arg.device_coordinates
-                )
-            )
 
         # Carry the node's full logical output ranges (NCHW, incl. unit dims)
         # so codegen can derive surviving dim roles and the channel count from
@@ -1211,7 +1219,7 @@ class SpyreKernel(Kernel[CSEVariable]):
                 f"device_size={list(layout.device_layout.device_size)}, op_info={op_info}"
             )
 
-        if value.op in [BATCH_MATMUL_OP, BATCH_MATMUL_FP8_OP, CONV2D_FWD_OP]:
+        if value.op in TWO_INPUT_REDUCTION_OPS:
             # Two-input reductions: matmul (activation @ weight) and conv2d
             # (activation * weight, reduced over in/ki/kj). Both build
             # [input, weight, output] tensor args.
@@ -1229,7 +1237,7 @@ class SpyreKernel(Kernel[CSEVariable]):
                 self.create_tensor_arg(False, real_dst_name, dst),
             ]
             self.op_specs.append(self.create_op_spec(value.op, True, args, op_info))
-        elif value.op == DEPTHWISE_CONV2D_OP:
+        elif value.op in DEPTHWISE_CONV_REDUCTION_OPS:
             if (
                 len(value.arguments) < 2
                 or (not isinstance(value.arguments[0], TensorAccess))

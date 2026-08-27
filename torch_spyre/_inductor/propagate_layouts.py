@@ -82,6 +82,7 @@ from .pass_utils import (
     device_coordinates,
     try_device_coordinates,
     indirect_info_from_op,
+    is_keep_by_index,
     is_stick_expr_offset_free,
     is_topk,
     iter_var_id,
@@ -789,6 +790,57 @@ def _dev_coord_for_var(dev_coords, arg_host_coords, var):
     return None
 
 
+def _find_layout_avoiding_var_on_stick(
+    arg: PropArg,
+    avoid_var: sympy.Symbol,
+    label: str,
+) -> SpyreTensorLayout:
+    """Find required STL for ``arg`` whose stick does not carry ``avoid_var``.
+
+    1. Return the first layout whose stick already excludes avoid_var (zero cost).
+    2. Else return the first layout that can be restickified to move avoid_var
+       off the stick, onto a surviving coordinate.
+    3. Else raise Unsupported.
+    """
+    for stl in arg.layouts:
+        dev_coords = device_coordinates(stl, arg.dep, None)
+        if dev_coords is None:
+            continue
+        if avoid_var not in dev_coords[-1].free_symbols:
+            return stl
+
+    arg_host_coords = host_coordinates(arg.layout, arg.dep, None)
+    surviving_vars = set()
+    for coord in arg_host_coords:
+        if len(coord.free_symbols) > 0 and avoid_var not in coord.free_symbols:
+            surviving_vars.update(coord.free_symbols)
+
+    if not surviving_vars:
+        raise Unsupported(
+            f"{label}: no surviving coordinates after removing {avoid_var}"
+        )
+    surviving_var = next(iter(surviving_vars))
+
+    for stl in arg.layouts:
+        dev_coords = device_coordinates(stl, arg.dep, None)
+        if dev_coords is None:
+            continue
+        target_stick_expr = _dev_coord_for_var(
+            dev_coords, arg_host_coords, surviving_var
+        )
+        if target_stick_expr is None:
+            continue
+        result = compute_restickify_target_layout(
+            stl, arg.layout, target_stick_expr, arg_host_coords, dev_coords
+        )
+        if result is not None:
+            return result
+
+    raise Unsupported(
+        f"{label}: cannot restickify layout to move {avoid_var} off the stick"
+    )
+
+
 def find_stick_compatible_input_layout(
     arg: PropArg,
     reduction_var: sympy.Symbol,
@@ -869,7 +921,7 @@ def _matmul_layouts(
     #   Input2 (y): stick on generated_var (loop var present in output, absent from x)
     #   Output:     stick on generated_var
     reduction_var = find_reduction_var(x.dep, output_dep)
-    generated_var = find_matmul_generated_var(y.dep, x.dep, output_dep)
+    generated_var = find_matmul_generated_var(y.dep, x.dep, output_dep, op)
 
     x_req_stl = find_stick_compatible_input_layout(
         x, reduction_var, data.reduction_type, "x"
@@ -1325,6 +1377,87 @@ def _topk_layouts(
     return results
 
 
+def _keep_by_index_layouts(
+    op: Operation,
+    output: FixedLayout,
+    output_dep: MemoryDep,
+    args: list[PropArg],
+) -> list[SpyreTensorLayout]:
+    """Layout propagation for keep_by_index.
+
+    Output shape matches values input (arg0). Search dimension cannot be the
+    stick for arg0 or output. Indices (arg1) k dimension cannot be the stick.
+
+    Algorithm:
+      1. Identify search_var: dimension in values not in indices
+      2. Find required layout for values where search_var is NOT on stick
+      3. Find required layout for indices where k dimension is NOT on stick
+      4. Compute output STL with stick matching values' output stick position
+    """
+    _check_supported_input_sticks(args, "keep_by_index")
+    values = args[0]
+    indices = args[1]
+    out_coords = host_coordinates(output, output_dep, None)
+    values_coords = host_coordinates(values.layout, values.dep, None)
+
+    # Find search_var: the loop variable in values not present in indices
+    # (unlike reductions, keep_by_index preserves all dimensions)
+    indices_coords = host_coordinates(indices.layout, indices.dep, None)
+    search_var = None
+    for v_coord in values_coords:
+        if len(v_coord.free_symbols) == 0:
+            continue
+        # Check if this coordinate appears in indices
+        found_in_indices = any(v_coord.equals(i_coord) for i_coord in indices_coords)
+        if not found_in_indices:
+            search_var = next(iter(v_coord.free_symbols))
+            break
+
+    if search_var is None:
+        raise Unsupported("keep_by_index: could not identify search dimension")
+
+    values_req_stl = _find_layout_avoiding_var_on_stick(
+        values, search_var, "keep_by_index"
+    )
+
+    # Find reduction_var: loop variable in indices not in values (the k dimension)
+    reduction_var = None
+    for i_coord in indices_coords:
+        if len(i_coord.free_symbols) == 0:
+            continue
+        found_in_values = any(i_coord.equals(v_coord) for v_coord in values_coords)
+        if not found_in_values:
+            reduction_var = next(iter(i_coord.free_symbols))
+            break
+
+    if reduction_var is None:
+        raise Unsupported("keep_by_index: could not identify k dimension")
+
+    indices_req_stl = _find_layout_avoiding_var_on_stick(
+        indices, reduction_var, "keep_by_index"
+    )
+
+    # Compute output STL: stick position matches values' required layout
+    x_stick_expr = device_coordinates(values_req_stl, values.dep, None)[-1]
+    out_stick_dim = matching_dim(out_coords, x_stick_expr)
+
+    c_size = [concretize_expr(s) for s in output.size]
+    c_stride = [concretize_expr(s) for s in output.stride]
+
+    if out_stick_dim is None:
+        out_dim_order = list(range(len(output.size))) + [-1]
+    else:
+        out_dim_order = [d for d in range(len(output.size)) if d != out_stick_dim]
+        out_dim_order += [out_stick_dim]
+
+    out_stl = SpyreTensorLayout(c_size, c_stride, output.dtype, out_dim_order)
+
+    op.restick_cost_fn = FixedInOutNode.from_args(
+        [values, indices], out_stl, [values_req_stl, indices_req_stl], op
+    )
+    return [out_stl]
+
+
 def compute_layouts(
     op: Operation,
     output: FixedLayout,
@@ -1374,7 +1507,11 @@ def compute_layouts(
     if is_topk(op):
         return _topk_layouts(op, output, output_dep, args)
 
+    if is_keep_by_index(op):
+        return _keep_by_index_layouts(op, output, output_dep, args)
+
     aten_op = next(iter(data.origins)).target if data.origins else None
+
     if aten_op == spyreop.layernormnorm.default:
         # layernormnorm is pointwise but special: it has multiple args, input and
         # output must have matching size/stride, and x's stick must match
@@ -1783,15 +1920,13 @@ def propagate_spyre_tensor_layouts(
                         target_buf_layouts and len(target_buf_layouts) > 1
                     ):
                         # target_buf is an ordinary multi-candidate ComputedBuffer
-                        # (issue #3845): the mutation op (e.g. copy_forced) has no
-                        # genuine MemoryDep read-edge to target_buf, so none of the
-                        # existing per-arg propagation machinery can see or price
-                        # the constraint that this op's output STL must match
-                        # whatever target_buf eventually commits to. Synthesize a
-                        # coupling edge by reusing target_buf's own write MemoryDep
-                        # (real index/shape, since copy_forced requires identical
-                        # shapes) as an extra "input" arg, and let AllSameNode price
-                        # it exactly like any other input alongside the real reads.
+                        # (issue #3845): this mutation op (e.g. copy_forced) and
+                        # target_buf are co-outputs — both write the same buffer, so
+                        # they must commit to the same layout. Pass target_buf as a
+                        # co-output to AllSameNode so the beam search enforces exact
+                        # layout equality. Restickify may only be inserted on real
+                        # input edges (e.g. the src tensor); the output buffer itself
+                        # cannot be restickified.
                         assert target_buf is not None
                         target_write_dep = _one_mem_dep(
                             target_buf.get_read_writes().writes
@@ -1803,15 +1938,13 @@ def propagate_spyre_tensor_layouts(
                         )
                         rw = op.get_read_writes()
                         output_dep = next(iter(rw.writes))
-                        args = _get_prop_args(rw.reads)
-                        target_arg = PropArg(
-                            target_write_dep,
-                            target_buf.get_layout(),
-                            list(target_buf_layouts),
-                        )
-                        op.layouts = list(target_buf_layouts)
+                        args = _get_prop_args(rw.reads)  # real inputs only (e.g. src)
+                        op.layouts = list(
+                            target_buf_layouts
+                        )  # inherit target's candidates
+                        # target_write_dep is the co-output: same buffer, must agree on layout
                         op.restick_cost_fn = AllSameNode.from_args(
-                            [*args, target_arg], op.layouts, output_dep, op
+                            args, op.layouts, [output_dep, target_write_dep], op
                         )
                         continue
                     if not isinstance(target_buf, SpyreEmptyFallback):
@@ -1839,17 +1972,17 @@ def propagate_spyre_tensor_layouts(
                         target_name,
                         type(target_buf).__name__,
                     )
-                    # SpyreEmptyFallback accumulator has no device layout yet.
+                    # SpyreEmptyFallback target has no device layout yet.
                     # Treat the mutation op like a normal pointwise op: run
-                    # _multi_arg_pointwise_layouts with the "new value" inputs
-                    # (excluding the running accumulator read-back).  This
-                    # enforces the same input-compatibility and slice constraints
-                    # as a regular add, so the backend DDL slice check passes.
+                    # _multi_arg_pointwise_layouts with the non-target inputs.
+                    # This enforces input-compatibility and slice constraints,
+                    # so the backend DDL slice check passes.
                     rw = op.get_read_writes()
                     output_dep = next(iter(rw.writes))
                     all_args = _get_prop_args(rw.reads)
-                    # Exclude the running accumulator itself (dep.name == target_name)
-                    # from the layout constraint: it IS the output, not a new input.
+                    # Exclude the target read-back (dep.name == target_name) from
+                    # layout candidate derivation: it IS the output buffer, not an
+                    # independent input.
                     new_value_args = [a for a in all_args if a.dep.name != target_name]
                     if not new_value_args:
                         # No real inputs — fall back to unconstrained candidates.
@@ -1863,20 +1996,13 @@ def propagate_spyre_tensor_layouts(
                         isinstance(op.data, Reduction)
                         and op.data.reduction_type == BATCH_MATMUL_OP
                     ):
-                        # Tiled matmul/bmm accumulator: op computes a per-tile
-                        # partial matmul and writes it into a slice of the
-                        # full-size accumulator. x and y are the two genuine
-                        # matmul operands (never the accumulator read-back —
-                        # mirrors the non-accumulator BATCH_MATMUL_OP dispatch
-                        # in compute_layouts, whose args also never include the
-                        # reduction's own output buffer). _matmul_layouts
-                        # derives a single out_stl deterministically from
-                        # accum_layout and installs its own FixedInOutNode, so
-                        # the accumulator is automatically pinned to that same
-                        # out_stl -- no separate AllSameNode join is needed.
+                        # x and y are the two genuine matmul inputs (not the target
+                        # read-back). _matmul_layouts derives a single out_stl
+                        # deterministically from the target layout and installs its
+                        # own FixedInOutNode, so no separate AllSameNode join is needed.
                         assert len(new_value_args) == 2, (
-                            "BATCH_MATMUL_OP accumulator op should have exactly "
-                            f"two non-accumulator inputs, got {len(new_value_args)} "
+                            "BATCH_MATMUL_OP mutation op should have exactly "
+                            f"two non-target inputs, got {len(new_value_args)} "
                             f"for {op.get_name()}"
                         )
                         accum_layout = target_buf.get_layout()
@@ -1886,16 +2012,11 @@ def propagate_spyre_tensor_layouts(
                         target_buf.layouts = candidates
                         op.layouts = candidates
                     elif isinstance(op.data, Reduction):
-                        # Tiled-reduction accumulator: op computes a per-tile
-                        # partial reduction and writes it into a slice of the
-                        # full-size accumulator. The "new value" input is the
-                        # reduction's own un-reduced, higher-rank input, so
-                        # this must go through the same per-arg reduction
-                        # layout logic compute_layouts uses for ordinary
-                        # reductions (_single_arg_op_layout), not the
+                        # The non-target input is the reduction's un-reduced,
+                        # higher-rank input. Must use _single_arg_op_layout, not the
                         # broadcast-oriented pointwise join path.
                         assert len(new_value_args) == 1, (
-                            "Reduction op should have exactly one non-accumulator "
+                            "Reduction mutation op should have exactly one non-target "
                             f"input, got {len(new_value_args)} for {op.get_name()}"
                         )
                         accum_layout = target_buf.get_layout()
@@ -1916,13 +2037,12 @@ def propagate_spyre_tensor_layouts(
                             raise Unsupported(
                                 f"{op.get_name()}: no supported output layout "
                                 f"found for any of {len(in_arg.layouts)} "
-                                f"candidate input layouts; accum size="
+                                f"candidate input layouts; target size="
                                 f"{accum_layout.size}"
                             )
-                        # The accumulator read-back (target_name) is also a
-                        # real input to this op and its stick must match the
-                        # output, so build the cost function from all_args
-                        # (not just in_arg) — mirrors the pointwise branch.
+                        # The target read-back is also a real input whose stick
+                        # must match the output — include all_args so the beam
+                        # search enforces that constraint.
                         op.restick_cost_fn = AllSameNode.from_args(
                             all_args, candidates, output_dep, op
                         )
@@ -1933,12 +2053,10 @@ def propagate_spyre_tensor_layouts(
                         candidates = _multi_arg_pointwise_layouts(
                             op, accum_layout, output_dep, new_value_args
                         )
-                        # op.restick_cost_fn was set by _multi_arg_pointwise_layouts
-                        # using only new_value_args.  The accumulator read-back
-                        # (target_name) is also a real input to this add and its
-                        # stick must match the output.  Rebuild the cost function
-                        # with all_args so the beam search enforces that constraint
-                        # and doesn't commit the accumulator to a mismatched layout.
+                        # _multi_arg_pointwise_layouts used only new_value_args to
+                        # derive candidates. Rebuild the cost function with all_args
+                        # so the target read-back is also included: its stick must
+                        # match the output at runtime.
                         op.restick_cost_fn = AllSameNode.from_args(
                             all_args, candidates, output_dep, op
                         )

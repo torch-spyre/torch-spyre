@@ -622,6 +622,24 @@ def test_mutation_target_multi_candidate_layout():
     _compare(fn, a, b, d)
 
 
+def test_mutation_target_restick_on_src_not_target():
+    # d is (N, M) so d.t() is (M, N) col-major — a different layout than c = a+b
+    # (row-major).  The restickify must land on d.t() (src), not on c (the mutation
+    # target).  validate_no_restickify_on_mutation_targets is wired into passes.py by
+    # this PR and fires during compilation if the target is incorrectly restickified.
+    M, N = 128, 256
+    a = torch.randn((M, N), dtype=torch.float16) * 0.01
+    b = torch.randn((M, N), dtype=torch.float16) * 0.01
+    d = torch.randn((N, M), dtype=torch.float16) * 0.01
+
+    def fn(a, b, d):
+        c = a + b
+        torch.ops.spyre.copy_forced(d.t(), c)
+        return c
+
+    _compare(fn, a, b, d, optimal_cost=M * N)
+
+
 # Optimizer correctness + optimality tests: verify both output values and
 # minimum-cost restickify plan across a range of graph patterns.
 
