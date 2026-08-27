@@ -28,6 +28,7 @@ from torch_spyre._C import DataFormats
 from torch_spyre._inductor.op_spec import LoopSpec, OpSpec, TensorArg, UnimplementedOp
 from torch_spyre._inductor.op_spec_validation import (
     BINARY_OPS,
+    STICK_STAGE,
     OpSpecValidationError,
     _is_unimplemented_op,
     validate_op_specs,
@@ -80,7 +81,7 @@ def _make_matmul_op_spec() -> OpSpec:
         _make_tensor_arg(is_input=False, arg_index=2),
     ]
     return OpSpec(
-        op="matmul",
+        op="batchmatmul",
         is_reduction=True,
         iteration_space={
             _C_ROW: (Integer(128), 1),
@@ -348,11 +349,13 @@ class TestValidateOpSpecsErrors(unittest.TestCase):
 
     def test_unknown_op_no_output_passes(self):
         """Unknown/synthetic ops without output args are valid."""
-        c0 = Symbol("c0")
         op = OpSpec(
             op="synthetic_test_op",
             is_reduction=False,
-            iteration_space={c0: (Integer(128), 1)},
+            iteration_space={
+                _C_ROW: (Integer(128), 1),
+                _C_COL: (Integer(256), 1),
+            },
             args=[_make_tensor_arg(is_input=True, arg_index=0)],
             op_info={},
             tiled_symbols=[],
@@ -364,7 +367,7 @@ class TestValidateOpSpecsErrors(unittest.TestCase):
         op = _make_valid_op_spec()
         op.args[0] = dataclasses.replace(op.args[0], allocation={"bad_key": 42})
         with self.assertRaises(OpSpecValidationError) as ctx:
-            validate_op_specs([op], stage="test")
+            validate_op_specs([op], stage="before_bundle_generation")
         self.assertIn("exactly one of hbm/lx/hbm_pool", str(ctx.exception))
 
     def test_allocation_multiple_keys(self):
@@ -374,7 +377,7 @@ class TestValidateOpSpecsErrors(unittest.TestCase):
             op.args[0], allocation={"hbm": 0x1000, "lx": 0x2000}
         )
         with self.assertRaises(OpSpecValidationError) as ctx:
-            validate_op_specs([op], stage="test")
+            validate_op_specs([op], stage="before_bundle_generation")
         self.assertIn("exactly one of hbm/lx/hbm_pool", str(ctx.exception))
 
 
@@ -485,6 +488,385 @@ class TestBinaryOpsConstant(unittest.TestCase):
             "lesserequal",
         }
         self.assertTrue(comparisons.issubset(BINARY_OPS))
+
+
+# ---------------------------------------------------------------------------
+# Tests: stick constraints (OS-8)
+# ---------------------------------------------------------------------------
+
+
+class TestStickConstraints(unittest.TestCase):
+    def test_uniform_same_stick_passes(self):
+        validate_op_specs([_make_valid_op_spec("add")], stage=STICK_STAGE)
+
+    def test_uniform_different_sticks_raises(self):
+        c_other = Symbol("c_other")
+        op = _make_valid_op_spec("add")
+        op.iteration_space[c_other] = (Integer(64), 1)
+        op.args[1] = dataclasses.replace(
+            op.args[1],
+            device_coordinates=[_C_COL // 64, _C_ROW, sympy.Mod(c_other, 64)],
+        )
+        with self.assertRaises(OpSpecValidationError) as ctx:
+            validate_op_specs([op], stage=STICK_STAGE)
+        self.assertIn("different stick loop variables", str(ctx.exception))
+
+    def test_restickify_different_sticks_passes(self):
+        c_other = Symbol("c_other")
+        op = _make_valid_op_spec("ReStickifyOpHBM")
+        op.iteration_space[c_other] = (Integer(64), 1)
+        op.args = [
+            _make_tensor_arg(is_input=True, arg_index=0),
+            dataclasses.replace(
+                _make_tensor_arg(is_input=False, arg_index=1),
+                device_coordinates=[_C_COL // 64, _C_ROW, sympy.Mod(c_other, 64)],
+            ),
+        ]
+        validate_op_specs([op], stage=STICK_STAGE)
+
+    def test_restickify_same_sticks_raises(self):
+        op = _make_valid_op_spec("ReStickifyOpHBM")
+        op.args = [
+            _make_tensor_arg(is_input=True, arg_index=0),
+            _make_tensor_arg(is_input=False, arg_index=1),
+        ]
+        with self.assertRaises(OpSpecValidationError) as ctx:
+            validate_op_specs([op], stage=STICK_STAGE)
+        self.assertIn(
+            "ReStickifyOpHBM input and output must have different stick loop variables",
+            str(ctx.exception),
+        )
+
+
+# ---------------------------------------------------------------------------
+# Tests: _check_stick_norm (exx2)
+# ---------------------------------------------------------------------------
+
+# For these ops the input has the normalization (reduction) dim in its coords
+# and the output does not — the reduction symbol is _C_ROW here.
+# The stick symbol (_C_COL) must equal the reduction symbol to be valid, so
+# we build fixtures where either _C_ROW or _C_COL is the stick.
+
+
+def _make_norm_op_spec(op: str, stick_is_reduction_dim: bool) -> OpSpec:
+    """Build a minimal exx2-like reduction OpSpec.
+
+    Input has both _C_ROW and _C_COL in its coords; output only has _C_COL.
+    So _C_ROW is the reduction symbol.
+
+    If stick_is_reduction_dim=True, the input stick coord uses _C_ROW (valid).
+    If False, the input stick coord uses _C_COL (invalid — wrong dim in stick).
+    """
+    if stick_is_reduction_dim:
+        # Stick = _C_ROW (the reduction dim) — valid
+        in_coords = [_C_COL // 64, sympy.Mod(_C_ROW, 64)]
+        in_size = [4, 64]
+    else:
+        # Stick = _C_COL (a non-reduction dim) — invalid
+        in_coords = [_C_ROW, sympy.Mod(_C_COL, 64)]
+        in_size = [128, 64]
+
+    out_coords = [_C_COL // 64, sympy.Mod(_C_COL, 64)]
+    out_size = [4, 64]
+
+    input_arg = TensorArg(
+        is_input=True,
+        arg_index=0,
+        device_dtype=DataFormats.SEN169_FP16,
+        device_size=in_size,
+        device_coordinates=in_coords,
+        allocation={"hbm": 0x400000000},
+    )
+    output_arg = TensorArg(
+        is_input=False,
+        arg_index=1,
+        device_dtype=DataFormats.SEN169_FP16,
+        device_size=out_size,
+        device_coordinates=out_coords,
+        allocation={"hbm": 0x500000000},
+    )
+    return OpSpec(
+        op=op,
+        is_reduction=True,
+        iteration_space={
+            _C_ROW: (Integer(64), 1),
+            _C_COL: (Integer(256), 1),
+        },
+        args=[input_arg, output_arg],
+        op_info={},
+        tiled_symbols=[],
+    )
+
+
+class TestNormStick(unittest.TestCase):
+    def test_exx2_stick_is_reduction_dim_passes(self):
+        validate_op_specs(
+            [_make_norm_op_spec("exx2", stick_is_reduction_dim=True)],
+            stage=STICK_STAGE,
+        )
+
+    def test_exx2_stick_is_non_reduction_dim_raises(self):
+        with self.assertRaises(OpSpecValidationError) as ctx:
+            validate_op_specs(
+                [_make_norm_op_spec("exx2", stick_is_reduction_dim=False)],
+                stage=STICK_STAGE,
+            )
+        self.assertIn("stick symbol must be the reduction", str(ctx.exception))
+
+
+# ---------------------------------------------------------------------------
+# Tests: _check_topk_stick
+# ---------------------------------------------------------------------------
+
+# Topk coord layout:
+#   input:  [_C_FEAT (reduction dim), Mod(_C_STICK, 64)]
+#   output: [_C_K    (k dim),         Mod(_C_STICK, 64)]
+# _C_FEAT is input-only  → reduction symbol.
+# _C_K    is output-only → k symbol.
+# _C_STICK is shared     → surviving stick dimension (valid in stick).
+
+_C_FEAT = Symbol("c_feat")
+_C_K = Symbol("c_k")
+_C_STICK = Symbol("c_stick")
+
+
+def _make_topk_op_spec(
+    op: str,
+    input_stick: sympy.Expr,
+    output_stick: sympy.Expr,
+) -> OpSpec:
+    """Build a minimal topkvalue/topkindex-like OpSpec.
+
+    Input coords: [_C_FEAT, input_stick]
+    Output coords: [_C_K,   output_stick]
+
+    _C_FEAT is the reduction symbol (input-only).
+    _C_K is the k symbol (output-only).
+    _C_STICK (used in the default valid case) is a shared surviving symbol.
+    """
+    input_arg = TensorArg(
+        is_input=True,
+        arg_index=0,
+        device_dtype=DataFormats.SEN169_FP16,
+        device_size=[128, 64],
+        device_coordinates=[_C_FEAT, input_stick],
+        allocation={"hbm": 0x400000000},
+    )
+    output_arg = TensorArg(
+        is_input=False,
+        arg_index=1,
+        device_dtype=DataFormats.SEN169_FP16,
+        device_size=[8, 64],
+        device_coordinates=[_C_K, output_stick],
+        allocation={"hbm": 0x500000000},
+    )
+    return OpSpec(
+        op=op,
+        is_reduction=True,
+        iteration_space={
+            _C_FEAT: (Integer(128), 1),
+            _C_K: (Integer(8), 1),
+            _C_STICK: (Integer(256), 1),
+        },
+        args=[input_arg, output_arg],
+        op_info={},
+        tiled_symbols=[],
+    )
+
+
+class TestTopkStick(unittest.TestCase):
+    def test_topkvalue_surviving_stick_passes(self):
+        validate_op_specs(
+            [
+                _make_topk_op_spec(
+                    "topkvalue", sympy.Mod(_C_STICK, 64), sympy.Mod(_C_STICK, 64)
+                )
+            ],
+            stage=STICK_STAGE,
+        )
+
+    def test_topkvalue_reduction_dim_in_stick_raises(self):
+        with self.assertRaises(OpSpecValidationError) as ctx:
+            validate_op_specs(
+                [
+                    _make_topk_op_spec(
+                        "topkvalue",
+                        sympy.Mod(_C_FEAT, 64),
+                        sympy.Mod(_C_STICK, 64),
+                    )
+                ],
+                stage=STICK_STAGE,
+            )
+        self.assertIn("reduction or k dimension", str(ctx.exception))
+
+    def test_topkindex_surviving_stick_passes(self):
+        validate_op_specs(
+            [
+                _make_topk_op_spec(
+                    "topkindex", sympy.Mod(_C_STICK, 64), sympy.Mod(_C_STICK, 64)
+                )
+            ],
+            stage=STICK_STAGE,
+        )
+
+    def test_topkindex_k_dim_in_stick_raises(self):
+        with self.assertRaises(OpSpecValidationError) as ctx:
+            validate_op_specs(
+                [
+                    _make_topk_op_spec(
+                        "topkindex",
+                        sympy.Mod(_C_STICK, 64),
+                        sympy.Mod(_C_K, 64),  # k dim in output stick — invalid
+                    )
+                ],
+                stage=STICK_STAGE,
+            )
+        self.assertIn("reduction or k dimension", str(ctx.exception))
+
+
+# ---------------------------------------------------------------------------
+# Tests: _check_matmul_stick
+# ---------------------------------------------------------------------------
+
+# Batchmatmul semantic dimensions:
+#   _C_K_MM  = reduction_sym  (in Input1, Input2; absent from Output)
+#   _C_N_MM  = generated_sym  (in Input2, Output; absent from Input1)
+#   _C_M_MM  = preserved_sym  (in Input1, Output; absent from Input2)
+#   _C_B_MM  = noreuse_sym    (in all three — batch dim)
+#
+# Required stick symbols:
+#   Input1 stick = _C_K_MM  (reduction)
+#   Input2 stick = _C_N_MM  (generated)
+#   Output stick = _C_N_MM  (generated)
+
+_C_K_MM = Symbol("c_k_mm")
+_C_N_MM = Symbol("c_n_mm")
+_C_M_MM = Symbol("c_m_mm")
+_C_B_MM = Symbol("c_b_mm")
+
+
+def _make_bmm_stick_op_spec(
+    op: str,
+    input1_stick: sympy.Expr,
+    input2_stick: sympy.Expr,
+    output_stick: sympy.Expr,
+) -> OpSpec:
+    """Build a minimal batchmatmul-like OpSpec.
+
+    Input1 (x): coords [_C_B_MM, _C_M_MM, input1_stick]  (K is reduction_sym)
+    Input2 (y): coords [_C_B_MM, _C_K_MM, input2_stick]  (N is generated_sym)
+    Output:     coords [_C_B_MM, _C_M_MM, output_stick]
+    """
+    input1 = TensorArg(
+        is_input=True,
+        arg_index=0,
+        device_dtype=DataFormats.SEN169_FP16,
+        device_size=[8, 16, 64],
+        device_coordinates=[_C_B_MM, _C_M_MM, input1_stick],
+        allocation={"hbm": 0x400000000},
+    )
+    input2 = TensorArg(
+        is_input=True,
+        arg_index=1,
+        device_dtype=DataFormats.SEN169_FP16,
+        device_size=[8, 64, 64],
+        device_coordinates=[_C_B_MM, _C_K_MM, input2_stick],
+        allocation={"hbm": 0x500000000},
+    )
+    output = TensorArg(
+        is_input=False,
+        arg_index=2,
+        device_dtype=DataFormats.SEN169_FP16,
+        device_size=[8, 16, 64],
+        device_coordinates=[_C_B_MM, _C_M_MM, output_stick],
+        allocation={"hbm": 0x600000000},
+    )
+    return OpSpec(
+        op=op,
+        is_reduction=True,
+        iteration_space={
+            _C_B_MM: (Integer(8), 1),
+            _C_K_MM: (Integer(64), 1),
+            _C_N_MM: (Integer(64), 1),
+            _C_M_MM: (Integer(16), 1),
+        },
+        args=[input1, input2, output],
+        op_info={},
+        tiled_symbols=[],
+    )
+
+
+class TestMatmulStick(unittest.TestCase):
+    def test_batchmatmul_valid_passes(self):
+        validate_op_specs(
+            [
+                _make_bmm_stick_op_spec(
+                    "batchmatmul",
+                    sympy.Mod(_C_K_MM, 64),
+                    sympy.Mod(_C_N_MM, 64),
+                    sympy.Mod(_C_N_MM, 64),
+                )
+            ],
+            stage=STICK_STAGE,
+        )
+
+    def test_input1_wrong_stick_raises(self):
+        with self.assertRaises(OpSpecValidationError) as ctx:
+            validate_op_specs(
+                [
+                    _make_bmm_stick_op_spec(
+                        "batchmatmul",
+                        sympy.Mod(_C_N_MM, 64),  # wrong: N instead of K
+                        sympy.Mod(_C_N_MM, 64),
+                        sympy.Mod(_C_N_MM, 64),
+                    )
+                ],
+                stage=STICK_STAGE,
+            )
+        self.assertIn("Input1 stick", str(ctx.exception))
+
+    def test_input2_wrong_stick_raises(self):
+        with self.assertRaises(OpSpecValidationError) as ctx:
+            validate_op_specs(
+                [
+                    _make_bmm_stick_op_spec(
+                        "batchmatmul",
+                        sympy.Mod(_C_K_MM, 64),
+                        sympy.Mod(_C_K_MM, 64),  # wrong: K instead of N
+                        sympy.Mod(_C_N_MM, 64),
+                    )
+                ],
+                stage=STICK_STAGE,
+            )
+        self.assertIn("Input2 stick", str(ctx.exception))
+
+    def test_output_wrong_stick_raises(self):
+        with self.assertRaises(OpSpecValidationError) as ctx:
+            validate_op_specs(
+                [
+                    _make_bmm_stick_op_spec(
+                        "batchmatmul",
+                        sympy.Mod(_C_K_MM, 64),
+                        sympy.Mod(_C_N_MM, 64),
+                        sympy.Mod(_C_K_MM, 64),  # wrong: K instead of N
+                    )
+                ],
+                stage=STICK_STAGE,
+            )
+        self.assertIn("Output stick", str(ctx.exception))
+
+    def test_batchmatmulfp8_valid_passes(self):
+        validate_op_specs(
+            [
+                _make_bmm_stick_op_spec(
+                    "batchmatmulfp8",
+                    sympy.Mod(_C_K_MM, 64),
+                    sympy.Mod(_C_N_MM, 64),
+                    sympy.Mod(_C_N_MM, 64),
+                )
+            ],
+            stage=STICK_STAGE,
+        )
 
 
 if __name__ == "__main__":

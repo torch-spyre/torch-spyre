@@ -624,7 +624,7 @@ jobs:
           workflow: ${{ github.workflow }}
           branch: ${{ inputs.ref || github.event.pull_request.head.sha || github.ref_name }}
           sha: ${{ inputs.ref || github.event.pull_request.head.sha || github.sha }}
-          run-id: ${{ github.run_id }}
+          gha-run-id: ${{ github.run_id }}
           triggered-at: ''
           # perf never runs on pull_request (see the job `if:` above), so there
           # is no PR to associate; leave empty.

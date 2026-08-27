@@ -22,7 +22,6 @@ cases:
       code: special_image_mask = input_ids == self.config.image_token_id'
     marks:
       - constant
-      - tensorsoncpu
   - name: torch.or_.1
     op: torch.or_
     inputs:
@@ -40,7 +39,6 @@ cases:
           device: cuda
     description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L1034 in forward,
       code: multimodal_mask = image_mask | video_mask | audio_mask'
-    marks: tensorsoncpu
   - name: torch.clone.1
     op: torch.clone
     inputs:
@@ -55,7 +53,6 @@ cases:
             high: 1000
     description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L1039 in forward,
       code: llm_input_ids = input_ids.clone()'
-    marks: tensorsoncpu
   - name: torch.where.1
     op: torch.where
     inputs:
@@ -79,7 +76,6 @@ cases:
       code: llm_input_ids = torch.where(multimodal_mask, self.config.text_config.pad_token_id, llm_input_ids)'
     marks:
       - constant
-      - tensorsoncpu
   - name: torch.nn.functional.embedding.1
     op: torch.nn.functional.embedding
     inputs:
@@ -109,7 +105,6 @@ cases:
     marks:
       - bf16operation
       - constant
-      - tensorsoncpu
   - name: torch.to.1
     op: torch.to
     inputs:
@@ -125,7 +120,6 @@ cases:
       code: return super().forward(input_ids) * self.embed_scale.to(self.weight.dtype)'
     marks:
       - constant
-      - tensorsoncpu
   - name: torch.mul.1
     op: torch.mul
     inputs:
@@ -147,7 +141,6 @@ cases:
       code: return super().forward(input_ids) * self.embed_scale.to(self.weight.dtype)'
     marks:
       - bf16operation
-      - tensorsoncpu
   - name: torch.getitem.1
     op: torch.getitem
     inputs:
@@ -164,7 +157,6 @@ cases:
     marks:
       - fp32operation
       - constant
-      - tensorsoncpu
   - name: torch.float.1
     op: torch.float
     inputs:
@@ -179,7 +171,6 @@ cases:
       code: inv_freq_expanded = inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1).to(x.device)'
     marks:
       - fp32operation
-      - tensorsoncpu
   - name: torch.Tensor.expand.1
     op: torch.Tensor.expand
     inputs:
@@ -198,7 +189,6 @@ cases:
     marks:
       - fp32operation
       - constant
-      - tensorsoncpu
   - name: torch.to.2
     op: torch.to
     inputs:
@@ -215,7 +205,6 @@ cases:
     marks:
       - fp32operation
       - constant
-      - tensorsoncpu
   - name: torch.getitem.2
     op: torch.getitem
     inputs:
@@ -233,7 +222,6 @@ cases:
       code: position_ids_expanded = position_ids[:, None, :].float()'
     marks:
       - constant
-      - tensorsoncpu
   - name: torch.float.2
     op: torch.float
     inputs:
@@ -248,7 +236,6 @@ cases:
             high: 1000
     description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L274 in forward,
       code: position_ids_expanded = position_ids[:, None, :].float()'
-    marks: tensorsoncpu
   - name: torch.float.3
     op: torch.float
     inputs:
@@ -263,7 +250,6 @@ cases:
       code: freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)'
     marks:
       - fp32operation
-      - tensorsoncpu
   - name: torch.matmul.1
     op: torch.matmul
     inputs:
@@ -285,7 +271,6 @@ cases:
       code: freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)'
     marks:
       - fp32operation
-      - tensorsoncpu
   - name: torch.transpose.1
     op: torch.transpose
     inputs:
@@ -303,7 +288,6 @@ cases:
     marks:
       - fp32operation
       - constant
-      - tensorsoncpu
   - name: torch.cat.1
     op: torch.cat
     inputs:
@@ -325,7 +309,6 @@ cases:
     marks:
       - fp32operation
       - constant
-      - tensorsoncpu
     kwmap:
       dim: -1
   - name: torch.cos.1
@@ -342,7 +325,6 @@ cases:
       code: cos = emb.cos() * attention_scaling'
     marks:
       - fp32operation
-      - tensorsoncpu
   - name: torch.mul.2
     op: torch.mul
     inputs:
@@ -359,7 +341,6 @@ cases:
     marks:
       - fp32operation
       - constant
-      - tensorsoncpu
   - name: torch.sin.1
     op: torch.sin
     inputs:
@@ -374,7 +355,6 @@ cases:
       code: sin = emb.sin() * attention_scaling'
     marks:
       - fp32operation
-      - tensorsoncpu
   - name: torch.to.3
     op: torch.to
     inputs:
@@ -389,7 +369,6 @@ cases:
       code: return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)'
     marks:
       - fp32operation
-      - tensorsoncpu
     kwmap:
       dtype: torch.bfloat16
   - name: torch.getitem.3
@@ -408,7 +387,6 @@ cases:
     marks:
       - fp32operation
       - constant
-      - tensorsoncpu
   - name: torch.float.4
     op: torch.float
     inputs:
@@ -423,7 +401,6 @@ cases:
       code: inv_freq_expanded = inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1).to(x.device)'
     marks:
       - fp32operation
-      - tensorsoncpu
   - name: torch.Tensor.expand.2
     op: torch.Tensor.expand
     inputs:
@@ -442,7 +419,6 @@ cases:
     marks:
       - fp32operation
       - constant
-      - tensorsoncpu
   - name: torch.to.4
     op: torch.to
     inputs:
@@ -459,7 +435,6 @@ cases:
     marks:
       - fp32operation
       - constant
-      - tensorsoncpu
   - name: torch.matmul.2
     op: torch.matmul
     inputs:
@@ -481,7 +456,6 @@ cases:
       code: freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)'
     marks:
       - fp32operation
-      - tensorsoncpu
   - name: torch.transpose.2
     op: torch.transpose
     inputs:
@@ -499,7 +473,6 @@ cases:
     marks:
       - fp32operation
       - constant
-      - tensorsoncpu
   - name: torch.cat.2
     op: torch.cat
     inputs:
@@ -521,7 +494,6 @@ cases:
     marks:
       - fp32operation
       - constant
-      - tensorsoncpu
     kwmap:
       dim: -1
   - name: torch.cos.2
@@ -538,7 +510,6 @@ cases:
       code: cos = emb.cos() * attention_scaling'
     marks:
       - fp32operation
-      - tensorsoncpu
   - name: torch.mul.3
     op: torch.mul
     inputs:
@@ -555,7 +526,6 @@ cases:
     marks:
       - fp32operation
       - constant
-      - tensorsoncpu
   - name: torch.sin.2
     op: torch.sin
     inputs:
@@ -570,7 +540,6 @@ cases:
       code: sin = emb.sin() * attention_scaling'
     marks:
       - fp32operation
-      - tensorsoncpu
   - name: torch.to.5
     op: torch.to
     inputs:
@@ -585,7 +554,6 @@ cases:
       code: return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)'
     marks:
       - fp32operation
-      - tensorsoncpu
     kwmap:
       dtype: torch.bfloat16
   - name: torch.float.5
@@ -602,7 +570,6 @@ cases:
       code: normed_output = self._norm(hidden_states.float())'
     marks:
       - bf16operation
-      - tensorsoncpu
   - name: torch.pow.1
     op: torch.pow
     inputs:
@@ -619,7 +586,6 @@ cases:
     marks:
       - fp32operation
       - constant
-      - tensorsoncpu
   - name: torch.mean.1
     op: torch.mean
     inputs:
@@ -636,7 +602,6 @@ cases:
     marks:
       - fp32operation
       - constant
-      - tensorsoncpu
     kwmap:
       keepdim: true
   - name: torch.add.1
@@ -655,7 +620,6 @@ cases:
     marks:
       - fp32operation
       - constant
-      - tensorsoncpu
   - name: torch.pow.2
     op: torch.pow
     inputs:
@@ -672,7 +636,6 @@ cases:
     marks:
       - fp32operation
       - constant
-      - tensorsoncpu
   - name: torch.mul.4
     op: torch.mul
     inputs:
@@ -694,7 +657,6 @@ cases:
       code: return hidden_states * torch.pow(mean_squared, -0.5)'
     marks:
       - fp32operation
-      - tensorsoncpu
   - name: torch.float.6
     op: torch.float
     inputs:
@@ -709,7 +671,6 @@ cases:
       code: normed_output = normed_output * self.weight.float()'
     marks:
       - bf16operation
-      - tensorsoncpu
   - name: torch.mul.5
     op: torch.mul
     inputs:
@@ -731,7 +692,6 @@ cases:
       code: normed_output = normed_output * self.weight.float()'
     marks:
       - fp32operation
-      - tensorsoncpu
   - name: torch.type_as.1
     op: torch.type_as
     inputs:
@@ -754,7 +714,6 @@ cases:
     marks:
       - fp32operation
       - bf16operation
-      - tensorsoncpu
   - name: torch.nn.functional.linear.1
     op: torch.nn.functional.linear
     inputs:
@@ -778,7 +737,6 @@ cases:
     marks:
       - bf16operation
       - constant
-      - tensorsoncpu
   - name: torch.Tensor.view.1
     op: torch.Tensor.view
     inputs:
@@ -795,7 +753,6 @@ cases:
     marks:
       - bf16operation
       - constant
-      - tensorsoncpu
   - name: torch.float.7
     op: torch.float
     inputs:
@@ -810,7 +767,6 @@ cases:
       code: normed_output = self._norm(hidden_states.float())'
     marks:
       - bf16operation
-      - tensorsoncpu
   - name: torch.pow.3
     op: torch.pow
     inputs:
@@ -827,7 +783,6 @@ cases:
     marks:
       - fp32operation
       - constant
-      - tensorsoncpu
   - name: torch.mean.2
     op: torch.mean
     inputs:
@@ -844,7 +799,6 @@ cases:
     marks:
       - fp32operation
       - constant
-      - tensorsoncpu
     kwmap:
       keepdim: true
   - name: torch.add.2
@@ -863,7 +817,6 @@ cases:
     marks:
       - fp32operation
       - constant
-      - tensorsoncpu
   - name: torch.pow.4
     op: torch.pow
     inputs:
@@ -880,7 +833,6 @@ cases:
     marks:
       - fp32operation
       - constant
-      - tensorsoncpu
   - name: torch.mul.6
     op: torch.mul
     inputs:
@@ -902,7 +854,6 @@ cases:
       code: return hidden_states * torch.pow(mean_squared, -0.5)'
     marks:
       - fp32operation
-      - tensorsoncpu
   - name: torch.float.8
     op: torch.float
     inputs:
@@ -917,7 +868,6 @@ cases:
       code: normed_output = normed_output * self.weight.float()'
     marks:
       - bf16operation
-      - tensorsoncpu
   - name: torch.mul.7
     op: torch.mul
     inputs:
@@ -939,7 +889,6 @@ cases:
       code: normed_output = normed_output * self.weight.float()'
     marks:
       - fp32operation
-      - tensorsoncpu
   - name: torch.type_as.2
     op: torch.type_as
     inputs:
@@ -962,7 +911,6 @@ cases:
     marks:
       - fp32operation
       - bf16operation
-      - tensorsoncpu
   - name: torch.unsqueeze.1
     op: torch.unsqueeze
     inputs:
@@ -979,7 +927,6 @@ cases:
     marks:
       - bf16operation
       - constant
-      - tensorsoncpu
   - name: torch.mul.8
     op: torch.mul
     inputs:
@@ -1001,7 +948,6 @@ cases:
       code: return (x * cos) + (rotate_half(x) * sin)'
     marks:
       - bf16operation
-      - tensorsoncpu
   - name: torch.getitem.4
     op: torch.getitem
     inputs:
@@ -1018,7 +964,6 @@ cases:
     marks:
       - bf16operation
       - constant
-      - tensorsoncpu
   - name: torch.neg.1
     op: torch.neg
     inputs:
@@ -1033,7 +978,6 @@ cases:
       code: return torch.cat((-x2, x1), dim=-1)'
     marks:
       - bf16operation
-      - tensorsoncpu
   - name: torch.cat.3
     op: torch.cat
     inputs:
@@ -1055,7 +999,6 @@ cases:
     marks:
       - bf16operation
       - constant
-      - tensorsoncpu
     kwmap:
       dim: -1
   - name: torch.add.3
@@ -1079,7 +1022,6 @@ cases:
       code: return (x * cos) + (rotate_half(x) * sin)'
     marks:
       - bf16operation
-      - tensorsoncpu
   - name: torch.transpose.3
     op: torch.transpose
     inputs:
@@ -1097,7 +1039,6 @@ cases:
     marks:
       - bf16operation
       - constant
-      - tensorsoncpu
   - name: torch.nn.functional.linear.2
     op: torch.nn.functional.linear
     inputs:
@@ -1121,7 +1062,6 @@ cases:
     marks:
       - bf16operation
       - constant
-      - tensorsoncpu
   - name: torch.Tensor.view.2
     op: torch.Tensor.view
     inputs:
@@ -1138,7 +1078,6 @@ cases:
     marks:
       - bf16operation
       - constant
-      - tensorsoncpu
   - name: torch.float.9
     op: torch.float
     inputs:
@@ -1153,7 +1092,6 @@ cases:
       code: normed_output = self._norm(hidden_states.float())'
     marks:
       - bf16operation
-      - tensorsoncpu
   - name: torch.pow.5
     op: torch.pow
     inputs:
@@ -1170,7 +1108,6 @@ cases:
     marks:
       - fp32operation
       - constant
-      - tensorsoncpu
   - name: torch.mean.3
     op: torch.mean
     inputs:
@@ -1187,7 +1124,6 @@ cases:
     marks:
       - fp32operation
       - constant
-      - tensorsoncpu
     kwmap:
       keepdim: true
   - name: torch.add.4
@@ -1206,7 +1142,6 @@ cases:
     marks:
       - fp32operation
       - constant
-      - tensorsoncpu
   - name: torch.pow.6
     op: torch.pow
     inputs:
@@ -1223,7 +1158,6 @@ cases:
     marks:
       - fp32operation
       - constant
-      - tensorsoncpu
   - name: torch.mul.9
     op: torch.mul
     inputs:
@@ -1245,7 +1179,6 @@ cases:
       code: return hidden_states * torch.pow(mean_squared, -0.5)'
     marks:
       - fp32operation
-      - tensorsoncpu
   - name: torch.mul.10
     op: torch.mul
     inputs:
@@ -1267,7 +1200,6 @@ cases:
       code: normed_output = normed_output * self.weight.float()'
     marks:
       - fp32operation
-      - tensorsoncpu
   - name: torch.type_as.3
     op: torch.type_as
     inputs:
@@ -1290,7 +1222,6 @@ cases:
     marks:
       - fp32operation
       - bf16operation
-      - tensorsoncpu
   - name: torch.mul.11
     op: torch.mul
     inputs:
@@ -1312,7 +1243,6 @@ cases:
       code: return (x * cos) + (rotate_half(x) * sin)'
     marks:
       - bf16operation
-      - tensorsoncpu
   - name: torch.getitem.5
     op: torch.getitem
     inputs:
@@ -1329,7 +1259,6 @@ cases:
     marks:
       - bf16operation
       - constant
-      - tensorsoncpu
   - name: torch.neg.2
     op: torch.neg
     inputs:
@@ -1344,7 +1273,6 @@ cases:
       code: return torch.cat((-x2, x1), dim=-1)'
     marks:
       - bf16operation
-      - tensorsoncpu
   - name: torch.cat.4
     op: torch.cat
     inputs:
@@ -1366,7 +1294,6 @@ cases:
     marks:
       - bf16operation
       - constant
-      - tensorsoncpu
     kwmap:
       dim: -1
   - name: torch.add.5
@@ -1390,7 +1317,6 @@ cases:
       code: return (x * cos) + (rotate_half(x) * sin)'
     marks:
       - bf16operation
-      - tensorsoncpu
   - name: torch.transpose.4
     op: torch.transpose
     inputs:
@@ -1408,7 +1334,6 @@ cases:
     marks:
       - bf16operation
       - constant
-      - tensorsoncpu
   - name: torch.zeros.1
     op: torch.zeros
     inputs:
@@ -1417,7 +1342,6 @@ cases:
       = torch.zeros('
     marks:
       - constant
-      - tensorsoncpu
     kwmap:
       dtype: torch.bfloat16
       device: cpu
@@ -1438,7 +1362,6 @@ cases:
       = self.cumulative_length.to(self.device)'
     marks:
       - constant
-      - tensorsoncpu
   - name: torch.arange.1
     op: torch.arange
     inputs:
@@ -1447,7 +1370,6 @@ cases:
       device=self.device) + self.cumulative_length'
     marks:
       - constant
-      - tensorsoncpu
     kwmap:
       device: cpu
   - name: torch.add.6
@@ -1473,7 +1395,6 @@ cases:
             high: 1000
     description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/cache_utils.py#L529 in update, code: cache_position = torch.arange(kv_length,
       device=self.device) + self.cumulative_length'
-    marks: tensorsoncpu
   - name: torch.index_copy_.1
     op: torch.index_copy_
     inputs:
@@ -1506,7 +1427,6 @@ cases:
     marks:
       - bf16operation
       - constant
-      - tensorsoncpu
   - name: torch.add_.1
     op: torch.add_
     inputs:
@@ -1523,7 +1443,6 @@ cases:
     description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/cache_utils.py#L539 in update, code: self.cumulative_length.add_(kv_length)'
     marks:
       - constant
-      - tensorsoncpu
   - name: torch.getitem.6
     op: torch.getitem
     inputs:
@@ -1540,7 +1459,6 @@ cases:
     marks:
       - bf16operation
       - constant
-      - tensorsoncpu
   - name: torch.Tensor.expand.3
     op: torch.Tensor.expand
     inputs:
@@ -1561,7 +1479,6 @@ cases:
     marks:
       - bf16operation
       - constant
-      - tensorsoncpu
   - name: torch.reshape.1
     op: torch.reshape
     inputs:
@@ -1578,7 +1495,6 @@ cases:
     marks:
       - bf16operation
       - constant
-      - tensorsoncpu
   - name: torch.nn.functional.scaled_dot_product_attention.1
     op: torch.nn.functional.scaled_dot_product_attention
     inputs:
@@ -1607,7 +1523,6 @@ cases:
       code: attn_output = torch.nn.functional.scaled_dot_product_attention('
     marks:
       - bf16operation
-      - tensorsoncpu
     kwmap:
       dropout_p: 0.0
       scale: 1.0
@@ -1629,7 +1544,6 @@ cases:
     marks:
       - bf16operation
       - constant
-      - tensorsoncpu
   - name: torch.Tensor.contiguous.1
     op: torch.Tensor.contiguous
     inputs:
@@ -1644,7 +1558,6 @@ cases:
       code: attn_output = attn_output.transpose(1, 2).contiguous()'
     marks:
       - bf16operation
-      - tensorsoncpu
   - name: torch.reshape.2
     op: torch.reshape
     inputs:
@@ -1661,7 +1574,6 @@ cases:
     marks:
       - bf16operation
       - constant
-      - tensorsoncpu
   - name: torch.Tensor.contiguous.2
     op: torch.Tensor.contiguous
     inputs:
@@ -1676,7 +1588,6 @@ cases:
       code: attn_output = attn_output.reshape(*input_shape, -1).contiguous()'
     marks:
       - bf16operation
-      - tensorsoncpu
   - name: torch.nn.functional.linear.3
     op: torch.nn.functional.linear
     inputs:
@@ -1700,7 +1611,6 @@ cases:
     marks:
       - bf16operation
       - constant
-      - tensorsoncpu
   - name: torch.add.7
     op: torch.add
     inputs:
@@ -1722,7 +1632,6 @@ cases:
       code: hidden_states = residual + hidden_states'
     marks:
       - bf16operation
-      - tensorsoncpu
   - name: torch.nn.functional.linear.4
     op: torch.nn.functional.linear
     inputs:
@@ -1746,7 +1655,6 @@ cases:
     marks:
       - bf16operation
       - constant
-      - tensorsoncpu
   - name: torch.nn.functional.gelu.1
     op: torch.nn.functional.gelu
     inputs:
@@ -1760,7 +1668,6 @@ cases:
     description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/activations.py#L51 in forward, code: return self.act(input)'
     marks:
       - bf16operation
-      - tensorsoncpu
     kwmap:
       approximate: tanh
   - name: torch.mul.12
@@ -1784,7 +1691,6 @@ cases:
       code: down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))'
     marks:
       - bf16operation
-      - tensorsoncpu
   - name: torch.nn.functional.linear.5
     op: torch.nn.functional.linear
     inputs:
@@ -1808,7 +1714,6 @@ cases:
     marks:
       - bf16operation
       - constant
-      - tensorsoncpu
   - name: torch.Tensor.mul.1
     op: torch.Tensor.mul
     inputs:
@@ -1830,7 +1735,6 @@ cases:
       code: hidden_states *= self.layer_scalar'
     marks:
       - bf16operation
-      - tensorsoncpu
   - name: torch.nn.functional.scaled_dot_product_attention.2
     op: torch.nn.functional.scaled_dot_product_attention
     inputs:
@@ -1859,7 +1763,6 @@ cases:
       code: attn_output = torch.nn.functional.scaled_dot_product_attention('
     marks:
       - bf16operation
-      - tensorsoncpu
     kwmap:
       dropout_p: 0.0
       scale: 1.0
@@ -1892,7 +1795,6 @@ cases:
       code: attn_output = torch.nn.functional.scaled_dot_product_attention('
     marks:
       - bf16operation
-      - tensorsoncpu
     kwmap:
       dropout_p: 0.0
       scale: 1.0
@@ -1925,7 +1827,6 @@ cases:
       code: attn_output = torch.nn.functional.scaled_dot_product_attention('
     marks:
       - bf16operation
-      - tensorsoncpu
     kwmap:
       dropout_p: 0.0
       scale: 1.0
@@ -1958,7 +1859,6 @@ cases:
       code: attn_output = torch.nn.functional.scaled_dot_product_attention('
     marks:
       - bf16operation
-      - tensorsoncpu
     kwmap:
       dropout_p: 0.0
       scale: 1.0
@@ -1986,7 +1886,6 @@ cases:
     marks:
       - bf16operation
       - constant
-      - tensorsoncpu
   - name: torch.float.10
     op: torch.float
     inputs:
@@ -2001,7 +1900,6 @@ cases:
       code: normed_output = self._norm(hidden_states.float())'
     marks:
       - bf16operation
-      - tensorsoncpu
   - name: torch.pow.7
     op: torch.pow
     inputs:
@@ -2018,7 +1916,6 @@ cases:
     marks:
       - fp32operation
       - constant
-      - tensorsoncpu
   - name: torch.mean.4
     op: torch.mean
     inputs:
@@ -2035,7 +1932,6 @@ cases:
     marks:
       - fp32operation
       - constant
-      - tensorsoncpu
     kwmap:
       keepdim: true
   - name: torch.mul.13
@@ -2059,7 +1955,6 @@ cases:
       code: return hidden_states * torch.pow(mean_squared, -0.5)'
     marks:
       - fp32operation
-      - tensorsoncpu
   - name: torch.float.11
     op: torch.float
     inputs:
@@ -2074,7 +1969,6 @@ cases:
       code: normed_output = normed_output * self.weight.float()'
     marks:
       - bf16operation
-      - tensorsoncpu
   - name: torch.mul.14
     op: torch.mul
     inputs:
@@ -2096,7 +1990,6 @@ cases:
       code: normed_output = normed_output * self.weight.float()'
     marks:
       - fp32operation
-      - tensorsoncpu
   - name: torch.type_as.4
     op: torch.type_as
     inputs:
@@ -2119,7 +2012,6 @@ cases:
     marks:
       - fp32operation
       - bf16operation
-      - tensorsoncpu
   - name: torch.unsqueeze.2
     op: torch.unsqueeze
     inputs:
@@ -2136,7 +2028,6 @@ cases:
     marks:
       - bf16operation
       - constant
-      - tensorsoncpu
   - name: torch.mul.15
     op: torch.mul
     inputs:
@@ -2158,7 +2049,6 @@ cases:
       code: return (x * cos) + (rotate_half(x) * sin)'
     marks:
       - bf16operation
-      - tensorsoncpu
   - name: torch.getitem.7
     op: torch.getitem
     inputs:
@@ -2175,7 +2065,6 @@ cases:
     marks:
       - bf16operation
       - constant
-      - tensorsoncpu
   - name: torch.neg.3
     op: torch.neg
     inputs:
@@ -2190,7 +2079,6 @@ cases:
       code: return torch.cat((-x2, x1), dim=-1)'
     marks:
       - bf16operation
-      - tensorsoncpu
   - name: torch.cat.5
     op: torch.cat
     inputs:
@@ -2212,7 +2100,6 @@ cases:
     marks:
       - bf16operation
       - constant
-      - tensorsoncpu
     kwmap:
       dim: -1
   - name: torch.add.8
@@ -2236,7 +2123,6 @@ cases:
       code: return (x * cos) + (rotate_half(x) * sin)'
     marks:
       - bf16operation
-      - tensorsoncpu
   - name: torch.transpose.6
     op: torch.transpose
     inputs:
@@ -2254,7 +2140,6 @@ cases:
     marks:
       - bf16operation
       - constant
-      - tensorsoncpu
   - name: torch.nn.functional.linear.7
     op: torch.nn.functional.linear
     inputs:
@@ -2278,7 +2163,6 @@ cases:
     marks:
       - bf16operation
       - constant
-      - tensorsoncpu
   - name: torch.float.12
     op: torch.float
     inputs:
@@ -2293,7 +2177,6 @@ cases:
       code: normed_output = self._norm(hidden_states.float())'
     marks:
       - bf16operation
-      - tensorsoncpu
   - name: torch.pow.8
     op: torch.pow
     inputs:
@@ -2310,7 +2193,6 @@ cases:
     marks:
       - fp32operation
       - constant
-      - tensorsoncpu
   - name: torch.mean.5
     op: torch.mean
     inputs:
@@ -2327,7 +2209,6 @@ cases:
     marks:
       - fp32operation
       - constant
-      - tensorsoncpu
     kwmap:
       keepdim: true
   - name: torch.add.9
@@ -2346,7 +2227,6 @@ cases:
     marks:
       - fp32operation
       - constant
-      - tensorsoncpu
   - name: torch.pow.9
     op: torch.pow
     inputs:
@@ -2363,7 +2243,6 @@ cases:
     marks:
       - fp32operation
       - constant
-      - tensorsoncpu
   - name: torch.mul.16
     op: torch.mul
     inputs:
@@ -2385,7 +2264,6 @@ cases:
       code: return hidden_states * torch.pow(mean_squared, -0.5)'
     marks:
       - fp32operation
-      - tensorsoncpu
   - name: torch.mul.17
     op: torch.mul
     inputs:
@@ -2407,7 +2285,6 @@ cases:
       code: normed_output = normed_output * self.weight.float()'
     marks:
       - fp32operation
-      - tensorsoncpu
   - name: torch.type_as.5
     op: torch.type_as
     inputs:
@@ -2430,7 +2307,6 @@ cases:
     marks:
       - fp32operation
       - bf16operation
-      - tensorsoncpu
   - name: torch.mul.18
     op: torch.mul
     inputs:
@@ -2452,7 +2328,6 @@ cases:
       code: return (x * cos) + (rotate_half(x) * sin)'
     marks:
       - bf16operation
-      - tensorsoncpu
   - name: torch.getitem.8
     op: torch.getitem
     inputs:
@@ -2469,7 +2344,6 @@ cases:
     marks:
       - bf16operation
       - constant
-      - tensorsoncpu
   - name: torch.neg.4
     op: torch.neg
     inputs:
@@ -2484,7 +2358,6 @@ cases:
       code: return torch.cat((-x2, x1), dim=-1)'
     marks:
       - bf16operation
-      - tensorsoncpu
   - name: torch.cat.6
     op: torch.cat
     inputs:
@@ -2506,7 +2379,6 @@ cases:
     marks:
       - bf16operation
       - constant
-      - tensorsoncpu
     kwmap:
       dim: -1
   - name: torch.add.10
@@ -2530,7 +2402,6 @@ cases:
       code: return (x * cos) + (rotate_half(x) * sin)'
     marks:
       - bf16operation
-      - tensorsoncpu
   - name: torch.transpose.7
     op: torch.transpose
     inputs:
@@ -2548,7 +2419,6 @@ cases:
     marks:
       - bf16operation
       - constant
-      - tensorsoncpu
   - name: torch.index_copy_.2
     op: torch.index_copy_
     inputs:
@@ -2581,7 +2451,6 @@ cases:
     marks:
       - bf16operation
       - constant
-      - tensorsoncpu
   - name: torch.getitem.9
     op: torch.getitem
     inputs:
@@ -2598,7 +2467,6 @@ cases:
     marks:
       - bf16operation
       - constant
-      - tensorsoncpu
   - name: torch.getitem.10
     op: torch.getitem
     inputs:
@@ -2615,7 +2483,6 @@ cases:
     marks:
       - bf16operation
       - constant
-      - tensorsoncpu
   - name: torch.nn.functional.scaled_dot_product_attention.6
     op: torch.nn.functional.scaled_dot_product_attention
     inputs:
@@ -2644,7 +2511,6 @@ cases:
       code: attn_output = torch.nn.functional.scaled_dot_product_attention('
     marks:
       - bf16operation
-      - tensorsoncpu
     kwmap:
       dropout_p: 0.0
       scale: 1.0
@@ -2666,7 +2532,6 @@ cases:
     marks:
       - bf16operation
       - constant
-      - tensorsoncpu
   - name: torch.Tensor.contiguous.3
     op: torch.Tensor.contiguous
     inputs:
@@ -2681,7 +2546,6 @@ cases:
       code: attn_output = attn_output.transpose(1, 2).contiguous()'
     marks:
       - bf16operation
-      - tensorsoncpu
   - name: torch.reshape.3
     op: torch.reshape
     inputs:
@@ -2698,7 +2562,6 @@ cases:
     marks:
       - bf16operation
       - constant
-      - tensorsoncpu
   - name: torch.Tensor.contiguous.4
     op: torch.Tensor.contiguous
     inputs:
@@ -2713,7 +2576,6 @@ cases:
       code: attn_output = attn_output.reshape(*input_shape, -1).contiguous()'
     marks:
       - bf16operation
-      - tensorsoncpu
   - name: torch.nn.functional.linear.8
     op: torch.nn.functional.linear
     inputs:
@@ -2737,7 +2599,6 @@ cases:
     marks:
       - bf16operation
       - constant
-      - tensorsoncpu
   - name: torch.nn.functional.scaled_dot_product_attention.7
     op: torch.nn.functional.scaled_dot_product_attention
     inputs:
@@ -2766,7 +2627,6 @@ cases:
       code: attn_output = torch.nn.functional.scaled_dot_product_attention('
     marks:
       - bf16operation
-      - tensorsoncpu
     kwmap:
       dropout_p: 0.0
       scale: 1.0
@@ -2799,7 +2659,6 @@ cases:
       code: attn_output = torch.nn.functional.scaled_dot_product_attention('
     marks:
       - bf16operation
-      - tensorsoncpu
     kwmap:
       dropout_p: 0.0
       scale: 1.0
@@ -2820,7 +2679,6 @@ cases:
     marks:
       - bf16operation
       - constant
-      - tensorsoncpu
   - name: torch.nn.functional.linear.9
     op: torch.nn.functional.linear
     inputs:
@@ -2844,7 +2702,6 @@ cases:
     marks:
       - bf16operation
       - constant
-      - tensorsoncpu
   - name: torch.truediv.1
     op: torch.truediv
     inputs:
@@ -2861,7 +2718,6 @@ cases:
     marks:
       - bf16operation
       - constant
-      - tensorsoncpu
   - name: torch.tanh.1
     op: torch.tanh
     inputs:
@@ -2876,7 +2732,6 @@ cases:
       code: logits = torch.tanh(logits)'
     marks:
       - bf16operation
-      - tensorsoncpu
   - name: torch.mul.19
     op: torch.mul
     inputs:
@@ -2893,7 +2748,6 @@ cases:
     marks:
       - bf16operation
       - constant
-      - tensorsoncpu
   - name: torch.eq.2
     op: torch.eq
     inputs:
@@ -2911,7 +2765,6 @@ cases:
       code: special_image_mask = input_ids == self.config.image_token_id'
     marks:
       - constant
-      - tensorsoncpu
   - name: torch.or_.2
     op: torch.or_
     inputs:
@@ -2929,7 +2782,6 @@ cases:
           device: cuda
     description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L1034 in forward,
       code: multimodal_mask = image_mask | video_mask | audio_mask'
-    marks: tensorsoncpu
   - name: torch.clone.2
     op: torch.clone
     inputs:
@@ -2944,7 +2796,6 @@ cases:
             high: 1000
     description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L1039 in forward,
       code: llm_input_ids = input_ids.clone()'
-    marks: tensorsoncpu
   - name: torch.where.2
     op: torch.where
     inputs:
@@ -2968,7 +2819,6 @@ cases:
       code: llm_input_ids = torch.where(multimodal_mask, self.config.text_config.pad_token_id, llm_input_ids)'
     marks:
       - constant
-      - tensorsoncpu
   - name: torch.nn.functional.embedding.2
     op: torch.nn.functional.embedding
     inputs:
@@ -2998,7 +2848,6 @@ cases:
     marks:
       - bf16operation
       - constant
-      - tensorsoncpu
   - name: torch.mul.20
     op: torch.mul
     inputs:
@@ -3020,7 +2869,6 @@ cases:
       code: return super().forward(input_ids) * self.embed_scale.to(self.weight.dtype)'
     marks:
       - bf16operation
-      - tensorsoncpu
   - name: torch.getitem.12
     op: torch.getitem
     inputs:
@@ -3038,7 +2886,6 @@ cases:
       code: position_ids_expanded = position_ids[:, None, :].float()'
     marks:
       - constant
-      - tensorsoncpu
   - name: torch.float.13
     op: torch.float
     inputs:
@@ -3053,7 +2900,6 @@ cases:
             high: 1000
     description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L274 in forward,
       code: position_ids_expanded = position_ids[:, None, :].float()'
-    marks: tensorsoncpu
   - name: torch.float.14
     op: torch.float
     inputs:
@@ -3068,7 +2914,6 @@ cases:
       code: freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)'
     marks:
       - fp32operation
-      - tensorsoncpu
   - name: torch.matmul.3
     op: torch.matmul
     inputs:
@@ -3090,7 +2935,6 @@ cases:
       code: freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)'
     marks:
       - fp32operation
-      - tensorsoncpu
   - name: torch.transpose.9
     op: torch.transpose
     inputs:
@@ -3108,7 +2952,6 @@ cases:
     marks:
       - fp32operation
       - constant
-      - tensorsoncpu
   - name: torch.cat.7
     op: torch.cat
     inputs:
@@ -3130,7 +2973,6 @@ cases:
     marks:
       - fp32operation
       - constant
-      - tensorsoncpu
     kwmap:
       dim: -1
   - name: torch.cos.3
@@ -3147,7 +2989,6 @@ cases:
       code: cos = emb.cos() * attention_scaling'
     marks:
       - fp32operation
-      - tensorsoncpu
   - name: torch.mul.21
     op: torch.mul
     inputs:
@@ -3164,7 +3005,6 @@ cases:
     marks:
       - fp32operation
       - constant
-      - tensorsoncpu
   - name: torch.sin.3
     op: torch.sin
     inputs:
@@ -3179,7 +3019,6 @@ cases:
       code: sin = emb.sin() * attention_scaling'
     marks:
       - fp32operation
-      - tensorsoncpu
   - name: torch.to.7
     op: torch.to
     inputs:
@@ -3194,7 +3033,6 @@ cases:
       code: return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)'
     marks:
       - fp32operation
-      - tensorsoncpu
     kwmap:
       dtype: torch.bfloat16
   - name: torch.matmul.4
@@ -3218,7 +3056,6 @@ cases:
       code: freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)'
     marks:
       - fp32operation
-      - tensorsoncpu
   - name: torch.transpose.10
     op: torch.transpose
     inputs:
@@ -3236,7 +3073,6 @@ cases:
     marks:
       - fp32operation
       - constant
-      - tensorsoncpu
   - name: torch.cat.8
     op: torch.cat
     inputs:
@@ -3258,7 +3094,6 @@ cases:
     marks:
       - fp32operation
       - constant
-      - tensorsoncpu
     kwmap:
       dim: -1
   - name: torch.cos.4
@@ -3275,7 +3110,6 @@ cases:
       code: cos = emb.cos() * attention_scaling'
     marks:
       - fp32operation
-      - tensorsoncpu
   - name: torch.mul.22
     op: torch.mul
     inputs:
@@ -3292,7 +3126,6 @@ cases:
     marks:
       - fp32operation
       - constant
-      - tensorsoncpu
   - name: torch.sin.4
     op: torch.sin
     inputs:
@@ -3307,7 +3140,6 @@ cases:
       code: sin = emb.sin() * attention_scaling'
     marks:
       - fp32operation
-      - tensorsoncpu
   - name: torch.to.8
     op: torch.to
     inputs:
@@ -3322,7 +3154,6 @@ cases:
       code: return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)'
     marks:
       - fp32operation
-      - tensorsoncpu
     kwmap:
       dtype: torch.bfloat16
   - name: torch.float.15
@@ -3339,7 +3170,6 @@ cases:
       code: normed_output = self._norm(hidden_states.float())'
     marks:
       - bf16operation
-      - tensorsoncpu
   - name: torch.pow.10
     op: torch.pow
     inputs:
@@ -3356,7 +3186,6 @@ cases:
     marks:
       - fp32operation
       - constant
-      - tensorsoncpu
   - name: torch.mean.6
     op: torch.mean
     inputs:
@@ -3373,7 +3202,6 @@ cases:
     marks:
       - fp32operation
       - constant
-      - tensorsoncpu
     kwmap:
       keepdim: true
   - name: torch.add.11
@@ -3392,7 +3220,6 @@ cases:
     marks:
       - fp32operation
       - constant
-      - tensorsoncpu
   - name: torch.pow.11
     op: torch.pow
     inputs:
@@ -3409,7 +3236,6 @@ cases:
     marks:
       - fp32operation
       - constant
-      - tensorsoncpu
   - name: torch.mul.23
     op: torch.mul
     inputs:
@@ -3431,7 +3257,6 @@ cases:
       code: return hidden_states * torch.pow(mean_squared, -0.5)'
     marks:
       - fp32operation
-      - tensorsoncpu
   - name: torch.mul.24
     op: torch.mul
     inputs:
@@ -3453,7 +3278,6 @@ cases:
       code: normed_output = normed_output * self.weight.float()'
     marks:
       - fp32operation
-      - tensorsoncpu
   - name: torch.type_as.6
     op: torch.type_as
     inputs:
@@ -3476,7 +3300,6 @@ cases:
     marks:
       - fp32operation
       - bf16operation
-      - tensorsoncpu
   - name: torch.getitem.13
     op: torch.getitem
     inputs:
@@ -3493,7 +3316,6 @@ cases:
     marks:
       - bf16operation
       - constant
-      - tensorsoncpu
   - name: torch.nn.functional.linear.10
     op: torch.nn.functional.linear
     inputs:
@@ -3517,4 +3339,3 @@ cases:
     marks:
       - bf16operation
       - constant
-      - tensorsoncpu

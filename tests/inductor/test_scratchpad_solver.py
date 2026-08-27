@@ -51,7 +51,7 @@ except ImportError:
 from torch_spyre._inductor.scratchpad.firstfit_bestfit_solver import (
     BestFitLayoutSolver,
     FirstFitLayoutSolver,
-    _assert_in_place_relationships,
+    _check_in_place_relationships,
     _topological_sort,
 )
 from torch_spyre._inductor.scratchpad.simulated_annealing import (
@@ -300,17 +300,15 @@ class BaseLayoutSolverTests:
         # over data nothing consumes.
         #
         # The two solver families check this at different points -- the gap-based
-        # and ILP solvers in ``_assert_in_place_relationships``, the
+        # and ILP solvers in ``_check_in_place_relationships``, the
         # permutation-based ones (which simulated annealing drives) in
         # ``_compute_inplace_partners`` -- and they share no base class, so
         # running one case against all of them is what pins the coverage.
-        # Matched on the message: ``solve`` also asserts layout legality, and a
+        # Matched on the message: ``solve`` also checks layout legality, and a
         # bare ``assertRaises`` would accept that unrelated failure as a pass.
         parent = self.make_buffer("parent", 40, [0])
         child = self.make_buffer("child", 40, [0, 2], in_place_parents=["parent"])
-        with self.assertRaisesRegex(
-            AssertionError, "computed buffer that is never read"
-        ):
+        with self.assertRaisesRegex(ValueError, "computed buffer that is never read"):
             self.solve([parent, child], size=120)
 
     def test_single_use_in_place_parent_allowed_for_an_input(self):
@@ -598,23 +596,23 @@ class BaseLayoutSolverTests:
             size=100,
         )
 
-    def test_assert_rejects_wrong_end_time(self):
+    def test_rejects_wrong_end_time(self):
         p = LifetimeBoundBuffer("P", 20, [0, 4])
         c = LifetimeBoundBuffer(
             "C", 15, [3, 8], in_place_parents=["P"]
         )  # uses[0]=3, need P.uses[-1]+1==4
-        with self.assertRaises(AssertionError):
-            _assert_in_place_relationships([p, c])
+        with self.assertRaises(ValueError):
+            _check_in_place_relationships([p, c])
 
-    def test_assert_rejects_oversized_child(self):
+    def test_rejects_oversized_child(self):
         p = LifetimeBoundBuffer("P", 10, [0, 4])
         c = LifetimeBoundBuffer(
             "C", 15, [4, 8], in_place_parents=["P"]
         )  # child larger than parent
-        with self.assertRaises(AssertionError):
-            _assert_in_place_relationships([p, c])
+        with self.assertRaises(ValueError):
+            _check_in_place_relationships([p, c])
 
-    def test_assert_rejects_write_only_computed_parent(self):
+    def test_rejects_write_only_computed_parent(self):
         # P's single use is its write, so it is never read: C would take over
         # storage holding data nothing consumes, and the two would come alive on
         # the same tick. P.end_time == C.start_time + 1 still holds, so only the
@@ -622,16 +620,16 @@ class BaseLayoutSolverTests:
         p = LifetimeBoundBuffer("P", 20, [3])
         c = LifetimeBoundBuffer("C", 15, [3, 8], in_place_parents=["P"])
         self.assertEqual(p.end_time, c.start_time + 1)
-        with self.assertRaises(AssertionError):
-            _assert_in_place_relationships([p, c])
+        with self.assertRaises(ValueError):
+            _check_in_place_relationships([p, c])
 
-    def test_assert_allows_single_use_input_parent(self):
+    def test_allows_single_use_input_parent(self):
         # A graph input's single use is a read, so handing its storage over is
         # legitimate; first_use_is_read is what distinguishes it from the
         # computed buffer above.
         p = LifetimeBoundBuffer("P", 20, [3], first_use_is_read=True)
         c = LifetimeBoundBuffer("C", 15, [3, 8], in_place_parents=["P"])
-        _assert_in_place_relationships([p, c])
+        _check_in_place_relationships([p, c])
 
     def test_uses_must_be_strictly_increasing(self):
         # One distinct index per accessing op. A repeat would describe a buffer
@@ -678,14 +676,14 @@ class BaseLayoutSolverTests:
         # message for the same reason.
         p = LifetimeBoundBuffer("P", 20, [2, 3])
         c = LifetimeBoundBuffer("C", 15, [3, 8], in_place_parents=["P"])
-        _assert_in_place_relationships([p, c])  # baseline: accepted
+        _check_in_place_relationships([p, c])  # baseline: accepted
         p.uses = [3, 3]  # bypasses __post_init__
         self.assertEqual(p.end_time, c.start_time + 1)  # geometry still holds
         self.assertEqual(p.read_count, 1)  # read_count is fooled...
         with self.assertRaisesRegex(  # ...the invariant is not
-            AssertionError, "computed buffer that is never read"
+            ValueError, "computed buffer that is never read"
         ):
-            _assert_in_place_relationships([p, c])
+            _check_in_place_relationships([p, c])
 
 
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
@@ -1159,7 +1157,7 @@ class TestCpSatJointDivision(JointDivisionSolverTests, TestCase):
         # ``gp`` has to be an input clone (``first_use_is_read``) rather than a
         # computed buffer: a computed buffer's lone use is its write, so it is
         # never read and cannot hand storage over at all -- forbidden by
-        # ``_assert_in_place_relationships``. A clone read exactly once is the
+        # ``_check_in_place_relationships``. A clone read exactly once is the
         # real shape of a single-use in-place parent. The flag does reach
         # ``spill_cost`` -- it is read there unconditionally -- but cancels: it
         # raises ``read_count`` by one and is discounted by one, so the cost is

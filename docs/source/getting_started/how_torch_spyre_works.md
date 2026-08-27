@@ -723,8 +723,11 @@ in proof-of-concept form. See [Scratchpad planning](../compiler/scratchpad_plann
 collectives (`scatter`, `reduce_scatter`, `alltoall`). See
 [Runtime — Multi-card and distributed execution](../runtime/index.md).
 
-**Profiling.** `torch.profiler` integration via `ProfilerActivity.PrivateUse1` is implemented
-in the in-progress `SpyreActivityProfiler` Kineto bridge. The memory APIs
+**Profiling.** The `SpyreActivityProfiler` Kineto bridge for `ProfilerActivity.PrivateUse1`
+device-side timing is in the tree (`torch_spyre/csrc/profiler/`) and builds by default. It uses
+upstream Kineto, which integrates with `libaiupti` through the PrivateUse1 profiler registration
+macros, so `torch.profiler` captures device-side kernel and transfer events without a separate
+wheel. The memory APIs
 (`torch.spyre.memory.memory_allocated` and friends) are available today, and
 `aiu-trace-analyzer` post-processes traces with PT-utilisation metrics. The
 [profiling RFC 0601](https://github.com/torch-spyre/rfcs/blob/main/0601-SpyreProfilingToolkit/0601-SpyreProfilingToolkitRFC.md)
@@ -776,7 +779,7 @@ used. The tables are organized by the challenge that each hook addresses.
 | `SpyreCCLBackend` | `c10d::Backend` (registered as `"spyreccl"`) | Multi-card collective communication via `torch.distributed` | `init_process_group(backend="spyreccl")`. Implements synchronous `send`, `recv`, `broadcast`, `barrier`, `gather`, `allgather`, `reduce`, `allreduce`. Reuses the rank's flex runtime instance and default stream. |
 
 Initialization is lazy and thread-safe. Importing `torch_spyre` registers the device name and
-module. `flex::initializeRuntime()` starts only on the first device use.
+module. `flex::RuntimeContext::create()` starts only on the first device use.
 
 ### Challenge 2: tiled tensor layout (FixedTiledLayout)
 
@@ -816,7 +819,7 @@ would require invasive core changes. Deferring to codegen is too late.
 | `torch.spyre.memory.*` | `torch.accelerator.memory` re-export | Per-device memory queries | `memory_allocated`, `max_memory_allocated`, `reset_peak_memory_stats`, `memory_stats` — all available today. |
 | `aiu-smi` | Standalone CLI / sampler | Power, thermal, PT-utilisation, DDR / PCIe / RDMA bandwidth | Available in PF and VF mode (Z/LinuxONE rollout in progress for VF). Public release tracked in [#1335](https://github.com/torch-spyre/torch-spyre/issues/1335). |
 | `aiu-trace-analyzer` | Trace post-processor | Adds derived metrics (PT-Util %) to Chrome / Perfetto traces | Available with some known gaps. |
-| `SpyreActivityProfiler` (Kineto bridge) | `ProfilerActivity.PrivateUse1` | Device-side kernel timing into `torch.profiler` traces | In progress in [#1856](https://github.com/torch-spyre/torch-spyre/pull/1856). The full design is in [profiling RFC 0601](https://github.com/torch-spyre/rfcs/blob/main/0601-SpyreProfilingToolkit/0601-SpyreProfilingToolkitRFC.md). |
+| `SpyreActivityProfiler` (Kineto bridge) | `ProfilerActivity.PrivateUse1` | Device-side kernel timing into `torch.profiler` traces | Merged in [#1856](https://github.com/torch-spyre/torch-spyre/pull/1856) and built by default via upstream Kineto and `libaiupti`. The full design is in [profiling RFC 0601](https://github.com/torch-spyre/rfcs/blob/main/0601-SpyreProfilingToolkit/0601-SpyreProfilingToolkitRFC.md). |
 
 ---
 

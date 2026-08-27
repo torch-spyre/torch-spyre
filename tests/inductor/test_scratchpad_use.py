@@ -1509,6 +1509,71 @@ class TestInplaceEdgeGate(unittest.TestCase):
                 )
 
 
+class TestInPlaceMutationCoOptimizing(BaseTestScratchpadUsage):
+    """Plain in-place mutations compile under the co-optimizing greedy path
+    (issue #3940).
+
+    With ``co_optimizing_lx_planning=True`` and the default ``greedy`` solver,
+    ``ExhaustiveSearchSolver`` runs with ``prune=True``, so
+    ``_split_fits_sticks`` calls ``_output_stride_to_device_size`` on every op.
+    An op whose buffer is mutated in place carries
+    ``MutationLayoutSHOULDREMOVE``, which has no ``device_layout`` -- the
+    helper must unwrap it via ``real_layout()``. Sliced mutations
+    (``x[:, 32:96] = ...``) never reach the helper because the
+    offset-mutation component routes them to a fixed division first, which is
+    exactly what masked this; hence the plain-mutation cases here."""
+
+    def _compile_and_compare(self, fn, args, cpu_args=None):
+        if cpu_args is None:
+            cpu_args = tuple(t.to("cpu") for t in args)
+        cpu_result = fn(*cpu_args)
+        with ts_inductor_config.patch(
+            lx_planning=True,
+            layout_solver="greedy",
+            co_optimizing_lx_planning=True,
+        ):
+            device_result = torch.compile(fn, fullgraph=True)(*args).to("cpu")
+        torch.testing.assert_close(device_result, cpu_result, atol=1e-2, rtol=1e-3)
+
+    def test_inplace_add(self):
+        def fn(dst, a):
+            dst.add_(a)
+            return dst * 2.0
+
+        self._compile_and_compare(
+            fn, (self.rand_device((64, 256)), self.rand_device((64, 256)))
+        )
+
+    def test_inplace_copy(self):
+        def fn(dst, a, b):
+            dst.copy_(a + b)
+            return dst
+
+        self._compile_and_compare(
+            fn,
+            (
+                torch.zeros(64, 256, dtype=torch.float16, device="spyre"),
+                self.rand_device((64, 256)),
+                self.rand_device((64, 256)),
+            ),
+        )
+
+    def test_inplace_index_copy(self):
+        def fn(cache, idx, v):
+            cache.index_copy_(2, idx, v)
+            return cache
+
+        cache = torch.zeros(1, 8, 128, 64, dtype=torch.float16, device="spyre")
+        idx = torch.tensor([3], dtype=torch.int32, device="spyre")
+        v = self.rand_device((1, 8, 1, 64))
+        # CPU index_copy_ requires an int64 index; Spyre wants int32.
+        self._compile_and_compare(
+            fn,
+            (cache, idx, v),
+            cpu_args=(cache.to("cpu"), idx.to("cpu").long(), v.to("cpu")),
+        )
+
+
 class TestBoundaryCloneInPlace(BaseTestScratchpadUsage):
     """In-place reuse of boundary-clone buffers in the greedy build path (#3212).
 
@@ -1917,7 +1982,11 @@ class TestBoundaryCloneInPlace(BaseTestScratchpadUsage):
                 }
 
         with self.pre_scheduling_iterating_pass(visit):
-            with ts_inductor_config.patch(lx_planning=True):
+            # In-place reuse of boundary-clone buffers is a paired-buffer feature
+            # of the greedy build path (only the greedy solver sets
+            # supports_paired_buffers). Pin it so the slot-sharing assertion holds
+            # regardless of the default layout_solver.
+            with ts_inductor_config.patch(lx_planning=True, layout_solver="greedy"):
                 result = torch.compile(fn, fullgraph=True)(x).to("cpu")
 
         # Group LX-resident buffers by address; a shared address == in-place reuse.

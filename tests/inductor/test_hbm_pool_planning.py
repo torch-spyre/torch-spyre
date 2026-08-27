@@ -494,6 +494,81 @@ class TestHbmPoolPlanningPerBundle(unittest.TestCase):
         self.assertNotIn("hbm_pool", target_buf.get_layout().allocation)
         self.assertNotIn("hbm_pool", alias_buf.get_layout().allocation)
 
+    def test_aliased_buffer_within_same_bundle_shares_one_merged_live_range(self):
+        """Regression test for issue #3980: two buffer *names* that share
+        the exact same FixedTiledLayout.allocation dict object -- as
+        enforce_indirect_access_layout.py's _insert_mutation_relayout_copy
+        produces for a non-compliant scatter destination, via
+        propagate_layouts.py's propagate_mutation_layouts resolving
+        MutationLayoutSHOULDREMOVE.real_layout() to the *same* layout
+        instance as its copy-in buffer's -- are truly one physical storage
+        location. Pool-allocating them safely (rather than excluding them
+        outright, which would regress coarse_tiling's pervasive use of
+        mutation buffers) requires treating their live range as the union
+        of both names' individual ranges, not each in isolation.
+
+        Before the fix, "target" and "alias" (sharing one allocation dict)
+        were each given their own live range from their own reads/writes
+        and separately allocated -- two distinct offsets written into the
+        one shared dict, the second clobbering the first. The fix merges
+        alias-group members into one (min start, max end) range and
+        allocates once per group.
+
+        This test isolates the *merge* itself (not just the single-write
+        aliasing, which would trivially "pass" even unfixed since both
+        names share one dict): "target" is read late (read_target, step 3)
+        while "alias" is written+read early (steps 1-2). "other" is written
+        and read in between (step 2's write, step 2's read) -- overlapping
+        alias's naive [1,2] range but *not* target's own naive [0,0] range.
+        Only the merged [0,3] range correctly keeps "other" from reusing
+        target/alias's block while target is still live.
+        """
+        target = _make_ftl_buffer("target", host_size=(64,))
+        write_target = _make_snode_with_rw("write_target", writes=["target"], reads=[])
+
+        _make_ftl_buffer_aliased("alias", alias_of=target, host_size=(64,))
+        write_alias = _make_snode_with_rw("write_alias", writes=["alias"], reads=[])
+        read_alias = _make_snode_with_rw("read_alias", writes=[], reads=["alias"])
+
+        _make_ftl_buffer("other", host_size=(64,))
+        write_other = _make_snode_with_rw("write_other", writes=["other"], reads=[])
+        read_other = _make_snode_with_rw("read_other", writes=[], reads=["other"])
+
+        read_target = _make_snode_with_rw("read_target", writes=[], reads=["target"])
+
+        # Steps: 0=write_target, 1=write_alias, 2=[read_alias, write_other,
+        # read_other] (fused into one timestep), 3=read_target.
+        step2 = FusedSchedulerNode(MagicMock(), [read_alias, write_other, read_other])
+        bundle = FusedSchedulerNode(
+            MagicMock(), [write_target, write_alias, step2, read_target]
+        )
+
+        hbm_pool_planning([bundle])
+
+        target_buf = V.graph.get_buffer("target")
+        alias_buf = V.graph.get_buffer("alias")
+        other_buf = V.graph.get_buffer("other")
+
+        # Both aliased names are pool-eligible now (same-bundle aliasing no
+        # longer bars pool allocation outright)...
+        self.assertIn("hbm_pool", target_buf.get_layout().allocation)
+        self.assertIn("hbm_pool", alias_buf.get_layout().allocation)
+        self.assertIn("hbm_pool", other_buf.get_layout().allocation)
+        # ...sharing the exact same offset, since they are one physical
+        # storage location (same underlying allocation dict).
+        self.assertEqual(
+            target_buf.get_layout().allocation["hbm_pool"],
+            alias_buf.get_layout().allocation["hbm_pool"],
+        )
+        # "other" must not reuse target/alias's block: with the naive
+        # (unmerged) per-name ranges, alias's range [1, 2] would end before
+        # other's start [2], wrongly freeing the block for reuse while
+        # target (whose own real read is at step 3) still needs it.
+        self.assertNotEqual(
+            target_buf.get_layout().allocation["hbm_pool"],
+            other_buf.get_layout().allocation["hbm_pool"],
+        )
+
     def test_buffer_that_overflows_pool_falls_back_to_standalone_hbm(self):
         """When MAX_POOL_SIZE_BYTES is too small to hold every pool-eligible
         buffer, the ones that fit get an hbm_pool allocation and the

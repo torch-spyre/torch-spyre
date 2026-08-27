@@ -14,6 +14,7 @@
 
 import functools
 import math
+import sys
 import pytest
 import unittest
 import torch
@@ -34,7 +35,7 @@ from utils_inductor import (
 import utils_inductor
 from unittest import mock
 from torch_spyre._inductor import config as inductor_config
-from torch._inductor.utils import run_and_get_code
+from torch._inductor.utils import fresh_inductor_cache, run_and_get_code
 from torch_spyre._inductor.dtype_ops import DtypeOpTable
 from torch_spyre._inductor.constants import IDENTITY_OP
 
@@ -1299,6 +1300,46 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     unique_randn_along_dim((256, 64), dim=0),
                     128,
                     0,
+                ),
+            },
+        },
+        ("test_keep_by_index", "test_keep_by_index_cpu"): {
+            "param_sets": {
+                "2d_dim0": (
+                    unique_randn_along_dim((67, 256), dim=0),
+                    8,
+                    0,
+                    -1.0,
+                ),
+                "2d_dim1": (
+                    unique_randn_along_dim((256, 64), dim=1),
+                    12,
+                    1,
+                    -1.0,
+                ),
+                "3d_dim0": (
+                    unique_randn_along_dim((67, 71, 256), dim=0),
+                    2,
+                    0,
+                    0.0,
+                ),
+                "4d_dim0": (
+                    unique_randn_along_dim((6, 17, 7, 64), dim=0),
+                    2,
+                    0,
+                    -1.0,
+                ),
+                "4d_dim2": (
+                    unique_randn_along_dim((6, 17, 64, 64), dim=2),
+                    16,
+                    2,
+                    0.0,
+                ),
+                "4d_dim3": (
+                    unique_randn_along_dim((6, 17, 4, 128), dim=3),
+                    4,
+                    3,
+                    -1.0,
                 ),
             },
         },
@@ -6121,6 +6162,49 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "spyre",
             )
 
+    def test_keep_by_index_cpu(self, x, k: int, dim: int, fill_value: float):
+        _, indices = torch.topk(x, k, dim=dim, largest=True)
+
+        def fn(x, indices):
+            return torch.ops.spyre.keep_by_index(x, indices, dim, fill_value)
+
+        compiled_fn = torch.compile(fn)
+        result_spyre = compiled_fn(
+            x.to("spyre"), indices.to(torch.float16).to("spyre")
+        ).cpu()
+        expected = fn(x, indices)
+
+        torch.testing.assert_close(result_spyre, expected, atol=0.1, rtol=0.1)
+
+    def test_keep_by_index_moe_router(self):
+        """Repro: keep_by_index router mask -> SpyreReduction stick clash.
+
+        Isolates the blocker from Gemma-4 MoE prefill router with keep_by_index.
+        The reduction on k-dimension needs to find the indices read (which has k)
+        instead of the values read to encode splits correctly.
+        Real shapes: T=64 tokens, E=128 experts, K=8 top-K.
+        """
+        T, E, K = 64, 128, 8
+
+        def keep_by_index_tail(probs, sel):
+            mask = torch.ops.spyre.keep_by_index(probs, sel, -1, 0.0)
+            return mask / mask.sum(-1, keepdim=True)
+
+        probs = torch.rand(T, E, dtype=torch.float16)
+        sel = (torch.rand(T, K) * E).floor().to(torch.float16)
+
+        probs_dev = probs.to("spyre")
+        sel_dev = sel.to("spyre")
+
+        out = torch.compile(keep_by_index_tail, dynamic=False)(probs_dev, sel_dev)
+        out_c = out.cpu()
+
+        ref_mask = torch.ops.spyre.keep_by_index(probs, sel, -1, 0.0)
+        ref = ref_mask / ref_mask.sum(-1, keepdim=True)
+
+        assert out.shape == (T, E)
+        torch.testing.assert_close(out_c.float(), ref.float(), atol=1e-2, rtol=1e-2)
+
     def test_min_tuple_output_keepdim0(self):
         x = unique_randn_along_dim((5, 7), dim=1)
         self.compare_with_cpu(
@@ -7134,6 +7218,103 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         assert torch.isfinite(actual).all() and cosine >= 0.99, (
             f"cosine={cosine:.8f} max_abs={(actual - expected).abs().max().item():.8f}"
         )
+
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+    def test_sdpa_bf16_gqa_decode_query_is_canonicalized(self):
+        """Decode SDPA must canonicalize a physically heads-inner query."""
+        num_heads, num_kv_heads, head_dim = 16, 1, 512
+        generator = torch.Generator().manual_seed(1337)
+        query = (
+            torch.randn(
+                (1, num_heads, 1, head_dim),
+                dtype=torch.bfloat16,
+                generator=generator,
+            )
+            * 0.1
+        )
+        key = (
+            torch.randn(
+                (1, num_kv_heads, 64, head_dim),
+                dtype=torch.bfloat16,
+                generator=generator,
+            )
+            * 0.1
+        )
+        value = (
+            torch.randn(
+                (1, num_kv_heads, 64, head_dim),
+                dtype=torch.bfloat16,
+                generator=generator,
+            )
+            * 0.1
+        )
+        mask = torch.zeros((1, 1, 1, 64), dtype=torch.bfloat16)
+
+        def fn(query, key, value, mask):
+            return F.scaled_dot_product_attention(
+                query,
+                key,
+                value,
+                attn_mask=mask,
+                dropout_p=0.0,
+                scale=1 / head_dim**0.5,
+                enable_gqa=True,
+            )
+
+        # This is the exact device tiling emitted for Gemma's in-graph RoPE
+        # query at decode: logical [B, H, 1, D], but heads nested after the
+        # stick axis.  Construct it explicitly so the regression does not
+        # depend on hash-sensitive LX allocation decisions.
+        layout_type = sys.modules["torch_spyre._C"].SpyreTensorLayout
+        heads_inner = layout_type(
+            list(query.size()),
+            list(query.stride()),
+            query.dtype,
+            [1, 0, 2, 3],
+        )
+        assert list(heads_inner.device_size) == [1, 1, 8, num_heads, 64]
+        query_spyre = query.to("spyre", device_layout=heads_inner)
+
+        bmm_x_sizes = []
+        spyre_kernel = sys.modules["torch_spyre._inductor.spyre_kernel"]
+        original_create_op_spec = spyre_kernel.SpyreKernel.create_op_spec
+
+        def capture_bmm_x(self, op, is_reduction, args, op_info, *a, **kw):
+            if op == "batchmatmul" and args:
+                bmm_x_sizes.append(list(args[0].device_size))
+            return original_create_op_spec(
+                self, op, is_reduction, args, op_info, *a, **kw
+            )
+
+        # OpSpec construction is skipped on a generated-code cache hit, so a
+        # fresh cache is part of the test fixture rather than relying on the
+        # state left by earlier tests in the same worker.
+        with (
+            fresh_inductor_cache(),
+            mock.patch.object(
+                spyre_kernel.SpyreKernel, "create_op_spec", capture_bmm_x
+            ),
+        ):
+            actual = torch.compile(fn, dynamic=False)(
+                query_spyre,
+                key.to("spyre"),
+                value.to("spyre"),
+                mask.to("spyre"),
+            ).cpu()
+
+        expected = fn(query, key, value, mask)
+        cosine = F.cosine_similarity(
+            actual.float().flatten(), expected.float().flatten(), dim=0
+        ).item()
+        assert torch.isfinite(actual).all() and cosine >= 0.99, (
+            f"cosine={cosine:.8f} "
+            f"max_abs={(actual.float() - expected.float()).abs().max().item():.8f}"
+        )
+
+        query_elems = num_heads * head_dim
+        query_sizes = [ds for ds in bmm_x_sizes if math.prod(ds) == query_elems]
+        assert query_sizes, f"no score-matmul query found in {bmm_x_sizes}"
+        assert all(ds[0] == num_heads for ds in query_sizes), query_sizes
 
     @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_implicit_loading(self):
