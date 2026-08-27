@@ -1289,15 +1289,16 @@ def test_softmax_2d_512x256_dim1_B4():
 
 
 def test_softmax_2d_512x256_dim1_A4_B4():
-    """softmax(x, dim=1) on [512,256] tiled A÷4 B÷4.
+    """softmax(x, dim=1) on [512,256] tiled A÷4 B÷4 (nested reduction tiling).
 
-    coarse_tile now correctly classifies exp's copy-out (div reads sum's
-    tiled-reduction result, forcing div into a separate loop nest, so exp
-    can no longer stay loop_internal — see _consumers_reading_incomplete_
-    reduction). That surfaces a distinct, still-unresolved layout-solver
-    bug: the layout solver cannot find a restickify path for div's new
-    full-buffer read of exp's copy-out. Track the follow-on bug here until
-    it's root-caused.
+    Compiles successfully but produces a numerically wrong result: the sum
+    reduction's own cross-B-tile combine is partial (confirmed by returning
+    amax/sum directly — amax matches CPU exactly, sum is too-small on
+    505/512 rows), independent of any consumer redirect. Same symptom family
+    as the flat-case reduction-dim-tiled rejection (see
+    test_softmax_2d_512x256_dim1_B4), but a distinct code path: this is
+    inside _propagate_tiled_reduction_op's nested-case combine itself, not a
+    same-loop-body consumer redirect. See #4104.
     """
     inputs = [tensor("x", shape=(512, 256), dims=["A", "B"])]
 
@@ -1306,10 +1307,11 @@ def test_softmax_2d_512x256_dim1_A4_B4():
             with spyre_hint(num_tiles_per_dim={"B": 4}):
                 return torch.softmax(x, dim=1)
 
-    with pytest.raises(
-        (InductorError, NotImplementedError),
-    ):
-        run_coarse_tile_test(fn, inputs)
+    _run_coarse_tile_test_raises(
+        fn,
+        inputs,
+        match="Mismatched elements",
+    )
 
 
 def test_softmax_2d_512x256_dim0_A4():
@@ -2098,14 +2100,19 @@ def test_copy_accum_with_reduction_512x256_A4():
     run_coarse_tile_test(fn, inputs)
 
 
-@pytest.mark.skip(
-    reason=(
-        "IndexError: _insert_all_read_copy_ops fails when tiling B with "
-        "unit-size B dim in scale"
-    )
-)
 def test_copy_accum_with_reduction_512x256_B4():
-    """copy_forced(acc * scale + x.amin(dim=1, keepdim=True), acc) tiled B÷4."""
+    """copy_forced(acc * scale + x.amin(dim=1, keepdim=True), acc) tiled B÷4.
+
+    Must be rejected at compile time. B is both the tiled dim and the
+    reduction dim; the reduction op (amin) is tiled alongside no other
+    output dim, so this is the flat case, and the same-group consumer
+    (acc * scale + r) tiles B as a real output dim while the reduction op
+    itself only carries B in loop_tiled_reduction_dims. Per
+    coarse_tile.py's _plan_tiling_propagation reduction branch, the
+    consumer's loop_tiled_dims can never match the reduction op's own in
+    this shape, so it is rejected with Unsupported instead of silently
+    reading a partially-accumulated reduction result.
+    """
     inputs = [
         tensor("acc", shape=(512, 256), dims=["A", "B"]),
         tensor("scale", shape=(512, 1), dims=["A", "B"]),
@@ -2120,17 +2127,23 @@ def test_copy_accum_with_reduction_512x256_B4():
                 copy_forced(acc * scale + r, acc)
         return acc
 
-    run_coarse_tile_test(fn, inputs)
-
-
-@pytest.mark.skip(
-    reason=(
-        "IndexError: _insert_all_read_copy_ops fails when tiling B with "
-        "unit-size B dim in scale"
+    _run_coarse_tile_test_raises(
+        fn,
+        inputs,
+        match="tiles the reduction dim as a real output dim",
     )
-)
+
+
 def test_copy_accum_with_reduction_512x256_A4_B4():
-    """copy_forced(acc * scale + x.amin(dim=1, keepdim=True), acc) tiled A÷4 B÷4."""
+    """copy_forced(acc * scale + x.amin(dim=1, keepdim=True), acc) tiled A÷4 B÷4.
+
+    Unlike test_copy_accum_with_reduction_512x256_B4, A (an output dim of
+    the reduction op) is tiled outer to B (the reduction dim) here, making
+    this the nested case (see _compute_fill_loop_info_planned): the
+    reduction re-runs once per outer A-tile, so _propagate_tiled_reduction_op
+    redirects every same-group inside consumer to accum_full unconditionally
+    -- no consumer-loop_tiled_dims-mismatch rejection applies.
+    """
     inputs = [
         tensor("acc", shape=(512, 256), dims=["A", "B"]),
         tensor("scale", shape=(512, 1), dims=["A", "B"]),

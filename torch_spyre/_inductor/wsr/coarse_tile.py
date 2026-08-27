@@ -3695,7 +3695,25 @@ def _insert_one_read_copy(
         # data.ranges (what SpyreKernel._host_dim_to_index_symbol will
         # later squeeze again when it runs against copy_buf) -- i.e. the
         # squeezed position computed above, not sizing_op's raw d.
-        copy_dim = squeeze_pos[d]
+        #
+        # squeeze_pos[d] is sizing_op's OWN squeezed symbol number for d --
+        # it says nothing about whether THIS dep has d at all, or at that
+        # same squeezed position, since dep can squeeze a different set of
+        # unit dims out of its own iteration space than sizing_op does (e.g.
+        # a broadcast operand like a [M, 1] scale read against a reduction
+        # whose own ranges keep that dim non-unit at tile-extent > 1 --
+        # issue #3613's family of mismatches). dep.var_names is dep's own
+        # squeezed d{i} symbol list, positionally aligned with copy_ranges
+        # (both derived from the same dep.size/dep.index); find sizing_op's
+        # d{squeeze_pos[d]} symbol within it directly, mirroring
+        # _tiled_dims_for_dep's free-symbol membership check rather than
+        # assuming the two ops' squeezed numbering coincides.
+        sizing_symbol = sympy_index_symbol(f"d{squeeze_pos[d]}")
+        if sizing_symbol not in dep.var_names:
+            # This dim is squeezed out of, or simply absent from, dep's own
+            # space (broadcast) -- no advance term to contribute here.
+            continue
+        copy_dim = dep.var_names.index(sizing_symbol)
         running = sympy.sympify(copy_ranges[copy_dim])
         for level_idx in reversed(levels_tiling_d):
             read_level_extents[level_idx][copy_dim] = running
@@ -4625,13 +4643,29 @@ def _patch_consumers(
 
     for consumer in consumers:
         orig_inner = consumer.data.inner_fn
+        # _retile_load_index's squeezed-dim term injection (see
+        # _squeezed_retile_dims) is only meaningful for a consumer with no
+        # loop_info of its own -- an "outside" consumer whose incoming index
+        # was traced against old_name's tile-local (squeezed) layout with no
+        # enclosing coarse-tile loop nest to supply a term for a dim that
+        # layout squeezed away. An "inside" consumer (has loop_info) already
+        # derives its index from a real, enclosing loop nest that supplies a
+        # correct term for every one of *its own* real dimensions; passing
+        # it here anyway injects a bogus extra term for any dim this
+        # consumer tiles as an output dim but that new_name's layout does
+        # not vary over (e.g. a fully-reduced dim in an accum_full buffer),
+        # double-counting/corrupting the address. See
+        # test_copy_accum_with_reduction_512x256_A4_B4, where this caused a
+        # spurious B-tile-index term in a redirected read of an
+        # already-fully-B-reduced accum_full buffer.
+        _index_consumer = consumer if not hasattr(consumer, "loop_info") else None
 
         def new_inner_fn(
             *args,
             _map=name_map,
             _info=retile_info if has_retile else None,
             _orig=orig_inner,
-            _consumer=consumer,
+            _consumer=_index_consumer,
         ):
             if _info is not None:
                 handler = _NameAndIndexSwapHandler(
