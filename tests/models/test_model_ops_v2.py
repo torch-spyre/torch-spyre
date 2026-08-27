@@ -415,6 +415,19 @@ class TestSpyreModelOps(TestCase):
             SampleInput=SampleInput,
         )
 
+        # `device` selects where the op runs, so it resolves to test_device.
+        # Tensors stay CPU-built so both samples hold identical values and
+        # _to_target_device keeps its layout-aware to_spyre() path.
+        device_kwargs = ops_item.sample_inputs_func.resolved_kwargs(
+            test_device=test_device,
+            seed=seed,
+            dtype=dtype,
+        )
+        device_arg_values = ops_item.sample_inputs_func.resolved_device_args(
+            test_device=test_device,
+            op_name=op_name,
+        )
+
         def _to_target_device(x: Any, arg_spec: Optional[Any] = None) -> Any:
             if torch.is_tensor(x):
                 if (
@@ -472,19 +485,28 @@ class TestSpyreModelOps(TestCase):
         ):
             test_args.append(_to_target_device(cpu_arg, spec_arg))
 
+        # torch.to names its destination positionally.
+        for idx, dev_value in device_arg_values.items():
+            if idx < len(test_args):
+                test_args[idx] = dev_value
+
         if test_args:
             test_sample = SampleInput(
                 test_args[0],
                 args=tuple(test_args[1:]),
-                # NOTE: kwargs are plain values only (dim, dtype, keepdim, etc.) — no
-                # current config passes a tensor/device_layout via kwargs, and
-                # resolved_kwargs() will raise if one ever tries to. If that changes,
-                # this needs the same arg_spec-based layout lookup as _to_target_device
-                # uses for positional args above.
-                kwargs={k: _to_target_device(v) for k, v in cpu_sample.kwargs.items()},
+                # NOTE: kwargs are plain values only (dim, dtype, keepdim, etc.) —
+                # resolved_kwargs() raises on a tensor/device_layout spec. If that
+                # changes, this needs the same arg_spec-based layout lookup as
+                # _to_target_device uses for positional args above.
+                kwargs={k: _to_target_device(v) for k, v in device_kwargs.items()},
             )
         else:
-            test_sample = cpu_sample.transform(lambda x: _to_target_device(x))
+            moved = cpu_sample.transform(lambda x: _to_target_device(x))
+            test_sample = SampleInput(
+                moved.input,
+                args=moved.args,
+                kwargs={k: _to_target_device(v) for k, v in device_kwargs.items()},
+            )
 
         # Adapter pre-hook (e.g. dropout sets training=False)
         if adapter.pre is not None:

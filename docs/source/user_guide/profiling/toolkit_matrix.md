@@ -11,7 +11,7 @@ questions, see [Debugging](../debugging/index.md).
 | Device-side time per Spyre kernel | `torch.profiler` with `PrivateUse1` + [kineto-spyre][kineto-spyre] | [PyTorch Profiler](pytorch_profiler.md#cpu--privateuse1) |
 | Device power / temperature / bandwidth | `aiu-smi` | [Device monitoring](device_monitoring.md) |
 | Post-processed trace metrics | [aiu-trace-analyzer][ata] | [Trace analysis](trace_analysis.md#aiu-trace-analyzer) |
-| Memory APIs (`torch.spyre.memory_allocated()` / peak) | *Planned* | [RFC 0601][rfc-0601] |
+| Memory APIs (`torch.spyre.memory.memory_allocated()` / peak) | Available | [PyTorch Profiler](pytorch_profiler.md) |
 | Scratchpad utilization | *Planned* | [RFC 0601][rfc-0601] |
 | IR-instrumentation profiling | *Planned* | [RFC 0601][rfc-0601] |
 

@@ -42,7 +42,6 @@ ORIGINAL TESTS (below the boundary marker)
 """
 
 import dataclasses
-import gc
 import math
 import os
 import sys
@@ -6108,7 +6107,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         lx_planning is disabled here so the `a = x + y` intermediate isn't
         claimed by LX scratchpad planning first -- with LX planning on,
         `add`/`mul`/`sub` outputs are all LX-eligible by default (see
-        OP_OUTPUT_GOOD_FOR_LX_REUSE in scratchpad/utils.py) and may win the
+        OP_OUTPUT_NOT_GOOD_FOR_LX_REUSE in scratchpad/utils.py) and may win the
         scratchpad before hbm_pool_planning ever sees them, leaving every
         bundle's pool_size at 0 and proving nothing about the plumbing this
         test exists to check.
@@ -6295,7 +6294,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
 
         With lx_planning enabled, the `a = x + y` intermediate is claimed by
         LX scratchpad planning before hbm_pool_planning ever sees it (see
-        OP_OUTPUT_GOOD_FOR_LX_REUSE in scratchpad/utils.py), so this bundle
+        OP_OUTPUT_NOT_GOOD_FOR_LX_REUSE in scratchpad/utils.py), so this bundle
         has no pool-eligible buffer and define_kernel() must omit the
         pool_size kwarg entirely rather than emit pool_size=0.
         """
@@ -6875,9 +6874,11 @@ class TestCoarseTileMoEBroadcastMatmulE2E(InductorTestCase):
 
     def test_unsqueeze_broadcast_matmul_tile_E_poisoned_correct(self):
         """Same pattern as test_unsqueeze_broadcast_matmul_tile_E_correct,
-        but forces the device HBM this kernel will read to hold nonzero
-        "poison" values before compiling/running it, instead of relying on
-        being scheduled after other tests (or not) to expose the same bug.
+        but relies on the session-scoped `_poison_device_hbm` fixture (see
+        tests/inductor/conftest.py) having already filled device HBM with
+        nonzero sentinel values before this test -- or any test in this
+        file -- runs, instead of relying on being scheduled after other
+        tests (or not) to expose the same bug.
 
         Root cause (issue #3613 follow-up): two independent bugs both let
         this kernel read uninitialized HBM instead of the intended operand
@@ -6885,35 +6886,16 @@ class TestCoarseTileMoEBroadcastMatmulE2E(InductorTestCase):
         happen to come back as zero, silently producing the right answer by
         accident and masking the bug -- which is exactly what made this test
         pass when run first/in isolation and fail only after other tests had
-        left nonzero data in the same HBM region.
-
-        Technique: allocate device tensors filled with a large, easily
-        recognized sentinel value, `del` them and force a `gc.collect()` so
-        the allocator is free to reuse their HBM, then run this test's exact
-        logic as the first thing to compile in the process. If either bug
-        regresses, the kernel reads back stale sentinel-derived garbage
-        (scaled through the matmul) instead of zero, and the mismatch is
-        deterministic rather than dependent on what any other test happened
-        to leave behind.
+        left nonzero data in the same HBM region. The session-level HBM
+        poisoning fixture removes that "virgin device" escape hatch
+        entirely: if either bug regresses, the kernel reads back stale
+        sentinel-derived garbage (scaled through the matmul) instead of
+        zero, and the mismatch is deterministic regardless of test order or
+        isolation.
         """
         from torch_spyre._inductor import spyre_hint
 
         E, T, H, F = 128, 64, 64, 64
-
-        # 4 copies of w's shape (E,H,F), not 1: the allocator's free-list
-        # ordering for a given size class isn't guaranteed to hand back the
-        # single most-recently-freed region first, so poisoning only one
-        # (E,H,F)-shaped tensor risks missing whichever HBM slot this
-        # kernel's own w read actually lands on. Over-poisoning multiple
-        # same-shape regions raises confidence that the slot in question is
-        # covered.
-        sentinel_shapes = [(E, H, F), (1, T, H), (E, H, F), (E, H, F), (E, H, F)]
-        poison_tensors = [
-            torch.full(shape, 1234.0, dtype=torch.float16, device="spyre")
-            for shape in sentinel_shapes
-        ]
-        del poison_tensors
-        gc.collect()
 
         x = torch.randn(T, H, dtype=torch.float16) * 0.01
         w = torch.randn(E, H, F, dtype=torch.float16) * 0.01
@@ -6944,21 +6926,15 @@ class TestCoarseTileMoEBroadcastMatmulE2E(InductorTestCase):
         host_stride*d_full_size = (T*F)*E = (64*64)*2 = 8192 -- despite x
         having no E dimension at all. A numel-only check would wrongly
         grant x a per-tile E-advance here, making it read past its own
-        8192 elements into whatever HBM follows (uninitialized on a
-        virgin device). Poisons that HBM region so any regression back to
-        a numel-only check is caught deterministically.
+        8192 elements into whatever HBM follows. The session-scoped
+        `_poison_device_hbm` fixture (see tests/inductor/conftest.py) has
+        already filled that HBM with nonzero sentinel values before this
+        test runs, so any regression back to a numel-only check is caught
+        deterministically instead of only on a non-virgin device.
         """
         from torch_spyre._inductor import spyre_hint
 
         E, T, H, F = 2, 64, 128, 64
-
-        sentinel_shapes = [(E, H, F), (1, T, H)]
-        poison_tensors = [
-            torch.full(shape, 1234.0, dtype=torch.float16, device="spyre")
-            for shape in sentinel_shapes
-        ]
-        del poison_tensors
-        gc.collect()
 
         x = torch.randn(T, H, dtype=torch.float16) * 0.01
         w = torch.randn(E, H, F, dtype=torch.float16) * 0.01
@@ -6977,28 +6953,21 @@ class TestCoarseTileMoEBroadcastMatmulE2E(InductorTestCase):
             fn, x, w, run_compile=True, run_eager=False, atol=0.05, rtol=0.05
         )
 
-    @pytest.mark.skip(
-        reason=(
-            "Unsupported: expected exactly 1 generated variable, got {d0, d2}. "
-            "find_matmul_generated_var (pass_utils.py) identifies the matmul's "
-            "N dim as 'in y and the output, absent from x' -- but here E is "
-            "also 'in y and the output, absent from x' (a broadcast batch dim "
-            "with no corresponding dim in x at all), and with tile size 2 its "
-            "per-tile loop var (d0) still appears in y's/the output's index, "
-            "so it satisfies the same set membership as the true N dim (F, "
-            "d2). The two are structurally indistinguishable by pure "
-            "set-arithmetic on MemoryDep.index.free_symbols once x lacks a "
-            "batch dim outright; d0 and d2 both have real nonzero coefficients "
-            "in y_dep/out_dep and are absent from x_dep.index.free_symbols. "
-            "At tile size 1 (see test_unsqueeze_broadcast_matmul_tile_E_correct) "
-            "E's per-tile loop var is constant-folded away entirely, so the "
-            "ambiguity never arises -- this is a distinct, real bug in "
-            "propagate_layouts.py/pass_utils.py, not in coarse_tile.py. "
-            "See issue #3888."
-        )
-    )
-    def test_unsqueeze_broadcast_matmul_tile_E_64_correct(self):
-        """[1,T,H]@[E,H,F] -> [E,T,F] tiled over E with 64 tiles (2 experts/tile)."""
+    def test_unsqueeze_broadcast_matmul_tile_E_64_rejected(self):
+        """[1,T,H]@[E,H,F] tiled over E with 64 tiles (2 experts/tile) is rejected.
+
+        Coarse-tiling a matmul's broadcast batch dim (x has no E dim here)
+        with more than 1 element per tile is not supported: the backend's
+        SDSC batched-matmul scheduling primitive requires exactly 1
+        broadcast element per kernel invocation
+        (``inp0_reuse_dim.size() == 1``), and aborts deep in the native
+        device compiler if that's violated. torch-spyre now rejects this
+        configuration at plan time with a clear message instead of letting
+        it reach the native compiler -- see issue #3927 for the backend
+        limitation this is tracking. 1 expert/tile
+        (test_unsqueeze_broadcast_matmul_tile_E_correct,
+        num_tiles_per_dim={"E": E}) is unaffected and continues to work.
+        """
         from torch_spyre._inductor import spyre_hint
 
         E, T, H, F = 128, 64, 64, 64
@@ -7015,9 +6984,10 @@ class TestCoarseTileMoEBroadcastMatmulE2E(InductorTestCase):
             with spyre_hint(num_tiles_per_dim={"E": 64}):
                 return torch.matmul(x.unsqueeze(0), w)
 
-        compare_with_cpu(
-            fn, x, w, run_compile=True, run_eager=False, atol=0.05, rtol=0.05
-        )
+        with pytest.raises(InductorError, match="coarse-tiling broadcast batch dim"):
+            compare_with_cpu(
+                fn, x, w, run_compile=True, run_eager=False, atol=0.05, rtol=0.05
+            )
 
 
 class TestCoarseTileNestedReductionE2E(InductorTestCase):

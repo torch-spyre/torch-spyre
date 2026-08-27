@@ -74,6 +74,7 @@ from torch_spyre._inductor.constants import (
 from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.loop_info import CoarseTileInfo, copy_op_metadata
 from torch_spyre._inductor.pass_utils import coeff_through_floor
+from torch_spyre._inductor.propagate_hints import DimHint
 from torch_spyre._inductor.wsr.coarse_tile import (
     _LOOPS_FREE_SYMS_KEY,
     _REDUCTION_FREE_SYMS_KEY,
@@ -92,6 +93,21 @@ from torch_spyre._inductor.wsr.coarse_tile import (
     coarse_tile_post_stickify,
     coarse_tile_pre_stickify,
     plan_coarse_tile_groups,
+    reduction_loop_vars,
+)
+from torch_spyre._inductor.scratchpad.coarse_tiling import (
+    CoarseTilingPass,
+    _derive_group_idx_offset,
+    _derive_hint_id_base,
+    derive_tiling_groups,
+    tile_spec_to_dim_hints,
+)
+from torch_spyre._inductor.scratchpad.plan_solver import (
+    CoreDivision,
+    CoreDivisionBuffer,
+    TileAxis,
+    TileSpec,
+    ceil_div,
 )
 from torch_spyre._inductor.op_spec import LoopSpec, OpSpec, TensorArg, UnimplementedOp
 from torch_spyre._inductor.fusion import spyre_fuse_nodes
@@ -3925,15 +3941,16 @@ class TestGenerateBundleAffineLoopPath(unittest.TestCase):
         self._c_b = Symbol("c_b")
 
     def _bundle(self, specs, fake_compile):
-        with patch(
-            "torch_spyre._inductor.codegen.bundle.compile_op_spec",
-            side_effect=fake_compile,
-        ):
-            generate_bundle(
-                "test_kernel",
-                self.tmpdir,
-                specs,
-            )
+        with config.patch({"sdsc_cache": False}):
+            with patch(
+                "torch_spyre._inductor.codegen.bundle.compile_op_spec",
+                side_effect=fake_compile,
+            ):
+                generate_bundle(
+                    "test_kernel",
+                    self.tmpdir,
+                    specs,
+                )
         return _read_mlir(self.tmpdir)
 
     # --- Group 1: flat row-tiling ---
@@ -6031,16 +6048,17 @@ class TestGenerateBundleMlirSymbolicArgs(unittest.TestCase):
     def _bundle(self, specs, fake_compile=None, pool_size=0):
         if fake_compile is None:
             fake_compile = _fake_compile_op_spec
-        with patch(
-            "torch_spyre._inductor.codegen.bundle.compile_op_spec",
-            side_effect=fake_compile,
-        ):
-            generate_bundle(
-                "test_kernel",
-                self.tmpdir,
-                specs,
-                pool_size=pool_size,
-            )
+        with config.patch({"sdsc_cache": False}):
+            with patch(
+                "torch_spyre._inductor.codegen.bundle.compile_op_spec",
+                side_effect=fake_compile,
+            ):
+                generate_bundle(
+                    "test_kernel",
+                    self.tmpdir,
+                    specs,
+                    pool_size=pool_size,
+                )
         return _read_mlir(self.tmpdir)
 
     def _make_op_spec_with_hbm_args(self, name: str, arg_indices: list) -> OpSpec:
@@ -6494,15 +6512,16 @@ class TestSymbolKind(unittest.TestCase):
                 json1 = _make_tiled_json(idx, -(symbol_id_offset + 1))
                 return json1, [base + off], [{}], kinds
 
-        with patch(
-            "torch_spyre._inductor.codegen.bundle.compile_op_spec",
-            side_effect=fake,
-        ):
-            generate_bundle(
-                "test_kernel",
-                self.tmpdir,
-                [a, b],
-            )
+        with config.patch({"sdsc_cache": False}):
+            with patch(
+                "torch_spyre._inductor.codegen.bundle.compile_op_spec",
+                side_effect=fake,
+            ):
+                generate_bundle(
+                    "test_kernel",
+                    self.tmpdir,
+                    [a, b],
+                )
         mlir = _read_mlir(self.tmpdir)
 
         # Only one input_arg param (the kernel base)
@@ -7429,6 +7448,363 @@ class TestSpyreKernelPoolSize(unittest.TestCase):
 
         default_kernel = SpyreKernel()
         self.assertEqual(default_kernel.pool_size, 0)
+
+
+class TestTileSpecRepresentation(unittest.TestCase):
+    """TileAxis/TileSpec/CoreDivision.tiling and the min_footprint win."""
+
+    def test_empty_spec_is_untiled_and_inert(self):
+        u = TileSpec()
+        self.assertTrue(u.is_untiled)
+        self.assertEqual(u.depth, 0)
+        self.assertEqual(u.tile_count, 1)
+        self.assertEqual(u.output_tile_count, 1)
+        self.assertTrue(u.is_clean)
+        self.assertEqual(u.label, "untiled")
+
+    def test_ordered_and_hashable_equality_is_same_shape(self):
+        a = TileSpec((TileAxis(0, 4), TileAxis(1, 2)))
+        b = TileSpec((TileAxis(0, 4), TileAxis(1, 2)))
+        swapped = TileSpec((TileAxis(1, 2), TileAxis(0, 4)))
+        self.assertEqual(a, b)
+        self.assertEqual(hash(a), hash(b))
+        # Levels nest, so swapping them is a different plan (unlike divisions).
+        self.assertNotEqual(a, swapped)
+        # Hashable: usable as a dict/set key (the group-derivation key).
+        self.assertEqual(len({a, b, swapped}), 2)
+
+    def test_output_axis_scalars(self):
+        a = TileSpec((TileAxis(0, 4), TileAxis(1, 2)))
+        self.assertEqual(a.depth, 2)
+        self.assertEqual(a.tile_count, 8)
+        self.assertEqual(a.output_tile_count, 8)
+        self.assertTrue(a.is_clean)
+        self.assertEqual(a.label, "d0:4/d1:2")
+
+    def test_reduction_axis_excluded_from_output_tile_count(self):
+        r = TileSpec((TileAxis(0, 4), TileAxis(2, 3, is_reduction=True)))
+        # Reduction level counts in tile_count but not in output_tile_count.
+        self.assertEqual(r.tile_count, 12)
+        self.assertEqual(r.output_tile_count, 4)
+        self.assertFalse(r.is_clean)
+        self.assertEqual(r.label, "d0:4/~d2:3")
+
+    def test_core_division_tiling_defaults_untiled_and_inert(self):
+        cd = CoreDivision(output_splits={0: 2})
+        self.assertEqual(cd.tiling, TileSpec())
+        self.assertTrue(cd.tiling.is_untiled)
+        # Distinct CoreDivisions do not share one mutable default.
+        self.assertIsNot(CoreDivision().tiling, CoreDivision().tiling)
+
+    def test_min_footprint_inert_when_untiled(self):
+        buf = CoreDivisionBuffer(
+            name="x",
+            size=1024,
+            uses=[0, 1],
+            core_divisions=[CoreDivision(output_splits={0: 2})],
+        )
+        self.assertEqual(buf.min_footprint, ceil_div(1024, 2))
+
+    def test_min_footprint_shrinks_by_output_tile_count(self):
+        spec = TileSpec((TileAxis(0, 4), TileAxis(1, 2)))  # 8 output tiles
+        buf = CoreDivisionBuffer(
+            name="y",
+            size=1024,
+            uses=[0, 1],
+            core_divisions=[CoreDivision(output_splits={0: 2}, tiling=spec)],
+        )
+        self.assertEqual(buf.min_footprint, ceil_div(1024, 2 * spec.output_tile_count))
+
+    def test_min_footprint_reduction_level_does_not_shrink_accumulator(self):
+        # The reduction-tiled op's own buffer is the accumulator: full extent.
+        spec = TileSpec((TileAxis(0, 4), TileAxis(1, 3, is_reduction=True)))
+        buf = CoreDivisionBuffer(
+            name="z",
+            size=1024,
+            uses=[0, 1],
+            core_divisions=[CoreDivision(output_splits={0: 2}, tiling=spec)],
+        )
+        self.assertEqual(buf.min_footprint, ceil_div(1024, 2 * spec.output_tile_count))
+
+
+class TestTileSpecLoweringOutput(unittest.TestCase):
+    """tile_spec_to_dim_hints on output axes — same DimHints as the hint path."""
+
+    def setUp(self):
+        self.enterContext(
+            patch(
+                "torch_spyre._inductor.scratchpad.coarse_tiling.op_out_coords",
+                side_effect=_mock_op_out_coords,
+            )
+        )
+
+    def _op(self, n_dims, name="op0"):
+        op = _make_op(_make_pointwise([Integer(64)] * n_dims), name)
+        op._test_out_coords = [sympy.Symbol(f"c{i}") for i in range(n_dims)]
+        return op
+
+    def test_single_output_axis(self):
+        op = self._op(2)
+        spec = TileSpec((TileAxis(0, 4),))
+        hints = tile_spec_to_dim_hints(op, spec, [7])
+        self.assertEqual(len(hints), 1)
+        h = hints[0]
+        self.assertEqual(h.split_count, 4)
+        self.assertEqual(h.loop_var, sympy.Symbol("c0"))
+        self.assertFalse(h.is_reduction)
+        self.assertEqual(h.hint_id, 7)
+
+    def test_nested_output_axes_get_their_own_loop_vars(self):
+        op = self._op(3)
+        spec = TileSpec((TileAxis(0, 4), TileAxis(2, 2)))
+        hints = tile_spec_to_dim_hints(op, spec, [0, 1])
+        self.assertEqual(
+            [h.loop_var for h in hints], [sympy.Symbol("c0"), sympy.Symbol("c2")]
+        )
+        self.assertEqual([h.split_count for h in hints], [4, 2])
+        self.assertEqual([h.hint_id for h in hints], [0, 1])
+
+    def test_hint_id_count_must_match_axis_count(self):
+        op = self._op(2)
+        spec = TileSpec((TileAxis(0, 4),))
+        with self.assertRaises(ValueError):
+            tile_spec_to_dim_hints(op, spec, [0, 1])
+
+    def test_host_dim_out_of_bounds_raises(self):
+        op = self._op(2)
+        spec = TileSpec((TileAxis(5, 4),))
+        # unsupported because too few loop ids are provided
+        with self.assertRaises(Unsupported):
+            tile_spec_to_dim_hints(op, spec, [0])
+
+
+class TestTileSpecLoweringReduction(unittest.TestCase):
+    """The reduction-axis lowering is the inverse of reduction_loop_vars."""
+
+    def setUp(self):
+        gm = fx.symbolic_trace(lambda: None)
+        self._graph_ctx = V.set_graph_handler(GraphLowering(gm))
+        self._graph_ctx.__enter__()
+
+    def tearDown(self):
+        self._graph_ctx.__exit__(None, None, None)
+
+    def test_reduction_axis_resolves_via_reduction_loop_vars(self):
+        # out[d0] = sum_{d1} in[d0, d1]; one reduction loop var.
+        op = _make_real_reduction_op(
+            ranges=[Integer(8)],
+            reduction_ranges=[Integer(16)],
+            input_shape_stride=([8, 16], [16, 1]),
+            name="buf0",
+            hints=((1, 0),),
+        )
+        red_vars = reduction_loop_vars(op)
+        self.assertEqual(len(red_vars), 1)
+        spec = TileSpec((TileAxis(0, 4, is_reduction=True),))
+        hints = tile_spec_to_dim_hints(op, spec, [3])
+        self.assertEqual(len(hints), 1)
+        h = hints[0]
+        self.assertTrue(h.is_reduction)
+        self.assertEqual(h.split_count, 4)
+        self.assertEqual(h.hint_id, 3)
+        # The inverse relationship: the lowered loop_var is exactly the one
+        # reduction_loop_vars reports at that position.
+        self.assertEqual(h.loop_var, red_vars[0])
+        self.assertEqual(_loop_var_to_reduction_ranges_pos_public(op, h.loop_var), 0)
+
+    def test_reduction_host_dim_out_of_bounds_raises(self):
+        op = _make_real_reduction_op(
+            ranges=[Integer(8)],
+            reduction_ranges=[Integer(16)],
+            input_shape_stride=([8, 16], [16, 1]),
+            name="buf0",
+            hints=((1, 0),),
+        )
+        spec = TileSpec((TileAxis(3, 4, is_reduction=True),))  # only 1 red var
+        with self.assertRaises(Unsupported):
+            tile_spec_to_dim_hints(op, spec, [0])
+
+    def test_reduction_axis_on_pointwise_raises(self):
+        op = _make_real_pointwise_op(
+            ranges=[Integer(8), Integer(16)],
+            input_shapes_strides=[([8, 16], [16, 1])],
+            name="buf0",
+            hints=((0, 0),),
+        )
+        spec = TileSpec((TileAxis(0, 4, is_reduction=True),))
+        with self.assertRaises(Unsupported):
+            tile_spec_to_dim_hints(op, spec, [0])
+
+
+def _loop_var_to_reduction_ranges_pos_public(op, sym):
+    from torch_spyre._inductor.wsr.coarse_tile import (
+        _loop_var_to_reduction_ranges_pos,
+    )
+
+    return _loop_var_to_reduction_ranges_pos(op, sym)
+
+
+class TestDeriveTilingGroups(unittest.TestCase):
+    """derive_tiling_groups — consecutive runs of ops sharing a TileSpec."""
+
+    def _graph_of(self, names):
+        return _graph([_make_op(_make_pointwise([Integer(64)]), n) for n in names])
+
+    def _names(self, groups):
+        return [[o.get_operation_name() for o in ops] for ops, _ in groups]
+
+    def test_consecutive_run_grouped_untiled_breaks(self):
+        g = self._graph_of(["op0", "op1", "op2", "op3", "op4"])
+        spec = TileSpec((TileAxis(0, 4),))
+        # op1,op2 tiled and consecutive -> one group; op4 tiled alone; op0/op3
+        # untiled -> break the runs.
+        choices = {"op1": spec, "op2": spec, "op4": spec}
+        groups = derive_tiling_groups(g, choices)
+        self.assertEqual(self._names(groups), [["op1", "op2"], ["op4"]])
+
+    def test_spec_change_breaks_the_run(self):
+        g = self._graph_of(["op0", "op1"])
+        s1 = TileSpec((TileAxis(0, 4),))
+        s2 = TileSpec((TileAxis(0, 2),))
+        groups = derive_tiling_groups(g, {"op0": s1, "op1": s2})
+        self.assertEqual([len(ops) for ops, _ in groups], [1, 1])
+        self.assertEqual([spec for _, spec in groups], [s1, s2])
+
+    def test_empty_and_all_untiled_produce_no_groups(self):
+        g = self._graph_of(["op0", "op1"])
+        self.assertEqual(derive_tiling_groups(g, {}), [])
+        self.assertEqual(derive_tiling_groups(g, {"op0": TileSpec()}), [])
+
+
+class TestDerivedBases(unittest.TestCase):
+    """Hint-id and group-idx bases are derived off the graph, never reserved."""
+
+    def test_hint_id_base_avoids_existing_hints(self):
+        op = _make_op(_make_pointwise([Integer(64)]), "op0")
+        op.dim_hints = []
+        self.assertEqual(_derive_hint_id_base(_graph([op])), 0)
+        op.dim_hints = [
+            DimHint(
+                dim_names=["a"],
+                split_count=2,
+                loop_var=None,
+                is_reduction=False,
+                hint_id=10005,
+            )
+        ]
+        self.assertEqual(_derive_hint_id_base(_graph([op])), 10006)
+
+    def test_group_idx_offset_avoids_existing_loop_group_ids(self):
+        op = _make_op(_make_pointwise([Integer(64)]), "op0")
+        self.assertEqual(_derive_group_idx_offset(_graph([op])), 0)
+        op.loop_info = CoarseTileInfo(
+            loop_group_id=(3,), loop_count=[Integer(2)], loop_tiled_dims=[[0]]
+        )
+        self.assertEqual(_derive_group_idx_offset(_graph([op])), 4)
+
+
+class TestCoarseTilingPassEquivalence(unittest.TestCase):
+    """CoarseTilingPass reduces to the hint path.
+
+    Both paths call the same coarse_tile(); the pass just builds its (groups,
+    group_idx_offset, dim_hints) inputs from a TileSpec instead of pre-stamped
+    hints. Feeding structurally identical inputs to the identical function
+    yields identical output, which is asserted end-to-end here on the stamped
+    loop_info and the divided ranges.
+    """
+
+    def setUp(self):
+        self.enterContext(
+            patch(
+                "torch_spyre._inductor.wsr.coarse_tile.op_out_coords",
+                side_effect=_mock_op_out_coords,
+            )
+        )
+        self.enterContext(
+            patch(
+                "torch_spyre._inductor.scratchpad.coarse_tiling.op_out_coords",
+                side_effect=_mock_op_out_coords,
+            )
+        )
+
+    def _bare(self, ranges, name):
+        op = _make_op(_make_pointwise([Integer(r) for r in ranges]), name)
+        op._test_out_coords = [sympy.Symbol(f"c{i}") for i in range(len(ranges))]
+        op.dim_hints = []
+        return op
+
+    def _loop_fields(self, op):
+        li = op.loop_info
+        return (
+            tuple(li.loop_group_id),
+            list(li.loop_count),
+            [list(x) for x in li.loop_tiled_dims],
+        )
+
+    def test_single_level_matches_hint_path(self):
+        # Reference: hint path, hint_id 0, group 0.
+        ref = _make_hinted_op(_make_pointwise([Integer(256)]), "op0", hints=((0, 0),))
+        coarse_tile_pre_stickify(_graph([ref]), [([ref], [(0, Integer(4))])])
+        ref_fields = self._loop_fields(ref)
+        ref_range = ref.data.ranges[0]
+
+        # CoarseTilingPass: same tiling expressed as a TileSpec.
+        got = self._bare([256], "op0")
+        CoarseTilingPass({"op0": TileSpec((TileAxis(0, 4),))}).apply_pass(_graph([got]))
+        self.assertEqual(self._loop_fields(got), ref_fields)
+        self.assertEqual(got.data.ranges[0], ref_range)
+        # And the win is visible: dim 0 divided by 4.
+        self.assertEqual(got.data.ranges[0], Integer(64))
+
+    def test_nested_two_level_matches_hint_path(self):
+        ref = _make_hinted_op(
+            _make_pointwise([Integer(256), Integer(128)]), "op0", hints=((0, 0), (1, 1))
+        )
+        coarse_tile_pre_stickify(
+            _graph([ref]), [([ref], [(0, Integer(4)), (1, Integer(2))])]
+        )
+        ref_fields = self._loop_fields(ref)
+        ref_ranges = list(ref.data.ranges)
+
+        got = self._bare([256, 128], "op0")
+        CoarseTilingPass(
+            {"op0": TileSpec((TileAxis(0, 4), TileAxis(1, 2)))}
+        ).apply_pass(_graph([got]))
+        self.assertEqual(self._loop_fields(got), ref_fields)
+        self.assertEqual(list(got.data.ranges), ref_ranges)
+        self.assertEqual(list(got.data.ranges), [Integer(64), Integer(64)])
+
+    def test_pass_inputs_match_hint_path_structurally(self):
+        # Two independent ops in one group: prove the group derivation and
+        # hint-id minting produce exactly the coarse_tile inputs the hint path
+        # would, without running the mutation (robust against mock read-edges).
+        got0 = self._bare([256], "op0")
+        got1 = self._bare([256], "op1")
+        g = _graph([got0, got1])
+        spec = TileSpec((TileAxis(0, 4),))
+        groups_specs = derive_tiling_groups(g, {"op0": spec, "op1": spec})
+        self.assertEqual(len(groups_specs), 1)
+        group_ops, group_spec = groups_specs[0]
+        self.assertEqual([o.get_operation_name() for o in group_ops], ["op0", "op1"])
+        # One group, base 0 -> hint_ids [0], every op in the group shares it.
+        base = _derive_hint_id_base(g)
+        self.assertEqual(base, 0)
+        hints0 = tile_spec_to_dim_hints(got0, group_spec, [base])
+        hints1 = tile_spec_to_dim_hints(got1, group_spec, [base])
+        self.assertEqual(hints0[0].hint_id, hints1[0].hint_id)
+        self.assertEqual(hints0[0].split_count, 4)
+
+    def test_empty_choices_is_a_noop(self):
+        # The pass leaves op count unchanged when it does nothing
+        # (untiled/absent choices).
+        ops = [self._bare([64], "op0"), self._bare([64], "op1")]
+        g = _graph(ops)
+        CoarseTilingPass({}).apply_pass(g)
+        self.assertEqual(len(g.operations), 2)
+        for op in ops:
+            self.assertFalse(
+                hasattr(op, "loop_info") and isinstance(op.loop_info, CoarseTileInfo)
+            )
 
 
 if __name__ == "__main__":

@@ -39,7 +39,7 @@ std::mutex SpyreAllocator::stats_mutex_;
 std::shared_ptr<flex::FlexAllocator> SpyreAllocator::getFlexAllocator() {
   // FlexAllocator is owned by RuntimeContext (one per device per process).
   // RuntimeContext::getAllocator() returns shared_ptr<FlexAllocator>;
-  auto flex_alloc = flex::getFlexRuntimeContext()->getAllocator();
+  auto flex_alloc = flex::RuntimeContext::getInstance()->getAllocator();
 
   // Register memory pressure callback on first access (lazy initialization)
   static std::once_flag callback_registered;

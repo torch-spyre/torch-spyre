@@ -523,7 +523,6 @@ void synchronizeDevice(c10::optional<c10::Device> device) {
       collect(pool.host_compute_streams);
     }  // lock released
 
-    auto runtime = GlobalRuntime::get();
     c10::DeviceGuard guard(dev);
     for (auto handle : handles_to_sync) {
       handle->synchronize();
