@@ -138,6 +138,31 @@ def enable_spyre_compile_fx_wrapper():
             try:
                 if uses_spyre:
                     torch.spyre._impl._lazy_init()
+
+                    # AOTAutogradCache (L2 of the PyTorch caching stack) stores
+                    # references into FxGraphCache.  Spyre's compiled wrappers
+                    # are compatible with FxGraphCache (SpyreSDSCKernelRunner
+                    # is picklable), but AOTAutogradCache itself is not
+                    # exercised for Spyre graphs because the Spyre compile path
+                    # goes through the compile_fx wrapper rather than
+                    # AOTAutograd.  If a user has enabled it explicitly, warn
+                    # rather than silently producing a broken or stale cache
+                    # entry.
+                    import torch._functorch.config as _ftn_config
+
+                    if getattr(_ftn_config, "enable_autograd_cache", False):
+                        import warnings
+
+                        warnings.warn(
+                            "torch._functorch.config.enable_autograd_cache is "
+                            "True, but AOTAutogradCache is not supported for "
+                            "Spyre graphs. The AOTAutogradCache layer will be "
+                            "bypassed for this graph. Disable this warning by "
+                            "setting torch._functorch.config."
+                            "enable_autograd_cache = False.",
+                            stacklevel=2,
+                        )
+
                     # AOTAutograd uses the dict passed via ``decompositions=``
                     # to decompose the joint graph; Spyre-specific
                     # decompositions must be applied at this stage so ops like

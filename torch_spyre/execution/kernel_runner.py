@@ -47,6 +47,16 @@ class SpyreUnimplementedRunner:
 
 
 class SpyreSDSCKernelRunner:
+    """Kernel runner for a compiled SDSC bundle.
+
+    The live ``jobplan`` handle (a C-extension object returned by
+    ``prepare_kernel``) is built lazily on first use rather than in
+    ``__init__``, because ``prepare_kernel`` needs a live C++ ``RuntimeContext``
+    on the process that will launch the kernel.  Construction happens during
+    compilation, which is not necessarily that process, so the handle is
+    deferred to the first ``run()``.
+    """
+
     def __init__(
         self,
         name: str,
@@ -56,27 +66,51 @@ class SpyreSDSCKernelRunner:
         self.kernel_name = name
         self.code_dir = code_dir
         self.kernel_provenance = kernel_provenance
-        self.profiler_event_name: str | None
-        spyrecode_dir = code_dir + "/spyreCodeDir"
-        if kernel_provenance is None:
-            self.profiler_event_name = None
-            self.jobplan = prepare_kernel(spyrecode_dir)
-        else:
-            self.profiler_event_name = format_kernel_provenance_event_name(
-                kernel_provenance
+        self._jobplan = None  # see the class docstring: built on first run()
+
+    # ------------------------------------------------------------------
+    # Derived from ``kernel_provenance`` rather than stored, so the two cannot
+    # disagree if ``kernel_provenance`` is ever reassigned.
+    # ------------------------------------------------------------------
+    @property
+    def profiler_event_name(self) -> str | None:
+        if self.kernel_provenance is None:
+            return None
+        return format_kernel_provenance_event_name(self.kernel_provenance)
+
+    # ------------------------------------------------------------------
+    # Lazy jobplan initialisation
+    # ------------------------------------------------------------------
+    @property
+    def jobplan(self):
+        if self._jobplan is None:
+            logger.debug(
+                "Initialising jobplan for %s from %s", self.kernel_name, self.code_dir
             )
-            # Rejection is intentionally fail-open: C++ warns and counts
-            # conflicts while the key-bearing name remains the compatibility
-            # join.
-            register_kernel_provenance(
-                self.profiler_event_name,
-                list(kernel_provenance.debug_handle_ids),
-            )
-            with torch.profiler.record_function(f"prepare_kernel:{self.kernel_name}"):
-                self.jobplan = prepare_kernel(
-                    spyrecode_dir,
-                    profiler_name=self.profiler_event_name,
+            # prepare_kernel() → JobPlanBuilder → getDefaultStream() segfaults if
+            # the C++ RuntimeContext is null.  _lazy_init() is idempotent and
+            # ensures start_runtime() has been called before prepare_kernel().
+            torch.spyre._impl._lazy_init()
+            spyrecode_dir = self.code_dir + "/spyreCodeDir"
+            if self.kernel_provenance is None:
+                self._jobplan = prepare_kernel(spyrecode_dir)
+            else:
+                profiler_event_name = self.profiler_event_name
+                # Rejection is intentionally fail-open: C++ warns and counts
+                # conflicts while the key-bearing name remains the compatibility
+                # join.
+                register_kernel_provenance(
+                    profiler_event_name,
+                    list(self.kernel_provenance.debug_handle_ids),
                 )
+                with torch.profiler.record_function(
+                    f"prepare_kernel:{self.kernel_name}"
+                ):
+                    self._jobplan = prepare_kernel(
+                        spyrecode_dir,
+                        profiler_name=profiler_event_name,
+                    )
+        return self._jobplan
 
     @with_ffdc(CATEGORY_RUNTIME_LAUNCH, logger)
     def run(self, *args, symbolic_args: list[SymbolicArg] | None = None, **kw_args):

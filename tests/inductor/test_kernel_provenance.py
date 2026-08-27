@@ -30,6 +30,7 @@ from torch_spyre._C import (
     ElementArrangement,
     extract_kernel_provenance_key as extract_kernel_provenance_key_cpp,
 )
+from torch_spyre._inductor import config as _spyre_config
 from torch_spyre._inductor.op_spec import (
     DebugHandle,
     IndirectAccess,
@@ -544,6 +545,20 @@ class TestKernelProvenanceEventName:
 
 
 class TestKernelProvenancePropagation:
+    @pytest.fixture(autouse=True)
+    def _disable_kernel_cache(self):
+        """Route ``sdsc()`` down the cache-disabled path.
+
+        These tests assert on how provenance reaches the runner, and build
+        minimal synthetic OpSpecs to do it.  The caching path first derives a
+        cache key via ``compute_specs_hash``, which runs the real
+        ``compile_op_spec`` -- that needs fully formed specs and rejects these.
+        Both paths carry provenance identically, so the cheaper one is the one
+        to exercise here.
+        """
+        with _spyre_config.patch("spyre_kernel_cache", False):
+            yield
+
     def test_async_compile_builds_descriptor_from_finalized_specs(self):
         specs = [
             _op(_handle(9)),
@@ -648,9 +663,12 @@ class TestKernelProvenancePropagation:
                 kernel_provenance=descriptor,
             )
 
-        assert runner.kernel_provenance is descriptor
-        assert runner.profiler_event_name == _event_name(descriptor)
-        assert runner.jobplan == "jobplan"
+            # Inside the patch block: ``jobplan`` is lazy, so touching it is
+            # what drives prepare_kernel/register_kernel_provenance.
+            assert runner.kernel_provenance is descriptor
+            assert runner.profiler_event_name == _event_name(descriptor)
+            assert runner.jobplan == "jobplan"
+
         register_kernel_provenance.assert_called_once_with(
             _event_name(descriptor), list(descriptor.debug_handle_ids)
         )
@@ -671,7 +689,193 @@ class TestKernelProvenancePropagation:
         ):
             runner = SpyreSDSCKernelRunner("sdsc_fused_mm_0", "/tmp/kernel")
 
-        assert runner.kernel_provenance is None
-        assert runner.profiler_event_name is None
+            assert runner.kernel_provenance is None
+            assert runner.profiler_event_name is None
+            # Lazy: this is what drives the prepare_kernel call asserted below.
+            assert runner.jobplan == "jobplan"
+
         prepare_kernel.assert_called_once_with("/tmp/kernel/spyreCodeDir")
         register_kernel_provenance.assert_not_called()
+
+
+class TestKernelProvenanceCache:
+    """Cache-aware provenance tests: verify descriptor + cache interaction."""
+
+    def _make_simple_spec(self, handle_id: int) -> OpSpec:
+        """Create a minimal OpSpec with given handle ID."""
+        handle = _handle(
+            handle_id,
+            source=SourceLoc("/code.py", 10),
+            aten_op="aten.mm.default",
+        )
+        return _op(handle, op="matmul")
+
+    def test_cache_miss_and_hit_consistency(self):
+        """Unified test: miss/hit consistency, provenance fail-safe, key stability.
+
+        Combines three scenarios under shared mock context:
+        1. Cache miss → hit produces identical event names (flow consistency)
+        2. Provenance failure is handled gracefully (fail-safe path)
+        3. Descriptor key extracted from event name is stable (key consistency)
+        """
+        with (
+            patch(
+                "torch_spyre.execution.async_compile.get_output_dir",
+                return_value="/tmp/kernel",
+            ),
+            patch("torch_spyre.execution.async_compile.generate_bundle"),
+            patch("torch_spyre.execution.async_compile.subprocess.run"),
+            patch("torch_spyre._inductor.config.spyre_kernel_cache", True),
+            patch(
+                "torch_spyre.execution.async_compile.compute_specs_hash",
+                return_value="test_key",
+            ),
+            patch(
+                "torch_spyre.execution.async_compile.get_cached_kernel_dir",
+            ) as mock_cache_get,
+            patch(
+                "torch_spyre.execution.async_compile.allocate_compile_dir",
+                return_value="/tmp/compile_dir",
+            ),
+            patch(
+                "torch_spyre.execution.async_compile.commit_compile_dir",
+                return_value="/tmp/kernel_cached",
+            ),
+            patch(
+                "torch_spyre.execution.kernel_runner.prepare_kernel",
+                return_value="jobplan",
+            ) as mock_prepare,
+            patch(
+                "torch_spyre.execution.kernel_runner.register_kernel_provenance",
+            ) as mock_register,
+            # Patch only _lazy_init, not the whole ``torch`` module.  A blanket
+            # ``patch(...kernel_runner.torch)`` also replaces
+            # ``torch.profiler.record_function`` with a MagicMock *and* turns
+            # _lazy_init into a mock that silently succeeds -- so deleting the
+            # segfault guard entirely would still pass.  Patching just this one
+            # attribute keeps the guard observable (asserted below).
+            patch(
+                "torch.spyre._impl._lazy_init",
+            ) as mock_lazy_init,
+        ):
+            # Scenario 1: Cache miss → hit consistency
+            specs_42 = [self._make_simple_spec(42)]
+            mock_cache_get.return_value = None
+            compiler = SpyreAsyncCompile()
+            runner_miss = compiler.sdsc("test_kernel", specs_42)
+            assert runner_miss.kernel_provenance is not None
+            event_name_miss = runner_miss.profiler_event_name
+
+            mock_cache_get.return_value = "/tmp/kernel_cached"
+            runner_hit = compiler.sdsc("test_kernel", specs_42)
+            assert runner_hit.kernel_provenance is not None
+            event_name_hit = runner_hit.profiler_event_name
+
+            assert event_name_miss == event_name_hit, (
+                f"Cache miss and hit should have same event name. "
+                f"Miss: {event_name_miss}, Hit: {event_name_hit}"
+            )
+
+            # Scenario 2: Provenance failure handled (fail-safe)
+            specs_99 = [self._make_simple_spec(99)]
+            with patch(
+                "torch_spyre.execution.async_compile.build_kernel_provenance_descriptor",
+                side_effect=Exception("Provenance construction failed"),
+            ):
+                mock_cache_get.return_value = None
+                runner_fail_safe = compiler.sdsc("test_kernel_failsafe", specs_99)
+
+            assert runner_fail_safe.kernel_provenance is None
+            assert runner_fail_safe.profiler_event_name is None
+            mock_lazy_init.reset_mock()
+            _ = runner_fail_safe.jobplan
+            mock_prepare.assert_called()
+            # prepare_kernel() -> JobPlanBuilder -> getDefaultStream() segfaults
+            # on a null C++ RuntimeContext, so the jobplan path must always run
+            # _lazy_init() first -- including on the no-provenance branch.
+            mock_lazy_init.assert_called()
+
+            # Scenario 3: Key consistency (extraction matches descriptor)
+            specs_77 = [self._make_simple_spec(77)]
+            mock_cache_get.return_value = None
+            mock_prepare.reset_mock()
+            mock_register.reset_mock()
+
+            runner_key = compiler.sdsc("test_kernel_key", specs_77)
+            assert runner_key.kernel_provenance is not None
+            descriptor_key = runner_key.kernel_provenance.key
+            extracted_key = extract_kernel_provenance_key(
+                runner_key.profiler_event_name
+            )
+
+            assert extracted_key == descriptor_key, (
+                f"Extracted key {extracted_key} doesn't match descriptor {descriptor_key}"
+            )
+
+            mock_lazy_init.reset_mock()
+            _ = runner_key.jobplan
+            mock_register.assert_called()
+            # Same guard on the provenance-bearing branch.
+            mock_lazy_init.assert_called()
+
+    def test_cache_enabled_vs_disabled_provenance_equivalence(self):
+        """Cache enabled vs disabled must produce the same profiler event name.
+
+        Provenance identity is derived from the finalized specs, so whether the
+        bundle came from a fresh compile or from the kernel cache must not change
+        how the kernel is named to the profiler.
+        """
+        with (
+            patch(
+                "torch_spyre.execution.async_compile.get_output_dir",
+                return_value="/tmp/kernel",
+            ),
+            patch("torch_spyre.execution.async_compile.generate_bundle"),
+            patch("torch_spyre.execution.async_compile.subprocess.run"),
+            patch(
+                "torch_spyre.execution.async_compile.compute_specs_hash",
+                return_value="cache_key",
+            ),
+            patch(
+                "torch_spyre.execution.async_compile.get_cached_kernel_dir",
+            ) as mock_cache_get,
+            patch(
+                "torch_spyre.execution.async_compile.allocate_compile_dir",
+                return_value="/tmp/compile",
+            ),
+            patch(
+                "torch_spyre.execution.async_compile.commit_compile_dir",
+                return_value="/tmp/cached",
+            ),
+            patch(
+                "torch_spyre.execution.kernel_runner.prepare_kernel",
+                return_value="jobplan",
+            ),
+            # See the note in test_cache_miss_and_hit_consistency: patch only
+            # _lazy_init so the segfault guard stays observable.
+            patch("torch.spyre._impl._lazy_init") as mock_lazy_init,
+        ):
+            specs_55 = [self._make_simple_spec(55)]
+
+            with patch("torch_spyre._inductor.config.spyre_kernel_cache", False):
+                compiler1 = SpyreAsyncCompile()
+                runner_disabled = compiler1.sdsc("test_kernel", specs_55)
+                event_name_disabled = runner_disabled.profiler_event_name
+
+            with patch("torch_spyre._inductor.config.spyre_kernel_cache", True):
+                compiler2 = SpyreAsyncCompile()
+                mock_cache_get.return_value = None
+                runner_enabled = compiler2.sdsc("test_kernel", specs_55)
+                event_name_enabled = runner_enabled.profiler_event_name
+
+            assert event_name_disabled == event_name_enabled, (
+                f"Cache-disabled and enabled should produce same event name. "
+                f"Disabled: {event_name_disabled}, Enabled: {event_name_enabled}"
+            )
+
+            # The jobplan path runs _lazy_init() before prepare_kernel()
+            # regardless of which cache mode produced the runner.
+            for runner in (runner_disabled, runner_enabled):
+                mock_lazy_init.reset_mock()
+                _ = runner.jobplan
+                mock_lazy_init.assert_called()

@@ -12,11 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import shutil
 import tempfile
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 from collections.abc import Sequence
 import os
-import shutil
 import subprocess
 import torch
 import uuid
@@ -37,6 +37,17 @@ from torch_spyre._inductor.kernel_provenance import (
 from torch_spyre._inductor.codegen.bundle import generate_bundle
 from torch_spyre.profiler._ffdc import CATEGORY_COMPILE_BACKEND, try_collect
 from .kernel_runner import SpyreSDSCKernelRunner, SpyreUnimplementedRunner
+from .kernel_cache import (
+    allocate_compile_dir,
+    commit_compile_dir,
+    compute_specs_hash,
+    get_cache_root_dir,
+    get_cached_kernel_dir,
+    retain_failed_compile_dir,
+)
+
+if TYPE_CHECKING:
+    from torch_spyre._inductor.kernel_provenance import KernelProvenanceDescriptor
 
 logger = get_inductor_logger("sdsc_compile")
 
@@ -82,6 +93,40 @@ def get_output_dir(kernel_name: str):
     return kernel_output_dir
 
 
+def _compile_bundle_in_dir(
+    kernel_name: str,
+    output_dir: str,
+    specs: Sequence[OpSpec | LoopSpec | UnimplementedOp],
+    pool_size: int = 0,
+) -> None:
+    """Emit the SDSC bundle into ``output_dir`` and compile it with dxp_standalone.
+
+    The single compile step shared by the cache-miss and cache-disabled paths:
+    both need exactly this, so neither owns it.  ``generate_bundle`` is inside
+    the collected region because a bundle we failed to emit is as much a
+    backend-compile failure as one dxp_standalone rejected, and the FFDC report
+    is the only place that distinction is recoverable after the fact.
+
+    Collects FFDC once and re-raises unchanged -- callers clean up ``output_dir``
+    themselves, so the report is written while the directory it names still
+    exists.
+    """
+    try:
+        generate_bundle(kernel_name, output_dir, specs, pool_size=pool_size)
+
+        with torch.profiler.record_function(f"dxp_standalone:{kernel_name}"):
+            subprocess.run(["dxp_standalone", "-d", output_dir], check=True)
+    except Exception as exc:
+        try_collect(
+            exc,
+            logger=logger,
+            failure_category=CATEGORY_COMPILE_BACKEND,
+            kernel_name=kernel_name,
+            code_dir=output_dir,
+        )
+        raise
+
+
 class SpyreAsyncCompile(AsyncCompile):
     """Spyre kernel compilation (`sdsc`), plus the upstream AsyncCompile.
 
@@ -96,6 +141,12 @@ class SpyreAsyncCompile(AsyncCompile):
         super().__init__()
         self._provenance_attempt_count = 0
         self._provenance_failure_count = 0
+        if _spyre_config.spyre_kernel_cache:
+            logger.info(
+                "Spyre kernel cache enabled; cache root: %s", get_cache_root_dir()
+            )
+        else:
+            logger.info("Spyre kernel cache disabled")
 
     def triton(self, *args, **kwargs):
         raise NotImplementedError(
@@ -108,6 +159,31 @@ class SpyreAsyncCompile(AsyncCompile):
             "SpyreAsyncCompile does not support the cpp() path; CPU kernels "
             "go through cpp_pybinding (cpu_backend='cpp')."
         )
+
+    def _build_provenance(
+        self,
+        kernel_name: str,
+        specs: Sequence[OpSpec | LoopSpec | UnimplementedOp],
+    ) -> "KernelProvenanceDescriptor | None":
+        """Return the provenance identity for ``specs``, or None if it fails."""
+        self._provenance_attempt_count += 1
+        try:
+            finalized_specs = cast(Sequence[OpSpec | LoopSpec], specs)
+            return build_kernel_provenance_descriptor(finalized_specs)
+        except Exception:  # noqa: BLE001 - provenance must never fail the build
+            # Keep canonicalization strict rather than issuing an ambiguous
+            # fallback key. Log the first traceback, then report the complete
+            # failure count at the generated wrapper's wait() boundary.
+            self._provenance_failure_count += 1
+            if self._provenance_failure_count == 1:
+                logger.warning(
+                    "kernel provenance descriptor construction failed for kernel "
+                    "%s; continuing without kernel provenance; additional "
+                    "failures in this compilation will be summarized",
+                    kernel_name,
+                    exc_info=True,
+                )
+            return None
 
     def sdsc(
         self,
@@ -122,49 +198,79 @@ class SpyreAsyncCompile(AsyncCompile):
             )
             return SpyreUnimplementedRunner(kernel_name, unimp.op)
 
-        # Generate SDSC Bundle from OpSpecs
-        output_dir = get_output_dir(kernel_name)
-        generate_bundle(kernel_name, output_dir, specs, pool_size=pool_size)
+        kernel_provenance = self._build_provenance(kernel_name, specs)
 
-        self._provenance_attempt_count += 1
-        try:
-            # This is the common fresh-compile/cache-reload boundary: generated
-            # wrappers have reconstructed the finalized OpSpecs before calling
-            # sdsc(). Derive the transport-neutral identity here without changing
-            # the generated wrapper call ABI.
-            finalized_specs = cast(Sequence[OpSpec | LoopSpec], specs)
-            kernel_provenance = build_kernel_provenance_descriptor(finalized_specs)
-        except Exception:  # noqa: BLE001 - provenance must never fail the build
-            # Keep canonicalization strict rather than issuing an ambiguous
-            # fallback key. Log the first traceback, then report the complete
-            # failure count at the generated wrapper's wait() boundary.
-            self._provenance_failure_count += 1
-            if self._provenance_failure_count == 1:
-                logger.warning(
-                    "kernel provenance descriptor construction failed for kernel "
-                    "%s; continuing without kernel provenance; additional "
-                    "failures in this compilation will be summarized",
+        use_cache = _spyre_config.spyre_kernel_cache and not (
+            torch._inductor.config.force_disable_caches
+        )
+
+        if use_cache:
+            # Hash the specs in-memory BEFORE any disk I/O.  On a cache hit
+            # neither generate_bundle nor dxp_standalone runs at all.
+            cache_key = compute_specs_hash(specs, pool_size=pool_size)
+            logger.debug("Bundle cache key: %s", cache_key)
+
+            cached_dir = get_cached_kernel_dir(cache_key)
+            if cached_dir is not None:
+                logger.debug("Cache HIT: Using cached kernel from: %s", cached_dir)
+                # Runner points at the persistent cache dir, not a temp dir, so
+                # the path stays valid for every later process that re-executes
+                # this wrapper (e.g. on an FxGraphCache hit) and lands here.
+                return SpyreSDSCKernelRunner(
                     kernel_name,
-                    exc_info=True,
+                    cached_dir,
+                    kernel_provenance=kernel_provenance,
                 )
-            kernel_provenance = None
 
-        # Invoke backend compiler of SDSC Bundle
-        with torch.profiler.record_function(f"dxp_standalone:{kernel_name}"):
+            logger.debug("Cache MISS: Compiling kernel")
+
+            # Allocate a temp dir INSIDE the cache root (same filesystem) so
+            # the rename in commit_compile_dir is atomic on POSIX.  There is
+            # no separate workspace: dxp_standalone writes directly here.
+            compile_dir = allocate_compile_dir(cache_key)
             try:
-                subprocess.run(
-                    ["dxp_standalone", "-d", output_dir],
-                    check=True,
+                _compile_bundle_in_dir(
+                    kernel_name, compile_dir, specs, pool_size=pool_size
                 )
-            except Exception as exc:
-                try_collect(
-                    exc,
-                    logger=logger,
-                    failure_category=CATEGORY_COMPILE_BACKEND,
-                    kernel_name=kernel_name,
-                    code_dir=output_dir,
-                )
+            except Exception:
+                # Never published, so nothing can observe it as a cache entry --
+                # but keep the artifacts: re-running `dxp_standalone -d <dir>`
+                # on them is how this failure gets debugged.  It moves out of
+                # the cache root because that is the commit namespace, not a
+                # place to leave half-written bundles.
+                retained = retain_failed_compile_dir(compile_dir, cache_key)
+                if retained is not None:
+                    logger.warning(
+                        "Kernel %s failed to compile; retained bundle for "
+                        "debugging at %s",
+                        kernel_name,
+                        retained,
+                    )
                 raise
+
+            # Outside the cleanup guard on purpose: once commit runs, the temp
+            # dir may already be renamed away, so a commit failure must not
+            # send us to rmtree a path that is now the live cache entry.
+            cached_dir = commit_compile_dir(compile_dir, cache_key)
+            logger.debug("Kernel compiled and cached at: %s", cached_dir)
+            return SpyreSDSCKernelRunner(
+                kernel_name,
+                cached_dir,
+                kernel_provenance=kernel_provenance,
+            )
+
+        # Caching disabled (SPYRE_KERNEL_CACHE=0 or force_disable_caches).
+        output_dir = get_output_dir(kernel_name)
+        try:
+            _compile_bundle_in_dir(kernel_name, output_dir, specs, pool_size=pool_size)
+        except Exception:
+            # Deliberately kept, useful for debugging
+            logger.warning(
+                "Kernel %s failed to compile; retained bundle for debugging at %s",
+                kernel_name,
+                output_dir,
+            )
+            raise
 
         return SpyreSDSCKernelRunner(
             kernel_name,

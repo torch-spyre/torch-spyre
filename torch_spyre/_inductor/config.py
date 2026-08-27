@@ -166,9 +166,16 @@ layout_solver: Literal[
     "greedy", "bestfit", "firstfit", "cpsat", "simulated_annealing"
 ] = os.environ.get("LAYOUT_SOLVER", "cpsat")  # type: ignore[assignment]
 
+# Enable/disable persistent caching of compiled SDSC kernels.
+# When enabled, compiled artifacts are stored in content-addressed directories
+# under {cache_dir}/inductor-spyre-cache/ and reused across torch.compile
+# invocations.
+spyre_kernel_cache: bool = os.environ.get("SPYRE_KERNEL_CACHE", "1") == "1"
+
 # OpSpec validation at pipeline stage boundaries. Enabled by default to catch
 # invariant violations early. Set SPYRE_VALIDATE_OP_SPECS=0 to disable.
 validate_op_specs: bool = os.environ.get("SPYRE_VALIDATE_OP_SPECS", "1") == "1"
+
 # Use the C++ (native) permutation-layout packer accelerator, which the
 # simulated-annealing layout solver drives. The native and Python packers are
 # behaviourally identical (verified bit-for-bit); the native one is faster. Set

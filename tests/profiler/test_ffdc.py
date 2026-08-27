@@ -954,6 +954,11 @@ class TestFfdcAsyncCompile:
         monkeypatch.setattr(mod, "get_output_dir", lambda name: out_dir)
         monkeypatch.setattr(mod, "generate_bundle", lambda *a, **k: None)
         monkeypatch.setattr(mod, "find_unimplemented", lambda specs: None)
+        # Exercise the cache-disabled path: ``out_dir`` above is what
+        # ``get_output_dir`` returns, and only that path uses it -- the caching
+        # path derives its own dir from a cache key whose computation pulls in
+        # the codegen stack this stub environment deliberately does not build.
+        monkeypatch.setattr(mod._spyre_config, "spyre_kernel_cache", False)
         return mod, out_dir
 
     def test_sdsc_dxp_failure_triggers_ffdc_collect(self, monkeypatch, tmp_path):
