@@ -1001,11 +1001,34 @@ def find_matmul_generated_var(
     return next(iter(generated_vars))
 
 
+def _is_scaled_mod(stick_expr: sympy.Expr, elems_per_stick: int) -> bool:
+    """Check for sympy's canonicalized form of ``Mod(coeff * var, elems_per_stick)``.
+
+    ``sympy.Mod(coeff * var, coeff * N)`` auto-simplifies to
+    ``coeff * Mod(var, N)`` whenever ``coeff`` divides the modulus (e.g. a
+    strided/step>1 slice landing inside a single stick). This is the same
+    stick expression as the un-factored ``Mod(var, elems_per_stick)`` case
+    below — just algebraically regrouped by sympy — so it is equally
+    supported, not merely "may be valid".
+    """
+    if not (isinstance(stick_expr, sympy.Mul) and len(stick_expr.args) == 2):
+        return False
+    coeff, mod_term = stick_expr.args
+    if not isinstance(mod_term, sympy.Mod):
+        coeff, mod_term = mod_term, coeff
+    if not (isinstance(mod_term, sympy.Mod) and coeff.is_Integer and coeff > 0):
+        return False
+    base, modulus = mod_term.args
+    return len(base.free_symbols) == 1 and coeff * modulus == elems_per_stick
+
+
 def is_stick_expr_offset_free(stick_expr: sympy.Expr, elems_per_stick: int) -> bool:
     """Check if a stick expression is free of constant offsets.
 
     Returns True for stick expressions with no additive offset:
     - Mod(var, elems_per_stick) where var is a single symbol
+    - coeff * Mod(var, elems_per_stick // coeff) — sympy's canonicalized form
+      of the above when a coefficient divides the modulus (see _is_scaled_mod)
     - A bare variable (symbol)
     - Zero
     """
@@ -1016,7 +1039,12 @@ def is_stick_expr_offset_free(stick_expr: sympy.Expr, elems_per_stick: int) -> b
     )
     is_bare_var = stick_expr.is_symbol
     is_zero = stick_expr == sympy.S.Zero
-    return is_supported_mod or is_bare_var or is_zero
+    return (
+        is_supported_mod
+        or is_bare_var
+        or is_zero
+        or _is_scaled_mod(stick_expr, elems_per_stick)
+    )
 
 
 def _is_stick_expr_with_offset(stick_expr: sympy.Expr, elems_per_stick: int) -> bool:

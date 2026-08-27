@@ -21,6 +21,7 @@ from torch_spyre._C import SpyreTensorLayout
 from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.pass_utils import (
     device_coordinates,
+    is_stick_expr_offset_free,
     try_device_coordinates,
 )
 from torch_spyre._inductor.propagate_layouts import (
@@ -28,6 +29,7 @@ from torch_spyre._inductor.propagate_layouts import (
     _check_supported_input_sticks,
 )
 from torch_spyre._inductor.views import (
+    align_tensors,
     compute_coordinates,
     normalize_coordinates,
     tiling_expr_to_device_expr,
@@ -467,6 +469,91 @@ class TestNormalizeCoordinatesFusion(TestCase):
             ],
         )
         self.assertEqual([int(t.dim_size) for t in terms], [32, 64])
+
+
+class TestScaledModStickExpr(TestCase):
+    """Regression coverage for a strided (step>1) slice landing inside a
+    stick, e.g. ``t[:, ::2].to(torch.float32).to(torch.float16)`` on a
+    [4, 128] fp16 tensor.
+
+    sympy auto-canonicalizes ``Mod(2*d1, 64)`` to ``2*Mod(d1, 32)`` --
+    algebraically identical, just regrouped. Three independent spots assumed
+    the un-factored ``Mod(var, elems_per_stick)`` shape and broke on the
+    canonicalized one:
+
+    1. ``is_stick_expr_offset_free`` rejected the scaled-Mod form outright
+       (``Unexpected stick expression 2*(Mod(d1, 32))``).
+    2. ``align_tensors``'s split-tracking identified "the stick term" by
+       comparing variable identity (``var != stick_dim[i]``) rather than
+       position, so an unrelated outer ("which stick") term sharing the same
+       variable was mistaken for the stick term and had its ``mod`` dropped
+       from ``splits`` (``ValueError: 64 is not in list``).
+    3. ``align_tensors``'s "ensure stick dim var occurs twice" fallback
+       rebuilt the stick coordinate from scratch as plain ``var //
+       elems_per_stick`` / ``var % elems_per_stick``, silently discarding the
+       ``2x`` scale factor whenever the outer segment had been renamed to a
+       synthetic var (e.g. ``z0``) rather than reusing the original name.
+    """
+
+    def _dtype(self):
+        return SpyreTensorLayout([1, 1], torch.float16).device_dtype
+
+    def test_device_coordinates_accepts_scaled_mod(self):
+        dev = self._dtype()
+        d0, d1 = sympy.symbols("d0 d1", integer=True, nonnegative=True)
+        # arg0_1: [4, 128] fp16, tiled into 2 sticks of 64; dep reads every
+        # other column (the `::2` slice), ranges {d0: 4, d1: 64}.
+        dep = MemoryDep("buf", 128 * d0 + 2 * d1, (d0, d1), (4, 64))
+        stl = SpyreTensorLayout([2, 4, 64], [64, 128, 1], dev)
+        coords = device_coordinates(stl, dep, None)  # must not raise
+        self.assertEqual(coords[-1], 2 * sympy.Mod(d1, 32))
+
+    def test_is_stick_expr_offset_free_scaled_mod_forms(self):
+        d1 = sympy.Symbol("d1", integer=True, nonnegative=True)
+        # sympy's canonicalized coeff*Mod(var, N) form, coeff*N == stick size.
+        self.assertTrue(is_stick_expr_offset_free(sympy.Mod(2 * d1, 64), 64))
+        # Un-scaled forms still work as before.
+        self.assertTrue(is_stick_expr_offset_free(sympy.Mod(d1, 64), 64))
+        self.assertTrue(is_stick_expr_offset_free(d1, 64))
+        # A coefficient that does not evenly divide the stick size is not a
+        # representable stick expression.
+        self.assertFalse(is_stick_expr_offset_free(3 * sympy.Mod(d1, 64), 128))
+
+    def test_align_tensors_scaled_mod_stick_dim(self):
+        d0, d1 = sympy.symbols("d0 d1", integer=True, nonnegative=True)
+        iteration_space = {d0: (4, 1), d1: (64, 1)}
+        tensors = [
+            {
+                "size": [2, 4, 64],
+                "coordinates": [sympy.floor(d1 / 32), d0, 2 * sympy.Mod(d1, 32)],
+            },
+        ]
+        _, new_tensors = align_tensors(iteration_space, tensors)  # must not raise
+        # The final (stick-dim) coordinate must retain the *2 scale factor;
+        # it must not collapse to the unscaled `Mod(d1, 64)`.
+        self.assertEqual(new_tensors[0]["coordinates"][-1], 2 * sympy.Mod(d1, 32))
+
+    def test_align_tensors_matmul_unaffected(self):
+        # Matmul's "outer chunk" term legitimately shares its variable with
+        # the stick term (e.g. floor(c2/64) alongside Mod(c2, 64)) without
+        # any coefficient. This must decompose exactly as before the fix.
+        c0, c1, c2 = sympy.symbols("c0 c1 c2", integer=True, nonnegative=True)
+        iteration_space = {c0: (64, 4), c1: (256, 4), c2: (128, 2)}
+        tensors = [
+            {
+                "size": [2, 64, 64],
+                "coordinates": [sympy.floor(c2 / 64), c0, sympy.Mod(c2, 64)],
+            },
+        ]
+        new_splits, new_tensors = align_tensors(iteration_space, tensors)
+        self.assertEqual(new_splits, iteration_space)
+        self.assertEqual(
+            new_tensors[0],
+            {
+                "size": [2, 64, 64],
+                "coordinates": [sympy.floor(c2 / 64), c0, sympy.Mod(c2, 64)],
+            },
+        )
 
 
 if __name__ == "__main__":

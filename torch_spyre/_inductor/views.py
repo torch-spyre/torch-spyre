@@ -661,14 +661,30 @@ def align_tensors(
     splits: dict[sympy.Symbol, sympy.Expr] = {var: set() for var in all_vars}
 
     for i, terms in enumerate(all_terms):
-        for num, den, var, mod, dim_size, offset in [astuple(term) for term in terms]:
+        n_terms = len(terms)
+        for j, term in enumerate(terms):
+            num, den, var, mod, dim_size, offset = astuple(term)
             if var is not None:
                 if den != stick_size[i] or var != stick_dim[i]:
                     # add den to splits unless stick dim and stick size
                     splits[var].add(den)
+                # Identify the stick term by position (it is always
+                # terms[-1]), not by comparing `var` to stick_dim[i]: a
+                # strided (step>1) access landing inside a stick can reuse
+                # the same variable for both the stick term and an outer
+                # (e.g. num-sticks-selector) term, and that outer term's
+                # `mod` can coincidentally equal the stick size too (e.g.
+                # when the variable's own full range equals the stick size).
+                # Comparing by variable alone would then wrongly treat the
+                # outer term as the stick term, dropping its mod from
+                # splits. den (above) does not need this: the outer term's
+                # den only equals stick_size for the genuine "elided outer
+                # stick dim" pattern (see the mirroring check at the
+                # reconstruction site below), which is safe to key off var.
+                is_stick_term = j == n_terms - 1
                 if (
                     mod != stick_size[i]
-                    or var != stick_dim[i]
+                    or not is_stick_term
                     or var in repeat_info.keys()
                 ):
                     # add mod to splits unless stick dim and stick size
@@ -794,8 +810,14 @@ def align_tensors(
         # add stick dim
         num, den, var, mod, dim_size, offset = astuple(terms[-1])
         size.append(dim_size)
+        # (var * num // den) generalizes to `var` for the common num=1, den=1
+        # case; the explicit scale is needed for a strided (step>1) access
+        # landing inside a stick (e.g. a `::2` slice feeding a same-size
+        # dtype conversion), where the stick coordinate is `coeff * var`, not
+        # bare `var`.
         coordinates.append(
-            (var % dim_size if var is not None else sympy.S.Zero) + offset
+            ((var * num // den) % dim_size if var is not None else sympy.S.Zero)
+            + offset
         )
         new_tensors.append({"size": size, "coordinates": coordinates})
 
@@ -829,6 +851,16 @@ def align_tensors(
         vars = t["coordinates"][-1].free_symbols
         if len(vars) == 1:
             stick_dim_var = next(iter(vars))
+            if len(remap.get(stick_dim_var, [stick_dim_var])) > 1:
+                # Already decomposed by the split/remap machinery above: its
+                # outer segment lives under a synthetic var (e.g. z0), not
+                # stick_dim_var itself, so the free-symbol scan below can
+                # never find it there. That is not a real gap -- skip this
+                # tensor rather than clobber the (already correct, and
+                # possibly scaled, e.g. `coeff * Mod(var, N)`) stick
+                # coordinate with a plain var // size / var % size pairing
+                # that ignores the split boundaries and any coefficient.
+                continue
             found = False
             for i in range(len(t["coordinates"]) - 1):
                 vars = t["coordinates"][i].free_symbols
