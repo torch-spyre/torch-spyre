@@ -347,6 +347,8 @@ def core_mappings_equal(
         for dim in left
         for core in range(num_cores)
     )
+
+
 def partition_physical_span_bytes(
     device_size: Sequence[int],
     stride_map: Sequence[int],

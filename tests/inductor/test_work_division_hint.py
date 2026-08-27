@@ -37,6 +37,7 @@ from torch._inductor.test_case import TestCase as InductorTestCase
 from torch._inductor.utils import run_and_get_code, InputType
 
 from torch_spyre._inductor import config, spyre_hint
+import torch_spyre._inductor.scratchpad.allocator as allocator_module
 import torch_spyre._inductor.scratchpad.lx_relayout as lx_relayout_module
 import torch_spyre._inductor.scheduler as scheduler_module
 import torch_spyre._inductor.work_division as _wd
@@ -44,6 +45,7 @@ import torch_spyre._inductor.wsr.propagate_named_dims as _pnd
 from torch_spyre._C import DataFormats
 from torch_spyre._inductor.codegen.superdsc import compile_op_spec, parse_op_spec
 from torch_spyre._inductor.constants import IDENTITY_OP
+from torch_spyre._inductor.core_mapping import remap_work_division
 from torch_spyre._inductor.scratchpad.lx_relayout import (
     FinalLXView,
     LXRelayoutPlan,
@@ -54,7 +56,6 @@ from torch_spyre._inductor.pass_utils import PerCoreView
 from torch_spyre._inductor.scratchpad.allocator import ScratchpadAllocator
 from torch_spyre._inductor.scratchpad.greedy_solver import GreedyLayoutSolver
 from torch_spyre._inductor.scratchpad.plan_solver import LifetimeBoundBuffer
-from torch_spyre._inductor.core_mapping import remap_work_division
 from torch_spyre._inductor.spyre_kernel import simplify_op_spec
 
 _LAUNCH_JOBPLAN = "torch_spyre.execution.kernel_runner.launch_jobplan"
@@ -614,6 +615,24 @@ def test_partition_footprint_counts_strided_span_not_elements():
         )
         == 19 * 128
     )
+
+
+def test_partition_footprints_skip_buffers_without_concrete_layout():
+    dep = SimpleNamespace(name="multi_output")
+
+    def unavailable_layout():
+        raise NotImplementedError("MultiOutputLayout")
+
+    graph = SimpleNamespace(
+        operations=[SimpleNamespace()],
+        try_get_buffer=lambda _name: SimpleNamespace(get_layout=unavailable_layout),
+    )
+    read_writes = SimpleNamespace(reads=[], writes=[dep])
+    with (
+        mock_patch.object(allocator_module, "MemoryDep", SimpleNamespace),
+        mock_patch.object(allocator_module, "op_read_writes", return_value=read_writes),
+    ):
+        assert ScratchpadAllocator._partition_footprints(graph, {dep.name: 1}) == {}
 
 
 def test_final_view_maps_stick_split_to_outer_device_dimension():

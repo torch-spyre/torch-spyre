@@ -832,7 +832,10 @@ class ScratchpadAllocator:
                 buffer = graph.try_get_buffer(dep.name)
                 if buffer is None:
                     continue
-                layout = buffer.get_layout()
+                try:
+                    layout = buffer.get_layout()
+                except NotImplementedError:
+                    continue
                 if not isinstance(layout, FixedTiledLayout):
                     continue
                 view, partial, representable = _per_core_view_on_buf(
@@ -864,7 +867,10 @@ class ScratchpadAllocator:
             buffer = graph.try_get_buffer(name)
             if buffer is None:
                 continue
-            layout = buffer.get_layout()
+            try:
+                layout = buffer.get_layout()
+            except NotImplementedError:
+                continue
             if not isinstance(layout, FixedTiledLayout):
                 continue
             device_layout = layout.device_layout

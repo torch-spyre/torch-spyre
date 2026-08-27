@@ -73,6 +73,17 @@ from . import config as _spyre_config
 logger = get_inductor_logger("scheduler")
 
 
+def _fixed_tiled_layout(name: str) -> FixedTiledLayout | None:
+    buffer = V.graph.try_get_buffer(name)
+    if buffer is None:
+        return None
+    try:
+        layout = buffer.get_layout()
+    except NotImplementedError:
+        return None
+    return layout if isinstance(layout, FixedTiledLayout) else None
+
+
 def _scheduled_work_division(
     node: SchedulerNode,
     dep: MemoryDep,
@@ -81,11 +92,8 @@ def _scheduled_work_division(
 ) -> TensorWorkDivision | None:
     """Project a physical partition into final scheduled loop symbols."""
 
-    buffer = V.graph.try_get_buffer(name)
-    if buffer is None:
-        return None
-    layout = buffer.get_layout()
-    if not isinstance(layout, FixedTiledLayout):
+    layout = _fixed_tiled_layout(name)
+    if layout is None:
         return None
     coordinates = try_device_coordinates(layout.device_layout, dep, None)
     if coordinates is None:
@@ -385,14 +393,8 @@ def _lx_resident(node: SchedulerNode) -> bool:
 
 
 def _lx_view(name: str):
-    buffer = V.graph.try_get_buffer(name)
-    if buffer is None:
-        return None
-    try:
-        layout = buffer.get_layout()
-    except NotImplementedError:
-        return None
-    if not isinstance(layout, FixedTiledLayout):
+    layout = _fixed_tiled_layout(name)
+    if layout is None:
         return None
     if "lx" not in layout.allocation:
         return None
@@ -695,12 +697,10 @@ def demote_incoherent_lx_buffers(
             counters["torch_spyre"]["lx_relayout_gate_demoted_with_hbm_clone"] += 1
             demote_lx_relayout_group(V.graph, source_name, reason)
             return
-        buffer = V.graph.try_get_buffer(source_name)
-        if buffer is not None:
-            layout = buffer.get_layout()
-            if isinstance(layout, FixedTiledLayout):
-                layout.allocation.pop("lx", None)
-                layout.lx_view = None
+        layout = _fixed_tiled_layout(source_name)
+        if layout is not None:
+            layout.allocation.pop("lx", None)
+            layout.lx_view = None
         logger.info("demoted %s out of LX: %s", source_name, reason)
 
     for source_name, reason in invalid_sources.items():
@@ -785,11 +785,8 @@ def demote_incoherent_lx_buffers(
             dep.name
             for dep in (*node.read_writes.reads, *node.read_writes.writes)
             if isinstance(dep, MemoryDep)
-            and (
-                (buffer := V.graph.try_get_buffer(dep.name)) is not None
-                and isinstance((layout := buffer.get_layout()), FixedTiledLayout)
-                and "lx" in layout.allocation
-            )
+            and (layout := _fixed_tiled_layout(dep.name)) is not None
+            and "lx" in layout.allocation
         }
         if not lx_buffers:
             continue
@@ -849,11 +846,8 @@ def demote_incoherent_lx_buffers(
 
     accepted_views: dict[tuple[str, str], FinalLXView] = {}
     for key, final_view in preview_views.items():
-        buffer = V.graph.try_get_buffer(key[1])
-        if buffer is None:
-            continue
-        layout = buffer.get_layout()
-        if isinstance(layout, FixedTiledLayout) and "lx" in layout.allocation:
+        layout = _fixed_tiled_layout(key[1])
+        if layout is not None and "lx" in layout.allocation:
             accepted_views[key] = final_view
     set_final_lx_views(V.graph, accepted_views)
     logger.debug(
