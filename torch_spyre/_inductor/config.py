@@ -157,9 +157,16 @@ sdsc_cache: bool = os.environ.get("SPYRE_INDUCTOR_SDSC_CACHE", "1") == "1"
 #  "greedy":       GreedyLayoutSolver (default),
 #  "bestfit":      BestFitLayoutSolver,
 #  "firstfit":     FirstFitLayoutSolver,
-#  "simulated_annealing":  SimulatedAnnealingLayoutSolver,
+#  "simulated_annealing":  SimulatedAnnealingLayoutSolver, or -- when
+#              ``co_optimizing_lx_planning`` is set -- SaCoOptimizingSolver, the
+#              joint work-division + LX-placement annealer. Two different
+#              solvers sharing one config value, not one solver in two modes.
 #  "cpsat":    CpSatLayoutSolver (OR-Tools CP-SAT joint core-division +
 #              LX placement, minimizing HBM transfer traffic).
+#
+# For "cpsat" and "simulated_annealing" the value names a solver *family* whose
+# joint-ness is selected by ``co_optimizing_lx_planning``; for the gap-based
+# solvers that same flag instead wraps them in ExhaustiveSearchSolver.
 
 # TODO(isuruf): Change to firstfit when deeptools PR4298 lands
 layout_solver: Literal[
@@ -169,9 +176,11 @@ layout_solver: Literal[
 # OpSpec validation at pipeline stage boundaries. Enabled by default to catch
 # invariant violations early. Set SPYRE_VALIDATE_OP_SPECS=0 to disable.
 validate_op_specs: bool = os.environ.get("SPYRE_VALIDATE_OP_SPECS", "1") == "1"
-# Use the C++ (native) permutation-layout packer accelerator, which the
-# simulated-annealing layout solver drives. The native and Python packers are
-# behaviourally identical (verified bit-for-bit); the native one is faster. Set
+
+# Use the C++ (native) permutation-layout packer accelerator, which both
+# simulated-annealing solvers drive (the layout-only one and the joint
+# co-optimizer). The native and Python packers are behaviourally identical
+# (verified bit-for-bit); the native one is faster. Set
 # False (or ``TORCH_SPYRE_NATIVE_PACKER=0``/``false``, which backs this default)
 # to force the pure-Python packer. A missing native class is a stale or
 # incomplete build, not a supported mode, and raises rather than falling back.

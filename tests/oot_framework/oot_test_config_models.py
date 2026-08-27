@@ -998,6 +998,29 @@ class InputsEdits(BaseModel):
 
         return cpu_args
 
+    def resolved_device_args(
+        self,
+        *,
+        test_device: Optional[torch.device],
+        op_name: str = "",
+    ) -> Dict[int, Any]:
+        """Return {arg_index: test_device} for positional device args.
+
+        ``torch.to("cuda:0")`` names its destination positionally, so it takes
+        the same substitution ``resolved_kwargs`` rule 2 applies to a ``device``
+        kwarg. Only indices holding a device are returned, so callers can overlay
+        them onto CPU-built args without disturbing other values.
+        """
+        out: Dict[int, Any] = {}
+        if test_device is None or op_name != "torch.to":
+            return out
+        for i, raw in enumerate(self.args):
+            arg = _parse_input_arg(raw) if isinstance(raw, dict) else raw
+            val = getattr(arg, "value", None)
+            if isinstance(val, str) and "cuda" in val:
+                out[i] = test_device
+        return out
+
     def resolved_kwargs(
         self,
         *,

@@ -293,15 +293,22 @@ def make_SampleInput(
         elif "value" in inp:
             val = inp["value"]
             if isinstance(val, str):
-                try:
-                    val = ast.literal_eval(val)
-                except (ValueError, SyntaxError):
-                    pass
-                # if test target is tensor.to("cuda:0"), replace "cuda:0" with test_device
                 op_name = case.get("op")
-                if test_device is not None and op_name == "torch.to":
-                    if "cuda" in val:
+                # For tensor.to(...), a string value is either a device
+                # ("cuda:0") or a dtype ("torch.float32"). ast.literal_eval
+                # cannot parse either, so resolve them explicitly.
+                if op_name == "torch.to":
+                    if val.startswith("torch.") and not val.startswith(
+                        ("torch.cuda", "torch.cpu")
+                    ):
+                        val = parse_dtype(val)
+                    elif test_device is not None and "cuda" in val:
                         val = test_device
+                else:
+                    try:
+                        val = ast.literal_eval(val)
+                    except (ValueError, SyntaxError):
+                        pass
             cpu_args.append(val)  # python scalar or list, etc.
         elif "py" in inp:
             cpu_args.append(parse_py_value(inp["py"]))
