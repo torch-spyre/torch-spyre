@@ -20,6 +20,8 @@ import subprocess
 import sys
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+
+import sympy
 from unittest import TestCase
 
 from torch_spyre._inductor import config
@@ -61,6 +63,24 @@ from torch_spyre._inductor.scratchpad.simulated_annealing import (
 LARGE_SIZE = 512
 SMALL_SIZE = 10
 ALIGNMENT = 128
+
+
+class TestCoreDivision(TestCase):
+    def test_symbol_keys_are_sortable_for_signature_and_label(self):
+        x, y = sympy.symbols("x y")
+        division = CoreDivision(
+            output_splits={y: 2, x: 4}, reduction_splits={y: 8, x: 16}
+        )
+
+        self.assertEqual(
+            division.label,
+            "sx/4,sy/2 ~sx/16,~sy/8",
+        )
+        self.assertIsNone(division.signature_key())
+        self.assertEqual(
+            CoreDivision(output_splits={y: 2, x: 4}).signature_key(),
+            ((x, 4), (y, 2)),
+        )
 
 
 class TestLxPlanningContract(TestCase):
