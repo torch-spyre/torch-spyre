@@ -110,7 +110,7 @@ from ..pass_utils import (
     indirect_sizes_from_op,
 )
 from ..ir import FixedTiledLayout, SpyreConstantFallback, _resize_device_layout
-from .tile import compute_tile_index, compute_tile_stride
+from .tile import compute_tile_index, compute_tile_stride, decompose_index_for_tiling
 
 logger = get_inductor_logger("coarse_tile")
 
@@ -4366,6 +4366,56 @@ def _consumer_own_dim_symbol(
     return sympy_index_symbol(f"{prefix}{mapped}")
 
 
+def _index_already_at_new_scale(
+    index: Expr, loop_syms: set, info: "_RetiledBufferInfo"
+) -> bool:
+    """Return True when index's atom coefficients already match new_stride.
+
+    A consumer in the same tiling group as a retiled buffer can be resynced
+    (by name) to a *replacement* ComputedBuffer object spliced in by Pass
+    1/2/3 after ``_apply_plan`` already ran -- see _coarse_tile_common's
+    by-name resync comment above its ``_patch_retiled_load_indexes`` call.
+    That replacement's inner_fn may have been retraced against the
+    producer's already-mutated (new_stride) layout, in which case its load
+    index is already correct and must not be decomposed against old_stride
+    again -- doing so silently produces a wrong, merely plausible-looking
+    index (two dims' coefficients can collide under old_stride's pairing
+    even though the input was never stale -- see
+    test_copy_running_max_4d_H4_Lq4).
+
+    Detected by comparing the *set* of each atom's raw coefficient (before
+    any tile-offset decomposition) against the set of old_stride vs.
+    new_stride values for this buffer's real (non-irregular) dimensions.
+    Each atom's coefficient is exactly one dimension's stride value in
+    whatever scale the trace used -- a single loop variable that
+    legitimately spans multiple dims (the "diagonal" case handled by
+    compute_tile_offset's divmod chain, e.g. test_compute_tile_index_2d_diagonal)
+    produces one atom whose coefficient is a *combined* value that matches
+    neither set exactly, so this check only ever fires on the genuine
+    already-new-scale case, never on a legitimate diagonal index. A
+    coincidental match between the two sets can only happen when
+    old_stride == new_stride for the dims involved (tiling never increases
+    a dim's stride), which is a no-op either way.
+    """
+    try:
+        atoms, _offset = decompose_index_for_tiling(
+            index, {sym: 1 for sym in loop_syms}
+        )
+    except Unsupported:
+        return False
+    if not atoms:
+        return False
+    coeffs = {atom[0] for atom in atoms}
+    dims = [
+        d
+        for d, (s, t) in enumerate(zip(info.old_size, info.old_stride))
+        if s != 1 and t != 0
+    ]
+    old_set = {info.old_stride[d] for d in dims}
+    new_set = {info.new_stride[d] for d in dims}
+    return coeffs == new_set and coeffs != old_set
+
+
 def _retile_load_index(
     buf_name: str,
     index: Expr,
@@ -4416,6 +4466,16 @@ def _retile_load_index(
 
     loop_syms = index.free_symbols
     if not loop_syms:
+        new_index = index
+    elif _index_already_at_new_scale(index, loop_syms, info):
+        # This consumer's index was traced *after* the producer's layout was
+        # already mutated to new_stride (e.g. built/retraced during Pass
+        # 1/2/3, from a same-name replacement object resynced into group_ops
+        # -- see _coarse_tile_common's by-name resync comment), so it is
+        # already correct at the target scale. Rewriting it again would
+        # decompose already-new-scale coefficients against old_stride and
+        # silently produce a wrong (but plausible-looking) index -- see
+        # issue found via test_copy_running_max_4d_H4_Lq4.
         new_index = index
     else:
         new_index = compute_tile_index(

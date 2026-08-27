@@ -968,6 +968,44 @@ class TestRetileLoadIndexFromStrides(unittest.TestCase):
         self.assertEqual(simplify(result_c0 - 64 * c0), 0)
         self.assertEqual(simplify(result_c1 - 32 * c1), 0)
 
+    def test_index_already_at_new_scale_is_left_unchanged(self):
+        # Reproduces test_copy_running_max_4d_H4_Lq4: a [2,32,4096] buffer
+        # tiled on two coarse-tile levels (H then Lq) down to old_stride
+        # (131072, 4096, 1) -> new_stride (4096, 1024, 1). A same-group
+        # consumer resynced to a Pass-1/2/3 replacement object (see
+        # _coarse_tile_common's by-name resync) can have its load index
+        # already retraced at new_stride scale. Rewriting it again against
+        # old_stride would silently collide two dims' coefficients (dim 1's
+        # old_stride 4096 equals dim 0's new_stride 4096) instead of raising
+        # or leaving it alone.
+        d0, d1, d2 = sympy.symbols("d0 d1 d2")
+        info = _RetiledBufferInfo(
+            old_stride=(Integer(131072), Integer(4096), Integer(1)),
+            new_stride=(Integer(4096), Integer(1024), Integer(1)),
+            old_size=(Integer(2), Integer(32), Integer(4096)),
+        )
+        already_fresh_index = 4096 * d0 + 1024 * d1 + d2
+
+        result = _retile_load_index("buf", already_fresh_index, info)
+
+        self.assertEqual(simplify(result - already_fresh_index), 0)
+
+    def test_genuinely_stale_index_at_old_scale_still_rewritten(self):
+        # Same buffer/info as test_index_already_at_new_scale_is_left_unchanged,
+        # but with a genuinely stale index (coefficients at old_stride scale)
+        # -- must still be rewritten to new_stride, not skipped.
+        d0, d1, d2 = sympy.symbols("d0 d1 d2")
+        info = _RetiledBufferInfo(
+            old_stride=(Integer(131072), Integer(4096), Integer(1)),
+            new_stride=(Integer(4096), Integer(1024), Integer(1)),
+            old_size=(Integer(2), Integer(32), Integer(4096)),
+        )
+        stale_index = 131072 * d0 + 4096 * d1 + d2
+
+        result = _retile_load_index("buf", stale_index, info)
+
+        self.assertEqual(simplify(result - (4096 * d0 + 1024 * d1 + d2)), 0)
+
 
 def _make_consumer_with_ranges(ranges):
     """Return a fake ComputedBuffer whose ``.data.ranges`` is ``ranges``.
@@ -1800,6 +1838,69 @@ class TestCoarseTile(unittest.TestCase):
             self.assertIn(full_buf_name, loaded_names)
         finally:
             graph_ctx.__exit__(None, None, None)
+
+    def test_post_stickify_loop_extends_crossing_lifetime(self):
+        """A value born before an automatically-tiled counted loop and read
+        inside it must stay live through the loop (issue #4035).
+
+        Same clobber the ``persistent``/``later`` repro in
+        test_perm_layout_solver.py guards at the solver level, but here the
+        ``lifetime_end_override`` is *computed* by
+        ``counted_loop_lifetime_end_overrides`` for a loop built by the
+        automatic span-overflow entry point, ``coarse_tile_post_stickify``
+        -- not hand-passed, and not hint-driven.  The liveness gap comes
+        from the graph holding one textual copy of the loop body regardless
+        of how the loop was constructed, so overrides must cover this path
+        exactly as they cover explicit ``spyre_hint`` loops.
+        """
+        from collections import namedtuple
+
+        from torch_spyre._inductor.scratchpad.utils import (
+            counted_loop_lifetime_end_overrides,
+        )
+
+        _dep = namedtuple("_dep", ["name"])
+
+        def _stub_read_writes(op, reads, writes):
+            op.get_read_writes.return_value = SimpleNamespace(
+                reads={_dep(name) for name in reads},
+                writes={_dep(name) for name in writes},
+            )
+
+        # Op 0 is born outside the loop; ops 1-3 form one counted loop.
+        # ``reader_x`` reads across the loop boundary; ``reader_i`` reads a
+        # value born inside the same loop.
+        crossing = _make_op(_make_pointwise([Integer(16)]), "crossing")
+        _stub_read_writes(crossing, reads=["arg0"], writes=["crossing"])
+        body_writer = _make_hinted_op(_make_pointwise([Integer(16)]), "body_writer")
+        _stub_read_writes(body_writer, reads=["arg1"], writes=["internal"])
+        reader_x = _make_hinted_op(_make_pointwise([Integer(16)]), "reader_x")
+        _stub_read_writes(reader_x, reads=["crossing"], writes=["reader_x_out"])
+        reader_i = _make_hinted_op(_make_pointwise([Integer(16)]), "reader_i")
+        _stub_read_writes(reader_i, reads=["internal"], writes=["reader_i_out"])
+
+        operations = [crossing, body_writer, reader_x, reader_i]
+        coarse_tile_post_stickify(
+            _graph(operations),
+            [([body_writer, reader_x, reader_i], [(0, Integer(4))])],
+        )
+
+        # The loop body stays ops 1..3: nothing was inserted, the op outside
+        # the group was not stamped, and the group ops carry the loop id.
+        self.assertEqual(len(operations), 4)
+        self.assertFalse(hasattr(crossing, "loop_info"))
+        self.assertEqual(reader_i.loop_info.loop_group_id, (0,))
+
+        overrides = counted_loop_lifetime_end_overrides(
+            SimpleNamespace(operations=operations, graph_input_names=["arg0", "arg1"])
+        )
+
+        # Values born before the loop and read inside it -- the computed
+        # buffer ``crossing`` and the graph input ``arg1`` -- live through
+        # the loop's textual end (exclusive index 4).  ``internal`` is born
+        # and consumed inside the loop: no extension.  ``arg0`` is only read
+        # outside the loop: no extension.
+        self.assertEqual(overrides, {"crossing": 4, "arg1": 4})
 
     def test_end_to_end_shares_one_copy_across_group(self):
         """Full coarse_tile() entry point: two hint-driven ops in one group

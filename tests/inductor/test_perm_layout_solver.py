@@ -1476,6 +1476,23 @@ class NativeSolverDifferentialTests(TestCase):
         self._assert_equal(py_plan, cpp_plan, "pokethrough fast path")
         self._assert_equal(ref_plan, cpp_plan, "pokethrough fast path vs reference")
 
+    def test_native_solver_honors_lifetime_end_override(self):
+        persistent = LifetimeBoundBuffer(
+            "persistent",
+            64,
+            [0, 1],
+            lifetime_end_override=5,
+        )
+        later = LifetimeBoundBuffer("later", 64, [2, 3])
+        buffers = [persistent, later]
+        permutation = [0, 1]
+
+        py_plan = PermutationBasedLayoutSolver(buffers, permutation, 10_000, 1)
+        cpp_plan = NativePermutationLayoutSolver(buffers, permutation, 10_000, 1)
+
+        self._assert_equal(py_plan, cpp_plan, "lifetime end override")
+        self.assertNotEqual(cpp_plan.addresses[0], cpp_plan.addresses[1])
+
     def test_random_mixed_sequences_match_python(self):
         seeds = 4000 if _STRESS else 800
         for seed in range(seeds):
