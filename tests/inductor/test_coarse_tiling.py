@@ -952,6 +952,44 @@ class TestRetileLoadIndexFromStrides(unittest.TestCase):
         self.assertEqual(simplify(result_c0 - 64 * c0), 0)
         self.assertEqual(simplify(result_c1 - 32 * c1), 0)
 
+    def test_index_already_at_new_scale_is_left_unchanged(self):
+        # Reproduces test_copy_running_max_4d_H4_Lq4: a [2,32,4096] buffer
+        # tiled on two coarse-tile levels (H then Lq) down to old_stride
+        # (131072, 4096, 1) -> new_stride (4096, 1024, 1). A same-group
+        # consumer resynced to a Pass-1/2/3 replacement object (see
+        # _coarse_tile_common's by-name resync) can have its load index
+        # already retraced at new_stride scale. Rewriting it again against
+        # old_stride would silently collide two dims' coefficients (dim 1's
+        # old_stride 4096 equals dim 0's new_stride 4096) instead of raising
+        # or leaving it alone.
+        d0, d1, d2 = sympy.symbols("d0 d1 d2")
+        info = _RetiledBufferInfo(
+            old_stride=(Integer(131072), Integer(4096), Integer(1)),
+            new_stride=(Integer(4096), Integer(1024), Integer(1)),
+            old_size=(Integer(2), Integer(32), Integer(4096)),
+        )
+        already_fresh_index = 4096 * d0 + 1024 * d1 + d2
+
+        result = _retile_load_index("buf", already_fresh_index, info)
+
+        self.assertEqual(simplify(result - already_fresh_index), 0)
+
+    def test_genuinely_stale_index_at_old_scale_still_rewritten(self):
+        # Same buffer/info as test_index_already_at_new_scale_is_left_unchanged,
+        # but with a genuinely stale index (coefficients at old_stride scale)
+        # -- must still be rewritten to new_stride, not skipped.
+        d0, d1, d2 = sympy.symbols("d0 d1 d2")
+        info = _RetiledBufferInfo(
+            old_stride=(Integer(131072), Integer(4096), Integer(1)),
+            new_stride=(Integer(4096), Integer(1024), Integer(1)),
+            old_size=(Integer(2), Integer(32), Integer(4096)),
+        )
+        stale_index = 131072 * d0 + 4096 * d1 + d2
+
+        result = _retile_load_index("buf", stale_index, info)
+
+        self.assertEqual(simplify(result - (4096 * d0 + 1024 * d1 + d2)), 0)
+
 
 def _make_consumer_with_ranges(ranges):
     """Return a fake ComputedBuffer whose ``.data.ranges`` is ``ranges``.

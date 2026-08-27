@@ -1935,10 +1935,6 @@ def test_copy_after_reduction_512x256_A4_B4():
     )
 
 
-@pytest.mark.skip(
-    reason="4D H4xLq4 copy_forced into locally-created buffer still mismatches after "
-    "mutation_write_back copy_out fix (39.7% mismatch) -- distinct/deeper bug"
-)
 def test_copy_running_max_4d_H4_Lq4():
     """copy_forced(maximum(real_max, amax(scores,dim=-2)), real_max) on [B,H,Lk,Lq] tiled H÷4 Lq÷4.
 
