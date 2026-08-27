@@ -195,15 +195,54 @@ class TestMultiDimIterationSpaceSplit(unittest.TestCase):
         )
         self.assertEqual(splits[o0], 8)
 
-    def test_committed_minimum_split_can_grow(self):
-        o0, o1 = Symbol("o0"), Symbol("o1")
+    def test_span_floor_can_use_a_larger_nonmultiple_factor(self):
+        o0 = Symbol("o0")
         splits = multi_dim_iteration_space_split(
-            {o0: 16, o1: 16}, 32, [o0, o1], [], min_splits={o0: 2}
+            {o0: 6},
+            3,
+            [o0],
+            [],
+            min_splits={o0: 2},
+            allowed_splits={o0: frozenset({1, 2, 3, 6})},
         )
-        self.assertEqual(splits[o0], 16)
+        self.assertEqual(splits[o0], 3)
 
 
 class TestWorkDivisionCandidates(unittest.TestCase):
+    def test_candidates_respect_span_floor(self):
+        x = _isym("x")
+        op = _computed_buffer((8,), name="span_floor")
+        op._work_division_span_min_splits = {x: 2}
+        output_td = _tensor_dep("span_floor", (8,), (x,))
+        with (
+            patch(
+                "torch_spyre._inductor.work_division.iteration_space_from_op",
+                return_value={x: 8},
+            ),
+            patch(
+                "torch_spyre._inductor.work_division.collect_tensor_deps",
+                return_value=([], output_td),
+            ),
+            patch(
+                "torch_spyre._inductor.work_division.op_read_writes",
+                return_value=MagicMock(writes=[output_td.dep], reads=[]),
+            ),
+            patch(
+                "torch_spyre._inductor.work_division.get_mem_deps_from_rw",
+                return_value=[],
+            ),
+            patch(
+                "torch_spyre._inductor.work_division.adjust_it_space_for_sticks",
+                return_value=({x: 8}, {}),
+            ),
+            patch(
+                "torch_spyre._inductor.work_division.collect_work_division_constraints",
+                return_value=ConstraintResult(allowed_splits={x: frozenset({1, 2, 4})}),
+            ),
+        ):
+            candidates = enumerate_work_division_candidates(op, 8)
+        self.assertEqual(candidates, [{x: 2}, {x: 4}])
+
     def test_candidates_respect_legal_split_domain(self):
         x = _isym("x")
         op = _computed_buffer((8,), name="candidate_domain")

@@ -402,9 +402,12 @@ grow it only to a legal multiple (`4` or `8`) if core budget remains. Thus an
 explicit legal-factor domain can encode a minimum split without a separate
 constraint field. `{2}` instead pins the dimension to exactly `2`.
 
-Span reduction's `min_splits` are separate hardware-span commitments. They are
-applied first and must themselves be members of any applicable
-`allowed_splits` domain.
+Span reduction's `min_splits` are separate hardware-span floors. They are
+applied first, must themselves be members of any applicable `allowed_splits`
+domain, and remain in force for later planning, hints, and LX candidates. The
+floors are retained with the operation's work-division metadata when an IR pass
+reconstructs it. A later split may use any legal factor at least as large as the
+floor; it need not be a multiple of the original span factor.
 
 :::{admonition} What gets written to `iteration_space_ownership`
 :class: note

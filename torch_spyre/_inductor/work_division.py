@@ -168,12 +168,18 @@ def _legal_split_factors(
     v: Symbol,
     basis: int,
     allowed_splits: dict[Symbol, frozenset[int]] | None = None,
+    min_splits: dict[Symbol, int] | None = None,
 ) -> list[int]:
-    """Return legal divisors of ``basis`` for ``v`` in ascending order."""
+    """Return legal divisors of ``basis`` at or above a span-required floor."""
     factors = [int(s) for s in divisors(basis)]
     if allowed_splits is not None and v in allowed_splits:
         factors = [s for s in factors if s in allowed_splits[v]]
-    return factors
+    return [s for s in factors if s >= (min_splits or {}).get(v, 1)]
+
+
+def _span_min_splits(op: ComputedBuffer) -> dict[Symbol, int]:
+    """Return the hard span floors committed by ``span_reduction_pass``."""
+    return getattr(op, "_work_division_span_min_splits", {})
 
 
 def _largest_legal_split(
@@ -199,15 +205,20 @@ def _largest_legal_split_from(
     v: Symbol,
     basis: int,
     current_split: int,
-    n_cores: int,
+    cores_used: int,
+    max_cores: int,
     allowed_splits: dict[Symbol, frozenset[int]] | None = None,
+    min_splits: dict[Symbol, int] | None = None,
 ) -> int:
-    """Largest legal split reachable from ``current_split`` within ``n_cores``."""
+    """Largest legal factor that replaces ``current_split`` within the budget."""
     return next(
         (
             split
-            for split in reversed(_legal_split_factors(v, basis, allowed_splits))
-            if split % current_split == 0 and split // current_split <= n_cores
+            for split in reversed(
+                _legal_split_factors(v, basis, allowed_splits, min_splits)
+            )
+            if split >= current_split
+            and cores_used // current_split * split <= max_cores
         ),
         current_split,
     )
@@ -217,9 +228,11 @@ def _most_splittable_dim(
     dims: list[Symbol],
     iteration_space: dict[Symbol, Expr],
     splits: dict[Symbol, int],
-    n_cores: int,
+    cores_used: int,
+    max_cores: int,
     symbol_meta: SymbolMeta,
     allowed_splits: dict[Symbol, frozenset[int]] | None = None,
+    min_splits: dict[Symbol, int] | None = None,
 ) -> tuple[Symbol, int] | None:
     """Return dim and largest reachable split, or None if no dim can grow."""
     best_dim, best_split = None, 0
@@ -228,8 +241,10 @@ def _most_splittable_dim(
             d,
             _valid_divisor_basis(d, iteration_space, symbol_meta),
             splits[d],
-            n_cores,
+            cores_used,
+            max_cores,
             allowed_splits,
+            min_splits,
         )
         if split > splits[d] and split > best_split:
             best_dim, best_split = d, split
@@ -259,10 +274,10 @@ def multi_dim_iteration_space_split(
     bucket evenly.
 
     ``mandatory_splits`` is a local merge of ``min_splits`` and the smallest
-    legal factor for every domain that excludes one. It never mutates
-    ``min_splits``; each selected factor reserves core budget before greedy
-    distribution and may grow only to a larger legal multiple, preserving its
-    already-partitioned work.
+    legal factor for every domain that excludes one. Each selected factor
+    reserves core budget before greedy distribution. A later factor may replace
+    it when it is legal, no smaller than the span floor, and fits the total
+    core budget.
 
     The product of all splits will be <= max_cores.
     """
@@ -270,7 +285,7 @@ def multi_dim_iteration_space_split(
     is_reduction_included = bool(reduction_dims)
 
     splits = {v: 1 for v in iteration_space}
-    n_cores_remaining = max_cores
+    cores_used = 1
 
     mandatory_splits = dict(min_splits or {})
     if allowed_splits:
@@ -285,7 +300,7 @@ def multi_dim_iteration_space_split(
         )
 
     for var, min_split in mandatory_splits.items():
-        if n_cores_remaining // min_split <= 0:
+        if cores_used * min_split > max_cores:
             raise Unsupported(
                 f"Cannot satisfy mandatory split {min_split} for {var} within "
                 f"{max_cores} cores."
@@ -298,10 +313,10 @@ def multi_dim_iteration_space_split(
                 f"domain {sorted(allowed_splits[var])}."
             )
         splits[var] = min_split
-        n_cores_remaining = n_cores_remaining // min_split
+        cores_used *= min_split
 
     for v in output_dims:
-        if n_cores_remaining <= 1:
+        if cores_used >= max_cores:
             break
         # Symbolic dims use granularity (divisibility invariant); concrete
         # dims use the concretised size. _valid_divisor_basis picks per dim.
@@ -310,34 +325,39 @@ def multi_dim_iteration_space_split(
         #                   can be dropped.
         basis = _valid_divisor_basis(v, iteration_space, symbol_meta)
         best_split = _largest_legal_split_from(
-            v, basis, splits[v], n_cores_remaining, allowed_splits
+            v,
+            basis,
+            splits[v],
+            cores_used,
+            max_cores,
+            allowed_splits,
+            min_splits,
         )
         if v in symbol_meta:
             logger.info(
                 f"[work_division/symbolic] dim {v} (symbolic, max="
                 f"{symbol_meta[v][0]}, gran={symbol_meta[v][1]}): "
-                f"selected_split(basis={basis}, n_cores={n_cores_remaining}) = "
+                f"selected_split(basis={basis}, n_cores={max_cores // cores_used}) = "
                 f"{best_split}"
             )
         if best_split > splits[v]:
-            # Mandatory splits already consumed their factor from the budget.
-            # Growing one consumes only its incremental multiplier.
-            n_cores_remaining = n_cores_remaining // (best_split // splits[v])
+            cores_used = cores_used // splits[v] * best_split
             splits[v] = best_split
 
-    if is_reduction_included and n_cores_remaining > 1:
+    if is_reduction_included and cores_used < max_cores:
         result = _most_splittable_dim(
             reduction_dims,
             iteration_space,
             splits,
-            n_cores_remaining,
+            cores_used,
+            max_cores,
             symbol_meta,
             allowed_splits,
+            min_splits,
         )
         if result is not None:
             best_dim, best_split = result
-            # ``best_dim`` may have a mandatory split; charge only growth.
-            n_cores_remaining = n_cores_remaining // (best_split // splits[best_dim])
+            cores_used = cores_used // splits[best_dim] * best_split
             splits[best_dim] = best_split
 
     return splits
@@ -834,7 +854,7 @@ def enumerate_work_division_candidates(
             basis = concretize_expr(it_space_adjusted[v])  # stick count
         else:
             basis = concretize_expr(it_space[v])  # element count
-        return _legal_split_factors(v, basis, allowed_splits)
+        return _legal_split_factors(v, basis, allowed_splits, _span_min_splits(op))
 
     def create_splits(axis_vars, combo):
         return dict(zip(axis_vars, combo))
@@ -902,8 +922,13 @@ def work_division_splits_are_legal(
             committed_splits={},
         )
     )
-    return not any(splits.get(v, 1) > 1 for v in result.blocked) and all(
-        splits.get(v, 1) in allowed for v, allowed in result.allowed_splits.items()
+    min_splits = _span_min_splits(op)
+    return (
+        not any(splits.get(v, 1) > 1 for v in result.blocked)
+        and all(
+            splits.get(v, 1) in allowed for v, allowed in result.allowed_splits.items()
+        )
+        and all(splits.get(v, 1) >= minimum for v, minimum in min_splits.items())
     )
 
 
@@ -951,6 +976,7 @@ def _apply_user_hint(
     op_name = op.get_name()
     blocked = blocked or set()
     allowed_splits = allowed_splits or {}
+    min_splits = _span_min_splits(op)
 
     splits: dict[Symbol, int] = {}
     cores_used = 1
@@ -981,6 +1007,11 @@ def _apply_user_hint(
             raise Unsupported(
                 f"work_division_hint: {op_name} dim {sym} legal splits are "
                 f"{sorted(allowed_splits[sym])}."
+            )
+        if split < min_splits.get(sym, 1):
+            raise Unsupported(
+                f"work_division_hint: {op_name} dim {sym} must split at least "
+                f"{min_splits[sym]} ways for the hardware memory-span limit."
             )
 
         next_cores = cores_used * split
@@ -1027,10 +1058,15 @@ def _apply_user_hint(
         for sym, allowed in allowed_splits.items()
         if splits.get(sym, 1) not in allowed
     }
-    if conflicting_domains:
+    below_span_floor = {
+        sym: minimum
+        for sym, minimum in min_splits.items()
+        if splits.get(sym, 1) < minimum
+    }
+    if conflicting_domains or below_span_floor:
         raise Unsupported(
             f"work_division_hint: {op_name} conflicts with legal split domains "
-            f"{conflicting_domains}."
+            f"{conflicting_domains} or span floors {below_span_floor}."
         )
 
     return splits
@@ -1045,10 +1081,12 @@ def span_reduction_pass(
     args: list[SchedNodeArg],
     max_cores: int,
 ) -> None:
-    """Mandatory per-op pass: compute minimum splits to satisfy the MAX_SPAN_BYTES.
+    """Mandatory per-op pass: compute hard minimum splits for MAX_SPAN_BYTES.
 
-    Writes symbol-keyed ownership. Unity splits are retained so later passes
-    have a complete operation iteration-space ownership record.
+    Writes symbol-keyed ownership and persists the span floors separately so
+    later planning may choose any legal factor at or above each floor. Unity
+    splits are retained so later passes have a complete operation iteration-space
+    ownership record.
 
     For indirect-access ops (gather / scatter), shared-table data dimensions
     (K, N of the value table or the scatter destination) have legal split domain
@@ -1124,6 +1162,7 @@ def span_reduction_pass(
             f"({reduction_vars_to_split}), but the backend supports at most 1."
         )
 
+    op._work_division_span_min_splits = dict(min_splits)
     apply_splits(op, min_splits)
 
     if symbol_meta and math.prod(min_splits.values()) > 1:
@@ -1252,16 +1291,6 @@ def work_distribution_pass(
                 blocked,
                 allowed_splits,
             )
-            dropped = {
-                s: v for s, v in committed_splits.items() if user_splits.get(s, 1) < v
-            }
-            if dropped:
-                logger.warning(
-                    f"work_division_hint: {op.get_name()} user hint reduces "
-                    f"splits committed by span_reduction for dims {list(dropped)}. "
-                    f"Applying strict user hint; this may violate the hardware "
-                    f"{MAX_SPAN_BYTES / (1024**2):.3f} MB span limit."
-                )
             _commit_user_splits(op, user_splits)
 
             if logger.isEnabledFor(logging.DEBUG):
@@ -1583,9 +1612,13 @@ def _cost_model_matmul_planner(
     batch_sizes = [concretize_expr(it_space_adjusted[bd]) for bd in batch_dims]
     B_total = math.prod(batch_sizes)
 
+    span_min_splits = _span_min_splits(op)
+
     def factors(dim: Symbol, size: int) -> list[int]:
         return (
-            [1] if dim in blocked else _legal_split_factors(dim, size, allowed_splits)
+            [1]
+            if dim in blocked
+            else _legal_split_factors(dim, size, allowed_splits, span_min_splits)
         )
 
     b_combos = (
