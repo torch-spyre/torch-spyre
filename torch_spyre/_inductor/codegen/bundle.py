@@ -48,7 +48,12 @@ sdsc_log = get_inductor_logger("sdsc")
 #                   [{} for _ in tiled_symbols] for non-tiled / lx tensors
 #                   (one empty dict per level, preserving the level count).
 #   symbol_kinds:   list[SymbolKind] parallel to symbol_values
-_CompiledEntry = tuple[Any, list[int], list[list[dict]], list[SymbolKind]]
+#   cached_json:    the JSON from the first (canonical) compilation of this SDSC,
+#                   used for the sdsc_filename and printed symbol_ids in
+#                   sdsc_execute.  Equals sdsc_json on a cache miss; on a hit it
+#                   carries the original symbol IDs while sdsc_json carries the
+#                   fresh ones used for operand resolution.
+_CompiledEntry = tuple[Any, list[int], list[list[dict]], list[SymbolKind], Any]
 
 
 # ---------------------------------------------------------------------------
@@ -117,6 +122,9 @@ def generate_bundle(
     sdsc_counter = [0]
     symbol_id_offset_counter = [0]
 
+    sdsc_cache_counts: list[int] | None = None
+    if _spyre_config.sdsc_cache:
+        sdsc_cache_counts = [0, 0]  # [hits, misses]
     _compile_specs(
         specs_list,
         symbols,
@@ -124,7 +132,17 @@ def generate_bundle(
         sdsc_counter,
         symbol_id_offset_counter,
         output_dir,
+        sdsc_cache={} if _spyre_config.sdsc_cache else None,
+        _sdsc_cache_counts=sdsc_cache_counts,
     )
+    if sdsc_cache_counts is not None:
+        hits, misses = sdsc_cache_counts
+        logger.info(
+            "sdsc_cache: %d/%d ops reused an existing sdsc file (%d unique)",
+            hits,
+            hits + misses,
+            misses,
+        )
 
     # -----------------------------------------------------------------------
     # Pass 2: emit bundle.mlir.
@@ -159,7 +177,7 @@ def generate_bundle(
     # (sdsc_idx, ordinal) for each dimension symbol to generate its MLIR name.
     symbol_kinds: list[SymbolKind] = []
     sym_idx_to_dim_origin: dict[int, tuple[int, int]] = {}
-    for sdsc_idx, (_, _, _, local_kinds) in enumerate(compiled):
+    for sdsc_idx, (_, _, _, local_kinds, _) in enumerate(compiled):
         local_dim_ordinal = 0
         for lk in local_kinds:
             if lk.is_dimension:
@@ -440,8 +458,15 @@ def _compile_specs(
     sdsc_counter: list,
     symbol_id_offset_counter: list,
     output_dir: str,
+    sdsc_cache: dict | None = None,
+    _sdsc_cache_counts: list | None = None,
 ) -> None:
-    """Recursively compile all OpSpecs in specs depth-first."""
+    """Recursively compile all OpSpecs in specs depth-first.
+
+    Identical op specs (same canonical SDSC at counter 0) reuse the previously
+    compiled entry — same sdsc file and same symbol registrations.
+    Pass sdsc_cache={} to enable caching; None disables it.
+    """
     for entry in specs:
         if isinstance(entry, LoopSpec):
             _compile_specs(
@@ -451,10 +476,36 @@ def _compile_specs(
                 sdsc_counter,
                 symbol_id_offset_counter,
                 output_dir,
+                sdsc_cache,
+                _sdsc_cache_counts,
             )
         elif isinstance(entry, OpSpec):
-            idx = sdsc_counter[0]
-            sdsc_counter[0] += 1
+            cached = None
+            if sdsc_cache is not None:
+                # Generate a canonical (counter-0) version as cache key,
+                # ignoring debug_handle_ which varies per op but is irrelevant
+                # to structural identity.
+                canonical_json, _, _, _ = compile_op_spec(0, entry, [], 0)
+                top_val = next(iter(canonical_json.values()))
+                top_val.pop("debug_handle_", None)
+                # arg_indices must be part of the key: the canonical json only
+                # records sequential placeholder IDs (-1,-2,-3), not which
+                # kernel tensor argument each slot belongs to. Two structurally
+                # identical ops on different tensors would otherwise collide.
+                arg_indices = tuple(a.arg_index for a in entry.args)
+                cache_key = json.dumps(canonical_json, sort_keys=True) + str(
+                    arg_indices
+                )
+                cached = sdsc_cache.get(cache_key)
+            if cached is None:
+                idx = sdsc_counter[0]
+                sdsc_counter[0] += 1
+                if _sdsc_cache_counts is not None:
+                    _sdsc_cache_counts[1] += 1
+            else:
+                idx, cached_json = cached
+                if _sdsc_cache_counts is not None:
+                    _sdsc_cache_counts[0] += 1
             sdsc_json, local_sym_values, affine_strides, local_symbol_kinds = (
                 compile_op_spec(
                     idx,
@@ -464,13 +515,23 @@ def _compile_specs(
                 )
             )
             symbol_id_offset_counter[0] += len(local_sym_values)
-            compiled.append(
-                (sdsc_json, local_sym_values, affine_strides, local_symbol_kinds)
-            )
             file_name = f"sdsc_{idx}.json"
-            with open(os.path.join(output_dir, file_name), "w") as f:
-                logger.info(f"Generating {f.name}")
-                json.dump(sdsc_json, f, indent=2)
+            if cached is None:
+                cached_json = sdsc_json
+                if sdsc_cache is not None:
+                    sdsc_cache[cache_key] = (idx, cached_json)
+                with open(os.path.join(output_dir, file_name), "w") as f:
+                    logger.info(f"Generating {f.name}")
+                    json.dump(sdsc_json, f, indent=2)
+            compiled.append(
+                (
+                    sdsc_json,
+                    local_sym_values,
+                    affine_strides,
+                    local_symbol_kinds,
+                    cached_json,
+                )
+            )
             if sdsc_log.isEnabledFor(logging.INFO):
                 sdsc_log.info(
                     "SDSC JSON [%s]\n%s",
@@ -529,7 +590,7 @@ def _collect_affine_maps(
                 loop_var_indices_out,
             )
         elif isinstance(entry, OpSpec):
-            _, _, affine_strides, _ = next(compiled_iter)
+            _, _, affine_strides, _, _ = next(compiled_iter)
             per_tensor_lv_indices: list[list[int]] = []
             for per_level_strides in affine_strides:
                 # per_level_strides is list[dict], one dict per level (outermost first).
@@ -646,18 +707,21 @@ def _emit_specs(
             f.write(f"{tab}}}\n")
 
         elif isinstance(entry, OpSpec):
-            sdsc_json, local_sym_values, affine_strides, _ = next(compiled_iter)
+            sdsc_json, local_sym_values, affine_strides, _, cached_json = next(
+                compiled_iter
+            )
             # Per-tensor loop-var index lists: which positions in the enclosing
             # loop_vars list correspond to the strides for each tensor.
             per_tensor_lv_indices: list[list[int]] = next(affine_map_lv_iter)
 
-            # Determine the JSON filename from the sdsc_json key.
-            sdsc_name = next(iter(sdsc_json))
+            # Filename and printed symbol_ids come from the cached (first) JSON so
+            # that deduplicated executions reference the same sdsc file and IDs.
+            sdsc_name = next(iter(cached_json))
             sdsc_idx = sdsc_name.split("_")[0]
             sdsc_filename = f"sdsc_{sdsc_idx}.json"
+            cached_symbol_ids = _extract_symbol_ids(cached_json)
 
-            # Extract symbol_ids from the negative IDs stored in the JSON
-            # (unique, in registration order).
+            # Fresh symbol_ids (from sdsc_json) are used only for resolving operands.
             symbol_ids = _extract_symbol_ids(sdsc_json)
 
             # Build affine.apply ops for tiled tensors, tracking which
@@ -703,7 +767,7 @@ def _emit_specs(
             ]
 
             operand_str = ", ".join(operands)
-            symbol_ids_str = ", ".join(str(i) for i in symbol_ids)
+            symbol_ids_str = ", ".join(str(i) for i in cached_symbol_ids)
             f.write(
                 f"{tab}sdscbundle.sdsc_execute ({operand_str}) "
                 f'{{sdsc_filename="{sdsc_filename}", '

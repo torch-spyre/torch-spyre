@@ -42,7 +42,12 @@ from torch_spyre._inductor.op_spec import IndirectAccess
 
 from . import config
 from .core_mapping import core_to_slice_mapping
-from .constants import ELIDED_COPY_BACK_ATTR, MATMUL_REDUCTION_OPS, TOPK_OPS
+from .constants import (
+    ELIDED_COPY_BACK_ATTR,
+    KEEP_BY_INDEX_OP,
+    MATMUL_REDUCTION_OPS,
+    TOPK_OPS,
+)
 from .ir import FixedTiledLayout, SpyreConstantFallback
 from .logging_utils import get_inductor_logger
 from .loop_info import copy_op_metadata
@@ -904,17 +909,91 @@ def find_reduction_var(x_dep: MemoryDep, out_dep: MemoryDep) -> sympy.Symbol:
     return next(iter(reduction_vars))
 
 
+def broadcast_batch_vars(op: Operation, x_dep: MemoryDep, out_dep: MemoryDep) -> set:
+    """Return output loop vars for dims coarse-tiled that x is broadcast over.
+
+    When a matmul operand (x) is broadcast over a batch dim (e.g. torch.matmul
+    of a [T,H] tensor unsqueezed against a [E,H,F] weight) AND that dim is
+    coarse-tiled with >1 element per tile, the tile-loop variable for that dim
+    survives in the output's (and y's) index expression -- unlike at 1
+    element/tile, where the per-tile address offset is a pure constant handled
+    entirely outside the per-tile index expression. This makes the leftover
+    batch-dim loop var indistinguishable from the true generated (N) dim via
+    set membership on dep.index.free_symbols alone (see issue #3888): both are
+    "in y and the output, but not in x".
+
+    op.loop_info.loop_tiled_dims (stamped by coarse-tiling before layout
+    propagation runs, per passes.py's pass ordering) lists, per nesting
+    level, the raw op.data.ranges positions this loop group tiles -- for the
+    innermost tile-body op itself, output_tiled_dims/tiled_dims_per_read are
+    both empty (this op's own write is already the tile-local slice, so it
+    has nothing further to report), so loop_tiled_dims is the only surviving
+    signal identifying which raw dims the enclosing loop nest tiles at all.
+    A raw tiled dim is a spurious "excess" batch var iff x's own read lacks
+    that dim's squeezed symbol entirely (broadcast), rather than genuinely
+    being tiled on it too.
+    """
+    loop_info = getattr(op, "loop_info", None)
+    if loop_info is None or not loop_info.loop_tiled_dims:
+        return set()
+
+    # Map each squeezed output-dim position (index into out_dep.var_names) to
+    # its raw op.data.ranges position -- mirrors
+    # SpyreKernel._host_dim_to_index_symbol's squeeze arithmetic, restricted to
+    # the output (non-reduction) side.
+    ranges = getattr(op.data, "ranges", None)
+    if ranges is None:
+        return set()
+    raw_to_squeezed: dict[int, int] = {}
+    it_idx = 0
+    for host_idx, r in enumerate(ranges):
+        if int(r) != 1:
+            raw_to_squeezed[host_idx] = it_idx
+            it_idx += 1
+
+    excess: set = set()
+    for level_dims in loop_info.loop_tiled_dims:
+        for pos in level_dims:
+            squeezed = raw_to_squeezed.get(pos)
+            if squeezed is None or squeezed >= len(out_dep.var_names):
+                continue
+            var = out_dep.var_names[squeezed]
+            # x is genuinely tiled on this dim too -- not a broadcast dim.
+            if var in x_dep.index.free_symbols:
+                continue
+            excess.add(var)
+    return excess
+
+
 def find_matmul_generated_var(
-    y_dep: MemoryDep, x_dep: MemoryDep, out_dep: MemoryDep
+    y_dep: MemoryDep,
+    x_dep: MemoryDep,
+    out_dep: MemoryDep,
+    op: Operation | None = None,
 ) -> sympy.Symbol:
     """Return the single loop variable that appears in y's and the output's index but not in x's.
 
     This is the N (generation) dimension of a matmul.
+
+    When op is given, excludes candidates that are actually a coarse-tiled
+    batch dim x is broadcast over rather than the true generated dim -- see
+    broadcast_batch_vars.
+
+    coarse_tile.py's plan-time check (_check_matmul_broadcast_batch_tiling)
+    already rejects the >1-element/tile broadcast-batch configuration before
+    layout propagation runs, so in the tiled case this disambiguation should
+    only ever need to resolve the (always-supported) 1-element/tile case. The
+    two checks are intentionally layered as belt-and-suspenders: the plan-time
+    check gives an early, precise diagnostic; this one keeps propagation
+    correct even if that guard is ever loosened or bypassed.
+
     Raises Unsupported if the count is not exactly 1.
     """
     generated_vars = (
         y_dep.index.free_symbols & out_dep.index.free_symbols
     ) - x_dep.index.free_symbols
+    if op is not None and len(generated_vars) > 1:
+        generated_vars = generated_vars - broadcast_batch_vars(op, x_dep, out_dep)
     if len(generated_vars) != 1:
         raise Unsupported(
             f"expected exactly 1 generated variable, got {generated_vars}"
@@ -1169,6 +1248,14 @@ def _non_indirect_coord_syms(coords: list[Expr]) -> set[Symbol]:
     syms: set[Symbol] = set()
     for coord in coords:
         if hasattr(coord, "has") and coord.has(IndirectAccess):
+            # A coordinate can mix the runtime-chosen row with data syms when
+            # the layout folds the row dim into an outer one -- a paged KV cache
+            # reads as `d0 + 128*IndirectAccess(idx)`. Those data syms still
+            # address into the shared table, so report them (#3984).
+            inner: set[Symbol] = set()
+            for term in coord.atoms(IndirectAccess):
+                inner |= term.free_symbols
+            syms |= coord.free_symbols - inner
             continue
         syms |= coord.free_symbols
     return syms
@@ -1627,6 +1714,48 @@ def copy_fx_custom_meta(src: "torch.fx.Node", dst: "torch.fx.Node") -> None:
         dst.meta["custom"] = src.meta["custom"]
 
 
+def _repoint_mutation_targets(
+    operations: list[Operation], old_buf: Buffer, new_buf: Buffer
+) -> None:
+    """Repoint any ``MutationLayoutSHOULDREMOVE.target`` chain aimed at ``old_buf``.
+
+    Reconstructing a ``ComputedBuffer`` (see ``replace_computed_buffer_body``,
+    ``redirect_computed_buffer_reads``) swaps the new object into ``operations``
+    and ``V.graph.name_to_buffer``, but a mutation op elsewhere in the graph may
+    hold a direct object reference to the old buffer via
+    ``MutationLayoutSHOULDREMOVE.target`` -- set once, at the mutation op's
+    original lowering time, and never re-resolved by name afterwards (unlike
+    ordinary reads, which always go through ``V.graph.get_buffer(name)``).  Left
+    unpatched, that op keeps mutating the orphaned old object forever: its
+    layout is never promoted past ``FixedLayout``, which later fails the
+    ``isinstance(layout, FixedTiledLayout)`` assert in
+    ``work_division._resolve_layout`` (see issue #3944/#3945).
+
+    ``target`` may be the bare buffer, or wrapped in one or more
+    ``MutableBox``/``BaseView`` layers (``TensorBox(StorageBox(buf))``,
+    ``ReinterpretView``, ...) -- both wrapper families expose the next layer
+    as ``.data``, so a single attribute name covers both.
+    """
+    for candidate in operations:
+        layout = getattr(candidate, "layout", None)
+        if not isinstance(layout, MutationLayoutSHOULDREMOVE):
+            continue
+        target = layout.target
+        if target is old_buf:
+            layout.target = new_buf
+            continue
+        # Buffer/ComputedBuffer (a bare target) has no `.data`, so the walk
+        # is guaranteed to terminate there without wrongly descending into
+        # an already-bare buffer.
+        holder = target
+        while hasattr(holder, "data"):
+            inner = holder.data
+            if inner is old_buf:
+                holder.data = new_buf
+                break
+            holder = inner
+
+
 def replace_computed_buffer_body(
     op: ComputedBuffer,
     new_data: Loops,
@@ -1644,7 +1773,9 @@ def replace_computed_buffer_body(
     ``origin_node``, and the ``_split_size`` / ``_original_*`` fields used by
     ``get_default_sizes_body``.  The ``get_default_sizes_body`` cache is
     cleared on the new buffer so stale size results from the old body are not
-    reused.
+    reused.  Also repoints any ``MutationLayoutSHOULDREMOVE.target`` elsewhere
+    in ``operations`` that referenced the old object (see
+    ``_repoint_mutation_targets``).
 
     Returns the replacement ComputedBuffer.
     """
@@ -1666,6 +1797,7 @@ def replace_computed_buffer_body(
 
     op_idx = operations.index(op)
     operations[op_idx] = new_buf
+    _repoint_mutation_targets(operations, op, new_buf)
     return new_buf
 
 
@@ -1704,7 +1836,10 @@ def redirect_computed_buffer_reads(
     remapped buffer resolves to its replacement, then reconstructs the frozen
     ``ComputedBuffer`` so the instance-keyed ``get_default_sizes_body`` cache is
     cleanly invalidated (the reconstruct is the reason both this helper and
-    ``replace_computed_buffer_body`` rebuild rather than mutate in place).
+    ``replace_computed_buffer_body`` rebuild rather than mutate in place). Also
+    repoints any ``MutationLayoutSHOULDREMOVE.target`` elsewhere in
+    ``operations`` that referenced the old object (see
+    ``_repoint_mutation_targets``).
 
     Returns the replacement ComputedBuffer.
     """
@@ -1735,6 +1870,7 @@ def redirect_computed_buffer_reads(
     op_idx = operations.index(op)
     operations[op_idx] = new_buf
     V.graph.name_to_buffer[new_buf.get_name()] = new_buf
+    _repoint_mutation_targets(operations, op, new_buf)
 
     # Invalidate the sizes/body cache so it is recomputed on next access with
     # the patched inner_fn.
@@ -1996,6 +2132,41 @@ def is_topk(op: Operation) -> bool:
         and isinstance(op.data, Reduction)
         and op.data.reduction_type in TOPK_OPS
     )
+
+
+def is_keep_by_index(op: Operation) -> bool:
+    """Return True iff ``op`` is a ``ComputedBuffer`` computing a keep_by_index reduction."""
+    return (
+        isinstance(op, ComputedBuffer)
+        and isinstance(op.data, Reduction)
+        and op.data.reduction_type == KEEP_BY_INDEX_OP
+    )
+
+
+def read_with_max_reduction_overlap(
+    reads: Any,
+    reduction_vars: set[sympy.Symbol],
+) -> Optional[sympy.Expr]:
+    """Return the non-indirect read index with the most reduction-var coefficients.
+
+    For keep_by_index, the indices tensor carries the k (reduction) dimension
+    while the values tensor doesn't, so the read that should drive
+    ``splits_by_index_coeff`` / ``apply_splits_from_index_coeff`` isn't
+    necessarily the first non-indirect read. Instead, pick whichever
+    non-indirect read's index has nonzero coefficients on the most
+    ``reduction_vars`` symbols. Returns None if no read has any overlap.
+    """
+    best_read = None
+    best_count = 0
+    for d in reads:
+        if isinstance(d, MemoryDep) and not d.is_indirect():
+            red_count = sum(
+                1 for red_var in reduction_vars if d.index.coeff(red_var) != 0
+            )
+            if red_count > best_count:
+                best_count = red_count
+                best_read = d.index
+    return best_read
 
 
 # TODO: Select and store the core mapping before LX planning, then pass the

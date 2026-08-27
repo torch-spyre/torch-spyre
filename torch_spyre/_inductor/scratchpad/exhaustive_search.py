@@ -118,7 +118,7 @@ class ExhaustiveSearchSolver(CoreDivisionLayoutSolver):
         def _valid_inplace_parents(b: CoreDivisionBuffer, ci: int) -> list[str]:
             """In-place parents whose per-core sizes are compatible with division ``ci``.
 
-            ``_assert_in_place_relationships`` requires ``child.size <= parent.size``
+            ``_check_in_place_relationships`` requires ``child.size <= parent.size``
             for plain :class:`LifetimeBoundBuffer` pairs (no ``core_divisions``).
             Only include parents whose per-core size is >= the child's under the
             respective chosen divisions so the assertion in the inner solver holds.

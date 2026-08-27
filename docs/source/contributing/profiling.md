@@ -20,7 +20,7 @@ several:
 |---|---|---|
 | Python API | `torch_spyre/profiler/` | `profile_spyre()` wrapper, `torch.spyre.memory_*` |
 | C++ registration | `torch_spyre/csrc/profiler/` | PrivateUse1 observer, kineto wiring |
-| Build | `CMakeLists.txt`, `torch_spyre/csrc/profiler/CMakeLists.txt` | Guarded by `USE_SPYRE_PROFILER` |
+| Build | `setup.py` | Guarded by the `USE_SPYRE_PROFILER` env var |
 | Tests | `tests/profiler/` | Skip-marked when `USE_SPYRE_PROFILER` is off |
 | External | [`kineto-spyre`][kineto-spyre], [`aiu-trace-analyzer`][ata] | Versioned separately |
 | Docs | `docs/source/user_guide/profiling/` | User-visible additions |
@@ -34,7 +34,7 @@ tells the reviewer what each branch is about without opening the PR:
 
 | Prefix | Use for |
 |---|---|
-| `profiler/build-…` | Build system, CMake, linking, `USE_SPYRE_PROFILER` |
+| `profiler/build-…` | Build system, `setup.py`, linking, `USE_SPYRE_PROFILER` |
 | `profiler/reg-…` | C++ registration, PrivateUse1 plugin loading |
 | `profiler/api-…` | Python APIs in `torch_spyre/profiler/` |
 | `profiler/trace-…` | Trace enrichment, post-processing, Perfetto grouping |
@@ -44,7 +44,7 @@ tells the reviewer what each branch is about without opening the PR:
 | `profiler/feat-…` | Multi-PR feature work |
 | `profiler/fix-…` | Bug fixes |
 
-Keep `<short-description>` to **3–5 hyphenated words**. `cmake-libaiupti`
+Keep `<short-description>` to **3 to 5 hyphenated words**. `link-libaiupti`
 is about right. `sol` is too terse to read at a glance, and
 `tex-scratchpad-vram-sol-average` should be split into smaller PRs.
 
@@ -87,26 +87,6 @@ If a feature genuinely cannot be split, flag that in the PR description
 and in the matching sub-issue so reviewers know what they are signing up
 for.
 
-## Building with the profiler enabled
-
-The profiler is gated by a CMake flag so torch-spyre still imports
-cleanly without it. Local development usually wants it on:
-
-```bash
-USE_SPYRE_PROFILER=1 pip install -e . --no-build-isolation
-```
-
-When the flag is **off**, every profiler import path must still succeed
-(the import test below covers this). When it is **on**, install the
-kineto-spyre wheel:
-
-```bash
-pip install kineto-spyre
-```
-
-If you change build wiring, verify both the on and off paths build and
-import.
-
 ## Testing profiler changes
 
 The profiler test suite lives at `tests/profiler/`. Tests that need the
@@ -131,7 +111,8 @@ pytest tests/profiler/test_spyre_profiler.py -k trace
 Smoke test validation before you open a PR:
 
 1. `import torch_spyre.profiler` succeeds with `USE_SPYRE_PROFILER=0`.
-2. `tests/profiler/` passes with the kineto-spyre wheel installed.
+2. `tests/profiler/` passes with the default build (`USE_SPYRE_PROFILER=1`)
+   on Spyre hardware.
 3. If you touched trace emission, capture a small trace and open it in
    Perfetto. See [Trace analysis](../user_guide/profiling/trace_analysis.md).
 4. If you touched device telemetry, sanity-check against `aiu-smi`. See

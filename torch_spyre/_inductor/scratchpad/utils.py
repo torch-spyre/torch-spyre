@@ -38,29 +38,16 @@ from torch_spyre._inductor.pass_utils import (
 from torch._inductor.ir import MutationLayoutSHOULDREMOVE, ComputedBuffer
 from torch_spyre._inductor.scratchpad.plan_solver import LifetimeBoundBuffer
 
-# Op outputs eligible for LX-pinning. `amax` is the lowered form of
-# `max`; both names are listed to match whichever the IR shows.
-OP_OUTPUT_GOOD_FOR_LX_REUSE = frozenset(
+# Op outputs NOT eligible for LX-pinning; every other op is eligible by
+# default. `convolution` is aten's direct-conv op name and `conv2d` is the
+# depthwise (`torch.ops.spyre.conv2d`) op name -- both are listed because a
+# stride-2 direct-lowered conv miscomputes (shuffled spatial elements) when
+# its output is pinned to LX; see the direct-lowering codegen follow-up
+# tracked from PR #3284.
+OP_OUTPUT_NOT_GOOD_FOR_LX_REUSE = frozenset(
     {
-        "max",
-        "amax",
-        "maximum",
-        "sum",
-        "clone",
-        "exp",
-        "sub",
-        "mul",
-        "mean",
-        "add",
-        "rsqrt",
-        "neg",
-        "mm",
-        "bmm",
-        "batched_matmul",
-        "div",
-        "realdiv",
-        "expand",
-        "silu",
+        "convolution",
+        "conv2d",
     }
 )
 
@@ -73,12 +60,12 @@ def clone_at_graph_boundaries() -> bool:
     """True when clone ops are eligible for LX, enabling clone insertion at graph
     input/output boundaries so those buffers can also be LX-pinned.
 
-    Gated by listing "clone" in OP_OUTPUT_GOOD_FOR_LX_REUSE. It intentionally
-    does NOT consult ``allow_all_ops_in_lx_planning``: that flag widens
-    intermediate-output eligibility and is set broadly (e.g. the LX-planning
-    op suite), so coupling it here would silently turn on the boundary clone
-    path in contexts that don't intend to exercise it."""
-    return "clone" in OP_OUTPUT_GOOD_FOR_LX_REUSE
+    Gated by "clone" being absent from OP_OUTPUT_NOT_GOOD_FOR_LX_REUSE. It
+    intentionally does NOT consult ``allow_all_ops_in_lx_planning``: that flag
+    widens intermediate-output eligibility and is set broadly (e.g. the
+    LX-planning op suite), so coupling it here would silently turn on the
+    boundary clone path in contexts that don't intend to exercise it."""
+    return "clone" not in OP_OUTPUT_NOT_GOOD_FOR_LX_REUSE
 
 
 def calculate_liveness(graph: GraphLowering) -> dict[str, list[int]]:

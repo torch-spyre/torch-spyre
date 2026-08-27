@@ -85,7 +85,14 @@ jobs:
           verbose: 'true'
 
       - name: Install uv
-        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          # latest-known, not "latest": it resolves to the newest uv whose checksum is
+          # bundled INTO this setup-uv pin, resolved locally with no release lookup. A
+          # just-published release is not yet mirrored on releases.astral.sh, so "latest"
+          # 404s there and falls back to GitHub Releases, which rate-limits (429) once the
+          # fleet requests it concurrently. Bumping setup-uv moves this version forward.
+          version: latest-known
 
       - name: Write dispatch payload to file
         env:
@@ -106,6 +113,7 @@ jobs:
 
 
       - name: 'Report stage: torch_build'
+        continue-on-error: true
         run: |
           echo "T_TORCH_BUILD_START=$(date +%s)" >> "$GITHUB_ENV"
           uv run --with clickhouse-connect --with regex \
@@ -132,6 +140,7 @@ jobs:
           retention-days: 5
 
       - name: 'Report stage: torch_spyre_build'
+        continue-on-error: true
         run: |
           echo "T_TORCH_SPYRE_BUILD_START=$(date +%s)" >> "$GITHUB_ENV"
           uv run --with clickhouse-connect --with regex \
@@ -157,12 +166,6 @@ jobs:
           if-no-files-found: error
           retention-days: 5
 
-      # - name: Report CI started to pytorch/pytorch
-      #   continue-on-error: true
-      #   uses: pytorch/test-infra/.github/actions/cross-repo-ci-relay-callback@main
-      #   with:
-      #     status: in_progress
-
       - name: Compute build durations
         id: compute_durations
         run: |
@@ -171,6 +174,7 @@ jobs:
           echo "torch_spyre_build_seconds=$(( NOW - T_TORCH_SPYRE_BUILD_START ))" >> "$GITHUB_OUTPUT"
 
       - name: 'Report stage: running_tests'
+        continue-on-error: true
         run: |
           uv run --with clickhouse-connect --with regex \
             torch-spyre/.github/scripts/ingest_pytorch_dispatch.py \
@@ -183,6 +187,23 @@ jobs:
             --progress in_progress \
             --pytorch-sha "${{ inputs.pytorch_sha }}" \
             --torch-spyre-sha "${{ github.sha }}"
+
+      # upstream HUD requires same check_run_id
+      # however check_run_id differs across jobs
+      # therefore we need to have both the callbacks
+      # under the same job.
+      # so moving this to final job.
+      # - name: Report CI started to pytorch/pytorch
+      #   # Only repository_dispatch (real PR-triggered CI) needs an
+      #   # in_progress ping -- pytorch/pytorch's CRCR only watches those
+      #   # runs live. Nightly (schedule) doesn't need one, and
+      #   # workflow_dispatch (manual/ad-hoc) is never relayed at all.
+      #   if: github.event_name == 'repository_dispatch'
+      #   continue-on-error: true
+      #   uses: pytorch/test-infra/.github/actions/cross-repo-ci-relay-callback@main
+      #   with:
+      #     status: in_progress
+      #     job-name: linux-x86_64 / pytorch / test
 
   # ---------------------------------------------------------------------------
   # Run every upstream-beta suite (as a per-suite matrix, with retry/stall-
@@ -226,7 +247,14 @@ jobs:
           path: torch-spyre
 
       - name: Install uv
-        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          # latest-known, not "latest": it resolves to the newest uv whose checksum is
+          # bundled INTO this setup-uv pin, resolved locally with no release lookup. A
+          # just-published release is not yet mirrored on releases.astral.sh, so "latest"
+          # 404s there and falls back to GitHub Releases, which rate-limits (429) once the
+          # fleet requests it concurrently. Bumping setup-uv moves this version forward.
+          version: latest-known
 
       # actions4gh/setup-gh@v1.0.2 extracts the gh tarball but never lands
       # the binary on PATH before it calls `gh auth login`, so every job
@@ -244,6 +272,18 @@ jobs:
           mkdir -p "${RUNNER_TEMP}/gh-cli"
           tar -xzf "${RUNNER_TEMP}/gh-cli.tar.gz" -C "${RUNNER_TEMP}/gh-cli" --strip-components=1
           echo "${RUNNER_TEMP}/gh-cli/bin" >> "${GITHUB_PATH}"
+
+      - name: Report CI started to pytorch/pytorch
+        # Only repository_dispatch (real PR-triggered CI) needs an
+        # in_progress ping -- pytorch/pytorch's CRCR only watches those
+        # runs live. Nightly (schedule) doesn't need one, and
+        # workflow_dispatch (manual/ad-hoc) is never relayed at all.
+        if: github.event_name == 'repository_dispatch'
+        continue-on-error: true
+        uses: pytorch/test-infra/.github/actions/cross-repo-ci-relay-callback@main
+        with:
+          status: in_progress
+          job-name: linux-x86_64 / pytorch / test
 
       - name: Write dispatch payload to file
         env:
@@ -293,10 +333,18 @@ jobs:
           retention-days: 30
 
       - name: 'Report stage: completed'
+        continue-on-error: true
         env:
           TEST_RESULTS_JSON: ${{ steps.test_results.outputs.test_results_json }}
           MAX_DURATION_SECONDS: ${{ steps.test_results.outputs.max_duration_seconds }}
-          CONCLUSION: ${{ (needs.build.result == 'success' && needs.test.result == 'success') && 'success' || 'failure' }}
+          # Only a genuine 'success' when tests actually ran (total > 0) --
+          # a build/test job that reports 'success' without collecting any
+          # tests (e.g. a matrix/artifact-download problem) must not be
+          # recorded as a passing run.
+          CONCLUSION: >-
+            ${{
+              (fromJSON(steps.test_results.outputs.test_results_json).total > 0) && 'success' || 'failure'
+            }}
           # Empty whenever `build` failed before reaching compute_durations
           # (e.g. the PyTorch/torch-spyre build itself failed) — omitted
           # below rather than passed through, since build_stage_result_payload.py
@@ -327,11 +375,49 @@ jobs:
             --torch-spyre-sha "${{ github.sha }}" \
             --result-payload-file result_payload.json
 
-      # - name: Report CI completed to pytorch/pytorch
-      #   if: always()
-      #   continue-on-error: true
-      #   uses: pytorch/test-infra/.github/actions/cross-repo-ci-relay-callback@main
-      #   with:
-      #     status: completed
-      #     conclusion: ${{ (needs.build.result == 'success' && needs.test.result == 'success') && 'success' || 'failure' }}
-      #     test-results: ${{ steps.test_results.outputs.test_results_json }}
+
+      - name: Report CI completed to pytorch/pytorch (nightly)
+        # event-type: nightly only applies to the actual nightly (schedule)
+        # run -- never sent for repository_dispatch, see the step below.
+        if: always() && github.event_name == 'schedule'
+        continue-on-error: true
+        uses: pytorch/test-infra/.github/actions/cross-repo-ci-relay-callback@main
+        with:
+          status: completed
+          conclusion: >-
+            ${{
+              (fromJSON(steps.test_results.outputs.test_results_json).total > 0) && 'success' || 'failure'
+            }}
+          test-results: >-
+            {
+              "passed": ${{ fromJSON(steps.test_results.outputs.test_results_json).passed }},
+              "failed": ${{ fromJSON(steps.test_results.outputs.test_results_json).failed }},
+              "skipped": ${{ fromJSON(steps.test_results.outputs.test_results_json).skipped }},
+              "total": ${{ fromJSON(steps.test_results.outputs.test_results_json).total }}
+            }
+          job-name: linux-x86_64 / pytorch / test
+          event-type: nightly
+          # Ties this callback to the upstream pytorch/pytorch commit the
+          # nightly resolution step picked, matching pytorch-redhat-ci's
+          # crcr-nightly.yml convention of keying delivery-id on the
+          # resolved source SHA rather than a run-specific token.
+          delivery-id: ${{ inputs.pytorch_sha }}
+
+      - name: Report CI completed to pytorch/pytorch (repository_dispatch)
+        if: always() && github.event_name == 'repository_dispatch'
+        continue-on-error: true
+        uses: pytorch/test-infra/.github/actions/cross-repo-ci-relay-callback@main
+        with:
+          status: completed
+          conclusion: >-
+            ${{
+              (fromJSON(steps.test_results.outputs.test_results_json).total > 0) && 'success' || 'failure'
+            }}
+          test-results: >-
+            {
+              "passed": ${{ fromJSON(steps.test_results.outputs.test_results_json).passed }},
+              "failed": ${{ fromJSON(steps.test_results.outputs.test_results_json).failed }},
+              "skipped": ${{ fromJSON(steps.test_results.outputs.test_results_json).skipped }},
+              "total": ${{ fromJSON(steps.test_results.outputs.test_results_json).total }}
+            }
+          job-name: linux-x86_64 / pytorch / test

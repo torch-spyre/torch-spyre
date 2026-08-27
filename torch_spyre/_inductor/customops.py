@@ -156,6 +156,58 @@ def _(x: torch.Tensor, k: int, dim: int) -> torch.Tensor:
     return x.new_empty(out_size, dtype=x.dtype)
 
 
+@torch.library.custom_op("spyre::keep_by_index", mutates_args=(), device_types="spyre")
+def keep_by_index(
+    values: torch.Tensor,
+    indices: torch.Tensor,
+    dim: int,
+    fill_value: torch.types.Number,
+) -> torch.Tensor:
+    pass
+
+
+@keep_by_index.register_fake
+def _(
+    values: torch.Tensor,
+    indices: torch.Tensor,
+    dim: int,
+    fill_value: torch.types.Number,
+) -> torch.Tensor:
+    return values.new_empty(values.size())
+
+
+@torch.library.register_kernel("spyre::keep_by_index", ["cpu"])
+def keep_by_index_cpu(
+    values: torch.Tensor,
+    indices: torch.Tensor,
+    dim: int,
+    fill_value: torch.types.Number,
+) -> torch.Tensor:
+    # Normalize dim to handle negative indices
+    dim = dim % values.ndim
+    indices_long = indices.to(torch.long)
+
+    # Create mask: for each position in output, check if value[dim] matches any index
+    mask = torch.zeros_like(values, dtype=torch.bool)
+
+    # For each k in the indices dimension, check which values match
+    for k in range(indices.shape[dim]):
+        idx_k = indices_long.select(dim, k)  # values.shape with dim removed
+        idx_k = idx_k.unsqueeze(dim)  # add back dimension
+
+        # Create coordinate tensor reshaped for broadcasting
+        shape = [1] * values.ndim
+        shape[dim] = values.shape[dim]
+        coords = torch.arange(
+            values.shape[dim], device=values.device, dtype=torch.long
+        ).view(shape)
+
+        # Mark where values[dim] == indices[k, ...]
+        mask = mask | (coords == idx_k)
+
+    return torch.where(mask, values, torch.full_like(values, fill_value))
+
+
 @torch.library.custom_op("spyre::gelu", mutates_args=(), device_types="spyre")
 def gelu(
     input: torch.Tensor,
