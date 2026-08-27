@@ -195,8 +195,8 @@ class NativePermutationLayoutSolver {
         bool first_read = b.attr("first_use_is_read").cast<bool>();
         parent_names[i] =
             b.attr("in_place_parents").cast<std::vector<std::string>>();
-        st->start[i] = uses.front();
-        st->end[i] = uses.back() + 1;
+        st->start[i] = b.attr("start_time").cast<int64_t>();
+        st->end[i] = b.attr("end_time").cast<int64_t>();
         st->weight[i] =
             static_cast<double>(uses.size()) + (first_read ? 0.0 : 0.5);
         const bool read_after_write =

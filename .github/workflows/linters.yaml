@@ -31,8 +31,14 @@ jobs:
         with:
           python-version: '3.12'
       - name: Install uv
-        uses: astral-sh/setup-uv@6ee6290f1cbc4156c0bdd66691b2c144ef8df19a # v7.1.3
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         with:
+          # latest-known, not "latest": it resolves to the newest uv whose checksum is
+          # bundled INTO this setup-uv pin, resolved locally with no release lookup. A
+          # just-published release is not yet mirrored on releases.astral.sh, so "latest"
+          # 404s there and falls back to GitHub Releases, which rate-limits (429) once the
+          # fleet requests it concurrently. Bumping setup-uv moves this version forward.
+          version: latest-known
           enable-cache: true
           cache-dependency-glob: requirements/*
       - run: uv venv

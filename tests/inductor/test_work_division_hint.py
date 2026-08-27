@@ -742,6 +742,10 @@ def test_lx_relayout_normalizes_ownership_and_lowers_only_in_superdsc():
         "lx_planning": True,
         "allow_all_ops_in_lx_planning": True,
         "lx_planner_relayout": True,
+        # LX relayout needs a paired-buffer-capable solver; only the greedy
+        # solver sets supports_paired_buffers. Pin it explicitly so this test
+        # keeps exercising relayout regardless of the default layout_solver.
+        "layout_solver": "greedy",
     }
 )
 @pytest.mark.parametrize("second_consumer", ["pointwise", "matmul_lhs", "matmul_rhs"])
@@ -866,6 +870,71 @@ def test_lx_relayout_allocation_is_atomic_in_one_greedy_solve(caplog):
         "rejected LX relayout group source=source" in record.message
         for record in caplog.records
     )
+
+
+def _assert_live_buffers_do_not_share_addresses(buffers, limit):
+    allocator = ScratchpadAllocator(GreedyLayoutSolver, limit)
+    allocation = allocator._solve(allocator._build_solver(buffers))
+    assert all(buffer.address is not None for buffer in allocation)
+    for index, left in enumerate(allocation):
+        for right in allocation[index + 1 :]:
+            if not left.overlaps_in_time(right):
+                continue
+            assert left.address + left.size <= right.address or (
+                right.address + right.size <= left.address
+            )
+
+
+def test_lx_relayout_copies_loop_lifetime_to_every_destination():
+    plans = [
+        _relayout_plan("source", ("consumer_a", "consumer_b")),
+        LXRelayoutPlan(
+            "source",
+            ("consumer_c",),
+            _SOURCE_VIEW,
+            PerCoreView(((1, 8),), ((1, _CORE_ID),)),
+            8,
+        ),
+    ]
+    graph = SimpleNamespace(
+        operations=[
+            SimpleNamespace(get_name=lambda name=name: name)
+            for name in ("producer", "consumer_a", "consumer_b", "consumer_c")
+        ]
+    )
+    source = LifetimeBoundBuffer("source", 64, [0, 1, 2, 3], lifetime_end_override=6)
+    source.lx_relayout_plans = list(plans)
+    buffers = [source]
+    ScratchpadAllocator(GreedyLayoutSolver, 256)._append_lx_relayout_destinations(
+        graph, buffers
+    )
+
+    assert source.lifetime_end_override is None
+    assert [buffer.lifetime_end_override for buffer in source.paired_with] == [12, 12]
+    tail = LifetimeBoundBuffer("tail", 64, [8, 11])
+    buffers.append(tail)
+    _assert_live_buffers_do_not_share_addresses(buffers, 384)
+
+
+def test_lx_relayout_keeps_source_lifetime_for_later_original_reader():
+    graph = SimpleNamespace(
+        operations=[
+            SimpleNamespace(get_name=lambda name=name: name)
+            for name in ("producer", "relayout_consumer", "ordinary_consumer")
+        ]
+    )
+    source = LifetimeBoundBuffer("source", 64, [0, 1, 2], lifetime_end_override=4)
+    source.lx_relayout_plans = [_relayout_plan("source", "relayout_consumer")]
+    buffers = [source]
+    ScratchpadAllocator(GreedyLayoutSolver, 192)._append_lx_relayout_destinations(
+        graph, buffers
+    )
+
+    assert source.lifetime_end_override == 8
+    assert source.paired_with[0].lifetime_end_override == 8
+    tail = LifetimeBoundBuffer("tail", 64, [6, 7])
+    buffers.append(tail)
+    _assert_live_buffers_do_not_share_addresses(buffers, 384)
 
 
 @config.patch({"lx_planner_relayout": True})

@@ -212,10 +212,15 @@ def test_synchronize_callable():
 
     torch.spyre.synchronize()
 
+    # .cpu() performs an implicit synchronization, so this test does not
+    # independently verify synchronize(). It serves as an end-to-end correctness
+    # and API smoke test.
     result = z.cpu()
 
     assert result.numel() == 64 * 64
     assert torch.isfinite(result).all()
+
+    torch.testing.assert_close(result, atol=1e-1, rtol=1e-1)
 
 
 @pytest.mark.requires_spyre_profiler

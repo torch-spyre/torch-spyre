@@ -16,12 +16,11 @@ from torch.fx.graph import Graph
 from torch._inductor.graph import GraphLowering
 from torch._inductor.ops_handler import WrapperHandler
 from torch_spyre._inductor.pass_utils import (
-    apply_splits_from_index_coeff,
+    commit_iteration_space_ownership,
     copy_op_metadata,
     iteration_space_from_op,
-    splits_by_index_coeff,
-    op_read_writes,
     invalidate_op_read_writes,
+    op_read_writes,
 )
 from torch._inductor.virtualized import V
 from torch._inductor.ir import (
@@ -100,25 +99,6 @@ class GraphEditor:
 
         raise KeyError(f"could not find buffer {old_name} to replace as output")
 
-    @staticmethod
-    def _clone_output_splits(name: str, consumer: ComputedBuffer) -> dict:
-        splits: tuple[dict, dict] = getattr(consumer, "op_it_space_splits", ({}, {}))
-        if not any(n > 1 for values in splits for n in values.values()):
-            return {}
-        rw = op_read_writes(consumer)
-        read = next((dep for dep in rw.reads if dep.name == name), None)
-        if read is None:
-            return {}
-        write_index = next(iter(rw.writes)).index
-        reference_index = next((dep.index for dep in rw.reads), write_index)
-        by_symbol = apply_splits_from_index_coeff(
-            splits,
-            write_index,
-            reference_index,
-            iteration_space_from_op(consumer),
-        )
-        return splits_by_index_coeff(by_symbol, read.index, read.index)[0]
-
     def push_allocation_with_clone(
         self,
         buffer: ComputedBuffer | TensorBox,
@@ -182,18 +162,35 @@ class GraphEditor:
         self.lowering.register_operation(new_com_buf)
         new_buf_name = new_com_buf.get_name()
 
-        # Ordinary input clones have compatible consumers; private clones have one.
-        first_consumer = buffer_users[0]
-        consumer_splits: tuple[dict, dict] = getattr(
-            first_consumer, "op_it_space_splits", ({}, {})
-        )
-        clone_out_splits: dict = consumer_splits[0]
-        if input:
-            # Re-key consumer splits against this read. Copying output keys is
-            # wrong for reductions because their output drops reduced axes.
-            assert isinstance(first_consumer, ComputedBuffer)
-            clone_out_splits = self._clone_output_splits(buf_name, first_consumer)
-        new_com_buf.op_it_space_splits = (clone_out_splits, {})
+        # Clone loops mirror their source/consumer symbols before Scheduler, so
+        # retain direct symbol ownership instead of round-tripping through index
+        # coefficients. A clone has no reduction split.
+        metadata_owner = getattr(metadata_source, "iteration_space_ownership", None)
+        if input and metadata_owner is not None:
+            read = next(
+                (
+                    dep
+                    for dep in op_read_writes(metadata_source).reads
+                    if dep.name == buf_name
+                ),
+                None,
+            )
+            clone_write = next(iter(op_read_writes(new_com_buf).writes))
+            by_coeff = {
+                read.index.coeff(sym): split
+                for sym, split in metadata_owner.work_slices.items()
+                if read is not None and read.index.coeff(sym) != 0
+            }
+            clone_splits = {
+                sym: by_coeff.get(clone_write.index.coeff(sym), 1)
+                for sym in iteration_space_from_op(new_com_buf)
+            }
+        else:
+            clone_splits = {
+                sym: metadata_owner.work_slices.get(sym, 1) if metadata_owner else 1
+                for sym in iteration_space_from_op(new_com_buf)
+            }
+        commit_iteration_space_ownership(new_com_buf, clone_splits)
 
         if input:
             source_users = []

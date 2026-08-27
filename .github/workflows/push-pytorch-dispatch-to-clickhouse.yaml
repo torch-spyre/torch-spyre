@@ -68,9 +68,8 @@ jobs:
     if: github.event_name == 'repository_dispatch'
     runs-on:
       - x86_64
-      - spyre_pf_x0
       - linux
-      - image_spyre_backend
+      - image_ingest
     timeout-minutes: 10
 
     env:
@@ -94,7 +93,14 @@ jobs:
           printf '%s' "$PAYLOAD_JSON" > payload.json
 
       - name: Install uv
-        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          # latest-known, not "latest": it resolves to the newest uv whose checksum is
+          # bundled INTO this setup-uv pin, resolved locally with no release lookup. A
+          # just-published release is not yet mirrored on releases.astral.sh, so "latest"
+          # 404s there and falls back to GitHub Releases, which rate-limits (429) once the
+          # fleet requests it concurrently. Bumping setup-uv moves this version forward.
+          version: latest-known
 
       - name: Setup venv
         run: |
@@ -132,9 +138,8 @@ jobs:
     name: Gate on merged PR to main, extract build SHA
     runs-on:
       - x86_64
-      - spyre_pf_x0
       - linux
-      - image_spyre_backend
+      - image_ingest
     outputs:
       pytorch_sha: ${{ steps.extract.outputs.pytorch_sha }}
       should_build: ${{ steps.extract.outputs.should_build }}
@@ -275,7 +280,14 @@ jobs:
 
       - name: Install uv
         if: steps.extract.outputs.should_build == 'false'
-        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          # latest-known, not "latest": it resolves to the newest uv whose checksum is
+          # bundled INTO this setup-uv pin, resolved locally with no release lookup. A
+          # just-published release is not yet mirrored on releases.astral.sh, so "latest"
+          # 404s there and falls back to GitHub Releases, which rate-limits (429) once the
+          # fleet requests it concurrently. Bumping setup-uv moves this version forward.
+          version: latest-known
 
       - name: Record gate rejection in ClickHouse
         if: steps.extract.outputs.should_build == 'false'

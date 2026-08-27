@@ -29,6 +29,10 @@ test_suite_config:
             - TestPatternMatcherLogging::test_failed_match_constant_args_format_string
             - TestPatternMatcherLogging::test_gumbel_max_trick
             - TestPatternMatcherLogging::test_pattern_match_debug_output
+            - TestPatternMatcherLogging::test_pattern_match_debug_all_nodes
+            - TestPatternMatcherLogging::test_pattern_match_debug_multiple_nodes
+            - TestPatternMatcherLogging::test_per_pattern_counter
+            - TestPatternMatcherLogging::test_per_pattern_counter_accumulation
             - TestPatternMatcher::test_addmm
             - TestPatternMatcher::test_addmm_alpha_beta_with_pointwise
             - TestPatternMatcher::test_addmm_broadcasting_bias

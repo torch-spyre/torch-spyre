@@ -57,9 +57,7 @@ from .pass_utils import (
     iteration_space_from_op,
     is_topk,
     is_keep_by_index,
-    read_with_max_reduction_overlap,
-    splits_by_index_coeff,
-    apply_splits_from_index_coeff,
+    commit_iteration_space_ownership,
     indirect_access_subs_from_op,
     indirect_sizes_from_op,
     _fixed_read_layout,
@@ -730,49 +728,9 @@ def collect_indirect_value_tds(op: ComputedBuffer) -> list[TensorDep]:
     return tds
 
 
-def _first_non_indirect_read_index(rw, default):
-    """Return the index of the first non-indirect read, falling back to default.
-
-    Indirect reads carry data-dependent symbols whose coefficients are not a
-    stable identity key, so they must not be used as the reduction-split
-    reference index in splits_by_index_coeff / apply_splits_from_index_coeff.
-    """
-    for d in rw.reads:
-        if isinstance(d, MemoryDep) and not d.is_indirect():
-            return d.index
-    first = next(iter(rw.reads), None)
-    return first.index if first is not None else default
-
-
-def apply_splits(
-    op: ComputedBuffer,
-    splits: dict,
-    output_td: TensorDep,
-) -> None:
-    """Commit splits to op.
-
-    Does nothing when the product of splits is 1 (no parallelism).
-    """
-    cores_used = math.prod(splits.values())
-    if cores_used <= 1:
-        return
-
-    rw = op_read_writes(op)
-    write_index = output_td.dep.index
-    read_index = _first_non_indirect_read_index(rw, write_index)
-
-    # For keep_by_index, the indices tensor (not values) carries the k
-    # (reduction) dimension, so pick whichever read overlaps reduction_vars
-    # the most instead of just taking the first non-indirect read.
-    if is_keep_by_index(op):
-        coord_vars = {v for e in output_td.device_coords[:-1] for v in e.free_symbols}
-        reduction_vars = set(splits.keys()) - coord_vars
-        if reduction_vars:
-            best_read = read_with_max_reduction_overlap(rw.reads, reduction_vars)
-            if best_read is not None:
-                read_index = best_read
-
-    op.op_it_space_splits = splits_by_index_coeff(splits, write_index, read_index)
+def apply_splits(op: ComputedBuffer, splits: dict) -> None:
+    """Commit symbol-keyed work division; scheduler transport is finalized later."""
+    commit_iteration_space_ownership(op, splits)
 
 
 def enumerate_work_division_candidates(
@@ -1007,16 +965,8 @@ def _apply_user_hint(
     return splits
 
 
-def _commit_user_splits(
-    op: ComputedBuffer,
-    splits: dict[Symbol, int],
-    output_td: TensorDep,
-) -> None:
-    if math.prod(splits.values()) <= 1:
-        if hasattr(op, "op_it_space_splits"):
-            delattr(op, "op_it_space_splits")
-        return
-    apply_splits(op, splits, output_td)
+def _commit_user_splits(op: ComputedBuffer, splits: dict[Symbol, int]) -> None:
+    apply_splits(op, splits)
 
 
 def span_reduction_pass(
@@ -1026,8 +976,8 @@ def span_reduction_pass(
 ) -> None:
     """Mandatory per-op pass: compute minimum splits to satisfy the MAX_SPAN_BYTES.
 
-    Writes results to op.op_it_space_splits. If no span violation exists,
-    op.op_it_space_splits is left unset (apply_splits is a no-op for splits <= 1).
+    Writes symbol-keyed ownership. Unity splits are retained so later passes
+    have a complete operation iteration-space ownership record.
 
     For indirect-access ops (gather / scatter), shared-table data dimensions
     (K, N of the value table or the scatter destination) are excluded from the
@@ -1110,7 +1060,7 @@ def span_reduction_pass(
             f"({reduction_vars_to_split}), but the backend supports at most 1."
         )
 
-    apply_splits(op, min_splits, output_td)
+    apply_splits(op, min_splits)
 
     if symbol_meta and math.prod(min_splits.values()) > 1:
         logger.info(
@@ -1122,9 +1072,7 @@ def span_reduction_pass(
         logger.debug(
             f"span_reduction work_division {op.get_name()}: cores={math.prod(min_splits.values())}, "
             f"iteration_space={it_space}, it_space_adjusted={it_space_adjusted}, "
-            f"symbol_meta={symbol_meta}, "
-            f"priorities=[], min_splits={min_splits}, "
-            f"op_it_space_splits={op.op_it_space_splits}"
+            f"symbol_meta={symbol_meta}, priorities=[], min_splits={min_splits}"
         )
 
 
@@ -1187,7 +1135,7 @@ def _default_split(
     # honored, so don't suppress for that op.
     coord_vars = {v for e in output_td.device_coords[:-1] for v in e.free_symbols}
     # Note: span_reduction_pass merges both must_split_vars AND constraints into
-    # op.op_it_space_splits, so we can't distinguish them here. Only suppress for
+    # committed_splits, so we can't distinguish them here. Only suppress for
     # ops where we know the reduction split came from span_reduction, not constraints.
     has_reduction_split = any(v not in coord_vars for v in committed_splits)
     is_kbi = is_keep_by_index(op) if op else False
@@ -1238,21 +1186,12 @@ def work_distribution_pass(
         it_space, input_tds + [output_td], symbol_meta
     )
 
-    # Recover splits committed by span_reduction_pass using the same
-    # coeff-keyed encoding that codegen uses — stable across passes.
-    if hasattr(op, "op_it_space_splits"):
-        rw = op_read_writes(op)
-        write_index = next(iter(rw.writes)).index
-        read_index = _first_non_indirect_read_index(rw, write_index)
-        min_splits = apply_splits_from_index_coeff(
-            op.op_it_space_splits, write_index, read_index, it_space
-        )
-    else:
-        min_splits = {}
-
-    # apply_splits_from_index_coeff returns 1 for every unsplit dim; keep only
-    # dims with actual committed splits so they don't overlap with priorities.
-    committed_splits = {s: v for s, v in min_splits.items() if v > 1}
+    ownership = getattr(op, "iteration_space_ownership", None)
+    committed_splits = (
+        {s: v for s, v in ownership.work_slices.items() if v > 1}
+        if ownership is not None
+        else {}
+    )
 
     coord_vars = {v for e in output_td.device_coords[:-1] for v in e.free_symbols}
     reduction_vars = [v for v in it_space_adjusted if v not in coord_vars]
@@ -1293,18 +1232,14 @@ def work_distribution_pass(
                     f"Applying strict user hint; this may violate the hardware "
                     f"{MAX_SPAN_BYTES / (1024**2):.3f} MB span limit."
                 )
-            _commit_user_splits(op, user_splits, output_td)
+            _commit_user_splits(op, user_splits)
 
             if logger.isEnabledFor(logging.DEBUG):
-                op_splits: tuple[dict, dict] = getattr(
-                    op, "op_it_space_splits", ({}, {})
-                )
                 logger.debug(
                     f"work_distribution(user-hint) work_division {op.get_name()}: "
                     f"cores={math.prod(user_splits.values())}, "
                     f"iteration_space={it_space}, it_space_adjusted={it_space_adjusted}, "
-                    f"min_splits={committed_splits}, user_splits={user_splits}, "
-                    f"op_it_space_splits={op_splits}"
+                    f"min_splits={committed_splits}, user_splits={user_splits}"
                 )
             raise_if_per_core_overflow(
                 all_tds, it_space, user_splits, op.get_name(), symbol_meta
@@ -1323,7 +1258,7 @@ def work_distribution_pass(
         op=op,
     )
 
-    apply_splits(op, splits, output_td)
+    apply_splits(op, splits)
 
     if symbol_meta and math.prod(splits.values()) > 1:
         logger.info(
@@ -1337,8 +1272,7 @@ def work_distribution_pass(
             f"work_distribution work_division {op.get_name()}: cores={math.prod(splits.values())}, "
             f"iteration_space={it_space}, it_space_adjusted={it_space_adjusted}, "
             f"symbol_meta={symbol_meta}, "
-            f"priorities={output_dims + reduction_dims}, min_splits={committed_splits}, "
-            f"op_it_space_splits={op.op_it_space_splits}"
+            f"priorities={output_dims + reduction_dims}, min_splits={committed_splits}"
         )
 
     raise_if_per_core_overflow(all_tds, it_space, splits, op.get_name(), symbol_meta)
@@ -1833,8 +1767,8 @@ def work_distribution(
 def _cost_model_divide_op(op: ComputedBuffer, max_cores: int) -> bool:
     """Re-price one matmul's split with the analytic cost model.
 
-    Runs between span_reduction and work_distribution, so op.op_it_space_splits
-    still holds only span_reduction's commits. Computes the split
+    Runs between span_reduction and work_distribution, so
+    iteration_space_ownership still holds only span-reduction's commits. Computes the split
     work_distribution would pick, hands it to the cost model, and commits the
     cost model's choice when it differs — returning True so the caller excludes
     the op from work_distribution (every op is divided by exactly one pass).
@@ -1871,18 +1805,12 @@ def _cost_model_divide_op(op: ComputedBuffer, max_cores: int) -> bool:
 
     it_space_adjusted, stick_vars = adjust_it_space_for_sticks(it_space, all_tds)
 
-    # op.op_it_space_splits holds span_reduction's commits here: span_reduction
-    # runs before this pass, and work_distribution — which would overwrite it —
-    # runs after and skips the ops this pass claims.
-    if hasattr(op, "op_it_space_splits"):
-        write_index = next(iter(rw.writes)).index
-        read_index = _first_non_indirect_read_index(rw, write_index)
-        span_splits = apply_splits_from_index_coeff(
-            op.op_it_space_splits, write_index, read_index, it_space
-        )
-        committed_splits = {s: v for s, v in span_splits.items() if v > 1}
-    else:
-        committed_splits = {}
+    ownership = getattr(op, "iteration_space_ownership", None)
+    committed_splits = (
+        {s: v for s, v in ownership.work_slices.items() if v > 1}
+        if ownership is not None
+        else {}
+    )
 
     coord_vars = {v for e in output_td.device_coords[:-1] for v in e.free_symbols}
     reduction_vars = [v for v in it_space_adjusted if v not in coord_vars]
@@ -1923,7 +1851,7 @@ def _cost_model_divide_op(op: ComputedBuffer, max_cores: int) -> bool:
     if splits == default_splits:
         return False
 
-    apply_splits(op, splits, output_td)
+    apply_splits(op, splits)
     raise_if_per_core_overflow(all_tds, it_space, splits, op.get_name(), symbol_meta)
 
     if logger.isEnabledFor(logging.DEBUG):
@@ -1931,8 +1859,7 @@ def _cost_model_divide_op(op: ComputedBuffer, max_cores: int) -> bool:
             f"cost_model_matmul_division work_division {op.get_name()}: "
             f"cores={math.prod(splits.values())}, "
             f"iteration_space={it_space}, it_space_adjusted={it_space_adjusted}, "
-            f"min_splits={committed_splits}, "
-            f"op_it_space_splits={op.op_it_space_splits}"
+            f"min_splits={committed_splits}"
         )
     return True
 
