@@ -2673,13 +2673,27 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                         projectable[key] = False
                 return projectable[key]
 
+            # A coarse-tiled CANDIDATE can never host a relayout, for the same
+            # reasons a coarse-tiled op cannot (the fitted law has no
+            # loop-trip factor, and a tiled candidate's buffer is per-tile
+            # scratch). The loop_info edge gate covers hint-materialized
+            # tiling decided before the solve; once the unified-tiling work
+            # (#3923) makes tiling a per-candidate solver choice, cd.tiling
+            # is the only marker. Written via getattr so it is inert until
+            # that lands.
+            def _candidate_tiled(cd) -> bool:
+                tiling = getattr(cd, "tiling", None)
+                return tiling is not None and not getattr(tiling, "is_untiled", True)
+
             pair_cost: dict[tuple, Optional[float]] = {}
             triples: list[tuple[int, int, float]] = []
             for i, pv in enumerate(prod_views):
-                if pv is None:
+                if pv is None or _candidate_tiled(parent_divs[i]):
                     continue
                 for j, cv in enumerate(cons_views):
                     if cv is None or pv == cv:
+                        continue
+                    if _candidate_tiled(consumer_divs[j]):
                         continue
                     ncores = parent_divs[i].cores_used
                     if ncores != consumer_divs[j].cores_used:
