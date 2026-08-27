@@ -769,6 +769,15 @@ def test_final_view_validation_requires_one_shared_physical_view():
             )
             is None
         )
+        assert "source users derived 0 final views" in (
+            lx_relayout_module.validate_final_views(
+                graph,
+                plan,
+                {},
+                destination_name="destination",
+            )
+            or ""
+        )
         views[("consumer", "destination")] = replace(
             destination,
             slice_shape=(2, 4, 64),
@@ -868,8 +877,13 @@ def test_grouped_gather_mapping_is_derived_after_alignment():
     source = TensorWorkDivision(
         {h: 4, local: 8},
         {h: Mod(floor(_CORE_ID / 8), 4), local: Mod(_CORE_ID, 8)},
+        num_cores=32,
     )
-    destination = TensorWorkDivision({h: 4}, {h: Mod(_CORE_ID, 4)})
+    destination = TensorWorkDivision(
+        {h: 4},
+        {h: Mod(_CORE_ID, 4)},
+        num_cores=32,
+    )
     args = [
         TensorArg(
             True,
@@ -1493,13 +1507,16 @@ def test_lx_relayout_scheduler_demotes_groups_but_not_ordinary_unary():
             128,
         )
 
-        def preview(node, *, relayout_copy):
+        def preview(node, *, relayout_copy, tracked_buffers):
             del relayout_copy
+            if drift == "mapping" and node.name == "consumer":
+                raise ValueError("no operation core mapping satisfies LX ownership")
             return (
                 {
                     (node.name, dep.name): final_view
                     for dep in (*node.read_writes.reads, *node.read_writes.writes)
-                    if dep.name in buffers
+                    if dep.name in tracked_buffers
+                    and dep.name in buffers
                     and "lx" in buffers[dep.name].get_layout().allocation
                 },
                 False,
@@ -1548,11 +1565,12 @@ def test_lx_relayout_scheduler_demotes_groups_but_not_ordinary_unary():
     run_registered("source")
     run_registered("consumer")
     run_registered("projection")
+    run_registered("mapping")
     run_registered("missing")
     run_registered("missing_buffer")
 
 
-def test_final_view_gate_demotes_ordinary_buffer_without_a_preview_view():
+def test_final_view_gate_leaves_ordinary_lx_to_existing_validation():
     dep = SimpleNamespace(name="ordinary")
     layout = _relayout_layout(0, _SOURCE_VIEW)
     nodes = [
@@ -1583,13 +1601,13 @@ def test_final_view_gate_demotes_ordinary_buffer_without_a_preview_view():
         mock_patch.object(
             scheduler_module,
             "_preview_final_lx_views",
-            return_value=({}, False),
+            side_effect=AssertionError("ordinary LX must not enter the relayout gate"),
         ),
         config.patch({"lx_planning": True}),
     ):
         scheduler_module.demote_incoherent_lx_buffers(nodes)
 
-    assert "lx" not in layout.allocation
+    assert "lx" in layout.allocation
 
 
 def aot_backend(gm: GraphModule, example_inputs: Sequence[InputType]):

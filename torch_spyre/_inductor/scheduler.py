@@ -40,12 +40,11 @@ from torch.utils._ordered_set import OrderedSet
 from .spyre_kernel import SpyreKernel
 from .ir import FixedTiledLayout
 from .pass_utils import (
+    AlignmentAccess,
     PerCoreView,
     _is_matmul_op,
-    alignment_coordinates,
-    indirect_sizes_from_op,
+    build_operation_alignment_inputs,
     iteration_space,
-    iteration_space_with_splits,
     per_core_view_scheduled,
     try_device_coordinates,
 )
@@ -67,7 +66,7 @@ from .scratchpad.lx_relayout import (
     work_division_from_view,
 )
 from .op_spec import LoopSpec, TensorWorkDivision
-from .views import align_tensors
+from .views import align_tensors_pure
 from . import config as _spyre_config
 
 logger = get_inductor_logger("scheduler")
@@ -484,6 +483,7 @@ def _preview_final_lx_views(
     node: SchedulerNode,
     *,
     relayout_copy: bool,
+    tracked_buffers: set[str],
 ) -> tuple[dict[tuple[str, str], FinalLXView], bool]:
     """Run codegen's pure alignment and derive this op's final physical views.
 
@@ -501,18 +501,6 @@ def _preview_final_lx_views(
         raise ValueError(f"{node.get_name()} has no computed operation")
 
     raw_iteration_space = iteration_space(node)
-    aligned_input_space = iteration_space_with_splits(op, rw, raw_iteration_space)
-    indirect_sizes = indirect_sizes_from_op(op)
-    if indirect_sizes:
-        # Re-executing the op to recover indirect ranges can create equivalent
-        # SymPy symbols with different assumptions. Bind the scheduler's actual
-        # index symbol to the recovered range, just as codegen does directly.
-        size_by_name = {str(dim): size for dim, size in indirect_sizes.items()}
-        for dep in (*reads, *writes):
-            for dim in dep.index.free_symbols - raw_iteration_space.keys():
-                if dim not in indirect_sizes and str(dim) in size_by_name:
-                    indirect_sizes[dim] = size_by_name[str(dim)]
-    repeat_info: dict[sympy.Symbol, dict] = {}
     entries = []
     for dep in (*reads, *writes):
         buffer = V.graph.try_get_buffer(dep.name)
@@ -524,39 +512,32 @@ def _preview_final_lx_views(
             continue
         if not isinstance(layout, FixedTiledLayout):
             continue
-        coordinates = alignment_coordinates(
-            layout.device_layout,
-            dep.index,
-            raw_iteration_space,
-            indirect_sizes,
-            repeat_info_out=repeat_info,
-        )
+        entries.append((dep.name, layout, dep.index))
+
+    alignment_inputs = build_operation_alignment_inputs(
+        raw_iteration_space,
+        [AlignmentAccess(layout.device_layout, index) for _, layout, index in entries],
+        op=op,
+        read_writes=rw,
+    )
+    divisions = []
+    for (_, layout, _), tensor in zip(entries, alignment_inputs.tensors):
+        coordinates = tensor["coordinates"]
         division = work_division_from_view(
             layout.lx_view if "lx" in layout.allocation else None,
             coordinates,
             tuple(raw_iteration_space),
         )
-        entries.append((dep.name, layout, coordinates, division))
+        divisions.append(division)
 
-    final_space, final_tensors, dimension_remap = align_tensors(
-        aligned_input_space,
-        [
-            {
-                "size": list(layout.device_layout.device_size),
-                "coordinates": coordinates,
-            }
-            for _, layout, coordinates, _ in entries
-        ],
-        indirect_sizes,
-        repeat_info=repeat_info,
-    )
+    final_space, final_tensors, dimension_remap = align_tensors_pure(alignment_inputs)
     changed = any(
         len(new_dims) != 1 or new_dims[0][0] != old_dim
         for old_dim, new_dims in dimension_remap.items()
     )
     remapped = [
         remap_work_division(division, dimension_remap) if division is not None else None
-        for *_, division in entries
+        for division in divisions
     ]
     finalized = finalize_tensor_work_divisions(final_space, remapped)
 
@@ -584,10 +565,8 @@ def _preview_final_lx_views(
         )
 
     result: dict[tuple[str, str], FinalLXView] = {}
-    for (name, layout, _, _), tensor, division in zip(
-        entries, final_tensors, finalized
-    ):
-        if "lx" not in layout.allocation:
+    for (name, layout, _), tensor, division in zip(entries, final_tensors, finalized):
+        if "lx" not in layout.allocation or name not in tracked_buffers:
             continue
         effective = division if relayout_copy else operation_division
         if effective is None:
@@ -642,6 +621,11 @@ def demote_incoherent_lx_buffers(
         copy_name: plan.source_name for copy_name, plan in plans_by_copy.items()
     }
     relayout_sources = set(source_by_copy.values())
+    relayout_buffers = {
+        name
+        for copy_name, plan in plans_by_copy.items()
+        for name in (plan.source_name, copy_name)
+    }
 
     copy_reads = set()
     valid_copy_nodes = set()
@@ -685,6 +669,24 @@ def demote_incoherent_lx_buffers(
         if copy_name not in seen_copies:
             invalid_sources[plan.source_name] = f"missing relayout copy {copy_name}"
 
+    # Validation coverage is partitioned by the plan registry. Ordinary LX
+    # buffers retain the scheduler's established view-equality validation;
+    # registered non-canonical handoffs use the graph-wide C4 gate below.
+    # Future non-canonical residency must first register its buffers here.
+    resident_relayout_buffers = {
+        name
+        for name in relayout_buffers
+        if (layout := _fixed_tiled_layout(name)) is not None
+        and "lx" in layout.allocation
+    }
+    resident_lx_buffers = set(lx_names) | resident_relayout_buffers
+    registered_lx_buffers = resident_lx_buffers & relayout_buffers
+    ordinary_lx_buffers = OrderedSet(
+        name for name in lx_names if name not in relayout_buffers
+    )
+    assert registered_lx_buffers.isdisjoint(set(ordinary_lx_buffers))
+    assert registered_lx_buffers | set(ordinary_lx_buffers) == resident_lx_buffers
+
     demoted = set()
 
     def demote(source_name: str, reason: str) -> None:
@@ -706,7 +708,7 @@ def demote_incoherent_lx_buffers(
     for source_name, reason in invalid_sources.items():
         demote(source_name, reason)
 
-    for name in lx_names:
+    for name in ordinary_lx_buffers:
         ref = None
         culprit = None
         expected = _lx_view(name)
@@ -770,9 +772,13 @@ def demote_incoherent_lx_buffers(
         for dep in accesses:
             demote(source_by_copy.get(dep.name, dep.name), reason)
 
+    if not relayout_buffers:
+        set_final_lx_views(V.graph, {})
+        return nodes
+
     # Preview the same alignment calculation codegen will run, while atomic
     # fallback is still possible. This is the graph-wide proof point: all
-    # producer, copy, and consumer views coexist here.
+    # producer, copy, and consumer views for each relayout coexist here.
     source_by_buffer = {
         plan.source_name: plan.source_name for plan in plans_by_copy.values()
     }
@@ -790,15 +796,19 @@ def demote_incoherent_lx_buffers(
         }
         if not lx_buffers:
             continue
+        tracked_buffers = lx_buffers & relayout_buffers
+        if not tracked_buffers:
+            continue
         try:
             views, changed = _preview_final_lx_views(
                 node,
                 relayout_copy=node.get_name() in valid_copy_nodes,
+                tracked_buffers=tracked_buffers,
             )
         except (Unsupported, ValueError) as exc:
             reason = f"{node.get_name()} alignment preview failed: {exc}"
             counters["torch_spyre"]["lx_relayout_gate_preview_failures"] += 1
-            for name in lx_buffers:
+            for name in tracked_buffers:
                 demote(source_by_buffer.get(name, name), reason)
             continue
         previewed_ops += 1
@@ -807,24 +817,6 @@ def demote_incoherent_lx_buffers(
 
     counters["torch_spyre"]["lx_relayout_gate_previewed_ops"] += previewed_ops
     counters["torch_spyre"]["lx_relayout_gate_alignment_changed_ops"] += changed_ops
-
-    relayout_buffers = {
-        name
-        for copy_name, plan in plans_by_copy.items()
-        for name in (plan.source_name, copy_name)
-    }
-    for name in lx_names - relayout_buffers:
-        buffer_views = {
-            view
-            for (_, buffer_name), view in preview_views.items()
-            if buffer_name == name
-        }
-        if len(buffer_views) != 1:
-            counters["torch_spyre"]["lx_relayout_gate_ordinary_mismatch"] += 1
-            demote(
-                name,
-                f"ordinary LX handoff derived {len(buffer_views)} final views",
-            )
 
     checked_groups = 0
     for copy_name, plan in list(materialized_lx_relayouts(V.graph).values()):
@@ -847,7 +839,11 @@ def demote_incoherent_lx_buffers(
     accepted_views: dict[tuple[str, str], FinalLXView] = {}
     for key, final_view in preview_views.items():
         layout = _fixed_tiled_layout(key[1])
-        if layout is not None and "lx" in layout.allocation:
+        if (
+            key[1] in relayout_buffers
+            and layout is not None
+            and "lx" in layout.allocation
+        ):
             accepted_views[key] = final_view
     set_final_lx_views(V.graph, accepted_views)
     logger.debug(

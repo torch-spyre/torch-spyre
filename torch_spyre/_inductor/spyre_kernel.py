@@ -1059,9 +1059,9 @@ class SpyreKernel(Kernel[CSEVariable]):
                 raise RuntimeError("LX tensor is missing its codegen buffer identity")
             expected = cached.get((node_name, name))
             if expected is None:
-                raise RuntimeError(
-                    f"LX final-view gate has no result for {node_name} reading {name}"
-                )
+                # The graph-wide cache proves relayout handoffs. Ordinary LX
+                # residency keeps using the scheduler's existing validation.
+                continue
             division = arg.work_division if is_relayout else operation_division
             if division is None:
                 raise RuntimeError(f"LX tensor {name} has no final work division")
