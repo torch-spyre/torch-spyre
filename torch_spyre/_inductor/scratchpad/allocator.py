@@ -1630,7 +1630,9 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             elif self.prune and isinstance(op, ComputedBuffer):
                 divs = [
                     _core_division(op, splits)
-                    for splits in _enum_split_options(op, profiles, matmul_roles)
+                    for splits in _legal_split_options(
+                        op, _enum_split_options(op, profiles, matmul_roles)
+                    )
                 ]
             else:
                 divs = self._enumerate_core_divisions(op, max_cores)
@@ -1705,6 +1707,8 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             if not hasattr(op, "iteration_space_ownership"):
                 continue
             cd = buf.core_divisions[buf.chosen_division]
+            if not _split_option_is_legal(op, (cd.output_splits, cd.reduction_splits)):
+                raise Unsupported(f"{op.name}: chosen split violates hard domain.")
             commit_iteration_space_ownership(op, _division_splits(op, cd))
 
     def _determine_in_place_division_invariant(

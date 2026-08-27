@@ -36,8 +36,10 @@ from torch_spyre._inductor.scratchpad.allocator import (
     CoOptimizingAllocator,
     CoreDivision,
 )
+from torch_spyre._inductor.scratchpad.plan_solver import CoreDivisionBuffer
 from torch_spyre._inductor.work_division import (
     TensorDep,
+    _cost_model_matmul_planner,
     _default_split,
     enumerate_work_division_candidates,
     work_division_split_is_legal,
@@ -291,6 +293,58 @@ class TestWorkDivisionSplitLegality(unittest.TestCase):
             self.assertFalse(work_division_split_is_legal(op, ({}, {})))
             del op._input_layout_overrides
             self.assertTrue(work_division_split_is_legal(op, ({}, {})))
+
+
+class TestCostModelConstraints(unittest.TestCase):
+    def test_restricted_batch_dim_stays_unsplit(self):
+        batch, m, n, k = (_isym(name) for name in ("batch", "m", "n", "k"))
+        op = _computed_buffer(
+            (4, 64, 256),
+            name="matmul_out",
+            reduction_type="batchmatmul",
+            reduction_ranges=(128,),
+        )
+        output_td = _tensor_dep("matmul_out", (4, 64, 256), (batch, m, n))
+        input_tds = [
+            _tensor_dep("lhs", (4, 64, 128), (batch, m, k)),
+            _tensor_dep("rhs", (4, 128, 256), (batch, k, n)),
+        ]
+        it_space = {batch: 4, m: 64, n: 4, k: 2}
+
+        def prefer_batch_split(batch_axis, *_args, **_kwargs):
+            return 0 if batch_axis[1] > 1 else 1
+
+        with patch(
+            "torch_spyre._inductor.work_division._matmul_split_cost",
+            side_effect=prefer_batch_split,
+        ):
+            unrestricted = _cost_model_matmul_planner(
+                op,
+                {sym: 1 for sym in it_space},
+                it_space,
+                output_td,
+                {n: 64, k: 64},
+                {},
+                32,
+                input_tds,
+                set(),
+                {},
+            )
+            restricted = _cost_model_matmul_planner(
+                op,
+                {sym: 1 for sym in it_space},
+                it_space,
+                output_td,
+                {n: 64, k: 64},
+                {},
+                32,
+                input_tds,
+                {batch},
+                {},
+            )
+
+        self.assertGreater(unrestricted[batch], 1)
+        self.assertEqual(restricted[batch], 1)
 
 
 class TestCoordinateMaskBlockedVars(unittest.TestCase):
@@ -655,6 +709,73 @@ class TestCoOptimizingAllocator(unittest.TestCase):
                 Unsupported, "fixed split violates hard domain"
             ):
                 allocator._division_map(graph)
+
+    def test_pruned_candidates_and_commit_reject_illegal_division(self):
+        batch, m = _isym("batch"), _isym("m")
+        op = _computed_buffer((4, 64), name="constrained_out")
+        graph = MagicMock(operations=[op])
+        allocator = CoOptimizingAllocator(MagicMock(), size=1, prune=True)
+        safe = {batch: 1, m: 8}
+        unsafe = {batch: 4, m: 8}
+        rw = MagicMock(
+            writes=[MemoryDep(op.name, 64 * batch + m, (batch, m), (4, 64))],
+            reads=[],
+        )
+
+        with (
+            patch(
+                "torch_spyre._inductor.scratchpad.allocator."
+                "ops_in_offset_mutation_component",
+                return_value=set(),
+            ),
+            patch(
+                "torch_spyre._inductor.scratchpad.allocator."
+                "_find_distinct_matmul_splits",
+                return_value=((), ()),
+            ),
+            patch(
+                "torch_spyre._inductor.scratchpad.allocator._enum_split_options",
+                return_value=[safe, unsafe],
+            ),
+            patch(
+                "torch_spyre._inductor.scratchpad.allocator.op_read_writes",
+                return_value=rw,
+            ),
+            patch(
+                "torch_spyre._inductor.scratchpad.allocator._split_fits_sticks",
+                return_value=True,
+            ),
+            patch(
+                "torch_spyre._inductor.scratchpad.allocator._split_option_is_legal",
+                side_effect=lambda _op, splits: splits == safe,
+            ),
+        ):
+            divisions = allocator._division_map(graph)[op.name]
+
+        self.assertEqual(
+            divisions, [CoreDivision(output_splits={m: 8}, reduction_splits={})]
+        )
+
+        op.iteration_space_ownership = MagicMock()
+        allocation = [
+            CoreDivisionBuffer(
+                name=op.name,
+                size=128,
+                uses=[0],
+                core_divisions=[
+                    CoreDivision(output_splits={batch: 4}, reduction_splits={})
+                ],
+                chosen_division=0,
+            )
+        ]
+        with (
+            patch(
+                "torch_spyre._inductor.scratchpad.allocator._split_option_is_legal",
+                return_value=False,
+            ),
+            self.assertRaisesRegex(Unsupported, "chosen split violates hard domain"),
+        ):
+            allocator._commit_divisions(graph, allocation)
 
     def test_no_enumerable_candidates_keeps_legal_fixed_division(self):
         op = MagicMock(spec=ComputedBuffer)
