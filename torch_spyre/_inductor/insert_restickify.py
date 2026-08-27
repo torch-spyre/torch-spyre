@@ -313,9 +313,9 @@ def finalize_layouts(graph: GraphLowering) -> None:
         if not cost_fn:
             continue
         # Mutation ops targeting a SpyreEmptyFallback: the beam commits the
-        # accumulator's STL via the co-output dep on each writer, so the
-        # accumulator and all its writers agree on the same STL.  Stamp the
-        # accumulator's layout here so the backend sees a FixedTiledLayout.
+        # mutation target's STL via the co-output dep on each writer, so the
+        # target buffer and all its writers agree on the same STL.  Stamp the
+        # target buffer's layout here so the backend sees a FixedTiledLayout.
         #
         # Skip fill ops (AnyInNode): they have no real inputs and therefore no
         # layout preference — the combine/copy op determines the correct STL.

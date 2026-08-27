@@ -129,7 +129,7 @@ def _get_prop_args(reads) -> list[PropArg]:
             # SpyreEmptyFallback has no device layout until its mutation writers
             # have run. If it already has .layouts (assigned by the SpyreEmptyFallback
             # branch below), include it as a normal input so downstream consumers
-            # (e.g. mul reading the accumulator) see the stick constraint.
+            # (e.g. mul reading the mutation target buffer) see the stick constraint.
             if isinstance(buf, SpyreEmptyFallback) and not hasattr(buf, "layouts"):
                 continue
             if hasattr(buf, "layouts"):
@@ -1565,8 +1565,8 @@ def _all_constant_layouts(op: Operation) -> list[SpyreTensorLayout]:
     NOTE: constant-fill ops in the main propagation loop currently use
     generic_layout instead (a single default-layout candidate) to avoid
     exponential beam-state growth in loop-unrolled graphs.  This function is
-    still used for the accumulator fallback path (in-place update ops with no
-    real inputs) where the enumeration is bounded and correct.  It will also be
+    still used for the SpyreEmptyFallback mutation target path (in-place update
+    ops with no real inputs) where the enumeration is bounded and correct.  It will also be
     restored for the single-consumer constant case once that optimization lands.
     """
     output: FixedLayout = op.get_layout()
@@ -1969,7 +1969,7 @@ def propagate_spyre_tensor_layouts(
                             type(target_buf).__name__,
                         )
                         continue
-                    # SpyreEmptyFallback accumulator has no device layout yet
+                    # SpyreEmptyFallback mutation target has no device layout yet
                     # -- expected, not exceptional; handled just below.
                     logger.debug(
                         "MutationLayoutSHOULDREMOVE target_stl=None: "
