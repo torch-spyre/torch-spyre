@@ -3722,12 +3722,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
     # Single pointwise op
     # ------------------------------------------------------------------
 
-    @config.patch(
-        {
-            "lx_planning": True,
-            "allow_all_ops_in_lx_planning": True,
-        }
-    )
     def test_hint_single_group_pointwise(self):
         """spyre_hint(num_tiles_per_dim={"A": 4}) tiles a pointwise abs into 4 iterations."""
         from torch_spyre._inductor import spyre_hint
@@ -3765,12 +3759,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
     # Softmax-shaped chain (pointwise-reduce-pointwise)
     # ------------------------------------------------------------------
 
-    @config.patch(
-        {
-            "lx_planning": True,
-            "allow_all_ops_in_lx_planning": True,
-        }
-    )
     def test_hint_softmax_shaped(self):
         """Tile the pointwise-reduce-pointwise stages of a softmax-like kernel.
 
@@ -3835,13 +3823,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
     # Nested hints: outer K=2, inner M=4 on a single op
     # ------------------------------------------------------------------
 
-    @config.patch(
-        {
-            "lx_planning": True,
-            "allow_all_ops_in_lx_planning": True,
-            "sencores": 4,
-        }
-    )
+    @config.patch({"sencores": 4})
     def test_hint_nested_loop_with_scratchpad(self):
         """Design-doc small example: y=a+b; z=y*c with nested K=2×M=4 hints.
 
@@ -3921,12 +3903,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
     # Two ops in separate groups tiling different iteration dimensions
     # ------------------------------------------------------------------
 
-    @config.patch(
-        {
-            "lx_planning": True,
-            "allow_all_ops_in_lx_planning": True,
-        }
-    )
     def test_hint_per_group_tiled_dims(self):
         """Two ops in separate hint groups tile different sets of iteration dims.
 
@@ -4003,12 +3979,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
     # Two ops with different slice counts -> two separate groups
     # ------------------------------------------------------------------
 
-    @config.patch(
-        {
-            "lx_planning": True,
-            "allow_all_ops_in_lx_planning": True,
-        }
-    )
     def test_hint_two_groups(self):
         """Two separate tiling groups produce two LoopSpec entries in the source."""
         from torch_spyre._inductor import spyre_hint
@@ -4052,12 +4022,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
     # Op inside hint scope with no matching named dim
     # ------------------------------------------------------------------
 
-    @config.patch(
-        {
-            "lx_planning": True,
-            "allow_all_ops_in_lx_planning": True,
-        }
-    )
     def test_hint_group_includes_op_with_no_matching_dim(self):
         """An op inside a hint scope whose loop vars don't match the hinted dim stays in the group.
 
@@ -4104,12 +4068,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
     # Loop-invariant (broadcast) op's own write does not advance
     # ------------------------------------------------------------------
 
-    @config.patch(
-        {
-            "lx_planning": True,
-            "allow_all_ops_in_lx_planning": True,
-        }
-    )
     def test_loop_invariant_op_write_does_not_advance_in_sdsc(self):
         """A loop-invariant ComputedBuffer's own write inside a coarse-tile
         group must never get a device_tile_advance_expr, so the unroller does
@@ -4186,12 +4144,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
     # Hint propagation through mm_to_bmm_pass
     # ------------------------------------------------------------------
 
-    @config.patch(
-        {
-            "lx_planning": True,
-            "allow_all_ops_in_lx_planning": True,
-        }
-    )
     def test_hint_survives_mm_to_bmm_rewrite(self):
         """spyre_hint is not dropped when mm_to_bmm_pass rewrites mm -> bmm.
 
@@ -4238,12 +4190,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
     # Hint propagation into inserted restickify nodes
     # ------------------------------------------------------------------
 
-    @config.patch(
-        {
-            "lx_planning": True,
-            "allow_all_ops_in_lx_planning": True,
-        }
-    )
     def test_hint_restickify_stays_in_group(self):
         """A restickify node inserted inside a hint scope lands in the same group.
 
@@ -4293,12 +4239,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
     # Softmax with row-tiling: large [NROW, NCOL] tensor
     # ------------------------------------------------------------------
 
-    @config.patch(
-        {
-            "lx_planning": True,
-            "allow_all_ops_in_lx_planning": True,
-        }
-    )
     def test_hint_softmax_row_tiling(self):
         """spyre_hint(num_tiles_per_dim={"NROW": 4}) tiles softmax over the row dimension.
 
@@ -4671,12 +4611,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
             "must not be silently skipped",
         )
 
-    @config.patch(
-        {
-            "lx_planning": True,
-            "allow_all_ops_in_lx_planning": True,
-        }
-    )
     # Consider deleting — superseded by Group 10 structured tests (_flash_v3_fn)
     @pytest.mark.skip(reason="dxp_standalone timeout")
     def test_hint_flash_attention_v3(self):
@@ -5095,30 +5029,19 @@ class TestCoarseTileSpyreHints(InductorTestCase):
             "count=sympify('4')", src, "Expected B loop count 4 as count= in LoopSpec"
         )
 
-    @config.patch(
-        {
-            "lx_planning": True,
-            "allow_all_ops_in_lx_planning": True,
-        }
-    )
-    @pytest.mark.skip
     def test_hint_flash_attention_loopspec(self):
-        """Lk loop level not dropped when Lk-broadcast ops appear first in group.
+        """Lk (the reduction dim) tiled alongside H must be rejected at compile time.
 
-        Flash-attention-style code with nested hints {B:1}/{H:4}/{Lk:2}.
-        The B=1 hint tiles by 1 and is optimised away (no loop generated),
-        leaving two effective loop levels: H and Lk.  Ops like amax/exp/sum
-        have shape [B,H,Lq] — no Lk dimension — and appear before
-        Lk-iterating ops in topological order.  The old _hints_levels
-        returned early from one of those ops and dropped Lk.  The fixed
-        version unions loop_var assignments and finds Lk from a later op
-        in the group.
-
-        Decision xfail: failing in CI (Actions run 30385154736, job
-        90362755639) on PR #3293. We've decided to xfail the coarse tiling
-        tests to allow us to merge to main -- deliberate decision to unblock
-        the merge, not a claim about a specific bisected root cause. Un-xfail
-        once the underlying regression is investigated and fixed.
+        Originally written to pin down an unrelated _hints_levels bug (Lk
+        loop level dropped when Lk-broadcast ops appear before Lk-iterating
+        ops in topological order); that bug is long fixed. The test now
+        compiles far enough to hit a distinct, legitimate restriction: Lk is
+        the reduction dim here, tiled alongside H (no separate outer output-
+        dim loop), so M/denominator's same-group consumers (max_running,
+        exp_scores, ...) would read a per-Lk-tile partial max/sum instead of
+        the fully-combined one. Same flat-case family as
+        test_softmax_2d_512x256_dim1_B4 -- rejected by the same
+        _reads_incomplete_reduction planning-time check.
         """
         import math
         from torch_spyre._inductor import spyre_hint
@@ -5181,22 +5104,9 @@ class TestCoarseTileSpyreHints(InductorTestCase):
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
             mock_patch("subprocess.run"),
+            pytest.raises(Exception, match="partial reduction result consumed before"),
         ):
-            _, source_codes = run_and_get_code(cfn, queries_dev, keys_dev, values_dev)
-        self.assertTrue(len(source_codes) > 0)
-        src = source_codes[0]
-        self.assertIn("LoopSpec(", src, "Expected LoopSpec in generated source")
-        self.assertIn(
-            "count=sympify('4')",
-            src,
-            "Expected H loop count 4 — hint_H must appear as count= in LoopSpec",
-        )
-        self.assertIn(
-            "count=sympify('2')",
-            src,
-            "Expected Lk loop count 2 as count= in LoopSpec — hint_Lk must not be"
-            " dropped by _hints_levels",
-        )
+            run_and_get_code(cfn, queries_dev, keys_dev, values_dev)
 
     def test_hint_mixed_output_and_reduction_loopspec(self):
         """Lk loop level stamped correctly when Lk is output dim for some ops and
@@ -5264,22 +5174,16 @@ class TestCoarseTileSpyreHints(InductorTestCase):
             " by _stamp_group (group-wide is_reduction_level flag bug)",
         )
 
-    @pytest.mark.skip
     def test_hint_flash_attention_two_loop_levels(self):
-        """Flash-attention graph: both H and Lk loop levels survive into codegen.
+        """Lk (the reduction dim) tiled alongside H must be rejected at compile time.
 
-        Nested hints {B:1}/{H:4}/{Lk:2} — B=1 tiles by 1 and is optimised
-        away (no loop generated), leaving two effective loop levels: H and Lk.
-        The generated LoopSpec must carry both count=sympify('4') for H and
-        count=sympify('2') for Lk.  Before the _stamp_group per-op dispatch
-        fix, Lk tiling was silently skipped for ops where the group-wide
-        is_reduction_level flag disagreed with the op's own dim role.
-
-        Decision xfail: failing in CI (Actions run 30385154736, job
-        90362755639) on PR #3293. We've decided to xfail the coarse tiling
-        tests to allow us to merge to main -- deliberate decision to unblock
-        the merge, not a claim about a specific bisected root cause. Un-xfail
-        once the underlying regression is investigated and fixed.
+        Same graph shape as test_hint_flash_attention_loopspec (originally
+        written to pin down an unrelated, long-fixed _stamp_group per-op
+        dispatch bug); now correctly rejected before any LoopSpec/OpSpec is
+        generated by the same _reads_incomplete_reduction planning-time
+        check -- Lk is the reduction dim tiled alongside H with no separate
+        outer output-dim loop, so max_running/denominator's same-group
+        consumers would read a per-Lk-tile partial result.
         """
         import math
         from torch_spyre._inductor import spyre_hint
@@ -5340,52 +5244,18 @@ class TestCoarseTileSpyreHints(InductorTestCase):
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
             mock_patch("subprocess.run"),
+            pytest.raises(Exception, match="partial reduction result consumed before"),
         ):
-            _, source_codes = run_and_get_code(cfn, queries_dev, keys_dev, values_dev)
-        self.assertTrue(len(source_codes) > 0)
-        src = source_codes[0]
-        self.assertIn("LoopSpec(", src, "Expected LoopSpec in generated source")
-        self.assertIn(
-            "count=sympify('4')",
-            src,
-            "Expected H loop count 4 as count= in LoopSpec",
-        )
-        self.assertIn(
-            "count=sympify('2')",
-            src,
-            "Expected Lk loop count 2 as count= in LoopSpec — _stamp_group must"
-            " divide Lk ranges on each op using that op's own dim role",
-        )
-        # The amax (op='max') reduces over Lk.  The bug causes it to receive
-        # is_reduction_level=False at the Lk loop level (group-wide flag taken
-        # from a pointwise op), so _divide_reduction_ranges is never called:
-        # amax iterates over the full Lk per tile and its tiled_symbols inner
-        # level stays empty ("[[], ").  After the per-op dispatch fix, the amax
-        # op gets a non-empty inner tiled_symbols entry for its Lk reduction dim.
-        max_op_idx = src.find("op='max'")
-        self.assertGreater(
-            max_op_idx, 0, "Expected op='max' (amax) OpSpec in generated source"
-        )
-        self.assertNotIn(
-            "tiled_symbols=[[], ",
-            src[max_op_idx : max_op_idx + 500],
-            "amax op has empty inner tiled_symbols — Lk reduction range not divided"
-            " by _stamp_group (group-wide is_reduction_level flag bug)",
-        )
+            run_and_get_code(cfn, queries_dev, keys_dev, values_dev)
 
-    @pytest.mark.skip
     def test_hint_flash_attention_two_loop_levels_v2(self):
         """Flash-attention graph: both H and Lq loop levels survive into codegen.
 
         Variant of test_hint_flash_attention_two_loop_levels with a causal
         mask and an explicit running-max (real_max) formulation that updates
-        output and denominator in place via copy_.
-
-        Decision xfail: failing in CI (Actions run 30385154736, job
-        90362755639) on PR #3293. We've decided to xfail the coarse tiling
-        tests to allow us to merge to main -- deliberate decision to unblock
-        the merge, not a claim about a specific bisected root cause. Un-xfail
-        once the underlying regression is investigated and fixed.
+        output and denominator in place via copy_. Unlike that test, Lq (an
+        output dim, not the reduction dim Lk) is tiled here, so it never hits
+        the reduction-dim-tiled-alongside-output-dim restriction.
         """
         import math
         from torch_spyre._inductor import spyre_hint
@@ -5951,12 +5821,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
     # Tiled pointwise with outside consumer (_allocate_full_buffer)
     # ------------------------------------------------------------------
 
-    @config.patch(
-        {
-            "lx_planning": True,
-            "allow_all_ops_in_lx_planning": True,
-        }
-    )
     def test_hint_tiled_pointwise_outside_consumer_correct(self):
         """Tiled pointwise op with a consumer outside the loop (tests
         _allocate_full_buffer pre-stickify: the full buffer must be correctly
@@ -6408,12 +6272,6 @@ class TestNamedDimsHint(InductorTestCase):
         torch.manual_seed(0xAFFE)
         _pnd.reset()
 
-    @config.patch(
-        {
-            "lx_planning": True,
-            "allow_all_ops_in_lx_planning": True,
-        }
-    )
     def test_full_with_named_dims_hint_tiles(self):
         """spyre_hint(named_dims=[...]) on torch.full enables coarse tiling.
 
@@ -6449,12 +6307,6 @@ class TestNamedDimsHint(InductorTestCase):
         self.assertIn("LoopSpec(", src, "Expected LoopSpec in generated source")
         self.assertIn("sympify('4')", src, "Expected loop count 4")
 
-    @config.patch(
-        {
-            "lx_planning": True,
-            "allow_all_ops_in_lx_planning": True,
-        }
-    )
     def test_full_like_with_named_dims_hint_tiles(self):
         """spyre_hint(named_dims=[...]) on torch.full_like enables coarse tiling."""
         from torch_spyre._inductor import spyre_hint
@@ -6484,12 +6336,6 @@ class TestNamedDimsHint(InductorTestCase):
         self.assertIn("LoopSpec(", src, "Expected LoopSpec in generated source")
         self.assertIn("sympify('2')", src, "Expected loop count 2")
 
-    @config.patch(
-        {
-            "lx_planning": True,
-            "allow_all_ops_in_lx_planning": True,
-        }
-    )
     def test_named_dims_hint_self_contained_no_driver_calls(self):
         """spyre_hint(named_dims=[...]) alone enables coarse tiling.
 
@@ -7233,12 +7079,6 @@ class TestCoarseTileNestedReductionE2E(InductorTestCase):
             "Expected a coarse_tile_reduce_copy op in generated source for nested M+K tiling",
         )
 
-    @config.patch(
-        {
-            "lx_planning": True,
-            "allow_all_ops_in_lx_planning": True,
-        }
-    )
     def test_nested_matmul_outer_M_inner_K_accum_in_lx(self):
         """With lx_planning enabled, the tile-sized accum buffer lands in LX scratchpad."""
         from torch_spyre._inductor import spyre_hint
