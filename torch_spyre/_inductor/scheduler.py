@@ -855,13 +855,13 @@ def demote_incoherent_lx_buffers(
     )
 
     accepted_views: dict[tuple[str, str], FinalLXView] = {}
-    for key, view in preview_views.items():
+    for key, final_view in preview_views.items():
         buffer = V.graph.try_get_buffer(key[1])
         if buffer is None:
             continue
         layout = buffer.get_layout()
         if isinstance(layout, FixedTiledLayout) and "lx" in layout.allocation:
-            accepted_views[key] = view
+            accepted_views[key] = final_view
     set_final_lx_views(V.graph, accepted_views)
     logger.debug(
         "LX final-view gate: previewed_ops=%d alignment_changed_ops=%d "
