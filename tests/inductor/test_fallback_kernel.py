@@ -372,11 +372,11 @@ class TestInGraphCpuComputedBuffers(unittest.TestCase):
     """CPU pointwise ComputedBuffers in a mixed graph must not crash scratchpad planning.
 
     A convert fallback returns a CPU tensor; a chain of pointwise ops
-    (add/sub/mul -- all in OP_OUTPUT_GOOD_FOR_LX_REUSE) then runs on it inside
-    the same graph, before converting back to Spyre. propagate_layouts SKIPS
-    those CPU ComputedBuffers (device != spyre), leaving them a plain
+    (add/sub/mul -- none in OP_OUTPUT_NOT_GOOD_FOR_LX_REUSE) then runs on it
+    inside the same graph, before converting back to Spyre. propagate_layouts
+    SKIPS those CPU ComputedBuffers (device != spyre), leaving them a plain
     `FixedLayout` with no `device_layout`. The scratchpad planner's op gate
-    (`_op_output_good_for_lx_reuse`) whitelisted by op NAME only, so a CPU
+    (`_op_output_good_for_lx_reuse`) filtered by op NAME only, so a CPU
     add/sub/mul passed the gate, entered graph_view, and reached
     `mem_usage_by_buf`, which read `layout.device_layout` and raised
     `'FixedLayout' object has no attribute 'device_layout'`. The gate now also

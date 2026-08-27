@@ -25,9 +25,8 @@ jobs:
     name: Parse logs -> ClickHouse
     runs-on:
       - x86_64
-      - spyre_pf_x0
       - linux
-      - image_spyre_backend
+      - image_ingest
     timeout-minutes: 15
     if: |
       github.event_name == 'workflow_dispatch' ||
@@ -55,7 +54,14 @@ jobs:
             .github/scripts/ingest_hw_diagnostics.py
 
       - name: Install uv
-        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          # latest-known, not "latest": it resolves to the newest uv whose checksum is
+          # bundled INTO this setup-uv pin, resolved locally with no release lookup. A
+          # just-published release is not yet mirrored on releases.astral.sh, so "latest"
+          # 404s there and falls back to GitHub Releases, which rate-limits (429) once the
+          # fleet requests it concurrently. Bumping setup-uv moves this version forward.
+          version: latest-known
 
       - name: setup venv
         run: |
@@ -78,8 +84,21 @@ jobs:
       # call is needed here.
       - name: Setup the GitHub CLI
         env:
-          GH_CLI_VERSION: 2.97.0
+          # Offline floor only: used when api.github.com can't be reached to resolve the
+          # latest release, so a transient API failure degrades to a known-good gh instead
+          # of failing the job.
+          GH_CLI_VERSION_FLOOR: 2.98.0
         run: |
+          set -euo pipefail
+          # Track the latest gh release rather than a pin: nothing here depends on a
+          # specific gh version, and a pin silently rots (this fleet had 2.92.0 and 2.97.0
+          # drifting apart across workflows).
+          GH_CLI_VERSION="$(curl -fsSL https://api.github.com/repos/cli/cli/releases/latest \
+                              | jq -r '.tag_name // empty' | sed 's/^v//')" || GH_CLI_VERSION=""
+          if [ -z "$GH_CLI_VERSION" ]; then
+            echo "api.github.com unreachable; flooring to ${GH_CLI_VERSION_FLOOR}"
+            GH_CLI_VERSION="${GH_CLI_VERSION_FLOOR}"
+          fi
           curl -fsSL \
             "https://github.com/cli/cli/releases/download/v${GH_CLI_VERSION}/gh_${GH_CLI_VERSION}_linux_amd64.tar.gz" \
             -o "${RUNNER_TEMP}/gh-cli.tar.gz"

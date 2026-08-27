@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Extract cost-model features from the after-pre-scheduling LoopLevel IR.
+"""Extract cost-model features from the after-LX-planning LoopLevel IR.
 
 Walks ``graph.operations`` and builds :class:`cost_model.OpFeatures` per op
 (per-core cores, per-tensor-arg bytes + HBM/LX residency + broadcast flags),
@@ -68,19 +68,30 @@ def _op_name(op) -> str:
     return type(data).__name__ if data is not None else op.get_operation_name()
 
 
-def _cores(op) -> int:
+def _work_slices(op, write_index, read_index, iteration_space, work_slices=None):
+    """Resolve explicit or committed pre-Scheduler ownership, then transport."""
+    if work_slices is not None:
+        return work_slices
+    ownership = getattr(op, "iteration_space_ownership", None)
+    if ownership is not None:
+        return ownership.work_slices
     splits = getattr(op, "op_it_space_splits", None)
     if not splits:
-        return 1
+        return {}
+    return apply_splits_from_index_coeff(
+        splits, write_index, read_index, iteration_space
+    )
+
+
+def _cores(op, work_slices=None) -> int:
     try:
         rw = op.get_read_writes()
         write_index = next(iter(rw.writes)).index
         read_index = next((d.index for d in rw.reads), write_index)
         it_space = iteration_space_from_op(op)
-        readable = apply_splits_from_index_coeff(
-            splits, write_index, read_index, it_space
+        return _prod_ints(
+            _work_slices(op, write_index, read_index, it_space, work_slices).values()
         )
-        return _prod_ints(readable.values())
     except Exception:  # noqa: BLE001 - best-effort feature extraction
         return 1
 
@@ -260,7 +271,7 @@ def _loop_factor_for_index(index, levels) -> int:
     return factor
 
 
-def _row_split(op, default: int) -> int:
+def _row_split(op, default: int, work_slices=None) -> int:
     """Core split of the ROW (partition) device dim = the output var with the largest
     write-index coefficient (the outer/row dim; the stick dim has the smallest). Used so
     ``tile_rows_per_core`` divides by the cores actually on the rows, not total cores --
@@ -268,16 +279,11 @@ def _row_split(op, default: int) -> int:
     (usually total cores) on any failure -> the prior all-cores-on-rows behavior.
     """
     try:
-        splits = getattr(op, "op_it_space_splits", None)
-        if not splits:
-            return default
         rw = op.get_read_writes()
         write_index = next(iter(rw.writes)).index
         read_index = next((d.index for d in rw.reads), write_index)
         it_space = iteration_space_from_op(op)
-        readable = apply_splits_from_index_coeff(
-            splits, write_index, read_index, it_space
-        )
+        readable = _work_slices(op, write_index, read_index, it_space, work_slices)
         out_vars = [
             (abs(int(write_index.coeff(s))), s)
             for s in it_space
@@ -297,6 +303,7 @@ def _matmul_features(
     dtype_bytes: int,
     loop_trip: int = 1,
     tiles_red_dim: bool = False,
+    work_slices=None,
 ):
     """(macs, rows_per_core, cols_per_core, a_bytes, b_bytes, k_split, m_split, n_split).
 
@@ -329,15 +336,12 @@ def _matmul_features(
     a_bytes = b_bytes = 0
     k_split = m_split = n_split = 1
     try:
-        splits = getattr(op, "op_it_space_splits", None)
-        if splits:
-            rw = op.get_read_writes()
-            write_index = next(iter(rw.writes)).index
-            read_index = next((d.index for d in rw.reads), write_index)
-            it_space = iteration_space_from_op(op)
-            readable = apply_splits_from_index_coeff(
-                splits, write_index, read_index, it_space
-            )
+        rw = op.get_read_writes()
+        write_index = next(iter(rw.writes)).index
+        read_index = next((d.index for d in rw.reads), write_index)
+        it_space = iteration_space_from_op(op)
+        readable = _work_slices(op, write_index, read_index, it_space, work_slices)
+        if readable:
             out_vars = []
             for s in it_space:
                 wc = write_index.coeff(s)
@@ -459,8 +463,13 @@ def _hbm_pattern(op, is_reduction: bool, out_dims) -> str:
         return ""
 
 
-def extract_op_features(op) -> OpFeatures:
-    """Build OpFeatures for one ComputedBuffer op (best-effort)."""
+def extract_op_features(op, work_slices=None) -> OpFeatures:
+    """Build OpFeatures for one ComputedBuffer op (best-effort).
+
+    ``work_slices`` is a complete symbol-keyed candidate division during LX
+    planning. Otherwise committed pre-scheduler ownership is used, falling back
+    to legacy coefficient-keyed Scheduler transport after finalization.
+    """
     data = getattr(op, "data", None)
     is_reduction = getattr(data, "reduction_type", None) is not None
     loop_trip, tiles_red_dim, tiles_out_dim = _loop_features(op)
@@ -479,7 +488,7 @@ def extract_op_features(op) -> OpFeatures:
     out_dims = _device_dims(op.get_layout()) or out_size
     out_elems = _prod_ints(out_dims)
 
-    cores = _cores(op)
+    cores = _cores(op, work_slices)
 
     # Cross-core ring combine: work division splits OUTPUT dims first, then the reduced
     # axis with leftover cores -> the reduced axis is split only when out_elems < cores.
@@ -508,7 +517,9 @@ def extract_op_features(op) -> OpFeatures:
             k_split,
             matmul_m_split,
             matmul_n_split,
-        ) = _matmul_features(op, out_elems, dtype_bytes, loop_trip, is_tiled_red)
+        ) = _matmul_features(
+            op, out_elems, dtype_bytes, loop_trip, is_tiled_red, work_slices
+        )
         reduction_cores = k_split
 
     # Per-core per-tile pass-row height for the UNDERFILL derate -- only for OUTPUT-dim
@@ -540,7 +551,7 @@ def extract_op_features(op) -> OpFeatures:
         # principle return 0 if a split map ever records one, and this term is a
         # diagnostic -- a ZeroDivisionError here would take down a compile for a number
         # nothing depends on. Guard locally rather than rely on the caller's condition.
-        split = _row_split(op, cores) or 1
+        split = _row_split(op, cores, work_slices) or 1
         tile_rows_per_core = rows / split
 
     # PER-ARG, PER-LEVEL loop factors. An operand is re-transferred at a nesting level

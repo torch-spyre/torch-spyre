@@ -206,9 +206,9 @@ toward the limit). Previously committed splits are
 carried forward as lower bounds and narrow the search for subsequent
 tensors.
 
-The resulting minimum splits are written to `op.op_it_space_splits` via
-`apply_splits`. If no span violation exists, `op_it_space_splits` is
-left unset.
+The resulting minimum splits are committed as symbol-keyed
+`op.iteration_space_ownership` via `apply_splits`. If no span violation
+exists, no ownership is recorded.
 
 Splitting the outermost dim halves each core's footprint:
 
@@ -372,10 +372,9 @@ after Pass 2 has finished across all operations.
 
 For each remaining op, `work_distribution_pass` does three things:
 
-1. It recovers the splits committed by Pass 1 by reading
-   `op.op_it_space_splits` via `apply_splits_from_index_coeff`. The
-   coeff-keyed encoding is the same one codegen uses, so it remains
-   stable across compiler passes even as sympy symbols are renamed.
+1. It reads the symbol-keyed splits committed by Pass 1 from
+   `op.iteration_space_ownership.work_slices`. The ownership remains in
+   operation-symbol space through LX planning.
 2. It ranks the remaining dimensions (those not already committed by
    Pass 1) for additional core assignment via `prioritize_dimensions`:
    output dimensions first by decreasing stick-adjusted size, reduction
@@ -390,22 +389,21 @@ For each remaining op, `work_distribution_pass` does three things:
    greedily assigns the largest valid divisor of each remaining
    dimension to the leftover core budget.
 
-The final splits overwrite `op.op_it_space_splits`.
+The final splits overwrite `op.iteration_space_ownership`.
 
-:::{admonition} What gets written to `op.op_it_space_splits`
+:::{admonition} What gets written to `iteration_space_ownership`
 :class: note
 
-The attribute is a `dict` keyed by the index coefficients of the
-buffer's read and write index expressions (computed by
-`splits_by_index_coeff` in
-[pass_utils.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/pass_utils.py)),
-with each coefficient mapping to its slice count. The coefficient
-encoding is internal. Downstream passes recover an iteration-variable
-view by calling
-`apply_splits_from_index_coeff(splits, write_index, read_index, it_space)`.
+The pre-scheduler carrier is a `TensorWorkDivision`: `work_slices` maps
+operation iteration symbols to slice counts, and `core_id_to_work_slice`
+records the selected symbol-keyed core assignment. LX planning consumes this
+ownership directly. Cost-model reporting also reads this ownership before the
+final Scheduler boundary. `finalize_work_division_for_scheduler()` then converts
+the splits to legacy coefficient-keyed `op_it_space_splits` transport so
+Scheduler/codegen can survive iteration-symbol renaming.
 
-For the worked example below, the user-facing view is
-`{M: 16, N: 1, K: 2}` and codegen sees the equivalent
+For the worked example below, the pre-scheduler ownership is
+`{M: 16, N: 1, K: 2}`. Scheduler/codegen receives the equivalent legacy
 coefficient-keyed encoding.
 :::
 
