@@ -224,19 +224,17 @@ class TileSpec:
 class CoreDivision:
     """One permissible core-division of a buffer's producing op.
 
-    ``output_splits`` / ``reduction_splits`` are the stride/coeff-keyed encoding
-    produced by :func:`pass_utils.splits_by_index_coeff` -- exactly the shape
-    stored in ``op.op_it_space_splits``. Solvers are expected to use these to size
-    the buffer (per-core footprint = total / ``output_partition``).
+    ``output_splits`` / ``reduction_splits`` are keyed by the producer's
+    iteration symbols. Solvers use them to size the buffer (per-core footprint
+    = total / ``output_partition``); cross-operation compatibility is derived
+    through ``PerCoreView``, never by comparing these local symbols.
 
-    ``tiling`` pairs a coarse tiling onto this division as *one* candidate rather
-    than a parallel list. A division is only meaningful relative to a tiling
-    (the legal set and the coeff encoding both move with it), so the two must be
-    chosen together. The empty :class:`TileSpec` is untiled and inert.
+    ``tiling`` pairs a coarse tiling onto this division as one candidate. The
+    empty :class:`TileSpec` is untiled and inert.
     """
 
-    output_splits: dict[int, int] = field(default_factory=dict)
-    reduction_splits: dict[int, int] = field(default_factory=dict)
+    output_splits: dict[object, int] = field(default_factory=dict)
+    reduction_splits: dict[object, int] = field(default_factory=dict)
     tiling: TileSpec = field(default_factory=TileSpec)
 
     @property
@@ -259,13 +257,27 @@ class CoreDivision:
     def signature_key(self):
         """Per-core slicing signature, or ``None`` for a reduction-split division
         (a ``None`` never compares equal, so partial-reduction divisions never
-        match)."""
-        return tuple(sorted(self.output_splits.items())) if self.is_clean else None
+        match). Only used within one operation's symbol namespace."""
+        return (
+            tuple(sorted(self.output_splits.items(), key=lambda item: str(item[0])))
+            if self.is_clean
+            else None
+        )
 
     @property
     def label(self) -> str:
-        out = ",".join(f"s{s}/{f}" for s, f in sorted(self.output_splits.items()))
-        red = ",".join(f"~s{s}/{f}" for s, f in sorted(self.reduction_splits.items()))
+        out = ",".join(
+            f"s{s}/{f}"
+            for s, f in sorted(
+                self.output_splits.items(), key=lambda item: str(item[0])
+            )
+        )
+        red = ",".join(
+            f"~s{s}/{f}"
+            for s, f in sorted(
+                self.reduction_splits.items(), key=lambda item: str(item[0])
+            )
+        )
         return " ".join(p for p in (out, red) if p) or "whole"
 
 

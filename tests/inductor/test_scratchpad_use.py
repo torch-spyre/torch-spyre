@@ -442,7 +442,7 @@ class TestMeasureHBMUsageCoOptimizing(BaseTestScratchpadUsage):
     where adjacent ops disagree on which iteration-space dim to split. The
     canonical case is softmax(dim=0): work_distribution picks rows for the
     pointwise ops and cols for the reductions, forcing 3 of 4 shared buffers to
-    HBM by default — Strategy B reconciles them and pins all 4.
+    HBM by default — co-optimization reconciles them and pins all 4.
     """
 
     @override
@@ -480,15 +480,15 @@ class TestMeasureHBMUsageCoOptimizing(BaseTestScratchpadUsage):
     def test_softmax_dim0_strictly_lower_hbm(self):
         """The canonical motivating case from the design doc. softmax(dim=0)
         has every adjacent op pair disagreeing on which dim to split, so
-        ScratchpadAllocator only pins 1 of 4 shared buffers; Strategy B should
-        flip the pointwise ops to cols and pin all 4 → strictly lower HBM."""
+        ScratchpadAllocator only pins 1 of 4 shared buffers; co-optimization
+        should flip the pointwise ops to cols and pin all 4 → strictly lower HBM."""
         f = functools.partial(torch.softmax, dim=0)
         x = self.rand_device((512, 1024))
         self.run_test(f, (x,), strict=True)
 
     def test_softmax_dim_neg1_no_regression(self):
         """softmax(dim=-1) is the well-behaved baseline where ScratchpadAllocator
-        already pins everything pinnable. Strategy B must match (no regression)."""
+        already pins everything pinnable. Co-optimization must match (no regression)."""
         f = functools.partial(torch.softmax, dim=-1)
         x = self.rand_device((512, 1024))
         self.run_test(f, (x,))
@@ -810,7 +810,7 @@ class CoOptAllocatorIntegrationTests(BaseTestScratchpadUsage):
     When enabled: the acceptance criterion for each model (its prescribed
     fingerprint) is defined *once* in that model's factory and swept over the
     ``solver_method`` axis by ``_ParameterizedScratchpadMeta``. The prescribed
-    plans are the *greedy* StrategyB plans; the joint CP-SAT allocator
+    plans are the *greedy* co-optimization plans; the joint CP-SAT allocator
     (``layout_solver="cpsat"``) optimises core division and placement jointly
     and is expected to land on a different (not yet pinned-down) plan, so the
     ``cpsat`` combos are marked ``expectedFailure`` via ``case_decorators``.
@@ -889,7 +889,7 @@ class CoOptAllocatorIntegrationTests(BaseTestScratchpadUsage):
         self.assertEqual(
             fingerprint,
             expected,
-            "allocation does not match the prescribed (desired = StrategyB) plan "
+            "allocation does not match the prescribed (desired greedy) plan "
             "{buf: (location, size, split)}:\n"
             f"  expected {expected}\n  got      {fingerprint}",
         )

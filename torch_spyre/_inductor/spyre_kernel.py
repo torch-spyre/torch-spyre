@@ -58,6 +58,7 @@ from .pass_utils import (
     finite_upper_or_none,
     apply_splits_from_index_coeff,
     iteration_space,
+    select_work_division_transport_indexes,
     indirect_access_subs_from_kernel,
     is_restickify_coords,
 )
@@ -867,43 +868,11 @@ class SpyreKernel(Kernel[CSEVariable]):
         ir_node = self.current_node.node  # ComputedBuffer
         work_division: dict[sympy.Symbol, int] = {}
         if hasattr(ir_node, "op_it_space_splits"):
-            from .pass_utils import is_keep_by_index, read_with_max_reduction_overlap
-
-            write_index = next(iter(self.current_node.read_writes.writes)).index
-            reads = self.current_node.read_writes.reads
-
-            # For keep_by_index, the indices tensor (not values) carries the k
-            # (reduction) dimension, so pick whichever read overlaps
-            # reduction_vars the most instead of just taking the first
-            # non-indirect read.
-            if is_keep_by_index(ir_node):
-                coord_vars = {v for v in write_index.free_symbols}
-                reduction_vars = set(it_space.keys()) - coord_vars
-                read_index = write_index
-                if reduction_vars:
-                    best_read = read_with_max_reduction_overlap(reads, reduction_vars)
-                    if best_read is not None:
-                        read_index = best_read
-            else:
-                # Match the encoding in work_division.apply_splits: an indirect
-                # (gather) read carries data-dependent symbols whose coefficients are
-                # not a stable identity key, so prefer the first non-indirect read as
-                # the reduction-split reference index.
-                read_dep = next(
-                    (
-                        d
-                        for d in reads
-                        if isinstance(d, MemoryDep) and not d.is_indirect()
-                    ),
-                    next(iter(reads), None),
-                )
-                read_index = read_dep.index if read_dep is not None else write_index
-
+            write_index, read_index = select_work_division_transport_indexes(
+                ir_node, self.current_node.read_writes, it_space
+            )
             work_division = apply_splits_from_index_coeff(
-                ir_node.op_it_space_splits,
-                write_index,
-                read_index,
-                it_space,
+                ir_node.op_it_space_splits, write_index, read_index, it_space
             )
 
         it_space_extended = {

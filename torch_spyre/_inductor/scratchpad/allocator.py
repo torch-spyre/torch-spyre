@@ -37,14 +37,14 @@ from torch._inductor.dependencies import MemoryDep
 from torch._inductor.graph import GraphLowering
 
 from torch_spyre._inductor.pass_utils import (
-    apply_splits_from_index_coeff,
+    commit_iteration_space_ownership,
     concretize_expr,
     indirect_info_from_op,
     iteration_space_from_op,
-    splits_by_index_coeff,
     op_read_writes,
     _prepare_per_core_view,
     _per_core_view_from_prep,
+    _is_matmul_op,
     op_short_name,
 )
 from torch_spyre._inductor.work_division import enumerate_work_division_candidates
@@ -100,7 +100,6 @@ from torch_spyre._inductor.scratchpad.lx_relayout import (
     collect_lx_relayout_plans,
     materialize_lx_relayouts,
 )
-from torch_spyre._inductor.pass_utils import _is_matmul_op
 
 logger = get_inductor_logger("scratchpad.allocator")
 
@@ -1160,15 +1159,47 @@ def _lx_planning_size() -> int:
     return round_up_to_alignment(frontend_reservation, _LX_ALLOCATION_GRANULARITY_BYTES)
 
 
+def _core_division(op: Operation, splits: dict[sympy.Symbol, int]) -> CoreDivision:
+    """Classify one symbol-keyed candidate for its producing operation."""
+    rw = op_read_writes(op)
+    write = next((d for d in rw.writes if isinstance(d, MemoryDep)), None)
+    if write is None:
+        return CoreDivision()
+    output = {
+        s: int(v) for s, v in splits.items() if write.index.coeff(s) != 0 and v > 1
+    }
+    reduction = {
+        s: int(v) for s, v in splits.items() if write.index.coeff(s) == 0 and v > 1
+    }
+    return CoreDivision(output_splits=output, reduction_splits=reduction)
+
+
+def _division_splits(op: Operation, division: CoreDivision) -> dict[sympy.Symbol, int]:
+    """Restore a complete symbol-keyed split map from a sparse division."""
+    return {
+        sym: int(division.output_splits.get(sym, division.reduction_splits.get(sym, 1)))
+        for sym in iteration_space_from_op(op)
+    }
+
+
 def _fixed_core_division(op: Operation) -> CoreDivision:
-    """The op's upstream-committed division (``op.op_it_space_splits``) as a single
-    pinned :class:`CoreDivision`; a never-divided op yields a one-core empty split.
-    """
-    seed: tuple[dict, dict] = getattr(op, "op_it_space_splits", None) or ({}, {})
-    return CoreDivision(output_splits=dict(seed[0]), reduction_splits=dict(seed[1]))
+    """The op's committed symbol-keyed division, or a one-core division."""
+    ownership = getattr(op, "iteration_space_ownership", None)
+    return _core_division(op, ownership.work_slices if ownership is not None else {})
 
 
 DEFAULT_VARIANT_CAP = 6
+# Try larger batch factors first. Keeping more of the batch axis whole offers
+# the same reconciliation benefit with fewer co-optimization candidates.
+_FACTORED_B_FACTORS: tuple[int, ...] = (8, 4, 2)
+
+
+def _seed_splits(op: Operation) -> dict[sympy.Symbol, int]:
+    ownership = getattr(op, "iteration_space_ownership", None)
+    return {
+        sym: int(ownership.work_slices.get(sym, 1)) if ownership is not None else 1
+        for sym in iteration_space_from_op(op)
+    }
 
 
 def _output_stride_to_device_size(op: Operation) -> dict[int, int]:
@@ -1203,360 +1234,271 @@ def _output_stride_to_device_size(op: Operation) -> dict[int, int]:
     return stride_to_size
 
 
-def _split_fits_sticks(op: Operation, splits: tuple[dict, dict]) -> bool:
-    """True if every output-dim factor in `splits` divides that dim's stick count.
+def _split_fits_sticks(op: Operation, splits: dict[sympy.Symbol, int]) -> bool:
+    """True if every output split divides its physical device dimension.
 
-    A split factor must divide the device size of the dim it lands on, which for
-    the stickified dim is the stick count, not the element extent. Element-extent
-    divisibility is not enough: N=128 with 64 elems/stick is only 2 sticks, yet
-    128 % 4 == 0 would admit a 4-way split the SDSC bundler then rejects (SIGABRT).
-    Checks output splits only; reduction (K) splits are bounded by the planner.
+    A split factor must divide the device dimension it lands on. For the
+    stickified host dimension that is the outer-stick count, not the element
+    extent: an extent of 128 with 64 elements per stick has only two splittable
+    sticks. Reduction-only symbols are absent from the write index and are not
+    constrained here; work-division bounds those separately.
 
-    A split whose stride has no entry in stride_to_size (e.g. it lands on a
-    collapsed/broadcast device dim that _output_stride_to_device_size skips) is
-    unplaceable and rejected: size defaults to 0, and `size <= 0` fails the check.
-    (Plain `0 % factor == 0` would wrongly *admit* it.)
+    A positive-coefficient output symbol with no device-stride entry is
+    unplaceable (for example, a collapsed or broadcast dimension), so reject it
+    rather than relying on modulo arithmetic with a missing size.
     """
-    out_splits = splits[0]
-    if not out_splits:
-        return True
-    stride_to_size = _output_stride_to_device_size(op)
-    for stride, factor in out_splits.items():
-        if factor <= 1:
-            continue
-        size = stride_to_size.get(int(stride), 0)
-        if size <= 0 or size % factor != 0:
+    write = next(iter(op_read_writes(op).writes), None)
+    if write is None:
+        return False
+    sizes = _output_stride_to_device_size(op)
+    for sym, factor in splits.items():
+        stride = int(write.index.coeff(sym))
+        size = sizes.get(stride, 0)
+        if factor > 1 and stride and (not size or size % factor):
             return False
     return True
 
 
-# TODO: helper for cross-matmul split transfer. Remove together with the
-# block in _enum_split_options once work_dist assigns consistent splits.
-def _matmul_axis_parse(
-    op: Operation,
-) -> dict[str, tuple[sympy.Symbol, int, int]]:
-    """Parse a batched-matmul op into ``{role: (sym, extent, factor)}``.
+def _matmul_axis_parse(op: Operation) -> dict[str, tuple[sympy.Symbol, int, int]]:
+    """Parse a matmul into ``{B|M|N|K: (symbol, extent, seed_factor)}``.
 
-    Role is one of "B", "M", "N", "K"; `sym` is the op's iter symbol for that
-    axis, `extent` its splittable size, `factor` the current split from
-    op.op_it_space_splits (1 if unsplit). Output is [B, M, N] (3D) or [M, N]
-    (2D), so output symbols sorted by ascending stride spell N, M, B (B absent
-    for 2D); the lone reduction symbol is K.
-
-    For output dims, `extent` is the device size of the dim it maps to (the stick
-    count for the stickified dim), via _output_stride_to_device_size — so a valid
-    split must divide the stick count, not the element extent.
+    Output symbols sorted by ascending write-index stride are N, M, B (with B
+    absent for 2D matmuls); the symbol added by a read index is K. Output
+    extents come from stick-aware device geometry, so generated split factors
+    divide stick counts rather than element extents. The returned symbols and
+    factors remain local and symbol-keyed.
     """
-    rw = op.get_read_writes()
-    write_index = next(iter(rw.writes)).index
-    read_index = next((d.index for d in rw.reads), write_index)
-    iter_space = iteration_space_from_op(op)
-
-    seed: tuple[dict, dict] = getattr(op, "op_it_space_splits", ({}, {}))
-    per_sym = apply_splits_from_index_coeff(seed, write_index, read_index, iter_space)
-    stride_to_size = _output_stride_to_device_size(op)
-
-    # Derive axis symbols from the index free_symbols (not iter_space, which may
-    # not enumerate every indexed symbol): output dims are in write_index, and K
-    # is whatever the read index adds on top of the write.
-    out_stride_sym = {int(write_index.coeff(s)): s for s in write_index.free_symbols}
-    k_syms = read_index.free_symbols - write_index.free_symbols
+    rw = op_read_writes(op)
+    write = next(iter(rw.writes)).index
+    read = next((dep.index for dep in rw.reads), write)
+    out_syms = {int(write.coeff(sym)): sym for sym in write.free_symbols}
+    k_syms = read.free_symbols - write.free_symbols
     if not k_syms:
-        raise ValueError(
-            f"matmul {op.get_name()}: read index adds no reduction symbol over "
-            f"the write index (read={read_index}, write={write_index})"
-        )
-    k_sym = next(iter(k_syms))
-
+        raise ValueError(f"matmul {op.get_name()} has no reduction axis")
+    sizes = _output_stride_to_device_size(op)
+    seed = _seed_splits(op)
     roles: dict[str, tuple[sympy.Symbol, int, int]] = {}
-    possible_roles = ["N", "M", "B"]
-    for i, st in enumerate(sorted(out_stride_sym)):  # ascending, works for 2D and 3D
-        sym = out_stride_sym[st]
-        roles[possible_roles[i]] = (sym, stride_to_size[st], per_sym[sym])
-    roles["K"] = (k_sym, concretize_expr(iter_space[k_sym]), per_sym[k_sym])
-
+    for role, stride in zip(("N", "M", "B"), sorted(out_syms)):
+        sym = out_syms[stride]
+        roles[role] = (sym, sizes[stride], seed[sym])
+    k_sym = next(iter(k_syms))
+    roles["K"] = (
+        k_sym,
+        concretize_expr(iteration_space_from_op(op)[k_sym]),
+        seed[k_sym],
+    )
     return roles
-
-
-# Batch factors to try, largest first. Only the largest one that fits is offered
-# (see _factored_bm_splits): a bigger B split keeps more of the batch axis whole,
-# and smaller-B variants don't aid reconciliation while multiplying the co-opt
-# search space. m_fac = ncores // b_fac.
-_FACTORED_B_FACTORS: tuple[int, ...] = (8, 4, 2)
 
 
 def _bm_axes_from_roles(
     roles: dict[str, tuple[sympy.Symbol, int, int]],
-) -> Optional[tuple[tuple[sympy.Symbol, int], tuple[sympy.Symbol, int]]]:
-    """B/M axes ((b_sym, b_extent), (m_sym, m_extent)) from _matmul_axis_parse
-    roles, or None if either is absent."""
-    b = roles.get("B")
-    m = roles.get("M")
-    if b is None or m is None:
-        return None
-    return (b[0], b[1]), (m[0], m[1])
+) -> tuple[tuple[sympy.Symbol, int], tuple[sympy.Symbol, int]] | None:
+    """Return B/M ``(symbol, extent)`` pairs, or ``None`` when either is absent."""
+    b, m = roles.get("B"), roles.get("M")
+    return ((b[0], b[1]), (m[0], m[1])) if b is not None and m is not None else None
 
 
 def _reduction_bm_axes(
     op: Operation,
-) -> Optional[tuple[tuple[sympy.Symbol, int], tuple[sympy.Symbol, int]]]:
-    """B/M axes for a reduction op, from its output dims.
+) -> tuple[tuple[sympy.Symbol, int], tuple[sympy.Symbol, int]] | None:
+    """Return stick-aware B/M output axes for a non-matmul reduction.
 
-    A reduction over N keeps B and M as output dims (e.g. write `512*d0 + d1`:
-    B=d0, M=d1). Mirror _matmul_axis_parse's stride convention: sort output syms
-    by ascending stride; the largest-stride dim is B (outermost), the next is M.
-    Extents are stick-aware via _output_stride_to_device_size. None if < 2 output
-    dims (nothing to factor).
+    A reduction over N keeps B and M in its write. As in
+    :func:`_matmul_axis_parse`, the largest output stride is B and the next is
+    M. Reductions with fewer than two output axes cannot use this factorization.
     """
-    write_index = next(iter(op.get_read_writes().writes)).index
-    out_stride_sym = {int(write_index.coeff(s)): s for s in write_index.free_symbols}
-    if len(out_stride_sym) < 2:
+    write = next(iter(op_read_writes(op).writes)).index
+    out_syms = {int(write.coeff(sym)): sym for sym in write.free_symbols}
+    if len(out_syms) < 2:
         return None
-    stride_to_size = _output_stride_to_device_size(op)
-    by_stride = sorted(out_stride_sym)  # ascending: [..., M, B]
-    m_stride, b_stride = by_stride[-2], by_stride[-1]
-    return (
-        (out_stride_sym[b_stride], stride_to_size[b_stride]),
-        (out_stride_sym[m_stride], stride_to_size[m_stride]),
-    )
+    m_stride, b_stride = sorted(out_syms)[-2:]
+    sizes = _output_stride_to_device_size(op)
+    return (out_syms[b_stride], sizes[b_stride]), (out_syms[m_stride], sizes[m_stride])
 
 
-# TODO: companion to _matmul_axis_parse. Remove with the block in
-# _enum_split_options once work_dist assigns consistent splits.
 def _factored_bm_splits(
-    op: Operation,
-    bm_axes: Optional[tuple[tuple[sympy.Symbol, int], tuple[sympy.Symbol, int]]],
-) -> list[tuple[dict, dict]]:
-    """Batch-major (B/b · M/m) full-core output split for `op`.
+    bm_axes: tuple[tuple[sympy.Symbol, int], tuple[sympy.Symbol, int]] | None,
+) -> list[dict[sympy.Symbol, int]]:
+    """Offer at most one largest-B full-core B/M factorization.
 
-    `bm_axes` is ((b_sym, b_extent), (m_sym, m_extent)) for the op's batch and M
-    output dims (from _bm_axes_from_roles for matmuls, _reduction_bm_axes for
-    reductions). Returns at most ONE candidate: the largest-B full-core factoring
-    (b_fac from _FACTORED_B_FACTORS, largest first; m_fac = ncores // b_fac) that
-    divides both stick-count extents. Smaller-B factorings are not offered — they
-    don't help reconciliation and only inflate the co-opt search space. Empty if
-    no factoring fits (e.g. B too small). The caller's _split_fits_sticks is the
-    final guard.
+    Smaller B factors do not add a useful reconciliation option but multiply the
+    co-optimization search space. An empty result means B/M is absent or no
+    factorization divides both stick-aware extents.
     """
     if bm_axes is None:
         return []
-    (b_sym, b_extent), (m_sym, m_extent) = bm_axes
-    ncores = config.sencores
-
-    rw = op.get_read_writes()
-    write_index = next(iter(rw.writes)).index
-    read_index = next((d.index for d in rw.reads), write_index)
-
-    for b_fac in _FACTORED_B_FACTORS:
-        m_fac = ncores // b_fac
+    (b_sym, b_size), (m_sym, m_size) = bm_axes
+    for b_factor in _FACTORED_B_FACTORS:
+        m_factor = config.sencores // b_factor
         if (
-            b_fac * m_fac != ncores
-            or b_fac > b_extent
-            or b_extent % b_fac != 0
-            or m_extent % m_fac != 0
+            b_factor * m_factor == config.sencores
+            and b_size % b_factor == 0
+            and m_size % m_factor == 0
         ):
-            continue
-        per_sym = {b_sym: b_fac, m_sym: m_fac}
-        return [splits_by_index_coeff(per_sym, write_index, read_index)]
+            return [{b_sym: b_factor, m_sym: m_factor}]
     return []
 
 
-# TODO: companion to _matmul_axis_parse. Remove with the block in
-# _enum_split_options once work_dist assigns consistent splits.
+def _candidate_key(splits: dict[sympy.Symbol, int]) -> tuple[tuple[str, int], ...]:
+    """Return a stable, symbol-orderable deduplication key for one candidate."""
+    return tuple(sorted(((str(sym), factor) for sym, factor in splits.items())))
+
+
+def _output_profile(op: Operation, splits: dict[sympy.Symbol, int]) -> dict[int, int]:
+    """Project output splits onto physical strides for cross-operation transfer.
+
+    This is temporary candidate-generation metadata only; callers immediately
+    reconstruct a symbol-keyed candidate for the target operation.
+    """
+    write = next(iter(op_read_writes(op).writes)).index
+    return {
+        int(write.coeff(sym)): factor
+        for sym, factor in splits.items()
+        if factor > 1 and write.coeff(sym) != 0
+    }
+
+
+def _from_output_profile(
+    op: Operation, profile: dict[int, int]
+) -> dict[sympy.Symbol, int]:
+    """Apply a transient physical output profile as a symbol-keyed candidate."""
+    write = next(iter(op_read_writes(op).writes)).index
+    return {
+        sym: profile.get(int(write.coeff(sym)), 1) if write.coeff(sym) != 0 else 1
+        for sym in iteration_space_from_op(op)
+    }
+
+
 def _find_distinct_matmul_splits(
     ops: list[Operation],
-) -> tuple[tuple[tuple[dict, dict], ...], tuple[dict[str, int], ...]]:
-    """Collect the distinct matmul output-splits in `ops`.
+) -> tuple[tuple[dict[int, int], ...], tuple[dict[str, int], ...]]:
+    """Collect distinct physical profiles and B/M/N/K factors from matmul seeds.
 
-    Returns ``(bases, roles)`` deduped by canonical key. `bases` are raw
-    (output_splits, {}) tuples for the pointwise path — the matmuls' seed splits
-    plus the factored batch-major (B/b · M/m) splits, so the softmax chain between
-    two matmuls can adopt a shared B/M tiling. `roles` are the seed splits as
-    {role: factor} maps (e.g. {"M": 4, "N": 8}) for the cross-matmul transfer.
+    Profiles let intervening pointwise operations offer a matching output
+    division. Role factors let another matmul transfer a split despite using
+    different local iteration symbols. Both are transient inputs to candidate
+    generation; committed divisions remain symbol-keyed.
     """
-    seen: set[tuple] = set()
-    bases: list[tuple[dict, dict]] = []
+    profiles: list[dict[int, int]] = []
     roles: list[dict[str, int]] = []
+    seen: set[tuple[tuple[int, int], ...]] = set()
     for op in ops:
         if not _is_matmul_op(op):
             continue
-        op_roles = _matmul_axis_parse(op)
-        out: dict = getattr(op, "op_it_space_splits", ({}, {}))[0]
-        candidates: list[tuple[dict, dict]] = [(dict(out), {})] if out != {} else []
-        candidates += _factored_bm_splits(op, _bm_axes_from_roles(op_roles))
-        for base in candidates:
-            key = _canonical_key(base)
-            if key in seen:
-                continue
-            seen.add(key)
-            bases.append(base)
-        if out != {}:
-            roles.append({r: f for r, (_s, _e, f) in op_roles.items()})
-    return tuple(bases), tuple(roles)
+        parsed = _matmul_axis_parse(op)
+        candidates = [_output_profile(op, _seed_splits(op))]
+        candidates += [
+            _output_profile(op, candidate)
+            for candidate in _factored_bm_splits(_bm_axes_from_roles(parsed))
+        ]
+        for profile in candidates:
+            key = tuple(sorted(profile.items()))
+            if profile and key not in seen:
+                seen.add(key)
+                profiles.append(profile)
+        if candidates[0]:
+            roles.append(
+                {role: factor for role, (_sym, _size, factor) in parsed.items()}
+            )
+    return tuple(profiles), tuple(roles)
 
 
-# TODO: companion to _matmul_axis_parse. Remove with the block in
-# _enum_split_options once work_dist assigns consistent splits.
-def _check_and_add_matmul_option(
+def _check_and_add_matmul_options(
     op: Operation,
-    seed: tuple[dict, dict],
+    seed: dict[sympy.Symbol, int],
     matmul_roles: tuple[dict[str, int], ...],
-) -> list[tuple[dict, dict]]:
-    """Options for matmul `op`: its seed, each other matmul's split transferred
-    into this op's coordinates by axis role, plus factored batch-major (B/b · M/m)
-    splits.
+) -> list[dict[sympy.Symbol, int]]:
+    """Offer seed, cross-matmul, and factored B/M candidates for ``op``.
 
-    work_dist can assign two matmuls inconsistent splits (e.g. QK {4096:4, 1:8}
-    vs AV {128:32}); a shared axis (here M) then disagrees with the PW/softmax
-    ops between them, forcing a core-div mismatch and blocking LX pinning.
-    Offering each matmul the other's split lets the co-opt search pick a
-    consistent assignment. A role absent on this op, or whose extent is not
-    divisible by the source factor, does not transfer. The factored B/M splits
-    cover the case where the two matmuls' N/K roles map to different physical
-    dims and so can't be cross-transferred, but they still share the B and M
-    output axes. Candidates that fail to reconcile a shared buffer's PerCoreView
-    self-eliminate during scoring.
+    Work distribution may choose incompatible splits for two matmuls joined by
+    pointwise/reduction operations. Transferring each source's B/M/N/K factors
+    gives the co-optimizer a chance to choose a compatible assignment. Missing
+    roles or non-divisible extents default to one; view matching later rejects
+    candidates that cannot share a physical buffer view.
     """
-    self_roles = _matmul_axis_parse(op)
-    rw = op.get_read_writes()
-    write_index = next(iter(rw.writes)).index
-    read_index = next((d.index for d in rw.reads), write_index)
-
-    options: dict[tuple, tuple[dict, dict]] = {_canonical_key(seed): seed}
-    for src in matmul_roles:
-        per_sym = {}
-        for role, (sym, extent, _factor) in self_roles.items():
-            factor = src.get(role, 1)
-            per_sym[sym] = factor if factor > 1 and extent % factor == 0 else 1
-        if not any(f > 1 for f in per_sym.values()):
-            continue
-        candidate = splits_by_index_coeff(per_sym, write_index, read_index)
-        options.setdefault(_canonical_key(candidate), candidate)
-    for candidate in _factored_bm_splits(op, _bm_axes_from_roles(self_roles)):
-        options.setdefault(_canonical_key(candidate), candidate)
-    # Here the filter is mostly defense-in-depth: _matmul_axis_parse already
-    # reports stick-count extents, so the `extent % factor == 0` gate above keeps
-    # candidates stick-divisible. _split_fits_sticks still catches the residual
-    # case it can't — a factor landing on a collapsed/broadcast dim (no stick
-    # count). The seed is always kept (work_dist's own choice).
+    parsed = _matmul_axis_parse(op)
+    options = {_candidate_key(seed): seed}
+    for source in matmul_roles:
+        candidate = {sym: 1 for sym in iteration_space_from_op(op)}
+        for role, (sym, extent, _factor) in parsed.items():
+            factor = source.get(role, 1)
+            candidate[sym] = factor if factor > 1 and extent % factor == 0 else 1
+        options.setdefault(_candidate_key(candidate), candidate)
+    for candidate in _factored_bm_splits(_bm_axes_from_roles(parsed)):
+        full_candidate = {sym: 1 for sym in iteration_space_from_op(op)}
+        full_candidate.update(candidate)
+        options.setdefault(_candidate_key(full_candidate), full_candidate)
     return [
-        opt for opt in options.values() if opt == seed or _split_fits_sticks(op, opt)
+        candidate
+        for candidate in options.values()
+        if candidate == seed or _split_fits_sticks(op, candidate)
     ]
 
 
 def _enum_split_options(
     op: Operation,
-    extra_bases: tuple[tuple[dict, dict], ...] = (),
+    extra_profiles: tuple[dict[int, int], ...] = (),
     matmul_roles: tuple[dict[str, int], ...] = (),
-) -> list[tuple[dict, dict]]:
-    """Split options for a pointwise op: the seed (index 0) plus variants
-    that flip the split onto another output dim (≤ DEFAULT_VARIANT_CAP).
+) -> list[dict[sympy.Symbol, int]]:
+    """Enumerate symbol-keyed candidates for the pruned co-optimization path.
 
-    `extra_bases` (the matmuls' output-splits) are offered on top so the op
-    can adopt a matmul's tiling and pin its shared buffer to LX. Matmuls take
-    their dedicated cross-matmul + factored-B/M path; non-matmul reductions are
-    offered the factored B/M splits (so a softmax chain's max/sum can reconcile
-    with the chain instead of forcing a core-div mismatch). Invalid bases
-    self-eliminate during scoring.
-
-    `matmul_roles` map BMNK to splits, {"M": 4, "N: 8, ...} then apply to other matmuls.
+    Matmuls use role transfer plus B/M factorizations. Other reductions offer
+    B/M factorizations only because their reduction axis is fixed. Pointwise
+    ops can move a single output split to another divisible output axis and can
+    adopt a matmul's transient physical output profile. The seed is always kept;
+    non-seed candidates must fit physical stick geometry.
     """
-    seed: tuple[dict, dict] = getattr(op, "op_it_space_splits", ({}, {}))
-    is_output_splits_empty = seed[0] == {}
-    is_computed_buf = isinstance(op, ComputedBuffer)
-    is_reduction = is_computed_buf and isinstance(op.data, Reduction)
+    seed = _seed_splits(op)
+    is_computed = isinstance(op, ComputedBuffer)
+    is_reduction = is_computed and isinstance(op.data, Reduction)
     is_matmul = is_reduction and _is_matmul_op(op)
-
-    # TODO: let a matmul also consider the *other* matmuls' splits.
-    # Remove once work_dist assigns consistent splits.
+    seed_profile = _output_profile(op, seed)
     if is_matmul and matmul_roles:
-        return _check_and_add_matmul_option(op, seed, matmul_roles)
-
-    # A non-matmul reduction (e.g. softmax max/sum) keeps B and M as output dims;
-    # offer it the factored B/M splits so it can reconcile with a B/M-tiled chain
-    # rather than being stuck on its seed and breaking the chain's per-core views.
-    # We do NOT flip reductions onto other dims (their reduction axis is fixed).
-    if is_reduction and not is_matmul and not is_output_splits_empty:
-        red_options: dict[tuple, tuple[dict, dict]] = {_canonical_key(seed): seed}
-        for base in _factored_bm_splits(op, _reduction_bm_axes(op)):
-            red_options.setdefault(_canonical_key(base), base)
+        return _check_and_add_matmul_options(op, seed, matmul_roles)
+    if is_reduction:
+        if not seed_profile:
+            return [seed]
+        options = {_candidate_key(seed): seed}
+        for candidate in _factored_bm_splits(_reduction_bm_axes(op)):
+            full_candidate = {sym: 1 for sym in iteration_space_from_op(op)}
+            full_candidate.update(candidate)
+            options.setdefault(_candidate_key(full_candidate), full_candidate)
         return [
-            opt
-            for opt in red_options.values()
-            if opt == seed or _split_fits_sticks(op, opt)
+            candidate
+            for candidate in options.values()
+            if candidate == seed or _split_fits_sticks(op, candidate)
         ]
-
-    # Only pointwise ops are flipped; reductions/matmuls keep work-division's
-    # split. For compute-bound ops, prioritize PT utilization over LX pinning:
-    # overriding a matmul's split to chase pinning regressed kernel time ~2.5x
-    # (mlp-linear-kn.t, SENCORES=32; PT-util 66%→33%). Exclude future
-    # compute-bound ops here too.
-    # is_matmul implies is_reduction, so it's covered by the is_reduction term.
-    if is_output_splits_empty or not is_computed_buf or is_reduction:
+    if not is_computed or not seed_profile:
         return [seed]
 
-    # Recover seed's per-symbol form to mutate the slicing.
-    rw = op_read_writes(op)
-    write_index = next(iter(rw.writes)).index
-    first_read = next(iter(rw.reads), None)
-    read_index = first_read.index if first_read is not None else write_index
-    iter_space = iteration_space_from_op(op)
-    seed_per_sym = apply_splits_from_index_coeff(
-        seed, write_index, read_index, iter_space
-    )
-
-    sliced_output_syms = [
-        s for s in seed_per_sym if seed_per_sym[s] > 1 and write_index.coeff(s) != 0
+    write = next(iter(op_read_writes(op).writes)).index
+    sliced = [
+        sym for sym, factor in seed.items() if factor > 1 and write.coeff(sym) != 0
     ]
-
-    # Dedup-and-collect in one dict: canonical key -> split tuple (the split
-    # tuple itself is two dicts, so it can't be a key directly). Insertion
-    # order is preserved, so the seed stays first.
-    options: dict[tuple, tuple[dict, dict]] = {_canonical_key(seed): seed}
-
-    # Only single output-dim splits are flipped. Multi-dim splits (e.g.
-    # k_fast (1, n, k)) aren't yet handled.
-    if len(sliced_output_syms) != 1:
-        return [seed]
-    seed_sym = sliced_output_syms[0]
-    seed_factor = int(seed_per_sym[seed_sym])
-
-    for sym, extent in iter_space.items():
-        extent_int = concretize_expr(extent)
-        if (
-            sym is seed_sym
-            or write_index.coeff(sym) == 0
-            or extent_int <= 1
-            or extent_int % seed_factor != 0
-        ):
-            continue
-        variant_per_sym = dict(seed_per_sym)
-        variant_per_sym[seed_sym] = 1
-        variant_per_sym[sym] = seed_factor
-        variant = splits_by_index_coeff(variant_per_sym, write_index, read_index)
-        options.setdefault(_canonical_key(variant), variant)
-        if len(options) >= DEFAULT_VARIANT_CAP:
-            break
-
-    # Let this pointwise op adopt a matmul's tiling to pin its shared buffer to
-    # LX. High-value, so added regardless of DEFAULT_VARIANT_CAP (flips only).
-    for base in extra_bases:
-        options.setdefault(_canonical_key(base), base)
-    # Load-bearing here (unlike the matmul path): the variant gate above tests
-    # the element extent (extent_int % seed_factor), not the stick count, so it
-    # can admit a factor that overflows the stickified dim's stick count — which
-    # would SIGABRT the SDSC bundler. _split_fits_sticks drops those (and any
-    # factor on a collapsed/broadcast dim). The seed is always kept: if it itself
-    # is over-stick, that is work_dist's choice and not ours to discard here.
+    options = {_candidate_key(seed): seed}
+    if len(sliced) == 1:
+        source = sliced[0]
+        factor = seed[source]
+        for sym, extent in iteration_space_from_op(op).items():
+            if (
+                sym is not source
+                and write.coeff(sym) != 0
+                and (size := concretize_expr(extent)) > 1
+                and size % factor == 0
+            ):
+                candidate = dict(seed)
+                candidate[source], candidate[sym] = 1, factor
+                options.setdefault(_candidate_key(candidate), candidate)
+                if len(options) >= DEFAULT_VARIANT_CAP:
+                    break
+    for profile in extra_profiles:
+        candidate = _from_output_profile(op, profile)
+        options.setdefault(_candidate_key(candidate), candidate)
     return [
-        opt for opt in options.values() if opt == seed or _split_fits_sticks(op, opt)
+        candidate
+        for candidate in options.values()
+        if candidate == seed or _split_fits_sticks(op, candidate)
     ]
-
-
-def _canonical_key(splits: tuple[dict, dict]) -> tuple:
-    """Hashable key for a (output_splits, reduction_splits) pair."""
-    out, red = splits
-    return (tuple(sorted(out.items())), tuple(sorted(red.items())))
 
 
 class CoOptimizingAllocator(ScratchpadAllocator):
@@ -1581,7 +1523,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                 never constructs this allocator without a valid factory.
             pre_optimization_passes: Graph passes applied before layout planning.
             post_optimization_passes: Graph passes applied after layout planning.
-            prune: Enable heuristic based pruning of core division search space.
+            prune: Enable heuristic pruning of the core-division search space.
         """
         super().__init__(
             layout_planning=layout_planning,
@@ -1631,8 +1573,8 @@ class CoOptimizingAllocator(ScratchpadAllocator):
 
         Every op gets at least one ``CoreDivision`` so the slicing-match gate can
         constrain it. Pointwise / Reduction ops get the enumerated candidates;
-        every other op falls back to a single fixed division read off its
-        committed ``op_it_space_splits``. No op-kind pre-filter -- residency is
+        every other op falls back to its committed symbol-keyed division. No
+        op-kind pre-filter -- residency is
         gated per buffer (``_residency_by_buf``) and by the solver, so ineligible
         ops still participate as producers/consumers in the match.
 
@@ -1648,18 +1590,16 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         """
         max_cores = config.sencores
         fixed_division_ops = ops_in_offset_mutation_component(graph)
-
-        ops = graph.operations
-        matmul_bases, matmul_roles = _find_distinct_matmul_splits(ops)
+        profiles, matmul_roles = _find_distinct_matmul_splits(graph.operations)
 
         result = {}
         for op in graph.operations:
             if op.name in fixed_division_ops:
                 divs = [_fixed_core_division(op)]
-            elif self.prune:
+            elif self.prune and isinstance(op, ComputedBuffer):
                 divs = [
-                    CoreDivision(output_splits=dict(out), reduction_splits=dict(red))
-                    for out, red in _enum_split_options(op, matmul_bases, matmul_roles)
+                    _core_division(op, splits)
+                    for splits in _enum_split_options(op, profiles, matmul_roles)
                 ]
             else:
                 divs = self._enumerate_core_divisions(op, max_cores)
@@ -1670,48 +1610,42 @@ class CoOptimizingAllocator(ScratchpadAllocator):
     def _enumerate_core_divisions(
         self, op: Operation, max_cores: int
     ) -> list[CoreDivision]:
-        """Core-division candidates for one eligible op (see ``_division_map``).
+        """Enumerate and deduplicate symbol-keyed candidates for one operation.
 
-        Each ``enumerate_work_division_candidates`` split is encoded into the
-        stride-keyed ``(output_splits, reduction_splits)`` form and deduped by
-        slicing signature. Ops without a divisible iteration space, or whose
-        space can't be enumerated, fall back to a single fixed division.
+        Operations without an enumerable concrete iteration space retain their
+        committed division. Deduplication uses local symbol names only within
+        this operation; cross-operation compatibility is derived from
+        ``PerCoreView`` instead.
         """
         fixed = [_fixed_core_division(op)]
         if not isinstance(op, ComputedBuffer) or not isinstance(
             op.data, (Pointwise, Reduction)
         ):
             return fixed
-        rw = op_read_writes(op)
-        write = next(iter(rw.writes), None)
-
-        # this is essentially a dead branch but serves as a type narrowing below
-        if write is None:
-            return fixed
-        write_index = write.index
-        first_read = next(iter(rw.reads), None)
-        read_index = first_read.index if first_read is not None else write_index
-
         try:
             candidates = enumerate_work_division_candidates(op, max_cores)
         except Unsupported as exc:
-            # Symbolic stick dims etc. can't be enumerated; leave the op on its
-            # upstream-chosen split (fixed division).
             logger.debug("skip joint division for %s: %s", op.name, exc)
             return fixed
-
         cds: list[CoreDivision] = []
         seen: set[tuple] = set()
-        for cand in candidates:
-            out_s, red_s = splits_by_index_coeff(cand, write_index, read_index)
+        for candidate in candidates:
+            division = _core_division(op, candidate)
             key = (
-                tuple(sorted(out_s.items())),
-                tuple(sorted(red_s.items())),
+                tuple(
+                    sorted(
+                        division.output_splits.items(), key=lambda item: str(item[0])
+                    )
+                ),
+                tuple(
+                    sorted(
+                        division.reduction_splits.items(), key=lambda item: str(item[0])
+                    )
+                ),
             )
-            if key in seen:
-                continue
-            seen.add(key)
-            cds.append(CoreDivision(output_splits=out_s, reduction_splits=red_s))
+            if key not in seen:
+                seen.add(key)
+                cds.append(division)
         return cds or fixed
 
     def _commit_divisions(
@@ -1719,8 +1653,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         graph: GraphLowering,
         allocation: Sequence[CoreDivisionBuffer],
     ) -> None:
-        """Write the solver's chosen division back to ``op.op_it_space_splits``
-        for *every* buffer the solver assigned one.
+        """Commit the solver's chosen symbol-keyed division for every buffer.
 
         The solver optimizes a core division for all buffers, not just resident
         ones: a resident producer and its consumers are pinned by
@@ -1737,11 +1670,10 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             op = op_by_name.get(buf.name)
             if op is None or buf.chosen_division is None:
                 continue
+            if not hasattr(op, "iteration_space_ownership"):
+                continue
             cd = buf.core_divisions[buf.chosen_division]
-            op.op_it_space_splits = (
-                dict(cd.output_splits),
-                dict(cd.reduction_splits),
-            )
+            commit_iteration_space_ownership(op, _division_splits(op, cd))
 
     def _determine_in_place_division_invariant(
         self, graph: GraphLowering
@@ -2059,7 +1991,6 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             if read_dep is None or write is None:
                 matches[cname] = []
                 continue
-            iter_space = iteration_space_from_op(consumer)
             views = self._views_for_divs(
                 consumer, read_dep, input_name, consumer_divs, prep_cache
             )
@@ -2070,21 +2001,18 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                 k = next((idx for idx, v in enumerate(clone_views) if v == view), None)
                 if k is None:
                     cd = consumer_divs[j]
-                    per_sym = apply_splits_from_index_coeff(
-                        (cd.output_splits, cd.reduction_splits),
-                        write.index,
-                        read_dep.index,
-                        iter_space,
-                    )
-                    clone_out, _ = splits_by_index_coeff(
-                        per_sym, read_dep.index, read_dep.index
-                    )
+                    per_sym = _division_splits(consumer, cd)
                     k = len(clone_divs)
                     clone_divs.append(
                         CoreDivision(
-                            output_splits=clone_out, reduction_splits={}
-                        )  # a clone op cannot have a division split
-                    )
+                            output_splits={
+                                sym: split
+                                for sym, split in per_sym.items()
+                                if split > 1
+                            },
+                            reduction_splits={},
+                        )
+                    )  # a clone op cannot have a reduction split
                     clone_views.append(view)
                 if clone_divs[k].cores_used == consumer_divs[j].cores_used:
                     pairs.append((k, j))
@@ -2218,16 +2146,12 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         key = (op.get_name(), dep, buf_name)
         out = []
         for cd in divs:
-            coeff = (cd.output_splits, cd.reduction_splits)
-            # Build the op-level prep once per key, on first sight, regardless
-            # of whether this candidate splits. ``_per_core_view_from_prep``
-            # still short-circuits to the whole-buffer view for a no-split
-            # candidate, but always populating the cache keeps an absent entry
-            # distinct from a genuine ``None`` prep, so a later candidate (or a
-            # cache reuse) can't silently get a stale/``None`` view.
             if key not in prep_cache:
                 prep_cache[key] = _prepare_per_core_view(op, dep, buf_name)
-            out.append(_per_core_view_from_prep(prep_cache[key], coeff))
+            splits = _division_splits(op, cd)
+            out.append(
+                _per_core_view_from_prep(prep_cache[key], splits, cd.reduction_splits)
+            )
         return out
 
 

@@ -458,16 +458,9 @@ def _get_buffer_user_deps(
 
 
 def _op_num_cores(op: Operation) -> int:
-    """Cores implied by op.op_it_space_splits (defaults to 1 when unset).
-
-    `op_it_space_splits` is set conditionally by span_reduction_pass /
-    work_distribution; ops that don't get split (e.g. trivial pointwise
-    on a small output) leave the attribute unset. Match the existing
-    convention (pass_utils.py, work_division.py) and treat missing as
-    no-split → 1 core.
-    """
-    splits: tuple[dict, dict] = getattr(op, "op_it_space_splits", ({}, {}))
-    return math.prod([s for p in splits for s in p.values()])
+    """Cores implied by symbol-keyed ownership (defaults to one)."""
+    ownership = getattr(op, "iteration_space_ownership", None)
+    return math.prod(ownership.work_slices.values()) if ownership is not None else 1
 
 
 def get_ncores_for_buffers(
