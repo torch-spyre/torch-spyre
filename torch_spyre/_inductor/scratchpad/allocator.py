@@ -1286,6 +1286,13 @@ def _split_fits_sticks(op: Operation, splits: dict[sympy.Symbol, int]) -> bool:
     unplaceable (for example, a collapsed or broadcast dimension), so reject it
     rather than relying on modulo arithmetic with a missing size.
     """
+    layout = op.layout
+    if isinstance(layout, MutationLayoutSHOULDREMOVE):
+        layout = layout.real_layout()
+    # CPU ComputedBuffers participate in the joint division map but never in LX
+    # placement. They have no device geometry to validate against.
+    if not isinstance(layout, FixedTiledLayout):
+        return True
     write = next(iter(op_read_writes(op).writes), None)
     if write is None:
         return False
