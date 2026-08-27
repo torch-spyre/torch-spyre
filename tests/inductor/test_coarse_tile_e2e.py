@@ -1263,18 +1263,29 @@ def test_softmax_2d_512x256_dim1_A4():
     run_coarse_tile_test(fn, inputs)
 
 
-@pytest.mark.skip(
-    reason="correctness bug: B÷4 tiled softmax over dim=1 produces numerical errors (0.3% mismatched, 0.30 diff)"
-)
 def test_softmax_2d_512x256_dim1_B4():
-    """softmax(x, dim=1) on [512,256] tiled B÷4 → 64 elems/tile (1 stick)."""
+    """softmax(x, dim=1) on [512,256] tiled B÷4 must be rejected at compile time.
+
+    B is both the tiled dim and the reduction dim here (no other tiled
+    output dim exists at all) -- sub/div tile B as a real output dim
+    (loop_tiled_dims=[[1]]) while amax/sum's own loop_tiled_dims is [[]],
+    so they can never be safely redirected to the accumulated result. Same
+    root cause as test_softmax_2d_512x256_dim0_A4 (see its docstring);
+    previously this test only reached a distinct, unrelated restickify
+    failure because the reduction-consumer bug went undetected and let
+    compilation proceed further before hitting a different wall.
+    """
     inputs = [tensor("x", shape=(512, 256), dims=["A", "B"])]
 
     def fn(x):
         with spyre_hint(num_tiles_per_dim={"B": 4}):
             return torch.softmax(x, dim=1)
 
-    run_coarse_tile_test(fn, inputs)
+    _run_coarse_tile_test_raises(
+        fn,
+        inputs,
+        match="tiles the reduction dim as a real output dim",
+    )
 
 
 def test_softmax_2d_512x256_dim1_A4_B4():
@@ -1301,18 +1312,31 @@ def test_softmax_2d_512x256_dim1_A4_B4():
         run_coarse_tile_test(fn, inputs)
 
 
-@pytest.mark.skip(
-    reason="correctness bug: A÷4 tiled softmax over dim=0 produces numerical errors (0.0% but 0.24 diff)"
-)
 def test_softmax_2d_512x256_dim0_A4():
-    """softmax(x, dim=0) on [512,256] tiled A÷4 → 128 elems/tile (2 sticks)."""
+    """softmax(x, dim=0) on [512,256] tiled A÷4 must be rejected at compile time.
+
+    A is both the tiled dim and the reduction dim; sub/div need the fully
+    combined amax/sum before they can run, but the reduction op's own
+    inside_consumers redirect (_propagate_tiled_reduction_op) can never
+    match sub/div's loop_tiled_dims to the reduction op's own — the
+    reduction dim lives in loop_tiled_reduction_dims for the reduction op
+    but in loop_tiled_dims for sub/div, which tile it as a real output dim.
+    Left unredirected, sub/div would silently read raw per-tile scratch
+    instead of the accumulated result — see coarse_tile.py's
+    _plan_tiling_propagation reduction branch, which now rejects this
+    shape with Unsupported instead of compiling it wrong.
+    """
     inputs = [tensor("x", shape=(512, 256), dims=["A", "B"])]
 
     def fn(x):
         with spyre_hint(num_tiles_per_dim={"A": 4}):
             return torch.softmax(x, dim=0)
 
-    run_coarse_tile_test(fn, inputs)
+    _run_coarse_tile_test_raises(
+        fn,
+        inputs,
+        match="tiles the reduction dim as a real output dim",
+    )
 
 
 def test_softmax_2d_512x256_dim0_B4():
@@ -1329,10 +1353,13 @@ def test_softmax_2d_512x256_dim0_B4():
 # Two bugs blocked this before PR #3622: (1) sibling-op A-reduction vs A-output
 # tiling collision (colsum diagnostic: every output column summed to ~4.0 instead
 # of ~1.0); (2) squeeze-position bug in _insert_reduction_copy_op (issue #3613).
-# Post-#3622 compilation succeeds but results are still numerically wrong.
-@pytest.mark.skip(reason="numerically incorrect results — root cause unknown")
+# Post-#3622 compilation succeeds, but sub/div (same-group consumers of the
+# A-tiled amax/sum reductions) can never be safely redirected to the
+# accumulated result for this shape -- see test_softmax_2d_512x256_dim0_A4's
+# docstring. Now rejected at compile time with Unsupported instead of
+# silently producing numerically wrong results.
 def test_softmax_2d_512x256_dim0_A4_B4():
-    """softmax(x, dim=0) on [512,256] tiled A÷4 B÷4."""
+    """softmax(x, dim=0) on [512,256] tiled A÷4 B÷4 must be rejected at compile time."""
     inputs = [tensor("x", shape=(512, 256), dims=["A", "B"])]
 
     def fn(x):
@@ -1340,7 +1367,11 @@ def test_softmax_2d_512x256_dim0_A4_B4():
             with spyre_hint(num_tiles_per_dim={"B": 4}):
                 return torch.softmax(x, dim=0)
 
-    run_coarse_tile_test(fn, inputs)
+    _run_coarse_tile_test_raises(
+        fn,
+        inputs,
+        match="tiles the reduction dim as a real output dim",
+    )
 
 
 # ---------------------------------------------------------------------------

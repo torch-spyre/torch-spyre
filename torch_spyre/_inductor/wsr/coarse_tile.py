@@ -600,6 +600,7 @@ def _plan_tiling_propagation(
                 per_tile_ranges = _compute_per_tile_ranges_planned(op, info)
                 full_output_ranges = _compute_full_ranges_planned(op, info)
                 outer_fill_loop_info = _compute_fill_loop_info_planned(info)
+                is_nested = outer_fill_loop_info is not None
                 full_output_strides = tuple(op.layout.stride)
                 per_tile_strides = tuple(
                     compute_tile_stride(
@@ -608,17 +609,70 @@ def _plan_tiling_propagation(
                         list(per_tile_ranges),
                     )
                 )
+                buf_name = op.get_name()
+                if not is_nested:
+                    # Flat reduction-tiling: _propagate_tiled_reduction_op's
+                    # inside_consumers filter only redirects a same-group
+                    # consumer of buf_name to the fully-combined accum_full
+                    # buffer when that consumer's own loop_tiled_dims
+                    # exactly equals this reduction op's loop_tiled_dims. A
+                    # consumer that tiles the reduction dim as a genuine
+                    # output dim (e.g. softmax's sub/div, which must write
+                    # the full un-reduced shape) can never satisfy that —
+                    # the reduction dim lives in loop_tiled_reduction_dims
+                    # for this op but in loop_tiled_dims for the consumer.
+                    # Left unredirected, such a consumer silently reads
+                    # buf_name's raw, un-combined per-tile scratch on every
+                    # tile instead of the accumulated result — a silent
+                    # wrong-code bug, not a diagnosable one. A correct fix
+                    # requires splitting this loop group into two
+                    # sequential passes (reduce-and-combine, then consume)
+                    # with a real barrier between them, which coarse_tile's
+                    # single-fused-loop-body model cannot express today.
+                    # Reject the pattern loudly instead of compiling it
+                    # wrong.
+                    outer_key = info.loop_group_id[0]
+                    for candidate in operations:
+                        if (
+                            not isinstance(candidate, ComputedBuffer)
+                            or candidate is op
+                            or not _reads_buffer(candidate, buf_name)
+                        ):
+                            continue
+                        if name_to_group_outer_key.get(candidate.get_name()) != (
+                            outer_key
+                        ):
+                            continue
+                        candidate_info = plan.get(id(candidate))
+                        if (
+                            candidate_info is not None
+                            and candidate_info.loop_tiled_dims != info.loop_tiled_dims
+                        ):
+                            raise Unsupported(
+                                f"coarse_tile: reduction op {buf_name!r} "
+                                f"(reduction_type={reduction_type!r}) is "
+                                f"tiled alongside a sibling output dim, and "
+                                f"same-group consumer "
+                                f"{candidate.get_name()!r} tiles the "
+                                f"reduction dim as a real output dim "
+                                f"(loop_tiled_dims={candidate_info.loop_tiled_dims} "
+                                f"vs. reduction op's "
+                                f"{info.loop_tiled_dims}). This consumer "
+                                f"would read a partially-accumulated "
+                                f"reduction result. Reorder spyre_hint "
+                                f"scopes so the reduction dim is not tiled "
+                                f"alongside another tiled output dim."
+                            )
                 reduction_plan = ReductionPlan(
                     reduction_type=reduction_type,
                     identity=identity,
-                    is_nested=outer_fill_loop_info is not None,
+                    is_nested=is_nested,
                     full_output_ranges=full_output_ranges,
                     per_tile_ranges=per_tile_ranges,
                     outer_fill_loop_info=outer_fill_loop_info,
                     full_output_strides=full_output_strides,
                     per_tile_strides=per_tile_strides,
                 )
-                buf_name = op.get_name()
                 consumer_names, is_graph_output = _find_outside_consumers_planned(
                     buf_name, info.loop_group_id, operations, name_to_group_outer_key
                 )
@@ -1399,15 +1453,18 @@ def _consumers_reading_incomplete_reduction(
     unaccumulated reduction sibling.
 
     Such a consumer (e.g. softmax's ``div``, which reads ``sum``'s still-
-    partial per-tile buffer) is necessarily deferred to a separate loop nest
-    that runs only after the reduction's own inner loop fully accumulates —
-    its read of the reduction gets redirected to accum_full by
-    _tile_reduction's inside_consumers handling. It therefore does NOT
-    actually execute in the same tile iteration as buf_name's producer, even
-    though both share the same outer loop_group_id — so it cannot safely
-    read buf_name as loop-internal (per-tile, overwritten-every-iteration)
-    scratch either; buf_name must be materialized to a full buffer just like
-    a genuine cross-group consumer. See _plan_tiling_propagation.
+    partial per-tile buffer) would need to be deferred to a separate loop
+    nest that runs only after the reduction's own inner loop fully
+    accumulates for its read of the reduction to be safe. No such deferral
+    mechanism currently exists: _propagate_tiled_reduction_op's
+    inside_consumers handling only redirects a same-group consumer to
+    accum_full when is_nested is True, or (when flat) when the consumer's
+    loop_tiled_dims exactly equals the reduction op's own — which can never
+    hold for a consumer like ``div`` that tiles the reduction dim as a real
+    output dim. For that flat-and-mismatched shape, _plan_tiling_propagation
+    instead raises Unsupported (see the reduction branch's same-group
+    consumer check) rather than silently reading a partially-accumulated
+    value. A genuine two-pass deferral remains a possible future extension.
     """
     result = []
     for o in group_ops:
