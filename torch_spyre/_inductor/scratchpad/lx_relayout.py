@@ -93,7 +93,7 @@ class FinalLXView:
     ownership: PerCoreView
     device_size: tuple[int, ...]
     slice_shape: tuple[int, ...]
-    minimum_footprint_bytes: int
+    physical_span_bytes: int | None
 
 
 def work_division_from_view(
@@ -268,8 +268,16 @@ def final_view_from_work_division(
     device_size: Sequence[int],
     device_coordinates: Sequence[sympy.Expr],
     iteration_space: Mapping[sympy.Symbol, tuple[sympy.Expr, int]],
+    *,
+    physical_span_bytes: int | None,
 ) -> FinalLXView:
-    """Build the physical view described by a finalized tensor argument."""
+    """Build the view described by a finalized tensor argument.
+
+    Alignment may factor or insert descriptor dimensions, so its ``device_size``
+    cannot be combined with the original layout strides.  The exact physical
+    span is therefore carried from the committed physical partition while the
+    final ownership and slice shape are derived from the aligned descriptor.
+    """
 
     size = tuple(int(extent) for extent in device_size)
     ownership = view_from_work_division(division, device_coordinates, iteration_space)
@@ -291,7 +299,7 @@ def final_view_from_work_division(
         ownership=ownership,
         device_size=canonical_size,
         slice_shape=slice_shape,
-        minimum_footprint_bytes=math.prod(extents[:-1]) * 128,
+        physical_span_bytes=physical_span_bytes,
     )
 
 
@@ -363,7 +371,7 @@ def _grouped_gather_geometry(
     return grouped_source, grouped_destination, tuple(geometry)
 
 
-def _partition_footprint(layout: FixedTiledLayout, view: PerCoreView) -> int:
+def partition_footprint(layout: FixedTiledLayout, view: PerCoreView) -> int:
     device_layout = layout.device_layout
     return partition_physical_span_bytes(
         tuple(int(size) for size in device_layout.device_size),
@@ -521,9 +529,11 @@ def validate_final_views(
                 f"final {name} slice shape {view.slice_shape} differs from planned "
                 f"{planned_shape}"
             )
-        if view.minimum_footprint_bytes > plan.max_footprint_bytes:
+        if view.physical_span_bytes is None:
+            return f"final {name} has no committed physical span"
+        if view.physical_span_bytes > plan.max_footprint_bytes:
             return (
-                f"final {name} minimum footprint {view.minimum_footprint_bytes} "
+                f"final {name} physical span {view.physical_span_bytes} "
                 f"exceeds planned "
                 f"{plan.max_footprint_bytes}"
             )
@@ -769,8 +779,8 @@ def collect_lx_relayout_plans(graph: GraphLowering) -> list[LXRelayoutPlan]:
                 kind = "gather" if consumer_name in grouped_geometry else "shuffle"
                 geometry = grouped_geometry.get(consumer_name, ())
                 footprint = max(
-                    _partition_footprint(producer.layout, source_view),
-                    _partition_footprint(producer.layout, destination_view),
+                    partition_footprint(producer.layout, source_view),
+                    partition_footprint(producer.layout, destination_view),
                 )
                 key = (destination_view, kind, geometry, footprint)
                 plans_by_destination.setdefault(key, []).append(consumer_name)

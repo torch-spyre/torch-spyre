@@ -13,6 +13,7 @@
 # limitations under the License.
 
 from collections.abc import Sequence
+from contextlib import nullcontext
 from dataclasses import replace
 import logging
 import logging.handlers
@@ -638,12 +639,14 @@ def test_final_view_ignores_alignment_only_singleton_dimensions():
         [8, 64],
         [c, Mod(c, 64)],
         {c: (8, 1)},
+        physical_span_bytes=512,
     )
     expanded = lx_relayout_module.final_view_from_work_division(
         division,
         [1, 1, 8, 64],
         [0, 0, c, Mod(c, 64)],
         {c: (8, 1)},
+        physical_span_bytes=512,
     )
     assert expanded == compact
 
@@ -690,6 +693,85 @@ def test_final_view_validation_requires_one_shared_physical_view():
             slice_shape=(2, 4, 64),
         )
         assert "destination users derived 2 final views" in (
+            lx_relayout_module.validate_final_views(
+                graph,
+                plan,
+                views,
+                destination_name="destination",
+            )
+            or ""
+        )
+        views[("consumer", "destination")] = destination
+        oversized_source = replace(
+            source,
+            physical_span_bytes=2048,
+        )
+        views[("producer", "source")] = oversized_source
+        views[("copy", "source")] = oversized_source
+        assert "physical span 2048 exceeds planned 1024" in (
+            lx_relayout_module.validate_final_views(
+                graph,
+                plan,
+                views,
+                destination_name="destination",
+            )
+            or ""
+        )
+
+
+def test_final_view_validation_rejects_padded_span_above_plan():
+    source_view = PerCoreView(
+        ((0, 2), (1, 2)),
+        ((0, floor(_CORE_ID / 2)), (1, Mod(_CORE_ID, 2))),
+        num_cores=4,
+    )
+    destination_view = PerCoreView(
+        ((0, 2), (1, 2)),
+        ((0, Mod(_CORE_ID, 2)), (1, floor(_CORE_ID / 2))),
+        num_cores=4,
+    )
+    element_count_bound = 3 * 3 * 128
+    physical_span = lx_relayout_module.partition_physical_span_bytes(
+        (5, 5, 64),
+        (512, 64, 1),
+        64,
+        {0: 2, 1: 2},
+    )
+    assert physical_span == 19 * 128 > element_count_bound
+
+    plan = LXRelayoutPlan(
+        "source",
+        ("consumer",),
+        source_view,
+        destination_view,
+        4,
+        max_footprint_bytes=element_count_bound,
+        source_address=0,
+        destination_address=4096,
+    )
+    source = FinalLXView(
+        source_view,
+        (5, 5, 64),
+        (3, 3, 64),
+        physical_span,
+    )
+    destination = replace(source, ownership=destination_view)
+    views = {
+        ("producer", "source"): source,
+        ("copy", "source"): source,
+        ("copy", "destination"): destination,
+        ("consumer", "destination"): destination,
+    }
+    layout = SimpleNamespace(device_layout=SimpleNamespace(device_size=(5, 5, 64)))
+    graph = SimpleNamespace(
+        try_get_buffer=lambda name: (
+            SimpleNamespace(get_layout=lambda: layout)
+            if name in {"source", "destination"}
+            else None
+        )
+    )
+    with mock_patch.object(lx_relayout_module, "FixedTiledLayout", SimpleNamespace):
+        assert "physical span 2432 exceeds planned 1152" in (
             lx_relayout_module.validate_final_views(
                 graph,
                 plan,
@@ -1021,10 +1103,12 @@ def test_lx_relayout_consumers_share_destination_view(second_consumer):
     }
 )
 @pytest.mark.parametrize(
-    ("num_heads", "key_length", "query_length", "key_split"),
-    ((4, 128, 8, 8), (8, 64, 4, 4)),
+    ("num_heads", "key_length", "query_length", "key_split", "force_fallback"),
+    ((4, 128, 8, 8, False), (8, 64, 4, 4, False), (4, 128, 8, 8, True)),
 )
-def test_grouped_lx_gather_device(num_heads, key_length, query_length, key_split):
+def test_grouped_lx_gather_device(
+    num_heads, key_length, query_length, key_split, force_fallback
+):
     torch.manual_seed(0)
     value = torch.randn(num_heads, key_length, 64, dtype=torch.float16)
     attention = torch.randn(num_heads, query_length, key_length, dtype=torch.float16)
@@ -1047,10 +1131,23 @@ def test_grouped_lx_gather_device(num_heads, key_length, query_length, key_split
         _name_tensor_dims(attention.to("spyre"), ["H", "Lq", "Lk"]),
     )
     torch._inductor.codecache.FxGraphCache.clear()
-    actual, code = run_and_get_code(
-        torch.compile(fn, dynamic=False, options={"epilogue_fusion": False}),
-        *device_args,
+    clone_counter = scheduler_module.counters["torch_spyre"][
+        "lx_relayout_gate_demoted_with_hbm_clone"
+    ]
+    preview = (
+        mock_patch.object(
+            scheduler_module,
+            "_preview_final_lx_views",
+            side_effect=ValueError("forced fallback"),
+        )
+        if force_fallback
+        else nullcontext()
     )
+    with preview:
+        actual, code = run_and_get_code(
+            torch.compile(fn, dynamic=False, options={"epilogue_fusion": False}),
+            *device_args,
+        )
     torch.testing.assert_close(actual.cpu(), fn(value, attention), rtol=2e-2, atol=1e-1)
     identities = [
         block
@@ -1058,8 +1155,17 @@ def test_grouped_lx_gather_device(num_heads, key_length, query_length, key_split
         if "op='identity'" in block[:100]
     ]
     assert len(identities) == 1
-    assert identities[0].count("allocation={'lx':") == 2
-    assert identities[0].count("TensorWorkDivision(") == 2
+    if force_fallback:
+        assert "allocation={'lx':" not in identities[0]
+        assert (
+            scheduler_module.counters["torch_spyre"][
+                "lx_relayout_gate_demoted_with_hbm_clone"
+            ]
+            > clone_counter
+        )
+    else:
+        assert identities[0].count("allocation={'lx':") == 2
+        assert identities[0].count("TensorWorkDivision(") == 2
 
 
 def test_lx_relayout_allocation_is_atomic_in_one_greedy_solve(caplog):
@@ -1297,6 +1403,29 @@ def test_lx_relayout_scheduler_demotes_groups_but_not_ordinary_unary():
                 True,
             )
 
+        final_view = FinalLXView(
+            PerCoreView((), (), num_cores=1),
+            (64,),
+            (64,),
+            128,
+        )
+
+        def preview(node, *, relayout_copy):
+            del relayout_copy
+            return (
+                {
+                    (node.name, dep.name): final_view
+                    for dep in (*node.read_writes.reads, *node.read_writes.writes)
+                    if dep.name in buffers
+                    and "lx" in buffers[dep.name].get_layout().allocation
+                },
+                False,
+            )
+
+        clone_counter = scheduler_module.counters["torch_spyre"][
+            "lx_relayout_gate_demoted_with_hbm_clone"
+        ]
+
         with (
             mock_patch.object(scheduler_module, "SchedulerNode", _RelayoutNode),
             mock_patch.object(scheduler_module, "MemoryDep", SimpleNamespace),
@@ -1307,7 +1436,7 @@ def test_lx_relayout_scheduler_demotes_groups_but_not_ordinary_unary():
             mock_patch.object(
                 scheduler_module,
                 "_preview_final_lx_views",
-                return_value=({}, False),
+                side_effect=preview,
             ),
             mock_patch.object(
                 scheduler_module,
@@ -1319,6 +1448,12 @@ def test_lx_relayout_scheduler_demotes_groups_but_not_ordinary_unary():
             config.patch({"lx_planning": True}),
         ):
             scheduler_module.demote_incoherent_lx_buffers(nodes)
+        assert (
+            scheduler_module.counters["torch_spyre"][
+                "lx_relayout_gate_demoted_with_hbm_clone"
+            ]
+            == clone_counter + 1
+        )
         assert graph._spyre_lx_relayout_copies == {}
         assert "lx" not in layouts["source"].allocation
         if drift != "missing_buffer":
@@ -1332,6 +1467,46 @@ def test_lx_relayout_scheduler_demotes_groups_but_not_ordinary_unary():
     run_registered("projection")
     run_registered("missing")
     run_registered("missing_buffer")
+
+
+def test_final_view_gate_demotes_ordinary_buffer_without_a_preview_view():
+    dep = SimpleNamespace(name="ordinary")
+    layout = _relayout_layout(0, _SOURCE_VIEW)
+    nodes = [
+        _RelayoutNode("producer", writes=(dep,), layout=layout),
+        _RelayoutNode("consumer", reads=(dep,)),
+    ]
+    buffer = SimpleNamespace(get_layout=lambda: layout)
+    graph = SimpleNamespace(
+        _spyre_lx_relayout_copies={},
+        try_get_buffer=lambda name: buffer if name == "ordinary" else None,
+        get_buffer=lambda name: buffer,
+    )
+    with (
+        mock_patch.object(scheduler_module, "SchedulerNode", _RelayoutNode),
+        mock_patch.object(scheduler_module, "MemoryDep", SimpleNamespace),
+        mock_patch.object(scheduler_module, "FixedTiledLayout", SimpleNamespace),
+        mock_patch.object(scheduler_module, "V", SimpleNamespace(graph=graph)),
+        mock_patch.object(
+            scheduler_module,
+            "per_core_view_scheduled",
+            return_value=(_SOURCE_VIEW, False, True),
+        ),
+        mock_patch.object(
+            scheduler_module,
+            "_ownership_projectable",
+            return_value=True,
+        ),
+        mock_patch.object(
+            scheduler_module,
+            "_preview_final_lx_views",
+            return_value=({}, False),
+        ),
+        config.patch({"lx_planning": True}),
+    ):
+        scheduler_module.demote_incoherent_lx_buffers(nodes)
+
+    assert "lx" not in layout.allocation
 
 
 def aot_backend(gm: GraphModule, example_inputs: Sequence[InputType]):

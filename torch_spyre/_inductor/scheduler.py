@@ -42,12 +42,11 @@ from .ir import FixedTiledLayout
 from .pass_utils import (
     PerCoreView,
     _is_matmul_op,
-    apply_splits_from_index_coeff,
-    concretize_index,
+    alignment_coordinates,
     indirect_sizes_from_op,
     iteration_space,
+    iteration_space_with_splits,
     per_core_view_scheduled,
-    select_work_division_transport_indexes,
     try_device_coordinates,
 )
 from .core_mapping import (
@@ -64,10 +63,11 @@ from .scratchpad.lx_relayout import (
     set_final_lx_views,
     validate_final_views,
     final_view_from_work_division,
+    partition_footprint,
     work_division_from_view,
 )
 from .op_spec import LoopSpec, TensorWorkDivision
-from .views import align_tensors, compute_coordinates
+from .views import align_tensors
 from . import config as _spyre_config
 
 logger = get_inductor_logger("scheduler")
@@ -499,19 +499,7 @@ def _preview_final_lx_views(
         raise ValueError(f"{node.get_name()} has no computed operation")
 
     raw_iteration_space = iteration_space(node)
-    write_index, read_index = select_work_division_transport_indexes(
-        op, rw, raw_iteration_space
-    )
-    split_by_dim = apply_splits_from_index_coeff(
-        getattr(op, "op_it_space_splits", ({}, {})),
-        write_index,
-        read_index,
-        raw_iteration_space,
-    )
-    aligned_input_space = {
-        dim: (extent, int(split_by_dim.get(dim, 1)))
-        for dim, extent in raw_iteration_space.items()
-    }
+    aligned_input_space = iteration_space_with_splits(op, rw, raw_iteration_space)
     indirect_sizes = indirect_sizes_from_op(op)
     if indirect_sizes:
         # Re-executing the op to recover indirect ranges can create equivalent
@@ -534,12 +522,10 @@ def _preview_final_lx_views(
             continue
         if not isinstance(layout, FixedTiledLayout):
             continue
-        index = concretize_index(dep.index, set(raw_iteration_space))
-        coordinates = compute_coordinates(
-            layout.device_layout.device_size,
-            layout.device_layout.stride_map,
+        coordinates = alignment_coordinates(
+            layout.device_layout,
+            dep.index,
             raw_iteration_space,
-            index,
             indirect_sizes,
             repeat_info_out=repeat_info,
         )
@@ -604,11 +590,17 @@ def _preview_final_lx_views(
         effective = division if relayout_copy else operation_division
         if effective is None:
             raise ValueError(f"{node.get_name()} has no final ownership for {name}")
+        physical_span_bytes = (
+            partition_footprint(layout, layout.lx_view)
+            if layout.lx_view is not None
+            else None
+        )
         view = final_view_from_work_division(
             effective,
             tensor["size"],
             tensor["coordinates"],
             final_space,
+            physical_span_bytes=physical_span_bytes,
         )
         key = (node.get_name(), name)
         previous = result.setdefault(key, view)
@@ -700,6 +692,7 @@ def demote_incoherent_lx_buffers(
         if source_name in relayout_sources:
             # Scheduling supplies the final ownership verdict; the relayout
             # layer owns atomic group fallback and registry cleanup.
+            counters["torch_spyre"]["lx_relayout_gate_demoted_with_hbm_clone"] += 1
             demote_lx_relayout_group(V.graph, source_name, reason)
             return
         buffer = V.graph.try_get_buffer(source_name)
@@ -829,7 +822,7 @@ def demote_incoherent_lx_buffers(
             for (_, buffer_name), view in preview_views.items()
             if buffer_name == name
         }
-        if len(buffer_views) > 1:
+        if len(buffer_views) != 1:
             counters["torch_spyre"]["lx_relayout_gate_ordinary_mismatch"] += 1
             demote(
                 name,

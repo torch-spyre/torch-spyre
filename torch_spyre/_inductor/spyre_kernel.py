@@ -1065,11 +1065,21 @@ class SpyreKernel(Kernel[CSEVariable]):
             division = arg.work_division if is_relayout else operation_division
             if division is None:
                 raise RuntimeError(f"LX tensor {name} has no final work division")
+            buffer = V.graph.try_get_buffer(name)
+            if buffer is None or not isinstance(
+                (layout := buffer.get_layout()), FixedTiledLayout
+            ):
+                raise RuntimeError(f"LX tensor {name} has no fixed tiled layout")
             actual = final_view_from_work_division(
                 division,
                 arg.device_size,
                 arg.device_coordinates,
                 op_spec.iteration_space,
+                physical_span_bytes=(
+                    partition_footprint(layout, layout.lx_view)
+                    if layout.lx_view is not None
+                    else None
+                ),
             )
             if actual != expected:
                 raise RuntimeError(
