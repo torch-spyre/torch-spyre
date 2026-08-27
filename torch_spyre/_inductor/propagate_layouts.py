@@ -1998,14 +1998,18 @@ def propagate_spyre_tensor_layouts(
                     # MemoryDep with target_name but same index shape as output_dep.
                     #
                     if not new_value_args:
-                        # No real inputs (e.g. fill with identity value). The
-                        # SpyreEmptyFallback node branch already owns target_buf.layouts
-                        # (all valid STL candidates) and must not be overwritten.
-                        # Use the same candidates for this op's layouts and AnyInNode
-                        # so the beam commits at zero cost.
-                        candidates = getattr(
-                            target_buf, "layouts", [generic_layout(target_buf)]
+                        # No real tensor inputs: this is a coarse-tile identity fill
+                        # (e.g. coarse_tile_fill writing inf/0 into the accumulator).
+                        # A scalar fill has no stick orientation preference, so use
+                        # AnyInNode and let the real writers (combine, copy) determine
+                        # the STL. Borrow target_buf.layouts so the beam has a non-empty
+                        # candidate list; AnyInNode commits at zero cost regardless.
+                        assert hasattr(target_buf, "layouts"), (
+                            f"SpyreEmptyFallback {target_name!r} has no layouts — "
+                            "expected SpyreEmptyFallback to have layouts set before any "
+                            "mutation op writes it"
                         )
+                        candidates = target_buf.layouts
                         op.layouts = candidates
                         op.restick_cost_fn = AnyInNode.from_args()
                         continue
