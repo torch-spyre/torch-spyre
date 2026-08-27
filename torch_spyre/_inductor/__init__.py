@@ -21,7 +21,11 @@ from functools import wraps
 from typing import Any
 
 from .propagate_hints import spyre_hint, get_op_hints  # noqa: F401
-from torch_spyre.profiler._ffdc import CATEGORY_COMPILE_FRONTEND, try_collect
+from torch_spyre.profiler._ffdc import (
+    CATEGORY_COMPILE_BACKEND,
+    CATEGORY_COMPILE_FRONTEND,
+    try_collect,
+)
 
 _autoload_lock = threading.Lock()
 
@@ -210,7 +214,9 @@ def enable_spyre_compile_fx_wrapper():
                 return _orig_bw(gm, example_inputs, compiler_config_extra, **kwargs)
             except Exception as exc:
                 if uses_spyre:
-                    try_collect(exc, logger=logger, failure_category=CATEGORY_COMPILE)
+                    try_collect(
+                        exc, logger=logger, failure_category=CATEGORY_COMPILE_BACKEND
+                    )
                 raise
 
         cfx.compile_fx = _wrapper
