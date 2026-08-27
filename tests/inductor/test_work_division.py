@@ -42,7 +42,7 @@ from torch_spyre._inductor.work_division import (
     _cost_model_matmul_planner,
     _default_split,
     enumerate_work_division_candidates,
-    work_division_split_is_legal,
+    work_division_splits_are_legal,
     multi_dim_iteration_space_split,
     span_reduction_pass,
 )
@@ -242,7 +242,40 @@ class TestWorkDivisionSplitLegality(unittest.TestCase):
     def test_cpu_computed_buffer_is_not_constrained(self):
         op = _computed_buffer((8,), name="cpu_buf")
         op.layout = FixedLayout("cpu", torch.float16, [8], [1])
-        self.assertTrue(work_division_split_is_legal(op, ({}, {})))
+        self.assertTrue(work_division_splits_are_legal(op, {}))
+
+    def test_symbol_keyed_splits_obey_allowed_domain(self):
+        x = _isym("x")
+        op = _computed_buffer((8,), name="domain")
+        output_td = _tensor_dep("domain", (8,), (x,))
+        rw = MagicMock(writes=[output_td.dep], reads=[])
+        with (
+            patch(
+                "torch_spyre._inductor.work_division.iteration_space_from_op",
+                return_value={x: 8},
+            ),
+            patch(
+                "torch_spyre._inductor.work_division.op_read_writes", return_value=rw
+            ),
+            patch(
+                "torch_spyre._inductor.work_division.get_mem_deps_from_rw",
+                return_value=[],
+            ),
+            patch(
+                "torch_spyre._inductor.work_division.collect_tensor_deps",
+                return_value=([], output_td),
+            ),
+            patch(
+                "torch_spyre._inductor.work_division.adjust_it_space_for_sticks",
+                return_value=({x: 8}, {}),
+            ),
+            patch(
+                "torch_spyre._inductor.work_division.collect_work_division_constraints",
+                return_value=ConstraintResult(allowed_splits={x: frozenset({2})}),
+            ),
+        ):
+            self.assertTrue(work_division_splits_are_legal(op, {x: 2}))
+            self.assertFalse(work_division_splits_are_legal(op, {x: 1}))
 
     def test_uses_input_layout_override_for_qfp8wt_constraint(self):
         b, m, n = _isym("b"), _isym("m"), _isym("n")
@@ -284,17 +317,13 @@ class TestWorkDivisionSplitLegality(unittest.TestCase):
                 return_value=raw_args,
             ),
             patch(
-                "torch_spyre._inductor.work_division.apply_splits_from_index_coeff",
-                return_value={constrained_var: 2},
-            ),
-            patch(
                 "torch_spyre._inductor.work_division.adjust_it_space_for_sticks",
                 return_value=({b: 4, m: 8, n: 128}, {}),
             ),
         ):
-            self.assertFalse(work_division_split_is_legal(op, ({}, {})))
+            self.assertFalse(work_division_splits_are_legal(op, {constrained_var: 2}))
             del op._input_layout_overrides
-            self.assertTrue(work_division_split_is_legal(op, ({}, {})))
+            self.assertTrue(work_division_splits_are_legal(op, {constrained_var: 2}))
 
 
 class TestKeepByIndexConstraints(unittest.TestCase):
@@ -713,10 +742,12 @@ class TestSpanReductionConstraints(unittest.TestCase):
 
 class TestCoOptimizingAllocator(unittest.TestCase):
     def test_fixed_illegal_split_raises_unsupported(self):
-        op = MagicMock(name="fixed_op")
+        op = MagicMock(spec=ComputedBuffer, name="fixed_op")
+        op.data = MagicMock(spec=Pointwise)
         op.name = "fixed_op"
         graph = MagicMock(operations=[op])
         allocator = CoOptimizingAllocator(MagicMock(), size=1)
+        fixed = CoreDivision()
 
         with (
             patch(
@@ -731,6 +762,11 @@ class TestCoOptimizingAllocator(unittest.TestCase):
             ),
             patch(
                 "torch_spyre._inductor.scratchpad.allocator._fixed_core_division",
+                return_value=fixed,
+            ),
+            patch(
+                "torch_spyre._inductor.scratchpad.allocator._division_splits",
+                return_value={},
             ),
             patch(
                 "torch_spyre._inductor.scratchpad.allocator._split_option_is_legal",
@@ -780,13 +816,15 @@ class TestCoOptimizingAllocator(unittest.TestCase):
             patch(
                 "torch_spyre._inductor.scratchpad.allocator._split_option_is_legal",
                 side_effect=lambda _op, splits: splits == safe,
-            ),
+            ) as is_legal,
         ):
             divisions = allocator._division_map(graph)[op.name]
 
         self.assertEqual(
             divisions, [CoreDivision(output_splits={m: 8}, reduction_splits={})]
         )
+        self.assertEqual(is_legal.call_args_list[0].args[1], safe)
+        self.assertEqual(is_legal.call_args_list[1].args[1], unsafe)
 
         op.iteration_space_ownership = MagicMock()
         allocation = [
@@ -801,6 +839,10 @@ class TestCoOptimizingAllocator(unittest.TestCase):
             )
         ]
         with (
+            patch(
+                "torch_spyre._inductor.scratchpad.allocator._division_splits",
+                return_value={batch: 4},
+            ),
             patch(
                 "torch_spyre._inductor.scratchpad.allocator._split_option_is_legal",
                 return_value=False,
@@ -827,6 +869,10 @@ class TestCoOptimizingAllocator(unittest.TestCase):
             patch(
                 "torch_spyre._inductor.scratchpad.allocator._fixed_core_division",
                 return_value=fixed,
+            ),
+            patch(
+                "torch_spyre._inductor.scratchpad.allocator._division_splits",
+                return_value={},
             ),
             patch(
                 "torch_spyre._inductor.scratchpad.allocator."

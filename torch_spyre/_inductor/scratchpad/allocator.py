@@ -49,7 +49,7 @@ from torch_spyre._inductor.pass_utils import (
 )
 from torch_spyre._inductor.work_division import (
     enumerate_work_division_candidates,
-    work_division_split_is_legal,
+    work_division_splits_are_legal,
 )
 from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.scratchpad.plan_solver import (
@@ -1196,23 +1196,18 @@ def _legal_fixed_division(
 ) -> list[CoreDivision]:
     """Return upstream division when it satisfies hard constraints."""
     division = fixed[0]
-    if _split_option_is_legal(op, (division.output_splits, division.reduction_splits)):
+    if not isinstance(op, ComputedBuffer) or _split_option_is_legal(
+        op, _division_splits(op, division)
+    ):
         logger.debug("keep upstream division for %s: %s", op.name, reason)
         return fixed
     raise Unsupported(f"{op.name}: fixed split violates hard domain.")
 
 
-def _split_option_is_legal(
-    op: Operation, splits: dict[sympy.Symbol, int] | tuple[dict, dict]
-) -> bool:
-    """Return whether a symbol-keyed or sparse split satisfies hard domains."""
-    if not isinstance(op, ComputedBuffer):
-        return True
-    if isinstance(splits, tuple):
-        return work_division_split_is_legal(op, splits)
-    division = _core_division(op, splits)
-    return work_division_split_is_legal(
-        op, (division.output_splits, division.reduction_splits)
+def _split_option_is_legal(op: Operation, splits: dict[sympy.Symbol, int]) -> bool:
+    """Return whether symbol-keyed splits satisfy hard domains."""
+    return not isinstance(op, ComputedBuffer) or work_division_splits_are_legal(
+        op, splits
     )
 
 
@@ -1714,7 +1709,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             if not hasattr(op, "iteration_space_ownership"):
                 continue
             cd = buf.core_divisions[buf.chosen_division]
-            if not _split_option_is_legal(op, (cd.output_splits, cd.reduction_splits)):
+            if not _split_option_is_legal(op, _division_splits(op, cd)):
                 raise Unsupported(f"{op.name}: chosen split violates hard domain.")
             commit_iteration_space_ownership(op, _division_splits(op, cd))
 

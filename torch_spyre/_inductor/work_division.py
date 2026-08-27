@@ -52,8 +52,6 @@ from .logging_utils import get_inductor_logger
 from .op_spec import IndirectAccess
 from .pass_utils import (
     SchedNodeArg,
-    apply_splits_from_index_coeff,
-    select_work_division_transport_indexes,
     compute_granularity,
     compute_max_size,
     concretize_expr,
@@ -867,11 +865,10 @@ def enumerate_work_division_candidates(
     return candidates
 
 
-def work_division_split_is_legal(
-    op: ComputedBuffer,
-    splits: tuple[dict, dict],
+def work_division_splits_are_legal(
+    op: ComputedBuffer, splits: dict[Symbol, int]
 ) -> bool:
-    """Return whether encoded splits obey this op's hard constraints."""
+    """Return whether symbol-keyed splits obey this op's hard constraints."""
     layout = op.get_layout()
     if isinstance(layout, MutationLayoutSHOULDREMOVE):
         layout = layout.real_layout()
@@ -880,15 +877,6 @@ def work_division_split_is_legal(
 
     it_space = iteration_space_from_op(op)
     rw = op_read_writes(op)
-    try:
-        write_index, read_index = select_work_division_transport_indexes(
-            op, rw, it_space
-        )
-    except Unsupported:
-        return False
-    per_symbol = apply_splits_from_index_coeff(
-        splits, write_index, read_index, it_space
-    )
     input_tds, output_td = collect_tensor_deps(
         op, _apply_input_layout_overrides(op, get_mem_deps_from_rw(rw))
     )
@@ -914,8 +902,8 @@ def work_division_split_is_legal(
             committed_splits={},
         )
     )
-    return not any(per_symbol.get(v, 1) > 1 for v in result.blocked) and all(
-        per_symbol.get(v, 1) in allowed for v, allowed in result.allowed_splits.items()
+    return not any(splits.get(v, 1) > 1 for v in result.blocked) and all(
+        splits.get(v, 1) in allowed for v, allowed in result.allowed_splits.items()
     )
 
 
@@ -1210,8 +1198,8 @@ def work_distribution_pass(
 ) -> None:
     """Optional per-op pass: distribute remaining cores to maximize parallelism.
 
-    Reads op.op_it_space_splits written by span_reduction_pass (if any) to
-    recover the already-committed splits, then fills remaining cores by priority.
+    Reads symbol-keyed ownership written by span_reduction_pass (if any), then
+    fills remaining cores by priority.
     """
     it_space = iteration_space_from_op(op)
     input_tds, output_td = collect_tensor_deps(op, args)
