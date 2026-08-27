@@ -165,6 +165,9 @@ class ReadCopyEntry:
         get_operation_name() of the op supplying tiled_op.loop_info for
         the copy's own read/write-level-extent computation (the first
         consuming op, per the sizing-invariant in the design doc).
+    sizing_read_index:
+        Position of ``dep`` in the sizing op's original MemoryDep list.
+        Recorded before copy insertion rewrites any of those reads.
     consumer_op_names:
         Names of every op in the group that must have this dep's buffer
         name patched (via _NameSwapHandler) to load from copy_name instead.
@@ -174,6 +177,7 @@ class ReadCopyEntry:
     dep: "MemoryDep"
     insert_before_op_name: str
     sizing_op_name: str
+    sizing_read_index: int
     consumer_op_names: tuple[str, ...]
 
 
@@ -268,6 +272,12 @@ class CoarseTileInfo:
         contribution as an extra term via ``tiling_expr_to_device_expr``
         rather than by substitution. Empty list means no such dims for this
         read (the common case).
+    predivision_unit_step_per_read:
+        One entry per read dependency and loop level. Each tuple records
+        ``(op_dim_index, host_stride, tile_extent)`` for a tiled dimension
+        whose final per-tile extent is one. Planning captures this while the
+        dimension still exists in the dependency index; transformation uses
+        it after range division squeezes that dimension away.
     squeezed_advance_output:
         The analogous per-level ``(host_stride, extent)`` list for this op's
         own write dependency, parallel to ``output_tiled_dims`` the same way
@@ -290,6 +300,9 @@ class CoarseTileInfo:
     squeezed_advance_per_read: list[list[list[tuple[sympy.Expr, sympy.Expr]]]] = field(
         default_factory=list
     )
+    predivision_unit_step_per_read: list[
+        list[list[tuple[int, sympy.Expr, sympy.Expr]]]
+    ] = field(default_factory=list)
     squeezed_advance_output: list[list[tuple[sympy.Expr, sympy.Expr]]] = field(
         default_factory=list
     )

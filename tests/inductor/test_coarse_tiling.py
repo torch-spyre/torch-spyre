@@ -2111,6 +2111,28 @@ class TestCoarseTileTiledDimsPerRead(unittest.TestCase):
         # only dim 1 (M=4, extent 1024, tiled at level 1) survives.
         self.assertEqual(broadcast_tiled_dims, [[], [(1, Integer(1024))]])
 
+    def test_unit_tile_keeps_predivision_input_step(self):
+        op = _make_real_pointwise_op(
+            ranges=[Integer(3), Integer(64)],
+            input_shapes_strides=[([3, 64], [64, 1])],
+            name="buf0",
+            hints=((1, 0),),
+        )
+        levels = [(1, Integer(3))]
+        plan = plan_coarse_tile_groups([op], [([op], levels)])
+
+        self.assertEqual(
+            plan[id(op)].predivision_unit_step_per_read,
+            [[[(0, Integer(64), Integer(1))]]],
+        )
+
+        _apply_plan([op], (0,), levels, {op.get_operation_name(): 0}, plan)
+        self.assertEqual(op.loop_info.tiled_dims_per_read, [[[]]])
+        self.assertEqual(
+            op.loop_info.squeezed_advance_per_read,
+            [[[(Integer(64), Integer(1))]]],
+        )
+
     def test_reduction_dim_advance_is_offset_by_output_dims(self):
         # out[d0] = sum_{d1} in[d0, d1].  in is [8, 16], row-major
         # (stride [16, 1]).  Output dim 0 (K=2 outer) is a real output dim;
@@ -5294,6 +5316,7 @@ class TestReadCopyPlanDataclasses(unittest.TestCase):
             dep=dep,
             insert_before_op_name="op0",
             sizing_op_name="op0",
+            sizing_read_index=0,
             consumer_op_names=("op0", "op1"),
         )
         self.assertEqual(entry.copy_name, "coarse_tile_read_copy_group0_a_0")

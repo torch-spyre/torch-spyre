@@ -306,6 +306,10 @@ def plan_coarse_tile_groups(
             tiled_dims_per_read = [
                 _tiled_dims_for_dep(dep, per_level_extents, op) for dep in read_deps
             ]
+            predivision_unit_step_per_read = [
+                _predivision_unit_steps_for_dep(dep, tiled_dims, per_level_extents, op)
+                for dep, tiled_dims in zip(read_deps, tiled_dims_per_read)
+            ]
             output_tiled_dims = (
                 _tiled_dims_for_dep(write_deps[0], per_level_extents, op)
                 if write_deps
@@ -322,6 +326,7 @@ def plan_coarse_tile_groups(
                 loop_tiled_dims=op_tiled_dims,
                 loop_tiled_reduction_dims=op_tiled_reduction_dims,
                 tiled_dims_per_read=tiled_dims_per_read,
+                predivision_unit_step_per_read=predivision_unit_step_per_read,
                 output_tiled_dims=output_tiled_dims,
             )
 
@@ -1051,6 +1056,86 @@ def _tiled_dims_for_dep(
     ]
 
 
+def _predivision_unit_steps_for_dep(
+    dep: MemoryDep,
+    tiled_dims_per_level: list[list[tuple[int, Expr]]],
+    per_level_extents: list[dict[int, Expr]],
+    ir_node: ComputedBuffer,
+) -> list[list[tuple[int, Expr, Expr]]]:
+    """Keep address steps for tiled dimensions that will be squeezed away.
+
+    At planning time the original dimension and its index coefficient still
+    exist. After division, a one-element expert tile has neither, so the
+    address step cannot be reconstructed reliably from the smaller view.
+    """
+    raw_to_squeezed = _raw_to_squeezed_pos(ir_node)
+    unit_dims = {
+        dim
+        for dim in {d for level in per_level_extents for d in level}
+        if any(
+            extent == 1
+            for level in per_level_extents
+            for d, extent in level.items()
+            if d == dim
+        )
+    }
+    result: list[list[tuple[int, Expr, Expr]]] = []
+    for level in tiled_dims_per_level:
+        steps: list[tuple[int, Expr, Expr]] = []
+        for dim, extent in level:
+            if dim not in unit_dims:
+                continue
+            squeezed_dim = raw_to_squeezed.get(dim)
+            if squeezed_dim is None:
+                continue
+            symbol = sympy_index_symbol(f"d{squeezed_dim}")
+            stride = dep.index.coeff(symbol)
+            if stride != 0:
+                steps.append((dim, stride, extent))
+        result.append(steps)
+    return result
+
+
+def _materialize_predivision_unit_steps(info: CoarseTileInfo) -> CoarseTileInfo:
+    """Move captured unit-tile steps into codegen's squeezed-step form."""
+    if not any(any(levels) for levels in info.predivision_unit_step_per_read):
+        return info
+
+    tiled_dims = [
+        [list(level) for level in per_read] for per_read in info.tiled_dims_per_read
+    ]
+    squeezed = [
+        [list(level) for level in per_read]
+        for per_read in info.squeezed_advance_per_read
+    ]
+    while len(squeezed) < len(tiled_dims):
+        squeezed.append([[] for _ in info.loop_count])
+
+    for dep_idx, per_level_steps in enumerate(info.predivision_unit_step_per_read):
+        while len(tiled_dims[dep_idx]) < len(info.loop_count):
+            tiled_dims[dep_idx].append([])
+        while len(squeezed[dep_idx]) < len(info.loop_count):
+            squeezed[dep_idx].append([])
+        for level_idx, steps in enumerate(per_level_steps):
+            if not steps:
+                continue
+            unit_dims = {dim for dim, _stride, _extent in steps}
+            tiled_dims[dep_idx][level_idx] = [
+                pair
+                for pair in tiled_dims[dep_idx][level_idx]
+                if pair[0] not in unit_dims
+            ]
+            squeezed[dep_idx][level_idx].extend(
+                (stride, extent) for _dim, stride, extent in steps
+            )
+
+    return dataclasses.replace(
+        info,
+        tiled_dims_per_read=tiled_dims,
+        squeezed_advance_per_read=squeezed,
+    )
+
+
 def _check_matmul_broadcast_batch_tiling(
     op: ComputedBuffer,
     read_deps: list[MemoryDep],
@@ -1619,7 +1704,8 @@ def _apply_plan(
                 _divide_reduction_ranges(op, count, rpos_list)
 
         op.loop_info = dataclasses.replace(  # type: ignore[attr-defined]
-            info, loop_group_id=stamped_group_id
+            _materialize_predivision_unit_steps(info),
+            loop_group_id=stamped_group_id,
         )
 
         logger.debug(
@@ -2823,6 +2909,7 @@ def _rescale_index(
 def _insert_one_read_copy(
     sizing_op: ComputedBuffer,
     dep: MemoryDep,
+    sizing_read_index: int,
     copy_name: str,
     operations: list[Operation],
     insert_before_op: Operation,
@@ -3164,6 +3251,16 @@ def _insert_one_read_copy(
     # SpyreKernel._general_tile_advance's positional dep-index lookup —
     # a semantic mismatch, not merely a magnitude one.
     sizing_op_info = sizing_op.loop_info  # type: ignore[attr-defined]
+    dep_idx = sizing_read_index
+    planned_unit_dims = (
+        {
+            dim
+            for level in sizing_op_info.predivision_unit_step_per_read[dep_idx]
+            for dim, _stride, _extent in level
+        }
+        if dep_idx < len(sizing_op_info.predivision_unit_step_per_read)
+        else set()
+    )
     copy_ranges = list(copy_data.ranges)
     # sizing_op_info.loop_tiled_dims's dim keys are raw positional indices
     # into sizing_op.data.ranges (see CoarseTileInfo's docstring), which
@@ -3185,10 +3282,16 @@ def _insert_one_read_copy(
     read_level_extents: list[dict[int, Expr]] = [
         {} for _ in sizing_op_info.loop_tiled_dims
     ]
-    squeezed_advance: list[list[tuple[Expr, Expr]]] = [
-        [] for _ in sizing_op_info.loop_tiled_dims
-    ]
+    squeezed_advance: list[list[tuple[Expr, Expr]]] = (
+        [list(level) for level in sizing_op_info.squeezed_advance_per_read[dep_idx]]
+        if dep_idx < len(sizing_op_info.squeezed_advance_per_read)
+        else [[] for _ in sizing_op_info.loop_tiled_dims]
+    )
     for d in {d for level in sizing_op_info.loop_tiled_dims for d in level}:
+        if d in planned_unit_dims:
+            # Planning captured this source step before division squeezed the
+            # dimension away; it is already present in squeezed_advance.
+            continue
         levels_tiling_d = [
             i for i, dims in enumerate(sizing_op_info.loop_tiled_dims) if d in dims
         ]
@@ -3449,7 +3552,8 @@ def _patch_consumer_to_read_copy(
     # read must be zeroed (dim omitted, see _fixed_level_extents).
     new_loop_info = new_op.loop_info  # type: ignore[attr-defined]
     new_reads = [r for r in new_op.get_read_writes().reads if isinstance(r, MemoryDep)]
-    if new_loop_info.tiled_dims_per_read:
+    new_tiled_dims_per_read = new_loop_info.tiled_dims_per_read
+    if new_tiled_dims_per_read:
         assert len(new_reads) == len(new_loop_info.tiled_dims_per_read), (
             f"_patch_consumer_to_read_copy: positional mismatch between "
             f"new_op.get_read_writes().reads ({len(new_reads)} entries) and "
@@ -3467,9 +3571,29 @@ def _patch_consumer_to_read_copy(
             )
             for read_dep, per_level in zip(new_reads, new_loop_info.tiled_dims_per_read)
         ]
-        new_op.loop_info = dataclasses.replace(  # type: ignore[attr-defined]
-            new_loop_info, tiled_dims_per_read=new_tiled_dims_per_read
+
+    new_squeezed_advance_per_read = new_loop_info.squeezed_advance_per_read
+    if new_squeezed_advance_per_read:
+        assert len(new_reads) == len(new_squeezed_advance_per_read), (
+            "_patch_consumer_to_read_copy: positional mismatch between "
+            f"new_op.get_read_writes().reads ({len(new_reads)} entries) and "
+            "new_loop_info.squeezed_advance_per_read "
+            f"({len(new_squeezed_advance_per_read)} entries)"
         )
+        new_squeezed_advance_per_read = [
+            (
+                [[] for _ in new_loop_info.loop_count]
+                if read_dep.name == copy_name
+                else per_level
+            )
+            for read_dep, per_level in zip(new_reads, new_squeezed_advance_per_read)
+        ]
+
+    new_op.loop_info = dataclasses.replace(  # type: ignore[attr-defined]
+        new_loop_info,
+        tiled_dims_per_read=new_tiled_dims_per_read,
+        squeezed_advance_per_read=new_squeezed_advance_per_read,
+    )
 
 
 def _plan_read_copies(
@@ -3569,6 +3693,11 @@ def _plan_read_copies(
                     dep=sizing_dep,
                     insert_before_op_name=sizing_op.get_operation_name(),
                     sizing_op_name=sizing_op.get_operation_name(),
+                    sizing_read_index=[
+                        read
+                        for read in sizing_op.get_read_writes().reads
+                        if isinstance(read, MemoryDep)
+                    ].index(sizing_dep),
                     consumer_op_names=tuple(
                         op.get_operation_name() for op, _dep in op_deps
                     ),
@@ -3606,6 +3735,7 @@ def _insert_all_read_copy_ops(
             new_copy_name = _insert_one_read_copy(
                 sizing_op,
                 entry.dep,
+                entry.sizing_read_index,
                 entry.copy_name,
                 operations,
                 insert_before_op=insert_before_op,
