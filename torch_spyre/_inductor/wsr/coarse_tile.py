@@ -2278,16 +2278,45 @@ def _propagate_tiled_op(
     loop_group_id = loop_info.loop_group_id
     buf_name = op.get_name()
 
-    # Resolve planning-time consumer names to their current objects --
-    # Pass 1/2 may have spliced replacements into `operations` under the
-    # same names since planning ran (see PropagationPlan's docstring on
-    # name stability).
-    outside_consumers = [
-        o
-        for o in operations
-        if isinstance(o, ComputedBuffer)
-        and o.get_name() in propagation.outside_consumer_names
-    ]
+    # Resolve consumers at TRANSFORM time, by actual reads rather than by
+    # the planning-time name list. Pass 1/2 may have spliced replacements
+    # into `operations` under the same names since planning ran (see
+    # PropagationPlan's docstring on name stability) -- and Pass 1 may have
+    # rewired a planned consumer in another tiled group through a read-copy
+    # staging op, which then performs the group's actual read of buf_name.
+    # Patching only the planned names would miss that staging op, leaving
+    # it draining this op's per-tile scratch while the full buffer goes
+    # unread (issue #4008: 94.6% wrong on two chained hint groups). Any
+    # current reader outside this op's outermost loop group needs the
+    # redirect; the in-group copy-out drain reads buf_name by design and is
+    # excluded by the group test exactly like the planning-time analog
+    # (_find_outside_consumers_planned).
+    own_outer_key = loop_group_id[0]
+    planned_names = set(propagation.outside_consumer_names)
+    outside_consumers = []
+    for o in operations:
+        if not isinstance(o, ComputedBuffer) or o is op:
+            continue
+        if not _reads_buffer(o, buf_name):
+            continue
+        o_outer = getattr(getattr(o, "loop_info", None), "loop_group_id", (None,))[0]
+        # Union of both consumer notions: a planned name that still reads
+        # buf_name may legitimately share this group's outer key (a deferred
+        # reduction consumer such as softmax's div - see
+        # _consumers_reading_incomplete_reduction), so the group test alone
+        # would wrongly drop it.
+        if o_outer != own_outer_key or o.get_name() in planned_names:
+            outside_consumers.append(o)
+    resolved_names = {o.get_name() for o in outside_consumers}
+    if resolved_names != planned_names:
+        logger.debug(
+            "coarse_tile: copy-out %s consumer set changed between planning "
+            "and transform: planned=%s resolved=%s (read-copy staging ops "
+            "take over their consumer's read)",
+            buf_name,
+            sorted(planned_names),
+            sorted(resolved_names),
+        )
     is_graph_output = propagation.is_graph_output
 
     full_ranges = propagation.full_ranges

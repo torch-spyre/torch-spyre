@@ -231,6 +231,33 @@ def test_abs_256x256_A4():
     run_coarse_tile_test(fn, inputs)
 
 
+def test_two_chained_groups_512x256_A4():
+    """Two SEQUENTIAL hint groups chained through a value (issue #4008).
+
+    z = abs(x)+y under one A/4 scope, then out = z*2 under a SEPARATE A/4
+    scope. The cross-group edge must read group 1's full HBM materialization:
+    Pass 1 interposes a read-copy staging op that takes over the consumer's
+    read, so Pass 3's copy-out patching must resolve consumers by their
+    actual current reads (the planning-time name list alone patched an op
+    that no longer performed the read, and group 2 then striding-read the
+    128-row per-tile scratch - 94.6% mismatch)."""
+    inputs = [
+        tensor("x", shape=(512, 256), dims=["A", "B"]),
+        tensor("y", shape=(512, 256), dims=["A", "B"]),
+    ]
+
+    def fn(x, y):
+        with spyre_hint(num_tiles_per_dim={"A": 4}):
+            with spyre_hint(expected_named_dims=["A", "B"]):
+                z = torch.abs(x) + y
+        with spyre_hint(num_tiles_per_dim={"A": 4}):
+            with spyre_hint(expected_named_dims=["A", "B"]):
+                out = z * 2
+        return out
+
+    run_coarse_tile_test(fn, inputs)
+
+
 def test_abs_256x256_B4():
     """abs [256,256] tiled B÷4 → 64 elems/tile (1 stick)."""
     inputs = [tensor("x", shape=(256, 256), dims=["A", "B"])]
