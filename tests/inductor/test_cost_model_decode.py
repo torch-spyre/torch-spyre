@@ -25,6 +25,8 @@ No Spyre device or backend compiler is required; the iteration space and split m
 are injected so the pure decode logic is exercised in isolation.
 """
 
+from types import SimpleNamespace
+
 import sympy
 
 import torch_spyre._inductor.dump_cost_model as dcm
@@ -100,6 +102,24 @@ def test_bmm_named_dim_map_picks_m_n(monkeypatch):
     )
     _, rows_per_core, cols_per_core, *_ = dcm._matmul_features(op, 4 * 1024 * 1024, 2)
     assert rows_per_core == 64 and cols_per_core == 512
+
+
+def test_symbol_keyed_ownership_precedes_scheduler_transport(monkeypatch):
+    """Pre-Scheduler reporting reads ownership, not lossy coefficient transport."""
+    b, m, n, kk = sympy.symbols("b m n kk", positive=True, integer=True)
+    it_space = {b: 4, m: 1024, n: 1024, kk: 2048}
+    write_index = 1048576 * b + 1024 * m + n
+    owned = {b: 1, m: 16, n: 2, kk: 1}
+    _patch(monkeypatch, it_space, {b: 1, m: 1, n: 1, kk: 1})
+    op = _FakeOp(write_index, 1024 * b + m + kk, {1: 1})
+    op.iteration_space_ownership = SimpleNamespace(work_slices=owned)
+
+    _, rows_per_core, cols_per_core, _, _, k_split, m_split, n_split = (
+        dcm._matmul_features(op, 4 * 1024 * 1024, 2)
+    )
+
+    assert rows_per_core == 64 and cols_per_core == 512
+    assert (m_split, n_split, k_split) == (16, 2, 1)
 
 
 def test_plain_matmul_b1_unchanged(monkeypatch):

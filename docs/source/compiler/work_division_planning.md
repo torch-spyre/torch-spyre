@@ -397,10 +397,10 @@ The final splits overwrite `op.iteration_space_ownership`.
 The pre-scheduler carrier is a `TensorWorkDivision`: `work_slices` maps
 operation iteration symbols to slice counts, and `core_id_to_work_slice`
 records the selected symbol-keyed core assignment. LX planning consumes this
-ownership directly. At the final Scheduler boundary,
-`finalize_work_division_for_scheduler()` converts the splits to legacy
-coefficient-keyed `op_it_space_splits` transport so Scheduler/codegen can
-survive iteration-symbol renaming.
+ownership directly. Cost-model reporting also reads this ownership before the
+final Scheduler boundary. `finalize_work_division_for_scheduler()` then converts
+the splits to legacy coefficient-keyed `op_it_space_splits` transport so
+Scheduler/codegen can survive iteration-symbol renaming.
 
 For the worked example below, the pre-scheduler ownership is
 `{M: 16, N: 1, K: 2}`. Scheduler/codegen receives the equivalent legacy

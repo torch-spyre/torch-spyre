@@ -485,8 +485,6 @@ class CustomPreSchedulingPasses:
             #
             # LX Planning
             _maybe_scratchpad_planning,
-            # Scheduler boundary
-            finalize_work_division_for_scheduler,
         ]
 
     def __call__(self, graph: GraphLowering) -> None:
@@ -537,6 +535,9 @@ class CustomPreSchedulingPasses:
         # of lines on a real graph. Printing the evidence first buries the answer.
         cost_model_pass(graph)
         dump_cost_model(graph.operations)
+        # Keep rich symbol-keyed ownership through every pre-Scheduler reader;
+        # legacy coefficient transport exists only for Scheduler/codegen.
+        finalize_work_division_for_scheduler(graph)
 
     def uuid(self) -> Any | None:
         return _uuid(self.passes)
