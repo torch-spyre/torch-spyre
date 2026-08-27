@@ -1195,18 +1195,21 @@ def _legal_fixed_division(
     op: Operation, fixed: list[CoreDivision], reason: str
 ) -> list[CoreDivision]:
     """Return upstream division when it satisfies hard constraints."""
-    if _split_option_is_legal(op, _division_splits(op, fixed[0])):
+    division = fixed[0]
+    if _split_option_is_legal(op, (division.output_splits, division.reduction_splits)):
         logger.debug("keep upstream division for %s: %s", op.name, reason)
         return fixed
-    raise Unsupported(f"{op.name}: no legal core-division candidates.")
+    raise Unsupported(f"{op.name}: fixed split violates hard domain.")
 
 
 def _split_option_is_legal(
-    op: Operation, splits: dict[sympy.Symbol, int]
+    op: Operation, splits: dict[sympy.Symbol, int] | tuple[dict, dict]
 ) -> bool:
-    """Return whether symbol-keyed ``splits`` satisfy hard work-division domains."""
+    """Return whether a symbol-keyed or sparse split satisfies hard domains."""
     if not isinstance(op, ComputedBuffer):
         return True
+    if isinstance(splits, tuple):
+        return work_division_split_is_legal(op, splits)
     division = _core_division(op, splits)
     return work_division_split_is_legal(
         op, (division.output_splits, division.reduction_splits)

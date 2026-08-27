@@ -22,6 +22,7 @@ from collections.abc import Callable
 from sympy import Expr, Integer, Symbol, divisors
 from torch._inductor.dependencies import MemoryDep
 from torch._inductor.graph import GraphLowering
+from torch._inductor.virtualized import V
 from torch._inductor.ir import (
     ComputedBuffer,
     DeviceCopy,
@@ -61,14 +62,11 @@ from .pass_utils import (
     finite_upper_or_none,
     get_mem_deps_from_rw,
     iteration_space_from_op,
-    is_topk,
-    is_keep_by_index,
     commit_iteration_space_ownership,
     indirect_access_subs_from_op,
     indirect_sizes_from_op,
     _fixed_read_layout,
     op_read_writes,
-    splits_by_index_coeff,
 )
 from .propagate_hints import get_op_hints
 from .work_division_constraints import (
