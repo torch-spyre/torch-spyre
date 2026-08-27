@@ -53,6 +53,8 @@ from torch_spyre._inductor.work_division_constraints import (
     conv_spatial_blocked_vars,
     coordinate_mask_blocked_vars,
     indirect_access_split_domains,
+    keep_by_index_k_split_constraint,
+    keep_by_index_pinned_search_space_vars,
     qfp8wt_matmul_k_split_domains,
     topk_split_domains,
     qfp8wt_split_domains,
@@ -293,6 +295,36 @@ class TestWorkDivisionSplitLegality(unittest.TestCase):
             self.assertFalse(work_division_split_is_legal(op, ({}, {})))
             del op._input_layout_overrides
             self.assertTrue(work_division_split_is_legal(op, ({}, {})))
+
+
+class TestKeepByIndexConstraints(unittest.TestCase):
+    def test_k_is_minimally_split_and_search_axis_is_unsplit(self):
+        batch, search, k = (_isym(name) for name in ("batch", "search", "k"))
+        op = _computed_buffer(
+            (8, 64), name="keep_by_index", reduction_type="keepbyindex"
+        )
+        output_td = _tensor_dep("keep_by_index", (8, 64), (batch, search))
+        ctx = _make_context(
+            op,
+            output_td,
+            input_tds=[
+                _tensor_dep("values", (8, 64), (batch, search)),
+                _tensor_dep("indices", (8, 8), (batch, k)),
+            ],
+            it_space={batch: 8, search: 64, k: 8},
+            reduction_vars=(k,),
+        )
+        rw = MagicMock(writes=[output_td.dep])
+
+        with patch(
+            "torch_spyre._inductor.work_division_constraints.op_read_writes",
+            return_value=rw,
+        ):
+            k_result = keep_by_index_k_split_constraint(ctx)
+            search_result = keep_by_index_pinned_search_space_vars(ctx)
+
+        self.assertEqual(k_result.allowed_splits, {k: frozenset({2})})
+        self.assertEqual(search_result.allowed_splits, {search: frozenset({1})})
 
 
 class TestCostModelConstraints(unittest.TestCase):

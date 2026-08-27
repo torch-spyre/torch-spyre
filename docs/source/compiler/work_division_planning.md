@@ -431,6 +431,23 @@ TopK reductions use constraint-based work division:
 Other output/batch dimensions are distributed across the remaining core budget
 under the constraint that total cores used is `k_cores * product(other_dims) <= max_cores`.
 
+## Keep-by-index work division
+
+`keep_by_index` applies an index-selected mask while preserving the values
+shape. Its index tensor adds a K axis that is absent from the output, while the
+values dimension absent from the indices is the full search axis.
+
+1. **Index-only K uses the minimum supported split.** Its legal factor is the
+   smallest divisor `d` of K that satisfies `K / d <= 4` and `d <= SENCORES`.
+   The hardware supports at most four selected indices per core.
+2. **The search axis remains whole.** Every core must search the full masked
+   values dimension, so its legal split is `1`.
+3. **Other output and batch axes remain eligible.** The default planner uses
+   them with the remaining core budget.
+
+The Scheduler transport uses the indices read as the reduction-split reference
+for this operation because it carries K; the values read does not.
+
 ## Worked example: large matmul on 32 cores
 
 Take a single matmul with `A: [8192, 32768]`, `W: [32768, 4096]`,

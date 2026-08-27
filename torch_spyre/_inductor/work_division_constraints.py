@@ -37,6 +37,8 @@ from torch_spyre._C import ElementArrangement
 from .constants import (
     BATCH_MATMUL_OP,
     BATCH_MATMUL_FP8_OP,
+    KEEP_BY_INDEX_OP,
+    _MAX_K_PER_CORE,
     TOPK_MAX_K_PER_CORE,
     TOPK_OPS,
 )
@@ -102,6 +104,8 @@ def collect_work_division_constraints(
         qfp8wt_split_domains,
         qfp8wt_matmul_k_split_domains,
         topk_split_domains,
+        keep_by_index_k_split_constraint,
+        keep_by_index_pinned_search_space_vars,
         indirect_access_split_domains,
     ):
         result = constraint(ctx)
@@ -299,6 +303,79 @@ def topk_split_domains(ctx: WorkDivConstraintContext) -> ConstraintResult:
         )
     allowed_splits[k_var] = frozenset({min(legal_k_splits)})
     return ConstraintResult(allowed_splits=allowed_splits)
+
+
+def _keep_by_index_axes(
+    ctx: WorkDivConstraintContext,
+) -> tuple[set[Symbol], set[Symbol]] | None:
+    """Return the index-only K and full-search axes of a keep_by_index op."""
+    if not (
+        isinstance(ctx.op.data, Reduction)
+        and ctx.op.data.reduction_type == KEEP_BY_INDEX_OP
+    ):
+        return None
+    writes = op_read_writes(ctx.op).writes
+    if not writes:
+        return None
+    iteration_vars = set(ctx.it_space)
+    output_vars = {
+        sym
+        for sym in next(iter(writes)).index.free_symbols
+        if isinstance(sym, Symbol) and sym in iteration_vars
+    }
+    # The indices input is the one that introduces K, a symbol absent from the
+    # values/output index. This is structural rather than name-based: argument
+    # names are scheduler-generated and therefore not a stable identifier.
+    index_vars = set().union(
+        *(
+            {
+                sym
+                for sym in td.dep.index.free_symbols
+                if isinstance(sym, Symbol) and sym in iteration_vars
+            }
+            for td in ctx.input_tds
+            if td.dep.index.free_symbols & (iteration_vars - output_vars)
+        )
+    )
+    if not index_vars:
+        index_vars = set(ctx.reduction_vars)
+    return index_vars - output_vars, output_vars - index_vars
+
+
+def keep_by_index_k_split_constraint(ctx: WorkDivConstraintContext) -> ConstraintResult:
+    """Pin index-only K to the smallest split that leaves at most four results/core."""
+    axes = _keep_by_index_axes(ctx)
+    if axes is None:
+        return ConstraintResult()
+    index_only, _ = axes
+    allowed_splits = {}
+    for axis in index_only:
+        size = concretize_expr(ctx.it_space[axis])
+        legal = [
+            split
+            for split in divisors(size)
+            if split <= config.sencores and size // split <= _MAX_K_PER_CORE
+        ]
+        if not legal:
+            raise Unsupported(
+                f"keep_by_index(k={size}): no divisor within {config.sencores} "
+                f"cores gives k_per_core <= {_MAX_K_PER_CORE}."
+            )
+        allowed_splits[axis] = frozenset({min(legal)})
+    return ConstraintResult(allowed_splits=allowed_splits)
+
+
+def keep_by_index_pinned_search_space_vars(
+    ctx: WorkDivConstraintContext,
+) -> ConstraintResult:
+    """Keep keep_by_index's full-search output axis on each core."""
+    axes = _keep_by_index_axes(ctx)
+    if axes is None:
+        return ConstraintResult()
+    _, search_axes = axes
+    return ConstraintResult(
+        allowed_splits={axis: frozenset({1}) for axis in search_axes}
+    )
 
 
 def indirect_access_split_domains(ctx: WorkDivConstraintContext) -> ConstraintResult:
