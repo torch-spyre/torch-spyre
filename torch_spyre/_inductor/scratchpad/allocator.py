@@ -1127,6 +1127,7 @@ def _core_division(op: Operation, splits: dict[sympy.Symbol, int]) -> CoreDivisi
 
 
 def _division_splits(op: Operation, division: CoreDivision) -> dict[sympy.Symbol, int]:
+    """Restore a complete symbol-keyed split map from a sparse division."""
     return {
         sym: int(division.output_splits.get(sym, division.reduction_splits.get(sym, 1)))
         for sym in iteration_space_from_op(op)
@@ -1140,6 +1141,8 @@ def _fixed_core_division(op: Operation) -> CoreDivision:
 
 
 DEFAULT_VARIANT_CAP = 6
+# Try larger batch factors first. Keeping more of the batch axis whole offers
+# the same reconciliation benefit with fewer co-optimization candidates.
 _FACTORED_B_FACTORS: tuple[int, ...] = (8, 4, 2)
 
 
@@ -1171,11 +1174,11 @@ def _output_stride_to_device_size(op: Operation) -> dict[int, int]:
     stride_map = dev_layout.stride_map
     elems_per_stick = dev_layout.device_dtype.elems_per_stick()
     stride_to_size: dict[int, int] = {}
-    for i, stride in enumerate(stride_map):
-        if stride <= 0:  # sentinel for collapsed / broadcast dims
+    for i, s in enumerate(stride_map):
+        if s <= 0:  # sentinel for collapsed / broadcast dims
             continue
-        if stride not in stride_to_size or device_size[i] != 1:
-            stride_to_size[stride] = device_size[i]
+        if s not in stride_to_size or device_size[i] != 1:
+            stride_to_size[s] = device_size[i]
     if stride_map[-1] > 0:  # stickified dim -> bound by the outer-stick count
         stride_to_size[stride_map[-1]] = stride_to_size.get(
             stride_map[-1] * elems_per_stick, 1
@@ -1184,7 +1187,18 @@ def _output_stride_to_device_size(op: Operation) -> dict[int, int]:
 
 
 def _split_fits_sticks(op: Operation, splits: dict[sympy.Symbol, int]) -> bool:
-    """True if every output split fits its device dimension's stick count."""
+    """True if every output split divides its physical device dimension.
+
+    A split factor must divide the device dimension it lands on. For the
+    stickified host dimension that is the outer-stick count, not the element
+    extent: an extent of 128 with 64 elements per stick has only two splittable
+    sticks. Reduction-only symbols are absent from the write index and are not
+    constrained here; work-division bounds those separately.
+
+    A positive-coefficient output symbol with no device-stride entry is
+    unplaceable (for example, a collapsed or broadcast dimension), so reject it
+    rather than relying on modulo arithmetic with a missing size.
+    """
     write = next(iter(op_read_writes(op).writes), None)
     if write is None:
         return False
@@ -1198,7 +1212,14 @@ def _split_fits_sticks(op: Operation, splits: dict[sympy.Symbol, int]) -> bool:
 
 
 def _matmul_axis_parse(op: Operation) -> dict[str, tuple[sympy.Symbol, int, int]]:
-    """Return this matmul's B/M/N/K symbols, extents, and seed factors."""
+    """Parse a matmul into ``{B|M|N|K: (symbol, extent, seed_factor)}``.
+
+    Output symbols sorted by ascending write-index stride are N, M, B (with B
+    absent for 2D matmuls); the symbol added by a read index is K. Output
+    extents come from stick-aware device geometry, so generated split factors
+    divide stick counts rather than element extents. The returned symbols and
+    factors remain local and symbol-keyed.
+    """
     rw = op_read_writes(op)
     write = next(iter(rw.writes)).index
     read = next((dep.index for dep in rw.reads), write)
@@ -1224,6 +1245,7 @@ def _matmul_axis_parse(op: Operation) -> dict[str, tuple[sympy.Symbol, int, int]
 def _bm_axes_from_roles(
     roles: dict[str, tuple[sympy.Symbol, int, int]],
 ) -> tuple[tuple[sympy.Symbol, int], tuple[sympy.Symbol, int]] | None:
+    """Return B/M ``(symbol, extent)`` pairs, or ``None`` when either is absent."""
     b, m = roles.get("B"), roles.get("M")
     return ((b[0], b[1]), (m[0], m[1])) if b is not None and m is not None else None
 
@@ -1231,6 +1253,12 @@ def _bm_axes_from_roles(
 def _reduction_bm_axes(
     op: Operation,
 ) -> tuple[tuple[sympy.Symbol, int], tuple[sympy.Symbol, int]] | None:
+    """Return stick-aware B/M output axes for a non-matmul reduction.
+
+    A reduction over N keeps B and M in its write. As in
+    :func:`_matmul_axis_parse`, the largest output stride is B and the next is
+    M. Reductions with fewer than two output axes cannot use this factorization.
+    """
     write = next(iter(op_read_writes(op).writes)).index
     out_syms = {int(write.coeff(sym)): sym for sym in write.free_symbols}
     if len(out_syms) < 2:
@@ -1243,7 +1271,12 @@ def _reduction_bm_axes(
 def _factored_bm_splits(
     bm_axes: tuple[tuple[sympy.Symbol, int], tuple[sympy.Symbol, int]] | None,
 ) -> list[dict[sympy.Symbol, int]]:
-    """Offer the largest valid B/M factorization across all cores."""
+    """Offer at most one largest-B full-core B/M factorization.
+
+    Smaller B factors do not add a useful reconciliation option but multiply the
+    co-optimization search space. An empty result means B/M is absent or no
+    factorization divides both stick-aware extents.
+    """
     if bm_axes is None:
         return []
     (b_sym, b_size), (m_sym, m_size) = bm_axes
@@ -1259,10 +1292,16 @@ def _factored_bm_splits(
 
 
 def _candidate_key(splits: dict[sympy.Symbol, int]) -> tuple[tuple[str, int], ...]:
+    """Return a stable, symbol-orderable deduplication key for one candidate."""
     return tuple(sorted(((str(sym), factor) for sym, factor in splits.items())))
 
 
 def _output_profile(op: Operation, splits: dict[sympy.Symbol, int]) -> dict[int, int]:
+    """Project output splits onto physical strides for cross-operation transfer.
+
+    This is temporary candidate-generation metadata only; callers immediately
+    reconstruct a symbol-keyed candidate for the target operation.
+    """
     write = next(iter(op_read_writes(op).writes)).index
     return {
         int(write.coeff(sym)): factor
@@ -1274,6 +1313,7 @@ def _output_profile(op: Operation, splits: dict[sympy.Symbol, int]) -> dict[int,
 def _from_output_profile(
     op: Operation, profile: dict[int, int]
 ) -> dict[sympy.Symbol, int]:
+    """Apply a transient physical output profile as a symbol-keyed candidate."""
     write = next(iter(op_read_writes(op).writes)).index
     return {
         sym: profile.get(int(write.coeff(sym)), 1) if write.coeff(sym) != 0 else 1
@@ -1284,7 +1324,13 @@ def _from_output_profile(
 def _find_distinct_matmul_splits(
     ops: list[Operation],
 ) -> tuple[tuple[dict[int, int], ...], tuple[dict[str, int], ...]]:
-    """Collect physical output profiles and B/M/N/K roles from matmul seeds."""
+    """Collect distinct physical profiles and B/M/N/K factors from matmul seeds.
+
+    Profiles let intervening pointwise operations offer a matching output
+    division. Role factors let another matmul transfer a split despite using
+    different local iteration symbols. Both are transient inputs to candidate
+    generation; committed divisions remain symbol-keyed.
+    """
     profiles: list[dict[int, int]] = []
     roles: list[dict[str, int]] = []
     seen: set[tuple[tuple[int, int], ...]] = set()
@@ -1314,6 +1360,14 @@ def _check_and_add_matmul_options(
     seed: dict[sympy.Symbol, int],
     matmul_roles: tuple[dict[str, int], ...],
 ) -> list[dict[sympy.Symbol, int]]:
+    """Offer seed, cross-matmul, and factored B/M candidates for ``op``.
+
+    Work distribution may choose incompatible splits for two matmuls joined by
+    pointwise/reduction operations. Transferring each source's B/M/N/K factors
+    gives the co-optimizer a chance to choose a compatible assignment. Missing
+    roles or non-divisible extents default to one; view matching later rejects
+    candidates that cannot share a physical buffer view.
+    """
     parsed = _matmul_axis_parse(op)
     options = {_candidate_key(seed): seed}
     for source in matmul_roles:
@@ -1338,7 +1392,14 @@ def _enum_split_options(
     extra_profiles: tuple[dict[int, int], ...] = (),
     matmul_roles: tuple[dict[str, int], ...] = (),
 ) -> list[dict[sympy.Symbol, int]]:
-    """Symbol-keyed Strategy B candidates for a pruned joint solve."""
+    """Enumerate symbol-keyed candidates for the pruned co-optimization path.
+
+    Matmuls use role transfer plus B/M factorizations. Other reductions offer
+    B/M factorizations only because their reduction axis is fixed. Pointwise
+    ops can move a single output split to another divisible output axis and can
+    adopt a matmul's transient physical output profile. The seed is always kept;
+    non-seed candidates must fit physical stick geometry.
+    """
     seed = _seed_splits(op)
     is_computed = isinstance(op, ComputedBuffer)
     is_reduction = is_computed and isinstance(op.data, Reduction)
@@ -1501,7 +1562,13 @@ class CoOptimizingAllocator(ScratchpadAllocator):
     def _enumerate_core_divisions(
         self, op: Operation, max_cores: int
     ) -> list[CoreDivision]:
-        """Symbol-keyed core-division candidates for one eligible operation."""
+        """Enumerate and deduplicate symbol-keyed candidates for one operation.
+
+        Operations without an enumerable concrete iteration space retain their
+        committed division. Deduplication uses local symbol names only within
+        this operation; cross-operation compatibility is derived from
+        ``PerCoreView`` instead.
+        """
         fixed = [_fixed_core_division(op)]
         if not isinstance(op, ComputedBuffer) or not isinstance(
             op.data, (Pointwise, Reduction)
