@@ -927,6 +927,60 @@ def test_grouped_gather_mapping_is_derived_after_alignment():
     ] == [owner for owner in range(4) for _ in range(8)]
 
 
+@config.patch({"sencores": 32})
+def test_grouped_broadcast_derives_distinct_physical_core_domains():
+    h = Symbol("h")
+    source_view = PerCoreView(((0, 2),), ((0, Mod(_CORE_ID, 2)),), num_cores=2)
+    destination_view = PerCoreView(
+        ((0, 2),), ((0, floor(_CORE_ID / 16)),), num_cores=32
+    )
+    grouped = lx_relayout_module._grouped_broadcast_geometry(
+        source_view, destination_view, 2, 32
+    )
+    assert grouped is not None
+    source_view, destination_view, geometry = grouped
+    assert [(item.source_split, item.destination_split) for item in geometry] == [
+        (2, 2)
+    ]
+
+    coordinates = [h, Integer(0)]
+    args = [
+        TensorArg(
+            True,
+            -1,
+            DataFormats.SEN169_FP16,
+            [2, 64],
+            coordinates,
+            {"lx": 0},
+            work_division=work_division_from_view(source_view, coordinates, (h,)),
+        ),
+        TensorArg(
+            False,
+            -1,
+            DataFormats.SEN169_FP16,
+            [2, 64],
+            coordinates,
+            {"lx": 1024},
+            work_division=work_division_from_view(destination_view, coordinates, (h,)),
+        ),
+    ]
+    root, allocations = _compile_spec(
+        OpSpec(IDENTITY_OP, False, {h: (Integer(2), 2)}, args, {})
+    )
+    assert set(root["dscs_"][0]) == {"shuffle"}
+    assert root["numCoresUsed_"] == 32
+    source_map, destination_map = [
+        node["coordinates_"]["coreIdToWkSlice_"] for node in allocations
+    ]
+    assert set(source_map) == {"0", "1"}
+    source_owners = [tuple(source_map[str(core)].values()) for core in range(2)]
+    destination_owners = [
+        tuple(destination_map[str(core)].values()) for core in range(32)
+    ]
+    assert source_owners[0] != source_owners[1]
+    assert destination_owners == [owner for owner in source_owners for _ in range(16)]
+
+
 def test_lx_relayout_activation_policy_is_source_wide():
     dep = SimpleNamespace(name="input")
     producer = SimpleNamespace()
@@ -1263,6 +1317,52 @@ def test_grouped_lx_gather_device(
         assert identities[0].count("allocation={'lx':") == 2
         assert identities[0].count("TensorWorkDivision(") == 2
         _assert_lx_only_relayout_payload(output_dirs)
+
+
+@config.patch(
+    {
+        "sencores": 32,
+        "lx_planning": True,
+        "allow_all_ops_in_lx_planning": True,
+        "lx_planner_relayout": True,
+        "layout_solver": "greedy",
+    }
+)
+def test_grouped_lx_broadcast_device():
+    torch.manual_seed(0)
+    probs = torch.randn(1, 8, 512, 128, dtype=torch.float16)
+    value_pages = torch.randn(2, 8, 128, 128, dtype=torch.float16)
+    page_table = torch.zeros(2, 32, dtype=torch.int32)
+
+    def fn(probs, value_pages, page_table):
+        page = value_pages.index_select(0, page_table[0, :1])
+        return torch.matmul(probs, page)
+
+    device_args = tuple(arg.to("spyre") for arg in (probs, value_pages, page_table))
+    torch._inductor.codecache.FxGraphCache.clear()
+    with _capture_backend_output_dirs() as output_dirs:
+        actual, code = run_and_get_code(
+            torch.compile(fn, dynamic=False, options={"epilogue_fusion": False}),
+            *device_args,
+        )
+    torch.testing.assert_close(
+        actual.cpu(), fn(probs, value_pages, page_table), rtol=2e-2, atol=2e-1
+    )
+    identities = [
+        block
+        for block in "\n".join(code).split("OpSpec(")
+        if "op='identity'" in block[:100]
+    ]
+    relayouts = [
+        block
+        for block in identities
+        if block.count("allocation={'lx':") == 2
+        and block.count("TensorWorkDivision(") == 2
+    ]
+    assert len(relayouts) == 1
+    assert "num_cores=1" in relayouts[0]
+    assert "num_cores=32" in relayouts[0]
+    _assert_lx_only_relayout_payload(output_dirs)
 
 
 def test_lx_relayout_allocation_is_atomic_in_one_greedy_solve(caplog):

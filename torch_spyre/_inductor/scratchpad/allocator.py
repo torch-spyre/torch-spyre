@@ -955,19 +955,26 @@ class ScratchpadAllocator:
             if name in partition_footprints:
                 info["size_per_core"] = partition_footprints[name]
         for plan in lx_relayout_plans:
-            name = plan.source_name
-            if name not in mem_usage:
-                continue
-            ncores[name] = plan.num_cores
-            ncores_reasons.pop(name, None)
-            footprint = plan.max_footprint_bytes or partition_footprints.get(name, 0)
-            # One source may feed differently shaped destinations. Its shared
-            # allocation must satisfy the largest member of the atomic group,
-            # independent of plan iteration order.
-            mem_usage[name]["size_per_core"] = max(
-                mem_usage[name]["size_per_core"], footprint
-            )
-            mem_usage[name]["core_div_mismatch"] = False
+            core_counts = {
+                plan.source_name: plan.source_view.num_cores or plan.num_cores,
+                plan.destination_name: plan.destination_view.num_cores
+                or plan.num_cores,
+            }
+            for name, num_cores in core_counts.items():
+                if name not in mem_usage:
+                    continue
+                ncores[name] = num_cores
+                ncores_reasons.pop(name, None)
+                footprint = plan.max_footprint_bytes or partition_footprints.get(
+                    name, 0
+                )
+                # One source may feed differently shaped destinations. Its
+                # shared allocation must satisfy the largest member of the
+                # atomic group, independent of plan iteration order.
+                mem_usage[name]["size_per_core"] = max(
+                    mem_usage[name]["size_per_core"], footprint
+                )
+                mem_usage[name]["core_div_mismatch"] = False
         t2 = time.perf_counter()
         if timings is not None:
             timings["residency"] += t1 - t0

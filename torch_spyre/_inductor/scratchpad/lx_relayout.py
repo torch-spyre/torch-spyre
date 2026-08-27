@@ -71,7 +71,7 @@ class LXRelayoutPlan:
     source_view: PerCoreView
     destination_view: PerCoreView
     num_cores: int
-    kind: Literal["shuffle", "gather"] = "shuffle"
+    kind: Literal["shuffle", "gather", "broadcast"] = "shuffle"
     group_geometry: tuple[RelayoutDimension, ...] = ()
     max_footprint_bytes: int = 0
     source_address: int | None = None
@@ -371,6 +371,52 @@ def _grouped_gather_geometry(
     return grouped_source, grouped_destination, tuple(geometry)
 
 
+def _grouped_broadcast_geometry(
+    source: PerCoreView,
+    destination: PerCoreView,
+    source_num_cores: int,
+    destination_num_cores: int,
+) -> tuple[PerCoreView, PerCoreView, tuple[RelayoutDimension, ...]] | None:
+    """Classify a complete source partition spread over more physical cores."""
+
+    source_splits = dict(source.work_slice_dims)
+    destination_splits = dict(destination.work_slice_dims)
+    if (
+        source_num_cores >= destination_num_cores
+        or math.prod(source_splits.values()) != source_num_cores
+        or destination_num_cores % math.prod(destination_splits.values())
+    ):
+        return None
+
+    geometry = []
+    for dim in dict.fromkeys((*source_splits, *destination_splits)):
+        source_split = source_splits.get(dim, 1)
+        destination_split = destination_splits.get(dim, 1)
+        if destination_split < source_split or destination_split % source_split:
+            return None
+        geometry.append(
+            RelayoutDimension(
+                device_dim=dim,
+                source_split=source_split,
+                destination_split=destination_split,
+                group_count=source_split,
+                group_size=destination_split // source_split,
+                multiplicity=destination_split // source_split,
+                ordering_tag="contiguous_groups",
+            )
+        )
+    grouped_source = _view_from_splits(source_splits, source_num_cores)
+    grouped_destination = _view_from_splits(destination_splits, destination_num_cores)
+    if not _compatible_partitions(
+        grouped_source,
+        grouped_destination,
+        source_num_cores,
+        destination_num_cores,
+    ):
+        return None
+    return grouped_source, grouped_destination, tuple(geometry)
+
+
 def partition_footprint(layout: FixedTiledLayout, view: PerCoreView) -> int:
     device_layout = layout.device_layout
     return partition_physical_span_bytes(
@@ -410,12 +456,16 @@ def _overlap(a: int, an: int, b: int, bn: int) -> bool:
 
 
 def _compatible_partitions(
-    source: PerCoreView, destination: PerCoreView, num_cores: int
+    source: PerCoreView,
+    destination: PerCoreView,
+    source_num_cores: int,
+    destination_num_cores: int | None = None,
 ) -> bool:
     """Whether every destination receives a uniform, complete partition."""
 
-    source_map = _core_slices(source, num_cores)
-    destination_map = _core_slices(destination, num_cores)
+    destination_num_cores = destination_num_cores or source_num_cores
+    source_map = _core_slices(source, source_num_cores)
+    destination_map = _core_slices(destination, destination_num_cores)
     source_splits = dict(source.work_slice_dims)
     destination_splits = dict(destination.work_slice_dims)
     dims = set(source_splits) | set(destination_splits)
@@ -433,20 +483,30 @@ def _compatible_partitions(
             for dim in dims
         )
     }
-    fanout = [sum(src == core for src, _ in edges) for core in range(num_cores)]
-    fanin = [sum(dst == core for _, dst in edges) for core in range(num_cores)]
+    fanout = [sum(src == core for src, _ in edges) for core in range(source_num_cores)]
+    fanin = [
+        sum(dst == core for _, dst in edges) for core in range(destination_num_cores)
+    ]
     if not edges or len(set(fanout)) != 1 or len(set(fanin)) != 1:
         return False
     source_owners = len({tuple(sorted(row.items())) for row in source_map.values()})
     destination_owners = len(
         {tuple(sorted(row.items())) for row in destination_map.values()}
     )
-    if source_owners != num_cores or math.prod(source_splits.values()) != num_cores:
+    if (
+        source_owners != source_num_cores
+        or math.prod(source_splits.values()) != source_num_cores
+    ):
         return False
     destination_slices = math.prod(destination_splits.values())
-    if destination_owners != destination_slices or num_cores % destination_slices:
+    if (
+        destination_owners != destination_slices
+        or destination_num_cores % destination_slices
+    ):
         return False
-    multiplicity = num_cores // destination_slices
+    if source_num_cores != destination_num_cores:
+        return fanout[0] == destination_num_cores // source_num_cores and fanin[0] == 1
+    multiplicity = source_num_cores // destination_slices
     return multiplicity == 1 or (fanout[0] == multiplicity and fanin[0] == multiplicity)
 
 
@@ -477,15 +537,20 @@ def validate_final_views(
     source = next(iter(source_views))
     destination = next(iter(destination_views))
 
+    source_num_cores = plan.source_view.num_cores or plan.num_cores
+    destination_num_cores = plan.destination_view.num_cores or plan.num_cores
     if (
-        source.ownership.num_cores != plan.num_cores
-        or destination.ownership.num_cores != plan.num_cores
+        source.ownership.num_cores != source_num_cores
+        or destination.ownership.num_cores != destination_num_cores
     ):
         return "final view physical core count changed"
     if source == destination:
         return "final source and destination views no longer require a relayout"
     if not _compatible_partitions(
-        source.ownership, destination.ownership, plan.num_cores
+        source.ownership,
+        destination.ownership,
+        source_num_cores,
+        destination_num_cores,
     ):
         return "final source and destination partitions are not a complete transfer"
 
@@ -493,13 +558,25 @@ def validate_final_views(
         classified = _grouped_gather_geometry(
             source.ownership,
             destination.ownership,
-            plan.num_cores,
+            source_num_cores,
         )
         if classified is None:
             return "final views are not a grouped gather"
         geometry = classified[2]
         if _geometry_topology(geometry) != _geometry_topology(plan.group_geometry):
             return f"final grouped-gather geometry changed: {geometry}"
+    elif plan.kind == "broadcast":
+        classified = _grouped_broadcast_geometry(
+            source.ownership,
+            destination.ownership,
+            source_num_cores,
+            destination_num_cores,
+        )
+        if classified is None:
+            return "final views are not a grouped broadcast"
+        geometry = classified[2]
+        if _geometry_topology(geometry) != _geometry_topology(plan.group_geometry):
+            return f"final grouped-broadcast geometry changed: {geometry}"
     elif plan.kind != "shuffle":
         return f"unsupported relayout kind {plan.kind}"
 
@@ -613,7 +690,7 @@ def collect_lx_relayout_plans(graph: GraphLowering) -> list[LXRelayoutPlan]:
         source_view, partial, representable = _per_core_view_on_buf(
             producer, write, source_name, cache
         )
-        num_cores = _op_num_cores(producer)
+        source_num_cores = _op_num_cores(producer)
         if source_view is None or partial or not representable:
             continue
 
@@ -648,16 +725,21 @@ def collect_lx_relayout_plans(graph: GraphLowering) -> list[LXRelayoutPlan]:
             view, consumer_partial, representable = _per_core_view_on_buf(
                 consumer, dep, source_name, cache
             )
+            consumer_num_cores = _op_num_cores(consumer)
+            if view is None or consumer_partial or not representable:
+                rejection_reason = "consumer ownership is partial or unrepresentable"
+                break
+            if consumer_num_cores < source_num_cores:
+                rejection_reason = "consumer uses fewer physical cores than producer"
+                break
+            if consumer_num_cores > source_num_cores and not _is_matmul_op(consumer):
+                rejection_reason = "grouped broadcast requires a matmul consumer"
+                break
             if (
-                view is None
-                or consumer_partial
-                or not representable
-                or _op_num_cores(consumer) != num_cores
+                consumer_num_cores > source_num_cores
+                and consumer_num_cores != config.sencores
             ):
-                rejection_reason = (
-                    "consumer ownership is partial, unrepresentable, or uses a "
-                    "different core count"
-                )
+                rejection_reason = "grouped broadcast must target all compute cores"
                 break
             consumer_coordinates = try_device_coordinates(
                 producer.layout.device_layout, dep, None
@@ -674,21 +756,57 @@ def collect_lx_relayout_plans(graph: GraphLowering) -> list[LXRelayoutPlan]:
                     view,
                     consumer_coordinates,
                     consumer_symbols,
+                    consumer_num_cores,
                 )
             )
 
         grouped_source = None
         grouped_destinations = {}
         grouped_geometry = {}
+        grouped_kinds = {}
         if rejection_reason is None:
-            for consumer_name, consumer, _, view, _, _ in consumer_views:
+            for (
+                consumer_name,
+                consumer,
+                _,
+                view,
+                _,
+                _,
+                consumer_num_cores,
+            ) in consumer_views:
+                if consumer_num_cores > source_num_cores:
+                    grouped = _grouped_broadcast_geometry(
+                        source_view,
+                        view,
+                        source_num_cores,
+                        consumer_num_cores,
+                    )
+                    if grouped is None:
+                        rejection_reason = (
+                            "grouped destination does not evenly replicate the source"
+                        )
+                        break
+                    candidate_source, destination, geometry = grouped
+                    if (
+                        grouped_source is not None
+                        and candidate_source != grouped_source
+                    ):
+                        rejection_reason = (
+                            "consumers require different grouped source geometry"
+                        )
+                        break
+                    grouped_source = candidate_source
+                    grouped_destinations[consumer_name] = destination
+                    grouped_geometry[consumer_name] = geometry
+                    grouped_kinds[consumer_name] = "broadcast"
+                    continue
                 destination_owners = math.prod(dict(view.work_slice_dims).values())
-                if destination_owners >= num_cores:
+                if destination_owners >= source_num_cores:
                     continue
                 if not _is_matmul_op(consumer):
                     rejection_reason = "grouped gather requires a matmul consumer"
                     break
-                grouped = _grouped_gather_geometry(source_view, view, num_cores)
+                grouped = _grouped_gather_geometry(source_view, view, source_num_cores)
                 if grouped is None:
                     rejection_reason = (
                         "grouped destination does not evenly contract the source"
@@ -703,6 +821,7 @@ def collect_lx_relayout_plans(graph: GraphLowering) -> list[LXRelayoutPlan]:
                 grouped_source = candidate_source
                 grouped_destinations[consumer_name] = destination
                 grouped_geometry[consumer_name] = geometry
+                grouped_kinds[consumer_name] = "gather"
 
         source_view = grouped_source or source_view
         producer_coordinates = try_device_coordinates(
@@ -733,9 +852,13 @@ def collect_lx_relayout_plans(graph: GraphLowering) -> list[LXRelayoutPlan]:
                 raw_view,
                 consumer_coordinates,
                 consumer_symbols,
+                consumer_num_cores,
             ) in consumer_views:
                 destination_view = grouped_destinations.get(consumer_name, raw_view)
-                if raw_view.work_slice_dims == source_geometry:
+                if (
+                    raw_view.work_slice_dims == source_geometry
+                    and consumer_num_cores == source_num_cores
+                ):
                     destination_view = source_view
                 try:
                     source_work_division = work_division_from_view(
@@ -756,7 +879,12 @@ def collect_lx_relayout_plans(graph: GraphLowering) -> list[LXRelayoutPlan]:
                 if not is_matmul and not isinstance(consumer.data, Pointwise):
                     rejection_reason = "consumer is neither pointwise nor matmul"
                     break
-                if not _compatible_partitions(source_view, destination_view, num_cores):
+                if not _compatible_partitions(
+                    source_view,
+                    destination_view,
+                    source_num_cores,
+                    consumer_num_cores,
+                ):
                     rejection_reason = (
                         "source and destination partitions are incompatible"
                     )
@@ -776,7 +904,7 @@ def collect_lx_relayout_plans(graph: GraphLowering) -> list[LXRelayoutPlan]:
                 ):
                     rejection_reason = reason
                     break
-                kind = "gather" if consumer_name in grouped_geometry else "shuffle"
+                kind = grouped_kinds.get(consumer_name, "shuffle")
                 geometry = grouped_geometry.get(consumer_name, ())
                 footprint = max(
                     partition_footprint(producer.layout, source_view),
@@ -792,7 +920,7 @@ def collect_lx_relayout_plans(graph: GraphLowering) -> list[LXRelayoutPlan]:
                     consumer_names=tuple(consumer_names),
                     source_view=source_view,
                     destination_view=destination_view,
-                    num_cores=num_cores,
+                    num_cores=source_num_cores,
                     kind=kind,
                     group_geometry=geometry,
                     max_footprint_bytes=footprint,
