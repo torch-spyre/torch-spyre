@@ -900,7 +900,8 @@ class ScratchpadAllocator:
                 ncores[name] = plan.num_cores
                 ncores_reasons.pop(name, None)
                 mem_usage[name]["size_per_core"] = (
-                    mem_usage[name]["size"] // plan.num_cores
+                    plan.max_footprint_bytes
+                    or mem_usage[name]["size"] // plan.num_cores
                 )
                 mem_usage[name]["core_div_mismatch"] = False
         t2 = time.perf_counter()
@@ -998,7 +999,8 @@ class ScratchpadAllocator:
                 destination = LifetimeBoundBuffer(
                     plan.destination_name,
                     round_up_to_alignment(
-                        source.size, _LX_ALLOCATION_GRANULARITY_BYTES
+                        plan.max_footprint_bytes or source.size,
+                        _LX_ALLOCATION_GRANULARITY_BYTES,
                     ),
                     [transfer_tick, *consumer_ticks],
                     lifetime_end_override=destination_end,

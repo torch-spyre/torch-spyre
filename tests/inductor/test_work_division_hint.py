@@ -569,6 +569,101 @@ def _relayout_plan(source="source", consumers="consumer"):
     return LXRelayoutPlan(source, consumers, _SOURCE_VIEW, _DESTINATION_VIEW, 8)
 
 
+def test_grouped_gather_records_geometry_without_persisting_new_placement():
+    source = PerCoreView(
+        ((0, 4), (1, 8)),
+        ((0, Mod(_CORE_ID, 4)), (1, Mod(floor(_CORE_ID / 4), 8))),
+    )
+    destination = PerCoreView(((0, 4),), ((0, Mod(_CORE_ID, 4)),))
+
+    grouped = lx_relayout_module._grouped_gather_geometry(source, destination, 32)
+    assert grouped is not None
+    grouped_source, grouped_destination, geometry = grouped
+    assert lx_relayout_module._compatible_partitions(
+        grouped_source, grouped_destination, 32
+    )
+    assert [(item.source_split, item.destination_split) for item in geometry] == [
+        (4, 4),
+        (8, 1),
+    ]
+    owners = lx_relayout_module._core_slices(grouped_destination, 32)
+    assert all(
+        len({tuple(owners[core].items()) for core in range(start, start + 8)}) == 1
+        for start in range(0, 32, 8)
+    )
+
+
+def test_partition_footprint_counts_strided_span_not_elements():
+    assert (
+        lx_relayout_module.partition_physical_span_bytes(
+            (5, 5, 64),
+            (320, 64, 1),
+            64,
+            {0: 2, 1: 2},
+        )
+        == 13 * 128
+    )
+    assert (
+        lx_relayout_module.partition_physical_span_bytes(
+            (5, 5, 64),
+            (512, 64, 1),
+            64,
+            {0: 2, 1: 2},
+        )
+        == 19 * 128
+    )
+
+
+def test_grouped_gather_mapping_is_derived_after_alignment():
+    h, local = Symbol("h"), Symbol("local")
+    source = TensorWorkDivision(
+        {h: 4, local: 8},
+        {h: Mod(floor(_CORE_ID / 8), 4), local: Mod(_CORE_ID, 8)},
+    )
+    destination = TensorWorkDivision({h: 4}, {h: Mod(_CORE_ID, 4)})
+    args = [
+        TensorArg(
+            True,
+            -1,
+            DataFormats.SEN169_FP16,
+            [4, 8, 64],
+            [h, local, Integer(0)],
+            {"lx": 0},
+            work_division=source,
+        ),
+        TensorArg(
+            False,
+            -1,
+            DataFormats.SEN169_FP16,
+            [4, 8, 64],
+            [h, local, Integer(0)],
+            {"lx": 1024},
+            work_division=destination,
+        ),
+    ]
+    spec = OpSpec(
+        IDENTITY_OP,
+        False,
+        {h: (Integer(4), 4), local: (Integer(8), 8)},
+        args,
+        {},
+    )
+
+    simplify_op_spec(spec)
+    source_owner, destination_owner = [arg.work_division for arg in spec.args]
+    assert source_owner is not None and destination_owner is not None
+    assert source_owner.core_id_to_work_slice != source.core_id_to_work_slice
+    destination_dim = next(iter(destination_owner.core_id_to_work_slice))
+    assert [
+        int(
+            destination_owner.core_id_to_work_slice[destination_dim].subs(
+                _CORE_ID, core
+            )
+        )
+        for core in range(32)
+    ] == [owner for owner in range(4) for _ in range(8)]
+
+
 def test_lx_relayout_activation_policy_is_source_wide():
     dep = SimpleNamespace(name="input")
     producer = SimpleNamespace()
@@ -828,6 +923,57 @@ def test_lx_relayout_consumers_share_destination_view(second_consumer):
     if not shares_destination:
         expected_destinations.add("sympify('c0'): 8")
     assert {pair[1] for pair in divisions} == expected_destinations
+
+
+@config.patch(
+    {
+        "sencores": 32,
+        "lx_planning": True,
+        "allow_all_ops_in_lx_planning": True,
+        "lx_planner_relayout": True,
+        "layout_solver": "greedy",
+    }
+)
+@pytest.mark.parametrize(
+    ("num_heads", "key_length", "query_length", "key_split"),
+    ((4, 128, 8, 8), (8, 64, 4, 4)),
+)
+def test_grouped_lx_gather_device(num_heads, key_length, query_length, key_split):
+    torch.manual_seed(0)
+    value = torch.randn(num_heads, key_length, 64, dtype=torch.float16)
+    attention = torch.randn(num_heads, query_length, key_length, dtype=torch.float16)
+    for name, size in (
+        ("H", num_heads),
+        ("Lk", key_length),
+        ("Lq", query_length),
+        ("D", 64),
+    ):
+        _declare_tensor_dim(name, size)
+
+    def fn(value, attention):
+        with spyre_hint(work_div={"H": num_heads, "Lk": key_split}):
+            hidden = torch.neg(value)
+        with spyre_hint(work_div={"H": num_heads, "Lq": query_length}):
+            return torch.bmm(attention, hidden)
+
+    device_args = (
+        _name_tensor_dims(value.to("spyre"), ["H", "Lk", "D"]),
+        _name_tensor_dims(attention.to("spyre"), ["H", "Lq", "Lk"]),
+    )
+    torch._inductor.codecache.FxGraphCache.clear()
+    actual, code = run_and_get_code(
+        torch.compile(fn, dynamic=False, options={"epilogue_fusion": False}),
+        *device_args,
+    )
+    torch.testing.assert_close(actual.cpu(), fn(value, attention), rtol=2e-2, atol=1e-1)
+    identities = [
+        block
+        for block in "\n".join(code).split("OpSpec(")
+        if "op='identity'" in block[:100]
+    ]
+    assert len(identities) == 1
+    assert identities[0].count("allocation={'lx':") == 2
+    assert identities[0].count("TensorWorkDivision(") == 2
 
 
 def test_lx_relayout_allocation_is_atomic_in_one_greedy_solve(caplog):

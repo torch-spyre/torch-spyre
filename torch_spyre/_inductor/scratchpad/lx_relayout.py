@@ -17,7 +17,7 @@ from __future__ import annotations
 import dataclasses
 import math
 from collections.abc import Sequence
-from typing import cast
+from typing import Literal, cast
 
 import sympy
 from torch._inductor.dependencies import MemoryDep
@@ -30,6 +30,7 @@ from torch._inductor.ir import (
 )
 
 from .. import config
+from ..core_mapping import derive_partition_mapping, partition_physical_span_bytes
 from ..ir import FixedTiledLayout
 from ..logging_utils import get_inductor_logger
 from ..op_spec import TensorWorkDivision
@@ -50,12 +51,25 @@ _REGISTRY = "_spyre_lx_relayout_copies"
 
 
 @dataclasses.dataclass(frozen=True)
+class RelayoutDimension:
+    """One device dimension's source-to-destination partition geometry."""
+
+    device_dim: int
+    source_split: int
+    destination_split: int
+    ordering_tag: Literal["contiguous_groups"]
+
+
+@dataclasses.dataclass(frozen=True)
 class LXRelayoutPlan:
     source_name: str
     consumer_names: tuple[str, ...]
     source_view: PerCoreView
     destination_view: PerCoreView
     num_cores: int
+    kind: Literal["shuffle", "gather"] = "shuffle"
+    group_geometry: tuple[RelayoutDimension, ...] = ()
+    max_footprint_bytes: int = 0
     source_address: int | None = None
     destination_address: int | None = None
 
@@ -154,6 +168,81 @@ def _core_slices(view: PerCoreView, num_cores: int) -> dict[int, dict[int, int]]
     return result
 
 
+def _view_from_splits(
+    split_by_device_dim: dict[int, int], num_cores: int
+) -> PerCoreView:
+    """Build v1 planning ownership with the shared late-mapping formula."""
+
+    dims = tuple(sympy.Symbol(f"device_dim_{dim}") for dim in split_by_device_dim)
+    mapping = derive_partition_mapping(
+        dims,
+        tuple(split_by_device_dim.values()),
+        num_cores,
+    )
+    device_dim_by_symbol = dict(zip(dims, split_by_device_dim))
+    return PerCoreView(
+        tuple(split_by_device_dim.items()),
+        tuple(
+            (device_dim_by_symbol[dim], expression)
+            for dim, expression in mapping.items()
+            if split_by_device_dim[device_dim_by_symbol[dim]] > 1
+        ),
+        num_cores=num_cores,
+    )
+
+
+def _grouped_gather_geometry(
+    source: PerCoreView, destination: PerCoreView, num_cores: int
+) -> tuple[PerCoreView, PerCoreView, tuple[RelayoutDimension, ...]] | None:
+    """Classify a full source partition contracting into repeated owners."""
+
+    source_splits = dict(source.work_slice_dims)
+    destination_splits = dict(destination.work_slice_dims)
+    if math.prod(source_splits.values()) != num_cores:
+        return None
+    destination_owners = math.prod(destination_splits.values())
+    if not 0 < destination_owners < num_cores:
+        return None
+
+    dimensions = tuple(dict.fromkeys((*source_splits, *destination_splits)))
+    geometry = []
+    for dim in dimensions:
+        source_split = source_splits.get(dim, 1)
+        destination_split = destination_splits.get(dim, 1)
+        if source_split < destination_split or source_split % destination_split:
+            return None
+        geometry.append(
+            RelayoutDimension(
+                device_dim=dim,
+                source_split=source_split,
+                destination_split=destination_split,
+                ordering_tag="contiguous_groups",
+            )
+        )
+
+    if (
+        destination_owners
+        * math.prod(item.source_split // item.destination_split for item in geometry)
+        != num_cores
+    ):
+        return None
+    grouped_source = _view_from_splits(source_splits, num_cores)
+    grouped_destination = _view_from_splits(destination_splits, num_cores)
+    if not _compatible_partitions(grouped_source, grouped_destination, num_cores):
+        return None
+    return grouped_source, grouped_destination, tuple(geometry)
+
+
+def _partition_footprint(layout: FixedTiledLayout, view: PerCoreView) -> int:
+    device_layout = layout.device_layout
+    return partition_physical_span_bytes(
+        tuple(int(size) for size in device_layout.device_size),
+        tuple(int(stride) for stride in device_layout.stride_map),
+        int(device_layout.elems_per_stick()),
+        dict(view.work_slice_dims),
+    )
+
+
 def _overlap(a: int, an: int, b: int, bn: int) -> bool:
     return a * bn < (b + 1) * an and b * an < (a + 1) * bn
 
@@ -161,6 +250,8 @@ def _overlap(a: int, an: int, b: int, bn: int) -> bool:
 def _compatible_partitions(
     source: PerCoreView, destination: PerCoreView, num_cores: int
 ) -> bool:
+    """Whether every destination receives a uniform, complete partition."""
+
     source_map = _core_slices(source, num_cores)
     destination_map = _core_slices(destination, num_cores)
     source_splits = dict(source.work_slice_dims)
@@ -182,18 +273,19 @@ def _compatible_partitions(
     }
     fanout = [sum(src == core for src, _ in edges) for core in range(num_cores)]
     fanin = [sum(dst == core for _, dst in edges) for core in range(num_cores)]
-    return bool(edges) and all(
-        (
-            len(set(fanout)) == 1,
-            len(set(fanin)) == 1,
-            len({tuple(sorted(row.items())) for row in source_map.values()})
-            == num_cores,
-            len({tuple(sorted(row.items())) for row in destination_map.values()})
-            == num_cores,
-            math.prod(source_splits.values()) == num_cores,
-            math.prod(destination_splits.values()) == num_cores,
-        )
+    if not edges or len(set(fanout)) != 1 or len(set(fanin)) != 1:
+        return False
+    source_owners = len({tuple(sorted(row.items())) for row in source_map.values()})
+    destination_owners = len(
+        {tuple(sorted(row.items())) for row in destination_map.values()}
     )
+    if source_owners != num_cores or math.prod(source_splits.values()) != num_cores:
+        return False
+    destination_slices = math.prod(destination_splits.values())
+    if destination_owners != destination_slices or num_cores % destination_slices:
+        return False
+    multiplicity = num_cores // destination_slices
+    return multiplicity == 1 or (fanout[0] == multiplicity and fanin[0] == multiplicity)
 
 
 def _single_write(op: ComputedBuffer, name: str) -> MemoryDep | None:
@@ -272,24 +364,10 @@ def collect_lx_relayout_plans(graph: GraphLowering) -> list[LXRelayoutPlan]:
         if not _is_activation_source(operations, producer):
             continue
 
-        producer_coordinates = try_device_coordinates(
-            producer.layout.device_layout, write, None
-        )
-        if producer_coordinates is None:
-            continue
-        try:
-            work_division_from_view(
-                source_view,
-                producer_coordinates,
-                tuple(iteration_space_from_op(producer)),
-            )
-        except ValueError:
-            continue
-
         # Relayout copies sharing one source are allocated and materialized as
         # one atomic group. Any unsupported consumer therefore rejects the
         # group; supported consumers keep using the original buffer instead.
-        consumers_by_view: dict[PerCoreView, list[str]] = {}
+        consumer_views = []
         seen_consumers = set()
         rejection_reason = None
         for consumer, dep in consumer_reads:
@@ -330,52 +408,143 @@ def collect_lx_relayout_plans(graph: GraphLowering) -> list[LXRelayoutPlan]:
                 rejection_reason = "consumer coordinates are unavailable"
                 break
             consumer_symbols = tuple(iteration_space_from_op(consumer))
-            try:
-                source_work_division = work_division_from_view(
-                    source_view, consumer_coordinates, consumer_symbols
+            consumer_views.append(
+                (
+                    consumer_name,
+                    consumer,
+                    deps,
+                    view,
+                    consumer_coordinates,
+                    consumer_symbols,
                 )
-            except ValueError:
-                rejection_reason = "source ownership cannot be projected to consumer"
-                break
-            assert source_work_division is not None
-            if view == source_view:
-                continue
-            is_matmul = _is_matmul_op(consumer)
-            if is_matmul and len(deps) != 2:
-                rejection_reason = "matmul consumer does not have two inputs"
-                break
-            if not is_matmul and not isinstance(consumer.data, Pointwise):
-                rejection_reason = "consumer is neither pointwise nor matmul"
-                break
-            if not _compatible_partitions(source_view, view, num_cores):
-                rejection_reason = "source and destination partitions are incompatible"
-                break
-            try:
-                destination_work_division = work_division_from_view(
-                    view, consumer_coordinates, consumer_symbols
+            )
+
+        grouped_source = None
+        grouped_destinations = {}
+        grouped_geometry = {}
+        if rejection_reason is None:
+            for consumer_name, consumer, _, view, _, _ in consumer_views:
+                destination_owners = math.prod(dict(view.work_slice_dims).values())
+                if destination_owners >= num_cores:
+                    continue
+                if not _is_matmul_op(consumer):
+                    rejection_reason = "grouped gather requires a matmul consumer"
+                    break
+                grouped = _grouped_gather_geometry(source_view, view, num_cores)
+                if grouped is None:
+                    rejection_reason = (
+                        "grouped destination does not evenly contract the source"
+                    )
+                    break
+                candidate_source, destination, geometry = grouped
+                if grouped_source is not None and candidate_source != grouped_source:
+                    rejection_reason = (
+                        "consumers require different grouped source geometry"
+                    )
+                    break
+                grouped_source = candidate_source
+                grouped_destinations[consumer_name] = destination
+                grouped_geometry[consumer_name] = geometry
+
+        source_view = grouped_source or source_view
+        producer_coordinates = try_device_coordinates(
+            producer.layout.device_layout, write, None
+        )
+        if rejection_reason is None:
+            if producer_coordinates is None:
+                rejection_reason = "producer coordinates are unavailable"
+            else:
+                try:
+                    work_division_from_view(
+                        source_view,
+                        producer_coordinates,
+                        tuple(iteration_space_from_op(producer)),
+                    )
+                except ValueError:
+                    rejection_reason = (
+                        "source ownership cannot be projected to producer"
+                    )
+
+        plans_by_destination = {}
+        if rejection_reason is None:
+            source_geometry = source_view.work_slice_dims
+            for (
+                consumer_name,
+                consumer,
+                deps,
+                raw_view,
+                consumer_coordinates,
+                consumer_symbols,
+            ) in consumer_views:
+                destination_view = grouped_destinations.get(consumer_name, raw_view)
+                if raw_view.work_slice_dims == source_geometry:
+                    destination_view = source_view
+                try:
+                    source_work_division = work_division_from_view(
+                        source_view, consumer_coordinates, consumer_symbols
+                    )
+                except ValueError:
+                    rejection_reason = (
+                        "source ownership cannot be projected to consumer"
+                    )
+                    break
+                assert source_work_division is not None
+                if destination_view == source_view:
+                    continue
+                is_matmul = _is_matmul_op(consumer)
+                if is_matmul and len(deps) != 2:
+                    rejection_reason = "matmul consumer does not have two inputs"
+                    break
+                if not is_matmul and not isinstance(consumer.data, Pointwise):
+                    rejection_reason = "consumer is neither pointwise nor matmul"
+                    break
+                if not _compatible_partitions(source_view, destination_view, num_cores):
+                    rejection_reason = (
+                        "source and destination partitions are incompatible"
+                    )
+                    break
+                try:
+                    destination_work_division = work_division_from_view(
+                        destination_view, consumer_coordinates, consumer_symbols
+                    )
+                except ValueError:
+                    rejection_reason = (
+                        "destination ownership cannot be projected to consumer"
+                    )
+                    break
+                assert destination_work_division is not None
+                if reason := _unsupported_relayout_transition_reason(
+                    source_work_division, destination_work_division
+                ):
+                    rejection_reason = reason
+                    break
+                kind = "gather" if consumer_name in grouped_geometry else "shuffle"
+                geometry = grouped_geometry.get(consumer_name, ())
+                footprint = max(
+                    _partition_footprint(producer.layout, source_view),
+                    _partition_footprint(producer.layout, destination_view),
                 )
-            except ValueError:
-                rejection_reason = (
-                    "destination ownership cannot be projected to consumer"
-                )
-                break
-            assert destination_work_division is not None
-            if reason := _unsupported_relayout_transition_reason(
-                source_work_division, destination_work_division
-            ):
-                rejection_reason = reason
-                break
-            consumers_by_view.setdefault(view, []).append(consumer_name)
-        else:
+                key = (destination_view, kind, geometry, footprint)
+                plans_by_destination.setdefault(key, []).append(consumer_name)
+
+        if rejection_reason is None:
             result.extend(
                 LXRelayoutPlan(
-                    source_name,
-                    tuple(consumer_names),
-                    source_view,
-                    destination_view,
-                    num_cores,
+                    source_name=source_name,
+                    consumer_names=tuple(consumer_names),
+                    source_view=source_view,
+                    destination_view=destination_view,
+                    num_cores=num_cores,
+                    kind=kind,
+                    group_geometry=geometry,
+                    max_footprint_bytes=footprint,
                 )
-                for destination_view, consumer_names in consumers_by_view.items()
+                for (
+                    destination_view,
+                    kind,
+                    geometry,
+                    footprint,
+                ), consumer_names in plans_by_destination.items()
             )
         if rejection_reason is not None:
             logger.debug(

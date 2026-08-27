@@ -47,10 +47,33 @@ from .scratchpad.lx_relayout import (
     materialized_lx_relayouts,
     work_division_from_view,
 )
-from .op_spec import LoopSpec
+from .op_spec import LoopSpec, TensorWorkDivision
 from . import config as _spyre_config
 
 logger = get_inductor_logger("scheduler")
+
+
+def _scheduled_work_division(
+    node: SchedulerNode,
+    dep: MemoryDep,
+    name: str,
+    view: PerCoreView,
+) -> TensorWorkDivision | None:
+    """Project a physical partition into final scheduled loop symbols."""
+
+    buffer = V.graph.try_get_buffer(name)
+    if buffer is None:
+        return None
+    layout = buffer.get_layout()
+    if not isinstance(layout, FixedTiledLayout):
+        return None
+    coordinates = try_device_coordinates(layout.device_layout, dep, None)
+    if coordinates is None:
+        return None
+    try:
+        return work_division_from_view(view, coordinates, tuple(iteration_space(node)))
+    except ValueError:
+        return None
 
 
 def _ownership_projectable(
@@ -59,22 +82,7 @@ def _ownership_projectable(
     name: str,
     view: PerCoreView,
 ) -> bool:
-    """Whether final scheduled coordinates can carry ``view`` into codegen."""
-
-    buffer = V.graph.try_get_buffer(name)
-    if buffer is None:
-        return False
-    layout = buffer.get_layout()
-    if not isinstance(layout, FixedTiledLayout):
-        return False
-    coordinates = try_device_coordinates(layout.device_layout, dep, None)
-    if coordinates is None:
-        return False
-    try:
-        work_division_from_view(view, coordinates, tuple(iteration_space(node)))
-    except ValueError:
-        return False
-    return True
+    return _scheduled_work_division(node, dep, name, view) is not None
 
 
 class CountedLoopSchedulerNode(FusedSchedulerNode):
@@ -360,7 +368,10 @@ def _lx_view(name: str):
     buffer = V.graph.try_get_buffer(name)
     if buffer is None:
         return None
-    layout = buffer.get_layout()
+    try:
+        layout = buffer.get_layout()
+    except NotImplementedError:
+        return None
     if not isinstance(layout, FixedTiledLayout):
         return None
     if "lx" not in layout.allocation:
@@ -450,32 +461,13 @@ def align_lx_producer_loop_order(
 def demote_incoherent_lx_buffers(
     nodes: list[BaseSchedulerNode],
 ) -> list[BaseSchedulerNode]:
-    """Post-fusion pass: drop an LX buffer whose users disagree on core->slice.
+    """Reject LX groups that final scheduled loops cannot represent safely.
 
-    LX planning runs before the Scheduler exists, so it reasons about each op's
-    *pre*-scheduler ranges. ``core_to_slice_mapping`` is positional -- it hands
-    ``core_id`` strides out in iteration-space order -- and Inductor's
-    ``loop_ordering_after_fusion`` may permute a fused op's ranges after planning
-    has already committed. When it permutes one user of an LX buffer and not
-    another, the two disagree about which core owns which slice: each core writes
-    one slice and reads back a different one. LX is per-core scratchpad with no
-    other copy, so the read is silently wrong (#2062).
-
-    Planning cannot see that permutation, so re-check here, where the ranges are
-    final, and demote any buffer whose users no longer agree. Clearing ``"lx"``
-    is all that is needed: this runs before ``hbm_pool_planning``, which claims
-    exactly the intermediates LX did not, so a demoted buffer lands in the HBM
-    intermediates segment on its way through.
-
-    Deliberately verification-only -- it never *adds* residency and never
-    rewrites a loop order, so it cannot perturb a graph whose users already
-    agree.
-
-    Complements :func:`align_lx_producer_loop_order`, which runs pre-fusion and
-    rewrites a producer's loop order to match its consumers'. That pass fixes the
-    incoherence it can reach; this one is the backstop for what it cannot -- a
-    disagreement introduced after it ran, or a view too irregular to represent --
-    where the only safe answer is to give up LX residency.
+    The planner preserves physical partition geometry, not a final core map.
+    After fusion this pass checks that every producer, copy, and consumer can
+    still project that geometry into its scheduled loops. The final mapping is
+    derived later from those loops. A failed check demotes the complete source
+    group before HBM-pool planning, so no partial relayout survives.
     """
     if not _spyre_config.lx_planning:
         return nodes
@@ -499,6 +491,7 @@ def demote_incoherent_lx_buffers(
     relayout_sources = set(source_by_copy.values())
 
     copy_reads = set()
+    valid_copy_nodes = set()
     invalid_sources = {}
     seen_copies = set()
     for node in scheduled:
@@ -533,6 +526,7 @@ def demote_incoherent_lx_buffers(
             ):
                 invalid_sources[plan.source_name] = f"invalid relayout copy {dep.name}"
             else:
+                valid_copy_nodes.add(node.get_name())
                 copy_reads.add((node.get_name(), plan.source_name))
     for copy_name, plan in plans_by_copy.items():
         if copy_name not in seen_copies:
@@ -574,8 +568,11 @@ def demote_incoherent_lx_buffers(
                 culprit = f"{node.get_name()} view unrepresentable"
                 break
             if expected is not None:
-                if view != expected:
-                    culprit = f"{node.get_name()} view {view} != {expected}"
+                if view.work_slice_dims != expected.work_slice_dims:
+                    culprit = (
+                        f"{node.get_name()} split geometry "
+                        f"{view.work_slice_dims} != {expected.work_slice_dims}"
+                    )
                     break
                 if not _ownership_projectable(node, dep, name, expected):
                     culprit = f"{node.get_name()} ownership unprojectable"
@@ -589,6 +586,37 @@ def demote_incoherent_lx_buffers(
         if culprit is None:
             continue
         demote(source_by_copy.get(name, name), culprit)
+
+    # An ordinary operation has one execution mapping. Accepted LX tensors may
+    # constrain it, but they cannot demand different split counts for one loop.
+    for node in scheduled:
+        accesses = [
+            dep
+            for dep in (*node.read_writes.reads, *node.read_writes.writes)
+            if isinstance(dep, MemoryDep) and _lx_view(dep.name) is not None
+        ]
+        if len(accesses) < 2 or node.get_name() in valid_copy_nodes:
+            continue
+        merged_splits = {}
+        conflict = False
+        for dep in accesses:
+            view = _lx_view(dep.name)
+            assert view is not None
+            division = _scheduled_work_division(node, dep, dep.name, view)
+            if division is None:
+                continue
+            for dim, split in division.work_slices.items():
+                previous = merged_splits.setdefault(dim, int(split))
+                if previous != int(split):
+                    conflict = True
+                    break
+            if conflict:
+                break
+        if not conflict:
+            continue
+        reason = f"{node.get_name()} has incompatible LX split geometry"
+        for dep in accesses:
+            demote(source_by_copy.get(dep.name, dep.name), reason)
 
     return nodes
 
