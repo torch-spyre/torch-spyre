@@ -173,9 +173,9 @@ classifies it as a *reduction* dim, which a non-reduction op never splits.
 is heuristic policy, not constraint state.
 
 A scatter entry dim has coefficient 0 in the indirect write index, so
-`splits_by_index_coeff` encodes it via the first direct read. `apply_splits`,
-split recovery, split validation, and codegen use
-`first_non_indirect_read_index` for that reference.
+`splits_by_index_coeff` encodes it via the first direct read. Split recovery,
+split validation, and codegen use the same transport-index selection for that
+reference.
 
 This is gated on the [uniqueness condition](#the-scatter-only-correctness-condition-index-uniqueness):
 `indirect_store_entry_syms` returns dims only for overwrite scatters.

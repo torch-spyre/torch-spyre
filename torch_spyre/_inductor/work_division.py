@@ -22,7 +22,6 @@ from collections.abc import Callable
 from sympy import Expr, Integer, Symbol, divisors
 from torch._inductor.dependencies import MemoryDep
 from torch._inductor.graph import GraphLowering
-from torch._inductor.virtualized import V
 from torch._inductor.ir import (
     ComputedBuffer,
     DeviceCopy,
@@ -63,9 +62,6 @@ from .pass_utils import (
     get_mem_deps_from_rw,
     iteration_space_from_op,
     commit_iteration_space_ownership,
-    indirect_access_subs_from_op,
-    indirect_sizes_from_op,
-    _fixed_read_layout,
     op_read_writes,
 )
 from .propagate_hints import get_op_hints
@@ -770,36 +766,6 @@ def collect_tensor_deps(
     return input_tds, output_td
 
 
-def collect_indirect_value_tds(op: ComputedBuffer) -> list[TensorDep]:
-    """Collect tensor dependencies for gather's value tables.
-
-    Gather value tables are filtered out of the normal argument list, but we
-    still need to check if they fit in per-core memory. This function brings
-    them back in with proper IndirectAccess markers. The value table is never
-    split across cores - these dependencies are only used for memory size checks.
-    """
-    subs = indirect_access_subs_from_op(op)
-    if not subs:
-        return []
-    # device_coordinates needs the *integer* index range for each indirect
-    # symbol (indirect_sizes), not the IndirectAccess marker map. Compute the
-    # coordinates with the raw indirect symbol treated as a normal loop var,
-    # then xreplace subs to mark the runtime-chosen row dimension — mirroring
-    # the align_tensors -> IndirectAccess-substitution order in simplify_op_spec.
-    ind_sizes = indirect_sizes_from_op(op)
-    tds: list[TensorDep] = []
-    for d in op.get_read_writes().reads:
-        if isinstance(d, MemoryDep) and d.is_indirect():
-            layout = _fixed_read_layout(V.graph.get_buffer(d.name))
-            td = TensorDep.__new__(TensorDep)
-            td.dep = d
-            td.layout = layout
-            coords = device_coordinates(layout.device_layout, d, ind_sizes)
-            td.device_coords = [c.xreplace(subs) for c in coords]
-            tds.append(td)
-    return tds
-
-
 def apply_splits(op: ComputedBuffer, splits: dict) -> None:
     """Commit symbol-keyed work division; scheduler transport is finalized later."""
     commit_iteration_space_ownership(op, splits)
@@ -1097,12 +1063,10 @@ def span_reduction_pass(
     have a complete operation iteration-space ownership record.
 
     For indirect-access ops (gather / scatter), shared-table data dimensions
-    (K, N of the value table or the scatter destination) are excluded from the
-    split candidate set via `forbidden_split_syms`. Splitting those dims would
-    give every core a different base address into the shared table, producing
-    wrong results. If reducing the span requires splitting a forbidden dim the
-    pass proceeds with the best available split on the remaining dims;
-    work_distribution_pass may then place fewer cores to compensate.
+    (K, N of the value table or the scatter destination) have legal split domain
+    `{1}`. Splitting those dims would give every core a different base address
+    into the shared table, producing wrong results. If the memory span cannot be
+    reduced within the hard domains, the pass raises `Unsupported`.
     """
     it_space = iteration_space_from_op(op)
     input_tds, output_td = collect_tensor_deps(op, args)

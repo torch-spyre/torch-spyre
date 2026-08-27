@@ -16,7 +16,7 @@ import io
 import math
 import warnings
 from dataclasses import dataclass
-from typing import Any, Callable, Iterable, NamedTuple, Optional, TypeVar, Union
+from typing import Any, Callable, NamedTuple, Optional, TypeVar, Union
 
 import regex
 import torch
@@ -1476,46 +1476,6 @@ def _coeff_splits_from_index(
     return result
 
 
-def first_non_indirect_read_index(
-    reads: "Iterable[MemoryDep]", default: sympy.Expr
-) -> sympy.Expr:
-    """Return stable split-encoding reference, preferring a direct read."""
-    first = None
-    for dep in reads:
-        if first is None:
-            first = dep
-        if isinstance(dep, MemoryDep) and not dep.is_indirect():
-            return dep.index
-    return first.index if first is not None else default
-
-
-def has_lossy_split_encoding(
-    splits: dict[sympy.Symbol, int], write_index: sympy.Expr, read_index: sympy.Expr
-) -> bool:
-    """Return whether non-unity splits cannot survive coefficient encoding.
-
-    Generic encoding intentionally drops dimensions absent from both indexes for
-    compatibility with coarse tiling. LX must skip such alternatives because it
-    cannot preserve their candidate division for solver comparison or commit.
-    """
-    by_coeff: dict[tuple[str, sympy.Expr], set[int]] = {}
-    for sym, split in splits.items():
-        if split <= 1:
-            continue
-        namespace, coeff = (
-            ("output", write_index.coeff(sym))
-            if write_index.coeff(sym) != 0
-            else ("reduction", read_index.coeff(sym))
-        )
-        if coeff == 0:
-            return True
-        factors = by_coeff.setdefault((namespace, coeff), set())
-        factors.add(split)
-        if len(factors) > 1:
-            return True
-    return False
-
-
 def splits_by_index_coeff(
     splits: dict[sympy.Symbol, int],
     write_index: sympy.Expr,
@@ -1529,8 +1489,7 @@ def splits_by_index_coeff(
     rejected.
 
     Only non-unity splits are stored; 1 is the default on the apply side.
-    Dimensions absent from both indexes are intentionally omitted; callers that
-    require lossless candidate encoding must use ``has_lossy_split_encoding``.
+    Dimensions absent from both indexes are intentionally omitted.
     """
     skip = lambda v: v <= 1  # noqa: E731
     output_splits = _coeff_splits_from_index(splits, write_index, skip=skip)
@@ -1611,9 +1570,10 @@ def select_work_division_transport_indexes(
         read_index = read_with_max_reduction_overlap(rw.reads, reduction_vars)
         if read_index is not None:
             return write_index, read_index
+    first_read = next((d for d in rw.reads if isinstance(d, MemoryDep)), None)
     read = next(
         (d for d in rw.reads if isinstance(d, MemoryDep) and not d.is_indirect()),
-        next((d for d in rw.reads if isinstance(d, MemoryDep)), None),
+        first_read,
     )
     return write_index, read.index if read is not None else write_index
 
