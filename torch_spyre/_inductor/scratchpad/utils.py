@@ -102,6 +102,61 @@ def calculate_liveness(graph: GraphLowering) -> dict[str, list[int]]:
     return liveness
 
 
+def counted_loop_lifetime_end_overrides(graph: GraphLowering) -> dict[str, int]:
+    """Return exclusive lifetime ends for values reused by counted loops.
+
+    The graph contains one textual copy of a loop body.  Ordinary liveness
+    therefore sees only the first runtime iteration and may reuse a value's LX
+    address later in that body, even though the next iteration reads it again.
+    A value born outside a loop and read inside it must stay alive through that
+    loop.  This records that storage fact without adding a fake read to
+    :func:`calculate_liveness`.
+    """
+
+    def group_path(op: Operation) -> tuple[int, ...]:
+        return tuple(getattr(getattr(op, "loop_info", None), "loop_group_id", ()) or ())
+
+    loop_end: dict[tuple[int, ...], int] = {}
+    birth_group: dict[str, tuple[int, ...]] = {
+        name: () for name in graph.graph_input_names
+    }
+    last_access: dict[str, int] = {}
+
+    for index, op in enumerate(graph.operations):
+        path = group_path(op)
+        for depth in range(1, len(path) + 1):
+            loop_end[path[:depth]] = index
+        rw = op_read_writes(op)
+        for dep in rw.writes:
+            birth_group.setdefault(dep.name, path)
+            last_access[dep.name] = index
+        for dep in rw.reads:
+            birth_group.setdefault(dep.name, ())
+            last_access[dep.name] = index
+
+    overrides: dict[str, int] = {}
+    for index, op in enumerate(graph.operations):
+        consumer_path = group_path(op)
+        if not consumer_path:
+            continue
+        for dep in op_read_writes(op).reads:
+            producer_path = birth_group.get(dep.name, ())
+            common = 0
+            while (
+                common < len(producer_path)
+                and common < len(consumer_path)
+                and producer_path[common] == consumer_path[common]
+            ):
+                common += 1
+            if common == len(consumer_path):
+                continue
+            enclosing_loop = consumer_path[: common + 1]
+            end = loop_end[enclosing_loop] + 1
+            if end > last_access.get(dep.name, index) + 1:
+                overrides[dep.name] = max(overrides.get(dep.name, 0), end)
+    return overrides
+
+
 def mem_usage_by_buf(
     graph: GraphLowering,
     cache: Optional[dict] = None,

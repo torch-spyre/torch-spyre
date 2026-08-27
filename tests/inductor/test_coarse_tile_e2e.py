@@ -1935,10 +1935,6 @@ def test_copy_after_reduction_512x256_A4_B4():
     )
 
 
-@pytest.mark.skip(
-    reason="4D H4xLq4 copy_forced into locally-created buffer still mismatches after "
-    "mutation_write_back copy_out fix (39.7% mismatch) -- distinct/deeper bug"
-)
 def test_copy_running_max_4d_H4_Lq4():
     """copy_forced(maximum(real_max, amax(scores,dim=-2)), real_max) on [B,H,Lk,Lq] tiled H÷4 Lq÷4.
 
@@ -2848,7 +2844,10 @@ def test_flash_tile_Lk():
         )
 
 
-@pytest.mark.skip(reason="KeyError: 0 — B tiling not yet supported")
+@pytest.mark.skip(
+    reason="running-max/copy_forced accumulator bug produces inf (see"
+    " test_flash_v2_tile_H); B tiling itself compiles and runs correctly"
+)
 def test_flash_tile_B_H():
     """Flash v1: tile B÷2 H÷4. B=2."""
     run_coarse_tile_test(
@@ -3052,7 +3051,10 @@ def test_flash_v2_tile_H():
     )
 
 
-@pytest.mark.skip(reason="KeyError: 0 — B tiling not yet supported")
+@pytest.mark.skip(
+    reason="running-max/copy_forced accumulator bug produces inf (see"
+    " test_flash_v2_tile_H); B tiling itself compiles and runs correctly"
+)
 def test_flash_v2_tile_B():
     """Flash v2: tile B÷2 only. B=2."""
     run_coarse_tile_test(
@@ -3093,7 +3095,10 @@ def test_flash_v2_tile_Lk():
         )
 
 
-@pytest.mark.skip(reason="KeyError: 0 — B tiling not yet supported")
+@pytest.mark.skip(
+    reason="running-max/copy_forced accumulator bug produces inf (see"
+    " test_flash_v2_tile_H); B tiling itself compiles and runs correctly"
+)
 def test_flash_v2_tile_B_H():
     """Flash v2: tile B÷2 H÷4. B=2."""
     run_coarse_tile_test(
@@ -3281,7 +3286,10 @@ def test_flash_v3_tile_H():
     )
 
 
-@pytest.mark.skip(reason="KeyError: 0 — B tiling not yet supported")
+@pytest.mark.skip(
+    reason="running-max/copy_forced accumulator bug produces inf (see"
+    " test_flash_v2_tile_H); B tiling itself compiles and runs correctly"
+)
 def test_flash_v3_tile_B():
     """Flash v3: tile B÷2 only. B=2."""
     run_coarse_tile_test(
@@ -3327,7 +3335,10 @@ def test_flash_v3_tile_Lk():
     )
 
 
-@pytest.mark.skip(reason="KeyError: 0 — B tiling not yet supported")
+@pytest.mark.skip(
+    reason="running-max/copy_forced accumulator bug produces inf (see"
+    " test_flash_v2_tile_H); B tiling itself compiles and runs correctly"
+)
 def test_flash_v3_tile_B_H():
     """Flash v3: tile B÷2 H÷4. B=2."""
     run_coarse_tile_test(
