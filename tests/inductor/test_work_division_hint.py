@@ -44,6 +44,7 @@ from torch_spyre._C import DataFormats
 from torch_spyre._inductor.codegen.superdsc import compile_op_spec, parse_op_spec
 from torch_spyre._inductor.constants import IDENTITY_OP
 from torch_spyre._inductor.scratchpad.lx_relayout import (
+    FinalLXView,
     LXRelayoutPlan,
     work_division_from_view,
 )
@@ -612,6 +613,91 @@ def test_partition_footprint_counts_strided_span_not_elements():
         )
         == 19 * 128
     )
+
+
+def test_final_view_maps_stick_split_to_outer_device_dimension():
+    c = Symbol("c")
+    division = TensorWorkDivision(
+        {c: 2},
+        {c: Mod(_CORE_ID, 2)},
+        num_cores=2,
+    )
+    view = lx_relayout_module.view_from_work_division(
+        division,
+        [floor(c / 64), Mod(c, 64)],
+        {c: (128, 2)},
+    )
+    assert view.work_slice_dims == ((0, 2),)
+
+
+def test_final_view_ignores_alignment_only_singleton_dimensions():
+    c = Symbol("c")
+    division = TensorWorkDivision({}, {}, num_cores=1)
+    compact = lx_relayout_module.final_view_from_work_division(
+        division,
+        [8, 64],
+        [c, Mod(c, 64)],
+        {c: (8, 1)},
+    )
+    expanded = lx_relayout_module.final_view_from_work_division(
+        division,
+        [1, 1, 8, 64],
+        [0, 0, c, Mod(c, 64)],
+        {c: (8, 1)},
+    )
+    assert expanded == compact
+
+
+def test_final_view_validation_requires_one_shared_physical_view():
+    plan = replace(
+        _relayout_plan(),
+        max_footprint_bytes=1024,
+        source_address=0,
+        destination_address=2048,
+    )
+    layout = SimpleNamespace(device_layout=SimpleNamespace(device_size=(8, 4, 64)))
+    graph = SimpleNamespace(
+        try_get_buffer=lambda name: (
+            SimpleNamespace(get_layout=lambda: layout)
+            if name in {"source", "destination"}
+            else None
+        )
+    )
+    source = FinalLXView(
+        replace(_SOURCE_VIEW, num_cores=8), (8, 4, 64), (2, 2, 64), 512
+    )
+    destination = FinalLXView(
+        replace(_DESTINATION_VIEW, num_cores=8), (8, 4, 64), (1, 4, 64), 512
+    )
+    views = {
+        ("producer", "source"): source,
+        ("copy", "source"): source,
+        ("copy", "destination"): destination,
+        ("consumer", "destination"): destination,
+    }
+    with mock_patch.object(lx_relayout_module, "FixedTiledLayout", SimpleNamespace):
+        assert (
+            lx_relayout_module.validate_final_views(
+                graph,
+                plan,
+                views,
+                destination_name="destination",
+            )
+            is None
+        )
+        views[("consumer", "destination")] = replace(
+            destination,
+            slice_shape=(2, 4, 64),
+        )
+        assert "destination users derived 2 final views" in (
+            lx_relayout_module.validate_final_views(
+                graph,
+                plan,
+                views,
+                destination_name="destination",
+            )
+            or ""
+        )
 
 
 def test_grouped_gather_mapping_is_derived_after_alignment():
@@ -1218,6 +1304,11 @@ def test_lx_relayout_scheduler_demotes_groups_but_not_ordinary_unary():
             mock_patch.object(lx_relayout_module, "FixedTiledLayout", SimpleNamespace),
             mock_patch.object(scheduler_module, "V", SimpleNamespace(graph=graph)),
             mock_patch.object(scheduler_module, "per_core_view_scheduled", view),
+            mock_patch.object(
+                scheduler_module,
+                "_preview_final_lx_views",
+                return_value=({}, False),
+            ),
             mock_patch.object(
                 scheduler_module,
                 "_ownership_projectable",

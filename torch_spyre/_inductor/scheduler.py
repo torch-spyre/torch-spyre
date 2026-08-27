@@ -14,6 +14,8 @@
 
 from typing import Sequence, Union
 
+import math
+
 import sympy
 
 from torch._inductor.utils import IndentedBuffer
@@ -23,6 +25,7 @@ from torch._inductor.utils import (
     sympy_product,
 )
 from torch._inductor.dependencies import MemoryDep
+from torch._inductor.ir import ComputedBuffer
 from torch._inductor.scheduler import (
     BaseScheduling,
     BaseSchedulerNode,
@@ -31,23 +34,40 @@ from torch._inductor.scheduler import (
 )
 from torch._inductor.virtualized import V
 from torch._inductor.codecache import code_hash
+from torch._dynamo.utils import counters
 from torch.utils._ordered_set import OrderedSet
 
 from .spyre_kernel import SpyreKernel
 from .ir import FixedTiledLayout
 from .pass_utils import (
     PerCoreView,
+    _is_matmul_op,
+    apply_splits_from_index_coeff,
+    concretize_index,
+    indirect_sizes_from_op,
     iteration_space,
     per_core_view_scheduled,
+    select_work_division_transport_indexes,
     try_device_coordinates,
 )
+from .core_mapping import (
+    derive_operation_mapping,
+    finalize_tensor_work_divisions,
+    remap_work_division,
+)
+from .errors import Unsupported
 from .logging_utils import get_inductor_logger
 from .scratchpad.lx_relayout import (
+    FinalLXView,
     demote_lx_relayout_group,
     materialized_lx_relayouts,
+    set_final_lx_views,
+    validate_final_views,
+    final_view_from_work_division,
     work_division_from_view,
 )
 from .op_spec import LoopSpec, TensorWorkDivision
+from .views import align_tensors, compute_coordinates
 from . import config as _spyre_config
 
 logger = get_inductor_logger("scheduler")
@@ -458,6 +478,145 @@ def align_lx_producer_loop_order(
     return nodes
 
 
+def _preview_final_lx_views(
+    node: SchedulerNode,
+    *,
+    relayout_copy: bool,
+) -> tuple[dict[tuple[str, str], FinalLXView], bool]:
+    """Run codegen's pure alignment and derive this op's final physical views.
+
+    The preview is read-only. It consumes scheduler-final ranges and tensor
+    coordinates, then uses the same alignment and mapping helpers as codegen.
+    """
+
+    rw = node.read_writes
+    reads = [dep for dep in rw.reads if isinstance(dep, MemoryDep)]
+    writes = [dep for dep in rw.writes if isinstance(dep, MemoryDep)]
+    if not writes:
+        raise ValueError(f"{node.get_name()} has no concrete output dependency")
+    op = node.node
+    if not isinstance(op, ComputedBuffer):
+        raise ValueError(f"{node.get_name()} has no computed operation")
+
+    raw_iteration_space = iteration_space(node)
+    write_index, read_index = select_work_division_transport_indexes(
+        op, rw, raw_iteration_space
+    )
+    split_by_dim = apply_splits_from_index_coeff(
+        getattr(op, "op_it_space_splits", ({}, {})),
+        write_index,
+        read_index,
+        raw_iteration_space,
+    )
+    aligned_input_space = {
+        dim: (extent, int(split_by_dim.get(dim, 1)))
+        for dim, extent in raw_iteration_space.items()
+    }
+    indirect_sizes = indirect_sizes_from_op(op)
+    if indirect_sizes:
+        # Re-executing the op to recover indirect ranges can create equivalent
+        # SymPy symbols with different assumptions. Bind the scheduler's actual
+        # index symbol to the recovered range, just as codegen does directly.
+        size_by_name = {str(dim): size for dim, size in indirect_sizes.items()}
+        for dep in (*reads, *writes):
+            for dim in dep.index.free_symbols - raw_iteration_space.keys():
+                if dim not in indirect_sizes and str(dim) in size_by_name:
+                    indirect_sizes[dim] = size_by_name[str(dim)]
+    repeat_info: dict[sympy.Symbol, dict] = {}
+    entries = []
+    for dep in (*reads, *writes):
+        buffer = V.graph.try_get_buffer(dep.name)
+        if buffer is None:
+            continue
+        try:
+            layout = buffer.get_layout()
+        except NotImplementedError:
+            continue
+        if not isinstance(layout, FixedTiledLayout):
+            continue
+        index = concretize_index(dep.index, set(raw_iteration_space))
+        coordinates = compute_coordinates(
+            layout.device_layout.device_size,
+            layout.device_layout.stride_map,
+            raw_iteration_space,
+            index,
+            indirect_sizes,
+            repeat_info_out=repeat_info,
+        )
+        division = work_division_from_view(
+            layout.lx_view if "lx" in layout.allocation else None,
+            coordinates,
+            tuple(raw_iteration_space),
+        )
+        entries.append((dep.name, layout, coordinates, division))
+
+    final_space, final_tensors, dimension_remap = align_tensors(
+        aligned_input_space,
+        [
+            {
+                "size": list(layout.device_layout.device_size),
+                "coordinates": coordinates,
+            }
+            for _, layout, coordinates, _ in entries
+        ],
+        indirect_sizes,
+        repeat_info=repeat_info,
+    )
+    changed = any(
+        len(new_dims) != 1 or new_dims[0][0] != old_dim
+        for old_dim, new_dims in dimension_remap.items()
+    )
+    remapped = [
+        remap_work_division(division, dimension_remap) if division is not None else None
+        for *_, division in entries
+    ]
+    finalized = finalize_tensor_work_divisions(final_space, remapped)
+
+    operation_division = None
+    if not relayout_copy:
+        contiguous_dim = (
+            next(reversed(final_space))
+            if final_space
+            and _is_matmul_op(op)
+            and _spyre_config.core_id_k_fast_emission
+            else None
+        )
+        mapping = derive_operation_mapping(
+            final_space,
+            finalized,
+            contiguous_dim=contiguous_dim,
+        )
+        work_slices = {
+            dim: int(split) for dim, (_, split) in final_space.items() if int(split) > 1
+        }
+        operation_division = TensorWorkDivision(
+            work_slices,
+            {dim: mapping[dim] for dim in work_slices},
+            num_cores=math.prod(int(split) for _, split in final_space.values()),
+        )
+
+    result: dict[tuple[str, str], FinalLXView] = {}
+    for (name, layout, _, _), tensor, division in zip(
+        entries, final_tensors, finalized
+    ):
+        if "lx" not in layout.allocation:
+            continue
+        effective = division if relayout_copy else operation_division
+        if effective is None:
+            raise ValueError(f"{node.get_name()} has no final ownership for {name}")
+        view = final_view_from_work_division(
+            effective,
+            tensor["size"],
+            tensor["coordinates"],
+            final_space,
+        )
+        key = (node.get_name(), name)
+        previous = result.setdefault(key, view)
+        if previous != view:
+            raise ValueError(f"{node.get_name()} accesses {name} with two final views")
+    return result, changed
+
+
 def demote_incoherent_lx_buffers(
     nodes: list[BaseSchedulerNode],
 ) -> list[BaseSchedulerNode]:
@@ -597,7 +756,7 @@ def demote_incoherent_lx_buffers(
         ]
         if len(accesses) < 2 or node.get_name() in valid_copy_nodes:
             continue
-        merged_splits = {}
+        merged_splits: dict[sympy.Symbol, int] = {}
         conflict = False
         for dep in accesses:
             view = _lx_view(dep.name)
@@ -617,6 +776,101 @@ def demote_incoherent_lx_buffers(
         reason = f"{node.get_name()} has incompatible LX split geometry"
         for dep in accesses:
             demote(source_by_copy.get(dep.name, dep.name), reason)
+
+    # Preview the same alignment calculation codegen will run, while atomic
+    # fallback is still possible. This is the graph-wide proof point: all
+    # producer, copy, and consumer views coexist here.
+    source_by_buffer = {
+        plan.source_name: plan.source_name for plan in plans_by_copy.values()
+    }
+    source_by_buffer.update(source_by_copy)
+    preview_views: dict[tuple[str, str], FinalLXView] = {}
+    changed_ops = 0
+    previewed_ops = 0
+    for node in scheduled:
+        lx_buffers = {
+            dep.name
+            for dep in (*node.read_writes.reads, *node.read_writes.writes)
+            if isinstance(dep, MemoryDep)
+            and (
+                (buffer := V.graph.try_get_buffer(dep.name)) is not None
+                and isinstance((layout := buffer.get_layout()), FixedTiledLayout)
+                and "lx" in layout.allocation
+            )
+        }
+        if not lx_buffers:
+            continue
+        try:
+            views, changed = _preview_final_lx_views(
+                node,
+                relayout_copy=node.get_name() in valid_copy_nodes,
+            )
+        except (Unsupported, ValueError) as exc:
+            reason = f"{node.get_name()} alignment preview failed: {exc}"
+            counters["torch_spyre"]["lx_relayout_gate_preview_failures"] += 1
+            for name in lx_buffers:
+                demote(source_by_buffer.get(name, name), reason)
+            continue
+        previewed_ops += 1
+        changed_ops += int(changed)
+        preview_views.update(views)
+
+    counters["torch_spyre"]["lx_relayout_gate_previewed_ops"] += previewed_ops
+    counters["torch_spyre"]["lx_relayout_gate_alignment_changed_ops"] += changed_ops
+
+    relayout_buffers = {
+        name
+        for copy_name, plan in plans_by_copy.items()
+        for name in (plan.source_name, copy_name)
+    }
+    for name in lx_names - relayout_buffers:
+        buffer_views = {
+            view
+            for (_, buffer_name), view in preview_views.items()
+            if buffer_name == name
+        }
+        if len(buffer_views) > 1:
+            counters["torch_spyre"]["lx_relayout_gate_ordinary_mismatch"] += 1
+            demote(
+                name,
+                f"ordinary LX handoff derived {len(buffer_views)} final views",
+            )
+
+    checked_groups = 0
+    for copy_name, plan in list(materialized_lx_relayouts(V.graph).values()):
+        if plan.source_name in demoted:
+            continue
+        checked_groups += 1
+        if validation_reason := validate_final_views(
+            V.graph,
+            plan,
+            preview_views,
+            destination_name=copy_name,
+        ):
+            counters["torch_spyre"]["lx_relayout_gate_group_mismatch"] += 1
+            demote(plan.source_name, validation_reason)
+    counters["torch_spyre"]["lx_relayout_gate_checked_groups"] += checked_groups
+    counters["torch_spyre"]["lx_relayout_gate_demoted_groups"] += len(
+        demoted & relayout_sources
+    )
+
+    accepted_views: dict[tuple[str, str], FinalLXView] = {}
+    for key, view in preview_views.items():
+        buffer = V.graph.try_get_buffer(key[1])
+        if buffer is None:
+            continue
+        layout = buffer.get_layout()
+        if isinstance(layout, FixedTiledLayout) and "lx" in layout.allocation:
+            accepted_views[key] = view
+    set_final_lx_views(V.graph, accepted_views)
+    logger.debug(
+        "LX final-view gate: previewed_ops=%d alignment_changed_ops=%d "
+        "checked_groups=%d demoted_groups=%d",
+        previewed_ops,
+        changed_ops,
+        checked_groups,
+        len(demoted & relayout_sources),
+    )
 
     return nodes
 

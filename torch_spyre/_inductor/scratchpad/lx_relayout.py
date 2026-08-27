@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import dataclasses
 import math
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from typing import Literal, cast
 
 import sympy
@@ -48,6 +48,7 @@ from .utils import _op_num_cores
 logger = get_inductor_logger("lx_relayout")
 _DESTINATION_PREFIX = "__spyre_lx_relayout__"
 _REGISTRY = "_spyre_lx_relayout_copies"
+_FINAL_VIEWS = "_spyre_lx_final_views"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -57,6 +58,9 @@ class RelayoutDimension:
     device_dim: int
     source_split: int
     destination_split: int
+    group_count: int
+    group_size: int
+    multiplicity: int
     ordering_tag: Literal["contiguous_groups"]
 
 
@@ -80,6 +84,16 @@ class LXRelayoutPlan:
     @property
     def edge(self) -> tuple[str, str]:
         return self.source_name, self.destination_name
+
+
+@dataclasses.dataclass(frozen=True)
+class FinalLXView:
+    """One tensor's final emitted physical shape and ownership."""
+
+    ownership: PerCoreView
+    device_size: tuple[int, ...]
+    slice_shape: tuple[int, ...]
+    minimum_footprint_bytes: int
 
 
 def work_division_from_view(
@@ -118,6 +132,18 @@ def materialized_lx_relayouts(
     return getattr(graph, _REGISTRY, {})
 
 
+def final_lx_views(graph: GraphLowering) -> dict[tuple[str, str], FinalLXView]:
+    """Final post-alignment physical views accepted by the graph-wide gate."""
+
+    return getattr(graph, _FINAL_VIEWS, {})
+
+
+def set_final_lx_views(
+    graph: GraphLowering, views: dict[tuple[str, str], FinalLXView]
+) -> None:
+    setattr(graph, _FINAL_VIEWS, views)
+
+
 def _discard_lx_relayout_group(graph: GraphLowering, source_name: str) -> set[str]:
     copies = materialized_lx_relayouts(graph)
     removed = set()
@@ -125,6 +151,10 @@ def _discard_lx_relayout_group(graph: GraphLowering, source_name: str) -> set[st
         if edge[0] == source_name:
             removed.add(copy_name)
             del copies[edge]
+    cached = final_lx_views(graph)
+    for key in list(cached):
+        if key[1] == source_name or key[1] in removed:
+            del cached[key]
     return removed
 
 
@@ -166,6 +196,103 @@ def _core_slices(view: PerCoreView, num_cores: int) -> dict[int, dict[int, int]]
             row[dim] = slot
         result[core] = row
     return result
+
+
+def view_from_work_division(
+    division: TensorWorkDivision,
+    device_coordinates: Sequence[sympy.Expr],
+    iteration_space: Mapping[sympy.Symbol, tuple[sympy.Expr, int]],
+) -> PerCoreView:
+    """Convert final loop-symbol ownership back to a physical device view."""
+
+    split_by_device_dim: dict[int, int] = {}
+    slot_by_device_dim: dict[int, sympy.Expr] = {}
+    for loop_dim, split in division.work_slices.items():
+        matches = [
+            device_dim
+            for device_dim, coordinate in enumerate(device_coordinates)
+            if loop_dim in coordinate.free_symbols
+        ]
+        # An operation may split a loop that this tensor broadcasts across
+        # (for example the query dimension of a BMM input). That loop chooses
+        # execution cores, but it does not further partition this tensor.
+        if not matches:
+            continue
+        if len(matches) > 1:
+            extent = int(iteration_space[loop_dim][0])
+            slice_extent = math.ceil(extent / int(split))
+            physical_matches = []
+            for device_dim in matches:
+                coordinate = device_coordinates[device_dim]
+                other_dims = coordinate.free_symbols - {loop_dim}
+                coordinate = coordinate.xreplace({dim: 0 for dim in other_dims})
+                values = []
+                for slot in range(int(split)):
+                    start = slot * slice_extent
+                    end = min(extent, start + slice_extent) - 1
+                    if start >= extent:
+                        break
+                    first = sympy.simplify(coordinate.xreplace({loop_dim: start}))
+                    last = sympy.simplify(coordinate.xreplace({loop_dim: end}))
+                    if first != last:
+                        break
+                    values.append(first)
+                if len(values) == int(split) and len(set(values)) == int(split):
+                    physical_matches.append(device_dim)
+            matches = physical_matches
+        if len(matches) != 1:
+            raise ValueError(
+                f"cannot map final loop {loop_dim} to one device dimension"
+            )
+        device_dim = matches[0]
+        slot = sympy.sympify(division.core_id_to_work_slice[loop_dim])
+        previous = (
+            split_by_device_dim.get(device_dim),
+            slot_by_device_dim.get(device_dim),
+        )
+        if previous[0] is not None and previous != (int(split), slot):
+            raise ValueError(
+                f"conflicting final ownership on device dimension {device_dim}"
+            )
+        split_by_device_dim[device_dim] = int(split)
+        slot_by_device_dim[device_dim] = slot
+    return PerCoreView(
+        tuple(sorted(split_by_device_dim.items())),
+        tuple(sorted(slot_by_device_dim.items())),
+        num_cores=division.num_cores,
+    )
+
+
+def final_view_from_work_division(
+    division: TensorWorkDivision,
+    device_size: Sequence[int],
+    device_coordinates: Sequence[sympy.Expr],
+    iteration_space: Mapping[sympy.Symbol, tuple[sympy.Expr, int]],
+) -> FinalLXView:
+    """Build the physical view described by a finalized tensor argument."""
+
+    size = tuple(int(extent) for extent in device_size)
+    ownership = view_from_work_division(division, device_coordinates, iteration_space)
+    kept_dims = [dim for dim, extent in enumerate(size) if extent != 1]
+    canonical_dim = {dim: index for index, dim in enumerate(kept_dims)}
+    ownership = PerCoreView(
+        tuple((canonical_dim[dim], split) for dim, split in ownership.work_slice_dims),
+        tuple((canonical_dim[dim], slot) for dim, slot in ownership.core_to_slot),
+        num_cores=ownership.num_cores,
+    )
+    canonical_size = tuple(size[dim] for dim in kept_dims)
+    splits = dict(ownership.work_slice_dims)
+    extents = tuple(
+        math.ceil(extent / int(splits.get(dim, 1)))
+        for dim, extent in enumerate(canonical_size)
+    )
+    slice_shape = tuple(sorted(extents[:-1])) + (extents[-1],)
+    return FinalLXView(
+        ownership=ownership,
+        device_size=canonical_size,
+        slice_shape=slice_shape,
+        minimum_footprint_bytes=math.prod(extents[:-1]) * 128,
+    )
 
 
 def _view_from_splits(
@@ -216,6 +343,9 @@ def _grouped_gather_geometry(
                 device_dim=dim,
                 source_split=source_split,
                 destination_split=destination_split,
+                group_count=destination_split,
+                group_size=source_split // destination_split,
+                multiplicity=source_split // destination_split,
                 ordering_tag="contiguous_groups",
             )
         )
@@ -240,6 +370,30 @@ def _partition_footprint(layout: FixedTiledLayout, view: PerCoreView) -> int:
         tuple(int(stride) for stride in device_layout.stride_map),
         int(device_layout.elems_per_stick()),
         dict(view.work_slice_dims),
+    )
+
+
+def _geometry_topology(
+    geometry: Sequence[RelayoutDimension],
+) -> tuple[tuple[int, int, int, int, int, str], ...]:
+    """Return the layout-normalization-invariant collective geometry.
+
+    Device-dimension numbers may change when a tensor layout is normalized.
+    The split contraction and grouping structure must not.
+    """
+
+    return tuple(
+        sorted(
+            (
+                item.source_split,
+                item.destination_split,
+                item.group_count,
+                item.group_size,
+                item.multiplicity,
+                item.ordering_tag,
+            )
+            for item in geometry
+        )
     )
 
 
@@ -286,6 +440,100 @@ def _compatible_partitions(
         return False
     multiplicity = num_cores // destination_slices
     return multiplicity == 1 or (fanout[0] == multiplicity and fanin[0] == multiplicity)
+
+
+def validate_final_views(
+    graph: GraphLowering,
+    plan: LXRelayoutPlan,
+    views: dict[tuple[str, str], FinalLXView],
+    *,
+    destination_name: str | None = None,
+) -> str | None:
+    """Validate one complete relayout group after scheduler alignment preview."""
+
+    destination_name = destination_name or plan.destination_name
+    source_views = {
+        view
+        for (_, buffer_name), view in views.items()
+        if buffer_name == plan.source_name
+    }
+    destination_views = {
+        view
+        for (_, buffer_name), view in views.items()
+        if buffer_name == destination_name
+    }
+    if len(source_views) != 1:
+        return f"source users derived {len(source_views)} final views"
+    if len(destination_views) != 1:
+        return f"destination users derived {len(destination_views)} final views"
+    source = next(iter(source_views))
+    destination = next(iter(destination_views))
+
+    if (
+        source.ownership.num_cores != plan.num_cores
+        or destination.ownership.num_cores != plan.num_cores
+    ):
+        return "final view physical core count changed"
+    if source == destination:
+        return "final source and destination views no longer require a relayout"
+    if not _compatible_partitions(
+        source.ownership, destination.ownership, plan.num_cores
+    ):
+        return "final source and destination partitions are not a complete transfer"
+
+    if plan.kind == "gather":
+        classified = _grouped_gather_geometry(
+            source.ownership,
+            destination.ownership,
+            plan.num_cores,
+        )
+        if classified is None:
+            return "final views are not a grouped gather"
+        geometry = classified[2]
+        if _geometry_topology(geometry) != _geometry_topology(plan.group_geometry):
+            return f"final grouped-gather geometry changed: {geometry}"
+    elif plan.kind != "shuffle":
+        return f"unsupported relayout kind {plan.kind}"
+
+    for name, view in (
+        (plan.source_name, source),
+        (destination_name, destination),
+    ):
+        buffer = graph.try_get_buffer(name)
+        if buffer is None:
+            return f"missing final buffer {name}"
+        layout = buffer.get_layout()
+        if not isinstance(layout, FixedTiledLayout):
+            return f"final buffer {name} has no fixed tiled layout"
+        planned_view = (
+            plan.source_view if name == plan.source_name else plan.destination_view
+        )
+        planned_size = tuple(int(extent) for extent in layout.device_layout.device_size)
+        planned_splits = dict(planned_view.work_slice_dims)
+        planned_extents = tuple(
+            math.ceil(extent / int(planned_splits.get(dim, 1)))
+            for dim, extent in enumerate(planned_size)
+            if extent != 1
+        )
+        planned_shape = tuple(sorted(planned_extents[:-1])) + (planned_extents[-1],)
+        if view.slice_shape != planned_shape:
+            return (
+                f"final {name} slice shape {view.slice_shape} differs from planned "
+                f"{planned_shape}"
+            )
+        if view.minimum_footprint_bytes > plan.max_footprint_bytes:
+            return (
+                f"final {name} minimum footprint {view.minimum_footprint_bytes} "
+                f"exceeds planned "
+                f"{plan.max_footprint_bytes}"
+            )
+
+    if plan.source_address is None or plan.destination_address is None:
+        return "relayout group has no committed LX addresses"
+    # The allocator validates disjointness using each concrete buffer size.
+    # Repeating that check with this edge's maximum bound is incorrect for a
+    # source shared by differently sized destinations.
+    return None
 
 
 def _single_write(op: ComputedBuffer, name: str) -> MemoryDep | None:
@@ -465,7 +713,7 @@ def collect_lx_relayout_plans(graph: GraphLowering) -> list[LXRelayoutPlan]:
                         "source ownership cannot be projected to producer"
                     )
 
-        plans_by_destination = {}
+        plans_by_destination: dict[tuple, list[str]] = {}
         if rejection_reason is None:
             source_geometry = source_view.work_slice_dims
             for (

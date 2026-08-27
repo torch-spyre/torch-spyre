@@ -13,6 +13,7 @@
 # limitations under the License.
 
 from dataclasses import dataclass, field
+import math
 from typing import Any, Callable, Self, Sequence, Tuple, Union
 from abc import ABC
 import itertools
@@ -55,7 +56,12 @@ from .core_mapping import (
 )
 from .errors import Unsupported
 from .ir import FixedTiledLayout
-from .scratchpad.lx_relayout import work_division_from_view
+from .scratchpad.lx_relayout import (
+    final_view_from_work_division,
+    final_lx_views,
+    partition_footprint,
+    work_division_from_view,
+)
 from .pass_utils import (
     AlignmentAccess,
     concretize_expr,
@@ -80,6 +86,7 @@ from .op_spec import (
     LoopSpec,
     OpSpec,
     TensorArg,
+    TensorWorkDivision,
     UnimplementedOp as OpSpecUnimplementedOp,
     format_op_spec_list,
     is_lx_relayout_identity,
@@ -577,6 +584,8 @@ class SpyreKernel(Kernel[CSEVariable]):
         ] = {}
         self._alignment_access_by_tensor_arg: dict[int, AlignmentAccess] = {}
         self._alignment_inputs_by_spec: dict[int, AlignmentInputs] = {}
+        self._buffer_name_by_tensor_arg: dict[int, str] = {}
+        self._node_name_by_spec: dict[int, str] = {}
         self.pool_size: int = pool_size
 
     def indirect_var_names(self) -> "frozenset[str] | None":
@@ -848,6 +857,7 @@ class SpyreKernel(Kernel[CSEVariable]):
         self._alignment_access_by_tensor_arg[id(tensor_arg)] = AlignmentAccess(
             tensor.layout.device_layout, tensor.index
         )
+        self._buffer_name_by_tensor_arg[id(tensor_arg)] = name
         if (
             "lx" not in tensor.layout.allocation
             and "hbm_pool" not in tensor.layout.allocation
@@ -1011,7 +1021,61 @@ class SpyreKernel(Kernel[CSEVariable]):
         }
         if op != RESTICKIFY_OP:
             self._alignment_inputs_by_spec[id(op_spec)] = alignment_inputs
+        assert self.current_node is not None
+        self._node_name_by_spec[id(op_spec)] = self.current_node.get_name()
         return op_spec
+
+    def _validate_final_lx_views(self, op_spec: OpSpec) -> None:
+        """Assert codegen reproduced the graph-wide gate's accepted views."""
+
+        cached = final_lx_views(V.graph)
+        if not cached:
+            return
+        node_name = self._node_name_by_spec.get(id(op_spec))
+        if node_name is None:
+            return
+        is_relayout = is_lx_relayout_identity(op_spec.op, op_spec.args)
+        operation_division = None
+        if not is_relayout:
+            assert op_spec.core_id_to_work_slice is not None
+            work_slices = {
+                dim: int(split)
+                for dim, (_, split) in op_spec.iteration_space.items()
+                if int(split) > 1
+            }
+            operation_division = TensorWorkDivision(
+                work_slices,
+                {dim: op_spec.core_id_to_work_slice[dim] for dim in work_slices},
+                num_cores=math.prod(
+                    int(split) for _, split in op_spec.iteration_space.values()
+                ),
+            )
+
+        for arg in op_spec.args:
+            if "lx" not in arg.allocation:
+                continue
+            name = self._buffer_name_by_tensor_arg.get(id(arg))
+            if name is None:
+                raise RuntimeError("LX tensor is missing its codegen buffer identity")
+            expected = cached.get((node_name, name))
+            if expected is None:
+                raise RuntimeError(
+                    f"LX final-view gate has no result for {node_name} reading {name}"
+                )
+            division = arg.work_division if is_relayout else operation_division
+            if division is None:
+                raise RuntimeError(f"LX tensor {name} has no final work division")
+            actual = final_view_from_work_division(
+                division,
+                arg.device_size,
+                arg.device_coordinates,
+                op_spec.iteration_space,
+            )
+            if actual != expected:
+                raise RuntimeError(
+                    f"LX final view changed after the graph-wide gate for "
+                    f"{node_name}:{name}: {actual} != {expected}"
+                )
 
     def remove_kernel_local_buffers(self) -> None:
         """Remove buffers that have a scratchpad or temporary allocation from the kernel's arg list."""
@@ -1292,6 +1356,7 @@ class SpyreKernel(Kernel[CSEVariable]):
                 repeat_info=self._alignment_repeat_info_by_spec.get(id(op_spec)),
                 alignment_inputs=self._alignment_inputs_by_spec.get(id(op_spec)),
             )
+            self._validate_final_lx_views(op_spec)
 
         if _spyre_config.validate_op_specs:
             validate_op_specs(self.op_specs, stage="after_simplification")
