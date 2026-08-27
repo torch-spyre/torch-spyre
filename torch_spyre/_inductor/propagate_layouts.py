@@ -1566,8 +1566,9 @@ def _all_constant_layouts(op: Operation) -> list[SpyreTensorLayout]:
     generic_layout instead (a single default-layout candidate) to avoid
     exponential beam-state growth in loop-unrolled graphs.  This function is
     still used for the SpyreEmptyFallback mutation target path (in-place update
-    ops with no real inputs) where the enumeration is bounded and correct.  It will also be
-    restored for the single-consumer constant case once that optimization lands.
+    ops with no real inputs) where the enumeration is bounded and correct.
+    It will also be restored for the single-consumer constant case once that
+    optimization lands.
     """
     output: FixedLayout = op.get_layout()
     c_size = [concretize_expr(s) for s in output.size]

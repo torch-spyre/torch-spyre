@@ -207,6 +207,11 @@ class AllSameNode(RestickNodeCost):
         output_edge_costs = [
             EdgeCostMap(
                 dep,
+                # Always non-empty: SpyreEmptyFallback.layouts is set by the
+                # SpyreEmptyFallback branch in propagate_layouts before any
+                # mutation writer is processed (topo order guarantee). An empty
+                # list here would cause min_input_cost to return INF for all
+                # beam states with no useful error message.
                 getattr(V.graph.get_buffer(dep.name), "layouts", []),
                 out_layouts,
                 out_dep,
@@ -700,6 +705,16 @@ def beam_global_min_cost(operations: list) -> None:
     At the end, the best state's assignments are committed to the ops.
     """
     operations = _reorder_any_in_nodes(operations)
+    # NOTE: compute_future_min_cost and _compute_last_use both iterate over
+    # op.restick_cost_fn.edge_costs, which on AllSameNode includes co-output
+    # EdgeCostMap entries (the SpyreEmptyFallback buffer dep). This means each
+    # mutation writer appears as a "downstream consumer" of the fallback in the
+    # future-cost and last-use maps. This is safe in practice: co-output edges
+    # have zero cost when STLs match, and SpyreEmptyFallback has all valid STLs
+    # as candidates, so the future-min-cost estimate is never pessimistic in a
+    # way that causes incorrect pruning. Last-use liveness is also correct — the
+    # fallback should stay live until its last writer. A cleaner fix would
+    # exclude co-output deps from the base class edge_costs; cleanup is coming.
     future_min_cost = compute_future_min_cost(operations)
 
     step_of: dict[str, int] = {}
