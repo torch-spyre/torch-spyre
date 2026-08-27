@@ -126,6 +126,12 @@ def _get_prop_args(reads) -> list[PropArg]:
             # Skip 0-d scalar constants — they have no meaningful STL to propagate.
             if isinstance(buf, SpyreConstantFallback) and not layout.size:
                 continue
+            # SpyreEmptyFallback has no device layout until its mutation writers
+            # have run. If it already has .layouts (assigned by the SpyreEmptyFallback
+            # branch below), include it as a normal input so downstream consumers
+            # (e.g. mul reading the mutation target buffer) see the stick constraint.
+            if isinstance(buf, SpyreEmptyFallback) and not hasattr(buf, "layouts"):
+                continue
             if hasattr(buf, "layouts"):
                 res.append(PropArg(arg, layout, list(buf.layouts)))
             else:
@@ -1559,9 +1565,10 @@ def _all_constant_layouts(op: Operation) -> list[SpyreTensorLayout]:
     NOTE: constant-fill ops in the main propagation loop currently use
     generic_layout instead (a single default-layout candidate) to avoid
     exponential beam-state growth in loop-unrolled graphs.  This function is
-    still used for the accumulator fallback path (in-place update ops with no
-    real inputs) where the enumeration is bounded and correct.  It will also be
-    restored for the single-consumer constant case once that optimization lands.
+    still used for the SpyreEmptyFallback mutation target path (in-place update
+    ops with no real inputs) where the enumeration is bounded and correct.
+    It will also be restored for the single-consumer constant case once that
+    optimization lands.
     """
     output: FixedLayout = op.get_layout()
     c_size = [concretize_expr(s) for s in output.size]
@@ -1963,7 +1970,7 @@ def propagate_spyre_tensor_layouts(
                             type(target_buf).__name__,
                         )
                         continue
-                    # SpyreEmptyFallback accumulator has no device layout yet
+                    # SpyreEmptyFallback mutation target has no device layout yet
                     # -- expected, not exceptional; handled just below.
                     logger.debug(
                         "MutationLayoutSHOULDREMOVE target_stl=None: "
@@ -1984,15 +1991,41 @@ def propagate_spyre_tensor_layouts(
                     # layout candidate derivation: it IS the output buffer, not an
                     # independent input.
                     new_value_args = [a for a in all_args if a.dep.name != target_name]
+                    # Build a dep for the SpyreEmptyFallback target so the beam
+                    # search couples all mutation ops writing it via a co-output
+                    # edge. We cannot find it in rw.reads — the mutation target is
+                    # encoded in MutationLayoutSHOULDREMOVE, not in inner_fn, so
+                    # it never appears in get_read_writes().reads. Construct a
+                    # MemoryDep with target_name but same index shape as output_dep.
+                    #
                     if not new_value_args:
-                        # No real inputs — fall back to unconstrained candidates.
-                        candidates = _all_constant_layouts(target_buf)
-                        target_buf.layouts = candidates
-                        op.layouts = candidates
-                        op.restick_cost_fn = AllSameNode.from_args(
-                            all_args, candidates, output_dep, op
+                        # No real tensor inputs: this is a coarse-tile identity fill
+                        # (e.g. coarse_tile_fill writing inf/0 into the accumulator).
+                        # A scalar fill has no stick orientation preference, so use
+                        # AnyInNode and let the real writers (combine, copy) determine
+                        # the STL. Borrow target_buf.layouts so the beam has a non-empty
+                        # candidate list; AnyInNode commits at zero cost regardless.
+                        assert hasattr(target_buf, "layouts"), (
+                            f"SpyreEmptyFallback {target_name!r} has no layouts — "
+                            "expected SpyreEmptyFallback to have layouts set before any "
+                            "mutation op writes it"
                         )
-                    elif (
+                        candidates = target_buf.layouts
+                        op.layouts = candidates
+                        op.restick_cost_fn = AnyInNode.from_args()
+                        continue
+                    # Build a co-output dep for the mutation target so the beam
+                    # couples all mutation ops (that have real inputs) writing it
+                    # to the same STL. The target has all valid STLs as candidates
+                    # so this dep adds no spurious constraint.
+                    target_co_dep = MemoryDep(
+                        name=target_name,
+                        index=output_dep.index,
+                        var_names=output_dep.var_names,
+                        size=output_dep.size,
+                    )
+                    out_deps = [output_dep, target_co_dep]
+                    if (
                         isinstance(op.data, Reduction)
                         and op.data.reduction_type == BATCH_MATMUL_OP
                     ):
@@ -2000,6 +2033,9 @@ def propagate_spyre_tensor_layouts(
                         # read-back). _matmul_layouts derives a single out_stl
                         # deterministically from the target layout and installs its
                         # own FixedInOutNode, so no separate AllSameNode join is needed.
+                        # target_co_dep is intentionally not threaded in: matmul has a
+                        # fixed, deterministic output STL so two BATCH_MATMUL ops writing
+                        # the same SpyreEmptyFallback will always agree.
                         assert len(new_value_args) == 2, (
                             "BATCH_MATMUL_OP mutation op should have exactly "
                             f"two non-target inputs, got {len(new_value_args)} "
@@ -2040,27 +2076,27 @@ def propagate_spyre_tensor_layouts(
                                 f"candidate input layouts; target size="
                                 f"{accum_layout.size}"
                             )
-                        # The target read-back is also a real input whose stick
-                        # must match the output — include all_args so the beam
-                        # search enforces that constraint.
                         op.restick_cost_fn = AllSameNode.from_args(
-                            all_args, candidates, output_dep, op
+                            all_args, candidates, out_deps, op
                         )
                         target_buf.layouts = candidates
                         op.layouts = candidates
                     else:
-                        accum_layout = target_buf.get_layout()
+                        target_layout = target_buf.get_layout()
                         candidates = _multi_arg_pointwise_layouts(
-                            op, accum_layout, output_dep, new_value_args
+                            op, target_layout, output_dep, new_value_args
                         )
-                        # _multi_arg_pointwise_layouts used only new_value_args to
-                        # derive candidates. Rebuild the cost function with all_args
-                        # so the target read-back is also included: its stick must
-                        # match the output at runtime.
-                        op.restick_cost_fn = AllSameNode.from_args(
-                            all_args, candidates, output_dep, op
-                        )
+                        # Propagate candidates forward: the mutation target is
+                        # write-only from this op's perspective (excluded from
+                        # new_value_args), so no read edge carries the layout
+                        # information forward naturally.  Overwrite target_buf.layouts
+                        # so that ops later in topo order that READ the target see
+                        # the narrowed candidate set from this write, not the initial
+                        # wide set assigned at allocation time.
                         target_buf.layouts = candidates
+                        op.restick_cost_fn = AllSameNode.from_args(
+                            all_args, candidates, out_deps, op
+                        )
                         op.layouts = candidates
                     continue
                 rw = op.get_read_writes()
@@ -2147,11 +2183,14 @@ def propagate_spyre_tensor_layouts(
             op.layouts = [generic_layout(op)]
             op.restick_cost_fn = AnyInNode.from_args()
         elif isinstance(op, SpyreEmptyFallback):
-            # Full-buffer placeholder allocated by _allocate_full_buffer when
-            # hint-driven coarse tiling runs pre-stickify.  Treat it like a
-            # constant: assign a single generic STL so downstream ops can read
-            # its layout through _get_prop_args without raising.
-            op.layouts = [generic_layout(op)]
+            # Full-buffer placeholder allocated by _allocate_full_buffer.
+            # Offer all valid STLs so the beam can commit to whichever layout
+            # the mutation writers (fill, combine, copy) require.  The co-output
+            # dep on each writer enforces that the committed STL matches the
+            # writer's output STL — so the beam picks the right one rather than
+            # defaulting to generic_layout (stick) and forcing infeasibility for
+            # flat writers.
+            op.layouts = _all_constant_layouts(op)
             op.restick_cost_fn = AnyInNode.from_args()
         elif isinstance(op, DeviceCopy):
             # spyre -> cpu: the output is a host tensor and carries no Spyre

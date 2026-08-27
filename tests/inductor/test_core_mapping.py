@@ -138,9 +138,6 @@ def test_planner_and_sdsc_use_the_same_mapping(monkeypatch, op, reduction_contig
     op_spec = _bmm_op_spec(op)
     dims = tuple(op_spec.iteration_space)
     splits = dict(zip(dims, (2, 4, 4)))
-    monkeypatch.setattr(
-        pass_utils_module, "apply_splits_from_index_coeff", lambda *_: splits
-    )
     prep = pass_utils_module._ViewPrep(
         iter_space=op_spec.iteration_space,
         write_index=dims[0],
@@ -157,7 +154,7 @@ def test_planner_and_sdsc_use_the_same_mapping(monkeypatch, op, reduction_contig
         is_matmul=pass_utils_module._is_matmul_op(FakeComputedBuffer(op)),
     )
     planner_view, _, representable = pass_utils_module._per_core_view_from_prep(
-        prep, ({1: 2, 2: 4}, {3: 4})
+        prep, splits, {dims[2]: 4}
     )
 
     sdsc_spec, renamed = parse_op_spec(op_spec)
@@ -167,3 +164,30 @@ def test_planner_and_sdsc_use_the_same_mapping(monkeypatch, op, reduction_contig
     }
     assert representable
     assert dict(planner_view.core_to_slot) == sdsc_output_mapping
+
+
+def test_flattened_iteration_span_is_not_a_single_axis_view():
+    heads, flat = sympy.symbols("heads flat")
+    prep = pass_utils_module._ViewPrep(
+        iter_space={heads: 16, flat: 512},
+        write_index=512 * heads + flat,
+        read_index=512 * heads + flat,
+        dep_coeff={heads: 512, flat: 1},
+        device_size=[2, 1, 1, 1, 4, 16, 64],
+        stride_map=[256, -1, -1, -1, 64, 512, 1],
+        elems_per_stick=64,
+        device_stride_to_dim={256: 0, 64: 4, 512: 5, 1: 6},
+        stick_host_stride=1,
+        num_stick_dim=4,
+        num_stick=4,
+        num_stick_stride=64,
+        is_matmul=False,
+    )
+
+    view, partial, representable = pass_utils_module._per_core_view_from_prep(
+        prep, ({512: 16, 1: 2}, {})
+    )
+
+    assert not representable
+    assert not partial
+    assert not view.work_slice_dims

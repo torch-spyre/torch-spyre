@@ -14,19 +14,22 @@
 
 """Unit tests for splits_by_index_coeff and apply_splits_from_index_coeff.
 
-These functions encode pre-scheduler core-division splits so they can be
-recovered after the scheduler renames iteration-space symbols.  The key
-invariant: the coefficient of a symbol in a tensor's flat index expression
-is determined by the layout strides, which are fixed across the
-pre-scheduling / codegen boundary.
+These functions encode final scheduler-boundary core-division splits so they
+can be recovered after the scheduler renames iteration-space symbols. The key
+invariant: the coefficient of a symbol in a tensor's flat index expression is
+determined by layout strides, which are fixed across that boundary.
 """
 
 import sympy
+from unittest.mock import patch
 
 import torch
+from torch._inductor.dependencies import MemoryDep
 from torch.testing._internal.common_utils import run_tests, TestCase
+from torch_spyre._inductor.op_spec import TensorWorkDivision
 from torch_spyre._inductor.pass_utils import (
     apply_splits_from_index_coeff,
+    finalize_work_division_for_scheduler,
     splits_by_index_coeff,
 )
 
@@ -216,6 +219,38 @@ class TestItSpaceSplits(TestCase):
 
         recovered = apply_splits_from_index_coeff(stored, s0, s0, {s0: 8})
         self.assertEqual(recovered, {s0: 1})
+
+    def test_scheduler_transport_warns_and_uses_last_axis_for_collision(self):
+        class Op:
+            def __init__(self):
+                self.op_it_space_splits = None
+                write = MemoryDep("out", 8 * i0 + 8 * i1, (i0, i1), (8, 8))
+                self.read_writes = type(
+                    "ReadWrites", (), {"writes": [write], "reads": []}
+                )()
+                self.iteration_space_ownership = TensorWorkDivision(
+                    {i0: 2, i1: 4}, {i0: sympy.Integer(0), i1: sympy.Integer(0)}
+                )
+
+            def get_name(self):
+                return "collision"
+
+            def get_read_writes(self):
+                return self.read_writes
+
+        op = Op()
+        graph = type("Graph", (), {"operations": [op]})()
+        with self.assertLogs("spyre.inductor.pass_utils", "WARNING") as logs:
+            with patch(
+                "torch_spyre._inductor.pass_utils.iteration_space_from_op",
+                return_value={i0: 8, i1: 8},
+            ):
+                finalize_work_division_for_scheduler(graph)
+
+        self.assertEqual(len(logs.records), 1)
+        self.assertIn("lossy work-division scheduler transport", logs.output[0])
+        self.assertEqual(op.op_it_space_splits, ({8: 4}, {}))
+        self.assertFalse(hasattr(op, "iteration_space_ownership"))
 
 
 if __name__ == "__main__":

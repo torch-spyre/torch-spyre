@@ -34,11 +34,12 @@ from torch._inductor.ir import (
 )
 from torch._inductor.ops_handler import WrapperHandler
 from torch._inductor.scheduler import SchedulerNode
+from torch._inductor.graph import GraphLowering
 from torch._inductor.dependencies import MemoryDep, ReadWrites, StarDep, is_indirect
 from torch._inductor.virtualized import V
 from torch_spyre._C import SpyreTensorLayout, get_elem_in_stick
 from torch_spyre._inductor.errors import Unsupported
-from torch_spyre._inductor.op_spec import IndirectAccess
+from torch_spyre._inductor.op_spec import IndirectAccess, TensorWorkDivision
 
 from . import config
 from .core_mapping import core_to_slice_mapping
@@ -1480,24 +1481,156 @@ def splits_by_index_coeff(
     write_index: sympy.Expr,
     read_index: sympy.Expr,
 ) -> ItSpaceSplits:
-    """Encode a symbol→split dict as a pair of coeff-keyed dicts.
+    """Encode a symbol→split dict as scheduler coefficient transport.
 
-    Output dims (those present in write_index) are encoded using their
-    coefficient in write_index.  Reduction dims (absent from write_index) are
-    encoded using their coefficient in read_index.  The two dicts form separate
-    namespaces so their keys never collide, even when output and reduction dims
-    happen to share the same stride value in different tensors.
+    This is intentionally a boundary representation: pre-scheduler passes keep
+    symbol-keyed ownership.  Coefficients are stable across scheduler renaming,
+    but are not generally unique.  In iteration-space order, the last symbol
+    for a coefficient wins, matching the legacy dictionary behavior.
 
     Only non-unity splits are stored; 1 is the default on the apply side.
     """
     skip = lambda v: v <= 1  # noqa: E731
     output_splits = _coeff_splits_from_index(splits, write_index, skip=skip)
-    # Reduction splits: symbols with coeff==0 in write_index but coeff!=0 in read_index
     reduction_only = {
         sym: val for sym, val in splits.items() if write_index.coeff(sym) == 0
     }
     reduction_splits = _coeff_splits_from_index(reduction_only, read_index, skip=skip)
     return output_splits, reduction_splits
+
+
+def make_iteration_space_ownership(
+    op: Operation, splits: dict[sympy.Symbol, int]
+) -> TensorWorkDivision:
+    """Return complete symbol-keyed ownership for ``op``'s iteration space."""
+    iter_space = iteration_space_from_op(op)
+    work_slices = {sym: int(splits.get(sym, 1)) for sym in iter_space}
+    dim_splits = tuple(work_slices.values())
+    contiguous_dim = (
+        len(dim_splits) - 1
+        if (
+            isinstance(op, ComputedBuffer)
+            and isinstance(op.data, Reduction)
+            and op.data.reduction_type in MATMUL_REDUCTION_OPS
+            and config.core_id_k_fast_emission
+        )
+        else None
+    )
+    # Keep the selected mapping with the splits for the planned codegen handoff.
+    # Scheduler still reconstructs it from coefficient transport today; meanwhile
+    # retaining it lets the boundary diagnose aliases with different ownership.
+    return TensorWorkDivision(
+        work_slices,
+        core_to_slice_mapping(
+            tuple(iter_space),
+            dim_splits,
+            math.prod(dim_splits),
+            contiguous_dim=contiguous_dim,
+        ),
+    )
+
+
+def commit_iteration_space_ownership(
+    op: Operation, splits: dict[sympy.Symbol, int]
+) -> None:
+    """Commit pre-scheduler symbol-keyed split and core ownership."""
+    op.iteration_space_ownership = make_iteration_space_ownership(op, splits)
+
+
+def select_work_division_transport_indexes(
+    op: Operation, rw: ReadWrites, it_space: dict[sympy.Symbol, sympy.Expr]
+) -> tuple[sympy.Expr, sympy.Expr]:
+    """Choose the write/read indexes for legacy coefficient-keyed transport.
+
+    Pre-scheduler work division is keyed by iteration symbols, but Scheduler's
+    ``op_it_space_splits`` transport keys output splits by a write-index
+    coefficient and reduction-only splits by a read-index coefficient. Encoding
+    and later decoding must select the same indexes: changing the read can map a
+    reduction symbol to a different coefficient.
+
+    The write reference is the first ``MemoryDep`` write. Normally the read
+    reference is the first non-indirect ``MemoryDep`` read, falling back to the
+    first memory read and then the write for read-free operations. ``keep_by_index``
+    operations instead choose the read whose free symbols overlap the most with
+    the iteration symbols absent from the write, because that read best exposes
+    their reduction axes.
+
+    Raises:
+        Unsupported: if the operation has no ``MemoryDep`` write and therefore
+            cannot be represented by this transport.
+    """
+    write = next((d for d in rw.writes if isinstance(d, MemoryDep)), None)
+    if write is None:
+        raise Unsupported(f"{op.get_name()} has no MemoryDep write for work division")
+    write_index = write.index
+    if is_keep_by_index(op):
+        reduction_vars = set(it_space) - write_index.free_symbols
+        read_index = read_with_max_reduction_overlap(rw.reads, reduction_vars)
+        if read_index is not None:
+            return write_index, read_index
+    read = next(
+        (d for d in rw.reads if isinstance(d, MemoryDep) and not d.is_indirect()),
+        next((d for d in rw.reads if isinstance(d, MemoryDep)), None),
+    )
+    return write_index, read.index if read is not None else write_index
+
+
+def finalize_work_division_for_scheduler(graph: GraphLowering) -> None:
+    """Convert committed symbol ownership to legacy scheduler split transport.
+
+    Coefficient keys cannot distinguish every symbol.  Preserve the established
+    iteration-order last-wins behavior, but warn once per affected operation.
+    """
+    for op in graph.operations:
+        ownership = getattr(op, "iteration_space_ownership", None)
+        if ownership is None:
+            continue
+        rw = op_read_writes(op)
+        try:
+            write_index, read_index = select_work_division_transport_indexes(
+                op, rw, iteration_space_from_op(op)
+            )
+        except Unsupported:
+            continue
+        collisions: list[str] = []
+        for label, index, symbols in (
+            ("output", write_index, ownership.work_slices),
+            (
+                "reduction",
+                read_index,
+                {
+                    sym: split
+                    for sym, split in ownership.work_slices.items()
+                    if write_index.coeff(sym) == 0
+                },
+            ),
+        ):
+            seen: dict[sympy.Expr, tuple[sympy.Symbol, int, sympy.Expr]] = {}
+            for sym, split in symbols.items():
+                if split <= 1:
+                    continue
+                coeff = index.coeff(sym)
+                if coeff == 0:
+                    collisions.append(f"{label}:{sym}=absent")
+                    continue
+                value = (sym, split, ownership.core_id_to_work_slice[sym])
+                if coeff in seen and seen[coeff][1:] != value[1:]:
+                    collisions.append(
+                        f"{label}: coeff {coeff} {seen[coeff][0]}={seen[coeff][1:]} "
+                        f"-> {sym}={value[1:]}"
+                    )
+                seen[coeff] = value
+        if collisions:
+            logger.warning(
+                "lossy work-division scheduler transport for %s; using "
+                "iteration-order last-axis-wins: %s",
+                op.get_name(),
+                "; ".join(collisions),
+            )
+        op.op_it_space_splits = splits_by_index_coeff(
+            ownership.work_slices, write_index, read_index
+        )
+        delattr(op, "iteration_space_ownership")
 
 
 def apply_splits_from_index_coeff(
@@ -2282,13 +2415,11 @@ def _prepare_per_core_view(
 
 
 def _per_core_view_from_prep(
-    prep: Optional[_ViewPrep], coeff_splits: tuple[dict, dict]
+    prep: Optional[_ViewPrep],
+    splits: dict[sympy.Symbol, int] | tuple[dict, dict],
+    reduction_splits: Optional[dict[sympy.Symbol, int]] = None,
 ) -> tuple[PerCoreView, bool, bool]:
-    """Evaluate a per-core view for one candidate division from a precomputed
-    ``_ViewPrep``. This is the only part that depends on ``coeff_splits``.
-
-    See ``_per_core_view_on_buf`` for the meaning of the returned tuple.
-    """
+    """Evaluate a precomputed view for symbol splits or scheduler transport."""
     # 3-tuple: (view, has_partial_reduction, representable). ``representable`` is
     # False only on the give-up returns below (a split that slices this buffer
     # can't be placed on a device dim); cross-op view comparisons must treat it
@@ -2297,15 +2428,22 @@ def _per_core_view_from_prep(
 
     # No real split -> whole-buffer view, representable regardless of layout. Must
     # precede the ``prep is None`` guard to match the original ordering.
-    if not any(n > 1 for d in coeff_splits for n in d.values()):
-        return (PerCoreView(work_slice_dims=(), core_to_slot=()), False, True)
-    if prep is None:
-        return unrepresentable
-
-    # Step 1: recover {iter-symbol: split} from the candidate coeff_splits.
-    per_sym = apply_splits_from_index_coeff(
-        coeff_splits, prep.write_index, prep.read_index, prep.iter_space
-    )
+    if isinstance(splits, tuple):
+        if not any(n > 1 for d in splits for n in d.values()):
+            return (PerCoreView(work_slice_dims=(), core_to_slot=()), False, True)
+        if prep is None:
+            return unrepresentable
+        per_sym = apply_splits_from_index_coeff(
+            splits, prep.write_index, prep.read_index, prep.iter_space
+        )
+        has_partial_reduction = any(n > 1 for n in splits[1].values())
+    else:
+        if not any(n > 1 for n in splits.values()):
+            return (PerCoreView(work_slice_dims=(), core_to_slot=()), False, True)
+        if prep is None:
+            return unrepresentable
+        per_sym = {sym: int(splits.get(sym, 1)) for sym in prep.iter_space}
+        has_partial_reduction = any(n > 1 for n in (reduction_splits or {}).values())
 
     # Step 2: keep splits that actually slice this buffer, keyed by their host
     # stride on buf (precomputed in ``dep_coeff``). host_stride == 0 means the
@@ -2313,7 +2451,6 @@ def _per_core_view_from_prep(
     # K-split's output dep) and is dropped from the geometry. The
     # has_partial_reduction flag is op-level -- set whenever the op has any
     # reduction-axis split -- and is independent of which dep we're inspecting.
-    has_partial_reduction = any(n > 1 for n in coeff_splits[1].values())
     splits_by_stride: dict[int, tuple[int, "sympy.Symbol"]] = {}
     for sym, split in per_sym.items():
         host_stride = prep.dep_coeff.get(sym, 0)
@@ -2323,6 +2460,7 @@ def _per_core_view_from_prep(
 
     device_size = prep.device_size
     stride_map = prep.stride_map
+    elems_per_stick = prep.elems_per_stick
     device_stride_to_dim = prep.device_stride_to_dim
     stick_host_stride = prep.stick_host_stride
     num_stick_dim = prep.num_stick_dim
@@ -2356,6 +2494,25 @@ def _per_core_view_from_prep(
         dev_dim = device_stride_to_dim.get(h)
         if h == stick_host_stride:
             dev_dim = num_stick_dim
+        # A lower-rank reshape can flatten outer axes into the stickified axis.
+        # Mapping that loop only by its host-stride then falsely attributes the
+        # split to num_stick_dim. The full physical capacity of that host axis
+        # is known exactly, so an iteration spanning beyond it proves compound
+        # ownership that PerCoreView cannot express. Keep the buffer in HBM.
+        if h == stick_host_stride and dev_dim is not None:
+            iter_extent_expr = iter_space[sym]
+            if isinstance(iter_extent_expr, tuple):
+                iter_extent_expr = iter_extent_expr[0]
+            iter_extent = concretize_expr(iter_extent_expr)
+            stickified_extent = num_stick * elems_per_stick
+            if iter_extent > stickified_extent:
+                logger.debug(
+                    f"iteration {sym} extent {iter_extent} spans beyond mapped "
+                    f"stickified dim {dev_dim} extent {stickified_extent}; "
+                    f"returning empty_view"
+                )
+                return unrepresentable
+
         # Multi-stick-stride rescue: a consumer view subdivides the stickified
         # axis at k sticks per step (h = k * num_stick_stride). Only safe when
         # split*k fully covers num_stick_dim — partial coverage would
@@ -2448,7 +2605,7 @@ def _per_core_view_on_buf(
     callers act on it only for write-deps. ``representable`` is False only on the
     give-up cases (a split that slices this buffer can't be placed on a device
     dim), which cross-op comparisons must treat as a non-match. Pass `cache` to
-    memoize, keyed by (op name, op.op_it_space_splits, dep, buf_name).
+    memoize, keyed by (op name, symbol-keyed splits, dep, buf_name).
 
     The op name is part of the key because the result also depends on op-derived
     write_index / read_index / iter_space / matmul-ness, not just (splits, dep,
@@ -2458,33 +2615,27 @@ def _per_core_view_on_buf(
     ``ScratchpadAllocator._cd_parent_matches`` and ``get_ncores_for_buffers``
     share one cache across a producer and consumer of the same buffer).
     """
-    coeff_splits: tuple[dict, dict] = getattr(op, "op_it_space_splits", ({}, {}))
+    ownership = getattr(op, "iteration_space_ownership", None)
+    splits = ownership.work_slices if ownership is not None else {}
+    key = None
     if cache is not None:
-        # dicts aren't hashable; freeze each into a frozenset of items so
-        # the key is hashable and order-independent.
-        out, red = coeff_splits
-        key = (
-            op.get_name(),
-            frozenset(out.items()),
-            frozenset(red.items()),
-            dep,
-            buf_name,
-        )
+        key = (op.get_name(), frozenset(splits.items()), dep, buf_name)
         hit = cache.get(key)
         if hit is not None:
             return hit
 
-    # No real split -> whole-buffer view, representable. Short-circuit before
-    # ``_prepare_per_core_view`` touches ``next(iter(rw.writes)).index``, which a
-    # StarDep write lacks.
-    if not any(n > 1 for d in coeff_splits for n in d.values()):
+    if not any(n > 1 for n in splits.values()):
         result = (PerCoreView(work_slice_dims=(), core_to_slot=()), False, True)
         if cache is not None:
             cache[key] = result
         return result
 
     prep = _prepare_per_core_view(op, dep, buf_name)
-    result = _per_core_view_from_prep(prep, coeff_splits)
+    write_index = prep.write_index if prep is not None else sympy.S.Zero
+    reduction_splits = {
+        sym: split for sym, split in splits.items() if write_index.coeff(sym) == 0
+    }
+    result = _per_core_view_from_prep(prep, splits, reduction_splits)
     if cache is not None:
         cache[key] = result
     return result

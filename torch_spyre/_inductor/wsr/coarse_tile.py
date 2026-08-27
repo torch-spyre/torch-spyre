@@ -110,7 +110,7 @@ from ..pass_utils import (
     indirect_sizes_from_op,
 )
 from ..ir import FixedTiledLayout, SpyreConstantFallback, _resize_device_layout
-from .tile import compute_tile_index, compute_tile_stride
+from .tile import compute_tile_index, compute_tile_stride, decompose_index_for_tiling
 
 logger = get_inductor_logger("coarse_tile")
 
@@ -1051,6 +1051,119 @@ def _tiled_dims_for_dep(
     ]
 
 
+def _predivision_unit_steps_for_dep(
+    dep: MemoryDep,
+    tiled_dims_per_level: list[list[tuple[int, Expr]]],
+    ir_node: ComputedBuffer,
+) -> list[list[tuple[int, Expr, Expr]]]:
+    """Keep address steps for tiled dimensions that will be squeezed away.
+
+    At planning time the original dimension and its index coefficient still
+    exist. After division, a one-element expert tile has neither, so the
+    address step cannot be reconstructed reliably from the smaller view.
+    """
+    raw_to_squeezed = _raw_to_squeezed_pos(ir_node)
+    unit_dims = {
+        dim for level in tiled_dims_per_level for dim, extent in level if extent == 1
+    }
+    result: list[list[tuple[int, Expr, Expr]]] = []
+    for level in tiled_dims_per_level:
+        steps: list[tuple[int, Expr, Expr]] = []
+        for dim, extent in level:
+            if dim not in unit_dims:
+                continue
+            squeezed_dim = raw_to_squeezed.get(dim)
+            if squeezed_dim is None:
+                continue
+            symbol = sympy_index_symbol(f"d{squeezed_dim}")
+            stride = dep.index.coeff(symbol)
+            if stride != 0:
+                steps.append((dim, stride, extent))
+        result.append(steps)
+    return result
+
+
+def _capture_predivision_unit_steps(
+    operations: list[Operation],
+    plan: dict[int, CoarseTileInfo],
+) -> dict[
+    int,
+    tuple[tuple[tuple[tuple[int, Expr, Expr], ...], ...], ...],
+]:
+    """Capture size-one source steps without stamping them onto operations.
+
+    This runs while the original read indexes still contain every dimension.
+    The result is deliberately local to the Pass-1 read-copy planner: after
+    division, ``_plan_read_copies`` transfers only the selected sizing read's
+    fact into its immutable ``ReadCopyEntry``.  General ``CoarseTileInfo`` and
+    the transformed IR never carry this temporary observation.
+    """
+
+    result: dict[
+        int,
+        tuple[tuple[tuple[tuple[int, Expr, Expr], ...], ...], ...],
+    ] = {}
+    for op in operations:
+        if not isinstance(op, ComputedBuffer):
+            continue
+        info = plan.get(id(op))
+        if info is None:
+            continue
+        read_deps = [
+            dep for dep in op.get_read_writes().reads if isinstance(dep, MemoryDep)
+        ]
+        result[id(op)] = tuple(
+            tuple(
+                tuple(level)
+                for level in _predivision_unit_steps_for_dep(dep, tiled_dims, op)
+            )
+            for dep, tiled_dims in zip(read_deps, info.tiled_dims_per_read)
+        )
+    return result
+
+
+def _select_unit_steps(
+    *,
+    op_name: str,
+    dep_name: str,
+    dim: int,
+    planned: list[list[tuple[Expr, Expr]]] | None,
+    legacy: list[list[tuple[Expr, Expr]]],
+) -> list[list[tuple[Expr, Expr]]]:
+    """Use the pre-division fact when present; retain legacy as a check."""
+    if planned is None:
+        return legacy
+
+    def equivalent() -> bool:
+        if len(planned) != len(legacy):
+            return False
+        return all(
+            len(planned_level) == len(legacy_level)
+            and all(
+                sympy.simplify(planned_stride - legacy_stride) == 0
+                and sympy.simplify(planned_extent - legacy_extent) == 0
+                for (planned_stride, planned_extent), (
+                    legacy_stride,
+                    legacy_extent,
+                ) in zip(planned_level, legacy_level)
+            )
+            for planned_level, legacy_level in zip(planned, legacy)
+        )
+
+    if any(legacy) and not equivalent():
+        logger.warning(
+            "coarse_tile: pre-division unit step for %s read %s dim %s "
+            "disagrees with legacy reconstruction (planned=%s legacy=%s); "
+            "using the pre-division plan",
+            op_name,
+            dep_name,
+            dim,
+            planned,
+            legacy,
+        )
+    return planned
+
+
 def _check_matmul_broadcast_batch_tiling(
     op: ComputedBuffer,
     read_deps: list[MemoryDep],
@@ -1718,6 +1831,13 @@ def _coarse_tile_common(
     # recomputed below in the transformation loop and overwrites
     # info.loop_group_id via _apply_plan before it's ever read back out.
     plan = plan_coarse_tile_groups(operations, groups)
+    # A source dimension tiled to extent one disappears when _apply_plan
+    # divides the operation.  Capture that one fact now, but keep it outside
+    # CoarseTileInfo and the IR: Pass 1 is its only consumer and will attach
+    # the selected read's value to the corresponding ReadCopyEntry.
+    predivision_unit_steps_by_op = (
+        _capture_predivision_unit_steps(operations, plan) if run_read_copies else {}
+    )
 
     # Planning continued: decide every op's propagation kind (loop-internal
     # / copy-out / reduction) with zero mutation, consumed by Pass 1/2/3
@@ -1745,7 +1865,11 @@ def _coarse_tile_common(
     # run_read_copies is False (the post-stickify call site, where layout
     # propagation already ran and a read-copy buys nothing).
     if run_read_copies:
-        read_copy_plans = _plan_read_copies(operations, retiled_infos_by_group)
+        read_copy_plans = _plan_read_copies(
+            operations,
+            retiled_infos_by_group,
+            predivision_unit_steps_by_op,
+        )
         _insert_all_read_copy_ops(operations, read_copy_plans)
 
     # Pass 2: reduction machinery (accumulator/fill/combine), using each
@@ -2823,9 +2947,12 @@ def _rescale_index(
 def _insert_one_read_copy(
     sizing_op: ComputedBuffer,
     dep: MemoryDep,
+    sizing_read_index: int,
     copy_name: str,
     operations: list[Operation],
     insert_before_op: Operation,
+    *,
+    predivision_unit_steps: tuple[tuple[tuple[int, Expr, Expr], ...], ...] = (),
 ) -> str:
     """Build and insert one tile-sized copy op for a single full-buffer read.
 
@@ -3164,6 +3291,14 @@ def _insert_one_read_copy(
     # SpyreKernel._general_tile_advance's positional dep-index lookup —
     # a semantic mismatch, not merely a magnitude one.
     sizing_op_info = sizing_op.loop_info  # type: ignore[attr-defined]
+    dep_idx = sizing_read_index
+    planned_unit_steps_by_dim: dict[int, list[list[tuple[Expr, Expr]]]] = {}
+    for level_idx, level in enumerate(predivision_unit_steps):
+        for dim, stride, extent in level:
+            per_level = planned_unit_steps_by_dim.setdefault(
+                dim, [[] for _ in sizing_op_info.loop_count]
+            )
+            per_level[level_idx].append((stride, extent))
     copy_ranges = list(copy_data.ranges)
     # sizing_op_info.loop_tiled_dims's dim keys are raw positional indices
     # into sizing_op.data.ranges (see CoarseTileInfo's docstring), which
@@ -3185,10 +3320,26 @@ def _insert_one_read_copy(
     read_level_extents: list[dict[int, Expr]] = [
         {} for _ in sizing_op_info.loop_tiled_dims
     ]
-    squeezed_advance: list[list[tuple[Expr, Expr]]] = [
-        [] for _ in sizing_op_info.loop_tiled_dims
-    ]
+    squeezed_advance: list[list[tuple[Expr, Expr]]] = (
+        [list(level) for level in sizing_op_info.squeezed_advance_per_read[dep_idx]]
+        if dep_idx < len(sizing_op_info.squeezed_advance_per_read)
+        else [[] for _ in sizing_op_info.loop_tiled_dims]
+    )
     for d in {d for level in sizing_op_info.loop_tiled_dims for d in level}:
+        if d in planned_unit_steps_by_dim and d in squeeze_pos:
+            # A captured unit-tile dim should have been squeezed out by
+            # division. Keep the captured fact authoritative and make this
+            # unexpected legacy shape visible.
+            selected_steps: list[list[tuple[Expr, Expr]]] = _select_unit_steps(
+                op_name=sizing_op.get_name(),
+                dep_name=dep.name,
+                dim=d,
+                planned=planned_unit_steps_by_dim[d],
+                legacy=[],
+            )
+            for level_idx, step_level in enumerate(selected_steps):
+                squeezed_advance[level_idx].extend(step_level)
+            continue
         levels_tiling_d = [
             i for i, dims in enumerate(sizing_op_info.loop_tiled_dims) if d in dims
         ]
@@ -3277,12 +3428,23 @@ def _insert_one_read_copy(
                 and len(leftover_sizes) == 1
                 and leftover_sizes[0] == d_full_size
             )
-            if not dep_has_dim_d:
-                continue
-            running = sympy.Integer(1)
-            for level_idx in reversed(levels_tiling_d):
-                squeezed_advance[level_idx].append((host_stride, running))
-                running = running * sizing_op_info.loop_count[level_idx]
+            legacy_steps: list[list[tuple[Expr, Expr]]] = [
+                [] for _ in sizing_op_info.loop_count
+            ]
+            if dep_has_dim_d:
+                running = sympy.Integer(1)
+                for level_idx in reversed(levels_tiling_d):
+                    legacy_steps[level_idx].append((host_stride, running))
+                    running = running * sizing_op_info.loop_count[level_idx]
+            selected_steps = _select_unit_steps(
+                op_name=sizing_op.get_name(),
+                dep_name=dep.name,
+                dim=d,
+                planned=planned_unit_steps_by_dim.get(d),
+                legacy=legacy_steps,
+            )
+            for level_idx, step_level in enumerate(selected_steps):
+                squeezed_advance[level_idx].extend(step_level)
             continue
         # The dict key must be a raw positional index into copy_buf's own
         # data.ranges (what SpyreKernel._host_dim_to_index_symbol will
@@ -3449,7 +3611,8 @@ def _patch_consumer_to_read_copy(
     # read must be zeroed (dim omitted, see _fixed_level_extents).
     new_loop_info = new_op.loop_info  # type: ignore[attr-defined]
     new_reads = [r for r in new_op.get_read_writes().reads if isinstance(r, MemoryDep)]
-    if new_loop_info.tiled_dims_per_read:
+    new_tiled_dims_per_read = new_loop_info.tiled_dims_per_read
+    if new_tiled_dims_per_read:
         assert len(new_reads) == len(new_loop_info.tiled_dims_per_read), (
             f"_patch_consumer_to_read_copy: positional mismatch between "
             f"new_op.get_read_writes().reads ({len(new_reads)} entries) and "
@@ -3467,9 +3630,29 @@ def _patch_consumer_to_read_copy(
             )
             for read_dep, per_level in zip(new_reads, new_loop_info.tiled_dims_per_read)
         ]
-        new_op.loop_info = dataclasses.replace(  # type: ignore[attr-defined]
-            new_loop_info, tiled_dims_per_read=new_tiled_dims_per_read
+
+    new_squeezed_advance_per_read = new_loop_info.squeezed_advance_per_read
+    if new_squeezed_advance_per_read:
+        assert len(new_reads) == len(new_squeezed_advance_per_read), (
+            "_patch_consumer_to_read_copy: positional mismatch between "
+            f"new_op.get_read_writes().reads ({len(new_reads)} entries) and "
+            "new_loop_info.squeezed_advance_per_read "
+            f"({len(new_squeezed_advance_per_read)} entries)"
         )
+        new_squeezed_advance_per_read = [
+            (
+                [[] for _ in new_loop_info.loop_count]
+                if read_dep.name == copy_name
+                else per_level
+            )
+            for read_dep, per_level in zip(new_reads, new_squeezed_advance_per_read)
+        ]
+
+    new_op.loop_info = dataclasses.replace(  # type: ignore[attr-defined]
+        new_loop_info,
+        tiled_dims_per_read=new_tiled_dims_per_read,
+        squeezed_advance_per_read=new_squeezed_advance_per_read,
+    )
 
 
 def _plan_read_copies(
@@ -3477,6 +3660,11 @@ def _plan_read_copies(
     retiled_infos_by_group: list[
         tuple[tuple[int, ...], list[Operation], dict[str, "_RetiledBufferInfo"]]
     ],
+    predivision_unit_steps_by_op: dict[
+        int,
+        tuple[tuple[tuple[tuple[int, Expr, Expr], ...], ...], ...],
+    ]
+    | None = None,
 ) -> dict[tuple[int, ...], ReadCopyPlan]:
     """Plan Pass 1's read-copy sharing, with zero mutation.
 
@@ -3495,6 +3683,7 @@ def _plan_read_copies(
     holds before _apply_plan runs for that op's group.
     """
     op_position = {op.get_operation_name(): i for i, op in enumerate(operations)}
+    predivision_unit_steps_by_op = predivision_unit_steps_by_op or {}
     plans: dict[tuple[int, ...], ReadCopyPlan] = {}
 
     for stamped_group_id, group_ops, _retiled_infos in retiled_infos_by_group:
@@ -3563,15 +3752,29 @@ def _plan_read_copies(
                 f"coarse_tile_read_copy_{group_tag}_{key[0]}_{n}"
             )
             assert copy_name.isidentifier(), f"invalid copy buffer name: {copy_name!r}"
+            sizing_reads = [
+                read
+                for read in sizing_op.get_read_writes().reads
+                if isinstance(read, MemoryDep)
+            ]
+            sizing_read_index = sizing_reads.index(sizing_dep)
+            sizing_steps = predivision_unit_steps_by_op.get(id(sizing_op), ())
+            predivision_unit_steps = (
+                sizing_steps[sizing_read_index]
+                if sizing_read_index < len(sizing_steps)
+                else ()
+            )
             entries.append(
                 ReadCopyEntry(
                     copy_name=copy_name,
                     dep=sizing_dep,
                     insert_before_op_name=sizing_op.get_operation_name(),
                     sizing_op_name=sizing_op.get_operation_name(),
+                    sizing_read_index=sizing_read_index,
                     consumer_op_names=tuple(
                         op.get_operation_name() for op, _dep in op_deps
                     ),
+                    predivision_unit_steps=predivision_unit_steps,
                 )
             )
         if entries:
@@ -3606,9 +3809,11 @@ def _insert_all_read_copy_ops(
             new_copy_name = _insert_one_read_copy(
                 sizing_op,
                 entry.dep,
+                entry.sizing_read_index,
                 entry.copy_name,
                 operations,
                 insert_before_op=insert_before_op,
+                predivision_unit_steps=entry.predivision_unit_steps,
             )
             for consumer_name in entry.consumer_op_names:
                 consumer = name_to_op[consumer_name]
@@ -4366,6 +4571,56 @@ def _consumer_own_dim_symbol(
     return sympy_index_symbol(f"{prefix}{mapped}")
 
 
+def _index_already_at_new_scale(
+    index: Expr, loop_syms: set, info: "_RetiledBufferInfo"
+) -> bool:
+    """Return True when index's atom coefficients already match new_stride.
+
+    A consumer in the same tiling group as a retiled buffer can be resynced
+    (by name) to a *replacement* ComputedBuffer object spliced in by Pass
+    1/2/3 after ``_apply_plan`` already ran -- see _coarse_tile_common's
+    by-name resync comment above its ``_patch_retiled_load_indexes`` call.
+    That replacement's inner_fn may have been retraced against the
+    producer's already-mutated (new_stride) layout, in which case its load
+    index is already correct and must not be decomposed against old_stride
+    again -- doing so silently produces a wrong, merely plausible-looking
+    index (two dims' coefficients can collide under old_stride's pairing
+    even though the input was never stale -- see
+    test_copy_running_max_4d_H4_Lq4).
+
+    Detected by comparing the *set* of each atom's raw coefficient (before
+    any tile-offset decomposition) against the set of old_stride vs.
+    new_stride values for this buffer's real (non-irregular) dimensions.
+    Each atom's coefficient is exactly one dimension's stride value in
+    whatever scale the trace used -- a single loop variable that
+    legitimately spans multiple dims (the "diagonal" case handled by
+    compute_tile_offset's divmod chain, e.g. test_compute_tile_index_2d_diagonal)
+    produces one atom whose coefficient is a *combined* value that matches
+    neither set exactly, so this check only ever fires on the genuine
+    already-new-scale case, never on a legitimate diagonal index. A
+    coincidental match between the two sets can only happen when
+    old_stride == new_stride for the dims involved (tiling never increases
+    a dim's stride), which is a no-op either way.
+    """
+    try:
+        atoms, _offset = decompose_index_for_tiling(
+            index, {sym: 1 for sym in loop_syms}
+        )
+    except Unsupported:
+        return False
+    if not atoms:
+        return False
+    coeffs = {atom[0] for atom in atoms}
+    dims = [
+        d
+        for d, (s, t) in enumerate(zip(info.old_size, info.old_stride))
+        if s != 1 and t != 0
+    ]
+    old_set = {info.old_stride[d] for d in dims}
+    new_set = {info.new_stride[d] for d in dims}
+    return coeffs == new_set and coeffs != old_set
+
+
 def _retile_load_index(
     buf_name: str,
     index: Expr,
@@ -4416,6 +4671,16 @@ def _retile_load_index(
 
     loop_syms = index.free_symbols
     if not loop_syms:
+        new_index = index
+    elif _index_already_at_new_scale(index, loop_syms, info):
+        # This consumer's index was traced *after* the producer's layout was
+        # already mutated to new_stride (e.g. built/retraced during Pass
+        # 1/2/3, from a same-name replacement object resynced into group_ops
+        # -- see _coarse_tile_common's by-name resync comment), so it is
+        # already correct at the target scale. Rewriting it again would
+        # decompose already-new-scale coefficients against old_stride and
+        # silently produce a wrong (but plausible-looking) index -- see
+        # issue found via test_copy_running_max_4d_H4_Lq4.
         new_index = index
     else:
         new_index = compute_tile_index(

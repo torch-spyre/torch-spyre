@@ -157,9 +157,10 @@ _maybe_scratchpad_planning            # ← THIS PASS, gated by config.lx_planni
 
 Two ordering constraints fix this slot:
 
-- **Work division must run first.** Scratchpad planning needs
-  `op_it_space_splits` to compute per-core buffer sizes. Work division
-  also decides whether adjacent ops have compatible core splits.
+- **Work division must run first.** Scratchpad planning reads the
+  symbol-keyed `iteration_space_ownership` committed by work division to
+  compute per-core buffer sizes. Work division also decides whether adjacent
+  ops have compatible core splits.
   Incompatible splits trigger `core_div_mismatch` and disqualify shared
   buffers from LX (see [Current limitations](#current-limitations)).
 - **Stickification must run first.** All buffers need `FixedTiledLayout`

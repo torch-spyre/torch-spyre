@@ -30,9 +30,16 @@ import math
 import os
 import unittest
 from unittest import TestCase
+from unittest.mock import patch
+
+import sympy
 
 from torch_spyre._inductor.cost_model import OpFeatures, op_from_dict, predict_ops
-from torch_spyre._inductor.scratchpad.op_features import with_residency
+from torch_spyre._inductor.scratchpad.op_features import (
+    features_for_division,
+    with_residency,
+)
+from torch_spyre._inductor.scratchpad.plan_solver import CoreDivision
 
 FIXTURE = os.path.join(os.path.dirname(__file__), "cooptimization_op_features.json")
 
@@ -47,6 +54,28 @@ def _entries():
     for gname, g in _graphs().items():
         for bname, b in g["buffers"].items():
             yield gname, bname, b
+
+
+class CandidateDivisionTest(TestCase):
+    def test_candidate_is_passed_as_complete_symbol_keyed_map(self):
+        """SA feature extraction neither encodes nor mutates Scheduler transport."""
+        m, n, kk = sympy.symbols("m n kk")
+        op = object()
+        division = CoreDivision(output_splits={m: 8}, reduction_splits={kk: 2})
+        expected = {m: 8, n: 1, kk: 2}
+        with (
+            patch(
+                "torch_spyre._inductor.scratchpad.op_features.iteration_space_from_op",
+                return_value={m: 1024, n: 1024, kk: 2048},
+            ),
+            patch(
+                "torch_spyre._inductor.dump_cost_model.extract_op_features",
+                return_value="features",
+            ) as extract,
+        ):
+            self.assertEqual(features_for_division(op, division), "features")
+
+        extract.assert_called_once_with(op, expected)
 
 
 class FixturePresentTest(TestCase):

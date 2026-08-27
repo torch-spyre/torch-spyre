@@ -133,6 +133,51 @@ def _concretize_for_cmp(expr):
     return int(expr)
 
 
+def _decompose_constant_offset(
+    offset: sympy.Expr,
+    size: Sequence[sympy.Expr],
+    stride: Sequence[sympy.Expr],
+    coordinates: list[sympy.Expr],
+) -> bool:
+    """Attribute a constant storage offset to device coordinates positionally.
+
+    A storage offset is a fixed host-flat position, i.e. a mixed-radix number in
+    the layout's strides.  We peel it greedily from the largest stride down
+    (``digit = remaining // stride[d]``), so a whole-dimension offset lands
+    entirely on that dimension.  This is unlike ``add_term``'s per-dim modular
+    split, which assumes the strides form a clean nested radix
+    (``stride[outer] == stride[inner] * size[inner]``).  A padded layout breaks
+    that assumption -- e.g. an fp16 base whose row width is not a multiple of the
+    64-element stick has row stride 100 but a stick pair spanning 128, so the
+    modular split leaks ``offset % 64`` onto the stick coordinate.  Positional
+    peeling keeps the stick coordinate offset-free.
+
+    Mutates ``coordinates`` in place and returns True on success.  Returns False
+    without touching ``coordinates`` if the offset cannot be fully peeled (never
+    expected for a valid host position), so the caller can fall back to
+    ``add_term``.
+    """
+    n = len(size)
+    dims = sorted(
+        (d for d in range(n) if size[d] > 1 and stride[d] > 0),
+        key=lambda d: stride[d],
+        reverse=True,
+    )
+    remaining = offset
+    digits: list[tuple[int, sympy.Expr]] = []
+    for d in dims:
+        if remaining < stride[d]:
+            continue
+        digit = remaining // stride[d]
+        digits.append((d, digit))
+        remaining -= digit * stride[d]
+    if remaining != 0:
+        return False
+    for d, digit in digits:
+        coordinates[d] += digit
+    return True
+
+
 def compute_coordinates(
     size: Sequence[sympy.Expr],
     stride: Sequence[sympy.Expr],
@@ -242,7 +287,15 @@ def compute_coordinates(
     offset = index.xreplace({v: 0 for v in vars})
     if offset > 0:
         index = index - offset
-        add_term(var=offset, step=sympy.S.One, limit=sympy.oo)
+        # A concrete offset is decomposed positionally so a padded layout does
+        # not leak a modular residual onto the stick coordinate (see
+        # _decompose_constant_offset).  Symbolic offsets, or an offset that
+        # cannot be fully peeled, fall back to add_term's original behavior.
+        handled = not offset.free_symbols and _decompose_constant_offset(
+            offset, size, stride, coordinates
+        )
+        if not handled:
+            add_term(var=offset, step=sympy.S.One, limit=sympy.oo)
 
     for var in vars:
         # Skip symbols that are not loop variables (e.g. size symbols
