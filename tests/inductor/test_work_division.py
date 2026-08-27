@@ -53,6 +53,7 @@ from torch_spyre._inductor.work_division_constraints import (
     conv_spatial_blocked_vars,
     coordinate_mask_blocked_vars,
     indirect_access_split_domains,
+    keep_by_index_split_domains,
     qfp8wt_matmul_k_split_domains,
     topk_split_domains,
     qfp8wt_split_domains,
@@ -293,6 +294,25 @@ class TestWorkDivisionSplitLegality(unittest.TestCase):
             self.assertFalse(work_division_split_is_legal(op, ({}, {})))
             del op._input_layout_overrides
             self.assertTrue(work_division_split_is_legal(op, ({}, {})))
+
+
+class TestKeepByIndexConstraints(unittest.TestCase):
+    def test_keep_by_index_stays_single_core(self):
+        output_axis, index_axis = _isym("output"), _isym("index")
+        op = _computed_buffer((64,), name="keep_by_index", reduction_type="keepbyindex")
+        ctx = _make_context(
+            op,
+            _tensor_dep("keep_by_index", (64,), (output_axis,)),
+            it_space={output_axis: 64, index_axis: 8},
+            reduction_vars=(index_axis,),
+        )
+
+        result = keep_by_index_split_domains(ctx)
+
+        self.assertEqual(
+            result.allowed_splits,
+            {output_axis: frozenset({1}), index_axis: frozenset({1})},
+        )
 
 
 class TestCostModelConstraints(unittest.TestCase):

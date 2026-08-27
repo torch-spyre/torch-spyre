@@ -37,6 +37,7 @@ from torch_spyre._C import ElementArrangement
 from .constants import (
     BATCH_MATMUL_OP,
     BATCH_MATMUL_FP8_OP,
+    KEEP_BY_INDEX_OP,
     TOPK_MAX_K_PER_CORE,
     TOPK_OPS,
 )
@@ -102,6 +103,7 @@ def collect_work_division_constraints(
         qfp8wt_split_domains,
         qfp8wt_matmul_k_split_domains,
         topk_split_domains,
+        keep_by_index_split_domains,
         indirect_access_split_domains,
     ):
         result = constraint(ctx)
@@ -299,6 +301,25 @@ def topk_split_domains(ctx: WorkDivConstraintContext) -> ConstraintResult:
         )
     allowed_splits[k_var] = frozenset({min(legal_k_splits)})
     return ConstraintResult(allowed_splits=allowed_splits)
+
+
+def keep_by_index_split_domains(ctx: WorkDivConstraintContext) -> ConstraintResult:
+    """Keep keep_by_index on one core.
+
+    Its K axis exists only on the indices input and cannot be encoded by the
+    legacy Scheduler transport. More importantly, this masked selection has no
+    cross-core reduction combine. Splitting either output or K therefore gives
+    each core an incomplete mask. Keep the operation whole until codegen gains
+    a compatible multi-core implementation.
+    """
+    if (
+        isinstance(ctx.op.data, Reduction)
+        and ctx.op.data.reduction_type == KEEP_BY_INDEX_OP
+    ):
+        return ConstraintResult(
+            allowed_splits={var: frozenset({1}) for var in ctx.it_space_adjusted}
+        )
+    return ConstraintResult()
 
 
 def indirect_access_split_domains(ctx: WorkDivConstraintContext) -> ConstraintResult:
