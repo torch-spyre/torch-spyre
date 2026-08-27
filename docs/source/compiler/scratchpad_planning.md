@@ -503,10 +503,13 @@ collapsed/broadcast dim. The upstream seed is already stick-valid from work
 division. Every candidate, including the seed, must satisfy hard
 work-division constraints: blocked axes remain unsplit and split domains
 restrict legal factors. Candidate divisions remain symbol-keyed in their
-producing operation's iteration space. Cross-operation compatibility is
-derived from physical `PerCoreView` ownership rather than comparing those
-local symbols, so an LX candidate remains faithful through selection and
-commit even when adjacent operations use different iteration-symbol names.
+producing operation's iteration space. Fixed candidates and the solver's
+selected candidate are revalidated from that symbol-keyed map before commit;
+LX planning never decodes candidates through the legacy coefficient-keyed
+Scheduler transport. Cross-operation compatibility is derived from physical
+`PerCoreView` ownership rather than comparing those local symbols, so an LX
+candidate remains faithful through selection and commit even when adjacent
+operations use different iteration-symbol names.
 
 **Pointwise ops** get their seed, dim-flip variants (move the seed's
 single output-dim factor onto each compatible alternative output dim,
