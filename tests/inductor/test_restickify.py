@@ -719,7 +719,7 @@ def test_two_mutations_read_between_writes_minimal_copy_():
     reason="crashes in _clone_layout (propagate_layouts) before the conflicting-layout "
     "assert fires: `return snapshot * acc` forces a flat 1D clone of acc (size=[32768]) "
     "between the two writes; device_coordinates on the col-stick acc via that flat index "
-    "produces the unsupported stick expr floor((Mod(d0,16384))/256)"
+    "produces the unsupported stick expr floor((Mod(d0,16384))/256). Issue #4093"
 )
 def test_two_mutations_read_between_writes_v2_copy_f():
     # write / read / write returning snapshot * acc (both outputs live).

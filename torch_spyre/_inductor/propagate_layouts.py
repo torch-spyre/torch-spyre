@@ -2000,8 +2000,8 @@ def propagate_spyre_tensor_layouts(
                     if not new_value_args:
                         # No real inputs (e.g. fill with identity value). The
                         # SpyreEmptyFallback node branch already owns target_buf.layouts
-                        # (single generic_layout candidate) and must not be overwritten.
-                        # Use the same candidate for this op's layouts and AnyInNode
+                        # (all valid STL candidates) and must not be overwritten.
+                        # Use the same candidates for this op's layouts and AnyInNode
                         # so the beam commits at zero cost.
                         candidates = getattr(
                             target_buf, "layouts", [generic_layout(target_buf)]
@@ -2028,6 +2028,9 @@ def propagate_spyre_tensor_layouts(
                         # read-back). _matmul_layouts derives a single out_stl
                         # deterministically from the target layout and installs its
                         # own FixedInOutNode, so no separate AllSameNode join is needed.
+                        # target_co_dep is intentionally not threaded in: matmul has a
+                        # fixed, deterministic output STL so two BATCH_MATMUL ops writing
+                        # the same SpyreEmptyFallback will always agree.
                         assert len(new_value_args) == 2, (
                             "BATCH_MATMUL_OP mutation op should have exactly "
                             f"two non-target inputs, got {len(new_value_args)} "

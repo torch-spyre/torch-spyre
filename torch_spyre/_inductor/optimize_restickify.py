@@ -562,12 +562,6 @@ def _reorder_any_in_nodes(operations: list) -> list:
     before their first consumer means the branch is immediately resolved by
     the consumer's cost function, eliminating the blowup.
     """
-    # Build name -> position index for quick lookup.
-    name_to_pos = {}
-    for i, op in enumerate(operations):
-        if hasattr(op, "layouts"):
-            name_to_pos[op.get_name()] = i
-
     # For each AnyInNode op, find the position of its first consumer.
     to_move: dict[int, int] = {}  # old_pos -> insert_before_pos
     for i, op in enumerate(operations):
@@ -582,6 +576,14 @@ def _reorder_any_in_nodes(operations: list) -> list:
                 continue
             if not hasattr(other, "layouts"):
                 continue
+            # NOTE: AnyInNode.edge_costs is always [], so an AnyInNode op can
+            # never appear as a consumer here. In practice SpyreEmptyFallback
+            # (the only current AnyInNode user) has no inputs and cannot consume
+            # another SpyreEmptyFallback, so chained AnyInNode ops cannot occur.
+            # If new AnyInNode users are added, generalize this into a dedicated
+            # reorder pass that handles chained AnyInNode ops.
+            # NOTE: This is O(k·n) where k is the number of AnyInNode ops.
+            # Since SpyreEmptyFallback buffers are rare, this is effectively O(n).
             if any(ec.dep.name == name for ec in other.restick_cost_fn.edge_costs):
                 first_consumer_pos = j
                 break

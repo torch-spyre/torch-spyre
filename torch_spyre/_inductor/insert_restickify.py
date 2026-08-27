@@ -293,11 +293,10 @@ def finalize_layouts(graph: GraphLowering) -> None:
                     for dims in getattr(loop_info, "loop_tiled_reduction_dims", [])
                 )
                 if not all_tiled_rdims_empty:
-                    # Propagate the reduction op's device layout to accum_full.
-                    # Pre-stickify, _allocate_full_buffer assigned accum_full a
-                    # generic layout; we now overwrite it with the same STL as
-                    # the reduction op (they share the same output shape and
-                    # stick orientation must agree for the combine to work).
+                    # If accum_full already has a FixedTiledLayout,
+                    # _allocate_full_buffer derived the correct layout via
+                    # _resize_device_layout — nothing to do. Otherwise promote
+                    # to FixedTiledLayout using the reduction op's device layout.
                     accum_name = getattr(op, "_tiled_reduction_accum_name", None)
                     if accum_name is not None:
                         accum_buf = graph.get_buffer(accum_name)
