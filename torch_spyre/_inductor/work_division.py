@@ -56,6 +56,8 @@ from .pass_utils import (
     device_coordinates,
     iteration_space_from_op,
     is_topk,
+    is_keep_by_index,
+    read_with_max_reduction_overlap,
     splits_by_index_coeff,
     apply_splits_from_index_coeff,
     indirect_access_subs_from_op,
@@ -758,6 +760,18 @@ def apply_splits(
     rw = op_read_writes(op)
     write_index = output_td.dep.index
     read_index = _first_non_indirect_read_index(rw, write_index)
+
+    # For keep_by_index, the indices tensor (not values) carries the k
+    # (reduction) dimension, so pick whichever read overlaps reduction_vars
+    # the most instead of just taking the first non-indirect read.
+    if is_keep_by_index(op):
+        coord_vars = {v for e in output_td.device_coords[:-1] for v in e.free_symbols}
+        reduction_vars = set(splits.keys()) - coord_vars
+        if reduction_vars:
+            best_read = read_with_max_reduction_overlap(rw.reads, reduction_vars)
+            if best_read is not None:
+                read_index = best_read
+
     op.op_it_space_splits = splits_by_index_coeff(splits, write_index, read_index)
 
 
@@ -1123,6 +1137,7 @@ def _default_split(
     blocked: set[Symbol],
     forbidden_split_syms: set[Symbol] | None = None,
     force_output_syms: set[Symbol] | None = None,
+    op: Operation | None = None,
 ) -> tuple[dict[Symbol, int], list[Symbol], list[Symbol]]:
     """Distribute max_cores by priority on top of span_reduction's commits.
 
@@ -1168,8 +1183,15 @@ def _default_split(
 
     # If span_reduction_pass already committed a reduction split, suppress further
     # reduction splitting so the final result never exceeds one reduction dim split.
+    # Exception: keep_by_index has constraint-based reduction splits that must be
+    # honored, so don't suppress for that op.
     coord_vars = {v for e in output_td.device_coords[:-1] for v in e.free_symbols}
-    if any(v not in coord_vars for v in committed_splits):
+    # Note: span_reduction_pass merges both must_split_vars AND constraints into
+    # op.op_it_space_splits, so we can't distinguish them here. Only suppress for
+    # ops where we know the reduction split came from span_reduction, not constraints.
+    has_reduction_split = any(v not in coord_vars for v in committed_splits)
+    is_kbi = is_keep_by_index(op) if op else False
+    if has_reduction_split and not is_kbi:
         reduction_dims = []
 
     # Drop blocked dims before the greedy distributor commits them. Coordinate
@@ -1298,6 +1320,7 @@ def work_distribution_pass(
         blocked,
         forbidden_split_syms=constraint_result.forbidden,
         force_output_syms=constraint_result.force_output,
+        op=op,
     )
 
     apply_splits(op, splits, output_td)

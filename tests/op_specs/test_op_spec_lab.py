@@ -21,6 +21,7 @@ that it still works when someone reaches for it.  Everything here is pure Python
 
 import ast
 import builtins
+import inspect
 import os
 import sys
 import types
@@ -78,9 +79,16 @@ def _add_op(debug_handle=None):
 
 
 def _pool_op():
-    """An add whose output spilled to the HBM pool, so .run() gets a pool first."""
+    """An add whose output spilled to the HBM pool, leaving two kernel args.
+
+    ``arg_index=-1`` is what makes this a *real* pool spec rather than one that
+    only looks like it: ``generate_bundle`` keys its ``device_mem_allocate`` on
+    the pooled tensor being an intermediate, so with a non-negative arg_index it
+    emits no pool at all and accepts ``pool_size=0`` without complaint.
+    """
     op = _add_op()
     op.args[2].allocation = {"hbm_pool": 0}
+    op.args[2].arg_index = -1
     return op
 
 
@@ -95,12 +103,7 @@ class _FakeLayout:
 
 
 class _FakeTensor:
-    """A stand-in for a device tensor, counting the .cpu() calls it receives.
-
-    The pool must never get one: per _record_args, ``pool.cpu()`` on the flat
-    SENINT8 pool aborts the process, so "was .cpu() called" is the assertion that
-    matters and a real tensor could not make it.
-    """
+    """A stand-in for a device tensor, counting the .cpu() calls it receives."""
 
     def __init__(self, shape=(128, 256), dtype=torch.float16, numel=32768):
         self.shape = shape
@@ -130,6 +133,11 @@ class _FakeRunner:
         self.launches.append(args)
 
 
+def _fake_sdsc(self, kernel_name, specs, pool_size=0):
+    """Stand in for sdsc() with its real signature, so the spy is called as it is."""
+    return _FakeRunner()
+
+
 def _arg_record(dtype=torch.float16):
     return capture.ArgRecord(
         shape=(128, 256),
@@ -141,17 +149,17 @@ def _arg_record(dtype=torch.float16):
     )
 
 
-def _record(name="sdsc_add_0", pool_bytes=0):
+def _record(name="sdsc_add_0", pool_size=0):
     return capture.KernelRecord(
         name=name,
         specs=[_add_op()],
         index=0,
         sencores=32,
         bundle_symbolic_args=True,
+        pool_size=pool_size,
         # A distinct record per arg: sharing one object made a test that retyped
         # arg0 silently retype all three.
         args=[_arg_record() for _ in range(3)],
-        pool_bytes=pool_bytes,
         observed_run=True,
     )
 
@@ -196,9 +204,10 @@ def test_render_discloses_that_a_layout_label_is_not_a_role():
 
 
 def test_render_reports_the_pool_it_was_given():
-    out = explain.render([_add_op()], kernel_name="k", pool_bytes=32768)
+    out = explain.render([_add_op()], kernel_name="k", pool_size=32768)
     assert "32768-byte pool" in out  # title
-    assert "32768 bytes (uint8) -- passed first to .run()" in out
+    # The bundle emits its own device_mem_allocate, so the pool is not an arg.
+    assert "32768 bytes -- allocated by the bundle, not an arg" in out
     assert "no pool" in explain.render([_add_op()], kernel_name="k")
 
 
@@ -301,16 +310,63 @@ def test_emitted_script_executes_its_definitions():
     break every future capture at *its* import time.  ``__main__`` does not fire
     under exec, so nothing is compiled or launched.
     """
-    src = capture.emit_script(_record(pool_bytes=32768), "prog.py", 1, False)
+    src = capture.emit_script(_record(pool_size=32768), "prog.py", 1, False)
     namespace: dict = {"__file__": "/tmp/captured/sdsc_add_0.py"}
     exec(compile(src, "<emitted>", "exec"), namespace)  # noqa: S102
     assert namespace["KERNEL_NAME"] == "sdsc_add_0"
-    assert namespace["POOL_BYTES"] == 32768
+    assert namespace["POOL_SIZE"] == 32768
     assert len(namespace["ops"]) == 1
     assert len(namespace["LAYOUTS"]) == 3
     # Keyed on the script, not the kernel: two graphs can share a fused name, and
     # a kernel-keyed .pt would be clobbered by the second capture.
     assert namespace["INPUTS_PT"] == "/tmp/captured/sdsc_add_0.inputs.pt"
+
+
+def test_emitted_script_forwards_the_pool_size():
+    """A pool kernel bundles only if pool_size reaches sdsc().
+
+    ``generate_bundle`` asserts ``0 < pool_size`` whenever a pool symbol is
+    present, so an emitted script that drops it fails in codegen -- no device
+    needed to get it wrong.
+    """
+    src = capture.emit_script(_record(pool_size=32768), "prog.py", 1, False)
+    assert "POOL_SIZE = 32768" in src
+    assert "pool_size=POOL_SIZE" in src
+
+
+def test_bundling_a_pool_spec_emits_the_pool_allocation(tmp_path):
+    """Bundle a pool spec for real -- no device, no mock, no dxp_standalone.
+
+    The unmocked call is the point: ``generate_bundle`` is where a dropped
+    pool_size actually bites, and it asserts ``0 < pool_size`` only when it sees
+    a pool symbol. So this fails on a lab that forgets to forward the size, where
+    a mocked ``generate_bundle`` would happily record the call and pass.
+    """
+    with spyre_config.patch(bundle_symbolic_args=True):  # type: ignore[attr-defined]
+        listing = runner.bundle_op_specs(
+            "k", [_pool_op()], str(tmp_path), pool_size=32768
+        )
+        assert "bundle.mlir" in listing
+        mlir = (tmp_path / "bundle.mlir").read_text()
+        assert "sdscbundle.device_mem_allocate 32768 bytes" in mlir
+
+        with pytest.raises(AssertionError, match="pool_size=0 out of range"):
+            runner.bundle_op_specs("k", [_pool_op()], str(tmp_path / "dropped"))
+
+
+def test_run_op_specs_forwards_the_pool_size():
+    """The replay path, which is where a dropped pool_size would go unnoticed."""
+    tensors = [torch.zeros(4, dtype=torch.float16) for _ in range(2)]
+    fake = _FakeRunner()
+    with (
+        patch.object(runner, "to_device", lambda ts, layouts=None: list(ts)),
+        patch.object(SpyreAsyncCompile, "sdsc", return_value=fake) as sdsc,
+    ):
+        runner.run_op_specs("k", [_pool_op()], tensors, pool_size=32768)
+
+    assert sdsc.call_args.kwargs["pool_size"] == 32768
+    # The pool is not an argument any more, so only the kernel args reach .run().
+    assert len(fake.launches[0]) == 2
 
 
 def test_runner_template_is_self_contained():
@@ -362,36 +418,45 @@ def test_write_kernel_disambiguates_script_and_pt_together(tmp_path):
         assert os.path.exists(os.path.splitext(path)[0] + ".inputs.pt")
 
 
-def test_record_args_pops_the_pool_and_never_reads_it():
-    """The pool is .run()'s first argument, identified by the shared predicate.
+def test_spy_accepts_everything_sdsc_accepts():
+    """The spy stands in for sdsc(), so it must take sdsc()'s parameters.
 
-    ``uses_hbm_pool`` is what ``call_kernel`` used to prepend the pool, so
-    _record_args has to reach the same verdict. Getting it wrong is not a bad
-    label: it means calling .cpu() on the flat pool tensor, which aborts the
-    process rather than failing an assertion.
+    #3707 added ``pool_size`` and the spy did not follow, which left every
+    pool-using program uncapturable -- a TypeError raised through the Inductor
+    backend -- while this suite stayed green, because every other test here
+    patches sdsc itself and never exercises the real signature.
+    """
+    real = inspect.signature(SpyreAsyncCompile.sdsc)
+    with capture.capture_kernels():
+        spy = inspect.signature(SpyreAsyncCompile.sdsc)
+
+    assert list(spy.parameters) == list(real.parameters)
+
+
+def test_record_args_keeps_every_arg_for_a_pool_kernel():
+    """Nothing is skipped even when the kernel spills to the pool.
+
+    Since #3707 the bundle allocates its own pool via ``device_mem_allocate``, so
+    no pool tensor is passed at launch and ``arg_index`` is the ``.run()``
+    position for every arg. Popping one here would silently drop arg0 from the
+    capture and record its ``numel()`` as a byte count.
     """
     rec = capture.KernelRecord(
         name="k", specs=[_pool_op()], index=0, sencores=32, bundle_symbolic_args=True
     )
-    pool = _FakeTensor(shape=(32768,), dtype=torch.uint8, numel=32768)
-    args = (pool, _FakeTensor(), _FakeTensor(), _FakeTensor())
+    capture._record_args(rec, tuple(_FakeTensor() for _ in range(2)), save_inputs=True)
 
-    capture._record_args(rec, args, save_inputs=True)
-
-    assert rec.pool_bytes == 32768
-    assert len(rec.args) == 3
-    assert pool.cpu_calls == 0
+    assert rec.pool_size == 0  # only the sdsc() keyword sets this
+    assert len(rec.args) == 2
     assert all(a.values is not None for a in rec.args)
 
 
-def test_record_args_keeps_every_arg_when_there_is_no_pool():
-    """Nothing is popped for a pool-free kernel, so arg0 stays arg0."""
+def test_record_args_records_the_layout_of_every_arg():
     rec = capture.KernelRecord(
         name="k", specs=[_add_op()], index=0, sencores=32, bundle_symbolic_args=True
     )
     capture._record_args(rec, tuple(_FakeTensor() for _ in range(3)), save_inputs=False)
 
-    assert rec.pool_bytes == 0
     assert len(rec.args) == 3
     assert rec.args[0].device_dtype_name == "SEN169_FP16"
     assert rec.args[0].element_arrangement_name == "STANDARD"
@@ -437,7 +502,7 @@ def test_capture_writes_what_it_recorded_before_the_target_crashed(tmp_path, cap
     )
     out_dir = tmp_path / "captured"
 
-    with patch.object(SpyreAsyncCompile, "sdsc", lambda self, n, s: _FakeRunner()):
+    with patch.object(SpyreAsyncCompile, "sdsc", _fake_sdsc):
         status = capture.main([str(program), "--out", str(out_dir)])
 
     # Not 0: a caller has to be able to tell a partial capture from a whole one
@@ -454,7 +519,7 @@ def test_capture_of_a_clean_program_exits_zero(tmp_path):
     program = _stub_sdsc_program(tmp_path, body)
     out_dir = tmp_path / "captured"
 
-    with patch.object(SpyreAsyncCompile, "sdsc", lambda self, n, s: _FakeRunner()):
+    with patch.object(SpyreAsyncCompile, "sdsc", _fake_sdsc):
         assert capture.main([str(program), "--out", str(out_dir)]) == 0
 
     assert (out_dir / "sdsc_ok_0.py").exists()
@@ -502,7 +567,7 @@ def test_build_tensors_synthesizes_fp8_args():
     src = capture.emit_script(rec, "prog.py", 1, False)
     exec(compile(src, "<emitted>", "exec"), namespace)  # noqa: S102
 
-    tensors, _ = namespace["build_tensors"]()
+    tensors = namespace["build_tensors"]()
 
     assert tensors[0].dtype == torch.float8_e4m3fn
     assert tuple(tensors[0].shape) == (128, 256)

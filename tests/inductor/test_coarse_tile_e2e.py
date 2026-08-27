@@ -6107,7 +6107,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         lx_planning is disabled here so the `a = x + y` intermediate isn't
         claimed by LX scratchpad planning first -- with LX planning on,
         `add`/`mul`/`sub` outputs are all LX-eligible by default (see
-        OP_OUTPUT_GOOD_FOR_LX_REUSE in scratchpad/utils.py) and may win the
+        OP_OUTPUT_NOT_GOOD_FOR_LX_REUSE in scratchpad/utils.py) and may win the
         scratchpad before hbm_pool_planning ever sees them, leaving every
         bundle's pool_size at 0 and proving nothing about the plumbing this
         test exists to check.
@@ -6294,7 +6294,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
 
         With lx_planning enabled, the `a = x + y` intermediate is claimed by
         LX scratchpad planning before hbm_pool_planning ever sees it (see
-        OP_OUTPUT_GOOD_FOR_LX_REUSE in scratchpad/utils.py), so this bundle
+        OP_OUTPUT_NOT_GOOD_FOR_LX_REUSE in scratchpad/utils.py), so this bundle
         has no pool-eligible buffer and define_kernel() must omit the
         pool_size kwarg entirely rather than emit pool_size=0.
         """
@@ -6953,28 +6953,21 @@ class TestCoarseTileMoEBroadcastMatmulE2E(InductorTestCase):
             fn, x, w, run_compile=True, run_eager=False, atol=0.05, rtol=0.05
         )
 
-    @pytest.mark.skip(
-        reason=(
-            "Unsupported: expected exactly 1 generated variable, got {d0, d2}. "
-            "find_matmul_generated_var (pass_utils.py) identifies the matmul's "
-            "N dim as 'in y and the output, absent from x' -- but here E is "
-            "also 'in y and the output, absent from x' (a broadcast batch dim "
-            "with no corresponding dim in x at all), and with tile size 2 its "
-            "per-tile loop var (d0) still appears in y's/the output's index, "
-            "so it satisfies the same set membership as the true N dim (F, "
-            "d2). The two are structurally indistinguishable by pure "
-            "set-arithmetic on MemoryDep.index.free_symbols once x lacks a "
-            "batch dim outright; d0 and d2 both have real nonzero coefficients "
-            "in y_dep/out_dep and are absent from x_dep.index.free_symbols. "
-            "At tile size 1 (see test_unsqueeze_broadcast_matmul_tile_E_correct) "
-            "E's per-tile loop var is constant-folded away entirely, so the "
-            "ambiguity never arises -- this is a distinct, real bug in "
-            "propagate_layouts.py/pass_utils.py, not in coarse_tile.py. "
-            "See issue #3888."
-        )
-    )
-    def test_unsqueeze_broadcast_matmul_tile_E_64_correct(self):
-        """[1,T,H]@[E,H,F] -> [E,T,F] tiled over E with 64 tiles (2 experts/tile)."""
+    def test_unsqueeze_broadcast_matmul_tile_E_64_rejected(self):
+        """[1,T,H]@[E,H,F] tiled over E with 64 tiles (2 experts/tile) is rejected.
+
+        Coarse-tiling a matmul's broadcast batch dim (x has no E dim here)
+        with more than 1 element per tile is not supported: the backend's
+        SDSC batched-matmul scheduling primitive requires exactly 1
+        broadcast element per kernel invocation
+        (``inp0_reuse_dim.size() == 1``), and aborts deep in the native
+        device compiler if that's violated. torch-spyre now rejects this
+        configuration at plan time with a clear message instead of letting
+        it reach the native compiler -- see issue #3927 for the backend
+        limitation this is tracking. 1 expert/tile
+        (test_unsqueeze_broadcast_matmul_tile_E_correct,
+        num_tiles_per_dim={"E": E}) is unaffected and continues to work.
+        """
         from torch_spyre._inductor import spyre_hint
 
         E, T, H, F = 128, 64, 64, 64
@@ -6991,9 +6984,10 @@ class TestCoarseTileMoEBroadcastMatmulE2E(InductorTestCase):
             with spyre_hint(num_tiles_per_dim={"E": 64}):
                 return torch.matmul(x.unsqueeze(0), w)
 
-        compare_with_cpu(
-            fn, x, w, run_compile=True, run_eager=False, atol=0.05, rtol=0.05
-        )
+        with pytest.raises(InductorError, match="coarse-tiling broadcast batch dim"):
+            compare_with_cpu(
+                fn, x, w, run_compile=True, run_eager=False, atol=0.05, rtol=0.05
+            )
 
 
 class TestCoarseTileNestedReductionE2E(InductorTestCase):

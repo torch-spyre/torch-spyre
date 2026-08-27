@@ -953,6 +953,19 @@ class InputsEdits(BaseModel):
                         f"config so the constructor arg uses 'config_path' + "
                         f"'config_kwargs' instead of a bare '<config:...>' value."
                     )
+                # A dtype recorded as its repr (e.g. 'torch.bfloat16'). Left as
+                # a string it reaches the op as a positional arg and is
+                # misinterpreted -- x.to('torch.bfloat16') parses it as a
+                # DEVICE string and raises. kwargs already resolve dtypes;
+                # positional values get the same treatment. Gated on a known
+                # dtype name so device strings ('cpu', 'cuda:0') and any other
+                # 'torch.'-prefixed value fall through unchanged.
+                if (
+                    isinstance(val, str)
+                    and val.startswith("torch.")
+                    and val.removeprefix("torch.") in _VALID_DTYPE_STRINGS
+                ):
+                    val = _resolve_dtype_str(val)
                 if (
                     test_device is not None
                     and op_name == "torch.to"
@@ -984,6 +997,29 @@ class InputsEdits(BaseModel):
                 raise ValueError(f"Unknown InputArg type: {type(arg)}")
 
         return cpu_args
+
+    def resolved_device_args(
+        self,
+        *,
+        test_device: Optional[torch.device],
+        op_name: str = "",
+    ) -> Dict[int, Any]:
+        """Return {arg_index: test_device} for positional device args.
+
+        ``torch.to("cuda:0")`` names its destination positionally, so it takes
+        the same substitution ``resolved_kwargs`` rule 2 applies to a ``device``
+        kwarg. Only indices holding a device are returned, so callers can overlay
+        them onto CPU-built args without disturbing other values.
+        """
+        out: Dict[int, Any] = {}
+        if test_device is None or op_name != "torch.to":
+            return out
+        for i, raw in enumerate(self.args):
+            arg = _parse_input_arg(raw) if isinstance(raw, dict) else raw
+            val = getattr(arg, "value", None)
+            if isinstance(val, str) and "cuda" in val:
+                out[i] = test_device
+        return out
 
     def resolved_kwargs(
         self,

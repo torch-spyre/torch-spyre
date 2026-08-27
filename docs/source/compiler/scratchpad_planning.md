@@ -331,7 +331,7 @@ The checks, in evaluation order (the first failure is the reason reported):
 
 | Reason | Why |
 |---|---|
-| `op not allowed` | not a `ComputedBuffer`, a mutation layout, or an op name outside `OP_OUTPUT_GOOD_FOR_LX_REUSE` (the debug flag `config.allow_all_ops_in_lx_planning` bypasses the op-name gate) |
+| `op not allowed` | not a `ComputedBuffer`, a mutation layout, or an op name inside `OP_OUTPUT_NOT_GOOD_FOR_LX_REUSE` (the debug flag `config.allow_all_ops_in_lx_planning` bypasses the op-name gate) |
 | `unsized (no device layout)` | no computable footprint (e.g. a `MultiOutputLayout` tuple op) |
 | `mutation target` | filled by offset writes, so one LX base mis-addresses it |
 | `tiled (advancing)` | LX addresses cannot be `affine.apply` symbols; the advancing-tile check reads `loop_info` (the sole source of truth for per-tile geometry) |
@@ -467,6 +467,11 @@ single-pass solvers. See
 [Simulated Annealing Layout Planner](simulated_annealing_layout.md) for the
 algorithm and the tunable schedule parameters.
 
+Note this is placement-only. With `co_optimizing_lx_planning` the same config
+value instead selects `SaCoOptimizingSolver`, a *different* class that anneals
+the core divisions and the placement jointly — see
+[Joint core-division + LX placement](sa_co_optimization.md).
+
 ## Co-optimization with work-distribution
 
 Work division optimizes each op independently for parallelism. Adjacent
@@ -560,6 +565,14 @@ the producer/consumer slicing-match constraints to the CP-SAT solver,
 which chooses the core divisions and LX placements jointly in one
 constraint model. It falls back to the greedy allocator when `ortools`
 is unavailable.
+
+### Joint SA co-optimization
+
+Setting `layout_solver = "simulated_annealing"` together with
+`co_optimizing_lx_planning` routes through the same `CoOptimizingAllocator`,
+driven by `SaCoOptimizingSolver`, which anneals the division vector and the
+layout permutation as one joint state and scores it with the cost model. See
+[Joint core-division + LX placement](sa_co_optimization.md).
 
 ## Current limitations
 
