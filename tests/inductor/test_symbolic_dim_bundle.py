@@ -159,7 +159,9 @@ class TestGenerateBundleDimensionSymbols(InductorTestCase):
         if op_specs is None:
             op_specs = [_minimal_op_spec() for _ in compiled_entries]
 
-        side_effects = list(compiled_entries)
+        # compile_op_spec is called twice per OpSpec: once as a probe to derive
+        # the cache key (result discarded except for JSON), once for real.
+        side_effects = [e for entry in compiled_entries for e in (entry, entry)]
         with patch(
             "torch_spyre._inductor.codegen.bundle.compile_op_spec",
             side_effect=side_effects,

@@ -147,6 +147,11 @@ core_id_k_fast_emission: bool = (
 # emitter, i.e. also requires ktir_emitter=True / TORCH_SPYRE_KTIR=1.)
 bundle_symbolic_args: bool = os.environ.get("BUNDLE_SYMBOLIC_ARGS", "1") == "1"
 
+# Cache and reuse sdsc.json files during codegen when two OpSpecs produce
+# identical SuperDSC content, reducing bundle size for programs with loops.
+# Set SPYRE_INDUCTOR_SDSC_CACHE=0 to disable.
+sdsc_cache: bool = os.environ.get("SPYRE_INDUCTOR_SDSC_CACHE", "1") == "1"
+
 # Layout solver class used by default in scratchpad.allocator.ScratchpadAllocator.
 # Options:
 #  "greedy":       GreedyLayoutSolver (default),
@@ -159,7 +164,7 @@ bundle_symbolic_args: bool = os.environ.get("BUNDLE_SYMBOLIC_ARGS", "1") == "1"
 # TODO(isuruf): Change to firstfit when deeptools PR4298 lands
 layout_solver: Literal[
     "greedy", "bestfit", "firstfit", "cpsat", "simulated_annealing"
-] = os.environ.get("LAYOUT_SOLVER", "greedy")  # type: ignore[assignment]
+] = os.environ.get("LAYOUT_SOLVER", "cpsat")  # type: ignore[assignment]
 
 # OpSpec validation at pipeline stage boundaries. Enabled by default to catch
 # invariant violations early. Set SPYRE_VALIDATE_OP_SPECS=0 to disable.

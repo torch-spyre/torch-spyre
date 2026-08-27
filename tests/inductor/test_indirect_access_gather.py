@@ -70,7 +70,12 @@ from indirect_access_common import (  # noqa: E402
     plain_to_spyre,
 )
 
-from torch_spyre._C import DataFormats  # noqa: E402
+from torch_spyre._C import (  # noqa: E402
+    DataFormats,
+    SpyreTensorLayout,
+    get_device_dtype,
+    get_elem_in_stick,
+)
 from torch_spyre._inductor.constants import IDENTITY_OP, RESTICKIFY_OP  # noqa: E402
 from torch_spyre._inductor.op_spec import find_unimplemented  # noqa: E402
 
@@ -1082,6 +1087,24 @@ class _GatherMulticoreScenarios:
         self._stage_and_e2e(
             lambda w, i: w[i], expert_w, expert_ids, expect=GATHER_OP_SPEC
         )
+
+    def test_embedding_large_vocab_table_no_span_overflow(self):
+        """Vocab-scale table (V=262144, E=2816, ~1.4 GB): would overflow the
+        256 MB span limit if the indirectly-accessed vocab dim was used in full.
+        full, but that dim is never actually resident per-core."""
+        V, E = 262144, 2816
+        eps = get_elem_in_stick(torch.float16)
+        stick_count = (E + eps - 1) // eps
+        stl = SpyreTensorLayout(
+            device_size=[V, stick_count, eps],
+            stride_map=[E, eps, 1],
+            device_dtype=get_device_dtype(torch.float16),
+        )
+        table = torch.rand(V, E, dtype=torch.float16).to("spyre", device_layout=stl)
+        token_ids = torch.randint(0, V, (2, 128), dtype=torch.int64).to("spyre")
+        self.name_dims(table, {"V": V, "E": E})
+        self.name_dims(token_ids, {"B": 2, "S": 128})
+        self._stage_and_e2e(lambda t, i: t[i], table, token_ids, expect=GATHER_OP_SPEC)
 
     # -- Work-division scenarios -----------------------------------------
     # Swept across SENCORES, so each TestGatherMulticore_cores{N} variant

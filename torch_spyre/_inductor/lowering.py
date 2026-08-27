@@ -1123,6 +1123,49 @@ def lower_clamp(x, min=None, max=None):
     return pw
 
 
+@register_spyre_lowering(torch.ops.spyre.keep_by_index)
+def lower_keep_by_index(values, indices, dim, fill_value):
+    from .pass_utils import concretize_expr
+
+    x_size = values.get_size()
+    ndim = len(x_size)
+
+    # Concretize dim if symbolic
+    if isinstance(dim, sympy.Basic):
+        norm_dim = int(concretize_expr(dim)) % ndim
+    else:
+        norm_dim = dim % ndim
+
+    indices_size = indices.get_size()
+    values_loader = values.make_loader()
+    indices_loader = indices.make_loader()
+
+    ranges = list(x_size)
+    reduction_ranges = [indices_size[norm_dim]]
+
+    def inner_fn(index, rindex):
+        values_index = list(index)
+        # indices has K at norm_dim position
+        indices_index = list(index)
+        indices_index[norm_dim] = rindex[0]
+        return (values_loader(values_index), indices_loader(indices_index))
+
+    op_info = {"constants": {"maskval": fill_value}}
+    result = SpyreReduction.create(
+        reduction_type="keepbyindex",
+        input_node=[values, indices],
+        device=values.get_device(),
+        dst_dtype=values.get_dtype(),
+        src_dtype=values.get_dtype(),
+        inner_fn=inner_fn,
+        ranges=ranges,
+        reduction_ranges=reduction_ranges,
+        op_info=op_info,
+    )
+    result.realize()
+    return result
+
+
 @register_spyre_lowering(torch.ops.aten.clone.default, type_promotion_kind=None)
 def clone(x, *, memory_format=None):
     result = lowering.clone(x, memory_format=memory_format)
@@ -1266,8 +1309,7 @@ def lower_spyre_from_d2d(src, dst, src_off, dst_off):
 
 
 def _build_mutation_lowering(src, dst):
-    # Shared lowering body for copy_forced and opaque_copy_: builds an
-    # explicit MutationLayoutSHOULDREMOVE buffer so the mutation into dst
+    # Builds an explicit MutationLayoutSHOULDREMOVE buffer so the mutation into dst
     # survives regardless of what the scheduler would otherwise decide.
     # mutate_to() has multiple code paths and does not always mutate, so
     # the buffer is constructed by hand here instead.

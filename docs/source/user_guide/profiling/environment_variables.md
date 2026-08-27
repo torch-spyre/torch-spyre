@@ -72,7 +72,7 @@ The `torch_spyre.*` namespace is only for the `TORCH_LOGS` environment variable.
 
 | Variable | Effect |
 |---|---|
-| `TORCH_SPYRE_FFDC=1` | Opt in to automatic FFDC JSON reports on Spyre frontend-compile / backend-compile / runtime / unimplemented failures. Retrieve with `torch.spyre.get_diagnostic_report()`. Separate from `USE_SPYRE_PROFILER` (CMake / Kineto build flag); this env var alone gates capture at runtime and is not set by default on pods. |
+| `TORCH_SPYRE_FFDC=1` | Opt in to automatic FFDC JSON reports on Spyre frontend-compile / backend-compile / runtime / unimplemented failures. Retrieve with `torch.spyre.get_diagnostic_report()`. Separate from `USE_SPYRE_PROFILER` (the `setup.py` Kineto build flag); this env var alone gates capture at runtime and is not set by default on pods. |
 | `TORCH_COMPILE_DEBUG=1` | Optional. Writes `torch_compile_debug/` artifacts that FFDC links into `artifacts.paths` (see [FFDC user guide](ffdc.md)). Not required for capture. |
 | `DUMP_SPYRE_CODE=1` | Optional. Emits `sdsc_*.json` and `*.mlir` bundle files that FFDC can reference. Not required for capture. |
 

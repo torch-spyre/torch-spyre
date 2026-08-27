@@ -2,19 +2,12 @@
 
 **Stack:** torch-spyre (new, Inductor-based).
 
-:::{admonition} Stub
-:class: warning
-
-This page is a scaffold. Methodology examples — bottleneck
-classification, kernel drill-down, category breakdowns, multi-rank
-analysis — will land here as real new-stack traces become available
-and are validated against [RFC 0601][rfc-0601] tooling. Contributions
-welcome.
-:::
-
 The high-value pattern today is capturing a time-bounded
-`torch.profiler` trace alongside `aiu-smi` telemetry and reading them
-together.
+`torch.profiler` trace, breaking it down into kernel and transfer time,
+comparing kernel time against the compiler's ideal-cycle estimate, and
+reading the result alongside `aiu-smi` telemetry. Bottleneck
+classification and multi-rank analysis will follow as the
+[RFC 0601][rfc-0601] tooling matures. Contributions welcome.
 
 ## 1. Bound the measured region
 
@@ -40,7 +33,67 @@ prof.export_chrome_trace("spyre_trace.json")
 See the upstream [PyTorch profiler documentation][torch-profiler-docs]
 for the full `schedule` / `record_function` API.
 
-## 2. Pair the trace with `aiu-smi`
+## 2. Extract kernel and transfer time from the trace
+
+A trace captured with `ProfilerActivity.PrivateUse1` is written in the
+Chrome Trace Event Format, where every event carries a category (`cat`)
+and a duration (`dur`) in microseconds. Two categories give the
+device-side breakdown:
+
+- `cat == "kernel"` events are device compute. Summing their `dur`
+  yields total kernel time.
+- `cat in ("gpu_memcpy", "gpu_memset")` events are host-to-device and
+  device-to-host transfers and memory initialization. Summing their
+  `dur` yields total transfer time.
+
+Reading the exported JSON directly keeps the metric independent of the
+printed summary table:
+
+```python
+import json
+
+def kernel_and_transfer_ms(trace_path, n_iters):
+    with open(trace_path) as f:
+        events = json.load(f).get("traceEvents", [])
+    kernel_us = sum(e.get("dur", 0) for e in events if e.get("cat") == "kernel")
+    transfer_us = sum(
+        e.get("dur", 0) for e in events
+        if e.get("cat") in ("gpu_memcpy", "gpu_memset")
+    )
+    return kernel_us / n_iters / 1000.0, transfer_us / n_iters / 1000.0
+```
+
+Divide by the iteration count captured in the `active` window so the
+result is per-iteration milliseconds. A high transfer fraction relative
+to kernel time points to host-device movement on the critical path
+rather than device compute.
+
+## 3. PT-active utilization
+
+PT-active utilization compares the theoretical minimum time for a kernel
+against its measured execution time. It answers how close a kernel runs
+to the hardware bound.
+
+The numerator comes from a compiler artifact. When the compiler runs
+with `SENPERFORMANCE=2`, it writes an `ideal_cycles.json` file per
+kernel under `inductor-spyre/sdsc.bundle.mlir/perf/` in the Inductor
+cache directory (`TORCHINDUCTOR_CACHE_DIR`). The `TOTAL` entry in that file
+gives the kernel's ideal cycle count. Convert cycles to time with the
+core clock frequency:
+
+```text
+ideal_ms  = ideal_cycles / core_frequency_mhz / 1000
+actual_ms = measured kernel time for that kernel (from the trace)
+pt_active_utilization = ideal_ms / actual_ms * 100
+```
+
+Sum `ideal_ms` and `actual_ms` across kernels, excluding memcpy and
+memset entries from the compute total, for a whole-model figure.
+`SENPERFORMANCE` is a compiler environment variable rather than a
+torch-spyre setting, so the availability and exact format of
+`ideal_cycles.json` follow the compiler build in use.
+
+## 4. Pair the trace with `aiu-smi`
 
 Run `aiu-smi` in a second shell during the profiling window (see
 [Device monitoring](device_monitoring.md)). Both timestamps are
@@ -56,7 +109,7 @@ For post-processing the captured trace (additional statistics, trace
 enrichment), see [`aiu-trace-analyzer`](trace_analysis.md#aiu-trace-analyzer)
 ([public repository][ata]).
 
-## 3. Filing a performance report
+## 5. Filing a performance report
 
 When opening an issue, include:
 

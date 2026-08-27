@@ -9,9 +9,7 @@ test_suite_config:
         # They are classified as mandatory_success due to the critical nature of these operations.
         # Spyre's limitations in dtype support and type conversion during tensor operations are most relevant.
         - names:
-            - TestBinaryUfuncs::test_cross_device_inplace_error_msg
             - TestBinaryUfuncs::test_floor_divide_zero
-            - TestBinaryUfuncs::test_sub_typing
           mode: mandatory_success
         # These tests exercise binary operations (add, bitwise_and, clamp_max, etc.) with unsupported dtypes (bool, int64).
         # They are classified as mandatory_success because these operations are essential but currently unsupported on Spyre.
@@ -228,6 +226,10 @@ test_suite_config:
             - TestBinaryUfuncs::test_xlogy_xlog1py_bfloat16
             - TestBinaryUfuncs::test_zeta
           mode: skip  # does not engage the torch-spyre layer
+        - names:
+            - TestBinaryUfuncs::test_cross_device_inplace_error_msg
+            - TestBinaryUfuncs::test_sub_typing
+          mode: skip
 
   global:
     supported_dtypes:

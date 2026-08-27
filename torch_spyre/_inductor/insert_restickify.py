@@ -561,3 +561,38 @@ def insert_post_mutation_restickify(graph: GraphLowering) -> None:
             target_name,
             mutation_name,
         )
+
+
+def validate_no_restickify_on_mutation_targets(graph: GraphLowering) -> None:
+    """Assert that no restickify was inserted on a mutation target buffer.
+
+    A mutation op (MutationLayoutSHOULDREMOVE) writes directly into its target buffer.
+    Restickifying that buffer would redirect the write to a temporary, silently breaking
+    the in-place semantics.
+
+    Must run after insert_restickify (so restickify_plan is populated) and before
+    the scheduler (which resolves MutationLayoutSHOULDREMOVE to a concrete buffer
+    address, after which mutation target identity is no longer recoverable).
+    """
+    assert hasattr(graph, "restickify_plan"), (
+        "validate_no_restickify_on_mutation_targets must run after insert_restickify"
+    )
+    restickify_plan = graph.restickify_plan
+    for op in graph.operations:
+        if not isinstance(op, ComputedBuffer):
+            continue
+        layout = op.get_layout()
+        if not isinstance(layout, MutationLayoutSHOULDREMOVE):
+            continue
+        target = layout.target
+        while isinstance(target, ReinterpretView):
+            target = target.data
+        if not hasattr(target, "get_name"):
+            continue
+        target_name = target.get_name()
+        for entry in restickify_plan.get(op.get_name(), []):
+            if entry["arg_name"] == target_name:
+                raise AssertionError(
+                    f"restickify inserted on mutation target buffer {target_name!r} "
+                    f"as input to its own mutation op {op.get_name()!r}"
+                )

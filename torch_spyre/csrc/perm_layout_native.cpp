@@ -161,6 +161,13 @@ class NativePermutationLayoutSolver {
     sizes_.resize(n);
     std::vector<std::string> names(n);
     std::vector<std::vector<std::string>> parent_names(n);
+    // Whether each buffer's last use is a read, i.e. whether it has storage to
+    // hand to an in-place child (checked below). Derived here because it needs
+    // ``first_use_is_read``, which nothing else retains -- the rest of the test
+    // is recoverable from ``st->start``/``st->end``. The test is the one in
+    // ``plan_solver.check_in_place_parent_is_read``, "a use strictly after the
+    // first", kept term-for-term so a repeated index cannot pass as a read.
+    std::vector<char> can_hand_over(n, 0);
     for (int i = 0; i < n; ++i) {
       // ``py::object``, not ``py::handle``: a handle is a *borrowed* reference
       // owned only by ``buffers``, so Python code running during the field
@@ -178,6 +185,13 @@ class NativePermutationLayoutSolver {
         if (uses.empty()) {
           throw std::invalid_argument("buffer uses must be non-empty");
         }
+        // end_time is uses.back() + 1, so the last use has to leave room for
+        // it. A use past INT64_MAX already fails the cast above, making this
+        // the only value that reaches the addition.
+        if (uses.back() == std::numeric_limits<int64_t>::max()) {
+          throw std::invalid_argument("buffer " + std::to_string(i) +
+                                      ": last use must be below INT64_MAX");
+        }
         bool first_read = b.attr("first_use_is_read").cast<bool>();
         parent_names[i] =
             b.attr("in_place_parents").cast<std::vector<std::string>>();
@@ -185,6 +199,9 @@ class NativePermutationLayoutSolver {
         st->end[i] = uses.back() + 1;
         st->weight[i] =
             static_cast<double>(uses.size()) + (first_read ? 0.0 : 0.5);
+        const bool read_after_write =
+            uses.size() > 1 && uses.back() > uses.front();
+        can_hand_over[i] = (first_read || read_after_write) ? 1 : 0;
       }
       catch (const py::cast_error&) {
         // pybind11 turns a failed cast into a RuntimeError whose message names
@@ -229,6 +246,27 @@ class NativePermutationLayoutSolver {
         auto it = name_to_idx.find(pname);
         if (it == name_to_idx.end()) continue;
         int parent = it->second;
+        // The two invariants the Python packer asserts where it resolves the
+        // same pairs (``_compute_inplace_partners``), restated so the two
+        // packers reject the same inputs and not merely agree on the layouts
+        // they do produce. A write-only computed parent has no storage to hand
+        // over; and ``PlaceDecision`` co-locates a declared partner on nothing
+        // more than a time overlap, so a pair overlapping by more than the
+        // handoff tick would be handed one address while both are live.
+        if (!can_hand_over[parent]) {
+          throw std::invalid_argument(
+              "in-place parent " + names[parent] +
+              " is a computed buffer that is never read, so it cannot hand its "
+              "storage to child " +
+              names[child]);
+        }
+        if (st->end[parent] != st->start[child] + 1) {
+          throw std::invalid_argument(
+              "in-place pair (" + names[parent] + ", " + names[child] +
+              ") must hand off at a single tick: parent end_time " +
+              std::to_string(st->end[parent]) + " != child start_time " +
+              std::to_string(st->start[child]) + " + 1");
+        }
         st->declared_parents[child].push_back(parent);
         partner_sets[child].insert(parent);
         partner_sets[parent].insert(child);

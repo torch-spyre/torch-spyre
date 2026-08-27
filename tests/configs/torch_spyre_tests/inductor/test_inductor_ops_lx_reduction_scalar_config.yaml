@@ -35,8 +35,9 @@ test_suite_config:
             # identity copy reads the strided-conv output buffer densely and the
             # spatial elements shuffle). Non-strided direct convs are correct
             # under LX (all 16 stride-1 direct cases pass). Production never
-            # pins conv output -- conv is not in OP_OUTPUT_GOOD_FOR_LX_REUSE --
-            # so this is a test-only path (backend follow-up on PR #3284).
+            # pins conv output -- "convolution"/"conv2d" are in
+            # OP_OUTPUT_NOT_GOOD_FOR_LX_REUSE -- so this is a test-only path
+            # (backend follow-up on PR #3284).
             - LxPlanning.*::test_conv2d_direct_.*_s2_lx_planning_(pointwise|reduction)
           mode: xfail
         - names:
