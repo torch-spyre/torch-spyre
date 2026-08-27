@@ -13,11 +13,15 @@
 # limitations under the License.
 
 from collections.abc import Sequence
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from dataclasses import replace
+import json
 import logging
 import logging.handlers
+import os
+from pathlib import Path
 import regex as re
+import subprocess
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch as mock_patch
@@ -42,6 +46,7 @@ import torch_spyre._inductor.scratchpad.lx_relayout as lx_relayout_module
 import torch_spyre._inductor.scheduler as scheduler_module
 import torch_spyre._inductor.work_division as _wd
 import torch_spyre._inductor.wsr.propagate_named_dims as _pnd
+import torch_spyre.execution.async_compile as async_compile_module
 from torch_spyre._C import DataFormats
 from torch_spyre._inductor.codegen.superdsc import compile_op_spec, parse_op_spec
 from torch_spyre._inductor.constants import IDENTITY_OP
@@ -64,6 +69,63 @@ _PREPARE_KERNEL = "torch_spyre.execution.kernel_runner.prepare_kernel"
 
 _declare_tensor_dim = _pnd.declare_tensor_dim
 _name_tensor_dims = _pnd.name_tensor_dims
+
+
+@contextmanager
+def _capture_backend_output_dirs():
+    output_dirs = []
+    get_output_dir = async_compile_module.get_output_dir
+
+    def capture(kernel_name):
+        output_dir = get_output_dir(kernel_name)
+        output_dirs.append(Path(output_dir))
+        return output_dir
+
+    with mock_patch.object(async_compile_module, "get_output_dir", side_effect=capture):
+        yield output_dirs
+
+
+def _assert_lx_only_relayout_payload(output_dirs):
+    for output_dir in output_dirs:
+        subprocess.run(
+            ["dxp_standalone", "-d", output_dir, "--use-dxp"],
+            check=True,
+            env={**os.environ, "DXP_DEBUG": "1"},
+        )
+    payloads = [
+        json.loads(path.read_text())
+        for output_dir in output_dirs
+        for path in output_dir.glob("debug/sdsc_*/*.out.out.out.json")
+    ]
+    assert payloads, "DeepTools emitted no debug SDSC payloads"
+
+    op_names = []
+    lx_ops = []
+
+    def visit(value):
+        if isinstance(value, dict):
+            op = value.get("op")
+            if isinstance(op, dict) and op.get("name") == "STCDPOpLx":
+                lx_ops.append(value)
+            for key, child in value.items():
+                if key == "name" and isinstance(child, str):
+                    op_names.append(child)
+                visit(child)
+        elif isinstance(value, list):
+            for child in value:
+                visit(child)
+
+    for payload in payloads:
+        visit(payload)
+
+    assert len(lx_ops) == 1
+    assert not any(
+        token in name.lower()
+        for name in op_names
+        for token in ("dma", "restickify", "stcdpophbm")
+    )
+    labeled_ds = lx_ops[0]["labeledDs_"]
+    assert labeled_ds and all(ds["hbmSize_"] == 0 for ds in labeled_ds)
 
 
 class TestNamedWorkDivisionHint(InductorTestCase):
@@ -1162,7 +1224,8 @@ def test_grouped_lx_gather_device(
         if force_fallback
         else nullcontext()
     )
-    with preview:
+    backend = nullcontext([]) if force_fallback else _capture_backend_output_dirs()
+    with preview, backend as output_dirs:
         actual, code = run_and_get_code(
             torch.compile(fn, dynamic=False, options={"epilogue_fusion": False}),
             *device_args,
@@ -1185,6 +1248,7 @@ def test_grouped_lx_gather_device(
     else:
         assert identities[0].count("allocation={'lx':") == 2
         assert identities[0].count("TensorWorkDivision(") == 2
+        _assert_lx_only_relayout_payload(output_dirs)
 
 
 def test_lx_relayout_allocation_is_atomic_in_one_greedy_solve(caplog):
