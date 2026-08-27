@@ -138,7 +138,8 @@ def generate_bundle(
     if sdsc_cache_counts is not None:
         hits, misses = sdsc_cache_counts
         logger.info(
-            "sdsc_cache: %d/%d ops reused an existing sdsc file (%d unique)",
+            "sdsc_cache: %d/%d ops were structurally identical to an earlier "
+            "op (%d unique; each still emitted as its own sdsc file)",
             hits,
             hits + misses,
             misses,
@@ -497,15 +498,15 @@ def _compile_specs(
                     arg_indices
                 )
                 cached = sdsc_cache.get(cache_key)
-            if cached is None:
-                idx = sdsc_counter[0]
-                sdsc_counter[0] += 1
-                if _sdsc_cache_counts is not None:
-                    _sdsc_cache_counts[1] += 1
-            else:
-                idx, cached_json = cached
-                if _sdsc_cache_counts is not None:
-                    _sdsc_cache_counts[0] += 1
+            # The SBF bundler's uniqueSdscMap_ requires each sdsc_filename in
+            # exactly one sdsc_execute, so every OpSpec gets its own file even
+            # on a cache hit -- reuse would emit duplicate filenames and abort
+            # the bundler. Pool planning makes reuse routine (one kernel across
+            # many pool regions). The cache lookup now only tallies duplicates.
+            idx = sdsc_counter[0]
+            sdsc_counter[0] += 1
+            if _sdsc_cache_counts is not None:
+                _sdsc_cache_counts[0 if cached is not None else 1] += 1
             sdsc_json, local_sym_values, affine_strides, local_symbol_kinds = (
                 compile_op_spec(
                     idx,
@@ -516,13 +517,12 @@ def _compile_specs(
             )
             symbol_id_offset_counter[0] += len(local_sym_values)
             file_name = f"sdsc_{idx}.json"
-            if cached is None:
-                cached_json = sdsc_json
-                if sdsc_cache is not None:
-                    sdsc_cache[cache_key] = (idx, cached_json)
-                with open(os.path.join(output_dir, file_name), "w") as f:
-                    logger.info(f"Generating {f.name}")
-                    json.dump(sdsc_json, f, indent=2)
+            cached_json = sdsc_json
+            if sdsc_cache is not None and cached is None:
+                sdsc_cache[cache_key] = (idx, cached_json)
+            with open(os.path.join(output_dir, file_name), "w") as f:
+                logger.info(f"Generating {f.name}")
+                json.dump(sdsc_json, f, indent=2)
             compiled.append(
                 (
                     sdsc_json,

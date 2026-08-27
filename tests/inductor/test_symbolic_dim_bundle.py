@@ -19,10 +19,13 @@ compile_op_spec is mocked throughout so no Spyre hardware is required.
 
 import os
 import tempfile
+
+import regex as re
 from unittest.mock import patch
 
 from torch._inductor.test_case import TestCase as InductorTestCase
 
+from torch_spyre._inductor import config
 from torch_spyre._inductor.codegen.bundle import (
     _extract_symbol_ids,
     generate_bundle,
@@ -406,3 +409,79 @@ class TestGenerateBundleDimensionSymbols(InductorTestCase):
             f"%pool = sdscbundle.device_mem_allocate {MAX_POOL_SIZE_BYTES} bytes : index",
             bundle,
         )
+
+
+class TestSdscCacheUniqueFilenames(InductorTestCase):
+    """The sdsc_cache must never make two sdsc_execute ops share a filename.
+
+    The backend's SDSC-loading pass registers each sdsc_filename exactly once
+    and assumes it appears in a single sdsc_execute (the SBF bundler enforces
+    this with a uniqueSdscMap_ that rejects a repeated filename outright). HBM
+    pool planning routinely executes one structurally-identical kernel across
+    several pool regions -- the pool address is an sdsc_execute operand, not
+    part of the SDSC json -- which the cache would otherwise collapse onto a
+    single reused file, emitting several sdsc_execute ops that share one
+    filename and crashing the bundler. Every OpSpec must get its own file.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.output_dir = self._tmpdir.name
+
+    def tearDown(self):
+        self._tmpdir.cleanup()
+        super().tearDown()
+
+    def _run_identical_ops(self, n: int) -> str:
+        """Bundle n structurally-identical ops with the cache on; return mlir.
+
+        The real compile_op_spec bakes its idx argument into the SDSC json's
+        top-level key. The cache-key probe always passes idx=0, so identical
+        ops collide on the cache key (hits after the first); the real call
+        passes the freshly-allocated sdsc idx, so each op's json -- and hence
+        its sdsc file -- must be distinct.
+        """
+
+        def fake_compile(idx, entry, symbols, offset):
+            return (
+                _make_sdsc_json(sdsc_idx=idx, hbm_sym_ids_per_core={"[0, 0, 0]": -1}),
+                [0],
+                [],
+                [SymbolKind.kernel(arg_index=0)],
+            )
+
+        op_specs = [_minimal_op_spec() for _ in range(n)]
+        with (
+            config.patch({"sdsc_cache": True}),
+            patch(
+                "torch_spyre._inductor.codegen.bundle.compile_op_spec",
+                side_effect=fake_compile,
+            ),
+        ):
+            generate_bundle("test", self.output_dir, op_specs, pool_size=0)
+        with open(os.path.join(self.output_dir, "bundle.mlir")) as f:
+            return f.read()
+
+    def test_identical_ops_get_distinct_sdsc_filenames(self):
+        """Three identical ops -> three sdsc_execute ops, three distinct files.
+
+        Regression: with the old file-reuse behavior the cache hits collapsed
+        all three onto sdsc_0.json, producing duplicate sdsc_filename refs.
+        """
+        bundle = self._run_identical_ops(3)
+
+        filenames = re.findall(r'sdsc_filename="([^"]+)"', bundle)
+        self.assertEqual(len(filenames), 3, f"expected 3 sdsc_execute, got {filenames}")
+        self.assertEqual(
+            len(set(filenames)),
+            3,
+            f"duplicate sdsc_filename(s) violate the backend 1:1 invariant: {filenames}",
+        )
+
+        written = sorted(
+            f
+            for f in os.listdir(self.output_dir)
+            if f.startswith("sdsc_") and f.endswith(".json")
+        )
+        self.assertEqual(set(filenames), set(written))
