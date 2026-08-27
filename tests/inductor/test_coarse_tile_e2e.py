@@ -5628,7 +5628,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         """h_tiles == H (one head per tile) crashes in read-copy insertion."""
         self._run_kv_chunked_flash(h_tiles=8, lq_tiles=2)
 
-
     def test_hint_flash_attention_kv_chunked_8_chunks(self):
         """8 unrolled K/V chunks: now succeeds with optimized layouts for constants"""
         self._run_kv_chunked_flash(

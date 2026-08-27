@@ -336,14 +336,15 @@ def finalize_layouts(graph: GraphLowering) -> None:
                 accum_layout = mut_target_buf.get_layout()
                 if isinstance(accum_layout, FixedTiledLayout):
                     existing_stl = accum_layout.device_layout
-                    if existing_stl != committed:
-                        print(
-                            f"WARNING: Two mutation ops write SpyreEmptyFallback "
-                            f"{mut_target_name!r} with conflicting layouts: "
-                            f"existing={list(existing_stl.stride_map)} "
-                            f"new={list(committed.stride_map)} "
-                            f"op={op.get_name()!r}"
-                        )
+                    assert existing_stl == committed, (
+                        f"Two mutation ops write SpyreEmptyFallback "
+                        f"{mut_target_name!r} with conflicting layouts: "
+                        f"existing=device_size={existing_stl.device_size} "
+                        f"stride_map={list(existing_stl.stride_map)} "
+                        f"new=device_size={committed.device_size} "
+                        f"stride_map={list(committed.stride_map)} "
+                        f"op={op.get_name()!r}"
+                    )
                 if isinstance(accum_layout, (FixedTiledLayout, FixedLayout)):
                     mut_target_buf.layout = FixedTiledLayout(
                         accum_layout.device,

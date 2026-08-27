@@ -38,7 +38,6 @@ from .pass_utils import (
     compute_restickify_needed,
     device_coordinates,
     host_coordinates,
-    stl_eq,
 )
 
 INF = math.inf
@@ -238,7 +237,7 @@ class AllSameNode(RestickNodeCost):
         # layouts, which is always wrong — cost INF, not a restickify.
         co_offset = len(self._input_edge_costs)
         for ec, lk in zip(self._output_edge_costs, in_layouts[co_offset:]):
-            if lk is not None and not stl_eq(lk, out_stl):
+            if lk is not None and lk != out_stl:
                 return INF
         return input_cost
 
