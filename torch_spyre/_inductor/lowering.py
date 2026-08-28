@@ -1430,7 +1430,7 @@ def lower_full(size, fill_value, dtype=None, layout=None, device=None, pin_memor
     assert not pin_memory, f"doesn't support pin_memory={pin_memory}"
     if dtype is None:
         dtype = torch.get_default_dtype()
-    if dtype not in (torch.float16, torch.float32):
+    if dtype not in (torch.float16, torch.bfloat16, torch.float32):
         return ir.TensorBox.create(
             ir.FallbackKernel.create(
                 torch.ops.aten.full.default,
