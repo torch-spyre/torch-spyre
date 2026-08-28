@@ -671,6 +671,74 @@ def spyre_amin_decomp(
     return torch.ops.prims.convert_element_type(result_float, torch.bool)
 
 
+@register_spyre_decompositions([torch.ops.aten.sum.dim_IntList])
+def spyre_sum_dim_decomp(
+    input: torch.Tensor, dim=None, keepdim: bool = False, dtype=None
+) -> torch.Tensor:
+    """
+    Decompose torch.sum(input, dim) for boolean tensors only.
+
+    bool input:  bool(dl16) -> fp32 -> sum(fp32) -> fp32 -> int64
+        The bool tensor is reinterpreted as its physical float dtype (zero-copy
+        identity via prims.convert_element_type), promoted to fp32 if needed
+        (fp16-based bool), summed in fp32, then cast to int64 to match PyTorch
+        CPU semantics (torch.sum on bool returns int64: count of True values).
+
+        The DL16-to-FP32 conversion staggeres the fp32 tensor. Summing over a
+        non-stick dim accumulates elements in an order that depends on the
+        stagger, producing wrong results. Summing over the stick dim is
+        unaffected because the result is the sum of all elements in that dim
+        regardless of their order; stick-dim alignment is still required.
+        (Alignment and stagger constraints are enforced by _validate_sum_op in
+        split_multi_ops.py.)
+
+    For non-bool dtypes: return NotImplemented to use the default lowering.
+        fp32 inputs (device_dtype IEEE_FP32) are handled by the default
+        lowering path; stick-dim alignment is enforced there by _validate_sum_op.
+    """
+    if input.dtype != torch.bool:
+        return NotImplemented
+
+    # Reinterpret bool as its physical float dtype (zero-copy identity op).
+    float_dtype = _get_float_dtype_for_bool()
+
+    input_float = torch.ops.prims.convert_element_type(input, float_dtype)
+
+    # Sum requires fp32 precision. If the bool is fp16-based, promote to fp32.
+    if float_dtype != torch.float32:
+        input_float = torch.ops.prims.convert_element_type(input_float, torch.float32)
+
+    result_float = torch.ops.aten.sum.dim_IntList(input_float, dim, keepdim)
+
+    # Cast fp32 sum result to int64: PyTorch CPU semantics for sum(bool) -> int64.
+    # fp32->int64 is not in DtypeOpTable, so to_dtype lowering routes this to
+    # eager_fallback(to_dtype_cpu), the same CPU round-trip used by with_int64_fallback.
+    return torch.ops.prims.convert_element_type(result_float, torch.int64)
+
+
+@register_spyre_decompositions([torch.ops.aten.sum.default])
+def spyre_sum_default_decomp(input: torch.Tensor, dtype=None) -> torch.Tensor:
+    """
+    Decompose torch.sum(input) (no-dim form) for boolean tensors only.
+    Reduces over all dimensions. Delegates to spyre_sum_dim_decomp.
+
+    bool input:  bool(dl16) -> fp32 -> sum(fp32) -> fp32 -> int64
+        The DL16-to-FP32 conversion staggeres the fp32 tensor, but reducing
+        over all dims makes element order irrelevant, so stagger does not
+        affect correctness. Stick-dim alignment is still required.
+        (Alignment constraints are enforced by _validate_sum_op in
+        split_multi_ops.py.)
+
+    For non-bool dtypes: return NotImplemented to use the default lowering.
+        fp32 inputs (device_dtype IEEE_FP32) are handled by the default
+        lowering path; stick-dim alignment is enforced there by _validate_sum_op.
+    """
+    if input.dtype != torch.bool:
+        return NotImplemented
+
+    return spyre_sum_dim_decomp(input, dim=list(range(input.dim())), keepdim=False)
+
+
 @register_spyre_decompositions([torch.ops.aten.ceil.default])
 def spyre_ceil(input: torch.Tensor) -> torch.Tensor:
     return torch.ops.aten.neg.default(

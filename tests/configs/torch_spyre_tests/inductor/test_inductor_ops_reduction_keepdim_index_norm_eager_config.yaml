@@ -32,5 +32,10 @@ test_suite_config:
             - TestOps::test_mean_keepdim1_mean_fp16_3d_dim_neg1_spyre
             - TestOps::test_mean_keepdim1_mean_fp32_3d_dim_2_spyre
             - TestOps::test_mean_keepdim1_mean_fp32_3d_dim_neg1_spyre
-            - TestOps::test_sum_keepdim1_sum_fp32_3d_dim_neg1_spyre
+          mode: xfail
+        # Known failures for test_sum_keepdim0
+        - names:
+            - TestOps::test_sum_keepdim0_sum_fp32_2d_dim_1_unaligned_spyre
+            - TestOps::test_sum_keepdim0_sum_bool_2d_non_stickdim_spyre
+            - TestOps::test_sum_keepdim0_sum_bool_2d_dim_1_unaligned_spyre
           mode: xfail

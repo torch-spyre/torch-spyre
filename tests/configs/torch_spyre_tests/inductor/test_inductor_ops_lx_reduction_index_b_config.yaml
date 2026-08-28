@@ -25,8 +25,10 @@ test_suite_config:
           mode: xfail
         - names:
             - LxPlanning.*::test_aminmax_keepdim.*_lx_planning_(pointwise|reduction)
-            - LxPlanning.*::test_sum_keepdim0.*_lx_planning_(pointwise|reduction)
-            - LxPlanning.*::test_sum_keepdim1.*_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_sum_keepdim0_sum_(fp16|fp32).*_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_sum_keepdim0_sum_bool_(2d_dim_1|4d_dim_3)_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_sum_keepdim1_sum_(fp16|fp32).*_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_sum_keepdim1_sum_bool_(1d_dim_0|2d_dim_1)_lx_planning_(pointwise|reduction)
             - LxPlanning.*::test_mean_keepdim0.*_lx_planning_(pointwise|reduction)
             - LxPlanning.*::test_mean_keepdim1.*_lx_planning_(pointwise|reduction)
             - LxPlanning.*::test_vector_norm_keepdim.*_lx_planning_(pointwise|reduction)
