@@ -298,13 +298,14 @@ def _plan_carried_sum(
     """
 
     data = op.data
+    has_work_div = bool(getattr(op, "work_div_loop_info", None))
     if not (
         isinstance(data, Reduction)
         and data.reduction_type == "sum"
         and getattr(data, "src_dtype", object()) == getattr(data, "dtype", None)
         and not is_nested
-        and is_graph_output
-        and not outside_consumer_names
+        and (is_graph_output or has_work_div)
+        and (not outside_consumer_names or has_work_div)
         and len(info.loop_count) == 1
         and all(not dims for dims in info.loop_tiled_dims)
         and info.loop_tiled_reduction_dims == [[0]]
