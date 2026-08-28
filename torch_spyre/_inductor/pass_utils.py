@@ -1485,8 +1485,9 @@ def splits_by_index_coeff(
 
     This is intentionally a boundary representation: pre-scheduler passes keep
     symbol-keyed ownership. Coefficients are stable across scheduler renaming,
-    but distinct non-unity splits sharing one coefficient are ambiguous and
-    rejected.
+    but cannot distinguish distinct non-unity splits sharing one coefficient.
+    This encoder retains the established iteration-order last-axis-wins behavior;
+    ``finalize_work_division_for_scheduler`` warns when that transport is lossy.
 
     Only non-unity splits are stored; 1 is the default on the apply side.
     Dimensions absent from both indexes are intentionally omitted.

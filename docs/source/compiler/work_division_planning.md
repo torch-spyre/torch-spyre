@@ -398,7 +398,7 @@ an iteration dimension. Domains are intersected when multiple constraints apply.
 A domain containing `1` permits leaving that dimension unsplit. A domain that
 excludes `1`, such as `{2, 4, 8}`, also establishes a mandatory baseline: the
 planner reserves its smallest factor (`2`) before greedy distribution, then may
-grow it only to a legal multiple (`4` or `8`) if core budget remains. Thus an
+grow it to any larger legal factor (`4` or `8`) if core budget remains. Thus an
 explicit legal-factor domain can encode a minimum split without a separate
 constraint field. `{2}` instead pins the dimension to exactly `2`.
 
@@ -452,14 +452,15 @@ under the constraint that total cores used is `k_cores * product(other_dims) <= 
 ## Keep-by-index work division
 
 `keep_by_index` applies an index-selected mask while preserving the values
-shape. Its index tensor adds a K axis that is absent from the output, while the
-values dimension absent from the indices is the full search axis.
+shape. Its index tensor adds a K axis that is absent from the output. One output
+coordinate absent from the semantic indices operand is selected as the full
+search axis; other absent coordinates can be broadcast batch/output axes.
 
 1. **Index-only K uses the minimum supported split.** Its legal factor is the
    smallest divisor `d` of K that satisfies `K / d <= 4` and `d <= SENCORES`.
    The hardware supports at most four selected indices per core.
-2. **The search axis remains whole.** Every core must search the full masked
-   values dimension, so its legal split is `1`.
+2. **The selected search axis remains whole.** Every core must search the full
+   masked values dimension, so its legal split is `1`.
 3. **Other output and batch axes remain eligible.** The default planner uses
    them with the remaining core budget.
 
@@ -487,10 +488,10 @@ and Pass 3 distributes the remaining cores. Without the Pass-1 commit,
 the planner would enumerate divisors of `(B, M, N, K)` and price each
 feasible combination with the cost equation.
 
-Pass 3 retains Pass 1's K=2 lower bound. A committed factor may grow only to
-a legal multiple, preserving its existing work partition. With 16 cores
-remaining per K-slice, it ranks output dims by size (`M = 8192`, `N = 4096`)
-and assigns all 16 cores to `M`. Final split: `{M: 16, N: 1, K: 2}`.
+Pass 3 retains Pass 1's K=2 lower bound. A later split may use any legal
+factor at or above that floor. With 16 cores remaining per K-slice, it ranks
+output dims by size (`M = 8192`, `N = 4096`) and assigns all 16 cores to `M`.
+Final split: `{M: 16, N: 1, K: 2}`.
 
 | Dim | Size | Split | Per-core |
 |---|---|---|---|

@@ -268,10 +268,9 @@ def multi_dim_iteration_space_split(
       3. If this is a reduction op, pick the single most-splittable reduction dim
          for any remaining cores.
 
-    ``symbol_meta`` carries ``(max_size, granularity)`` for any symbolic dim;
-    when a dim is symbolic, ``core_split`` is fed ``granularity`` instead of
-    the concretised size so the chosen split divides every admissible runtime
-    bucket evenly.
+    ``symbol_meta`` carries ``(max_size, granularity)`` for any symbolic dim.
+    A symbolic dimension uses ``granularity`` instead of its concretised size
+    so the chosen split divides every admissible runtime bucket evenly.
 
     ``mandatory_splits`` is a local merge of ``min_splits`` and the smallest
     legal factor for every domain that excludes one. Each selected factor
@@ -315,6 +314,13 @@ def multi_dim_iteration_space_split(
         splits[var] = min_split
         cores_used *= min_split
 
+    split_reduction_dims = [v for v in reduction_dims if splits[v] > 1]
+    if len(split_reduction_dims) > 1:
+        raise Unsupported(
+            "The backend supports at most one split reduction dimension, got "
+            f"{split_reduction_dims}."
+        )
+
     for v in output_dims:
         if cores_used >= max_cores:
             break
@@ -345,8 +351,11 @@ def multi_dim_iteration_space_split(
             splits[v] = best_split
 
     if is_reduction_included and cores_used < max_cores:
+        eligible_reduction_dims = (
+            split_reduction_dims if split_reduction_dims else reduction_dims
+        )
         result = _most_splittable_dim(
-            reduction_dims,
+            eligible_reduction_dims,
             iteration_space,
             splits,
             cores_used,
@@ -923,8 +932,12 @@ def work_division_splits_are_legal(
         )
     )
     min_splits = _span_min_splits(op)
+    split_reduction_dims = [
+        v for v in it_space_adjusted if v not in coord_vars and splits.get(v, 1) > 1
+    ]
     return (
-        not any(splits.get(v, 1) > 1 for v in result.blocked)
+        len(split_reduction_dims) <= 1
+        and not any(splits.get(v, 1) > 1 for v in result.blocked)
         and all(
             splits.get(v, 1) in allowed for v, allowed in result.allowed_splits.items()
         )

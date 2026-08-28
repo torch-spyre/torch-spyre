@@ -207,6 +207,17 @@ class TestMultiDimIterationSpaceSplit(unittest.TestCase):
         )
         self.assertEqual(splits[o0], 3)
 
+    def test_rejects_two_mandatory_reduction_splits(self):
+        r0, r1 = Symbol("r0"), Symbol("r1")
+        with self.assertRaisesRegex(Unsupported, "at most one split reduction"):
+            multi_dim_iteration_space_split(
+                {r0: 8, r1: 8},
+                32,
+                [],
+                [r0, r1],
+                allowed_splits={r0: frozenset({2}), r1: frozenset({2})},
+            )
+
 
 class TestWorkDivisionCandidates(unittest.TestCase):
     def test_candidates_respect_span_floor(self):
@@ -316,6 +327,38 @@ class TestWorkDivisionSplitLegality(unittest.TestCase):
             self.assertTrue(work_division_splits_are_legal(op, {x: 2}))
             self.assertFalse(work_division_splits_are_legal(op, {x: 1}))
 
+    def test_rejects_two_split_reduction_axes(self):
+        o, r0, r1 = (_isym(name) for name in ("o", "r0", "r1"))
+        op = _computed_buffer((8,), name="two_reductions")
+        output_td = _tensor_dep("two_reductions", (8,), (o,))
+        rw = MagicMock(writes=[output_td.dep], reads=[])
+        with (
+            patch(
+                "torch_spyre._inductor.work_division.iteration_space_from_op",
+                return_value={o: 8, r0: 8, r1: 8},
+            ),
+            patch(
+                "torch_spyre._inductor.work_division.op_read_writes", return_value=rw
+            ),
+            patch(
+                "torch_spyre._inductor.work_division.get_mem_deps_from_rw",
+                return_value=[],
+            ),
+            patch(
+                "torch_spyre._inductor.work_division.collect_tensor_deps",
+                return_value=([], output_td),
+            ),
+            patch(
+                "torch_spyre._inductor.work_division.adjust_it_space_for_sticks",
+                return_value=({o: 8, r0: 8, r1: 8}, {}),
+            ),
+            patch(
+                "torch_spyre._inductor.work_division.collect_work_division_constraints",
+                return_value=ConstraintResult(),
+            ),
+        ):
+            self.assertFalse(work_division_splits_are_legal(op, {r0: 2, r1: 2}))
+
     def test_uses_input_layout_override_for_qfp8wt_constraint(self):
         b, m, n = _isym("b"), _isym("m"), _isym("n")
         op = _computed_buffer((4, 8, 128), name="override_output")
@@ -393,6 +436,32 @@ class TestKeepByIndexConstraints(unittest.TestCase):
 
         self.assertEqual(k_result.allowed_splits, {k: frozenset({2})})
         self.assertEqual(search_result.allowed_splits, {search: frozenset({1})})
+
+    def test_only_one_search_axis_is_pinned_when_indices_broadcast_batch(self):
+        batch, search, k = (_isym(name) for name in ("batch", "search", "k"))
+        op = _computed_buffer(
+            (8, 64), name="keep_by_index", reduction_type="keepbyindex"
+        )
+        output_td = _tensor_dep("keep_by_index", (8, 64), (batch, search))
+        ctx = _make_context(
+            op,
+            output_td,
+            input_tds=[
+                _tensor_dep("values", (8, 64), (batch, search)),
+                _tensor_dep("indices", (8,), (k,)),
+            ],
+            it_space={batch: 8, search: 64, k: 8},
+            reduction_vars=(k,),
+        )
+        rw = MagicMock(writes=[output_td.dep])
+
+        with patch(
+            "torch_spyre._inductor.work_division_constraints.op_read_writes",
+            return_value=rw,
+        ):
+            result = keep_by_index_pinned_search_space_vars(ctx)
+
+        self.assertEqual(result.allowed_splits, {batch: frozenset({1})})
 
 
 class TestCostModelConstraints(unittest.TestCase):

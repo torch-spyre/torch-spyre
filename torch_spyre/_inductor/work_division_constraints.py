@@ -305,10 +305,8 @@ def topk_split_domains(ctx: WorkDivConstraintContext) -> ConstraintResult:
     return ConstraintResult(allowed_splits=allowed_splits)
 
 
-def _keep_by_index_axes(
-    ctx: WorkDivConstraintContext,
-) -> tuple[set[Symbol], set[Symbol]] | None:
-    """Return the index-only K and full-search axes of a keep_by_index op."""
+def _keep_by_index_axes(ctx: WorkDivConstraintContext) -> set[Symbol] | None:
+    """Return the index-only K axes of a keep_by_index op."""
     if not (
         isinstance(ctx.op.data, Reduction)
         and ctx.op.data.reduction_type == KEEP_BY_INDEX_OP
@@ -339,7 +337,7 @@ def _keep_by_index_axes(
     )
     if not index_vars:
         index_vars = set(ctx.reduction_vars)
-    return index_vars - output_vars, output_vars - index_vars
+    return index_vars - output_vars
 
 
 def keep_by_index_k_split_constraint(ctx: WorkDivConstraintContext) -> ConstraintResult:
@@ -347,9 +345,8 @@ def keep_by_index_k_split_constraint(ctx: WorkDivConstraintContext) -> Constrain
     axes = _keep_by_index_axes(ctx)
     if axes is None:
         return ConstraintResult()
-    index_only, _ = axes
     allowed_splits = {}
-    for axis in index_only:
+    for axis in axes:
         size = concretize_expr(ctx.it_space[axis])
         legal = [
             split
@@ -368,13 +365,40 @@ def keep_by_index_k_split_constraint(ctx: WorkDivConstraintContext) -> Constrain
 def keep_by_index_pinned_search_space_vars(
     ctx: WorkDivConstraintContext,
 ) -> ConstraintResult:
-    """Keep keep_by_index's full-search output axis on each core."""
-    axes = _keep_by_index_axes(ctx)
-    if axes is None:
+    """Keep one keep_by_index full-search output axis on each core.
+
+    A broadcast indices input can omit unrelated output/batch axes. Preserve the
+    prior coordinate-based policy: select one simplest output coordinate absent
+    from the semantic indices operand rather than pinning every absent symbol.
+    """
+    if (
+        not (
+            isinstance(ctx.op.data, Reduction)
+            and ctx.op.data.reduction_type == KEEP_BY_INDEX_OP
+        )
+        or len(ctx.input_tds) < 2
+    ):
         return ConstraintResult()
-    _, search_axes = axes
-    return ConstraintResult(
-        allowed_splits={axis: frozenset({1}) for axis in search_axes}
+
+    index_coords = ctx.input_tds[1].device_coords
+    candidates = [
+        coord
+        for coord in ctx.output_td.device_coords
+        if coord.free_symbols and not any(coord.equals(index) for index in index_coords)
+    ]
+    if not candidates:
+        return ConstraintResult()
+
+    search_coord = min(
+        candidates, key=lambda coord: (len(coord.free_symbols), str(coord))
+    )
+    search_axis = next(
+        (axis for axis in ctx.it_space if axis in search_coord.free_symbols), None
+    )
+    return (
+        ConstraintResult(allowed_splits={search_axis: frozenset({1})})
+        if search_axis is not None
+        else ConstraintResult()
     )
 
 
