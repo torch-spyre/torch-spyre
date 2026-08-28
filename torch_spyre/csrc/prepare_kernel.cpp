@@ -29,7 +29,6 @@
 
 #include "job_plan.h"
 #include "logging.h"
-#include "module.h"
 #include "spyre_allocator.h"
 #include "spyrecode-host-functions/spyrecode.h"
 

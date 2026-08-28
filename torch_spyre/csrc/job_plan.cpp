@@ -396,41 +396,46 @@ std::string checkJobPlanStepOrdering(const std::vector<StepKind>& kinds,
     return std::string(i < seq.size() ? stepKindName(seq[i]) : "<end>");
   };
 
-  // S_prep must be exactly HostCompute -> H2D. On the HAZARD path torch-spyre
-  // emits no cross-stream event steps; flex derives the RAW/WAR edges.
+  // The contract is ordering-only, not an exact triple: prepare can emit longer
+  // plans (e.g. HostCompute -> H2D -> Compute -> D2H), which project to
+  // S_prep = [HostCompute, H2D] and S_dev = [Compute, D2H]. What must hold is
+  // the leading-producer guarantee: prep produces (HostCompute -> H2D) before
+  // dev consumes (Compute). On the HAZARD path torch-spyre emits no cross-
+  // stream event steps; flex derives the RAW/WAR edges from these subsequences.
+
+  // S_prep must BEGIN with HostCompute -> H2D and carry only {HostCompute, H2D}
+  // (the persistent host-compute stream; see StreamRole in job_plan.h).
   {
-    size_t i = 0;
-    if (i >= prep.size() || prep[i] != StepKind::HostCompute) {
+    if (prep.size() < 2 || prep[0] != StepKind::HostCompute ||
+        prep[1] != StepKind::H2D) {
       return "S_prep ordering violation: prep stream must begin with "
-             "HostCompute, got " +
-             name_at(prep, i);
+             "HostCompute -> H2D, got " +
+             name_at(prep, 0) + " -> " + name_at(prep, 1);
     }
-    ++i;
-    if (i >= prep.size() || prep[i] != StepKind::H2D) {
-      return "S_prep ordering violation: expected H2D after HostCompute, got " +
-             name_at(prep, i);
-    }
-    ++i;
-    if (i != prep.size()) {
-      return "S_prep ordering violation: unexpected step " + name_at(prep, i) +
-             " (prep allows only HostCompute -> H2D; any Compute on the prep "
-             "stream lands here)";
+    for (size_t i = 2; i < prep.size(); ++i) {
+      if (prep[i] != StepKind::HostCompute && prep[i] != StepKind::H2D) {
+        return "S_prep ordering violation: " + name_at(prep, i) +
+               " is not permitted on the prep stream (prep carries only "
+               "HostCompute / H2D)";
+      }
     }
   }
 
-  // S_dev must be exactly Compute (no HostCompute/H2D on the device stream),
-  // preserving the leading-producer guarantee.
+  // S_dev must BEGIN with Compute (leading-producer guarantee) and carry only
+  // {Compute, D2H} (the device stream; see StreamRole in job_plan.h). No
+  // HostCompute/H2D -- host-produce steps belong on S_prep.
   {
-    size_t i = 0;
-    if (i >= dev.size() || dev[i] != StepKind::Compute) {
-      return "S_dev ordering violation: expected Compute, got " +
-             name_at(dev, i) +
-             " (no HostCompute/H2D permitted on the device stream)";
+    if (dev.empty() || dev[0] != StepKind::Compute) {
+      return "S_dev ordering violation: device stream must begin with Compute, "
+             "got " +
+             name_at(dev, 0);
     }
-    ++i;
-    if (i != dev.size()) {
-      return "S_dev ordering violation: unexpected step " + name_at(dev, i) +
-             " (dev allows only Compute)";
+    for (size_t i = 1; i < dev.size(); ++i) {
+      if (dev[i] != StepKind::Compute && dev[i] != StepKind::D2H) {
+        return "S_dev ordering violation: " + name_at(dev, i) +
+               " is not permitted on the device stream (dev carries only "
+               "Compute / D2H)";
+      }
     }
   }
 

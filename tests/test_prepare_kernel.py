@@ -365,83 +365,50 @@ class TestPrepareKernel:
             with pytest.raises(RuntimeError, match="Step index out of range"):
                 job_plan.get_step_type(999)
 
-    def test_hazard_tracker_emits_bare_split_triple(self):
-        """SPYRE_HAZARD_TRACKER on: prepare emits the bare split triple.
+    def test_prepare_emits_bare_split_triple(self):
+        """prepare emits the bare split triple, independent of the flag.
 
         PrepareKernel emits the plain [HostCompute, H2D, Compute] triple with
         NO cross-stream event steps, carrying its by-type roles [Prep, Prep,
         Dev] -- so the launch router splits it across S_prep/S_dev while flex
         inserts the cross-stream RAW/WAR edges dynamically at enqueue. There is
         no plan rewrite and no event-step emission (3 steps, never 7).
+
+        SPYRE_HAZARD_TRACKER only affects launch-time routing (whether the
+        S_prep/S_dev split engages), never the prepared plan's shape, so this
+        holds regardless of the flag.
         """
-        prev = torch_spyre._C.get_hazard_tracker_enabled()
-        try:
-            torch_spyre._C.set_hazard_tracker_enabled(True)
-            with tempfile.TemporaryDirectory() as tmpdir:
-                spyrecode_dir = self.create_mock_spyrecode(
-                    tmpdir, exec_command="ComputeOnHost"
-                )
-                # Must NOT raise: prepare emits the plain triple unconditionally
-                # (the static-edge block and its region-count TORCH_CHECK are
-                # gone), so nothing here depends on the program-region count.
-                job_plan = torch_spyre._C.prepare_kernel(spyrecode_dir)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            spyrecode_dir = self.create_mock_spyrecode(
+                tmpdir, exec_command="ComputeOnHost"
+            )
+            # Must NOT raise: prepare emits the plain triple unconditionally
+            # (the static-edge block and its region-count TORCH_CHECK are
+            # gone), so nothing here depends on the program-region count.
+            job_plan = torch_spyre._C.prepare_kernel(spyrecode_dir)
 
-                # Bare split triple: 3 steps, NO event steps inserted.
-                assert job_plan.num_steps() == 3
-                assert [job_plan.get_step_type(i) for i in range(3)] == [
-                    "HostCompute",
-                    "H2D",
-                    "Compute",
-                ]
-                # Roles are assigned by step type in the ctors, so the bare
-                # triple already carries the split roles -- the split is real.
-                assert [job_plan.get_step_stream_role(i) for i in range(3)] == [
-                    "Prep",
-                    "Prep",
-                    "Dev",
-                ]
-                # pipeline_barrier stays True on EVERY step of the bare split:
-                # overlap comes only from the S_prep/S_dev split + flex's
-                # dynamic cross-stream events, never from relaxing a barrier.
-                assert [job_plan.get_step_pipeline_barrier(i) for i in range(3)] == [
-                    True,
-                    True,
-                    True,
-                ]
-        finally:
-            torch_spyre._C.set_hazard_tracker_enabled(prev)
-
-    def test_prepare_flag_independent_bare_triple(self):
-        """Flag OFF: prepare still emits the SAME bare triple (flag-independent).
-
-        Post-excision, PrepareKernel no longer branches on SPYRE_HAZARD_TRACKER:
-        it always emits the plain [HostCompute, H2D, Compute] triple with roles
-        [Prep, Prep, Dev]. The flag only affects launch-time routing (whether the
-        S_prep/S_dev split engages), never the prepared plan's shape. This guards
-        against reintroducing a prepare-time branch on the flag.
-        """
-        prev = torch_spyre._C.get_hazard_tracker_enabled()
-        try:
-            torch_spyre._C.set_hazard_tracker_enabled(False)
-            with tempfile.TemporaryDirectory() as tmpdir:
-                spyrecode_dir = self.create_mock_spyrecode(
-                    tmpdir, exec_command="ComputeOnHost"
-                )
-                job_plan = torch_spyre._C.prepare_kernel(spyrecode_dir)
-
-                assert job_plan.num_steps() == 3
-                assert [job_plan.get_step_type(i) for i in range(3)] == [
-                    "HostCompute",
-                    "H2D",
-                    "Compute",
-                ]
-                assert [job_plan.get_step_stream_role(i) for i in range(3)] == [
-                    "Prep",
-                    "Prep",
-                    "Dev",
-                ]
-        finally:
-            torch_spyre._C.set_hazard_tracker_enabled(prev)
+            # Bare split triple: 3 steps, NO event steps inserted.
+            assert job_plan.num_steps() == 3
+            assert [job_plan.get_step_type(i) for i in range(3)] == [
+                "HostCompute",
+                "H2D",
+                "Compute",
+            ]
+            # Roles are assigned by step type in the ctors, so the bare triple
+            # already carries the split roles -- the split is real.
+            assert [job_plan.get_step_stream_role(i) for i in range(3)] == [
+                "Prep",
+                "Prep",
+                "Dev",
+            ]
+            # pipeline_barrier stays True on EVERY step of the bare split:
+            # overlap comes only from the S_prep/S_dev split + flex's dynamic
+            # cross-stream events, never from relaxing a barrier.
+            assert [job_plan.get_step_pipeline_barrier(i) for i in range(3)] == [
+                True,
+                True,
+                True,
+            ]
 
     def test_compute_on_host_missing_ohandle(self):
         """Test that missing ohandle field raises RuntimeError."""
@@ -940,7 +907,7 @@ class TestStepOrderingValidator:
     def test_missing_h2d_on_prep_rejected(self):
         """NEGATIVE: a HostCompute-led plan with no H2D on S_prep is rejected.
 
-        The prep stream must be exactly HostCompute -> H2D; dropping the H2D
+        The prep stream must BEGIN with HostCompute -> H2D; dropping the H2D
         leaves prep as just [HostCompute], which the S_prep walk rejects.
         """
         kinds = ["HostCompute", "Compute"]
@@ -952,8 +919,9 @@ class TestStepOrderingValidator:
     def test_compute_on_prep_stream_rejected(self):
         """NEGATIVE: a device Compute mis-assigned to S_prep is rejected.
 
-        Routing the Compute to Prep leaves prep as [HostCompute, H2D, Compute]
-        (an extra step past the H2D) and leaves S_dev empty -- both rejected.
+        Routing the Compute to Prep leaves prep as [HostCompute, H2D, Compute];
+        Compute is a device op and is not permitted on the prep stream, which
+        carries only HostCompute / H2D.
         """
         kinds = ["HostCompute", "H2D", "Compute"]
         roles = ["Prep", "Prep", "Prep"]
@@ -993,6 +961,44 @@ class TestStepOrderingValidator:
             )
             == ""
         )
+
+    def test_trailing_d2h_on_dev_accepted(self):
+        """The contract is ordering-only, not an exact triple: S_dev carries
+        Compute AND D2H (see StreamRole in job_plan.h), so a longer plan
+        HostCompute -> H2D -> Compute -> D2H is valid.
+
+        S_prep = [HostCompute, H2D], S_dev = [Compute, D2H]. This locks the
+        relaxation so a future re-tightening to the bare triple fails here.
+        """
+        kinds = ["HostCompute", "H2D", "Compute", "D2H"]
+        roles = ["Prep", "Prep", "Dev", "Dev"]
+        err = torch_spyre._C.check_job_plan_step_ordering(kinds, roles)
+        assert err == "", f"HostCompute -> H2D -> Compute -> D2H must be valid: {err!r}"
+
+    def test_multiple_compute_on_dev_accepted(self):
+        """More than one Compute on S_dev is valid (ordering-only contract).
+
+        S_prep = [HostCompute, H2D], S_dev = [Compute, Compute]. The dev walk
+        requires only that the stream BEGIN with Compute and carry nothing
+        outside {Compute, D2H}.
+        """
+        kinds = ["HostCompute", "H2D", "Compute", "Compute"]
+        roles = ["Prep", "Prep", "Dev", "Dev"]
+        err = torch_spyre._C.check_job_plan_step_ordering(kinds, roles)
+        assert err == "", f"a second Compute on S_dev must be valid: {err!r}"
+
+    def test_d2h_on_prep_stream_rejected(self):
+        """NEGATIVE: a D2H on S_prep is rejected.
+
+        D2H is a device op and belongs on S_dev (see StreamRole in job_plan.h);
+        role assignment never routes it to Prep, so a D2H on prep signals a
+        role-assignment bug. Prep carries only HostCompute / H2D.
+        """
+        kinds = ["HostCompute", "H2D", "D2H"]
+        roles = ["Prep", "Prep", "Prep"]
+        err = torch_spyre._C.check_job_plan_step_ordering(kinds, roles)
+        assert err != "", "D2H on the prep stream must be rejected"
+        assert "prep stream" in err
 
     def test_hostcompute_on_dev_stream_rejected(self):
         """NEGATIVE: HostCompute mis-assigned to the device stream (S_dev).
