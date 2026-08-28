@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import copy
 import logging
 from collections import defaultdict
 from typing import cast
@@ -23,6 +24,7 @@ from .ir import FixedTiledLayout, SpyreEmptyFallback
 from .optimize_restickify import AnyInNode, EdgeCostMap
 from .logging_utils import get_inductor_logger
 from .pass_utils import redirect_computed_buffer_reads
+from torch._inductor.dependencies import MemoryDep
 from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import (
     ComputedBuffer,
@@ -205,8 +207,45 @@ def insert_restickify_on_node_inputs(
         # carries loop_info (loop_group_id + loop_count).  The restickify node
         # is inserted inside the same loop group, so it must inherit loop_info
         # to remain contiguous in build_loop_scheduler_nodes.
+        #
+        # It must inherit a COPY, not the consumer's own object: the restickify
+        # node is a per-iteration stage of old_name, so it TAKES OVER the
+        # consumer's per-read tile advance for that dependency (its own read of
+        # old_name strides through the source), its output is per-iteration
+        # scratch that never advances, and the consumer's read of the stage
+        # must stop advancing. Sharing one CoarseTileInfo (the old behavior)
+        # makes that transfer impossible - both ops kept the advance, so a
+        # coarse-tiled consumer of a cross-loop-group full buffer read the
+        # 1-tile stage with a striding index and ran off its end (issue #4008).
         if hasattr(op, "loop_info"):
-            restick_buff.loop_info = op.loop_info
+            consumer_li = op.loop_info
+            n_levels = len(getattr(consumer_li, "loop_count", []) or [])
+            reads_per_dim = getattr(consumer_li, "tiled_dims_per_read", None)
+            if n_levels and reads_per_dim is not None:
+                mem_deps = [
+                    d for d in op.get_read_writes().reads if isinstance(d, MemoryDep)
+                ]
+                dep_idxs = [
+                    i
+                    for i, d in enumerate(mem_deps)
+                    if d.name == old_name and i < len(reads_per_dim)
+                ]
+                dep_advance = (
+                    copy.deepcopy(reads_per_dim[dep_idxs[0]])
+                    if dep_idxs
+                    else [[] for _ in range(n_levels)]
+                )
+                restick_li = copy.copy(consumer_li)
+                restick_li.tiled_dims_per_read = [dep_advance]
+                restick_li.output_tiled_dims = [[] for _ in range(n_levels)]
+                restick_buff.loop_info = restick_li
+                if dep_idxs:
+                    consumer_li.tiled_dims_per_read = [
+                        [[] for _ in range(n_levels)] if i in dep_idxs else entry
+                        for i, entry in enumerate(reads_per_dim)
+                    ]
+            else:
+                restick_buff.loop_info = consumer_li
 
     # Patch inner_fn once with the full name_map covering all restickified args.
     redirect_computed_buffer_reads(

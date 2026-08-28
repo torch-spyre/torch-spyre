@@ -127,23 +127,51 @@ jobs:
           > /tmp/jobs.jsonl
 
           python3 - << 'PYEOF'
-          import json, os, re, subprocess
+          import json, os, re, subprocess, sys
 
           repo = os.environ["GITHUB_REPOSITORY"]
           jobs = [json.loads(l) for l in open("/tmp/jobs.jsonl") if l.strip()]
 
+          # gh 2.97.0 started refusing to emit a response body that contains
+          # terminal escape sequences unless --allow-escape-sequences is passed,
+          # and Actions job logs are full of them. Without the flag every
+          # download exits 1 with an empty body, raw_logs/ stays empty and the
+          # ingest is silently skipped. The flag does not exist before 2.97.0,
+          # so probe for it rather than pinning a version.
+          esc = subprocess.run(
+              ["gh", "api", "--help"], capture_output=True, text=True
+          ).stdout
+          esc_flag = (
+              ["--allow-escape-sequences"] if "--allow-escape-sequences" in esc else []
+          )
+
+          downloaded = 0
           for idx, j in enumerate(jobs):
               safe   = re.sub(r"[^\w\s\-\.]", "", j["name"]).strip()
               out    = f"raw_logs/{idx}_{safe}.txt"
               result = subprocess.run(
-                  ["gh", "api", f"/repos/{repo}/actions/jobs/{j['id']}/logs"],
+                  ["gh", "api", *esc_flag,
+                   f"/repos/{repo}/actions/jobs/{j['id']}/logs"],
                   capture_output=True, env={**os.environ},
               )
               if result.returncode == 0 and result.stdout:
                   open(out, "wb").write(result.stdout)
+                  downloaded += 1
                   print(f"  OK   {out}")
               else:
-                  print(f"  SKIP {j['name']} (no log)")
+                  err = result.stderr.decode("utf-8", "replace").strip()
+                  print(f"  SKIP {j['name']} (rc={result.returncode}): {err}")
+
+          print(f"[info] downloaded {downloaded}/{len(jobs)} job logs")
+
+          # Every completed run has at least one job with a log, so zero
+          # downloads means the download mechanism itself broke -- not that the
+          # nightly produced nothing. Fail loudly here; otherwise the
+          # empty-data guard downstream skips the ingest and the job still
+          # reports success, which is how this outage stayed green for days.
+          if jobs and downloaded == 0:
+              print(f"::error::downloaded 0 of {len(jobs)} job logs -- aborting")
+              sys.exit(1)
           PYEOF
 
       # -----------------------------------------------------------------

@@ -17,7 +17,7 @@ import logging
 import math
 import time
 from collections import defaultdict
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from dataclasses import replace
 from typing import Any, Callable, cast, Optional
 
@@ -47,7 +47,10 @@ from torch_spyre._inductor.pass_utils import (
     _is_matmul_op,
     op_short_name,
 )
-from torch_spyre._inductor.work_division import enumerate_work_division_candidates
+from torch_spyre._inductor.work_division import (
+    enumerate_work_division_candidates,
+    work_division_splits_are_legal,
+)
 from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.scratchpad.plan_solver import (
     CoreDivision,
@@ -1188,6 +1191,37 @@ def _fixed_core_division(op: Operation) -> CoreDivision:
     return _core_division(op, ownership.work_slices if ownership is not None else {})
 
 
+def _legal_fixed_division(
+    op: Operation, fixed: list[CoreDivision], reason: str
+) -> list[CoreDivision]:
+    """Return upstream division when it satisfies hard constraints."""
+    division = fixed[0]
+    if not isinstance(op, ComputedBuffer) or _split_option_is_legal(
+        op, _division_splits(op, division)
+    ):
+        logger.debug("keep upstream division for %s: %s", op.name, reason)
+        return fixed
+    raise Unsupported(f"{op.name}: fixed split violates hard domain.")
+
+
+def _split_option_is_legal(op: Operation, splits: dict[sympy.Symbol, int]) -> bool:
+    """Return whether symbol-keyed splits satisfy hard domains."""
+    return not isinstance(op, ComputedBuffer) or work_division_splits_are_legal(
+        op, splits
+    )
+
+
+def _legal_split_options(
+    op: Operation, options: Iterable[dict[sympy.Symbol, int]]
+) -> list[dict[sympy.Symbol, int]]:
+    """Return stick-valid candidates satisfying hard work-division domains."""
+    return [
+        option
+        for option in options
+        if _split_fits_sticks(op, option) and _split_option_is_legal(op, option)
+    ]
+
+
 DEFAULT_VARIANT_CAP = 6
 # Try larger batch factors first. Keeping more of the batch axis whole offers
 # the same reconciliation benefit with fewer co-optimization candidates.
@@ -1247,6 +1281,13 @@ def _split_fits_sticks(op: Operation, splits: dict[sympy.Symbol, int]) -> bool:
     unplaceable (for example, a collapsed or broadcast dimension), so reject it
     rather than relying on modulo arithmetic with a missing size.
     """
+    layout = op.layout
+    if isinstance(layout, MutationLayoutSHOULDREMOVE):
+        layout = layout.real_layout()
+    # CPU ComputedBuffers participate in the joint division map but never in LX
+    # placement. They have no device geometry to validate against.
+    if not isinstance(layout, FixedTiledLayout):
+        return True
     write = next(iter(op_read_writes(op).writes), None)
     if write is None:
         return False
@@ -1428,11 +1469,7 @@ def _check_and_add_matmul_options(
         full_candidate = {sym: 1 for sym in iteration_space_from_op(op)}
         full_candidate.update(candidate)
         options.setdefault(_candidate_key(full_candidate), full_candidate)
-    return [
-        candidate
-        for candidate in options.values()
-        if candidate == seed or _split_fits_sticks(op, candidate)
-    ]
+    return _legal_split_options(op, options.values())
 
 
 def _enum_split_options(
@@ -1463,11 +1500,7 @@ def _enum_split_options(
             full_candidate = {sym: 1 for sym in iteration_space_from_op(op)}
             full_candidate.update(candidate)
             options.setdefault(_candidate_key(full_candidate), full_candidate)
-        return [
-            candidate
-            for candidate in options.values()
-            if candidate == seed or _split_fits_sticks(op, candidate)
-        ]
+        return _legal_split_options(op, options.values())
     if not is_computed or not seed_profile:
         return [seed]
 
@@ -1494,11 +1527,7 @@ def _enum_split_options(
     for profile in extra_profiles:
         candidate = _from_output_profile(op, profile)
         options.setdefault(_candidate_key(candidate), candidate)
-    return [
-        candidate
-        for candidate in options.values()
-        if candidate == seed or _split_fits_sticks(op, candidate)
-    ]
+    return _legal_split_options(op, options.values())
 
 
 class CoOptimizingAllocator(ScratchpadAllocator):
@@ -1585,7 +1614,9 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         least one valid candidate"``), the root cause of the
         ``slice_stick_mutation_*`` failures. Keeping the fixed division there
         matches the schedulable slicing the greedy path uses; it costs only a
-        division optimization, never correctness. See
+        division optimization when that division also satisfies hard
+        work-division constraints. Otherwise LX planning raises ``Unsupported``
+        rather than committing an illegal division. See
         ``utils.ops_in_offset_mutation_component``.
         """
         max_cores = config.sencores
@@ -1595,14 +1626,20 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         result = {}
         for op in graph.operations:
             if op.name in fixed_division_ops:
-                divs = [_fixed_core_division(op)]
+                divs = _legal_fixed_division(
+                    op, [_fixed_core_division(op)], "offset mutation component"
+                )
             elif self.prune and isinstance(op, ComputedBuffer):
                 divs = [
                     _core_division(op, splits)
-                    for splits in _enum_split_options(op, profiles, matmul_roles)
+                    for splits in _legal_split_options(
+                        op, _enum_split_options(op, profiles, matmul_roles)
+                    )
                 ]
             else:
                 divs = self._enumerate_core_divisions(op, max_cores)
+            if not divs:
+                raise Unsupported(f"{op.name}: no legal core-division candidates.")
             result[op.name] = divs
 
         return result
@@ -1625,8 +1662,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         try:
             candidates = enumerate_work_division_candidates(op, max_cores)
         except Unsupported as exc:
-            logger.debug("skip joint division for %s: %s", op.name, exc)
-            return fixed
+            return _legal_fixed_division(op, fixed, str(exc))
         cds: list[CoreDivision] = []
         seen: set[tuple] = set()
         for candidate in candidates:
@@ -1646,7 +1682,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             if key not in seen:
                 seen.add(key)
                 cds.append(division)
-        return cds or fixed
+        return cds or _legal_fixed_division(op, fixed, "no enumerable candidate")
 
     def _commit_divisions(
         self,
@@ -1673,6 +1709,8 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             if not hasattr(op, "iteration_space_ownership"):
                 continue
             cd = buf.core_divisions[buf.chosen_division]
+            if not _split_option_is_legal(op, _division_splits(op, cd)):
+                raise Unsupported(f"{op.name}: chosen split violates hard domain.")
             commit_iteration_space_ownership(op, _division_splits(op, cd))
 
     def _determine_in_place_division_invariant(

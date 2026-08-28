@@ -23,7 +23,7 @@ from typing import Mapping, Optional
 
 import torch
 
-from torch_spyre._C import DataFormats
+from torch_spyre._C import DataFormats, get_device_dtype
 from torch_spyre._inductor.constants import (
     IDENTITY_OP,
     DL16TOFP32_OP,
@@ -32,6 +32,7 @@ from torch_spyre._inductor.constants import (
     FP32TOINT32_OP,
     INT32TOFP32_OP,
 )
+from torch_spyre._inductor.errors import Unsupported
 
 # Spyre has no native bool: a bool tensor reuses whichever physical format
 # produced it (e.g. fp16 vs fp32 comparison results). Maps that format to
@@ -45,6 +46,47 @@ _BOOL_EQUIVALENT_DTYPES: Mapping[DataFormats, torch.dtype] = {
 def bool_equivalent_dtype(device_dtype: DataFormats) -> Optional[torch.dtype]:
     """Logical dtype matching a bool's physical format, or None if unsupported."""
     return _BOOL_EQUIVALENT_DTYPES.get(device_dtype)
+
+
+def bool_layout_dtype(
+    device_dtype: DataFormats, context: str = "result"
+) -> torch.dtype:
+    """Return the logical dtype to build a bool tensor's layout with.
+
+    ``get_elem_in_stick(torch.bool)`` hardcodes the SEN169_FP16 stick size of
+    64, so any layout built from a bool's *logical* dtype silently assumes an
+    fp16 format. Callers must instead resolve the stick size from the bool's
+    real physical format via this function.
+
+    Raises Unsupported if `device_dtype` has no bool-equivalent dtype.
+    """
+    dtype_for_layout = bool_equivalent_dtype(device_dtype)
+    if dtype_for_layout is None:
+        raise Unsupported(
+            f"torch.bool {context} of operand with device format {device_dtype}"
+        )
+    return dtype_for_layout
+
+
+def resolve_output_formats(
+    output_dtype: torch.dtype,
+    bool_device_dtype: Optional[DataFormats],
+    context: str = "result",
+) -> tuple[DataFormats, torch.dtype]:
+    """Resolve an op output's ``(device_dtype, layout_dtype)`` pair.
+
+    Non-bool outputs derive both from ``output_dtype``. For bool outputs,
+    ``get_device_dtype(torch.bool)`` hardcodes SEN169_FP16 -- wrong for e.g. a
+    float32 comparison result -- so the caller supplies the real on-device
+    format in ``bool_device_dtype`` (read off the producing operand(s)).
+
+    Callers needing only the layout dtype should call `bool_layout_dtype`
+    directly rather than discarding half of this pair.
+    """
+    if output_dtype == torch.bool:
+        assert bool_device_dtype is not None, "bool output needs bool_device_dtype"
+        return bool_device_dtype, bool_layout_dtype(bool_device_dtype, context)
+    return get_device_dtype(output_dtype), output_dtype
 
 
 class DtypeOpTable:
@@ -139,6 +181,11 @@ class DtypeOpTable:
         format could convert to dst_dtype (see get_bool_src_operator). The
         codegen (spyre_kernel.to_dtype) instead resolves from the one real
         device_dtype.
+
+        The looseness is structural, not an oversight: this runs from the
+        convert_element_type lowering, which decides the CPU fallback before
+        layout propagation has assigned any device_dtype. Keying on the real
+        format would mean deferring that fallback decision to a later pass.
 
         This "any format" looseness is safe only while every dst reachable from
         a bool resolves to a supported op under *both* SEN169_FP16 (fp16) and

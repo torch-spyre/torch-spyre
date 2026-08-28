@@ -108,6 +108,8 @@ from ..pass_utils import (
     host_coordinates,
     identify_matmul_inputs,
     indirect_sizes_from_op,
+    invalidate_op_read_writes,
+    iteration_space_from_op,
 )
 from ..ir import FixedTiledLayout, SpyreConstantFallback, _resize_device_layout
 from .tile import compute_tile_index, compute_tile_stride, decompose_index_for_tiling
@@ -121,6 +123,26 @@ class _RetiledBufferInfo(NamedTuple):
     old_stride: tuple[Expr, ...]
     new_stride: tuple[Expr, ...]
     old_size: tuple[Expr, ...]
+
+
+class _LogicalIterationSymbol(NamedTuple):
+    """One active loop symbol keyed by its stable raw dimension identity."""
+
+    logical_dim: tuple[str, int]
+    extent: Expr
+    symbol: sympy.Symbol
+
+
+class _IterationSymbolRemap(NamedTuple):
+    """Order-preserving loop-symbol translation produced by a range rewrite."""
+
+    before_symbols: tuple[sympy.Symbol, ...]
+    pairs: tuple[tuple[sympy.Symbol, sympy.Symbol], ...]
+
+
+class _DivideRangesResult(NamedTuple):
+    retiled_info: _RetiledBufferInfo | None
+    symbol_remap: _IterationSymbolRemap | None
 
 
 # ---------------------------------------------------------------------------
@@ -1524,11 +1546,115 @@ def _validate_contiguous(
         )
 
 
+def _capture_logical_iteration_symbols(
+    op: ComputedBuffer,
+) -> tuple[_LogicalIterationSymbol, ...]:
+    """Capture active symbols by raw output/reduction position.
+
+    This identity is valid only for callers that preserve dimension order.
+    Unit dimensions have no loop symbol and are deliberately omitted.
+    """
+
+    data = op.data
+    if not isinstance(data, (Pointwise, Reduction)):
+        raise Unsupported(
+            f"coarse_tile: cannot capture iteration symbols for "
+            f"{op.get_name()!r} with data type {type(data).__name__}"
+        )
+
+    logical_extents: list[tuple[tuple[str, int], Expr]] = [
+        (("output", idx), extent) for idx, extent in enumerate(data.ranges)
+    ]
+    if isinstance(data, Reduction):
+        logical_extents.extend(
+            (("reduction", idx), extent)
+            for idx, extent in enumerate(data.reduction_ranges)
+        )
+
+    active = [
+        (logical_dim, extent)
+        for logical_dim, extent in logical_extents
+        if sympy.sympify(extent) != 1
+    ]
+    symbols = tuple(iteration_space_from_op(op))
+    if len(active) != len(symbols):
+        raise Unsupported(
+            f"coarse_tile: cannot match logical dimensions to iteration symbols "
+            f"for {op.get_name()!r}: logical_dimensions={active}, "
+            f"iteration_symbols={symbols}"
+        )
+
+    return tuple(
+        _LogicalIterationSymbol(logical_dim, extent, symbol)
+        for (logical_dim, extent), symbol in zip(active, symbols)
+    )
+
+
+def _order_preserving_symbol_remap(
+    op: ComputedBuffer,
+    before: tuple[_LogicalIterationSymbol, ...],
+    after: tuple[_LogicalIterationSymbol, ...],
+) -> _IterationSymbolRemap:
+    """Return the surviving old-to-new symbols for an order-preserving rewrite."""
+
+    before_by_dim = {entry.logical_dim: entry for entry in before}
+    after_by_dim = {entry.logical_dim: entry for entry in after}
+    after_dims = tuple(entry.logical_dim for entry in after)
+    surviving_dims = tuple(
+        entry.logical_dim for entry in before if entry.logical_dim in after_by_dim
+    )
+
+    pairs = tuple(
+        (before_by_dim[logical_dim].symbol, after_by_dim[logical_dim].symbol)
+        for logical_dim in surviving_dims
+    )
+    monotone = (
+        surviving_dims == after_dims
+        and len({old for old, _ in pairs}) == len(pairs)
+        and len({new for _, new in pairs}) == len(pairs)
+    )
+    if not monotone:
+        raise Unsupported(
+            f"coarse_tile: order-preserving dimension mapping failed for "
+            f"{op.get_name()!r}: old_dimensions={before}, "
+            f"new_dimensions={after}, attempted_mapping={pairs}"
+        )
+
+    return _IterationSymbolRemap(
+        before_symbols=tuple(entry.symbol for entry in before), pairs=pairs
+    )
+
+
+def _apply_work_div_symbol_remap(
+    op: ComputedBuffer, remap: _IterationSymbolRemap | None
+) -> None:
+    """Move named work-division metadata through a proven symbol mapping."""
+
+    if remap is None or not hasattr(op, "work_div_loop_info"):
+        return
+
+    old_names = op.work_div_loop_info  # type: ignore[attr-defined]
+    unknown = set(old_names) - set(remap.before_symbols)
+    if unknown:
+        raise Unsupported(
+            f"coarse_tile: work-division symbols are outside the captured "
+            f"iteration space for {op.get_name()!r}: unknown={sorted(map(str, unknown))}, "
+            f"captured={tuple(map(str, remap.before_symbols))}"
+        )
+
+    by_old_symbol = dict(remap.pairs)
+    op.work_div_loop_info = {  # type: ignore[attr-defined]
+        by_old_symbol[old_symbol]: list(names)
+        for old_symbol, names in old_names.items()
+        if old_symbol in by_old_symbol
+    }
+
+
 def _divide_ranges(
     op: ComputedBuffer,
     loop_count: Expr,
     tiled_dims: list[int],
-) -> _RetiledBufferInfo | None:
+) -> _DivideRangesResult:
     """Divide the specified iteration ranges of op by loop_count.
 
     For a ``Pointwise`` the full ranges are op.data.ranges.
@@ -1546,11 +1672,17 @@ def _divide_ranges(
     """
     data = op.data
     if not isinstance(data, (Pointwise, Reduction)):
-        return None
+        return _DivideRangesResult(None, None)
 
     ranges = list(data.ranges)
     if not ranges:
-        return None
+        return _DivideRangesResult(None, None)
+
+    before_symbols = (
+        _capture_logical_iteration_symbols(op)
+        if tiled_dims and hasattr(op, "work_div_loop_info")
+        else None
+    )
 
     for i in tiled_dims:
         assert 0 <= i < len(ranges), (
@@ -1585,10 +1717,17 @@ def _divide_ranges(
     _clear_cache(op, _COMPUTED_BUF_SIZES_KEY)
     _clear_cache(op, _COMPUTED_BUF_FREE_SYMS_KEY)
 
+    symbol_remap = None
+    if before_symbols is not None:
+        invalidate_op_read_writes(op)
+        symbol_remap = _order_preserving_symbol_remap(
+            op, before_symbols, _capture_logical_iteration_symbols(op)
+        )
+
     # Sync layout.size, layout.stride, and layout.device_layout with the new ranges.
     layout = getattr(op, "layout", None)
     if not (isinstance(layout, FixedLayout) and len(layout.size) == len(ranges)):
-        return None
+        return _DivideRangesResult(None, symbol_remap)
 
     old_stride = tuple(layout.stride)
     old_size = tuple(layout.size)
@@ -1614,7 +1753,7 @@ def _divide_ranges(
     # reconstruction: transform the original device layout directly without
     # guessing a dim_order.
     if not isinstance(layout, FixedTiledLayout):
-        return retiled_info
+        return _DivideRangesResult(retiled_info, symbol_remap)
     # Capture old/new sizes as ints here, after the FixedTiledLayout guard,
     # so symbolic-size FixedLayout tests above are not affected.
     # layout.size is already the new (divided) size; reconstruct the old size
@@ -1630,14 +1769,14 @@ def _divide_ranges(
     layout.device_layout = _resize_device_layout(
         layout.device_layout, old_host_size, new_size_ints, stick_host_dim=stick_hd
     )
-    return retiled_info
+    return _DivideRangesResult(retiled_info, symbol_remap)
 
 
 def _divide_reduction_ranges(
     op: ComputedBuffer,
     loop_count: Expr,
     tiled_dims: list[int],
-) -> None:
+) -> _IterationSymbolRemap | None:
     """Divide the specified reduction_ranges entries of op by loop_count.
 
     Unlike _divide_ranges, does NOT update op.layout.size/stride — the
@@ -1647,7 +1786,12 @@ def _divide_reduction_ranges(
     data = op.data
     assert isinstance(data, Reduction)
     if not tiled_dims:
-        return
+        return None
+    before_symbols = (
+        _capture_logical_iteration_symbols(op)
+        if hasattr(op, "work_div_loop_info")
+        else None
+    )
     reduction_ranges = list(data.reduction_ranges)
     for i in tiled_dims:
         assert 0 <= i < len(reduction_ranges), (
@@ -1669,6 +1813,13 @@ def _divide_reduction_ranges(
             reduction_ranges[i] = sympy.sympify(r) / sympy.sympify(loop_count)
     # Reduction is a frozen dataclass; use object.__setattr__ to mutate it.
     object.__setattr__(data, "reduction_ranges", reduction_ranges)
+    if before_symbols is None:
+        return None
+
+    invalidate_op_read_writes(op)
+    return _order_preserving_symbol_remap(
+        op, before_symbols, _capture_logical_iteration_symbols(op)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1717,7 +1868,9 @@ def _apply_plan(
         for level_idx, (_, count) in enumerate(levels):
             opos_list = info.loop_tiled_dims[level_idx]
             rpos_list = info.loop_tiled_reduction_dims[level_idx]
-            retiled_info = _divide_ranges(op, count, opos_list)
+            divide_result = _divide_ranges(op, count, opos_list)
+            _apply_work_div_symbol_remap(op, divide_result.symbol_remap)
+            retiled_info = divide_result.retiled_info
             if retiled_info is not None:
                 name = op.get_name()
                 prior = retiled_infos.get(name)
@@ -1729,7 +1882,8 @@ def _apply_plan(
                     else retiled_info
                 )
             if isinstance(op.data, Reduction):
-                _divide_reduction_ranges(op, count, rpos_list)
+                reduction_remap = _divide_reduction_ranges(op, count, rpos_list)
+                _apply_work_div_symbol_remap(op, reduction_remap)
 
         op.loop_info = dataclasses.replace(  # type: ignore[attr-defined]
             info, loop_group_id=stamped_group_id
@@ -2278,16 +2432,45 @@ def _propagate_tiled_op(
     loop_group_id = loop_info.loop_group_id
     buf_name = op.get_name()
 
-    # Resolve planning-time consumer names to their current objects --
-    # Pass 1/2 may have spliced replacements into `operations` under the
-    # same names since planning ran (see PropagationPlan's docstring on
-    # name stability).
-    outside_consumers = [
-        o
-        for o in operations
-        if isinstance(o, ComputedBuffer)
-        and o.get_name() in propagation.outside_consumer_names
-    ]
+    # Resolve consumers at TRANSFORM time, by actual reads rather than by
+    # the planning-time name list. Pass 1/2 may have spliced replacements
+    # into `operations` under the same names since planning ran (see
+    # PropagationPlan's docstring on name stability) -- and Pass 1 may have
+    # rewired a planned consumer in another tiled group through a read-copy
+    # staging op, which then performs the group's actual read of buf_name.
+    # Patching only the planned names would miss that staging op, leaving
+    # it draining this op's per-tile scratch while the full buffer goes
+    # unread (issue #4008: 94.6% wrong on two chained hint groups). Any
+    # current reader outside this op's outermost loop group needs the
+    # redirect; the in-group copy-out drain reads buf_name by design and is
+    # excluded by the group test exactly like the planning-time analog
+    # (_find_outside_consumers_planned).
+    own_outer_key = loop_group_id[0]
+    planned_names = set(propagation.outside_consumer_names)
+    outside_consumers = []
+    for o in operations:
+        if not isinstance(o, ComputedBuffer) or o is op:
+            continue
+        if not _reads_buffer(o, buf_name):
+            continue
+        o_outer = getattr(getattr(o, "loop_info", None), "loop_group_id", (None,))[0]
+        # Union of both consumer notions: a planned name that still reads
+        # buf_name may legitimately share this group's outer key (a deferred
+        # reduction consumer such as softmax's div - see
+        # _consumers_reading_incomplete_reduction), so the group test alone
+        # would wrongly drop it.
+        if o_outer != own_outer_key or o.get_name() in planned_names:
+            outside_consumers.append(o)
+    resolved_names = {o.get_name() for o in outside_consumers}
+    if resolved_names != planned_names:
+        logger.debug(
+            "coarse_tile: copy-out %s consumer set changed between planning "
+            "and transform: planned=%s resolved=%s (read-copy staging ops "
+            "take over their consumer's read)",
+            buf_name,
+            sorted(planned_names),
+            sorted(resolved_names),
+        )
     is_graph_output = propagation.is_graph_output
 
     full_ranges = propagation.full_ranges
@@ -3269,6 +3452,11 @@ def _insert_one_read_copy(
     copy_buf.origins = sizing_op.origins
     copy_buf.operation_name = copy_name
     copy_op_metadata(sizing_op, copy_buf)
+    # This is a new operation with its own iteration space.  The source
+    # operation's d0/d1/... names have no positional meaning for the copy, so
+    # let work-division planning choose from the copy's actual dimensions.
+    if hasattr(copy_buf, "work_div_loop_info"):
+        del copy_buf.work_div_loop_info  # type: ignore[attr-defined]
 
     # Fresh per-level tiled-dim decisions for copy_buf's own read/write —
     # mirroring _insert_copy_op's read/write split (see its comment), but

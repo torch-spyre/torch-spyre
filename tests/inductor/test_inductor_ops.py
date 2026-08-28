@@ -1869,6 +1869,52 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     torch.tensor([-0.0, 0.0, -0.0, 0.0], dtype=torch.float16),
                     torch.tensor([0.0, -0.0, 0.0, -0.0], dtype=torch.float16),
                 ),
+                "fp32_1d": (
+                    torch.ceil(
+                        cached_randn((256,), abs=True, scale=10.0, dtype=torch.float32)
+                    ),
+                    torch.ceil(
+                        cached_randn((256,), abs=True, scale=9.9, dtype=torch.float32)
+                    ),
+                ),
+                "fp32_2d": (
+                    torch.ceil(
+                        cached_randn(
+                            (64, 128), abs=True, scale=10.0, dtype=torch.float32
+                        )
+                    ),
+                    torch.ceil(
+                        cached_randn(
+                            (64, 128), abs=True, scale=9.9, dtype=torch.float32
+                        )
+                    ),
+                ),
+                "fp32_3d": (
+                    torch.ceil(
+                        cached_randn(
+                            (2, 32, 128), abs=True, scale=10.0, dtype=torch.float32
+                        )
+                    ),
+                    torch.ceil(
+                        cached_randn(
+                            (2, 32, 128), abs=True, scale=9.9, dtype=torch.float32
+                        )
+                    ),
+                ),
+                "fp32_broadcast": (
+                    torch.ceil(
+                        cached_randn(
+                            (256, 256), abs=True, scale=10.0, dtype=torch.float32
+                        )
+                    ),
+                    torch.ceil(
+                        cached_randn((256,), abs=True, scale=9.9, dtype=torch.float32)
+                    ),
+                ),
+                "fp32_signed_zero": (
+                    torch.tensor([-0.0, 0.0, -0.0, 0.0], dtype=torch.float32),
+                    torch.tensor([0.0, -0.0, 0.0, -0.0], dtype=torch.float32),
+                ),
             },
         },
         ("test_cmp_scalar_int64", "test_cmp_scalar_int64_cpu"): {
@@ -6889,6 +6935,29 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
         self.compare_with_cpu(fn, needs_device=True, cpu_compile=False)
 
+    def test_full_bfloat16_cpu(self):
+        """Compiled BF16 ``full`` stays in native Spyre lowering."""
+
+        def fn():
+            return torch.full(
+                (4, 64), 1.5, dtype=torch.bfloat16, device=utils_inductor.DEVICE
+            )
+
+        with fresh_inductor_cache():
+            actual, source_codes = run_and_get_code(torch.compile(fn, dynamic=False))
+        self.assertEqual(actual.dtype, torch.bfloat16)
+        torch.testing.assert_close(
+            actual.cpu(), torch.full((4, 64), 1.5, dtype=torch.bfloat16)
+        )
+        generated = "\n".join(source_codes)
+        self.assertIn("async_compile.sdsc(", generated)
+        self.assertFalse(
+            any(
+                " = torch.ops.aten.full.default(" in line
+                for line in generated.splitlines()
+            )
+        )
+
     def test_dim_op_cpu(self, op, dim, *args):
         def fn(*args):
             return op(dim, *args)
@@ -7826,6 +7895,16 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
         x = torch.randint(0, 2, (64,), dtype=torch.bool)
         self.compare_with_cpu(fn, x, cpu_compile=False, run_eager=False)
+
+    def test_bool_staggered_ea_src_to_fp16_cpu(self):
+        # Both operands upcast in-graph, so the bool carries a DL16_TO_FP32 EA
+        # as well as IEEE_FP32; casting back to fp16 must de-stagger it.
+        def fn(x, y):
+            return (x.to(torch.float32) > y.to(torch.float32)).to(torch.float16)
+
+        x = cached_randn((64,), dtype=torch.float16)
+        y = cached_randn((64,), dtype=torch.float16)
+        self.compare_with_cpu(fn, x, y, cpu_compile=False, run_eager=False)
 
     def test_avg_pool2d_base(self, op, x):
         # Spyre stores C as the stick (innermost) dim, so the op must see a

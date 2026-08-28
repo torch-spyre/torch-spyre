@@ -396,6 +396,16 @@ class SpyreOpFuncs:
         if src_dtype == torch.bool:
             # A bool's physical format (fp16 vs fp32) depends on how it was
             # produced, so resolve the op from its propagated device dtype.
+            # That format only survives on a materialized buffer's layout, so an
+            # inlined bool producer has no format to read. Unreachable today
+            # (nothing fuses into this position), but vertical fusion (#826)
+            # would make it reachable, and the invariant is not locally obvious.
+            if not isinstance(x, TensorAccess):
+                raise Unsupported(
+                    f"conversion from an inlined torch.bool value to {dtype}: "
+                    f"a bool's physical format is only recoverable from a "
+                    f"materialized buffer's layout"
+                )
             op = DtypeOpTable.get_bool_src_operator(
                 x.layout.device_layout.device_dtype, dtype
             )

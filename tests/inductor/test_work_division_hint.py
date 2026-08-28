@@ -35,7 +35,6 @@ from torch._functorch._aot_autograd.utils import make_boxed_func
 from torch._inductor.test_case import TestCase as InductorTestCase
 from torch._inductor.utils import run_and_get_code, InputType
 
-
 from torch_spyre._inductor import config, spyre_hint
 import torch_spyre._inductor.scratchpad.lx_relayout as lx_relayout_module
 import torch_spyre._inductor.scheduler as scheduler_module
@@ -241,18 +240,18 @@ class TestNamedWorkDivisionHint(InductorTestCase):
                 max_cores=32,
             )
 
-    def test_apply_work_div_hint_rejects_pinned_split(self):
+    def test_apply_work_div_hint_rejects_illegal_split(self):
         m = Symbol("M")
         op = self._fake_op({m: ["M"]})
 
-        with self.assertRaisesRegex(Exception, "pinned to split=1"):
+        with self.assertRaisesRegex(Exception, "legal splits are"):
             _wd._apply_user_hint(
                 op,
                 {m: 2},
                 {m: 64},
                 self._fake_output_td([m]),
                 max_cores=32,
-                pinned={m: 1},
+                allowed_splits={m: frozenset({1})},
             )
 
     @config.patch({"sencores": 8})

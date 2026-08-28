@@ -1489,14 +1489,17 @@ def splits_by_index_coeff(
     """Encode a symbol→split dict as scheduler coefficient transport.
 
     This is intentionally a boundary representation: pre-scheduler passes keep
-    symbol-keyed ownership.  Coefficients are stable across scheduler renaming,
-    but are not generally unique.  In iteration-space order, the last symbol
-    for a coefficient wins, matching the legacy dictionary behavior.
+    symbol-keyed ownership. Coefficients are stable across scheduler renaming,
+    but cannot distinguish distinct non-unity splits sharing one coefficient.
+    This encoder retains the established iteration-order last-axis-wins behavior;
+    ``finalize_work_division_for_scheduler`` warns when that transport is lossy.
 
     Only non-unity splits are stored; 1 is the default on the apply side.
+    Dimensions absent from both indexes are intentionally omitted.
     """
     skip = lambda v: v <= 1  # noqa: E731
     output_splits = _coeff_splits_from_index(splits, write_index, skip=skip)
+    # Reduction splits: symbols with coeff==0 in write_index but coeff!=0 in read_index
     reduction_only = {
         sym: val for sym, val in splits.items() if write_index.coeff(sym) == 0
     }
@@ -1573,9 +1576,10 @@ def select_work_division_transport_indexes(
         read_index = read_with_max_reduction_overlap(rw.reads, reduction_vars)
         if read_index is not None:
             return write_index, read_index
+    first_read = next((d for d in rw.reads if isinstance(d, MemoryDep)), None)
     read = next(
         (d for d in rw.reads if isinstance(d, MemoryDep) and not d.is_indirect()),
-        next((d for d in rw.reads if isinstance(d, MemoryDep)), None),
+        first_read,
     )
     return write_index, read.index if read is not None else write_index
 

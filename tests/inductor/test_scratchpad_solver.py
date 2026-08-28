@@ -1252,6 +1252,39 @@ class TestCpSatJointDivision(JointDivisionSolverTests, TestCase):
         for name, buf in result.items():
             self.assertEqual(buf.address is None, name in solver.spill_reasons)
 
+    def test_balance_prefers_balanced_division(self):
+        # verify the solver prefers the balanced core split
+        unbalanced = CoreDivision(output_splits={256: 4})  # 4 cores, cost 16
+        balanced = CoreDivision(output_splits={256: 2, 128: 2})  # 4 cores, cost 8
+        self.assertEqual(unbalanced.cores_used, balanced.cores_used)
+        a = CoreDivisionBuffer(
+            "a",
+            400,
+            [0, 1],
+            core_divisions=[unbalanced, balanced],
+            residency_reason="no consumer reads it from LX",
+        )
+        b = CoreDivisionBuffer(
+            "b",
+            400,
+            [0, 1],
+            core_divisions=[balanced, unbalanced],
+            residency_reason="no consumer reads it from LX",
+        )
+        result = {
+            buf.name: buf
+            for buf in self.solver_class(
+                [a, b], size=256, alignment=1
+            ).plan_layout_and_core_divisions()
+        }
+        for name in ("a", "b"):
+            chosen = result[name].core_divisions[result[name].chosen_division]
+            self.assertEqual(
+                chosen.output_splits,
+                balanced.output_splits,
+                f"{name}: balance step should pick the balanced two-axis division",
+            )
+
 
 @unittest.skipUnless(_HAS_ORTOOLS, "cpsat placement unit tests need ortools")
 class TestCpSatPlacementOnly(BaseLayoutSolverTests, TestCase):
