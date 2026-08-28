@@ -19,10 +19,12 @@ compile_op_spec is mocked throughout so no Spyre hardware is required.
 
 import os
 import tempfile
+import unittest
 from unittest.mock import patch
 
 from torch._inductor.test_case import TestCase as InductorTestCase
 
+from torch_spyre._inductor import config
 from torch_spyre._inductor.codegen.bundle import (
     _extract_symbol_ids,
     generate_bundle,
@@ -30,6 +32,18 @@ from torch_spyre._inductor.codegen.bundle import (
 from torch_spyre._inductor.codegen.compute_ops import SymbolKind
 from torch_spyre._inductor.constants import MAX_POOL_SIZE_BYTES
 from torch_spyre._inductor.op_spec import OpSpec
+
+
+class TestFrontendPoolAllocationConfig(unittest.TestCase):
+    """Standalone sanity checks for the frontend_pool_allocation config flag."""
+
+    def test_default_is_false(self):
+        self.assertFalse(config.frontend_pool_allocation)
+
+    def test_patchable(self):
+        with config.patch({"frontend_pool_allocation": True}):
+            self.assertTrue(config.frontend_pool_allocation)
+        self.assertFalse(config.frontend_pool_allocation)
 
 
 # ---------------------------------------------------------------------------
