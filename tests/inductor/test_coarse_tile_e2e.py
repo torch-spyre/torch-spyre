@@ -2846,19 +2846,18 @@ def test_flash_tile_H():
     )
 
 
-@pytest.mark.skip(
-    reason=(
-        "Intermittent numerical mismatch against CPU reference (~22.7% "
-        "elements wrong), unrelated to coarse-tiling changes in "
-        "#3888/#3927 -- confirmed via git-stash A/B, reproduces identically "
-        "with those changes reverted. Mismatch pattern (scattered, large "
-        "abs+rel error) suggests an uninitialized-memory read similar to "
-        "the MoE E-tiling bug fixed in 133a3afb; not yet root-caused with "
-        "the poisoned-memory harness. See issue #3937."
-    )
-)
 def test_flash_tile_B():
-    """Flash v1: tile B÷2 only. B=2."""
+    """Flash v1: tile B÷2 only. B=2.
+
+    Previously skipped for an intermittent ~22.7% numerical mismatch
+    suspected to be an uninitialized-memory read (issue #3937). No longer
+    reproduces -- confirmed passing across 5 isolated runs (fresh fxgraph
+    cache each time) plus the full flash test cluster, at a point in
+    history with ~20 candidate fixes to cross-group/reduction-consumer
+    read redirection landed since the issue was filed. Not worth
+    bisecting to a single fixing commit; un-skipped on verified current
+    behavior.
+    """
     run_coarse_tile_test(
         lambda q, k, v: _flash_v1_fn(
             q, k, v, B=2, H=8, Lq=256, Lk=256, D=64, b_tiles=2
@@ -3102,7 +3101,8 @@ def _flash_v2_fn(
 
 
 @pytest.mark.skip(
-    reason="finalize_layouts: restickify infeasible for copy ops across loop groups"
+    reason="copy_forced(running_max, real_max) write-back is dropped -- real_max"
+    " never carries across H tiles, producing inf (issue #4126)"
 )
 def test_flash_v2_tile_H():
     """Flash v2: tile H÷4 only."""
@@ -3134,7 +3134,8 @@ def test_flash_v2_tile_B():
 
 
 @pytest.mark.skip(
-    reason="finalize_layouts: restickify infeasible for copy ops across loop groups"
+    reason="copy_forced(running_max, real_max) write-back is dropped -- real_max"
+    " never carries across tiles, producing inf (issue #4126)"
 )
 def test_flash_v2_tile_Lq():
     """Flash v2: tile Lq÷2 only."""
