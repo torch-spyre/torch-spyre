@@ -1321,8 +1321,20 @@ class SpyreKernel(Kernel[CSEVariable]):
         call_args = []
 
         uses_pool = self._kernel_uses_hbm_pool()
+        # name is unique across kernels per Inductor's wrapper codegen --
+        # kernels are deduped by src_code, but each kept kernel still gets
+        # its own unique name -- so deriving the pool variable name from it
+        # is collision-free without any extra bookkeeping here.
         pool_var_name = f"_pool_{name}"
         emit_pool_tensor = uses_pool and _spyre_config.frontend_pool_allocation
+        if emit_pool_tensor and _spyre_config.ktir_emitter:
+            raise AssertionError(
+                "config.frontend_pool_allocation is not supported on the KTIR "
+                "emitter path: async_compile.ktir() takes no pool_size and the "
+                "KTIR emitter threads hbm_pool buffers as internal SSA values, "
+                "so a front-end pool argument would shift every tensor's "
+                "positional address binding."
+            )
         if emit_pool_tensor:
             wrapper.writeline(
                 f"{pool_var_name} = spyre_empty_with_layout("
@@ -1415,8 +1427,9 @@ def uses_hbm_pool(specs) -> bool:
     """Return True if any op in ``specs`` references an HBM-pool-allocated tensor.
 
     This decides whether ``call_kernel`` passes the pool ahead of the kernel
-    args, so anything reading a kernel's ``.run()`` arguments has to agree with
-    it -- hence a shared function rather than a copy per caller.
+    args when ``config.frontend_pool_allocation`` is set, so anything reading
+    a kernel's ``.run()`` arguments has to agree with it -- hence a shared
+    function rather than a copy per caller.
     """
     return any(
         "hbm_pool" in arg.allocation
