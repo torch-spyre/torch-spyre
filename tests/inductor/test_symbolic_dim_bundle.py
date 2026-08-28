@@ -327,6 +327,59 @@ class TestGenerateBundleDimensionSymbols(InductorTestCase):
         self.assertNotIn("%pool_base_addr", bundle)
         self.assertNotIn("input_arg_extract value from %pool_base_addr", bundle)
 
+    def test_pool_frontend_allocation_emitted(self):
+        """With frontend_pool_allocation=True, a pool symbol produces a
+        %pool_base_addr input_arg parameter and an input_arg_extract
+        statement instead of device_mem_allocate."""
+        pool_kind = SymbolKind.pool()
+        entry = (
+            _make_sdsc_json(hbm_sym_ids_per_core={"[0, 0, 0]": -1}),
+            [0],
+            [],
+            [pool_kind],
+        )
+
+        with patch(
+            "torch_spyre._inductor.codegen.bundle._spyre_config.frontend_pool_allocation",
+            True,
+        ):
+            bundle = self._run_bundle([entry], pool_size=65536)
+
+        self.assertIn("%pool_base_addr: !sdscbundle.input_arg<index>", bundle)
+        self.assertIn(
+            "%pool = sdscbundle.input_arg_extract value from"
+            " %pool_base_addr : !sdscbundle.input_arg<index> -> index",
+            bundle,
+        )
+        self.assertNotIn("device_mem_allocate", bundle)
+
+    def test_pool_frontend_allocation_param_ordering(self):
+        """The pool param is emitted before kernel_arg_sym_indices params,
+        matching the pre-PR-#3707 ordering (pool first)."""
+        pool_kind = SymbolKind.pool()
+        kernel_kind = SymbolKind.kernel(arg_index=0)
+        entry = (
+            _make_sdsc_json(hbm_sym_ids_per_core={"[0, 0, 0]": -1}),
+            [0, 0],
+            [],
+            [kernel_kind, pool_kind],
+        )
+
+        with patch(
+            "torch_spyre._inductor.codegen.bundle._spyre_config.frontend_pool_allocation",
+            True,
+        ):
+            bundle = self._run_bundle([entry], pool_size=65536)
+
+        sig_line = next(
+            line for line in bundle.splitlines() if "func.func @sdsc_bundle(" in line
+        )
+        self.assertLess(
+            sig_line.index("%pool_base_addr"),
+            sig_line.index("%arg_0_base_addr"),
+            "pool_base_addr param must come before arg_0_base_addr",
+        )
+
     def test_pool_absent_when_no_pool_symbols(self):
         """A bundle with no pool symbols emits no device_mem_allocate at all,
         regardless of the pool_size argument passed in."""
