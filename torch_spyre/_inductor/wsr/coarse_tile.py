@@ -1950,11 +1950,12 @@ def _divide_ranges(
     if not ranges:
         return _DivideRangesResult(None, None)
 
-    before_symbols = (
-        _capture_logical_iteration_symbols(op)
-        if tiled_dims and hasattr(op, "work_div_loop_info")
-        else None
-    )
+    before_symbols = None
+    if tiled_dims and hasattr(op, "work_div_loop_info"):
+        try:
+            before_symbols = _capture_logical_iteration_symbols(op)
+        except Unsupported:
+            pass
 
     for i in tiled_dims:
         assert 0 <= i < len(ranges), (
@@ -2059,11 +2060,12 @@ def _divide_reduction_ranges(
     assert isinstance(data, Reduction)
     if not tiled_dims:
         return None
-    before_symbols = (
-        _capture_logical_iteration_symbols(op)
-        if hasattr(op, "work_div_loop_info")
-        else None
-    )
+    before_symbols = None
+    if hasattr(op, "work_div_loop_info"):
+        try:
+            before_symbols = _capture_logical_iteration_symbols(op)
+        except Unsupported:
+            pass
     reduction_ranges = list(data.reduction_ranges)
     for i in tiled_dims:
         assert 0 <= i < len(reduction_ranges), (
