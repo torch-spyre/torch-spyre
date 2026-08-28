@@ -16,6 +16,7 @@ import os
 import sys
 from typing import Literal
 
+from torch._dynamo.utils import get_debug_dir
 from torch.utils._config_module import install_config_module
 from .logging_utils import _get_env_bool
 
@@ -185,5 +186,15 @@ validate_op_specs: bool = os.environ.get("SPYRE_VALIDATE_OP_SPECS", "1") == "1"
 # to force the pure-Python packer. A missing native class is a stale or
 # incomplete build, not a supported mode, and raises rather than falling back.
 native_layout_packer: bool = _get_env_bool("TORCH_SPYRE_NATIVE_PACKER", True)
+_provenance_artifact_env = os.environ.get("TORCH_SPYRE_PROVENANCE_PATH")
+if _provenance_artifact_env is None:
+    # Match upstream Inductor: the run-scoped debug directory, not the bare cwd.
+    provenance_artifact_path: str | None = os.path.join(
+        get_debug_dir(), "torchinductor", "spyre_provenance.json"
+    )
+elif _provenance_artifact_env:
+    provenance_artifact_path = _provenance_artifact_env
+else:
+    provenance_artifact_path = None
 
 install_config_module(sys.modules[__name__])

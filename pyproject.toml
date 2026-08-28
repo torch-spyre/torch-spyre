@@ -76,6 +76,7 @@ build = [ # no-isolation build
 ]
 test = [
     "pytest~=9.0",
+    "jsonschema~=4.26.0",    # validates the shipped provenance artifact schema
     "pydantic",             # needed by test framework to support pydantic models for config
     "pytest-xdist",         # -n1 worker isolation for segfault resilience
 #    "torch_sendnn",        # must be installed manually
@@ -92,7 +93,7 @@ torch_spyre = "torch_spyre:_autoload"
 
 [tool.setuptools]
 package-dir = { torch_spyre = "torch_spyre" }
-package-data = { torch_spyre = ["*.dll", "*.dylib", "*.so"] }
+package-data = { torch_spyre = ["*.dll", "*.dylib", "*.so", "_inductor/schemas/*.json"] }
 
 [tool.setuptools.packages.find]
 exclude = ["tests"]  # exclude packages matching these glob patterns (empty by default)

@@ -56,22 +56,31 @@ class SpyreSDSCKernelRunner:
         self.kernel_name = name
         self.code_dir = code_dir
         self.kernel_provenance = kernel_provenance
-        self.profiler_event_name: str | None
+        self.profiler_event_name: str | None = None
         spyrecode_dir = code_dir + "/spyreCodeDir"
-        if kernel_provenance is None:
-            self.profiler_event_name = None
+        if kernel_provenance is not None:
+            try:
+                self.profiler_event_name = format_kernel_provenance_event_name(
+                    kernel_provenance
+                )
+                # Rejection is intentionally fail-open: C++ warns and counts
+                # conflicts while the key-bearing name remains the compatibility
+                # join.
+                register_kernel_provenance(
+                    self.profiler_event_name,
+                    list(kernel_provenance.debug_handle_ids),
+                )
+            except Exception:  # noqa: BLE001 - provenance must not fail preparation
+                logger.warning(
+                    "kernel provenance runtime attachment failed for kernel %s; "
+                    "continuing with any available event-name provenance",
+                    name,
+                    exc_info=True,
+                )
+
+        if self.profiler_event_name is None:
             self.jobplan = prepare_kernel(spyrecode_dir)
         else:
-            self.profiler_event_name = format_kernel_provenance_event_name(
-                kernel_provenance
-            )
-            # Rejection is intentionally fail-open: C++ warns and counts
-            # conflicts while the key-bearing name remains the compatibility
-            # join.
-            register_kernel_provenance(
-                self.profiler_event_name,
-                list(kernel_provenance.debug_handle_ids),
-            )
             with torch.profiler.record_function(f"prepare_kernel:{self.kernel_name}"):
                 self.jobplan = prepare_kernel(
                     spyrecode_dir,

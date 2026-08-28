@@ -921,6 +921,25 @@ class TestFfdcAsyncCompile:
             "torch_spyre._inductor.kernel_provenance",
             build_kernel_provenance_descriptor=lambda specs: None,
         )
+
+        class _ProvenanceCollectionBuilder:
+            def add_uncollected_kernel(self, _kernel_name):
+                pass
+
+        _stub_module(
+            monkeypatch,
+            "torch_spyre._inductor.provenance_artifact",
+            CollectedProvenance=object,
+            ProvenanceCollectionBuilder=_ProvenanceCollectionBuilder,
+            collect_kernel_provenance=lambda *args, **kwargs: None,
+            consume_kernel_registration_state=lambda graph: None,
+        )
+        _stub_module(
+            monkeypatch,
+            "torch_spyre._inductor.provenance_writer",
+            capture_upstream_projection=lambda collection: None,
+            publish_provenance_collection=lambda *args, **kwargs: "disabled",
+        )
         codegen = _stub_module(monkeypatch, "torch_spyre._inductor.codegen")
         codegen.__path__ = []
         _stub_module(

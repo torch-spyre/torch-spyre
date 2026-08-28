@@ -43,14 +43,16 @@ from torch_spyre._inductor.op_spec import (
     TensorArg,
     TensorWorkDivision,
 )
+from torch_spyre.provenance_codec import (
+    KERNEL_PROVENANCE_KEY_BASE32_WIDTH,
+    KERNEL_PROVENANCE_KEY_VERSION,
+)
 
 
 # Bump this only when existing v1 identities would be reinterpreted, or when the
 # key width changes. New optional fields may extend identity without a bump when
 # they are omitted for all previously representable bundles.
 _KERNEL_BUNDLE_KEY_DOMAIN = "spyre-kernel-bundle"
-KERNEL_PROVENANCE_KEY_VERSION = 1
-KERNEL_PROVENANCE_KEY_BASE32_WIDTH = 16
 _KERNEL_PROVENANCE_KEY_ALPHABET = frozenset("abcdefghijklmnopqrstuvwxyz234567")
 
 _EXPECTED_OP_SPEC_SCHEMA = {

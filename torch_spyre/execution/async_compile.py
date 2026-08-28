@@ -18,12 +18,14 @@ from collections.abc import Sequence
 import os
 import shutil
 import subprocess
+import threading
 import torch
 import uuid
 
 from torch._inductor.async_compile import AsyncCompile
 from torch._inductor.runtime.runtime_utils import cache_dir
-from torch_spyre._inductor import config as _spyre_config
+from torch._inductor.virtualized import V
+from torch_spyre._inductor import config as spyre_config
 from torch_spyre._inductor.logging_utils import get_inductor_logger
 from torch_spyre._inductor.op_spec import (
     LoopSpec,
@@ -33,6 +35,16 @@ from torch_spyre._inductor.op_spec import (
 )
 from torch_spyre._inductor.kernel_provenance import (
     build_kernel_provenance_descriptor,
+)
+from torch_spyre._inductor.provenance_artifact import (
+    collect_kernel_provenance,
+    CollectedProvenance,
+    consume_kernel_registration_state,
+    ProvenanceCollectionBuilder,
+)
+from torch_spyre._inductor.provenance_writer import (
+    capture_upstream_projection,
+    publish_provenance_collection,
 )
 from torch_spyre._inductor.codegen.bundle import generate_bundle
 from torch_spyre.profiler._ffdc import CATEGORY_COMPILE_BACKEND, try_collect
@@ -55,11 +67,11 @@ def _check_ktir_device_prerequisites() -> None:
     """
     missing = []
 
-    if _spyre_config.bundle_symbolic_args:
+    if spyre_config.bundle_symbolic_args:
         # The env var, not just config: prepare_kernel.cpp reads it directly.
         missing.append("set BUNDLE_SYMBOLIC_ARGS=0 (baked addresses are required)")
 
-    if not _spyre_config.ktir_device_mlir:
+    if not spyre_config.ktir_device_mlir:
         missing.append("set KTIR_DEVICE_MLIR to a .mlir declaring the target device")
 
     if shutil.which("dbo-opt") is None:
@@ -70,6 +82,32 @@ def _check_ktir_device_prerequisites() -> None:
             "OpSpec->KTIR: cannot compile for the device:\n"
             + "\n".join(f"  - {m}" for m in missing)
         )
+
+
+_publication_disabled_lock = threading.Lock()
+_publication_disabled_logged = False
+_provenance_level_zero_lock = threading.Lock()
+_provenance_level_zero_logged = False
+
+
+def _log_publication_disabled_once() -> None:
+    global _publication_disabled_logged
+    with _publication_disabled_lock:
+        if not _publication_disabled_logged:
+            logger.debug("Spyre provenance sidecar publication is disabled")
+            _publication_disabled_logged = True
+
+
+def _log_provenance_level_zero_once() -> None:
+    global _provenance_level_zero_logged
+    with _provenance_level_zero_lock:
+        if not _provenance_level_zero_logged:
+            logger.warning(
+                "Spyre provenance upstream projection is unavailable; set "
+                "torch._inductor.config.trace.provenance_tracking_level=1 "
+                "to enable it"
+            )
+            _provenance_level_zero_logged = True
 
 
 def get_output_dir(kernel_name: str):
@@ -96,6 +134,13 @@ class SpyreAsyncCompile(AsyncCompile):
         super().__init__()
         self._provenance_attempt_count = 0
         self._provenance_failure_count = 0
+        self._artifact_collection_builder = ProvenanceCollectionBuilder()
+        self._artifact_collection_failure_count = 0
+        self._artifact_upstream_projection_failed = False
+        self._artifact_publication_failure_count = 0
+        # Retained after wait() for publication diagnostics and integration tests.
+        self._last_provenance_collection: CollectedProvenance | None = None
+        self._provenance_wait_completed = False
 
     def triton(self, *args, **kwargs):
         raise NotImplementedError(
@@ -116,7 +161,9 @@ class SpyreAsyncCompile(AsyncCompile):
         pool_size: int = 0,
     ):
         unimp = find_unimplemented(list(specs))
+        self._provenance_attempt_count += 1
         if unimp is not None:
+            self._artifact_collection_builder.add_uncollected_kernel(kernel_name)
             logger.warning(
                 f"WARNING: Compiling unimplemented {unimp.op} to runtime exception"
             )
@@ -126,7 +173,6 @@ class SpyreAsyncCompile(AsyncCompile):
         output_dir = get_output_dir(kernel_name)
         generate_bundle(kernel_name, output_dir, specs, pool_size=pool_size)
 
-        self._provenance_attempt_count += 1
         try:
             # This is the common fresh-compile/cache-reload boundary: generated
             # wrappers have reconstructed the finalized OpSpecs before calling
@@ -149,6 +195,27 @@ class SpyreAsyncCompile(AsyncCompile):
                 )
             kernel_provenance = None
 
+            self._artifact_collection_builder.add_uncollected_kernel(kernel_name)
+        if kernel_provenance is not None:
+            try:
+                collected_kernel = collect_kernel_provenance(
+                    kernel_name,
+                    finalized_specs,
+                    kernel_provenance,
+                )
+                self._artifact_collection_builder.add_kernel(collected_kernel)
+            except Exception:  # noqa: BLE001 - provenance must never fail the build
+                self._artifact_collection_failure_count += 1
+                if self._artifact_collection_failure_count == 1:
+                    logger.warning(
+                        "provenance artifact collection failed for kernel %s; "
+                        "continuing without a sidecar contribution; additional "
+                        "failures in this compilation will be summarized",
+                        kernel_name,
+                        exc_info=True,
+                    )
+
+                self._artifact_collection_builder.add_uncollected_kernel(kernel_name)
         # Invoke backend compiler of SDSC Bundle
         with torch.profiler.record_function(f"dxp_standalone:{kernel_name}"):
             try:
@@ -206,7 +273,7 @@ class SpyreAsyncCompile(AsyncCompile):
         ktir_text = generate_ktir(
             kernel_name,
             specs,
-            bake_addresses=not _spyre_config.bundle_symbolic_args,
+            bake_addresses=not spyre_config.bundle_symbolic_args,
         )
 
         # Persist the emitted KTIR as a text file in the same per-kernel output
@@ -234,7 +301,7 @@ class SpyreAsyncCompile(AsyncCompile):
         cmd = [
             "dbo-opt",
             "--from-ktir",
-            f"--device={_spyre_config.ktir_device_mlir}",
+            f"--device={spyre_config.ktir_device_mlir}",
             f"--export-dir={output_dir}",
             "--kEmitSpyreCode",
             ktir_path,
@@ -307,11 +374,110 @@ class SpyreAsyncCompile(AsyncCompile):
 
     def wait(self, scope: dict[str, Any]) -> None:
         super().wait(scope)
+        # Later waits must not consume stale V.graph state or publish/count twice.
+        if self._provenance_wait_completed:
+            return
+        self._provenance_wait_completed = True
+        self._last_provenance_collection = None
+        upstream_projection = None
+        upstream_projection_failed = False
+        try:
+            registration_state = consume_kernel_registration_state(V.graph)
+            self._last_provenance_collection = self._artifact_collection_builder.finish(
+                registration_state
+            )
+            if registration_state.capture_failed:
+                upstream_projection_failed = True
+        except Exception:  # noqa: BLE001 - provenance must never fail the build
+            self._artifact_collection_failure_count += 1
+            if self._artifact_collection_failure_count == 1:
+                logger.warning(
+                    "provenance artifact finalization failed; continuing without "
+                    "a sidecar contribution",
+                    exc_info=True,
+                )
+
+        configured_path = spyre_config.provenance_artifact_path
+        if (
+            configured_path
+            and self._last_provenance_collection is not None
+            and self._last_provenance_collection.kernels
+        ):
+            try:
+                upstream_projection = capture_upstream_projection(
+                    self._last_provenance_collection
+                )
+                if upstream_projection is not None and upstream_projection.failed:
+                    upstream_projection_failed = True
+            except Exception:  # noqa: BLE001 - projection must never fail the build
+                upstream_projection_failed = True
+                logger.warning(
+                    "upstream provenance projection capture failed; continuing "
+                    "with a partial sidecar",
+                    exc_info=True,
+                )
+
+        if upstream_projection_failed:
+            self._artifact_upstream_projection_failed = True
+
+        if self._last_provenance_collection is not None:
+            try:
+                publication_result = publish_provenance_collection(
+                    self._last_provenance_collection,
+                    configured_path,
+                    upstream_projection=upstream_projection,
+                    upstream_projection_failed=upstream_projection_failed,
+                )
+                if publication_result == "disabled":
+                    _log_publication_disabled_once()
+                elif (
+                    self._last_provenance_collection.kernels
+                    and torch._inductor.config.trace.provenance_tracking_level < 1
+                ):
+                    _log_provenance_level_zero_once()
+            except Exception:  # noqa: BLE001 - publication must never fail the build
+                self._artifact_publication_failure_count += 1
+                if self._artifact_publication_failure_count == 1:
+                    configured_path = spyre_config.provenance_artifact_path
+                    basename = (
+                        os.path.basename(configured_path)
+                        if configured_path
+                        else "spyre_provenance.json"
+                    )
+                    logger.warning(
+                        "provenance sidecar publication failed for %s; "
+                        "continuing compilation",
+                        basename,
+                        exc_info=True,
+                    )
+
         if self._provenance_failure_count:
             logger.warning(
                 "kernel provenance disabled for %d/%d compiled Spyre kernels",
                 self._provenance_failure_count,
                 self._provenance_attempt_count,
             )
+        if self._artifact_collection_failure_count:
+            logger.warning(
+                "provenance artifact collection incomplete after %d failure(s) "
+                "across %d compiled Spyre kernels",
+                self._artifact_collection_failure_count,
+                self._provenance_attempt_count,
+            )
+        if self._artifact_upstream_projection_failed:
+            logger.warning(
+                "provenance upstream projection incomplete for this generated wrapper"
+            )
+        if self._artifact_publication_failure_count:
+            logger.warning(
+                "provenance sidecar publication incomplete after %d failure(s) "
+                "across %d compiled Spyre kernels",
+                self._artifact_publication_failure_count,
+                self._provenance_attempt_count,
+            )
         self._provenance_attempt_count = 0
         self._provenance_failure_count = 0
+        self._artifact_collection_builder = ProvenanceCollectionBuilder()
+        self._artifact_collection_failure_count = 0
+        self._artifact_upstream_projection_failed = False
+        self._artifact_publication_failure_count = 0

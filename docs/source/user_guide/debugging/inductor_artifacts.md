@@ -131,6 +131,11 @@ that case. See the
 [PyTorch provenance docs][pytorch-provenance] for the upstream
 reference.
 
+For runtime-event-first inspection of Spyre source, FX, lower-IR, and direct
+OpSpec evidence, see the [offline provenance viewer](../provenance/viewer.md).
+It consumes `spyre_provenance.json` and an optional Kineto trace; raw
+`tlparse` artifacts are not required.
+
 ## Quick reference
 
 ```bash

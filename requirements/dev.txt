@@ -6,6 +6,10 @@ annotated-types==0.8.0
     # via pydantic
 ast-serialize==0.6.0
     # via mypy
+attrs==26.1.0
+    # via
+    #   jsonschema
+    #   referencing
 build==1.5.0
     # via torch-spyre
 cfgv==3.5.0
@@ -39,6 +43,10 @@ jinja2==3.1.6
     # via
     #   torch
     #   torch-spyre
+jsonschema==4.26.0
+    # via torch-spyre
+jsonschema-specifications==2025.9.1
+    # via jsonschema
 librt==0.13.0 ; platform_python_implementation != 'PyPy'
     # via mypy
 markupsafe==3.0.3
@@ -110,8 +118,16 @@ pyyaml==6.0.3
     # via
     #   pre-commit
     #   torch-spyre
+referencing==0.37.0
+    # via
+    #   jsonschema
+    #   jsonschema-specifications
 regex==2026.7.19
     # via torch-spyre
+rpds-py==2026.6.3
+    # via
+    #   jsonschema
+    #   referencing
 setuptools==81.0.0
     # via
     #   torch
@@ -132,6 +148,7 @@ typing-extensions==4.16.0
     #   ortools
     #   pydantic
     #   pydantic-core
+    #   referencing
     #   torch
     #   typing-inspection
 typing-inspection==0.4.2

@@ -421,6 +421,13 @@ jobs:
           echo "REPORT_NAME=${REPORT_NAME}" >> "$GITHUB_ENV"
           echo "REPORT_PATH=${GITHUB_WORKSPACE}/${REPORT_NAME}" >> "$GITHUB_ENV"
 
+      - name: Install mandatory provenance viewer DOM gate
+        if: ${{ matrix.suite.config == 'inductor/test_provenance_viewer_config.yaml' }}
+        run: |
+          npm install --prefix "${RUNNER_TEMP}/torch-spyre-jsdom" --no-save jsdom@30.0.1
+          echo "NODE_PATH=${RUNNER_TEMP}/torch-spyre-jsdom/node_modules" >> "$GITHUB_ENV"
+          echo "SPYRE_REQUIRE_DOM_GATE=1" >> "$GITHUB_ENV"
+
       - name: Run ${{ matrix.suite.name }} tests
         id: run_tests
         uses: ./.github/actions/run-test-suite

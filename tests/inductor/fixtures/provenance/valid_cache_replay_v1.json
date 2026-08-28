@@ -1,0 +1,125 @@
+{
+  "schemaVersion": 1,
+  "eventKey": {
+    "version": 1,
+    "algorithm": "sha256-prefix-80-base32-lower",
+    "width": 16,
+    "stepAttribution": "bundle"
+  },
+  "mergeGeneration": 1,
+  "status": "partial",
+  "diagnostics": {},
+  "handles": {
+    "101": {
+      "id": "101",
+      "source": {
+        "file": "/workspace/model.py",
+        "start_line": 17,
+        "start_col": 0,
+        "end_line": null,
+        "end_col": null
+      },
+      "aten_op": "aten.linear.default",
+      "ir_chain": ["linear"],
+      "fused_from": [],
+      "transform_history": []
+    },
+    "102": {
+      "id": "102",
+      "source": {
+        "file": "/workspace/model.py",
+        "start_line": 18,
+        "start_col": 0,
+        "end_line": null,
+        "end_col": null
+      },
+      "aten_op": "aten.relu.default",
+      "ir_chain": ["relu"],
+      "fused_from": [],
+      "transform_history": []
+    },
+    "200": {
+      "id": "200",
+      "source": null,
+      "aten_op": null,
+      "ir_chain": ["linear", "relu", "buf0"],
+      "fused_from": ["101", "102"],
+      "transform_history": [
+        {
+          "kind": "fusion",
+          "pass_name": "fuse_linear_relu",
+          "reason": "same iteration space"
+        }
+      ]
+    }
+  },
+  "kernelIdentities": {
+    "atqydvnuutl766na": {
+      "directHandleIds": ["200"],
+      "specHandleBindings": [
+        {
+          "specPath": [0],
+          "handleId": "200"
+        },
+        {
+          "specPath": [1, 0],
+          "handleId": "200"
+        }
+      ],
+      "atenOps": ["aten.linear.default", "aten.relu.default"],
+      "eventNameBase": "spyre_kernel_v1_fused_linear_relu_atqydvnuutl766na"
+    },
+    "vsancadvtjfcq6cv": {
+      "directHandleIds": [],
+      "specHandleBindings": [],
+      "atenOps": [],
+      "eventNameBase": "spyre_kernel_v1_fused_unknown_vsancadvtjfcq6cv"
+    }
+  },
+  "kernelOccurrences": {
+    "628cf6fb3dc79712e3556d549e9b9895088b978deb90882cc61e7ba62d3b0cb2": {
+      "identityKey": "vsancadvtjfcq6cv",
+      "compileId": "3acd1120e2323fa1fec28f1ff89a59da68cda82541b0a19815ec47a2c922ac0e",
+      "compilerKernelName": "sdsc_fused_unknown_1",
+      "registrations": []
+    },
+    "9defcebc8e4505ae8ce0699292e7841f7e0c9d8dbfae401b797e415ff7176ef0": {
+      "identityKey": "atqydvnuutl766na",
+      "compileId": "3acd1120e2323fa1fec28f1ff89a59da68cda82541b0a19815ec47a2c922ac0e",
+      "compilerKernelName": "sdsc_fused_linear_relu_0",
+      "registrations": []
+    }
+  },
+  "upstreamProjections": {
+    "3acd1120e2323fa1fec28f1ff89a59da68cda82541b0a19815ec47a2c922ac0e": {
+      "source": "inductor_provenance_tracking_node_mappings",
+      "version": 2.0,
+      "producer": {
+        "torchSpyreVersion": "0.1.0",
+        "torchVersion": "2.13.0+cpu"
+      },
+      "settings": {
+        "provenanceTrackingLevel": 1,
+        "structuredTracing": false
+      },
+      "kernels": [
+        {
+          "compilerKernelName": "sdsc_fused_linear_relu_0",
+          "identityKey": "atqydvnuutl766na"
+        },
+        {
+          "compilerKernelName": "sdsc_fused_unknown_1",
+          "identityKey": "vsancadvtjfcq6cv"
+        }
+      ],
+      "uncollectedKernels": [],
+      "upstreamProjectionFailed": false,
+      "upstreamJoin": "unavailable-cache-replay",
+      "preToPost": {},
+      "postToPre": {},
+      "cppCodeToPost": {},
+      "postToCppCode": {},
+      "kernelStackTraces": {}
+    }
+  }
+}
