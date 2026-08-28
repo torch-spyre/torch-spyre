@@ -47,6 +47,17 @@ def _extract_failure_message(rep):
     return message
 
 
+@pytest.fixture(autouse=True)
+def _disable_provenance_publication():
+    """Keep ordinary tests from publishing a sidecar into the repository."""
+    import torch  # noqa: F401
+
+    from torch_spyre._inductor import config as spyre_config
+
+    with spyre_config.patch({"provenance_artifact_path": None}):
+        yield
+
+
 # Attaches per-test tags to the pytest report object after each test call.
 # Tags come from _RUNTIME_TAGS (set by print_test_tags_oot during test execution,
 # includes per-occurrence op tags) with fallback to _spyre_method_tags

@@ -48,6 +48,10 @@ from .scratchpad.lx_relayout import (
     work_division_from_view,
 )
 from .op_spec import LoopSpec
+from .provenance_artifact import (
+    mark_kernel_registration_failure,
+    record_kernel_registration,
+)
 from . import config as _spyre_config
 
 logger = get_inductor_logger("scheduler")
@@ -606,6 +610,39 @@ class SuperDSCScheduling(BaseScheduling):
         """
         # Overrides superclass method that raises NotImplementedError.
         pass
+
+    def codegen_comment(
+        self,
+        node_schedule: Sequence[BaseSchedulerNode],
+        kernel_name: str | None = None,
+    ) -> None:
+        """Register and retain the exact upstream provenance alias once."""
+        if not kernel_name:
+            return
+
+        from torch._inductor.debug import set_kernel_post_grad_provenance_tracing
+
+        debug_handle = set_kernel_post_grad_provenance_tracing(
+            node_schedule,
+            kernel_name,
+        )
+        V.graph.wrapper_code.write_provenance_debug_handle(
+            kernel_name,
+            debug_handle,
+        )
+        try:
+            record_kernel_registration(V.graph, kernel_name, debug_handle)
+        except Exception:  # noqa: BLE001 - provenance must never fail codegen
+            try:
+                mark_kernel_registration_failure(V.graph)
+            except Exception:  # noqa: BLE001 - preserve the original traceback
+                pass
+            logger.warning(
+                "failed to retain the upstream provenance alias for kernel %s; "
+                "continuing without artifact registration data",
+                kernel_name,
+                exc_info=True,
+            )
 
     def can_buffer_be_removed_through_fusion(
         self, name: str, fused_node_names: OrderedSet[str]

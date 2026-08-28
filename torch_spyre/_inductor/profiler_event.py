@@ -30,9 +30,12 @@ import regex
 
 from torch_spyre._C import AIUPTI_ACTIVITY_NAME_MAX_BYTES
 from torch_spyre._inductor.kernel_provenance import (
+    KernelProvenanceDescriptor,
+)
+from torch_spyre.provenance_codec import (
     KERNEL_PROVENANCE_KEY_BASE32_WIDTH,
     KERNEL_PROVENANCE_KEY_VERSION,
-    KernelProvenanceDescriptor,
+    parse_kernel_provenance_event_name,
 )
 
 
@@ -45,20 +48,8 @@ _MAX_EVENT_NAME_BASE_BYTES = (
     AIUPTI_ACTIVITY_NAME_MAX_BYTES - _MAX_COMPUTE_STEP_SUFFIX_BYTES
 )
 
-_SUPPORTED_KEY_WIDTHS = {
-    KERNEL_PROVENANCE_KEY_VERSION: KERNEL_PROVENANCE_KEY_BASE32_WIDTH
-}
-_EVENT_NAME_PREFIX = f"spyre_kernel_v{KERNEL_PROVENANCE_KEY_VERSION}_"
-# The separator before the key is unambiguous because ``_`` is not in the
-# lowercase base32 alphabet. Revisit this parser if a future version changes
-# the alphabet.
-_EVENT_KEY_RE = regex.compile(
-    r"\Aspyre_kernel_v(?P<version>[0-9]+)_"
-    r"[A-Za-z0-9_]+?_"
-    r"(?P<key>[a-z2-7]+)"
-    r"(?:#[0-9]+)?\Z"
-)
 _DISPLAY_COMPONENT_RE = regex.compile(r"[^A-Za-z0-9]+")
+_EVENT_NAME_PREFIX = f"spyre_kernel_v{KERNEL_PROVENANCE_KEY_VERSION}_"
 _MIN_EVENT_NAME_BASE_BYTES = len(
     f"{_EVENT_NAME_PREFIX}u_{'a' * KERNEL_PROVENANCE_KEY_BASE32_WIDTH}".encode("ascii")
 )
@@ -85,13 +76,8 @@ def format_kernel_provenance_event_name(
 
 def extract_kernel_provenance_key(event_name: str) -> str | None:
     """Extract a kernel-provenance key from a Spyre device event name."""
-    match = _EVENT_KEY_RE.match(event_name)
-    if match is None:
-        return None
-    version = int(match.group("version"))
-    expected_width = _SUPPORTED_KEY_WIDTHS.get(version)
-    key = match.group("key")
-    return key if expected_width is not None and len(key) == expected_width else None
+    parsed = parse_kernel_provenance_event_name(event_name)
+    return parsed.key if parsed is not None else None
 
 
 def _aten_summary(aten_ops: tuple[str, ...]) -> str:

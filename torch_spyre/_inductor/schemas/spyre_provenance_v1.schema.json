@@ -1,0 +1,476 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/torch-spyre/torch-spyre/schemas/spyre_provenance_v1.schema.json",
+  "title": "Torch-Spyre provenance sidecar v1",
+  "description": "Authoritative durable mapping from Spyre profiler bundle keys to normalized source provenance and filtered upstream Inductor relationships.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "eventKey",
+    "mergeGeneration",
+    "status",
+    "diagnostics",
+    "handles",
+    "kernelIdentities",
+    "kernelOccurrences",
+    "upstreamProjections"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "description": "Wire-format version. Readers check this field before JSON Schema validation and reject unsupported versions explicitly.",
+      "const": 1
+    },
+    "eventKey": {
+      "description": "Versioned profiler event-key contract shared by every kernel identity in this artifact.",
+      "$ref": "#/$defs/eventKey"
+    },
+    "mergeGeneration": {
+      "description": "One-based count of semantic publications. A no-op merge does not increment it.",
+      "type": "integer",
+      "minimum": 1
+    },
+    "status": {
+      "description": "Derived artifact completeness: complete only when diagnostics is empty and every upstream projection is ok; partial otherwise.",
+      "enum": ["complete", "partial"]
+    },
+    "diagnostics": {
+      "description": "Writer-side failure counts derived from compile projections. Reader rejection diagnostics use a separate vocabulary defined by the resolver contract.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "collection-failure": {
+          "description": "Sum of the per-projection distinct uncollected kernel-name counts.",
+          "type": "integer",
+          "minimum": 1
+        },
+        "upstream-projection-failure": {
+          "description": "Number of compile projections that observed a failure while capturing or filtering upstream provenance.",
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "handles": {
+      "description": "Normalized DebugHandle records keyed by decimal-string handle ID. An empty map is valid.",
+      "type": "object",
+      "propertyNames": { "$ref": "#/$defs/decimalId" },
+      "additionalProperties": { "$ref": "#/$defs/handle" }
+    },
+    "kernelIdentities": {
+      "description": "Content identities keyed by the finalized-bundle provenance key.",
+      "type": "object",
+      "minProperties": 1,
+      "propertyNames": { "$ref": "#/$defs/eventKeyValue" },
+      "additionalProperties": { "$ref": "#/$defs/kernelIdentity" }
+    },
+    "kernelOccurrences": {
+      "description": "Compile-scoped reconstructed bundles keyed by their derived occurrence ID.",
+      "type": "object",
+      "minProperties": 1,
+      "propertyNames": { "$ref": "#/$defs/sha256Hex" },
+      "additionalProperties": { "$ref": "#/$defs/kernelOccurrence" }
+    },
+    "upstreamProjections": {
+      "description": "Compile metadata and filtered upstream relationships keyed by the derived compile ID.",
+      "type": "object",
+      "minProperties": 1,
+      "propertyNames": { "$ref": "#/$defs/sha256Hex" },
+      "additionalProperties": { "$ref": "#/$defs/upstreamProjection" }
+    }
+  },
+  "$defs": {
+    "decimalId": {
+      "description": "Canonical non-negative decimal integer spelling without leading zeros.",
+      "type": "string",
+      "pattern": "^(0|[1-9][0-9]*)$"
+    },
+    "eventKeyValue": {
+      "description": "Lowercase base32 encoding of the first 80 bits of the SHA-256 finalized-bundle fingerprint.",
+      "type": "string",
+      "pattern": "^[a-z2-7]{16}$"
+    },
+    "sha256Hex": {
+      "description": "Full lowercase hexadecimal SHA-256 digest.",
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "stringSet": {
+      "description": "Order-preserving array with no duplicate strings.",
+      "type": "array",
+      "items": { "type": "string" },
+      "uniqueItems": true
+    },
+    "producer": {
+      "description": "Toolchain versions that produced one compile-scoped contribution.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["torchSpyreVersion", "torchVersion"],
+      "properties": {
+        "torchSpyreVersion": {
+          "description": "torch-spyre package version.",
+          "type": "string",
+          "minLength": 1
+        },
+        "torchVersion": {
+          "description": "PyTorch package version.",
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "eventKey": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["version", "algorithm", "width", "stepAttribution"],
+      "properties": {
+        "version": {
+          "description": "Profiler event-key format version.",
+          "const": 1
+        },
+        "algorithm": {
+          "description": "Bundle-key digest and encoding algorithm.",
+          "const": "sha256-prefix-80-base32-lower"
+        },
+        "width": {
+          "description": "Encoded bundle-key width in ASCII characters.",
+          "const": 16
+        },
+        "stepAttribution": {
+          "description": "Current JobExecPlan step suffixes resolve to the whole finalized open-source bundle.",
+          "const": "bundle"
+        }
+      }
+    },
+    "settings": {
+      "description": "Strongest upstream provenance and structured-tracing settings observed across contributions merged into one compile identity.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["provenanceTrackingLevel", "structuredTracing"],
+      "properties": {
+        "provenanceTrackingLevel": {
+          "description": "Maximum observed torch._inductor.config.trace.provenance_tracking_level across merged contributions.",
+          "type": "integer",
+          "minimum": 0
+        },
+        "structuredTracing": {
+          "description": "Whether upstream structured tracing was active for any merged contribution.",
+          "type": "boolean"
+        }
+      }
+    },
+    "sourceLoc": {
+      "description": "Structured source range matching MLIR FileLineColRange fields.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["file", "start_line", "start_col", "end_line", "end_col"],
+      "properties": {
+        "file": {
+          "description": "Source filename as recorded by the compiler.",
+          "type": "string",
+          "minLength": 1
+        },
+        "start_line": {
+          "description": "One-based starting line.",
+          "type": "integer",
+          "minimum": 1
+        },
+        "start_col": {
+          "description": "Zero-based starting column.",
+          "type": "integer",
+          "minimum": 0
+        },
+        "end_line": {
+          "description": "Optional one-based ending line.",
+          "oneOf": [
+            { "type": "integer", "minimum": 1 },
+            { "type": "null" }
+          ]
+        },
+        "end_col": {
+          "description": "Optional zero-based ending column.",
+          "oneOf": [
+            { "type": "integer", "minimum": 0 },
+            { "type": "null" }
+          ]
+        }
+      }
+    },
+    "transform": {
+      "description": "One immutable lower-IR provenance transformation.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "pass_name", "reason"],
+      "properties": {
+        "kind": {
+          "description": "Typed rewrite relationship.",
+          "enum": ["rewrite", "fusion", "decomposition", "clone", "remap"]
+        },
+        "pass_name": {
+          "description": "Compiler pass that performed the transformation.",
+          "type": "string",
+          "minLength": 1
+        },
+        "reason": {
+          "description": "Optional structured explanation supplied by the pass.",
+          "oneOf": [{ "type": "string" }, { "type": "null" }]
+        }
+      }
+    },
+    "handle": {
+      "description": "Normalized DebugHandle. fused_from contains ID references rather than DebugHandle.to_dict()'s recursively nested objects.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "source",
+        "aten_op",
+        "ir_chain",
+        "fused_from",
+        "transform_history"
+      ],
+      "properties": {
+        "id": {
+          "description": "Must equal this record's key in the top-level handles map.",
+          "$ref": "#/$defs/decimalId"
+        },
+        "source": {
+          "description": "Unambiguous headline source, or null when constituents disagree or source metadata is absent.",
+          "oneOf": [
+            { "$ref": "#/$defs/sourceLoc" },
+            { "type": "null" }
+          ]
+        },
+        "aten_op": {
+          "description": "Unambiguous source-level ATen identity, or null when constituents disagree or metadata is absent.",
+          "oneOf": [
+            { "type": "string", "minLength": 1 },
+            { "type": "null" }
+          ]
+        },
+        "ir_chain": {
+          "description": "Ordered opaque compiler names. V1 does not infer stage types that production data does not encode.",
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "fused_from": {
+          "description": "Ordered authoritative constituent handle IDs. Every ID must resolve in the top-level handles map.",
+          "type": "array",
+          "items": { "$ref": "#/$defs/decimalId" },
+          "uniqueItems": true
+        },
+        "transform_history": {
+          "description": "Ordered typed lower-IR transformation history.",
+          "type": "array",
+          "items": { "$ref": "#/$defs/transform" }
+        }
+      }
+    },
+    "specHandleBinding": {
+      "description": "One direct handle attachment at a finalized OpSpec position.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["specPath", "handleId"],
+      "properties": {
+        "specPath": {
+          "description": "Non-empty zero-based index path through the finalized OpSpec/LoopSpec tree.",
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "integer", "minimum": 0 }
+        },
+        "handleId": {
+          "description": "Directly attached handle ID at this OpSpec position.",
+          "$ref": "#/$defs/decimalId"
+        }
+      }
+    },
+    "kernelIdentity": {
+      "description": "Cache-stable finalized-bundle identity independent of compiler occurrence context.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "directHandleIds",
+        "specHandleBindings",
+        "atenOps",
+        "eventNameBase"
+      ],
+      "properties": {
+        "directHandleIds": {
+          "description": "Ordered first-appearance deduplication of specHandleBindings handle IDs.",
+          "type": "array",
+          "items": { "$ref": "#/$defs/decimalId" },
+          "uniqueItems": true
+        },
+        "specHandleBindings": {
+          "description": "Depth-first finalized OpSpec attachments, retaining position, multiplicity, and order.",
+          "type": "array",
+          "items": { "$ref": "#/$defs/specHandleBinding" }
+        },
+        "atenOps": {
+          "description": "Sorted unique recursive ATen identities reachable from direct handles.",
+          "$ref": "#/$defs/stringSet"
+        },
+        "eventNameBase": {
+          "description": "Exact profiler event name before the runtime appends #<step>.",
+          "type": "string",
+          "pattern": "^spyre_kernel_v1_[A-Za-z0-9_]+_[a-z2-7]{16}$"
+        }
+      }
+    },
+    "registration": {
+      "description": "One exact upstream registration retained from a scheduler codegen call.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["ordinal", "alias"],
+      "properties": {
+        "ordinal": {
+          "description": "One-based compile-scoped ordinal returned by upstream registration.",
+          "type": "integer",
+          "minimum": 1
+        },
+        "alias": {
+          "description": "Exact <compiler-kernel-name>:<ordinal> upstream mapping key.",
+          "type": "string",
+          "pattern": "^.+:[1-9][0-9]*$"
+        }
+      }
+    },
+    "kernelOccurrence": {
+      "description": "One finalized sdsc() bundle reconstructed for one compiler kernel in one compile identity.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "identityKey",
+        "compileId",
+        "compilerKernelName",
+        "registrations"
+      ],
+      "properties": {
+        "identityKey": {
+          "description": "Key into kernelIdentities.",
+          "$ref": "#/$defs/eventKeyValue"
+        },
+        "compileId": {
+          "description": "Key into upstreamProjections. Availability belongs to that compile-scoped projection, not this deduplicated occurrence.",
+          "$ref": "#/$defs/sha256Hex"
+        },
+        "compilerKernelName": {
+          "description": "Exact sdsc_* name used by the generated wrapper.",
+          "type": "string",
+          "minLength": 1
+        },
+        "registrations": {
+          "description": "Ordered exact aliases observed during fresh codegen; empty on cache replay or provenance level 0.",
+          "type": "array",
+          "items": { "$ref": "#/$defs/registration" },
+          "uniqueItems": true
+        },
+        "selector": {
+          "description": "Reserved optional opaque exact-match occurrence token supplied by runtime event metadata. V1 writers omit this field.",
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "compileKernel": {
+      "description": "One wrapper kernel used to derive compileId in finalized wrapper order.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["compilerKernelName", "identityKey"],
+      "properties": {
+        "compilerKernelName": {
+          "type": "string",
+          "minLength": 1
+        },
+        "identityKey": {
+          "$ref": "#/$defs/eventKeyValue"
+        }
+      }
+    },
+    "nameMap": {
+      "description": "Upstream graph-name relation preserving upstream value order.",
+      "type": "object",
+      "additionalProperties": { "$ref": "#/$defs/stringSet" }
+    },
+    "kernelStackContext": {
+      "description": "Kernel-level display context copied from upstream, not handle-level structured provenance.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["stackTraces", "postGradNodes", "preGradNodes"],
+      "properties": {
+        "stackTraces": { "$ref": "#/$defs/stringSet" },
+        "postGradNodes": { "$ref": "#/$defs/stringSet" },
+        "preGradNodes": { "$ref": "#/$defs/stringSet" }
+      }
+    },
+    "upstreamProjection": {
+      "description": "Compile-scoped producer/settings metadata plus a filtered cache of upstream-owned v2 relationships.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "source",
+        "version",
+        "producer",
+        "settings",
+        "kernels",
+        "uncollectedKernels",
+        "upstreamProjectionFailed",
+        "upstreamJoin",
+        "preToPost",
+        "postToPre",
+        "cppCodeToPost",
+        "postToCppCode",
+        "kernelStackTraces"
+      ],
+      "properties": {
+        "source": {
+          "description": "Upstream artifact whose live state was filtered.",
+          "const": "inductor_provenance_tracking_node_mappings"
+        },
+        "version": {
+          "description": "Numeric upstream node-mapping schema version.",
+          "const": 2.0
+        },
+        "producer": { "$ref": "#/$defs/producer" },
+        "settings": { "$ref": "#/$defs/settings" },
+        "kernels": {
+          "description": "Ordered wrapper kernel list used to derive this map key as the compile ID.",
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/compileKernel" }
+        },
+        "uncollectedKernels": {
+          "description": "Sorted set of compiler kernel names that belonged to this wrapper but could not safely produce a bundle identity.",
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "uniqueItems": true
+        },
+        "upstreamProjectionFailed": {
+          "description": "Whether this compile observed a failure while capturing or filtering upstream provenance.",
+          "type": "boolean"
+        },
+        "upstreamJoin": {
+          "description": "Best available alias/projection status after merge. Richer data is never replaced by a weaker status.",
+          "enum": [
+            "ok",
+            "unavailable-provenance-level-0",
+            "unavailable-cache-replay",
+            "partial"
+          ]
+        },
+        "preToPost": { "$ref": "#/$defs/nameMap" },
+        "postToPre": { "$ref": "#/$defs/nameMap" },
+        "cppCodeToPost": { "$ref": "#/$defs/nameMap" },
+        "postToCppCode": { "$ref": "#/$defs/nameMap" },
+        "kernelStackTraces": {
+          "description": "Reachable stack context keyed by exact registration alias.",
+          "type": "object",
+          "additionalProperties": { "$ref": "#/$defs/kernelStackContext" }
+        }
+      }
+    }
+  }
+}

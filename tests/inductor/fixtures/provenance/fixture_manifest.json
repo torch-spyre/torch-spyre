@@ -1,0 +1,106 @@
+{
+  "valid": [
+    {
+      "path": "valid_v1.json",
+      "covers": [
+        "fused-handles",
+        "empty-handles",
+        "repeated-bundle-identity",
+        "repeated-registration",
+        "multi-graph",
+        "provenance-level-0"
+      ]
+    },
+    {
+      "path": "valid_cache_replay_v1.json",
+      "covers": [
+        "cache-replay",
+        "stable-compile-id",
+        "stable-occurrence-id",
+        "empty-registrations"
+      ]
+    }
+  ],
+  "invalid": [
+    {
+      "name": "forward-version",
+      "base": "valid_v1.json",
+      "mutation": {
+        "operation": "replace",
+        "path": "/schemaVersion",
+        "value": 2
+      },
+      "expectedReaderDiagnostic": "unsupported-schema-version"
+    },
+    {
+      "name": "unknown-field",
+      "base": "valid_v1.json",
+      "mutation": {
+        "operation": "add",
+        "path": "/futureField",
+        "value": true
+      },
+      "expectedReaderDiagnostic": "schema-validation-failure"
+    },
+    {
+      "name": "numeric-handle-id",
+      "base": "valid_v1.json",
+      "mutation": {
+        "operation": "replace",
+        "path": "/handles/101/id",
+        "value": 101
+      },
+      "expectedReaderDiagnostic": "schema-validation-failure"
+    },
+    {
+      "name": "empty-spec-path",
+      "base": "valid_v1.json",
+      "mutation": {
+        "operation": "replace",
+        "path": "/kernelIdentities/atqydvnuutl766na/specHandleBindings/0/specPath",
+        "value": []
+      },
+      "expectedReaderDiagnostic": "schema-validation-failure"
+    },
+    {
+      "name": "dangling-handle-reference",
+      "base": "valid_v1.json",
+      "mutation": {
+        "operation": "replace",
+        "path": "/kernelIdentities/atqydvnuutl766na/directHandleIds/0",
+        "value": "999"
+      },
+      "expectedReaderDiagnostic": "semantic-validation-failure"
+    },
+    {
+      "name": "wrong-compile-id",
+      "base": "valid_cache_replay_v1.json",
+      "mutation": {
+        "operation": "replace",
+        "path": "/upstreamProjections/3acd1120e2323fa1fec28f1ff89a59da68cda82541b0a19815ec47a2c922ac0e/kernels/0/compilerKernelName",
+        "value": "sdsc_wrong_name"
+      },
+      "expectedReaderDiagnostic": "semantic-validation-failure"
+    },
+    {
+      "name": "wrong-occurrence-id",
+      "base": "valid_cache_replay_v1.json",
+      "mutation": {
+        "operation": "replace",
+        "path": "/kernelOccurrences/9defcebc8e4505ae8ce0699292e7841f7e0c9d8dbfae401b797e415ff7176ef0/compilerKernelName",
+        "value": "sdsc_wrong_name"
+      },
+      "expectedReaderDiagnostic": "semantic-validation-failure"
+    },
+    {
+      "name": "wrong-document-status",
+      "base": "valid_v1.json",
+      "mutation": {
+        "operation": "replace",
+        "path": "/status",
+        "value": "complete"
+      },
+      "expectedReaderDiagnostic": "semantic-validation-failure"
+    }
+  ]
+}
