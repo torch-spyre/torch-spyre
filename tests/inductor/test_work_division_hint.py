@@ -658,6 +658,29 @@ def test_grouped_gather_records_geometry_without_persisting_new_placement():
     )
 
 
+def test_grouped_regroup_classifies_cross_dim_transfer():
+    # GQA paged-attention page: source partitioned on dim 1 across all cores,
+    # consumer owns it on a DISJOINT dim 2 with fewer owners (a transpose of the
+    # owned axis). The same-dim gather classifier rejects this; the regroup
+    # classifier accepts it and _compatible_regroup certifies the transfer.
+    source = PerCoreView(((1, 32),), ((1, Mod(_CORE_ID, 32)),), num_cores=32)
+    destination = PerCoreView(((2, 2),), ((2, floor(_CORE_ID / 16)),), num_cores=32)
+
+    assert lx_relayout_module._grouped_gather_geometry(source, destination, 32) is None
+    grouped = lx_relayout_module._grouped_regroup_geometry(source, destination, 32)
+    assert grouped is not None
+    assert lx_relayout_module._compatible_regroup(source, destination, 32)
+
+
+def test_grouped_regroup_rejects_shared_split_axis():
+    # A same-axis contraction is a gather, not a regroup: the regroup classifier
+    # must decline when source and destination split overlapping dims.
+    source = PerCoreView(((0, 32),), ((0, Mod(_CORE_ID, 32)),), num_cores=32)
+    destination = PerCoreView(((0, 2),), ((0, floor(_CORE_ID / 16)),), num_cores=32)
+
+    assert lx_relayout_module._grouped_regroup_geometry(source, destination, 32) is None
+
+
 def test_partition_footprint_counts_strided_span_not_elements():
     assert (
         lx_relayout_module.partition_physical_span_bytes(

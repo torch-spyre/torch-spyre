@@ -71,7 +71,7 @@ class LXRelayoutPlan:
     source_view: PerCoreView
     destination_view: PerCoreView
     num_cores: int
-    kind: Literal["shuffle", "gather", "broadcast"] = "shuffle"
+    kind: Literal["shuffle", "gather", "broadcast", "regroup"] = "shuffle"
     group_geometry: tuple[RelayoutDimension, ...] = ()
     max_footprint_bytes: int = 0
     source_address: int | None = None
@@ -326,6 +326,81 @@ def _view_from_splits(
     )
 
 
+def _compatible_regroup(
+    source: PerCoreView, destination: PerCoreView, num_cores: int
+) -> bool:
+    """Whether a cross-dim regroup is a complete, uniform transfer.
+
+    ``_compatible_partitions`` assumes source and destination split the SAME
+    device dims (it intersects per-dim slice coordinates via ``_overlap``). A
+    regroup partitions DIFFERENT dims (source on dims X, destination on disjoint
+    dims Y), so per-dim overlap is meaningless. Here every source core owns a
+    distinct 1/num_cores slice and every destination owner replicates one of
+    ``destination_owners`` slices to an equal-size contiguous core group; the
+    transfer is complete iff the counts line up.
+    """
+
+    source_splits = dict(source.work_slice_dims)
+    destination_splits = dict(destination.work_slice_dims)
+    if set(source_splits) & set(destination_splits):
+        return False
+    if math.prod(source_splits.values()) != num_cores:
+        return False
+    destination_owners = math.prod(destination_splits.values())
+    if not 0 < destination_owners < num_cores or num_cores % destination_owners:
+        return False
+    source_map = _core_slices(source, num_cores)
+    destination_map = _core_slices(destination, num_cores)
+    if len({tuple(sorted(r.items())) for r in source_map.values()}) != num_cores:
+        return False
+    if (
+        len({tuple(sorted(r.items())) for r in destination_map.values()})
+        != destination_owners
+    ):
+        return False
+    # Each destination owner group must be an equal-size contiguous core block.
+    group_size = num_cores // destination_owners
+    for core in range(num_cores):
+        if destination_map[core] != destination_map[(core // group_size) * group_size]:
+            return False
+    return True
+
+
+def _grouped_regroup_geometry(
+    source: PerCoreView, destination: PerCoreView, num_cores: int
+) -> tuple[PerCoreView, PerCoreView, tuple[RelayoutDimension, ...]] | None:
+    """Classify a cross-dim regroup: a source partitioned on dims X re-expressed
+    as a destination partitioned on disjoint dims Y (a transpose of the owned
+    axis).
+
+    This is the GQA paged-attention V/K page: the page is split across all cores
+    on its kv-head axis, but the matmul owns it on the head-group axis. Emitted as
+    a generic ``shuffle`` (validated only by ``_compatible_regroup``) because the
+    structured gather/broadcast geometry both assume a shared split axis.
+    """
+
+    if not _compatible_regroup(source, destination, num_cores):
+        return None
+    source_splits = dict(source.work_slice_dims)
+    destination_splits = dict(destination.work_slice_dims)
+    destination_owners = math.prod(destination_splits.values())
+    geometry = tuple(
+        RelayoutDimension(
+            device_dim=dim,
+            source_split=source_splits.get(dim, 1),
+            destination_split=destination_splits.get(dim, 1),
+            group_count=destination_splits.get(dim, 1),
+            group_size=num_cores // destination_owners,
+            multiplicity=num_cores // destination_owners,
+            ordering_tag="contiguous_groups",
+        )
+        for dim in dict.fromkeys((*source_splits, *destination_splits))
+    )
+    grouped_source = _view_from_splits(source_splits, num_cores)
+    grouped_destination = _view_from_splits(destination_splits, num_cores)
+    return grouped_source, grouped_destination, geometry
+
+
 def _grouped_gather_geometry(
     source: PerCoreView, destination: PerCoreView, num_cores: int
 ) -> tuple[PerCoreView, PerCoreView, tuple[RelayoutDimension, ...]] | None:
@@ -577,6 +652,17 @@ def validate_final_views(
         geometry = classified[2]
         if _geometry_topology(geometry) != _geometry_topology(plan.group_geometry):
             return f"final grouped-broadcast geometry changed: {geometry}"
+    elif plan.kind == "regroup":
+        classified = _grouped_regroup_geometry(
+            source.ownership,
+            destination.ownership,
+            source_num_cores,
+        )
+        if classified is None:
+            return "final views are not a grouped regroup"
+        geometry = classified[2]
+        if _geometry_topology(geometry) != _geometry_topology(plan.group_geometry):
+            return f"final grouped-regroup geometry changed: {geometry}"
     elif plan.kind != "shuffle":
         return f"unsupported relayout kind {plan.kind}"
 
@@ -807,6 +893,12 @@ def collect_lx_relayout_plans(graph: GraphLowering) -> list[LXRelayoutPlan]:
                     rejection_reason = "grouped gather requires a matmul consumer"
                     break
                 grouped = _grouped_gather_geometry(source_view, view, source_num_cores)
+                grouped_kind = "gather"
+                if grouped is None:
+                    grouped = _grouped_regroup_geometry(
+                        source_view, view, source_num_cores
+                    )
+                    grouped_kind = "regroup"
                 if grouped is None:
                     rejection_reason = (
                         "grouped destination does not evenly contract the source"
@@ -821,7 +913,7 @@ def collect_lx_relayout_plans(graph: GraphLowering) -> list[LXRelayoutPlan]:
                 grouped_source = candidate_source
                 grouped_destinations[consumer_name] = destination
                 grouped_geometry[consumer_name] = geometry
-                grouped_kinds[consumer_name] = "gather"
+                grouped_kinds[consumer_name] = grouped_kind
 
         source_view = grouped_source or source_view
         producer_coordinates = try_device_coordinates(
@@ -884,6 +976,11 @@ def collect_lx_relayout_plans(graph: GraphLowering) -> list[LXRelayoutPlan]:
                     destination_view,
                     source_num_cores,
                     consumer_num_cores,
+                ) and not (
+                    grouped_kinds.get(consumer_name) == "regroup"
+                    and _compatible_regroup(
+                        source_view, destination_view, source_num_cores
+                    )
                 ):
                     rejection_reason = (
                         "source and destination partitions are incompatible"
