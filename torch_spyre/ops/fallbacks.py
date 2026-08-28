@@ -140,6 +140,7 @@ def register_fallback(ops, device="cpu"):
             return torch.get_default_device()
 
         if len(devices) > 1:
+            # Unlike eager._check_same_device, no CPU-scalar exemption: fallback ops always move tensors to one resolved device.
             raise RuntimeError(
                 f"Expected all tensors to be on the same device, but found: {devices}"
             )

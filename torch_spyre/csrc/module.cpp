@@ -119,17 +119,11 @@ void _startRuntime() {
               "Device index out of bounds. logical_device_id=",
               logical_device_id, ", number of visible devices=", num_devices);
 
-  std::shared_ptr<flex::RuntimeContext> runtime;
-  auto s = flex::initializeRuntime(&runtime, logical_device_id);
+  flex::RuntimeContext* runtime =
+      flex::RuntimeContext::create(logical_device_id);
   init_from_env();
-  if (runtime) {
-    GlobalRuntime::set(runtime);
-    DEBUGINFO(s);
-    DEBUGINFO("runtime started with logical_device_id ", logical_device_id);
-  } else {
-    DEBUGINFO("runtime FAILED TO START.");
-    throw std::runtime_error("Failed to initialize Spyre runtime. ");
-  }
+  GlobalRuntime::set(runtime);
+  DEBUGINFO("runtime started with logical_device_id ", logical_device_id);
 }
 void startRuntime() {
   static std::once_flag flag;

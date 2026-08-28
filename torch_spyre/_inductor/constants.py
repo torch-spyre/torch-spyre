@@ -20,6 +20,7 @@ IDENTITY_OP = "identity"
 RESTICKIFY_OP = "ReStickifyOpHBM"
 DEPTHWISE_CONV2D_OP = "depthwiseconv2dnative"
 BATCH_MATMUL_FP8_OP = "batchmatmulfp8"
+KEEP_BY_INDEX_OP = "keepbyindex"
 MATMUL_REDUCTION_OPS = frozenset({BATCH_MATMUL_OP, BATCH_MATMUL_FP8_OP})
 
 # Reduction ops that cannot reduce along the stick dimension.
@@ -189,6 +190,8 @@ SPYRE_FP8_OPS = {
 }
 
 TOPK_OPS = {"topkvalue", "topkindex"}
+_MAX_K_PER_CORE = 4
+TOPK_MAX_K_PER_CORE = _MAX_K_PER_CORE
 
 LAYOUT_LABELS = ["OUTPUT", "KERNEL", "INPUT", "KERNEL_IDX"]
 MATMUL_LAYOUT_LABELS = ["INPUT", "KERNEL", "OUTPUT", "KERNEL_IDX"]
@@ -212,7 +215,7 @@ CONV_OPS = {CONV2D_FWD_OP, DEPTHWISE_CONV2D_OP}
 # matmul (activation @ weight) and conv2d (activation * weight, reduced over
 # in/ki/kj) both build [input, weight, output] tensor args.
 TWO_INPUT_REDUCTION_OPS = frozenset(
-    {BATCH_MATMUL_OP, BATCH_MATMUL_FP8_OP, CONV2D_FWD_OP}
+    {BATCH_MATMUL_OP, BATCH_MATMUL_FP8_OP, CONV2D_FWD_OP, KEEP_BY_INDEX_OP}
 )
 
 # Depthwise conv is a two-input reduction like TWO_INPUT_REDUCTION_OPS but is

@@ -58,6 +58,7 @@ from .pass_utils import (
     finite_upper_or_none,
     apply_splits_from_index_coeff,
     iteration_space,
+    select_work_division_transport_indexes,
     indirect_access_subs_from_kernel,
     is_restickify_coords,
 )
@@ -285,6 +286,10 @@ class SpyreOpFuncs:
     @staticmethod
     def gt(a, b):
         return PointwiseOp("greaterthan", [a, b])
+
+    @staticmethod
+    def keep_by_index(x, indices):
+        return ReductionOp("keepbyindex", [x, indices])
 
     @staticmethod
     def layernormnorm(*args):
@@ -863,22 +868,11 @@ class SpyreKernel(Kernel[CSEVariable]):
         ir_node = self.current_node.node  # ComputedBuffer
         work_division: dict[sympy.Symbol, int] = {}
         if hasattr(ir_node, "op_it_space_splits"):
-            write_index = next(iter(self.current_node.read_writes.writes)).index
-            # Match the encoding in work_division.apply_splits: an indirect
-            # (gather) read carries data-dependent symbols whose coefficients are
-            # not a stable identity key, so prefer the first non-indirect read as
-            # the reduction-split reference index.
-            reads = self.current_node.read_writes.reads
-            read_dep = next(
-                (d for d in reads if isinstance(d, MemoryDep) and not d.is_indirect()),
-                next(iter(reads), None),
+            write_index, read_index = select_work_division_transport_indexes(
+                ir_node, self.current_node.read_writes, it_space
             )
-            read_index = read_dep.index if read_dep is not None else write_index
             work_division = apply_splits_from_index_coeff(
-                ir_node.op_it_space_splits,
-                write_index,
-                read_index,
-                it_space,
+                ir_node.op_it_space_splits, write_index, read_index, it_space
             )
 
         it_space_extended = {
@@ -964,23 +958,6 @@ class SpyreKernel(Kernel[CSEVariable]):
                 exc_info=True,
             )
             debug_handle = None
-
-        if not is_reduction and op != "ReStickifyOpHBM" and not indirect_var_names:
-            stick_vars = {
-                next(iter(arg.device_coordinates[-1].free_symbols))
-                for arg in args
-                if arg.device_coordinates and arg.device_coordinates[-1].free_symbols
-            }
-            assert len(stick_vars) <= 1, (
-                f"create_op_spec: stick mismatch for op={op!r} "
-                f"ir_chain={getattr(debug_handle, 'ir_chain', '?')}: "
-                f"args have different stick loop variables: "
-                + ", ".join(
-                    str(arg.device_coordinates[-1])
-                    for arg in args
-                    if arg.device_coordinates
-                )
-            )
 
         # Carry the node's full logical output ranges (NCHW, incl. unit dims)
         # so codegen can derive surviving dim roles and the channel count from

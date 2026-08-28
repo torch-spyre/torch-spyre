@@ -206,9 +206,9 @@ toward the limit). Previously committed splits are
 carried forward as lower bounds and narrow the search for subsequent
 tensors.
 
-The resulting minimum splits are written to `op.op_it_space_splits` via
-`apply_splits`. If no span violation exists, `op_it_space_splits` is
-left unset.
+The resulting minimum splits are committed as symbol-keyed
+`op.iteration_space_ownership` via `apply_splits`. If no span violation
+exists, no ownership is recorded.
 
 Splitting the outermost dim halves each core's footprint:
 
@@ -372,40 +372,56 @@ after Pass 2 has finished across all operations.
 
 For each remaining op, `work_distribution_pass` does three things:
 
-1. It recovers the splits committed by Pass 1 by reading
-   `op.op_it_space_splits` via `apply_splits_from_index_coeff`. The
-   coeff-keyed encoding is the same one codegen uses, so it remains
-   stable across compiler passes even as sympy symbols are renamed.
+1. It reads the symbol-keyed splits committed by Pass 1 from
+   `op.iteration_space_ownership.work_slices`. The ownership remains in
+   operation-symbol space through LX planning.
 2. It ranks the remaining dimensions (those not already committed by
    Pass 1) for additional core assignment via `prioritize_dimensions`:
    output dimensions first by decreasing stick-adjusted size, reduction
    dimensions last. At most one reduction dimension is eligible for
-   splitting, the one that maximises
-   `core_split(size, remaining_cores)` after output dimensions have
-   absorbed their share of cores. If Pass 1 already committed a
-   reduction split, no further reduction dimensions are eligible.
+   splitting, selecting largest reachable legal factor within remaining core
+   budget after output dimensions have absorbed their share of cores. If Pass 1
+   already committed a reduction split, no further reduction dimensions are
+   eligible.
 3. It distributes all `max_cores` across committed and priority
    dimensions with `multi_dim_iteration_space_split`. The function
    first applies the committed splits as minimum requirements, then
    greedily assigns the largest valid divisor of each remaining
    dimension to the leftover core budget.
 
-The final splits overwrite `op.op_it_space_splits`.
+The final splits overwrite `op.iteration_space_ownership`.
 
-:::{admonition} What gets written to `op.op_it_space_splits`
+### Hard split domains
+
+Operation constraints may provide `allowed_splits`, the exact legal factors for
+an iteration dimension. Domains are intersected when multiple constraints apply.
+A domain containing `1` permits leaving that dimension unsplit. A domain that
+excludes `1`, such as `{2, 4, 8}`, also establishes a mandatory baseline: the
+planner reserves its smallest factor (`2`) before greedy distribution, then may
+grow it to any larger legal factor (`4` or `8`) if core budget remains. Thus an
+explicit legal-factor domain can encode a minimum split without a separate
+constraint field. `{2}` instead pins the dimension to exactly `2`.
+
+Span reduction's `min_splits` are separate hardware-span floors. They are
+applied first, must themselves be members of any applicable `allowed_splits`
+domain, and remain in force for later planning, hints, and LX candidates. The
+floors are retained with the operation's work-division metadata when an IR pass
+reconstructs it. A later split may use any legal factor at least as large as the
+floor; it need not be a multiple of the original span factor.
+
+:::{admonition} What gets written to `iteration_space_ownership`
 :class: note
 
-The attribute is a `dict` keyed by the index coefficients of the
-buffer's read and write index expressions (computed by
-`splits_by_index_coeff` in
-[pass_utils.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/pass_utils.py)),
-with each coefficient mapping to its slice count. The coefficient
-encoding is internal. Downstream passes recover an iteration-variable
-view by calling
-`apply_splits_from_index_coeff(splits, write_index, read_index, it_space)`.
+The pre-scheduler carrier is a `TensorWorkDivision`: `work_slices` maps
+operation iteration symbols to slice counts, and `core_id_to_work_slice`
+records the selected symbol-keyed core assignment. LX planning consumes this
+ownership directly. Cost-model reporting also reads this ownership before the
+final Scheduler boundary. `finalize_work_division_for_scheduler()` then converts
+the splits to legacy coefficient-keyed `op_it_space_splits` transport so
+Scheduler/codegen can survive iteration-symbol renaming.
 
-For the worked example below, the user-facing view is
-`{M: 16, N: 1, K: 2}` and codegen sees the equivalent
+For the worked example below, the pre-scheduler ownership is
+`{M: 16, N: 1, K: 2}`. Scheduler/codegen receives the equivalent legacy
 coefficient-keyed encoding.
 :::
 
@@ -422,15 +438,34 @@ compiler raises an error.
 
 TopK reductions use constraint-based work division:
 
-1. **k is split, capped at 4 rows per core.** The hardware can only produce
-   up to 4 top-k rows per core, so the smallest divisor `d` of `k` with
-   `k / d <= 4` is chosen. If no valid divisor exists within max_cores, the
-   compiler raises `Unsupported`.
+1. **k is split, capped at 4 rows per core.** The legal splits are divisors
+   `d` of `k` with `k / d <= 4`. The planner uses the smallest legal divisor:
+   larger factors are not supported because they can produce incorrect output
+   mapping for 4D TopK results. If no valid divisor exists within max_cores, the compiler
+   raises `Unsupported`.
 2. **The search-space dimension is never split.** The dimension being
    searched (the `dim` argument to `torch.topk`) must stay whole on one core.
 
 Other output/batch dimensions are distributed across the remaining core budget
 under the constraint that total cores used is `k_cores * product(other_dims) <= max_cores`.
+
+## Keep-by-index work division
+
+`keep_by_index` applies an index-selected mask while preserving the values
+shape. Its index tensor adds a K axis that is absent from the output. One output
+coordinate absent from the semantic indices operand is selected as the full
+search axis; other absent coordinates can be broadcast batch/output axes.
+
+1. **Index-only K uses the minimum supported split.** Its legal factor is the
+   smallest divisor `d` of K that satisfies `K / d <= 4` and `d <= SENCORES`.
+   The hardware supports at most four selected indices per core.
+2. **The selected search axis remains whole.** Every core must search the full
+   masked values dimension, so its legal split is `1`.
+3. **Other output and batch axes remain eligible.** The default planner uses
+   them with the remaining core budget.
+
+The Scheduler transport uses the indices read as the reduction-split reference
+for this operation because it carries K; the values read does not.
 
 ## Worked example: large matmul on 32 cores
 
@@ -443,7 +478,7 @@ dim `K`.
 
 | Tensor | Unsplit per-core span | Violating dim | Pass 1 commit | After Pass 3 | Cores reading it |
 |---|---|---|---|---|---|
-| A `[8192, 32768]` fp16 | 512 MB | K (outermost) | K split = 2 | M = 16, K = 2 | each core reads (512 rows) × (16384 K) = 16 MB |
+| A `[8192, 32768]` fp16 | 512 MB | K (outermost) | K minimum = 2 | M = 16, K = 2 | each core reads (512 rows) × (16384 K) = 16 MB |
 | W `[32768, 4096]` fp16 | 255.996 MiB | none (at limit) | — | M = 16, K = 2 | each core reads (16384 K) × (4096 N) = 128 MB |
 | O `[8192, 4096]` fp16 | 64 MB | none | — | M = 16, K = 2 | each core writes (512 rows) × 4096 = 4 MB |
 
@@ -453,9 +488,10 @@ and Pass 3 distributes the remaining cores. Without the Pass-1 commit,
 the planner would enumerate divisors of `(B, M, N, K)` and price each
 feasible combination with the cost equation.
 
-Pass 3 inherits the 2-way K split from Pass 1. With 16 cores remaining
-per K-slice, it ranks output dims by size (`M = 8192`, `N = 4096`) and
-assigns all 16 cores to `M`. Final split: `{M: 16, N: 1, K: 2}`.
+Pass 3 retains Pass 1's K=2 lower bound. A later split may use any legal
+factor at or above that floor. With 16 cores remaining per K-slice, it ranks
+output dims by size (`M = 8192`, `N = 4096`) and assigns all 16 cores to `M`.
+Final split: `{M: 16, N: 1, K: 2}`.
 
 | Dim | Size | Split | Per-core |
 |---|---|---|---|

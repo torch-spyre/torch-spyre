@@ -199,6 +199,72 @@ def _dma_to_spyre_indirect_access(
     return dst
 
 
+def dma_moe_expert_weight_to_spyre(
+    weight: torch.Tensor,
+    target_dtype: torch.dtype | None = None,
+) -> torch.Tensor | None:
+    """Transfer ``[E, C, F]`` weights in a gather- and matmul-friendly layout.
+
+    The device layout is ``[E, C, F // eps, eps]``. Returns ``None`` when
+    ``F`` does not span complete sticks.
+    """
+    assert weight.ndim == 3, "MoE expert-weight path is for rank-3 [E,C,F] only"
+
+    if not weight.is_contiguous():
+        weight = weight.contiguous()
+    dev_dtype = target_dtype if target_dtype is not None else weight.dtype
+
+    experts, contract, free = weight.shape
+    eps = SpyreTensorLayout(list(weight.shape), dev_dtype).elems_per_stick()
+    if free % eps != 0:
+        warnings.warn(
+            f"MoE expert-weight free dim {free} is not a multiple of the Spyre "
+            f"stick size {eps} for dtype {dev_dtype}; falling back to the "
+            "default layout (no shared-layout optimization) for this weight.",
+            stacklevel=2,
+        )
+        return None
+
+    layout = SpyreTensorLayout(
+        [experts, contract, free // eps, eps],
+        [contract * free, free, eps, 1],
+        get_device_dtype(dev_dtype),
+    )
+    dst = spyre_empty_with_layout(weight.size(), weight.stride(), dev_dtype, layout)
+    copy_tensor(weight, dst, non_blocking=False)
+    return dst
+
+
+def dma_moe_per_expert_scale_to_spyre(
+    scale: torch.Tensor,
+    target_dtype: torch.dtype | None = None,
+) -> torch.Tensor | None:
+    """Transfer ``[E]`` scales as a gather-ready ``[E, eps]`` tensor.
+
+    Each scale fills one stick. Widening on the host avoids an unsupported
+    in-graph rank expansion.
+    """
+    assert scale.ndim == 1, "per-expert-scale path is for 1D [E] tensors only"
+
+    if not scale.is_contiguous():
+        scale = scale.contiguous()
+    dev_dtype = target_dtype if target_dtype is not None else scale.dtype
+
+    experts = scale.shape[0]
+    eps = SpyreTensorLayout([experts, 1], dev_dtype).elems_per_stick()
+
+    widened = scale[:, None].expand(-1, eps).contiguous()
+
+    layout = SpyreTensorLayout(
+        [experts, 1, eps],
+        [eps, eps, 1],
+        get_device_dtype(dev_dtype),
+    )
+    dst = spyre_empty_with_layout(widened.size(), widened.stride(), dev_dtype, layout)
+    copy_tensor(widened, dst, non_blocking=False)
+    return dst
+
+
 # --- Model loading ---------------------------------------------------
 
 

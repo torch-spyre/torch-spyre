@@ -69,6 +69,7 @@ from .insert_restickify import (
     finalize_layouts,
     insert_post_mutation_restickify,
     insert_restickify,
+    validate_no_restickify_on_mutation_targets,
 )
 from .enforce_indirect_access_layout import enforce_indirect_access_layout
 from .hbm_pool_planning import hbm_pool_planning
@@ -77,7 +78,7 @@ from .work_division import (
     work_distribution,
     cost_model_matmul_division,
 )
-from .pass_utils import format_operations
+from .pass_utils import format_operations, finalize_work_division_for_scheduler
 from .scratchpad.allocator import (
     scratchpad_planning,
 )
@@ -465,6 +466,7 @@ class CustomPreSchedulingPasses:
             optimize_restickify_locations,
             finalize_layouts,
             insert_restickify,
+            validate_no_restickify_on_mutation_targets,
             enforce_indirect_access_layout,
             insert_post_mutation_restickify,
             insert_restickify_padding,
@@ -533,6 +535,9 @@ class CustomPreSchedulingPasses:
         # of lines on a real graph. Printing the evidence first buries the answer.
         cost_model_pass(graph)
         dump_cost_model(graph.operations)
+        # Keep rich symbol-keyed ownership through every pre-Scheduler reader;
+        # legacy coefficient transport exists only for Scheduler/codegen.
+        finalize_work_division_for_scheduler(graph)
 
     def uuid(self) -> Any | None:
         return _uuid(self.passes)

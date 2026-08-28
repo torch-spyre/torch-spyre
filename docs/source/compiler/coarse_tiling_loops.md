@@ -414,10 +414,12 @@ Key points:
   the full tensor shape — because `MutationLayoutSHOULDREMOVE` always
   describes the mutation *target*'s shape, not the per-tile source.
 - `op_it_space_splits={d0: 4, d1: 1}` is `format_operations`'s
-  human-readable reconstruction (via `apply_splits_from_index_coeff`) of the
-  `(dict, dict)` coefficient-keyed pair `work_distribution`
-  (`_distribute_work`) actually stamps: `d0` (the outer, row-tiled loop
-  symbol) is split 4 ways across `sencores`, and `d1` (the inner,
+  human-readable Scheduler-stage reconstruction (via
+  `apply_splits_from_index_coeff`) of the legacy `(dict, dict)`
+  coefficient-keyed transport. Before the Scheduler boundary,
+  `work_distribution` commits the same split as symbol-keyed ownership:
+  `d0` (the outer, row-tiled loop symbol) is split 4 ways across `sencores`,
+  and `d1` (the inner,
   column-tiled loop symbol) is not split (`1`) — every op in this example,
   including the copy, divides its per-tile work the same way. The
   internal storage is keyed by each symbol's coefficient in the relevant
@@ -1168,13 +1170,13 @@ memory layout for each tensor.  The span-overflow half of coarse tiling
 must see the post-stickify, post-padding shapes or it will split on the
 wrong dimension or produce a non-stick-aligned inner size.
 
-**Must run before `work_distribution`.**  `work_distribution` stamps
-`op_it_space_splits` on each `ir.Operation` to assign per-core work
-slices.  It must see the already-reduced (inner) iteration space so that
-cores divide the per-iteration work, not the full pre-tiling iteration
-space.  Running coarse tiling after `work_distribution` would produce
-`op_it_space_splits` values sized for the full range, which would then
-be wrong relative to the reduced `ranges` written by the tiling pass.
+**Must run before `work_distribution`.**  `work_distribution` commits
+symbol-keyed `iteration_space_ownership` on each `ir.Operation` to assign
+per-core work slices. It must see the already-reduced (inner) iteration
+space so that cores divide the per-iteration work, not the full pre-tiling
+iteration space. Running coarse tiling after `work_distribution` would
+produce ownership sized for the full range, which would then be wrong
+relative to the reduced `ranges` written by the tiling pass.
 `span_reduction` and `cost_model_matmul_division` have the same requirement
 and already run before `work_distribution`, so placing `coarse_tile` with
 them is consistent.

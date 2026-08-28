@@ -1123,6 +1123,49 @@ def lower_clamp(x, min=None, max=None):
     return pw
 
 
+@register_spyre_lowering(torch.ops.spyre.keep_by_index)
+def lower_keep_by_index(values, indices, dim, fill_value):
+    from .pass_utils import concretize_expr
+
+    x_size = values.get_size()
+    ndim = len(x_size)
+
+    # Concretize dim if symbolic
+    if isinstance(dim, sympy.Basic):
+        norm_dim = int(concretize_expr(dim)) % ndim
+    else:
+        norm_dim = dim % ndim
+
+    indices_size = indices.get_size()
+    values_loader = values.make_loader()
+    indices_loader = indices.make_loader()
+
+    ranges = list(x_size)
+    reduction_ranges = [indices_size[norm_dim]]
+
+    def inner_fn(index, rindex):
+        values_index = list(index)
+        # indices has K at norm_dim position
+        indices_index = list(index)
+        indices_index[norm_dim] = rindex[0]
+        return (values_loader(values_index), indices_loader(indices_index))
+
+    op_info = {"constants": {"maskval": fill_value}}
+    result = SpyreReduction.create(
+        reduction_type="keepbyindex",
+        input_node=[values, indices],
+        device=values.get_device(),
+        dst_dtype=values.get_dtype(),
+        src_dtype=values.get_dtype(),
+        inner_fn=inner_fn,
+        ranges=ranges,
+        reduction_ranges=reduction_ranges,
+        op_info=op_info,
+    )
+    result.realize()
+    return result
+
+
 @register_spyre_lowering(torch.ops.aten.clone.default, type_promotion_kind=None)
 def clone(x, *, memory_format=None):
     result = lowering.clone(x, memory_format=memory_format)
@@ -1387,7 +1430,7 @@ def lower_full(size, fill_value, dtype=None, layout=None, device=None, pin_memor
     assert not pin_memory, f"doesn't support pin_memory={pin_memory}"
     if dtype is None:
         dtype = torch.get_default_dtype()
-    if dtype not in (torch.float16, torch.float32):
+    if dtype not in (torch.float16, torch.bfloat16, torch.float32):
         return ir.TensorBox.create(
             ir.FallbackKernel.create(
                 torch.ops.aten.full.default,

@@ -147,6 +147,7 @@ class ExhaustiveSearchSolver(CoreDivisionLayoutSolver):
                     first_use_is_read=b.first_use_is_read,
                     in_place_parents=_valid_inplace_parents(b, chosen[b.name]),
                     residency_reason=_residency_reason(b, chosen[b.name]),
+                    lifetime_end_override=b.lifetime_end_override,
                 )
                 for b in buffers_list
             ]

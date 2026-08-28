@@ -43,6 +43,7 @@ from torch_spyre._inductor.constants import (
     POOL_OPS,
     RESTICKIFY_OP,
     TOPK_OPS,
+    KEEP_BY_INDEX_OP,
 )
 from torch_spyre._inductor.core_mapping import core_to_slice_mapping
 from torch_spyre._inductor.dtype_ops import DtypeOpTable
@@ -454,6 +455,10 @@ def _is_conv(op: str) -> bool:
 
 def _is_depthwise_conv(op: str) -> bool:
     return op == DEPTHWISE_CONV2D_OP
+
+
+def _is_keep_by_index(op: str) -> bool:
+    return op == KEEP_BY_INDEX_OP
 
 
 # Canonical avgpool iteration-space order (NHWC) -> SDSC labels.  Codegen owns
@@ -1202,7 +1207,12 @@ def _create_sdsc_tensors(
         reduced_dims: list = []
 
         # Step 2: Handle reduced dimensions — skip for index tensors.
-        if use_op_dims and dim_order != dims and not _is_topk(op_spec.op):
+        if (
+            use_op_dims
+            and dim_order != dims
+            and not _is_topk(op_spec.op)
+            and not _is_keep_by_index(op_spec.op)
+        ):
             if not (has_indirect_access and i in index_tensor_indices):
                 reduced_dims = [
                     d for d in op_dim_order if d not in dim_order and d is not mb_sym
@@ -1465,6 +1475,7 @@ def _get_op_func(op: str, is_reduction: bool, output_scales: dict) -> str:
         and not _is_topk(op)
         and not _is_conv(op)
         and -2 not in output_scales.values()
+        and not _is_keep_by_index(op)
     ):
         return op + "nonstick"
     return op
@@ -2089,6 +2100,9 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
 
     if _is_topk(op_spec.op):
         num_inputs = 1  # topk has exactly 1 input tensor and 1 output tensor
+
+    if _is_keep_by_index(op_spec.op):
+        num_inputs = 2  # keep_by_index has exactly 2 input tensors (values, indices)
 
     if is_pool:
         num_inputs = 1  # avgpool has exactly 1 input tensor and 1 output tensor

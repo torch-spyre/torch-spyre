@@ -620,13 +620,12 @@ class IndirectAccessTestCase(InductorTestCase):
         variants introduce.
         """
         from torch_spyre._inductor import config
-        from torch_spyre._inductor.work_division import core_split
 
         n = config.sencores
         if n == 1:
             self.skipTest("no work division at sencores=1")
         sticks = -(-index_size // self.INDEX_ELEMS_PER_STICK)  # ceil division
-        expected = core_split(sticks, n)
+        expected = max(divisor for divisor in range(1, n + 1) if sticks % divisor == 0)
         self.assertIn(
             f"sympify('c0'): (sympify('{index_size}'), {expected})",
             code,
@@ -653,13 +652,12 @@ class IndirectAccessTestCase(InductorTestCase):
         is a no-op when the count could not split anyway (would-be split of 1).
         """
         from torch_spyre._inductor import config
-        from torch_spyre._inductor.work_division import core_split
 
         n = config.sencores
         if n == 1:
             self.skipTest("no work division at sencores=1")
         sticks = -(-index_size // self.INDEX_ELEMS_PER_STICK)  # ceil division
-        would_be = core_split(sticks, n)
+        would_be = max(divisor for divisor in range(1, n + 1) if sticks % divisor == 0)
         if would_be <= 1:
             return  # nothing could split even if allowed; nothing to assert
         self.assertNotIn(

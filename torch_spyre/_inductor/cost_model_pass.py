@@ -409,8 +409,8 @@ def build_report(operations: list, params: CostParams | None = None) -> CostRepo
 def cost_model_pass(graph) -> CostReport | None:
     """Predict this graph's runtime; ``None`` when the model is disabled.
 
-    Read-only: the graph is never mutated. Called after the pre-scheduling pipeline,
-    where the loop-level IR is final.
+    Read-only: the graph is never mutated. Called after LX planning and before
+    Scheduler-boundary work-division conversion, where the loop-level IR is final.
 
     Returns the report so a caller can use it -- ``CustomPreSchedulingPasses`` exposes
     it as ``last_cost_report`` for exactly that reason.

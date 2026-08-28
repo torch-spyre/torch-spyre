@@ -33,8 +33,8 @@ both ways compiles it twice (see :func:`dedup_key`).
 Options:
     --out DIR         where to write the scripts (default: ./captured)
     --kernel NAME     only emit kernels whose name contains NAME
-    --save-inputs     also dump recorded input values (and pool bytes) to a .pt
-                      beside each script, for byte-exact replay
+    --save-inputs     also dump recorded input values to a .pt beside each
+                      script, for byte-exact replay
     --no-execute      capture without a device or dxp_standalone (see below)
     --no-explain-header
                       omit the decoded OpSpec explanation from each script
@@ -63,11 +63,7 @@ from torch._inductor.utils import IndentedBuffer
 import torch_spyre  # noqa: F401  -- registers the "spyre" device
 from torch_spyre._inductor import config as spyre_config
 from torch_spyre._inductor.op_spec import IndirectAccess, TensorArg
-from torch_spyre._inductor.spyre_kernel import (
-    _codegen_op_spec_list,
-    _iter_op_specs,
-    uses_hbm_pool,
-)
+from torch_spyre._inductor.spyre_kernel import _codegen_op_spec_list, _iter_op_specs
 from torch_spyre.execution.async_compile import SpyreAsyncCompile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -132,6 +128,10 @@ class KernelRecord:
     that has already exited.  ``sencores`` is provenance only -- work division is
     already baked into ``iteration_space``.  ``bundle_symbolic_args`` is not, and
     the emitted script pins it: see ``pin_bundle_symbolic_args`` in runner.py.
+
+    ``pool_size`` comes from the ``sdsc()`` keyword, not from anything observed at
+    ``.run()``: the bundle allocates its own pool via ``device_mem_allocate``, so
+    no pool tensor is passed at launch.
     """
 
     name: str
@@ -139,28 +139,19 @@ class KernelRecord:
     index: int
     sencores: int
     bundle_symbolic_args: bool
+    pool_size: int = 0
     args: list = dataclasses.field(default_factory=list)
-    pool_bytes: int = 0
     observed_run: bool = False
 
 
 def _record_args(rec: KernelRecord, args: tuple, save_inputs: bool) -> None:
     """Record shape/dtype/device-layout for each .run() argument.
 
-    The pool's *size* is recorded but never its contents, even under
-    ``save_inputs``: ``pool.cpu()`` on the flat SENINT8 pool tensor corrupts the
-    heap and aborts the process, which no try/except can catch.  Replays get an
-    uninitialized pool, as production does for a graph's first kernel.
-
-    So the pool must be identified by the same predicate ``call_kernel`` used to
-    prepend it -- ``uses_hbm_pool``, shared rather than reimplemented, because a
-    copy that drifted would mean calling ``.cpu()`` on the pool.
+    Every argument is a kernel arg: since #3707 the HBM pool is allocated inside
+    the bundle rather than passed in, so there is nothing to skip here and
+    ``arg_index`` is the ``.run()`` position for every spec.
     """
-    remaining = list(args)
-    if uses_hbm_pool(rec.specs) and remaining:
-        pool = remaining.pop(0)
-        rec.pool_bytes = int(pool.numel())
-    for tensor in remaining:
+    for tensor in args:
         layout = tensor.device_tensor_layout()
         rec.args.append(
             ArgRecord(
@@ -209,16 +200,18 @@ def capture_kernels(save_inputs: bool = False, no_execute: bool = False):
     records: list = []
     real_sdsc = SpyreAsyncCompile.sdsc
 
-    def spy(self, kernel_name, specs):
+    def spy(self, kernel_name, specs, pool_size=0):
         rec = KernelRecord(
             name=kernel_name,
             specs=list(specs),
             index=len(records),
             sencores=spyre_config.sencores,
             bundle_symbolic_args=spyre_config.bundle_symbolic_args,
+            pool_size=pool_size,
         )
         records.append(rec)
-        return _RunRecorder(real_sdsc(self, kernel_name, specs), rec, save_inputs)
+        runner = real_sdsc(self, kernel_name, specs, pool_size=pool_size)
+        return _RunRecorder(runner, rec, save_inputs)
 
     with contextlib.ExitStack() as stack:
         stack.enter_context(inductor_config.patch({"force_disable_caches": True}))
@@ -317,11 +310,8 @@ def _provenance(rec: KernelRecord, source: str, total: int, no_execute: bool) ->
         f"Kernel args:     {n_spec_args} in the spec, "
         f"{len(rec.args)} observed at .run()",
     ]
-    if rec.pool_bytes:
-        lines.append(
-            f"Pool:            {rec.pool_bytes} bytes, passed to .run() "
-            "ahead of the args"
-        )
+    if rec.pool_size:
+        lines.append(f"Pool:            {rec.pool_size} bytes, allocated by the bundle")
     lines += [
         "",
         "Run it:",
@@ -359,7 +349,7 @@ def _explain_header(rec: KernelRecord) -> str:
             rec.specs,
             kernel_name=rec.name,
             args=rec.args or None,
-            pool_bytes=rec.pool_bytes,
+            pool_size=rec.pool_size,
         )
     except Exception as exc:
         block = f"# (explain header unavailable: {type(exc).__name__}: {exc})"
@@ -402,7 +392,7 @@ from torch_spyre._inductor.op_spec import (
 )
 
 KERNEL_NAME = "{rec.name}"
-POOL_BYTES = {rec.pool_bytes}
+POOL_SIZE = {rec.pool_size}
 BUNDLE_SYMBOLIC_ARGS = {rec.bundle_symbolic_args}
 # Named after this file, not the kernel: two graphs can share a fused kernel
 # name, and write_kernel disambiguates the scripts (name_1.py) -- so a
@@ -422,7 +412,7 @@ LAYOUTS = [
 ops = {spec_source(rec.specs)}
 
 def build_tensors():
-    """Return (host tensors, pool bytes or None) for this kernel's args.
+    """Return the host tensors for this kernel's args, in arg_index order.
 
     Replays a .inputs.pt sitting beside this script, otherwise synthesizes.
     Integer args get zeros, not random values: they are usually indirect-access
@@ -431,7 +421,7 @@ def build_tensors():
     if os.path.exists(INPUTS_PT):
         saved = torch.load(INPUTS_PT)
         print(f"inputs: replayed from {{INPUTS_PT}}")
-        return saved["tensors"], saved["pool"]
+        return saved["tensors"]
     torch.manual_seed(0xAFFE)
     tensors = []
     for shape, dtype in SHAPES:
@@ -443,21 +433,19 @@ def build_tensors():
             tensors.append(torch.rand(shape, dtype=src).to(dtype))
         else:
             tensors.append(torch.zeros(shape, dtype=dtype))
-    return tensors, None
+    return tensors
 
 
 {runner_template()}
 
 
 if __name__ == "__main__":
-    host_tensors, pool_contents = build_tensors()
     main(
         KERNEL_NAME,
         ops,
-        host_tensors,
+        build_tensors(),
         layouts=LAYOUTS,
-        pool_bytes=POOL_BYTES,
-        pool_contents=pool_contents,
+        pool_size=POOL_SIZE,
         bundle_symbolic_args=BUNDLE_SYMBOLIC_ARGS,
     )
 '''
@@ -477,10 +465,8 @@ def write_kernel(
         f.write(emit_script(rec, source, total, no_execute, explain_header))
     if save_inputs and rec.observed_run:
         # Keyed on the script path, so a disambiguated script gets its own .pt.
-        # "pool" is always None -- see _record_args -- but stays in the dict so
-        # the schema does not depend on whether the kernel used one.
         torch.save(
-            {"tensors": [a.values for a in rec.args], "pool": None},
+            {"tensors": [a.values for a in rec.args]},
             os.path.splitext(path)[0] + ".inputs.pt",
         )
     return path
@@ -585,12 +571,10 @@ def main(argv=None) -> int:
         written += 1
         n_ops = sum(1 for _ in _iter_op_specs(rec.specs))
         detail = f"{n_ops} OpSpec(s), {len(rec.args)} arg(s)"
-        if rec.pool_bytes:
-            detail += f", {rec.pool_bytes}-byte pool"
+        if rec.pool_size:
+            detail += f", {rec.pool_size}-byte pool"
         note = "" if rec.observed_run else "  [no .run() seen -- shapes unfilled]"
         print(f"  {path}  ({detail}){note}")
-        if args.save_inputs and rec.pool_bytes:
-            print("    note: arg values saved; pool contents are not captured")
 
     if written == 0:
         raise SystemExit("nothing written")
