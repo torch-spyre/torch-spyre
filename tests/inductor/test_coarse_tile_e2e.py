@@ -2909,9 +2909,11 @@ def test_flash_tile_Lk():
 
 
 @pytest.mark.skip(
-    reason="copy_forced/mutation_write_back drop is fixed (issue #4126) -- no"
-    " more inf, but a distinct B+H tiling correctness bug remains (70%"
-    " mismatch, finite values); B tiling itself compiles and runs correctly"
+    reason="numerically incorrect results when both B and H are tiled -- root"
+    " cause not yet diagnosed; not issue #4126 (v1 uses plain Python"
+    " rebinding for M/denominator/output, no copy_forced, so there is no"
+    " auto_functionalized_v2 node for AOTAutograd to drop); B tiling alone"
+    " compiles and runs correctly"
 )
 def test_flash_tile_B_H():
     """Flash v1: tile B÷2 H÷4. B=2."""
