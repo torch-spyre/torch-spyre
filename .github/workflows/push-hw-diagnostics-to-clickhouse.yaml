@@ -112,30 +112,55 @@ jobs:
         run: |
           mkdir -p raw_logs
 
-          gh api \
-            "/repos/${{ github.repository }}/actions/runs/${TRIGGERING_RUN_ID}/jobs" \
-            --paginate \
-            --jq '.jobs[] | {id: .id, name: .name}' \
-          > /tmp/jobs.jsonl
-
           python3 - << 'PYEOF'
-          import json, os, re, subprocess
+          import json, os, subprocess, time
+          import regex as re
 
           repo = os.environ["GITHUB_REPOSITORY"]
-          jobs = [json.loads(l) for l in open("/tmp/jobs.jsonl") if l.strip()]
+          run_id = os.environ["TRIGGERING_RUN_ID"]
+
+          def gh_api(path, paginate=False, jq=None):
+              """Call `gh api` with retry/backoff.
+
+              GitHub's Actions API returns transient 5xx (seen: HTTP 502) often
+              enough to fail this job ~25% of the time. Retry so a flaky call
+              does not drop the whole diagnostics ingest.
+              """
+              cmd = ["gh", "api", path]
+              if paginate:
+                  cmd.append("--paginate")
+              if jq:
+                  cmd += ["--jq", jq]
+              last = None
+              for attempt in range(1, 6):
+                  r = subprocess.run(cmd, capture_output=True, env={**os.environ})
+                  if r.returncode == 0:
+                      return r.stdout
+                  last = (r.stderr or b"").decode(errors="replace").strip()
+                  print(f"  retry {attempt}/5 for {path}: {last}")
+                  time.sleep(2 * attempt)
+              raise RuntimeError(f"gh api failed after 5 attempts for {path}: {last}")
+
+          jobs_raw = gh_api(
+              f"/repos/{repo}/actions/runs/{run_id}/jobs",
+              paginate=True,
+              jq=".jobs[] | {id: .id, name: .name}",
+          ).decode()
+          jobs = [json.loads(l) for l in jobs_raw.splitlines() if l.strip()]
 
           for idx, j in enumerate(jobs):
-              safe   = re.sub(r"[^\w\s\-]", "", j["name"]).strip()
-              out    = f"raw_logs/{idx}_{safe}.txt"
-              result = subprocess.run(
-                  ["gh", "api", f"/repos/{repo}/actions/jobs/{j['id']}/logs"],
-                  capture_output=True, env={**os.environ},
-              )
-              if result.returncode == 0 and result.stdout:
-                  open(out, "wb").write(result.stdout)
+              safe = re.sub(r"[^\w\s\-]", "", j["name"]).strip()
+              out = f"raw_logs/{idx}_{safe}.txt"
+              try:
+                  data = gh_api(f"/repos/{repo}/actions/jobs/{j['id']}/logs")
+              except RuntimeError as exc:
+                  print(f"  SKIP  {j['name']} (no log: {exc})")
+                  continue
+              if data:
+                  open(out, "wb").write(data)
                   print(f"  OK  {out}")
               else:
-                  print(f"  SKIP  {j['name']} (no log)")
+                  print(f"  SKIP  {j['name']} (empty log)")
           PYEOF
 
       - name: Parse Logs
