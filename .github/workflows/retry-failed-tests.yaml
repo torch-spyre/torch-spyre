@@ -1,6 +1,6 @@
 name: retry-failed-tests
 
-# On failure of "tests"/"tests-nightly", reruns the failed jobs via `gh run rerun --failed` so ARC gives them a fresh pod/card (unlike run-test-suite's same-pod in-suite retry).
+# On failure of "tests"/"tests-nightly", reruns the failed jobs via `gh run rerun --failed` so ARC gives them a fresh pod/card (run-test-suite itself only retries a same-pod stall, once, with -n1).
 # Separate workflow_run workflow, like push-to-clickhouse.yaml (gh run rerun needs a completed run; workflow_run keeps base-repo perms for fork PRs); only picks up changes from the default branch.
 on:
   workflow_run:

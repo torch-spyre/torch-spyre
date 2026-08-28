@@ -427,24 +427,6 @@ def spyre__sdpa_overrideable(
         key = key.unsqueeze(2).expand(-1, -1, expansion, -1, -1).flatten(1, 2)
         value = value.unsqueeze(2).expand(-1, -1, expansion, -1, -1).flatten(1, 2)
 
-    # A decode query commonly arrives as a logical [B, H, 1, D] view of
-    # physical [B, 1, H, D] storage.  The score matmul can accept that view as
-    # stick-compatible even though it consumes a canonical heads-outer layout,
-    # so whether the query is read correctly can depend on an unrelated LX
-    # allocation decision.  Ordinary clones are removed by Inductor; copying
-    # into a fresh contiguous destination forces a real canonical buffer.
-    if max_seqlen_q == 1:
-        query_for_scores = torch.ops.spyre.opaque_copy_(
-            query,
-            torch.zeros(
-                (batch_size, num_heads, max_seqlen_q, head_dim),
-                device=query.device,
-                dtype=query.dtype,
-            ),
-        )
-    else:
-        query_for_scores = query
-
     kv_block_size = 64
     q_block_size = 64
 
@@ -499,7 +481,7 @@ def spyre__sdpa_overrideable(
                             -1, -2
                         )  # batch_size, num_heads, head_dim, max_seqlen_kv
                         scores = torch.matmul(
-                            query_for_scores * scaling_factor, keys_T
+                            query * scaling_factor, keys_T
                         )  # batch_size, num_heads, max_seqlen_q, max_seqlen_kv
 
                         if is_causal:

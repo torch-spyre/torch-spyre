@@ -14,22 +14,12 @@
 
 """Cost-model ``OpFeatures`` for a *candidate* core division.
 
-The extractor (:mod:`torch_spyre._inductor.dump_cost_model`) reads each
-op's **committed** ``op_it_space_splits``, so it yields features for the division
-the compiler already chose. A co-optimizer needs features for every division in a
-buffer's candidate menu, because the division is exactly what it is searching
-over.
-
-That turns out to need no re-derivation. ``CoreDivision`` stores
-``(output_splits, reduction_splits)`` -- the coeff-keyed ``ItSpaceSplits`` pair
-produced by :func:`pass_utils.splits_by_index_coeff` -- which is the same type,
-in the same encoding, that ``op_it_space_splits`` holds and that
-:func:`pass_utils.apply_splits_from_index_coeff` consumes. So a candidate is
-evaluated by temporarily installing its pair on the op and re-running the
-extractor: every division-dependent field (``cores``, ``reduction_cores``,
-``matmul_rows_per_core`` / ``_cols_per_core``, ``tile_rows_per_core``) is then
-recomputed by the extractor rather than by a second, drifting copy of its
-axis-decoding rules.
+A co-optimizer needs features for every division in a buffer's candidate menu,
+not just the committed division. ``CoreDivision`` stores sparse, symbol-keyed
+output and reduction splits, so this module restores its complete symbol-keyed
+map and passes it directly to :func:`dump_cost_model.extract_op_features`.
+No candidate is encoded into ``op_it_space_splits``: that legacy
+coefficient-keyed representation is reserved for the Scheduler boundary.
 
 Residency (``ArgTraffic.mem``) is deliberately *not* resolved here. It is the
 other half of what the co-optimizer searches over, it is a plain per-argument
@@ -46,14 +36,22 @@ from typing import TYPE_CHECKING, Optional
 
 from torch_spyre._inductor.cost_model import OpFeatures
 from torch_spyre._inductor.logging_utils import get_inductor_logger
+from torch_spyre._inductor.pass_utils import iteration_space_from_op
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from torch_spyre._inductor.scratchpad.plan_solver import CoreDivision
 
 logger = get_inductor_logger("scratchpad.op_features")
 
-# The attribute the extractor reads the division from.
-_SPLITS_ATTR = "op_it_space_splits"
+
+def _work_slices(op, division: "CoreDivision") -> dict:
+    """Restore a complete symbol-keyed split map from a sparse candidate."""
+    return {
+        symbol: int(
+            division.output_splits.get(symbol, division.reduction_splits.get(symbol, 1))
+        )
+        for symbol in iteration_space_from_op(op)
+    }
 
 
 def features_for_division(op, division: "CoreDivision") -> Optional[OpFeatures]:
@@ -63,29 +61,16 @@ def features_for_division(op, division: "CoreDivision") -> Optional[OpFeatures]:
     best-effort and swallows its own failures, so a ``None`` here means the op
     itself was rejected, not that the division was bad).
 
-    Temporarily swaps ``op_it_space_splits``. The swap is restored on every path
-    including failure, so a caller that iterates a menu leaves the op exactly as
-    it found it -- important because the same ``op`` objects stay live in the
-    graph after capture.
+    The candidate is passed as a complete symbol-keyed map, leaving the live
+    operation and its Scheduler-boundary transport untouched.
     """
     from torch_spyre._inductor.dump_cost_model import extract_op_features
 
-    had = hasattr(op, _SPLITS_ATTR)
-    saved = getattr(op, _SPLITS_ATTR, None)
     try:
-        setattr(op, _SPLITS_ATTR, (division.output_splits, division.reduction_splits))
-        return extract_op_features(op)
+        return extract_op_features(op, _work_slices(op, division))
     except Exception:  # noqa: BLE001 - featurization is best-effort by design
         logger.debug("could not featurize op for a candidate division", exc_info=True)
         return None
-    finally:
-        if had:
-            setattr(op, _SPLITS_ATTR, saved)
-        else:  # never had one: do not leave an attribute the op did not carry
-            try:
-                delattr(op, _SPLITS_ATTR)
-            except AttributeError:
-                pass
 
 
 def features_for_menu(op, divisions) -> list[Optional[OpFeatures]]:

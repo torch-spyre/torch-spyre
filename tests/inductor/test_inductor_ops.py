@@ -4931,24 +4931,40 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
             },
         },
-        # Non-stick dim offset whose base row length (100) isn't a multiple
-        # of elem_in_stick (64). Flat offset 100 decomposes to a device
-        # stick coordinate of Mod(i1,64)+36 -- genuinely not stick-aligned,
-        # since the device layout pads each row's tail to a partial stick
-        # rather than the row itself landing on a stick boundary. Needs
-        # padding-aware device-coordinate construction, which isn't
-        # implemented yet. Dedicated test (not folded into the ops_dict
-        # cross-product above) so the exact rejection reason can be
-        # pinned, matching test_storage_offset_placeholder_stick_dim_rejected
-        # below.
+        # Offset on a non-stick dim of a PADDED base -- row width 100 is not a
+        # multiple of elem_in_stick, so each row pads to two sticks and the flat
+        # offset 100 is a whole row. compute_coordinates now decomposes that
+        # positionally, keeping the stick coordinate offset-free; before the fix
+        # it leaked Mod(i1,64)+36 and the placeholder was rejected outright.
+        #
+        # Deliberately narrower than the group above -- compiled only, and only
+        # layout-preserving ops -- because two unrelated defects still bound
+        # this shape on current main. Neither is caused by the offset:
+        #   - eager: every eager op on an offset view is cloned via
+        #     spyre::copy_from_d2d, which rejects on the flat-offset heuristic
+        #     `offset % elems_per_stick != 0` (100 % 64 = 36). Same
+        #     padding-blind assumption this fix removes, in another location.
+        #   - exp (and other ops that re-select the output layout): miscomputes
+        #     or fails to compile on any padded-row fp16 tensor, including
+        #     UNSLICED ones with no offset at all. Measured: (3,100) unsliced
+        #     fails identically to (4,100)[1:, :], in both core counts.
+        # x + x stays correct because it reuses the input layout verbatim.
         (
-            "test_storage_offset_placeholder_nonstick_row",
-            "test_storage_offset_placeholder_nonstick_row_rejected",
+            "test_storage_offset_placeholder_padded_row",
+            "test_storage_offset_placeholder_compiled_only",
         ): {
+            "ops_dict": {"add": lambda x: x + x},
             "param_sets": {
                 "2d_offset_dim0_nonstick_multiple": (
                     lambda t: t[1:, :],
                     cached_randn((4, 100), differentiation="ph_2d_offset0_nonstick"),
+                ),
+                # Same padded row, but dim0 IS a multiple of elem_in_stick, so
+                # the leaked residual would have looked resolvable by a stick
+                # move rather than rejected outright.
+                "2d_offset_dim0_nonstick_multiple_alt_dim": (
+                    lambda t: t[1:, :],
+                    cached_randn((64, 100), differentiation="ph_2d_offset0_nsalt"),
                 ),
             },
         },
@@ -5649,6 +5665,20 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 f"{(result.float() - expected).abs().max().item()}"
             )
 
+    def test_storage_offset_placeholder_compiled_only(self, op, slicer, base):
+        # Same as test_storage_offset_placeholder, minus the eager arm: eager
+        # materializes an offset view through spyre::copy_from_d2d, which
+        # rejects any storage_offset that is not a whole number of sticks --
+        # unrelated to whether the offset itself decomposes correctly.
+        cpu_view = slicer(base.clone())
+        expected = op(cpu_view).float()
+
+        dev_view = slicer(base.clone().to("spyre"))
+        result = _compile_and_run(op, [dev_view], "spyre", compile=True)
+        assert torch.allclose(result.float(), expected, atol=0.1, rtol=0.1), (
+            f"max abs diff: {(result.float() - expected).abs().max().item()}"
+        )
+
     def test_storage_offset_placeholder_stick_dim_rejected(self, slicer, base):
         # Stick-dim placeholder offset: alt-layout retargeting not yet
         # implemented (#2750), so compile must raise rather than silently
@@ -5660,22 +5690,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         dev_view = slicer(base.clone().to("spyre"))
 
         with pytest.raises(Exception, match="Unsupported"):
-            _compile_and_run(fn, [dev_view], "spyre", compile=True)
-
-    def test_storage_offset_placeholder_nonstick_row_rejected(self, slicer, base):
-        # Non-stick dim offset whose base row length isn't a multiple of
-        # elem_in_stick: padding-aware device-coordinate construction not
-        # yet implemented, so compile must raise rather than silently
-        # miscompute. No eager arm: compile=False skips the Inductor pass
-        # entirely, so it can't exercise this check.
-        def fn(x):
-            return x + x
-
-        dev_view = slicer(base.clone().to("spyre"))
-
-        with pytest.raises(
-            Exception, match="non-stick-aligned device stick coordinate"
-        ):
             _compile_and_run(fn, [dev_view], "spyre", compile=True)
 
     def test_storage_offset_placeholder_vs_internal_equivalence(self):
@@ -6858,6 +6872,29 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
         self.compare_with_cpu(fn, needs_device=True, cpu_compile=False)
 
+    def test_full_bfloat16_cpu(self):
+        """Compiled BF16 ``full`` stays in native Spyre lowering."""
+
+        def fn():
+            return torch.full(
+                (4, 64), 1.5, dtype=torch.bfloat16, device=utils_inductor.DEVICE
+            )
+
+        with fresh_inductor_cache():
+            actual, source_codes = run_and_get_code(torch.compile(fn, dynamic=False))
+        self.assertEqual(actual.dtype, torch.bfloat16)
+        torch.testing.assert_close(
+            actual.cpu(), torch.full((4, 64), 1.5, dtype=torch.bfloat16)
+        )
+        generated = "\n".join(source_codes)
+        self.assertIn("async_compile.sdsc(", generated)
+        self.assertFalse(
+            any(
+                " = torch.ops.aten.full.default(" in line
+                for line in generated.splitlines()
+            )
+        )
+
     def test_dim_op_cpu(self, op, dim, *args):
         def fn(*args):
             return op(dim, *args)
@@ -7206,8 +7243,8 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         )
 
     @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
-    def test_sdpa_bf16_gqa_decode_query_is_canonicalized(self):
-        """Decode SDPA must canonicalize a physically heads-inner query."""
+    def test_sdpa_bf16_gqa_decode_heads_inner_query(self):
+        """Decode SDPA must correctly consume a physically heads-inner query."""
         num_heads, num_kv_heads, head_dim = 16, 1, 512
         generator = torch.Generator().manual_seed(1337)
         query = (
@@ -7261,26 +7298,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         assert list(heads_inner.device_size) == [1, 1, 8, num_heads, 64]
         query_spyre = query.to("spyre", device_layout=heads_inner)
 
-        bmm_x_sizes = []
-        spyre_kernel = sys.modules["torch_spyre._inductor.spyre_kernel"]
-        original_create_op_spec = spyre_kernel.SpyreKernel.create_op_spec
-
-        def capture_bmm_x(self, op, is_reduction, args, op_info, *a, **kw):
-            if op == "batchmatmul" and args:
-                bmm_x_sizes.append(list(args[0].device_size))
-            return original_create_op_spec(
-                self, op, is_reduction, args, op_info, *a, **kw
-            )
-
-        # OpSpec construction is skipped on a generated-code cache hit, so a
-        # fresh cache is part of the test fixture rather than relying on the
-        # state left by earlier tests in the same worker.
-        with (
-            fresh_inductor_cache(),
-            mock.patch.object(
-                spyre_kernel.SpyreKernel, "create_op_spec", capture_bmm_x
-            ),
-        ):
+        with fresh_inductor_cache():
             actual = torch.compile(fn, dynamic=False)(
                 query_spyre,
                 key.to("spyre"),
@@ -7297,10 +7315,79 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             f"max_abs={(actual.float() - expected.float()).abs().max().item():.8f}"
         )
 
-        query_elems = num_heads * head_dim
-        query_sizes = [ds for ds in bmm_x_sizes if math.prod(ds) == query_elems]
-        assert query_sizes, f"no score-matmul query found in {bmm_x_sizes}"
-        assert all(ds[0] == num_heads for ds in query_sizes), query_sizes
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+    def test_sdpa_bf16_gqa_decode_with_in_graph_rope_query(self):
+        """An LX-resident RoPE result must retain its ownership into SDPA."""
+        num_heads, num_kv_heads, head_dim = 16, 1, 512
+        generator = torch.Generator().manual_seed(1337)
+        query = (
+            torch.randn(
+                (1, num_heads, 1, head_dim),
+                dtype=torch.bfloat16,
+                generator=generator,
+            )
+            * 0.1
+        )
+        key = (
+            torch.randn(
+                (1, num_kv_heads, 128, head_dim),
+                dtype=torch.bfloat16,
+                generator=generator,
+            )
+            * 0.1
+        )
+        value = (
+            torch.randn(
+                (1, num_kv_heads, 128, head_dim),
+                dtype=torch.bfloat16,
+                generator=generator,
+            )
+            * 0.1
+        )
+        mask = torch.zeros((1, 1, 1, 128), dtype=torch.bfloat16)
+        freqs = torch.zeros((1, 1, 2, 2, head_dim // 2), dtype=torch.bfloat16)
+        freqs[:, :, 0, 0, :] = 1
+        freqs[:, :, 1, 1, :] = 1
+
+        def fn(query, key, value, mask, freqs):
+            batch, heads, length, dim = query.shape
+            query_pairs = query.transpose(1, 2).reshape(
+                batch, length, heads, 2, dim // 2
+            )
+            query = (
+                freqs[:, :, None, :, :, :]
+                .mul(query_pairs.unsqueeze(-3))
+                .sum(4, keepdim=True)
+                .flatten(3)
+                .transpose(1, 2)
+            )
+            return F.scaled_dot_product_attention(
+                query,
+                key,
+                value,
+                attn_mask=mask,
+                dropout_p=0.0,
+                scale=1.0,
+                enable_gqa=True,
+            )
+
+        expected = fn(query, key, value, mask, freqs)
+        with fresh_inductor_cache():
+            actual = torch.compile(fn, dynamic=False)(
+                query.to("spyre"),
+                key.to("spyre"),
+                value.to("spyre"),
+                mask.to("spyre"),
+                freqs.to("spyre"),
+            ).cpu()
+
+        cosine = F.cosine_similarity(
+            actual.float().flatten(), expected.float().flatten(), dim=0
+        ).item()
+        assert torch.isfinite(actual).all() and cosine >= 0.99, (
+            f"cosine={cosine:.8f} "
+            f"max_abs={(actual.float() - expected.float()).abs().max().item():.8f}"
+        )
 
     @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_implicit_loading(self):

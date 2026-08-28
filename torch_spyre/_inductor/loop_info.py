@@ -165,16 +165,28 @@ class ReadCopyEntry:
         get_operation_name() of the op supplying tiled_op.loop_info for
         the copy's own read/write-level-extent computation (the first
         consuming op, per the sizing-invariant in the design doc).
+    sizing_read_index:
+        Position of ``dep`` in the sizing op's original MemoryDep list.
+        Recorded before copy insertion rewrites any of those reads.
     consumer_op_names:
         Names of every op in the group that must have this dep's buffer
         name patched (via _NameSwapHandler) to load from copy_name instead.
+    predivision_unit_steps:
+        Per-loop-level ``(op_dim_index, host_stride, tile_extent)`` facts
+        captured before division squeezes a size-one tiled dimension away.
+        ``_plan_read_copies`` attaches the selected sizing read's facts here;
+        this entry is their authority during copy construction.
     """
 
     copy_name: str
     dep: "MemoryDep"
     insert_before_op_name: str
     sizing_op_name: str
+    sizing_read_index: int
     consumer_op_names: tuple[str, ...]
+    predivision_unit_steps: tuple[
+        tuple[tuple[int, sympy.Expr, sympy.Expr], ...], ...
+    ] = ()
 
 
 @dataclass(frozen=True)
@@ -303,13 +315,15 @@ class CoarseTileInfo:
 _SPYRE_METADATA_ATTRS = (
     "dim_hints",
     "work_div_loop_info",
+    "iteration_space_ownership",
+    "_work_division_span_min_splits",
     "loop_info",
     "_restickify_plan",
     "_input_layout_overrides",
     "_emit_set_layout",
     # Links a tiled reduction op to its accumulation buffer; set by
     # coarse_tile._propagate_tiled_reduction_op, read by finalize_layouts in
-    # insert_restickify.py to overwrite accum_full's generic layout.
+    # insert_restickify.py to promote accum_full to FixedTiledLayout when needed.
     "_tiled_reduction_accum_name",
 )
 
