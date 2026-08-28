@@ -24,6 +24,7 @@ co_optimizing_lx_planning: bool = (
     os.environ.get("CO_OPTIMIZING_LX_PLANNING", "0") == "1"
 )
 hbm_pool_planning: bool = _get_env_bool("HBM_POOL_PLANNING", True)
+frontend_pool_allocation: bool = _get_env_bool("FRONTEND_POOL_ALLOCATION", False)
 
 global_stick_optimizer: bool = os.environ.get("GLOBAL_STICK_OPTIMIZER", "1") == "1"
 
