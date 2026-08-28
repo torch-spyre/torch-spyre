@@ -167,6 +167,71 @@ class TestBuildingBlocks(unittest.TestCase):
         # Compare with cpu implementation
         compare_with_cpu(rms_norm, *args, cpu_compile=True)
 
+    def test_residual_rms_norm_fp32_upcast(self):
+        # Regression for the mixed-EA layout gate in
+        # _multi_arg_pointwise_layouts. A residual add feeding an fp32-upcast
+        # RMSNorm: the add is a computed buffer that gives the upcast -- and
+        # thus the reduction-broadcast operand (rsqrt) -- multiple layout
+        # candidates, one with its device stick on a non-broadcast axis. The old
+        # gate rejected the broadcast mul if ANY candidate was non-broadcast; it
+        # now prunes to the broadcast candidate (case 3.1). WITHOUT the residual
+        # add the operand got only the broadcast candidate and compiled, so the
+        # residual add is essential to the repro.
+        B, S, H = 1, 64, 1024
+        eps = 1e-6
+        hidden = torch.randn(B, S, H, dtype=torch.float16)
+        residual = torch.randn(B, S, H, dtype=torch.float16)
+        weight = torch.randn(H, dtype=torch.float16)
+
+        def residual_rms_norm(hidden, residual, weight):
+            x = (hidden + residual).to(torch.float32)
+            var = x.pow(2).mean(-1, keepdim=True)
+            normed = x * torch.rsqrt(var + eps)
+            return weight * normed.to(torch.float16)
+
+        # Spyre eager mishandles the fp32-upcast staggered layout (a separate,
+        # pre-existing issue), so validate the compiled path only.
+        compare_with_cpu(
+            residual_rms_norm,
+            hidden,
+            residual,
+            weight,
+            cpu_compile=False,
+            run_eager=False,
+        )
+
+    def test_mixed_ea_staggered_broadcaster_fp16(self):
+        # Case 3.2 of the mixed-EA rule: the *staggered* operand is the
+        # size-1-stick broadcaster (fp16 produced by an fp32->fp16 downcast,
+        # FP32_TO_DL16) combined with a STANDARD full operand. A broadcastable
+        # staggered operand is physically identical to STANDARD of that shape, so
+        # the op is allowed (STANDARD output).
+        x = torch.randn(4, 1, dtype=torch.float32)  # -> .to(f16): staggered bcast
+        w = torch.randn(4, 64, dtype=torch.float16)  # STANDARD full
+
+        def fn(x, w):
+            return torch.add(x.to(torch.float16), w)
+
+        compare_with_cpu(fn, x, w, cpu_compile=False, run_eager=False)
+
+    @unittest.expectedFailure
+    def test_mixed_ea_staggered_broadcaster_fp32(self):
+        # Case 3.2 with an fp32-physical staggered broadcaster (DL16_TO_FP32).
+        # The mixed-EA gate now allows it (it is physically the equivalent
+        # all-STANDARD fp32 broadcast), but device codegen cannot yet emit an
+        # fp32 broadcast along the stick axis -- ddc crashes in ddc_fold.cpp
+        # (innermostRelevantAllocLoop == innermostRelevantRefLoop). This same
+        # crash hits a pure-STANDARD fp32 [4,1]+[4,64] broadcast, so it is a
+        # separate, pre-existing codegen gap tracked outside this change. Marked
+        # expectedFailure until that codegen support lands.
+        x = torch.randn(4, 1, dtype=torch.float16)  # -> .to(f32): staggered bcast
+        w = torch.randn(4, 64, dtype=torch.float32)  # STANDARD full
+
+        def fn(x, w):
+            return torch.add(x.to(torch.float32), w)
+
+        compare_with_cpu(fn, x, w, cpu_compile=False, run_eager=False)
+
     def test_flash_attention(self):
         B, H, L, D = 1, 8, 256, 64
         block_size = 128
