@@ -6181,10 +6181,11 @@ class TestCoarseTileSpyreHints(InductorTestCase):
     @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_pool_alloc_scoped_per_bundle_across_fallback_boundary(self):
         """A CPU-fallback op (torch.sin) splits the graph into multiple
-        bundles. Each bundle's pool (if any) is allocated inside that
-        bundle's own generated MLIR via sdscbundle.device_mem_allocate --
-        there is no Python-side pool tensor, and no bundle's MLIR references
-        another bundle's pool."""
+        bundles. With frontend_pool_allocation at its default (False), each
+        bundle's pool (if any) is allocated inside that bundle's own
+        generated MLIR via sdscbundle.device_mem_allocate -- there is no
+        Python-side pool tensor, and no bundle's MLIR references another
+        bundle's pool."""
         from torch_spyre.execution import async_compile as async_compile_mod
 
         def fn(t):
@@ -6257,8 +6258,9 @@ class TestCoarseTileSpyreHints(InductorTestCase):
     @config.patch({"lx_planning": False})
     @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_no_python_side_pool_tensor_allocated(self):
-        """No bundle allocates a Python-side _pool_<name> tensor any more --
-        pool allocation is now entirely inside the generated MLIR."""
+        """With frontend_pool_allocation at its default (False), no bundle
+        allocates a Python-side _pool_<name> tensor -- pool allocation is
+        entirely inside the generated MLIR."""
 
         def fn(t):
             a = torch.exp(t) * 2
