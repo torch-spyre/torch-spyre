@@ -41,7 +41,7 @@
 /tests/distributed/      @jjhursey @thoangtrvn @avery-blanchard
 
 # Documentation
-/docs/                   @kaoutar55 @dgrove-oss @mudhakar @raghukiran1224 @viji560 @tehbone
+/docs/                   @kaoutar55 @dgrove-oss @tardieu @mudhakar @raghukiran1224 @viji560 @tehbone
 
 # CI/CD
 /.github/                 @ashokponkumar @jabostian @anubhavjana @n-marion
