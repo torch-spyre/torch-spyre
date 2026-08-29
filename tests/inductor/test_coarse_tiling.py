@@ -2240,8 +2240,8 @@ class TestCoarseTileTiledDimsPerRead(unittest.TestCase):
     "'NullHandler' object does not support the context manager protocol").
     _apply_plan is the layer that actually populates tiled_dims_per_read /
     output_tiled_dims (see Task 2/3), so calling plan_coarse_tile_groups +
-    _apply_plan directly exercises exactly what Stage 1 needs without
-    pulling in buffer propagation, which Stage 1 does not touch.
+    _apply_plan directly exercises exactly what the declarative tiling pass
+    needs without pulling in buffer propagation, which it does not touch.
     """
 
     def setUp(self):
@@ -4932,9 +4932,9 @@ class TestPlanTilingPropagation(unittest.TestCase):
     """Cross-check: _plan_tiling_propagation's kind decision must match what
     _propagate_tiled_op / _propagate_tiled_reduction_op actually do today.
 
-    This is the load-bearing regression net for Stage 2: it validates the
-    front-loaded planning decision against current (still transformation-
-    driving) behavior, before Stage 3 ever makes transformation consume the
+    This is the load-bearing regression net for front-loaded planning: it
+    validates the planning decision against current (still transformation-
+    driving) behavior, before transformation ever consumes the
     new field. Built with the same mock-based fixtures
     (_make_tiled_op/_make_consumer_op/_make_inside_consumer_op/
     _make_tiled_reduction_op) TestCoarseTileBufferPropagation already uses
@@ -6590,7 +6590,7 @@ class TestValidatePlannedReductionTiling(unittest.TestCase):
         return op
 
     def test_pure_reduction_tile_ok(self):
-        """Single level, only reduction dim tiled — Stage 1 supported case."""
+        """Single level, only reduction dim tiled — supported case."""
         from torch_spyre._inductor.wsr.coarse_tile import (
             _validate_planned_reduction_tiling,
         )
@@ -6622,7 +6622,7 @@ class TestValidatePlannedReductionTiling(unittest.TestCase):
         _validate_planned_reduction_tiling(op, [[]], [[]])  # must not raise
 
     def test_mixed_same_level_raises(self):
-        """Both output and reduction dim tiled at the same level — Stage 2, raises."""
+        """Both output and reduction dim tiled at the same level — raises."""
         from torch_spyre._inductor.wsr.coarse_tile import (
             _validate_planned_reduction_tiling,
         )
@@ -6670,7 +6670,7 @@ class TestValidatePlannedReductionTiling(unittest.TestCase):
         _validate_planned_reduction_tiling(op, tiled_dims, tiled_rdims)
 
     def test_multiple_reduction_dims_same_level_raises(self):
-        """Multiple reduction dims tiled at one level — Stage 2, raises."""
+        """Multiple reduction dims tiled at one level — raises."""
         from torch._inductor.ir import ComputedBuffer, Reduction
         from torch_spyre._inductor.wsr.coarse_tile import (
             _validate_planned_reduction_tiling,

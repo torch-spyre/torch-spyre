@@ -14,11 +14,11 @@
 
 """Declarative coarse tiling, applied inside the scratchpad planning pass.
 
-This is stage 1 of the coarse-tiling optimization: a tiling stated as data (a
+The tiling is stated as data (a
 :class:`~torch_spyre._inductor.scratchpad.plan_solver.TileSpec` per op) and
 *applied* to a real graph through a :class:`ScratchpadOptimizationPass`. The
 tiling is an input here, not a search -- candidate enumeration and the solver
-that chooses among tilings arrive in later stages.
+that chooses among tilings live elsewhere.
 
 The pass mints hint ids and a group-id offset from bases derived off the graph
 (never a reserved constant), so a tiling applied here cannot collide with a
@@ -181,7 +181,7 @@ def _derive_group_idx_offset(graph: GraphLowering) -> int:
 class CoarseTilingPass(ScratchpadOptimizationPass):
     """Apply a declared coarse tiling to a graph, inside the scratchpad pass.
 
-    Stage 1: the tiling is an *input* (``choices``: operation name -> TileSpec),
+    The tiling is an *input* (``choices``: operation name -> TileSpec),
     not a search. Consecutive ops sharing a non-empty spec form one loop group;
     the pass mints hint ids and a group-id offset from bases derived off the
     graph, stamps each op's ``dim_hints``, validates group contiguity, then calls
