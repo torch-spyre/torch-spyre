@@ -13,3 +13,8 @@
 # limitations under the License.
 
 """Working Set Reduction (coarse-tiling) pass implementations."""
+
+from .for_each_tile import for_each_tile, Gather
+
+
+__all__ = ["for_each_tile", "Gather"]
