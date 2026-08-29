@@ -225,14 +225,6 @@ wheels = [
 ]
 
 [[package]]
-name = "ktir-mlir-frontend"
-version = "0.1.0"
-source = { git = "https://github.com/torch-spyre/ktir-mlir-frontend.git?rev=05e7a0ff814ebefb6e78450b1ec0e871c488c8bc#05e7a0ff814ebefb6e78450b1ec0e871c488c8bc" }
-dependencies = [
-    { name = "nanobind" },
-]
-
-[[package]]
 name = "librt"
 version = "0.13.0"
 source = { registry = "https://pypi.org/simple" }
@@ -448,15 +440,6 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/a2/6e/371856a3fb9d31ca8dac321cda606860fa4548858c0cc45d9d1d4ca2628b/mypy_extensions-1.1.0.tar.gz", hash = "sha256:52e68efc3284861e772bbcd66823fde5ae21fd2fdb51c62a211403730b916558", size = 6343, upload-time = "2025-04-22T14:54:24.164Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/79/7b/2c79738432f5c924bef5071f933bcc9efd0473bac3b4aa584a6f7c1c8df8/mypy_extensions-1.1.0-py3-none-any.whl", hash = "sha256:1be4cccdb0f2482337c4743e60421de3a356cd97508abadd57d47403e94f5505", size = 4963, upload-time = "2025-04-22T14:54:22.983Z" },
-]
-
-[[package]]
-name = "nanobind"
-version = "2.14.0"
-source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/1f/23/a6fdf94de7bf760da93a115593cc1756a7b3d408c12681df9e4c63bf11e3/nanobind-2.14.0.tar.gz", hash = "sha256:0cf1477d8b1697abc1454028b6469e7113d9aa6ba3ced8b102cc569affbacb13", size = 1053642, upload-time = "2026-08-07T06:07:51.605Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/94/17/fba47a85a7b0bfb9ab5a5100e8a26b361b881089c7d8cad9a95f895f1546/nanobind-2.14.0-py3-none-any.whl", hash = "sha256:a57cd4fe613db78410ca13ba007a3ffaf3125b831d8be46ec7f4351e8cf6e513", size = 269917, upload-time = "2026-08-07T06:07:50.045Z" },
 ]
 
 [[package]]
@@ -1230,13 +1213,13 @@ resolution-markers = [
     "python_full_version < '3.12' and sys_platform == 'darwin'",
 ]
 dependencies = [
-    { name = "filelock" },
-    { name = "fsspec" },
-    { name = "jinja2" },
-    { name = "networkx" },
-    { name = "setuptools" },
-    { name = "sympy" },
-    { name = "typing-extensions" },
+    { name = "filelock", marker = "python_full_version < '3.15' and sys_platform == 'darwin'" },
+    { name = "fsspec", marker = "python_full_version < '3.15' and sys_platform == 'darwin'" },
+    { name = "jinja2", marker = "python_full_version < '3.15' and sys_platform == 'darwin'" },
+    { name = "networkx", marker = "python_full_version < '3.15' and sys_platform == 'darwin'" },
+    { name = "setuptools", marker = "python_full_version < '3.15' and sys_platform == 'darwin'" },
+    { name = "sympy", marker = "python_full_version < '3.15' and sys_platform == 'darwin'" },
+    { name = "typing-extensions", marker = "python_full_version < '3.15' and sys_platform == 'darwin'" },
 ]
 wheels = [
     { url = "https://download-r2.pytorch.org/whl/cpu/torch-2.13.0-cp311-cp311-macosx_14_0_arm64.whl", hash = "sha256:e76f9bcecc52b8ff711239a2f7547d5353df95878ab232f0773c1d95928b92f8", upload-time = "2026-07-08T12:26:13Z" },
@@ -1266,13 +1249,13 @@ resolution-markers = [
     "python_full_version < '3.12' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32'",
 ]
 dependencies = [
-    { name = "filelock" },
-    { name = "fsspec" },
-    { name = "jinja2" },
-    { name = "networkx" },
-    { name = "setuptools" },
-    { name = "sympy" },
-    { name = "typing-extensions" },
+    { name = "filelock", marker = "python_full_version >= '3.15' or sys_platform != 'darwin'" },
+    { name = "fsspec", marker = "python_full_version >= '3.15' or sys_platform != 'darwin'" },
+    { name = "jinja2", marker = "python_full_version >= '3.15' or sys_platform != 'darwin'" },
+    { name = "networkx", marker = "python_full_version >= '3.15' or sys_platform != 'darwin'" },
+    { name = "setuptools", marker = "python_full_version >= '3.15' or sys_platform != 'darwin'" },
+    { name = "sympy", marker = "python_full_version >= '3.15' or sys_platform != 'darwin'" },
+    { name = "typing-extensions", marker = "python_full_version >= '3.15' or sys_platform != 'darwin'" },
 ]
 wheels = [
     { url = "https://download-r2.pytorch.org/whl/cpu/torch-2.13.0%2Bcpu-cp311-cp311-linux_s390x.whl", hash = "sha256:6e9817dbdf5ea76789babd46e457eac5bf14ff566cf85f8addbfdff2d56601ce", upload-time = "2026-07-08T19:27:52Z" },
@@ -1348,11 +1331,6 @@ test = [
     { name = "pytest-xdist" },
 ]
 
-[package.dev-dependencies]
-ktir = [
-    { name = "ktir-mlir-frontend", marker = "python_full_version >= '3.12'" },
-]
-
 [package.metadata]
 requires-dist = [
     { name = "build", marker = "extra == 'build'" },
@@ -1381,9 +1359,6 @@ requires-dist = [
     { name = "wheel", marker = "extra == 'build'" },
 ]
 provides-extras = ["cpsat", "build", "test", "lint"]
-
-[package.metadata.requires-dev]
-ktir = [{ name = "ktir-mlir-frontend", marker = "python_full_version >= '3.12'", git = "https://github.com/torch-spyre/ktir-mlir-frontend.git?rev=05e7a0ff814ebefb6e78450b1ec0e871c488c8bc" }]
 
 [[package]]
 name = "types-pyyaml"

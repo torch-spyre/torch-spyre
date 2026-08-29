@@ -89,10 +89,12 @@ from .scheduler import (
     align_lx_producer_loop_order,
     build_loop_scheduler_nodes,
     demote_incoherent_lx_buffers,
+    verify_carried_reduction_ownership,
 )
 from .constants import DEVICE_NAME
 from .deadcode_elimination import deadcode_elimination
 from .dedup_constants import dedup_and_promote_constants
+from .read_copy_elision import elide_proven_read_copies
 from .wsr.coarse_tile import coarse_tile_post_stickify, coarse_tile_pre_stickify
 from .dump_cost_model import dump_cost_model
 
@@ -296,7 +298,12 @@ class CustomPostFusionPasses(_SpyreNodePassPipeline):
         # hbm_pool_planning runs after spyre_fuse_nodes so it can compute
         # bundle-scoped live ranges.
         super().__init__(
-            [demote_incoherent_lx_buffers, spyre_fuse_nodes, hbm_pool_planning]
+            [
+                demote_incoherent_lx_buffers,
+                spyre_fuse_nodes,
+                hbm_pool_planning,
+                verify_carried_reduction_ownership,
+            ]
         )
 
 
@@ -503,6 +510,9 @@ class CustomPreSchedulingPasses:
             #
             # LX Planning
             _maybe_scratchpad_planning,
+            # Preserve copies through physical planning, then remove only
+            # those whose direct-read form is proven equivalent.
+            elide_proven_read_copies,
         ]
 
     def __call__(self, graph: GraphLowering) -> None:

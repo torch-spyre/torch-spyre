@@ -1113,15 +1113,14 @@ class _GatherMulticoreScenarios:
     # (c1 = K) -- splitting K makes every core read address 0 of the shared
     # table, silently returning wrong results. Shapes are chosen so the planner
     # *would* prefer K (its largest output-coordinate dim) if the guard were
-    # absent. assert_indexed_dim_split() reads the current SENCORES and expects
-    # c0 to split by min(SENCORES, index_size // 32) with c1 pinned at 1.
+    # absent. Aligned c0 sizes split in whole sticks; partial-stick c0 sizes stay
+    # unsplit because restickify must pad them. c1 always stays unsplit.
     #
-    # After the split-map check each scenario runs through the shared
+    # After the work-division check each scenario runs through the shared
     # _stage_and_e2e path (fresh inputs, since run_and_get_code has already
     # executed the split-map compile) -- the same capture-path stage checks +
-    # e2e leg every other gather scenario uses -- so the multicore split is also
-    # exercised end-to-end. (Skipped at sencores=1 by assert_indexed_dim_split
-    # -- nothing to divide.)
+    # e2e leg every other gather scenario uses -- so the selected mapping is
+    # exercised end-to-end. (Skipped at sencores=1 -- nothing to divide.)
 
     @staticmethod
     def _gather_fn(table, idx):
@@ -1173,15 +1172,11 @@ class _GatherMulticoreScenarios:
         self._stage_and_e2e(fn, *make(), expect=GATHER_OP_SPEC)
 
     # -- stick-aligned vs partial-last-stick index-entry counts -----------
-    # The index-entry dim is the index tensor's stick dim, so work division
-    # splits it in whole 32-entry sticks. A STICK-ALIGNED count (a multiple of
-    # 32) has always split cleanly. A NON-aligned count (a partial last stick)
-    # used to be forced onto one core, because an even per-core slice straddles
-    # the index stick boundary and the backend cannot step a sticked dim across it;
-    # the fix pads the gather output's entry dim up to the next whole stick
-    # (enforce_indirect_access_layout) so the split lands stick-aligned. Both
-    # kinds are swept across every SENCORES; the expected split for either is
-    # min(SENCORES, ceil(count / 32)) with the K data dim always pinned at 1.
+    # The index-entry dim is the index tensor's stick dim, so an aligned count
+    # can split in whole 32-entry sticks. A partial last stick is padded during
+    # restickify and must stay unsplit. SuperDSC historically forced that split
+    # to one only after wrapper emission; the planning constraint now makes the
+    # wrapper and the executed mapping agree.
 
     def test_work_division_index_split_aligned_six_sticks(self):
         """Stick-aligned index with exactly 6 sticks (P=192): a non-power-of-two
@@ -1202,9 +1197,7 @@ class _GatherMulticoreScenarios:
 
     def test_work_division_index_split_partial_stick(self):
         """Non-stick-aligned index (P=40 = one full stick + a partial second):
-        the entry dim is padded up to ceil(40/32)=2 whole sticks so the split
-        lands stick-aligned (2 across any SENCORES>=2) instead of an even slice
-        that would straddle the index stick boundary and miscompile."""
+        restickify pads the entry dim, so planning keeps it on one core."""
 
         def make():
             x = torch.rand(128, 64, 256, dtype=torch.float16).to("spyre")
@@ -1213,14 +1206,11 @@ class _GatherMulticoreScenarios:
 
         fn = self._gather_fn
         _, source_codes = run_and_get_code(torch.compile(fn, dynamic=False), *make())
-        self.assert_indexed_dim_split(source_codes[0], index_size=40, data_size=64)
+        self.assert_entry_dim_unsplit(source_codes[0], index_size=40, data_size=64)
         self._stage_and_e2e(fn, *make(), expect=GATHER_OP_SPEC)
 
     def test_work_division_index_split_partial_stick_mid(self):
-        """Non-stick-aligned index spanning several sticks (P=250, ceil=8 sticks):
-        the padded split scales past a single partial stick -- the non-aligned
-        counterpart of the aligned 8-stick test_work_division_index_split_capped,
-        splitting by the same largest divisor of 8 that fits the core count."""
+        """A larger partial-stick index (P=250) also stays unsplit."""
 
         def make():
             x = torch.rand(128, 64, 256, dtype=torch.float16).to("spyre")
@@ -1229,14 +1219,11 @@ class _GatherMulticoreScenarios:
 
         fn = self._gather_fn
         _, source_codes = run_and_get_code(torch.compile(fn, dynamic=False), *make())
-        self.assert_indexed_dim_split(source_codes[0], index_size=250, data_size=64)
+        self.assert_entry_dim_unsplit(source_codes[0], index_size=250, data_size=64)
         self._stage_and_e2e(fn, *make(), expect=GATHER_OP_SPEC)
 
     def test_work_division_index_split_partial_stick_full(self):
-        """Non-stick-aligned index at 32-stick scale (P=1000, ceil=32): the padded
-        split would reach a full 32-way division, but the indirect uint32 address
-        cap holds it to 16-way at SENCORES=32 -- the partial-stick counterpart of
-        test_work_division_index_split_full."""
+        """A full-scale partial-stick index (P=1000) also stays unsplit."""
 
         def make():
             x = torch.rand(128, 64, 256, dtype=torch.float16).to("spyre")
@@ -1245,7 +1232,7 @@ class _GatherMulticoreScenarios:
 
         fn = self._gather_fn
         _, source_codes = run_and_get_code(torch.compile(fn, dynamic=False), *make())
-        self.assert_indexed_dim_split(source_codes[0], index_size=1000, data_size=64)
+        self.assert_entry_dim_unsplit(source_codes[0], index_size=1000, data_size=64)
         self._stage_and_e2e(fn, *make(), expect=GATHER_OP_SPEC)
 
     # -- shared value table: cross-core read correctness ------------------

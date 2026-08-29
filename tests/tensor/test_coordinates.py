@@ -17,7 +17,8 @@ import sympy
 import torch
 from torch.testing._internal.common_utils import run_tests, TestCase
 from torch._inductor.dependencies import MemoryDep
-from torch_spyre._C import SpyreTensorLayout
+from torch._inductor.ir import FixedLayout
+from torch_spyre._C import DataFormats, SpyreTensorLayout
 from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.pass_utils import (
     device_coordinates,
@@ -26,6 +27,7 @@ from torch_spyre._inductor.pass_utils import (
 from torch_spyre._inductor.propagate_layouts import (
     PropArg,
     _check_supported_input_sticks,
+    _find_alt_target_stl,
 )
 from torch_spyre._inductor.views import (
     _decompose_constant_offset,
@@ -422,6 +424,61 @@ class TestTilingExprToDeviceExpr(TestCase):
         index = p0
         result = tiling_expr_to_device_expr([64, 1024, 64], [64, 4096, 1], index)
         self.assertEqual(result, p0)
+
+
+class TestFindAltTargetStlBoolStickSize(TestCase):
+    """_find_alt_target_stl must size a bool mutation target's stick from its
+    real physical format (target_stl.device_dtype), not target_layout.dtype's
+    hardcoded SEN169_FP16 assumption -- a bool held in IEEE_FP32 has a 32-elem
+    stick, not 64. Both cases below write host_size [64, 128] at column
+    offset 32 (a ``mask[:, 32:64].copy_(upd)``-style mutation): offset 32 is a
+    whole stick for IEEE_FP32 (32) but not for SEN169_FP16 (64), so the same
+    logical write must be treated differently depending on physical format.
+
+    This is a pure layout-resolution test: it calls _find_alt_target_stl
+    directly with hand-built layout objects, so it never reaches torch.compile
+    or the hardware compiler. That matters because an actual compiled
+    mutation into an IEEE_FP32-backed bool currently fails end-to-end on two
+    unrelated, lower-level gaps (ReStickifyOpHBM rejects IEEE_FP32 outright --
+    see test_restickify_fp32_unsupported_xfail in test_inductor_ops.py -- and
+    separately the DL op scheduler finds no candidate for a fused copy/slice
+    into IEEE_FP32). Neither gap is specific to this stick-size computation,
+    so this test isolates the one thing this fix actually changes.
+    """
+
+    def _write_dep(self):
+        # mask[:, 32:64].copy_(upd) over a [64, 128] host tensor: offset 32
+        # into the row-major index 128*d0 + d1.
+        d0, d1 = sympy.symbols("d0 d1", integer=True, nonnegative=True)
+        return MemoryDep("mask_buf", 128 * d0 + d1 + 32, (d0, d1), (64, 32))
+
+    def test_fp32_backed_bool_offset_is_stick_aligned(self):
+        # Pre-fix, get_elem_in_stick(target_layout.dtype) would use bool's
+        # hardcoded SEN169_FP16 stick (64) here regardless of target_stl,
+        # wrongly conclude offset 32 is not stick-aligned, and search for an
+        # alt layout. The fix resolves the real IEEE_FP32 stick (32), under
+        # which offset 32 is already aligned, so no alt is needed.
+        target_layout = FixedLayout(
+            torch.device("cpu"), torch.bool, [64, 128], [128, 1]
+        )
+        target_stl = SpyreTensorLayout([64, 128], torch.float32)
+        self.assertEqual(target_stl.device_dtype, DataFormats.IEEE_FP32)
+        self.assertIsNone(
+            _find_alt_target_stl(target_layout, target_stl, self._write_dep())
+        )
+
+    def test_fp16_backed_bool_offset_needs_alt(self):
+        # Contrast case: for a bool actually backed by SEN169_FP16, stick=64
+        # is correct, and offset 32 genuinely is not stick-aligned -- an alt
+        # stick dim is required, same as the pre-fix code would have found.
+        target_layout = FixedLayout(
+            torch.device("cpu"), torch.bool, [64, 128], [128, 1]
+        )
+        target_stl = SpyreTensorLayout([64, 128], torch.float16)
+        self.assertEqual(target_stl.device_dtype, DataFormats.SEN169_FP16)
+        self.assertIsNotNone(
+            _find_alt_target_stl(target_layout, target_stl, self._write_dep())
+        )
 
 
 class TestNormalizeCoordinatesFusion(TestCase):

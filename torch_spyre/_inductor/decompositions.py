@@ -1160,6 +1160,26 @@ def spyre_prod_dim_int(
     return acc
 
 
+@register_spyre_decompositions(
+    [torch.ops.aten.all.default, torch.ops.aten.all.dim, torch.ops.aten.all.dims]
+)
+def spyre_all(
+    input: torch.Tensor,
+    dim=None,
+    keepdim: bool = False,
+) -> torch.Tensor:
+    # Convert bool to float16 if needed
+    if input.dtype is torch.bool:
+        tmp = input.to(torch.float16)
+    else:
+        tmp = input
+
+    tmp = torch.abs(tmp)
+    result = torch.amin(tmp, dim=dim, keepdim=keepdim)
+
+    return result.to(torch.bool)
+
+
 def _masked_scatter_reject_reason(
     self: torch.Tensor,
     mask: torch.Tensor,

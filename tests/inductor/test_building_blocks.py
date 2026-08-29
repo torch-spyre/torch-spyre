@@ -23,6 +23,7 @@ import torch.nn.functional as F
 import torch_spyre._inductor.wsr.propagate_named_dims as _pnd
 from torch._inductor.utils import run_and_get_code
 from torch_spyre._inductor import spyre_hint  # noqa: F401
+from torch_spyre._inductor import config
 
 from utils_inductor import (
     DEVICE,
@@ -364,6 +365,11 @@ class TestBuildingBlocks(unittest.TestCase):
         self.assertTrue(tiled_syms.issubset(op_spec.tiled_symbol_trip_counts.keys()))
         for sym in tiled_syms:
             self.assertEqual(op_spec.tiled_symbol_trip_counts[sym], 2)
+
+
+FrontendPoolAllocationTestBuildingBlocks = config.patch(
+    {"frontend_pool_allocation": True}
+)(type("FrontendPoolAllocationTestBuildingBlocks", (TestBuildingBlocks,), {}))
 
 
 def test_tensor_arg_has_no_tile_advance_fields():

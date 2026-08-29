@@ -25,6 +25,13 @@ co_optimizing_lx_planning: bool = (
 )
 hbm_pool_planning: bool = _get_env_bool("HBM_POOL_PLANNING", True)
 
+# Select who allocates the HBM pool for an SDSC bundle's intermediates:
+# False (default) has the backend self-allocate via
+# sdscbundle.device_mem_allocate, exactly matching pre-existing behavior.
+# True has the front end allocate a real PyTorch tensor (via
+# spyre_empty_with_layout) and pass its address in as %pool_base_addr.
+frontend_pool_allocation: bool = _get_env_bool("FRONTEND_POOL_ALLOCATION", False)
+
 global_stick_optimizer: bool = os.environ.get("GLOBAL_STICK_OPTIMIZER", "1") == "1"
 
 # Emit a native conv2d SDSC (opFuncName="conv2d" on the "pt" unit) instead of
@@ -86,6 +93,10 @@ ignore_work_division_hints: bool = (
 )
 
 ignore_wsr_hints: bool = os.environ.get("SPYRE_INDUCTOR_IGNORE_HINTS", "0") == "1"
+
+# Temporary kill switch for removing a proven-redundant read copy after LX
+# planning.  A failed proof leaves the original graph unchanged.
+read_copy_elision: bool = _get_env_bool("SPYRE_READ_COPY_ELISION", True)
 
 # Per-pass operation logging for CustomPreSchedulingPasses.
 # Set to "all" or "1" to log after every pass, or a comma-separated list of
