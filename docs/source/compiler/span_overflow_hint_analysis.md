@@ -301,8 +301,8 @@ Code flow:
 
 ```text
 _output_span_candidates_from_op -> candidates for dim 0 and dim 1
-_candidate_host_dims            -> order by span pressure
-_split_candidates_for_host_dim  -> legal divisors per dim
+_candidate_axes                 -> order output/reduction axes by pressure
+_split_candidates_for_axis     -> legal divisors per axis
 _iter_split_combos              -> cheapest combos first
 _remaining_span_candidates_after_tile -> accept only if all spans are safe
 ```
@@ -469,8 +469,9 @@ groups:
 
 Whether a level tiles an output range or the BMM K reduction range is stored on
 the per-op `DimHint` (`is_reduction`), not in the group-level `levels` list.
-Output-range automatic hints have `is_reduction=False`; BMM K fallback hints
-have `is_reduction=True` and are emitted as independent singleton groups.
+Output-range automatic hints have `is_reduction=False`; BMM K hints have
+`is_reduction=True`. Plans containing K are emitted as independent singleton
+groups, including combined output+K plans.
 
 ## Scope
 
@@ -481,8 +482,8 @@ The production planner handles:
 - output layout span overflow;
 - reduction/BMM input span overflow when the span is controlled by output
   symbols;
-- BMM input span overflow controlled only by the single K reduction symbol,
-  using an independent K-only fallback plan;
+- BMM input span overflow controlled by the single K reduction symbol,
+  searched together with output dimensions to allow K-only or combined plans;
 - one or more output host dimensions per op, bounded by `_MAX_TILE_DIMS`;
 - static `FixedTiledLayout` metadata only.
 
@@ -494,7 +495,6 @@ The planner skips:
 - scalar/full reductions where `op.data.ranges` is empty;
 - Pointwise or Reduction ops with indirect/gather/scatter-style reads;
 - input spans controlled only by reduction symbols for non-BMM reductions;
-- combined output-range plus reduction-range tiling, such as M+K.
 
 ### Support Matrix
 
@@ -507,8 +507,8 @@ The planner skips:
 | Coordinate jointly controlled by 2+ output symbols | Yes | Emit a candidate for each contributing dim |
 | Reduction input span controlled by reduction dim | No | Skip candidate; generic reduction-range tiling is future work |
 | BMM input span controlled by `b`, `m`, or `n` | Yes | Emit tile for matching output dim |
-| BMM input span controlled by `k` | Yes | Emit independent K reduction-range tile if K-only validation clears every span |
-| BMM input spans needing both output dim and `k` tiling | No | Raise `Unsupported`; combined output+K plans are future work |
+| BMM input span controlled by `k` | Yes | Emit K-only or combined output+K levels when full validation clears every span |
+| BMM input spans needing both output dim and `k` tiling | Yes | Search and validate output+K split combinations together |
 | BMM with ambiguous reduction symbols | No | Return no BMM input candidates |
 | Scalar/full reduction | No | Return `None` |
 | Symbolic layout metadata | No | Return `None` |
@@ -668,14 +668,14 @@ must clear the whole joint span -- but it only seeds the bounded divisor
 search; the post-tile combo is always validated exactly, so an imprecise
 estimate costs extra combo attempts, not correctness.
 
-`_candidate_host_dims` merges candidates by host dim and orders dims by
+`_candidate_axes` merges candidates by `(host dim, is_reduction)` and orders dims by
 decreasing span pressure.  This ordering affects the bounded combo search when
 costs tie.
 
 ## Split Candidates and Cost Search
 
-For each candidate host dim, `_split_candidates_for_host_dim` enumerates legal
-split counts from exact divisors of `op.data.ranges[host_dim]`.
+For each candidate axis, `_split_candidates_for_axis` dispatches output axes to
+`_split_candidates_for_host_dim` and BMM K to `_bmm_k_split_candidates`.
 
 A split candidate is legal only if:
 

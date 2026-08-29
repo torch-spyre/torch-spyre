@@ -46,7 +46,7 @@ Structure
    accepted.
 
 Adding an op is one ``RECIPES`` entry; adding an emission *shape* is one method
-on ``KtirBuilder``, named for its ``Family``.
+on ``KtirBuilder`` plus one ``Surface`` arm in ``compute``.
 """
 
 from __future__ import annotations
@@ -61,11 +61,14 @@ from typing import TYPE_CHECKING, Any, ClassVar, NoReturn
 from torch_spyre._C import DataFormats, ElementArrangement
 from torch_spyre._inductor.codegen.compute_ops import num_bytes
 from torch_spyre._inductor.codegen.opspec_utils import (
+    PARALLEL,
+    REDUCTION,
     align_reshape_plan,
     buf_id,
     core_divisions,
     per_core_extent,
-    reduced_axes,
+    placeholder_axes,
+    reduction_indexing,
     row_major_strides,
 )
 from torch_spyre._inductor.constants import STAGGERED_EAS
@@ -304,23 +307,78 @@ class Access:
 # interpret.
 
 
+class Surface(enum.Enum):
+    """The shape of the op that carries the payload.
+
+    Chosen by the plan, so it is a step field rather than a decision emission
+    makes: which shape an op comes out as follows from its operands' coordinates,
+    and reading those is derivation.  Emission owning it would put a refusal
+    behind a half-built module.
+
+    ``BARE`` is a named linalg op (``linalg.add``), which states its own
+    indexing; ``REDUCE`` is ``linalg.reduce`` with ``dimensions=``, which states
+    only which axes go; ``GENERIC`` is ``linalg.generic``, the shape that has to
+    state its maps and iterators because nothing else says them for it.
+    """
+
+    BARE = enum.auto()
+    REDUCE = enum.auto()
+    GENERIC = enum.auto()
+
+
+@dataclasses.dataclass(frozen=True)
+class Indexing:
+    """What a ``linalg.generic`` must state, and nothing else.
+
+    ``maps`` is the inputs in operand order and then the result last -- the order
+    ``indexing_maps`` itself takes.  Each row is one iteration-dim index per
+    result position, i.e. a *projection*: ``(0, 1, 2)`` against a rank-4 nest is
+    ``(d0, d1, d2, d3) -> (d0, d1, d2)``.  Ints and strings rather than
+    ``ir.AffineMap`` and iterator attributes, so the record stays dialect-free
+    like every other one; ``KtirBuilder._affine_map`` is what turns a row into a
+    map, the way ``access_tile`` already turns a rank into an identity.
+
+    No ``extents`` field: ``linalg.generic`` infers its loop bounds from the
+    operand shapes and the maps, so nothing would read one.
+
+    A row is a bare dim index per position, which is every map in scope and not
+    every map there is: a *linearised* map such as
+    ``(d0, d1, d2, d3, d4) -> (d0, d2 * 64 + d3, d4)`` needs (coefficient, dim)
+    terms, so nothing here generalises to one for free.
+    """
+
+    iters: tuple[str, ...]  # PARALLEL | REDUCTION, one per iteration dim
+    maps: tuple[tuple[int, ...], ...]  # [operand][result position] -> dim
+
+
 @dataclasses.dataclass(frozen=True)
 class ComputeStep:
     """One compute op: what to read, what to apply, what to do with the result.
 
     ``ins`` is one ``(buf_id, Access)`` per operand, in the op's operand order.
     ``store`` is ``False`` for an internal result, which is bound in scope for a
-    later step instead of being stored through ``out``.  ``reduce_dims`` is the
-    input tile axes a REDUCTION consumes, and empty for every other family.
+    later step instead of being stored through ``out``.
+
+    ``reduce_dims`` is **the iteration dims whose iterator is ``REDUCTION``**, and
+    empty for every other surface.  On a ``REDUCE`` step those coincide with the
+    input tile's own axes -- which is what ``dimensions=`` means -- because
+    ``REDUCE`` is chosen exactly when the input map is the full identity; on a
+    ``GENERIC`` step they do not, and the maps are what say so.
+
+    ``indexing`` is carried on a ``GENERIC`` step and on no other, because it is
+    read by one surface: a named op defines its own indexing and ``linalg.reduce``
+    derives its maps from ``dimensions=``, so a per-operand map record on every
+    step would be built three times and read once.
     """
 
     op: str  # a KtirBuilder.RECIPES key
-    family: Family
+    surface: Surface
     ins: tuple[tuple[str, Access], ...]
     out: Access
     out_buf_id: str
     store: bool
     reduce_dims: tuple[int, ...] = ()
+    indexing: Indexing | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -635,6 +693,64 @@ def _squeezed(arg: TensorArg, axes: Sequence[int]) -> TensorArg:
     )
 
 
+def _reduce_surface(
+    iters: Sequence[str], in_map: Sequence[int], out_map: Sequence[int]
+) -> Surface:
+    """Which shape says the nest ``reduction_indexing`` derived.
+
+    ``REDUCE`` iff the nest is what ``linalg.reduce`` *means*: an identity input
+    map of the full rank, and an output map that is the identity with the reduced
+    dims dropped.  ``mlir::linalg::ReduceOp`` derives its maps as
+    ``getMultiDimIdentityMap(rank).dropResults(dimensions)``, so nothing else is
+    expressible by ``dimensions=`` alone and everything else needs a generic.
+
+    Testing the *input* map is the load-bearing half.  An on-stick reduction's
+    output map is ``(1, 3)``, which *is* the identity of a rank-4 nest with
+    ``(0, 2)`` dropped -- so an output-only test would accept it and emit a rank-2
+    ``linalg.reduce`` over a rank-3 input, silently reducing the wrong elements.
+    What disqualifies it is that its input map covers 3 of 4 dims.
+    """
+    rank = len(iters)
+    reduced = {dim for dim, iterator in enumerate(iters) if iterator == REDUCTION}
+    identity = tuple(range(rank))
+    kept = tuple(dim for dim in identity if dim not in reduced)
+    return (
+        Surface.REDUCE
+        if tuple(in_map) == identity and tuple(out_map) == kept
+        else Surface.GENERIC
+    )
+
+
+def _parallel_surface(
+    recipe: Recipe, operands: int, rank: int
+) -> tuple[Surface, Indexing | None]:
+    """Which shape carries a non-reducing payload, and what it has to state.
+
+    Nothing is *derived* here and nothing needs to be: the pointwise arm's
+    alignment refusal has already established that every operand's coordinates
+    and extents equal the output's, which is precisely the identity condition, so
+    the maps are known rather than read off the coordinates.  Deriving them
+    instead would make the emitted form of ``add`` hostage to the dim-reuse rule
+    ``reduction_indexing`` needs -- a coordinate list that repeated a
+    classification would yield a non-identity map and silently turn a
+    ``linalg.add`` into a ``linalg.generic``.
+
+    So the choice is only about spelling, and it follows from the binding: a
+    ``NAMED`` builder is an op the dialect already has, which says its own
+    indexing and needs no record, while anything else has to state the identity
+    maps and the all-parallel iterators itself -- which only a generic can do.
+    That second arm is where a ``spyreop`` intrinsic hooks in; no recipe selects
+    it yet.
+    """
+    if recipe.kind is BindingKind.NAMED:
+        return Surface.BARE, None
+    identity = tuple(range(rank))
+    return Surface.GENERIC, Indexing(
+        iters=(PARALLEL,) * rank,
+        maps=(identity,) * (operands + 1),
+    )
+
+
 def _access(
     arg: TensorArg,
     extent: Sequence[Any],
@@ -938,16 +1054,20 @@ class KernelPlan:
                     f"OpSpec->KTIR: op {entry.op!r} is not supported yet "
                     f"(registered: {sorted(KtirBuilder.RECIPES)})"
                 )
-            family = Family.of(entry)
-            if family is not KtirBuilder.RECIPES[entry.op].family:
-                # The spec asks for a shape this op's recipe does not implement
-                # (an 'add' as a reduction, a 'sum' as elementwise).  The recipe
-                # is what has an emission behind it, so the request is refused
-                # rather than emitted in the shape that happens to exist.
+            recipe = KtirBuilder.RECIPES[entry.op]
+            if (recipe.kind is BindingKind.COMBINER) != bool(entry.is_reduction):
+                # Two independent statements of one bit -- what the recipe's
+                # binding accumulates, and what the frontend labelled the request
+                # -- and both directions are silent if unchecked.  An 'add' asked
+                # for as a reduction would derive no reduced axis and come out as
+                # a plain 'linalg.add' for a spec the frontend called a reduction;
+                # a 'sum' asked for elementwise would reach a two-operand scalar
+                # combiner with one operand and fail inside emission, which is the
+                # one thing the plan/emission split exists to rule out.
                 raise NotImplementedError(
                     f"OpSpec->KTIR: op {entry.op!r} is registered as "
-                    f"{KtirBuilder.RECIPES[entry.op].family.name} but this spec "
-                    f"asks for {family.name}"
+                    f"{recipe.kind.name} but this spec asks for "
+                    f"{'a reduction' if entry.is_reduction else 'an elementwise op'}"
                 )
             steps.append(self._compute_step(entry, loops))
         return tuple(steps)
@@ -962,7 +1082,7 @@ class KernelPlan:
         """
         out, inputs = validated_roles(spec)
         out_extents = [int(s) for s in out.device_size]
-        family = Family.of(spec)
+        recipe = KtirBuilder.RECIPES[spec.op]
         for arg in inputs:
             # In-place (input buffer aliases the output) is not supported yet.
             if buf_id(arg) == buf_id(out):
@@ -970,28 +1090,45 @@ class KernelPlan:
                     "OpSpec->KTIR: in-place ops (input aliases output) not supported"
                 )
         reduce_dims: tuple[int, ...] = ()
+        indexing: Indexing | None = None
         args = list(spec.args)
-        if family is Family.REDUCTION:
-            # Which axes a reduction consumes is a fact about its operands, so it
-            # is derived here (once) and carried on the step, not re-derived from
-            # the op name at emit time.
+        if spec.is_reduction:
+            # What iteration nest a reduction wants is a fact about its operands'
+            # coordinates, so it is derived here (once) and carried on the step,
+            # not re-derived from the op name at emit time.  Every reduction in
+            # scope is unary, which is why the derivation takes one input.
             [source] = inputs
-            reduce_dims, placeholder = reduced_axes(
-                source.device_coordinates,
-                [int(s) for s in source.device_size],
-                out.device_coordinates,
-                out_extents,
-            )
+            placeholder = placeholder_axes(out.device_coordinates, out_extents)
             if placeholder:
-                # The projection leaves each reduced axis in the output as a unit
-                # extent; the reduced tile does not have it at all.  Squeezing the
-                # arg here, once, is what keeps every derivation after this point
-                # unaware that a reduction is different: the output's view, tile
-                # and stored tensor are all the same (lower) rank.
+                # The projection leaves an axis the op does not write in the output
+                # as a unit extent; the reduced tile does not have it at all.
+                # Squeezing the arg here, once and before ``_access_of``, is what
+                # keeps every derivation after this point unaware that a reduction
+                # is different: the output's view, tile, per-core division and
+                # stored tensor are all the same (lower) rank.  It stays gated on
+                # ``is_reduction`` because an *accepted* pointwise spec can carry a
+                # unit constant axis on its inputs too, and squeezing only the
+                # output would hand ``linalg.add`` operands of two ranks.
                 squeezed = _squeezed(out, placeholder)
                 args = [squeezed if arg is out else arg for arg in args]
                 out = squeezed
+            iters, in_map, out_map = reduction_indexing(
+                source.device_coordinates,
+                [int(s) for s in source.device_size],
+                out.device_coordinates,
+                [int(s) for s in out.device_size],
+            )
+            surface = _reduce_surface(iters, in_map, out_map)
+            reduce_dims = tuple(
+                dim for dim, iterator in enumerate(iters) if iterator == REDUCTION
+            )
+            if surface is Surface.GENERIC:
+                # The one nest ``dimensions=`` cannot state, so the maps have to
+                # travel with the step: the input covers three of four dims and
+                # the lane axis is reduced on the way in and kept on the way out.
+                indexing = Indexing(iters=iters, maps=(in_map, out_map))
         else:
+            surface, indexing = _parallel_surface(recipe, len(inputs), len(out_extents))
             for arg in inputs:
                 # Reject broadcast / transpose operands: only operands whose
                 # device axes already match the output tile exactly are supported.
@@ -1026,11 +1163,12 @@ class KernelPlan:
                 )
         return ComputeStep(
             op=spec.op,
-            family=family,
+            surface=surface,
             ins=tuple((buf_id(arg), accesses[buf_id(arg)]) for arg in inputs),
             out=accesses[buf_id(out)],
             out_buf_id=buf_id(out),
             reduce_dims=reduce_dims,
+            indexing=indexing,
             # An internal buffer never reaches memory: it is threaded as a value,
             # so it gets no store, no func parameter, no view and no address.
             store=not is_internal(out),
@@ -1133,33 +1271,44 @@ def validated_roles(spec: OpSpec) -> tuple[TensorArg, list[TensorArg]]:
 # Ops
 # ---------------------------------------------------------------------------
 #
-# A recipe declares one op: how many inputs it takes, which emission family it
-# belongs to, and the dialect builder that implements it.  The recipes live on
-# ``KtirBuilder`` beside the family methods that execute them.
+# A recipe declares one op: how many inputs it takes, what kind of thing its
+# binding is, and the dialect builder itself.  The recipes live on
+# ``KtirBuilder`` beside the surfaces that execute them.
 #
 # ``binding`` returns the builder rather than being it.  The call defers the
 # dialect reference to emit time, keeping this module importable without a
 # dialect build, and keeps the reference a literal that tooling can resolve.
 
 
-class Family(enum.Enum):
-    """An emission shape.  A recipe declares the one its binding implements;
-    ``Family.of`` reads the one a spec asks for."""
+class BindingKind(enum.Enum):
+    """What ``Recipe.binding()`` returns, which is what decides how it is used.
 
-    ELEMENTWISE = enum.auto()
-    REDUCTION = enum.auto()
+    Three kinds, and the surface follows from the kind plus (for a ``COMBINER``)
+    the shape of the reduction:
 
-    @classmethod
-    def of(cls, spec: OpSpec) -> Family:
-        """The family ``spec`` asks for, read from the spec rather than the op
-        name: the same binding can be wanted in more than one shape."""
-        return cls.REDUCTION if spec.is_reduction else cls.ELEMENTWISE
+      NAMED    a whole-op builder for a linalg op that already exists
+               (``linalg.add``).  Elementwise; emitted bare.
+      PAYLOAD  a scalar builder for a parallel body (a ``spyreop`` intrinsic).
+               Elementwise, but no named op wraps it, so it needs a generic.
+      COMBINER a two-operand scalar folded into the accumulator (``arith.addf``).
+               The only kind that reduces.
+
+    No separate ``reduces`` flag: reducing *is* ``kind is COMBINER``, because a
+    named linalg op is elementwise and a parallel-body payload does not
+    accumulate.  Nor is ``binding`` split per kind -- no op in scope wants two
+    spellings of itself, and the day one does (``add`` as a named op *and* as a
+    payload under a broadcast operand) is the day it earns a second field.
+    """
+
+    NAMED = enum.auto()
+    PAYLOAD = enum.auto()
+    COMBINER = enum.auto()
 
 
 @dataclasses.dataclass(frozen=True)
 class Recipe:
     arity: int
-    family: Family
+    kind: BindingKind
     binding: Callable[[], Any]
 
     def __post_init__(self) -> None:
@@ -1288,6 +1437,20 @@ class KtirBuilder:
         """A fresh ``arith.constant <value> : index``."""
         return self.val(arith.ConstantOp(self.index_t, int(value)))
 
+    @staticmethod
+    def _affine_map(rank: int, row: Sequence[int]):
+        """One ``Indexing`` row as a projection of a ``rank``-dim iteration nest.
+
+        ``(0, 1, 2)`` of rank 4 is ``(d0, d1, d2, d3) -> (d0, d1, d2)``: the row is
+        one dim index per result position, so the map has ``rank`` dims, no
+        symbols, and one expression per entry.  Returns the map itself and not an
+        ``ir.AffineMapAttr`` -- ``indexing_maps`` takes maps, and an attribute
+        raises there.
+        """
+        return ir.AffineMap.get(
+            rank, 0, [ir.AffineExpr.get_dim(int(dim)) for dim in row]
+        )
+
     # -- module scaffolding ------------------------------------------------
 
     @contextlib.contextmanager
@@ -1412,21 +1575,27 @@ class KtirBuilder:
                 )
 
     def compute(self, step: ComputeStep) -> None:
-        """Read the operands, apply the op's family builder, dispose of the result.
+        """Read the operands, emit the planned surface, dispose of the result.
 
-        The family names its own method (``Family.ELEMENTWISE`` ->
-        ``elementwise``), so adding a family is adding a method rather than
-        editing a dispatch table; a recipe whose family has no method is caught by
-        a test, not discovered here.
+        A ``match`` over literal calls rather than a dispatch table, because a
+        table's arms are unreachable to the call-graph walk that asserts nothing
+        on this path can refuse: ``self.SURFACES[step.surface](...)`` has no
+        resolvable callee, so every surface would have to be declared a root
+        instead of being *reached*.  The cost is that a new surface is two edits
+        (a method and an arm), and a test parses this ``match`` to catch the
+        second one being forgotten.
         """
         recipe = self.RECIPES[step.op]
-        emit = getattr(self, step.family.name.lower(), None)
-        if emit is None:
-            # The plan only accepts a family whose recipe declares it, and every
-            # declared family has a method, so this is a plan bug.
-            raise AssertionError(f"no emission for family {step.family} of {step.op!r}")
         ins = [self.operand(buf_id, access) for buf_id, access in step.ins]
-        value = emit(recipe, ins, step)
+        match step.surface:
+            case Surface.BARE:
+                value = self._emit_bare(recipe.binding(), ins, step)
+            case Surface.REDUCE:
+                value = self._emit_reduce(recipe.binding(), ins, step)
+            case Surface.GENERIC:
+                value = self._emit_generic(recipe.binding(), ins, step)
+            case _:
+                raise AssertionError(f"unplanned surface {step.surface} of {step.op!r}")
         self.result(step.out_buf_id, step.out if step.store else None, value)
 
     # -- ktdp shapes -------------------------------------------------------
@@ -1440,10 +1609,22 @@ class KtirBuilder:
         sizes = [int(e) for e in buffer.layout.extent]
         strides = [int(s) for s in buffer.layout.strides]
         memref_t = ir.MemRefType.get(sizes, self.named_type(buffer.elems.storage))
-        # No Python builder is exposed for the ``spyre_memory_space`` enum
-        # attribute (only the ktdp *types* have getters), so this small enum
-        # literal is the one unavoidable textual attribute.
-        memory_space = ir.Attribute.parse(f"#ktdp.spyre_memory_space<{buffer.space}>")
+        # ``memory_space`` was the last attribute built as text, because no
+        # builder was exposed for it; ktir-mlir-frontend#61 adds one, so it now
+        # goes through the same verifier-checked API as everything else and a
+        # rename breaks type checking rather than failing at runtime.
+        #
+        # The builder takes the tablegen-generated ``MemorySpaceKind``, not a
+        # spelling, so the mapping names enum members.  ``global_`` carries the
+        # trailing underscore mlir-tblgen adds to escape the Python keyword.
+        # Keyed lookup rather than a fallback, so a space this mapping has not
+        # been taught fails loudly instead of emitting an attribute the backend
+        # cannot read.
+        kind = {
+            "HBM": ktdp.MemorySpaceKind.global_,
+            "LX": ktdp.MemorySpaceKind.ct_local,
+        }[buffer.space]
+        memory_space = ktdp.MemorySpaceAttr.get(kind)
         return self.val(
             ktdp.construct_memory_view(
                 result=memref_t,
@@ -1534,8 +1715,8 @@ class KtirBuilder:
 
     # -- compute -----------------------------------------------------------
     #
-    # One method per emission family, not per op: the op contributes only its
-    # dialect builder, via ``recipe.binding()``.
+    # One entry per op, and it contributes only its dialect builder: what shape
+    # that builder is wrapped in comes from ``step.surface``, which the plan chose.
     #
     # Bindings are dialect *functions*, not OpView classes: ``linalg.AddOp``
     # constructed directly leaves the named op's body region empty and fails
@@ -1543,48 +1724,70 @@ class KtirBuilder:
     #
     # A repeated key here is ruff F601, so an op cannot be declared twice.
     RECIPES: ClassVar[dict[str, Recipe]] = {
-        "add": Recipe(arity=2, family=Family.ELEMENTWISE, binding=lambda: linalg.add),
-        "mul": Recipe(arity=2, family=Family.ELEMENTWISE, binding=lambda: linalg.mul),
-        "sum": Recipe(arity=1, family=Family.REDUCTION, binding=lambda: arith.addf),
+        "add": Recipe(arity=2, kind=BindingKind.NAMED, binding=lambda: linalg.add),
+        "mul": Recipe(arity=2, kind=BindingKind.NAMED, binding=lambda: linalg.mul),
+        "sum": Recipe(arity=1, kind=BindingKind.COMBINER, binding=lambda: arith.addf),
     }
 
-    def elementwise(self, recipe: Recipe, ins: Sequence, step: ComputeStep):
-        """Apply ``recipe``'s builder to ``ins``, shaped by the result's tile.
+    # -- emission surfaces -------------------------------------------------
+    #
+    # One method per ``Surface``: the shape of the op that carries a recipe's
+    # payload.  The surface owns the destination and the operand/result typing, so
+    # the shape is written once however many kinds of payload reach for it, and it
+    # chooses nothing -- the plan already did.
+    #
+    # ``linalg.reduce`` derives its indexing maps as the identity with the reduced
+    # dimensions dropped, so it says only rank-reducing, identity-indexed
+    # reductions.  A reduction over the stick axis is not one -- it reduces the
+    # lane axis on the way in and keeps it on the way out -- which is why
+    # ``Surface.GENERIC`` exists as a third shape rather than being folded in.
+    #
+    # Every surface writes its result into an uninitialised ``tensor.empty``: on
+    # this path the destination is a pure destination -- the op writes every
+    # element of it, or (a reduction) leaves materialising the identity to the
+    # scheduler's reduction passes, for which a ``linalg.fill`` here would be a
+    # second compute op to unpick.
 
-        Returns the result value; what becomes of it is the caller's decision.
-        Every operand and the result share the result tile's extents.
+    def _destination(self, step: ComputeStep):
+        """``(extents, elt_t, dest)`` for ``step``'s result: what every surface needs.
 
-        The destination is an uninitialised ``tensor.empty``, valid because an
-        elementwise op writes every element of it.
+        Emits the ``tensor.empty``, so a surface calls this once and first --
+        before the op that writes into it, which is the order the module reads
+        in.  Shared rather than repeated because the surfaces agree on it
+        exactly, and one that disagreed would be describing a different
+        destination, not a different shape.
         """
         extents = list(step.out.extent)
         elt_t = self.named_type(step.out.elems.value)
-        dest = self.val(tensor.EmptyOp(extents, elt_t))
-        return recipe.binding()(
+        return extents, elt_t, self.val(tensor.EmptyOp(extents, elt_t))
+
+    def _emit_bare(self, build: Callable, ins: Sequence, step: ComputeStep):
+        """``build`` called directly, shaped by the result tile.
+
+        The surface for an op the dialect already names: no region to fill and no
+        maps to state, because the named op's own definition says how its
+        operands are indexed.  Every operand and the result share the result
+        tile's extents, which is what makes the call legal without them.
+        """
+        extents, elt_t, dest = self._destination(step)
+        return build(
             *ins,
             outs=[dest],
             result_tensors=[ir.RankedTensorType.get(extents, elt_t)],
         )
 
-    def reduction(self, recipe: Recipe, ins: Sequence, step: ComputeStep):
-        """``linalg.reduce`` over ``step.reduce_dims``, combining with ``recipe``.
+    def _emit_reduce(self, combine: Callable, ins: Sequence, step: ComputeStep):
+        """``linalg.reduce`` over ``step.reduce_dims``, folding with ``combine``.
 
-        The recipe contributes the *combiner* here rather than a whole-op builder
-        (``arith.addf`` for a sum), because ``linalg.reduce`` is one op for every
-        reduction and the payload is what differs between them.
-
-        The accumulator is a bare ``tensor.empty``, not a filled one: the identity
-        belongs to whoever materialises the accumulator, and on this path that is
-        the scheduler's reduction passes -- a ``linalg.fill`` here becomes a second
-        compute op they have to unpick.  Reducing in place also means no reshape:
-        keeping the surviving axes in the output tile makes the result the shape
-        the store's access tile already has.
+        The surface for a reduction that drops whole axes: ``linalg.reduce``
+        indexes its operands for you and its region is fixed at two scalars, so
+        all it needs is the dimensions and a combiner -- there is no room for the
+        payload to be anything else, which is why it takes the two-argument
+        function and builds the region itself.  Reducing in place also means no
+        reshape: keeping the surviving axes in the output tile makes the result
+        the shape the store's access tile already has.
         """
-        [source] = ins
-        extents = list(step.out.extent)
-        elt_t = self.named_type(step.out.elems.value)
-        dest = self.val(tensor.EmptyOp(extents, elt_t))
-        combine = recipe.binding()
+        extents, elt_t, dest = self._destination(step)
 
         def body(accumulated, element):
             return combine(accumulated, element)
@@ -1595,9 +1798,41 @@ class KtirBuilder:
         body.__annotations__ = {"accumulated": elt_t, "element": elt_t}
         return linalg.reduce(
             result=[ir.RankedTensorType.get(extents, elt_t)],
-            inputs=[source],
+            inputs=list(ins),
             inits=[dest],
             dimensions=list(step.reduce_dims),
+        )(body)
+
+    def _emit_generic(self, payload: Callable, ins: Sequence, step: ComputeStep):
+        """``linalg.generic`` stating the plan's maps and iterators.
+
+        The surface for a nest nothing else can spell.  Two callers reach it and
+        one body serves both: the block arguments are one per input and then the
+        ``outs`` accumulator, which a reducing nest folds into and a parallel one
+        drops -- so the arity works out either way (one input plus an accumulator,
+        or two inputs with the accumulator dropped, both two arguments).
+
+        Only ``dest`` is taken from ``_destination``: a generic's result type comes
+        from its ``outs`` operand rather than being stated, and unlike
+        ``_emit_reduce`` the region's block argument types are appended by the
+        builder off the operand element types, so there is no annotation to set.
+        """
+        indexing = step.indexing
+        # Every GENERIC step carries one (the plan's field invariant); reaching
+        # here without it is a plan bug, not an unsupported request.
+        assert indexing is not None, f"generic {step.op!r} with no indexing record"
+        _extents, _elt_t, dest = self._destination(step)
+        rank = len(indexing.iters)
+        reducing = bool(step.reduce_dims)
+
+        def body(*args):
+            return payload(*(args if reducing else args[:-1]))
+
+        return linalg.generic(
+            inputs=list(ins),
+            outputs=[dest],
+            indexing_maps=[self._affine_map(rank, row) for row in indexing.maps],
+            iterator_types=list(indexing.iters),
         )(body)
 
     # -- attributes --------------------------------------------------------

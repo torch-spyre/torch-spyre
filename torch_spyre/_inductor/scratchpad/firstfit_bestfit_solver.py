@@ -19,14 +19,14 @@ from typing import Optional, Callable
 from torch_spyre._inductor.scratchpad.plan_solver import (
     LifetimeBoundBuffer,
     MemoryPlanSolver,
-    _assert_in_place_relationships,
+    _check_in_place_relationships,
 )
 from torch_spyre._inductor.scratchpad.utils import round_up_to_alignment
 
 __all__ = [
     "FirstFitLayoutSolver",
     "BestFitLayoutSolver",
-    "_assert_in_place_relationships",
+    "_check_in_place_relationships",
 ]
 
 
@@ -189,7 +189,7 @@ class FirstFitLayoutSolver(MemoryPlanSolver):
         assert all(buf.address is None for buf in buffers), (
             "Buffers cannot be previously or partially planned"
         )
-        _assert_in_place_relationships(buffers)
+        _check_in_place_relationships(buffers)
 
         # Barred buffers keep address=None and are never candidates for a gap,
         # nor obstacles in one (they occupy no LX).

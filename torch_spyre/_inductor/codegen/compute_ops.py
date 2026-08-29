@@ -687,6 +687,7 @@ def generate_sdsc(
     operation_work_division = TensorWorkDivision(
         {dim: int(split) for dim, split in sdsc_spec.work_slices.items()},
         {dim: sdsc_spec.core_id_to_work_slice[dim] for dim in sdsc_spec.work_slices},
+        num_cores=sdsc_spec.num_cores,
     )
     for tensor in sdsc_spec.args:
         if tensor.work_division is None:
@@ -1548,7 +1549,8 @@ def generate_sdsc(
                                         ),
                                         "coreIdToWkSlice_": (
                                             tensor.work_division.to_core_slices(
-                                                sdsc_spec.num_cores
+                                                tensor.work_division.num_cores
+                                                or sdsc_spec.num_cores
                                             )
                                             if sdsc_spec.opfunc == "shuffle"
                                             and tensor.work_division is not None

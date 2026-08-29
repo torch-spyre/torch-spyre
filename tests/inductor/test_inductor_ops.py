@@ -14,6 +14,7 @@
 
 import functools
 import math
+import sys
 import pytest
 import unittest
 import torch
@@ -34,7 +35,7 @@ from utils_inductor import (
 import utils_inductor
 from unittest import mock
 from torch_spyre._inductor import config as inductor_config
-from torch._inductor.utils import run_and_get_code
+from torch._inductor.utils import fresh_inductor_cache, run_and_get_code
 from torch_spyre._inductor.dtype_ops import DtypeOpTable
 from torch_spyre._inductor.constants import IDENTITY_OP
 
@@ -1302,6 +1303,46 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
             },
         },
+        ("test_keep_by_index", "test_keep_by_index_cpu"): {
+            "param_sets": {
+                "2d_dim0": (
+                    unique_randn_along_dim((67, 256), dim=0),
+                    8,
+                    0,
+                    -1.0,
+                ),
+                "2d_dim1": (
+                    unique_randn_along_dim((256, 64), dim=1),
+                    12,
+                    1,
+                    -1.0,
+                ),
+                "3d_dim0": (
+                    unique_randn_along_dim((67, 71, 256), dim=0),
+                    2,
+                    0,
+                    0.0,
+                ),
+                "4d_dim0": (
+                    unique_randn_along_dim((6, 17, 7, 64), dim=0),
+                    2,
+                    0,
+                    -1.0,
+                ),
+                "4d_dim2": (
+                    unique_randn_along_dim((6, 17, 64, 64), dim=2),
+                    16,
+                    2,
+                    0.0,
+                ),
+                "4d_dim3": (
+                    unique_randn_along_dim((6, 17, 4, 128), dim=3),
+                    4,
+                    3,
+                    -1.0,
+                ),
+            },
+        },
         ("test_reduce_keepdim0", "test_reduce_keepdim0_cpu"): {
             "ops_dict": CORE_REDUCTION_OPS_DICT,
             "param_sets": COMMON_REDUCTION_KEEPDIM_PARAM_SETS,
@@ -1827,6 +1868,52 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "signed_zero": (
                     torch.tensor([-0.0, 0.0, -0.0, 0.0], dtype=torch.float16),
                     torch.tensor([0.0, -0.0, 0.0, -0.0], dtype=torch.float16),
+                ),
+                "fp32_1d": (
+                    torch.ceil(
+                        cached_randn((256,), abs=True, scale=10.0, dtype=torch.float32)
+                    ),
+                    torch.ceil(
+                        cached_randn((256,), abs=True, scale=9.9, dtype=torch.float32)
+                    ),
+                ),
+                "fp32_2d": (
+                    torch.ceil(
+                        cached_randn(
+                            (64, 128), abs=True, scale=10.0, dtype=torch.float32
+                        )
+                    ),
+                    torch.ceil(
+                        cached_randn(
+                            (64, 128), abs=True, scale=9.9, dtype=torch.float32
+                        )
+                    ),
+                ),
+                "fp32_3d": (
+                    torch.ceil(
+                        cached_randn(
+                            (2, 32, 128), abs=True, scale=10.0, dtype=torch.float32
+                        )
+                    ),
+                    torch.ceil(
+                        cached_randn(
+                            (2, 32, 128), abs=True, scale=9.9, dtype=torch.float32
+                        )
+                    ),
+                ),
+                "fp32_broadcast": (
+                    torch.ceil(
+                        cached_randn(
+                            (256, 256), abs=True, scale=10.0, dtype=torch.float32
+                        )
+                    ),
+                    torch.ceil(
+                        cached_randn((256,), abs=True, scale=9.9, dtype=torch.float32)
+                    ),
+                ),
+                "fp32_signed_zero": (
+                    torch.tensor([-0.0, 0.0, -0.0, 0.0], dtype=torch.float32),
+                    torch.tensor([0.0, -0.0, 0.0, -0.0], dtype=torch.float32),
                 ),
             },
         },
@@ -4890,24 +4977,40 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
             },
         },
-        # Non-stick dim offset whose base row length (100) isn't a multiple
-        # of elem_in_stick (64). Flat offset 100 decomposes to a device
-        # stick coordinate of Mod(i1,64)+36 -- genuinely not stick-aligned,
-        # since the device layout pads each row's tail to a partial stick
-        # rather than the row itself landing on a stick boundary. Needs
-        # padding-aware device-coordinate construction, which isn't
-        # implemented yet. Dedicated test (not folded into the ops_dict
-        # cross-product above) so the exact rejection reason can be
-        # pinned, matching test_storage_offset_placeholder_stick_dim_rejected
-        # below.
+        # Offset on a non-stick dim of a PADDED base -- row width 100 is not a
+        # multiple of elem_in_stick, so each row pads to two sticks and the flat
+        # offset 100 is a whole row. compute_coordinates now decomposes that
+        # positionally, keeping the stick coordinate offset-free; before the fix
+        # it leaked Mod(i1,64)+36 and the placeholder was rejected outright.
+        #
+        # Deliberately narrower than the group above -- compiled only, and only
+        # layout-preserving ops -- because two unrelated defects still bound
+        # this shape on current main. Neither is caused by the offset:
+        #   - eager: every eager op on an offset view is cloned via
+        #     spyre::copy_from_d2d, which rejects on the flat-offset heuristic
+        #     `offset % elems_per_stick != 0` (100 % 64 = 36). Same
+        #     padding-blind assumption this fix removes, in another location.
+        #   - exp (and other ops that re-select the output layout): miscomputes
+        #     or fails to compile on any padded-row fp16 tensor, including
+        #     UNSLICED ones with no offset at all. Measured: (3,100) unsliced
+        #     fails identically to (4,100)[1:, :], in both core counts.
+        # x + x stays correct because it reuses the input layout verbatim.
         (
-            "test_storage_offset_placeholder_nonstick_row",
-            "test_storage_offset_placeholder_nonstick_row_rejected",
+            "test_storage_offset_placeholder_padded_row",
+            "test_storage_offset_placeholder_compiled_only",
         ): {
+            "ops_dict": {"add": lambda x: x + x},
             "param_sets": {
                 "2d_offset_dim0_nonstick_multiple": (
                     lambda t: t[1:, :],
                     cached_randn((4, 100), differentiation="ph_2d_offset0_nonstick"),
+                ),
+                # Same padded row, but dim0 IS a multiple of elem_in_stick, so
+                # the leaked residual would have looked resolvable by a stick
+                # move rather than rejected outright.
+                "2d_offset_dim0_nonstick_multiple_alt_dim": (
+                    lambda t: t[1:, :],
+                    cached_randn((64, 100), differentiation="ph_2d_offset0_nsalt"),
                 ),
             },
         },
@@ -5474,6 +5577,137 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         ("test_transpose_patterns", "test_transpose_patterns_cpu"): {
             "param_sets": _pattern_param_sets(),
         },
+        # torch.any / torch.all: single-dim reduction
+        ("test_any_single_dim", "test_reduce_keepdim0_cpu"): {
+            "ops_dict": {"any": torch.any},
+            "param_sets": {
+                "bool_2d_dim_0": (0, torch.rand((67, 256)) > 0.5),
+                "bool_2d_dim_1": (1, torch.rand((67, 256)) > 0.5),
+                "bool_3d_dim_0": (0, torch.rand((3, 5, 256)) > 0.5),
+                "bool_3d_dim_1": (1, torch.rand((67, 71, 256)) > 0.5),
+                "bool_3d_dim_neg1": (-1, torch.rand((67, 71, 256)) > 0.5),
+                "bool_4d_dim_2": (2, torch.rand((6, 7, 12, 256)) > 0.5),
+                "fp16_2d_dim_0": (0, cached_randn((67, 256), dtype=torch.float16)),
+                "fp16_2d_dim_1": (1, cached_randn((67, 256), dtype=torch.float16)),
+                "fp16_3d_dim_0": (0, cached_randn((3, 5, 256), dtype=torch.float16)),
+                "fp16_3d_dim_1": (1, cached_randn((67, 71, 256), dtype=torch.float16)),
+                "fp16_3d_dim_neg1": (
+                    -1,
+                    cached_randn((67, 71, 256), dtype=torch.float16),
+                ),
+                "fp16_4d_dim_2": (
+                    2,
+                    cached_randn((6, 7, 12, 256), dtype=torch.float16),
+                ),
+            },
+        },
+        ("test_all_single_dim", "test_reduce_keepdim0_cpu"): {
+            "ops_dict": {"all": torch.all},
+            "param_sets": {
+                "bool_2d_dim_0": (0, torch.rand((67, 256)) > 0.5),
+                "bool_2d_dim_1": (1, torch.rand((67, 256)) > 0.5),
+                "bool_3d_dim_0": (0, torch.rand((3, 5, 256)) > 0.5),
+                "bool_3d_dim_1": (1, torch.rand((67, 71, 256)) > 0.5),
+                "bool_3d_dim_neg1": (-1, torch.rand((67, 71, 256)) > 0.5),
+                "bool_4d_dim_2": (2, torch.rand((6, 7, 12, 256)) > 0.5),
+                "fp16_2d_dim_0": (0, cached_randn((67, 256), dtype=torch.float16)),
+                "fp16_2d_dim_1": (1, cached_randn((67, 256), dtype=torch.float16)),
+                "fp16_3d_dim_0": (0, cached_randn((3, 5, 256), dtype=torch.float16)),
+                "fp16_3d_dim_1": (1, cached_randn((67, 71, 256), dtype=torch.float16)),
+                "fp16_3d_dim_neg1": (
+                    -1,
+                    cached_randn((67, 71, 256), dtype=torch.float16),
+                ),
+                "fp16_4d_dim_2": (
+                    2,
+                    cached_randn((6, 7, 12, 256), dtype=torch.float16),
+                ),
+            },
+        },
+        # torch.any / torch.all: multi-dim reduction
+        ("test_any_multidim", "test_reduce_multidim_keepdim0_cpu"): {
+            "ops_dict": {"any": torch.any},
+            "param_sets": {
+                "bool_2d_dim_01": ((0, 1), torch.rand((67, 256)) > 0.5),
+                "bool_3d_dim_01": ((0, 1), torch.rand((67, 71, 256)) > 0.5),
+                "bool_3d_dim_12": ((1, 2), torch.rand((67, 71, 256)) > 0.5),
+                "bool_3d_dim_012": ((0, 1, 2), torch.rand((67, 71, 256)) > 0.5),
+                "bool_4d_dim_23": ((2, 3), torch.rand((6, 7, 12, 64)) > 0.5),
+                "fp16_2d_dim_01": (
+                    (0, 1),
+                    cached_randn((67, 256), dtype=torch.float16),
+                ),
+                "fp16_3d_dim_01": (
+                    (0, 1),
+                    cached_randn((67, 71, 256), dtype=torch.float16),
+                ),
+                "fp16_3d_dim_12": (
+                    (1, 2),
+                    cached_randn((67, 71, 256), dtype=torch.float16),
+                ),
+                "fp16_3d_dim_012": (
+                    (0, 1, 2),
+                    cached_randn((67, 71, 256), dtype=torch.float16),
+                ),
+                "fp16_4d_dim_23": (
+                    (2, 3),
+                    cached_randn((6, 7, 12, 64), dtype=torch.float16),
+                ),
+            },
+        },
+        ("test_all_multidim", "test_reduce_multidim_keepdim0_cpu"): {
+            "ops_dict": {"all": torch.all},
+            "param_sets": {
+                "bool_2d_dim_01": ((0, 1), torch.rand((67, 256)) > 0.5),
+                "bool_3d_dim_01": ((0, 1), torch.rand((67, 71, 256)) > 0.5),
+                "bool_3d_dim_12": ((1, 2), torch.rand((67, 71, 256)) > 0.5),
+                "bool_3d_dim_012": ((0, 1, 2), torch.rand((67, 71, 256)) > 0.5),
+                "bool_4d_dim_23": ((2, 3), torch.rand((6, 7, 12, 64)) > 0.5),
+                "fp16_2d_dim_01": (
+                    (0, 1),
+                    cached_randn((67, 256), dtype=torch.float16),
+                ),
+                "fp16_3d_dim_01": (
+                    (0, 1),
+                    cached_randn((67, 71, 256), dtype=torch.float16),
+                ),
+                "fp16_3d_dim_12": (
+                    (1, 2),
+                    cached_randn((67, 71, 256), dtype=torch.float16),
+                ),
+                "fp16_3d_dim_012": (
+                    (0, 1, 2),
+                    cached_randn((67, 71, 256), dtype=torch.float16),
+                ),
+                "fp16_4d_dim_23": (
+                    (2, 3),
+                    cached_randn((6, 7, 12, 64), dtype=torch.float16),
+                ),
+            },
+        },
+        # torch.any / torch.all: full reduction (no dim)
+        ("test_any_full", "test_reduce_cpu"): {
+            "ops_dict": {"any": torch.any},
+            "param_sets": {
+                "bool_1d": (torch.rand((256,)) > 0.5,),
+                "bool_2d": (torch.rand((67, 256)) > 0.5,),
+                "bool_3d": (torch.rand((3, 5, 256)) > 0.5,),
+                "fp16_1d": (cached_randn((256,), dtype=torch.float16),),
+                "fp16_2d": (cached_randn((67, 256), dtype=torch.float16),),
+                "fp16_3d": (cached_randn((3, 5, 256), dtype=torch.float16),),
+            },
+        },
+        ("test_all_full", "test_reduce_cpu"): {
+            "ops_dict": {"all": torch.all},
+            "param_sets": {
+                "bool_1d": (torch.rand((256,)) > 0.5,),
+                "bool_2d": (torch.rand((67, 256)) > 0.5,),
+                "bool_3d": (torch.rand((3, 5, 256)) > 0.5,),
+                "fp16_1d": (cached_randn((256,), dtype=torch.float16),),
+                "fp16_2d": (cached_randn((67, 256), dtype=torch.float16),),
+                "fp16_3d": (cached_randn((3, 5, 256), dtype=torch.float16),),
+            },
+        },
     }
 
     def __init__(self, *args, **kwargs):
@@ -5608,6 +5842,20 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 f"{(result.float() - expected).abs().max().item()}"
             )
 
+    def test_storage_offset_placeholder_compiled_only(self, op, slicer, base):
+        # Same as test_storage_offset_placeholder, minus the eager arm: eager
+        # materializes an offset view through spyre::copy_from_d2d, which
+        # rejects any storage_offset that is not a whole number of sticks --
+        # unrelated to whether the offset itself decomposes correctly.
+        cpu_view = slicer(base.clone())
+        expected = op(cpu_view).float()
+
+        dev_view = slicer(base.clone().to("spyre"))
+        result = _compile_and_run(op, [dev_view], "spyre", compile=True)
+        assert torch.allclose(result.float(), expected, atol=0.1, rtol=0.1), (
+            f"max abs diff: {(result.float() - expected).abs().max().item()}"
+        )
+
     def test_storage_offset_placeholder_stick_dim_rejected(self, slicer, base):
         # Stick-dim placeholder offset: alt-layout retargeting not yet
         # implemented (#2750), so compile must raise rather than silently
@@ -5619,22 +5867,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         dev_view = slicer(base.clone().to("spyre"))
 
         with pytest.raises(Exception, match="Unsupported"):
-            _compile_and_run(fn, [dev_view], "spyre", compile=True)
-
-    def test_storage_offset_placeholder_nonstick_row_rejected(self, slicer, base):
-        # Non-stick dim offset whose base row length isn't a multiple of
-        # elem_in_stick: padding-aware device-coordinate construction not
-        # yet implemented, so compile must raise rather than silently
-        # miscompute. No eager arm: compile=False skips the Inductor pass
-        # entirely, so it can't exercise this check.
-        def fn(x):
-            return x + x
-
-        dev_view = slicer(base.clone().to("spyre"))
-
-        with pytest.raises(
-            Exception, match="non-stick-aligned device stick coordinate"
-        ):
             _compile_and_run(fn, [dev_view], "spyre", compile=True)
 
     def test_storage_offset_placeholder_vs_internal_equivalence(self):
@@ -6107,6 +6339,49 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "spyre",
             )
 
+    def test_keep_by_index_cpu(self, x, k: int, dim: int, fill_value: float):
+        _, indices = torch.topk(x, k, dim=dim, largest=True)
+
+        def fn(x, indices):
+            return torch.ops.spyre.keep_by_index(x, indices, dim, fill_value)
+
+        compiled_fn = torch.compile(fn)
+        result_spyre = compiled_fn(
+            x.to("spyre"), indices.to(torch.float16).to("spyre")
+        ).cpu()
+        expected = fn(x, indices)
+
+        torch.testing.assert_close(result_spyre, expected, atol=0.1, rtol=0.1)
+
+    def test_keep_by_index_moe_router(self):
+        """Repro: keep_by_index router mask -> SpyreReduction stick clash.
+
+        Isolates the blocker from Gemma-4 MoE prefill router with keep_by_index.
+        The reduction on k-dimension needs to find the indices read (which has k)
+        instead of the values read to encode splits correctly.
+        Real shapes: T=64 tokens, E=128 experts, K=8 top-K.
+        """
+        T, E, K = 64, 128, 8
+
+        def keep_by_index_tail(probs, sel):
+            mask = torch.ops.spyre.keep_by_index(probs, sel, -1, 0.0)
+            return mask / mask.sum(-1, keepdim=True)
+
+        probs = torch.rand(T, E, dtype=torch.float16)
+        sel = (torch.rand(T, K) * E).floor().to(torch.float16)
+
+        probs_dev = probs.to("spyre")
+        sel_dev = sel.to("spyre")
+
+        out = torch.compile(keep_by_index_tail, dynamic=False)(probs_dev, sel_dev)
+        out_c = out.cpu()
+
+        ref_mask = torch.ops.spyre.keep_by_index(probs, sel, -1, 0.0)
+        ref = ref_mask / ref_mask.sum(-1, keepdim=True)
+
+        assert out.shape == (T, E)
+        torch.testing.assert_close(out_c.float(), ref.float(), atol=1e-2, rtol=1e-2)
+
     def test_min_tuple_output_keepdim0(self):
         x = unique_randn_along_dim((5, 7), dim=1)
         self.compare_with_cpu(
@@ -6218,48 +6493,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             dtype=torch.float32,
         )
         self.compare_with_cpu(lambda x: torch.nansum(x), x, run_eager=False)
-
-    @pytest.mark.xfail(
-        reason=(
-            "Spyre compiled backend does not support torch.all yet (stable "
-            "error signature: InductorError: AttributeError: "
-            "'UnimplementedOp' object has no attribute 'iteration_space')"
-        ),
-        strict=True,
-    )
-    def test_all_dim0_known_xfail(self):
-        x = torch.tensor(
-            [
-                [True, False, True, False],
-                [True, True, False, False],
-                [False, True, True, False],
-            ],
-            dtype=torch.bool,
-        )
-        self.compare_with_cpu(
-            lambda x: torch.all(x, dim=0, keepdim=False), x, run_eager=False
-        )
-
-    @pytest.mark.xfail(
-        reason=(
-            "Spyre compiled backend does not support torch.any yet (stable "
-            "error signature: InductorError: AttributeError: "
-            "'UnimplementedOp' object has no attribute 'iteration_space')"
-        ),
-        strict=True,
-    )
-    def test_any_dim0_known_xfail(self):
-        x = torch.tensor(
-            [
-                [True, False, True, False],
-                [True, True, False, False],
-                [False, True, True, False],
-            ],
-            dtype=torch.bool,
-        )
-        self.compare_with_cpu(
-            lambda x: torch.any(x, dim=0, keepdim=False), x, run_eager=False
-        )
 
     @pytest.mark.xfail(
         reason=(
@@ -6774,6 +7007,29 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
         self.compare_with_cpu(fn, needs_device=True, cpu_compile=False)
 
+    def test_full_bfloat16_cpu(self):
+        """Compiled BF16 ``full`` stays in native Spyre lowering."""
+
+        def fn():
+            return torch.full(
+                (4, 64), 1.5, dtype=torch.bfloat16, device=utils_inductor.DEVICE
+            )
+
+        with fresh_inductor_cache():
+            actual, source_codes = run_and_get_code(torch.compile(fn, dynamic=False))
+        self.assertEqual(actual.dtype, torch.bfloat16)
+        torch.testing.assert_close(
+            actual.cpu(), torch.full((4, 64), 1.5, dtype=torch.bfloat16)
+        )
+        generated = "\n".join(source_codes)
+        self.assertIn("async_compile.sdsc(", generated)
+        self.assertFalse(
+            any(
+                " = torch.ops.aten.full.default(" in line
+                for line in generated.splitlines()
+            )
+        )
+
     def test_dim_op_cpu(self, op, dim, *args):
         def fn(*args):
             return op(dim, *args)
@@ -7119,6 +7375,153 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         cosine = F.cosine_similarity(actual, expected, dim=0).item()
         assert torch.isfinite(actual).all() and cosine >= 0.99, (
             f"cosine={cosine:.8f} max_abs={(actual - expected).abs().max().item():.8f}"
+        )
+
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+    def test_sdpa_bf16_gqa_decode_heads_inner_query(self):
+        """Decode SDPA must correctly consume a physically heads-inner query."""
+        num_heads, num_kv_heads, head_dim = 16, 1, 512
+        generator = torch.Generator().manual_seed(1337)
+        query = (
+            torch.randn(
+                (1, num_heads, 1, head_dim),
+                dtype=torch.bfloat16,
+                generator=generator,
+            )
+            * 0.1
+        )
+        key = (
+            torch.randn(
+                (1, num_kv_heads, 64, head_dim),
+                dtype=torch.bfloat16,
+                generator=generator,
+            )
+            * 0.1
+        )
+        value = (
+            torch.randn(
+                (1, num_kv_heads, 64, head_dim),
+                dtype=torch.bfloat16,
+                generator=generator,
+            )
+            * 0.1
+        )
+        mask = torch.zeros((1, 1, 1, 64), dtype=torch.bfloat16)
+
+        def fn(query, key, value, mask):
+            return F.scaled_dot_product_attention(
+                query,
+                key,
+                value,
+                attn_mask=mask,
+                dropout_p=0.0,
+                scale=1 / head_dim**0.5,
+                enable_gqa=True,
+            )
+
+        # This is the exact device tiling emitted for Gemma's in-graph RoPE
+        # query at decode: logical [B, H, 1, D], but heads nested after the
+        # stick axis.  Construct it explicitly so the regression does not
+        # depend on hash-sensitive LX allocation decisions.
+        layout_type = sys.modules["torch_spyre._C"].SpyreTensorLayout
+        heads_inner = layout_type(
+            list(query.size()),
+            list(query.stride()),
+            query.dtype,
+            [1, 0, 2, 3],
+        )
+        assert list(heads_inner.device_size) == [1, 1, 8, num_heads, 64]
+        query_spyre = query.to("spyre", device_layout=heads_inner)
+
+        with fresh_inductor_cache():
+            actual = torch.compile(fn, dynamic=False)(
+                query_spyre,
+                key.to("spyre"),
+                value.to("spyre"),
+                mask.to("spyre"),
+            ).cpu()
+
+        expected = fn(query, key, value, mask)
+        cosine = F.cosine_similarity(
+            actual.float().flatten(), expected.float().flatten(), dim=0
+        ).item()
+        assert torch.isfinite(actual).all() and cosine >= 0.99, (
+            f"cosine={cosine:.8f} "
+            f"max_abs={(actual.float() - expected.float()).abs().max().item():.8f}"
+        )
+
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+    def test_sdpa_bf16_gqa_decode_with_in_graph_rope_query(self):
+        """An LX-resident RoPE result must retain its ownership into SDPA."""
+        num_heads, num_kv_heads, head_dim = 16, 1, 512
+        generator = torch.Generator().manual_seed(1337)
+        query = (
+            torch.randn(
+                (1, num_heads, 1, head_dim),
+                dtype=torch.bfloat16,
+                generator=generator,
+            )
+            * 0.1
+        )
+        key = (
+            torch.randn(
+                (1, num_kv_heads, 128, head_dim),
+                dtype=torch.bfloat16,
+                generator=generator,
+            )
+            * 0.1
+        )
+        value = (
+            torch.randn(
+                (1, num_kv_heads, 128, head_dim),
+                dtype=torch.bfloat16,
+                generator=generator,
+            )
+            * 0.1
+        )
+        mask = torch.zeros((1, 1, 1, 128), dtype=torch.bfloat16)
+        freqs = torch.zeros((1, 1, 2, 2, head_dim // 2), dtype=torch.bfloat16)
+        freqs[:, :, 0, 0, :] = 1
+        freqs[:, :, 1, 1, :] = 1
+
+        def fn(query, key, value, mask, freqs):
+            batch, heads, length, dim = query.shape
+            query_pairs = query.transpose(1, 2).reshape(
+                batch, length, heads, 2, dim // 2
+            )
+            query = (
+                freqs[:, :, None, :, :, :]
+                .mul(query_pairs.unsqueeze(-3))
+                .sum(4, keepdim=True)
+                .flatten(3)
+                .transpose(1, 2)
+            )
+            return F.scaled_dot_product_attention(
+                query,
+                key,
+                value,
+                attn_mask=mask,
+                dropout_p=0.0,
+                scale=1.0,
+                enable_gqa=True,
+            )
+
+        expected = fn(query, key, value, mask, freqs)
+        with fresh_inductor_cache():
+            actual = torch.compile(fn, dynamic=False)(
+                query.to("spyre"),
+                key.to("spyre"),
+                value.to("spyre"),
+                mask.to("spyre"),
+                freqs.to("spyre"),
+            ).cpu()
+
+        cosine = F.cosine_similarity(
+            actual.float().flatten(), expected.float().flatten(), dim=0
+        ).item()
+        assert torch.isfinite(actual).all() and cosine >= 0.99, (
+            f"cosine={cosine:.8f} "
+            f"max_abs={(actual.float() - expected.float()).abs().max().item():.8f}"
         )
 
     @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
@@ -7655,6 +8058,16 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
         x = torch.randint(0, 2, (64,), dtype=torch.bool)
         self.compare_with_cpu(fn, x, cpu_compile=False, run_eager=False)
+
+    def test_bool_staggered_ea_src_to_fp16_cpu(self):
+        # Both operands upcast in-graph, so the bool carries a DL16_TO_FP32 EA
+        # as well as IEEE_FP32; casting back to fp16 must de-stagger it.
+        def fn(x, y):
+            return (x.to(torch.float32) > y.to(torch.float32)).to(torch.float16)
+
+        x = cached_randn((64,), dtype=torch.float16)
+        y = cached_randn((64,), dtype=torch.float16)
+        self.compare_with_cpu(fn, x, y, cpu_compile=False, run_eager=False)
 
     def test_avg_pool2d_base(self, op, x):
         # Spyre stores C as the stick (innermost) dim, so the op must see a

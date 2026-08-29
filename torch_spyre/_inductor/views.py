@@ -133,12 +133,58 @@ def _concretize_for_cmp(expr):
     return int(expr)
 
 
+def _decompose_constant_offset(
+    offset: sympy.Expr,
+    size: Sequence[sympy.Expr],
+    stride: Sequence[sympy.Expr],
+    coordinates: list[sympy.Expr],
+) -> bool:
+    """Attribute a constant storage offset to device coordinates positionally.
+
+    A storage offset is a fixed host-flat position, i.e. a mixed-radix number in
+    the layout's strides.  We peel it greedily from the largest stride down
+    (``digit = remaining // stride[d]``), so a whole-dimension offset lands
+    entirely on that dimension.  This is unlike ``add_term``'s per-dim modular
+    split, which assumes the strides form a clean nested radix
+    (``stride[outer] == stride[inner] * size[inner]``).  A padded layout breaks
+    that assumption -- e.g. an fp16 base whose row width is not a multiple of the
+    64-element stick has row stride 100 but a stick pair spanning 128, so the
+    modular split leaks ``offset % 64`` onto the stick coordinate.  Positional
+    peeling keeps the stick coordinate offset-free.
+
+    Mutates ``coordinates`` in place and returns True on success.  Returns False
+    without touching ``coordinates`` if the offset cannot be fully peeled (never
+    expected for a valid host position), so the caller can fall back to
+    ``add_term``.
+    """
+    n = len(size)
+    dims = sorted(
+        (d for d in range(n) if size[d] > 1 and stride[d] > 0),
+        key=lambda d: stride[d],
+        reverse=True,
+    )
+    remaining = offset
+    digits: list[tuple[int, sympy.Expr]] = []
+    for d in dims:
+        if remaining < stride[d]:
+            continue
+        digit = remaining // stride[d]
+        digits.append((d, digit))
+        remaining -= digit * stride[d]
+    if remaining != 0:
+        return False
+    for d, digit in digits:
+        coordinates[d] += digit
+    return True
+
+
 def compute_coordinates(
     size: Sequence[sympy.Expr],
     stride: Sequence[sympy.Expr],
     var_ranges: dict[sympy.Symbol, sympy.Expr],
     index: sympy.Expr,
     indirect_sizes: "dict[sympy.Symbol, int] | None" = None,
+    repeat_info_out: "dict[sympy.Symbol, dict] | None" = None,
 ) -> list[sympy.Expr]:
     """
     Compute an array of coordinate expressions from an index expression.
@@ -166,10 +212,8 @@ def compute_coordinates(
     # Convert ModularIndexing expressions to sympy.Mod before processing
     index = convert_modular_indexing(index)
     repeat_info = find_repeat_vars([index], var_ranges)
-    if not hasattr(V.graph, "_repeat_info"):
-        V.graph._repeat_info = dict(repeat_info)
-    else:
-        V.graph._repeat_info.update(repeat_info)
+    if repeat_info_out is not None:
+        repeat_info_out.update(repeat_info)
 
     # find stride immediately strictly larger that dim stride
     n = len(size)
@@ -242,7 +286,15 @@ def compute_coordinates(
     offset = index.xreplace({v: 0 for v in vars})
     if offset > 0:
         index = index - offset
-        add_term(var=offset, step=sympy.S.One, limit=sympy.oo)
+        # A concrete offset is decomposed positionally so a padded layout does
+        # not leak a modular residual onto the stick coordinate (see
+        # _decompose_constant_offset).  Symbolic offsets, or an offset that
+        # cannot be fully peeled, fall back to add_term's original behavior.
+        handled = not offset.free_symbols and _decompose_constant_offset(
+            offset, size, stride, coordinates
+        )
+        if not handled:
+            add_term(var=offset, step=sympy.S.One, limit=sympy.oo)
 
     for var in vars:
         # Skip symbols that are not loop variables (e.g. size symbols
@@ -373,6 +425,7 @@ def normalize_coordinates(
     coordinates: Sequence[sympy.Expr],
     synthetic_var_fn: Callable[[], sympy.Symbol],
     indirect_sizes: "dict[sympy.Symbol, int] | None" = None,
+    compare_value: Callable[[sympy.Expr], int | float] = _concretize_for_cmp,
 ) -> list[Term]:
     """
     Normalize coordinate expressions obtained from compute_coordinates.
@@ -463,8 +516,8 @@ def normalize_coordinates(
         # when num is equal
         dim_terms.sort(
             key=lambda t: (
-                _concretize_for_cmp(t.num),
-                _concretize_for_cmp(t.mod),
+                compare_value(t.num),
+                compare_value(t.mod),
             )
         )
 
@@ -562,17 +615,79 @@ def normalize_coordinates(
     return fused_terms
 
 
-def align_tensors(
+@dataclass(frozen=True)
+class AlignmentInputs:
+    """Everything tensor alignment needs, captured without hidden graph state."""
+
+    iteration_space: dict[sympy.Symbol, tuple[sympy.Expr, int]]
+    tensors: list[dict[str, list[sympy.Expr]]]
+    indirect_sizes: dict[sympy.Symbol, int] | None
+    repeat_info: dict[sympy.Symbol, dict]
+    concrete_ranges: dict[sympy.Symbol, int | float]
+    restored_ranges: dict[sympy.Symbol, sympy.Expr | int | float]
+
+
+def build_alignment_inputs(
     iteration_space: Dict[sympy.Symbol, Tuple[sympy.Expr, int]],
     tensors: list[Dict[str, list[sympy.Expr]]],
     indirect_sizes: "dict[sympy.Symbol, int] | None" = None,
+    repeat_info: "dict[sympy.Symbol, dict] | None" = None,
+) -> AlignmentInputs:
+    """Snapshot explicit inputs for a repeatable, side-effect-free alignment."""
+
+    from .pass_utils import finite_upper_or_none
+
+    concrete_ranges = {
+        var: _concretize_for_cmp(value) for var, (value, _) in iteration_space.items()
+    }
+    restored_ranges: dict[sympy.Symbol, sympy.Expr | int | float] = {}
+    for var, (value, _) in iteration_space.items():
+        if (
+            hasattr(value, "free_symbols")
+            and value.free_symbols
+            and finite_upper_or_none(value) is None
+        ):
+            restored_ranges[var] = concrete_ranges[var]
+        else:
+            restored_ranges[var] = value
+
+    return AlignmentInputs(
+        iteration_space=dict(iteration_space),
+        tensors=[
+            {
+                "size": list(tensor["size"]),
+                "coordinates": list(tensor["coordinates"]),
+            }
+            for tensor in tensors
+        ],
+        indirect_sizes=dict(indirect_sizes) if indirect_sizes is not None else None,
+        repeat_info={
+            symbol: dict(info) for symbol, info in (repeat_info or {}).items()
+        },
+        concrete_ranges=concrete_ranges,
+        restored_ranges=restored_ranges,
+    )
+
+
+def _concrete_alignment_value(expr: sympy.Expr) -> int | float:
+    if hasattr(expr, "free_symbols") and expr.free_symbols:
+        raise Unsupported(f"alignment input is not concrete: {expr}")
+    if expr == sympy.oo:
+        return math.inf
+    if expr == -sympy.oo:
+        return -math.inf
+    return int(expr)
+
+
+def align_tensors_pure(
+    inputs: AlignmentInputs,
 ) -> tuple[
     dict[sympy.Symbol, tuple[sympy.Expr, int]],
     list[dict[str, list]],
     dict[sympy.Symbol, tuple[tuple[sympy.Symbol, int], ...]],
 ]:
     """
-    Transform op iteration space and tensor arguments to satisfy codegen requirements.
+    Transform tensor coordinates using only the supplied immutable snapshot.
     """
 
     # Concretize range values for the algorithm: align_tensors performs
@@ -580,33 +695,11 @@ def align_tensors(
     # Coordinate *expressions* remain symbolic (they reference loop variable
     # Symbols, not range values).
 
-    # Save original (possibly symbolic) range expressions before concretizing.
-    # The algorithm below requires concrete ints for sorting and integer division,
-    # but we must propagate symbolic expressions forward so downstream passes
-    # (work_division, SDSC codegen) see the symbols to extract fields, not hints.
-    orig_ranges = {var: val[0] for var, val in iteration_space.items()}
-    # local import: pass_utils imports compute_coordinates/matching_dim from
-    # this module, so importing at module scope would create a cycle.
-    from .pass_utils import finite_upper_or_none
-
-    def _bounded_or_hint(expr, hint):
-        """Return ``expr`` unless it's an unbounded symbolic expression.
-
-        Auto-dynamic symbols (Dynamo promoting an int on retrace, with no
-        finite max and are not symbolic dims ) carry no bound downstream passes
-        (work_division, SDSC codegen) can size buffers/loops with. Fall back to
-        the concretized ``hint`` instead of propagating an unbounded symbol.
-        """
-        if hasattr(expr, "free_symbols") and expr.free_symbols:
-            if finite_upper_or_none(expr) is None:
-                return hint
-        return expr
-
-    repeat_info: dict = getattr(V.graph, "_repeat_info", {})
-
-    var_ranges = {
-        var: _concretize_for_cmp(val[0]) for var, val in iteration_space.items()
-    }
+    iteration_space = inputs.iteration_space
+    tensors = inputs.tensors
+    indirect_sizes = inputs.indirect_sizes
+    repeat_info = inputs.repeat_info
+    var_ranges = dict(inputs.concrete_ranges)
 
     # work division for each variable
     op_it_space_splits = {var: val[1] for var, val in iteration_space.items()}
@@ -638,6 +731,7 @@ def align_tensors(
             tensor["coordinates"],
             synthetic_var,
             indirect_sizes,
+            _concrete_alignment_value,
         )
         stick_dim.append(terms[-1].var)
         stick_size.append(terms[-1].dim_size)
@@ -673,9 +767,6 @@ def align_tensors(
                 ):
                     # add mod to splits unless stick dim and stick size
                     splits[var].add(mod)
-
-    if hasattr(V.graph, "_repeat_info"):
-        V.graph._repeat_info.clear()
 
     # Insert restored size-1 dimensions with offset/gap to the other tensors
     for var in new_vars:
@@ -730,9 +821,7 @@ def align_tensors(
             # Synthetic vars (z0, z1, …) are introduced by normalize_coordinates
             # for restored size-1 dims and are not in orig_ranges; fall back to
             # the concretized value (always 1) for those.
-            new_var_ranges[var] = _bounded_or_hint(
-                orig_ranges.get(var, var_ranges[var]), var_ranges[var]
-            )
+            new_var_ranges[var] = inputs.restored_ranges.get(var, var_ranges[var])
             # var can be a loop var or an indirect symbol
             if var in var_ranges:
                 new_var_ranges[var] = var_ranges[var]
@@ -850,10 +939,10 @@ def align_tensors(
     # bound, so fall back to the concretized size-hint instead of
     # propagating an unbounded symbol. See work_division.py's symbol_meta
     # for the same distinction.
-    for var, orig_expr in orig_ranges.items():
+    for var, restored_expr in inputs.restored_ranges.items():
         if var not in new_var_ranges or new_var_ranges[var] != var_ranges[var]:
             continue
-        new_var_ranges[var] = _bounded_or_hint(orig_expr, var_ranges[var])
+        new_var_ranges[var] = restored_expr
 
     # Iteration space should only contain loop variables, not indirect symbols.
     # Filter out any indirect symbols that were added during normalization.
@@ -865,6 +954,23 @@ def align_tensors(
     }
 
     return new_iteration_space, new_tensors, work_division_remap
+
+
+def align_tensors(
+    iteration_space: Dict[sympy.Symbol, Tuple[sympy.Expr, int]],
+    tensors: list[Dict[str, list[sympy.Expr]]],
+    indirect_sizes: "dict[sympy.Symbol, int] | None" = None,
+    repeat_info: "dict[sympy.Symbol, dict] | None" = None,
+) -> tuple[
+    dict[sympy.Symbol, tuple[sympy.Expr, int]],
+    list[dict[str, list]],
+    dict[sympy.Symbol, tuple[tuple[sympy.Symbol, int], ...]],
+]:
+    """Build explicit alignment inputs, then run the pure implementation."""
+
+    return align_tensors_pure(
+        build_alignment_inputs(iteration_space, tensors, indirect_sizes, repeat_info)
+    )
 
 
 def tiling_expr_to_device_expr(

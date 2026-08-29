@@ -44,8 +44,8 @@ from torch_spyre._inductor.constants import (
     POOL_OPS,
     RESTICKIFY_OP,
     TOPK_OPS,
+    KEEP_BY_INDEX_OP,
 )
-from torch_spyre._inductor.core_mapping import core_to_slice_mapping
 from torch_spyre._inductor.dtype_ops import DtypeOpTable
 from torch_spyre._inductor.indirect_access import (
     compute_indirect_max_dim_sizes,
@@ -530,6 +530,10 @@ def _is_conv(op: str) -> bool:
 
 def _is_depthwise_conv(op: str) -> bool:
     return op == DEPTHWISE_CONV2D_OP
+
+
+def _is_keep_by_index(op: str) -> bool:
+    return op == KEEP_BY_INDEX_OP
 
 
 # Canonical avgpool iteration-space order (NHWC) -> SDSC labels.  Codegen owns
@@ -1283,7 +1287,12 @@ def _create_sdsc_tensors(
         reduced_dims: list = []
 
         # Step 2: Handle reduced dimensions — skip for index tensors.
-        if use_op_dims and dim_order != dims and not _is_topk(op_spec.op):
+        if (
+            use_op_dims
+            and dim_order != dims
+            and not _is_topk(op_spec.op)
+            and not _is_keep_by_index(op_spec.op)
+        ):
             if not (has_indirect_access and i in index_tensor_indices):
                 reduced_dims = [
                     d for d in op_dim_order if d not in dim_order and d is not mb_sym
@@ -1550,6 +1559,7 @@ def _get_op_func(op: str, is_reduction: bool, output_scales: dict) -> str:
         and not _is_topk(op)
         and not _is_conv(op)
         and -2 not in output_scales.values()
+        and not _is_keep_by_index(op)
     ):
         return op + "nonstick"
     return op
@@ -1758,6 +1768,7 @@ def _finalize_tensor_work_divisions(
     operation_work_division = TensorWorkDivision(
         {dim: work_slices[dim] for dim in mapping_dims},
         {dim: core_map[dim] for dim in mapping_dims},
+        num_cores=num_cores,
     )
     assert is_lx_relayout or all(arg.work_division is None for arg in args), (
         "per-tensor ownership is supported only for LX relayout identities"
@@ -1775,11 +1786,20 @@ def _finalize_tensor_work_divisions(
                     dim: override.core_id_to_work_slice.get(dim, Integer(0))
                     for dim in mapping_dims
                 },
+                num_cores=override.num_cores or num_cores,
             )
         )
-        if math.prod(effective.work_slices.values()) != num_cores:
+        tensor_cores = effective.num_cores or num_cores
+        tensor_owners = math.prod(effective.work_slices.values())
+        valid = (
+            tensor_cores == num_cores == tensor_owners
+            if not is_lx_relayout
+            else num_cores % tensor_cores == 0 and tensor_cores % tensor_owners == 0
+        )
+        if not valid:
             raise ValueError(
-                f"tensor ownership uses {effective.work_slices}, expected {num_cores} cores"
+                f"tensor ownership uses {tensor_owners} slices across "
+                f"{tensor_cores} of {num_cores} operation cores"
             )
         arg.work_division = effective
 
@@ -1883,6 +1903,12 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
     work_slices = {
         symbol_mapping[sym]: wk_slice
         for sym, (_, wk_slice) in op_spec.iteration_space.items()
+    }
+    if op_spec.core_id_to_work_slice is None:
+        raise ValueError("OpSpec is missing its finalized core mapping")
+    core_id_to_work_slice = {
+        symbol_mapping[sym]: expression
+        for sym, expression in op_spec.core_id_to_work_slice.items()
     }
 
     # Inject implicit kernel dimensions for conv2d when kernel_size=1. This is
@@ -2134,9 +2160,10 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
                 if dev_dim_size < padded_it_size:
                     sdsc_arg.backGap[dim_sym] = padded_it_size - dev_dim_size
         for dim in padding:
-            dim_splits[dim] = 1
-            work_slices[dim] = 1
-        num_cores = math.prod(dim_splits.values())
+            if dim_splits[dim] != 1:
+                raise ValueError(
+                    f"restickify padding dimension {dim} must be unsplit before codegen"
+                )
 
     conv_params = (
         dict(op_spec.op_info.get("conv_params", {})) if op_spec.op_info else {}
@@ -2170,15 +2197,18 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
     if _is_topk(op_spec.op):
         num_inputs = 1  # topk has exactly 1 input tensor and 1 output tensor
 
+    if _is_keep_by_index(op_spec.op):
+        num_inputs = 2  # keep_by_index has exactly 2 input tensors (values, indices)
+
     if is_pool:
         num_inputs = 1  # avgpool has exactly 1 input tensor and 1 output tensor
         # The pool hardware accumulates the full kernel window on each core.
         # Splitting ki/kj across cores produces partial sums, giving wrong results.
         for _k_sym in (Symbol("ki"), Symbol("kj")):
-            if _k_sym in dim_splits:
-                dim_splits[_k_sym] = 1
-                work_slices[_k_sym] = 1
-        num_cores = math.prod(dim_splits.values())
+            if dim_splits.get(_k_sym, 1) != 1:
+                raise ValueError(
+                    f"pool kernel dimension {_k_sym} must be unsplit before codegen"
+                )
 
     if is_conv:
         # Both conv paths accumulate the full kernel window per core; splitting
@@ -2186,9 +2216,10 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
         # reduction MAY be core-split (matmul K via psum), so it is left to the
         # default work division.
         for _k_sym in (Symbol("ki"), Symbol("kj")):
-            if _k_sym in dim_splits:
-                dim_splits[_k_sym] = 1
-                work_slices[_k_sym] = 1
+            if dim_splits.get(_k_sym, 1) != 1:
+                raise ValueError(
+                    f"convolution kernel dimension {_k_sym} must be unsplit before codegen"
+                )
 
         if _spyre_config.disable_conv2d_spatial_split:
             # Strided convs cannot split the output spatial dims (i/j): a strided
@@ -2214,8 +2245,6 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
                             f"ways; expected work division to block it unless the "
                             f"memory-span limit required the split."
                         )
-        num_cores = math.prod(dim_splits.values())
-
     # Pool-specific SDSC field values (#3510).  Empty for non-pool ops.
     pool_sdsc_fields = (
         _avgpool_sdsc_fields(sdsc_iteration_space, pool_params_out) if is_pool else {}
@@ -2232,24 +2261,20 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
     else:
         window_sdsc_fields = {}
 
-    # Project dim_splits into final SDSC iteration-space order; normalization
-    # can add unit axes to either mapping independently.
+    # Unit dimensions may be injected while translating the completed OpSpec
+    # into backend labels. They are unsplit and therefore owned at slice zero.
+    # Every non-unit dimension must already have a final assignment.
     mapping_dims = tuple(sdsc_iteration_space)
-    mapping_splits = tuple(int(dim_splits[dim]) for dim in mapping_dims)
-    # Generic reductions do not yet define the same physical cohort contract as
-    # matmul partial sums.
-    contiguous_dim = (
-        len(mapping_splits) - 1
-        if is_matmul and _spyre_config.core_id_k_fast_emission
-        else None
-    )
-    # TODO: Choose the mapping before LX planning and pass it through to codegen.
-    core_id_to_work_slice = core_to_slice_mapping(
-        mapping_dims,
-        mapping_splits,
-        num_cores,
-        contiguous_dim=contiguous_dim,
-    )
+    if is_relayout:
+        num_cores = max(
+            num_cores,
+            *(arg.work_division.num_cores or 1 for arg in args if arg.work_division),
+        )
+    for dim in mapping_dims:
+        if dim not in core_id_to_work_slice:
+            if int(dim_splits[dim]) != 1:
+                raise ValueError(f"final core mapping is missing split dimension {dim}")
+            core_id_to_work_slice[dim] = Integer(0)
     _finalize_tensor_work_divisions(
         args,
         mapping_dims,

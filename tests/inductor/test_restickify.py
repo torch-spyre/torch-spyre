@@ -595,6 +595,172 @@ def test_bmm_with_inplace_mutation():
     _compare(func, x, weight, cache)
 
 
+def test_mutation_target_multi_candidate_layout():
+    """Issue #3845: a mutation op and its target can diverge on device layout in
+    the beam search.  ``c = a + b`` is an ordinary ComputedBuffer with two
+    genuine candidate STLs (row-stick vs. column-stick, since 128x256 is
+    non-square); ``copy_forced(d, c)`` then mutates it.  Unlike the
+    SpyreEmptyFallback accumulator case above (test_bmm_with_inplace_mutation,
+    where the target starts as a fresh torch.zeros() buffer and already has
+    working multi-candidate coupling), the mutation op here has no genuine
+    MemoryDep read-edge to its target at all -- propagate_layouts synthesizes
+    a coupling edge from the target's own write MemoryDep so the beam search
+    can price the constraint that this op's output STL must match whatever
+    the target eventually commits to.  This reproducer is independent of
+    coarse_tiling and spyre_hint, isolating the root propagate_layouts gap.
+    """
+    M, N = 128, 256
+    a = torch.randn((M, N), dtype=torch.float16) * 0.01
+    b = torch.randn((M, N), dtype=torch.float16) * 0.01
+    d = torch.randn((M, N), dtype=torch.float16) * 0.01
+
+    def fn(a, b, d):
+        c = a + b
+        torch.ops.spyre.copy_forced(d, c)
+        return c
+
+    _compare(fn, a, b, d)
+
+
+def test_mutation_target_restick_on_src_not_target():
+    # d is (N, M) so d.t() is (M, N) col-major — a different layout than c = a+b
+    # (row-major).  The restickify must land on d.t() (src), not on c (the mutation
+    # target).  validate_no_restickify_on_mutation_targets is wired into passes.py by
+    # this PR and fires during compilation if the target is incorrectly restickified.
+    M, N = 128, 256
+    a = torch.randn((M, N), dtype=torch.float16) * 0.01
+    b = torch.randn((M, N), dtype=torch.float16) * 0.01
+    d = torch.randn((N, M), dtype=torch.float16) * 0.01
+
+    def fn(a, b, d):
+        c = a + b
+        torch.ops.spyre.copy_forced(d.t(), c)
+        return c
+
+    _compare(fn, a, b, d, optimal_cost=M * N)
+
+
+def test_two_mutations_same_target_copy_f():
+    # Two copy_forced calls writing the same SpyreEmptyFallback with conflicting
+    # input layouts.  The optimizer must assign both mutation ops the same output
+    # STL so the backend sees a consistent layout for acc.
+    M, N = 128, 256
+    a = torch.randn((N, M), dtype=torch.float16) * 0.01  # a.t() is MxN col-stick
+    b = torch.randn((M, N), dtype=torch.float16) * 0.01  # MxN row-stick
+
+    def fn(a, b):
+        acc = torch.ops.spyre.empty([M, N], device=a.device, dtype=a.dtype)
+        torch.ops.spyre.copy_forced(a.t() + a.t(), acc)
+        torch.ops.spyre.copy_forced(b + b, acc)
+        return acc
+
+    result = _compile_and_run(fn, (a.to(DEVICE), b.to(DEVICE)), DEVICE).cpu()
+    expected = b + b
+    assert torch.allclose(result, expected, atol=1e-2), (
+        f"max_diff={(result - expected).abs().max().item():.4f}"
+    )
+
+
+def test_two_mutations_same_target_copy_():
+    # Same as test_two_mutations_same_target_copy_f but using PyTorch copy_()
+    # instead of spyre.copy_forced.  The mutation target is a graph-input tensor,
+    # so both ops must commit the same STL for acc.
+    M, N = 128, 256
+    a = torch.randn((N, M), dtype=torch.float16) * 0.01  # a.t() is MxN col-stick
+    b = torch.randn((M, N), dtype=torch.float16) * 0.01  # MxN row-stick
+    acc = torch.zeros((M, N), dtype=torch.float16)
+
+    def fn(a, b, acc):
+        acc.copy_(a.t() + a.t())
+        acc.copy_(b + b)
+        return acc
+
+    _compare(fn, a, b, acc)
+
+
+def test_two_mutations_read_between_writes_minimal_copy_f():
+    # Minimal write/read/write: write acc, read acc into snapshot, write acc again,
+    # return snapshot.  Both mutation ops must commit the same STL for acc.
+    M, N = 128, 256
+    a = torch.randn((N, M), dtype=torch.float16) * 0.01
+    b = torch.randn((M, N), dtype=torch.float16) * 0.01
+
+    def fn(a, b):
+        acc = torch.ops.spyre.empty([M, N], device=a.device, dtype=a.dtype)
+        torch.ops.spyre.copy_forced(a.t(), acc)  # write 1: col-stick
+        snapshot = acc * b  # READ acc
+        torch.ops.spyre.copy_forced(b, acc)  # write 2: row-stick
+        return snapshot
+
+    result = _compile_and_run(fn, (a.to(DEVICE), b.to(DEVICE)), DEVICE).cpu()
+    expected = a.t().contiguous() * b
+    assert torch.allclose(result, expected, atol=1e-2), (
+        f"max_diff={(result - expected).abs().max().item():.4f}"
+    )
+
+
+def test_two_mutations_read_between_writes_minimal_copy_():
+    # Same as test_two_mutations_read_between_writes_minimal_copy_f but using copy_().
+    M, N = 128, 256
+    a = torch.randn((N, M), dtype=torch.float16) * 0.01
+    b = torch.randn((M, N), dtype=torch.float16) * 0.01
+    acc = torch.zeros((M, N), dtype=torch.float16)
+
+    def fn(a, b, acc):
+        acc.copy_(a.t())  # write 1: col-stick
+        snapshot = acc * b  # READ acc
+        acc.copy_(b)  # write 2: row-stick
+        return snapshot
+
+    _compare(fn, a, b, acc)
+
+
+@pytest.mark.skip(
+    reason="crashes in _clone_layout (propagate_layouts) before the conflicting-layout "
+    "assert fires: `return snapshot * acc` forces a flat 1D clone of acc (size=[32768]) "
+    "between the two writes; device_coordinates on the col-stick acc via that flat index "
+    "produces the unsupported stick expr floor((Mod(d0,16384))/256). Issue #4093"
+)
+def test_two_mutations_read_between_writes_v2_copy_f():
+    # write / read / write returning snapshot * acc (both outputs live).
+    # Skipped: `return snapshot * acc` forces a flat 1D clone of acc between the
+    # two writes; device_coordinates on the col-stick acc via that flat index
+    # produces an unsupported stick expression in _clone_layout.
+    M, N = 128, 256
+    a = torch.randn((N, M), dtype=torch.float16) * 0.01  # a.t() is MxN col-stick
+    b = torch.randn((M, N), dtype=torch.float16) * 0.01  # MxN row-stick
+
+    def fn(a, b):
+        acc = torch.ops.spyre.empty([M, N], device=a.device, dtype=a.dtype)
+        torch.ops.spyre.copy_forced(a.t() + a.t(), acc)  # write 1: col-stick
+        snapshot = acc * b  # READ acc
+        torch.ops.spyre.copy_forced(b + b, acc)  # write 2: row-stick
+        return snapshot * acc
+
+    result = _compile_and_run(fn, (a.to(DEVICE), b.to(DEVICE)), DEVICE).cpu()
+    a_t = a.t().contiguous()
+    expected = (a_t + a_t) * b * (b + b)
+    assert torch.allclose(result, expected, atol=1e-2), (
+        f"max_diff={(result - expected).abs().max().item():.4f}"
+    )
+
+
+def test_two_mutations_read_between_writes_v2_copy_():
+    # Same as test_two_mutations_read_between_writes_v2_copy_f but using copy_().
+    M, N = 128, 256
+    a = torch.randn((N, M), dtype=torch.float16) * 0.01
+    b = torch.randn((M, N), dtype=torch.float16) * 0.01
+    acc = torch.zeros((M, N), dtype=torch.float16)
+
+    def fn(a, b, acc):
+        acc.copy_(a.t() + a.t())  # write 1: col-stick
+        snapshot = acc * b  # READ acc
+        acc.copy_(b + b)  # write 2: row-stick
+        return snapshot * acc
+
+    _compare(fn, a, b, acc)
+
+
 # Optimizer correctness + optimality tests: verify both output values and
 # minimum-cost restickify plan across a range of graph patterns.
 

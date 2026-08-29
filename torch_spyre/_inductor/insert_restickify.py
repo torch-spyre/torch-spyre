@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import copy
 import logging
 from collections import defaultdict
 from typing import cast
@@ -20,9 +21,10 @@ import torch
 
 from .constants import ELIDED_COPY_BACK_ATTR
 from .ir import FixedTiledLayout, SpyreEmptyFallback
-from .optimize_restickify import EdgeCostMap
+from .optimize_restickify import AnyInNode, EdgeCostMap
 from .logging_utils import get_inductor_logger
 from .pass_utils import redirect_computed_buffer_reads
+from torch._inductor.dependencies import MemoryDep
 from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import (
     ComputedBuffer,
@@ -205,8 +207,45 @@ def insert_restickify_on_node_inputs(
         # carries loop_info (loop_group_id + loop_count).  The restickify node
         # is inserted inside the same loop group, so it must inherit loop_info
         # to remain contiguous in build_loop_scheduler_nodes.
+        #
+        # It must inherit a COPY, not the consumer's own object: the restickify
+        # node is a per-iteration stage of old_name, so it TAKES OVER the
+        # consumer's per-read tile advance for that dependency (its own read of
+        # old_name strides through the source), its output is per-iteration
+        # scratch that never advances, and the consumer's read of the stage
+        # must stop advancing. Sharing one CoarseTileInfo (the old behavior)
+        # makes that transfer impossible - both ops kept the advance, so a
+        # coarse-tiled consumer of a cross-loop-group full buffer read the
+        # 1-tile stage with a striding index and ran off its end (issue #4008).
         if hasattr(op, "loop_info"):
-            restick_buff.loop_info = op.loop_info
+            consumer_li = op.loop_info
+            n_levels = len(getattr(consumer_li, "loop_count", []) or [])
+            reads_per_dim = getattr(consumer_li, "tiled_dims_per_read", None)
+            if n_levels and reads_per_dim is not None:
+                mem_deps = [
+                    d for d in op.get_read_writes().reads if isinstance(d, MemoryDep)
+                ]
+                dep_idxs = [
+                    i
+                    for i, d in enumerate(mem_deps)
+                    if d.name == old_name and i < len(reads_per_dim)
+                ]
+                dep_advance = (
+                    copy.deepcopy(reads_per_dim[dep_idxs[0]])
+                    if dep_idxs
+                    else [[] for _ in range(n_levels)]
+                )
+                restick_li = copy.copy(consumer_li)
+                restick_li.tiled_dims_per_read = [dep_advance]
+                restick_li.output_tiled_dims = [[] for _ in range(n_levels)]
+                restick_buff.loop_info = restick_li
+                if dep_idxs:
+                    consumer_li.tiled_dims_per_read = [
+                        [[] for _ in range(n_levels)] if i in dep_idxs else entry
+                        for i, entry in enumerate(reads_per_dim)
+                    ]
+            else:
+                restick_buff.loop_info = consumer_li
 
     # Patch inner_fn once with the full name_map covering all restickified args.
     redirect_computed_buffer_reads(
@@ -293,33 +332,17 @@ def finalize_layouts(graph: GraphLowering) -> None:
                     for dims in getattr(loop_info, "loop_tiled_reduction_dims", [])
                 )
                 if not all_tiled_rdims_empty:
-                    # Propagate the reduction op's device layout to accum_full.
-                    # Pre-stickify, _allocate_full_buffer assigned accum_full a
-                    # generic layout; we now overwrite it with the same STL as
-                    # the reduction op (they share the same output shape and
-                    # stick orientation must agree for the combine to work).
+                    # If accum_full already has a FixedTiledLayout,
+                    # _allocate_full_buffer derived the correct layout via
+                    # _resize_device_layout — nothing to do. Otherwise promote
+                    # to FixedTiledLayout using the reduction op's device layout.
                     accum_name = getattr(op, "_tiled_reduction_accum_name", None)
                     if accum_name is not None:
                         accum_buf = graph.get_buffer(accum_name)
                         accum_layout = accum_buf.layout
                         if isinstance(accum_layout, FixedTiledLayout):
-                            # finalize_layouts already committed a generic STL
-                            # (from propagate_spyre_tensor_layouts) to accum_full.
-                            # Replace with the reduction op's actual STL so that
-                            # fill, combine, and copy all agree on the device
-                            # coordinate system.  Skip if already has the right
-                            # STL (span-overflow path where _allocate_full_buffer
-                            # already derived it from _resize_device_layout).
-                            if accum_layout.device_layout != op.layout.device_layout:
-                                accum_buf.layout = FixedTiledLayout(
-                                    accum_layout.device,
-                                    accum_layout.dtype,
-                                    accum_layout.size,
-                                    accum_layout.stride,
-                                    op.layout.device_layout,
-                                )
+                            pass
                         else:
-                            # FixedLayout: wrap with the reduction op's STL.
                             accum_buf.layout = _fixed_tiled(
                                 accum_layout, op.layout.device_layout
                             )
@@ -328,12 +351,16 @@ def finalize_layouts(graph: GraphLowering) -> None:
         # is incompatible with what this op requires on that edge.
         if not cost_fn:
             continue
-        # Mutation ops targeting a SpyreEmptyFallback: the optimizer commits the
-        # mutation op's output STL via AllSameNode (matching the new-value inputs).
-        # The SpyreEmptyFallback was separately committed by AnyInNode (candidates[0]),
-        # which may differ.  Overwrite the accumulator's FixedTiledLayout to match the
-        # mutation op's committed STL so the backend sees consistent layouts.
-        if isinstance(getattr(op, "layout", None), MutationLayoutSHOULDREMOVE):
+        # Mutation ops targeting a SpyreEmptyFallback: the beam commits the
+        # mutation target's STL via the co-output dep on each writer, so the
+        # target buffer and all its writers agree on the same STL.  Stamp the
+        # target buffer's layout here so the backend sees a FixedTiledLayout.
+        #
+        # Skip fill ops (AnyInNode): they have no real inputs and therefore no
+        # layout preference — the combine/copy op determines the correct STL.
+        if not isinstance(cost_fn, AnyInNode) and isinstance(
+            getattr(op, "layout", None), MutationLayoutSHOULDREMOVE
+        ):
             mut_target = op.layout.target
             while isinstance(mut_target, ReinterpretView):
                 mut_target = mut_target.data
@@ -345,17 +372,27 @@ def finalize_layouts(graph: GraphLowering) -> None:
             )
             if isinstance(mut_target_buf, SpyreEmptyFallback) and committed is not None:
                 accum_layout = mut_target_buf.get_layout()
+                if isinstance(accum_layout, FixedTiledLayout):
+                    existing_stl = accum_layout.device_layout
+                    assert existing_stl == committed, (
+                        f"Two mutation ops write SpyreEmptyFallback "
+                        f"{mut_target_name!r} with conflicting layouts: "
+                        f"existing=device_size={existing_stl.device_size} "
+                        f"stride_map={list(existing_stl.stride_map)} "
+                        f"new=device_size={committed.device_size} "
+                        f"stride_map={list(committed.stride_map)} "
+                        f"op={op.get_name()!r}"
+                    )
                 if isinstance(accum_layout, (FixedTiledLayout, FixedLayout)):
-                    new_layout = FixedTiledLayout(
+                    mut_target_buf.layout = FixedTiledLayout(
                         accum_layout.device,
                         accum_layout.dtype,
                         accum_layout.size,
                         accum_layout.stride,
                         committed,
                     )
-                    mut_target_buf.layout = new_layout
             elif isinstance(mut_target_buf, SpyreEmptyFallback) and committed is None:
-                # committed_stl was cleaned up; fall back to the accumulator's layout.
+                # committed_stl was cleaned up; fall back to the target's layout.
                 accum_layout = mut_target_buf.get_layout()
                 if isinstance(accum_layout, FixedTiledLayout):
                     committed = accum_layout.device_layout
@@ -561,3 +598,38 @@ def insert_post_mutation_restickify(graph: GraphLowering) -> None:
             target_name,
             mutation_name,
         )
+
+
+def validate_no_restickify_on_mutation_targets(graph: GraphLowering) -> None:
+    """Assert that no restickify was inserted on a mutation target buffer.
+
+    A mutation op (MutationLayoutSHOULDREMOVE) writes directly into its target buffer.
+    Restickifying that buffer would redirect the write to a temporary, silently breaking
+    the in-place semantics.
+
+    Must run after insert_restickify (so restickify_plan is populated) and before
+    the scheduler (which resolves MutationLayoutSHOULDREMOVE to a concrete buffer
+    address, after which mutation target identity is no longer recoverable).
+    """
+    assert hasattr(graph, "restickify_plan"), (
+        "validate_no_restickify_on_mutation_targets must run after insert_restickify"
+    )
+    restickify_plan = graph.restickify_plan
+    for op in graph.operations:
+        if not isinstance(op, ComputedBuffer):
+            continue
+        layout = op.get_layout()
+        if not isinstance(layout, MutationLayoutSHOULDREMOVE):
+            continue
+        target = layout.target
+        while isinstance(target, ReinterpretView):
+            target = target.data
+        if not hasattr(target, "get_name"):
+            continue
+        target_name = target.get_name()
+        for entry in restickify_plan.get(op.get_name(), []):
+            if entry["arg_name"] == target_name:
+                raise AssertionError(
+                    f"restickify inserted on mutation target buffer {target_name!r} "
+                    f"as input to its own mutation op {op.get_name()!r}"
+                )
