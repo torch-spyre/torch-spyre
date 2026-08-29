@@ -1078,18 +1078,24 @@ def _multi_arg_pointwise_layouts(
     # Determine output EA and enforce the multi-arg mixed-EA compatibility rule
     # over STAGGERED_EAS = {DL16_TO_FP32, FP32_TO_DL16}. (EXX2 is intentionally
     # out of scope here: it is a reduction ordering handled by the layernorm
-    # layouts and the validate_ops skip, and is_ea_compatible likewise excludes
-    # it from the broadcast pattern.) The cases are:
+    # layouts, and is_ea_compatible in split_multi_ops likewise excludes it from
+    # the broadcast pattern. The ops that bypass that check -- layernormnorm /
+    # layernormscale carrying EXX2 -- have dedicated layout handlers and never
+    # reach this multi-arg-pointwise path, so no EXX2 operand can slip through
+    # case 3.1/3.2 here.) The cases are:
     #   1.  all STANDARD                            -> STANDARD output
     #   2a. >1 distinct staggered EA                -> unsupported (raise)
-    #   2b. one staggered EA, no STANDARD operands  -> staggered output
+    #   2b. one staggered EA, no STANDARD operands  -> staggered output (via 3.1)
     #   3.  one staggered EA mixed with STANDARD operands:
-    #       3.1 every STANDARD operand can broadcast   -> staggered output
     #       3.2 every staggered operand can broadcast  -> STANDARD output
-    #           (a broadcastable staggered operand is physically identical to the
-    #            STANDARD layout of that shape, so it is equivalent to STANDARD)
+    #       3.1 every STANDARD operand can broadcast   -> staggered output
     #       3.3 otherwise (a STANDARD and a staggered full operand coexist)
     #                                                  -> unsupported (raise)
+    # 3.2 is checked BEFORE 3.1: when every staggered operand is a size-1-stick
+    # broadcaster it carries no ordering, so the op is representable as an
+    # all-STANDARD broadcast, and a STANDARD output is preferred even when the
+    # STANDARD operands are also broadcastable (the overlap) -- it avoids a
+    # downstream back-conversion and the staggered operands are degenerate anyway.
     # A future extension may admit 2a/3.3 by inserting an explicit EA conversion
     # at extra cost.
     staggered_inputs = input_eas & STAGGERED_EAS
@@ -1138,32 +1144,63 @@ def _multi_arg_pointwise_layouts(
             if arg.layouts and arg.layouts[0].element_arrangement == staggered_ea
         ]
 
-        if all(broadcast for _, broadcast, _ in std_split):
-            # Case 3.1 (and, vacuously, case 2b when there are no STANDARD
-            # operands): every STANDARD operand can broadcast against the
-            # staggered ordering. The staggered operand(s) dictate the
-            # arrangement, so keep their candidates and prune each STANDARD
-            # operand to its broadcast candidates; the output stays staggered.
-            output_ea = staggered_ea
-            for arg, broadcast, non_broadcast in std_split:
-                if non_broadcast:
-                    arg.layouts[:] = broadcast
-        elif all(broadcast for _, broadcast, _ in stag_split):
-            # Case 3.2: every staggered operand can broadcast (size-1 stick). A
-            # broadcastable staggered operand is *physically identical* to the
-            # STANDARD layout of the same shape (same device_size / stride_map /
-            # device coordinates — verified: a fp16->fp32 upcast [4,1] and a
-            # native fp32 [4,1] both give dev_size=[1,4,32], coords=[0,d0,0]), so
-            # it carries no real ordering and is equivalent to STANDARD. Prune the
-            # staggered operands to their broadcast candidates, emit a STANDARD
-            # output, and take the non-staggered candidate-generation path below.
-            # The resulting graph is exactly the equivalent all-STANDARD broadcast
-            # and shares its codegen behaviour.
+        if stag_split and all(broadcast for _, broadcast, _ in stag_split):
+            # Case 3.2 (checked before 3.1): every staggered operand is a size-1-
+            # stick broadcaster, so none carries a real ordering. Treat the op as
+            # an all-STANDARD broadcast (STANDARD output), preferred even in the
+            # overlap where the STANDARD operands also broadcast.
+            #
+            # Safety: device coordinates depend only on device_size/stride_map,
+            # not the EA label (see device_coordinates), and `_is_supported_layout`
+            # rebuilds each operand from its host size/stride with the *output* EA
+            # (here STANDARD). Reinterpreting a broadcastable staggered operand as
+            # STANDARD is therefore sound only if its staggered device geometry is
+            # identical to the STANDARD layout of the same host shape. A size-1
+            # stick usually makes the staggering vacuous, but we do NOT assume it:
+            # verify per kept candidate and raise rather than silently emit wrong
+            # coordinates (e.g. under a non-identity dim_order or a shape whose
+            # staggering is not a genuine no-op).
+            for arg, broadcast, _ in stag_split:
+                c_in_size = [concretize_expr(s) for s in arg.layout.size]
+                c_in_stride = [concretize_expr(s) for s in arg.layout.stride]
+                std_geom = SpyreTensorLayout(
+                    c_in_size,
+                    c_in_stride,
+                    arg.layout.dtype,
+                    list(range(len(c_in_size))),
+                    ElementArrangement.STANDARD,
+                )
+                for cand in broadcast:
+                    if (
+                        cand.device_size != std_geom.device_size
+                        or cand.stride_map != std_geom.stride_map
+                    ):
+                        raise Unsupported(
+                            f"Multi-arg pointwise with mixed EA: staggered operand "
+                            f"{arg.dep.name} is broadcastable but its {staggered_ea} "
+                            f"device layout "
+                            f"({cand.device_size}/{cand.stride_map}) differs from the "
+                            f"STANDARD layout of the same shape "
+                            f"({std_geom.device_size}/{std_geom.stride_map}); "
+                            f"reinterpreting it as STANDARD would change its "
+                            f"coordinates. De-staggering via an explicit EA "
+                            f"conversion is not supported yet."
+                        )
             output_ea = ElementArrangement.STANDARD
             for arg, broadcast, non_broadcast in stag_split:
                 if non_broadcast:
                     arg.layouts[:] = broadcast
             staggered_inputs = set()
+        elif all(broadcast for _, broadcast, _ in std_split):
+            # Case 3.1 (and, vacuously, case 2b when there are no STANDARD
+            # operands): a genuine (full) staggered operand dictates the
+            # arrangement and every STANDARD operand broadcasts against it. Keep
+            # the staggered candidates and prune each STANDARD operand to its
+            # broadcast candidates; the output stays staggered.
+            output_ea = staggered_ea
+            for arg, broadcast, non_broadcast in std_split:
+                if non_broadcast:
+                    arg.layouts[:] = broadcast
         else:
             # Case 3.3: a STANDARD operand and a staggered operand are both
             # non-broadcast full tensors — a genuine mixed-order op we cannot
@@ -1368,9 +1405,15 @@ def _multi_arg_pointwise_layouts(
         results.insert(0, candidate)
 
     if not results:
+        # Reaches here when no stick-compatible output layout survives — e.g. in
+        # the mixed-EA case (3.1) a STANDARD operand pruned to its only broadcast
+        # candidate then fails `_is_supported_layout`. Surface the EA context so
+        # the diagnostic is as localized as the pre-pruning gate's was.
         raise Unsupported(
-            f"Multi-arg pointwise ({op.get_name()}): no supported output layout found "
-            f"with size={output.size} and coordinates={out_coords}"
+            f"Multi-arg pointwise ({op.get_name()}): no supported output layout "
+            f"found with size={output.size}, output_ea={output_ea}, "
+            f"coordinates={out_coords}. Input EAs: "
+            f"{[a.layouts[0].element_arrangement for a in args if a.layouts]}"
         )
 
     if len(results) > 1:
