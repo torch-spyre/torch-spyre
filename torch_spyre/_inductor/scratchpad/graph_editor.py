@@ -35,6 +35,7 @@ from torch._inductor.ir import (
 from torch._inductor.lowering import clone as clone_lowering, lowerings
 
 from torch_spyre._inductor.ir import FixedTiledLayout
+from torch_spyre._inductor.split_multi_ops import _origin_in_graph
 
 
 class GraphEditor:
@@ -116,7 +117,17 @@ class GraphEditor:
             )
             buf_name = buffer.name
         assert isinstance(buf_name, str)
-        buf_fx = list(buffer.origins)[0]  # .origin_node may not exist
+        # A buffer lowered inside an invoke_subgraph HOP inherits origins that
+        # span BOTH the parent graph (the invoke_subgraph call / get_attr nodes)
+        # and the subgraph's own compute node. inserting_after requires an anchor
+        # in the current lowering graph, so select the graph-local origin rather
+        # than list(origins)[0] (which may be a foreign parent-graph node and
+        # asserts). See split_multi_ops._origin_in_graph for the same pattern.
+        buf_fx = _origin_in_graph(buffer.origins, self.fx_graph)
+        assert buf_fx is not None, (
+            f"no origin of {buf_name} lives in the current lowering graph; "
+            f"origins={[getattr(n, 'name', n) for n in buffer.origins]}"
+        )
         old_users = list(buf_fx.users.keys())
         if private:
             old_users = list(
