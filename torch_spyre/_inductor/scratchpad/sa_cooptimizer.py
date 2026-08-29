@@ -64,11 +64,14 @@ from torch_spyre._inductor.scratchpad.permutation_layout import (
     PermutationBasedLayoutSolver,
     make_permutation_packer,
 )
-from torch_spyre._inductor.scratchpad import cooptimization_scorer as scorer
+from torch_spyre._inductor.scratchpad import utils
+from torch_spyre._inductor.cost_model import OpFeatures
 from torch_spyre._inductor.logging_utils import get_inductor_logger
+from torch_spyre._inductor.pass_utils import iteration_space_from_op
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from torch_spyre._inductor.scratchpad.cost_objective import BundleCostObjective
+    from torch_spyre._inductor.scratchpad.plan_solver import CoreDivision
 
 logger = get_inductor_logger("scratchpad.sa_cooptimizer")
 
@@ -104,6 +107,41 @@ Packer = Union[PermutationBasedLayoutSolver, NativePermutationLayoutSolver]
 _SOLVER_CHOSE_SPILL = "spilled by solver (no residency benefit / no room)"
 
 
+def _work_slices(op, division: "CoreDivision") -> dict:
+    """Restore a complete symbol-keyed split map from a sparse candidate."""
+    return {
+        symbol: int(
+            division.output_splits.get(symbol, division.reduction_splits.get(symbol, 1))
+        )
+        for symbol in iteration_space_from_op(op)
+    }
+
+
+def features_for_division(op, division: "CoreDivision") -> Optional[OpFeatures]:
+    """``OpFeatures`` for ``op`` as if it were divided per ``division``.
+
+    Returns ``None`` when the op cannot be featurized (the extractor is
+    best-effort and swallows its own failures, so a ``None`` here means the op
+    itself was rejected, not that the division was bad).
+
+    The candidate is passed as a complete symbol-keyed map, leaving the live
+    operation and its Scheduler-boundary transport untouched.
+    """
+    from torch_spyre._inductor.dump_cost_model import extract_op_features
+
+    try:
+        return extract_op_features(op, _work_slices(op, division))
+    except Exception:  # noqa: BLE001 - featurization is best-effort by design
+        logger.debug("could not featurize op for a candidate division", exc_info=True)
+        return None
+
+
+def features_for_menu(op, divisions) -> list[Optional[OpFeatures]]:
+    """``features_for_division`` over a buffer's whole candidate menu, index for
+    index with ``divisions`` so a menu index selects its features directly."""
+    return [features_for_division(op, cd) for cd in divisions]
+
+
 def _bundle_objective(
     buffers: Sequence["CoreDivisionBuffer"],
 ) -> Optional["BundleCostObjective"]:
@@ -120,7 +158,6 @@ def _bundle_objective(
 
     from torch_spyre._inductor.fusion import estimate_bundles
     from torch_spyre._inductor.scratchpad.cost_objective import BundleCostObjective
-    from torch_spyre._inductor.scratchpad.op_features import features_for_menu
 
     # Unset, ``V.graph`` is a ``NullHandler`` rather than ``None``, so detect the
     # live graph by what this needs from it rather than by identity.
@@ -325,7 +362,7 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         the *per-core* footprint the packer sees, never a buffer's total size, so
         neither the spill costs nor the bandwidth constant can move."""
         self._spill_costs = [self._spill_cost(b) for b in self._bufs]
-        self._hbm_bytes_per_us = scorer.hbm_bytes_per_us()
+        self._hbm_bytes_per_us = utils.hbm_bytes_per_us()
 
     # -- division-dependent derivations --------------------------------------
 
@@ -477,7 +514,7 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
             for cost, address in zip(self._spill_costs, addresses)
             if address is None
         )
-        return scorer.to_fixed_us(traffic / self._hbm_bytes_per_us)
+        return utils.to_fixed_us(traffic / self._hbm_bytes_per_us)
 
     # -- moves ---------------------------------------------------------------
 

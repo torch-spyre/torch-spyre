@@ -156,6 +156,44 @@ class TestBroadcastCompiled(TestCase):
             f"Rank {self.comm_rank}: broadcast with interleaved compute incorrect",
         )
 
+    def test_broadcast_compiled_repeated_execution(self):
+        """Multiple same-shape broadcasts in one graph, executed multiple times.
+
+        Mimics the pattern where a compiled graph with several broadcast calls
+        (same tensor shape) is run repeatedly. Catches regressions where bundle
+        artifacts are not preserved across repeated executeBundle calls on the
+        same WSI.
+        """
+        src_rank = 0
+
+        class MultiBroadcastModule(torch.nn.Module):
+            def __init__(self, group_name=_GROUP_NAME):
+                super().__init__()
+                self._group_name = group_name
+
+            def forward(self, x, y):
+                b1 = torch.ops._c10d_functional.broadcast(x, src_rank, self._group_name)
+                b2 = torch.ops._c10d_functional.broadcast(y, src_rank, self._group_name)
+                r1 = torch.ops._c10d_functional.wait_tensor(b1)
+                r2 = torch.ops._c10d_functional.wait_tensor(b2)
+                return r1 + r2
+
+        x = torch.full((128,), 3.0, dtype=torch.float16, device=DEVICE)
+        y = torch.full((128,), 7.0, dtype=torch.float16, device=DEVICE)
+
+        module = MultiBroadcastModule()
+        compiled_module = torch.compile(module)
+
+        expected = torch.full((128,), 10.0, dtype=torch.float16)
+
+        for iteration in range(4):
+            result = compiled_module(x, y)
+            self.assertTrue(
+                torch.allclose(result.to("cpu"), expected),
+                f"Rank {self.comm_rank}: iteration {iteration} incorrect. "
+                f"Expected 10.0, got {result[0].to('cpu').item()}",
+            )
+
 
 if __name__ == "__main__":
     run_tests()

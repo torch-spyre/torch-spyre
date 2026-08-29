@@ -221,6 +221,37 @@ def make_nested_op_spec(*, levels: list, **overrides) -> tuple:
     return loops[0], spec, loops
 
 
+def make_onstick_sum_specs() -> list:
+    """``sum(x[256, 128], dim=-1)`` on one core, as the frontend projects it.
+
+    The reduction runs along the *stick*, so it consumes both halves of the
+    reduced symbol -- the outer-stick chunk index ``floor(c1 / 64)`` and the
+    within-stick lane ``c1 % 64`` -- and the output nonetheless has 64 lanes at a
+    constant coordinate.  Every number here is the frontend's own: device sizes
+    [2, 256, 64] in and [1, 256, 64] out, the output's axis 0 a placeholder and
+    its axis 2 the lane the D2H descriptor gathers across.
+
+    Shared rather than local to one test class because both halves of the suite
+    want it: the dialect-free plan assertions here, and the golden in
+    ``test_ktir_emitter.py``.
+    """
+    rows, reduced = sympy.symbols("c0 c1")
+    stick, lane = sympy.floor(reduced / 64), sympy.Mod(reduced, 64)
+    return [
+        make_op_spec(
+            "sum",
+            is_reduction=True,
+            inputs=1,
+            sizes=[[2, 256, 64], [1, 256, 64]],
+            coords_per_arg=[
+                [stick, rows, lane],
+                [sympy.Integer(0), rows, sympy.Integer(0)],
+            ],
+            space={rows: (256, 1), reduced: (128, 1)},
+        )
+    ]
+
+
 class TestValidateRejections(unittest.TestCase):
     """One test per rejection ``build_kernel_plan`` is responsible for.
 
@@ -264,7 +295,7 @@ class TestValidateRejections(unittest.TestCase):
         """An ``add`` asked for as a reduction: the recipe is what has an
         emission, so the request is refused rather than emitted elementwise."""
         specs = [make_op_spec(is_reduction=True)]
-        self._rejects(specs, "registered as ELEMENTWISE")
+        self._rejects(specs, "registered as NAMED")
 
     def test_unregistered_op_rejected(self):
         """An op with no recipe is rejected, and the message names what exists."""
@@ -530,38 +561,63 @@ class TestInternalBufferSignal(unittest.TestCase):
 
 
 class TestRecipes(unittest.TestCase):
-    """One recipe per op, and every recipe is emittable by some family method."""
+    """One recipe per op, and every surface the plan can pick has an arm."""
 
     def test_every_recipe_is_complete(self):
         self.assertTrue(ktir.KtirBuilder.RECIPES)
         for op, recipe in ktir.KtirBuilder.RECIPES.items():
             with self.subTest(op=op):
                 self.assertGreaterEqual(recipe.arity, 1)
-                self.assertIsInstance(recipe.family, ktir.Family)
+                self.assertIsInstance(recipe.kind, ktir.BindingKind)
                 # A thunk, not the builder itself: resolving it here would need
                 # the dialect, which this module deliberately does not require.
                 self.assertTrue(callable(recipe.binding))
-                # The family it declares must be one the builder can emit,
-                # otherwise the walk fails at emit time rather than here.
-                self.assertTrue(
-                    callable(
-                        getattr(ktir.KtirBuilder, recipe.family.name.lower(), None)
-                    ),
-                    f"KtirBuilder has no {recipe.family.name.lower()}() for {op!r}",
-                )
+
+        # Which surface a step gets is the plan's choice, not a recipe's, so
+        # completeness on this side is about ``compute`` rather than about any one
+        # op: every ``Surface`` must appear as a ``case`` pattern.  Read off the
+        # AST because ``case _:`` alone turns a missing arm into a runtime
+        # discovery, at which point a module is already half built.  Deliberately
+        # *not* the mirror assertion that every ``BindingKind`` is used by some
+        # recipe -- PAYLOAD is the registered-nowhere hook for ``spyreop``.
+        tree = ast.parse(inspect.getsource(ktir))
+        builder = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.ClassDef) and node.name == "KtirBuilder"
+        )
+        compute = next(
+            node
+            for node in builder.body
+            if isinstance(node, ast.FunctionDef) and node.name == "compute"
+        )
+        cased = {
+            node.pattern.value.attr
+            for node in ast.walk(compute)
+            if isinstance(node, ast.match_case)
+            and isinstance(node.pattern, ast.MatchValue)
+            and isinstance(node.pattern.value, ast.Attribute)
+        }
+        for surface in ktir.Surface:
+            self.assertIn(surface.name, cased, f"compute has no case for {surface}")
 
     def test_recipe_rejects_a_nonsense_arity(self):
         """A duplicate op name is ruff F601; arity is checked at construction."""
         with self.assertRaises(ValueError):
-            ktir.Recipe(arity=0, family=ktir.Family.ELEMENTWISE, binding=lambda: None)
+            ktir.Recipe(arity=0, kind=ktir.BindingKind.NAMED, binding=lambda: None)
 
-    def test_family_comes_from_the_spec_not_the_name(self):
-        """A reducing spec asks for REDUCTION even when the op is registered
-        elementwise -- which is why the plan walk rejects it rather than the walk
-        silently emitting the wrong shape."""
-        self.assertIs(ktir.Family.of(make_op_spec()), ktir.Family.ELEMENTWISE)
-        reducing = make_op_spec(is_reduction=True)
-        self.assertIs(ktir.Family.of(reducing), ktir.Family.REDUCTION)
+    def test_a_reduction_asked_for_elementwise_is_rejected(self):
+        """The other direction of the agreement check, and the dangerous one.
+
+        ``sum``'s binding is a two-operand combiner; with nothing labelled as
+        reduced it would be handed a single operand and fail *inside* emission,
+        with a half-built module in hand.  Refused by the plan instead.
+        """
+        specs = [make_op_spec("sum", inputs=1, is_reduction=False)]
+        with self.assertRaises(NotImplementedError) as ctx:
+            ktir.build_kernel_plan(specs)
+        self.assertIn("registered as COMBINER", str(ctx.exception))
+        self.assertIn("elementwise", str(ctx.exception))
 
     def test_emit_asserts_on_an_unplanned_step(self):
         """The emitter's only remaining ``raise`` is this plan-bug guard.
@@ -573,6 +629,254 @@ class TestRecipes(unittest.TestCase):
         """
         with self.assertRaises(AssertionError):
             ktir.KtirBuilder.emit(None, [UnimplementedOp(op="atan2")])
+
+
+class TestReduceSurface(unittest.TestCase):
+    """Which of the two reduction shapes a loop nest can be emitted as.
+
+    ``linalg.reduce`` is the compact spelling: hand it the dimensions to fold
+    away and it works out the rest itself.  The price is that it can only say a
+    reduction that reads its input with one loop per input dimension and leaves
+    the surviving dimensions where they were.  Anything else has to be a
+    ``linalg.generic``, which spells the correspondence out in full.  These tests
+    go straight at that rule -- no spec is involved.
+    """
+
+    def test_a_plain_reduction_can_be_a_linalg_reduce(self):
+        """Fold away the middle dimension of three, keep the other two in order."""
+        self.assertIs(
+            ktir._reduce_surface(
+                ("parallel", "reduction", "parallel"), (0, 1, 2), (0, 2)
+            ),
+            ktir.Surface.REDUCE,
+        )
+
+    def test_a_reduction_over_the_stick_cannot_be_a_linalg_reduce(self):
+        """The on-stick sum, and the reason it is worth a test of its own.
+
+        Judged on its output alone, ``(1, 3)`` reads as "keep dimensions 1 and 3
+        of four, fold away 0 and 2" -- which ``linalg.reduce`` says perfectly
+        well.  What it cannot say is the input side: three input dimensions
+        addressed by a loop nest of four, because the 64 lanes are read as one
+        dimension and written as a different one.  ``linalg.reduce`` always reads
+        its input with exactly one loop per input dimension.
+
+        So if this rule is ever relaxed to look only at the output, this is the
+        test that fails -- and without it the emitter would quietly build a
+        two-dimensional ``linalg.reduce`` that sums the wrong elements.
+        """
+        iters = ("reduction", "parallel", "reduction", "parallel")
+        self.assertEqual(
+            tuple(d for d, it in enumerate(iters) if it == "reduction"), (0, 2)
+        )
+        self.assertIs(
+            ktir._reduce_surface(iters, (0, 1, 2), (1, 3)), ktir.Surface.GENERIC
+        )
+
+    def test_a_reduction_that_also_reorders_cannot_be_a_linalg_reduce(self):
+        """It folds dimensions away; it never moves the ones that survive.
+
+        Here the two survivors come out swapped, which the compact spelling has
+        no way to express.
+        """
+        self.assertIs(
+            ktir._reduce_surface(
+                ("parallel", "reduction", "parallel"), (0, 1, 2), (2, 0)
+            ),
+            ktir.Surface.GENERIC,
+        )
+
+
+class TestOnlyAReductionOutputIsSqueezed(unittest.TestCase):
+    """A pointwise op keeps a size-1 output dimension; only a reduction drops one.
+
+    Dropping a size-1 dimension is safe when a reduction left it behind, because
+    nothing was ever written along it.  It is not safe in general, and this spec
+    is the counterexample: an ``add`` whose operands and output all carry the
+    same size-1 dimension.  It compiles today, and it works precisely *because*
+    all three agree on it.  Drop it from the output alone and ``linalg.add``
+    would be handed a two-dimensional result against three-dimensional operands,
+    which fails when the module is verified -- inside emission, the one place
+    nothing is allowed to fail.
+
+    So the drop happens only for a reduction, and this test is the reason.
+    """
+
+    @staticmethod
+    def _size_one_add():
+        rows = sympy.Symbol("c1")
+        return [
+            make_op_spec(
+                size=[1, 256, 64],
+                coords=[sympy.Integer(0), rows, sympy.Mod(rows, 64)],
+            )
+        ]
+
+    def test_a_size_one_dimension_is_kept_when_nothing_is_reduced(self):
+        plan = ktir.build_kernel_plan(self._size_one_add())
+        [step] = plan.steps
+        self.assertIs(step.surface, ktir.Surface.BARE)
+        self.assertEqual(step.out.extent, (1, 256, 64))
+        for _buf_id, access in step.ins:
+            self.assertEqual(access.extent, (1, 256, 64))
+
+
+class TestAnOutputLaneIsNotATranspose(unittest.TestCase):
+    """A reduction may write an axis its input reduced; it may not reorder axes.
+
+    Both shapes reach the same matching walk, and before the broadcast lane had a
+    home the on-stick one came out of it with the *wrong* diagnostic: its output
+    lane matched no input axis, so it was reported as a permutation needing a
+    restickify.  It is not a permutation -- nothing moved -- so the two cases have
+    to be told apart, and a refusal that still fires for the real thing is what
+    says the first case was widened rather than the check being weakened.
+    """
+
+    def test_a_reduced_axis_may_be_written_again(self):
+        plan = ktir.build_kernel_plan(make_onstick_sum_specs())
+        [step] = plan.steps
+        self.assertEqual(step.out.extent, (256, 64))
+
+    def test_reordered_surviving_axes_are_still_refused(self):
+        """The same reduction with its two kept axes swapped on the way out."""
+        lanes, rows = sympy.symbols("c0 c1")
+        stick, lane = sympy.floor(lanes / 64), sympy.Mod(lanes, 64)
+        specs = [
+            make_op_spec(
+                "sum",
+                is_reduction=True,
+                inputs=1,
+                sizes=[[32, 256, 64], [64, 32]],
+                coords_per_arg=[[stick, rows, lane], [lane, stick]],
+                space={lanes: (2048, 1), rows: (256, 1)},
+            )
+        ]
+        with self.assertRaises(NotImplementedError) as ctx:
+            ktir.build_kernel_plan(specs)
+        self.assertIn("transpose", str(ctx.exception))
+
+
+class TestAPayloadWithNoNamedOpGetsAGeneric(unittest.TestCase):
+    """An elementwise op the dialect has no named op for, and how it is spelled.
+
+    Nothing in ``RECIPES`` is a ``PAYLOAD`` yet -- registering the intrinsics that
+    will be is one line each and no emitter change -- so the arm that serves them
+    is exercised here with a recipe registered for the length of the test.  Its
+    binding is never called: what is under test is the plan's choice, which is
+    made before any dialect is reached.
+    """
+
+    @staticmethod
+    @contextlib.contextmanager
+    def _registered(op, recipe):
+        """``recipe`` in ``RECIPES`` under ``op``, for the body of the ``with``."""
+        ktir.KtirBuilder.RECIPES[op] = recipe
+        try:
+            yield
+        finally:
+            del ktir.KtirBuilder.RECIPES[op]
+
+    def test_no_recipe_registers_a_payload_binding(self):
+        """The state this test compensates for, asserted so it stays true.
+
+        The moment an intrinsic is registered, this fails and the synthetic recipe
+        below has a real counterpart to be replaced by.
+        """
+        kinds = {r.kind for r in ktir.KtirBuilder.RECIPES.values()}
+        self.assertNotIn(ktir.BindingKind.PAYLOAD, kinds)
+
+    def test_the_identity_maps_are_stated_rather_than_implied(self):
+        recipe = ktir.Recipe(
+            arity=1, kind=ktir.BindingKind.PAYLOAD, binding=lambda: None
+        )
+        with self._registered("probe", recipe):
+            plan = ktir.build_kernel_plan([make_op_spec("probe", inputs=1)])
+        [step] = plan.steps
+        self.assertIs(step.surface, ktir.Surface.GENERIC)
+        self.assertEqual(step.reduce_dims, ())
+        # Rank 3, one map per input and then the result: the operand and the
+        # destination are read one element at a time in the same order.
+        self.assertEqual(step.indexing.iters, ("parallel",) * 3)
+        self.assertEqual(step.indexing.maps, ((0, 1, 2), (0, 1, 2)))
+
+
+class TestStepFieldsAgreeWithTheSurface(unittest.TestCase):
+    """The price of two optional fields with one reader each, charged in one test.
+
+    ``indexing`` is carried by the surface that reads it and by no other, and a
+    nest with a reduced dim is never a bare named op.  Both are invariants of the
+    plan rather than of any one fixture, so they are asserted over every accepted
+    fixture in this file at once -- which is what stops the minimal record's
+    optional fields drifting into a bug nobody's own test covers.
+    """
+
+    @staticmethod
+    def _accepted_fixtures() -> dict:
+        """Every spec list in this file that ``build_kernel_plan`` accepts."""
+        n_stick, m = sympy.symbols("n_stick m")
+        nest, _spec, _loops = make_nested_op_spec(
+            levels=[(n_stick, 2), (m, 256)],
+            size=[1, 1, 64],
+            advances=[16384 * n_stick + 64 * m] * 3,
+        )
+        rows = sympy.Symbol("c1")
+        lanes = sympy.Symbol("c0")
+        stick, lane = sympy.floor(lanes / 64), sympy.Mod(lanes, 64)
+        return {
+            "pointwise": [make_op_spec()],
+            "divided": [make_op_spec(divisions={"d1": 32})],
+            "chained": make_chained_op_specs(("add", "mul")),
+            "nested": [nest],
+            "unit_axis_pointwise": [
+                make_op_spec(
+                    size=[1, 256, 64],
+                    coords=[sympy.Integer(0), rows, sympy.Mod(rows, 64)],
+                )
+            ],
+            "nonstick_reduction": [
+                make_op_spec(
+                    "sum",
+                    is_reduction=True,
+                    inputs=1,
+                    sizes=[[32, 256, 64], [1, 32, 64]],
+                    coords_per_arg=[
+                        [stick, rows, lane],
+                        [sympy.Integer(0), stick, lane],
+                    ],
+                    space={lanes: (2048, 32), rows: (256, 1)},
+                )
+            ],
+            "onstick_reduction": make_onstick_sum_specs(),
+        }
+
+    @staticmethod
+    def _steps(steps):
+        for step in steps:
+            if isinstance(step, ktir.LoopStep):
+                yield from TestStepFieldsAgreeWithTheSurface._steps(step.body)
+            else:
+                yield step
+
+    def test_the_fixtures_cover_every_surface(self):
+        """A vacuous invariant is the failure mode, so the coverage is asserted."""
+        surfaces = {
+            step.surface
+            for specs in self._accepted_fixtures().values()
+            for step in self._steps(ktir.build_kernel_plan(specs).steps)
+        }
+        self.assertEqual(surfaces, set(ktir.Surface))
+
+    def test_a_generic_is_the_only_step_that_states_its_indexing(self):
+        for name, specs in self._accepted_fixtures().items():
+            for position, step in enumerate(
+                self._steps(ktir.build_kernel_plan(specs).steps)
+            ):
+                with self.subTest(fixture=name, step=position):
+                    self.assertIs(
+                        step.indexing is not None, step.surface is ktir.Surface.GENERIC
+                    )
+                    if step.reduce_dims:
+                        self.assertIsNot(step.surface, ktir.Surface.BARE)
 
 
 def _tiled_reduction_specs() -> tuple:
@@ -889,14 +1193,7 @@ class TestEmissionCannotRefuse(unittest.TestCase):
         }
 
         seen: set[str] = set()
-        # ``compute`` reaches a family's method by name (``Family.ELEMENTWISE`` ->
-        # ``elementwise``), which no call-graph walk can follow, so every family
-        # method is a root here: a new family cannot escape this check by being
-        # dispatched dynamically.
-        families = [family.name.lower() for family in ktir.Family]
-        for family in families:
-            self.assertIn(family, methods, f"KtirBuilder has no {family}()")
-        pending = ["emit", *families]
+        pending = ["emit"]
         raised: list[tuple[str, str]] = []
         while pending:
             name = pending.pop()

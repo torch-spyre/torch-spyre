@@ -97,33 +97,33 @@ class TestKtirPrerequisites(_PrereqCase):
         self.assertIn("KTIR_DEVICE_MLIR", str(ctx.exception))
         run.assert_not_called()
 
-    def test_symbolic_args_is_a_prerequisite_failure(self):
-        with (
-            mock.patch(f"{_CONFIG}.bundle_symbolic_args", True),
-            mock.patch(f"{_MODULE}.subprocess.run") as run,
-        ):
-            with self.assertRaises(RuntimeError) as ctx:
-                self.compile()
-        message = str(ctx.exception)
-        # The footgun this replaced was a dbo-opt exit-1 dump that never
-        # mentioned the knob responsible.
-        self.assertIn("BUNDLE_SYMBOLIC_ARGS=0", message)
-        run.assert_not_called()
+    def test_symbolic_args_are_not_a_prerequisite_failure(self):
+        """A symbolic base address is compiled, not refused.
+
+        This check used to demand ``BUNDLE_SYMBOLIC_ARGS=0``, because dbo-opt
+        needed base addresses baked into constants and the footgun it replaced was
+        a dbo-opt exit-1 dump that never mentioned the knob responsible.  The
+        backend takes a symbolic start address itself now, so the prerequisite is
+        gone -- and what is worth pinning is the reverse of what was pinned before:
+        that the check stays quiet and dbo-opt is actually reached.
+        """
+        with mock.patch(f"{_CONFIG}.bundle_symbolic_args", True):
+            ac._check_ktir_device_prerequisites()  # does not raise
 
     def test_all_unmet_prerequisites_reported_at_once(self):
         """One error naming every unmet prerequisite, not the first one found."""
         with (
-            mock.patch(f"{_CONFIG}.bundle_symbolic_args", True),
             mock.patch(f"{_CONFIG}.ktir_device_mlir", ""),
             mock.patch(f"{_MODULE}.shutil.which", return_value=None),
         ):
             with self.assertRaises(RuntimeError) as ctx:
                 ac._check_ktir_device_prerequisites()
         message = str(ctx.exception)
-        for expected in ("BUNDLE_SYMBOLIC_ARGS=0", "KTIR_DEVICE_MLIR", "dbo-opt"):
+        for expected in ("KTIR_DEVICE_MLIR", "dbo-opt"):
             self.assertIn(expected, message)
-        # All three, not just the first one found.
-        self.assertEqual(message.count("\n  - "), 3)
+        # Both, not just the first one found.  Two rather than three since the
+        # symbolic-args prerequisite was lifted.
+        self.assertEqual(message.count("\n  - "), 2)
 
 
 class TestKtirDboFailures(_PrereqCase):

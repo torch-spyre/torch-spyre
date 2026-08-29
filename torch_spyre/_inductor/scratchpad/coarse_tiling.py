@@ -45,7 +45,7 @@ from ..wsr.coarse_tile import (
     reduction_loop_vars,
     validate_coarse_tile_groups,
 )
-from .passes import ScratchpadOptimizationPass
+from .allocator import ScratchpadOptimizationPass
 from .plan_solver import TileSpec
 
 

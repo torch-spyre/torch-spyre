@@ -25,7 +25,12 @@ Self-contained otherwise: no live Inductor graph, no compiler run.
 
 import unittest
 
-from test_ktir_validate import make_chained_op_specs, make_nested_op_spec, make_op_spec
+from test_ktir_validate import (
+    make_chained_op_specs,
+    make_nested_op_spec,
+    make_onstick_sum_specs,
+    make_op_spec,
+)
 
 
 def _mlir_ktdp_available() -> bool:
@@ -58,9 +63,9 @@ class TestKtirEmitter(unittest.TestCase):
 module {
   func.func @ktir_fused_add_0(%arg0: index, %arg1: index, %arg2: index) attributes {grid = [1]} {
     %c0 = arith.constant 0 : index
-    %0 = ktdp.construct_memory_view %arg0, sizes: [16, 512, 64], strides: [32768, 64, 1] {coordinate_set = #set, memory_space = #ktdp.spyre_memory_space<HBM>} : memref<16x512x64xf16>
-    %1 = ktdp.construct_memory_view %arg1, sizes: [16, 512, 64], strides: [32768, 64, 1] {coordinate_set = #set, memory_space = #ktdp.spyre_memory_space<HBM>} : memref<16x512x64xf16>
-    %2 = ktdp.construct_memory_view %arg2, sizes: [16, 512, 64], strides: [32768, 64, 1] {coordinate_set = #set, memory_space = #ktdp.spyre_memory_space<HBM>} : memref<16x512x64xf16>
+    %0 = ktdp.construct_memory_view %arg0, sizes: [16, 512, 64], strides: [32768, 64, 1] {coordinate_set = #set, memory_space = #ktdp.memory_space<global>} : memref<16x512x64xf16>
+    %1 = ktdp.construct_memory_view %arg1, sizes: [16, 512, 64], strides: [32768, 64, 1] {coordinate_set = #set, memory_space = #ktdp.memory_space<global>} : memref<16x512x64xf16>
+    %2 = ktdp.construct_memory_view %arg2, sizes: [16, 512, 64], strides: [32768, 64, 1] {coordinate_set = #set, memory_space = #ktdp.memory_space<global>} : memref<16x512x64xf16>
     %3 = ktdp.construct_access_tile %0[%c0, %c0, %c0] {access_tile_order = #map, access_tile_set = #set} : memref<16x512x64xf16> -> !ktdp.access_tile<16x512x64xindex>
     %4 = ktdp.load %3 : <16x512x64xindex> -> tensor<16x512x64xf16>
     %5 = ktdp.construct_access_tile %1[%c0, %c0, %c0] {access_tile_order = #map, access_tile_set = #set} : memref<16x512x64xf16> -> !ktdp.access_tile<16x512x64xindex>
@@ -156,10 +161,10 @@ class TestInternalBufferIsThreaded(unittest.TestCase):
 module {
   func.func @ktir_fused_add_mul_0(%arg0: index, %arg1: index, %arg2: index, %arg3: index) attributes {grid = [1]} {
     %c0 = arith.constant 0 : index
-    %0 = ktdp.construct_memory_view %arg0, sizes: [16, 512, 64], strides: [32768, 64, 1] {coordinate_set = #set, memory_space = #ktdp.spyre_memory_space<HBM>} : memref<16x512x64xf16>
-    %1 = ktdp.construct_memory_view %arg1, sizes: [16, 512, 64], strides: [32768, 64, 1] {coordinate_set = #set, memory_space = #ktdp.spyre_memory_space<HBM>} : memref<16x512x64xf16>
-    %2 = ktdp.construct_memory_view %arg2, sizes: [16, 512, 64], strides: [32768, 64, 1] {coordinate_set = #set, memory_space = #ktdp.spyre_memory_space<HBM>} : memref<16x512x64xf16>
-    %3 = ktdp.construct_memory_view %arg3, sizes: [16, 512, 64], strides: [32768, 64, 1] {coordinate_set = #set, memory_space = #ktdp.spyre_memory_space<HBM>} : memref<16x512x64xf16>
+    %0 = ktdp.construct_memory_view %arg0, sizes: [16, 512, 64], strides: [32768, 64, 1] {coordinate_set = #set, memory_space = #ktdp.memory_space<global>} : memref<16x512x64xf16>
+    %1 = ktdp.construct_memory_view %arg1, sizes: [16, 512, 64], strides: [32768, 64, 1] {coordinate_set = #set, memory_space = #ktdp.memory_space<global>} : memref<16x512x64xf16>
+    %2 = ktdp.construct_memory_view %arg2, sizes: [16, 512, 64], strides: [32768, 64, 1] {coordinate_set = #set, memory_space = #ktdp.memory_space<global>} : memref<16x512x64xf16>
+    %3 = ktdp.construct_memory_view %arg3, sizes: [16, 512, 64], strides: [32768, 64, 1] {coordinate_set = #set, memory_space = #ktdp.memory_space<global>} : memref<16x512x64xf16>
     %4 = ktdp.construct_access_tile %0[%c0, %c0, %c0] {access_tile_order = #map, access_tile_set = #set} : memref<16x512x64xf16> -> !ktdp.access_tile<16x512x64xindex>
     %5 = ktdp.load %4 : <16x512x64xindex> -> tensor<16x512x64xf16>
     %6 = ktdp.construct_access_tile %1[%c0, %c0, %c0] {access_tile_order = #map, access_tile_set = #set} : memref<16x512x64xf16> -> !ktdp.access_tile<16x512x64xindex>
@@ -226,9 +231,9 @@ module {
   func.func @ktir_fused_add_0(%arg0: index, %arg1: index, %arg2: index) attributes {grid = [32]} {
     %c0 = arith.constant 0 : index
     %0 = ktdp.get_compute_tile_id : index
-    %1 = ktdp.construct_memory_view %arg0, sizes: [16, 512, 64], strides: [32768, 64, 1] {coordinate_set = #set, memory_space = #ktdp.spyre_memory_space<HBM>} : memref<16x512x64xf16>
-    %2 = ktdp.construct_memory_view %arg1, sizes: [16, 512, 64], strides: [32768, 64, 1] {coordinate_set = #set, memory_space = #ktdp.spyre_memory_space<HBM>} : memref<16x512x64xf16>
-    %3 = ktdp.construct_memory_view %arg2, sizes: [16, 512, 64], strides: [32768, 64, 1] {coordinate_set = #set, memory_space = #ktdp.spyre_memory_space<HBM>} : memref<16x512x64xf16>
+    %1 = ktdp.construct_memory_view %arg0, sizes: [16, 512, 64], strides: [32768, 64, 1] {coordinate_set = #set, memory_space = #ktdp.memory_space<global>} : memref<16x512x64xf16>
+    %2 = ktdp.construct_memory_view %arg1, sizes: [16, 512, 64], strides: [32768, 64, 1] {coordinate_set = #set, memory_space = #ktdp.memory_space<global>} : memref<16x512x64xf16>
+    %3 = ktdp.construct_memory_view %arg2, sizes: [16, 512, 64], strides: [32768, 64, 1] {coordinate_set = #set, memory_space = #ktdp.memory_space<global>} : memref<16x512x64xf16>
     %c16 = arith.constant 16 : index
     %4 = arith.muli %0, %c16 : index
     %5 = ktdp.construct_access_tile %1[%c0, %4, %c0] {access_tile_order = #map, access_tile_set = #set1} : memref<16x512x64xf16> -> !ktdp.access_tile<16x16x64xindex>
@@ -309,8 +314,8 @@ module {
   func.func @ktir_sum_0(%arg0: index, %arg1: index) attributes {grid = [32]} {
     %c0 = arith.constant 0 : index
     %0 = ktdp.get_compute_tile_id : index
-    %1 = ktdp.construct_memory_view %arg0, sizes: [32, 256, 64], strides: [16384, 64, 1] {coordinate_set = #set, memory_space = #ktdp.spyre_memory_space<HBM>} : memref<32x256x64xf16>
-    %2 = ktdp.construct_memory_view %arg1, sizes: [32, 64], strides: [64, 1] {coordinate_set = #set1, memory_space = #ktdp.spyre_memory_space<HBM>} : memref<32x64xf16>
+    %1 = ktdp.construct_memory_view %arg0, sizes: [32, 256, 64], strides: [16384, 64, 1] {coordinate_set = #set, memory_space = #ktdp.memory_space<global>} : memref<32x256x64xf16>
+    %2 = ktdp.construct_memory_view %arg1, sizes: [32, 64], strides: [64, 1] {coordinate_set = #set1, memory_space = #ktdp.memory_space<global>} : memref<32x64xf16>
     %3 = ktdp.construct_access_tile %1[%0, %c0, %c0] {access_tile_order = #map, access_tile_set = #set2} : memref<32x256x64xf16> -> !ktdp.access_tile<1x256x64xindex>
     %4 = ktdp.load %3 : <1x256x64xindex> -> tensor<1x256x64xf16>
     %5 = tensor.empty() : tensor<1x64xf16>
@@ -361,10 +366,116 @@ module {
 
         plan = ktir.build_kernel_plan(self._sum_specs())
         [step] = plan.steps
+        # An identity input map with one dim dropped on the way out, which is the
+        # only nest ``dimensions=`` can state -- so the surface is what makes the
+        # reduced dim a bare axis list rather than a pair of maps.
+        self.assertIs(step.surface, ktir.Surface.REDUCE)
         self.assertEqual(step.reduce_dims, (1,))  # the 256 rows
         self.assertEqual(step.out.extent, (1, 64))
         self.assertEqual(plan.buffers["buf0"].layout.extent, (32, 64))
         self.assertNotIn("expand_shape", ktir.generate_ktir("k", self._sum_specs()))
+
+
+@unittest.skipUnless(
+    _mlir_ktdp_available(),
+    "mlir_ktdp with the func/arith/linalg/scf/tensor dialect bindings is not installed",
+)
+class TestOnStickReductionEmission(unittest.TestCase):
+    """``sum`` along the stick, which is the shape ``dimensions=`` cannot state.
+
+    The dual of ``TestReductionEmission``: there the reduced axis vanishes, here it
+    is the 64 lanes, and the output has 64 lanes of its own.  So one axis is read
+    on the way in and written on the way out, the input covers three dims of a
+    four-dim nest, and the correspondence has to be spelled out -- which is what
+    ``linalg.generic`` is for and what the ``indexing_maps`` below say:
+
+        ins:  (d0, d1, d2, d3) -> (d0, d1, d2)   the lane read, d3 broadcast
+        outs: (d0, d1, d2, d3) -> (d1, d3)       the lane written, d2 reduced
+
+    i.e. ``out[m, l] = sum over (s, k) of a[s, m, k]``, for every ``l``.  The
+    output really is that total in all 64 lanes: the hardware writes a whole stick
+    at a time, so stating the output as [256, 64] is what makes the store a plain
+    identity write over contiguous elements, and a rank-1 output of 256 elements
+    at stride 64 would name the same bytes with a non-unit innermost stride the
+    store path cannot address.
+
+    **This text is not a compilable kernel.** Its body is ``arith.addf``, so it
+    passes the scheduler's first legality pass, but reducing along the lanes is an
+    in-register horizontal collapse rather than a cross-iteration accumulate and
+    nothing lowers one yet.  What the golden claims is that the emitter produces
+    the agreed text, which is checkable here; that it compiles is not.
+    """
+
+    EXPECTED_ONSTICK_SUM_KTIR = """\
+#map = affine_map<(d0, d1, d2) -> (d0, d1, d2)>
+#map1 = affine_map<(d0, d1, d2, d3) -> (d0, d1, d2)>
+#map2 = affine_map<(d0, d1, d2, d3) -> (d1, d3)>
+#map3 = affine_map<(d0, d1) -> (d0, d1)>
+#set = affine_set<(d0, d1, d2) : (d0 >= 0, -d0 + 1 >= 0, d1 >= 0, -d1 + 255 >= 0, d2 >= 0, -d2 + 63 >= 0)>
+#set1 = affine_set<(d0, d1) : (d0 >= 0, -d0 + 255 >= 0, d1 >= 0, -d1 + 63 >= 0)>
+module {
+  func.func @ktir_sum_onstick_0(%arg0: index, %arg1: index) attributes {grid = [1]} {
+    %c0 = arith.constant 0 : index
+    %0 = ktdp.construct_memory_view %arg0, sizes: [2, 256, 64], strides: [16384, 64, 1] {coordinate_set = #set, memory_space = #ktdp.memory_space<global>} : memref<2x256x64xf16>
+    %1 = ktdp.construct_memory_view %arg1, sizes: [256, 64], strides: [64, 1] {coordinate_set = #set1, memory_space = #ktdp.memory_space<global>} : memref<256x64xf16>
+    %2 = ktdp.construct_access_tile %0[%c0, %c0, %c0] {access_tile_order = #map, access_tile_set = #set} : memref<2x256x64xf16> -> !ktdp.access_tile<2x256x64xindex>
+    %3 = ktdp.load %2 : <2x256x64xindex> -> tensor<2x256x64xf16>
+    %4 = tensor.empty() : tensor<256x64xf16>
+    %5 = linalg.generic {indexing_maps = [#map1, #map2], iterator_types = ["reduction", "parallel", "reduction", "parallel"]} ins(%3 : tensor<2x256x64xf16>) outs(%4 : tensor<256x64xf16>) {
+    ^bb0(%in: f16, %out: f16):
+      %7 = arith.addf %in, %out : f16
+      linalg.yield %7 : f16
+    } -> tensor<256x64xf16>
+    %6 = ktdp.construct_access_tile %1[%c0, %c0] {access_tile_order = #map3, access_tile_set = #set1} : memref<256x64xf16> -> !ktdp.access_tile<256x64xindex>
+    ktdp.store %5, %6 : tensor<256x64xf16>, <256x64xindex>
+    return
+  }
+}
+"""
+
+    @staticmethod
+    def _onstick_specs():
+        """``sum(x[256, 128], dim=-1)`` as the frontend projects it, on one core."""
+        return make_onstick_sum_specs()
+
+    def test_on_stick_sum_golden(self):
+        from torch_spyre._inductor.codegen.ktir import generate_ktir
+
+        emitted = generate_ktir("ktir_sum_onstick_0", self._onstick_specs())
+        self.assertEqual(emitted, self.EXPECTED_ONSTICK_SUM_KTIR)
+
+    def test_the_lane_axis_is_reduced_on_the_way_in_and_written_on_the_way_out(self):
+        """The nest behind the golden, read off the plan.
+
+        Four dims for a rank-3 input, two of them reduced, and the output's lane is
+        a dim of its own rather than the one the input was read with -- which is
+        the fact no flat list of reduced axes can state and the reason the step
+        carries maps at all.
+        """
+        from torch_spyre._inductor.codegen import ktir
+
+        plan = ktir.build_kernel_plan(self._onstick_specs())
+        [step] = plan.steps
+        self.assertIs(step.surface, ktir.Surface.GENERIC)
+        self.assertEqual(
+            step.indexing.iters, ("reduction", "parallel", "reduction", "parallel")
+        )
+        self.assertEqual(step.indexing.maps, ((0, 1, 2), (1, 3)))
+        self.assertEqual(step.reduce_dims, (0, 2))
+        # The placeholder axis is gone and the lane is not: rank 2 out, 64 wide.
+        self.assertEqual(step.out.extent, (256, 64))
+        self.assertEqual(plan.buffers["buf0"].layout.strides, (64, 1))
+
+    def test_the_accumulator_is_left_uninitialised(self):
+        """A bare ``tensor.empty``: materialising the identity belongs to the
+        scheduler's reduction passes, and a ``linalg.fill`` here would be a second
+        compute op for them to unpick."""
+        from torch_spyre._inductor.codegen.ktir import generate_ktir
+
+        emitted = generate_ktir("ktir_sum_onstick_0", self._onstick_specs())
+        self.assertIn("tensor.empty() : tensor<256x64xf16>", emitted)
+        self.assertNotIn("linalg.fill", emitted)
+        self.assertNotIn("expand_shape", emitted)
 
 
 @unittest.skipUnless(
@@ -388,9 +499,9 @@ class TestTiledLoopEmission(unittest.TestCase):
 module {
   func.func @ktir_tiled_add_0(%arg0: index, %arg1: index, %arg2: index) attributes {grid = [1]} {
     %c0 = arith.constant 0 : index
-    %0 = ktdp.construct_memory_view %arg0, sizes: [2, 256, 64], strides: [16384, 64, 1] {coordinate_set = #set, memory_space = #ktdp.spyre_memory_space<HBM>} : memref<2x256x64xf16>
-    %1 = ktdp.construct_memory_view %arg1, sizes: [2, 256, 64], strides: [16384, 64, 1] {coordinate_set = #set, memory_space = #ktdp.spyre_memory_space<HBM>} : memref<2x256x64xf16>
-    %2 = ktdp.construct_memory_view %arg2, sizes: [2, 256, 64], strides: [16384, 64, 1] {coordinate_set = #set, memory_space = #ktdp.spyre_memory_space<HBM>} : memref<2x256x64xf16>
+    %0 = ktdp.construct_memory_view %arg0, sizes: [2, 256, 64], strides: [16384, 64, 1] {coordinate_set = #set, memory_space = #ktdp.memory_space<global>} : memref<2x256x64xf16>
+    %1 = ktdp.construct_memory_view %arg1, sizes: [2, 256, 64], strides: [16384, 64, 1] {coordinate_set = #set, memory_space = #ktdp.memory_space<global>} : memref<2x256x64xf16>
+    %2 = ktdp.construct_memory_view %arg2, sizes: [2, 256, 64], strides: [16384, 64, 1] {coordinate_set = #set, memory_space = #ktdp.memory_space<global>} : memref<2x256x64xf16>
     %c0_0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
     %c2 = arith.constant 2 : index

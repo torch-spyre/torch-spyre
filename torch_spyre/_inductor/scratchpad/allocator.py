@@ -16,6 +16,7 @@ import functools
 import logging
 import math
 import time
+from abc import ABC, abstractmethod
 from collections import defaultdict
 from collections.abc import Iterable, Sequence
 from dataclasses import replace
@@ -73,9 +74,6 @@ from torch_spyre._inductor.scratchpad.exhaustive_search import (
     ExhaustiveSearchSolver,
 )
 from torch_spyre._inductor.scratchpad.sa_cooptimizer import SaCoOptimizingSolver
-from torch_spyre._inductor.scratchpad.passes import (
-    ScratchpadOptimizationPass,
-)
 from torch_spyre._inductor.scratchpad.utils import (
     round_up_to_alignment,
     clone_at_graph_boundaries,
@@ -98,6 +96,7 @@ from torch_spyre._inductor.ir import FixedTiledLayout, SpyreEmptyFallback
 
 from torch_spyre._inductor import config
 from torch_spyre._inductor.logging_utils import get_inductor_logger
+from torch_spyre._inductor.loop_info import CarriedReductionRecord
 from torch_spyre._inductor.scratchpad.lx_relayout import (
     LXRelayoutPlan,
     collect_lx_relayout_plans,
@@ -159,6 +158,16 @@ def _extern_kernel_in_live_range(graph: GraphLowering, uses: list[int]) -> bool:
     )
 
 
+def _is_carried_reduction_storage(op: Any) -> bool:
+    """True only for the accumulator named by its shared physical contract."""
+
+    record = getattr(op, "_carried_reduction_record", None)
+    return (
+        isinstance(record, CarriedReductionRecord)
+        and record.accumulator_name == op.get_name()
+    )
+
+
 # A ``MemoryPlanSolver`` is single-use (buffers are required at construction),
 # so the allocators hold a factory -- how to build a solver for a given buffer
 # set -- rather than a live instance, and build a fresh one per solve.
@@ -169,6 +178,25 @@ LayoutSolverFactory = Callable[[Sequence[LifetimeBoundBuffer], int], MemoryPlanS
 CoreDivisionSolverFactory = Callable[
     [Sequence[LifetimeBoundBuffer], int], CoreDivisionLayoutSolver
 ]
+
+
+class ScratchpadOptimizationPass(ABC):
+    """
+    Abstract class for optimization passes which are implemented to improve
+    a graph's overall scratchpad memory utilization and/or memory latency.
+    """
+
+    @abstractmethod
+    def apply_pass(self, graph: GraphLowering):
+        """
+        Accepts a candidate graph to be optimized and evaluated for scratchpad memory allocation.
+        `graph` will be mutated according in an implementation defined way. The order and
+        number of nodes in the graph may change as a result of an optimization pass.
+
+        Args:
+            graph (GraphLowering): The graph to be optimized for scratchpad memory allocation
+        """
+        pass
 
 
 class ScratchpadAllocator:
@@ -350,8 +378,10 @@ class ScratchpadAllocator:
             return False
         # A planned source intentionally bypasses the profitability denylist:
         # the relayout planner has already applied its stricter structural gates.
-        return config.allow_all_ops_in_lx_planning or (
-            self._get_op_name(op) not in OP_OUTPUT_NOT_GOOD_FOR_LX_REUSE
+        return (
+            _is_carried_reduction_storage(op)
+            or config.allow_all_ops_in_lx_planning
+            or self._get_op_name(op) not in OP_OUTPUT_NOT_GOOD_FOR_LX_REUSE
             or op.get_name() in planned_lx_buffers
         )
 
@@ -445,8 +475,11 @@ class ScratchpadAllocator:
             # MultiOutputLayout tuple op). There is nothing to place, and the
             # checks below would raise.
             return "unsized (no device layout)"
-        if name in mutated_buffers:
+        if name in mutated_buffers and not _is_carried_reduction_storage(op):
             return "mutation target"
+        # The shared carried-reduction contract names exactly one accumulator
+        # with one in-loop mutator and a closed fill -> combine -> drain
+        # lifetime.  The general mutation gate remains unchanged otherwise.
         if _is_tiled_advancing(op) or _is_read_advancing_anywhere(name, buf_user_deps):
             # LX addresses cannot be expressed as affine.apply symbols today (see
             # compute_ops.py's is_tiled_lx check), so a buffer whose address

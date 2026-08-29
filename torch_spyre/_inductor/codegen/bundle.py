@@ -88,9 +88,24 @@ def generate_bundle(
     ``pool_size`` is the byte count for this bundle's HBM pool (from
     ``hbm_pool_planning.py`` via ``SpyreKernel.pool_size``). Ignored unless
     a pool symbol is present in ``specs``. When a pool symbol is present,
-    it is emitted as ``%pool = sdscbundle.device_mem_allocate <pool_size>
-    bytes : index`` as the first statement of the bundle body — there is
-    no ``%pool_base_addr`` function parameter.
+    how ``%pool`` is produced depends on
+    ``config.frontend_pool_allocation``:
+
+    - ``False`` (default): emitted as ``%pool = sdscbundle.device_mem_allocate
+      <pool_size> bytes : index`` as the first statement of the bundle
+      body — there is no ``%pool_base_addr`` function parameter.
+    - ``True``: emitted as a ``%pool_base_addr: !sdscbundle.input_arg<index>``
+      function parameter (ordered first, before any
+      ``kernel_arg_sym_indices``/``dimension_sym_indices`` params) plus an
+      ``sdscbundle.input_arg_extract value from %pool_base_addr`` statement
+      producing ``%pool`` as the first statement of the bundle body. The
+      caller (``SpyreKernel.call_kernel()``) is then responsible for
+      allocating a real pool tensor and passing its address as this
+      argument.
+
+    Either way, ``%pool`` is an ordinary ``index``-typed SSA value; every
+    per-buffer ``arith.addi %pool, <offset>`` emission downstream is
+    identical in both modes.
     """
     if not _spyre_config.bundle_symbolic_args:
         raise AssertionError(
@@ -250,14 +265,20 @@ def generate_bundle(
         f.write("module {\n")
 
         # Function signature:
+        #   - when config.frontend_pool_allocation and a pool symbol is
+        #     present: one %pool_base_addr !sdscbundle.input_arg<index>
+        #     param, emitted first
         #   - one !sdscbundle.input_arg<index> param per kernel tensor arg
         #   - one !sdscbundle.input_arg<index, granularity=G, max_value=M> param
         #     per unique dynamic-shape (mark_dynamic) symbol; emitted whenever
         #     present.
-        # Pool allocation is emitted in the body as device_mem_allocate,
-        # not as a function parameter.
-        if kernel_arg_sym_indices or dimension_sym_indices:
+        # Otherwise (default), pool allocation is emitted in the body as
+        # device_mem_allocate, not as a function parameter.
+        emit_pool_param = has_pool and _spyre_config.frontend_pool_allocation
+        if emit_pool_param or kernel_arg_sym_indices or dimension_sym_indices:
             params = []
+            if emit_pool_param:
+                params.append("%pool_base_addr: !sdscbundle.input_arg<index>")
             for sym_idx in kernel_arg_sym_indices:
                 ai = symbol_kinds[sym_idx].arg_index
                 params.append(f"%arg_{ai}_base_addr: !sdscbundle.input_arg<index>")
@@ -275,10 +296,16 @@ def generate_bundle(
             f"(0, {MAX_POOL_SIZE_BYTES}] for a bundle with a pool symbol present"
         )
         if has_pool:
-            f.write(
-                f"\t\t%pool = sdscbundle.device_mem_allocate {pool_size} bytes"
-                " : index\n"
-            )
+            if _spyre_config.frontend_pool_allocation:
+                f.write(
+                    "\t\t%pool = sdscbundle.input_arg_extract value from"
+                    " %pool_base_addr : !sdscbundle.input_arg<index> -> index\n"
+                )
+            else:
+                f.write(
+                    f"\t\t%pool = sdscbundle.device_mem_allocate {pool_size} bytes"
+                    " : index\n"
+                )
 
         for sym_idx in kernel_arg_sym_indices:
             ai = symbol_kinds[sym_idx].arg_index
