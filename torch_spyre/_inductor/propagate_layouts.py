@@ -464,6 +464,52 @@ def _qfp8wt_stl(
     )
 
 
+def _pad_sparse_stick_count(
+    stl: SpyreTensorLayout, src_dtype: torch.dtype
+) -> SpyreTensorLayout:
+    """Widen a sparse layout's stick-count slot to the sticks one source stick spans.
+
+    A sparse layout holds one host element per stick, so its stick-count slot is 1 by
+    construction. That count is in *device* sticks, and a conversion changes how wide a
+    stick is: narrowing fp16 (64 elements) to fp32 (32) makes one source stick span two
+    device sticks. The count must cover them both, or the buffer is allocated for half
+    the sticks the kernel writes.
+
+    The extra sticks are padding: allocated, not iterated. Codegen derives the skip from
+    the difference between this device extent and the iteration extent, so the count is
+    the allocation side of that pair and is deliberately not matched by an iteration
+    range.
+
+    ``_recover_dim_order`` fixes the slot: a sparse layout carries exactly one slot more
+    than its host rank plus the trailing stick width, and that slot is the count.
+
+    Returns ``stl`` unchanged when the layout is dense or the conversion does not narrow
+    the stick.
+    """
+    device_size = list(stl.device_size)
+    stride_map = list(stl.stride_map)
+
+    src_eps = get_elem_in_stick(src_dtype)
+    dst_eps = stl.device_dtype.elems_per_stick()
+    if dst_eps >= src_eps:
+        return stl
+
+    # Sparse layouts alone have a count slot to widen; a dense one carries the count in
+    # a host dim, which this must not touch.
+    count_idx = -3
+    if len(device_size) < 3 or stride_map[count_idx] != -1:
+        return stl
+
+    spanned = src_eps // dst_eps
+    if device_size[count_idx] * dst_eps >= src_eps:
+        return stl
+    device_size[count_idx] *= spanned
+
+    return SpyreTensorLayout(
+        device_size, stride_map, stl.device_dtype, stl.element_arrangement
+    )
+
+
 def _single_arg_op_layout(
     op: Operation,
     output: FixedLayout,
@@ -616,9 +662,10 @@ def _single_arg_op_layout(
                 in_size = [concretize_expr(s) for s in in_layout.size]
                 in_stride = [concretize_expr(s) for s in in_layout.stride]
                 dim_order = _recover_dim_order(stl, in_size, in_stride)
-                return [
-                    SpyreTensorLayout(c_size, c_stride, output.dtype, dim_order, fmt)
-                ]
+                out_stl = SpyreTensorLayout(
+                    c_size, c_stride, output.dtype, dim_order, fmt
+                )
+                return [_pad_sparse_stick_count(out_stl, in_layout.dtype)]
 
             # The only op left is FP8TODL16, dequantizing qfp8ch output back to
             # fp16: a STANDARD output undoes the input's staggering, as in the

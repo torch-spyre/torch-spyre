@@ -293,6 +293,43 @@ def _is_conv2d_kernel_tensor(arg: TensorArg, tensor_position: int | None) -> boo
     return tensor_position == 1
 
 
+def _sparse_stick_symbol(arg: TensorArg, symbol_mapping: dict) -> Symbol | None:
+    """The symbol naming a sparse arg's stick axis, whose stick lane indexes nothing.
+
+    A sparse layout holds one host element per stick, so its trailing lane carries a
+    constant and the usual read of ``device_coordinates[-1]`` finds no symbol. The axis
+    that walks sticks is the stick-count slot, and a conversion reshapes the layout around
+    it, so its position differs between the arms of one conversion while its role does
+    not. Selecting it by extent instead names one axis on both sides.
+
+    The count spans a stick rather than a tensor dim, so it is the narrowest of the
+    symbol-carrying slots: it counts how many sticks one row of the sparse dim occupies,
+    which the conversion's width change keeps small, while the host dims carry the
+    tensor's own extents.
+
+    Returns ``None`` for a dense arg, or when the narrowest extent is shared, so callers
+    keep their existing behaviour rather than guessing between equal candidates.
+    """
+    coords = arg.device_coordinates
+    if len(coords) < 3 or coords[-1].subs(symbol_mapping).free_symbols:
+        return None
+
+    best: tuple[int, Symbol] | None = None
+    ties = 0
+    for size, coord in zip(arg.device_size[:-1], coords[:-1]):
+        free = sorted(coord.subs(symbol_mapping).free_symbols, key=str)
+        if len(free) != 1:
+            continue
+        extent = int(size)
+        if best is None or extent < best[0]:
+            best, ties = (extent, free[0]), 1
+        elif extent == best[0]:
+            ties += 1
+    if best is None or ties > 1:
+        return None
+    return best[1]
+
+
 def _get_device_dim_order(
     arg: TensorArg,
     symbol_mapping: dict,
@@ -308,7 +345,7 @@ def _get_device_dim_order(
     """
     last_coord = arg.device_coordinates[-1].subs(symbol_mapping)
     free = sorted(last_coord.free_symbols, key=str)
-    stick_dim = free[0] if free else None
+    stick_dim = free[0] if free else _sparse_stick_symbol(arg, symbol_mapping)
 
     dim_order: list[Symbol] = []
     for i in range(len(arg.device_coordinates) - 2, -1, -1):
@@ -403,12 +440,45 @@ def _get_layout_label(
     return label
 
 
+def _allocated_sticks(
+    arg: TensorArg,
+    dim: Symbol,
+    symbol_mapping: dict,
+    stick_size: int,
+) -> int:
+    """How many sticks ``arg`` allocates along ``dim``, its stick dim.
+
+    A dense stick dim indexes elements inside one stick, so the answer is 1 and the
+    extent needs only rounding to a boundary. A sparse layout instead spends a whole
+    slot counting sticks -- one host element per stick means the lane itself is indexed
+    by nothing -- and a conversion that narrows the stick raises that count, so the
+    extent has to span every stick or the tail of them is never visited.
+
+    The counting slot's position is not fixed: rebuilding a layout for a different stick
+    width reorders the slots, so the slot is found by which coordinate ``dim`` drives,
+    never by where its label sits. Extents at or above a stick width are host dims that
+    happen to sit there, never a count.
+
+    Returns 1 when no counting slot is found, leaving boundary rounding unchanged.
+    """
+    for slot, coord in enumerate(arg.device_coordinates):
+        if slot >= len(arg.device_size):
+            break
+        if coord.subs(symbol_mapping) != dim:
+            continue
+        count = arg.device_size[slot]
+        if 1 < count < stick_size:
+            return count
+    return 1
+
+
 def _get_padded_iteration_space(
     op_spec_args: list[TensorArg],
     sdsc_args: list[SDSCArgs],
     sdsc_iteration_space: dict,
     layouts: dict,
     dim_order,
+    symbol_mapping: dict,
 ) -> dict:
     """
     Compute padding per dim when device size exceeds iteration space.
@@ -427,9 +497,15 @@ def _get_padded_iteration_space(
             effective_stick_size = (
                 stick_size[0] if len(stick_size) == 1 else stick_size[0] * stick_size[1]
             )
-            unaligned = sdsc_iteration_space[dim] % effective_stick_size
-            if unaligned > 0:
-                padding[dim] = effective_stick_size - unaligned
+            # The extent must reach every stick the layout allocates, not just round to
+            # the next boundary: an axis carrying several sticks is described by one
+            # extent, and stopping at the first boundary leaves the rest unreachable.
+            target = effective_stick_size * _allocated_sticks(
+                op_spec_arg, dim, symbol_mapping, effective_stick_size
+            )
+            unaligned = sdsc_iteration_space[dim] % target
+            if unaligned > 0 or sdsc_iteration_space[dim] < target:
+                padding[dim] = target - unaligned
                 sdsc_iteration_space[dim] += padding[dim]
     return padding
 
@@ -1340,7 +1416,11 @@ def _create_sdsc_tensors(
                 # iteration extent. Emitting a backGap for a conv op double-counts
                 # that gap and corrupts the generated addressing.
                 #
-                if not _is_conv(op_spec.op):
+                # The hardware always processes a whole stick, so the stick dim's
+                # device extent is a whole number of sticks and there is nothing to
+                # skip past on that axis. A gap there would be counted in elements
+                # against an extent the hardware never partially traverses.
+                if not _is_conv(op_spec.op) and dim is not stick_dim:
                     backGap[dim] = dev_dim_size - it_dim_size
                 strides[dim] = strides[dim] // dev_dim_size * it_dim_size
 
@@ -2023,7 +2103,12 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
             [args[-1].dim_order],
         )
     padding = _get_padded_iteration_space(
-        pad_args, pad_sdsc_args, sdsc_iteration_space, layouts, dim_order
+        pad_args,
+        pad_sdsc_args,
+        sdsc_iteration_space,
+        layouts,
+        dim_order,
+        symbol_mapping,
     )
 
     # For restickify, update backGaps based on the padded iteration space,
