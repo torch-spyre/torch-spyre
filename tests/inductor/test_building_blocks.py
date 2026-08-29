@@ -221,7 +221,7 @@ class TestBuildingBlocks(unittest.TestCase):
         # the stick axis -- ddc crashes in ddc_fold.cpp (innermostRelevantAllocLoop
         # == innermostRelevantRefLoop). The same crash hits a pure-STANDARD fp32
         # [4,1]+[4,64] broadcast, so it is a separate, pre-existing codegen gap
-        # tracked in <ISSUE_URL>.
+        # tracked in https://github.com/torch-spyre/torch-spyre/issues/4132.
         #
         # We assert the failure originates in *codegen*, not the mixed-EA layout
         # gate: a plain @unittest.expectedFailure would also stay green if a future
