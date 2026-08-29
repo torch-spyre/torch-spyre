@@ -35,6 +35,7 @@ from torch._inductor.virtualized import V
 
 from .constants import (
     SPYRE_FP32_OPS,
+    SPYRE_INT32_OPS,
     BATCH_MATMUL_OP,
     BATCH_MATMUL_FP8_OP,
     CONV_OPS,
@@ -882,6 +883,9 @@ class SpyreKernel(Kernel[CSEVariable]):
                 op == IDENTITY_OP
                 or DtypeOpTable.is_dtype_op(op)
                 or (op in SPYRE_FP32_OPS and arg.device_dtype == DataFormats.IEEE_FP32)
+                or (
+                    op in SPYRE_INT32_OPS and arg.device_dtype == DataFormats.IEEE_INT32
+                )
                 or arg.device_dtype == DataFormats.SEN169_FP16
                 or (
                     op in SPYRE_FP8_OPS

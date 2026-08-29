@@ -2601,13 +2601,13 @@ def _validate_planned_reduction_tiling(
                 f"coarse_tile: op {op.get_name()!r} level {i} tiles both "
                 f"output dim(s) {out_dims} and reduction dim(s) {red_dims} "
                 "simultaneously (mixed output+reduction tiling at one level "
-                "is not yet implemented — Stage 2)."
+                "is not yet implemented)."
             )
         if len(red_dims) > 1:
             raise Unsupported(
                 f"coarse_tile: op {op.get_name()!r} level {i} tiles multiple "
                 f"reduction dims {red_dims} (tiling more than one reduction "
-                "dim per level is not yet implemented — Stage 2)."
+                "dim per level is not yet implemented)."
             )
 
 
