@@ -147,7 +147,9 @@ def write_dump(name, header, graphs, code):
     parts = ["\n".join(header) + "\n"]
     parts += [
         f"\n{bar}\npost-grad graph {n} (after decompose_scan_to_while_loop)\n{bar}\n"
-        + gm.print_readable(print_output=False, include_stride=True, include_device=False)
+        + gm.print_readable(
+            print_output=False, include_stride=True, include_device=False
+        )
         + "\n"
         for n, gm in enumerate(graphs)
     ]
@@ -314,6 +316,7 @@ def single_page_inputs():
 # The tests.
 # ======================================================================
 
+
 class TestForEachTileLowering(unittest.TestCase):
     def _assert_lowers(self, fn, args, ref, *, name, loops, materializations=0):
         """Compile `fn` and check the loop count, the copy count and the numbers.
@@ -327,6 +330,13 @@ class TestForEachTileLowering(unittest.TestCase):
         with post_grad_graphs() as graphs:
             compiled = torch.compile(fn, backend="inductor", fullgraph=True)
             out, code = run_and_get_code(compiled, *args)
+
+        # No `fresh_cache()` needed, unlike its neighbours in this suite: inductor
+        # bypasses the FX graph cache outright for a graph holding a `scan` HOP, which
+        # every case here has by construction, so a warm cache can never skip the
+        # post-grad pass the capture above hooks. Asserted rather than assumed -- if
+        # that ever changes, this says so instead of an IndexError on `graphs[-1]`.
+        self.assertTrue(graphs, "no post-grad graph captured (FX graph cache hit?)")
 
         # The decomposition runs bottom-up, one module at a time, so the graph captured
         # last is the top-level one and the rest are the subgraphs it now contains.

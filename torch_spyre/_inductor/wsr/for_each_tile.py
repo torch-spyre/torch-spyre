@@ -315,7 +315,7 @@ def for_each_tile(
     # An extra CARRY leaf, not an extra `ys` leaf: the counter is a scalar the body
     # increments, whereas a padded per-step output costs a stacked buffer for the whole
     # trip count and an `aten.copy_` in the innermost body graph.
-    init_leaves = () if map_mode else tree_leaves(init)
+    init_leaves = [] if map_mode else tree_leaves(init)
     count_mode = out_dim is None and len(init_leaves) == 1
     if count_mode:
         scan_init = (_step_counter(init_leaves[0]), init)
