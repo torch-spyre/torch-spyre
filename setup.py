@@ -26,8 +26,8 @@ os.environ.setdefault(
 
 
 import glob
+import re
 
-import regex as re
 from setuptools import Command, setup
 from setuptools.command.build_py import build_py as _build_py
 
@@ -255,7 +255,7 @@ class BuildPyWithVersion(_build_py):
             # plain base version rather than a bogus one.
             print(f"build_py: no git metadata; keeping version {version}")
             return
-        original = Path(outfile).read_text()
+        original = Path(outfile).read_text(encoding="utf-8")
         stamped, count = _VERSION_LITERAL_RE.subn(
             f'__version__ = "{version}"', original, count=1
         )
@@ -267,7 +267,7 @@ class BuildPyWithVersion(_build_py):
                 f"{outfile}; {PATH_NAME}/version.py and setup.py's "
                 f"BuildPyWithVersion have drifted."
             )
-        Path(outfile).write_text(stamped)
+        Path(outfile).write_text(stamped, encoding="utf-8")
         print(f"build_py: baked __version__ = {version!r} into {outfile}")
 
 

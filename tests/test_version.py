@@ -42,25 +42,38 @@ def _load_version_module():
     return module
 
 
-version_mod = _load_version_module()
+@pytest.fixture(scope="module")
+def version_mod():
+    """torch_spyre.version, imported once per module.
+
+    A fixture rather than a module-level call: an import failure here surfaces as
+    an error on the individual tests instead of breaking collection of the whole
+    file with a bare traceback.
+    """
+    return _load_version_module()
 
 
 def _in_source_checkout() -> bool:
-    """True when the live git lookup is expected to have fired."""
+    """True when the live git lookup is expected to have fired.
+
+    Evaluated at decoration time by ``skipif``, so it cannot use the fixture and
+    resolves the repo root from this file's location instead.
+    """
+    repo_root = Path(__file__).resolve().parent.parent
     return (
-        (Path(version_mod._REPO_ROOT) / ".git").is_dir()
+        (repo_root / ".git").is_dir()
         and shutil.which("git") is not None
         and os.environ.get("TORCH_SPYRE_VERSION_NO_GIT") != "1"
     )
 
 
-def test_version_is_valid_pep440():
+def test_version_is_valid_pep440(version_mod):
     """__version__ must parse as a PEP 440 version, local segment included."""
     packaging_version = pytest.importorskip("packaging.version")
     packaging_version.Version(version_mod.__version__)
 
 
-def test_base_version_is_the_public_prefix():
+def test_base_version_is_the_public_prefix(version_mod):
     """__version__ is either the bare base version or base + a local segment."""
     base = version_mod._BASE_VERSION
     assert version_mod.__version__ == base or version_mod.__version__.startswith(
@@ -68,7 +81,7 @@ def test_base_version_is_the_public_prefix():
     )
 
 
-def test_local_segment_shape_when_present():
+def test_local_segment_shape_when_present(version_mod):
     """A local segment must be 'g' followed by a plausible short sha."""
     if "+" not in version_mod.__version__:
         pytest.skip("no local segment (wheel built without git metadata)")
@@ -79,7 +92,7 @@ def test_local_segment_shape_when_present():
     assert len(sha) >= 4, f"sha suspiciously short: {sha!r}"
 
 
-def test_version_module_is_statically_readable():
+def test_version_module_is_statically_readable(version_mod):
     """The first top-level __version__ binding must be an ast.literal_eval-able str.
 
     pyproject.toml resolves the project version with
@@ -111,7 +124,7 @@ def test_version_module_is_statically_readable():
 @pytest.mark.skipif(
     not _in_source_checkout(), reason="not a git source checkout with git available"
 )
-def test_checkout_version_matches_head():
+def test_checkout_version_matches_head(version_mod):
     """In a checkout the local segment must be the real HEAD short sha."""
     sha = subprocess.run(
         ["git", "-C", str(version_mod._REPO_ROOT), "rev-parse", "--short", "HEAD"],
@@ -124,7 +137,7 @@ def test_checkout_version_matches_head():
     assert version_mod.__version__ == expected
 
 
-def test_git_short_sha_returns_none_for_non_repo(tmp_path):
+def test_git_short_sha_returns_none_for_non_repo(version_mod, tmp_path):
     """A path that is not a git repository must yield None, not raise."""
     # A nonexistent path, not tmp_path itself: `git -C` walks UP looking for a
     # repository, and the temp dir could sit under one on some machines.
@@ -139,6 +152,6 @@ def test_no_git_env_var_suppresses_lookup(monkeypatch):
     assert "+" not in reloaded.__version__
 
 
-def test_module_exports_only_version():
+def test_module_exports_only_version(version_mod):
     """__all__ stays limited to __version__; helpers are private."""
     assert version_mod.__all__ == ["__version__"]
