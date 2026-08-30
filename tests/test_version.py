@@ -32,9 +32,30 @@ from pathlib import Path
 import pytest
 
 
+def _repo_root() -> Path:
+    """Locate the repo root without assuming this file's path depth.
+
+    The CI harness runs pytest from its own working directory with the test file
+    passed by basename.
+    """
+    env_root = os.environ.get("TORCH_DEVICE_ROOT")
+    if env_root and (Path(env_root) / "torch_spyre" / "version.py").is_file():
+        return Path(env_root).resolve()
+
+    here = Path(__file__).resolve()
+    for candidate in (here.parent, *here.parents):
+        if (candidate / "torch_spyre" / "version.py").is_file():
+            return candidate
+
+    raise RuntimeError(
+        "cannot locate the torch-spyre repo root: no torch_spyre/version.py found "
+        f"above {here} and TORCH_DEVICE_ROOT={env_root!r} does not contain it"
+    )
+
+
 def _load_version_module():
     """Import torch_spyre.version without importing the torch_spyre package."""
-    module_path = Path(__file__).resolve().parent.parent / "torch_spyre" / "version.py"
+    module_path = _repo_root() / "torch_spyre" / "version.py"
     spec = importlib.util.spec_from_file_location("torch_spyre_version", module_path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
@@ -57,11 +78,10 @@ def _in_source_checkout() -> bool:
     """True when the live git lookup is expected to have fired.
 
     Evaluated at decoration time by ``skipif``, so it cannot use the fixture and
-    resolves the repo root from this file's location instead.
+    resolves the repo root itself.
     """
-    repo_root = Path(__file__).resolve().parent.parent
     return (
-        (repo_root / ".git").is_dir()
+        (_repo_root() / ".git").is_dir()
         and shutil.which("git") is not None
         and os.environ.get("TORCH_SPYRE_VERSION_NO_GIT") != "1"
     )
