@@ -307,8 +307,18 @@ def _sparse_stick_symbol(arg: TensorArg, symbol_mapping: dict) -> Symbol | None:
     which the conversion's width change keeps small, while the host dims carry the
     tensor's own extents.
 
-    Returns ``None`` for a dense arg, or when the narrowest extent is shared, so callers
-    keep their existing behaviour rather than guessing between equal candidates.
+    A count slot sits alongside the host dims rather than replacing one, so a sparse
+    layout always offers at least two symbol-carrying slots. A lone candidate is instead
+    a reduction output's single surviving host dim, whose trailing lane is constant
+    because the reduced axis collapsed and not because the layout is sparse.
+
+    Returns ``None`` for a dense arg, for a lone candidate, or when the narrowest extent
+    is shared, so callers keep their existing behaviour rather than guessing.
+
+    TODO: extent alone cannot separate a small host dim from a stick count once two or
+    more host dims survive, so a reduction over a leading axis is still misread. The
+    reliable test is a stride equal to the elements per stick, which ``TensorArg`` does
+    not carry at this layer.
     """
     coords = arg.device_coordinates
     if len(coords) < 3 or coords[-1].subs(symbol_mapping).free_symbols:
@@ -316,16 +326,18 @@ def _sparse_stick_symbol(arg: TensorArg, symbol_mapping: dict) -> Symbol | None:
 
     best: tuple[int, Symbol] | None = None
     ties = 0
+    candidates = 0
     for size, coord in zip(arg.device_size[:-1], coords[:-1]):
         free = sorted(coord.subs(symbol_mapping).free_symbols, key=str)
         if len(free) != 1:
             continue
+        candidates += 1
         extent = int(size)
         if best is None or extent < best[0]:
             best, ties = (extent, free[0]), 1
         elif extent == best[0]:
             ties += 1
-    if best is None or ties > 1:
+    if best is None or candidates < 2 or ties > 1:
         return None
     return best[1]
 
