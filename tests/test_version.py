@@ -23,6 +23,7 @@ torch_spyre`` so these run without a built ``_C`` extension.
 """
 
 import ast
+import importlib.metadata
 import importlib.util
 import os
 import shutil
@@ -32,30 +33,70 @@ from pathlib import Path
 import pytest
 
 
-def _repo_root() -> Path:
-    """Locate the repo root without assuming this file's path depth.
+def _find_version_file() -> Path:
+    """Locate the version.py that is actually in effect, without importing it.
 
-    The CI harness runs pytest from its own working directory with the test file
-    passed by basename.
+    Two layouts must both work:
+
+    * **Source checkout** -- ``torch_spyre/version.py`` sits next to ``tests/``.
+    * **CI wheel flow** -- ``.github/actions/install-prebuilt-torch-spyre`` installs
+      the prebuilt wheel and then deletes the checked-out ``torch_spyre/`` package
+      so it cannot shadow it, leaving ``tests/`` with no sibling source package.
+      The installed wheel is authoritative there, and is the copy whose stamped
+      version we actually want to assert on.
+
+    The installed distribution is therefore consulted first, via its recorded file
+    list -- ``import torch_spyre`` is avoided throughout because importing the
+    package triggers the PyTorch backend autoload (and needs a compiled ``_C``).
     """
-    env_root = os.environ.get("TORCH_DEVICE_ROOT")
-    if env_root and (Path(env_root) / "torch_spyre" / "version.py").is_file():
-        return Path(env_root).resolve()
+    try:
+        dist = importlib.metadata.distribution("torch_spyre")
+    except importlib.metadata.PackageNotFoundError:
+        dist = None
 
-    here = Path(__file__).resolve()
-    for candidate in (here.parent, *here.parents):
-        if (candidate / "torch_spyre" / "version.py").is_file():
-            return candidate
+    if dist is not None:
+        for recorded in dist.files or ():
+            if recorded.parts[-2:] == ("torch_spyre", "version.py"):
+                located = Path(str(dist.locate_file(recorded))).resolve()
+                if located.is_file():
+                    return located
+
+    # Source checkout: walk up for the sentinel rather than assuming this file's
+    # depth, since the CI harness may run pytest from a different directory.
+    for candidate in Path(__file__).resolve().parents:
+        source_copy = candidate / "torch_spyre" / "version.py"
+        if source_copy.is_file():
+            return source_copy
 
     raise RuntimeError(
-        "cannot locate the torch-spyre repo root: no torch_spyre/version.py found "
-        f"above {here} and TORCH_DEVICE_ROOT={env_root!r} does not contain it"
+        "cannot locate torch_spyre/version.py: it is neither recorded in an "
+        "installed torch_spyre distribution nor present in a parent directory of "
+        f"{Path(__file__).resolve()}"
     )
+
+
+def _read_static_version() -> str:
+    """The ``__version__`` literal as it sits on disk, before any git override.
+
+    Read statically rather than imported, so it reflects what the file ships with
+    -- a wheel stamped at build time carries a local segment here, a source
+    checkout carries the bare base version.
+    """
+    module = ast.parse(_find_version_file().read_bytes())
+    for statement in module.body:
+        if not isinstance(statement, ast.Assign):
+            continue
+        for target in statement.targets:
+            if isinstance(target, ast.Name) and target.id == "__version__":
+                literal = ast.literal_eval(statement.value)
+                assert isinstance(literal, str)
+                return literal
+    raise AssertionError("no top-level __version__ assignment found")
 
 
 def _load_version_module():
     """Import torch_spyre.version without importing the torch_spyre package."""
-    module_path = _repo_root() / "torch_spyre" / "version.py"
+    module_path = _find_version_file()
     spec = importlib.util.spec_from_file_location("torch_spyre_version", module_path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
@@ -77,11 +118,13 @@ def version_mod():
 def _in_source_checkout() -> bool:
     """True when the live git lookup is expected to have fired.
 
-    Evaluated at decoration time by ``skipif``, so it cannot use the fixture and
-    resolves the repo root itself.
+    Only a source checkout has a ``.git`` beside the package; the CI wheel flow
+    installs into site-packages, where the lookup never fires. Evaluated at
+    decoration time by ``skipif``, so it cannot use the fixture -- the directory
+    tested here mirrors version.py's own ``_REPO_ROOT`` (its ``parent.parent``).
     """
     return (
-        (_repo_root() / ".git").is_dir()
+        (_find_version_file().parent.parent / ".git").is_dir()
         and shutil.which("git") is not None
         and os.environ.get("TORCH_SPYRE_VERSION_NO_GIT") != "1"
     )
@@ -165,11 +208,24 @@ def test_git_short_sha_returns_none_for_non_repo(version_mod, tmp_path):
 
 
 def test_no_git_env_var_suppresses_lookup(monkeypatch):
-    """TORCH_SPYRE_VERSION_NO_GIT=1 must yield the bare base version."""
+    """TORCH_SPYRE_VERSION_NO_GIT=1 must suppress the live git lookup.
+
+    Only the lookup is suppressed, never an already-baked local segment: the
+    guarded block is deliberately inert when ``__version__`` already carries a
+    ``+`` so an unpacked wheel cannot be re-stamped from an unrelated checkout.
+    So a stamped copy (the CI wheel flow) legitimately keeps its segment, and
+    only an unstamped source copy collapses to the bare base version.
+    """
     monkeypatch.setenv("TORCH_SPYRE_VERSION_NO_GIT", "1")
+    baked = "+" in _read_static_version()
+
     reloaded = _load_version_module()
-    assert reloaded.__version__ == reloaded._BASE_VERSION
-    assert "+" not in reloaded.__version__
+
+    if baked:
+        assert reloaded.__version__ == _read_static_version()
+    else:
+        assert reloaded.__version__ == reloaded._BASE_VERSION
+        assert "+" not in reloaded.__version__
 
 
 def test_module_exports_only_version(version_mod):
