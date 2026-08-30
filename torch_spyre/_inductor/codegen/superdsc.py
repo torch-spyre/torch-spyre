@@ -1425,11 +1425,18 @@ def _create_sdsc_tensors(
                 # iteration extent. Emitting a backGap for a conv op double-counts
                 # that gap and corrupts the generated addressing.
                 #
-                # The hardware always processes a whole stick, so the stick dim's
-                # device extent is a whole number of sticks and there is nothing to
-                # skip past on that axis. A gap there would be counted in elements
-                # against an extent the hardware never partially traverses.
-                if not _is_conv(op_spec.op) and dim is not stick_dim:
+                # A sparse layout's stick axis is its stick-count slot, whose
+                # extent counts whole sticks rather than elements within one.
+                # The hardware always processes a whole stick, so the count is
+                # already fully traversed and a gap there would be applied in
+                # elements against an axis measured in sticks. A dense stick dim
+                # is measured in elements and a coarse tile genuinely covers only
+                # part of it, so it still needs the gap.
+                skip_gap = (
+                    dim is stick_dim
+                    and _sparse_stick_symbol(arg, symbol_mapping) is stick_dim
+                )
+                if not _is_conv(op_spec.op) and not skip_gap:
                     backGap[dim] = dev_dim_size - it_dim_size
                 strides[dim] = strides[dim] // dev_dim_size * it_dim_size
 
