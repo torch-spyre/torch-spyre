@@ -54,6 +54,7 @@ from .pass_utils import (
     op_read_writes,
 )
 from .logging_utils import get_inductor_logger
+from .propagate_hints import get_op_hints
 from .wsr.coarse_tile import _raw_to_squeezed_pos
 from . import config
 
@@ -291,6 +292,34 @@ _K_SPLIT_COMBINE_SUPPORTED = {
 _GENERATED_COPY_OP_PREFIXES = ("coarse_tile_read_copy_", "coarse_tile_reduce_copy_")
 
 
+def _hinted_work_div_syms(ctx: WorkDivConstraintContext) -> set[Symbol]:
+    """Symbols in ``ctx.it_space`` that carry an explicit user ``work_div`` hint.
+
+    Mirrors ``_resolve_work_div_hint``'s name->symbol resolution
+    (work_division.py) so a dim the user explicitly asked to split can be
+    recognized here too, without importing work_division.py itself (it
+    imports this module, so importing back would be circular). Kept as a
+    plain set of symbols, not a split-count dict: this function only needs
+    to know which symbols to leave unpinned -- the actual requested split
+    value is validated and applied later, by work_division.py's own
+    ``_apply_user_hint``.
+    """
+    dim_to_split: dict[str, int] = {}
+    for _, hint_dict in sorted(get_op_hints(ctx.op).items()):
+        dim_to_split.update(hint_dict.get("work_div") or {})
+    if not dim_to_split:
+        return set()
+
+    loop_var_dims = getattr(ctx.op, "work_div_loop_info", {})
+    hinted: set[Symbol] = set()
+    for name in dim_to_split:
+        for sym in ctx.it_space:
+            if name in loop_var_dims.get(sym, []):
+                hinted.add(sym)
+                break
+    return hinted
+
+
 def coarse_tile_local_dim_split_domains(
     ctx: WorkDivConstraintContext,
 ) -> ConstraintResult:
@@ -405,6 +434,7 @@ def coarse_tile_local_dim_split_domains(
         return ConstraintResult()
 
     raw_to_squeezed = _raw_to_squeezed_pos(ctx.op)
+    hinted_syms = _hinted_work_div_syms(ctx)
 
     def pin(pos: int, extent: Expr) -> None:
         squeezed = raw_to_squeezed.get(pos)
@@ -412,6 +442,16 @@ def coarse_tile_local_dim_split_domains(
             return
         sym = sympy_index_symbol(f"d{squeezed}")
         if sym not in ctx.it_space:
+            return
+        if sym in hinted_syms:
+            # The user explicitly asked (via spyre_hint(work_div=...)) to
+            # split this coarse-tile-local dim. Leave it unpinned here and
+            # let work_division.py's _apply_user_hint validate and apply the
+            # requested split -- it already checks divisibility, core
+            # budget, and consistency with every OTHER constraint's
+            # allowed_splits/blocked, so deferring to it does not reopen the
+            # unhinted-greedy-search hazard this function otherwise guards
+            # against for the remaining, un-hinted coarse-tile-local dims.
             return
         assert concretize_expr(extent) == concretize_expr(ctx.it_space[sym]), (
             f"{ctx.op.get_name()}: tiled-dim extent {extent} for {sym} "
