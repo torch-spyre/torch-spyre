@@ -20,10 +20,6 @@ from typing import cast
 os.environ.setdefault(
     "TORCH_DEVICE_BACKEND_AUTOLOAD", "0"
 )  # must be before torch import
-os.environ.setdefault(
-    "SEN_COMMON_HEADERS", str(Path(__file__).resolve().parent.parent / "flex")
-)
-
 
 import glob
 
@@ -155,7 +151,6 @@ else:
             "or set the SPYRE_COMMS_INSTALL_DIR to the Spyre Comms install directory."
         )
 
-INCLUDE_DIRS += [os.environ["SEN_COMMON_HEADERS"]]
 LIBRARIES = ["flex"]
 
 
