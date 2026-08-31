@@ -26,7 +26,7 @@ os.environ.setdefault(
 
 
 import glob
-import re
+import regex as re
 
 from setuptools import Command, setup
 from setuptools.command.build_py import build_py as _build_py
