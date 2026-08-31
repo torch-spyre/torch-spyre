@@ -1,4 +1,4 @@
-ー# Copyright 2025 The Torch-Spyre Authors.
+# Copyright 2025 The Torch-Spyre Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -225,7 +225,7 @@ class TestBuildingBlocks(unittest.TestCase):
         #
         # We assert the failure originates in *codegen*, not the mixed-EA layout
         # gate: a plain @unittest.expectedFailure would also stay green if a future
-        # change re-tightened the gate and raised `Unsupported` before backend,
+        # change re-tightened the gate and raised `Unsupported` before codegen,
         # masking a regression of the path this test guards. So we require the
         # error to be a codegen failure and NOT the gate's "mixed EA"
         # Unsupported. Flip this to a compare_with_cpu once codegen lands.
