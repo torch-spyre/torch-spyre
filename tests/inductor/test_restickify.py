@@ -2360,6 +2360,25 @@ def test_restickify_coverage_gap(shape):
     _strict(lambda t: (t + t).transpose(0, -1).contiguous(), x)
 
 
+# Broadcasting an elided size-one axis into a new stick is an identity fill.
+_BROADCAST_INTO_STICK_SHAPES = [
+    ((1, 8, 1), 64),
+    ((1, 8, 1), 67),
+    ((3, 5, 1), 64),
+    ((1, 1, 1), 64),
+]
+
+
+@pytest.mark.parametrize(
+    "shape,bwidth",
+    _BROADCAST_INTO_STICK_SHAPES,
+    ids=[f"{'x'.join(map(str, s))}_b{b}" for s, b in _BROADCAST_INTO_STICK_SHAPES],
+)
+def test_restickify_broadcast_into_stick(shape, bwidth):
+    x = _arange(*shape, span=511)
+    _strict(lambda t: t.expand(*shape[:-1], bwidth).contiguous(), x)
+
+
 # --------------------------------------------------------------------------
 # White-box (device-free) geometry of the size-1 stick allocation grow.
 #

@@ -87,7 +87,7 @@ def _pointwise_ops() -> frozenset[str]:
 # them so this file cannot silently drift out of sync as ops are added.
 MATMUL_OPS = constants.MATMUL_REDUCTION_OPS
 
-REDUCTION_OPS = constants.SINGLE_INPUT_REDUCTION_OPS
+REDUCTION_OPS = constants.SINGLE_INPUT_REDUCTION_OPS | {constants.KEEP_BY_INDEX_OP}
 
 DTYPE_OPS = DtypeOpTable.op_names()
 

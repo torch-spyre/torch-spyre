@@ -407,16 +407,23 @@ def is_restickify_coords(in_coords: list[Expr], out_coords: list[Expr]) -> bool:
     """Return whether a single-input pointwise copy is a RESTICKIFY (vs IDENTITY).
 
     ``in_coords`` / ``out_coords`` are the operands' device-space coordinates.
-    It is a restickify iff a *different* host dim lands within the stick (the
-    within-stick coords carry different free symbols) -- except a broadcast (an
-    all-zero input expanding to non-scalar output), which is an identity fill.
+    It is a restickify iff a *different* host dim lands within the stick. A
+    broadcast into a new stick dim is an identity fill, not a stick swap.
 
     The authoritative test, shared by the codegen store side and the padding
     pass matcher (``is_restickify_op``) so the two cannot disagree.
     """
     if all(e == 0 for e in in_coords) and not all(e == 0 for e in out_coords):
         return False  # broadcast: scalar input expanding to non-scalar output
-    return in_coords[-1].free_symbols != out_coords[-1].free_symbols
+    out_stick_syms = out_coords[-1].free_symbols
+    if out_stick_syms == in_coords[-1].free_symbols:
+        return False
+    in_stick_syms = in_coords[-1].free_symbols
+    if not in_stick_syms and out_stick_syms:
+        in_syms = set().union(*(coord.free_symbols for coord in in_coords))
+        if out_stick_syms.isdisjoint(in_syms):
+            return False
+    return True
 
 
 def _scatter_index_buf_names_ordered(op: ComputedBuffer) -> list[str]:
