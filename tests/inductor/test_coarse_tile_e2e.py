@@ -4348,25 +4348,9 @@ class TestCoarseTileSpyreHints(InductorTestCase):
 
         Variant of test_hint_flash_attention with a causal mask and an
         explicit running-max (real_max) formulation that updates output and
-        denominator in place via copy_.
-
-        Still xfailed.  The divide sits outside the tiled scopes, so
-        `output`/`denominator` get full buffers + copy ops; each copy writes its
-        target without reading it, nothing costs that pairing, and
-        finalize_layouts overwrites the target with the writer's layout ->
-        "restickify needed but infeasible for op='buf24' input='buf26'".
-
-        Not resolvable by layout choice: writer and consumer need mutually
-        unrestickifiable candidates (forcing either aborts or gives ~70% wrong).
-        {"Lq": 2} alone reproduces it.  See
-        test_hint_flash_attention_v2_divide_in_scope for the formulation that
-        works, which localizes this to the cross-loop-group copy path.
-
-        Decision xfail: failing in CI (Actions run 30385154736, job
-        90362755639) on PR #3293. We've decided to xfail the coarse tiling
-        tests to allow us to merge to main -- deliberate decision to unblock
-        the merge, not a claim about a specific bisected root cause. Un-xfail
-        once the underlying regression is investigated and fixed.
+        denominator in place via copy_. The divide sits outside the tiled
+        scopes; see test_hint_flash_attention_v2_divide_in_scope for the
+        variant with the divide inside scope.
         """
         import math
         from torch_spyre._inductor import spyre_hint
