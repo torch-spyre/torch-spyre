@@ -19,4 +19,5 @@ test_suite_config:
             - TestOps::test_sdpa.*
             - TestOps::test_rope_fms.*
             - TestOps::test_qkv_attn_paths_fms.*
+            - TestOps::test_granite_attn_block.*
           mode: mandatory_success

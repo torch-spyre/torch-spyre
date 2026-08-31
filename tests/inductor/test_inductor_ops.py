@@ -3383,6 +3383,28 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             },
             "expect_fail": ["mha_decode", "gqa_decode"],
         },
+        ("test_granite_attn_block", "test_granite_attn_block_cpu"): {
+            "param_sets": {
+                "batch_size_1": (
+                    cached_randn(
+                        (1, 512, 4096), differentiation=1, dtype=torch.float16
+                    ),
+                    cached_randn((4096, 4096), differentiation=2, dtype=torch.float16),
+                    cached_randn((4096, 1024), differentiation=3, dtype=torch.float16),
+                    cached_randn((4096, 1024), differentiation=4, dtype=torch.float16),
+                    cached_randn((4096, 4096), differentiation=5, dtype=torch.float16),
+                ),
+                "batch_size_2": (
+                    cached_randn(
+                        (2, 512, 4096), differentiation=1, dtype=torch.float16
+                    ),
+                    cached_randn((4096, 4096), differentiation=2, dtype=torch.float16),
+                    cached_randn((4096, 1024), differentiation=3, dtype=torch.float16),
+                    cached_randn((4096, 1024), differentiation=4, dtype=torch.float16),
+                    cached_randn((4096, 4096), differentiation=5, dtype=torch.float16),
+                ),
+            },
+        },
         ("test_split", "test_split_cpu"): {
             "ops_dict": {
                 "exp": (
@@ -8389,6 +8411,25 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             return torch.prod(a, dim=dim, keepdim=keepdim)
 
         self.compare_with_cpu(fn, x, run_eager=False)
+
+    def test_granite_attn_block_cpu(self, x, wq, wk, wv, wo):
+        B, S, _ = x.shape
+        Hq, Hkv, D = 32, 8, 128
+        expansion = Hq // Hkv
+
+        def block(x, wq, wk, wv, wo):
+            q = (x @ wq).view(B, S, Hq, D).transpose(1, 2)
+            k = (x @ wk).view(B, S, Hkv, D).transpose(1, 2)
+            v = (x @ wv).view(B, S, Hkv, D).transpose(1, 2)
+            k = k.unsqueeze(2).expand(-1, -1, expansion, -1, -1).flatten(1, 2)
+            v = v.unsqueeze(2).expand(-1, -1, expansion, -1, -1).flatten(1, 2)
+            a = torch.nn.functional.scaled_dot_product_attention(
+                q, k, v, is_causal=True
+            )
+            a = a.transpose(1, 2).reshape(B, S, Hq * D)
+            return a @ wo
+
+        self.compare_with_cpu(block, x, wq, wk, wv, wo)
 
 
 if __name__ == "__main__":
