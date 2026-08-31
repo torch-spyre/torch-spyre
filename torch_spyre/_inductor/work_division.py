@@ -73,12 +73,8 @@ from .work_division_constraints import (
 
 logger = get_inductor_logger("work_division")
 
-# Maximum memory-access span per core.
-#
-# MVLOC supports a maximum value of 65535, with each entry representing
-# 4096 bytes. Therefore, the maximum addressable offset is:
-# 65535 * 4096 = 268431360 bytes (255.996 MiB).
-MAX_SPAN_BYTES = 65535 * 4096
+# Maximum memory-access span per core: 256MB hardware limit
+MAX_SPAN_BYTES = 256 * 1024 * 1024
 
 
 @dataclasses.dataclass

@@ -3,7 +3,7 @@
 ## Background
 
 Spyre kernels must keep each core's memory-address span within the hardware
-limit (`MAX_SPAN_BYTES`, (255.996 MiB)).  Normal `work_division` splits work
+limit (`MAX_SPAN_BYTES`, (256 MB)).  Normal `work_division` splits work
 across cores, but some physical layouts still expose a span that is too large
 for one core.  When that happens, backend compilation can fail with Work
 Division warnings, deeptools mutable-address failures, or immediate/EAR boundary
@@ -51,6 +51,7 @@ Example operation:
 ```python
 def fn(x, y):
     return x + y
+
 
 x.shape == y.shape == (1, 8195, 256, 64)
 ```
@@ -114,6 +115,7 @@ Example operation:
 def fn(x):
     return x.sum(dim=-1)
 
+
 x.shape == (1, 8195, 256, 64)
 out.shape == (1, 8195, 256)
 ```
@@ -142,7 +144,8 @@ Example operation:
 def fn(x):
     return x.sum(dim=0)
 
-x.shape   == (2, 20, 16, 64)
+
+x.shape == (2, 20, 16, 64)
 out.shape == (20, 16, 64)
 ```
 
@@ -181,9 +184,10 @@ Example operation:
 def lm_head(x, weight):
     return torch.nn.functional.linear(x, weight)
 
-x.shape      == (2, 64)
+
+x.shape == (2, 64)
 weight.shape == (1024, 64)
-out.shape    == (2, 1024)
+out.shape == (2, 1024)
 ```
 
 Lowering can represent this as a restickify producer followed by a
@@ -611,9 +615,7 @@ For a physical device coordinate at `device_dim`, span is computed as:
 
 ```python
 per_core_span = (
-    coord_span_elems
-    * math.prod(device_size[device_dim + 1:])
-    * dtype.itemsize
+    coord_span_elems * math.prod(device_size[device_dim + 1 :]) * dtype.itemsize
 )
 ```
 

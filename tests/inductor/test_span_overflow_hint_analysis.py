@@ -4377,7 +4377,7 @@ class TestSpanOverflowAdditionalPlannerCases(InductorTestCase):
         outside the initial candidate set.  With tiled ranges, the selected
         split validates against the same domain the real tiled kernel executes.
         """
-        op = _pointwise_op((4096, 4032, 4032, 64))
+        op = _pointwise_op((4096, 4096, 4096, 64))
 
         with patch.object(soha, "MAX_SPAN_BYTES", MAX_SPAN_BYTES):
             plan = plan_span_overflow_tile(op, max_cores=1)

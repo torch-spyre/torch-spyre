@@ -1180,7 +1180,7 @@ def _candidate_required_split_count(candidate: SpanOverflowCandidate) -> int:
     """Return the minimum split needed if this candidate's dim tiled alone.
 
     This is ``ceil(per_core_span / MAX_SPAN_BYTES)``: if a dim creates a
-    384 MB span and the limit is 255.996 MB it needs at least split ``2`` when
+    384 MB span and the limit is 256 MB it needs at least split ``2`` when
     considered by itself.
 
     The combined search can still choose a different legal divisor or combine
