@@ -773,12 +773,19 @@ def _find_layout_avoiding_var_on_stick(
        off the stick, onto a surviving coordinate.
     3. Else raise Unsupported.
     """
+    constant_stick = None
     for stl in arg.layouts:
         dev_coords = device_coordinates(stl, arg.dep, None)
         if dev_coords is None:
             continue
-        if avoid_var not in dev_coords[-1].free_symbols:
-            return stl
+        stick_vars = dev_coords[-1].free_symbols
+        if avoid_var not in stick_vars:
+            if stick_vars:
+                return stl
+            constant_stick = stl
+
+    if constant_stick is not None:
+        return constant_stick
 
     arg_host_coords = host_coordinates(arg.layout, arg.dep, None)
     surviving_vars = set()
