@@ -8390,6 +8390,109 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
         self.compare_with_cpu(fn, x, run_eager=False)
 
+    def test_scatter_into_view_simple(self):
+        """Test scatter into a reshaped tensor view.
+
+        Buffer shape: [512, 64, 32, 128] (4D)
+        View shape: [32768, 32, 128] (3D, flattening first two dims)
+        Mutation: scatter keys into random positions in the view
+
+        This tests the mutation-through-view code path where the op's
+        iteration space (3D view) differs from the buffer's rank (4D).
+        """
+        from torch.spyre import SpyreTensorLayout
+
+        cache_size = 512
+        cache_block_size = 64
+        H, D = 32, 128
+
+        kv_cache_layout = SpyreTensorLayout(
+            [cache_size, cache_block_size, H, D],
+            [cache_block_size * H * D, H * D, D, 1],
+            torch.float16,
+            [1, 0, 2, 3],
+        )
+
+        buffer = torch.zeros(cache_size, cache_block_size, H, D, dtype=torch.float16)
+        keys = torch.randn(3072, H, D, dtype=torch.float16)
+        indices = torch.randint(0, 32768, (3072,), dtype=torch.int64)
+
+        def scatter_op(buffer, keys, indices):
+            buffer.view(32768, H, D)[indices] = keys
+            return buffer
+
+        expected = scatter_op(buffer.clone(), keys, indices)
+
+        compiled = torch.compile(scatter_op)
+        buffer_spyre = buffer.clone().to(device_layout=kv_cache_layout)
+        keys_spyre = keys.to(device="spyre")
+        indices_spyre = indices.to(device="spyre")
+
+        result = compiled(buffer_spyre, keys_spyre, indices_spyre)
+        result_cpu = result.cpu()
+
+        torch.testing.assert_close(expected, result_cpu, atol=1e-3, rtol=1e-3)
+
+    def test_scatter_into_paged_cache(self):
+        """Test paged KV-cache scatter through views.
+
+        Multiple scatters into the same cache buffer through views,
+        simulating the paged attention pattern where mutation targets
+        are reshaped views of the underlying cache buffers.
+        """
+        from torch.spyre import SpyreTensorLayout
+
+        B, H, D = 12, 32, 128
+        cache_size = 512
+        cache_block_size = 64
+        num_tokens = B * 256
+
+        kv_cache_layout = SpyreTensorLayout(
+            [cache_size, cache_block_size, H, D],
+            [cache_block_size * H * D, H * D, D, 1],
+            torch.float16,
+            [1, 0, 2, 3],
+        )
+
+        def paged_store(key_cache, value_cache, keys, values, slot_idxs):
+            key_cache.view(32768, H, D)[slot_idxs] = keys
+            value_cache.view(32768, H, D)[slot_idxs] = values
+            return key_cache, value_cache
+
+        key_cache = torch.zeros(cache_size, cache_block_size, H, D, dtype=torch.float16)
+        value_cache = torch.zeros(
+            cache_size, cache_block_size, H, D, dtype=torch.float16
+        )
+        keys = torch.randn(num_tokens, H, D, dtype=torch.float16)
+        values = torch.randn(num_tokens, H, D, dtype=torch.float16)
+        slot_idxs = torch.randint(0, 32768, (num_tokens,), dtype=torch.int64)
+
+        key_cache_exp, value_cache_exp = paged_store(
+            key_cache.clone(), value_cache.clone(), keys, values, slot_idxs
+        )
+
+        compiled = torch.compile(paged_store)
+        key_cache_spyre = key_cache.clone().to(device_layout=kv_cache_layout)
+        value_cache_spyre = value_cache.clone().to(device_layout=kv_cache_layout)
+        keys_spyre = keys.to(device="spyre")
+        values_spyre = values.to(device="spyre")
+        slot_idxs_spyre = slot_idxs.to(device="spyre")
+
+        key_result, value_result = compiled(
+            key_cache_spyre,
+            value_cache_spyre,
+            keys_spyre,
+            values_spyre,
+            slot_idxs_spyre,
+        )
+        key_result_cpu = key_result.cpu()
+        value_result_cpu = value_result.cpu()
+
+        torch.testing.assert_close(key_cache_exp, key_result_cpu, atol=1e-3, rtol=1e-3)
+        torch.testing.assert_close(
+            value_cache_exp, value_result_cpu, atol=1e-3, rtol=1e-3
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

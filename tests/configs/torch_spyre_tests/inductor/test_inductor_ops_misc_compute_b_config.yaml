@@ -69,4 +69,6 @@ test_suite_config:
             # restickify add on padded dim tests
             - TestOps::test_restickify_add_transpose.*
             - TestOps::test_prod.*
+            - TestOps::test_scatter_into_paged_cache.*
+            - TestOps::test_scatter_into_view_simple.*
           mode: mandatory_success

@@ -110,6 +110,37 @@ def _fixed_read_layout(buf) -> "FixedTiledLayout":
     return layout
 
 
+def mutation_op_layout(op: ComputedBuffer) -> "FixedTiledLayout":
+    """Get the iteration-space layout of a mutation op.
+
+    When the mutation target is itself a view (e.g.
+    ``key_cache.view(32768, H, D)[slot_idxs] = keys``), the op's own iteration
+    space matches the view's shape, not the buffer's -- propagate_layouts.py
+    stamps a rank-correct FixedTiledLayout derived from the view onto
+    ``op.layout.view_layout``. This function returns that layout when present,
+    falling back to ``real_layout()`` for non-view mutations.
+
+    The returned layout should always be a FixedTiledLayout (mutation ops in
+    propagate_mutation_layouts are only scheduled if their real layout is one,
+    or if a rank-correct view layout was computed and is available to override
+    it).
+    """
+    if not isinstance(op.layout, MutationLayoutSHOULDREMOVE):
+        raise RuntimeError(
+            f"{op} expected to have MutationLayoutSHOULDREMOVE, got {type(op.layout)}"
+        )
+    view_layout = getattr(op.layout, "view_layout", None)
+    if isinstance(view_layout, FixedTiledLayout):
+        return view_layout
+    real = op.layout.real_layout()
+    if not isinstance(real, FixedTiledLayout):
+        raise RuntimeError(
+            f"{op} expected view or real layout to be FixedTiledLayout, "
+            f"got view_layout={type(view_layout)}, real_layout={type(real)}"
+        )
+    return real
+
+
 def get_mem_deps(n: SchedulerNode) -> list[SchedNodeArg]:
     res: list[SchedNodeArg] = []
     for arg in n.read_writes.reads:

@@ -23,12 +23,14 @@ import sympy
 import torch
 from .logging_utils import get_inductor_logger
 from torch._inductor.ir import (
+    BaseView,
     ComputedBuffer,
     DeviceCopy,
     ExternKernel,
     FallbackKernel,
     FixedLayout,
     InputBuffer,
+    MutableBox,
     MutationLayoutSHOULDREMOVE,
     MultiOutput,
     ReinterpretView,
@@ -90,6 +92,7 @@ from .pass_utils import (
     is_stick_expr_offset_free,
     is_topk,
     iter_var_id,
+    mutation_op_layout,
 )
 from .optimize_restickify import AllSameNode, AnyInNode, FixedInOutNode
 from .views import compute_coordinates, matching_dim
@@ -100,7 +103,6 @@ from .views import compute_coordinates, matching_dim
 # ---------------------------------------------------------------------------
 
 logger = get_inductor_logger("propagate_layouts")
-
 
 prims = torch.ops.prims
 aten = torch.ops.aten
@@ -1979,6 +1981,7 @@ def propagate_spyre_tensor_layouts(
                 continue
             if isinstance(op.layout, MutationLayoutSHOULDREMOVE):
                 target = op.layout.target
+                mutation_target_view = _mutation_target_view(op.layout)
                 while isinstance(target, ReinterpretView):
                     target = target.data
                 target_name = target.get_name() if hasattr(target, "get_name") else ""
@@ -2203,6 +2206,25 @@ def propagate_spyre_tensor_layouts(
                 op.restick_cost_fn = AllSameNode.from_args(
                     args, [target_stl], output_dep, op
                 )
+                if mutation_target_view is not None:
+                    # Mutation iterates over view's shape/rank, not buffer's
+                    # (rank mismatch would cause crash). Stamp view-derived
+                    # FixedTiledLayout onto op.layout (not the view node
+                    # itself, which may be frozen/shared IR). Device-side offset
+                    # handling is delegated to the unconditional stick-dimension
+                    # check (_find_alt_target_stl, above) which already ran and
+                    # either succeeded, raised Unsupported, or reassigned
+                    # target_stl to an alt_stl. Host-side offset is forwarded
+                    # through and flows to device coordinates via MemoryDep.index.
+                    view_layout = mutation_target_view.get_layout()
+                    op.layout.view_layout = FixedTiledLayout(
+                        view_layout.device,
+                        view_layout.dtype,
+                        view_layout.size,
+                        view_layout.stride,
+                        target_stl,
+                        view_layout.offset,
+                    )  # type: ignore[call-arg]
                 continue
             op.decide_layout()
             rw = op.get_read_writes()
@@ -2289,6 +2311,47 @@ def propagate_spyre_tensor_layouts(
     _resolve_copy_back_candidates(operations)
 
 
+def _mutation_target_buffer_and_view(mutation_layout: MutationLayoutSHOULDREMOVE):
+    """Unwrap MutationLayoutSHOULDREMOVE target to buffer and optional view.
+
+    Returns (buffer, view_or_none) where:
+    - ``buffer`` is the fully-unwrapped raw storage (like ``real_layout()``).
+    - ``view_or_none`` is the first ``BaseView`` encountered, or None if no
+      intervening view exists.
+
+    When the mutation target is itself a view, the mutating op's own iteration
+    space matches the *view's* shape, not the buffer's -- we need both the view
+    (for host shape/stride) and the buffer (for device layout computation).
+
+    Mirrors ``MutationLayoutSHOULDREMOVE.get_buffer()``'s ``unwrap_views``,
+    but tracks the first view encountered and returns it alongside the final
+    buffer.
+    """
+    target = mutation_layout.target
+    view_or_none = None
+    while True:
+        if isinstance(target, MutationLayoutSHOULDREMOVE):
+            target = target.target
+        elif isinstance(target, MutableBox):
+            target = target.data
+        elif isinstance(target, TensorBox):
+            target = target.data
+        elif isinstance(target, StorageBox):
+            target = target.data
+        elif isinstance(target, BaseView):
+            if view_or_none is None:
+                view_or_none = target
+            target = target.unwrap_view()
+        else:
+            return target, view_or_none
+
+
+def _mutation_target_view(mutation_layout: MutationLayoutSHOULDREMOVE):
+    """Wrapper for backward compatibility: return just the view, if any."""
+    _, view = _mutation_target_buffer_and_view(mutation_layout)
+    return view
+
+
 def propagate_mutation_layouts(
     nodes: list,
 ) -> list:
@@ -2300,6 +2363,19 @@ def propagate_mutation_layouts(
     mutation layout during its initialisation to set up mutation tracking.
     This pass runs as a _pre_fusion_custom_pass (after scheduler init) to
     assign FixedTiledLayout to those remaining mutation ops.
+
+    The mutation target may itself be a view (e.g.
+    ``key_cache.view(32768, H, D)[slot_idxs] = keys``): the op's own iteration
+    space matches the view's shape, not the fully-unwrapped buffer's, so
+    real_layout() alone would assign a layout whose rank disagrees with
+    op.data.ranges. propagate_spyre_tensor_layouts already computed a
+    rank-correct FixedTiledLayout for that case (pairing the view's host
+    shape/stride with the resolved device_layout) and recorded it as
+    ``op.layout.view_layout`` -- it is not stamped onto the view node itself,
+    since that node may be a frozen, shared/cached IR node (e.g.
+    ReinterpretView) that other ops also read. op.layout (the
+    MutationLayoutSHOULDREMOVE instance) is owned by this one mutation, so
+    it's a safe place to carry the extra layout alongside real_layout().
     """
     for n in nodes:
         if not (isinstance(n, SchedulerNode) and isinstance(n.node, ComputedBuffer)):
@@ -2307,10 +2383,9 @@ def propagate_mutation_layouts(
         if not isinstance(n.node.layout, MutationLayoutSHOULDREMOVE):
             continue
         if isinstance(n.node.data, (Pointwise, Reduction)):
-            real = n.node.layout.real_layout()
-            if isinstance(real, FixedTiledLayout):
-                n.node.layout = real
-            else:
+            try:
+                n.node.layout = mutation_op_layout(n.node)
+            except RuntimeError:
                 rw = n.read_writes
                 output_dep = next(iter(rw.writes))
                 args = _get_prop_args(rw.reads)
@@ -2318,13 +2393,12 @@ def propagate_mutation_layouts(
                 layouts = list(compute_layouts(n.node, output, output_dep, args))
                 n.node.layout = layouts[0]
         elif isinstance(n.node.data, Reduction):
-            real = n.node.layout.real_layout()
-            if isinstance(real, FixedTiledLayout):
-                n.node.layout = real
-            else:
+            try:
+                n.node.layout = mutation_op_layout(n.node)
+            except RuntimeError:
                 logger.warning(
                     "propagate_mutation_layouts: unhandled mutation Reduction"
-                    f" op {n.node.get_name()}: real_layout is {type(real)}"
+                    f" op {n.node.get_name()}"
                 )
         else:
             logger.warning(
