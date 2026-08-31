@@ -6844,16 +6844,15 @@ class TestCoarseTileReductionDim0E2E(InductorTestCase):
         def check_source(source):
             self.assertIn("coarse_tile_reduction_drain", source)
 
-        with config.patch({"sencores": 32, "lx_planning": True}):
-            compare_with_cpu(
-                fn,
-                values,
-                run_compile=True,
-                run_eager=False,
-                source_check=check_source,
-                atol=0.05,
-                rtol=0.05,
-            )
+        compare_with_cpu(
+            fn,
+            values,
+            run_compile=True,
+            run_eager=False,
+            source_check=check_source,
+            atol=0.05,
+            rtol=0.05,
+        )
 
     def test_carried_sum_rejects_reduction_dim_work_div(self):
         """The hint must name an output row, not the reduced expert dim."""
