@@ -50,6 +50,7 @@ import regex as re
 
 import pytest
 import torch
+import torch.nn.functional as F
 import unittest
 from unittest.mock import patch as mock_patch
 
@@ -5369,6 +5370,8 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         Lk=256,
         D=64,
         kv_block=128,
+        N_KV=None,
+        with_mask=False,
     ):
         """Flash attention with K/V chunking in PYTHON and WSR tiling only H/Lq.
 
@@ -5412,22 +5415,25 @@ class TestCoarseTileSpyreHints(InductorTestCase):
 
         h_tiles=4 and lq_tiles=2 differ deliberately so the LoopSpec assertions
         can tell the two levels apart; equal counts would pass even if one level
-        were dropped.  No causal mask here on purpose: with K chunking a fully
-        masked chunk gives block_max == -inf and exp(-inf - -inf) is NaN, which
-        is a real trap but a separate one from what this test pins down.
+        were dropped.  ``with_mask`` uses a finite-sentinel causal mask.  Unlike
+        ``-inf``, the finite value keeps a fully masked chunk from producing
+        ``exp(-inf - -inf) == NaN`` while a valid earlier/later chunk suppresses
+        its contribution in the online recurrence.
         """
         from torch_spyre._inductor import spyre_hint
 
         n_chunks = Lk // kv_block
         self.assertEqual(Lk % kv_block, 0, "chunks must divide Lk")
+        N_KV = H if N_KV is None else N_KV
+        self.assertEqual(H % N_KV, 0, "GQA heads must divide query heads")
         scale = 1.0 / math.sqrt(math.sqrt(D))
 
         torch.manual_seed(42)
         queries_t = torch.randn(B, H, Lq, D, dtype=torch.float16)
-        keys_t = torch.randn(B, H, Lk, D, dtype=torch.float16)
-        values_t = torch.randn(B, H, Lk, D, dtype=torch.float16)
+        keys_t = torch.randn(B, N_KV, Lk, D, dtype=torch.float16)
+        values_t = torch.randn(B, N_KV, Lk, D, dtype=torch.float16)
 
-        def flash(queries, k_chunks, v_chunks):
+        def flash(queries, k_chunks, v_chunks, m_chunks):
             with spyre_hint(named_dims=["B", "H", "Lq"]):
                 running_max = torch.full(
                     (B, H, Lq, 64),
@@ -5456,6 +5462,8 @@ class TestCoarseTileSpyreHints(InductorTestCase):
                     # matmuls need an explicit named_dims hint.
                     with spyre_hint(named_dims=["B", "H", "Lq", "Lkc"]):
                         scores = torch.matmul(queries * scale, keys_T)
+                    if m_chunks is not None:
+                        scores = scores + m_chunks[kb]
                     block_max = torch.amax(scores, dim=-1)
                     new_max = torch.maximum(running_max, block_max)
                     correction = torch.exp(running_max - new_max)
@@ -5487,12 +5495,56 @@ class TestCoarseTileSpyreHints(InductorTestCase):
             ]
 
         # CPU reference first, then device setup -- matching the driver pattern.
-        k_chunks_t, v_chunks_t = chunk(keys_t), chunk(values_t)
-        ref = flash(queries_t, k_chunks_t, v_chunks_t)
+        repeats = H // N_KV
+        keys_full_t = keys_t.repeat_interleave(repeats, dim=1)
+        values_full_t = values_t.repeat_interleave(repeats, dim=1)
+        k_chunks_t, v_chunks_t = chunk(keys_full_t), chunk(values_full_t)
+        m_chunks_t = None
+        mask_base_t = None
+        if with_mask:
+            query_positions = torch.arange(Lk - Lq, Lk).view(1, 1, Lq, 1)
+            key_positions = torch.arange(Lk).view(1, 1, 1, Lk)
+            mask_base_t = (
+                torch.where(
+                    key_positions <= query_positions,
+                    torch.tensor(0.0, dtype=torch.float16),
+                    torch.tensor(
+                        torch.finfo(torch.float16).min / 2, dtype=torch.float16
+                    ),
+                )
+                .expand(B, 1, Lq, Lk)
+                .contiguous()
+            )
+            mask_t = mask_base_t.expand(B, H, Lq, Lk).contiguous()
+            m_chunks_t = [
+                mask_t[..., i * kv_block : (i + 1) * kv_block].contiguous()
+                for i in range(n_chunks)
+            ]
+        if with_mask:
+            ref = F.scaled_dot_product_attention(
+                queries_t,
+                keys_t,
+                values_t,
+                attn_mask=mask_base_t,
+                dropout_p=0.0,
+                scale=1.0 / math.sqrt(D),
+                enable_gqa=N_KV != H,
+            )
+        else:
+            ref = flash(queries_t, k_chunks_t, v_chunks_t, m_chunks_t)
 
         queries_dev = queries_t.to("spyre")
-        k_chunks = [t.to("spyre") for t in k_chunks_t]
-        v_chunks = [t.to("spyre") for t in v_chunks_t]
+        keys_full = keys_t.to("spyre").repeat_interleave(repeats, dim=1)
+        values_full = values_t.to("spyre").repeat_interleave(repeats, dim=1)
+        k_chunks = chunk(keys_full)
+        v_chunks = chunk(values_full)
+        m_chunks = None
+        if mask_base_t is not None:
+            mask_full = mask_base_t.to("spyre").expand(B, H, Lq, Lk)
+            m_chunks = [
+                mask_full[..., i * kv_block : (i + 1) * kv_block].contiguous()
+                for i in range(n_chunks)
+            ]
         _declare_tensor_dim("B", B)
         _declare_tensor_dim("H", H)
         _declare_tensor_dim("Lq", Lq)
@@ -5502,9 +5554,12 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         _name_tensor_dims(queries_dev, ["B", "H", "Lq", "D"])
         for t in k_chunks + v_chunks:
             _name_tensor_dims(t, ["B", "H", "Lkc", "D"])
+        if m_chunks is not None:
+            for t in m_chunks:
+                _name_tensor_dims(t, ["B", "H", "Lq", "Lkc"])
 
         result, source_codes = run_and_get_code(
-            torch.compile(flash), queries_dev, k_chunks, v_chunks
+            torch.compile(flash), queries_dev, k_chunks, v_chunks, m_chunks
         )
         torch.testing.assert_close(
             result.cpu(),
@@ -5536,6 +5591,21 @@ class TestCoarseTileSpyreHints(InductorTestCase):
     def test_hint_flash_attention_kv_chunked_python_loop(self):
         """K/V chunked in Python, WSR tiling H (4) and Lq (2). See impl docstring."""
         self._run_kv_chunked_flash(h_tiles=4, lq_tiles=2)
+
+    def test_hint_flash_attention_kv_chunked_finite_causal_mask(self):
+        """Granite-shaped named masks remain correct under H/Lq coarse tiling."""
+        self._run_kv_chunked_flash(
+            h_tiles=8,
+            lq_tiles=4,
+            B=1,
+            H=32,
+            Lq=64,
+            Lk=128,
+            D=128,
+            kv_block=64,
+            N_KV=8,
+            with_mask=True,
+        )
 
     def test_hint_flash_attention_kv_chunked_prefill_8k(self):
         """Chunked prefill: a 512-token query block against an 8k K/V cache.
