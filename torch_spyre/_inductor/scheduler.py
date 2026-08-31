@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Sequence, Union
+from typing import Iterator, Sequence, Union
 
 import sympy
 
@@ -38,6 +38,7 @@ from .ir import FixedTiledLayout
 from .pass_utils import (
     PerCoreView,
     iteration_space,
+    iteration_space_from_op,
     per_core_view_scheduled,
     try_device_coordinates,
 )
@@ -49,6 +50,7 @@ from .scratchpad.lx_relayout import (
 )
 from .op_spec import LoopSpec
 from . import config as _spyre_config
+from .errors import Unsupported
 
 logger = get_inductor_logger("scheduler")
 
@@ -589,6 +591,191 @@ def demote_incoherent_lx_buffers(
         if culprit is None:
             continue
         demote(source_by_copy.get(name, name), culprit)
+
+    return nodes
+
+
+def verify_carried_reduction_ownership(
+    nodes: list[BaseSchedulerNode],
+) -> list[BaseSchedulerNode]:
+    """Verify the final physical contract of every loop-carried reduction.
+
+    This runs after fusion, LX demotion, and HBM-pool planning.  Earlier split
+    metadata is only an input request; the scheduled per-core views checked
+    here are the ownership codegen will actually emit.
+    """
+
+    def all_scheduler_nodes(
+        items: Sequence[BaseSchedulerNode],
+    ) -> Iterator[SchedulerNode]:
+        for item in items:
+            if isinstance(item, FusedSchedulerNode):
+                yield from all_scheduler_nodes(item.get_nodes())
+            elif isinstance(item, SchedulerNode):
+                yield item
+
+    grouped: dict[object, dict[str, SchedulerNode]] = {}
+    for node in all_scheduler_nodes(nodes):
+        record = getattr(node.node, "_carried_reduction_record", None)
+        if record is not None:
+            grouped.setdefault(record, {})[node.get_name()] = node
+
+    for record, by_name in grouped.items():
+        expected_names = {
+            record.fill_name,
+            record.combine_name,
+            record.drain_name,
+        }
+        missing = expected_names - by_name.keys()
+        if missing:
+            raise Unsupported(
+                "carried reduction lost physical stages after fusion: "
+                f"accumulator={record.accumulator_name}, missing={sorted(missing)}"
+            )
+
+        accumulator = V.graph.try_get_buffer(record.accumulator_name)
+        if accumulator is None:
+            raise Unsupported(
+                f"carried reduction accumulator {record.accumulator_name} is missing"
+            )
+        layout = accumulator.get_layout()
+        if not isinstance(layout, FixedTiledLayout):
+            raise Unsupported(
+                f"carried reduction accumulator {record.accumulator_name} has "
+                f"non-device layout {type(layout).__name__}"
+            )
+        if "lx" not in layout.allocation:
+            logger.warning(
+                "carried reduction %s remained in HBM; execution is correct but "
+                "the persistent-LX performance contract was not realized",
+                record.accumulator_name,
+            )
+            continue
+
+        checks = (
+            (record.fill_name, "write"),
+            (record.combine_name, "read"),
+            (record.combine_name, "write"),
+            (record.drain_name, "read"),
+        )
+        expected_view = layout.lx_view
+        for op_name, access in checks:
+            node = by_name[op_name]
+            deps = (
+                node.read_writes.reads if access == "read" else node.read_writes.writes
+            )
+            dep = next(
+                (
+                    candidate
+                    for candidate in deps
+                    if isinstance(candidate, MemoryDep)
+                    and candidate.name == record.accumulator_name
+                ),
+                None,
+            )
+            if dep is None and access == "write" and op_name == record.combine_name:
+                # MutationLayout's scheduled write is named after the combine
+                # op, while its storage target is the carried accumulator.
+                memory_deps = [
+                    candidate for candidate in deps if isinstance(candidate, MemoryDep)
+                ]
+                dep = memory_deps[0] if len(memory_deps) == 1 else None
+            if dep is None and access == "read" and op_name == record.drain_name:
+                # Mutation propagation names this dependency after the latest
+                # in-place writer, but it still reads the accumulator storage.
+                memory_deps = [
+                    candidate for candidate in deps if isinstance(candidate, MemoryDep)
+                ]
+                dep = memory_deps[0] if len(memory_deps) == 1 else None
+            if dep is None:
+                raise Unsupported(
+                    f"carried reduction {op_name} lost its {access} of "
+                    f"{record.accumulator_name}; deps="
+                    f"{[(type(candidate).__name__, candidate.name) for candidate in deps]}"
+                )
+            view, _, representable = per_core_view_scheduled(
+                node, dep, record.accumulator_name
+            )
+            if not representable:
+                raise Unsupported(
+                    f"carried reduction {op_name} {access} ownership is not "
+                    "representable"
+                )
+            if expected_view is None:
+                expected_view = view
+            elif view != expected_view:
+                raise Unsupported(
+                    f"carried reduction {op_name} {access} ownership {view} "
+                    f"does not match accumulator ownership {expected_view}"
+                )
+
+            # Equal physical views are necessary but not sufficient.  A
+            # 32-way split over H and a 32-way split over T can have the same
+            # total core count while assigning different logical rows to a
+            # core.  Project the final physical view back into this stage's
+            # scheduled loop symbols, then require the one split to be the
+            # row dimension named by the immutable carried-reduction record.
+            coordinates = try_device_coordinates(layout.device_layout, dep, None)
+            if coordinates is None:
+                raise Unsupported(
+                    f"carried reduction {op_name} {access} cannot map final "
+                    "accumulator coordinates back to operation loops"
+                )
+            try:
+                realized_division = work_division_from_view(
+                    view,
+                    coordinates,
+                    tuple(iteration_space(node)),
+                )
+            except ValueError as exc:
+                raise Unsupported(
+                    f"carried reduction {op_name} {access} cannot project final "
+                    f"ownership into operation loops: {exc}"
+                ) from exc
+            if realized_division is None:
+                raise Unsupported(
+                    f"carried reduction {op_name} {access} has no final work division"
+                )
+
+            # Scheduler dependency extraction alpha-renames operation symbols
+            # (for example, d0 -> c0) without changing dimension order.  The
+            # carried-reduction rewrite is explicitly limited to
+            # order-preserving pointwise stages, so translate the names across
+            # that rename here.  This is not a general positional-remapping
+            # facility: a rank change fails closed, and no other rewrite uses
+            # this path.
+            operation_symbols = tuple(iteration_space_from_op(node.node))
+            scheduled_symbols = tuple(iteration_space(node))
+            if len(operation_symbols) != len(scheduled_symbols):
+                raise Unsupported(
+                    f"carried reduction {op_name} {access} changed iteration rank "
+                    "before final ownership verification"
+                )
+            operation_named_dims = getattr(node.node, "work_div_loop_info", {})
+            named_dims = {
+                scheduled_symbol: operation_named_dims.get(operation_symbol, [])
+                for operation_symbol, scheduled_symbol in zip(
+                    operation_symbols, scheduled_symbols
+                )
+            }
+            row_symbols = [
+                symbol
+                for symbol in realized_division.work_slices
+                if record.row_dim_name in named_dims.get(symbol, [])
+            ]
+            expected_splits = (
+                {row_symbols[0]: record.required_row_split}
+                if len(row_symbols) == 1
+                else None
+            )
+            if realized_division.work_slices != expected_splits:
+                raise Unsupported(
+                    f"carried reduction {op_name} {access} expected only "
+                    f"{record.row_dim_name} split={record.required_row_split}, but "
+                    f"final logical splits are {realized_division.work_slices}"
+                )
+
+        assert expected_view is not None
 
     return nodes
 

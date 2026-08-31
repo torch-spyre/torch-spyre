@@ -19,8 +19,9 @@ defaults to off. It enlarges each op's set of candidate splits — pointwise
 dim-flips, the matmuls' tilings offered to neighbours, cross-matmul split
 transfer, a shared batch-major `B/M` tiling for matmuls and reductions —
 then searches the cross-product for the assignment that minimizes HBM
-traffic. The seed (work-division's choice) is always retained, so the
-result is never worse than work division alone.
+traffic. Every candidate, including work division's seed, must satisfy hard
+work-division constraints; generated alternatives also pass stick validation.
+An op with no legal candidate raises `Unsupported`.
 :::
 
 **Quick navigation:**
@@ -495,12 +496,20 @@ the winning assignment back before the standard allocator flow.
 :::
 
 Each op's candidate list is built by `_enum_split_options`, dispatching
-on op type. The seed (work division's choice) is always option 0 and is
-always retained, so the worst case matches work division. Every non-seed
-candidate is deduped by canonical key and filtered through
-`_split_fits_sticks`, which rejects factors that overflow a stickified
-dim's stick count (those would abort the SuperDSC bundler) or that land on
-a collapsed/broadcast dim.
+on op type. Generated alternatives are deduped by canonical key and filtered
+through `_split_fits_sticks`, which rejects factors that overflow a stickified
+dim's stick count (those would abort the SuperDSC bundler) or that land on a
+collapsed/broadcast dim. The upstream seed is already stick-valid from work
+division. Every candidate, including the seed, must satisfy hard
+work-division constraints: blocked axes remain unsplit and split domains
+restrict legal factors. Candidate divisions remain symbol-keyed in their
+producing operation's iteration space. Fixed candidates and the solver's
+selected candidate are revalidated from that symbol-keyed map before commit;
+LX planning never decodes candidates through the legacy coefficient-keyed
+Scheduler transport. Cross-operation compatibility is derived from physical
+`PerCoreView` ownership rather than comparing those local symbols, so an LX
+candidate remains faithful through selection and commit even when adjacent
+operations use different iteration-symbol names.
 
 **Pointwise ops** get their seed, dim-flip variants (move the seed's
 single output-dim factor onto each compatible alternative output dim,

@@ -51,7 +51,11 @@ from torch_spyre._C import (
     get_device_dtype,
     get_elem_in_stick,
 )
-from .dtype_ops import bool_equivalent_dtype
+from .dtype_ops import (
+    bool_equivalent_dtype,
+    bool_layout_dtype,
+    resolve_output_formats,
+)
 from .errors import Unsupported
 from .constants import (
     BATCH_MATMUL_OP,
@@ -164,46 +168,6 @@ def infer_bool_device_dtype(args: list[PropArg]) -> DataFormats:
         )
     (device_dtype,) = formats
     return device_dtype
-
-
-def _bool_layout_dtype(
-    device_dtype: DataFormats, context: str = "result"
-) -> torch.dtype:
-    """Return the logical dtype for a bool tensor stored as `device_dtype`.
-
-    Raises Unsupported if `device_dtype` has no bool-equivalent dtype.
-    """
-    dtype_for_layout = bool_equivalent_dtype(device_dtype)
-    if dtype_for_layout is None:
-        raise Unsupported(
-            f"torch.bool {context} of operand with device format {device_dtype}"
-        )
-    return dtype_for_layout
-
-
-def resolve_bool_layout_dtype(
-    stl: SpyreTensorLayout, context: str = "result"
-) -> torch.dtype:
-    """Return the logical dtype for a bool tensor physically stored as `stl`."""
-    return _bool_layout_dtype(stl.device_dtype, context)
-
-
-def resolve_output_formats(
-    output_dtype: torch.dtype,
-    bool_device_dtype: DataFormats | None,
-    context: str = "result",
-) -> tuple[DataFormats, torch.dtype]:
-    """Resolve an op output's ``(device_dtype, layout_dtype)`` pair.
-
-    Non-bool outputs derive both from ``output_dtype``. For bool outputs,
-    ``get_device_dtype(torch.bool)`` hardcodes SEN169_FP16 -- wrong for e.g. a
-    float32 comparison result -- so the caller supplies the real on-device
-    format in ``bool_device_dtype`` (read off the producing operand(s)).
-    """
-    if output_dtype == torch.bool:
-        assert bool_device_dtype is not None, "bool output needs bool_device_dtype"
-        return bool_device_dtype, _bool_layout_dtype(bool_device_dtype, context)
-    return get_device_dtype(output_dtype), output_dtype
 
 
 def _compute_dim_order(stick_dim, size, coords):
@@ -444,9 +408,12 @@ def _single_arg_op_layout(
     c_stride = [concretize_expr(s) for s in output.stride]
 
     if isinstance(data, Reduction):
-        # A bool result's physical format matches its operand's, not
-        # get_elem_in_stick(torch.bool)'s hardcoded SEN169_FP16.
-        out_dtype_for_layout = resolve_output_formats(output.dtype, stl.device_dtype)[1]
+        # Bool physical format resolution: see bool_layout_dtype's docstring.
+        out_dtype_for_layout = (
+            bool_layout_dtype(stl.device_dtype)
+            if output.dtype == torch.bool
+            else output.dtype
+        )
         stick_size = get_elem_in_stick(out_dtype_for_layout)
 
         x_dev_coords = device_coordinates(stl, dep, None)
@@ -631,8 +598,6 @@ def _single_arg_op_layout(
     ):
         # Input and output tensors are being accessed identically and elem size is the same.
         # We can simply propagate the device_layout including ElementArrangement.
-        # out_device_dtype resolves the correct physical format for bool outputs
-        # (get_device_dtype(bool) would hardcode SEN169_FP16).
         stl = SpyreTensorLayout(
             stl.device_size,
             stl.stride_map,
@@ -696,7 +661,7 @@ def _clone_layout(
     # input's -- substitute the equivalent logical dtype since
     # get_device_dtype(torch.bool) can't express that.
     if output.dtype == torch.bool:
-        dtype_for_layout = resolve_bool_layout_dtype(in_stl, "clone")
+        dtype_for_layout = bool_layout_dtype(in_stl.device_dtype, "clone")
     else:
         dtype_for_layout = output.dtype
     stick_size = get_elem_in_stick(dtype_for_layout)
@@ -1152,8 +1117,7 @@ def _multi_arg_pointwise_layouts(
         if dc is not None
     }
 
-    # A bool output reuses its operands' physical format (resolved from args);
-    # get_device_dtype(torch.bool) would hardcode SEN169_FP16.
+    # Bool physical format resolution: see resolve_output_formats's docstring.
     bool_device_dtype = (
         infer_bool_device_dtype(args) if output.dtype == torch.bool else None
     )
@@ -1652,7 +1616,15 @@ def _find_alt_target_stl(
     for a mutation target. Returns None if the current layout is already valid,
     or raises Unsupported if no valid alternative exists.
     """
-    stick_size = get_elem_in_stick(target_layout.dtype)
+    # A bool target's stick size comes from the format it is physically stored
+    # in (target_stl), not from target_layout.dtype -- see bool_layout_dtype's
+    # docstring.
+    dtype_for_layout = (
+        bool_layout_dtype(target_stl.device_dtype, "mutation target")
+        if target_layout.dtype == torch.bool
+        else target_layout.dtype
+    )
+    stick_size = get_elem_in_stick(dtype_for_layout)
     write_stick = device_coordinates(target_stl, output_dep, None)[-1]
     if is_stick_expr_offset_free(write_stick, stick_size):
         return None
@@ -1660,7 +1632,7 @@ def _find_alt_target_stl(
     c_size = [concretize_expr(s) for s in target_layout.size]
     c_stride = [concretize_expr(s) for s in target_layout.stride]
     candidates = _candidate_output_stls(
-        target_layout, output_dep, c_size, c_stride, write_stick
+        target_layout, output_dep, c_size, c_stride, write_stick, dtype_for_layout
     )
     if not candidates:
         raise Unsupported(

@@ -38,7 +38,7 @@ import sys
 import unittest
 from unittest import TestCase
 
-from torch_spyre._inductor.scratchpad import cooptimization_scorer as scorer
+from torch_spyre._inductor.scratchpad import utils
 from torch_spyre._inductor.scratchpad.sa_cooptimizer import (
     _MAX_STEPS,
     _MIN_STEPS,
@@ -1113,6 +1113,6 @@ class MemoryOnlyFallbackTest(TestCase):
                     traffic += (reads + (1 if intermediate else 0)) * max(0, b.size)
                 self.assertEqual(
                     solver.best_score,
-                    scorer.to_fixed_us(traffic / scorer.hbm_bytes_per_us()),
+                    utils.to_fixed_us(traffic / utils.hbm_bytes_per_us()),
                     f"{case}[{gi}] cap={cap}",
                 )

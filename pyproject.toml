@@ -40,16 +40,12 @@ requires-python = ">=3.11"
 dynamic = ["version"]
 
 [dependency-groups]
-# mlir_ktdp bindings for the OpSpec->KTIR emitter (TORCH_SPYRE_KTIR=1), imported
-# lazily so codegen/ktir.py stays importable without them. `uv sync --group ktir`.
-#
-# A group, not an extra, to keep it out of requirements/dev.txt: it needs an
-# out-of-band MLIR build (CMAKE_ARGS=-DMLIR_DIR=...), so it cannot be installed
-# unattended. The marker is required: it needs >=3.12, this project allows >=3.11,
-# and uv.lock must resolve for every version supported.
-ktir = [
-    "ktir-mlir-frontend @ git+https://github.com/torch-spyre/ktir-mlir-frontend.git@05e7a0ff814ebefb6e78450b1ec0e871c488c8bc ; python_version >= '3.12'",
-]
+# mlir_ktdp (ktir-mlir-frontend), which the OpSpec->KTIR emitter imports lazily,
+# is deliberately NOT declared here.  It is a scikit-build-core/CMake project that
+# must configure against a matching LLVM/MLIR, so it cannot be installed
+# unattended, and pinning it here would put this file in the path of every
+# routine bump.  Install it with `tools/install-ktir.sh`; the commit it is tested
+# against is `tools/ktir-mlir-frontend.pin`, which explains the rest.
 
 [project.optional-dependencies]
 # ortools is now a base dependency (on wheel-supported arches) since layout_solver

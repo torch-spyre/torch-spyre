@@ -351,6 +351,81 @@ def _patch_tensor_for_spyre():
     # preventing incorrect disk cache hits across process boundaries.
     # ──────────────────────────────────────────────────────────────────────────
     _patch_fx_graph_hash()
+    # ─────────────── invoke_subgraph subgraph decompositions ───────────────
+    # Threads the Spyre decomposition table into the re-trace of every
+    # nested_compile_region / invoke_subgraph subgraph body, so ops that must
+    # be decomposed on Spyre (notably SDPA → online-softmax) are decomposed
+    # inside the HOP body — not just in the top-level graph.
+    # ──────────────────────────────────────────────────────────────────────────
+    _patch_invoke_subgraph_decompositions()
+
+
+def _patch_invoke_subgraph_decompositions():
+    """Thread the Spyre decomp table into invoke_subgraph subgraph re-traces.
+
+    torch-spyre installs its decomposition table only on the patched top-level
+    ``compile_fx``/``compile_fx_inner`` (see ``torch_spyre/_inductor``). But
+    ``torch.compiler.nested_compile_region`` bodies (the ``invoke_subgraph``
+    HOP) are RE-TRACED separately, via
+    ``reenter_make_fx(subgraph, subgraph_decomp_table=_extract_nested_region_config(subgraph))``.
+    ``_extract_nested_region_config`` reads
+    ``gm.meta["nested_region_config"].decompositions`` which is ``None`` unless
+    the user passed an explicit ``NestedCompileRegionOptions(decompositions=...)``.
+    With ``None``, the subgraph body is re-traced with NO decomposition table —
+    so e.g. ``aten.scaled_dot_product_attention`` survives in the subgraph and
+    torch-spyre lowers it incorrectly (Blocker 6: correct when a single call is
+    inlined by Inductor, wrong once ≥2 calls keep it as a shared HOP body).
+
+    This patch wraps ``_extract_nested_region_config`` so that when it returns
+    ``None`` (the region inherits its parent's decompositions) AND we are inside
+    a Spyre ``compile_fx`` call, it returns ``get_spyre_decomp_table()`` instead.
+    An explicit user-provided table is respected unchanged, and — because the
+    gate is the ``in_spyre_compile()`` thread-local set by the patched
+    ``compile_fx`` wrapper — a nested_compile_region compiled outside a Spyre
+    compile (pure-CPU) is left alone.
+
+    Why the thread-local (not device inspection): at HOP re-trace time the
+    subgraph body is traced on fake tensors whose device is not ``spyre`` and
+    whose weights are lifted as inputs, so scanning the subgraph GraphModule's
+    tensor devices always reports "not Spyre" (B6DIAG3, device-proven). The
+    reliable signal that this re-trace belongs to a Spyre compile is that a
+    Spyre ``compile_fx`` is on the stack — which ``_wrapper`` records.
+
+    Guarded behind availability so a torch without the invoke_subgraph reenter
+    machinery is unaffected. Idempotent.
+    """
+    import sys
+
+    mod = sys.modules.get("torch._higher_order_ops.invoke_subgraph")
+    if mod is None:
+        try:
+            import torch._higher_order_ops.invoke_subgraph as mod  # noqa: F811
+        except ImportError:
+            # torch predates the invoke_subgraph reenter path — nothing to do.
+            return
+
+    original = getattr(mod, "_extract_nested_region_config", None)
+    if original is None or getattr(original, "_spyre_decomp_patched", False):
+        return
+
+    def _spyre_extract_nested_region_config(fn):
+        # Respect an explicit user-provided table; otherwise, if this HOP
+        # re-trace is happening inside a Spyre compile, thread the Spyre decomp
+        # table so ops that must be decomposed on Spyre (notably SDPA →
+        # online-softmax) are decomposed inside the region body.
+        table = original(fn)
+        if table is not None:
+            return table
+        from torch_spyre._inductor import in_spyre_compile
+
+        if not in_spyre_compile():
+            return None
+        from torch_spyre._inductor.decompositions import get_spyre_decomp_table
+
+        return get_spyre_decomp_table()
+
+    _spyre_extract_nested_region_config._spyre_decomp_patched = True
+    mod._extract_nested_region_config = _spyre_extract_nested_region_config
 
 
 def _patch_fx_graph_hash():

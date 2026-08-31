@@ -69,13 +69,13 @@ def _feats(
     elems = 512 * 1024  # 1 MB at 2 bytes
     args = []
     if shared_input:
-        args.append(ArgTraffic("arg0", "input", "hbm", elems, False, [], []))
+        args.append(ArgTraffic("arg0", "input", False, elems, False, [], []))
     for i in range(extra_reads):
-        args.append(ArgTraffic(f"{name}_in{i}", "input", "hbm", elems, False, [], []))
+        args.append(ArgTraffic(f"{name}_in{i}", "input", False, elems, False, [], []))
     for i in range(write_mb):
-        args.append(ArgTraffic(f"{name}_out{i}", "output", "hbm", elems, False, [], []))
+        args.append(ArgTraffic(f"{name}_out{i}", "output", False, elems, False, [], []))
     for i in range(lx_mb):
-        args.append(ArgTraffic(f"{name}_lx{i}", "output", "lx", elems, False, [], []))
+        args.append(ArgTraffic(f"{name}_lx{i}", "output", True, elems, False, [], []))
     f = OpFeatures(
         name=name,
         is_reduction=False,
@@ -448,13 +448,19 @@ def _looped(name, trip, args, matmul=False):
         loop_trip=trip,
         is_matmul=matmul,
         tiles_output_dim=matmul,
+        # A concrete matmul geometry so a bundle containing this op is priceable by
+        # ``_matmul_axes_for_split_cost`` (M=rows_per_core, N=cols_per_core, K backed
+        # out of matmul_a_bytes) -- unused when ``matmul`` is False.
+        matmul_rows_per_core=64.0,
+        matmul_cols_per_core=64.0,
+        matmul_a_bytes=64 * 64 * 2,
     )
     f.get_device = lambda: _Device(DEVICE_NAME)
     return f
 
 
 def _arg(name, role, elems, factor=1, mem="hbm"):
-    a = ArgTraffic(name, role, mem, elems, False, [], [])
+    a = ArgTraffic(name, role, mem == "lx", elems, False, [], [])
     a.loop_factor = factor
     return a
 
