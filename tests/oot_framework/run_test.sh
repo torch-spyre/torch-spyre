@@ -1780,13 +1780,29 @@ _run_pytest_isolated() {
         }
 
         if [[ "$_dir" == *"/distributed"* ]] || [[ "$_dir" == *"/distributed" ]]; then
-            # Check that AIU_WORLD_SIZE is set
-            if [[ -z "${AIU_WORLD_SIZE:-}" ]]; then
-                echo "Error: AIU_WORLD_SIZE environment variable is not set" >&2
-                exit 1
+            # Determine _NPROC from SPYRE_DEVICES if set, otherwise fall back to
+            # AIU_WORLD_SIZE.  SPYRE_DEVICES is a comma-separated list of device
+            # indices (e.g. "0,2,3").
+
+            # Only used for count
+            local -a _SPYRE_DEVICE_IDS=()
+            if [[ -n "${SPYRE_DEVICES:-}" ]]; then
+                IFS=',' read -r -a _SPYRE_DEVICE_IDS <<< "${SPYRE_DEVICES}"
+                _NPROC="${#_SPYRE_DEVICE_IDS[@]}"
+                # Cache the original AIU_WORLD_SIZE so it can be restored after torchrun exits
+                _AIU_WORLD_SIZE_ORIG="${AIU_WORLD_SIZE:-}"
+                export AIU_WORLD_SIZE="$_NPROC"
+                echo "[torch_oot_device_tests_run] SPYRE_DEVICES='${SPYRE_DEVICES}' -> nproc=${_NPROC} (AIU_WORLD_SIZE overridden for this run)"
+            else
+                # SPYRE_DEVICES not set: require AIU_WORLD_SIZE.
+                if [[ -z "${AIU_WORLD_SIZE:-}" ]]; then
+                    echo "Error: neither SPYRE_DEVICES nor AIU_WORLD_SIZE is set" >&2
+                    exit 1
+                fi
+                _NPROC="${AIU_WORLD_SIZE}"
+                _AIU_WORLD_SIZE_ORIG="${AIU_WORLD_SIZE}"
+                echo "[torch_oot_device_tests_run] AIU_WORLD_SIZE='${AIU_WORLD_SIZE}' -> nproc=${_NPROC}"
             fi
-            # Use torchrun for distributed tests
-            _NPROC="${AIU_WORLD_SIZE}"
             echo "[torch_oot_device_tests_run] Running distributed test with torchrun (nproc=$_NPROC)"
 
             # Set environment variables for split_output.sh
@@ -1839,6 +1855,14 @@ _run_pytest_isolated() {
 
             # Clean up log directory
             rm -rf "${_LOGDIR}"
+
+            # Restore AIU_WORLD_SIZE to its original value now that torchrun has exited.
+            # If it was unset before we overrode it, unset it again.
+            if [[ -z "$_AIU_WORLD_SIZE_ORIG" ]]; then
+                unset AIU_WORLD_SIZE
+            else
+                export AIU_WORLD_SIZE="$_AIU_WORLD_SIZE_ORIG"
+            fi
         else
             echo "[torch_oot_device_tests_run] Running serial test"
             # Regular pytest for non-distributed tests.
