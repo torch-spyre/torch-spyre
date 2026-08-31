@@ -179,6 +179,33 @@ class HostBuffer {
 // function is defined as deeptools::processComputeOnHostCommand
 
 /**
+ * @brief Which stream a JobPlanStep runs on in the two-stream overlap topology.
+ *
+ * Prep = the persistent host-compute stream (S_prep): HostCompute and H2D.
+ * Dev = the default stream (S_dev): Compute and D2H. Compute overlaps HC/H2D by
+ * running on a different stream; every op keeps pipeline_barrier=true.
+ */
+enum class StreamRole { Prep, Dev };
+
+/**
+ * @brief Coarse classification of a JobPlanStep for structural validation.
+ *
+ * Used by the P2-14 step-ordering validator (checkJobPlanStepOrdering) and the
+ * get_step_type binding. Kept separate from the concrete step classes so the
+ * ordering logic is a PURE function over a projected (StepKind, StreamRole)
+ * sequence and can be unit-tested (e.g. a role-misplacement negative test)
+ * without constructing heavyweight steps (a real HostCompute needs a
+ * deeptools::Hcm plus pinned HostBuffers).
+ */
+enum class StepKind {
+  HostCompute,
+  H2D,
+  D2H,
+  Compute,
+  Unknown,
+};
+
+/**
  * @brief Discriminator for SymbolicArg entries.
  *
  * kAddress  – the slot carries the HBM device address of a tensor.
@@ -310,11 +337,27 @@ class JobPlanStep {
     return pipeline_barrier_;
   }
 
+  /**
+   * @brief Which stream this step runs on (Prep or Dev).
+   *
+   * Resolved at PrepareKernel time and read by SpyreStream::launch() to route
+   * the step to S_prep or S_dev. Defaults to Dev; subclasses that belong on the
+   * prep stream (HostCompute, H2D) set Prep in their ctor.
+   */
+  StreamRole role() const {
+    return role_;
+  }
+
  protected:
   // true by default: every step is a potential consumer that should wait for
-  // prior ops. Steps that are genuinely overlap-eligible (HostCompute) opt out
-  // explicitly.
+  // prior ops. With the two-stream topology EVERY step keeps this true (strict
+  // per-stream FIFO); overlap comes from the stream split, never from relaxing
+  // a barrier.
   bool pipeline_barrier_ = true;
+
+  // Which stream this step runs on. Defaults to Dev (device compute / D2H);
+  // HostCompute and H2D override to Prep in their ctors.
+  StreamRole role_ = StreamRole::Dev;
 };
 
 /**
@@ -351,7 +394,9 @@ class JobPlanStepH2D final : public JobPlanStep {
    */
   JobPlanStepH2D(void* host_address, flex::CompositeAddress device_address)
       : host_address_(host_address),
-        device_address_(std::move(device_address)) {}
+        device_address_(std::move(device_address)) {
+    role_ = StreamRole::Prep;  // H2D runs on the prep stream (S_prep)
+  }
 
   void construct(LaunchContext& ctx, const SpyreStream& stream) const override;
 
@@ -494,8 +539,12 @@ class JobPlanStepHostCompute final : public JobPlanStep {
         output_buffer_(output_buffer),
         input_buffer_(input_buffer),
         ishape_(std::move(ishape)) {
-    pipeline_barrier_ = false;  // host callbacks are overlap-eligible
-
+    // Inherits pipeline_barrier_ = true from the base. HostCompute keeps strict
+    // per-stream FIFO like every other op; overlap with device compute comes
+    // from placing HostCompute on the prep stream (S_prep), NOT from relaxing
+    // its barrier. The inline synchronize() it triggers only drains S_prep, so
+    // it never blocks device compute on S_dev.
+    role_ = StreamRole::Prep;
     // Try to build fast plan at construction time (prepare time)
     if (hcm_) {
       fast_plan_.valid = deeptools::buildFastHcmPatchPlan(fast_plan_, *hcm_);
@@ -635,5 +684,51 @@ struct JobPlan {
  * @return Reference to the output stream
  */
 std::ostream& operator<<(std::ostream& os, const JobPlan& plan);
+
+/**
+ * @brief Classify a JobPlanStep into a StepKind (dynamic_cast dispatch).
+ *
+ * Single source of truth for step-type identification, shared by the
+ * get_step_type binding and the P2-14 ordering validator.
+ */
+StepKind classifyStep(const JobPlanStep& step);
+
+/// Human-readable name for a StepKind (used by get_step_type and validator
+/// error messages). Never returns nullptr.
+const char* stepKindName(StepKind kind);
+
+/// Parse a StepKind from its stepKindName() spelling. Throws on an unknown
+/// name. Used by the check_job_plan_step_ordering Python binding.
+StepKind stepKindFromName(const std::string& name);
+
+/// Parse a StreamRole from "Prep"/"Dev". Throws on an unknown name. Used by the
+/// check_job_plan_step_ordering Python binding.
+StreamRole streamRoleFromName(const std::string& name);
+
+/**
+ * @brief Validate the two-stream step ordering over a PROJECTED sequence.
+ *
+ * Pure function over parallel (kinds, roles) vectors — one entry per step, in
+ * plan order. Returns an empty string when the ordering is valid, otherwise a
+ * human-readable error message. This is the core of the P2-14 validator:
+ * JobPlanBuilder::validate() classifies the real plan and calls this, and the
+ * check_job_plan_step_ordering binding calls it directly so a role-misplacement
+ * rejection can be tested without building real steps.
+ *
+ * Since the STATIC correction-overlap path was retired, torch-spyre emits NO
+ * cross-stream event steps: the correction plan is the plain role-tagged triple
+ * [HostCompute(Prep), H2D(Prep), Compute(Dev)] and flex's per-region hazard
+ * tracker inserts the RAW/WAR edges dynamically at enqueue. The validator
+ * therefore checks ROLE ordering only:
+ *  - Applied only when the plan has a HostCompute; a plan without one (pure
+ *    ComputeOnDevice, standalone D2H, tensor .to() moves) is legacy
+ *    single-stream and stays valid unconditionally (backward-compat).
+ *  - S_prep (role Prep) must be exactly  HostCompute -> H2D  (no Compute on
+ *    Prep).
+ *  - S_dev (role Dev) must be exactly  Compute  (no HostCompute/H2D on Dev),
+ *    preserving the leading-producer guarantee.
+ */
+std::string checkJobPlanStepOrdering(const std::vector<StepKind>& kinds,
+                                     const std::vector<StreamRole>& roles);
 
 }  // namespace spyre

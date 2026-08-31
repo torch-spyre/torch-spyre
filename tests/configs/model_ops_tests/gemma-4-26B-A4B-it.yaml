@@ -2801,7 +2801,7 @@ test_suite_config:
                           device: cuda
                           init: randint
                           init_args:
-                            high: 1000
+                            high: 272
                       - tensor:
                           shape: [272]
                           stride: [1]
