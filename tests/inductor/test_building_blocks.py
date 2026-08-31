@@ -201,6 +201,38 @@ class TestBuildingBlocks(unittest.TestCase):
             run_eager=False,
         )
 
+    def test_chained_rms_norm_fp32_upcast(self):
+        B, S, H = 1, 64, 2816
+        eps = 1e-6
+        residual = torch.randn(B, S, H, dtype=torch.float16) / 4
+        dense = torch.randn(B, S, H, dtype=torch.float16) / 4
+        moe = torch.randn(S, H, dtype=torch.float16) / 4
+        weight1 = torch.randn(H, dtype=torch.float16) / 4
+        weight2 = torch.randn(H, dtype=torch.float16) / 4
+        scale = torch.tensor([0.5], dtype=torch.float16)
+
+        def rms_norm(x, weight):
+            x32 = x.to(torch.float32)
+            var = x32.pow(2).mean(-1, keepdim=True)
+            return (x32 * torch.rsqrt(var + eps)).to(x.dtype) * weight
+
+        def chained_rms_norm(residual, dense, moe, weight1, weight2, scale):
+            moe_out = rms_norm(moe, weight1).reshape_as(dense)
+            ffn_out = rms_norm(dense + moe_out, weight2)
+            return (residual + ffn_out) * scale
+
+        compare_with_cpu(
+            chained_rms_norm,
+            residual,
+            dense,
+            moe,
+            weight1,
+            weight2,
+            scale,
+            cpu_compile=False,
+            run_eager=False,
+        )
+
     def test_mixed_ea_staggered_broadcaster_fp16(self):
         # Case 3.2 of the mixed-EA rule: the *staggered* operand is the
         # size-1-stick broadcaster (fp16 produced by an fp32->fp16 downcast,
