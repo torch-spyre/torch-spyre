@@ -342,8 +342,10 @@ jobs:
           # tests (e.g. a matrix/artifact-download problem) must not be
           # recorded as a passing run.
           CONCLUSION: >-
-            ${{
-              (fromJSON(steps.test_results.outputs.test_results_json).total > 0) && 'success' || 'failure'
+            ${{ 
+              fromJSON(steps.test_results.outputs.test_results_json).total > 0
+              && fromJSON(steps.test_results.outputs.test_results_json).failed == 0
+              && 'success' || 'failure'
             }}
           # Empty whenever `build` failed before reaching compute_durations
           # (e.g. the PyTorch/torch-spyre build itself failed) — omitted
@@ -385,8 +387,10 @@ jobs:
         with:
           status: completed
           conclusion: >-
-            ${{
-              (fromJSON(steps.test_results.outputs.test_results_json).total > 0) && 'success' || 'failure'
+            ${{ 
+              fromJSON(steps.test_results.outputs.test_results_json).total > 0
+              && fromJSON(steps.test_results.outputs.test_results_json).failed == 0
+              && 'success' || 'failure'
             }}
           test-results: >-
             {
@@ -410,8 +414,10 @@ jobs:
         with:
           status: completed
           conclusion: >-
-            ${{
-              (fromJSON(steps.test_results.outputs.test_results_json).total > 0) && 'success' || 'failure'
+            ${{ 
+              fromJSON(steps.test_results.outputs.test_results_json).total > 0
+              && fromJSON(steps.test_results.outputs.test_results_json).failed == 0
+              && 'success' || 'failure'
             }}
           test-results: >-
             {
