@@ -14,7 +14,7 @@
 
 """Lowering tests for `for_each_tile`: the loop must reach a `while_loop`, and copy nothing.
 
-Nine cases:
+Eleven cases:
 
   A     tile M as a map: step `i` takes a row band of X, sees Y whole, and its result
         tile is laid along dim 0 of the output. The map level in its smallest form.
@@ -41,6 +41,18 @@ Nine cases:
   PA_D  the complement of PA_C: the page loop and nothing else. Gather K and V for the
         pages `page_index` names, add a constant, accumulate. Read it for the Gather
         alone -- it copies nothing at all.
+  PA_E  PA_B's nest on the whole argument list a vLLM deployment calls with -- head size
+        128, 128-token pages out of a 256-page pool, a stick-wide `(2, 32)` page table,
+        one KV head serving all eight query heads (MQA) -- swept over query length 1 and
+        32, i.e. decode and prefill. No new machinery; the case exists to hold the loop
+        count fixed while the working set grows by four orders of magnitude, because a
+        lowering that copied a 768-float pool per step would pass PA_B and a 16 MiB one
+        would not go unnoticed.
+  PA_F  PA_E with the heads unshared, eight KV heads at one query head each: MHA, the
+        degenerate-dimension layout. Both realistic layouts cost ONE materialization, the
+        caller's own mask stack, and neither of PA_B's two clones, which need `nkv` AND
+        `nq` both above 1, i.e. a batch flatten that has to merge a real axis with the
+        head broadcast's stride-0 one.
 
 Each case asserts three things about the post-grad graphs, `while_loop` subgraphs
 included:
@@ -51,9 +63,18 @@ included:
     ones listed per case, each of which is something the caller asked for;
   * the numbers, against eager and against a dense reference.
 
-The gathered cases take their page index already contiguous, so nothing the caller does
-to a stick-wide page table lands in the graph. `for_each_tile` raises on a strided index
-instead of copying it silently, because the index table becomes a while_loop carry whose
+A page can be selected on either side of the loop boundary, and the cases take both.
+PA_B/PA_C/PA_D hand `for_each_tile` the page index up front as a `Gather` tile spec, so
+the frontend selects each step's page and the body only ever sees a tile -- the mechanism
+PA_D exists to isolate. PA_E/PA_F instead write the real kernel's `for i in
+range(num_blocks)` body: the `(active, 32)` page table is the loop's own tiled operand, so
+step `i` gets row `i`, reads its column 0, and `index_select`s the untiled pools itself.
+The pools then reach the `while_loop` as loop-invariant additional inputs rather than as
+tiles, which is the arrangement worth checking at serving sizes -- 16 MiB entering whole
+and one 64 KiB page coming out per step, with no copy of either.
+
+Both forms need a contiguous index and `for_each_tile` raises on a strided `Gather` one
+rather than copying it silently, because that index becomes a while_loop carry whose
 strides would be re-established every step.
 
 The graph is the right instrument for the copy count rather than the generated wrapper:
@@ -75,6 +96,7 @@ Run:
 import contextlib
 import os
 import unittest
+from typing import NamedTuple
 
 import torch
 from torch._inductor.utils import run_and_get_code
@@ -171,7 +193,8 @@ def write_dump(name, header, graphs, code):
 # Matmul settings:
 M, K, N = 8, 12, 6
 
-# Paged attention settings: a 6-page pool with 3 pages active. Shared by PA_B, PA_C, PA_D.
+# Paged attention settings: a 6-page pool with 3 pages active. Shared by PA_B, PA_C, PA_D
+# and collected as `SMALL` below; PA_E and PA_F run the same PA_B nest at serving sizes.
 # Names and roles follow vLLM's; the sizes are shrunk so codegen stays readable.
 NKV = 2  # KV heads, i.e. GQA groups. q, k, v and the carry all keep this leading.
 NQ = 2  # query heads per KV head, so HEADS = NKV * NQ overall. k/v broadcast over it.
@@ -195,6 +218,64 @@ SCALE = 1.0 / (HS**0.5)
 # k_pool/v_pool are one tensor each, as in the real kernel, so Gather is faithful: the
 # per-step page is an index_select of ACTIVE-many rows out of POOL_PAGES. Only `mask`
 # is stacked from a list here, because a per-step operand has to be one tensor.
+#
+# PA_E/PA_F keep this table except for the page path, where they follow the real kernel
+# instead: the (ACTIVE, 32) page table takes dim 0 and the pools go untiled, so the body
+# indexes them with the row it is handed. See `paged_attn_nested`.
+
+
+class PagedShape(NamedTuple):
+    """One paged-attention call's geometry, so a case is a shape rather than a rewrite.
+
+    `nq` is query heads PER KV head, i.e. the GQA group width: `nq == 1` is MHA, every
+    head with its own KV; `nkv == 1` is MQA, one KV head serving every query head; and
+    anything between is GQA proper. That follows q's layout in the real kernel,
+    `[num_kv_heads, num_queries_per_kv, padded_query_len, head_size]`, where the leading
+    axis is KV heads and not heads.
+    """
+
+    nkv: int  # KV heads, i.e. GQA groups
+    nq: int  # query heads per KV head
+    pql: int  # query tokens in this block
+    hs: int  # head size: the contraction axis of Q@K^T
+    block: int  # KV tokens per page: a score tile's key axis
+    pool_pages: int  # pages in the whole cache
+    active: int  # pages this sequence occupies = the page loop's trip count
+    stick_table: bool = False  # hand the kernel the (active, 32) table, not a column
+
+    @property
+    def heads(self) -> int:
+        return self.nkv * self.nq
+
+    @property
+    def scale(self) -> float:
+        return 1.0 / self.hs**0.5
+
+
+SMALL = PagedShape(NKV, NQ, PQL, HS, BLOCK, POOL_PAGES, ACTIVE)
+
+
+def vllm_shape(nkv, nq, pql):
+    """A serving-sized shape: 8 heads at head size 128, 2 pages of a 256-page pool.
+
+    The sizes a vLLM deployment actually calls with -- `block_size=128`, `head_size=128`,
+    a 256-page cache -- rather than the shrunk-for-readability `SMALL`. `nkv * nq == 8`
+    either way, so the two head layouts differ only in how the KV is shared: `(1, 8)` is
+    MQA, one KV head serving all eight query heads, `(8, 1)` is MHA, each head its own.
+
+    The page index arrives stick-wide too, `(active, 32)` as the real kernel takes it, so
+    the whole argument list is the deployment's and not a convenience.
+    """
+    return PagedShape(
+        nkv=nkv,
+        nq=nq,
+        pql=pql,
+        hs=128,
+        block=128,
+        pool_pages=256,
+        active=2,
+        stick_table=True,
+    )
 
 
 def matmul_inputs():
@@ -256,37 +337,145 @@ def nest(axes, tM, tK, tN):
     return fn
 
 
-def paged_attn_inputs():
+def paged_attn_inputs(shape=SMALL):
     """(q, k_pool, v_pool, page_index, mask_tiles) and the dense-softmax reference.
 
     Shaped the way the real kernel is called: the page table is stick-wide int32 with
-    the page index in column 0, and the mask tiles carry `finfo.min` (not -inf) on a
-    padded tail, as vLLM's do.
+    the page index in column 0, the pages the sequence occupies are scattered through
+    the pool rather than the first `active` of it, and the mask carries `finfo.min` (not
+    -inf) on a padded tail, as vLLM's does.
 
-    The page index is handed over already contiguous, so the column extraction is the
-    caller's business and stays out of the compiled region: `for_each_tile` requires a
-    contiguous `Gather` index and raises otherwise (the table becomes a while_loop
-    carry whose strides are re-established every step, so the frontend makes the cost
-    visible where it is paid rather than hiding a copy). What the graph then shows is
-    the tiling alone.
+    The mask is one dense `(pql, active * block)` matrix -- the shape the caller thinks
+    in -- handed to the kernel as the per-page `(pql, block)` tiles the page loop
+    consumes, half of the last page being the sequence's padded tail. The tiles are made
+    contiguous here for the same reason the page index is: what the caller does to its
+    own tables stays out of the compiled region.
+
+    `shape.stick_table` picks which of the two page arguments the kernel gets. `False`
+    hands over an already-contiguous `(active,)` index, all `Gather` needs and all the
+    caller keeps to itself. `True` hands over the `(active, 32)` table itself, the real
+    kernel's argument -- row `i` holding block `i`'s page index at column 0, as its `for i
+    in range(num_blocks)` loop reads it -- and the kernel then picks the index out per
+    step, one row at a time, the way that loop does.
     """
     torch.manual_seed(0)
-    q = torch.randn(NKV, NQ, PQL, HS)
-    k_pool = torch.randn(POOL_PAGES, BLOCK, NKV, HS)
-    v_pool = torch.randn(POOL_PAGES, BLOCK, NKV, HS)
-    page_table = torch.zeros(ACTIVE, 32, dtype=torch.int32)
-    page_table[:, 0] = torch.tensor([4, 1, 5], dtype=torch.int32)
-    mask_tiles = [torch.zeros(PQL, BLOCK) for _ in range(ACTIVE)]
-    mask_tiles[-1][:, -2:] = torch.finfo(q.dtype).min
+    q = torch.randn(shape.nkv, shape.nq, shape.pql, shape.hs)
+    k_pool = torch.randn(shape.pool_pages, shape.block, shape.nkv, shape.hs)
+    v_pool = torch.randn(shape.pool_pages, shape.block, shape.nkv, shape.hs)
+    page_table = torch.zeros(shape.active, 32, dtype=torch.int32)
+    page_table[:, 0] = torch.randperm(shape.pool_pages)[: shape.active]
 
-    page_index = page_table[:ACTIVE, 0].contiguous()
-    kc = k_pool.index_select(0, page_index).reshape(ACTIVE * BLOCK, NKV, HS)
-    vc = v_pool.index_select(0, page_index).reshape(ACTIVE * BLOCK, NKV, HS)
+    kv_len = shape.active * shape.block
+    mask = torch.zeros(shape.pql, kv_len)
+    mask[:, -(shape.block // 2) :] = torch.finfo(q.dtype).min
+    mask_tiles = [t.contiguous() for t in mask.split(shape.block, dim=-1)]
+
+    page_index = page_table[:, 0].contiguous()
+    kc = k_pool.index_select(0, page_index).reshape(kv_len, shape.nkv, shape.hs)
+    vc = v_pool.index_select(0, page_index).reshape(kv_len, shape.nkv, shape.hs)
     k4, v4 = kc.permute(1, 0, 2).unsqueeze(1), vc.permute(1, 0, 2).unsqueeze(1)
-    scores = torch.matmul(q, k4.transpose(-2, -1)) * SCALE + torch.cat(mask_tiles, -1)
+    scores = torch.matmul(q, k4.transpose(-2, -1)) * shape.scale + mask
     ref = torch.matmul(torch.softmax(scores, -1), v4)
-    ref = ref.reshape(1, HEADS, PQL, HS).transpose(1, 2).reshape(PQL, HEADS, HS)
-    return (q, k_pool, v_pool, page_index, mask_tiles), ref
+    ref = ref.reshape(1, shape.heads, shape.pql, shape.hs).transpose(1, 2)
+    index_arg = page_table if shape.stick_table else page_index
+    return (q, k_pool, v_pool, index_arg, mask_tiles), ref.reshape(
+        shape.pql, shape.heads, shape.hs
+    )
+
+
+def paged_attn_nested(shape, inner):
+    """The PA_B kernel at any `PagedShape`: a page loop outside two tiled matmuls.
+
+    `inner` is the trip count of both inner levels and must divide both contracted axes
+    (`shape.hs` for Q@K^T, `shape.block` for P@V).
+
+    `shape.stick_table` also picks WHERE the page is selected, because the two go
+    together in the real kernel. `False` gives `for_each_tile` the page index up front as
+    a `Gather` tile spec on the pools, so the frontend selects each page. `True` puts the
+    selection in the body exactly as `for i in range(num_blocks)` writes it -- the
+    `(active, 32)` table is the loop's own tiled operand, so a step gets row `i`, reads
+    `page_idx = row[0, 0:1]`, and `index_select`s the pools itself. The pools then arrive
+    untiled, and it is the body that names one page out of the whole cache.
+    """
+    scale = shape.scale
+
+    def fn(q, k_pool, v_pool, page_index, mask_tiles):
+        def body(carry, ops):
+            tile_max, tile_sum, tile_output = carry
+            if shape.stick_table:
+                table_row, mask_tile, q_whole, k_whole, v_whole = ops
+                # `[0, 0:1]` and not `[0, 0]`: index_select wants a 1-D index, and a
+                # slice of the row keeps it a view of the carry, so nothing is copied.
+                page_idx = table_row[0, 0:1]
+                # index_select, not `k_whole[page_idx]`, for the real kernel's reason:
+                # subscripting upcasts the int32 index to int64 and fails eager, which
+                # this test runs for its reference. (Post-grad the two converge: the
+                # graph below shows `aten.index.Tensor` holding the i32 index.)
+                k_page = k_whole.index_select(0, page_idx)
+                v_page = v_whole.index_select(0, page_idx)
+            else:
+                k_page, v_page, mask_tile, q_whole = ops
+            k_page_4d = k_page.squeeze(0).permute(1, 0, 2).unsqueeze(1)
+            v_page_4d = v_page.squeeze(0).permute(1, 0, 2).unsqueeze(1)
+
+            def qk_body(acc, inner_ops):
+                q_tile, k_tile = inner_ops
+                return acc + torch.matmul(q_tile, k_tile.transpose(-2, -1)), None
+
+            scores, _ = for_each_tile(
+                qk_body,
+                (q_whole, k_page_4d),
+                dims=(-1, -1),
+                tile_size=shape.hs // inner,
+                init=torch.zeros(shape.nkv, shape.nq, shape.pql, shape.block),
+            )
+            scores = scores * scale + mask_tile.squeeze(0)
+            new_max = torch.maximum(tile_max, torch.amax(scores, dim=-1, keepdim=True))
+            rescale = torch.exp(tile_max - new_max)
+            tile_probs = torch.exp(scores - new_max)
+            new_sum = tile_sum * rescale + tile_probs.sum(-1, keepdim=True)
+
+            def pv_body(acc, inner_ops):
+                p_tile, v_tile = inner_ops
+                return acc + torch.matmul(p_tile, v_tile), None
+
+            out, _ = for_each_tile(
+                pv_body,
+                (tile_probs, v_page_4d),
+                dims=(-1, -2),
+                tile_size=shape.block // inner,
+                init=tile_output * rescale,
+            )
+            return (new_max, new_sum, out), None
+
+        mask = torch.stack(mask_tiles)
+        if shape.stick_table:
+            # The table drives the trip count, so the loop is over `num_blocks` in the
+            # same sense the real `for i in range(num_blocks)` is.
+            operands = (page_index, mask, q, k_pool, v_pool)
+            dims = (0, 0, None, None, None)
+        else:
+            page = Gather(0, page_index)
+            operands = (k_pool, v_pool, mask, q)
+            dims = (page, page, 0, None)
+        # (-inf, 0, 0) makes the general update reproduce a peeled i == 0 exactly.
+        init = (
+            torch.full((shape.nkv, shape.nq, shape.pql, 1), float("-inf")),
+            torch.zeros((shape.nkv, shape.nq, shape.pql, 1)),
+            torch.zeros((shape.nkv, shape.nq, shape.pql, shape.hs)),
+        )
+        (_, tile_sum, tile_output), _ = for_each_tile(
+            body,
+            operands,
+            dims=dims,
+            tile_size=1,
+            init=init,
+        )
+        attn = tile_output / tile_sum
+        attn = attn.reshape(1, shape.heads, shape.pql, shape.hs).transpose(1, 2)
+        return attn.reshape(shape.pql, shape.heads, shape.hs)
+
+    return fn
 
 
 def single_page_inputs():
@@ -555,13 +744,80 @@ class TestForEachTileLowering(unittest.TestCase):
 
     def test_paged_attention_nested_matmuls_inner2(self):
         """PA_B at 2 tiles per inner level."""
-        self._paged_attention_nested_matmuls(2)
+        self._paged_attention_nested(SMALL, 2, name="PA_B_nested_inner2")
 
     def test_paged_attention_nested_matmuls_inner4(self):
         """PA_B at 4 tiles per inner level."""
-        self._paged_attention_nested_matmuls(4)
+        self._paged_attention_nested(SMALL, 4, name="PA_B_nested_inner4")
 
-    def _paged_attention_nested_matmuls(self, inner):
+    QLENS = (1, 32)
+
+    def test_paged_attention_vllm_mqa(self):
+        """PA_E: PA_B's nest at serving shapes, one KV head serving all eight.
+
+        `q` is `(1, 8, pql, 128)` against a `(256, 128, 1, 128)` pool with two active
+        pages, so the mask is `(pql, 256)` and the page table `(2, 32)`, its first axis
+        the `num_blocks` the page loop walks -- the argument list a vLLM deployment calls
+        with, where PA_B's is shrunk for readable codegen. The nest is unchanged, three
+        while_loop levels of it, and the page selection is written the real kernel's way:
+        the table is the page loop's tiled operand, so a step gets row `i` and indexes the
+        untiled pools itself. That is the arrangement worth measuring at these sizes. At
+        `SMALL` the pool is 768 floats, so a lowering that copied the whole cache per step
+        would still pass; here it is 16 MiB, and it reaches the `while_loop` as a
+        loop-invariant additional input, with one 64 KiB page indexed out of it per step
+        and both inner levels affine tiles of that page.
+
+        Swept over `pql`: decode (1 query token) and prefill (32) are one kernel at two
+        query lengths, and the trip counts do not depend on `pql` at all.
+
+        ONE materialization, the caller's own: the mask `torch.stack`, `(2, pql, 128)`,
+        which at prefill is the score matrix's own size. Nothing of the page path costs
+        anything -- the row is a `select` of the tiled table, the index a `slice` of the
+        row, the page an `index` of a pool that stays where it is.
+
+        PA_B's two clones on top of that are absent, and that is a property of the head
+        layout rather than of the sizes. Flattening `bmm`'s batch has to merge `nkv` with
+        `nq`, and the K/V tile is stride-0 along `nq` (the head broadcast). At `nkv == 1`
+        that merge is a size-1 axis against the stride-0 one, which is still expressible
+        in strides -- the tile reaches `bmm` as `[8, 64, 128][0, 128, 1]`, a stride-0
+        batch view of one page. PA_B's `nkv == 2` has to merge a REAL axis with the
+        stride-0 one, which strides cannot express, hence its `clone(expand(...))` per
+        level.
+        """
+        for pql in self.QLENS:
+            with self.subTest(pql=pql):
+                self._paged_attention_nested(
+                    vllm_shape(1, 8, pql),
+                    2,
+                    name=f"PA_E_vllm_mqa_q{pql}",
+                    materializations=1,
+                )
+
+    def test_paged_attention_vllm_mha(self):
+        """PA_F: PA_E with the heads unshared -- eight KV heads, one query head each.
+
+        `q` is `(8, 1, pql, 128)` against a `(256, 128, 8, 128)` pool, 128 MiB of cache
+        per pool: MHA, since q's leading axis is KV heads and `nq == 1` gives every head
+        its own KV. The other end of the sharing axis from PA_E's MQA, and the cheapest
+        end of it: with `nq == 1` there is no broadcast at all, so no axis is stride-0,
+        every batch flatten is a view, and PA_E's one caller-side mask stack is all that
+        is left -- of eight times the cache.
+
+        Worth having beside PA_E because MHA is the degenerate-dimension case the Spyre
+        compiler has historically been unhappy with (spyre_attn_online_softmax.py's
+        `num_queries_per_kv == 1` note), so the shape that provokes it should be in the
+        lowering suite and not only in the backend's.
+        """
+        for pql in self.QLENS:
+            with self.subTest(pql=pql):
+                self._paged_attention_nested(
+                    vllm_shape(8, 1, pql),
+                    2,
+                    name=f"PA_F_vllm_mha_q{pql}",
+                    materializations=1,
+                )
+
+    def _paged_attention_nested(self, shape, inner, *, name, materializations=3):
         """PA_B: both of the body's matmuls tiled inside the page loop, three levels.
 
         Both inner levels tile the matmul's CONTRACTION axis and accumulate in a carry,
@@ -582,73 +838,20 @@ class TestForEachTileLowering(unittest.TestCase):
         the stick-wide table's column costs nothing here; `for_each_tile` requires that
         and raises on a strided index rather than copying behind the caller's back. The
         other two are one per inner loop body, the same GQA broadcast clone as PA_C.
+
+        Shape-parameterized, because PA_E and PA_F are this same kernel at serving sizes:
+        `shape` is the only thing that varies. `materializations` varies with it, since
+        their head layouts have no broadcast to clone, and so does the page path: their
+        `stick_table` moves the page selection into the body, where the real kernel has it.
         """
-        args, ref = paged_attn_inputs()
-
-        def fn(q, k_pool, v_pool, page_index, mask_tiles):
-            def body(carry, ops):
-                tile_max, tile_sum, tile_output = carry
-                k_page, v_page, mask_tile, q_whole = ops
-                k_page_4d = k_page.squeeze(0).permute(1, 0, 2).unsqueeze(1)
-                v_page_4d = v_page.squeeze(0).permute(1, 0, 2).unsqueeze(1)
-
-                def qk_body(acc, inner_ops):
-                    q_tile, k_tile = inner_ops
-                    return acc + torch.matmul(q_tile, k_tile.transpose(-2, -1)), None
-
-                scores, _ = for_each_tile(
-                    qk_body,
-                    (q_whole, k_page_4d),
-                    dims=(-1, -1),
-                    tile_size=HS // inner,
-                    init=torch.zeros(NKV, NQ, PQL, BLOCK),
-                )
-                scores = scores * SCALE + mask_tile.squeeze(0)
-                new_max = torch.maximum(
-                    tile_max, torch.amax(scores, dim=-1, keepdim=True)
-                )
-                rescale = torch.exp(tile_max - new_max)
-                tile_probs = torch.exp(scores - new_max)
-                new_sum = tile_sum * rescale + tile_probs.sum(-1, keepdim=True)
-
-                def pv_body(acc, inner_ops):
-                    p_tile, v_tile = inner_ops
-                    return acc + torch.matmul(p_tile, v_tile), None
-
-                out, _ = for_each_tile(
-                    pv_body,
-                    (tile_probs, v_page_4d),
-                    dims=(-1, -2),
-                    tile_size=BLOCK // inner,
-                    init=tile_output * rescale,
-                )
-                return (new_max, new_sum, out), None
-
-            page = Gather(0, page_index)
-            # (-inf, 0, 0) makes the general update reproduce a peeled i == 0 exactly.
-            init = (
-                torch.full((NKV, NQ, PQL, 1), float("-inf")),
-                torch.zeros((NKV, NQ, PQL, 1)),
-                torch.zeros((NKV, NQ, PQL, HS)),
-            )
-            (_, tile_sum, tile_output), _ = for_each_tile(
-                body,
-                (k_pool, v_pool, torch.stack(mask_tiles), q),
-                dims=(page, page, 0, None),
-                tile_size=1,
-                init=init,
-            )
-            attn = tile_output / tile_sum
-            attn = attn.reshape(1, HEADS, PQL, HS).transpose(1, 2)
-            return attn.reshape(PQL, HEADS, HS)
-
+        args, ref = paged_attn_inputs(shape)
         self._assert_lowers(
-            fn,
+            paged_attn_nested(shape, inner),
             args,
             ref,
-            name=f"PA_B_nested_inner{inner}",
+            name=name,
             loops=3,
-            materializations=3,
+            materializations=materializations,
         )
 
     def test_single_page_matmuls_inner2(self):
