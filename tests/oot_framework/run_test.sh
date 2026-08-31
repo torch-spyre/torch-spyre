@@ -1119,6 +1119,7 @@ _cls_${cls} = _pre_import_classes.get('${cls}')
 if _cls_${cls} is None:
     raise RuntimeError('Could not find original class ${cls} in pre-import of module ${module_name}')
 globals().setdefault('${cls}', _cls_${cls})
+_flatten_same_named_bases(_cls_${cls})
 _instantiate(_cls_${cls}, globals())
 _restore_staticmethods(_cls_${cls}, globals())
 "
@@ -1314,6 +1315,53 @@ def _restore_staticmethods(original_cls, scope):
                 desc = _inspect.getattr_static(original_cls, attr, None)
                 if isinstance(desc, staticmethod):
                     setattr(obj, attr, desc)
+
+# ---------------------------------------------------------------------------
+# @<config>.patch(...)-as-class-decorator flattening
+#
+# Some upstream test files decorate a TestCase subclass itself, e.g.:
+#   @inductor_config.patch(fx_graph_cache=False)
+#   class TestPatternMatcherLogging(LoggingTestCase):
+#       def test_foo(self, records): ...
+#
+# torch._inductor.config.patch's ContextDecorator, applied to a class,
+# returns a NEW class -- also named "TestPatternMatcherLogging" -- that
+# subclasses the original and only adds config-patching setUp/tearDown.
+# All the real test_* methods stay on the ORIGINAL (inner) class; the name
+# bound at module level after the decorator runs is the OUTER (wrapper)
+# class, whose OWN __dict__ has no test methods at all.
+#
+# instantiate_device_type_tests() computes its test list from
+# generic_test_class.__dict__.keys() -- the outer class's OWN dict only,
+# never inherited members. For a class shaped like this, that list comes
+# back empty, so instantiate_device_type_tests() silently does nothing:
+# no suffixing, no YAML mode:skip/mandatory_success/xfail filtering. The
+# raw, unsuffixed test methods still end up reachable on the generated
+# PRIVATEUSE1 subclass purely through Python inheritance (outer -> inner),
+# so pytest collects and runs them completely unfiltered -- e.g. hitting a
+# hardcoded GPU_TYPE="cuda" in the test body with
+# "AssertionError: Torch not compiled with CUDA enabled", regardless of
+# what the YAML config says.
+#
+# Fix: before injection, walk the class's MRO for any ancestor sharing the
+# exact same __name__ (i.e. a decorator-inserted same-named wrapper) and
+# copy its test_* methods onto the target class's own __dict__ so
+# instantiate_device_type_tests() actually sees them.
+# ---------------------------------------------------------------------------
+def _flatten_same_named_bases(cls):
+    for base in cls.__mro__[1:]:
+        if base.__name__ != cls.__name__:
+            continue
+        for name, obj in list(base.__dict__.items()):
+            if not name.startswith("test"):
+                continue
+            if name not in cls.__dict__:
+                setattr(cls, name, obj)
+            # Remove from the pre-decorator ancestor too -- otherwise it
+            # stays reachable through inheritance even after
+            # instantiate_device_type_tests()'s own cleanup deletes the
+            # (now correctly suffixed and filtered) copy on cls itself.
+            delattr(base, name)
 
 # ---------------------------------------------------------------------------
 # Inject instantiate_device_type_tests for all classes needing injection,
