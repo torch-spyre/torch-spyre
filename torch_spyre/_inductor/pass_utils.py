@@ -418,9 +418,11 @@ def is_restickify_coords(in_coords: list[Expr], out_coords: list[Expr]) -> bool:
     out_stick_syms = out_coords[-1].free_symbols
     if out_stick_syms == in_coords[-1].free_symbols:
         return False
-    in_syms = set().union(*(coord.free_symbols for coord in in_coords))
-    if out_stick_syms and out_stick_syms.isdisjoint(in_syms):
-        return False
+    in_stick_syms = in_coords[-1].free_symbols
+    if not in_stick_syms and out_stick_syms:
+        in_syms = set().union(*(coord.free_symbols for coord in in_coords))
+        if out_stick_syms.isdisjoint(in_syms):
+            return False
     return True
 
 
