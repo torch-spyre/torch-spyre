@@ -229,6 +229,28 @@ class OpFeatures:
     # (cross-row reduction: reduced var read with coeff!=1). "" -> default
     # 150+turnaround.
     hbm_pattern: str = ""
+    # LX RELAYOUT (PR #3439): an identity copy the scratchpad planner inserts when a
+    # producer and its consumers own an LX buffer under different per-core divisions.
+    # Its traffic is entirely LX, which this model charges at zero -- calibrated for
+    # ops whose LX traffic rides beside a larger HBM stream, and exactly wrong for the
+    # one op that is nothing but LX traffic. Measured on 53 configurations it costs
+    # 2.3-24.2 us at 2.1 MB / 8 cores depending on slice geometry alone, so it gets an
+    # additive term (see ``relayout_ns`` in predict_ops) keyed on these features.
+    # ``is_lx_relayout`` derives from the planner's materialization registry, never
+    # inferred; the other two are 0 when it is False. The bytes moved are NOT a
+    # separate feature: a relayout copy is an identity clone, so they are exactly
+    # ``out_elems * dtype_bytes`` (grouped gathers (#3440) will multiply by
+    # ``cores / owners`` via a future ``relayout_owners`` feature, not by a bytes
+    # field).
+    is_lx_relayout: bool = False
+    # Per-core contiguous run, in ELEMENTS, of the finer (governing) of the two
+    # PerCoreViews: (device_size[d] // split[d]) * prod(device_size[d+1:]) for the
+    # innermost split dim d. The 10x-at-fixed-bytes variable.
+    relayout_run_elems: int = 0
+    # Split factor of the governing side's innermost split dim. Sets the walked-span
+    # multiplier: the engine streams the whole strided span at ~K GB/s per core and a
+    # core keeps 1/split of it (BW*split measured constant at 588/540/549).
+    relayout_split: int = 0
 
     def read_bytes(self) -> int:
         """HBM bytes READ (input args). Each HBM arg is counted at its own device size,
@@ -475,6 +497,31 @@ class CostParams:
     # over-charged rather than the overlap under-modelled.
     loop_reread_scale: float = 0.85
     overlap_gamma: float = 1.0  # compute/HBM overlap: min(compute,HBM) partly hidden
+    # LX RELAYOUT (shuffle) term: per-core serial descriptor cost plus a stride-limited
+    # walk. Fitted 2026-08-17 on 21 direct per-kernel rows (main @ 65508a02, fp16,
+    # BUNDLE_SYMBOLIC_ARGS=0 -- a method #3741 has since removed; re-measuring needs
+    # the fused swap estimator at ~+/-8%): mean +2.5%, RMS 10.0% over bytes 0.52-4.19
+    # MB, cores 4-32, run 128-4096 B, split 2-8.
+    #
+    #   relayout_ns = runs_per_core * (a + b*log2(split)) + span_per_core / K
+    #     runs_per_core = bytes/cores / run_bytes
+    #     span_per_core = bytes/cores * split   (the engine walks the whole strided
+    #                                            span; a core keeps 1/split of it --
+    #                                            BW*split measured 588/540/549, so K
+    #                                            is per-core and split-invariant)
+    #
+    # The log2 in the per-run cost is FITTED, no mechanism behind it. VALID FOR SPLITS
+    # 2..8 ONLY: past 8 the law over-predicts 12-40% (measured at split 16), so the
+    # term clamps split into [2, 8] rather than extrapolate. Carries a +/-25% error
+    # bar from the non-governing side of the view pair -- reproducible scatter with no
+    # consistent direction (destination sweep, 10 pairs x 15 reps), so it is an error
+    # bar and not a term. Fanout was measured NOT to be a term (2/4/8 at fixed
+    # geometry, no trend). NO loop_trip factor: a relayout inside a coarse-tiling loop
+    # is structurally impossible today (the planner rejects coarse_tile_copy
+    # consumers).
+    relayout_run_a_ns: float = -1.14  # per-run cost intercept
+    relayout_run_b_ns: float = 3.92  # per-run cost log2(split) slope
+    relayout_span_gbps: float = 547.0  # per-core stride-limited walk rate
     # Matmul operand RE-READ (tile spill): the per-core OUTPUT-accumulator tile has area
     # (M/m)*(N/n); once it exceeds the on-chip capacity (~64K fp16 elems/core) it no
     # longer stays resident, so the operands are re-streamed from HBM. The re-read
@@ -976,6 +1023,38 @@ def mm_spill_frac(tile_area: float, params: CostParams | None = None) -> float:
     return min(
         p.mm_spill_cap,
         p.mm_spill_slope * log2(max(1.0, tile_area / p.mm_spill_area0)),
+    )
+
+
+def relayout_ns(o: "OpFeatures", params: "CostParams | None" = None) -> float:
+    """Additive cost of one LX relayout (shuffle) op; 0 for everything else.
+
+    A permutation across cores: every core moves its own per-core bytes, paying a
+    fixed cost per contiguous run plus a stride-limited walk over the whole span
+    (see the ``relayout_*`` CostParams for the fitted law, its derivation and its
+    validity range). Kept as a standalone function on purpose: the solver-objective
+    path (#3810) cannot lower ``log2`` or division by a decision variable, so it
+    evaluates THIS function per candidate division and folds the result into an
+    AddElement table -- one source of truth for both paths.
+
+    The split is clamped into [2, 8], the fitted range. Below 2 cannot occur for a
+    real ownership change (and would turn the fitted intercept negative); above 8
+    the law over-predicts by 12-40% (measured at split 16), so the clamp bounds the
+    error instead of extrapolating an unmeasured log2.
+    """
+    p = params or CostParams()
+    if not o.is_lx_relayout or o.out_elems <= 0:
+        return 0.0
+    if o.relayout_run_elems <= 0 or o.cores <= 0:
+        return 0.0
+    # Bytes moved == the copy's device bytes: a relayout is an identity clone.
+    per_core = o.out_elems * o.dtype_bytes / o.cores
+    run_bytes = o.relayout_run_elems * o.dtype_bytes
+    split = min(8, max(2, o.relayout_split))
+    runs = per_core / run_bytes
+    return (
+        runs * (p.relayout_run_a_ns + p.relayout_run_b_ns * math.log2(split))
+        + per_core * split / p.relayout_span_gbps
     )
 
 
@@ -1566,7 +1645,16 @@ def predict_ops(ops: list, params: CostParams | None = None) -> float:
     # regresses mmwd 15.1 -> 17.6 and bmm_layout 20.2 -> 25.5. Compute and memory
     # OVERLAP: the engine streams operands while the array works, so a kernel takes the
     # LONGER of the two rather than their sum.
-    t = compute + mem_t - p.overlap_gamma * min(compute, mem_t)
+    # LX RELAYOUT (shuffle): an ownership-change identity copy is its own DSC inside
+    # the bundle, moves no HBM bytes, and DSCs in a bundle execute serially (the
+    # allocator's half-tick lifetime scheme depends on exactly that) -- so it ADDS to
+    # the kernel time rather than overlapping, and sits OUTSIDE the compute/memory
+    # overlap term below. Measured directly: fusing never recovers it (fused total
+    # == unfused sum +/- 2%), and it costs its full time beside a 223 us bmm exactly
+    # as beside a 25 us relu, so it does not hide behind PT-array work either. See
+    # relayout_ns() and the CostParams note for the fitted law and its validity range.
+    rel_ns = sum(relayout_ns(o, p) for o in ops)
+    t = compute + mem_t - p.overlap_gamma * min(compute, mem_t) + rel_ns
     # (A genuine-reduction cross-core ring-combine term once lived here; it is provably
     # bounded by ~cores * a tiny per-elem cost <= ~5 ns -- below run-to-run noise --
     # so it is dropped as inert. K is never split for matmul, so there is no matmul

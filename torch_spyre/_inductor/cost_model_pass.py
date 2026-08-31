@@ -61,7 +61,7 @@ from torch._inductor.ir import ComputedBuffer
 
 from . import config
 from .constants import DEVICE_NAME
-from .cost_model import CostParams, _loop_reread_bytes, predict_ops
+from .cost_model import CostParams, _loop_reread_bytes, predict_ops, relayout_ns
 from .dump_cost_model import extract_op_features
 from .logging_utils import get_inductor_logger
 
@@ -336,15 +336,23 @@ def _price(feats, index, params) -> GroupCost | None:
     try:
         weights = [max(0, f.hbm_bytes()) for f in feats]
         total = sum(weights)
-        for f, w in zip(feats, weights):
+        # An LX relayout op's cost is ADDITIVE and PER-OP (its own term in
+        # predict_ops), not part of the bundle's HBM price -- and it moves no HBM
+        # bytes, so the byte-share split alone would show the one op that added
+        # real time as 0.0 (exactly the misleading display that motivated the
+        # term). Attribute each op its own relayout cost, and split only the
+        # remainder by HBM share; parts still sum to the kernel total.
+        rel_us = [relayout_ns(f, params) / 1000.0 for f in feats]
+        base_us = predicted_us - sum(rel_us)
+        for f, w, r in zip(feats, weights, rel_us):
             ops.append(
                 OpCost(
                     name=f.name,
                     loop_group_id=getattr(f, "_loop_group_id", None),
                     hbm_bytes=w,
                     lx_bytes=max(0, f.lx_bytes()),
-                    predicted_us=predicted_us
-                    * (w / total if total > 0 else 1.0 / max(1, len(feats))),
+                    predicted_us=r
+                    + base_us * (w / total if total > 0 else 1.0 / max(1, len(feats))),
                     **_per_iteration(f),
                 )
             )
