@@ -419,8 +419,50 @@ def lower_scaled_mm(
     return result
 
 
+def _contraction_read_is_flat(x) -> bool:
+    """True when reading ``x``'s contraction dim needs one dim of the base buffer.
+
+    ``lower_mm``/``lower_bmm`` give their reduction a single K range, but the read
+    goes through ``x.make_loader()``. When ``x`` is a view whose K spans more than
+    one dim of the buffer underneath — a multi-head activation arriving as
+    ``[.., heads, head_dim]`` — the emitted index carries *two* contraction symbols
+    into the kernel's iteration space, and the backend scheduler requires exactly
+    one (``getMinParamBmm``; see ``codegen.compute_ops.check_bmm_dim_roles``).
+
+    Deliberately not a contiguity test. Such an activation is contiguous in memory
+    — at ``seqlen == 1`` the ``transpose(1, 2)`` preceding the reshape is a no-op —
+    so ``ir.is_contiguous_storage_and_layout`` reports it flat and would miss it.
+    What matters is the shape of the buffer the loader indexes, so this compares
+    ``x``'s trailing dim against the base's. That also keeps an ordinary flattening
+    view copy-free: ``[B, M, K]`` read as ``[B*M, K]`` has the same trailing dim and
+    needs no copy.
+    """
+    node = x.data if isinstance(x, ir.TensorBox) else x
+    if isinstance(node, StorageBox):
+        node = node.data
+    if not isinstance(node, ir.BaseView):
+        return True
+    base_size = node.unwrap_view().get_size()
+    x_size = x.get_size()
+    if not base_size or not x_size:
+        return True
+    return V.graph.sizevars.statically_known_equals(x_size[-1], base_size[-1])
+
+
+def _flatten_contraction(x):
+    """Copy ``x`` when its contraction dim is not a single flat read.
+
+    The copy is what collapses a split contraction into one dim; it is skipped
+    whenever the read is already flat, so ordinary matmuls are untouched.
+    """
+    if _contraction_read_is_flat(x):
+        return x
+    return ir.ExternKernel.copy_input(x)
+
+
 @register_spyre_lowering(torch.ops.aten.mm.default)
 def lower_mm(x, y):
+    x = _flatten_contraction(x)
     x.realize()
     y.realize()
     x_loader = x.make_loader()
@@ -484,6 +526,7 @@ def lower_mm(x, y):
 @register_spyre_lowering(torch.ops.spyre.batched_matmul.default)
 @register_spyre_lowering(torch.ops.aten.bmm.default)
 def lower_bmm(x, y):
+    x = _flatten_contraction(x)
     x.realize()
     y.realize()
     x_loader = x.make_loader()

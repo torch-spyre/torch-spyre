@@ -29,6 +29,7 @@ from torch_spyre._C import DataFormats
 from torch_spyre._inductor import config
 from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.codegen.compute_ops import (
+    check_bmm_dim_roles,
     SymbolKind,
     _per_core_symbolic_dim_info,
     _symbolic_split_info,
@@ -47,6 +48,68 @@ from torch_spyre._inductor.work_division import (
     _valid_divisor_basis,
     adjust_it_space_for_sticks,
 )
+
+
+class TestBmmDimRoles(InductorTestCase):
+    """The backend classifies a BMM's M/N/K roles by set arithmetic over the three
+    operands' ``layoutDimOrder_`` and requires N and K to be exactly one dim each
+    (``getMinParamBmm``, deeptools ``L3DlOpsScheduler.cpp``). When they are not, it
+    aborts inside ``DT_CHECK`` with no shape information, so codegen refuses first.
+
+    The real case: a decode-shaped attention output reaching ``o_proj`` as
+    ``[.., heads, head_dim]`` rather than one flattened dim, which happens when the
+    ``seqlen_q == 1`` reshape is layout-free and Inductor elides the materialisation
+    that would collapse it. K then spans two iteration symbols.
+    """
+
+    # The layouts observed on hardware, from the SDSC JSON of a Gemma 4 sliding
+    # layer at seqlen_q=1 (4 heads x 256) and at seqlen_q=64 respectively.
+    SPLIT_CONTRACTION = {
+        "INPUT": ["in", "out"],
+        "KERNEL": ["out", "in", "mb"],
+        "OUTPUT": ["mb"],
+    }
+    SINGLE_CONTRACTION = {
+        "INPUT": ["in", "mb"],
+        "KERNEL": ["in", "out"],
+        "OUTPUT": ["out", "mb"],
+    }
+
+    def test_split_contraction_is_refused(self):
+        with self.assertRaisesRegex(Unsupported, "contraction"):
+            check_bmm_dim_roles("batchmatmul", self.SPLIT_CONTRACTION)
+
+    def test_error_names_the_offending_dims_and_the_op(self):
+        """A bare refusal is not much better than the DT_CHECK it replaces."""
+        with self.assertRaisesRegex(Unsupported, r"batchmatmul"):
+            check_bmm_dim_roles("batchmatmul", self.SPLIT_CONTRACTION)
+        with self.assertRaisesRegex(Unsupported, r"in.*out|out.*in"):
+            check_bmm_dim_roles("batchmatmul", self.SPLIT_CONTRACTION)
+
+    def test_single_contraction_is_accepted(self):
+        check_bmm_dim_roles("batchmatmul", self.SINGLE_CONTRACTION)
+
+    def test_fp8_bmm_is_checked_too(self):
+        with self.assertRaisesRegex(Unsupported, "contraction"):
+            check_bmm_dim_roles("batchmatmulfp8", self.SPLIT_CONTRACTION)
+
+    def test_non_matmul_opfuncs_are_not_checked(self):
+        """Only matmul-family opfuncs use the INPUT/KERNEL/OUTPUT role contract."""
+        check_bmm_dim_roles("abs", self.SPLIT_CONTRACTION)
+
+    def test_split_output_channel_dim_is_refused(self):
+        """The N dim is DT_CHECKed the same way; refuse it for the same reason."""
+        layouts = {
+            "INPUT": ["in", "mb"],
+            "KERNEL": ["in", "out", "out2"],
+            "OUTPUT": ["out", "out2", "mb"],
+        }
+        with self.assertRaisesRegex(Unsupported, "output-channel"):
+            check_bmm_dim_roles("batchmatmul", layouts)
+
+    def test_incomplete_layout_set_is_left_alone(self):
+        """Some matmul paths carry a KERNEL_IDX or omit a role; do not guess."""
+        check_bmm_dim_roles("batchmatmul", {"INPUT": ["in"], "KERNEL": ["in"]})
 
 
 class TestSpyreConfig(InductorTestCase):

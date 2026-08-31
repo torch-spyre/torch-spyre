@@ -18,7 +18,11 @@ import dataclasses
 from sympy import Symbol
 
 from torch_spyre._C import DataFormats, encode_constant
-from torch_spyre._inductor.constants import CONV2D_DIM_LABELS, DEPTHWISE_CONV2D_OP
+from torch_spyre._inductor.constants import (
+    CONV2D_DIM_LABELS,
+    DEPTHWISE_CONV2D_OP,
+    MATMUL_REDUCTION_OPS,
+)
 from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.op_spec import TensorWorkDivision
 from torch_spyre._inductor.pass_utils import coeff_through_floor
@@ -636,6 +640,56 @@ def _tensor_tiled_by_symbol(tensor, sym) -> bool:
     if tensor.device_tile_advance_expr is None:
         return False
     return bool(coeff_through_floor(tensor.device_tile_advance_expr, sym))
+
+
+def check_bmm_dim_roles(opfunc: str, layout_dim_orders: dict) -> None:
+    """Refuse a matmul whose dim roles the backend scheduler cannot classify.
+
+    ``getMinParamBmm`` (deeptools ``dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp``)
+    derives a BMM's roles by set arithmetic over the three operands'
+    ``layoutDimOrder_``, and ``DT_CHECK``s that two of them are exactly one dim::
+
+        N = (KERNEL & OUTPUT) - INPUT     # output channels
+        K = (INPUT  & KERNEL) - OUTPUT    # the contraction
+
+    A contraction spanning two iteration symbols reaches that check as
+    ``DT_CHECK(out_reuse_dim.size() == 1)`` and aborts the backend compiler with
+    no shape, op or dim information — the error names only the failed predicate.
+    Refusing here instead costs nothing and says which op and which dims.
+
+    How a split contraction arises in practice: a multi-head activation reaching
+    a matmul as ``[.., heads, head_dim]`` rather than one flattened dim. A
+    decode-shaped attention output does exactly that — at ``seqlen_q == 1`` the
+    reshape to ``[batch, 1, heads * head_dim]`` is layout-free, so the
+    materialisation that would collapse ``heads x head_dim`` into a single dim is
+    elided, and K stays two symbols. At ``seqlen_q > 1`` the same reshape must
+    materialise, which collapses it and the check passes.
+
+    ``MATMUL_REDUCTION_OPS`` only: other op families do not use the
+    INPUT/KERNEL/OUTPUT role contract. A layout set missing any of the three
+    roles is left alone rather than guessed at.
+    """
+    if opfunc not in MATMUL_REDUCTION_OPS:
+        return
+    try:
+        inputs = set(layout_dim_orders["INPUT"])
+        kernel = set(layout_dim_orders["KERNEL"])
+        output = set(layout_dim_orders["OUTPUT"])
+    except KeyError:
+        return
+
+    for role, dims in (
+        ("contraction (K)", (inputs & kernel) - output),
+        ("output-channel (N)", (kernel & output) - inputs),
+    ):
+        if len(dims) != 1:
+            raise Unsupported(
+                f"{opfunc} with a {role} dim spanning {len(dims)} dims "
+                f"{sorted(dims)}; the backend scheduler requires exactly one. "
+                f"layoutDimOrder_ INPUT={layout_dim_orders['INPUT']} "
+                f"KERNEL={layout_dim_orders['KERNEL']} "
+                f"OUTPUT={layout_dim_orders['OUTPUT']}"
+            )
 
 
 def generate_sdsc(
@@ -1308,6 +1362,14 @@ def generate_sdsc(
             extra["dsOffset"] = 0
             extra["allocateNode_"] = alloc_node
         return extra
+
+    check_bmm_dim_roles(
+        sdsc_spec.opfunc,
+        {
+            label: [str(dim) for dim in _filter_window_dims(info["dim_order"], label)]
+            for label, info in sdsc_spec.layouts.items()
+        },
+    )
 
     return (
         {
