@@ -55,7 +55,8 @@ class JobPlanBuilder {
    * compute events. A JobExecPlan step suffix is added to each compute command.
    */
   JobPlanBuilder(const std::string& spyrecode_dir, const SpyreStream* stream,
-                 std::optional<std::string> profiler_name = std::nullopt);
+                 std::optional<std::string> profiler_name = std::nullopt,
+                 std::string sdsc_bundle_dir_prefix = {});
 
   /**
    * @brief Build the JobPlan
@@ -147,6 +148,9 @@ class JobPlanBuilder {
   const SpyreStream stream_;
   /// Optional compiler-generated base name for profiler-visible compute events
   const std::optional<std::string> profiler_name_;
+  /// 8-char hex prefix of the SDSC bundle directory (emitted in trace
+  /// args as sdsc_bundle_dir_prefix regardless of whether provenance is set)
+  const std::string sdsc_bundle_dir_prefix_;
   /// Device memory allocation for the job (set during preparation and moved to
   /// JobPlan in translation)
   std::vector<flex::CompositeAddress> job_allocation_;
@@ -194,7 +198,9 @@ class JobPlanBuilder {
  * @return Prepared JobPlan
  */
 std::unique_ptr<JobPlan> prepareKernel(
-    const std::string& spyrecode_dir, const SpyreStream* stream = nullptr,
-    std::optional<std::string> profiler_name = std::nullopt);
+    const std::string& spyrecode_dir,
+    const SpyreStream* stream = nullptr,
+    std::optional<std::string> profiler_name = std::nullopt,
+    std::string sdsc_bundle_dir_prefix = {});
 
 }  // namespace spyre

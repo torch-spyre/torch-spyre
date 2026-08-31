@@ -28,6 +28,7 @@
 #include <vector>
 
 #include "job_plan.h"
+#include "kernel_provenance_registry.h"
 #include "logging.h"
 #include "spyre_allocator.h"
 #include "spyrecode-host-functions/spyrecode.h"
@@ -212,10 +213,12 @@ static int64_t safe_stoll(const std::string& str,
 
 JobPlanBuilder::JobPlanBuilder(const std::string& spyrecode_dir,
                                const SpyreStream* stream,
-                               std::optional<std::string> profiler_name)
+                               std::optional<std::string> profiler_name,
+                               std::string sdsc_bundle_dir_prefix)
     : spyrecode_dir_(spyrecode_dir),
       stream_(stream ? *stream : getCurrentStream()),
-      profiler_name_(std::move(profiler_name)) {
+      profiler_name_(std::move(profiler_name)),
+      sdsc_bundle_dir_prefix_(std::move(sdsc_bundle_dir_prefix)) {
   // Validate directory exists
   TORCH_CHECK(std::filesystem::exists(spyrecode_dir_),
               "SpyreCode directory does not exist: ", spyrecode_dir_.string());
@@ -697,6 +700,23 @@ JobPlanBuilder::ValidationResult JobPlanBuilder::validate(
 }
 
 std::unique_ptr<JobPlan> JobPlanBuilder::build() {
+  // Register the SDSC bundle directory prefix for this kernel so the activity
+  // handler can emit sdsc_bundle_dir_prefix unconditionally in trace args metadata.
+  // The name base mirrors how translateComputeOnDevice forms the step name:
+  // prefer profiler_name_ (stable provenance name), otherwise use the fallback
+  // directory path that lands in the activity name.
+  if (!sdsc_bundle_dir_prefix_.empty()) {
+    std::string name_base;
+    if (profiler_name_.has_value() && !profiler_name_->empty()) {
+      name_base = *profiler_name_;
+    } else {
+      auto inner = spyrecode_dir_.filename();
+      auto sdsc = spyrecode_dir_.parent_path().filename();
+      name_base = (sdsc / inner / "bundle.mlir").string();
+    }
+    spyre::registerBundleDirPrefix(name_base, sdsc_bundle_dir_prefix_);
+  }
+
   // Execute job preparation plan (allocate + init transfers)
   executeJobPreparationPlan();
 
@@ -723,8 +743,11 @@ std::unique_ptr<JobPlan> JobPlanBuilder::build() {
 
 std::unique_ptr<JobPlan> prepareKernel(
     const std::string& spyrecode_dir, const SpyreStream* stream,
-    std::optional<std::string> profiler_name) {
-  JobPlanBuilder builder(spyrecode_dir, stream, std::move(profiler_name));
+    std::optional<std::string> profiler_name,
+    std::string sdsc_bundle_dir_prefix) {
+  JobPlanBuilder builder(spyrecode_dir,
+                         stream, std::move(profiler_name),
+                         std::move(sdsc_bundle_dir_prefix));
   auto jobplan = builder.build();
 
   // Dump JobPlan if debug logging is enabled

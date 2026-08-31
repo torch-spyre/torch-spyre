@@ -272,6 +272,11 @@ void AiuptiActivityProfilerSession::handleKernelActivity(
   kernel_activity->addMetadataQuoted("context",
                                      std::to_string(activity->context_id));
   kernel_activity->addMetadata("correlation", activity->correlation_id);
+  const std::string name_base = spyre::activityNameBase(activity->name);
+  const std::string bundle_prefix = spyre::lookupBundleDirPrefix(name_base);
+  if (!bundle_prefix.empty()) {
+    kernel_activity->addMetadataQuoted("sdsc_bundle_dir_prefix", bundle_prefix);
+  }
   if (const auto key = spyre::extractKernelProvenanceKey(activity->name)) {
     kernel_activity->addMetadataQuoted("provenance_key", *key);
     if (const auto ids = spyre::lookupKernelProvenance(*key)) {
