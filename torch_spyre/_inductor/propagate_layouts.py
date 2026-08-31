@@ -914,31 +914,34 @@ def _matmul_layouts(
         output_dep.index,
         out_coords,
     )
-    for i, arg in enumerate(args):
-        stl = arg.layouts[0]
-        h_coords = host_coordinates(arg.layout, arg.dep, None)
-        d_coords = device_coordinates(stl, arg.dep, None)
-        logger.debug(
-            "[_matmul_layouts] input[%d] (%s):\n"
-            "  host size   = %s\n"
-            "  host stride = %s\n"
-            "  dep ranges  = %s\n"
-            "  dep index   = %s\n"
-            "  STL         = %s\n"
-            "  host coords = %s\n"
-            "  dev coords  = %s",
-            i,
-            arg.dep.name,
-            list(arg.layout.size),
-            list(arg.layout.stride),
-            dict(arg.dep.ranges),
-            arg.dep.index,
-            stl,
-            h_coords,
-            d_coords,
-        )
+    if logger.isEnabledFor(logging.DEBUG):
+        for i, arg in enumerate(args):
+            stl = arg.layouts[0]
+            h_coords = host_coordinates(arg.layout, arg.dep, None)
+            d_coords = device_coordinates(stl, arg.dep, None)
+            logger.debug(
+                "[_matmul_layouts] input[%d] (%s):\n"
+                "  host size   = %s\n"
+                "  host stride = %s\n"
+                "  dep ranges  = %s\n"
+                "  dep index   = %s\n"
+                "  STL         = %s\n"
+                "  host coords = %s\n"
+                "  dev coords  = %s",
+                i,
+                arg.dep.name,
+                list(arg.layout.size),
+                list(arg.layout.stride),
+                dict(arg.dep.ranges),
+                arg.dep.index,
+                stl,
+                h_coords,
+                d_coords,
+            )
 
     x_dep, y_dep = identify_matmul_inputs([a.dep for a in args], output_dep)
+    if x_dep is None or y_dep is None:
+        raise Unsupported(f"{data.reduction_type}: could not identify Input1/Input2")
     # Map identified deps back to PropArgs.
     if x_dep is args[0].dep:
         x, y = args[0], args[1]
@@ -1024,6 +1027,10 @@ def _conv_layouts(
     out_coords = host_coordinates(output, output_dep, None)
 
     x_dep, y_dep = identify_matmul_inputs([a.dep for a in args], output_dep)
+    if x_dep is None or y_dep is None:
+        raise Unsupported(
+            f"{data.reduction_type}: could not identify activation/weight"
+        )
     if x_dep is args[0].dep:
         x, y = args[0], args[1]
     else:

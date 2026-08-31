@@ -595,7 +595,7 @@ def test_bmm_unit_n():
 
 @pytest.mark.xfail(reason="Matmul with size 1 dims not yet supported")
 def test_bmm_unit_n_self():
-    """Same as test_bmm_unit_n but uses the same tensor for both operands."""
+    """same tensor to matmul with and without transpose"""
     x = torch.randn((32, 1, 128), dtype=torch.float16) * 0.1
     _compare(lambda x: torch.matmul(x, x.transpose(1, 2)), x)
 
