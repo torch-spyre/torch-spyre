@@ -19,10 +19,12 @@ compile_op_spec is mocked throughout so no Spyre hardware is required.
 
 import os
 import tempfile
+import unittest
 from unittest.mock import patch
 
 from torch._inductor.test_case import TestCase as InductorTestCase
 
+from torch_spyre._inductor import config
 from torch_spyre._inductor.codegen.bundle import (
     _extract_symbol_ids,
     generate_bundle,
@@ -30,6 +32,18 @@ from torch_spyre._inductor.codegen.bundle import (
 from torch_spyre._inductor.codegen.compute_ops import SymbolKind
 from torch_spyre._inductor.constants import MAX_POOL_SIZE_BYTES
 from torch_spyre._inductor.op_spec import OpSpec
+
+
+class TestFrontendPoolAllocationConfig(unittest.TestCase):
+    """Standalone sanity checks for the frontend_pool_allocation config flag."""
+
+    def test_default_is_false(self):
+        self.assertFalse(config.frontend_pool_allocation)
+
+    def test_patchable(self):
+        with config.patch({"frontend_pool_allocation": True}):
+            self.assertTrue(config.frontend_pool_allocation)
+        self.assertFalse(config.frontend_pool_allocation)
 
 
 # ---------------------------------------------------------------------------
@@ -326,6 +340,59 @@ class TestGenerateBundleDimensionSymbols(InductorTestCase):
         )
         self.assertNotIn("%pool_base_addr", bundle)
         self.assertNotIn("input_arg_extract value from %pool_base_addr", bundle)
+
+    def test_pool_frontend_allocation_emitted(self):
+        """With frontend_pool_allocation=True, a pool symbol produces a
+        %pool_base_addr input_arg parameter and an input_arg_extract
+        statement instead of device_mem_allocate."""
+        pool_kind = SymbolKind.pool()
+        entry = (
+            _make_sdsc_json(hbm_sym_ids_per_core={"[0, 0, 0]": -1}),
+            [0],
+            [],
+            [pool_kind],
+        )
+
+        with patch(
+            "torch_spyre._inductor.codegen.bundle._spyre_config.frontend_pool_allocation",
+            True,
+        ):
+            bundle = self._run_bundle([entry], pool_size=65536)
+
+        self.assertIn("%pool_base_addr: !sdscbundle.input_arg<index>", bundle)
+        self.assertIn(
+            "%pool = sdscbundle.input_arg_extract value from"
+            " %pool_base_addr : !sdscbundle.input_arg<index> -> index",
+            bundle,
+        )
+        self.assertNotIn("device_mem_allocate", bundle)
+
+    def test_pool_frontend_allocation_param_ordering(self):
+        """The pool param is emitted before kernel_arg_sym_indices params,
+        matching the pre-PR-#3707 ordering (pool first)."""
+        pool_kind = SymbolKind.pool()
+        kernel_kind = SymbolKind.kernel(arg_index=0)
+        entry = (
+            _make_sdsc_json(hbm_sym_ids_per_core={"[0, 0, 0]": -1}),
+            [0, 0],
+            [],
+            [kernel_kind, pool_kind],
+        )
+
+        with patch(
+            "torch_spyre._inductor.codegen.bundle._spyre_config.frontend_pool_allocation",
+            True,
+        ):
+            bundle = self._run_bundle([entry], pool_size=65536)
+
+        sig_line = next(
+            line for line in bundle.splitlines() if "func.func @sdsc_bundle(" in line
+        )
+        self.assertLess(
+            sig_line.index("%pool_base_addr"),
+            sig_line.index("%arg_0_base_addr"),
+            "pool_base_addr param must come before arg_0_base_addr",
+        )
 
     def test_pool_absent_when_no_pool_symbols(self):
         """A bundle with no pool symbols emits no device_mem_allocate at all,

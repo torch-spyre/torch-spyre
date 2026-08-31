@@ -31,6 +31,11 @@ from torch._inductor.ir import (
 from torch_spyre._C import ElementArrangement, SpyreTensorLayout
 from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.ir import FixedTiledLayout
+from torch_spyre._inductor.constants import (
+    AVGPOOL2D_OP,
+    CONV2D_FWD_OP,
+    DEPTHWISE_CONV2D_OP,
+)
 from torch_spyre._inductor.pass_utils import SchedNodeArg
 from torch_spyre._inductor.scratchpad.allocator import (
     CoOptimizingAllocator,
@@ -56,8 +61,10 @@ from torch_spyre._inductor.work_division_constraints import (
     keep_by_index_k_split_constraint,
     keep_by_index_pinned_search_space_vars,
     qfp8wt_matmul_k_split_domains,
-    topk_split_domains,
     qfp8wt_split_domains,
+    reduction_window_blocked_vars,
+    restickify_padding_blocked_vars,
+    topk_split_domains,
 )
 
 
@@ -618,6 +625,140 @@ class TestConvSpatialBlockedVars(unittest.TestCase):
         self.assertNotIn(j, output_dims)
         self.assertEqual(splits[i], 1)
         self.assertEqual(splits[j], 1)
+
+
+class TestFinalMappingConstraints(unittest.TestCase):
+    _PLACEHOLDER_TD = _tensor_dep("mapping_placeholder", (128,), (_isym("_mapping"),))
+
+    def test_pool_window_dims_are_unsplit(self):
+        ki, kj = (_isym(name) for name in ("ki", "kj"))
+        op = _computed_buffer(
+            (8,),
+            name="pool",
+            reduction_type=AVGPOOL2D_OP,
+            reduction_ranges=(3, 3),
+        )
+        result = reduction_window_blocked_vars(
+            _make_context(
+                op,
+                self._PLACEHOLDER_TD,
+                reduction_vars=[ki, kj],
+            )
+        )
+
+        self.assertEqual(result.blocked, {ki, kj})
+
+    def test_conv_only_blocks_nontrivial_kernel_dims(self):
+        channel, ki, kj = (_isym(name) for name in ("channel", "ki", "kj"))
+        op = _computed_buffer(
+            (8,),
+            name="conv",
+            reduction_type=CONV2D_FWD_OP,
+            reduction_ranges=(64, 3, 1),
+        )
+        op.data.op_info = {"conv_params": {"kernel_h": 3, "kernel_w": 1}}
+        result = reduction_window_blocked_vars(
+            _make_context(
+                op,
+                self._PLACEHOLDER_TD,
+                reduction_vars=[channel, ki],
+            )
+        )
+
+        self.assertEqual(result.blocked, {ki})
+
+    def test_depthwise_conv_does_not_block_trailing_group_dim(self):
+        kh, kw, group = (_isym(name) for name in ("kh", "kw", "group"))
+        op = _computed_buffer(
+            (8,),
+            name="depthwise_conv",
+            reduction_type=DEPTHWISE_CONV2D_OP,
+            reduction_ranges=(3, 3, 4),
+        )
+        result = reduction_window_blocked_vars(
+            _make_context(
+                op,
+                self._PLACEHOLDER_TD,
+                reduction_vars=[kh, kw, group],
+            )
+        )
+
+        self.assertEqual(result.blocked, {kh, kw})
+
+    def test_conv_spatial_and_window_blocks_compose(self):
+        mb, out, i, j, channel, ki = (
+            _isym(name) for name in ("mb", "out", "i", "j", "channel", "ki")
+        )
+        op = _computed_buffer(
+            (2, 3, 8, 16),
+            name="strided_windowed_conv",
+            reduction_type=CONV2D_FWD_OP,
+            reduction_ranges=(64, 3),
+        )
+        op.data.op_info = {
+            "conv_params": {
+                "stride_i": 2,
+                "stride_j": 1,
+                "kernel_h": 3,
+                "kernel_w": 1,
+            }
+        }
+        ctx = _make_context(
+            op,
+            self._PLACEHOLDER_TD,
+            it_space={mb: 2, out: 3, i: 8, j: 16, channel: 64, ki: 3},
+            reduction_vars=[channel, ki],
+        )
+        rw = MagicMock()
+        rw.writes = [MagicMock(ranges=(mb, out, i, j))]
+
+        with patch(TestConvSpatialBlockedVars._PATCH_TARGET, return_value=rw):
+            result = collect_work_division_constraints(ctx)
+
+        self.assertEqual(result.blocked, {i, j, ki})
+
+    def test_window_block_conflicting_with_span_commit_raises_unsupported(self):
+        ki, kj = (_isym(name) for name in ("ki", "kj"))
+        op = _computed_buffer(
+            (8,),
+            name="pool_with_forced_window_split",
+            reduction_type=AVGPOOL2D_OP,
+            reduction_ranges=(3, 3),
+        )
+        ctx = _make_context(
+            op,
+            self._PLACEHOLDER_TD,
+            reduction_vars=[ki, kj],
+            committed_splits={ki: 2},
+        )
+
+        with self.assertRaisesRegex(Unsupported, "reduction_window_blocked_vars"):
+            collect_work_division_constraints(ctx)
+
+    def test_unaligned_restickify_stick_dim_is_unsplit(self):
+        old_stick, new_stick = (_isym(name) for name in ("old_stick", "new_stick"))
+        op = _computed_buffer((96,), name="restickify")
+        input_td = MagicMock()
+        input_td.device_coords = [
+            sympy.floor(old_stick / 64),
+            sympy.Mod(old_stick, 64),
+        ]
+        output_td = MagicMock()
+        output_td.device_coords = [
+            sympy.floor(new_stick / 64),
+            sympy.Mod(new_stick, 64),
+        ]
+        result = restickify_padding_blocked_vars(
+            _make_context(
+                op,
+                output_td,
+                input_tds=[input_td],
+                it_space={old_stick: 96, new_stick: 128},
+                stick_vars={old_stick: 64, new_stick: 64},
+            )
+        )
+
+        self.assertEqual(result.blocked, {old_stick})
 
 
 class TestQfp8wtConstraints(unittest.TestCase):

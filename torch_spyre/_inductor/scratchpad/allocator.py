@@ -16,6 +16,7 @@ import functools
 import logging
 import math
 import time
+from abc import ABC, abstractmethod
 from collections import defaultdict
 from collections.abc import Iterable, Sequence
 from dataclasses import replace
@@ -73,9 +74,6 @@ from torch_spyre._inductor.scratchpad.exhaustive_search import (
     ExhaustiveSearchSolver,
 )
 from torch_spyre._inductor.scratchpad.sa_cooptimizer import SaCoOptimizingSolver
-from torch_spyre._inductor.scratchpad.passes import (
-    ScratchpadOptimizationPass,
-)
 from torch_spyre._inductor.scratchpad.utils import (
     round_up_to_alignment,
     clone_at_graph_boundaries,
@@ -98,10 +96,20 @@ from torch_spyre._inductor.ir import FixedTiledLayout, SpyreEmptyFallback
 
 from torch_spyre._inductor import config
 from torch_spyre._inductor.logging_utils import get_inductor_logger
+from torch_spyre._inductor.loop_info import CarriedReductionRecord
 from torch_spyre._inductor.scratchpad.lx_relayout import (
     LXRelayoutPlan,
     collect_lx_relayout_plans,
     materialize_lx_relayouts,
+)
+from torch_spyre._inductor.cost_model import CostParams
+
+_COST_PARAMS = CostParams(
+    # we need a expression of both compute, mem_t
+    # whereas the default gives max(compute, mem_t)
+    # which optimizes compute only when there's a matmul
+    overlap_gamma=0.46,
+    use_bundled_cost_model=False,
 )
 
 logger = get_inductor_logger("scratchpad.allocator")
@@ -159,6 +167,16 @@ def _extern_kernel_in_live_range(graph: GraphLowering, uses: list[int]) -> bool:
     )
 
 
+def _is_carried_reduction_storage(op: Any) -> bool:
+    """True only for the accumulator named by its shared physical contract."""
+
+    record = getattr(op, "_carried_reduction_record", None)
+    return (
+        isinstance(record, CarriedReductionRecord)
+        and record.accumulator_name == op.get_name()
+    )
+
+
 # A ``MemoryPlanSolver`` is single-use (buffers are required at construction),
 # so the allocators hold a factory -- how to build a solver for a given buffer
 # set -- rather than a live instance, and build a fresh one per solve.
@@ -169,6 +187,25 @@ LayoutSolverFactory = Callable[[Sequence[LifetimeBoundBuffer], int], MemoryPlanS
 CoreDivisionSolverFactory = Callable[
     [Sequence[LifetimeBoundBuffer], int], CoreDivisionLayoutSolver
 ]
+
+
+class ScratchpadOptimizationPass(ABC):
+    """
+    Abstract class for optimization passes which are implemented to improve
+    a graph's overall scratchpad memory utilization and/or memory latency.
+    """
+
+    @abstractmethod
+    def apply_pass(self, graph: GraphLowering):
+        """
+        Accepts a candidate graph to be optimized and evaluated for scratchpad memory allocation.
+        `graph` will be mutated according in an implementation defined way. The order and
+        number of nodes in the graph may change as a result of an optimization pass.
+
+        Args:
+            graph (GraphLowering): The graph to be optimized for scratchpad memory allocation
+        """
+        pass
 
 
 class ScratchpadAllocator:
@@ -241,7 +278,7 @@ class ScratchpadAllocator:
         self._run_passes(self.pre_optimization_passes, graph)
         buffers = self._prepare_buffers(graph)
         solver = self._build_solver(buffers)
-        allocation = self._solve(solver)
+        allocation = self._solve(solver, graph)
         accepted_lx_relayouts = self._finalize_lx_relayout_allocation(allocation)
         self._post_solve(graph, allocation)
         reasons = self._get_spill_reasons(solver, allocation)
@@ -276,7 +313,7 @@ class ScratchpadAllocator:
         self._append_lx_relayout_destinations(graph, buffers)
         return buffers
 
-    def _solve(self, solver: MemoryPlanSolver) -> Sequence[Any]:
+    def _solve(self, solver: MemoryPlanSolver, graph: GraphLowering) -> Sequence[Any]:
         """Assign LX addresses. Base: placement-only ``plan_layout``."""
         return solver.plan_layout(log_lx_usage=True)
 
@@ -350,8 +387,10 @@ class ScratchpadAllocator:
             return False
         # A planned source intentionally bypasses the profitability denylist:
         # the relayout planner has already applied its stricter structural gates.
-        return config.allow_all_ops_in_lx_planning or (
-            self._get_op_name(op) not in OP_OUTPUT_NOT_GOOD_FOR_LX_REUSE
+        return (
+            _is_carried_reduction_storage(op)
+            or config.allow_all_ops_in_lx_planning
+            or self._get_op_name(op) not in OP_OUTPUT_NOT_GOOD_FOR_LX_REUSE
             or op.get_name() in planned_lx_buffers
         )
 
@@ -445,8 +484,11 @@ class ScratchpadAllocator:
             # MultiOutputLayout tuple op). There is nothing to place, and the
             # checks below would raise.
             return "unsized (no device layout)"
-        if name in mutated_buffers:
+        if name in mutated_buffers and not _is_carried_reduction_storage(op):
             return "mutation target"
+        # The shared carried-reduction contract names exactly one accumulator
+        # with one in-loop mutator and a closed fill -> combine -> drain
+        # lifetime.  The general mutation gate remains unchanged otherwise.
         if _is_tiled_advancing(op) or _is_read_advancing_anywhere(name, buf_user_deps):
             # LX addresses cannot be expressed as affine.apply symbols today (see
             # compute_ops.py's is_tiled_lx check), so a buffer whose address
@@ -1572,13 +1614,73 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         )
         return buffers
 
-    def _solve(self, solver: MemoryPlanSolver) -> Sequence[Any]:
+    def _solve(self, solver: MemoryPlanSolver, graph: GraphLowering) -> Sequence[Any]:
         assert isinstance(solver, CoreDivisionLayoutSolver)
-        result = solver.plan_layout_and_core_divisions()
+        bufmap = {buf.name: buf for buf in solver.buffers}
+
+        # Keyed by buffer name, which is what ``predict_by_bundle`` needs to match
+        # features to the ops in each estimated bundle. ``mem_usage_by_buf`` keys
+        # on ``op.name`` over ``graph.operations``, so every feature here belongs
+        # to an op the grouping will see -- a feature whose buffer is absent from
+        # ``graph.operations`` would silently drop out of the objective.
+        mem_usage = mem_usage_by_buf(graph)
+        op_features = {}
+        for output_name in mem_usage:
+            if not isinstance(graph.get_buffer(output_name), ComputedBuffer):
+                continue
+            if output_name not in bufmap:
+                continue
+            op_features[output_name] = self._extract_op_features(
+                graph, output_name, bufmap
+            )
+
+        from torch_spyre._inductor.cost_model import predict_by_bundle
+
+        # Logged, not asserted: dropping a buffer from the objective changes what
+        # the solver optimizes without failing anything, so it has to be visible,
+        # but it is not worth killing a plan over. Empty today.
+        unscored = set(op_features) - {
+            getattr(op, "name", None) for op in graph.operations
+        }
+        if unscored:
+            logger.debug(
+                "cost objective omits %d buffer(s) absent from graph.operations: %s",
+                len(unscored),
+                sorted(unscored),
+            )
+
+        # Scored one estimated bundle at a time, not as a single whole-graph
+        # kernel: bundle membership decides input dedup, the arity derate and the
+        # underfill derate, so a graph that fuses into several kernels is
+        # mispriced when scored flat.
+        try:
+            cost_expr = sympy.sympify(
+                predict_by_bundle(graph.operations, op_features, params=_COST_PARAMS)
+            )
+        except (ValueError, RuntimeError):
+            cost_expr = None
+        result = solver.plan_layout_and_core_divisions(cost_expr)
         assert not any(buffer.lx_relayout_plans for buffer in result), (
             "CoOptimizingAllocator does not support LX relayout"
         )
         return result
+
+    def _extract_op_features(self, graph, output_name, buffers):
+        """Build symbolic OpFeatures for one ComputedBuffer op (best-effort).
+
+        Same extraction as dump_cost_model.extract_op_features, but keyed off
+        each buffer's *symbolic* is_lx/cores/core-division vars (sym_is_lx,
+        sym_core_divs) instead of concrete values, so the
+        resulting OpFeatures can be fed to predict_ops() to build a cost
+        expression over the solver's own decision variables.
+        """
+        from torch_spyre._inductor.dump_cost_model import extract_op_features
+        from torch_spyre._inductor.scratchpad.sa_cooptimizer import _work_slices
+
+        sym_core_divs = buffers[output_name].sym_core_divs
+        op = graph.get_buffer(output_name)
+        ws = _work_slices(op, CoreDivision(sym_core_divs[0], sym_core_divs[1]))
+        return extract_op_features(op, ws, buffers=buffers)
 
     def _post_solve(self, graph: GraphLowering, allocation: Sequence[Any]) -> None:
         # The divisions must be committed such that any buffer clones can correctly

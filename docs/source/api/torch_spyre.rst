@@ -679,6 +679,11 @@ Environment Variables
    * - ``HBM_POOL_PLANNING``
      - Enable HBM-pool planning for intermediates not in LX
        (default ``1``)
+   * - ``FRONTEND_POOL_ALLOCATION``
+     - Allocate each SDSC bundle's HBM pool as a front-end PyTorch tensor
+       passed in as ``%pool_base_addr``, instead of the backend
+       self-allocating via ``sdscbundle.device_mem_allocate``
+       (default ``0``)
    * - ``GLOBAL_STICK_OPTIMIZER``
      - Enable the global stick-dimension optimizer (default ``1``)
    * - ``SPYRE_CORE_ID_K_FAST_EMISSION``

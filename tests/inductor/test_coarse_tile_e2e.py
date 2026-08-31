@@ -41,6 +41,7 @@ ORIGINAL TESTS (below the boundary marker)
     Original class-based tests preserved for coverage and reference, to be cleaned up in future.
 """
 
+import ast
 import dataclasses
 import math
 import os
@@ -1263,30 +1264,42 @@ def test_softmax_2d_512x256_dim1_A4():
     run_coarse_tile_test(fn, inputs)
 
 
-@pytest.mark.skip(
-    reason="correctness bug: B÷4 tiled softmax over dim=1 produces numerical errors (0.3% mismatched, 0.30 diff)"
-)
 def test_softmax_2d_512x256_dim1_B4():
-    """softmax(x, dim=1) on [512,256] tiled B÷4 → 64 elems/tile (1 stick)."""
+    """softmax(x, dim=1) on [512,256] tiled B÷4 must be rejected at compile time.
+
+    B is both the tiled dim and the reduction dim here (no other tiled
+    output dim exists at all) -- sub/div tile B as a real output dim
+    (loop_tiled_dims=[[1]]) while amax/sum's own loop_tiled_dims is [[]],
+    so they can never be safely redirected to the accumulated result. Same
+    root cause as test_softmax_2d_512x256_dim0_A4 (see its docstring);
+    previously this test only reached a distinct, unrelated restickify
+    failure because the reduction-consumer bug went undetected and let
+    compilation proceed further before hitting a different wall.
+    """
     inputs = [tensor("x", shape=(512, 256), dims=["A", "B"])]
 
     def fn(x):
         with spyre_hint(num_tiles_per_dim={"B": 4}):
             return torch.softmax(x, dim=1)
 
-    run_coarse_tile_test(fn, inputs)
+    _run_coarse_tile_test_raises(
+        fn,
+        inputs,
+        match="tiles the reduction dim as a real output dim",
+    )
 
 
 def test_softmax_2d_512x256_dim1_A4_B4():
-    """softmax(x, dim=1) on [512,256] tiled A÷4 B÷4.
+    """softmax(x, dim=1) on [512,256] tiled A÷4 B÷4 (nested reduction tiling).
 
-    coarse_tile now correctly classifies exp's copy-out (div reads sum's
-    tiled-reduction result, forcing div into a separate loop nest, so exp
-    can no longer stay loop_internal — see _consumers_reading_incomplete_
-    reduction). That surfaces a distinct, still-unresolved layout-solver
-    bug: the layout solver cannot find a restickify path for div's new
-    full-buffer read of exp's copy-out. Track the follow-on bug here until
-    it's root-caused.
+    Compiles successfully but produces a numerically wrong result: the sum
+    reduction's own cross-B-tile combine is partial (confirmed by returning
+    amax/sum directly — amax matches CPU exactly, sum is too-small on
+    505/512 rows), independent of any consumer redirect. Same symptom family
+    as the flat-case reduction-dim-tiled rejection (see
+    test_softmax_2d_512x256_dim1_B4), but a distinct code path: this is
+    inside _propagate_tiled_reduction_op's nested-case combine itself, not a
+    same-loop-body consumer redirect. See #4104.
     """
     inputs = [tensor("x", shape=(512, 256), dims=["A", "B"])]
 
@@ -1295,24 +1308,38 @@ def test_softmax_2d_512x256_dim1_A4_B4():
             with spyre_hint(num_tiles_per_dim={"B": 4}):
                 return torch.softmax(x, dim=1)
 
-    with pytest.raises(
-        (InductorError, NotImplementedError),
-    ):
-        run_coarse_tile_test(fn, inputs)
+    _run_coarse_tile_test_raises(
+        fn,
+        inputs,
+        match="Mismatched elements",
+    )
 
 
-@pytest.mark.skip(
-    reason="correctness bug: A÷4 tiled softmax over dim=0 produces numerical errors (0.0% but 0.24 diff)"
-)
 def test_softmax_2d_512x256_dim0_A4():
-    """softmax(x, dim=0) on [512,256] tiled A÷4 → 128 elems/tile (2 sticks)."""
+    """softmax(x, dim=0) on [512,256] tiled A÷4 must be rejected at compile time.
+
+    A is both the tiled dim and the reduction dim; sub/div need the fully
+    combined amax/sum before they can run, but the reduction op's own
+    inside_consumers redirect (_propagate_tiled_reduction_op) can never
+    match sub/div's loop_tiled_dims to the reduction op's own — the
+    reduction dim lives in loop_tiled_reduction_dims for the reduction op
+    but in loop_tiled_dims for sub/div, which tile it as a real output dim.
+    Left unredirected, sub/div would silently read raw per-tile scratch
+    instead of the accumulated result — see coarse_tile.py's
+    _plan_tiling_propagation reduction branch, which now rejects this
+    shape with Unsupported instead of compiling it wrong.
+    """
     inputs = [tensor("x", shape=(512, 256), dims=["A", "B"])]
 
     def fn(x):
         with spyre_hint(num_tiles_per_dim={"A": 4}):
             return torch.softmax(x, dim=0)
 
-    run_coarse_tile_test(fn, inputs)
+    _run_coarse_tile_test_raises(
+        fn,
+        inputs,
+        match="tiles the reduction dim as a real output dim",
+    )
 
 
 def test_softmax_2d_512x256_dim0_B4():
@@ -1329,10 +1356,13 @@ def test_softmax_2d_512x256_dim0_B4():
 # Two bugs blocked this before PR #3622: (1) sibling-op A-reduction vs A-output
 # tiling collision (colsum diagnostic: every output column summed to ~4.0 instead
 # of ~1.0); (2) squeeze-position bug in _insert_reduction_copy_op (issue #3613).
-# Post-#3622 compilation succeeds but results are still numerically wrong.
-@pytest.mark.skip(reason="numerically incorrect results — root cause unknown")
+# Post-#3622 compilation succeeds, but sub/div (same-group consumers of the
+# A-tiled amax/sum reductions) can never be safely redirected to the
+# accumulated result for this shape -- see test_softmax_2d_512x256_dim0_A4's
+# docstring. Now rejected at compile time with Unsupported instead of
+# silently producing numerically wrong results.
 def test_softmax_2d_512x256_dim0_A4_B4():
-    """softmax(x, dim=0) on [512,256] tiled A÷4 B÷4."""
+    """softmax(x, dim=0) on [512,256] tiled A÷4 B÷4 must be rejected at compile time."""
     inputs = [tensor("x", shape=(512, 256), dims=["A", "B"])]
 
     def fn(x):
@@ -1340,7 +1370,11 @@ def test_softmax_2d_512x256_dim0_A4_B4():
             with spyre_hint(num_tiles_per_dim={"B": 4}):
                 return torch.softmax(x, dim=0)
 
-    run_coarse_tile_test(fn, inputs)
+    _run_coarse_tile_test_raises(
+        fn,
+        inputs,
+        match="tiles the reduction dim as a real output dim",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2067,14 +2101,19 @@ def test_copy_accum_with_reduction_512x256_A4():
     run_coarse_tile_test(fn, inputs)
 
 
-@pytest.mark.skip(
-    reason=(
-        "IndexError: _insert_all_read_copy_ops fails when tiling B with "
-        "unit-size B dim in scale"
-    )
-)
 def test_copy_accum_with_reduction_512x256_B4():
-    """copy_forced(acc * scale + x.amin(dim=1, keepdim=True), acc) tiled B÷4."""
+    """copy_forced(acc * scale + x.amin(dim=1, keepdim=True), acc) tiled B÷4.
+
+    Must be rejected at compile time. B is both the tiled dim and the
+    reduction dim; the reduction op (amin) is tiled alongside no other
+    output dim, so this is the flat case, and the same-group consumer
+    (acc * scale + r) tiles B as a real output dim while the reduction op
+    itself only carries B in loop_tiled_reduction_dims. Per
+    coarse_tile.py's _plan_tiling_propagation reduction branch, the
+    consumer's loop_tiled_dims can never match the reduction op's own in
+    this shape, so it is rejected with Unsupported instead of silently
+    reading a partially-accumulated reduction result.
+    """
     inputs = [
         tensor("acc", shape=(512, 256), dims=["A", "B"]),
         tensor("scale", shape=(512, 1), dims=["A", "B"]),
@@ -2089,17 +2128,23 @@ def test_copy_accum_with_reduction_512x256_B4():
                 copy_forced(acc * scale + r, acc)
         return acc
 
-    run_coarse_tile_test(fn, inputs)
-
-
-@pytest.mark.skip(
-    reason=(
-        "IndexError: _insert_all_read_copy_ops fails when tiling B with "
-        "unit-size B dim in scale"
+    _run_coarse_tile_test_raises(
+        fn,
+        inputs,
+        match="tiles the reduction dim as a real output dim",
     )
-)
+
+
 def test_copy_accum_with_reduction_512x256_A4_B4():
-    """copy_forced(acc * scale + x.amin(dim=1, keepdim=True), acc) tiled A÷4 B÷4."""
+    """copy_forced(acc * scale + x.amin(dim=1, keepdim=True), acc) tiled A÷4 B÷4.
+
+    Unlike test_copy_accum_with_reduction_512x256_B4, A (an output dim of
+    the reduction op) is tiled outer to B (the reduction dim) here, making
+    this the nested case (see _compute_fill_loop_info_planned): the
+    reduction re-runs once per outer A-tile, so _propagate_tiled_reduction_op
+    redirects every same-group inside consumer to accum_full unconditionally
+    -- no consumer-loop_tiled_dims-mismatch rejection applies.
+    """
     inputs = [
         tensor("acc", shape=(512, 256), dims=["A", "B"]),
         tensor("scale", shape=(512, 1), dims=["A", "B"]),
@@ -3678,12 +3723,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
     # Single pointwise op
     # ------------------------------------------------------------------
 
-    @config.patch(
-        {
-            "lx_planning": True,
-            "allow_all_ops_in_lx_planning": True,
-        }
-    )
     def test_hint_single_group_pointwise(self):
         """spyre_hint(num_tiles_per_dim={"A": 4}) tiles a pointwise abs into 4 iterations."""
         from torch_spyre._inductor import spyre_hint
@@ -3721,12 +3760,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
     # Softmax-shaped chain (pointwise-reduce-pointwise)
     # ------------------------------------------------------------------
 
-    @config.patch(
-        {
-            "lx_planning": True,
-            "allow_all_ops_in_lx_planning": True,
-        }
-    )
     def test_hint_softmax_shaped(self):
         """Tile the pointwise-reduce-pointwise stages of a softmax-like kernel.
 
@@ -3791,13 +3824,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
     # Nested hints: outer K=2, inner M=4 on a single op
     # ------------------------------------------------------------------
 
-    @config.patch(
-        {
-            "lx_planning": True,
-            "allow_all_ops_in_lx_planning": True,
-            "sencores": 4,
-        }
-    )
+    @config.patch({"sencores": 4})
     def test_hint_nested_loop_with_scratchpad(self):
         """Design-doc small example: y=a+b; z=y*c with nested K=2×M=4 hints.
 
@@ -3877,12 +3904,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
     # Two ops in separate groups tiling different iteration dimensions
     # ------------------------------------------------------------------
 
-    @config.patch(
-        {
-            "lx_planning": True,
-            "allow_all_ops_in_lx_planning": True,
-        }
-    )
     def test_hint_per_group_tiled_dims(self):
         """Two ops in separate hint groups tile different sets of iteration dims.
 
@@ -3959,12 +3980,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
     # Two ops with different slice counts -> two separate groups
     # ------------------------------------------------------------------
 
-    @config.patch(
-        {
-            "lx_planning": True,
-            "allow_all_ops_in_lx_planning": True,
-        }
-    )
     def test_hint_two_groups(self):
         """Two separate tiling groups produce two LoopSpec entries in the source."""
         from torch_spyre._inductor import spyre_hint
@@ -4008,12 +4023,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
     # Op inside hint scope with no matching named dim
     # ------------------------------------------------------------------
 
-    @config.patch(
-        {
-            "lx_planning": True,
-            "allow_all_ops_in_lx_planning": True,
-        }
-    )
     def test_hint_group_includes_op_with_no_matching_dim(self):
         """An op inside a hint scope whose loop vars don't match the hinted dim stays in the group.
 
@@ -4060,12 +4069,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
     # Loop-invariant (broadcast) op's own write does not advance
     # ------------------------------------------------------------------
 
-    @config.patch(
-        {
-            "lx_planning": True,
-            "allow_all_ops_in_lx_planning": True,
-        }
-    )
     def test_loop_invariant_op_write_does_not_advance_in_sdsc(self):
         """A loop-invariant ComputedBuffer's own write inside a coarse-tile
         group must never get a device_tile_advance_expr, so the unroller does
@@ -4142,12 +4145,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
     # Hint propagation through mm_to_bmm_pass
     # ------------------------------------------------------------------
 
-    @config.patch(
-        {
-            "lx_planning": True,
-            "allow_all_ops_in_lx_planning": True,
-        }
-    )
     def test_hint_survives_mm_to_bmm_rewrite(self):
         """spyre_hint is not dropped when mm_to_bmm_pass rewrites mm -> bmm.
 
@@ -4194,12 +4191,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
     # Hint propagation into inserted restickify nodes
     # ------------------------------------------------------------------
 
-    @config.patch(
-        {
-            "lx_planning": True,
-            "allow_all_ops_in_lx_planning": True,
-        }
-    )
     def test_hint_restickify_stays_in_group(self):
         """A restickify node inserted inside a hint scope lands in the same group.
 
@@ -4249,12 +4240,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
     # Softmax with row-tiling: large [NROW, NCOL] tensor
     # ------------------------------------------------------------------
 
-    @config.patch(
-        {
-            "lx_planning": True,
-            "allow_all_ops_in_lx_planning": True,
-        }
-    )
     def test_hint_softmax_row_tiling(self):
         """spyre_hint(num_tiles_per_dim={"NROW": 4}) tiles softmax over the row dimension.
 
@@ -4627,12 +4612,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
             "must not be silently skipped",
         )
 
-    @config.patch(
-        {
-            "lx_planning": True,
-            "allow_all_ops_in_lx_planning": True,
-        }
-    )
     # Consider deleting — superseded by Group 10 structured tests (_flash_v3_fn)
     @pytest.mark.skip(reason="dxp_standalone timeout")
     def test_hint_flash_attention_v3(self):
@@ -5051,30 +5030,19 @@ class TestCoarseTileSpyreHints(InductorTestCase):
             "count=sympify('4')", src, "Expected B loop count 4 as count= in LoopSpec"
         )
 
-    @config.patch(
-        {
-            "lx_planning": True,
-            "allow_all_ops_in_lx_planning": True,
-        }
-    )
-    @pytest.mark.skip
     def test_hint_flash_attention_loopspec(self):
-        """Lk loop level not dropped when Lk-broadcast ops appear first in group.
+        """Lk (the reduction dim) tiled alongside H must be rejected at compile time.
 
-        Flash-attention-style code with nested hints {B:1}/{H:4}/{Lk:2}.
-        The B=1 hint tiles by 1 and is optimised away (no loop generated),
-        leaving two effective loop levels: H and Lk.  Ops like amax/exp/sum
-        have shape [B,H,Lq] — no Lk dimension — and appear before
-        Lk-iterating ops in topological order.  The old _hints_levels
-        returned early from one of those ops and dropped Lk.  The fixed
-        version unions loop_var assignments and finds Lk from a later op
-        in the group.
-
-        Decision xfail: failing in CI (Actions run 30385154736, job
-        90362755639) on PR #3293. We've decided to xfail the coarse tiling
-        tests to allow us to merge to main -- deliberate decision to unblock
-        the merge, not a claim about a specific bisected root cause. Un-xfail
-        once the underlying regression is investigated and fixed.
+        Originally written to pin down an unrelated _hints_levels bug (Lk
+        loop level dropped when Lk-broadcast ops appear before Lk-iterating
+        ops in topological order); that bug is long fixed. The test now
+        compiles far enough to hit a distinct, legitimate restriction: Lk is
+        the reduction dim here, tiled alongside H (no separate outer output-
+        dim loop), so M/denominator's same-group consumers (max_running,
+        exp_scores, ...) would read a per-Lk-tile partial max/sum instead of
+        the fully-combined one. Same flat-case family as
+        test_softmax_2d_512x256_dim1_B4 -- rejected by the same
+        _reads_incomplete_reduction planning-time check.
         """
         import math
         from torch_spyre._inductor import spyre_hint
@@ -5137,22 +5105,9 @@ class TestCoarseTileSpyreHints(InductorTestCase):
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
             mock_patch("subprocess.run"),
+            pytest.raises(Exception, match="partial reduction result consumed before"),
         ):
-            _, source_codes = run_and_get_code(cfn, queries_dev, keys_dev, values_dev)
-        self.assertTrue(len(source_codes) > 0)
-        src = source_codes[0]
-        self.assertIn("LoopSpec(", src, "Expected LoopSpec in generated source")
-        self.assertIn(
-            "count=sympify('4')",
-            src,
-            "Expected H loop count 4 — hint_H must appear as count= in LoopSpec",
-        )
-        self.assertIn(
-            "count=sympify('2')",
-            src,
-            "Expected Lk loop count 2 as count= in LoopSpec — hint_Lk must not be"
-            " dropped by _hints_levels",
-        )
+            run_and_get_code(cfn, queries_dev, keys_dev, values_dev)
 
     def test_hint_mixed_output_and_reduction_loopspec(self):
         """Lk loop level stamped correctly when Lk is output dim for some ops and
@@ -5220,22 +5175,16 @@ class TestCoarseTileSpyreHints(InductorTestCase):
             " by _stamp_group (group-wide is_reduction_level flag bug)",
         )
 
-    @pytest.mark.skip
     def test_hint_flash_attention_two_loop_levels(self):
-        """Flash-attention graph: both H and Lk loop levels survive into codegen.
+        """Lk (the reduction dim) tiled alongside H must be rejected at compile time.
 
-        Nested hints {B:1}/{H:4}/{Lk:2} — B=1 tiles by 1 and is optimised
-        away (no loop generated), leaving two effective loop levels: H and Lk.
-        The generated LoopSpec must carry both count=sympify('4') for H and
-        count=sympify('2') for Lk.  Before the _stamp_group per-op dispatch
-        fix, Lk tiling was silently skipped for ops where the group-wide
-        is_reduction_level flag disagreed with the op's own dim role.
-
-        Decision xfail: failing in CI (Actions run 30385154736, job
-        90362755639) on PR #3293. We've decided to xfail the coarse tiling
-        tests to allow us to merge to main -- deliberate decision to unblock
-        the merge, not a claim about a specific bisected root cause. Un-xfail
-        once the underlying regression is investigated and fixed.
+        Same graph shape as test_hint_flash_attention_loopspec (originally
+        written to pin down an unrelated, long-fixed _stamp_group per-op
+        dispatch bug); now correctly rejected before any LoopSpec/OpSpec is
+        generated by the same _reads_incomplete_reduction planning-time
+        check -- Lk is the reduction dim tiled alongside H with no separate
+        outer output-dim loop, so max_running/denominator's same-group
+        consumers would read a per-Lk-tile partial result.
         """
         import math
         from torch_spyre._inductor import spyre_hint
@@ -5296,52 +5245,18 @@ class TestCoarseTileSpyreHints(InductorTestCase):
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
             mock_patch("subprocess.run"),
+            pytest.raises(Exception, match="partial reduction result consumed before"),
         ):
-            _, source_codes = run_and_get_code(cfn, queries_dev, keys_dev, values_dev)
-        self.assertTrue(len(source_codes) > 0)
-        src = source_codes[0]
-        self.assertIn("LoopSpec(", src, "Expected LoopSpec in generated source")
-        self.assertIn(
-            "count=sympify('4')",
-            src,
-            "Expected H loop count 4 as count= in LoopSpec",
-        )
-        self.assertIn(
-            "count=sympify('2')",
-            src,
-            "Expected Lk loop count 2 as count= in LoopSpec — _stamp_group must"
-            " divide Lk ranges on each op using that op's own dim role",
-        )
-        # The amax (op='max') reduces over Lk.  The bug causes it to receive
-        # is_reduction_level=False at the Lk loop level (group-wide flag taken
-        # from a pointwise op), so _divide_reduction_ranges is never called:
-        # amax iterates over the full Lk per tile and its tiled_symbols inner
-        # level stays empty ("[[], ").  After the per-op dispatch fix, the amax
-        # op gets a non-empty inner tiled_symbols entry for its Lk reduction dim.
-        max_op_idx = src.find("op='max'")
-        self.assertGreater(
-            max_op_idx, 0, "Expected op='max' (amax) OpSpec in generated source"
-        )
-        self.assertNotIn(
-            "tiled_symbols=[[], ",
-            src[max_op_idx : max_op_idx + 500],
-            "amax op has empty inner tiled_symbols — Lk reduction range not divided"
-            " by _stamp_group (group-wide is_reduction_level flag bug)",
-        )
+            run_and_get_code(cfn, queries_dev, keys_dev, values_dev)
 
-    @pytest.mark.skip
     def test_hint_flash_attention_two_loop_levels_v2(self):
         """Flash-attention graph: both H and Lq loop levels survive into codegen.
 
         Variant of test_hint_flash_attention_two_loop_levels with a causal
         mask and an explicit running-max (real_max) formulation that updates
-        output and denominator in place via copy_.
-
-        Decision xfail: failing in CI (Actions run 30385154736, job
-        90362755639) on PR #3293. We've decided to xfail the coarse tiling
-        tests to allow us to merge to main -- deliberate decision to unblock
-        the merge, not a claim about a specific bisected root cause. Un-xfail
-        once the underlying regression is investigated and fixed.
+        output and denominator in place via copy_. Unlike that test, Lq (an
+        output dim, not the reduction dim Lk) is tiled here, so it never hits
+        the reduction-dim-tiled-alongside-output-dim restriction.
         """
         import math
         from torch_spyre._inductor import spyre_hint
@@ -5907,12 +5822,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
     # Tiled pointwise with outside consumer (_allocate_full_buffer)
     # ------------------------------------------------------------------
 
-    @config.patch(
-        {
-            "lx_planning": True,
-            "allow_all_ops_in_lx_planning": True,
-        }
-    )
     def test_hint_tiled_pointwise_outside_consumer_correct(self):
         """Tiled pointwise op with a consumer outside the loop (tests
         _allocate_full_buffer pre-stickify: the full buffer must be correctly
@@ -6181,10 +6090,11 @@ class TestCoarseTileSpyreHints(InductorTestCase):
     @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_pool_alloc_scoped_per_bundle_across_fallback_boundary(self):
         """A CPU-fallback op (torch.sin) splits the graph into multiple
-        bundles. Each bundle's pool (if any) is allocated inside that
-        bundle's own generated MLIR via sdscbundle.device_mem_allocate --
-        there is no Python-side pool tensor, and no bundle's MLIR references
-        another bundle's pool."""
+        bundles. With frontend_pool_allocation at its default (False), each
+        bundle's pool (if any) is allocated inside that bundle's own
+        generated MLIR via sdscbundle.device_mem_allocate -- there is no
+        Python-side pool tensor, and no bundle's MLIR references another
+        bundle's pool."""
         from torch_spyre.execution import async_compile as async_compile_mod
 
         def fn(t):
@@ -6257,8 +6167,9 @@ class TestCoarseTileSpyreHints(InductorTestCase):
     @config.patch({"lx_planning": False})
     @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_no_python_side_pool_tensor_allocated(self):
-        """No bundle allocates a Python-side _pool_<name> tensor any more --
-        pool allocation is now entirely inside the generated MLIR."""
+        """With frontend_pool_allocation at its default (False), no bundle
+        allocates a Python-side _pool_<name> tensor -- pool allocation is
+        entirely inside the generated MLIR."""
 
         def fn(t):
             a = torch.exp(t) * 2
@@ -6364,12 +6275,6 @@ class TestNamedDimsHint(InductorTestCase):
         torch.manual_seed(0xAFFE)
         _pnd.reset()
 
-    @config.patch(
-        {
-            "lx_planning": True,
-            "allow_all_ops_in_lx_planning": True,
-        }
-    )
     def test_full_with_named_dims_hint_tiles(self):
         """spyre_hint(named_dims=[...]) on torch.full enables coarse tiling.
 
@@ -6405,12 +6310,6 @@ class TestNamedDimsHint(InductorTestCase):
         self.assertIn("LoopSpec(", src, "Expected LoopSpec in generated source")
         self.assertIn("sympify('4')", src, "Expected loop count 4")
 
-    @config.patch(
-        {
-            "lx_planning": True,
-            "allow_all_ops_in_lx_planning": True,
-        }
-    )
     def test_full_like_with_named_dims_hint_tiles(self):
         """spyre_hint(named_dims=[...]) on torch.full_like enables coarse tiling."""
         from torch_spyre._inductor import spyre_hint
@@ -6440,12 +6339,6 @@ class TestNamedDimsHint(InductorTestCase):
         self.assertIn("LoopSpec(", src, "Expected LoopSpec in generated source")
         self.assertIn("sympify('2')", src, "Expected loop count 2")
 
-    @config.patch(
-        {
-            "lx_planning": True,
-            "allow_all_ops_in_lx_planning": True,
-        }
-    )
     def test_named_dims_hint_self_contained_no_driver_calls(self):
         """spyre_hint(named_dims=[...]) alone enables coarse tiling.
 
@@ -6706,7 +6599,297 @@ class TestCoarseTileReductionDim0E2E(InductorTestCase):
             with spyre_hint(num_tiles_per_dim={"B": 4}):
                 return x.sum(dim=0)
 
-        compare_with_cpu(fn, x, run_compile=True, run_eager=False, atol=0.05, rtol=0.05)
+        def check_source(source):
+            self.assertNotIn("coarse_tile_reduction_drain", source)
+
+        compare_with_cpu(
+            fn,
+            x,
+            run_compile=True,
+            run_eager=False,
+            source_check=check_source,
+            atol=0.05,
+            rtol=0.05,
+        )
+
+    def test_hinted_terminal_sum_is_carried_in_lx(self):
+        """A terminal E sum keeps one [T,H] running value in LX."""
+
+        E, T, H = 2, 64, 64
+        base = torch.linspace(-4.0, 4.0, E * T * H, dtype=torch.float32)
+        values = base.reshape(E, T, H).to(torch.float16)
+        _declare_tensor_dim("E", E)
+        _declare_tensor_dim("T", T)
+        _declare_tensor_dim("H", H)
+
+        def fn(values):
+            _name_tensor_dims(values, ["E", "T", "H"])
+            with spyre_hint(
+                num_tiles_per_dim={"E": E},
+                work_div={"T": 32},
+            ):
+                return values.sum(dim=0)
+
+        def check_source(source):
+            self.assertIn("LoopSpec(", source)
+            self.assertIn("coarse_tile_reduction_drain", source)
+            self.assertIn("'lx'", source)
+
+        with config.patch({"sencores": 32, "lx_planning": True}):
+            compare_with_cpu(
+                fn,
+                values,
+                run_compile=True,
+                run_eager=False,
+                source_check=check_source,
+                atol=0.05,
+                rtol=0.05,
+            )
+
+    def test_hinted_terminal_sum_e128_matches_ordinary_and_cpu(self):
+        """The E=128 carried sum preserves the existing reduction result."""
+
+        E, T, H = 128, 64, 64
+        values = (
+            torch.linspace(-3.0, 4.0, E * T * H, dtype=torch.float32)
+            .reshape(E, T, H)
+            .to(torch.float16)
+        )
+        _declare_tensor_dim("E", E)
+        _declare_tensor_dim("T", T)
+        _declare_tensor_dim("H", H)
+
+        def ordinary(values):
+            return values.sum(dim=0)
+
+        def carried(values):
+            _name_tensor_dims(values, ["E", "T", "H"])
+            with spyre_hint(
+                num_tiles_per_dim={"E": E},
+                work_div={"T": 32},
+            ):
+                return values.sum(dim=0)
+
+        def check_source(source):
+            self.assertIn("LoopSpec(count=sympify('128')", source)
+            self.assertIn("coarse_tile_reduction_drain", source)
+            self.assertIn("'lx'", source)
+
+        with config.patch({"sencores": 32, "lx_planning": True}):
+            ordinary_result = _compile_and_run(ordinary, (values,), "spyre")
+            _declare_tensor_dim("E", E)
+            _declare_tensor_dim("T", T)
+            _declare_tensor_dim("H", H)
+            carried_result = _compile_and_run(
+                carried, (values,), "spyre", source_check=check_source
+            )
+
+        cpu_result = ordinary(values)
+        torch.testing.assert_close(carried_result, ordinary_result, atol=1.0, rtol=0.05)
+        torch.testing.assert_close(carried_result, cpu_result, atol=1.0, rtol=0.05)
+
+    def test_carried_sum_hbm_fallback_is_correct_and_visible(self):
+        """Capacity spill keeps correct execution and emits a warning."""
+
+        E, T, H = 2, 64, 64
+        values = torch.randn(E, T, H, dtype=torch.float16) * 0.1
+        _declare_tensor_dim("E", E)
+        _declare_tensor_dim("T", T)
+        _declare_tensor_dim("H", H)
+
+        def fn(values):
+            _name_tensor_dims(values, ["E", "T", "H"])
+            with spyre_hint(
+                num_tiles_per_dim={"E": E},
+                work_div={"T": 32},
+            ):
+                return values.sum(dim=0)
+
+        def check_source(source):
+            self.assertIn("coarse_tile_reduction_drain", source)
+            self.assertNotIn("'lx'", source)
+
+        with (
+            config.patch(
+                {
+                    "sencores": 32,
+                    "lx_planning": True,
+                    "dxp_lx_frac_avail": 1.0,
+                }
+            ),
+            self.assertLogs("spyre.inductor.scheduler", level="WARNING") as logs,
+        ):
+            compare_with_cpu(
+                fn,
+                values,
+                run_compile=True,
+                run_eager=False,
+                source_check=check_source,
+                atol=0.05,
+                rtol=0.05,
+            )
+        self.assertTrue(any("remained in HBM" in line for line in logs.output))
+
+    def test_carried_sum_requires_explicit_work_div(self):
+        """Without row ownership, the existing reduction path is unchanged."""
+
+        E, T, H = 4, 64, 64
+        values = torch.randn(E, T, H, dtype=torch.float16) * 0.1
+        _declare_tensor_dim("E", E)
+        _declare_tensor_dim("T", T)
+        _declare_tensor_dim("H", H)
+
+        def fn(values):
+            _name_tensor_dims(values, ["E", "T", "H"])
+            with spyre_hint(num_tiles_per_dim={"E": 2}):
+                return values.sum(dim=0)
+
+        def check_source(source):
+            self.assertNotIn("coarse_tile_reduction_drain", source)
+
+        compare_with_cpu(
+            fn,
+            values,
+            run_compile=True,
+            run_eager=False,
+            source_check=check_source,
+            atol=0.05,
+            rtol=0.05,
+        )
+
+    def test_carried_sum_does_not_apply_without_an_expert_loop(self):
+        """E=1 remains an ordinary reduction because there is nothing to carry."""
+
+        E, T, H = 1, 64, 64
+        values = torch.randn(E, T, H, dtype=torch.float16) * 0.1
+        _declare_tensor_dim("E", E)
+        _declare_tensor_dim("T", T)
+        _declare_tensor_dim("H", H)
+
+        def fn(values):
+            _name_tensor_dims(values, ["E", "T", "H"])
+            with spyre_hint(
+                num_tiles_per_dim={"E": E},
+                work_div={"T": 32},
+            ):
+                return values.sum(dim=0)
+
+        def check_source(source):
+            self.assertNotIn("coarse_tile_reduction_drain", source)
+
+        compare_with_cpu(
+            fn,
+            values,
+            run_compile=True,
+            run_eager=False,
+            source_check=check_source,
+            atol=0.05,
+            rtol=0.05,
+        )
+
+    def test_carried_sum_does_not_apply_to_nested_tiling(self):
+        """Tiling an output axis keeps the existing nested-reduction path."""
+
+        E, T, H = 4, 64, 64
+        values = torch.randn(E, T, H, dtype=torch.float16) * 0.1
+        _declare_tensor_dim("E", E)
+        _declare_tensor_dim("T", T)
+        _declare_tensor_dim("H", H)
+
+        def fn(values):
+            _name_tensor_dims(values, ["E", "T", "H"])
+            with spyre_hint(
+                num_tiles_per_dim={"T": 2},
+                work_div={"T": 32},
+            ):
+                with spyre_hint(num_tiles_per_dim={"E": 2}):
+                    return values.sum(dim=0)
+
+        def check_source(source):
+            self.assertNotIn("coarse_tile_reduction_drain", source)
+
+        compare_with_cpu(
+            fn,
+            values,
+            run_compile=True,
+            run_eager=False,
+            source_check=check_source,
+            atol=0.05,
+            rtol=0.05,
+        )
+
+    def test_carried_sum_requires_terminal_reduction(self):
+        """A sum with a consumer retains the existing unsupported result."""
+
+        E, T, H = 4, 64, 64
+        values = torch.randn(E, T, H, dtype=torch.float16) * 0.1
+        _declare_tensor_dim("E", E)
+        _declare_tensor_dim("T", T)
+        _declare_tensor_dim("H", H)
+
+        def fn(values):
+            _name_tensor_dims(values, ["E", "T", "H"])
+            with spyre_hint(
+                num_tiles_per_dim={"E": 2},
+                work_div={"T": 32},
+            ):
+                reduced = values.sum(dim=0)
+                return reduced + 1
+
+        with self.assertRaisesRegex(
+            Exception, "partial reduction result consumed before accumulation"
+        ):
+            _compile_and_run(fn, (values,), "spyre")
+
+    def test_carried_sum_rejects_reduction_dim_work_div(self):
+        """The hint must name an output row, not the reduced expert dim."""
+
+        E, T, H = 4, 64, 64
+        values = torch.randn(E, T, H, dtype=torch.float16) * 0.1
+        _declare_tensor_dim("E", E)
+        _declare_tensor_dim("T", T)
+        _declare_tensor_dim("H", H)
+
+        def fn(values):
+            _name_tensor_dims(values, ["E", "T", "H"])
+            with spyre_hint(
+                num_tiles_per_dim={"E": 2},
+                work_div={"E": 2},
+            ):
+                return values.sum(dim=0)
+
+        with self.assertRaisesRegex(Exception, "work_div on an output row dimension"):
+            _compile_and_run(fn, (values,), "spyre")
+
+    def test_carried_sum_does_not_apply_to_max(self):
+        """Only sums are converted into loop-carried accumulators."""
+
+        E, T, H = 4, 64, 64
+        values = torch.randn(E, T, H, dtype=torch.float16)
+        _declare_tensor_dim("E", E)
+        _declare_tensor_dim("T", T)
+        _declare_tensor_dim("H", H)
+
+        def fn(values):
+            _name_tensor_dims(values, ["E", "T", "H"])
+            with spyre_hint(
+                num_tiles_per_dim={"E": 2},
+                work_div={"T": 32},
+            ):
+                return values.amax(dim=0)
+
+        def check_source(source):
+            self.assertNotIn("coarse_tile_reduction_drain", source)
+
+        compare_with_cpu(
+            fn,
+            values,
+            run_compile=True,
+            run_eager=False,
+            source_check=check_source,
+            atol=1e-3,
+            rtol=1e-3,
+        )
 
     def test_hint_tiled_reduction_dim0_max_correct(self):
         """x.amax(dim=0) tiled over B produces correct results."""
@@ -6903,8 +7086,8 @@ class TestCoarseTileMoEBroadcastMatmulE2E(InductorTestCase):
             fn, x, w, run_compile=True, run_eager=False, atol=0.05, rtol=0.05
         )
 
-    def test_unsqueeze_broadcast_matmul_emits_expert_weight_step(self):
-        """The read of packed weights advances once per expert loop trip."""
+    def test_unsqueeze_broadcast_matmul_reads_expert_weights_directly(self):
+        """Activation stays fixed while weights advance without staging."""
         from torch_spyre._inductor import spyre_hint
 
         E, T, H, F = 3, 64, 64, 64
@@ -6928,15 +7111,137 @@ class TestCoarseTileMoEBroadcastMatmulE2E(InductorTestCase):
         ):
             _, source_codes = run_and_get_code(torch.compile(fn), x, w)
 
+        tensor_args = []
+        for node in ast.walk(ast.parse(source_codes[0])):
+            if not (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "TensorArg"
+            ):
+                continue
+            keywords = {kw.arg: kw.value for kw in node.keywords}
+            size_node = keywords.get("device_size")
+            if not isinstance(size_node, ast.List):
+                continue
+            size = [ast.literal_eval(elt) for elt in size_node.elts]
+            advance_node = keywords.get("device_tile_advance_expr")
+            advance = (
+                ast.literal_eval(advance_node.args[0])
+                if isinstance(advance_node, ast.Call) and advance_node.args
+                else None
+            )
+            tensor_args.append((ast.literal_eval(keywords["is_input"]), size, advance))
+
+        activation_reads = [
+            advance
+            for is_input, size, advance in tensor_args
+            if is_input and size == [1, T, H]
+        ]
+        self.assertEqual(activation_reads, [None])
+
+        weight_reads = [
+            advance
+            for is_input, size, advance in tensor_args
+            if is_input and size == [1, H, E, F]
+        ]
+        self.assertEqual(len(weight_reads), 1)
+        self.assertIsInstance(weight_reads[0], str)
+        weight_step = re.fullmatch(r"floor\((\d+)\*[^)]+\)", weight_reads[0])
+        self.assertIsNotNone(weight_step)
+        # TensorArg addresses are in df16 sticks.  64 sticks * 64 elements
+        # per stick is one H*F = 4096-element expert slab.
+        self.assertEqual(int(weight_step.group(1)) * 64, H * F)
+        self.assertNotIn("coarse_tile_read_copy_0_arg1_1", source_codes[0])
+
+    def test_unsqueeze_broadcast_matmul_keeps_copy_when_proof_declines(self):
+        """A failed proof leaves the original staging copy authoritative."""
+        from torch_spyre._inductor import spyre_hint
+
+        E, T, H, F = 3, 64, 64, 64
+        x = torch.randn(T, H, dtype=torch.float16).to("spyre")
+        w = torch.randn(E, H, F, dtype=torch.float16).to("spyre")
+        _declare_tensor_dim("E", E)
+        _declare_tensor_dim("T", T)
+        _declare_tensor_dim("H", H)
+        _declare_tensor_dim("F", F)
+
+        def fn(x, w):
+            _name_tensor_dims(x, ["T", "H"])
+            _name_tensor_dims(w, ["E", "H", "F"])
+            with spyre_hint(num_tiles_per_dim={"E": E}):
+                return torch.matmul(x.unsqueeze(0), w)
+
+        with (
+            mock_patch(_LAUNCH_JOBPLAN),
+            mock_patch(_PREPARE_KERNEL),
+            mock_patch("subprocess.run"),
+            mock_patch(
+                "torch_spyre._inductor.read_copy_elision._prove_matmul_direct_read",
+                return_value=(None, "forced test decline"),
+            ),
+        ):
+            _, source_codes = run_and_get_code(torch.compile(fn), x, w)
+
         src = source_codes[0]
-        weight_copy = re.search(
-            r"op='identity'.*?arg_index=1.*?"
-            r"device_tile_advance_expr=sympify\('([^']+)'\)",
-            src,
-            flags=re.DOTALL,
+        self.assertIn("coarse_tile_read_copy_0_arg1_1", src)
+
+    def test_unsqueeze_broadcast_matmul_keeps_copy_for_different_core_views(self):
+        """A legal but different source ownership cannot replace the copy."""
+        from torch_spyre._inductor import spyre_hint
+
+        E, T, H, F = 3, 64, 64, 64
+        x = torch.randn(T, H, dtype=torch.float16).to("spyre")
+        w = torch.randn(E, H, F, dtype=torch.float16).to("spyre")
+        _declare_tensor_dim("E", E)
+        _declare_tensor_dim("T", T)
+        _declare_tensor_dim("H", H)
+        _declare_tensor_dim("F", F)
+
+        def fn(x, w):
+            _name_tensor_dims(x, ["T", "H"])
+            _name_tensor_dims(w, ["E", "H", "F"])
+            with spyre_hint(num_tiles_per_dim={"E": E}):
+                return torch.matmul(x.unsqueeze(0), w)
+
+        with (
+            mock_patch(_LAUNCH_JOBPLAN),
+            mock_patch(_PREPARE_KERNEL),
+            mock_patch("subprocess.run"),
+            mock_patch(
+                "torch_spyre._inductor.read_copy_elision._per_core_view_on_buf",
+                side_effect=[
+                    ("output", None, True),
+                    ("output", None, True),
+                    ("staged-weight", None, True),
+                    ("direct-weight", None, True),
+                ],
+            ),
+        ):
+            _, source_codes = run_and_get_code(torch.compile(fn), x, w)
+
+        self.assertIn("coarse_tile_read_copy_0_arg1_1", source_codes[0])
+
+    def test_unsqueeze_broadcast_matmul_distinguishes_experts_exactly(self):
+        """Each trip reads its own weight slab, not expert zero or stale HBM."""
+        from torch_spyre._inductor import spyre_hint
+
+        E, T, H, F = 3, 64, 64, 64
+        x = torch.eye(T, H, dtype=torch.float16)
+        w = torch.stack(
+            [torch.eye(H, F, dtype=torch.float16) * scale for scale in range(1, E + 1)]
         )
-        self.assertIsNotNone(weight_copy)
-        self.assertIn("_tile_adv_coarse_tile_read_copy", weight_copy.group(1))
+        _declare_tensor_dim("E", E)
+        _declare_tensor_dim("T", T)
+        _declare_tensor_dim("H", H)
+        _declare_tensor_dim("F", F)
+
+        def fn(x, w):
+            _name_tensor_dims(x, ["T", "H"])
+            _name_tensor_dims(w, ["E", "H", "F"])
+            with spyre_hint(num_tiles_per_dim={"E": E}):
+                return torch.matmul(x.unsqueeze(0), w)
+
+        compare_with_cpu(fn, x, w, run_compile=True, run_eager=False, atol=0, rtol=0)
 
     def test_unsqueeze_broadcast_matmul_tile_E_poisoned_correct(self):
         """Same pattern as test_unsqueeze_broadcast_matmul_tile_E_correct,
@@ -7098,6 +7403,103 @@ class TestCoarseTileNestedReductionE2E(InductorTestCase):
             fn, a, b, run_compile=True, run_eager=False, atol=0.05, rtol=0.05
         )
 
+    def test_nested_bmm_outer_M_inner_K_correct(self):
+        """bmm [B,M,K]@[B,K,N] outer M (output) + inner K — correct."""
+        from torch_spyre._inductor import spyre_hint
+
+        B, M, K, N = 2, 128, 512, 32
+        a = torch.randn(B, M, K, dtype=torch.float16) * 0.01
+        b = torch.randn(B, K, N, dtype=torch.float16) * 0.01
+        _declare_tensor_dim("B", B)
+        _declare_tensor_dim("M", M)
+        _declare_tensor_dim("K", K)
+        _declare_tensor_dim("N", N)
+
+        def fn(a, b):
+            _name_tensor_dims(a, ["B", "M", "K"])
+            _name_tensor_dims(b, ["B", "K", "N"])
+            with spyre_hint(num_tiles_per_dim={"M": 2}):
+                with spyre_hint(num_tiles_per_dim={"K": 4}):
+                    return torch.bmm(a, b)
+
+        compare_with_cpu(
+            fn, a, b, run_compile=True, run_eager=False, atol=0.05, rtol=0.05
+        )
+
+    @config.patch(
+        {
+            "sencores": 4,
+            "lx_planning": True,
+            "allow_all_ops_in_lx_planning": True,
+            "ignore_span_overflow_hints": False,
+            "enable_reduction_tiling": True,
+        }
+    )
+    def test_auto_span_overflow_bmm_combined_correct(self):
+        """Automatic span planning selects output+K tiling without spyre_hint."""
+        B, M, K, N = 1, 128, 512, 32
+        a = torch.randn(B, M, K, dtype=torch.float16) * 0.01
+        b = torch.randn(B, K, N, dtype=torch.float16) * 0.01
+
+        def fn(a, b):
+            return torch.bmm(a, b)
+
+        with mock_patch(
+            "torch_spyre._inductor.wsr.span_overflow_hint_analysis.MAX_SPAN_BYTES",
+            16 * 1024,
+        ):
+            compare_with_cpu(
+                fn, a, b, run_compile=True, run_eager=False, atol=0.05, rtol=0.05
+            )
+
+    def _auto_span_overflow_bmm_source(self, *, enable_reduction_tiling):
+        B, M, K, N = 1, 128, 512, 32
+        a = torch.randn(B, M, K, dtype=torch.float16).to("spyre")
+        b = torch.randn(B, K, N, dtype=torch.float16).to("spyre")
+
+        def fn(a, b):
+            return torch.bmm(a, b)
+
+        with (
+            config.patch(
+                {
+                    "sencores": 4,
+                    "lx_planning": True,
+                    "allow_all_ops_in_lx_planning": True,
+                    "ignore_span_overflow_hints": False,
+                    "enable_reduction_tiling": enable_reduction_tiling,
+                }
+            ),
+            mock_patch(
+                "torch_spyre._inductor.wsr.span_overflow_hint_analysis.MAX_SPAN_BYTES",
+                16 * 1024,
+            ),
+            mock_patch(_LAUNCH_JOBPLAN),
+            mock_patch(_PREPARE_KERNEL),
+            mock_patch("subprocess.run"),
+        ):
+            _, source_codes = run_and_get_code(torch.compile(fn), a, b)
+
+        self.assertTrue(source_codes)
+        return source_codes[0]
+
+    def test_auto_span_overflow_bmm_combined_loopspec(self):
+        """Automatic M+K planning emits the expected nested loop counts."""
+        src = self._auto_span_overflow_bmm_source(enable_reduction_tiling=True)
+
+        self.assertEqual(src.count("LoopSpec("), 2)
+        self.assertIn("count=sympify('8')", src)
+        self.assertIn("count=sympify('2')", src)
+        self.assertIn("coarse_tile_reduce_copy", src)
+
+    def test_auto_span_overflow_bmm_kill_switch_rejects_unresolved_k_span(self):
+        """Disabling K tiling must not hide a K span left by output-only tiling."""
+        with self.assertRaisesRegex(
+            Exception,
+            "no combined split.*makes all spans fit",
+        ):
+            self._auto_span_overflow_bmm_source(enable_reduction_tiling=False)
+
     def test_nested_matmul_outer_M_inner_K_correct(self):
         """mm [M,K]@[K,N] with outer M (output) + inner K (reduction) — correct."""
         from torch_spyre._inductor import spyre_hint
@@ -7189,12 +7591,6 @@ class TestCoarseTileNestedReductionE2E(InductorTestCase):
             "Expected a coarse_tile_reduce_copy op in generated source for nested M+K tiling",
         )
 
-    @config.patch(
-        {
-            "lx_planning": True,
-            "allow_all_ops_in_lx_planning": True,
-        }
-    )
     def test_nested_matmul_outer_M_inner_K_accum_in_lx(self):
         """With lx_planning enabled, the tile-sized accum buffer lands in LX scratchpad."""
         from torch_spyre._inductor import spyre_hint

@@ -31,6 +31,26 @@ if TYPE_CHECKING:
 
 
 @dataclass(frozen=True)
+class CarriedReductionSpec:
+    """Planning-time requirement for one value carried through a tiled loop."""
+
+    row_dim_name: str
+    required_row_split: int
+
+
+@dataclass(frozen=True)
+class CarriedReductionRecord:
+    """Shared identity and ownership contract for a realized carried sum."""
+
+    accumulator_name: str
+    row_dim_name: str
+    required_row_split: int
+    fill_name: str
+    combine_name: str
+    drain_name: str
+
+
+@dataclass(frozen=True)
 class ReductionPlan:
     """Planned shape/identity/nesting data for a tiled-reduction op.
 
@@ -84,6 +104,7 @@ class ReductionPlan:
     outer_fill_loop_info: "CoarseTileInfo | None"
     full_output_strides: tuple[sympy.Expr, ...]
     per_tile_strides: tuple[sympy.Expr, ...]
+    carried: CarriedReductionSpec | None = None
 
 
 @dataclass(frozen=True)
@@ -176,6 +197,10 @@ class ReadCopyEntry:
         captured before division squeezes a size-one tiled dimension away.
         ``_plan_read_copies`` attaches the selected sizing read's facts here;
         this entry is their authority during copy construction.
+    loop_invariant:
+        True only when every consumer reads the same source slice on every
+        trip of the surrounding counted loop.  Such a copy is a preheader
+        operation, not part of the loop body.
     """
 
     copy_name: str
@@ -187,6 +212,7 @@ class ReadCopyEntry:
     predivision_unit_steps: tuple[
         tuple[tuple[int, sympy.Expr, sympy.Expr], ...], ...
     ] = ()
+    loop_invariant: bool = False
 
 
 @dataclass(frozen=True)
@@ -205,6 +231,25 @@ class ReadCopyPlan:
     """
 
     entries: tuple["ReadCopyEntry", ...]
+
+
+@dataclass(frozen=True)
+class ReadCopyElisionRecord:
+    """Direct-read form saved while a consumer is redirected through a copy.
+
+    Coarse tiling keeps the copy authoritative until layout selection, work
+    division, and LX planning finish.  A later pass may restore
+    ``direct_inner_fn`` only when the final physical plan proves that reading
+    ``source_name`` directly is equivalent.  The record is deliberately not
+    copied by :func:`copy_op_metadata`: rebuilding the consumer body
+    invalidates the saved direct form unless that pass explicitly recreates
+    the record.
+    """
+
+    consumer_name: str
+    copy_name: str
+    source_name: str
+    direct_inner_fn: object
 
 
 @dataclass
@@ -242,9 +287,11 @@ class CoarseTileInfo:
         level's extent equals the final (innermost) extent times the
         product of every more-inner level's own count that also tiles that
         dim.
-        An empty per-level list means the dep is loop-invariant at that
-        level. This is a tiling *decision*, not a substituted index
-        expression -- deferred substitution into the dependency's actual
+        An empty per-level list means this read's address does not advance at
+        that level. It does not by itself prove value invariance: a producer
+        may rewrite fixed-address scratch on every trip. This is a tiling
+        *decision*, not a substituted index expression -- deferred
+        substitution into the dependency's actual
         (possibly later-rewritten) index expression happens in
         spyre_kernel.py at OpSpec/TensorArg construction time, when the
         index is guaranteed final.
@@ -278,8 +325,10 @@ class CoarseTileInfo:
         ``test_flash_tile_B``). Independent of ``dep.index`` entirely, so
         ``SpyreKernel._general_tile_advance`` can add its device-address
         contribution as an extra term via ``tiling_expr_to_device_expr``
-        rather than by substitution. Empty list means no such dims for this
-        read (the common case).
+        rather than by substitution. An empty per-read list means that read
+        has no such dims. The outer list may also be empty when no read in the
+        operation needs squeezed-dimension metadata; that is complete "none
+        needed" metadata, not a missing entry for every read.
     squeezed_advance_output:
         The analogous per-level ``(host_stride, extent)`` list for this op's
         own write dependency, parallel to ``output_tiled_dims`` the same way
@@ -325,6 +374,9 @@ _SPYRE_METADATA_ATTRS = (
     # coarse_tile._propagate_tiled_reduction_op, read by finalize_layouts in
     # insert_restickify.py to promote accum_full to FixedTiledLayout when needed.
     "_tiled_reduction_accum_name",
+    # One immutable record shared by the fill, loop combine, and final drain
+    # of a loop-carried reduction.  Post-fusion verification consumes it.
+    "_carried_reduction_record",
 )
 
 

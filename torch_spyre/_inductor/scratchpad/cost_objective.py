@@ -38,6 +38,10 @@ scoring naively is not affordable. Two mechanisms:
 * **Dirty tracking.** Between calls, only the buffers whose division or residency
   actually changed can dirty a bundle, so the rest keep their previous cost.
 
+Parameterization. Scoring uses the same ``CostParams`` the allocator's ILP
+objective uses -- the upstream matmul model with partial compute/HBM overlap --
+not ``predict_ops``' defaults. See ``_COST_PARAMS``.
+
 Determinism. Each bundle's microsecond prediction is converted to the shared
 fixed-point integer scale *once*, then summed as integers. Float accumulation
 would make an incrementally-updated total drift from a recomputed one, which
@@ -47,15 +51,32 @@ two agree exactly. :meth:`score_from_scratch` exists so tests can assert that.
 
 from __future__ import annotations
 
+import dataclasses
 from collections.abc import Sequence, Set as AbstractSet
 from typing import Optional
 
 from torch_spyre._inductor.cost_model import OpFeatures, predict_ops
 from torch_spyre._inductor.logging_utils import get_inductor_logger
-from torch_spyre._inductor.scratchpad import cooptimization_scorer as scorer
-from torch_spyre._inductor.scratchpad.op_features import with_residency
+from torch_spyre._inductor.scratchpad import utils
+from torch_spyre._inductor.scratchpad.allocator import _COST_PARAMS
 
 logger = get_inductor_logger("scratchpad.cost_objective")
+
+
+def with_residency(features: OpFeatures, lx_names: AbstractSet[str]) -> OpFeatures:
+    """``features`` with each argument's ``mem`` set from ``lx_names``.
+
+    The cost model charges an LX-resident argument no HBM traffic, so this is
+    what turns a placement decision into a cost. Returns a new object; the input
+    is left alone so one extracted menu can be scored against many candidate
+    placements.
+    """
+    return dataclasses.replace(
+        features,
+        args=[
+            dataclasses.replace(a, is_lx=(a.name in lx_names)) for a in features.args
+        ],
+    )
 
 
 class BundleCostObjective:
@@ -168,7 +189,9 @@ class BundleCostObjective:
         else:
             # One rounding step per bundle, then integer accumulation -- see the
             # determinism note in the module docstring.
-            value = scorer.to_fixed_us(max(0.0, predict_ops(feats)) / 1000.0)
+            value = utils.to_fixed_us(
+                max(0.0, predict_ops(feats, params=_COST_PARAMS)) / 1000.0
+            )
         self._cache[key] = value
         self.evaluations += 1
         return value
