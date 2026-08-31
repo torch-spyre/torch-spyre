@@ -16,6 +16,7 @@ import warnings
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import regex as re
 import sympy
 import torch
 from torch.testing import FileCheck
@@ -49,6 +50,26 @@ from torch_spyre._inductor.work_division import (
 )
 
 
+def _total_core_split(source: str) -> int:
+    """Return the product of split factors in the emitted ``iteration_space``.
+
+    Co-optimization spreads the work division across several ``c`` dims rather
+    than loading all cores onto ``c0``, so the total core usage is the product
+    of the per-dim split factors (e.g. ``c0:(256, 2), c1:(128, 4), c2:(512, 4)``
+    uses ``2 * 4 * 4 == 32`` cores).
+    """
+    match = re.search(r"iteration_space=\{([^}]*)\}", source)
+    assert match, "no iteration_space found in emitted source"
+    factors = [
+        int(f) for f in re.findall(r"sympify\('\d+'\),\s*(\d+)\)", match.group(1))
+    ]
+    assert factors, f"no split factors found in {match.group(1)!r}"
+    product = 1
+    for f in factors:
+        product *= f
+    return product
+
+
 class TestSpyreConfig(InductorTestCase):
     def setUp(self):
         super().setUp()
@@ -62,9 +83,10 @@ class TestSpyreConfig(InductorTestCase):
         out, source_codes = run_and_get_code(comp_fn, x)
         # print("test_config_default")
         # print(source_codes[0])
-        FileCheck().check("sdsc_fused_abs").check(
-            f"sympify('c0'): (sympify('256'), {config.sencores})"
-        ).run(source_codes[0])
+        FileCheck().check("sdsc_fused_abs").run(source_codes[0])
+        # Co-optimization spreads the split across dims; the product of the
+        # per-dim split factors must add up to the configured core count.
+        self.assertEqual(_total_core_split(source_codes[0]), config.sencores)
 
     @config.patch({"sencores": 64})
     def test_config_too_many_sencores(self):
@@ -86,9 +108,10 @@ class TestSpyreConfig(InductorTestCase):
         out, source_codes = run_and_get_code(cfn, x)
         # print("test_sencores 16")
         # print(source_codes[0])
-        FileCheck().check("sdsc_fused_abs").check(
-            f"sympify('c0'): (sympify('256'), {config.sencores})"
-        ).run(source_codes[0])
+        FileCheck().check("sdsc_fused_abs").run(source_codes[0])
+        # Co-optimization spreads the split across dims; the product of the
+        # per-dim split factors must add up to the configured core count.
+        self.assertEqual(_total_core_split(source_codes[0]), config.sencores)
 
     @config.patch({"sencores": 32})
     def test_symbolic_batch_dim_pointwise_split(self):
@@ -108,30 +131,10 @@ class TestSpyreConfig(InductorTestCase):
         _, source_codes = run_and_get_code(comp_fn, x.to("spyre"), y.to("spyre"))
         # Iteration space embeds (size_expr, split). The symbolic batch dim's
         # split must equal SENCORES=32; the static stick dim's split must be 1.
-        FileCheck().check("sdsc_fused_add").check(", 32)").check(", 1)").run(
-            source_codes[0]
-        )
-
-    # Need a test where changing dxp_lx_frac_avail changes the generated OpSpec
-    # @config.patch({"dxp_lx_frac_avail": 0.01, "lx_planning": True})
-    # def test_config_dxp_lx_frac_avail(self):
-    #    fn = torch.abs
-    #    x = torch.randn((256, 128, 512)).to("spyre")
-    #
-    #    comp_fn = torch.compile(fn)
-    #    out, source_codes = run_and_get_code(comp_fn, x)
-    #    #print("test_conf_dxp_lx_frac_avail")
-    #    #print(source_codes[0])
-
-    # Need a test where setting lx_planning to True generates a different OpSpec
-    # @config.patch({'lx_planning': True})
-    # def test_config_lx_planning(self):
-    #    fn = torch.abs
-    #    x = torch.randn((256, 128, 512)).to("spyre")
-    #
-    #    comp_fn = torch.compile(fn)
-    #    out, source_codes = run_and_get_code(comp_fn, x)
-    #    #print(source_codes[0])
+        FileCheck().check("sdsc_fused_add").run(source_codes[0])
+        # Co-optimization spreads the split across dims; the product of the
+        # per-dim split factors must add up to the configured core count.
+        self.assertEqual(_total_core_split(source_codes[0]), config.sencores)
 
     # ------------------------------------------------------------------
     # Unit tests for the symbolic-shape sidecar in work_division.py
