@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Extract cost-model features from the after-pre-scheduling LoopLevel IR.
+"""Extract cost-model features from the after-LX-planning LoopLevel IR.
 
 Walks ``graph.operations`` and builds :class:`cost_model.OpFeatures` per op
 (per-core cores, per-tensor-arg bytes + HBM/LX residency + broadcast flags),
@@ -25,13 +25,20 @@ against device measurements (``examples/bench_*``); the model is only as good as
 this extraction.
 """
 
+import math
 import os
 
 from torch._inductor.ir import ComputedBuffer
 
+
 from .constants import BATCH_MATMUL_OP
-from .cost_model import ArgTraffic, OpFeatures, explain
+from .cost_model import ArgTraffic, OpFeatures, explain, max
 from .pass_utils import apply_splits_from_index_coeff, iteration_space_from_op
+
+from typing import Mapping, Optional, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from torch_spyre._inductor.scratchpad.plan_solver import LifetimeBoundBuffer
 
 
 def cost_dump_enabled() -> bool:
@@ -68,19 +75,30 @@ def _op_name(op) -> str:
     return type(data).__name__ if data is not None else op.get_operation_name()
 
 
-def _cores(op) -> int:
+def _work_slices(op, write_index, read_index, iteration_space, work_slices=None):
+    """Resolve explicit or committed pre-Scheduler ownership, then transport."""
+    if work_slices is not None:
+        return work_slices
+    ownership = getattr(op, "iteration_space_ownership", None)
+    if ownership is not None:
+        return ownership.work_slices
     splits = getattr(op, "op_it_space_splits", None)
     if not splits:
-        return 1
+        return {}
+    return apply_splits_from_index_coeff(
+        splits, write_index, read_index, iteration_space
+    )
+
+
+def _cores(op, work_slices=None) -> int:
     try:
         rw = op.get_read_writes()
         write_index = next(iter(rw.writes)).index
         read_index = next((d.index for d in rw.reads), write_index)
         it_space = iteration_space_from_op(op)
-        readable = apply_splits_from_index_coeff(
-            splits, write_index, read_index, it_space
+        return math.prod(
+            _work_slices(op, write_index, read_index, it_space, work_slices).values()
         )
-        return _prod_ints(readable.values())
     except Exception:  # noqa: BLE001 - best-effort feature extraction
         return 1
 
@@ -260,7 +278,7 @@ def _loop_factor_for_index(index, levels) -> int:
     return factor
 
 
-def _row_split(op, default: int) -> int:
+def _row_split(op, default: int, work_slices=None) -> int:
     """Core split of the ROW (partition) device dim = the output var with the largest
     write-index coefficient (the outer/row dim; the stick dim has the smallest). Used so
     ``tile_rows_per_core`` divides by the cores actually on the rows, not total cores --
@@ -268,16 +286,11 @@ def _row_split(op, default: int) -> int:
     (usually total cores) on any failure -> the prior all-cores-on-rows behavior.
     """
     try:
-        splits = getattr(op, "op_it_space_splits", None)
-        if not splits:
-            return default
         rw = op.get_read_writes()
         write_index = next(iter(rw.writes)).index
         read_index = next((d.index for d in rw.reads), write_index)
         it_space = iteration_space_from_op(op)
-        readable = apply_splits_from_index_coeff(
-            splits, write_index, read_index, it_space
-        )
+        readable = _work_slices(op, write_index, read_index, it_space, work_slices)
         out_vars = [
             (abs(int(write_index.coeff(s))), s)
             for s in it_space
@@ -297,6 +310,7 @@ def _matmul_features(
     dtype_bytes: int,
     loop_trip: int = 1,
     tiles_red_dim: bool = False,
+    work_slices=None,
 ):
     """(macs, rows_per_core, cols_per_core, a_bytes, b_bytes, k_split, m_split, n_split).
 
@@ -329,22 +343,19 @@ def _matmul_features(
     a_bytes = b_bytes = 0
     k_split = m_split = n_split = 1
     try:
-        splits = getattr(op, "op_it_space_splits", None)
-        if splits:
-            rw = op.get_read_writes()
-            write_index = next(iter(rw.writes)).index
-            read_index = next((d.index for d in rw.reads), write_index)
-            it_space = iteration_space_from_op(op)
-            readable = apply_splits_from_index_coeff(
-                splits, write_index, read_index, it_space
-            )
+        rw = op.get_read_writes()
+        write_index = next(iter(rw.writes)).index
+        read_index = next((d.index for d in rw.reads), write_index)
+        it_space = iteration_space_from_op(op)
+        readable = _work_slices(op, write_index, read_index, it_space, work_slices)
+        if readable:
             out_vars = []
             for s in it_space:
                 wc = write_index.coeff(s)
                 if wc != 0:
                     out_vars.append((abs(int(wc)), s))
                 else:  # reduction (K) dim -> contributes to the K-split
-                    k_split *= max(1, int(readable.get(s, 1)))
+                    k_split *= max(1, readable.get(s, 1))
             if out_vars:
                 # Identify M (row/outer) and N (stick/inner), EXCLUDING batch. Prefer
                 # the exact named-dim map (present on work_div-hinted runs); else drop
@@ -368,10 +379,8 @@ def _matmul_features(
                     n_sym = mn[0][1] if len(mn) >= 2 else None
                 m_size = _int(it_space[m_sym], 1)
                 n_size = _int(it_space[n_sym], 1) if n_sym is not None else 1
-                m_split = max(1, int(readable.get(m_sym, 1)))
-                n_split = (
-                    max(1, int(readable.get(n_sym, 1))) if n_sym is not None else 1
-                )
+                m_split = max(1, readable.get(m_sym, 1))
+                n_split = max(1, readable.get(n_sym, 1)) if n_sym is not None else 1
                 if m_size > 1:
                     rows_per_core = m_size / m_split
                 if n_size > 1:
@@ -459,8 +468,19 @@ def _hbm_pattern(op, is_reduction: bool, out_dims) -> str:
         return ""
 
 
-def extract_op_features(op) -> OpFeatures:
-    """Build OpFeatures for one ComputedBuffer op (best-effort)."""
+def extract_op_features(
+    op, work_slices=None, buffers: Optional[Mapping[str, "LifetimeBoundBuffer"]] = None
+) -> OpFeatures:
+    """Build OpFeatures for one ComputedBuffer op (best-effort).
+
+    ``work_slices`` is a complete symbol-keyed candidate division during LX
+    planning. Otherwise committed pre-scheduler ownership is used, falling back
+    to legacy coefficient-keyed Scheduler transport after finalization.
+
+    buffers is an optional name -> LifetimeBoundBuffer map used for creating a
+    symbolic cost model.
+    """
+    buf = buffers.get(op.name) if buffers else None
     data = getattr(op, "data", None)
     is_reduction = getattr(data, "reduction_type", None) is not None
     loop_trip, tiles_red_dim, tiles_out_dim = _loop_features(op)
@@ -479,16 +499,16 @@ def extract_op_features(op) -> OpFeatures:
     out_dims = _device_dims(op.get_layout()) or out_size
     out_elems = _prod_ints(out_dims)
 
-    cores = _cores(op)
+    cores = _cores(op, work_slices)
 
     # Cross-core ring combine: work division splits OUTPUT dims first, then the reduced
     # axis with leftover cores -> the reduced axis is split only when out_elems < cores.
     # Approx k as the cores not absorbed by the output (refine if rung 11 needs it).
     reduction_cores = 1
-    if is_reduction and out_elems < cores:
+    if is_reduction:
         reduction_cores = max(1, cores // max(1, out_elems))
 
-    out_mem = _mem_of_layout(op.get_layout())
+    is_lx = buf.sym_is_lx if buf else _mem_of_layout(op.get_layout()) == "lx"
 
     # Matmul (batchmatmul reduction): compute-bound -> extra additive compute term. Pull
     # MACs (M*N*K), the per-core M tile (pt_eff), and the K-split k (-> reduction_cores,
@@ -508,7 +528,9 @@ def extract_op_features(op) -> OpFeatures:
             k_split,
             matmul_m_split,
             matmul_n_split,
-        ) = _matmul_features(op, out_elems, dtype_bytes, loop_trip, is_tiled_red)
+        ) = _matmul_features(
+            op, out_elems, dtype_bytes, loop_trip, is_tiled_red, work_slices
+        )
         reduction_cores = k_split
 
     # Per-core per-tile pass-row height for the UNDERFILL derate -- only for OUTPUT-dim
@@ -520,7 +542,7 @@ def extract_op_features(op) -> OpFeatures:
     # (rows/tile < col-sticks), leaving each core a full row tile (no underfill). 0.0 =
     # N/A -> no derate.
     tile_rows_per_core = 0.0
-    if tiles_out_dim and loop_trip > 1 and cores > 0 and len(out_dims) >= 2:
+    if tiles_out_dim and loop_trip > 1 and len(out_dims) >= 2:
         # Row extent from the LOGICAL shape, not the device shape. ``out_dims[-2]`` is
         # the row count only for a rank-2 tensor, whose device layout is rank-3. A
         # rank-3 or rank-4 tensor has a rank-4/5 device layout in which [-2] is a
@@ -534,13 +556,13 @@ def extract_op_features(op) -> OpFeatures:
         # previously modelled; it only repairs rank>=3. Same class of mistake, and the
         # same fix, as _matmul_features' batch-dim exclusion above.
         rows = (out_size[-2] if len(out_size) >= 2 else 0) or out_dims[-2]
-        if out_mem != "lx":  # full-buffer alloc: per-tile slice is rows / loop_trip
-            rows = rows / loop_trip
+        # full-buffer alloc: per-tile slice is rows / loop_trip
+        rows = rows / loop_trip * (1 - is_lx) + rows * is_lx
         # `loop_trip > 1` is guaranteed by the branch condition; `_row_split` can in
         # principle return 0 if a split map ever records one, and this term is a
         # diagnostic -- a ZeroDivisionError here would take down a compile for a number
         # nothing depends on. Guard locally rather than rely on the caller's condition.
-        split = _row_split(op, cores) or 1
+        split = _row_split(op, cores, work_slices) or 1
         tile_rows_per_core = rows / split
 
     # PER-ARG, PER-LEVEL loop factors. An operand is re-transferred at a nesting level
@@ -576,7 +598,7 @@ def extract_op_features(op) -> OpFeatures:
         ArgTraffic(
             name=op.get_operation_name(),
             role="output",
-            mem=out_mem,
+            is_lx=is_lx,
             elems=out_elems,
             dims=list(out_dims),
             logical=list(out_size),
@@ -613,14 +635,21 @@ def extract_op_features(op) -> OpFeatures:
             # output size. Only a NON-broadcast unresolved read is conservatively
             # sized at the full output.
             if broadcast:
-                mem, dims, in_elems, in_logical = "hbm", [1], 1, [1]
+                dims, in_elems, in_logical = [1], 1, [1]
             else:
-                mem, dims, in_elems, in_logical = "hbm", list(out_dims), out_elems, []
+                dims, in_elems, in_logical = list(out_dims), out_elems, []
+            inp_is_lx = False
+        else:
+            if buffers:
+                inp_buf = buffers.get(name)
+                inp_is_lx = inp_buf.sym_is_lx if inp_buf is not None else (mem == "lx")
+            else:
+                inp_is_lx = mem == "lx"
         args.append(
             ArgTraffic(
                 name=name,
                 role="input",
-                mem=mem,
+                is_lx=inp_is_lx,
                 elems=in_elems,
                 broadcast=broadcast,
                 dims=list(dims),

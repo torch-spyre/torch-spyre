@@ -34,6 +34,7 @@ import torch
 
 from torch_spyre._C import DataFormats, ElementArrangement
 from torch_spyre._inductor import config as spyre_config
+from torch_spyre._inductor.core_mapping import derive_operation_mapping
 from torch_spyre._inductor.op_spec import (
     DebugHandle,
     LoopSpec,
@@ -53,13 +54,15 @@ import runner  # noqa: E402
 
 def _add_op(debug_handle=None):
     """A 128x256 fp16 elementwise add -- the shape verified on hardware."""
+    iteration_space = {
+        sympify("c0"): (sympify("128"), 32),
+        sympify("c1"): (sympify("256"), 1),
+    }
     return OpSpec(
         op="add",
         is_reduction=False,
-        iteration_space={
-            sympify("c0"): (sympify("128"), 32),
-            sympify("c1"): (sympify("256"), 1),
-        },
+        iteration_space=iteration_space,
+        core_id_to_work_slice=derive_operation_mapping(iteration_space),
         op_info={},
         debug_handle=debug_handle,
         args=[

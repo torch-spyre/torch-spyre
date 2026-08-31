@@ -392,9 +392,7 @@ class ParameterizedScratchpadUsage(
             "simulated_annealing",
         ),
         "sencores": (1, 32),
-        "co_optimization": (False, True)
-        if ts_inductor_config.co_optimizing_lx_planning
-        else (False,),
+        "co_optimization": (False, True),
     }
 
     parameter_models = (("softmax", _softmax_case), ("mlp", _mlp_case))
@@ -407,6 +405,7 @@ class ParameterizedScratchpadUsage(
             layout_solver=params["solver_method"],
             sencores=params["sencores"],
             co_optimizing_lx_planning=params["co_optimization"],
+            _cpsat_warn_on_cost_expr=False,
         ):
             model, args, kwargs = factory(self)
             torch.compiler.reset()
@@ -442,7 +441,7 @@ class TestMeasureHBMUsageCoOptimizing(BaseTestScratchpadUsage):
     where adjacent ops disagree on which iteration-space dim to split. The
     canonical case is softmax(dim=0): work_distribution picks rows for the
     pointwise ops and cols for the reductions, forcing 3 of 4 shared buffers to
-    HBM by default — Strategy B reconciles them and pins all 4.
+    HBM by default — co-optimization reconciles them and pins all 4.
     """
 
     @override
@@ -480,15 +479,15 @@ class TestMeasureHBMUsageCoOptimizing(BaseTestScratchpadUsage):
     def test_softmax_dim0_strictly_lower_hbm(self):
         """The canonical motivating case from the design doc. softmax(dim=0)
         has every adjacent op pair disagreeing on which dim to split, so
-        ScratchpadAllocator only pins 1 of 4 shared buffers; Strategy B should
-        flip the pointwise ops to cols and pin all 4 → strictly lower HBM."""
+        ScratchpadAllocator only pins 1 of 4 shared buffers; co-optimization
+        should flip the pointwise ops to cols and pin all 4 → strictly lower HBM."""
         f = functools.partial(torch.softmax, dim=0)
         x = self.rand_device((512, 1024))
         self.run_test(f, (x,), strict=True)
 
     def test_softmax_dim_neg1_no_regression(self):
         """softmax(dim=-1) is the well-behaved baseline where ScratchpadAllocator
-        already pins everything pinnable. Strategy B must match (no regression)."""
+        already pins everything pinnable. Co-optimization must match (no regression)."""
         f = functools.partial(torch.softmax, dim=-1)
         x = self.rand_device((512, 1024))
         self.run_test(f, (x,))
@@ -754,6 +753,7 @@ class TestCloneAtGraphBoundaries(
             layout_solver=params["solver_method"],
             sencores=params["sencores"],
             co_optimizing_lx_planning=params["co_optimization"],
+            _cpsat_warn_on_cost_expr=False,
         ):
             model, args, kwargs = factory(self)
             torch.compiler.reset()
@@ -810,7 +810,7 @@ class CoOptAllocatorIntegrationTests(BaseTestScratchpadUsage):
     When enabled: the acceptance criterion for each model (its prescribed
     fingerprint) is defined *once* in that model's factory and swept over the
     ``solver_method`` axis by ``_ParameterizedScratchpadMeta``. The prescribed
-    plans are the *greedy* StrategyB plans; the joint CP-SAT allocator
+    plans are the *greedy* co-optimization plans; the joint CP-SAT allocator
     (``layout_solver="cpsat"``) optimises core division and placement jointly
     and is expected to land on a different (not yet pinned-down) plan, so the
     ``cpsat`` combos are marked ``expectedFailure`` via ``case_decorators``.
@@ -868,6 +868,7 @@ class CoOptAllocatorIntegrationTests(BaseTestScratchpadUsage):
                 layout_solver=layout_solver,
                 sencores=32,
                 co_optimizing_lx_planning=True,
+                _cpsat_warn_on_cost_expr=False,
             ):
                 compiled = torch.compile(model, fullgraph=True)
                 device_result = compiled(*args).to("cpu")
@@ -889,7 +890,7 @@ class CoOptAllocatorIntegrationTests(BaseTestScratchpadUsage):
         self.assertEqual(
             fingerprint,
             expected,
-            "allocation does not match the prescribed (desired = StrategyB) plan "
+            "allocation does not match the prescribed (desired greedy) plan "
             "{buf: (location, size, split)}:\n"
             f"  expected {expected}\n  got      {fingerprint}",
         )
@@ -1230,6 +1231,7 @@ class TestCpSatAllocatorFallback(
                 layout_solver=params["solver_method"],
                 sencores=params["sencores"],
                 co_optimizing_lx_planning=params["co_optimization"],
+                _cpsat_warn_on_cost_expr=False,
             ):
                 model, args, kwargs = factory(self)
                 torch.compiler.reset()
@@ -1314,6 +1316,7 @@ class TestCpSatTimeoutFallback(BaseTestScratchpadUsage):
             layout_solver="cpsat",
             sencores=32,
             co_optimizing_lx_planning=False,
+            _cpsat_warn_on_cost_expr=False,
         ):
             torch.compiler.reset()
             with ts_inductor_config.patch(lx_planning=False):
@@ -1404,7 +1407,9 @@ class TestSelectAllocator(unittest.TestCase):
         # used directly, else it degrades to an ExhaustiveSearchSolver wrapping
         # the cpsat factory's own greedy fallback.
         with ts_inductor_config.patch(
-            layout_solver="cpsat", co_optimizing_lx_planning=True
+            layout_solver="cpsat",
+            co_optimizing_lx_planning=True,
+            _cpsat_warn_on_cost_expr=False,
         ):
             a = select_allocator()
             self.assertIsInstance(a, CoOptimizingAllocator)
@@ -1425,6 +1430,35 @@ class TestSelectAllocator(unittest.TestCase):
             a = select_allocator()
             self.assertIs(type(a), ScratchpadAllocator)
             self.assertIs(a.layout_planning, _make_cpsat_solver)
+
+        # simulated_annealing + co-optimization routes to the joint allocator
+        # driven by the SA co-optimizer. This is a *different class* from the
+        # placement-only annealer below, not the same solver doing less work.
+        from torch_spyre._inductor.scratchpad.sa_cooptimizer import (
+            SaCoOptimizingSolver,
+        )
+        from torch_spyre._inductor.scratchpad.simulated_annealing import (
+            SimulatedAnnealingLayoutSolver,
+        )
+
+        with ts_inductor_config.patch(
+            layout_solver="simulated_annealing", co_optimizing_lx_planning=True
+        ):
+            a = select_allocator()
+            self.assertIsInstance(a, CoOptimizingAllocator)
+            self.assertEqual(a.layout_planning, SaCoOptimizingSolver)
+
+        # Without co-optimization the same config value selects the layout-only
+        # annealer, placement-only -- deliberately NOT wrapped in
+        # ExhaustiveSearchSolver, which solves the layout once per enumerated
+        # division candidate.
+        with ts_inductor_config.patch(
+            layout_solver="simulated_annealing", co_optimizing_lx_planning=False
+        ):
+            a = select_allocator()
+            self.assertIs(type(a), ScratchpadAllocator)
+            self.assertEqual(a.layout_planning, SimulatedAnnealingLayoutSolver)
+            self.assertNotEqual(a.layout_planning, SaCoOptimizingSolver)
 
         with ts_inductor_config.patch(
             layout_solver="bogus", co_optimizing_lx_planning=False
@@ -1633,6 +1667,7 @@ class TestBoundaryCloneInPlace(BaseTestScratchpadUsage):
                 lx_planning=True,
                 layout_solver="cpsat",
                 co_optimizing_lx_planning=True,
+                _cpsat_warn_on_cost_expr=False,
             ):
                 torch.compile(fn, fullgraph=True)(x)
 
@@ -1725,6 +1760,7 @@ class TestBoundaryCloneInPlace(BaseTestScratchpadUsage):
                 lx_planning=True,
                 layout_solver="cpsat",
                 co_optimizing_lx_planning=True,
+                _cpsat_warn_on_cost_expr=False,
             ):
                 result = torch.compile(fn, fullgraph=True)(x).to("cpu")
 
@@ -1929,6 +1965,7 @@ class TestBoundaryCloneInPlace(BaseTestScratchpadUsage):
                     lx_planning=True,
                     layout_solver="cpsat",
                     co_optimizing_lx_planning=True,
+                    _cpsat_warn_on_cost_expr=False,
                 ):
                     compiled = torch.compile(fn, fullgraph=True)
                     ry, ru = compiled(x)

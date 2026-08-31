@@ -12,10 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 from typing import Any, Callable, Optional, Sequence, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from .pass_utils import PerCoreView
+
 
 from sympy import Expr
 import torch
@@ -452,6 +454,47 @@ class SpyreEmptyFallback(ir.ExternKernel):
         V.graph.register_operation(self)
 
 
+_DTYPE_TO_SCALAR_TYPE: dict[torch.dtype, int] = {
+    torch.uint8: 0,
+    torch.int8: 1,
+    torch.int16: 2,
+    torch.int32: 3,
+    torch.int64: 4,
+    torch.float16: 5,
+    torch.float32: 6,
+    torch.float64: 7,
+    torch.bool: 11,
+    torch.bfloat16: 15,
+}
+
+
+def _dtype_to_int(dtype: torch.dtype) -> int:
+    """Convert a torch dtype to its c10::ScalarType integer code."""
+    code = _DTYPE_TO_SCALAR_TYPE.get(dtype)
+    if code is None:
+        raise ValueError(f"Unsupported dtype for collective plan: {dtype}")
+    return code
+
+
+_STICK_BYTES = 128
+
+
+def _compute_device_num_elems(layout: "FixedLayout") -> int:
+    """Compute flat 1D device element count from a layout.
+
+    For FixedTiledLayout (has device_layout), uses the actual device size.
+    For plain FixedLayout (intermediates), falls back to logical numel.
+    """
+    if isinstance(layout, FixedTiledLayout):
+        stl = layout.device_layout
+        num_sticks = math.prod(stl.device_size[:-1])
+        size_bytes = num_sticks * _STICK_BYTES
+        element_size = torch.tensor([], dtype=layout.dtype).element_size()
+        return size_bytes // element_size
+    numel = sympy.prod(layout.size)
+    return int(V.graph.sizevars.guarding_hint_or_throw(numel))
+
+
 class BroadcastAsyncFallback(ir.ExternKernel):
     """IR node for spyre.broadcast_async — emits a runtime call to async broadcast.
 
@@ -460,27 +503,41 @@ class BroadcastAsyncFallback(ir.ExternKernel):
     """
 
     def codegen(self, wrapper: PythonWrapperCodegen) -> None:
-        """Generate code to call torch.ops.spyre.broadcast_async at runtime."""
-        # Get input tensor name
+        """Emit plan call in header (compile-time) and run call in body (runtime)."""
         input_tensor = self.inputs[0]
         input_name = input_tensor.codegen_reference()
-
-        # Get constant args (src_rank, group_name)
         src_rank, group_name = self.constant_args
-
-        # Generate the async call
         output_name = self.get_name()
-        generated_code = f"{output_name} = torch.ops.spyre.broadcast_async({input_name}, {src_rank}, '{group_name}')"
+
+        input_layout = input_tensor.get_layout()
+        dtype_code = _dtype_to_int(input_layout.dtype)
+        num_elems = _compute_device_num_elems(input_layout)
+
+        # Emit plan call in header (module-level, runs once at graph load)
+        plan_var = f"_bcast_plan_{output_name}"
+        plan_line = (
+            f"{plan_var} = torch.ops.spyre.broadcast_plan("
+            f"{num_elems}, {dtype_code}, {src_rank}, '{group_name}')"
+        )
+        if not hasattr(wrapper, "_emitted_plans"):
+            wrapper._emitted_plans = set()
+        if plan_line not in wrapper._emitted_plans:
+            wrapper.header.writeline(plan_line)
+            wrapper._emitted_plans.add(plan_line)
+
+        # Emit run call in body (per-invocation)
+        wrapper.writeline(
+            f"{output_name} = torch.ops.spyre.broadcast_run("
+            f"{input_name}, {plan_var}, {src_rank})"
+        )
 
         logger.debug(
-            "Codegen broadcast_async: %s -> %s (src=%s, group='%s')",
+            "Codegen broadcast plan+run: %s -> %s (src=%s, group='%s')",
             input_name,
             output_name,
             src_rank,
             group_name,
         )
-
-        wrapper.writeline(generated_code)
 
     def should_allocate(self) -> bool:
         return True
@@ -498,7 +555,6 @@ class BroadcastAsyncFallback(ir.ExternKernel):
         src_rank: int,
         group_name: str,
     ) -> None:
-        # Async broadcast returns a tensor with the same layout as input
         x_device = x.get_device()
         x_dtype = x.get_dtype()
         x_size = x.get_size()
@@ -509,7 +565,7 @@ class BroadcastAsyncFallback(ir.ExternKernel):
             layout,
             [x],
             (src_rank, group_name),
-            python_kernel_name="torch.ops.spyre.broadcast_async",
+            python_kernel_name="torch.ops.spyre.broadcast_run",
             op_overload=op_overload,
         )
         self.name = V.graph.register_buffer(self)
@@ -524,23 +580,41 @@ class AllGatherAsyncFallback(ir.ExternKernel):
     """
 
     def codegen(self, wrapper: PythonWrapperCodegen) -> None:
+        """Emit plan call in header (compile-time) and run call in body (runtime)."""
         input_tensor = self.inputs[0]
         input_name = input_tensor.codegen_reference()
-
         group_size, group_name = self.constant_args
-
         output_name = self.get_name()
-        generated_code = (
-            f"{output_name} = torch.ops.spyre.all_gather_async("
-            f"{input_name}, {group_size}, '{group_name}')"
+
+        input_layout = input_tensor.get_layout()
+        dtype_code = _dtype_to_int(input_layout.dtype)
+        num_elems = _compute_device_num_elems(input_layout)
+
+        # Emit plan call in header (module-level, runs once at graph load)
+        plan_var = f"_ag_plan_{output_name}"
+        plan_line = (
+            f"{plan_var} = torch.ops.spyre.allgather_plan("
+            f"{num_elems}, {dtype_code}, {group_size}, '{group_name}')"
+        )
+        if not hasattr(wrapper, "_emitted_plans"):
+            wrapper._emitted_plans = set()
+        if plan_line not in wrapper._emitted_plans:
+            wrapper.header.writeline(plan_line)
+            wrapper._emitted_plans.add(plan_line)
+
+        # Emit run call in body (per-invocation)
+        wrapper.writeline(
+            f"{output_name} = torch.ops.spyre.allgather_run("
+            f"{input_name}, {plan_var}, {group_size})"
         )
 
         logger.debug(
-            f"Codegen all_gather_async: {input_name} -> {output_name} "
-            f"(group_size={group_size}, group='{group_name}')"
+            "Codegen allgather plan+run: %s -> %s (group_size=%s, group='%s')",
+            input_name,
+            output_name,
+            group_size,
+            group_name,
         )
-
-        wrapper.writeline(generated_code)
 
     def should_allocate(self) -> bool:
         return False
@@ -568,7 +642,7 @@ class AllGatherAsyncFallback(ir.ExternKernel):
             layout,
             [x],
             (group_size, group_name),
-            python_kernel_name="torch.ops.spyre.all_gather_async",
+            python_kernel_name="torch.ops.spyre.allgather_run",
             op_overload=op_overload,
         )
         self.name = V.graph.register_buffer(self)
@@ -586,19 +660,37 @@ class AllReduceAsyncFallback(ir.ExternKernel):
     """
 
     def codegen(self, wrapper):
-        input_name = self.inputs[0].codegen_reference()
+        """Emit plan call in header (compile-time) and run call in body (runtime)."""
+        input_tensor = self.inputs[0]
+        input_name = input_tensor.codegen_reference()
         reduce_op, group_name = self.constant_args
         output_name = self.get_name()
+
+        input_layout = input_tensor.get_layout()
+        dtype_code = _dtype_to_int(input_layout.dtype)
+        num_elems = _compute_device_num_elems(input_layout)
+
+        # Emit plan call in header
+        plan_var = f"_ar_plan_{output_name}"
+        plan_line = (
+            f"{plan_var} = torch.ops.spyre.allreduce_plan("
+            f"{num_elems}, {dtype_code}, '{reduce_op}', '{group_name}')"
+        )
+        if not hasattr(wrapper, "_emitted_plans"):
+            wrapper._emitted_plans = set()
+        if plan_line not in wrapper._emitted_plans:
+            wrapper.header.writeline(plan_line)
+            wrapper._emitted_plans.add(plan_line)
+
+        # Emit run call in body
         wrapper.writeline(
-            f"{output_name} = torch.ops.spyre.all_reduce_async("
-            f"{input_name}, '{reduce_op}', '{group_name}')"
+            f"{output_name} = torch.ops.spyre.allreduce_run({input_name}, {plan_var})"
         )
 
     def should_allocate(self):
         return False
 
     def get_mutation_names(self):
-        # The Spyre runtime reduces in-place into the input buffer.
         return [self.inputs[0].get_name()]
 
     def get_unbacked_symbol_defs(self):
@@ -621,7 +713,7 @@ class AllReduceAsyncFallback(ir.ExternKernel):
             layout,
             [x],
             (reduce_op, group_name),
-            python_kernel_name="torch.ops.spyre.all_reduce_async",
+            python_kernel_name="torch.ops.spyre.allreduce_run",
             op_overload=op_overload,
         )
         self.name = V.graph.register_buffer(self)

@@ -65,7 +65,7 @@ The separation lets the compiler reason about memory layout, work
 division, and data movement independently. Spyre's hardware exposes
 HBM and per-core LX scratchpad as distinct memory spaces, so each
 `construct_memory_view` carries an explicit
-`#ktdp.spyre_memory_space<HBM>` or `<LX>` attribute. A
+`#ktdp.memory_space<global>` or `<ct_local>` attribute. A
 `construct_distributed_memory_view` variant covers the case where a
 tensor is split across many per-core scratchpad slices instead of
 sitting in a single HBM region.
@@ -84,7 +84,7 @@ func.func @add(%A: index, %B: index, %Out: index)
 
   %A_view = ktdp.construct_memory_view %A, sizes:[1024], strides:[1] {
     coordinate_set = affine_set<(d0): (0 <= d0, d0 <= 1023)>,
-    memory_space   = #ktdp.spyre_memory_space<HBM>
+    memory_space   = #ktdp.memory_space<global>
   } : memref<1024xf16>
 
   %A_tile = ktdp.construct_access_tile %A_view[%off] {

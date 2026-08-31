@@ -25,6 +25,13 @@ co_optimizing_lx_planning: bool = (
 )
 hbm_pool_planning: bool = _get_env_bool("HBM_POOL_PLANNING", True)
 
+# Select who allocates the HBM pool for an SDSC bundle's intermediates:
+# False (default) has the backend self-allocate via
+# sdscbundle.device_mem_allocate, exactly matching pre-existing behavior.
+# True has the front end allocate a real PyTorch tensor (via
+# spyre_empty_with_layout) and pass its address in as %pool_base_addr.
+frontend_pool_allocation: bool = _get_env_bool("FRONTEND_POOL_ALLOCATION", False)
+
 global_stick_optimizer: bool = os.environ.get("GLOBAL_STICK_OPTIMIZER", "1") == "1"
 
 # Emit a native conv2d SDSC (opFuncName="conv2d" on the "pt" unit) instead of
@@ -86,6 +93,10 @@ ignore_work_division_hints: bool = (
 )
 
 ignore_wsr_hints: bool = os.environ.get("SPYRE_INDUCTOR_IGNORE_HINTS", "0") == "1"
+
+# Temporary kill switch for removing a proven-redundant read copy after LX
+# planning.  A failed proof leaves the original graph unchanged.
+read_copy_elision: bool = _get_env_bool("SPYRE_READ_COPY_ELISION", True)
 
 # Per-pass operation logging for CustomPreSchedulingPasses.
 # Set to "all" or "1" to log after every pass, or a comma-separated list of
@@ -157,11 +168,17 @@ sdsc_cache: bool = os.environ.get("SPYRE_INDUCTOR_SDSC_CACHE", "1") == "1"
 #  "greedy":       GreedyLayoutSolver (default),
 #  "bestfit":      BestFitLayoutSolver,
 #  "firstfit":     FirstFitLayoutSolver,
-#  "simulated_annealing":  SimulatedAnnealingLayoutSolver,
+#  "simulated_annealing":  SimulatedAnnealingLayoutSolver, or -- when
+#              ``co_optimizing_lx_planning`` is set -- SaCoOptimizingSolver, the
+#              joint work-division + LX-placement annealer. Two different
+#              solvers sharing one config value, not one solver in two modes.
 #  "cpsat":    CpSatLayoutSolver (OR-Tools CP-SAT joint core-division +
 #              LX placement, minimizing HBM transfer traffic).
+#
+# For "cpsat" and "simulated_annealing" the value names a solver *family* whose
+# joint-ness is selected by ``co_optimizing_lx_planning``; for the gap-based
+# solvers that same flag instead wraps them in ExhaustiveSearchSolver.
 
-# TODO(isuruf): Change to firstfit when deeptools PR4298 lands
 layout_solver: Literal[
     "greedy", "bestfit", "firstfit", "cpsat", "simulated_annealing"
 ] = os.environ.get("LAYOUT_SOLVER", "cpsat")  # type: ignore[assignment]
@@ -169,12 +186,17 @@ layout_solver: Literal[
 # OpSpec validation at pipeline stage boundaries. Enabled by default to catch
 # invariant violations early. Set SPYRE_VALIDATE_OP_SPECS=0 to disable.
 validate_op_specs: bool = os.environ.get("SPYRE_VALIDATE_OP_SPECS", "1") == "1"
-# Use the C++ (native) permutation-layout packer accelerator, which the
-# simulated-annealing layout solver drives. The native and Python packers are
-# behaviourally identical (verified bit-for-bit); the native one is faster. Set
+
+# Use the C++ (native) permutation-layout packer accelerator, which both
+# simulated-annealing solvers drive (the layout-only one and the joint
+# co-optimizer). The native and Python packers are behaviourally identical
+# (verified bit-for-bit); the native one is faster. Set
 # False (or ``TORCH_SPYRE_NATIVE_PACKER=0``/``false``, which backs this default)
 # to force the pure-Python packer. A missing native class is a stale or
 # incomplete build, not a supported mode, and raises rather than falling back.
 native_layout_packer: bool = _get_env_bool("TORCH_SPYRE_NATIVE_PACKER", True)
+
+# When symbolic cost_expr fails, use the fallback cost instead of erroring out
+_cpsat_warn_on_cost_expr: bool = True
 
 install_config_module(sys.modules[__name__])
