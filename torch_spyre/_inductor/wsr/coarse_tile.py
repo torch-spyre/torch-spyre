@@ -1898,6 +1898,42 @@ def _order_preserving_symbol_remap(
     )
 
 
+def _fused_iteration_symbol_remap(
+    op: ComputedBuffer,
+    before_symbols: tuple[sympy.Symbol, ...],
+    *,
+    max_trailing_removals: int,
+) -> _IterationSymbolRemap:
+    """Preserve names when fused-loop symbols demonstrably retain their identity.
+
+    ``_capture_logical_iteration_symbols`` cannot describe a many-logical-dims to
+    one-loop-symbol fusion.  For that case, accept only the narrower invariant we
+    can still prove: the post-rewrite symbols are an unchanged prefix of the old
+    symbols.  Reduction variables are appended to the iteration space, so a
+    reduction-range rewrite may additionally remove a known number of trailing
+    symbols.  Output-range rewrites pass zero and therefore cannot silently
+    reinterpret a renumbered surviving dimension.
+    """
+
+    after_symbols = tuple(iteration_space_from_op(op))
+    removed = len(before_symbols) - len(after_symbols)
+    if (
+        removed < 0
+        or removed > max_trailing_removals
+        or before_symbols[: len(after_symbols)] != after_symbols
+    ):
+        raise Unsupported(
+            f"coarse_tile: cannot safely preserve fused work-division symbols "
+            f"for {op.get_name()!r}: before={tuple(map(str, before_symbols))}, "
+            f"after={tuple(map(str, after_symbols))}"
+        )
+
+    return _IterationSymbolRemap(
+        before_symbols=before_symbols,
+        pairs=tuple((symbol, symbol) for symbol in after_symbols),
+    )
+
+
 def _apply_work_div_symbol_remap(
     op: ComputedBuffer, remap: _IterationSymbolRemap | None
 ) -> None:
@@ -1952,11 +1988,12 @@ def _divide_ranges(
         return _DivideRangesResult(None, None)
 
     before_symbols = None
+    fused_before_symbols = None
     if tiled_dims and hasattr(op, "work_div_loop_info"):
         try:
             before_symbols = _capture_logical_iteration_symbols(op)
         except Unsupported:
-            pass
+            fused_before_symbols = tuple(iteration_space_from_op(op))
 
     for i in tiled_dims:
         assert 0 <= i < len(ranges), (
@@ -1992,11 +2029,20 @@ def _divide_ranges(
     _clear_cache(op, _COMPUTED_BUF_FREE_SYMS_KEY)
 
     symbol_remap = None
-    if before_symbols is not None:
+    if before_symbols is not None or fused_before_symbols is not None:
+        # Both capture paths call the memoized iteration-space helper before
+        # ranges are rewritten.  Always invalidate it before observing the new
+        # iteration space, including the fused-dimension fallback.
         invalidate_op_read_writes(op)
-        symbol_remap = _order_preserving_symbol_remap(
-            op, before_symbols, _capture_logical_iteration_symbols(op)
-        )
+        if before_symbols is not None:
+            symbol_remap = _order_preserving_symbol_remap(
+                op, before_symbols, _capture_logical_iteration_symbols(op)
+            )
+        else:
+            assert fused_before_symbols is not None
+            symbol_remap = _fused_iteration_symbol_remap(
+                op, fused_before_symbols, max_trailing_removals=0
+            )
 
     # Sync layout.size, layout.stride, and layout.device_layout with the new ranges.
     layout = getattr(op, "layout", None)
@@ -2062,12 +2108,14 @@ def _divide_reduction_ranges(
     if not tiled_dims:
         return None
     before_symbols = None
+    fused_before_symbols = None
     if hasattr(op, "work_div_loop_info"):
         try:
             before_symbols = _capture_logical_iteration_symbols(op)
         except Unsupported:
-            pass
-    reduction_ranges = list(data.reduction_ranges)
+            fused_before_symbols = tuple(iteration_space_from_op(op))
+    original_reduction_ranges = tuple(data.reduction_ranges)
+    reduction_ranges = list(original_reduction_ranges)
     for i in tiled_dims:
         assert 0 <= i < len(reduction_ranges), (
             f"coarse_tile: op {op.get_name()!r} tiled reduction dim {i} out of bounds "
@@ -2088,12 +2136,29 @@ def _divide_reduction_ranges(
             reduction_ranges[i] = sympy.sympify(r) / sympy.sympify(loop_count)
     # Reduction is a frozen dataclass; use object.__setattr__ to mutate it.
     object.__setattr__(data, "reduction_ranges", reduction_ranges)
-    if before_symbols is None:
+    if before_symbols is None and fused_before_symbols is None:
         return None
 
     invalidate_op_read_writes(op)
-    return _order_preserving_symbol_remap(
-        op, before_symbols, _capture_logical_iteration_symbols(op)
+    if before_symbols is not None:
+        return _order_preserving_symbol_remap(
+            op, before_symbols, _capture_logical_iteration_symbols(op)
+        )
+
+    active_before = [
+        i
+        for i, extent in enumerate(original_reduction_ranges)
+        if sympy.sympify(extent) != 1
+    ]
+    removed = [i for i in active_before if sympy.sympify(data.reduction_ranges[i]) == 1]
+    # Only reduction symbols at the end of the iteration space may disappear
+    # without renumbering a survivor. Anything else remains ambiguous.
+    trailing_removals = (
+        len(removed) if removed and removed == active_before[-len(removed) :] else 0
+    )
+    assert fused_before_symbols is not None
+    return _fused_iteration_symbol_remap(
+        op, fused_before_symbols, max_trailing_removals=trailing_removals
     )
 
 

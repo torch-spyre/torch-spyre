@@ -6818,8 +6818,8 @@ class TestCoarseTileReductionDim0E2E(InductorTestCase):
             rtol=0.05,
         )
 
-    def test_carried_sum_requires_terminal_reduction(self):
-        """A sum with a consumer retains the existing unsupported result."""
+    def test_carried_sum_allows_outside_pointwise_consumer(self):
+        """An outside consumer reads the completed post-loop drain."""
 
         E, T, H = 4, 64, 64
         values = torch.randn(E, T, H, dtype=torch.float16) * 0.1
@@ -6830,16 +6830,25 @@ class TestCoarseTileReductionDim0E2E(InductorTestCase):
         def fn(values):
             _name_tensor_dims(values, ["E", "T", "H"])
             with spyre_hint(
-                num_tiles_per_dim={"E": 2},
+                num_tiles_per_dim={"E": E},
                 work_div={"T": 32},
             ):
                 reduced = values.sum(dim=0)
-                return reduced + 1
+            return reduced + 1
 
-        with self.assertRaisesRegex(
-            Exception, "partial reduction result consumed before accumulation"
-        ):
-            _compile_and_run(fn, (values,), "spyre")
+        def check_source(source):
+            self.assertIn("coarse_tile_reduction_drain", source)
+
+        with config.patch({"sencores": 32, "lx_planning": True}):
+            compare_with_cpu(
+                fn,
+                values,
+                run_compile=True,
+                run_eager=False,
+                source_check=check_source,
+                atol=0.05,
+                rtol=0.05,
+            )
 
     def test_carried_sum_rejects_reduction_dim_work_div(self):
         """The hint must name an output row, not the reduced expert dim."""

@@ -1500,6 +1500,64 @@ class TestDivideRanges(unittest.TestCase):
             [["T"]],
         )
 
+    def test_fused_symbol_fallback_invalidates_and_preserves_stable_symbols(self):
+        from torch_spyre._inductor.pass_utils import iteration_space_from_op
+        from torch_spyre._inductor.wsr.coarse_tile import (
+            _apply_work_div_symbol_remap,
+        )
+
+        op = self._make_named_pointwise([Integer(128), Integer(64)], ["T", "H"])
+        symbols = tuple(iteration_space_from_op(op))
+        before_space = dict(zip(symbols, (Integer(128), Integer(64))))
+        after_space = dict(zip(symbols, (Integer(64), Integer(64))))
+
+        with (
+            patch(
+                "torch_spyre._inductor.wsr.coarse_tile._capture_logical_iteration_symbols",
+                side_effect=Unsupported("fused dimensions"),
+            ),
+            patch(
+                "torch_spyre._inductor.wsr.coarse_tile.iteration_space_from_op",
+                side_effect=(before_space, after_space),
+            ),
+            patch(
+                "torch_spyre._inductor.wsr.coarse_tile.invalidate_op_read_writes"
+            ) as invalidate,
+        ):
+            result = _divide_ranges(op, Integer(2), tiled_dims=[0])
+
+        invalidate.assert_called_once_with(op)
+        _apply_work_div_symbol_remap(op, result.symbol_remap)
+        self.assertEqual(
+            op.work_div_loop_info,  # type: ignore[attr-defined]
+            {symbols[0]: ["T"], symbols[1]: ["H"]},
+        )
+
+    def test_fused_symbol_fallback_rejects_output_rank_change(self):
+        from torch_spyre._inductor.pass_utils import iteration_space_from_op
+
+        op = self._make_named_pointwise([Integer(2), Integer(64)], ["E", "H"])
+        before_symbols = tuple(iteration_space_from_op(op))
+        after_symbols = before_symbols[:1]
+
+        with (
+            patch(
+                "torch_spyre._inductor.wsr.coarse_tile._capture_logical_iteration_symbols",
+                side_effect=Unsupported("fused dimensions"),
+            ),
+            patch(
+                "torch_spyre._inductor.wsr.coarse_tile.iteration_space_from_op",
+                side_effect=(
+                    dict(zip(before_symbols, (Integer(2), Integer(64)))),
+                    {after_symbols[0]: Integer(64)},
+                ),
+            ),
+            self.assertRaisesRegex(
+                Unsupported, "cannot safely preserve fused work-division symbols"
+            ),
+        ):
+            _divide_ranges(op, Integer(2), tiled_dims=[0])
+
     def test_non_monotone_symbol_mapping_fails_visibly(self):
         from torch_spyre._inductor.wsr.coarse_tile import (
             _LogicalIterationSymbol,
@@ -7351,6 +7409,48 @@ class TestDivideReductionRanges(unittest.TestCase):
         self.assertEqual(
             op.work_div_loop_info,  # type: ignore[attr-defined]
             {Symbol("d0"): ["T"], Symbol("d1"): ["F"]},
+        )
+
+    def test_fused_output_dims_allow_trailing_reduction_symbol_squeeze(self):
+        from torch_spyre._inductor.wsr.coarse_tile import (
+            _apply_work_div_symbol_remap,
+            _divide_reduction_ranges,
+        )
+
+        output_sym = Symbol("d0")
+        reduction_sym = Symbol("r0")
+        op = self._make_reduction_op(
+            ranges=[Integer(512), Integer(704)],
+            reduction_ranges=[Integer(128)],
+        )
+        op.work_div_loop_info = {  # type: ignore[attr-defined]
+            output_sym: ["T", "H"],
+            reduction_sym: ["E"],
+        }
+
+        with (
+            patch(
+                "torch_spyre._inductor.wsr.coarse_tile._capture_logical_iteration_symbols",
+                side_effect=Unsupported("fused output dimensions"),
+            ),
+            patch(
+                "torch_spyre._inductor.wsr.coarse_tile.iteration_space_from_op",
+                side_effect=(
+                    {output_sym: Integer(512 * 704), reduction_sym: Integer(128)},
+                    {output_sym: Integer(512 * 704)},
+                ),
+            ),
+            patch(
+                "torch_spyre._inductor.wsr.coarse_tile.invalidate_op_read_writes"
+            ) as invalidate,
+        ):
+            remap = _divide_reduction_ranges(op, Integer(128), [0])
+
+        invalidate.assert_called_once_with(op)
+        _apply_work_div_symbol_remap(op, remap)
+        self.assertEqual(
+            op.work_div_loop_info,  # type: ignore[attr-defined]
+            {output_sym: ["T", "H"]},
         )
 
 
