@@ -939,15 +939,18 @@ def _plan_tiling_propagation(
                         mut_target = op.layout.get_buffer()
                         mut_target_name = mut_target.get_name()
                         target_is_graph_input = mut_target_name in V.graph.graph_inputs
-                        _, target_is_output = _find_outside_consumers_planned(
-                            mut_target_name,
-                            info.loop_group_id,
-                            operations,
-                            name_to_group_outer_key,
+                        target_consumer_names, target_is_output = (
+                            _find_outside_consumers_planned(
+                                mut_target_name,
+                                info.loop_group_id,
+                                operations,
+                                name_to_group_outer_key,
+                            )
                         )
                     except (AttributeError, TypeError):
                         target_is_graph_input = False
                         target_is_output = False
+                        target_consumer_names = []
                         mut_target = None
                     if (
                         target_is_graph_input
@@ -963,20 +966,28 @@ def _plan_tiling_propagation(
                         )
                         continue
                     # Locally-created mutation target that IS the graph
-                    # output (not a graph input): per the comment above,
-                    # this must still go through the normal copy_out path,
-                    # patching graph_outputs by the *target's* name (buf_name
-                    # itself never appears there -- see
-                    # PropagationPlan.graph_output_name).
-                    if target_is_output and mut_target is not None:
+                    # output, and/or is read by other ops outside this loop
+                    # group (e.g. copy_forced(src, acc) where acc is a local
+                    # buffer later read by another op, or is the function's
+                    # return value, or both): must go through the normal
+                    # copy_out path, keyed on the *target's* name -- not
+                    # buf_name, which is the mutation op's own (irrelevant)
+                    # buffer name -- for both consumer redirection
+                    # (PropagationPlan.consumer_lookup_name) and, if
+                    # applicable, graph-output patching
+                    # (PropagationPlan.graph_output_name).
+                    if (
+                        target_is_output or target_consumer_names
+                    ) and mut_target is not None:
                         full_ranges = _compute_full_ranges_planned(op, info)
                         info.propagation = PropagationPlan(
                             kind="copy_out",
                             full_ranges=full_ranges,
                             full_strides=tuple(op.layout.stride),
-                            outside_consumer_names=(),
-                            is_graph_output=True,
+                            outside_consumer_names=tuple(target_consumer_names),
+                            is_graph_output=target_is_output,
                             graph_output_name=mut_target_name,
+                            consumer_lookup_name=mut_target_name,
                         )
                         continue
                 info.propagation = PropagationPlan(kind="loop_internal")
@@ -2703,27 +2714,33 @@ def _propagate_tiled_op(
     loop_info = op.loop_info
     loop_group_id = loop_info.loop_group_id
     buf_name = op.get_name()
+    # A MutationLayoutSHOULDREMOVE op whose mutation target (not the op's
+    # own buffer) is what outside ops actually read -- e.g.
+    # copy_forced(src, c) where c is read later -- must have its consumers
+    # re-resolved against the target's name; see PropagationPlan's
+    # consumer_lookup_name docstring.
+    read_lookup_name = propagation.consumer_lookup_name or buf_name
 
     # Resolve consumers at TRANSFORM time, by actual reads rather than by
     # the planning-time name list. Pass 1/2 may have spliced replacements
     # into `operations` under the same names since planning ran (see
     # PropagationPlan's docstring on name stability) -- and Pass 1 may have
     # rewired a planned consumer in another tiled group through a read-copy
-    # staging op, which then performs the group's actual read of buf_name.
-    # Patching only the planned names would miss that staging op, leaving
-    # it draining this op's per-tile scratch while the full buffer goes
-    # unread (issue #4008: 94.6% wrong on two chained hint groups). Any
-    # current reader outside this op's outermost loop group needs the
-    # redirect; the in-group copy-out drain reads buf_name by design and is
-    # excluded by the group test exactly like the planning-time analog
-    # (_find_outside_consumers_planned).
+    # staging op, which then performs the group's actual read of
+    # read_lookup_name. Patching only the planned names would miss that
+    # staging op, leaving it draining this op's per-tile scratch while the
+    # full buffer goes unread (issue #4008: 94.6% wrong on two chained hint
+    # groups). Any current reader outside this op's outermost loop group
+    # needs the redirect; the in-group copy-out drain reads read_lookup_name
+    # by design and is excluded by the group test exactly like the
+    # planning-time analog (_find_outside_consumers_planned).
     own_outer_key = loop_group_id[0]
     planned_names = set(propagation.outside_consumer_names)
     outside_consumers = []
     for o in operations:
         if not isinstance(o, ComputedBuffer) or o is op:
             continue
-        if not _reads_buffer(o, buf_name):
+        if not _reads_buffer(o, read_lookup_name):
             continue
         o_outer = getattr(getattr(o, "loop_info", None), "loop_group_id", (None,))[0]
         # Union of both consumer notions: a planned name that still reads
@@ -2790,7 +2807,9 @@ def _propagate_tiled_op(
     retile_info = _RetiledBufferInfo(
         old_stride, tuple(full_buf.layout.stride), old_size
     )
-    _patch_consumers(outside_consumers, buf_name, full_name, operations, retile_info)
+    _patch_consumers(
+        outside_consumers, read_lookup_name, full_name, operations, retile_info
+    )
     if is_graph_output:
         _patch_graph_outputs(propagation.graph_output_name or buf_name, full_buf)
 

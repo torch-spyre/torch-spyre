@@ -616,7 +616,7 @@ def test_mutation_target_multi_candidate_layout():
 
     def fn(a, b, d):
         c = a + b
-        torch.ops.spyre.copy_forced(d, c)
+        c = torch.ops.spyre.copy_forced(d, c)
         return c
 
     _compare(fn, a, b, d)
@@ -634,7 +634,7 @@ def test_mutation_target_restick_on_src_not_target():
 
     def fn(a, b, d):
         c = a + b
-        torch.ops.spyre.copy_forced(d.t(), c)
+        c = torch.ops.spyre.copy_forced(d.t(), c)
         return c
 
     _compare(fn, a, b, d, optimal_cost=M * N)
@@ -650,8 +650,8 @@ def test_two_mutations_same_target_copy_f():
 
     def fn(a, b):
         acc = torch.ops.spyre.empty([M, N], device=a.device, dtype=a.dtype)
-        torch.ops.spyre.copy_forced(a.t() + a.t(), acc)
-        torch.ops.spyre.copy_forced(b + b, acc)
+        acc = torch.ops.spyre.copy_forced(a.t() + a.t(), acc)
+        acc = torch.ops.spyre.copy_forced(b + b, acc)
         return acc
 
     result = _compile_and_run(fn, (a.to(DEVICE), b.to(DEVICE)), DEVICE).cpu()
@@ -687,9 +687,9 @@ def test_two_mutations_read_between_writes_minimal_copy_f():
 
     def fn(a, b):
         acc = torch.ops.spyre.empty([M, N], device=a.device, dtype=a.dtype)
-        torch.ops.spyre.copy_forced(a.t(), acc)  # write 1: col-stick
+        acc = torch.ops.spyre.copy_forced(a.t(), acc)  # write 1: col-stick
         snapshot = acc * b  # READ acc
-        torch.ops.spyre.copy_forced(b, acc)  # write 2: row-stick
+        acc = torch.ops.spyre.copy_forced(b, acc)  # write 2: row-stick
         return snapshot
 
     result = _compile_and_run(fn, (a.to(DEVICE), b.to(DEVICE)), DEVICE).cpu()
@@ -732,9 +732,9 @@ def test_two_mutations_read_between_writes_v2_copy_f():
 
     def fn(a, b):
         acc = torch.ops.spyre.empty([M, N], device=a.device, dtype=a.dtype)
-        torch.ops.spyre.copy_forced(a.t() + a.t(), acc)  # write 1: col-stick
+        acc = torch.ops.spyre.copy_forced(a.t() + a.t(), acc)  # write 1: col-stick
         snapshot = acc * b  # READ acc
-        torch.ops.spyre.copy_forced(b + b, acc)  # write 2: row-stick
+        acc = torch.ops.spyre.copy_forced(b + b, acc)  # write 2: row-stick
         return snapshot * acc
 
     result = _compile_and_run(fn, (a.to(DEVICE), b.to(DEVICE)), DEVICE).cpu()

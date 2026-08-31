@@ -504,22 +504,22 @@ def spyre__sdpa_overrideable(
                             M - max_running
                         )  # batch_size, num_heads, max_seqlen_q sparse
 
-                        denominator = torch.ops.spyre.opaque_copy_(
+                        denominator = torch.ops.spyre.copy_forced(
                             denominator * correction + exp_scores.sum(dim=-1),
                             denominator,
                         )  # batch_size, num_heads, max_seqlen_q sparse
-                        output = torch.ops.spyre.opaque_copy_(
+                        output = torch.ops.spyre.copy_forced(
                             output * correction.unsqueeze(-1)
                             + torch.matmul(exp_scores, value),
                             output,
                         )  # batch_size, num_heads, max_seqlen_q, head_dim
 
-                        M = torch.ops.spyre.opaque_copy_(
+                        M = torch.ops.spyre.copy_forced(
                             max_running,
                             M,
                         )  # batch_size, num_heads, max_seqlen_q sparse
 
-    output = torch.ops.spyre.opaque_copy_(output / denominator.unsqueeze(-1), output)
+    output = torch.ops.spyre.copy_forced(output / denominator.unsqueeze(-1), output)
     # The reference meta kernel for this op
     # (torch._meta_registrations.meta__scaled_dot_product_fused_attention_
     # overrideable -> alloc_with_matching_layout) declares the output layout to

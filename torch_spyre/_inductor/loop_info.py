@@ -155,6 +155,16 @@ class PropagationPlan:
         ``copy_forced(src, c)`` where ``c`` is a locally-created buffer that is
         also the function's return value). ``None`` otherwise, meaning the
         op's own name should be used to patch ``V.graph.graph_outputs``.
+    consumer_lookup_name:
+        Only set (and only differs from the op's own name) when this op is
+        a ``MutationLayoutSHOULDREMOVE`` write whose mutation *target* --
+        not the op's own buffer -- is what outside ops actually read (e.g.
+        ``copy_forced(src, c)`` where ``c`` is a locally-created buffer read
+        later by another op). Transform-time consumer re-resolution
+        (``_propagate_tiled_op``) and the read-redirect it performs
+        (``_patch_consumers``) must search for reads of this name instead of
+        the op's own name. ``None`` otherwise, meaning the op's own name
+        should be used, as for ordinary (non-mutation) copy-out ops.
     """
 
     kind: Literal["loop_internal", "copy_out", "reduction", "mutation_write_back"]
@@ -164,6 +174,7 @@ class PropagationPlan:
     outside_consumer_names: tuple[str, ...] = ()
     is_graph_output: bool = False
     graph_output_name: str | None = None
+    consumer_lookup_name: str | None = None
 
 
 @dataclass(frozen=True)

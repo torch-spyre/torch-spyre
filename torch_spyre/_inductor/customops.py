@@ -15,6 +15,7 @@
 from typing import Optional, Sequence
 import torch
 import torch._dynamo
+import torch._higher_order_ops.effects
 from torch._inductor.fx_passes.reinplace import inplaceable_ops, InplaceableOp
 from torch_spyre.ops.eager import compile_once
 from torch_spyre.ops.fallbacks import warn_fallback
@@ -336,48 +337,62 @@ def _(
     pass
 
 
-# Copy src into dst in-place, guaranteed to survive Inductor's
-# remove_noop_ops pass (unlike aten.copy_, this op is not in
-# noop_registry). Use this to guarantee a copy survives to the coarse
-# tile validator.
-@torch.library.custom_op(
-    "spyre::copy_forced", mutates_args=("dst",), device_types="spyre"
-)
-def copy_forced(src: torch.Tensor, dst: torch.Tensor) -> None:
-    dst.copy_(src)
+# Copy src into dst, guaranteed to survive both Inductor's remove_noop_ops
+# pass (unlike aten.copy_, this op is not in noop_registry) and
+# AOTAutograd's dead-code elimination when dst is never read again in the
+# same trace (issue #4126). Use this to guarantee a copy survives to the
+# coarse tile validator.
+#
+# mutates_args=() (not ("dst",)) so the schema carries no alias_info. This
+# is required for two independent reasons that turn out to be the same
+# underlying constraint:
+#   1. It lets this op be called from inside a decomposition traced by
+#      torch.compile (e.g. spyre__sdpa_overrideable) without tripping
+#      aot_autograd's assert_functional_graph, which rejects any node
+#      whose OpOverload schema is_mutable.
+#   2. It is a precondition for effects registration below: has_effects()
+#      unconditionally returns False for any op with an aliasing schema,
+#      so a mutates_args=("dst",) op can never be made DCE-safe this way.
+#
+# CALLERS MUST REASSIGN THE RETURN VALUE: dst = copy_forced(src, dst).
+# Because this op has no alias_info, AOTAutograd never threads its
+# mutation into the caller's own dataflow -- unlike the old
+# mutates_args=("dst",) design, whose auto_functionalized_v2 getitem was
+# spliced back into every later read of dst automatically. Here, a
+# discarded return value means later reads of the old `dst` Python
+# variable see the *pre-copy* value; only the reassigned variable sees
+# the write. A void call (`copy_forced(src, dst)` with no reassignment)
+# is only correct when dst is never read again in the same trace.
+#
+# _register_effectful_op below wraps every call in
+# torch.ops.higher_order.with_effects at trace time, threading a token
+# through it. That keeps the call node alive through ordinary FX DCE
+# regardless of whether the caller's dst is read again -- unlike a
+# mutates_args-based op, whose auto_functionalized_v2 getitem is silently
+# removed when unread (see issue #4126). Inductor's own generic
+# with_effects lowering delegates straight to lower_spyre_copy_forced
+# below and marks the resulting scheduler op has_side_effects=True, so it
+# is additionally protected from the scheduler's own DCE (see
+# _spyre_scheduler_node_has_side_effects in patches.py).
+@torch.library.custom_op("spyre::copy_forced", mutates_args=(), device_types="spyre")
+def copy_forced(src: torch.Tensor, dst: torch.Tensor) -> torch.Tensor:
+    return torch.empty_like(dst).copy_(src)
 
 
 @copy_forced.register_fake
-def _(src: torch.Tensor, dst: torch.Tensor) -> None:
-    pass
+def _(src: torch.Tensor, dst: torch.Tensor) -> torch.Tensor:
+    return torch.empty_like(dst)
 
 
 @torch.library.register_kernel("spyre::copy_forced", ["cpu"])
-def copy_forced_cpu(src: torch.Tensor, dst: torch.Tensor) -> None:
-    dst.copy_(src)
+def copy_forced_cpu(src: torch.Tensor, dst: torch.Tensor) -> torch.Tensor:
+    return torch.empty_like(dst).copy_(src)
 
 
-# Purely functional at trace time (mutates_args=()) so aot_autograd's
-# assert_functional_graph never sees a mutation. The real write into acc is
-# introduced later by lower_spyre_opaque_copy_ at Inductor lowering time,
-# which builds a MutationLayoutSHOULDREMOVE(acc) buffer identical to the one
-# copy_forced's lowering builds. Callers must reassign:
-# acc = opaque_copy_(value, acc). Use this instead of copy_forced where
-# AOTAutograd functionalization would otherwise reject the mutation (e.g.
-# inside a decomposition traced by torch.compile).
-@torch.library.custom_op("spyre::opaque_copy_", mutates_args=(), device_types="spyre")
-def opaque_copy_(value: torch.Tensor, acc: torch.Tensor) -> torch.Tensor:
-    return value.clone()
-
-
-@opaque_copy_.register_fake
-def _(value: torch.Tensor, acc: torch.Tensor) -> torch.Tensor:
-    return torch.empty_like(value)
-
-
-@torch.library.register_kernel("spyre::opaque_copy_", ["cpu"])
-def opaque_copy__cpu(value: torch.Tensor, acc: torch.Tensor) -> torch.Tensor:
-    return value.clone()
+torch._higher_order_ops.effects._register_effectful_op(
+    torch.ops.spyre.copy_forced.default,
+    torch._higher_order_ops.effects._EffectType.ORDERED,
+)
 
 
 # Copy input into output starting at offsets along dimensions dims and

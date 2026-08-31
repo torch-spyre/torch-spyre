@@ -1742,7 +1742,7 @@ def test_copy_into_preallocated_512x256_A4():
             c = torch.ones(a.shape, device=a.device, dtype=a.dtype)
         with spyre_hint(num_tiles_per_dim={"A": 4}):
             with spyre_hint(expected_named_dims=["A", "B"]):
-                copy_forced(a + c, c)
+                c = copy_forced(a + c, c)
         return c
 
     run_coarse_tile_test(fn, inputs, loopspec=None)
@@ -1760,7 +1760,7 @@ def test_copy_into_preallocated_512x256_B4():
             c = torch.zeros(a.shape, device=a.device, dtype=a.dtype)
         with spyre_hint(num_tiles_per_dim={"B": 4}):
             with spyre_hint(expected_named_dims=["A", "B"]):
-                copy_forced(a + b, c)
+                c = copy_forced(a + b, c)
         return c
 
     run_coarse_tile_test(fn, inputs)
@@ -1779,7 +1779,7 @@ def test_copy_into_preallocated_512x256_A4_B4():
         with spyre_hint(num_tiles_per_dim={"A": 4}):
             with spyre_hint(num_tiles_per_dim={"B": 4}):
                 with spyre_hint(expected_named_dims=["A", "B"]):
-                    copy_forced(a + b, c)
+                    c = copy_forced(a + b, c)
         return c
 
     run_coarse_tile_test(fn, inputs)
@@ -1798,7 +1798,7 @@ def test_copy_inplace_accum_512x256_A4():
     def fn(acc, x):
         with spyre_hint(num_tiles_per_dim={"A": 4}):
             with spyre_hint(expected_named_dims=["A", "B"]):
-                copy_forced(acc + x, acc)
+                acc = copy_forced(acc + x, acc)
         return acc
 
     run_coarse_tile_test(fn, inputs)
@@ -1814,7 +1814,7 @@ def test_copy_inplace_accum_512x256_B4():
     def fn(acc, x):
         with spyre_hint(num_tiles_per_dim={"B": 4}):
             with spyre_hint(expected_named_dims=["A", "B"]):
-                copy_forced(acc + x, acc)
+                acc = copy_forced(acc + x, acc)
         return acc
 
     run_coarse_tile_test(fn, inputs)
@@ -1831,7 +1831,7 @@ def test_copy_inplace_accum_512x256_A4_B4():
         with spyre_hint(num_tiles_per_dim={"A": 4}):
             with spyre_hint(num_tiles_per_dim={"B": 4}):
                 with spyre_hint(expected_named_dims=["A", "B"]):
-                    copy_forced(acc + x, acc)
+                    acc = copy_forced(acc + x, acc)
         return acc
 
     run_coarse_tile_test(fn, inputs)
@@ -1852,7 +1852,7 @@ def test_copy_rmw_correction_512x256_A4():
     def fn(acc, scale, y):
         with spyre_hint(num_tiles_per_dim={"A": 4}):
             with spyre_hint(expected_named_dims=["A", "B"]):
-                copy_forced(acc * scale + y, acc)
+                acc = copy_forced(acc * scale + y, acc)
         return acc
 
     run_coarse_tile_test(fn, inputs)
@@ -1869,7 +1869,7 @@ def test_copy_rmw_correction_512x256_B4():
     def fn(acc, scale, y):
         with spyre_hint(num_tiles_per_dim={"B": 4}):
             with spyre_hint(expected_named_dims=["A", "B"]):
-                copy_forced(acc * scale + y, acc)
+                acc = copy_forced(acc * scale + y, acc)
         return acc
 
     run_coarse_tile_test(fn, inputs)
@@ -1887,7 +1887,7 @@ def test_copy_rmw_correction_512x256_A4_B4():
         with spyre_hint(num_tiles_per_dim={"A": 4}):
             with spyre_hint(num_tiles_per_dim={"B": 4}):
                 with spyre_hint(expected_named_dims=["A", "B"]):
-                    copy_forced(acc * scale + y, acc)
+                    acc = copy_forced(acc * scale + y, acc)
         return acc
 
     run_coarse_tile_test(fn, inputs)
@@ -1903,7 +1903,7 @@ def test_copy_forced_untiled():
 
     def fn(x):
         out = torch.zeros(256, device=x.device, dtype=x.dtype)
-        copy_forced(x.amin(dim=0), out)
+        out = copy_forced(x.amin(dim=0), out)
         return out
 
     run_coarse_tile_test(fn, inputs, loopspec=None)
@@ -1924,7 +1924,7 @@ def test_copy_not_deleted():
         out = torch.zeros(256, device=x.device, dtype=x.dtype)
         with spyre_hint(num_tiles_per_dim={"A": 4}):
             with spyre_hint(expected_named_dims=["B"], expected_reduction_dims=["A"]):
-                copy_forced(x.amin(dim=0), out)
+                out = copy_forced(x.amin(dim=0), out)
         return out
 
     with pytest.raises(InductorError, match="validate_named_dims"):
@@ -1940,7 +1940,7 @@ def test_copy_after_reduction_512x256_A4():
         with spyre_hint(num_tiles_per_dim={"A": 4}):
             with spyre_hint(expected_named_dims=["B"], expected_reduction_dims=["A"]):
                 temp = x.amin(dim=0)
-            copy_forced(temp, out)
+            out = copy_forced(temp, out)
         return out
 
     _run_coarse_tile_test_raises(
@@ -1961,7 +1961,7 @@ def test_copy_after_reduction_512x256_B4():
             with spyre_hint(expected_named_dims=["B"], expected_reduction_dims=["A"]):
                 temp = x.amin(dim=0)
             with spyre_hint(expected_named_dims=["B"]):
-                copy_forced(temp, out)
+                out = copy_forced(temp, out)
         return out
 
     run_coarse_tile_test(fn, inputs)
@@ -1979,7 +1979,7 @@ def test_copy_after_reduction_512x256_A4_B4():
                     expected_named_dims=["B"], expected_reduction_dims=["A"]
                 ):
                     temp = x.amin(dim=0)
-                copy_forced(temp, out)
+                out = copy_forced(temp, out)
         return out
 
     _run_coarse_tile_test_raises(
@@ -2013,7 +2013,7 @@ def test_copy_running_max_4d_H4_Lq4():
                     block_max = torch.amax(scores, dim=-2)
                 with spyre_hint(expected_named_dims=["B", "H", "Lq"]):
                     running_max = torch.maximum(real_max, block_max)
-                copy_forced(running_max, real_max)
+                real_max = copy_forced(running_max, real_max)
         return real_max
 
     run_coarse_tile_test(fn, inputs)
@@ -2035,7 +2035,7 @@ def test_copy_restickify_512x256_A4():
             c = torch.zeros(b.shape, device=b.device, dtype=b.dtype)
         with spyre_hint(num_tiles_per_dim={"A": 4}):
             with spyre_hint(expected_named_dims=["A", "B"]):
-                copy_forced(a.t() + b, c)
+                c = copy_forced(a.t() + b, c)
         return c
 
     run_coarse_tile_test(fn, inputs)
@@ -2053,7 +2053,7 @@ def test_copy_restickify_512x256_B4():
             c = torch.zeros(b.shape, device=b.device, dtype=b.dtype)
         with spyre_hint(num_tiles_per_dim={"B": 4}):
             with spyre_hint(expected_named_dims=["A", "B"]):
-                copy_forced(a.t() + b, c)
+                c = copy_forced(a.t() + b, c)
         return c
 
     run_coarse_tile_test(fn, inputs)
@@ -2072,7 +2072,7 @@ def test_copy_restickify_512x256_A4_B4():
         with spyre_hint(num_tiles_per_dim={"A": 4}):
             with spyre_hint(num_tiles_per_dim={"B": 4}):
                 with spyre_hint(expected_named_dims=["A", "B"]):
-                    copy_forced(a.t() + b, c)
+                    c = copy_forced(a.t() + b, c)
         return c
 
     run_coarse_tile_test(fn, inputs)
@@ -2095,7 +2095,7 @@ def test_copy_accum_with_reduction_512x256_A4():
             with spyre_hint(expected_named_dims=["A"], expected_reduction_dims=["B"]):
                 r = x.amin(dim=1, keepdim=True)
             with spyre_hint(expected_named_dims=["A", "B"]):
-                copy_forced(acc * scale + r, acc)
+                acc = copy_forced(acc * scale + r, acc)
         return acc
 
     run_coarse_tile_test(fn, inputs)
@@ -2125,7 +2125,7 @@ def test_copy_accum_with_reduction_512x256_B4():
             with spyre_hint(expected_named_dims=["A"], expected_reduction_dims=["B"]):
                 r = x.amin(dim=1, keepdim=True)
             with spyre_hint(expected_named_dims=["A", "B"]):
-                copy_forced(acc * scale + r, acc)
+                acc = copy_forced(acc * scale + r, acc)
         return acc
 
     _run_coarse_tile_test_raises(
@@ -2159,7 +2159,7 @@ def test_copy_accum_with_reduction_512x256_A4_B4():
                 ):
                     r = x.amin(dim=1, keepdim=True)
                 with spyre_hint(expected_named_dims=["A", "B"]):
-                    copy_forced(acc * scale + r, acc)
+                    acc = copy_forced(acc * scale + r, acc)
         return acc
 
     run_coarse_tile_test(fn, inputs)
@@ -2181,9 +2181,9 @@ def test_copy_two_copies_same_scope_512x256_A4():
             c2 = torch.zeros(a.shape, device=a.device, dtype=a.dtype)
         with spyre_hint(num_tiles_per_dim={"A": 4}):
             with spyre_hint(expected_named_dims=["A", "B"]):
-                copy_forced(a + b, c1)
+                c1 = copy_forced(a + b, c1)
             with spyre_hint(expected_named_dims=["A", "B"]):
-                copy_forced(a * b, c2)
+                c2 = copy_forced(a * b, c2)
         return c1, c2
 
     run_coarse_tile_test(fn, inputs)
@@ -2202,9 +2202,9 @@ def test_copy_two_copies_same_scope_512x256_B4():
             c2 = torch.zeros(a.shape, device=a.device, dtype=a.dtype)
         with spyre_hint(num_tiles_per_dim={"B": 4}):
             with spyre_hint(expected_named_dims=["A", "B"]):
-                copy_forced(a + b, c1)
+                c1 = copy_forced(a + b, c1)
             with spyre_hint(expected_named_dims=["A", "B"]):
-                copy_forced(a * b, c2)
+                c2 = copy_forced(a * b, c2)
         return c1, c2
 
     run_coarse_tile_test(fn, inputs)
@@ -2224,9 +2224,9 @@ def test_copy_two_copies_same_scope_512x256_A4_B4():
         with spyre_hint(num_tiles_per_dim={"A": 4}):
             with spyre_hint(num_tiles_per_dim={"B": 4}):
                 with spyre_hint(expected_named_dims=["A", "B"]):
-                    copy_forced(a + b, c1)
+                    c1 = copy_forced(a + b, c1)
                 with spyre_hint(expected_named_dims=["A", "B"]):
-                    copy_forced(a * b, c2)
+                    c2 = copy_forced(a * b, c2)
         return c1, c2
 
     run_coarse_tile_test(fn, inputs)
@@ -2309,7 +2309,7 @@ def test_outside_consumer_copy_then_read_512x256_A4():
         with spyre_hint(named_dims=["A", "B"]):
             out = torch.zeros(x.shape, device=x.device, dtype=x.dtype)
         with spyre_hint(num_tiles_per_dim={"A": 4}):
-            copy_forced(x + y, out)
+            out = copy_forced(x + y, out)
         return out / (torch.abs(norm) + 1.0)
 
     run_coarse_tile_test(fn, inputs)
@@ -2327,7 +2327,7 @@ def test_outside_consumer_copy_then_read_512x256_B4():
         with spyre_hint(named_dims=["A", "B"]):
             out = torch.zeros(x.shape, device=x.device, dtype=x.dtype)
         with spyre_hint(num_tiles_per_dim={"B": 4}):
-            copy_forced(x + y, out)
+            out = copy_forced(x + y, out)
         return out / (torch.abs(norm) + 1.0)
 
     run_coarse_tile_test(fn, inputs)
@@ -2346,7 +2346,7 @@ def test_outside_consumer_copy_then_read_512x256_A4_B4():
             out = torch.zeros(x.shape, device=x.device, dtype=x.dtype)
         with spyre_hint(num_tiles_per_dim={"A": 4}):
             with spyre_hint(num_tiles_per_dim={"B": 4}):
-                copy_forced(x + y, out)
+                out = copy_forced(x + y, out)
         return out / (torch.abs(norm) + 1.0)
 
     run_coarse_tile_test(fn, inputs)
@@ -2371,8 +2371,8 @@ def test_outside_consumer_two_accum_512x256_A4():
         with spyre_hint(named_dims=["A"]):
             denom = torch.zeros(x.shape[0], device=x.device, dtype=x.dtype)
         with spyre_hint(num_tiles_per_dim={"A": 4}):
-            copy_forced(out * scale + x, out)
-            copy_forced(denom + x.amin(dim=0), denom)
+            out = copy_forced(out * scale + x, out)
+            denom = copy_forced(denom + x.amin(dim=0), denom)
         return out / denom.unsqueeze(1)
 
     _run_coarse_tile_test_raises(
@@ -2393,8 +2393,8 @@ def test_outside_consumer_two_accum_512x256_B4():
         out = torch.zeros(x.shape, device=x.device, dtype=x.dtype)
         denom = torch.zeros(x.shape[0], device=x.device, dtype=x.dtype)
         with spyre_hint(num_tiles_per_dim={"B": 4}):
-            copy_forced(out * scale + x, out)
-            copy_forced(denom + x.amin(dim=1), denom)
+            out = copy_forced(out * scale + x, out)
+            denom = copy_forced(denom + x.amin(dim=1), denom)
         return out / denom.unsqueeze(1)
 
     _run_coarse_tile_test_raises(
@@ -2419,8 +2419,8 @@ def test_outside_consumer_two_accum_512x256_A4_B4():
         denom = torch.zeros(x.shape[0], device=x.device, dtype=x.dtype)
         with spyre_hint(num_tiles_per_dim={"A": 4}):
             with spyre_hint(num_tiles_per_dim={"B": 4}):
-                copy_forced(out * scale + x, out)
-                copy_forced(denom + x.sum(dim=1), denom)
+                out = copy_forced(out * scale + x, out)
+                denom = copy_forced(denom + x.sum(dim=1), denom)
         return out / denom.unsqueeze(1)
 
     run_coarse_tile_test(fn, inputs)
@@ -2910,8 +2910,9 @@ def test_flash_tile_Lk():
 
 
 @pytest.mark.skip(
-    reason="running-max/copy_forced accumulator bug produces inf (see"
-    " test_flash_v2_tile_H); B tiling itself compiles and runs correctly"
+    reason="copy_forced/mutation_write_back drop is fixed (issue #4126) -- no"
+    " more inf, but a distinct B+H tiling correctness bug remains (70%"
+    " mismatch, finite values); B tiling itself compiles and runs correctly"
 )
 def test_flash_tile_B_H():
     """Flash v1: tile B÷2 H÷4. B=2."""
@@ -3087,7 +3088,7 @@ def _flash_v2_fn(
                         denom_corrected = denominator * correction
                     with spyre_hint(expected_named_dims=["B", "H", "Lq"]):
                         new_denom = denom_corrected + sum_scores
-                    copy_forced(new_denom, denominator)
+                    denominator = copy_forced(new_denom, denominator)
                     with spyre_hint(named_dims=["B", "H", "Lq", "D"]):
                         matmul_out = torch.matmul(exp_scores, values)
                     # correction.unsqueeze(-1) is [B,H,Lq,1] — size-1 dim can't carry "D"
@@ -3095,8 +3096,8 @@ def _flash_v2_fn(
                     output_corrected = output * corr_expanded
                     with spyre_hint(expected_named_dims=["B", "H", "Lq", "D"]):
                         new_output = output_corrected + matmul_out
-                    copy_forced(new_output, output)
-                    copy_forced(running_max, real_max)
+                    output = copy_forced(new_output, output)
+                    real_max = copy_forced(running_max, real_max)
     return output / denominator.unsqueeze(-1)
 
 
@@ -3117,8 +3118,9 @@ def test_flash_v2_tile_H():
 
 
 @pytest.mark.skip(
-    reason="running-max/copy_forced accumulator bug produces inf (see"
-    " test_flash_v2_tile_H); B tiling itself compiles and runs correctly"
+    reason="B-tiling still produces inf after the copy_forced/"
+    "mutation_write_back drop fix (issue #4126) -- distinct, still-open"
+    " B-tiling bug, not the copy_forced accumulator drop"
 )
 def test_flash_v2_tile_B():
     """Flash v2: tile B÷2 only. B=2."""
@@ -3161,8 +3163,9 @@ def test_flash_v2_tile_Lk():
 
 
 @pytest.mark.skip(
-    reason="running-max/copy_forced accumulator bug produces inf (see"
-    " test_flash_v2_tile_H); B tiling itself compiles and runs correctly"
+    reason="B-tiling still produces inf after the copy_forced/"
+    "mutation_write_back drop fix (issue #4126) -- distinct, still-open"
+    " B-tiling bug, not the copy_forced accumulator drop"
 )
 def test_flash_v2_tile_B_H():
     """Flash v2: tile B÷2 H÷4. B=2."""
@@ -3320,17 +3323,17 @@ def _flash_v3_fn(
                     with spyre_hint(expected_named_dims=["B", "H", "Lq"]):
                         correction = torch.exp(real_max_diff)
 
-                    copy_forced(
+                    denominator = copy_forced(
                         denominator * correction + exp_scores.sum(dim=-2),
                         denominator,
                     )  # B, H, Lq sparse
-                    copy_forced(
+                    output = copy_forced(
                         output * correction.unsqueeze(-1)
                         + torch.matmul(exp_scores.transpose(-1, -2), values),
                         output,
                     )  # B, H, Lq, D
 
-                    copy_forced(running_max, real_max)  # B, H, Lq sparse
+                    real_max = copy_forced(running_max, real_max)  # B, H, Lq sparse
 
     return output / denominator.unsqueeze(-1)
 
@@ -3352,8 +3355,9 @@ def test_flash_v3_tile_H():
 
 
 @pytest.mark.skip(
-    reason="running-max/copy_forced accumulator bug produces inf (see"
-    " test_flash_v2_tile_H); B tiling itself compiles and runs correctly"
+    reason="B-tiling still produces inf after the copy_forced/"
+    "mutation_write_back drop fix (issue #4126) -- distinct, still-open"
+    " B-tiling bug, not the copy_forced accumulator drop"
 )
 def test_flash_v3_tile_B():
     """Flash v3: tile B÷2 only. B=2."""
@@ -3401,8 +3405,9 @@ def test_flash_v3_tile_Lk():
 
 
 @pytest.mark.skip(
-    reason="running-max/copy_forced accumulator bug produces inf (see"
-    " test_flash_v2_tile_H); B tiling itself compiles and runs correctly"
+    reason="B-tiling still produces inf after the copy_forced/"
+    "mutation_write_back drop fix (issue #4126) -- distinct, still-open"
+    " B-tiling bug, not the copy_forced accumulator drop"
 )
 def test_flash_v3_tile_B_H():
     """Flash v3: tile B÷2 H÷4. B=2."""
@@ -3550,7 +3555,7 @@ def _flash_v4_fn(q, k, v, *, B, S, H, D, b_tiles=1, h_tiles=1, lq_tiles=1, lk_ti
                         denom_corrected = denominator * correction
                     with spyre_hint(expected_named_dims=["B", "H", "Lq"]):
                         new_denom = denom_corrected + sum_scores
-                    copy_forced(new_denom, denominator)
+                    denominator = copy_forced(new_denom, denominator)
                     with spyre_hint(expected_named_dims=["B", "H", "Lq", "Lk"]):
                         exp_scores_T = exp_scores.transpose(-1, -2).contiguous()
                     with spyre_hint(named_dims=["B", "H", "Lq", "D"]):
@@ -3559,9 +3564,9 @@ def _flash_v4_fn(q, k, v, *, B, S, H, D, b_tiles=1, h_tiles=1, lq_tiles=1, lk_ti
                     output_corrected = output * correction.unsqueeze(-1)
                     with spyre_hint(expected_named_dims=["B", "H", "Lq", "D"]):
                         new_output = output_corrected + matmul_out
-                    copy_forced(new_output, output)
-                    copy_forced(running_max, real_max)
-    copy_forced(output / denominator.unsqueeze(-1), output)
+                    output = copy_forced(new_output, output)
+                    real_max = copy_forced(running_max, real_max)
+    output = copy_forced(output / denominator.unsqueeze(-1), output)
     return output.transpose(1, 2).reshape(B, S, H * D)
 
 
@@ -4460,17 +4465,17 @@ class TestCoarseTileSpyreHints(InductorTestCase):
                             real_max - running_max
                         )  # B, H, Lq sparse
 
-                        copy_forced(
+                        denominator = copy_forced(
                             denominator * correction + exp_scores.sum(dim=-1),
                             denominator,
                         )  # B, H, Lq sparse
-                        copy_forced(
+                        output = copy_forced(
                             output * correction.unsqueeze(-1)
                             + torch.matmul(exp_scores, values),
                             output,
                         )  # B, H, Lq, D
 
-                        copy_forced(running_max, real_max)  # B, H, Lq sparse
+                        real_max = copy_forced(running_max, real_max)  # B, H, Lq sparse
 
             return output / denominator.unsqueeze(-1)
 
@@ -4562,15 +4567,15 @@ class TestCoarseTileSpyreHints(InductorTestCase):
                     exp_scores = torch.exp(scores - running_max.unsqueeze(-1))
                     correction = torch.exp(real_max - running_max)
 
-                    copy_forced(
+                    denominator = copy_forced(
                         denominator * correction + exp_scores.sum(dim=-1), denominator
                     )
-                    copy_forced(
+                    output = copy_forced(
                         output * correction.unsqueeze(-1)
                         + torch.matmul(exp_scores, values),
                         output,
                     )
-                    copy_forced(running_max, real_max)
+                    real_max = copy_forced(running_max, real_max)
 
                     # The one difference from test_hint_flash_attention_v2.
                     result = output / denominator.unsqueeze(-1)
@@ -4674,17 +4679,19 @@ class TestCoarseTileSpyreHints(InductorTestCase):
                                 real_max - running_max
                             )  # B, H, Lq sparse
 
-                            copy_forced(
+                            denominator = copy_forced(
                                 denominator * correction + exp_scores.sum(dim=-2),
                                 denominator,
                             )  # B, H, Lq sparse
-                            copy_forced(
+                            output = copy_forced(
                                 output * correction.unsqueeze(-1)
                                 + torch.matmul(exp_scores.transpose(-1, -2), values),
                                 output,
                             )  # B, H, Lq, D
 
-                            copy_forced(running_max, real_max)  # B, H, Lq sparse
+                            real_max = copy_forced(
+                                running_max, real_max
+                            )  # B, H, Lq sparse
             return output / denominator.unsqueeze(-1)
 
         queries_t_spyre = queries_t.to(device="spyre")
@@ -4779,17 +4786,19 @@ class TestCoarseTileSpyreHints(InductorTestCase):
                                 real_max - running_max
                             )  # B, H, Lq sparse
 
-                            copy_forced(
+                            denominator = copy_forced(
                                 denominator * correction + exp_scores.sum(dim=-2),
                                 denominator,
                             )  # B, H, Lq sparse
-                            copy_forced(
+                            output = copy_forced(
                                 output * correction.unsqueeze(-1)
                                 + torch.matmul(exp_scores.transpose(-1, -2), values),
                                 output,
                             )  # B, H, Lq, D
 
-                            copy_forced(running_max, real_max)  # B, H, Lq sparse
+                            real_max = copy_forced(
+                                running_max, real_max
+                            )  # B, H, Lq sparse
             return output / denominator.unsqueeze(-1)
 
         queries_t_spyre = queries_t.to(device="spyre")
@@ -4857,7 +4866,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
                         block_max = torch.amax(scores, dim=-2)  # [B, H, Lq]
                     with spyre_hint(expected_named_dims=["B", "H", "Lq"]):
                         running_max = torch.maximum(real_max, block_max)
-                    copy_forced(running_max, real_max)
+                    real_max = copy_forced(running_max, real_max)
             return real_max
 
         ref = fn(scores)
@@ -4934,18 +4943,18 @@ class TestCoarseTileSpyreHints(InductorTestCase):
                             running_max = torch.maximum(real_max, block_max)
                             exp_scores = torch.exp(scores - running_max.unsqueeze(-2))
                             correction = torch.exp(real_max - running_max)
-                            copy_forced(
+                            denominator = copy_forced(
                                 denominator * correction + exp_scores.sum(dim=-2),
                                 denominator,
                             )
-                            copy_forced(
+                            output = copy_forced(
                                 output * correction.unsqueeze(-1)
                                 + torch.matmul(exp_scores.transpose(-1, -2), v),
                                 output,
                             )
-                            copy_forced(running_max, real_max)
+                            real_max = copy_forced(running_max, real_max)
 
-            copy_forced(output / denominator.unsqueeze(-1), output)
+            output = copy_forced(output / denominator.unsqueeze(-1), output)
             return output.transpose(1, 2).reshape(B, S, H * D)
 
         ref = block(queries_t, keys_t, values_t)
@@ -5321,17 +5330,17 @@ class TestCoarseTileSpyreHints(InductorTestCase):
                             real_max - running_max
                         )  # B, H, Lq sparse
 
-                        copy_forced(
+                        denominator = copy_forced(
                             denominator * correction + exp_scores.sum(dim=-1),
                             denominator,
                         )  # B, H, Lq sparse
-                        copy_forced(
+                        output = copy_forced(
                             output * correction.unsqueeze(-1)
                             + torch.matmul(exp_scores, values),
                             output,
                         )  # B, H, Lq, D
 
-                        copy_forced(running_max, real_max)  # B, H, Lq sparse
+                        real_max = copy_forced(running_max, real_max)  # B, H, Lq sparse
             return output / denominator.unsqueeze(-1)
 
         cfn = torch.compile(flash)
@@ -5864,7 +5873,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
             c = torch.full((Lq, D), 0, device=a.device, dtype=torch.float16)
             with spyre_hint(num_tiles_per_dim={"Lq": 2}):
                 with spyre_hint(num_tiles_per_dim={"D": 2}):
-                    copy_forced(a + b, c)
+                    c = copy_forced(a + b, c)
             return c
 
         compare_with_cpu(fn, a, b, run_compile=True, run_eager=False)
@@ -5917,7 +5926,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
             c = torch.full((B, Lq, D), 0, device=a.device, dtype=torch.float16)
             with spyre_hint(num_tiles_per_dim={"Lq": 2}):
                 with spyre_hint(num_tiles_per_dim={"B": 2}):
-                    copy_forced(a + b, c)
+                    c = copy_forced(a + b, c)
             return c
 
         spyre_result = torch.compile(fn)(a_dev, b_dev).cpu()
@@ -5949,7 +5958,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
             c = torch.full([Lq * D], 0, device=a.device, dtype=torch.float16)
             with spyre_hint(num_tiles_per_dim={"Lq": 2}):
                 with spyre_hint(num_tiles_per_dim={"D": 2}):
-                    copy_forced(a + b, c)
+                    c = copy_forced(a + b, c)
             return c
 
         compare_with_cpu(fn, a, b, run_compile=True, run_eager=False)
@@ -7720,7 +7729,7 @@ def test_tiled_in_place_accumulator():
         with spyre_hint(num_tiles_per_dim={"H": 4}):
             with spyre_hint(num_tiles_per_dim={"Lq": lq_slices}):
                 block_max = torch.amax(x, dim=-1, keepdim=True)
-                copy_forced(acc + block_max * scale, acc)
+                acc = copy_forced(acc + block_max * scale, acc)
         return acc
 
     ref = fn(x_t, scale_t, acc_t.clone())
