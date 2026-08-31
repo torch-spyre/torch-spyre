@@ -264,6 +264,13 @@ def reduction_window_blocked_vars(ctx: WorkDivConstraintContext) -> ConstraintRe
     return ConstraintResult(blocked=set(window_dims))
 
 
+# These ops have dedicated cross-core hardware/codegen combine support
+# (matmul: PSUM accumulation; topk/keep_by_index/pool/conv: dedicated
+# combine codegen), so a K-split across cores is safe. Plain elementwise
+# reductions like sum/max/min/xor_sum/any are deliberately absent: they use
+# coarse_tile.py's own outer-loop accumulate path (_insert_combine_op)
+# instead, which is a different mechanism and does not enable a cross-core
+# K-split -- their absence here is not an oversight to "fix" by adding them.
 _K_SPLIT_COMBINE_SUPPORTED = {
     BATCH_MATMUL_OP,
     BATCH_MATMUL_FP8_OP,
@@ -289,6 +296,12 @@ _K_SPLIT_COMBINE_SUPPORTED = {
 # Unsupported (confirmed: test_copy_running_max_4d_H4_Lq4 fails with
 # "per-core tensor span ... exceeds hardware limit" once its read-copy op's
 # H/Lq dims are pinned, and passes once they aren't).
+#
+# These prefixes are matched cross-module against names coarse_tile.py
+# constructs via V.graph.qualify_name: "coarse_tile_read_copy_..." in
+# _insert_all_read_copy_ops, and "coarse_tile_reduce_copy_..." in
+# _insert_reduce_copy_op and its _insert_combine_op/reduction-drain
+# call sites. If either naming site changes, update this tuple to match.
 _GENERATED_COPY_OP_PREFIXES = ("coarse_tile_read_copy_", "coarse_tile_reduce_copy_")
 
 

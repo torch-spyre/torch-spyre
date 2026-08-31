@@ -4097,6 +4097,14 @@ def _insert_one_read_copy(
     # by its correct raw position in copy_buf's own data.ranges -- reuse
     # those keys instead of sizing_op_info's.
     copy_loop_tiled_dims = [sorted(level) for level in read_level_extents]
+    # Always empty, unconditionally: a generated copy_buf's own data is
+    # always a Pointwise passthrough (a plain per-tile scratch read or
+    # write-back), never a Reduction, so it has no reduction_ranges of its
+    # own to tile regardless of whether the sizing op it copies for reduces
+    # over a dim. work_division_constraints.coarse_tile_local_dim_split_
+    # domains relies on this: it only indexes reduction_ranges when
+    # ctx.op.data exposes it, so an empty list here is correct, not a
+    # placeholder to fill in later.
     copy_loop_tiled_reduction_dims: list[list[int]] = [
         [] for _ in sizing_op_info.loop_count
     ]
