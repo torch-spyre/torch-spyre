@@ -1734,11 +1734,13 @@ _run_pytest_isolated() {
         if [[ "$_dir" == *"/distributed"* ]] || [[ "$_dir" == *"/distributed" ]]; then
             # Determine _NPROC from SPYRE_DEVICES if set, otherwise fall back to
             # AIU_WORLD_SIZE.  SPYRE_DEVICES is a comma-separated list of device
-            # indices (e.g. "0,2,3"); its length is commas+1.
+            # indices (e.g. "0,2,3").
+
+            # Only used for count
+            local -a _SPYRE_DEVICE_IDS=()
             if [[ -n "${SPYRE_DEVICES:-}" ]]; then
-                # e.g. "0,2,3" -> 2 commas -> _NPROC=3
-                _comma_count="${SPYRE_DEVICES//[^,]/}"
-                _NPROC=$(( ${#_comma_count} + 1 ))
+                IFS=',' read -r -a _SPYRE_DEVICE_IDS <<< "${SPYRE_DEVICES}"
+                _NPROC="${#_SPYRE_DEVICE_IDS[@]}"
                 # Cache the original AIU_WORLD_SIZE so it can be restored after torchrun exits
                 _AIU_WORLD_SIZE_ORIG="${AIU_WORLD_SIZE:-}"
                 export AIU_WORLD_SIZE="$_NPROC"
