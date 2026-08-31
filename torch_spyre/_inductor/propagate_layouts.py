@@ -1059,15 +1059,12 @@ def _multi_arg_pointwise_layouts(
     #   2a. >1 distinct staggered EA                -> unsupported (raise)
     #   2b. one staggered EA, no STANDARD operands  -> staggered output (via 3.1)
     #   3.  one staggered EA mixed with STANDARD operands:
-    #       3.2 every staggered operand can broadcast  -> STANDARD output
     #       3.1 every STANDARD operand can broadcast   -> staggered output
+    #       3.2 every staggered operand can broadcast  -> STANDARD output
     #       3.3 otherwise (a STANDARD and a staggered full operand coexist)
     #                                                  -> unsupported (raise)
-    # 3.2 is checked BEFORE 3.1: when every staggered operand is a size-1-stick
-    # broadcaster it carries no ordering, so the op is representable as an
-    # all-STANDARD broadcast, and a STANDARD output is preferred even when the
-    # STANDARD operands are also broadcastable (the overlap) -- it avoids a
-    # downstream back-conversion and the staggered operands are degenerate anyway.
+    # Prefer 3.1 in the overlap because propagation does not yet know which
+    # candidate layout the optimizer will commit for the staggered producer.
     # A future extension may admit 2a/3.3 by inserting an explicit EA conversion
     # at extra cost.
     staggered_inputs = input_eas & STAGGERED_EAS
@@ -1116,11 +1113,17 @@ def _multi_arg_pointwise_layouts(
             if arg.layouts and arg.layouts[0].element_arrangement == staggered_ea
         ]
 
-        if stag_split and all(broadcast for _, broadcast, _ in stag_split):
-            # Case 3.2 (checked before 3.1): every staggered operand is a size-1-
-            # stick broadcaster, so none carries a real ordering. Treat the op as
-            # an all-STANDARD broadcast (STANDARD output), preferred even in the
-            # overlap where the STANDARD operands also broadcast.
+        if all(broadcast for _, broadcast, _ in std_split):
+            # Case 3.1 (and case 2b with no STANDARD operands): preserve the
+            # staggered arrangement and keep only broadcast-compatible STANDARD
+            # candidates.
+            output_ea = staggered_ea
+            for arg, broadcast, non_broadcast in std_split:
+                if non_broadcast:
+                    arg.layouts[:] = broadcast
+        elif stag_split and all(broadcast for _, broadcast, _ in stag_split):
+            # Case 3.2: every staggered operand has a broadcast candidate, so
+            # the operation can use STANDARD ordering.
             #
             # Safety: device coordinates depend only on device_size/stride_map,
             # not the EA label (see device_coordinates), and `_is_supported_layout`
@@ -1163,16 +1166,6 @@ def _multi_arg_pointwise_layouts(
                 if non_broadcast:
                     arg.layouts[:] = broadcast
             staggered_inputs = set()
-        elif all(broadcast for _, broadcast, _ in std_split):
-            # Case 3.1 (and, vacuously, case 2b when there are no STANDARD
-            # operands): a genuine (full) staggered operand dictates the
-            # arrangement and every STANDARD operand broadcasts against it. Keep
-            # the staggered candidates and prune each STANDARD operand to its
-            # broadcast candidates; the output stays staggered.
-            output_ea = staggered_ea
-            for arg, broadcast, non_broadcast in std_split:
-                if non_broadcast:
-                    arg.layouts[:] = broadcast
         else:
             # Case 3.3: a STANDARD operand and a staggered operand are both
             # non-broadcast full tensors — a genuine mixed-order op we cannot
