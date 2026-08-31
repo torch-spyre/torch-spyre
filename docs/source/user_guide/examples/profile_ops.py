@@ -990,83 +990,14 @@ def _print_model(feats: list) -> float:
         _emit("MODEL (no features extracted)")
         return 0.0
     p = cost_model.CostParams()
-    r, w = cost_model._fused_hbm_bytes(
-        feats
-    )  # external input counted once (fused kernel)
-    lp = max((o.loop_trip for o in feats), default=1)
-    is_mm = any(getattr(o, "is_matmul", False) for o in feats)
-    base = (
-        (r / p.mm_bw_read_gbps + w / p.mm_bw_write_gbps)
-        if is_mm
-        else (r + w) / p.bw_peak_gbps
-    )
-    turn = p.rw_turnaround_ns_per_byte * min(r, w)
-    # Underfill derate (output-dim tiling): smallest per-core tile governs.
-    eff, eff_rows, eff_cols = 1.0, 0.0, 0.0
-    for o in feats:
-        if o.loop_trip > 1 and o.tiles_output_dim and o.tile_rows_per_core > 0:
-            cols = cost_model._op_cols(o)
-            e = (
-                cost_model.coarse_underfill_eff_matmul(o.tile_rows_per_core, p)
-                if is_mm
-                else cost_model.coarse_underfill_eff(o.tile_rows_per_core, cols, p)
-            )
-            if e < eff:
-                eff, eff_rows, eff_cols = e, o.tile_rows_per_core, cols
-    # Matmul compute term (additive).
-    mm_us, mm_lines = 0.0, []
-    for o in feats:
-        if getattr(o, "is_matmul", False) and o.matmul_macs > 0 and o.cores > 0:
-            pe = cost_model.underfill_eff(
-                o.matmul_rows_per_core, p, p.underfill_target_passes_matmul
-            )
-            c_ns = o.matmul_macs / o.cores / (p.mac_peak_per_core_ns * pe)
-            mm_us += c_ns / 1000
-            mm_lines.append(
-                f"MODEL   compute = MACs/cores/(mac_peak*pt_eff) = {o.matmul_macs}/"
-                f"{o.cores}/({p.mac_peak_per_core_ns:.0f}*{pe:.3f}) = {c_ns / 1000:.2f}"
-                f" us  (M/m={o.matmul_rows_per_core:.0f}, pt_eff={pe:.3f})"
-            )
+    # Delegate the whole step-by-step breakdown to cost_model.explain() rather than
+    # duplicating its logic here -- a matmul bundle is now priced entirely by
+    # work_division._matmul_split_cost (see cost_model's module docstring), which has a
+    # different breakdown shape (reconstructed B/M/N/K axes, no base/turn/eff terms) than
+    # the pointwise turnaround model this function used to spell out by hand.
     t = cost_model.predict_ops(feats, p)
-    parts = "(R+W)/BW_PEAK + a*min(R,W)"
-    if eff < 1.0:
-        parts = f"[{parts}] / eff_underfill"
-    if mm_us > 0:
-        parts = f"compute + {parts}"
-    _emit(f"MODEL -- estimate (turnaround): T = {parts} --")
-    _emit(f"MODEL   R={r} B (read)   W={w} B (write)   loop_trip L={lp}")
-    for ln in mm_lines:
-        _emit(ln)
-    blab = (
-        f"R/{p.mm_bw_read_gbps:.0f}+W/{p.mm_bw_write_gbps:.0f}"
-        if is_mm
-        else f"(R+W)/{p.bw_peak_gbps:.0f}"
-    )
-    _emit(f"MODEL   base = {blab} = {base / 1000:.2f} us")
-    _emit(
-        f"MODEL   turn = a*min(R,W) = {p.rw_turnaround_ns_per_byte}*{min(r, w)} "
-        f"= {turn / 1000:.2f} us"
-    )
-    if eff < 1.0:
-        if is_mm:
-            _shape = (
-                f"({eff_rows:.1f}/{p.coarse_underfill_rfull_matmul:g})"
-                f"**{p.coarse_underfill_exp_matmul}"
-            )
-            _ceil = p.coarse_underfill_cap_matmul
-        else:
-            _shape = (
-                f"({eff_rows:.1f}/{p.coarse_underfill_rfull:g})"
-                f"**{p.coarse_underfill_exp}"
-                f" * ({eff_cols:.0f}/{p.coarse_underfill_col_ref:.0f})"
-                f"**{p.coarse_underfill_col_exp}"
-            )
-            _ceil = p.coarse_underfill_cap
-        _emit(
-            f"MODEL   eff_underfill = min({_ceil}, {_shape}) = {eff:.3f} "
-            f"-> (base+turn)/eff = {(base + turn) / eff / 1000:.2f} us"
-        )
-    _emit(f"MODEL   => T_model = {t / 1000:.2f} us")
+    for ln in cost_model.explain(feats, p).splitlines():
+        _emit(f"MODEL {ln.strip()}")
     # Machine-readable feature vector (the model's INPUT) so a NEW model version can be
     # scored OFFLINE against the stored measured time -- no hardware re-run. Prefixed
     # `MODEL ` so the sweeps' `^MODEL ` grep already captures it; parse_sweep_logs.py

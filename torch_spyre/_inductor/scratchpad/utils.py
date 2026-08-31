@@ -102,6 +102,61 @@ def calculate_liveness(graph: GraphLowering) -> dict[str, list[int]]:
     return liveness
 
 
+def counted_loop_lifetime_end_overrides(graph: GraphLowering) -> dict[str, int]:
+    """Return exclusive lifetime ends for values reused by counted loops.
+
+    The graph contains one textual copy of a loop body.  Ordinary liveness
+    therefore sees only the first runtime iteration and may reuse a value's LX
+    address later in that body, even though the next iteration reads it again.
+    A value born outside a loop and read inside it must stay alive through that
+    loop.  This records that storage fact without adding a fake read to
+    :func:`calculate_liveness`.
+    """
+
+    def group_path(op: Operation) -> tuple[int, ...]:
+        return tuple(getattr(getattr(op, "loop_info", None), "loop_group_id", ()) or ())
+
+    loop_end: dict[tuple[int, ...], int] = {}
+    birth_group: dict[str, tuple[int, ...]] = {
+        name: () for name in graph.graph_input_names
+    }
+    last_access: dict[str, int] = {}
+
+    for index, op in enumerate(graph.operations):
+        path = group_path(op)
+        for depth in range(1, len(path) + 1):
+            loop_end[path[:depth]] = index
+        rw = op_read_writes(op)
+        for dep in rw.writes:
+            birth_group.setdefault(dep.name, path)
+            last_access[dep.name] = index
+        for dep in rw.reads:
+            birth_group.setdefault(dep.name, ())
+            last_access[dep.name] = index
+
+    overrides: dict[str, int] = {}
+    for index, op in enumerate(graph.operations):
+        consumer_path = group_path(op)
+        if not consumer_path:
+            continue
+        for dep in op_read_writes(op).reads:
+            producer_path = birth_group.get(dep.name, ())
+            common = 0
+            while (
+                common < len(producer_path)
+                and common < len(consumer_path)
+                and producer_path[common] == consumer_path[common]
+            ):
+                common += 1
+            if common == len(consumer_path):
+                continue
+            enclosing_loop = consumer_path[: common + 1]
+            end = loop_end[enclosing_loop] + 1
+            if end > last_access.get(dep.name, index) + 1:
+                overrides[dep.name] = max(overrides.get(dep.name, 0), end)
+    return overrides
+
+
 def mem_usage_by_buf(
     graph: GraphLowering,
     cache: Optional[dict] = None,
@@ -403,16 +458,9 @@ def _get_buffer_user_deps(
 
 
 def _op_num_cores(op: Operation) -> int:
-    """Cores implied by op.op_it_space_splits (defaults to 1 when unset).
-
-    `op_it_space_splits` is set conditionally by span_reduction_pass /
-    work_distribution; ops that don't get split (e.g. trivial pointwise
-    on a small output) leave the attribute unset. Match the existing
-    convention (pass_utils.py, work_division.py) and treat missing as
-    no-split → 1 core.
-    """
-    splits: tuple[dict, dict] = getattr(op, "op_it_space_splits", ({}, {}))
-    return math.prod([s for p in splits for s in p.values()])
+    """Cores implied by symbol-keyed ownership (defaults to one)."""
+    ownership = getattr(op, "iteration_space_ownership", None)
+    return math.prod(ownership.work_slices.values()) if ownership is not None else 1
 
 
 def get_ncores_for_buffers(
@@ -694,3 +742,37 @@ def quality_plot(
         ax2.plot(temperature_logs, "g", lw=1)
 
     return fig
+
+
+# Microseconds are the universal currency; every µs quantity is converted to an
+# integer on this scale by exactly one rounding step, so accumulation is pure
+# integer. 1e6 gives picosecond resolution -- ample for the smallest memory
+# terms -- while Python's arbitrary-precision ints keep large sums exact.
+US_FIXED_POINT_SCALE = 1_000_000
+
+
+def to_fixed_us(us: float) -> int:
+    """Map a non-negative microsecond quantity to the fixed-point integer scale
+    with a single deterministic round-half-up step.
+
+    Round-half-up on non-negative inputs is order-independent and platform-stable
+    (no banker's rounding), which is what the determinism guarantee needs. An
+    infinite cost (an infeasible split) is a caller error, flagged rather than
+    silently mapped.
+    """
+    if not math.isfinite(us) or us < 0.0:
+        raise ValueError(f"cost must be finite and non-negative, got {us!r}")
+    return int(us * US_FIXED_POINT_SCALE + 0.5)
+
+
+def hbm_bytes_per_us() -> float:
+    """HBM bandwidth as bytes per microsecond, sourced from the native cost model
+    (``_HBM_BW_GBS`` GB/s x 1000) so the memory objective and the cost model's
+    own traffic term use the identical constant.
+
+    Imported lazily so the fixed-point helper above stays importable without
+    pulling in torch.
+    """
+    from torch_spyre._inductor import work_division  # noqa: PLC0415
+
+    return float(work_division._HBM_BW_GBS) * 1000.0

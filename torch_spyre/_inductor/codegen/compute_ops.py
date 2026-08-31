@@ -380,7 +380,7 @@ def gen_coord_info_value(
                     {"factor_": nsplits, "label_": "core_fold"},
                     {"factor_": 1, "label_": "corelet_fold"},
                     {"factor_": 1, "label_": "row_fold"},
-                    {"factor_": (size // 128), "label_": "elem_arr_3"},
+                    {"factor_": -(-size // 128), "label_": "elem_arr_3"},
                     {"factor_": 8, "label_": "elem_arr_2"},
                     {"factor_": 2, "label_": "elem_arr_1"},
                     {"factor_": 8, "label_": "elem_arr_0"},
@@ -411,9 +411,9 @@ def gen_coord_info_value(
                     {"factor_": 1, "label_": "corelet_fold"},
                     {"factor_": 1, "label_": "row_fold"},
                     {
-                        "factor_": 1
-                        if is_stick_reduction
-                        else (size // elems_per_stick),
+                        "factor_": (
+                            1 if is_stick_reduction else -(-size // elems_per_stick)
+                        ),
                         "label_": "elem_arr_1",
                     },
                     {"factor_": elems_per_stick, "label_": "elem_arr_0"},
@@ -687,6 +687,7 @@ def generate_sdsc(
     operation_work_division = TensorWorkDivision(
         {dim: int(split) for dim, split in sdsc_spec.work_slices.items()},
         {dim: sdsc_spec.core_id_to_work_slice[dim] for dim in sdsc_spec.work_slices},
+        num_cores=sdsc_spec.num_cores,
     )
     for tensor in sdsc_spec.args:
         if tensor.work_division is None:
@@ -1548,7 +1549,8 @@ def generate_sdsc(
                                         ),
                                         "coreIdToWkSlice_": (
                                             tensor.work_division.to_core_slices(
-                                                sdsc_spec.num_cores
+                                                tensor.work_division.num_cores
+                                                or sdsc_spec.num_cores
                                             )
                                             if sdsc_spec.opfunc == "shuffle"
                                             and tensor.work_division is not None

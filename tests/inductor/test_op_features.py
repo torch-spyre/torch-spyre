@@ -22,6 +22,11 @@ well-formed and that it actually separates those cases, so a regression in the
 extractor (or a schema drift in the cost model) is caught here rather
 than as a silently flat search landscape.
 
+Division features (``sa_cooptimizer.features_for_division``) and residency
+(``cost_objective.with_residency``) are the two halves of that story -- division
+choice and placement choice -- so this file tests both against one shared
+fixture rather than splitting per source module.
+
 Regenerate with ``python3 docs/source/user_guide/examples/scratchpad/capture_op_features.py`` on a Spyre machine.
 """
 
@@ -30,9 +35,14 @@ import math
 import os
 import unittest
 from unittest import TestCase
+from unittest.mock import patch
+
+import sympy
 
 from torch_spyre._inductor.cost_model import OpFeatures, op_from_dict, predict_ops
-from torch_spyre._inductor.scratchpad.op_features import with_residency
+from torch_spyre._inductor.scratchpad.cost_objective import with_residency
+from torch_spyre._inductor.scratchpad.sa_cooptimizer import features_for_division
+from torch_spyre._inductor.scratchpad.plan_solver import CoreDivision
 
 FIXTURE = os.path.join(os.path.dirname(__file__), "cooptimization_op_features.json")
 
@@ -47,6 +57,28 @@ def _entries():
     for gname, g in _graphs().items():
         for bname, b in g["buffers"].items():
             yield gname, bname, b
+
+
+class CandidateDivisionTest(TestCase):
+    def test_candidate_is_passed_as_complete_symbol_keyed_map(self):
+        """SA feature extraction neither encodes nor mutates Scheduler transport."""
+        m, n, kk = sympy.symbols("m n kk")
+        op = object()
+        division = CoreDivision(output_splits={m: 8}, reduction_splits={kk: 2})
+        expected = {m: 8, n: 1, kk: 2}
+        with (
+            patch(
+                "torch_spyre._inductor.scratchpad.sa_cooptimizer.iteration_space_from_op",
+                return_value={m: 1024, n: 1024, kk: 2048},
+            ),
+            patch(
+                "torch_spyre._inductor.dump_cost_model.extract_op_features",
+                return_value="features",
+            ) as extract,
+        ):
+            self.assertEqual(features_for_division(op, division), "features")
+
+        extract.assert_called_once_with(op, expected)
 
 
 class FixturePresentTest(TestCase):

@@ -55,10 +55,6 @@ def _check_ktir_device_prerequisites() -> None:
     """
     missing = []
 
-    if _spyre_config.bundle_symbolic_args:
-        # The env var, not just config: prepare_kernel.cpp reads it directly.
-        missing.append("set BUNDLE_SYMBOLIC_ARGS=0 (baked addresses are required)")
-
     if not _spyre_config.ktir_device_mlir:
         missing.append("set KTIR_DEVICE_MLIR to a .mlir declaring the target device")
 

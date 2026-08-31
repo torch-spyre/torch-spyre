@@ -76,7 +76,10 @@ class ExhaustiveSearchSolver(CoreDivisionLayoutSolver):
     # CoreDivisionLayoutSolver contract
     # ------------------------------------------------------------------
 
-    def plan_layout_and_core_divisions(self) -> list[CoreDivisionBuffer]:
+    def plan_layout_and_core_divisions(
+        self, cost_expr=None
+    ) -> list[CoreDivisionBuffer]:
+        # TODO: use cost_expr here
         buffers_list = cast("list[CoreDivisionBuffer]", self.buffers)
 
         buf_by_name: dict[str, CoreDivisionBuffer] = {b.name: b for b in buffers_list}
@@ -147,6 +150,7 @@ class ExhaustiveSearchSolver(CoreDivisionLayoutSolver):
                     first_use_is_read=b.first_use_is_read,
                     in_place_parents=_valid_inplace_parents(b, chosen[b.name]),
                     residency_reason=_residency_reason(b, chosen[b.name]),
+                    lifetime_end_override=b.lifetime_end_override,
                 )
                 for b in buffers_list
             ]

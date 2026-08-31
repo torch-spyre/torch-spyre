@@ -39,6 +39,7 @@ from torch_spyre._inductor.codegen.superdsc import (
     _resolve_sdsc_size,
     compile_op_spec,
 )
+from torch_spyre._inductor.core_mapping import derive_operation_mapping
 from torch_spyre._inductor.op_spec import OpSpec, TensorArg
 from torch_spyre._inductor.work_division import (
     _collect_symbol_metadata,
@@ -446,13 +447,15 @@ class TestSdscJsonSymbolicDimSmoke(InductorTestCase):
                 allocation={"hbm": hbm_base},
             )
 
+        iteration_space = {
+            c_row: (s0, 1),
+            c_col: (sympy.Integer(256), 1),
+        }
         return OpSpec(
             op="add",
             is_reduction=False,
-            iteration_space={
-                c_row: (s0, 1),
-                c_col: (sympy.Integer(256), 1),
-            },
+            iteration_space=iteration_space,
+            core_id_to_work_slice=derive_operation_mapping(iteration_space),
             args=[
                 _tensor_arg(True, 0, self._HBM_BASE),
                 _tensor_arg(True, 1, self._HBM_BASE + 0x1000),
@@ -664,13 +667,15 @@ class TestGenerateSdscSymbolicPerCoreAddresses(InductorTestCase):
                 allocation={"hbm": hbm_base},
             )
 
+        iteration_space = {
+            c_row: (s0, self._NUM_CORES),
+            c_col: (sympy.Integer(256), 1),
+        }
         return OpSpec(
             op="add",
             is_reduction=False,
-            iteration_space={
-                c_row: (s0, self._NUM_CORES),
-                c_col: (sympy.Integer(256), 1),
-            },
+            iteration_space=iteration_space,
+            core_id_to_work_slice=derive_operation_mapping(iteration_space),
             args=[
                 _tensor_arg(True, 0, self._HBM_BASE),
                 _tensor_arg(True, 1, self._HBM_BASE + 0x1000),

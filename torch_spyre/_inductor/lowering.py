@@ -36,6 +36,7 @@ from .constants import (
 )
 from . import config
 import torch_spyre._inductor.customops  # noqa: F401
+import torch_spyre._inductor.distributed.spyre_library  # noqa: F401
 from torch_spyre.ops.fallbacks import fallback_ops
 from .ir import (
     SpyreReduction,
@@ -1341,18 +1342,6 @@ def lower_spyre_copy_forced(src, dst):
     return _build_mutation_lowering(src, dst)
 
 
-@register_spyre_lowering(torch.ops.spyre.opaque_copy_)
-def lower_spyre_opaque_copy_(value, acc):
-    # opaque_copy_ is functional at the FX/AOTAutograd level (see customops.py)
-    # so that assert_functional_graph never sees a mutation. The real
-    # mutating write into acc is introduced here, at lowering time, via the
-    # same MutationLayoutSHOULDREMOVE(acc) buffer that lower_spyre_copy_forced
-    # builds for copy_forced. Everything downstream that keys off
-    # MutationLayoutSHOULDREMOVE (e.g. wsr/coarse_tile.py) treats this
-    # identically to a copy_forced write.
-    return _build_mutation_lowering(value, acc)
-
-
 @register_spyre_lowering(torch.ops.spyre.overwrite)
 def lower_overwrite(input, output, dims, offsets):
     depr_msg = """torch.ops.spyre.overwrite is deprecated. Use standard PyTorch operations like \
@@ -1430,7 +1419,7 @@ def lower_full(size, fill_value, dtype=None, layout=None, device=None, pin_memor
     assert not pin_memory, f"doesn't support pin_memory={pin_memory}"
     if dtype is None:
         dtype = torch.get_default_dtype()
-    if dtype not in (torch.float16, torch.float32):
+    if dtype not in (torch.float16, torch.bfloat16, torch.float32):
         return ir.TensorBox.create(
             ir.FallbackKernel.create(
                 torch.ops.aten.full.default,
@@ -1874,6 +1863,43 @@ def lower_prod_dim(x, dim, keepdim=False):
         return result
 
     return with_int64_fallback(_prod_dim_impl, x)
+
+
+@register_spyre_lowering(torch.ops.aten.any.dim, type_promotion_kind=None)
+@register_spyre_lowering(torch.ops.aten.any.dims, type_promotion_kind=None)
+def lower_any_dim(x, dim, keepdim=False):
+    x = to_dtype(x, torch.float16)
+    x.realize()
+
+    # Handle both single dimension and tuple of dimensions
+    axis = [dim] if isinstance(dim, int) else list(dim)
+
+    kwargs = lowering._make_reduction_inner(
+        x, axis=axis, keepdims=keepdim, dtype=x.dtype, override_return_dtype=None
+    )
+    result = Reduction.create(
+        reduction_type="absmax",
+        input_node=x,
+        **kwargs,
+    )
+    result.realize()
+    return to_dtype(result, torch.bool)
+
+
+@register_spyre_lowering(torch.ops.aten.any.default, type_promotion_kind=None)
+def lower_any_def(x):
+    x = to_dtype(x, torch.float16)
+    x.realize()
+    kwargs = lowering._make_reduction_inner(
+        x, axis=None, keepdims=None, dtype=x.dtype, override_return_dtype=None
+    )
+    result = Reduction.create(
+        reduction_type="absmax",
+        input_node=x,
+        **kwargs,
+    )
+    result.realize()
+    return to_dtype(result, torch.bool)
 
 
 # ============================================================================
