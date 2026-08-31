@@ -1497,12 +1497,13 @@ def _check_matmul_broadcast_batch_tiling(
         and op.data.reduction_type in MATMUL_REDUCTION_OPS
     ):
         return
-    if len(read_deps) != 2 or not write_deps:
+    if not write_deps:
         return
 
     out_dep = write_deps[0]
-    x_dep, y_dep = identify_matmul_inputs(read_deps, out_dep)
-    if x_dep is None or y_dep is None:
+    try:
+        x_dep, y_dep = identify_matmul_inputs(read_deps, out_dep)
+    except ValueError:
         return
 
     # Candidates for "absent from x, present in y and the output": the true

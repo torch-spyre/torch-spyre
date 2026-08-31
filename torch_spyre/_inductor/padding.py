@@ -37,10 +37,10 @@ introduce numerical error from x.
 Deduplication of identical constants across multiple pad calls happens later
 at the IR level via dedup_and_promote_constants.
 
-x and y are identified via identify_matmul_inputs() using the BatchMatmul
-generated_dim definition: y is the input whose index contains a symbol
-present in the output but absent from x (N).  This handles M==K==N and
-M=1 (decode phase) correctly.
+x and y are identified via identify_matmul_inputs() using positional order:
+lower_bmm always emits x before y, so inputs[0] is x and inputs[1] is y.
+This is correct even when N=1 and the N symbol is absent from all index
+expressions.
 """
 
 import torch
@@ -200,10 +200,10 @@ def insert_bmm_padding(graph: GraphLowering) -> None:
     size by lower_pad_sequence; reduction_ranges stays at K so the IR iteration
     space is unchanged.  The K→K_padded widening happens at SDSC codegen time.
 
-    x and y are identified via identify_matmul_inputs() using the BatchMatmul
-    generated_dim definition: y is the input whose index contains a symbol
-    present in the output but absent from x (N).  This handles M==K==N and
-    M=1 (decode phase) correctly.
+    x and y are identified via identify_matmul_inputs() using positional order:
+    lower_bmm always emits x before y, so inputs[0] is x and inputs[1] is y.
+    This is correct even when N=1 and the N symbol is absent from all index
+    expressions.
 
     Deduplication of identical constants across multiple pad calls happens later
     at the IR level via dedup_and_promote_constants.
@@ -220,8 +220,6 @@ def insert_bmm_padding(graph: GraphLowering) -> None:
 
         rw = op.get_read_writes()
         reads = [r for r in rw.reads if hasattr(r, "name")]
-        if len(reads) != 2:  # noqa: PLR2004
-            continue
 
         # Skip aligned-K matmuls early before any x/y identification.
         # Aligned-K matmuls need no padding regardless of input layout, and
@@ -241,8 +239,9 @@ def insert_bmm_padding(graph: GraphLowering) -> None:
             continue
 
         write_dep = next(iter(rw.writes))
-        x_dep, y_dep = identify_matmul_inputs(reads, write_dep)
-        if x_dep is None or y_dep is None:
+        try:
+            x_dep, y_dep = identify_matmul_inputs(reads, write_dep)
+        except ValueError:
             logger.warning(
                 "insert_bmm_padding: could not identify x/y for %s, skipping",
                 op.get_name(),

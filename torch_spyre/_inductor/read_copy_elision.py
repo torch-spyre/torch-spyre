@@ -197,9 +197,12 @@ def _prove_matmul_direct_read(
     direct_reads = _memory_deps(direct_rw.reads)
     output_dep = _one_memory_dep(direct_rw.writes)
     if output_dep is None or len(direct_reads) != 2:
+        # Require exactly 2 distinct inputs: elision targets the copy of one
+        # specific input (x or weight). A self-matmul collapsed to 1 dep has
+        # no distinct weight to elide.
         return None, "matmul dependencies are ambiguous"
     x_dep, weight_dep = identify_matmul_inputs(direct_reads, output_dep)
-    if x_dep is None or weight_dep is None or weight_dep.name != record.source_name:
+    if weight_dep.name != record.source_name:
         return None, "saved source is not the matmul weight"
     direct_source_idx = direct_reads.index(weight_dep)
 
