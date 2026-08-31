@@ -63,6 +63,7 @@ class SpyreSDSCKernelRunner:
         code_dir: str,
         kernel_provenance: KernelProvenanceDescriptor | None = None,
         symbol_kinds: list[SymbolKind] | None = None,
+        sdsc_bundle_dir_prefix: str = None,
     ):
         self.kernel_name = name
         self.code_dir = code_dir
@@ -72,6 +73,7 @@ class SpyreSDSCKernelRunner:
             symbol_kinds if symbol_kinds is not None else []
         )
         self.profiler_event_name: str | None
+        self.sdsc_bundle_dir_prefix = sdsc_bundle_dir_prefix
         self._jobplan = None  # initialised lazily, not pickled
 
         if kernel_provenance is None:
@@ -128,15 +130,16 @@ class SpyreSDSCKernelRunner:
             # prepare_kernel(), which calls into JobPlanBuilder/getDefaultStream().
             torch.spyre._impl._lazy_init()
             spyrecode_dir = self.code_dir + "/spyreCodeDir"
-            if self.profiler_event_name is None:
-                self._jobplan = prepare_kernel(spyrecode_dir)
-            else:
-                with torch.profiler.record_function(
+            with torch.profiler.record_function(
                     f"prepare_kernel:{self.kernel_name}"
                 ):
+                if self.profiler_event_name is None:
+                    self._jobplan = prepare_kernel(spyrecode_dir, sdsc_bundle_dir_prefix=self.sdsc_bundle_dir_prefix)
+                else:
                     self._jobplan = prepare_kernel(
                         spyrecode_dir,
                         profiler_name=self.profiler_event_name,
+                        sdsc_bundle_dir_prefix=self.sdsc_bundle_dir_prefix
                     )
         return self._jobplan
 

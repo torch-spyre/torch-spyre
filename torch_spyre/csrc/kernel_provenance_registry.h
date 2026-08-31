@@ -35,6 +35,26 @@ std::optional<std::string> extractKernelProvenanceKey(
     const std::string& event_name);
 
 /**
+ * Strip the trailing ``#<step>`` suffix from an activity name, returning the
+ * base name used as the registry key for sdsc_bundle_dir_prefix lookups.
+ */
+std::string activityNameBase(const std::string& activity_name);
+
+/**
+ * Register the SDSC bundle directory prefix for an activity name base.
+ * Stored unconditionally at prepare_kernel time so it is available for every
+ * kernel regardless of whether provenance is present.
+ */
+void registerBundleDirPrefix(const std::string& name_base,
+                              std::string sdsc_bundle_dir_prefix);
+
+/**
+ * Return the SDSC bundle directory prefix for an activity name base, or an
+ * empty string when none has been registered.
+ */
+std::string lookupBundleDirPrefix(const std::string& name_base);
+
+/**
  * Register the direct debug handles for one provenance-aware event base name.
  *
  * Entries are immutable and retained for the process lifetime because AIUPTI
