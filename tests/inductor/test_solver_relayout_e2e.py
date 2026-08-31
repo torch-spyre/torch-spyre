@@ -69,7 +69,6 @@ def test_solver_relayout_materializes_and_runs(monkeypatch):
         {
             "co_optimizing_lx_planning": True,
             "layout_solver": "cpsat",
-            "lx_solver_relayout": True,
         }
     ):
         out = torch.compile(fn, dynamic=False)(x)
@@ -90,6 +89,9 @@ def test_solver_relayout_materializes_and_runs(monkeypatch):
 
 
 def test_flag_off_materializes_nothing(monkeypatch):
+    """The kill switch: with the feature default-on, SPYRE_LX_SOLVER_RELAYOUT=0
+    (config.lx_solver_relayout=False) must disarm every relayout decision and
+    leave the co-optimizing solve exactly as it was before this feature."""
     recorded = []
     real_materialize = alloc_mod.materialize_lx_relayouts
 
@@ -167,7 +169,6 @@ def test_relayout_fires_naturally_on_a_hinted_graph(monkeypatch):
         {
             "co_optimizing_lx_planning": True,
             "layout_solver": "cpsat",
-            "lx_solver_relayout": True,
         }
     ):
         out = torch.compile(fn, dynamic=False)(x)
@@ -262,7 +263,6 @@ def test_coarse_tiled_edges_are_never_offered(monkeypatch):
         {
             "co_optimizing_lx_planning": True,
             "layout_solver": "cpsat",
-            "lx_solver_relayout": True,
         }
     ):
         out = torch.compile(fn, dynamic=False)(a, b)
