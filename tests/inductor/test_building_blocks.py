@@ -1,4 +1,4 @@
-# Copyright 2025 The Torch-Spyre Authors.
+ー# Copyright 2025 The Torch-Spyre Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -218,17 +218,16 @@ class TestBuildingBlocks(unittest.TestCase):
     def test_mixed_ea_staggered_broadcaster_fp32(self):
         # Case 3.2 with an fp32-physical staggered broadcaster (DL16_TO_FP32).
         # The mixed-EA gate ALLOWS it (physically the equivalent all-STANDARD fp32
-        # broadcast), but device codegen cannot yet emit an fp32 broadcast along
-        # the stick axis -- ddc crashes in ddc_fold.cpp (innermostRelevantAllocLoop
-        # == innermostRelevantRefLoop). The same crash hits a pure-STANDARD fp32
+        # broadcast), but the codegen doesn't yet emit an fp32 broadcast along
+        # the stick axis. The same crash hits a pure-STANDARD fp32
         # [4,1]+[4,64] broadcast, so it is a separate, pre-existing codegen gap
         # tracked in https://github.com/torch-spyre/torch-spyre/issues/4132.
         #
         # We assert the failure originates in *codegen*, not the mixed-EA layout
         # gate: a plain @unittest.expectedFailure would also stay green if a future
-        # change re-tightened the gate and raised `Unsupported` before codegen,
+        # change re-tightened the gate and raised `Unsupported` before backend,
         # masking a regression of the path this test guards. So we require the
-        # error to be a ddc/dxp codegen failure and NOT the gate's "mixed EA"
+        # error to be a codegen failure and NOT the gate's "mixed EA"
         # Unsupported. Flip this to a compare_with_cpu once codegen lands.
         x = torch.randn(4, 1, dtype=torch.float16)  # -> .to(f32): staggered bcast
         w = torch.randn(4, 64, dtype=torch.float32)  # STANDARD full
