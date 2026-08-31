@@ -2405,7 +2405,10 @@ def test_outside_consumer_two_accum_512x256_B4():
 
 
 @pytest.mark.skip(
-    reason="infeasible restickify for 1D denom in mixed 1D/2D tiled scope"
+    reason="Unsupported: partial reduction result consumed before"
+    " accumulation is complete (op reads a per-tile partial result from"
+    " the same loop group) -- same carry-propagation gap as the Lk"
+    " reduction-dim tiling cases below"
 )
 def test_outside_consumer_two_accum_512x256_A4_B4():
     """Flash-style: out=zeros, denom=zeros; tiled copy_; return out/denom — A÷4 B÷4."""
@@ -2867,21 +2870,6 @@ def test_flash_tile_B():
     )
 
 
-@pytest.mark.skip(
-    reason=(
-        "Compiles now (the squeeze-position crash from issue #3613 is "
-        "fixed), but produces numerically wrong results: ~93% of output "
-        "elements mismatched, spread across both Lq tiles and all H heads. "
-        "Root cause not yet isolated -- ruled out so far: the "
-        "_tiled_dims_for_dep raw->squeezed fix (removing it causes an "
-        "immediate validate_writer_tile_advance failure, so it's necessary "
-        "and unrelated), the _insert_one_read_copy active_full_sizes fix "
-        "(reverting it does not change the mismatch), and the loop_internal "
-        "output_tiled_dims-clearing for op8/op9 (un-clearing it does not "
-        "change the mismatch either). See issue #3613 for the ongoing "
-        "investigation."
-    )
-)
 def test_flash_tile_Lq():
     """Flash v1: tile Lq÷2 only."""
     run_coarse_tile_test(
@@ -2919,15 +2907,6 @@ def test_flash_tile_B_H():
     )
 
 
-@pytest.mark.skip(
-    reason=(
-        "validate_writer_tile_advance now catches this at compile time: "
-        "squeeze-position bug in _insert_copy_op's write-side "
-        "_tiled_dims_for_dep (raw d{N} numbering breaks when a unit dim is "
-        "squeezed out of the index). Same root cause as issue #3613; "
-        "deferred until PR #3622's tile.py helpers land."
-    )
-)
 def test_flash_tile_H_Lq():
     """Flash v1: tile H÷4 Lq÷2."""
     run_coarse_tile_test(
@@ -3096,8 +3075,9 @@ def _flash_v2_fn(
 
 
 @pytest.mark.skip(
-    reason="copy_forced(running_max, real_max) write-back is dropped -- real_max"
-    " never carries across H tiles, producing inf (issue #4126)"
+    reason="H-tiling produces a large finite mismatch (~88% of elements,"
+    " max abs diff ~4) -- distinct, still-open H-tiling bug, not"
+    " accumulator inf"
 )
 def test_flash_v2_tile_H():
     """Flash v2: tile H÷4 only."""
@@ -3113,9 +3093,9 @@ def test_flash_v2_tile_H():
 
 
 @pytest.mark.skip(
-    reason="B-tiling still produces inf after the copy_forced/"
-    "mutation_write_back drop fix (issue #4126) -- distinct, still-open"
-    " B-tiling bug, not the copy_forced accumulator drop"
+    reason="B-tiling produces a large finite mismatch (~48% of elements,"
+    " max abs diff ~3.5) -- distinct, still-open B-tiling bug, not"
+    " accumulator inf"
 )
 def test_flash_v2_tile_B():
     """Flash v2: tile B÷2 only. B=2."""
@@ -3128,10 +3108,6 @@ def test_flash_v2_tile_B():
     )
 
 
-@pytest.mark.skip(
-    reason="copy_forced(running_max, real_max) write-back is dropped -- real_max"
-    " never carries across tiles, producing inf (issue #4126)"
-)
 def test_flash_v2_tile_Lq():
     """Flash v2: tile Lq÷2 only."""
     run_coarse_tile_test(
@@ -3159,9 +3135,9 @@ def test_flash_v2_tile_Lk():
 
 
 @pytest.mark.skip(
-    reason="B-tiling still produces inf after the copy_forced/"
-    "mutation_write_back drop fix (issue #4126) -- distinct, still-open"
-    " B-tiling bug, not the copy_forced accumulator drop"
+    reason="B/H-tiling produces a large finite mismatch (~46% of elements,"
+    " max abs diff ~3.8) -- distinct, still-open B-tiling bug, not"
+    " accumulator inf"
 )
 def test_flash_v2_tile_B_H():
     """Flash v2: tile B÷2 H÷4. B=2."""
@@ -3174,9 +3150,6 @@ def test_flash_v2_tile_B_H():
     )
 
 
-@pytest.mark.skip(
-    reason="finalize_layouts: restickify infeasible for copy ops across loop groups"
-)
 def test_flash_v2_tile_H_Lq():
     """Flash v2: tile H÷4 Lq÷2. Equivalent to original test_flash_v2."""
     run_coarse_tile_test(
@@ -3351,9 +3324,9 @@ def test_flash_v3_tile_H():
 
 
 @pytest.mark.skip(
-    reason="B-tiling still produces inf after the copy_forced/"
-    "mutation_write_back drop fix (issue #4126) -- distinct, still-open"
-    " B-tiling bug, not the copy_forced accumulator drop"
+    reason="B-tiling produces a large finite mismatch (~48% of elements,"
+    " max abs diff ~3.5) -- distinct, still-open B-tiling bug, not"
+    " accumulator inf"
 )
 def test_flash_v3_tile_B():
     """Flash v3: tile B÷2 only. B=2."""
@@ -3366,15 +3339,6 @@ def test_flash_v3_tile_B():
     )
 
 
-@pytest.mark.skip(
-    reason=(
-        "validate_writer_tile_advance now catches this at compile time: "
-        "squeeze-position bug in _insert_copy_op's write-side "
-        "_tiled_dims_for_dep (raw d{N} numbering breaks when a unit dim is "
-        "squeezed out of the index). Same root cause as issue #3613; "
-        "deferred until PR #3622's tile.py helpers land."
-    )
-)
 def test_flash_v3_tile_Lq():
     """Flash v3: tile Lq÷2 only."""
     run_coarse_tile_test(
@@ -3400,11 +3364,6 @@ def test_flash_v3_tile_Lk():
     )
 
 
-@pytest.mark.skip(
-    reason="B-tiling still produces inf after the copy_forced/"
-    "mutation_write_back drop fix (issue #4126) -- distinct, still-open"
-    " B-tiling bug, not the copy_forced accumulator drop"
-)
 def test_flash_v3_tile_B_H():
     """Flash v3: tile B÷2 H÷4. B=2."""
     run_coarse_tile_test(
@@ -3416,15 +3375,6 @@ def test_flash_v3_tile_B_H():
     )
 
 
-@pytest.mark.skip(
-    reason=(
-        "validate_writer_tile_advance now catches this at compile time: "
-        "squeeze-position bug in _insert_copy_op's write-side "
-        "_tiled_dims_for_dep (raw d{N} numbering breaks when a unit dim is "
-        "squeezed out of the index). Same root cause as issue #3613; "
-        "deferred until PR #3622's tile.py helpers land."
-    )
-)
 def test_flash_v3_tile_H_Lq():
     """Flash v3: tile H÷4 Lq÷2. Equivalent to original test_flash_v3 (small sizes)."""
     run_coarse_tile_test(
@@ -3567,7 +3517,9 @@ def _flash_v4_fn(q, k, v, *, B, S, H, D, b_tiles=1, h_tiles=1, lq_tiles=1, lk_ti
 
 
 @pytest.mark.skip(
-    reason="Unsupported: propagate_named_dims bug — num_heads layout dim has no loop vars after view+transpose"
+    reason="AssertionError in _stick_symbol: within-stick coordinate"
+    " carries 2 free symbols, want exactly 1 -- v4's view+transpose"
+    " layout produces a coordinate expression padding.py cannot solve"
 )
 def test_flash_v4_tile_H():
     """Flash v4: tile num_heads÷4 only."""
@@ -3579,7 +3531,9 @@ def test_flash_v4_tile_H():
 
 
 @pytest.mark.skip(
-    reason="Unsupported: propagate_named_dims bug — num_heads layout dim has no loop vars after view+transpose"
+    reason="AssertionError in _stick_symbol: within-stick coordinate"
+    " carries 2 free symbols, want exactly 1 -- v4's view+transpose"
+    " layout produces a coordinate expression padding.py cannot solve"
 )
 def test_flash_v4_tile_B():
     """Flash v4: tile batch_size÷2 only. B=2."""
@@ -3591,7 +3545,9 @@ def test_flash_v4_tile_B():
 
 
 @pytest.mark.skip(
-    reason="Unsupported: propagate_named_dims bug — num_heads layout dim has no loop vars after view+transpose"
+    reason="AssertionError in _stick_symbol: within-stick coordinate"
+    " carries 2 free symbols, want exactly 1 -- v4's view+transpose"
+    " layout produces a coordinate expression padding.py cannot solve"
 )
 def test_flash_v4_tile_Lq():
     """Flash v4: tile max_seqlen_q÷2 only."""
@@ -3603,7 +3559,9 @@ def test_flash_v4_tile_Lq():
 
 
 @pytest.mark.skip(
-    reason="Unsupported: propagate_named_dims bug — num_heads layout dim has no loop vars after view+transpose"
+    reason="AssertionError in _stick_symbol: within-stick coordinate"
+    " carries 2 free symbols, want exactly 1 -- v4's view+transpose"
+    " layout produces a coordinate expression padding.py cannot solve"
 )
 def test_flash_v4_tile_H_Lq():
     """Flash v4: tile num_heads÷4 max_seqlen_q÷2. Equivalent to original test_flash_v4."""
@@ -3617,7 +3575,9 @@ def test_flash_v4_tile_H_Lq():
 
 
 @pytest.mark.skip(
-    reason="Unsupported: propagate_named_dims bug — num_heads layout dim has no loop vars after view+transpose"
+    reason="Hangs rather than failing fast (observed: no completion after"
+    " 2+ minutes, killed) -- distinct from the other v4 tile combinations,"
+    " which fail at compile time; root cause not yet investigated"
 )
 def test_flash_v4_tile_H_Lq_Lk():
     """Flash v4: tile num_heads÷4 max_seqlen_q÷2 max_seqlen_kv÷2."""
@@ -3631,7 +3591,10 @@ def test_flash_v4_tile_H_Lq_Lk():
 
 
 @pytest.mark.skip(
-    reason="Unsupported: propagate_named_dims bug — num_heads layout dim has no loop vars after view+transpose"
+    reason="Unsupported: partial reduction result consumed before"
+    " accumulation is complete (op reads a per-tile partial result from"
+    " the same loop group) -- same carry-propagation gap as the Lk"
+    " reduction-dim tiling cases below, not the view+transpose bug"
 )
 def test_flash_v4_tile_all():
     """Flash v4: tile all dims. B=2, H÷4, Lq÷2, Lk÷2."""
@@ -4380,9 +4343,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         )
 
     # Consider deleting — superseded by Group 10 structured tests (_flash_v2_fn)
-    @pytest.mark.skip(
-        reason="finalize_layouts: restickify infeasible for copy ops across loop groups"
-    )
     def test_hint_flash_attention_v2(self):
         """Flash attention tiled over H (4 slices) via nested spyre_hints.
 
@@ -4503,7 +4463,9 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         )
 
     @pytest.mark.skip(
-        reason="Expected FixedTiledLayout for output buf — layout not promoted correctly with divide inside scope"
+        reason="Compiles now, but produces a genuine numeric inf at runtime"
+        " (99.3% of elements mismatched, abs diff inf) -- distinct from the"
+        " compile-time layout-promotion issue this test previously hit"
     )
     def test_hint_flash_attention_v2_divide_in_scope(self):
         """test_hint_flash_attention_v2 with the final divide INSIDE the scope.
@@ -4614,7 +4576,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         )
 
     # Consider deleting — superseded by Group 10 structured tests (_flash_v3_fn)
-    @pytest.mark.skip(reason="dxp_standalone timeout")
     def test_hint_flash_attention_v3(self):
         from torch_spyre._inductor import spyre_hint
 
@@ -4720,7 +4681,10 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         )
 
     @pytest.mark.skip(
-        reason="finalize_layouts: restickify infeasible for copy ops across loop groups"
+        reason="work_division: cannot satisfy span limit for a coarse-tile"
+        " read-copy tensor (coord evaluates to 4 after splits, best span"
+        " 8589934592 vs. limit 268435456) -- distinct from the previous"
+        " restickify-infeasibility failure this test hit"
     )
     def test_hint_flash_attention_v3_b2(self):
         """Same as flash_v3 but with B=2 and b_block_size=2 so B is nto tiled"""
@@ -4887,12 +4851,9 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         )
 
     @pytest.mark.skip(
-        reason="propagate_named_dims bug: view+transpose produces index with var in two Mod "
-        "expressions that compute_coordinates cannot handle. "
-        "Root cause: find_repeat_vars skips len(mods)!=1 case silently; "
-        "compute_coordinates then produces coord=0 for num_heads dim. "
-        "Error (with PR#3034 fix): variable d2 (range 8192) appears in multiple Mod "
-        "expressions [Mod((d2//256), 32), Mod(d2, 256)] and cannot be mapped to coordinates."
+        reason="AssertionError in _stick_symbol: within-stick coordinate"
+        " carries 2 free symbols, want exactly 1 -- v4's view+transpose"
+        " layout produces a coordinate expression padding.py cannot solve"
     )
     def test_hint_flash_attention_v4(self):
         """This test attempts to replicate the standalone test_granite_attn.py with views
