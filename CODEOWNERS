@@ -16,6 +16,7 @@
 
 # Inductor / compiler backend
 /torch_spyre/_inductor/  @dgrove-oss @avery-blanchard @cyang49 @marnold-ibm @tardieu
+/torch_spyre/inductor/  @dgrove-oss @avery-blanchard @cyang49 @marnold-ibm @tardieu
 
 # Device, execution, memory, and C++ runtime
 /torch_spyre/device/     @JRosenkranz @thoangtrvn @ani300
@@ -41,7 +42,7 @@
 /tests/distributed/      @jjhursey @thoangtrvn @avery-blanchard
 
 # Documentation
-/docs/                   @kaoutar55 @dgrove-oss @mudhakar @raghukiran1224 @viji560 @tehbone
+/docs/                   @kaoutar55 @dgrove-oss @tardieu @mudhakar @raghukiran1224 @viji560 @tehbone
 
 # CI/CD
 /.github/                 @ashokponkumar @jabostian @anubhavjana @n-marion
@@ -55,3 +56,6 @@
 # against is a fact about /torch_spyre/_inductor/.
 /tools/ktir-mlir-frontend.pin  @dgrove-oss @avery-blanchard @tardieu
 /tools/install-ktir.sh         @dgrove-oss @avery-blanchard @tardieu
+
+# tools used to tune/refresh the cost model used in inductor
+/tools/cost_model/  @dgrove-oss @avery-blanchard @cyang49 @marnold-ibm @tardieu

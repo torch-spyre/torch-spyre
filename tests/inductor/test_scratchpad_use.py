@@ -392,9 +392,7 @@ class ParameterizedScratchpadUsage(
             "simulated_annealing",
         ),
         "sencores": (1, 32),
-        "co_optimization": (False, True)
-        if ts_inductor_config.co_optimizing_lx_planning
-        else (False,),
+        "co_optimization": (False, True),
     }
 
     parameter_models = (("softmax", _softmax_case), ("mlp", _mlp_case))
@@ -407,6 +405,7 @@ class ParameterizedScratchpadUsage(
             layout_solver=params["solver_method"],
             sencores=params["sencores"],
             co_optimizing_lx_planning=params["co_optimization"],
+            _cpsat_warn_on_cost_expr=False,
         ):
             model, args, kwargs = factory(self)
             torch.compiler.reset()
@@ -754,6 +753,7 @@ class TestCloneAtGraphBoundaries(
             layout_solver=params["solver_method"],
             sencores=params["sencores"],
             co_optimizing_lx_planning=params["co_optimization"],
+            _cpsat_warn_on_cost_expr=False,
         ):
             model, args, kwargs = factory(self)
             torch.compiler.reset()
@@ -868,6 +868,7 @@ class CoOptAllocatorIntegrationTests(BaseTestScratchpadUsage):
                 layout_solver=layout_solver,
                 sencores=32,
                 co_optimizing_lx_planning=True,
+                _cpsat_warn_on_cost_expr=False,
             ):
                 compiled = torch.compile(model, fullgraph=True)
                 device_result = compiled(*args).to("cpu")
@@ -1230,6 +1231,7 @@ class TestCpSatAllocatorFallback(
                 layout_solver=params["solver_method"],
                 sencores=params["sencores"],
                 co_optimizing_lx_planning=params["co_optimization"],
+                _cpsat_warn_on_cost_expr=False,
             ):
                 model, args, kwargs = factory(self)
                 torch.compiler.reset()
@@ -1314,6 +1316,7 @@ class TestCpSatTimeoutFallback(BaseTestScratchpadUsage):
             layout_solver="cpsat",
             sencores=32,
             co_optimizing_lx_planning=False,
+            _cpsat_warn_on_cost_expr=False,
         ):
             torch.compiler.reset()
             with ts_inductor_config.patch(lx_planning=False):
@@ -1404,7 +1407,9 @@ class TestSelectAllocator(unittest.TestCase):
         # used directly, else it degrades to an ExhaustiveSearchSolver wrapping
         # the cpsat factory's own greedy fallback.
         with ts_inductor_config.patch(
-            layout_solver="cpsat", co_optimizing_lx_planning=True
+            layout_solver="cpsat",
+            co_optimizing_lx_planning=True,
+            _cpsat_warn_on_cost_expr=False,
         ):
             a = select_allocator()
             self.assertIsInstance(a, CoOptimizingAllocator)
@@ -1662,6 +1667,7 @@ class TestBoundaryCloneInPlace(BaseTestScratchpadUsage):
                 lx_planning=True,
                 layout_solver="cpsat",
                 co_optimizing_lx_planning=True,
+                _cpsat_warn_on_cost_expr=False,
             ):
                 torch.compile(fn, fullgraph=True)(x)
 
@@ -1754,6 +1760,7 @@ class TestBoundaryCloneInPlace(BaseTestScratchpadUsage):
                 lx_planning=True,
                 layout_solver="cpsat",
                 co_optimizing_lx_planning=True,
+                _cpsat_warn_on_cost_expr=False,
             ):
                 result = torch.compile(fn, fullgraph=True)(x).to("cpu")
 
@@ -1958,6 +1965,7 @@ class TestBoundaryCloneInPlace(BaseTestScratchpadUsage):
                     lx_planning=True,
                     layout_solver="cpsat",
                     co_optimizing_lx_planning=True,
+                    _cpsat_warn_on_cost_expr=False,
                 ):
                     compiled = torch.compile(fn, fullgraph=True)
                     ry, ru = compiled(x)

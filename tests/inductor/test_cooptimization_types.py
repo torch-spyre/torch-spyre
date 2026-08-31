@@ -66,7 +66,7 @@ class _NoOpSolver(CoreDivisionLayoutSolver):
     def plan_layout(self, log_lx_usage=False):
         return list(self.buffers)
 
-    def plan_layout_and_core_divisions(self):
+    def plan_layout_and_core_divisions(self, cost_expr=None):
         for b in self.buffers:
             b.chosen_division = SEED_DIVISION_INDEX
             b.address = None  # spilled

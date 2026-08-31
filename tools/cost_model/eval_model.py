@@ -36,7 +36,7 @@ Feature source per record (in priority order):
     python tools/cost_model/eval_model.py                         # is_current rows, current params
     python tools/cost_model/eval_model.py --all                   # every row (not just is_current)
     python tools/cost_model/eval_model.py --category matmul --op softmax_row_tiling
-    python tools/cost_model/eval_model.py --params mac_peak_per_core_ns=1190
+    python tools/cost_model/eval_model.py --params bw_peak_gbps=155
     python tools/cost_model/eval_model.py --verify                # feature-fidelity vs stored pred_us
     python tools/cost_model/eval_model.py --update                # write recomputed pred_us/err back
 """
@@ -172,7 +172,7 @@ def reconstruct_from_io(rec):
                 cm.ArgTraffic(
                     name=t["name"],
                     role=t["role"],
-                    mem=t["mem"].lower(),
+                    is_lx=t["mem"].lower() == "lx",
                     elems=elems,
                     broadcast="broadcast" in (t.get("flags") or ""),
                     loop_factor=1,

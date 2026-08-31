@@ -868,7 +868,7 @@ def test_lx_relayout_allocation_is_atomic_in_one_greedy_solve(caplog):
 
     solver = allocator._build_solver(buffers)
     with caplog.at_level(logging.DEBUG, logger="spyre.inductor.scratchpad.allocator"):
-        allocation = allocator._solve(solver)
+        allocation = allocator._solve(solver, graph)
         allocator._finalize_lx_relayout_allocation(allocation)
 
     by_name = {buffer.name: buffer for buffer in allocation}
@@ -882,9 +882,9 @@ def test_lx_relayout_allocation_is_atomic_in_one_greedy_solve(caplog):
     )
 
 
-def _assert_live_buffers_do_not_share_addresses(buffers, limit):
+def _assert_live_buffers_do_not_share_addresses(graph, buffers, limit):
     allocator = ScratchpadAllocator(GreedyLayoutSolver, limit)
-    allocation = allocator._solve(allocator._build_solver(buffers))
+    allocation = allocator._solve(allocator._build_solver(buffers), graph)
     assert all(buffer.address is not None for buffer in allocation)
     for index, left in enumerate(allocation):
         for right in allocation[index + 1 :]:
@@ -923,7 +923,7 @@ def test_lx_relayout_copies_loop_lifetime_to_every_destination():
     assert [buffer.lifetime_end_override for buffer in source.paired_with] == [12, 12]
     tail = LifetimeBoundBuffer("tail", 64, [8, 11])
     buffers.append(tail)
-    _assert_live_buffers_do_not_share_addresses(buffers, 384)
+    _assert_live_buffers_do_not_share_addresses(graph, buffers, 384)
 
 
 def test_lx_relayout_keeps_source_lifetime_for_later_original_reader():
@@ -944,7 +944,7 @@ def test_lx_relayout_keeps_source_lifetime_for_later_original_reader():
     assert source.paired_with[0].lifetime_end_override == 8
     tail = LifetimeBoundBuffer("tail", 64, [6, 7])
     buffers.append(tail)
-    _assert_live_buffers_do_not_share_addresses(buffers, 384)
+    _assert_live_buffers_do_not_share_addresses(graph, buffers, 384)
 
 
 @config.patch({"lx_planner_relayout": True})

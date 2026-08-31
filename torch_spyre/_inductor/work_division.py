@@ -13,8 +13,10 @@
 # limitations under the License.
 
 
+import builtins
 import dataclasses
 import itertools
+import sympy
 import logging
 import math
 from collections.abc import Callable
@@ -1349,6 +1351,34 @@ def work_distribution_pass(
     raise_if_per_core_overflow(all_tds, it_space, splits, op.get_name(), symbol_meta)
 
 
+def max(*args, **kwargs):
+    """``max``, but symbolic-aware: dispatches to ``sympy.Max`` when an arg is
+    a sympy expression (whose truth-valued comparisons the builtin can't
+    resolve), otherwise defers to the builtin -- including its ``key``/
+    ``default`` kwargs and single-iterable form, neither of which ``sympy.Max``
+    supports."""
+    if any(isinstance(a, sympy.Basic) for a in args):
+        return sympy.Max(*args)
+    return builtins.max(*args, **kwargs)
+
+
+def min(*args, **kwargs):
+    """``min`` counterpart of :func:`max`; see its docstring."""
+    if any(isinstance(a, sympy.Basic) for a in args):
+        return sympy.Min(*args)
+    return builtins.min(*args, **kwargs)
+
+
+def log2(arg):
+    """``log2`` counterpart of :func:`max`; see its docstring."""
+    if isinstance(arg, sympy.Basic):
+        if isinstance(arg, sympy.Rational):
+            return sympy.log(arg.n(), 2.0)
+        else:
+            return sympy.log(arg, 2.0)
+    return math.log2(arg)
+
+
 _PT_ROWS = 8  # PT block rows per corelet
 
 # Constants for the matmul cost model (_matmul_split_cost). Each is either an
@@ -1386,15 +1416,26 @@ def _matmul_split_cost(
     k_axis: tuple[int, int],
     max_cores: int,
     shared_weight: bool = False,
+    include_hbm: bool = True,
 ) -> float:
     """Estimated kernel time in microseconds for ``[B,M,K]@[B,K,N]`` run with
     the given core split. Each axis is a ``(size, split)`` pair so a dim's size
     cannot be paired with another dim's split. Lower is better; inf if infeasible.
+
+    ``include_hbm=False`` drops the operand/output HBM-traffic term for a caller
+    that charges that traffic itself (``cost_model._matmul_ns_upstream``, whose
+    bundle memory term counts the same bytes and knows about LX residency). The
+    cohort bandwidth penalty scales only that term, so it drops out with it.
     """
     (B, b), (M, m), (N, n), (K, k) = b_axis, m_axis, n_axis, k_axis
     cores_used = b * m * n * k
-    if cores_used == 0 or cores_used > max_cores:
+    if cores_used == 0 or (isinstance(cores_used, int) and cores_used > max_cores):
         return math.inf
+
+    num_elems = B * M * N * K
+    is_symbolic = isinstance(cores_used, sympy.Basic) or isinstance(
+        num_elems, sympy.Basic
+    )
 
     # Compute: per-core MACs over peak, derated when the per-core M tile is too
     # short to fill the PT pipeline. The PT array streams M in passes of
@@ -1402,25 +1443,36 @@ def _matmul_split_cost(
     # amortised over too little work, and that overhead grows sub-linearly.
     m_t = M // m if m else 1
     pt_passes = max(1.0, m_t / _PT_ROWS)
-    pt_eff = min(1.0, (pt_passes / _TARGET_PT_PASSES) ** _PT_EFFICIENCY_EXPONENT)
-    compute_us = (B * M * N * K / cores_used) / (_PEAK_MACS_US_CORE * pt_eff)
+    pt_eff = (
+        # TODO: allow symbolic
+        1.0
+        if is_symbolic
+        else min(1.0, (pt_passes / _TARGET_PT_PASSES) ** _PT_EFFICIENCY_EXPONENT)
+    )
+    compute_us = (num_elems / cores_used) / (_PEAK_MACS_US_CORE * pt_eff)
 
     # HBM: every input operand is broadcast to the cohort of cores splitting the
     # orthogonal dim. Past _COHORT_LIMIT the broadcasts contend for the shared
     # link, so effective bandwidth falls off linearly with cohort size.
-    weight_batches = 1 if shared_weight else B
-    bytes_total = (B * M * K + weight_batches * K * N + B * M * N) * _DTYPE_BYTES
-    fanout_split = max(m, n) if shared_weight else n
-    cohort_penalty = max(
-        1.0, (fanout_split / _COHORT_LIMIT) ** _COHORT_PENALTY_EXPONENT
-    )
-    hbm_us = bytes_total / (_HBM_BW_GBS * 1000) * cohort_penalty
+    if include_hbm:
+        weight_batches = 1 if shared_weight else B
+        bytes_total = (B * M * K + weight_batches * K * N + B * M * N) * _DTYPE_BYTES
+        fanout_split = max(m, n) if shared_weight else n
+        # TODO: Remove special casing symbolic
+        cohort_penalty = (
+            1.0
+            if is_symbolic
+            else max(1.0, (fanout_split / _COHORT_LIMIT) ** _COHORT_PENALTY_EXPONENT)
+        )
+        hbm_us = bytes_total / (_HBM_BW_GBS * 1000) * cohort_penalty
+    else:
+        hbm_us = 0.0
 
     # PSUM: a K-split spreads the reduction over k cores, costing (k-1)
     # partial-sum hops. Charge each core's output tile rather than the whole
     # output, so useful K-splits are not over-penalized.
     psum_coeff = _PSUM_PER_CORE_ELEM_US if shared_weight else _BMM_PSUM_PER_CORE_ELEM_US
-    output_elems_per_core = (B * M * N) / max(1, b * m * n)
+    output_elems_per_core = (B * M * N) / (b * m * n)
     psum_us = max(0, k - 1) * output_elems_per_core * psum_coeff
 
     # Tie-break: among compute-equivalent splits prefer exposing enough M lanes
@@ -1430,11 +1482,9 @@ def _matmul_split_cost(
         _M_MIN,
         min(max_cores // 2, max(1, M // (_TARGET_M_TIE_PASSES * _PT_ROWS))),
     )
-    m_lane_underuse_us = (
-        max(0.0, math.log2(target_m / max(1, m))) * _M_LANE_UNDERUSE_PENALTY_US
-    )
+    m_lane_underuse_us = max(0.0, log2(target_m / m)) * _M_LANE_UNDERUSE_PENALTY_US
     m_tile_underfill_us = (
-        max(0.0, math.log2(_M_TILE_UNDERFILL_TARGET / max(1, m_t)))
+        max(0.0, log2(_M_TILE_UNDERFILL_TARGET / max(1, m_t)))
         * _M_TILE_UNDERFILL_PENALTY_US
     )
 
@@ -1443,8 +1493,7 @@ def _matmul_split_cost(
     # are not pulled away from PT-friendly M tiles.
     n_t = N // n if n else N
     wide_n_us = (
-        max(0.0, math.log2(max(1, n_t) / _TARGET_N_TILE_ELEMS))
-        * _WIDE_N_TILE_PENALTY_US
+        max(0.0, log2(max(1, n_t) / _TARGET_N_TILE_ELEMS)) * _WIDE_N_TILE_PENALTY_US
     )
 
     # Once M is large enough to feed the PT, prefer tile shapes that avoid
@@ -1454,45 +1503,48 @@ def _matmul_split_cost(
     # means avoiding very wide per-core N tiles when the whole projection is
     # narrow enough that more N lanes are available. Both effects are expressed
     # as ratios rather than op names or workload-specific shapes.
-    filled_m_tile_factor = 1.0 if m_t >= _M_TILE_UNDERFILL_TARGET else 0.0
-    true_bmm_value_split_us = (
-        0.0
-        if shared_weight or n <= 1
-        else filled_m_tile_factor
-        * max(0.0, math.log2(max(1, K) / max(1, N)))
-        * math.log2(n)
-        * _LARGE_M_TILE_SHAPE_PENALTY_US
-    )
-    shared_narrow_tile_us = (
-        0.0
-        if not shared_weight
-        else filled_m_tile_factor
-        * max(0.0, math.log2(_SHARED_NARROW_OUTPUT_REF / max(1, N)))
-        * max(0.0, math.log2(max(1, n_t) / _SHARED_N_TILE_TARGET))
-        * (_LARGE_M_TILE_SHAPE_PENALTY_US / 4)
-    )
-    shared_down_n_split_us = (
-        0.0
-        if not shared_weight or n <= 1
-        else max(0.0, math.log2(max(1, K) / max(1, N)))
-        * math.log2(n)
-        * _SHARED_DOWN_N_SPLIT_PENALTY_US
-    )
-    large_m_tile_shape_us = (
-        true_bmm_value_split_us + shared_narrow_tile_us + shared_down_n_split_us
-    )
+    # filled_m_tile_factor = 1.0 if m_t >= _M_TILE_UNDERFILL_TARGET else 0.0
+    # TODO: Remove special casing symbolic
+    if not is_symbolic:
+        filled_m_tile_factor = 1.0 if m_t >= _M_TILE_UNDERFILL_TARGET else 0.0
+        true_bmm_value_split_us = (
+            0.0
+            if shared_weight or n <= 1
+            else filled_m_tile_factor
+            * max(0.0, log2(max(1, K) / max(1, N)))
+            * log2(n)
+            * _LARGE_M_TILE_SHAPE_PENALTY_US
+        )
+        shared_narrow_tile_us = (
+            0.0
+            if not shared_weight
+            else filled_m_tile_factor
+            * max(0.0, log2(_SHARED_NARROW_OUTPUT_REF / max(1, N)))
+            * max(0.0, log2(max(1, n_t) / _SHARED_N_TILE_TARGET))
+            * (_LARGE_M_TILE_SHAPE_PENALTY_US / 4)
+        )
+        shared_down_n_split_us = (
+            0.0
+            if not shared_weight or n <= 1
+            else max(0.0, log2(max(1, K) / max(1, N)))
+            * log2(n)
+            * _SHARED_DOWN_N_SPLIT_PENALTY_US
+        )
+        large_m_tile_shape_us = (
+            true_bmm_value_split_us + shared_narrow_tile_us + shared_down_n_split_us
+        )
+    else:
+        large_m_tile_shape_us = 0.0
 
     # Prefer using the full core budget, but keep this soft so measured-good
     # lower-core candidates can still win.
     core_underuse_us = (
-        max(0.0, math.log2(max_cores / cores_used)) * _CORE_UNDERUSE_PENALTY_US
+        max(0.0, log2(max_cores / cores_used)) * _CORE_UNDERUSE_PENALTY_US
     )
 
     # True BMMs often need batch parallelism to avoid tiny-M underfill. Charge a
     # small additive split overhead instead of multiplying the whole estimate.
-    batch_split_us = (
-        0.0 if shared_weight else math.log2(max(1, b)) * _BMM_BATCH_SPLIT_PENALTY_US
-    )
+    batch_split_us = 0.0 if shared_weight else log2(b) * _BMM_BATCH_SPLIT_PENALTY_US
 
     return (
         compute_us

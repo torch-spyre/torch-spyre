@@ -102,6 +102,15 @@ from torch_spyre._inductor.scratchpad.lx_relayout import (
     collect_lx_relayout_plans,
     materialize_lx_relayouts,
 )
+from torch_spyre._inductor.cost_model import CostParams
+
+_COST_PARAMS = CostParams(
+    # we need a expression of both compute, mem_t
+    # whereas the default gives max(compute, mem_t)
+    # which optimizes compute only when there's a matmul
+    overlap_gamma=0.46,
+    use_bundled_cost_model=False,
+)
 
 logger = get_inductor_logger("scratchpad.allocator")
 
@@ -269,7 +278,7 @@ class ScratchpadAllocator:
         self._run_passes(self.pre_optimization_passes, graph)
         buffers = self._prepare_buffers(graph)
         solver = self._build_solver(buffers)
-        allocation = self._solve(solver)
+        allocation = self._solve(solver, graph)
         accepted_lx_relayouts = self._finalize_lx_relayout_allocation(allocation)
         self._post_solve(graph, allocation)
         reasons = self._get_spill_reasons(solver, allocation)
@@ -304,7 +313,7 @@ class ScratchpadAllocator:
         self._append_lx_relayout_destinations(graph, buffers)
         return buffers
 
-    def _solve(self, solver: MemoryPlanSolver) -> Sequence[Any]:
+    def _solve(self, solver: MemoryPlanSolver, graph: GraphLowering) -> Sequence[Any]:
         """Assign LX addresses. Base: placement-only ``plan_layout``."""
         return solver.plan_layout(log_lx_usage=True)
 
@@ -1605,13 +1614,73 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         )
         return buffers
 
-    def _solve(self, solver: MemoryPlanSolver) -> Sequence[Any]:
+    def _solve(self, solver: MemoryPlanSolver, graph: GraphLowering) -> Sequence[Any]:
         assert isinstance(solver, CoreDivisionLayoutSolver)
-        result = solver.plan_layout_and_core_divisions()
+        bufmap = {buf.name: buf for buf in solver.buffers}
+
+        # Keyed by buffer name, which is what ``predict_by_bundle`` needs to match
+        # features to the ops in each estimated bundle. ``mem_usage_by_buf`` keys
+        # on ``op.name`` over ``graph.operations``, so every feature here belongs
+        # to an op the grouping will see -- a feature whose buffer is absent from
+        # ``graph.operations`` would silently drop out of the objective.
+        mem_usage = mem_usage_by_buf(graph)
+        op_features = {}
+        for output_name in mem_usage:
+            if not isinstance(graph.get_buffer(output_name), ComputedBuffer):
+                continue
+            if output_name not in bufmap:
+                continue
+            op_features[output_name] = self._extract_op_features(
+                graph, output_name, bufmap
+            )
+
+        from torch_spyre._inductor.cost_model import predict_by_bundle
+
+        # Logged, not asserted: dropping a buffer from the objective changes what
+        # the solver optimizes without failing anything, so it has to be visible,
+        # but it is not worth killing a plan over. Empty today.
+        unscored = set(op_features) - {
+            getattr(op, "name", None) for op in graph.operations
+        }
+        if unscored:
+            logger.debug(
+                "cost objective omits %d buffer(s) absent from graph.operations: %s",
+                len(unscored),
+                sorted(unscored),
+            )
+
+        # Scored one estimated bundle at a time, not as a single whole-graph
+        # kernel: bundle membership decides input dedup, the arity derate and the
+        # underfill derate, so a graph that fuses into several kernels is
+        # mispriced when scored flat.
+        try:
+            cost_expr = sympy.sympify(
+                predict_by_bundle(graph.operations, op_features, params=_COST_PARAMS)
+            )
+        except (ValueError, RuntimeError):
+            cost_expr = None
+        result = solver.plan_layout_and_core_divisions(cost_expr)
         assert not any(buffer.lx_relayout_plans for buffer in result), (
             "CoOptimizingAllocator does not support LX relayout"
         )
         return result
+
+    def _extract_op_features(self, graph, output_name, buffers):
+        """Build symbolic OpFeatures for one ComputedBuffer op (best-effort).
+
+        Same extraction as dump_cost_model.extract_op_features, but keyed off
+        each buffer's *symbolic* is_lx/cores/core-division vars (sym_is_lx,
+        sym_core_divs) instead of concrete values, so the
+        resulting OpFeatures can be fed to predict_ops() to build a cost
+        expression over the solver's own decision variables.
+        """
+        from torch_spyre._inductor.dump_cost_model import extract_op_features
+        from torch_spyre._inductor.scratchpad.sa_cooptimizer import _work_slices
+
+        sym_core_divs = buffers[output_name].sym_core_divs
+        op = graph.get_buffer(output_name)
+        ws = _work_slices(op, CoreDivision(sym_core_divs[0], sym_core_divs[1]))
+        return extract_op_features(op, ws, buffers=buffers)
 
     def _post_solve(self, graph: GraphLowering, allocation: Sequence[Any]) -> None:
         # The divisions must be committed such that any buffer clones can correctly
