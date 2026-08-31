@@ -21,6 +21,7 @@
 #include <c10/core/Stream.h>
 
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
@@ -283,16 +284,31 @@ void SpyreStream::launch(const JobPlan& plan,
                 " must be on Spyre device, got ", args[i].device());
   }
 
+  // Two-stream overlap topology:
+  //   S_dev  = this stream (the default) — Compute (+ D2H).
+  //   S_prep = the persistent host-compute stream — HostCompute + H2D.
+  // Compute overlaps HC/H2D because they run on different streams; every op
+  // keeps pipeline_barrier=true (per-stream FIFO). S_prep must be the same
+  // persistent flex handle each launch: getHostComputeStreamById is a pure
+  // lookup of the handle registered once in initializeStreamPoolImpl.
+  const SpyreStream& s_dev = *this;
+  const SpyreStream s_prep =
+      getHostComputeStreamById(kHostComputeStreamStartPerDevice, device());
+
   // Create launch context with tensor arguments and typed symbolic payload.
   // symbolic_args is moved in so the closure in
   // JobPlanStepHostCompute::construct can capture it by value without an extra
   // copy.
   LaunchContext ctx{args, std::move(symbolic_args)};
 
-  // Each JobPlanStep builds its flex operation params and launches them on
-  // this stream in order. flex owns the RuntimeOperation lifecycle.
+  // Split Prep-role steps onto S_prep only when the flex tracker is on; flex
+  // then inserts the cross-stream edges. Off = every step on S_dev (the
+  // single-stream floor). Routing keys on role(), so all-Dev plans never split.
+  const bool should_split = get_hazard_tracker_enabled();
   for (const auto& step : plan.steps) {
-    step->construct(ctx, *this);
+    const SpyreStream& target =
+        (should_split && step->role() == StreamRole::Prep) ? s_prep : s_dev;
+    step->construct(ctx, target);
   }
 }
 
@@ -332,7 +348,9 @@ void initializeStreamPoolImpl(c10::DeviceIndex device_index) {
         " is already registered; only one Spyre device per process is "
         "supported.");
     pool.stream_handle_map[sid] =
-        runtime->createStream(flex::RuntimeStreamPriority::NORMAL);
+        runtime->createStream(flex::RuntimeStreamPriority::NORMAL,
+                              flex::RuntimeStreamMode::STRICT_ORDERING,
+                              /*track_hazards=*/get_hazard_tracker_enabled());
     pool.host_compute_streams[device_index].push_back(sid);
   }
   pool.next_host_compute_idx[device_index] = 0;
@@ -483,7 +501,9 @@ SpyreStream getStreamFromPool(c10::Device device, int priority) {
     flex::RuntimeStreamPriority streamPriority =
         priority < 0 ? flex::RuntimeStreamPriority::HIGH
                      : flex::RuntimeStreamPriority::NORMAL;
-    flex::RuntimeStream* flex_handle = runtime->createStream(streamPriority);
+    flex::RuntimeStream* flex_handle = runtime->createStream(
+        streamPriority, flex::RuntimeStreamMode::STRICT_ORDERING,
+        /*track_hazards=*/get_hazard_tracker_enabled());
     pool.stream_handle_map[stream_id] = flex_handle;
   }
 

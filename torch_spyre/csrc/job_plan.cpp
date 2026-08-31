@@ -314,4 +314,132 @@ std::ostream& operator<<(std::ostream& os, const JobPlan& plan) {
   return os;
 }
 
+StepKind classifyStep(const JobPlanStep& step) {
+  if (dynamic_cast<const JobPlanStepHostCompute*>(&step)) {
+    return StepKind::HostCompute;
+  }
+  if (dynamic_cast<const JobPlanStepH2D*>(&step)) {
+    return StepKind::H2D;
+  }
+  if (dynamic_cast<const JobPlanStepD2H*>(&step)) {
+    return StepKind::D2H;
+  }
+  if (dynamic_cast<const JobPlanStepCompute*>(&step)) {
+    return StepKind::Compute;
+  }
+  return StepKind::Unknown;
+}
+
+const char* stepKindName(StepKind kind) {
+  switch (kind) {
+    case StepKind::HostCompute:
+      return "HostCompute";
+    case StepKind::H2D:
+      return "H2D";
+    case StepKind::D2H:
+      return "D2H";
+    case StepKind::Compute:
+      return "Compute";
+    case StepKind::Unknown:
+    default:
+      return "Unknown";
+  }
+}
+
+StepKind stepKindFromName(const std::string& name) {
+  if (name == "HostCompute") return StepKind::HostCompute;
+  if (name == "H2D") return StepKind::H2D;
+  if (name == "D2H") return StepKind::D2H;
+  if (name == "Compute") return StepKind::Compute;
+  if (name == "Unknown") return StepKind::Unknown;
+  TORCH_CHECK(false, "Unknown StepKind name: ", name);
+}
+
+StreamRole streamRoleFromName(const std::string& name) {
+  if (name == "Prep") return StreamRole::Prep;
+  if (name == "Dev") return StreamRole::Dev;
+  TORCH_CHECK(false, "Unknown StreamRole name: ", name, " (expected Prep/Dev)");
+}
+
+std::string checkJobPlanStepOrdering(const std::vector<StepKind>& kinds,
+                                     const std::vector<StreamRole>& roles) {
+  if (kinds.size() != roles.size()) {
+    return "kinds/roles length mismatch";
+  }
+
+  // Gate: only validate plans built as HostCompute-led (the two-stream
+  // correction triple). A plan without a HostCompute is legacy single-stream
+  // and stays valid (backward-compat with the pre-overlap path: pure
+  // ComputeOnDevice, standalone D2H, tensor .to() moves).
+  bool has_host_compute = false;
+  for (StepKind k : kinds) {
+    if (k == StepKind::HostCompute) {
+      has_host_compute = true;
+    }
+  }
+  if (!has_host_compute) {
+    return "";
+  }
+
+  // Project into the two per-stream subsequences, preserving plan order.
+  std::vector<StepKind> prep;
+  std::vector<StepKind> dev;
+  for (size_t i = 0; i < kinds.size(); ++i) {
+    if (roles[i] == StreamRole::Prep) {
+      prep.push_back(kinds[i]);
+    } else {
+      dev.push_back(kinds[i]);
+    }
+  }
+
+  auto name_at = [](const std::vector<StepKind>& seq, size_t i) {
+    return std::string(i < seq.size() ? stepKindName(seq[i]) : "<end>");
+  };
+
+  // The contract is ordering-only, not an exact triple: prepare can emit longer
+  // plans (e.g. HostCompute -> H2D -> Compute -> D2H), which project to
+  // S_prep = [HostCompute, H2D] and S_dev = [Compute, D2H]. What must hold is
+  // the leading-producer guarantee: prep produces (HostCompute -> H2D) before
+  // dev consumes (Compute). On the HAZARD path torch-spyre emits no cross-
+  // stream event steps; flex derives the RAW/WAR edges from these subsequences.
+
+  // S_prep must BEGIN with HostCompute -> H2D and carry only {HostCompute, H2D}
+  // (the persistent host-compute stream; see StreamRole in job_plan.h).
+  {
+    if (prep.size() < 2 || prep[0] != StepKind::HostCompute ||
+        prep[1] != StepKind::H2D) {
+      return "S_prep ordering violation: prep stream must begin with "
+             "HostCompute -> H2D, got " +
+             name_at(prep, 0) + " -> " + name_at(prep, 1);
+    }
+    for (size_t i = 2; i < prep.size(); ++i) {
+      if (prep[i] != StepKind::HostCompute && prep[i] != StepKind::H2D) {
+        return "S_prep ordering violation: " + name_at(prep, i) +
+               " is not permitted on the prep stream (prep carries only "
+               "HostCompute / H2D)";
+      }
+    }
+  }
+
+  // S_dev must BEGIN with Compute (leading-producer guarantee) and carry only
+  // {Compute, D2H} (the device stream; see StreamRole in job_plan.h). No
+  // HostCompute/H2D -- host-produce steps belong on S_prep.
+  {
+    if (dev.empty() || dev[0] != StepKind::Compute) {
+      return "S_dev ordering violation: device stream must begin with Compute, "
+             "got " +
+             name_at(dev, 0);
+    }
+    for (size_t i = 1; i < dev.size(); ++i) {
+      if (dev[i] != StepKind::Compute && dev[i] != StepKind::D2H) {
+        return "S_dev ordering violation: " + name_at(dev, i) +
+               " is not permitted on the device stream (dev carries only "
+               "Compute / D2H)";
+      }
+    }
+  }
+
+  return "";
+}
+
 }  // namespace spyre

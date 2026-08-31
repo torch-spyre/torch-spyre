@@ -25,6 +25,7 @@
 #include <spyrecode-host-functions/sendataconvert/sen_data_convert.h>
 #include <util/sendefs/sendefs.h>
 
+#include <cstdint>
 #include <cstdlib>     // std::getenv
 #include <filesystem>  // NOLINT(build/c++17)
 #include <flex/flex.hpp>
@@ -76,6 +77,22 @@ void set_downcast_warn_enabled(bool enabled) {
   g_downcast_warn_enabled.store(enabled, std::memory_order_relaxed);
 }
 
+// SPYRE_HAZARD_TRACKER: on = split the correction triple across S_prep/S_dev
+// and let flex insert the cross-stream H2D->Compute edge. off = single-stream
+// floor (all on S_dev; FIFO enforces the edge). Default OFF to match flex: if
+// we split but flex isn't tracking, nothing enforces H2D->Compute and results
+// go wrong. Read once in init_from_env; latched into each stream's
+// track_hazards. Env-only by design: flex latches the same value at
+// RuntimeContext construction and cannot register the default stream
+// afterward, so there is no runtime setter -- a post-startup flip would leave
+// S_dev unregistered and route H2D to S_prep with no H2D->Compute edge minted.
+std::atomic<bool> g_hazard_tracker_enabled{
+    false};  // default OFF (matches flex)
+
+bool get_hazard_tracker_enabled() {
+  return g_hazard_tracker_enabled.load(std::memory_order_relaxed);
+}
+
 // Optional: initialize from env at module init
 static void init_from_env() {
   if (const char* v = std::getenv(SPYRE_DOWNCAST_ENV)) {
@@ -84,6 +101,15 @@ static void init_from_env() {
     for (auto& c : s) c = std::tolower(c);
     bool enable = !(s == "0" || s == "false" || s == "off");
     g_downcast_warn_enabled.store(enable, std::memory_order_relaxed);
+  }
+  // SPYRE_HAZARD_TRACKER: match flex's BooleanEnvVar grammar exactly, since
+  // flex reads the same var. On = {"1","true","t","yes","y"} (case-sensitive);
+  // anything else is off. Defaults OFF when unset.
+  if (const char* v = std::getenv("SPYRE_HAZARD_TRACKER")) {
+    const std::string s(v);
+    const bool enable =
+        (s == "1" || s == "true" || s == "t" || s == "yes" || s == "y");
+    g_hazard_tracker_enabled.store(enable, std::memory_order_relaxed);
   }
 }
 
@@ -119,10 +145,13 @@ void _startRuntime() {
               "Device index out of bounds. logical_device_id=",
               logical_device_id, ", number of visible devices=", num_devices);
 
+  // create() never returns null: it returns the singleton or throws.
   flex::RuntimeContext* runtime =
       flex::RuntimeContext::create(logical_device_id);
   init_from_env();
   GlobalRuntime::set(runtime);
+  // SPYRE_HAZARD_TRACKER (read in init_from_env) is latched per stream at
+  // creation via track_hazards; nothing to toggle on the runtime here.
   DEBUGINFO("runtime started with logical_device_id ", logical_device_id);
 }
 void startRuntime() {
@@ -371,6 +400,8 @@ PYBIND11_MODULE(_C, m) {
         "Return whether downcast warnings are enabled.");
   m.def("set_downcast_warning", &spyre::set_downcast_warn_enabled,
         "Enable/disable downcast warnings for this process.");
+  m.def("get_hazard_tracker_enabled", &spyre::get_hazard_tracker_enabled,
+        "Whether the flex per-region hazard tracker is enabled.");
   m.def("get_elem_in_stick", &spyre::get_elem_in_stick);
   m.def("get_device_dtype", &spyre::get_device_dtype);
 
@@ -470,20 +501,10 @@ PYBIND11_MODULE(_C, m) {
           "get_step_type",
           [](const spyre::JobPlan& plan, size_t idx) {
             TORCH_CHECK(idx < plan.steps.size(), "Step index out of range");
-            const auto& step = plan.steps[idx];
-            if (dynamic_cast<const spyre::JobPlanStepH2D*>(step.get())) {
-              return "H2D";
-            } else if (dynamic_cast<const spyre::JobPlanStepD2H*>(step.get())) {
-              return "D2H";
-            } else if (dynamic_cast<const spyre::JobPlanStepCompute*>(
-                           step.get())) {
-              return "Compute";
-            } else if (dynamic_cast<const spyre::JobPlanStepHostCompute*>(
-                           step.get())) {
-              return "HostCompute";
-            } else {
-              return "Unknown";
-            }
+            // Single source of truth for step-type identification (also used by
+            // the P2-14 ordering validator). Returns
+            // HostCompute/H2D/D2H/Compute or Unknown.
+            return spyre::stepKindName(spyre::classifyStep(*plan.steps[idx]));
           },
           py::arg("idx"), "Get the type of step at the given index")
       .def(
@@ -494,6 +515,15 @@ PYBIND11_MODULE(_C, m) {
           },
           py::arg("idx"),
           "Get the pipeline_barrier flag for the step at the given index")
+      .def(
+          "get_step_stream_role",
+          [](const spyre::JobPlan& plan, size_t idx) {
+            TORCH_CHECK(idx < plan.steps.size(), "Step index out of range");
+            return plan.steps[idx]->role() == spyre::StreamRole::Prep ? "Prep"
+                                                                      : "Dev";
+          },
+          py::arg("idx"),
+          "Get the stream role (Prep/Dev) for the step at the given index")
       .def(
           "get_step_name",
           [](const spyre::JobPlan& plan,
@@ -583,6 +613,66 @@ PYBIND11_MODULE(_C, m) {
         "Calls JobPlanStepHostCompute::resolveSymbolicArgs — the same function "
         "used by the typed-payload resolution path at launch time — so the "
         "result is identical to what would be passed to deeptools.");
+
+  // ── Two-stream overlap: step-ordering validator + test hooks ──
+
+  // Direct binding of the pure P2-14 ordering checker so a role-misplacement
+  // rejection can be tested without constructing real steps (a real HostCompute
+  // needs a deeptools::Hcm + pinned buffers). Takes parallel lists of StepKind
+  // names ("HostCompute"/"H2D"/... per stepKindName) and StreamRole names
+  // ("Prep"/"Dev"), returns "" when valid or a human-readable error otherwise.
+  m.def(
+      "check_job_plan_step_ordering",
+      [](const std::vector<std::string>& kind_names,
+         const std::vector<std::string>& role_names) {
+        TORCH_CHECK(kind_names.size() == role_names.size(),
+                    "kind_names/role_names length mismatch: ",
+                    kind_names.size(), " vs ", role_names.size());
+        std::vector<spyre::StepKind> kinds;
+        std::vector<spyre::StreamRole> roles;
+        kinds.reserve(kind_names.size());
+        roles.reserve(role_names.size());
+        for (const auto& n : kind_names) {
+          kinds.push_back(spyre::stepKindFromName(n));
+        }
+        for (const auto& n : role_names) {
+          roles.push_back(spyre::streamRoleFromName(n));
+        }
+        return spyre::checkJobPlanStepOrdering(kinds, roles);
+      },
+      py::arg("kind_names"), py::arg("role_names"),
+      "Validate a projected two-stream step ordering; '' if valid else the "
+      "error message.");
+
+  // ── Test-only validator projection hook (#7a) ──
+  // Projects a REAL prepared plan's steps through the SAME path validate()
+  // uses -- classifyStep(*step) + step->role() -- in a caller-specified index
+  // order, then runs the ordering checker. Exercises the JobPlanStep->(kind,
+  // role) projection end-to-end, where a real plan-wiring bug would live (the
+  // check_job_plan_step_ordering binding takes name lists and bypasses this
+  // projection). Passing a permuted `order` injects a role-ordering
+  // violation over the real step objects. Returns '' if valid else the error.
+  m.def(
+      "_test_project_and_check_ordering",
+      [](const spyre::JobPlan& plan, const std::vector<size_t>& order) {
+        std::vector<spyre::StepKind> kinds;
+        std::vector<spyre::StreamRole> roles;
+        kinds.reserve(order.size());
+        roles.reserve(order.size());
+        for (size_t idx : order) {
+          TORCH_CHECK(idx < plan.steps.size(),
+                      "_test_project_and_check_ordering: step index ", idx,
+                      " out of range (", plan.steps.size(), " steps)");
+          const auto& step = plan.steps[idx];
+          kinds.push_back(spyre::classifyStep(*step));
+          roles.push_back(step->role());
+        }
+        return spyre::checkJobPlanStepOrdering(kinds, roles);
+      },
+      py::arg("plan"), py::arg("order"),
+      "TEST-ONLY: project REAL plan steps (classifyStep + role(), exactly as "
+      "validate() does) in the given index order, then run the ordering "
+      "checker. Returns '' if valid else the error message.");
 
   // Allocator statistics functions
   m.def(
