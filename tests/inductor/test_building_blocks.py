@@ -168,6 +168,86 @@ class TestBuildingBlocks(unittest.TestCase):
         # Compare with cpu implementation
         compare_with_cpu(rms_norm, *args, cpu_compile=True)
 
+    def test_residual_rms_norm_fp32_upcast(self):
+        # Regression for the mixed-EA layout gate in
+        # _multi_arg_pointwise_layouts. A residual add feeding an fp32-upcast
+        # RMSNorm: the add is a computed buffer that gives the upcast -- and
+        # thus the reduction-broadcast operand (rsqrt) -- multiple layout
+        # candidates, one with its device stick on a non-broadcast axis. The old
+        # gate rejected the broadcast mul if ANY candidate was non-broadcast; it
+        # now prunes to the broadcast candidate (case 3.1). WITHOUT the residual
+        # add the operand got only the broadcast candidate and compiled, so the
+        # residual add is essential to the repro.
+        B, S, H = 1, 64, 1024
+        eps = 1e-6
+        hidden = torch.randn(B, S, H, dtype=torch.float16)
+        residual = torch.randn(B, S, H, dtype=torch.float16)
+        weight = torch.randn(H, dtype=torch.float16)
+
+        def residual_rms_norm(hidden, residual, weight):
+            x = (hidden + residual).to(torch.float32)
+            var = x.pow(2).mean(-1, keepdim=True)
+            normed = x * torch.rsqrt(var + eps)
+            return weight * normed.to(torch.float16)
+
+        # Spyre eager mishandles the fp32-upcast staggered layout (a separate,
+        # pre-existing issue), so validate the compiled path only.
+        compare_with_cpu(
+            residual_rms_norm,
+            hidden,
+            residual,
+            weight,
+            cpu_compile=False,
+            run_eager=False,
+        )
+
+    def test_mixed_ea_staggered_broadcaster_fp16(self):
+        # Case 3.2 of the mixed-EA rule: the *staggered* operand is the
+        # size-1-stick broadcaster (fp16 produced by an fp32->fp16 downcast,
+        # FP32_TO_DL16) combined with a STANDARD full operand. A broadcastable
+        # staggered operand is physically identical to STANDARD of that shape, so
+        # the op is allowed (STANDARD output).
+        x = torch.randn(4, 1, dtype=torch.float32)  # -> .to(f16): staggered bcast
+        w = torch.randn(4, 64, dtype=torch.float16)  # STANDARD full
+
+        def fn(x, w):
+            return torch.add(x.to(torch.float16), w)
+
+        compare_with_cpu(fn, x, w, cpu_compile=False, run_eager=False)
+
+    def test_mixed_ea_staggered_broadcaster_fp32(self):
+        # Case 3.2 with an fp32-physical staggered broadcaster (DL16_TO_FP32).
+        # The mixed-EA gate ALLOWS it (physically the equivalent all-STANDARD fp32
+        # broadcast), but the codegen doesn't yet emit an fp32 broadcast along
+        # the stick axis. The same crash hits a pure-STANDARD fp32
+        # [4,1]+[4,64] broadcast, so it is a separate, pre-existing codegen gap
+        # tracked in https://github.com/torch-spyre/torch-spyre/issues/4132.
+        #
+        # We assert the failure originates in *codegen*, not the mixed-EA layout
+        # gate: a plain @unittest.expectedFailure would also stay green if a future
+        # change re-tightened the gate and raised `Unsupported` before codegen,
+        # masking a regression of the path this test guards. So we require the
+        # error to be a codegen failure and NOT the gate's "mixed EA"
+        # Unsupported. Flip this to a compare_with_cpu once codegen lands.
+        x = torch.randn(4, 1, dtype=torch.float16)  # -> .to(f32): staggered bcast
+        w = torch.randn(4, 64, dtype=torch.float32)  # STANDARD full
+
+        def fn(x, w):
+            return torch.add(x.to(torch.float32), w)
+
+        with self.assertRaises(Exception) as ctx:
+            compare_with_cpu(fn, x, w, cpu_compile=False, run_eager=False)
+        msg = str(ctx.exception)
+        self.assertNotIn(
+            "Multi-arg pointwise with mixed EA",
+            msg,
+            f"expected a codegen failure, but the mixed-EA gate rejected it: {msg}",
+        )
+        self.assertTrue(
+            any(k in msg for k in ("dxp_standalone", "ddc", "sbf-")),
+            f"expected a ddc/dxp codegen-stage failure, got: {msg[:300]}",
+        )
+
     def test_flash_attention(self):
         B, H, L, D = 1, 8, 256, 64
         block_size = 128

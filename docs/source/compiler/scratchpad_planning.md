@@ -62,7 +62,7 @@ The compiler picks which buffers live where.
 | Usable LX per core | ~1.55 MB | `round_up_128(int(((2<<20) - (64<<10)) * (1 - frac_avail)))` |
 | Alignment | 128-byte (stick) | implicit |
 | Cores | 1 to 32 | `SENCORES` |
-| Per-core HBM span limit | (255.996 MiB) | hardware, separate from LX |
+| Per-core HBM span limit | (256 MB) | hardware, separate from LX |
 | Inter-core data ring | yes | not yet used by compiler |
 | Inter-core reduce-sum ring | yes | not yet used by compiler |
 
@@ -150,7 +150,7 @@ insert_post_mutation_restickify
 insert_bmm_padding
 dedup_and_promote_constants
 _maybe_coarse_tile_span_overflow      # span-overflow coarse tiling (post-stickification)
-span_reduction                        # work-division: enforce 255.996 MiB span
+span_reduction                        # work-division: enforce 256 MB span
 cost_model_matmul_division            # work-division: matmul cost model
 work_distribution                     # work-division: default distributor
 _maybe_scratchpad_planning            # ← THIS PASS, gated by config.lx_planning
