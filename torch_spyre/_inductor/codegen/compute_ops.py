@@ -380,7 +380,7 @@ def gen_coord_info_value(
                     {"factor_": nsplits, "label_": "core_fold"},
                     {"factor_": 1, "label_": "corelet_fold"},
                     {"factor_": 1, "label_": "row_fold"},
-                    {"factor_": (size // 128), "label_": "elem_arr_3"},
+                    {"factor_": -(-size // 128), "label_": "elem_arr_3"},
                     {"factor_": 8, "label_": "elem_arr_2"},
                     {"factor_": 2, "label_": "elem_arr_1"},
                     {"factor_": 8, "label_": "elem_arr_0"},
@@ -411,9 +411,9 @@ def gen_coord_info_value(
                     {"factor_": 1, "label_": "corelet_fold"},
                     {"factor_": 1, "label_": "row_fold"},
                     {
-                        "factor_": 1
-                        if is_stick_reduction
-                        else (size // elems_per_stick),
+                        "factor_": (
+                            1 if is_stick_reduction else -(-size // elems_per_stick)
+                        ),
                         "label_": "elem_arr_1",
                     },
                     {"factor_": elems_per_stick, "label_": "elem_arr_0"},

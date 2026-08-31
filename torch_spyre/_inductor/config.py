@@ -179,7 +179,6 @@ sdsc_cache: bool = os.environ.get("SPYRE_INDUCTOR_SDSC_CACHE", "1") == "1"
 # joint-ness is selected by ``co_optimizing_lx_planning``; for the gap-based
 # solvers that same flag instead wraps them in ExhaustiveSearchSolver.
 
-# TODO(isuruf): Change to firstfit when deeptools PR4298 lands
 layout_solver: Literal[
     "greedy", "bestfit", "firstfit", "cpsat", "simulated_annealing"
 ] = os.environ.get("LAYOUT_SOLVER", "cpsat")  # type: ignore[assignment]
@@ -196,5 +195,8 @@ validate_op_specs: bool = os.environ.get("SPYRE_VALIDATE_OP_SPECS", "1") == "1"
 # to force the pure-Python packer. A missing native class is a stale or
 # incomplete build, not a supported mode, and raises rather than falling back.
 native_layout_packer: bool = _get_env_bool("TORCH_SPYRE_NATIVE_PACKER", True)
+
+# When symbolic cost_expr fails, use the fallback cost instead of erroring out
+_cpsat_warn_on_cost_expr: bool = True
 
 install_config_module(sys.modules[__name__])
