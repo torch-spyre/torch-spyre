@@ -32,8 +32,6 @@ hbm_pool_planning: bool = _get_env_bool("HBM_POOL_PLANNING", True)
 # spyre_empty_with_layout) and pass its address in as %pool_base_addr.
 frontend_pool_allocation: bool = _get_env_bool("FRONTEND_POOL_ALLOCATION", False)
 
-global_stick_optimizer: bool = os.environ.get("GLOBAL_STICK_OPTIMIZER", "1") == "1"
-
 # Emit a native conv2d SDSC (opFuncName="conv2d" on the "pt" unit) instead of
 # the im2col+matmul decomposition (conv2d_via_bmm_decomp). Off by default: the
 # decomposition remains the default path and the fallback for cases the direct
