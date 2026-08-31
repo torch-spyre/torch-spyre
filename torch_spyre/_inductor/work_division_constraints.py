@@ -32,6 +32,7 @@ from sympy import Expr, Symbol, divisors
 
 from torch._inductor.dependencies import MemoryDep
 from torch._inductor.ir import ComputedBuffer, Pointwise, Reduction
+from torch._inductor.utils import sympy_index_symbol
 from torch_spyre._C import ElementArrangement
 
 from .constants import (
@@ -53,6 +54,8 @@ from .pass_utils import (
     op_read_writes,
 )
 from .logging_utils import get_inductor_logger
+from .propagate_hints import get_op_hints
+from .wsr.coarse_tile import _raw_to_squeezed_pos
 from . import config
 
 if typing.TYPE_CHECKING:
@@ -107,6 +110,8 @@ def collect_work_division_constraints(
         coordinate_mask_blocked_vars,
         conv_spatial_blocked_vars,
         reduction_window_blocked_vars,
+        coarse_tile_local_dim_split_domains,
+        plain_reduction_k_split_domains,
         restickify_padding_blocked_vars,
         qfp8wt_split_domains,
         qfp8wt_matmul_k_split_domains,
@@ -257,6 +262,269 @@ def reduction_window_blocked_vars(ctx: WorkDivConstraintContext) -> ConstraintRe
         return ConstraintResult()
 
     return ConstraintResult(blocked=set(window_dims))
+
+
+# These ops have dedicated cross-core hardware/codegen combine support
+# (matmul: PSUM accumulation; topk/keep_by_index/pool/conv: dedicated
+# combine codegen), so a K-split across cores is safe. Plain elementwise
+# reductions like sum/max/min/xor_sum/any are deliberately absent: they use
+# coarse_tile.py's own outer-loop accumulate path (_insert_combine_op)
+# instead, which is a different mechanism and does not enable a cross-core
+# K-split -- their absence here is not an oversight to "fix" by adding them.
+_K_SPLIT_COMBINE_SUPPORTED = {
+    BATCH_MATMUL_OP,
+    BATCH_MATMUL_FP8_OP,
+    "topkvalue",
+    "topkindex",
+    KEEP_BY_INDEX_OP,
+    *POOL_OPS,
+    CONV2D_FWD_OP,
+    DEPTHWISE_CONV2D_OP,
+}
+
+# Generated scratch-copy ops (coarse_tile.py's _insert_all_read_copy_ops /
+# _insert_reduce_copy_op) inherit their tiled dims from the sizing op they
+# copy for, but their own write is per-tile scratch reused in place and
+# never advances (see PropagationPlan(kind="loop_internal")) -- no sibling op
+# in the fused loop body depends on which cores a copy op's OWN internal
+# work is split across the way it depends on a self-planning op's shared
+# coarse-tile-local loop variable. A copy op's read, by contrast, is often
+# into the full, un-tiled source tensor, so splitting its tile-local dims
+# across cores is exactly what lets the normal per-core span-limit search
+# (raise_if_per_core_overflow) shrink that read's footprint -- pinning them
+# to 1 forecloses that and can make an otherwise-legal plan look
+# Unsupported (confirmed: test_copy_running_max_4d_H4_Lq4 fails with
+# "per-core tensor span ... exceeds hardware limit" once its read-copy op's
+# H/Lq dims are pinned, and passes once they aren't).
+#
+# These prefixes are matched cross-module against names coarse_tile.py
+# constructs via V.graph.qualify_name: "coarse_tile_read_copy_..." in
+# _insert_all_read_copy_ops, and "coarse_tile_reduce_copy_..." in
+# _insert_reduce_copy_op and its _insert_combine_op/reduction-drain
+# call sites. If either naming site changes, update this tuple to match.
+_GENERATED_COPY_OP_PREFIXES = ("coarse_tile_read_copy_", "coarse_tile_reduce_copy_")
+
+
+def _hinted_work_div_syms(ctx: WorkDivConstraintContext) -> set[Symbol]:
+    """Symbols in ``ctx.it_space`` that carry an explicit user ``work_div`` hint.
+
+    Mirrors ``_resolve_work_div_hint``'s name->symbol resolution
+    (work_division.py) so a dim the user explicitly asked to split can be
+    recognized here too, without importing work_division.py itself (it
+    imports this module, so importing back would be circular). Kept as a
+    plain set of symbols, not a split-count dict: this function only needs
+    to know which symbols to leave unpinned -- the actual requested split
+    value is validated and applied later, by work_division.py's own
+    ``_apply_user_hint``.
+    """
+    dim_to_split: dict[str, int] = {}
+    for _, hint_dict in sorted(get_op_hints(ctx.op).items()):
+        dim_to_split.update(hint_dict.get("work_div") or {})
+    if not dim_to_split:
+        return set()
+
+    loop_var_dims = getattr(ctx.op, "work_div_loop_info", {})
+    hinted: set[Symbol] = set()
+    for name in dim_to_split:
+        for sym in ctx.it_space:
+            if name in loop_var_dims.get(sym, []):
+                hinted.add(sym)
+                break
+    return hinted
+
+
+def coarse_tile_local_dim_split_domains(
+    ctx: WorkDivConstraintContext,
+) -> ConstraintResult:
+    """Pin every coarse-tile-local dim's work-division split to 1, on every op.
+
+    ``allowed_splits`` values are core-partition *counts* (legal divisors of
+    a dim's extent), not the extent itself -- ``multi_dim_iteration_space_split``
+    (work_division.py) initializes every dim's split to 1 by default, meaning
+    "one partition covers the dim's full extent, walked serially inside the
+    op's own loop" (see ``TensorWorkDivision.work_slices``'s docstring in
+    ``op_spec.py``). A coarse-tile-local dim's extent is already the correct
+    per-tile size decided by coarse_tile.py's own loop nest; work_division
+    must never fragment it further across cores, or two ops in the same
+    fused loop body could disagree about which core owns which slice of that
+    dim (``committed_splits``/ownership is keyed by split count, so a split
+    other than the deliberate, uniform value of 1 breaks that agreement).
+    ``work_distribution``/``span_reduction`` divide each op in the graph
+    independently, so without this pin an op's own greedy, size-priority core
+    search (``_default_split`` -> ``multi_dim_iteration_space_split``) could
+    otherwise choose a split > 1 for a dim that must stay whole -- confirmed
+    by a minimal B+H coarse-tiled matmul repro producing stale cross-tile
+    data when that happened.
+
+    Skips generated scratch-copy ops entirely (see
+    ``_GENERATED_COPY_OP_PREFIXES``): a copy op's own tile-local dims are not
+    shared, cross-op, ownership the way a self-planning op's loop variable
+    is, and pinning them can defeat the per-core span-limit search on a copy
+    whose read spans the full, un-tiled source tensor.
+
+    ``coarse_tile.py`` stamps ``op.loop_info`` (a ``CoarseTileInfo``) on every
+    op it tiles. ``loop_tiled_dims``/``loop_tiled_reduction_dims`` name tiled
+    dims by *raw position into ``op.data.ranges``/``reduction_ranges``*.
+    Historically this raw numbering was only self-consistent for an op that
+    planned its own tiling: a generated read-copy op
+    (``_insert_all_read_copy_ops``, coarse_tile.py) used to inherit
+    ``loop_tiled_dims``/``loop_tiled_reduction_dims`` verbatim from the
+    *sizing op* it copies for, still numbered in the sizing op's ranges,
+    which can disagree with the copy's own ``data.ranges``
+    position-for-position (issue: a minimal B+H coarse-tiled matmul repro
+    produced ``Unsupported: Cannot satisfy mandatory split 64 for d1 within
+    32 cores``, tracing to exactly this: the copy's own D axis at position 1
+    misread as the sizing op's H axis). ``coarse_tile.py`` now recomputes
+    ``loop_tiled_dims``/``loop_tiled_reduction_dims`` for a generated copy in
+    the copy's own raw-position space too (from the same ``read_level_extents``
+    data used for ``tiled_dims_per_read``), so ``loop_tiled_dims`` is now sound
+    to read directly for every op, self-planning or copy.
+
+    ``loop_tiled_dims`` must be the primary source (not
+    ``tiled_dims_per_read``/``output_tiled_dims``): for a self-planning op
+    whose only read is of a generated copy buffer,
+    ``tiled_dims_per_read``'s entry for that read is *deliberately* zeroed
+    by ``_insert_all_read_copy_ops`` (the copy is per-tile scratch reused in
+    place every iteration and "must not advance" -- the same
+    ``_fixed_level_extents`` convention used for a copy's own
+    ``output_tiled_dims``). That zeroing is correct for its own purpose
+    (building the copy-read's ``device_tile_advance_expr``) but leaves
+    ``tiled_dims_per_read``/``output_tiled_dims`` carrying no "is this op's
+    own dim tiled" signal at all for such an op -- confirmed by a direct
+    trace: ``buf0`` (reads only a generated copy) showed
+    ``tiled_dims_per_read=[[[], []]]``, ``output_tiled_dims=[]``, so this
+    constraint pinned nothing for ``buf0``'s own H/B dims, leaving them
+    exposed to the greedy search's independent, unpinned choice.
+    ``loop_tiled_dims`` has no such caveat: it is recomputed fresh from
+    ``ctx.op``'s own ranges at whichever point (self-planning or copy
+    construction) last stamped ``loop_info``, so it always reflects the
+    current op's own tiling.
+
+    Each raw position is translated to an ``ctx.it_space`` symbol via
+    ``ctx.op``'s own raw->squeezed table (mirroring
+    ``_raw_to_squeezed_pos``'s convention -- squeezed index ``i`` names
+    symbol ``d{i}``), the same bridge ``_tiled_dims_for_dep`` itself uses,
+    rather than an independent survivor-count walk that silently assumes
+    the raw numbering already matches ``ctx.op.data.ranges`` (that
+    assumption is what this function's docstring above documents as
+    trustworthy now, but the translation step itself must still go through
+    the table rather than being conflated with squeezed indices directly).
+
+    The symbol built from ``d{i}`` MUST use ``sympy_index_symbol`` (the same
+    constructor ``coarse_tile.py`` uses everywhere it builds a ``d{i}``
+    iteration symbol, e.g. its ``sizing_symbol``/``symbol`` locals), not a
+    plain ``sympy.Symbol`` -- ``sympy_index_symbol`` stamps extra assumptions
+    (``integer=True`` etc.) that make its symbols compare unequal to a
+    plain ``Symbol`` of the same name despite printing identically. Every
+    key in ``ctx.it_space`` is a ``sympy_index_symbol``, so a plain
+    ``Symbol(f"d{squeezed}")`` here silently fails every ``sym not in
+    ctx.it_space`` check and ``pin()`` never sets anything -- confirmed by
+    direct trace: for ``buf0``, ``sym`` printed as ``d0`` and
+    ``ctx.it_space`` printed as ``{d0: 2, ...}``, yet ``sym not in
+    ctx.it_space`` was ``True``. This was the actual reason this
+    constraint never forced any split, for any op, since it was written --
+    the coordinate-space/copy-op issues above are real but were never the
+    thing silently defeating this function; a mismatched ``Symbol``
+    constructor was.
+
+    ``loop_tiled_reduction_dims`` can be non-empty on an op whose own
+    ``data`` is a ``Pointwise`` with no ``reduction_ranges`` at all: a
+    reduction combine op (``_insert_combine_op``, coarse_tile.py)
+    deliberately inherits ``loop_tiled_reduction_dims`` verbatim from the
+    ``Reduction`` op it combines into, purely so the scheduler places it in
+    the same ``CountedLoopSchedulerNode`` -- the reduction dim has already
+    been reduced away and does not exist in the combine op's own iteration
+    space, so there is nothing of that dim left to pin here. Guard on
+    ``ctx.op.data`` actually exposing ``reduction_ranges`` before indexing
+    into it, rather than assuming a non-empty ``loop_tiled_reduction_dims``
+    implies one exists.
+    """
+    loop_info = getattr(ctx.op, "loop_info", None)
+    if loop_info is None:
+        return ConstraintResult()
+
+    if ctx.op.get_name().startswith(_GENERATED_COPY_OP_PREFIXES):
+        return ConstraintResult()
+
+    raw_to_squeezed = _raw_to_squeezed_pos(ctx.op)
+    hinted_syms = _hinted_work_div_syms(ctx)
+
+    def pin(pos: int, extent: Expr) -> None:
+        squeezed = raw_to_squeezed.get(pos)
+        if squeezed is None:
+            return
+        sym = sympy_index_symbol(f"d{squeezed}")
+        if sym not in ctx.it_space:
+            return
+        if sym in hinted_syms:
+            # The user explicitly asked (via spyre_hint(work_div=...)) to
+            # split this coarse-tile-local dim. Leave it unpinned here and
+            # let work_division.py's _apply_user_hint validate and apply the
+            # requested split -- it already checks divisibility, core
+            # budget, and consistency with every OTHER constraint's
+            # allowed_splits/blocked, so deferring to it does not reopen the
+            # unhinted-greedy-search hazard this function otherwise guards
+            # against for the remaining, un-hinted coarse-tile-local dims.
+            return
+        assert concretize_expr(extent) == concretize_expr(ctx.it_space[sym]), (
+            f"{ctx.op.get_name()}: tiled-dim extent {extent} for {sym} "
+            f"disagrees with its iteration-space extent {ctx.it_space[sym]}."
+        )
+        # allowed_splits values are core-partition COUNTS (divisors of the
+        # dim's extent), not the extent itself -- work_division.py's
+        # splits[var] defaults to 1 for every dim, meaning "one partition
+        # covers the dim's full extent, walked serially inside the op's own
+        # loop" (see TensorWorkDivision.work_slices' docstring). Pinning to
+        # {1} is what forces work_division to leave this coarse-tile-local
+        # dim whole rather than fragmenting it across cores -- every sibling
+        # constraint in this file (qfp8wt_split_domains,
+        # qfp8wt_matmul_k_split_domains, topk_split_domains,
+        # indirect_access_split_domains) uses the same frozenset({1}) idiom.
+        # Pinning to the extent itself (the old code here) asks
+        # work_division for a split count equal to the dim's size, which
+        # fails outright once that exceeds max_cores.
+        allowed_splits[sym] = frozenset({1})
+
+    allowed_splits: dict[Symbol, frozenset[int]] = {}
+    output_ranges = ctx.op.data.ranges
+    for level_dims in loop_info.loop_tiled_dims:
+        for pos in level_dims:
+            pin(pos, output_ranges[pos])
+
+    n_output_dims = len(output_ranges)
+    reduction_ranges = getattr(ctx.op.data, "reduction_ranges", None)
+    if reduction_ranges is not None:
+        for level_dims in loop_info.loop_tiled_reduction_dims:
+            for pos in level_dims:
+                pin(n_output_dims + pos, reduction_ranges[pos])
+
+    return ConstraintResult(allowed_splits=allowed_splits)
+
+
+def plain_reduction_k_split_domains(
+    ctx: WorkDivConstraintContext,
+) -> ConstraintResult:
+    """Forbid K-splits for reductions with no cross-core combine step.
+
+    Splitting a reduction dim across cores leaves each core holding a partial
+    result (e.g. a partial max over its own slice of the reduction range).
+    Matmul has PSUM hardware to combine those partial sums, and topk/
+    keep_by_index/pool/conv have their own dedicated combine or blocking
+    rules above. Every other reduction type (max, min, sum, prod, mean,
+    absmax, ...) has no combine step wired up anywhere in codegen: the
+    partial result is written out and never reduced further, silently
+    producing a wrong answer (issue: B+H coarse-tiled flash-attention amax,
+    where freeing up core budget let the generic work-division search reach
+    for a K-split on a plain `max` reduction). Restrict those to split=1
+    until a real combine mechanism exists for them.
+    """
+    if not isinstance(ctx.op.data, Reduction):
+        return ConstraintResult()
+    if ctx.op.data.reduction_type in _K_SPLIT_COMBINE_SUPPORTED:
+        return ConstraintResult()
+    return ConstraintResult(
+        allowed_splits={v: frozenset({1}) for v in ctx.reduction_vars}
+    )
 
 
 def restickify_padding_blocked_vars(

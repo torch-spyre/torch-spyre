@@ -933,12 +933,36 @@ class SpyreKernel(Kernel[CSEVariable]):
         raw_tiled_red_dims: list[list[int]] = (
             li.loop_tiled_reduction_dims if li is not None else []
         )
+        # A dim tiled down to a per-tile extent of 1 is squeezed out of the
+        # op's own iteration space entirely (no d{i} symbol survives), so it
+        # is invisible to loop_tiled_dims/loop_tiled_reduction_dims and can
+        # only advance via squeezed_advance_per_read/squeezed_advance_output
+        # (see coarse_tile.py's _insert_all_read_copy_ops, the "d not in
+        # squeeze_pos" branch). _general_tile_advance already mints/uses a
+        # level symbol from squeezed_advance_per_level regardless of
+        # loop_tiled_dims, so has_any_tiled_dim must check the same fields —
+        # otherwise the minted symbol shows up in device_tile_advance_expr
+        # but never in OpSpec.tiled_symbols, and superdsc.py's affine-stride
+        # extraction (which only walks tiled_symbols) silently drops the
+        # advance, leaving the tensor's address pinned across that level's
+        # iterations instead of stepping through it.
+        raw_squeezed_advance_reads: list[list[list[tuple]]] = (
+            li.squeezed_advance_per_read if li is not None else []
+        )
+        raw_squeezed_advance_output: list[list[tuple]] = (
+            li.squeezed_advance_output if li is not None else []
+        )
         # CoarseTileInfo always constructs loop_tiled_dims and
         # loop_tiled_reduction_dims with the same length (one sublist per
         # nesting level), so max() is just a safety net; in practice both
         # lists have the same length and the per-level loop below never
         # silently drops an entry from the shorter one.
-        n_levels = max(len(raw_tiled_dims), len(raw_tiled_red_dims))
+        n_levels = max(
+            len(raw_tiled_dims),
+            len(raw_tiled_red_dims),
+            max((len(levels) for levels in raw_squeezed_advance_reads), default=0),
+            len(raw_squeezed_advance_output),
+        )
 
         tiled_symbol_trip_counts: dict = {}
         tiled_syms: list[list] = []
@@ -950,8 +974,17 @@ class SpyreKernel(Kernel[CSEVariable]):
             for lvl in range(n_levels):
                 level_syms: list = []
                 has_any_tiled_dim = (
-                    lvl < len(raw_tiled_dims) and raw_tiled_dims[lvl]
-                ) or (lvl < len(raw_tiled_red_dims) and raw_tiled_red_dims[lvl])
+                    (lvl < len(raw_tiled_dims) and raw_tiled_dims[lvl])
+                    or (lvl < len(raw_tiled_red_dims) and raw_tiled_red_dims[lvl])
+                    or any(
+                        lvl < len(levels) and levels[lvl]
+                        for levels in raw_squeezed_advance_reads
+                    )
+                    or (
+                        lvl < len(raw_squeezed_advance_output)
+                        and raw_squeezed_advance_output[lvl]
+                    )
+                )
                 if has_any_tiled_dim:
                     level_syms.append(self._get_or_mint_level_symbol(lvl, op_name))
                 tiled_syms_per_level_outermost.append(level_syms)
