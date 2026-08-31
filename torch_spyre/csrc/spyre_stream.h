@@ -19,6 +19,8 @@
 #include <ATen/ATen.h>
 #include <c10/core/Stream.h>
 
+#include <cstdint>
+#include <memory>
 #include <vector>
 
 #include "job_plan.h"
