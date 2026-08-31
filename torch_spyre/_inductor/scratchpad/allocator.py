@@ -104,6 +104,7 @@ from torch_spyre._inductor.logging_utils import get_inductor_logger
 from torch_spyre._inductor.loop_info import CarriedReductionRecord
 from torch_spyre._inductor.scratchpad.lx_relayout import (
     LXRelayoutPlan,
+    _unsupported_relayout_transition_reason,
     collect_lx_relayout_plans,
     materialize_lx_relayouts,
     solver_relayout_edge_context,
@@ -111,6 +112,7 @@ from torch_spyre._inductor.scratchpad.lx_relayout import (
     work_division_from_view,
 )
 from torch_spyre._inductor.cost_model import CostParams
+from torch_spyre._inductor.op_spec import TensorWorkDivision
 from torch_spyre._inductor.pass_utils import PerCoreView
 
 _COST_PARAMS = CostParams(
@@ -2660,18 +2662,19 @@ class CoOptimizingAllocator(ScratchpadAllocator):
 
             # Ownership must project into loop symbols on both frames (the
             # committed path's work_division_from_view gates), cached per view:
-            # several candidates often induce the same view.
-            projectable: dict[tuple, bool] = {}
+            # several candidates often induce the same view. The projected
+            # division is kept (not just a bool) because the transition gate
+            # below compares source and destination divisions for equality.
+            projected: dict[tuple, Optional[TensorWorkDivision]] = {}
 
-            def _projects(view, coords, syms, frame) -> bool:
+            def _projected(view, coords, syms, frame) -> Optional[TensorWorkDivision]:
                 key = (view, frame)
-                if key not in projectable:
+                if key not in projected:
                     try:
-                        work_division_from_view(view, coords, syms)
-                        projectable[key] = True
+                        projected[key] = work_division_from_view(view, coords, syms)
                     except ValueError:
-                        projectable[key] = False
-                return projectable[key]
+                        projected[key] = None
+                return projected[key]
 
             # A coarse-tiled CANDIDATE can never host a relayout, for the same
             # reasons a coarse-tiled op cannot (the fitted law has no
@@ -2698,10 +2701,21 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                     ncores = parent_divs[i].cores_used
                     if ncores != consumer_divs[j].cores_used:
                         continue
-                    if not (
-                        _projects(pv, prod_coords, prod_syms, "prod")
-                        and _projects(pv, cons_coords, cons_syms, "cons")
-                        and _projects(cv, cons_coords, cons_syms, "cons")
+                    if _projected(pv, prod_coords, prod_syms, "prod") is None:
+                        continue
+                    src_division = _projected(pv, cons_coords, cons_syms, "cons")
+                    dst_division = _projected(cv, cons_coords, cons_syms, "cons")
+                    if src_division is None or dst_division is None:
+                        continue
+                    # Distinct per-core views that collapse to one logical work
+                    # division would codegen as a plain identity copy with the
+                    # cross-core movement silently omitted (#3926); the solver
+                    # must never be offered such a pair.
+                    if (
+                        _unsupported_relayout_transition_reason(
+                            src_division, dst_division
+                        )
+                        is not None
                     ):
                         continue
                     key = (pv, cv, ncores)
