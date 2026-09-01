@@ -1471,6 +1471,7 @@ def device_coordinates(
     *,
     check_stick_expr: bool = True,
     op: "Operation | None" = None,
+    cache: "dict | None" = None,
 ) -> list[sympy.Expr]:
     """Compute device-space coordinate expressions for a tensor access.
 
@@ -1482,15 +1483,39 @@ def device_coordinates(
             matching) where indirect coordinates are irrelevant.
         op: when given, splice trip counters in the dep index are pinned to trip
             zero (``per_trip_index``), matching codegen's base coordinates.
+        cache: optional memo for a caller that asks the same question
+            repeatedly. Keyed on every input: SpyreTensorLayout compares and
+            hashes over all four of its fields, MemoryDep is frozen, and ``op``
+            enters through the pinned index rather than by identity, so ops that
+            pin nothing share entries. The result is NOT a pure function of
+            them, though -- concretization consults ``V.graph.sizevars``
+            optimization hints, whose precomputed-replacement state grows as
+            compilation proceeds -- so a cache must not outlive the graph it was
+            populated for. A fresh list is returned each time, so no caller can
+            mutate another's result through it.
 
     Returns:
         One coordinate expression per device dimension; the last element is
         the stick expression.
     """
     index = per_trip_index(op, dep.index) if op is not None else dep.index
+    key = None
+    if cache is not None:
+        sizes_key = (
+            None if indirect_sizes is None else frozenset(indirect_sizes.items())
+        )
+        key = (stl, dep, index, sizes_key, check_stick_expr)
+        hit = cache.get(key)
+        if hit is not None:
+            return list(hit)
     coords = alignment_coordinates(stl, index, dep.ranges, indirect_sizes)
+    # Unsupported stick expressions raise here, so they are never cached and
+    # the raising path stays identical whether or not a cache is supplied.
     if check_stick_expr:
         _check_stick_expr_supported(coords[-1], stl.elems_per_stick())
+    if cache is not None:
+        cache[key] = coords
+        return list(coords)
     return coords
 
 
@@ -1586,6 +1611,7 @@ def try_device_coordinates(
     indirect_sizes: "dict[sympy.Symbol, int] | None",
     *,
     op: "Operation | None" = None,
+    cache: "dict | None" = None,
 ) -> list[sympy.Expr] | None:
     """Like ``device_coordinates`` but returns ``None`` instead of raising when
     the layout's stick expression is one the backend cannot represent.
@@ -1600,7 +1626,7 @@ def try_device_coordinates(
     returns ``None``.
     """
     try:
-        return device_coordinates(stl, dep, indirect_sizes, op=op)
+        return device_coordinates(stl, dep, indirect_sizes, op=op, cache=cache)
     except Unsupported:
         return None
 
@@ -2424,6 +2450,7 @@ def compute_restickify_needed(
     out_stl: SpyreTensorLayout,
     out_dep: MemoryDep,
     op: "ComputedBuffer | None" = None,
+    coord_cache: "dict | None" = None,
 ) -> "tuple[bool, SpyreTensorLayout | None]":
     """Determine whether a restickify is needed for one (in_stl, out_stl) pair.
 
@@ -2438,11 +2465,13 @@ def compute_restickify_needed(
       (True, stl)     — restickify needed, stl is the target STL for the restickified input
       (True, None)    — restickify needed but infeasible
 
+    coord_cache: optional memo forwarded to try_device_coordinates, shared by a
+    caller that evaluates many layout pairs over the same accesses.
     """
     ind_names, _, ind_sizes = indirect_info_from_op(op)
     if in_dep.name in ind_names:
         return False, None
-    idc = try_device_coordinates(in_stl, in_dep, ind_sizes, op=op)
+    idc = try_device_coordinates(in_stl, in_dep, ind_sizes, op=op, cache=coord_cache)
     if idc is None:
         # The layouts has a stick expression the backend cannot
         # represent (e.g. floor(var/N) from a cross-stick access). Such a
@@ -2454,7 +2483,9 @@ def compute_restickify_needed(
         # EdgeCostMap._compute_and_cache_cost in optimize_restickify.py. This is
         # preferable to aborting the whole pass when another candidate is valid.
         return True, None
-    out_idc = try_device_coordinates(out_stl, out_dep, ind_sizes, op=op)
+    out_idc = try_device_coordinates(
+        out_stl, out_dep, ind_sizes, op=op, cache=coord_cache
+    )
     if idc is None or out_idc is None:
         # Same as above
         return True, None
