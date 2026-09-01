@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import itertools
+
 import sympy
 
 import torch
@@ -28,6 +30,7 @@ from torch_spyre._inductor.propagate_layouts import (
     PropArg,
     _check_supported_input_sticks,
     _find_alt_target_stl,
+    _recover_dim_order,
 )
 from torch_spyre._inductor.views import (
     _decompose_constant_offset,
@@ -424,6 +427,98 @@ class TestTilingExprToDeviceExpr(TestCase):
         index = p0
         result = tiling_expr_to_device_expr([64, 1024, 64], [64, 4096, 1], index)
         self.assertEqual(result, p0)
+
+
+class TestRecoverDimOrder(TestCase):
+    """_recover_dim_order inverts a SpyreTensorLayout back to its dim_order.
+
+    dim_order selects which host dim becomes the stick dim and in what order the rest
+    are tiled. A SpyreTensorLayout keeps only its effect on device_size and
+    stride_map, so rebuilding a layout for a different number of elements per stick
+    while keeping that selection depends on recovering it.
+    """
+
+    def _recover(self, host_size, host_strides, dtype, dim_order, ea=None):
+        kwargs = {} if ea is None else {"element_arrangement": ea}
+        stl = SpyreTensorLayout(
+            list(host_size), list(host_strides), dtype, list(dim_order), **kwargs
+        )
+        return stl, _recover_dim_order(stl, list(host_size), list(host_strides))
+
+    def test_recovers_canonical_order(self):
+        stl, got = self._recover([2, 4, 64], [256, 64, 1], torch.float16, [0, 1, 2])
+        self.assertEqual(got, [0, 1, 2])
+
+    def test_recovers_transposed_order(self):
+        # A non-identity order is the case that matters: recovery exists to carry an
+        # alternative device layout across, not to rediscover the identity one.
+        stl, got = self._recover([2, 4, 64], [256, 64, 1], torch.float16, [1, 0, 2])
+        self.assertEqual(got, [1, 0, 2])
+
+    def test_recovers_sparse_order(self):
+        # Reducing over the stick dim leaves no host dim in the stick slot -- a
+        # sparse layout -- which _compute_dim_order expresses as a trailing -1: a
+        # dim_order one longer than the host rank, yielding a degenerate stick slot.
+        stl, got = self._recover([2, 4, 8], [32, 8, 1], torch.float16, [0, 1, 2, -1])
+        self.assertEqual(got, [0, 1, 2, -1])
+
+    def test_recovered_order_rebuilds_every_layout(self):
+        """Whatever is returned reproduces the layout it was recovered from.
+
+        Recovery is only useful if the result is a genuine preimage, so this
+        checks the property directly rather than comparing against the order
+        that happened to be passed in -- where size-one host dims sit is a
+        don't-care, so several orders can be equally correct.
+
+        This is also the check that keeps the positional model honest. The model
+        is transcribed from a per-rank table in ``get_generic_stick_layout``
+        (``csrc/spyre_tensor_impl.cpp``), and nothing in the function itself
+        enforces that the two agree, so drift is caught by enumerating layouts
+        here and comparing against the real constructor.
+        """
+        extents = [1, 2, 4, 64]
+        # Gaps as well as dense strides: callers pass an input STL that can
+        # describe a sliced parent, so a stride is not always the product of the
+        # extents below it.
+        gaps = [0, 1, 64]
+        checked = 0
+        for rank in (1, 2, 3, 4):
+            for size in itertools.product(extents, repeat=rank):
+                for gap in itertools.product(gaps, repeat=rank):
+                    strides, acc = [1] * rank, 1
+                    for i in range(rank - 1, -1, -1):
+                        strides[i] = acc
+                        acc *= size[i] + gap[i]
+                    perms = list(itertools.permutations(range(rank)))
+                    for order in [list(p) for p in perms] + [[*p, -1] for p in perms]:
+                        for dtype in (torch.float16, torch.float32):
+                            try:
+                                stl = SpyreTensorLayout(
+                                    list(size), strides, dtype, list(order)
+                                )
+                            except Exception:  # noqa: BLE001
+                                continue  # not every order is constructible
+                            # A constructible layout must recover; a raise fails.
+                            got = _recover_dim_order(stl, list(size), strides)
+                            rebuilt = SpyreTensorLayout(
+                                list(size), strides, dtype, list(got)
+                            )
+                            where = (
+                                f"size={list(size)} strides={strides} "
+                                f"dtype={dtype} order={order} recovered={got}"
+                            )
+                            self.assertEqual(
+                                list(rebuilt.device_size),
+                                list(stl.device_size),
+                                where,
+                            )
+                            self.assertEqual(
+                                list(rebuilt.stride_map), list(stl.stride_map), where
+                            )
+                            checked += 1
+        # Guards the enumeration itself: a corpus that silently stopped building
+        # layouts would pass every assertion above while checking nothing.
+        self.assertGreater(checked, 100_000, "enumeration collapsed")
 
 
 class TestFindAltTargetStlBoolStickSize(TestCase):

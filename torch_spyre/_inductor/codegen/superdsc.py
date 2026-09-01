@@ -15,6 +15,7 @@
 import dataclasses
 import math
 from collections import Counter
+from collections.abc import Iterable
 from typing import Any
 
 from sympy import Expr, Integer, Symbol
@@ -292,6 +293,81 @@ def _is_conv2d_kernel_tensor(arg: TensorArg, tensor_position: int | None) -> boo
     return tensor_position == 1
 
 
+def _sparse_stick_symbol(
+    arg: TensorArg, symbol_mapping: dict, op_spec: OpSpec | None
+) -> Symbol | None:
+    """The symbol naming a sparse arg's stick axis, whose stick lane indexes nothing.
+
+    A sparse layout holds one host element per stick, so its trailing lane carries a
+    constant and the usual read of ``device_coordinates[-1]`` finds no symbol. The axis
+    that walks sticks is the stick-count slot, and a conversion reshapes the layout around
+    it, so its position differs between the arms of one conversion while its role does
+    not. Selecting it by extent instead names one axis on both sides.
+
+    The count spans a stick rather than a tensor dim, so it is the narrowest of the
+    symbol-carrying slots: it counts how many sticks one row of the sparse dim occupies,
+    which the conversion's width change keeps small, while the host dims carry the
+    tensor's own extents.
+
+    Narrowness alone cannot tell a stick count from a genuinely small host dim, so the
+    winner must also look like a count. A count enumerates sticks, which the iteration
+    space never walks, so its extent is absent from the op's iteration ranges; every host
+    dim's extent is one of them. A reduction output reaches this function with a constant
+    trailing lane too -- the reduced axis collapsed rather than the layout being sparse --
+    and its surviving host dims are rejected by that test.
+
+    Extent 1 is exempt: a sparse count of 1 is what a layout whose stick holds exactly one
+    host element reports, and it collides with any unit iteration range by coincidence
+    rather than by being a host dim.
+
+    ``op_spec`` supplies the iteration ranges and is required positionally so a caller
+    cannot drop sparse detection by omitting it; ``None`` is accepted for the callers that
+    genuinely have no op yet, and confirms nothing. Returns ``None`` for a dense arg, for a
+    rejected winner, or when the narrowest extent is shared, so callers keep their existing
+    behaviour rather than guessing.
+    """
+    coords = arg.device_coordinates
+    if op_spec is None or len(coords) < 3:
+        return None
+    if coords[-1].subs(symbol_mapping).free_symbols:
+        return None
+
+    best: tuple[int, Symbol] | None = None
+    ties = 0
+    for size, coord in zip(arg.device_size[:-1], coords[:-1]):
+        free = sorted(coord.subs(symbol_mapping).free_symbols, key=str)
+        if len(free) != 1:
+            continue
+        extent = int(size)
+        if best is None or extent < best[0]:
+            best, ties = (extent, free[0]), 1
+        elif extent == best[0]:
+            ties += 1
+    if best is None or ties > 1:
+        return None
+
+    extent, symbol = best
+    if extent != 1 and extent in _constant_iteration_extents(op_spec):
+        return None
+    return symbol
+
+
+def _constant_iteration_extents(op_spec: OpSpec) -> set[int]:
+    """The op's iteration ranges that are known integers.
+
+    A dynamic range cannot be compared against a device extent, so it is dropped rather
+    than guessed at; a caller weighing a candidate against this set only ever gains
+    confirmations from it.
+    """
+    extents: set[int] = set()
+    for range_expr, _ in op_spec.iteration_space.values():
+        try:
+            extents.add(int(range_expr))
+        except (TypeError, ValueError):
+            continue
+    return extents
+
+
 def _get_device_dim_order(
     arg: TensorArg,
     symbol_mapping: dict,
@@ -307,7 +383,7 @@ def _get_device_dim_order(
     """
     last_coord = arg.device_coordinates[-1].subs(symbol_mapping)
     free = sorted(last_coord.free_symbols, key=str)
-    stick_dim = free[0] if free else None
+    stick_dim = free[0] if free else _sparse_stick_symbol(arg, symbol_mapping, op_spec)
 
     dim_order: list[Symbol] = []
     for i in range(len(arg.device_coordinates) - 2, -1, -1):
@@ -402,12 +478,45 @@ def _get_layout_label(
     return label
 
 
+def _allocated_sticks(
+    arg: TensorArg,
+    dim: Symbol,
+    symbol_mapping: dict,
+    stick_size: int,
+) -> int:
+    """How many sticks ``arg`` allocates along ``dim``, its stick dim.
+
+    A dense stick dim indexes elements inside one stick, so the answer is 1 and the
+    extent needs only rounding to a boundary. A sparse layout instead spends a whole
+    slot counting sticks -- one host element per stick means the lane itself is indexed
+    by nothing -- and a conversion that narrows the stick raises that count, so the
+    extent has to span every stick or the tail of them is never visited.
+
+    The counting slot's position is not fixed: rebuilding a layout for a different stick
+    width reorders the slots, so the slot is found by which coordinate ``dim`` drives,
+    never by where its label sits. Extents at or above a stick width are host dims that
+    happen to sit there, never a count.
+
+    Returns 1 when no counting slot is found, leaving boundary rounding unchanged.
+    """
+    for slot, coord in enumerate(arg.device_coordinates):
+        if slot >= len(arg.device_size):
+            break
+        if coord.subs(symbol_mapping) != dim:
+            continue
+        count = arg.device_size[slot]
+        if 1 < count < stick_size:
+            return count
+    return 1
+
+
 def _get_padded_iteration_space(
     op_spec_args: list[TensorArg],
     sdsc_args: list[SDSCArgs],
     sdsc_iteration_space: dict,
     layouts: dict,
     dim_order,
+    symbol_mapping: dict,
 ) -> dict:
     """
     Compute padding per dim when device size exceeds iteration space.
@@ -420,16 +529,21 @@ def _get_padded_iteration_space(
         layout = layouts[sdsc_arg.layout]
         stick_dim_order = layout["stick_dim_order"]
         stick_size = layout["stick_size"]
-        dev_size = op_spec_arg.device_size[-2::-1]
-        for idx, dim in enumerate(dim_order):
-            if idx >= len(dev_size) or dim not in stick_dim_order:
+        for dim in dim_order:
+            if dim not in stick_dim_order:
                 continue
             effective_stick_size = (
                 stick_size[0] if len(stick_size) == 1 else stick_size[0] * stick_size[1]
             )
-            unaligned = sdsc_iteration_space[dim] % effective_stick_size
-            if unaligned > 0:
-                padding[dim] = effective_stick_size - unaligned
+            # The extent must reach every stick the layout allocates, not just round to
+            # the next boundary: an axis carrying several sticks is described by one
+            # extent, and stopping at the first boundary leaves the rest unreachable.
+            target = effective_stick_size * _allocated_sticks(
+                op_spec_arg, dim, symbol_mapping, effective_stick_size
+            )
+            unaligned = sdsc_iteration_space[dim] % target
+            if unaligned > 0 or sdsc_iteration_space[dim] < target:
+                padding[dim] = target - unaligned
                 sdsc_iteration_space[dim] += padding[dim]
     return padding
 
@@ -1026,6 +1140,11 @@ def _get_op_dim_labels(ndim: int, is_matmul: bool, is_conv2d: bool) -> list[str]
         return INPUT_DIM_LABELS[: ndim - 1] + OUTPUT_DIM_LABELS[:1]
 
 
+def _first_free_dim_label(taken: Iterable[Symbol]) -> Symbol:
+    names = {sym.name for sym in taken}
+    return Symbol(next(lbl for lbl in INPUT_DIM_LABELS if lbl not in names))
+
+
 def _get_tensor_layout_labels(use_op_dims: bool, op_name: str) -> list[str]:
     # use_op_dims is False only for matmul and conv (see the caller's
     # `not (_is_matmul or _is_conv)`), so the non-use_op_dims branch is reached
@@ -1092,7 +1211,7 @@ def _collect_index_tensor_layouts(
 
     for i in index_tensor_indices:
         arg = op_spec.args[i]
-        dim_order, stick_dim = _get_device_dim_order(arg, symbol_mapping)
+        dim_order, stick_dim = _get_device_dim_order(arg, symbol_mapping, op_spec)
         if mb_sym is not None and not dim_order:
             # P=1: all-constant coords; use injected mb_sym.
             dim_order = [mb_sym]
@@ -1344,7 +1463,18 @@ def _create_sdsc_tensors(
                 # iteration extent. Emitting a backGap for a conv op double-counts
                 # that gap and corrupts the generated addressing.
                 #
-                if not _is_conv(op_spec.op):
+                # A sparse layout's stick axis is its stick-count slot, whose
+                # extent counts whole sticks rather than elements within one.
+                # The hardware always processes a whole stick, so the count is
+                # already fully traversed and a gap there would be applied in
+                # elements against an axis measured in sticks. A dense stick dim
+                # is measured in elements and a coarse tile genuinely covers only
+                # part of it, so it still needs the gap.
+                skip_gap = (
+                    dim is stick_dim
+                    and _sparse_stick_symbol(arg, symbol_mapping, op_spec) is stick_dim
+                )
+                if not _is_conv(op_spec.op) and not skip_gap:
                     backGap[dim] = dev_dim_size - it_dim_size
                 strides[dim] = strides[dim] // dev_dim_size * it_dim_size
 
@@ -1569,12 +1699,12 @@ def _extend_matmul_k_to_padded(
     out_arg = op_spec.args[-1]
 
     # Collect non-stick symbols in y's device_coordinates (after symbol_mapping).
-    y_dim_order, y_stick_dim = _get_device_dim_order(y_arg, symbol_mapping)
+    y_dim_order, y_stick_dim = _get_device_dim_order(y_arg, symbol_mapping, op_spec)
     # y_stick_dim is the within-stick symbol; the remaining dims include K.
     y_non_stick_syms: set = set(y_dim_order) - ({y_stick_dim} if y_stick_dim else set())
 
     # Collect all symbols in the output's device_coordinates.
-    out_dim_order, _ = _get_device_dim_order(out_arg, symbol_mapping)
+    out_dim_order, _ = _get_device_dim_order(out_arg, symbol_mapping, op_spec)
     out_syms: set = set(out_dim_order)
 
     # K is in y but not in the output (it's reduced).
@@ -1624,7 +1754,7 @@ def _extend_restickify_to_padded(
     widening done by ``_get_padded_iteration_space``).
     """
     for arg in op_spec.args:
-        _, stick_sym = _get_device_dim_order(arg, symbol_mapping)
+        _, stick_sym = _get_device_dim_order(arg, symbol_mapping, op_spec)
         if stick_sym is None or stick_sym not in sdsc_iteration_space:
             continue
         stick_size = arg.device_dtype.elems_per_stick()
@@ -1839,17 +1969,17 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
     )
 
     ref_arg = _ref_arg(op_spec)
-    op_dim_order, op_stick_dim = _get_device_dim_order(ref_arg, symbol_mapping)
+    op_dim_order, op_stick_dim = _get_device_dim_order(ref_arg, symbol_mapping, op_spec)
 
     # On-device type-conversion ops (DL16TOFP32/FP32TODL16, not identity)
     # require at least one outer spatial dim beyond the stick; inject a
     # virtual mb=1 row when the op's tensor has only the stick dim.
+    # op_dim_order is empty for a degenerate stick dim, which has no loop symbol.
     mb_sym: Symbol | None = None
     if (
         (DtypeOpTable.is_dtype_op(op_spec.op) or op_spec.op == "qfp8ch")
         and op_spec.op != IDENTITY_OP
-        and op_stick_dim is not None
-        and all(d is op_stick_dim for d in op_dim_order)
+        and (op_dim_order == [] or op_dim_order == [op_stick_dim])
     ):
         mb_sym = Symbol(INPUT_DIM_LABELS[0])
         sdsc_iteration_space = {mb_sym: 1, **sdsc_iteration_space}
@@ -1873,19 +2003,15 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
     if has_indirect_access and mb_sym is None:
         for idx in index_tensor_indices:
             idx_arg = op_spec.args[idx]
-            idx_dim_order, _ = _get_device_dim_order(idx_arg, symbol_mapping)
+            idx_dim_order, _ = _get_device_dim_order(idx_arg, symbol_mapping, op_spec)
             if not idx_dim_order:
                 # P=1: all-constant coords, no loop variable.
-                _existing_names = {s.name for s in op_dim_order}
-                _p1_label = next(
-                    lbl for lbl in INPUT_DIM_LABELS if lbl not in _existing_names
-                )
-                mb_sym = Symbol(_p1_label)
+                mb_sym = _first_free_dim_label(op_dim_order)
                 _inject_index_dim(mb_sym, prepend=True)
                 logger.debug(
                     "P=1 gather detected (index tensor %d): injecting virtual %s=1",
                     idx,
-                    _p1_label,
+                    mb_sym.name,
                 )
                 break
 
@@ -1895,22 +2021,16 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
         for idx in index_tensor_indices:
             idx_arg = op_spec.args[idx]
             idx_dim_order, idx_stick_dim = _get_device_dim_order(
-                idx_arg, symbol_mapping
+                idx_arg, symbol_mapping, op_spec
             )
             if idx_dim_order and idx_stick_dim is None:
-                _existing_names = {s.name for s in op_dim_order} | {
-                    s.name for s in idx_dim_order
-                }
-                _stick_label = next(
-                    lbl for lbl in INPUT_DIM_LABELS if lbl not in _existing_names
-                )
-                stick_sym = Symbol(_stick_label)
+                stick_sym = _first_free_dim_label([*op_dim_order, *idx_dim_order])
                 _inject_index_dim(stick_sym, prepend=False)
                 index_stick_syms[idx] = stick_sym
                 logger.debug(
                     "Index tensor %d: stick coordinate absent; injecting %s",
                     idx,
-                    _stick_label,
+                    stick_sym.name,
                 )
 
     if op_stick_dim is None:
@@ -1950,10 +2070,10 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
             else:
                 sdsc_iteration_space[stick_sym] = int(op_spec.node_output_ranges[1])
         else:
-            stick_sym = Symbol(INPUT_DIM_LABELS[ndim])
-            sdsc_iteration_space[stick_sym] = op_spec.args[
-                0
-            ].device_dtype.elems_per_stick()
+            # A degenerate dim has logical size 1; _get_padded_iteration_space
+            # later pads it up to a full stick, per arg by that arg's own width.
+            stick_sym = _first_free_dim_label(sdsc_iteration_space)
+            sdsc_iteration_space[stick_sym] = 1
         work_slices[stick_sym] = 1
         dim_splits[stick_sym] = 1
 
@@ -2054,7 +2174,12 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
             [args[-1].dim_order],
         )
     padding = _get_padded_iteration_space(
-        pad_args, pad_sdsc_args, sdsc_iteration_space, layouts, dim_order
+        pad_args,
+        pad_sdsc_args,
+        sdsc_iteration_space,
+        layouts,
+        dim_order,
+        symbol_mapping,
     )
 
     # For restickify, update backGaps based on the padded iteration space,

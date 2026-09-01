@@ -38,6 +38,7 @@ from torch_spyre._inductor.codegen.compute_ops import (
 from torch_spyre._inductor.codegen.superdsc import (
     _align_pool_dim_labels,
     _resolve_sdsc_size,
+    _sparse_stick_symbol,
     compile_op_spec,
 )
 from torch_spyre._inductor.core_mapping import derive_operation_mapping
@@ -482,6 +483,114 @@ class TestSdscJsonSymbolicDimSmoke(InductorTestCase):
         for stage in ("ss_", "el_"):
             sym_info = dsc["dataStageParam_"]["0"][stage]["symbolicDimInfo_"]
             self.assertEqual(sym_info, {"mb": {"maxSize_": 512, "granularity_": 64}})
+
+
+class TestSparseStickSymbol(InductorTestCase):
+    """Unit tests for _sparse_stick_symbol's stick-count identification.
+
+    A sparse layout's trailing lane holds a constant, so the stick axis must be found
+    among the other slots. A reduction output looks the same from the trailing lane --
+    the reduced axis collapsed -- so the tests pair each sparse layout with the dense
+    reduction output it must not be confused with. Shapes and iteration ranges are the
+    ones measured on an fp16<->fp32 sparse round trip and on a 128x512x768 rmsnorm.
+    """
+
+    @staticmethod
+    def _arg(device_size, coords, dtype=DataFormats.IEEE_FP32) -> TensorArg:
+        return TensorArg(
+            is_input=False,
+            arg_index=0,
+            device_dtype=dtype,
+            device_size=list(device_size),
+            device_coordinates=[sympy.sympify(c) for c in coords],
+            allocation={"hbm": 0},
+        )
+
+    @staticmethod
+    def _op_spec(ranges) -> OpSpec:
+        iteration_space = {
+            sym: (sympy.Integer(extent), 1) for sym, extent in ranges.items()
+        }
+        return OpSpec(
+            op="add",
+            is_reduction=False,
+            iteration_space=iteration_space,
+            core_id_to_work_slice=derive_operation_mapping(iteration_space),
+            args=[],
+            op_info={},
+        )
+
+    def test_sparse_fp32_count_named(self):
+        """An fp32 sparse arm's count of 2 is absent from the iteration ranges."""
+        x, out, mb = sympy.symbols("x out mb")
+        arg = self._arg([1, 64, 2, 12, 32], [0, x, out, mb, 0])
+        op_spec = self._op_spec({mb: 12, x: 64, out: 1})
+        self.assertIs(_sparse_stick_symbol(arg, {}, op_spec), out)
+
+    def test_sparse_fp16_count_of_one_named(self):
+        """A count of 1 is named despite colliding with a unit iteration range."""
+        x, out, mb = sympy.symbols("x out mb")
+        arg = self._arg([1, 1, 64, 12, 64], [0, out, x, mb, 0], DataFormats.SEN169_FP16)
+        op_spec = self._op_spec({mb: 12, x: 64, out: 1})
+        self.assertIs(_sparse_stick_symbol(arg, {}, op_spec), out)
+
+    def test_reduction_output_two_host_dims_rejected(self):
+        """A reduction output's narrowest host dim is an iteration range, not a count."""
+        x, mb = sympy.symbols("x mb")
+        arg = self._arg([1, 512, 128, 64], [0, x, mb, 0], DataFormats.SEN169_FP16)
+        op_spec = self._op_spec({mb: 128, x: 512})
+        self.assertIsNone(_sparse_stick_symbol(arg, {}, op_spec))
+
+    def test_reduction_output_one_host_dim_rejected(self):
+        """The lone surviving host dim of a reduction is rejected on the same test."""
+        mb = sympy.Symbol("mb")
+        arg = self._arg([1, 512, 32], [0, mb, 0])
+        op_spec = self._op_spec({mb: 512, sympy.Symbol("out"): 768})
+        self.assertIsNone(_sparse_stick_symbol(arg, {}, op_spec))
+
+    def test_dense_trailing_lane_declines(self):
+        """A dense arg indexes its trailing lane, so this fallback never applies."""
+        x, out, mb = sympy.symbols("x out mb")
+        arg = self._arg(
+            [512, 12, 128, 64],
+            [x, out // 64, mb, sympy.Mod(out, 64)],
+            DataFormats.SEN169_FP16,
+        )
+        op_spec = self._op_spec({mb: 128, x: 512, out: 768})
+        self.assertIsNone(_sparse_stick_symbol(arg, {}, op_spec))
+
+    def test_tied_narrowest_extent_declines(self):
+        """Two slots share the narrowest extent, so neither can be named."""
+        x, out, mb = sympy.symbols("x out mb")
+        arg = self._arg([1, 2, 2, 12, 32], [0, x, out, mb, 0])
+        op_spec = self._op_spec({mb: 12, x: 64, out: 1})
+        self.assertIsNone(_sparse_stick_symbol(arg, {}, op_spec))
+
+    def test_without_op_spec_declines(self):
+        """No iteration ranges means no candidate can be confirmed."""
+        x, out, mb = sympy.symbols("x out mb")
+        arg = self._arg([1, 64, 2, 12, 32], [0, x, out, mb, 0])
+        self.assertIsNone(_sparse_stick_symbol(arg, {}, None))
+
+    def test_symbolic_range_cannot_reject(self):
+        """A dynamic range confirms nothing, so this arg falls through as a candidate.
+
+        Rejection needs a comparable integer extent, so a dim whose range is symbolic is
+        indistinguishable from a stick count at this layer -- the pre-fix behaviour, kept
+        deliberately rather than guessed at.
+        """
+        x, mb = sympy.symbols("x mb")
+        s0 = sympy.Symbol("s0", integer=True, positive=True)
+        arg = self._arg([1, 512, 128, 64], [0, x, mb, 0], DataFormats.SEN169_FP16)
+        op_spec = OpSpec(
+            op="add",
+            is_reduction=False,
+            iteration_space={mb: (s0, 1), x: (sympy.Integer(512), 1)},
+            core_id_to_work_slice={},
+            args=[],
+            op_info={},
+        )
+        self.assertIs(_sparse_stick_symbol(arg, {}, op_spec), mb)
 
 
 class TestSymbolKindKernelDerivedSymbolic(InductorTestCase):

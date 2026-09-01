@@ -57,6 +57,7 @@ from .dtype_ops import (
     resolve_output_formats,
 )
 from .errors import Unsupported
+from .padding import round_up_to_stick
 from .constants import (
     BATCH_MATMUL_OP,
     BATCH_MATMUL_FP8_OP,
@@ -175,6 +176,95 @@ def _compute_dim_order(stick_dim, size, coords):
     dim_order = [d for d in range(len(size)) if d != stick_dim and coords[d] != 0]
     dim_order += [d for d in range(len(size)) if d != stick_dim and coords[d] == 0]
     dim_order += [stick_dim]
+    return dim_order
+
+
+def _recover_dim_order(
+    stl: SpyreTensorLayout,
+    host_size: list[int],
+    host_strides: list[int],
+) -> list[int]:
+    """Recover the ``dim_order`` that produced ``stl`` from the given host layout.
+
+    ``dim_order`` selects which host dim becomes the stick dim and in what order the
+    rest are tiled. It is a constructor argument, not layout state: the resulting
+    ``SpyreTensorLayout`` keeps only its effect on ``device_size`` and
+    ``stride_map``. Recovering it lets a layout be rebuilt for a different number of
+    elements per stick while keeping that selection, instead of falling back to an
+    identity order.
+
+    This inverts ``get_generic_stick_layout`` and ``dim_map_to_stride_map``
+    (``csrc/spyre_tensor_impl.cpp``). Dims of extent > 1 are recovered exactly, because
+    ``stride_map`` holds host stride *values* and each one identifies the host dim it came
+    from. Size-one dims are not: the forward map writes ``-1`` for all of them, so which
+    one sat where is unrecoverable. They are assigned in ascending order, which addresses
+    the same memory as the original -- their only index is 0, so they contribute nothing to
+    an address wherever they land.
+
+    Args:
+        stl: The layout to invert.
+        host_size: Host extents ``stl`` was built from.
+        host_strides: Host strides ``stl`` was built from.
+
+    Returns:
+        The recovered ``dim_order``: one entry per host dim, plus a trailing ``-1``
+        for a sparse layout.
+    """
+    host_rank = len(host_size)
+    stride_map = stl.stride_map
+    device_rank = len(stride_map)
+
+    assert device_rank in (host_rank + 1, host_rank + 2), (
+        f"invalid device rank {device_rank} for host size {list(host_size)}: {stl}"
+    )
+    sparse = device_rank == host_rank + 2
+    dim_order_len = device_rank - 1
+
+    # Stride value -> the one host dim carrying it. Size-one dims are skipped, so a
+    # missing key below means a size-one dim.
+    host_dim_of_stride: dict[int, int] = {}
+    for host_dim in range(host_rank):
+        if host_size[host_dim] != 1:
+            stride = host_strides[host_dim]
+            # A shared stride makes the lookup below ambiguous. Only a broadcast or an
+            # as_strided overlap produces one, and neither is known to reach this path.
+            assert stride not in host_dim_of_stride, (
+                f"host dims {host_dim_of_stride[stride]} and {host_dim} both have "
+                f"stride {stride} in size={list(host_size)}, "
+                f"strides={list(host_strides)}"
+            )
+            host_dim_of_stride[stride] = host_dim
+
+    # get_generic_stick_layout (csrc/spyre_tensor_impl.cpp) builds each device dim from one
+    # dim_order entry: the leading device dims from dim_order[1:], then dim_order[0] (the
+    # num-sticks dim), then dim_order[-1] again (the stick dim). Inverted here: the device
+    # dim to read for each dim_order entry, in order. The stick dim reads the last of its
+    # two device dims. A sparse layout has no stick entry to read; the trailing -1 is
+    # appended after the loop instead.
+    device_dim_of_dim_order_index = [dim_order_len - 1, *range(dim_order_len - 2)]
+    if not sparse:
+        device_dim_of_dim_order_index[dim_order_len - 1 :] = [device_rank - 1]
+    assert len(device_dim_of_dim_order_index) == dim_order_len - (1 if sparse else 0)
+
+    # Size-one dims are unrecoverable from stride_map; assign them in ascending order.
+    remaining_size_one_dims = (d for d in range(host_rank) if host_size[d] == 1)
+
+    dim_order: list[int] = []
+    for device_dim in device_dim_of_dim_order_index:
+        stride = stride_map[device_dim]
+        if stride in host_dim_of_stride:
+            host_dim = host_dim_of_stride[stride]
+        else:
+            size_one_dim = next(remaining_size_one_dims, None)
+            assert size_one_dim is not None, (
+                f"no host dim left for stride {stride} in device dim {device_dim} of "
+                f"{stl} (size={list(host_size)}, strides={list(host_strides)})"
+            )
+            host_dim = size_one_dim
+        dim_order.append(host_dim)
+
+    if sparse:
+        dim_order.append(-1)
     return dim_order
 
 
@@ -310,52 +400,6 @@ def _check_supported_input_sticks(args: list[PropArg], op_label: str) -> None:
             )
 
 
-def _rescale_stl_for_dtype(
-    stl: SpyreTensorLayout,
-    out_dtype: torch.dtype,
-    ea: ElementArrangement,
-) -> SpyreTensorLayout:
-    """Propagate a device layout across a same-shape, differing-stick-depth dtype conversion.
-
-    Copies the input STL's ``device_size``/``stride_map`` and rescales the stick
-    depth (the last device dim) plus, when present, the one non-stick dim whose
-    stride equals the input stick depth. This preserves any non-canonical layout
-    or padding present in the input STL instead of reconstructing a dense layout
-    from the logical size/stride.
-
-    The input elements-per-stick is read from ``stl.device_size[-1]`` (the stick
-    dimension is always full, so it equals ``get_elem_in_stick(in_dtype)``); the
-    output count comes from ``out_dtype``.
-
-    Args:
-        stl: Input device layout to rescale.
-        out_dtype: Torch dtype of the conversion output.
-        ea: ElementArrangement to stamp on the returned layout.
-    """
-    in_eps = stl.device_size[-1]
-    out_eps = get_elem_in_stick(out_dtype)
-    out_device_size = list(stl.device_size)
-    out_stride_map = list(stl.stride_map)
-    out_device_size[-1] = out_eps
-    # Rescale the first non-stick dim that indexes whole sticks (stride == the
-    # input stick depth) by the stick-depth ratio. A staggered/sparse layout
-    # (e.g. the DL16_TO_FP32 restoration operand, whose stride_map carries
-    # sentinel -1 entries rather than a linear num-sticks stride) has no such
-    # dim; there only the stick depth changes, so a no-match is expected and
-    # left as-is.
-    for i, s in enumerate(stl.stride_map):
-        if s == in_eps:
-            out_device_size[i] = stl.device_size[i] * in_eps // out_eps
-            out_stride_map[i] = out_eps
-            break
-    return SpyreTensorLayout(
-        out_device_size,
-        out_stride_map,
-        get_device_dtype(out_dtype),
-        ea,
-    )
-
-
 def _qfp8wt_stl(
     output: FixedLayout,
     in_layout: FixedLayout,
@@ -388,6 +432,52 @@ def _qfp8wt_stl(
         output.dtype,
         list(range(len(c_size))),
         ElementArrangement.QFP8WT,
+    )
+
+
+def _pad_sparse_stick_count(
+    stl: SpyreTensorLayout, src_dtype: torch.dtype
+) -> SpyreTensorLayout:
+    """Widen a sparse layout's stick-count slot to the sticks one source stick spans.
+
+    A sparse layout holds one host element per stick, so its stick-count slot is 1 by
+    construction. That count is in *device* sticks, and a conversion changes how wide a
+    stick is: narrowing fp16 (64 elements) to fp32 (32) makes one source stick span two
+    device sticks. The count must cover them both, or the buffer is allocated for half
+    the sticks the kernel writes.
+
+    The extra sticks are padding: allocated, not iterated. Codegen derives the skip from
+    the difference between this device extent and the iteration extent, so the count is
+    the allocation side of that pair and is deliberately not matched by an iteration
+    range.
+
+    ``_recover_dim_order`` fixes the slot: a sparse layout carries exactly one slot more
+    than its host rank plus the trailing stick width, and that slot is the count.
+
+    Returns ``stl`` unchanged when the layout is dense or the conversion does not narrow
+    the stick.
+    """
+    device_size = list(stl.device_size)
+    stride_map = list(stl.stride_map)
+
+    src_eps = get_elem_in_stick(src_dtype)
+    dst_eps = stl.device_dtype.elems_per_stick()
+    if dst_eps >= src_eps:
+        return stl
+
+    # Sparse layouts alone have a count slot to widen; a dense one carries the count in
+    # a host dim, which this must not touch.
+    count_idx = -3
+    if len(device_size) < 3 or stride_map[count_idx] != -1:
+        return stl
+
+    spanned = src_eps // dst_eps
+    if device_size[count_idx] * dst_eps >= src_eps:
+        return stl
+    device_size[count_idx] *= spanned
+
+    return SpyreTensorLayout(
+        device_size, stride_map, stl.device_dtype, stl.element_arrangement
     )
 
 
@@ -500,9 +590,13 @@ def _single_arg_op_layout(
 
             input_ea = stl.element_arrangement
 
+            src_dtype = in_layout.dtype
+            if src_dtype == torch.bool:
+                src_dtype = bool_layout_dtype(stl.device_dtype, "conversion source")
+
             # Determine output EA based on conversion direction and input EA
             if (
-                in_layout.dtype in (torch.float16, torch.bfloat16)
+                src_dtype in (torch.float16, torch.bfloat16)
                 and output.dtype == torch.float32
             ):
                 # FP16/BF16 → FP32 conversion. Both share SEN169_FP16 physical
@@ -518,7 +612,7 @@ def _single_arg_op_layout(
                     raise Unsupported(
                         f"FP16→FP32 conversion with unsupported input EA: {input_ea}"
                     )
-            elif in_layout.dtype == torch.float32 and output.dtype == torch.float16:
+            elif src_dtype == torch.float32 and output.dtype == torch.float16:
                 # FP32 → FP16 conversion
                 if input_ea == ElementArrangement.STANDARD:
                     # Case 3: STANDARD → FP32_TO_DL16 (creates staggered layout)
@@ -535,33 +629,45 @@ def _single_arg_op_layout(
                 # Other type conversions default to STANDARD
                 fmt = ElementArrangement.STANDARD
 
-            # Two strategies, chosen by whether a staggered EA is involved:
-            #
-            # 1. Staggered conversions (RMSNorm up/down-cast and their
-            #    restoration: STANDARD<->DL16_TO_FP32 / FP32_TO_DL16). The
-            #    staggered element ordering only exists on the physical device
-            #    layout, so we must propagate the input's device_size/stride_map
-            #    and rescale just the stick depth via _rescale_stl_for_dtype.
-            #    Reconstructing from the logical host size would lose it.
-            #
-            # 2. Plain conversions (e.g. fp8->fp16 after qfp8ch). Here the input
-            #    device layout can be degenerate — qfp8ch rescales a size-1
-            #    num-sticks dim to 0 (1*64//128), leaving a size-0 dim — and
-            #    _rescale_stl_for_dtype would faithfully propagate that garbage,
-            #    changing the layout rank and downstream graph partitioning.
-            #    Rebuild a clean dense layout from the output host size instead,
-            #    as the general (non-EA) convert path does.
+            # A staggered conversion is ordinary layout propagation: rebuild in
+            # host space for the output dtype, keeping the input's device layout
+            # via its recovered dim_order.
             if fmt in STAGGERED_EAS or input_ea in STAGGERED_EAS:
-                return [_rescale_stl_for_dtype(stl, output.dtype, fmt)]
+                in_size = [concretize_expr(s) for s in in_layout.size]
+                in_stride = [concretize_expr(s) for s in in_layout.stride]
+                dim_order = _recover_dim_order(stl, in_size, in_stride)
+                out_stl = SpyreTensorLayout(
+                    c_size, c_stride, output.dtype, dim_order, fmt
+                )
+                return [_pad_sparse_stick_count(out_stl, in_layout.dtype)]
 
-            # Dense reconstruction from the output host size. When the input
-            # stick dim is unaligned, force a full input-stick depth so stick
-            # padding is reflected in the device layout (see #1756 example above).
-            in_elems_per_stick = get_elem_in_stick(in_layout.dtype)
-            if concretize_expr(in_layout.size[-1] % in_elems_per_stick) > 0:
-                c_size = [concretize_expr(s) for s in output.size[:-1]] + [
-                    in_elems_per_stick
-                ]
+            # The only op left is FP8TODL16, dequantizing qfp8ch output back to
+            # fp16: a STANDARD output undoes the input's staggering, as in the
+            # fp16<->fp32 restoration cases above.
+            assert (
+                src_dtype == torch.float8_e4m3fn
+                and output.dtype == torch.float16
+                and fmt == ElementArrangement.STANDARD
+                and input_ea == ElementArrangement.QFP8CH
+            ), (
+                f"unexpected conversion {src_dtype}->{output.dtype} with "
+                f"input EA {input_ea}, output EA {fmt}"
+            )
+
+            # An fp8 stick spans two fp16 ones, and the hardware converts whole
+            # sticks, so the compiled kernel iterates whole fp8 sticks and the
+            # fp16 buffer must be allocated that wide, or the kernel's store
+            # overflows it. The round-ups differ exactly on an odd fp16 stick
+            # count, except for a single stick that one fp8 stick already covers.
+            #
+            # TODO: allow non-standard layouts. Padding the stick dim here means
+            # padding the innermost one, which enforces the standard stick layout.
+            out_eps = get_elem_in_stick(output.dtype)
+            stick_dim_size = concretize_expr(in_layout.size[-1])
+            in_padded = round_up_to_stick(stick_dim_size, in_layout.dtype)
+            out_padded = round_up_to_stick(stick_dim_size, output.dtype)
+            if in_padded > out_padded and out_padded > out_eps:
+                c_size = [concretize_expr(s) for s in output.size[:-1]] + [in_padded]
                 c_stride = [concretize_expr(s) for s in output.stride[:-1]] + [1]
             return [
                 SpyreTensorLayout(
@@ -570,11 +676,35 @@ def _single_arg_op_layout(
             ]
 
         case spyreop.qfp8ch.default:
-            # fp16 (64 elems/stick) -> fp8 (128 elems/stick) quantization.
-            # Propagate the input device layout and rescale for the dtype change,
-            # preserving any padding present in the input STL.
+            # Narrowing fp16 to fp8, the inverse of FP8TODL16 above. An fp8 stick
+            # spans two fp16 ones, so the compiled kernel iterates whole fp8
+            # sticks, leaving the fp16 buffer a stick shorter than the kernels
+            # reading and writing it, when the extent covers an odd number of fp16
+            # sticks except for a single stick, which one fp8 stick already covers.
+            #
+            # TODO: allocate the fp16 buffer to an even stick count. Its declared
+            # size has to grow with it, so that consuming kernels iterate the same
+            # width the conversion does.
+            in_eps = get_elem_in_stick(in_layout.dtype)
+            out_eps = get_elem_in_stick(output.dtype)
+            stick_dim_size = concretize_expr(in_layout.size[-1])
+            in_padded = round_up_to_stick(stick_dim_size, in_layout.dtype)
+            out_padded = round_up_to_stick(stick_dim_size, output.dtype)
+            if stick_dim_size > in_eps and out_padded > in_padded:
+                raise Unsupported(
+                    f"qfp8ch with stick dim size {stick_dim_size}: an odd number of "
+                    f"{in_eps}-element input sticks cannot fill whole "
+                    f"{out_eps}-element output sticks; the input needs padding to "
+                    f"{out_padded}"
+                )
             return [
-                _rescale_stl_for_dtype(stl, output.dtype, ElementArrangement.QFP8CH)
+                SpyreTensorLayout(
+                    c_size,
+                    c_stride,
+                    output.dtype,
+                    list(range(len(c_size))),
+                    ElementArrangement.QFP8CH,
+                )
             ]
 
         case spyreop.qfp8wt.default:

@@ -5,7 +5,7 @@ test_suite_config:
       unlisted_test_mode: skip
       tests:
         - names:
-            - TestFP8Operations::test_(quantize_dequantize_fp8_small_range|quantize_dequantize_fp8_medium_range|quantize_dequantize_fp8_boundary_cases|quantize_dequantize_fp8_production_shapes|qfp8ch_basic_conversion|fp8todl16_basic_conversion).*
+            - TestFP8Operations::test_(quantize_dequantize_fp8_small_range|quantize_dequantize_fp8_medium_range|quantize_dequantize_fp8_boundary_cases|quantize_dequantize_fp8_production_shapes|quantize_dequantize_fp8_single_stick_rows|quantize_fp8_odd_input_stick_count_rejected|qfp8ch_basic_conversion|fp8todl16_basic_conversion).*
           mode: mandatory_success
           tags:
             - ops__inductor-fp8

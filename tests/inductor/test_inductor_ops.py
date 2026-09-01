@@ -7826,6 +7826,97 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             run_eager=False,
         )
 
+    def test_upcast_reduction_num_sticks_dim_collision(self):
+        # An upcast whose num-sticks dim is size 1 must rescale THAT dim, not an
+        # ordinary host dim that happens to share its stride.
+        #
+        # Host (2, 4, 8, 64) at fp16 is device_size [4, 8, 1, 2, 64] with
+        # stride_map [512, 64, 64, 2048, 1]. The trailing host dim is exactly one
+        # stick, so dim 2 (the num-sticks dim, extent 1) and dim 1 (an ordinary
+        # host dim, extent 8) BOTH have stride 64. Identifying the num-sticks dim
+        # by its stride therefore picks dim 1 and doubles it on the fp32 upcast,
+        # giving [4, 16, 1, 2, 32] instead of [4, 8, 2, 2, 32] -- the reduction
+        # then sums the wrong 64 elements.
+        #
+        # The round trip back to fp16 is load-bearing: leaving the sum in fp32
+        # writes the staggered result out without ever addressing through the
+        # malformed dim, and the error does not surface.
+        #
+        # Values are integers whose partial sums stay <= 1024, so they are exact
+        # in DLFloat16 and torch.equal cannot report a false mismatch. Structured
+        # values are essential here: with randn inputs the wrong elements sum to a
+        # plausible total (~0.5% off), which the suite's default tolerance
+        # absorbs, so this defect is invisible to a tolerance-based oracle.
+        x_cpu = (
+            (torch.arange(2 * 4 * 8 * 64) % 32).to(torch.float16).reshape(2, 4, 8, 64)
+        )
+
+        def fn(x):
+            return x.to(torch.float32).sum(-1).to(torch.float16)
+
+        expected = fn(x_cpu)
+        assert expected.max() <= 1024, "oracle must stay in the DLFloat16-exact range"
+
+        got = torch.compile(fn)(x_cpu.to("spyre")).cpu()
+
+        assert torch.equal(got, expected), (
+            "upcast+reduction mismatch on a size-1 num-sticks dim: "
+            f"{int((got.float() - expected.float()).abs().gt(0).sum())} of "
+            f"{expected.numel()} elements differ"
+        )
+
+    def test_upcast_reduction_sliced_stick_dim(self):
+        # A conversion whose input is sliced along the stick dim must describe the
+        # output with the extents and pitches of the VIEW, not of the parent.
+        #
+        # Slicing lives in the index expression, not in the layout, so the input's
+        # layout carries the parent's extent (192) and strides (768, 192), while
+        # the conversion's freshly allocated output is a dense tensor of the view's
+        # shape that inductor indexes densely (256, 64). Describing the output with
+        # the parent's numbers pairs an STL with an index that walks different
+        # memory, and the pass rescales a stick count derived from 192 rather than
+        # from the 64 or 128 elements actually read.
+        #
+        # The parent width decides how the mismatch surfaces, so a single width is
+        # not enough coverage in principle -- 192 raises "Unsupported coordinate
+        # expression 4*c0/3 + c1/3" from normalize_coordinates, 256 is rejected by
+        # the STL constructor, and 128 produces a silently wrong layout with no
+        # diagnostic at all. 192 is used here because it is the only one of the
+        # three that also admits multi-stick slices at both offset 0 and 64.
+        #
+        # The round trip back to fp16 is load-bearing, as in
+        # test_upcast_reduction_num_sticks_dim_collision: leaving the result in
+        # fp32 writes it out without addressing through the malformed layout.
+        #
+        # Values are integers whose partial sums stay <= 1024, so they are exact in
+        # DLFloat16 and torch.equal cannot report a false mismatch.
+        x_cpu = (torch.arange(2 * 4 * 192) % 8).to(torch.float16).reshape(2, 4, 192)
+        x_dev = x_cpu.to("spyre")
+
+        def fn(x):
+            return x.to(torch.float32).sum(-1).to(torch.float16)
+
+        slicers = {
+            "one_stick_offset": lambda t: t[..., 64:128],
+            "two_sticks_at_zero": lambda t: t[:, :, :128],
+            "two_sticks_offset": lambda t: t[:, :, 64:192],
+        }
+
+        for name, slicer in slicers.items():
+            with self.subTest(slice=name):
+                expected = fn(slicer(x_cpu))
+                assert expected.max() <= 1024, (
+                    "oracle must stay in the DLFloat16-exact range"
+                )
+
+                got = torch.compile(fn)(slicer(x_dev)).cpu()
+
+                assert torch.equal(got, expected), (
+                    "upcast+reduction mismatch on a stick-dim slice: "
+                    f"{int((got.float() - expected.float()).abs().gt(0).sum())} of "
+                    f"{expected.numel()} elements differ"
+                )
+
     def test_reduction_with_to_dtype_cpu(self, op, x, dst_dtype):
         def fn(op, x, dst_dtype):
             return op(x, dtype=dst_dtype)
