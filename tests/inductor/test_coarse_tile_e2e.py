@@ -3075,11 +3075,6 @@ def _flash_v2_fn(
     return output / denominator.unsqueeze(-1)
 
 
-@pytest.mark.skip(
-    reason="H-tiling produces a large finite mismatch (~88% of elements,"
-    " max abs diff ~4) -- distinct, still-open H-tiling bug, not"
-    " accumulator inf"
-)
 def test_flash_v2_tile_H():
     """Flash v2: tile H÷4 only."""
     run_coarse_tile_test(
@@ -3093,11 +3088,6 @@ def test_flash_v2_tile_H():
     )
 
 
-@pytest.mark.skip(
-    reason="B-tiling produces a large finite mismatch (~48% of elements,"
-    " max abs diff ~3.5) -- distinct, still-open B-tiling bug, not"
-    " accumulator inf"
-)
 def test_flash_v2_tile_B():
     """Flash v2: tile B÷2 only. B=2."""
     run_coarse_tile_test(
@@ -3135,11 +3125,6 @@ def test_flash_v2_tile_Lk():
         )
 
 
-@pytest.mark.skip(
-    reason="B/H-tiling produces a large finite mismatch (~46% of elements,"
-    " max abs diff ~3.8) -- distinct, still-open B-tiling bug, not"
-    " accumulator inf"
-)
 def test_flash_v2_tile_B_H():
     """Flash v2: tile B÷2 H÷4. B=2."""
     run_coarse_tile_test(
@@ -3308,11 +3293,6 @@ def _flash_v3_fn(
     return output / denominator.unsqueeze(-1)
 
 
-@pytest.mark.skip(
-    reason="flash v3 H-tiling still mismatches after mutation_write_back copy_out "
-    "fix (49% mismatch) -- distinct/deeper bug, not the locally-created-buffer "
-    "copy_out routing issue"
-)
 def test_flash_v3_tile_H():
     """Flash v3: tile H÷4 only."""
     run_coarse_tile_test(
@@ -3324,11 +3304,6 @@ def test_flash_v3_tile_H():
     )
 
 
-@pytest.mark.skip(
-    reason="B-tiling produces a large finite mismatch (~48% of elements,"
-    " max abs diff ~3.5) -- distinct, still-open B-tiling bug, not"
-    " accumulator inf"
-)
 def test_flash_v3_tile_B():
     """Flash v3: tile B÷2 only. B=2."""
     run_coarse_tile_test(
