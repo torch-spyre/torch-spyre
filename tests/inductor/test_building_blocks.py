@@ -384,6 +384,136 @@ class TestBuildingBlocks(unittest.TestCase):
             # docstring.
             compare_with_pytorch(sdpa, sdpa, q, k, v, atol=0.3, rtol=0.3, target=out)
 
+    def _run_granite_gqa_with_finite_broadcast_mask(
+        self,
+        LQ,
+        *,
+        dtype=torch.float16,
+        name_inputs=False,
+        LK=128,
+        transposed_inputs=False,
+        reshape_output=False,
+    ):
+        B, H, N_KV, D = 1, 32, 8, 128
+
+        def sdpa(q, k, v, mask):
+            result = F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                attn_mask=mask,
+                dropout_p=0.0,
+                scale=D**-0.5,
+                enable_gqa=True,
+            )
+            if reshape_output:
+                return result.transpose(1, 2).reshape(B, LQ, H * D)
+            return result
+
+        if transposed_inputs:
+            # Match the model's post-RoPE tensors: logical BHLD views backed by
+            # physical BLHD storage.
+            q = torch.randn(B, LQ, H, D, dtype=dtype).transpose(1, 2)
+            k = torch.randn(B, LK, N_KV, D, dtype=dtype).transpose(1, 2)
+            v = torch.randn(B, LK, N_KV, D, dtype=dtype).transpose(1, 2)
+        else:
+            q = torch.randn(B, H, LQ, D, dtype=dtype)
+            k = torch.randn(B, N_KV, LK, D, dtype=dtype)
+            v = torch.randn(B, N_KV, LK, D, dtype=dtype)
+        query_positions = torch.arange(LK - LQ, LK).view(1, 1, LQ, 1)
+        key_positions = torch.arange(LK).view(1, 1, 1, LK)
+        mask = torch.where(
+            key_positions <= query_positions,
+            torch.tensor(0.0, dtype=dtype),
+            torch.tensor(torch.finfo(dtype).min / 2, dtype=dtype),
+        )
+        self.assertEqual(mask.shape, (B, 1, LQ, LK))
+
+        expected = sdpa(q, k, v, mask)
+        q_dev, k_dev, v_dev, mask_dev = (
+            q.to("spyre"),
+            k.to("spyre"),
+            v.to("spyre"),
+            mask.to("spyre"),
+        )
+        if name_inputs:
+            for name, size in (
+                ("_b", B),
+                ("num_heads", H),
+                ("num_kvheads", N_KV),
+                ("max_seqlen_q", LQ),
+                ("max_seqlen_kv", LK),
+                ("head_dim", D),
+            ):
+                _pnd.declare_tensor_dim(name, size)
+            # The eager naming API omits static unit axes, matching the adapter.
+            logical_names = (
+                ("_b", "num_heads", "max_seqlen_q", "head_dim"),
+                ("_b", "num_kvheads", "max_seqlen_kv", "head_dim"),
+                ("_b", "num_kvheads", "max_seqlen_kv", "head_dim"),
+            )
+            for tensor, names in zip((q_dev, k_dev, v_dev), logical_names, strict=True):
+                _pnd.name_tensor_dims(
+                    tensor,
+                    [
+                        name
+                        for size, name in zip(tensor.shape, names, strict=True)
+                        if size != 1
+                    ],
+                )
+        actual = torch.compile(sdpa, dynamic=False)(q_dev, k_dev, v_dev, mask_dev).cpu()
+        tolerance = 0.2 if dtype is torch.bfloat16 else 0.1
+        torch.testing.assert_close(actual, expected, atol=tolerance, rtol=tolerance)
+
+    _GRANITE_GQA_SKIP_REASON = (
+        "Depends on a factorized-matmul-dimension canonicalization pass over "
+        "propagate_layouts.py from draft PR torch-spyre/torch-spyre#3981 that "
+        "has not been ported yet. Without it, compilation raises "
+        "`Unsupported: Multi-arg pointwise ...: no supported output layout "
+        "found` before these tests get to check numerics. Unskip once that "
+        "layout-propagation work lands."
+    )
+
+    @unittest.skip(_GRANITE_GQA_SKIP_REASON)
+    def test_granite_gqa_decode_with_finite_mask(self):
+        """Decode SDPA uses all KV chunks through an unnamed broadcast mask."""
+        self._run_granite_gqa_with_finite_broadcast_mask(LQ=1)
+
+    @unittest.skip(_GRANITE_GQA_SKIP_REASON)
+    def test_granite_gqa_prefill_with_finite_broadcast_mask(self):
+        """Prefill SDPA accepts the model's ``[B,1,Lq,Lk]`` causal mask.
+
+        The mask deliberately remains unexpanded and unnamed. Expanding or
+        naming its singleton head dimension would hide the Hugging Face path.
+        """
+        self._run_granite_gqa_with_finite_broadcast_mask(LQ=128)
+
+    @unittest.skip(_GRANITE_GQA_SKIP_REASON)
+    @mock.patch("torch_spyre._inductor.decompositions._SDPA_MAX_SEQUENCE_TILE_SIZE", 64)
+    def test_granite_gqa_prefill_four_by_four_sequence_tiling(self):
+        """Exercise Granite's transposed attention inputs and fused consumer."""
+        self._run_granite_gqa_with_finite_broadcast_mask(
+            LQ=256,
+            dtype=torch.bfloat16,
+            name_inputs=True,
+            LK=256,
+            transposed_inputs=True,
+            reshape_output=True,
+        )
+
+    @unittest.skip(_GRANITE_GQA_SKIP_REASON)
+    @mock.patch("torch_spyre._inductor.decompositions._SDPA_MAX_SEQUENCE_TILE_SIZE", 64)
+    def test_granite_gqa_prefill_grouped_sixteen_by_sixteen_tiling(self):
+        """Sixteen KV loop groups preserve Granite's online-softmax carries."""
+        self._run_granite_gqa_with_finite_broadcast_mask(
+            LQ=1024,
+            dtype=torch.bfloat16,
+            name_inputs=True,
+            LK=1024,
+            transposed_inputs=True,
+            reshape_output=True,
+        )
+
     def test_refactored_plain_bundle_codegen(self):
         """Pointwise ops fuse into one bundle via the refactored codegen path."""
 
