@@ -659,3 +659,106 @@ def test_an_untiled_kernel_gets_no_loop_headers(monkeypatch):
     text = cmp.build_report(ops).format()
     assert "not in a loop" not in text
     assert "runs" not in text
+
+
+# ---------------------------------------------------------------------------
+# LX relayout term
+# ---------------------------------------------------------------------------
+
+
+def _relayout_feats(bytes_, cores, run_bytes, split):
+    """A relayout copy as the extractor emits it: LX-only traffic + geometry."""
+    elems = bytes_ // 2
+    f = OpFeatures(
+        name="Pointwise",
+        is_reduction=False,
+        out_elems=elems,
+        cores=cores,
+        dtype_bytes=2,
+        args=[
+            ArgTraffic("buf_copy", "output", True, elems, False, [], []),
+            ArgTraffic("buf_src", "input", True, elems, False, [], []),
+        ],
+        is_lx_relayout=True,
+        relayout_run_elems=run_bytes // 2,
+        relayout_split=split,
+    )
+    # Same contract as _feats: the pass breaks a kernel at any op not on the
+    # Spyre device, so the fixture must answer get_device().
+    f.get_device = lambda: _Device(DEVICE_NAME)
+    return f
+
+
+@pytest.mark.parametrize(
+    ("bytes_", "cores", "run_bytes", "split", "measured_us"),
+    [
+        # Direct named-kernel measurements (main @ 65508a02); the law was fitted
+        # to these at mean +2.5% / RMS 10.0%, so assert to 20%.
+        (2097152, 8, 256, 4, 8.721),
+        (2097152, 8, 512, 2, 2.334),
+        (2097152, 4, 1024, 4, 7.221),
+        (2097152, 32, 1024, 4, 0.990),
+        (4194304, 8, 256, 4, 17.304),
+    ],
+)
+def test_relayout_term_reproduces_measured_rows(
+    bytes_, cores, run_bytes, split, measured_us
+):
+    f = _relayout_feats(bytes_, cores, run_bytes, split)
+    pred_us = cost_model.relayout_ns(f) / 1000.0
+    assert abs(pred_us - measured_us) / measured_us < 0.20
+    # The term is the whole price of an LX-only op: predict_ops == relayout_ns.
+    assert cost_model.predict_ops([f]) == pytest.approx(cost_model.relayout_ns(f))
+
+
+def test_relayout_term_is_zero_for_everything_else():
+    # An ordinary LX-resident op (fused-away intermediate) still prices at 0 --
+    # the term must not become a general LX-bandwidth charge, every other
+    # category's calibration rests on LX being free.
+    f = _feats("lxonly", write_mb=0, lx_mb=1, shared_input=False)
+    assert cost_model.relayout_ns(f) == 0.0
+    assert cost_model.predict_ops([f]) == 0.0
+
+
+def test_relayout_fields_survive_schema_roundtrip_and_old_records():
+    f = _relayout_feats(2097152, 8, 256, 4)
+    back = cost_model.op_from_dict(cost_model.op_to_dict(f))
+    assert cost_model.predict_ops([back]) == pytest.approx(cost_model.predict_ops([f]))
+    # A record written before the fields existed loads and prices unchanged.
+    d = cost_model.op_to_dict(f)
+    for key in (
+        "is_lx_relayout",
+        "relayout_run_elems",
+        "relayout_split",
+    ):
+        d.pop(key)
+    assert cost_model.predict_ops([cost_model.op_from_dict(d)]) == 0.0
+
+
+def test_relayout_split_clamps_to_fitted_range():
+    # Past split 8 the law over-predicts 12-40% (measured at 16): clamp, never
+    # extrapolate. Below 2 the fitted intercept would go negative: clamp up.
+    f16 = _relayout_feats(2097152, 16, 512, 16)
+    f8 = _relayout_feats(2097152, 16, 512, 8)
+    # The WHOLE term clamps: split 16 prices exactly as split 8. Measured, the
+    # unclamped law over-predicts split 16 by 12-40%; the clamp under-predicts
+    # it by ~15% -- bounded either way, and never an extrapolated log2.
+    assert cost_model.relayout_ns(f16) == pytest.approx(cost_model.relayout_ns(f8))
+    f1 = _relayout_feats(2097152, 8, 512, 1)
+    assert cost_model.relayout_ns(f1) > 0.0  # clamped up to 2: never negative
+
+
+def test_relayout_attribution_lands_on_the_relayout_op(monkeypatch):
+    # The shuffle moves no HBM bytes, so byte-share attribution alone showed it
+    # as 0.0 -- the misleading display that motivated the term. Its own cost
+    # must land on it, and the parts must still sum to the kernel total.
+    shuffle = _relayout_feats(2097152, 8, 256, 4)
+    neg = _feats("neg", write_mb=1)
+    ops = _ops([neg, shuffle], monkeypatch)
+    with config.patch({"cost_model": "1"}):
+        report = cmp.build_report(ops)
+    (group,) = report.groups
+    by_name = {o.name: o for o in group.ops}
+    rel_us = cost_model.relayout_ns(shuffle) / 1000.0
+    assert by_name["Pointwise"].predicted_us == pytest.approx(rel_us, rel=1e-6)
+    assert sum(o.predicted_us for o in group.ops) == pytest.approx(group.predicted_us)
