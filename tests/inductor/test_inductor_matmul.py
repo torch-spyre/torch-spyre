@@ -93,3 +93,18 @@ class TestMatmulOps:
         _compare_modes(
             execution_mode, fn, *(eye, a) if left else (a, eye), atol=atol, rtol=rtol
         )
+
+    @pytest.mark.parametrize(
+        "N,K,M",
+        [
+            (16, 64, 64),
+            (16, 128, 192),
+        ],
+        ids=["square", "fused_qkv"],
+    )
+    def test_unit_batch_matmul(self, execution_mode, N, K, M):
+        torch.manual_seed(0)
+        x = torch.randn(1, N, K, dtype=torch.float16)
+        w = torch.randn(K, M, dtype=torch.float16)
+        atol, rtol = _tol(torch.float16)
+        _compare_modes(execution_mode, torch.matmul, x, w, atol=0.1, rtol=0.1)

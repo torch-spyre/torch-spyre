@@ -3654,7 +3654,7 @@ class TestSharedWeightUnitBmmLayout(unittest.TestCase):
         args = [input_arg, kernel_arg, output_arg]
         op_info = {SHARED_WEIGHT_UNIT_BMM_INFO_KEY: {"batch_dim": 0}}
 
-        iteration_space = _preserve_shared_weight_unit_bmm_dim(
+        iteration_space, _ = _preserve_shared_weight_unit_bmm_dim(
             "batchmatmul", iteration_space, args, op_info
         )
         sdsc_spec, _ = parse_op_spec(
@@ -3725,7 +3725,7 @@ class TestSharedWeightUnitBmmLayout(unittest.TestCase):
         }
         op_info = {SHARED_WEIGHT_UNIT_BMM_INFO_KEY: {"batch_dim": 0}}
 
-        new_iteration_space = _preserve_shared_weight_unit_bmm_dim(
+        new_iteration_space, modified_ids = _preserve_shared_weight_unit_bmm_dim(
             "batchmatmul",
             iteration_space,
             [input_arg, kernel_arg, output_arg],
@@ -3733,6 +3733,7 @@ class TestSharedWeightUnitBmmLayout(unittest.TestCase):
         )
 
         self.assertIs(new_iteration_space, iteration_space)
+        self.assertEqual(modified_ids, set())
         self.assertNotIn("_spyre_bmm_unit", {str(dim) for dim in iteration_space})
         self.assertEqual(input_arg.device_size, [512, 32, 2, 1, 64])
         self.assertEqual(

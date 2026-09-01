@@ -110,18 +110,20 @@ def _preserve_shared_weight_unit_bmm_dim(
     it_space: dict[sympy.Symbol, tuple[sympy.Expr, int]],
     args: Sequence[TensorArg],
     op_info: dict[str, Any],
-) -> dict[sympy.Symbol, tuple[sympy.Expr, int]]:
+) -> tuple[dict[sympy.Symbol, tuple[sympy.Expr, int]], set[int]]:
     # TensorArg layout is normalized in-place below to match the surrounding
     # OpSpec construction helpers.
+    # Returns (iteration_space, modified_arg_ids) where modified_arg_ids is the
+    # set of id(arg) for args whose device_coordinates were rewritten.
     if SHARED_WEIGHT_UNIT_BMM_INFO_KEY not in op_info:
-        return it_space
+        return it_space, set()
     if op not in [BATCH_MATMUL_OP, BATCH_MATMUL_FP8_OP]:
-        return it_space
+        return it_space, set()
     if len(it_space) != 3 or len(args) < 3:
-        return it_space
+        return it_space, set()
     info = op_info.get(SHARED_WEIGHT_UNIT_BMM_INFO_KEY)
     if not isinstance(info, dict) or info.get("batch_dim") != 0:
-        return it_space
+        return it_space, set()
 
     unit_sym = sympy.Symbol("_spyre_bmm_unit")
     suffix = 0
@@ -144,20 +146,20 @@ def _preserve_shared_weight_unit_bmm_dim(
     # as attention heads from SDPA, rewriting one axis into the BMM iteration
     # space can produce an illegal SDSC layout.
     if any(len(arg.device_size) > 4 for arg in target_args):
-        return it_space
+        return it_space, set()
     unit_idxs_by_arg = [_unit_indices(arg) for arg in target_args]
 
     if all(len(unit_idxs) == 0 for unit_idxs in unit_idxs_by_arg):
         for arg in target_args:
             if len(arg.device_size) < 2:
-                return it_space
+                return it_space, set()
             insert_at = len(arg.device_size) - 1
             arg.device_size.insert(insert_at, 1)
             arg.device_coordinates.insert(insert_at, sympy.S.Zero)
         unit_idxs_by_arg = [_unit_indices(arg) for arg in target_args]
 
     if not all(len(unit_idxs) == 1 for unit_idxs in unit_idxs_by_arg):
-        return it_space
+        return it_space, set()
 
     rewrite_targets = [
         (arg, unit_idxs[0]) for arg, unit_idxs in zip(target_args, unit_idxs_by_arg)
@@ -172,7 +174,8 @@ def _preserve_shared_weight_unit_bmm_dim(
         arg.device_coordinates[:] = [arg.device_coordinates[i] for i in order]
 
     logger.info("Preserving shared-weight unit BMM dim %s", unit_sym)
-    return {unit_sym: (sympy.S.One, 1), **it_space}
+    modified_ids = {id(arg) for arg, _ in rewrite_targets}
+    return {unit_sym: (sympy.S.One, 1), **it_space}, modified_ids
 
 
 @dataclass
@@ -901,7 +904,7 @@ class SpyreKernel(Kernel[CSEVariable]):
         it_space_extended = iteration_space_with_splits(
             ir_node, self.current_node.read_writes, it_space
         )
-        it_space_extended = _preserve_shared_weight_unit_bmm_dim(
+        it_space_extended, bmm_modified_arg_ids = _preserve_shared_weight_unit_bmm_dim(
             op, it_space_extended, args, op_info
         )
         alignment_inputs = build_operation_alignment_inputs(
@@ -912,6 +915,8 @@ class SpyreKernel(Kernel[CSEVariable]):
             aligned_iteration_space=it_space_extended,
         )
         for arg, tensor in zip(args, alignment_inputs.tensors):
+            if id(arg) in bmm_modified_arg_ids:
+                continue
             if list(arg.device_coordinates) != tensor["coordinates"]:
                 raise RuntimeError(
                     "alignment input collection disagrees with tensor codegen"
