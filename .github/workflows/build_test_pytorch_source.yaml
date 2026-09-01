@@ -342,8 +342,10 @@ jobs:
           # tests (e.g. a matrix/artifact-download problem) must not be
           # recorded as a passing run.
           CONCLUSION: >-
-            ${{
-              (fromJSON(steps.test_results.outputs.test_results_json).total > 0) && 'success' || 'failure'
+            ${{ 
+              fromJSON(steps.test_results.outputs.test_results_json).total > 0
+              && fromJSON(steps.test_results.outputs.test_results_json).failed == 0
+              && 'success' || 'failure'
             }}
           # Empty whenever `build` failed before reaching compute_durations
           # (e.g. the PyTorch/torch-spyre build itself failed) — omitted
@@ -385,8 +387,10 @@ jobs:
         with:
           status: completed
           conclusion: >-
-            ${{
-              (fromJSON(steps.test_results.outputs.test_results_json).total > 0) && 'success' || 'failure'
+            ${{ 
+              fromJSON(steps.test_results.outputs.test_results_json).total > 0
+              && fromJSON(steps.test_results.outputs.test_results_json).failed == 0
+              && 'success' || 'failure'
             }}
           test-results: >-
             {
@@ -410,8 +414,10 @@ jobs:
         with:
           status: completed
           conclusion: >-
-            ${{
-              (fromJSON(steps.test_results.outputs.test_results_json).total > 0) && 'success' || 'failure'
+            ${{ 
+              fromJSON(steps.test_results.outputs.test_results_json).total > 0
+              && fromJSON(steps.test_results.outputs.test_results_json).failed == 0
+              && 'success' || 'failure'
             }}
           test-results: >-
             {
@@ -421,3 +427,79 @@ jobs:
               "total": ${{ fromJSON(steps.test_results.outputs.test_results_json).total }}
             }
           job-name: linux-x86_64 / pytorch / test
+
+      # ---------------------------------------------------------------------------
+      # Report the nightly result to the RHEL CI Results Relay (see
+      # https://github.com/TorchedHat/pytorch-redhat-ci onboarding docs).
+      # Nightly (schedule) only -- same gating as the pytorch/pytorch CRCR
+      # relay's nightly step above.
+      # ---------------------------------------------------------------------------
+      - name: Mint OIDC token for RHEL Results Relay
+        id: rhel_oidc
+        if: always() && github.event_name == 'schedule'
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        with:
+          script: |
+            const token = await core.getIDToken("rhel-results-relay");
+            core.setSecret(token);
+            core.setOutput('token', token);
+
+      - name: Report result to RHEL Results Relay
+        if: always() && github.event_name == 'schedule'
+        # Best-effort only -- see the onboarding docs' "Never gate your CI on
+        # reporting" guidance. A relay outage must never fail this workflow.
+        continue-on-error: true
+        env:
+          OIDC_TOKEN: ${{ steps.rhel_oidc.outputs.token }}
+          CALLBACK_URL: https://hg21hqq0r6.execute-api.us-east-1.amazonaws.com/default/crcr-rhel-workflow
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          WORKFLOW_NAME: ${{ github.workflow }}
+          # Same convention as the pytorch/pytorch CRCR relay's delivery-id
+          # above -- keyed on the bare resolved pytorch_sha, not a composite
+          # string.
+          DELIVERY_ID: ${{ inputs.pytorch_sha }}
+          # Same rule the CRCR relay callbacks above use: only a real
+          # "success" once tests actually ran (total > 0).
+          CONCLUSION: >-
+            ${{
+              steps.test_results.outputs.test_results_json
+              && fromJSON(steps.test_results.outputs.test_results_json).total > 0
+              && fromJSON(steps.test_results.outputs.test_results_json).failed == 0
+              && 'success' || 'failure'
+            }}
+        run: |
+          PAYLOAD=$(jq -n \
+            --arg delivery_id "$DELIVERY_ID" \
+            --arg conclusion "$CONCLUSION" \
+            --arg workflow_name "$WORKFLOW_NAME" \
+            --arg run_id "$RUN_ID" \
+            --arg run_attempt "$RUN_ATTEMPT" \
+            '{
+              schema_version: 1,
+              event_type: "nightly",
+              delivery_id: $delivery_id,
+              status: "completed",
+              conclusion: $conclusion,
+              workflow_name: $workflow_name,
+              run_id: $run_id,
+              run_attempt: $run_attempt,
+              job_name: "linux-x86_64 / pytorch / test"
+            }')
+
+          HTTP_CODE=$(curl -s -o /tmp/response.txt -w "%{http_code}" \
+            -X POST "$CALLBACK_URL" \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer $OIDC_TOKEN" \
+            -d "$PAYLOAD" \
+            --max-time 15)
+
+          BODY=$(cat /tmp/response.txt)
+          echo "HTTP Status: $HTTP_CODE"
+          echo "Response: $BODY"
+
+          if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
+            echo "Result reported successfully to RHEL CI Relay"
+          else
+            echo "::warning::Failed to report result to RHEL CI Relay (HTTP $HTTP_CODE) -- non-blocking"
+          fi

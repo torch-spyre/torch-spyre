@@ -22,7 +22,6 @@ from typing import Any
 
 import sympy
 
-from . import config
 from .logging_utils import get_inductor_logger
 
 from torch._inductor.dependencies import MemoryDep
@@ -420,66 +419,6 @@ def _no_feasible_layout_error(op) -> NotImplementedError:
     return NotImplementedError("\n".join(lines))
 
 
-def greedy_local_min_cost(operations: list) -> None:
-    """Greedy layout selection: process ops in topological order, picking the output layout with minimum local restick cost.
-
-    On cost ties, the first candidate layout (leftmost arg's stick) is chosen. Each op's chosen
-    layout is committed immediately so downstream ops can read it.
-    """
-
-    # Process graph inputs first so all upstreams have committed_stl.
-    # For now inputs are always a set of size 1, since we use it as it
-    # was transferred to device
-    for name in V.graph.graph_input_names:
-        tb = V.graph.graph_inputs[name]
-        if (
-            isinstance(tb, TensorBox)
-            and isinstance(tb.data, StorageBox)
-            and isinstance(tb.data.data, InputBuffer)
-            and hasattr(tb, "layouts")
-        ):
-            if not tb.layouts:
-                raise AssertionError(f"graph input {name} has empty layouts set")
-            stl = next(iter(tb.layouts))
-            tb.data.data.committed_stl = stl
-            tb.committed_stl = stl
-
-    for op in operations:
-        if not hasattr(op, "layouts"):
-            continue  # FallbackKernel and other unhandled op types
-
-        assert hasattr(op, "restick_cost_fn"), (
-            f"op {op.get_name()} has layouts but no restick_cost_fn"
-        )
-        cost_fn = op.restick_cost_fn
-
-        # Collect each input arg's committed layout (finalized by earlier topo iterations).
-        in_layouts = []
-        for ec in cost_fn.edge_costs:
-            buf = V.graph.get_buffer(ec.dep.name)
-            assert hasattr(buf, "committed_stl"), (
-                f"buffer {ec.dep.name} has no committed_stl — "
-                "topological order violated or input not committed"
-            )
-            in_layouts.append(buf.committed_stl)
-
-        assert op.layouts, (
-            f"op {op.get_name()} has restick_cost_fn but no candidate output layouts"
-        )
-        out_stl = None
-        best_cost = float("inf")
-        for candidate_stl in op.layouts:
-            out_layout_cost = cost_fn.cost(in_layouts, candidate_stl)
-            if out_layout_cost < best_cost:
-                best_cost = out_layout_cost
-                out_stl = candidate_stl
-
-        if out_stl is None:
-            raise _no_feasible_layout_error(op)
-
-        op.committed_stl = out_stl
-
-
 # Global Stick Optimizer
 #
 # The global optimizer is a simple forward-propagation algorithm that tracks a frontier of possible
@@ -858,9 +797,5 @@ def beam_global_min_cost(operations: list) -> None:
 def optimize_restickify_locations(graph: GraphLowering) -> None:
     """Select restickify locations for all ops, minimizing total restickify cost."""
     operations = graph.operations
-    if config.global_stick_optimizer:
-        logger.info("optimizer: beam (global)")
-        beam_global_min_cost(operations)
-    else:
-        logger.info("optimizer: greedy (local)")
-        greedy_local_min_cost(operations)
+    logger.info("optimizer: beam (global)")
+    beam_global_min_cost(operations)

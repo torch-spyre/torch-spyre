@@ -624,6 +624,12 @@ std::unique_ptr<JobPlan> JobPlanBuilder::translateJobExecPlan() {
     }
   }
 
+  // Two-stream overlap. Emit the plain triple [HostCompute, H2D, Compute]; the
+  // ctors tag it with roles [Prep, Prep, Dev]. When SPYRE_HAZARD_TRACKER is on,
+  // the launch router splits it across S_prep/S_dev and flex inserts the
+  // cross-stream H2D->Compute edge; off keeps every step on S_dev. Every op
+  // keeps pipeline_barrier=true (per-stream FIFO). No plan rewrite here.
+
   // TODO(jni): expected_input_shapes to be added once provided in SpyreCode
   // Create pinned_buffers vector from pinned_buffer_map_
   // Move tensors from map to avoid unnecessary reference count increments
@@ -654,53 +660,22 @@ JobPlanBuilder::ValidationResult JobPlanBuilder::validate(
   // - Verify shape dimensions are positive
   // - Verify shape count matches number of input tensors
 
-  // P2-14: JobPlan step ordering validation
-  // Enforces the following rule when first step is HostCallback:
-  // - HostCallback→H2D→Compute sequence must be maintained
-  if (!job_plan.steps.empty()) {
-    bool first_is_host_callback = dynamic_cast<const JobPlanStepHostCompute*>(
-                                      job_plan.steps[0].get()) != nullptr;
-
-    if (first_is_host_callback) {
-      enum class ExpectedStep {
-        H2D,      // Expecting H2D after HostCallback
-        Compute,  // Expecting Compute after H2D
-      };
-
-      // Step 0 is already verified as HostCallback; validate from step 1 onward
-      ExpectedStep expected = ExpectedStep::H2D;
-      bool sequence_complete = false;
-
-      for (size_t i = 1; i < job_plan.steps.size(); ++i) {
-        const auto& step = job_plan.steps[i];
-
-        // Check step type using dynamic_cast
-        bool is_h2d =
-            dynamic_cast<const JobPlanStepH2D*>(step.get()) != nullptr;
-        bool is_compute =
-            dynamic_cast<const JobPlanStepCompute*>(step.get()) != nullptr;
-
-        // Validate based on expected state
-        switch (expected) {
-          case ExpectedStep::H2D:
-            TORCH_CHECK(is_h2d, "Step ordering violation at step ", i,
-                        ": HostCallback must be followed by H2D transfer");
-            // H2D must be followed by Compute
-            expected = ExpectedStep::Compute;
-            break;
-
-          case ExpectedStep::Compute:
-            TORCH_CHECK(is_compute, "Step ordering violation at step ", i,
-                        ": H2D transfer must be followed by Compute");
-            sequence_complete = true;
-            break;
-        }
-      }
-
-      TORCH_CHECK(sequence_complete,
-                  "Incomplete step sequence: HostCallback must be followed "
-                  "by H2D transfer and Compute");
+  // Validate step ordering: the checker projects the plan into (StepKind,
+  // StreamRole) and checks each stream's subsequence -- S_prep must be
+  // HostCompute -> H2D, S_dev must be Compute. See checkJobPlanStepOrdering.
+  // A legacy plan with no HostCompute stays valid (single-stream paths).
+  {
+    std::vector<StepKind> kinds;
+    std::vector<StreamRole> roles;
+    kinds.reserve(job_plan.steps.size());
+    roles.reserve(job_plan.steps.size());
+    for (const auto& step : job_plan.steps) {
+      kinds.push_back(classifyStep(*step));
+      roles.push_back(step->role());
     }
+    std::string ordering_error = checkJobPlanStepOrdering(kinds, roles);
+    TORCH_CHECK(ordering_error.empty(),
+                "JobPlan step ordering violation: ", ordering_error);
   }
 
   // P2-15: Host compute metadata validation

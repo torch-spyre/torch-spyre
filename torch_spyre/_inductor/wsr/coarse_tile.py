@@ -298,13 +298,14 @@ def _plan_carried_sum(
     """
 
     data = op.data
+    has_work_div = bool(getattr(op, "work_div_loop_info", None))
     if not (
         isinstance(data, Reduction)
         and data.reduction_type == "sum"
         and getattr(data, "src_dtype", object()) == getattr(data, "dtype", None)
         and not is_nested
-        and is_graph_output
-        and not outside_consumer_names
+        and (is_graph_output or has_work_div)
+        and (not outside_consumer_names or has_work_div)
         and len(info.loop_count) == 1
         and all(not dims for dims in info.loop_tiled_dims)
         and info.loop_tiled_reduction_dims == [[0]]
@@ -939,15 +940,18 @@ def _plan_tiling_propagation(
                         mut_target = op.layout.get_buffer()
                         mut_target_name = mut_target.get_name()
                         target_is_graph_input = mut_target_name in V.graph.graph_inputs
-                        _, target_is_output = _find_outside_consumers_planned(
-                            mut_target_name,
-                            info.loop_group_id,
-                            operations,
-                            name_to_group_outer_key,
+                        target_consumer_names, target_is_output = (
+                            _find_outside_consumers_planned(
+                                mut_target_name,
+                                info.loop_group_id,
+                                operations,
+                                name_to_group_outer_key,
+                            )
                         )
                     except (AttributeError, TypeError):
                         target_is_graph_input = False
                         target_is_output = False
+                        target_consumer_names = []
                         mut_target = None
                     if (
                         target_is_graph_input
@@ -963,20 +967,28 @@ def _plan_tiling_propagation(
                         )
                         continue
                     # Locally-created mutation target that IS the graph
-                    # output (not a graph input): per the comment above,
-                    # this must still go through the normal copy_out path,
-                    # patching graph_outputs by the *target's* name (buf_name
-                    # itself never appears there -- see
-                    # PropagationPlan.graph_output_name).
-                    if target_is_output and mut_target is not None:
+                    # output, and/or is read by other ops outside this loop
+                    # group (e.g. copy_forced(src, acc) where acc is a local
+                    # buffer later read by another op, or is the function's
+                    # return value, or both): must go through the normal
+                    # copy_out path, keyed on the *target's* name -- not
+                    # buf_name, which is the mutation op's own (irrelevant)
+                    # buffer name -- for both consumer redirection
+                    # (PropagationPlan.consumer_lookup_name) and, if
+                    # applicable, graph-output patching
+                    # (PropagationPlan.graph_output_name).
+                    if (
+                        target_is_output or target_consumer_names
+                    ) and mut_target is not None:
                         full_ranges = _compute_full_ranges_planned(op, info)
                         info.propagation = PropagationPlan(
                             kind="copy_out",
                             full_ranges=full_ranges,
                             full_strides=tuple(op.layout.stride),
-                            outside_consumer_names=(),
-                            is_graph_output=True,
+                            outside_consumer_names=tuple(target_consumer_names),
+                            is_graph_output=target_is_output,
                             graph_output_name=mut_target_name,
+                            consumer_lookup_name=mut_target_name,
                         )
                         continue
                 info.propagation = PropagationPlan(kind="loop_internal")
@@ -1897,6 +1909,42 @@ def _order_preserving_symbol_remap(
     )
 
 
+def _fused_iteration_symbol_remap(
+    op: ComputedBuffer,
+    before_symbols: tuple[sympy.Symbol, ...],
+    *,
+    max_trailing_removals: int,
+) -> _IterationSymbolRemap:
+    """Preserve names when fused-loop symbols demonstrably retain their identity.
+
+    ``_capture_logical_iteration_symbols`` cannot describe a many-logical-dims to
+    one-loop-symbol fusion.  For that case, accept only the narrower invariant we
+    can still prove: the post-rewrite symbols are an unchanged prefix of the old
+    symbols.  Reduction variables are appended to the iteration space, so a
+    reduction-range rewrite may additionally remove a known number of trailing
+    symbols.  Output-range rewrites pass zero and therefore cannot silently
+    reinterpret a renumbered surviving dimension.
+    """
+
+    after_symbols = tuple(iteration_space_from_op(op))
+    removed = len(before_symbols) - len(after_symbols)
+    if (
+        removed < 0
+        or removed > max_trailing_removals
+        or before_symbols[: len(after_symbols)] != after_symbols
+    ):
+        raise Unsupported(
+            f"coarse_tile: cannot safely preserve fused work-division symbols "
+            f"for {op.get_name()!r}: before={tuple(map(str, before_symbols))}, "
+            f"after={tuple(map(str, after_symbols))}"
+        )
+
+    return _IterationSymbolRemap(
+        before_symbols=before_symbols,
+        pairs=tuple((symbol, symbol) for symbol in after_symbols),
+    )
+
+
 def _apply_work_div_symbol_remap(
     op: ComputedBuffer, remap: _IterationSymbolRemap | None
 ) -> None:
@@ -1950,11 +1998,13 @@ def _divide_ranges(
     if not ranges:
         return _DivideRangesResult(None, None)
 
-    before_symbols = (
-        _capture_logical_iteration_symbols(op)
-        if tiled_dims and hasattr(op, "work_div_loop_info")
-        else None
-    )
+    before_symbols = None
+    fused_before_symbols = None
+    if tiled_dims and hasattr(op, "work_div_loop_info"):
+        try:
+            before_symbols = _capture_logical_iteration_symbols(op)
+        except Unsupported:
+            fused_before_symbols = tuple(iteration_space_from_op(op))
 
     for i in tiled_dims:
         assert 0 <= i < len(ranges), (
@@ -1990,11 +2040,20 @@ def _divide_ranges(
     _clear_cache(op, _COMPUTED_BUF_FREE_SYMS_KEY)
 
     symbol_remap = None
-    if before_symbols is not None:
+    if before_symbols is not None or fused_before_symbols is not None:
+        # Both capture paths call the memoized iteration-space helper before
+        # ranges are rewritten.  Always invalidate it before observing the new
+        # iteration space, including the fused-dimension fallback.
         invalidate_op_read_writes(op)
-        symbol_remap = _order_preserving_symbol_remap(
-            op, before_symbols, _capture_logical_iteration_symbols(op)
-        )
+        if before_symbols is not None:
+            symbol_remap = _order_preserving_symbol_remap(
+                op, before_symbols, _capture_logical_iteration_symbols(op)
+            )
+        else:
+            assert fused_before_symbols is not None
+            symbol_remap = _fused_iteration_symbol_remap(
+                op, fused_before_symbols, max_trailing_removals=0
+            )
 
     # Sync layout.size, layout.stride, and layout.device_layout with the new ranges.
     layout = getattr(op, "layout", None)
@@ -2059,12 +2118,15 @@ def _divide_reduction_ranges(
     assert isinstance(data, Reduction)
     if not tiled_dims:
         return None
-    before_symbols = (
-        _capture_logical_iteration_symbols(op)
-        if hasattr(op, "work_div_loop_info")
-        else None
-    )
-    reduction_ranges = list(data.reduction_ranges)
+    before_symbols = None
+    fused_before_symbols = None
+    if hasattr(op, "work_div_loop_info"):
+        try:
+            before_symbols = _capture_logical_iteration_symbols(op)
+        except Unsupported:
+            fused_before_symbols = tuple(iteration_space_from_op(op))
+    original_reduction_ranges = tuple(data.reduction_ranges)
+    reduction_ranges = list(original_reduction_ranges)
     for i in tiled_dims:
         assert 0 <= i < len(reduction_ranges), (
             f"coarse_tile: op {op.get_name()!r} tiled reduction dim {i} out of bounds "
@@ -2085,12 +2147,29 @@ def _divide_reduction_ranges(
             reduction_ranges[i] = sympy.sympify(r) / sympy.sympify(loop_count)
     # Reduction is a frozen dataclass; use object.__setattr__ to mutate it.
     object.__setattr__(data, "reduction_ranges", reduction_ranges)
-    if before_symbols is None:
+    if before_symbols is None and fused_before_symbols is None:
         return None
 
     invalidate_op_read_writes(op)
-    return _order_preserving_symbol_remap(
-        op, before_symbols, _capture_logical_iteration_symbols(op)
+    if before_symbols is not None:
+        return _order_preserving_symbol_remap(
+            op, before_symbols, _capture_logical_iteration_symbols(op)
+        )
+
+    active_before = [
+        i
+        for i, extent in enumerate(original_reduction_ranges)
+        if sympy.sympify(extent) != 1
+    ]
+    removed = [i for i in active_before if sympy.sympify(data.reduction_ranges[i]) == 1]
+    # Only reduction symbols at the end of the iteration space may disappear
+    # without renumbering a survivor. Anything else remains ambiguous.
+    trailing_removals = (
+        len(removed) if removed and removed == active_before[-len(removed) :] else 0
+    )
+    assert fused_before_symbols is not None
+    return _fused_iteration_symbol_remap(
+        op, fused_before_symbols, max_trailing_removals=trailing_removals
     )
 
 
@@ -2703,27 +2782,33 @@ def _propagate_tiled_op(
     loop_info = op.loop_info
     loop_group_id = loop_info.loop_group_id
     buf_name = op.get_name()
+    # A MutationLayoutSHOULDREMOVE op whose mutation target (not the op's
+    # own buffer) is what outside ops actually read -- e.g.
+    # copy_forced(src, c) where c is read later -- must have its consumers
+    # re-resolved against the target's name; see PropagationPlan's
+    # consumer_lookup_name docstring.
+    read_lookup_name = propagation.consumer_lookup_name or buf_name
 
     # Resolve consumers at TRANSFORM time, by actual reads rather than by
     # the planning-time name list. Pass 1/2 may have spliced replacements
     # into `operations` under the same names since planning ran (see
     # PropagationPlan's docstring on name stability) -- and Pass 1 may have
     # rewired a planned consumer in another tiled group through a read-copy
-    # staging op, which then performs the group's actual read of buf_name.
-    # Patching only the planned names would miss that staging op, leaving
-    # it draining this op's per-tile scratch while the full buffer goes
-    # unread (issue #4008: 94.6% wrong on two chained hint groups). Any
-    # current reader outside this op's outermost loop group needs the
-    # redirect; the in-group copy-out drain reads buf_name by design and is
-    # excluded by the group test exactly like the planning-time analog
-    # (_find_outside_consumers_planned).
+    # staging op, which then performs the group's actual read of
+    # read_lookup_name. Patching only the planned names would miss that
+    # staging op, leaving it draining this op's per-tile scratch while the
+    # full buffer goes unread (issue #4008: 94.6% wrong on two chained hint
+    # groups). Any current reader outside this op's outermost loop group
+    # needs the redirect; the in-group copy-out drain reads read_lookup_name
+    # by design and is excluded by the group test exactly like the
+    # planning-time analog (_find_outside_consumers_planned).
     own_outer_key = loop_group_id[0]
     planned_names = set(propagation.outside_consumer_names)
     outside_consumers = []
     for o in operations:
         if not isinstance(o, ComputedBuffer) or o is op:
             continue
-        if not _reads_buffer(o, buf_name):
+        if not _reads_buffer(o, read_lookup_name):
             continue
         o_outer = getattr(getattr(o, "loop_info", None), "loop_group_id", (None,))[0]
         # Union of both consumer notions: a planned name that still reads
@@ -2790,7 +2875,9 @@ def _propagate_tiled_op(
     retile_info = _RetiledBufferInfo(
         old_stride, tuple(full_buf.layout.stride), old_size
     )
-    _patch_consumers(outside_consumers, buf_name, full_name, operations, retile_info)
+    _patch_consumers(
+        outside_consumers, read_lookup_name, full_name, operations, retile_info
+    )
     if is_graph_output:
         _patch_graph_outputs(propagation.graph_output_name or buf_name, full_buf)
 
@@ -3162,16 +3249,27 @@ def _insert_copy_op(
             # Tiled down to extent 1 in copy_buf's own write -- no d{i}
             # symbol survives squeeze for _host_dim_to_index_symbol to find.
             # full_buf's own canonical (squeezed-space) index coefficient
-            # for this raw dim -- product of copy_buf's *own* data.ranges
-            # sizes strictly to its right, matching the units
-            # dep.index's surviving d{i} symbols already carry (Inductor
-            # mints those coefficients over the *unsqueezed* data.ranges,
-            # then squeeze only renumbers/drops symbols, never rescales
-            # them) -- not full_buf.layout.stride, which is a raw PyTorch
-            # memory stride in a different unit system that
-            # tiling_expr_to_device_expr's stride_map-based dimension
-            # selection cannot be compared against.
-            host_stride = sympy.prod(copy_ranges[d + 1 :])
+            # for this raw dim -- product of the sizes strictly to its
+            # right, matching the units dep.index's surviving d{i} symbols
+            # already carry (Inductor mints those coefficients over the
+            # *unsqueezed* data.ranges, then squeeze only renumbers/drops
+            # symbols, never rescales them) -- not full_buf.layout.stride,
+            # which is a raw PyTorch memory stride in a different unit
+            # system that tiling_expr_to_device_expr's stride_map-based
+            # dimension selection cannot be compared against.
+            #
+            # Must use full_buf's own (pre-division) sizes here, NOT
+            # copy_ranges (== copy_buf's already-divided data.ranges): a
+            # dim strictly to the right of d that is ITSELF tiled by
+            # another loop level has already been divided down in
+            # copy_ranges, undercounting host_stride by that dim's
+            # division factor. full_buf.get_size() is allocated directly
+            # from full_ranges (see _allocate_full_buffer) in this same
+            # raw dim order and is never divided, so it gives the correct
+            # full extent for both tiled and untiled dims to the right of
+            # d (a no-op substitution for the untiled ones).
+            full_sizes = list(full_buf.get_size())
+            host_stride = sympy.prod(full_sizes[d + 1 :])
             running = sympy.Integer(1)
             for level_idx in reversed(levels_tiling_d):
                 squeezed_advance[level_idx].append((host_stride, running))
@@ -4049,8 +4147,39 @@ def _insert_one_read_copy(
     # a "reduction"-kind plan leak onto this Pointwise passthrough buffer,
     # causing Pass 2 (_insert_all_reduction_ops) to misdispatch it into
     # _propagate_tiled_reduction_op.
+    #
+    # loop_tiled_dims/loop_tiled_reduction_dims must ALSO be recomputed in
+    # copy_buf's own raw-position space here, for the same reason
+    # tiled_dims_per_read/output_tiled_dims are: sizing_op_info's raw
+    # positions name dims in sizing_op's data.ranges, which can (and, for
+    # any sizing_op whose read/write dims don't line up 1:1 with copy_buf's
+    # own -- e.g. a transpose/reshape between them -- generally does) point
+    # at a different dim of copy_buf's own data.ranges at the same raw
+    # index. Downstream consumers of copy_buf.loop_info (e.g.
+    # work_division_constraints.coarse_tile_local_dim_split_domains) read
+    # loop_tiled_dims against copy_buf's own ranges/raw-squeeze table, so a
+    # verbatim carry-over here silently mis-names which dim is tiled at
+    # each level (confirmed by a minimal B+H coarse-tiled matmul repro
+    # misreading the copy's own D axis as sizing_op's H axis). read_level_
+    # extents/write_level_extents (built above) already key each tiled dim
+    # by its correct raw position in copy_buf's own data.ranges -- reuse
+    # those keys instead of sizing_op_info's.
+    copy_loop_tiled_dims = [sorted(level) for level in read_level_extents]
+    # Always empty, unconditionally: a generated copy_buf's own data is
+    # always a Pointwise passthrough (a plain per-tile scratch read or
+    # write-back), never a Reduction, so it has no reduction_ranges of its
+    # own to tile regardless of whether the sizing op it copies for reduces
+    # over a dim. work_division_constraints.coarse_tile_local_dim_split_
+    # domains relies on this: it only indexes reduction_ranges when
+    # ctx.op.data exposes it, so an empty list here is correct, not a
+    # placeholder to fill in later.
+    copy_loop_tiled_reduction_dims: list[list[int]] = [
+        [] for _ in sizing_op_info.loop_count
+    ]
     copy_buf.loop_info = dataclasses.replace(  # type: ignore[attr-defined]
         sizing_op_info,
+        loop_tiled_dims=copy_loop_tiled_dims,
+        loop_tiled_reduction_dims=copy_loop_tiled_reduction_dims,
         tiled_dims_per_read=tiled_dims_per_read,
         output_tiled_dims=output_tiled_dims,
         squeezed_advance_per_read=[squeezed_advance] if copy_reads else [],

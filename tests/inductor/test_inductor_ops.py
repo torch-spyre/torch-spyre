@@ -1020,9 +1020,9 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     cached_randn((3, 11, 2880)),
                     cached_xavier((2880, 2880)),
                 ),
-                "4d_B2_H2_M2048_K2048_N65472": (
+                "4d_B2_H2_M2048_K2048_N65536": (
                     cached_randn((2, 2, 2048, 2048)),
-                    cached_xavier((2, 2, 2048, 65472)),
+                    cached_xavier((2, 2, 2048, 65536)),
                 ),
             },
         },
@@ -6628,6 +6628,23 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
         assert out.shape == (T, E)
         torch.testing.assert_close(out_c.float(), ref.float(), atol=1e-2, rtol=1e-2)
+
+    def test_topk_keep_by_index_moe_router(self):
+        T, E, K = 64, 128, 8
+
+        def route(probs):
+            _, indices = torch.topk(probs, K, dim=-1)
+            weights = torch.ops.spyre.keep_by_index(probs, indices, -1, 0.0)
+            return weights / weights.sum(-1, keepdim=True)
+
+        levels = torch.arange(E, dtype=torch.float16) / 16
+        signs = torch.where(torch.arange(T) % 2 == 0, 1, -1)
+        probs = torch.softmax(signs[:, None] * levels, dim=-1)
+
+        expected = route(probs)
+        result = torch.compile(route, dynamic=False)(probs.to("spyre")).cpu()
+
+        torch.testing.assert_close(result, expected, atol=1e-2, rtol=1e-2)
 
     def test_min_tuple_output_keepdim0(self):
         x = unique_randn_along_dim((5, 7), dim=1)
