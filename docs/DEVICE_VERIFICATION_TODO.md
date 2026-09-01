@@ -11,62 +11,41 @@ index entry, `CustomPostFusionPasses`/pre-scheduling pass-order and
 missing-step errors in `inductor_frontend.md`, the wrong `LAYOUT_SOLVER`
 default in `torch_spyre.rst`, and a stray "Internal reference" heading in
 `spyre_accelerator.md`) have already been fixed directly on this branch.
-The items below are the ones that genuinely need a device.
 
-## 1. KTIR production-path framing
+## Remaining residual gaps (not fixable from this machine)
 
-**File:** `docs/source/compiler/ktir.md`
+A follow-up device-access pass confirmed items 1-3 below (see git history
+on this branch for the fixes). One narrow gap remains, a hard environment
+constraint rather than a doc bug:
 
-The doc frames KTIR as experimental and states production still goes
-through SuperDSC (see lines referencing "production path still goes
-through SuperDSC" and "The README describes it as an experimental...").
-Static analysis confirms there is substantial in-tree KTIR
-implementation (`torch_spyre/_inductor/codegen/ktir.py`,
-`tests/inductor/test_ktir_emitter.py`, `test_ktir_compile.py`,
-`test_ktir_validate.py`, plus two test config YAMLs), but static analysis
-cannot tell whether KTIR is actually exercised on real hardware yet, or
-is still exclusively CI/simulation-only.
+- `docs/source/user_guide/profiling/device_monitoring.md` and the
+  `aiu-smi`-specific rows in `environment_variables.md` /
+  `performance_analysis_methodology.md` describe `aiu-smi` output and its
+  "Known issues" (`rsvmem`/`pt_act` not captured correctly). `aiu-smi`
+  requires a wheel from an internal IBM package mirror not reachable from
+  this machine, so these specific claims remain unverified independently.
+  Everything else in those docs that does not depend on `aiu-smi` itself
+  (env var plumbing, `SENPERFORMANCE=2`/`ideal_cycles.json`, the
+  provenance-naming and profiler-table format) was verified on-device.
 
-**Needs device access to confirm:**
+`ProfilerActivity.PrivateUse1` profiling (`pytorch_profiler.md`) was
+*also* verified on-device this pass: it needs no separate `kineto-spyre`
+wheel — that dependency was obsoleted by the PyTorch 2.12 upgrade (Kineto
+headers now ship with PyTorch itself, and AIUPTI tracing is built
+directly into `torch_spyre`'s native extension). `pytorch_profiler.md`,
+`toolkit_matrix.md`, `contributing/profiling.md`, and
+`examples/profile_ops.py` had stale `kineto-spyre` install instructions
+from before that change; fixed on this branch, along with the same stale
+instruction in the `upgrade-pytorch-version` skill's Step 7. Ran
+`tests/profiler/test_spyre_profiler.py` on-device with no `kineto-spyre`
+package installed to confirm: 9 passed (4 skipped on an unrelated
+`requires_spyre_profiler` build-flag marker), including
+`test_basic_profile`'s `ProfilerActivity.PrivateUse1` capture.
+`profiling/end_to_end_example.md`'s Granite/FMS walkthrough was not run —
+it requires cloning separate FMS repos and downloading a model
+checkpoint, disproportionate to a docs-verification pass (its own
+kineto-spyre note is already correctly scoped to "not required for
+PyTorch 2.13 and later", so left as-is).
 
-- Whether any current model-enablement or perf workflow actually runs the
-  KTIR path against a physical Spyre device (as opposed to only
-  compiling/validating KTIR in CI without executing it).
-- Whether the `ktir.md` "experimental, not the production path" framing
-  is still accurate, or should be updated to describe a partial rollout.
-
-## 2. Runtime/perf claims that can't be confirmed from source alone
-
-**Files:** `docs/source/runtime/*.md`, `docs/source/user_guide/profiling/*.md`
-
-Several docs make claims about runtime behavior (DMA transfer costs,
-profiler counter names/units, actual observed latencies) that are
-consistent with the source code but were not independently verified
-against a running device or real profiler output in this audit.
-
-**Needs device access to confirm:**
-
-- Profiler output examples in `docs/source/user_guide/profiling/` still
-  match the real output format of current profiling infrastructure.
-- Any specific performance numbers or example traces quoted in the docs
-  are still representative.
-
-## 3. Quickstart / example scripts
-
-**Files:** `docs/source/getting_started/quickstart.md`,
-`docs/source/user_guide/examples/`
-
-Code samples were checked for API correctness against current source
-(import paths, function signatures) but were not actually executed,
-since running them requires a Spyre device.
-
-**Needs device access to confirm:**
-
-- Quickstart and example scripts run end-to-end and produce the output
-  shown in the docs.
-
-## How to close out this file
-
-For each item above: reproduce on a device, update the referenced doc
-page if reality has diverged, then delete that section from this file.
-Once all sections are resolved, delete this file entirely.
+This last `aiu-smi` gap is not a documentation defect; it's a follow-up
+for whoever next has access to the internal package mirror.
