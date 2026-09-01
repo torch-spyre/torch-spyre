@@ -2587,3 +2587,36 @@ def test_round_up_to_stick_geometry():
     assert round_up_to_stick(70, torch.float16) == 128
     assert round_up_to_stick(128, torch.float16) == 128
     assert round_up_to_stick(129, torch.float16) == 192
+
+
+def test_coord_cache_detached_after_layout_selection():
+    # The shared device_coordinates memo must not outlive layout selection: its
+    # results depend on V.graph.sizevars optimization hints, whose
+    # precomputed-replacement state keeps growing as compilation proceeds.
+    # Assert the detach reaches every edge rather than trusting the finally.
+    #
+    # Spies on the module-global helper, which optimize_restickify_locations
+    # resolves at call time, rather than on the pass function itself -- the
+    # pass pipeline captures that by reference when it is built, so patching it
+    # would not take.
+    observed = []
+    real = _optimize_restickify._set_coord_cache
+
+    def _spy(operations, cache):
+        real(operations, cache)
+        if cache is None:
+            for op in operations:
+                cost_fn = getattr(op, "restick_cost_fn", None)
+                if cost_fn is None:
+                    continue
+                observed.extend(edge.coord_cache for edge in cost_fn.edge_costs)
+
+    x = _arange(3, 1, 5, 64, span=255)
+    with patch.object(_optimize_restickify, "_set_coord_cache", _spy):
+        _strict(lambda x: (x + x * 3.0).permute(0, 1, 3, 2).contiguous(), x)
+
+    assert observed, "no edge cost maps were reached; the assertion is vacuous"
+    assert all(c is None for c in observed), (
+        f"{sum(c is not None for c in observed)} of {len(observed)} edge cost "
+        "maps still hold a coordinate cache after layout selection"
+    )

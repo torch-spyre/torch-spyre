@@ -399,6 +399,42 @@ class TestUnrepresentableStickCandidates(TestCase):
         d2 = sympy.Symbol("d2", integer=True, nonnegative=True)
         self.assertEqual(device_coordinates(good, dep, None)[-1].free_symbols, {d2})
 
+    def test_cache_matches_uncached_and_copies(self):
+        # A wrong or incomplete cache key would show up as a silently different
+        # layout decision, so pin equality with and without a cache. The cache is
+        # the FOURTH argument: passing it third binds it to indirect_sizes and
+        # every assertion below then holds vacuously.
+        dep, bad, good = self._traced_scenario()
+        cache: dict = {}
+        for stl in (good, bad):
+            key = (stl, dep, None)
+            try:
+                expected = device_coordinates(stl, dep, None)
+            except Unsupported:
+                # Unsupported layouts raise before the store, so the raising
+                # path must be identical with a cache supplied and must leave no
+                # entry of its own -- asserted for this key, not globally, since
+                # the representable layout above has already stored one.
+                with self.assertRaises(Unsupported):
+                    device_coordinates(stl, dep, None, cache)
+                self.assertNotIn(key, cache)
+                continue
+            self.assertEqual(expected, device_coordinates(stl, dep, None, cache))
+            # Pins that the cache path was actually taken, so this cannot go
+            # quietly vacuous again.
+            self.assertIn(key, cache)
+            # Served from the cache on the second call and still agreeing ...
+            first = device_coordinates(stl, dep, None, cache)
+            second = device_coordinates(stl, dep, None, cache)
+            self.assertEqual(expected, second)
+            # ... while handing out a distinct list, so one caller mutating its
+            # result cannot corrupt another's.
+            self.assertIsNot(first, second)
+        self.assertEqual(
+            try_device_coordinates(good, dep, None),
+            try_device_coordinates(good, dep, None, cache),
+        )
+
     def test_reversed_dim_rejected(self):
         # prims.rev / Tensor.flip(0) on a (4, 64) tensor reads
         # x[64*(3 - p0) + p1], i.e. p0 carries a negative coefficient.  No

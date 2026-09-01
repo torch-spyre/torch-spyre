@@ -1102,6 +1102,7 @@ def device_coordinates(
     stl: SpyreTensorLayout,
     dep: MemoryDep,
     indirect_sizes: "dict[sympy.Symbol, int] | None",
+    cache: "dict | None" = None,
 ) -> list[sympy.Expr]:
     """Compute device-space coordinate expressions for a tensor access.
 
@@ -1111,13 +1112,37 @@ def device_coordinates(
         indirect_sizes: {indirect_sym → size} from indirect_sizes_from_op(), or
             None for structural callers (stick-compatibility checks, layout
             matching) where indirect coordinates are irrelevant.
+        cache: optional memo keyed on (stl, dep, indirect_sizes), for a caller
+            that asks the same question repeatedly. The key covers every
+            argument: SpyreTensorLayout compares and hashes over all four of
+            its fields, and MemoryDep is frozen. The result is NOT a pure
+            function of them, though -- concretization consults
+            ``V.graph.sizevars`` optimization hints, whose
+            precomputed-replacement state grows as compilation proceeds -- so a
+            cache must not outlive the graph it was populated for. A fresh list
+            is returned each time, so no caller can mutate another's result
+            through it.
 
     Returns:
         One coordinate expression per device dimension; the last element is
         the stick expression.
     """
+    key = None
+    if cache is not None:
+        sizes_key = (
+            None if indirect_sizes is None else frozenset(indirect_sizes.items())
+        )
+        key = (stl, dep, sizes_key)
+        hit = cache.get(key)
+        if hit is not None:
+            return list(hit)
     coords = alignment_coordinates(stl, dep.index, dep.ranges, indirect_sizes)
+    # Unsupported stick expressions raise here, so they are never cached and
+    # the raising path stays identical whether or not a cache is supplied.
     _check_stick_expr_supported(coords[-1], stl.elems_per_stick())
+    if cache is not None:
+        cache[key] = coords
+        return list(coords)
     return coords
 
 
@@ -1219,6 +1244,7 @@ def try_device_coordinates(
     stl: SpyreTensorLayout,
     dep: MemoryDep,
     indirect_sizes: "dict[sympy.Symbol, int] | None",
+    cache: "dict | None" = None,
 ) -> list[sympy.Expr] | None:
     """Like ``device_coordinates`` but returns ``None`` instead of raising when
     the layout's stick expression is one the backend cannot represent.
@@ -1229,7 +1255,7 @@ def try_device_coordinates(
     when the stick dimension is size-1 in the current op's loop ranges).
     """
     try:
-        return device_coordinates(stl, dep, indirect_sizes)
+        return device_coordinates(stl, dep, indirect_sizes, cache)
     except Unsupported:
         return None
 
@@ -1949,6 +1975,7 @@ def compute_restickify_needed(
     out_stl: SpyreTensorLayout,
     out_dep: MemoryDep,
     op: "ComputedBuffer | None" = None,
+    coord_cache: "dict | None" = None,
 ) -> "tuple[bool, SpyreTensorLayout | None]":
     """Determine whether a restickify is needed for one (in_stl, out_stl) pair.
 
@@ -1958,6 +1985,9 @@ def compute_restickify_needed(
     op: when provided, index-role deps (gather indices) are never stick-constrained
     and always return (False, None).
 
+    coord_cache: optional memo forwarded to try_device_coordinates, shared by a
+    caller that evaluates many layout pairs over the same accesses.
+
     Returns:
       (False, None)   — stick-compatible: no restickify needed
       (True, stl)     — restickify needed, stl is the target STL for the restickified input
@@ -1966,8 +1996,8 @@ def compute_restickify_needed(
     ind_names, _, ind_sizes = indirect_info_from_op(op)
     if in_dep.name in ind_names:
         return False, None
-    idc = try_device_coordinates(in_stl, in_dep, ind_sizes)
-    out_idc = try_device_coordinates(out_stl, out_dep, ind_sizes)
+    idc = try_device_coordinates(in_stl, in_dep, ind_sizes, coord_cache)
+    out_idc = try_device_coordinates(out_stl, out_dep, ind_sizes, coord_cache)
     if idc is None or out_idc is None:
         # One of the layouts has a stick expression the backend cannot
         # represent (e.g. floor(var/N) from a cross-stick access). Such a
