@@ -81,16 +81,32 @@ and pod/CI usage.
 
 ## Device enumeration
 
-Read by torch-spyre
+Read by the `flex` runtime via
 ([`spyre_device_enum.cpp`](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/csrc/spyre_device_enum.cpp))
-at startup to discover the Spyre devices visible to the process.
+to determine how many Spyre devices are visible to the process:
 
 | Variable | Effect |
 |---|---|
-| `PCIDEVICE_IBM_COM_AIU_PF` | Comma-separated list of PCI bus IDs assigned to the container (set by the OpenShift AIU operator or manually) |
-| `AIU_WORLD_RANK_<N>` | PCI bus ID bound to rank `N` |
+| `FLEX_DEVICE` | Device type: `PF`, `VF`, or `MOCK`. Selects how device count is determined |
+| `AIU_WORLD_SIZE` | Number of devices to use; caps the total device count (or is returned directly under `FLEX_DEVICE=MOCK`) |
 | `SPYRE_DEVICES` | Comma-separated list of device indices to use (e.g., `0,2,3`); overrides the default enumeration |
-| `LOCAL_RANK` | Per-process rank set by `torchrun`; used to select the device for each child process |
+
+Read directly by torch-spyre
+([`spyre_guard.cpp`](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/csrc/spyre_guard.cpp))
+to pick the device for the current process:
+
+| Variable | Effect |
+|---|---|
+| `LOCAL_RANK` | Per-process rank set by `torchrun`; used to select the device for each child process (defaults to 0 if unset) |
+
+Set by the OpenShift AIU operator (or manually) and consumed by launch/test
+scripts and the Spyre runtime's own diagnostic log dump, not read directly by
+torch-spyre's device-enumeration code:
+
+| Variable | Effect |
+|---|---|
+| `PCIDEVICE_IBM_COM_AIU_PF` | Comma-separated list of PCI bus IDs assigned to the container |
+| `AIU_WORLD_RANK_<N>` | PCI bus ID bound to rank `N` |
 
 ## Runtime / driver (for `aiu-smi` and `aiu-trace-analyzer`)
 
