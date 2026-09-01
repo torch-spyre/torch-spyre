@@ -831,6 +831,21 @@ def find_stick_compatible_input_layout(
     2. Else return the first layout that can be restickified to put reduction_var on the stick.
     3. Else raise Unsupported.
     """
+    logger.debug(
+        "[find_stick_compatible_input_layout] label=%r reduction_type=%r\n"
+        "  arg.dep.name      = %s\n"
+        "  reduction_var     = %s\n"
+        "  arg.layout.size   = %s\n"
+        "  arg.layout.stride = %s\n"
+        "  arg.layouts       = %s",
+        label,
+        reduction_type,
+        arg.dep.name,
+        reduction_var,
+        list(arg.layout.size),
+        list(arg.layout.stride),
+        arg.layouts,
+    )
     # Skip candidates whose stick expression the backend cannot represent
     # (e.g. floor(var/N) from a cross-stick access); they are not usable inputs
     # and another candidate may work.
@@ -884,6 +899,45 @@ def _matmul_layouts(
     data = op.data
     _check_supported_input_sticks(args, data.reduction_type)
     out_coords = host_coordinates(output, output_dep, None)
+
+    logger.debug(
+        "[_matmul_layouts] output (%s):\n"
+        "  host size   = %s\n"
+        "  host stride = %s\n"
+        "  dep ranges  = %s\n"
+        "  dep index   = %s\n"
+        "  host coords = %s",
+        output_dep.name,
+        list(output.size),
+        list(output.stride),
+        dict(output_dep.ranges),
+        output_dep.index,
+        out_coords,
+    )
+    if logger.isEnabledFor(logging.DEBUG):
+        for i, arg in enumerate(args):
+            stl = arg.layouts[0]
+            h_coords = host_coordinates(arg.layout, arg.dep, None)
+            d_coords = device_coordinates(stl, arg.dep, None)
+            logger.debug(
+                "[_matmul_layouts] input[%d] (%s):\n"
+                "  host size   = %s\n"
+                "  host stride = %s\n"
+                "  dep ranges  = %s\n"
+                "  dep index   = %s\n"
+                "  STL         = %s\n"
+                "  host coords = %s\n"
+                "  dev coords  = %s",
+                i,
+                arg.dep.name,
+                list(arg.layout.size),
+                list(arg.layout.stride),
+                dict(arg.dep.ranges),
+                arg.dep.index,
+                stl,
+                h_coords,
+                d_coords,
+            )
 
     x_dep, y_dep = identify_matmul_inputs([a.dep for a in args], output_dep)
     if x_dep is None or y_dep is None:
