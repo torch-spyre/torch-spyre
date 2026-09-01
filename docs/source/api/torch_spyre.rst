@@ -684,8 +684,6 @@ Environment Variables
        passed in as ``%pool_base_addr``, instead of the backend
        self-allocating via ``sdscbundle.device_mem_allocate``
        (default ``0``)
-   * - ``GLOBAL_STICK_OPTIMIZER``
-     - Enable the global stick-dimension optimizer (default ``1``)
    * - ``SPYRE_CORE_ID_K_FAST_EMISSION``
      - Permute physical core IDs at SDSC emission so K-collaborator cores
        sit on adjacent ring positions, reducing PSUM chain hops (default
