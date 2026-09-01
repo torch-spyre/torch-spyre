@@ -25,6 +25,71 @@ from torch._inductor.virtualized import V
 from .errors import Unsupported
 
 
+def _mixed_radix_digits(expr, var, var_range, mods):
+    """Describe an exact quotient/remainder digit chain for ``var``.
+
+    A flattened loop variable commonly reaches a pre-flatten view as adjacent
+    mixed-radix digits, for example ``Mod(hd, 128)`` and
+    ``Mod(FloorDiv(hd, 128), 32)`` for a flattened ``H*D`` axis. Multiple Mods
+    are safe in that case: each digit addresses a distinct tensor dimension.
+
+    Return the digits in low-to-high order, or ``None`` when the expressions
+    overlap, leave a gap, or do not cover the variable's full range. Keeping
+    this recognition deliberately strict preserves rejection of ambiguous
+    combinations such as ``Mod(x, 4) + Mod(x, 6)``.
+    """
+    term = expr.xreplace({s: 0 for s in expr.free_symbols - {var}})
+    var_terms = [addend for addend in sympy.Add.make_args(term) if addend.has(var)]
+    if len(var_terms) != len(mods):
+        return None
+
+    digits = []
+    for node in mods:
+        containing = [addend for addend in var_terms if addend.has(node)]
+        if len(containing) != 1:
+            return None
+        addend = containing[0]
+        if len([m for m in addend.atoms(sympy.Mod) if m.has(var)]) != 1:
+            return None
+
+        base, modulus = node.args
+        if base == var:
+            divisor = sympy.S.One
+        elif isinstance(base, FloorDiv) and base.args[0] == var:
+            divisor = base.args[1]
+        else:
+            return None
+
+        coeff = sympy.simplify(addend / node)
+        if (
+            coeff.has(var)
+            or coeff.is_Rational is not True
+            or coeff <= 0
+            or (coeff.numerator != 1 and coeff.denominator != 1)
+        ):
+            return None
+        if any(not value.is_Integer or value <= 0 for value in (divisor, modulus)):
+            return None
+        digits.append(
+            {
+                "node": node,
+                "modulus": modulus,
+                "divisor": divisor,
+                "coeff": coeff,
+            }
+        )
+
+    digits.sort(key=lambda digit: int(digit["divisor"]))
+    if digits[0]["divisor"] != 1:
+        return None
+    for low, high in zip(digits, digits[1:]):
+        if sympy.simplify(low["divisor"] * low["modulus"] - high["divisor"]) != 0:
+            return None
+    if sympy.simplify(digits[-1]["divisor"] * digits[-1]["modulus"] - var_range) != 0:
+        return None
+    return digits
+
+
 def find_repeat_vars(index_exprs, var_ranges):
     repeat_info = {}
     for var, var_range in var_ranges.items():
@@ -34,12 +99,16 @@ def find_repeat_vars(index_exprs, var_ranges):
             for m in all_mods:
                 if m.has(var):
                     mods.append(m)
-            if len(mods) != 1:
-                if len(mods) > 1:
+            if len(mods) > 1:
+                digits = _mixed_radix_digits(expr, var, var_range, mods)
+                if digits is None:
                     raise Unsupported(
                         f"variable {var} (range {var_range}) appears in multiple Mod "
                         f"expressions {mods} and cannot be mapped to coordinates."
                     )
+                repeat_info[var] = {"kind": "mixed_radix", "digits": digits}
+                break
+            if len(mods) == 0:
                 continue
             node = mods[0]
             base, modulus = node.args
@@ -330,6 +399,13 @@ def compute_coordinates(
             elif info["kind"] == "mul_mod":
                 coeff = info["coeff"]
                 add_term(var=info["node"], step=coeff, limit=coeff * info["modulus"])
+            elif info["kind"] == "mixed_radix":
+                for digit in info["digits"]:
+                    add_term(
+                        var=digit["node"],
+                        step=digit["coeff"],
+                        limit=digit["coeff"] * digit["modulus"],
+                    )
             continue
 
         # compute index({var=1}) and index({var=var_ranges[var]})
@@ -442,6 +518,53 @@ def normalize_coordinates(
     device dims with a constant zero coordinate are dropped, and do not stop
     the dims on either side of them from fusing.
     """
+
+    def normalize_var_expr(term, var, var_range, dim_size):
+        """Convert one single-variable coordinate term to ``Term``.
+
+        ``Mod(FloorDiv(var, divisor), radix)`` is one digit of a
+        mixed-radix decomposition. Its equivalent normalized form is
+        ``(var % (divisor * radix)) // divisor``; retaining both bounds is
+        essential when ``align_tensors`` splits the original loop variable.
+        """
+        coeff = sympy.S.One
+        body = term
+        if term.func == sympy.Mul and term.args[0].is_rational:
+            coeff, body = term.args
+            # TODO: handle non-unit fractions
+            # https://github.com/torch-spyre/torch-spyre/issues/1353
+            assert coeff.numerator == 1 or coeff.denominator == 1, (
+                f"Unsupported coordinate expression {term}"
+            )
+
+        divisor = sympy.S.One
+        modulus = var_range
+        if body == var:
+            pass
+        elif isinstance(body, FloorDiv) and body.args[0] == var:
+            divisor = body.args[1]
+        elif body.func == sympy.Mod:
+            base, radix = body.args
+            if base == var:
+                modulus = radix
+            elif isinstance(base, FloorDiv) and base.args[0] == var:
+                divisor = base.args[1]
+                modulus = divisor * radix
+            else:
+                raise Unsupported(
+                    f"Unsupported modular coordinate expression {body} for {var}"
+                )
+        else:
+            raise Unsupported(f"Unsupported coordinate expression {term}")
+
+        return Term(
+            coeff.numerator,
+            coeff.denominator * divisor,
+            var,
+            modulus,
+            dim_size,
+        )
+
     # terms in non-increasing stride order
     terms = []
 
@@ -489,28 +612,7 @@ def normalize_coordinates(
 
             # extract term for each var
             term = expr.xreplace({v: 0 for v in vars - {var}}) - offset
-            # pattern match expression tree, there is small number of possibilities
-            if term.is_symbol:
-                dim_terms.append(
-                    Term(sympy.S.One, sympy.S.One, var, var_range, dim_size)
-                )
-            elif term.func == sympy.Mod:
-                dim_terms.append(
-                    Term(sympy.S.One, sympy.S.One, var, term.args[1], dim_size)
-                )
-            elif term.func == sympy.Mul and term.args[0].is_rational:
-                expr0, expr1 = term.args
-                mod = expr1.args[1] if expr1.func == sympy.Mod else var_range
-                # TODO: handle non-unit fractions
-                # https://github.com/torch-spyre/torch-spyre/issues/1353
-                assert expr0.numerator == 1 or expr0.denominator == 1, (
-                    f"Unsupported coordinate expression {expr}"
-                )
-                dim_terms.append(
-                    Term(expr0.numerator, expr0.denominator, var, mod, dim_size)
-                )
-            else:
-                assert False, f"Unsupported coordinate expression {expr}"
+            dim_terms.append(normalize_var_expr(term, var, var_range, dim_size))
         # sort dim_terms in increasing (num, mod) order so that z + offset
         # vars (num=1, mod=1) always sort before real iteration vars (num=1, mod=N)
         # when num is equal
