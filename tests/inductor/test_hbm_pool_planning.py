@@ -889,6 +889,45 @@ class TestHbmPoolPlanningE2E(InductorTestCase):
         self.assertIn("async_compile.sdsc(", src)
         self.assertNotIn("pool_size", src)
 
+    @config.patch({"lx_planning": False})
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+    def test_alias_read_in_another_bundle_blocks_pool_eligibility(self):
+        """A co-allocated sibling read by another bundle must keep the whole
+        allocation off the pool.
+
+        copy_forced's lowering builds a MutationLayoutSHOULDREMOVE buffer, so
+        several buffer names share one layout.allocation dict. Assigning a
+        pool offset writes into that shared dict, relocating EVERY name on it
+        -- including names that were never pool candidates and so were never
+        passed to _is_cross_bundle. When such a sibling is read by a later
+        bundle, that bundle addresses it pool-relative while owning no pool
+        of its own, and generate_bundle's `pool_size=0 out of range ... for a
+        bundle with a pool symbol present` assertion fires.
+
+        torch.sin is a CPU fallback and forces the bundle boundary; the
+        multiply after it is compiled, so the read of `acc` lands in a second
+        compiled bundle rather than in fallback_read.
+        """
+
+        def fn(x, y):
+            acc = torch.zeros_like(x)
+            acc = torch.ops.spyre.copy_forced(x + y, acc)
+            s = torch.sin(x)  # CPU fallback -- forces a bundle boundary
+            return acc * 2 + s  # second compiled bundle reads `acc`
+
+        x = torch.randn(64, 64, dtype=torch.float16, device="spyre")
+        y = torch.randn(64, 64, dtype=torch.float16, device="spyre")
+
+        with (
+            mock_patch(_LAUNCH_JOBPLAN),
+            mock_patch(_PREPARE_KERNEL),
+            mock_patch("subprocess.run"),
+            pytest.warns(UserWarning),
+        ):
+            # Without the alias-read guard this raises InductorError from
+            # generate_bundle's pool_size assertion.
+            torch.compile(fn)(x, y)
+
 
 if __name__ == "__main__":
     unittest.main()
