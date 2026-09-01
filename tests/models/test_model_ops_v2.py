@@ -209,6 +209,18 @@ _FACTORY_OPS: Set[str] = {
     "torch.empty",
 }
 
+# Ops whose output holds uninitialized memory. Their element values are
+# non-deterministic, so CPU and Spyre results can never be compared by value;
+# only tensor metadata (shape, dtype, layout) is checked for these.
+_UNINITIALIZED_OUTPUT_OPS: Set[str] = {
+    "torch.empty",
+    "torch.empty_like",
+    "torch.empty_strided",
+    "torch.empty_permuted",
+    "torch.new_empty",
+    "torch.new_empty_strided",
+}
+
 
 def _normalize_out(out: Any) -> Any:
     if torch.is_tensor(out):
@@ -234,6 +246,36 @@ def _confirm_device(x: Any, expected: torch.device) -> bool:
     return True
 
 
+def _assert_same_metadata(
+    ref: torch.Tensor,
+    got: torch.Tensor,
+    *,
+    case_name: str,
+    description: Optional[str],
+) -> None:
+    """Compare tensor metadata only, ignoring the element values.
+
+    Used for ops such as ``torch.empty_like`` whose output holds uninitialized
+    memory: the values are non-deterministic by definition, so only
+    shape/dtype/layout are meaningful to check.
+    """
+    mismatches = []
+    if tuple(got.shape) != tuple(ref.shape):
+        mismatches.append(f"shape: expected {tuple(ref.shape)}, got {tuple(got.shape)}")
+    if got.dtype != ref.dtype:
+        mismatches.append(f"dtype: expected {ref.dtype}, got {got.dtype}")
+    if got.layout != ref.layout:
+        mismatches.append(f"layout: expected {ref.layout}, got {got.layout}")
+
+    if mismatches:
+        details = "\n".join(mismatches)
+        raise AssertionError(
+            f"{case_name} FAILED: output metadata does not match reference\n"
+            f"{details}\n"
+            f"location: {description}\n"
+        )
+
+
 def _assert_close(
     tc: TestCase,
     ref: Any,
@@ -243,10 +285,16 @@ def _assert_close(
     rtol: float,
     case_name: str,
     description: Optional[str],
+    metadata_only: bool = False,
 ) -> None:
     ref = _normalize_out(ref)
     got = _normalize_out(got)
     if torch.is_tensor(ref):
+        if metadata_only:
+            _assert_same_metadata(
+                ref, got, case_name=case_name, description=description
+            )
+            return
         try:
             tc.assertEqual(got, ref, atol=atol, rtol=rtol)
         except AssertionError as e:
@@ -267,7 +315,11 @@ def _assert_close(
                 rtol=rtol,
                 case_name=case_name,
                 description=description,
+                metadata_only=metadata_only,
             )
+        return
+    if metadata_only:
+        assert type(got) is type(ref)
         return
     assert got == ref
 
@@ -540,6 +592,7 @@ class TestSpyreModelOps(TestCase):
                 rtol=rtol,
                 case_name=method_name,
                 description=description,
+                metadata_only=op_name in _UNINITIALIZED_OUTPUT_OPS,
             )
         finally:
             torch._dynamo.reset()
