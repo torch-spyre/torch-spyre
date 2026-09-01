@@ -531,8 +531,20 @@ def _relayout_features(op, out_dims):
         if run_elems <= 0 or split <= 0:
             return zeros
         return True, run_elems, split
-    except Exception:  # noqa: BLE001 - a diagnostic feature must not sink a compile
+    except Exception as exc:  # noqa: BLE001 - a diagnostic feature must not sink a compile
+        # Deliberately broad, but never silent: a regression in the registry
+        # lookup (say an AttributeError from a PerCoreView refactor) must not
+        # masquerade as "no relayouts found" forever.
+        _relayout_logger().debug(
+            "relayout feature extraction failed for %s: %r", op.get_name(), exc
+        )
         return zeros
+
+
+def _relayout_logger():
+    from .logging_utils import get_inductor_logger
+
+    return get_inductor_logger("dump_cost_model")
 
 
 def extract_op_features(
