@@ -24,4 +24,5 @@ test_suite_config:
             - test_find_device_overlaps
             - test_find_device_overlaps_invalid_events
             - test_kernel_time_overlap
+            - test_trace_analyzer_device_overlap
           mode: mandatory_success
