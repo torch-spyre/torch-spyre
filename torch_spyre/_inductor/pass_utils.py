@@ -901,12 +901,18 @@ def identify_matmul_inputs(
     return inputs[0], inputs[1]
 
 
-def find_reduction_var(x_dep: MemoryDep, out_dep: MemoryDep) -> sympy.Symbol:
-    """Return the single loop variable that appears in x's index but not in the output's.
+def find_reduction_var(inputs: Sequence[MemoryDep], out_dep: MemoryDep) -> sympy.Symbol:
+    """Return the single input iteration symbol reduced from the output.
 
-    Raises Unsupported if the count is not exactly 1.
+    Symbols must have a range on the input dependency that uses them. Indirect
+    gather/scatter address symbols are not iteration dimensions.
     """
-    reduction_vars = x_dep.index.free_symbols - out_dep.index.free_symbols
+    reduction_vars = {
+        sym
+        for inp in inputs
+        for sym in inp.index.free_symbols
+        if sym in inp.ranges and not is_indirect(sym.name)
+    } - out_dep.index.free_symbols
     if len(reduction_vars) != 1:
         raise Unsupported(
             f"expected exactly 1 reduction variable, got {reduction_vars}"

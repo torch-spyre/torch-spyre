@@ -399,9 +399,11 @@ def _single_arg_op_layout(
     in_layout: FixedLayout,
     stl: SpyreTensorLayout,
 ) -> list[SpyreTensorLayout]:
-    """
-    Compute the output STL(s) for a single-arg op given one candidate input STL.
+    """Compute output STL(s) for one candidate input STL of a single-arg op.
+
     Called once per candidate input STL to produce corresponding output STL(s).
+    An empty result means this candidate cannot produce a supported output layout;
+    callers continue trying the other input STLs and fail only if none are usable.
     """
     data = op.data
     c_size = [concretize_expr(s) for s in output.size]
@@ -416,7 +418,9 @@ def _single_arg_op_layout(
         )
         stick_size = get_elem_in_stick(out_dtype_for_layout)
 
-        x_dev_coords = device_coordinates(stl, dep, None)
+        x_dev_coords = try_device_coordinates(stl, dep, None)
+        if x_dev_coords is None:
+            return []
         x_stick_expr = x_dev_coords[-1]
         reduction_var = next(
             iter(dep.index.free_symbols - output_dep.index.free_symbols), None
@@ -724,7 +728,7 @@ def _exx2_layout(
     out_stl = SpyreTensorLayout(
         c_size, c_stride, output.dtype, out_dim_order, ElementArrangement.EXX2
     )
-    reduction_var = find_reduction_var(x.dep, output_dep)
+    reduction_var = find_reduction_var((x.dep,), output_dep)
     req_in_stl = find_stick_compatible_input_layout(x, reduction_var, "exx2", "x")
     op.restick_cost_fn = FixedInOutNode.from_args(args, out_stl, [req_in_stl], op)
     return [out_stl]
@@ -745,7 +749,7 @@ def _layernormnorm_layout(
     c_size = [concretize_expr(s) for s in output.size]
     c_stride = [concretize_expr(s) for s in output.stride]
     out_stl = SpyreTensorLayout(c_size, c_stride, output.dtype, out_dim_order)
-    reduction_var = find_reduction_var(x.dep, output_dep)
+    reduction_var = find_reduction_var((x.dep,), output_dep)
     req_in_stl = find_stick_compatible_input_layout(
         x, reduction_var, "layernormnorm", "x"
     )
@@ -952,7 +956,7 @@ def _matmul_layouts(
     #   Input1 (x): stick on reduction_var (loop var absent from output)
     #   Input2 (y): stick on generated_var (loop var present in output, absent from x)
     #   Output:     stick on generated_var
-    reduction_var = find_reduction_var(x.dep, output_dep)
+    reduction_var = find_reduction_var((x.dep,), output_dep)
     generated_var = find_matmul_generated_var(y.dep, x.dep, output_dep, op)
 
     x_req_stl = find_stick_compatible_input_layout(
@@ -1455,7 +1459,7 @@ def _topk_layouts(
     out_coords = host_coordinates(output, output_dep, None)
 
     # Reduction var: in x's index but absent from output's.
-    reduction_var = find_reduction_var(x.dep, output_dep)
+    reduction_var = find_reduction_var((x.dep,), output_dep)
 
     # Coords that survive the reduction into the output.
     surviving_coords = [

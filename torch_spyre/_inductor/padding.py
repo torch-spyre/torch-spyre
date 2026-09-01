@@ -249,7 +249,7 @@ def insert_bmm_padding(graph: GraphLowering) -> None:
             )
             continue
 
-        reduction_var = find_reduction_var(x_dep, write_dep)
+        reduction_var = find_reduction_var((x_dep,), write_dep)
 
         # y's K host dim: the dim whose host coordinate contains reduction_var.
         y_buf_tmp = graph.get_buffer(y_dep.name)

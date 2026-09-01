@@ -20,15 +20,18 @@
 
 import collections
 import math
+from unittest.mock import patch
 
 import pytest
+import sympy
 import torch
+from torch._inductor.dependencies import MemoryDep
 from torch._inductor.ir import ComputedBuffer
-from unittest.mock import patch
 
 import torch_spyre._inductor.passes as _passes
 import torch_spyre._inductor.wsr.propagate_named_dims as _pnd
 from torch_spyre._inductor import spyre_hint as _spyre_hint
+from torch_spyre._inductor.pass_utils import find_reduction_var
 from utils_inductor import _compile_and_run
 
 DEVICE = torch.device("spyre")
@@ -38,7 +41,7 @@ DEVICE = torch.device("spyre")
 # surviving loop variable for both pointwise and reduction ops.
 # (Verified: test_2d_add and test_2d_reduce_on_M both assign d0 across 3 runs.)
 _CaptureResult = collections.namedtuple(
-    "_CaptureResult", ["propagated_dims", "dim_hints"]
+    "_CaptureResult", ["propagated_dims", "reduction_dims", "dim_hints"]
 )
 
 # Dim sizes shared by the attention-shaped tests.
@@ -55,12 +58,14 @@ def _run_and_capture(
     tensor_dims,
     *,
     expected_propagated_dims=None,
+    expected_reduction_dims=None,
     expected_dim_hints=None,
 ):
     """Declare dims, annotate device tensors, compile, return _CaptureResult.
 
     named_dims: the output op's _dim_prop_info.named_dims (captured between
         propagate_named_dims and assign_dim_hints).
+    reduction_dims: the output op's _dim_prop_info.reduction_named_dims.
     dim_hints: the output op's dim_hints list (captured after assign_dim_hints).
 
     If expected_propagated_dims is provided, asserts result.propagated_dims matches.
@@ -92,6 +97,11 @@ def _run_and_capture(
         ]
         if output_ops:
             captured["named_dims"] = list(output_ops[-1]._dim_prop_info.named_dims)
+            captured["reduction_dims"] = (
+                list(output_ops[-1]._dim_prop_info.reduction_named_dims)
+                if output_ops[-1]._dim_prop_info.reduction_named_dims is not None
+                else None
+            )
 
     def capturing_assign(graph):
         real_assign(graph)
@@ -126,6 +136,7 @@ def _run_and_capture(
 
     result = _CaptureResult(
         propagated_dims=captured.get("named_dims", []),
+        reduction_dims=captured.get("reduction_dims"),
         dim_hints=captured.get("dim_hints", []),
     )
 
@@ -133,6 +144,12 @@ def _run_and_capture(
         assert result.propagated_dims == expected_propagated_dims, (
             f"named_dims mismatch:\n  got:      {result.propagated_dims}"
             f"\n  expected: {expected_propagated_dims}"
+        )
+
+    if expected_reduction_dims is not None:
+        assert result.reduction_dims == expected_reduction_dims, (
+            f"reduction_named_dims mismatch:\n  got:      {result.reduction_dims}"
+            f"\n  expected: {expected_reduction_dims}"
         )
 
     if expected_dim_hints is not None:
@@ -1116,6 +1133,56 @@ def test_gather_advanced_indexing_2d():
         tensor_dims={x: ["M", "N"], i: ["P"]},
         expected_propagated_dims=["P", "N"],
     )
+
+
+def test_keep_by_index_reduction_dim_from_indices():
+    tokens, experts, selected = 64, 128, 8
+    probs = torch.rand(tokens, experts, dtype=torch.float16, device=DEVICE)
+    indices = torch.randint(
+        0, experts, (tokens, selected), dtype=torch.int32, device=DEVICE
+    )
+
+    def fn(probs, indices):
+        return torch.ops.spyre.keep_by_index(probs, indices, -1, 0.0)
+
+    _run_and_capture(
+        fn,
+        [probs, indices],
+        named_dims={"T": tokens, "E": experts, "K": selected},
+        tensor_dims={probs: ["T", "E"], indices: ["T", "K"]},
+        expected_propagated_dims=["T", "E"],
+        expected_reduction_dims=["K"],
+    )
+
+
+def test_reduction_range_can_come_from_later_input():
+    output_sym, reduction_sym = sympy.symbols("output reduction")
+    first_input = MemoryDep("data", output_sym, (output_sym,), (64,))
+    indices = MemoryDep(
+        "indices",
+        8 * output_sym + reduction_sym,
+        (output_sym, reduction_sym),
+        (64, 8),
+    )
+
+    assert _pnd._input_range_for_symbol([first_input, indices], reduction_sym) == 8
+
+
+def test_find_reduction_var_across_inputs_ignores_non_iteration_symbols():
+    output_sym, reduction_sym, indirect_sym, address_sym = sympy.symbols(
+        "output reduction indirect0 address_coefficient"
+    )
+    first_input = MemoryDep("first", output_sym, (output_sym,), (64,))
+    data = MemoryDep(
+        "data",
+        output_sym + reduction_sym + indirect_sym + address_sym,
+        (output_sym, reduction_sym),
+        (64, 8),
+    )
+    output = MemoryDep("output", output_sym, (output_sym,), (64,))
+
+    assert find_reduction_var([first_input, data], output) == reduction_sym
+    assert find_reduction_var([data], output) == reduction_sym
 
 
 def test_gather_advanced_indexing_with_exp():
