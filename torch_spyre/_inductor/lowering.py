@@ -75,6 +75,41 @@ def _current_fx_custom_meta() -> dict[str, Any]:
     return custom if isinstance(custom, dict) else {}
 
 
+def _aten_result_dtype() -> torch.dtype | None:
+    """The output dtype ATen's own meta function already decided for the FX
+    node currently being lowered, e.g. via its dim-aware promotion (a 0-D
+    operand doesn't win over a same-category dimensioned tensor).
+    ``register_spyre_lowering``'s ``broadcast=True`` materializes any 0-D
+    operand to full rank before a pointwise lowering runs, which loses that
+    distinction and lets the (already rank-expanded) inputs promote to the
+    wrong (wider) dtype on their own. Reading the answer straight from the
+    traced FX node sidesteps re-deriving promotion from shapes already
+    broadcast away.
+    """
+    node = V.get_current_node()
+    val = getattr(node, "meta", {}).get("val") if node is not None else None
+    return val.dtype if isinstance(val, torch.Tensor) else None
+
+
+def _fixup_promoted_dtype(out, expected_dtype: torch.dtype | None):
+    """Correct ``out``'s dtype to ``expected_dtype`` when Spyre's own (already
+    rank-expanded, see ``_aten_result_dtype``) promotion picked the wrong one.
+    Gives the correction a synthetic FX origin (same pattern as ``clone``'s
+    own synthetic-origin injection above) since it wasn't produced by any FX
+    node of its own -- without one, ``split_multi_ops.py`` can't trace it.
+    """
+    if expected_dtype is None or out.get_dtype() == expected_dtype:
+        return out
+    src_node = V.get_current_node()
+    out.realize()
+    converted = to_dtype(out, expected_dtype)
+    args = (src_node,) if src_node is not None else ()
+    _ensure_synthetic_origin(
+        converted, torch.ops.prims.convert_element_type.default, args
+    )
+    return converted
+
+
 def register_spyre_lowering(
     op,
     name=None,
@@ -1738,6 +1773,7 @@ def with_int64_fallback(fn, *args, convert_output=True):
     broadcast=True,
 )
 def lower_add(x, y, *, alpha=1):
+    expected_dtype = _aten_result_dtype()
     if alpha != 1:
         alpha_tensor = lower_full(
             y.get_size(),
@@ -1748,7 +1784,8 @@ def lower_add(x, y, *, alpha=1):
         alpha_tensor.realize()
         y = with_int64_fallback(lowering.mul, y, alpha_tensor)
         y.realize()
-    return with_int64_fallback(lowering.add, x, y)
+    out = with_int64_fallback(lowering.add, x, y)
+    return _fixup_promoted_dtype(out, expected_dtype)
 
 
 @register_spyre_lowering(
@@ -1757,7 +1794,9 @@ def lower_add(x, y, *, alpha=1):
     broadcast=True,
 )
 def lower_mul(x, y):
-    return with_int64_fallback(lowering.mul, x, y)
+    expected_dtype = _aten_result_dtype()
+    out = with_int64_fallback(lowering.mul, x, y)
+    return _fixup_promoted_dtype(out, expected_dtype)
 
 
 @register_spyre_lowering(
@@ -1766,6 +1805,7 @@ def lower_mul(x, y):
     broadcast=True,
 )
 def lower_sub(x, y, *, alpha=1):
+    expected_dtype = _aten_result_dtype()
     if alpha != 1:
         alpha_tensor = lower_full(
             y.get_size(),
@@ -1776,7 +1816,8 @@ def lower_sub(x, y, *, alpha=1):
         alpha_tensor.realize()
         y = with_int64_fallback(lowering.mul, y, alpha_tensor)
         y.realize()
-    return with_int64_fallback(lowering.sub, x, y)
+    out = with_int64_fallback(lowering.sub, x, y)
+    return _fixup_promoted_dtype(out, expected_dtype)
 
 
 @register_spyre_lowering(
@@ -1785,7 +1826,9 @@ def lower_sub(x, y, *, alpha=1):
     broadcast=True,
 )
 def lower_minimum(x, y):
-    return with_int64_fallback(lowering.minimum, x, y)
+    expected_dtype = _aten_result_dtype()
+    out = with_int64_fallback(lowering.minimum, x, y)
+    return _fixup_promoted_dtype(out, expected_dtype)
 
 
 @register_spyre_lowering(
@@ -1794,7 +1837,9 @@ def lower_minimum(x, y):
     broadcast=True,
 )
 def lower_maximum(x, y):
-    return with_int64_fallback(lowering.maximum, x, y)
+    expected_dtype = _aten_result_dtype()
+    out = with_int64_fallback(lowering.maximum, x, y)
+    return _fixup_promoted_dtype(out, expected_dtype)
 
 
 @register_spyre_lowering(torch.ops.spyre.qfp8ch)

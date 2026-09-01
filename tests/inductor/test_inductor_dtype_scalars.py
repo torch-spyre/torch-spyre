@@ -422,6 +422,34 @@ class TestDatatypeScalarOperations:
             f"Device mismatch: {result.device.type} != spyre"
         )
 
+    @pytest.mark.parametrize(
+        "op",
+        [
+            lambda x, s: x + s,
+            lambda x, s: x * s,
+            lambda x, s: x - s,
+            torch.minimum,
+            torch.maximum,
+        ],
+        ids=["add", "mul", "sub", "minimum", "maximum"],
+    )
+    def test_0dim_fp32_scalar_result_dtype(self, execution_mode, op):
+        """
+        Regression test for issue #2845: a shaped FP16 tensor combined with a
+        0-D FP32 scalar tensor must keep PyTorch's own dim-aware promotion
+        (the 0-D operand does not win over a same-category dimensioned
+        tensor), giving an FP16 result -- not FP32.
+
+        Bug: Spyre's outer ``broadcast=True`` lowering wrapper materializes
+        the 0-D scalar to full rank before promotion runs, which loses the
+        "this was 0-D" distinction and lets Spyre's own promotion pick the
+        wider FP32 dtype instead (values were correct; only the dtype tag
+        was wrong).
+        """
+        x = torch.ones(64, dtype=torch.float16)
+        s = torch.tensor(2.0, dtype=torch.float32)
+        _compare_modes(execution_mode, op, x, s, atol=1e-3, rtol=1e-3)
+
 
 @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
 @pytest.mark.parametrize("execution_mode", ["eager", "compiled"])
