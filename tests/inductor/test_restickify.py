@@ -2593,7 +2593,10 @@ def test_coord_cache_detached_after_layout_selection():
     # The shared device_coordinates memo must not outlive layout selection: its
     # results depend on V.graph.sizevars optimization hints, whose
     # precomputed-replacement state keeps growing as compilation proceeds.
-    # Assert the detach reaches every edge rather than trusting the finally.
+    # Pins that the finally ran and that every edge the setter reaches is left
+    # at None. Coverage of "every edge" is tautological -- this walks the same
+    # structure the setter does -- so the vacuity guard below is what gives it
+    # teeth.
     #
     # Spies on the module-global helper, which optimize_restickify_locations
     # resolves at call time, rather than on the pass function itself -- the
@@ -2619,4 +2622,67 @@ def test_coord_cache_detached_after_layout_selection():
     assert all(c is None for c in observed), (
         f"{sum(c is not None for c in observed)} of {len(observed)} edge cost "
         "maps still hold a coordinate cache after layout selection"
+    )
+
+
+def test_memos_agree_with_fresh_computation_during_search():
+    # Both memos are filled during layout selection, not snapshotted when the
+    # edge maps are built, because propagate_spyre_tensor_layouts rebinds buffer
+    # layouts while it constructs them and get_read_writes reads input layouts
+    # through make_indexer. Comparing against a snapshot taken at construction
+    # would pass even if a later rebinding had invalidated it, so recompute both
+    # fresh mid-search and compare against what the caches are serving.
+    from torch_spyre._inductor import pass_utils as pu
+
+    checked = {"indirect": 0, "host": 0}
+    # Patch where it is CALLED from: optimize_restickify imports it by name, so
+    # patching pass_utils would not take.
+    real = _optimize_restickify.compute_restickify_needed
+
+    def _spy(
+        in_stl,
+        in_host,
+        in_dep,
+        out_stl,
+        out_dep,
+        op=None,
+        coord_cache=None,
+        host_coords=None,
+    ):
+        out = real(
+            in_stl, in_host, in_dep, out_stl, out_dep, op, coord_cache, host_coords
+        )
+        if coord_cache is not None:
+            key = ("indirect_info", op.get_name() if op is not None else None)
+            if key in coord_cache:
+                assert coord_cache[key] == pu.indirect_info_from_op(op), (
+                    f"memoized indirect info for {key[1]} disagrees with a fresh "
+                    "computation taken during the search"
+                )
+                checked["indirect"] += 1
+        if host_coords:
+            _, _, ind_sizes = pu.indirect_info_from_op(op)  # full tuple here
+            sizes_key = None if ind_sizes is None else frozenset(ind_sizes.items())
+            hk = (in_dep, sizes_key)
+            if hk in host_coords:
+                assert host_coords[hk] == pu.host_coordinates(
+                    in_host, in_dep, ind_sizes
+                ), "memoized host coordinates disagree with a fresh computation"
+                checked["host"] += 1
+        return out
+
+    # A transpose feeding an add whose other operand has the transposed shape:
+    # the two inputs disagree on layout, so candidate pairs are priced past the
+    # stick-compatible early-out and the host-coordinate memo is actually
+    # reached. A workload whose pairs all take that early-out leaves the host
+    # half of this test verifying nothing, which the guard below catches.
+    a = torch.randn((2, 256, 128), dtype=torch.float16)
+    x = torch.randn((2, 128, 256), dtype=torch.float16)
+    with patch.object(_optimize_restickify, "compute_restickify_needed", _spy):
+        _compare(lambda a, x: a.transpose(1, 2) + x, a, x)
+
+    assert checked["indirect"], "no memoized indirect info was reached"
+    assert checked["host"], (
+        "no memoized host coordinates were reached; that half of this test "
+        "would verify nothing"
     )

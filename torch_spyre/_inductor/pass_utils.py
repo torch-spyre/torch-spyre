@@ -1968,6 +1968,69 @@ def stick_compatible(coords: "list[list[sympy.Expr]]") -> bool:
     return len(stick_vars) <= 1 and stick_vars.isdisjoint(nonstick_vars)
 
 
+def _indirect_info_memo(
+    op: "ComputedBuffer | None", cache: "dict | None"
+) -> "tuple[set[str], dict[sympy.Symbol, int] | None]":
+    """``indirect_info_from_op`` memoized per op for the lifetime of ``cache``.
+
+    A function of ``op`` alone, yet recomputed on every candidate pair by
+    :func:`compute_restickify_needed` -- and not cheap: it calls
+    ``ComputedBuffer.get_read_writes``, which carries no ``cache_on_self`` and so
+    re-extracts every dep and index expression, then re-runs ``inner_fn`` for ops
+    with indirect reads.
+
+    Computed on first use during layout selection rather than snapshotted when
+    the edge maps are built. ``get_read_writes`` reaches input buffer layouts
+    through ``make_indexer``, and ``propagate_spyre_tensor_layouts`` rebinds
+    buffer layouts while it constructs those maps, so a construction-time value
+    could predate a rebinding. Copies are handed out so no caller can mutate
+    another's.
+    """
+    if cache is None:
+        names, _, sizes = indirect_info_from_op(op)
+        return names, sizes
+    key = ("indirect_info", op.get_name() if op is not None else None)
+    hit = cache.get(key)
+    if hit is None:
+        hit = indirect_info_from_op(op)
+        cache[key] = hit
+    names, _, sizes = hit
+    return set(names), None if sizes is None else dict(sizes)
+
+
+def _host_coords_memo(
+    in_host: FixedLayout,
+    in_dep: MemoryDep,
+    ind_sizes: "dict[sympy.Symbol, int] | None",
+    cache: "dict | None",
+) -> "list[sympy.Expr]":
+    """``host_coordinates`` memoized per edge for the lifetime of ``cache``.
+
+    ``in_host`` and ``in_dep`` are an edge's construction-time snapshots, so the
+    result varies only with ``ind_sizes`` for a given edge. Keyed on
+    ``(in_dep, sizes)`` even though the owning EdgeCostMap makes the dep
+    redundant: this parameter sits beside ``coord_cache`` with the same type but
+    the opposite sharing contract, and a self-keyed entry means a dict passed
+    for both cannot silently serve another edge's coordinates. ``in_host`` stays
+    out of the key because it is fixed for a dep name across the search, the
+    invariant ``_dep_layout`` already leans on.
+
+    Filled on first use, so an edge whose candidate pairs all take the
+    stick-compatible early-out never pays for it. Like the coordinate memo this
+    is graph-bounded rather than pass-bounded, which holds because the owning
+    edge map is itself per-graph.
+    """
+    if cache is None:
+        return host_coordinates(in_host, in_dep, ind_sizes)
+    sizes_key = None if ind_sizes is None else frozenset(ind_sizes.items())
+    key = (in_dep, sizes_key)
+    hit = cache.get(key)
+    if hit is None:
+        hit = host_coordinates(in_host, in_dep, ind_sizes)
+        cache[key] = hit
+    return list(hit)
+
+
 def compute_restickify_needed(
     in_stl: SpyreTensorLayout,
     in_host: FixedLayout,
@@ -1976,6 +2039,7 @@ def compute_restickify_needed(
     out_dep: MemoryDep,
     op: "ComputedBuffer | None" = None,
     coord_cache: "dict | None" = None,
+    host_coords: "dict | None" = None,
 ) -> "tuple[bool, SpyreTensorLayout | None]":
     """Determine whether a restickify is needed for one (in_stl, out_stl) pair.
 
@@ -1985,15 +2049,19 @@ def compute_restickify_needed(
     op: when provided, index-role deps (gather indices) are never stick-constrained
     and always return (False, None).
 
-    coord_cache: optional memo forwarded to try_device_coordinates, shared by a
-    caller that evaluates many layout pairs over the same accesses.
+    coord_cache: optional memo forwarded to try_device_coordinates and used for
+    the per-op indirect-access info, shared by a caller that evaluates many
+    layout pairs over the same accesses.
+
+    host_coords: optional per-edge memo for the host-side coordinates, whose
+    inputs are fixed for one edge.
 
     Returns:
       (False, None)   — stick-compatible: no restickify needed
       (True, stl)     — restickify needed, stl is the target STL for the restickified input
       (True, None)    — restickify needed but infeasible
     """
-    ind_names, _, ind_sizes = indirect_info_from_op(op)
+    ind_names, ind_sizes = _indirect_info_memo(op, coord_cache)
     if in_dep.name in ind_names:
         return False, None
     idc = try_device_coordinates(in_stl, in_dep, ind_sizes, coord_cache)
@@ -2015,7 +2083,7 @@ def compute_restickify_needed(
     in_stick_offset_free = is_stick_expr_offset_free(idc[-1], in_stl.elems_per_stick())
     if in_stick_offset_free and stick_compatible([idc, out_idc]):
         return False, None
-    ic = host_coordinates(in_host, in_dep, ind_sizes)
+    ic = _host_coords_memo(in_host, in_dep, ind_sizes, host_coords)
     target_stick = out_idc[-1]
 
     if target_stick == sympy.S.Zero and in_stick_offset_free and _is_matmul_op(op):

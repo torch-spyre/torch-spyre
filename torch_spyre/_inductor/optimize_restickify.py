@@ -73,6 +73,12 @@ class EdgeCostMap:
         # computation recomputes its coordinates.
         self.coord_cache: "dict | None" = None
 
+        # Host-side coordinates for THIS edge. Its inputs (_dep_layout, dep) are
+        # the snapshots above, so the result varies only with the indirect-access
+        # sizes; filled on first use, since an edge whose candidate pairs all
+        # take the stick-compatible early-out never needs it.
+        self._host_coords: dict = {}
+
         # _cost and _layout are parallel maps.
         # _cost stores the cost for a given in/target layout pair
         # _layout stores the target STL for the restickify, or None if no restickify is needed
@@ -107,6 +113,7 @@ class EdgeCostMap:
             self._target_dep,
             self._op,
             self.coord_cache,
+            self._host_coords,
         )
         if not needed:
             cost = 0.0
