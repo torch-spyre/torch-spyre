@@ -81,9 +81,10 @@ and pod/CI usage.
 
 ## Device enumeration
 
-Read by the `flex` runtime via
-([`spyre_device_enum.cpp`](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/csrc/spyre_device_enum.cpp))
-to determine how many Spyre devices are visible to the process:
+Honored by the `flex` library itself (not read directly by torch-spyre)
+when [`spyre_device_enum.cpp`](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/csrc/spyre_device_enum.cpp)
+calls `flex::getNumDevices()` to determine how many Spyre devices are
+visible to the process:
 
 | Variable | Effect |
 |---|---|
@@ -99,14 +100,13 @@ to pick the device for the current process:
 |---|---|
 | `LOCAL_RANK` | Per-process rank set by `torchrun`; used to select the device for each child process (defaults to 0 if unset) |
 
-Set by the OpenShift AIU operator (or manually) and consumed by launch/test
-scripts and the Spyre runtime's own diagnostic log dump, not read directly by
+Set by the OpenShift AIU operator (or manually); not read directly by
 torch-spyre's device-enumeration code:
 
 | Variable | Effect |
 |---|---|
-| `PCIDEVICE_IBM_COM_AIU_PF` | Comma-separated list of PCI bus IDs assigned to the container |
-| `AIU_WORLD_RANK_<N>` | PCI bus ID bound to rank `N` |
+| `PCIDEVICE_IBM_COM_AIU_PF` | Comma-separated list of PCI bus IDs assigned to the container; consumed by [`tests/oot_framework/run_test.sh`](https://github.com/torch-spyre/torch-spyre/blob/main/tests/oot_framework/run_test.sh) |
+| `AIU_WORLD_RANK_<N>` | PCI bus ID bound to rank `N`; not consumed in-tree — it is scraped back out of pod logs after the fact by [`.github/scripts/parse_hw_failures.py`](https://github.com/torch-spyre/torch-spyre/blob/main/.github/scripts/parse_hw_failures.py) |
 
 ## Runtime / driver (for `aiu-smi` and `aiu-trace-analyzer`)
 

@@ -6,8 +6,8 @@ test_suite_config:
       tests:
         # Temporarily skipped: UnicodeDecodeError from a garbage kernel-event
         # name, traced to an ABI/stride mismatch between libaiupti (struct grew
-        # +40 bytes in libaiupti #114) and the kineto-spyre build. Re-enable once
-        # both are rebuilt in lockstep.
+        # +40 bytes in libaiupti #114) and the AIUPTI/Kineto bridge built into
+        # torch_spyre. Re-enable once they are rebuilt against a matching ABI.
         - names: [TestSpyreProfiler::test_basic_profile]
           mode: mandatory_success
         # Listed explicitly so the config-coverage checker (CHECK 2) sees full

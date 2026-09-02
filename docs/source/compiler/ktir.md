@@ -28,10 +28,13 @@ Concretely: `TORCH_SPYRE_KTIR=1` plus `KTIR_DEVICE_MLIR=<path>` routes
 compilation through `async_compile.ktir()` (see
 `torch_spyre/execution/async_compile.py`), which emits KTIR and hands it
 to `dbo-opt --from-ktir` for backend lowering. That path is real and
-device-executable, but it is opt-in and off by default, and it is
-exercised in the test suite only through `tests/inductor/test_ktir_compile.py`
-and `test_ktir_validate.py`, both of which mock `subprocess.run` and
-`shutil.which` rather than running `dbo-opt` or touching hardware. No CI
+device-executable, but it is opt-in and off by default. In the test
+suite it is covered by three files: `tests/inductor/test_ktir_compile.py`
+mocks `subprocess.run` and `shutil.which` rather than running `dbo-opt`
+or touching hardware; `tests/inductor/test_ktir_validate.py` is a
+dialect-free rejection suite that imports neither `mlir_ktdp` nor
+`subprocess`; and `tests/inductor/test_ktir_emitter.py` is a golden-MLIR
+test that is skipped unless `mlir_ktdp` is installed. No CI
 workflow currently sets `TORCH_SPYRE_KTIR=1`/`KTIR_DEVICE_MLIR` to run
 this path against a physical device. The emitter itself
 (`torch_spyre/_inductor/codegen/ktir.py`) also depends on the `mlir_ktdp`
