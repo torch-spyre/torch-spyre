@@ -30,6 +30,24 @@ on:
         description: Exact pytorch/pytorch commit SHA to build
         required: true
         type: string
+      run_torch_spyre_tests:
+        description: >-
+          Also run torch-spyre's own test suite (tests/, via _test_matrix.yaml)
+          against the wheels the `build` job produces, in addition to the
+          upstream-beta suites. Non-blocking: a failure here does not fail
+          this workflow. Default false -- manual workflow_dispatch opt-in only.
+        required: false
+        type: boolean
+        default: false
+      torch_spyre_test_type:
+        description: >-
+          Suite subset for the torch-spyre test run when
+          run_torch_spyre_tests is true. Forwarded verbatim to
+          _test_matrix.yaml's test_type input: smoke | unit | integration |
+          regression | trunk | suite_<group> | <label>.
+        required: false
+        type: string
+        default: regression
 
 defaults:
   run:
@@ -219,6 +237,33 @@ jobs:
       pytorch_sha: ${{ inputs.pytorch_sha }}
       pytorch_wheel_artifact_name: pytorch-wheel-${{ inputs.pytorch_sha }}
       mode: validate
+
+  # ---------------------------------------------------------------------------
+  # Manual opt-in only (run_torch_spyre_tests, surfaced as a workflow_dispatch
+  # input on push-pytorch-dispatch-to-clickhouse.yaml): run torch-spyre's own
+  # test suite -- the same _test_matrix.yaml used by tests.yaml/PR CI -- against
+  # the exact wheels `build` just produced, instead of rebuilding them.
+  # Non-blocking: this must never fail the overall run or feed the
+  # pytorch/pytorch CRCR / ClickHouse reporting in `report` below. Same
+  # mechanism the `test` job above uses (mode: validate, forwarded to
+  # run_test.sh's own --mode flag) rather than continue-on-error -- GitHub
+  # Actions does not support continue-on-error on a job that calls a
+  # reusable workflow via `uses:`.
+  # ---------------------------------------------------------------------------
+  torch_spyre_tests:
+    name: Run torch-spyre tests
+    needs: build
+    if: ${{ inputs.run_torch_spyre_tests }}
+    uses: ./.github/workflows/_test_matrix.yaml
+    secrets: inherit
+    with:
+      runner_label: linux
+      extra_test_flags: -v -m "not xfail" --mode=validate
+      extra_test_flags_multi_spyre: -v --mode=validate
+      checkout_pytorch: false
+      test_type: ${{ inputs.torch_spyre_test_type }}
+      pytorch_wheel_artifact_name: pytorch-wheel-${{ inputs.pytorch_sha }}
+      torch_spyre_wheel_artifact_name: torch-spyre-wheel-${{ inputs.pytorch_sha }}
 
   # ---------------------------------------------------------------------------
   # Aggregate the per-suite JUnit XMLs the `test` matrix uploaded (one per
