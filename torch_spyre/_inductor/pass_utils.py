@@ -37,7 +37,7 @@ from torch._inductor.scheduler import SchedulerNode
 from torch._inductor.graph import GraphLowering
 from torch._inductor.dependencies import MemoryDep, ReadWrites, StarDep, is_indirect
 from torch._inductor.virtualized import V
-from torch_spyre._C import SpyreTensorLayout, get_elem_in_stick
+from torch_spyre._C import ElementArrangement, SpyreTensorLayout, get_elem_in_stick
 from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.op_spec import IndirectAccess, TensorWorkDivision
 
@@ -1955,6 +1955,25 @@ def compute_restickify_needed(
     assert out_idc, "device_coordinates returned empty list for output"
     # Input stick with an offset always needs restickify to remove the offset.
     in_stick_offset_free = is_stick_expr_offset_free(idc[-1], in_stl.elems_per_stick())
+    # A factorized layout places the stick variable on outer axes as well as the
+    # stick; the backend would see two contraction dimensions and produce wrong output.
+    # Such a layout is not truly compatible with any target that has a clean stick,
+    # so skip the stick_compatible short-circuit when the layouts differ.
+    stick_syms = idc[-1].free_symbols
+    outer_axes_with_stick_var = [
+        c for c in idc[:-1] if bool(c.free_symbols & stick_syms)
+    ]
+    is_factorized = bool(stick_syms) and len(outer_axes_with_stick_var) > 1
+    if is_factorized and in_stl != out_stl:
+        # The input layout places the contraction variable on outer axes AND the
+        # stick (factorized layout). The backend would see two contraction dims
+        # even though the var is on the stick — stick_compatible would incorrectly
+        # accept it. out_stl is the canonical collapsed target from
+        # find_stick_compatible_input_layout Pass 3; FixedInOutNode.from_args
+        # always passes [req_stl] as the target list, so the beam search only
+        # queries this function with that canonical result.
+        assert in_stl.element_arrangement == ElementArrangement.STANDARD
+        return True, out_stl
     if in_stick_offset_free and stick_compatible([idc, out_idc]):
         return False, None
     ic = host_coordinates(in_host, in_dep, ind_sizes)

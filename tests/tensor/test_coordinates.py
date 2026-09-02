@@ -21,7 +21,16 @@ from torch.testing._internal.common_utils import run_tests, TestCase
 from torch._inductor.dependencies import MemoryDep
 from torch._inductor.ir import FixedLayout
 from torch._inductor.virtualized import V
-from torch_spyre._C import DataFormats, SpyreTensorLayout
+from torch_spyre._C import (
+    DataFormats,
+    ElementArrangement,
+    SpyreTensorLayout,
+    get_device_dtype,
+)
+from torch_spyre._inductor.constants import (
+    BATCH_MATMUL_FP8_OP,
+    BATCH_MATMUL_OP,
+)
 from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.pass_utils import (
     device_coordinates,
@@ -31,6 +40,7 @@ from torch_spyre._inductor.propagate_layouts import (
     PropArg,
     _check_supported_input_sticks,
     _find_alt_target_stl,
+    find_stick_compatible_input_layout,
 )
 from torch_spyre._inductor.views import (
     _decompose_constant_offset,
@@ -454,6 +464,136 @@ class TestUnrepresentableStickCandidates(TestCase):
         dep, bad, _ = self._traced_scenario()
         arg = PropArg(dep, None, [bad])
         _check_supported_input_sticks([arg], "batchmatmul")  # must not raise
+
+
+class TestFactorizedMatmulCandidates(TestCase):
+    def _scenario(self, layouts):
+        lq, generated, contraction = sympy.symbols(
+            "lq generated contraction", integer=True, nonnegative=True
+        )
+        dep = MemoryDep(
+            "x",
+            4096 * lq + contraction,
+            (lq, generated, contraction),
+            (8, 4096, 4096),
+        )
+        host = FixedLayout(
+            torch.device("cpu"),
+            torch.float16,
+            [1, 8, 4096],
+            [32768, 4096, 1],
+        )
+        return PropArg(dep, host, layouts), contraction
+
+    def _same_graph_attention_scenario(
+        self,
+        host_stride=(262144, 4096, 128, 1),
+        contraction_range=4096,
+    ):
+        """SDPA's BLHD producer viewed as BL(H*D) by a fused o_proj."""
+        lq, generated, contraction = sympy.symbols(
+            "lq generated contraction", integer=True, nonnegative=True
+        )
+        dep = MemoryDep(
+            "x",
+            4096 * lq + contraction,
+            (lq, generated, contraction),
+            (64, 4096, contraction_range),
+        )
+        host_size = [1, 64, 32, 128]
+        host = FixedLayout(
+            torch.device("cpu"),
+            torch.float16,
+            host_size,
+            list(host_stride),
+        )
+        if tuple(host_stride) == (262144, 4096, 128, 1):
+            source = SpyreTensorLayout(
+                [64, 2, 32, 64],
+                [4096, 64, 128, 1],
+                get_device_dtype(torch.float16),
+            )
+        else:
+            source = SpyreTensorLayout(
+                host_size,
+                list(host_stride),
+                torch.float16,
+                [0, 1, 2, 3],
+            )
+        return PropArg(dep, host, [source]), contraction, source
+
+    def test_canonicalization_is_independent_of_candidate_order(self):
+        """Canonical layout is returned regardless of candidate list order."""
+        dtype = get_device_dtype(torch.float16)
+        factorized = SpyreTensorLayout([8, 2, 32, 64], [4096, 64, 128, 1], dtype)
+        canonical = SpyreTensorLayout(
+            [1, 8, 4096], [32768, 4096, 1], torch.float16, [0, 1, 2]
+        )
+
+        for layouts in ([factorized, canonical], [canonical, factorized]):
+            with self.subTest(first=layouts[0]):
+                arg, contraction = self._scenario(layouts)
+                result = find_stick_compatible_input_layout(
+                    arg, contraction, BATCH_MATMUL_OP, "x"
+                )
+                self.assertEqual(result, canonical)
+
+    def test_canonicalizes_same_graph_attention_flatten(self):
+        """Contiguous H,D producer dims become one o_proj contraction dim."""
+        arg, contraction, source = self._same_graph_attention_scenario()
+        expected = SpyreTensorLayout(
+            [1, 64, 4096],
+            [262144, 4096, 1],
+            torch.float16,
+            [0, 1, 2],
+        )
+
+        result = find_stick_compatible_input_layout(
+            arg, contraction, BATCH_MATMUL_OP, "x"
+        )
+
+        self.assertEqual(result, expected)
+        with V.set_graph_handler(SimpleNamespace()):
+            self.assertEqual(
+                device_coordinates(result, arg.dep, None),
+                [
+                    arg.dep.var_names[0],
+                    sympy.floor(contraction / 64),
+                    0,
+                    sympy.Mod(contraction, 64),
+                ],
+            )
+
+    def test_rejects_noncontiguous_or_partial_factorized_chain(self):
+        """Only a full, gap-free mixed-radix view is safe to collapse."""
+        scenarios = (
+            self._same_graph_attention_scenario(host_stride=(262144, 4096, 256, 1)),
+            self._same_graph_attention_scenario(contraction_range=2048),
+        )
+        for arg, contraction, source in scenarios:
+            with self.subTest(
+                stride=arg.layout.stride,
+                contraction_range=arg.dep.ranges[contraction],
+            ):
+                with self.assertRaisesRegex(Unsupported, "full-range contiguous"):
+                    find_stick_compatible_input_layout(
+                        arg, contraction, BATCH_MATMUL_OP, "x"
+                    )
+
+    def test_nonstandard_matmul_layout_is_not_canonicalized(self):
+        """Non-STANDARD formats are returned unchanged by Pass 3."""
+        dtype = get_device_dtype(torch.float16)
+        qfp8wt = SpyreTensorLayout(
+            [8, 2, 32, 64],
+            [4096, 64, 128, 1],
+            dtype,
+            ElementArrangement.QFP8WT,
+        )
+        arg, contraction = self._scenario([qfp8wt])
+        result = find_stick_compatible_input_layout(
+            arg, contraction, BATCH_MATMUL_FP8_OP, "x"
+        )
+        self.assertEqual(result, qfp8wt)
 
 
 class TestTilingExprToDeviceExpr(TestCase):
