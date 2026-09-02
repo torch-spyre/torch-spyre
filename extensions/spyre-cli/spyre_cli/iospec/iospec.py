@@ -26,7 +26,6 @@ class Dtype(str, Enum):
 
 
 class TensorSpec(BaseModel):
-    ndims: int
     dimensions: List[int]  # has to be opened-up for symbolic
     dtype: Dtype
 

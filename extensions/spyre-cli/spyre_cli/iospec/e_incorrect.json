@@ -1,13 +1,11 @@
 {
   "inputs": [
     {
-      "ndims": 2,
       "dtype": "float16"
     },
   ],
   "outputs": [
     {
-      "ndims": 2,
       "dimensions": [512, 1024],
       "dtype": "float32"
     }
