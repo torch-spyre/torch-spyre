@@ -81,6 +81,7 @@ from .pass_utils import (
     concretize_expr,
     find_matmul_generated_var,
     find_reduction_var,
+    get_matmul_n_size,
     identify_matmul_inputs,
     host_coordinates,
     device_coordinates,
@@ -943,37 +944,56 @@ def _matmul_layouts(
                 d_coords,
             )
 
-    x_dep, y_dep = identify_matmul_inputs([a.dep for a in args], output_dep)
-    if x_dep is None or y_dep is None:
-        raise Unsupported(f"{data.reduction_type}: could not identify Input1/Input2")
-    # Map identified deps back to PropArgs.
-    if x_dep is args[0].dep:
-        x, y = args[0], args[1]
-    else:
-        x, y = args[1], args[0]
+    # ReadWrites.reads is an OrderedSet: two semantic operands collapse to one
+    # MemoryDep when they are aliases with identical access.  Restore the pair.
+    if len(args) == 1:
+        args = [args[0], args[0]]
+
+    # identify_matmul_inputs either confirms positional order or falls back to it.
+    # Map positionally — object identity breaks for self-alias (same dep object).
+    identify_matmul_inputs([a.dep for a in args], output_dep)
+    x, y = args[0], args[1]
 
     # Hardware stick constraints (DF16):
     #   Input1 (x): stick on reduction_var (loop var absent from output)
     #   Input2 (y): stick on generated_var (loop var present in output, absent from x)
     #   Output:     stick on generated_var
     reduction_var = find_reduction_var((x.dep,), output_dep)
-    generated_var = find_matmul_generated_var(y.dep, x.dep, output_dep, op)
+    n_size = get_matmul_n_size(op)
 
     x_req_stl = find_stick_compatible_input_layout(
         x, reduction_var, data.reduction_type, "x"
     )
-    y_req_stl = find_stick_compatible_input_layout(
-        y, generated_var, data.reduction_type, "y"
-    )
 
-    out_stick_dim = next(
-        (i for i, c in enumerate(out_coords) if generated_var in c.free_symbols),
-        None,
-    )
-    if out_stick_dim is None:
-        raise Unsupported(
-            f"{data.reduction_type}: generated_var={generated_var} not found in output coords {out_coords}"
+    if n_size == 1:
+        # N has no loop symbol after size-one simplification, so there is no
+        # generated_var to discover.  Build an explicit sparse-stick layout for y
+        # so K is not mistaken for a second contraction dimension.
+        y_dim_order = list(range(len(y.layout.size))) + [-1]
+        y_req_stl = SpyreTensorLayout(
+            [concretize_expr(s) for s in y.layout.size],
+            [concretize_expr(s) for s in y.layout.stride],
+            y.layout.dtype,
+            y_dim_order,
         )
+        # Output stick is on the last host dim (N=1 collapses N to a scalar position).
+        out_dims = len(output.size)
+        out_stick_dim = out_dims - 1
+    else:
+        generated_var = find_matmul_generated_var(y.dep, x.dep, output_dep, op)
+        y_req_stl = find_stick_compatible_input_layout(
+            y, generated_var, data.reduction_type, "y"
+        )
+        _out_stick_dim = next(
+            (i for i, c in enumerate(out_coords) if generated_var in c.free_symbols),
+            None,
+        )
+        if _out_stick_dim is None:
+            raise Unsupported(
+                f"{data.reduction_type}: generated_var={generated_var} not found "
+                f"in output coords {out_coords}"
+            )
+        out_stick_dim = _out_stick_dim
 
     out_dims = len(output.size)
     out_dim_order = list(range(out_dims - 2))
@@ -1030,15 +1050,9 @@ def _conv_layouts(
     _check_supported_input_sticks(args, data.reduction_type)
     out_coords = host_coordinates(output, output_dep, None)
 
-    x_dep, y_dep = identify_matmul_inputs([a.dep for a in args], output_dep)
-    if x_dep is None or y_dep is None:
-        raise Unsupported(
-            f"{data.reduction_type}: could not identify activation/weight"
-        )
-    if x_dep is args[0].dep:
-        x, y = args[0], args[1]
-    else:
-        x, y = args[1], args[0]
+    # No len(args)==1 guard needed: conv activation and weight are never aliased.
+    identify_matmul_inputs([a.dep for a in args], output_dep)
+    x, y = args[0], args[1]
 
     reduction_candidates = x.dep.index.free_symbols - output_dep.index.free_symbols
     reduction_var = _conv_reduction_var(x, reduction_candidates)

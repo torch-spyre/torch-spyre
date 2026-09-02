@@ -7138,6 +7138,59 @@ class TestCoarseTileMoEBroadcastMatmulE2E(InductorTestCase):
                 fn, x, w, run_compile=True, run_eager=False, atol=0.05, rtol=0.05
             )
 
+    def test_unsqueeze_broadcast_matmul_no_hint_reuse_dim_scale(self):
+        """[1,T,H]@[E,H,F] -> [E,T,F], no spyre_hint (single kernel invocation).
+
+        With no coarse-tiling hint, E never gets tiled/constant-folded away
+        before SDSC generation, so x's emitted SDSCArgs must carry E as a
+        genuine "reuse dim" (present in w/output, absent from x) with
+        scale == -1, the same way any other op's Step 2 broadcast-dim
+        handling would. See _matmul_reuse_dims in superdsc.py.
+        """
+        from torch_spyre._inductor.codegen import superdsc
+
+        E, T, H, F = 4, 64, 64, 64
+        x = torch.randn(T, H, dtype=torch.float16) * 0.01
+        w = torch.randn(E, H, F, dtype=torch.float16) * 0.01
+        _declare_tensor_dim("E", E)
+        _declare_tensor_dim("T", T)
+        _declare_tensor_dim("H", H)
+        _declare_tensor_dim("F", F)
+
+        def fn(x, w):
+            _name_tensor_dims(x, ["T", "H"])
+            _name_tensor_dims(w, ["E", "H", "F"])
+            return torch.matmul(x.unsqueeze(0), w)
+
+        captured = []
+        real_create_sdsc_tensors = superdsc._create_sdsc_tensors
+
+        def _spy(*args, **kwargs):
+            result = real_create_sdsc_tensors(*args, **kwargs)
+            captured.append(result[0])
+            return result
+
+        with (
+            mock_patch(_LAUNCH_JOBPLAN),
+            mock_patch(_PREPARE_KERNEL),
+            mock_patch("subprocess.run"),
+            mock_patch.object(superdsc, "_create_sdsc_tensors", side_effect=_spy),
+        ):
+            run_and_get_code(torch.compile(fn), x.to("spyre"), w.to("spyre"))
+
+        self.assertTrue(captured, "no SDSC generated")
+        found_reuse_dim = False
+        for sdsc_args_list in captured:
+            x_arg = sdsc_args_list[0]
+            for dim, scale in x_arg.scales.items():
+                if scale == -1 and str(dim) not in ("H",):
+                    found_reuse_dim = True
+        self.assertTrue(
+            found_reuse_dim,
+            "expected x's SDSCArgs to include a reuse dim (scale == -1) for "
+            "the broadcast batch dim E",
+        )
+
 
 class TestCoarseTileNestedReductionE2E(InductorTestCase):
     """Correctness and LoopSpec tests for nested output-dim + reduction-dim tiling.

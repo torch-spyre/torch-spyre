@@ -890,15 +890,33 @@ def identify_matmul_inputs(
 
     Uses positional order: lower_bmm always emits x before y, so inputs[0] is
     x and inputs[1] is y.  This is valid even when N=1 (the N symbol is
-    constant-folded out of index expressions).
+    constant-folded out of index expressions) or when both deps are identical
+    (ReadWrites deduplicated a self-alias read).
 
-    Raises ValueError if len(inputs) != 2.
+    For a 1-element input list, the single dep is treated as both x and y
+    (self-matmul where ReadWrites collapsed two identical MemoryDeps to one).
+
+    Raises ValueError for 0 or 3+ inputs.
     """
-    if len(inputs) != 2:
+    if len(inputs) == 0 or len(inputs) > 2:
         raise ValueError(
-            f"identify_matmul_inputs: expected 2 inputs, got {len(inputs)}"
+            f"identify_matmul_inputs: expected 1 or 2 inputs, got {len(inputs)}"
         )
-    return inputs[0], inputs[1]
+    if len(inputs) == 1:
+        return inputs[0], inputs[0]
+
+    a, b = inputs[0], inputs[1]
+    return a, b
+
+
+def get_matmul_n_size(op: "Operation") -> int:
+    """Return the concrete N (output columns) extent of a matmul op.
+
+    Reads from op.data.ranges[-1] rather than inferring from index expressions,
+    so it is correct even when N=1 and the N symbol has been constant-folded
+    out of every MemoryDep.
+    """
+    return concretize_expr(op.data.ranges[-1])
 
 
 def find_reduction_var(inputs: Sequence[MemoryDep], out_dep: MemoryDep) -> sympy.Symbol:
@@ -1023,6 +1041,16 @@ def find_matmul_generated_var(
     if op is not None and len(generated_vars) > 1:
         generated_vars = generated_vars - broadcast_batch_vars(op, x_dep, out_dep)
         logger.debug("  generated_vars (after broadcast filter) = %s", generated_vars)
+    if len(generated_vars) > 1 and out_dep.var_names:
+        # The Inductor matmul lowering always places N (the generated/output-column
+        # dim) last in ranges — see lower_bmm/lower_mm in lowering.py.  The last
+        # squeezed output var is therefore always the generated var.
+        last_var = out_dep.var_names[-1]
+        if last_var in generated_vars:
+            generated_vars = {last_var}
+            logger.debug(
+                "  generated_vars (after last-output-var fallback) = %s", generated_vars
+            )
     if len(generated_vars) != 1:
         raise Unsupported(
             f"expected exactly 1 generated variable, got {generated_vars}"
@@ -1959,6 +1987,34 @@ def compute_restickify_needed(
         return False, None
     ic = host_coordinates(in_host, in_dep, ind_sizes)
     target_stick = out_idc[-1]
+
+    if target_stick == sympy.S.Zero and in_stick_offset_free and _is_matmul_op(op):
+        # The output stick is 0 (sparse) and the input is clean-dense.  For
+        # matmul, y may legally arrive sparse when N=1 collapses the N symbol.
+        # Build the sparse target from in_stl's device dimensions — not from host
+        # dimensions, which may include size-1 dims (e.g. M=1) that cause
+        # SpyreTensorLayout constructor 2 to produce an extra device dimension.
+        # Rule: find the K-chunk dim (stride == elem_stride * stick_size), expand
+        # it by stick_size, promote the element stride there, set stick to -1.
+        stick_size = get_elem_in_stick(in_host.dtype)
+        ds = list(in_stl.device_size)
+        sm = list(in_stl.stride_map)
+        elem_stride = sm[-1]
+        k_chunk_dim = next(
+            (i for i in range(len(sm) - 1) if sm[i] == elem_stride * stick_size),
+            None,
+        )
+        if k_chunk_dim is not None:
+            y_ds = list(ds)
+            y_sm = list(sm)
+            y_ds[k_chunk_dim] = ds[k_chunk_dim] * stick_size
+            y_sm[k_chunk_dim] = elem_stride
+            y_sm[-1] = -1
+            return True, SpyreTensorLayout(y_ds, y_sm, in_stl.device_dtype)
+        assert False, (
+            f"k_chunk_dim not found in sparse-N=1 restickify path: "
+            f"stride_map={sm}, elem_stride={elem_stride}, stick_size={stick_size}"
+        )
 
     if target_stick == sympy.S.Zero and not in_stick_offset_free:
         # No output dim carries the input's stick var, so compute_restickify_target_layout

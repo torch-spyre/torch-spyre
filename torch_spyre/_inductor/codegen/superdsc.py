@@ -1129,7 +1129,9 @@ def _create_sdsc_tensors(
     # matmul and conv share the two-input tensor treatment: each arg keeps its
     # own natural (per-tensor) dim order and the weight gets the KERNEL layout
     # label. Reduced-dim appending (below) is a single-input-reduction concern.
-    use_op_dims = not (_is_matmul(op_spec.op) or _is_conv(op_spec.op))
+    is_matmul = _is_matmul(op_spec.op)
+    use_op_dims = not (is_matmul or _is_conv(op_spec.op))
+    matmul_x_reuse_dims: list[Symbol] = []
     # Detect indirect access from device_coordinates: index tensors are those
     # whose name is referenced by an IndirectAccess in another tensor's coordinates,
     # and value tensors are those that contain IndirectAccess in their coordinates.
@@ -1154,6 +1156,7 @@ def _create_sdsc_tensors(
 
     missing_dim = None
     sdsc_args: list[SDSCArgs] = []
+    matmul_n_dim = injected_dims.get("matmul_n_dim")
 
     for i, arg in enumerate(op_spec.args):
         is_fp8_mm_kernel_arg = arg.element_arrangement == ElementArrangement.QFP8WT
@@ -1166,6 +1169,9 @@ def _create_sdsc_tensors(
             dim_order, stick_dim = _get_device_dim_order(
                 arg, symbol_mapping, op_spec, tensor_position=i
             )
+
+        if is_matmul and i == 0 and len(op_spec.args) >= 3 and matmul_n_dim is None:
+            matmul_x_reuse_dims = _matmul_reuse_dims(op_spec, symbol_mapping, dim_order)
 
         # Case 2 (MutationLayoutSHOULDREMOVE) ops carry an authoritative
         # device-stride sympy.Expr for each coarse-tiled dim's per-iteration
@@ -1217,6 +1223,10 @@ def _create_sdsc_tensors(
                     d for d in op_dim_order if d not in dim_order and d is not mb_sym
                 ]
                 dim_order = dim_order + reduced_dims
+
+        if is_matmul and i == 0 and matmul_x_reuse_dims:
+            reduced_dims = reduced_dims + matmul_x_reuse_dims
+            dim_order = dim_order + matmul_x_reuse_dims
 
         # Step 3: Handle missing stick dimension — skip for index tensors.
         if op_stick_dim is None:
@@ -1384,6 +1394,23 @@ def _create_sdsc_tensors(
             )
             offsets[topk_missing_dim] = 0
             max_dim_sizes[topk_missing_dim] = -1
+
+        # For matmul N=1: inject matmul_n_dim into y (i==1) and output (i==-1) tensors.
+        if (
+            matmul_n_dim is not None
+            and is_matmul
+            and (i == 1 or i == len(op_spec.args) - 1)
+        ):
+            dim_order = dim_order + [matmul_n_dim]
+            stick_dim = (
+                matmul_n_dim  # Override stick_dim to be the injected N dimension
+            )
+            scales[matmul_n_dim] = 1
+            strides[matmul_n_dim] = _calculate_device_stride(
+                len(dim_order) - 1, arg.device_size
+            )
+            offsets[matmul_n_dim] = 0
+            max_dim_sizes[matmul_n_dim] = -1
 
         effective_stick = [op_stick_dim if stick_dim is None else stick_dim]
         layout_labels = _get_tensor_layout_labels(use_op_dims, op_spec.op)
@@ -1606,6 +1633,30 @@ def _extend_matmul_k_to_padded(
     _round_up_to_stick(
         sdsc_iteration_space, k_sym, stick_size, "_extend_matmul_k_to_padded"
     )
+
+
+def _matmul_reuse_dims(
+    op_spec: OpSpec,
+    symbol_mapping: dict,
+    x_dim_order: list[Symbol],
+) -> list[Symbol]:
+    """Dims x is broadcast over (in y/output, not in x, excluding N).
+
+    matmul broadcasts x over batch dims it doesn't index (issue #3888/#3927).
+    These are indistinguishable from the true generated dim N by set membership
+    alone. Use layout policy to disambiguate: y and output always stick on N,
+    broadcast-batch dims never do. N = y's stick dim; others are reuse dims.
+    """
+    y_arg = op_spec.args[1]
+    out_arg = op_spec.args[-1]
+    y_dim_order, y_stick = _get_device_dim_order(y_arg, symbol_mapping)
+    out_dim_order, out_stick = _get_device_dim_order(out_arg, symbol_mapping)
+    if y_stick is None:
+        return []
+    y_syms = set(y_dim_order) | {y_stick}
+    out_syms = set(out_dim_order) | ({out_stick} if out_stick is not None else set())
+    reuse_syms = (y_syms & out_syms) - set(x_dim_order) - {y_stick}
+    return [d for d in y_dim_order if d in reuse_syms]
 
 
 def _extend_restickify_to_padded(
@@ -2008,6 +2059,28 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
                 dim_splits[topk_missing_dim] = 1
                 work_slices[topk_missing_dim] = 1
                 injected_dims["topk_missing_dim"] = topk_missing_dim
+
+    # For matmul N=1: inject N dimension into iteration space so y and output have it.
+    if is_matmul:
+        y_arg = op_spec.args[1]
+        out_arg = op_spec.args[-1]
+        y_stick_coord = (
+            y_arg.device_coordinates[-1] if len(y_arg.device_coordinates) > 0 else None
+        )
+        out_stick_coord = (
+            out_arg.device_coordinates[-1]
+            if len(out_arg.device_coordinates) > 0
+            else None
+        )
+        if y_stick_coord == 0 and out_stick_coord == 0:
+            idx = len(sdsc_iteration_space)
+            if idx < len(INPUT_DIM_LABELS):
+                n_dim_label = INPUT_DIM_LABELS[idx]
+                n_dim = Symbol(n_dim_label)
+                sdsc_iteration_space[n_dim] = 1
+                dim_splits[n_dim] = 1
+                work_slices[n_dim] = 1
+                injected_dims["matmul_n_dim"] = n_dim
 
     args, layouts, missing_dim = _create_sdsc_tensors(
         op_spec,
