@@ -2,7 +2,7 @@
 
 ## Install
 
-Needs a pod with entire Spyre stack setup.
+Needs a working Spyre stack environment.
 
 ```
 git clone ...
