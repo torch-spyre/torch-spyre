@@ -56,3 +56,9 @@ def test_parse_json_file_invalid_data(tmp_path: Path):
     iofile.write_text(json.dumps({"inputs": "bad", "outputs": []}))
     with pytest.raises(Exception):
         parse_json_file(str(iofile))
+
+
+def test_parse_json_file_e_incorrect():
+    iofile = Path(__file__).parent.parent / "spyre_cli" / "iospec" / "e_incorrect.json"
+    with pytest.raises(ValueError, match="Invalid JSON"):
+        parse_json_file(str(iofile))

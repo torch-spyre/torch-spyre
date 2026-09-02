@@ -38,8 +38,7 @@ def launch_from_iofile(path=".", iofile="io.json"):
     try:
         spec = parse_json_file(iofile)
     except Exception as e:
-        print(e)
-        exit(1)
+        raise RuntimeError(f"Failed to parse IO Spec file '{iofile}': {e}") from e
 
     import torch
 
