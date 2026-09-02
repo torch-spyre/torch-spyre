@@ -695,7 +695,9 @@ def parse_log(
 
 # Jobs that are CI infrastructure, not test suites — skip them entirely
 _SKIP_JOB_NAMES = re.compile(
-    r"^(detect changed files|run spyre unit tests|ingest|push.*(clickhouse|diagnostics))",
+    r"^(detect changed files|run spyre unit tests|ingest|push.*(clickhouse|diagnostics)"
+    r"|collect suites for|build torch-spyre wheel|generate test matrix"
+    r"|test matrix result|report empty test suites)",
     re.IGNORECASE,
 )
 
@@ -715,6 +717,7 @@ def _suite_from_filename(filename: str) -> tuple[str, bool] | None:
     "0_Run Spyre unit tests.txt"                         → None  (skipped)
     "12_run-tests _ Inductor Ops Misc Shape C pod-level retry.txt"
                                                           → ("Inductor Ops Misc Shape C", True)
+    "3_run-tests  Collect suites for pod-level retry.txt" → None  (skipped, meta job)
     """
     # Strip .txt extension (case-insensitive)
     stem = re.sub(r"\.txt$", "", filename, flags=re.IGNORECASE)
@@ -727,14 +730,16 @@ def _suite_from_filename(filename: str) -> tuple[str, bool] | None:
     if is_pod_level_retry:
         stem = RE_POD_LEVEL_RETRY_SUFFIX.sub("", stem).strip()
 
+    # Strip a leading "run-tests" caller-job prefix before the skip check below, however its
+    # separator survived filename sanitization — a literal "_" when the original name used "/"
+    # with spaces around it, or bare whitespace when "/" was stripped to nothing instead.
+    m = re.match(r"^run-tests[\s_]+(.+)$", stem, re.IGNORECASE)
+    if m:
+        stem = m.group(1).strip()
+
     # Skip meta/gate jobs
     if _SKIP_JOB_NAMES.match(stem):
         return None
-
-    # Strip "run-tests _ " prefix (the GHA job name format)
-    m = re.match(r"^run-tests\s*_\s*(.+)$", stem, re.IGNORECASE)
-    if m:
-        return m.group(1).strip(), is_pod_level_retry
 
     # Extension-less files without a "run-tests _ " prefix are almost always
     # the unnumbered GHA duplicate of a .txt file (same content) OR a stray
