@@ -20,14 +20,12 @@ from typing import cast
 os.environ.setdefault(
     "TORCH_DEVICE_BACKEND_AUTOLOAD", "0"
 )  # must be before torch import
-os.environ.setdefault(
-    "SEN_COMMON_HEADERS", str(Path(__file__).resolve().parent.parent / "flex")
-)
-
 
 import glob
+import regex as re
 
 from setuptools import Command, setup
+from setuptools.command.build_py import build_py as _build_py
 
 PATH_NAME = "torch_spyre"
 PACKAGE_NAME = "torch_spyre"
@@ -35,13 +33,23 @@ DISTRIBUTED_PACKAGE_NAME = "spyre_ccl"
 
 
 def get_torch_spyre_version() -> str:
-    version_ns: dict[str, object] = {}
-    with open(f"{PATH_NAME}/version.py") as f:
+    # Not ROOT_DIR: that is defined further down, after this runs.
+    version_path = Path(__file__).absolute().parent / PATH_NAME / "version.py"
+    # Seed __file__ so version.py can locate the repo root and resolve the git
+    # commit; a bare exec() namespace has no __file__ and it would fall back to
+    # the cwd. version.py tolerates either, but being explicit keeps the result
+    # independent of where the build was invoked from.
+    version_ns: dict[str, object] = {"__file__": str(version_path)}
+    with open(version_path) as f:
         exec(f.read(), version_ns)
         version = cast(str, version_ns["__version__"])
     return version
 
 
+# Resolved version, e.g. "0.0.1+gabc1234" in a git checkout. Consumed by
+# BuildPyWithVersion to stamp the wheel's copy of version.py; the project version
+# in metadata comes separately from pyproject.toml's attr: pointer, which reads
+# the static literal instead.
 version = get_torch_spyre_version()
 
 
@@ -155,7 +163,6 @@ else:
             "or set the SPYRE_COMMS_INSTALL_DIR to the Spyre Comms install directory."
         )
 
-INCLUDE_DIRS += [os.environ["SEN_COMMON_HEADERS"]]
 LIBRARIES = ["flex"]
 
 
@@ -206,6 +213,57 @@ class clean(Command):
         for path in build_dirs:
             if path.exists():
                 shutil.rmtree(str(path), ignore_errors=True)
+
+
+# Matches the single top-level `__version__ = "..."` literal in version.py.
+# A regex, not str.replace of the exact literal: on an incremental build the
+# staged copy may already carry a stale `0.0.1+gOLD`, which a literal replace
+# would silently fail to update (shipping the wrong commit). This re-stamps
+# whatever is there.
+_VERSION_LITERAL_RE = re.compile(r'^__version__ = "[^"]*"$', re.MULTILINE)
+
+
+class BuildPyWithVersion(_build_py):
+    """Bake the resolved version into the ``build_lib`` copy of ``version.py``.
+
+    An installed wheel has no ``.git`` beside it, so ``version.py``'s import-time
+    git lookup cannot fire once installed. Rewriting the *staged* copy gives
+    wheels a literal ``__version__ = "0.0.1+gabc1234"``.
+
+    The tracked source file is never touched: builds run inside the checkout
+    (every CI build passes ``--no-build-isolation``), so mutating it would dirty
+    the working tree and could trip the pre-commit hooks.
+    """
+
+    def build_module(self, module, module_file, package):
+        result = super().build_module(module, module_file, package)
+        pkg = package if isinstance(package, str) else ".".join(package)
+        if module == "version" and pkg == PACKAGE_NAME:
+            outfile = self.get_module_outfile(self.build_lib, pkg.split("."), module)
+            self._stamp_version(outfile)
+        return result
+
+    def _stamp_version(self, outfile):
+        if "+" not in version:
+            # No git metadata available at build time (exported tarball, no git
+            # binary, ...). Leave the copy pristine so the wheel reports the
+            # plain base version rather than a bogus one.
+            print(f"build_py: no git metadata; keeping version {version}")
+            return
+        original = Path(outfile).read_text(encoding="utf-8")
+        stamped, count = _VERSION_LITERAL_RE.subn(
+            f'__version__ = "{version}"', original, count=1
+        )
+        if count != 1:
+            # The literal was moved, reformatted or re-quoted. Fail loudly:
+            # silently shipping a stale version is the exact bug this fixes.
+            raise RuntimeError(
+                f"could not find a top-level '__version__ = \"...\"' literal in "
+                f"{outfile}; {PATH_NAME}/version.py and setup.py's "
+                f"BuildPyWithVersion have drifted."
+            )
+        Path(outfile).write_text(stamped, encoding="utf-8")
+        print(f"build_py: baked __version__ = {version!r} into {outfile}")
 
 
 if __name__ == "__main__":
@@ -299,6 +357,7 @@ if __name__ == "__main__":
             ext_modules=ext_modules,
             cmdclass={
                 "build_ext": PermanentBuildExtension,
+                "build_py": BuildPyWithVersion,
                 "clean": clean,
             },
             entry_points={

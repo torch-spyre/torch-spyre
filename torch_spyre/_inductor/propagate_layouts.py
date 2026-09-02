@@ -51,7 +51,11 @@ from torch_spyre._C import (
     get_device_dtype,
     get_elem_in_stick,
 )
-from .dtype_ops import bool_equivalent_dtype
+from .dtype_ops import (
+    bool_equivalent_dtype,
+    bool_layout_dtype,
+    resolve_output_formats,
+)
 from .errors import Unsupported
 from .constants import (
     BATCH_MATMUL_OP,
@@ -164,46 +168,6 @@ def infer_bool_device_dtype(args: list[PropArg]) -> DataFormats:
         )
     (device_dtype,) = formats
     return device_dtype
-
-
-def _bool_layout_dtype(
-    device_dtype: DataFormats, context: str = "result"
-) -> torch.dtype:
-    """Return the logical dtype for a bool tensor stored as `device_dtype`.
-
-    Raises Unsupported if `device_dtype` has no bool-equivalent dtype.
-    """
-    dtype_for_layout = bool_equivalent_dtype(device_dtype)
-    if dtype_for_layout is None:
-        raise Unsupported(
-            f"torch.bool {context} of operand with device format {device_dtype}"
-        )
-    return dtype_for_layout
-
-
-def resolve_bool_layout_dtype(
-    stl: SpyreTensorLayout, context: str = "result"
-) -> torch.dtype:
-    """Return the logical dtype for a bool tensor physically stored as `stl`."""
-    return _bool_layout_dtype(stl.device_dtype, context)
-
-
-def resolve_output_formats(
-    output_dtype: torch.dtype,
-    bool_device_dtype: DataFormats | None,
-    context: str = "result",
-) -> tuple[DataFormats, torch.dtype]:
-    """Resolve an op output's ``(device_dtype, layout_dtype)`` pair.
-
-    Non-bool outputs derive both from ``output_dtype``. For bool outputs,
-    ``get_device_dtype(torch.bool)`` hardcodes SEN169_FP16 -- wrong for e.g. a
-    float32 comparison result -- so the caller supplies the real on-device
-    format in ``bool_device_dtype`` (read off the producing operand(s)).
-    """
-    if output_dtype == torch.bool:
-        assert bool_device_dtype is not None, "bool output needs bool_device_dtype"
-        return bool_device_dtype, _bool_layout_dtype(bool_device_dtype, context)
-    return get_device_dtype(output_dtype), output_dtype
 
 
 def _compute_dim_order(stick_dim, size, coords):
@@ -435,21 +399,28 @@ def _single_arg_op_layout(
     in_layout: FixedLayout,
     stl: SpyreTensorLayout,
 ) -> list[SpyreTensorLayout]:
-    """
-    Compute the output STL(s) for a single-arg op given one candidate input STL.
+    """Compute output STL(s) for one candidate input STL of a single-arg op.
+
     Called once per candidate input STL to produce corresponding output STL(s).
+    An empty result means this candidate cannot produce a supported output layout;
+    callers continue trying the other input STLs and fail only if none are usable.
     """
     data = op.data
     c_size = [concretize_expr(s) for s in output.size]
     c_stride = [concretize_expr(s) for s in output.stride]
 
     if isinstance(data, Reduction):
-        # A bool result's physical format matches its operand's, not
-        # get_elem_in_stick(torch.bool)'s hardcoded SEN169_FP16.
-        out_dtype_for_layout = resolve_output_formats(output.dtype, stl.device_dtype)[1]
+        # Bool physical format resolution: see bool_layout_dtype's docstring.
+        out_dtype_for_layout = (
+            bool_layout_dtype(stl.device_dtype)
+            if output.dtype == torch.bool
+            else output.dtype
+        )
         stick_size = get_elem_in_stick(out_dtype_for_layout)
 
-        x_dev_coords = device_coordinates(stl, dep, None)
+        x_dev_coords = try_device_coordinates(stl, dep, None)
+        if x_dev_coords is None:
+            return []
         x_stick_expr = x_dev_coords[-1]
         reduction_var = next(
             iter(dep.index.free_symbols - output_dep.index.free_symbols), None
@@ -631,8 +602,6 @@ def _single_arg_op_layout(
     ):
         # Input and output tensors are being accessed identically and elem size is the same.
         # We can simply propagate the device_layout including ElementArrangement.
-        # out_device_dtype resolves the correct physical format for bool outputs
-        # (get_device_dtype(bool) would hardcode SEN169_FP16).
         stl = SpyreTensorLayout(
             stl.device_size,
             stl.stride_map,
@@ -696,7 +665,7 @@ def _clone_layout(
     # input's -- substitute the equivalent logical dtype since
     # get_device_dtype(torch.bool) can't express that.
     if output.dtype == torch.bool:
-        dtype_for_layout = resolve_bool_layout_dtype(in_stl, "clone")
+        dtype_for_layout = bool_layout_dtype(in_stl.device_dtype, "clone")
     else:
         dtype_for_layout = output.dtype
     stick_size = get_elem_in_stick(dtype_for_layout)
@@ -759,7 +728,7 @@ def _exx2_layout(
     out_stl = SpyreTensorLayout(
         c_size, c_stride, output.dtype, out_dim_order, ElementArrangement.EXX2
     )
-    reduction_var = find_reduction_var(x.dep, output_dep)
+    reduction_var = find_reduction_var((x.dep,), output_dep)
     req_in_stl = find_stick_compatible_input_layout(x, reduction_var, "exx2", "x")
     op.restick_cost_fn = FixedInOutNode.from_args(args, out_stl, [req_in_stl], op)
     return [out_stl]
@@ -780,7 +749,7 @@ def _layernormnorm_layout(
     c_size = [concretize_expr(s) for s in output.size]
     c_stride = [concretize_expr(s) for s in output.stride]
     out_stl = SpyreTensorLayout(c_size, c_stride, output.dtype, out_dim_order)
-    reduction_var = find_reduction_var(x.dep, output_dep)
+    reduction_var = find_reduction_var((x.dep,), output_dep)
     req_in_stl = find_stick_compatible_input_layout(
         x, reduction_var, "layernormnorm", "x"
     )
@@ -808,12 +777,19 @@ def _find_layout_avoiding_var_on_stick(
        off the stick, onto a surviving coordinate.
     3. Else raise Unsupported.
     """
+    constant_stick = None
     for stl in arg.layouts:
         dev_coords = device_coordinates(stl, arg.dep, None)
         if dev_coords is None:
             continue
-        if avoid_var not in dev_coords[-1].free_symbols:
-            return stl
+        stick_vars = dev_coords[-1].free_symbols
+        if avoid_var not in stick_vars:
+            if stick_vars:
+                return stl
+            constant_stick = stl
+
+    if constant_stick is not None:
+        return constant_stick
 
     arg_host_coords = host_coordinates(arg.layout, arg.dep, None)
     surviving_vars = set()
@@ -859,6 +835,21 @@ def find_stick_compatible_input_layout(
     2. Else return the first layout that can be restickified to put reduction_var on the stick.
     3. Else raise Unsupported.
     """
+    logger.debug(
+        "[find_stick_compatible_input_layout] label=%r reduction_type=%r\n"
+        "  arg.dep.name      = %s\n"
+        "  reduction_var     = %s\n"
+        "  arg.layout.size   = %s\n"
+        "  arg.layout.stride = %s\n"
+        "  arg.layouts       = %s",
+        label,
+        reduction_type,
+        arg.dep.name,
+        reduction_var,
+        list(arg.layout.size),
+        list(arg.layout.stride),
+        arg.layouts,
+    )
     # Skip candidates whose stick expression the backend cannot represent
     # (e.g. floor(var/N) from a cross-stick access); they are not usable inputs
     # and another candidate may work.
@@ -913,6 +904,45 @@ def _matmul_layouts(
     _check_supported_input_sticks(args, data.reduction_type)
     out_coords = host_coordinates(output, output_dep, None)
 
+    logger.debug(
+        "[_matmul_layouts] output (%s):\n"
+        "  host size   = %s\n"
+        "  host stride = %s\n"
+        "  dep ranges  = %s\n"
+        "  dep index   = %s\n"
+        "  host coords = %s",
+        output_dep.name,
+        list(output.size),
+        list(output.stride),
+        dict(output_dep.ranges),
+        output_dep.index,
+        out_coords,
+    )
+    if logger.isEnabledFor(logging.DEBUG):
+        for i, arg in enumerate(args):
+            stl = arg.layouts[0]
+            h_coords = host_coordinates(arg.layout, arg.dep, None)
+            d_coords = device_coordinates(stl, arg.dep, None)
+            logger.debug(
+                "[_matmul_layouts] input[%d] (%s):\n"
+                "  host size   = %s\n"
+                "  host stride = %s\n"
+                "  dep ranges  = %s\n"
+                "  dep index   = %s\n"
+                "  STL         = %s\n"
+                "  host coords = %s\n"
+                "  dev coords  = %s",
+                i,
+                arg.dep.name,
+                list(arg.layout.size),
+                list(arg.layout.stride),
+                dict(arg.dep.ranges),
+                arg.dep.index,
+                stl,
+                h_coords,
+                d_coords,
+            )
+
     x_dep, y_dep = identify_matmul_inputs([a.dep for a in args], output_dep)
     if x_dep is None or y_dep is None:
         raise Unsupported(f"{data.reduction_type}: could not identify Input1/Input2")
@@ -926,7 +956,7 @@ def _matmul_layouts(
     #   Input1 (x): stick on reduction_var (loop var absent from output)
     #   Input2 (y): stick on generated_var (loop var present in output, absent from x)
     #   Output:     stick on generated_var
-    reduction_var = find_reduction_var(x.dep, output_dep)
+    reduction_var = find_reduction_var((x.dep,), output_dep)
     generated_var = find_matmul_generated_var(y.dep, x.dep, output_dep, op)
 
     x_req_stl = find_stick_compatible_input_layout(
@@ -1075,71 +1105,151 @@ def _multi_arg_pointwise_layouts(
             # Get EA from first SpyreTensorLayout (all should have same EA for this input)
             input_eas.add(arg.layouts[0].element_arrangement)
 
-    # Determine output EA based on input EAs. The full EA-compatibility rule is
-    # enforced later by validate_ops via the shared is_ea_compatible predicate;
-    # here we only reject the one case propagation itself cannot represent
-    # (more than one distinct staggered EA) and otherwise pick the output EA.
-    # We deliberately do NOT run is_ea_compatible here: validate_ops skips
-    # layernorm ops carrying EXX2, and this join point sees those ops too, so a
-    # blanket gate here would over-reject valid layernorm/EXX2 combinations.
+    # Determine output EA and enforce the multi-arg mixed-EA compatibility rule
+    # over STAGGERED_EAS = {DL16_TO_FP32, FP32_TO_DL16}. (EXX2 is intentionally
+    # out of scope here: it is a reduction ordering handled by the layernorm
+    # layouts, and is_ea_compatible in split_multi_ops likewise excludes it from
+    # the broadcast pattern. The ops that bypass that check -- layernormnorm /
+    # layernormscale carrying EXX2 -- have dedicated layout handlers and never
+    # reach this multi-arg-pointwise path, so no EXX2 operand can slip through
+    # case 3.1/3.2 here.) The cases are:
+    #   1.  all STANDARD                            -> STANDARD output
+    #   2a. >1 distinct staggered EA                -> unsupported (raise)
+    #   2b. one staggered EA, no STANDARD operands  -> staggered output (via 3.1)
+    #   3.  one staggered EA mixed with STANDARD operands:
+    #       3.1 every STANDARD operand can broadcast   -> staggered output
+    #       3.2 every staggered operand can broadcast  -> STANDARD output
+    #       3.3 otherwise (a STANDARD and a staggered full operand coexist)
+    #                                                  -> unsupported (raise)
+    # Prefer 3.1 in the overlap because propagation does not yet know which
+    # candidate layout the optimizer will commit for the staggered producer.
+    # A future extension may admit 2a/3.3 by inserting an explicit EA conversion
+    # at extra cost.
     staggered_inputs = input_eas & STAGGERED_EAS
 
     if len(staggered_inputs) > 1:
-        # Multiple different staggered EAs - not supported
+        # Case 2a: multiple distinct staggered EAs - not supported.
         raise Unsupported(
             f"Multi-arg pointwise with multiple staggered EAs not supported: {input_eas}"
         )
     elif len(staggered_inputs) == 1:
-        # One staggered EA mixed with STANDARD inputs (the broadcast pattern).
-        output_ea = next(iter(staggered_inputs))
+        staggered_ea = next(iter(staggered_inputs))
 
-        # A STANDARD operand can broadcast against a staggered-EA operand only if
-        # its device *stick* dimension enumerates at most one distinct host
-        # element, i.e. the stick maps to a size-1 (broadcast) host axis. The
-        # element arrangement is a device-layout property, so we must test the
-        # host axis the device stick actually maps to, not a fixed host axis.
+        # A device *stick* is a broadcast (carries at most one distinct host
+        # element) exactly when it maps to a size-1 / sparse host axis. In an STL
+        # the stick is the last device dim and the layout constructor
+        # (spyre_tensor_impl.cpp) sets `stride_map[-1] == -1` precisely in that
+        # case. This is the correct, dim_order-independent test — reading
+        # `arg.layout.size[-1]` only works under an identity dim_order (e.g. host
+        # size [1, 64, 1] with the stick on a size-1 axis that is not last would
+        # be mishandled).
         #
-        # In an STL the stick is the last device dim and `stride_map[-1]` is its
-        # host stride; the layout constructor (spyre_tensor_impl.cpp) sets that
-        # entry to -1 exactly when the mapped host axis has size 1 (or the stick
-        # is sparse). So `stride_map[-1] == -1` is the correct, dim_order-
-        # independent test. Reading `arg.layout.size[-1]` instead only works when
-        # dim_order is the identity (stick == last host dim); under a non-identity
-        # dim_order the device stick may map to a size-1 axis that is not last
-        # (e.g. host size [1, 64, 1] with the stick on a size-1 axis), which the
-        # trailing-dim check would mishandle.
-        for arg in args:
-            if not arg.layouts:
-                continue
+        # `arg.layouts` is a per-consumer list of *candidate* device layouts (see
+        # _get_prop_args: `list(buf.layouts)`), from which the cost solver later
+        # picks one. So an operand "can broadcast" as long as it has at least one
+        # broadcast candidate; pruning the non-broadcast candidates in place is
+        # safe and steers the solver to a compatible stick.
+        def _broadcast_split(arg):
+            """Partition arg.layouts into (broadcast, non_broadcast) candidates."""
+            if len(arg.layout.size) == 0:
+                return list(arg.layouts), []  # scalar: always broadcastable
+            broadcast: list[SpyreTensorLayout] = []
+            non_broadcast: list[SpyreTensorLayout] = []
             for stl in arg.layouts:
-                if stl.element_arrangement != ElementArrangement.STANDARD:
-                    continue
-                if len(arg.layout.size) == 0:
-                    # Scalar - always compatible.
-                    continue
-                if stl.stride_map[-1] == -1:
-                    # Device stick maps to a size-1 (broadcast) / sparse host
-                    # axis: compatible.
-                    continue
-                # Stick maps to a real host axis; identify it for the message.
-                c_stride = [concretize_expr(s) for s in arg.layout.stride]
-                mapped = next(
-                    (d for d, hs in enumerate(c_stride) if hs == stl.stride_map[-1]),
-                    None,
+                (broadcast if stl.stride_map[-1] == -1 else non_broadcast).append(stl)
+            return broadcast, non_broadcast
+
+        std_split = [
+            (arg, *_broadcast_split(arg))
+            for arg in args
+            if arg.layouts
+            and arg.layouts[0].element_arrangement == ElementArrangement.STANDARD
+        ]
+        stag_split = [
+            (arg, *_broadcast_split(arg))
+            for arg in args
+            if arg.layouts and arg.layouts[0].element_arrangement == staggered_ea
+        ]
+
+        if all(broadcast for _, broadcast, _ in std_split):
+            # Case 3.1 (and case 2b with no STANDARD operands): preserve the
+            # staggered arrangement and keep only broadcast-compatible STANDARD
+            # candidates.
+            output_ea = staggered_ea
+            for arg, broadcast, non_broadcast in std_split:
+                if non_broadcast:
+                    arg.layouts[:] = broadcast
+        elif stag_split and all(broadcast for _, broadcast, _ in stag_split):
+            # Case 3.2: every staggered operand has a broadcast candidate, so
+            # the operation can use STANDARD ordering.
+            #
+            # Safety: device coordinates depend only on device_size/stride_map,
+            # not the EA label (see device_coordinates), and `_is_supported_layout`
+            # rebuilds each operand from its host size/stride with the *output* EA
+            # (here STANDARD). Reinterpreting a broadcastable staggered operand as
+            # STANDARD is therefore sound only if its staggered device geometry is
+            # identical to the STANDARD layout of the same host shape. A size-1
+            # stick usually makes the staggering vacuous, but we do NOT assume it:
+            # verify per kept candidate and raise rather than silently emit wrong
+            # coordinates (e.g. under a non-identity dim_order or a shape whose
+            # staggering is not a genuine no-op).
+            for arg, broadcast, _ in stag_split:
+                c_in_size = [concretize_expr(s) for s in arg.layout.size]
+                c_in_stride = [concretize_expr(s) for s in arg.layout.stride]
+                std_geom = SpyreTensorLayout(
+                    c_in_size,
+                    c_in_stride,
+                    arg.layout.dtype,
+                    list(range(len(c_in_size))),
+                    ElementArrangement.STANDARD,
                 )
-                mapped_size = (
-                    concretize_expr(arg.layout.size[mapped])
-                    if mapped is not None
-                    else "unknown"
-                )
-                raise Unsupported(
-                    f"Multi-arg pointwise with mixed EA: STANDARD input {arg.dep.name} "
-                    f"must broadcast (device stick dimension size 1) to be compatible "
-                    f"with a staggered EA. Its stick maps to host dim {mapped} of size "
-                    f"{mapped_size}"
-                )
+                for cand in broadcast:
+                    if (
+                        cand.device_size != std_geom.device_size
+                        or cand.stride_map != std_geom.stride_map
+                    ):
+                        raise Unsupported(
+                            f"Multi-arg pointwise with mixed EA: staggered operand "
+                            f"{arg.dep.name} is broadcastable but its {staggered_ea} "
+                            f"device layout "
+                            f"({cand.device_size}/{cand.stride_map}) differs from the "
+                            f"STANDARD layout of the same shape "
+                            f"({std_geom.device_size}/{std_geom.stride_map}); "
+                            f"reinterpreting it as STANDARD would change its "
+                            f"coordinates. De-staggering via an explicit EA "
+                            f"conversion is not supported yet."
+                        )
+            output_ea = ElementArrangement.STANDARD
+            for arg, broadcast, non_broadcast in stag_split:
+                if non_broadcast:
+                    arg.layouts[:] = broadcast
+            staggered_inputs = set()
+        else:
+            # Case 3.3: a STANDARD operand and a staggered operand are both
+            # non-broadcast full tensors — a genuine mixed-order op we cannot
+            # represent yet (future: insert an explicit EA conversion at extra
+            # cost). Report the offending STANDARD operand (there is always one
+            # here, since 3.1 failed).
+            arg = next(arg for arg, broadcast, _ in std_split if not broadcast)
+            stl = arg.layouts[0]
+            c_stride = [concretize_expr(s) for s in arg.layout.stride]
+            mapped = next(
+                (d for d, hs in enumerate(c_stride) if hs == stl.stride_map[-1]),
+                None,
+            )
+            mapped_size = (
+                concretize_expr(arg.layout.size[mapped])
+                if mapped is not None
+                else "unknown"
+            )
+            raise Unsupported(
+                f"Multi-arg pointwise with mixed EA: STANDARD input {arg.dep.name} "
+                f"must broadcast (device stick dimension size 1) to be compatible "
+                f"with a staggered EA, and no staggered operand is broadcastable "
+                f"either. Its stick maps to host dim {mapped} of size {mapped_size}"
+            )
     else:
-        # All STANDARD or other EAs - use STANDARD
+        # Case 1: all STANDARD (or non-staggered) EAs - use STANDARD.
         output_ea = ElementArrangement.STANDARD
 
     ind_names, _, ind_sizes = indirect_info_from_op(op)
@@ -1152,8 +1262,7 @@ def _multi_arg_pointwise_layouts(
         if dc is not None
     }
 
-    # A bool output reuses its operands' physical format (resolved from args);
-    # get_device_dtype(torch.bool) would hardcode SEN169_FP16.
+    # Bool physical format resolution: see resolve_output_formats's docstring.
     bool_device_dtype = (
         infer_bool_device_dtype(args) if output.dtype == torch.bool else None
     )
@@ -1318,9 +1427,15 @@ def _multi_arg_pointwise_layouts(
         results.insert(0, candidate)
 
     if not results:
+        # Reaches here when no stick-compatible output layout survives — e.g. in
+        # the mixed-EA case (3.1) a STANDARD operand pruned to its only broadcast
+        # candidate then fails `_is_supported_layout`. Surface the EA context so
+        # the diagnostic is as localized as the pre-pruning gate's was.
         raise Unsupported(
-            f"Multi-arg pointwise ({op.get_name()}): no supported output layout found "
-            f"with size={output.size} and coordinates={out_coords}"
+            f"Multi-arg pointwise ({op.get_name()}): no supported output layout "
+            f"found with size={output.size}, output_ea={output_ea}, "
+            f"coordinates={out_coords}. Input EAs: "
+            f"{[a.layouts[0].element_arrangement for a in args if a.layouts]}"
         )
 
     if len(results) > 1:
@@ -1344,7 +1459,7 @@ def _topk_layouts(
     out_coords = host_coordinates(output, output_dep, None)
 
     # Reduction var: in x's index but absent from output's.
-    reduction_var = find_reduction_var(x.dep, output_dep)
+    reduction_var = find_reduction_var((x.dep,), output_dep)
 
     # Coords that survive the reduction into the output.
     surviving_coords = [
@@ -1652,7 +1767,15 @@ def _find_alt_target_stl(
     for a mutation target. Returns None if the current layout is already valid,
     or raises Unsupported if no valid alternative exists.
     """
-    stick_size = get_elem_in_stick(target_layout.dtype)
+    # A bool target's stick size comes from the format it is physically stored
+    # in (target_stl), not from target_layout.dtype -- see bool_layout_dtype's
+    # docstring.
+    dtype_for_layout = (
+        bool_layout_dtype(target_stl.device_dtype, "mutation target")
+        if target_layout.dtype == torch.bool
+        else target_layout.dtype
+    )
+    stick_size = get_elem_in_stick(dtype_for_layout)
     write_stick = device_coordinates(target_stl, output_dep, None)[-1]
     if is_stick_expr_offset_free(write_stick, stick_size):
         return None
@@ -1660,7 +1783,7 @@ def _find_alt_target_stl(
     c_size = [concretize_expr(s) for s in target_layout.size]
     c_stride = [concretize_expr(s) for s in target_layout.stride]
     candidates = _candidate_output_stls(
-        target_layout, output_dep, c_size, c_stride, write_stick
+        target_layout, output_dep, c_size, c_stride, write_stick, dtype_for_layout
     )
     if not candidates:
         raise Unsupported(

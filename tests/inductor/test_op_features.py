@@ -22,6 +22,11 @@ well-formed and that it actually separates those cases, so a regression in the
 extractor (or a schema drift in the cost model) is caught here rather
 than as a silently flat search landscape.
 
+Division features (``sa_cooptimizer.features_for_division``) and residency
+(``cost_objective.with_residency``) are the two halves of that story -- division
+choice and placement choice -- so this file tests both against one shared
+fixture rather than splitting per source module.
+
 Regenerate with ``python3 docs/source/user_guide/examples/scratchpad/capture_op_features.py`` on a Spyre machine.
 """
 
@@ -35,10 +40,8 @@ from unittest.mock import patch
 import sympy
 
 from torch_spyre._inductor.cost_model import OpFeatures, op_from_dict, predict_ops
-from torch_spyre._inductor.scratchpad.op_features import (
-    features_for_division,
-    with_residency,
-)
+from torch_spyre._inductor.scratchpad.cost_objective import with_residency
+from torch_spyre._inductor.scratchpad.sa_cooptimizer import features_for_division
 from torch_spyre._inductor.scratchpad.plan_solver import CoreDivision
 
 FIXTURE = os.path.join(os.path.dirname(__file__), "cooptimization_op_features.json")
@@ -65,7 +68,7 @@ class CandidateDivisionTest(TestCase):
         expected = {m: 8, n: 1, kk: 2}
         with (
             patch(
-                "torch_spyre._inductor.scratchpad.op_features.iteration_space_from_op",
+                "torch_spyre._inductor.scratchpad.sa_cooptimizer.iteration_space_from_op",
                 return_value={m: 1024, n: 1024, kk: 2048},
             ),
             patch(

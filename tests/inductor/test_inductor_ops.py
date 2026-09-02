@@ -1020,9 +1020,9 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     cached_randn((3, 11, 2880)),
                     cached_xavier((2880, 2880)),
                 ),
-                "4d_B2_H2_M2048_K2048_N65472": (
+                "4d_B2_H2_M2048_K2048_N65536": (
                     cached_randn((2, 2, 2048, 2048)),
-                    cached_xavier((2, 2, 2048, 65472)),
+                    cached_xavier((2, 2, 2048, 65536)),
                 ),
             },
         },
@@ -1334,12 +1334,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     16,
                     2,
                     0.0,
-                ),
-                "4d_dim3": (
-                    unique_randn_along_dim((6, 17, 4, 128), dim=3),
-                    4,
-                    3,
-                    -1.0,
                 ),
             },
         },
@@ -1868,6 +1862,52 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "signed_zero": (
                     torch.tensor([-0.0, 0.0, -0.0, 0.0], dtype=torch.float16),
                     torch.tensor([0.0, -0.0, 0.0, -0.0], dtype=torch.float16),
+                ),
+                "fp32_1d": (
+                    torch.ceil(
+                        cached_randn((256,), abs=True, scale=10.0, dtype=torch.float32)
+                    ),
+                    torch.ceil(
+                        cached_randn((256,), abs=True, scale=9.9, dtype=torch.float32)
+                    ),
+                ),
+                "fp32_2d": (
+                    torch.ceil(
+                        cached_randn(
+                            (64, 128), abs=True, scale=10.0, dtype=torch.float32
+                        )
+                    ),
+                    torch.ceil(
+                        cached_randn(
+                            (64, 128), abs=True, scale=9.9, dtype=torch.float32
+                        )
+                    ),
+                ),
+                "fp32_3d": (
+                    torch.ceil(
+                        cached_randn(
+                            (2, 32, 128), abs=True, scale=10.0, dtype=torch.float32
+                        )
+                    ),
+                    torch.ceil(
+                        cached_randn(
+                            (2, 32, 128), abs=True, scale=9.9, dtype=torch.float32
+                        )
+                    ),
+                ),
+                "fp32_broadcast": (
+                    torch.ceil(
+                        cached_randn(
+                            (256, 256), abs=True, scale=10.0, dtype=torch.float32
+                        )
+                    ),
+                    torch.ceil(
+                        cached_randn((256,), abs=True, scale=9.9, dtype=torch.float32)
+                    ),
+                ),
+                "fp32_signed_zero": (
+                    torch.tensor([-0.0, 0.0, -0.0, 0.0], dtype=torch.float32),
+                    torch.tensor([0.0, -0.0, 0.0, -0.0], dtype=torch.float32),
                 ),
             },
         },
@@ -5531,6 +5571,137 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         ("test_transpose_patterns", "test_transpose_patterns_cpu"): {
             "param_sets": _pattern_param_sets(),
         },
+        # torch.any / torch.all: single-dim reduction
+        ("test_any_single_dim", "test_reduce_keepdim0_cpu"): {
+            "ops_dict": {"any": torch.any},
+            "param_sets": {
+                "bool_2d_dim_0": (0, torch.rand((67, 256)) > 0.5),
+                "bool_2d_dim_1": (1, torch.rand((67, 256)) > 0.5),
+                "bool_3d_dim_0": (0, torch.rand((3, 5, 256)) > 0.5),
+                "bool_3d_dim_1": (1, torch.rand((67, 71, 256)) > 0.5),
+                "bool_3d_dim_neg1": (-1, torch.rand((67, 71, 256)) > 0.5),
+                "bool_4d_dim_2": (2, torch.rand((6, 7, 12, 256)) > 0.5),
+                "fp16_2d_dim_0": (0, cached_randn((67, 256), dtype=torch.float16)),
+                "fp16_2d_dim_1": (1, cached_randn((67, 256), dtype=torch.float16)),
+                "fp16_3d_dim_0": (0, cached_randn((3, 5, 256), dtype=torch.float16)),
+                "fp16_3d_dim_1": (1, cached_randn((67, 71, 256), dtype=torch.float16)),
+                "fp16_3d_dim_neg1": (
+                    -1,
+                    cached_randn((67, 71, 256), dtype=torch.float16),
+                ),
+                "fp16_4d_dim_2": (
+                    2,
+                    cached_randn((6, 7, 12, 256), dtype=torch.float16),
+                ),
+            },
+        },
+        ("test_all_single_dim", "test_reduce_keepdim0_cpu"): {
+            "ops_dict": {"all": torch.all},
+            "param_sets": {
+                "bool_2d_dim_0": (0, torch.rand((67, 256)) > 0.5),
+                "bool_2d_dim_1": (1, torch.rand((67, 256)) > 0.5),
+                "bool_3d_dim_0": (0, torch.rand((3, 5, 256)) > 0.5),
+                "bool_3d_dim_1": (1, torch.rand((67, 71, 256)) > 0.5),
+                "bool_3d_dim_neg1": (-1, torch.rand((67, 71, 256)) > 0.5),
+                "bool_4d_dim_2": (2, torch.rand((6, 7, 12, 256)) > 0.5),
+                "fp16_2d_dim_0": (0, cached_randn((67, 256), dtype=torch.float16)),
+                "fp16_2d_dim_1": (1, cached_randn((67, 256), dtype=torch.float16)),
+                "fp16_3d_dim_0": (0, cached_randn((3, 5, 256), dtype=torch.float16)),
+                "fp16_3d_dim_1": (1, cached_randn((67, 71, 256), dtype=torch.float16)),
+                "fp16_3d_dim_neg1": (
+                    -1,
+                    cached_randn((67, 71, 256), dtype=torch.float16),
+                ),
+                "fp16_4d_dim_2": (
+                    2,
+                    cached_randn((6, 7, 12, 256), dtype=torch.float16),
+                ),
+            },
+        },
+        # torch.any / torch.all: multi-dim reduction
+        ("test_any_multidim", "test_reduce_multidim_keepdim0_cpu"): {
+            "ops_dict": {"any": torch.any},
+            "param_sets": {
+                "bool_2d_dim_01": ((0, 1), torch.rand((67, 256)) > 0.5),
+                "bool_3d_dim_01": ((0, 1), torch.rand((67, 71, 256)) > 0.5),
+                "bool_3d_dim_12": ((1, 2), torch.rand((67, 71, 256)) > 0.5),
+                "bool_3d_dim_012": ((0, 1, 2), torch.rand((67, 71, 256)) > 0.5),
+                "bool_4d_dim_23": ((2, 3), torch.rand((6, 7, 12, 64)) > 0.5),
+                "fp16_2d_dim_01": (
+                    (0, 1),
+                    cached_randn((67, 256), dtype=torch.float16),
+                ),
+                "fp16_3d_dim_01": (
+                    (0, 1),
+                    cached_randn((67, 71, 256), dtype=torch.float16),
+                ),
+                "fp16_3d_dim_12": (
+                    (1, 2),
+                    cached_randn((67, 71, 256), dtype=torch.float16),
+                ),
+                "fp16_3d_dim_012": (
+                    (0, 1, 2),
+                    cached_randn((67, 71, 256), dtype=torch.float16),
+                ),
+                "fp16_4d_dim_23": (
+                    (2, 3),
+                    cached_randn((6, 7, 12, 64), dtype=torch.float16),
+                ),
+            },
+        },
+        ("test_all_multidim", "test_reduce_multidim_keepdim0_cpu"): {
+            "ops_dict": {"all": torch.all},
+            "param_sets": {
+                "bool_2d_dim_01": ((0, 1), torch.rand((67, 256)) > 0.5),
+                "bool_3d_dim_01": ((0, 1), torch.rand((67, 71, 256)) > 0.5),
+                "bool_3d_dim_12": ((1, 2), torch.rand((67, 71, 256)) > 0.5),
+                "bool_3d_dim_012": ((0, 1, 2), torch.rand((67, 71, 256)) > 0.5),
+                "bool_4d_dim_23": ((2, 3), torch.rand((6, 7, 12, 64)) > 0.5),
+                "fp16_2d_dim_01": (
+                    (0, 1),
+                    cached_randn((67, 256), dtype=torch.float16),
+                ),
+                "fp16_3d_dim_01": (
+                    (0, 1),
+                    cached_randn((67, 71, 256), dtype=torch.float16),
+                ),
+                "fp16_3d_dim_12": (
+                    (1, 2),
+                    cached_randn((67, 71, 256), dtype=torch.float16),
+                ),
+                "fp16_3d_dim_012": (
+                    (0, 1, 2),
+                    cached_randn((67, 71, 256), dtype=torch.float16),
+                ),
+                "fp16_4d_dim_23": (
+                    (2, 3),
+                    cached_randn((6, 7, 12, 64), dtype=torch.float16),
+                ),
+            },
+        },
+        # torch.any / torch.all: full reduction (no dim)
+        ("test_any_full", "test_reduce_cpu"): {
+            "ops_dict": {"any": torch.any},
+            "param_sets": {
+                "bool_1d": (torch.rand((256,)) > 0.5,),
+                "bool_2d": (torch.rand((67, 256)) > 0.5,),
+                "bool_3d": (torch.rand((3, 5, 256)) > 0.5,),
+                "fp16_1d": (cached_randn((256,), dtype=torch.float16),),
+                "fp16_2d": (cached_randn((67, 256), dtype=torch.float16),),
+                "fp16_3d": (cached_randn((3, 5, 256), dtype=torch.float16),),
+            },
+        },
+        ("test_all_full", "test_reduce_cpu"): {
+            "ops_dict": {"all": torch.all},
+            "param_sets": {
+                "bool_1d": (torch.rand((256,)) > 0.5,),
+                "bool_2d": (torch.rand((67, 256)) > 0.5,),
+                "bool_3d": (torch.rand((3, 5, 256)) > 0.5,),
+                "fp16_1d": (cached_randn((256,), dtype=torch.float16),),
+                "fp16_2d": (cached_randn((67, 256), dtype=torch.float16),),
+                "fp16_3d": (cached_randn((3, 5, 256), dtype=torch.float16),),
+            },
+        },
     }
 
     def __init__(self, *args, **kwargs):
@@ -6205,6 +6376,23 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         assert out.shape == (T, E)
         torch.testing.assert_close(out_c.float(), ref.float(), atol=1e-2, rtol=1e-2)
 
+    def test_topk_keep_by_index_moe_router(self):
+        T, E, K = 64, 128, 8
+
+        def route(probs):
+            _, indices = torch.topk(probs, K, dim=-1)
+            weights = torch.ops.spyre.keep_by_index(probs, indices, -1, 0.0)
+            return weights / weights.sum(-1, keepdim=True)
+
+        levels = torch.arange(E, dtype=torch.float16) / 16
+        signs = torch.where(torch.arange(T) % 2 == 0, 1, -1)
+        probs = torch.softmax(signs[:, None] * levels, dim=-1)
+
+        expected = route(probs)
+        result = torch.compile(route, dynamic=False)(probs.to("spyre")).cpu()
+
+        torch.testing.assert_close(result, expected, atol=1e-2, rtol=1e-2)
+
     def test_min_tuple_output_keepdim0(self):
         x = unique_randn_along_dim((5, 7), dim=1)
         self.compare_with_cpu(
@@ -6316,48 +6504,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             dtype=torch.float32,
         )
         self.compare_with_cpu(lambda x: torch.nansum(x), x, run_eager=False)
-
-    @pytest.mark.xfail(
-        reason=(
-            "Spyre compiled backend does not support torch.all yet (stable "
-            "error signature: InductorError: AttributeError: "
-            "'UnimplementedOp' object has no attribute 'iteration_space')"
-        ),
-        strict=True,
-    )
-    def test_all_dim0_known_xfail(self):
-        x = torch.tensor(
-            [
-                [True, False, True, False],
-                [True, True, False, False],
-                [False, True, True, False],
-            ],
-            dtype=torch.bool,
-        )
-        self.compare_with_cpu(
-            lambda x: torch.all(x, dim=0, keepdim=False), x, run_eager=False
-        )
-
-    @pytest.mark.xfail(
-        reason=(
-            "Spyre compiled backend does not support torch.any yet (stable "
-            "error signature: InductorError: AttributeError: "
-            "'UnimplementedOp' object has no attribute 'iteration_space')"
-        ),
-        strict=True,
-    )
-    def test_any_dim0_known_xfail(self):
-        x = torch.tensor(
-            [
-                [True, False, True, False],
-                [True, True, False, False],
-                [False, True, True, False],
-            ],
-            dtype=torch.bool,
-        )
-        self.compare_with_cpu(
-            lambda x: torch.any(x, dim=0, keepdim=False), x, run_eager=False
-        )
 
     @pytest.mark.xfail(
         reason=(
@@ -7833,6 +7979,16 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         x = torch.randint(0, 2, (64,), dtype=torch.bool)
         self.compare_with_cpu(fn, x, cpu_compile=False, run_eager=False)
 
+    def test_bool_staggered_ea_src_to_fp16_cpu(self):
+        # Both operands upcast in-graph, so the bool carries a DL16_TO_FP32 EA
+        # as well as IEEE_FP32; casting back to fp16 must de-stagger it.
+        def fn(x, y):
+            return (x.to(torch.float32) > y.to(torch.float32)).to(torch.float16)
+
+        x = cached_randn((64,), dtype=torch.float16)
+        y = cached_randn((64,), dtype=torch.float16)
+        self.compare_with_cpu(fn, x, y, cpu_compile=False, run_eager=False)
+
     def test_avg_pool2d_base(self, op, x):
         # Spyre stores C as the stick (innermost) dim, so the op must see a
         # physically-NHWC tensor viewed as NCHW.  Pass an NHWC-contiguous input
@@ -8227,6 +8383,14 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             return torch.prod(a, dim=dim, keepdim=keepdim)
 
         self.compare_with_cpu(fn, x, run_eager=False)
+
+    def test_matmul_bs1_3d_linear(self):
+        def fn(x, w):
+            return torch.matmul(x, w.T)
+
+        x = cached_xavier((1, 16, 4096))
+        w = cached_xavier((6144, 4096))
+        self.compare_with_cpu(fn, x, w, atol=0.5, rtol=0.1)
 
 
 if __name__ == "__main__":

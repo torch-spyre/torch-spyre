@@ -113,13 +113,6 @@ COPY_BACK_CANDIDATE_ATTR = "_spyre_copy_back_candidate"
 # compute mutation op from a pure-copy mutation op.
 ELIDED_COPY_BACK_ATTR = "_spyre_writes_copy_back_target"
 
-# FX ``custom`` metadata key for BMMs created from a shared 2D weight whose
-# logical batch dim is statically 1.  The downstream OpSpec key carries the same
-# fact after lowering, where FX metadata is no longer directly available.
-SHARED_WEIGHT_UNIT_BMM_CUSTOM_META_KEY = "_spyre_shared_weight_unit_bmm"
-SHARED_WEIGHT_UNIT_BMM_INFO_KEY = "shared_weight_unit_bmm"
-
-
 SEGMENT_OFFSETS = [
     0x0,
     0x400000000,
@@ -156,6 +149,7 @@ SPYRE_FP32_OPS = [
     "neg",
     "exp",
     "sigmoid",
+    "silu",
     "exx2",
     "layernormnorm",
     "identity",
@@ -176,6 +170,16 @@ SPYRE_FP32_OPS = [
     "prod",
 ]
 
+# Operations the device has a 32-bit integer intrinsic for: `spyreop.addi32toi32`
+# and `spyreop.muli32toi32`, each splitting its operands into halves and finding
+# the carry with a pair of scale factors.  Separate from SPYRE_FP32_OPS because
+# the two are different templates reached by the same op name, and only the KTIR
+# path can spell them -- SDSC still relabels IEEE_INT32 as SENUINT32 for indices.
+SPYRE_INT32_OPS = [
+    "add",
+    "mul",
+]
+
 # FP8 E4M3 numeric limits
 FP8_E4M3FN_INFO = torch.finfo(torch.float8_e4m3fn)
 FP8_E4M3FN_MAX = float(FP8_E4M3FN_INFO.max)
@@ -190,6 +194,8 @@ SPYRE_FP8_OPS = {
 }
 
 TOPK_OPS = {"topkvalue", "topkindex"}
+_MAX_K_PER_CORE = 4
+TOPK_MAX_K_PER_CORE = _MAX_K_PER_CORE
 
 LAYOUT_LABELS = ["OUTPUT", "KERNEL", "INPUT", "KERNEL_IDX"]
 MATMUL_LAYOUT_LABELS = ["INPUT", "KERNEL", "OUTPUT", "KERNEL_IDX"]

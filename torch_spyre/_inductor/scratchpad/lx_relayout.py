@@ -77,6 +77,8 @@ def work_division_from_view(
 
     if view is None:
         return None
+    if view.num_cores is None:
+        raise ValueError("LX ownership must carry its physical core domain")
     loop_symbols = set(iteration_symbols)
     splits: dict[sympy.Symbol, int] = {}
     core_map: dict[sympy.Symbol, sympy.Expr] = {}
@@ -93,7 +95,7 @@ def work_division_from_view(
             raise ValueError(f"conflicting ownership for loop {dim}")
         splits[dim] = split
         core_map[dim] = slot
-    return TensorWorkDivision(splits, core_map)
+    return TensorWorkDivision(splits, core_map, num_cores=view.num_cores)
 
 
 def materialized_lx_relayouts(

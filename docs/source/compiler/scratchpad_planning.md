@@ -19,8 +19,9 @@ defaults to off. It enlarges each op's set of candidate splits — pointwise
 dim-flips, the matmuls' tilings offered to neighbours, cross-matmul split
 transfer, a shared batch-major `B/M` tiling for matmuls and reductions —
 then searches the cross-product for the assignment that minimizes HBM
-traffic. The seed (work-division's choice) is always retained, so the
-result is never worse than work division alone.
+traffic. Every candidate, including work division's seed, must satisfy hard
+work-division constraints; generated alternatives also pass stick validation.
+An op with no legal candidate raises `Unsupported`.
 :::
 
 **Quick navigation:**
@@ -61,7 +62,7 @@ The compiler picks which buffers live where.
 | Usable LX per core | ~1.55 MB | `round_up_128(int(((2<<20) - (64<<10)) * (1 - frac_avail)))` |
 | Alignment | 128-byte (stick) | implicit |
 | Cores | 1 to 32 | `SENCORES` |
-| Per-core HBM span limit | (255.996 MiB) | hardware, separate from LX |
+| Per-core HBM span limit | (256 MB) | hardware, separate from LX |
 | Inter-core data ring | yes | not yet used by compiler |
 | Inter-core reduce-sum ring | yes | not yet used by compiler |
 
@@ -149,7 +150,7 @@ insert_post_mutation_restickify
 insert_bmm_padding
 dedup_and_promote_constants
 _maybe_coarse_tile_span_overflow      # span-overflow coarse tiling (post-stickification)
-span_reduction                        # work-division: enforce 255.996 MiB span
+span_reduction                        # work-division: enforce 256 MB span
 cost_model_matmul_division            # work-division: matmul cost model
 work_distribution                     # work-division: default distributor
 _maybe_scratchpad_planning            # ← THIS PASS, gated by config.lx_planning
@@ -495,12 +496,20 @@ the winning assignment back before the standard allocator flow.
 :::
 
 Each op's candidate list is built by `_enum_split_options`, dispatching
-on op type. The seed (work division's choice) is always option 0 and is
-always retained, so the worst case matches work division. Every non-seed
-candidate is deduped by canonical key and filtered through
-`_split_fits_sticks`, which rejects factors that overflow a stickified
-dim's stick count (those would abort the SuperDSC bundler) or that land on
-a collapsed/broadcast dim.
+on op type. Generated alternatives are deduped by canonical key and filtered
+through `_split_fits_sticks`, which rejects factors that overflow a stickified
+dim's stick count (those would abort the SuperDSC bundler) or that land on a
+collapsed/broadcast dim. The upstream seed is already stick-valid from work
+division. Every candidate, including the seed, must satisfy hard
+work-division constraints: blocked axes remain unsplit and split domains
+restrict legal factors. Candidate divisions remain symbol-keyed in their
+producing operation's iteration space. Fixed candidates and the solver's
+selected candidate are revalidated from that symbol-keyed map before commit;
+LX planning never decodes candidates through the legacy coefficient-keyed
+Scheduler transport. Cross-operation compatibility is derived from physical
+`PerCoreView` ownership rather than comparing those local symbols, so an LX
+candidate remains faithful through selection and commit even when adjacent
+operations use different iteration-symbol names.
 
 **Pointwise ops** get their seed, dim-flip variants (move the seed's
 single output-dim factor onto each compatible alternative output dim,

@@ -25,13 +25,20 @@ against device measurements (``examples/bench_*``); the model is only as good as
 this extraction.
 """
 
+import math
 import os
 
 from torch._inductor.ir import ComputedBuffer
 
+
 from .constants import BATCH_MATMUL_OP
-from .cost_model import ArgTraffic, OpFeatures, explain
+from .cost_model import ArgTraffic, OpFeatures, explain, max
 from .pass_utils import apply_splits_from_index_coeff, iteration_space_from_op
+
+from typing import Mapping, Optional, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from torch_spyre._inductor.scratchpad.plan_solver import LifetimeBoundBuffer
 
 
 def cost_dump_enabled() -> bool:
@@ -89,7 +96,7 @@ def _cores(op, work_slices=None) -> int:
         write_index = next(iter(rw.writes)).index
         read_index = next((d.index for d in rw.reads), write_index)
         it_space = iteration_space_from_op(op)
-        return _prod_ints(
+        return math.prod(
             _work_slices(op, write_index, read_index, it_space, work_slices).values()
         )
     except Exception:  # noqa: BLE001 - best-effort feature extraction
@@ -348,7 +355,7 @@ def _matmul_features(
                 if wc != 0:
                     out_vars.append((abs(int(wc)), s))
                 else:  # reduction (K) dim -> contributes to the K-split
-                    k_split *= max(1, int(readable.get(s, 1)))
+                    k_split *= max(1, readable.get(s, 1))
             if out_vars:
                 # Identify M (row/outer) and N (stick/inner), EXCLUDING batch. Prefer
                 # the exact named-dim map (present on work_div-hinted runs); else drop
@@ -372,13 +379,11 @@ def _matmul_features(
                     n_sym = mn[0][1] if len(mn) >= 2 else None
                 m_size = _int(it_space[m_sym], 1)
                 n_size = _int(it_space[n_sym], 1) if n_sym is not None else 1
-                m_split = max(1, int(readable.get(m_sym, 1)))
-                n_split = (
-                    max(1, int(readable.get(n_sym, 1))) if n_sym is not None else 1
-                )
-                if m_size > 1:
+                m_split = max(1, readable.get(m_sym, 1))
+                n_split = max(1, readable.get(n_sym, 1)) if n_sym is not None else 1
+                if m_size:
                     rows_per_core = m_size / m_split
-                if n_size > 1:
+                if n_size:
                     cols_per_core = n_size / n_split
                 a_bytes = m_size * k_size * dtype_bytes
                 b_bytes = k_size * n_size * dtype_bytes
@@ -463,13 +468,78 @@ def _hbm_pattern(op, is_reduction: bool, out_dims) -> str:
         return ""
 
 
-def extract_op_features(op, work_slices=None) -> OpFeatures:
+def _per_core_run(view, device_dims) -> tuple:
+    """(contiguous device elements one core owns per run, split of the dim that
+    bounds it) for a PerCoreView over ``device_dims``.
+
+    The view's ``work_slice_dims`` is keyed by DEVICE-dim index, so the innermost
+    (largest-index) split dim bounds each core's contiguous run at
+    ``(device_dims[d] // split) * prod(device_dims[d+1:])``. Validated against real
+    plans: logical [8,256,512] lays out as [256,8,8,64], a ``{B:4,M:2}`` hint gives
+    view ((0,2),(2,4)) -> (8//4)*64 = 128 elements (256 B), the geometry the
+    relayout cost law was fitted at.
+    """
+    splits = dict(view.work_slice_dims)
+    if not splits:
+        return _prod_ints(device_dims), 1
+    d = max(splits)
+    inner = _prod_ints(device_dims[d + 1 :]) or 1
+    return (device_dims[d] // splits[d]) * inner, splits[d]
+
+
+def _relayout_features(op, out_dims):
+    """(is_lx_relayout, relayout_run_elems, relayout_split) for one op.
+
+    The materialization registry is the authority: an op is a relayout copy iff the
+    scratchpad planner registered it (``graph._spyre_lx_relayout_copies``), so a plan
+    the allocator or scheduler later demoted never reaches here as a relayout. The
+    governing geometry is the FINER of the plan's two views (smaller per-core run);
+    the term's law is direction-symmetric (measured: 8.721 vs 8.701 us reversed), so
+    which side is source does not matter. All-zeros for every other op.
+    """
+    zeros = (False, 0, 0)
+    try:
+        from torch._inductor.virtualized import V
+
+        from .scratchpad.lx_relayout import materialized_lx_relayouts
+
+        registry = materialized_lx_relayouts(V.graph)
+        if not registry:
+            return zeros
+        # The registry records the COPY BUFFER's name (materialize_lx_relayouts
+        # stores ``copy.get_name()``, e.g. "buf2"); ``get_operation_name()`` is the
+        # op name ("op2"), so match on the buffer name.
+        name = op.get_name()
+        plan = next(
+            (p for copy_name, p in registry.values() if copy_name == name), None
+        )
+        if plan is None:
+            return zeros
+        src = _per_core_run(plan.source_view, out_dims)
+        dst = _per_core_run(plan.destination_view, out_dims)
+        # Governing side = the finer view: smaller per-core run; on a run tie the
+        # LARGER split (at equal run the higher split measured ~3.6x slower).
+        run_elems, split = min(src, dst, key=lambda t: (t[0], -t[1]))
+        if run_elems <= 0 or split <= 0:
+            return zeros
+        return True, run_elems, split
+    except Exception:  # noqa: BLE001 - a diagnostic feature must not sink a compile
+        return zeros
+
+
+def extract_op_features(
+    op, work_slices=None, buffers: Optional[Mapping[str, "LifetimeBoundBuffer"]] = None
+) -> OpFeatures:
     """Build OpFeatures for one ComputedBuffer op (best-effort).
 
     ``work_slices`` is a complete symbol-keyed candidate division during LX
     planning. Otherwise committed pre-scheduler ownership is used, falling back
     to legacy coefficient-keyed Scheduler transport after finalization.
+
+    buffers is an optional name -> LifetimeBoundBuffer map used for creating a
+    symbolic cost model.
     """
+    buf = buffers.get(op.name) if buffers else None
     data = getattr(op, "data", None)
     is_reduction = getattr(data, "reduction_type", None) is not None
     loop_trip, tiles_red_dim, tiles_out_dim = _loop_features(op)
@@ -494,10 +564,10 @@ def extract_op_features(op, work_slices=None) -> OpFeatures:
     # axis with leftover cores -> the reduced axis is split only when out_elems < cores.
     # Approx k as the cores not absorbed by the output (refine if rung 11 needs it).
     reduction_cores = 1
-    if is_reduction and out_elems < cores:
+    if is_reduction:
         reduction_cores = max(1, cores // max(1, out_elems))
 
-    out_mem = _mem_of_layout(op.get_layout())
+    is_lx = buf.sym_is_lx if buf else _mem_of_layout(op.get_layout()) == "lx"
 
     # Matmul (batchmatmul reduction): compute-bound -> extra additive compute term. Pull
     # MACs (M*N*K), the per-core M tile (pt_eff), and the K-split k (-> reduction_cores,
@@ -531,7 +601,7 @@ def extract_op_features(op, work_slices=None) -> OpFeatures:
     # (rows/tile < col-sticks), leaving each core a full row tile (no underfill). 0.0 =
     # N/A -> no derate.
     tile_rows_per_core = 0.0
-    if tiles_out_dim and loop_trip > 1 and cores > 0 and len(out_dims) >= 2:
+    if tiles_out_dim and loop_trip > 1 and len(out_dims) >= 2:
         # Row extent from the LOGICAL shape, not the device shape. ``out_dims[-2]`` is
         # the row count only for a rank-2 tensor, whose device layout is rank-3. A
         # rank-3 or rank-4 tensor has a rank-4/5 device layout in which [-2] is a
@@ -545,8 +615,8 @@ def extract_op_features(op, work_slices=None) -> OpFeatures:
         # previously modelled; it only repairs rank>=3. Same class of mistake, and the
         # same fix, as _matmul_features' batch-dim exclusion above.
         rows = (out_size[-2] if len(out_size) >= 2 else 0) or out_dims[-2]
-        if out_mem != "lx":  # full-buffer alloc: per-tile slice is rows / loop_trip
-            rows = rows / loop_trip
+        # full-buffer alloc: per-tile slice is rows / loop_trip
+        rows = rows / loop_trip * (1 - is_lx) + rows * is_lx
         # `loop_trip > 1` is guaranteed by the branch condition; `_row_split` can in
         # principle return 0 if a split map ever records one, and this term is a
         # diagnostic -- a ZeroDivisionError here would take down a compile for a number
@@ -587,7 +657,7 @@ def extract_op_features(op, work_slices=None) -> OpFeatures:
         ArgTraffic(
             name=op.get_operation_name(),
             role="output",
-            mem=out_mem,
+            is_lx=is_lx,
             elems=out_elems,
             dims=list(out_dims),
             logical=list(out_size),
@@ -624,14 +694,21 @@ def extract_op_features(op, work_slices=None) -> OpFeatures:
             # output size. Only a NON-broadcast unresolved read is conservatively
             # sized at the full output.
             if broadcast:
-                mem, dims, in_elems, in_logical = "hbm", [1], 1, [1]
+                dims, in_elems, in_logical = [1], 1, [1]
             else:
-                mem, dims, in_elems, in_logical = "hbm", list(out_dims), out_elems, []
+                dims, in_elems, in_logical = list(out_dims), out_elems, []
+            inp_is_lx = False
+        else:
+            if buffers:
+                inp_buf = buffers.get(name)
+                inp_is_lx = inp_buf.sym_is_lx if inp_buf is not None else (mem == "lx")
+            else:
+                inp_is_lx = mem == "lx"
         args.append(
             ArgTraffic(
                 name=name,
                 role="input",
-                mem=mem,
+                is_lx=inp_is_lx,
                 elems=in_elems,
                 broadcast=broadcast,
                 dims=list(dims),
@@ -644,6 +721,8 @@ def extract_op_features(op, work_slices=None) -> OpFeatures:
                 ),
             )
         )
+
+    _rl = _relayout_features(op, out_dims)
 
     return OpFeatures(
         name=_op_name(op),
@@ -666,6 +745,9 @@ def extract_op_features(op, work_slices=None) -> OpFeatures:
         matmul_m_split=matmul_m_split,
         matmul_n_split=matmul_n_split,
         hbm_pattern="" if is_matmul else _hbm_pattern(op, is_reduction, out_dims),
+        is_lx_relayout=_rl[0],
+        relayout_run_elems=_rl[1],
+        relayout_split=_rl[2],
     )
 
 

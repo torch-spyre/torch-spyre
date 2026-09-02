@@ -17,8 +17,11 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Optional, TYPE_CHECKING
 from abc import ABC, abstractmethod
+import itertools
 import math
+import sympy
 from torch_spyre._inductor.logging_utils import get_inductor_logger
+
 from enum import Enum
 
 if TYPE_CHECKING:
@@ -147,6 +150,10 @@ class LifetimeBoundBuffer:
     def overlaps_in_time(self, other: "LifetimeBoundBuffer") -> bool:
         """Returns true iff self and other overlap in time."""
         return self.start_time < other.end_time and other.start_time < self.end_time
+
+    @property
+    def sym_is_lx(self) -> sympy.Symbol:
+        return sympy.Symbol(f"is_lx_{self.name}", integer=True, nonnegative=True)
 
 
 @dataclass(frozen=True)
@@ -320,6 +327,39 @@ class CoreDivisionBuffer(LifetimeBoundBuffer):
             ceil_div(self.size, cd.output_partition * cd.tiling.output_tile_count)
             for cd in self.core_divisions
         )
+
+    @property
+    def sym_cores(self) -> sympy.Symbol:
+        output, reduction = self.sym_core_divs
+        return math.prod(output.values()) * math.prod(reduction.values())
+
+    @property
+    def sym_core_divs(self) -> tuple[dict, dict]:
+        """Symbolic stand-in for a chosen ``op_it_space_splits``: one symbol per
+        stride coefficient seen across this buffer's candidate divisions, so the
+        cost model can carry an undecided split as an unknown rather than a
+        concrete value."""
+        core_divs = self.core_divisions
+
+        def unique(args):
+            d = {arg: None for arg in args}
+            return list(d)
+
+        output_keys = unique(
+            itertools.chain.from_iterable(cd.output_splits for cd in core_divs)
+        )
+        reduction_keys = unique(
+            itertools.chain.from_iterable(cd.reduction_splits for cd in core_divs)
+        )
+
+        def sym(prefix, key):
+            return sympy.Symbol(
+                f"{prefix}_split_{self.name}_{key}", integer=True, positive=True
+            )
+
+        sym_output_splits = {key: sym("output", key) for key in output_keys}
+        sym_reduction_splits = {key: sym("reduction", key) for key in reduction_keys}
+        return (sym_output_splits, sym_reduction_splits)
 
 
 def check_in_place_parent_is_read(
@@ -496,7 +536,9 @@ class CoreDivisionLayoutSolver(MemoryPlanSolver):
     """
 
     @abstractmethod
-    def plan_layout_and_core_divisions(self) -> list[CoreDivisionBuffer]:
+    def plan_layout_and_core_divisions(
+        self, cost_expr: sympy.Expr | None = None
+    ) -> list[CoreDivisionBuffer]:
         """Choose each buffer's core division and its LX placement together.
 
         On top of the :meth:`plan_layout` contract, implementations write the

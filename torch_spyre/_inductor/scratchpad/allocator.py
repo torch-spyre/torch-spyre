@@ -16,8 +16,9 @@ import functools
 import logging
 import math
 import time
+from abc import ABC, abstractmethod
 from collections import defaultdict
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from dataclasses import replace
 from typing import Any, Callable, cast, Optional
 
@@ -47,7 +48,10 @@ from torch_spyre._inductor.pass_utils import (
     _is_matmul_op,
     op_short_name,
 )
-from torch_spyre._inductor.work_division import enumerate_work_division_candidates
+from torch_spyre._inductor.work_division import (
+    enumerate_work_division_candidates,
+    work_division_splits_are_legal,
+)
 from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.scratchpad.plan_solver import (
     CoreDivision,
@@ -70,9 +74,6 @@ from torch_spyre._inductor.scratchpad.exhaustive_search import (
     ExhaustiveSearchSolver,
 )
 from torch_spyre._inductor.scratchpad.sa_cooptimizer import SaCoOptimizingSolver
-from torch_spyre._inductor.scratchpad.passes import (
-    ScratchpadOptimizationPass,
-)
 from torch_spyre._inductor.scratchpad.utils import (
     round_up_to_alignment,
     clone_at_graph_boundaries,
@@ -95,10 +96,20 @@ from torch_spyre._inductor.ir import FixedTiledLayout, SpyreEmptyFallback
 
 from torch_spyre._inductor import config
 from torch_spyre._inductor.logging_utils import get_inductor_logger
+from torch_spyre._inductor.loop_info import CarriedReductionRecord
 from torch_spyre._inductor.scratchpad.lx_relayout import (
     LXRelayoutPlan,
     collect_lx_relayout_plans,
     materialize_lx_relayouts,
+)
+from torch_spyre._inductor.cost_model import CostParams
+
+_COST_PARAMS = CostParams(
+    # we need a expression of both compute, mem_t
+    # whereas the default gives max(compute, mem_t)
+    # which optimizes compute only when there's a matmul
+    overlap_gamma=0.46,
+    use_bundled_cost_model=False,
 )
 
 logger = get_inductor_logger("scratchpad.allocator")
@@ -156,6 +167,16 @@ def _extern_kernel_in_live_range(graph: GraphLowering, uses: list[int]) -> bool:
     )
 
 
+def _is_carried_reduction_storage(op: Any) -> bool:
+    """True only for the accumulator named by its shared physical contract."""
+
+    record = getattr(op, "_carried_reduction_record", None)
+    return (
+        isinstance(record, CarriedReductionRecord)
+        and record.accumulator_name == op.get_name()
+    )
+
+
 # A ``MemoryPlanSolver`` is single-use (buffers are required at construction),
 # so the allocators hold a factory -- how to build a solver for a given buffer
 # set -- rather than a live instance, and build a fresh one per solve.
@@ -166,6 +187,25 @@ LayoutSolverFactory = Callable[[Sequence[LifetimeBoundBuffer], int], MemoryPlanS
 CoreDivisionSolverFactory = Callable[
     [Sequence[LifetimeBoundBuffer], int], CoreDivisionLayoutSolver
 ]
+
+
+class ScratchpadOptimizationPass(ABC):
+    """
+    Abstract class for optimization passes which are implemented to improve
+    a graph's overall scratchpad memory utilization and/or memory latency.
+    """
+
+    @abstractmethod
+    def apply_pass(self, graph: GraphLowering):
+        """
+        Accepts a candidate graph to be optimized and evaluated for scratchpad memory allocation.
+        `graph` will be mutated according in an implementation defined way. The order and
+        number of nodes in the graph may change as a result of an optimization pass.
+
+        Args:
+            graph (GraphLowering): The graph to be optimized for scratchpad memory allocation
+        """
+        pass
 
 
 class ScratchpadAllocator:
@@ -238,7 +278,7 @@ class ScratchpadAllocator:
         self._run_passes(self.pre_optimization_passes, graph)
         buffers = self._prepare_buffers(graph)
         solver = self._build_solver(buffers)
-        allocation = self._solve(solver)
+        allocation = self._solve(solver, graph)
         accepted_lx_relayouts = self._finalize_lx_relayout_allocation(allocation)
         self._post_solve(graph, allocation)
         reasons = self._get_spill_reasons(solver, allocation)
@@ -273,7 +313,7 @@ class ScratchpadAllocator:
         self._append_lx_relayout_destinations(graph, buffers)
         return buffers
 
-    def _solve(self, solver: MemoryPlanSolver) -> Sequence[Any]:
+    def _solve(self, solver: MemoryPlanSolver, graph: GraphLowering) -> Sequence[Any]:
         """Assign LX addresses. Base: placement-only ``plan_layout``."""
         return solver.plan_layout(log_lx_usage=True)
 
@@ -347,8 +387,10 @@ class ScratchpadAllocator:
             return False
         # A planned source intentionally bypasses the profitability denylist:
         # the relayout planner has already applied its stricter structural gates.
-        return config.allow_all_ops_in_lx_planning or (
-            self._get_op_name(op) not in OP_OUTPUT_NOT_GOOD_FOR_LX_REUSE
+        return (
+            _is_carried_reduction_storage(op)
+            or config.allow_all_ops_in_lx_planning
+            or self._get_op_name(op) not in OP_OUTPUT_NOT_GOOD_FOR_LX_REUSE
             or op.get_name() in planned_lx_buffers
         )
 
@@ -442,8 +484,11 @@ class ScratchpadAllocator:
             # MultiOutputLayout tuple op). There is nothing to place, and the
             # checks below would raise.
             return "unsized (no device layout)"
-        if name in mutated_buffers:
+        if name in mutated_buffers and not _is_carried_reduction_storage(op):
             return "mutation target"
+        # The shared carried-reduction contract names exactly one accumulator
+        # with one in-loop mutator and a closed fill -> combine -> drain
+        # lifetime.  The general mutation gate remains unchanged otherwise.
         if _is_tiled_advancing(op) or _is_read_advancing_anywhere(name, buf_user_deps):
             # LX addresses cannot be expressed as affine.apply symbols today (see
             # compute_ops.py's is_tiled_lx check), so a buffer whose address
@@ -1188,6 +1233,37 @@ def _fixed_core_division(op: Operation) -> CoreDivision:
     return _core_division(op, ownership.work_slices if ownership is not None else {})
 
 
+def _legal_fixed_division(
+    op: Operation, fixed: list[CoreDivision], reason: str
+) -> list[CoreDivision]:
+    """Return upstream division when it satisfies hard constraints."""
+    division = fixed[0]
+    if not isinstance(op, ComputedBuffer) or _split_option_is_legal(
+        op, _division_splits(op, division)
+    ):
+        logger.debug("keep upstream division for %s: %s", op.name, reason)
+        return fixed
+    raise Unsupported(f"{op.name}: fixed split violates hard domain.")
+
+
+def _split_option_is_legal(op: Operation, splits: dict[sympy.Symbol, int]) -> bool:
+    """Return whether symbol-keyed splits satisfy hard domains."""
+    return not isinstance(op, ComputedBuffer) or work_division_splits_are_legal(
+        op, splits
+    )
+
+
+def _legal_split_options(
+    op: Operation, options: Iterable[dict[sympy.Symbol, int]]
+) -> list[dict[sympy.Symbol, int]]:
+    """Return stick-valid candidates satisfying hard work-division domains."""
+    return [
+        option
+        for option in options
+        if _split_fits_sticks(op, option) and _split_option_is_legal(op, option)
+    ]
+
+
 DEFAULT_VARIANT_CAP = 6
 # Try larger batch factors first. Keeping more of the batch axis whole offers
 # the same reconciliation benefit with fewer co-optimization candidates.
@@ -1247,6 +1323,13 @@ def _split_fits_sticks(op: Operation, splits: dict[sympy.Symbol, int]) -> bool:
     unplaceable (for example, a collapsed or broadcast dimension), so reject it
     rather than relying on modulo arithmetic with a missing size.
     """
+    layout = op.layout
+    if isinstance(layout, MutationLayoutSHOULDREMOVE):
+        layout = layout.real_layout()
+    # CPU ComputedBuffers participate in the joint division map but never in LX
+    # placement. They have no device geometry to validate against.
+    if not isinstance(layout, FixedTiledLayout):
+        return True
     write = next(iter(op_read_writes(op).writes), None)
     if write is None:
         return False
@@ -1428,11 +1511,7 @@ def _check_and_add_matmul_options(
         full_candidate = {sym: 1 for sym in iteration_space_from_op(op)}
         full_candidate.update(candidate)
         options.setdefault(_candidate_key(full_candidate), full_candidate)
-    return [
-        candidate
-        for candidate in options.values()
-        if candidate == seed or _split_fits_sticks(op, candidate)
-    ]
+    return _legal_split_options(op, options.values())
 
 
 def _enum_split_options(
@@ -1463,11 +1542,7 @@ def _enum_split_options(
             full_candidate = {sym: 1 for sym in iteration_space_from_op(op)}
             full_candidate.update(candidate)
             options.setdefault(_candidate_key(full_candidate), full_candidate)
-        return [
-            candidate
-            for candidate in options.values()
-            if candidate == seed or _split_fits_sticks(op, candidate)
-        ]
+        return _legal_split_options(op, options.values())
     if not is_computed or not seed_profile:
         return [seed]
 
@@ -1494,11 +1569,7 @@ def _enum_split_options(
     for profile in extra_profiles:
         candidate = _from_output_profile(op, profile)
         options.setdefault(_candidate_key(candidate), candidate)
-    return [
-        candidate
-        for candidate in options.values()
-        if candidate == seed or _split_fits_sticks(op, candidate)
-    ]
+    return _legal_split_options(op, options.values())
 
 
 class CoOptimizingAllocator(ScratchpadAllocator):
@@ -1543,13 +1614,73 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         )
         return buffers
 
-    def _solve(self, solver: MemoryPlanSolver) -> Sequence[Any]:
+    def _solve(self, solver: MemoryPlanSolver, graph: GraphLowering) -> Sequence[Any]:
         assert isinstance(solver, CoreDivisionLayoutSolver)
-        result = solver.plan_layout_and_core_divisions()
+        bufmap = {buf.name: buf for buf in solver.buffers}
+
+        # Keyed by buffer name, which is what ``predict_by_bundle`` needs to match
+        # features to the ops in each estimated bundle. ``mem_usage_by_buf`` keys
+        # on ``op.name`` over ``graph.operations``, so every feature here belongs
+        # to an op the grouping will see -- a feature whose buffer is absent from
+        # ``graph.operations`` would silently drop out of the objective.
+        mem_usage = mem_usage_by_buf(graph)
+        op_features = {}
+        for output_name in mem_usage:
+            if not isinstance(graph.get_buffer(output_name), ComputedBuffer):
+                continue
+            if output_name not in bufmap:
+                continue
+            op_features[output_name] = self._extract_op_features(
+                graph, output_name, bufmap
+            )
+
+        from torch_spyre._inductor.cost_model import predict_by_bundle
+
+        # Logged, not asserted: dropping a buffer from the objective changes what
+        # the solver optimizes without failing anything, so it has to be visible,
+        # but it is not worth killing a plan over. Empty today.
+        unscored = set(op_features) - {
+            getattr(op, "name", None) for op in graph.operations
+        }
+        if unscored:
+            logger.debug(
+                "cost objective omits %d buffer(s) absent from graph.operations: %s",
+                len(unscored),
+                sorted(unscored),
+            )
+
+        # Scored one estimated bundle at a time, not as a single whole-graph
+        # kernel: bundle membership decides input dedup, the arity derate and the
+        # underfill derate, so a graph that fuses into several kernels is
+        # mispriced when scored flat.
+        try:
+            cost_expr = sympy.sympify(
+                predict_by_bundle(graph.operations, op_features, params=_COST_PARAMS)
+            )
+        except (ValueError, RuntimeError):
+            cost_expr = None
+        result = solver.plan_layout_and_core_divisions(cost_expr)
         assert not any(buffer.lx_relayout_plans for buffer in result), (
             "CoOptimizingAllocator does not support LX relayout"
         )
         return result
+
+    def _extract_op_features(self, graph, output_name, buffers):
+        """Build symbolic OpFeatures for one ComputedBuffer op (best-effort).
+
+        Same extraction as dump_cost_model.extract_op_features, but keyed off
+        each buffer's *symbolic* is_lx/cores/core-division vars (sym_is_lx,
+        sym_core_divs) instead of concrete values, so the
+        resulting OpFeatures can be fed to predict_ops() to build a cost
+        expression over the solver's own decision variables.
+        """
+        from torch_spyre._inductor.dump_cost_model import extract_op_features
+        from torch_spyre._inductor.scratchpad.sa_cooptimizer import _work_slices
+
+        sym_core_divs = buffers[output_name].sym_core_divs
+        op = graph.get_buffer(output_name)
+        ws = _work_slices(op, CoreDivision(sym_core_divs[0], sym_core_divs[1]))
+        return extract_op_features(op, ws, buffers=buffers)
 
     def _post_solve(self, graph: GraphLowering, allocation: Sequence[Any]) -> None:
         # The divisions must be committed such that any buffer clones can correctly
@@ -1585,7 +1716,9 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         least one valid candidate"``), the root cause of the
         ``slice_stick_mutation_*`` failures. Keeping the fixed division there
         matches the schedulable slicing the greedy path uses; it costs only a
-        division optimization, never correctness. See
+        division optimization when that division also satisfies hard
+        work-division constraints. Otherwise LX planning raises ``Unsupported``
+        rather than committing an illegal division. See
         ``utils.ops_in_offset_mutation_component``.
         """
         max_cores = config.sencores
@@ -1595,14 +1728,20 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         result = {}
         for op in graph.operations:
             if op.name in fixed_division_ops:
-                divs = [_fixed_core_division(op)]
+                divs = _legal_fixed_division(
+                    op, [_fixed_core_division(op)], "offset mutation component"
+                )
             elif self.prune and isinstance(op, ComputedBuffer):
                 divs = [
                     _core_division(op, splits)
-                    for splits in _enum_split_options(op, profiles, matmul_roles)
+                    for splits in _legal_split_options(
+                        op, _enum_split_options(op, profiles, matmul_roles)
+                    )
                 ]
             else:
                 divs = self._enumerate_core_divisions(op, max_cores)
+            if not divs:
+                raise Unsupported(f"{op.name}: no legal core-division candidates.")
             result[op.name] = divs
 
         return result
@@ -1625,8 +1764,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         try:
             candidates = enumerate_work_division_candidates(op, max_cores)
         except Unsupported as exc:
-            logger.debug("skip joint division for %s: %s", op.name, exc)
-            return fixed
+            return _legal_fixed_division(op, fixed, str(exc))
         cds: list[CoreDivision] = []
         seen: set[tuple] = set()
         for candidate in candidates:
@@ -1646,7 +1784,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             if key not in seen:
                 seen.add(key)
                 cds.append(division)
-        return cds or fixed
+        return cds or _legal_fixed_division(op, fixed, "no enumerable candidate")
 
     def _commit_divisions(
         self,
@@ -1673,6 +1811,8 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             if not hasattr(op, "iteration_space_ownership"):
                 continue
             cd = buf.core_divisions[buf.chosen_division]
+            if not _split_option_is_legal(op, _division_splits(op, cd)):
+                raise Unsupported(f"{op.name}: chosen split violates hard domain.")
             commit_iteration_space_ownership(op, _division_splits(op, cd))
 
     def _determine_in_place_division_invariant(

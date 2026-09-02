@@ -30,9 +30,11 @@ from torch_spyre._inductor.op_spec_validation import (
     BINARY_OPS,
     STICK_STAGE,
     OpSpecValidationError,
+    _all_known_ops,
     _is_unimplemented_op,
     validate_op_specs,
 )
+from torch_spyre._inductor.constants import KEEP_BY_INDEX_OP
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -125,6 +127,9 @@ class TestValidateOpSpecsHappyPath(unittest.TestCase):
 
     def test_matmul_valid(self):
         validate_op_specs([_make_matmul_op_spec()], stage="test")
+
+    def test_keep_by_index_is_known(self):
+        self.assertIn(KEEP_BY_INDEX_OP, _all_known_ops())
 
     def test_tiled_symbols_valid(self):
         op = _make_valid_op_spec()

@@ -482,8 +482,15 @@ def span_overflow_groups(
     # join branch is deliberately *not* keyed on this flag.
     current_root_is_reduction = False
 
+    def allocate_hint_ids(signature: _PwDims) -> list[int]:
+        """Reserve one contiguous hint-ID range for a coarse-tile group."""
+        nonlocal next_hint_id
+        hint_ids = list(range(next_hint_id, next_hint_id + len(signature)))
+        next_hint_id += len(signature)
+        return hint_ids
+
     def flush_current_group() -> None:
-        nonlocal next_hint_id, current_group, current_signature
+        nonlocal current_group, current_signature
         nonlocal current_root_is_reduction
         if not current_group:
             current_root_is_reduction = False
@@ -491,8 +498,7 @@ def span_overflow_groups(
 
         signature = current_signature
         assert signature is not None
-        hint_ids = list(range(next_hint_id, next_hint_id + len(signature)))
-        next_hint_id += len(signature)
+        hint_ids = allocate_hint_ids(signature)
         levels = [
             (hint_id, sympy.Integer(split_count))
             for hint_id, (_host_dim, split_count, _is_reduction) in zip(
@@ -552,7 +558,7 @@ def span_overflow_groups(
             continue
 
         signature = _auto_span_plan_signature(plan)
-        reduction_only_plan = bool(signature) and all(
+        has_reduction_range = any(
             is_reduction for _host_dim, _split, is_reduction in signature
         )
         logger.debug(
@@ -768,13 +774,12 @@ def span_overflow_groups(
             continue
 
         # A Reduction/BMM op that did not join an open producer group (above)
-        # either opens a run of its own (for output-range tiles) or stays as an
-        # independent singleton (for reduction-range/K-only tiles).  K-only
-        # plans cannot join or root a producer-consumer run because each K tile
-        # is only a partial accumulation.
-        if reduction_only_plan:
-            hint_ids = list(range(next_hint_id, next_hint_id + len(signature)))
-            next_hint_id += len(signature)
+        # either opens a run of its own (for output-only tiles) or stays as an
+        # independent singleton (for any plan containing a reduction-range tile).
+        # A K level is a partial accumulation, so K-only and combined output+K
+        # plans cannot join or root a producer-consumer run.
+        if has_reduction_range:
+            hint_ids = allocate_hint_ids(signature)
             dim_hint_assignments.append((op, _dims_to_hints(op, signature, hint_ids)))
             levels = [
                 (hint_id, sympy.Integer(split_count))
@@ -783,6 +788,7 @@ def span_overflow_groups(
                 )
             ]
             groups.append(([op], levels))
+            auto_tiled_producers.add(op.get_name())
             logger.debug(
                 "[span-overflow groups] created group_index=%d op=%s levels=%s",
                 len(groups) - 1,

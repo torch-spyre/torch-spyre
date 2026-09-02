@@ -22,7 +22,6 @@ from typing import Any
 
 import sympy
 
-from . import config
 from .logging_utils import get_inductor_logger
 
 from torch._inductor.dependencies import MemoryDep
@@ -274,10 +273,10 @@ class FixedInOutNode(RestickNodeCost):
         required_in_stls: "list[SpyreTensorLayout]",
     ):
         super().__init__(edge_costs)
-        self.required_out_stl = required_out_stl  # output layout currently assigned
-        self.required_in_stls = (
-            required_in_stls  # each input must be stick-compatible with this layout
-        )
+        self.required_out_stl = required_out_stl
+        # Parallel to edge_costs by construction in from_args (both built from the
+        # same zip over args/req_stls). strict=True in min_input_cost asserts this.
+        self.required_in_stls = required_in_stls
 
     @classmethod
     def from_args(cls, args, out_stl, req_stls, op):
@@ -304,22 +303,22 @@ class FixedInOutNode(RestickNodeCost):
     def min_input_cost(self, dep_name, in_stl, out_stl):
         if out_stl != self.required_out_stl:
             return INF
-        # Returns on first match. If dep_name appears twice (e.g. matmul(x, x)),
-        # the two positions may have different required_in_stls — this would return
-        # the wrong cost. All current FixedInOutNode ops require the same STL for
-        # both positions of a self-matmul, so this is safe today.
-        for ec, req in zip(self.edge_costs, self.required_in_stls):
-            if ec.dep.name == dep_name:
-                edge_c = ec.cost(in_stl, req)
-                if edge_c == INF:
-                    return INF
-                other_ok = all(
-                    any(e.cost(other_c, r) < INF for other_c in e._in_layouts)
-                    for e, r in zip(self.edge_costs, self.required_in_stls)
-                    if e.dep.name != dep_name
-                )
-                return edge_c if other_ok else INF
-        return INF
+        matching = [
+            (ec, req)
+            for ec, req in zip(self.edge_costs, self.required_in_stls, strict=True)
+            if ec.dep.name == dep_name
+        ]
+        if not matching:
+            return INF
+        costs = [ec.cost(in_stl, req) for ec, req in matching]
+        if any(c == INF for c in costs):
+            return INF
+        other_ok = all(
+            any(e.cost(other_c, req) < INF for other_c in e._in_layouts)
+            for e, req in zip(self.edge_costs, self.required_in_stls, strict=True)
+            if e.dep.name != dep_name
+        )
+        return sum(costs) if other_ok else INF
 
 
 class AnyInNode(RestickNodeCost):
@@ -418,66 +417,6 @@ def _no_feasible_layout_error(op) -> NotImplementedError:
     lines += ["", "  Problem:"]
     lines += analysis if analysis else ["    No automated triage available"]
     return NotImplementedError("\n".join(lines))
-
-
-def greedy_local_min_cost(operations: list) -> None:
-    """Greedy layout selection: process ops in topological order, picking the output layout with minimum local restick cost.
-
-    On cost ties, the first candidate layout (leftmost arg's stick) is chosen. Each op's chosen
-    layout is committed immediately so downstream ops can read it.
-    """
-
-    # Process graph inputs first so all upstreams have committed_stl.
-    # For now inputs are always a set of size 1, since we use it as it
-    # was transferred to device
-    for name in V.graph.graph_input_names:
-        tb = V.graph.graph_inputs[name]
-        if (
-            isinstance(tb, TensorBox)
-            and isinstance(tb.data, StorageBox)
-            and isinstance(tb.data.data, InputBuffer)
-            and hasattr(tb, "layouts")
-        ):
-            if not tb.layouts:
-                raise AssertionError(f"graph input {name} has empty layouts set")
-            stl = next(iter(tb.layouts))
-            tb.data.data.committed_stl = stl
-            tb.committed_stl = stl
-
-    for op in operations:
-        if not hasattr(op, "layouts"):
-            continue  # FallbackKernel and other unhandled op types
-
-        assert hasattr(op, "restick_cost_fn"), (
-            f"op {op.get_name()} has layouts but no restick_cost_fn"
-        )
-        cost_fn = op.restick_cost_fn
-
-        # Collect each input arg's committed layout (finalized by earlier topo iterations).
-        in_layouts = []
-        for ec in cost_fn.edge_costs:
-            buf = V.graph.get_buffer(ec.dep.name)
-            assert hasattr(buf, "committed_stl"), (
-                f"buffer {ec.dep.name} has no committed_stl — "
-                "topological order violated or input not committed"
-            )
-            in_layouts.append(buf.committed_stl)
-
-        assert op.layouts, (
-            f"op {op.get_name()} has restick_cost_fn but no candidate output layouts"
-        )
-        out_stl = None
-        best_cost = float("inf")
-        for candidate_stl in op.layouts:
-            out_layout_cost = cost_fn.cost(in_layouts, candidate_stl)
-            if out_layout_cost < best_cost:
-                best_cost = out_layout_cost
-                out_stl = candidate_stl
-
-        if out_stl is None:
-            raise _no_feasible_layout_error(op)
-
-        op.committed_stl = out_stl
 
 
 # Global Stick Optimizer
@@ -858,9 +797,5 @@ def beam_global_min_cost(operations: list) -> None:
 def optimize_restickify_locations(graph: GraphLowering) -> None:
     """Select restickify locations for all ops, minimizing total restickify cost."""
     operations = graph.operations
-    if config.global_stick_optimizer:
-        logger.info("optimizer: beam (global)")
-        beam_global_min_cost(operations)
-    else:
-        logger.info("optimizer: greedy (local)")
-        greedy_local_min_cost(operations)
+    logger.info("optimizer: beam (global)")
+    beam_global_min_cost(operations)

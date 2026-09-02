@@ -121,6 +121,7 @@ def counted_loop_lifetime_end_overrides(graph: GraphLowering) -> dict[str, int]:
         name: () for name in graph.graph_input_names
     }
     last_access: dict[str, int] = {}
+    last_read: dict[str, int] = {}
 
     for index, op in enumerate(graph.operations):
         path = group_path(op)
@@ -133,8 +134,10 @@ def counted_loop_lifetime_end_overrides(graph: GraphLowering) -> dict[str, int]:
         for dep in rw.reads:
             birth_group.setdefault(dep.name, ())
             last_access[dep.name] = index
+            last_read[dep.name] = index
 
     overrides: dict[str, int] = {}
+    crossed_loops: set[tuple[int, ...]] = set()
     for index, op in enumerate(graph.operations):
         consumer_path = group_path(op)
         if not consumer_path:
@@ -154,6 +157,34 @@ def counted_loop_lifetime_end_overrides(graph: GraphLowering) -> dict[str, int]:
             end = loop_end[enclosing_loop] + 1
             if end > last_access.get(dep.name, index) + 1:
                 overrides[dep.name] = max(overrides.get(dep.name, 0), end)
+                crossed_loops.add(enclosing_loop)
+
+    # A value that crosses `enclosing_loop`'s boundary (above) must stay valid
+    # across every runtime iteration of that loop. But the graph holds only one
+    # textual copy of the loop body, so any OTHER value that is born and fully
+    # consumed entirely inside that same loop looks, under plain liveness, like
+    # it occupies a short, disjoint tick range that never overlaps the
+    # crossing value's -- even though that loop-local value is actually
+    # rewritten fresh on every iteration, including iterations after the one
+    # the crossing value's own reads happen to fall in. Sharing an LX address
+    # between the two is therefore unsafe: a later iteration's rewrite of the
+    # loop-local value can land between two of the crossing value's reads and
+    # clobber it. Extending the loop-local value's own end_time to also cover
+    # the whole loop forces `overlaps_in_time` to see the conflict for every
+    # solver, instead of leaving it to placement-order luck. A value that is
+    # never read again by anything (write-only) cannot be clobbered before its
+    # next read -- it has none -- so only values with at least one recorded
+    # read are candidates here; `last_read`, not `last_access`, decides
+    # whether that read already falls before the loop's end.
+    if crossed_loops:
+        for name, path in birth_group.items():
+            if name not in last_read:
+                continue
+            for loop in crossed_loops:
+                if path[: len(loop)] == loop:
+                    end = loop_end[loop] + 1
+                    if end > last_read[name] + 1:
+                        overrides[name] = max(overrides.get(name, 0), end)
     return overrides
 
 
@@ -285,6 +316,17 @@ def _is_tiled_advancing(op: Operation) -> bool:
     all. A loop-internal buffer (e.g. drained by a copy op every iteration)
     can be tiled yet have its own write pinned at a fixed address; such a
     buffer is LX-eligible.
+
+    Also checks ``squeezed_advance_output``: a dim tiled down to per-tile
+    extent 1 (e.g. a coarse-tiled batch dim with one tile per iteration) is
+    squeezed out of the write's own index entirely, so it never appears in
+    ``output_tiled_dims`` even though the write's device address genuinely
+    advances every iteration (see ``loop_info.py``'s
+    ``squeezed_advance_output`` docstring). Missing this let a
+    mutation_write_back accumulator (e.g. flash attention's running max/
+    denominator carry) reside in LX, where the advance later crashed --
+    or, if the crash path were ever bypassed, silently pinned every
+    iteration to the same address.
     """
     layout = getattr(op, "layout", None)
     if not isinstance(layout, FixedTiledLayout):
@@ -292,7 +334,10 @@ def _is_tiled_advancing(op: Operation) -> bool:
     loop_info = getattr(op, "loop_info", None)
     if loop_info is None:
         return False
-    return any(dims for dims in loop_info.output_tiled_dims)
+    if any(dims for dims in loop_info.output_tiled_dims):
+        return True
+    squeezed_advance_output = getattr(loop_info, "squeezed_advance_output", None) or []
+    return any(level for level in squeezed_advance_output)
 
 
 def _is_read_advancing_anywhere(
@@ -339,6 +384,19 @@ def _is_read_advancing_anywhere(
         # continue` never contributes a term for such a level, so the
         # resulting device_tile_advance_expr is None, not merely small.
         if any(loop_info.tiled_dims_per_read[dep_idx]):
+            return True
+        # Mirror _is_tiled_advancing's squeezed_advance_output check on the
+        # read side: a dim tiled down to per-tile extent 1 is squeezed out
+        # of this read's own index, so it never appears in
+        # tiled_dims_per_read even though the read's device address
+        # genuinely advances every iteration (see loop_info.py's
+        # squeezed_advance_per_read docstring).
+        squeezed_advance_per_read = (
+            getattr(loop_info, "squeezed_advance_per_read", None) or []
+        )
+        if dep_idx < len(squeezed_advance_per_read) and any(
+            squeezed_advance_per_read[dep_idx]
+        ):
             return True
     return False
 
@@ -742,3 +800,37 @@ def quality_plot(
         ax2.plot(temperature_logs, "g", lw=1)
 
     return fig
+
+
+# Microseconds are the universal currency; every µs quantity is converted to an
+# integer on this scale by exactly one rounding step, so accumulation is pure
+# integer. 1e6 gives picosecond resolution -- ample for the smallest memory
+# terms -- while Python's arbitrary-precision ints keep large sums exact.
+US_FIXED_POINT_SCALE = 1_000_000
+
+
+def to_fixed_us(us: float) -> int:
+    """Map a non-negative microsecond quantity to the fixed-point integer scale
+    with a single deterministic round-half-up step.
+
+    Round-half-up on non-negative inputs is order-independent and platform-stable
+    (no banker's rounding), which is what the determinism guarantee needs. An
+    infinite cost (an infeasible split) is a caller error, flagged rather than
+    silently mapped.
+    """
+    if not math.isfinite(us) or us < 0.0:
+        raise ValueError(f"cost must be finite and non-negative, got {us!r}")
+    return int(us * US_FIXED_POINT_SCALE + 0.5)
+
+
+def hbm_bytes_per_us() -> float:
+    """HBM bandwidth as bytes per microsecond, sourced from the native cost model
+    (``_HBM_BW_GBS`` GB/s x 1000) so the memory objective and the cost model's
+    own traffic term use the identical constant.
+
+    Imported lazily so the fixed-point helper above stays importable without
+    pulling in torch.
+    """
+    from torch_spyre._inductor import work_division  # noqa: PLC0415
+
+    return float(work_division._HBM_BW_GBS) * 1000.0
