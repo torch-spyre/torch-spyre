@@ -824,6 +824,109 @@ def _find_layout_avoiding_var_on_stick(
     )
 
 
+def _canonical_stl_from_collapsed_host(
+    arg: PropArg,
+    matmul_var: sympy.Symbol,
+    reduction_type: str,
+    label: str,
+) -> SpyreTensorLayout:
+    """Build the canonical STL for a matmul input by collapsing host dims.
+
+    Constructs the canonical ``SpyreTensorLayout`` directly from the host
+    geometry, collapsing any mixed-radix dims that jointly carry ``matmul_var``
+    into one logical dim.  This is the single authoritative path for Pass 3.
+
+    Single-host-dim case (Case A): the host already has exactly one dim for
+    ``matmul_var``; build the STL directly from it (``compute_restickify_target_layout``
+    can produce different results depending on candidate order, so we bypass it).
+
+    Multi-host-dim case (Case B): validate the chain is affine, full-range,
+    and contiguous, then merge the dims.
+
+    Raises ``Unsupported`` on invalid chains.  Does not call ``matching_dim`` or
+    ``compute_restickify_target_layout``.
+    """
+    host_coords = host_coordinates(arg.layout, arg.dep, None)
+    host_dims = [
+        dim for dim, coord in enumerate(host_coords) if matmul_var in coord.free_symbols
+    ]
+    host_size = [concretize_expr(size) for size in arg.layout.size]
+    host_stride = [concretize_expr(stride) for stride in arg.layout.stride]
+
+    if len(host_dims) == 1:
+        # Case A: single host dim — build STL from host size/stride directly,
+        # with that dim as the stick.
+        stick_dim = host_dims[0]
+        canonical_size = host_size
+        canonical_stride = host_stride
+    else:
+        zeroed_index = arg.dep.index.xreplace({matmul_var: sympy.S.Zero})
+        var_delta = sympy.expand(arg.dep.index - zeroed_index)
+        var_stride = sympy.expand(var_delta.coeff(matmul_var))
+        var_range = concretize_expr(arg.dep.ranges[matmul_var])
+
+        carrier_dims = [dim for dim in host_dims if host_size[dim] > 1]
+        affine_full_range = (
+            len(carrier_dims) > 1
+            and not var_stride.free_symbols
+            and var_stride.is_Integer
+            and var_stride > 0
+            and sympy.simplify(var_delta - var_stride * matmul_var) == 0
+            and all(
+                coord.free_symbols <= {matmul_var}
+                and sympy.simplify(coord.xreplace({matmul_var: sympy.S.Zero})) == 0
+                for dim, coord in enumerate(host_coords)
+                if dim in host_dims
+            )
+            and math.prod(host_size[dim] for dim in carrier_dims) == var_range
+        )
+        chain = sorted(carrier_dims, key=lambda dim: host_stride[dim], reverse=True)
+        contiguous_chain = bool(chain) and all(
+            host_stride[outer] == host_stride[inner] * host_size[inner]
+            for outer, inner in zip(chain, chain[1:])
+        )
+        if (
+            not affine_full_range
+            or not contiguous_chain
+            or host_stride[chain[-1]] != var_stride
+        ):
+            raise Unsupported(
+                f"{reduction_type}: cannot canonicalize factorized {label}_var="
+                f"{matmul_var}; expected an affine full-range contiguous host "
+                f"dimension chain, got host coordinates {host_coords}, "
+                f"size={list(arg.layout.size)}, stride={list(arg.layout.stride)}, "
+                f"dep={arg.dep.name}, index={arg.dep.index}, "
+                f"ranges={dict(arg.dep.ranges)}"
+            )
+
+        # Collapse the mixed-radix host dims into one logical dim, preserving all
+        # unrelated dims (including size-one batch dims) to keep rank conventions.
+        collapsed_dims = set(host_dims)
+        insert_at = min(host_dims)
+        canonical_size = []
+        canonical_stride = []
+        stick_dim = -1
+        for dim, (size, stride) in enumerate(zip(host_size, host_stride)):
+            if dim == insert_at:
+                stick_dim = len(canonical_size)
+                canonical_size.append(var_range)
+                canonical_stride.append(int(var_stride))
+            if dim not in collapsed_dims:
+                canonical_size.append(size)
+                canonical_stride.append(stride)
+        assert stick_dim >= 0
+
+    dim_order = [dim for dim in range(len(canonical_size)) if dim != stick_dim]
+    dim_order.append(stick_dim)
+    return SpyreTensorLayout(
+        canonical_size,
+        canonical_stride,
+        arg.layout.dtype,
+        dim_order,
+        ElementArrangement.STANDARD,
+    )
+
+
 def find_stick_compatible_input_layout(
     arg: PropArg,
     reduction_var: sympy.Symbol,
@@ -832,9 +935,13 @@ def find_stick_compatible_input_layout(
 ) -> SpyreTensorLayout:
     """Find the required STL for a matmul input by iterating all candidate layouts.
 
-    1. Return the first layout whose stick already carries reduction_var (zero cost).
-    2. Else return the first layout that can be restickified to put reduction_var on the stick.
-    3. Else raise Unsupported.
+    1. Return the first layout whose stick already carries reduction_var and no
+       outer axis also carries it (zero cost, no restickify needed).
+    2. Else return the first layout that can be restickified to put reduction_var
+       on the stick via compute_restickify_target_layout.
+    3. (BATCH_MATMUL_OP only) Else collapse mixed-radix host dims and construct
+       the canonical STL directly.
+    4. Else raise Unsupported.
     """
     logger.debug(
         "[find_stick_compatible_input_layout] label=%r reduction_type=%r\n"
@@ -863,14 +970,47 @@ def find_stick_compatible_input_layout(
     # Pass 1: already stick-compatible.
     # stick_compatible() checks cross-tensor compatibility; here we only need
     # to know if this input's stick coord already carries the target loop variable.
+    # For BATCH_MATMUL_OP: also reject layouts where the reduction variable appears
+    # on any outer axis in addition to the stick (factorized layout, e.g. SDPA's
+    # [L, D/64, H, 64]).  The backend treats a variable present on both an outer
+    # axis and the stick as two separate contraction dimensions, producing wrong
+    # output.  Such candidates fall through to Pass 2 / Pass 3 so a restickify
+    # collapses the factorization first.
+    # Other reduction types (exx2, layernormnorm, …): the backend correctly handles
+    # a tiled layout where the reduction var appears on one outer axis (floor(v/64))
+    # and the stick (Mod(v, 64)), so no special check is needed.
+    # Non-STANDARD arrangements (QFP8WT etc.) carry their own contraction
+    # structure; the backend handles them regardless of device coord shape,
+    # so return immediately without checking the stick.
     for stl, dev_coords in candidates:
-        if reduction_var in dev_coords[-1].free_symbols:
+        if stl.element_arrangement != ElementArrangement.STANDARD:
             return stl
+        if reduction_var not in dev_coords[-1].free_symbols:
+            continue
+        if reduction_type == BATCH_MATMUL_OP and any(
+            reduction_var in c.free_symbols for c in dev_coords[:-1]
+        ):
+            continue
+        return stl
 
     # Pass 2: can be restickified — find the resolvable device coord for reduction_var
     # and use it as target_stick_expr for compute_restickify_target_layout.
+    # Skip non-STANDARD arrangements: compute_restickify_target_layout always
+    # produces a STANDARD layout and would silently drop the arrangement.
+    # For BATCH_MATMUL_OP: skip candidates where reduction_var is on the stick AND
+    # on any outer axis (factorized, e.g. SDPA [L,D/64,H,64]).
+    # compute_restickify_target_layout cannot correctly collapse this factorization.
+    # Such candidates are handled by Pass 3 instead.
     arg_host_coords = host_coordinates(arg.layout, arg.dep, None)
     for stl, dev_coords in candidates:
+        if stl.element_arrangement != ElementArrangement.STANDARD:
+            continue
+        if (
+            reduction_type == BATCH_MATMUL_OP
+            and reduction_var in dev_coords[-1].free_symbols
+            and any(reduction_var in c.free_symbols for c in dev_coords[:-1])
+        ):
+            continue
         target_stick_expr = _dev_coord_for_var(
             dev_coords, arg_host_coords, reduction_var
         )
@@ -881,6 +1021,30 @@ def find_stick_compatible_input_layout(
         )
         if result is not None:
             return result
+
+    # Pass 3 (BATCH_MATMUL_OP only): all candidates were factorized (reduction_var
+    # on outer axes), so Pass 2 found nothing.  Build the canonical STL directly
+    # from the host geometry, collapsing mixed-radix dims if needed.
+    # This fires for:
+    #   Case A: single host dim but only factorized STL candidates — Pass 2
+    #           correctly skipped them; derive from host geometry instead.
+    #   Case B: multiple host dims (mixed-radix view) — collapse and construct.
+    # Does NOT fire when Pass 2 returned successfully (normal weight tensors where
+    # the generated var is on the stick and reduction_var is only on outer axes in
+    # a non-factorized sense).
+    if reduction_type == BATCH_MATMUL_OP:
+        canonical = _canonical_stl_from_collapsed_host(
+            arg, reduction_var, reduction_type, label
+        )
+        logger.debug(
+            "[find_stick_compatible_input_layout] Pass 3: canonical STL"
+            " for %r %s_var=%s → %s",
+            label,
+            label,
+            reduction_var,
+            canonical,
+        )
+        return canonical
 
     raise Unsupported(
         f"{reduction_type}: cannot restickify any input layout of {label} to carry {label}_var={reduction_var}"
@@ -1008,7 +1172,10 @@ def _matmul_layouts(
     out_stl = SpyreTensorLayout(c_size, c_stride, output.dtype, out_dim_order)
 
     op.restick_cost_fn = FixedInOutNode.from_args(
-        [x, y], out_stl, [x_req_stl, y_req_stl], op
+        [x, y],
+        out_stl,
+        [x_req_stl, y_req_stl],
+        op,
     )
     return [out_stl]
 
