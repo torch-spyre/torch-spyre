@@ -30,9 +30,19 @@ def launch_from_iofile(path=".", iofile="io.json"):
     import torch
 
     tensors = []
-    for tensor_spec in spec.inputs + spec.outputs:
+    for tensor_spec in spec.inputs:
         dtype = getattr(torch, tensor_spec.dtype.value)
         tensor = torch.ones(
+            tensor_spec.dimensions,
+            dtype=dtype,
+            device="spyre",
+        )
+        tensors.append(tensor)
+
+    # Use `torch.empty` for output tensors
+    for tensor_spec in spec.outputs:
+        dtype = getattr(torch, tensor_spec.dtype.value)
+        tensor = torch.empty(
             tensor_spec.dimensions,
             dtype=dtype,
             device="spyre",
