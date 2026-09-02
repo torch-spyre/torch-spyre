@@ -43,6 +43,8 @@ present in the output but absent from x (N).  This handles M==K==N and
 M=1 (decode phase) correctly.
 """
 
+from typing import Optional
+
 import torch
 from sympy import Expr
 from torch._inductor.graph import GraphLowering
@@ -117,7 +119,7 @@ def _move_ops_before(
         operations.insert(idx + i, o)
 
 
-def _find_arg_fx_node(arg_name: str) -> torch.fx.Node:
+def _find_arg_fx_node(arg_name: str) -> Optional[torch.fx.Node]:
     """Return the FX node whose lowered TensorBox has the given buffer name.
 
     Buffer names are unique, but a single buffer can be reached through
@@ -127,8 +129,11 @@ def _find_arg_fx_node(arg_name: str) -> torch.fx.Node:
     [M, K].  Both FX nodes lower to a TensorBox whose get_name() returns
     the same buffer name, but with different get_size() results.
 
-    Returns the first candidate (the base buffer, with no view applied).
-    Raises RuntimeError if no candidate exists.
+    Returns the first candidate (the base buffer, with no view applied), or
+    None if no candidate exists -- e.g. a coarse_tile read-copy buffer (see
+    coarse_tile.py's _insert_one_read_copy), which is synthesized purely at
+    the IR level after FX lowering completed and so has no FX-graph
+    counterpart at all.
     """
     graph_lowering = V.graph
     _patch_env(graph_lowering)
@@ -139,14 +144,13 @@ def _find_arg_fx_node(arg_name: str) -> torch.fx.Node:
         and isinstance(tb, TensorBox)
         and tb.get_name() == arg_name
     ]
-    if not candidates:
-        raise RuntimeError(f"no FX node found for buffer {arg_name!r}")
-    return candidates[0]
+    return candidates[0] if candidates else None
 
 
 def _rebuild_matmul(
     op: ComputedBuffer,
     y_padded_buf: Buffer,
+    y_k_dim: int,
     operations: list[Operation],
 ) -> ComputedBuffer:
     """Rebuild the matmul ComputedBuffer so y's loader reads from the padded buffer.
@@ -155,6 +159,13 @@ def _rebuild_matmul(
     loader with one that reads from the padded buffer.  reduction_ranges stays
     at K; the K→K_padded extension happens at SDSC codegen time via
     _extend_matmul_k_to_padded in superdsc.py.
+
+    y's non-batch dims are [K, N] in the common case, but need not be --
+    e.g. a coarse-tile read-copy buffer for a loop-invariant y can be
+    transposed ([N, K]), see test_bmm_read_copy_y_unaligned_k_pads.
+    ``y_k_dim`` (the same host dim insert_bmm_padding padded) says which
+    non-batch position K actually occupies in y_padded_buf; N takes
+    whichever position is left.
     """
     reduction = op.data
     assert isinstance(reduction, Reduction)
@@ -163,6 +174,13 @@ def _rebuild_matmul(
     y_padded_loader = y_padded_buf.make_loader()
     y_ndim = len(y_padded_buf.get_size())
     y_batch_ndim = y_ndim - 2
+    # y_k_dim is a host-dim index into the whole buffer; translate to a
+    # position within the two non-batch dims (0 or 1).
+    y_k_local = y_k_dim - y_batch_ndim
+    assert y_k_local in (0, 1), (
+        f"_rebuild_matmul: y_k_dim={y_k_dim} not in y's non-batch dims "
+        f"(y_batch_ndim={y_batch_ndim})"
+    )
 
     def new_inner_fn(
         index,
@@ -170,10 +188,14 @@ def _rebuild_matmul(
         _orig_inner_fn=orig_inner_fn,
         _y_loader=y_padded_loader,
         _y_batch_ndim=y_batch_ndim,
+        _y_k_local=y_k_local,
     ):
         # x_val comes from the original inner_fn; discard its y and replace below.
         x_val, _ = _orig_inner_fn(index, reduction_index)
-        y_index = list(index[:_y_batch_ndim]) + list(reduction_index) + [index[-1]]
+        non_batch = [None, None]
+        non_batch[_y_k_local] = reduction_index[0]
+        non_batch[1 - _y_k_local] = index[-1]
+        y_index = list(index[:_y_batch_ndim]) + non_batch
         y_val = _y_loader(y_index)
         return (x_val, y_val)
 
@@ -312,6 +334,7 @@ def insert_bmm_padding(graph: GraphLowering) -> None:
             dim=y_k_dim,
             insert_before=matmul_fx_node,
             orig_stl=y_orig_stl,
+            arg_buf=y_buf if y_fx_node is None else None,
         )
 
         # --- Relocate new ops before the matmul ---
@@ -329,7 +352,7 @@ def insert_bmm_padding(graph: GraphLowering) -> None:
         # --- Rebuild matmul inner_fn to load y from the padded buffer ---
         # x is left entirely untouched: the original inner_fn's x loader is
         # preserved as-is.  Only y's loader is replaced with the padded buffer.
-        _rebuild_matmul(op, y_padded_buf, operations)
+        _rebuild_matmul(op, y_padded_buf, y_k_dim, operations)
 
 
 # --------------------------------------------------------------------------- #
@@ -741,8 +764,11 @@ def _pad_restickify_input(op: Operation, graph: GraphLowering) -> None:
         device = in_buf.get_device()
         if device is None:
             return
+        in_fx_node = _find_arg_fx_node(in_dep.name)
+        if in_fx_node is None:
+            raise RuntimeError(f"no FX node found for buffer {in_dep.name!r}")
         clone_buf, new_ops = lower_identity_clone(
-            _find_arg_fx_node(in_dep.name),
+            in_fx_node,
             host_size=[concretize_expr(s) for s in in_layout.size],
             host_stride=[concretize_expr(s) for s in in_layout.stride],
             device=device,

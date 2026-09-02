@@ -1552,7 +1552,19 @@ def lower_cat(inputs, dim=0):
 @register_spyre_lowering(
     torch.ops.aten.constant_pad_nd.default, type_promotion_kind=None
 )
-def lower_constant_pad_nd(input, pad, value=0, align_to_stick=False):
+def lower_constant_pad_nd(
+    input, pad, value=0, align_to_stick=False, output_stride=None
+):
+    # output_stride, when given, is the host stride the *output* buffer must
+    # be allocated with (e.g. to match a non-row-major source buffer's
+    # physical layout -- see pass_utils.py's lower_pad_sequence).  It must be
+    # applied at allocation time via lowering.empty_strided, not patched onto
+    # output.layout afterward: ir.SliceView.create's fast path (taken because
+    # a freshly-allocated ComputedBuffer is_storage_and_layout) snapshots
+    # old_layout.stride into a brand-new, independent FixedLayout on the
+    # ReinterpretView it returns, with no back-reference to output.layout --
+    # every fill_padding/copy slice built below would keep using the stale
+    # stride regardless of any later reassignment of output.layout.
     # pad is in reverse dim order: (left_last, right_last, left_2nd_last, right_2nd_last, ...)
     bounds = list(reversed(list(zip(pad[::2], pad[1::2]))))
     sizes = input.get_size()
@@ -1592,7 +1604,12 @@ def lower_constant_pad_nd(input, pad, value=0, align_to_stick=False):
 
     dtype = input.get_dtype()
     device = input.get_device()
-    output = lowering.empty(output_size, dtype=dtype, device=device)
+    if output_stride is not None:
+        output = lowering.empty_strided(
+            output_size, output_stride, dtype=dtype, device=device
+        )
+    else:
+        output = lowering.empty(output_size, dtype=dtype, device=device)
     pad_constant = lower_constant(value, dtype, device)
 
     # Fill padding regions. If align_to_stick is enabled, use stick-aligned offsets.

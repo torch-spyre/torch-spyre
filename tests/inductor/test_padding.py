@@ -35,9 +35,14 @@ from torch._inductor.graph import GraphLowering
 from torch_spyre._C import get_elem_in_stick
 from torch_spyre._inductor import config as ts_inductor_config
 from torch_spyre._inductor import passes
+from torch_spyre._inductor import spyre_hint
 from torch_spyre._inductor.constants import BATCH_MATMUL_OP
 from torch_spyre._inductor.ir import FixedTiledLayout, SpyreConstantFallback
 from torch_spyre._inductor.passes import CustomPreSchedulingPasses
+from torch_spyre._inductor.wsr.propagate_named_dims import (
+    declare_tensor_dim,
+    name_tensor_dims,
+)
 from torch_spyre._inductor.scratchpad import allocator
 from torch_spyre._inductor.scratchpad import utils as scratchpad_utils
 
@@ -701,6 +706,50 @@ class TestInsertPaddingIR(unittest.TestCase):
         # padding sequence for y, so _assert_constant_pad_nd_ops (which expects
         # exactly 4 ops) cannot be used here.  Correctness is verified by assert_close.
         torch.testing.assert_close(fn(x_cpu, y_cpu), result.cpu(), atol=0.1, rtol=0.1)
+
+    def test_bmm_read_copy_y_unaligned_k_pads(self) -> None:
+        """y is a coarse-tile read-copy buffer AND has unaligned K.
+
+        x is [E, M, K] tiled over E via spyre_hint; w (y in BatchMatmul terms)
+        is [K, N], loop-invariant across the E tiles, so coarse tiling inserts
+        a read-copy ComputedBuffer for it (see coarse_tile.py's
+        _insert_one_read_copy) -- that copy has no FX node of its own.  K=67 is
+        not stick-aligned, so insert_bmm_padding must pad the read-copy buffer,
+        not any FX-graph node.  Regression test for issue where
+        _find_arg_fx_node raised "no FX node found" for such a buffer.
+        """
+        dtype = torch.float16
+        stick_size = get_elem_in_stick(dtype)
+        E, M, K, N = 3, 64, 67, 128
+        assert K % stick_size != 0
+
+        x_cpu = torch.randn(E, M, K, dtype=dtype)
+        w_cpu = torch.randn(K, N, dtype=dtype)
+        x = x_cpu.to(device="spyre")
+        w = w_cpu.to(device="spyre")
+
+        declare_tensor_dim("E", E)
+        declare_tensor_dim("M", M)
+        declare_tensor_dim("K", K)
+        declare_tensor_dim("N", N)
+        name_tensor_dims(x, ["E", "M", "K"])
+        name_tensor_dims(w, ["K", "N"])
+
+        def fn(x, w):
+            with spyre_hint(num_tiles_per_dim={"E": E}):
+                return torch.matmul(x, w)
+
+        ops, result = self.compile_and_run(fn, (x, w))
+        matmuls = self._matmul_ops(ops)
+        self.assertEqual(len(matmuls), 1, "Expected exactly one batched matmul op")
+        mm = matmuls[0]
+
+        # reduction_ranges stays at K.
+        reduction = mm.data
+        assert isinstance(reduction, Reduction)
+        self.assertEqual(int(reduction.reduction_ranges[0]), K)
+
+        torch.testing.assert_close(fn(x_cpu, w_cpu), result.cpu(), atol=0.1, rtol=0.1)
 
 
 if __name__ == "__main__":
