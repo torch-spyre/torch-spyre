@@ -82,6 +82,7 @@ from .pass_utils import (
     concretize_expr,
     find_matmul_generated_var,
     find_reduction_var,
+    get_matmul_m_size,
     get_matmul_n_size,
     identify_matmul_inputs,
     host_coordinates,
@@ -825,8 +826,12 @@ def _canonical_stl_from_collapsed_host(
             and var_stride > 0
             and sympy.simplify(var_delta - var_stride * matmul_var) == 0
             and all(
-                coord.free_symbols <= {matmul_var}
-                and sympy.simplify(coord.xreplace({matmul_var: sympy.S.Zero})) == 0
+                sympy.simplify(
+                    (coord - coord.xreplace({matmul_var: sympy.S.Zero})).xreplace(
+                        {matmul_var: sympy.S.Zero}
+                    )
+                )
+                == 0
                 for dim, coord in enumerate(host_coords)
                 if dim in host_dims
             )
@@ -1076,15 +1081,15 @@ def _matmul_layouts(
     #   Output:     stick on generated_var
     reduction_var = find_reduction_var((x.dep,), output_dep)
     n_size = get_matmul_n_size(op)
-
-    x_req_stl = find_stick_compatible_input_layout(
-        x, reduction_var, data.reduction_type, "x"
-    )
+    m_size = get_matmul_m_size(op)
 
     if n_size == 1:
         # N has no loop symbol after size-one simplification, so there is no
         # generated_var to discover.  Build an explicit sparse-stick layout for y
         # so K is not mistaken for a second contraction dimension.
+        x_req_stl = find_stick_compatible_input_layout(
+            x, reduction_var, data.reduction_type, "x"
+        )
         y_dim_order = list(range(len(y.layout.size))) + [-1]
         y_req_stl = SpyreTensorLayout(
             [concretize_expr(s) for s in y.layout.size],
@@ -1095,7 +1100,28 @@ def _matmul_layouts(
         # Output stick is on the last host dim (N=1 collapses N to a scalar position).
         out_dims = len(output.size)
         out_stick_dim = out_dims - 1
+    elif m_size == 1:
+        # M has no loop symbol after size-one simplification.  N leaks into x's
+        # dep index (x iterates over both N and K because M=1 contributes nothing),
+        # so the normal set-exclusion (y & out) - x returns set().  Skip
+        # find_matmul_generated_var and read N directly from the output dep.
+        x_req_stl = find_stick_compatible_input_layout(
+            x, reduction_var, data.reduction_type, "x"
+        )
+        if not output_dep.var_names:
+            raise Unsupported(
+                f"{data.reduction_type}: M=1 matmul but output dep has no vars"
+            )
+        generated_var = output_dep.var_names[-1]
+        y_req_stl = find_stick_compatible_input_layout(
+            y, generated_var, data.reduction_type, "y"
+        )
+        out_dims = len(output.size)
+        out_stick_dim = out_dims - 1
     else:
+        x_req_stl = find_stick_compatible_input_layout(
+            x, reduction_var, data.reduction_type, "x"
+        )
         generated_var = find_matmul_generated_var(y.dep, x.dep, output_dep, op)
         y_req_stl = find_stick_compatible_input_layout(
             y, generated_var, data.reduction_type, "y"
