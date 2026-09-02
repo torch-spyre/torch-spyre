@@ -195,7 +195,18 @@ def _rebuild_matmul(
         non_batch = [None, None]
         non_batch[_y_k_local] = reduction_index[0]
         non_batch[1 - _y_k_local] = index[-1]
-        y_index = list(index[:_y_batch_ndim]) + non_batch
+        # index's batch prefix can be longer than y_padded_buf's: e.g. a
+        # leading batch=1 dim that op's own output layout carries (from the
+        # un-squeezed [B, H, ...] tensor) but that y_padded_buf never had
+        # (y is built from a per-block V slice that dropped/never carried a
+        # batch axis). Aligning index[:y_batch_ndim] from the LEFT then
+        # silently drops the real trailing batch coordinates (e.g. the
+        # coarse-tiled head-tile index) and replaces them with a
+        # leading placeholder like the constant batch index.
+        # Align from the RIGHT instead, immediately before the N-dim
+        # (index[-1]), so the batch coordinates actually used are the ones
+        # nearest to y's own dims.
+        y_index = list(index[-1 - _y_batch_ndim : -1]) + non_batch
         y_val = _y_loader(y_index)
         return (x_val, y_val)
 
