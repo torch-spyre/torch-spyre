@@ -112,9 +112,14 @@ jobs:
         run: |
           mkdir -p raw_logs
 
+          # filter=latest is the API's own default, but pin it explicitly: jobs from a
+          # prior attempt of this run (a runner-infra retry, not just a user re-run
+          # click) leaking into the list would download and parse every one of them
+          # twice, doubling every row this run produces in hw_failure_diagnostics.
           gh api \
             "/repos/${{ github.repository }}/actions/runs/${TRIGGERING_RUN_ID}/jobs" \
             --paginate \
+            -f filter=latest \
             --jq '.jobs[] | {id: .id, name: .name}' \
           > /tmp/jobs.jsonl
 
@@ -123,6 +128,19 @@ jobs:
 
           repo = os.environ["GITHUB_REPOSITORY"]
           jobs = [json.loads(l) for l in open("/tmp/jobs.jsonl") if l.strip()]
+
+          # Defensive: dedupe by job id even with filter=latest pinned above, so a
+          # duplicate entry in the API response downloads and parses each job once,
+          # not once per repeated listing.
+          seen_ids = set()
+          deduped = []
+          for j in jobs:
+              if j["id"] not in seen_ids:
+                  seen_ids.add(j["id"])
+                  deduped.append(j)
+          if len(deduped) != len(jobs):
+              print(f"[warn] jobs list had {len(jobs) - len(deduped)} duplicate id(s), deduped")
+          jobs = deduped
 
           # gh 2.97.0 started refusing to emit a response body that contains
           # terminal escape sequences unless --allow-escape-sequences is passed,
