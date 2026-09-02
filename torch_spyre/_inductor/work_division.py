@@ -61,6 +61,7 @@ from .pass_utils import (
     finite_upper_or_none,
     get_mem_deps_from_rw,
     iteration_space_from_op,
+    indirect_info_from_op,
     commit_iteration_space_ownership,
     op_read_writes,
 )
@@ -459,6 +460,24 @@ def adjust_it_space_for_sticks(
     return adjusted_space, max_elems
 
 
+def _non_index_tensor_deps(
+    op: ComputedBuffer, tensor_deps: list[TensorDep]
+) -> list[TensorDep]:
+    """Drop the indirect-access index tensor(s) from a TensorDep list.
+
+    The index tensor's entry-dim size is a runtime row *count*, not a stick-
+    shaped data layout; work division must decide its split candidacy from
+    the raw element count, never a stick-count approximation. Excluding it
+    here means ``adjust_it_space_for_sticks`` never adjusts its entry-dim
+    symbol's iteration-space size, regardless of what other tensors (e.g. the
+    gather output) share that symbol for their own coordinates.
+    """
+    index_names, _, _ = indirect_info_from_op(op)
+    if not index_names:
+        return tensor_deps
+    return [td for td in tensor_deps if td.dep.name not in index_names]
+
+
 def _is_indirectly_accessed(td: TensorDep) -> bool:
     """Return whether td has a data-dependent indirect coordinate."""
     return any(coord.has(IndirectAccess) for coord in td.device_coords[:-1])
@@ -825,7 +844,7 @@ def enumerate_work_division_candidates(
 
     symbol_meta = _collect_symbol_metadata(it_space)
     it_space_adjusted, stick_vars = adjust_it_space_for_sticks(
-        it_space, all_tds, symbol_meta
+        it_space, _non_index_tensor_deps(op, all_tds), symbol_meta
     )
 
     # Reduction (K) dims are absent from output device coordinates.
@@ -909,7 +928,7 @@ def work_division_splits_are_legal(
     )
     symbol_meta = _collect_symbol_metadata(it_space)
     it_space_adjusted, stick_vars = adjust_it_space_for_sticks(
-        it_space, input_tds + [output_td], symbol_meta
+        it_space, _non_index_tensor_deps(op, input_tds + [output_td]), symbol_meta
     )
     coord_vars = {
         v
@@ -1115,7 +1134,7 @@ def span_reduction_pass(
     symbol_meta = _collect_symbol_metadata(it_space)
 
     it_space_adjusted, stick_vars = adjust_it_space_for_sticks(
-        it_space, all_tds, symbol_meta
+        it_space, _non_index_tensor_deps(op, all_tds), symbol_meta
     )
     coord_vars = {
         v
@@ -1258,7 +1277,7 @@ def work_distribution_pass(
     symbol_meta = _collect_symbol_metadata(it_space)
 
     it_space_adjusted, stick_vars = adjust_it_space_for_sticks(
-        it_space, all_tds, symbol_meta
+        it_space, _non_index_tensor_deps(op, all_tds), symbol_meta
     )
 
     ownership = getattr(op, "iteration_space_ownership", None)
@@ -1900,7 +1919,7 @@ def _cost_model_divide_op(op: ComputedBuffer, max_cores: int) -> bool:
         )
 
     it_space_adjusted, stick_vars = adjust_it_space_for_sticks(
-        it_space, all_tds, symbol_meta
+        it_space, _non_index_tensor_deps(op, all_tds), symbol_meta
     )
 
     ownership = getattr(op, "iteration_space_ownership", None)

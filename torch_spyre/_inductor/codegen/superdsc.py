@@ -1962,32 +1962,6 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
     elif is_restickify:
         _extend_restickify_to_padded(op_spec, sdsc_iteration_space, symbol_mapping)
 
-    # Grow the index-entry iteration to the padded output device_size so a
-    # partial-last-stick gather splits stick-aligned across cores. The output's
-    # entry-dim device_size was rounded up to the index stick multiple at layout
-    # time (enforce_indirect_access_layout); match the SDSC iteration to it BEFORE
-    # _create_sdsc_tensors so the output's per-core base stride is computed from
-    # the padded (stick-aligned) size rather than the shorter logical count.
-    # Otherwise the per-core base lands element-aligned (mid-stick) and the split
-    # miscompiles. No-op unless the output was actually padded (device_size >
-    # iteration), i.e. only for the multi-core partial-stick case.
-    if has_indirect_access and _spyre_config.sencores > 1:
-        idx_arg = op_spec.args[next(iter(index_tensor_indices))]
-        idx_stick = idx_arg.device_coordinates[-1]
-        if len(idx_stick.free_symbols) == 1:
-            entry_c = next(iter(idx_stick.free_symbols))
-            out_arg = op_spec.args[-1]
-            for pos, coord in enumerate(out_arg.device_coordinates[:-1]):
-                if coord.free_symbols == {entry_c}:
-                    entry_mb = symbol_mapping.get(entry_c)
-                    dev = int(out_arg.device_size[pos])
-                    if (
-                        entry_mb in sdsc_iteration_space
-                        and dev > sdsc_iteration_space[entry_mb]
-                    ):
-                        sdsc_iteration_space[entry_mb] = dev
-                    break
-
     # For topk: if all output dims are in the input, add a missing dimension.
     injected_dims = {"mb_sym": mb_sym} if mb_sym else {}
     if index_stick_syms:

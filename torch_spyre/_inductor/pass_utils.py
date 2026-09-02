@@ -1206,113 +1206,6 @@ def try_device_coordinates(
         return None
 
 
-def _find_entry_output_dim(op) -> "tuple[int, int, int] | None":
-    """Locate a gather's index-entry dim on the output; the one coordinate search.
-
-    The entry dim is the index tensor's STICK dim (its rows are selected at
-    runtime), which on the gather output is a NON-stick dim (the row selector).
-    Multi-core work division splits this dim in whole index sticks, so a split
-    is only legal when the output can hold a stick-aligned slice -- i.e. when the
-    output extent is a whole multiple of the index ``eps``.
-
-    Returns ``(eps, out_pos, out_extent)`` -- the index elems_per_stick, the
-    entry dim's device position in the output layout, and the output
-    device_size there -- or ``None`` when ``op`` is not a gather-style indirect
-    access, the output layout is not yet a committed ``FixedTiledLayout``, or the
-    entry dim coincides with the output's own stick dim (a geometry the
-    stick-alignment padding does not cover). Valid from
-    ``enforce_indirect_access_layout`` onward, once every buffer's layout is
-    committed.
-    """
-    subs = indirect_access_subs_from_op(op)
-    if not subs:
-        return None
-    index_names = {e.args[0].name for e in subs.values() if e.args}
-
-    rw = op.get_read_writes()
-    out_dep = next(iter(rw.writes), None)
-    if out_dep is None:
-        return None
-
-    # Fail safe: callers use this only to *enable* a split / pad a paddable
-    # gather output. If the output can't be analysed (e.g. a scatter writes its
-    # destination indirectly, so device_coordinates can't resolve the entry
-    # coord), return None so the caller stays conservative rather than erroring.
-    try:
-        out_stl = _fixed_read_layout(op).device_layout
-        out_coords = device_coordinates(out_stl, out_dep, None)
-        for d in rw.reads:
-            if not (isinstance(d, MemoryDep) and d.name in index_names):
-                continue
-            idx_stl = _fixed_read_layout(V.graph.get_buffer(d.name)).device_layout
-            stick_expr = device_coordinates(idx_stl, d, None)[-1]
-            if len(stick_expr.free_symbols) != 1:
-                continue
-            stick_var = next(iter(stick_expr.free_symbols))
-            eps = idx_stl.elems_per_stick()
-            # The entry dim must be a NON-stick dim of the output (exclude the
-            # last, stick, coordinate). On a scatter the entry coord is an
-            # IndirectAccess (its free symbol is the index buffer, not the
-            # iteration stick var), so no match -> None -> partial scatter stays
-            # forbidden, which is correct: its in-place dest can't be padded.
-            for pos, coord in enumerate(out_coords[:-1]):
-                if coord.free_symbols == {stick_var}:
-                    return eps, pos, int(out_stl.device_size[pos])
-    except (RuntimeError, AssertionError, KeyError, ValueError, Unsupported):
-        return None
-    return None
-
-
-def is_output_stick_aligned_for_entry(op) -> bool:
-    """Whether a gather output already holds a whole-stick slice for its entry dim.
-
-    The work-division guard uses this to decide the partial-last-stick split:
-    True means the stick-aligned split is legal (the output extent is a multiple
-    of the index ``eps`` -- either naturally, or because the padding pass grew
-    it); False means keep the split forbidden. Returns False for anything that is
-    not a paddable gather entry (scatter, non-committed layout), so the guard
-    stays conservative.
-    """
-    found = _find_entry_output_dim(op)
-    if found is None:
-        return False
-    eps, _out_pos, out_extent = found
-    return out_extent % eps == 0
-
-
-def padded_entry_output_stl(op) -> "SpyreTensorLayout | None":
-    """The gather output's device layout grown so the entry dim is a whole stick.
-
-    The padding pass applies this returned layout; the coordinate search and the
-    size math both stay here. Returns ``None`` when there is nothing to do -- not
-    a paddable gather entry, or the entry dim is already stick-aligned. The
-    logical size is unchanged: only the physical ``device_size`` grows, and the
-    D2H copy extracts the logical view from the larger allocation.
-    """
-    found = _find_entry_output_dim(op)
-    if found is None:
-        return None
-    eps, out_pos, out_extent = found
-    if out_extent % eps == 0:
-        return None
-    out_stl = _fixed_read_layout(op).device_layout
-    device_size = list(out_stl.device_size)
-    device_size[out_pos] = ((out_extent + eps - 1) // eps) * eps
-    logger.info(
-        "padded_entry_output_stl: %s entry dim (pos %d) %d -> %d for "
-        "stick-aligned multi-core split",
-        op.get_name(),
-        out_pos,
-        out_extent,
-        device_size[out_pos],
-    )
-    return SpyreTensorLayout(
-        device_size=device_size,
-        stride_map=list(out_stl.stride_map),
-        device_dtype=out_stl.device_dtype,
-    )
-
-
 def _shared_indirect_coords(op: "ComputedBuffer") -> list[list[Expr]]:
     """Device-coordinate lists for tensors shared across cores with runtime rows.
 
@@ -1393,46 +1286,18 @@ def shared_indirect_data_syms(op: "ComputedBuffer") -> set[Symbol]:
 def indirect_forbidden_split_syms(op: "ComputedBuffer") -> set[Symbol]:
     """Iteration dims that must not be core-split for an indirect op.
 
-    1. **Shared-table data dims** — the non-row dims of a shared gather/scatter
-       table must not advance per core (all cores share the same base address).
+    **Shared-table data dims** — the non-row dims of a shared gather/scatter
+    table must not advance per core (all cores share the same base address).
 
-    2. **Partial-last-stick entry dims** — splitting a partial last index stick
-       across cores straddles the stick boundary. Forbidden unless the gather
-       output was already padded to a stick boundary by
-       ``enforce_indirect_access_layout``, which makes the split safe. Scatter
-       output rows are chosen at runtime so can never be padded; they stay unsplit.
+    The index tensor's entry dim is NOT subject to any stick-alignment
+    restriction: it is a runtime row count, not a stick-shaped data layout, so
+    work division may split it at any granularity -- including sizes that are
+    not a multiple of the index dtype's elems_per_stick. Splitting it unevenly
+    across cores is fine because each core's index sub-tensor is independently
+    addressed; there is no shared base address to keep aligned, unlike the data
+    dims covered above.
     """
-    syms = shared_indirect_data_syms(op)  # (1)
-
-    # (2) Forbid a partial-last-stick index-entry dim UNLESS the gather output is
-    # provably stick-aligned for it. The partial check keys off the INDEX's
-    # *logical* entry count (d.ranges[stick_var], e.g. 40), which is never padded
-    # -- the stick-alignment fix grows the gather OUTPUT's device_size, not the
-    # index. is_output_stick_aligned_for_entry reads that (possibly padded)
-    # output extent, so the split is allowed only when the output can hold a
-    # whole-stick slice. It stays forbidden when the output is NOT aligned: a
-    # SCATTER (its in-place dest can't be resized -> returns False) or a gather
-    # whose output the pass could not grow -- those fall back to a single core,
-    # not miscompile. Applies to BOTH gather and scatter
-    output_aligned = is_output_stick_aligned_for_entry(op)
-    subs = indirect_access_subs_from_op(op)
-    index_names = {e.args[0].name for e in subs.values() if e.args}
-    for d in op.get_read_writes().reads:
-        if not (isinstance(d, MemoryDep) and d.name in index_names):
-            continue
-        layout = _fixed_read_layout(V.graph.get_buffer(d.name))
-        stick_expr = device_coordinates(layout.device_layout, d, None)[-1]
-        if len(stick_expr.free_symbols) != 1:
-            continue
-        stick_var = next(iter(stick_expr.free_symbols))
-        eps = layout.device_layout.elems_per_stick()
-        partial = (
-            stick_var in d.ranges and concretize_expr(d.ranges[stick_var]) % eps != 0
-        )
-        if partial and not output_aligned:
-            syms.add(stick_var)
-
-    return syms
+    return shared_indirect_data_syms(op)
 
 
 def indirect_store_entry_syms(

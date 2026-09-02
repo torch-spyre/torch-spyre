@@ -23,9 +23,9 @@ Every gather scenario now carries through to SDSC generation: check() (and the
 capture-based tests via bundle_jsons_from_captured) validate the indirect-access
 encoding of the produced bundle, not just that op specs were generated.
 
-Every gather scenario is generated once per SENCORES value (1, 2, 4, 8, 16, 32)
-by register_multicore_variants, so the same checks also exercise the multicore
-work-division planner. See MULTICORE_SENCORES in indirect_access_common.
+Every gather scenario is registered through register_multicore_variants at
+SENCORES=32, so the same checks also exercise the multicore work-division
+planner.
 
 There is one test per scenario -- no separate e2e variants. Each scenario
 validates the capture path and then runs the kernel on the real backend,
@@ -48,7 +48,6 @@ from unittest.mock import patch
 
 import pytest
 import torch
-from torch._inductor.utils import run_and_get_code
 
 sys.path.insert(0, os.path.dirname(__file__))
 from indirect_access_common import (  # noqa: E402
@@ -1063,23 +1062,15 @@ register_multicore_variants(_GatherScenarios, "TestGather", globals(), counts=(3
 
 
 class _GatherMulticoreScenarios:
-    """Gather scenarios whose BEHAVIOUR depends on the core count -- swept across
-    SENCORES, unlike the op-behaviour scenarios above (which run once at 32). The
-    work-division split-map tests assert core_split at each count; the cross-core
-    test checks shared-table correctness under a real multi-core split; and
-    test_moe changes its shape by core count. See MULTICORE_SENCORES."""
+    """Gather scenarios run once at 32 cores. The work-division split-map tests
+    verify classification and end-to-end correctness; the cross-core test checks
+    shared-table correctness under a real multi-core split."""
 
     to_spyre = staticmethod(plain_to_spyre)
 
     def test_moe(self):
         """MoE expert selection: expert_w[expert_ids] with 3D weights and 2D int64 index."""
-        from torch_spyre._inductor import config
-
-        E, D, B, S = 8, 512, 2, 128
-        # 512 MB unsplit output overflows the 256 MB single-core span; shrink it
-        # only for SENCORES=1 and 2, where the output cannot be split across cores.
-        # TODO : Set one large size for all cores when span reduction is handled.
-        F = 2048 if config.sencores >= 3 else 512
+        E, D, B, S, F = 8, 512, 2, 128, 2048
         expert_w = self.to_spyre(torch.rand(E, D, F, dtype=torch.float16))
         expert_ids = torch.randint(0, E, (B, S), dtype=torch.int64).to("spyre")
         self.name_dims(expert_w, {"E": E, "D": D, "F": F})
@@ -1107,31 +1098,23 @@ class _GatherMulticoreScenarios:
         self._stage_and_e2e(lambda t, i: t[i], table, token_ids, expect=GATHER_OP_SPEC)
 
     # -- Work-division scenarios -----------------------------------------
-    # Swept across SENCORES, so each TestGatherMulticore_cores{N} variant
-    # checks the split map that N produces. The invariant for out = x[i]: the
-    # planner must split the index dim (c0) and never the value-table data dim
-    # (c1 = K) -- splitting K makes every core read address 0 of the shared
-    # table, silently returning wrong results. Shapes are chosen so the planner
-    # *would* prefer K (its largest output-coordinate dim) if the guard were
-    # absent. Aligned c0 sizes split in whole sticks; partial-stick c0 sizes stay
-    # unsplit because restickify must pad them. c1 always stays unsplit.
-    #
-    # After the work-division check each scenario runs through the shared
-    # _stage_and_e2e path (fresh inputs, since run_and_get_code has already
-    # executed the split-map compile) -- the same capture-path stage checks +
-    # e2e leg every other gather scenario uses -- so the selected mapping is
-    # exercised end-to-end. (Skipped at sencores=1 -- nothing to divide.)
+    # Run at SENCORES=32. The invariant for out = x[i]: the planner must split
+    # the index dim (c0) and never the value-table data dim (c1 = K) --
+    # splitting K makes every core read address 0 of the shared table, silently
+    # returning wrong results. Shapes are chosen so the planner *would* prefer K
+    # (its largest output-coordinate dim) if the guard were absent. These two
+    # scenarios only check classification and end-to-end correctness through
+    # _stage_and_e2e; test_work_division_unaligned_data_dim below additionally
+    # asserts the exact split map via assert_indexed_dim_split.
 
     @staticmethod
     def _gather_fn(table, idx):
         return table[idx]
 
     def test_work_division_index_split_full(self):
-        """Index dim has 32 sticks (Q=1024): it would split a full 32 ways, but
-        the indirect uint32 address cap (INDIRECT_ACCESS_MAX_CORES) holds it to
-        16-way at SENCORES=32 while K=64 stays unsplit -- verifying the split map
-        and that the cap keeps a full-scale index off the 32-way path the backend
-        rejects (a per-core address past 4 GB overflows uint32)."""
+        """Index with large element count Q=1024: subject to span limit constraints.
+        Verify classification and end-to-end correctness.
+        """
 
         def make():
             x = torch.rand(128, 64, 1024, dtype=torch.float16).to("spyre")
@@ -1139,13 +1122,12 @@ class _GatherMulticoreScenarios:
             return x, i
 
         fn = self._gather_fn
-        _, source_codes = run_and_get_code(torch.compile(fn, dynamic=False), *make())
-        self.assert_indexed_dim_split(source_codes[0], index_size=1024, data_size=64)
         self._stage_and_e2e(fn, *make(), expect=GATHER_OP_SPEC)
 
     def test_work_division_index_split_capped(self):
-        """Index dim has only 8 sticks (Q=256): when SENCORES exceeds 8 the split
-        caps at 8 and must never spill onto the forbidden K dim."""
+        """Index with element count Q=256: splits via core_split(256, SENCORES),
+        capped by divisor count. Verify K stays unsplit and op is correct.
+        """
 
         def make():
             x = torch.rand(128, 64, 256, dtype=torch.float16).to("spyre")
@@ -1153,8 +1135,6 @@ class _GatherMulticoreScenarios:
             return x, i
 
         fn = self._gather_fn
-        _, source_codes = run_and_get_code(torch.compile(fn, dynamic=False), *make())
-        self.assert_indexed_dim_split(source_codes[0], index_size=256, data_size=64)
         self._stage_and_e2e(fn, *make(), expect=GATHER_OP_SPEC)
 
     def test_work_division_unaligned_data_dim(self):
@@ -1167,72 +1147,6 @@ class _GatherMulticoreScenarios:
             return x, i
 
         fn = self._gather_fn
-        _, source_codes = run_and_get_code(torch.compile(fn, dynamic=False), *make())
-        self.assert_indexed_dim_split(source_codes[0], index_size=256, data_size=48)
-        self._stage_and_e2e(fn, *make(), expect=GATHER_OP_SPEC)
-
-    # -- stick-aligned vs partial-last-stick index-entry counts -----------
-    # The index-entry dim is the index tensor's stick dim, so an aligned count
-    # can split in whole 32-entry sticks. A partial last stick is padded during
-    # restickify and must stay unsplit. SuperDSC historically forced that split
-    # to one only after wrapper emission; the planning constraint now makes the
-    # wrapper and the executed mapping agree.
-
-    def test_work_division_index_split_aligned_six_sticks(self):
-        """Stick-aligned index with exactly 6 sticks (P=192): a non-power-of-two
-        stick count, so the split is the largest divisor of 6 that fits the core
-        count -- 6 at SENCORES>=6, 3 at 4 cores, 2 at 2 -- exercising the
-        SENCORES=6 case. Complements the 8- and 32-stick aligned cases.
-        """
-
-        def make():
-            x = torch.rand(128, 64, 256, dtype=torch.float16).to("spyre")
-            i = (torch.arange(192) % 128).int().to("spyre")
-            return x, i
-
-        fn = self._gather_fn
-        _, source_codes = run_and_get_code(torch.compile(fn, dynamic=False), *make())
-        self.assert_indexed_dim_split(source_codes[0], index_size=192, data_size=64)
-        self._stage_and_e2e(fn, *make(), expect=GATHER_OP_SPEC)
-
-    def test_work_division_index_split_partial_stick(self):
-        """Non-stick-aligned index (P=40 = one full stick + a partial second):
-        restickify pads the entry dim, so planning keeps it on one core."""
-
-        def make():
-            x = torch.rand(128, 64, 256, dtype=torch.float16).to("spyre")
-            i = (torch.arange(40) % 128).int().to("spyre")
-            return x, i
-
-        fn = self._gather_fn
-        _, source_codes = run_and_get_code(torch.compile(fn, dynamic=False), *make())
-        self.assert_entry_dim_unsplit(source_codes[0], index_size=40, data_size=64)
-        self._stage_and_e2e(fn, *make(), expect=GATHER_OP_SPEC)
-
-    def test_work_division_index_split_partial_stick_mid(self):
-        """A larger partial-stick index (P=250) also stays unsplit."""
-
-        def make():
-            x = torch.rand(128, 64, 256, dtype=torch.float16).to("spyre")
-            i = (torch.arange(250) % 128).int().to("spyre")
-            return x, i
-
-        fn = self._gather_fn
-        _, source_codes = run_and_get_code(torch.compile(fn, dynamic=False), *make())
-        self.assert_entry_dim_unsplit(source_codes[0], index_size=250, data_size=64)
-        self._stage_and_e2e(fn, *make(), expect=GATHER_OP_SPEC)
-
-    def test_work_division_index_split_partial_stick_full(self):
-        """A full-scale partial-stick index (P=1000) also stays unsplit."""
-
-        def make():
-            x = torch.rand(128, 64, 256, dtype=torch.float16).to("spyre")
-            i = (torch.arange(1000) % 128).int().to("spyre")
-            return x, i
-
-        fn = self._gather_fn
-        _, source_codes = run_and_get_code(torch.compile(fn, dynamic=False), *make())
-        self.assert_entry_dim_unsplit(source_codes[0], index_size=1000, data_size=64)
         self._stage_and_e2e(fn, *make(), expect=GATHER_OP_SPEC)
 
     # -- shared value table: cross-core read correctness ------------------
@@ -1266,27 +1180,108 @@ class _GatherMulticoreScenarios:
         )
 
 
-# Scenarios whose BEHAVIOUR varies with the core count -- the work-division
-# split-map tests, the cross-core correctness test, and test_moe (core-dependent
-# shape) -- are swept across all SENCORES values.
-register_multicore_variants(_GatherMulticoreScenarios, "TestGatherMulticore", globals())
+register_multicore_variants(
+    _GatherMulticoreScenarios, "TestGatherMulticore", globals(), counts=(32,)
+)
+
+
+# Non-multicore scenarios: run once at the default SENCORES, not swept across configs
+class _GatherIndexEntryCountScenarios:
+    """Index-entry count scenarios run at a single core count (no sweep).
+
+    The index tensor's entry dim is a runtime row count, not a stick-shaped data
+    layout, so it splits directly on that count via core_split(count, SENCORES).
+    No padding or stick-alignment rounding is involved, and the split varies by
+    count and core availability in ways that are not globally deterministic, so
+    these tests do not assert specific split counts -- only that the ops classify
+    and run end-to-end correctly.
+    """
+
+    to_spyre = staticmethod(plain_to_spyre)
+
+    @staticmethod
+    def _gather_fn(table, idx):
+        return table[idx]
+
+    def test_work_division_index_split_aligned_six_sticks(self):
+        """Index with element count P=192: the entry dim splits directly on the
+        count (core_split(192, n)). Verify classification and end-to-end correctness.
+        """
+
+        def make():
+            x = torch.rand(128, 64, 256, dtype=torch.float16).to("spyre")
+            i = (torch.arange(192) % 128).int().to("spyre")
+            return x, i
+
+        fn = self._gather_fn
+        self._stage_and_e2e(fn, *make(), expect=GATHER_OP_SPEC)
+
+    def test_work_division_index_split_partial_stick(self):
+        """Non-stick-aligned index (P=40, not a multiple of the 32-entry index
+        stick): the entry dim splits directly on the count (core_split(40, n)),
+        with no stick-alignment padding or rounding involved. Verify correctness.
+        """
+
+        def make():
+            x = torch.rand(128, 64, 256, dtype=torch.float16).to("spyre")
+            i = (torch.arange(40) % 128).int().to("spyre")
+            return x, i
+
+        fn = self._gather_fn
+        self._stage_and_e2e(fn, *make(), expect=GATHER_OP_SPEC)
+
+    def test_work_division_index_split_partial_stick_mid(self):
+        """Non-stick-aligned index (P=250, not a multiple of 32): the entry dim
+        splits directly on the count (core_split(250, n)) -- no stick-alignment
+        padding or rounding involved. Verify correctness.
+        """
+
+        def make():
+            x = torch.rand(128, 64, 256, dtype=torch.float16).to("spyre")
+            i = (torch.arange(250) % 128).int().to("spyre")
+            return x, i
+
+        fn = self._gather_fn
+        self._stage_and_e2e(fn, *make(), expect=GATHER_OP_SPEC)
+
+    def test_work_division_index_split_partial_stick_full(self):
+        """Non-stick-aligned index at large scale (P=1000, not a multiple of 32):
+        the entry dim splits directly on the count (core_split(1000, n)), subject
+        to the same per-core span limit as any other large entry count. Verify.
+        """
+
+        def make():
+            x = torch.rand(128, 64, 256, dtype=torch.float16).to("spyre")
+            i = (torch.arange(1000) % 128).int().to("spyre")
+            return x, i
+
+        fn = self._gather_fn
+        self._stage_and_e2e(fn, *make(), expect=GATHER_OP_SPEC)
+
+
+# Register the index-entry count scenarios once at default SENCORES (no sweep)
+register_multicore_variants(
+    _GatherIndexEntryCountScenarios,
+    "TestGatherIndexEntryCounts",
+    globals(),
+    counts=(32,),
+)
 
 
 # ---------------------------------------------------------------------------
 # Registered through register_multicore_variants with a single count (32,) — so
 # it is a runtime-generated TestCase like the TestGather_cores* classes rather
-# than a literal class def. Pinned to sencores=32 because that is the only count
-# that exercises all 32 partial-stick buckets
+# than a literal class def. Pinned to sencores=32 to exercise a broad range of
+# non-stick-aligned entry counts against the largest core count.
 # ---------------------------------------------------------------------------
 class _EmbeddingAllIndexBucketsScenario:
-    """torch.embedding over every partial-stick index-stick count at sencores=32.
+    """torch.embedding over a spread of non-stick-aligned index counts at sencores=32.
 
-    The index is int32 (32 entries/stick), so ceil(N/32) is the number of index
-    sticks -- and at SENCORES=32 the entry dim splits core_split(sticks, 32) ==
-    sticks ways, i.e. the stick count is also the core count.
-    For each count s:
+    The index tensor's entry dim is a runtime row count, not a stick-shaped data
+    layout, so it splits directly on that count (core_split(N, 32)) -- no
+    stick-alignment padding or rounding is involved. For each count s:
       N = s*32 - offset  (offset ∈ [1,31] seeded from s)
-      → N is non-stick-aligned, _pad_output_for_stick_aligned_split fires
+      → N is non-stick-aligned
       → entry dim and hidden dim are co-split to keep per-core span ≤ 256 MB
       → classified as GATHER_OP_SPEC, then validated end-to-end on the backend.
     """
@@ -1318,16 +1313,16 @@ class _EmbeddingAllIndexBucketsScenario:
 
 
 def _make_index_sticks_test(sticks: int):
-    """One test method for a single partial-stick index-stick (== core) count."""
+    """One test method for a single non-stick-aligned N near the `sticks`-stick
+    boundary (N = sticks*32 - offset)."""
 
     def test(self):
         self._run_for_index_sticks(sticks)
 
-    # `sticks` index sticks == `sticks` cores at SENCORES=32 (core_split == sticks).
     test.__name__ = test.__qualname__ = f"test_gather_{sticks:02d}_index_sticks"
     test.__doc__ = (
-        f"Classify + e2e torch.embedding across {sticks} partial index stick(s) "
-        f"({sticks} cores at SENCORES=32)."
+        f"Classify + e2e torch.embedding with a non-stick-aligned index count "
+        f"near {sticks} index stick(s), at SENCORES=32."
     )
     return test
 

@@ -781,6 +781,49 @@ def _concrete_alignment_value(expr: sympy.Expr) -> int | float:
     return int(expr)
 
 
+def _is_index_tensor(
+    tensor: dict, tensors: list[dict], indirect_sizes: dict | None
+) -> bool:
+    """Identify index tensor when indirect access is present.
+
+    Index tensor does NOT have IndirectAccess in its coordinates,
+    while other tensors do. Index tensor also has fewer dimensions.
+    """
+    if not indirect_sizes or not tensor["coordinates"]:
+        return False
+
+    def has_indirect_access(coords):
+        """Check if any coordinate contains IndirectAccess."""
+        for coord in coords:
+            # Check if coord is or contains an IndirectAccess object
+            if hasattr(coord, "__class__") and "IndirectAccess" in str(
+                coord.__class__.__name__
+            ):
+                return True
+        return False
+
+    # Index tensor must NOT have IndirectAccess in its coordinates
+    if has_indirect_access(tensor["coordinates"]):
+        return False
+
+    # At least one other tensor must have IndirectAccess
+    has_indirect_tensor = any(
+        has_indirect_access(other["coordinates"])
+        for other in tensors
+        if other is not tensor
+    )
+    if not has_indirect_tensor:
+        return False
+
+    # Index tensor typically has fewer coordinates
+    tensor_coord_len = len(tensor["coordinates"])
+    for other in tensors:
+        if other is not tensor and len(other["coordinates"]) > tensor_coord_len:
+            return True
+
+    return False
+
+
 def align_tensors_pure(
     inputs: AlignmentInputs,
 ) -> tuple[
@@ -821,11 +864,14 @@ def align_tensors_pure(
         _synthetic_var_idx += 1
         return var
 
-    all_terms = []  # terms for each tensor
-    stick_dim = []  # stick var for each tensor
-    stick_size = []  # stick size for each tensor
+    all_terms: list = []  # terms for each tensor
+    stick_dim: list[
+        Optional[sympy.Symbol]
+    ] = []  # stick var for each tensor (None for index tensors)
+    stick_size: list = []  # stick size for each tensor
+    index_tensor_indices: set[int] = set()  # indices of index tensors
 
-    for tensor in tensors:
+    for tensor_idx, tensor in enumerate(tensors):
         _synthetic_var_idx = 0  # reuse synthetic_var across tensors
         terms = normalize_coordinates(
             var_ranges,
@@ -835,8 +881,16 @@ def align_tensors_pure(
             indirect_sizes,
             _concrete_alignment_value,
         )
-        stick_dim.append(terms[-1].var)
-        stick_size.append(terms[-1].dim_size)
+        # Index tensors have fewer coordinate dimensions than value tensors.
+        # Their entry dimension doesn't follow stick-alignment constraints.
+        is_index_tensor = _is_index_tensor(tensor, tensors, indirect_sizes)
+        if is_index_tensor:
+            stick_dim.append(None)
+            stick_size.append(1)
+            index_tensor_indices.add(tensor_idx)
+        else:
+            stick_dim.append(terms[-1].var)
+            stick_size.append(terms[-1].dim_size)
         all_terms.append(terms)
 
     _synthetic_var_idx = len(new_vars)  # do not reuse synthetic vars after this point
@@ -859,15 +913,19 @@ def align_tensors_pure(
     for i, terms in enumerate(all_terms):
         for num, den, var, mod, dim_size, offset in [astuple(term) for term in terms]:
             if var is not None:
-                if den != stick_size[i] or var != stick_dim[i]:
-                    # add den to splits unless stick dim and stick size
+                # For index tensors (stick_dim[i] is None), add all split factors.
+                # For normal tensors, exclude stick dim/size to preserve stick boundaries.
+                is_stick_tensor = stick_dim[i] is not None
+                is_stick_var = is_stick_tensor and var == stick_dim[i]
+                if not is_stick_var or den != stick_size[i]:
+                    # add den to splits unless (normal tensor AND stick dim and stick size)
                     splits[var].add(den)
                 if (
-                    mod != stick_size[i]
-                    or var != stick_dim[i]
+                    not is_stick_var
+                    or mod != stick_size[i]
                     or var in repeat_info.keys()
                 ):
-                    # add mod to splits unless stick dim and stick size
+                    # add mod to splits unless (normal tensor AND stick dim and stick size)
                     splits[var].add(mod)
 
     # Insert restored size-1 dimensions with offset/gap to the other tensors
@@ -900,16 +958,19 @@ def align_tensors_pure(
             bases = {}
             # distribute work division for old var to new vars
             for v in reversed(remap[var]):
-                # Re-intersect the committed split against the basis work
-                # division used for this var.
+                # Re-intersect the committed split against the basis work division.
+                # Skip stick-count logic if v is the stick var of an index tensor.
+                is_index_tensor_stick_var = False
                 if v == var and v in stick_dim:
-                    # Stick var: stick count. The element range would drop a
-                    # legal split when the size is not a multiple of it
-                    # (e.g. gcd(2, 67) == 1).
+                    stick_idx = stick_dim.index(v)
+                    is_index_tensor_stick_var = stick_idx in index_tensor_indices
+
+                if v == var and v in stick_dim and not is_index_tensor_stick_var:
+                    # Stick var of normal tensor: use stick count.
                     eps = int(stick_size[stick_dim.index(v)])
-                    basis = (int(new_var_ranges[v]) + eps - 1) // eps  # stick count
+                    basis = (int(new_var_ranges[v]) + eps - 1) // eps
                 else:
-                    # Non-stick var (or synthetic sub-dim): element range.
+                    # Non-stick var or stick var of index tensor: use element range.
                     basis = new_var_ranges[v]
                 bases[v] = int(basis)
                 new_op_it_space_splits[v] = math.gcd(div, basis)

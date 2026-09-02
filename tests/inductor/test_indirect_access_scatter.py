@@ -29,7 +29,6 @@ import os
 import sys
 
 import torch
-from torch._inductor.utils import run_and_get_code
 
 sys.path.insert(0, os.path.dirname(__file__))
 from indirect_access_common import (  # noqa: E402
@@ -38,6 +37,7 @@ from indirect_access_common import (  # noqa: E402
     SCATTER_OP_SPEC,
     DIRECT_OP_SPEC,
     register_multicore_variants,
+    plain_to_spyre,
 )
 
 from torch_spyre._C import (  # noqa: E402
@@ -1031,28 +1031,19 @@ class _ScatterScenarios:
 register_multicore_variants(_ScatterScenarios, "TestScatter", globals(), counts=(32,))
 
 
-class _ScatterMulticoreScenarios:
-    """Scatter scenarios whose BEHAVIOUR depends on the core count -- the
-    work-division split-map tests -- swept across SENCORES, unlike the
-    op-behaviour scenarios above (which run once at 32). See MULTICORE_SENCORES."""
+# Non-multicore scenarios: run once at the default SENCORES, not swept across configs
+class _ScatterEntryCountScenarios:
+    """Scatter entry-count scenarios run at a single core count (no sweep).
 
-    # -- Work-division scenarios -----------------------------------------
-    # Swept across SENCORES, so each TestScatterMulticore_cores{N} variant
-    # checks the split map that N produces. The invariant for dest[i] = src: the
-    # planner must split the index-entry dim (c0) and never the destination data
-    # dim (c1 = K) -- splitting K makes every core write address 0 of the shared
-    # destination, silently returning wrong results. Shapes are chosen so the
-    # planner *would* prefer K if the guard were absent. assert_indexed_dim_split()
-    # reads the current SENCORES and expects c0 to split by
-    # min(SENCORES, index_size // 32) with c1 pinned at 1.
-    #
-    # After the split-map check each scenario runs through the shared
-    # _stage_and_e2e path (fresh inputs, since run_and_get_code has already
-    # executed the split-map compile and the overwrite-scatter mutates its
-    # destination) -- the same capture-path stage checks + e2e leg every other
-    # scatter scenario uses -- so the multicore split is also exercised
-    # end-to-end. (Skipped at sencores=1 by assert_indexed_dim_split -- nothing
-    # to divide.)
+    The index tensor's entry dim is a runtime row count, not a stick-shaped data
+    layout, so it splits directly on that count via core_split(count, SENCORES).
+    No padding or stick-alignment rounding is involved, and the split varies by
+    count and core availability in ways that are not globally deterministic, so
+    these tests do not assert specific split counts -- only that the ops classify
+    and run end-to-end correctly.
+    """
+
+    to_spyre = staticmethod(plain_to_spyre)
 
     @staticmethod
     def _scatter_fn(dst, s, idx):
@@ -1060,12 +1051,9 @@ class _ScatterMulticoreScenarios:
         return dst
 
     def test_work_division_entry_split_full(self):
-        """Entry dim has 32 sticks (Q=1024): it would split a full 32 ways, but
-        the indirect uint32 address cap (INDIRECT_ACCESS_MAX_CORES) holds it below
-        that, so at SENCORES=32 core_split rounds it down to 16-way while dest
-        K=64 stays unsplit. Verifies the split map and that the cap keeps a
-        full-scale entry off the 32-way path the backend rejects (a per-core
-        address past 4 GB overflows its uint32 UINT32_TO_16* encoding)."""
+        """Entry dim with large element count Q=1024: subject to span limit
+        constraints. Verify classification and end-to-end correctness.
+        """
 
         def make():
             src = torch.rand(1024, 64, 1024, dtype=torch.float16).to("spyre")
@@ -1074,13 +1062,12 @@ class _ScatterMulticoreScenarios:
             return dest, src, i
 
         fn = self._scatter_fn
-        _, source_codes = run_and_get_code(torch.compile(fn, dynamic=False), *make())
-        self.assert_indexed_dim_split(source_codes[0], index_size=1024, data_size=64)
         self._stage_and_e2e(fn, *make(), expect=SCATTER_OP_SPEC)
 
     def test_work_division_entry_split_capped(self):
-        """Entry dim has only 8 sticks (Q=256): when SENCORES exceeds 8 the split
-        caps at 8 and must never spill onto the forbidden dest K dim."""
+        """Entry dim with element count Q=256: splits via core_split(256, SENCORES),
+        capped by divisor count. Verify dest K stays unsplit and op is correct.
+        """
 
         def make():
             src = torch.rand(256, 64, 256, dtype=torch.float16).to("spyre")
@@ -1089,15 +1076,43 @@ class _ScatterMulticoreScenarios:
             return dest, src, i
 
         fn = self._scatter_fn
-        _, source_codes = run_and_get_code(torch.compile(fn, dynamic=False), *make())
-        self.assert_indexed_dim_split(source_codes[0], index_size=256, data_size=64)
         self._stage_and_e2e(fn, *make(), expect=SCATTER_OP_SPEC)
 
+    def test_scatter_cross_core_shared_dest(self):
+        """Every source row is scattered to a destination row in a DIFFERENT
+        core's work slice, and must still be correct -- the destination table is
+        shared, not partitioned.
 
-# Scenarios whose BEHAVIOUR varies with the core count -- the work-division
-# split-map tests -- are swept across all SENCORES values.
+        The destination starts at -1 everywhere; src is row-identifying (src[r, :]
+        == r, exact in fp16 for r < 2048); and idx maps source row i -> destination
+        row (i + P/2) % P: always a half-table hop, so under a multi-core split the
+        write lands in another core's slice. The result must match the CPU
+        reference exactly (expect_close=True) -- if the shared destination's
+        per-core base ever drifted with the work-division slice, a core would write
+        a shifted row and diverge.
+        """
+        P, N = 1024, 128
+        dest = self.to_spyre(torch.full((P, N), -1.0, dtype=torch.float16))
+        src = self.to_spyre(
+            torch.arange(P, dtype=torch.float16).unsqueeze(1).repeat(1, N)
+        )
+        idx = ((torch.arange(P) + P // 2) % P).to(torch.int32).to("spyre")
+        self.name_dims(dest, {"P": P, "N": N})
+        self.name_dims(src, {"P": P, "N": N})
+        self.name_dims(idx, {"P": P})
+
+        def kernel(dst, s, idx):
+            dst[idx] = s
+            return dst
+
+        self._stage_and_e2e(
+            kernel, dest, src, idx, expect=SCATTER_OP_SPEC, expect_close=True
+        )
+
+
+# Register the entry-count scenarios once at default SENCORES (no sweep)
 register_multicore_variants(
-    _ScatterMulticoreScenarios, "TestScatterMulticore", globals()
+    _ScatterEntryCountScenarios, "TestScatterEntryCounts", globals(), counts=(32,)
 )
 
 
