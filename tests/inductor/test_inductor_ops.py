@@ -8384,6 +8384,14 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
         self.compare_with_cpu(fn, x, run_eager=False)
 
+    def test_matmul_bs1_3d_linear(self):
+        def fn(x, w):
+            return torch.matmul(x, w.T)
+
+        x = cached_xavier((1, 16, 4096))
+        w = cached_xavier((6144, 4096))
+        self.compare_with_cpu(fn, x, w, atol=0.5, rtol=0.1)
+
 
 if __name__ == "__main__":
     unittest.main()

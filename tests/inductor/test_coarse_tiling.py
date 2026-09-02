@@ -67,10 +67,6 @@ from torch_spyre._inductor.codegen.superdsc import (
     compile_op_spec,
     parse_op_spec,
 )
-from torch_spyre._inductor.constants import (
-    SHARED_WEIGHT_UNIT_BMM_CUSTOM_META_KEY,
-    SHARED_WEIGHT_UNIT_BMM_INFO_KEY,
-)
 from torch_spyre._inductor.core_mapping import derive_operation_mapping
 from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.loop_info import CoarseTileInfo, copy_op_metadata
@@ -121,11 +117,6 @@ from torch_spyre._inductor.scheduler import (
 from torch_spyre._inductor.spyre_kernel import (
     _codegen_op_spec_list,
     _iter_op_specs,
-    _preserve_shared_weight_unit_bmm_dim,
-)
-from torch_spyre._inductor.temp_passes import (
-    _mark_static_unit_batch_bmm,
-    mark_direct_unit_bmm_pass,
 )
 from torch_spyre._inductor.wsr.tile import (
     compute_tile_offset,
@@ -3600,185 +3591,6 @@ class TestCompileOpSpecSymbolMapping(unittest.TestCase):
         )
 
 
-class TestSharedWeightUnitBmmLayout(unittest.TestCase):
-    def _static_bmm_custom_meta(self, x_shape, y_shape, out_shape):
-        graph = fx.Graph()
-        x = graph.placeholder("x")
-        x.meta["val"] = SimpleNamespace(shape=x_shape)
-        y = graph.placeholder("y")
-        y.meta["val"] = SimpleNamespace(shape=y_shape)
-        bmm = graph.call_function(torch.ops.aten.bmm.default, args=(x, y))
-        bmm.meta["val"] = SimpleNamespace(shape=out_shape)
-        graph.output(bmm)
-
-        _mark_static_unit_batch_bmm(bmm, x, y)
-        graph.lint()
-        return bmm.meta.get("custom") or {}
-
-    def test_marked_squeezed_unit_bmm_recovers_sendnn_like_unit_layout(self):
-        c0 = Symbol("c0")
-        c1 = Symbol("c1")
-        c2 = Symbol("c2")
-        input_arg = TensorArg(
-            is_input=True,
-            arg_index=0,
-            device_dtype=_FP16,
-            device_size=[512, 64, 1, 64],
-            device_coordinates=[c0, floor(c2 / 64), Integer(0), Mod(c2, 64)],
-            allocation={"hbm": 0},
-        )
-        kernel_arg = TensorArg(
-            is_input=True,
-            arg_index=1,
-            device_dtype=_FP16,
-            device_size=[200, 4096, 64],
-            device_coordinates=[floor(c1 / 64), c2, Mod(c1, 64)],
-            allocation={"hbm": 0x400000000},
-        )
-        output_arg = TensorArg(
-            is_input=False,
-            arg_index=2,
-            device_dtype=_FP16,
-            device_size=[512, 200, 1, 64],
-            device_coordinates=[c0, floor(c1 / 64), Integer(0), Mod(c1, 64)],
-            allocation={"hbm": 0x800000000},
-        )
-        for arg in (input_arg, output_arg):
-            del arg.device_size[-2]
-            del arg.device_coordinates[-2]
-        iteration_space = {
-            c0: (Integer(512), 4),
-            c1: (Integer(12800), 8),
-            c2: (Integer(4096), 1),
-        }
-        args = [input_arg, kernel_arg, output_arg]
-        op_info = {SHARED_WEIGHT_UNIT_BMM_INFO_KEY: {"batch_dim": 0}}
-
-        iteration_space = _preserve_shared_weight_unit_bmm_dim(
-            "batchmatmul", iteration_space, args, op_info
-        )
-        sdsc_spec, _ = parse_op_spec(
-            OpSpec(
-                op="batchmatmul",
-                is_reduction=True,
-                iteration_space=iteration_space,
-                core_id_to_work_slice=derive_operation_mapping(iteration_space),
-                args=args,
-                op_info=op_info,
-            )
-        )
-
-        self.assertEqual(
-            [str(dim) for dim in sdsc_spec.iteration_space],
-            ["x", "mb", "out", "in"],
-        )
-        input_layout = sdsc_spec.layouts[sdsc_spec.args[0].layout]
-        output_layout = sdsc_spec.layouts[sdsc_spec.args[-1].layout]
-        self.assertEqual(
-            [str(dim) for dim in input_layout["dim_order"]],
-            ["mb", "in", "x"],
-        )
-        self.assertEqual(
-            [str(dim) for dim in output_layout["dim_order"]],
-            ["mb", "out", "x"],
-        )
-
-    def test_unit_bmm_preserve_skips_higher_rank_attention_layout(self):
-        c0 = Symbol("c0")
-        c1 = Symbol("c1")
-        c2 = Symbol("c2")
-        z0 = Symbol("z0")
-        input_arg = TensorArg(
-            is_input=True,
-            arg_index=0,
-            device_dtype=_FP16,
-            device_size=[512, 32, 2, 1, 64],
-            device_coordinates=[
-                c0,
-                z0,
-                floor(c2 / 64),
-                Integer(0),
-                Mod(c2, 64),
-            ],
-            allocation={"hbm_pool": 0},
-        )
-        kernel_arg = TensorArg(
-            is_input=True,
-            arg_index=1,
-            device_dtype=_FP16,
-            device_size=[64, 4096, 64],
-            device_coordinates=[floor(c1 / 64), c2, Mod(c1, 64)],
-            allocation={"hbm": 0x400000000},
-        )
-        output_arg = TensorArg(
-            is_input=False,
-            arg_index=2,
-            device_dtype=_FP16,
-            device_size=[512, 64, 1, 64],
-            device_coordinates=[c0, floor(c1 / 64), Integer(0), Mod(c1, 64)],
-            allocation={"hbm": 0x800000000},
-        )
-        iteration_space = {
-            c0: (Integer(512), 4),
-            c1: (Integer(4096), 8),
-            c2: (Integer(4096), 1),
-        }
-        op_info = {SHARED_WEIGHT_UNIT_BMM_INFO_KEY: {"batch_dim": 0}}
-
-        new_iteration_space = _preserve_shared_weight_unit_bmm_dim(
-            "batchmatmul",
-            iteration_space,
-            [input_arg, kernel_arg, output_arg],
-            op_info,
-        )
-
-        self.assertIs(new_iteration_space, iteration_space)
-        self.assertNotIn("_spyre_bmm_unit", {str(dim) for dim in iteration_space})
-        self.assertEqual(input_arg.device_size, [512, 32, 2, 1, 64])
-        self.assertEqual(
-            input_arg.device_coordinates,
-            [c0, z0, floor(c2 / 64), Integer(0), Mod(c2, 64)],
-        )
-
-    def test_shared_weight_marker_requires_stick_aligned_dims(self):
-        m, k, n = 2, 128, 64
-        self.assertEqual(
-            self._static_bmm_custom_meta((1, m, k), (1, k, n), (1, m, n))[
-                SHARED_WEIGHT_UNIT_BMM_CUSTOM_META_KEY
-            ],
-            {"batch_dim": 0},
-        )
-        self.assertNotIn(
-            SHARED_WEIGHT_UNIT_BMM_CUSTOM_META_KEY,
-            self._static_bmm_custom_meta((4, m, k), (4, k, n), (4, m, n)),
-        )
-        self.assertNotIn(
-            SHARED_WEIGHT_UNIT_BMM_CUSTOM_META_KEY,
-            self._static_bmm_custom_meta((1, m, 2), (1, 2, n), (1, m, n)),
-        )
-
-    def test_mark_direct_unit_bmm_pass_does_not_mark_reshape_inputs(self):
-        m, k, n = 2, 64, 128
-        graph = fx.Graph()
-        x = graph.placeholder("x")
-        y = graph.placeholder("y")
-        x_view = graph.call_function(
-            torch.ops.aten.reshape.default, args=(x, (1, m, k))
-        )
-        y_view = graph.call_function(
-            torch.ops.aten.reshape.default, args=(y, (1, k, n))
-        )
-        bmm = graph.call_function(torch.ops.aten.bmm.default, args=(x_view, y_view))
-        graph.output(bmm)
-
-        mark_direct_unit_bmm_pass(graph)
-        graph.lint()
-        self.assertNotIn(
-            SHARED_WEIGHT_UNIT_BMM_CUSTOM_META_KEY,
-            bmm.meta.get("custom") or {},
-        )
-
-
 # ===========================================================================
 # 5. generate_bundle MLIR output
 # ===========================================================================
@@ -7158,7 +6970,6 @@ class TestSymbolKind(unittest.TestCase):
 
         s = Symbol("s")
         core_id = Symbol("core_id")
-        from sympy import Mod
 
         # Mirror the existing TestGenerateSdscTiledSymbols multi-core test but
         # with arg_index=0 to exercise the kernel/kernel_derived kind path.
