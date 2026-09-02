@@ -193,6 +193,34 @@ def test_chrome_trace_is_valid_json(tmp_path):
     assert len(data["traceEvents"]) > 0, "Trace JSON must contain at least one event"
 
 
+def _run_trace_analyzer_overlap_verification(trace_data):
+    """Run Trace Analyzer overlap verification and return its result and report."""
+    pytest.importorskip("aiu_trace_analyzer", minversion="1.3.0")
+    from aiu_trace_analyzer.core.acelyzer import Acelyzer
+
+    analyzer = Acelyzer(
+        ["-i", "api://jsonbuffer", "-V", "--disable_file"],
+        in_data=trace_data,
+    )
+    analyzer.run()
+    report = analyzer.get_output_data()
+
+    overlap_result = next(
+        (
+            result
+            for result in report.get("test_results", [])
+            if result.get("test") == "Compute Overlap Check"
+        ),
+        None,
+    )
+
+    assert overlap_result is not None, (
+        "AIU Trace Analyzer did not return a Compute Overlap Check result"
+    )
+
+    return overlap_result, report
+
+
 @pytest.mark.requires_spyre_profiler
 def test_synchronize_callable():
     """
@@ -410,6 +438,51 @@ def test_kineto_memcpy_and_memset_events_captured():
 
     memset_events = [e for e in events if e.get("cat") == "gpu_memset"]
     assert memset_events, "Expected at least one memset event in the kineto-spyre trace"
+
+
+@pytest.mark.requires_spyre_profiler
+def test_trace_analyzer_device_overlap(tmp_path):
+    """Verify Spyre device overlaps using AIU Trace Analyzer."""
+    trace_file = tmp_path / "trace_analyzer_overlap.json"
+
+    x = torch.randn((64, 64), dtype=torch.float16, device="spyre")
+    y = torch.randn((64, 64), dtype=torch.float16, device="spyre")
+
+    with profile(
+        activities=[ProfilerActivity.CPU, ProfilerActivity.PrivateUse1]
+    ) as prof:
+        result = torch.matmul(x, y)
+        result = F.gelu(result)
+        result = torch.sum(result)
+        torch.spyre.synchronize()
+
+    prof.export_chrome_trace(str(trace_file))
+
+    assert trace_file.exists(), "Chrome trace file was not created"
+
+    trace_data = trace_file.read_bytes()
+
+    trace_json = json.loads(trace_data)
+    trace_events = trace_json.get("traceEvents", [])
+    device_events, _ = _find_device_overlaps(trace_events)
+
+    assert len(device_events) >= 2, (
+        "Expected at least two Spyre device events for Trace Analyzer overlap validation"
+    )
+
+    overlap_result, report = _run_trace_analyzer_overlap_verification(trace_data)
+
+    if overlap_result.get("result") != "pass":
+        overlap_errors = [
+            error
+            for error in report.get("errors", [])
+            if error.get("finding") == "overlaps"
+        ]
+
+        pytest.fail(
+            "AIU Trace Analyzer detected invalid Spyre device overlap(s):\n"
+            f"{overlap_errors}"
+        )
 
 
 class TestMemoryProfilerTimeline(TestCase):

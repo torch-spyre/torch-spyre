@@ -12,12 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from types import SimpleNamespace
+
 import sympy
 
 import torch
 from torch.testing._internal.common_utils import run_tests, TestCase
 from torch._inductor.dependencies import MemoryDep
 from torch._inductor.ir import FixedLayout
+from torch._inductor.virtualized import V
 from torch_spyre._C import DataFormats, SpyreTensorLayout
 from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.pass_utils import (
@@ -31,11 +34,12 @@ from torch_spyre._inductor.propagate_layouts import (
 )
 from torch_spyre._inductor.views import (
     _decompose_constant_offset,
+    align_tensors,
     compute_coordinates,
     normalize_coordinates,
     tiling_expr_to_device_expr,
 )
-from torch.utils._sympy.functions import ModularIndexing
+from torch.utils._sympy.functions import FloorDiv, ModularIndexing
 
 p0, p1, p2, p3, p4, p5 = sympy.symbols("p0 p1 p2 p3 p4 p5", integer=True)
 
@@ -153,6 +157,68 @@ class TestCoordinates(TestCase):
         )
         # offset 1855 = 3*600 + 1*30 + 25*1
         self.assertEqual(cx, [p0 + 3, p1 + 1, p2 + 25])
+
+    def test_compute_coordinates_mixed_radix_flattened_dim(self):
+        """A flattened H*D loop maps back to separate H and D coordinates."""
+        lq, hd = sympy.symbols("lq hd", integer=True, nonnegative=True)
+        with V.set_graph_handler(SimpleNamespace()):
+            repeat_info: dict = {}
+            cx = compute_coordinates(
+                [1, 32, 64, 128],
+                [262144, 8192, 128, 1],
+                {lq: 64, hd: 4096},
+                128 * lq
+                + 8192 * ModularIndexing(hd, 128, 32)
+                + ModularIndexing(hd, 1, 128),
+                repeat_info_out=repeat_info,
+            )
+            self.assertEqual(
+                cx,
+                [0, sympy.Mod(FloorDiv(hd, 128), 32), lq, sympy.Mod(hd, 128)],
+            )
+
+            terms = normalize_coordinates(
+                {lq: 64, hd: 4096},
+                [1, 32, 64, 128],
+                cx,
+                lambda: sympy.Symbol("z0"),
+            )
+            high_digit = next(
+                term for term in terms if term.var == hd and term.dim_size == 32
+            )
+            self.assertEqual(high_digit.den, 128)
+            self.assertEqual(high_digit.mod, 4096)
+
+            iteration_space, tensors, remap = align_tensors(
+                {lq: (64, 1), hd: (4096, 1)},
+                [{"size": [1, 32, 64, 128], "coordinates": cx}],
+                repeat_info=repeat_info,
+            )
+            self.assertEqual(iteration_space[hd][0], 128)
+            self.assertEqual(remap[hd][0], (hd, 1))
+            high_var = remap[hd][1][0]
+            self.assertEqual(iteration_space[high_var][0], 32)
+            self.assertTrue(all(size > 0 for size in tensors[0]["size"]))
+
+    def test_compute_coordinates_rejects_overlapping_moduli(self):
+        """Multiple Mods remain unsupported unless they form one digit chain."""
+        with self.assertRaisesRegex(Unsupported, "multiple Mod"):
+            compute_coordinates(
+                [4, 6],
+                [6, 1],
+                {p0: 24},
+                6 * (p0 % 4) + p0 % 6,
+            )
+
+    def test_compute_coordinates_rejects_fractional_mixed_radix_coefficient(self):
+        """An unsupported digit scale is rejected before normalization."""
+        with self.assertRaisesRegex(Unsupported, "multiple Mod"):
+            compute_coordinates(
+                [4, 6],
+                [6, 1],
+                {p0: 24},
+                sympy.Rational(3, 2) * (p0 % 4) + 6 * sympy.Mod(FloorDiv(p0, 4), 6),
+            )
 
     def test_compute_device_coordinates(self):
         # B, S, E -> B, E/H, S, H

@@ -334,6 +334,7 @@ class TestSpyreModelOps(TestCase):
     def setUp(self):
         super().setUp()
         torch.manual_seed(0xAFFE)
+        torch._dynamo.config.accumulated_recompile_limit = 4096
 
     @ops(model_ops_db)
     def test_model_ops_db(self, device: str, dtype: torch.dtype, op: ModelOpInfo):

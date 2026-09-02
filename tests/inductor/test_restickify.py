@@ -600,6 +600,14 @@ def test_bmm_unit_n_self():
     _compare(lambda x: torch.matmul(x, x.transpose(1, 2)), x)
 
 
+def test_bmm_self():
+    """Self-matmul: same tensor for both operands, forcing the optimizer to
+    distinguish the LHS and RHS restickify edges even though both reads share
+    one deduplicated MemoryDep."""
+    x = torch.randn((32, 2, 128), dtype=torch.float16) * 0.1
+    _compare(lambda x: torch.matmul(x, x.transpose(1, 2)), x, optimal_cost=x.numel())
+
+
 # ------- FallbackKernel + restickify regression test ---------
 
 

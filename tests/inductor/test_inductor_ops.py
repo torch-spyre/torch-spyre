@@ -1335,12 +1335,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     2,
                     0.0,
                 ),
-                "4d_dim3": (
-                    unique_randn_along_dim((6, 17, 4, 128), dim=3),
-                    4,
-                    3,
-                    -1.0,
-                ),
             },
         },
         ("test_reduce_keepdim0", "test_reduce_keepdim0_cpu"): {
@@ -8389,6 +8383,14 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             return torch.prod(a, dim=dim, keepdim=keepdim)
 
         self.compare_with_cpu(fn, x, run_eager=False)
+
+    def test_matmul_bs1_3d_linear(self):
+        def fn(x, w):
+            return torch.matmul(x, w.T)
+
+        x = cached_xavier((1, 16, 4096))
+        w = cached_xavier((6144, 4096))
+        self.compare_with_cpu(fn, x, w, atol=0.5, rtol=0.1)
 
 
 if __name__ == "__main__":

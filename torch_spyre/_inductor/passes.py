@@ -42,7 +42,6 @@ from .padding import insert_bmm_padding, insert_restickify_padding
 from .temp_passes import (
     bmm_unflatten_pass,
     decompose_addmm,
-    mark_direct_unit_bmm_pass,
     mm_to_bmm_pass,
 )
 from .wsr.coarse_tile import validate_coarse_tile_groups
@@ -247,7 +246,6 @@ class CustomPostPasses(_SpyreGraphPassPipeline):
                 # falling back to extern_kernels.addmm.
                 decompose_addmm,
                 mm_to_bmm_pass.apply,
-                mark_direct_unit_bmm_pass,
                 bmm_unflatten_pass.apply,
             ]
         )
