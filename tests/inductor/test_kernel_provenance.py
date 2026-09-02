@@ -675,7 +675,7 @@ class TestKernelProvenancePropagation:
                 "sdsc_fused_mm_0",
                 "/tmp/kernel",
                 kernel_provenance=descriptor,
-                sdsc_bundle_dir_prefix="deadbeef",
+                sdsc_bundle_dir_prefix=None,
             )
 
         assert runner.kernel_provenance is descriptor
@@ -687,7 +687,7 @@ class TestKernelProvenancePropagation:
         prepare_kernel.assert_called_once_with(
             "/tmp/kernel/spyreCodeDir",
             profiler_name=_event_name(descriptor),
-            sdsc_bundle_dir_prefix="deadbeef",
+            sdsc_bundle_dir_prefix=None,
         )
 
     def test_runner_preserves_legacy_prepare_call_without_descriptor(self):
