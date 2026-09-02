@@ -381,9 +381,9 @@ def _matmul_features(
                 n_size = _int(it_space[n_sym], 1) if n_sym is not None else 1
                 m_split = max(1, readable.get(m_sym, 1))
                 n_split = max(1, readable.get(n_sym, 1)) if n_sym is not None else 1
-                if m_size > 1:
+                if m_size:
                     rows_per_core = m_size / m_split
-                if n_size > 1:
+                if n_size:
                     cols_per_core = n_size / n_split
                 a_bytes = m_size * k_size * dtype_bytes
                 b_bytes = k_size * n_size * dtype_bytes

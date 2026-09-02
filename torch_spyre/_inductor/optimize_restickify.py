@@ -273,10 +273,10 @@ class FixedInOutNode(RestickNodeCost):
         required_in_stls: "list[SpyreTensorLayout]",
     ):
         super().__init__(edge_costs)
-        self.required_out_stl = required_out_stl  # output layout currently assigned
-        self.required_in_stls = (
-            required_in_stls  # each input must be stick-compatible with this layout
-        )
+        self.required_out_stl = required_out_stl
+        # Parallel to edge_costs by construction in from_args (both built from the
+        # same zip over args/req_stls). strict=True in min_input_cost asserts this.
+        self.required_in_stls = required_in_stls
 
     @classmethod
     def from_args(cls, args, out_stl, req_stls, op):
@@ -303,22 +303,22 @@ class FixedInOutNode(RestickNodeCost):
     def min_input_cost(self, dep_name, in_stl, out_stl):
         if out_stl != self.required_out_stl:
             return INF
-        # Returns on first match. If dep_name appears twice (e.g. matmul(x, x)),
-        # the two positions may have different required_in_stls — this would return
-        # the wrong cost. All current FixedInOutNode ops require the same STL for
-        # both positions of a self-matmul, so this is safe today.
-        for ec, req in zip(self.edge_costs, self.required_in_stls):
-            if ec.dep.name == dep_name:
-                edge_c = ec.cost(in_stl, req)
-                if edge_c == INF:
-                    return INF
-                other_ok = all(
-                    any(e.cost(other_c, r) < INF for other_c in e._in_layouts)
-                    for e, r in zip(self.edge_costs, self.required_in_stls)
-                    if e.dep.name != dep_name
-                )
-                return edge_c if other_ok else INF
-        return INF
+        matching = [
+            (ec, req)
+            for ec, req in zip(self.edge_costs, self.required_in_stls, strict=True)
+            if ec.dep.name == dep_name
+        ]
+        if not matching:
+            return INF
+        costs = [ec.cost(in_stl, req) for ec, req in matching]
+        if any(c == INF for c in costs):
+            return INF
+        other_ok = all(
+            any(e.cost(other_c, req) < INF for other_c in e._in_layouts)
+            for e, req in zip(self.edge_costs, self.required_in_stls, strict=True)
+            if e.dep.name != dep_name
+        )
+        return sum(costs) if other_ok else INF
 
 
 class AnyInNode(RestickNodeCost):

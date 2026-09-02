@@ -885,44 +885,34 @@ def host_coordinates(
 def identify_matmul_inputs(
     inputs: list[MemoryDep],
     write_dep: MemoryDep,
-) -> tuple[MemoryDep, MemoryDep] | tuple[None, None]:
+) -> tuple[MemoryDep, MemoryDep]:
     """Identify Input1 (x) and Input2 (y) of a BatchMatmul op.
 
-    Uses the BatchMatmul semantic dimension definitions:
-      reduction_dim: in Input1, Input2,  NOT Output
-      generated_dim: in Input2, Output,  NOT Input1
-      preserved_dim: in Input1, Output,  NOT Input2
-      noreuse_dim:   in Input1, Input2,  Output
+    Uses positional order: lower_bmm always emits x before y, so inputs[0] is
+    x and inputs[1] is y.  This is valid even when N=1 (the N symbol is
+    constant-folded out of index expressions).
 
-    Identifies y by its generated_dim (N): present in y and the output, absent
-    from x.  This is more robust than identifying x by its preserved_dim (M):
-    when M=1, M is constant-folded out of both x's and the output's index
-    simultaneously, making the preserved_dim test blind.  N is immune — even
-    N=1 ranges stay in the output's index expression.
-
-    Returns (None, None) if y cannot be identified.
+    Raises ValueError if len(inputs) != 2.
     """
-    assert len(inputs) == 2
-    a, b = inputs[0], inputs[1]
-    out_syms = write_dep.index.free_symbols
-    syms_a = a.index.free_symbols
-    syms_b = b.index.free_symbols
-
-    # b has generated_dim → b is y, a is x
-    if (syms_b & out_syms) - syms_a:
-        return a, b
-    # a has generated_dim → a is y, b is x
-    if (syms_a & out_syms) - syms_b:
-        return b, a
-    return None, None
+    if len(inputs) != 2:
+        raise ValueError(
+            f"identify_matmul_inputs: expected 2 inputs, got {len(inputs)}"
+        )
+    return inputs[0], inputs[1]
 
 
-def find_reduction_var(x_dep: MemoryDep, out_dep: MemoryDep) -> sympy.Symbol:
-    """Return the single loop variable that appears in x's index but not in the output's.
+def find_reduction_var(inputs: Sequence[MemoryDep], out_dep: MemoryDep) -> sympy.Symbol:
+    """Return the single input iteration symbol reduced from the output.
 
-    Raises Unsupported if the count is not exactly 1.
+    Symbols must have a range on the input dependency that uses them. Indirect
+    gather/scatter address symbols are not iteration dimensions.
     """
-    reduction_vars = x_dep.index.free_symbols - out_dep.index.free_symbols
+    reduction_vars = {
+        sym
+        for inp in inputs
+        for sym in inp.index.free_symbols
+        if sym in inp.ranges and not is_indirect(sym.name)
+    } - out_dep.index.free_symbols
     if len(reduction_vars) != 1:
         raise Unsupported(
             f"expected exactly 1 reduction variable, got {reduction_vars}"
@@ -1010,11 +1000,29 @@ def find_matmul_generated_var(
 
     Raises Unsupported if the count is not exactly 1.
     """
-    generated_vars = (
-        y_dep.index.free_symbols & out_dep.index.free_symbols
-    ) - x_dep.index.free_symbols
+    y_syms = y_dep.index.free_symbols
+    x_syms = x_dep.index.free_symbols
+    out_syms = out_dep.index.free_symbols
+    logger.debug(
+        "[find_matmul_generated_var] looking for N (generated dim = in y & out, not in x)\n"
+        "  x   index=%-20s  free=%s\n"
+        "  y   index=%-20s  free=%s\n"
+        "  out index=%-20s  free=%s\n"
+        "  (y & out) = %s  =>  minus x = %s",
+        x_dep.index,
+        x_syms,
+        y_dep.index,
+        y_syms,
+        out_dep.index,
+        out_syms,
+        y_syms & out_syms,
+        (y_syms & out_syms) - x_syms,
+    )
+    generated_vars = (y_syms & out_syms) - x_syms
+    logger.debug("  generated_vars = %s", generated_vars)
     if op is not None and len(generated_vars) > 1:
         generated_vars = generated_vars - broadcast_batch_vars(op, x_dep, out_dep)
+        logger.debug("  generated_vars (after broadcast filter) = %s", generated_vars)
     if len(generated_vars) != 1:
         raise Unsupported(
             f"expected exactly 1 generated variable, got {generated_vars}"
