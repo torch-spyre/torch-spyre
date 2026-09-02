@@ -33,7 +33,7 @@ from torch_spyre._inductor.scratchpad.cooling_schedules import (
     ExponentialCoolingSchedule,
 )
 from torch_spyre._inductor.scratchpad.simulated_annealing import (
-    SimulatedAnnealingSolverWithBuffers,
+    SimulatedAnnealingLayoutSolver,
 )
 from torch_spyre._inductor.scratchpad.utils import plot_buffers
 
@@ -44,7 +44,7 @@ buffers = [
     LifetimeBoundBuffer("B3", 8, [3, 5]),
 ]
 
-solver = SimulatedAnnealingSolverWithBuffers(
+solver = SimulatedAnnealingLayoutSolver(
     buffers,
     size=14,
     alignment=1,
