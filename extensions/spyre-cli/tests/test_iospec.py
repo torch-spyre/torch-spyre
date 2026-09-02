@@ -58,6 +58,18 @@ def test_parse_json_file_invalid_data(tmp_path: Path):
         parse_json_file(str(iofile))
 
 
+def test_parse_json_file_no_outputs(tmp_path: Path):
+    iofile = tmp_path / "io.json"
+    data = {
+        "inputs": [{"ndims": 2, "dimensions": [10, 1024], "dtype": "float16"}],
+        "outputs": [],
+    }
+    iofile.write_text(json.dumps(data))
+
+    with pytest.raises(ValueError, match="No output found in IO Spec"):
+        parse_json_file(str(iofile))
+
+
 def test_parse_json_file_e_incorrect():
     iofile = Path(__file__).parent.parent / "spyre_cli" / "iospec" / "e_incorrect.json"
     with pytest.raises(ValueError, match="Invalid JSON"):

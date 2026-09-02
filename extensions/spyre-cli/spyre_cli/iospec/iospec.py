@@ -55,4 +55,7 @@ def parse_json_file(iofile):
     except ValidationError as e:
         raise ValueError(f"IO Spec validation failed: {e}") from e
 
+    if len(spec.outputs) == 0:
+        raise ValueError(f"No output found in IO Spec. One or more output is expected.")
+
     return spec

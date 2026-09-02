@@ -64,6 +64,11 @@ def launch_from_iofile(path=".", iofile="io.json"):
 
     _launch(path, tensors)
 
+    # TODO: deal with the cases when we have multiple outputs
+    # which ops would those be?
+    if len(spec.outputs) > 1:
+        print("WARNING: multiple outputs found, but only last one printed!")
+
     print(tensors[-1])
 
 
