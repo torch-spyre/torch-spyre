@@ -2288,7 +2288,15 @@ def lower_pad_sequence(
         source_buf = arg_buf
     else:
         assert arg_fx_node is not None
-        source_buf = V.graph.get_buffer(arg_fx_node.name)
+        # arg_fx_node.name is the FX node's own identifier, not necessarily
+        # the lowered buffer's name (see _find_arg_fx_node's docstring: a
+        # single buffer can be reached through multiple FX nodes presenting
+        # it at different sizes, e.g. mm_to_bmm_pass's unsqueeze/reshape, or
+        # conv2d's im2col unfold node).  Recover the buffer via the node's
+        # own TensorBox in graph_lowering.env instead of re-deriving a name.
+        arg_tb = graph_lowering.env[arg_fx_node]
+        assert isinstance(arg_tb, TensorBox)
+        source_buf = arg_tb.data.data
     # Both recovery mechanisms below resolve an index in "view space" (source_
     # buf's own raw dims, i.e. original_shape's space, which may include
     # phantom leading dims) -- translate to core space once at the end by
