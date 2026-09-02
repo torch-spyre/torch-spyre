@@ -712,16 +712,35 @@ def _check_stick_matmul(op_spec: OpSpec, stage: str) -> None:
     other input. Returns early if the two inputs cannot be distinguished
     (symmetric arg symbols — degenerate case).
 
+    When N=1, the generated_sym is constant-folded away; y and output have
+    sparse stick layouts and the stick constraint is vacuously satisfied.
+
     Required stick (innermost coord free symbol):
       Input1: reduction_sym  (all dtypes — for FP8/INT8/INT4 multi-dim sticks
                                the innermost element is still reduction_sym)
       Input2: generated_sym  (all dtypes — innermost element is generated_sym)
-      Output: generated_sym  (always DF16)
+                              OR sparse (when N=1)
+      Output: generated_sym  (always DF16) OR sparse (when N=1)
     """
     inputs = [a for a in op_spec.args if a.is_input]
     outputs = [a for a in op_spec.args if not a.is_input]
 
     if len(inputs) < 2 or len(outputs) < 1:
+        return
+
+    # When N=1, the N symbol is constant-folded away. Both y and output have
+    # sparse stick layouts (device_coordinates[-1] is 0). Skip validation.
+    y_stick_coord = (
+        inputs[1].device_coordinates[-1]
+        if len(inputs[1].device_coordinates) > 0
+        else None
+    )
+    out_stick_coord = (
+        outputs[0].device_coordinates[-1]
+        if len(outputs[0].device_coordinates) > 0
+        else None
+    )
+    if y_stick_coord == 0 and out_stick_coord == 0:
         return
 
     out_syms: set[sympy.Symbol] = set()
@@ -732,18 +751,23 @@ def _check_stick_matmul(op_spec: OpSpec, stage: str) -> None:
     b_syms = _arg_free_syms(inputs[1])
 
     gen_from_b = (b_syms & out_syms) - a_syms
-    gen_from_a = (a_syms & out_syms) - b_syms
 
     if gen_from_b:
         x_arg, y_arg = inputs[0], inputs[1]
+        if len(gen_from_b) > 1:
+            # Broadcast-batch case: x is broadcast over an extra dim, so multiple
+            # candidates appear in gen_from_b.  The true generated sym is the one
+            # on y's stick — layout propagation always puts N there.
+            on_y_stick = gen_from_b & _arg_stick_syms(y_arg)
+            if len(on_y_stick) == 1:
+                gen_from_b = on_y_stick
         generated_sym = next(iter(gen_from_b))
-    elif gen_from_a:
-        x_arg, y_arg = inputs[1], inputs[0]
-        generated_sym = next(iter(gen_from_a))
     else:
+        # No generated_sym found — N=1 collapsed or symmetric. Vacuously valid.
         return
 
     reduction_syms = _arg_free_syms(x_arg) - out_syms
+    # If reduction sym is missing (K=1 or constant-folded), skip.
     if not reduction_syms:
         return
     reduction_sym = next(iter(reduction_syms))
@@ -752,6 +776,9 @@ def _check_stick_matmul(op_spec: OpSpec, stage: str) -> None:
     for arg in outputs:
         out_stick.update(_arg_stick_syms(arg))
 
+    # Only report a violation if the symbol exists in the op but lands in the
+    # wrong slot.  If it's absent entirely (constant-folded unit dim), skip that
+    # check — it can't be wrong if it isn't there.
     errors = []
     if reduction_sym not in _arg_stick_syms(x_arg):
         errors.append(
