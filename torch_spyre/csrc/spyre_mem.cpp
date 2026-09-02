@@ -38,6 +38,7 @@
 #include "logging.h"
 #include "module.h"
 #include "spyre_allocator.h"
+#include "spyre_composite_address.h"
 #include "spyre_storage_impl.h"
 #include "spyre_stream.h"
 #include "spyre_tensor_impl.h"
@@ -788,18 +789,14 @@ at::Tensor spyre_fill_tensor(const at::Tensor& self, double value) {
               "spyre_fill_tensor: tensor must be on spyre device");
   TORCH_CHECK(self.numel() > 0, "spyre_fill_tensor: cannot fill empty tensor");
 
-  // Get the device allocation (CompositeAddress) from the spyre tensor
-  auto* spyre_impl = static_cast<SpyreTensorImpl*>(self.unsafeGetTensorImpl());
-  auto& storage = spyre_impl->storage();
-  auto* ctx = static_cast<SharedOwnerCtx*>(storage.data_ptr().get_context());
-
   // Map torch dtype to DataFormats for the value->pattern conversion, which
   // fillAsync performs internally.
   DataFormats dtype = get_device_dtype(self.scalar_type());
 
   // Launch a device-side MEMORY_FILL DMA via the typed fillAsync overload.
   SpyreStream stream;
-  stream.fillAsync(&ctx->composite_addr, value, dtype, /*use_dmai=*/true);
+  stream.fillAsync(get_composite_address(self), value, dtype,
+                   /*use_dmai=*/true);
 
   return self;
 }
