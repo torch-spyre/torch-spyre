@@ -826,12 +826,8 @@ def _canonical_stl_from_collapsed_host(
             and var_stride > 0
             and sympy.simplify(var_delta - var_stride * matmul_var) == 0
             and all(
-                sympy.simplify(
-                    (coord - coord.xreplace({matmul_var: sympy.S.Zero})).xreplace(
-                        {matmul_var: sympy.S.Zero}
-                    )
-                )
-                == 0
+                (coord - coord.xreplace({matmul_var: sympy.S.Zero})).free_symbols
+                <= {matmul_var}
                 for dim, coord in enumerate(host_coords)
                 if dim in host_dims
             )
@@ -1112,6 +1108,9 @@ def _matmul_layouts(
             raise Unsupported(
                 f"{data.reduction_type}: M=1 matmul but output dep has no vars"
             )
+        # N is always last in output_dep.var_names: Inductor's matmul lowering
+        # places N last in ranges regardless of M's size (M=1 folds M's loop
+        # symbol away but does not reorder the output dep).
         generated_var = output_dep.var_names[-1]
         y_req_stl = find_stick_compatible_input_layout(
             y, generated_var, data.reduction_type, "y"
