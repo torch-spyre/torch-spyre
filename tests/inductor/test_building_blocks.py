@@ -273,8 +273,9 @@ class TestBuildingBlocks(unittest.TestCase):
         # Case 3.2 of the mixed-EA rule: the *staggered* operand is the
         # size-1-stick broadcaster (fp16 produced by an fp32->fp16 downcast,
         # FP32_TO_DL16) combined with a STANDARD full operand. A broadcastable
-        # staggered operand is physically identical to STANDARD of that shape, so
-        # the op is allowed (STANDARD output).
+        # staggered operand reads only element zero of each stick, so its
+        # within-stick ordering is unobservable and the op can produce a STANDARD
+        # output.
         x = torch.randn(4, 1, dtype=torch.float32)  # -> .to(f16): staggered bcast
         w = torch.randn(4, 64, dtype=torch.float16)  # STANDARD full
 
@@ -282,6 +283,23 @@ class TestBuildingBlocks(unittest.TestCase):
             return torch.add(x.to(torch.float16), w)
 
         compare_with_cpu(fn, x, w, cpu_compile=False, run_eager=False)
+
+    def test_mixed_ea_noncanonical_staggered_broadcaster_fp16(self):
+        # Gemma 4 vision RMSNorm produces its mean in fp32, then downcasts it
+        # before subtracting it from a full bf16 activation. The downcast keeps
+        # the reduction's noncanonical device geometry, but its stick is sparse;
+        # the FP32_TO_DL16 ordering is therefore unobservable to the broadcast.
+        x = torch.rand(1, 280, 6912, dtype=torch.bfloat16)
+
+        def fn(x):
+            xf = x.to(torch.float32)
+            mean = xf.mean(-1, keepdim=True)
+            centered = xf - mean
+            variance = (centered * centered).mean(-1, keepdim=True)
+            inv = torch.rsqrt(variance + 1e-6).to(x.dtype)
+            return (x - mean.to(x.dtype)) * inv
+
+        compare_with_cpu(fn, x, cpu_compile=False, run_eager=False)
 
     def test_mixed_ea_staggered_broadcaster_fp32(self):
         # Case 3.2 with an fp32-physical staggered broadcaster (DL16_TO_FP32).

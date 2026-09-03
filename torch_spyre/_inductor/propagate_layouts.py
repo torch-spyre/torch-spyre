@@ -1283,8 +1283,10 @@ def _multi_arg_pointwise_layouts(
     #       3.2 every staggered operand can broadcast  -> STANDARD output
     #       3.3 otherwise (a STANDARD and a staggered full operand coexist)
     #                                                  -> unsupported (raise)
-    # Prefer 3.1 in the overlap because propagation does not yet know which
-    # candidate layout the optimizer will commit for the staggered producer.
+    # In the overlap, prefer the direction whose broadcast condition holds for
+    # every candidate of the opposite-EA inputs. That choice remains valid no
+    # matter which producer layouts the optimizer can actually reach. If both
+    # directions are equally stable (or unstable), retain the 3.1 preference.
     # A future extension may admit 2a/3.3 by inserting an explicit EA conversion
     # at extra cost.
     staggered_inputs = input_eas & STAGGERED_EAS
@@ -1333,7 +1335,18 @@ def _multi_arg_pointwise_layouts(
             if arg.layouts and arg.layouts[0].element_arrangement == staggered_ea
         ]
 
-        if all(broadcast for _, broadcast, _ in std_split):
+        std_can_broadcast = all(broadcast for _, broadcast, _ in std_split)
+        stag_can_broadcast = bool(stag_split) and all(
+            broadcast for _, broadcast, _ in stag_split
+        )
+        std_always_broadcasts = all(
+            not non_broadcast for _, _, non_broadcast in std_split
+        )
+        stag_always_broadcasts = all(
+            not non_broadcast for _, _, non_broadcast in stag_split
+        )
+
+        if std_can_broadcast and (std_always_broadcasts or not stag_always_broadcasts):
             # Case 3.1 (and case 2b with no STANDARD operands): preserve the
             # staggered arrangement and keep only broadcast-compatible STANDARD
             # candidates.
@@ -1341,46 +1354,20 @@ def _multi_arg_pointwise_layouts(
             for arg, broadcast, non_broadcast in std_split:
                 if non_broadcast:
                     arg.layouts[:] = broadcast
-        elif stag_split and all(broadcast for _, broadcast, _ in stag_split):
+        elif stag_can_broadcast:
             # Case 3.2: every staggered operand has a broadcast candidate, so
             # the operation can use STANDARD ordering.
             #
-            # Safety: device coordinates depend only on device_size/stride_map,
-            # not the EA label (see device_coordinates), and `_is_supported_layout`
-            # rebuilds each operand from its host size/stride with the *output* EA
-            # (here STANDARD). Reinterpreting a broadcastable staggered operand as
-            # STANDARD is therefore sound only if its staggered device geometry is
-            # identical to the STANDARD layout of the same host shape. A size-1
-            # stick usually makes the staggering vacuous, but we do NOT assume it:
-            # verify per kept candidate and raise rather than silently emit wrong
-            # coordinates (e.g. under a non-identity dim_order or a shape whose
-            # staggering is not a genuine no-op).
-            for arg, broadcast, _ in stag_split:
-                c_in_size = [concretize_expr(s) for s in arg.layout.size]
-                c_in_stride = [concretize_expr(s) for s in arg.layout.stride]
-                std_geom = SpyreTensorLayout(
-                    c_in_size,
-                    c_in_stride,
-                    arg.layout.dtype,
-                    list(range(len(c_in_size))),
-                    ElementArrangement.STANDARD,
-                )
-                for cand in broadcast:
-                    if (
-                        cand.device_size != std_geom.device_size
-                        or cand.stride_map != std_geom.stride_map
-                    ):
-                        raise Unsupported(
-                            f"Multi-arg pointwise with mixed EA: staggered operand "
-                            f"{arg.dep.name} is broadcastable but its {staggered_ea} "
-                            f"device layout "
-                            f"({cand.device_size}/{cand.stride_map}) differs from the "
-                            f"STANDARD layout of the same shape "
-                            f"({std_geom.device_size}/{std_geom.stride_map}); "
-                            f"reinterpreting it as STANDARD would change its "
-                            f"coordinates. De-staggering via an explicit EA "
-                            f"conversion is not supported yet."
-                        )
+            # ElementArrangement changes only the order of elements *within* a
+            # stick. Every candidate retained here has a sparse stick
+            # (stride_map[-1] == -1), so all its logical loads address the same
+            # within-stick element and the stagger is unobservable. Its outer
+            # device geometry may still be noncanonical (dtype conversion keeps
+            # its producer's geometry); that geometry remains on the input and
+            # is handled independently by the coordinate compatibility solver.
+            # Comparing it with a freshly constructed canonical STANDARD layout
+            # would therefore reject valid broadcasts such as Gemma 4's fp32
+            # RMSNorm mean downcast.
             output_ea = ElementArrangement.STANDARD
             for arg, broadcast, non_broadcast in stag_split:
                 if non_broadcast:
