@@ -68,6 +68,17 @@ class EdgeCostMap:
         self._dep_layout = V.graph.get_buffer(dep.name).get_layout()
         self._target_dep_layout = V.graph.get_buffer(target_dep.name).get_layout()
 
+        # Shared device_coordinates memo, installed for the duration of layout
+        # selection (see _set_coord_cache). None means "no sharing": each cost
+        # computation recomputes its coordinates.
+        self.coord_cache: "dict | None" = None
+
+        # Host-side coordinates for THIS edge. Its inputs (_dep_layout, dep) are
+        # the snapshots above, so the result varies only with the indirect-access
+        # sizes; filled on first use, since an edge whose candidate pairs all
+        # take the stick-compatible early-out never needs it.
+        self._host_coords: dict = {}
+
         # _cost and _layout are parallel maps.
         # _cost stores the cost for a given in/target layout pair
         # _layout stores the target STL for the restickify, or None if no restickify is needed
@@ -95,7 +106,14 @@ class EdgeCostMap:
           SpyreTensorLayout  — feasible restickify target layout
         """
         needed, tgt = compute_restickify_needed(
-            in_stl, self._dep_layout, self.dep, target_stl, self._target_dep, self._op
+            in_stl,
+            self._dep_layout,
+            self.dep,
+            target_stl,
+            self._target_dep,
+            self._op,
+            self.coord_cache,
+            self._host_coords,
         )
         if not needed:
             cost = 0.0
@@ -629,6 +647,32 @@ def _compute_last_use(operations: list, step_of: "dict[str, int]") -> "dict[str,
     return last_use
 
 
+def _set_coord_cache(operations: list, cache: "dict | None") -> None:
+    """Point every edge cost map at ``cache``, or at None to detach it.
+
+    EdgeCostMap memoizes compute_restickify_needed per (in_stl, target_stl),
+    but each map covers a single op-input edge, so the same (layout, access)
+    pair recomputes its device coordinates once per edge. Those pairs recur
+    across edges on tiled graphs, which is redundancy a per-edge cache cannot
+    see.
+
+    The lifetime is bounded because `device_coordinates` results are not a pure
+    function of their arguments: concretization consults
+    ``V.graph.sizevars`` optimization hints, whose precomputed-replacement
+    state grows as compilation proceeds. Its arguments are all immutable and
+    all in the key, so a committed layout cannot invalidate an entry -- what
+    bounds the cache is the graph, not this pass. Scoping it here rather than
+    sharing one memo with propagate_layouts, which issues the same queries
+    immediately before, keeps that bound close to the code that relies on it.
+    """
+    for op in operations:
+        cost_fn = getattr(op, "restick_cost_fn", None)
+        if cost_fn is None:
+            continue
+        for edge_cost in cost_fn.edge_costs:
+            edge_cost.coord_cache = cache
+
+
 def beam_global_min_cost(operations: list) -> None:
     """Global beam search layout selection.
 
@@ -798,4 +842,8 @@ def optimize_restickify_locations(graph: GraphLowering) -> None:
     """Select restickify locations for all ops, minimizing total restickify cost."""
     operations = graph.operations
     logger.info("optimizer: beam (global)")
-    beam_global_min_cost(operations)
+    _set_coord_cache(operations, {})
+    try:
+        beam_global_min_cost(operations)
+    finally:
+        _set_coord_cache(operations, None)
