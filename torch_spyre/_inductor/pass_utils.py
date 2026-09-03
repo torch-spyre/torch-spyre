@@ -975,6 +975,17 @@ def get_matmul_n_size(op: "Operation") -> int:
     return concretize_expr(op.data.ranges[-1])
 
 
+def get_matmul_m_size(op: "Operation") -> int:
+    """Return the concrete M (output rows) extent of a matmul op.
+
+    Reads from op.data.ranges[-2] (the second-to-last non-batch range).
+    Returns 1 when the matmul has fewer than 2 non-batch ranges (degenerate).
+    """
+    if len(op.data.ranges) >= 2:
+        return concretize_expr(op.data.ranges[-2])
+    return 1
+
+
 def find_reduction_var(inputs: Sequence[MemoryDep], out_dep: MemoryDep) -> sympy.Symbol:
     """Return the single input iteration symbol reduced from the output.
 
@@ -1097,12 +1108,14 @@ def find_matmul_generated_var(
     if op is not None and len(generated_vars) > 1:
         generated_vars = generated_vars - broadcast_batch_vars(op, x_dep, out_dep)
         logger.debug("  generated_vars (after broadcast filter) = %s", generated_vars)
-    if len(generated_vars) > 1 and out_dep.var_names:
+    if len(generated_vars) != 1 and out_dep.var_names:
         # The Inductor matmul lowering always places N (the generated/output-column
         # dim) last in ranges — see lower_bmm/lower_mm in lowering.py.  The last
         # squeezed output var is therefore always the generated var.
+        # When generated_vars is empty (self-alias matmul: x and y are the same
+        # buffer, so x_syms swallows the N var), use last_var unconditionally.
         last_var = out_dep.var_names[-1]
-        if last_var in generated_vars:
+        if not generated_vars or last_var in generated_vars:
             generated_vars = {last_var}
             logger.debug(
                 "  generated_vars (after last-output-var fallback) = %s", generated_vars

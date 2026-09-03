@@ -1248,8 +1248,28 @@ def _create_sdsc_tensors(
                 dim_order = dim_order + reduced_dims
 
         if is_matmul and i == 0 and matmul_x_reuse_dims:
-            reduced_dims = reduced_dims + matmul_x_reuse_dims
-            dim_order = dim_order + matmul_x_reuse_dims
+            # Two cases for reuse dims on x:
+            #
+            # Batch-broadcast (normal): E is in x, y, and output but y sticks
+            # on N — E is a genuine outer-loop dim x iterates over and should
+            # appear in x's layout with scale=-1 (reduced_dim).
+            #
+            # M=1 (coarse-tiling GEMV): N leaks into x's physical dep index,
+            # so x_dim_order already contains y_stick (N).  DXP computes x's
+            # reuse dim by set-subtraction (KERNEL - INPUT); if N is in both,
+            # the result is empty and DXP asserts inp0_reuse_dim.size() == 1.
+            # Strip N from x's layout so INPUT stays K-only and DXP correctly
+            # identifies N as x's broadcast dim.
+            # Partition matmul_x_reuse_dims into two mutually exclusive,
+            # exhaustive subsets based on membership in x's current dim_order.
+            x_dim_order_set = set(dim_order)
+            m1_reuse = [d for d in matmul_x_reuse_dims if d in x_dim_order_set]
+            batch_reuse = [d for d in matmul_x_reuse_dims if d not in x_dim_order_set]
+            # Strip M=1 reuse dims (already in dim_order due to N leak).
+            dim_order = [d for d in dim_order if d not in m1_reuse]
+            # Append batch-broadcast reuse dims as reduced_dims (scale=-1).
+            reduced_dims = reduced_dims + batch_reuse
+            dim_order = dim_order + batch_reuse
 
         # Step 3: Handle missing stick dimension — skip for index tensors.
         if op_stick_dim is None:
@@ -1675,6 +1695,11 @@ def _matmul_reuse_dims(
     These are indistinguishable from the true generated dim N by set membership
     alone. Use layout policy to disambiguate: y and output always stick on N,
     broadcast-batch dims never do. N = y's stick dim; others are reuse dims.
+
+    M=1 exception: when M=1, the M loop symbol is size-folded away and N leaks
+    into x's index expression (x iterates over both N and K).  Consequently
+    y_stick (N) appears in x_dim_order.  In this case x genuinely reuses over N
+    (a GEMV broadcasts x over all output columns), so return [y_stick].
     """
     y_arg = op_spec.args[1]
     out_arg = op_spec.args[-1]
@@ -1682,6 +1707,9 @@ def _matmul_reuse_dims(
     out_dim_order, out_stick = _get_device_dim_order(out_arg, symbol_mapping)
     if y_stick is None:
         return []
+    if y_stick in set(x_dim_order):
+        # M=1: N leaked into x's dim_order; N is x's reuse dim.
+        return [y_stick]
     y_syms = set(y_dim_order) | {y_stick}
     out_syms = set(out_dim_order) | ({out_stick} if out_stick is not None else set())
     reuse_syms = (y_syms & out_syms) - set(x_dim_order) - {y_stick}

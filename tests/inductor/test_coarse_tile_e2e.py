@@ -1701,6 +1701,69 @@ def test_restickify_matmul_x_yt_128x256_M2_N2():
     run_coarse_tile_test(fn, inputs)
 
 
+def test_m1_matmul_coarse_tile():
+    """M=1 SDPA + o_proj decode: o_proj bmm hits coarse-tile with factorized x.
+
+    SDPA with q shape [B, H, 1, D] (decode: max_seqlen_q=1) produces attn_out
+    [B, H, 1, D] with a factorized tiled layout from SDPA's internal num_heads
+    tiling.  After transpose+reshape to [B, 1, H*D], the combined H*D dim is
+    the K-dimension for the down-projection (o_proj) linear.  Inside the
+    coarse-tile group the bmm's x reads attn_out with host coordinates
+    [0, 32*d0+floor(d1/D), 0, Mod(d1,D)], where outer tile var d0 appears
+    alongside contraction var d1 — a factorized layout.
+
+    Without the fix, _canonical_stl_from_collapsed_host rejects this with
+    "batchmatmul: cannot canonicalize factorized x_var".  The fix relaxes the
+    affine_full_range check to allow outer loop vars alongside the contraction
+    var.
+    """
+    B, H, Lq, Lk, D = 1, 32, 1, 2048, 128  # decode: seq_len=1
+    hidden = H * D  # 4096
+    inputs = [
+        tensor(
+            "q",
+            shape=(B, H, Lq, D),
+            dims=["_b", "num_heads", "max_seqlen_q", "head_dim"],
+            named_dims={
+                "_b": B,
+                "num_heads": H,
+                "max_seqlen_q": Lq,
+                "head_dim": D,
+                "max_seqlen_kv": Lk,
+            },
+        ),
+        tensor(
+            "k",
+            shape=(B, H, Lk, D),
+            dims=["_b", "num_heads", "max_seqlen_kv", "head_dim"],
+            named_dims={},
+        ),
+        tensor(
+            "v",
+            shape=(B, H, Lk, D),
+            dims=["_b", "num_heads", "max_seqlen_kv", "head_dim"],
+            named_dims={},
+        ),
+        tensor(
+            "w",
+            shape=(hidden, hidden),
+            dims=["out_hidden", "in_hidden"],
+            named_dims={"out_hidden": hidden, "in_hidden": hidden},
+        ),
+    ]
+
+    def fn(q, k, v, w):
+        attn_out = F.scaled_dot_product_attention(q, k, v, scale=D**-0.5)
+        # Granite decode pattern: collapse heads before o_proj.
+        # attn_out is [B, H, 1, D] with SDPA's factorized tiled layout.
+        # After reshape, K-dim = H*D spans both num_heads and head_dim dims,
+        # making x's host coords factorized for the coarse-tile bmm.
+        x = attn_out.transpose(1, 2).reshape(B, Lq, hidden)  # [1, 1, 4096]
+        return F.linear(x, w)  # o_proj: no spyre_hint, coarse-tile from SDPA
+
+    run_coarse_tile_test(fn, inputs, loopspec=None, atol=0.2, rtol=0.2)
+
+
 def test_restickify_pointwise_unsqueeze_mul_Lq2():
     """pointwise result unsqueezed and multiplied with 4D tensor, tiled Lq÷2.
 
