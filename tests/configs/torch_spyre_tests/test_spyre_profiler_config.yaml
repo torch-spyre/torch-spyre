@@ -21,6 +21,9 @@ test_suite_config:
             - TestMemoryProfilerTimeline::test_memory_timeline_no_id_cpu
           mode: mandatory_success
         - names:
+            - TestOverExtendedKernelDurations::test_find_over_extended_activities
+            - TestOverExtendedKernelDurations::test_find_over_extended_activities_invalid_events
+            - TestOverExtendedKernelDurations::test_activity_duration_limit
             - test_find_device_overlaps
             - test_find_device_overlaps_invalid_events
             - test_kernel_time_overlap
