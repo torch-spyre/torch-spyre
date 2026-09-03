@@ -24,13 +24,17 @@ import unittest
 from unittest.mock import patch
 
 import torch
+import torch.fx as fx
 from torch._inductor import config as t_inductor_config
 from torch._inductor.ir import (
     ComputedBuffer,
+    FixedLayout,
+    InputBuffer,
     Operation,
     Reduction,
 )
 from torch._inductor.graph import GraphLowering
+from torch._inductor.virtualized import V
 
 from torch_spyre._C import get_elem_in_stick
 from torch_spyre._inductor import config as ts_inductor_config
@@ -872,6 +876,86 @@ class TestInsertPaddingIR(unittest.TestCase):
         for op in ops:
             if isinstance(op, ComputedBuffer):
                 self.assertIs(self.captured_name_to_buffer[op.get_name()], op)
+
+
+class TestLowerPadSequenceBroadcastDim(unittest.TestCase):
+    """White-box tests for ``lower_pad_sequence``'s host-stride ranking.
+
+    A coarse-tile read-copy buffer can carry a broadcast dim -- stride 0,
+    size > 1 -- alongside a dim that needs stick-boundary padding (see
+    coarse_tile.py's ``_insert_one_read_copy``: an ``ADVANCING_READ`` source
+    keeps its full, uncompacted rank, with absent/broadcast dims left at
+    stride 0).  ``lower_pad_sequence`` ranks the padded buffer's host dims
+    by the source buffer's raw host stride to preserve fastest/slowest
+    ordering; ranking a stride-0 broadcast dim by that raw value put it
+    first (0 sorts smallest) and handed it a real nonzero stride, corrupting
+    addressing for a dimension that must stay stride 0.
+
+    These tests call ``lower_pad_sequence`` directly against a hand-built
+    ``InputBuffer`` (the pre-stickification path used by
+    ``insert_bmm_padding``, mirroring ``coarse_tile.py``'s own FX-node-free
+    ``arg_buf`` call convention), independent of any end-to-end
+    coarse-tiling or SDPA compilation -- exercising the bug's structural
+    precondition directly rather than reproducing it through a full
+    ``torch.compile`` call.
+    """
+
+    def setUp(self) -> None:
+        gm = fx.symbolic_trace(lambda: None)
+        self._graph_ctx = V.set_graph_handler(GraphLowering(gm))
+        self._graph_ctx.__enter__()
+
+    def tearDown(self) -> None:
+        self._graph_ctx.__exit__(None, None, None)
+
+    def test_broadcast_dim_kept_at_stride_zero_when_padding_adjacent_dim(
+        self,
+    ) -> None:
+        """A stride-0, size>1 dim must stay stride 0 in the padded buffer.
+
+        arg_buf mirrors a coarse-tile read-copy of V broadcast across 4 head
+        tiles (dim 0, stride 0, size 4), with a real row dim (dim 1, size
+        64, stride 32) and a K dim (dim 2, size 13, unaligned) padded to 32.
+        """
+        from torch_spyre._inductor.pass_utils import lower_pad_sequence
+
+        device = torch.device("cpu")
+        dtype = torch.float16
+
+        arg_buf = InputBuffer(
+            name="arg0",
+            layout=FixedLayout(device, dtype, [4, 64, 13], [0, 1, 32]),
+        )
+        V.graph.name_to_buffer["arg0"] = arg_buf
+        V.graph.graph_inputs["arg0"] = arg_buf
+        insert_before = next(iter(V.graph.graph.nodes))
+
+        padded_buf, _new_ops = lower_pad_sequence(
+            arg_fx_node=None,
+            padded_size=[4, 64, 32],
+            device=device,
+            dtype=dtype,
+            dim=2,
+            insert_before=insert_before,
+            orig_stl=None,
+            fill_value=0.0,
+            arg_buf=arg_buf,
+        )
+
+        size = [int(s) for s in padded_buf.get_size()]
+        stride = [int(s) for s in padded_buf.get_stride()]
+        self.assertEqual(size, [4, 64, 32])
+        self.assertEqual(
+            stride[0],
+            0,
+            f"broadcast dim (size 4) must stay stride 0; got padded stride {stride}",
+        )
+        # The two real dims must still be assigned distinct, non-overlapping
+        # strides consistent with their original relative order (dim 1 was
+        # fastest-varying at stride 1, dim 2 was next at stride 32).
+        self.assertLess(stride[1], stride[2])
+        self.assertNotEqual(stride[1], stride[0])
+        self.assertNotEqual(stride[2], stride[0])
 
 
 if __name__ == "__main__":
