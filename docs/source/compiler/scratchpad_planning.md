@@ -139,6 +139,7 @@ deadcode_elimination
 propagate_named_dims                  # named-dimension metadata (pre-stickification)
 assign_dim_hints
 _maybe_coarse_tile_hints              # hint-driven coarse tiling, when hints produce groups
+insert_bmm_padding                    # pad matmul y's K (pre-stickification)
 split_multi_ops
 propagate_spyre_tensor_layouts        # assign FixedTiledLayout
 validate_ops
@@ -147,7 +148,7 @@ finalize_layouts
 insert_restickify
 enforce_indirect_access_layout
 insert_post_mutation_restickify
-insert_bmm_padding
+insert_restickify_padding
 dedup_and_promote_constants
 _maybe_coarse_tile_span_overflow      # span-overflow coarse tiling (post-stickification)
 span_reduction                        # work-division: enforce 256 MB span

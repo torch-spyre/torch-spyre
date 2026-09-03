@@ -70,6 +70,15 @@ class CustomPreSchedulingPassesWithCapture(CustomPreSchedulingPasses):
         assert self.test_instance is not None
         super().__call__(graph)
         self.test_instance.captured_operations = list(graph.operations)
+        self.test_instance.captured_name_to_buffer = dict(graph.name_to_buffer)
+        # Reads must be traced while V.graph is live; record them per op here.
+        self.test_instance.captured_read_names = {
+            op.get_name(): {
+                d.name for d in op.get_read_writes().reads if hasattr(d, "name")
+            }
+            for op in graph.operations
+            if isinstance(op, ComputedBuffer)
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -86,6 +95,8 @@ class TestInsertPaddingIR(unittest.TestCase):
     """
 
     captured_operations: list[Operation] = []
+    captured_name_to_buffer: dict[str, Any] = {}
+    captured_read_names: dict[str, set[str]] = {}
 
     def setUp(self) -> None:
         torch.manual_seed(0xAFFE)
@@ -181,6 +192,18 @@ class TestInsertPaddingIR(unittest.TestCase):
                 if getattr(getattr(op, "origin_node", None), "target", None) == aten_op:
                     padded_buf_ops.append(op)
         return padded_buf_ops
+
+    @staticmethod
+    def _restickify_ops(operations: list[Operation]) -> list[ComputedBuffer]:
+        """Return ComputedBuffer operations whose origin_node.target is spyre.restickify."""
+        restickify_op = torch.ops.spyre.restickify.default
+        return [
+            op
+            for op in operations
+            if isinstance(op, ComputedBuffer)
+            and getattr(getattr(op, "origin_node", None), "target", None)
+            == restickify_op
+        ]
 
     @staticmethod
     def _constant_ops(ops: list[Operation]) -> list[SpyreConstantFallback]:
@@ -750,6 +773,105 @@ class TestInsertPaddingIR(unittest.TestCase):
         self.assertEqual(int(reduction.reduction_ranges[0]), K)
 
         torch.testing.assert_close(fn(x_cpu, w_cpu), result.cpu(), atol=0.1, rtol=0.1)
+
+    def test_transposed_y_unaligned_k_pads_then_restickifies(self) -> None:
+        """``x @ w.t()`` with unaligned K -- the ``nn.Linear`` weight pattern.
+
+        The weight is stored ``[N, K]`` with K within the stick, so the matmul
+        needs it restickified to put N within the stick.  Padding runs before
+        stickification, so the pass pads the weight's K while it is a plain host
+        buffer and stickification then restickifies the *padded* buffer.  The
+        matmul must read that restickify output, and the restickify must read
+        the padded buffer, so the zero rows K..K_padded-1 are what the matmul
+        accumulates over (issue #4208).
+        """
+        dtype = torch.float16
+        stick_size = get_elem_in_stick(dtype)
+        M, K, N = 64, 784, 512
+        assert K % stick_size != 0
+
+        x_cpu = torch.randn(M, K, dtype=dtype)
+        w_cpu = torch.randn(N, K, dtype=dtype)
+        x = x_cpu.to(device="spyre")
+        w = w_cpu.to(device="spyre")
+
+        def fn(x, w):
+            return x @ w.t()
+
+        ops, result = self.compile_and_run(fn, (x, w))
+        matmuls = self._matmul_ops(ops)
+        self.assertEqual(len(matmuls), 1)
+        mm = matmuls[0]
+        reduction = mm.data
+        assert isinstance(reduction, Reduction)
+        self.assertEqual(int(reduction.reduction_ranges[0]), K)
+
+        ops_before = self._ops_before(ops, mm)
+        padded = self._padded_buf_ops(ops_before)
+        self.assertEqual(len(padded), 1, "expected exactly one padded buffer")
+        padded_buf = padded[0]
+        self.assertEqual(
+            [int(s) for s in padded_buf.get_size()],
+            [N, K + stick_size - K % stick_size],
+            "y is padded along its K dim, in y's own [N, K] host order",
+        )
+
+        resticks = self._restickify_ops(ops_before)
+        self.assertEqual(len(resticks), 1, "expected one restickify of the padded y")
+        restick = resticks[0]
+        self.assertIn(
+            padded_buf.get_name(),
+            self.captured_read_names[restick.get_name()],
+            "the restickify must read the padded buffer, not the raw weight",
+        )
+        self.assertIn(
+            restick.get_name(),
+            self.captured_read_names[mm.get_name()],
+            "the matmul must read the restickify output",
+        )
+
+        torch.testing.assert_close(fn(x_cpu, w_cpu), result.cpu(), atol=0.5, rtol=0.05)
+
+    def test_linear_unaligned_in_features(self) -> None:
+        """``F.linear`` (bias included) compiles and is correct for unaligned
+        ``in_features`` -- e.g. ``nn.Linear(28 * 28, 512)`` (issue #4208)."""
+        dtype = torch.float16
+        M, K, N = 32, 28 * 28, 512
+        x_cpu = torch.randn(M, K, dtype=dtype)
+        w_cpu = torch.randn(N, K, dtype=dtype) * 0.05
+        b_cpu = torch.randn(N, dtype=dtype)
+        args = tuple(t.to(device="spyre") for t in (x_cpu, w_cpu, b_cpu))
+
+        def fn(x, w, b):
+            return torch.nn.functional.linear(x, w, b)
+
+        ops, result = self.compile_and_run(fn, args)
+        self.assertEqual(len(self._matmul_ops(ops)), 1)
+        self.assertEqual(len(self._padded_buf_ops(ops)), 1)
+        torch.testing.assert_close(
+            fn(x_cpu, w_cpu, b_cpu), result.cpu(), atol=0.5, rtol=0.05
+        )
+
+    def test_rebuilt_matmul_is_registered_in_graph(self) -> None:
+        """The matmul ``insert_bmm_padding`` rebuilds must be the object the graph
+        registry returns for its name.
+
+        Layout selection runs after padding and commits its choice through
+        ``V.graph.get_buffer(name)``; a stale registry entry would receive the
+        committed layout while the live op in ``operations`` got none.
+        """
+        dtype = torch.float16
+        x = torch.randn(55, 67, dtype=dtype).to(device="spyre")
+        w = torch.randn(67, 128, dtype=dtype).to(device="spyre")
+
+        ops = self.compile_and_capture(lambda x, w: x @ w, (x, w))
+        matmuls = self._matmul_ops(ops)
+        self.assertEqual(len(matmuls), 1)
+        mm = matmuls[0]
+        self.assertIs(self.captured_name_to_buffer[mm.get_name()], mm)
+        for op in ops:
+            if isinstance(op, ComputedBuffer):
+                self.assertIs(self.captured_name_to_buffer[op.get_name()], op)
 
 
 if __name__ == "__main__":

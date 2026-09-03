@@ -2142,11 +2142,44 @@ def replace_computed_buffer_body(
     preserve_provenance(op, new_buf, pass_name=pass_name, reason=reason)
     copy_op_metadata(op, new_buf)
     ComputedBuffer.get_default_sizes_body.clear_cache(new_buf)
+    _invalidate_body_caches(new_data)
 
     op_idx = operations.index(op)
     operations[op_idx] = new_buf
+    _register_replacement(op, new_buf)
     _repoint_mutation_targets(operations, op, new_buf)
     return new_buf
+
+
+def _invalidate_body_caches(data: Loops) -> None:
+    """Drop caches on ``data`` that were computed from its previous ``inner_fn``.
+
+    ``Loops.inner_fn_opcount`` (behind ``get_read_names`` / ``num_reads``) is
+    cached on the data object, so after ``inner_fn`` is swapped it would keep
+    reporting the buffers the *old* body read.  ``Loops`` is a frozen
+    dataclass, so Inductor's own ``clear_cache`` (a plain ``delattr``) cannot
+    remove the entry; mirror how ``cache_on_self`` stores it instead.
+    """
+    key = "__inner_fn_opcount_cache"
+    if hasattr(data, key):
+        object.__delattr__(data, key)
+
+
+def _register_replacement(old: ComputedBuffer, new: ComputedBuffer) -> None:
+    """Point the graph's name registries at ``new`` wherever they held ``old``.
+
+    Passes that look an op up by name (``V.graph.get_buffer`` in the layout
+    optimizer's commit step, ``name_to_op`` in scheduling) must see the object
+    that lives in ``operations``; otherwise attributes they set (such as
+    ``committed_stl``) land on the discarded instance.
+    """
+    graph = V.graph
+    graph.name_to_buffer[new.get_name()] = new
+    name_to_op = getattr(graph, "name_to_op", None)
+    if name_to_op is not None:
+        op_name = new.get_operation_name()
+        if name_to_op.get(op_name) is old:
+            name_to_op[op_name] = new
 
 
 class NameSwapHandler(WrapperHandler):
@@ -2199,6 +2232,7 @@ def redirect_computed_buffer_reads(
             return _orig_inner(*args)
 
     object.__setattr__(op.data, "inner_fn", new_inner_fn)
+    _invalidate_body_caches(op.data)
 
     # Reconstruct ComputedBuffer as a fresh object so the instance-keyed cache
     # on get_default_sizes_body can be cleanly invalidated below.
@@ -2217,13 +2251,35 @@ def redirect_computed_buffer_reads(
 
     op_idx = operations.index(op)
     operations[op_idx] = new_buf
-    V.graph.name_to_buffer[new_buf.get_name()] = new_buf
+    _register_replacement(op, new_buf)
     _repoint_mutation_targets(operations, op, new_buf)
 
     # Invalidate the sizes/body cache so it is recomputed on next access with
     # the patched inner_fn.
     ComputedBuffer.get_default_sizes_body.clear_cache(new_buf)
     return new_buf
+
+
+def _fx_node_shape_and_stride(fx_node: torch.fx.Node) -> tuple[list[int], list[int]]:
+    """Return the host shape and stride of the buffer ``fx_node`` lowers to.
+
+    Prefers ``meta["val"]`` (set on every node Dynamo traced).  Nodes a compiler
+    pass synthesised (e.g. ``spyre.restickify``) may carry no ``meta["val"]``,
+    so fall back to the lowered ``TensorBox`` recorded in ``V.graph.env``.
+    """
+    val = fx_node.meta.get("val")
+    if val is not None:
+        return list(val.shape), list(val.stride())
+    tb = V.graph.env.get(fx_node)
+    if tb is None:
+        raise RuntimeError(
+            f"lower_pad_sequence: FX node {fx_node.name!r} has no meta['val'] "
+            "and no lowered TensorBox in V.graph.env"
+        )
+    return (
+        [concretize_expr(s) for s in tb.get_size()],
+        [concretize_expr(s) for s in tb.get_stride()],
+    )
 
 
 def lower_pad_sequence(
@@ -2233,7 +2289,7 @@ def lower_pad_sequence(
     dtype: torch.dtype,
     dim: int,
     insert_before: torch.fx.Node,
-    orig_stl: SpyreTensorLayout,
+    orig_stl: SpyreTensorLayout | None = None,
     fill_value: float = 0.0,
     arg_buf: Optional[Buffer] = None,
 ) -> tuple[Buffer, list[Operation]]:
@@ -2253,10 +2309,13 @@ def lower_pad_sequence(
     is filled with stick-aligned offsets. This is required because the dim is
     ensured to be a stick dimension here.
 
-    ``orig_stl`` is the ``SpyreTensorLayout`` of the unpadded buffer and is used
-    to derive the padded buffer's device layout, preserving the within-stick host
-    dimension.  Raises ``RuntimeError`` if the within-stick dimension cannot be
-    determined from ``orig_stl``.
+    ``orig_stl`` is the ``SpyreTensorLayout`` of the unpadded buffer.  When given
+    (post-stickification callers), it is used to derive the padded buffer's device
+    layout, preserving the within-stick host dimension; ``RuntimeError`` is raised
+    if that dimension cannot be determined.  When ``None`` (pre-stickification
+    callers such as ``insert_bmm_padding``), the new ops keep their host
+    ``FixedLayout`` and ``propagate_spyre_tensor_layouts`` assigns device layouts
+    later, exactly as for a user-written ``F.pad``.
 
     ``arg_fx_node`` is None for a buffer with no FX-graph counterpart -- e.g. a
     coarse_tile read-copy (see coarse_tile.py's _insert_one_read_copy), which is
@@ -2288,8 +2347,7 @@ def lower_pad_sequence(
     ops_before = len(graph_lowering.operations)
 
     if arg_fx_node is not None:
-        original_shape = list(arg_fx_node.meta["val"].shape)
-        original_stride = list(arg_fx_node.meta["val"].stride())
+        original_shape, original_stride = _fx_node_shape_and_stride(arg_fx_node)
     else:
         assert arg_buf is not None
         original_shape = [concretize_expr(s) for s in arg_buf.get_size()]
@@ -2341,78 +2399,15 @@ def lower_pad_sequence(
     # computation looks the way it does (phantom dims, within-stick dim
     # recovery, non-row-major source buffers).
 
-    # Step 1 — strip phantom batch dims to get the core host shape.
-    orig_host_ndim = len(list(orig_stl.stride_map)) - 1
-    n_phantom = len(padded_size) - orig_host_ndim
-    padded_core = padded_size[n_phantom:]
-
-    # Step 2 — identify the within-stick host dim (in core-shape space).
-    #
-    # Prefer coordinate-identity recovery (_stick_host_dim, same mechanism
-    # coarse_tile.py's other _resize_device_layout call sites use): the source
-    # buffer's own write-dep unambiguously names its stick host dim, even when
-    # two host dims share a size.  This works whenever the source buffer is a
-    # ComputedBuffer with its own write-dep -- true both for graph inputs read
-    # through an earlier op's output and for coarse-tile read-copy buffers,
-    # which is exactly the case that has no FX node at all.
-    #
-    # Fall back to matching orig_stl.stride_map[-1] (the within-stick element
-    # stride, always 1 for contiguous layouts) against the source buffer's own
-    # host strides -- e.g. for a graph-input Buffer with no write-dep to walk.
-    if arg_buf is not None:
-        source_buf = arg_buf
+    # Step 1 — strip phantom batch dims to get the core host shape.  Without an
+    # orig_stl (pre-stickification callers) padded_size is the buffer's own
+    # rank, so there is nothing to strip.
+    if orig_stl is not None:
+        orig_host_ndim = len(list(orig_stl.stride_map)) - 1
+        n_phantom = len(padded_size) - orig_host_ndim
     else:
-        assert arg_fx_node is not None
-        # arg_fx_node.name is the FX node's own identifier, not necessarily
-        # the lowered buffer's name (see _find_arg_fx_node's docstring: a
-        # single buffer can be reached through multiple FX nodes presenting
-        # it at different sizes, e.g. mm_to_bmm_pass's unsqueeze/reshape, or
-        # conv2d's im2col unfold node).  Recover the buffer via the node's
-        # own TensorBox in graph_lowering.env instead of re-deriving a name.
-        arg_tb = graph_lowering.env[arg_fx_node]
-        assert isinstance(arg_tb, TensorBox)
-        source_buf = arg_tb.data.data
-    # Both recovery mechanisms below resolve an index in "view space" (source_
-    # buf's own raw dims, i.e. original_shape's space, which may include
-    # phantom leading dims) -- translate to core space once at the end by
-    # subtracting n_phantom, mirroring Step 1's stripping of padded_size.
-    within_stick_dim_view: Optional[int] = None
-    if isinstance(source_buf, ComputedBuffer):
-        from .wsr.coarse_tile import _stick_host_dim
-
-        within_stick_dim_view = _stick_host_dim(source_buf, orig_stl)
-
-    if within_stick_dim_view is None:
-        sm_last = int(list(orig_stl.stride_map)[-1])
-        orig_host_stride = original_stride
-        within_stick_dim_view = next(
-            (i for i, s in enumerate(orig_host_stride) if int(s) == sm_last), None
-        )
-        if within_stick_dim_view is None:
-            if arg_fx_node is not None:
-                buf_name = arg_fx_node.name
-            else:
-                assert arg_buf is not None
-                buf_name = arg_buf.get_name()
-            raise RuntimeError(
-                f"lower_pad_sequence: cannot determine within-stick host "
-                f"dimension for buffer {buf_name!r}: neither coordinate "
-                f"identity nor orig_stl.stride_map[-1]={sm_last} (in view "
-                f"strides {orig_host_stride}) resolved it.  "
-                f"orig_stl={list(orig_stl.device_size)} "
-                f"stride_map={list(orig_stl.stride_map)}, padded_size={padded_size}"
-            )
-
-    # Translate the within-stick dim index from view space to core space
-    # (subtract the number of phantom dims stripped in Step 1).
-    within_stick_dim_core = within_stick_dim_view - n_phantom
-
-    # Step 4 — build dim_order for SpyreTensorLayout: all non-stick dims in their
-    # natural order, followed by the within-stick dim last.  This tells the STL
-    # constructor which host dim maps to the innermost device (within-stick) axis.
-    dim_order_core = [
-        i for i in range(len(padded_core)) if i != within_stick_dim_core
-    ] + [within_stick_dim_core]
+        n_phantom = 0
+    padded_core = padded_size[n_phantom:]
 
     # Step 5 — compute strides for the padded core shape, preserving the
     # *relative* dim ordering (fastest- to slowest-varying) of the source
@@ -2436,7 +2431,80 @@ def lower_pad_sequence(
         core_stride[i] = running
         running *= padded_core[i]
 
-    padded_stl = SpyreTensorLayout(padded_core, core_stride, dtype, dim_order_core)
+    # The device layout can only be derived when the caller knows the
+    # unpadded buffer's STL; pre-stickification callers leave it to
+    # propagate_spyre_tensor_layouts.
+    padded_stl: Optional[SpyreTensorLayout] = None
+    if orig_stl is not None:
+        # Step 2 — identify the within-stick host dim (in core-shape space).
+        #
+        # Prefer coordinate-identity recovery (_stick_host_dim, same mechanism
+        # coarse_tile.py's other _resize_device_layout call sites use): the source
+        # buffer's own write-dep unambiguously names its stick host dim, even when
+        # two host dims share a size.  This works whenever the source buffer is a
+        # ComputedBuffer with its own write-dep -- true both for graph inputs read
+        # through an earlier op's output and for coarse-tile read-copy buffers,
+        # which is exactly the case that has no FX node at all.
+        #
+        # Fall back to matching orig_stl.stride_map[-1] (the within-stick element
+        # stride, always 1 for contiguous layouts) against the source buffer's own
+        # host strides -- e.g. for a graph-input Buffer with no write-dep to walk.
+        if arg_buf is not None:
+            source_buf = arg_buf
+        else:
+            assert arg_fx_node is not None
+            # arg_fx_node.name is the FX node's own identifier, not necessarily
+            # the lowered buffer's name (see _find_arg_fx_node's docstring: a
+            # single buffer can be reached through multiple FX nodes presenting
+            # it at different sizes, e.g. mm_to_bmm_pass's unsqueeze/reshape, or
+            # conv2d's im2col unfold node).  Recover the buffer via the node's
+            # own TensorBox in graph_lowering.env instead of re-deriving a name.
+            arg_tb = graph_lowering.env[arg_fx_node]
+            assert isinstance(arg_tb, TensorBox)
+            source_buf = arg_tb.data.data
+        # Both recovery mechanisms below resolve an index in "view space" (source_
+        # buf's own raw dims, i.e. original_shape's space, which may include
+        # phantom leading dims) -- translate to core space once at the end by
+        # subtracting n_phantom, mirroring Step 1's stripping of padded_size.
+        within_stick_dim_view: Optional[int] = None
+        if isinstance(source_buf, ComputedBuffer):
+            from .wsr.coarse_tile import _stick_host_dim
+
+            within_stick_dim_view = _stick_host_dim(source_buf, orig_stl)
+
+        if within_stick_dim_view is None:
+            sm_last = int(list(orig_stl.stride_map)[-1])
+            orig_host_stride = original_stride
+            within_stick_dim_view = next(
+                (i for i, s in enumerate(orig_host_stride) if int(s) == sm_last), None
+            )
+            if within_stick_dim_view is None:
+                if arg_fx_node is not None:
+                    buf_name = arg_fx_node.name
+                else:
+                    assert arg_buf is not None
+                    buf_name = arg_buf.get_name()
+                raise RuntimeError(
+                    f"lower_pad_sequence: cannot determine within-stick host "
+                    f"dimension for buffer {buf_name!r}: neither coordinate "
+                    f"identity nor orig_stl.stride_map[-1]={sm_last} (in view "
+                    f"strides {orig_host_stride}) resolved it.  "
+                    f"orig_stl={list(orig_stl.device_size)} "
+                    f"stride_map={list(orig_stl.stride_map)}, padded_size={padded_size}"
+                )
+
+        # Translate the within-stick dim index from view space to core space
+        # (subtract the number of phantom dims stripped in Step 1).
+        within_stick_dim_core = within_stick_dim_view - n_phantom
+
+        # Step 4 — build dim_order for SpyreTensorLayout: all non-stick dims in their
+        # natural order, followed by the within-stick dim last.  This tells the STL
+        # constructor which host dim maps to the innermost device (within-stick) axis.
+        dim_order_core = [
+            i for i in range(len(padded_core)) if i != within_stick_dim_core
+        ] + [within_stick_dim_core]
+
+        padded_stl = SpyreTensorLayout(padded_core, core_stride, dtype, dim_order_core)
 
     # Phantom leading batch dims (size 1) never contribute to addressing, so
     # any stride value works for them; use row-major defaults for these
@@ -2500,6 +2568,10 @@ def lower_pad_sequence(
 
     assert new_ops[0] == padded_buf
 
+    # LX planning (scratchpad.py) accesses op.origin_node directly on the
+    # ComputedBuffer, so we set it here explicitly.
+    object.__setattr__(padded_buf, "origin_node", pad_fx)
+
     # Verify structure: constant_pad_nd lowers to 4 operations
     #   op0: ComputedBuffer - output buffer allocation (FixedLayout)
     #   op1: SpyreConstantFallback - fill constant (FixedLayout)
@@ -2517,6 +2589,14 @@ def lower_pad_sequence(
         and isinstance(new_ops[3].get_layout(), MutationLayoutSHOULDREMOVE)
     )
 
+    if orig_stl is None:
+        # Pre-stickification: leave host FixedLayouts in place for
+        # propagate_spyre_tensor_layouts to convert.  The padded buffer's host
+        # stride already preserves the source's dim order (computed above), so
+        # propagation sees the same contiguity the unpadded buffer had.
+        return padded_buf, new_ops
+
+    assert padded_stl is not None
     # --- Attach the device layout (SpyreTensorLayout) to the padded buffer. ---
     #
     # padded_stl/padded_stride were already computed above (before the
@@ -2533,10 +2613,6 @@ def lower_pad_sequence(
         padded_stride,
         padded_stl,
     )
-
-    # LX planning (scratchpad.py) accesses op.origin_node directly on the ComputedBuffer,
-    # so we set it here explicitly.
-    object.__setattr__(padded_buf, "origin_node", pad_fx)
 
     # propagate_spyre_tensor_layouts already ran before this pass, so any op
     # lowered here keeps FlexibleLayout unless we assign a FixedTiledLayout
