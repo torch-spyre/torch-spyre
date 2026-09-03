@@ -984,7 +984,7 @@ def stagger_to_standard_ea(x: torch.Tensor) -> torch.Tensor:
     # Each fp16 stick (64 elements) staggers independently with half=32.
     FP16_STICK = 64
     half = FP16_STICK // 2  # 32 — fixed, independent of n
-    P = torch.zeros(n, n, dtype=torch.float16, device="cpu")
+    P = torch.zeros(n, n, dtype=x.dtype, device="cpu")
     for phys_j in range(n):
         stick_base = (phys_j // FP16_STICK) * FP16_STICK
         local_phys = phys_j % FP16_STICK

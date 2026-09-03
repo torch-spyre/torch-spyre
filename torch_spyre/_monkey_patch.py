@@ -23,6 +23,69 @@ if TYPE_CHECKING:
     from torch_spyre._C import SpyreTensorLayout
 
 
+def _add_ea(src_tensor, res_tensor) -> None:
+    """Update ElementArrangement (EA) tag on output SpyreTensorLayout
+
+    For to_dtype op in eager mode.
+    """
+    if res_tensor.dtype == src_tensor.dtype:
+        return
+
+    import torch
+    from torch_spyre._inductor.dtype_ops import DtypeOpTable
+    from torch_spyre._inductor.constants import STAGGERED_EAS
+    from torch_spyre._inductor.pass_utils import rescale_stl_for_dtype
+
+    # Skip FakeTensor tracing contexts during torch.compile
+    if (
+        torch.compiler.is_compiling()
+        or isinstance(src_tensor, torch._subclasses.FakeTensor)
+        or isinstance(res_tensor, torch._subclasses.FakeTensor)
+    ):
+        return
+
+    from torch_spyre._C import (
+        ElementArrangement,
+        get_spyre_tensor_layout,
+        set_spyre_tensor_layout,
+    )
+
+    # TODO EA torch.bool as it can be fp16 or fp32
+
+    try:
+        src_layout = get_spyre_tensor_layout(src_tensor)
+    except RuntimeError:
+        return
+
+    if src_layout is None:
+        return
+
+    input_ea = src_layout.element_arrangement
+    fmt = DtypeOpTable.ea_map(src_tensor.dtype, res_tensor.dtype, input_ea)
+
+    # FP32 -> FP16 runtime type conversion is not yet supported.
+    if (
+        src_tensor.dtype == torch.float32
+        and res_tensor.dtype in DtypeOpTable.fp16_types()
+    ):
+        fmt = ElementArrangement.STANDARD
+
+    try:
+        res_layout = get_spyre_tensor_layout(res_tensor)
+    except RuntimeError:
+        return
+
+    if res_layout is None:
+        return
+
+    stl = res_layout.with_element_arrangement(fmt)
+    is_staggered_ea = fmt in STAGGERED_EAS or input_ea in STAGGERED_EAS
+    if src_tensor.dtype != torch.float32 and is_staggered_ea:
+        stl = rescale_stl_for_dtype(src_layout, res_tensor.dtype, fmt)
+
+    set_spyre_tensor_layout(res_tensor, stl)
+
+
 def _patch_tensor_for_spyre():
     import torch
 
@@ -82,14 +145,20 @@ def _patch_tensor_for_spyre():
             ):
                 _device = args[0]
             _dtype = kwargs.get("dtype", None)
-            if _dtype is None and len(args) > 1 and isinstance(args[1], torch.dtype):
-                _dtype = args[1]
+            if _dtype is None:
+                if len(args) > 0 and isinstance(args[0], torch.dtype):
+                    _dtype = args[0]
+                elif len(args) > 1 and isinstance(args[1], torch.dtype):
+                    _dtype = args[1]
+
+            target_device_type = (
+                torch.device(_device).type if _device is not None else None
+            )
 
             if (
-                _device is not None
+                target_device_type == DEVICE_NAME
                 and _dtype is not None
                 and self.device.type == DEVICE_NAME
-                and torch.device(_device).type == DEVICE_NAME
             ):
                 import warnings
 
@@ -102,7 +171,12 @@ def _patch_tensor_for_spyre():
                 tmp = orig_to(self, "cpu")
                 # Step 2: cast dtype via H2D
                 return orig_to(tmp, _device, dtype=_dtype)
-            return orig_to(self, *args, **kwargs)
+
+            res = orig_to(self, *args, **kwargs)
+            if res.device.type == DEVICE_NAME:
+                _add_ea(self, res)
+
+            return res
         else:
             # Check if copy kwarg is explicitly set
             copy = kwargs.get("copy")

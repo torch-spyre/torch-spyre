@@ -55,6 +55,7 @@ from .dtype_ops import (
     bool_equivalent_dtype,
     bool_layout_dtype,
     resolve_output_formats,
+    DtypeOpTable,
 )
 from .errors import Unsupported
 from .constants import (
@@ -91,6 +92,7 @@ from .pass_utils import (
     is_stick_expr_offset_free,
     is_topk,
     iter_var_id,
+    rescale_stl_for_dtype,
 )
 from .optimize_restickify import AllSameNode, AnyInNode, FixedInOutNode
 from .views import compute_coordinates, matching_dim
@@ -311,52 +313,6 @@ def _check_supported_input_sticks(args: list[PropArg], op_label: str) -> None:
             )
 
 
-def _rescale_stl_for_dtype(
-    stl: SpyreTensorLayout,
-    out_dtype: torch.dtype,
-    ea: ElementArrangement,
-) -> SpyreTensorLayout:
-    """Propagate a device layout across a same-shape, differing-stick-depth dtype conversion.
-
-    Copies the input STL's ``device_size``/``stride_map`` and rescales the stick
-    depth (the last device dim) plus, when present, the one non-stick dim whose
-    stride equals the input stick depth. This preserves any non-canonical layout
-    or padding present in the input STL instead of reconstructing a dense layout
-    from the logical size/stride.
-
-    The input elements-per-stick is read from ``stl.device_size[-1]`` (the stick
-    dimension is always full, so it equals ``get_elem_in_stick(in_dtype)``); the
-    output count comes from ``out_dtype``.
-
-    Args:
-        stl: Input device layout to rescale.
-        out_dtype: Torch dtype of the conversion output.
-        ea: ElementArrangement to stamp on the returned layout.
-    """
-    in_eps = stl.device_size[-1]
-    out_eps = get_elem_in_stick(out_dtype)
-    out_device_size = list(stl.device_size)
-    out_stride_map = list(stl.stride_map)
-    out_device_size[-1] = out_eps
-    # Rescale the first non-stick dim that indexes whole sticks (stride == the
-    # input stick depth) by the stick-depth ratio. A staggered/sparse layout
-    # (e.g. the DL16_TO_FP32 restoration operand, whose stride_map carries
-    # sentinel -1 entries rather than a linear num-sticks stride) has no such
-    # dim; there only the stick depth changes, so a no-match is expected and
-    # left as-is.
-    for i, s in enumerate(stl.stride_map):
-        if s == in_eps:
-            out_device_size[i] = stl.device_size[i] * in_eps // out_eps
-            out_stride_map[i] = out_eps
-            break
-    return SpyreTensorLayout(
-        out_device_size,
-        out_stride_map,
-        get_device_dtype(out_dtype),
-        ea,
-    )
-
-
 def _qfp8wt_stl(
     output: FixedLayout,
     in_layout: FixedLayout,
@@ -505,40 +461,7 @@ def _single_arg_op_layout(
 
             input_ea = stl.element_arrangement
 
-            # Determine output EA based on conversion direction and input EA
-            if (
-                in_layout.dtype in (torch.float16, torch.bfloat16)
-                and output.dtype == torch.float32
-            ):
-                # FP16/BF16 → FP32 conversion. Both share SEN169_FP16 physical
-                # storage and the DL16TOFP32 hardware op.
-                if input_ea == ElementArrangement.STANDARD:
-                    # Case 1: STANDARD → DL16_TO_FP32 (creates staggered layout)
-                    fmt = ElementArrangement.DL16_TO_FP32
-                elif input_ea == ElementArrangement.FP32_TO_DL16:
-                    # Case 2: FP32_TO_DL16 → STANDARD (restoration)
-                    fmt = ElementArrangement.STANDARD
-                else:
-                    # Unexpected input EA for FP16→FP32
-                    raise Unsupported(
-                        f"FP16→FP32 conversion with unsupported input EA: {input_ea}"
-                    )
-            elif in_layout.dtype == torch.float32 and output.dtype == torch.float16:
-                # FP32 → FP16 conversion
-                if input_ea == ElementArrangement.STANDARD:
-                    # Case 3: STANDARD → FP32_TO_DL16 (creates staggered layout)
-                    fmt = ElementArrangement.FP32_TO_DL16
-                elif input_ea == ElementArrangement.DL16_TO_FP32:
-                    # Case 4: DL16_TO_FP32 → STANDARD (restoration)
-                    fmt = ElementArrangement.STANDARD
-                else:
-                    # Unexpected input EA for FP32→FP16
-                    raise Unsupported(
-                        f"FP32→FP16 conversion with unsupported input EA: {input_ea}"
-                    )
-            else:
-                # Other type conversions default to STANDARD
-                fmt = ElementArrangement.STANDARD
+            fmt = DtypeOpTable.ea_map(in_layout.dtype, output.dtype, input_ea)
 
             # Two strategies, chosen by whether a staggered EA is involved:
             #
@@ -546,18 +469,18 @@ def _single_arg_op_layout(
             #    restoration: STANDARD<->DL16_TO_FP32 / FP32_TO_DL16). The
             #    staggered element ordering only exists on the physical device
             #    layout, so we must propagate the input's device_size/stride_map
-            #    and rescale just the stick depth via _rescale_stl_for_dtype.
+            #    and rescale just the stick depth via rescale_stl_for_dtype.
             #    Reconstructing from the logical host size would lose it.
             #
             # 2. Plain conversions (e.g. fp8->fp16 after qfp8ch). Here the input
             #    device layout can be degenerate — qfp8ch rescales a size-1
             #    num-sticks dim to 0 (1*64//128), leaving a size-0 dim — and
-            #    _rescale_stl_for_dtype would faithfully propagate that garbage,
+            #    rescale_stl_for_dtype would faithfully propagate that garbage,
             #    changing the layout rank and downstream graph partitioning.
             #    Rebuild a clean dense layout from the output host size instead,
             #    as the general (non-EA) convert path does.
             if fmt in STAGGERED_EAS or input_ea in STAGGERED_EAS:
-                return [_rescale_stl_for_dtype(stl, output.dtype, fmt)]
+                return [rescale_stl_for_dtype(stl, output.dtype, fmt)]
 
             # Dense reconstruction from the output host size. When the input
             # stick dim is unaligned, force a full input-stick depth so stick
@@ -578,9 +501,7 @@ def _single_arg_op_layout(
             # fp16 (64 elems/stick) -> fp8 (128 elems/stick) quantization.
             # Propagate the input device layout and rescale for the dtype change,
             # preserving any padding present in the input STL.
-            return [
-                _rescale_stl_for_dtype(stl, output.dtype, ElementArrangement.QFP8CH)
-            ]
+            return [rescale_stl_for_dtype(stl, output.dtype, ElementArrangement.QFP8CH)]
 
         case spyreop.qfp8wt.default:
             # fp16 -> fp8 weight quantization with 2D-stick layout [2, 64].
