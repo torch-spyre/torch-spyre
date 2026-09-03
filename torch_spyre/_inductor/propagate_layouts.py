@@ -512,6 +512,10 @@ def _single_arg_op_layout(
                         if candidate not in layouts:
                             layouts.append(candidate)
 
+                # Under the current EA map, an already-staggered input is the
+                # reverse staggered-to-STANDARD restoration. It needs no
+                # expansion: preserve the stick selected before the upcast.
+
                 return layouts
 
             # Dense reconstruction from the output host size. When the input

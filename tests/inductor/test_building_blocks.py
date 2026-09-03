@@ -209,32 +209,33 @@ class TestBuildingBlocks(unittest.TestCase):
         # input before its fp16-to-fp32 upcast: the reduction result is STANDARD
         # and has to broadcast along the normalized axis against the staggered
         # upcast tensor.
-        B, S, H = 1, 64, 1536
+        B, S = 1, 64
         eps = 1e-6
-        for dtype in (torch.float16, torch.bfloat16):
-            with self.subTest(dtype=dtype):
-                hidden = torch.randn(B, S, H, dtype=dtype)
-                weight = torch.randn(H, dtype=dtype)
+        for H in (1536, 3840):
+            for dtype in (torch.float16, torch.bfloat16):
+                with self.subTest(hidden_size=H, dtype=dtype):
+                    hidden = torch.randn(B, S, H, dtype=dtype)
+                    weight = torch.randn(H, dtype=dtype)
 
-                def rms_norm(hidden, weight):
-                    x = hidden.to(torch.float32)
-                    var = x.pow(2).mean(-1, keepdim=True)
-                    normed = x * torch.rsqrt(var + eps)
-                    return weight * normed.to(dtype)
+                    def rms_norm(hidden, weight):
+                        x = hidden.to(torch.float32)
+                        var = x.pow(2).mean(-1, keepdim=True)
+                        normed = x * torch.rsqrt(var + eps)
+                        return weight * normed.to(dtype)
 
-                expected = rms_norm(hidden, weight)
-                hidden_layout = SpyreTensorLayout(
-                    hidden.size(), hidden.stride(), hidden.dtype, [0, 2, 1]
-                )
-                hidden_device = hidden.to(device_layout=hidden_layout)
-                weight_device = weight.to(DEVICE)
-                actual = torch.compile(rms_norm)(hidden_device, weight_device).cpu()
-                torch.testing.assert_close(
-                    actual,
-                    expected,
-                    atol=0.1,
-                    rtol=0.1,
-                )
+                    expected = rms_norm(hidden, weight)
+                    hidden_layout = SpyreTensorLayout(
+                        hidden.size(), hidden.stride(), hidden.dtype, [0, 2, 1]
+                    )
+                    hidden_device = hidden.to(device_layout=hidden_layout)
+                    weight_device = weight.to(DEVICE)
+                    actual = torch.compile(rms_norm)(hidden_device, weight_device).cpu()
+                    torch.testing.assert_close(
+                        actual,
+                        expected,
+                        atol=0.1,
+                        rtol=0.1,
+                    )
 
     def test_chained_rms_norm_fp32_upcast(self):
         B, S, H = 1, 64, 2816

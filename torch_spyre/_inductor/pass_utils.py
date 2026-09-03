@@ -2069,11 +2069,13 @@ def compute_restickify_needed(
     ):
         return False, None
 
-    # ReStickifyOpHBM currently supports only the native FP16 device format.
+    # ReStickifyOpHBM currently supports only the native FP16 device format
+    # (both logical float16 and bfloat16 map to SEN169_FP16).
     # Do not advertise an edge as feasible when codegen cannot lower it: this
     # is especially important for fp32-upcast graphs, where a later IEEE_FP32
     # restick can otherwise tie with and displace the valid FP16 restick before
-    # the conversion.
+    # the conversion. This also deliberately precedes the factorized-layout
+    # target below: a concrete target is not actionable for a non-DL16 input.
     if in_stl.device_dtype != DataFormats.SEN169_FP16:
         return True, None
 

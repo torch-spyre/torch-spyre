@@ -24,9 +24,10 @@ if TYPE_CHECKING:
 
 
 def _add_ea(src_tensor, res_tensor) -> None:
-    """Update ElementArrangement (EA) tag on output SpyreTensorLayout
+    """Update the EA tag after an eager transfer handled by ``orig_to``.
 
-    For to_dtype op in eager mode.
+    Same-device dtype-changing casts return through ``to_dtype_d2d`` before
+    this helper is reached; their EA is propagated by the compiled graph.
     """
     if res_tensor.dtype == src_tensor.dtype:
         return
@@ -45,7 +46,6 @@ def _add_ea(src_tensor, res_tensor) -> None:
         return
 
     from torch_spyre._C import (
-        ElementArrangement,
         get_spyre_tensor_layout,
         set_spyre_tensor_layout,
     )
@@ -62,13 +62,6 @@ def _add_ea(src_tensor, res_tensor) -> None:
 
     input_ea = src_layout.element_arrangement
     fmt = DtypeOpTable.ea_map(src_tensor.dtype, res_tensor.dtype, input_ea)
-
-    # FP32 -> FP16 runtime type conversion is not yet supported.
-    if (
-        src_tensor.dtype == torch.float32
-        and res_tensor.dtype in DtypeOpTable.fp16_types()
-    ):
-        fmt = ElementArrangement.STANDARD
 
     try:
         res_layout = get_spyre_tensor_layout(res_tensor)
@@ -148,9 +141,11 @@ def _patch_tensor_for_spyre():
                 return orig_to(self, *args, **kwargs)
 
             # Support D2H and H2D dtype casting via DCI (DataConversionInfo) in
-            # spyre_mem.cpp. Same-device casting is lowered through the existing
-            # compiled D2D copy, whose mutate_to lowering performs the conversion
-            # on device.
+            # spyre_mem.cpp. Same-device casting is routed through the standalone
+            # compiled to_dtype_d2d path, whose lowering converts on device.
+            # Unsupported conversion pairs are still accepted here: the compiled
+            # lowering checks DtypeOpTable and uses to_dtype_cpu, preserving the
+            # previous host-roundtrip fallback and warning.
             _device = kwargs.get("device", None)
             _dtype = kwargs.get("dtype", None)
             if args:
@@ -175,6 +170,8 @@ def _patch_tensor_for_spyre():
                 and _dtype is not None
                 and _dtype != self.dtype
             ):
+                # device_layout is necessarily None in this branch (guarded at
+                # function entry), so this dtype-only op drops no layout request.
                 return torch.ops.spyre.to_dtype_d2d(self, _dtype, self.storage_offset())
 
             res = orig_to(self, *args, **kwargs)

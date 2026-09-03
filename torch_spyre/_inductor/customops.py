@@ -350,7 +350,8 @@ def to_dtype_d2d(
     The explicit offset is required for the same reason as copy_from_d2d:
     Inductor otherwise drops a graph input view's storage offset. Returning the
     converted tensor (rather than mutating a preallocated destination) also lets
-    the compiled wrapper attach the conversion's staggered element arrangement.
+    ``propagate_layouts`` attach the conversion's staggered element arrangement
+    to the compiled graph's output layout.
     """
     with torch._dynamo.config.patch(specialize_int=True):
         return compiled(src, dtype, src_off)
