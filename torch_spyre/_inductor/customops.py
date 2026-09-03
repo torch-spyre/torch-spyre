@@ -337,6 +337,30 @@ def _(
     pass
 
 
+@torch.library.custom_op("spyre::to_dtype_d2d", mutates_args=(), device_types="spyre")
+@compile_once("spyre.to_dtype_d2d", dynamic=False)
+def to_dtype_d2d(
+    src: torch.Tensor,
+    dtype: torch.dtype,
+    src_off: int,
+    compiled,
+) -> torch.Tensor:
+    """Run an eager same-device dtype conversion as a compiled Spyre op.
+
+    The explicit offset is required for the same reason as copy_from_d2d:
+    Inductor otherwise drops a graph input view's storage offset. Returning the
+    converted tensor (rather than mutating a preallocated destination) also lets
+    the compiled wrapper attach the conversion's staggered element arrangement.
+    """
+    with torch._dynamo.config.patch(specialize_int=True):
+        return compiled(src, dtype, src_off)
+
+
+@to_dtype_d2d.register_fake
+def _(src: torch.Tensor, dtype: torch.dtype, src_off: int) -> torch.Tensor:
+    return torch.empty_like(src, dtype=dtype)
+
+
 # Copy src into dst, guaranteed to survive both Inductor's remove_noop_ops
 # pass (unlike aten.copy_, this op is not in noop_registry) and
 # AOTAutograd's dead-code elimination when dst is never read again in the

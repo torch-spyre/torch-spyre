@@ -442,9 +442,12 @@ def _single_arg_op_layout(
     origin_node = next(iter(data.origins))
     aten_op = origin_node.target
     match aten_op:
-        case prims.convert_element_type.default | aten.copy.default if (
-            output.dtype != torch.bool
-            and stl.elems_per_stick() != get_elem_in_stick(output.dtype)
+        case (
+            prims.convert_element_type.default
+            | aten.copy.default
+            | torch.ops.spyre.to_dtype_d2d.default
+        ) if output.dtype != torch.bool and stl.elems_per_stick() != get_elem_in_stick(
+            output.dtype
         ):
             # Type conversion may require padding when input has padding due to stick
             # alignment. For example, 4x16 FP16 has 48 elements of padding (64 total),
@@ -480,7 +483,35 @@ def _single_arg_op_layout(
             #    Rebuild a clean dense layout from the output host size instead,
             #    as the general (non-EA) convert path does.
             if fmt in STAGGERED_EAS or input_ea in STAGGERED_EAS:
-                return [rescale_stl_for_dtype(stl, output.dtype, fmt)]
+                layouts = [rescale_stl_for_dtype(stl, output.dtype, fmt)]
+
+                # A conversion that creates a staggered EA must also expose
+                # outputs reachable by restickifying its STANDARD input first.
+                # Otherwise the conversion permanently inherits the input's
+                # stick and a downstream reduction-broadcast join has no way to
+                # request the normalized dimension as the stick. Gemma 4 hits
+                # this when an embedding output enters RMSNorm with its sequence
+                # dimension on the stick.
+                if fmt in STAGGERED_EAS and input_ea == ElementArrangement.STANDARD:
+                    in_coords = host_coordinates(in_layout, dep, None)
+                    source_device_coords = device_coordinates(stl, dep, None)
+                    for target_stick_expr in in_coords:
+                        if not target_stick_expr.free_symbols:
+                            continue
+                        target_stl = compute_restickify_target_layout(
+                            stl,
+                            in_layout,
+                            target_stick_expr,
+                            in_coords,
+                            source_device_coords,
+                        )
+                        if target_stl is None:
+                            continue
+                        candidate = rescale_stl_for_dtype(target_stl, output.dtype, fmt)
+                        if candidate not in layouts:
+                            layouts.append(candidate)
+
+                return layouts
 
             # Dense reconstruction from the output host size. When the input
             # stick dim is unaligned, force a full input-stick depth so stick

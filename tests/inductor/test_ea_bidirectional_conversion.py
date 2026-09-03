@@ -128,10 +128,7 @@ def test_fp32_to_fp16_standard_input(device, mode, fp16):
     result = _run(fn, x, mode=mode)
 
     # Verify output EA
-    expected_ea = ElementArrangement.STANDARD
-    if mode == "compile":
-        expected_ea = ElementArrangement.FP32_TO_DL16
-    assert_ea(result, expected_ea)
+    assert_ea(result, ElementArrangement.FP32_TO_DL16)
 
     # Note: Cannot compare tensors with non-STANDARD EA directly with CPU
     # The result has FP32_TO_DL16 EA which differs from CPU's STANDARD EA
@@ -359,12 +356,17 @@ EAGER_TO_TEST_CASES, EAGER_TO_TEST_IDS = _build_eager_ea_tests()
 )
 def test_eager_ea(src_dev, dst_dev, fp16, eager_to):
     """Verify eager mode EA across device transfer combinations."""
+    same_spyre_device = src_dev == dst_dev == DEVICE_NAME
+
     # FP16 -> FP32 casting flow
     x16 = torch.randn(4, 128, device=src_dev, dtype=fp16)
     assert_ea(x16, ea_of(src_dev))
 
     y32 = eager_to(x16, dst_dev, torch.float32)
-    assert_ea(y32, ea_of(dst_dev))
+    assert_ea(
+        y32,
+        ElementArrangement.DL16_TO_FP32 if same_spyre_device else ea_of(dst_dev),
+    )
 
     z16 = eager_to(y32, src_dev, fp16)
     assert_ea(z16, ea_of(src_dev))
@@ -374,7 +376,10 @@ def test_eager_ea(src_dev, dst_dev, fp16, eager_to):
     assert_ea(x32, ea_of(src_dev))
 
     y16 = eager_to(x32, dst_dev, fp16)
-    assert_ea(y16, ea_of(dst_dev))
+    assert_ea(
+        y16,
+        ElementArrangement.FP32_TO_DL16 if same_spyre_device else ea_of(dst_dev),
+    )
 
     z32 = eager_to(y16, src_dev, torch.float32)
     assert_ea(z32, ea_of(src_dev))

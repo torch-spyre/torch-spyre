@@ -16,12 +16,14 @@ import dataclasses
 import math
 import unittest
 from unittest import mock
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 import torch_spyre._inductor.wsr.propagate_named_dims as _pnd
 from torch._inductor.utils import run_and_get_code
+from torch_spyre._C import SpyreTensorLayout
 from torch_spyre._inductor import spyre_hint  # noqa: F401
 from torch_spyre._inductor import config
 
@@ -200,6 +202,39 @@ class TestBuildingBlocks(unittest.TestCase):
             cpu_compile=False,
             run_eager=False,
         )
+
+    def test_rms_norm_fp32_upcast_non_normalized_input_stick(self):
+        # Gemma 4's embedding output can enter a compiled decoder block with
+        # the sequence dimension as its device stick. RMSNorm must restick the
+        # input before its fp16-to-fp32 upcast: the reduction result is STANDARD
+        # and has to broadcast along the normalized axis against the staggered
+        # upcast tensor.
+        B, S, H = 1, 64, 1536
+        eps = 1e-6
+        for dtype in (torch.float16, torch.bfloat16):
+            with self.subTest(dtype=dtype):
+                hidden = torch.randn(B, S, H, dtype=dtype)
+                weight = torch.randn(H, dtype=dtype)
+
+                def rms_norm(hidden, weight):
+                    x = hidden.to(torch.float32)
+                    var = x.pow(2).mean(-1, keepdim=True)
+                    normed = x * torch.rsqrt(var + eps)
+                    return weight * normed.to(dtype)
+
+                expected = rms_norm(hidden, weight)
+                hidden_layout = SpyreTensorLayout(
+                    hidden.size(), hidden.stride(), hidden.dtype, [0, 2, 1]
+                )
+                hidden_device = hidden.to(device_layout=hidden_layout)
+                weight_device = weight.to(DEVICE)
+                actual = torch.compile(rms_norm)(hidden_device, weight_device).cpu()
+                torch.testing.assert_close(
+                    actual,
+                    expected,
+                    atol=0.1,
+                    rtol=0.1,
+                )
 
     def test_chained_rms_norm_fp32_upcast(self):
         B, S, H = 1, 64, 2816

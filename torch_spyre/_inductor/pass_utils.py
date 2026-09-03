@@ -42,10 +42,11 @@ from torch._inductor.dependencies import MemoryDep, ReadWrites, StarDep, is_indi
 from torch._inductor.virtualized import V
 from torch.utils._ordered_set import OrderedSet
 from torch_spyre._C import (
-    SpyreTensorLayout,
+    DataFormats,
     ElementArrangement,
-    get_elem_in_stick,
+    SpyreTensorLayout,
     get_device_dtype,
+    get_elem_in_stick,
 )
 from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.op_spec import IndirectAccess, TensorWorkDivision
@@ -2047,7 +2048,23 @@ def compute_restickify_needed(
         c for c in idc[:-1] if bool(c.free_symbols & stick_syms)
     ]
     is_factorized = bool(stick_syms) and len(outer_axes_with_stick_var) > 1
-    if is_factorized and in_stl != out_stl:
+    factorized_layout_mismatch = is_factorized and in_stl != out_stl
+    if (
+        not factorized_layout_mismatch
+        and in_stick_offset_free
+        and stick_compatible([idc, out_idc])
+    ):
+        return False, None
+
+    # ReStickifyOpHBM currently supports only the native FP16 device format.
+    # Do not advertise an edge as feasible when codegen cannot lower it: this
+    # is especially important for fp32-upcast graphs, where a later IEEE_FP32
+    # restick can otherwise tie with and displace the valid FP16 restick before
+    # the conversion.
+    if in_stl.device_dtype != DataFormats.SEN169_FP16:
+        return True, None
+
+    if factorized_layout_mismatch:
         # The input layout places the contraction variable on outer axes AND the
         # stick (factorized layout). The backend would see two contraction dims
         # even though the var is on the stick — stick_compatible would incorrectly
@@ -2057,8 +2074,6 @@ def compute_restickify_needed(
         # queries this function with that canonical result.
         assert in_stl.element_arrangement == ElementArrangement.STANDARD
         return True, out_stl
-    if in_stick_offset_free and stick_compatible([idc, out_idc]):
-        return False, None
     ic = host_coordinates(in_host, in_dep, ind_sizes)
     target_stick = out_idc[-1]
 
