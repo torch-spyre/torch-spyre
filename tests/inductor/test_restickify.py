@@ -578,6 +578,19 @@ def test_matmul_unit_n_2d_reduce():
     _compare(lambda x, y: x @ y.sum(dim=-1, keepdim=True), x, y)
 
 
+def test_bmm_unit_m():
+    """M=1 matmul: x is a 2D matmul output consumed as x[:1] by a second linear."""
+    a = torch.randn((128, 256), dtype=torch.float16) * 0.1
+    w1 = torch.randn((256, 256), dtype=torch.float16) * 0.1
+    w2 = torch.randn((128, 256), dtype=torch.float16) * 0.1
+
+    def fn(a, w1, w2):
+        x = a @ w1
+        return torch.nn.functional.linear(x[:1], w2)
+
+    _compare(fn, a, w1, w2)
+
+
 def test_bmm_unit_n():
     """Batched matmul with N=1 output dimension (decode-style query matmul).
 

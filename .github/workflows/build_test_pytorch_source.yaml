@@ -228,15 +228,113 @@ jobs:
   # watching/JUnit-XML reporting) against the wheel `build` just packaged.
   # Shared with upstream_tests_beta.yaml so the suite list has a single
   # source of truth.
+  #
+  # Dispatched via a step (github-script + createWorkflowDispatch, mirroring
+  # trigger_other_repos-style dispatch) rather than a job-level `uses:`, so
+  # this job can wrap the dispatch with CRCR in_progress/completed callback
+  # steps -- the CRCR check-run is scoped per-job, so both callbacks have to
+  # originate from the same job as each other (see build's commented-out
+  # in_progress step, moved out of that job for the same reason).
   # ---------------------------------------------------------------------------
   test:
+    name: Run upstream-beta test matrix
     needs: build
-    uses: ./.github/workflows/_upstream_tests_beta_matrix.yaml
-    with:
-      artifact_name: torch-spyre-wheel-${{ inputs.pytorch_sha }}
-      pytorch_sha: ${{ inputs.pytorch_sha }}
-      pytorch_wheel_artifact_name: pytorch-wheel-${{ inputs.pytorch_sha }}
-      mode: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    outputs:
+      run_id: ${{ steps.dispatch.outputs.run_id }}
+    steps:
+      - name: Report CI started to pytorch/pytorch
+        # Only repository_dispatch (real PR-triggered CI) needs an
+        # in_progress ping -- pytorch/pytorch's CRCR only watches those
+        # runs live. Nightly (schedule) doesn't need one, and
+        # workflow_dispatch (manual/ad-hoc) is never relayed at all.
+        if: github.event_name == 'repository_dispatch'
+        continue-on-error: true
+        uses: pytorch/test-infra/.github/actions/cross-repo-ci-relay-callback@main
+        with:
+          status: in_progress
+          job-name: linux-x86_64 / pytorch / test
+
+      - name: Dispatch and wait for upstream-beta test matrix
+        id: dispatch
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        env:
+          PYTORCH_SHA: ${{ inputs.pytorch_sha }}
+        with:
+          script: |
+            const workflowFile = '_upstream_tests_beta_matrix.yaml';
+            const correlationId = `${context.runId}-${context.runNumber}-${Date.now()}`;
+            const pytorchSha = process.env.PYTORCH_SHA;
+
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: workflowFile,
+              ref: context.ref,
+              inputs: {
+                artifact_name: `torch-spyre-wheel-${pytorchSha}`,
+                pytorch_sha: pytorchSha,
+                pytorch_wheel_artifact_name: `pytorch-wheel-${pytorchSha}`,
+                mode: 'validate',
+                correlation_id: correlationId,
+                source_run_id: `${context.runId}`,
+              },
+            });
+
+            const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+            let run;
+            // Poll for the dispatched run to appear (createWorkflowDispatch
+            // returns nothing, so it has to be found by its run-name).
+            for (let attempt = 0; !run && attempt < 30; attempt++) {
+              await sleep(10000);
+              const { data } = await github.rest.actions.listWorkflowRuns({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                workflow_id: workflowFile,
+                event: 'workflow_dispatch',
+              });
+              run = data.workflow_runs.find((r) => r.name && r.name.includes(correlationId));
+            }
+            if (!run) {
+              core.setFailed(`Could not find dispatched run for correlation_id ${correlationId}`);
+              return;
+            }
+            core.info(`Found dispatched run ${run.id} (${run.html_url})`);
+            core.setOutput('run_id', `${run.id}`);
+
+            // Poll until it finishes. mode: validate means the matrix
+            // itself never fails on test failures, so this only fails on
+            // an infra-level problem (e.g. the run erroring out or timing
+            // out) -- test-result failures are non-blocking, same as the
+            // job-level `uses:` this replaces.
+            let conclusion = run.conclusion;
+            for (let attempt = 0; run.status !== 'completed' && attempt < 700; attempt++) {
+              await sleep(30000);
+              const { data } = await github.rest.actions.getWorkflowRun({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                run_id: run.id,
+              });
+              run = data;
+              conclusion = run.conclusion;
+            }
+            if (run.status !== 'completed') {
+              core.setFailed(`Dispatched run ${run.id} did not complete in time`);
+              return;
+            }
+            core.info(`Dispatched run ${run.id} completed with conclusion: ${conclusion}`);
+            core.setOutput('conclusion', conclusion);
+
+      - name: Report CI completed to pytorch/pytorch
+        if: always() && github.event_name == 'repository_dispatch'
+        continue-on-error: true
+        uses: pytorch/test-infra/.github/actions/cross-repo-ci-relay-callback@main
+        with:
+          status: completed
+          conclusion: ${{ steps.dispatch.outputs.conclusion }}
+          job-name: linux-x86_64 / pytorch / test
 
   # ---------------------------------------------------------------------------
   # Manual opt-in only (run_torch_spyre_tests, surfaced as a workflow_dispatch
@@ -318,17 +416,6 @@ jobs:
           tar -xzf "${RUNNER_TEMP}/gh-cli.tar.gz" -C "${RUNNER_TEMP}/gh-cli" --strip-components=1
           echo "${RUNNER_TEMP}/gh-cli/bin" >> "${GITHUB_PATH}"
 
-      - name: Report CI started to pytorch/pytorch
-        # Only repository_dispatch (real PR-triggered CI) needs an
-        # in_progress ping -- pytorch/pytorch's CRCR only watches those
-        # runs live. Nightly (schedule) doesn't need one, and
-        # workflow_dispatch (manual/ad-hoc) is never relayed at all.
-        if: github.event_name == 'repository_dispatch'
-        continue-on-error: true
-        uses: pytorch/test-infra/.github/actions/cross-repo-ci-relay-callback@main
-        with:
-          status: in_progress
-          job-name: linux-x86_64 / pytorch / test
 
       - name: Write dispatch payload to file
         env:
@@ -353,7 +440,7 @@ jobs:
         run: |
           python3 torch-spyre/.github/scripts/download_run_xml_artifacts.py \
             --repo "${{ github.repository }}" \
-            --run-id "${{ github.run_id }}" \
+            --run-id "${{ needs.test.outputs.run_id }}" \
             --output-dir xml_artifacts
 
       - name: Parse test results (counts)
@@ -452,26 +539,6 @@ jobs:
           # resolved source SHA rather than a run-specific token.
           delivery-id: ${{ inputs.pytorch_sha }}
 
-      - name: Report CI completed to pytorch/pytorch (repository_dispatch)
-        if: always() && github.event_name == 'repository_dispatch'
-        continue-on-error: true
-        uses: pytorch/test-infra/.github/actions/cross-repo-ci-relay-callback@main
-        with:
-          status: completed
-          conclusion: >-
-            ${{ 
-              fromJSON(steps.test_results.outputs.test_results_json).total > 0
-              && fromJSON(steps.test_results.outputs.test_results_json).failed == 0
-              && 'success' || 'failure'
-            }}
-          test-results: >-
-            {
-              "passed": ${{ fromJSON(steps.test_results.outputs.test_results_json).passed }},
-              "failed": ${{ fromJSON(steps.test_results.outputs.test_results_json).failed }},
-              "skipped": ${{ fromJSON(steps.test_results.outputs.test_results_json).skipped }},
-              "total": ${{ fromJSON(steps.test_results.outputs.test_results_json).total }}
-            }
-          job-name: linux-x86_64 / pytorch / test
 
       # ---------------------------------------------------------------------------
       # Report the nightly result to the RHEL CI Results Relay (see

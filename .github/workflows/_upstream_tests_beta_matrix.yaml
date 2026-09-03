@@ -47,6 +47,61 @@ on:
         required: false
         type: string
         default: gating
+  # ---------------------------------------------------------------------------
+  # Lets build_test_pytorch_source.yaml's `test` job dispatch this workflow
+  # from a *step* (via actions/github-script + createWorkflowDispatch,
+  # mirroring trigger_other_repos-style dispatch) instead of a job-level
+  # `uses:`, so that job can wrap the dispatch with CRCR in_progress/completed
+  # callback steps. Mirrors the workflow_call inputs above (GHA doesn't allow
+  # sharing an inputs: block between two triggers) plus two dispatch-only
+  # inputs used to find/read the resulting run and its source artifacts.
+  # ---------------------------------------------------------------------------
+  workflow_dispatch:
+    inputs:
+      artifact_name:
+        description: Name of the uploaded torch-spyre wheel artifact to download and install
+        required: false
+        type: string
+        default: torch-spyre-wheel
+      pytorch_sha:
+        description: Exact pytorch/pytorch commit SHA to check out. Empty = release branch derived from pyproject.toml.
+        required: false
+        type: string
+        default: ''
+      pytorch_wheel_artifact_name:
+        description: >-
+          Name of a prebuilt PyTorch wheel artifact to install in place of the
+          pinned pytorch-cpu wheel (e.g. a from-source build at pytorch_sha).
+          Empty (default) = keep the pinned wheel install-prebuilt-torch-spyre
+          resolves normally.
+        required: false
+        type: string
+        default: ''
+      mode:
+        description: >-
+          Forwarded to run_test.sh as --mode. 'gating' (default) fails the
+          job on test failures; 'validate' still records failures in the
+          summary/JUnit XML but does not fail the job on them.
+        required: false
+        type: string
+        default: gating
+      correlation_id:
+        description: >-
+          Opaque token set by the dispatching step, used only so it can find
+          the run it just created (the dispatch API returns no run ID) --
+          surfaced via run-name below.
+        required: true
+        type: string
+      source_run_id:
+        description: >-
+          Workflow run ID to download the torch-spyre/PyTorch wheel artifacts
+          from. Empty (default) = current run.
+        required: false
+        type: string
+        default: ''
+
+run-name: >-
+  ${{ github.workflow }}${{ inputs.correlation_id && format(' ({0})', inputs.correlation_id) || '' }}
 
 defaults:
   run:
@@ -217,6 +272,8 @@ jobs:
         uses: ./.github/actions/install-prebuilt-torch-spyre
         with:
           artifact_name: ${{ inputs.artifact_name }}
+          run_id: ${{ inputs.source_run_id }}
+          github_token: ${{ inputs.source_run_id != '' && github.token || '' }}
 
       # pytorch/pytorch dispatch path only (build_test_pytorch_source.yaml):
       # override the pinned pytorch-cpu wheel with the exact PyTorch build
@@ -226,6 +283,8 @@ jobs:
         uses: ./.github/actions/install-prebuilt-pytorch
         with:
           artifact_name: ${{ inputs.pytorch_wheel_artifact_name }}
+          run_id: ${{ inputs.source_run_id }}
+          github_token: ${{ inputs.source_run_id != '' && github.token || '' }}
 
       - name: Derive report paths
         run: |

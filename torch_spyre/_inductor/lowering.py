@@ -1287,6 +1287,14 @@ def lower_spyre_from_d2d(src, dst, src_off, dst_off):
     lowering.mutate_to(dst, src)
 
 
+@register_spyre_lowering(torch.ops.spyre.to_dtype_d2d, type_promotion_kind=None)
+def lower_spyre_to_dtype_d2d(src, dtype, src_off):
+    # Like copy_from_d2d, preserve a sliced eager input's storage offset when it
+    # becomes a graph input to the standalone compiled conversion.
+    src = _reoffset(src, src_off)
+    return to_dtype(src, dtype)
+
+
 def _build_mutation_lowering(src, dst):
     # Builds an explicit MutationLayoutSHOULDREMOVE buffer so the mutation into dst
     # survives regardless of what the scheduler would otherwise decide.

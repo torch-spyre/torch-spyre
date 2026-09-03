@@ -2108,14 +2108,15 @@ cases:
     description: 'site-packages/torch/nn/functional.py:7139 in grouped_mm, code: return torch._grouped_mm(mat_a, mat_b, offs=offs, bias=bias, out_dtype=out_dtype)'
     kwmap:
       offs:
-        shape: [128]
-        stride: [1]
-        storage_offset: 0
-        dtype: torch.int32
-        device: cuda:0
-        init: cumsum_offsets
-        init_args:
-          total: 192
+        tensor:
+          shape: [128]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int32
+          device: cuda:0
+          init: cumsum_offsets
+          init_args:
+            total: 192
       bias: None
       out_dtype: None
   - name: torch.chunk.1_spyre
@@ -2229,14 +2230,15 @@ cases:
     description: 'site-packages/torch/nn/functional.py:7139 in grouped_mm, code: return torch._grouped_mm(mat_a, mat_b, offs=offs, bias=bias, out_dtype=out_dtype)'
     kwmap:
       offs:
-        shape: [128]
-        stride: [1]
-        storage_offset: 0
-        dtype: torch.int32
-        device: cuda:0
-        init: cumsum_offsets
-        init_args:
-          total: 192
+        tensor:
+          shape: [128]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int32
+          device: cuda:0
+          init: cumsum_offsets
+          init_args:
+            total: 192
       bias: None
       out_dtype: None
   - name: torch.unsqueeze.3_spyre
@@ -2456,14 +2458,15 @@ cases:
     description: 'site-packages/torch/nn/functional.py:7139 in grouped_mm, code: return torch._grouped_mm(mat_a, mat_b, offs=offs, bias=bias, out_dtype=out_dtype)'
     kwmap:
       offs:
-        shape: [128]
-        stride: [1]
-        storage_offset: 0
-        dtype: torch.int32
-        device: cuda:0
-        init: cumsum_offsets
-        init_args:
-          total: 192
+        tensor:
+          shape: [128]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int32
+          device: cuda:0
+          init: cumsum_offsets
+          init_args:
+            total: 192
       bias: None
       out_dtype: None
   - name: torch._grouped_mm.4_spyre
@@ -2486,14 +2489,15 @@ cases:
     description: 'site-packages/torch/nn/functional.py:7139 in grouped_mm, code: return torch._grouped_mm(mat_a, mat_b, offs=offs, bias=bias, out_dtype=out_dtype)'
     kwmap:
       offs:
-        shape: [128]
-        stride: [1]
-        storage_offset: 0
-        dtype: torch.int32
-        device: cuda:0
-        init: cumsum_offsets
-        init_args:
-          total: 192
+        tensor:
+          shape: [128]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int32
+          device: cuda:0
+          init: cumsum_offsets
+          init_args:
+            total: 192
       bias: None
       out_dtype: None
   - name: torch._grouped_mm.5_spyre
@@ -2516,14 +2520,15 @@ cases:
     description: 'site-packages/torch/nn/functional.py:7139 in grouped_mm, code: return torch._grouped_mm(mat_a, mat_b, offs=offs, bias=bias, out_dtype=out_dtype)'
     kwmap:
       offs:
-        shape: [128]
-        stride: [1]
-        storage_offset: 0
-        dtype: torch.int32
-        device: cuda:0
-        init: cumsum_offsets
-        init_args:
-          total: 192
+        tensor:
+          shape: [128]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int32
+          device: cuda:0
+          init: cumsum_offsets
+          init_args:
+            total: 192
       bias: None
       out_dtype: None
   - name: torch._grouped_mm.6_spyre
@@ -2546,14 +2551,15 @@ cases:
     description: 'site-packages/torch/nn/functional.py:7139 in grouped_mm, code: return torch._grouped_mm(mat_a, mat_b, offs=offs, bias=bias, out_dtype=out_dtype)'
     kwmap:
       offs:
-        shape: [128]
-        stride: [1]
-        storage_offset: 0
-        dtype: torch.int32
-        device: cuda:0
-        init: cumsum_offsets
-        init_args:
-          total: 192
+        tensor:
+          shape: [128]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int32
+          device: cuda:0
+          init: cumsum_offsets
+          init_args:
+            total: 192
       bias: None
       out_dtype: None
   - name: torch._grouped_mm.7_spyre
@@ -2576,14 +2582,15 @@ cases:
     description: 'site-packages/torch/nn/functional.py:7139 in grouped_mm, code: return torch._grouped_mm(mat_a, mat_b, offs=offs, bias=bias, out_dtype=out_dtype)'
     kwmap:
       offs:
-        shape: [128]
-        stride: [1]
-        storage_offset: 0
-        dtype: torch.int32
-        device: cuda:0
-        init: cumsum_offsets
-        init_args:
-          total: 192
+        tensor:
+          shape: [128]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int32
+          device: cuda:0
+          init: cumsum_offsets
+          init_args:
+            total: 192
       bias: None
       out_dtype: None
   - name: torch._grouped_mm.8_spyre
@@ -2606,14 +2613,15 @@ cases:
     description: 'site-packages/torch/nn/functional.py:7139 in grouped_mm, code: return torch._grouped_mm(mat_a, mat_b, offs=offs, bias=bias, out_dtype=out_dtype)'
     kwmap:
       offs:
-        shape: [128]
-        stride: [1]
-        storage_offset: 0
-        dtype: torch.int32
-        device: cuda:0
-        init: cumsum_offsets
-        init_args:
-          total: 192
+        tensor:
+          shape: [128]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int32
+          device: cuda:0
+          init: cumsum_offsets
+          init_args:
+            total: 192
       bias: None
       out_dtype: None
   - name: torch._grouped_mm.9_spyre
@@ -2636,14 +2644,15 @@ cases:
     description: 'site-packages/torch/nn/functional.py:7139 in grouped_mm, code: return torch._grouped_mm(mat_a, mat_b, offs=offs, bias=bias, out_dtype=out_dtype)'
     kwmap:
       offs:
-        shape: [128]
-        stride: [1]
-        storage_offset: 0
-        dtype: torch.int32
-        device: cuda:0
-        init: cumsum_offsets
-        init_args:
-          total: 192
+        tensor:
+          shape: [128]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int32
+          device: cuda:0
+          init: cumsum_offsets
+          init_args:
+            total: 192
       bias: None
       out_dtype: None
   - name: torch._grouped_mm.10_spyre
@@ -3454,14 +3463,15 @@ cases:
     description: 'site-packages/torch/nn/functional.py:7139 in grouped_mm, code: return torch._grouped_mm(mat_a, mat_b, offs=offs, bias=bias, out_dtype=out_dtype)'
     kwmap:
       offs:
-        shape: [128]
-        stride: [1]
-        storage_offset: 0
-        dtype: torch.int32
-        device: cuda:0
-        init: cumsum_offsets
-        init_args:
-          total: 192
+        tensor:
+          shape: [128]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int32
+          device: cuda:0
+          init: cumsum_offsets
+          init_args:
+            total: 192
       bias: None
       out_dtype: None
   - name: torch._grouped_mm.13_spyre
@@ -3484,14 +3494,15 @@ cases:
     description: 'site-packages/torch/nn/functional.py:7139 in grouped_mm, code: return torch._grouped_mm(mat_a, mat_b, offs=offs, bias=bias, out_dtype=out_dtype)'
     kwmap:
       offs:
-        shape: [128]
-        stride: [1]
-        storage_offset: 0
-        dtype: torch.int32
-        device: cuda:0
-        init: cumsum_offsets
-        init_args:
-          total: 192
+        tensor:
+          shape: [128]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int32
+          device: cuda:0
+          init: cumsum_offsets
+          init_args:
+            total: 192
       bias: None
       out_dtype: None
   - name: torch._grouped_mm.14_spyre
@@ -3514,14 +3525,15 @@ cases:
     description: 'site-packages/torch/nn/functional.py:7139 in grouped_mm, code: return torch._grouped_mm(mat_a, mat_b, offs=offs, bias=bias, out_dtype=out_dtype)'
     kwmap:
       offs:
-        shape: [128]
-        stride: [1]
-        storage_offset: 0
-        dtype: torch.int32
-        device: cuda:0
-        init: cumsum_offsets
-        init_args:
-          total: 192
+        tensor:
+          shape: [128]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int32
+          device: cuda:0
+          init: cumsum_offsets
+          init_args:
+            total: 192
       bias: None
       out_dtype: None
   - name: torch._grouped_mm.15_spyre
@@ -3544,14 +3556,15 @@ cases:
     description: 'site-packages/torch/nn/functional.py:7139 in grouped_mm, code: return torch._grouped_mm(mat_a, mat_b, offs=offs, bias=bias, out_dtype=out_dtype)'
     kwmap:
       offs:
-        shape: [128]
-        stride: [1]
-        storage_offset: 0
-        dtype: torch.int32
-        device: cuda:0
-        init: cumsum_offsets
-        init_args:
-          total: 192
+        tensor:
+          shape: [128]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int32
+          device: cuda:0
+          init: cumsum_offsets
+          init_args:
+            total: 192
       bias: None
       out_dtype: None
   - name: torch._grouped_mm.16_spyre
@@ -3574,14 +3587,15 @@ cases:
     description: 'site-packages/torch/nn/functional.py:7139 in grouped_mm, code: return torch._grouped_mm(mat_a, mat_b, offs=offs, bias=bias, out_dtype=out_dtype)'
     kwmap:
       offs:
-        shape: [128]
-        stride: [1]
-        storage_offset: 0
-        dtype: torch.int32
-        device: cuda:0
-        init: cumsum_offsets
-        init_args:
-          total: 192
+        tensor:
+          shape: [128]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int32
+          device: cuda:0
+          init: cumsum_offsets
+          init_args:
+            total: 192
       bias: None
       out_dtype: None
   - name: torch._grouped_mm.17_spyre
@@ -3604,14 +3618,15 @@ cases:
     description: 'site-packages/torch/nn/functional.py:7139 in grouped_mm, code: return torch._grouped_mm(mat_a, mat_b, offs=offs, bias=bias, out_dtype=out_dtype)'
     kwmap:
       offs:
-        shape: [128]
-        stride: [1]
-        storage_offset: 0
-        dtype: torch.int32
-        device: cuda:0
-        init: cumsum_offsets
-        init_args:
-          total: 192
+        tensor:
+          shape: [128]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int32
+          device: cuda:0
+          init: cumsum_offsets
+          init_args:
+            total: 192
       bias: None
       out_dtype: None
   - name: torch._grouped_mm.18_spyre
@@ -3634,14 +3649,15 @@ cases:
     description: 'site-packages/torch/nn/functional.py:7139 in grouped_mm, code: return torch._grouped_mm(mat_a, mat_b, offs=offs, bias=bias, out_dtype=out_dtype)'
     kwmap:
       offs:
-        shape: [128]
-        stride: [1]
-        storage_offset: 0
-        dtype: torch.int32
-        device: cuda:0
-        init: cumsum_offsets
-        init_args:
-          total: 192
+        tensor:
+          shape: [128]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int32
+          device: cuda:0
+          init: cumsum_offsets
+          init_args:
+            total: 192
       bias: None
       out_dtype: None
   - name: torch._grouped_mm.19_spyre
@@ -3664,14 +3680,15 @@ cases:
     description: 'site-packages/torch/nn/functional.py:7139 in grouped_mm, code: return torch._grouped_mm(mat_a, mat_b, offs=offs, bias=bias, out_dtype=out_dtype)'
     kwmap:
       offs:
-        shape: [128]
-        stride: [1]
-        storage_offset: 0
-        dtype: torch.int32
-        device: cuda:0
-        init: cumsum_offsets
-        init_args:
-          total: 192
+        tensor:
+          shape: [128]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int32
+          device: cuda:0
+          init: cumsum_offsets
+          init_args:
+            total: 192
       bias: None
       out_dtype: None
   - name: torch._grouped_mm.20_spyre
@@ -3694,14 +3711,15 @@ cases:
     description: 'site-packages/torch/nn/functional.py:7139 in grouped_mm, code: return torch._grouped_mm(mat_a, mat_b, offs=offs, bias=bias, out_dtype=out_dtype)'
     kwmap:
       offs:
-        shape: [128]
-        stride: [1]
-        storage_offset: 0
-        dtype: torch.int32
-        device: cuda:0
-        init: cumsum_offsets
-        init_args:
-          total: 192
+        tensor:
+          shape: [128]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int32
+          device: cuda:0
+          init: cumsum_offsets
+          init_args:
+            total: 192
       bias: None
       out_dtype: None
   - name: torch._grouped_mm.21_spyre
@@ -3724,14 +3742,15 @@ cases:
     description: 'site-packages/torch/nn/functional.py:7139 in grouped_mm, code: return torch._grouped_mm(mat_a, mat_b, offs=offs, bias=bias, out_dtype=out_dtype)'
     kwmap:
       offs:
-        shape: [128]
-        stride: [1]
-        storage_offset: 0
-        dtype: torch.int32
-        device: cuda:0
-        init: cumsum_offsets
-        init_args:
-          total: 192
+        tensor:
+          shape: [128]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int32
+          device: cuda:0
+          init: cumsum_offsets
+          init_args:
+            total: 192
       bias: None
       out_dtype: None
   - name: torch._grouped_mm.22_spyre
@@ -3754,14 +3773,15 @@ cases:
     description: 'site-packages/torch/nn/functional.py:7139 in grouped_mm, code: return torch._grouped_mm(mat_a, mat_b, offs=offs, bias=bias, out_dtype=out_dtype)'
     kwmap:
       offs:
-        shape: [128]
-        stride: [1]
-        storage_offset: 0
-        dtype: torch.int32
-        device: cuda:0
-        init: cumsum_offsets
-        init_args:
-          total: 192
+        tensor:
+          shape: [128]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int32
+          device: cuda:0
+          init: cumsum_offsets
+          init_args:
+            total: 192
       bias: None
       out_dtype: None
   - name: torch._grouped_mm.23_spyre
@@ -3784,14 +3804,15 @@ cases:
     description: 'site-packages/torch/nn/functional.py:7139 in grouped_mm, code: return torch._grouped_mm(mat_a, mat_b, offs=offs, bias=bias, out_dtype=out_dtype)'
     kwmap:
       offs:
-        shape: [128]
-        stride: [1]
-        storage_offset: 0
-        dtype: torch.int32
-        device: cuda:0
-        init: cumsum_offsets
-        init_args:
-          total: 192
+        tensor:
+          shape: [128]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int32
+          device: cuda:0
+          init: cumsum_offsets
+          init_args:
+            total: 192
       bias: None
       out_dtype: None
   - name: torch._grouped_mm.24_spyre
@@ -3814,14 +3835,15 @@ cases:
     description: 'site-packages/torch/nn/functional.py:7139 in grouped_mm, code: return torch._grouped_mm(mat_a, mat_b, offs=offs, bias=bias, out_dtype=out_dtype)'
     kwmap:
       offs:
-        shape: [128]
-        stride: [1]
-        storage_offset: 0
-        dtype: torch.int32
-        device: cuda:0
-        init: cumsum_offsets
-        init_args:
-          total: 192
+        tensor:
+          shape: [128]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int32
+          device: cuda:0
+          init: cumsum_offsets
+          init_args:
+            total: 192
       bias: None
       out_dtype: None
   - name: torch._grouped_mm.25_spyre
@@ -3844,14 +3866,15 @@ cases:
     description: 'site-packages/torch/nn/functional.py:7139 in grouped_mm, code: return torch._grouped_mm(mat_a, mat_b, offs=offs, bias=bias, out_dtype=out_dtype)'
     kwmap:
       offs:
-        shape: [128]
-        stride: [1]
-        storage_offset: 0
-        dtype: torch.int32
-        device: cuda:0
-        init: cumsum_offsets
-        init_args:
-          total: 192
+        tensor:
+          shape: [128]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int32
+          device: cuda:0
+          init: cumsum_offsets
+          init_args:
+            total: 192
       bias: None
       out_dtype: None
   - name: torch._grouped_mm.26_spyre
@@ -3874,14 +3897,15 @@ cases:
     description: 'site-packages/torch/nn/functional.py:7139 in grouped_mm, code: return torch._grouped_mm(mat_a, mat_b, offs=offs, bias=bias, out_dtype=out_dtype)'
     kwmap:
       offs:
-        shape: [128]
-        stride: [1]
-        storage_offset: 0
-        dtype: torch.int32
-        device: cuda:0
-        init: cumsum_offsets
-        init_args:
-          total: 192
+        tensor:
+          shape: [128]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int32
+          device: cuda:0
+          init: cumsum_offsets
+          init_args:
+            total: 192
       bias: None
       out_dtype: None
   - name: torch._grouped_mm.27_spyre
@@ -3904,14 +3928,15 @@ cases:
     description: 'site-packages/torch/nn/functional.py:7139 in grouped_mm, code: return torch._grouped_mm(mat_a, mat_b, offs=offs, bias=bias, out_dtype=out_dtype)'
     kwmap:
       offs:
-        shape: [128]
-        stride: [1]
-        storage_offset: 0
-        dtype: torch.int32
-        device: cuda:0
-        init: cumsum_offsets
-        init_args:
-          total: 192
+        tensor:
+          shape: [128]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int32
+          device: cuda:0
+          init: cumsum_offsets
+          init_args:
+            total: 192
       bias: None
       out_dtype: None
   - name: torch._grouped_mm.28_spyre
@@ -3934,14 +3959,15 @@ cases:
     description: 'site-packages/torch/nn/functional.py:7139 in grouped_mm, code: return torch._grouped_mm(mat_a, mat_b, offs=offs, bias=bias, out_dtype=out_dtype)'
     kwmap:
       offs:
-        shape: [128]
-        stride: [1]
-        storage_offset: 0
-        dtype: torch.int32
-        device: cuda:0
-        init: cumsum_offsets
-        init_args:
-          total: 192
+        tensor:
+          shape: [128]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int32
+          device: cuda:0
+          init: cumsum_offsets
+          init_args:
+            total: 192
       bias: None
       out_dtype: None
   - name: torch._grouped_mm.29_spyre
@@ -3964,14 +3990,15 @@ cases:
     description: 'site-packages/torch/nn/functional.py:7139 in grouped_mm, code: return torch._grouped_mm(mat_a, mat_b, offs=offs, bias=bias, out_dtype=out_dtype)'
     kwmap:
       offs:
-        shape: [128]
-        stride: [1]
-        storage_offset: 0
-        dtype: torch.int32
-        device: cuda:0
-        init: cumsum_offsets
-        init_args:
-          total: 192
+        tensor:
+          shape: [128]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int32
+          device: cuda:0
+          init: cumsum_offsets
+          init_args:
+            total: 192
       bias: None
       out_dtype: None
   - name: torch._grouped_mm.30_spyre
@@ -3994,14 +4021,15 @@ cases:
     description: 'site-packages/torch/nn/functional.py:7139 in grouped_mm, code: return torch._grouped_mm(mat_a, mat_b, offs=offs, bias=bias, out_dtype=out_dtype)'
     kwmap:
       offs:
-        shape: [128]
-        stride: [1]
-        storage_offset: 0
-        dtype: torch.int32
-        device: cuda:0
-        init: cumsum_offsets
-        init_args:
-          total: 192
+        tensor:
+          shape: [128]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int32
+          device: cuda:0
+          init: cumsum_offsets
+          init_args:
+            total: 192
       bias: None
       out_dtype: None
   - name: torch._grouped_mm.31_spyre
@@ -4024,14 +4052,15 @@ cases:
     description: 'site-packages/torch/nn/functional.py:7139 in grouped_mm, code: return torch._grouped_mm(mat_a, mat_b, offs=offs, bias=bias, out_dtype=out_dtype)'
     kwmap:
       offs:
-        shape: [128]
-        stride: [1]
-        storage_offset: 0
-        dtype: torch.int32
-        device: cuda:0
-        init: cumsum_offsets
-        init_args:
-          total: 192
+        tensor:
+          shape: [128]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int32
+          device: cuda:0
+          init: cumsum_offsets
+          init_args:
+            total: 192
       bias: None
       out_dtype: None
   - name: torch._grouped_mm.32_spyre
@@ -4054,14 +4083,15 @@ cases:
     description: 'site-packages/torch/nn/functional.py:7139 in grouped_mm, code: return torch._grouped_mm(mat_a, mat_b, offs=offs, bias=bias, out_dtype=out_dtype)'
     kwmap:
       offs:
-        shape: [128]
-        stride: [1]
-        storage_offset: 0
-        dtype: torch.int32
-        device: cuda:0
-        init: cumsum_offsets
-        init_args:
-          total: 192
+        tensor:
+          shape: [128]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int32
+          device: cuda:0
+          init: cumsum_offsets
+          init_args:
+            total: 192
       bias: None
       out_dtype: None
   - name: torch._grouped_mm.33_spyre
@@ -4084,14 +4114,15 @@ cases:
     description: 'site-packages/torch/nn/functional.py:7139 in grouped_mm, code: return torch._grouped_mm(mat_a, mat_b, offs=offs, bias=bias, out_dtype=out_dtype)'
     kwmap:
       offs:
-        shape: [128]
-        stride: [1]
-        storage_offset: 0
-        dtype: torch.int32
-        device: cuda:0
-        init: cumsum_offsets
-        init_args:
-          total: 192
+        tensor:
+          shape: [128]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int32
+          device: cuda:0
+          init: cumsum_offsets
+          init_args:
+            total: 192
       bias: None
       out_dtype: None
   - name: torch._grouped_mm.34_spyre
@@ -4114,14 +4145,15 @@ cases:
     description: 'site-packages/torch/nn/functional.py:7139 in grouped_mm, code: return torch._grouped_mm(mat_a, mat_b, offs=offs, bias=bias, out_dtype=out_dtype)'
     kwmap:
       offs:
-        shape: [128]
-        stride: [1]
-        storage_offset: 0
-        dtype: torch.int32
-        device: cuda:0
-        init: cumsum_offsets
-        init_args:
-          total: 192
+        tensor:
+          shape: [128]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int32
+          device: cuda:0
+          init: cumsum_offsets
+          init_args:
+            total: 192
       bias: None
       out_dtype: None
   - name: torch._grouped_mm.35_spyre
@@ -4144,14 +4176,15 @@ cases:
     description: 'site-packages/torch/nn/functional.py:7139 in grouped_mm, code: return torch._grouped_mm(mat_a, mat_b, offs=offs, bias=bias, out_dtype=out_dtype)'
     kwmap:
       offs:
-        shape: [128]
-        stride: [1]
-        storage_offset: 0
-        dtype: torch.int32
-        device: cuda:0
-        init: cumsum_offsets
-        init_args:
-          total: 192
+        tensor:
+          shape: [128]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int32
+          device: cuda:0
+          init: cumsum_offsets
+          init_args:
+            total: 192
       bias: None
       out_dtype: None
   - name: torch._grouped_mm.36_spyre
@@ -4174,14 +4207,15 @@ cases:
     description: 'site-packages/torch/nn/functional.py:7139 in grouped_mm, code: return torch._grouped_mm(mat_a, mat_b, offs=offs, bias=bias, out_dtype=out_dtype)'
     kwmap:
       offs:
-        shape: [128]
-        stride: [1]
-        storage_offset: 0
-        dtype: torch.int32
-        device: cuda:0
-        init: cumsum_offsets
-        init_args:
-          total: 192
+        tensor:
+          shape: [128]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int32
+          device: cuda:0
+          init: cumsum_offsets
+          init_args:
+            total: 192
       bias: None
       out_dtype: None
   - name: torch._grouped_mm.37_spyre
@@ -4204,14 +4238,15 @@ cases:
     description: 'site-packages/torch/nn/functional.py:7139 in grouped_mm, code: return torch._grouped_mm(mat_a, mat_b, offs=offs, bias=bias, out_dtype=out_dtype)'
     kwmap:
       offs:
-        shape: [128]
-        stride: [1]
-        storage_offset: 0
-        dtype: torch.int32
-        device: cuda:0
-        init: cumsum_offsets
-        init_args:
-          total: 192
+        tensor:
+          shape: [128]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int32
+          device: cuda:0
+          init: cumsum_offsets
+          init_args:
+            total: 192
       bias: None
       out_dtype: None
   - name: torch._grouped_mm.38_spyre
@@ -4234,14 +4269,15 @@ cases:
     description: 'site-packages/torch/nn/functional.py:7139 in grouped_mm, code: return torch._grouped_mm(mat_a, mat_b, offs=offs, bias=bias, out_dtype=out_dtype)'
     kwmap:
       offs:
-        shape: [128]
-        stride: [1]
-        storage_offset: 0
-        dtype: torch.int32
-        device: cuda:0
-        init: cumsum_offsets
-        init_args:
-          total: 192
+        tensor:
+          shape: [128]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int32
+          device: cuda:0
+          init: cumsum_offsets
+          init_args:
+            total: 192
       bias: None
       out_dtype: None
   - name: torch._grouped_mm.39_spyre
@@ -4264,14 +4300,15 @@ cases:
     description: 'site-packages/torch/nn/functional.py:7139 in grouped_mm, code: return torch._grouped_mm(mat_a, mat_b, offs=offs, bias=bias, out_dtype=out_dtype)'
     kwmap:
       offs:
-        shape: [128]
-        stride: [1]
-        storage_offset: 0
-        dtype: torch.int32
-        device: cuda:0
-        init: cumsum_offsets
-        init_args:
-          total: 192
+        tensor:
+          shape: [128]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int32
+          device: cuda:0
+          init: cumsum_offsets
+          init_args:
+            total: 192
       bias: None
       out_dtype: None
   - name: torch._grouped_mm.40_spyre
@@ -4294,14 +4331,15 @@ cases:
     description: 'site-packages/torch/nn/functional.py:7139 in grouped_mm, code: return torch._grouped_mm(mat_a, mat_b, offs=offs, bias=bias, out_dtype=out_dtype)'
     kwmap:
       offs:
-        shape: [128]
-        stride: [1]
-        storage_offset: 0
-        dtype: torch.int32
-        device: cuda:0
-        init: cumsum_offsets
-        init_args:
-          total: 192
+        tensor:
+          shape: [128]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int32
+          device: cuda:0
+          init: cumsum_offsets
+          init_args:
+            total: 192
       bias: None
       out_dtype: None
   - name: torch._grouped_mm.41_spyre
@@ -4324,14 +4362,15 @@ cases:
     description: 'site-packages/torch/nn/functional.py:7139 in grouped_mm, code: return torch._grouped_mm(mat_a, mat_b, offs=offs, bias=bias, out_dtype=out_dtype)'
     kwmap:
       offs:
-        shape: [128]
-        stride: [1]
-        storage_offset: 0
-        dtype: torch.int32
-        device: cuda:0
-        init: cumsum_offsets
-        init_args:
-          total: 192
+        tensor:
+          shape: [128]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int32
+          device: cuda:0
+          init: cumsum_offsets
+          init_args:
+            total: 192
       bias: None
       out_dtype: None
   - name: torch._grouped_mm.42_spyre
@@ -4354,14 +4393,15 @@ cases:
     description: 'site-packages/torch/nn/functional.py:7139 in grouped_mm, code: return torch._grouped_mm(mat_a, mat_b, offs=offs, bias=bias, out_dtype=out_dtype)'
     kwmap:
       offs:
-        shape: [128]
-        stride: [1]
-        storage_offset: 0
-        dtype: torch.int32
-        device: cuda:0
-        init: cumsum_offsets
-        init_args:
-          total: 192
+        tensor:
+          shape: [128]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int32
+          device: cuda:0
+          init: cumsum_offsets
+          init_args:
+            total: 192
       bias: None
       out_dtype: None
   - name: torch._grouped_mm.43_spyre
@@ -4384,14 +4424,15 @@ cases:
     description: 'site-packages/torch/nn/functional.py:7139 in grouped_mm, code: return torch._grouped_mm(mat_a, mat_b, offs=offs, bias=bias, out_dtype=out_dtype)'
     kwmap:
       offs:
-        shape: [128]
-        stride: [1]
-        storage_offset: 0
-        dtype: torch.int32
-        device: cuda:0
-        init: cumsum_offsets
-        init_args:
-          total: 192
+        tensor:
+          shape: [128]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int32
+          device: cuda:0
+          init: cumsum_offsets
+          init_args:
+            total: 192
       bias: None
       out_dtype: None
   - name: torch._grouped_mm.44_spyre
@@ -4414,14 +4455,15 @@ cases:
     description: 'site-packages/torch/nn/functional.py:7139 in grouped_mm, code: return torch._grouped_mm(mat_a, mat_b, offs=offs, bias=bias, out_dtype=out_dtype)'
     kwmap:
       offs:
-        shape: [128]
-        stride: [1]
-        storage_offset: 0
-        dtype: torch.int32
-        device: cuda:0
-        init: cumsum_offsets
-        init_args:
-          total: 192
+        tensor:
+          shape: [128]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int32
+          device: cuda:0
+          init: cumsum_offsets
+          init_args:
+            total: 192
       bias: None
       out_dtype: None
   - name: torch._grouped_mm.45_spyre
@@ -4444,14 +4486,15 @@ cases:
     description: 'site-packages/torch/nn/functional.py:7139 in grouped_mm, code: return torch._grouped_mm(mat_a, mat_b, offs=offs, bias=bias, out_dtype=out_dtype)'
     kwmap:
       offs:
-        shape: [128]
-        stride: [1]
-        storage_offset: 0
-        dtype: torch.int32
-        device: cuda:0
-        init: cumsum_offsets
-        init_args:
-          total: 192
+        tensor:
+          shape: [128]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int32
+          device: cuda:0
+          init: cumsum_offsets
+          init_args:
+            total: 192
       bias: None
       out_dtype: None
   - name: torch._grouped_mm.46_spyre
@@ -4474,14 +4517,15 @@ cases:
     description: 'site-packages/torch/nn/functional.py:7139 in grouped_mm, code: return torch._grouped_mm(mat_a, mat_b, offs=offs, bias=bias, out_dtype=out_dtype)'
     kwmap:
       offs:
-        shape: [128]
-        stride: [1]
-        storage_offset: 0
-        dtype: torch.int32
-        device: cuda:0
-        init: cumsum_offsets
-        init_args:
-          total: 192
+        tensor:
+          shape: [128]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int32
+          device: cuda:0
+          init: cumsum_offsets
+          init_args:
+            total: 192
       bias: None
       out_dtype: None
   - name: torch._grouped_mm.47_spyre
@@ -4504,14 +4548,15 @@ cases:
     description: 'site-packages/torch/nn/functional.py:7139 in grouped_mm, code: return torch._grouped_mm(mat_a, mat_b, offs=offs, bias=bias, out_dtype=out_dtype)'
     kwmap:
       offs:
-        shape: [128]
-        stride: [1]
-        storage_offset: 0
-        dtype: torch.int32
-        device: cuda:0
-        init: cumsum_offsets
-        init_args:
-          total: 192
+        tensor:
+          shape: [128]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int32
+          device: cuda:0
+          init: cumsum_offsets
+          init_args:
+            total: 192
       bias: None
       out_dtype: None
   - name: torch._grouped_mm.48_spyre
@@ -4534,14 +4579,15 @@ cases:
     description: 'site-packages/torch/nn/functional.py:7139 in grouped_mm, code: return torch._grouped_mm(mat_a, mat_b, offs=offs, bias=bias, out_dtype=out_dtype)'
     kwmap:
       offs:
-        shape: [128]
-        stride: [1]
-        storage_offset: 0
-        dtype: torch.int32
-        device: cuda:0
-        init: cumsum_offsets
-        init_args:
-          total: 192
+        tensor:
+          shape: [128]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int32
+          device: cuda:0
+          init: cumsum_offsets
+          init_args:
+            total: 192
       bias: None
       out_dtype: None
   - name: torch._grouped_mm.49_spyre
@@ -4564,14 +4610,15 @@ cases:
     description: 'site-packages/torch/nn/functional.py:7139 in grouped_mm, code: return torch._grouped_mm(mat_a, mat_b, offs=offs, bias=bias, out_dtype=out_dtype)'
     kwmap:
       offs:
-        shape: [128]
-        stride: [1]
-        storage_offset: 0
-        dtype: torch.int32
-        device: cuda:0
-        init: cumsum_offsets
-        init_args:
-          total: 192
+        tensor:
+          shape: [128]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int32
+          device: cuda:0
+          init: cumsum_offsets
+          init_args:
+            total: 192
       bias: None
       out_dtype: None
   - name: torch._grouped_mm.50_spyre
@@ -4594,14 +4641,15 @@ cases:
     description: 'site-packages/torch/nn/functional.py:7139 in grouped_mm, code: return torch._grouped_mm(mat_a, mat_b, offs=offs, bias=bias, out_dtype=out_dtype)'
     kwmap:
       offs:
-        shape: [128]
-        stride: [1]
-        storage_offset: 0
-        dtype: torch.int32
-        device: cuda:0
-        init: cumsum_offsets
-        init_args:
-          total: 192
+        tensor:
+          shape: [128]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int32
+          device: cuda:0
+          init: cumsum_offsets
+          init_args:
+            total: 192
       bias: None
       out_dtype: None
   - name: torch._grouped_mm.51_spyre
@@ -4624,14 +4672,15 @@ cases:
     description: 'site-packages/torch/nn/functional.py:7139 in grouped_mm, code: return torch._grouped_mm(mat_a, mat_b, offs=offs, bias=bias, out_dtype=out_dtype)'
     kwmap:
       offs:
-        shape: [128]
-        stride: [1]
-        storage_offset: 0
-        dtype: torch.int32
-        device: cuda:0
-        init: cumsum_offsets
-        init_args:
-          total: 192
+        tensor:
+          shape: [128]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int32
+          device: cuda:0
+          init: cumsum_offsets
+          init_args:
+            total: 192
       bias: None
       out_dtype: None
   - name: torch._grouped_mm.52_spyre
@@ -4654,14 +4703,15 @@ cases:
     description: 'site-packages/torch/nn/functional.py:7139 in grouped_mm, code: return torch._grouped_mm(mat_a, mat_b, offs=offs, bias=bias, out_dtype=out_dtype)'
     kwmap:
       offs:
-        shape: [128]
-        stride: [1]
-        storage_offset: 0
-        dtype: torch.int32
-        device: cuda:0
-        init: cumsum_offsets
-        init_args:
-          total: 192
+        tensor:
+          shape: [128]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int32
+          device: cuda:0
+          init: cumsum_offsets
+          init_args:
+            total: 192
       bias: None
       out_dtype: None
   - name: torch._grouped_mm.53_spyre
@@ -4684,14 +4734,15 @@ cases:
     description: 'site-packages/torch/nn/functional.py:7139 in grouped_mm, code: return torch._grouped_mm(mat_a, mat_b, offs=offs, bias=bias, out_dtype=out_dtype)'
     kwmap:
       offs:
-        shape: [128]
-        stride: [1]
-        storage_offset: 0
-        dtype: torch.int32
-        device: cuda:0
-        init: cumsum_offsets
-        init_args:
-          total: 192
+        tensor:
+          shape: [128]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int32
+          device: cuda:0
+          init: cumsum_offsets
+          init_args:
+            total: 192
       bias: None
       out_dtype: None
   - name: torch._grouped_mm.54_spyre
@@ -4714,14 +4765,15 @@ cases:
     description: 'site-packages/torch/nn/functional.py:7139 in grouped_mm, code: return torch._grouped_mm(mat_a, mat_b, offs=offs, bias=bias, out_dtype=out_dtype)'
     kwmap:
       offs:
-        shape: [128]
-        stride: [1]
-        storage_offset: 0
-        dtype: torch.int32
-        device: cuda:0
-        init: cumsum_offsets
-        init_args:
-          total: 192
+        tensor:
+          shape: [128]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int32
+          device: cuda:0
+          init: cumsum_offsets
+          init_args:
+            total: 192
       bias: None
       out_dtype: None
   - name: torch._grouped_mm.55_spyre
@@ -4744,14 +4796,15 @@ cases:
     description: 'site-packages/torch/nn/functional.py:7139 in grouped_mm, code: return torch._grouped_mm(mat_a, mat_b, offs=offs, bias=bias, out_dtype=out_dtype)'
     kwmap:
       offs:
-        shape: [128]
-        stride: [1]
-        storage_offset: 0
-        dtype: torch.int32
-        device: cuda:0
-        init: cumsum_offsets
-        init_args:
-          total: 192
+        tensor:
+          shape: [128]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int32
+          device: cuda:0
+          init: cumsum_offsets
+          init_args:
+            total: 192
       bias: None
       out_dtype: None
   - name: torch._grouped_mm.56_spyre
@@ -4774,14 +4827,15 @@ cases:
     description: 'site-packages/torch/nn/functional.py:7139 in grouped_mm, code: return torch._grouped_mm(mat_a, mat_b, offs=offs, bias=bias, out_dtype=out_dtype)'
     kwmap:
       offs:
-        shape: [128]
-        stride: [1]
-        storage_offset: 0
-        dtype: torch.int32
-        device: cuda:0
-        init: cumsum_offsets
-        init_args:
-          total: 192
+        tensor:
+          shape: [128]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int32
+          device: cuda:0
+          init: cumsum_offsets
+          init_args:
+            total: 192
       bias: None
       out_dtype: None
   - name: torch._grouped_mm.57_spyre
@@ -4804,14 +4858,15 @@ cases:
     description: 'site-packages/torch/nn/functional.py:7139 in grouped_mm, code: return torch._grouped_mm(mat_a, mat_b, offs=offs, bias=bias, out_dtype=out_dtype)'
     kwmap:
       offs:
-        shape: [128]
-        stride: [1]
-        storage_offset: 0
-        dtype: torch.int32
-        device: cuda:0
-        init: cumsum_offsets
-        init_args:
-          total: 192
+        tensor:
+          shape: [128]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int32
+          device: cuda:0
+          init: cumsum_offsets
+          init_args:
+            total: 192
       bias: None
       out_dtype: None
   - name: torch._grouped_mm.58_spyre
@@ -4834,14 +4889,15 @@ cases:
     description: 'site-packages/torch/nn/functional.py:7139 in grouped_mm, code: return torch._grouped_mm(mat_a, mat_b, offs=offs, bias=bias, out_dtype=out_dtype)'
     kwmap:
       offs:
-        shape: [128]
-        stride: [1]
-        storage_offset: 0
-        dtype: torch.int32
-        device: cuda:0
-        init: cumsum_offsets
-        init_args:
-          total: 192
+        tensor:
+          shape: [128]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int32
+          device: cuda:0
+          init: cumsum_offsets
+          init_args:
+            total: 192
       bias: None
       out_dtype: None
   - name: torch._grouped_mm.59_spyre
@@ -4864,14 +4920,15 @@ cases:
     description: 'site-packages/torch/nn/functional.py:7139 in grouped_mm, code: return torch._grouped_mm(mat_a, mat_b, offs=offs, bias=bias, out_dtype=out_dtype)'
     kwmap:
       offs:
-        shape: [128]
-        stride: [1]
-        storage_offset: 0
-        dtype: torch.int32
-        device: cuda:0
-        init: cumsum_offsets
-        init_args:
-          total: 192
+        tensor:
+          shape: [128]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int32
+          device: cuda:0
+          init: cumsum_offsets
+          init_args:
+            total: 192
       bias: None
       out_dtype: None
   - name: torch._grouped_mm.60_spyre
@@ -4894,14 +4951,15 @@ cases:
     description: 'site-packages/torch/nn/functional.py:7139 in grouped_mm, code: return torch._grouped_mm(mat_a, mat_b, offs=offs, bias=bias, out_dtype=out_dtype)'
     kwmap:
       offs:
-        shape: [128]
-        stride: [1]
-        storage_offset: 0
-        dtype: torch.int32
-        device: cuda:0
-        init: cumsum_offsets
-        init_args:
-          total: 192
+        tensor:
+          shape: [128]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int32
+          device: cuda:0
+          init: cumsum_offsets
+          init_args:
+            total: 192
       bias: None
       out_dtype: None
   - name: torch.getitem.18_spyre
