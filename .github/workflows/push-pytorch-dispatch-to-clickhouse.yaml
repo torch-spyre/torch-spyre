@@ -46,6 +46,22 @@ on:
           and build the current nightly (same as the scheduled cron run).
         required: false
         type: string
+      run_torch_spyre_tests:
+        description: >-
+          Also run torch-spyre's own test suite (tests/) against the built
+          PyTorch commit, in addition to the upstream-beta suites. Manual
+          dispatch only; non-blocking (does not fail this run).
+        required: false
+        type: boolean
+        default: false
+      torch_spyre_test_type:
+        description: >-
+          Suite subset for the torch-spyre test run when
+          run_torch_spyre_tests is enabled: smoke | unit | integration |
+          regression | trunk | suite_<group> | <label>.
+        required: false
+        type: string
+        default: regression
 
 
 concurrency:
@@ -311,3 +327,7 @@ jobs:
     secrets: inherit
     with:
       pytorch_sha: ${{ needs.gate_and_build.outputs.pytorch_sha }}
+      # Manual-dispatch-only opt-in -- empty/false on schedule and
+      # repository_dispatch triggers, which have no workflow_dispatch inputs.
+      run_torch_spyre_tests: ${{ github.event.inputs.run_torch_spyre_tests == 'true' }}
+      torch_spyre_test_type: ${{ github.event.inputs.torch_spyre_test_type || 'regression' }}

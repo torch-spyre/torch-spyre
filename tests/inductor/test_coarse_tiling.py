@@ -7485,11 +7485,22 @@ class TestReorderUnhintedInterlopers(unittest.TestCase):
         b = _make_rui_op("b", hint_ids=(0,))
         self.assertEqual(self._run([a, extern, b]), ["a", "extern", "b"])
 
-    def test_differently_hinted_breaks_run(self):
-        # An op with a different hint_id is not a candidate for reordering.
+    def test_differently_hinted_pulled_across_when_safe(self):
+        # An op with a different hint_id is not a candidate for reordering
+        # itself, but the later same-key op is pulled before it when doing
+        # so is dependency-safe, making the hint-0 run contiguous.
         a = _make_rui_op("a", hint_ids=(0,))
         c = _make_rui_op("c", hint_ids=(1,))
         b = _make_rui_op("b", hint_ids=(0,))
+        self.assertEqual(self._run([a, c, b]), ["a", "b", "c"])
+
+    def test_differently_hinted_breaks_run_when_pull_unsafe(self):
+        # b reads c's output, so pulling b before c would violate that
+        # read dependency; the pull is skipped and the run stays broken
+        # (left for validate_coarse_tile_groups to report).
+        a = _make_rui_op("a", hint_ids=(0,))
+        c = _make_rui_op("c", hint_ids=(1,))
+        b = _make_rui_op("b", hint_ids=(0,), reads=("c",))
         self.assertEqual(self._run([a, c, b]), ["a", "c", "b"])
 
     def test_multiple_interlopers_all_moveable_before(self):

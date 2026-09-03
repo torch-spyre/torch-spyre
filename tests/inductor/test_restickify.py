@@ -564,7 +564,6 @@ def test_bmm_xt_yt(bmm_tensors_ab_ba):
     _compare(lambda x, y: torch.matmul(x.transpose(1, 2), y.transpose(1, 2)), x, y)
 
 
-@pytest.mark.xfail(reason="Matmul with size 1 dims not yet supported")
 def test_matmul_unit_n_2d():
     """2D matmul where N=1 (output is a column vector)."""
     x = torch.rand(5, 64, dtype=torch.float16)
@@ -572,7 +571,6 @@ def test_matmul_unit_n_2d():
     _compare(lambda x, y: x @ y, x, y)
 
 
-@pytest.mark.xfail(reason="Matmul with size 1 dims not yet supported")
 def test_matmul_unit_n_2d_reduce():
     """2D matmul where Y is sparse"""
     x = torch.rand(5, 64, dtype=torch.float16)
@@ -580,7 +578,6 @@ def test_matmul_unit_n_2d_reduce():
     _compare(lambda x, y: x @ y.sum(dim=-1, keepdim=True), x, y)
 
 
-@pytest.mark.xfail(reason="Matmul with size 1 dims not yet supported")
 def test_bmm_unit_n():
     """Batched matmul with N=1 output dimension (decode-style query matmul).
 
@@ -593,10 +590,15 @@ def test_bmm_unit_n():
     _compare(lambda x, y: torch.matmul(x, y.transpose(1, 2)), x, y)
 
 
-@pytest.mark.xfail(reason="Matmul with size 1 dims not yet supported")
-def test_bmm_unit_n_self():
-    """same tensor to matmul with and without transpose"""
+def test_bmm_unit_self_1():
+    """Self-matmul where N=1: same tensor for both operands with a sparse y layout."""
     x = torch.randn((32, 1, 128), dtype=torch.float16) * 0.1
+    _compare(lambda x: torch.matmul(x, x.transpose(1, 2)), x)
+
+
+def test_bmm_unit_self_2():
+    """Self-matmul where M=N=2: exercises restickify occurrence-counter bookkeeping for the self-alias case."""
+    x = torch.randn((32, 2, 128), dtype=torch.float16) * 0.1
     _compare(lambda x: torch.matmul(x, x.transpose(1, 2)), x)
 
 
