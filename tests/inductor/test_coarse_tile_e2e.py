@@ -1716,9 +1716,6 @@ def test_m1_matmul_coarse_tile():
     "batchmatmul: cannot canonicalize factorized x_var".  The fix relaxes the
     affine_full_range check to allow outer loop vars alongside the contraction
     var.
-
-    Reproduces the granite decode failure fixed in commit 66b8b101.
-    Toggle SPYRE_DISABLE_M1_MATMUL_FIX=1 to revert to broken behaviour.
     """
     B, H, Lq, Lk, D = 1, 32, 1, 2048, 128  # decode: seq_len=1
     hidden = H * D  # 4096

@@ -1135,9 +1135,9 @@ def _matmul_layouts(
                 f"{data.reduction_type}: generated_var={generated_var} not found "
                 f"in output coords {out_coords}"
             )
+        out_dims = len(output.size)
         out_stick_dim = _out_stick_dim
 
-    out_dims = len(output.size)
     out_dim_order = list(range(out_dims - 2))
     if out_stick_dim == out_dims - 1:
         out_dim_order = out_dim_order + [out_dims - 2, out_dims - 1]

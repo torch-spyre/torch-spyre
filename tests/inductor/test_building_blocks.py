@@ -500,21 +500,10 @@ class TestBuildingBlocks(unittest.TestCase):
         tolerance = 0.2 if dtype is torch.bfloat16 else 0.1
         torch.testing.assert_close(actual, expected, atol=tolerance, rtol=tolerance)
 
-    _GRANITE_GQA_SKIP_REASON = (
-        "Depends on a factorized-matmul-dimension canonicalization pass over "
-        "propagate_layouts.py from draft PR torch-spyre/torch-spyre#3981 that "
-        "has not been ported yet. Without it, compilation raises "
-        "`Unsupported: Multi-arg pointwise ...: no supported output layout "
-        "found` before these tests get to check numerics. Unskip once that "
-        "layout-propagation work lands."
-    )
-
-    @unittest.skip(_GRANITE_GQA_SKIP_REASON)
     def test_granite_gqa_decode_with_finite_mask(self):
         """Decode SDPA uses all KV chunks through an unnamed broadcast mask."""
         self._run_granite_gqa_with_finite_broadcast_mask(LQ=1)
 
-    @unittest.skip(_GRANITE_GQA_SKIP_REASON)
     def test_granite_gqa_prefill_with_finite_broadcast_mask(self):
         """Prefill SDPA accepts the model's ``[B,1,Lq,Lk]`` causal mask.
 
@@ -523,7 +512,6 @@ class TestBuildingBlocks(unittest.TestCase):
         """
         self._run_granite_gqa_with_finite_broadcast_mask(LQ=128)
 
-    @unittest.skip(_GRANITE_GQA_SKIP_REASON)
     @mock.patch("torch_spyre._inductor.decompositions._SDPA_MAX_SEQUENCE_TILE_SIZE", 64)
     def test_granite_gqa_prefill_four_by_four_sequence_tiling(self):
         """Exercise Granite's transposed attention inputs and fused consumer."""
@@ -536,7 +524,7 @@ class TestBuildingBlocks(unittest.TestCase):
             reshape_output=True,
         )
 
-    @unittest.skip(_GRANITE_GQA_SKIP_REASON)
+    @unittest.skip("Runs for long time, possibly hang.  Keeping disabled")
     @mock.patch("torch_spyre._inductor.decompositions._SDPA_MAX_SEQUENCE_TILE_SIZE", 64)
     def test_granite_gqa_prefill_grouped_sixteen_by_sixteen_tiling(self):
         """Sixteen KV loop groups preserve Granite's online-softmax carries."""
