@@ -3436,9 +3436,12 @@ def _flash_v4_fn(q, k, v, *, B, S, H, D, b_tiles=1, h_tiles=1, lq_tiles=1, lk_ti
     k = k.view(B, S, H, D).transpose(1, 2)
     v = v.view(B, S, H, D).transpose(1, 2)
     scale = 1.0 / math.sqrt(math.sqrt(D))
-    output = torch.zeros_like(q)
-    real_max = torch.full((B, H, S), float("-inf"), device=q.device, dtype=q.dtype)
-    denominator = torch.zeros((B, H, S), device=q.device, dtype=q.dtype)
+    with spyre_hint(named_dims=["B", "Lq", "H", "D"]):
+        output = torch.zeros_like(q)
+    with spyre_hint(named_dims=["B", "H", "Lq"]):
+        real_max = torch.full((B, H, S), float("-inf"), device=q.device, dtype=q.dtype)
+    with spyre_hint(named_dims=["B", "H", "Lq"]):
+        denominator = torch.zeros((B, H, S), device=q.device, dtype=q.dtype)
     with spyre_hint(num_tiles_per_dim={"B": b_tiles}):
         with spyre_hint(num_tiles_per_dim={"H": h_tiles}):
             with spyre_hint(num_tiles_per_dim={"Lq": lq_tiles}):
@@ -3495,7 +3498,12 @@ def _flash_v4_fn(q, k, v, *, B, S, H, D, b_tiles=1, h_tiles=1, lq_tiles=1, lk_ti
 @pytest.mark.skip(
     reason="AssertionError in _stick_symbol: within-stick coordinate"
     " carries 2 free symbols, want exactly 1 -- v4's view+transpose"
-    " layout produces a coordinate expression padding.py cannot solve"
+    " layout produces a coordinate expression padding.py cannot solve."
+    " Named-dims tracking is no longer the cause (buf1/buf25/buf29 are"
+    " now correctly named end to end); propagate_layouts.py's multi-arg"
+    " pointwise candidate search still picks an interleaved (H+Lq) stick"
+    " layout for buf29 even with full naming -- fix belongs in"
+    " propagate_layouts.py's candidate acceptance, not naming."
 )
 def test_flash_v4_tile_H():
     """Flash v4: tile num_heads÷4 only."""
