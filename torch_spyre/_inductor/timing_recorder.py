@@ -36,7 +36,22 @@ region still running when the record was written.
 
 Event names have three shapes, so a reader can group without a lookup table:
 ``pipeline:<PipelineClass>``, ``pass:<PipelineClass>:<pass_name>``, and
-``stage:<PipelineClass>:<what>`` for work a pipeline does around its passes.
+``stage:<Owner>:<what>`` for a region that is not a pass -- work a pipeline does
+around its pass list, or a stage of the compile outside the pipelines entirely.
+
+Frontend time for one compile is a subtraction, not a span, because the backend
+runs per kernel from inside codegen::
+
+    pre_backend = stage:compile_fx:spyre_compile.inclusive_ns
+                  - sum(stage:SpyreAsyncCompile:backend_compile.inclusive_ns
+                        under that compile)
+
+One event name covers every backend (``dxp_standalone``, ``dbo-opt``), named in
+its ``meta["tool"]``, so the subtraction does not go stale when an emitter is
+added.
+
+A process compiling several graphs has one such event per compile, so group by
+the enclosing ``stage:compile_fx:spyre_compile`` rather than summing the record.
 
 Events nest, so ``inclusive_ns`` double-counts across levels and ``self_ns``
 does not. Ordinals are assignment-ordered, which reproduces the wall-clock
@@ -152,7 +167,13 @@ class TimingRecorder:
         return _Region(self, name, meta)
 
     def set_run_meta(self, **kv: Any) -> None:
-        self.run_meta.update(kv)
+        with self._lock:
+            self.run_meta.update(kv)
+
+    def append_run_meta(self, key: str, value: Any) -> None:
+        """Append to a list-valued run metadata key, creating it if absent."""
+        with self._lock:
+            self.run_meta.setdefault(key, []).append(value)
 
     def finalize(self) -> None:
         """Fill in ``self_ns``: inclusive time minus that of direct children.
@@ -329,6 +350,13 @@ def _run_metadata() -> dict[str, Any]:
         "torch_spyre_version": spyre_version,
         "torch_spyre_path": package_dir,
         "git_sha": _git_sha(package_dir),
+        # Unconditional: a record that only says "frontend only" when a kernel
+        # happened to be skipped cannot be told apart from a normal one. Read
+        # when the record is written, which is the value that governed the
+        # process unless a caller patched the config mid-run. If per-compile
+        # modes ever become real, the flag belongs on each
+        # stage:compile_fx:spyre_compile event's meta, not here.
+        "frontend_only": config.frontend_only,
         "torch_version": torch.__version__,
         "python_version": sys.version.split()[0],
     }
@@ -354,6 +382,11 @@ def stage(name: str, **meta: Any) -> ContextManager[_Event]:
 def set_run_meta(**kv: Any) -> None:
     if config.timing:
         RECORDER.set_run_meta(**kv)
+
+
+def append_run_meta(key: str, value: Any) -> None:
+    if config.timing:
+        RECORDER.append_run_meta(key, value)
 
 
 def dump_and_finalize(path: Optional[str] = None) -> Optional[str]:
@@ -389,6 +422,7 @@ __all__ = [
     "RECORDER",
     "RECORDER_VERSION",
     "TimingRecorder",
+    "append_run_meta",
     "dump_and_finalize",
     "is_enabled",
     "record_path",

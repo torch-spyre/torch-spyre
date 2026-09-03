@@ -709,6 +709,10 @@ Environment Variables
      - Destination for the ``TORCH_SPYRE_TIMING`` record. The pid is
        inserted before the suffix, so ``rec.json`` is written as
        ``rec.<pid>.json``. Empty writes nothing (default empty)
+   * - ``TORCH_SPYRE_FRONTEND_ONLY``
+     - Measurement mode: run a compile through backend-input generation and
+       stop before the backend compiler. Produces no runnable kernel --
+       calling one raises (default ``0``)
    * - ``SPYRE_DUMP_COST``
      - Print the predicted-runtime report after pre-scheduling: one total
        plus a per-kernel breakdown (default ``0``).

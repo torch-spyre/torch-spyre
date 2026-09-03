@@ -46,6 +46,31 @@ class SpyreUnimplementedRunner:
         )
 
 
+class SpyreFrontendOnlyRunner:
+    """Stands in for a kernel whose backend compile was deliberately skipped.
+
+    ``config.frontend_only`` stops a compile before ``dxp_standalone``, so there
+    is no spyreCodeDir to prepare and nothing to launch. Failing at call time
+    rather than at compile time is the point: the frontend runs to completion and
+    is measured, and only an attempt to actually execute reports the gap.
+    """
+
+    def __init__(self, name: str, code_dir: str):
+        self.kernel_name = name
+        self.code_dir = code_dir
+        self.profiler_event_name = None
+
+    # No @with_ffdc, unlike every other runner here: this failure is the mode
+    # working as asked, not a first failure worth capturing diagnostics for.
+    def run(self, *args, **kw_args):
+        raise RuntimeError(
+            f"{self.kernel_name} was compiled with TORCH_SPYRE_FRONTEND_ONLY=1: "
+            "the backend compiler never ran, so there is no kernel to launch. "
+            f"Backend input was left in {self.code_dir}. Unset "
+            "TORCH_SPYRE_FRONTEND_ONLY to produce a runnable kernel."
+        )
+
+
 class SpyreSDSCKernelRunner:
     def __init__(
         self,

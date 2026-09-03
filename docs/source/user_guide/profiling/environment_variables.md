@@ -92,7 +92,76 @@ one record. Event names have three shapes:
 |---|---|
 | `pipeline:<PipelineClass>` | One pass pipeline, start to finish |
 | `pass:<PipelineClass>:<pass_name>` | One pass within it |
-| `stage:<PipelineClass>:<what>` | Work a pipeline does around its passes (`pass_loop`, `cost_model`, `cost_dump`, `finalize_work_division`, and the `log_before` / `log_after` IR dumps when INFO logging is on) |
+| `stage:<Owner>:<what>` | Anything else that is timed |
+
+The `stage:` regions are:
+
+| Name | Region |
+|---|---|
+| `stage:compile_fx:spyre_compile` | One whole Spyre compile; every other region nests inside it |
+| `stage:CustomPreSchedulingPasses:pass_loop` | The pre-scheduling pass list |
+| `stage:CustomPreSchedulingPasses:cost_model` / `:cost_dump` | Predicted-runtime report and its per-op dump |
+| `stage:CustomPreSchedulingPasses:finalize_work_division` | Work-division ownership handoff to the scheduler |
+| `stage:CustomPreSchedulingPasses:log_before` / `:log_after` | The IR dumps, only when INFO logging is on |
+| `stage:GraphLowering:update_scheduler` | Upstream scheduler construction |
+| `stage:SpyreAsyncCompile:generate_bundle` / `:generate_ktir` | Backend-input generation, per kernel |
+| `stage:SpyreAsyncCompile:kernel_provenance` | Kernel provenance descriptor, per kernel |
+| `stage:SpyreAsyncCompile:backend_compile` | The backend compiler, per kernel (`meta.tool` is `dxp_standalone` or `dbo-opt`) |
+| `stage:SpyreAsyncCompile:prepare_kernel` | Loading the backend's output |
+| `stage:SpyreAsyncCompile:backend_skipped` | Marker where the backend was skipped; its duration is not a measurement |
+
+**Frontend time is a subtraction, not a span**, because the backend runs per
+kernel from inside codegen:
+
+```
+pre_backend = stage:compile_fx:spyre_compile
+              - sum(stage:SpyreAsyncCompile:backend_compile under that compile)
+```
+
+A process that compiles several graphs has one `spyre_compile` event per
+compile, so group by it rather than summing the whole record.
+
+### Skipping the backend
+
+The backend compiler -- `dxp_standalone`, or `dbo-opt` under
+`TORCH_SPYRE_KTIR=1` -- is invoked once per kernel and usually dominates compile
+wall time, so paying for it on every frontend measurement is what makes a sweep
+expensive. `TORCH_SPYRE_FRONTEND_ONLY=1` runs the frontend in
+full -- all pass pipelines, scheduling, codegen, and backend-input generation --
+and stops at each per-kernel backend invocation:
+
+```bash
+TORCH_SPYRE_FRONTEND_ONLY=1 TORCH_SPYRE_TIMING=1 \
+  TORCH_SPYRE_TIMING_OUT=/tmp/rec.json \
+  TORCHINDUCTOR_FORCE_DISABLE_CACHES=1 python3 my_model.py
+```
+
+The compile produces **no runnable kernel**: calling one raises a `RuntimeError`
+naming the variable and the bundle directory. Use it to measure, never to run --
+and to measure several graphs in one process, trigger compilation without
+executing the result, since the first call is what raises.
+
+**Disable caches when measuring**, with
+`TORCHINDUCTOR_FORCE_DISABLE_CACHES=1`. A cache hit skips the frontend
+altogether, so `stage:compile_fx:spyre_compile` would time a cache lookup and
+the record would still look valid -- which is what the second iteration of a
+sweep does by default.
+
+Caches stay usable afterwards. Each kernel's bundle goes to a fresh directory,
+and the generated wrapper re-enters the backend step on a cache reload, so a
+normal run reusing the same `TORCHINDUCTOR_CACHE_DIR` still compiles and runs.
+
+The record makes the difference explicit. A normal compile carries one
+`stage:SpyreAsyncCompile:backend_compile` event per kernel; a frontend-only
+compile carries `stage:SpyreAsyncCompile:backend_skipped` instead. Every record
+states the mode in its metadata (`frontend_only: true` or `false`) whether or not
+a kernel was skipped, and a frontend-only one also lists
+`backend_skipped_kernels`, so a truncated compile can never be mistaken for a
+fast one.
+
+What it does not measure: the backend itself, kernel execution, and anything a
+later pass would have learned from a compiled artifact. Bundle generation is
+inside the boundary, not outside it.
 
 ## FFDC (First Failure Data Capture)
 

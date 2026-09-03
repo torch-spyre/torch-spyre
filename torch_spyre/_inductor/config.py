@@ -119,6 +119,13 @@ timing: bool = _get_env_bool("TORCH_SPYRE_TIMING", False)
 # timing_recorder.RECORDER directly wants.
 timing_out: str = os.environ.get("TORCH_SPYRE_TIMING_OUT", "")
 
+# Measurement mode: run a compile through backend-input generation and stop
+# before the backend compiler.  The frontend runs in full; every per-kernel
+# dxp_standalone invocation is skipped, so the compile produces no runnable
+# kernel and calling one raises.  Never enable this to run a model -- it exists
+# so a frontend measurement does not have to pay for the backend.
+frontend_only: bool = _get_env_bool("TORCH_SPYRE_FRONTEND_ONLY", False)
+
 # Predicted-runtime reporting from the analytical cost model (cost_model.py,
 # cost_model_pass.py).  NOT related to work_division.cost_model_matmul_division,
 # which is a separate model used to choose a matmul work division.
