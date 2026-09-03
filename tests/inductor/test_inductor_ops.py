@@ -5193,6 +5193,18 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             # guard's own message refers to.  So this entry tracks "depthwise +
             # padding does not work end to end"; a message-asserting negative
             # test would additionally pin *where* it is rejected.
+            # Every activation stride_map below is declared H-major: the OUTER
+            # spatial dim (H) carries the LARGER stride, e.g. [32, 1, -1, ...] for
+            # a 32x32 activation.  This is required, not cosmetic.  Depthwise
+            # geometry is dim-label keyed downstream (get_conv_params picks
+            # stride_i/kernel_h vs stride_j/kernel_w by label, and
+            # compute_padding_for_dim pairs i<->ki, j<->kj), while the label a
+            # device slot receives follows that tensor's own coordinate order.  So
+            # the activation must order its spatial axes the same way the output
+            # does, and _depthwise_conv_layouts pins the output canonically
+            # H-major (host order, stick innermost) for every N.  A W-major
+            # activation now raises Unsupported at compile time -- see
+            # test_dwise_conv2d_rejects_w_major_activation.
             "expect_fail": ["8x64_ksize3_pad1"],
             "param_sets": {
                 "1x64_ksize3": (
@@ -5203,7 +5215,17 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     (1, 1),
                     64,
                     [[32, 32, 1, 1, 64], [3, 3, 1, 1, 64]],
-                    [[1, 32, -1, 65536, 1024], [1, 3, -1, 9, 9]],
+                    [[32, 1, -1, 65536, 1024], [1, 3, -1, 9, 9]],
+                ),
+                "2x64_ksize5_stride2": (
+                    cached_randn((2, 64, 32, 32)),
+                    cached_randn((64, 1, 5, 5)),
+                    None,
+                    (0, 0),
+                    (2, 2),
+                    64,
+                    [[32, 32, 1, 2, 64], [5, 5, 1, 1, 64]],
+                    [[32, 1, -1, 65536, 1024], [1, 5, -1, 25, 25]],
                 ),
                 "8x64_ksize3": (
                     cached_randn((8, 64, 128, 128)),
@@ -5213,7 +5235,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     (1, 1),
                     64,
                     [[128, 128, 1, 8, 64], [3, 3, 1, 1, 64]],
-                    [[1, 128, -1, 1048576, 16384], [1, 3, -1, 9, 9]],
+                    [[128, 1, -1, 1048576, 16384], [1, 3, -1, 9, 9]],
                 ),
                 # Same shape/layouts as 8x64_ksize3, padding=(1, 1): xfail, see
                 # the expect_fail note above.  The layouts are inherited from the
@@ -5226,7 +5248,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     (1, 1),
                     64,
                     [[128, 128, 1, 8, 64], [3, 3, 1, 1, 64]],
-                    [[1, 128, -1, 1048576, 16384], [1, 3, -1, 9, 9]],
+                    [[128, 1, -1, 1048576, 16384], [1, 3, -1, 9, 9]],
                 ),
                 "1x3x64_ksize3": (
                     cached_randn((1, 3, 64, 64)),
@@ -5236,7 +5258,25 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     (1, 1),
                     3,
                     [[64, 64, 1, 1, 64], [3, 3, 1, 1, 64]],
-                    [[1, 64, -1, 12288, 4096], [1, 3, -1, 9, 9]],
+                    [[64, 1, -1, 12288, 4096], [1, 3, -1, 9, 9]],
+                ),
+                # C == 1 (single-channel depthwise), strided.  The activation's
+                # channel axis is size 1, so its device stick is degenerate and
+                # its stick coordinate collapses to the constant 0.  A constant
+                # cannot identify an output dim (matching_dim requires exactly one
+                # free symbol), so the out-channel scan in
+                # _depthwise_conv_layouts finds no candidate and the op used to
+                # raise "no supported output layout" even though the canonical
+                # layout is representable.  Guards the canonical-order fallback.
+                "8x1_ksize3_stride2": (
+                    cached_randn((8, 1, 128, 128)),
+                    cached_randn((1, 1, 3, 3)),
+                    None,
+                    (0, 0),
+                    (2, 2),
+                    1,
+                    [[128, 128, 1, 8, 64], [3, 3, 1, 1, 64]],
+                    [[128, 1, -1, 16384, -1], [1, 3, -1, 9, -1]],
                 ),
                 "1x3x64_ksize_1x3": (
                     cached_randn((1, 3, 64, 64)),
@@ -5246,7 +5286,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     (1, 1),
                     3,
                     [[64, 64, 1, 1, 64], [3, 1, 1, 1, 64]],
-                    [[1, 64, -1, 12288, 4096], [1, 3, -1, 3, 3]],
+                    [[64, 1, -1, 12288, 4096], [1, 3, -1, 3, 3]],
                 ),
                 "1x3x64_ksize_3x1": (
                     cached_randn((1, 3, 64, 64)),
@@ -5256,7 +5296,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     (1, 1),
                     3,
                     [[64, 64, 1, 1, 64], [1, 3, 1, 1, 64]],
-                    [[1, 64, -1, 12288, 4096], [1, 1, -1, 3, 3]],
+                    [[64, 1, -1, 12288, 4096], [1, 1, -1, 3, 3]],
                 ),
                 "1x3x64x1_ksize_3x1": (
                     cached_randn((1, 3, 64, 1)),
@@ -5286,7 +5326,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     (1, 1),
                     3,
                     [[32, 32, 1, 2, 64], [1, 1, 1, 1, 64]],
-                    [[1, 32, -1, 3072, 1024], [1, 1, -1, 1, 1]],
+                    [[32, 1, -1, 3072, 1024], [1, 1, -1, 1, 1]],
                 ),
                 "1x16x64_ksize3": (
                     cached_randn((1, 16, 64, 64)),
@@ -5296,7 +5336,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     (1, 1),
                     16,
                     [[64, 64, 1, 1, 64], [3, 3, 1, 1, 64]],
-                    [[1, 64, -1, 65536, 4096], [1, 3, -1, 9, 9]],
+                    [[64, 1, -1, 65536, 4096], [1, 3, -1, 9, 9]],
                 ),
                 "2x32_ksize1_stride2": (
                     cached_randn((2, 32, 64, 64)),
@@ -5306,7 +5346,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     (2, 2),
                     32,
                     [[64, 64, 1, 2, 64], [1, 1, 1, 1, 64]],
-                    [[1, 64, -1, 131072, 4096], [1, 1, -1, 1, 1]],
+                    [[64, 1, -1, 131072, 4096], [1, 1, -1, 1, 1]],
                 ),
                 "1x3x128_ksize5": (
                     cached_randn((1, 3, 128, 128)),
@@ -5316,7 +5356,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     (1, 1),
                     3,
                     [[128, 128, 1, 1, 64], [5, 5, 1, 1, 64]],
-                    [[1, 128, -1, 49152, 16384], [1, 5, -1, 25, 25]],
+                    [[128, 1, -1, 49152, 16384], [1, 5, -1, 25, 25]],
                 ),
             },
         },
@@ -5606,6 +5646,18 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     None,
                     (2, 2),
                 ),
+                # H_out == 1 with a strided width. The lone surviving spatial
+                # symbol is a WIDTH axis, so _match_labels_by_structure must give
+                # it out_w/win_w; offering out_h first built the SDSC padding
+                # entry from stride_h/kernel_h and was wrong by ~48. Same defect
+                # as the rank-3 conv1d sets below, reached at rank 4 instead --
+                # which is why the guard keys on H_out, not on the rank.
+                "1x64x1x9_k1x3_s2": (
+                    cached_randn((1, 64, 1, 9)),
+                    cached_randn((64, 64, 1, 3)),
+                    None,
+                    (1, 2),
+                ),
                 # The declined corners -- ragged input width ((W_in-kW)%sW != 0)
                 # and kernel > 3 -- are covered by the pure-Python predicate test
                 # (test_conv2d_direct_support_predicate), not end-to-end here:
@@ -5616,9 +5668,12 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             },
         },
         ("test_conv1d_direct", "test_conv1d_direct_base"): {
-            ## strides 2 and above have numerical errors, so xfailing related tests
-            ## until the issue gets fixed
-            "expect_fail": ["1x64x13_k3_s2", "1x64x17_k3_s2", "1x64x9_k3_s2"],
+            # Strided conv1d used to be wrong here (~55 abs error at stride 2):
+            # a rank-3 conv1d's lone spatial axis was labelled ``i`` (out_h) by
+            # _match_labels_by_structure, while lower_convolution puts a conv1d's
+            # real geometry in the ``w`` slot, so its SDSC padding entry was built
+            # from stride_h == 1. Fixed by giving a rank-3 conv1d the ``out_w``
+            # role; stride 1 passed before only because stride_h == stride_w == 1.
             "param_sets": {
                 # k2, zero padding -- smallest direct-lowered window.
                 "1x64x8_k2": (
@@ -5669,10 +5724,10 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     None,
                     2,
                 ),
-                # Ragged HEIGHT, clean width (H:(8-3)%2=1, W:(9-3)%2=0). Height
-                # is untiled, so a ragged height is harmless -- this still
-                # direct-lowers and matches CPU (proves the width-tiling
-                # constraint is on width only, not either spatial dim).
+                # Smallest strided width here. A rank-3 conv1d has no height
+                # axis at all, so (unlike the conv2d group's same-named set)
+                # there is no ragged height in play: all three strided widths
+                # above are clean, (W-3)%2 == 0 for 9, 13 and 17.
                 "1x64x9_k3_s2": (
                     cached_randn((1, 64, 9)),
                     cached_randn((64, 64, 3)),
@@ -8428,6 +8483,51 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             rtol=0.1,
             msg=lambda msg: f"eager mode spyre <-> cpu mismatch\n\n{msg}\n",
         )
+
+    def test_dwise_conv2d_rejects_w_major_activation(self):
+        """A W-major activation must be rejected, not silently mis-addressed.
+
+        Depthwise geometry is dim-label keyed downstream, and the label a device
+        slot receives follows that tensor's own coordinate order, so the
+        activation has to order its spatial axes the same way the canonical
+        (H-major) output does.  Declaring the activation W-major -- inner spatial
+        dim carrying the larger stride -- used to compile fine and return numbers
+        off by up to ~26; _depthwise_conv_layouts now raises instead.
+
+        A non-square shape is used deliberately: with H == W the two device slots
+        carry the same extent, so device_size alone cannot disambiguate them and a
+        square case would not pin down which convention is under test.
+        """
+        from torch_spyre._C import SpyreTensorLayout, get_device_dtype
+
+        torch._dynamo.reset()
+        torch._inductor.codecache.FxGraphCache.clear()
+
+        N, C, H, W, K = 2, 64, 32, 24, 5
+        x = cached_randn((N, C, H, W))
+        weight = cached_randn((C, 1, K, K))
+        device_dtype_fp16 = get_device_dtype(torch.float16)
+
+        # W-major: slot 0 is W (stride 1), slot 1 is H (stride W).
+        x_dev = x.to(
+            device_layout=SpyreTensorLayout(
+                [W, H, 1, N, C], [1, W, -1, H * W * C, H * W], device_dtype_fp16
+            )
+        )
+        weight_dev = weight.to(
+            device_layout=SpyreTensorLayout(
+                [K, K, 1, 1, C], [K, 1, -1, K * K, K * K], device_dtype_fp16
+            )
+        )
+
+        def fn(x, weight):
+            return torch.conv2d(
+                x, weight, None, stride=(2, 2), padding=(0, 0), groups=C
+            )
+
+        with self.assertRaises(Exception) as ctx:
+            torch.compile(fn)(x_dev, weight_dev)
+        self.assertIn("spatial axis order", str(ctx.exception))
 
     def test_dwise_conv1d_cpu(
         self, x, weight, bias, padding, stride, groups, dev_layout, dev_stride

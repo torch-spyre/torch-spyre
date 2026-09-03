@@ -618,7 +618,29 @@ def _match_labels_by_structure(op_spec: "OpSpec") -> dict | None:
     # Output roles: non-stick output symbols in coordinate order are
     # [out_h, out_w, batch] (batch trails the spatial dims in the output layout).
     out_spatial = _ordered_arg_symbols(out_arg, exclude=(channel,))
-    spatial_roles = ["out_h", "out_w", "batch"]
+    # When the output height is degenerate (H_out == 1) the surviving spatial
+    # symbol is a **width** axis, so ``out_h`` must not be offered as a role.
+    # Two shapes reach here that way: a rank-3 conv1d, which
+    # ``lower_convolution`` models as a conv2d with H_in = kH = sH = 1 and whose
+    # real geometry therefore lives in the ``w`` slot; and a rank-4 conv2d whose
+    # H_out simplified to 1.  Zipping the canonical ``[out_h, out_w, batch]``
+    # order would hand the lone axis ``out_h`` -> ``i``, whose SDSC padding entry
+    # is then built from ``stride_h``/``kernel_h`` (1 for a conv1d) instead of the
+    # true width geometry, so ``totalSize_`` collapses to the output extent and
+    # every tap past the first reads the wrong element.  Measured wrong by ~55
+    # (conv1d) and ~48 (rank-4 H_out==1) at stride 2; stride 1 was correct only
+    # because stride_h == stride_w there.
+    #
+    # Keyed on H_out rather than on the rank, so both shapes are covered: rank is
+    # only a proxy, and a rank-4 conv2d with H_out == 1 has the same defect.
+    ranges = op_spec.node_output_ranges
+    height_is_degenerate = ranges is not None and (
+        len(ranges) == 3  # conv1d: no height axis at all
+        or (len(ranges) == 4 and _is_static_one(ranges[2]))  # NCHW, H_out == 1
+    )
+    spatial_roles = (
+        ["out_w", "batch"] if height_is_degenerate else ["out_h", "out_w", "batch"]
+    )
     if len(out_spatial) > len(spatial_roles):
         return None
     role_of = dict(zip(out_spatial, spatial_roles))
