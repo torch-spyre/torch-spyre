@@ -1,0 +1,62 @@
+# Solver-relayout sweep shard: mirrors test_inductor_ops_lx_misc_shape_c_config.yaml but runs
+# Split by wrap suffix so each shard fits the 60 minute job budget: the
+# CP-SAT co-optimizing configuration compiles roughly 2.5x slower per test
+# than the greedy LX shards this file mirrors. The split keys on the
+# _lx_planning_{pointwise,reduction} METHOD suffix: the OOT runner strips
+# the ClassName:: prefix from `names:` entries and matches bare method
+# names, so a class-name split does not select anything.
+# tests/inductor/test_inductor_ops_lx_solver_relayout.py, the LX-planning
+# wrap re-wrapped with layout_solver=cpsat, co_optimizing_lx_planning=True
+# and lx_solver_relayout=True. The xfail floor is inherited from the
+# LX-planning shard; deltas found by this sweep are appended per shard.
+test_suite_config:
+  labels: [regression, trunk]
+  files:
+    - path: ${TORCH_DEVICE_ROOT}/tests/inductor/test_inductor_ops_lx_solver_relayout.py
+      unlisted_test_mode: skip
+      tests:
+        # Known LX-planning failures -- run and expected to fail. Non-strict
+        # xfail: an unexpected pass (XPASS) does not fail CI. Entries failing
+        # in both wraps collapse to (pointwise|reduction).
+        - names:
+            - SolverRelayout.*::test_unfold_1d_large_lx_planning_pointwise
+            - SolverRelayout.*::test_unfold_1d_no_overlap_lx_planning_pointwise
+            - SolverRelayout.*::test_unfold_1d_step1_lx_planning_pointwise
+            - SolverRelayout.*::test_unfold_1d_step2_lx_planning_pointwise
+            - SolverRelayout.*::test_unfold_2d_dim0_lx_planning_pointwise
+            - SolverRelayout.*::test_unfold_2d_dim1_lx_planning_pointwise
+            - SolverRelayout.*::test_unfold_2d_dim_neg_lx_planning_pointwise
+            - SolverRelayout.*::test_unfold_2d_square_lx_planning_pointwise
+            - SolverRelayout.*::test_unfold_3d_dim0_lx_planning_pointwise
+            - SolverRelayout.*::test_unfold_3d_dim1_lx_planning_pointwise
+            - SolverRelayout.*::test_unfold_3d_dim2_lx_planning_pointwise
+            - SolverRelayout.*::test_unfold_4d_batch_lx_planning_pointwise
+            - SolverRelayout.*::test_unfold_4d_cnn_lx_planning_pointwise
+            - SolverRelayout.*::test_unfold_4d_spatial_lx_planning_pointwise
+            - SolverRelayout.*::test_unfold_edge_large_step_lx_planning_pointwise
+            - SolverRelayout.*::test_unfold_edge_nopad_2d_lx_planning_pointwise
+            - SolverRelayout.*::test_unfold_edge_nopad_37_lx_planning_pointwise
+            - SolverRelayout.*::test_unfold_edge_pow2_64_lx_planning_pointwise
+            - SolverRelayout.*::test_transpose_2d_large_dim_0_1_lx_planning_pointwise
+            - SolverRelayout.*::test_transpose_2d_large_dim_0_1_nopad_lx_planning_pointwise
+            - SolverRelayout.*::test_transpose_2d_large_dim_0_2_lx_planning_pointwise
+            - SolverRelayout.*::test_transpose_2d_large_dim_0_2_nopad_lx_planning_pointwise
+          mode: xfail
+        - names:
+            - SolverRelayout.*::test_unfold.*_lx_planning_pointwise
+            - SolverRelayout.*::test_squeeze.*_lx_planning_pointwise
+            - SolverRelayout.*::test_unsqueeze.*_lx_planning_pointwise
+            - SolverRelayout.*::test_t_1d.*_lx_planning_pointwise
+            - SolverRelayout.*::test_t_2d.*_lx_planning_pointwise
+            - SolverRelayout.*::test_transpose_2d.*_lx_planning_pointwise
+            - SolverRelayout.*::test_transpose_3d.*_lx_planning_pointwise
+            - SolverRelayout.*::test_transpose_4d.*_lx_planning_pointwise
+            - SolverRelayout.*::test_transpose_patterns.*_lx_planning_pointwise
+            - SolverRelayout.*::test_add_constant.*_lx_planning_pointwise
+            - SolverRelayout.*::test_repeat.*_lx_planning_pointwise
+            - SolverRelayout.*::test_restickify_fp32_unsupported_xfail.*_lx_planning_pointwise
+            - SolverRelayout.*::test_restickify_int64_unsupported_xfail.*_lx_planning_pointwise
+            - SolverRelayout.*::test_multiops_split.*_lx_planning_pointwise
+          mode: mandatory_success
+          tags:
+            - ops__inductor_misc_shape

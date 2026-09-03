@@ -1,0 +1,61 @@
+# Solver-relayout sweep shard: mirrors test_inductor_ops_lx_misc_shape_b_config.yaml but runs
+# Split by wrap suffix so each shard fits the 60 minute job budget: the
+# CP-SAT co-optimizing configuration compiles roughly 2.5x slower per test
+# than the greedy LX shards this file mirrors. The split keys on the
+# _lx_planning_{pointwise,reduction} METHOD suffix: the OOT runner strips
+# the ClassName:: prefix from `names:` entries and matches bare method
+# names, so a class-name split does not select anything.
+# tests/inductor/test_inductor_ops_lx_solver_relayout.py, the LX-planning
+# wrap re-wrapped with layout_solver=cpsat, co_optimizing_lx_planning=True
+# and lx_solver_relayout=True. The xfail floor is inherited from the
+# LX-planning shard; deltas found by this sweep are appended per shard.
+test_suite_config:
+  labels: [regression, trunk]
+  files:
+    - path: ${TORCH_DEVICE_ROOT}/tests/inductor/test_inductor_ops_lx_solver_relayout.py
+      unlisted_test_mode: skip
+      tests:
+        # Native SIGFPE (process-killing) in eager spyre__copy_from during the
+        # result copy-back of the round_trip_to_dtype add variants under the
+        # co-optimizing CP-SAT configuration. A crash cannot be xfailed; skip.
+        # First entry on purpose: name matching is first-match-wins.
+        - names:
+            - SolverRelayout.*::test_round_trip_to_dtype_add_.*_lx_planning_pointwise
+          mode: skip
+        # Known LX-planning failures -- run and expected to fail. Non-strict
+        # xfail: an unexpected pass (XPASS) does not fail CI. Entries failing
+        # in both wraps collapse to (pointwise|reduction).
+        - names:
+            - SolverRelayout.*::test_flatten_2d_full_lx_planning_pointwise
+            - SolverRelayout.*::test_flatten_3d_full_lx_planning_pointwise
+            - SolverRelayout.*::test_flatten_3d_mixed_dims_lx_planning_pointwise
+            - SolverRelayout.*::test_flatten_3d_neg_dims_lx_planning_pointwise
+            - SolverRelayout.*::test_flatten_3d_neg_full_lx_planning_pointwise
+            - SolverRelayout.*::test_flatten_3d_noncontig_full_lx_planning_pointwise
+            - SolverRelayout.*::test_flatten_3d_noncontig_partial_lx_planning_pointwise
+            - SolverRelayout.*::test_flatten_3d_trailing_lx_planning_pointwise
+            - SolverRelayout.*::test_flatten_4d_full_lx_planning_pointwise
+            - SolverRelayout.*::test_flatten_4d_large_full_lx_planning_pointwise
+            - SolverRelayout.*::test_flatten_4d_trailing_lx_planning_pointwise
+            - SolverRelayout.*::test_unbind_1d_dim0_lx_planning_pointwise
+            - SolverRelayout.*::test_unbind_2d_dim0_lx_planning_pointwise
+            - SolverRelayout.*::test_unbind_2d_dim1_lx_planning_pointwise
+            - SolverRelayout.*::test_unbind_2d_dimneg1_lx_planning_pointwise
+            - SolverRelayout.*::test_unbind_3d_dim0_lx_planning_pointwise
+            - SolverRelayout.*::test_unbind_3d_dim1_lx_planning_pointwise
+            - SolverRelayout.*::test_unbind_3d_dim2_lx_planning_pointwise
+            - SolverRelayout.*::test_unbind_3d_dimneg1_lx_planning_pointwise
+            - SolverRelayout.*::test_unbind_4d_dim0_lx_planning_pointwise
+            - SolverRelayout.*::test_unbind_4d_dim3_lx_planning_pointwise
+            - SolverRelayout.*::test_round_trip_to_dtype_mixed_ea_broadcast_add_fp16_2x4x64_bcast_fp32_2x4x1_lx_planning_pointwise
+          mode: xfail
+        - names:
+            - SolverRelayout.*::test_to_dtype.*_lx_planning_pointwise
+            - SolverRelayout.*::test_round_trip_to_dtype.*_lx_planning_pointwise
+            - SolverRelayout.*::test_flatten.*_lx_planning_pointwise
+            - SolverRelayout.*::test_permute.*_lx_planning_pointwise
+            - SolverRelayout.*::test_unbind.*_lx_planning_pointwise
+            - SolverRelayout.*::test_size_one.*_lx_planning_pointwise
+          mode: mandatory_success
+          tags:
+            - ops__inductor_misc_shape

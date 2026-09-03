@@ -30,6 +30,8 @@ from torch._inductor.ir import (
 )
 
 from .. import config
+from ..cost_model import OpFeatures, relayout_ns
+from ..dump_cost_model import governing_run_split
 from ..ir import FixedTiledLayout
 from ..logging_utils import get_inductor_logger
 from ..op_spec import TensorWorkDivision
@@ -234,6 +236,128 @@ def _unsupported_relayout_transition_reason(
     if source_work_division == destination_work_division:
         return "distinct physical ownerships collapse to the same logical work division"
     return None
+
+
+def solver_relayout_edge_context(
+    producer: Operation,
+    consumer: Operation,
+    source_name: str,
+    operations: dict[str, Operation],
+) -> tuple | None:
+    """Division-independent relayout eligibility of one producer->consumer edge.
+
+    The same structural gates ``collect_lx_relayout_plans`` applies on the
+    committed graph, restricted to what does not depend on a chosen division, so
+    the solver's candidate enumeration can run them once per edge before any
+    per-division-pair work. Returns ``(write_dep, read_dep, producer_coords,
+    consumer_coords, producer_symbols, consumer_symbols)``, or ``None`` when the
+    edge can never host a relayout.
+    """
+    # A coarse-tiled endpoint can never host a relayout. The fitted law has
+    # no loop_trip factor (the committed-path planner already guarantees "a
+    # relayout cannot be inside a coarse-tiling loop"), a tiled producer's
+    # buffer is per-tile scratch rather than the full tensor, and a tiled
+    # consumer reads cross-group data through a per-iteration staging op.
+    # The MutationLayout check below only screens the loop's DRAIN op; the
+    # staging and tiled compute ops are plain Pointwise buffers, so the
+    # loop_info presence is the reliable marker.
+    if (
+        getattr(producer, "loop_info", None) is not None
+        or getattr(consumer, "loop_info", None) is not None
+    ):
+        return None
+    if (
+        not isinstance(producer, ComputedBuffer)
+        or not isinstance(producer.layout, FixedTiledLayout)
+        or (write_dep := _single_write(producer, source_name)) is None
+        or not _is_activation_source(operations, producer)
+    ):
+        return None
+    if not isinstance(consumer, ComputedBuffer) or isinstance(
+        consumer.layout, MutationLayoutSHOULDREMOVE
+    ):
+        return None
+    if not _is_matmul_op(consumer) and not isinstance(consumer.data, Pointwise):
+        return None
+    consumer_deps = [
+        d for d in op_read_writes(consumer).reads if isinstance(d, MemoryDep)
+    ]
+    if any(d.is_indirect() for d in consumer_deps):
+        return None
+    if _is_matmul_op(consumer) and len(consumer_deps) != 2:
+        return None
+    source_reads = [d for d in consumer_deps if d.name == source_name]
+    if len(source_reads) != 1:
+        return None
+    read_dep = source_reads[0]
+    producer_coords = try_device_coordinates(
+        producer.layout.device_layout, write_dep, None
+    )
+    consumer_coords = try_device_coordinates(
+        producer.layout.device_layout, read_dep, None
+    )
+    if producer_coords is None or consumer_coords is None:
+        return None
+    return (
+        write_dep,
+        read_dep,
+        producer_coords,
+        consumer_coords,
+        tuple(iteration_space_from_op(producer)),
+        tuple(iteration_space_from_op(consumer)),
+    )
+
+
+def solver_relayout_pair_cost(
+    source_view: PerCoreView,
+    destination_view: PerCoreView,
+    num_cores: int,
+    device_dims: Sequence[int],
+    out_elems: int,
+    dtype_bytes: int,
+    params=None,
+) -> float | None:
+    """Price one candidate relayout (source view -> destination view), in ns.
+
+    ``None`` when the pair cannot host a relayout, or should not be offered:
+
+    - equal views need no relayout (that pair belongs to ``cd_parent_matches``);
+    - ``_compatible_partitions`` rejects everything but a full permutation
+      (uniform fanout/fanin, ``num_cores`` distinct owners on BOTH sides, split
+      products equal to ``num_cores``) - grouped gathers (#3440) fall out here,
+      exactly as on the committed path, and stay unpriced until their own term
+      is calibrated;
+    - a governing split outside the law's fitted range [2, 8] is DECLINED, not
+      clamped: the reporting path clamps because the shuffle it prices already
+      exists, but the solver must never be offered an option at a price the
+      law was not fitted for.
+
+    The price is ``relayout_ns`` on a minimal feature vector - the same function
+    the reporting path uses, so the two paths cannot drift.
+
+    Both views must be built FOR ``num_cores`` (every core's owner slot within
+    its split); the caller's cores_used equality gate guarantees that, and
+    ``_core_slices`` asserts it rather than tolerating an out-of-range slot.
+    """
+    if source_view == destination_view:
+        return None
+    if not _compatible_partitions(source_view, destination_view, num_cores):
+        return None
+    run_elems, split = governing_run_split(source_view, destination_view, device_dims)
+    if run_elems <= 0 or not 2 <= split <= 8:
+        return None
+    features = OpFeatures(
+        name="lx_relayout",
+        is_reduction=False,
+        out_elems=out_elems,
+        cores=num_cores,
+        dtype_bytes=dtype_bytes,
+        args=[],
+        is_lx_relayout=True,
+        relayout_run_elems=run_elems,
+        relayout_split=split,
+    )
+    return relayout_ns(features, params)
 
 
 def collect_lx_relayout_plans(graph: GraphLowering) -> list[LXRelayoutPlan]:

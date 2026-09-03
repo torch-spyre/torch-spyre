@@ -1,0 +1,47 @@
+# Solver-relayout sweep shard: mirrors test_inductor_ops_lx_reduction_scalar_config.yaml but runs
+# Split by wrap suffix so each shard fits the 60 minute job budget: the
+# CP-SAT co-optimizing configuration compiles roughly 2.5x slower per test
+# than the greedy LX shards this file mirrors. The split keys on the
+# _lx_planning_{pointwise,reduction} METHOD suffix: the OOT runner strips
+# the ClassName:: prefix from `names:` entries and matches bare method
+# names, so a class-name split does not select anything.
+# tests/inductor/test_inductor_ops_lx_solver_relayout.py, the LX-planning
+# wrap re-wrapped with layout_solver=cpsat, co_optimizing_lx_planning=True
+# and lx_solver_relayout=True. The xfail floor is inherited from the
+# LX-planning shard; deltas found by this sweep are appended per shard.
+test_suite_config:
+  labels: [regression, trunk]
+  files:
+    - path: ${TORCH_DEVICE_ROOT}/tests/inductor/test_inductor_ops_lx_solver_relayout.py
+      unlisted_test_mode: skip
+      tests:
+        # Known LX-planning failures -- run and expected to fail. Non-strict
+        # xfail: an unexpected pass (XPASS) does not fail CI. Entries failing
+        # in both wraps collapse to (pointwise|reduction).
+        - names:
+            - SolverRelayout.*::test_conv2d_1x3x32_ksize3_no_pad_lx_planning_reduction
+            # patch-embed conv (H_out*W_out == 64, one fp16 stick): the mandatory
+            # (N,C_out,64)->(N,C_out,8,8) reshape splits a full stick into the
+            # 2-variable stick expr 8*d1+d2, which the restickify solver rejects
+            # once a fused LX consumer pins the layout. Fine standalone (free
+            # output layout); the standalone test_conv2d case validates the fix.
+            - SolverRelayout.*::test_conv2d_1x6x128_patch16_bias_lx_planning_reduction
+            - SolverRelayout.*::test_dwise_conv2d_1x64_ksize3_depthwise_lx_planning_reduction
+            - SolverRelayout.*::test_conv2d_2x32_ksize1_stride2_lx_planning_reduction
+            - SolverRelayout.*::test_conv2d_2x3x32_ksize1_lx_planning_reduction
+            - SolverRelayout.*::test_conv2d_mistral_model_lx_planning_reduction
+            # Native direct-lowered conv2d, STRIDED cases only. A stride-2 conv
+            # miscomputes when its output is pinned in LX via the test-only
+            # allow_all_ops_in_lx_planning clone-insertion path (the inserted
+            # identity copy reads the strided-conv output buffer densely and the
+            # spatial elements shuffle). Non-strided direct convs are correct
+            # under LX (all 16 stride-1 direct cases pass). Production never
+            # pins conv output -- conv is not in OP_OUTPUT_GOOD_FOR_LX_REUSE --
+            # so this is a test-only path (backend follow-up on PR #3284).
+            - SolverRelayout.*::test_conv2d_direct_.*_s2_lx_planning_reduction
+          mode: xfail
+        - names:
+            - SolverRelayout.*::test_(all_dim|any_dim|count_nonzero|cummax|cummin|cumprod|logcumsumexp|max_default|median|mode_|nanmean|nanmedian|nanquantile|nansum|quantile|std_|topk|conv2d|dwise_conv2d|var_).*_lx_planning_reduction
+          mode: mandatory_success
+          tags:
+            - ops__inductor-reduction

@@ -1,0 +1,21 @@
+# Solver-relayout sweep shard: mirrors test_inductor_ops_lx_reduction_singledim1_config.yaml but runs
+# Split by wrap suffix so each shard fits the 60 minute job budget: the
+# CP-SAT co-optimizing configuration compiles roughly 2.5x slower per test
+# than the greedy LX shards this file mirrors. The split keys on the
+# _lx_planning_{pointwise,reduction} METHOD suffix: the OOT runner strips
+# the ClassName:: prefix from `names:` entries and matches bare method
+# names, so a class-name split does not select anything.
+# tests/inductor/test_inductor_ops_lx_solver_relayout.py, the LX-planning
+# wrap re-wrapped with layout_solver=cpsat, co_optimizing_lx_planning=True
+# and lx_solver_relayout=True. The xfail floor is inherited from the
+# LX-planning shard; deltas found by this sweep are appended per shard.
+test_suite_config:
+  labels: [regression, trunk]
+  files:
+    - path: ${TORCH_DEVICE_ROOT}/tests/inductor/test_inductor_ops_lx_solver_relayout.py
+      unlisted_test_mode: skip
+      tests:
+        - names:
+            - SolverRelayout.*::test_reduce_keepdim1.*_lx_planning_pointwise
+            - SolverRelayout.*::test_reduce_edge_keepdim1.*_lx_planning_pointwise
+          mode: mandatory_success

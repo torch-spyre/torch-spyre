@@ -487,6 +487,20 @@ def _per_core_run(view, device_dims) -> tuple:
     return (device_dims[d] // splits[d]) * inner, splits[d]
 
 
+def governing_run_split(source_view, destination_view, device_dims) -> tuple:
+    """(run_elems, split) of the FINER of the two views - the side the law keys on.
+
+    Governing side = smaller per-core run; on a run tie the LARGER split (at
+    equal run the higher split measured ~3.6x slower). Direction-symmetric, as
+    the fitted law requires (8.721 vs 8.701 us with the pair reversed). Shared
+    by the extractor here and the solver's candidate enumeration
+    (``lx_relayout.solver_relayout_pair_cost``) so the two paths cannot drift.
+    """
+    src = _per_core_run(source_view, device_dims)
+    dst = _per_core_run(destination_view, device_dims)
+    return min(src, dst, key=lambda t: (t[0], -t[1]))
+
+
 def _relayout_features(op, out_dims):
     """(is_lx_relayout, relayout_run_elems, relayout_split) for one op.
 
@@ -515,11 +529,9 @@ def _relayout_features(op, out_dims):
         )
         if plan is None:
             return zeros
-        src = _per_core_run(plan.source_view, out_dims)
-        dst = _per_core_run(plan.destination_view, out_dims)
-        # Governing side = the finer view: smaller per-core run; on a run tie the
-        # LARGER split (at equal run the higher split measured ~3.6x slower).
-        run_elems, split = min(src, dst, key=lambda t: (t[0], -t[1]))
+        run_elems, split = governing_run_split(
+            plan.source_view, plan.destination_view, out_dims
+        )
         if run_elems <= 0 or split <= 0:
             return zeros
         return True, run_elems, split

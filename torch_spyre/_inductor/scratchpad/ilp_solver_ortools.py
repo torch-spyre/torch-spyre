@@ -111,6 +111,7 @@ from torch_spyre._inductor.scratchpad.plan_solver import (
     SolveError,
     BufferType,
     _check_in_place_relationships,
+    relayout_symbol,
 )
 from torch_spyre._inductor import config
 
@@ -213,6 +214,13 @@ class _LifetimeBufferWithCpVars(Generic[_BufT]):
             for parent in b.in_place_parents
         }
         self.core_cost = None
+        # Relayout state (populated only by the joint subclass; kept here so
+        # every solver method can iterate uniformly). relayout_vars: one edge
+        # BoolVar per parent this buffer could relayout-read; pair lits and the
+        # destination (offset, size) vars are filled in as the model is built.
+        self.relayout_vars: dict[str, object] = {}
+        self.relayout_pair_lits: dict[str, list] = {}
+        self.relayout_dest: dict[str, tuple] = {}
 
     # -- producer/consumer edges (joint model only; none when division-fixed) --
     @property
@@ -331,6 +339,15 @@ class _CoreDivisionBufferWithCpVars(_LifetimeBufferWithCpVars[CoreDivisionBuffer
         m.add_element(self.division, cores_used, self.cores)
         m.add_element(self.division, core_cost, self.core_cost)
 
+        # One decision variable per relayout-eligible producer edge. The
+        # candidate (i, j, cost) triples arrive on the buffer from the
+        # allocator's enumeration (cd_parent_relayouts).
+        for parent, triples in b.cd_parent_relayouts.items():
+            if triples:
+                self.relayout_vars[parent] = m.new_bool_var(
+                    f"relayout_{parent}__{b.name}"
+                )
+
     @property
     def parents(self) -> list[str]:
         return self.buffer.parents
@@ -350,9 +367,36 @@ class _CoreDivisionBufferWithCpVars(_LifetimeBufferWithCpVars[CoreDivisionBuffer
         correctly if it slips through: ``_gate_divisions`` forces ``in_buffer``
         false when the pair list is empty."""
         for child, compatible in kids:
+            child_w = bufs[child]
+            relayout_lit = child_w.relayout_vars.get(self.name)
+            if relayout_lit is None:
+                _gate_divisions(
+                    model, compatible, self.division, child_w.division, self.in_buffer
+                )
+                continue
+            # Relayout relaxes the gate on this edge: residency needs a slicing
+            # MATCH or an active RELAYOUT (whose own pair table then pins the
+            # division pair). The source must be resident to be shuffled from.
+            match_lit = model.new_bool_var(f"match_{self.name}__{child}")
             _gate_divisions(
-                model, compatible, self.division, bufs[child].division, self.in_buffer
+                model, compatible, self.division, child_w.division, match_lit
             )
+            model.add_bool_or([match_lit, relayout_lit]).only_enforce_if(self.in_buffer)
+            model.add_implication(relayout_lit, self.in_buffer)
+            pair_lits = []
+            for i, j, cost in child_w.buffer.cd_parent_relayouts[self.name]:
+                lit = model.new_bool_var("")
+                model.add(self.division == i).only_enforce_if(lit)
+                model.add(child_w.division == j).only_enforce_if(lit)
+                # A pair lit implies its edge: the cost term (sum of
+                # cost * lit) can then never charge an inactive edge, and
+                # extraction reads the chosen pair directly.
+                model.add_implication(lit, relayout_lit)
+                pair_lits.append((lit, i, j, cost))
+            model.add_bool_or([lit for lit, *_ in pair_lits]).only_enforce_if(
+                relayout_lit
+            )
+            child_w.relayout_pair_lits[self.name] = pair_lits
 
     def constrain_merge(self, model, parent, edge) -> None:
         """An active merge means the child reuses the parent's exact per-core
@@ -752,6 +796,10 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
             b.address = None if sb.address is None else sb.address * self.alignment
             if isinstance(b, CoreDivisionBuffer) and isinstance(sb, CoreDivisionBuffer):
                 b.chosen_division = sb.chosen_division
+                b.chosen_relayouts = {
+                    parent: (i, j, dest_offset * self.alignment)
+                    for parent, (i, j, dest_offset) in sb.chosen_relayouts.items()
+                }
         return list(buffers)
 
     # ------------------------------------------------------------------
@@ -778,6 +826,17 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
                     sym_map[symbol.name] = cp_splits[key]
                     sym_map[f"_buffer_{symbol.name}"] = t
                     sym_map[f"_raw_{symbol.name}"] = cp_splits_raw[key]
+            # Each relayout edge's cost symbol binds to the float-weighted
+            # sum over its pair literals: a pair lit implies its edge and
+            # pins the division pair, so the sum charges exactly the chosen
+            # pair's fitted cost, and zero when the edge is off. Linear, so
+            # it never touches the log/Min/Max lowering. (sym_map is keyed
+            # by symbol NAME, and the printer resolves a direct binding
+            # before its lazy inv_/log2_ construction.)
+            for parent, plist in t.relayout_pair_lits.items():
+                sym_map[relayout_symbol(t.name, parent).name] = sum(
+                    lit * cost for lit, _i, _j, cost in plist
+                )
 
         try:
             cp_cost = _SympyExprToCpSat(model, sym_map).convert(cost_expr)
@@ -831,6 +890,13 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
             # as a constraint before optimizing the next, so a later step only
             # breaks ties the earlier ones leave open.
 
+            # Fallback discipline: the traffic objective below knows no relayout
+            # price, and an unpriced shuffle looks free - the exact degeneracy
+            # the cost term exists to remove. No relayout decision may be made
+            # under this objective.
+            for sb in tensors.values():
+                for lit in sb.relayout_vars.values():
+                    model.add(lit == 0)
             # Residency (the hard priority): minimize total HBM transfer traffic so
             # as much as possible stays resident in LX.
             hbm_terms = [
@@ -1030,6 +1096,50 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
                     f"y_{sb.name}",
                 )
             )
+        # Relayout destinations: one optional rectangle per eligible edge whose
+        # presence literal IS the edge's decision variable. The destination
+        # lives exactly the consumer's tick (the shuffle and the read both
+        # execute inside that bundle, serially), the source keeps its full
+        # lifetime, and this constraint keeps the two - and everything else
+        # alive at that tick - disjoint in space. This is the interval-variable
+        # form of the greedy path's half-tick lifetime surgery: no time-axis
+        # doubling and no variable source end are needed while relayout is
+        # per-edge (the source may still be read by its other consumers).
+        for sb in bufs.values():
+            for parent, lit in sb.relayout_vars.items():
+                pw = bufs.get(parent)
+                if pw is None:
+                    model.add(lit == 0)
+                    continue
+                dest_sizes = [
+                    ceil_div(pw.buffer.size, cd.cores_used)
+                    for cd in sb.buffer.core_divisions
+                ]
+                eff = model.new_int_var(
+                    0, max(dest_sizes), f"rdest_size_{parent}__{sb.name}"
+                )
+                model.add_element(sb.division, dest_sizes, eff)
+                off = model.new_int_var(
+                    0,
+                    max(0, self._capacity_units - 1),
+                    f"rdest_off_{parent}__{sb.name}",
+                )
+                model.add(off + eff <= self._capacity_units).only_enforce_if(lit)
+                tick = sb.start_time
+                x_intervals.append(
+                    model.new_optional_interval_var(
+                        tick, 1, tick + 1, lit, f"rdest_x_{parent}__{sb.name}"
+                    )
+                )
+                y_end = model.new_int_var(
+                    0, self._capacity_units, f"rdest_top_{parent}__{sb.name}"
+                )
+                y_intervals.append(
+                    model.new_optional_interval_var(
+                        off, eff, y_end, lit, f"rdest_y_{parent}__{sb.name}"
+                    )
+                )
+                sb.relayout_dest[parent] = (off, eff)
         model.add_no_overlap_2d(x_intervals, y_intervals)
 
     def _get_children(
@@ -1088,8 +1198,33 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         }
         footprint = {name: sb.footprint(solver) for name, sb in bufs.items()}
 
+        # Read back fired relayout edges: the chosen (parent_div, own_div) pair
+        # and the destination's solved offset (alignment units; the caller
+        # scales to bytes). Recorded on the buffer for the commit path.
+        relayout_fired = False
+        for sb in bufs.values():
+            for src_name, lit in sb.relayout_vars.items():
+                if not solver.BooleanValue(lit):
+                    continue
+                relayout_fired = True
+                pair = next(
+                    (i, j)
+                    for plit, i, j, _cost in sb.relayout_pair_lits[src_name]
+                    if solver.BooleanValue(plit)
+                )
+                off, _eff = sb.relayout_dest[src_name]
+                sb.buffer.chosen_relayouts[src_name] = (
+                    pair[0],
+                    pair[1],
+                    solver.Value(off),
+                )
+
         offsets: Optional[dict[str, int]] = None
-        if self._bottom_justify:
+        # Bottom-justify slides placement units below the solver's offsets, but
+        # it knows nothing about relayout destination rectangles - a slide
+        # could move a buffer into a destination's space. Keep the solver's own
+        # (always-legal) offsets whenever a relayout fired.
+        if self._bottom_justify and not relayout_fired:
             # A placement unit is a connected component of active merge edges: its
             # members share one base (the merge equalities), so the component
             # slides as a single block and in-place reuse is preserved.
