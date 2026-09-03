@@ -4143,11 +4143,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
             fn, x, y, run_compile=True, run_eager=False, atol=0.01, rtol=0.01
         )
 
-    @pytest.mark.skip(
-        reason="Compiles now, but produces a genuine numeric inf at runtime"
-        " (99.3% of elements mismatched, abs diff inf) -- distinct from the"
-        " compile-time layout-promotion issue this test previously hit"
-    )
     def test_hint_flash_attention_v2_divide_in_scope(self):
         """Flash attention v2 with the final divide INSIDE the scope.
 
@@ -4833,19 +4828,8 @@ class TestCoarseTileSpyreHints(InductorTestCase):
             h_tiles=4, lq_tiles=None, B=4, H=8, Lq=1, Lk=8192, D=128, kv_block=2048
         )
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason=(
-            "h_tiles == H gives a 1-element H tile, and a unit-size tiled dim is "
-            "squeezed out of _insert_one_read_copy's squeeze_pos map (built by "
-            "skipping ranges where int(r) == 1), so the subsequent "
-            "squeeze_pos[d] lookup raises KeyError. Reproduced at 2 and 4 chunks "
-            "on main; h_tiles of 2 and 4 are numerically exact. Compile-time "
-            "error only -- it does not leave the device in an error state."
-        ),
-    )
     def test_hint_flash_attention_kv_chunked_unit_h_tile(self):
-        """h_tiles == H (one head per tile) crashes in read-copy insertion."""
+        """h_tiles == H (one head per tile) is numerically exact."""
         self._run_kv_chunked_flash(h_tiles=8, lq_tiles=2)
 
     def test_hint_flash_attention_kv_chunked_8_chunks(self):
