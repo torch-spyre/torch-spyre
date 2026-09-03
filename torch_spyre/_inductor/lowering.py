@@ -59,6 +59,7 @@ from .ir import (
     BroadcastKernel,
     SpyreConstantFallback,
     SpyreEmptyFallback,
+    ReduceScatterKernel,
     SpyreReduction,
     WaitKernel,
     copy_back_view,
@@ -3161,6 +3162,9 @@ def lower_any_def(x):
 # These mirror torch/_inductor/comm_lowering.py: nodes are built with the
 # upstream _CollectiveKernel factories (create_inplace / create_out_of_place /
 # create_wait), and only codegen is Spyre-specific (see SpyreCollectiveKernel).
+# spyre-comms only supports single-tensor WSIs, so coalesced variants are
+# decomposed into per-tensor collectives; the C++ wsi_cache_ deduplicates plans
+# for same-shaped tensors.
 _c10d = torch.ops._c10d_functional
 
 
@@ -3236,6 +3240,43 @@ def lower_c10d_all_gather(tensor, group_size, group_name):
     return _all_gather(tensor, group_size, group_name)
 
 
+@register_spyre_lowering(_c10d.all_gather_into_tensor_coalesced.default)
+def lower_c10d_all_gather_coalesced(tensors, group_size, group_name):
+    """Decompose coalesced all_gather into per-tensor all_gather calls."""
+    return [_all_gather(t, group_size, group_name) for t in tensors]
+
+
+def _reduce_scatter(tensor, reduce_op, group_size, group_name):
+    return ir.TensorBox.create(
+        ReduceScatterKernel.create_out_of_place(
+            _c10d.reduce_scatter_tensor.default,
+            tensor,
+            reduce_op,
+            group_size,
+            group_name,
+        )
+    )
+
+
+@register_spyre_lowering(_c10d.reduce_scatter_tensor.default)
+def lower_c10d_reduce_scatter(tensor, reduce_op, group_size, group_name):
+    """Out-of-place reduce_scatter: output shape[0] = input.shape[0] // group_size."""
+    logger.debug(
+        "Lowering _c10d_functional.reduce_scatter_tensor "
+        "(reduce_op=%s, group_size=%s, group_name='%s')",
+        reduce_op,
+        group_size,
+        group_name,
+    )
+    return _reduce_scatter(tensor, reduce_op, group_size, group_name)
+
+
+@register_spyre_lowering(_c10d.reduce_scatter_tensor_coalesced.default)
+def lower_c10d_reduce_scatter_coalesced(tensors, reduce_op, group_size, group_name):
+    """Decompose coalesced reduce_scatter into per-tensor reduce_scatter calls."""
+    return [_reduce_scatter(t, reduce_op, group_size, group_name) for t in tensors]
+
+
 def _all_reduce_inplace(tensor, reduce_op, group_name):
     mutation_target = tensor if isinstance(tensor.data, ir.BaseView) else None
     tensor = _realize_collective_input(tensor)
@@ -3278,3 +3319,15 @@ def lower_c10d_all_reduce_inplace(tensor, reduce_op, group_name):
         group_name,
     )
     return _all_reduce_inplace(tensor, reduce_op, group_name)
+
+
+@register_spyre_lowering(_c10d.all_reduce_coalesced.default)
+def lower_c10d_all_reduce_coalesced(tensors, reduce_op, group_name):
+    """Decompose coalesced all_reduce into per-tensor all_reduce_ on clones."""
+    return [_all_reduce_inplace(clone(t), reduce_op, group_name) for t in tensors]
+
+
+@register_spyre_lowering(_c10d.all_reduce_coalesced_.default)
+def lower_c10d_all_reduce_coalesced_inplace(tensors, reduce_op, group_name):
+    """In-place variant of the coalesced all_reduce decomposition."""
+    return [_all_reduce_inplace(t, reduce_op, group_name) for t in tensors]
