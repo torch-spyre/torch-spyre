@@ -30,6 +30,8 @@ def _launch(path, tensors):
     # this is the magic line
     # should have already compiled at this point
     jobplan = torch.spyre.prepare_kernel(str(spyrecode_dir))
+
+    print(jobplan.expected_input_shapes())
     torch.spyre.launch_jobplan(jobplan, tensors)
 
 

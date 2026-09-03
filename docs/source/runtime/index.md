@@ -230,6 +230,28 @@ cover every operation a launch needs:
 `flex::RuntimeStream`. FIFO ordering on the stream is what makes the step
 sequence safe: each step completes before the next one starts.
 
+### Inspecting a JobPlan from Python
+
+`torch_spyre._C.JobPlan` exposes a read-only view of a prepared plan, useful
+for tests and for debugging a bundle before launching it:
+
+| Method | Returns |
+|---|---|
+| `num_steps()` | Number of steps in the plan |
+| `get_step_type(idx)` | `"H2D"`, `"D2H"`, `"Compute"`, or `"HostCompute"` |
+| `get_step_name(idx)` | Profiler-visible name of a compute step, else `None` |
+| `get_step_pipeline_barrier(idx)` | Pipeline-barrier flag for the step |
+| `job_allocation_size()` | Total size of the owning job allocation |
+| `num_expected_inputs()` | Number of recorded compiled input shapes |
+| `expected_input_shapes()` | Compiled tile dimensions, one list per input |
+| `get_expected_input_shape(idx)` | Compiled tile dimensions for one input |
+
+`expected_input_shapes()` returns an empty list for pure-DMA JobPlans. It is
+also empty for compute JobPlans today: `JobPlanBuilder::translateJobExecPlan`
+leaves the field unset because SpyreCode does not yet carry input shape
+metadata. Callers must therefore treat an empty result as "unknown", not as
+"zero inputs".
+
 ### Program correction
 
 Compiled binaries arrive with symbolic placeholders for tensor addresses that

@@ -399,6 +399,23 @@ class JobPlan:
         """Get the size of the job allocation"""
         ...
 
+    def num_expected_inputs(self) -> int:
+        """Get the number of compiled input shapes recorded in the JobPlan"""
+        ...
+
+    def expected_input_shapes(self) -> list[list[int]]:
+        """Get the compiled tile dimensions, one list per kernel input.
+
+        Returns an empty list for pure-DMA JobPlans (e.g. tensor .to(device))
+        and for JobPlans whose SpyreCode does not yet carry input shape
+        metadata.
+        """
+        ...
+
+    def get_expected_input_shape(self, idx: int) -> list[int]:
+        """Get the compiled tile dimensions for the input at the given index"""
+        ...
+
     def get_step_type(self, idx: int) -> str:
         """Get the type of step at the given index (H2D, D2H, Compute, or HostCompute)"""
         ...

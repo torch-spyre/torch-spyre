@@ -467,6 +467,28 @@ PYBIND11_MODULE(_C, m) {
           },
           "Get the size of the job allocation")
       .def(
+          "num_expected_inputs",
+          [](const spyre::JobPlan& plan) {
+            return plan.expected_input_shapes.size();
+          },
+          "Get the number of compiled input shapes recorded in the JobPlan")
+      .def(
+          "expected_input_shapes",
+          [](const spyre::JobPlan& plan) { return plan.expected_input_shapes; },
+          "Get the compiled tile dimensions, one list per kernel input.\n\n"
+          "Returns an empty list for pure-DMA JobPlans (e.g. tensor "
+          ".to(device)) and for JobPlans whose SpyreCode does not yet carry "
+          "input shape metadata.")
+      .def(
+          "get_expected_input_shape",
+          [](const spyre::JobPlan& plan, size_t idx) {
+            TORCH_CHECK(idx < plan.expected_input_shapes.size(),
+                        "Input shape index out of range");
+            return plan.expected_input_shapes[idx];
+          },
+          py::arg("idx"),
+          "Get the compiled tile dimensions for the input at the given index")
+      .def(
           "get_step_type",
           [](const spyre::JobPlan& plan, size_t idx) {
             TORCH_CHECK(idx < plan.steps.size(), "Step index out of range");

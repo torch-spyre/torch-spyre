@@ -210,6 +210,37 @@ class TestPrepareKernel:
             # Should match the allocated size (1024 bytes)
             assert job_plan.job_allocation_size() == 1024
 
+    def test_job_plan_expected_input_shapes(self):
+        """Test JobPlan.expected_input_shapes() and num_expected_inputs().
+
+        SpyreCode does not carry input shape metadata yet (see the TODO in
+        JobPlanBuilder::translateJobExecPlan), so a prepared JobPlan reports
+        zero expected inputs. This test pins the accessor contract: a list is
+        returned, it is consistent with num_expected_inputs(), and it does not
+        raise. Update the expectation once deeptools emits the shapes.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            spyrecode_dir = self.create_mock_spyrecode(tmpdir)
+            job_plan = torch_spyre._C.prepare_kernel(spyrecode_dir)
+
+            shapes = job_plan.expected_input_shapes()
+            assert isinstance(shapes, list)
+            assert all(isinstance(shape, list) for shape in shapes)
+            assert all(isinstance(dim, int) for shape in shapes for dim in shape)
+            assert len(shapes) == job_plan.num_expected_inputs()
+
+            # Not yet populated from SpyreCode.
+            assert shapes == []
+
+    def test_job_plan_get_expected_input_shape_out_of_range(self):
+        """get_expected_input_shape must raise for an out-of-range index."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            spyrecode_dir = self.create_mock_spyrecode(tmpdir)
+            job_plan = torch_spyre._C.prepare_kernel(spyrecode_dir)
+
+            with pytest.raises(RuntimeError, match="Input shape index out of range"):
+                job_plan.get_expected_input_shape(0)
+
     def test_job_plan_step_type(self):
         """Test JobPlan.get_step_type() method."""
         with tempfile.TemporaryDirectory() as tmpdir:
