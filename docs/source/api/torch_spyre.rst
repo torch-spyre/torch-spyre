@@ -684,8 +684,6 @@ Environment Variables
        passed in as ``%pool_base_addr``, instead of the backend
        self-allocating via ``sdscbundle.device_mem_allocate``
        (default ``0``)
-   * - ``GLOBAL_STICK_OPTIMIZER``
-     - Enable the global stick-dimension optimizer (default ``1``)
    * - ``SPYRE_CORE_ID_K_FAST_EMISSION``
      - Permute physical core IDs at SDSC emission so K-collaborator cores
        sit on adjacent ring positions, reducing PSUM chain hops (default
@@ -694,8 +692,8 @@ Environment Variables
      - Emit LPDDR5 tensor addresses as runtime symbols rather than baked
        integers (default ``1``)
    * - ``LAYOUT_SOLVER``
-     - LX scratchpad layout solver strategy: ``greedy`` (default),
-       ``bestfit``, ``firstfit``, ``cpsat``, ``simulated_annealing``.
+     - LX scratchpad layout solver strategy: ``cpsat`` (default),
+       ``greedy``, ``bestfit``, ``firstfit``, ``simulated_annealing``.
        See :doc:`/compiler/scratchpad_planning`
    * - ``SPYRE_INDUCTOR_ENABLE_REDUCTION_TILING``
      - Enable reduction tiling in the pre-scheduling pipeline (default

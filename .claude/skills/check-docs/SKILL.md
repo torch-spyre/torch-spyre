@@ -165,14 +165,15 @@ contiguous, expand, narrow, select) require special attention:
 - **inductor_frontend.md** — Check that extension points (PrePass, PostPass,
   SchedulerPass) match what is registered in `torch_spyre/_inductor/passes.py`
   and `torch_spyre/_inductor/pass_utils.py`.
-- **backend.md** — Verify DeepTools invocation paths match `torch_spyre/_inductor/dsc.py`.
+- **backend.md** — Verify DeepTools invocation paths match
+  `torch_spyre/_inductor/codegen/superdsc.py` and
+  `torch_spyre/_inductor/codegen/compute_ops.py` (`generate_sdsc()`).
 - **adding_operations.md** — Confirm the three patterns (direct mapping,
   decomposition, custom op) still match the current code patterns. Check that
   example ops cited still exist.
 - **work_division_planning.md** — Verify op_dim_splits representation and
-  dimension labels match `torch_spyre/_inductor/core_division.py`.
-- **work_division_codegen.md** — Check code generation patterns match
-  `torch_spyre/_inductor/codegen/compute_ops.py` and `data_ops.py`.
+  dimension labels match `torch_spyre/_inductor/work_division.py` and
+  `torch_spyre/_inductor/core_mapping.py` (`core_to_slice_mapping`).
 
 ## 4. Runtime Documentation
 
@@ -239,16 +240,17 @@ Cross-reference the "Streams" tables in `torch_spyre.rst` against
 
 ### 5e. New Public Modules
 
-Check if any new public modules have been added that are not yet in the
-API docs:
-
-- `torch_spyre/ops/` — eager ops and fallbacks
-- `torch_spyre/device/` — device interface
-- `torch_spyre/execution/` — async compile, kernel runner
-- `torch_spyre/memory/` — memory management
-
-For each, determine if it exposes public API that users would call
-directly. If so, add a section to `torch_spyre.rst`.
+Check if any new modules have been added under `torch_spyre/` that expose
+API a user would call directly (as opposed to internal Inductor/device
+plumbing). As of this writing, `torch_spyre/device/` (device interface),
+`torch_spyre/execution/` (async compile, kernel runner), and
+`torch_spyre/memory/` are internal — they are wired into Inductor's device
+registration and are already referenced as implementation links from
+`docs/source/compiler/inductor_frontend.md` and `backend.md`, not from the
+public API reference. Don't add them to `torch_spyre.rst` on that basis
+alone; only do so if a module starts exposing something meant to be called
+directly by user code. `torch_spyre/ops/` (eager ops and fallbacks) is
+similarly internal registration machinery, not a user-facing namespace.
 
 ## 6. User Guide
 

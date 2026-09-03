@@ -8,10 +8,10 @@ working on next.
 
 Scratchpad planning runs by default. The pass is gated by `lx_planning`,
 which has defaulted to `1` since [#2459](https://github.com/torch-spyre/torch-spyre/pull/2459).
-The greedy solver (`config.layout_solver = "greedy"`) is the default.
-First-fit, best-fit, and an OR-Tools CP-SAT solver (`"cpsat"`) are
-available as opt-ins; `layout_solver` can also be set from the
-`LAYOUT_SOLVER` environment variable.
+The OR-Tools CP-SAT solver (`config.layout_solver = "cpsat"`) is the
+default. Greedy, first-fit, and best-fit are available as opt-ins;
+`layout_solver` can also be set from the `LAYOUT_SOLVER` environment
+variable.
 
 Co-optimization with work distribution is opt-in.
 `config.co_optimizing_lx_planning` (`CO_OPTIMIZING_LX_PLANNING=1`)
@@ -62,7 +62,7 @@ The compiler picks which buffers live where.
 | Usable LX per core | ~1.55 MB | `round_up_128(int(((2<<20) - (64<<10)) * (1 - frac_avail)))` |
 | Alignment | 128-byte (stick) | implicit |
 | Cores | 1 to 32 | `SENCORES` |
-| Per-core HBM span limit | (255.996 MiB) | hardware, separate from LX |
+| Per-core HBM span limit | (256 MB) | hardware, separate from LX |
 | Inter-core data ring | yes | not yet used by compiler |
 | Inter-core reduce-sum ring | yes | not yet used by compiler |
 
@@ -139,6 +139,7 @@ deadcode_elimination
 propagate_named_dims                  # named-dimension metadata (pre-stickification)
 assign_dim_hints
 _maybe_coarse_tile_hints              # hint-driven coarse tiling, when hints produce groups
+insert_bmm_padding                    # pad matmul y's K (pre-stickification)
 split_multi_ops
 propagate_spyre_tensor_layouts        # assign FixedTiledLayout
 validate_ops
@@ -147,10 +148,10 @@ finalize_layouts
 insert_restickify
 enforce_indirect_access_layout
 insert_post_mutation_restickify
-insert_bmm_padding
+insert_restickify_padding
 dedup_and_promote_constants
 _maybe_coarse_tile_span_overflow      # span-overflow coarse tiling (post-stickification)
-span_reduction                        # work-division: enforce 255.996 MiB span
+span_reduction                        # work-division: enforce 256 MB span
 cost_model_matmul_division            # work-division: matmul cost model
 work_distribution                     # work-division: default distributor
 _maybe_scratchpad_planning            # ← THIS PASS, gated by config.lx_planning
@@ -401,9 +402,9 @@ Once `layout.allocation["lx"]` is set:
 `config.layout_solver`
 (`"greedy" | "firstfit" | "bestfit" | "cpsat" | "simulated_annealing"`)
 picks the solver; it defaults from the `LAYOUT_SOLVER` environment
-variable (falling back to `"greedy"`).
+variable (falling back to `"cpsat"`).
 
-### GreedyLayoutSolver (default)
+### GreedyLayoutSolver
 
 Walks transition points in chronological order. At each point it
 deallocates expired buffers, then for each newly-live buffer:

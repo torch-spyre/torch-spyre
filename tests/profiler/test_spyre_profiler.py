@@ -58,19 +58,19 @@ class TestSpyreProfiler(TestCase):
         #   AIUpti_ActivityCompute (and _ActivityMemcpy) *after* the `name[128]`
         #   field. `name`'s own offset didn't move — but the record WALKER
         #   advances by sizeof(AIUpti_ActivityCompute) (libaiupti
-        #   aiupti_api.cpp::aiuptiActivityGetNextRecord). If libaiupti and
-        #   kineto-spyre are not rebuilt in lockstep they disagree on that size,
-        #   so after the first record every subsequent record is read at the
-        #   wrong offset and the kernel `name` lands on garbage bytes ->
-        #   UnicodeDecodeError when prof.events() -> _parse_kineto_results ->
-        #   evt.name() decodes it. Real fix = rebuild libaiupti + kineto-spyre
-        #   together. Tracked in #114.
+        #   aiupti_api.cpp::aiuptiActivityGetNextRecord). If the AIUPTI/Kineto
+        #   bridge built into torch_spyre is stale relative to libaiupti, they
+        #   disagree on that size, so after the first record every subsequent
+        #   record is read at the wrong offset and the kernel `name` lands on
+        #   garbage bytes -> UnicodeDecodeError when prof.events() ->
+        #   _parse_kineto_results -> evt.name() decodes it. Real fix = rebuild
+        #   against a matching libaiupti. Tracked in #114.
         #
         # Why the body is stubbed (no `as prof`, assertTrue(True)):
         #   Reading prof.events() is what triggers the buffer walk and the crash.
         #   We still run capture + teardown (the `with profile(...)` block) but
         #   never decode the corrupt kernel name. Restore the real check (below)
-        #   once the two libs are rebuilt in lockstep.
+        #   once the ABI mismatch is fixed.
         #
         # WHY STUBBING THIS ALSO "FIXED" test_event_list /
         # test_profiler_timestamp_consistency (the surprising part):
@@ -98,7 +98,7 @@ class TestSpyreProfiler(TestCase):
             with_stack=False,
         ) as prof:
             x *= 2
-            # TODO(#114): check with_stack=True once libaiupti + kineto-spyre are rebuilt in lockstep.
+            # TODO(#114): check with_stack=True once the libaiupti ABI mismatch is fixed.
         names = [e.name for e in prof.events()]
         self.assertTrue("aten::mul_" in names)
 
@@ -191,6 +191,34 @@ def test_chrome_trace_is_valid_json(tmp_path):
     assert isinstance(data, dict), "Trace JSON must be a dictionary"
     assert "traceEvents" in data, "Trace JSON must contain 'traceEvents'"
     assert len(data["traceEvents"]) > 0, "Trace JSON must contain at least one event"
+
+
+def _run_trace_analyzer_overlap_verification(trace_data):
+    """Run Trace Analyzer overlap verification and return its result and report."""
+    pytest.importorskip("aiu_trace_analyzer", minversion="1.3.0")
+    from aiu_trace_analyzer.core.acelyzer import Acelyzer
+
+    analyzer = Acelyzer(
+        ["-i", "api://jsonbuffer", "-V", "--disable_file"],
+        in_data=trace_data,
+    )
+    analyzer.run()
+    report = analyzer.get_output_data()
+
+    overlap_result = next(
+        (
+            result
+            for result in report.get("test_results", [])
+            if result.get("test") == "Compute Overlap Check"
+        ),
+        None,
+    )
+
+    assert overlap_result is not None, (
+        "AIU Trace Analyzer did not return a Compute Overlap Check result"
+    )
+
+    return overlap_result, report
 
 
 @pytest.mark.requires_spyre_profiler
@@ -357,7 +385,7 @@ def test_compiled_kernel_event_keys_match_captured_debug_handles(monkeypatch):
 def test_kineto_memcpy_and_memset_events_captured():
     """
     Confirm that H2D memcpy, D2H memcpy, and memset events are captured
-    in the kineto-spyre Chrome trace when profiling with PrivateUse1.
+    in the AIUPTI-backed Chrome trace when profiling with PrivateUse1.
 
     Triggered operations:
       - H2D: cpu_tensor.to("spyre")
@@ -387,16 +415,17 @@ def test_kineto_memcpy_and_memset_events_captured():
     events = trace["traceEvents"]
 
     # "gpu_memcpy" / "gpu_memset" are emitted by libkineto's ActivityType::type_string()
-    # (upstream kineto, not kineto-spyre-specific) and have been stable across all kineto
-    # versions used by torch-spyre. kineto-spyre maps Spyre memory activities to these
-    # standard ActivityType values; the Chrome trace writer produces these category strings.
+    # (upstream kineto, not Spyre-specific) and have been stable across all kineto
+    # versions used by torch-spyre. torch_spyre's AIUPTI bridge maps Spyre memory
+    # activities to these standard ActivityType values; the Chrome trace writer
+    # produces these category strings.
     h2d_events = [
         e
         for e in events
         if e.get("cat") == "gpu_memcpy" and "HtoD" in e.get("name", "")
     ]
     assert h2d_events, (
-        "Expected at least one H2D memcpy event in the kineto-spyre trace"
+        "Expected at least one H2D memcpy event in the AIUPTI-backed trace"
     )
 
     d2h_events = [
@@ -405,11 +434,58 @@ def test_kineto_memcpy_and_memset_events_captured():
         if e.get("cat") == "gpu_memcpy" and "DtoH" in e.get("name", "")
     ]
     assert d2h_events, (
-        "Expected at least one D2H memcpy event in the kineto-spyre trace"
+        "Expected at least one D2H memcpy event in the AIUPTI-backed trace"
     )
 
     memset_events = [e for e in events if e.get("cat") == "gpu_memset"]
-    assert memset_events, "Expected at least one memset event in the kineto-spyre trace"
+    assert memset_events, (
+        "Expected at least one memset event in the AIUPTI-backed trace"
+    )
+
+
+@pytest.mark.requires_spyre_profiler
+def test_trace_analyzer_device_overlap(tmp_path):
+    """Verify Spyre device overlaps using AIU Trace Analyzer."""
+    trace_file = tmp_path / "trace_analyzer_overlap.json"
+
+    x = torch.randn((64, 64), dtype=torch.float16, device="spyre")
+    y = torch.randn((64, 64), dtype=torch.float16, device="spyre")
+
+    with profile(
+        activities=[ProfilerActivity.CPU, ProfilerActivity.PrivateUse1]
+    ) as prof:
+        result = torch.matmul(x, y)
+        result = F.gelu(result)
+        result = torch.sum(result)
+        torch.spyre.synchronize()
+
+    prof.export_chrome_trace(str(trace_file))
+
+    assert trace_file.exists(), "Chrome trace file was not created"
+
+    trace_data = trace_file.read_bytes()
+
+    trace_json = json.loads(trace_data)
+    trace_events = trace_json.get("traceEvents", [])
+    device_events, _ = _find_device_overlaps(trace_events)
+
+    assert len(device_events) >= 2, (
+        "Expected at least two Spyre device events for Trace Analyzer overlap validation"
+    )
+
+    overlap_result, report = _run_trace_analyzer_overlap_verification(trace_data)
+
+    if overlap_result.get("result") != "pass":
+        overlap_errors = [
+            error
+            for error in report.get("errors", [])
+            if error.get("finding") == "overlaps"
+        ]
+
+        pytest.fail(
+            "AIU Trace Analyzer detected invalid Spyre device overlap(s):\n"
+            f"{overlap_errors}"
+        )
 
 
 class TestMemoryProfilerTimeline(TestCase):

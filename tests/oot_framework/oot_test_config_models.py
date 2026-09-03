@@ -62,6 +62,7 @@ class InputInitArgs(BaseModel):
 
     low: int = 0  # randint: lower bound
     high: Optional[int] = None  # randint: upper bound (required)
+    total: Optional[int] = None  # cumsum_offsets: total (required)
     fill_value: Optional[float] = None  # full: fill value (required)
     path: Optional[str] = None  # file: path to .pt / .npy / .safetensors
     key: Optional[str] = None  # file: key within file (dict/.safetensors)
@@ -147,6 +148,8 @@ class InputTensorSpec(BaseModel):
     def validate_cross_fields(self) -> "InputTensorSpec":
         if self.init == "randint" and self.init_args.high is None:
             raise ValueError("init_args.high is required when init: randint")
+        if self.init == "cumsum_offsets" and self.init_args.total is None:
+            raise ValueError("init_args.total is required when init: cumsum_offsets")
         if self.init == "full" and self.init_args.fill_value is None:
             raise ValueError("init_args.fill_value is required when init: full")
         if self.init == "file" and self.init_args.path is None:
@@ -305,6 +308,23 @@ class InputTensorSpec(BaseModel):
             return torch.eye(shape[0], dtype=dtype)
         elif init == "xavier":
             return torch.nn.init.xavier_uniform_(torch.empty(shape, dtype=dtype))
+        elif init == "cumsum_offsets":
+            # Group offsets for torch._grouped_mm: a non-decreasing cumulative
+            # partition of `total` rows over shape[0] groups, ending at `total`.
+            # Seeded here (rather than in the make_tensor block below) so the
+            # partition is identical for the CPU reference and the device run.
+            assert ia.total is not None  # enforced by validate_cross_fields
+            total = ia.total
+            with torch.random.fork_rng(devices=[]):
+                if seed is not None:
+                    torch.manual_seed(int(seed))
+                counts = torch.zeros(shape[0], dtype=dtype)
+                counts.scatter_add_(
+                    0,
+                    torch.randint(0, shape[0], (total,)),
+                    torch.ones(total, dtype=dtype),
+                )
+            return torch.cumsum(counts, dim=0, dtype=dtype)
         elif init == "full":
             return torch.full(shape, ia.fill_value, dtype=dtype)
         elif init == "zeros":
@@ -391,6 +411,16 @@ class InputTensorSpec(BaseModel):
                 t = torch.ones(shape, dtype=dtype)
             elif init == "randint":
                 t = torch.randint(ia.low, ia.high, shape, dtype=dtype)
+            elif init == "cumsum_offsets":
+                assert ia.total is not None  # enforced by validate_cross_fields
+                total = ia.total
+                counts = torch.zeros(shape[0], dtype=dtype)
+                counts.scatter_add_(
+                    0,
+                    torch.randint(0, shape[0], (total,)),
+                    torch.ones(total, dtype=dtype),
+                )
+                t = torch.cumsum(counts, dim=0, dtype=dtype)
             elif init == "arange":
                 t = torch.arange(shape[0], dtype=dtype)
             elif init == "eye":

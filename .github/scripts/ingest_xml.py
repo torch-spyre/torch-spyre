@@ -1083,23 +1083,9 @@ def main():
 
             insert_run(client, run_id, run, args)
 
-            # run_id is this run's own key, so the join through test_runs is unnecessary.
-            existing_cases = client.query(
-                "SELECT count() FROM test_cases WHERE run_id = {run_id:String}",
-                parameters={"run_id": run_id},
-            )
-            if existing_cases.result_rows[0][0] > 0:
-                print("  Cases already exist — skipping case+property inserts")
-            else:
-                insert_cases(client, run_id, cases, workflow=args.workflow)
-                existing_props = client.query(
-                    "SELECT count() FROM run_properties WHERE run_id = {run_id:String}",
-                    parameters={"run_id": run_id},
-                )
-                if existing_props.result_rows[0][0] > 0:
-                    print("  Properties already exist — skipping property insert")
-                else:
-                    insert_properties(client, run_id, cases)
+            # The (run_id, filename) dedup above already covers this file; a run_id-only recheck here would skip a second file sharing the same run_id.
+            insert_cases(client, run_id, cases, workflow=args.workflow)
+            insert_properties(client, run_id, cases)
 
             total_cases += len(cases)
             print(
