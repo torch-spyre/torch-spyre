@@ -45,7 +45,7 @@ import torch_spyre._inductor.customops  # noqa: F401
 logger = get_inductor_logger("decompositions")
 
 
-_SDPA_MAX_SEQUENCE_TILE_SIZE = 2048
+_SDPA_MAX_SEQUENCE_TILE_SIZE = 512
 _SDPA_MAX_TILE_PAIRS_PER_LOOP_GROUP = 16
 
 
@@ -482,15 +482,14 @@ def spyre__sdpa_overrideable(
         value = value.unsqueeze(2).expand(-1, -1, expansion, -1, -1).flatten(1, 2)
 
     # Keep the original approximately four-way KV split for short sequences,
-    # but cap each explicit online-softmax block at 2048 tokens. This yields
-    # four 2k blocks at 8k and sixteen 2k blocks at 32k. Round the short-case
-    # target up to a 64-element fp16 stick as before.
+    # but cap each explicit online-softmax block at the max tile size. Round
+    # the short-case target up to a 64-element fp16 stick as before.
     quarter_kv_stick_aligned = max(64, ((max_seqlen_kv + 3) // 4 + 63) // 64 * 64)
     kv_block_size = min(_SDPA_MAX_SEQUENCE_TILE_SIZE, quarter_kv_stick_aligned)
     num_kv_blocks = (max_seqlen_kv + kv_block_size - 1) // kv_block_size
 
     # Lq uses equal-sized WSR coarse tiles. Select the smallest exact split
-    # count whose extent is at most 2048: 8k -> 4 x 2k, 32k -> 16 x 2k.
+    # count whose per-tile extent is at most _SDPA_MAX_SEQUENCE_TILE_SIZE.
     num_q_tiles = _num_tiles_for_max_extent(max_seqlen_q, _SDPA_MAX_SEQUENCE_TILE_SIZE)
     q_tile_size = max_seqlen_q // num_q_tiles
     kv_blocks_per_loop_group = _kv_blocks_per_loop_group(num_q_tiles, num_kv_blocks)
