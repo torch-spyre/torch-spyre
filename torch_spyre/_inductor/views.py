@@ -1095,17 +1095,26 @@ def tiling_expr_to_device_expr(
     out = sympy.S.Zero
     n = len(stride_map)
     vars = index.free_symbols
+    terms = index.args if isinstance(index, sympy.Add) else (index,)
     for var in vars:
-        # index.xreplace({var: 1}) can degenerate to the bare Python int 1
-        # (not sympy.Integer(1)) when `index` is itself exactly the single
-        # symbol being replaced (e.g. index == var, coefficient 1, no other
-        # additive term) -- sympy auto-simplifies Mul(1, var) to var, and
-        # substituting var -> 1 into var alone returns the literal object
-        # passed in. sympy.sympify coerces that raw int back to a proper
-        # sympy numeric type so the second .xreplace call below (which
-        # every other, non-degenerate case already returns) does not crash
-        # with "'int' object has no attribute 'xreplace'".
-        step = sympy.sympify(index.xreplace({var: 1})).xreplace({v: 0 for v in vars})
+        # step must be var's own coefficient, not index's value at var=1 --
+        # those only coincide when index has zero constant term. `index` can
+        # legitimately carry one here: _general_tile_advance builds it from
+        # dep.index, which bakes in literal offsets from Python-level slicing
+        # (e.g. key[..., start:end, :] for KV-block >= 1 contributes a
+        # constant +start*row_stride term alongside the tiled-dim symbol).
+        # Evaluating at var=1 folded that unrelated constant straight into
+        # the per-level advance coefficient (issue: S=128 flash-attention,
+        # second head-tile group's second KV block reading the wrong head).
+        # Isolate var's own additive term first (mirrors coeff_through_floor
+        # in pass_utils.py -- not reused directly to avoid a views<->pass_utils
+        # import cycle), then take its coefficient, looking through one
+        # floor() layer since a term can be floor(k*var/d).
+        own_term = next((t for t in terms if var in t.free_symbols), sympy.S.Zero)
+        if isinstance(own_term, sympy.floor):
+            step = own_term.args[0].coeff(var)
+        else:
+            step = own_term.coeff(var)
         j = -1  # device dimension for var
         for i in range(n):
             if (
