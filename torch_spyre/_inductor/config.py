@@ -102,6 +102,23 @@ read_copy_elision: bool = _get_env_bool("SPYRE_READ_COPY_ELISION", True)
 # after specific passes. Set via SPYRE_LOG_PASSES env var or programmatically.
 log_passes: str = os.environ.get("SPYRE_LOG_PASSES", "")
 
+# Structured per-compile timing records (timing_recorder.py).  Off by default;
+# when off, a timed region records nothing and allocates no event, but the call
+# site still builds its name and keyword arguments and this flag is still read,
+# so it is cheap rather than free: measured at ~1.4 us per region off and ~3.9 us
+# on (of which ~1.0 us is reading this flag through install_config_module, the
+# same cost log_passes already pays per pass).  A compile emitting 132 regions
+# pays ~0.2 ms off, ~0.5 ms on.  Records go to timing_out at process exit, or via
+# timing_recorder.dump_and_finalize() for callers that want them sooner.
+# Tests override with config.patch({"timing": True}) rather than the environment.
+timing: bool = _get_env_bool("TORCH_SPYRE_TIMING", False)
+
+# Destination for the timing record.  The pid is inserted before the suffix, so
+# one setting is safe when a run fans out into several processes.  Empty means
+# keep the events in memory and write nothing, which is what a caller reading
+# timing_recorder.RECORDER directly wants.
+timing_out: str = os.environ.get("TORCH_SPYRE_TIMING_OUT", "")
+
 # Predicted-runtime reporting from the analytical cost model (cost_model.py,
 # cost_model_pass.py).  NOT related to work_division.cost_model_matmul_division,
 # which is a separate model used to choose a matmul work division.
