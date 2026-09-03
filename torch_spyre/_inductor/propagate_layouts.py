@@ -1298,15 +1298,6 @@ def _depthwise_conv_layouts(
     spatial axes relative to the activation's (issue: N==1 strided depthwise
     returned numbers off by up to 26).
 
-    Everything downstream of here is dim-*label* keyed -- ``get_conv_params``
-    picks ``stride_i``/``kernel_h`` vs ``stride_j``/``kernel_w`` by label, and
-    ``compute_padding_for_dim`` pairs ``i``<->``ki`` and ``j``<->``kj`` -- while
-    the label a slot receives follows the tensor's own coordinate order.  So the
-    activation and the output must list their spatial axes in the same slot
-    order; a disagreement mis-pairs every tap and stride with the wrong axis.
-    Pinning the output canonically fixes the N==1 case, and the check below
-    rejects the mirror-image case (an activation declared in the opposite order)
-    at compile time rather than returning wrong numbers.
     """
     out_dims = len(output.size)
     c_size = [concretize_expr(s) for s in output.size]
@@ -1317,7 +1308,7 @@ def _depthwise_conv_layouts(
     # channel.  Reuse the same stick-expression -> output dim mapping the generic
     # single-arg path uses, so stick selection (and its stick-alignment /
     # offset-free handling) stays identical -- only the non-stick dim ORDER
-    # differs, which is the point of this function.
+    # differs.
     def _canonical_candidate(
         stick_dim: int, dtype_for_layout
     ) -> SpyreTensorLayout | None:
@@ -1369,14 +1360,8 @@ def _depthwise_conv_layouts(
     if out_stl is None and fallback_dtype is not None:
         # No input stick expression mapped to an output dim.  This happens when
         # the channel count is 1: the activation's channel axis is size-1, so its
-        # device stick is degenerate (``stride_map[-1] == -1``) and its stick
-        # coordinate collapses to the constant ``0``.  ``matching_dim`` requires
-        # exactly one free symbol, so a constant can never identify a dim and the
-        # scan above yields nothing -- even though the canonical layout is
-        # perfectly representable.  The generic single-arg path does not trip on
-        # this because it always also scans every dim as a candidate stick
-        # (see _single_arg_op_layout); this branch is that same fallback, but
-        # restricted to the canonical order this function exists to pin.
+        # device stick is degenerate and its stick
+        # coordinate collapses to the constant ``0``.
         #
         # Prefer the out-channel so a C==1 depthwise keeps the same
         # channel-innermost layout a C>1 one gets.  ``lower_depthwise_conv2d``
@@ -1400,14 +1385,11 @@ def _depthwise_conv_layouts(
         )
 
     # Reject an activation whose spatial slot order disagrees with the output's.
-    # The activation is the read carrying the output's spatial symbols; the
-    # weight's index does not (args order is dep-name based, not lowering order).
     out_coords_dev = device_coordinates(out_stl, output_dep, None)
     spatial_syms = output_dep.index.free_symbols - out_coords_dev[-1].free_symbols
     out_order = _spatial_symbol_order(out_coords_dev, spatial_syms)
     # Fewer than two surviving spatial symbols (conv1d, or a spatial extent of 1)
-    # leaves no order to disagree about.  Note a 1x1 *kernel* does NOT qualify:
-    # only the taps collapse there, both output spatial dims still iterate.
+    # leaves no order to disagree about.
     if len(out_order) >= 2:
         for arg in args:
             if not spatial_syms <= arg.dep.index.free_symbols:
