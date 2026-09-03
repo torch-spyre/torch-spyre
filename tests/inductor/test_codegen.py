@@ -39,6 +39,7 @@ from torch_spyre._inductor.codegen.superdsc import (
     _align_pool_dim_labels,
     _resolve_sdsc_size,
     compile_op_spec,
+    parse_op_spec,
 )
 from torch_spyre._inductor.core_mapping import derive_operation_mapping
 from torch_spyre._inductor.op_spec import OpSpec, TensorArg
@@ -482,6 +483,78 @@ class TestSdscJsonSymbolicDimSmoke(InductorTestCase):
         for stage in ("ss_", "el_"):
             sym_info = dsc["dataStageParam_"]["0"][stage]["symbolicDimInfo_"]
             self.assertEqual(sym_info, {"mb": {"maxSize_": 512, "granularity_": 64}})
+
+
+class TestTiledAwayPhysicalAxis(InductorTestCase):
+    def test_native_bmm_fake_broadcasts_gqa_axis(self):
+        query = torch.empty((1, 8, 4, 256, 128), device="meta")
+        key = torch.empty((1, 8, 1, 128, 256), device="meta")
+
+        result = torch.ops.spyre.batched_matmul(query, key)
+
+        self.assertEqual(result.shape, (1, 8, 4, 256, 256))
+
+    def test_nonstick_role_uses_coordinate_axis_across_tiled_away_axis(self):
+        """A constant GQA group slot must not collapse the Hkv stride."""
+        d0, d1, d2, d3 = sympy.symbols("d0:4")
+        iteration_space = {
+            d0: (sympy.Integer(2), 1),
+            d1: (sympy.Integer(8), 1),
+            d2: (sympy.Integer(64), 32),
+            d3: (sympy.Integer(128), 1),
+        }
+        spec = OpSpec(
+            op="identity",
+            is_reduction=False,
+            iteration_space=iteration_space,
+            core_id_to_work_slice={dim: sympy.S.Zero for dim in iteration_space},
+            args=[
+                TensorArg(
+                    is_input=True,
+                    arg_index=0,
+                    device_dtype=DataFormats.SEN169_FP16,
+                    # [Hkv, tiled-away G, M, D/64, B, D%64]
+                    device_size=[32, 4, 64, 2, 2, 64],
+                    device_coordinates=[
+                        d1,
+                        sympy.S.Zero,
+                        d2,
+                        sympy.floor(d3 / 64),
+                        d0,
+                        sympy.Mod(d3, 64),
+                    ],
+                    allocation={"hbm": 0},
+                    device_tile_advance_expr=16_384 * sympy.Symbol("tile_group"),
+                ),
+                TensorArg(
+                    is_input=False,
+                    arg_index=1,
+                    device_dtype=DataFormats.SEN169_FP16,
+                    device_size=[1, 8, 64, 2, 2, 64],
+                    device_coordinates=[
+                        sympy.S.Zero,
+                        d1,
+                        d2,
+                        sympy.floor(d3 / 64),
+                        d0,
+                        sympy.Mod(d3, 64),
+                    ],
+                    allocation={"lx": 0},
+                ),
+            ],
+            op_info={},
+            tiled_symbols=[[sympy.Symbol("tile_group")]],
+            tiled_symbol_trip_counts={sympy.Symbol("tile_group"): 4},
+        )
+
+        sdsc_spec, _ = parse_op_spec(spec)
+        source = sdsc_spec.args[0]
+
+        self.assertEqual(
+            {str(dim): gap for dim, gap in source.backGap.items()},
+            {"y": 192, "x": 24},
+        )
+        self.assertEqual(int(source.strides[sympy.Symbol("x")]), 524_288)
 
 
 class TestSymbolKindKernelDerivedSymbolic(InductorTestCase):
