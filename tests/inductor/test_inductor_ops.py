@@ -5653,6 +5653,70 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "3d_to_4d_view_permute_mul": (cached_randn((2, 3, 4)),),
             },
         },
+        # A view that splits the stick dim into (heads, D) and then slices or
+        # strides D makes the read walk the stick-tile dim in steps (``2*d1``).
+        # That stride used to inflate the dim's footprint and double every
+        # outer stride, so output row l read input row 2*l (issue #4050).
+        ("test_view_split_stick_slice", "test_view_split_stick_slice_cpu"): {
+            "param_sets": {
+                "head_half_lo": (
+                    (1, 8, 4, 128),
+                    lambda t: t[..., :64],
+                    cached_randn((1, 8, 512), differentiation="vss_lo"),
+                ),
+                "head_half_hi_offset": (
+                    (1, 8, 4, 128),
+                    lambda t: t[..., 64:],
+                    cached_randn((1, 8, 512), differentiation="vss_hi"),
+                ),
+                "head_sub_stick": (
+                    (1, 8, 4, 128),
+                    lambda t: t[..., :32],
+                    cached_randn((1, 8, 512), differentiation="vss_sub"),
+                ),
+                "transposed_head_half_lo": (
+                    (1, 8, 4, 128),
+                    lambda t: t.transpose(1, 2)[..., :64],
+                    cached_randn((1, 8, 512), differentiation="vss_tlo"),
+                ),
+                "transposed_head_half_hi_offset": (
+                    (1, 8, 4, 128),
+                    lambda t: t.transpose(1, 2)[..., 64:],
+                    cached_randn((1, 8, 512), differentiation="vss_thi"),
+                ),
+                "batched_head_half_lo": (
+                    (4, 8, 4, 128),
+                    lambda t: t[..., :64],
+                    cached_randn((4, 8, 512), differentiation="vss_b4"),
+                ),
+                "quarter_of_4_stick_head": (
+                    (1, 8, 4, 256),
+                    lambda t: t[..., :64],
+                    cached_randn((1, 8, 1024), differentiation="vss_q"),
+                ),
+                "step2_over_sticks": (
+                    (1, 8, 8, 64),
+                    lambda t: t[:, :, ::2, :],
+                    cached_randn((1, 8, 512), differentiation="vss_s2"),
+                ),
+                "step2_over_sticks_offset": (
+                    (1, 8, 8, 64),
+                    lambda t: t[:, :, 1::2, :],
+                    cached_randn((1, 8, 512), differentiation="vss_s2o"),
+                ),
+            },
+        },
+        # rotate_half on q/k built by view + transpose of the projection output:
+        # the HF attention pattern issue #4050 was reported against.
+        ("test_rope_on_split_stick_view", "test_rope_on_split_stick_view_cpu"): {
+            "param_sets": {
+                "b1_l8_h4_d128": (
+                    cached_randn((1, 8, 512), differentiation="rope_h"),
+                    cached_randn((1, 8, 128), differentiation="rope_cos"),
+                    cached_randn((1, 8, 128), differentiation="rope_sin"),
+                ),
+            },
+        },
         ("test_transpose_patterns", "test_transpose_patterns_cpu"): {
             "param_sets": _pattern_param_sets(),
         },
@@ -7233,6 +7297,37 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             return x.view(*x.shape, 1).permute(0, 3, 1, 2).mul(5.0)
 
         self.compare_with_cpu(fn, x)
+
+    def test_view_split_stick_slice_cpu(self, view_shape, slicer, x):
+        """View the stick dim as (heads, D), then slice or stride D.
+
+        Compiled path only: the eager path materialises such views through
+        copy_from_d2d, which rejects sub-stick offsets for unrelated reasons.
+        """
+
+        def fn(x):
+            return slicer(x.view(*view_shape)) * 1.0
+
+        self.compare_with_cpu(fn, x, run_eager=False)
+
+    def test_rope_on_split_stick_view_cpu(self, hidden, cos, sin):
+        """rotate_half on q and k that are view + transpose of one buffer."""
+        B, L, H, D = 1, 8, 4, 128
+
+        def rotate_half(t):
+            half = t.shape[-1] // 2
+            return torch.cat((-t[..., half:], t[..., :half]), dim=-1)
+
+        def fn(hidden, cos, sin):
+            q = hidden.view(B, L, H, D).transpose(1, 2)
+            k = hidden.view(B, L, H, D).transpose(1, 2)
+            cos = cos.unsqueeze(1)
+            sin = sin.unsqueeze(1)
+            q = (q * cos) + (rotate_half(q) * sin)
+            k = (k * cos) + (rotate_half(k) * sin)
+            return q.contiguous(), k.contiguous()
+
+        self.compare_with_cpu(fn, hidden, cos, sin, run_eager=False)
 
     # --- Migrated from test_ops.py ---
 
