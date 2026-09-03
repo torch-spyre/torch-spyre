@@ -255,10 +255,10 @@ jobs:
             exit 0
           fi
 
-          # torch-spyre's pinned PyTorch minor version (e.g. "2.13" from
-          # "torch~=2.13.0" in pyproject.toml) maps 1:1 onto the
+          # torch-spyre's pinned PyTorch minor version (e.g. "2.14" from
+          # "torch~=2.14.0" in pyproject.toml) maps 1:1 onto the
           # pytorch/pytorch release branch this repo currently tracks
-          # (e.g. "release/2.13"). Recomputed on every dispatch so this
+          # (e.g. "release/2.14"). Recomputed on every dispatch so this
           # keeps following whichever release branch pyproject.toml is
           # pinned to, without needing to touch this workflow on bump.
           PINNED_MINOR=$(grep -v '^#' pyproject.toml | grep -oE 'torch~=[0-9]+\.[0-9]+' | head -1 | grep -oE '[0-9]+\.[0-9]+')
