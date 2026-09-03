@@ -1364,7 +1364,7 @@ def _matmul_axis_parse(op: Operation) -> dict[str, tuple[sympy.Symbol, int, int]
     for role, stride in zip(("N", "M", "B"), sorted(out_syms)):
         sym = out_syms[stride]
         roles[role] = (sym, sizes[stride], seed[sym])
-    k_sym = next(iter(k_syms))
+    k_sym = min(k_syms, key=str)
     roles["K"] = (
         k_sym,
         concretize_expr(iteration_space_from_op(op)[k_sym]),

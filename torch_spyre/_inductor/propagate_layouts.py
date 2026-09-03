@@ -802,7 +802,7 @@ def _find_layout_avoiding_var_on_stick(
         raise Unsupported(
             f"{label}: no surviving coordinates after removing {avoid_var}"
         )
-    surviving_var = next(iter(surviving_vars))
+    surviving_var = min(surviving_vars, key=str)
 
     for stl in arg.layouts:
         dev_coords = device_coordinates(stl, arg.dep, None)
@@ -1195,7 +1195,7 @@ def _conv_reduction_var(x: PropArg, reduction_candidates: set) -> sympy.Symbol |
         stick_syms = device_coordinates(stl, x.dep, None)[-1].free_symbols
         hit = reduction_candidates & stick_syms
         if hit:
-            return next(iter(hit))
+            return min(hit, key=str)
     return None
 
 
@@ -1712,7 +1712,7 @@ def _keep_by_index_layouts(
         # Check if this coordinate appears in indices
         found_in_indices = any(v_coord.equals(i_coord) for i_coord in indices_coords)
         if not found_in_indices:
-            search_var = next(iter(v_coord.free_symbols))
+            search_var = min(v_coord.free_symbols, key=str)
             break
 
     if search_var is None:
@@ -1729,7 +1729,7 @@ def _keep_by_index_layouts(
             continue
         found_in_values = any(i_coord.equals(v_coord) for v_coord in values_coords)
         if not found_in_values:
-            reduction_var = next(iter(i_coord.free_symbols))
+            reduction_var = min(i_coord.free_symbols, key=str)
             break
 
     if reduction_var is None:

@@ -695,7 +695,7 @@ def enforce_indirect_access_layout(graph: GraphLowering) -> None:
                 for sym in access_subs.values()
                 if isinstance(sym, IndirectAccess)
             }
-            index_name = next(iter(index_names & dep_names), None)
+            index_name = min(index_names & dep_names, default=None)
             if index_name is None:
                 continue
             index_dep = next(

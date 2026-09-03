@@ -5758,7 +5758,7 @@ def _index_var_prefix(free_symbols: "OrderedSet[Expr] | set[Expr]") -> str:
     from any sibling symbol already present in the index instead of
     assuming one.
     """
-    for sym in free_symbols:
+    for sym in sorted(free_symbols, key=str):
         name = sym.name
         i = len(name)
         while i > 0 and name[i - 1].isdigit():

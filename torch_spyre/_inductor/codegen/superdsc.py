@@ -350,7 +350,7 @@ def _get_device_dim_order(
         expr = coord.subs(symbol_mapping)
         if expr == 0 and stick_dim is not None and stick_dim not in dim_order:
             dim_order.append(stick_dim)
-        for sym in expr.free_symbols:
+        for sym in sorted(expr.free_symbols, key=str):
             # For kernel tensors in conv ops, exclude size-1 output-spatial dimensions.
             # Kernels don't depend on output spatial position, so i and j (when size-1)
             # are synthetic placeholders that shouldn't affect kernel layout.
@@ -1564,8 +1564,14 @@ def _resolve_sdsc_size(expr: Expr, symbolic_dim_bounds: dict) -> int:
     file) so this works during the reload phase when ShapeEnv is gone.
     Falls back to _concretize_for_sdsc for concrete expressions.
     """
-    if hasattr(expr, "free_symbols") and expr.free_symbols:
-        sym_name = str(next(iter(expr.free_symbols)))
+    # ``symbolic_dim_bounds`` is keyed by a single symbol name, so it can only
+    # answer for a single-symbol expression; a multi-symbol one falls through to
+    # ``_concretize_for_sdsc``, which resolves the whole expression. Reading one
+    # arbitrary symbol's bound out of the ``free_symbols`` set both answered the
+    # wrong question and made the answer depend on PYTHONHASHSEED.
+    syms = getattr(expr, "free_symbols", None)
+    if syms and len(syms) == 1:
+        sym_name = str(next(iter(syms)))
         if sym_name in symbolic_dim_bounds:
             return symbolic_dim_bounds[sym_name][0]  # max
     return _concretize_for_sdsc(expr)
@@ -1637,7 +1643,7 @@ def _extend_matmul_k_to_padded(
             out_syms,
         )
         return
-    k_sym = next(iter(k_candidates))
+    k_sym = min(k_candidates, key=str)
 
     if k_sym not in sdsc_iteration_space:
         logger.warning(

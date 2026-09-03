@@ -1498,7 +1498,7 @@ def iter_var_id(stick_expr) -> int:
     NOTE: this is the loop variable index (suffix of dN), NOT a tensor dimension index."""
     if stick_expr == sympy.S.Zero or not stick_expr.free_symbols:
         return -1
-    sym = next(iter(stick_expr.free_symbols))
+    sym = min(stick_expr.free_symbols, key=str)
     name = str(sym)
     i = len(name) - 1
     while i >= 0 and name[i].isdigit():
@@ -2045,7 +2045,7 @@ def compute_restickify_needed(
         # restickify removes the offset.
         reduction_vars = in_dep.index.free_symbols - out_dep.index.free_symbols
         if reduction_vars:
-            red_var = next(iter(reduction_vars))
+            red_var = min(reduction_vars, key=str)
             target_stick = sympy.Mod(red_var, in_stl.elems_per_stick())
     return True, compute_restickify_target_layout(
         in_stl, in_host, target_stick, ic, idc
