@@ -102,6 +102,10 @@ jobs:
       fail-fast: false   # run all suites even if one fails
       matrix:
         suite:
+          - name: Bert Base Uncased
+            config: bert-base-uncased.yaml
+          - name: Bert Base Uncased Spyre
+            config: bert-base-uncased_spyre.yaml
           - name: GPT OSS 20B
             config: gpt-oss-20b.yaml
           - name: GPT OSS 20B Spyre
