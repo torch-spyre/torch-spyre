@@ -115,7 +115,6 @@ from torch_spyre._inductor.scratchpad.lx_relayout import (
 )
 from torch_spyre._inductor.cost_model import CostParams
 from torch_spyre._inductor.op_spec import TensorWorkDivision
-from torch_spyre._inductor.pass_utils import PerCoreView
 
 _COST_PARAMS = CostParams(
     # we need a expression of both compute, mem_t
