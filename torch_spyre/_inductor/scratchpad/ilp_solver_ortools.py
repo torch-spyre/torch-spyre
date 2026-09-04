@@ -83,6 +83,7 @@ below are written once against whichever wrapper ``_wrap`` chose.
 
 from __future__ import annotations
 
+import copy
 import logging
 import math
 import os
@@ -103,6 +104,7 @@ else:
     except ImportError:  # pragma: no cover - exercised only when ortools is absent
         cp_model = None
 
+from torch_spyre._inductor.scratchpad.greedy_solver import GreedyLayoutSolver
 from torch_spyre._inductor.scratchpad.plan_solver import (
     CoreDivisionBuffer,
     ceil_div,
@@ -123,6 +125,29 @@ logger = logging.getLogger(__name__)
 # there was no room once higher-value buffers were placed. Shared so the DEBUG
 # log and the reasons surfaced to the allocator agree.
 _SOLVER_CHOSE_SPILL = "spilled by solver (no residency benefit / no room)"
+
+
+def _hbm_spill_cost(buffer: LifetimeBoundBuffer) -> int:
+    """Differential HBM traffic a spill of ``buffer`` adds over residency.
+
+    See :meth:`_LifetimeBufferWithCpVars.spill_cost` for the derivation. This
+    helper is the single source of truth: both the CP-SAT residency objective
+    (``sum(spill_cost * (1 - in_buffer))``) and the certified-greedy-seed
+    lower-bound / plan-objective evaluators call it against a buffer whose
+    ``size`` field is in whatever unit the caller has already normalised to
+    (bytes for a raw ``LifetimeBoundBuffer``; alignment-units after
+    :func:`_wrap` has replaced ``size`` with ``ceil_div(size, alignment)``).
+    Reads and boundary attributes do not depend on the unit.
+    """
+    boundary = getattr(buffer, "boundary", None)
+    is_intermediate = (
+        boundary == BufferType.Intermediate
+        if boundary is not None
+        else not buffer.first_use_is_read
+    )
+    reads_served = buffer.read_count - (1 if buffer.first_use_is_read else 0)
+    return (reads_served + (1 if is_intermediate else 0)) * buffer.size
+
 
 # Buffer type the wrapper carries: the base placement wrapper holds any
 # LifetimeBoundBuffer; the joint subclass binds this to CoreDivisionBuffer.
@@ -236,16 +261,13 @@ class _LifetimeBufferWithCpVars(Generic[_BufT]):
         not one of the reads residency serves and is discounted from
         ``read_count`` (which counts the buffer's reads, not the savings). For a
         computed buffer the first use is the write and ``read_count`` already
-        excludes it, hence the discount is keyed on ``first_use_is_read``."""
-        b = self.buffer
-        boundary = getattr(b, "boundary", None)
-        is_intermediate = (
-            boundary == BufferType.Intermediate
-            if boundary is not None
-            else not b.first_use_is_read
-        )
-        reads_served = b.read_count - (1 if b.first_use_is_read else 0)
-        return (reads_served + (1 if is_intermediate else 0)) * b.size
+        excludes it, hence the discount is keyed on ``first_use_is_read``.
+
+        The arithmetic is factored out into :func:`_hbm_spill_cost` so the
+        certified-greedy seed inside :meth:`CpSatLayoutSolver.plan_layout`
+        evaluates the exact same formula on the exact same
+        alignment-unit-scaled ``buffer.size`` this wrapper carries."""
+        return _hbm_spill_cost(self.buffer)
 
     def constrain_residency(self, model, kids, bufs) -> None:
         """Placement-only: any buffer may reside, so there is no slicing gate."""
@@ -659,14 +681,196 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
     def plan_layout(self, log_lx_usage: bool = False) -> list[LifetimeBoundBuffer]:
         """Place buffers on their already-fixed core divisions (placement-only).
 
-        Same model as :meth:`plan_layout_and_core_divisions` minus the joint
-        division choice: each buffer's footprint is its ``size``, so there is no
-        slicing gate on residency and no parallelism step -- the solve reduces
-        to minimising HBM traffic under the 2D no-overlap with in-place reuse.
-        Dispatch is per buffer and keys on whether it carries candidate
-        divisions, not on its class, so a :class:`CoreDivisionBuffer` with an
-        empty candidate list is placed here rather than divided."""
+        First runs a cheap **certified greedy seed** on a solver-local copy
+        (:meth:`_try_certified_greedy_seed`): if that plan is feasible under
+        CP-SAT's placement contract and attains the exact forced-spill lower
+        bound of CP-SAT's own residency objective, it is already globally
+        optimal for that objective and the CP-SAT solve is skipped. Otherwise
+        the full CP-SAT solve runs as before via :meth:`_plan_layout_generic`
+        on the untouched caller buffers.
+
+        The joint entry (:meth:`plan_layout_and_core_divisions`) does not
+        use this seed: greedy cannot pick core divisions, and the joint
+        model's objective (residency, then parallelism, then balance, or a
+        caller-supplied ``cost_expr``) is not a scalar residency floor.
+
+        Otherwise the model is unchanged: same as
+        :meth:`plan_layout_and_core_divisions` minus the joint division
+        choice -- each buffer's footprint is its ``size``, so there is no
+        slicing gate on residency and no parallelism step. Dispatch is per
+        buffer and keys on whether it carries candidate divisions, not on
+        its class, so a :class:`CoreDivisionBuffer` with an empty candidate
+        list is placed here rather than divided."""
+        seed = self._try_certified_greedy_seed(log_lx_usage=log_lx_usage)
+        if seed is not None:
+            return seed
         return cast("list[LifetimeBoundBuffer]", list(self._plan_layout_generic()))
+
+    def _try_certified_greedy_seed(
+        self, log_lx_usage: bool = False
+    ) -> Optional[list[LifetimeBoundBuffer]]:
+        """Run greedy on a solver-local copy; commit its placement onto the
+        caller's buffers and return them iff the plan is representable in
+        the CP-SAT placement domain **and** its objective attains CP-SAT's
+        forced-spill lower bound. Return ``None`` otherwise; the caller
+        then runs the normal ``_plan_layout_generic`` path unchanged.
+
+        The certificate. Placement-only ``plan_layout`` runs only level 1
+        of the lex-solve inside :meth:`_run`: minimize
+        ``sum(spill_cost(b) * (1 - in_buffer(b)))`` over CP-SAT's
+        alignment-unit-scaled buffer copies. Levels 2 and 3 are gated on
+        ``core_terms`` being non-empty, which requires at least one
+        buffer to be a :class:`CoreDivisionBuffer` with non-empty
+        ``core_divisions`` -- absent on the placement-only path. The
+        :meth:`_run` ``cost_expr`` branch is not reachable from
+        :meth:`plan_layout` either (only
+        :meth:`plan_layout_and_core_divisions` accepts ``cost_expr``).
+
+        Every ``spill_cost(b) >= 0`` and ``(1 - in_buffer) in {0, 1}``, so
+        the objective is a nonnegative sum. Its lower bound is the sum
+        over exactly the buffers CP-SAT is forced to keep non-resident:
+        the set :meth:`record_exclusions` returns, which
+        ``_add_core_division`` pins to ``in_buffer = 0``. Reaching that
+        floor proves global optimality of the placement-only residency
+        objective: no feasible CP-SAT solution can have a strictly
+        lower objective value than the forced-spill sum. Any
+        additionally spilled non-excluded buffers on such a plan must
+        have ``spill_cost == 0`` (else they would raise the sum above
+        the floor), and zero-cost terms neither help nor hurt the
+        objective.
+
+        The certificate compares CP-SAT-domain quantities. Buffer sizes
+        are wrapped with ``ceil_div(size, alignment)`` -- exactly what
+        :meth:`_wrap` does before the objective is built -- so
+        :func:`_hbm_spill_cost` (which
+        :meth:`_LifetimeBufferWithCpVars.spill_cost` also calls) evaluates
+        the exact same numerical objective CP-SAT would optimize.
+
+        Representability precondition. CP-SAT works in
+        ``_capacity_units = self.limit // self.alignment`` alignment-unit
+        slots and can only express offsets in ``[0, _capacity_units)``. If
+        ``_capacity_units == 0`` no plan the model can build places any
+        buffer, so greedy is not allowed to seed it; likewise a greedy
+        placement whose top-of-buffer exceeds ``_capacity_units *
+        alignment`` or whose address is not alignment-aligned is a plan
+        the model could not represent. Both cases fall through to
+        :meth:`_plan_layout_generic`.
+
+        Never mutates the caller's buffers unless it commits.
+        """
+        buffers = self.buffers
+        if not buffers:
+            return list(buffers)
+        # Representability: CP-SAT has zero addressable slots when
+        # capacity < alignment, so it cannot express any placement.
+        if self._capacity_units <= 0:
+            logger.debug(
+                "[CP-SAT layout solver] greedy seed skipped: "
+                "_capacity_units=%d has no placement domain",
+                self._capacity_units,
+            )
+            return None
+        # The forced-spill floor, in CP-SAT's alignment units. Match the
+        # exact set CP-SAT pins non-resident (residency_reason plus
+        # ``min_footprint > limit`` -- both covered by record_exclusions).
+        forced_reasons = dict(self.record_exclusions())
+        lower_bound_units = sum(
+            _hbm_spill_cost(replace(b, size=ceil_div(b.size, self.alignment)))
+            for b in buffers
+            if b.name in forced_reasons
+        )
+        try:
+            probe_buffers = copy.deepcopy(buffers)
+            greedy_plan = GreedyLayoutSolver(
+                probe_buffers,
+                self.limit,
+                self.alignment,
+            ).plan_layout(log_lx_usage=log_lx_usage)
+        except Exception as e:
+            # Greedy failed on this input -- surface via the CP-SAT path,
+            # which either handles the input or raises its own error.
+            logger.debug(
+                "[CP-SAT layout solver] greedy seed failed: %s; "
+                "falling through to full CP-SAT solve",
+                e,
+            )
+            return None
+        # Representability check on greedy's plan: each placed buffer
+        # must fit within ``[0, _capacity_units * alignment)`` and its
+        # address must be alignment-aligned. Greedy already aligns
+        # addresses to ``self.alignment`` in ``_find_free_block`` and
+        # already refuses to place a buffer above ``self.limit``, but
+        # ``self.limit`` isn't necessarily a multiple of alignment while
+        # CP-SAT's domain ceiling ``_capacity_units * alignment`` is.
+        cpsat_top = self._capacity_units * self.alignment
+        for b in greedy_plan:
+            if b.address is None:
+                continue
+            if b.address < 0 or b.address % self.alignment != 0:
+                logger.debug(
+                    "[CP-SAT layout solver] greedy seed unrepresentable: "
+                    "buffer %s at address=%d violates alignment=%d",
+                    b.name,
+                    b.address,
+                    self.alignment,
+                )
+                return None
+            if b.address + b.size > cpsat_top:
+                logger.debug(
+                    "[CP-SAT layout solver] greedy seed unrepresentable: "
+                    "buffer %s at address=%d size=%d exceeds CP-SAT top=%d",
+                    b.name,
+                    b.address,
+                    b.size,
+                    cpsat_top,
+                )
+                return None
+        # Evaluate greedy's objective in the same alignment-unit domain
+        # CP-SAT is optimizing.
+        greedy_objective_units = sum(
+            _hbm_spill_cost(replace(b, size=ceil_div(b.size, self.alignment)))
+            for b in greedy_plan
+            if b.address is None
+        )
+        if greedy_objective_units != lower_bound_units:
+            logger.debug(
+                "[CP-SAT layout solver] greedy seed left %d units of "
+                "residency objective on the table (lower bound %d, "
+                "greedy %d); running full CP-SAT solve",
+                greedy_objective_units - lower_bound_units,
+                lower_bound_units,
+                greedy_objective_units,
+            )
+            return None
+        # Certified. Commit greedy's addresses onto the caller's own
+        # ``LifetimeBoundBuffer`` instances, matching what
+        # :meth:`_plan_layout_generic` does at the tail of a normal CP-SAT
+        # solve. Match by name so the seed's own copies stay solver-local.
+        greedy_by_name = {b.name: b for b in greedy_plan}
+        for b in buffers:
+            b.address = greedy_by_name[b.name].address
+        # ``spill_reasons`` matches the CP-SAT tail: pre-solve forced
+        # reason when we have one, else the solver-chose-spill sentinel.
+        # The certificate only bounds the *objective*, not the placement
+        # set: a non-excluded buffer with ``spill_cost == 0`` may
+        # remain spilled without lifting the sum above the floor, so
+        # the sentinel branch is a real code path, not just symmetry.
+        self.spill_reasons = {
+            b.name: forced_reasons.get(b.name, _SOLVER_CHOSE_SPILL)
+            for b in buffers
+            if b.address is None
+        }
+        if logger.isEnabledFor(logging.DEBUG):
+            n_placed = sum(1 for b in buffers if b.address is not None)
+            logger.debug(
+                "[CP-SAT layout solver] greedy seed certified: "
+                "buffers=%d resident=%d hbm_traffic=%d (lower bound in "
+                "alignment units); CP-SAT solve skipped",
+                len(buffers),
+                n_placed,
+                lower_bound_units,
+            )
+        return list(buffers)
 
     def plan_layout_and_core_divisions(
         self, cost_expr: sympy.Expr | None = None
