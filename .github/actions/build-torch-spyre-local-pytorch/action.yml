@@ -44,12 +44,12 @@ runs:
         # the runner is ephemeral, but this keeps the checkout in the state a
         # human would expect if it were ever inspected mid-job.
         cp uv.lock uv.lock.bak
-        sed -i 's|^    "torch~=2.13.0",|#    "torch~=2.13.0",|' pyproject.toml
-        sed -i 's|^#    "torch>=2.13.0",|    "torch>=2.13.0",|' pyproject.toml
+        sed -i 's|^    "torch~=2.14.0",|#    "torch~=2.14.0",|' pyproject.toml
+        sed -i 's|^#    "torch>=2.14.0",|    "torch>=2.14.0",|' pyproject.toml
         sed -i 's|^#  { path = "\.\./pytorch", editable = true },|  { path = "../pytorch", editable = false },|' pyproject.toml
         sed -i '/^  { path = "\.\.\/pytorch", editable = false },/{n;s|^  { index = "pytorch-cpu" },|#  { index = "pytorch-cpu" },|}' pyproject.toml
-        trap 'sed -i "s|^#    \"torch~=2.13.0\",|    \"torch~=2.13.0\",|" pyproject.toml; \
-              sed -i "s|^    \"torch>=2.13.0\",|#    \"torch>=2.13.0\",|" pyproject.toml; \
+        trap 'sed -i "s|^#    \"torch~=2.14.0\",|    \"torch~=2.14.0\",|" pyproject.toml; \
+              sed -i "s|^    \"torch>=2.14.0\",|#    \"torch>=2.14.0\",|" pyproject.toml; \
               sed -i "/^  { path = \"\.\.\/pytorch\", editable = false },/{n;s|^#  { index = \"pytorch-cpu\" },|  { index = \"pytorch-cpu\" },|}" pyproject.toml; \
               sed -i "s|^  { path = \"\.\./pytorch\", editable = false },|#  { path = \"../pytorch\", editable = true },|" pyproject.toml; \
               mv uv.lock.bak uv.lock' EXIT
