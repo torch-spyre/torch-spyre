@@ -168,10 +168,18 @@ uint32_t encodeConstant(float torch_const, DataFormats df) {
   uint32_t sen_const;
 
   if (df == DataFormats::IEEE_FP32) {
+#ifdef USE_FLEX_NAMESPACE
+    sen_const = flex::BinaryConvert<uint32_t>(static_cast<float>(torch_const));
+#else
     sen_const =
         deeptools::BinaryConvert<uint32_t>(static_cast<float>(torch_const));
+#endif
   } else {
+#ifdef USE_FLEX_NAMESPACE
+    sen_const = flex::FloatToFp16Bin(torch_const);
+#else
     sen_const = deeptools::FloatToFp16Bin(torch_const);
+#endif
   }
   return sen_const;
 }
