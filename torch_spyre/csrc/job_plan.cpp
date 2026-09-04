@@ -115,9 +115,31 @@ void JobPlanStepCompute::construct(LaunchContext& ctx,
       tensor_allocs.push_back(get_composite_address(tensor));
     }
   }
+  // Bind the job's per-launch dynamic region, if it has one. Every Compute step
+  // in the plan shares the same region and each captures the allocation in its
+  // completion callback, so the region outlives the last compute op to finish
+  // and no step has to know whether it is the last. This is safe because all
+  // Compute steps are Dev-role: per-stream FIFO serializes them, so two are
+  // never live in the region at once.
+  const flex::CompositeAddress* dynamic_address = nullptr;
+  if (ctx.dynamic_alloc) {
+    dynamic_address =
+        &static_cast<SharedOwnerCtx*>(ctx.dynamic_alloc->get_context())
+             ->composite_addr;
+  }
+
   auto* params = flex::createComputeParams(
-      &program_address_, std::move(tensor_allocs), name_, bootstrap_offset_);
+      &program_address_, std::move(tensor_allocs), name_, bootstrap_offset_,
+      /*tensor_byte_offsets=*/{}, dynamic_address);
   params->pipeline_barrier = pipeline_barrier_;
+  if (ctx.dynamic_alloc) {
+    // Keeps the allocation alive until flex runs the completion callback for
+    // this op. flex destroys the RuntimeOperation at submit time, but
+    // makeCompletionCallback() copies params->callback into the completion
+    // closure, which lives until the hardware op completes — so the capture,
+    // not the op, is what holds the region.
+    params->callback = [alloc = ctx.dynamic_alloc](void*) {};
+  }
   stream.launchCompute(params);
   flex::destroyComputeParams(params);
 }
@@ -267,12 +289,17 @@ std::ostream& operator<<(std::ostream& os, const JobPlan& plan) {
   size_t addr_idx = 0;
   for (const auto& addr : plan.job_allocation) {
     if (addr_idx == 0) {
-      os << "Job allocation: " << addr << "\n";
+      os << "Static job allocation: " << addr << "\n";
     } else {
       os << "Program " << addr_idx - 1 << ": " << addr << "\n";
     }
     ++addr_idx;
   }
+
+  // The dynamic region has no CompositeAddress to print here: it is allocated
+  // per launch in SpyreStream::launch(), so only its size is known at this
+  // point.
+  os << "Dynamic size: " << plan.dynamic_size << " bytes\n";
 
   // Expected input shapes
   if (!plan.expected_input_shapes.empty()) {

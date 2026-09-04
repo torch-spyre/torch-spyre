@@ -527,7 +527,12 @@ PYBIND11_MODULE(_C, m) {
           [](const spyre::JobPlan& plan) {
             return plan.job_allocation.at(0).total_size();
           },
-          "Get the size of the job allocation")
+          "Get the size of the static job allocation")
+      .def(
+          "dynamic_size",
+          [](const spyre::JobPlan& plan) { return plan.dynamic_size; },
+          "Get the size of the job's dynamic allocation, which is allocated "
+          "and freed per execution (0 if the job has no dynamic region)")
       .def(
           "get_step_type",
           [](const spyre::JobPlan& plan, size_t idx) {
@@ -574,6 +579,7 @@ PYBIND11_MODULE(_C, m) {
         return "<JobPlan steps=" + std::to_string(plan.steps.size()) +
                " job_allocation_size=" +
                std::to_string(plan.job_allocation.at(0).total_size()) +
+               " dynamic_size=" + std::to_string(plan.dynamic_size) +
                " expected_inputs=" +
                std::to_string(plan.expected_input_shapes.size()) +
                " pinned_buffers=" + std::to_string(plan.pinned_buffers.size()) +

@@ -297,6 +297,24 @@ void SpyreStream::launch(const JobPlan& plan,
   // copy.
   LaunchContext ctx{args, std::move(symbolic_args)};
 
+  // Allocate the job's dynamic region for this execution only. Unlike
+  // plan.job_allocation (allocated during PrepareKernel, alive for the
+  // JobPlan's lifetime), this is carved fresh per launch and released once the
+  // device is done with it — each Compute step keeps a refcount through its
+  // flex completion callback, so the last one to finish frees it.
+  //
+  // MemoryType::ProgramDynamic puts it in the same region as the static allocation;
+  // flex distinguishes the two by giving each its own xlat window (segment 6
+  // for dynamic, 7 for static).
+  if (plan.dynamic_size > 0) {
+    auto& allocator = SpyreAllocator::instance();
+    flex::AllocationDirective directive(
+        flex::PlacementPolicy::Bind, {0}, std::nullopt,
+        flex::MemoryType::ProgramDynamic);
+    ctx.dynamic_alloc = std::make_shared<c10::DataPtr>(
+        allocator.allocate(plan.dynamic_size, directive));
+  }
+
   // Split Prep-role steps onto S_prep only when the flex tracker is on; flex
   // then inserts the cross-stream edges. Off = every step on S_dev (the
   // single-stream floor). Routing keys on role(), so all-Dev plans never split.

@@ -258,20 +258,28 @@ void JobPlanBuilder::executeAllocate(const nlohmann::json& cmd) {
   const auto& allocate_props =
       cmd.contains("properties") ? cmd["properties"] : nlohmann::json();
 
-  TORCH_CHECK(allocate_props.contains("size"),
-              "Allocate command missing 'size' property");
+  TORCH_CHECK(allocate_props.contains("static_size"),
+              "Allocate command missing 'static_size' property");
 
-  std::string size_str = allocate_props["size"].get<std::string>();
-  size_t size = safe_stoull(size_str, "Allocate size");
+  std::string static_size_str =
+      allocate_props["static_size"].get<std::string>();
+  size_t static_size = safe_stoull(static_size_str, "Allocate static size");
 
   auto& allocator = SpyreAllocator::instance();
   flex::AllocationDirective directive(flex::PlacementPolicy::Bind, {0},
-                                      std::nullopt, flex::MemoryType::Program);
-  c10::DataPtr allocated_ptr = allocator.allocate(size, directive);
+                                      std::nullopt, flex::MemoryType::ProgramStatic);
+  c10::DataPtr allocated_ptr = allocator.allocate(static_size, directive);
 
   job_allocation_.emplace_back(
       std::move(static_cast<SharedOwnerCtx*>(allocated_ptr.get_context())
                     ->composite_addr));
+
+  TORCH_CHECK(allocate_props.contains("dynamic_size"),
+              "Allocate command missing 'dynamic_size' property");
+
+  std::string dynamic_size_str =
+      allocate_props["dynamic_size"].get<std::string>();
+  dynamic_size_ = safe_stoull(dynamic_size_str, "Allocate dynamic size");
 }
 
 void JobPlanBuilder::executeInitTransfer(const nlohmann::json& cmd) {
@@ -646,7 +654,8 @@ std::unique_ptr<JobPlan> JobPlanBuilder::translateJobExecPlan() {
               std::move(job_allocation_),  // job_allocation
               {},                          // expected_input_shapes
               std::move(pinned_buffers),   // pinned_buffers
-              std::move(inits_)});
+              std::move(inits_),
+              dynamic_size_});
 }
 
 JobPlanBuilder::ValidationResult JobPlanBuilder::validate(
