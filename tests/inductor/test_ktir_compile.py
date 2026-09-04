@@ -69,12 +69,13 @@ class _PrereqCase(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         self.output_dir = tmp.name
         self.ktir_path = os.path.join(self.output_dir, "k.ktir")
+        self.sdsc_bundle_dir_prefix = None
         with open(self.ktir_path, "w") as fh:
             fh.write("module {}\n")
 
     def compile(self):
         return _compiler()._compile_ktir_with_dbo(
-            "ktir_fused_add_0", self.ktir_path, self.output_dir
+            "ktir_fused_add_0", self.ktir_path, self.output_dir, self.sdsc_bundle_dir_prefix
         )
 
     def _write_spyrecode(self):

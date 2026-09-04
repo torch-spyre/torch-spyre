@@ -604,14 +604,18 @@ PYBIND11_MODULE(_C, m) {
 
   m.def("prepare_kernel", &spyre::prepareKernel, py::arg("spyrecode_dir"),
         py::arg("stream") = nullptr, py::arg("profiler_name") = std::nullopt,
+        py::arg("sdsc_bundle_dir_prefix") = std::string{},
         "Prepare a kernel from a SpyreCode directory and return a JobPlan.\n\n"
         "Args:\n"
         "    spyrecode_dir (str): Path to the SpyreCode directory\n"
         "    stream (SpyreStream, optional): Stream to use for initialization "
         "transfers.\n"
-        "        If None, uses the current stream. Defaults to None.\n\n"
+        "        If None, uses the current stream. Defaults to None.\n"
         "    profiler_name (str, optional): Bounded base name for "
-        "profiler-visible compute events. Defaults to None.\n\n"
+        "profiler-visible compute events. Defaults to None.\n"
+        "    sdsc_bundle_dir_prefix (str, optional): 8-char hex prefix of the "
+        "SDSC bundle directory; emitted as args.sdsc_bundle_dir_prefix "
+        "in profiler traces.\n\n"
         "Returns:\n"
         "    Prepared JobPlan ready for execution");
   // Bind the current-stream overload (resolves the current stream internally).

@@ -5286,6 +5286,230 @@ class TestCoarseTileSpyreHints(InductorTestCase):
                 fn, x, y, run_compile=True, run_eager=False, atol=0.01, rtol=0.01
             )
 
+    # ------------------------------------------------------------------
+    # Per-bundle hbm_pool_sizes threading into SpyreKernel
+    # ------------------------------------------------------------------
+
+    @config.patch({"lx_planning": False})
+    def test_bundle_pool_size_threaded_from_hbm_pool_sizes(self):
+        """codegen_node must look up this bundle's own pool_size from
+        V.graph.hbm_pool_sizes, not a stale graph-global scalar.
+
+        lx_planning is disabled here so the `a = x + y` intermediate isn't
+        claimed by LX scratchpad planning first -- with LX planning on,
+        `add`/`mul`/`sub` outputs are all LX-eligible by default (see
+        OP_OUTPUT_NOT_GOOD_FOR_LX_REUSE in scratchpad/utils.py) and may win the
+        scratchpad before hbm_pool_planning ever sees them, leaving every
+        bundle's pool_size at 0 and proving nothing about the plumbing this
+        test exists to check.
+        """
+        from unittest.mock import patch
+
+        from torch_spyre._inductor.spyre_kernel import SpyreKernel
+
+        seen_pool_sizes = []
+        orig_init = SpyreKernel.__init__
+
+        def _recording_init(self, pool_size=0, **kwargs):
+            seen_pool_sizes.append(pool_size)
+            orig_init(self, pool_size=pool_size, **kwargs)
+
+        def fn(x, y):
+            a = x + y
+            b = a * 2
+            return b - x
+
+        x = torch.randn(64, 64, dtype=torch.float16, device="spyre")
+        y = torch.randn(64, 64, dtype=torch.float16, device="spyre")
+
+        with (
+            patch.object(SpyreKernel, "__init__", _recording_init),
+            mock_patch(_LAUNCH_JOBPLAN),
+            mock_patch(_PREPARE_KERNEL),
+            mock_patch("subprocess.run"),
+        ):
+            torch.compile(fn)(x, y)
+
+        self.assertTrue(seen_pool_sizes)
+        self.assertTrue(
+            any(seen_pool_sizes),
+            f"expected at least one bundle with a nonzero pool_size, got "
+            f"{seen_pool_sizes}",
+        )
+
+    @config.patch({"lx_planning": False})
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+    def test_pool_alloc_scoped_per_bundle_across_fallback_boundary(self):
+        """A CPU-fallback op (torch.sin) splits the graph into multiple
+        bundles. With frontend_pool_allocation at its default (False), each
+        bundle's pool (if any) is allocated inside that bundle's own
+        generated MLIR via sdscbundle.device_mem_allocate -- there is no
+        Python-side pool tensor, and no bundle's MLIR references another
+        bundle's pool."""
+        from torch_spyre.execution import async_compile as async_compile_mod
+
+        def fn(t):
+            a = torch.exp(t) * 2  # compiled bundle 1; `a` crosses the
+            b = torch.sin(a)  # fallback op -- forces a bundle boundary
+            c = torch.exp(b) * 2  # compiled bundle 2
+            return c
+
+        x = torch.randn(64, 64, dtype=torch.float16, device="spyre")
+
+        # get_output_dir() mints a fresh random tempdir on every call (see
+        # its uuid4()-based implementation), so it cannot be re-invoked from
+        # the test to recover the directory sdsc() actually used to write
+        # bundle.mlir. Wrap it to record kernel_name -> output_dir while
+        # still delegating to the real implementation.
+        real_get_output_dir = async_compile_mod.get_output_dir
+        output_dirs_by_kernel = {}
+
+        def _recording_get_output_dir(kernel_name, sdsc_bundle_dir_prefix=None):
+            output_dir = real_get_output_dir(kernel_name, sdsc_bundle_dir_prefix)
+            output_dirs_by_kernel[kernel_name] = output_dir
+            return output_dir
+
+        with (
+            mock_patch(_LAUNCH_JOBPLAN),
+            mock_patch(_PREPARE_KERNEL),
+            mock_patch("subprocess.run"),
+            mock_patch.object(
+                async_compile_mod, "get_output_dir", _recording_get_output_dir
+            ),
+            pytest.warns(UserWarning),
+        ):
+            _, source_codes = run_and_get_code(torch.compile(fn), x)
+        src = source_codes[0]
+
+        # No Python-side pool tensor of any kind remains in the wrapper.
+        # Ordinary output buffers legitimately use spyre_empty_with_layout,
+        # so distinguish pool allocs by their telltale uint8 dtype, same as
+        # test_no_python_side_pool_tensor_allocated below.
+        pool_alloc_lines = [
+            line
+            for line in src.splitlines()
+            if "spyre_empty_with_layout" in line and "uint8" in line
+        ]
+        self.assertEqual(pool_alloc_lines, [])
+        self.assertNotIn("_pool_", src)
+
+        # Each kernel name mentioned in an async_compile.sdsc(...) call gets
+        # its own bundle.mlir; any that uses a pool must self-allocate it via
+        # device_mem_allocate, never via a %pool_base_addr parameter.
+        kernel_names = re.findall(r"async_compile\.sdsc\('(\w+)'", src)
+        self.assertTrue(kernel_names)
+        saw_pool_allocate = False
+        for kernel_name in kernel_names:
+            self.assertIn(kernel_name, output_dirs_by_kernel)
+            bundle_path = os.path.join(
+                output_dirs_by_kernel[kernel_name], "bundle.mlir"
+            )
+            with open(bundle_path) as f:
+                bundle_text = f.read()
+            self.assertNotIn("%pool_base_addr", bundle_text)
+            if "device_mem_allocate" in bundle_text:
+                saw_pool_allocate = True
+        self.assertTrue(
+            saw_pool_allocate,
+            f"expected at least one bundle to use device_mem_allocate, "
+            f"kernels were {kernel_names}",
+        )
+
+    @config.patch({"lx_planning": False})
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+    def test_no_python_side_pool_tensor_allocated(self):
+        """With frontend_pool_allocation at its default (False), no bundle
+        allocates a Python-side _pool_<name> tensor -- pool allocation is
+        entirely inside the generated MLIR."""
+
+        def fn(t):
+            a = torch.exp(t) * 2
+            b = torch.sin(a)  # fallback op -- forces a bundle boundary
+            c = torch.exp(b) * 2
+            return c
+
+        x = torch.randn(64, 64, dtype=torch.float16, device="spyre")
+
+        with (
+            mock_patch(_LAUNCH_JOBPLAN),
+            mock_patch(_PREPARE_KERNEL),
+            mock_patch("subprocess.run"),
+            pytest.warns(UserWarning),
+        ):
+            _, source_codes = run_and_get_code(torch.compile(fn), x)
+        src = source_codes[0]
+
+        # No Python-side pool tensor allocation (uint8 SpyreTensorLayout) --
+        # ordinary output buffers still legitimately use
+        # spyre_empty_with_layout, so distinguish pool allocs by their
+        # telltale uint8 dtype, same as
+        # test_pool_alloc_scoped_per_bundle_across_fallback_boundary above.
+        pool_alloc_lines = [
+            line
+            for line in src.splitlines()
+            if "spyre_empty_with_layout" in line and "uint8" in line
+        ]
+        self.assertEqual(pool_alloc_lines, [])
+        self.assertNotIn("_pool_", src)
+
+    @config.patch({"lx_planning": False})
+    def test_pool_size_kwarg_in_generated_sdsc_call(self):
+        """define_kernel() must append pool_size=<N> to the generated
+        async_compile.sdsc(...) call text for a kernel whose pool_size > 0,
+        and pool_size=0 must never be emitted explicitly. See
+        test_pool_size_kwarg_omitted_when_no_pool below for the omission
+        case on a kernel with no pool usage at all."""
+
+        def fn(x, y):
+            a = x + y
+            b = a * 2
+            return b - x
+
+        x = torch.randn(64, 64, dtype=torch.float16, device="spyre")
+        y = torch.randn(64, 64, dtype=torch.float16, device="spyre")
+
+        with (
+            mock_patch(_LAUNCH_JOBPLAN),
+            mock_patch(_PREPARE_KERNEL),
+            mock_patch("subprocess.run"),
+        ):
+            _, source_codes = run_and_get_code(torch.compile(fn), x, y)
+        src = source_codes[0]
+
+        self.assertIn("pool_size=", src)
+        # Every async_compile.sdsc( call either has no pool_size kwarg, or a
+        # positive one -- pool_size=0 must never be emitted explicitly.
+        self.assertNotIn("pool_size=0", src)
+
+    @config.patch({"lx_planning": True})
+    def test_pool_size_kwarg_omitted_when_no_pool(self):
+        """A kernel with no pool usage gets no pool_size kwarg at all.
+
+        With lx_planning enabled, the `a = x + y` intermediate is claimed by
+        LX scratchpad planning before hbm_pool_planning ever sees it (see
+        OP_OUTPUT_NOT_GOOD_FOR_LX_REUSE in scratchpad/utils.py), so this bundle
+        has no pool-eligible buffer and define_kernel() must omit the
+        pool_size kwarg entirely rather than emit pool_size=0.
+        """
+
+        def fn(x, y):
+            a = x + y
+            b = a * 2
+            return b - x
+
+        x = torch.randn(64, 64, dtype=torch.float16, device="spyre")
+        y = torch.randn(64, 64, dtype=torch.float16, device="spyre")
+
+        with (
+            mock_patch(_LAUNCH_JOBPLAN),
+            mock_patch(_PREPARE_KERNEL),
+            mock_patch("subprocess.run"),
+        ):
+            _, source_codes = run_and_get_code(torch.compile(fn), x, y)
+        src = source_codes[0]
+
+        self.assertIn("async_compile.sdsc(", src)
+        self.assertNotIn("pool_size", src)
 
 class TestNamedDimsHint(InductorTestCase):
     """Tests for propagate_named_dims handling of ops with a named_dims hint.

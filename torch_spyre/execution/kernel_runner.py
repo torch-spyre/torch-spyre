@@ -52,6 +52,7 @@ class SpyreSDSCKernelRunner:
         name: str,
         code_dir: str,
         kernel_provenance: KernelProvenanceDescriptor | None = None,
+        sdsc_bundle_dir_prefix: str = None,
     ):
         self.kernel_name = name
         self.code_dir = code_dir
@@ -60,7 +61,9 @@ class SpyreSDSCKernelRunner:
         spyrecode_dir = code_dir + "/spyreCodeDir"
         if kernel_provenance is None:
             self.profiler_event_name = None
-            self.jobplan = prepare_kernel(spyrecode_dir)
+            self.jobplan = prepare_kernel(
+                spyrecode_dir,
+                sdsc_bundle_dir_prefix=sdsc_bundle_dir_prefix)
         else:
             self.profiler_event_name = format_kernel_provenance_event_name(
                 kernel_provenance
@@ -76,6 +79,7 @@ class SpyreSDSCKernelRunner:
                 self.jobplan = prepare_kernel(
                     spyrecode_dir,
                     profiler_name=self.profiler_event_name,
+                    sdsc_bundle_dir_prefix=sdsc_bundle_dir_prefix
                 )
 
     @with_ffdc(CATEGORY_RUNTIME_LAUNCH, logger)
