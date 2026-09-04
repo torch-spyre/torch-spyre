@@ -38,10 +38,17 @@ import textwrap
 import regex
 import sympy
 
-from . import constants
+from . import config, constants
 from .dtype_ops import DtypeOpTable
 from .logging_utils import get_inductor_logger
-from .op_spec import IndirectAccess, LoopSpec, OpSpec, TensorArg, UnimplementedOp
+from .op_spec import (
+    IndirectAccess,
+    LoopSpec,
+    OpSpec,
+    TensorArg,
+    UnimplementedOp,
+    is_lx_relayout_identity,
+)
 
 logger = get_inductor_logger("op_spec_validation")
 
@@ -236,7 +243,76 @@ def _validate_op_spec(op_spec: OpSpec, stage: str, loop_depth: int) -> None:
     _check_symbol_consistency(op_spec, stage)
     _check_tiled_symbols(op_spec, stage, loop_depth)
     _check_stick_constraints(op_spec, stage)
+    _check_completed_reduction_route(op_spec, stage)
     _check_op_specific_constraints(op_spec, stage)
+
+
+def _check_completed_reduction_route(op_spec: OpSpec, stage: str) -> None:
+    """Validate the completed-reduction route certified during planning."""
+
+    routes = op_spec.producer_consumers
+    if not routes:
+        return
+    if not is_lx_relayout_identity(op_spec.op, op_spec.args, op_spec.op_info):
+        raise OpSpecValidationError(
+            op_spec,
+            "completed-reduction routes require a certified LX identity copy",
+            f"Got op={op_spec.op!r}, args={len(op_spec.args)}",
+            stage,
+        )
+
+    sources: set[int] = set()
+    destinations: set[int] = set()
+    for source, consumers in routes:
+        if source in sources:
+            raise OpSpecValidationError(
+                op_spec,
+                "completed-reduction source cores must be unique",
+                f"Duplicate source core {source}",
+                stage,
+            )
+        sources.add(source)
+        if not consumers:
+            raise OpSpecValidationError(
+                op_spec,
+                "each completed-reduction source must feed a consumer",
+                f"Source core {source} has no consumers",
+                stage,
+            )
+        for core in (source, *consumers):
+            if not isinstance(core, int) or not 0 <= core < config.sencores:
+                raise OpSpecValidationError(
+                    op_spec,
+                    "completed-reduction routes must name configured cores",
+                    f"Got core {core!r} for {config.sencores} cores",
+                    stage,
+                )
+        for consumer in consumers:
+            if consumer in destinations:
+                raise OpSpecValidationError(
+                    op_spec,
+                    "each destination core must have exactly one source",
+                    f"Destination core {consumer} appears more than once",
+                    stage,
+                )
+            destinations.add(consumer)
+
+    expected = set(range(config.sencores))
+    if destinations != expected:
+        raise OpSpecValidationError(
+            op_spec,
+            "completed-reduction routes must cover every destination core",
+            f"Got {sorted(destinations)}, expected {sorted(expected)}",
+            stage,
+        )
+    fanouts = {len(consumers) for _, consumers in routes}
+    if len(fanouts) != 1:
+        raise OpSpecValidationError(
+            op_spec,
+            "completed-reduction routes require uniform fanout",
+            f"Got fanouts {sorted(fanouts)}",
+            stage,
+        )
 
 
 def _check_mandatory_fields(op_spec: OpSpec, stage: str) -> None:

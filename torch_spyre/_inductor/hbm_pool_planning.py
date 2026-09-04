@@ -23,14 +23,13 @@ from torch._inductor.scheduler import (
 )
 from torch._inductor.ir import FallbackKernel
 from torch._inductor.virtualized import V
-from .constants import MAX_POOL_SIZE_BYTES, INTERMEDIATES_SEGMENT
+from .constants import BYTES_PER_STICK, MAX_POOL_SIZE_BYTES, INTERMEDIATES_SEGMENT
 from .ir import FixedTiledLayout, SpyreEmptyFallback
 from .logging_utils import get_inductor_logger
 from .scheduler import CountedLoopSchedulerNode
 from . import config
 
 logger = get_inductor_logger("HBM_POOL_PLANNING")
-_STICK_BYTES = 128
 _BYTES_PER_GB = 1024**3
 
 
@@ -117,8 +116,8 @@ def _compute_size_bytes(name: str) -> int:
     )
     dev_layout = layout.device_layout
     num_sticks = math.prod(dev_layout.device_size[:-1])
-    size_bytes = num_sticks * _STICK_BYTES
-    return _align_up(size_bytes, _STICK_BYTES)
+    size_bytes = num_sticks * BYTES_PER_STICK
+    return _align_up(size_bytes, BYTES_PER_STICK)
 
 
 def _compute_live_ranges(

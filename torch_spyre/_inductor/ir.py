@@ -39,6 +39,7 @@ import sympy
 from torch.utils._ordered_set import OrderedSet
 import torch._inductor.ir as ir
 from torch_spyre._inductor.logging_utils import get_inductor_logger
+from torch_spyre._inductor.constants import BYTES_PER_STICK
 
 logger = get_inductor_logger("ir")
 
@@ -476,9 +477,6 @@ def _dtype_to_int(dtype: torch.dtype) -> int:
     return code
 
 
-_STICK_BYTES = 128
-
-
 def _compute_device_num_elems(layout: "FixedLayout") -> int:
     """Compute flat 1D device element count from a layout.
 
@@ -488,7 +486,7 @@ def _compute_device_num_elems(layout: "FixedLayout") -> int:
     if isinstance(layout, FixedTiledLayout):
         stl = layout.device_layout
         num_sticks = math.prod(stl.device_size[:-1])
-        size_bytes = num_sticks * _STICK_BYTES
+        size_bytes = num_sticks * BYTES_PER_STICK
         element_size = torch.tensor([], dtype=layout.dtype).element_size()
         return size_bytes // element_size
     numel = sympy.prod(layout.size)

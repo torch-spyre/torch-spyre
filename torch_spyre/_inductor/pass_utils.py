@@ -88,6 +88,14 @@ class AlignmentAccess:
     index: sympy.Expr
 
 
+def input_layout_for_operation(op: Operation, name: str, default: Any) -> Any:
+    """Return the input descriptor every compiler phase must use for ``name``."""
+
+    overrides = getattr(op, "_input_layout_overrides", {})
+    override = overrides.get(name)
+    return default if override is None else override
+
+
 def _fixed_read_layout(buf) -> "FixedTiledLayout":
     layout = buf.get_layout()
     if isinstance(layout, MutationLayoutSHOULDREMOVE):
@@ -179,11 +187,10 @@ def op_read_writes(op: Operation) -> ReadWrites:
     """``op.get_read_writes()`` memoized on the op instance.
 
     ``ComputedBuffer.get_read_writes`` re-runs sympy dependency extraction on
-    every call and is not cached upstream, yet its result does not depend on the
-    only thing the LX planner mutates (``op_it_space_splits``). The scratchpad
-    pass calls it hundreds of times, so we cache it under a private key only this
-    helper reads -- a non-planner caller (e.g. later-pass codegen) still goes
-    through the real method.
+    every call and is not cached upstream, yet its result does not depend on
+    work-division metadata. The scratchpad pass calls it hundreds of times, so
+    we cache it under a private key only this helper reads -- a non-planner
+    caller (e.g. later-pass codegen) still goes through the real method.
     """
     rw = op.__dict__.get("_ts_cached_read_writes")
     if rw is None:
@@ -210,8 +217,8 @@ def invalidate_op_read_writes(op: Operation) -> None:
     swapping a load name in its ``inner_fn`` -- so the next
     :func:`op_read_writes` re-traces instead of returning stale reads/writes.
     The memo is keyed on the op instance and is otherwise never invalidated: its
-    result is independent of ``op_it_space_splits`` (the only thing the LX
-    planner normally mutates), so a plain split change needs no invalidation.
+    result is independent of work-division metadata, so a plain ownership or
+    split change needs no invalidation.
     """
     op.__dict__.pop("_ts_cached_read_writes", None)
 
@@ -1259,6 +1266,15 @@ def build_operation_alignment_inputs(
             for dim in access.index.free_symbols - raw_iteration_space.keys():
                 if dim not in resolved_indirect_sizes and str(dim) in size_by_name:
                     resolved_indirect_sizes[dim] = size_by_name[str(dim)]
+        used_symbols = set().union(*(access.index.free_symbols for access in accesses))
+        # Codegen retains index bindings for the whole kernel, while preflight
+        # sees one operation. Earlier operations' unused bindings are not
+        # inputs to this operation's alignment or ownership proof.
+        resolved_indirect_sizes = {
+            dim: size
+            for dim, size in resolved_indirect_sizes.items()
+            if dim in used_symbols
+        }
 
     repeat_snapshot = {
         symbol: dict(info) for symbol, info in (repeat_info or {}).items()
@@ -1281,6 +1297,88 @@ def build_operation_alignment_inputs(
         tensors,
         resolved_indirect_sizes,
         repeat_snapshot,
+    )
+
+
+def restore_restickify_alignment_inputs(
+    inputs: AlignmentInputs,
+    stick_size: int,
+) -> AlignmentInputs:
+    """Restore one size-1 restickify dimension before tensor alignment.
+
+    Inductor can elide a size-1 dimension on one side of a restickify. The
+    padding pass leaves a physical gap for it; this pure transform binds that
+    gap to one shared symbol. Scheduler preflight and codegen must call this
+    exact function so neither validates a different descriptor.
+    """
+
+    if len(inputs.tensors) != 2:
+        raise ValueError(
+            f"restickify alignment requires two tensors, got {len(inputs.tensors)}"
+        )
+    if stick_size <= 0:
+        raise ValueError(f"restickify stick size must be positive, got {stick_size}")
+
+    tensors = [
+        {
+            "size": list(tensor["size"]),
+            "coordinates": list(tensor["coordinates"]),
+        }
+        for tensor in inputs.tensors
+    ]
+
+    def stick_symbol(tensor: dict[str, list[sympy.Expr]]) -> sympy.Symbol | None:
+        symbols = tuple(tensor["coordinates"][-1].free_symbols)
+        if len(symbols) > 1:
+            raise ValueError(
+                "restickify within-stick coordinate has more than one symbol: "
+                f"{symbols}"
+            )
+        return symbols[0] if symbols else None
+
+    input_symbol = stick_symbol(tensors[0])
+    output_symbol = stick_symbol(tensors[1])
+    if input_symbol is not None and output_symbol is not None:
+        return inputs
+    if input_symbol is None and output_symbol is None:
+        raise ValueError("both restickify operands have an elided stick dimension")
+
+    used = set(inputs.iteration_space)
+    suffix = 0
+    while (new_symbol := sympy.Symbol(f"rs{suffix}")) in used:
+        suffix += 1
+
+    elided, intact = (
+        (tensors[0], tensors[1]) if input_symbol is None else (tensors[1], tensors[0])
+    )
+    real = [
+        (size, coordinate)
+        for size, coordinate in zip(elided["size"][:-1], elided["coordinates"][:-1])
+        if coordinate.free_symbols
+    ]
+    elided["size"] = [1, *(size for size, _ in real), stick_size]
+    elided["coordinates"] = [
+        sympy.floor(new_symbol / stick_size),
+        *(coordinate for _, coordinate in real),
+        sympy.Mod(new_symbol, stick_size),
+    ]
+
+    if intact["size"][0] != stick_size or intact["coordinates"][0] != 0:
+        raise ValueError(
+            f"restickify restore expected a padding-prepended size-{stick_size} "
+            f"gap dimension, got size={intact['size'][0]} "
+            f"coordinate={intact['coordinates'][0]}"
+        )
+    intact["coordinates"][0] = new_symbol
+    iteration_space = {
+        new_symbol: (sympy.Integer(stick_size), 1),
+        **inputs.iteration_space,
+    }
+    return build_alignment_inputs(
+        iteration_space,
+        tensors,
+        inputs.indirect_sizes,
+        inputs.repeat_info,
     )
 
 
@@ -1729,9 +1827,9 @@ def make_iteration_space_ownership(
         )
         else None
     )
-    # Keep the selected mapping with the splits for the planned codegen handoff.
-    # Scheduler still reconstructs it from coefficient transport today; meanwhile
-    # retaining it lets the boundary diagnose aliases with different ownership.
+    # Keep the selected mapping with its splits through LX planning. Physical
+    # views preserve this core order after the legacy scheduler transport keeps
+    # only the operation's split counts.
     return TensorWorkDivision(
         work_slices,
         core_to_slice_mapping(
@@ -1749,6 +1847,35 @@ def commit_iteration_space_ownership(
 ) -> None:
     """Commit pre-scheduler symbol-keyed split and core ownership."""
     op.iteration_space_ownership = make_iteration_space_ownership(op, splits)
+
+
+def commit_tensor_work_division(op: Operation, ownership: TensorWorkDivision) -> None:
+    """Commit physical owners, completing omitted unsplit operation loops."""
+
+    symbols = tuple(iteration_space_from_op(op))
+    split_symbols = set(ownership.work_slices)
+    owner_symbols = set(ownership.core_id_to_work_slice)
+    if split_symbols != owner_symbols:
+        raise ValueError("committed ownership split and owner symbols differ")
+    unknown = split_symbols - set(symbols)
+    if unknown:
+        raise ValueError(
+            "committed ownership has unknown operation loops: "
+            f"{sorted(map(str, unknown))}"
+        )
+
+    # A physical view records only dimensions that divide the tensor. Missing
+    # operation loops are therefore unambiguously local: one slice, slot zero.
+    committed = TensorWorkDivision(
+        {symbol: int(ownership.work_slices.get(symbol, 1)) for symbol in symbols},
+        {
+            symbol: ownership.core_id_to_work_slice.get(symbol, sympy.S.Zero)
+            for symbol in symbols
+        },
+        num_cores=ownership.physical_core_count,
+    )
+    committed.to_core_slices(committed.physical_core_count)
+    op.iteration_space_ownership = committed
 
 
 def select_work_division_transport_indexes(
@@ -2763,6 +2890,54 @@ class PerCoreView:
     core_to_slot: tuple[tuple[int, Expr], ...]
     num_cores: int | None = None
 
+    def same_partition(self, other: object) -> bool:
+        """Whether both views assign every physical core the same buffer slice."""
+
+        if not isinstance(other, PerCoreView):
+            return False
+        left_splits = {
+            dim: int(split) for dim, split in self.work_slice_dims if int(split) > 1
+        }
+        right_splits = {
+            dim: int(split) for dim, split in other.work_slice_dims if int(split) > 1
+        }
+        left_cores = (
+            self.num_cores
+            if self.num_cores is not None
+            else math.prod(left_splits.values())
+        )
+        right_cores = (
+            other.num_cores
+            if other.num_cores is not None
+            else math.prod(right_splits.values())
+        )
+        if left_splits != right_splits or left_cores != right_cores:
+            return False
+        if not left_splits:
+            return True
+
+        from .core_mapping import core_mappings_equal
+
+        left_slots = dict(self.core_to_slot)
+        right_slots = dict(other.core_to_slot)
+        try:
+            symbols = {dim: sympy.Symbol(f"device_dim_{dim}") for dim in left_splits}
+            return core_mappings_equal(
+                {symbols[dim]: left_slots[dim] for dim in left_splits},
+                {symbols[dim]: right_slots[dim] for dim in right_splits},
+                left_cores,
+            )
+        except KeyError:
+            return False
+
+
+def per_core_views_equal(left: PerCoreView | None, right: PerCoreView | None) -> bool:
+    """None-aware physical-partition comparison."""
+
+    if left is None or right is None:
+        return left is right
+    return left.same_partition(right)
+
 
 def _is_matmul_op(op: Operation) -> bool:
     return (
@@ -2816,15 +2991,13 @@ def read_with_max_reduction_overlap(
     return best_read
 
 
-# TODO: Select and store the core mapping before LX planning, then pass the
-# winning mapping to codegen.
 class _ViewPrep(NamedTuple):
     """Candidate-invariant precompute shared across every core-division
     candidate of one ``(op, dep, buf_name)``.
 
-    Everything here depends only on the op, its dep, and the target buffer (not
-    on ``op.op_it_space_splits``), so ``_prepare_per_core_view`` computes it once
-    and ``_per_core_view_from_prep`` reuses it per candidate -- hoisting the
+    Everything here depends only on the op, its dep, and the target buffer, not
+    on a candidate's splits or owners. ``_prepare_per_core_view`` computes it
+    once and ``_per_core_view_from_prep`` reuses it per candidate, hoisting the
     sympy-heavy op-level work out of the per-candidate loop.
     """
 
@@ -2854,8 +3027,6 @@ def _prepare_per_core_view(
     op: Operation,
     dep: MemoryDep,
     buf_name: str,
-    *,
-    parts: "Optional[tuple[dict, sympy.Expr, sympy.Expr]]" = None,
 ) -> Optional[_ViewPrep]:
     """Compute the candidate-invariant pieces of a per-core view once.
 
@@ -2864,21 +3035,17 @@ def _prepare_per_core_view(
     ``None`` to the unrepresentable result without entering the per-candidate
     path.
 
-    ``parts`` supplies ``(iter_space, write_index, read_index)`` explicitly.
-    Default (None) reads them off ``op`` -- the *pre*-scheduler ranges, which is
-    what LX planning sees. Post-fusion callers pass the ``SchedulerNode``'s
-    ranges instead, so they model the order codegen will actually emit.
+    The inputs come from the pre-scheduler operation. Post-scheduler ownership
+    is validated by projecting the committed physical view through the final
+    access; this builder no longer has a second scheduler-derived mode.
     """
-    if parts is not None:
-        iter_space, write_index, read_index = parts
-    else:
-        # The op-level write_index / read_index (for *any* buffer the op writes /
-        # reads, not necessarily buf_name) bridge stride-keyed coeff_splits back
-        # to scheduler symbols.
-        rw = op_read_writes(op)
-        write_index = next(iter(rw.writes)).index
-        read_index = next((d.index for d in rw.reads), write_index)
-        iter_space = iteration_space_from_op(op)
+    # The op-level write_index / read_index (for *any* buffer the op writes /
+    # reads, not necessarily buf_name) bridge stride-keyed coeff_splits back
+    # to scheduler symbols.
+    rw = op_read_writes(op)
+    write_index = next(iter(rw.writes)).index
+    read_index = next((d.index for d in rw.reads), write_index)
+    iter_space = iteration_space_from_op(op)
 
     buf_op = V.graph.get_buffer(buf_name)
     buf_layout = buf_op.layout
@@ -2940,14 +3107,16 @@ def _prepare_per_core_view(
 
 def _per_core_view_from_prep(
     prep: Optional[_ViewPrep],
-    splits: dict[sympy.Symbol, int] | tuple[dict, dict],
+    splits: dict[sympy.Symbol, int],
     reduction_splits: Optional[dict[sympy.Symbol, int]] = None,
+    *,
+    ownership: TensorWorkDivision | None = None,
 ) -> tuple[PerCoreView, bool, bool]:
-    """Evaluate a precomputed view for symbol splits or scheduler transport."""
-    num_cores = math.prod(
-        value
-        for group in (splits if isinstance(splits, tuple) else (splits,))
-        for value in group.values()
+    """Evaluate a view from complete symbol-keyed ownership or candidate splits."""
+    num_cores = (
+        ownership.physical_core_count
+        if ownership is not None
+        else math.prod(splits.values())
     )
     # 3-tuple: (view, has_partial_reduction, representable). ``representable`` is
     # False only on the give-up returns below (a split that slices this buffer
@@ -2961,30 +3130,16 @@ def _per_core_view_from_prep(
 
     # No real split -> whole-buffer view, representable regardless of layout. Must
     # precede the ``prep is None`` guard to match the original ordering.
-    if isinstance(splits, tuple):
-        if not any(n > 1 for d in splits for n in d.values()):
-            return (
-                PerCoreView(work_slice_dims=(), core_to_slot=(), num_cores=num_cores),
-                False,
-                True,
-            )
-        if prep is None:
-            return unrepresentable
-        per_sym = apply_splits_from_index_coeff(
-            splits, prep.write_index, prep.read_index, prep.iter_space
+    if not any(n > 1 for n in splits.values()):
+        return (
+            PerCoreView(work_slice_dims=(), core_to_slot=(), num_cores=num_cores),
+            False,
+            True,
         )
-        has_partial_reduction = any(n > 1 for n in splits[1].values())
-    else:
-        if not any(n > 1 for n in splits.values()):
-            return (
-                PerCoreView(work_slice_dims=(), core_to_slot=(), num_cores=num_cores),
-                False,
-                True,
-            )
-        if prep is None:
-            return unrepresentable
-        per_sym = {sym: int(splits.get(sym, 1)) for sym in prep.iter_space}
-        has_partial_reduction = any(n > 1 for n in (reduction_splits or {}).values())
+    if prep is None:
+        return unrepresentable
+    per_sym = {sym: int(splits.get(sym, 1)) for sym in prep.iter_space}
+    has_partial_reduction = any(n > 1 for n in (reduction_splits or {}).values())
 
     # Step 2: keep splits that actually slice this buffer, keyed by their host
     # stride on buf (precomputed in ``dep_coeff``). host_stride == 0 means the
@@ -3066,6 +3221,48 @@ def _per_core_view_from_prep(
                 dev_dim = num_stick_dim
                 split *= k
 
+        # A stride match proposes one physical axis; it does not prove that a
+        # flattened loop owns that axis's contiguous slices. For example,
+        # f in [0, 32) with coordinates (f % 8, f // 8) cannot put an eight-way
+        # split on the first axis alone. Ordinary stickification (f // 64,
+        # f % 64) is valid when each loop slice covers complete sticks.
+        if (
+            dev_dim is not None
+            and sum(
+                sym in coordinate.free_symbols
+                for coordinate in prep.dep_device_coordinates
+            )
+            > 1
+        ):
+            from .core_mapping import (
+                _DIRECT_AXIS_LOOP,
+                _direct_axis_ownership_matches,
+            )
+
+            extent = iter_space[sym]
+            if isinstance(extent, tuple):
+                extent = extent[0]
+            # Prove every logical partition, independent of the physical core
+            # order. Step 4 preserves that order using the same partition IDs.
+            partition = sympy.Symbol("core_id")
+            if not _direct_axis_ownership_matches(
+                concretize_expr(extent),
+                per_sym[sym],
+                partition,
+                device_size[dev_dim],
+                prep.dep_device_coordinates[dev_dim].xreplace({sym: _DIRECT_AXIS_LOOP}),
+                split,
+                partition,
+                per_sym[sym],
+            ):
+                logger.debug(
+                    "cannot prove stride-selected ownership for iteration %s "
+                    "on device dim %s; require exact decomposition",
+                    sym,
+                    dev_dim,
+                )
+                dev_dim = None
+
         # A reshape can place more than one logical loop symbol on one physical
         # device axis.  Splitting an inner symbol while an unsplit outer symbol
         # also contributes to that axis gives each core several interleaved
@@ -3121,23 +3318,28 @@ def _per_core_view_from_prep(
         work_slice_dims[dev_dim] = split
         sym_to_device_dim[sym] = dev_dim
 
-    # Step 4: model the same physical ownership SDSC will emit. LX compatibility
-    # requires producer and consumer to assign each slice to the same physical
-    # core; matching split factors alone is insufficient.
-    num_cores = int(math.prod(per_sym.values()))
+    # Step 4: project the committed core order into device dimensions. Candidate
+    # exploration has no committed record yet and keeps the existing default.
     iter_symbols = tuple(iter_space)
     dim_splits = tuple(int(per_sym[sym]) for sym in iter_symbols)
-    contiguous_dim = (
-        len(dim_splits) - 1
-        if prep.is_matmul and config.core_id_k_fast_emission
-        else None
-    )
-    core_to_slot = core_to_slice_mapping(
-        iter_symbols,
-        dim_splits,
-        num_cores,
-        contiguous_dim=contiguous_dim,
-    )
+    if ownership is not None:
+        if set(ownership.work_slices) != set(iter_symbols) or set(
+            ownership.core_id_to_work_slice
+        ) != set(iter_symbols):
+            return unrepresentable
+        core_to_slot = dict(ownership.core_id_to_work_slice)
+    else:
+        contiguous_dim = (
+            len(dim_splits) - 1
+            if prep.is_matmul and config.core_id_k_fast_emission
+            else None
+        )
+        core_to_slot = core_to_slice_mapping(
+            iter_symbols,
+            dim_splits,
+            num_cores,
+            contiguous_dim=contiguous_dim,
+        )
     # Re-key by the buffer's device-dim index (canonical) instead of the op's
     # iter symbol name. Two ops with the same per-core slicing on this buffer
     # compare equal even if they name their iter axes differently.
@@ -3163,16 +3365,18 @@ def _per_core_view_on_buf(
     """Build a PerCoreView describing how `op` slices `buf_name` via `dep`.
 
     Thin wrapper over ``_prepare_per_core_view`` + ``_per_core_view_from_prep``,
-    reading the candidate division from ``op.op_it_space_splits``. Callers
-    sweeping many candidates of one op/edge should call those two directly to
-    amortize the op-level precompute.
+    reading the complete committed division from
+    ``op.iteration_space_ownership``. Callers sweeping many candidates of one
+    op/edge should call those two directly to amortize the op-level precompute.
 
     Returns `(view, has_partial_reduction, representable)`. ``has_partial_reduction``
     is True when the op has a reduction split (partial sums left on most cores);
     callers act on it only for write-deps. ``representable`` is False only on the
     give-up cases (a split that slices this buffer can't be placed on a device
     dim), which cross-op comparisons must treat as a non-match. Pass `cache` to
-    memoize, keyed by (op name, symbol-keyed splits, dep, buf_name).
+    memoize, keyed by the op name, complete symbol-keyed ownership, dependency,
+    and buffer name. Owner formulas and the physical core count are part of the
+    key, so equal split counts with different core orders cannot alias.
 
     The op name is part of the key because the result also depends on op-derived
     write_index / read_index / iter_space / matmul-ness, not just (splits, dep,
@@ -3186,13 +3390,27 @@ def _per_core_view_on_buf(
     splits = ownership.work_slices if ownership is not None else {}
     key = None
     if cache is not None:
-        key = (op.get_name(), frozenset(splits.items()), dep, buf_name)
+        ownership_key = (
+            (
+                ownership.physical_core_count,
+                frozenset(ownership.core_id_to_work_slice.items()),
+            )
+            if ownership is not None
+            else None
+        )
+        key = (
+            op.get_name(),
+            frozenset(splits.items()),
+            ownership_key,
+            dep,
+            buf_name,
+        )
         hit = cache.get(key)
         if hit is not None:
             return hit
 
     if not any(n > 1 for n in splits.values()):
-        num_cores = ownership.num_cores if ownership is not None else 1
+        num_cores = ownership.physical_core_count if ownership is not None else 1
         result = (
             PerCoreView(work_slice_dims=(), core_to_slot=(), num_cores=num_cores),
             False,
@@ -3207,53 +3425,58 @@ def _per_core_view_on_buf(
     reduction_splits = {
         sym: split for sym, split in splits.items() if write_index.coeff(sym) == 0
     }
-    result = _per_core_view_from_prep(prep, splits, reduction_splits)
+    result = _per_core_view_from_prep(
+        prep,
+        splits,
+        reduction_splits,
+        ownership=ownership,
+    )
     if cache is not None:
         cache[key] = result
     return result
 
 
-def per_core_view_scheduled(
-    node: "SchedulerNode", dep: MemoryDep, buf_name: str
-) -> tuple[PerCoreView, bool, bool]:
-    """:func:`_per_core_view_on_buf` against the *post*-scheduler ranges.
+def completed_reduction_splits_on_buf(
+    op: Operation,
+    dep: MemoryDep,
+    buf_name: str,
+) -> tuple[int, int] | None:
+    """Return the committed reduction and output splits for a matmul result.
 
-    Same result shape, but the iteration space and indices come from
-    ``node.read_writes`` / :func:`iteration_space` rather than the pre-scheduler
-    ``op.get_read_writes()``. Inductor's ``loop_ordering_after_fusion`` can
-    permute a fused op's ranges after LX planning has already committed, and
-    ``core_to_slice_mapping`` is positional, so only this post-fusion view
-    reflects the core->slice assignment codegen will really emit.
+    DeepTools chooses the core holding the completed partial sum from both
+    values: an unsplit OUT dimension completes on the last core in each
+    reduction group, while a split OUT dimension completes on the middle core.
+    Planning therefore certifies both facts before it records broadcast routes.
     """
-    op = node.node
-    coeff_splits: tuple[dict, dict] = getattr(op, "op_it_space_splits", ({}, {}))
-    if not any(n > 1 for d in coeff_splits for n in d.values()):
-        # No real split -> whole-buffer view; every core holds all of it.
-        return (
-            PerCoreView(work_slice_dims=(), core_to_slot=(), num_cores=1),
-            False,
-            True,
-        )
 
-    rw = node.read_writes
-    write_dep = next((d for d in rw.writes if isinstance(d, MemoryDep)), None)
-    if write_dep is None:
-        # StarDep-only writer: no index to reason about, so treat as
-        # unrepresentable rather than guessing.
-        num_cores = math.prod(
-            value for group in coeff_splits for value in group.values()
-        )
-        return (
-            PerCoreView(work_slice_dims=(), core_to_slot=(), num_cores=num_cores),
-            False,
-            False,
-        )
-    read_index = next(
-        (d.index for d in rw.reads if isinstance(d, MemoryDep)), write_dep.index
+    if not _is_matmul_op(op):
+        return None
+    prep = _prepare_per_core_view(op, dep, buf_name)
+    ownership = getattr(op, "iteration_space_ownership", None)
+    if prep is None or ownership is None:
+        return None
+    reduction_splits = [
+        int(ownership.work_slices.get(sym, 1))
+        for sym in prep.iter_space
+        if prep.write_index.coeff(sym) == 0
+        and int(ownership.work_slices.get(sym, 1)) > 1
+    ]
+    if len(reduction_splits) != 1 or prep.stick_host_stride is None:
+        return None
+
+    # Matmul OUT is the output tensor's stick dimension. Size-one OUT has no
+    # loop symbol and therefore keeps the default split of one.
+    output_symbols = [
+        sym
+        for sym in prep.iter_space
+        if prep.write_index.coeff(sym) == prep.stick_host_stride
+    ]
+    if len(output_symbols) > 1:
+        return None
+    output_split = (
+        int(ownership.work_slices.get(output_symbols[0], 1)) if output_symbols else 1
     )
-    parts = (iteration_space(node), write_dep.index, read_index)
-    prep = _prepare_per_core_view(op, dep, buf_name, parts=parts)
-    return _per_core_view_from_prep(prep, coeff_splits)
+    return reduction_splits[0], output_split
 
 
 def format_operations(operations: list[Operation]) -> str:

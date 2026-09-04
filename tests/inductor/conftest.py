@@ -24,11 +24,91 @@ import os
 
 import pytest
 import torch
+from lx_finalizer_parity import LXFinalizerParity
+
+
+@pytest.fixture
+def lx_finalizer_parity():
+    """Audit successful real compiles through both finalizer call sites."""
+
+    with LXFinalizerParity() as audit:
+        yield audit
+
+
+@pytest.fixture(autouse=True)
+def _audit_lx_finalizer_corpus(request):
+    """Optional whole-suite audit; direct finalizer unit calls are out of scope.
+
+    Set ``SPYRE_AUDIT_LX_FINALIZER_INPUTS=1`` when running the Inductor corpus.
+    Tests that instantiate OpSpec/finalizer objects directly have no scheduler
+    node and are intentionally not recorded. Real codegen calls are required to
+    match a full-node preflight exactly.
+    """
+
+    if os.environ.get("SPYRE_AUDIT_LX_FINALIZER_INPUTS") != "1":
+        yield
+        return
+    audit = request.getfixturevalue("lx_finalizer_parity")
+    yield
+    # A test can intentionally stop compilation before codegen. In that case
+    # there is no later call for a successful scheduler preflight to match.
+    # Still reject every codegen call that lacked an identical preflight; only
+    # the reverse coverage proof is conditional on the test reaching its end.
+    audit.assert_codegen_covered()
+    fallback_report = audit.fallback_report()
+    terminal = request.config.pluginmanager.getplugin("terminalreporter")
+    if terminal is not None:
+        for line in fallback_report:
+            terminal.write_line(line)
+    report = getattr(request.node, "lx_finalizer_call_report", None)
+    if report is not None and report.passed:
+        audit.assert_complete()
+        expected = request.node.get_closest_marker("lx_finalizer_fallback_expected")
+        if expected is None:
+            assert not fallback_report, "\n".join(fallback_report)
+        else:
+            assert len(expected.args) == 1 and isinstance(expected.args[0], str), (
+                "lx_finalizer_fallback_expected requires one reason string"
+            )
+            expected_count = expected.kwargs.get("count", 1)
+            assert isinstance(expected_count, int) and expected_count > 0, (
+                "lx_finalizer_fallback_expected count must be a positive integer"
+            )
+            assert len(fallback_report) == expected_count, (
+                "LX finalizer fallback count changed: "
+                f"expected {expected_count}, got {len(fallback_report)}; "
+                f"records={fallback_report}"
+            )
+            assert all(expected.args[0] in line for line in fallback_report), (
+                "LX finalizer fallback reason changed: "
+                f"expected substring {expected.args[0]!r}; records={fallback_report}"
+            )
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_makereport(item, call):
+    """Expose the call outcome to the finalizer-audit fixture teardown."""
+
+    outcome = yield
+    if call.when == "call":
+        item.lx_finalizer_call_report = outcome.get_result()
+
+
+def pytest_runtest_logreport(report):
+    """Make long corpus-run failures visible before the final pytest summary."""
+
+    if os.environ.get("SPYRE_AUDIT_LX_FINALIZER_INPUTS") == "1" and report.failed:
+        print(f"\nLX_AUDIT_FAILURE {report.nodeid} [{report.when}]\n{report.longrepr}")
 
 
 def pytest_configure(config):
     """Ensure OpSpec validation is enabled for the inductor test suite."""
     os.environ["SPYRE_VALIDATE_OP_SPECS"] = "1"
+    config.addinivalue_line(
+        "markers",
+        "lx_finalizer_fallback_expected(reason, count=1): this test deliberately "
+        "exercises the named number of scheduler LX fallbacks",
+    )
 
 
 _POISON_VALUE = 1234.0

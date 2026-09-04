@@ -13,11 +13,15 @@
 # limitations under the License.
 
 from torch.fx.graph import Graph
+from torch._inductor.dependencies import MemoryDep
 from torch._inductor.graph import GraphLowering
 from torch._inductor.ops_handler import WrapperHandler
 from torch_spyre._inductor.pass_utils import (
+    PerCoreView,
     commit_iteration_space_ownership,
+    commit_tensor_work_division,
     copy_op_metadata,
+    device_coordinates,
     iteration_space_from_op,
     invalidate_op_read_writes,
     op_read_writes,
@@ -107,8 +111,11 @@ class GraphEditor:
         *,
         input: bool,
         private: bool = False,
+        lx_view: PerCoreView | None = None,
     ) -> ComputedBuffer:
         """Insert a clone; private clones rewire only ``buffer_users``."""
+        if input and lx_view is None:
+            raise ValueError("an LX input clone requires its accepted physical view")
         if isinstance(buffer, TensorBox):
             buf_name = buffer.data.data.name  # type: ignore
         else:
@@ -179,35 +186,42 @@ class GraphEditor:
         self.lowering.register_operation(new_com_buf)
         new_buf_name = new_com_buf.get_name()
 
-        # Clone loops mirror their source/consumer symbols before Scheduler, so
-        # retain direct symbol ownership instead of round-tripping through index
-        # coefficients. A clone has no reduction split.
+        # Clone loops mirror their source/consumer symbols before Scheduler.
+        # Input ownership therefore comes directly from the accepted physical
+        # view; never rebuild its core order from index coefficients.
         metadata_owner = getattr(metadata_source, "iteration_space_ownership", None)
-        if input and metadata_owner is not None:
-            read = next(
-                (
-                    dep
-                    for dep in op_read_writes(metadata_source).reads
-                    if dep.name == buf_name
-                ),
-                None,
+        if input:
+            assert lx_view is not None
+            from torch_spyre._inductor.scratchpad.lx_relayout import (
+                work_division_from_view,
             )
-            clone_write = next(iter(op_read_writes(new_com_buf).writes))
-            by_coeff = {
-                read.index.coeff(sym): split
-                for sym, split in metadata_owner.work_slices.items()
-                if read is not None and read.index.coeff(sym) != 0
-            }
-            clone_splits = {
-                sym: by_coeff.get(clone_write.index.coeff(sym), 1)
-                for sym in iteration_space_from_op(new_com_buf)
-            }
+
+            clone_writes = [
+                dep
+                for dep in op_read_writes(new_com_buf).writes
+                if isinstance(dep, MemoryDep)
+            ]
+            if len(clone_writes) != 1:
+                raise ValueError(
+                    "LX input clone must have exactly one indexed tensor write, "
+                    f"got {len(clone_writes)}"
+                )
+            clone_write = clone_writes[0]
+            clone_symbols = tuple(iteration_space_from_op(new_com_buf))
+            clone_ownership = work_division_from_view(
+                lx_view,
+                device_coordinates(clone_layout.device_layout, clone_write, None),
+                clone_symbols,
+            )
+            if clone_ownership is None:
+                raise ValueError("LX clone is missing its accepted physical ownership")
+            commit_tensor_work_division(new_com_buf, clone_ownership)
         else:
             clone_splits = {
                 sym: metadata_owner.work_slices.get(sym, 1) if metadata_owner else 1
                 for sym in iteration_space_from_op(new_com_buf)
             }
-        commit_iteration_space_ownership(new_com_buf, clone_splits)
+            commit_iteration_space_ownership(new_com_buf, clone_splits)
 
         if input:
             source_users = []
@@ -248,9 +262,15 @@ class GraphEditor:
         self,
         buffer: ComputedBuffer,
         consumers: list[ComputedBuffer],
+        *,
+        lx_view: PerCoreView,
     ) -> ComputedBuffer:
         return self.push_allocation_with_clone(
-            buffer, consumers, input=True, private=True
+            buffer,
+            consumers,
+            input=True,
+            private=True,
+            lx_view=lx_view,
         )
 
     @staticmethod
