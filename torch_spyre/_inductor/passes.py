@@ -43,6 +43,7 @@ from .temp_passes import (
     bmm_unflatten_pass,
     decompose_addmm,
     mm_to_bmm_pass,
+    pad_unit_n_matmul,
 )
 from .wsr.coarse_tile import validate_coarse_tile_groups
 from .wsr.coarse_tile_span_overflow import span_overflow_groups
@@ -247,6 +248,10 @@ class CustomPostPasses(_SpyreGraphPassPipeline):
                 decompose_addmm,
                 mm_to_bmm_pass.apply,
                 bmm_unflatten_pass.apply,
+                # Pad statically-N=1 matmuls to N=2 and slice back: the backend
+                # cannot compile a size-1 generated dim. Runs last so it sees
+                # the final mm/bmm form after the unflatten passes above.
+                pad_unit_n_matmul,
             ]
         )
 

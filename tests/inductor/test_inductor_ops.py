@@ -991,6 +991,11 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     ((55, 2), (2, 99)),
                     ((67, 67), (67, 67)),
                     ((67, 255), (255, 128)),
+                    # N=1 output dim (score/regression head): the generated dim
+                    # folds out and the backend rejects size-1 reuse dims, so
+                    # pad_unit_n_matmul widens N to 2 and slices back.
+                    ((67, 256), (256, 1)),
+                    ((1, 128), (128, 1)),
                 ],
                 rand_type="xavier",
             ),
@@ -1035,6 +1040,9 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     ((3, 1, 256), (3, 256, 128)),
                     ((3, 17, 256), (3, 256, 128)),
                     ((2, 256, 1), (2, 1, 128)),
+                    # N=1 output dim: batched score head, widened by
+                    # pad_unit_n_matmul.
+                    ((3, 17, 256), (3, 256, 1)),
                     # Padding
                     ((2, 55, 2), (2, 2, 99)),
                     ((2, 99, 65), (2, 65, 55)),
