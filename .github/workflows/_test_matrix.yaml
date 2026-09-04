@@ -1,7 +1,7 @@
 name: Test matrix (reusable)
 
 # ---------------------------------------------------------------------------
-# Reusable workflow — not triggered directly.
+# Reusable workflow — not triggered directly. new line
 # Called by tests.yml and tests-nightly.yml.
 #
 # All differences between the two callers are expressed as inputs:
