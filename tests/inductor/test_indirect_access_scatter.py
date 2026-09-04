@@ -160,10 +160,11 @@ class _ScatterScenarios:
         """Scatter a computed ``[B, L, H, D] -> [B, H, L, D]`` view.
 
         RoPE produces K in this form before writing it into a pinned KV cache.
-        The scatter must honor the view's source layout without requiring an
-        explicit ``contiguous()`` materialization in the model.
+        The cache is longer than K, so an inserted restickify must retain K's
+        source geometry rather than inheriting the destination extent.  The
+        scatter must not require an explicit ``contiguous()`` in the model.
         """
-        Bn, H, L, D, M = 1, 8, 64, 256, 128
+        Bn, H, L, D, M = 1, 8, 320, 256, 384
         dtype = torch.bfloat16
         generator = torch.Generator().manual_seed(0)
         src = torch.randn(Bn, L, H, D, dtype=dtype, generator=generator)

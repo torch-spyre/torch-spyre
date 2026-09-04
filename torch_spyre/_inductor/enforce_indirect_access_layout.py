@@ -28,6 +28,7 @@ graph output) or inserts a spyre.restickify copy in the required layout.
 """
 
 import sympy
+import torch
 
 from torch._inductor.dependencies import MemoryDep
 from torch._inductor.graph import GraphLowering
@@ -314,6 +315,13 @@ def _dense_scatter_source_stl(value_layout: FixedTiledLayout) -> SpyreTensorLayo
     )
 
 
+def _is_synthetic_restickify(buf) -> bool:
+    """Return whether ``buf`` was produced by the restickify insertion pass."""
+    if not isinstance(buf, ComputedBuffer) or len(buf.origins) != 1:
+        return False
+    return next(iter(buf.origins)).target is torch.ops.spyre.restickify.default
+
+
 def _scatter_alignment_inputs(
     graph: GraphLowering,
     op: ComputedBuffer,
@@ -455,6 +463,15 @@ def _materialize_unaligned_scatter_source(
             dep.name,
             op.get_name(),
         )
+        if _is_synthetic_restickify(source_buf):
+            # Layout propagation may already have inserted a private restickify
+            # for this scatter edge.  Retarget that copy directly: inserting a
+            # second copy here would read an intermediate whose physical
+            # geometry was already chosen from the scatter destination and can
+            # therefore be too large for the logical source (for example a
+            # 64-token K tensor feeding a 384-token KV cache).
+            source_buf.layout = _fixed_tiled(source_layout, dense_stl)
+            return op
         return _insert_relayout_copy(
             graph,
             op,
