@@ -3724,6 +3724,41 @@ def _rescale_index(
     return new_index
 
 
+def _compute_read_copy_strides(
+    full_sizes: list[Expr],
+    full_strides: list[Expr],
+    copy_sizes: list[Expr],
+) -> list[Expr]:
+    """Resize source strides for a compact read-copy allocation.
+
+    Unlike an ordinary tensor tile, a staged read may cover a proper slice whose
+    extent does not divide the backing buffer (for example, 192 columns from a
+    640-column source).  Preserve the source layout's proportional padding while
+    shrinking each already-processed physical dimension to the copy extent.
+    """
+    copy_strides = [sympy.S.Zero] * len(copy_sizes)
+    dims = [
+        d
+        for d, (size, stride) in enumerate(zip(full_sizes, full_strides))
+        if size != 1 and stride != 0
+    ]
+    dims.sort(key=lambda d: full_strides[d])
+    cumulative_scale: Expr = sympy.S.One
+    for d in dims:
+        resized_stride = sympy.cancel(sympy.sympify(full_strides[d]) / cumulative_scale)
+        if resized_stride.is_integer is False:
+            raise Unsupported(
+                f"source stride {full_strides[d]} at dim {d} cannot be "
+                f"resized by cumulative scale {cumulative_scale}"
+            )
+        if copy_sizes[d] > 1:
+            copy_strides[d] = resized_stride
+        cumulative_scale *= sympy.cancel(
+            sympy.sympify(full_sizes[d]) / sympy.sympify(copy_sizes[d])
+        )
+    return copy_strides
+
+
 def _propagate_read_copy_named_dims(copy_buf: ComputedBuffer, dep: MemoryDep) -> None:
     """Give a read-copy staging buffer the named dims its source dep carries.
 
@@ -3902,7 +3937,7 @@ def _insert_one_read_copy(
                 else next_stride // active_full_strides[k]
             )
         active_tile_ranges = [dep.size[i] for i in active_idx]
-        active_tile_strides = compute_tile_stride(
+        active_tile_strides = _compute_read_copy_strides(
             active_full_sizes, active_full_strides, active_tile_ranges
         )
         # active_tile_strides[i] corresponds to active_idx[i]: both are indexed
