@@ -6549,15 +6549,12 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             run_eager=False,
         )
 
-    @pytest.mark.xfail(
-        reason=(
-            "Spyre compiled backend hits an internal lowering bug for "
-            "torch.logsumexp (stable error signature: InductorError: "
-            "IndexError: list index out of range)"
-        ),
-        strict=True,
-    )
-    def test_logsumexp_keepdim0_known_xfail(self):
+    def test_logsumexp_keepdim0(self):
+        """Was a strict xfail: the compiled path raised "Incompatible host_size
+        and dim_order" from the multi-arg pointwise dim_order projection, which
+        did not handle an operand of higher rank than the output. This op reaches
+        that path with a rank-2 operand against a rank-1 output.
+        """
         x = cached_randn((67, 256), scale=0.1)
         self.compare_with_cpu(
             lambda x: torch.logsumexp(x, dim=0, keepdim=False),
@@ -8342,6 +8339,61 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         self.compare_with_cpu(
             index_copy_fn, cache, index, source, run_compile=False, run_eager=True
         )
+
+    def test_gather_from_higher_rank_operand(self):
+        """Gather whose value operand outranks the gather's output.
+
+        `flatten`/`transpose` are views, so the multi-arg pointwise feeding the
+        gather keeps its rank-5 shape while the gather's output is rank 4. The
+        dim_order projection in _multi_arg_pointwise_layouts assumed an operand
+        rank <= the output's and came up short, raising "Incompatible host_size
+        and dim_order".
+        """
+
+        def fn(a, b, index):
+            out = a.mul(b).flatten(3).transpose(1, 2)
+            return out.index_select(2, index)
+
+        a = cached_randn((1, 64, 8, 2, 64), differentiation="rankdiff_a")
+        b = cached_randn((1, 64, 8, 2, 64), differentiation="rankdiff_b")
+        index = torch.tensor([17], dtype=torch.int32)
+
+        self.compare_with_cpu(fn, a, b, index)
+
+    def test_gather_from_higher_rank_rope_operand(self):
+        """The rope-shaped instance of test_gather_from_higher_rank_operand.
+
+        Mirrors hf_adapters `apply_rope_matmul` followed by a KV-cache
+        `index_select`: a rank-6 [B, L, H, 2, 1, D/2] intermediate viewed down to
+        [B, H, L, D] before the gather, giving an operand two ranks above the
+        gather's rank-4 output.
+        """
+
+        def fn(sf, x, index):
+            out = sf.mul(x.unsqueeze(-3)).sum(4, keepdim=True).flatten(3)
+            return out.transpose(1, 2).index_select(2, index)
+
+        sf = cached_randn((1, 64, 1, 2, 2, 64), differentiation="rankdiff_sf")
+        x = cached_randn((1, 64, 8, 2, 64), differentiation="rankdiff_x")
+        index = torch.tensor([17], dtype=torch.int32)
+
+        self.compare_with_cpu(fn, sf, x, index)
+
+    def test_gather_from_rank_aligned_operand(self):
+        """Control for the two tests above: operand rank == output rank.
+
+        The same gather on an operand the projection always handled, so a
+        failure here means the gather itself broke rather than the projection.
+        """
+
+        def fn(a, b, index):
+            return a.mul(b).index_select(2, index)
+
+        a = cached_randn((1, 8, 64, 128), differentiation="rankdiff_ctl_a")
+        b = cached_randn((1, 8, 64, 128), differentiation="rankdiff_ctl_b")
+        index = torch.tensor([17], dtype=torch.int32)
+
+        self.compare_with_cpu(fn, a, b, index)
 
     def test_repeat_cpu(self, x, *repeat_args):
         def fn(a):
