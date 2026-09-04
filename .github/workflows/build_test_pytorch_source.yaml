@@ -241,6 +241,12 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 120
+    permissions:
+      # Needed to dispatch and poll _upstream_tests_beta_matrix.yaml below
+      # (createWorkflowDispatch / listWorkflowRuns / getWorkflowRun). Capped
+      # by the caller's own token -- push-pytorch-dispatch-to-clickhouse.yaml
+      # must also grant `actions: write`.
+      actions: write
     outputs:
       run_id: ${{ steps.dispatch.outputs.run_id }}
     steps:
