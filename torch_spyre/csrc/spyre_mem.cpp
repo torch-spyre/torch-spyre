@@ -613,10 +613,50 @@ at::Tensor spyre_copy_from(const at::Tensor& self, const at::Tensor& dst,
   at::Tensor cpu_alloc;
   const at::Tensor* copy_from = &self;
   const at::Tensor* copy_to = &dst;
-  bool non_overlapping_and_dense = true;
+  bool staging = false;
 
   if (dst.is_privateuseone()) {
     stream = getCurrentStream(dst.device());
+    // H2D sub-view staging path: when the destination Spyre tensor is a
+    // sub-view of its physical allocation (dma_numel > dst.numel()), the DCI
+    // layer cannot represent a partial write into the middle of a tiled device
+    // allocation because the DCSI iteration space must align with stick
+    // boundaries.
+    //
+    // We use a read-modify-write:
+    //   1. D2H: DMA the full physical allocation into a CPU staging buffer.
+    //   2. CPU: overwrite only the sub-view slot with self.
+    //   3. H2D: DMA the staging buffer back — now with the full layout and
+    //           zero offset, which the DCI engine handles correctly.
+    //
+    // This is safe even when `dst` has a non-zero storage_offset: step 1 reads
+    // the current on-device values; step 2 patches exactly the right slot
+    // (same sizes/strides/storage_offset as dst); step 3 writes the whole
+    // allocation back atomically from the CPU side.
+    auto* spyre_impl =
+        static_cast<SpyreTensorImpl*>(dst.unsafeGetTensorImpl());
+    int64_t dma_numel = 1;
+    for (auto s : spyre_impl->dma_sizes) dma_numel *= s;
+    const bool physical_exceeds_logical = (dma_numel > dst.numel());
+
+    if (physical_exceeds_logical) {
+      staging = true;
+      c10::IntArrayRef alloc_sizes(spyre_impl->dma_sizes);
+      c10::IntArrayRef alloc_strides(spyre_impl->dma_strides);
+      // Step 1: D2H — read the current full allocation into a CPU buffer.
+      alloc_view = at::as_strided(dst, alloc_sizes, alloc_strides,
+                                  /*storage_offset=*/0);
+      cpu_alloc = at::empty(alloc_sizes, self.options().dtype(dst.scalar_type()));
+      stream.copyAsync(alloc_view, cpu_alloc);
+      stream.synchronize();
+      // Step 2: CPU patch — overwrite only the target slot.
+      at::Tensor cpu_slot =
+          cpu_alloc.as_strided(dst.sizes(), dst.strides(), dst.storage_offset());
+      cpu_slot.copy_(self);
+      // Step 3: H2D — write the full staging buffer back to the device.
+      copy_from = &cpu_alloc;
+      copy_to = &alloc_view;
+    }
   } else {
     stream = getCurrentStream(self.device());
     // D2H staging path: DMA the full physical allocation into a CPU buffer
@@ -640,7 +680,7 @@ at::Tensor spyre_copy_from(const at::Tensor& self, const at::Tensor& dst,
 
       if (!self.unsafeGetTensorImpl()->is_non_overlapping_and_dense_default() ||
           physical_exceeds_logical) {
-        non_overlapping_and_dense = false;
+        staging = true;
         c10::IntArrayRef alloc_sizes(spyre_impl->dma_sizes);
         c10::IntArrayRef alloc_strides(spyre_impl->dma_strides);
         alloc_view = at::as_strided(self, alloc_sizes, alloc_strides,
@@ -653,11 +693,15 @@ at::Tensor spyre_copy_from(const at::Tensor& self, const at::Tensor& dst,
   }
 
   stream.copyAsync(*copy_from, *copy_to);
-  if (!non_blocking) {
+  if (!non_blocking || (staging && dst.is_cpu())) {
+    // Always synchronize before reading cpu_alloc in the D2H staging path:
+    // copyAsync passes a raw void* and does not retain tensor ownership, so
+    // cpu_alloc must be fully written before we apply the logical view below.
     stream.synchronize();
   }
 
-  if (!non_overlapping_and_dense) {
+  if (staging && dst.is_cpu()) {
+    // D2H post-staging: apply the logical view onto the CPU destination.
     at::Tensor cpu_view = cpu_alloc.as_strided(self.sizes(), self.strides(),
                                                self.storage_offset());
     dst.copy_(cpu_view);
