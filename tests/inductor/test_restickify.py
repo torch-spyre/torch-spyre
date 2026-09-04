@@ -1596,6 +1596,48 @@ def test_strict_transpose_0_last_clone(shape):
     _strict(lambda x: x.transpose(0, -1).clone(), x)
 
 
+# -------- torch.cat on the target-model shapes (#1094) ----------
+#
+# ``torch.cat`` lowers to two slice writes into one freshly cloned buffer, so a
+# concat whose split point is not a stick multiple makes both writes land in the
+# SAME stick: ``[..., :32]`` and ``[..., 32:64]`` of a 64-wide stick.  Neither
+# write can be lowered natively -- the offset write cannot express its stick
+# expression, and the offset-free ``:32`` write covers only half a stick, so
+# written whole it pads to a full stick and zeroes the tail, clobbering its
+# sibling.  Both must therefore relocate to one shared alternative layout that
+# moves the offset off the stick dim.
+#
+# The two inputs occupy disjoint fp16-exact bands ([0, 512) and [512, 1024)), so
+# ``_strict`` catches any element that crosses the concat boundary in either
+# direction.  Within one input the ramp wraps every 512 elements, so a
+# displacement that is an exact multiple of 512 along the ramp is invisible; the
+# boundary itself, which is what these shapes exercise, is not.
+CAT_MODEL_SHAPES = [
+    # Aligned 64+64: both writes are whole sticks, no relocation needed.
+    ((1, 8, 1, 64), (1, 8, 1, 64), -1),
+    ((1, 14, 64), (1, 14, 64), -1),
+    ((1, 32, 41, 64), (1, 32, 41, 64), -1),
+    # KV-cache append on a non-stick dim: 67+1 -> 68 planes of a full stick.
+    ((1, 8, 67, 128), (1, 8, 1, 128), 2),
+    # Mid-stick 32+32 -> 64 (rotary embedding): the split point falls inside one
+    # stick, so both writes share it and must relocate together.
+    ((1, 8, 11, 32), (1, 8, 11, 32), -1),
+    ((1, 8, 1, 32), (1, 8, 1, 32), -1),
+]
+
+
+@pytest.mark.parametrize(
+    "shapes",
+    CAT_MODEL_SHAPES,
+    ids=lambda p: f"{'x'.join(map(str, p[0]))}+{'x'.join(map(str, p[1]))}_dim{p[2]}",
+)
+def test_strict_cat_model_shapes(shapes):
+    a_shape, b_shape, dim = shapes
+    x = _arange(*a_shape, base=0, span=512)
+    y = _arange(*b_shape, base=512, span=512)
+    _strict(lambda x, y: torch.cat([x, y], dim=dim), x, y)
+
+
 # ======================================================================
 # Size-1 dims in and around the stick.
 #

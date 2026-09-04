@@ -3646,6 +3646,17 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             },
             "param_sets": {
                 "2d64": (1, 32, 96, cached_randn((128, 256)), cached_randn((128, 64))),
+                # Offset sub-stick write: cols 32:64 land inside the first of
+                # the four 64-wide sticks spanning this 256-wide dim. start != 0,
+                # so relocation onto the dim-0 stick candidate handles it without
+                # needing stick-tail preserve.
+                "2d_substick_off32": (
+                    1,
+                    32,
+                    64,
+                    cached_randn((128, 256)),
+                    cached_randn((128, 32)),
+                ),
                 "2d128": (
                     1,
                     1,
@@ -3815,6 +3826,18 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     128,
                     cached_randn((2, 8, 4, 128)),
                     cached_randn((2, 8, 4, 64)),
+                ),
+                # Offset sub-stick write on the stick (last) dim: cols 32:64 are
+                # the upper half of this dim's single 64-wide stick. The write is
+                # offset (start != 0), so relocation moves it off the stick dim.
+                # (The offset-free sub-stick start=0 case additionally needs
+                # stick-tail preserve and is out of scope.)
+                "substick_off32_3d": (
+                    2,
+                    32,
+                    64,
+                    cached_randn((3, 8, 64)),
+                    cached_randn((3, 8, 32)),
                 ),
             },
         },

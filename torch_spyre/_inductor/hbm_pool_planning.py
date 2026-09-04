@@ -262,6 +262,27 @@ def hbm_pool_planning(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]
         and isinstance(layout := io_buf.maybe_get_layout(), FixedTiledLayout)
     }
 
+    all_flat_nodes: list[BaseSchedulerNode] = list(_iter_all_nodes(nodes))
+
+    # A relocated mutation target needs its device layout visible at runtime, which
+    # a set_spyre_tensor_layout call naming its wrapper variable provides. Pooled
+    # buffers emit no such call, so these targets are excluded from pooling and get
+    # a standalone HBM buffer. Keyed on allocation-dict identity because the
+    # mutation alias shares its target's dict.
+    restore_alloc_ids: set[int] = {
+        id(layout.allocation)
+        for node in all_flat_nodes
+        if isinstance(
+            emit := getattr(getattr(node, "node", None), "_emit_set_layout", None),
+            tuple,
+        )
+        and emit
+        and isinstance(emit[0], str)
+        if (target_buf := V.graph.get_buffer(emit[0])) is not None
+        and not isinstance(target_buf, Symbol)
+        and isinstance(layout := target_buf.maybe_get_layout(), FixedTiledLayout)
+    }
+
     def _is_intermediate(name: str) -> bool:
         buf = V.graph.get_buffer(name)
         if buf is None:
@@ -271,6 +292,7 @@ def hbm_pool_planning(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]
             isinstance(layout, FixedTiledLayout)
             and "lx" not in layout.allocation
             and id(layout.allocation) not in io_alloc_ids
+            and id(layout.allocation) not in restore_alloc_ids
         )
 
     def _alloc_id(name: str) -> int | None:
@@ -294,7 +316,6 @@ def hbm_pool_planning(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]
 
     # Buffers read by Fallback/Extern/Nop nodes must stay Python-side tensors,
     # regardless of which bundle they belong to.
-    all_flat_nodes: list[BaseSchedulerNode] = list(_iter_all_nodes(nodes))
     fallback_read = {
         dep.name
         for node in all_flat_nodes
