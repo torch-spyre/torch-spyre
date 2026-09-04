@@ -1800,6 +1800,76 @@ def lower_maximum(x, y):
     return with_int64_fallback(lowering.maximum, x, y)
 
 
+# ---------------------------------------------------------------------------
+# Comparison ops: aten.{eq,ne,lt,le,gt,ge}.Tensor / aten.{eq,ne,lt,le,gt,ge}.Scalar
+#
+# Spyre's hardware compare instructions only accept fp32 (and fp16) operands.
+# Integer inputs (int32, int64) are cast to float32 before the comparison; the
+# bool result needs no further conversion because Spyre already represents bool
+# tensors as fp32-width values.
+#
+# Each op is split into a .Tensor overload (broadcast=True) and a .Scalar
+# overload.  Both delegate to a shared ``_lower_cmp_impl`` helper so the
+# int-to-float promotion logic lives in exactly one place.
+# ---------------------------------------------------------------------------
+
+
+def _make_cmp_pointwise(op_name: str):
+    """Return a broadcast-capable pointwise lowering for a comparison op."""
+    return lowering.make_pointwise(
+        lowering.ops_wrapper(op_name), override_return_dtype=torch.bool
+    )
+
+
+def _lower_cmp_impl(x, y, pointwise_fn):
+    """Cast integer tensor operands to float32, then apply pointwise_fn.
+
+    Handles both int32 and int64 inputs; float inputs pass through unchanged.
+    Python scalar ``y`` is coerced to float when ``x`` is an integer tensor so
+    both sides share the same promoted type.
+    """
+    x_dtype = x.get_dtype() if hasattr(x, "get_dtype") else None
+    if x_dtype in (torch.int32, torch.int64):
+        x = to_dtype(x, torch.float32)
+        if isinstance(y, int):
+            y = float(y)
+    if hasattr(y, "get_dtype") and y.get_dtype() in (torch.int32, torch.int64):
+        y = to_dtype(y, torch.float32)
+    return pointwise_fn(x, y)
+
+
+def _register_cmp_lowerings(aten_op, op_name: str):
+    """Register .Tensor and .Scalar lowerings for one comparison op."""
+    pw = _make_cmp_pointwise(op_name)
+
+    @register_spyre_lowering(
+        getattr(torch.ops.aten, aten_op).Tensor,
+        name=aten_op,
+        type_promotion_kind=None,
+        broadcast=True,
+    )
+    def _tensor(x, y):
+        return _lower_cmp_impl(x, y, pw)
+
+    @register_spyre_lowering(
+        getattr(torch.ops.aten, aten_op).Scalar,
+        name=aten_op,
+        type_promotion_kind=None,
+    )
+    def _scalar(x, y):
+        return _lower_cmp_impl(x, y, pw)
+
+    return _tensor, _scalar
+
+
+lower_eq_tensor, lower_eq_scalar = _register_cmp_lowerings("eq", "eq")
+lower_ne_tensor, lower_ne_scalar = _register_cmp_lowerings("ne", "ne")
+lower_lt_tensor, lower_lt_scalar = _register_cmp_lowerings("lt", "lt")
+lower_le_tensor, lower_le_scalar = _register_cmp_lowerings("le", "le")
+lower_gt_tensor, lower_gt_scalar = _register_cmp_lowerings("gt", "gt")
+lower_ge_tensor, lower_ge_scalar = _register_cmp_lowerings("ge", "ge")
+
+
 @register_spyre_lowering(torch.ops.spyre.qfp8ch)
 def lower_qfp8ch(x):
     """
