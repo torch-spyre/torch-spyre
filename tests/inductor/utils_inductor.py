@@ -15,6 +15,7 @@
 import copy
 import functools
 import hashlib
+import sys
 import torch
 import os
 import pytest
@@ -571,6 +572,38 @@ def _compile_and_run(
     """Compile and execute function on specified device/backend, returning result on CPU."""
     torch._dynamo.reset_code_caches()
     torch._inductor.codecache.FxGraphCache.clear()
+
+    # Release device program memory held by previously compiled kernels.
+    # Clear Python module caches and their sys.modules entries so the module
+    # objects (and the SpyreSDSCKernelRunner / jobplan handles they own) are
+    # immediately unreferenced and destroyed by CPython's reference counting
+    # before the next kernel is loaded by prepare_kernel.  Without the
+    # sys.modules purge the modules remain alive despite PyCodeCache.cache
+    # being cleared, keeping FlexAllocator slots occupied and causing OOM on
+    # cards with limited free space (e.g. 1-card regression runs at
+    # sencores=32).
+    try:
+        import gc
+        import torch._inductor.codecache as codecache
+
+        if hasattr(codecache, "PyCodeCache") and hasattr(
+            codecache.PyCodeCache, "cache"
+        ):
+            for key in list(codecache.PyCodeCache.cache.keys()):
+                sys.modules.pop(key, None)
+            codecache.PyCodeCache.cache.clear()
+        if hasattr(codecache, "AotAndInlinedModulesCache") and hasattr(
+            codecache.AotAndInlinedModulesCache, "cache"
+        ):
+            for key in list(codecache.AotAndInlinedModulesCache.cache.keys()):
+                sys.modules.pop(key, None)
+            codecache.AotAndInlinedModulesCache.cache.clear()
+        if hasattr(torch, "compiler") and hasattr(torch.compiler, "reset"):
+            torch.compiler.reset()
+        gc.collect()
+    except Exception:
+        pass
+
     device = torch.device(device) if isinstance(device, str) else device
     device_args = [
         arg.to(device) if isinstance(arg, torch.Tensor) else arg for arg in args
