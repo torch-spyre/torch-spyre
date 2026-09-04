@@ -3726,6 +3726,30 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
             },
         },
+        ("test_slice_op", "test_slice_op_cpu"): {
+            "param_sets": {
+                "1d_begin": (0, 0, 64, cached_randn((192,), dtype=torch.float16)),
+                "1d_mid": (0, 64, 128, cached_randn((192,), dtype=torch.float16)),
+                "1d_end": (0, 128, 192, cached_randn((192,), dtype=torch.float16)),
+                "2d_d0": (0, 0, 3, cached_randn((9, 192), dtype=torch.float16)),
+                "2d_d1_begin": (1, 0, 64, cached_randn((9, 192), dtype=torch.float16)),
+                "2d_d1_mid": (1, 64, 128, cached_randn((9, 192), dtype=torch.float16)),
+                "3d_d0": (0, 0, 3, cached_randn((9, 5, 192), dtype=torch.float16)),
+                "3d_d1": (1, 1, 4, cached_randn((9, 5, 192), dtype=torch.float16)),
+                "3d_d2_begin": (
+                    2,
+                    0,
+                    64,
+                    cached_randn((3, 5, 192), dtype=torch.float16),
+                ),
+                "3d_d2_mid": (
+                    2,
+                    64,
+                    128,
+                    cached_randn((3, 5, 192), dtype=torch.float16),
+                ),
+            },
+        },
         ("test_slice_synthetic_dims", "test_slice_synthetic_dims_cpu"): {
             "param_sets": {
                 "5d": (cached_randn((2, 3, 4, 5, 192), dtype=torch.float16),),
@@ -7078,6 +7102,17 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
         # Note: .contiguous() causes issues with eager mode per existing patterns
         self.compare_with_cpu(fn, x, run_eager=False)
+
+    def test_slice_op_cpu(self, dim, start, end, x):
+        def fn(x):
+            if dim == 0:
+                return x[start:end].clone()
+            elif dim == 1:
+                return x[:, start:end].clone()
+            else:
+                return x[:, :, start:end].clone()
+
+        self.compare_with_cpu(fn, x, run_eager=True)
 
     @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_new_ones_cpu(self, x, y):
