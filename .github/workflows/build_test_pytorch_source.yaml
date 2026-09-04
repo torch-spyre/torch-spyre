@@ -146,7 +146,14 @@ jobs:
             --pytorch-sha "${{ inputs.pytorch_sha }}" \
             --torch-spyre-sha "${{ github.sha }}"
 
+      # Own job-name (not "test"), same-job-paired with the completed call below.
+      - name: Report build started to pytorch/pytorch
+        uses: ./.github/actions/report-ci-started
+        with:
+          job_name: linux-x86_64 / pytorch / build
+
       - name: Build PyTorch from source
+        id: build_pytorch
         uses: ./.github/actions/build-pytorch-from-source
 
       - name: Upload PyTorch wheel
@@ -174,7 +181,26 @@ jobs:
             --torch-spyre-sha "${{ github.sha }}"
 
       - name: Build torch-spyre against local PyTorch
+        id: build_torch_spyre
         uses: ./.github/actions/build-torch-spyre-local-pytorch
+
+      - name: Compute build conclusion
+        id: build_conclusion
+        if: always()
+        run: |
+          if [ "${{ steps.build_pytorch.outcome }}" = "success" ] && [ "${{ steps.build_torch_spyre.outcome }}" = "success" ]; then
+            echo "conclusion=success" >> "$GITHUB_OUTPUT"
+          else
+            echo "conclusion=failure" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Report build completed to pytorch/pytorch
+        if: always()
+        uses: ./.github/actions/report-ci-completed
+        with:
+          job_name: linux-x86_64 / pytorch / build
+          conclusion: ${{ steps.build_conclusion.outputs.conclusion }}
+          pytorch_sha: ${{ inputs.pytorch_sha }}
 
       - name: Upload torch-spyre wheel
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -237,16 +263,17 @@ jobs:
   # steps -- the CRCR check-run is scoped per-job, so both callbacks have to
   # originate from the same job as each other (see build's commented-out
   # in_progress step, moved out of that job for the same reason). The
-  # reporting steps below are appended to this same job (rather than a
-  # separate `report` job) for the same reason plus one more: they need
-  # this job's own dispatched-run id, which used to have to travel through
-  # a job `output` for a separate job to read.
+  # reporting steps live in this same job (rather than a separate `report`
+  # job) for the same reason plus one more: only here can the "completed"
+  # CRCR callback carry real pass/fail/skip/total counts -- mode: validate
+  # means the dispatched matrix run's own conclusion is almost always
+  # "success" even when tests failed, so the JUnit counts are the only
+  # trustworthy signal.
   #
-  # if: always() at the job level so the reporting steps still run (and
-  # write the ClickHouse/CRCR/RHEL-relay "completed" callbacks) even when
-  # `build` failed -- the dispatch/wait steps above them are individually
-  # gated on needs.build.result == 'success' so they don't attempt to use
-  # wheels that were never produced.
+  # if: always() at the job level so the reporting steps still run even
+  # when `build` failed -- the dispatch/wait step is individually gated on
+  # needs.build.result == 'success' so it doesn't attempt to use wheels
+  # that were never produced.
   # ---------------------------------------------------------------------------
   test:
     name: Run upstream-beta test matrix and report results
@@ -271,17 +298,65 @@ jobs:
       CLICKHOUSE_PASS: ${{ secrets.CLICKHOUSE_PASS_DEV }}
       CLICKHOUSE_DB: ${{ secrets.CLICKHOUSE_DB_DEV }}
     steps:
-      - name: Report CI started to pytorch/pytorch
-        # Only repository_dispatch (real PR-triggered CI) needs an
-        # in_progress ping -- pytorch/pytorch's CRCR only watches those
-        # runs live. Nightly (schedule) doesn't need one, and
-        # workflow_dispatch (manual/ad-hoc) is never relayed at all.
-        if: github.event_name == 'repository_dispatch' && needs.build.result == 'success'
-        continue-on-error: true
-        uses: pytorch/test-infra/.github/actions/cross-repo-ci-relay-callback@main
+      - name: Checkout composite actions
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          status: in_progress
-          job-name: linux-x86_64 / pytorch / test
+          sparse-checkout: .github/actions
+          sparse-checkout-cone-mode: false
+
+      - name: Checkout torch-spyre
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          path: torch-spyre
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          # latest-known, not "latest": it resolves to the newest uv whose checksum is
+          # bundled INTO this setup-uv pin, resolved locally with no release lookup. A
+          # just-published release is not yet mirrored on releases.astral.sh, so "latest"
+          # 404s there and falls back to GitHub Releases, which rate-limits (429) once the
+          # fleet requests it concurrently. Bumping setup-uv moves this version forward.
+          version: latest-known
+
+      # actions4gh/setup-gh@v1.0.2 extracts the gh tarball but never lands
+      # the binary on PATH before it calls `gh auth login`, so every job
+      # fails with "spawn gh ENOENT" (upstream actions4gh/setup-gh#7, #11,
+      # unresolved). Install gh directly instead; downstream steps already
+      # set GH_TOKEN, which `gh` picks up implicitly, so no `gh auth login`
+      # call is needed here.
+      - name: Setup the GitHub CLI
+        env:
+          GH_CLI_VERSION: 2.97.0
+        run: |
+          curl -fsSL \
+            "https://github.com/cli/cli/releases/download/v${GH_CLI_VERSION}/gh_${GH_CLI_VERSION}_linux_amd64.tar.gz" \
+            -o "${RUNNER_TEMP}/gh-cli.tar.gz"
+          mkdir -p "${RUNNER_TEMP}/gh-cli"
+          tar -xzf "${RUNNER_TEMP}/gh-cli.tar.gz" -C "${RUNNER_TEMP}/gh-cli" --strip-components=1
+          echo "${RUNNER_TEMP}/gh-cli/bin" >> "${GITHUB_PATH}"
+
+      - name: Write dispatch payload to file
+        env:
+          PAYLOAD_JSON: ${{ toJSON(github.event.client_payload) }}
+          # Must match the `build` job's synthetic delivery_id exactly (same
+          # github.event_name + github.run_id) so this job's "completed"
+          # stage row replaces the same ClickHouse row -- not a new one --
+          # for workflow_dispatch/schedule (nightly) runs, which have no
+          # client_payload to read a delivery_id from.
+          SYNTHETIC_DELIVERY_ID: ${{ github.event_name }}-${{ github.run_id }}
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] || [ "${{ github.event_name }}" = "schedule" ]; then
+            printf '{"delivery_id":"%s","event_type":"%s","payload":{"action":"manual_dispatch"}}' \
+              "$SYNTHETIC_DELIVERY_ID" "${{ github.event_name }}" > payload.json
+          else
+            printf '%s' "$PAYLOAD_JSON" > payload.json
+          fi
+
+      - name: Report CI started to pytorch/pytorch
+        uses: ./.github/actions/report-ci-started
+        with:
+          job_name: linux-x86_64 / pytorch / test
 
       - name: Dispatch and wait for upstream-beta test matrix
         id: dispatch
@@ -355,42 +430,6 @@ jobs:
             core.info(`Dispatched run ${run.id} completed with conclusion: ${conclusion}`);
             core.setOutput('conclusion', conclusion);
 
-
-      # actions4gh/setup-gh@v1.0.2 extracts the gh tarball but never lands
-      # the binary on PATH before it calls `gh auth login`, so every job
-      # fails with "spawn gh ENOENT" (upstream actions4gh/setup-gh#7, #11,
-      # unresolved). Install gh directly instead; downstream steps already
-      # set GH_TOKEN, which `gh` picks up implicitly, so no `gh auth login`
-      # call is needed here.
-      - name: Setup the GitHub CLI
-        env:
-          GH_CLI_VERSION: 2.97.0
-        run: |
-          curl -fsSL \
-            "https://github.com/cli/cli/releases/download/v${GH_CLI_VERSION}/gh_${GH_CLI_VERSION}_linux_amd64.tar.gz" \
-            -o "${RUNNER_TEMP}/gh-cli.tar.gz"
-          mkdir -p "${RUNNER_TEMP}/gh-cli"
-          tar -xzf "${RUNNER_TEMP}/gh-cli.tar.gz" -C "${RUNNER_TEMP}/gh-cli" --strip-components=1
-          echo "${RUNNER_TEMP}/gh-cli/bin" >> "${GITHUB_PATH}"
-
-
-      - name: Write dispatch payload to file
-        env:
-          PAYLOAD_JSON: ${{ toJSON(github.event.client_payload) }}
-          # Must match the `build` job's synthetic delivery_id exactly (same
-          # github.event_name + github.run_id) so this job's "completed"
-          # stage row replaces the same ClickHouse row -- not a new one --
-          # for workflow_dispatch/schedule (nightly) runs, which have no
-          # client_payload to read a delivery_id from.
-          SYNTHETIC_DELIVERY_ID: ${{ github.event_name }}-${{ github.run_id }}
-        run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ] || [ "${{ github.event_name }}" = "schedule" ]; then
-            printf '{"delivery_id":"%s","event_type":"%s","payload":{"action":"manual_dispatch"}}' \
-              "$SYNTHETIC_DELIVERY_ID" "${{ github.event_name }}" > payload.json
-          else
-            printf '%s' "$PAYLOAD_JSON" > payload.json
-          fi
-
       - name: Download all JUnit XML artifacts from the test matrix
         env:
           GH_TOKEN: ${{ github.token }}
@@ -421,21 +460,29 @@ jobs:
           if-no-files-found: warn
           retention-days: 30
 
+      # Only a genuine 'success' when tests actually ran (total > 0) -- a
+      # build/test job that reports 'success' without collecting any tests
+      # (e.g. a matrix/artifact-download problem) must not be recorded as a
+      # passing run. Computed once and reused below.
+      - name: Compute test conclusion
+        id: test_conclusion
+        env:
+          TEST_RESULTS_JSON: ${{ steps.test_results.outputs.test_results_json }}
+        run: |
+          TOTAL=$(echo "$TEST_RESULTS_JSON" | jq '.total')
+          FAILED=$(echo "$TEST_RESULTS_JSON" | jq '.failed')
+          if [ "$TOTAL" -gt 0 ] && [ "$FAILED" -eq 0 ]; then
+            echo "conclusion=success" >> "$GITHUB_OUTPUT"
+          else
+            echo "conclusion=failure" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: 'Report stage: completed'
         continue-on-error: true
         env:
           TEST_RESULTS_JSON: ${{ steps.test_results.outputs.test_results_json }}
           MAX_DURATION_SECONDS: ${{ steps.test_results.outputs.max_duration_seconds }}
-          # Only a genuine 'success' when tests actually ran (total > 0) --
-          # a build/test job that reports 'success' without collecting any
-          # tests (e.g. a matrix/artifact-download problem) must not be
-          # recorded as a passing run.
-          CONCLUSION: >-
-            ${{ 
-              fromJSON(steps.test_results.outputs.test_results_json).total > 0
-              && fromJSON(steps.test_results.outputs.test_results_json).failed == 0
-              && 'success' || 'failure'
-            }}
+          CONCLUSION: ${{ steps.test_conclusion.outputs.conclusion }}
           # Empty whenever `build` failed before reaching compute_durations
           # (e.g. the PyTorch/torch-spyre build itself failed) — omitted
           # below rather than passed through, since build_stage_result_payload.py
@@ -467,131 +514,13 @@ jobs:
             --result-payload-file result_payload.json
 
       - name: Report CI completed to pytorch/pytorch
-        if: always() && github.event_name == 'repository_dispatch'
-        continue-on-error: true
-        uses: pytorch/test-infra/.github/actions/cross-repo-ci-relay-callback@main
+        if: always()
+        uses: ./.github/actions/report-ci-completed
         with:
-          status: completed
-          conclusion: >-
-            ${{ 
-              fromJSON(steps.test_results.outputs.test_results_json).total > 0
-              && fromJSON(steps.test_results.outputs.test_results_json).failed == 0
-              && 'success' || 'failure'
-            }}
-          test-results: >-
-            {
-              "passed": ${{ fromJSON(steps.test_results.outputs.test_results_json).passed }},
-              "failed": ${{ fromJSON(steps.test_results.outputs.test_results_json).failed }},
-              "skipped": ${{ fromJSON(steps.test_results.outputs.test_results_json).skipped }},
-              "total": ${{ fromJSON(steps.test_results.outputs.test_results_json).total }}
-            }
-          job-name: linux-x86_64 / pytorch / test
-
-      - name: Report CI completed to pytorch/pytorch (nightly)
-        # event-type: nightly only applies to the actual nightly (schedule)
-        # run -- never sent for repository_dispatch, see the step below.
-        if: always() && github.event_name == 'schedule'
-        continue-on-error: true
-        uses: pytorch/test-infra/.github/actions/cross-repo-ci-relay-callback@main
-        with:
-          status: completed
-          conclusion: >-
-            ${{ 
-              fromJSON(steps.test_results.outputs.test_results_json).total > 0
-              && fromJSON(steps.test_results.outputs.test_results_json).failed == 0
-              && 'success' || 'failure'
-            }}
-          test-results: >-
-            {
-              "passed": ${{ fromJSON(steps.test_results.outputs.test_results_json).passed }},
-              "failed": ${{ fromJSON(steps.test_results.outputs.test_results_json).failed }},
-              "skipped": ${{ fromJSON(steps.test_results.outputs.test_results_json).skipped }},
-              "total": ${{ fromJSON(steps.test_results.outputs.test_results_json).total }}
-            }
-          job-name: linux-x86_64 / pytorch / test
-          event-type: nightly
-          # Ties this callback to the upstream pytorch/pytorch commit the
-          # nightly resolution step picked, matching pytorch-redhat-ci's
-          # crcr-nightly.yml convention of keying delivery-id on the
-          # resolved source SHA rather than a run-specific token.
-          delivery-id: ${{ inputs.pytorch_sha }}
-
-
-      # ---------------------------------------------------------------------------
-      # Report the nightly result to the RHEL CI Results Relay (see
-      # https://github.com/TorchedHat/pytorch-redhat-ci onboarding docs).
-      # Nightly (schedule) only -- same gating as the pytorch/pytorch CRCR
-      # relay's nightly step above.
-      # ---------------------------------------------------------------------------
-      - name: Mint OIDC token for RHEL Results Relay
-        id: rhel_oidc
-        if: always() && github.event_name == 'schedule'
-        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
-        with:
-          script: |
-            const token = await core.getIDToken("rhel-results-relay");
-            core.setSecret(token);
-            core.setOutput('token', token);
-
-      - name: Report result to RHEL Results Relay
-        if: always() && github.event_name == 'schedule'
-        # Best-effort only -- see the onboarding docs' "Never gate your CI on
-        # reporting" guidance. A relay outage must never fail this workflow.
-        continue-on-error: true
-        env:
-          OIDC_TOKEN: ${{ steps.rhel_oidc.outputs.token }}
-          CALLBACK_URL: https://hg21hqq0r6.execute-api.us-east-1.amazonaws.com/default/crcr-rhel-workflow
-          RUN_ID: ${{ github.run_id }}
-          RUN_ATTEMPT: ${{ github.run_attempt }}
-          WORKFLOW_NAME: ${{ github.workflow }}
-          # Same convention as the pytorch/pytorch CRCR relay's delivery-id
-          # above -- keyed on the bare resolved pytorch_sha, not a composite
-          # string.
-          DELIVERY_ID: ${{ inputs.pytorch_sha }}
-          # Same rule the CRCR relay callbacks above use: only a real
-          # "success" once tests actually ran (total > 0).
-          CONCLUSION: >-
-            ${{
-              steps.test_results.outputs.test_results_json
-              && fromJSON(steps.test_results.outputs.test_results_json).total > 0
-              && fromJSON(steps.test_results.outputs.test_results_json).failed == 0
-              && 'success' || 'failure'
-            }}
-        run: |
-          PAYLOAD=$(jq -n \
-            --arg delivery_id "$DELIVERY_ID" \
-            --arg conclusion "$CONCLUSION" \
-            --arg workflow_name "$WORKFLOW_NAME" \
-            --arg run_id "$RUN_ID" \
-            --arg run_attempt "$RUN_ATTEMPT" \
-            '{
-              schema_version: 1,
-              event_type: "nightly",
-              delivery_id: $delivery_id,
-              status: "completed",
-              conclusion: $conclusion,
-              workflow_name: $workflow_name,
-              run_id: $run_id,
-              run_attempt: $run_attempt,
-              job_name: "linux-x86_64 / pytorch / test"
-            }')
-
-          HTTP_CODE=$(curl -s -o /tmp/response.txt -w "%{http_code}" \
-            -X POST "$CALLBACK_URL" \
-            -H "Content-Type: application/json" \
-            -H "Authorization: Bearer $OIDC_TOKEN" \
-            -d "$PAYLOAD" \
-            --max-time 15)
-
-          BODY=$(cat /tmp/response.txt)
-          echo "HTTP Status: $HTTP_CODE"
-          echo "Response: $BODY"
-
-          if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
-            echo "Result reported successfully to RHEL CI Relay"
-          else
-            echo "::warning::Failed to report result to RHEL CI Relay (HTTP $HTTP_CODE) -- non-blocking"
-          fi
+          job_name: linux-x86_64 / pytorch / test
+          conclusion: ${{ steps.test_conclusion.outputs.conclusion }}
+          pytorch_sha: ${{ inputs.pytorch_sha }}
+          test_results_json: ${{ steps.test_results.outputs.test_results_json }}
 
   # ---------------------------------------------------------------------------
   # Manual opt-in only (run_torch_spyre_tests, surfaced as a workflow_dispatch
