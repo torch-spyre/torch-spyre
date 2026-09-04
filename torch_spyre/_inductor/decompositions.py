@@ -156,6 +156,25 @@ def register_spyre_decompositions(ops: OpOrOps):
     return decomp.register_decomposition(ops, spyre_decompositions)
 
 
+# Decompositions that Inductor should see during ``torch.compile`` but that
+# must NOT be auto-installed as eager PrivateUse1 kernels (unlike
+# ``spyre_decompositions``, ``_register_spyre_dispatchkey_kernels_permanently``
+# never iterates this dict). Reserved for ops whose eager path already works
+# (e.g. via a CPU fallback in ``fallback_ops``) and would be shadowed by
+# routing eager calls through ``_OPWrapper``'s lazy self-compile.
+spyre_compile_only_decompositions: dict = {}
+
+
+def register_spyre_compile_only_decomposition(ops: OpOrOps):
+    """Register a decomposition Inductor sees, without touching eager dispatch.
+
+    Use this instead of ``register_spyre_decompositions`` when a compiled-mode
+    fix would otherwise shadow a working eager-mode path (typically a CPU
+    fallback) for the same op overload.
+    """
+    return decomp.register_decomposition(ops, spyre_compile_only_decompositions)
+
+
 def get_spyre_decomp_table() -> dict[Any, Callable[..., Any]]:
     """Return the decomposition table Inductor sees when compiling for Spyre.
 
@@ -182,6 +201,7 @@ def get_spyre_decomp_table() -> dict[Any, Callable[..., Any]]:
     for op in fallback_ops:
         _drop(op)
     table.update(spyre_decompositions)
+    table.update(spyre_compile_only_decompositions)
     return table
 
 
@@ -1502,3 +1522,74 @@ def spyre_index_add(
     updated = gathered + source
     indices: list[Optional[torch.Tensor]] = [None] * dim + [index]
     return torch.index_put(self, indices, updated, accumulate=False)
+
+def _spyre_index_copy_functional(
+    self: torch.Tensor,
+    dim: int,
+    index: torch.Tensor,
+    source: torch.Tensor,
+) -> torch.Tensor:
+    """Shared ``index_copy`` logic that handles the P=1 destination-dim-1 case.
+
+    The upstream Inductor decomposition converts ``index_copy`` →
+    ``index_put(self, (index,), source)``.  When the destination's indexed
+    dimension has size 1 (i.e. only one valid slot exists), Inductor's
+    ``indirect_indexing`` folds ``index[0]`` to the constant 0 and the
+    scatter index symbol disappears from the write expression.  The Spyre
+    backend does not recognise the resulting op as an indirect-access scatter,
+    so the write-back never executes and the destination remains unchanged.
+
+    Fix: when ``self.shape[dim] == 1``, the only write target is the whole
+    tensor (exactly one valid row at index 0), so the result is exactly
+    ``source``.  This avoids the scatter path that would be mis-lowered.  For
+    all other shapes fall through to the standard ``index_put`` path.
+    """
+    dim = dim % self.dim()
+    if self.shape[dim] == 1:
+        # The entire indexed dimension is a single slot (only index 0 is valid).
+        # self and source have the same shape, so the result is just source.
+        # Avoid the scatter path: Inductor folds indirect_indexing(size=1) → 0,
+        # erasing the scatter symbol so the Spyre backend silently skips the write.
+        return source.clone()
+    # Use the raw aten op, not the ``torch.index_put`` Python wrapper: the
+    # wrapper's overload resolution rejects a ``None``-padded indices list
+    # (TypeError: expected Tensor as element 0 ... got NoneType) even though
+    # the op itself supports optional-tensor indices lists fine.
+    indices: list[Optional[torch.Tensor]] = [None] * dim + [index]
+    return torch.ops.aten.index_put.default(self, indices, source, accumulate=False)
+
+
+@register_spyre_compile_only_decomposition([torch.ops.aten.index_copy.default])
+def spyre_index_copy(
+    self: torch.Tensor,
+    dim: int,
+    index: torch.Tensor,
+    source: torch.Tensor,
+) -> torch.Tensor:
+    """Functional ``index_copy`` — this is the op ``torch.compile`` actually
+    traces for both ``index_copy`` and ``index_copy_`` calls, since
+    AOTAutograd functionalizes in-place ops on graph inputs before the decomp
+    table is consulted.
+
+    Registered compile-only (not as an eager PrivateUse1 kernel): eager
+    ``index_copy`` already works via the ``index_copy.out`` CPU fallback in
+    ``fallback_ops``, and the general (non P=1) branch below produces a
+    scatter that Inductor cannot yet lower in all layouts (see
+    ``test_index_copy_cpu``) — routing eager calls through this decomposition
+    would trade a working CPU fallback for that compiled-mode limitation.
+    """
+    return _spyre_index_copy_functional(self, dim, index, source)
+
+
+@register_spyre_decompositions([torch.ops.aten.index_copy_.default])
+def spyre_index_copy_(
+    self: torch.Tensor,
+    dim: int,
+    index: torch.Tensor,
+    source: torch.Tensor,
+) -> torch.Tensor:
+    """In-place ``index_copy_`` — reached by eager-mode dispatch (the
+    PrivateUse1 kernel ``register_spyre_decompositions`` installs for it).
+    Not reached by ``torch.compile``d graphs; see ``spyre_index_copy`` above.
+    """
+    return self.copy_(_spyre_index_copy_functional(self, dim, index, source))
