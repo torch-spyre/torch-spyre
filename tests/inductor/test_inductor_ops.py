@@ -3912,6 +3912,34 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
             },
         },
+        # vLLM `ApplyRotaryEmb.forward_static` body (NeoX-style). Separate
+        # cos/sin tensors, chunk(x, 2, -1) + pairwise muls + cat.
+        # Shapes model Granite 3.3 8B: head_size=128, num_heads=32, d/2=64.
+        # cos/sin are differentiated so they don't alias via lru_cache.
+        ("test_rope_vllm", "test_rope_vllm_cpu"): {
+            "param_sets": {
+                "prefill_bs1": (
+                    cached_randn((1, 256, 32, 128), dtype=torch.float16),
+                    cached_randn((256, 64), differentiation="cos", dtype=torch.float16),
+                    cached_randn((256, 64), differentiation="sin", dtype=torch.float16),
+                ),
+                "prefill": (
+                    cached_randn((2, 256, 32, 128), dtype=torch.float16),
+                    cached_randn((256, 64), differentiation="cos", dtype=torch.float16),
+                    cached_randn((256, 64), differentiation="sin", dtype=torch.float16),
+                ),
+                "decode_bs1": (
+                    cached_randn((1, 1, 32, 128), dtype=torch.float16),
+                    cached_randn((1, 64), differentiation="cos", dtype=torch.float16),
+                    cached_randn((1, 64), differentiation="sin", dtype=torch.float16),
+                ),
+                "decode": (
+                    cached_randn((2, 1, 32, 128), dtype=torch.float16),
+                    cached_randn((1, 64), differentiation="cos", dtype=torch.float16),
+                    cached_randn((1, 64), differentiation="sin", dtype=torch.float16),
+                ),
+            },
+        },
         ("test_qkv_attn_paths_fms", "test_attn_qkv_paths"): {
             "param_sets": {
                 "prefill_mha": (
@@ -7778,7 +7806,58 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             q_out = sum_out.flatten(3)
             return q_out
 
-        self.compare_with_cpu(fn, q, freqs, cpu_compile=False)
+        self.compare_with_cpu(fn, q, freqs, cpu_compile=False,
+                        #  atol=0.05, # currently required for passing
+                        #  rtol=0.05, # currently required for passing
+                         atol=5 * FP16_EPS, # more realistic error bound
+                         rtol=5 * FP16_EPS, # more realistic error bound
+        )
+        
+    def test_rope_vllm_cpu(self, q, cos, sin):
+        """vLLM upstream `ApplyRotaryEmb.forward_static` (NeoX-style).
+
+        Source: vllm/model_executor/layers/rotary_embedding/common.py.
+        This is the exact op sequence vLLM runs for RoPE. 
+        The FMS rope test above uses a different (view+mul+sum+flatten) 
+        formulation.
+
+        NOTE: torch-spyre does not yet support `torch.chunk` on device.
+        In upstream vLLM the split is:
+
+            x1, x2 = torch.chunk(q, 2, dim=-1)
+
+        To keep this test focused on the mul numerics, the split is
+        done on CPU outside `fn` and the two halves are passed in
+        directly. When torch-spyre supports `torch.chunk`, move the
+        call back into `fn` so the test covers the entire upstream
+        body.
+        """
+
+        # Chunk on CPU, see NOTE
+        x1, x2 = torch.chunk(q, 2, dim=-1)
+        x1 = x1.contiguous()
+        x2 = x2.contiguous()
+
+        def fn(x1, x2, cos, sin):
+            cos = cos.unsqueeze(-2)
+            sin = sin.unsqueeze(-2)
+            o1 = x1 * cos - x2 * sin
+            o2 = x2 * cos + x1 * sin
+            return torch.cat((o1, o2), dim=-1)
+
+        # Eager and compile surface the same fp16-mul divergence.
+        # Split into two calls so each mode is reported independently.
+        self.compare_with_cpu(
+            fn,
+            x1,
+            x2,
+            cos,
+            sin,
+            # atol=0.05, # currently required for passing
+            # rtol=0.05, # currently required for passing
+            atol=5 * FP16_EPS, # more realistic error bound
+            rtol=5 * FP16_EPS, # more realistic error bound
+        )
 
     def test_sum_eager(self, op, dim: int, keepdim: bool, x):
         self.compare_with_cpu(lambda x: op(x, dim=dim, keepdim=keepdim), x)
