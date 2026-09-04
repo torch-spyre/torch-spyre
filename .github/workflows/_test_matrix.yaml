@@ -461,8 +461,13 @@ jobs:
         run: |
           CONFIG="${{ matrix.suite.config }}"
           REPORT_NAME="$(basename "${CONFIG%.yaml}.xml")"
-          echo "REPORT_NAME=${REPORT_NAME}" >> "$GITHUB_ENV"
-          echo "REPORT_PATH=${GITHUB_WORKSPACE}/${REPORT_NAME}" >> "$GITHUB_ENV"
+          # REPORT_PATH_GLOB matches the -attemptN reports run-test-suite
+          # preserves on retry.
+          {
+            echo "REPORT_NAME=${REPORT_NAME}"
+            echo "REPORT_PATH=${GITHUB_WORKSPACE}/${REPORT_NAME}"
+            echo "REPORT_PATH_GLOB=${GITHUB_WORKSPACE}/${REPORT_NAME%.xml}-attempt*.xml"
+          } >> "$GITHUB_ENV"
 
       - name: Run ${{ matrix.suite.name }} tests
         id: run_tests
@@ -505,7 +510,11 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: ${{ env.REPORT_NAME }}
-          path: ${{ env.REPORT_PATH }}
+          # Glob picks up the -attemptN copies run-test-suite preserves when a
+          # retry would otherwise overwrite an earlier attempt's report.
+          path: |
+            ${{ env.REPORT_PATH }}
+            ${{ env.REPORT_PATH_GLOB }}
           if-no-files-found: warn
           retention-days: 10
 
@@ -828,8 +837,13 @@ jobs:
         run: |
           CONFIG="${{ matrix.suite.config }}"
           REPORT_NAME="$(basename "${CONFIG%.yaml}.xml")"
-          echo "REPORT_NAME=${REPORT_NAME}" >> "$GITHUB_ENV"
-          echo "REPORT_PATH=${GITHUB_WORKSPACE}/${REPORT_NAME}" >> "$GITHUB_ENV"
+          # REPORT_PATH_GLOB matches the -attemptN reports run-test-suite
+          # preserves on retry.
+          {
+            echo "REPORT_NAME=${REPORT_NAME}"
+            echo "REPORT_PATH=${GITHUB_WORKSPACE}/${REPORT_NAME}"
+            echo "REPORT_PATH_GLOB=${GITHUB_WORKSPACE}/${REPORT_NAME%.xml}-attempt*.xml"
+          } >> "$GITHUB_ENV"
 
       - name: Run ${{ matrix.suite.name }} tests
         uses: ./.github/actions/run-test-suite
@@ -860,7 +874,11 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: ${{ env.REPORT_NAME }}
-          path: ${{ env.REPORT_PATH }}
+          # Glob picks up the -attemptN copies run-test-suite preserves when a
+          # retry would otherwise overwrite an earlier attempt's report.
+          path: |
+            ${{ env.REPORT_PATH }}
+            ${{ env.REPORT_PATH_GLOB }}
           if-no-files-found: warn
           retention-days: 10
 
