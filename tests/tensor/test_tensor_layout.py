@@ -57,13 +57,45 @@ class TestSpyreTensorLayout(TestCase):
         self.assertEqual(stl.device_size, [4, 512, 64])
         self.assertEqual(stl.stride_map, [64, 256, 1])
 
+        # 512 is the largest non-stick dimension, so it becomes the stick
+        # dimension's tiling partner (moved next to the stick's tile-count
+        # slot), not dim 8 which sits closer positionally.
         stl = SpyreTensorLayout([512, 8, 240], torch.float16)
-        self.assertEqual(stl.device_size, [8, 4, 512, 64])
-        self.assertEqual(stl.stride_map, [240, 64, 1920, 1])
+        self.assertEqual(stl.device_size, [8, 512, 4, 64])
+        self.assertEqual(stl.stride_map, [240, 1920, 64, 1])
 
         stl = SpyreTensorLayout([512, 8, 256], torch.float16)
-        self.assertEqual(stl.device_size, [8, 4, 512, 64])
-        self.assertEqual(stl.stride_map, [256, 64, 2048, 1])
+        self.assertEqual(stl.device_size, [8, 512, 4, 64])
+        self.assertEqual(stl.stride_map, [256, 2048, 64, 1])
+
+    def test_default_layout_size_based_tiling(self):
+        """The default layout tiles the stick dim with the *largest*
+        non-stick dim, regardless of its position in the host dim order."""
+        # rank 3: largest non-stick dim (1024) is at position 0, far from
+        # the stick dim; still chosen over the positionally-closer dim (4).
+        stl = SpyreTensorLayout([1024, 4, 240], torch.float16)
+        self.assertEqual(stl.device_size, [4, 1024, 4, 64])
+        self.assertEqual(stl.stride_map, [240, 960, 64, 1])
+
+        # tie-break: dims 0 and 1 are both size 100; lower host index wins.
+        stl = SpyreTensorLayout([100, 100, 240], torch.float16)
+        self.assertEqual(stl.device_size, [100, 100, 4, 64])
+        self.assertEqual(stl.stride_map, [240, 24000, 64, 1])
+
+        # rank 4: largest non-stick dim (1024) is at position 0.
+        stl = SpyreTensorLayout([1024, 4, 8, 240], torch.float16)
+        self.assertEqual(stl.device_size, [4, 8, 1024, 4, 64])
+        self.assertEqual(stl.stride_map, [1920, 240, 7680, 64, 1])
+
+        # rank 5: largest non-stick dim (1024) is at position 0.
+        stl = SpyreTensorLayout([1024, 4, 8, 16, 240], torch.float16)
+        self.assertEqual(stl.device_size, [4, 8, 16, 1024, 4, 64])
+        self.assertEqual(stl.stride_map, [30720, 3840, 240, 122880, 64, 1])
+
+        # rank 6: largest non-stick dim (1024) is at position 0.
+        stl = SpyreTensorLayout([1024, 4, 8, 16, 2, 240], torch.float16)
+        self.assertEqual(stl.device_size, [4, 8, 16, 2, 1024, 4, 64])
+        self.assertEqual(stl.stride_map, [61440, 7680, 480, 240, 245760, 64, 1])
 
     def test_dim_order(self):
         stl = SpyreTensorLayout([512, 256], [256, 1], torch.float16, [1, 0])

@@ -98,10 +98,23 @@ class SpyreTensorLayout {
   /**
    * Construct a SpyreTensorLayout for the argument host_size with a row
    * major order of dimensions using the default device memory layout.
+   * The stick dimension is tiled together with whichever other host
+   * dimension has the largest size (ties broken by lowest host dim index).
    * See docs/SpyreTensors.md for a precise definition of this layout.
    */
   SpyreTensorLayout(std::vector<int64_t> host_size, c10::ScalarType dtype) {
     init(host_size, dtype);
+  }
+
+  /**
+   * Construct a SpyreTensorLayout for the argument host_size and
+   * host_strides using the default (size-based) device memory layout.
+   * Used when explicit host_strides are available/needed but no explicit
+   * dim_order is being requested.
+   */
+  SpyreTensorLayout(std::vector<int64_t> host_size,
+                    std::vector<int64_t> host_strides, c10::ScalarType dtype) {
+    init(host_size, host_strides, dtype);
   }
 
   /**
@@ -144,6 +157,9 @@ class SpyreTensorLayout {
   }
 
   void init(std::vector<int64_t> host_size, c10::ScalarType dtype);
+
+  void init(std::vector<int64_t> host_size, std::vector<int64_t> host_strides,
+            c10::ScalarType dtype);
 
   void init(std::vector<int64_t> host_size, std::vector<int64_t> host_strides,
             c10::ScalarType dtype, std::vector<int32_t> dim_order);

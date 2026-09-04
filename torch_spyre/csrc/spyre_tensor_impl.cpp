@@ -55,29 +55,29 @@ auto get_generic_stick_layout(std::vector<int32_t> host_dim_order)
       dim_map = {host_dim_order[1], host_dim_order[0], host_dim_order[1]};
       break;
     case 3:
-      dim_map = {host_dim_order[1], host_dim_order[2], host_dim_order[0],
+      dim_map = {host_dim_order[0], host_dim_order[2], host_dim_order[1],
                  host_dim_order[2]};
       break;
     case 4:
-      dim_map = {host_dim_order[1], host_dim_order[2], host_dim_order[3],
-                 host_dim_order[0], host_dim_order[3]};
+      dim_map = {host_dim_order[0], host_dim_order[1], host_dim_order[3],
+                 host_dim_order[2], host_dim_order[3]};
       break;
     case 5:
-      dim_map = {host_dim_order[1], host_dim_order[2], host_dim_order[3],
-                 host_dim_order[4], host_dim_order[0], host_dim_order[4]};
+      dim_map = {host_dim_order[0], host_dim_order[1], host_dim_order[2],
+                 host_dim_order[4], host_dim_order[3], host_dim_order[4]};
       break;
     case 6:
-      dim_map = {host_dim_order[1], host_dim_order[2], host_dim_order[3],
-                 host_dim_order[4], host_dim_order[5], host_dim_order[0],
+      dim_map = {host_dim_order[0], host_dim_order[1], host_dim_order[2],
+                 host_dim_order[3], host_dim_order[5], host_dim_order[4],
                  host_dim_order[5]};
       break;
     case 7:
       TORCH_CHECK(host_dim_order[6] == -1,
                   "7-element dim_order is only valid for sparse-stick (last "
                   "entry must be -1)");
-      dim_map = {host_dim_order[1], host_dim_order[2], host_dim_order[3],
-                 host_dim_order[4], host_dim_order[5], host_dim_order[6],
-                 host_dim_order[0], host_dim_order[6]};
+      dim_map = {host_dim_order[0], host_dim_order[1], host_dim_order[2],
+                 host_dim_order[3], host_dim_order[4], host_dim_order[6],
+                 host_dim_order[5], host_dim_order[6]};
       break;
     default:
       std::stringstream ss;
@@ -93,6 +93,57 @@ std::vector<int32_t> generic_stick_dim_order(int32_t num_dims) {
     dim_order.push_back(i);
   }
   return dim_order;
+}
+
+/* Build device dimension order (list of host dim indices) for a given layout
+ * policy. The device layout always has the stick dimension appear twice:
+ * once for the tile-count slot, once for the final inner-stick slot (always
+ * last). One non-stick dimension is selected to be tiled together with the
+ * stick (placed adjacent to the stick's tile-count slot). The selection
+ * policy is determined by the tiling_policy parameter:
+ *   - LARGEST_NON_STICK: select the non-stick dim with largest host_size
+ *     (ties broken by lowest host dim index). Ranks 3-6.
+ *   - For ranks 0-2 and sparse (trailing -1), delegates to old positional
+ *     get_generic_stick_layout unchanged.
+ */
+enum class TilingPolicy {
+  LARGEST_NON_STICK,
+};
+
+static std::vector<int32_t> build_device_dim_order(
+    std::vector<int32_t> host_dim_order, const std::vector<int64_t>& host_size,
+    TilingPolicy policy) {
+  auto rank = host_dim_order.size();
+  if (rank <= 2 || host_dim_order.back() == -1) {
+    return get_generic_stick_layout(host_dim_order);
+  }
+  TORCH_CHECK(rank >= 3 && rank <= 6,
+              "build_device_dim_order: unsupported rank ",
+              std::to_string(rank));
+
+  int32_t stick_dim = host_dim_order[rank - 1];
+  int32_t tiled_dim = host_dim_order[0];
+
+  if (policy == TilingPolicy::LARGEST_NON_STICK) {
+    for (size_t i = 0; i + 1 < rank; i++) {
+      if (host_size[host_dim_order[i]] > host_size[tiled_dim]) {
+        tiled_dim = host_dim_order[i];
+      }
+    }
+  }
+
+  std::vector<int32_t> device_dims;
+  device_dims.reserve(rank + 1);
+  // Add non-tiled, non-stick dims first
+  for (size_t i = 0; i + 1 < rank; i++) {
+    if (host_dim_order[i] != tiled_dim)
+      device_dims.push_back(host_dim_order[i]);
+  }
+  // Then stick tile-count slot, tiled dim, stick inner slot
+  device_dims.push_back(stick_dim);
+  device_dims.push_back(tiled_dim);
+  device_dims.push_back(stick_dim);
+  return device_dims;
 }
 
 static std::vector<int64_t> compute_host_stride(
@@ -129,12 +180,55 @@ static std::vector<int64_t> dim_map_to_stride_map(
   return stride_map;
 }
 
+static void finish_init_from_dim_map(spyre::SpyreTensorLayout& self,
+                                     const std::vector<int32_t>& dim_map,
+                                     bool sparse,
+                                     const std::vector<int64_t>& host_size,
+                                     const std::vector<int64_t>& host_strides) {
+  self.device_size.resize(dim_map.size());
+  auto elems_in_stick = sparse ? 1 : self.elems_per_stick();
+  auto stick_dim = dim_map.back();
+  self.device_size[dim_map.size() - 1] = self.elems_per_stick();
+  for (size_t i = 0; i < dim_map.size() - 1; i++) {
+    auto dim = dim_map[i];
+    if (dim == stick_dim) {
+      self.device_size[i] =
+          sparse ? 1 : (host_size[dim] + elems_in_stick - 1) / elems_in_stick;
+    } else {
+      self.device_size[i] = host_size[dim];
+    }
+  }
+  self.stride_map =
+      dim_map_to_stride_map(dim_map, host_size, host_strides, self.device_size);
+}
+
 void SpyreTensorLayout::init(std::vector<int64_t> host_size,
                              c10::ScalarType dtype) {
-  int host_dims = static_cast<int32_t>(host_size.size());
   auto host_strides = compute_host_stride(host_size);
-  auto dim_order = generic_stick_dim_order(host_dims);
-  init(host_size, host_strides, dtype, dim_order);
+  init(host_size, host_strides, dtype);
+}
+
+void SpyreTensorLayout::init(std::vector<int64_t> host_size,
+                             std::vector<int64_t> host_strides,
+                             c10::ScalarType dtype) {
+  auto str_type = torchScalarToString[dtype];
+  const auto [sen_dtype_cpu, sen_dtype_dev] =
+      stringToDTDataFormatPair(str_type);
+  this->device_dtype = sen_dtype_dev;
+
+  if (host_size.size() == 0) {
+    // Degenerate case of 0-dimension tensor (ie, a scalar)
+    this->device_size = {1, this->elems_per_stick()};
+    this->stride_map = {-1, -1};
+    return;
+  }
+
+  auto dim_order =
+      generic_stick_dim_order(static_cast<int32_t>(host_size.size()));
+  auto device_dims = build_device_dim_order(dim_order, host_size,
+                                            TilingPolicy::LARGEST_NON_STICK);
+  finish_init_from_dim_map(*this, device_dims, /*sparse=*/false, host_size,
+                           host_strides);
 }
 
 void SpyreTensorLayout::init(std::vector<int64_t> host_size,
@@ -153,37 +247,15 @@ void SpyreTensorLayout::init(std::vector<int64_t> host_size,
 
   if (host_size.size() == 0) {
     // Degenerate case of 0-dimension tensor (ie, a scalar)
-    this->device_size.resize(2);
-    this->device_size[0] = 1;
-    this->device_size[1] = this->elems_per_stick();
-    this->stride_map.resize(2);
-    this->stride_map[0] = -1;
-    this->stride_map[1] = -1;
+    this->device_size = {1, this->elems_per_stick()};
+    this->stride_map = {-1, -1};
     return;
   }
 
   // Computing tiling
   auto dim_map = spyre::get_generic_stick_layout(dim_order);
-  this->device_size.resize(dim_map.size());
   bool sparse = dim_order.back() == -1;
-  auto elems_in_stick = sparse ? 1 : this->elems_per_stick();
-  auto stick_dim = dim_map.back();
-  this->device_size[dim_map.size() - 1] = this->elems_per_stick();
-  for (int i = 0; i < dim_map.size() - 1; i++) {
-    auto dim = dim_map[i];
-    if (dim == stick_dim) {
-      if (sparse) {
-        this->device_size[i] = 1;
-      } else {
-        this->device_size[i] =
-            (host_size[stick_dim] + elems_in_stick - 1) / elems_in_stick;
-      }
-    } else {
-      this->device_size[i] = host_size[dim];
-    }
-  }
-  this->stride_map = dim_map_to_stride_map(dim_map, host_size, host_strides,
-                                           this->device_size);
+  finish_init_from_dim_map(*this, dim_map, sparse, host_size, host_strides);
 }
 
 std::string SpyreTensorLayout::toString() const {
