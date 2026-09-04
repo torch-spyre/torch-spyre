@@ -302,6 +302,21 @@ def hbm_pool_planning(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]
         for dep in node.read_writes.reads
     }
 
+    # Indirect-access value tensors (the buffer a gather/scatter reads via a
+    # data-dependent index) must NOT be pool-allocated.
+    indirect_value_names: set[str] = set()
+    for node in all_flat_nodes:
+        for dep in node.read_writes.reads:
+            is_indirect = getattr(dep, "is_indirect", None)
+            if callable(is_indirect) and is_indirect():
+                indirect_value_names.add(dep.name)
+    if indirect_value_names:
+        logger.debug(
+            "hbm_pool_planning: excluding indirect-access value tensor(s) %s "
+            "from pool (must not carry a pooled base)",
+            sorted(indirect_value_names),
+        )
+
     # Build per-buffer writer-bundle / reader-bundles maps by walking each
     # top-level bundle's own flattened node list once.  A buffer normally has
     # exactly one writer (bundle), tracked in buffer_writer_bundle; it may
@@ -426,7 +441,7 @@ def hbm_pool_planning(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]
 
     all_candidates = {
         name
-        for name in (written & read) - io_names - fallback_read
+        for name in (written & read) - io_names - fallback_read - indirect_value_names
         if _is_intermediate(name) and not _is_cross_bundle(name)
     }
 
