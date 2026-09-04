@@ -14,6 +14,8 @@
 
 import functools
 import math
+import os
+import platform
 import sys
 import pytest
 import unittest
@@ -685,6 +687,89 @@ def _pattern_resolve(variant, args):
             (q, k, v),
         )
     raise ValueError(f"unknown transpose suite variant {variant}")
+
+
+# Scope gate for fp32→fp16 proxy CPU refs (s390x/ppc64): param keys under
+# TestOps.PARAMS[("test_large_matmul", "test_mm_relaxed")]. Shapes are derived
+# from PARAMS after TestOps is defined so the allow-list cannot drift.
+_TEST_LARGE_MATMUL_FP32_PROXY_PARAM_KEYS = frozenset(
+    {
+        "2d_M2048_K2048_N65536",
+        "4d_B2_H2_M2048_K2048_N65536",
+    }
+)
+
+# Populated from TestOps.PARAMS after the class body runs (see bottom of module).
+_TEST_LARGE_MATMUL_FP32_PROXY_SHAPES = set()
+
+
+def _derive_test_large_matmul_fp32_proxy_shapes(param_sets) -> set:
+    missing = _TEST_LARGE_MATMUL_FP32_PROXY_PARAM_KEYS - param_sets.keys()
+    if missing:
+        raise RuntimeError(
+            "test_large_matmul fp32-proxy param keys missing from "
+            'TestOps.PARAMS[("test_large_matmul", "test_mm_relaxed")]: '
+            f"{sorted(missing)}"
+        )
+    return {
+        (tuple(param_sets[key][0].shape), tuple(param_sets[key][1].shape))
+        for key in _TEST_LARGE_MATMUL_FP32_PROXY_PARAM_KEYS
+    }
+
+
+# Cached once: platform.machine() is stable for the process.
+_ARCH_NEEDS_FP32_PROXY_CPU_REF = (
+    platform.machine().lower().startswith(("s390x", "ppc64"))
+)
+
+
+def _arch_needs_fp32_proxy_cpu_ref() -> bool:
+    return _ARCH_NEEDS_FP32_PROXY_CPU_REF
+
+
+def _is_test_large_matmul_fp32_proxy_shape(a: torch.Tensor, b: torch.Tensor) -> bool:
+    # Gated by tensor shapes only. Today these shapes are unique to test_large_matmul;
+    # if another test_mm_relaxed case reused them on s390x/ppc64, it would also take
+    # the fp32→fp16 CPU ref path. Intended coverage is _TEST_LARGE_MATMUL_FP32_PROXY_PARAM_KEYS.
+    return (tuple(a.shape), tuple(b.shape)) in _TEST_LARGE_MATMUL_FP32_PROXY_SHAPES
+
+
+def _build_fp32_proxy_cpu_refs(
+    op,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    wrap=None,
+) -> dict:
+    """Build compare_with_cpu kwargs using fp32 execution + cast to input dtype.
+
+    Run on fp32 CPU inputs and cast the result to the input dtype (typically fp16).
+    Skips live fp16 CPU work that is extremely slow on s390x/ppc64. Spyre still
+    runs on the original tensors.
+
+    When ``wrap`` is None (TestOps), ``cpu_eager_result`` is ``op(a32, b32)``.
+    When ``wrap`` is set (LX planning), ``cpu_eager_result`` is
+    ``wrap(op_fp32_proxy)(a, b)`` to match ``compare_with_cpu(wrap(op), ...)``.
+
+    Gate on arch + ``_is_test_large_matmul_fp32_proxy_shape`` before calling.
+
+    Proxy gold for CI wall-time under ``test_mm_relaxed`` tolerances, not fp16-CPU
+    parity vs x86.
+    """
+
+    def op_fp32_proxy(a, b):
+        return op(a.float(), b.float()).to(dtype=a.dtype)
+
+    kwargs = {}
+    with torch.no_grad():
+        if wrap is None:
+            a32, b32 = a.float(), b.float()
+            kwargs["cpu_eager_result"] = op(a32, b32).to(dtype=a.dtype)
+            if bool(os.getenv("TEST_COMPARE_CPU_COMPILE")):
+                out32 = _compile_and_run(op, (a32, b32), "cpu", compile=True)
+                kwargs["cpu_compile_result"] = out32.to(dtype=a.dtype)
+        else:
+            kwargs["cpu_eager_result"] = wrap(op_fp32_proxy)(a, b)
+    return kwargs
 
 
 class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
@@ -5992,10 +6077,23 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
     # Increased mm test tolerance for splitk
     def test_mm_relaxed(self, op, a, b):
         K = b.shape[-2]
+        kwargs = {}
         if K > (128 // b.element_size()):  # multiple sticks
-            self.compare_with_cpu(op, a, b, atol=0.1, rtol=0.1)
-        else:  # single stick, no need to relax
-            self.compare_with_cpu(op, a, b)
+            kwargs.update(atol=0.1, rtol=0.1)
+
+        # Large matmul on s390x/ppc64: live fp16 CPU GEMM can be extremely slow
+        # (no optimized fp16 BLAS). Use fp32→fp16 CPU references for allow-listed
+        # shapes only; Spyre still executes on the original fp16 inputs.
+        # Skip when compare_with_cpu is overridden (e.g. LX planning wraps fn with
+        # a second op); a bare-matmul CPU ref would not match wrap(fn) on Spyre.
+        if (
+            type(self).compare_with_cpu is TestOps.compare_with_cpu
+            and _arch_needs_fp32_proxy_cpu_ref()
+            and _is_test_large_matmul_fp32_proxy_shape(a, b)
+        ):
+            kwargs.update(_build_fp32_proxy_cpu_refs(op, a, b))
+
+        self.compare_with_cpu(op, a, b, **kwargs)
 
     def test_mm_autocast_cpu(self, enabled, a, b):
         def fn(a, b):
@@ -8392,6 +8490,10 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         w = cached_xavier((6144, 4096))
         self.compare_with_cpu(fn, x, w, atol=0.5, rtol=0.1)
 
+
+_TEST_LARGE_MATMUL_FP32_PROXY_SHAPES = _derive_test_large_matmul_fp32_proxy_shapes(
+    TestOps.PARAMS[("test_large_matmul", "test_mm_relaxed")]["param_sets"]
+)
 
 if __name__ == "__main__":
     unittest.main()

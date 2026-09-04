@@ -109,6 +109,12 @@ from ..loop_info import (
     copy_op_metadata,
 )
 from ..propagate_hints import get_op_hints
+from .propagate_named_dims import (
+    _DimPropInfo,
+    _get_dim_prop_info,
+    _get_layout,
+    _lone_sym,
+)
 from ..pass_utils import (
     op_out_coords,
     host_coordinates,
@@ -3718,6 +3724,55 @@ def _rescale_index(
     return new_index
 
 
+def _propagate_read_copy_named_dims(copy_buf: ComputedBuffer, dep: MemoryDep) -> None:
+    """Give a read-copy staging buffer the named dims its source dep carries.
+
+    propagate_named_dims (and assign_dim_hints's cleanup right after it) runs
+    long before coarse_tile inserts read-copy ops, so by this point the global
+    _named_dims size registry has already been cleared and every op-level
+    _dim_prop_info has already been deleted (assign_dim_hints's documented
+    contract) -- only a graph *input* TensorBox still carries one. A copy_buf
+    built here starts with no _dim_prop_info at all: any op that reads the
+    copy instead of the original buffer sees an untracked dim, even when the
+    source was fully named (e.g. via a spyre_hint on the fill that created
+    it). This can't reuse compute_input_named_dims -- it needs the (by-now
+    gone) _named_dims registry to size-match fused/split dims.  A read-copy
+    never fuses or splits dims, though (copy_buf's own ranges are dep's
+    ranges 1:1, in dep.var_names order -- see the tile_ranges construction
+    above), so a plain positional zip of the source's named_dims against its
+    own non-size-1 loop vars (found the same way compute_input_named_dims
+    does, via host_coordinates) is enough, with no size lookups needed.
+    """
+    dpi = _get_dim_prop_info(dep)
+    named_dims = dpi.named_dims if dpi is not None else None
+    if not named_dims:
+        return
+    layout = _get_layout(dep)
+    if layout is None:
+        return
+    coords = host_coordinates(layout, dep, None)
+    remaining = list(named_dims)
+    loop_var_dims: dict[sympy.Symbol, list[str]] = {}
+    for i, coord in enumerate(coords):
+        if not remaining:
+            break
+        if int(layout.size[i]) == 1:
+            continue
+        name = remaining.pop(0)
+        sym = _lone_sym(coord)
+        if sym is not None and sym in dep.ranges:
+            loop_var_dims.setdefault(sym, []).append(name)
+    if not loop_var_dims:
+        return
+    flat_named_dims = []
+    for var_name in dep.var_names:
+        flat_named_dims.extend(loop_var_dims.get(var_name, []))
+    copy_buf._dim_prop_info = _DimPropInfo(  # type: ignore[attr-defined]
+        named_dims=flat_named_dims,
+        loop_var_dims=loop_var_dims,
+    )
+
+
 def _insert_one_read_copy(
     sizing_op: ComputedBuffer,
     dep: MemoryDep,
@@ -4067,6 +4122,7 @@ def _insert_one_read_copy(
     copy_buf.origins = sizing_op.origins
     copy_buf.operation_name = copy_name
     copy_op_metadata(sizing_op, copy_buf)
+    _propagate_read_copy_named_dims(copy_buf, dep)
     # This is a new operation with its own iteration space.  The source
     # operation's d0/d1/... names have no positional meaning for the copy, so
     # let work-division planning choose from the copy's actual dimensions.

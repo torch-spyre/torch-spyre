@@ -47,6 +47,15 @@ logger = get_inductor_logger("decompositions")
 
 _SDPA_MAX_SEQUENCE_TILE_SIZE = 512
 _SDPA_MAX_TILE_PAIRS_PER_LOOP_GROUP = 16
+_SDPA_PREFERRED_HEADS_PER_TILE = (4, 2, 1)
+
+
+def _sdpa_heads_per_tile(num_heads: int) -> int:
+    """Pick the largest divisible heads-per-tile from the preference list."""
+    for h in _SDPA_PREFERRED_HEADS_PER_TILE:
+        if num_heads % h == 0:
+            return h
+    return 1
 
 
 def _num_tiles_for_max_extent(sequence_length: int, max_extent: int) -> int:
@@ -571,7 +580,7 @@ def spyre__sdpa_overrideable(
             block_group_start + kv_blocks_per_loop_group, num_kv_blocks
         )
         with spyre_hint(tiles={"batch_size": max(1, batch_size // 2)}):
-            with spyre_hint(tiles={"num_heads": max(1, num_heads // 4)}):
+            with spyre_hint(tiles={"num_heads": _sdpa_heads_per_tile(num_heads)}):
                 with spyre_hint(num_tiles_per_dim={"max_seqlen_q": num_q_tiles}):
                     for blk in range(block_group_start, block_group_end):
                         start = blk * kv_block_size

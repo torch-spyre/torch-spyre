@@ -1,0 +1,127 @@
+name: Report CI completed to pytorch/pytorch
+description: >-
+  Reports a completed run for one job-name to pytorch/pytorch's CRCR relay
+  (repository_dispatch or nightly, with optional test-results), plus the
+  RHEL Results Relay for nightly. Both are best-effort (continue-on-error).
+
+inputs:
+  job_name:
+    description: CRCR/RHEL job-name, e.g. "linux-x86_64 / pytorch / build"
+    required: true
+  conclusion:
+    description: success | failure | cancelled
+    required: true
+  pytorch_sha:
+    description: Resolved pytorch/pytorch commit SHA, used as the nightly delivery-id
+    required: true
+  test_results_json:
+    description: Optional {passed,failed,skipped,total} JSON, forwarded to the CRCR callback
+    required: false
+    default: ''
+
+runs:
+  using: composite
+  steps:
+    - name: Report CI completed to pytorch/pytorch (with test results)
+      if: >-
+        always() && github.event_name == 'repository_dispatch' && inputs.test_results_json != ''
+      continue-on-error: true
+      uses: pytorch/test-infra/.github/actions/cross-repo-ci-relay-callback@main
+      with:
+        status: completed
+        conclusion: ${{ inputs.conclusion }}
+        test-results: ${{ inputs.test_results_json }}
+        job-name: ${{ inputs.job_name }}
+
+    - name: Report CI completed to pytorch/pytorch
+      if: >-
+        always() && github.event_name == 'repository_dispatch' && inputs.test_results_json == ''
+      continue-on-error: true
+      uses: pytorch/test-infra/.github/actions/cross-repo-ci-relay-callback@main
+      with:
+        status: completed
+        conclusion: ${{ inputs.conclusion }}
+        job-name: ${{ inputs.job_name }}
+
+    - name: Report CI completed to pytorch/pytorch (nightly, with test results)
+      if: always() && github.event_name == 'schedule' && inputs.test_results_json != ''
+      continue-on-error: true
+      uses: pytorch/test-infra/.github/actions/cross-repo-ci-relay-callback@main
+      with:
+        status: completed
+        conclusion: ${{ inputs.conclusion }}
+        test-results: ${{ inputs.test_results_json }}
+        job-name: ${{ inputs.job_name }}
+        event-type: nightly
+        delivery-id: ${{ inputs.pytorch_sha }}
+
+    - name: Report CI completed to pytorch/pytorch (nightly)
+      if: always() && github.event_name == 'schedule' && inputs.test_results_json == ''
+      continue-on-error: true
+      uses: pytorch/test-infra/.github/actions/cross-repo-ci-relay-callback@main
+      with:
+        status: completed
+        conclusion: ${{ inputs.conclusion }}
+        job-name: ${{ inputs.job_name }}
+        event-type: nightly
+        delivery-id: ${{ inputs.pytorch_sha }}
+
+    - name: Mint OIDC token for RHEL Results Relay
+      id: rhel_oidc
+      if: always() && github.event_name == 'schedule'
+      uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+      with:
+        script: |
+          const token = await core.getIDToken("rhel-results-relay");
+          core.setSecret(token);
+          core.setOutput('token', token);
+
+    - name: Report result to RHEL Results Relay
+      if: always() && github.event_name == 'schedule'
+      continue-on-error: true
+      shell: bash
+      env:
+        OIDC_TOKEN: ${{ steps.rhel_oidc.outputs.token }}
+        CALLBACK_URL: https://hg21hqq0r6.execute-api.us-east-1.amazonaws.com/default/crcr-rhel-workflow
+        RUN_ID: ${{ github.run_id }}
+        RUN_ATTEMPT: ${{ github.run_attempt }}
+        WORKFLOW_NAME: ${{ github.workflow }}
+        DELIVERY_ID: ${{ inputs.pytorch_sha }}
+        CONCLUSION: ${{ inputs.conclusion }}
+        JOB_NAME: ${{ inputs.job_name }}
+      run: |
+        PAYLOAD=$(jq -n \
+          --arg delivery_id "$DELIVERY_ID" \
+          --arg conclusion "$CONCLUSION" \
+          --arg workflow_name "$WORKFLOW_NAME" \
+          --arg run_id "$RUN_ID" \
+          --arg run_attempt "$RUN_ATTEMPT" \
+          --arg job_name "$JOB_NAME" \
+          '{
+            schema_version: 1,
+            event_type: "nightly",
+            delivery_id: $delivery_id,
+            status: "completed",
+            conclusion: $conclusion,
+            workflow_name: $workflow_name,
+            run_id: $run_id,
+            run_attempt: $run_attempt,
+            job_name: $job_name
+          }')
+
+        HTTP_CODE=$(curl -s -o /tmp/response.txt -w "%{http_code}" \
+          -X POST "$CALLBACK_URL" \
+          -H "Content-Type: application/json" \
+          -H "Authorization: Bearer $OIDC_TOKEN" \
+          -d "$PAYLOAD" \
+          --max-time 15)
+
+        BODY=$(cat /tmp/response.txt)
+        echo "HTTP Status: $HTTP_CODE"
+        echo "Response: $BODY"
+
+        if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
+          echo "Result reported successfully to RHEL CI Relay"
+        else
+          echo "::warning::Failed to report result to RHEL CI Relay (HTTP $HTTP_CODE) -- non-blocking"
+        fi

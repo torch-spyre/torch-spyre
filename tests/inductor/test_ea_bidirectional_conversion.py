@@ -127,7 +127,8 @@ def test_fp32_to_fp16_standard_input(device, mode, fp16):
     x = torch.randn(4, 128, device=device, dtype=torch.float32)
     result = _run(fn, x, mode=mode)
 
-    # Verify output EA
+    # Eager and compiled casts use the same compiled D2D conversion path, so
+    # both preserve the hardware conversion's staggered element arrangement.
     assert_ea(result, ElementArrangement.FP32_TO_DL16)
 
     # Note: Cannot compare tensors with non-STANDARD EA directly with CPU

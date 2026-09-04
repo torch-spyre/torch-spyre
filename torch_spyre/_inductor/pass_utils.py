@@ -2060,7 +2060,12 @@ def compute_restickify_needed(
     outer_axes_with_stick_var = [
         c for c in idc[:-1] if bool(c.free_symbols & stick_syms)
     ]
-    is_factorized = bool(stick_syms) and len(outer_axes_with_stick_var) > 1
+    is_factorized = (
+        _is_matmul_op(op)
+        and in_stl.element_arrangement == ElementArrangement.STANDARD
+        and bool(stick_syms)
+        and len(outer_axes_with_stick_var) > 1
+    )
     factorized_layout_mismatch = is_factorized and in_stl != out_stl
     if (
         not factorized_layout_mismatch
@@ -2069,11 +2074,13 @@ def compute_restickify_needed(
     ):
         return False, None
 
-    # ReStickifyOpHBM currently supports only the native FP16 device format.
+    # ReStickifyOpHBM currently supports only the native FP16 device format
+    # (both logical float16 and bfloat16 map to SEN169_FP16).
     # Do not advertise an edge as feasible when codegen cannot lower it: this
     # is especially important for fp32-upcast graphs, where a later IEEE_FP32
     # restick can otherwise tie with and displace the valid FP16 restick before
-    # the conversion.
+    # the conversion. This also deliberately precedes the factorized-layout
+    # target below: a concrete target is not actionable for a non-DL16 input.
     if in_stl.device_dtype != DataFormats.SEN169_FP16:
         return True, None
 
@@ -2085,7 +2092,6 @@ def compute_restickify_needed(
         # find_stick_compatible_input_layout Pass 3; FixedInOutNode.from_args
         # always passes [req_stl] as the target list, so the beam search only
         # queries this function with that canonical result.
-        assert in_stl.element_arrangement == ElementArrangement.STANDARD
         return True, out_stl
     ic = host_coordinates(in_host, in_dep, ind_sizes)
     target_stick = out_idc[-1]

@@ -729,6 +729,27 @@ class AlignmentInputs:
     restored_ranges: dict[sympy.Symbol, sympy.Expr | int | float]
 
 
+class UnalignedStickSplit(Unsupported):
+    """A global alignment boundary cuts through one tensor's physical stick."""
+
+    def __init__(
+        self,
+        tensor_index: int,
+        variable: sympy.Symbol,
+        boundary: int,
+        stick_size: int,
+    ) -> None:
+        self.tensor_index = tensor_index
+        self.variable = variable
+        self.boundary = boundary
+        self.stick_size = stick_size
+        super().__init__(
+            "tensor alignment boundary "
+            f"{boundary} for {variable} cuts tensor {tensor_index}'s "
+            f"physical stick of {stick_size} elements"
+        )
+
+
 def build_alignment_inputs(
     iteration_space: Dict[sympy.Symbol, Tuple[sympy.Expr, int]],
     tensors: list[Dict[str, list[sympy.Expr]]],
@@ -880,6 +901,37 @@ def align_tensors_pure(
 
     # sort splits
     splits = {var: sorted(val) for var, val in splits.items()}
+
+    # When a tensor has the canonical pair of an outer-stick coordinate and an
+    # innermost stick coordinate for the same variable, every interior boundary
+    # must fall between physical sticks.  A boundary inside a stick cannot be
+    # represented as a device dimension: the outer-stick adjustment below would
+    # truncate it to zero (for example 16 // 32), or to an incorrect nonzero
+    # extent (for example 48 // 32).  Do not apply this restriction merely
+    # because the innermost coordinate uses the variable: arbitrary coordinate
+    # expressions in preceding dimensions can legally split it at other points.
+    # The final boundary is the logical range endpoint, so a partial last stick
+    # (for example 7 int32 elements in a 32-element stick) remains valid.
+    for tensor_index, (terms, var, physical_stick_size) in enumerate(
+        zip(all_terms, stick_dim, stick_size)
+    ):
+        if var is None:
+            # A constant/broadcast innermost coordinate has no stick loop to split.
+            continue
+        has_outer_stick_coordinate = any(
+            term.var == var and term.den == physical_stick_size for term in terms[:-1]
+        )
+        if not has_outer_stick_coordinate:
+            continue
+        for boundary_expr in splits[var][1:-1]:
+            boundary = _concrete_alignment_value(boundary_expr)
+            if boundary % int(physical_stick_size) != 0:
+                raise UnalignedStickSplit(
+                    tensor_index,
+                    var,
+                    int(boundary),
+                    int(physical_stick_size),
+                )
 
     # create new vars, var ranges, and work division for each variable
     # with one var per segment (split[i], split[i+1])

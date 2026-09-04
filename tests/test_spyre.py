@@ -883,6 +883,27 @@ class TestSpyre(TestCase):
                         restored.cpu(), expected, atol=atol, rtol=rtol
                     )
 
+    def test_unsupported_d2d_dtype_conversion_falls_back(self):
+        """Unsupported native D2D pairs retain the CPU fallback behavior."""
+        from torch_spyre._C import ElementArrangement, get_spyre_tensor_layout
+        from torch_spyre.ops.fallbacks import FallbackWarning
+
+        source_cpu = torch.arange(128, dtype=torch.int32).reshape(2, 64)
+        source = source_cpu.to("spyre")
+
+        with self.assertWarnsRegex(
+            FallbackWarning,
+            r"conversion from torch\.int32 to torch\.float16 is falling back to cpu",
+        ):
+            actual = source.to(torch.float16)
+
+        self.assertEqual(actual.dtype, torch.float16)
+        self.assertEqual(
+            get_spyre_tensor_layout(actual).element_arrangement,
+            ElementArrangement.STANDARD,
+        )
+        torch.testing.assert_close(actual.cpu(), source_cpu.to(torch.float16))
+
 
 if __name__ == "__main__":
     run_tests()

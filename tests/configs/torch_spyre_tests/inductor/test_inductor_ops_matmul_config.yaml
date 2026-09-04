@@ -18,5 +18,3 @@ test_suite_config:
           mode: mandatory_success
           tags:
             - ops__inductor-matmul
-            - slow__plat_ppc64
-            - slow__plat_s390x
