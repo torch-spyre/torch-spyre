@@ -17,7 +17,7 @@ from __future__ import annotations
 import collections
 import dataclasses
 import math
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from typing import cast
 
 import sympy
@@ -83,6 +83,151 @@ class LXRelayoutPlan:
     @property
     def edge(self) -> tuple[str, str]:
         return self.source_name, self.destination_name
+
+
+@dataclasses.dataclass(frozen=True)
+class RelayoutCandidate:
+    """One priced way for a divided producer to stay LX-resident for one consumer.
+
+    Born in the allocator's enumeration (``_cd_parent_relayouts``) and carried
+    unchanged through the CP-SAT model, the extraction and the commit path: the
+    solver keys its pair literal by this record, extraction attaches the solved
+    placement (:class:`ChosenRelayout`), and the commit path folds the fired
+    members of one segment into a :class:`LXRelayoutPlan`
+    (:class:`RelayoutSegment`). Nothing downstream re-derives a view, a core
+    count or a price from primitives, so a change to what a relayout *is*
+    (another lowering kind, a measured footprint) is a change to this record
+    and to the enumeration that builds it, nowhere else.
+
+    ``group`` identifies the DESTINATION per-core view of ``parent``, interned
+    per parent by the allocator for one solve: every candidate that lands on
+    the same view of the same parent shares one shuffle and one LX destination,
+    so the solver prices and places the group once, not per edge.
+
+    Both views are built for ``num_cores`` (every core's owner slot within its
+    split); the enumeration's ``cores_used`` equality gate guarantees that.
+    """
+
+    parent: str
+    consumer: str
+    source_division: int
+    consumer_division: int
+    group: int
+    source_view: PerCoreView
+    destination_view: PerCoreView
+    num_cores: int
+    cost_ns: float
+
+    def __post_init__(self) -> None:
+        if self.source_view == self.destination_view:
+            raise ValueError(
+                f"relayout candidate {self.parent} -> {self.consumer} has equal "
+                "views; that pair belongs to cd_parent_matches"
+            )
+
+    @property
+    def group_key(self) -> tuple[str, int]:
+        """The solver's registry key: one destination view of one parent."""
+        return self.parent, self.group
+
+
+@dataclasses.dataclass(frozen=True)
+class ChosenRelayout:
+    """A fired :class:`RelayoutCandidate` with its solved placement.
+
+    ``run_head`` names the earliest consumer of the SEGMENT this consumer reads
+    from: consumers of one group that the solver bridged onto one copy share a
+    destination address and a head, and the commit path materializes one plan
+    per head (:meth:`RelayoutSegment.from_chosen`).
+    """
+
+    candidate: RelayoutCandidate
+    destination_address: int
+    run_head: str
+
+    def scaled(self, alignment: int) -> ChosenRelayout:
+        """The same choice with the address converted from alignment units."""
+        return dataclasses.replace(
+            self, destination_address=self.destination_address * alignment
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class RelayoutSegment:
+    """A maximal run of consumers the solver bridged onto ONE relayout copy.
+
+    One segment is one shuffle and one continuous LX residency at
+    ``destination_address``; its members share the source division and the
+    destination view by construction (they are members of one group whose
+    rectangles were pinned to one offset by the bridge literals), which
+    :meth:`from_chosen` verifies rather than trusts.
+    """
+
+    parent: str
+    group: int
+    run_head: str
+    members: tuple[ChosenRelayout, ...]
+
+    @property
+    def candidate(self) -> RelayoutCandidate:
+        """A representative member; every field the plan needs agrees across
+        the segment (checked in :meth:`from_chosen`)."""
+        return self.members[0].candidate
+
+    @property
+    def source_division(self) -> int:
+        return self.candidate.source_division
+
+    @property
+    def destination_address(self) -> int:
+        return self.members[0].destination_address
+
+    @property
+    def consumer_names(self) -> tuple[str, ...]:
+        return tuple(m.candidate.consumer for m in self.members)
+
+    def plan(self, source_address: int) -> LXRelayoutPlan:
+        c = self.candidate
+        return LXRelayoutPlan(
+            self.parent,
+            self.consumer_names,
+            c.source_view,
+            c.destination_view,
+            c.num_cores,
+            source_address=source_address,
+            destination_address=self.destination_address,
+        )
+
+    @classmethod
+    def from_chosen(cls, chosen: Iterable[ChosenRelayout]) -> list[RelayoutSegment]:
+        """Regroup fired edges by segment: (parent, destination view, head).
+
+        Deterministic order (sorted keys, members sorted by consumer name) so
+        plan construction, and hence destination naming, is reproducible.
+        """
+        by_segment: dict[tuple[str, int, str], list[ChosenRelayout]] = {}
+        for ch in chosen:
+            key = (ch.candidate.parent, ch.candidate.group, ch.run_head)
+            by_segment.setdefault(key, []).append(ch)
+        segments: list[RelayoutSegment] = []
+        for (parent, group, head), members in sorted(by_segment.items()):
+            members.sort(key=lambda ch: ch.candidate.consumer)
+            first = members[0]
+            for m in members[1:]:
+                agree = (
+                    m.candidate.source_division == first.candidate.source_division
+                    and m.candidate.source_view == first.candidate.source_view
+                    and m.candidate.destination_view == first.candidate.destination_view
+                    and m.candidate.num_cores == first.candidate.num_cores
+                    and m.destination_address == first.destination_address
+                )
+                if not agree:
+                    raise AssertionError(
+                        f"relayout segment {parent}/g{group}@{head}: members "
+                        f"disagree on geometry or placement: {first} vs {m}"
+                    )
+            segments.append(cls(parent, group, head, tuple(members)))
+        return segments
 
 
 def work_division_from_view(

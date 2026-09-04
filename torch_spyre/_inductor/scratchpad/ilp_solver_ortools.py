@@ -88,7 +88,7 @@ import math
 import os
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING, Generic, Optional, TypeVar, cast
+from typing import TYPE_CHECKING, Any, Generic, Optional, TypeVar, cast
 import sympy
 from sympy.printing.printer import Printer
 import torch
@@ -103,6 +103,10 @@ else:
     except ImportError:  # pragma: no cover - exercised only when ortools is absent
         cp_model = None
 
+from torch_spyre._inductor.scratchpad.lx_relayout import (
+    ChosenRelayout,
+    RelayoutCandidate,
+)
 from torch_spyre._inductor.scratchpad.plan_solver import (
     CoreDivisionBuffer,
     ceil_div,
@@ -163,6 +167,194 @@ def _gate_divisions(model, compatible, src_div, dst_div, enforce_lit) -> None:
     model.AddBoolOr(pair_lits).OnlyEnforceIf(enforce_lit)
 
 
+class _GroupConsumer:
+    """One consumer's stake in a relayout group: its own destination rectangle
+    (present iff it fires into the group) and the bridges that may join it to
+    the neighbouring consumers of the same view."""
+
+    def __init__(self, tick: int):
+        self.tick = tick  # the consumer's schedule position (constant)
+        self.pairs_by_div: dict[int, list] = {}  # source div i -> its pair lits
+        self.present: Any = None  # fires into this group (OR of its pair lits)
+        self.end: Any = None  # destination interval end (tick + 1, or a later tick)
+        self.offset: Any = None  # destination LX offset (alignment units)
+        self.incoming: list = []  # bridges from earlier consumers
+        self.outgoing: list = []  # bridges to later consumers
+        self.pays: dict[int, object] = {}  # source div i -> "starts a segment"
+
+
+class _RelayoutGroup:
+    """All consumers that could read one source through one destination
+    per-core view, and the segment model that decides how many shuffles serve
+    them.
+
+    Every consumer in the group gets its own destination rectangle, present iff
+    its edge fires into the group. Between each ordered pair of consumers
+    (earlier tick first) a *bridge* literal lets the later one inherit the
+    earlier one's copy: the earlier rectangle is extended to abut the later
+    consumer's tick, the two offsets are pinned equal, and the later consumer
+    pays no shuffle. A maximal run of bridged consumers is a *segment*: one
+    shuffle, one continuous residency. No bridges is the per-edge policy (one
+    tick, one shuffle each); all bridges is one long-lived shared copy. The
+    solver chooses the segmentation on cost: a bridge saves a shuffle and
+    occupies LX over the gap, and that occupancy is priced by whatever it
+    displaces (the spill terms already in the objective).
+
+    The shuffle's geometry and price depend on the SOURCE division ``i`` (the
+    destination view is fixed by the group), so the per-segment charge is
+    ``cost_by_div[i]`` for the chosen ``i``.
+    """
+
+    def __init__(
+        self, model, parent: str, group: int, cores_used: int, dest_units: int
+    ):
+        self.parent = parent
+        self.group = group
+        self.cores_used = cores_used
+        self.dest_units = dest_units  # per-core destination footprint (constant)
+        # candidate -> pair lit; wired to division pins in constrain_residency
+        self.members: dict[RelayoutCandidate, object] = {}
+        self.cost_by_div: dict[int, float] = {}
+        self.consumers: dict[str, _GroupConsumer] = {}
+        self.bridges: dict[tuple[str, str], object] = {}  # (earlier, later) -> lit
+
+    def add_member(self, model, candidate: RelayoutCandidate) -> None:
+        i, cost = candidate.source_division, candidate.cost_ns
+        lit = model.new_bool_var(
+            f"rpair_{self.parent}__g{self.group}__{candidate.consumer}"
+            f"_{i}_{candidate.consumer_division}"
+        )
+        self.members[candidate] = lit
+        if i in self.cost_by_div:
+            # The destination view IS the group and the source view is fixed
+            # by i, so every member prices identically; a mismatch means the
+            # enumeration and the interning disagree.
+            assert abs(self.cost_by_div[i] - cost) <= 1e-6 * max(1.0, abs(cost)), (
+                f"relayout group {self.parent}/g{self.group}: members disagree on "
+                f"the price for source division {i}: {self.cost_by_div[i]} vs {cost}"
+            )
+        self.cost_by_div[i] = cost
+
+    def link(self, model, bufs, horizon: int, capacity_units: int) -> None:
+        tag = f"{self.parent}__g{self.group}"
+        for candidate, lit in self.members.items():
+            child = candidate.consumer
+            c = self.consumers.setdefault(child, _GroupConsumer(bufs[child].start_time))
+            c.pairs_by_div.setdefault(candidate.source_division, []).append(lit)
+        for child, c in self.consumers.items():
+            lits = [lit for ls in c.pairs_by_div.values() for lit in ls]
+            c.present = model.new_bool_var(f"rdest_{tag}__{child}")
+            for lit in lits:
+                model.add_implication(lit, c.present)
+            model.add_bool_or(lits).only_enforce_if(c.present)
+            c.end = model.new_int_var(c.tick + 1, horizon, f"rdest_end_{tag}__{child}")
+            c.offset = model.new_int_var(
+                0, max(0, capacity_units - 1), f"rdest_off_{tag}__{child}"
+            )
+        ordered = sorted(self.consumers.items(), key=lambda kv: kv[1].tick)
+        for a, (name_a, ca) in enumerate(ordered):
+            for name_b, cb in ordered[a + 1 :]:
+                if cb.tick == ca.tick:
+                    continue  # same tick: nothing to hold across
+                b = model.new_bool_var(f"rbridge_{tag}__{name_a}__{name_b}")
+                model.add_implication(b, ca.present)
+                model.add_implication(b, cb.present)
+                # Inherit: the earlier copy lives until the later consumer's
+                # tick and sits at the same offset, so the two rectangles abut
+                # in time at one slot (which the 2D no-overlap accepts).
+                model.add(ca.end == cb.tick).only_enforce_if(b)
+                model.add(ca.offset == cb.offset).only_enforce_if(b)
+                ca.outgoing.append(b)
+                cb.incoming.append(b)
+                self.bridges[(name_a, name_b)] = b
+        for child, c in self.consumers.items():
+            model.add_at_most_one(c.outgoing)
+            model.add_at_most_one(c.incoming)
+            # Without an outgoing bridge the copy lives exactly this tick.
+            model.add(c.end == c.tick + 1).only_enforce_if(
+                [b.Not() for b in c.outgoing]
+            )
+            # pays[i]: this consumer STARTS a segment under source division i,
+            # i.e. it fires with division i and inherits nothing.
+            for i, lits in c.pairs_by_div.items():
+                fires_i = model.new_bool_var(f"rfire_{tag}__{child}__div{i}")
+                for lit in lits:
+                    model.add_implication(lit, fires_i)
+                model.add_bool_or(lits).only_enforce_if(fires_i)
+                z = model.new_bool_var(f"rpays_{tag}__{child}__div{i}")
+                model.add_implication(z, fires_i)
+                for b in c.incoming:
+                    model.add_implication(z, b.Not())
+                model.add_bool_or([z, fires_i.Not(), *c.incoming])
+                c.pays[i] = z
+
+    def cost_terms(self):
+        """The group's objective contribution: one shuffle per segment, at the
+        price of the chosen source division."""
+        return sum(
+            self.cost_by_div[i] * z
+            for c in self.consumers.values()
+            for i, z in c.pays.items()
+        )
+
+    def run_head(self, solver, child: str) -> str:
+        """The earliest consumer of the segment ``child`` reads from."""
+        head = child
+        while True:
+            fired = [
+                a
+                for (a, b_name), lit in self.bridges.items()
+                if b_name == head and solver.BooleanValue(lit)
+            ]
+            if not fired:
+                return head
+            (head,) = fired
+
+
+def _build_relayout_groups(
+    model, bufs: dict[str, "_LifetimeBufferWithCpVars"], capacity_units: int
+) -> dict[tuple[str, int], _RelayoutGroup]:
+    """Mint the relayout group, pair, presence and bridge literals from the
+    static candidate tables, before any constraint is built: the destination
+    rectangles (``_add_no_overlap_2d``) and the residency gate
+    (``constrain_residency``) both reference them, and the rectangles are
+    built first."""
+    groups: dict[tuple[str, int], _RelayoutGroup] = {}
+    for sb in bufs.values():
+        for parent, entries in getattr(sb.buffer, "cd_parent_relayouts", {}).items():
+            if not entries:
+                continue
+            pw = bufs.get(parent)
+            if pw is None:
+                # The parent is not part of this solve: nothing to shuffle
+                # from, so the edge can never fire (its pair lits are never
+                # minted and extraction must not find it set).
+                model.add(sb.relayout_vars[parent] == 0)
+                continue
+            for candidate in entries:
+                key = candidate.group_key
+                if key not in groups:
+                    groups[key] = _RelayoutGroup(
+                        model,
+                        parent,
+                        candidate.group,
+                        candidate.num_cores,
+                        ceil_div(pw.buffer.size, candidate.num_cores),
+                    )
+                g = groups[key]
+                # A group is one destination view, and a view is built for one
+                # core count; the enumeration's cores_used gate guarantees this.
+                assert g.cores_used == candidate.num_cores, (
+                    f"relayout group {parent}/g{candidate.group} mixes core counts "
+                    f"{g.cores_used} and {candidate.num_cores}"
+                )
+                g.add_member(model, candidate)
+    horizon = max((sb.end_time for sb in bufs.values()), default=0) + 1
+    for g in groups.values():
+        g.link(model, bufs, horizon, capacity_units)
+    return groups
+
+
 @dataclass
 class _LifetimeBufferWithCpVars(Generic[_BufT]):
     """A :class:`LifetimeBoundBuffer` bundled with the CP-SAT variables the
@@ -216,11 +408,12 @@ class _LifetimeBufferWithCpVars(Generic[_BufT]):
         self.core_cost = None
         # Relayout state (populated only by the joint subclass; kept here so
         # every solver method can iterate uniformly). relayout_vars: one edge
-        # BoolVar per parent this buffer could relayout-read; pair lits and the
-        # destination (offset, size) vars are filled in as the model is built.
+        # BoolVar per parent this buffer could relayout-read; relayout_pair_lits:
+        # per parent, the (lit, RelayoutCandidate) pairs of that edge, whose
+        # lits are minted by the solver's group registry and wired to the
+        # division pins in constrain_residency.
         self.relayout_vars: dict[str, object] = {}
         self.relayout_pair_lits: dict[str, list] = {}
-        self.relayout_dest: dict[str, tuple] = {}
 
     # -- producer/consumer edges (joint model only; none when division-fixed) --
     @property
@@ -255,7 +448,7 @@ class _LifetimeBufferWithCpVars(Generic[_BufT]):
         reads_served = b.read_count - (1 if b.first_use_is_read else 0)
         return (reads_served + (1 if is_intermediate else 0)) * b.size
 
-    def constrain_residency(self, model, kids, bufs) -> None:
+    def constrain_residency(self, model, kids, bufs, groups) -> None:
         """Placement-only: any buffer may reside, so there is no slicing gate."""
 
     def constrain_merge(self, model, parent: "_LifetimeBufferWithCpVars", edge) -> None:
@@ -340,10 +533,10 @@ class _CoreDivisionBufferWithCpVars(_LifetimeBufferWithCpVars[CoreDivisionBuffer
         m.add_element(self.division, core_cost, self.core_cost)
 
         # One decision variable per relayout-eligible producer edge. The
-        # candidate (i, j, cost) triples arrive on the buffer from the
-        # allocator's enumeration (cd_parent_relayouts).
-        for parent, triples in b.cd_parent_relayouts.items():
-            if triples:
+        # RelayoutCandidate records arrive on the buffer from the allocator's
+        # enumeration (cd_parent_relayouts).
+        for parent, candidates in b.cd_parent_relayouts.items():
+            if candidates:
                 self.relayout_vars[parent] = m.new_bool_var(
                     f"relayout_{parent}__{b.name}"
                 )
@@ -355,7 +548,7 @@ class _CoreDivisionBufferWithCpVars(_LifetimeBufferWithCpVars[CoreDivisionBuffer
     def match_pairs(self, parent: str) -> list[tuple[int, int]]:
         return self.buffer.cd_parent_matches.get(parent, [])
 
-    def constrain_residency(self, model, kids, bufs) -> None:
+    def constrain_residency(self, model, kids, bufs, groups) -> None:
         """Slicing-consistency gate: a resident buffer's division must match
         *every* consumer's division under the ``cd_parent_matches`` pairs.
 
@@ -383,17 +576,24 @@ class _CoreDivisionBufferWithCpVars(_LifetimeBufferWithCpVars[CoreDivisionBuffer
             )
             model.add_bool_or([match_lit, relayout_lit]).only_enforce_if(self.in_buffer)
             model.add_implication(relayout_lit, self.in_buffer)
+            # The pair lits were minted by the group registry (they also drive
+            # the shared destination rectangles, which are built before this
+            # constraint); here they get their division pins and their edge.
             pair_lits = []
-            for i, j, cost in child_w.buffer.cd_parent_relayouts[self.name]:
-                lit = model.new_bool_var("")
-                model.add(self.division == i).only_enforce_if(lit)
-                model.add(child_w.division == j).only_enforce_if(lit)
-                # A pair lit implies its edge: the cost term (sum of
-                # cost * lit) can then never charge an inactive edge, and
-                # extraction reads the chosen pair directly.
+            for candidate in child_w.buffer.cd_parent_relayouts[self.name]:
+                lit = groups[candidate.group_key].members[candidate]
+                model.add(self.division == candidate.source_division).only_enforce_if(
+                    lit
+                )
+                model.add(
+                    child_w.division == candidate.consumer_division
+                ).only_enforce_if(lit)
+                # A pair lit implies its edge: the group cost (sum over the
+                # group's per-source-division lits) can then never charge an
+                # inactive edge, and extraction reads the chosen pair directly.
                 model.add_implication(lit, relayout_lit)
-                pair_lits.append((lit, i, j, cost))
-            model.add_bool_or([lit for lit, *_ in pair_lits]).only_enforce_if(
+                pair_lits.append((lit, candidate))
+            model.add_bool_or([lit for lit, _ in pair_lits]).only_enforce_if(
                 relayout_lit
             )
             child_w.relayout_pair_lits[self.name] = pair_lits
@@ -797,8 +997,8 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
             if isinstance(b, CoreDivisionBuffer) and isinstance(sb, CoreDivisionBuffer):
                 b.chosen_division = sb.chosen_division
                 b.chosen_relayouts = {
-                    parent: (i, j, dest_offset * self.alignment)
-                    for parent, (i, j, dest_offset) in sb.chosen_relayouts.items()
+                    parent: chosen.scaled(self.alignment)
+                    for parent, chosen in sb.chosen_relayouts.items()
                 }
         return list(buffers)
 
@@ -826,18 +1026,17 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
                     sym_map[symbol.name] = cp_splits[key]
                     sym_map[f"_buffer_{symbol.name}"] = t
                     sym_map[f"_raw_{symbol.name}"] = cp_splits_raw[key]
-            # Each relayout edge's cost symbol binds to the float-weighted
-            # sum over its pair literals: a pair lit implies its edge and
-            # pins the division pair, so the sum charges exactly the chosen
-            # pair's fitted cost, and zero when the edge is off. Linear, so
-            # it never touches the log/Min/Max lowering. (sym_map is keyed
-            # by symbol NAME, and the printer resolves a direct binding
-            # before its lazy inv_/log2_ construction.)
-            for parent, plist in t.relayout_pair_lits.items():
-                sym_map[relayout_symbol(t.name, parent).name] = sum(
-                    lit * cost for lit, _i, _j, cost in plist
-                )
 
+        # Each relayout GROUP's cost symbol binds to the float-weighted sum
+        # over its per-source-division literals: a member pair lit implies its
+        # group's g_i and pins the division pair, so the sum charges exactly the
+        # chosen geometry's fitted cost, once per group however many consumers
+        # share it, and zero when the group is off. Linear, so it never touches
+        # the log/Min/Max lowering. (sym_map is keyed by symbol NAME, and the
+        # printer resolves a direct binding before its lazy inv_/log2_
+        # construction.)
+        for (parent, group), g in self._relayout_groups.items():
+            sym_map[relayout_symbol(parent, group).name] = g.cost_terms()
         try:
             cp_cost = _SympyExprToCpSat(model, sym_map).convert(cost_expr)
             if not isinstance(cp_cost, (int, float)):
@@ -862,6 +1061,12 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         cost_expr: sympy.Expr | None,
     ) -> dict[str, LifetimeBoundBuffer]:
         children_of = self._get_children(tensors)
+        # Relayout groups first: the destination rectangles (inside the
+        # in-place relaxation's 2D no-overlap) and the residency gate both
+        # reference the group and pair literals.
+        self._relayout_groups = _build_relayout_groups(
+            model, tensors, self._capacity_units
+        )
         self._add_inplace_relaxation(model, tensors)
         self._add_core_division(model, tensors, children_of, forced_reasons)
 
@@ -1096,50 +1301,38 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
                     f"y_{sb.name}",
                 )
             )
-        # Relayout destinations: one optional rectangle per eligible edge whose
-        # presence literal IS the edge's decision variable. The destination
-        # lives exactly the consumer's tick (the shuffle and the read both
-        # execute inside that bundle, serially), the source keeps its full
-        # lifetime, and this constraint keeps the two - and everything else
-        # alive at that tick - disjoint in space. This is the interval-variable
-        # form of the greedy path's half-tick lifetime surgery: no time-axis
-        # doubling and no variable source end are needed while relayout is
-        # per-edge (the source may still be read by its other consumers).
-        for sb in bufs.values():
-            for parent, lit in sb.relayout_vars.items():
-                pw = bufs.get(parent)
-                if pw is None:
-                    model.add(lit == 0)
-                    continue
-                dest_sizes = [
-                    ceil_div(pw.buffer.size, cd.cores_used)
-                    for cd in sb.buffer.core_divisions
-                ]
-                eff = model.new_int_var(
-                    0, max(dest_sizes), f"rdest_size_{parent}__{sb.name}"
+        # Relayout destinations: one optional rectangle per (group, consumer),
+        # present iff that consumer fires into the group. Its start is the
+        # consumer's tick; its end is tick + 1, or a later consumer's tick when
+        # a bridge lets that consumer inherit the copy (the two rectangles then
+        # abut in time at one offset, which this constraint accepts, exactly as
+        # in-place merges do). The source keeps its full lifetime, so nothing
+        # on that side changes. See _RelayoutGroup for the segment model.
+        horizon = max((sb.end_time for sb in bufs.values()), default=0) + 1
+        for (parent, group), g in self._relayout_groups.items():
+            for child, c in g.consumers.items():
+                tag = f"{parent}__g{group}__{child}"
+                length = model.new_int_var(
+                    1, max(1, horizon - c.tick), f"rdest_len_{tag}"
                 )
-                model.add_element(sb.division, dest_sizes, eff)
-                off = model.new_int_var(
-                    0,
-                    max(0, self._capacity_units - 1),
-                    f"rdest_off_{parent}__{sb.name}",
-                )
-                model.add(off + eff <= self._capacity_units).only_enforce_if(lit)
-                tick = sb.start_time
+                model.add(length == c.end - c.tick)
+                model.add(
+                    c.offset + g.dest_units <= self._capacity_units
+                ).only_enforce_if(c.present)
                 x_intervals.append(
                     model.new_optional_interval_var(
-                        tick, 1, tick + 1, lit, f"rdest_x_{parent}__{sb.name}"
+                        c.tick, length, c.end, c.present, f"rdest_x_{tag}"
                     )
-                )
-                y_end = model.new_int_var(
-                    0, self._capacity_units, f"rdest_top_{parent}__{sb.name}"
                 )
                 y_intervals.append(
                     model.new_optional_interval_var(
-                        off, eff, y_end, lit, f"rdest_y_{parent}__{sb.name}"
+                        c.offset,
+                        g.dest_units,
+                        c.offset + g.dest_units,
+                        c.present,
+                        f"rdest_y_{tag}",
                     )
                 )
-                sb.relayout_dest[parent] = (off, eff)
         model.add_no_overlap_2d(x_intervals, y_intervals)
 
     def _get_children(
@@ -1172,7 +1365,9 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         for name in forced:
             model.add(bufs[name].in_buffer == 0)
         for sb in bufs.values():
-            sb.constrain_residency(model, children_of.get(sb.name, []), bufs)
+            sb.constrain_residency(
+                model, children_of.get(sb.name, []), bufs, self._relayout_groups
+            )
 
     # ------------------------------------------------------------------
     # Extract
@@ -1198,25 +1393,25 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         }
         footprint = {name: sb.footprint(solver) for name, sb in bufs.items()}
 
-        # Read back fired relayout edges: the chosen (parent_div, own_div) pair
-        # and the destination's solved offset (alignment units; the caller
-        # scales to bytes). Recorded on the buffer for the commit path.
+        # Read back fired relayout edges: the chosen candidate, the
+        # destination's solved offset (alignment units; the caller scales to
+        # bytes) and the segment head. Recorded on the buffer for the commit path.
         relayout_fired = False
         for sb in bufs.values():
             for src_name, lit in sb.relayout_vars.items():
                 if not solver.BooleanValue(lit):
                     continue
                 relayout_fired = True
-                pair = next(
-                    (i, j)
-                    for plit, i, j, _cost in sb.relayout_pair_lits[src_name]
+                candidate = next(
+                    c
+                    for plit, c in sb.relayout_pair_lits[src_name]
                     if solver.BooleanValue(plit)
                 )
-                off, _eff = sb.relayout_dest[src_name]
-                sb.buffer.chosen_relayouts[src_name] = (
-                    pair[0],
-                    pair[1],
-                    solver.Value(off),
+                g = self._relayout_groups[candidate.group_key]
+                gc = g.consumers[sb.name]
+                assert solver.BooleanValue(gc.present)
+                sb.buffer.chosen_relayouts[src_name] = ChosenRelayout(
+                    candidate, solver.Value(gc.offset), g.run_head(solver, sb.name)
                 )
 
         offsets: Optional[dict[str, int]] = None

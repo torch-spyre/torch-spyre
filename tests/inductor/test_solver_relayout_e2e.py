@@ -65,14 +65,40 @@ class _Observed:
         import torch_spyre._inductor.spyre_kernel as sk_mod
         from torch_spyre._inductor import op_spec as opspec_mod
 
-        self.plans = []
-        self.demotions = []
-        self.emitted = set()  # (source_lx_address, destination_lx_address)
+        self.plans: list = []
+        self.demotions: list = []
+        self.emitted: set[tuple[int, int]] = set()  # (src, dst) LX addresses
+        # One entry per emitted LX relayout op, recorded where spyre_kernel
+        # finalizes each op spec (exactly once per emitted op; superdsc's
+        # parse_op_spec classifies the same op twice, so it is not counted
+        # there). A list, not an address set, so two shuffles of one view that
+        # land at the same offset in different ticks are still two.
+        self.emitted_ops: list[tuple[int, int]] = []
+        # plan edge -> materialized copy buffer name, and each consumer's read
+        # names right after materialization (V.graph is live inside the pass).
+        self.copies: dict = {}
+        self.consumer_reads: dict[str, set[str]] = {}
         real_materialize = alloc_mod.materialize_lx_relayouts
 
         def spy_materialize(graph, plans):
+            from torch_spyre._inductor.pass_utils import op_read_writes
+            from torch_spyre._inductor.scratchpad.lx_relayout import (
+                materialized_lx_relayouts,
+            )
+
             self.plans.extend(plans)
-            return real_materialize(graph, plans)
+            result = real_materialize(graph, plans)
+            self.copies = {
+                edge: copy_name
+                for edge, (copy_name, _plan) in materialized_lx_relayouts(graph).items()
+            }
+            for plan in plans:
+                for name in plan.consumer_names:
+                    op = graph.get_buffer(name)
+                    self.consumer_reads[name] = {
+                        d.name for d in op_read_writes(op).reads if hasattr(d, "name")
+                    }
+            return result
 
         real_demote = sched_mod.demote_lx_relayout_group
 
@@ -82,21 +108,30 @@ class _Observed:
 
         real_identity = opspec_mod.is_lx_relayout_identity
 
-        def spy_identity(op, args):
+        def _check(args):
+            source, destination = args
+            assert set(source.allocation) == {"lx"}, source.allocation
+            assert set(destination.allocation) == {"lx"}, destination.allocation
+            pair = (source.allocation["lx"], destination.allocation["lx"])
+            self.emitted.add(pair)
+            return pair
+
+        def spy_identity_codegen(op, args):
             result = real_identity(op, args)
             if result:
-                source, destination = args
-                assert set(source.allocation) == {"lx"}, source.allocation
-                assert set(destination.allocation) == {"lx"}, destination.allocation
-                self.emitted.add(
-                    (source.allocation["lx"], destination.allocation["lx"])
-                )
+                _check(args)
+            return result
+
+        def spy_identity_kernel(op, args):
+            result = real_identity(op, args)
+            if result:
+                self.emitted_ops.append(_check(args))
             return result
 
         monkeypatch.setattr(alloc_mod, "materialize_lx_relayouts", spy_materialize)
         monkeypatch.setattr(sched_mod, "demote_lx_relayout_group", spy_demote)
-        monkeypatch.setattr(sdsc_mod, "is_lx_relayout_identity", spy_identity)
-        monkeypatch.setattr(sk_mod, "is_lx_relayout_identity", spy_identity)
+        monkeypatch.setattr(sdsc_mod, "is_lx_relayout_identity", spy_identity_codegen)
+        monkeypatch.setattr(sk_mod, "is_lx_relayout_identity", spy_identity_kernel)
         if force:
             monkeypatch.setattr(
                 alloc_mod.CoOptimizingAllocator, "_cd_parent_matches", _no_matches
@@ -118,13 +153,29 @@ class _Observed:
         assert planned == self.emitted, (
             f"planned {sorted(planned)} but codegen emitted {sorted(self.emitted)}"
         )
+        # One shuffle op per plan: a bridged segment is ONE relayout however
+        # many consumers read it, and two segments are two even if they reuse
+        # an offset across ticks.
+        assert len(self.emitted_ops) == expected_plans, (
+            f"expected {expected_plans} emitted relayout op(s), codegen emitted "
+            f"{len(self.emitted_ops)}: {sorted(self.emitted_ops)}"
+        )
+        # Every consumer of a plan reads the plan's materialized copy: that is
+        # what "the bridge is used" means at the graph level.
+        for plan in self.plans:
+            copy_name = self.copies[plan.edge]
+            for consumer in plan.consumer_names:
+                assert copy_name in self.consumer_reads[consumer], (
+                    f"{consumer} does not read the relayout copy {copy_name} "
+                    f"(reads {sorted(self.consumer_reads[consumer])})"
+                )
 
     def assert_nothing_emitted(self) -> None:
         """No plan, no demotion, and no identity op codegen took for an LX
         relayout: the compile ran exactly as it would without the feature."""
         assert self.plans == [], f"no relayout may materialize: {self.plans}"
         assert self.demotions == []
-        assert self.emitted == set(), (
+        assert self.emitted == set() and not self.emitted_ops, (
             f"codegen emitted an LX relayout with the feature disarmed: "
             f"{sorted(self.emitted)}"
         )
@@ -314,11 +365,12 @@ def test_two_relayout_edges_into_one_consumer(monkeypatch):
     torch.testing.assert_close(out.cpu(), ref, rtol=2**-8, atol=2**-6)
 
 
-def test_one_source_two_consumers_two_edges(monkeypatch):
-    """relu(h) and abs(h) from one h with both edges forced: per-edge design,
-    so each consumer gets its own shuffle (two plans from the same source),
-    and each output is correct. A single group move serving both consumers
-    would be cheaper; that is the deferred multi-consumer extension."""
+def test_one_source_two_consumers_share_one_relayout(monkeypatch):
+    """relu(h) and abs(h) from one h with both edges forced. Both consumers
+    want the same destination view of h, so they form one relayout GROUP: one
+    shuffle, one LX destination spanning both consumers' ticks, one plan read
+    by both, and the objective charges it once (see the decision tests for
+    the per-edge vs per-group economics). Each output is correct."""
     forced = _arm_forced(monkeypatch)
     recorded = forced.plans
 
@@ -331,9 +383,11 @@ def test_one_source_two_consumers_two_edges(monkeypatch):
     with config.patch(_COOPT):
         o1, o2 = torch.compile(fn, dynamic=False)(ht.to("spyre"))
 
-    forced.assert_emitted_in_lx(expected_plans=2)
-    assert {p.source_name for p in recorded} == {recorded[0].source_name}
-    assert len({p.consumer_names for p in recorded}) == 2
+    forced.assert_emitted_in_lx(expected_plans=1)
+    (plan,) = recorded
+    assert len(plan.consumer_names) == 2, (
+        f"one shared plan must serve both consumers: {plan.consumer_names}"
+    )
     torch.testing.assert_close(
         o1.cpu(),
         torch.relu(torch.neg(ht.float())).to(torch.float16),
