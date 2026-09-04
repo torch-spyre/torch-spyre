@@ -1,0 +1,39 @@
+# ──────────────────────────────────────────────────────────────────────────────
+#  OpenShift Route — exposes the Service outside the cluster
+#
+#  Auto-generated hostname pattern:
+#    <release-name>-<namespace>.apps.<cluster-domain>
+#
+#  Override by setting route.host in values.yaml or --set route.host=...
+# ──────────────────────────────────────────────────────────────────────────────
+{{- if .Values.route.enabled }}
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: {{ include "spyre-dashboard.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "spyre-dashboard.labels" . | nindent 4 }}
+  annotations:
+    haproxy.router.openshift.io/redirect-to-https: "true"
+spec:
+  {{- if .Values.route.host }}
+  host: {{ .Values.route.host }}
+  {{- end }}
+  # If route.host is empty, OpenShift auto-generates:
+  #   <release-name>-<namespace>.apps.<cluster-domain>
+
+  to:
+    kind: Service
+    name: {{ include "spyre-dashboard.fullname" . }}
+    weight: 100
+
+  port:
+    targetPort: http   # matches the Service port name
+
+  tls:
+    termination: {{ .Values.route.tls.termination }}
+    insecureEdgeTerminationPolicy: {{ .Values.route.tls.insecureEdgeTerminationPolicy }}
+
+  wildcardPolicy: None
+{{- end }}
