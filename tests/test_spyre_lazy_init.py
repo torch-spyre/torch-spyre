@@ -95,6 +95,69 @@ class TestSpyre(TestCase):
         )
         assert out.endswith("OK"), f"unexpected stdout:\n{out}\nstderr:\n{err}"
 
+    def test_profiler_construction_does_not_start_runtime(self):
+        """Constructing ``torch.profiler.profile`` must not start the runtime.
+
+        Autoload patches ``torch.profiler.profile.__init__`` so the first
+        construction imports ``_C``, whose static
+        ``REGISTER_PRIVATEUSE1_PROFILER`` initializer registers the activity
+        profiler. Importing ``_C`` is sufficient; starting the device runtime is
+        not, and doing so breaks processes that construct a profiler without
+        owning a card -- the vLLM API-server front-end builds a CPU-only
+        profiler and would fail to open the VFIO device already held by the
+        worker process. Run in a fresh process so an already-started runtime
+        from another test cannot mask a regression.
+        """
+        import sys
+        import subprocess
+        import textwrap
+
+        script = textwrap.dedent("""
+            import torch
+
+            assert torch.spyre.is_initialized() is False, (
+                "runtime was initialized during import"
+            )
+
+            # CPU-only profiler: nothing here justifies touching the device.
+            torch.profiler.profile(
+                activities=[torch.profiler.ProfilerActivity.CPU],
+            )
+            assert torch.spyre.is_initialized() is False, (
+                "constructing torch.profiler.profile started the device runtime"
+            )
+
+            # The patch is one-shot and restores the original __init__; a second
+            # construction must leave the runtime alone too.
+            torch.profiler.profile(
+                activities=[torch.profiler.ProfilerActivity.CPU],
+            )
+            assert torch.spyre.is_initialized() is False, (
+                "second profile() construction started the device runtime"
+            )
+
+            print("OK")
+        """)
+
+        env = os.environ.copy()
+        env["DT_DEEPRT_VERBOSE"] = "-1"
+        env["DTLOG_LEVEL"] = "error"
+
+        proc = subprocess.run(
+            [sys.executable, "-c", script],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+            timeout=130,
+            text=True,
+        )
+        out = (proc.stdout or "").strip()
+        err = (proc.stderr or "").strip()
+        assert proc.returncode == 0, (
+            f"subprocess failed (rc={proc.returncode}).\nstdout:\n{out}\nstderr:\n{err}"
+        )
+        assert out.endswith("OK"), f"unexpected stdout:\n{out}\nstderr:\n{err}"
+
 
 if __name__ == "__main__":
     run_tests()
