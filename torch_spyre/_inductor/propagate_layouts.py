@@ -424,6 +424,25 @@ def _single_arg_op_layout(
             data.reduction_type in REDUCTIONS_NON_STICK_DIM_ONLY
             and reduction_var in x_stick_expr.free_symbols
         ):
+            # When the input has a staggered EA and the reduction is along a
+            # non-stick dimension (reduction_var not in the stick expression),
+            # the stick dimension survives intact in the output.  Preserve the
+            # staggered EA by rescaling the input STL to the output dtype so
+            # that downstream pointwise ops (e.g. x_fp32 - amax) see matching
+            # EAs on both inputs.
+            # Only applicable when both dtypes share the same stick depth
+            # (same_device_size); cross-depth cases like fp16→fp32 where
+            # device_size dims may not be evenly divisible after rescaling are
+            # handled separately below.
+            input_ea = stl.element_arrangement
+            if (
+                input_ea in STAGGERED_EAS
+                and reduction_var is not None
+                and reduction_var not in x_stick_expr.free_symbols
+                and same_device_size(in_layout.dtype, out_dtype_for_layout)
+            ):
+                return [_rescale_stl_for_dtype(stl, out_dtype_for_layout, input_ea)]
+
             # Try to preserve input layout
             out_stl = _output_stl_from_stick_expr(
                 x_stick_expr, output, output_dep, c_size, c_stride, out_dtype_for_layout
