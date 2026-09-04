@@ -1015,6 +1015,23 @@ def test_reshape_1d_to_2d_exp():
         )
 
 
+def test_constant_indexed_dim_is_consumed_without_mapping():
+    """A fixed source slice consumes its name but has no output loop variable."""
+    rows, cols = 2, 128
+    x = torch.randn(rows, cols, dtype=torch.float16, device=DEVICE)
+
+    def fn(x):
+        return x[0].exp()
+
+    _run_and_capture(
+        fn,
+        [x],
+        named_dims={"R": rows, "C": cols},
+        tensor_dims={x: ["R", "C"]},
+        expected_propagated_dims=["C"],
+    )
+
+
 # -------- Stride-0 broadcast (torch.expand) tests --------
 
 
