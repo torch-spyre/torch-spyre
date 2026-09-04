@@ -1617,6 +1617,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
     def _solve(self, solver: MemoryPlanSolver, graph: GraphLowering) -> Sequence[Any]:
         assert isinstance(solver, CoreDivisionLayoutSolver)
         bufmap = {buf.name: buf for buf in solver.buffers}
+        is_lx = {name: buf.sym_is_lx for name, buf in bufmap.items()}
 
         # Keyed by buffer name, which is what ``predict_by_bundle`` needs to match
         # features to the ops in each estimated bundle. ``mem_usage_by_buf`` keys
@@ -1631,7 +1632,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             if output_name not in bufmap:
                 continue
             op_features[output_name] = self._extract_op_features(
-                graph, output_name, bufmap
+                graph, output_name, bufmap, is_lx
             )
 
         from torch_spyre._inductor.cost_model import predict_by_bundle
@@ -1665,14 +1666,16 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         )
         return result
 
-    def _extract_op_features(self, graph, output_name, buffers):
+    def _extract_op_features(self, graph, output_name, buffers, is_lx):
         """Build symbolic OpFeatures for one ComputedBuffer op (best-effort).
 
         Same extraction as dump_cost_model.extract_op_features, but keyed off
-        each buffer's *symbolic* is_lx/cores/core-division vars (sym_is_lx,
-        sym_core_divs) instead of concrete values, so the
-        resulting OpFeatures can be fed to predict_ops() to build a cost
-        expression over the solver's own decision variables.
+        each buffer's *symbolic* core-division vars (sym_core_divs) instead of
+        concrete values, so the resulting OpFeatures can be fed to
+        predict_ops() to build a cost expression over the solver's own
+        decision variables. Residency is likewise symbolic: ``is_lx`` (the
+        name -> ``sym_is_lx`` map) is passed straight into the extractor so
+        every arg is stamped with its symbolic placement as it is built.
         """
         from torch_spyre._inductor.dump_cost_model import extract_op_features
         from torch_spyre._inductor.scratchpad.sa_cooptimizer import _work_slices
@@ -1680,7 +1683,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         sym_core_divs = buffers[output_name].sym_core_divs
         op = graph.get_buffer(output_name)
         ws = _work_slices(op, CoreDivision(sym_core_divs[0], sym_core_divs[1]))
-        return extract_op_features(op, ws, buffers=buffers)
+        return extract_op_features(op, ws, is_lx)
 
     def _post_solve(self, graph: GraphLowering, allocation: Sequence[Any]) -> None:
         # The divisions must be committed such that any buffer clones can correctly
