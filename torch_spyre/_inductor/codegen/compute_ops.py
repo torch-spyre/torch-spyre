@@ -336,6 +336,15 @@ def gen_coord_info_value(
             },
         }
     elif is_stick_dim and is_fp8_stick and not (stick_idx == 0):
+        # size is the per-core element count for this dim (iteration_space[dim] //
+        # nsplits, in elements).  For QFP8WT the outer stick dim has a fixed
+        # inner granularity of 64 elements, so size must be 64-aligned.  This is
+        # guaranteed because n_sticks = N // 128, nsplits is a divisor of n_sticks,
+        # so size = N // nsplits = 128 * (n_sticks // nsplits), and 128 // 64 = 2.
+        assert size % 64 == 0, (
+            f"FP8 outer-stick dim size must be 64-aligned for correct elemArr "
+            f"encoding, got size={size} (nsplits={nsplits})"
+        )
         return {
             "spatial": 3,
             "temporal": 0,
@@ -346,7 +355,7 @@ def gen_coord_info_value(
                     {"Affine": {"alpha_": size, "beta_": 0}},
                     {"Affine": {"alpha_": 0, "beta_": 0}},
                     {"Affine": {"alpha_": 0, "beta_": 0}},
-                    {"Affine": {"alpha_": (size // 8), "beta_": 0}},
+                    {"Affine": {"alpha_": 64, "beta_": 0}},
                     {"Affine": {"alpha_": 8, "beta_": 0}},
                     {"Affine": {"alpha_": 1, "beta_": 0}},
                 ],
@@ -354,9 +363,9 @@ def gen_coord_info_value(
                     {"factor_": nsplits, "label_": "core_fold"},
                     {"factor_": 1, "label_": "corelet_fold"},
                     {"factor_": 1, "label_": "row_fold"},
-                    {"factor_": 64, "label_": "elem_arr_2"},
-                    {"factor_": 2, "label_": "elem_arr_1"},
-                    {"factor_": 1, "label_": "elem_arr_0"},
+                    {"factor_": size // 64, "label_": "elem_arr_2"},
+                    {"factor_": 8, "label_": "elem_arr_1"},
+                    {"factor_": 8, "label_": "elem_arr_0"},
                 ],
             },
         }

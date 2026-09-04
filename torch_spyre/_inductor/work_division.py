@@ -1807,12 +1807,20 @@ def _cost_model_matmul_planner(
     if math.prod(new_splits.values()) < math.prod(splits.values()):
         if not has_qfp8wt_tensor(input_tds + [output_td]):
             return splits
-        # For QFP8WT, force k_dim = 1 regardless of core count
+        # For QFP8WT, force k_dim = 1 regardless of core count.
+        # n_dim is left as the cost model's chosen n_s; any legal divisor of
+        # n_sticks is safe because N is always a multiple of 128 (one FP8
+        # stick), so size = N // n_split = 128 * (n_sticks // n_split) is
+        # always a multiple of 64 — matching the hardware invariant
+        # P_.out_ = 64 * myCoreledOutSp from dmlite.cpp.  The assert
+        # size % 64 == 0 in gen_coord_info_value's elemArr=3 branch enforces
+        # this at codegen time.
         new_splits[k_dim] = 1
 
     logger.debug(
         f"cost_model work_division {op.get_name()}: "
-        f"b={b_combo} m={m_s} n={n_s} k={k_s} rhs_loaded_once={rhs_loaded_once} "
+        f"b={b_combo} m={m_s} n={new_splits[n_dim]} k={new_splits[k_dim]} "
+        f"rhs_loaded_once={rhs_loaded_once} "
         f"cost={best_cost:.1f}us "
         f"[B={B_total} M={M_e} K={K_e} N={N_e}]"
     )
@@ -1947,7 +1955,7 @@ def _cost_model_divide_op(op: ComputedBuffer, max_cores: int) -> bool:
     """
     if not isinstance(op.data, Reduction):
         return False
-    if op.data.reduction_type != BATCH_MATMUL_OP:
+    if op.data.reduction_type not in (BATCH_MATMUL_OP, BATCH_MATMUL_FP8_OP):
         return False
     if not config.ignore_work_division_hints and _has_work_div_hint(op):
         # User hints take ownership of the split decision; do not override them.
