@@ -543,6 +543,29 @@ class TestBuildingBlocks(unittest.TestCase):
             reshape_output=True,
         )
 
+    def test_siglip_multicrop_attention_span(self):
+        """A seven-crop SigLIP prefill must fit each tiled BMM under 256 MB."""
+        B, H, L, D = 7, 16, 576, 128
+        generator = torch.Generator().manual_seed(1337)
+        q = torch.randn((B, L, H, D), dtype=torch.bfloat16, generator=generator)
+        k = torch.randn((B, L, H, D), dtype=torch.bfloat16, generator=generator)
+        v = torch.randn((B, L, H, D), dtype=torch.bfloat16, generator=generator)
+
+        def sdpa(q, k, v):
+            return F.scaled_dot_product_attention(
+                q.transpose(1, 2),
+                k.transpose(1, 2),
+                v.transpose(1, 2),
+                dropout_p=0.0,
+                scale=72**-0.5,
+            )
+
+        expected = sdpa(q, k, v)
+        actual = torch.compile(sdpa, dynamic=False)(
+            q.to("spyre"), k.to("spyre"), v.to("spyre")
+        ).cpu()
+        torch.testing.assert_close(actual, expected, atol=0.2, rtol=0.2)
+
     @unittest.skip("Runs for long time, possibly hang.  Keeping disabled")
     @mock.patch("torch_spyre._inductor.decompositions._SDPA_MAX_SEQUENCE_TILE_SIZE", 64)
     def test_granite_gqa_prefill_grouped_sixteen_by_sixteen_tiling(self):
