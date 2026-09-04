@@ -47,9 +47,10 @@ std::shared_ptr<flex::FlexAllocator> SpyreAllocator::getFlexAllocator() {
     if (flex_alloc) {
       flex_alloc->registerMemoryPressureCallback(
           &SpyreAllocator::memoryPressureCallback);
-      DEBUGINFO(
-          "SpyreAllocator: registered memory pressure callback with "
-          "FlexAllocator");
+      SPYRE_RUNTIME_DEBUG()
+          << __func__
+          << ": SpyreAllocator: registered memory pressure callback with "
+             "FlexAllocator";
     }
   });
 
@@ -155,7 +156,8 @@ c10::DataPtr SpyreAllocator::allocate(
 
   auto device_id = curr_device.index();
 
-  DEBUGINFO("allocating ", nbytes, " (bytes) on Spyre", curr_device);
+  SPYRE_RUNTIME_DEBUG() << __func__ << ": allocating " << nbytes
+                        << " (bytes) on Spyre" << curr_device;
   if (nbytes == 0) {
     return {nullptr, nullptr, &ReportAndDelete, curr_device};
   }
@@ -166,7 +168,7 @@ c10::DataPtr SpyreAllocator::allocate(
   flex::CompositeAddress composite_addr =
       flex_alloc->allocate(nbytes, directive);
 
-  DEBUGINFO("allocated ", composite_addr);
+  SPYRE_RUNTIME_DEBUG() << __func__ << ": allocated " << composite_addr;
   // FlexAllocator rounds up to DEVICE_ALIGNMENT (128 bytes), so the actual
   // allocation may be larger than the requested nbytes. Use total_size() for
   // accurate memory profiling.
@@ -211,7 +213,7 @@ c10::DeleterFnPtr SpyreAllocator::raw_deleter() const {
 void SpyreAllocator::copy_data(void* dest, const void* src,
                                std::size_t count) const {
   py::gil_scoped_acquire acquire;
-  DEBUGINFO("entering allocator->copy_data method");
+  SPYRE_RUNTIME_DEBUG() << __func__ << ": entering allocator->copy_data method";
   // do nothing -- look into when this is called
   // spyre_copy_from(reinterpret_cast<spyre_ptr_t>(dest),
   // reinterpret_cast<spyre_ptr_t>(src));
@@ -240,9 +242,10 @@ void SpyreAllocator::memoryPressureCallback(
   // handle the mutex correctly if this callback throws, so no catch-to-relock
   // pattern is needed here.
 
-  DEBUGINFO(
-      "SpyreAllocator: memory pressure callback invoked, releasing allocator "
-      "mutex");
+  SPYRE_RUNTIME_DEBUG()
+      << __func__
+      << ": SpyreAllocator: memory pressure callback invoked, releasing "
+         "allocator mutex";
 
   // Step 1: Release allocator mutex
   lock.unlock();
@@ -250,30 +253,37 @@ void SpyreAllocator::memoryPressureCallback(
   // Step 2: Acquire Python GIL
   // PyGILState_Ensure() is safe to call from any thread, even if the thread
   // was not created by Python. It returns the previous GIL state.
-  DEBUGINFO("SpyreAllocator: acquiring Python GIL for garbage collection");
+  SPYRE_RUNTIME_DEBUG()
+      << __func__
+      << ": SpyreAllocator: acquiring Python GIL for garbage collection";
   PyGILState_STATE gstate = PyGILState_Ensure();
 
   // Step 3: Trigger Python garbage collection
   // PyGC_Collect() runs a full collection cycle and returns the number of
   // unreachable objects found (or -1 on error)
-  DEBUGINFO("SpyreAllocator: calling PyGC_Collect()");
+  SPYRE_RUNTIME_DEBUG() << __func__
+                        << ": SpyreAllocator: calling PyGC_Collect()";
   Py_ssize_t collected = PyGC_Collect();
 
   if (collected >= 0) {
-    DEBUGINFO("SpyreAllocator: PyGC_Collect() completed, collected ", collected,
-              " objects");
+    SPYRE_RUNTIME_DEBUG()
+        << __func__ << ": SpyreAllocator: PyGC_Collect() completed, collected "
+        << collected << " objects";
   } else {
-    DEBUGINFO("SpyreAllocator: PyGC_Collect() returned error");
+    SPYRE_RUNTIME_DEBUG() << __func__
+                          << ": SpyreAllocator: PyGC_Collect() returned error";
   }
 
   // Step 4: Release Python GIL
-  DEBUGINFO("SpyreAllocator: releasing Python GIL");
+  SPYRE_RUNTIME_DEBUG() << __func__ << ": SpyreAllocator: releasing Python GIL";
   PyGILState_Release(gstate);
 
   // Step 5: Re-acquire allocator mutex before returning to FlexAllocator
-  DEBUGINFO("SpyreAllocator: re-acquiring allocator mutex");
+  SPYRE_RUNTIME_DEBUG() << __func__
+                        << ": SpyreAllocator: re-acquiring allocator mutex";
   lock.lock();
-  DEBUGINFO("SpyreAllocator: memory pressure callback complete");
+  SPYRE_RUNTIME_DEBUG()
+      << __func__ << ": SpyreAllocator: memory pressure callback complete";
 }
 
 // Register our custom allocator

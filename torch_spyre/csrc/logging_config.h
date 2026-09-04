@@ -201,6 +201,7 @@ class Logger {
   LogStream warning();
   LogStream error();
   LogStream critical();
+  LogStream stream();
 
  private:
   std::string component_;
@@ -223,7 +224,7 @@ class Logger {
     torch_spyre::logging::Logger(                                              \
         component, torch_spyre::logging::LogLevel::level,                      \
         torch_spyre::logging::Logger::AlreadyEnabled{})                        \
-        .level()
+        .stream()
 
 // Component-specific macros
 #define SPYRE_RUNTIME_DEBUG() SPYRE_LOG("spyre.runtime", DEBUG)
