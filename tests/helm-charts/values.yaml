@@ -1,0 +1,53 @@
+# ──────────────────────────────────────────────────────────────────────────────
+#  Default values for spyre-dashboard Helm chart.
+#  Override on the command line:  helm install ... --set key=value
+#  or with a values file:         helm install ... -f my-values.yaml
+# ──────────────────────────────────────────────────────────────────────────────
+
+# Use:  helm install spyre-dashboard . -n <your-namespace>
+
+image:
+  nginx: nginx:alpine
+  git: alpine/git:latest
+  pullPolicy: Always
+
+git:
+  repo: git@github.com:anubhavjana/torch-spyre-anu-forked.git
+  branch: torch_spyre_dashboard
+  # Path inside the cloned repo where dashboard.html lives
+  dashboardPath: tests/dashboard
+
+ssh:
+  # Name of the Secret containing the SSH private key.
+  # Create with:
+  #   kubectl create secret generic spyre-dashboard-ssh-key \
+  #     --from-file=id_rsa=$HOME/.ssh/id_ed25519 -n <namespace>
+  secretName: spyre-dashboard-ssh-key
+
+security:
+  runAsUser: 1000
+  runAsGroup: 1000
+  fsGroup: 1000
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 64Mi
+  limits:
+    cpu: 500m
+    memory: 128Mi
+
+service:
+  port: 80
+  targetPort: 8080
+
+route:
+  enabled: true
+  # Leave host empty to let OpenShift auto-generate:
+  #   <release-name>-<namespace>.apps.<cluster-domain>
+  host: ''
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect
+
+deployer: anubhavjana
