@@ -125,7 +125,10 @@ override-dependencies = ['setuptools>=70.1.0,<82']
 [tool.uv.sources]
 torch = [
 #  { path = "../pytorch", editable = true },
-  { index = "pytorch-cpu" },
+  # Power and Z have no prebuilt wheels on the pytorch-cpu index; build from source at
+  # the tag matching the runtime pin, same as spyre-inference.
+  { git = "https://github.com/pytorch/pytorch", tag = "v2.13.0", marker = "platform_machine == 'ppc64le' or platform_machine == 's390x'" },
+  { index = "pytorch-cpu", marker = "platform_machine != 'ppc64le' and platform_machine != 's390x'" },
 ]
 torchvision = [
   { index = "pytorch-cpu" },
