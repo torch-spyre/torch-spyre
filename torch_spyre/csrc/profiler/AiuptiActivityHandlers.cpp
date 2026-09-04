@@ -279,6 +279,10 @@ void AiuptiActivityProfilerSession::handleKernelActivity(
                                    nlohmann::json(*ids).dump());
     }
   }
+  kernel_activity->addMetadata(
+      "cycles_ts", fmt::format("[{}, {}, {}, {}, {}]", activity->cycles_ts1,
+                               activity->cycles_ts2, activity->cycles_ts3,
+                               activity->cycles_ts4, activity->cycles_ts5));
 
   recordStream(kernel_activity->device, kernel_activity->resource);
 
@@ -393,6 +397,10 @@ void AiuptiActivityProfilerSession::handleMemcpyActivity(
   memcpy_activity->addMetadata("memory operation id", activity->copy_kind);
   memcpy_activity->addMetadata("bytes", activity->bytes);
   memcpy_activity->addMetadata("memory bandwidth (GB/s)", bandwidth(activity));
+  memcpy_activity->addMetadata(
+      "cycles_ts", fmt::format("[{}, {}, {}, {}, {}]", activity->cycles_ts1,
+                               activity->cycles_ts2, activity->cycles_ts3,
+                               activity->cycles_ts4, activity->cycles_ts5));
 
   if (memcpy_activity->resource == getBaseResourceId(activity)) {
     recordMemoryStream(memcpy_activity->device, memcpy_activity->resource,
