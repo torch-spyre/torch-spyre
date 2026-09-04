@@ -50,11 +50,11 @@ _SDPA_MAX_TILE_PAIRS_PER_LOOP_GROUP = 16
 _SDPA_PREFERRED_HEADS_PER_TILE = (4, 2, 1)
 
 
-def _sdpa_heads_per_tile(num_heads: int) -> int:
-    """Pick the largest divisible heads-per-tile from the preference list."""
-    for h in _SDPA_PREFERRED_HEADS_PER_TILE:
-        if num_heads % h == 0:
-            return h
+def _sdpa_num_head_tiles(num_heads: int) -> int:
+    """Use at most four heads per tile and return the required tile count."""
+    for heads_per_tile in _SDPA_PREFERRED_HEADS_PER_TILE:
+        if num_heads % heads_per_tile == 0:
+            return num_heads // heads_per_tile
     return 1
 
 
@@ -580,7 +580,7 @@ def spyre__sdpa_overrideable(
             block_group_start + kv_blocks_per_loop_group, num_kv_blocks
         )
         with spyre_hint(tiles={"batch_size": max(1, batch_size // 2)}):
-            with spyre_hint(tiles={"num_heads": _sdpa_heads_per_tile(num_heads)}):
+            with spyre_hint(tiles={"num_heads": _sdpa_num_head_tiles(num_heads)}):
                 with spyre_hint(num_tiles_per_dim={"max_seqlen_q": num_q_tiles}):
                     for blk in range(block_group_start, block_group_end):
                         start = blk * kv_block_size
