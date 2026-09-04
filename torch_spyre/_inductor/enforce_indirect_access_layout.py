@@ -16,15 +16,18 @@
 
 The three-pass restickify pipeline (propagate_layouts -> optimize_restickify ->
 insert_restickify) resolves stick-dimension layout constraints. Indirect-access
-ops (gather/scatter) impose an additional requirement on non-stick dimension
-ordering: the indexed dimension must be outermost in the value tensor's device
-layout, based on their coordinate access patterns.
+ops (gather/scatter) impose two additional requirements that the stick-dimension
+machinery does not cover, both handled here:
+
+1. Value tensor non-stick dim ordering: the indexed dimension must be outermost
+   in the value tensor's device layout.
+2. Index tensor stick adjacency: the sticks the index operand reads must be
+   contiguous in device memory. See ``_index_sticks_are_adjacent``.
 
 This pass runs after insert_restickify, once every op has a committed
-FixedTiledLayout. For indirect-access ops, it checks whether the value tensor's
-current dim_order matches this requirement; if not, either rewrites the
-producer's output layout in place (if the producer is a ComputedBuffer and not a
-graph output) or inserts a spyre.restickify copy in the required layout.
+FixedTiledLayout. For each requirement it either rewrites the producer's output
+layout in place (if the producer is a ComputedBuffer and not a graph output) or
+inserts a spyre.restickify copy in the required layout.
 """
 
 import sympy
@@ -229,6 +232,74 @@ def _build_required_stl(
         device_size=new_device_size,
         stride_map=new_stride_map,
         device_dtype=value_stl.device_dtype,
+    )
+
+
+def _varying_device_dims(coords: list[sympy.Expr], ranges: dict) -> set[int]:
+    """Device dim positions whose coordinate actually moves across the loop nest.
+
+    ``compute_coordinates`` invents a fresh symbol for a device dim the access
+    does not span -- reading one row of a 2-D table gives the row dim its own
+    symbol with range 1 -- so a symbolic coordinate is not by itself a moving
+    one. Substituting every range-1 loop var away leaves only the dims that
+    genuinely walk more than one position.
+    """
+    pinned = {sym: 0 for sym, extent in ranges.items() if extent == 1}
+    varying = set()
+    for pos, coord in enumerate(coords):
+        if not hasattr(coord, "free_symbols"):
+            continue
+        expr = coord.subs(pinned) if pinned else coord
+        if getattr(expr, "free_symbols", set()):
+            varying.add(pos)
+    return varying
+
+
+def _index_sticks_are_adjacent(index_stl: SpyreTensorLayout, varying: set[int]) -> bool:
+    """Check that the sticks the index operand reads are contiguous on device.
+
+    A device address is row-major over ``device_size``, so the sticks a moving
+    dim walks are adjacent only when every dim between the outermost moving dim
+    and the stick dim is extent 1. A *pinned* dim of extent > 1 in between
+    leaves a hole: for an int32 ``[8, 64]`` index table the device layout is
+    chunk-outermost (``device_size=[2, 8, 32]``), so one row's two sticks sit 8
+    sticks apart. The backend's index load only honors the first stick of such
+    an access, silently gathering with a stale index for every element past it
+    (torch-spyre#3851), so the operand has to be relaid out instead.
+    """
+    if not varying:
+        return True
+    device_size = list(index_stl.device_size)
+    return all(
+        pos in varying or device_size[pos] == 1
+        for pos in range(min(varying), len(device_size) - 1)
+    )
+
+
+def _build_adjacent_index_stl(
+    index_stl: SpyreTensorLayout, varying: set[int]
+) -> SpyreTensorLayout:
+    """Rotate an index layout so its moving dims form a contiguous suffix.
+
+    Pinned dims move outward and the stick stays last, which makes the sticks a
+    single access reads adjacent. For the ``[8, 64]`` int32 table above this
+    turns ``device_size=[2, 8, 32]`` (chunk-outermost) into ``[8, 2, 32]``
+    (row-outermost), where each row is two neighbouring sticks.
+    """
+    device_size = list(index_stl.device_size)
+    stride_map = list(index_stl.stride_map)
+    n = len(device_size)
+    stick_pos = n - 1
+    non_stick = [pos for pos in range(n) if pos != stick_pos]
+    order = (
+        [pos for pos in non_stick if pos not in varying]
+        + [pos for pos in non_stick if pos in varying]
+        + [stick_pos]
+    )
+    return SpyreTensorLayout(
+        device_size=[device_size[pos] for pos in order],
+        stride_map=[stride_map[pos] for pos in order],
+        device_dtype=index_stl.device_dtype,
     )
 
 
@@ -837,6 +908,73 @@ def _enforce_scatter_destination_layout(
         _insert_mutation_relayout_copy(graph, scatter_op, write_dep, {}, None)
 
 
+def _index_names_from_subs(access_subs: dict, dep_names: set[str]) -> list[str]:
+    """Names of the index operands an op indirectly reads, in a stable order."""
+    names = {
+        sym.args[0].name
+        for sym in access_subs.values()
+        if isinstance(sym, IndirectAccess)
+    }
+    return sorted(names & dep_names)
+
+
+def _enforce_index_stick_adjacency(graph: GraphLowering) -> None:
+    """Relayout index operands whose sticks are not adjacent in device memory.
+
+    An index taken as a row of a 2-D table reads sticks that the table's
+    chunk-outermost layout leaves far apart, which the backend's index load
+    cannot follow (see ``_index_sticks_are_adjacent``). Rotating the layout so
+    the read is stick-contiguous fixes both the standalone-compiled eager
+    kernels and the in-graph select of a fully compiled region -- both reach
+    codegen with the same non-adjacent index access.
+    """
+    for original_op in list(graph.operations):
+        if not isinstance(original_op, ComputedBuffer):
+            continue
+        requirement = _get_indirect_access_dim_order_requirements(original_op)
+        if not requirement:
+            continue
+        dep_names, access_subs, sizes = requirement
+
+        op = original_op
+        for index_name in _index_names_from_subs(access_subs, dep_names):
+            index_dep = next(
+                (
+                    d
+                    for d in op.get_read_writes().reads
+                    if isinstance(d, MemoryDep) and d.name == index_name
+                ),
+                None,
+            )
+            if index_dep is None:
+                continue
+            index_buf = graph.get_buffer(index_name)
+            index_layout = _real_layout(index_buf)
+            if not isinstance(index_layout, FixedTiledLayout):
+                continue
+            index_stl = index_layout.device_layout
+            coords = device_coordinates(index_stl, index_dep, sizes)
+            varying = _varying_device_dims(coords, index_dep.ranges)
+            if _index_sticks_are_adjacent(index_stl, varying):
+                continue
+
+            required_stl = _build_adjacent_index_stl(index_stl, varying)
+            logger.info(
+                "enforce_indirect_access_layout: index %s reads non-adjacent "
+                "sticks (device_size=%s, moving dims=%s); relaying out to %s",
+                index_name,
+                list(index_stl.device_size),
+                sorted(varying),
+                list(required_stl.device_size),
+            )
+            if _can_mutate_producer_in_place(index_buf, graph.get_output_names()):
+                _rewrite_producer_layout(index_buf, required_stl)
+            else:
+                op = _insert_relayout_copy(
+                    graph, op, index_buf, _fixed_tiled(index_layout, required_stl)
+                )
+
+
 def enforce_indirect_access_layout(graph: GraphLowering) -> None:
     """Reorder non-stick dimensions to satisfy indirect-access ops' requirements.
 
@@ -846,7 +984,12 @@ def enforce_indirect_access_layout(graph: GraphLowering) -> None:
     indexed dimension outermost as required; if not, either rewrites the
     producer's layout in place (single-consumer, non-mutation, non-graph-output
     case) or inserts a spyre.restickify copy node ahead of the consumer.
+
+    Index operands are constrained first, so the value-tensor sweep below sees
+    the relaid-out graph.
     """
+    _enforce_index_stick_adjacency(graph)
+
     for original_op in list(graph.operations):
         if not isinstance(original_op, ComputedBuffer):
             continue
