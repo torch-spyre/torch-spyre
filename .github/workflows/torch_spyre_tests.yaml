@@ -127,7 +127,11 @@ jobs:
     with:
       runner_label: linux
       # Per-PR ephemeral image label when provided, else the standing set.
-      image_label: ${{ inputs.runner_label || 'image_spyre_backend' }}
+      # SHADOW-VALIDATION (do not merge): redirected to the isolated shadow
+      # runner set so this suite exercises the /next :dev backend image on the
+      # `image_spyre_backend_shadow` sets. Restore to 'image_spyre_backend'
+      # before this branch is ever merged.
+      image_label: ${{ inputs.runner_label || 'image_spyre_backend_shadow' }}
       extra_test_flags: -v -m "not xfail"
       extra_test_flags_multi_spyre: -v
       checkout_pytorch: false
