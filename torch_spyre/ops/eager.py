@@ -90,14 +90,36 @@ def _materialize_offset_view(x):
 
 
 class RetileWarning(UserWarning):
-    """Warning issued when an eager result had to be re-tiled to the layout a
-    compiled graph assumes for it."""
+    """Warning issued when an eager result needs host-assisted re-tiling."""
 
 
 warnings.simplefilter("once", RetileWarning)
 
+# A cross-layout D2D copy is not always representable by today's compiler.  For
+# example, gathering values from several source sticks into one destination
+# stick has no lowering yet.  Remember those exact layout pairs after the first
+# failed compile so repeated eager calls take the correctness fallback directly.
+_UNSUPPORTED_D2D_RETILES: set[tuple] = set()
 
-def _normalize_result_layout(x):
+
+def _retile_signature(x, real, canonical):
+    return (tuple(int(s) for s in x.shape), x.dtype, repr(real), repr(canonical))
+
+
+def _retile_via_host(x, *, op_name: str | None):
+    producer = f" from {op_name}" if op_name is not None else ""
+    warnings.warn(
+        f"re-tiling a {tuple(x.shape)} {x.dtype} eager result{producer} through "
+        f"the host because its device layouts cannot be converted directly",
+        category=RetileWarning,
+        stacklevel=3,
+    )
+    out = torch.zeros(x.shape, dtype=x.dtype, device=x.device)
+    out.copy_(x.to("cpu"))
+    return out
+
+
+def _normalize_result_layout(x, *, op_name: str | None = None):
     """Return a copy of a Spyre tensor whose device layout is the *canonical* one
     for its logical shape.
 
@@ -128,27 +150,38 @@ def _normalize_result_layout(x):
         # No layout to compare (e.g. a FakeTensor under tracing): leave it alone
         # rather than force a copy on a tensor we cannot reason about.
         return x
-    if real == SpyreTensorLayout([int(s) for s in x.shape], x.dtype):
+    canonical = SpyreTensorLayout([int(s) for s in x.shape], x.dtype)
+    if real == canonical:
         return x
 
-    warnings.warn(
-        f"re-tiling a {tuple(x.shape)} {x.dtype} eager result whose device "
-        f"layout is not the one a compiled graph assumes for its shape",
-        category=RetileWarning,
-        stacklevel=2,
+    signature = _retile_signature(x, real, canonical)
+    if signature in _UNSUPPORTED_D2D_RETILES:
+        return _retile_via_host(x, op_name=op_name)
+
+    out = torch.empty(
+        x.shape,
+        dtype=x.dtype,
+        device=x.device,
+        device_layout=canonical,
     )
-    out = torch.zeros(x.shape, dtype=x.dtype, device=x.device)
-    # The host round-trip reads the source by its own real layout and writes the
-    # destination by the canonical one, which is the re-tiling we want.
-    #
-    # A device-to-device copy_ would re-tile without leaving the device, but it
-    # routes through spyre::copy_from_d2d, i.e. a nested torch.compile from
-    # inside the eager kernel we are already compiling. That nesting raises
-    # InductorError from optimize_restickify.beam_global_min_cost and breaks
-    # test_reduction_reads_correct_slice[2|32] (measured). Revisit once a
-    # cross-layout D2D copy is available without re-entering the compiler — see
-    # the same TODO at csrc/spyre_mem.cpp:759.
-    out.copy_(x.to("cpu"))
+    try:
+        torch.ops.spyre.copy_from_d2d(
+            x,
+            out,
+            x.storage_offset(),
+            out.storage_offset(),
+        )
+    except Exception as exc:
+        # Compilation failure means this particular source/destination layout
+        # pair needs transport that the current D2D copy cannot express.  Do
+        # not hide execution or device faults behind the fallback.
+        from torch._dynamo.exc import BackendCompilerFailed
+        from torch._inductor.exc import InductorError
+
+        if not isinstance(exc, (BackendCompilerFailed, InductorError)):
+            raise
+        _UNSUPPORTED_D2D_RETILES.add(signature)
+        return _retile_via_host(x, op_name=op_name)
     return out
 
 
@@ -316,7 +349,10 @@ def _make_offset_safe_dispatch(op):
         result = compiled(*args, **kwargs)
 
         if normalize_results:
-            result = _map_result(result, _normalize_result_layout)
+            result = _map_result(
+                result,
+                functools.partial(_normalize_result_layout, op_name=op.name()),
+            )
 
         if write_back:
             for local, original in write_back:
