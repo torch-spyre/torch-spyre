@@ -3042,8 +3042,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
             },
         },
-        # TODO: aten::native_batch_norm not implemented for the 'spyre' backend
-        # (runtime NotImplementedError before compilation) (issue #1889)
         ("test_batch_norm_functional", "test_batch_norm_functional_cpu"): {
             "param_sets": {
                 "eval_mode": (
@@ -3053,8 +3051,16 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     torch.ones((256,), dtype=torch.float16),
                     torch.zeros((256,), dtype=torch.float16),
                 ),
+                "nontrivial_stats": (
+                    cached_randn((64, 256), dtype=torch.float16),
+                    cached_randn((256,), dtype=torch.float16, differentiation=1),
+                    cached_randn(
+                        (256,), dtype=torch.float16, differentiation=2, abs=True
+                    ),
+                    cached_randn((256,), dtype=torch.float16, differentiation=3),
+                    cached_randn((256,), dtype=torch.float16, differentiation=4),
+                ),
             },
-            "expect_fail": ["eval_mode"],
         },
         # TODO: TorchInductor compilation failure in the Spyre lowering pass —
         # KeyError 'No FX node for buf11' in split_multi_ops.py (issue #3287)

@@ -150,7 +150,7 @@ def register_spyre_decompositions(ops: OpOrOps):
     ``_register_spyre_dispatchkey_kernels_permanently`` additionally installs a
     PrivateUse1 kernel pointing at the same function at runtime init, so
     eager-mode dispatch reaches it too. This is required for
-    ``CompositeImplicitAutograd`` ops (``rms_norm``, ``layer_norm``, ...); it
+    ``CompositeImplicitAutograd`` ops (``rms_norm``, ``layer_norm``, ``batch_norm``, ...); it
     is harmless for the rest.
     """
     return decomp.register_decomposition(ops, spyre_decompositions)
@@ -363,6 +363,30 @@ def spyre_layer_norm(
     mean = torch.ops.spyre.exx2(input, 1.0 / normalized_shape[0], False)
     norm_mean = torch.ops.spyre.layernormscale(mean, eps)
     return torch.ops.spyre.layernormnorm(input, mean, norm_mean, weight, bias)
+
+
+@register_spyre_decompositions([torch.ops.aten.batch_norm.default])
+def spyre_batch_norm(
+    input: torch.Tensor,
+    weight: torch.Tensor | None,
+    bias: torch.Tensor | None,
+    running_mean: torch.Tensor | None,
+    running_var: torch.Tensor | None,
+    training: bool,
+    momentum: float,
+    eps: float,
+    cudnn_enabled: bool,
+) -> torch.Tensor:
+    if training:
+        raise Unsupported(
+            "spyre_batch_norm: training mode is not supported on "
+            "infrence-only Spyre backend."
+        )
+    # native_batch_norm returns (output, save_mean, save_invstd).
+    # The batch_norm schema returns only the output.
+    return torch.ops.aten.native_batch_norm(
+        input, weight, bias, running_mean, running_var, training, momentum, eps
+    )[0]
 
 
 @register_spyre_decompositions([torch.ops.aten.silu.default])
