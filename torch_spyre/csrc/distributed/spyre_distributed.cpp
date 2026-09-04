@@ -108,7 +108,7 @@ spyre_comms::TensorDataTypeEnum torch_dtype_to_spyre_comms(
 std::shared_ptr<spyre_comms::Context> ensure_context() {
   auto context = spyre_comms::get_world_context();
   if (context == nullptr) {
-    DEBUGINFO("Initializing spyre-comms library");
+    SPYRE_RUNTIME_DEBUG() << __func__ << ": Initializing spyre-comms library";
     spyre_comms::initialize_library(spyre::GlobalRuntime::get(),
                                     spyre::getDefaultStreamRuntimeHandle());
     context = spyre_comms::get_world_context();
@@ -182,8 +182,10 @@ void ensure_wsi(CachedPlan& plan, int64_t num_elems,
 int64_t spyre_broadcast_plan_impl(int64_t num_elems, int64_t dtype_code,
                                   int64_t src_rank,
                                   const std::string& group_name) {
-  DEBUGINFO("spyre::broadcast_plan called with num_elems=", num_elems,
-            ", dtype=", dtype_code, ", src_rank=", src_rank);
+  SPYRE_RUNTIME_DEBUG() << __func__
+                        << ": spyre::broadcast_plan called with num_elems="
+                        << num_elems << ", dtype=" << dtype_code
+                        << ", src_rank=" << src_rank;
 
   auto context = ensure_context();
 
@@ -199,7 +201,8 @@ int64_t spyre_broadcast_plan_impl(int64_t num_elems, int64_t dtype_code,
   int64_t handle = cache_lookup(PlanKind::Broadcast, dtype, num_elems, src_rank,
                                 spyre_comms::SpyreReductionOpType::SUM, 0);
   if (handle >= 0) {
-    DEBUGINFO("broadcast_plan: cache hit at handle=", handle);
+    SPYRE_RUNTIME_DEBUG() << __func__
+                          << ": broadcast_plan: cache hit at handle=" << handle;
     return handle;
   }
 
@@ -210,15 +213,18 @@ int64_t spyre_broadcast_plan_impl(int64_t num_elems, int64_t dtype_code,
   auto& plan = wsi_cache_.back();
   ensure_wsi(plan, num_elems, context);
 
-  DEBUGINFO("broadcast_plan: created WSI at handle=", handle);
+  SPYRE_RUNTIME_DEBUG() << __func__
+                        << ": broadcast_plan: created WSI at handle=" << handle;
   return handle;
 }
 
 int64_t spyre_allreduce_plan_impl(int64_t num_elems, int64_t dtype_code,
                                   const std::string& reduce_op,
                                   const std::string& group_name) {
-  DEBUGINFO("spyre::allreduce_plan called with num_elems=", num_elems,
-            ", dtype=", dtype_code, ", reduce_op=", reduce_op);
+  SPYRE_RUNTIME_DEBUG() << __func__
+                        << ": spyre::allreduce_plan called with num_elems="
+                        << num_elems << ", dtype=" << dtype_code
+                        << ", reduce_op=" << reduce_op;
 
   auto context = ensure_context();
   auto op_type = parse_reduce_op(reduce_op);
@@ -229,7 +235,8 @@ int64_t spyre_allreduce_plan_impl(int64_t num_elems, int64_t dtype_code,
   int64_t handle =
       cache_lookup(PlanKind::AllReduce, dtype, num_elems, 0, op_type, 0);
   if (handle >= 0) {
-    DEBUGINFO("allreduce_plan: cache hit at handle=", handle);
+    SPYRE_RUNTIME_DEBUG() << __func__
+                          << ": allreduce_plan: cache hit at handle=" << handle;
     return handle;
   }
 
@@ -239,15 +246,18 @@ int64_t spyre_allreduce_plan_impl(int64_t num_elems, int64_t dtype_code,
   auto& plan = wsi_cache_.back();
   ensure_wsi(plan, num_elems, context);
 
-  DEBUGINFO("allreduce_plan: created WSI at handle=", handle);
+  SPYRE_RUNTIME_DEBUG() << __func__
+                        << ": allreduce_plan: created WSI at handle=" << handle;
   return handle;
 }
 
 int64_t spyre_allgather_plan_impl(int64_t num_elems, int64_t dtype_code,
                                   int64_t group_size,
                                   const std::string& group_name) {
-  DEBUGINFO("spyre::allgather_plan called with num_elems=", num_elems,
-            ", dtype=", dtype_code, ", group_size=", group_size);
+  SPYRE_RUNTIME_DEBUG() << __func__
+                        << ": spyre::allgather_plan called with num_elems="
+                        << num_elems << ", dtype=" << dtype_code
+                        << ", group_size=" << group_size;
 
   auto context = ensure_context();
 
@@ -264,7 +274,8 @@ int64_t spyre_allgather_plan_impl(int64_t num_elems, int64_t dtype_code,
       cache_lookup(PlanKind::AllGather, dtype, num_elems, 0,
                    spyre_comms::SpyreReductionOpType::SUM, group_size);
   if (handle >= 0) {
-    DEBUGINFO("allgather_plan: cache hit at handle=", handle);
+    SPYRE_RUNTIME_DEBUG() << __func__
+                          << ": allgather_plan: cache hit at handle=" << handle;
     return handle;
   }
 
@@ -275,7 +286,8 @@ int64_t spyre_allgather_plan_impl(int64_t num_elems, int64_t dtype_code,
   auto& plan = wsi_cache_.back();
   ensure_wsi(plan, num_elems, context);
 
-  DEBUGINFO("allgather_plan: created WSI at handle=", handle);
+  SPYRE_RUNTIME_DEBUG() << __func__
+                        << ": allgather_plan: created WSI at handle=" << handle;
   return handle;
 }
 
@@ -285,8 +297,9 @@ int64_t spyre_allgather_plan_impl(int64_t num_elems, int64_t dtype_code,
 
 at::Tensor spyre_broadcast_run_impl(const at::Tensor& input,
                                     int64_t plan_handle, int64_t src_rank) {
-  DEBUGINFO("spyre::broadcast_run called with plan_handle=", plan_handle,
-            ", src_rank=", src_rank);
+  SPYRE_RUNTIME_DEBUG() << __func__
+                        << ": spyre::broadcast_run called with plan_handle="
+                        << plan_handle << ", src_rank=" << src_rank;
 
   auto context = ensure_context();
 
@@ -338,7 +351,9 @@ at::Tensor spyre_broadcast_run_impl(const at::Tensor& input,
 
 at::Tensor spyre_allreduce_run_impl(const at::Tensor& input,
                                     int64_t plan_handle) {
-  DEBUGINFO("spyre::allreduce_run called with plan_handle=", plan_handle);
+  SPYRE_RUNTIME_DEBUG() << __func__
+                        << ": spyre::allreduce_run called with plan_handle="
+                        << plan_handle;
 
   auto context = ensure_context();
 
@@ -387,8 +402,9 @@ at::Tensor spyre_allreduce_run_impl(const at::Tensor& input,
 
 at::Tensor spyre_allgather_run_impl(const at::Tensor& input,
                                     int64_t plan_handle, int64_t group_size) {
-  DEBUGINFO("spyre::allgather_run called with plan_handle=", plan_handle,
-            ", group_size=", group_size);
+  SPYRE_RUNTIME_DEBUG() << __func__
+                        << ": spyre::allgather_run called with plan_handle="
+                        << plan_handle << ", group_size=" << group_size;
 
   auto context = ensure_context();
 
@@ -461,7 +477,7 @@ at::Tensor spyre_allgather_run_impl(const at::Tensor& input,
 
 // Wait for async operation to complete
 at::Tensor spyre_wait_work_impl(const at::Tensor& tensor) {
-  DEBUGINFO("spyre::wait_work called");
+  SPYRE_RUNTIME_DEBUG() << __func__ << ": spyre::wait_work called";
 
   // Get SharedOwnerCtx for map lookup
   auto* ctx = static_cast<spyre::SharedOwnerCtx*>(
@@ -479,14 +495,15 @@ at::Tensor spyre_wait_work_impl(const at::Tensor& tensor) {
 
     pending = std::move(it->second);
     pending_work_map_.erase(it);
-    DEBUGINFO("Extracted and erased PendingWork, map size=",
-              pending_work_map_.size());
+    SPYRE_RUNTIME_DEBUG() << __func__
+                          << ": Extracted and erased PendingWork, map size="
+                          << pending_work_map_.size();
   }
 
   // Lock released — concurrent wait_work and run ops can now proceed
   if (pending.work) {
     pending.work->wait();
-    DEBUGINFO("WorkSchedule wait completed");
+    SPYRE_RUNTIME_DEBUG() << __func__ << ": WorkSchedule wait completed";
   }
 
   if (pending.kind == CollectiveKind::AllGather) {
@@ -506,8 +523,8 @@ at::Tensor spyre_wait_work_impl(const at::Tensor& tensor) {
                   pending.chunk_size)
           .copy_(pending.rank_outputs[i]);
     }
-    DEBUGINFO("Assembled allgather output from ", pending.rank_outputs.size(),
-              " rank buffers");
+    SPYRE_RUNTIME_DEBUG() << __func__ << ": Assembled allgather output from "
+                          << pending.rank_outputs.size() << " rank buffers";
   }
   // For Broadcast/AllReduce/Reduce the output data is already in tensor —
   // the collective operates in-place so no further data manipulation is needed.
