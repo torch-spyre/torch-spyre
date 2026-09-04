@@ -14,6 +14,7 @@
 
 import dataclasses
 import math
+import sys
 import unittest
 from unittest import mock
 
@@ -565,6 +566,17 @@ class TestBuildingBlocks(unittest.TestCase):
             q.to("spyre"), k.to("spyre"), v.to("spyre")
         ).cpu()
         torch.testing.assert_close(actual, expected, atol=0.2, rtol=0.2)
+
+    def test_sdpa_head_tiles_limit_heads_per_tile(self):
+        """The hint value is a tile count, not a per-tile head extent."""
+        # The backend entry point loaded by ``import torch`` has already
+        # registered this module. Fetch it without importing torch_spyre here.
+        decompositions = sys.modules["torch_spyre._inductor.decompositions"]
+        num_head_tiles = decompositions._sdpa_num_head_tiles
+
+        self.assertEqual(num_head_tiles(32), 8)
+        self.assertEqual(num_head_tiles(16), 4)
+        self.assertEqual(num_head_tiles(14), 7)
 
     @unittest.skip("Runs for long time, possibly hang.  Keeping disabled")
     @mock.patch("torch_spyre._inductor.decompositions._SDPA_MAX_SEQUENCE_TILE_SIZE", 64)
