@@ -50,6 +50,9 @@ Test sub-suites:
 | `TORCH_COMPILE_DEBUG=1` | Dump Inductor debug artifacts |
 | `TORCH_SPYRE_DOWNCAST_WARN=0` | Suppress int64→int32 downcast warnings |
 | `SPYRE_DUMP_COST=1` | Predicted-runtime report after pre-scheduling |
+| `TORCH_SPYRE_TIMING=1` | Structured per-compile frontend timing records |
+| `TORCH_SPYRE_TIMING_OUT` | Where to write them (pid inserted: `rec.json` -> `rec.<pid>.json`) |
+| `TORCH_SPYRE_FRONTEND_ONLY=1` | Stop each compile before `dxp_standalone`; no runnable kernel, measurement only |
 
 ## Spyre Hardware Basics
 
