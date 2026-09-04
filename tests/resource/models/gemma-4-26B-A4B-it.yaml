@@ -2291,14 +2291,15 @@ cases:
     marks: bf16operation
     kwmap:
       offs:
-        shape: [128]
-        stride: [1]
-        storage_offset: 0
-        dtype: torch.int32
-        device: cuda:0
-        init: cumsum_offsets
-        init_args:
-          total: 192
+        tensor:
+          shape: [128]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int32
+          device: cuda:0
+          init: cumsum_offsets
+          init_args:
+            total: 192
       bias: None
       out_dtype: None
   - name: torch.chunk.1
@@ -2429,14 +2430,15 @@ cases:
     marks: bf16operation
     kwmap:
       offs:
-        shape: [128]
-        stride: [1]
-        storage_offset: 0
-        dtype: torch.int32
-        device: cuda:0
-        init: cumsum_offsets
-        init_args:
-          total: 192
+        tensor:
+          shape: [128]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int32
+          device: cuda:0
+          init: cumsum_offsets
+          init_args:
+            total: 192
       bias: None
       out_dtype: None
   - name: torch.unsqueeze.3
@@ -2673,14 +2675,15 @@ cases:
     marks: bf16operation
     kwmap:
       offs:
-        shape: [128]
-        stride: [1]
-        storage_offset: 0
-        dtype: torch.int32
-        device: cuda:0
-        init: cumsum_offsets
-        init_args:
-          total: 192
+        tensor:
+          shape: [128]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int32
+          device: cuda:0
+          init: cumsum_offsets
+          init_args:
+            total: 192
       bias: None
       out_dtype: None
   - name: torch._grouped_mm.4
@@ -2704,14 +2707,15 @@ cases:
     marks: bf16operation
     kwmap:
       offs:
-        shape: [128]
-        stride: [1]
-        storage_offset: 0
-        dtype: torch.int32
-        device: cuda:0
-        init: cumsum_offsets
-        init_args:
-          total: 192
+        tensor:
+          shape: [128]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int32
+          device: cuda:0
+          init: cumsum_offsets
+          init_args:
+            total: 192
       bias: None
       out_dtype: None
   - name: torch._grouped_mm.5
@@ -2735,14 +2739,15 @@ cases:
     marks: bf16operation
     kwmap:
       offs:
-        shape: [128]
-        stride: [1]
-        storage_offset: 0
-        dtype: torch.int32
-        device: cuda:0
-        init: cumsum_offsets
-        init_args:
-          total: 192
+        tensor:
+          shape: [128]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int32
+          device: cuda:0
+          init: cumsum_offsets
+          init_args:
+            total: 192
       bias: None
       out_dtype: None
   - name: torch._grouped_mm.6
@@ -2766,14 +2771,15 @@ cases:
     marks: bf16operation
     kwmap:
       offs:
-        shape: [128]
-        stride: [1]
-        storage_offset: 0
-        dtype: torch.int32
-        device: cuda:0
-        init: cumsum_offsets
-        init_args:
-          total: 192
+        tensor:
+          shape: [128]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int32
+          device: cuda:0
+          init: cumsum_offsets
+          init_args:
+            total: 192
       bias: None
       out_dtype: None
   - name: torch._grouped_mm.7
@@ -2797,14 +2803,15 @@ cases:
     marks: bf16operation
     kwmap:
       offs:
-        shape: [128]
-        stride: [1]
-        storage_offset: 0
-        dtype: torch.int32
-        device: cuda:0
-        init: cumsum_offsets
-        init_args:
-          total: 192
+        tensor:
+          shape: [128]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int32
+          device: cuda:0
+          init: cumsum_offsets
+          init_args:
+            total: 192
       bias: None
       out_dtype: None
   - name: torch._grouped_mm.8
@@ -2828,14 +2835,15 @@ cases:
     marks: bf16operation
     kwmap:
       offs:
-        shape: [128]
-        stride: [1]
-        storage_offset: 0
-        dtype: torch.int32
-        device: cuda:0
-        init: cumsum_offsets
-        init_args:
-          total: 192
+        tensor:
+          shape: [128]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int32
+          device: cuda:0
+          init: cumsum_offsets
+          init_args:
+            total: 192
       bias: None
       out_dtype: None
   - name: torch._grouped_mm.9
@@ -2859,14 +2867,15 @@ cases:
     marks: bf16operation
     kwmap:
       offs:
-        shape: [128]
-        stride: [1]
-        storage_offset: 0
-        dtype: torch.int32
-        device: cuda:0
-        init: cumsum_offsets
-        init_args:
-          total: 192
+        tensor:
+          shape: [128]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int32
+          device: cuda:0
+          init: cumsum_offsets
+          init_args:
+            total: 192
       bias: None
       out_dtype: None
   - name: torch._grouped_mm.10
@@ -3752,14 +3761,15 @@ cases:
     marks: bf16operation
     kwmap:
       offs:
-        shape: [128]
-        stride: [1]
-        storage_offset: 0
-        dtype: torch.int32
-        device: cuda:0
-        init: cumsum_offsets
-        init_args:
-          total: 192
+        tensor:
+          shape: [128]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int32
+          device: cuda:0
+          init: cumsum_offsets
+          init_args:
+            total: 192
       bias: None
       out_dtype: None
   - name: torch._grouped_mm.13
@@ -3783,14 +3793,15 @@ cases:
     marks: bf16operation
     kwmap:
       offs:
-        shape: [128]
-        stride: [1]
-        storage_offset: 0
-        dtype: torch.int32
-        device: cuda:0
-        init: cumsum_offsets
-        init_args:
-          total: 192
+        tensor:
+          shape: [128]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int32
+          device: cuda:0
+          init: cumsum_offsets
+          init_args:
+            total: 192
       bias: None
       out_dtype: None
   - name: torch._grouped_mm.14
@@ -3814,14 +3825,15 @@ cases:
     marks: bf16operation
     kwmap:
       offs:
-        shape: [128]
-        stride: [1]
-        storage_offset: 0
-        dtype: torch.int32
-        device: cuda:0
-        init: cumsum_offsets
-        init_args:
-          total: 192
+        tensor:
+          shape: [128]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int32
+          device: cuda:0
+          init: cumsum_offsets
+          init_args:
+            total: 192
       bias: None
       out_dtype: None
   - name: torch._grouped_mm.15
@@ -3845,14 +3857,15 @@ cases:
     marks: bf16operation
     kwmap:
       offs:
-        shape: [128]
-        stride: [1]
-        storage_offset: 0
-        dtype: torch.int32
-        device: cuda:0
-        init: cumsum_offsets
-        init_args:
-          total: 192
+        tensor:
+          shape: [128]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int32
+          device: cuda:0
+          init: cumsum_offsets
+          init_args:
+            total: 192
       bias: None
       out_dtype: None
   - name: torch._grouped_mm.16
@@ -3876,14 +3889,15 @@ cases:
     marks: bf16operation
     kwmap:
       offs:
-        shape: [128]
-        stride: [1]
-        storage_offset: 0
-        dtype: torch.int32
-        device: cuda:0
-        init: cumsum_offsets
-        init_args:
-          total: 192
+        tensor:
+          shape: [128]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int32
+          device: cuda:0
+          init: cumsum_offsets
+          init_args:
+            total: 192
       bias: None
       out_dtype: None
   - name: torch._grouped_mm.17
@@ -3907,14 +3921,15 @@ cases:
     marks: bf16operation
     kwmap:
       offs:
-        shape: [128]
-        stride: [1]
-        storage_offset: 0
-        dtype: torch.int32
-        device: cuda:0
-        init: cumsum_offsets
-        init_args:
-          total: 192
+        tensor:
+          shape: [128]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int32
+          device: cuda:0
+          init: cumsum_offsets
+          init_args:
+            total: 192
       bias: None
       out_dtype: None
   - name: torch._grouped_mm.18
@@ -3938,14 +3953,15 @@ cases:
     marks: bf16operation
     kwmap:
       offs:
-        shape: [128]
-        stride: [1]
-        storage_offset: 0
-        dtype: torch.int32
-        device: cuda:0
-        init: cumsum_offsets
-        init_args:
-          total: 192
+        tensor:
+          shape: [128]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int32
+          device: cuda:0
+          init: cumsum_offsets
+          init_args:
+            total: 192
       bias: None
       out_dtype: None
   - name: torch._grouped_mm.19
@@ -3969,14 +3985,15 @@ cases:
     marks: bf16operation
     kwmap:
       offs:
-        shape: [128]
-        stride: [1]
-        storage_offset: 0
-        dtype: torch.int32
-        device: cuda:0
-        init: cumsum_offsets
-        init_args:
-          total: 192
+        tensor:
+          shape: [128]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int32
+          device: cuda:0
+          init: cumsum_offsets
+          init_args:
+            total: 192
       bias: None
       out_dtype: None
   - name: torch._grouped_mm.20
@@ -4000,14 +4017,15 @@ cases:
     marks: bf16operation
     kwmap:
       offs:
-        shape: [128]
-        stride: [1]
-        storage_offset: 0
-        dtype: torch.int32
-        device: cuda:0
-        init: cumsum_offsets
-        init_args:
-          total: 192
+        tensor:
+          shape: [128]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int32
+          device: cuda:0
+          init: cumsum_offsets
+          init_args:
+            total: 192
       bias: None
       out_dtype: None
   - name: torch._grouped_mm.21
@@ -4031,14 +4049,15 @@ cases:
     marks: bf16operation
     kwmap:
       offs:
-        shape: [128]
-        stride: [1]
-        storage_offset: 0
-        dtype: torch.int32
-        device: cuda:0
-        init: cumsum_offsets
-        init_args:
-          total: 192
+        tensor:
+          shape: [128]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int32
+          device: cuda:0
+          init: cumsum_offsets
+          init_args:
+            total: 192
       bias: None
       out_dtype: None
   - name: torch._grouped_mm.22
@@ -4062,14 +4081,15 @@ cases:
     marks: bf16operation
     kwmap:
       offs:
-        shape: [128]
-        stride: [1]
-        storage_offset: 0
-        dtype: torch.int32
-        device: cuda:0
-        init: cumsum_offsets
-        init_args:
-          total: 192
+        tensor:
+          shape: [128]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int32
+          device: cuda:0
+          init: cumsum_offsets
+          init_args:
+            total: 192
       bias: None
       out_dtype: None
   - name: torch._grouped_mm.23
@@ -4093,14 +4113,15 @@ cases:
     marks: bf16operation
     kwmap:
       offs:
-        shape: [128]
-        stride: [1]
-        storage_offset: 0
-        dtype: torch.int32
-        device: cuda:0
-        init: cumsum_offsets
-        init_args:
-          total: 192
+        tensor:
+          shape: [128]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int32
+          device: cuda:0
+          init: cumsum_offsets
+          init_args:
+            total: 192
       bias: None
       out_dtype: None
   - name: torch._grouped_mm.24
@@ -4124,14 +4145,15 @@ cases:
     marks: bf16operation
     kwmap:
       offs:
-        shape: [128]
-        stride: [1]
-        storage_offset: 0
-        dtype: torch.int32
-        device: cuda:0
-        init: cumsum_offsets
-        init_args:
-          total: 192
+        tensor:
+          shape: [128]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int32
+          device: cuda:0
+          init: cumsum_offsets
+          init_args:
+            total: 192
       bias: None
       out_dtype: None
   - name: torch._grouped_mm.25
@@ -4155,14 +4177,15 @@ cases:
     marks: bf16operation
     kwmap:
       offs:
-        shape: [128]
-        stride: [1]
-        storage_offset: 0
-        dtype: torch.int32
-        device: cuda:0
-        init: cumsum_offsets
-        init_args:
-          total: 192
+        tensor:
+          shape: [128]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int32
+          device: cuda:0
+          init: cumsum_offsets
+          init_args:
+            total: 192
       bias: None
       out_dtype: None
   - name: torch._grouped_mm.26
@@ -4186,14 +4209,15 @@ cases:
     marks: bf16operation
     kwmap:
       offs:
-        shape: [128]
-        stride: [1]
-        storage_offset: 0
-        dtype: torch.int32
-        device: cuda:0
-        init: cumsum_offsets
-        init_args:
-          total: 192
+        tensor:
+          shape: [128]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int32
+          device: cuda:0
+          init: cumsum_offsets
+          init_args:
+            total: 192
       bias: None
       out_dtype: None
   - name: torch._grouped_mm.27
@@ -4217,14 +4241,15 @@ cases:
     marks: bf16operation
     kwmap:
       offs:
-        shape: [128]
-        stride: [1]
-        storage_offset: 0
-        dtype: torch.int32
-        device: cuda:0
-        init: cumsum_offsets
-        init_args:
-          total: 192
+        tensor:
+          shape: [128]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int32
+          device: cuda:0
+          init: cumsum_offsets
+          init_args:
+            total: 192
       bias: None
       out_dtype: None
   - name: torch._grouped_mm.28
@@ -4248,14 +4273,15 @@ cases:
     marks: bf16operation
     kwmap:
       offs:
-        shape: [128]
-        stride: [1]
-        storage_offset: 0
-        dtype: torch.int32
-        device: cuda:0
-        init: cumsum_offsets
-        init_args:
-          total: 192
+        tensor:
+          shape: [128]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int32
+          device: cuda:0
+          init: cumsum_offsets
+          init_args:
+            total: 192
       bias: None
       out_dtype: None
   - name: torch._grouped_mm.29
@@ -4279,14 +4305,15 @@ cases:
     marks: bf16operation
     kwmap:
       offs:
-        shape: [128]
-        stride: [1]
-        storage_offset: 0
-        dtype: torch.int32
-        device: cuda:0
-        init: cumsum_offsets
-        init_args:
-          total: 192
+        tensor:
+          shape: [128]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int32
+          device: cuda:0
+          init: cumsum_offsets
+          init_args:
+            total: 192
       bias: None
       out_dtype: None
   - name: torch._grouped_mm.30
@@ -4310,14 +4337,15 @@ cases:
     marks: bf16operation
     kwmap:
       offs:
-        shape: [128]
-        stride: [1]
-        storage_offset: 0
-        dtype: torch.int32
-        device: cuda:0
-        init: cumsum_offsets
-        init_args:
-          total: 192
+        tensor:
+          shape: [128]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int32
+          device: cuda:0
+          init: cumsum_offsets
+          init_args:
+            total: 192
       bias: None
       out_dtype: None
   - name: torch._grouped_mm.31
@@ -4341,14 +4369,15 @@ cases:
     marks: bf16operation
     kwmap:
       offs:
-        shape: [128]
-        stride: [1]
-        storage_offset: 0
-        dtype: torch.int32
-        device: cuda:0
-        init: cumsum_offsets
-        init_args:
-          total: 192
+        tensor:
+          shape: [128]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int32
+          device: cuda:0
+          init: cumsum_offsets
+          init_args:
+            total: 192
       bias: None
       out_dtype: None
   - name: torch._grouped_mm.32
@@ -4372,14 +4401,15 @@ cases:
     marks: bf16operation
     kwmap:
       offs:
-        shape: [128]
-        stride: [1]
-        storage_offset: 0
-        dtype: torch.int32
-        device: cuda:0
-        init: cumsum_offsets
-        init_args:
-          total: 192
+        tensor:
+          shape: [128]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int32
+          device: cuda:0
+          init: cumsum_offsets
+          init_args:
+            total: 192
       bias: None
       out_dtype: None
   - name: torch._grouped_mm.33
@@ -4403,14 +4433,15 @@ cases:
     marks: bf16operation
     kwmap:
       offs:
-        shape: [128]
-        stride: [1]
-        storage_offset: 0
-        dtype: torch.int32
-        device: cuda:0
-        init: cumsum_offsets
-        init_args:
-          total: 192
+        tensor:
+          shape: [128]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int32
+          device: cuda:0
+          init: cumsum_offsets
+          init_args:
+            total: 192
       bias: None
       out_dtype: None
   - name: torch._grouped_mm.34
@@ -4434,14 +4465,15 @@ cases:
     marks: bf16operation
     kwmap:
       offs:
-        shape: [128]
-        stride: [1]
-        storage_offset: 0
-        dtype: torch.int32
-        device: cuda:0
-        init: cumsum_offsets
-        init_args:
-          total: 192
+        tensor:
+          shape: [128]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int32
+          device: cuda:0
+          init: cumsum_offsets
+          init_args:
+            total: 192
       bias: None
       out_dtype: None
   - name: torch._grouped_mm.35
@@ -4465,14 +4497,15 @@ cases:
     marks: bf16operation
     kwmap:
       offs:
-        shape: [128]
-        stride: [1]
-        storage_offset: 0
-        dtype: torch.int32
-        device: cuda:0
-        init: cumsum_offsets
-        init_args:
-          total: 192
+        tensor:
+          shape: [128]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int32
+          device: cuda:0
+          init: cumsum_offsets
+          init_args:
+            total: 192
       bias: None
       out_dtype: None
   - name: torch._grouped_mm.36
@@ -4496,14 +4529,15 @@ cases:
     marks: bf16operation
     kwmap:
       offs:
-        shape: [128]
-        stride: [1]
-        storage_offset: 0
-        dtype: torch.int32
-        device: cuda:0
-        init: cumsum_offsets
-        init_args:
-          total: 192
+        tensor:
+          shape: [128]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int32
+          device: cuda:0
+          init: cumsum_offsets
+          init_args:
+            total: 192
       bias: None
       out_dtype: None
   - name: torch._grouped_mm.37
@@ -4527,14 +4561,15 @@ cases:
     marks: bf16operation
     kwmap:
       offs:
-        shape: [128]
-        stride: [1]
-        storage_offset: 0
-        dtype: torch.int32
-        device: cuda:0
-        init: cumsum_offsets
-        init_args:
-          total: 192
+        tensor:
+          shape: [128]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int32
+          device: cuda:0
+          init: cumsum_offsets
+          init_args:
+            total: 192
       bias: None
       out_dtype: None
   - name: torch._grouped_mm.38
@@ -4558,14 +4593,15 @@ cases:
     marks: bf16operation
     kwmap:
       offs:
-        shape: [128]
-        stride: [1]
-        storage_offset: 0
-        dtype: torch.int32
-        device: cuda:0
-        init: cumsum_offsets
-        init_args:
-          total: 192
+        tensor:
+          shape: [128]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int32
+          device: cuda:0
+          init: cumsum_offsets
+          init_args:
+            total: 192
       bias: None
       out_dtype: None
   - name: torch._grouped_mm.39
@@ -4589,14 +4625,15 @@ cases:
     marks: bf16operation
     kwmap:
       offs:
-        shape: [128]
-        stride: [1]
-        storage_offset: 0
-        dtype: torch.int32
-        device: cuda:0
-        init: cumsum_offsets
-        init_args:
-          total: 192
+        tensor:
+          shape: [128]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int32
+          device: cuda:0
+          init: cumsum_offsets
+          init_args:
+            total: 192
       bias: None
       out_dtype: None
   - name: torch._grouped_mm.40
@@ -4620,14 +4657,15 @@ cases:
     marks: bf16operation
     kwmap:
       offs:
-        shape: [128]
-        stride: [1]
-        storage_offset: 0
-        dtype: torch.int32
-        device: cuda:0
-        init: cumsum_offsets
-        init_args:
-          total: 192
+        tensor:
+          shape: [128]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int32
+          device: cuda:0
+          init: cumsum_offsets
+          init_args:
+            total: 192
       bias: None
       out_dtype: None
   - name: torch._grouped_mm.41
@@ -4651,14 +4689,15 @@ cases:
     marks: bf16operation
     kwmap:
       offs:
-        shape: [128]
-        stride: [1]
-        storage_offset: 0
-        dtype: torch.int32
-        device: cuda:0
-        init: cumsum_offsets
-        init_args:
-          total: 192
+        tensor:
+          shape: [128]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int32
+          device: cuda:0
+          init: cumsum_offsets
+          init_args:
+            total: 192
       bias: None
       out_dtype: None
   - name: torch._grouped_mm.42
@@ -4682,14 +4721,15 @@ cases:
     marks: bf16operation
     kwmap:
       offs:
-        shape: [128]
-        stride: [1]
-        storage_offset: 0
-        dtype: torch.int32
-        device: cuda:0
-        init: cumsum_offsets
-        init_args:
-          total: 192
+        tensor:
+          shape: [128]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int32
+          device: cuda:0
+          init: cumsum_offsets
+          init_args:
+            total: 192
       bias: None
       out_dtype: None
   - name: torch._grouped_mm.43
@@ -4713,14 +4753,15 @@ cases:
     marks: bf16operation
     kwmap:
       offs:
-        shape: [128]
-        stride: [1]
-        storage_offset: 0
-        dtype: torch.int32
-        device: cuda:0
-        init: cumsum_offsets
-        init_args:
-          total: 192
+        tensor:
+          shape: [128]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int32
+          device: cuda:0
+          init: cumsum_offsets
+          init_args:
+            total: 192
       bias: None
       out_dtype: None
   - name: torch._grouped_mm.44
@@ -4744,14 +4785,15 @@ cases:
     marks: bf16operation
     kwmap:
       offs:
-        shape: [128]
-        stride: [1]
-        storage_offset: 0
-        dtype: torch.int32
-        device: cuda:0
-        init: cumsum_offsets
-        init_args:
-          total: 192
+        tensor:
+          shape: [128]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int32
+          device: cuda:0
+          init: cumsum_offsets
+          init_args:
+            total: 192
       bias: None
       out_dtype: None
   - name: torch._grouped_mm.45
@@ -4775,14 +4817,15 @@ cases:
     marks: bf16operation
     kwmap:
       offs:
-        shape: [128]
-        stride: [1]
-        storage_offset: 0
-        dtype: torch.int32
-        device: cuda:0
-        init: cumsum_offsets
-        init_args:
-          total: 192
+        tensor:
+          shape: [128]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int32
+          device: cuda:0
+          init: cumsum_offsets
+          init_args:
+            total: 192
       bias: None
       out_dtype: None
   - name: torch._grouped_mm.46
@@ -4806,14 +4849,15 @@ cases:
     marks: bf16operation
     kwmap:
       offs:
-        shape: [128]
-        stride: [1]
-        storage_offset: 0
-        dtype: torch.int32
-        device: cuda:0
-        init: cumsum_offsets
-        init_args:
-          total: 192
+        tensor:
+          shape: [128]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int32
+          device: cuda:0
+          init: cumsum_offsets
+          init_args:
+            total: 192
       bias: None
       out_dtype: None
   - name: torch._grouped_mm.47
@@ -4837,14 +4881,15 @@ cases:
     marks: bf16operation
     kwmap:
       offs:
-        shape: [128]
-        stride: [1]
-        storage_offset: 0
-        dtype: torch.int32
-        device: cuda:0
-        init: cumsum_offsets
-        init_args:
-          total: 192
+        tensor:
+          shape: [128]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int32
+          device: cuda:0
+          init: cumsum_offsets
+          init_args:
+            total: 192
       bias: None
       out_dtype: None
   - name: torch._grouped_mm.48
@@ -4868,14 +4913,15 @@ cases:
     marks: bf16operation
     kwmap:
       offs:
-        shape: [128]
-        stride: [1]
-        storage_offset: 0
-        dtype: torch.int32
-        device: cuda:0
-        init: cumsum_offsets
-        init_args:
-          total: 192
+        tensor:
+          shape: [128]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int32
+          device: cuda:0
+          init: cumsum_offsets
+          init_args:
+            total: 192
       bias: None
       out_dtype: None
   - name: torch._grouped_mm.49
@@ -4899,14 +4945,15 @@ cases:
     marks: bf16operation
     kwmap:
       offs:
-        shape: [128]
-        stride: [1]
-        storage_offset: 0
-        dtype: torch.int32
-        device: cuda:0
-        init: cumsum_offsets
-        init_args:
-          total: 192
+        tensor:
+          shape: [128]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int32
+          device: cuda:0
+          init: cumsum_offsets
+          init_args:
+            total: 192
       bias: None
       out_dtype: None
   - name: torch._grouped_mm.50
@@ -4930,14 +4977,15 @@ cases:
     marks: bf16operation
     kwmap:
       offs:
-        shape: [128]
-        stride: [1]
-        storage_offset: 0
-        dtype: torch.int32
-        device: cuda:0
-        init: cumsum_offsets
-        init_args:
-          total: 192
+        tensor:
+          shape: [128]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int32
+          device: cuda:0
+          init: cumsum_offsets
+          init_args:
+            total: 192
       bias: None
       out_dtype: None
   - name: torch._grouped_mm.51
@@ -4961,14 +5009,15 @@ cases:
     marks: bf16operation
     kwmap:
       offs:
-        shape: [128]
-        stride: [1]
-        storage_offset: 0
-        dtype: torch.int32
-        device: cuda:0
-        init: cumsum_offsets
-        init_args:
-          total: 192
+        tensor:
+          shape: [128]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int32
+          device: cuda:0
+          init: cumsum_offsets
+          init_args:
+            total: 192
       bias: None
       out_dtype: None
   - name: torch._grouped_mm.52
@@ -4992,14 +5041,15 @@ cases:
     marks: bf16operation
     kwmap:
       offs:
-        shape: [128]
-        stride: [1]
-        storage_offset: 0
-        dtype: torch.int32
-        device: cuda:0
-        init: cumsum_offsets
-        init_args:
-          total: 192
+        tensor:
+          shape: [128]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int32
+          device: cuda:0
+          init: cumsum_offsets
+          init_args:
+            total: 192
       bias: None
       out_dtype: None
   - name: torch._grouped_mm.53
@@ -5023,14 +5073,15 @@ cases:
     marks: bf16operation
     kwmap:
       offs:
-        shape: [128]
-        stride: [1]
-        storage_offset: 0
-        dtype: torch.int32
-        device: cuda:0
-        init: cumsum_offsets
-        init_args:
-          total: 192
+        tensor:
+          shape: [128]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int32
+          device: cuda:0
+          init: cumsum_offsets
+          init_args:
+            total: 192
       bias: None
       out_dtype: None
   - name: torch._grouped_mm.54
@@ -5054,14 +5105,15 @@ cases:
     marks: bf16operation
     kwmap:
       offs:
-        shape: [128]
-        stride: [1]
-        storage_offset: 0
-        dtype: torch.int32
-        device: cuda:0
-        init: cumsum_offsets
-        init_args:
-          total: 192
+        tensor:
+          shape: [128]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int32
+          device: cuda:0
+          init: cumsum_offsets
+          init_args:
+            total: 192
       bias: None
       out_dtype: None
   - name: torch._grouped_mm.55
@@ -5085,14 +5137,15 @@ cases:
     marks: bf16operation
     kwmap:
       offs:
-        shape: [128]
-        stride: [1]
-        storage_offset: 0
-        dtype: torch.int32
-        device: cuda:0
-        init: cumsum_offsets
-        init_args:
-          total: 192
+        tensor:
+          shape: [128]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int32
+          device: cuda:0
+          init: cumsum_offsets
+          init_args:
+            total: 192
       bias: None
       out_dtype: None
   - name: torch._grouped_mm.56
@@ -5116,14 +5169,15 @@ cases:
     marks: bf16operation
     kwmap:
       offs:
-        shape: [128]
-        stride: [1]
-        storage_offset: 0
-        dtype: torch.int32
-        device: cuda:0
-        init: cumsum_offsets
-        init_args:
-          total: 192
+        tensor:
+          shape: [128]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int32
+          device: cuda:0
+          init: cumsum_offsets
+          init_args:
+            total: 192
       bias: None
       out_dtype: None
   - name: torch._grouped_mm.57
@@ -5147,14 +5201,15 @@ cases:
     marks: bf16operation
     kwmap:
       offs:
-        shape: [128]
-        stride: [1]
-        storage_offset: 0
-        dtype: torch.int32
-        device: cuda:0
-        init: cumsum_offsets
-        init_args:
-          total: 192
+        tensor:
+          shape: [128]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int32
+          device: cuda:0
+          init: cumsum_offsets
+          init_args:
+            total: 192
       bias: None
       out_dtype: None
   - name: torch._grouped_mm.58
@@ -5178,14 +5233,15 @@ cases:
     marks: bf16operation
     kwmap:
       offs:
-        shape: [128]
-        stride: [1]
-        storage_offset: 0
-        dtype: torch.int32
-        device: cuda:0
-        init: cumsum_offsets
-        init_args:
-          total: 192
+        tensor:
+          shape: [128]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int32
+          device: cuda:0
+          init: cumsum_offsets
+          init_args:
+            total: 192
       bias: None
       out_dtype: None
   - name: torch._grouped_mm.59
@@ -5209,14 +5265,15 @@ cases:
     marks: bf16operation
     kwmap:
       offs:
-        shape: [128]
-        stride: [1]
-        storage_offset: 0
-        dtype: torch.int32
-        device: cuda:0
-        init: cumsum_offsets
-        init_args:
-          total: 192
+        tensor:
+          shape: [128]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int32
+          device: cuda:0
+          init: cumsum_offsets
+          init_args:
+            total: 192
       bias: None
       out_dtype: None
   - name: torch._grouped_mm.60
@@ -5240,14 +5297,15 @@ cases:
     marks: bf16operation
     kwmap:
       offs:
-        shape: [128]
-        stride: [1]
-        storage_offset: 0
-        dtype: torch.int32
-        device: cuda:0
-        init: cumsum_offsets
-        init_args:
-          total: 192
+        tensor:
+          shape: [128]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int32
+          device: cuda:0
+          init: cumsum_offsets
+          init_args:
+            total: 192
       bias: None
       out_dtype: None
   - name: torch.getitem.18

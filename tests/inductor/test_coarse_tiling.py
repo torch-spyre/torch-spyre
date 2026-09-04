@@ -7462,21 +7462,21 @@ class TestReorderUnhintedInterlopers(unittest.TestCase):
         self.assertEqual(self._run([a, x, b]), ["a", "b", "x"])
 
     def test_interloper_move_after_blocked_by_hinted_reader(self):
-        # x reads a (blocks move-before) AND b reads x (blocks move-after) → error.
+        # x reads a (blocks move-before) AND b reads x (blocks move-after).
+        # Keep x in place and split the hinted ops into separate runs.
         a = _make_rui_op("a", hint_ids=(0,))
         x = _make_rui_op("x", reads=("a",))
         b = _make_rui_op("b", reads=("x",), hint_ids=(0,))
         c = _make_rui_op("c", hint_ids=(0,))
-        with self.assertRaises(RuntimeError):
-            self._run([a, x, b, c])
+        self.assertEqual(self._run([a, x, b, c]), ["a", "x", "b", "c"])
 
     def test_interloper_blocked_both_directions(self):
-        # x reads a (blocks move-before) AND b reads x (blocks move-after) → error.
+        # x reads a (blocks move-before) AND b reads x (blocks move-after).
+        # The original topological order is already valid and is preserved.
         a = _make_rui_op("a", hint_ids=(0,))
         x = _make_rui_op("x_out", reads=("a",))
         b = _make_rui_op("b", reads=("x_out",), hint_ids=(0,))
-        with self.assertRaises(RuntimeError):
-            self._run([a, x, b])
+        self.assertEqual(self._run([a, x, b]), ["a", "x_out", "b"])
 
     def test_non_computed_buffer_breaks_run(self):
         # A non-ComputedBuffer between two hinted ops cannot be reordered.
@@ -7485,11 +7485,22 @@ class TestReorderUnhintedInterlopers(unittest.TestCase):
         b = _make_rui_op("b", hint_ids=(0,))
         self.assertEqual(self._run([a, extern, b]), ["a", "extern", "b"])
 
-    def test_differently_hinted_breaks_run(self):
-        # An op with a different hint_id is not a candidate for reordering.
+    def test_differently_hinted_pulled_across_when_safe(self):
+        # An op with a different hint_id is not a candidate for reordering
+        # itself, but the later same-key op is pulled before it when doing
+        # so is dependency-safe, making the hint-0 run contiguous.
         a = _make_rui_op("a", hint_ids=(0,))
         c = _make_rui_op("c", hint_ids=(1,))
         b = _make_rui_op("b", hint_ids=(0,))
+        self.assertEqual(self._run([a, c, b]), ["a", "b", "c"])
+
+    def test_differently_hinted_breaks_run_when_pull_unsafe(self):
+        # b reads c's output, so pulling b before c would violate that
+        # read dependency; the pull is skipped and the run stays broken
+        # (left for validate_coarse_tile_groups to report).
+        a = _make_rui_op("a", hint_ids=(0,))
+        c = _make_rui_op("c", hint_ids=(1,))
+        b = _make_rui_op("b", hint_ids=(0,), reads=("c",))
         self.assertEqual(self._run([a, c, b]), ["a", "c", "b"])
 
     def test_multiple_interlopers_all_moveable_before(self):
@@ -7591,13 +7602,12 @@ class TestReorderUnhintedInterlopers(unittest.TestCase):
     def test_mutating_interloper_blocked(self):
         # x mutates buffer 'a' produced by a hinted op; x cannot legally move
         # before the run (would run before 'a' is produced) and b reads x so
-        # x cannot move after — should raise RuntimeError.
+        # x cannot move after. Keep it in place as the run boundary.
         a = _make_rui_op("a", hint_ids=(0,))
         x = _make_rui_op("x", mutates=("a",))  # mutation dep on a
         b = _make_rui_op("b", reads=("x",), hint_ids=(0,))
         c = _make_rui_op("c", hint_ids=(0,))
-        with self.assertRaises(RuntimeError):
-            self._run([a, x, b, c])
+        self.assertEqual(self._run([a, x, b, c]), ["a", "x", "b", "c"])
 
 
 # ===========================================================================

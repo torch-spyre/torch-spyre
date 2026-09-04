@@ -31,8 +31,8 @@
 
 #include "../logging.h"
 #include "../spyre_allocator.h"
+#include "../spyre_composite_address.h"
 #include "../spyre_stream.h"
-#include "../spyre_tensor_impl.h"
 
 namespace spyre {
 
@@ -102,31 +102,6 @@ spyre_comms::TensorDataTypeEnum torch_dtype_to_spyre_comms(
     default:
       TORCH_CHECK(false, "Unsupported dtype for spyre_comms: ", dtype);
   }
-}
-
-// Helper to get CompositeAddress pointer from a Spyre tensor
-// NOTE: The returned pointer is valid only as long as the tensor's storage
-// context remains valid. Caller must keep the tensor alive.
-const flex::CompositeAddress* get_composite_address(const at::Tensor& tensor) {
-  TORCH_CHECK(tensor.is_privateuseone(),
-              "Tensor must be on Spyre device for distributed operations");
-
-  TORCH_CHECK(tensor.is_contiguous(),
-              "Tensor must be contiguous for distributed operations");
-
-  auto* spyre_impl =
-      static_cast<SpyreTensorImpl*>(tensor.unsafeGetTensorImpl());
-  TORCH_CHECK(spyre_impl != nullptr, "SpyreTensorImpl is null");
-
-  auto& storage = spyre_impl->storage();
-  auto* data_ptr = storage.data_ptr().get();
-  TORCH_CHECK(data_ptr != nullptr, "Storage data pointer is null");
-
-  auto* ctx = static_cast<SharedOwnerCtx*>(storage.data_ptr().get_context());
-  TORCH_CHECK(ctx != nullptr, "SharedOwnerCtx is null");
-
-  // Return a pointer to the CompositeAddress inside the context
-  return &ctx->composite_addr;
 }
 
 // Ensure spyre_comms is initialized and return the world context.
@@ -339,7 +314,7 @@ at::Tensor spyre_broadcast_run_impl(const at::Tensor& input,
 
   // Build spyre_comms::Tensor using the plan's TensorInfo (must stay alive)
   spyre_comms::Tensor buffer_tensor(*plan.tensor_info);
-  buffer_tensor.SetSpyreDeviceAddressBorrowed(&ctx->composite_addr);
+  buffer_tensor.SetSpyreDeviceAddressBorrowed(get_composite_address(output));
 
   auto work_schedule = context->broadcast_applyTensor(*plan.wsi, buffer_tensor);
   TORCH_CHECK(work_schedule != nullptr,
@@ -388,7 +363,7 @@ at::Tensor spyre_allreduce_run_impl(const at::Tensor& input,
   // Build spyre_comms::Tensor using the plan's TensorInfo (must stay alive)
   spyre_comms::Tensor inout_tensor(*plan.tensor_info,
                                    input.storage().data_ptr().get());
-  inout_tensor.SetSpyreDeviceAddressBorrowed(&ctx->composite_addr);
+  inout_tensor.SetSpyreDeviceAddressBorrowed(get_composite_address(input));
 
   auto work_schedule = context->allreduce_applyTensor(*plan.wsi, inout_tensor);
   TORCH_CHECK(work_schedule != nullptr,
@@ -429,14 +404,9 @@ at::Tensor spyre_allgather_run_impl(const at::Tensor& input,
   TORCH_CHECK(input.nbytes() > 0,
               "Tensor must have non-zero size for allgather");
 
-  // Get SharedOwnerCtx for input
-  auto* input_ctx = static_cast<spyre::SharedOwnerCtx*>(
-      input.storage().data_ptr().get_context());
-  TORCH_CHECK(input_ctx != nullptr, "SharedOwnerCtx is null for input tensor");
-
   spyre_comms::Tensor input_tensor(*plan.tensor_info,
                                    input.storage().data_ptr().get());
-  input_tensor.SetSpyreDeviceAddressBorrowed(&input_ctx->composite_addr);
+  input_tensor.SetSpyreDeviceAddressBorrowed(get_composite_address(input));
 
   // Allocate per-rank output tensors (same shape/layout as input)
   std::vector<at::Tensor> rank_outputs;
@@ -449,13 +419,10 @@ at::Tensor spyre_allgather_run_impl(const at::Tensor& input,
   std::vector<spyre_comms::Tensor> output_tensors;
   output_tensors.reserve(group_size);
   for (int64_t i = 0; i < group_size; i++) {
-    auto* out_ctx = static_cast<spyre::SharedOwnerCtx*>(
-        rank_outputs[i].storage().data_ptr().get_context());
-    TORCH_CHECK(out_ctx != nullptr, "SharedOwnerCtx is null for output tensor ",
-                i);
     spyre_comms::Tensor out_tensor(*plan.tensor_info,
                                    rank_outputs[i].storage().data_ptr().get());
-    out_tensor.SetSpyreDeviceAddressBorrowed(&out_ctx->composite_addr);
+    out_tensor.SetSpyreDeviceAddressBorrowed(
+        get_composite_address(rank_outputs[i]));
     output_tensors.push_back(std::move(out_tensor));
   }
 

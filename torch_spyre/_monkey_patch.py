@@ -23,6 +23,62 @@ if TYPE_CHECKING:
     from torch_spyre._C import SpyreTensorLayout
 
 
+def _add_ea(src_tensor, res_tensor) -> None:
+    """Update the EA tag after an eager transfer handled by ``orig_to``.
+
+    Same-device dtype-changing casts return through ``to_dtype_d2d`` before
+    this helper is reached; their EA is propagated by the compiled graph.
+    """
+    if res_tensor.dtype == src_tensor.dtype:
+        return
+
+    import torch
+    from torch_spyre._inductor.dtype_ops import DtypeOpTable
+    from torch_spyre._inductor.constants import STAGGERED_EAS
+    from torch_spyre._inductor.pass_utils import rescale_stl_for_dtype
+
+    # Skip FakeTensor tracing contexts during torch.compile
+    if (
+        torch.compiler.is_compiling()
+        or isinstance(src_tensor, torch._subclasses.FakeTensor)
+        or isinstance(res_tensor, torch._subclasses.FakeTensor)
+    ):
+        return
+
+    from torch_spyre._C import (
+        get_spyre_tensor_layout,
+        set_spyre_tensor_layout,
+    )
+
+    # TODO EA torch.bool as it can be fp16 or fp32
+
+    try:
+        src_layout = get_spyre_tensor_layout(src_tensor)
+    except RuntimeError:
+        return
+
+    if src_layout is None:
+        return
+
+    input_ea = src_layout.element_arrangement
+    fmt = DtypeOpTable.ea_map(src_tensor.dtype, res_tensor.dtype, input_ea)
+
+    try:
+        res_layout = get_spyre_tensor_layout(res_tensor)
+    except RuntimeError:
+        return
+
+    if res_layout is None:
+        return
+
+    stl = res_layout.with_element_arrangement(fmt)
+    is_staggered_ea = fmt in STAGGERED_EAS or input_ea in STAGGERED_EAS
+    if src_tensor.dtype != torch.float32 and is_staggered_ea:
+        stl = rescale_stl_for_dtype(src_layout, res_tensor.dtype, fmt)
+
+    set_spyre_tensor_layout(res_tensor, stl)
+
+
 def _patch_tensor_for_spyre():
     import torch
 
@@ -72,37 +128,56 @@ def _patch_tensor_for_spyre():
 
     def spyre_to(self, *args, device_layout=None, **kwargs):
         if device_layout is None:
-            # Support D2H and H2D dtype casting via DCI (DataConversionInfo) in spyre_mem.cpp.
-            # For D2D data casting, split it into a D2H copy and a H2D dtype conversion.
+            # During Dynamo tracing this wrapper is an allow_in_graph leaf: keep
+            # the operation device-local so Inductor sees and lowers the dtype
+            # conversion. The host-staged path below is only for real eager
+            # tensors; introducing CPU copies while tracing would put
+            # DeviceCopy nodes into the compiled graph.
+            if (
+                torch.compiler.is_compiling()
+                or isinstance(self, torch._subclasses.FakeTensor)
+                or torch._is_functional_tensor(self)
+            ):
+                return orig_to(self, *args, **kwargs)
+
+            # Support D2H and H2D dtype casting via DCI (DataConversionInfo) in
+            # spyre_mem.cpp. Same-device casting is routed through the standalone
+            # compiled to_dtype_d2d path, whose lowering converts on device.
+            # Unsupported conversion pairs are still accepted here: the compiled
+            # lowering checks DtypeOpTable and uses to_dtype_cpu, preserving the
+            # previous host-roundtrip fallback and warning.
             _device = kwargs.get("device", None)
-            if (
-                _device is None
-                and len(args) > 0
-                and isinstance(args[0], (str, torch.device))
-            ):
-                _device = args[0]
             _dtype = kwargs.get("dtype", None)
-            if _dtype is None and len(args) > 1 and isinstance(args[1], torch.dtype):
-                _dtype = args[1]
+            if args:
+                first = args[0]
+                if isinstance(first, torch.Tensor):
+                    # ``self.to(other)`` adopts both properties from ``other``.
+                    _device = first.device
+                    _dtype = first.dtype
+                elif isinstance(first, torch.dtype):
+                    # ``self.to(dtype)`` keeps the current device.
+                    _dtype = first
+                elif isinstance(first, (str, torch.device)):
+                    _device = first
+                    if len(args) > 1 and isinstance(args[1], torch.dtype):
+                        _dtype = args[1]
+
+            target_device = self.device if _device is None else torch.device(_device)
 
             if (
-                _device is not None
+                self.device.type == DEVICE_NAME
+                and target_device.type == DEVICE_NAME
                 and _dtype is not None
-                and self.device.type == DEVICE_NAME
-                and torch.device(_device).type == DEVICE_NAME
+                and _dtype != self.dtype
             ):
-                import warnings
+                # device_layout is necessarily None in this branch (guarded at
+                # function entry), so this dtype-only op drops no layout request.
+                return torch.ops.spyre.to_dtype_d2d(self, _dtype, self.storage_offset())
 
-                warnings.warn(
-                    "D2D dtype conversion on Spyre is not directly supported. "
-                    "Using CPU as an intermediate for the cast.",
-                    stacklevel=2,
-                )
-                # Step 1: plain D2H copy (no dtype change)
-                tmp = orig_to(self, "cpu")
-                # Step 2: cast dtype via H2D
-                return orig_to(tmp, _device, dtype=_dtype)
-            return orig_to(self, *args, **kwargs)
+            res = orig_to(self, *args, **kwargs)
+            if res.device.type == DEVICE_NAME:
+                _add_ea(self, res)
+            return res
         else:
             # Check if copy kwarg is explicitly set
             copy = kwargs.get("copy")

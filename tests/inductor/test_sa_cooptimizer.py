@@ -38,6 +38,8 @@ import sys
 import unittest
 from unittest import TestCase
 
+import sympy
+
 from torch_spyre._inductor.scratchpad import utils
 from torch_spyre._inductor.scratchpad.sa_cooptimizer import (
     _MAX_STEPS,
@@ -1083,18 +1085,19 @@ class ForeignParentTest(TestCase):
 
 
 class MemoryOnlyFallbackTest(TestCase):
-    """With no live ``V.graph`` there are no per-division ``OpFeatures``, so the
-    engine falls back to the memory-only spill-traffic objective.
+    """With no ``cost_expr`` -- built by the caller from a live ``V.graph``,
+    see ``CoOptimizingAllocator._solve`` -- the engine falls back to the
+    memory-only spill-traffic objective.
 
     That is the path the whole capture-driven suite above runs on, so it has to be
-    the memory-only formula exactly rather than an approximation of it. The
-    cost-model objective is covered by ``test_cost_objective.py``.
+    the memory-only formula exactly rather than an approximation of it.
     """
 
-    def test_no_live_graph_means_no_cost_objective(self):
+    def test_no_cost_expr_means_no_score_fn(self):
         buffers = [_cdbuf("A", [], {}), _cdbuf("B", ["A"], {"A": [(1, 1)]})]
         solver = SaCoOptimizingSolver(buffers, 1 << 30, 128)
-        self.assertIsNone(solver._cost_objective)
+        solver.plan_layout_and_core_divisions()
+        self.assertIsNone(solver._score_fn)
 
     def test_fallback_scores_spilled_traffic_over_the_hbm_bandwidth(self):
         # Re-derives the objective from the returned layout, sharing nothing with
@@ -1116,3 +1119,87 @@ class MemoryOnlyFallbackTest(TestCase):
                     utils.to_fixed_us(traffic / utils.hbm_bytes_per_us()),
                     f"{case}[{gi}] cap={cap}",
                 )
+
+
+class CostExprScoringTest(TestCase):
+    """``plan_layout_and_core_divisions(cost_expr)`` compiles the caller's
+    symbolic cost expression into the per-step scorer (see
+    ``SaCoOptimizingSolver._build_score_fn``). ``cost_expr`` is built the same
+    way ``CoOptimizingAllocator._solve`` builds it: a sympy expression over
+    THESE buffers' own ``sym_is_lx``/``sym_core_divs`` -- so these tests build
+    small ones by hand rather than needing a live Inductor graph.
+    """
+
+    def test_residency_symbol_drives_the_score(self):
+        buffers = [_cdbuf("A", [], {}), _cdbuf("B", ["A"], {"A": [(0, 0)]})]
+        solver = SaCoOptimizingSolver(buffers, 1 << 30, 128)
+        cost_expr = 1000 * (1 - buffers[1].sym_is_lx)
+        solver.plan_layout_and_core_divisions(cost_expr)
+        self.assertIsNotNone(solver._score_fn)
+        self.assertEqual(
+            solver._score_fn(solver.chosen, frozenset()), utils.to_fixed_us(1.0)
+        )
+        self.assertEqual(solver._score_fn(solver.chosen, frozenset({"B"})), 0)
+
+    def test_core_division_symbol_drives_the_score(self):
+        # _div(1)/_div(2)/_div(4) (see _cdbuf) -> sym_cores 1/2/4 at menu index 0/1/2.
+        buffers = [_cdbuf("A", [], {})]
+        solver = SaCoOptimizingSolver(buffers, 1 << 30, 128)
+        cost_expr = buffers[0].sym_cores * 10
+        solver.plan_layout_and_core_divisions(cost_expr)
+        self.assertEqual(
+            solver._score_fn([0], frozenset()), utils.to_fixed_us(10 / 1000)
+        )
+        self.assertEqual(
+            solver._score_fn([2], frozenset()), utils.to_fixed_us(40 / 1000)
+        )
+
+    def test_residency_and_multiple_core_division_symbols_combine(self):
+        # A single cost_expr mixing sym_is_lx with more than one sym_core_divs
+        # entry (two output-split keys and one reduction-split key) at once --
+        # the two tests above each isolate one symbol kind.
+        buf = CoreDivisionBuffer(
+            name="A",
+            size=1024,
+            uses=[0, 1],
+            first_use_is_read=False,
+            in_place_parents=[],
+            residency_reason=None,
+            core_divisions=[
+                CoreDivision(output_splits={0: 1, 1: 1}, reduction_splits={}),
+                CoreDivision(output_splits={0: 2, 1: 1}, reduction_splits={0: 1}),
+                CoreDivision(output_splits={0: 4, 1: 2}, reduction_splits={0: 2}),
+            ],
+            parents=[],
+            cd_parent_matches={},
+            boundary=BufferType.Intermediate,
+        )
+        solver = SaCoOptimizingSolver([buf], 1 << 30, 128)
+        out_syms, red_syms = buf.sym_core_divs
+        self.assertEqual(set(out_syms), {0, 1})
+        self.assertEqual(set(red_syms), {0})
+        cost_expr = (
+            out_syms[0] * 10
+            + out_syms[1] * 100
+            + red_syms[0] * 1000
+            + 5000 * (1 - buf.sym_is_lx)
+        )
+        solver.plan_layout_and_core_divisions(cost_expr)
+        self.assertEqual(
+            solver._score_fn([2], frozenset()),
+            utils.to_fixed_us((4 * 10 + 2 * 100 + 2 * 1000 + 5000) / 1000),
+        )
+        self.assertEqual(
+            solver._score_fn([2], frozenset({"A"})),
+            utils.to_fixed_us((4 * 10 + 2 * 100 + 2 * 1000) / 1000),
+        )
+
+    def test_unrecognized_free_symbol_falls_back_to_memory_only(self):
+        # A dynamic-shape symbol (or anything else the allocator's build could
+        # have left in) that isn't one of these buffers' own symbols must not
+        # be silently ignored or crash -- it disqualifies the whole expression.
+        buffers = [_cdbuf("A", [], {})]
+        solver = SaCoOptimizingSolver(buffers, 1 << 30, 128)
+        cost_expr = sympy.Symbol("mystery_shape_var")
+        solver.plan_layout_and_core_divisions(cost_expr)
+        self.assertIsNone(solver._score_fn)
