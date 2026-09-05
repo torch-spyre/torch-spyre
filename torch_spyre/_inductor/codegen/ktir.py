@@ -1065,9 +1065,6 @@ class KernelPlan:
         self._divisors: dict = {}
         self.buffers: dict[str, Buffer] = {}
         self.steps: tuple[Step, ...] = ()
-        # Empty until ``add_specs`` fuses; a plan that was never filled conceded
-        # nothing, which is what an empty report says.
-        self.fusion_report = FusionReport()
 
     @property
     def parameters(self) -> list[Buffer]:
@@ -1090,8 +1087,7 @@ class KernelPlan:
         # theirs in different symbol namespaces, so a divided pair is
         # self-contradictory right up until the fusion deletes one of them.  The
         # result is held, so ``_steps`` walks the same vector ``_divisions`` saw.
-        specs, self.fusion_report = apply_plan_fusions(specs)
-        self.fusion_report.log()
+        specs = apply_plan_fusions(specs)
         self._symbols, self.divisions = _divisions(specs)
         self._divisors = {
             symbol: division.div
@@ -1405,9 +1401,8 @@ def build_kernel_plan(
 #
 # A SPAN is the run of CONSECUTIVE OpSpecs a pattern matched -- ``specs[i:i+n]``
 # for a pattern of n slots -- and it is the unit everything here works on: what a
-# pattern matches, what a rewrite consumes, and what the concessions are derived
-# from.  For the one entry shipped, a span is two specs, an ``abs`` and the ``max``
-# that reads it.
+# pattern matches and what a rewrite consumes.  For the one entry shipped, a span
+# is two specs, an ``abs`` and the ``max`` that reads it.
 #
 # AN ENTRY IS A PATTERN AND A RESULT NAME.  The pattern is positional op names
 # and reduction flags, a prefilter deciding which spans are considered at all;
@@ -1419,120 +1414,9 @@ def build_kernel_plan(
 #
 # THERE IS NO KTIR COST MODEL.  Without a cost function over emitted kernels
 # there is no basis on which to justify a MANDATORY fusion, so opportunistic is
-# the most that can be defended.  What the mechanism owes in exchange is an
-# accurate statement of what it knowingly left on the floor, which is
-# ``FusionReport`` -- and that report is also the only visible trace that
-# planning and emission disagree about a buffer.
+# the most that can be defended.
 
 _ABSMAX_OP = "absmax"
-
-
-class ConcessionKind(enum.Enum):
-    """Something a fusion knowingly left in a worse state than it found it.
-
-    Only the kinds that are actually emitted are defined.  A kind nothing
-    concedes is a message nobody has read, and it looks like coverage.
-    """
-
-    #: Memory planning chose a placement -- a space, an offset and a size -- for
-    #: a buffer that no longer exists, and this kernel does not carry it out.
-    #:
-    #: What is abandoned is the STRATEGY, not a reservation: this emitter issues
-    #: no device allocate for ``lx`` or the pool at all, so the byte count is
-    #: PLANNING BOOKKEEPING and not device capacity, and nothing was ever held to
-    #: reclaim.  Nor is the fusion what abandons it -- every internal buffer's
-    #: placement goes unexecuted here, fused or not.  Reported because it is the
-    #: only visible trace that planning and emission disagree about a buffer.
-    ABANDONED_STRATEGY = enum.auto()
-
-    #: A predicted-runtime report (``SPYRE_DUMP_COST``) prices an op the emitted
-    #: kernel does not contain.  The prediction is made from the pre-fusion
-    #: vector and this runs too late to correct it, so the figure is an
-    #: over-estimate by whatever the deleted op would have cost.
-    STRANDED_COST = enum.auto()
-
-
-@dataclasses.dataclass(frozen=True)
-class Concession:
-    """One concession, attributed to the buffer that identifies it.
-
-    Per BUFFER and not per fusion, because two links of one vector can have
-    different fates -- one deleted outright, one still needing an address -- and
-    a report that said only "this fusion conceded something" could not tell them
-    apart.  For ``STRANDED_COST`` the buffer is the one whose producing op went
-    away, which is what locates the op in the vector; the op's name is in
-    ``detail``.
-    """
-
-    kind: ConcessionKind
-    buf_id: str
-    detail: str
-
-
-@dataclasses.dataclass
-class FusionReport:
-    """What the fusions in ONE kernel gave up, and the logging of it.
-
-    Per kernel because the concessions are: they name this kernel's buffers, and
-    a once-per-process notice cannot say which kernel it is about.  Two channels
-    for two readers.  Each concession at ``debug``, for whoever is asking why a
-    particular buffer's reservation went unused; one summary at ``warning`` when
-    ``config.plan_fusion_warn``, because the fact that a hand-written table
-    rather than a cost model chose this kernel is something a user is entitled
-    to see without having to opt in.
-    """
-
-    concessions: list[Concession] = dataclasses.field(default_factory=list)
-
-    def concede(self, kind: ConcessionKind, buffer: str, detail: str) -> None:
-        """Record one concession.  Nothing is logged until ``log``."""
-        self.concessions.append(Concession(kind, buffer, detail))
-
-    def absorb(self, other: FusionReport) -> None:
-        """Take on a nested vector's concessions; a kernel has one report."""
-        self.concessions.extend(other.concessions)
-
-    def of(self, kind: ConcessionKind) -> tuple[Concession, ...]:
-        """Every concession of one kind, in the order they were conceded."""
-        return tuple(item for item in self.concessions if item.kind is kind)
-
-    def log(self) -> None:
-        """Emit this kernel's report.  Called once, by whoever owns the kernel."""
-        for item in self.concessions:
-            logger.debug("%s: %s", item.buf_id, item.detail)
-        if not self.concessions:
-            return
-        # Read from ``config`` rather than the environment, so this module takes
-        # no compilation decision from config and parses no variable of its own.
-        from torch_spyre._inductor import config as _spyre_config
-
-        if not _spyre_config.plan_fusion_warn:
-            return
-        tally = ", ".join(
-            f"{len(self.of(kind))} {kind.name}"
-            for kind in ConcessionKind
-            if self.of(kind)
-        )
-        # ``info`` and not ``warning``: this fires on EVERY successful fusion, and
-        # what it names costs nothing measurable -- an abandoned strategy is a
-        # placement this emitter does not carry out for any internal buffer,
-        # fused or not, so no memory is held and none is lost.  A warning on every
-        # working compile, describing nothing actionable, is how a project teaches
-        # people to ignore warnings.  Promote it if an abandoned strategy is ever
-        # measured to displace something real.
-        logger.info(
-            "A plan-time fusion rewrote this kernel's OpSpec vector, conceding: "
-            "%s. Nothing is wrong with the kernel -- these are accounting notes, "
-            "not defects: no memory is left unwritten and no runtime cost is "
-            "added. What they record is that there is no KTIR cost model, so the "
-            "rewrite came from a hand-written table rather than from a cost "
-            "comparison, and that the placements planning chose for the ops it "
-            "deleted are not carried out. Log %s at debug for the per-buffer "
-            "detail, "
-            "or set TORCH_SPYRE_PLAN_FUSION_WARN=0 to silence this.",
-            tally,
-            logger.name,
-        )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1768,8 +1652,8 @@ PLAN_FUSIONS: tuple[PlanFusion, ...] = (
 
 def apply_plan_fusions(
     specs: Sequence[Any], table: Sequence[PlanFusion] = PLAN_FUSIONS
-) -> tuple[tuple[Any, ...], FusionReport]:
-    """``specs`` with every table match collapsed, and what collapsing them cost.
+) -> tuple[Any, ...]:
+    """``specs`` with every table match collapsed.
 
     Recurses into ``LoopSpec`` bodies because ``_divisions`` reads every op at
     every depth (``_op_specs``) and this runs before it.
@@ -1781,22 +1665,15 @@ def apply_plan_fusions(
     declined to make.  Adjacency is therefore not relied on for soundness: the
     condition it used to stand in for -- one reader of the link buffer -- is
     checked directly by the rewrite.
-
-    The report is RETURNED rather than logged, because it is per kernel and this
-    function is per spec list: it calls itself for every loop body, so logging
-    here would emit one summary per nesting level.  The caller that owns the
-    kernel logs the merged one, once.
     """
     out: list[Any] = []
-    report = FusionReport()
     i = 0
     while i < len(specs):
         entry = specs[i]
         if isinstance(entry, LoopSpec):
             # ``LoopSpec.body`` is declared a list, so the rebuilt body is one:
             # this is the contract's own type and not a copy taken for safety.
-            body, nested = apply_plan_fusions(entry.body, table)
-            report.absorb(nested)
+            body = apply_plan_fusions(entry.body, table)
             out.append(dataclasses.replace(entry, body=list(body)))
             i += 1
             continue
@@ -1804,14 +1681,20 @@ def apply_plan_fusions(
             fused = _apply(fusion, specs, i)
             if fused is None:
                 continue
-            _concede(report, fusion, specs[i : i + len(fusion.pattern)], fused)
+            logger.debug(
+                "plan fusion %r collapsed op %r into %r; buffer %s ceased to exist",
+                fusion.name,
+                entry.op,
+                fused.op,
+                ", ".join(buf_id(a) for a in entry.args if not a.is_input),
+            )
             out.append(fused)
             i += len(fusion.pattern)
             break
         else:
             out.append(entry)
             i += 1
-    return tuple(out), report
+    return tuple(out)
 
 
 def _apply(fusion: PlanFusion, specs: Sequence[Any], i: int) -> OpSpec | None:
@@ -1854,83 +1737,6 @@ def _apply(fusion: PlanFusion, specs: Sequence[Any], i: int) -> OpSpec | None:
             )
             return None
     return fused
-
-
-def _nbytes(arg: TensorArg) -> int:
-    """``arg``'s device buffer size in bytes.
-
-    A loop rather than ``math.prod``, because ``math`` in this module is the MLIR
-    math dialect handle that ``_load_dialects`` rebinds through ``global math``: an
-    ``import math`` here would be silently clobbered at the first emission, and
-    ``math.prod`` would start raising ``AttributeError`` only once a dialect build
-    was in play.
-    """
-    elements = 1
-    for size in arg.device_size:
-        elements *= int(size)
-    return elements * num_bytes(arg.device_dtype)
-
-
-def _concede(
-    report: FusionReport, fusion: PlanFusion, span: Sequence[Any], fused: OpSpec
-) -> None:
-    """Record what collapsing ``span`` into ``fused`` left behind.
-
-    Derived from the RESULT rather than declared by the entry, which is what
-    makes the report a check on the rewrite instead of a restatement of it: a
-    spec's output survives exactly when the fused spec writes it, so a buffer
-    that goes unreported is one the rewrite kept, and a buffer reported here is
-    one it chose to delete.  An entry that deleted a buffer something still
-    needed would say so in its own report.
-
-    What is NOT reported, deliberately: the survivor's op name changed too, and
-    any prediction of its cost changed with it, but its output buffer survives, so
-    it raises nothing.
-    """
-    written = {buf_id(arg) for arg in fused.args if not arg.is_input}
-    # ASSUMPTION 1, asserted: the rewrite PRESERVES BUFFER IDENTITY -- a buffer it
-    # keeps keeps its name.  The deletion test below is a name lookup, so a rewrite
-    # that renamed a surviving output would have that name miss ``written`` and the
-    # buffer would be conceded while still in use.
-    span_writes = {
-        buf_id(arg) for spec in span for arg in spec.args if not arg.is_input
-    }
-    assert written <= span_writes, (
-        f"fusion {fusion.name!r} writes {sorted(written - span_writes)}, which "
-        "none of the specs it matched wrote, so the rewrite renamed an output and "
-        "the concessions below cannot be derived by name"
-    )
-    # ASSUMPTION 2, NOT asserted and not yet true of anything: ``fused`` is the
-    # span's only survivor, so asking what IT writes is asking what survives.  A
-    # rewrite that KEEPS a spec -- collapsing a producer into one consumer while a
-    # second consumer still reads it -- breaks this: that producer's output is
-    # written by a surviving spec that is not ``fused``, and it would be conceded
-    # while live.  That rewrite does not exist yet; when it does, this function
-    # takes the replacement SEQUENCE and unions over it.
-    for spec in span:
-        for arg in spec.args:
-            if arg.is_input or buf_id(arg) in written:
-                continue
-            if is_internal(arg):
-                # ``allocation`` carries exactly one of three mutually-exclusive
-                # keys (``hbm``/``lx``/``hbm_pool``), so the first names the space.
-                space = next(iter(arg.allocation or {}), "?")
-                report.concede(
-                    ConcessionKind.ABANDONED_STRATEGY,
-                    buf_id(arg),
-                    f"planning placed this buffer in {space} at {_nbytes(arg)} "
-                    f"bytes; fusion {fusion.name!r} collapsed op {spec.op!r} and "
-                    f"the buffer ceased to exist, so that placement is not "
-                    f"carried out -- and this emitter issues no device allocate "
-                    f"for it either way, so no memory was held to reclaim",
-                )
-            report.concede(
-                ConcessionKind.STRANDED_COST,
-                buf_id(arg),
-                f"a predicted-runtime report still prices op {spec.op!r}, which "
-                f"this kernel does not contain: fusion {fusion.name!r} collapsed "
-                f"it into {fused.op!r}",
-            )
 
 
 def validated_roles(spec: OpSpec) -> tuple[TensorArg, list[TensorArg]]:
