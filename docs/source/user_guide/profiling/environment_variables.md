@@ -68,6 +68,32 @@ The `torch_spyre.*` namespace is only for the `TORCH_LOGS` environment variable.
 |---|---|
 | `SENCORES=<1..32>` | Number of Spyre cores to target (default 32) |
 
+## Compile-time timing
+
+Measures how long the compiler frontend takes, per pass pipeline and per
+pass, with the graph size each pass saw. This is compile time, not runtime:
+nothing here reports how long a kernel takes on device.
+
+| Variable | Effect |
+|---|---|
+| `TORCH_SPYRE_TIMING=1` | Record structured frontend compile timings (default off) |
+| `TORCH_SPYRE_TIMING_OUT=path/rec.json` | Write the record to `path/rec.<pid>.json` at process exit. Empty keeps events in memory only |
+
+```bash
+TORCH_SPYRE_TIMING=1 TORCH_SPYRE_TIMING_OUT=/tmp/rec.json python3 my_model.py
+# -> /tmp/rec.<pid>.json
+```
+
+Each event carries `inclusive_ns` and `self_ns` (inclusive minus direct
+children), so a pipeline total and its per-pass breakdown can be read from
+one record. Event names have three shapes:
+
+| Name | Region |
+|---|---|
+| `pipeline:<PipelineClass>` | One pass pipeline, start to finish |
+| `pass:<PipelineClass>:<pass_name>` | One pass within it |
+| `stage:<PipelineClass>:<what>` | Work a pipeline does around its passes (`pass_loop`, `cost_model`, `cost_dump`, `finalize_work_division`, and the `log_before` / `log_after` IR dumps when INFO logging is on) |
+
 ## FFDC (First Failure Data Capture)
 
 | Variable | Effect |
