@@ -81,9 +81,9 @@ from .pass_utils import format_operations, finalize_work_division_for_scheduler
 from .scratchpad.allocator import (
     scratchpad_planning,
 )
+from .scratchpad.lx_relayout import anchor_lx_relayout_ownership
 from .fusion import spyre_fuse_nodes
 from .scheduler import (
-    align_lx_producer_loop_order,
     build_loop_scheduler_nodes,
     demote_incoherent_lx_buffers,
     verify_carried_reduction_ownership,
@@ -266,13 +266,9 @@ class CustomPreFusionPasses(_SpyreNodePassPipeline):
     # are visible to SuperDSCScheduling.can_fuse_vertical/horizontal (which return
     # False), so loop groups survive Inductor fusion intact.
     def __init__(self):
-        # align_lx_producer_loop_order runs before build_loop_scheduler_nodes so
-        # it still sees plain SchedulerNodes (the only kind that can reorder
-        # their loops) rather than CountedLoopSchedulerNode wrappers.
         super().__init__(
             [
                 propagate_mutation_layouts,
-                align_lx_producer_loop_order,
                 build_loop_scheduler_nodes,
             ]
         )
@@ -288,15 +284,14 @@ class CustomPostFusionPasses(_SpyreNodePassPipeline):
     """
 
     def __init__(self):
-        # demote_incoherent_lx_buffers runs first: it re-checks LX core->slice
-        # coherence now that loop orders are final, and anything it demotes must
-        # still be visible to hbm_pool_planning as an unclaimed intermediate.
-        # hbm_pool_planning runs after spyre_fuse_nodes so it can compute
-        # bundle-scoped live ranges.
+        # Fusion fixes the final loop coordinates. LX ownership preflight then
+        # dry-runs codegen's real finalization while HBM fallback is still
+        # available. HBM planning claims anything preflight demotes before the
+        # carried-reduction pass checks that its required stages still exist.
         super().__init__(
             [
-                demote_incoherent_lx_buffers,
                 spyre_fuse_nodes,
+                demote_incoherent_lx_buffers,
                 hbm_pool_planning,
                 verify_carried_reduction_ownership,
             ]
@@ -418,6 +413,11 @@ def _maybe_scratchpad_planning(graph: GraphLowering) -> None:
     scratchpad_planning(graph)
 
 
+@_runs(anchor_lx_relayout_ownership)
+def _maybe_anchor_lx_relayout_ownership(graph: GraphLowering) -> None:
+    anchor_lx_relayout_ownership(graph)
+
+
 class CustomPreSchedulingPasses:
     """
     Spyre-specific passes that run on the GraphLowering immediately before the
@@ -497,6 +497,7 @@ class CustomPreSchedulingPasses:
             # Core Division
             span_reduction,
             _distribute_work,
+            _maybe_anchor_lx_relayout_ownership,
             #
             # LX Planning
             _maybe_scratchpad_planning,

@@ -1800,7 +1800,7 @@ def test_size1_new_stick_transpose_clone_graph_input(shape, dims):
 # Symmetric mirror of SIZE1_INPUT_STICK_CROSSING, on the elided-OUTPUT side.  A
 # size-1 dim moves INTO the stick (output-elided), and the real dim moving OUT of
 # the stick is > 64, so the INTACT operand -- here the INPUT -- crosses a stick
-# boundary.  _restickify_restore_elided_dim binds the shared symbol to the
+# boundary. restore_restickify_alignment_inputs binds the shared symbol to the
 # outermost size-64 gap dim on the intact input just as the mirror does on the
 # intact output, so the input buffer needs the same grow.  _pad_restickify_input
 # supplies it by ensuring the read comes from a buffer we own -- a producer we
@@ -2444,7 +2444,7 @@ def test_restickify_broadcast_into_stick(shape, bwidth):
 # A restickify whose old stick has host size 1 collapses one operand's
 # within-stick coordinate to a constant, so that operand's STL carries the old
 # stick as a size-1 ``stride_map == -1`` singleton dim, while the restore
-# (_restickify_restore_elided_dim) rebuilds the descriptor to sweep a full
+# (restore_restickify_alignment_inputs) rebuilds the descriptor to sweep a full
 # 64-plane stick.  The grow is two coupled halves: padding._pad_elided_dim
 # prepends an outermost size-64 ``-1`` gap dim to the (intact) operand's STL so
 # the allocation covers the sweep, and the restore REUSES that dim (binds the
@@ -2547,30 +2547,42 @@ def _size1_restickify_op_spec():
 
 
 def test_size1_restore_reuses_prepended_dim():
-    from torch_spyre._inductor.spyre_kernel import _restickify_restore_elided_dim
+    from torch_spyre._inductor.pass_utils import (
+        restore_restickify_alignment_inputs,
+    )
+    from torch_spyre._inductor.views import build_alignment_inputs
 
     op_spec = _size1_restickify_op_spec()
-    out_arg = op_spec.args[1]
-
-    _restickify_restore_elided_dim(op_spec)
+    inputs = build_alignment_inputs(
+        op_spec.iteration_space,
+        [
+            {"size": arg.device_size, "coordinates": arg.device_coordinates}
+            for arg in op_spec.args
+        ],
+    )
+    restored = restore_restickify_alignment_inputs(inputs, _SIZE1_STICK)
+    out_tensor = restored.tensors[1]
 
     # The outermost size-64 dim is REUSED: the restore binds its shared symbol to
     # the existing dim rather than inserting a second one, so the intact operand
     # still has exactly ONE outermost size-64 dim (no 64x double count).
-    assert list(out_arg.device_size) == [64, 67, 1, 64]
-    assert out_arg.device_size.count(64) == 2  # gap dim + within-stick dim
+    assert out_tensor["size"] == [64, 67, 1, 64]
+    assert out_tensor["size"].count(64) == 2  # gap dim + within-stick dim
     # The shared symbol (rs*) now drives that outermost dim ...
-    outer_syms = tuple(out_arg.device_coordinates[0].free_symbols)
+    outer_syms = tuple(out_tensor["coordinates"][0].free_symbols)
     assert len(outer_syms) == 1
     shared = outer_syms[0]
     assert shared.name.startswith("rs")
     # ... and it iterates with range 1, so it contributes no real stride: the
     # size-64 device slot is pure back-gap padding, not a 64-plane sweep.
-    assert op_spec.iteration_space[shared] == (_SIZE1_STICK, 1)
+    assert restored.iteration_space[shared] == (_SIZE1_STICK, 1)
 
 
 def test_size1_restore_asserts_when_phantom_absent():
-    from torch_spyre._inductor.spyre_kernel import _restickify_restore_elided_dim
+    from torch_spyre._inductor.pass_utils import (
+        restore_restickify_alignment_inputs,
+    )
+    from torch_spyre._inductor.views import build_alignment_inputs
 
     # If the padding grow did not run, the intact operand has no prepended
     # size-64 gap dim; the restore must hard-assert rather than silently insert a
@@ -2581,8 +2593,15 @@ def test_size1_restore_asserts_when_phantom_absent():
     out_arg.device_size = [67, 1, 64]
     out_arg.device_coordinates = out_arg.device_coordinates[1:]
 
-    with pytest.raises(AssertionError, match="padding-prepended"):
-        _restickify_restore_elided_dim(op_spec)
+    inputs = build_alignment_inputs(
+        op_spec.iteration_space,
+        [
+            {"size": arg.device_size, "coordinates": arg.device_coordinates}
+            for arg in op_spec.args
+        ],
+    )
+    with pytest.raises(ValueError, match="padding-prepended"):
+        restore_restickify_alignment_inputs(inputs, _SIZE1_STICK)
 
 
 def test_round_up_to_stick_geometry():

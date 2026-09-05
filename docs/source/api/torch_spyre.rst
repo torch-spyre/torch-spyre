@@ -674,6 +674,9 @@ Environment Variables
    * - ``LX_PLANNING``
      - Enable LX scratchpad planning (default ``1``; set ``0`` to skip the
        ``scratchpad_planning`` pass)
+   * - ``SPYRE_LX_PLANNER_RELAYOUT``
+     - Enable planned LX-to-LX gather and broadcast copies (default ``1``;
+       set ``0`` to keep the source and its consumers on the existing path)
    * - ``CO_OPTIMIZING_LX_PLANNING``
      - Use the co-optimizing LX allocator strategy (default ``0``)
    * - ``HBM_POOL_PLANNING``
@@ -688,6 +691,16 @@ Environment Variables
      - Permute physical core IDs at SDSC emission so K-collaborator cores
        sit on adjacent ring positions, reducing PSUM chain hops (default
        ``1``)
+   * - ``SPYRE_LX_FUSED_SPLIT_VIEWS``
+     - Experimental: allow the LX ownership proof to express one loop split
+       across several physical tensor dimensions (default ``0``). Unsupported
+       or ambiguous ownership remains in HBM.
+   * - ``SPYRE_LX_CONSUMER_ANCHORED_ORDERING``
+     - Experimental: change a producer's core order only when one unique order
+       makes its complete relayout group valid (default ``0``).
+   * - ``SPYRE_LX_RESTICKIFY_RESIDENCY``
+     - Experimental: keep a restickify input in LX only when exact ownership
+       proves that every read stays on the same core (default ``0``).
    * - ``BUNDLE_SYMBOLIC_ARGS``
      - Emit LPDDR5 tensor addresses as runtime symbols rather than baked
        integers (default ``1``)

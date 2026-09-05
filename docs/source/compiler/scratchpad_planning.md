@@ -339,6 +339,7 @@ The checks, in evaluation order (the first failure is the reason reported):
 | `mutation target` | filled by offset writes, so one LX base mis-addresses it |
 | `tiled (advancing)` | LX addresses cannot be `affine.apply` symbols; the advancing-tile check reads `loop_info` (the sole source of truth for per-tile geometry) |
 | `read by restickify (cross-frame barrier)` | the read and write frames are transposes, so a per-core LX slice is not self-sufficient (the buffer a restickify reads; its own output is safe and is not barred) |
+| `read by restickify (local-read proof failed)` | `SPYRE_LX_RESTICKIFY_RESIDENCY=1` was set, but exact physical ownership could not prove that every restickify read stays on the same core |
 | `extern kernel user` | extern ops read from HBM |
 | `index tensor or indirectly accessed` | index tensors and the value tensors they index into are read via data-dependent addressing, so they must stay in HBM |
 | `graph output (no clone)` / `graph input (no clone)` | without boundary cloning there is nothing to redirect |
