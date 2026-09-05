@@ -118,9 +118,14 @@ class SpyreAsyncCompile(AsyncCompile):
             )
             return SpyreUnimplementedRunner(kernel_name, unimp.op)
 
-        # Generate SDSC Bundle from OpSpecs
+        # Generate SDSC Bundle from OpSpecs.
+        # Capture the returned symbol order — one SymbolKind per unique kernel
+        # tensor arg sorted by arg_index — and pass it to the runner so it owns
+        # the canonical inputSym_ order at runtime.
         output_dir = get_output_dir(kernel_name)
-        generate_bundle(kernel_name, output_dir, specs, pool_size=pool_size)
+        symbol_kinds = generate_bundle(
+            kernel_name, output_dir, specs, pool_size=pool_size
+        )
 
         self._provenance_attempt_count += 1
         try:
@@ -166,6 +171,7 @@ class SpyreAsyncCompile(AsyncCompile):
             kernel_name,
             output_dir,
             kernel_provenance=kernel_provenance,
+            symbol_kinds=symbol_kinds,
         )
 
     def ktir(
