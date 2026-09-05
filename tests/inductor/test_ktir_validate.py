@@ -32,11 +32,13 @@ import importlib
 import inspect
 import sys
 import unittest
+from unittest import mock
 
 import regex as re
 import sympy
 
 from torch_spyre._C import DataFormats, ElementArrangement
+from torch_spyre._inductor import config as spyre_config
 from torch_spyre._inductor.codegen import ktir
 from torch_spyre._inductor.constants import STAGGERED_EAS
 from torch_spyre._inductor.op_spec import LoopSpec, OpSpec, TensorArg, UnimplementedOp
@@ -254,6 +256,119 @@ def make_onstick_sum_specs() -> list:
             space={rows: (256, 1), reduced: (128, 1)},
         )
     ]
+
+
+def make_linked_op_specs(
+    ops: tuple = ("abs", "max"),
+    *,
+    reductions: tuple = (False, True),
+    edges: tuple = ((0, 1),),
+    dangling: tuple = (),
+    prefixes: tuple | None = None,
+    link: dict | None = None,
+    links: dict | None = None,
+    out_sizes: dict | None = None,
+    out_coords: dict | None = None,
+    in_sizes: dict | None = None,
+    onstick: bool = False,
+    chunks: int | None = None,
+    rows: int = 256,
+    lanes: int = 64,
+    dtype: DataFormats = FP16,
+    row_division: int = 1,
+) -> list:
+    """A kernel's OpSpec vector described TOPOLOGICALLY: stages and their links."""
+    if len(ops) != len(reductions):
+        raise ValueError("make_linked_op_specs: one reduction flag per op")
+    prefixes = prefixes or tuple(chr(ord("d") + index) for index in range(len(ops)))
+    link = link or ({"lx": 0x1000} if onstick else {"hbm_pool": 0x2000})
+    links, out_sizes, out_coords, in_sizes = (
+        links or {},
+        out_sizes or {},
+        out_coords or {},
+        in_sizes or {},
+    )
+    chunks = (2 if onstick else 64) if chunks is None else chunks
+    full_size = [chunks, rows, lanes]
+    reduced_size = [1, rows, lanes]
+
+    def geometry(prefix: str) -> tuple[list, list, dict]:
+        """One stage's coordinates for a full and a reduced buffer, and its space."""
+        s0, s1, s2 = sympy.symbols(f"{prefix}0:3")
+        if onstick:
+            full = [sympy.floor(s1 / lanes), s0, sympy.Mod(s1, lanes)]
+            reduced = [sympy.Integer(0), s0, sympy.Integer(0)]
+            space = {s0: (rows, row_division), s1: (chunks * lanes, 1)}
+        else:
+            full = [s0, s1, s2]
+            reduced = [sympy.Integer(0), s1, s2]
+            space = {s0: (chunks, 1), s1: (rows, row_division), s2: (lanes, 1)}
+        return full, reduced, space
+
+    specs: list = []
+    next_arg = 0
+    for index, op in enumerate(ops):
+        full, reduced, space = geometry(prefixes[index])
+        incoming = [producer for producer, consumer in edges if consumer == index]
+        outgoing = index in dangling or any(producer == index for producer, _ in edges)
+        if incoming:
+            names = [f"t{producer}" for producer in incoming]
+            allocations = [dict(links.get(producer, link)) for producer in incoming]
+            # A read is described at the extent its producer wrote, in the
+            # READER's symbols: whose description is kept is the fuser's problem,
+            # so the fixture must not make the two accidentally identical.
+            sizes = [
+                in_sizes.get(index)
+                or (reduced_size if reductions[producer] else full_size)
+                for producer in incoming
+            ]
+            coords = [
+                reduced if reductions[producer] else full for producer in incoming
+            ]
+        else:
+            names, allocations = [f"x{index}"], [None]
+            sizes, coords = [in_sizes.get(index) or full_size], [full]
+        reduction = reductions[index]
+        # A reduction folds axis 0 away; a pointwise stage is the IDENTITY on its
+        # first operand, which is what makes it access-preserving and is why the
+        # result follows that operand rather than the stage's nominal extent.
+        result_size = reduced_size if reduction else sizes[0]
+        result_coords = reduced if reduction else coords[0]
+        spec = make_op_spec(
+            op,
+            inputs=len(names),
+            is_reduction=reduction,
+            names=[*names, f"t{index}" if outgoing else f"out{index}"],
+            sizes=[*sizes, out_sizes.get(index) or result_size],
+            coords_per_arg=[*coords, out_coords.get(index) or result_coords],
+            allocations=[
+                *allocations,
+                dict(links.get(index, link)) if outgoing else None,
+            ],
+            dtype=dtype,
+            space=space,
+            first_arg_index=next_arg,
+        )
+        specs.append(spec)
+        next_arg += sum(1 for arg in spec.args if arg.arg_index >= 0)
+    return specs
+
+
+def make_absmax_pair(**overrides) -> list:
+    """``amax(abs(x), ...)``: shape A, and the only fixture that names the entry."""
+    return make_linked_op_specs(ops=("abs", "max"), **overrides)
+
+
+def make_plan_fusion(**overrides) -> ktir.PlanFusion:
+    """A table entry defined by the test, defaulting to a two-slot collapse."""
+    entry = {
+        "name": "probe",
+        "pattern": (("abs", False), ("max", True)),
+        "result_op": "fused",
+        "why": "a probe entry, defined by the test that uses it",
+    }
+    entry.update(overrides)
+    return ktir.PlanFusion(**entry)  # type: ignore[arg-type]
 
 
 class TestValidateRejections(unittest.TestCase):
@@ -1153,7 +1268,11 @@ class TestLoopDerivations(unittest.TestCase):
         a, c = spec.args
 
         a_layout, a_q = ktir._solve_layout(a, levels)
-        a_access = ktir._access(a, a.device_size, a_q, a_layout)
+        # ``elems`` is the CALLER's answer: which element type an access reads a
+        # buffer at is the op's business (``Recipe.unfused``), not the arg's.
+        a_access = ktir._access(
+            a, a.device_size, a_q, a_layout, ktir.ElemTypes.of(a.device_dtype)
+        )
         # The tile extent is device_size, which is what tiling already baked in.
         self.assertEqual(a_access.extent, (1, 1, 64))
         # Per view dim, the step each level takes: dim 0 <- n_stick, dim 1 <- m,
@@ -1161,7 +1280,9 @@ class TestLoopDerivations(unittest.TestCase):
         self.assertEqual(a_access.index_coeffs, ((1, 0), (0, 1), (0, 0)))
 
         c_layout, c_q = ktir._solve_layout(c, levels)
-        c_access = ktir._access(c, c.device_size, c_q, c_layout)
+        c_access = ktir._access(
+            c, c.device_size, c_q, c_layout, ktir.ElemTypes.of(c.device_dtype)
+        )
         self.assertEqual(c_access.extent, (1, 64))
         self.assertEqual(c_access.index_coeffs, ((1, 0), (0, 0)))
 
@@ -1171,7 +1292,9 @@ class TestLoopDerivations(unittest.TestCase):
         layout, q = ktir._solve_layout(arg, [])
         self.assertEqual(layout.extent, (16, 512, 64))
         self.assertEqual(q, [])
-        access = ktir._access(arg, arg.device_size, q, layout)
+        access = ktir._access(
+            arg, arg.device_size, q, layout, ktir.ElemTypes.of(arg.device_dtype)
+        )
         # One empty sum per dim: every index expression is zero.
         self.assertEqual(access.index_coeffs, ((), (), ()))
 
@@ -1187,6 +1310,503 @@ class TestLoopDerivations(unittest.TestCase):
         self.assertIn("not a whole number of steps", str(ctx.exception))
 
 
+_TABLE_DEFAULT = object()
+
+
+def fuse(specs, table=_TABLE_DEFAULT) -> tuple:
+    """The rewritten vector, dropping the report."""
+    return _fuse(specs, table)[0]
+
+
+def fuse_report(specs, table=_TABLE_DEFAULT) -> ktir.FusionReport:
+    """The report, dropping the vector."""
+    return _fuse(specs, table)[1]
+
+
+def _fuse(specs, table):
+    """``apply_plan_fusions``, with the shipped table left as the default."""
+    if table is _TABLE_DEFAULT:
+        return ktir.apply_plan_fusions(specs)
+    return ktir.apply_plan_fusions(specs, table)
+
+
+def _symbols_of(spec) -> set:
+    """Every free symbol in ``spec``'s operands' device coordinates."""
+    return {
+        symbol
+        for arg in spec.args
+        for coordinate in arg.device_coordinates
+        for symbol in getattr(coordinate, "free_symbols", ())
+    }
+
+
+class FusionCase(unittest.TestCase):
+    """Base for the plan-fusion tests: the per-kernel summary is pinned off."""
+
+    def setUp(self):
+        patch = mock.patch.object(spyre_config, "plan_fusion_warn", False)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def assertDeclined(self, specs, table=_TABLE_DEFAULT, reason=None):
+        """``specs`` came back unfused, in order, with nothing raised."""
+        if reason is not None:
+            with self.assertLogs(ktir.logger, level="DEBUG") as captured:
+                vector, report = _fuse(specs, table)
+            declines = [
+                record.getMessage()
+                for record in captured.records
+                if "declines" in record.getMessage()
+            ]
+            self.assertTrue(any(reason in message for message in declines), declines)
+        else:
+            vector, report = _fuse(specs, table)
+        self.assertEqual([spec.op for spec in vector], [spec.op for spec in specs])
+        self.assertEqual(report.concessions, [])
+        return vector
+
+
+class TestPlanFusionRewrite(FusionCase):
+    """Recognition and rewrite: what replaces a span the table names."""
+
+    def test_a_two_stage_span_the_table_names_becomes_one_stage(self):
+        """DECISION: recognise the span positionally and replace the whole of it."""
+        vector = fuse(make_absmax_pair())
+        self.assertEqual([spec.op for spec in vector], ["absmax"])
+        self.assertTrue(vector[0].is_reduction)
+        self.assertIn("absmax", ktir.KtirBuilder.RECIPES)
+
+    def test_the_fused_spec_keeps_the_survivors_access_and_the_sources_identity(self):
+        """DECISION: splice buffer IDENTITY across, never access geometry."""
+        pair = make_absmax_pair(in_sizes={1: [32, 256, 64]})
+        producer_in, producer_out = pair[0].args
+        survivor_read, survivor_out = pair[1].args
+
+        [fused] = fuse(pair)
+        read, out = fused.args
+
+        # Identity: the producer's own source, so the link is gone entirely.
+        self.assertEqual(read.name, producer_in.name)
+        self.assertEqual(read.arg_index, producer_in.arg_index)
+        self.assertEqual(read.allocation, producer_in.allocation)
+        self.assertEqual(read.device_dtype, producer_in.device_dtype)
+        self.assertNotEqual(read.name, producer_out.name)
+
+        # Access: the survivor's own, in the survivor's namespace and not the
+        # producer's.
+        self.assertEqual(read.device_size, survivor_read.device_size)
+        self.assertNotEqual(read.device_size, producer_in.device_size)
+        self.assertEqual(read.device_coordinates, survivor_read.device_coordinates)
+        self.assertEqual(out.device_coordinates, survivor_out.device_coordinates)
+        survivor_prefix = str(next(iter(pair[1].iteration_space)))[0]
+        symbols = {
+            str(symbol)
+            for coordinate in read.device_coordinates
+            for symbol in coordinate.free_symbols
+        }
+        self.assertTrue(symbols)
+        self.assertTrue(all(s.startswith(survivor_prefix) for s in symbols), symbols)
+        # And the survivor's iteration space, which is what ``_divisions`` reads.
+        self.assertEqual(fused.iteration_space, pair[1].iteration_space)
+
+    def test_the_pattern_matches_on_the_reduction_flag_as_well_as_the_name(self):
+        """DECISION: a pattern slot is ``(op name, is_reduction)``, not a name."""
+        elementwise = make_linked_op_specs(reductions=(False, False))
+        self.assertDeclined(elementwise)
+        self.assertEqual([spec.op for spec in fuse(make_linked_op_specs())], ["absmax"])
+
+    def test_the_stages_around_a_collapsed_span_survive(self):
+        """DECISION: a match rewrites its own span and nothing around it."""
+        before, after = make_op_spec("add"), make_op_spec("mul")
+        vector = fuse([before, *make_absmax_pair(), after])
+        self.assertEqual([spec.op for spec in vector], ["add", "absmax", "mul"])
+        self.assertIs(vector[0], before)
+        self.assertIs(vector[2], after)
+
+
+class TestPlanFusionDeclines(FusionCase):
+    """Every condition the rewrite checks, and the vector it hands back."""
+
+    def test_a_producer_the_pattern_does_not_name_is_left_alone(self):
+        """DECISION: decline anything the table does not recognise; never guess."""
+        self.assertDeclined(make_linked_op_specs(ops=("exp", "max")))
+
+    def test_a_stage_between_the_two_is_not_a_match(self):
+        """DECISION: match positionally over the vector's own step order."""
+        producer, consumer = make_absmax_pair()
+        self.assertDeclined([producer, make_op_spec("add"), consumer])
+
+    def test_stages_with_no_link_between_them_are_not_a_match(self):
+        """DECISION: the shapes matching is not enough; the dataflow must be there."""
+        self.assertDeclined(
+            make_linked_op_specs(edges=(), dangling=(0,)),
+            reason="read 0 time(s)",
+        )
+
+    def test_a_link_the_kernel_does_not_own_is_not_deleted(self):
+        """DECISION: only a buffer memory planning placed may be deleted."""
+        self.assertDeclined(
+            make_absmax_pair(link={"hbm": None}),
+            reason="not a buffer this kernel owns",
+        )
+
+    def test_a_producer_that_resizes_is_not_access_preserving(self):
+        """DECISION: the deleted producer's input and output must be the same shape."""
+        self.assertDeclined(
+            make_absmax_pair(out_sizes={0: [32, 256, 64]}),
+            reason="not access-preserving",
+        )
+
+    def test_a_producer_that_moves_elements_is_not_access_preserving(self):
+        """DECISION: same condition, in the spelling an extent check cannot see."""
+        d0, d1, d2 = sympy.symbols("d0 d1 d2")
+        self.assertDeclined(
+            make_absmax_pair(out_coords={0: [d1, d0, d2]}),
+            reason="not access-preserving",
+        )
+
+    def test_a_link_with_two_readers_is_not_deleted(self):
+        """DECISION: the link must be read exactly once, by the survivor."""
+        vector = self.assertDeclined(
+            make_linked_op_specs(
+                ops=("abs", "max", "sum", "add"),
+                reductions=(False, True, True, False),
+                edges=((0, 1), (0, 2), (1, 3), (2, 3)),
+            ),
+            reason="read 2 time(s)",
+        )
+        self.assertEqual([spec.op for spec in vector], ["abs", "max", "sum", "add"])
+
+    def test_the_viability_predicate_declines_fp32_on_stick_and_not_fp16(self):
+        """DECISION: decline a form the device computes INCORRECTLY."""
+        fp16 = make_absmax_pair(onstick=True)
+        fp32 = make_absmax_pair(onstick=True, dtype=DataFormats.IEEE_FP32, lanes=32)
+        for pair in (fp16, fp32):
+            self.assertIs(ktir._reduction_surface(pair[1]), ktir.Surface.GENERIC)
+
+        self.assertDeclined(fp32, reason="is not viable on this operand")
+        self.assertEqual([spec.op for spec in fuse(fp16)], ["absmax"])
+
+    def test_a_viability_predicate_that_cannot_decide_declines(self):
+        """DECISION: an undecidable viability question declines, it does not raise."""
+
+        def undecidable(fused):
+            raise NotImplementedError("no surface for this shape")
+
+        cases = {
+            "answers no": (lambda fused: False, "is not viable on this operand"),
+            "cannot answer": (undecidable, "no surface for this shape"),
+        }
+        for label, (viable, reason) in cases.items():
+            with self.subTest(viable=label):
+                entry = make_plan_fusion(viable=viable)
+                self.assertDeclined(make_linked_op_specs(), (entry,), reason=reason)
+
+
+class TestFusionReport(FusionCase):
+    """What a successful fusion says it gave up."""
+
+    def setUp(self):
+        super().setUp()
+        self._warn = mock.patch.object(spyre_config, "plan_fusion_warn", True)
+        self._warn.start()
+        self.addCleanup(self._warn.stop)
+
+    def test_shape_a_concedes_one_strategy_and_one_price(self):
+        """DECISION: name the buffer, the space and the exact byte count."""
+        cases = {
+            # Off-stick: the link is [64, 256, 64] fp16 in the HBM pool.
+            "hbm_pool": (make_absmax_pair(), 64 * 256 * 64 * 2),
+            # On-stick: [2, 256, 64] fp16, small enough for the scratchpad.
+            "lx": (make_absmax_pair(onstick=True), 2 * 256 * 64 * 2),
+        }
+        for space, (pair, nbytes) in cases.items():
+            with self.subTest(space=space):
+                link = pair[0].args[-1].name
+                report = fuse_report(pair)
+                self.assertEqual(
+                    [(item.kind, item.buf_id) for item in report.concessions],
+                    [
+                        (ktir.ConcessionKind.ABANDONED_STRATEGY, link),
+                        (ktir.ConcessionKind.STRANDED_COST, link),
+                    ],
+                )
+                [strategy] = report.of(ktir.ConcessionKind.ABANDONED_STRATEGY)
+                self.assertIn(f"in {space} at {nbytes} bytes", strategy.detail)
+                self.assertIn("no memory was held to reclaim", strategy.detail)
+                [price] = report.of(ktir.ConcessionKind.STRANDED_COST)
+                self.assertIn(repr(pair[0].op), price.detail)
+        self.assertEqual(cases["hbm_pool"][1], 2097152)
+        self.assertEqual(cases["lx"][1], 65536)
+
+    def test_only_the_buffer_the_rewrite_deleted_is_conceded(self):
+        """DECISION: derive the concessions from the RESULT, per buffer."""
+        pair = make_absmax_pair()
+        pair[1].args[-1].allocation = {"lx": 0x3000}
+        report = fuse_report(pair)
+        self.assertEqual({item.buf_id for item in report.concessions}, {"t0"})
+
+    def test_a_vector_with_two_links_concedes_only_the_one_it_collapsed(self):
+        """Shape C: three stages whose two links have different fates."""
+        specs = make_linked_op_specs(
+            ops=("exp", "abs", "max"),
+            reductions=(False, False, True),
+            edges=((0, 1), (1, 2)),
+        )
+        vector, report = _fuse(specs, _TABLE_DEFAULT)
+        self.assertEqual([spec.op for spec in vector], ["exp", "absmax"])
+        self.assertEqual({item.buf_id for item in report.concessions}, {"t1"})
+
+    def test_a_kernel_no_fusion_touched_concedes_nothing_and_says_nothing(self):
+        """DECISION: the report is empty when nothing was rewritten, and silent."""
+        report = fuse_report(make_chained_op_specs(("add", "mul")))
+        self.assertEqual(report.concessions, [])
+        with self.assertNoLogs(ktir.logger, level="DEBUG"):
+            report.log()
+
+    def test_a_concession_from_inside_a_loop_body_reaches_the_kernels_report(self):
+        """DECISION: one report per kernel, merged across nesting levels."""
+        nest = LoopSpec(count=4, body=[LoopSpec(count=8, body=make_absmax_pair())])
+        report = fuse_report([nest])
+        self.assertEqual({item.buf_id for item in report.concessions}, {"t0"})
+
+    def test_each_concession_is_at_debug_and_one_summary_is_at_info(self):
+        """DECISION: two channels, and the summary is INFO, not WARNING."""
+        report = fuse_report(make_absmax_pair())
+        with self.assertLogs(ktir.logger, level="DEBUG") as captured:
+            report.log()
+        messages = [record.getMessage() for record in captured.records]
+        details = [record for record in captured.records if record.levelname == "DEBUG"]
+        summaries = [
+            record for record in captured.records if record.levelname == "INFO"
+        ]
+        self.assertEqual(len(details), len(report.concessions))
+        self.assertEqual(len(summaries), 1)
+        summary = summaries[0].getMessage()
+        self.assertIn("ABANDONED_STRATEGY", summary)
+        self.assertIn("STRANDED_COST", summary)
+        self.assertIn("TORCH_SPYRE_PLAN_FUSION_WARN=0", summary)
+        self.assertIn("Nothing is wrong with the kernel", summary)
+        for blame in ("error", "invalid", "failed", "corrupt"):
+            self.assertNotIn(blame, summary.lower(), messages)
+
+    def test_the_summary_is_suppressed_by_config_and_the_detail_is_not(self):
+        """DECISION: the flag silences the summary only, and changes no emission."""
+        report = fuse_report(make_absmax_pair())
+        with mock.patch.object(spyre_config, "plan_fusion_warn", False):
+            with self.assertNoLogs(ktir.logger, level="WARNING"):
+                with self.assertLogs(ktir.logger, level="DEBUG") as captured:
+                    report.log()
+        self.assertEqual(len(captured.records), len(report.concessions))
+        self.assertEqual([spec.op for spec in fuse(make_absmax_pair())], ["absmax"])
+
+    def test_the_plan_owns_the_report_for_its_own_kernel(self):
+        """DECISION: the plan holds the report and logs it, once."""
+        # Captured rather than allowed to escape, which also asserts the plan
+        # logs the report exactly once: it is the only caller that may.
+        with self.assertLogs(ktir.logger, level="INFO") as captured:
+            plan = ktir.build_kernel_plan(make_absmax_pair())
+        self.assertEqual(len(captured.records), 1)
+        self.assertEqual(
+            {item.buf_id for item in plan.fusion_report.concessions}, {"t0"}
+        )
+        self.assertEqual(ktir.KernelPlan().fusion_report.concessions, [])
+
+
+class TestPlanFusionStructure(FusionCase):
+    """Where the fuser runs from, which is not observable anywhere else."""
+
+    def test_a_span_inside_a_loop_body_is_fused(self):
+        """DECISION: recurse into loop bodies."""
+        nest = LoopSpec(count=4, body=[LoopSpec(count=8, body=make_absmax_pair())])
+        [result] = fuse([nest])
+        self.assertEqual([spec.op for spec in result.body[0].body], ["absmax"])
+        # The rebuilt bodies are lists, which is what ``LoopSpec.body`` declares.
+        self.assertIsInstance(result.body, list)
+        self.assertIsInstance(result.body[0].body, list)
+
+    def test_a_divided_pair_plans_because_fusion_precedes_the_grid(self):
+        """DECISION: fuse on the first line of ``add_specs``, before the grid."""
+        pair = make_absmax_pair(row_division=32)
+        with self.assertRaises(NotImplementedError) as ctx:
+            ktir._divisions(pair)
+        self.assertIn("different work divisions", str(ctx.exception))
+
+        plan = ktir.build_kernel_plan(pair)
+        self.assertEqual(plan.grid, (32,))
+        self.assertEqual(plan.divisions, (ktir.Division(symbol="e1", div=32, inner=1),))
+        self.assertEqual([step.op for step in plan.steps], ["absmax"])
+
+
+class TestFusionDriver(FusionCase):
+    """The driver, asked about entries the shipped table does not contain."""
+
+    def test_a_pattern_longer_than_the_vectors_tail_is_not_a_match(self):
+        """DECISION: the span length is READ from the pattern, not assumed."""
+        specs = make_linked_op_specs(
+            ops=("exp", "abs", "max"),
+            reductions=(False, False, True),
+            edges=((0, 1), (1, 2)),
+        )
+        entry = make_plan_fusion(pattern=(("abs", False), ("max", True), ("max", True)))
+        self.assertDeclined(specs, (entry,))
+
+    def test_a_rewrite_that_declines_leaves_the_vector_untouched(self):
+        """DECISION: a rewrite returning None is a decline, not an error."""
+        entry = make_plan_fusion()
+        self.assertDeclined(
+            make_linked_op_specs(edges=(), dangling=(0,)),
+            (entry,),
+            reason="read 0 time(s)",
+        )
+
+    def test_the_driver_asks_no_recipe_about_the_fused_op(self):
+        """DECISION: the fused op need not be emittable for the table to produce it."""
+        self.assertNotIn("fused", ktir.KtirBuilder.RECIPES)
+        [fused] = fuse(make_linked_op_specs(), (make_plan_fusion(),))
+        self.assertEqual(fused.op, "fused")
+
+    def test_each_vector_is_rewritten_by_its_own_entry(self):
+        """DECISION: the pattern selects the entry; the table is a set of them."""
+        table = (
+            make_plan_fusion(name="negmax", pattern=(("neg", False), ("max", True))),
+            make_plan_fusion(name="absmax", result_op="fused_abs"),
+        )
+        for producer, expected in (("abs", "fused_abs"), ("neg", "fused")):
+            with self.subTest(producer=producer):
+                specs = make_linked_op_specs(ops=(producer, "max"))
+                self.assertEqual([s.op for s in fuse(specs, table)], [expected])
+
+    def test_the_first_matching_entry_in_table_order_wins(self):
+        """DECISION: overlapping entries are resolved by position, not specificity."""
+        first = make_plan_fusion(name="first", result_op="fused_first")
+        second = make_plan_fusion(name="second", result_op="fused_second")
+        for table, expected in (
+            ((first, second), "fused_first"),
+            ((second, first), "fused_second"),
+        ):
+            with self.subTest(first=table[0].name):
+                vector = fuse(make_linked_op_specs(), table)
+                self.assertEqual([spec.op for spec in vector], [expected])
+
+    def test_every_shipped_entry_is_well_formed(self):
+        """DECISION: nothing validates a table entry any more."""
+        self.assertTrue(ktir.PLAN_FUSIONS)
+        for entry in ktir.PLAN_FUSIONS:
+            with self.subTest(entry=entry.name):
+                self.assertTrue(entry.pattern)
+                self.assertTrue(entry.result_op)
+                self.assertTrue(entry.why)
+        with self.assertRaises(AssertionError) as ctx:
+            fuse(make_linked_op_specs(), (make_plan_fusion(pattern=()),))
+        self.assertIn("empty pattern", str(ctx.exception))
+
+
+class TestFusionInvariants(FusionCase):
+    """Properties holding for every table and every vector, over several of each."""
+
+    def _vectors(self):
+        """No match, a match, a match among other stages, nested, and one stage."""
+        return {
+            "no match": make_chained_op_specs(("add", "mul", "sub")),
+            "one match": make_linked_op_specs(),
+            "match in context": [
+                make_op_spec("add"),
+                *make_linked_op_specs(),
+                make_op_spec("mul"),
+            ],
+            "match in a loop": [LoopSpec(count=4, body=make_linked_op_specs())],
+            "single op": [make_op_spec("add")],
+        }
+
+    def _tables(self):
+        """A spread of tables, including the empty one and the shipped one."""
+        return {
+            "empty": (),
+            "probe": (make_plan_fusion(),),
+            "two entries": (
+                make_plan_fusion(name="other", pattern=(("neg", False), ("max", True))),
+                make_plan_fusion(),
+            ),
+            "shipped": ktir.PLAN_FUSIONS,
+        }
+
+    def test_the_vector_never_grows_and_unmatched_entries_keep_their_identity(self):
+        """A fuser may shorten a vector and rewrite its own span; nothing else."""
+        for table_name, table in self._tables().items():
+            for vector_name, specs in self._vectors().items():
+                with self.subTest(table=table_name, vector=vector_name):
+                    before = list(specs)
+                    vector = fuse(specs, table)
+                    self.assertLessEqual(len(vector), len(before))
+                    self.assertEqual(list(specs), before, "input list mutated")
+                    survivors = [
+                        entry for entry in vector if any(entry is x for x in before)
+                    ]
+                    positions = [
+                        next(i for i, x in enumerate(before) if x is entry)
+                        for entry in survivors
+                    ]
+                    self.assertEqual(positions, sorted(positions))
+
+    def test_a_vector_no_entry_matches_is_returned_unchanged(self):
+        """The overwhelmingly common case, and the one with no test per table:"""
+        for table_name, table in self._tables().items():
+            with self.subTest(table=table_name):
+                specs = make_chained_op_specs(("add", "mul", "sub"))
+                vector = fuse(specs, table)
+                self.assertEqual(len(vector), len(specs))
+                for original, returned in zip(specs, vector, strict=True):
+                    self.assertIs(original, returned)
+
+    def test_no_rewrite_names_a_symbol_its_survivor_did_not(self):
+        """The invariant a fused spec has to satisfy, over several vectors."""
+        cases = {
+            "shipped entry": (make_absmax_pair(), ktir.PLAN_FUSIONS[0]),
+            "one namespace throughout": (
+                make_linked_op_specs(prefixes=("d", "d")),
+                ktir.PLAN_FUSIONS[0],
+            ),
+            "probe": (make_linked_op_specs(), make_plan_fusion()),
+        }
+        for name, (specs, entry) in cases.items():
+            with self.subTest(case=name):
+                survivor = specs[len(entry.pattern) - 1]
+                allowed = _symbols_of(survivor) | set(survivor.iteration_space)
+                [fused] = fuse(specs, (entry,))
+                self.assertTrue(_symbols_of(fused))
+                self.assertLessEqual(_symbols_of(fused), allowed)
+
+
+class TestGenuineAbsmaxRecipe(unittest.TestCase):
+    """``RECIPES['absmax']`` has a caller that is not the fusion table."""
+
+    def test_a_standalone_absmax_reduction_plans_without_any_fusion(self):
+        rows, reduced = sympy.symbols("c0 c1")
+        stick, lane = sympy.floor(reduced / 64), sympy.Mod(reduced, 64)
+        spec = make_op_spec(
+            "absmax",
+            is_reduction=True,
+            inputs=1,
+            sizes=[[2, 256, 64], [1, 256, 64]],
+            coords_per_arg=[
+                [stick, rows, lane],
+                [sympy.Integer(0), rows, sympy.Integer(0)],
+            ],
+            space={rows: (256, 1), reduced: (128, 1)},
+        )
+        self.assertIn("absmax", ktir.KtirBuilder.RECIPES)
+        plan = ktir.build_kernel_plan([spec])
+        [step] = plan.steps
+        self.assertEqual(step.op, "absmax")
+        # A reduction's recipe must accumulate, and on-stick is the generic form.
+        self.assertIs(
+            ktir.KtirBuilder.RECIPES["absmax"].arm(FP16).kind,
+            ktir.BindingKind.COMBINER,
+        )
+        self.assertIs(step.surface, ktir.Surface.GENERIC)
+
+
 # ---------------------------------------------------------------------------
 # What we generate
 # ---------------------------------------------------------------------------
@@ -1197,7 +1817,7 @@ class TestRefusals(unittest.TestCase):
 
     A label is a token shared by the raise and this test, so grepping it finds
     both.  No message here claims a consumer is the blocker: this repository
-    cannot run dbo-opt or the scheduler, so what they accept is not observable
+    cannot run the backend compiler or the scheduler, so what they accept is not observable
     from these tests, and two labels that used to claim it were both wrong.
     """
 
@@ -1238,7 +1858,7 @@ class TestRefusals(unittest.TestCase):
         """A refusal says what is missing here, not what someone else rejects.
 
         Checked over the ``_unimplemented`` messages rather than the whole file:
-        naming dbo-opt is legitimate where it explains why an *option* exists
+        naming the backend is legitimate where it explains why an *option* exists
         (baking addresses), but not as the reason a capability is refused, which
         this repository cannot observe.
         """

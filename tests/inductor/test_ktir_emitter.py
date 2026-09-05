@@ -297,7 +297,13 @@ class TestReductionEmission(unittest.TestCase):
 
     What comes out is the form a hand-written KTIR ``sum`` kernel uses -- a
     ``linalg.reduce`` with ``dimensions = [1]`` into a bare ``tensor.empty``, and
-    no reshape, because the placeholder axis is dropped rather than reduced.  A
+    no reshape, because the placeholder axis is dropped rather than reduced.
+
+    The combiner appears as MLIR's SHORT form, ``linalg.reduce { arith.addf }``,
+    rather than an explicit region.  That is not cosmetic: ``ReduceOp``'s printer
+    uses the short form only when the body folds accumulator-first, so the text
+    below is evidence the emitter writes ``combine(acc, x)``.  It printed an
+    explicit region while the operands were the other way round.  A
     ``linalg.fill`` accumulator would be rejected by the scheduler's first pass,
     and ``tensor.expand_shape`` is not supported anywhere in it, so both are worth
     the golden pinning them out.
@@ -319,11 +325,7 @@ module {
     %3 = ktdp.construct_access_tile %1[%0, %c0, %c0] {access_tile_order = #map, access_tile_set = #set2} : memref<32x256x64xf16> -> !ktdp.access_tile<1x256x64xindex>
     %4 = ktdp.load %3 : <1x256x64xindex> -> tensor<1x256x64xf16>
     %5 = tensor.empty() : tensor<1x64xf16>
-    %reduced = linalg.reduce ins(%4 : tensor<1x256x64xf16>) outs(%5 : tensor<1x64xf16>) dimensions = [1] 
-      (%in: f16, %init: f16) {
-        %7 = arith.addf %in, %init : f16
-        linalg.yield %7 : f16
-      }
+    %reduced = linalg.reduce { arith.addf } ins(%4 : tensor<1x256x64xf16>) outs(%5 : tensor<1x64xf16>) dimensions = [1] 
     %6 = ktdp.construct_access_tile %2[%0, %c0] {access_tile_order = #map1, access_tile_set = #set3} : memref<32x64xf16> -> !ktdp.access_tile<1x64xindex>
     ktdp.store %reduced, %6 : tensor<1x64xf16>, <1x64xindex>
     return
@@ -423,7 +425,7 @@ module {
     %4 = tensor.empty() : tensor<256x64xf16>
     %5 = linalg.generic {indexing_maps = [#map1, #map2], iterator_types = ["reduction", "parallel", "reduction", "parallel"]} ins(%3 : tensor<2x256x64xf16>) outs(%4 : tensor<256x64xf16>) {
     ^bb0(%in: f16, %out: f16):
-      %7 = arith.addf %in, %out : f16
+      %7 = arith.addf %out, %in : f16
       linalg.yield %7 : f16
     } -> tensor<256x64xf16>
     %6 = ktdp.construct_access_tile %1[%c0, %c0] {access_tile_order = #map3, access_tile_set = #set1} : memref<256x64xf16> -> !ktdp.access_tile<256x64xindex>

@@ -50,6 +50,7 @@ Test sub-suites:
 | `TORCH_COMPILE_DEBUG=1` | Dump Inductor debug artifacts |
 | `TORCH_SPYRE_DOWNCAST_WARN=0` | Suppress int64→int32 downcast warnings |
 | `SPYRE_DUMP_COST=1` | Predicted-runtime report after pre-scheduling |
+| `TORCH_SPYRE_PLAN_FUSION_WARN=0` | Suppress the once-per-process warning that the KTIR emitter's experimental `PlanFusion` table fused a kernel |
 
 ## Spyre Hardware Basics
 
