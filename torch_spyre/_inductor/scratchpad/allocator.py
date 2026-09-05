@@ -26,9 +26,12 @@ import sympy
 import torch
 from torch._inductor.ir import (
     TensorBox,
+    TorchBindObject,
     ComputedBuffer,
     ExternKernel,
+    MultiOutputLayout,
     MutationLayoutSHOULDREMOVE,
+    NoneLayout,
     Operation,
     Pointwise,
     Reduction,
@@ -54,6 +57,7 @@ from torch_spyre._inductor.work_division import (
     work_division_splits_are_legal,
 )
 from torch_spyre._inductor.errors import Unsupported
+from torch_spyre._inductor.constants import BYTES_PER_STICK
 from torch_spyre._inductor.scratchpad.plan_solver import (
     CoreDivision,
     CoreDivisionBuffer,
@@ -614,7 +618,7 @@ class ScratchpadAllocator:
             or isinstance(getattr(go, "data", None), ReinterpretView)
         }
         if division_is_fixed and ncores is None:
-            ncores, ncores_reasons = get_ncores_for_buffers(graph)
+            ncores, ncores_reasons, _ = get_ncores_for_buffers(graph)
         ncores = ncores or {}
         ncores_reasons = ncores_reasons or {}
         buf_user_deps = _get_buffer_user_deps(graph)
@@ -687,6 +691,7 @@ class ScratchpadAllocator:
         lifetimes: dict[str, list[int]],
         ncores: dict[str, int],
         ncores_reasons: dict[str, str],
+        lx_views: dict[str, PerCoreView],
         lifetime_end_overrides: Optional[dict[str, int]] = None,
     ) -> list[LifetimeBoundBuffer]:
         """Build one :class:`LifetimeBoundBuffer` per buffer, barred or not.
@@ -726,6 +731,7 @@ class ScratchpadAllocator:
                     ),
                     residency_reason=reasons.get(output_name),
                     lifetime_end_override=lifetime_end_overrides.get(output_name),
+                    lx_view=lx_views.get(output_name),
                 )
             )
 
@@ -758,6 +764,7 @@ class ScratchpadAllocator:
                     in_place_parents=[],
                     residency_reason=reason,
                     lifetime_end_override=lifetime_end_overrides.get(input_name),
+                    lx_view=lx_views.get(input_name),
                 )
             )
 
@@ -866,7 +873,7 @@ class ScratchpadAllocator:
         num_cores = ncores.get(name, -1)
         if dev_layout is None or num_cores < 1:
             return 0
-        return math.prod(dev_layout.device_size[:-1]) * 128 // num_cores
+        return math.prod(dev_layout.device_size[:-1]) * BYTES_PER_STICK // num_cores
 
     def _determine_in_place(
         self,
@@ -933,7 +940,7 @@ class ScratchpadAllocator:
         if lifetimes is None:
             lifetimes = calculate_liveness(graph)
         lifetime_end_overrides = counted_loop_lifetime_end_overrides(graph)
-        ncores, ncores_reasons = get_ncores_for_buffers(graph)
+        ncores, ncores_reasons, lx_views = get_ncores_for_buffers(graph)
         t1 = time.perf_counter()
         mem_usage = mem_usage_by_buf(graph, cache)
         for plan in lx_relayout_plans:
@@ -942,6 +949,11 @@ class ScratchpadAllocator:
                     continue
                 ncores[name] = plan.num_cores
                 ncores_reasons.pop(name, None)
+                lx_views[name] = (
+                    plan.source_view
+                    if name == plan.source_name
+                    else plan.destination_view
+                )
                 mem_usage[name]["size_per_core"] = (
                     mem_usage[name]["size"] // plan.num_cores
                 )
@@ -972,6 +984,7 @@ class ScratchpadAllocator:
             lifetimes=lifetimes,
             ncores=ncores,
             ncores_reasons=ncores_reasons,
+            lx_views=lx_views,
             lifetime_end_overrides=lifetime_end_overrides,
         )
         if lx_relayout_plans:
@@ -1045,6 +1058,7 @@ class ScratchpadAllocator:
                     ),
                     [transfer_tick, *consumer_ticks],
                     lifetime_end_override=destination_end,
+                    lx_view=plan.destination_view,
                 )
                 buffers.insert(buffers.index(source), destination)
                 source.paired_with.append(destination)
@@ -1162,27 +1176,68 @@ class ScratchpadAllocator:
             buf = graph.get_buffer(b.name)
             if b.name in inputs:
                 new_buffer = graph_editor.push_allocation_with_clone(
-                    buf, buffer_users[b.name], input=True
+                    buf,
+                    buffer_users[b.name],
+                    input=True,
+                    lx_view=b.lx_view,
                 )
-                self._set_one_allocation(new_buffer, b.address)
+                self._set_one_allocation(new_buffer, b.address, b.lx_view)
 
             elif b.name in outputs:
                 new_buffer = graph_editor.push_allocation_with_clone(
                     buf, buffer_users[b.name], input=False
                 )
-                self._set_one_allocation(buf, b.address)
+                self._set_one_allocation(buf, b.address, b.lx_view)
                 graph_editor.change_graph_output(buf, new_buffer)
 
             else:
-                self._set_one_allocation(buf, b.address)
+                self._set_one_allocation(buf, b.address, b.lx_view)
 
         # Keep graph mutation last and in pre-scheduling: solver retries require
         # the original graph, and post-grad no-op elimination has already run.
         materialize_lx_relayouts(graph, accepted_lx_relayouts)
 
-    def _set_one_allocation(self, buf: TensorBox | ComputedBuffer, address: int):
+        # Address and ownership are one placement decision. Check every buffer
+        # that the graph can access after boundary clones and relayout copies
+        # have been inserted; later stages may consume this pair but never
+        # repair a half-written record.
+        for name in _get_buffer_user_deps(graph):
+            buffer = graph.try_get_buffer(name)
+            if buffer is None or isinstance(buffer, TorchBindObject):
+                # Opaque application objects can be graph dependencies (for
+                # example vLLM attention state), but have no tensor layout.
+                continue
+            # Tuple-producing and void fallback ops deliberately have no tensor
+            # descriptor.  Skip only those two known layout classes: any other
+            # get_layout failure is a compiler bug and must remain visible.
+            if isinstance(
+                getattr(buffer, "layout", None), (MultiOutputLayout, NoneLayout)
+            ):
+                continue
+            layout = buffer.get_layout()
+            if not isinstance(layout, FixedTiledLayout):
+                continue
+            has_lx_address = "lx" in layout.allocation
+            has_lx_view = layout.lx_view is not None
+            if has_lx_address != has_lx_view:
+                raise RuntimeError(
+                    f"LX placement for {name} has address={has_lx_address} "
+                    f"but physical ownership={has_lx_view}"
+                )
+
+    def _set_one_allocation(
+        self,
+        buf: TensorBox | ComputedBuffer,
+        address: int,
+        lx_view: PerCoreView | None,
+    ) -> None:
+        if lx_view is None:
+            raise RuntimeError(
+                f"LX placement for {buf.get_name()} has no accepted physical ownership"
+            )
         layout = buf.get_layout()
         layout.allocation["lx"] = address
+        layout.lx_view = lx_view
 
 
 def _lx_planning_size() -> int:
@@ -1341,8 +1396,8 @@ class ResidencyEdge:
         if parent_division.cores_used != consumer_division.cores_used:
             return False
         parent_view = self.parent_view(parent_division)
-        return parent_view is not None and parent_view == self.consumer_view(
-            consumer_division
+        return parent_view is not None and parent_view.same_partition(
+            self.consumer_view(consumer_division)
         )
 
     def match_pairs(
@@ -1360,7 +1415,7 @@ class ResidencyEdge:
             if parent_view is not None
             for j, consumer_view in enumerate(consumer_views)
             if consumer_view is not None
-            and parent_view == consumer_view
+            and parent_view.same_partition(consumer_view)
             and parent_divisions[i].cores_used == consumer_divisions[j].cores_used
         ]
 
@@ -1838,9 +1893,8 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         except (ValueError, RuntimeError):
             cost_expr = None
         result = solver.plan_layout_and_core_divisions(cost_expr)
-        assert not any(buffer.lx_relayout_plans for buffer in result), (
-            "CoOptimizingAllocator does not support LX relayout"
-        )
+        if any(buffer.lx_relayout_plans for buffer in result):
+            raise RuntimeError("CoOptimizingAllocator does not support LX relayout")
         return result
 
     def _extract_op_features(self, graph, output_name, buffers, is_lx):
@@ -1867,6 +1921,15 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         # pull the selected core division from the dependent buffers when the graph
         # is updated with clones in ``_push_allocation``.
         self._commit_divisions(graph, allocation)
+        _, reasons, views = get_ncores_for_buffers(graph)
+        for buffer in allocation:
+            if buffer.address is None:
+                continue
+            view = views.get(buffer.name)
+            if view is None:
+                reason = reasons.get(buffer.name, "physical ownership was not accepted")
+                raise Unsupported(f"{buffer.name}: {reason}")
+            buffer.lx_view = view
 
     def _get_spill_reasons(
         self,
@@ -2136,7 +2199,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                     graph.operations[last_use].name, []
                 ).append(input_name)
                 dev_layout = graph.get_buffer(input_name).layout.device_layout
-                size = math.prod(dev_layout.device_size[:-1]) * 128
+                size = math.prod(dev_layout.device_size[:-1]) * BYTES_PER_STICK
                 buffers.append(
                     CoreDivisionBuffer(
                         input_name,
@@ -2275,7 +2338,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         finding the intersection of core divisions.
         """
         clone_divs: list[CoreDivision] = []
-        clone_views: list[tuple] = []  # parallel: the view each clone div reproduces
+        clone_views: list[PerCoreView] = []
         matches: dict[str, list[tuple[int, int]]] = {}
         for consumer in consumers:
             cname = consumer.get_name()
@@ -2296,7 +2359,14 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             for j, (view, _, repr_ok) in enumerate(views):
                 if not repr_ok:
                     continue
-                k = next((idx for idx, v in enumerate(clone_views) if v == view), None)
+                k = next(
+                    (
+                        idx
+                        for idx, candidate in enumerate(clone_views)
+                        if candidate.same_partition(view)
+                    ),
+                    None,
+                )
                 if k is None:
                     cd = consumer_divs[j]
                     per_sym = _division_splits(consumer, cd)
