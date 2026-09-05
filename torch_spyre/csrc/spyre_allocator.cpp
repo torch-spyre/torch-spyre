@@ -15,9 +15,14 @@
  */
 #include "spyre_allocator.h"
 
+#include <atomic>
+#include <cstdlib>  // std::getenv
 #include <memory>
 #include <mutex>
+#include <numeric>
+#include <string_view>
 #include <utility>
+#include <vector>
 
 #include "logging.h"
 #include "module.h"
@@ -25,6 +30,51 @@
 #include "spyre_tensor_impl.h"
 
 namespace spyre {
+
+namespace {
+
+// ─── TEMPORARY (T5, 1p5-emulation epic) ──────────────────────────────────────
+// Coarse env gate that makes every *tensor* storage allocation interleave
+// across all memory domains flex reports, so the epic's copy-only thin slice
+// (allocate → H2D → D2H) can be exercised on real 1p0-PF silicon under an
+// emulated multi-domain topology:
+//
+//   FLEX_NUM_MEMORY_DOMAINS=4 FLEX_MAX_REGIONS=8 \
+//   TORCH_SPYRE_EMULATE_INTERLEAVE=1
+//
+// This is deliberately NOT an eligibility policy: it interleaves everything it
+// sees. T6 replaces it with a topology-derived directive that decides per
+// tensor; delete this gate then.
+//
+// Scope and safety:
+//  - Only the c10::Allocator entry point (`allocate(nbytes)`) consults it, so
+//    it affects tensor storages only. The program allocation uses the
+//    directive-taking overload with its own Bind{0} (prepare_kernel.cpp) and is
+//    untouched.
+//  - Interleaved tensors are usable on the **eager copy path only**. The
+//    compiled JobPlan builder still asserts single-chunk (T7/T8, gated by the
+//    T1 verdict), so do not set this in a process that compiles kernels.
+//  - Off (the default) leaves behavior byte-for-byte identical to Bind{0}.
+//
+// The env var seeds the initial value, but the flag is a process-global that
+// `debugSetEmulateInterleave` can flip at runtime. That matters: only one
+// process may hold the Spyre device, so a test cannot compare an interleaved
+// run against a Bind{0} baseline by spawning a second process — both
+// placements have to be exercised in the same process, under the same topology.
+std::atomic<bool>& emulateInterleaveFlag() {
+  static std::atomic<bool> flag{[]() {
+    const char* env = std::getenv("TORCH_SPYRE_EMULATE_INTERLEAVE");
+    return env != nullptr && std::string_view(env) != "" &&
+           std::string_view(env) != "0";
+  }()};
+  return flag;
+}
+
+bool emulateInterleaveEnabled() {
+  return emulateInterleaveFlag().load(std::memory_order_relaxed);
+}
+
+}  // namespace
 
 SpyreAllocator::SpyreAllocator() {
   // Callback registration is deferred until first allocation
@@ -143,6 +193,26 @@ void SpyreAllocator::recordRelease(size_t nbytes, void* data, int device_id) {
 }
 
 c10::DataPtr SpyreAllocator::allocate(size_t nbytes) {
+  // ─── TEMPORARY (T5, 1p5-emulation epic) ────────────────────────────────────
+  // See emulateInterleaveEnabled(). Skipped for nbytes == 0 so the empty
+  // allocation keeps returning early below without touching the runtime.
+  if (nbytes != 0 && emulateInterleaveEnabled()) {
+    auto flex_alloc = getFlexAllocator();
+    const size_t num_domains =
+        flex_alloc ? flex_alloc->topology().num_domains() : 1;
+    if (num_domains > 1) {
+      std::vector<uint32_t> domain_ids(num_domains);
+      std::iota(domain_ids.begin(), domain_ids.end(), 0U);
+      flex::AllocationDirective interleaved(flex::PlacementPolicy::Interleave,
+                                            std::move(domain_ids), std::nullopt,
+                                            flex::MemoryType::Tensor);
+      DEBUGINFO("TORCH_SPYRE_EMULATE_INTERLEAVE: interleaving ", nbytes,
+                " (bytes) across ", num_domains, " memory domains");
+      return SpyreAllocator::allocate(nbytes, interleaved);
+    }
+    // num_domains == 1: no domains to stripe across, fall through to Bind{0}.
+  }
+
   flex::AllocationDirective directive(flex::PlacementPolicy::Bind, {0},
                                       std::nullopt, flex::MemoryType::Tensor);
   return SpyreAllocator::allocate(nbytes, directive);
@@ -220,6 +290,51 @@ void SpyreAllocator::copy_data(void* dest, const void* src,
 uint64_t SpyreAllocator::compositeAddressToDmva(
     const flex::CompositeAddress& addr) const {
   return getFlexAllocator()->compositeAddressToDmva(addr);
+}
+
+// ─── TEMPORARY (T5, 1p5-emulation epic) ──────────────────────────────────────
+// Flip the interleave gate for the rest of this process; returns the previous
+// value so a caller can restore it. See emulateInterleaveFlag().
+bool SpyreAllocator::debugSetEmulateInterleave(bool enabled) {
+  return emulateInterleaveFlag().exchange(enabled, std::memory_order_relaxed);
+}
+
+// ─── TEMPORARY (T5, 1p5-emulation epic) ──────────────────────────────────────
+// Number of memory domains flex reports (1 unless FLEX_NUM_MEMORY_DOMAINS is
+// set), so a test can skip cleanly instead of asserting on a single-domain
+// topology. Requires the runtime to be started.
+size_t SpyreAllocator::debugNumMemoryDomains() {
+  auto flex_alloc = getFlexAllocator();
+  return flex_alloc ? flex_alloc->topology().num_domains() : 0;
+}
+
+// ─── TEMPORARY (T5, 1p5-emulation epic) ──────────────────────────────────────
+// Debug-only introspection: see CompositeChunkInfo in the header.
+std::vector<CompositeChunkInfo> SpyreAllocator::debugCompositeChunks(
+    const at::Tensor& tensor) {
+  TORCH_CHECK(tensor.is_privateuseone(),
+              "debugCompositeChunks: expected a Spyre tensor, got one on ",
+              tensor.device());
+  auto* ctx =
+      static_cast<SharedOwnerCtx*>(tensor.storage().data_ptr().get_context());
+  TORCH_CHECK(ctx != nullptr,
+              "debugCompositeChunks: tensor has no device allocation");
+
+  const auto& region_map = getFlexAllocator()->getIdToRegionMap();
+
+  std::vector<CompositeChunkInfo> out;
+  out.reserve(ctx->composite_addr.chunks().size());
+  for (const auto& chunk : ctx->composite_addr.chunks()) {
+    uint32_t segment_id = flex::UNMAPPED_SEGMENT_ID;
+    auto it = region_map.find(chunk.addr.region_id);
+    if (it != region_map.end() && it->second != nullptr) {
+      segment_id = it->second->segment_id();
+    }
+    out.push_back(CompositeChunkInfo{chunk.domain_id, chunk.addr.region_id,
+                                     chunk.addr.offset, chunk.size, segment_id,
+                                     segment_id != flex::UNMAPPED_SEGMENT_ID});
+  }
+  return out;
 }
 
 void SpyreAllocator::memoryPressureCallback(

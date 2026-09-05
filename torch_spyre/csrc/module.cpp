@@ -742,6 +742,47 @@ PYBIND11_MODULE(_C, m) {
       },
       py::arg("device"), "Reset peak allocator statistics");
 
+  // ─── TEMPORARY (T5, 1p5-emulation epic) ──────────────────────────────────
+  // Debug-only introspection of a tensor's device chunk layout, so the
+  // copy-only thin-slice test can prove an allocation really is interleaved.
+  // Remove together with TORCH_SPYRE_EMULATE_INTERLEAVE when T6 lands.
+  m.def(
+      "_spyre_debug_composite_chunks",
+      [](const at::Tensor& tensor) {
+        py::list result;
+        for (const auto& chunk :
+             spyre::SpyreAllocator::debugCompositeChunks(tensor)) {
+          py::dict entry;
+          entry["domain_id"] = chunk.domain_id;
+          entry["region_id"] = chunk.region_id;
+          entry["offset"] = chunk.offset;
+          entry["size"] = chunk.size;
+          entry["segment_id"] = chunk.segment_id;
+          entry["segment_mapped"] = chunk.segment_mapped;
+          result.append(entry);
+        }
+        return result;
+      },
+      py::arg("tensor"),
+      "DEBUG/TEMPORARY: return the per-chunk layout "
+      "(domain_id, region_id, offset, size, segment_id, segment_mapped) of a "
+      "Spyre tensor's device allocation.");
+
+  m.def(
+      "_spyre_debug_set_emulate_interleave",
+      [](bool enabled) {
+        return spyre::SpyreAllocator::debugSetEmulateInterleave(enabled);
+      },
+      py::arg("enabled"),
+      "DEBUG/TEMPORARY: enable/disable interleaved tensor placement for the "
+      "rest of this process; returns the previous setting.");
+
+  m.def(
+      "_spyre_debug_num_memory_domains",
+      []() { return spyre::SpyreAllocator::debugNumMemoryDomains(); },
+      "DEBUG/TEMPORARY: number of memory domains flex reports (1 unless "
+      "FLEX_NUM_MEMORY_DOMAINS is set); 0 if the runtime is not started.");
+
   // ── Typed stream error API ───────────────────────────────────────────────
 
   py::enum_<spyre::SpyreStreamError>(m, "SpyreStreamError")
