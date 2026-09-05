@@ -38,7 +38,7 @@ import sympy
 
 from torch_spyre._C import DataFormats, ElementArrangement
 from torch_spyre._inductor.codegen import ktir
-from torch_spyre._inductor.constants import STAGGERED_EAS
+from torch_spyre._inductor.constants import IDENTITY_OP, STAGGERED_EAS
 from torch_spyre._inductor.op_spec import LoopSpec, OpSpec, TensorArg, UnimplementedOp
 
 # ---------------------------------------------------------------------------
@@ -73,6 +73,7 @@ def make_op_spec(
     coords: list | None = None,
     coords_per_arg: list | None = None,
     dtype: DataFormats = FP16,
+    arrangements: list | None = None,
     allocations: list | None = None,
     baked: bool = False,
     advances: list | None = None,
@@ -99,6 +100,9 @@ def make_op_spec(
       arg or ``coords_per_arg`` for one list each, which a reduction needs because
       its output drops an axis.  ``coords=[]`` is a tiled arg, addressing through
       ``advances`` instead of coordinates.
+    * ``arrangements`` per arg, for a buffer whose elements are not in the
+      standard order -- ``ElementArrangement.EXX2`` is a statistic buffer holding
+      two values in one element, and the default is ``STANDARD``.
     * ``allocations`` per arg, for an ``lx`` / ``hbm_pool`` intermediate or an
       unrecognised space; ``baked=True`` for the byte HBM address the baked form
       wants, which is the same field said the other way, so not both.
@@ -150,7 +154,8 @@ def make_op_spec(
                 name=at(names, position)
                 or (f"arg{ordinal}" if is_input else f"buf{ordinal}"),
                 device_tile_advance_expr=at(advances, position),
-                kernel_local=bool(at(kernel_locals, position)),
+                element_arrangement=at(arrangements, position)
+                or ElementArrangement.STANDARD,
             )
         )
 
@@ -171,35 +176,49 @@ def make_op_spec(
     )
 
 
-def make_chained_op_specs(ops: tuple = ("add", "mul"), **overrides) -> list:
-    """The ops of one kernel, each threading its result into the next.
+def make_chained_op_specs(
+    ops: tuple = ("add", "mul"), *, owned: bool = False, **overrides
+) -> list:
+    """The ops of one kernel, each handing its result to the next.
 
-    Every op but the last writes an ``lx`` intermediate that the next op reads,
-    which is the contract saying this kernel owns it: not passed in, no address,
-    and nothing outside the kernel can reach it.  The fresh inputs and the final
-    output are HBM args, numbered across the whole kernel rather than per op.
+    ``owned=False`` (the default) gives every intermediate an ordinary HBM buffer
+    with an ``arg_index``, so the producing stage stores it and the consuming stage
+    loads it -- what the frontend produces with the memory planners off.  One
+    buffer keeps ONE index across the specs that share it, which is why the
+    numbering advances over every arg rather than over the fresh inputs only.
+
+    ``owned=True`` makes each intermediate an ``lx`` buffer instead: not passed
+    in, no address, threaded as a value. That is what memory planning produces by
+    default, and across a stage boundary it is refused -- so it is kept for the
+    test that pins that refusal, and for nothing else.
     """
     lx = {"lx": 0}
     specs, next_arg = [], 0
     for level, op in enumerate(ops):
         # The first op reads two fresh inputs; every later one reads the previous
-        # result and one fresh input.  Only the last op's output is HBM.
+        # result and one fresh input.
         threaded = [] if level == 0 else [f"buf{level - 1}"]
         fresh = [f"arg{next_arg + i}" for i in range(2 - len(threaded))]
+        last = level == len(ops) - 1
         specs.append(
             make_op_spec(
                 op,
                 names=[*threaded, *fresh, f"buf{level}"],
                 allocations=[
-                    *([lx] if threaded else []),
+                    *([lx if owned else None] if threaded else []),
                     *([None] * len(fresh)),
-                    None if level == len(ops) - 1 else lx,
+                    None if last or not owned else lx,
                 ],
                 first_arg_index=next_arg,
                 **overrides,
             )
         )
-        next_arg += len(fresh)
+        # An owned intermediate takes no slot (``arg_index == -1``); a passed one
+        # takes the next, and the following spec starts AT it so the buffer they
+        # share carries one index.
+        next_arg += len(fresh) + (0 if owned and not last else 1)
+        if not owned and not last:
+            next_arg -= 1
     return specs
 
 
@@ -230,8 +249,12 @@ def make_nested_op_spec(*, levels: list, **overrides) -> tuple:
     return loops[0], spec, loops
 
 
-def make_onstick_sum_specs() -> list:
+def make_onstick_sum_specs(op: str = "sum", arrangements: list | None = None) -> list:
     """``sum(x[256, 128], dim=-1)`` on one core, as the frontend projects it.
+
+    ``op`` names the reduction and ``arrangements`` is passed straight through, so
+    the same vector serves any arity-1 reduction over the stick -- the shape is the
+    fixture's contribution and the op is the caller's.
 
     The reduction runs along the *stick*, so it consumes both halves of the
     reduced symbol -- the outer-stick chunk index ``floor(c1 / 64)`` and the
@@ -248,9 +271,10 @@ def make_onstick_sum_specs() -> list:
     stick, lane = sympy.floor(reduced / 64), sympy.Mod(reduced, 64)
     return [
         make_op_spec(
-            "sum",
+            op,
             is_reduction=True,
             inputs=1,
+            arrangements=arrangements,
             sizes=[[2, 256, 64], [1, 256, 64]],
             coords_per_arg=[
                 [stick, rows, lane],
@@ -258,6 +282,126 @@ def make_onstick_sum_specs() -> list:
             ],
             space={rows: (256, 1), reduced: (128, 1)},
         )
+    ]
+
+
+def make_broadcast_op_spec(form: str = "row") -> OpSpec:
+    """One pointwise op with a BROADCAST operand, in one of three forms."""
+    d0, d1, d2 = sympy.symbols("d0 d1 d2")
+    zero = sympy.Integer(0)
+    if form == "row":
+        return make_op_spec(
+            "realdiv",
+            sizes=[[16, 512, 64], [16, 1, 64], [16, 512, 64]],
+            coords_per_arg=[[d0, d1, d2], [d0, zero, d2], [d0, d1, d2]],
+        )
+    if form == "stat":
+        return make_op_spec(
+            "realdiv",
+            sizes=[[16, 512, 64], [512, 64], [16, 512, 64]],
+            coords_per_arg=[[d0, d1, d2], [d1, zero], [d0, d1, d2]],
+        )
+    if form == "splat":
+        return make_op_spec(
+            "layernormscale",
+            inputs=1,
+            sizes=[[512, 64], [512, 64]],
+            coords_per_arg=[[d0, zero], [d0, d1]],
+            arrangements=[ElementArrangement.EXX2, ElementArrangement.STANDARD],
+        )
+    raise ValueError(f"make_broadcast_op_spec: unknown form {form!r}")
+
+
+def make_statistic_reader_specs(reader: str = "realdiv") -> list:
+    """A reduction, and a pointwise stage that READS the statistic it wrote."""
+    rows, reduced = sympy.symbols("c0 c1")
+    stick, lane = sympy.floor(reduced / 64), sympy.Mod(reduced, 64)
+    zero = sympy.Integer(0)
+    statistic = [zero, rows, zero]
+    produce = make_op_spec(
+        "sum",
+        is_reduction=True,
+        inputs=1,
+        names=["x0", "buf0"],
+        sizes=[[2, 256, 64], [1, 256, 64]],
+        coords_per_arg=[[stick, rows, lane], statistic],
+        space={rows: (256, 1), reduced: (128, 1)},
+    )
+    e0, e1, e2 = sympy.symbols("e0 e1 e2")
+    consume = make_op_spec(
+        reader,
+        inputs=2,
+        names=["x1", "buf0", "out0"],
+        sizes=[[2, 256, 64], [1, 256, 64], [2, 256, 64]],
+        coords_per_arg=[[e0, e1, e2], [zero, e1, zero], [e0, e1, e2]],
+        space={e0: (2, 1), e1: (256, 1), e2: (64, 1)},
+        first_arg_index=2,
+    )
+    # ``buf0`` is ONE buffer at ONE index, which the per-spec numbering cannot
+    # know; said here for the same reason ``TestAStageOwnsItsViews`` says it.
+    consume.args[1].arg_index = 1  # buf0, as stage 0 numbered it
+    consume.args[2].arg_index = 3  # out0, after x1
+    return [produce, consume]
+
+
+def make_two_element_type_specs() -> list:
+    """Two stages over ONE buffer, each reading it at a different element type."""
+    rows, reduced = sympy.symbols("c0 c1")
+    stick, lane = sympy.floor(reduced / 64), sympy.Mod(reduced, 64)
+    zero = sympy.Integer(0)
+    fused = ElementArrangement.EXX2
+    produce = make_op_spec(
+        "exx2",
+        is_reduction=True,
+        inputs=1,
+        names=["x0", "pair"],
+        sizes=[[2, 256, 64], [1, 256, 64]],
+        coords_per_arg=[[stick, rows, lane], [zero, rows, zero]],
+        arrangements=[None, fused],
+        space={rows: (256, 1), reduced: (128, 1)},
+    )
+    e0, e1, e2 = sympy.symbols("e0 e1 e2")
+    full, statistic = [e0, e1, e2], [zero, e1, zero]
+    consume = make_op_spec(
+        "layernormnorm",
+        inputs=5,
+        names=["x1", "pair", "s2", "s3", "s4", "out0"],
+        sizes=[[2, 256, 64], [1, 256, 64], *([[2, 256, 64]] * 4)],
+        coords_per_arg=[full, statistic, full, full, full, full],
+        # The flag is on the BUFFER, so the reader's arg carries it too; that the
+        # read is nonetheless f16 is the recipe's word and not the arg's.
+        arrangements=[None, fused, None, None, None, None],
+        space={e0: (2, 1), e1: (256, 1), e2: (64, 1)},
+        first_arg_index=2,
+    )
+    # ``pair`` is ONE buffer at ONE index, which the per-spec numbering cannot
+    # know; the args after it close the gap that leaves.
+    consume.args[1].arg_index = 1  # pair, as stage 0 numbered it
+    for position, index in enumerate((3, 4, 5, 6), start=2):
+        consume.args[position].arg_index = index
+    return [produce, consume]
+
+
+def make_access_only_specs(readers: tuple = ("exp", "sqrt")) -> list:
+    """A placement of ``x`` into an owned buffer, and ``readers`` reading it."""
+    owned = {"lx": 0}
+    place = make_op_spec(
+        IDENTITY_OP, inputs=1, names=["x", "staged"], allocations=[None, owned]
+    )
+    return [
+        place,
+        *(
+            make_op_spec(
+                op,
+                inputs=1,
+                names=["staged", f"out{index}"],
+                allocations=[owned, None],
+                # ``staged`` is not passed in, so it consumes no position: the
+                # readers' outputs continue the kernel's numbering after ``x``.
+                first_arg_index=1 + index,
+            )
+            for index, op in enumerate(readers)
+        ),
     ]
 
 
@@ -448,10 +592,30 @@ class TestValidateRejections(unittest.TestCase):
         specs = [make_op_spec(names=["arg0", "arg1", "arg0"])]
         self._rejects(specs, "in-place ops (input aliases output)")
 
-    def test_broadcast_operand_rejected(self):
-        # A unit outer-stick extent against the output's 16: a real broadcast.
+    def test_stretched_operand_rejected(self):
+        """A unit extent on an axis the operand's coordinate says it WALKS."""
         specs = [make_op_spec(sizes=[[1, 512, 64]])]
-        self._rejects(specs, "broadcast / reshape operands")
+        self._rejects(specs, "not a stretch of it")
+
+    def test_a_broadcast_operand_of_a_named_linalg_op_rejected(self):
+        """A named ``linalg`` op states its own (identity) indexing, so a derived"""
+        named_only = ktir.Recipe(
+            arity=2,
+            arms=ktir.Arm(kind=ktir.BindingKind.NAMED, binding=lambda: None),
+        )
+        specs = [
+            make_op_spec(
+                "named_only",
+                sizes=[[16, 512, 1]],
+                coords_per_arg=[
+                    [*sympy.symbols("d0:2"), sympy.Integer(0)],
+                    sympy.symbols("d0:3"),
+                    sympy.symbols("d0:3"),
+                ],
+            )
+        ]
+        with mock.patch.dict(ktir.KtirBuilder.RECIPES, {"named_only": named_only}):
+            self._rejects(specs, "named linalg op, which states its own indexing")
 
     # -- per-buffer --------------------------------------------------------
 
@@ -895,6 +1059,142 @@ class TestRecipes(unittest.TestCase):
             ktir.KtirBuilder.emit(None, [UnimplementedOp(op="atan2")])
 
 
+class TestArmDispatch(unittest.TestCase):
+    """Selecting an arm on MORE than the format: the second discriminant."""
+
+    @staticmethod
+    def _arm(kind=ktir.BindingKind.NAMED, *dtypes):
+        return ktir.Arm(kind=kind, binding=lambda: None, dtypes=tuple(dtypes))
+
+    def test_the_default_dispatcher_is_the_format_alone(self):
+        """Every entry that did not ask for the new discriminant ignores it."""
+        for op, recipe in ktir.KtirBuilder.RECIPES.items():
+            if recipe.dispatch is not ktir.request_by_dtype:
+                continue
+            for dtype in (*ktir.ElemTypes.NAMES, None):
+                with self.subTest(op=op, dtype=dtype):
+                    self.assertIs(recipe.arm(dtype), recipe.arm(dtype, broadcast=True))
+
+    def test_a_dispatcher_may_not_return_a_foreign_arm(self):
+        """A dispatcher narrows; it does not invent."""
+        foreign = self._arm()
+        recipe = ktir.Recipe(
+            arity=1, arms=self._arm(), dispatch=lambda arms, request: foreign
+        )
+        with self.assertRaises(AssertionError):
+            recipe.arm(FP16)
+
+    def test_two_default_arms_are_one_kind_ambiguous_and_two_kinds_a_channel_each(
+        self,
+    ):
+        """The one-default-arm rule is per KIND, and why it has to be."""
+        with self.assertRaises(ValueError):
+            ktir.Recipe(arity=1, arms=(self._arm(), self._arm()))
+        recipe = ktir.Recipe(
+            arity=1,
+            arms=(self._arm(), self._arm(ktir.BindingKind.PAYLOAD)),
+            dispatch=ktir.request_scalar_when_broadcast,
+        )
+        self.assertIs(recipe.arm(FP16).kind, ktir.BindingKind.NAMED)
+        self.assertIs(recipe.arm(FP16, broadcast=True).kind, ktir.BindingKind.PAYLOAD)
+
+    def test_all_arms_of_an_op_must_agree_on_whether_it_reduces(self):
+        """What makes ``Recipe.reduces`` sound, and it is asked before any arm."""
+        with self.assertRaises(ValueError):
+            ktir.Recipe(
+                arity=1,
+                arms=(self._arm(), self._arm(ktir.BindingKind.COMBINER, FP16)),
+            )
+        # And the two shapes that do agree are fine, whichever way they agree.
+        self.assertFalse(
+            ktir.Recipe(
+                arity=1,
+                arms=(self._arm(), self._arm(ktir.BindingKind.PAYLOAD, FP16)),
+            ).reduces
+        )
+        self.assertTrue(
+            ktir.Recipe(arity=1, arms=self._arm(ktir.BindingKind.COMBINER)).reduces
+        )
+
+    def test_a_reduction_mismatch_is_refused_before_any_arm_is_chosen(self):
+        """The early family check asks the RECIPE, and asks nothing else."""
+
+        def never(arms, request):
+            raise AssertionError("the family check chose an arm")
+
+        recipe = dataclasses.replace(ktir.KtirBuilder.RECIPES["add"], dispatch=never)
+        with mock.patch.dict(ktir.KtirBuilder.RECIPES, {"add": recipe}):
+            with self.assertRaises(NotImplementedError) as ctx:
+                ktir.build_kernel_plan([make_op_spec(is_reduction=True)])
+        self.assertIn("is registered as NAMED", str(ctx.exception))
+        self.assertIn("a reduction", str(ctx.exception))
+
+    def test_a_broadcast_operand_takes_the_scalar_arm_and_an_aligned_one_the_named(
+        self,
+    ):
+        """The three entries' resolution table, and how it composes with format."""
+        for op in ("add", "mul", "sub"):
+            recipe = ktir.KtirBuilder.RECIPES[op]
+            with self.subTest(op=op):
+                self.assertIs(recipe.arm(FP16).kind, ktir.BindingKind.NAMED)
+                self.assertIs(
+                    recipe.arm(FP16, broadcast=True).kind, ktir.BindingKind.PAYLOAD
+                )
+        int32 = DataFormats.IEEE_INT32
+        for op in ("add", "mul"):
+            with self.subTest(op=op):
+                arm = ktir.KtirBuilder.RECIPES[op].arm(int32, broadcast=True)
+                self.assertIs(arm.kind, ktir.BindingKind.PAYLOAD)
+                self.assertEqual(arm.dtypes, (int32,))
+        self.assertIs(
+            ktir.KtirBuilder.RECIPES["sub"].arm(int32, broadcast=True).kind,
+            ktir.BindingKind.NAMED,
+        )
+        # The float scalars are dtype-less, so what they do NOT serve is listed
+        # once, in ``_INTEGER_FORMATS``.  Kept in step with the supported-format
+        # table here, because a new integer format added to ``NAMES`` alone would
+        # silently resolve to ``arith.addf``.
+        for dtype, spelling in ktir.ElemTypes.NAMES.items():
+            with self.subTest(dtype=dtype):
+                self.assertEqual(
+                    spelling.startswith("i"), dtype in ktir._INTEGER_FORMATS
+                )
+
+    def test_the_broadcast_flag_is_derived_from_coordinates_alone_and_reaches_step(
+        self,
+    ):
+        """``broadcast`` is on the step for the reason ``dtype`` is."""
+        for form in ("row", "stat", "splat"):
+            with self.subTest(form=form):
+                [step] = ktir.build_kernel_plan([make_broadcast_op_spec(form)]).steps
+                self.assertTrue(step.broadcast)
+        [aligned] = ktir.build_kernel_plan([make_op_spec()]).steps
+        self.assertFalse(aligned.broadcast)
+
+    def test_a_broadcast_sub_is_a_generic_and_an_aligned_one_is_still_the_named_op(
+        self,
+    ):
+        """The gap this closes, end to end through the plan."""
+        d0, d1, d2 = sympy.symbols("d0 d1 d2")
+        broadcast = make_op_spec(
+            "sub",
+            sizes=[[16, 512, 64], [16, 1, 64], [16, 512, 64]],
+            coords_per_arg=[
+                [d0, d1, d2],
+                [d0, sympy.Integer(0), d2],
+                [d0, d1, d2],
+            ],
+        )
+        [step] = ktir.build_kernel_plan([broadcast]).steps
+        self.assertIs(step.surface, ktir.Surface.GENERIC)
+        self.assertEqual(step.indexing.maps, ((0, 1, 2), (0, None, 2), (0, 1, 2)))
+        for op in ("add", "mul", "sub"):
+            with self.subTest(op=op):
+                [aligned] = ktir.build_kernel_plan([make_op_spec(op)]).steps
+                self.assertIs(aligned.surface, ktir.Surface.BARE)
+                self.assertIsNone(aligned.indexing)
+
+
 class TestReduceSurface(unittest.TestCase):
     """Which of the two reduction shapes a loop nest can be emitted as.
 
@@ -1083,13 +1383,10 @@ class TestAPayloadWithNoNamedOpGetsAGeneric(unittest.TestCase):
         """
         for op, recipe in ktir.KtirBuilder.RECIPES.items():
             # A reduction wants coordinates that actually reduce, which its own
-            # fixtures own; the claim here is about the pointwise ops.
-            # ``arm(None)`` is the arm an unlisted format reaches, which is the one
-            # ``make_op_spec``'s fp16 args resolve to.
-            if (
-                recipe.attrs is not None
-                or recipe.arm(None).kind is ktir.BindingKind.COMBINER
-            ):
+            # fixtures own; the claim here is about the pointwise ops.  Asked of
+            # the recipe rather than of an arm, because whether an op reduces is an
+            # op fact and needs no format to answer.
+            if recipe.attrs is not None or recipe.reduces:
                 continue
             with self.subTest(op=op):
                 spec = make_op_spec(op, inputs=recipe.arity)
@@ -1321,6 +1618,84 @@ class TestLoopDerivations(unittest.TestCase):
         with self.assertRaises(NotImplementedError) as ctx:
             ktir._solve_layout(a, levels)
         self.assertIn("not a whole number of steps", str(ctx.exception))
+
+
+class TestAThreadedValueMayNotCrossAStage(unittest.TestCase):
+    """An owned intermediate read by a later stage is refused, and says what to set."""
+
+    def test_an_owned_intermediate_read_by_a_later_stage_is_refused(self):
+        with self.assertRaises(NotImplementedError) as caught:
+            ktir.build_kernel_plan(make_chained_op_specs(("add", "mul"), owned=True))
+        message = str(caught.exception)
+        self.assertIn("written in stage 0 and read in stage 1", message)
+        self.assertIn("cannot cross a compute stage", message)
+
+    def test_the_refusal_names_both_planning_flags(self):
+        """The actionable half: a reader must not have to guess the variable."""
+        with self.assertRaises(NotImplementedError) as caught:
+            ktir.build_kernel_plan(make_chained_op_specs(("add", "mul"), owned=True))
+        message = str(caught.exception)
+        self.assertIn("LX_PLANNING=0", message)
+        self.assertIn("HBM_POOL_PLANNING=0", message)
+
+    def test_the_same_chain_is_accepted_when_the_intermediate_is_passed(self):
+        """The control, so the refusal is shown to be about the ALLOCATION only."""
+        steps = ktir.build_kernel_plan(make_chained_op_specs(("add", "mul"))).steps
+        self.assertEqual([step.stage for step in steps], [0, 1])
+
+
+class TestStagesAreNumbered(unittest.TestCase):
+    """``_stages`` hands each ``ComputeStep`` its own stage, over the whole tree."""
+
+    @staticmethod
+    def _two_stages_in_one_body() -> LoopSpec:
+        """``(a + b) * c`` at one row per iteration of a two-level nest."""
+        n_stick, m = sympy.symbols("n_stick m")
+        tiled = {
+            "coords": [],
+            "space": {},
+            "tiled": [[m], [n_stick]],  # innermost-first
+            "trips": {n_stick: 2, m: 256},
+            "size": [1, 1, 64],
+            "advances": [16384 * n_stick + 64 * m] * 3,
+        }
+        return LoopSpec(
+            count=2,
+            body=[
+                LoopSpec(
+                    count=256,
+                    body=[
+                        make_op_spec(
+                            "add",
+                            names=["arg0", "arg1", "buf0"],
+                            allocations=[None, None, None],
+                            **tiled,
+                        ),
+                        # ``buf0`` is passed, not owned: it crosses a stage, and a
+                        # value may not (``TestAThreadedValueMayNotCrossAStage``).
+                        # It keeps stage 0's index, so the second spec starts at it.
+                        make_op_spec(
+                            "mul",
+                            names=["buf0", "arg2", "buf1"],
+                            allocations=[None, None, None],
+                            first_arg_index=2,
+                            **tiled,
+                        ),
+                    ],
+                )
+            ],
+        )
+
+    def test_each_op_in_a_chain_is_its_own_stage(self):
+        steps = ktir.build_kernel_plan(make_chained_op_specs(("add", "mul"))).steps
+        self.assertEqual([step.stage for step in steps], [0, 1])
+
+    def test_a_loop_body_continues_the_kernels_count(self):
+        """The counter is the plan's, so recursion cannot restart it at zero."""
+        plan = ktir.build_kernel_plan([self._two_stages_in_one_body()])
+        [outer] = plan.steps
+        [inner] = outer.body
+        self.assertEqual([step.stage for step in inner.body], [0, 1])
 
 
 _TABLE_DEFAULT = object()
@@ -1599,6 +1974,14 @@ class TestRefusals(unittest.TestCase):
                     (extent, strides),
                 )
 
+    def test_a_fused_arrangement_is_a_type_and_not_a_stride(self):
+        """``EXX2`` selects an element TYPE, nothing else."""
+        extent, strides = (256, 64), (64, 1)
+        self.assertEqual(
+            ktir._arrangement_layout(ElementArrangement.EXX2, extent, strides),
+            (extent, strides),
+        )
+
     def test_every_label_is_greppable_and_uniquely_owned(self):
         """Each label is raised from exactly one site, so grepping it is exact."""
         source = inspect.getsource(ktir)
@@ -1630,6 +2013,337 @@ class TestRefusals(unittest.TestCase):
             with self.subTest(message=message[:40]):
                 for blame in ("dbo-opt", "no consumer", "nothing lowers", "scheduler"):
                     self.assertNotIn(blame, message)
+
+
+class TestBroadcastOperands(unittest.TestCase):
+    """An operand that does not walk every axis of the output."""
+
+    def test_each_form_derives_the_maps_the_chain_needs(self):
+        """The three rows, against the hand-written chain's three maps."""
+        for form, maps in (
+            ("row", ((0, 1, 2), (0, None, 2), (0, 1, 2))),
+            ("stat", ((0, 1, 2), (1, None), (0, 1, 2))),
+            ("splat", ((0, None), (0, 1))),
+        ):
+            with self.subTest(form=form):
+                plan = ktir.build_kernel_plan([make_broadcast_op_spec(form)])
+                [step] = plan.steps
+                self.assertIs(step.surface, ktir.Surface.GENERIC)
+                self.assertEqual(step.indexing.maps, maps)
+                # Pointwise: every iteration dim is the output's, all parallel.
+                self.assertEqual(
+                    step.indexing.iters, ("parallel",) * len(step.out.extent)
+                )
+
+    def test_an_aligned_operand_still_reaches_the_named_form(self):
+        """The fast path, asserted where the derivation would also have applied:"""
+        plan = ktir.build_kernel_plan([make_op_spec()])
+        [step] = plan.steps
+        self.assertIs(step.surface, ktir.Surface.BARE)
+        self.assertIsNone(step.indexing)
+
+    def test_a_broadcast_operand_beside_an_aligned_one_states_both_rows(self):
+        """``indexing_maps`` is one attribute, so the aligned operand's identity"""
+        plan = ktir.build_kernel_plan([make_broadcast_op_spec("row")])
+        [step] = plan.steps
+        self.assertEqual(step.indexing.maps[0], (0, 1, 2))
+
+
+class TestOneBufferViewedAtTwoElementTypes(unittest.TestCase):
+    """Two stages, one buffer, two element types -- and one address."""
+
+    def test_each_access_carries_its_own_element_type_on_one_buf_id(self):
+        plan = ktir.build_kernel_plan(make_two_element_type_specs())
+        produce, consume = plan.steps
+        [(link, statistic)] = [pair for pair in consume.ins if pair[0] == "pair"]
+        self.assertEqual((produce.out_buf_id, link), ("pair", "pair"))
+        self.assertEqual(produce.out.elems.storage, "!spyreop.fp16_fused")
+        self.assertEqual(statistic.elems.storage, "f16")
+        # One buffer, so one geometry: the views differ in element type only.
+        self.assertEqual(produce.out.buffer.layout, statistic.buffer.layout)
+        self.assertEqual(
+            (produce.out.buffer.arg_index, statistic.buffer.arg_index), (1, 1)
+        )
+
+    def test_the_signature_still_lists_the_buffer_once(self):
+        """The dedup by ``buf_id`` is what keeps the signature right while the"""
+        plan = ktir.build_kernel_plan(make_two_element_type_specs())
+        self.assertEqual([b.buf_id for b in plan.parameters].count("pair"), 1)
+        self.assertEqual(
+            [b.buf_id for b in plan.parameters],
+            ["x0", "pair", "x1", "s2", "s3", "s4", "out0"],
+        )
+
+    def test_two_element_types_for_one_buffer_in_one_stage_are_refused(self):
+        """Refused, not keyed more finely: the views are per ``(stage, buf_id)``,"""
+        specs = make_two_element_type_specs()
+        consume = specs[1]
+        # Operand 3, which the recipe does not name and which therefore reads its
+        # buffer at the buffer's fused arrangement, now names the very buffer
+        # operand 1 reads unfused.
+        consume.args[3] = dataclasses.replace(
+            consume.args[1], element_arrangement=ElementArrangement.EXX2
+        )
+        with self.assertRaises(NotImplementedError) as ctx:
+            ktir.build_kernel_plan(specs)
+        self.assertIn("two element types in one stage", str(ctx.exception))
+
+
+class TestArityBeyondTwoAndPerOperandElementTypes(unittest.TestCase):
+    """An op with five operands, and one of them read at another element type."""
+
+    @staticmethod
+    def _five_inputs(arrangements=None):
+        return make_op_spec(
+            "layernormnorm",
+            inputs=5,
+            size=[12, 64, 64],
+            dtype=DataFormats.IEEE_FP32,
+            arrangements=arrangements,
+        )
+
+    def test_five_operands_plan_with_one_map_each_and_one_for_the_result(self):
+        plan = ktir.build_kernel_plan([self._five_inputs()])
+        [step] = plan.steps
+        self.assertEqual(len(step.ins), 5)
+        self.assertEqual(len(plan.parameters), 6)
+        self.assertIs(step.surface, ktir.Surface.GENERIC)
+        self.assertEqual(step.indexing.maps, ((0, 1, 2),) * 6)
+
+    def test_the_recipe_and_not_the_arrangement_types_an_operand(self):
+        """Three operands whose buffers all hold fused statistics; the recipe says"""
+        recipe = ktir.KtirBuilder.RECIPES["layernormnorm"]
+        self.assertEqual(recipe.unfused, (1, 2))  # squares and scale, as f16
+        fused = ElementArrangement.EXX2
+        plan = ktir.build_kernel_plan(
+            [self._five_inputs([None, fused, fused, fused, None, None])]
+        )
+        [step] = plan.steps
+        self.assertEqual(step.ins[1][1].elems.storage, "f32")
+        self.assertEqual(step.ins[2][1].elems.storage, "f32")
+        self.assertEqual(step.ins[3][1].elems.storage, "!spyreop.fp32_fused")
+
+    def test_the_result_can_be_the_unfused_position(self):
+        """``layernormscale_fused`` returns a plain float out of a buffer the"""
+        self.assertEqual(ktir.KtirBuilder.RECIPES["layernormscale"].unfused, (1,))
+        plan = ktir.build_kernel_plan(
+            [
+                make_op_spec(
+                    "layernormscale",
+                    inputs=1,
+                    arrangements=[ElementArrangement.EXX2, ElementArrangement.EXX2],
+                )
+            ]
+        )
+        [step] = plan.steps
+        self.assertEqual(step.ins[0][1].elems.storage, "!spyreop.fp16_fused")
+        self.assertEqual(step.out.elems.storage, "f16")
+
+    def test_an_unfused_position_the_op_does_not_have_is_a_typo(self):
+        """A recipe is source, so a position past the result fails where it is"""
+        with self.assertRaises(ValueError) as ctx:
+            ktir.Recipe(
+                arity=1,
+                arms=ktir.Arm(
+                    kind=ktir.BindingKind.PAYLOAD, binding=lambda: None, dtypes=()
+                ),
+                unfused=(2,),
+            )
+        self.assertIn("does not have", str(ctx.exception))
+
+
+class TestReadingAStatisticAtTheHeadOfItsStick(unittest.TestCase):
+    """A pointwise stage reading what a reduction wrote."""
+
+    def test_the_reader_has_the_rank_the_producer_registered(self):
+        plan = ktir.build_kernel_plan(make_statistic_reader_specs())
+        produce, consume = plan.steps
+        [(_x1, _full), (link, statistic)] = consume.ins
+        self.assertEqual(link, "buf0")
+        self.assertEqual(len(statistic.extent), len(produce.out.extent))
+        self.assertEqual(plan.buffers["buf0"].layout.extent, (256, 64))
+
+    def test_the_tile_is_the_stick_head_and_the_view_is_the_whole_stick(self):
+        """The negative test's constraint, stated as the two numbers it is about:"""
+        plan = ktir.build_kernel_plan(make_statistic_reader_specs())
+        _produce, consume = plan.steps
+        [_full, (_link, statistic)] = consume.ins
+        self.assertEqual(statistic.extent, (256, 1))
+        self.assertEqual(plan.buffers["buf0"].layout.extent[-1], 64)
+
+    def test_the_producer_still_writes_the_whole_stick(self):
+        """The asymmetry: the reduction's own output keeps all 64 lanes, which is"""
+        plan = ktir.build_kernel_plan(make_statistic_reader_specs())
+        produce, _consume = plan.steps
+        self.assertEqual(produce.out.extent, (256, 64))
+
+    def test_the_squeezed_read_derives_the_statistic_map(self):
+        """And the two capabilities meet: a rank-reduced operand at a one-element"""
+        plan = ktir.build_kernel_plan(make_statistic_reader_specs())
+        _produce, consume = plan.steps
+        self.assertEqual(consume.indexing.maps, ((0, 1, 2), (1, None), (0, 1, 2)))
+
+
+class TestAReducingBodyThatIgnoresItsAccumulator(unittest.TestCase):
+    """A reduction registered ``COMBINER`` whose binding ignores ``accumulated``."""
+
+    def test_it_reduces_and_is_registered_as_a_combiner(self):
+        """Both statements of the one bit agree, so the equality check passes."""
+        recipe = ktir.KtirBuilder.RECIPES["exx2"]
+        self.assertEqual(recipe.arity, 1)
+        self.assertIs(recipe.arm(FP16).kind, ktir.BindingKind.COMBINER)
+
+    def test_the_plan_is_the_ordinary_on_stick_reduction(self):
+        specs = make_onstick_sum_specs(
+            "exx2", arrangements=[ElementArrangement.STANDARD, ElementArrangement.EXX2]
+        )
+        plan = ktir.build_kernel_plan(specs)
+        [step] = plan.steps
+        self.assertIs(step.surface, ktir.Surface.GENERIC)
+        self.assertEqual(
+            step.indexing.iters, ("reduction", "parallel", "reduction", "parallel")
+        )
+        self.assertEqual(step.indexing.maps, ((0, 1, 2), (1, 3)))
+        # The accumulator's type is the output buffer's, and that is the pair:
+        # ``exx2_fused`` returns it, so nothing else has to be told.
+        self.assertEqual(step.out.elems.value, "!spyreop.fp16_fused")
+        self.assertEqual(step.out.extent, (256, 64))
+
+
+class TestFusedElementType(unittest.TestCase):
+    """One buffer's ``element_arrangement`` decides its element TYPE."""
+
+    def test_exx2_is_the_fused_spelling_of_its_dtype(self):
+        for dtype, spelling in (
+            (DataFormats.SEN169_FP16, "!spyreop.fp16_fused"),
+            (DataFormats.IEEE_FP16, "!spyreop.fp16_fused"),
+            (DataFormats.IEEE_FP32, "!spyreop.fp32_fused"),
+        ):
+            with self.subTest(dtype=dtype):
+                fused = ktir.ElemTypes.of(dtype, ElementArrangement.EXX2)
+                self.assertEqual((fused.storage, fused.value), (spelling, spelling))
+                # The same dtype in the standard order is the plain float: the
+                # arrangement is what selects the table.
+                self.assertNotEqual(ktir.ElemTypes.of(dtype).storage, spelling)
+
+    def test_a_dtype_with_no_fused_spelling_is_refused(self):
+        """An integer pair has no spelling in the dialect, so it is not guessed:"""
+        with self.assertRaises(NotImplementedError) as ctx:
+            ktir.ElemTypes.of(DataFormats.IEEE_INT32, ElementArrangement.EXX2)
+        self.assertIn("EXX2", str(ctx.exception))
+
+    def test_the_buffer_and_the_access_both_take_the_fused_type(self):
+        """The view and the tile agree, because one derivation answers both."""
+        specs = [
+            make_op_spec(
+                "layernormscale",
+                inputs=1,
+                arrangements=[ElementArrangement.EXX2, ElementArrangement.STANDARD],
+            )
+        ]
+        plan = ktir.build_kernel_plan(specs)
+        [step] = plan.steps
+        [(_buf_id, source)] = step.ins
+        self.assertEqual(source.elems.storage, "!spyreop.fp16_fused")
+        self.assertEqual(plan.buffers["arg0"].elems.storage, "!spyreop.fp16_fused")
+        # The pair is one element, so the extent is the arg's own device_size.
+        self.assertEqual(plan.buffers["arg0"].layout.extent, tuple(ADD_SIZE))
+        # And the OUTPUT of this op is not fused: nothing propagates the flag.
+        self.assertEqual(step.out.elems.storage, "f16")
+
+    def test_layernormscale_binds_the_fused_form_at_arity_one(self):
+        """The frontend hands this op the pair as ONE operand."""
+        self.assertEqual(ktir.KtirBuilder.RECIPES["layernormscale"].arity, 1)
+
+
+class TestAnAccessOnlySpecIsNoStage(unittest.TestCase):
+    """A spec that carries only a placement becomes a hint, not a stage."""
+
+    def test_the_placement_emits_no_step_and_its_readers_read_the_source(self):
+        plan = ktir.build_kernel_plan(make_access_only_specs())
+        # Two readers, two steps: the placement contributed neither a step nor a
+        # stage number.
+        self.assertEqual([step.op for step in plan.steps], ["exp", "sqrt"])
+        self.assertEqual([step.stage for step in plan.steps], [0, 1])
+        for step in plan.steps:
+            [(read_id, access)] = step.ins
+            with self.subTest(op=step.op):
+                # The spec still names the link; the ACCESS is of the source.
+                self.assertEqual(read_id, "staged")
+                self.assertEqual(access.buffer.buf_id, "x")
+                # ...at the reader's own extent and coefficients, not the
+                # placement's: nothing is authored and nothing is translated.
+                self.assertEqual(access.extent, tuple(ADD_SIZE))
+
+    def test_the_link_is_neither_a_parameter_nor_a_threaded_value(self):
+        """One parameter per buffer that reaches memory: the source, and the two"""
+        plan = ktir.build_kernel_plan(make_access_only_specs())
+        self.assertEqual(
+            [(b.buf_id, b.arg_index) for b in plan.parameters],
+            [("x", 0), ("out0", 1), ("out1", 2)],
+        )
+        self.assertEqual(plan.hints["staged"].buf_id, "x")
+        # Not threaded: a hinted buffer has a real view and a real load, which is
+        # what ``Access.buffer`` being set says.
+        self.assertNotIn("staged", plan.buffers)
+
+    def test_a_near_miss_is_refused_rather_than_hinted_away(self):
+        """The one condition whose absence would be silent."""
+        for label, mutate in (
+            ("format", lambda arg: setattr(arg, "device_dtype", DataFormats.IEEE_FP32)),
+            (
+                "coordinates",
+                lambda arg: setattr(
+                    arg, "device_coordinates", list(reversed(arg.device_coordinates))
+                ),
+            ),
+            ("extent", lambda arg: setattr(arg, "device_size", [16, 512, 32])),
+        ):
+            with self.subTest(differs=label):
+                specs = make_access_only_specs()
+                mutate(specs[0].args[1])
+                with self.assertRaises(NotImplementedError) as ctx:
+                    ktir.build_kernel_plan(specs)
+                self.assertIn(
+                    "real data movement rather than a placement", str(ctx.exception)
+                )
+
+    def test_a_link_with_two_writers_is_refused(self):
+        """Dropping the placement would leave the other writer's data being read"""
+        specs = make_access_only_specs()
+        second_writer = make_op_spec(
+            "exp",
+            inputs=1,
+            names=["x", "staged"],
+            allocations=[None, {"lx": 0}],
+            first_arg_index=3,
+        )
+        with self.assertRaises(NotImplementedError) as ctx:
+            ktir.build_kernel_plan([specs[0], second_writer, *specs[1:]])
+        self.assertIn("written by 2 ops", str(ctx.exception))
+
+    def test_a_placement_into_a_buffer_the_kernel_does_not_own_is_refused(self):
+        """Only an owned link makes this kernel's reads all the reads there are: a"""
+        specs = make_access_only_specs()
+        specs[0] = make_op_spec(IDENTITY_OP, inputs=1, names=["x", "staged"])
+        with self.assertRaises(NotImplementedError) as ctx:
+            ktir.build_kernel_plan(specs)
+        self.assertIn("rather than one this kernel owns", str(ctx.exception))
+
+    def test_a_placement_with_two_inputs_is_refused(self):
+        """A spec with two inputs is computing something, whatever it is called."""
+        specs = make_access_only_specs()
+        specs[0] = make_op_spec(
+            IDENTITY_OP,
+            inputs=2,
+            names=["x", "y", "staged"],
+            allocations=[None, None, {"lx": 0}],
+        )
+        with self.assertRaises(NotImplementedError) as ctx:
+            ktir.build_kernel_plan(specs)
+        self.assertIn(
+            "a hint relates exactly one source to one link", str(ctx.exception)
+        )
 
 
 class TestWithoutTheDialectBuild(unittest.TestCase):

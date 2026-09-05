@@ -26,11 +26,16 @@ Self-contained otherwise: no live Inductor graph, no compiler run.
 import unittest
 
 from test_ktir_validate import (
+    make_access_only_specs,
+    make_broadcast_op_spec,
     make_chained_op_specs,
     make_nested_op_spec,
     make_onstick_sum_specs,
     make_op_spec,
+    make_statistic_reader_specs,
+    make_two_element_type_specs,
 )
+from torch_spyre._C import ElementArrangement
 
 
 def _mlir_ktdp_available() -> bool:
@@ -64,16 +69,16 @@ module {
   func.func @ktir_fused_add_0(%arg0: index, %arg1: index, %arg2: index) attributes {grid = [1]} {
     %c0 = arith.constant 0 : index
     %0 = ktdp.construct_memory_view %arg0, sizes: [16, 512, 64], strides: [32768, 64, 1] {coordinate_set = #set, memory_space = #ktdp.memory_space<global>} : memref<16x512x64xf16>
-    %1 = ktdp.construct_memory_view %arg1, sizes: [16, 512, 64], strides: [32768, 64, 1] {coordinate_set = #set, memory_space = #ktdp.memory_space<global>} : memref<16x512x64xf16>
-    %2 = ktdp.construct_memory_view %arg2, sizes: [16, 512, 64], strides: [32768, 64, 1] {coordinate_set = #set, memory_space = #ktdp.memory_space<global>} : memref<16x512x64xf16>
-    %3 = ktdp.construct_access_tile %0[%c0, %c0, %c0] {access_tile_order = #map, access_tile_set = #set} : memref<16x512x64xf16> -> !ktdp.access_tile<16x512x64xindex>
-    %4 = ktdp.load %3 : <16x512x64xindex> -> tensor<16x512x64xf16>
-    %5 = ktdp.construct_access_tile %1[%c0, %c0, %c0] {access_tile_order = #map, access_tile_set = #set} : memref<16x512x64xf16> -> !ktdp.access_tile<16x512x64xindex>
-    %6 = ktdp.load %5 : <16x512x64xindex> -> tensor<16x512x64xf16>
-    %7 = tensor.empty() : tensor<16x512x64xf16>
-    %8 = linalg.add ins(%4, %6 : tensor<16x512x64xf16>, tensor<16x512x64xf16>) outs(%7 : tensor<16x512x64xf16>) -> tensor<16x512x64xf16>
-    %9 = ktdp.construct_access_tile %2[%c0, %c0, %c0] {access_tile_order = #map, access_tile_set = #set} : memref<16x512x64xf16> -> !ktdp.access_tile<16x512x64xindex>
-    ktdp.store %8, %9 : tensor<16x512x64xf16>, <16x512x64xindex>
+    %1 = ktdp.construct_access_tile %0[%c0, %c0, %c0] {access_tile_order = #map, access_tile_set = #set} : memref<16x512x64xf16> -> !ktdp.access_tile<16x512x64xindex>
+    %2 = ktdp.load %1 : <16x512x64xindex> -> tensor<16x512x64xf16>
+    %3 = ktdp.construct_memory_view %arg1, sizes: [16, 512, 64], strides: [32768, 64, 1] {coordinate_set = #set, memory_space = #ktdp.memory_space<global>} : memref<16x512x64xf16>
+    %4 = ktdp.construct_access_tile %3[%c0, %c0, %c0] {access_tile_order = #map, access_tile_set = #set} : memref<16x512x64xf16> -> !ktdp.access_tile<16x512x64xindex>
+    %5 = ktdp.load %4 : <16x512x64xindex> -> tensor<16x512x64xf16>
+    %6 = tensor.empty() : tensor<16x512x64xf16>
+    %7 = linalg.add ins(%2, %5 : tensor<16x512x64xf16>, tensor<16x512x64xf16>) outs(%6 : tensor<16x512x64xf16>) -> tensor<16x512x64xf16>
+    %8 = ktdp.construct_memory_view %arg2, sizes: [16, 512, 64], strides: [32768, 64, 1] {coordinate_set = #set, memory_space = #ktdp.memory_space<global>} : memref<16x512x64xf16>
+    %9 = ktdp.construct_access_tile %8[%c0, %c0, %c0] {access_tile_order = #map, access_tile_set = #set} : memref<16x512x64xf16> -> !ktdp.access_tile<16x512x64xindex>
+    ktdp.store %7, %9 : tensor<16x512x64xf16>, <16x512x64xindex>
     return
   }
 }
@@ -141,42 +146,37 @@ class TestKtirBakedAddresses(unittest.TestCase):
     _mlir_ktdp_available(),
     "mlir_ktdp with the func/arith/linalg/scf/tensor dialect bindings is not installed",
 )
-class TestInternalBufferIsThreaded(unittest.TestCase):
-    """``(a + b) * c`` in one kernel, with the intermediate threaded.
-
-    ``buf0`` is allocated in LX, which is the contract saying the kernel owns it,
-    so it gets no func parameter, no memory view, no store and no load: the
-    ``linalg.mul`` consumes the ``linalg.add``'s result directly.
-
-    A live kernel does not reach this yet -- the frontend puts the two ops in two
-    kernels, with buf0's LX allocation crossing the boundary between them, and the
-    emitter refuses that (``verify.py``'s ``chain`` case is the standing check).
-    What this pins is the emission, so that fusing the two ops upstream is the
-    only thing that has to change.
-    """
+class TestAChainRoundTripsItsIntermediate(unittest.TestCase):
+    """``(a + b) * c`` in one kernel: the add stores, the mul loads."""
 
     EXPECTED_CHAIN_KTIR = """\
 #map = affine_map<(d0, d1, d2) -> (d0, d1, d2)>
 #set = affine_set<(d0, d1, d2) : (d0 >= 0, -d0 + 15 >= 0, d1 >= 0, -d1 + 511 >= 0, d2 >= 0, -d2 + 63 >= 0)>
 module {
-  func.func @ktir_fused_add_mul_0(%arg0: index, %arg1: index, %arg2: index, %arg3: index) attributes {grid = [1]} {
+  func.func @ktir_fused_add_mul_0(%arg0: index, %arg1: index, %arg2: index, %arg3: index, %arg4: index) attributes {grid = [1]} {
     %c0 = arith.constant 0 : index
     %0 = ktdp.construct_memory_view %arg0, sizes: [16, 512, 64], strides: [32768, 64, 1] {coordinate_set = #set, memory_space = #ktdp.memory_space<global>} : memref<16x512x64xf16>
-    %1 = ktdp.construct_memory_view %arg1, sizes: [16, 512, 64], strides: [32768, 64, 1] {coordinate_set = #set, memory_space = #ktdp.memory_space<global>} : memref<16x512x64xf16>
-    %2 = ktdp.construct_memory_view %arg2, sizes: [16, 512, 64], strides: [32768, 64, 1] {coordinate_set = #set, memory_space = #ktdp.memory_space<global>} : memref<16x512x64xf16>
-    %3 = ktdp.construct_memory_view %arg3, sizes: [16, 512, 64], strides: [32768, 64, 1] {coordinate_set = #set, memory_space = #ktdp.memory_space<global>} : memref<16x512x64xf16>
-    %4 = ktdp.construct_access_tile %0[%c0, %c0, %c0] {access_tile_order = #map, access_tile_set = #set} : memref<16x512x64xf16> -> !ktdp.access_tile<16x512x64xindex>
+    %1 = ktdp.construct_access_tile %0[%c0, %c0, %c0] {access_tile_order = #map, access_tile_set = #set} : memref<16x512x64xf16> -> !ktdp.access_tile<16x512x64xindex>
+    %2 = ktdp.load %1 : <16x512x64xindex> -> tensor<16x512x64xf16>
+    %3 = ktdp.construct_memory_view %arg1, sizes: [16, 512, 64], strides: [32768, 64, 1] {coordinate_set = #set, memory_space = #ktdp.memory_space<global>} : memref<16x512x64xf16>
+    %4 = ktdp.construct_access_tile %3[%c0, %c0, %c0] {access_tile_order = #map, access_tile_set = #set} : memref<16x512x64xf16> -> !ktdp.access_tile<16x512x64xindex>
     %5 = ktdp.load %4 : <16x512x64xindex> -> tensor<16x512x64xf16>
-    %6 = ktdp.construct_access_tile %1[%c0, %c0, %c0] {access_tile_order = #map, access_tile_set = #set} : memref<16x512x64xf16> -> !ktdp.access_tile<16x512x64xindex>
-    %7 = ktdp.load %6 : <16x512x64xindex> -> tensor<16x512x64xf16>
-    %8 = tensor.empty() : tensor<16x512x64xf16>
-    %9 = linalg.add ins(%5, %7 : tensor<16x512x64xf16>, tensor<16x512x64xf16>) outs(%8 : tensor<16x512x64xf16>) -> tensor<16x512x64xf16>
-    %10 = ktdp.construct_access_tile %2[%c0, %c0, %c0] {access_tile_order = #map, access_tile_set = #set} : memref<16x512x64xf16> -> !ktdp.access_tile<16x512x64xindex>
-    %11 = ktdp.load %10 : <16x512x64xindex> -> tensor<16x512x64xf16>
-    %12 = tensor.empty() : tensor<16x512x64xf16>
-    %13 = linalg.mul ins(%9, %11 : tensor<16x512x64xf16>, tensor<16x512x64xf16>) outs(%12 : tensor<16x512x64xf16>) -> tensor<16x512x64xf16>
-    %14 = ktdp.construct_access_tile %3[%c0, %c0, %c0] {access_tile_order = #map, access_tile_set = #set} : memref<16x512x64xf16> -> !ktdp.access_tile<16x512x64xindex>
-    ktdp.store %13, %14 : tensor<16x512x64xf16>, <16x512x64xindex>
+    %6 = tensor.empty() : tensor<16x512x64xf16>
+    %7 = linalg.add ins(%2, %5 : tensor<16x512x64xf16>, tensor<16x512x64xf16>) outs(%6 : tensor<16x512x64xf16>) -> tensor<16x512x64xf16>
+    %8 = ktdp.construct_memory_view %arg2, sizes: [16, 512, 64], strides: [32768, 64, 1] {coordinate_set = #set, memory_space = #ktdp.memory_space<global>} : memref<16x512x64xf16>
+    %9 = ktdp.construct_access_tile %8[%c0, %c0, %c0] {access_tile_order = #map, access_tile_set = #set} : memref<16x512x64xf16> -> !ktdp.access_tile<16x512x64xindex>
+    ktdp.store %7, %9 : tensor<16x512x64xf16>, <16x512x64xindex>
+    %10 = ktdp.construct_memory_view %arg2, sizes: [16, 512, 64], strides: [32768, 64, 1] {coordinate_set = #set, memory_space = #ktdp.memory_space<global>} : memref<16x512x64xf16>
+    %11 = ktdp.construct_access_tile %10[%c0, %c0, %c0] {access_tile_order = #map, access_tile_set = #set} : memref<16x512x64xf16> -> !ktdp.access_tile<16x512x64xindex>
+    %12 = ktdp.load %11 : <16x512x64xindex> -> tensor<16x512x64xf16>
+    %13 = ktdp.construct_memory_view %arg3, sizes: [16, 512, 64], strides: [32768, 64, 1] {coordinate_set = #set, memory_space = #ktdp.memory_space<global>} : memref<16x512x64xf16>
+    %14 = ktdp.construct_access_tile %13[%c0, %c0, %c0] {access_tile_order = #map, access_tile_set = #set} : memref<16x512x64xf16> -> !ktdp.access_tile<16x512x64xindex>
+    %15 = ktdp.load %14 : <16x512x64xindex> -> tensor<16x512x64xf16>
+    %16 = tensor.empty() : tensor<16x512x64xf16>
+    %17 = linalg.mul ins(%12, %15 : tensor<16x512x64xf16>, tensor<16x512x64xf16>) outs(%16 : tensor<16x512x64xf16>) -> tensor<16x512x64xf16>
+    %18 = ktdp.construct_memory_view %arg4, sizes: [16, 512, 64], strides: [32768, 64, 1] {coordinate_set = #set, memory_space = #ktdp.memory_space<global>} : memref<16x512x64xf16>
+    %19 = ktdp.construct_access_tile %18[%c0, %c0, %c0] {access_tile_order = #map, access_tile_set = #set} : memref<16x512x64xf16> -> !ktdp.access_tile<16x512x64xindex>
+    ktdp.store %17, %19 : tensor<16x512x64xf16>, <16x512x64xindex>
     return
   }
 }
@@ -184,7 +184,7 @@ module {
 
     @staticmethod
     def _chain():
-        """``(a + b) * c`` in one kernel: the add's result is the mul's operand."""
+        """``(a + b) * c`` in one kernel, the add's result stored for the mul."""
         return make_chained_op_specs(("add", "mul"))
 
     def test_chain_golden(self):
@@ -193,21 +193,63 @@ module {
         emitted = generate_ktir("ktir_fused_add_mul_0", self._chain())
         self.assertEqual(emitted, self.EXPECTED_CHAIN_KTIR)
 
-    def test_the_intermediate_leaves_no_trace_in_memory(self):
-        """The golden's point, asserted as counts so it cannot be read past.
-
-        Three loads and one store for four buffers: buf0 is a value, and the
-        second op's first operand is the first op's result.
-        """
+    def test_the_intermediate_round_trips_through_memory(self):
+        """The golden's point, as counts so it cannot be read past."""
         from torch_spyre._inductor.codegen.ktir import generate_ktir
 
         emitted = generate_ktir("ktir_fused_add_mul_0", self._chain())
-        self.assertEqual(emitted.count("ktdp.load"), 3)  # a, b, c -- not buf0
-        self.assertEqual(emitted.count("ktdp.store"), 1)  # buf1 only
-        self.assertEqual(emitted.count("ktdp.construct_memory_view"), 4)
+        self.assertEqual(emitted.count("ktdp.load"), 4)  # a, b, c, and buf0
+        self.assertEqual(emitted.count("ktdp.store"), 2)  # buf0 and buf1
+        self.assertEqual(emitted.count("ktdp.construct_memory_view"), 6)
         [add] = [ln for ln in emitted.splitlines() if "linalg.add ins(" in ln]
         [mul] = [ln for ln in emitted.splitlines() if "linalg.mul ins(" in ln]
-        self.assertIn(f"ins({add.split('=')[0].strip()},", mul)
+        self.assertNotIn(f"ins({add.split('=')[0].strip()},", mul)
+
+
+@unittest.skipUnless(
+    _mlir_ktdp_available(),
+    "mlir_ktdp with the func/arith/linalg/scf/tensor dialect bindings is not installed",
+)
+class TestAStageOwnsItsViews(unittest.TestCase):
+    """``(a + b) * a``: one buffer, read by two stages, viewed twice."""
+
+    @staticmethod
+    def _two_stages_over_one_buffer() -> list:
+        """``(a + b) * a``: the sum round-trips, and ``a`` is read by both stages."""
+        add = make_op_spec(
+            "add", names=["arg0", "arg1", "buf0"], allocations=[None, None, None]
+        )
+        mul = make_op_spec(
+            "mul", names=["buf0", "arg0", "buf1"], allocations=[None, None, None]
+        )
+        # ``make_op_spec`` numbers each spec's args from ``first_arg_index``, and
+        # this kernel's second stage re-reads two buffers the first one already
+        # numbered.  Said here rather than by a ``first_arg_index``, because the
+        # point of the fixture is that ``arg0`` is ONE buffer at ONE index -- and
+        # so is ``buf0``, which stage 0 stores and stage 1 loads back.
+        mul.args[0].arg_index = 2  # buf0, as stage 0 numbered it
+        mul.args[1].arg_index = 0  # arg0, likewise
+        mul.args[2].arg_index = 3  # buf1, after arg0, arg1 and buf0
+        return [add, mul]
+
+    def test_a_buffer_two_stages_read_is_viewed_once_in_each(self):
+        from torch_spyre._inductor.codegen.ktir import generate_ktir
+
+        emitted = generate_ktir(
+            "ktir_fused_add_mul_0", self._two_stages_over_one_buffer()
+        )
+        # The two stages are the two computes, so the compute lines are the
+        # boundary: nothing before the add belongs to the mul, and vice versa.
+        first, second = emitted.split("linalg.add ins(")
+        self.assertEqual(first.count("construct_memory_view %arg0"), 1)
+        self.assertEqual(second.count("construct_memory_view %arg0"), 1)
+        # Six views for four buffers: arg0 twice (once per stage), arg1 once, and
+        # buf0 twice -- stage 0 stores it and stage 1 loads it back, each through
+        # its own view -- plus buf1 once.
+        self.assertEqual(emitted.count("construct_memory_view"), 6)
+        # A round-tripped intermediate leaves a store and a load behind it.
+        self.assertEqual(emitted.count("ktdp.store"), 2)
+        self.assertEqual(emitted.count("ktdp.load"), 4)
 
 
 @unittest.skipUnless(
@@ -231,23 +273,23 @@ module {
   func.func @ktir_fused_add_0(%arg0: index, %arg1: index, %arg2: index) attributes {grid = [32]} {
     %c0 = arith.constant 0 : index
     %0 = ktdp.get_compute_tile_id : index
-    %1 = ktdp.construct_memory_view %arg0, sizes: [16, 512, 64], strides: [32768, 64, 1] {coordinate_set = #set, memory_space = #ktdp.memory_space<global>} : memref<16x512x64xf16>
-    %2 = ktdp.construct_memory_view %arg1, sizes: [16, 512, 64], strides: [32768, 64, 1] {coordinate_set = #set, memory_space = #ktdp.memory_space<global>} : memref<16x512x64xf16>
-    %3 = ktdp.construct_memory_view %arg2, sizes: [16, 512, 64], strides: [32768, 64, 1] {coordinate_set = #set, memory_space = #ktdp.memory_space<global>} : memref<16x512x64xf16>
     %c16 = arith.constant 16 : index
-    %4 = arith.muli %0, %c16 : index
-    %5 = ktdp.construct_access_tile %1[%c0, %4, %c0] {access_tile_order = #map, access_tile_set = #set1} : memref<16x512x64xf16> -> !ktdp.access_tile<16x16x64xindex>
-    %6 = ktdp.load %5 : <16x16x64xindex> -> tensor<16x16x64xf16>
+    %1 = arith.muli %0, %c16 : index
+    %2 = ktdp.construct_memory_view %arg0, sizes: [16, 512, 64], strides: [32768, 64, 1] {coordinate_set = #set, memory_space = #ktdp.memory_space<global>} : memref<16x512x64xf16>
+    %3 = ktdp.construct_access_tile %2[%c0, %1, %c0] {access_tile_order = #map, access_tile_set = #set1} : memref<16x512x64xf16> -> !ktdp.access_tile<16x16x64xindex>
+    %4 = ktdp.load %3 : <16x16x64xindex> -> tensor<16x16x64xf16>
     %c16_0 = arith.constant 16 : index
-    %7 = arith.muli %0, %c16_0 : index
-    %8 = ktdp.construct_access_tile %2[%c0, %7, %c0] {access_tile_order = #map, access_tile_set = #set1} : memref<16x512x64xf16> -> !ktdp.access_tile<16x16x64xindex>
-    %9 = ktdp.load %8 : <16x16x64xindex> -> tensor<16x16x64xf16>
-    %10 = tensor.empty() : tensor<16x16x64xf16>
-    %11 = linalg.add ins(%6, %9 : tensor<16x16x64xf16>, tensor<16x16x64xf16>) outs(%10 : tensor<16x16x64xf16>) -> tensor<16x16x64xf16>
+    %5 = arith.muli %0, %c16_0 : index
+    %6 = ktdp.construct_memory_view %arg1, sizes: [16, 512, 64], strides: [32768, 64, 1] {coordinate_set = #set, memory_space = #ktdp.memory_space<global>} : memref<16x512x64xf16>
+    %7 = ktdp.construct_access_tile %6[%c0, %5, %c0] {access_tile_order = #map, access_tile_set = #set1} : memref<16x512x64xf16> -> !ktdp.access_tile<16x16x64xindex>
+    %8 = ktdp.load %7 : <16x16x64xindex> -> tensor<16x16x64xf16>
+    %9 = tensor.empty() : tensor<16x16x64xf16>
+    %10 = linalg.add ins(%4, %8 : tensor<16x16x64xf16>, tensor<16x16x64xf16>) outs(%9 : tensor<16x16x64xf16>) -> tensor<16x16x64xf16>
     %c16_1 = arith.constant 16 : index
-    %12 = arith.muli %0, %c16_1 : index
-    %13 = ktdp.construct_access_tile %3[%c0, %12, %c0] {access_tile_order = #map, access_tile_set = #set1} : memref<16x512x64xf16> -> !ktdp.access_tile<16x16x64xindex>
-    ktdp.store %11, %13 : tensor<16x16x64xf16>, <16x16x64xindex>
+    %11 = arith.muli %0, %c16_1 : index
+    %12 = ktdp.construct_memory_view %arg2, sizes: [16, 512, 64], strides: [32768, 64, 1] {coordinate_set = #set, memory_space = #ktdp.memory_space<global>} : memref<16x512x64xf16>
+    %13 = ktdp.construct_access_tile %12[%c0, %11, %c0] {access_tile_order = #map, access_tile_set = #set1} : memref<16x512x64xf16> -> !ktdp.access_tile<16x16x64xindex>
+    ktdp.store %10, %13 : tensor<16x16x64xf16>, <16x16x64xindex>
     return
   }
 }
@@ -313,20 +355,20 @@ class TestReductionEmission(unittest.TestCase):
 #map = affine_map<(d0, d1, d2) -> (d0, d1, d2)>
 #map1 = affine_map<(d0, d1) -> (d0, d1)>
 #set = affine_set<(d0, d1, d2) : (d0 >= 0, -d0 + 31 >= 0, d1 >= 0, -d1 + 255 >= 0, d2 >= 0, -d2 + 63 >= 0)>
-#set1 = affine_set<(d0, d1) : (d0 >= 0, -d0 + 31 >= 0, d1 >= 0, -d1 + 63 >= 0)>
-#set2 = affine_set<(d0, d1, d2) : (d0 >= 0, -d0 >= 0, d1 >= 0, -d1 + 255 >= 0, d2 >= 0, -d2 + 63 >= 0)>
+#set1 = affine_set<(d0, d1, d2) : (d0 >= 0, -d0 >= 0, d1 >= 0, -d1 + 255 >= 0, d2 >= 0, -d2 + 63 >= 0)>
+#set2 = affine_set<(d0, d1) : (d0 >= 0, -d0 + 31 >= 0, d1 >= 0, -d1 + 63 >= 0)>
 #set3 = affine_set<(d0, d1) : (d0 >= 0, -d0 >= 0, d1 >= 0, -d1 + 63 >= 0)>
 module {
   func.func @ktir_sum_0(%arg0: index, %arg1: index) attributes {grid = [32]} {
     %c0 = arith.constant 0 : index
     %0 = ktdp.get_compute_tile_id : index
     %1 = ktdp.construct_memory_view %arg0, sizes: [32, 256, 64], strides: [16384, 64, 1] {coordinate_set = #set, memory_space = #ktdp.memory_space<global>} : memref<32x256x64xf16>
-    %2 = ktdp.construct_memory_view %arg1, sizes: [32, 64], strides: [64, 1] {coordinate_set = #set1, memory_space = #ktdp.memory_space<global>} : memref<32x64xf16>
-    %3 = ktdp.construct_access_tile %1[%0, %c0, %c0] {access_tile_order = #map, access_tile_set = #set2} : memref<32x256x64xf16> -> !ktdp.access_tile<1x256x64xindex>
-    %4 = ktdp.load %3 : <1x256x64xindex> -> tensor<1x256x64xf16>
-    %5 = tensor.empty() : tensor<1x64xf16>
-    %reduced = linalg.reduce { arith.addf } ins(%4 : tensor<1x256x64xf16>) outs(%5 : tensor<1x64xf16>) dimensions = [1] 
-    %6 = ktdp.construct_access_tile %2[%0, %c0] {access_tile_order = #map1, access_tile_set = #set3} : memref<32x64xf16> -> !ktdp.access_tile<1x64xindex>
+    %2 = ktdp.construct_access_tile %1[%0, %c0, %c0] {access_tile_order = #map, access_tile_set = #set1} : memref<32x256x64xf16> -> !ktdp.access_tile<1x256x64xindex>
+    %3 = ktdp.load %2 : <1x256x64xindex> -> tensor<1x256x64xf16>
+    %4 = tensor.empty() : tensor<1x64xf16>
+    %reduced = linalg.reduce { arith.addf } ins(%3 : tensor<1x256x64xf16>) outs(%4 : tensor<1x64xf16>) dimensions = [1] 
+    %5 = ktdp.construct_memory_view %arg1, sizes: [32, 64], strides: [64, 1] {coordinate_set = #set2, memory_space = #ktdp.memory_space<global>} : memref<32x64xf16>
+    %6 = ktdp.construct_access_tile %5[%0, %c0] {access_tile_order = #map1, access_tile_set = #set3} : memref<32x64xf16> -> !ktdp.access_tile<1x64xindex>
     ktdp.store %reduced, %6 : tensor<1x64xf16>, <1x64xindex>
     return
   }
@@ -419,17 +461,17 @@ module {
   func.func @ktir_sum_onstick_0(%arg0: index, %arg1: index) attributes {grid = [1]} {
     %c0 = arith.constant 0 : index
     %0 = ktdp.construct_memory_view %arg0, sizes: [2, 256, 64], strides: [16384, 64, 1] {coordinate_set = #set, memory_space = #ktdp.memory_space<global>} : memref<2x256x64xf16>
-    %1 = ktdp.construct_memory_view %arg1, sizes: [256, 64], strides: [64, 1] {coordinate_set = #set1, memory_space = #ktdp.memory_space<global>} : memref<256x64xf16>
-    %2 = ktdp.construct_access_tile %0[%c0, %c0, %c0] {access_tile_order = #map, access_tile_set = #set} : memref<2x256x64xf16> -> !ktdp.access_tile<2x256x64xindex>
-    %3 = ktdp.load %2 : <2x256x64xindex> -> tensor<2x256x64xf16>
-    %4 = tensor.empty() : tensor<256x64xf16>
-    %5 = linalg.generic {indexing_maps = [#map1, #map2], iterator_types = ["reduction", "parallel", "reduction", "parallel"]} ins(%3 : tensor<2x256x64xf16>) outs(%4 : tensor<256x64xf16>) {
+    %1 = ktdp.construct_access_tile %0[%c0, %c0, %c0] {access_tile_order = #map, access_tile_set = #set} : memref<2x256x64xf16> -> !ktdp.access_tile<2x256x64xindex>
+    %2 = ktdp.load %1 : <2x256x64xindex> -> tensor<2x256x64xf16>
+    %3 = tensor.empty() : tensor<256x64xf16>
+    %4 = linalg.generic {indexing_maps = [#map1, #map2], iterator_types = ["reduction", "parallel", "reduction", "parallel"]} ins(%2 : tensor<2x256x64xf16>) outs(%3 : tensor<256x64xf16>) {
     ^bb0(%in: f16, %out: f16):
       %7 = arith.addf %out, %in : f16
       linalg.yield %7 : f16
     } -> tensor<256x64xf16>
-    %6 = ktdp.construct_access_tile %1[%c0, %c0] {access_tile_order = #map3, access_tile_set = #set1} : memref<256x64xf16> -> !ktdp.access_tile<256x64xindex>
-    ktdp.store %5, %6 : tensor<256x64xf16>, <256x64xindex>
+    %5 = ktdp.construct_memory_view %arg1, sizes: [256, 64], strides: [64, 1] {coordinate_set = #set1, memory_space = #ktdp.memory_space<global>} : memref<256x64xf16>
+    %6 = ktdp.construct_access_tile %5[%c0, %c0] {access_tile_order = #map3, access_tile_set = #set1} : memref<256x64xf16> -> !ktdp.access_tile<256x64xindex>
+    ktdp.store %4, %6 : tensor<256x64xf16>, <256x64xindex>
     return
   }
 }
@@ -501,9 +543,6 @@ class TestTiledLoopEmission(unittest.TestCase):
 module {
   func.func @ktir_tiled_add_0(%arg0: index, %arg1: index, %arg2: index) attributes {grid = [1]} {
     %c0 = arith.constant 0 : index
-    %0 = ktdp.construct_memory_view %arg0, sizes: [2, 256, 64], strides: [16384, 64, 1] {coordinate_set = #set, memory_space = #ktdp.memory_space<global>} : memref<2x256x64xf16>
-    %1 = ktdp.construct_memory_view %arg1, sizes: [2, 256, 64], strides: [16384, 64, 1] {coordinate_set = #set, memory_space = #ktdp.memory_space<global>} : memref<2x256x64xf16>
-    %2 = ktdp.construct_memory_view %arg2, sizes: [2, 256, 64], strides: [16384, 64, 1] {coordinate_set = #set, memory_space = #ktdp.memory_space<global>} : memref<2x256x64xf16>
     %c0_0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
     %c2 = arith.constant 2 : index
@@ -512,14 +551,17 @@ module {
       %c1_2 = arith.constant 1 : index
       %c256 = arith.constant 256 : index
       scf.for %arg4 = %c0_1 to %c256 step %c1_2 {
-        %3 = ktdp.construct_access_tile %0[%arg3, %arg4, %c0] {access_tile_order = #map, access_tile_set = #set1} : memref<2x256x64xf16> -> !ktdp.access_tile<1x1x64xindex>
-        %4 = ktdp.load %3 : <1x1x64xindex> -> tensor<1x1x64xf16>
-        %5 = ktdp.construct_access_tile %1[%arg3, %arg4, %c0] {access_tile_order = #map, access_tile_set = #set1} : memref<2x256x64xf16> -> !ktdp.access_tile<1x1x64xindex>
-        %6 = ktdp.load %5 : <1x1x64xindex> -> tensor<1x1x64xf16>
-        %7 = tensor.empty() : tensor<1x1x64xf16>
-        %8 = linalg.add ins(%4, %6 : tensor<1x1x64xf16>, tensor<1x1x64xf16>) outs(%7 : tensor<1x1x64xf16>) -> tensor<1x1x64xf16>
-        %9 = ktdp.construct_access_tile %2[%arg3, %arg4, %c0] {access_tile_order = #map, access_tile_set = #set1} : memref<2x256x64xf16> -> !ktdp.access_tile<1x1x64xindex>
-        ktdp.store %8, %9 : tensor<1x1x64xf16>, <1x1x64xindex>
+        %0 = ktdp.construct_memory_view %arg0, sizes: [2, 256, 64], strides: [16384, 64, 1] {coordinate_set = #set, memory_space = #ktdp.memory_space<global>} : memref<2x256x64xf16>
+        %1 = ktdp.construct_access_tile %0[%arg3, %arg4, %c0] {access_tile_order = #map, access_tile_set = #set1} : memref<2x256x64xf16> -> !ktdp.access_tile<1x1x64xindex>
+        %2 = ktdp.load %1 : <1x1x64xindex> -> tensor<1x1x64xf16>
+        %3 = ktdp.construct_memory_view %arg1, sizes: [2, 256, 64], strides: [16384, 64, 1] {coordinate_set = #set, memory_space = #ktdp.memory_space<global>} : memref<2x256x64xf16>
+        %4 = ktdp.construct_access_tile %3[%arg3, %arg4, %c0] {access_tile_order = #map, access_tile_set = #set1} : memref<2x256x64xf16> -> !ktdp.access_tile<1x1x64xindex>
+        %5 = ktdp.load %4 : <1x1x64xindex> -> tensor<1x1x64xf16>
+        %6 = tensor.empty() : tensor<1x1x64xf16>
+        %7 = linalg.add ins(%2, %5 : tensor<1x1x64xf16>, tensor<1x1x64xf16>) outs(%6 : tensor<1x1x64xf16>) -> tensor<1x1x64xf16>
+        %8 = ktdp.construct_memory_view %arg2, sizes: [2, 256, 64], strides: [16384, 64, 1] {coordinate_set = #set, memory_space = #ktdp.memory_space<global>} : memref<2x256x64xf16>
+        %9 = ktdp.construct_access_tile %8[%arg3, %arg4, %c0] {access_tile_order = #map, access_tile_set = #set1} : memref<2x256x64xf16> -> !ktdp.access_tile<1x1x64xindex>
+        ktdp.store %7, %9 : tensor<1x1x64xf16>, <1x1x64xindex>
       }
     }
     return
@@ -608,17 +650,17 @@ module {
   func.func @ktir_fused_sqrt_0(%arg0: index, %arg1: index) attributes {grid = [1]} {
     %c0 = arith.constant 0 : index
     %0 = ktdp.construct_memory_view %arg0, sizes: [16, 512, 64], strides: [32768, 64, 1] {coordinate_set = #set, memory_space = #ktdp.memory_space<global>} : memref<16x512x64xf16>
-    %1 = ktdp.construct_memory_view %arg1, sizes: [16, 512, 64], strides: [32768, 64, 1] {coordinate_set = #set, memory_space = #ktdp.memory_space<global>} : memref<16x512x64xf16>
-    %2 = ktdp.construct_access_tile %0[%c0, %c0, %c0] {access_tile_order = #map, access_tile_set = #set} : memref<16x512x64xf16> -> !ktdp.access_tile<16x512x64xindex>
-    %3 = ktdp.load %2 : <16x512x64xindex> -> tensor<16x512x64xf16>
-    %4 = tensor.empty() : tensor<16x512x64xf16>
-    %5 = linalg.generic {indexing_maps = [#map, #map], iterator_types = ["parallel", "parallel", "parallel"]} ins(%3 : tensor<16x512x64xf16>) outs(%4 : tensor<16x512x64xf16>) {
+    %1 = ktdp.construct_access_tile %0[%c0, %c0, %c0] {access_tile_order = #map, access_tile_set = #set} : memref<16x512x64xf16> -> !ktdp.access_tile<16x512x64xindex>
+    %2 = ktdp.load %1 : <16x512x64xindex> -> tensor<16x512x64xf16>
+    %3 = tensor.empty() : tensor<16x512x64xf16>
+    %4 = linalg.generic {indexing_maps = [#map, #map], iterator_types = ["parallel", "parallel", "parallel"]} ins(%2 : tensor<16x512x64xf16>) outs(%3 : tensor<16x512x64xf16>) {
     ^bb0(%in: f16, %out: f16):
       %7 = spyreop.sqrt %in : f16
       linalg.yield %7 : f16
     } -> tensor<16x512x64xf16>
-    %6 = ktdp.construct_access_tile %1[%c0, %c0, %c0] {access_tile_order = #map, access_tile_set = #set} : memref<16x512x64xf16> -> !ktdp.access_tile<16x512x64xindex>
-    ktdp.store %5, %6 : tensor<16x512x64xf16>, <16x512x64xindex>
+    %5 = ktdp.construct_memory_view %arg1, sizes: [16, 512, 64], strides: [32768, 64, 1] {coordinate_set = #set, memory_space = #ktdp.memory_space<global>} : memref<16x512x64xf16>
+    %6 = ktdp.construct_access_tile %5[%c0, %c0, %c0] {access_tile_order = #map, access_tile_set = #set} : memref<16x512x64xf16> -> !ktdp.access_tile<16x512x64xindex>
+    ktdp.store %4, %6 : tensor<16x512x64xf16>, <16x512x64xindex>
     return
   }
 }
@@ -669,7 +711,8 @@ module {
             ("reciprocal", "spyreop.reciprocal"),
             # The one pair where the handler name and the op differ.
             ("gelufwd", "spyreop.gelu"),
-            ("layernormscale", "spyreop.layernormscale"),
+            # Not ``layernormscale``: its operand is a fused pair, so its text
+            # differs by more than the op name.  TestFusedElementTypeEmission.
         ):
             with self.subTest(op=op):
                 emitted = generate_ktir(
@@ -725,6 +768,297 @@ module {
             "spyreop.softplus %in beta 2.500000e+00 threshold 1.000000e+01 : f16",
             emitted,
         )
+
+
+@unittest.skipUnless(
+    _mlir_ktdp_available(),
+    "mlir_ktdp with the func/arith/linalg/scf/tensor dialect bindings is not installed",
+)
+class TestFusedElementTypeEmission(unittest.TestCase):
+    """An operand whose buffer holds two statistics per stick, read as ONE element."""
+
+    @staticmethod
+    def _fused_operand_spec():
+        """One unary op reading a fused pair and writing plain floats."""
+        return make_op_spec(
+            "layernormscale",
+            inputs=1,
+            arrangements=[ElementArrangement.EXX2, ElementArrangement.STANDARD],
+        )
+
+    def test_the_fused_pair_is_one_element_of_the_view_the_tile_and_the_load(self):
+        from torch_spyre._inductor.codegen.ktir import generate_ktir
+
+        emitted = generate_ktir(
+            "ktir_fused_layernormscale_0", [self._fused_operand_spec()]
+        )
+        # The view says the pair is the element type; the extent is unchanged.
+        self.assertIn(
+            "sizes: [16, 512, 64], strides: [32768, 64, 1]",
+            emitted,
+        )
+        self.assertIn("memref<16x512x64x!spyreop.fp16_fused>", emitted)
+        self.assertIn(
+            "ktdp.load %1 : <16x512x64xindex> -> tensor<16x512x64x!spyreop.fp16_fused>",
+            emitted,
+        )
+        # And the result is plain f16: one view of each kind, not two of one.
+        self.assertEqual(emitted.count("!spyreop.fp16_fused>"), 4)
+        self.assertIn("memref<16x512x64xf16>", emitted)
+
+    def test_the_body_is_the_fused_intrinsic_and_it_returns_a_plain_float(self):
+        from torch_spyre._inductor.codegen.ktir import generate_ktir
+
+        emitted = generate_ktir(
+            "ktir_fused_layernormscale_0", [self._fused_operand_spec()]
+        )
+        self.assertIn("^bb0(%in: !spyreop.fp16_fused, %out: f16):", emitted)
+        self.assertIn(
+            "spyreop.layernormscale_fused %in : !spyreop.fp16_fused -> f16", emitted
+        )
+        # NOT the two-operand form: the mean and the mean of squares are taken
+        # apart by the backend's own pass, below this emitter.
+        self.assertNotIn("spyreop.layernormscale %in", emitted)
+
+
+@unittest.skipUnless(
+    _mlir_ktdp_available(),
+    "mlir_ktdp with the func/arith/linalg/scf/tensor dialect bindings is not installed",
+)
+class TestAReducingBodyThatIgnoresItsAccumulator(unittest.TestCase):
+    """A reduction whose body reads only the element, never the accumulator."""
+
+    @staticmethod
+    def _reducing_vector():
+        """An arity-1 on-stick reduction whose output holds a fused pair."""
+        return make_onstick_sum_specs(
+            "exx2",
+            arrangements=[ElementArrangement.STANDARD, ElementArrangement.EXX2],
+        )
+
+    def test_the_nest_is_the_ordinary_on_stick_reduction(self):
+        """Same iterators and same maps as a bare ``sum`` over the stick: the"""
+        from torch_spyre._inductor.codegen.ktir import generate_ktir
+
+        emitted = generate_ktir("exx2_onstick_1core", self._reducing_vector())
+        self.assertIn("#map1 = affine_map<(d0, d1, d2, d3) -> (d0, d1, d2)>", emitted)
+        self.assertIn("#map2 = affine_map<(d0, d1, d2, d3) -> (d1, d3)>", emitted)
+        self.assertIn(
+            'indexing_maps = [#map1, #map2], iterator_types = ["reduction", '
+            '"parallel", "reduction", "parallel"]',
+            emitted,
+        )
+
+    def test_the_body_reads_the_element_and_not_the_accumulator(self):
+        """The whole capability, in one assertion: ``%out`` types the result and"""
+        from torch_spyre._inductor.codegen.ktir import generate_ktir
+
+        emitted = generate_ktir("exx2_onstick_1core", self._reducing_vector())
+        self.assertIn("^bb0(%in: f16, %out: !spyreop.fp16_fused):", emitted)
+        [body] = [line for line in emitted.splitlines() if "spyreop.exx2_fused" in line]
+        self.assertIn("spyreop.exx2_fused %in : f16 -> !spyreop.fp16_fused", body)
+        self.assertNotIn("%out", body)
+
+    def test_the_pair_is_stored_as_one_element_per_statistic(self):
+        """A whole stick per statistic, viewed at the fused type: rank 2, 256x64,"""
+        from torch_spyre._inductor.codegen.ktir import generate_ktir
+
+        emitted = generate_ktir("exx2_onstick_1core", self._reducing_vector())
+        self.assertIn("sizes: [256, 64], strides: [64, 1]", emitted)
+        self.assertIn("memref<256x64x!spyreop.fp16_fused>", emitted)
+        self.assertIn(
+            "ktdp.store %4, %6 : tensor<256x64x!spyreop.fp16_fused>, <256x64xindex>",
+            emitted,
+        )
+
+
+@unittest.skipUnless(
+    _mlir_ktdp_available(),
+    "mlir_ktdp with the func/arith/linalg/scf/tensor dialect bindings is not installed",
+)
+class TestBroadcastOperandEmission(unittest.TestCase):
+    """A constant result position in an ``indexing_maps`` row, as MLIR text."""
+
+    def test_each_form_prints_the_map_the_chain_writes(self):
+        from torch_spyre._inductor.codegen.ktir import generate_ktir
+
+        for form, printed in (
+            ("row", "affine_map<(d0, d1, d2) -> (d0, 0, d2)>"),
+            ("stat", "affine_map<(d0, d1, d2) -> (d1, 0)>"),
+            ("splat", "affine_map<(d0, d1) -> (d0, 0)>"),
+        ):
+            with self.subTest(form=form):
+                emitted = generate_ktir(f"k_{form}", [make_broadcast_op_spec(form)])
+                self.assertIn(printed, emitted)
+                self.assertIn("linalg.generic", emitted)
+
+    def test_the_broadcast_operand_is_loaded_at_the_shape_its_map_reads(self):
+        """The operand tensor is the tile, one element on the axis it does not"""
+        from torch_spyre._inductor.codegen.ktir import generate_ktir
+
+        emitted = generate_ktir("k_stat", [make_broadcast_op_spec("stat")])
+        self.assertIn("ins(%2, %5 : tensor<16x512x64xf16>, tensor<512x1xf16>)", emitted)
+        self.assertIn('iterator_types = ["parallel", "parallel", "parallel"]', emitted)
+
+    def test_an_aligned_operand_is_untouched(self):
+        """The pointwise golden is the evidence: nothing about a plain ``add``"""
+        from torch_spyre._inductor.codegen.ktir import generate_ktir
+
+        emitted = generate_ktir("ktir_fused_add_0", [make_op_spec()])
+        self.assertEqual(emitted, TestKtirEmitter.EXPECTED_ADD_KTIR)
+
+
+@unittest.skipUnless(
+    _mlir_ktdp_available(),
+    "mlir_ktdp with the func/arith/linalg/scf/tensor dialect bindings is not installed",
+)
+class TestStatisticReadEmission(unittest.TestCase):
+    """Two stages over one statistic buffer: a stick written, a head read."""
+
+    def test_the_write_covers_the_stick_and_the_read_covers_its_head(self):
+        from torch_spyre._inductor.codegen.ktir import generate_ktir
+
+        emitted = generate_ktir("StatReader_1", make_statistic_reader_specs())
+        # One view per stage of the one statistic buffer, both at the whole stick.
+        self.assertEqual(
+            emitted.count(
+                "ktdp.construct_memory_view %arg1, sizes: [256, 64], strides: [64, 1]"
+            ),
+            2,
+        )
+        # The write tiles all 64 lanes; the read tiles the first one.
+        self.assertIn("-> !ktdp.access_tile<256x64xindex>", emitted)
+        self.assertIn("-> !ktdp.access_tile<256x1xindex>", emitted)
+        self.assertIn("ktdp.load %11 : <256x1xindex> -> tensor<256x1xf16>", emitted)
+
+    def test_the_reader_is_a_generic_over_the_statistic_map(self):
+        from torch_spyre._inductor.codegen.ktir import generate_ktir
+
+        emitted = generate_ktir("StatReader_1", make_statistic_reader_specs())
+        self.assertIn("affine_map<(d0, d1, d2) -> (d1, 0)>", emitted)
+        self.assertIn("tensor<2x256x64xf16>, tensor<256x1xf16>)", emitted)
+
+
+@unittest.skipUnless(
+    _mlir_ktdp_available(),
+    "mlir_ktdp with the func/arith/linalg/scf/tensor dialect bindings is not installed",
+)
+class TestArityBeyondTwoEmission(unittest.TestCase):
+    """Five operands in one ``linalg.generic``, every one a func argument."""
+
+    @staticmethod
+    def _five_input_spec():
+        from torch_spyre._C import DataFormats
+
+        return make_op_spec(
+            "layernormnorm", inputs=5, size=[12, 64, 64], dtype=DataFormats.IEEE_FP32
+        )
+
+    def test_the_generic_states_one_map_per_operand_and_one_for_the_result(self):
+        from torch_spyre._inductor.codegen.ktir import generate_ktir
+
+        emitted = generate_ktir("LayerNormNorm_1", [self._five_input_spec()])
+        self.assertIn(
+            "indexing_maps = [#map, #map, #map, #map, #map, #map], "
+            'iterator_types = ["parallel", "parallel", "parallel"]',
+            emitted,
+        )
+        self.assertIn(
+            "^bb0(%in: f32, %in_0: f32, %in_1: f32, %in_2: f32, "
+            "%in_3: f32, %out: f32):",
+            emitted,
+        )
+        # Six index parameters, one per operand and one for the result.
+        self.assertIn(
+            "func.func @LayerNormNorm_1(%arg0: index, %arg1: index, %arg2: index, "
+            "%arg3: index, %arg4: index, %arg5: index)",
+            emitted,
+        )
+
+    def test_the_payload_is_called_with_its_operands_in_order(self):
+        """The spelling is positional, so operand order is the whole contract."""
+        from torch_spyre._inductor.codegen.ktir import generate_ktir
+
+        emitted = generate_ktir("LayerNormNorm_1", [self._five_input_spec()])
+        self.assertIn(
+            "spyreop.layernormnorm %in squares %in_0 scale %in_1 weight %in_2 "
+            "bias %in_3 : f32",
+            emitted,
+        )
+
+
+@unittest.skipUnless(
+    _mlir_ktdp_available(),
+    "mlir_ktdp with the func/arith/linalg/scf/tensor dialect bindings is not installed",
+)
+class TestOneBufferViewedAtTwoElementTypesEmission(unittest.TestCase):
+    """One base address, two memref element types, one func parameter."""
+
+    def test_one_base_is_viewed_at_two_element_types(self):
+        from torch_spyre._inductor.codegen.ktir import generate_ktir
+
+        emitted = generate_ktir("TwoElementTypes_1", make_two_element_type_specs())
+        views = [
+            line
+            for line in emitted.splitlines()
+            if "construct_memory_view %arg1," in line
+        ]
+        self.assertEqual(len(views), 2)
+        # Same base, same sizes and strides; different element type.
+        for view in views:
+            self.assertIn("sizes: [256, 64], strides: [64, 1]", view)
+        self.assertEqual(
+            sum("memref<256x64x!spyreop.fp16_fused>" in view for view in views), 1
+        )
+        self.assertEqual(sum(view.endswith("memref<256x64xf16>") for view in views), 1)
+
+    def test_the_two_views_are_one_parameter_and_one_address(self):
+        from torch_spyre._inductor.codegen.ktir import generate_ktir
+
+        emitted = generate_ktir("TwoElementTypes_1", make_two_element_type_specs())
+        # Seven buffers, seven parameters: the pair is ONE of them.
+        self.assertIn(
+            "func.func @TwoElementTypes_1(%arg0: index, %arg1: index, %arg2: index, "
+            "%arg3: index, %arg4: index, %arg5: index, %arg6: index)",
+            emitted,
+        )
+
+    def test_the_fused_write_covers_the_stick_and_the_plain_read_its_head(self):
+        """The element type and the tile are two different facts about one buffer,"""
+        from torch_spyre._inductor.codegen.ktir import generate_ktir
+
+        emitted = generate_ktir("TwoElementTypes_1", make_two_element_type_specs())
+        self.assertIn(
+            "ktdp.store %4, %6 : tensor<256x64x!spyreop.fp16_fused>, <256x64xindex>",
+            emitted,
+        )
+        self.assertIn("ktdp.load %11 : <256x1xindex> -> tensor<256x1xf16>", emitted)
+
+
+@unittest.skipUnless(
+    _mlir_ktdp_available(),
+    "mlir_ktdp with the func/arith/linalg/scf/tensor dialect bindings is not installed",
+)
+class TestAnAccessOnlySpecEmitsNothing(unittest.TestCase):
+    """The placed buffer appears nowhere; both readers view the source."""
+
+    def test_both_readers_view_the_source_and_the_link_is_absent(self):
+        from torch_spyre._inductor.codegen.ktir import generate_ktir
+
+        emitted = generate_ktir("Placement_1", make_access_only_specs())
+        # Three buffers, three parameters: the source and the two results.
+        self.assertIn(
+            "func.func @Placement_1(%arg0: index, %arg1: index, %arg2: index)",
+            emitted,
+        )
+        # Two computes, so two stages, and the source is viewed once in each.
+        self.assertEqual(emitted.count("spyreop.exp"), 1)
+        self.assertEqual(emitted.count("spyreop.sqrt"), 1)
+        self.assertEqual(emitted.count("construct_memory_view %arg0,"), 2)
+        # Four views for three buffers: the source twice, one per result. The
+        # placed buffer has no view, because it is not a buffer any more.
+        self.assertEqual(emitted.count("construct_memory_view"), 4)
+        self.assertNotIn("staged", emitted)
 
 
 if __name__ == "__main__":
