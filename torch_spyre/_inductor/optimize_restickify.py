@@ -27,6 +27,7 @@ from .logging_utils import get_inductor_logger
 from torch._inductor.dependencies import MemoryDep
 from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import (
+    FixedLayout,
     InputBuffer,
     StorageBox,
     TensorBox,
@@ -35,13 +36,52 @@ from torch._inductor.virtualized import V
 from torch_spyre._C import SpyreTensorLayout
 from .pass_utils import (
     compute_restickify_needed,
+    concretize_expr,
     device_coordinates,
+    find_reduction_var,
     host_coordinates,
+    is_topk,
 )
+from .views import matching_dim
 
 INF = math.inf
 
 logger = get_inductor_logger("optimize_restickify")
+
+
+def _topk_force_restickify_target(
+    dep: "MemoryDep",
+    dep_layout: "FixedLayout",
+    in_stl: "SpyreTensorLayout",
+    target_dep: "MemoryDep",
+    target_dep_layout: "FixedLayout",
+) -> "SpyreTensorLayout | None":
+    """Return a forced restickify target for topk's shape-(1, N) case, or None.
+
+    Assumes op is already known to be topk (checked by the caller). Forces
+    the input's stick off the reduction dim when no other dim survives it.
+    """
+    x_stick_expr = device_coordinates(in_stl, dep, None)[-1]
+    reduction_var = find_reduction_var((dep,), target_dep)
+    if reduction_var not in x_stick_expr.free_symbols:
+        return None
+    x_coords = host_coordinates(dep_layout, dep, None)
+    out_coords = host_coordinates(target_dep_layout, target_dep, None)
+    surviving_coords = [
+        c
+        for c in x_coords
+        if len(c.free_symbols) > 0 and matching_dim(out_coords, c) is not None
+    ]
+    if surviving_coords:
+        return None
+    x_host_size = [concretize_expr(s) for s in dep_layout.size]
+    x_host_stride = [concretize_expr(s) for s in dep_layout.stride]
+    return SpyreTensorLayout(
+        x_host_size,
+        x_host_stride,
+        dep_layout.dtype,
+        list(range(len(x_host_size))) + [-1],
+    )
 
 
 class EdgeCostMap:
@@ -94,9 +134,27 @@ class EdgeCostMap:
           INFEASIBLE         — restickify needed but compute_restickify_target_layout returned None
           SpyreTensorLayout  — feasible restickify target layout
         """
-        needed, tgt = compute_restickify_needed(
-            in_stl, self._dep_layout, self.dep, target_stl, self._target_dep, self._op
-        )
+        forced_target = None
+        if is_topk(self._op):
+            forced_target = _topk_force_restickify_target(
+                self.dep,
+                self._dep_layout,
+                in_stl,
+                self._target_dep,
+                self._target_dep_layout,
+            )
+        tgt: "SpyreTensorLayout | None"
+        if forced_target is not None:
+            needed, tgt = True, forced_target
+        else:
+            needed, tgt = compute_restickify_needed(
+                in_stl,
+                self._dep_layout,
+                self.dep,
+                target_stl,
+                self._target_dep,
+                self._op,
+            )
         if not needed:
             cost = 0.0
             self._layout[in_stl][target_stl] = None
