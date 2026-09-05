@@ -19,8 +19,10 @@ import tempfile
 from pathlib import Path
 
 import pytest
+import torch
 
 from torch_spyre import make_spyre_module  # type: ignore[attr-defined]
+from torch_spyre.constants import DEVICE_NAME
 from torch_spyre.profiler import get_diagnostic_report as profiler_get_diagnostic_report
 from torch_spyre.profiler._ffdc import (
     CATEGORY_COMPILE_BACKEND,
@@ -134,6 +136,47 @@ def _reimport(monkeypatch, name):
 
     monkeypatch.delitem(sys.modules, name, raising=False)
     return importlib.import_module(name)
+
+
+def _write_isolated_ffdc_report(
+    monkeypatch,
+    tmp_path,
+    trigger,
+    *,
+    expected_category: str,
+    match: str,
+):
+    """Capture under ``tmp_path`` via ``TORCHINDUCTOR_CACHE_DIR``; return the JSON path."""
+    monkeypatch.setenv("TORCH_SPYRE_FFDC", "1")
+    monkeypatch.setenv("TORCHINDUCTOR_CACHE_DIR", str(tmp_path))
+    reports_dir = _default_output_dir()
+    assert reports_dir.resolve().is_relative_to(Path(tmp_path).resolve())
+
+    with pytest.raises(RuntimeError, match=match):
+        trigger()
+
+    reports = sorted(reports_dir.glob("ffdc_*.json"))
+    assert len(reports) == 1
+    assert reports[0].name.startswith(f"ffdc_{expected_category}_")
+    with open(reports[0], encoding="utf-8") as handle:
+        on_disk = json.load(handle)
+    assert on_disk["failure"]["category"] == expected_category
+    assert match in (on_disk["failure"].get("message") or "")
+    assert on_disk["failure"].get("traceback")
+    return reports[0]
+
+
+def _retrieve_via_torch_spyre(expected_category: str, report_path, match: str):
+    """No-arg ``torch.spyre.get_diagnostic_report`` must return this report."""
+    assert hasattr(torch, "spyre") and hasattr(torch.spyre, "get_diagnostic_report"), (
+        "torch.spyre.get_diagnostic_report is not bound"
+    )
+    result = torch.spyre.get_diagnostic_report()
+    assert result is not None
+    assert result["failure"]["category"] == expected_category
+    assert result["_report_path"] == str(report_path.resolve())
+    assert result["failure"]["traceback"]
+    assert match in (result["failure"]["message"] or "")
 
 
 class TestFfdcCollect:
@@ -1017,6 +1060,8 @@ class TestFfdcKernelRunner:
 
         Prefer patching the module's bound ``launch_jobplan`` / ``prepare_kernel``.
         Stub ``_C`` only when it is absent (e.g. no extension on Mac).
+        Do not invent ``SymbolicArg`` on a present ``_C`` — that import must
+        fail if the extension is loaded without the type.
         """
         import logging
         import sys
@@ -1032,6 +1077,7 @@ class TestFfdcKernelRunner:
                 launch_jobplan=_launch,
                 prepare_kernel=lambda path: "fake_jobplan",
                 register_kernel_provenance=lambda *a, **k: True,
+                SymbolicArg=object,
             )
         if "torch_spyre._inductor" not in sys.modules:
             inductor = _stub_module(monkeypatch, "torch_spyre._inductor")
@@ -1078,6 +1124,57 @@ class TestFfdcKernelRunner:
 
         with pytest.raises(RuntimeError, match="launch_jobplan failed"):
             runner.run()
+
+    def test_unimplemented_hook_retrieves_via_torch_spyre(self, monkeypatch, tmp_path):
+        """No-arg ``torch.spyre.get_diagnostic_report`` after the unimplemented hook."""
+        try:
+            from torch_spyre.execution.kernel_runner import SpyreUnimplementedRunner
+
+            runner = SpyreUnimplementedRunner("k", "aten::foo")
+        except ImportError:
+            mod = self._load_kernel_runner(monkeypatch)
+            runner = mod.SpyreUnimplementedRunner("k", "aten::foo")
+        report_path = _write_isolated_ffdc_report(
+            monkeypatch,
+            tmp_path,
+            runner.run,
+            expected_category=CATEGORY_UNIMPLEMENTED,
+            match="unimplemented operation",
+        )
+        _retrieve_via_torch_spyre(
+            CATEGORY_UNIMPLEMENTED, report_path, "unimplemented operation"
+        )
+
+    def test_runtime_launch_after_prepare_writes_and_retrieves(
+        self, monkeypatch, tmp_path
+    ):
+        """``run()`` / ``launch_jobplan`` after a successful ``prepare_kernel``."""
+        try:
+            torch.zeros(1, device=DEVICE_NAME)
+        except (ImportError, RuntimeError):
+            pytest.skip("requires Spyre hardware")
+        from test_prepare_kernel import TestPrepareKernel as tpk
+        from torch_spyre.execution import kernel_runner as kr
+
+        code_dir = tmp_path / "kernel"
+        code_dir.mkdir()
+        tpk().create_mock_spyrecode(str(code_dir))
+        runner = kr.SpyreSDSCKernelRunner("ffdc_launch", str(code_dir))
+
+        def boom(*_args, **_kwargs):
+            raise RuntimeError("ffdc launch boom")
+
+        monkeypatch.setattr(kr, "launch_jobplan", boom)
+        report_path = _write_isolated_ffdc_report(
+            monkeypatch,
+            tmp_path,
+            runner.run,
+            expected_category=CATEGORY_RUNTIME_LAUNCH,
+            match="ffdc launch boom",
+        )
+        _retrieve_via_torch_spyre(
+            CATEGORY_RUNTIME_LAUNCH, report_path, "ffdc launch boom"
+        )
 
 
 class TestFfdcProfilerApi:
