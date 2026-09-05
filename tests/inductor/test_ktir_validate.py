@@ -32,6 +32,7 @@ import importlib
 import inspect
 import sys
 import unittest
+from unittest import mock
 
 import regex as re
 import sympy
@@ -156,6 +157,7 @@ def make_op_spec(
                 device_tile_advance_expr=at(advances, position),
                 element_arrangement=at(arrangements, position)
                 or ElementArrangement.STANDARD,
+                kernel_local=bool(at(kernel_locals, position)),
             )
         )
 
