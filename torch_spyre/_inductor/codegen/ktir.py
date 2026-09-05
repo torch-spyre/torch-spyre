@@ -1816,21 +1816,18 @@ def _access_preserving(source: TensorArg, result: TensorArg) -> bool:
 
     Same ``device_size``, same ``device_coordinates`` and same ``device_dtype``,
     which is what lets a consumer read the source in place of the result: the
-    consumer's own description of its input then already describes the source, and
-    nothing has to be translated between the two specs' iteration-space
+    consumer's own description of its input then already describes the source,
+    and nothing has to be translated between the two specs' iteration-space
     namespaces.  Anything that moves, resizes or reformats an element is not a
-    drop-in.
-
-    ``device_dtype`` is here because ``ACCESS_ONLY_OPS`` asks this question of a
-    spec whose only content is a placement: a conversion has the same extent and
-    the same coordinates as its source and is emphatically not a drop-in for it,
-    so leaving the format out would hint away a real cast.
+    drop-in.  The format is part of it because the rewrite hands the survivor the
+    SOURCE's ``device_dtype``, so a converting producer would silently change what
+    the survivor reads.
 
     Measured necessary, and it is the one condition whose absence is silent:
     without it a BROADCASTING ``abs`` fuses, and the ``absmax`` that comes out
     carries a [2, 256, 64] memory view over a 128-element buffer -- which
-    the backend compiler ACCEPTS. An out-of-bounds read that compiles is worse than any
-    refusal, so this is checked here and not left to a consumer.
+    the backend compiler ACCEPTS. An out-of-bounds read that compiles is worse
+    than any refusal, so this is checked here and not left to a consumer.
     """
     return (
         list(source.device_size) == list(result.device_size)
