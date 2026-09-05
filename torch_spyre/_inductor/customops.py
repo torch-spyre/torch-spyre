@@ -25,6 +25,19 @@ from .errors import Unsupported
 aten = torch.ops.aten
 
 
+@torch.library.custom_op("spyre::require_layout", mutates_args=(), device_types="spyre")
+def require_layout(
+    x: torch.Tensor, device_size: list[int], stride_map: list[int]
+) -> torch.Tensor:
+    """Compiler marker consumed before lowering."""
+    return x
+
+
+@require_layout.register_fake
+def _(x: torch.Tensor, device_size: list[int], stride_map: list[int]) -> torch.Tensor:
+    return x
+
+
 @torch.library.custom_op("spyre::softplus", mutates_args=(), device_types="spyre")
 def softplus(
     input: torch.Tensor, beta: float = 1.0, threshold: float = 20.0

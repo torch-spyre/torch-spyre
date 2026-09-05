@@ -39,6 +39,7 @@ from .logging_utils import get_inductor_logger
 from .provenance import SpyreGraphTransformObserver, reset_provenance_warnings
 
 from .padding import insert_bmm_padding, insert_restickify_padding
+from .layout_hints import apply_require_layout, assert_require_layout_consumed
 from .temp_passes import (
     bmm_unflatten_pass,
     decompose_addmm,
@@ -227,7 +228,7 @@ class CustomPrePasses(_SpyreGraphPassPipeline):
     """
 
     def __init__(self):
-        super().__init__([collect_spyre_hints])
+        super().__init__([apply_require_layout, collect_spyre_hints])
 
 
 class CustomPostPasses(_SpyreGraphPassPipeline):
@@ -246,6 +247,7 @@ class CustomPostPasses(_SpyreGraphPassPipeline):
                 # falling back to extern_kernels.addmm.
                 decompose_addmm,
                 mm_to_bmm_pass.apply,
+                apply_require_layout,
                 bmm_unflatten_pass.apply,
             ]
         )
@@ -478,6 +480,7 @@ class CustomPreSchedulingPasses:
             # Tensor Layout (Stickification)
             split_multi_ops,
             propagate_spyre_tensor_layouts,
+            assert_require_layout_consumed,
             validate_ops,
             optimize_restickify_locations,
             finalize_layouts,

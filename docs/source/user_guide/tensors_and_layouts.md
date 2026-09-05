@@ -426,6 +426,32 @@ yields a tensor with the tiling inverted:
 SpyreTensorLayout(device_size=[5, 3, 100, 64], stride_map =[15000, 64, 150, 1], device_dtype=DataFormats.SEN169_FP16)
 ```
 
+## Compiler Output Layout Requirements
+
+`torch_spyre.require_layout(tensor, device_size, stride_map)` requests that a
+compiled producer emit a physical layout directly. It supports
+matmul producers and eligible pointwise producers, including output-only
+`expand`/`reshape`/`view` chains. Unsupported producers or illegal direct
+layouts fail compilation; this is not an `out=` storage destination.
+
+`device_size` and `stride_map` are static integer lists. The compiled output
+uses the producer dtype and `ElementArrangement.STANDARD`; therefore non-standard
+element arrangements cannot be requested through this API. Geometry must use a
+final stride of `1`, must not use broadcast (`0`) strides, and must have unique
+positive strides. This compiler-only API raises when called eagerly. Use
+`tensor.to(device_layout=layout)` for eager conversion or layouts requiring
+other metadata. Compiled requests support FP16, BF16, and FP32.
+
+```python
+from torch_spyre import require_layout
+
+output = require_layout(
+    torch.matmul(x, weight),
+    device_size=[1, 8, 128, 64],
+    stride_map=[65536, 64, 512, 1],
+)
+```
+
 ## Layout Compatibility
 
 Spyre operations impose **hard constraints** on the memory layout of

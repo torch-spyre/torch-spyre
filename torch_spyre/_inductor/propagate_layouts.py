@@ -22,6 +22,7 @@ import math
 import sympy
 import torch
 from .logging_utils import get_inductor_logger
+from .layout_hints import REQUIRE_LAYOUT_KEY
 from torch._inductor.ir import (
     ComputedBuffer,
     DeviceCopy,
@@ -1040,6 +1041,75 @@ def find_stick_compatible_input_layout(
     )
 
 
+def _coordinate_upper_bound(expr: sympy.Expr, ranges: dict) -> int:
+    """Return a conservative upper bound for a nonnegative coordinate."""
+    if expr.is_Integer:
+        return int(expr)
+    if expr.is_Symbol:
+        return concretize_expr(ranges[expr]) - 1
+    if isinstance(expr, sympy.Add):
+        return sum(_coordinate_upper_bound(arg, ranges) for arg in expr.args)
+    if isinstance(expr, sympy.Mul):
+        coefficient, term = expr.as_coeff_Mul()
+        if coefficient < 0:
+            raise Unsupported(f"negative require_layout coordinate {expr}")
+        return int(coefficient) * _coordinate_upper_bound(term, ranges)
+    if expr.func is sympy.Mod:
+        base, modulus = expr.args
+        if not modulus.is_Integer or modulus <= 0:
+            raise Unsupported(f"invalid require_layout coordinate {expr}")
+        return min(_coordinate_upper_bound(base, ranges), int(modulus) - 1)
+    if expr.func.__name__ in ("FloorDiv", "floor"):
+        if expr.func.__name__ == "floor":
+            base, divisor = expr.args[0].as_numer_denom()
+        else:
+            base, divisor = expr.args
+        if not divisor.is_Integer or divisor <= 0:
+            raise Unsupported(f"invalid require_layout coordinate {expr}")
+        return _coordinate_upper_bound(base, ranges) // int(divisor)
+    raise Unsupported(f"unsupported require_layout coordinate {expr}")
+
+
+def _required_layout_stl(
+    op: Operation, dtype: torch.dtype, output: FixedLayout, output_dep: MemoryDep
+):
+    """Return validated output STL requested by ``require_layout``, if any."""
+    requests = []
+    for fx_node in getattr(op, "origins", ()):
+        custom = (fx_node.meta or {}).get("custom") or {}
+        candidate = custom.get(REQUIRE_LAYOUT_KEY)
+        if candidate is not None:
+            requests.append(candidate)
+    if not requests:
+        return None
+    geometry = requests[0]["geometry"]
+    if any(candidate["geometry"] != geometry for candidate in requests[1:]):
+        raise Unsupported(f"{op.get_name()}: conflicting require_layout requests")
+    device_size, stride_map = geometry
+    if len(device_size) != len(stride_map) or any(
+        extent <= 0 for extent in device_size
+    ):
+        raise Unsupported(f"{op.get_name()}: invalid require_layout geometry")
+    stl = SpyreTensorLayout(device_size, stride_map, get_device_dtype(dtype))
+    if device_size[-1] != stl.elems_per_stick():
+        raise Unsupported(f"{op.get_name()}: require_layout has invalid stick extent")
+    if math.prod(device_size) < math.prod(
+        concretize_expr(size) for size in output.size
+    ):
+        raise Unsupported(f"{op.get_name()}: require_layout cannot hold output")
+    coordinates = try_device_coordinates(stl, output_dep, None)
+    if coordinates is None or any(
+        _coordinate_upper_bound(coord, output_dep.ranges) >= extent
+        for coord, extent in zip(coordinates, device_size)
+    ):
+        raise Unsupported(
+            f"{op.get_name()}: require_layout coordinates exceed geometry"
+        )
+    for request in requests:
+        request["consumed"] = True
+    return stl
+
+
 def _matmul_layouts(
     op: Operation,
     output: FixedLayout,
@@ -1112,6 +1182,7 @@ def _matmul_layouts(
     #   Input2 (y): stick on generated_var (loop var present in output, absent from x)
     #   Output:     stick on generated_var
     reduction_var = find_reduction_var((x.dep,), output_dep)
+    generated_var = None
     n_size = get_matmul_n_size(op)
     m_size = get_matmul_m_size(op)
 
@@ -1183,6 +1254,22 @@ def _matmul_layouts(
     c_stride = [concretize_expr(s) for s in output.stride]
 
     out_stl = SpyreTensorLayout(c_size, c_stride, output.dtype, out_dim_order)
+    requested_stl = _required_layout_stl(op, output.dtype, output, output_dep)
+    if requested_stl is not None:
+        requested_coords = try_device_coordinates(requested_stl, output_dep, None)
+        if (
+            requested_coords is None
+            or (generated_var is None and requested_coords[-1] != sympy.S.Zero)
+            or (
+                generated_var is not None
+                and generated_var not in requested_coords[-1].free_symbols
+            )
+        ):
+            raise Unsupported(
+                f"{data.reduction_type}: require_layout target is not a legal "
+                f"output layout for generated_var={generated_var}"
+            )
+        out_stl = requested_stl
 
     op.restick_cost_fn = FixedInOutNode.from_args(
         [x, y],
@@ -1760,6 +1847,28 @@ def _keep_by_index_layouts(
     return [out_stl]
 
 
+def _require_pointwise_layout(
+    op: Operation,
+    output: FixedLayout,
+    output_dep: MemoryDep,
+    args: list[PropArg],
+    layouts: list[SpyreTensorLayout],
+) -> list[SpyreTensorLayout]:
+    """Restrict a pointwise producer to its requested direct-output layout."""
+    requested_stl = _required_layout_stl(op, output.dtype, output, output_dep)
+    if requested_stl is None:
+        return layouts
+    requested_coords = try_device_coordinates(requested_stl, output_dep, None)
+    if requested_coords is None or not is_stick_expr_offset_free(
+        requested_coords[-1], requested_stl.elems_per_stick()
+    ):
+        raise Unsupported(
+            f"{op.get_name()}: require_layout target is not a legal direct output layout"
+        )
+    op.restick_cost_fn = AllSameNode.from_args(args, [requested_stl], output_dep, op)
+    return [requested_stl]
+
+
 def compute_layouts(
     op: Operation,
     output: FixedLayout,
@@ -1792,7 +1901,13 @@ def compute_layouts(
                     )
 
     if len(args) > 1 and isinstance(data, Pointwise):
-        return _multi_arg_pointwise_layouts(op, output, output_dep, args)
+        return _require_pointwise_layout(
+            op,
+            output,
+            output_dep,
+            args,
+            _multi_arg_pointwise_layouts(op, output, output_dep, args),
+        )
 
     if isinstance(data, Reduction) and data.reduction_type in [
         BATCH_MATMUL_OP,
@@ -1847,6 +1962,8 @@ def compute_layouts(
             f"output size={output.size}"
         )
     op.restick_cost_fn = AllSameNode.from_args(args, layouts, output_dep, op)
+    if isinstance(data, Pointwise):
+        return _require_pointwise_layout(op, output, output_dep, args, layouts)
     return layouts
 
 
@@ -2451,6 +2568,13 @@ def propagate_spyre_tensor_layouts(
             args = _get_prop_args(rw.reads)
             output = op.get_layout()
             if not args:
+                if any(
+                    (fx_node.meta or {}).get("custom", {}).get(REQUIRE_LAYOUT_KEY)
+                    for fx_node in getattr(op, "origins", ())
+                ):
+                    raise Unsupported(
+                        f"{op.get_name()}: require_layout needs a producer with tensor inputs"
+                    )
                 mem_reads = [r for r in rw.reads if isinstance(r, MemoryDep)]
                 is_constant_fill = bool(mem_reads) and all(
                     isinstance(V.graph.get_buffer(r.name), SpyreConstantFallback)
