@@ -23,6 +23,7 @@
 #include <variant>
 #include <vector>
 
+#include "flex/memory_interface/raii_buffer.hpp"
 #include "spyre_allocator.h"
 #include "spyre_composite_address.h"
 #include "spyre_stream.h"
@@ -162,47 +163,33 @@ std::vector<int64_t> JobPlanStepHostCompute::resolveSymbolicArgs(
 
 void JobPlanStepHostCompute::construct(LaunchContext& ctx,
                                        const SpyreStream& stream) const {
-  // Helper lambda to build HostCallbackParams and launch on the stream.
-  // flex::RuntimeStream::launchOperationHostCallback() invokes the callback
-  // synchronously in the calling thread, so exceptions propagate directly
-  // through launchHostCallback() to the caller
-  auto launch_host_callback = [this, &stream](auto&& callback) {
-    auto* params = flex::createHostCallbackParams(
-        std::forward<decltype(callback)>(callback), nullptr, pipeline_barrier_);
-    // Use a scope-exit guard so params is freed even if launchHostCallback
-    // throws (which it does when the synchronous host callback raises).
-    struct Guard {
-      flex::HostCallbackParams* p;
-      ~Guard() {
-        flex::destroyHostCallbackParams(p);
-      }
-    } guard{params};
-    stream.launchHostCallback(params);
-  };
+  // Alignment for the staged RaiiBuffer (matches RaiiBuffer's own page-size
+  // default; will be upgraded to device IOVA alignment inside
+  // handleDmaDataConversionH2D when a real device handle is present).
+  static constexpr size_t kAlign = 4096;
 
-  // Case 1: input_buffer_ is provided
+  // Build the producer body.  All three source cases produce the same type
+  // (RaiiBuffer) via different fill strategies; the kind label is always
+  // "correction" for logs/profiler.
+  std::function<std::shared_ptr<flex::RaiiBuffer>()> producer;
+
   if (input_buffer_ != nullptr) {
-    launch_host_callback([this](void*) {
-      // Use regular path - input_buffer_ is already properly formatted
-      deeptools::processComputeOnHostCommand(*hcm_, output_buffer_,
+    // Case 1: input_buffer_ is provided — use it directly as the source.
+    producer = [this]() -> std::shared_ptr<flex::RaiiBuffer> {
+      auto buf = std::make_shared<flex::RaiiBuffer>(correction_size_, kAlign);
+      deeptools::processComputeOnHostCommand(*hcm_, buf->Pointer(),
                                              input_buffer_);
-    });
-    return;
-  }
-
-  // Case 2: fake symbols (ishape_ is {0})
-  // Further discussion is required on "ishape". For now, it's vector<int64_t>,
-  // and it's {0}, it's for fake symbols
-  if (ishape_.size() == 1 && ishape_[0] == 0) {
-    launch_host_callback([this](void*) {
-      // Fake symbols don't need fast path - use regular path
-      deeptools::processComputeOnHostCommand(*hcm_, output_buffer_, nullptr);
-    });
-    return;
-  }
-
-  // Typed symbolic payload present — resolve each slot by kind.
-  if (!ctx.symbolic_args.empty()) {
+      return buf;
+    };
+  } else if (ishape_.size() == 1 && ishape_[0] == 0) {
+    // Case 2: fake symbols (ishape_ is {0}) — nullptr src argument.
+    producer = [this]() -> std::shared_ptr<flex::RaiiBuffer> {
+      auto buf = std::make_shared<flex::RaiiBuffer>(correction_size_, kAlign);
+      deeptools::processComputeOnHostCommand(*hcm_, buf->Pointer(), nullptr);
+      return buf;
+    };
+  } else if (!ctx.symbolic_args.empty()) {
+    // Case 3a: typed symbolic payload — resolve addresses by kind.
     std::vector<int64_t> resolved_addresses =
         resolveSymbolicArgs(ctx.inputs_outputs, ctx.symbolic_args);
 
@@ -213,37 +200,57 @@ void JobPlanStepHostCompute::construct(LaunchContext& ctx,
                 ") does not match compiled symbol count (",
                 hcm_->vdci.inputSym_.size(), ") for this host-compute step");
 
-    launch_host_callback([this, resolved_addresses](void*) {
-      deeptools::processComputeOnHostCommand(*hcm_, output_buffer_,
+    producer = [this,
+                resolved_addresses]() -> std::shared_ptr<flex::RaiiBuffer> {
+      auto buf = std::make_shared<flex::RaiiBuffer>(correction_size_, kAlign);
+      deeptools::processComputeOnHostCommand(*hcm_, buf->Pointer(),
                                              &resolved_addresses);
-    });
-    return;
+      return buf;
+    };
+  } else {
+    // Case 3b: no payload — legacy path: treat every context tensor as an
+    // address source in iteration order.  Back-compat for callers that pass no
+    // symbolic_args (empty payload).
+    std::vector<int64_t> addresses(ctx.inputs_outputs.size());
+    int addr_idx = 0;
+    auto& allocator = SpyreAllocator::instance();
+    for (auto& tensor : ctx.inputs_outputs) {
+      int64_t addr = static_cast<int64_t>(allocator.compositeAddressToDmva(
+          (static_cast<SharedOwnerCtx*>(
+               tensor.storage().data_ptr().get_context())
+               ->composite_addr)));
+      addresses[addr_idx++] = addr;
+    }
+
+    producer = [this, addresses]() -> std::shared_ptr<flex::RaiiBuffer> {
+      auto buf = std::make_shared<flex::RaiiBuffer>(correction_size_, kAlign);
+      // Use fast path with all tensor addresses.
+      deeptools::processComputeOnHostCommandFast(
+          fast_plan_, *hcm_, buf->Pointer(), addresses.data(),
+          addresses.size());
+      return buf;
+    };
   }
 
-  // Case 3b: no payload — legacy path: treat every context tensor as an
-  // address source in iteration order.  Back-compat for callers that pass no
-  // symbolic_args (empty payload).
-  std::vector<int64_t> addresses(ctx.inputs_outputs.size());
-  int addr_idx = 0;
-  auto& allocator = SpyreAllocator::instance();
-  for (auto& tensor : ctx.inputs_outputs) {
-    int64_t addr = static_cast<int64_t>(allocator.compositeAddressToDmva(
-        (static_cast<SharedOwnerCtx*>(tensor.storage().data_ptr().get_context())
-             ->composite_addr)));
-    addresses[addr_idx++] = addr;
-  }
+  // Produce the staged buffer on the caller thread (same thread that produced
+  // it before via the inline HostCallback synchronize path).
+  auto staged = producer();
 
-  launch_host_callback([this, addresses](void*) {
-    // Use fast path with all tensor addresses
-    // Returns true if fast path was actually used, false if fell back
-    bool used_fast_path = deeptools::processComputeOnHostCommandFast(
-        fast_plan_, *hcm_, output_buffer_, addresses.data(), addresses.size());
-  });
+  // Launch the correction H2D with the staged buffer attached as the source.
+  // The RaiiBuffer lifetime is extended by the completion callback set below.
+  auto* params = flex::createDmaParams(staged->Pointer(), correction_size_,
+                                       /*to_device=*/true, &device_address_);
+  params->pipeline_barrier = pipeline_barrier_;
+  // Keep staged alive until the DMA engine finishes reading it.
+  params->callback = [staged](void*) { /* staged freed here */ };
+  stream.launchH2D(params);
+  flex::destroyDmaParams(params);
 }
 
 void JobPlanStepHostCompute::write(std::ostream& os) const {
   os << "  Host Compute\n";
-  os << "    Output buffer: " << output_buffer_ << "\n";
+  os << "    Correction size: " << correction_size_ << " bytes\n";
+  os << "    Device address: " << device_address_ << "\n";
   os << "    HCM metadata: " << (hcm_ ? "present" : "null") << "\n";
   os << "    Fast path: "
      << (fast_plan_.valid

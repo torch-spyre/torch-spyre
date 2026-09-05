@@ -175,8 +175,15 @@ class JobPlanBuilder {
   std::unique_ptr<JobPlanStep> translateComputeOnDevice(
       const nlohmann::json& cmd, size_t step_idx);
   /// Translate a ComputeOnHost command to a JobPlanStepHostCompute
+  /// NOTE: In production SpyreCode this is always merged with the adjacent
+  /// DataTransfer H2D via translateComputeOnHostWithH2D; this overload fires
+  /// only for isolated ComputeOnHost (test or error).
   std::unique_ptr<JobPlanStep> translateComputeOnHost(
       const nlohmann::json& cmd);
+  /// Translate a ComputeOnHost + adjacent DataTransfer-H2D pair into a single
+  /// JobPlanStepHostCompute that owns the device address and H2D launch.
+  std::unique_ptr<JobPlanStep> translateComputeOnHostWithH2D(
+      const nlohmann::json& hc_props, const nlohmann::json& h2d_props);
   /// Translate a DataTransfer command to a JobPlanStepH2D or JobPlanStepD2H
   std::unique_ptr<JobPlanStep> translateDataTransfer(const nlohmann::json& cmd);
 };

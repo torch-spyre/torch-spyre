@@ -398,35 +398,61 @@ std::unique_ptr<JobPlanStep> JobPlanBuilder::translateComputeOnDevice(
 
 std::unique_ptr<JobPlanStep> JobPlanBuilder::translateComputeOnHost(
     const nlohmann::json& cmd) {
-  // Parse ohandle
-  TORCH_CHECK(cmd.contains("ohandle"),
+  // This overload is only reached when there is NO adjacent DataTransfer H2D
+  // to consume (edge-case or test).  It is not expected in production
+  // SpyreCode — the translator always emits ComputeOnHost before a DataTransfer
+  // H2D.  Assert so that incorrect JSON is caught early.
+  TORCH_CHECK(false,
+              "translateComputeOnHost: ComputeOnHost must be immediately "
+              "followed by a DataTransfer H2D; isolated ComputeOnHost is "
+              "not supported");
+  return nullptr;  // unreachable
+}
+
+/**
+ * @brief Parse a ComputeOnHost + adjacent DataTransfer-H2D command pair into a
+ * single JobPlanStepHostCompute that owns both the produce and the H2D launch.
+ *
+ * @param hc_props  Properties from the ComputeOnHost command.
+ * @param h2d_props Properties from the adjacent DataTransfer H2D command.
+ */
+std::unique_ptr<JobPlanStep> JobPlanBuilder::translateComputeOnHostWithH2D(
+    const nlohmann::json& hc_props, const nlohmann::json& h2d_props) {
+  // ---- Parse ComputeOnHost properties ----
+  TORCH_CHECK(hc_props.contains("ohandle"),
               "ComputeOnHost command missing 'ohandle' property");
-  std::string ohandle = cmd["ohandle"].get<std::string>();
+  std::string ohandle = hc_props["ohandle"].get<std::string>();
 
-  // Allocate pinned buffer
-  auto it = pinned_buffer_map_.find(ohandle);
-  TORCH_CHECK(it == pinned_buffer_map_.end(), "ohandle '", ohandle,
-              "' already exists in pinned buffer map");
-  TORCH_CHECK(cmd.contains("size"),
+  // Determine correction_size from ComputeOnHost "size" field.
+  TORCH_CHECK(hc_props.contains("size"),
               "ComputeOnHost command missing 'size' property");
-  std::string size_str = cmd["size"].get<std::string>();
-  size_t buffer_size = safe_stoull(size_str, "ComputeOnHost size");
+  std::string hc_size_str = hc_props["size"].get<std::string>();
+  size_t correction_size = safe_stoull(hc_size_str, "ComputeOnHost size");
 
+  // Allocate a pinned buffer so the handle is registered (the adjacent H2D
+  // step used to read from this buffer; now the HostCompute step allocates a
+  // RaiiBuffer at launch time and the pinned buffer is no longer needed as a
+  // DMA source).  We still register it in the map so existing lookups by
+  // handle name don't fail.
+  auto map_it = pinned_buffer_map_.find(ohandle);
+  TORCH_CHECK(map_it == pinned_buffer_map_.end(), "ohandle '", ohandle,
+              "' already exists in pinned buffer map");
   try {
-    pinned_buffer_map_[ohandle] = HostBuffer(buffer_size);
+    // Allocate a minimal stub; real data flows via RaiiBuffer at launch time.
+    pinned_buffer_map_[ohandle] = HostBuffer(correction_size);
   }
   catch (const std::bad_alloc&) {
     TORCH_CHECK(false,
-                "Failed to allocate pinned buffer for host compute output '",
-                ohandle, "', size=", buffer_size, " bytes");
+                "Failed to allocate pinned buffer stub for host compute '",
+                ohandle, "', size=", correction_size, " bytes");
   }
 
   // Parse ishape
   // TODO(jni): further discussion is required on "ishape". See #2522. For now,
   // it's vector<int64_t>, and it's {0}, it's for fake symbols
-  TORCH_CHECK(cmd.contains("ishape"),
+  TORCH_CHECK(hc_props.contains("ishape"),
               "ComputeOnHost command missing 'ishape' property");
-  const nlohmann::json& ishape_json = cmd["ishape"];
+  const nlohmann::json& ishape_json = hc_props["ishape"];
   TORCH_CHECK(ishape_json.is_array(),
               "ComputeOnHost 'ishape' must be an array");
   std::vector<int64_t> ishape;
@@ -438,27 +464,22 @@ std::unique_ptr<JobPlanStep> JobPlanBuilder::translateComputeOnHost(
   }
 
   // Parse ihandle
-  void* inp_ptr = nullptr;
-  TORCH_CHECK(cmd.contains("ihandle"),
+  const void* inp_ptr = nullptr;
+  TORCH_CHECK(hc_props.contains("ihandle"),
               "ComputeOnHost command missing 'ihandle' property");
-  std::string ihandle = cmd["ihandle"].get<std::string>();
+  std::string ihandle = hc_props["ihandle"].get<std::string>();
   if (!ihandle.empty()) {
-    // Get input buffer from pinned_buffer_map_
-    it = pinned_buffer_map_.find(ihandle);
+    auto it = pinned_buffer_map_.find(ihandle);
     TORCH_CHECK(it != pinned_buffer_map_.end(), "ihandle '", ihandle,
                 "' not found in pinned buffer map");
     inp_ptr = it->second.data();
   }
 
   // Parse hcm JSON
-  TORCH_CHECK(cmd.contains("hcm"),
+  TORCH_CHECK(hc_props.contains("hcm"),
               "ComputeOnHost command missing 'hcm' property");
-  const nlohmann::json& hcm_json = cmd["hcm"];
-
-  // Create Hcm object and import from JSON string
   auto hcm_data = std::make_unique<Hcm>();
-  std::string hcm_json_str = hcm_json.dump();
-
+  std::string hcm_json_str = hc_props["hcm"].dump();
   try {
     hcm_data->importJsonStr(hcm_json_str);
   }
@@ -467,9 +488,28 @@ std::unique_ptr<JobPlanStep> JobPlanBuilder::translateComputeOnHost(
                 "': ", e.what());
   }
 
-  // Create and return JobPlanStepHostCompute
+  // ---- Parse adjacent DataTransfer H2D properties ----
+  TORCH_CHECK(h2d_props.contains("dev_ptr"),
+              "DataTransfer H2D (adjacent to ComputeOnHost) missing 'dev_ptr'");
+  TORCH_CHECK(h2d_props.contains("size"),
+              "DataTransfer H2D (adjacent to ComputeOnHost) missing 'size'");
+
+  std::string dev_ptr_str = h2d_props["dev_ptr"].get<std::string>();
+  std::string h2d_size_str = h2d_props["size"].get<std::string>();
+  uint64_t device_ptr = safe_stoull(dev_ptr_str, "DataTransfer H2D dev_ptr");
+  size_t transfer_size = safe_stoull(h2d_size_str, "DataTransfer H2D size");
+
+  TORCH_CHECK(correction_size == transfer_size, "ComputeOnHost size (",
+              correction_size,
+              ") does not match adjacent DataTransfer H2D size (",
+              transfer_size, ") for ohandle '", ohandle, "'");
+
+  flex::CompositeAddress device_address =
+      compute_offset_address(job_allocation_.at(0), device_ptr, transfer_size);
+
   return std::make_unique<JobPlanStepHostCompute>(
-      std::move(hcm_data), pinned_buffer_map_[ohandle].data(), inp_ptr, ishape);
+      std::move(hcm_data), correction_size, std::move(device_address), inp_ptr,
+      std::move(ishape));
 }
 
 std::unique_ptr<JobPlanStep> JobPlanBuilder::translateDataTransfer(
@@ -613,11 +653,47 @@ std::unique_ptr<JobPlan> JobPlanBuilder::translateJobExecPlan() {
   const char* env = std::getenv("BUNDLE_SYMBOLIC_ARGS");
   bind_io_addresses_ = (env == nullptr || std::string(env) != "1");
 
-  // Parse each command in the JobExecPlan and create JobPlanSteps
+  // Parse each command in the JobExecPlan and create JobPlanSteps.
+  //
+  // Merging ComputeOnHost + DataTransfer-H2D pairs:
+  // The SpyreCode always emits a ComputeOnHost followed immediately by a
+  // DataTransfer H2D that transfers the same correction blob (same ohandle /
+  // host_handle_str).  We consume both commands together and build a single
+  // JobPlanStepHostCompute that owns the device destination address and
+  // produces the staged buffer via an inline producer lambda, retiring the
+  // shared output_buffer_ pin and the separate H2D step.
   std::vector<std::unique_ptr<JobPlanStep>> steps;
   for (size_t i = 0; i < job_exec_plan.size(); ++i) {
     try {
-      steps.push_back(translateCommand(job_exec_plan[i], i));
+      const auto& cmd = job_exec_plan[i];
+      TORCH_CHECK(cmd.contains("command") && cmd["command"].is_string(),
+                  "SpyreCode command missing 'command' field at index ", i);
+      const std::string cmd_type = cmd["command"].get<std::string>();
+
+      // Look for a ComputeOnHost that is immediately followed by a
+      // DataTransfer H2D — collapse them into one HostCompute-with-H2D step.
+      if (cmd_type == "ComputeOnHost" && i + 1 < job_exec_plan.size()) {
+        const auto& next_cmd = job_exec_plan[i + 1];
+        if (next_cmd.contains("command") &&
+            next_cmd["command"].get<std::string>() == "DataTransfer") {
+          const auto& next_props = next_cmd.contains("properties")
+                                       ? next_cmd["properties"]
+                                       : nlohmann::json();
+          // Only collapse H2D (dirn == "false")
+          if (next_props.contains("dirn") &&
+              next_props["dirn"].get<std::string>() == "false") {
+            // Build the merged step; consume both commands.
+            steps.push_back(translateComputeOnHostWithH2D(
+                cmd.contains("properties") ? cmd["properties"]
+                                           : nlohmann::json(),
+                next_props));
+            ++i;  // skip the consumed DataTransfer H2D
+            continue;
+          }
+        }
+      }
+
+      steps.push_back(translateCommand(cmd, i));
     }
     catch (const std::exception& e) {
       TORCH_CHECK(false, "Failed to parse SpyreCode command: ", e.what());
@@ -660,22 +736,26 @@ JobPlanBuilder::ValidationResult JobPlanBuilder::validate(
   // - Verify shape dimensions are positive
   // - Verify shape count matches number of input tensors
 
-  // Validate step ordering: the checker projects the plan into (StepKind,
-  // StreamRole) and checks each stream's subsequence -- S_prep must be
-  // HostCompute -> H2D, S_dev must be Compute. See checkJobPlanStepOrdering.
-  // A legacy plan with no HostCompute stays valid (single-stream paths).
-  {
-    std::vector<StepKind> kinds;
-    std::vector<StreamRole> roles;
-    kinds.reserve(job_plan.steps.size());
-    roles.reserve(job_plan.steps.size());
-    for (const auto& step : job_plan.steps) {
-      kinds.push_back(classifyStep(*step));
-      roles.push_back(step->role());
+  // P2-14: JobPlan step ordering validation
+  // After the HostCompute+H2D merge, the required sequence when the first step
+  // is a HostCompute is:  HostCompute(owns H2D) → Compute.
+  // The old HostCallback→H2D→Compute pattern is no longer expected in
+  // production SpyreCode; the translator collapses them.
+  if (!job_plan.steps.empty()) {
+    bool first_is_host_compute = dynamic_cast<const JobPlanStepHostCompute*>(
+                                     job_plan.steps[0].get()) != nullptr;
+
+    if (first_is_host_compute) {
+      // Step 0 is HostCompute (which owns the H2D); step 1 must be Compute.
+      TORCH_CHECK(job_plan.steps.size() >= 2,
+                  "Incomplete step sequence: HostCompute must be followed "
+                  "by Compute");
+      bool is_compute = dynamic_cast<const JobPlanStepCompute*>(
+                            job_plan.steps[1].get()) != nullptr;
+      TORCH_CHECK(is_compute,
+                  "Step ordering violation at step 1: "
+                  "HostCompute (with H2D) must be followed by Compute");
     }
-    std::string ordering_error = checkJobPlanStepOrdering(kinds, roles);
-    TORCH_CHECK(ordering_error.empty(),
-                "JobPlan step ordering violation: ", ordering_error);
   }
 
   // P2-15: Host compute metadata validation
