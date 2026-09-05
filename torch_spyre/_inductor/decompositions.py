@@ -31,6 +31,13 @@ from typing import Any, Callable, Optional, Sequence, Union
 
 import torch
 import torch._decomp as decomp
+from torch._refs import scalar_tensor
+import torch._prims as prims
+from torch._prims_common import (
+    Number,
+    NumberType,
+    TensorLikeType,
+)
 
 from .constants import DEVICE_NAME, FP8_E4M3FN_MAX, FP8_E4M3FN_MIN
 from .errors import Unsupported
@@ -306,12 +313,55 @@ def logical_not_decomp(input: torch.Tensor) -> torch.Tensor:
 
 @register_spyre_decompositions([torch.ops.aten.sign.default])
 def spyre_sign(input: torch.Tensor) -> torch.Tensor:
-    zero = torch.zeros_like(input)
-    return torch.where(
-        torch.gt(input, zero),
-        torch.ones_like(input),
-        torch.where(torch.lt(input, zero), -torch.ones_like(input), zero),
-    )
+    if input.dtype.is_complex:
+        raise NotImplementedError("sign is not supported for complex inputs")
+
+    orig_dtype = input.dtype
+
+    if not input.dtype.is_floating_point:
+        # Spyre backend does not support bool result from int32 operands
+        input = input.to(torch.float16)
+
+    zeros = torch.zeros_like(input)
+    pos = torch.gt(input, zeros).to(input.dtype)
+    neg = torch.lt(input, zeros).to(input.dtype)
+
+    return (pos - neg).to(orig_dtype)
+
+
+@register_spyre_decompositions([torch.ops.aten.signbit.default])
+def spyre_signbit(input: torch.Tensor) -> torch.Tensor:
+    """Implements signbit without support for -0.0.
+
+    Without bitwise operations, the sign of -0.0 can be
+    detected on cpu with torch.reciprocal(-0.0) because it
+    returns -inf and -inf < 0.0 is True. But on sypre it just
+    returns inf.
+    """
+
+    if input.dtype.is_complex:
+        raise NotImplementedError("signbit is not supported for complex inputs")
+
+    if not input.dtype.is_floating_point:
+        # Spyre backend does not support bool result from int32 operands
+        input = input.to(torch.float16)
+
+    zeros = torch.zeros_like(input)
+    result = torch.lt(input, zeros)
+    if input.dtype == torch.float32:
+        return result.to(torch.float32).to(torch.int32).to(torch.bool)
+    return result
+
+
+@register_spyre_decompositions([torch.ops.aten.trunc.default])
+def spyre_trunc(input: torch.Tensor) -> torch.Tensor:
+    if input.dtype.is_complex:
+        raise NotImplementedError("trunc is not supported for complex inputs")
+
+    if not input.dtype.is_floating_point:
+        return input.clone()
+
+    return torch.sign(input) * torch.floor(torch.abs(input))
 
 
 ###############################################################################
@@ -855,6 +905,12 @@ def spyre_amin_decomp(
 
 @register_spyre_decompositions([torch.ops.aten.ceil.default])
 def spyre_ceil(input: torch.Tensor) -> torch.Tensor:
+    if input.dtype.is_complex:
+        raise NotImplementedError("ceil is not supported for complex inputs")
+
+    if not input.dtype.is_floating_point:
+        return input.clone()
+
     return torch.ops.aten.neg.default(
         torch.ops.aten.floor.default(torch.ops.aten.neg.default(input))
     )
@@ -1340,6 +1396,53 @@ def spyre_prod_dim_int(
         acc = acc.unsqueeze(dim)
 
     return acc
+
+
+@register_spyre_decompositions([torch.ops.aten.div.Tensor_mode])
+def spyre_div_Tensor_mode(
+    a: TensorLikeType | NumberType, b: TensorLikeType | NumberType, rounding_mode=None
+) -> torch.Tensor:
+    # Wrap scalars because some references only accept tensor arguments.
+    if isinstance(a, Number) and isinstance(b, Number):
+        a = scalar_tensor(a)
+        b = scalar_tensor(b)
+    elif isinstance(b, Number) and isinstance(a, torch.Tensor):
+        b = scalar_tensor(b, dtype=a.dtype, device=a.device)
+    elif isinstance(a, Number) and isinstance(b, torch.Tensor):
+        a = scalar_tensor(a, dtype=b.dtype, device=b.device)
+
+    result = torch.true_divide(a, b)
+
+    if rounding_mode == "floor":
+        result = prims.floor(result)
+    elif rounding_mode == "trunc":
+        result = prims.trunc(result)
+    else:
+        msg = f"div_Tensor_mode expected rounding_mode to be one of None, 'trunc', or 'floor' but found {rounding_mode}."
+        raise ValueError(msg)
+
+    if not (a.dtype.is_floating_point or b.dtype.is_floating_point):
+        if torch.iinfo(b.dtype).bits > torch.iinfo(a.dtype).bits:
+            result = result.to(b.dtype)
+        else:
+            result = result.to(a.dtype)
+    return result
+
+
+@register_spyre_decompositions([torch.ops.aten.fmod.Tensor])
+def spyre_fmod(
+    a: TensorLikeType | NumberType, b: TensorLikeType | NumberType
+) -> torch.Tensor:
+    # Wrap scalars because some references only accept tensor arguments.
+    if isinstance(a, Number) and isinstance(b, Number):
+        raise TypeError("Should be unreachable")
+    elif isinstance(b, Number) and isinstance(a, torch.Tensor):
+        b = scalar_tensor(b, dtype=a.dtype, device=a.device)
+    elif isinstance(a, Number) and isinstance(b, torch.Tensor):
+        a = scalar_tensor(a, dtype=b.dtype, device=b.device)
+
+    div_ = a / b
+    return a - torch.sign(div_) * torch.floor(torch.abs(div_)) * b
 
 
 @register_spyre_decompositions(

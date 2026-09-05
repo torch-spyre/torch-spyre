@@ -403,9 +403,10 @@ def shapes2key(shapes):
 
 
 # cases: Tuple of cases. Each case is defined by shapes of tensors
-def make_param_dict(cases, rand_type="randn"):
+def make_param_dict(cases, rand_type="randn", dtype=torch.float16):
     return {
-        shapes2key(shapes): init_helper(shapes, rand_type=rand_type) for shapes in cases
+        shapes2key(shapes): init_helper(shapes, dtype=dtype, rand_type=rand_type)
+        for shapes in cases
     }
 
 

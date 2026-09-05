@@ -50,14 +50,17 @@ POINTWISE_UNARY_OPS_DICT = {
     "reciprocal": torch.reciprocal,
     "relu": torch.relu,
     "sign": torch.sign,
+    "signbit": torch.signbit,
     "silu": torch.ops.aten.silu,
     "sin": torch.sin,
     "tanh": torch.tanh,
+    "trunc": torch.trunc,
 }
 
 POINTWISE_UNARY_OPS_FP32_DICT = {
     "ceil": torch.ceil,
     "floor": torch.floor,
+    "trunc": torch.trunc,
 }
 
 POINTWISE_BINARY_OPS_DICT = {
@@ -888,6 +891,63 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     ((2880,), (1, 11, 2880)),
                 ]
             ),
+        },
+        (
+            "test_division_fp16",
+            "test_division_op",
+        ): {
+            "ops_dict": {
+                "floordiv": functools.partial(torch.div, rounding_mode="floor"),
+                "truncdiv": functools.partial(torch.div, rounding_mode="trunc"),
+                "fmod": torch.fmod,
+            },
+            "param_sets": make_param_dict(
+                [
+                    ((256,),) * 2,
+                    ((67, 256),) * 2,
+                    ((67, 71, 256),) * 2,
+                    ((7, 12, 32, 64),) * 2,
+                    # broadcasting case
+                    ((2880,), (1, 11, 2880)),
+                ]
+            ),
+        },
+        (
+            "test_division_fp32",
+            "test_division_op",
+        ): {
+            "ops_dict": {
+                "floordiv": functools.partial(torch.div, rounding_mode="floor"),
+                "truncdiv": functools.partial(torch.div, rounding_mode="trunc"),
+                "fmod": torch.fmod,
+            },
+            "param_sets": make_param_dict(
+                [
+                    ((256,),) * 2,
+                    ((67, 256),) * 2,
+                    ((67, 71, 256),) * 2,
+                    ((7, 12, 32, 64),) * 2,
+                    # broadcasting case
+                    ((2880,), (1, 11, 2880)),
+                ],
+                dtype=torch.float32,
+            ),
+        },
+        (
+            "test_division_int64",
+            "test_division_op",
+        ): {
+            "ops_dict": {
+                "floordiv": functools.partial(torch.div, rounding_mode="floor"),
+                "truncdiv": functools.partial(torch.div, rounding_mode="trunc"),
+                "fmod": torch.fmod,
+            },
+            "param_sets": {
+                "1d": (
+                    torch.randint(-100, 100, (256,), dtype=torch.int64),
+                    torch.randint(-100, 100, (256,), dtype=torch.int64),
+                ),
+            },
         },
         (
             "test_pointwise_binary_op_int64",
@@ -5860,7 +5920,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             # TODO: Division by 0 or near-zero differs on Spyre from CPU, sidestep for now.
             tiny_value_mask = torch.abs(x) < FP16_EPS
             x[tiny_value_mask] = FP16_EPS
-        elif op == torch.floor:
+        elif op in [torch.floor, torch.trunc]:
             # To avoid cpu mismatch due to a negative fp16 having a fraction 0b0000000001
             x = x.to("spyre").cpu()
 
@@ -8482,6 +8542,55 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
         self.compare_with_cpu(fn, x, run_eager=False)
 
+    def test_division_op(self, op, a, b):
+        """Test truncdiv, floordiv and fmod.
+
+        All three do computations on the result of div. With fp16, the
+        results can be slightly different on CPU and Spyre, but since
+        floor and trunc introduce discontinuities, this can lead to
+        results that are quite different, so this function tries to
+        massage the input data to avoid these situations. Otherwise
+        this function is basically the same as test_binary_op
+        """
+        dtype = a.dtype
+        if b.dtype.is_floating_point:
+            dtype = b.dtype
+
+        if dtype.is_floating_point:
+            # To avoid cpu mismatch due to a negative
+            # fp16 having a fraction 0b0000000001
+            a = a.to(dtype).to("spyre").cpu()
+            b = a.to(dtype).to("spyre").cpu()
+
+        # TODO: Division by 0 or near-zero differs on Spyre from CPU, sidestep for now.
+        tiny_value_mask = torch.abs(b) < FP16_EPS
+        if b.dtype.is_floating_point:
+            b[tiny_value_mask] = FP16_EPS
+        else:
+            b[tiny_value_mask] = 1
+
+        def debroadcast_mask(big, small):
+            return big.to(torch.int32).sum_to_size(small.shape).to(torch.bool)
+
+        # If the division is almost exact the result of the division
+        # could be slightly below an integer on spyre and above on CPU.
+        # Applying trunc or floor in these cases will create a significant
+        # difference in outputs. It also applies to integer because internally
+        # they are converted float32 and interesting things can happen:
+        # >>> a = torch.tensor(47,dtype=torch.float32,device="spyre")
+        # >>> torch.floor(a/a)
+        # >>> tensor(0., device='spyre:0')
+        # >>>
+        # >>> a = torch.tensor(47,dtype=torch.float16,device="spyre")
+        # >>> torch.floor(a/a)
+        # >>> tensor(1., dtype=torch.float16, device='spyre:0')
+        div_ = torch.div(a, b)
+        nearest_int = torch.round(div_)
+        almost_exact_div_mask = abs(div_ - nearest_int) < FP16_EPS
+        a[debroadcast_mask(almost_exact_div_mask, a)] = 0
+
+        self.compare_with_cpu(op, a, b)
+
     def test_matmul_bs1_3d_linear(self):
         def fn(x, w):
             return torch.matmul(x, w.T)
@@ -8494,6 +8603,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 _TEST_LARGE_MATMUL_FP32_PROXY_SHAPES = _derive_test_large_matmul_fp32_proxy_shapes(
     TestOps.PARAMS[("test_large_matmul", "test_mm_relaxed")]["param_sets"]
 )
+
 
 if __name__ == "__main__":
     unittest.main()
