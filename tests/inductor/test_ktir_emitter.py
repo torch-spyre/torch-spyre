@@ -26,7 +26,6 @@ Self-contained otherwise: no live Inductor graph, no compiler run.
 import unittest
 
 from test_ktir_validate import (
-    make_access_only_specs,
     make_broadcast_op_spec,
     make_chained_op_specs,
     make_nested_op_spec,
@@ -1033,32 +1032,6 @@ class TestOneBufferViewedAtTwoElementTypesEmission(unittest.TestCase):
             emitted,
         )
         self.assertIn("ktdp.load %11 : <256x1xindex> -> tensor<256x1xf16>", emitted)
-
-
-@unittest.skipUnless(
-    _mlir_ktdp_available(),
-    "mlir_ktdp with the func/arith/linalg/scf/tensor dialect bindings is not installed",
-)
-class TestAnAccessOnlySpecEmitsNothing(unittest.TestCase):
-    """The placed buffer appears nowhere; both readers view the source."""
-
-    def test_both_readers_view_the_source_and_the_link_is_absent(self):
-        from torch_spyre._inductor.codegen.ktir import generate_ktir
-
-        emitted = generate_ktir("Placement_1", make_access_only_specs())
-        # Three buffers, three parameters: the source and the two results.
-        self.assertIn(
-            "func.func @Placement_1(%arg0: index, %arg1: index, %arg2: index)",
-            emitted,
-        )
-        # Two computes, so two stages, and the source is viewed once in each.
-        self.assertEqual(emitted.count("spyreop.exp"), 1)
-        self.assertEqual(emitted.count("spyreop.sqrt"), 1)
-        self.assertEqual(emitted.count("construct_memory_view %arg0,"), 2)
-        # Four views for three buffers: the source twice, one per result. The
-        # placed buffer has no view, because it is not a buffer any more.
-        self.assertEqual(emitted.count("construct_memory_view"), 4)
-        self.assertNotIn("staged", emitted)
 
 
 if __name__ == "__main__":

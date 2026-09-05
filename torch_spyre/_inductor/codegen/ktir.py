@@ -75,7 +75,7 @@ from torch_spyre._inductor.codegen.opspec_utils import (
     reduction_indexing,
     row_major_strides,
 )
-from torch_spyre._inductor.constants import IDENTITY_OP, STAGGERED_EAS
+from torch_spyre._inductor.constants import STAGGERED_EAS
 from torch_spyre._inductor.logging_utils import get_inductor_logger
 from torch_spyre._inductor.op_spec import LoopSpec, OpSpec, TensorArg, UnimplementedOp
 from torch_spyre._inductor.pass_utils import coeff_through_floor
@@ -1084,24 +1084,6 @@ def _access(
 # The ``allocation`` keys memory planning uses for a buffer the kernel owns.
 INTERNAL_SPACES: tuple[str, ...] = ("lx", "hbm_pool")
 
-# Ops whose whole content is a PLACEMENT: no arithmetic, no reindexing, not even
-# a format change, only a statement about where the data should live.  In KTIR
-# that is something a reading stage's own memory view and access tile already
-# say, so such a spec becomes no stage at all -- its readers access its source
-# instead (``KernelPlan._hint``).  MEASURED, the ``identity`` the frontend puts
-# in front of ``F.layer_norm`` is exactly this: same ``device_size``, same
-# ``device_coordinates``, same ``device_dtype``, and the only difference is
-# ``allocation`` (``hbm,0`` -> ``lx,-1``).
-#
-# A TABLE and not a structural test, and that is load-bearing rather than
-# stylistic.  "One input, one output, access-preserving, allocation differs" is
-# also true of a perfectly ordinary ``sqrt`` writing an LX intermediate, so
-# structure alone cannot tell a placement from a computation -- only the op name
-# can.  Membership here is the claim "this op computes nothing"; every condition
-# in ``_hint`` is then a REFUSAL, because a spec that claims to be a placement
-# and is not describes real data movement.
-ACCESS_ONLY_OPS: frozenset[str] = frozenset({IDENTITY_OP})
-
 
 def is_internal(arg: TensorArg) -> bool:
     """Whether this buffer is one the kernel owns rather than one it is passed.
@@ -1250,15 +1232,6 @@ class KernelPlan:
         self._symbols: list[Any] = []  # the divided symbols, outermost-first
         self._divisors: dict = {}
         self.buffers: dict[str, Buffer] = {}
-        # ``link buf_id -> the SOURCE's Buffer``, filled by ``_hint`` and consulted
-        # by ``_access_of``: a read of an access-only spec's result is built as an
-        # access to its source instead.  Identity and address are what is taken
-        # from it -- the reader keeps its own geometry and element type (T5).
-        self.hints: dict[str, Buffer] = {}
-        # The post-fusion vector this plan was filled from, held so ``_hint`` can
-        # count a link's readers and writers across the WHOLE kernel rather than
-        # across the one (possibly nested) list ``_stages`` is recursing over.
-        self._vector: tuple[Any, ...] = ()
         self.steps: tuple[Step, ...] = ()
         # Handed out by ``_stages``, one per ``ComputeStep``, across the whole
         # tree: a step in a loop body is as much a stage as a top-level one, and
@@ -1292,7 +1265,6 @@ class KernelPlan:
         # self-contradictory right up until the fusion deletes one of them.  The
         # result is held, so ``_stages`` walks the same vector ``_divisions`` saw.
         specs = apply_plan_fusions(specs)
-        self._vector = tuple(specs)
         self._symbols, self.divisions = _divisions(specs)
         self._divisors = {
             symbol: division.div
@@ -1303,7 +1275,6 @@ class KernelPlan:
             cores *= division.div
         self.grid = (cores,)
         self._next_stage = 0
-        self.hints.clear()
         self.steps = self._stages(specs, ())
         self._check_threaded_buffers(self.steps)
 
@@ -1418,14 +1389,6 @@ class KernelPlan:
                 raise NotImplementedError(
                     f"OpSpec->KTIR: unexpected spec entry {type(entry).__name__}"
                 )
-            if entry.op in ACCESS_ONLY_OPS:
-                # No stage, no step, no stage number: this spec's one fact is
-                # recorded for its readers and the spec itself is gone.  Before
-                # the recipe lookup, because a placement deliberately has no
-                # recipe -- giving it one would emit a copy the hardware does not
-                # need.
-                self._hint(entry, _levels(entry, loops))
-                continue
             if entry.op not in KtirBuilder.RECIPES:
                 raise NotImplementedError(
                     f"OpSpec->KTIR: op {entry.op!r} is not supported yet "
@@ -1454,91 +1417,6 @@ class KernelPlan:
             self._next_stage += 1
             steps.append(self._compute_step(entry, loops, stage))
         return tuple(steps)
-
-    def _hint(self, spec: OpSpec, levels: Sequence[Level]) -> None:
-        """Record ``spec``'s placement for its readers, and emit no step for it.
-
-        An access-only spec (``ACCESS_ONLY_OPS``) carries no computation: its
-        input and output agree on ``device_size``, ``device_coordinates`` and
-        ``device_dtype`` and differ only in ``allocation``.  There is nothing to
-        lower -- the only thing an emitted stage could do with it is copy a buffer
-        to itself at a different address -- so the right treatment is to let its
-        readers access the SOURCE, which is what their own memory view, access
-        tile and load already do.  MEASURED: a hand-written reference chain views
-        its input directly in two stages and contains no staging op at all.
-
-        This is NOT ``_collapse_producer``.  That rewrite deletes a producer into
-        ONE surviving consumer and declines when the link has more than one reader,
-        because a device primitive absorbs the producer's *work* and work can only
-        be absorbed once.  Here there is no work, so removing the spec rewires EVERY
-        reader, and several readers is the normal case rather than the exception.
-
-        Every condition below is a refusal rather than a decline, because
-        membership in ``ACCESS_ONLY_OPS`` is already the claim that this spec
-        computes nothing.  A spec that makes that claim and does not meet it is
-        describing real data movement -- a restickify, a relayout, a conversion --
-        and it must be emitted or refused, never hinted away.
-
-        What is DISCARDED is the hint itself: it said "stage this in LX", and the
-        readers now read from wherever the source lives.  Nothing is reclaimed --
-        this path issues no device allocate for ``lx`` or the pool in any case --
-        and preserving the intent would mean viewing the link at ``memory_space =
-        ct_local``, which is spellable except that an ``lx`` buffer has no address.
-        """
-        inputs = [arg for arg in spec.args if arg.is_input]
-        outputs = [arg for arg in spec.args if not arg.is_input]
-        if len(inputs) != 1 or len(outputs) != 1:
-            # A spec with two inputs is computing something, whatever it is called.
-            raise NotImplementedError(
-                f"OpSpec->KTIR: op {spec.op!r} carries no computation, so it is "
-                f"resolved as a placement hint, but it has {len(inputs)} input(s) "
-                f"and {len(outputs)} output(s); a hint relates exactly one source "
-                "to one link"
-            )
-        source, link = inputs[0], outputs[0]
-        if not _access_preserving(source, link):
-            # The one condition whose absence would be silent: a conversion or a
-            # relayout has a source its readers do NOT already describe.
-            raise NotImplementedError(
-                f"OpSpec->KTIR: op {spec.op!r} does not write "
-                f"{buf_id(link)!r} where it read {buf_id(source)!r} -- "
-                f"size {list(source.device_size)} -> {list(link.device_size)}, "
-                f"coordinates {list(source.device_coordinates)} -> "
-                f"{list(link.device_coordinates)}, format "
-                f"{source.device_dtype!r} -> {link.device_dtype!r} -- so it is "
-                "real data movement rather than a placement, and this emitter "
-                "does not emit it"
-            )
-        if not is_internal(link):
-            # Only then are this kernel's reads all the reads there are: a buffer
-            # in ``hbm`` may be read by a kernel this vector does not contain.
-            raise NotImplementedError(
-                f"OpSpec->KTIR: op {spec.op!r} places {buf_id(link)!r}, whose "
-                f"allocation is {link.allocation!r} rather than one this kernel "
-                "owns, so another kernel may read it and dropping the placement "
-                "would leave that reader with a buffer nothing writes"
-            )
-        writers = _writers(buf_id(link), self._vector)
-        if len(writers) != 1:
-            raise NotImplementedError(
-                f"OpSpec->KTIR: {buf_id(link)!r} is written by {len(writers)} ops "
-                f"in this kernel ({sorted({w.op for w in writers})}), so dropping "
-                f"the placement {spec.op!r} would leave the other writer's data "
-                "being read through a buffer nothing wrote"
-            )
-        # The source's own record: identity and address, which is all a reader
-        # takes from the map.  Its geometry and element type are replaced per
-        # access in ``_access_of``, so a reader that views the buffer at another
-        # element type (T5) is unaffected by which stage happened to be first.
-        layout, _q = _solve_layout(source, levels)
-        buffer = _buffer(
-            source,
-            layout,
-            ElemTypes.of(source.device_dtype, _arrangement(source)),
-            bake_addresses=self.options.bake_addresses,
-        )
-        self.buffers.setdefault(buffer.buf_id, buffer)
-        self.hints[buf_id(link)] = buffer
 
     def _compute_step(
         self, spec: OpSpec, loops: Sequence[LoopSpec], stage: int
@@ -1738,17 +1616,7 @@ class KernelPlan:
         layout, q = _solve_layout(arg, levels)
         elems = ElemTypes.of(arg.device_dtype, None if unfused else _arrangement(arg))
         buffer = None
-        hinted = self.hints.get(buf_id(arg))
-        if hinted is not None:
-            # An access-only spec placed this buffer, so this read is a read of its
-            # SOURCE (``_hint``).  Consulted before ``is_internal``, which would
-            # otherwise thread the link as a value: a hinted buffer is not
-            # threaded, it has a view, a real address and a real load.  Identity
-            # and address come from the source's record; the geometry and element
-            # type are THIS access's, so the map cannot pin a later stage to an
-            # earlier one's view (the T5 property).
-            buffer = dataclasses.replace(hinted, layout=layout, elems=elems)
-        elif not is_internal(arg):
+        if not is_internal(arg):
             # A ``Buffer`` PER ACCESS, built from this arg's own layout and element
             # types, and the registry keeps the first one.  The record does double
             # duty -- identity and address, which must be shared because
@@ -1940,25 +1808,6 @@ def _readers(link: str, specs: Sequence[Any]) -> tuple[tuple[OpSpec, TensorArg],
         for spec in _op_specs(specs)
         for arg in spec.args
         if arg.is_input and buf_id(arg) == link
-    )
-
-
-def _writers(link: str, specs: Sequence[Any]) -> tuple[OpSpec, ...]:
-    """Every spec in ``specs`` that WRITES buffer ``link``.
-
-    The mirror of ``_readers``, and it exists for one condition: an access-only
-    spec may be dropped only when it is its link's sole writer, or the other
-    writer's data would be read through a buffer nothing writes.  Loop bodies
-    included, and scoped to the list it is handed for the same reason and with the
-    same caveat ``_readers`` carries: safe only in combination with
-    ``is_internal``, which is what makes this kernel's writes the only writes
-    there can be.
-    """
-    return tuple(
-        spec
-        for spec in _op_specs(specs)
-        for arg in spec.args
-        if not arg.is_input and buf_id(arg) == link
     )
 
 
