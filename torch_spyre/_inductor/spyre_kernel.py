@@ -1153,6 +1153,7 @@ class SpyreKernel(Kernel[CSEVariable]):
                     self.create_tensor_arg(False, real_dst_name, dst),
                 ]
                 op_indirect_var_names = None
+
             in_coords = args[-2].device_coordinates
             out_coords = args[-1].device_coordinates
             if is_restickify_coords(in_coords, out_coords):

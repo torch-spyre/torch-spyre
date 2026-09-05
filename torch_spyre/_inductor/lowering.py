@@ -1399,6 +1399,37 @@ def lower_restickify(x):
     return pw
 
 
+@register_spyre_lowering(torch.ops.spyre.compact)
+def lower_compact(x):
+    # Just emit a pointwise op here. At this point we only know that
+    # 1) the host output layout should be the same as the host input layout
+    # 2) the device output layout should be the default for the host layout
+    # 3) we don't know the device input layout
+    #
+    # Later, during Opspec generation we have the input device layout and
+    # there we can decide to emit an identity or restickify and slice.
+
+    # Here we don't unwrap because we need to know what dimensions
+    # Pytorch is reasoning on.
+    x.realize()
+    loader = x.make_loader()
+
+    def inner_fn(index):
+        return loader(index)
+
+    pw = Pointwise.create(
+        device=x.get_device(),
+        dtype=x.get_dtype(),
+        inner_fn=inner_fn,
+        ranges=x.get_size(),
+        origin_node=V.get_current_node(),
+        traceback=x.get_traceback(),
+    )
+
+    pw.realize()
+    return pw
+
+
 @register_spyre_lowering(torch.ops.aten.full.default, type_promotion_kind=None)
 def lower_full(size, fill_value, dtype=None, layout=None, device=None, pin_memory=None):
     assert layout in (torch.strided, None), f"doesn't support layout={layout}"

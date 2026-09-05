@@ -986,6 +986,12 @@ def get_matmul_m_size(op: "Operation") -> int:
     return 1
 
 
+def _get_range_vars(dep: MemoryDep) -> set[sympy.Symbol]:
+    # Not all free symbols are range vars (symbolic shapes)
+    # and not all range vars appear in the index equation.
+    return set(dep.var_names) & set(dep.index.free_symbols)
+
+
 def find_reduction_var(inputs: Sequence[MemoryDep], out_dep: MemoryDep) -> sympy.Symbol:
     """Return the single input iteration symbol reduced from the output.
 
@@ -995,9 +1001,9 @@ def find_reduction_var(inputs: Sequence[MemoryDep], out_dep: MemoryDep) -> sympy
     reduction_vars = {
         sym
         for inp in inputs
-        for sym in inp.index.free_symbols
-        if sym in inp.ranges and not is_indirect(sym.name)
-    } - out_dep.index.free_symbols
+        for sym in _get_range_vars(inp)
+        if not is_indirect(sym.name)
+    } - _get_range_vars(out_dep)
     if len(reduction_vars) != 1:
         raise Unsupported(
             f"expected exactly 1 reduction variable, got {reduction_vars}"
@@ -1085,9 +1091,9 @@ def find_matmul_generated_var(
 
     Raises Unsupported if the count is not exactly 1.
     """
-    y_syms = y_dep.index.free_symbols
-    x_syms = x_dep.index.free_symbols
-    out_syms = out_dep.index.free_symbols
+    y_syms = _get_range_vars(y_dep)
+    x_syms = _get_range_vars(x_dep)
+    out_syms = _get_range_vars(out_dep)
     logger.debug(
         "[find_matmul_generated_var] looking for N (generated dim = in y & out, not in x)\n"
         "  x   index=%-20s  free=%s\n"
@@ -2009,6 +2015,55 @@ def stick_compatible(coords: "list[list[sympy.Expr]]") -> bool:
         for coord in dc[:-1]:
             nonstick_vars |= coord.free_symbols - tensor_stick_vars
     return len(stick_vars) <= 1 and stick_vars.isdisjoint(nonstick_vars)
+
+
+def is_sparse_stl(stl) -> bool:
+    """Return True if stl has the stride_map pattern of a sparse Spyre layout.
+
+    A sparse layout is produced by a reduction along the stick dimension:
+    the stick dim (device_size[-1] == elems_per_stick) is synthetic with
+    stride_map[-1] == -1 (no corresponding host stride).
+
+    A device tensor has a device_size and stride_map. Remove the dimensions of
+    size one from both lists. The stride of a dimension is the prod of the
+    dimensions to its right. Consider all dimensions whose stride is not a
+    multiple of num_elements_per_stick. A tensor is sparse iff the matching
+    stride_map elements are all less than or equal to zero.
+    """
+    dev_stride = 1
+    sparse = False
+    for dev_size, host_stride in zip(
+        reversed(stl.device_size), reversed(stl.stride_map)
+    ):
+        if dev_size != 1:
+            if dev_stride % stl.elems_per_stick() != 0:
+                if host_stride > 0:
+                    return False
+                else:
+                    sparse = True
+            else:
+                break
+            dev_stride *= dev_size
+    return sparse
+
+
+def _is_compact_node(current_node: ComputedBuffer | SchedulerNode) -> bool:
+    """Return True if current_node's FX origin is spyre::compact."""
+    try:
+        if isinstance(current_node, ComputedBuffer):
+            buf = current_node
+        elif isinstance(current_node, SchedulerNode):
+            buf = current_node.node
+        else:
+            return False
+        data = buf.data
+        origins: set = getattr(data, "origins", set())
+        return bool(origins) and any(
+            getattr(n, "target", None) is torch.ops.spyre.compact.default
+            for n in origins
+        )
+    except Exception:
+        return False
 
 
 def compute_restickify_needed(

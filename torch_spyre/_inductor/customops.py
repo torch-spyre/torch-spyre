@@ -508,6 +508,18 @@ def restickify(  # type: ignore[empty-body]
     pass
 
 
+@torch.library.custom_op("spyre::compact", mutates_args=(), device_types="spyre")
+def compact(  # type: ignore[empty-body]
+    x: torch.Tensor,
+) -> torch.Tensor:
+    pass
+
+
+@compact.register_fake
+def _(x: torch.Tensor) -> torch.Tensor:
+    return x.new_empty(x.size())
+
+
 @torch.library.custom_op("spyre::max_dim_int64_fallback", mutates_args=())
 def max_dim_int64_fallback(
     input: torch.Tensor, dim: int, keepdim: bool = False

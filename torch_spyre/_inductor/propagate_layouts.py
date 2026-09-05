@@ -90,6 +90,7 @@ from .pass_utils import (
     try_device_coordinates,
     indirect_info_from_op,
     is_keep_by_index,
+    is_sparse_stl,
     is_stick_expr_offset_free,
     is_topk,
     iter_var_id,
@@ -1679,6 +1680,49 @@ def _topk_layouts(
     return results
 
 
+def _compact_layout(
+    op: Operation,
+    output: FixedLayout,
+    output_dep: MemoryDep,
+    args: list[PropArg],
+) -> list[SpyreTensorLayout]:
+    """Layout for spyre::compact: output is the default dense STL."""
+
+    if len(args) != 1:
+        raise Unsupported(f"({op.get_name()}) requires exactly one input")
+
+    in_arg = args[0]
+    out_layouts = []
+
+    for in_stl in in_arg.layouts:
+        c_size = [concretize_expr(s) for s in output.size]
+        c_stride = [concretize_expr(s) for s in output.stride]
+
+        out_stl = SpyreTensorLayout(
+            c_size, c_stride, output.dtype, list(range(len(output.size)))
+        )
+
+        in_is_sparse = is_sparse_stl(in_stl)
+        out_is_sparse = is_sparse_stl(out_stl)
+
+        if not in_is_sparse:
+            assert not out_is_sparse
+
+        restick = len(in_stl.device_size) > 1 and in_is_sparse and not out_is_sparse
+
+        if restick:
+            out_stl = SpyreTensorLayout(
+                [in_stl.elems_per_stick()] + out_stl.device_size,
+                [c_stride[0] * c_size[0]] + out_stl.stride_map,
+                out_stl.device_dtype,
+            )
+
+        out_layouts.append(out_stl)
+
+    op.restick_cost_fn = AnyInNode.from_args()
+    return out_layouts
+
+
 def _keep_by_index_layouts(
     op: Operation,
     output: FixedLayout,
@@ -1824,6 +1868,9 @@ def compute_layouts(
                 f"views not supported for spyre.layernormnorm({in_layout.size})=>{output.size})"
             )
         return _layernormnorm_layout(op, output, output_dep, args)
+
+    if aten_op == spyreop.compact.default:
+        return _compact_layout(op, output, output_dep, args)
 
     if aten_op == aten.clone.default:
         # clone materializes a new buffer in a fixed row-major layout regardless of

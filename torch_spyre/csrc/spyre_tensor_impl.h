@@ -207,6 +207,8 @@ uint64_t get_device_size_in_bytes(SpyreTensorLayout stl);
 SpyreTensorLayout get_spyre_tensor_layout(const at::Tensor& tensor);
 void set_spyre_tensor_layout(const at::Tensor& tensor,
                              const SpyreTensorLayout& stl);
+std::vector<int64_t> get_spyre_dma_sizes(const at::Tensor& tensor);
+std::vector<int64_t> get_spyre_dma_strides(const at::Tensor& tensor);
 
 }  // namespace spyre
 
