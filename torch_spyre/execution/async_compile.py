@@ -12,15 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import tempfile
-from typing import Any, cast
-from collections.abc import Sequence
 import os
 import shutil
 import subprocess
-import torch
+import tempfile
 import uuid
+from typing import Any, cast
+from collections.abc import Sequence
 
+import torch
 from torch._inductor.async_compile import AsyncCompile
 from torch._inductor.runtime.runtime_utils import cache_dir
 from torch_spyre._inductor import config as _spyre_config
@@ -37,6 +37,14 @@ from torch_spyre._inductor.kernel_provenance import (
 from torch_spyre._inductor.codegen.bundle import generate_bundle
 from torch_spyre.profiler._ffdc import CATEGORY_COMPILE_BACKEND, try_collect
 from .kernel_runner import SpyreSDSCKernelRunner, SpyreUnimplementedRunner
+from .kernel_cache import (
+    allocate_compile_dir,
+    commit_compile_dir,
+    compute_specs_hash,
+    get_cached_kernel_dir,
+    get_kernel_registry,
+    _move_to_failed_dir,
+)
 
 logger = get_inductor_logger("sdsc_compile")
 
@@ -78,6 +86,36 @@ def get_output_dir(kernel_name: str):
     return kernel_output_dir
 
 
+def _compile_to_dir(
+    kernel_name: str,
+    compile_dir: str,
+    specs,
+    pool_size: int,
+) -> None:
+    """Run generate_bundle then dxp_standalone for ``specs`` into ``compile_dir``.
+
+    Shared by the cache-miss path and the no-cache path so that any change to
+    the compilation sequence is applied in both places automatically.
+    """
+    generate_bundle(kernel_name, compile_dir, specs, pool_size=pool_size)
+
+    with torch.profiler.record_function(f"dxp_standalone:{kernel_name}"):
+        try:
+            subprocess.run(
+                ["dxp_standalone", "-d", compile_dir],
+                check=True,
+            )
+        except subprocess.CalledProcessError as exc:
+            try_collect(
+                exc,
+                logger=logger,
+                failure_category=CATEGORY_COMPILE_BACKEND,
+                kernel_name=kernel_name,
+                code_dir=compile_dir,
+            )
+            raise
+
+
 class SpyreAsyncCompile(AsyncCompile):
     """Spyre kernel compilation (`sdsc`), plus the upstream AsyncCompile.
 
@@ -114,13 +152,9 @@ class SpyreAsyncCompile(AsyncCompile):
         unimp = find_unimplemented(list(specs))
         if unimp is not None:
             logger.warning(
-                f"WARNING: Compiling unimplemented {unimp.op} to runtime exception"
+                "WARNING: Compiling unimplemented %s to runtime exception", unimp.op
             )
             return SpyreUnimplementedRunner(kernel_name, unimp.op)
-
-        # Generate SDSC Bundle from OpSpecs
-        output_dir = get_output_dir(kernel_name)
-        generate_bundle(kernel_name, output_dir, specs, pool_size=pool_size)
 
         self._provenance_attempt_count += 1
         try:
@@ -145,23 +179,59 @@ class SpyreAsyncCompile(AsyncCompile):
                 )
             kernel_provenance = None
 
-        # Invoke backend compiler of SDSC Bundle
-        with torch.profiler.record_function(f"dxp_standalone:{kernel_name}"):
-            try:
-                subprocess.run(
-                    ["dxp_standalone", "-d", output_dir],
-                    check=True,
-                )
-            except Exception as exc:
-                try_collect(
-                    exc,
-                    logger=logger,
-                    failure_category=CATEGORY_COMPILE_BACKEND,
-                    kernel_name=kernel_name,
-                    code_dir=output_dir,
-                )
-                raise
+        use_cache = (
+            _spyre_config.spyre_kernel_cache
+            and not torch._inductor.config.force_disable_caches
+        )
 
+        if use_cache:
+            # Hash the specs in-memory BEFORE any disk I/O.  On a cache hit
+            # neither generate_bundle nor dxp_standalone runs at all.
+            try:
+                cache_key = compute_specs_hash(
+                    specs, kernel_name=kernel_name, pool_size=pool_size
+                )
+            except RuntimeError as e:
+                logger.warning(
+                    "Kernel cache disabled for %s: could not compute cache key: %s. "
+                    "Set SPYRE_KERNEL_CACHE=0 to suppress this warning.",
+                    kernel_name,
+                    e,
+                )
+            else:
+                logger.debug("Bundle cache key: %s", cache_key)
+
+                cached_dir = get_cached_kernel_dir(cache_key)
+                if cached_dir is not None:
+                    logger.debug("Cache HIT: Using cached kernel from: %s", cached_dir)
+                    get_kernel_registry().record_hit(cache_key)
+                    return SpyreSDSCKernelRunner(
+                        kernel_name, cached_dir, kernel_provenance=kernel_provenance
+                    )
+
+                logger.debug("Cache MISS: Compiling kernel")
+                get_kernel_registry().record_miss(cache_key)
+
+                # Allocate a temp dir INSIDE the cache root (same filesystem)
+                # so the rename in commit_compile_dir is atomic on POSIX.
+                compile_dir: str = allocate_compile_dir(cache_key)
+                try:
+                    _compile_to_dir(kernel_name, compile_dir, specs, pool_size)
+                    cached_dir = commit_compile_dir(compile_dir, cache_key)
+                    logger.debug("Kernel compiled and cached at: %s", cached_dir)
+                    return SpyreSDSCKernelRunner(
+                        kernel_name, cached_dir, kernel_provenance=kernel_provenance
+                    )
+                except Exception:  # subprocess.CalledProcessError:
+                    # Move the failed dir to failed/ for manual debugging
+                    # rather than leaving .tmp. dirs accumulating in the root.
+                    _move_to_failed_dir(compile_dir)
+                    raise
+
+        # Caching disabled (SPYRE_KERNEL_CACHE=0 or force_disable_caches).
+        # Compile into a throw-away temp dir that lives for this process only.
+        output_dir = get_output_dir(kernel_name)
+        _compile_to_dir(kernel_name, output_dir, specs, pool_size)
         return SpyreSDSCKernelRunner(
             kernel_name,
             output_dir,
@@ -186,7 +256,7 @@ class SpyreAsyncCompile(AsyncCompile):
         unimp = find_unimplemented(list(specs))
         if unimp is not None:
             logger.warning(
-                f"WARNING: Compiling unimplemented {unimp.op} to runtime exception"
+                "WARNING: Compiling unimplemented %s to runtime exception", unimp.op
             )
             return SpyreUnimplementedRunner(kernel_name, unimp.op)
 
