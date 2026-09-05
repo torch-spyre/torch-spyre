@@ -1073,6 +1073,11 @@ class KernelPlan:
         Ascending ``arg_index`` matches the positional order ``call_kernel``
         passes to ``.run(...)``, so the emitted func signature lines up with
         that binding.
+
+        KNOWN GAP: a plan-time fusion can delete a buffer the caller still
+        passes, so with the planners off this list can be one shorter than the
+        call site's argument list.  Invisible on the path that runs, whose bases
+        are baked constants and whose func takes no arguments.
         """
         return sorted(
             (e for e in self.buffers.values() if e.arg_index >= 0),
@@ -1493,9 +1498,8 @@ def _readers(link: str, specs: Sequence[Any]) -> tuple[tuple[OpSpec, TensorArg],
     Loop bodies included, because a nested op reads the same buffer namespace.
     The scope is the list it is handed, which is also the limit: a fusion inside
     a ``LoopSpec`` body cannot see a reader outside that body, the same blind
-    spot the recursion has.  Safe only in combination with ``is_internal`` on the
-    buffer -- a buffer the kernel does not own can be read by a kernel this list
-    does not contain, and no scope here would show it.
+    spot the recursion has.  Safe only in combination with ``kernel_local`` on
+    the buffer -- a reader in another kernel is one no scope here would show.
     """
     return tuple(
         (spec, arg)
@@ -1547,14 +1551,12 @@ def _collapse_producer(
     * it must be unary, or there is no single source to read instead of it;
     * it must be ACCESS-PRESERVING, or the survivor's description of its input
       does not describe that source;
-    * the link must be a buffer this kernel OWNS and must be read exactly ONCE,
-      by the survivor.  Those are two halves of one condition.  Ownership is
-      what makes this kernel's reads the only reads there can be: an ``hbm``
-      link is a real buffer another kernel may read, and deleting its producer
-      leaves that reader on stale memory.  The count is what rules out
-      ``a = abs(x); amax(a, -1) + sum(a, -1)``, where the second consumer sits
-      AFTER the pair -- so the pair is still adjacent, and a matcher trusting
-      adjacency deletes the producer of a buffer the ``sum`` still reads.
+    * the link must be KERNEL-LOCAL and must be read exactly ONCE, by the
+      survivor.  Two halves of one condition: locality (``TensorArg``, filled by
+      the scheduler) rules out a reader this spec list cannot see, and the count
+      rules out ``a = abs(x); amax(a, -1) + sum(a, -1)``, where the second
+      consumer sits AFTER the pair -- so the pair is still adjacent, and a
+      matcher trusting adjacency deletes a buffer the ``sum`` still reads.
 
     Only buffer IDENTITY moves across: name, arg index, allocation, format.  The
     extents and coordinates stay the survivor's own, because each spec writes
@@ -1582,12 +1584,11 @@ def _collapse_producer(
             producer.op,
         )
         return None
-    if not is_internal(producer_out):
+    if not producer_out.kernel_local:
         _decline(
-            "link %s is not a buffer this kernel owns (allocation=%r), so "
-            "deleting its producer would strand a reader elsewhere",
+            "link %s is not kernel-local, so deleting its producer would strand "
+            "a reader outside this kernel",
             buf_id(producer_out),
-            producer_out.allocation,
         )
         return None
     link = buf_id(producer_out)

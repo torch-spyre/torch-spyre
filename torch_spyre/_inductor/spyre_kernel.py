@@ -31,6 +31,7 @@ from torch._inductor.dependencies import MemoryDep
 from torch._inductor.ops_handler import DefaultHandler, StoreMode
 from torch._inductor.utils import IndentedBuffer, sympy_index_symbol, sympy_subs
 from torch._inductor.virtualized import V
+from torch.utils._ordered_set import OrderedSet
 
 
 from .constants import (
@@ -588,6 +589,11 @@ class SpyreKernel(Kernel[CSEVariable]):
         self._alignment_access_by_tensor_arg: dict[int, AlignmentAccess] = {}
         self._alignment_inputs_by_spec: dict[int, AlignmentInputs] = {}
         self.pool_size: int = pool_size
+        # The op names of the scheduler nodes codegenned into this kernel, set by
+        # the scheduler before any spec is built; empty means "unknown", which
+        # makes every buffer look non-local.  Read by create_tensor_arg for
+        # TensorArg.kernel_local.
+        self.fused_node_names: OrderedSet[str] = OrderedSet()
 
     def indirect_var_names(self) -> "frozenset[str] | None":
         if not self.indirect_vars:
@@ -818,6 +824,18 @@ class SpyreKernel(Kernel[CSEVariable]):
         # SDSC literal byte-identical.
         if opspec_name is None and _spyre_config.ktir_emitter:
             opspec_name = name
+        # Same gate, and for the same reason: the KTIR plan-time fuser deletes a
+        # producer op only for a buffer nothing outside this kernel reads, and
+        # the emitter is handed one kernel's specs and cannot ask.  The upstream
+        # predicate covers every user; a graph output can have no user at all,
+        # which it does not cover.  False without a scheduler, so the fuser
+        # declines.
+        kernel_local = bool(
+            _spyre_config.ktir_emitter
+            and (sched := getattr(V.graph, "scheduler", None))
+            and sched.can_buffer_be_removed_through_fusion(name, self.fused_node_names)
+            and name not in V.graph.get_output_names()
+        )
         it_space = iteration_space(self.current_node)
         # With dynamic=True the host index may contain symbolic strides
         # (e.g. x0*s1+x1).  Concretize size symbols so normalize_coordinates
@@ -854,6 +872,7 @@ class SpyreKernel(Kernel[CSEVariable]):
             name=opspec_name,
             device_tile_advance_expr=device_tile_advance_expr,
             work_division=work_division,
+            kernel_local=kernel_local,
         )
         self._alignment_access_by_tensor_arg[id(tensor_arg)] = AlignmentAccess(
             tensor.layout.device_layout, tensor.index
@@ -1622,6 +1641,8 @@ def _codegen_op_spec_list(specs, buf: IndentedBuffer, sympy_str) -> None:
                             buf.writeline(f"allocation={arg.allocation!r},")
                             if arg.name is not None:
                                 buf.writeline(f"name={arg.name!r},")
+                            if arg.kernel_local:
+                                buf.writeline("kernel_local=True,")
                             if arg.device_tile_advance_expr is not None:
                                 buf.writeline(
                                     "device_tile_advance_expr="

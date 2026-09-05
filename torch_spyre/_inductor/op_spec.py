@@ -220,6 +220,10 @@ class TensorArg:
             ops without loop_info/coarse tiling.
         work_division: Optional tensor-specific ownership used when it differs
             from the operation's work division.
+        kernel_local: True when nothing outside the kernel that produced this
+            buffer reads it. The KTIR plan-time fuser deletes a producer op only
+            for such a buffer; only the scheduler can see a buffer's users, so
+            it is filled there and defaults to False.
     """
 
     is_input: bool
@@ -234,6 +238,7 @@ class TensorArg:
         default_factory=lambda: ElementArrangement.STANDARD
     )
     work_division: TensorWorkDivision | None = None
+    kernel_local: bool = False
 
 
 def is_lx_relayout_identity(op: str, args: Sequence[TensorArg]) -> bool:
