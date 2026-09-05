@@ -185,6 +185,12 @@ layout_solver: Literal[
 # invariant violations early. Set SPYRE_VALIDATE_OP_SPECS=0 to disable.
 validate_op_specs: bool = os.environ.get("SPYRE_VALIDATE_OP_SPECS", "1") == "1"
 
+# GraphLowering invariant validation after each compiler pass in
+# CustomPreSchedulingPasses. Catches consistency violations (stale
+# name_to_buffer entries, duplicate buffer names, reads from undefined
+# buffers, etc.) early. Set SPYRE_VALIDATE_GRAPH=0 to disable.
+validate_graph_invariants: bool = os.environ.get("SPYRE_VALIDATE_GRAPH", "1") == "1"
+
 # Use the C++ (native) permutation-layout packer accelerator, which both
 # simulated-annealing solvers drive (the layout-only one and the joint
 # co-optimizer). The native and Python packers are behaviourally identical
