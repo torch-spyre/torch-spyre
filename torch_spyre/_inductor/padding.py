@@ -791,6 +791,7 @@ def _pad_restickify_input(op: Operation, graph: GraphLowering) -> None:
     out_stick_sym = _stick_symbol(op.get_layout().device_layout, _write_dep(op))
     size1 = out_stick_sym is None
     new_stick_dim = None
+    device_dim = None
     padded_dim_size = None
     if not size1:
         _assert_input_paddable(op, in_dep, in_layout)
@@ -858,22 +859,13 @@ def _pad_restickify_input(op: Operation, graph: GraphLowering) -> None:
         # allocation covers the full stick the restickify sweeps.
         _pad_elided_dim(in_buf)
     else:
-        assert new_stick_dim is not None  # set in the size>1 gate above
+        assert device_dim is not None  # selected from the consumer read above
         assert padded_dim_size is not None  # computed alongside it
-        # Bump device_size on the dim carrying new_stick_dim so the read window
-        # lands inside in_buf's own allocation.
+        # The buffer is unchanged, or lower_identity_clone copied its device
+        # layout. Keep the physical axis selected from the consumer read:
+        # an allocation-only producer can have zero loop ranges and therefore
+        # no write-coordinate symbol from which to recover that axis.
         layout = in_buf.get_layout()
-        write_dep = _write_dep(in_buf)
-        host_coords = host_coordinates(layout, write_dep, None)
-        syms = host_coords[new_stick_dim].free_symbols
-        assert len(syms) == 1
-        device_dim = _device_dim_carrying_sym(
-            layout.device_layout, write_dep, next(iter(syms))
-        )
-        assert device_dim is not None, (
-            f"restickify padding: {in_buf.get_name()} exposed no paddable device "
-            f"dim for new stick dim {new_stick_dim}"
-        )
         in_buf.layout = _pad_device_dim(layout, device_dim, padded_dim_size)
 
     logger.debug(

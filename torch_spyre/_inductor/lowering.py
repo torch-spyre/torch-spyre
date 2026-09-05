@@ -497,11 +497,20 @@ def lower_bmm(x, y):
     elif x_ndim == 4 and y_ndim == 4:
         ranges = [x_size[0], x_size[1], x_size[2], y_size[-1]]
 
+        def y_batch_index(dim, index):
+            if y_size[dim] == 1:
+                return 0
+            if y_size[dim] != x_size[dim]:
+                raise Unsupported(
+                    f"BMM batch dimensions are not broadcastable: {x_size} and {y_size}"
+                )
+            return index
+
         def inner_fn(index, reduction_index):
             i0, i1, i2, i3 = index
             (r0,) = reduction_index
             tmp1 = x_loader([i0, i1, i2, r0])
-            tmp2 = y_loader([i0, i1, r0, i3])
+            tmp2 = y_loader([y_batch_index(0, i0), y_batch_index(1, i1), r0, i3])
             return (tmp1, tmp2)
     elif x_ndim == 3 and y_ndim == 2:
         ranges = [x_size[0], x_size[1], y_size[1]]  # B, M, N

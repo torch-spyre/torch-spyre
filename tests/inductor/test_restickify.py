@@ -2167,6 +2167,20 @@ def test_substick_contraction_permuted_key(D):
     _strict(fn, q, k)
 
 
+@pytest.mark.parametrize("D", SUBSTICK_MATMUL_D, ids=lambda d: f"D{d}")
+def test_substick_contraction_permuted_broadcast_key(D):
+    # A real head-axis broadcast lets clone elision expose the permuted RHS
+    # directly to contraction padding, including the sub-stick D cases.
+    B, H, Lq, Lk = 2, 4, 16, 32
+    q = _arange(B, Lq, H, D, span=3)
+    k = _arange(B, Lk, 1, D, span=3)
+
+    def fn(q, k):
+        return torch.matmul(q.permute(0, 2, 1, 3), k.permute(0, 2, 3, 1))
+
+    _strict(fn, q, k)
+
+
 def test_2d_sparse_broadcast_dense_pointwise():
     """a.sum(-1) + b - reduction output broadcast into pointwise with dense b."""
     a = torch.randn((S, S), dtype=torch.float16)
@@ -2439,6 +2453,144 @@ def test_restickify_broadcast_into_stick(shape, bwidth):
 
 
 # --------------------------------------------------------------------------
+# White-box geometry of the input-padding axis and size-1 allocation grow.
+#
+# The bodies below do not execute device kernels. Ordinary collection of this
+# module still runs its RNG and HBM-poisoning fixtures, so the pytest lane is
+# device-capable.
+
+
+@pytest.mark.parametrize("source_kind", ["computed", "zero_trip", "graph_input_clone"])
+def test_restickify_input_padding_carries_consumer_axis(source_kind):
+    """The consumer selects the physical axis; a writer need not describe it."""
+    import sympy
+    from torch._inductor.graph import GraphLowering
+    from torch._inductor.ir import ComputedBuffer, InputBuffer, Pointwise
+    from torch._inductor.virtualized import ops
+    from torch_spyre._C import DataFormats, ElementArrangement
+    from torch_spyre._C import SpyreTensorLayout as NativeLayout
+    from torch_spyre._inductor.ir import FixedTiledLayout
+    import torch_spyre._inductor.padding as padding
+
+    device = torch.device("cpu")
+    shape = [2, 32, 1, 64]
+    strides = [2048, 64, 2048, 1]
+    source_stl = NativeLayout(
+        [32, 1, 1, 2, 64],
+        [64, -1, 64, 2048, 1],
+        DataFormats.SEN169_FP16,
+        ElementArrangement.STANDARD,
+    )
+    source_layout = FixedTiledLayout(device, torch.float16, shape, strides, source_stl)
+    # The output's stick carries host dim 1, so reading the 32-row input
+    # requires 64 rows of physical axis 0. Other axes must remain unchanged.
+    output_stl = NativeLayout(
+        [64, 1, 1, 2, 64],
+        [1, -1, 64, 2048, 64],
+        DataFormats.SEN169_FP16,
+        ElementArrangement.STANDARD,
+    )
+    graph = GraphLowering(torch.fx.symbolic_trace(lambda: None))
+    origin = next(iter(graph.graph.nodes))
+
+    def producer(name, layout, ranges):
+        return ComputedBuffer(
+            name=name,
+            layout=layout,
+            data=Pointwise(
+                device=device,
+                dtype=torch.float16,
+                inner_fn=lambda _index: ops.constant(0, torch.float16),
+                ranges=[sympy.Integer(size) for size in ranges],
+            ),
+        )
+
+    with V.set_graph_handler(graph):
+        if source_kind == "graph_input_clone":
+            source = InputBuffer(name="source", layout=source_layout)
+        else:
+            ranges = [0, 0, 0, 0] if source_kind == "zero_trip" else shape
+            source = producer("source", source_layout, ranges)
+        graph.name_to_buffer["source"] = source
+        output = ComputedBuffer(
+            name="restickify",
+            layout=FixedTiledLayout(device, torch.float16, shape, strides, output_stl),
+            data=Pointwise(
+                device=device,
+                dtype=torch.float16,
+                inner_fn=lambda index: ops.load(
+                    "source", 2048 * index[0] + 64 * index[1] + index[3]
+                ),
+                ranges=[sympy.Integer(size) for size in shape],
+            ),
+        )
+        output.origins.add(origin)
+        graph.name_to_buffer[output.name] = output
+        graph.operations = [output]
+
+        if source_kind == "zero_trip":
+            # Exact failure class from the D33 frame: an allocation-only
+            # writer has no coordinate symbol, although its reader has one.
+            write = padding._write_dep(source)
+            assert all(size == 0 for size in write.ranges.values())
+            assert padding.host_coordinates(source_layout, write, None) == [0] * 4
+
+        # Keep the unit's graph-input construction seam small. The returned
+        # buffer has the exact copied layout promised by lower_identity_clone;
+        # existing graph-input device tests exercise its real FX lowering.
+        clone_layout = FixedTiledLayout(
+            device,
+            torch.float16,
+            shape,
+            strides,
+            NativeLayout(
+                list(source_stl.device_size),
+                list(source_stl.stride_map),
+                source_stl.device_dtype,
+                source_stl.element_arrangement,
+            ),
+        )
+        clone = producer("clone", clone_layout, shape)
+
+        def supply_clone(*_args, **_kwargs):
+            graph.operations.append(clone)
+            return clone, [clone]
+
+        with (
+            patch.object(padding, "_find_arg_fx_node", return_value=origin),
+            patch.object(
+                padding, "lower_identity_clone", side_effect=supply_clone
+            ) as create,
+            patch.object(padding, "redirect_computed_buffer_reads") as redirect,
+            patch.object(padding, "_write_dep", wraps=padding._write_dep) as writes,
+        ):
+            padding._pad_restickify_input(output, graph)
+        # Only the restickify output's stick is queried. Reconstructing the
+        # selected input axis from either producer/clone write is forbidden.
+        assert [call.args[0] for call in writes.call_args_list] == [output]
+        selected = clone if source_kind == "graph_input_clone" else source
+        if source_kind == "graph_input_clone":
+            create.assert_called_once()
+            assert create.call_args.kwargs["orig_stl"] is source_stl
+            assert create.call_args.kwargs["host_size"] == shape
+            assert create.call_args.kwargs["host_stride"] == strides
+            redirect.assert_called_once()
+            assert redirect.call_args.args[1] == {"source": "clone"}
+            assert source.get_layout() is source_layout
+            assert list(source_layout.device_layout.device_size) == [32, 1, 1, 2, 64]
+            assert graph.operations == [clone, output]
+        else:
+            create.assert_not_called()
+            redirect.assert_not_called()
+
+        grown = selected.get_layout()
+        assert list(grown.size) == shape and list(grown.stride) == strides
+        assert list(grown.device_layout.device_size) == [64, 1, 1, 2, 64]
+        assert list(grown.device_layout.stride_map) == list(source_stl.stride_map)
+        assert grown.device_layout.device_dtype == source_stl.device_dtype
+        assert grown.device_layout.element_arrangement == source_stl.element_arrangement
+
+
 # White-box (device-free) geometry of the size-1 stick allocation grow.
 #
 # A restickify whose old stick has host size 1 collapses one operand's
