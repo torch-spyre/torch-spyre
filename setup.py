@@ -220,6 +220,8 @@ class clean(Command):
 # staged copy may already carry a stale `0.0.1+gOLD`, which a literal replace
 # would silently fail to update (shipping the wrong commit). This re-stamps
 # whatever is there.
+# tests/test_version.py keeps an inverse of this pattern to unstamp; keep both in
+# step when editing the literal's format.
 _VERSION_LITERAL_RE = re.compile(r'^__version__ = "[^"]*"$', re.MULTILINE)
 
 

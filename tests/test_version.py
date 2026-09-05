@@ -28,9 +28,11 @@ import importlib.util
 import os
 import shutil
 import subprocess
+import types
 from pathlib import Path
 
 import pytest
+import regex as re
 
 
 def _find_version_file() -> Path:
@@ -120,11 +122,12 @@ def _in_source_checkout() -> bool:
 
     Only a source checkout has a ``.git`` beside the package; the CI wheel flow
     installs into site-packages, where the lookup never fires. Evaluated at
-    decoration time by ``skipif``, so it cannot use the fixture -- the directory
-    tested here mirrors version.py's own ``_REPO_ROOT`` (its ``parent.parent``).
+    decoration time by ``skipif``, so it cannot use the fixture -- the path tested
+    here mirrors version.py's own ``_REPO_ROOT`` (its ``parent.parent``), including
+    its ``.exists()`` probe, so worktree and submodule checkouts are not skipped.
     """
     return (
-        (_find_version_file().parent.parent / ".git").is_dir()
+        (_find_version_file().parent.parent / ".git").exists()
         and shutil.which("git") is not None
         and os.environ.get("TORCH_SPYRE_VERSION_NO_GIT") != "1"
     )
@@ -198,6 +201,99 @@ def test_checkout_version_matches_head(version_mod):
     ).stdout.strip()
     expected = f"{version_mod._BASE_VERSION}+g{sha}"
     assert version_mod.__version__ == expected
+
+
+# Inverse of setup.py's ``_VERSION_LITERAL_RE`` stamp: matches the single
+# top-level ``__version__ = "..."`` literal so it can be rewritten back to the
+# bare base version.
+_VERSION_LITERAL_RE = re.compile(rb'^__version__ = "([^"]*)"$', re.MULTILINE)
+
+
+def _unstamped_version_source() -> bytes:
+    """version.py's source with ``__version__`` reset to the bare base version.
+
+    The installed copy the CI wheel flow resolves to is already stamped, which
+    makes the probe tests vacuous: the resolution block is guarded by ``"+" not in
+    __version__``. Unstamping keeps that branch live in both layouts.
+    """
+    source = _find_version_file().read_bytes()
+    match = _VERSION_LITERAL_RE.search(source)
+    assert match is not None, (
+        "no top-level '__version__ = \"...\"' literal in "
+        f"{_find_version_file()}: it has been moved, reformatted or re-quoted, and "
+        "setup.py's BuildPyWithVersion has drifted with it"
+    )
+    # The public prefix, not a hardcoded "0.0.1", so a base-version bump is fine.
+    base = match.group(1).split(b"+", 1)[0]
+    unstamped, count = _VERSION_LITERAL_RE.subn(
+        b'__version__ = "' + base + b'"', source, count=1
+    )
+    assert count == 1
+    return unstamped
+
+
+def _load_version_module_at(module_path: Path):
+    """Execute version.py with ``__file__`` set to ``module_path``.
+
+    Contents come from the copy under test (unstamped), but ``_REPO_ROOT`` follows
+    ``module_path`` -- which is what lets a test aim the probe at a synthetic tree.
+    """
+    source = _unstamped_version_source()
+    namespace = {"__file__": str(module_path), "__name__": "torch_spyre_version_probe"}
+    exec(compile(source, str(module_path), "exec"), namespace)  # noqa: S102
+    return types.SimpleNamespace(**namespace)
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="git not available")
+def test_dot_git_file_still_resolves_a_local_segment(tmp_path, monkeypatch):
+    """A checkout whose ``.git`` is a *file* (worktree, submodule) still gets a sha.
+
+    Built by hand rather than with ``git worktree add`` so it also runs on CI, where
+    the checkout is a primary clone. Fails if the probe regresses to ``.is_dir()``.
+    """
+    monkeypatch.delenv("TORCH_SPYRE_VERSION_NO_GIT", raising=False)
+
+    # Our own scratch repo, so the assertion is independent of the host checkout.
+    real = tmp_path / "real"
+    (real / "torch_spyre").mkdir(parents=True)
+    for command in (
+        ["git", "init", "--quiet"],
+        ["git", "config", "user.email", "test@example.invalid"],
+        ["git", "config", "user.name", "Test"],
+        ["git", "commit", "--quiet", "--allow-empty", "-m", "seed"],
+    ):
+        subprocess.run(command, cwd=real, check=True, timeout=30)
+
+    # The linked-worktree layout: a `.git` FILE pointing at the real git dir.
+    linked = tmp_path / "linked"
+    (linked / "torch_spyre").mkdir(parents=True)
+    (linked / ".git").write_text(f"gitdir: {real / '.git'}\n")
+
+    # Precondition: were this a directory, `.is_dir()` would pass and prove nothing.
+    assert not (linked / ".git").is_dir()
+    assert (linked / ".git").exists()
+
+    probed = _load_version_module_at(linked / "torch_spyre" / "version.py")
+    assert probed._REPO_ROOT == linked
+
+    sha = subprocess.run(
+        ["git", "-C", str(linked), "rev-parse", "--short", "HEAD"],
+        capture_output=True,
+        text=True,
+        timeout=5,
+        check=True,
+    ).stdout.strip()
+    assert probed.__version__ == f"{probed._BASE_VERSION}+g{sha}"
+
+
+def test_tree_without_dot_git_gets_no_local_segment(tmp_path, monkeypatch):
+    """No ``.git`` beside the package means a bare base version (the wheel case)."""
+    monkeypatch.delenv("TORCH_SPYRE_VERSION_NO_GIT", raising=False)
+
+    (tmp_path / "torch_spyre").mkdir()
+    probed = _load_version_module_at(tmp_path / "torch_spyre" / "version.py")
+
+    assert probed.__version__ == probed._BASE_VERSION
 
 
 def test_git_short_sha_returns_none_for_non_repo(version_mod, tmp_path):
