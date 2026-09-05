@@ -649,6 +649,85 @@ class AllGatherAsyncFallback(ir.ExternKernel):
         V.graph.register_operation(self)
 
 
+class ReduceScatterAsyncFallback(ir.ExternKernel):
+    """IR node for spyre.reduce_scatter_async.
+
+    Starts the reduce_scatter operation asynchronously and returns immediately.
+    Output tensor has shape[0] = input.shape[0] // group_size.
+    """
+
+    def codegen(self, wrapper: PythonWrapperCodegen) -> None:
+        """Emit plan call in header (compile-time) and run call in body (runtime)."""
+        input_tensor = self.inputs[0]
+        input_name = input_tensor.codegen_reference()
+        reduce_op, group_size, group_name = self.constant_args
+        output_name = self.get_name()
+
+        input_layout = input_tensor.get_layout()
+        dtype_code = _dtype_to_int(input_layout.dtype)
+        num_elems = _compute_device_num_elems(input_layout)
+
+        plan_var = f"_rs_plan_{output_name}"
+        plan_line = (
+            f"{plan_var} = torch.ops.spyre.reducescatter_plan("
+            f"{num_elems}, {dtype_code}, {group_size}, "
+            f"'{reduce_op}', '{group_name}')"
+        )
+        if not hasattr(wrapper, "_emitted_plans"):
+            wrapper._emitted_plans = set()
+        if plan_line not in wrapper._emitted_plans:
+            wrapper.header.writeline(plan_line)
+            wrapper._emitted_plans.add(plan_line)
+
+        wrapper.writeline(
+            f"{output_name} = torch.ops.spyre.reducescatter_run("
+            f"{input_name}, {plan_var}, {group_size})"
+        )
+
+        logger.debug(
+            "Codegen reducescatter plan+run: %s -> %s "
+            "(reduce_op=%s, group_size=%s, group='%s')",
+            input_name,
+            output_name,
+            reduce_op,
+            group_size,
+            group_name,
+        )
+
+    def should_allocate(self) -> bool:
+        return False
+
+    def get_mutation_names(self) -> Sequence[str]:
+        return []
+
+    def get_unbacked_symbol_defs(self) -> OrderedSet[sympy.Symbol]:
+        return OrderedSet()
+
+    def __init__(
+        self,
+        op_overload: torch._ops.OpOverload,
+        x: IRNode,
+        reduce_op: str,
+        group_size: int,
+        group_name: str,
+    ) -> None:
+        in_layout = x.get_layout()
+        out_size = list(in_layout.size)
+        out_size[0] = out_size[0] // group_size
+        out_stride = ir.FlexibleLayout.contiguous_strides(out_size)
+        layout = FixedLayout(in_layout.device, in_layout.dtype, out_size, out_stride)
+        super().__init__(
+            None,
+            layout,
+            [x],
+            (reduce_op, group_size, group_name),
+            python_kernel_name="torch.ops.spyre.reducescatter_run",
+            op_overload=op_overload,
+        )
+        self.name = V.graph.register_buffer(self)
+        V.graph.register_operation(self)
+
+
 class AllReduceAsyncFallback(ir.ExternKernel):
     """IR node for spyre.all_reduce_async.
 

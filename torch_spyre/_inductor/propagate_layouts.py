@@ -72,6 +72,7 @@ from .ir import (
     AllGatherAsyncFallback,
     AllReduceAsyncFallback,
     FixedTiledLayout,
+    ReduceScatterAsyncFallback,
     SpyreConstantFallback,
     SpyreEmptyFallback,
     BroadcastAsyncFallback,
@@ -2519,7 +2520,7 @@ def propagate_spyre_tensor_layouts(
             input_buf = V.graph.get_buffer(input_name)
             op.layouts = list(input_buf.layouts)
             op.restick_cost_fn = AnyInNode.from_args()
-        elif isinstance(op, AllGatherAsyncFallback):
+        elif isinstance(op, (AllGatherAsyncFallback, ReduceScatterAsyncFallback)):
             op.layouts = [generic_layout(op)]
             op.restick_cost_fn = AnyInNode.from_args()
         elif isinstance(op, ExternKernel):
