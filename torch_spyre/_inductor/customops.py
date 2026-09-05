@@ -629,6 +629,79 @@ def _(
     return input.new_empty(shape)
 
 
+@torch.library.custom_op(
+    "spyre::reshape_and_pad_via_cpu", mutates_args=(), device_types="spyre"
+)
+def spyre_reshape_and_pad_via_cpu(
+    input: torch.Tensor,
+    src_shape: Sequence[int],
+    padded_shape: Sequence[int],
+) -> torch.Tensor:
+    """Reshape to src_shape and zero-pad to padded_shape on CPU.
+
+    Combines N-D→3-D reshape and all zero-padding for the cumsum decomposition
+    into one CPU step; avoids sub-stick offset writes on Spyre (issue #3916).
+    """
+    warn_fallback("torch.ops.spyre.reshape_and_pad_via_cpu")
+    src = input.to("cpu").contiguous().reshape(src_shape)
+    out = src.new_zeros(padded_shape)
+    out[: src_shape[0], : src_shape[1], : src_shape[2]] = src
+    return out.to(input.device)
+
+
+@spyre_reshape_and_pad_via_cpu.register_fake
+def _(
+    input: torch.Tensor,
+    src_shape: Sequence[int],
+    padded_shape: Sequence[int],
+) -> torch.Tensor:
+    return input.new_empty(padded_shape)
+
+
+@torch.library.custom_op(
+    "spyre::slice_and_reshape_via_cpu", mutates_args=(), device_types="spyre"
+)
+def spyre_slice_and_reshape_via_cpu(
+    input: torch.Tensor,
+    src_shape: Sequence[int],
+    out_shape: Sequence[int],
+) -> torch.Tensor:
+    """Slice [:src_shape] and reshape to out_shape on CPU.
+
+    Removes padding and restores the original tensor shape for the cumsum
+    decomposition; paired with reshape_and_pad_via_cpu (issue #3916).
+    """
+    warn_fallback("torch.ops.spyre.slice_and_reshape_via_cpu")
+    tmp = input.to("cpu").contiguous()
+    result = tmp[: src_shape[0], : src_shape[1], : src_shape[2]].contiguous()
+    return result.reshape(out_shape).to(input.device)
+
+
+@spyre_slice_and_reshape_via_cpu.register_fake
+def _(
+    input: torch.Tensor,
+    src_shape: Sequence[int],
+    out_shape: Sequence[int],
+) -> torch.Tensor:
+    return input.new_empty(out_shape)
+
+
+@torch.library.custom_op(
+    "spyre::cumsum_cpu_fallback", mutates_args=(), device_types="spyre"
+)
+def spyre_cumsum_cpu_fallback(input: torch.Tensor, dim: int) -> torch.Tensor:
+    """CPU fallback for torch.cumsum on dtypes not supported on Spyre."""
+    warn_fallback("torch.ops.spyre.cumsum_cpu_fallback")
+    return torch.cumsum(input.to("cpu"), dim=dim).to(input.device)
+
+
+@spyre_cumsum_cpu_fallback.register_fake
+def _(input: torch.Tensor, dim: int) -> torch.Tensor:
+    # torch.cumsum promotes bool/int32 to int64; match the real output dtype.
+    out_dtype = torch.int64 if input.dtype in (torch.bool, torch.int32) else input.dtype
+    return input.new_empty(input.shape, dtype=out_dtype)
+
+
 @torch.library.custom_op("spyre::min_dim_int64_fallback", mutates_args=())
 def min_dim_int64_fallback(
     input: torch.Tensor, dim: int, keepdim: bool = False

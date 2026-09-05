@@ -237,7 +237,6 @@ def register_fallback_default(ops):
 
 register_fallback_default(
     [
-        aten.cumsum,
         aten.repeat.out,
         aten.arange,
         aten.sin,
@@ -291,3 +290,28 @@ def spyre__max_default_int64_fallback(input, **kwargs):
     This avoids recursive decomposition by directly calling torch.max on CPU.
     """
     return torch.max(input, **kwargs)
+
+
+@register_fallback(["spyre::reshape_and_pad_via_cpu"])
+def spyre__reshape_and_pad_via_cpu(input, src_shape, padded_shape, **kwargs):
+    """Reshape to src_shape and zero-pad to padded_shape on CPU (issue #3916)."""
+    src = input.contiguous().reshape(src_shape)
+    out = src.new_zeros(padded_shape)
+    out[: src_shape[0], : src_shape[1], : src_shape[2]] = src
+    return out
+
+
+@register_fallback(["spyre::slice_and_reshape_via_cpu"])
+def spyre__slice_and_reshape_via_cpu(input, src_shape, out_shape, **kwargs):
+    """Slice [:src_shape] and reshape to out_shape on CPU (issue #3916)."""
+    return (
+        input[: src_shape[0], : src_shape[1], : src_shape[2]]
+        .contiguous()
+        .reshape(out_shape)
+    )
+
+
+@register_fallback(["spyre::cumsum_cpu_fallback"])
+def spyre__cumsum_cpu_fallback(input, dim, **kwargs):
+    """CPU fallback for torch.cumsum on dtypes not supported on Spyre (int32/bool)."""
+    return torch.cumsum(input, dim)

@@ -881,6 +881,71 @@ def bitwise_and(input1: torch.Tensor, input2: torch.Tensor) -> torch.Tensor:
         )
 
 
+# Spyre has no native scan op (issue #3388), so cumsum is decomposed as:
+#
+#   int32 / bool: integer add not supported on Spyre; CPU fallback, does not
+#   reach the steps below.
+#
+#   For fp16 and fp32:
+#   1. reshape_and_pad_via_cpu  — reshape to (A, n, B) and zero-pad to
+#      (A_scan, n_scan, B_scan) on CPU (avoids issue #3916).
+#   2. On-device scan:
+#      - fp16: tril(ones(n_scan, n_scan)) @ y_3d via BMM.
+#              A_scan = max(A, _CUMSUM_MIN_B) to meet the BMM batch requirement.
+#      - fp32: parallel prefix scan on dim=1 of (A_scan, n_scan, B_scan).
+#   3. slice_and_reshape_via_cpu  — remove padding and restore original shape on CPU.
+#   TODO: steps 1 and 3 can be replaced with inline ops once #3916 is fixed.
+
+# Minimum batch-dim size required by the Spyre bmm kernel.
+_CUMSUM_MIN_B = 4
+
+
+@register_spyre_decompositions([torch.ops.aten.cumsum.default])
+def spyre_cumsum(
+    x: torch.Tensor,
+    dim: int,
+    dtype: Optional[torch.dtype] = None,
+) -> torch.Tensor:
+    y = x if dtype is None else x.to(dtype)
+    if y.dtype not in (torch.float16, torch.float32):
+        # integer add not supported on Spyre; fall back to CPU.
+        return torch.ops.spyre.cumsum_cpu_fallback(y, dim % y.dim())
+
+    ndim = y.dim()
+    dim = dim % ndim  # normalise negative dim
+    n = y.shape[dim]
+    _STICK = get_elem_in_stick(y.dtype)
+
+    A = math.prod(list(y.shape[:dim]))  # dims before scan
+    B = math.prod(list(y.shape[dim + 1 :]))  # dims after scan
+
+    n_scan = math.ceil(n / _STICK) * _STICK
+    B_scan = max(_STICK, math.ceil(B / _STICK) * _STICK)  # at least one stick wide
+
+    A_scan = max(A, _CUMSUM_MIN_B) if y.dtype == torch.float16 else A
+
+    y_3d = torch.ops.spyre.reshape_and_pad_via_cpu(
+        y, (A, n, B), (A_scan, n_scan, B_scan)
+    )
+
+    if y.dtype == torch.float16:
+        L = torch.tril(torch.ones(n_scan, n_scan, dtype=y.dtype, device=y.device))
+        L_b = L.unsqueeze(0).expand(A_scan, -1, -1).clone()  # clone for a dense buffer
+        result = torch.ops.aten.bmm.default(L_b, y_3d)
+    else:
+        # fp32: prefix scan — each step adds a shifted copy of the running sum.
+        result = y_3d
+        offset = 1
+        while offset < n_scan:
+            sliced = torch.ops.aten.slice.Tensor(result, 1, 0, n_scan - offset)
+            # pad args: [l_d2, r_d2, l_d1, r_d1, l_d0, r_d0] — left-pad dim=1
+            shifted = torch.ops.aten.constant_pad_nd(sliced, [0, 0, offset, 0, 0, 0], 0)
+            result = result + shifted
+            offset *= 2
+
+    return torch.ops.spyre.slice_and_reshape_via_cpu(result, (A, n, B), list(y.shape))
+
+
 #: Largest kernel tap (per spatial axis) the direct conv2d path accepts. A
 #: dense (groups==1) conv contracts over C_in*kH*kW; that per-output-channel
 #: weight working set grows with k**2 and, at k>3 with a stick-aligned C_in>=64,
@@ -1457,7 +1522,7 @@ def spyre_masked_scatter(
     # rows would get -1, so multiply by the mask to send them to row 0 instead
     # (in bounds, and discarded by the where). Done in fp32: Spyre has no usable
     # int `clip`, int32 sub/mul are unsupported, and fp16 loses large indices.
-    pos = mask_row.cumsum(0).to(torch.float32) - 1.0
+    pos = mask_row.to(torch.float32).cumsum(0) - 1.0
     row_idx = (pos * mask_row.to(torch.float32)).to(torch.int64)
     # The gather stays 2D (its args are indirect, so the pointwise dim_order
     # projection skips them), but the `where` must stay at `self`'s rank:
