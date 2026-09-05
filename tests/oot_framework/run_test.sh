@@ -1255,6 +1255,13 @@ def _do_pre_import():
             _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), '${module_name}.py'),
         )
         _pre_mod = _ilu.module_from_spec(_private_spec)
+        # Register before exec so the synthetic name is importable for as long as
+        # the captured classes live. Their functions keep _pre_mod's dict as
+        # __globals__, and anything that resolves a global through the module name
+        # -- torch.compile, pickle, dataclasses, typing.get_type_hints -- does
+        # importlib.import_module(__globals__['__name__']) and fails on an
+        # unregistered module.
+        _sys.modules[_private_spec.name] = _pre_mod
         _private_spec.loader.exec_module(_pre_mod)
     finally:
         _cdtype.instantiate_device_type_tests = real_fn
