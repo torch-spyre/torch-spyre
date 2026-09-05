@@ -5093,8 +5093,8 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
             },
         },
-        # Stick dim, unaligned offset: needs Step 2 (alt-layout, #2750).
-        # Must cleanly fail, not silently misbehave.
+        # Stick-dim offset at rank 1: no other dimension for the restickify
+        # pass to move the stick to, so it can never be resolved.
         (
             "test_storage_offset_placeholder_stick_dim",
             "test_storage_offset_placeholder_stick_dim_rejected",
@@ -5104,9 +5104,106 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     lambda t: t[3:],
                     cached_randn((259,), differentiation="ph_1d_offset"),
                 ),
-                "2d_last_dim_offset": (
+            },
+        },
+        # Stick-dim offsets, resolved by the restickify pass moving the stick
+        # to another dimension.  Compiled only: eager materializes an offset
+        # view through copy_from_d2d, whose flat offset % stick check is
+        # unreliable for these shapes (#3798, #3264).
+        #
+        # x + x reuses the input layout verbatim and skips address generation,
+        # so add_asym/clone/exp are the load-bearing ops here.
+        (
+            "test_storage_offset_placeholder_stick_dim_resolved",
+            "test_storage_offset_placeholder_compiled_only",
+        ): {
+            "ops_dict": {
+                "add_sym": lambda x: x + x,
+                "add_asym": lambda x: x.clone() + x,
+                "clone": torch.clone,
+                "exp": torch.exp,
+                "sum_stick": lambda x: torch.sum(x, dim=-1, keepdim=True),
+                "amax_stick": lambda x: torch.amax(x, dim=-1, keepdim=False),
+                "sum_dim0": lambda x: torch.sum(x, dim=0, keepdim=True),
+                "amax_dim0": lambda x: torch.amax(x, dim=0, keepdim=False),
+            },
+            "param_sets": {
+                "2d_off32": (
+                    lambda t: t[:, 32:96],
+                    cached_randn((128, 256), differentiation="ph_2d_off32"),
+                ),
+                "2d_off32_span128": (
+                    lambda t: t[:, 32:160],
+                    cached_randn((128, 256), differentiation="ph_2d_off32_s128"),
+                ),
+                "3d_off32": (
+                    lambda t: t[:, :, 32:96],
+                    cached_randn((128, 192, 256), differentiation="ph_3d_off32"),
+                ),
+                "3d_off32_span128": (
+                    lambda t: t[:, :, 32:160],
+                    cached_randn((128, 192, 256), differentiation="ph_3d_off32_s128"),
+                ),
+                # Only dim0 is a stick multiple, so the restickify must land
+                # there; the mirrored shape below leaves only dim1.
+                "3d_off32_dim0_alt": (
+                    lambda t: t[:, :, 32:96],
+                    cached_randn((128, 3, 256), differentiation="ph_3d_d0alt"),
+                ),
+                "3d_off32_dim1_alt": (
+                    lambda t: t[:, :, 32:96],
+                    cached_randn((2, 192, 256), differentiation="ph_3d_d1alt"),
+                ),
+                # dim0=5 is the only alternative and isn't a stick multiple,
+                # so restickify padding has to grow it (5 -> 64).
+                "2d_off1_unaligned_alt": (
                     lambda t: t[:, 1:],
                     cached_randn((5, 128), differentiation="ph_2d_last_offset"),
+                ),
+            },
+        },
+        # sum/amax over dim1, on the two shapes that isolate which dim the
+        # restickify targets.  The wide (128,192,*) shapes are deliberately not
+        # here: a 192-deep fp16 sum carries an error floor near 0.3 whatever
+        # the offset -- the same reduction on an unsliced tensor is bit-
+        # identical -- and their 16k outputs make a near-zero sum, where atol
+        # sits below that floor, near-certain.
+        (
+            "test_storage_offset_placeholder_stick_dim_reduce_dim1",
+            "test_storage_offset_placeholder_compiled_only",
+        ): {
+            "ops_dict": {
+                "sum_dim1": lambda x: torch.sum(x, dim=1, keepdim=True),
+                "amax_dim1": lambda x: torch.amax(x, dim=1, keepdim=False),
+            },
+            "param_sets": {
+                "3d_off32_dim0_alt": (
+                    lambda t: t[:, :, 32:96],
+                    cached_randn((128, 3, 256), differentiation="ph_3d_d0alt_r1"),
+                ),
+                "3d_off32_dim1_alt": (
+                    lambda t: t[:, :, 32:96],
+                    cached_randn((2, 192, 256), differentiation="ph_3d_d1alt_r1"),
+                ),
+            },
+        },
+        # Stick-dim offset on a PADDED base (row width 100 is not a stick
+        # multiple), so the offset decomposition and the stick move have to
+        # work together.  Layout-preserving ops only: exp miscomputes on any
+        # padded-row fp16 tensor, sliced or not (#3799).
+        (
+            "test_storage_offset_placeholder_stick_dim_padded",
+            "test_storage_offset_placeholder_compiled_only",
+        ): {
+            "ops_dict": {
+                "add_sym": lambda x: x + x,
+                "add_asym": lambda x: x.clone() + x,
+                "clone": torch.clone,
+            },
+            "param_sets": {
+                "2d_off1_padded": (
+                    lambda t: t[:, 1:],
+                    cached_randn((5, 100), differentiation="ph_2d_off1_padded"),
                 ),
             },
         },
@@ -5936,16 +6033,18 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         )
 
     def test_storage_offset_placeholder_stick_dim_rejected(self, slicer, base):
-        # Stick-dim placeholder offset: alt-layout retargeting not yet
-        # implemented (#2750), so compile must raise rather than silently
-        # miscompute. No eager arm: compile=False skips the Inductor pass
-        # entirely, so it can't exercise this check.
+        # No dimension for the restickify pass to move the stick to, so
+        # compile must raise rather than silently miscompute.  Matches the
+        # pass's own message: a generic "Unsupported" would also pass if the
+        # input were rejected earlier for an unrelated reason.
         def fn(x):
             return x + x
 
         dev_view = slicer(base.clone().to("spyre"))
 
-        with pytest.raises(Exception, match="Unsupported"):
+        with pytest.raises(
+            Exception, match="no mechanism to resolve stick incompatibility"
+        ):
             _compile_and_run(fn, [dev_view], "spyre", compile=True)
 
     def test_storage_offset_placeholder_vs_internal_equivalence(self):
@@ -6018,6 +6117,33 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             assert torch.allclose(result.float(), expected, atol=0.1, rtol=0.1), (
                 f"{mode_name}: max abs diff: "
                 f"{(result.float() - expected).abs().max().item()}"
+            )
+
+    def test_storage_offset_placeholder_fixed_layout_rejected(self):
+        # Fixed-layout ops need their inputs' sticks where the op dictates, so
+        # an offset stick would need a restickify before the op and another to
+        # restore the layout after.  Not implemented, so these reject.  The
+        # stick-dim counterpart of test_storage_offset_placeholder_matmul,
+        # which offsets a non-stick dim and succeeds.
+        base = cached_randn((128, 256), differentiation="ph_fixed_layout_base")
+        w = cached_randn((64, 64), differentiation="ph_fixed_layout_w")
+
+        dev_view = base.clone().to("spyre")[:, 32:96]
+        dev_w = w.clone().to("spyre")
+
+        msg = "requires a fixed input layout and double-restickify is not yet supported"
+
+        with pytest.raises(Exception, match=msg):
+            _compile_and_run(
+                lambda x, y: torch.mm(x, y), [dev_view, dev_w], "spyre", compile=True
+            )
+
+        with pytest.raises(Exception, match=msg):
+            _compile_and_run(
+                lambda x: torch.topk(x, 4, dim=-1)[0],
+                [dev_view],
+                "spyre",
+                compile=True,
             )
 
     def test_binary_op_stick_crossing_last_dim(self):
