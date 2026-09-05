@@ -1285,6 +1285,40 @@ class TestCpSatJointDivision(JointDivisionSolverTests, TestCase):
                 f"{name}: balance step should pick the balanced two-axis division",
             )
 
+    def test_reciprocal_cost_expr_with_all_core_counts_positive(self):
+        # Regression for a ``MODEL_INVALID`` failure ("The domain of the
+        # divisor cannot contain 0"): a reciprocal-of-cores cost term (as the
+        # matmul pt_eff formula produces) is lowered to an ``AddDivisionEquality``
+        # whose divisor is ``t.cores`` -- CP-SAT rejects that divisor's domain
+        # if it can be 0, even when every actual candidate uses at least one
+        # core.
+        #
+        # Mirrors a real [512,4096] @ [4096,4096] matmul with two 32-core
+        # candidates that split differently across 3 vs 2 axes: {b=4, m=8} (2
+        # symbols) and {b=4, m=4, k=2} (3 symbols, reduction-split). The union
+        # of split keys across candidates is what puts 3 symbols on the
+        # buffer's ``sym_cores`` product, matching the reported repro.
+        buf = CoreDivisionBuffer(
+            "mm_out",
+            128,
+            [0, 1],
+            core_divisions=[
+                CoreDivision(output_splits={"b": 4, "m": 8}, reduction_splits={}),
+                CoreDivision(output_splits={"b": 4, "m": 4}, reduction_splits={"k": 2}),
+            ],
+        )
+        self.assertEqual(buf.core_divisions[0].cores_used, 32)
+        self.assertEqual(buf.core_divisions[1].cores_used, 32)
+
+        cost_expr = 1 / buf.sym_cores
+        result = {
+            b.name: b
+            for b in self.solver_class(
+                [buf], size=1 << 20, alignment=1
+            ).plan_layout_and_core_divisions(cost_expr)
+        }
+        self.assertIsNotNone(result["mm_out"].chosen_division)
+
 
 @unittest.skipUnless(_HAS_ORTOOLS, "cpsat placement unit tests need ortools")
 class TestCpSatPlacementOnly(BaseLayoutSolverTests, TestCase):
