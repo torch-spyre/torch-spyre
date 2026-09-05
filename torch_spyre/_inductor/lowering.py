@@ -1359,11 +1359,9 @@ def lower_slice_scatter(self, src, dim=0, start=None, end=None, step=1):
     start = 0 if start is None else start
     end = size[dim] if end is None else end
 
-    output = lowering.clone(self)
-    output.realize()
-    sliced_output = ir.SliceView.create(output, dim, start, end)
+    sliced_output = ir.SliceView.create(self, dim, start, end)
     lowering.mutate_to(sliced_output, src)
-    return output
+    return self
 
 
 @register_spyre_lowering(torch.ops.spyre.restickify)
