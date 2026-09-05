@@ -9,3 +9,8 @@ test_suite_config:
           mode: mandatory_success
           tags:
             - ops__inductor-fp8
+        - names:
+            - TestFP8Operations::test_(dequantize_fp8_with_scale_eager_mode|quantize_dequantize_fp8_4d_shape|quantize_weight_fp8_with_scale_eager_mode_dtype_only)
+          mode: mandatory_success
+          tags:
+            - ops__inductor-fp8

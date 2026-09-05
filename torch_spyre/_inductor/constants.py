@@ -193,6 +193,12 @@ SPYRE_FP8_OPS = {
     "qfp8wt",  # FP8 quantization (output: FP8)
 }
 
+# Ops whose QFP8WT-arranged weight/output tensor requires a 2D stick [2, 64].
+# Used consistently in both compute_ops._layout_info_for_tensor and
+# superdsc._create_sdsc_tensors to gate device-size flattening and
+# 2D-stick metadata restoration.
+FP8_2D_STICK_OPS = ("batchmatmulfp8", "qfp8wt")
+
 TOPK_OPS = {"topkvalue", "topkindex"}
 _MAX_K_PER_CORE = 4
 TOPK_MAX_K_PER_CORE = _MAX_K_PER_CORE

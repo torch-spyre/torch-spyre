@@ -785,7 +785,7 @@ def lower_avg_pool2d(
     if kH == 1 or kW == 1:
         # avgpoolfwd is a windowed reduction; a 1-wide kernel has no pooling
         # window along that axis (it is an identity or a strided subsample),
-        # which the pool datapath cannot express — the DDL rejects a windowless
+        # which the pool datapath cannot express — the backend rejects a windowless
         # pool ("Unknown primary dimension kind ... for a window dimension").
         # Spyre also has no eager avg_pool2d kernel to fall back to.  So delegate
         # to the in-tree Inductor lowering, which decomposes avg_pool2d into
