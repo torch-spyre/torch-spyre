@@ -18,6 +18,7 @@ from typing import Any, Optional
 from torch._inductor.dependencies import MemoryDep
 from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import (
+    ExternKernel,
     Operation,
     IRNode,
     Pointwise,
@@ -542,6 +543,21 @@ def get_ncores_for_buffers(
     buf_user_deps = _get_buffer_user_deps(graph)
     for buf_name, users in buf_user_deps.items():
         # this dict includes graph input and output
+        if any(isinstance(user, ExternKernel) for user, _ in users):
+            # A FallbackKernel/ExternKernel is opaque: it has no
+            # op_it_space_splits or per-core tiling at all -- it needs the
+            # whole tensor as a real, materialized HBM value (its own call
+            # argument or write target). There is no PerCoreView to compare
+            # against a producer/other consumer's, so this buffer can never be
+            # LX-resident, regardless of core count (unlike the mismatch checks
+            # below, this is not gated on using_multicore: at SENCORES=1 the
+            # branches below never compare views at all and would default this
+            # buffer to num_cores=1, i.e. "fine").
+            result[buf_name] = -1
+            mismatch_reasons_cache[buf_name] = (
+                f"FallbackKernel/ExternKernel user among {[u.get_name() for u, _ in users]}"
+            )
+            continue
         if using_multicore and len(users) > 1:
             # A K-split-reduction writer leaves partial sums on most cores (only
             # k-last cores hold the final value), so it's unsafe on LX even if

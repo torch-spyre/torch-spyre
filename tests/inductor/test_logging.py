@@ -22,6 +22,7 @@ import torch_spyre._inductor.logging_utils as logging_utils
 from torch_spyre._inductor.logging_utils import (
     get_inductor_logger,
     is_inductor_logging_enabled,
+    warn_once,
 )
 
 
@@ -59,3 +60,42 @@ class TestLoggingOperations:
         logger.info("test message")
         logger.warning("test message")
         logger.debug("test message with data: shape=[2, 3], device_size=[1, 2, 3]")
+
+
+class TestWarnOnce:
+    def setup_method(self, method):
+        logging_utils._warned_once.clear()
+
+    def test_same_key_suppresses_repeat(self):
+        logger = get_inductor_logger("test_warn_once_repeat")
+        with patch.object(logger, "warning") as mock_warning:
+            warn_once(logger, "opX", "skipping %s", "opX")
+            warn_once(logger, "opX", "skipping %s", "opX")
+        mock_warning.assert_called_once_with("skipping %s", "opX")
+
+    def test_different_key_still_fires(self):
+        logger = get_inductor_logger("test_warn_once_distinct_keys")
+        with patch.object(logger, "warning") as mock_warning:
+            warn_once(logger, "opX", "skipping %s", "opX")
+            warn_once(logger, "opY", "skipping %s", "opY")
+        assert mock_warning.call_count == 2
+
+    def test_message_may_vary_without_defeating_dedup(self):
+        # The dedup key is caller-supplied, not the formatted message, so a
+        # message that legitimately differs per call (e.g. a shape folded
+        # into the text) still dedupes correctly on the shared key.
+        logger = get_inductor_logger("test_warn_once_varying_message")
+        with patch.object(logger, "warning") as mock_warning:
+            warn_once(logger, "opX", "skipping opX, shape=%s", [1, 2])
+            warn_once(logger, "opX", "skipping opX, shape=%s", [3, 4])
+        mock_warning.assert_called_once_with("skipping opX, shape=%s", [1, 2])
+
+    def test_same_key_different_logger_not_cross_suppressed(self):
+        logger_a = get_inductor_logger("test_warn_once_logger_a")
+        logger_b = get_inductor_logger("test_warn_once_logger_b")
+        with patch.object(logger_a, "warning") as mock_a:
+            with patch.object(logger_b, "warning") as mock_b:
+                warn_once(logger_a, "opX", "skipping %s", "opX")
+                warn_once(logger_b, "opX", "skipping %s", "opX")
+        mock_a.assert_called_once()
+        mock_b.assert_called_once()

@@ -30,6 +30,14 @@ _loggers: dict[str, logging.Logger] = {}
 # Flag set by tests to trigger re-initialization on next get_logger() call
 _needs_reinit: bool = False
 
+# (logger name, key) pairs already warned via warn_once, for the process
+# lifetime. Keyed on the caller's own dedup key, not the formatted message --
+# unlike torch._logging.warning_once (which caches on the full args tuple),
+# so a message that legitimately varies per occurrence (e.g. an op name plus
+# a shape that differs each time) can still be deduped on the part that
+# identifies the *kind* of event, not the literal text.
+_warned_once: set[tuple[str, str]] = set()
+
 
 def _reinitialize():
     """Force re-initialization of logging config from current environment.
@@ -77,6 +85,30 @@ def get_logger(name: str) -> logging.Logger:
 def get_inductor_logger(name: str) -> logging.Logger:
     """Backward-compatible alias for inductor logger creation."""
     return get_logger(name)
+
+
+def warn_once(logger: logging.Logger, key: str, msg: str, *args) -> None:
+    """Like ``logger.warning(msg, *args)``, but only the first time for `key`.
+
+    For a warning that is individually correct but structurally repeats --
+    the same skip/fallback decision made again for every graph a long-running
+    process compiles, or every call site of the same op kind in one graph --
+    so that logging it every time adds noise without adding information after
+    the first occurrence. `key` identifies the *kind* of event (e.g. an op
+    name); `msg`/`args` may still vary across calls sharing a key (e.g. a
+    shape or buffer name folded into the text) without defeating the dedup,
+    unlike caching on the formatted message itself.
+
+    Scoped per logger name, so two different passes warning on the same key
+    (e.g. both keying on an op name) don't suppress each other. Not reset
+    between test cases; tests asserting on repeated warnings for the same key
+    should expect only the first to fire.
+    """
+    dedup_key = (logger.name, key)
+    if dedup_key in _warned_once:
+        return
+    _warned_once.add(dedup_key)
+    logger.warning(msg, *args)
 
 
 def update_log_level(name: str, level: str):
