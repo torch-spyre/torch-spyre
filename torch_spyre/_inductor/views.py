@@ -626,6 +626,9 @@ def normalize_coordinates(
         for dim_term in dim_terms[::-1]:
             dim_term.offset = offset // dim_term.num
             offset %= dim_term.num
+        # Whatever is left is smaller than the smallest stride; it is placed
+        # inside the gap dim realized for that term below.
+        residual_offset = offset
 
         # split dims with n>1 terms
         split_dim_terms = []
@@ -656,6 +659,59 @@ def normalize_coordinates(
 
         # accumulate terms in reverse order to ensure non-increasing device strides
         terms += reversed(split_dim_terms)
+
+        # The innermost term is the only one that can still carry num > 1 (the
+        # loop above resets num for every other term): its variable steps over
+        # ``num`` elements of the device dim per iteration, e.g. ``2*d1`` from a
+        # stick-aligned slice of a stick dim that a view split in two, or from
+        # ``x[..., ::2, :]``.  Realize that stride as an explicit inner gap dim
+        # of size ``num`` so the address arithmetic stays exact:
+        #
+        # - the term's own extent must then be counted in iterations of its
+        #   variable.  For a lone term ``dim_size`` is still in device units,
+        #   so divide it by ``num`` -- leaving it inflates the dim, and with it
+        #   every outer stride (issue #4050: output row l read input row 2*l).
+        #   With several terms the split loop already sized it in iterations.
+        # - a residual constant offset below the stride (``2*d1 + 1``) selects
+        #   the position inside the gap.  Like any other constant offset on a
+        #   non-stick dim it needs a variable to hang off, so mint a synthetic
+        #   size-1 variable the same way the elided-dimension case above does.
+        #
+        # The stick dim (last coordinate) is left alone: within-stick strides
+        # are not representable and are rejected downstream.
+        inner = split_dim_terms[0]
+        if inner.num > 1 and dim_idx != len(size) - 1:
+            stride = inner.num
+            inner.num = sympy.S.One
+            if len(split_dim_terms) == 1:
+                if inner.dim_size % stride != 0:
+                    raise Unsupported(
+                        f"strided coordinate {coordinate} walks a dim of size "
+                        f"{dim_size} in steps of {stride}, which does not divide it"
+                    )
+                inner.dim_size //= stride
+            if residual_offset == 0:
+                terms.append(Term(None, None, None, None, stride))
+            else:
+                var = synthetic_var_fn()
+                var_ranges[var] = 1
+                terms.append(
+                    Term(
+                        sympy.S.One,
+                        sympy.S.One,
+                        var,
+                        sympy.S.One,
+                        stride,
+                        residual_offset,
+                    )
+                )
+        elif residual_offset != 0:
+            # Only a within-stick stride can get here (``2*d + 1`` on the stick
+            # dim); there is no gap dim to place the residual in.
+            raise Unsupported(
+                f"coordinate {coordinate} on dim {dim_idx} has offset "
+                f"{residual_offset} below its stride, which cannot be addressed"
+            )
 
     # fuse contiguous dimensions when possible
     # never fuse last dimension = stick dimension!
@@ -1030,10 +1086,9 @@ def align_tensors_pure(
                 size[-1] //= den
                 (offset, term) = coordinates[-1].as_coeff_Add()
                 coordinates[-1] = term // den + offset
-            if num > 1:
-                # iteration skips over elements in dim, realize gap as new dimension
-                size.append(num)
-                coordinates.append(sympy.S.Zero)
+            # normalize_coordinates realizes any stride (num > 1) on a
+            # non-stick dim as an explicit gap term, so nothing is left here.
+            assert num == 1, f"unexpected stride {num} on non-stick term for {var}"
         # add stick dim
         num, den, var, mod, dim_size, offset = astuple(terms[-1])
         size.append(dim_size)
