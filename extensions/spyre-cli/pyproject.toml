@@ -1,0 +1,21 @@
+[project]
+name = "spyre-cli"
+version = "0.1.0"
+description = "A direct launcher for spyreCode"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "click>=8.4.2",
+    "pydantic>=2.13.4",
+]
+
+[project.scripts]
+spyre = "spyre_cli.cli:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
+
+
+
