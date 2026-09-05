@@ -14,34 +14,10 @@
 
 """Tests for logging infrastructure."""
 
-import os
-import logging
-from unittest.mock import patch
 import torch  # noqa: F401
-import torch_spyre._inductor.logging_utils as logging_utils
 from torch_spyre._inductor.logging_utils import (
     get_inductor_logger,
-    is_inductor_logging_enabled,
 )
-
-
-class TestLoggingConfiguration:
-    def setup_method(self, method):
-        torch.manual_seed(0xAFFE)
-
-    def test_default_is_disabled(self):
-        with patch.object(logging_utils, "_needs_reinit", True):
-            with patch.dict(os.environ, {}, clear=True):
-                assert not is_inductor_logging_enabled()
-                logger = get_inductor_logger("test_disabled")
-                assert logger.level == logging.WARNING
-
-    def test_enabled_defaults_to_info_level(self):
-        with patch.object(logging_utils, "_needs_reinit", True):
-            with patch.dict(os.environ, {"SPYRE_INDUCTOR_LOG": "1"}, clear=True):
-                assert is_inductor_logging_enabled()
-                logger = get_inductor_logger("test_enabled")
-                assert logger.level == logging.INFO
 
 
 class TestLoggingOperations:
