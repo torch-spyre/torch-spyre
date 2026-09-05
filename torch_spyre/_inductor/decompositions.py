@@ -119,7 +119,6 @@ spyre_decompositions: dict = {}
 # backend cannot lower today; falling through to the CPU fallback is preferable
 # until those issues are fixed.
 spyre_decompositions_to_exclude = [
-    torch.ops.aten.triu,
     torch.ops.aten.tril,
     # PT 2.12 broadened torch._inductor.decomposition.mm/bmm to decompose the
     # K==1 (unit-contraction) case into a broadcast ``self * other`` on all
@@ -1502,3 +1501,18 @@ def spyre_index_add(
     updated = gathered + source
     indices: list[Optional[torch.Tensor]] = [None] * dim + [index]
     return torch.index_put(self, indices, updated, accumulate=False)
+
+
+@register_spyre_decompositions([torch.ops.aten.triu.default])
+def spyre_triu(
+    input: torch.Tensor,
+    diagonal: int = 0,
+) -> torch.Tensor:
+    h, w = input.shape[-2], input.shape[-1]
+
+    # spyre::triu_mask builds [H,W] upper triangular mask on CPU and
+    # transfers it to the input device. Wrapping this in a custom op makes the
+    # CPU-side in-place ops opaque to torch.compile, so assert_functional_graph
+    # is satisfied and the compiled graph sees only the resulting Spyre tensor.
+    mask = torch.ops.spyre.triu_mask(h, w, diagonal, input.dtype, input.device)
+    return input * mask

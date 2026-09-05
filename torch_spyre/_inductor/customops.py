@@ -972,6 +972,41 @@ def _(
     return torch.empty(1, 1, seqlen_q, seqlen_kv, dtype=dtype, device=device)
 
 
+@torch.library.custom_op("spyre::triu_mask", mutates_args=())
+def triu_mask(
+    h: int,
+    w: int,
+    diagonal: int,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
+    """
+    Build an upper triangular mask on CPU and transfer to the target device.
+
+    Shape: [H, W] in the input's dtype
+
+    Built entirely on CPU so the construction is opaque to torch.compile —
+    assert_functional_graph is satisfied and the compiled graph only sees the
+    resulting device tensor.  No device_types restriction is set because there
+    are no tensor arguments to dispatch on; the device is an explicit parameter.
+    """
+    cols = torch.arange(w, device="cpu", dtype=torch.int32).unsqueeze(0)  # [1, W]
+    rows = torch.arange(h, device="cpu", dtype=torch.int32).unsqueeze(1)  # [H, 1]
+    mask = ((cols - rows) >= diagonal).to(dtype=dtype)  # [H, W]
+    return mask.to(device=device)
+
+
+@triu_mask.register_fake
+def _(
+    h: int,
+    w: int,
+    diagonal: int,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
+    return torch.empty(h, w, dtype=dtype, device=device)
+
+
 @torch.library.custom_op(
     "spyre::stagger_to_standard_ea", mutates_args=(), device_types="spyre"
 )

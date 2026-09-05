@@ -245,7 +245,6 @@ register_fallback_default(
         aten.ne.Scalar_out,
         aten.isin,
         aten.tril,
-        aten.triu,
         aten.bitwise_xor.Tensor,
         aten.bitwise_xor.Tensor_out,
         aten.bitwise_or.Tensor,
