@@ -830,6 +830,10 @@ class SpyreKernel(Kernel[CSEVariable]):
         # predicate covers every user; a graph output can have no user at all,
         # which it does not cover.  False without a scheduler, so the fuser
         # declines.
+        #
+        # This resolves to Scheduler.can_buffer_be_removed_through_fusion, NOT to
+        # SuperDSCScheduling's same-named override, which answers a different
+        # question (may the allocation be elided -- always no here, issue #1266).
         kernel_local = bool(
             _spyre_config.ktir_emitter
             and (sched := getattr(V.graph, "scheduler", None))

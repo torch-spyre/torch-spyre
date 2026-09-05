@@ -1440,6 +1440,14 @@ class TestPlanFusionDeclines(FusionCase):
         producer = dataclasses.replace(producer, args=[source, second, link])
         self.assertDeclined([producer, survivor], reason="is not unary")
 
+    @staticmethod
+    def _converting_producer() -> list:
+        """A pair whose producer writes its link at a different format."""
+        producer, survivor = make_absmax_pair()
+        source, link = producer.args
+        link = dataclasses.replace(link, device_dtype=DataFormats.IEEE_FP32)
+        return [dataclasses.replace(producer, args=[source, link]), survivor]
+
     def test_a_producer_that_does_not_preserve_access_is_not_deleted(self):
         """DECISION: the deleted producer must write where it read."""
         d0, d1, d2 = sympy.symbols("d0 d1 d2")
@@ -1448,6 +1456,9 @@ class TestPlanFusionDeclines(FusionCase):
             "resizes": make_absmax_pair(out_sizes={0: [32, 256, 64]}),
             # ...and only a coordinate check sees this one.
             "moves elements": make_absmax_pair(out_coords={0: [d1, d0, d2]}),
+            # The rewrite hands the survivor the source's format, so a producer
+            # that converts is not a drop-in either.
+            "reformats": self._converting_producer(),
         }
         for label, pair in cases.items():
             with self.subTest(case=label):
