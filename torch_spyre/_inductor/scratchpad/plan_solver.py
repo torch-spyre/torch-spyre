@@ -25,7 +25,11 @@ from torch_spyre._inductor.logging_utils import get_inductor_logger
 from enum import Enum
 
 if TYPE_CHECKING:
-    from torch_spyre._inductor.scratchpad.lx_relayout import LXRelayoutPlan
+    from torch_spyre._inductor.scratchpad.lx_relayout import (
+        ChosenRelayout,
+        LXRelayoutPlan,
+        RelayoutCandidate,
+    )
 
 logger = get_inductor_logger("scratchpad.plan_solver")
 
@@ -306,7 +310,26 @@ class CoreDivisionBuffer(LifetimeBoundBuffer):
     # an absent/empty entry means no compatible division, so the gate forbids
     # the merge/residency across that edge.
     cd_parent_matches: dict[str, list[tuple[int, int]]] = field(default_factory=dict)
+    # parent_buf_name -> priced ``RelayoutCandidate`` records for the division
+    # pairs where the parent could stay LX-resident by RELAYING OUT to this
+    # consumer's slicing: the two views differ but are relayout-compatible (a
+    # permutation), priced by the fitted relayout law. Sibling of
+    # ``cd_parent_matches`` (which holds the free, equal-view pairs); populated
+    # only under ``config.lx_solver_relayout``, for the CP-SAT solver's
+    # relayout decision variables. The record carries the views, core count,
+    # group and price, so the solver and the commit path never re-derive them.
+    cd_parent_relayouts: dict[str, list["RelayoutCandidate"]] = field(
+        default_factory=dict
+    )
     chosen_division: Optional[int] = None
+    # Solver-chosen relayouts feeding this consumer: parent_buf_name -> the
+    # fired candidate with its destination address (bytes) and run head.
+    # Written back by the CP-SAT solver when a relayout edge fires. Consumers
+    # of one (parent, group) that the solver bridged into one SEGMENT share a
+    # destination address and name the segment's earliest consumer as
+    # ``run_head``; the commit path materializes one plan per segment
+    # (``RelayoutSegment.from_chosen``).
+    chosen_relayouts: dict[str, "ChosenRelayout"] = field(default_factory=dict)
     boundary: BufferType = BufferType.Intermediate
 
     @property
@@ -360,6 +383,21 @@ class CoreDivisionBuffer(LifetimeBoundBuffer):
         sym_output_splits = {key: sym("output", key) for key in output_keys}
         sym_reduction_splits = {key: sym("reduction", key) for key in reduction_keys}
         return (sym_output_splits, sym_reduction_splits)
+
+
+def relayout_symbol(parent: str, group: int) -> sympy.Symbol:
+    """The sympy symbol carrying one relayout GROUP's cost in the objective.
+
+    A group is one (source, destination per-core view) pair. The solver
+    splits the group's consumers into segments (see the solver's
+    ``_RelayoutGroup``), one shuffle each, and binds this symbol to the sum of
+    those per-segment charges. Shared by the allocator (which appends the symbol to the cost
+    expression) and the CP-SAT solver (which binds it to the float-weighted
+    sum over the group's per-source-division literals), so the two sides can
+    never disagree on name or assumptions - a mismatch would be a NameError at
+    lambdify time.
+    """
+    return sympy.Symbol(f"relayout_ns__{parent}__g{group}", nonnegative=True)
 
 
 def check_in_place_parent_is_read(
