@@ -567,9 +567,9 @@ def _pad_elided_dim(buf: ComputedBuffer) -> None:
     the paired stick needs 64.
 
     Prepending a size-64 gap dim makes the allocation cover all 64 planes.  This
-    only bumps the dim size; a later pass, ``_restickify_restore_elided_dim``,
-    creates the shared iteration variable that pairs this dim with the stick on the
-    other operand.
+    only bumps the dim size; the shared
+    ``restore_restickify_alignment_inputs`` transform later creates the
+    iteration variable that pairs this dim with the stick on the other operand.
     """
     layout = buf.get_layout()
     assert isinstance(layout, FixedTiledLayout)
@@ -771,7 +771,7 @@ def _pad_restickify_input(op: Operation, graph: GraphLowering) -> None:
     the new-stick dim collapsed to size 1:
 
     - **Size-1 new-stick dim:** the input carries the restickify's INTACT operand
-      (``_restickify_restore_elided_dim`` restores the stick on it), so codegen
+      (``restore_restickify_alignment_inputs`` restores the stick on it), so codegen
       sweeps a full 64-plane stick while the input under-allocates 64x.  Prepend
       an outermost size-64 gap dim (``_pad_elided_dim``); restore reuses that dim
       as the restored stick.
@@ -906,10 +906,9 @@ def insert_restickify_padding(graph: GraphLowering) -> None:
     its coordinate are set by different passes:
 
     - Size, here: ``_pad_elided_dim`` prepends an outermost size-64 gap dim.
-    - Coordinate, later: ``_restickify_restore_elided_dim`` (spyre_kernel.py)
-      mints a fresh iteration symbol just before ``align_tensors``.  It waits
-      because both operands must share that symbol for align to match them, and
-      align only sees a symbol that already exists when it runs.
+    - Coordinate, later: ``restore_restickify_alignment_inputs``
+      (pass_utils.py) mints a fresh iteration symbol before ``align_tensors``.
+      Scheduler preflight and codegen share that pure transform.
 
     The restore asserts the prepended gap dim is present before binding the
     symbol, so swapping the pass order fails loudly rather than silently.

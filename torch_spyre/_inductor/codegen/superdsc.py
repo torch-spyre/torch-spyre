@@ -1830,7 +1830,7 @@ def _finalize_tensor_work_divisions(
 def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
     is_matmul = _is_matmul(op_spec.op)
     is_conv2d = _is_conv(op_spec.op)
-    is_relayout = is_lx_relayout_identity(op_spec.op, op_spec.args)
+    is_relayout = is_lx_relayout_identity(op_spec.op, op_spec.args, op_spec.op_info)
     is_restickify = op_spec.op == RESTICKIFY_OP
     is_pool = _is_pool(op_spec.op)
     is_conv = _is_conv(op_spec.op)

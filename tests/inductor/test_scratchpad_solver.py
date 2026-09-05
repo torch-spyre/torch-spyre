@@ -34,6 +34,7 @@ from torch_spyre._inductor.scratchpad.plan_solver import (
     LifetimeBoundBuffer,
 )
 from torch_spyre._inductor.scratchpad.greedy_solver import GreedyLayoutSolver
+from torch_spyre._inductor.scratchpad.exhaustive_search import ExhaustiveSearchSolver
 
 try:
     from ortools.sat.python import cp_model  # noqa: F401
@@ -81,6 +82,46 @@ class TestCoreDivision(TestCase):
             CoreDivision(output_splits={y: 2, x: 4}).signature_key(),
             ((x, 4), (y, 2)),
         )
+
+
+class TestExhaustiveSearchResidency(TestCase):
+    def test_mismatched_consumer_spills_the_producer(self):
+        """A consumer mismatch makes its input unsafe in LX, not its output."""
+
+        producer = CoreDivisionBuffer(
+            "producer", 128, [0, 1], core_divisions=[CoreDivision()]
+        )
+        consumer = CoreDivisionBuffer(
+            "consumer",
+            128,
+            [1, 2],
+            core_divisions=[CoreDivision()],
+            parents=["producer"],
+            cd_parent_matches={"producer": []},
+        )
+        sink = CoreDivisionBuffer(
+            "sink",
+            128,
+            [2, 3],
+            core_divisions=[CoreDivision()],
+            parents=["consumer"],
+            cd_parent_matches={"consumer": [(0, 0)]},
+            residency_reason="no consumer reads it from LX",
+        )
+
+        solver = ExhaustiveSearchSolver(
+            [producer, consumer, sink],
+            size=512,
+            inner_factory=GreedyLayoutSolver,
+            alignment=1,
+        )
+        result = {
+            buffer.name: buffer for buffer in solver.plan_layout_and_core_divisions()
+        }
+
+        self.assertIsNone(result["producer"].address)
+        self.assertIsNotNone(result["consumer"].address)
+        self.assertEqual(solver.spill_reasons["producer"], "core div mismatch")
 
 
 class TestLxPlanningContract(TestCase):

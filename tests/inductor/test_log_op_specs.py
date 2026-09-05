@@ -206,7 +206,6 @@ def _make_test_kernel():
     kernel.args.python_argdefs.return_value = (None, [])
     kernel.spyre_kernel_args = []
     kernel._alignment_repeat_info = {}
-    kernel._alignment_repeat_info_by_spec = {}
     kernel._alignment_access_by_tensor_arg = {}
     kernel._alignment_inputs_by_spec = {}
     kernel.pool_size = 0

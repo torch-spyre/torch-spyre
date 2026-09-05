@@ -18,7 +18,11 @@ import dataclasses
 from sympy import Symbol
 
 from torch_spyre._C import DataFormats, encode_constant
-from torch_spyre._inductor.constants import CONV2D_DIM_LABELS, DEPTHWISE_CONV2D_OP
+from torch_spyre._inductor.constants import (
+    BYTES_PER_STICK,
+    CONV2D_DIM_LABELS,
+    DEPTHWISE_CONV2D_OP,
+)
 from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.op_spec import TensorWorkDivision
 from torch_spyre._inductor.pass_utils import coeff_through_floor
@@ -191,9 +195,9 @@ def core_idx_to_slice_offset(
 def num_bytes(df: DataFormats) -> int:
     """Try to avoid using this method; it is a bad API due to sub-byte datatypes"""
     num_elems = df.elems_per_stick()
-    if num_elems > 128:
+    if num_elems > BYTES_PER_STICK:
         raise RuntimeError(f"sub-byte dataformat {df}")
-    return 128 // num_elems
+    return BYTES_PER_STICK // num_elems
 
 
 def generate_constant_info(data_format, constants, num_cores):

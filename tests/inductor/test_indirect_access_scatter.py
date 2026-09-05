@@ -28,6 +28,7 @@ capture-only via check(expect=CRASHED); there is no bundle to run end-to-end.
 import os
 import sys
 
+import pytest
 import torch
 from torch._inductor.utils import run_and_get_code
 
@@ -906,8 +907,15 @@ class _ScatterScenarios:
         self._stage_and_e2e(kernel, out, src, index, expect=DIRECT_OP_SPEC)
 
     # -- Known crashes (separate from the indirect-store path) -------------
+    @pytest.mark.lx_finalizer_fallback_expected(
+        "indirect symbol tmp0 not found in indirect_sizes {}", count=1
+    )
     def test_index_fill_crashes(self):
         """out.index_fill_(0, idx, 0.0) -- scalar fill -> rank-0 Constant codegen."""
+        # Main 6e92c9ec and lift 89c7c210 both reject the scalar Constant
+        # before producing an OpSpec. The lift also rejects this unsupported
+        # scatter's missing index bound during preflight; this is not a
+        # successful-finalization case and must not hide any other fallback.
         out = torch.rand(128, 256, dtype=torch.float16).to("spyre")
         idx = torch.randint(0, 128, (3,), dtype=torch.int32).to("spyre")
         self.name_dims(out, {"M": 128, "N": 256})
@@ -916,7 +924,9 @@ class _ScatterScenarios:
         def kernel(out, idx):
             return out.index_fill_(0, idx, 0.0)
 
-        self.check(kernel, out, idx, expect=CRASHED)
+        result = self.check(kernel, out, idx, expect=CRASHED)
+        self.assertIn("store value of unexpected type", str(result.exc))
+        self.assertIn("Constant", str(result.exc))
 
     def test_masked_scatter_element_mask_unsupported(self):
         """Element-level mask (stride(-1) != 0): the decomposition rejects it.
