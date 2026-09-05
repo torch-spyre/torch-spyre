@@ -515,6 +515,10 @@ class SpyreKernel(Kernel[CSEVariable]):
         self._alignment_access_by_tensor_arg: dict[int, AlignmentAccess] = {}
         self._alignment_inputs_by_spec: dict[int, AlignmentInputs] = {}
         self.pool_size: int = pool_size
+        # Live call args, deduped and filtered to names in spyre_kernel_args.
+        # Set by codegen_kernel(); used by call_kernel() to ensure arg_index
+        # values match .run() positional args.
+        self._live_call_arg_names: list[str] | None = None
 
     def indirect_var_names(self) -> "frozenset[str] | None":
         if not self.indirect_vars:
@@ -1295,8 +1299,19 @@ class SpyreKernel(Kernel[CSEVariable]):
                 return f"IndirectAccess('{name_sym}')"
             return "sympify('" + str(x) + "')"
 
-        # Now that all loads/stores have been processed we know the final kernel_args and can map names to indices
-        actuals = self.args.python_argdefs()[1]
+        # Compute live, deduped call-arg list from names in spyre_kernel_args.
+        # python_argdefs() includes all registered names from load()/store(),
+        # but spyre_kernel_args only has those surviving to the final op specs
+        # (excludes dead names like gather indices folded away by simplify_op_spec).
+        # Use this list for arg_index assignment so positional .run() args match.
+        live_names = {name for name, _ in self.spyre_kernel_args}
+        actuals = []
+        seen_actuals: set[str] = set()
+        for name in self.args.python_argdefs()[1]:
+            if name in live_names and name not in seen_actuals:
+                seen_actuals.add(name)
+                actuals.append(name)
+        self._live_call_arg_names = actuals
         has_pool_allocations = self.pool_size > 0
 
         for name, tensor_arg in self.spyre_kernel_args:
@@ -1364,17 +1379,12 @@ class SpyreKernel(Kernel[CSEVariable]):
             )
             call_args.append(pool_var_name)
 
-        # Add remaining kernel arguments, deduplicating tensors that appear
-        # as both input and output (e.g. in-place ops like x *= 2).  With
-        # symbolic args the MLIR bundle emits one
-        # !sdscbundle.input_arg<index> per unique arg_index; passing the
-        # same tensor twice would cause a runtime "Number of inputs
-        # mismatches" error in processComputeOnHostCommand.
-        seen: set[str] = set()
-        for arg in self.args.python_argdefs()[1]:
-            if arg not in seen:
-                seen.add(arg)
-                call_args.append(arg)
+        # Use live call args computed in codegen_kernel() to keep positional
+        # .run() args in sync with arg_index values baked into op specs.
+        assert self._live_call_arg_names is not None, (
+            "call_kernel() requires codegen_kernel() to have run first"
+        )
+        call_args.extend(self._live_call_arg_names)
 
         call_args_str = ", ".join(call_args)
         wrapper.writeline(f"{name}.run({call_args_str})")

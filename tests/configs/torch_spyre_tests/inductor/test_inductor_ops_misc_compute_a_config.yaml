@@ -28,4 +28,6 @@ test_suite_config:
             - TestOps::test_sub_broadcast.*
             - TestOps::test_sub_scalar.*
             - TestOps::test_scalar_cpu.*
+            # regression tests
+            - TestOps::test_index_select_reshape_matmul_4033
           mode: mandatory_success
