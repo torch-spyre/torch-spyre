@@ -63,6 +63,7 @@ from .constants import (
     BATCH_MATMUL_FP8_OP,
     CONV2D_FWD_OP,
     COPY_BACK_CANDIDATE_ATTR,
+    DEPTHWISE_CONV2D_OP,
     DEVICE_NAME,
     ELIDED_COPY_BACK_ATTR,
     REDUCTIONS_NON_STICK_DIM_ONLY,
@@ -1275,6 +1276,156 @@ def _conv_layouts(
     return [out_stl]
 
 
+def _spatial_symbol_order(coords, spatial_syms) -> list[sympy.Symbol]:
+    """Spatial symbols in device-slot order, outermost first.
+
+    ``coords`` is a tensor's device coordinate list; its last entry is the stick
+    and is skipped.  Only symbols in ``spatial_syms`` are collected, which drops
+    the conv window taps for free: an activation's windowed coordinate is
+    ``stride*ho + kh``, and ``kh`` never appears in the output's index (the same
+    filtering ``_match_labels_by_structure`` relies on in codegen/superdsc.py).
+    """
+    order: list[sympy.Symbol] = []
+    for coord in coords[:-1]:
+        for sym in sorted(coord.free_symbols, key=str):
+            if sym in spatial_syms and sym not in order:
+                order.append(sym)
+    return order
+
+
+def _depthwise_conv_layouts(
+    op: Operation,
+    output: FixedLayout,
+    output_dep: MemoryDep,
+    args: list[PropArg],
+) -> list[SpyreTensorLayout]:
+    """Layout propagation for the depthwise conv2d/conv1d reduction.
+
+    The output is pinned to the **canonical** device dim order: host order with
+    the stick (out-channel) moved innermost.  This deliberately does not go
+    through ``_compute_dim_order``, whose ``coords[d] == 0`` demotion relocates a
+    dim whose coordinate was simplified away -- which for a batch of 1 pushes the
+    vanished ``N`` dim to the right of the spatial dims.  Since
+    ``SpyreTensorLayout`` fills device slots innermost-outward, that demoted dim
+    consumes a real slot and shifts H/W, silently transposing the output's
+    spatial axes relative to the activation's (issue: N==1 strided depthwise
+    returned numbers off by up to 26).
+
+    """
+    out_dims = len(output.size)
+    c_size = [concretize_expr(s) for s in output.size]
+    c_stride = [concretize_expr(s) for s in output.stride]
+
+    # The stick is the out-channel, i.e. whatever the activation already sticks
+    # on: depthwise contracts over the input channel, which equals the output
+    # channel.  Reuse the same stick-expression -> output dim mapping the generic
+    # single-arg path uses, so stick selection (and its stick-alignment /
+    # offset-free handling) stays identical -- only the non-stick dim ORDER
+    # differs.
+    def _canonical_candidate(
+        stick_dim: int, dtype_for_layout
+    ) -> SpyreTensorLayout | None:
+        """Build the canonical (host order, stick innermost) STL for ``stick_dim``.
+
+        Returns None when the resulting stick expression is not representable.
+        """
+        stick_size = get_elem_in_stick(dtype_for_layout)
+        dim_order = [d for d in range(out_dims) if d != stick_dim] + [stick_dim]
+        candidate = SpyreTensorLayout(c_size, c_stride, dtype_for_layout, dim_order)
+        # Same guard _make_output_stl applies: an offset stick is not
+        # representable on the device.
+        cand_coords = try_device_coordinates(candidate, output_dep, None)
+        if cand_coords is None or not is_stick_expr_offset_free(
+            cand_coords[-1], stick_size
+        ):
+            return None
+        return candidate
+
+    out_stl = None
+    # Remember a dtype from the scan so the fallback below can reuse it: the
+    # fallback runs precisely when no input stick expression mapped to an output
+    # dim, but the dtype resolution itself is independent of that mapping.
+    fallback_dtype = None
+    for arg in args:
+        for stl in arg.layouts:
+            coords = try_device_coordinates(stl, arg.dep, None)
+            if coords is None:
+                continue
+            dtype_for_layout = resolve_output_formats(output.dtype, stl.device_dtype)[1]
+            stick_size = get_elem_in_stick(dtype_for_layout)
+            if not is_stick_expr_offset_free(coords[-1], stick_size):
+                continue
+            if fallback_dtype is None:
+                fallback_dtype = dtype_for_layout
+            stick_dim = _pick_stick_dim(
+                coords[-1], host_coordinates(output, output_dep, None)
+            )
+            if stick_dim < 0 or c_size[stick_dim] == 1:
+                continue
+            candidate = _canonical_candidate(stick_dim, dtype_for_layout)
+            if candidate is None:
+                continue
+            out_stl = candidate
+            break
+        if out_stl is not None:
+            break
+
+    if out_stl is None and fallback_dtype is not None:
+        # No input stick expression mapped to an output dim.  This happens when
+        # the channel count is 1: the activation's channel axis is size-1, so its
+        # device stick is degenerate and its stick
+        # coordinate collapses to the constant ``0``.
+        #
+        # Prefer the out-channel so a C==1 depthwise keeps the same
+        # channel-innermost layout a C>1 one gets.  ``lower_depthwise_conv2d``
+        # builds an NCHW (or NCL) output, so the channel is dim 1 at both ranks.
+        # Fall back to the remaining dims only if that stick is not
+        # representable.
+        channel_dim = 1 if out_dims >= 2 else 0
+        stick_dim_order = [channel_dim] + [
+            d for d in range(out_dims) if d != channel_dim
+        ]
+        for stick_dim in stick_dim_order:
+            candidate = _canonical_candidate(stick_dim, fallback_dtype)
+            if candidate is not None:
+                out_stl = candidate
+                break
+
+    if out_stl is None:
+        raise Unsupported(
+            f"{DEPTHWISE_CONV2D_OP}: no supported output layout for "
+            f"size={list(output.size)} stride={list(output.stride)}"
+        )
+
+    # Reject an activation whose spatial slot order disagrees with the output's.
+    out_coords_dev = device_coordinates(out_stl, output_dep, None)
+    spatial_syms = output_dep.index.free_symbols - out_coords_dev[-1].free_symbols
+    out_order = _spatial_symbol_order(out_coords_dev, spatial_syms)
+    # Fewer than two surviving spatial symbols (conv1d, or a spatial extent of 1)
+    # leaves no order to disagree about.
+    if len(out_order) >= 2:
+        for arg in args:
+            if not spatial_syms <= arg.dep.index.free_symbols:
+                continue  # the weight
+            for stl in arg.layouts:
+                coords = try_device_coordinates(stl, arg.dep, None)
+                if coords is None:
+                    continue
+                arg_order = _spatial_symbol_order(coords, spatial_syms)
+                if len(arg_order) >= 2 and arg_order != out_order:
+                    raise Unsupported(
+                        f"{DEPTHWISE_CONV2D_OP}: activation spatial axis order "
+                        f"{arg_order} disagrees with the output's {out_order}. "
+                        "The activation's device layout must order its spatial "
+                        "axes outermost-first (H before W), matching the "
+                        "canonical output layout; declare its stride_map with "
+                        "the outer spatial dim carrying the larger stride."
+                    )
+
+    op.restick_cost_fn = AllSameNode.from_args(args, [out_stl], output_dep, op)
+    return [out_stl]
+
+
 def _multi_arg_pointwise_layouts(
     op: Operation,
     output: FixedLayout,
@@ -1802,6 +1953,9 @@ def compute_layouts(
 
     if isinstance(data, Reduction) and data.reduction_type == CONV2D_FWD_OP:
         return _conv_layouts(op, output, output_dep, args)
+
+    if isinstance(data, Reduction) and data.reduction_type == DEPTHWISE_CONV2D_OP:
+        return _depthwise_conv_layouts(op, output, output_dep, args)
 
     if isinstance(data, Reduction) and data.reduction_type == "exx2":
         return _exx2_layout(op, output, output_dep, args)

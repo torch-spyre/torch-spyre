@@ -641,7 +641,29 @@ def _match_labels_by_structure(op_spec: "OpSpec") -> dict | None:
     # Output roles: non-stick output symbols in coordinate order are
     # [out_h, out_w, batch] (batch trails the spatial dims in the output layout).
     out_spatial = _ordered_arg_symbols(out_arg, exclude=(channel,))
-    spatial_roles = ["out_h", "out_w", "batch"]
+    # When the output height is degenerate (H_out == 1) the surviving spatial
+    # symbol is a **width** axis, so ``out_h`` must not be offered as a role.
+    # Two shapes reach here that way: a rank-3 conv1d, which
+    # ``lower_convolution`` models as a conv2d with H_in = kH = sH = 1 and whose
+    # real geometry therefore lives in the ``w`` slot; and a rank-4 conv2d whose
+    # H_out simplified to 1.  Zipping the canonical ``[out_h, out_w, batch]``
+    # order would hand the lone axis ``out_h`` -> ``i``, whose SDSC padding entry
+    # is then built from ``stride_h``/``kernel_h`` (1 for a conv1d) instead of the
+    # true width geometry, so ``totalSize_`` collapses to the output extent and
+    # every tap past the first reads the wrong element.  Measured wrong by ~55
+    # (conv1d) and ~48 (rank-4 H_out==1) at stride 2; stride 1 was correct only
+    # because stride_h == stride_w there.
+    #
+    # Keyed on H_out rather than on the rank, so both shapes are covered: rank is
+    # only a proxy, and a rank-4 conv2d with H_out == 1 has the same defect.
+    ranges = op_spec.node_output_ranges
+    height_is_degenerate = ranges is not None and (
+        len(ranges) == 3  # conv1d: no height axis at all
+        or (len(ranges) == 4 and _is_static_one(ranges[2]))  # NCHW, H_out == 1
+    )
+    spatial_roles = (
+        ["out_w", "batch"] if height_is_degenerate else ["out_h", "out_w", "batch"]
+    )
     if len(out_spatial) > len(spatial_roles):
         return None
     role_of = dict(zip(out_spatial, spatial_roles))
@@ -727,17 +749,32 @@ def _align_conv2d_dim_labels(
     ``lower_avg_pool2d`` delegates to the in-tree lowering when
     ``kH == 1 or kW == 1``, so a pool ``SpyreReduction`` always has both window
     dims, but conv2d explicitly supports 1x1 / 1xN / Nx1 kernels.
+
+    A **depthwise conv1d** arrives at rank 3, ``[N, C, W_out]``, with no height
+    entry.
     """
-    if node_output_ranges is None or len(node_output_ranges) != 4:
+    if node_output_ranges is None or len(node_output_ranges) not in (3, 4):
         raise ValueError(
-            "conv2d node_output_ranges must be NCHW [N, C, H_out, W_out]; got "
-            f"{node_output_ranges!r}"
+            "conv2d node_output_ranges must be NCHW [N, C, H_out, W_out], or "
+            f"[N, C, W_out] for a rank-3 conv1d; got {node_output_ranges!r}"
+        )
+    is_1d = len(node_output_ranges) == 3
+    if is_1d and not _is_static_one(kernel_h):
+        raise ValueError(
+            "conv1d node_output_ranges [N, C, W_out] implies a degenerate "
+            f"height, but kernel_h is {kernel_h!r}, not 1"
         )
     # Full canonical label list with each entry's unit-ness, in iteration-space
     # order: output roles (mb, out, i, j) then window roles (ki, kj).
+    range_of_role = {
+        "batch": node_output_ranges[0],
+        "channel": node_output_ranges[1],
+        "out_h": Integer(1) if is_1d else node_output_ranges[2],
+        "out_w": node_output_ranges[-1],
+    }
     candidates: list[tuple[str, bool]] = [
-        (label, _is_static_one(node_output_ranges[pos]))
-        for pos, (_role, label) in enumerate(_CONV2D_ROLE_LABELS)
+        (label, _is_static_one(range_of_role[role]))
+        for role, label in _CONV2D_ROLE_LABELS
     ]
     candidates.append((_CONV2D_WINDOW_DIM_I, _is_static_one(kernel_h)))
     candidates.append((_CONV2D_WINDOW_DIM_J, _is_static_one(kernel_w)))
@@ -992,15 +1029,14 @@ def _build_conv2d_symbol_mapping(
     kernel_h = conv_params.get("kernel_h")
     kernel_w = conv_params.get("kernel_w")
     sym_list = list(op_spec.iteration_space.keys())
+    ranges = op_spec.node_output_ranges
 
-    if kernel_h is None or kernel_w is None or op_spec.node_output_ranges is None:
+    if kernel_h is None or kernel_w is None or ranges is None:
         # No kernel sizes or no live output ranges: keep the caller's positional
         # mapping rather than guessing.
         return {sym: Symbol(dim_labels[i]) for i, sym in enumerate(sym_list)}
 
-    labels = _align_conv2d_dim_labels(
-        op_spec.node_output_ranges, len(sym_list), kernel_h, kernel_w
-    )
+    labels = _align_conv2d_dim_labels(ranges, len(sym_list), kernel_h, kernel_w)
 
     # The label list is in canonical order (mb, out, i, j, ki, kj minus the
     # squeezed roles), but the *iteration space* is not guaranteed to be.  It is
@@ -1018,7 +1054,11 @@ def _build_conv2d_symbol_mapping(
     needs_reorder = all(lbl in labels for lbl in window_labels) and all(
         lbl in labels for lbl in spatial_labels
     )
-    if needs_reorder and _is_static_one(op_spec.node_output_ranges[2]):
+    # Rank 3 (conv1d) has no H_out entry, and position 2 there is W_out -- but a
+    # conv1d also drops i/ki, so needs_reorder is already False. Gate on the rank
+    # anyway so the index below is only ever taken against a real NCHW tuple,
+    # rather than depending on that short-circuit.
+    if needs_reorder and len(ranges) == 4 and _is_static_one(ranges[2]):
         sym_to_size = {
             sym: _concretize_for_sdsc(size)
             for sym, (size, _) in op_spec.iteration_space.items()

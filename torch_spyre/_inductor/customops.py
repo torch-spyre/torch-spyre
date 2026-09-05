@@ -704,6 +704,37 @@ def spyre_conv2d(
     pass
 
 
+def _conv_output_shape(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    stride: Sequence[int],
+    padding: Sequence[int],
+    dilation: Sequence[int],
+) -> list[int]:
+    """Output shape for spyre.conv2d, for a rank-3 (1-D) or rank-4 (2-D) input.
+
+    Rank 3 is a conv1d, which is lowered natively at rank 3 rather than via a
+    reshape to rank 4 (``lower_depthwise_conv2d`` for the depthwise case,
+    ``lower_convolution`` for the direct path), so the output keeps the input's
+    rank: ``(N, C_in, L) -> (N, C_out, L_out)``.  ``C_out`` is read from the
+    weight's dim 0, which holds for both, so the arithmetic is grouping-agnostic.
+    """
+    if input.dim() == 3:
+        N, _C_in, L_in = input.shape
+        C_out, _C_in_g, kL = weight.shape
+        L_out = (L_in + 2 * padding[0] - dilation[0] * (kL - 1) - 1) // stride[0] + 1
+        return [N, C_out, L_out]
+
+    # Compute output shape: (N, C_out, H_out, W_out)
+    N, C_in, H_in, W_in = input.shape
+    C_out, C_in_g, kH, kW = weight.shape
+
+    H_out = (H_in + 2 * padding[0] - dilation[0] * (kH - 1) - 1) // stride[0] + 1
+    W_out = (W_in + 2 * padding[1] - dilation[1] * (kW - 1) - 1) // stride[1] + 1
+
+    return [N, C_out, H_out, W_out]
+
+
 @spyre_conv2d.register_fake
 def _(
     input: torch.Tensor,
@@ -713,15 +744,7 @@ def _(
     dilation: Sequence[int],
     groups: int,
 ) -> torch.Tensor:
-    # Compute output shape: (N, C_out, H_out, W_out)
-    N, C_in, H_in, W_in = input.shape
-    C_out, C_in_g, kH, kW = weight.shape
-
-    H_out = (H_in + 2 * padding[0] - dilation[0] * (kH - 1) - 1) // stride[0] + 1
-    W_out = (W_in + 2 * padding[1] - dilation[1] * (kW - 1) - 1) // stride[1] + 1
-
-    output_shape = [N, C_out, H_out, W_out]
-    return input.new_empty(output_shape)
+    return input.new_empty(_conv_output_shape(input, weight, stride, padding, dilation))
 
 
 @torch.library.custom_op(
@@ -749,15 +772,7 @@ def _(
     dilation: Sequence[int],
     groups: int,
 ) -> torch.Tensor:
-    # Compute output shape: (N, C_out, H_out, W_out)
-    N, C_in, H_in, W_in = input.shape
-    C_out, C_in_g, kH, kW = weight.shape
-
-    H_out = (H_in + 2 * padding[0] - dilation[0] * (kH - 1) - 1) // stride[0] + 1
-    W_out = (W_in + 2 * padding[1] - dilation[1] * (kW - 1) - 1) // stride[1] + 1
-
-    output_shape = [N, C_out, H_out, W_out]
-    return input.new_empty(output_shape)
+    return input.new_empty(_conv_output_shape(input, weight, stride, padding, dilation))
 
 
 @torch.library.custom_op("spyre::constant", mutates_args=(), device_types="spyre")
