@@ -2132,9 +2132,26 @@ def compute_restickify_needed(
         if reduction_vars:
             red_var = min(reduction_vars, key=str)
             target_stick = sympy.Mod(red_var, in_stl.elems_per_stick())
-    return True, compute_restickify_target_layout(
-        in_stl, in_host, target_stick, ic, idc
-    )
+    new_stl = compute_restickify_target_layout(in_stl, in_host, target_stick, ic, idc)
+    if new_stl is not None:
+        # restickify_device_size/restickify_stride_map swap the old and new
+        # stick's outer device slots as if they were stride-independent. When
+        # the new stick's host dim is nested inside the old stick's host
+        # stride (e.g. a transpose where the new stick varies faster in
+        # memory than the old one did), the swap leaves the old stick's
+        # leftover high-order bits with nowhere to go but the new stick slot,
+        # producing a two-symbol stick coordinate that codegen cannot address
+        # (see issue tracked alongside the flash-v4 tiling tests). The
+        # restickify buffer will be consumed via out_dep's indexing (that's
+        # what target_stick was derived from), so validate against out_dep
+        # rather than in_dep: it's the future read pattern that must produce
+        # a clean stick, not the old one.
+        new_idc = try_device_coordinates(new_stl, out_dep, ind_sizes)
+        if new_idc is None or not is_stick_expr_offset_free(
+            new_idc[-1], new_stl.elems_per_stick()
+        ):
+            new_stl = None
+    return True, new_stl
 
 
 def copy_fx_custom_meta(src: "torch.fx.Node", dst: "torch.fx.Node") -> None:

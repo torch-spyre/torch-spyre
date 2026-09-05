@@ -3418,14 +3418,10 @@ def _flash_v4_fn(q, k, v, *, B, S, H, D, b_tiles=1, h_tiles=1, lq_tiles=1, lk_ti
 
 
 @pytest.mark.skip(
-    reason="AssertionError in _stick_symbol: within-stick coordinate"
-    " carries 2 free symbols, want exactly 1 -- v4's view+transpose"
-    " layout produces a coordinate expression padding.py cannot solve."
-    " Named-dims tracking is no longer the cause (buf1/buf25/buf29 are"
-    " now correctly named end to end); propagate_layouts.py's multi-arg"
-    " pointwise candidate search still picks an interleaved (H+Lq) stick"
-    " layout for buf29 even with full naming -- fix belongs in"
-    " propagate_layouts.py's candidate acceptance, not naming."
+    reason="No restickify/candidate layout bridges buf25's two inputs"
+    " (output sticks on D, correction sticks on Lq) once H's nested-in-Lq"
+    " host stride is correctly rejected as infeasible -- layout-propagation"
+    " architectural gap, see torch-spyre/torch-spyre#4292"
 )
 def test_flash_v4_tile_H():
     """Flash v4: tile num_heads÷4 only."""
@@ -3437,9 +3433,10 @@ def test_flash_v4_tile_H():
 
 
 @pytest.mark.skip(
-    reason="AssertionError in _stick_symbol: within-stick coordinate"
-    " carries 2 free symbols, want exactly 1 -- v4's view+transpose"
-    " layout produces a coordinate expression padding.py cannot solve"
+    reason="Same buf25 layout-propagation gap as test_flash_v4_tile_H --"
+    " no restickify/candidate layout bridges output (sticks on D) and"
+    " correction (sticks on Lq) given H nested in Lq's host stride,"
+    " see torch-spyre/torch-spyre#4292"
 )
 def test_flash_v4_tile_B():
     """Flash v4: tile batch_size÷2 only. B=2."""
@@ -3451,9 +3448,10 @@ def test_flash_v4_tile_B():
 
 
 @pytest.mark.skip(
-    reason="AssertionError in _stick_symbol: within-stick coordinate"
-    " carries 2 free symbols, want exactly 1 -- v4's view+transpose"
-    " layout produces a coordinate expression padding.py cannot solve"
+    reason="Same buf25 layout-propagation gap as test_flash_v4_tile_H --"
+    " no restickify/candidate layout bridges output (sticks on D) and"
+    " correction (sticks on Lq) given H nested in Lq's host stride,"
+    " see torch-spyre/torch-spyre#4292"
 )
 def test_flash_v4_tile_Lq():
     """Flash v4: tile max_seqlen_q÷2 only."""
@@ -3465,9 +3463,10 @@ def test_flash_v4_tile_Lq():
 
 
 @pytest.mark.skip(
-    reason="AssertionError in _stick_symbol: within-stick coordinate"
-    " carries 2 free symbols, want exactly 1 -- v4's view+transpose"
-    " layout produces a coordinate expression padding.py cannot solve"
+    reason="Same buf25 layout-propagation gap as test_flash_v4_tile_H --"
+    " no restickify/candidate layout bridges output (sticks on D) and"
+    " correction (sticks on Lq) given H nested in Lq's host stride,"
+    " see torch-spyre/torch-spyre#4292"
 )
 def test_flash_v4_tile_H_Lq():
     """Flash v4: tile num_heads÷4 max_seqlen_q÷2. Equivalent to original test_flash_v4."""
@@ -3483,7 +3482,10 @@ def test_flash_v4_tile_H_Lq():
 @pytest.mark.skip(
     reason="Hangs rather than failing fast (observed: no completion after"
     " 2+ minutes, killed) -- distinct from the other v4 tile combinations,"
-    " which fail at compile time; root cause not yet investigated"
+    " which fail at compile time via the buf25 layout-propagation gap"
+    " (torch-spyre/torch-spyre#4292); this test's own root cause -- and"
+    " whether it shares that gap or hangs before reaching it -- is not"
+    " yet investigated"
 )
 def test_flash_v4_tile_H_Lq_Lk():
     """Flash v4: tile num_heads÷4 max_seqlen_q÷2 max_seqlen_kv÷2."""
