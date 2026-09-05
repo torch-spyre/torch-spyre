@@ -146,10 +146,23 @@ def rescale_stl_for_dtype(
     dimension is always full, so it equals ``get_elem_in_stick(in_dtype)``); the
     output count comes from ``out_dtype``.
 
+    The rescale must be exact: the dim's sticks must hold a whole number of
+    output sticks. Flooring an inexact ratio either drops data (three fp32
+    sticks of 32 elements floor to one fp16 stick, losing 32 elements) or
+    floors to zero (one fp32 stick, ``1 * 32 // 64``), and a zero-sized device
+    dim used to reach ``get_device_stride_infos`` and kill the process with
+    SIGFPE (issue #3604). A conversion whose output can legitimately end in a
+    partially filled stick builds its own layout instead (see
+    ``_qfp8ch_stl`` in propagate_layouts.py).
+
     Args:
         stl: Input device layout to rescale.
         out_dtype: Torch dtype of the conversion output.
         ea: ElementArrangement to stamp on the returned layout.
+
+    Raises:
+        Unsupported: If the stick-indexing dim does not rescale to a whole
+            number of output sticks.
     """
     in_eps = stl.device_size[-1]
     out_eps = get_elem_in_stick(out_dtype)
@@ -164,7 +177,15 @@ def rescale_stl_for_dtype(
     # left as-is.
     for i, s in enumerate(stl.stride_map):
         if s == in_eps:
-            out_device_size[i] = stl.device_size[i] * in_eps // out_eps
+            total_elems = stl.device_size[i] * in_eps
+            if total_elems % out_eps != 0:
+                raise Unsupported(
+                    f"cannot rescale device layout {list(stl.device_size)} for "
+                    f"conversion to {out_dtype}: device dim {i} holds "
+                    f"{stl.device_size[i]} stick(s) of {in_eps} elements, which is "
+                    f"not a whole number of {out_eps}-element output sticks"
+                )
+            out_device_size[i] = total_elems // out_eps
             out_stride_map[i] = out_eps
             break
     return SpyreTensorLayout(

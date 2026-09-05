@@ -132,7 +132,37 @@ class SpyreTensorLayout {
       : device_size(device_size),
         stride_map(stride_map),
         device_dtype(device_dtype),
-        element_arrangement(element_arrangement) {}
+        element_arrangement(element_arrangement) {
+    validate_shape();
+  }
+
+  /**
+   * Reject a device layout that cannot describe any tensor: every device
+   * dimension must be positive and stride_map must have one entry per device
+   * dimension. This is the invariant every consumer assumes; a size-0 device
+   * dim in particular reached get_device_stride_infos, which divided by it
+   * and terminated the process with SIGFPE (issue #3604). Validating in the
+   * constructor means no producer can hand such a layout downstream.
+   *
+   * stride_map entries are deliberately not range-checked here: -1 marks a
+   * size-1 or sparse dimension and 0 a broadcast dimension, both legitimate.
+   * Consistency between stride_map and the host strides is only knowable at
+   * use time and is checked in get_device_stride_infos.
+   */
+  void validate_shape() const {
+    TORCH_CHECK(!device_size.empty(),
+                "Invalid SpyreTensorLayout: device_size is empty");
+    TORCH_CHECK(stride_map.size() == device_size.size(),
+                "Invalid SpyreTensorLayout: stride_map has ", stride_map.size(),
+                " entries for ", device_size.size(), " device dimensions");
+    for (size_t i = 0; i < device_size.size(); i++) {
+      TORCH_CHECK(device_size[i] > 0,
+                  "Invalid SpyreTensorLayout: device dimension ", i,
+                  " has size ", device_size[i],
+                  "; every device dimension must be positive (device_size=",
+                  c10::ArrayRef<int64_t>(device_size), ")");
+    }
+  }
 
   /**
    * Return a copy of this layout with element_arrangement overridden.
