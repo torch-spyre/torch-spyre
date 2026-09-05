@@ -1,0 +1,67 @@
+test_suite_config:
+  labels: [unit, regression, trunk]
+  files:
+    - path: ${TORCH_DEVICE_ROOT}/tests/inductor/test_inductor_dtype_conversion.py
+      unlisted_test_mode: skip
+      tests:
+        - names:
+            - TestImplicitPromotion::test_implicit_add_fp16_3d_stick_aligned
+            - TestImplicitPromotion::test_true_divide_fp16_fp16_stays_fp16
+            - TestImplicitPromotion::test_wa_sum_fp16_explicit_fp32
+            - TestImplicitPromotion::test_wa_sum_bf16_explicit_fp32
+            - TestImplicitPromotion::test_wa_add_4d_both_fp16
+            - TestImplicitPromotion::test_wa_add_5d_both_fp16
+            - TestImplicitPromotion::test_wa_add_large_values_both_fp16
+            - TestImplicitPromotion::test_wa_add_small_values_both_fp16
+            - TestImplicitPromotion::test_wa_div_both_fp16
+            - TestImplicitPromotion::test_wa_stack_both_fp16
+            - TestImplicitPromotion::test_wa_cat_both_fp16
+            - TestImplicitPromotion::test_wa_add_transposed_both_fp16
+            - TestImplicitPromotion::test_sum_fp16_with_dtype_fp32
+            - TestImplicitPromotion::test_sum_bf16_dtype_fp32
+          mode: mandatory_success
+
+        # SKIP #2252 — anywhere-valid: mixed arrangements rejected at SDSC validation
+        - names:
+            - TestImplicitPromotion::test_working_implicit_add_fp16_to_fp32
+            - TestImplicitPromotion::test_direct_mixed_dtype_add_arrangement_error
+            - TestImplicitPromotion::test_direct_mixed_dtype_add_4d_stick_aligned
+            - TestImplicitPromotion::test_direct_mixed_dtype_add_5d_stick_aligned
+            - TestImplicitPromotion::test_direct_mixed_dtype_add_large_values
+            - TestImplicitPromotion::test_direct_mixed_dtype_add_small_values
+            - TestImplicitPromotion::test_sub_fp16_fp32_via_explicit_cast_roundtrip
+            - TestImplicitPromotion::test_mul_fp16_fp32_via_explicit_cast_roundtrip
+            - TestImplicitPromotion::test_div_fp16_by_fp32_via_explicit_cast_workaround
+            - TestImplicitPromotion::test_direct_sub_fp32_tensor_fp16_tensor
+            - TestImplicitPromotion::test_stack_fp16_fp32_implicit_promotion
+            - TestImplicitPromotion::test_cat_fp16_fp32_implicit_promotion
+            - TestImplicitPromotion::test_implicit_tensor_add_non_contiguous_fp16_fp32
+            - TestImplicitPromotion::test_to_dtype_scalar_add_chain_multi_core
+          mode: skip
+
+        # SKIP #2204 — unaligned shapes: padding propagation failure
+        - names:
+            - TestImplicitPromotion::test_implicit_add_fp16_2d_unaligned
+            - TestImplicitPromotion::test_implicit_add_fp16_3d_unaligned
+            - TestImplicitPromotion::test_implicit_add_fp16_4d_unaligned
+          mode: skip
+
+        # SKIP #2205 — DL16_TO_FP32 arrangement on reduction output; D2H reads garbled values
+        - names:
+            - TestImplicitPromotion::test_mean_fp16_with_dtype_fp32
+          mode: skip
+
+        # SKIP #2845 — fp16 + 0-dim fp32 tensor: IndexError in codegen
+        - names:
+            - TestImplicitPromotion::test_fp16_plus_0dim_fp32_tensor_implicit_promotion
+          mode: skip
+
+
+  global:
+    supported_dtypes:
+      - name: float16
+      - name: bfloat16
+      - name: float32
+      - name: int32
+      - name: int64
+      - name: bool

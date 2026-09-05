@@ -154,6 +154,12 @@ jobs:
             config: test_view_ops_config.yaml
           - name: Profiler
             config: test_profiler_config.yaml
+          - name: Explicit Conversion Upstream
+            config: test_torch_config.yaml
+          - name: Implicit Promotion Upstream
+            config: test_binary_ufuncs_config.yaml
+          - name: Autocast Upstream
+            config: test_autocast_config.yaml
 
     steps:
       # Sparse checkout into the GHA workspace so the local composite

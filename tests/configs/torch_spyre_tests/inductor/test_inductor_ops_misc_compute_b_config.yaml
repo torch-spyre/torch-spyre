@@ -69,4 +69,7 @@ test_suite_config:
             # restickify add on padded dim tests
             - TestOps::test_restickify_add_transpose.*
             - TestOps::test_prod.*
+            # DtypeOpTable unit tests — pure Python, no hardware needed
+            - TestOps::test_dtype_op_table_keys_are_torch_dtypes
+            - TestOps::test_dtype_op_table_identity_pairs_symmetric
           mode: mandatory_success

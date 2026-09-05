@@ -300,7 +300,6 @@ class TestSpyre(TestCase):
             subtest(
                 (torch.int64, lambda: torch.tensor(10, dtype=torch.int64), None),
                 name="int64",
-                decorators=[_SCALAR_ADD_XFAIL_TO_DTYPE],
             ),
             subtest(
                 (torch.uint8, lambda: torch.tensor(10, dtype=torch.uint8), None),

@@ -428,7 +428,7 @@ TO_DTYPE_OP_ROUND_TRIP_PARAMS_SETS = {
         cached_randn(shape, dtype=src),
         dst,
     )
-    for src in [torch.float16, torch.float32]
+    for src in [torch.float16, torch.bfloat16, torch.float32]
     for dst in [torch.float16, torch.float32]
     if src != dst
     for shape in TO_DTYPE_OP_SHAPES
@@ -436,7 +436,7 @@ TO_DTYPE_OP_ROUND_TRIP_PARAMS_SETS = {
 
 TO_DTYPE_OP_ROUND_TRIP_EXPECT_FAIL = [
     f"{_dtype_name(src)}_to_{_dtype_name(dst)}_{shapes2key((shape,))}"
-    for src in [torch.float16, torch.float32]
+    for src in [torch.float16, torch.bfloat16, torch.float32]
     for dst in [torch.float16, torch.float32]
     if src != dst
     for shape in TO_DTYPE_OP_SHAPES_UNALIGNED
@@ -7856,6 +7856,43 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         else:
             assert result is None, (
                 f"Expected None for unsupported {src}->{dst}, got {result}"
+            )
+
+    def test_dtype_op_table_keys_are_torch_dtypes(self):
+        """DtypeOpTable keys use torch.dtype objects, not internal SEN names."""
+        table = DtypeOpTable.get_table()
+        for src, dst in table.keys():
+            assert isinstance(src, torch.dtype), (
+                f"Expected torch.dtype key, got {type(src)}: {src}"
+            )
+            assert isinstance(dst, torch.dtype), (
+                f"Expected torch.dtype key, got {type(dst)}: {dst}"
+            )
+        for src, dst in DtypeOpTable.get_dtype_pairs():
+            assert isinstance(src, torch.dtype), (
+                f"Expected torch.dtype in pairs, got {type(src)}: {src}"
+            )
+            assert isinstance(dst, torch.dtype), (
+                f"Expected torch.dtype in pairs, got {type(dst)}: {dst}"
+            )
+
+    def test_dtype_op_table_identity_pairs_symmetric(self):
+        """Identity pairs are symmetric — (A,B) identity iff (B,A) identity.
+
+        X→bool pairs are excluded: bool sources use get_bool_src_operator
+        (keyed on the physical DataFormats, not torch.dtype), so they are
+        intentionally absent from the regular get_operator table.
+        """
+        identity_pairs = [
+            (src, dst)
+            for src, dst in DtypeOpTable.get_dtype_pairs()
+            if DtypeOpTable.get_operator(src, dst) == IDENTITY_OP
+            and dst != torch.bool  # bool-src uses get_bool_src_operator
+        ]
+        for src, dst in identity_pairs:
+            rev = DtypeOpTable.get_operator(dst, src)
+            assert rev == IDENTITY_OP, (
+                f"({src},{dst}) is identity but ({dst},{src}) returned {rev}"
             )
 
     def test_to_dtype_cpu(self, x, dst_dtype):
