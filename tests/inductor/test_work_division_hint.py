@@ -571,6 +571,32 @@ def _relayout_plan(source="source", consumers="consumer"):
     return LXRelayoutPlan(source, consumers, _SOURCE_VIEW, _DESTINATION_VIEW, 8)
 
 
+@pytest.mark.parametrize(
+    ("view", "message"),
+    [
+        (
+            PerCoreView(((0, 2),), (), num_cores=2),
+            "split and owner-slot dimensions differ",
+        ),
+        (
+            PerCoreView(
+                ((0, 2),),
+                ((0, Symbol("unknown_owner")),),
+                num_cores=2,
+            ),
+            "non-concrete owner slot",
+        ),
+        (
+            PerCoreView(((0, 2),), ((0, Integer(2)),), num_cores=2),
+            "owner slot 2 outside split 2",
+        ),
+    ],
+)
+def test_lx_relayout_partition_validation_fails_closed(view, message):
+    with pytest.raises(ValueError, match=message):
+        lx_relayout_module._compatible_partitions(view, _DESTINATION_VIEW, 2)
+
+
 def test_lx_relayout_activation_policy_is_source_wide():
     dep = SimpleNamespace(name="input")
     producer = SimpleNamespace()

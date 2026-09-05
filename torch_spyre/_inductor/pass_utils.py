@@ -2763,6 +2763,54 @@ class PerCoreView:
     core_to_slot: tuple[tuple[int, Expr], ...]
     num_cores: int | None = None
 
+    def same_partition(self, other: object) -> bool:
+        """Whether both views assign every physical core the same buffer slice."""
+
+        if not isinstance(other, PerCoreView):
+            return False
+        left_splits = {
+            dim: int(split) for dim, split in self.work_slice_dims if int(split) > 1
+        }
+        right_splits = {
+            dim: int(split) for dim, split in other.work_slice_dims if int(split) > 1
+        }
+        left_cores = (
+            self.num_cores
+            if self.num_cores is not None
+            else math.prod(left_splits.values())
+        )
+        right_cores = (
+            other.num_cores
+            if other.num_cores is not None
+            else math.prod(right_splits.values())
+        )
+        if left_splits != right_splits or left_cores != right_cores:
+            return False
+        if not left_splits:
+            return True
+
+        from .core_mapping import core_mappings_equal
+
+        left_slots = dict(self.core_to_slot)
+        right_slots = dict(other.core_to_slot)
+        try:
+            symbols = {dim: sympy.Symbol(f"device_dim_{dim}") for dim in left_splits}
+            return core_mappings_equal(
+                {symbols[dim]: left_slots[dim] for dim in left_splits},
+                {symbols[dim]: right_slots[dim] for dim in right_splits},
+                left_cores,
+            )
+        except KeyError:
+            return False
+
+
+def per_core_views_equal(left: PerCoreView | None, right: PerCoreView | None) -> bool:
+    """None-aware physical-partition comparison."""
+
+    if left is None or right is None:
+        return left is right
+    return left.same_partition(right)
+
 
 def _is_matmul_op(op: Operation) -> bool:
     return (

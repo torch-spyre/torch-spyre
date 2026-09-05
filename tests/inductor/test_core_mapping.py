@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import copy
+import dataclasses
 import math
 from types import SimpleNamespace
 
@@ -34,8 +35,15 @@ from torch_spyre._inductor.core_mapping import (
     derive_operation_mapping,
     derive_partition_mapping,
     finalize_tensor_work_divisions,
+    remap_work_division,
 )
-from torch_spyre._inductor.op_spec import OpSpec, TensorArg, TensorWorkDivision
+from torch_spyre._inductor.op_spec import (
+    OpSpec,
+    TensorArg,
+    TensorWorkDivision,
+    is_lx_relayout_identity,
+)
+from torch_spyre._inductor.pass_utils import PerCoreView, per_core_views_equal
 from torch_spyre._inductor.spyre_kernel import simplify_op_spec
 from torch_spyre._inductor.views import (
     align_tensors,
@@ -168,6 +176,160 @@ def test_group_topology_does_not_follow_final_loop_reordering():
     )
 
 
+def test_tensor_work_division_compares_physical_owners_not_sympy_spelling():
+    head = sympy.Symbol("head")
+    core_id = sympy.Symbol("core_id")
+    left = TensorWorkDivision(
+        {head: 4},
+        {head: sympy.Mod(core_id, 4)},
+        num_cores=8,
+    )
+    right = TensorWorkDivision(
+        {head: 4},
+        {head: core_id - 4 * sympy.floor(core_id / 4)},
+        num_cores=8,
+    )
+
+    assert left != right
+    assert left.same_ownership(right)
+
+
+def test_tensor_work_division_rejects_different_core_order():
+    head = sympy.Symbol("head")
+    core_id = sympy.Symbol("core_id")
+    left = TensorWorkDivision(
+        {head: 4},
+        {head: sympy.Mod(core_id, 4)},
+        num_cores=8,
+    )
+    right = TensorWorkDivision(
+        {head: 4},
+        {head: sympy.floor(core_id / 2)},
+        num_cores=8,
+    )
+
+    assert not left.same_ownership(right)
+
+
+def test_tensor_work_division_ignores_unsplit_dimensions_and_infers_core_count():
+    head, local = sympy.symbols("head local")
+    core_id = sympy.Symbol("core_id")
+    left = TensorWorkDivision(
+        {head: 4, local: 1},
+        {head: sympy.Mod(core_id, 4), local: sympy.Integer(0)},
+    )
+    right = TensorWorkDivision(
+        {head: 4},
+        {head: sympy.Mod(core_id, 4)},
+        num_cores=4,
+    )
+
+    assert left.physical_core_count == 4
+    assert left.same_ownership(right)
+
+
+def test_per_core_view_compares_physical_owners_not_sympy_spelling():
+    core_id = sympy.Symbol("core_id")
+    left = PerCoreView(
+        ((0, 4),),
+        ((0, sympy.Mod(core_id, 4)),),
+        num_cores=8,
+    )
+    right = PerCoreView(
+        ((0, 4), (1, 1)),
+        (
+            (0, core_id - 4 * sympy.floor(core_id / 4)),
+            (1, sympy.Integer(0)),
+        ),
+        num_cores=8,
+    )
+    reordered = PerCoreView(
+        ((0, 4),),
+        ((0, sympy.floor(core_id / 2)),),
+        num_cores=8,
+    )
+
+    assert left != right
+    assert left.same_partition(right)
+    assert per_core_views_equal(left, right)
+    assert not left.same_partition(reordered)
+    assert per_core_views_equal(None, None)
+
+
+def test_remap_work_division_accepts_equivalent_merged_owner_slots():
+    first, second, merged = sympy.symbols("first second merged")
+    core_id = sympy.Symbol("core_id")
+    division = TensorWorkDivision(
+        {first: 4, second: 4},
+        {
+            first: sympy.Mod(core_id, 4),
+            second: core_id - 4 * sympy.floor(core_id / 4),
+        },
+        num_cores=8,
+    )
+
+    remapped = remap_work_division(
+        division,
+        {first: ((merged, 4),), second: ((merged, 4),)},
+    )
+
+    assert remapped.physical_core_count == 8
+    assert remapped.work_slices == {merged: 4}
+    assert core_mappings_equal(
+        {merged: remapped.core_id_to_work_slice[merged]},
+        {merged: sympy.Mod(core_id, 4)},
+        8,
+    )
+
+
+def test_remap_work_division_rejects_conflicting_merged_owner_slots():
+    first, second, merged = sympy.symbols("first second merged")
+    core_id = sympy.Symbol("core_id")
+    division = TensorWorkDivision(
+        {first: 4, second: 4},
+        {
+            first: sympy.Mod(core_id, 4),
+            second: sympy.floor(core_id / 2),
+        },
+        num_cores=8,
+    )
+
+    with pytest.raises(ValueError, match="conflicting normalized ownership"):
+        remap_work_division(
+            division,
+            {first: ((merged, 4),), second: ((merged, 4),)},
+        )
+
+
+def test_identity_with_equivalent_owner_spelling_is_not_a_relayout():
+    head = sympy.Symbol("head")
+    core_id = sympy.Symbol("core_id")
+    base = TensorArg(
+        True,
+        0,
+        DataFormats.SEN169_FP16,
+        [4, 64],
+        [head, head],
+        {"lx": 0},
+        work_division=TensorWorkDivision(
+            {head: 4},
+            {head: sympy.Mod(core_id, 4)},
+            num_cores=4,
+        ),
+    )
+    destination = dataclasses.replace(
+        base,
+        is_input=False,
+        work_division=TensorWorkDivision(
+            {head: 4},
+            {head: core_id - 4 * sympy.floor(core_id / 4)},
+            num_cores=4,
+        ),
+    )
+
+    assert not is_lx_relayout_identity("identity", (base, destination))
+
+
 def test_late_mapping_rejects_geometry_that_does_not_fill_groups():
     h, query = sympy.symbols("h query")
     with pytest.raises(ValueError, match="does not match operation split"):
@@ -281,6 +443,28 @@ def test_operation_mapping_rejects_conflicting_lx_tensor_owners():
         derive_operation_mapping(
             {shared: (8, 2), extra: (8, 2)},
             divisions,
+        )
+
+
+def test_operation_mapping_bounds_aligned_owner_dimension_permutations():
+    dims = sympy.symbols("d0:6")
+    core_id = sympy.Symbol("core_id")
+    division = TensorWorkDivision(
+        {dim: 2 for dim in dims},
+        {
+            dim: sympy.Mod(sympy.floor(core_id / (2**index)), 2)
+            for index, dim in enumerate(dims)
+        },
+        num_cores=64,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="too many aligned tensor-owned dimensions.*6 > 5",
+    ):
+        derive_operation_mapping(
+            {dim: (sympy.Integer(2), 2) for dim in dims},
+            [division],
         )
 
 

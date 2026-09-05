@@ -20,9 +20,12 @@ import math
 from collections.abc import Mapping, Sequence
 from itertools import permutations
 
-from sympy import Expr, Integer, Mod, Symbol, floor
+from sympy import Expr, Integer, Mod, Symbol, floor, sympify
 
 from .op_spec import TensorWorkDivision
+
+
+_MAX_OWNER_PERMUTATION_DIMS = 5
 
 
 def core_to_slice_mapping(
@@ -194,6 +197,7 @@ def remap_work_division(
     physical partition does not change; only the symbols used to describe it do.
     """
 
+    num_cores = division.physical_core_count
     new_splits: dict[Symbol, int] = {}
     new_core_map: dict[Symbol, Expr] = {}
     for old_dim, split in division.work_slices.items():
@@ -218,8 +222,17 @@ def remap_work_division(
             if factor == 1:
                 continue
             new_slot = Mod(floor(slot / slot_stride), factor)
-            previous = (new_splits.get(new_dim), new_core_map.get(new_dim))
-            if previous[0] is not None and previous != (factor, new_slot):
+            previous_split = new_splits.get(new_dim)
+            previous_slot = new_core_map.get(new_dim)
+            if previous_split is not None and (
+                previous_split != factor
+                or previous_slot is None
+                or not core_mappings_equal(
+                    {new_dim: previous_slot},
+                    {new_dim: new_slot},
+                    num_cores,
+                )
+            ):
                 raise ValueError(f"conflicting normalized ownership on {new_dim}")
             new_splits[new_dim] = factor
             new_core_map[new_dim] = new_slot
@@ -227,7 +240,7 @@ def remap_work_division(
     return TensorWorkDivision(
         new_splits,
         new_core_map,
-        num_cores=division.num_cores,
+        num_cores=num_cores,
     )
 
 
@@ -287,12 +300,14 @@ def derive_operation_mapping(
     for division in tensor_divisions:
         if division is None:
             continue
-        if division.work_slices and division.num_cores not in (None, num_cores):
+        if division.work_slices and division.physical_core_count != num_cores:
             raise ValueError(
                 "LX tensor ownership and operation use different core domains: "
-                f"{division.num_cores} != {num_cores}"
+                f"{division.physical_core_count} != {num_cores}"
             )
         for dim, split in division.work_slices.items():
+            if int(split) <= 1:
+                continue
             if dim not in split_by_dim:
                 raise ValueError(f"LX tensor dimension {dim} is not in the operation")
             if split_by_dim[dim] != int(split):
@@ -315,6 +330,11 @@ def derive_operation_mapping(
 
     # Tensor-owned dimensions occupy the outer, contiguous groups. At most five
     # dimensions can be split on 32 cores, so trying their radix orders is small.
+    if len(constrained) > _MAX_OWNER_PERMUTATION_DIMS:
+        raise ValueError(
+            "too many aligned tensor-owned dimensions for bounded core-order "
+            f"search: {len(constrained)} > {_MAX_OWNER_PERMUTATION_DIMS}"
+        )
     for order in permutations(constrained):
         candidate = derive_core_mapping(
             dims,
@@ -341,9 +361,15 @@ def core_mappings_equal(
 
     if left.keys() != right.keys():
         return False
+    if num_cores < 0:
+        return False
     core_id = Symbol("core_id")
-    return all(
-        int(left[dim].subs(core_id, core)) == int(right[dim].subs(core_id, core))
-        for dim in left
-        for core in range(num_cores)
-    )
+    try:
+        return all(
+            int(sympify(left[dim]).subs(core_id, core))
+            == int(sympify(right[dim]).subs(core_id, core))
+            for dim in left
+            for core in range(num_cores)
+        )
+    except (TypeError, ValueError):
+        return False

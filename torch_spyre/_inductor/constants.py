@@ -37,6 +37,10 @@ INT32TOFP32_OP = "int32tofp32"
 
 DEVICE_NAME = "spyre"
 
+# Spyre memory is addressed and allocated in 128-byte sticks. Keep every
+# frontend size and descriptor calculation on this single hardware constant.
+BYTES_PER_STICK = 128
+
 # The staggered EAs produced by the bidirectional fp16<->fp32 on-device
 # conversions, whose device coordinates are non-sequential and (unlike QFP8CH)
 # can be restored by the reverse conversion. propagate_layouts uses this set for

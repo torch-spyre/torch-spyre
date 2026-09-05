@@ -32,6 +32,7 @@ from torch._inductor.ir import (
 from .. import config
 from ..ir import FixedTiledLayout
 from ..logging_utils import get_inductor_logger
+from ..core_mapping import core_mappings_equal
 from ..op_spec import TensorWorkDivision
 from ..pass_utils import (
     PerCoreView,
@@ -91,7 +92,12 @@ def work_division_from_view(
             raise ValueError(f"cannot map device dimension {device_dim} to one loop")
         dim = next(iter(matches))
         slot = sympy.sympify(slots[device_dim])
-        if dim in splits and (splits[dim], core_map[dim]) != (split, slot):
+        if dim in splits and (
+            splits[dim] != split
+            or not core_mappings_equal(
+                {dim: core_map[dim]}, {dim: slot}, view.num_cores
+            )
+        ):
             raise ValueError(f"conflicting ownership for loop {dim}")
         splits[dim] = split
         core_map[dim] = slot
@@ -141,14 +147,23 @@ def _core_slices(view: PerCoreView, num_cores: int) -> dict[int, dict[int, int]]
     core_id = sympy.Symbol("core_id")
     splits = dict(view.work_slice_dims)
     slots = dict(view.core_to_slot)
+    if splits.keys() != slots.keys():
+        raise ValueError(
+            "ownership split and owner-slot dimensions differ: "
+            f"{set(splits)} != {set(slots)}"
+        )
     result = {}
     for core in range(num_cores):
         row = {}
         for dim, split in splits.items():
             value = sympy.sympify(slots[dim]).subs(core_id, core)
-            assert not value.free_symbols, f"non-concrete owner slot {value}"
+            if value.free_symbols:
+                raise ValueError(f"non-concrete owner slot {value} on core {core}")
             slot = int(value)
-            assert 0 <= slot < split, f"owner slot {slot} outside split {split}"
+            if not 0 <= slot < split:
+                raise ValueError(
+                    f"owner slot {slot} outside split {split} on core {core}"
+                )
             row[dim] = slot
         result[core] = row
     return result
@@ -231,7 +246,7 @@ def _unsupported_relayout_transition_reason(
     correctly addressed buffer.
     """
 
-    if source_work_division == destination_work_division:
+    if source_work_division.same_ownership(destination_work_division):
         return "distinct physical ownerships collapse to the same logical work division"
     return None
 
@@ -289,7 +304,7 @@ def collect_lx_relayout_plans(graph: GraphLowering) -> list[LXRelayoutPlan]:
         # Relayout copies sharing one source are allocated and materialized as
         # one atomic group. Any unsupported consumer therefore rejects the
         # group; supported consumers keep using the original buffer instead.
-        consumers_by_view: dict[PerCoreView, list[str]] = {}
+        consumers_by_view: list[tuple[PerCoreView, list[str]]] = []
         seen_consumers = set()
         rejection_reason = None
         for consumer, dep in consumer_reads:
@@ -338,7 +353,7 @@ def collect_lx_relayout_plans(graph: GraphLowering) -> list[LXRelayoutPlan]:
                 rejection_reason = "source ownership cannot be projected to consumer"
                 break
             assert source_work_division is not None
-            if view == source_view:
+            if view.same_partition(source_view):
                 continue
             is_matmul = _is_matmul_op(consumer)
             if is_matmul and len(deps) != 2:
@@ -347,7 +362,12 @@ def collect_lx_relayout_plans(graph: GraphLowering) -> list[LXRelayoutPlan]:
             if not is_matmul and not isinstance(consumer.data, Pointwise):
                 rejection_reason = "consumer is neither pointwise nor matmul"
                 break
-            if not _compatible_partitions(source_view, view, num_cores):
+            try:
+                compatible = _compatible_partitions(source_view, view, num_cores)
+            except (TypeError, ValueError) as exc:
+                rejection_reason = f"invalid ownership partition: {exc}"
+                break
+            if not compatible:
                 rejection_reason = "source and destination partitions are incompatible"
                 break
             try:
@@ -365,8 +385,13 @@ def collect_lx_relayout_plans(graph: GraphLowering) -> list[LXRelayoutPlan]:
             ):
                 rejection_reason = reason
                 break
-            consumers_by_view.setdefault(view, []).append(consumer_name)
-        else:
+            for destination_view, consumer_names in consumers_by_view:
+                if destination_view.same_partition(view):
+                    consumer_names.append(consumer_name)
+                    break
+            else:
+                consumers_by_view.append((view, [consumer_name]))
+        if rejection_reason is None:
             result.extend(
                 LXRelayoutPlan(
                     source_name,
@@ -375,7 +400,7 @@ def collect_lx_relayout_plans(graph: GraphLowering) -> list[LXRelayoutPlan]:
                     destination_view,
                     num_cores,
                 )
-                for destination_view, consumer_names in consumers_by_view.items()
+                for destination_view, consumer_names in consumers_by_view
             )
         if rejection_reason is not None:
             logger.debug(
@@ -406,7 +431,8 @@ def materialize_lx_relayouts(graph: GraphLowering, plans: list[LXRelayoutPlan]) 
         copies[plan.edge] = (copy.get_name(), plan)
 
         assert plan.source_address is not None and plan.destination_address is not None
-        assert plan.source_view != plan.destination_view
+        if plan.source_view.same_partition(plan.destination_view):
+            raise RuntimeError("LX relayout plan has identical source and destination")
         source_layout = cast(FixedTiledLayout, source.layout)
         copy_layout = cast(FixedTiledLayout, copy.layout)
         source_layout.allocation["lx"] = plan.source_address

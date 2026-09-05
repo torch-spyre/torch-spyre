@@ -17,6 +17,7 @@ from __future__ import annotations
 
 from collections import OrderedDict
 import dataclasses
+import math
 import threading
 from typing import Any, Literal, Sequence
 
@@ -153,6 +154,54 @@ class TensorWorkDivision:
     core_id_to_work_slice: dict[Symbol, Expr]
     num_cores: int | None = None
 
+    @property
+    def physical_core_count(self) -> int:
+        """Physical core domain over which the owner expressions are defined."""
+
+        return (
+            self.num_cores
+            if self.num_cores is not None
+            else math.prod(int(split) for split in self.work_slices.values())
+        )
+
+    def same_ownership(self, other: object) -> bool:
+        """Whether both values assign every physical core the same slice.
+
+        Structural equality remains the dataclass value-syntax comparison.
+        Ownership decisions use this evaluated comparison instead, so equivalent
+        SymPy spellings compare equal. Unsplit dimensions do not describe
+        ownership and are ignored.
+        """
+
+        if not isinstance(other, TensorWorkDivision):
+            return False
+        left_splits = {
+            dim: int(split) for dim, split in self.work_slices.items() if int(split) > 1
+        }
+        right_splits = {
+            dim: int(split)
+            for dim, split in other.work_slices.items()
+            if int(split) > 1
+        }
+        if (
+            left_splits != right_splits
+            or self.physical_core_count != other.physical_core_count
+        ):
+            return False
+        if not left_splits:
+            return True
+
+        from .core_mapping import core_mappings_equal
+
+        try:
+            return core_mappings_equal(
+                {dim: self.core_id_to_work_slice[dim] for dim in left_splits},
+                {dim: other.core_id_to_work_slice[dim] for dim in right_splits},
+                self.physical_core_count,
+            )
+        except KeyError:
+            return False
+
     def remap_symbols(self, symbol_mapping: dict[Symbol, Symbol]) -> TensorWorkDivision:
         """Return this ownership expressed in remapped loop symbols."""
 
@@ -247,7 +296,7 @@ def is_lx_relayout_identity(op: str, args: Sequence[TensorArg]) -> bool:
         and "lx" in destination.allocation
         and source.work_division is not None
         and destination.work_division is not None
-        and source.work_division != destination.work_division
+        and not source.work_division.same_ownership(destination.work_division)
     )
 
 

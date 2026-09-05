@@ -593,7 +593,7 @@ def get_ncores_for_buffers(
                             f"{view_cores} cores but op runs {_op_num_cores(op)}"
                         )
                         break
-                if view != ref_view:
+                if ref_view is not None and not view.same_partition(ref_view):
                     mismatch_reason = (
                         f"op '{ref_op_name}' ref {ref_view} != '{op.get_name()}' {view}"
                     )
