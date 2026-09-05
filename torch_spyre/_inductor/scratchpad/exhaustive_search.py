@@ -83,6 +83,15 @@ class ExhaustiveSearchSolver(CoreDivisionLayoutSolver):
         buffers_list = cast("list[CoreDivisionBuffer]", self.buffers)
 
         buf_by_name: dict[str, CoreDivisionBuffer] = {b.name: b for b in buffers_list}
+        children_by_parent: dict[
+            str, list[tuple[CoreDivisionBuffer, list[tuple[int, int]]]]
+        ] = {}
+        for child in buffers_list:
+            for parent_name in child.parents:
+                if parent_name in buf_by_name:
+                    children_by_parent.setdefault(parent_name, []).append(
+                        (child, child.cd_parent_matches.get(parent_name, []))
+                    )
 
         # CoreDivisionBuffer.size is the total device footprint (pre-division); that
         # is exactly the HBM cost when a buffer is not pinned to LX.
@@ -102,19 +111,20 @@ class ExhaustiveSearchSolver(CoreDivisionLayoutSolver):
 
             Starts from the pre-computed ``b.residency_reason`` (computed by
             :class:`CoOptimizingAllocator` with ``division_is_fixed=False``), then
-            adds the division-compatibility check via ``cd_parent_matches``: if no
-            (parent_div, ci) pair in ``cd_parent_matches[parent]`` matches the
-            parent's currently-chosen division, the per-core views disagree and the
-            buffer must spill.
+            adds the division-compatibility check via ``cd_parent_matches``. A
+            resident producer must match every consumer: if no
+            ``(producer_div, consumer_div)`` pair matches the selected divisions,
+            the producer spills so the consumer reads it correctly from HBM. This
+            is the same direction used by the CP-SAT and annealing solvers.
             """
             if b.residency_reason is not None:
                 return b.residency_reason
-            for p_name in b.parents:
-                if p_name not in buf_by_name:
-                    continue
-                pi = chosen[p_name]
-                pairs = b.cd_parent_matches.get(p_name, [])
-                if not any(pp == pi and pc == ci for pp, pc in pairs):
+            for child, pairs in children_by_parent.get(b.name, []):
+                child_division = chosen[child.name]
+                if not any(
+                    producer_division == ci and consumer_division == child_division
+                    for producer_division, consumer_division in pairs
+                ):
                     return "core div mismatch"
             return None
 

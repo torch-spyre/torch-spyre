@@ -44,8 +44,8 @@ points, all registered in
 | `CustomPreGradPasses` | Pre-grad FX graph | Reserved for graph rewrites before autograd partitioning. The pipeline is empty today. |
 | `CustomPrePasses` | Post-grad FX graph (early) | `collect_spyre_hints` snapshots `spyre_hint` annotations so they survive AOT re-tracing. |
 | `CustomPostPasses` | Post-grad FX graph (late) | Late post-grad rewrites: `decompose_addmm`, `mm_to_bmm_pass`, `bmm_unflatten_pass`. (`recover_spyre_hints` runs separately, via a `GraphLowering` monkey-patch in `patches.py`.) |
-| `CustomPreFusionPasses` | LoopLevelIR (pre-fusion) | Pre-fusion scheduler passes: `propagate_mutation_layouts`, `align_lx_producer_loop_order`, `build_loop_scheduler_nodes`. |
-| `CustomPostFusionPasses` | LoopLevelIR (post-fusion) | Post-fusion scheduler passes: `demote_incoherent_lx_buffers`, `spyre_fuse_nodes`, `hbm_pool_planning`, `verify_carried_reduction_ownership`. |
+| `CustomPreFusionPasses` | LoopLevelIR (pre-fusion) | Pre-fusion scheduler passes: `propagate_mutation_layouts`, `build_loop_scheduler_nodes`. |
+| `CustomPostFusionPasses` | LoopLevelIR (post-fusion) | Post-fusion scheduler passes: `spyre_fuse_nodes`, `demote_incoherent_lx_buffers`, `hbm_pool_planning`, `verify_carried_reduction_ownership`. The final pass checks the carried-reduction stages after placement is complete. |
 | `CustomPreSchedulingPasses` | LoopLevelIR (pre-scheduler) | The pre-scheduling pipeline that runs immediately before the Scheduler is constructed (wired in via a `GraphLowering._update_scheduler` monkey-patch in [`patches.py`](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/patches.py)). The full step list is in [LoopLevelIR Passes](#looplevelir-passes) below. |
 
 ### FX Graph Passes

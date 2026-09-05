@@ -8082,17 +8082,19 @@ class TestTileHelpers(unittest.TestCase):
 
 class TestCustomPostFusionPassesOrder(unittest.TestCase):
     def test_hbm_pool_planning_runs_after_fusion(self):
-        """hbm_pool_planning must see post-fusion bundles, not pre-fusion nodes."""
+        """Final ownership is checked before HBM placement and stage validation."""
         from torch_spyre._inductor.passes import CustomPostFusionPasses
-        from torch_spyre._inductor.fusion import spyre_fuse_nodes
-        from torch_spyre._inductor.hbm_pool_planning import hbm_pool_planning
 
         pipeline = CustomPostFusionPasses()
         names = [p.__name__ for p in pipeline.passes]
-        self.assertLess(
-            names.index(spyre_fuse_nodes.__name__),
-            names.index(hbm_pool_planning.__name__),
-            "spyre_fuse_nodes must run before hbm_pool_planning",
+        self.assertEqual(
+            names,
+            [
+                "spyre_fuse_nodes",
+                "demote_incoherent_lx_buffers",
+                "hbm_pool_planning",
+                "verify_carried_reduction_ownership",
+            ],
         )
 
 
