@@ -2392,6 +2392,27 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     torch.zeros(0, dtype=torch.float16),
                     cached_randn((1, 8, 14, 64), dtype=torch.float16),
                 ),
+                "2d_dim1_unaligned_fp16": (
+                    1,
+                    cached_randn((1, 24608), dtype=torch.float16),
+                    cached_randn((1, 32), dtype=torch.float16),
+                ),
+                "2d_dim1_unaligned_small_fp16": (
+                    1,
+                    cached_randn((4, 100), dtype=torch.float16),
+                    cached_randn((4, 28), dtype=torch.float16),
+                ),
+                "2d_dim1_unaligned_fp32": (
+                    1,
+                    cached_randn((1, 993), dtype=torch.float32),
+                    cached_randn((1, 31), dtype=torch.float32),
+                ),
+                "2d_dim1_unaligned_three_tensors": (
+                    1,
+                    cached_randn((2, 100), dtype=torch.float16),
+                    cached_randn((2, 100), dtype=torch.float16),
+                    cached_randn((2, 56), dtype=torch.float16),
+                ),
             },
         },
         (
@@ -2498,6 +2519,26 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "4d_dim2_negative_both": (
                     cached_randn((2, 5, 8, 64), dtype=torch.float16),
                     (0, 0, -2, -2),
+                ),
+                "2d_last_dim_unaligned_fp16": (
+                    cached_randn((1, 24608), dtype=torch.float16),
+                    (0, 32),
+                ),
+                "2d_last_dim_unaligned_fp16_small_pad": (
+                    cached_randn((1, 24608), dtype=torch.float16),
+                    (0, 64),
+                ),
+                "2d_last_dim_unaligned_fp32": (
+                    cached_randn((1, 993), dtype=torch.float32),
+                    (0, 31),
+                ),
+                "2d_both_dims_unaligned": (
+                    cached_randn((3, 100), dtype=torch.float16),
+                    (0, 28),
+                ),
+                "3d_last_dim_unaligned": (
+                    cached_randn((2, 4, 100), dtype=torch.float16),
+                    (0, 28),
                 ),
             },
         },

@@ -1911,7 +1911,7 @@ def _same_host_layout(lhs, rhs) -> bool:
     )
 
 
-def _target_device_layout(target, name: str):
+def _target_device_layout(target, name: str, output_dep: MemoryDep = None):
     layout = target.get_layout()
     if isinstance(layout, FixedTiledLayout):
         return layout.device_layout
@@ -1937,7 +1937,18 @@ def _target_device_layout(target, name: str):
 
     if not layouts or len(layouts) != 1:
         return None
-    return next(iter(layouts))
+
+    target_stl = next(iter(layouts))
+    dtype_for_layout = (
+        bool_layout_dtype(target_stl.device_dtype, "mutation target")
+        if layout.dtype == torch.bool
+        else layout.dtype
+    )
+    stick_size = get_elem_in_stick(dtype_for_layout)
+    write_stick = device_coordinates(target_stl, output_dep, None)[-1]
+    if not is_stick_expr_offset_free(write_stick, stick_size):
+        return None
+    return target_stl
 
 
 def _find_alt_target_stl(
@@ -2223,10 +2234,13 @@ def propagate_spyre_tensor_layouts(
                 while isinstance(target, ReinterpretView):
                     target = target.data
                 target_name = target.get_name() if hasattr(target, "get_name") else ""
+
+                rw = op.get_read_writes()
+                output_dep = next(iter(rw.writes))
                 # Look up the actual buffer node (unwraps TensorBox/StorageBox
                 # wrappers that coarse_tile.py places around SpyreEmptyFallback).
                 target_buf = V.graph.get_buffer(target_name) if target_name else None
-                target_stl = _target_device_layout(target, target_name)
+                target_stl = _target_device_layout(target, target_name, output_dep)
                 if target_stl is None:
                     target_buf_layouts = getattr(target_buf, "layouts", None)
                     if not isinstance(target_buf, SpyreEmptyFallback) and (
@@ -2405,8 +2419,6 @@ def propagate_spyre_tensor_layouts(
                         )
                         op.layouts = candidates
                     continue
-                rw = op.get_read_writes()
-                output_dep = next(iter(rw.writes))
                 args = _get_prop_args(rw.reads)
 
                 # Find an alternative layout if the write has an unsupported stick
