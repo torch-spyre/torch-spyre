@@ -41,14 +41,18 @@ from torch_spyre._inductor.scratchpad.plan_solver import LifetimeBoundBuffer
 
 # Op outputs NOT eligible for LX-pinning; every other op is eligible by
 # default. `convolution` is aten's direct-conv op name and `conv2d` is the
-# depthwise (`torch.ops.spyre.conv2d`) op name -- both are listed because a
-# stride-2 direct-lowered conv miscomputes (shuffled spatial elements) when
+# depthwise (`torch.ops.spyre.conv2d`) op name -- those two are listed because
+# a stride-2 direct-lowered conv miscomputes (shuffled spatial elements) when
 # its output is pinned to LX; see the direct-lowering codegen follow-up
-# tracked from PR #3284.
+# tracked from PR #3284. `avg_pool2d` is listed for an unrelated reason: a
+# windowed pool's operand paged through LX aborts DeepTools L3 scheduling
+# ("Expect valid lower and upper bound parameters"), because windowed padding
+# and LX paging disagree on the per-core bounds.
 OP_OUTPUT_NOT_GOOD_FOR_LX_REUSE = frozenset(
     {
         "convolution",
         "conv2d",
+        "avg_pool2d",
     }
 )
 
@@ -402,25 +406,33 @@ def _is_read_advancing_anywhere(
     return False
 
 
-def _writes_at_constant_offset(op: Operation) -> bool:
-    """True if ``op`` writes any buffer at a non-zero *constant* offset -- a
-    sliced in-place mutation into a sub-region (e.g. ``x[:, 32:96] = ...``,
-    whose write ``MemoryDep`` index is ``256*d0 + d1 + 32`` with
-    ``get_offset() == 32``).
+def dep_has_constant_offset(dep) -> bool:
+    """True if ``dep`` accesses its buffer at a non-zero *constant* offset.
+
+    A slice into a sub-region (e.g. ``x[:, 32:96]``) gives a ``MemoryDep``
+    index like ``256*d0 + d1 + 32``, whose ``get_offset()`` -- every iteration
+    variable set to 0 -- is ``32``.
 
     Coverage-aware: only a *constant* non-zero offset counts. Per-core /
-    coarse-tile writes carry their per-core shift as a symbol in the offset
+    coarse-tile accesses carry their per-core shift as a symbol in the offset
     (``free_symbols`` non-empty), so those are NOT flagged -- avoiding the
-    coarse-tile over-guard a flat-numel test would trigger.
+    coarse-tile over-guard a flat-numel test would trigger. Deps with no usable
+    index (``StarDep`` and friends) are likewise not flagged.
     """
-    for dep in op_read_writes(op).writes:
-        try:
-            off = dep.get_offset()
-        except (TypeError, ValueError, AttributeError):
-            continue
-        if off != 0 and not getattr(off, "free_symbols", frozenset()):
-            return True
-    return False
+    try:
+        off = dep.get_offset()
+    except (TypeError, ValueError, AttributeError):
+        return False
+    return off != 0 and not getattr(off, "free_symbols", frozenset())
+
+
+def _writes_at_constant_offset(op: Operation) -> bool:
+    """True if ``op`` writes any buffer at a non-zero constant offset -- a
+    sliced in-place mutation into a sub-region (e.g. ``x[:, 32:96] = ...``).
+
+    See :func:`dep_has_constant_offset` for what counts as such an offset.
+    """
+    return any(dep_has_constant_offset(dep) for dep in op_read_writes(op).writes)
 
 
 def ops_in_offset_mutation_component(

@@ -13,9 +13,9 @@ default. Greedy, first-fit, and best-fit are available as opt-ins;
 `layout_solver` can also be set from the `LAYOUT_SOLVER` environment
 variable.
 
-Co-optimization with work distribution is opt-in.
-`config.co_optimizing_lx_planning` (`CO_OPTIMIZING_LX_PLANNING=1`)
-defaults to off. It enlarges each op's set of candidate splits — pointwise
+Co-optimization with work distribution is on by default.
+`config.co_optimizing_lx_planning` (`CO_OPTIMIZING_LX_PLANNING=0` to opt
+out) enlarges each op's set of candidate splits — pointwise
 dim-flips, the matmuls' tilings offered to neighbours, cross-matmul split
 transfer, a shared batch-major `B/M` tiling for matmuls and reductions —
 then searches the cross-product for the assignment that minimizes HBM
@@ -482,8 +482,8 @@ ops sharing a buffer can get different splits (different shapes mean
 different optimal decompositions), which triggers `core_div_mismatch`
 and disqualifies the shared buffer from LX even when it would have fit.
 
-`CoOptimizingAllocator` (gated by
-`config.co_optimizing_lx_planning`, env var `CO_OPTIMIZING_LX_PLANNING=1`)
+`CoOptimizingAllocator` (the default; gated by
+`config.co_optimizing_lx_planning`, env var `CO_OPTIMIZING_LX_PLANNING`)
 treats split choices and LX placement jointly:
 
 :::{figure} ../_static/images/lx/co-optimization.svg

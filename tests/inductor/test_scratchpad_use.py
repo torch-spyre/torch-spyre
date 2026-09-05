@@ -1712,7 +1712,13 @@ class TestBoundaryCloneInPlace(BaseTestScratchpadUsage):
             return bufs
 
         with patch.object(ScratchpadAllocator, "_build_bound_buffers", spy):
-            with ts_inductor_config.patch(lx_planning=True):
+            # This test targets the base placement allocator's
+            # ``_build_bound_buffers``; with co-optimization now the default,
+            # pin the joint path off so ``select_allocator`` does not route to
+            # ``CoOptimizingAllocator`` (whose builder is ``_build_cd_bound_buffers``).
+            with ts_inductor_config.patch(
+                lx_planning=True, co_optimizing_lx_planning=False
+            ):
                 compiled = torch.compile(fn, fullgraph=True)
                 result = compiled(x).to("cpu")
 
@@ -1827,7 +1833,12 @@ class TestBoundaryCloneInPlace(BaseTestScratchpadUsage):
 
         with self.pre_scheduling_iterating_pass(collect_feeders):
             with patch.object(ScratchpadAllocator, "_build_bound_buffers", spy):
-                with ts_inductor_config.patch(lx_planning=True):
+                # Base placement path targeted (see the input-clone test above);
+                # pin the joint path off so the default co-optimization flip does
+                # not route to ``CoOptimizingAllocator``.
+                with ts_inductor_config.patch(
+                    lx_planning=True, co_optimizing_lx_planning=False
+                ):
                     compiled = torch.compile(fn, fullgraph=True)
                     ry, rq = compiled(x)
                     ry, rq = ry.to("cpu"), rq.to("cpu")
@@ -1900,7 +1911,12 @@ class TestBoundaryCloneInPlace(BaseTestScratchpadUsage):
 
         with self.pre_scheduling_iterating_pass(collect_feeders):
             with patch.object(ScratchpadAllocator, "_build_bound_buffers", spy):
-                with ts_inductor_config.patch(lx_planning=True):
+                # Base placement path targeted (see the input-clone test above);
+                # pin the joint path off so the default co-optimization flip does
+                # not route to ``CoOptimizingAllocator``.
+                with ts_inductor_config.patch(
+                    lx_planning=True, co_optimizing_lx_planning=False
+                ):
                     compiled = torch.compile(fn, fullgraph=True)
                     ry, ru = compiled(x)
                     ry, ru = ry.to("cpu"), ru.to("cpu")
@@ -2021,9 +2037,15 @@ class TestBoundaryCloneInPlace(BaseTestScratchpadUsage):
         with self.pre_scheduling_iterating_pass(visit):
             # In-place reuse of boundary-clone buffers is a paired-buffer feature
             # of the greedy build path (only the greedy solver sets
-            # supports_paired_buffers). Pin it so the slot-sharing assertion holds
-            # regardless of the default layout_solver.
-            with ts_inductor_config.patch(lx_planning=True, layout_solver="greedy"):
+            # supports_paired_buffers), which lives on the base placement
+            # allocator. Pin greedy *and* co-optimization off so the slot-sharing
+            # assertion holds regardless of the default layout_solver and the
+            # default co-optimization flip.
+            with ts_inductor_config.patch(
+                lx_planning=True,
+                layout_solver="greedy",
+                co_optimizing_lx_planning=False,
+            ):
                 result = torch.compile(fn, fullgraph=True)(x).to("cpu")
 
         # Group LX-resident buffers by address; a shared address == in-place reuse.
@@ -2049,6 +2071,106 @@ class TestBoundaryCloneInPlace(BaseTestScratchpadUsage):
         self.assertTrue(
             torch.allclose(fn(x.to("cpu")), result, atol=1e-2, rtol=1e-3),
             "input clone slot sharing changed the numerical result",
+        )
+
+    @unittest.skipUnless(_HAS_ORTOOLS, "co-optimizing path needs ortools")
+    def test_input_clone_inplace_shares_lx_slot_in_cooptimizing_path(self):
+        """Peak-LX: the joint CP-SAT co-optimizer also fires the reverse-parent
+        merge (#3212), reusing the input clone's slot rather than adding one.
+
+        Unlike greedy, the co-optimizer can *avoid* an in-place merge by choosing
+        a larger core division: a finer split shrinks every per-core footprint
+        until all buffers fit in their own slot, so with a roomy LX it never needs
+        to reuse a slot (and this test would be vacuous). To exercise the merge we
+        shrink the LX budget to two per-core slots while the graph has three
+        LX-eligible buffers at the maximum 32-way split (the input clone plus
+        ``x*2`` and ``x*3``). Keeping all three resident then costs strictly less
+        HBM traffic than spilling one, and the only 2-slot plan that holds all
+        three merges ``x*3`` onto the input clone's slot -- so the co-optimizer
+        picks it. We assert the input clone shares its LX address (merge fired)
+        and values are unchanged. Mirrors ``test_input_clone_inplace_shares_lx_slot``
+        on the joint (co-optimizing) allocator."""
+        from torch_spyre._inductor.pass_utils import op_short_name
+        from torch_spyre._inductor.scratchpad import allocator as alloc_mod
+        from torch_spyre._inductor.scratchpad.greedy_solver import GreedyLayoutSolver
+
+        sencores = 32
+        x = self.rand_device((64, 1024))
+        # Per-core footprint of each buffer at the 32-way split (fp16 -> 2 bytes),
+        # already 128-byte aligned; a 2-slot budget cannot hold the three
+        # LX-eligible buffers unmerged, forcing exactly one in-place merge.
+        per_core_bytes = 64 * 1024 * 2 // sencores
+        lx_budget = 2 * per_core_bytes
+
+        def fn(x):
+            return x * 2.0 + x * 3.0
+
+        input_names: set[str] = set()
+        per_op: dict[str, dict] = {}
+
+        def visit(graph: GraphLowering) -> None:
+            input_names.update(graph.graph_input_names)
+            for op in graph.operations:
+                alloc = getattr(
+                    graph.get_buffer(op.name).get_layout(), "allocation", {}
+                )
+                per_op[op.name] = {
+                    "short": op_short_name(op),
+                    "lx": alloc.get("lx"),
+                    "reads": [d.name for d in op.get_read_writes().reads],
+                }
+
+        # The joint solve is what this test is about, but ``scratchpad_planning``
+        # silently retries with greedy placement on SolveError -- and greedy also
+        # fires the merge (that is the sibling test), so without this the whole
+        # test would pass on the fallback path.
+        greedy_calls = {"count": 0}
+        original_greedy = GreedyLayoutSolver.plan_layout
+
+        def counting_greedy(solver_self, *args, **kwargs):
+            greedy_calls["count"] += 1
+            return original_greedy(solver_self, *args, **kwargs)
+
+        with self.pre_scheduling_iterating_pass(visit):
+            with patch.object(alloc_mod, "_lx_planning_size", lambda: lx_budget):
+                with patch.object(GreedyLayoutSolver, "plan_layout", counting_greedy):
+                    with ts_inductor_config.patch(
+                        lx_planning=True,
+                        layout_solver="cpsat",
+                        co_optimizing_lx_planning=True,
+                        sencores=sencores,
+                    ):
+                        result = torch.compile(fn, fullgraph=True)(x).to("cpu")
+
+        self.assertEqual(
+            greedy_calls["count"],
+            0,
+            "CP-SAT fell back to greedy placement, so this test did not "
+            "exercise the joint co-optimizer",
+        )
+
+        # Group LX-resident buffers by address; a shared address == in-place reuse.
+        addr_to_buffers: dict[int, list[str]] = {}
+        for name, info in per_op.items():
+            if info["lx"] is not None:
+                addr_to_buffers.setdefault(info["lx"], []).append(name)
+
+        input_clones = [
+            name
+            for name, info in per_op.items()
+            if info["short"] == "clone"
+            and info["lx"] is not None
+            and any(r in input_names for r in info["reads"])
+        ]
+        self.assertTrue(input_clones, "expected an LX-resident clone of a graph input")
+        self.assertTrue(
+            any(len(addr_to_buffers[per_op[c]["lx"]]) > 1 for c in input_clones),
+            "co-opt input clone occupies a dedicated LX slot -- expected the joint "
+            "solver to reuse it in place under LX pressure (no peak-LX reduction)",
+        )
+        self.assertTrue(
+            torch.allclose(fn(x.to("cpu")), result, atol=1e-2, rtol=1e-3),
+            "co-opt input clone slot sharing changed the numerical result",
         )
 
 

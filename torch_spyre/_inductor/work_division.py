@@ -1026,7 +1026,7 @@ def _work_div_hint_by_name(op: ComputedBuffer) -> dict[str, int]:
     return dim_to_split
 
 
-def _has_work_div_hint(op: ComputedBuffer) -> bool:
+def has_work_div_hint(op: ComputedBuffer) -> bool:
     return any(hint_dict.get("work_div") for hint_dict in get_op_hints(op).values())
 
 
@@ -1949,7 +1949,7 @@ def _cost_model_divide_op(op: ComputedBuffer, max_cores: int) -> bool:
         return False
     if op.data.reduction_type != BATCH_MATMUL_OP:
         return False
-    if not config.ignore_work_division_hints and _has_work_div_hint(op):
+    if not config.ignore_work_division_hints and has_work_div_hint(op):
         # User hints take ownership of the split decision; do not override them.
         return False
 

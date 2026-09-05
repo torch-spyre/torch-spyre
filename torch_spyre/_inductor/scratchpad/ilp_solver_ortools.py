@@ -640,7 +640,7 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         buffers: Sequence[LifetimeBoundBuffer],
         size: int,
         alignment: int = 128,
-        time_limit_seconds: float = 120.0,
+        time_limit_seconds: Optional[float] = None,
         bottom_justify: bool = True,
     ) -> None:
         if cp_model is None:
@@ -653,7 +653,11 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         # The solver works in alignment-sized units so every offset it picks is
         # automatically aligned; plan_layout scales sizes/offsets in and out.
         self._capacity_units = self.limit // self.alignment
-        self._time_limit_seconds = time_limit_seconds
+        self._time_limit_seconds = (
+            config.cpsat_time_limit_seconds
+            if time_limit_seconds is None
+            else time_limit_seconds
+        )
         self._bottom_justify = bottom_justify
 
     def plan_layout(self, log_lx_usage: bool = False) -> list[LifetimeBoundBuffer]:

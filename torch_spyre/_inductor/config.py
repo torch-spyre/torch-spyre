@@ -21,7 +21,7 @@ from .logging_utils import _get_env_bool
 
 lx_planning: bool = os.environ.get("LX_PLANNING", "1") == "1"
 co_optimizing_lx_planning: bool = (
-    os.environ.get("CO_OPTIMIZING_LX_PLANNING", "0") == "1"
+    os.environ.get("CO_OPTIMIZING_LX_PLANNING", "1") == "1"
 )
 hbm_pool_planning: bool = _get_env_bool("HBM_POOL_PLANNING", True)
 
@@ -180,6 +180,19 @@ sdsc_cache: bool = os.environ.get("SPYRE_INDUCTOR_SDSC_CACHE", "1") == "1"
 layout_solver: Literal[
     "greedy", "bestfit", "firstfit", "cpsat", "simulated_annealing"
 ] = os.environ.get("LAYOUT_SOLVER", "cpsat")  # type: ignore[assignment]
+
+# Wall-clock budget for one CP-SAT solve, in seconds. The joint objective is
+# lexicographic and re-solves the same model up to three times (residency, then
+# parallelism, then division balance), so this bounds each phase, not the pass.
+# It is a compile-time guard, not a correctness one: a solve that runs out of
+# budget without an incumbent raises SolveError, and scratchpad_planning falls
+# back to greedy placement (correct, but co-optimization is lost for that
+# graph). Raise it if large graphs are falling back; 0 disables the limit.
+# The default matches the budget CpSatLayoutSolver hard-coded before this knob
+# existed, so exposing it does not change how long any solve is allowed to run.
+cpsat_time_limit_seconds: float = float(
+    os.environ.get("CPSAT_TIME_LIMIT_SECONDS", "120")
+)
 
 # OpSpec validation at pipeline stage boundaries. Enabled by default to catch
 # invariant violations early. Set SPYRE_VALIDATE_OP_SPECS=0 to disable.

@@ -257,7 +257,10 @@ class TestNamedWorkDivisionHint(InductorTestCase):
                 allowed_splits={m: frozenset({1})},
             )
 
-    @config.patch({"sencores": 8})
+    # Patch co optimization to False as partial hinting is not currently
+    # supported for work division.
+    # TODO: Support work division hint preservation with co-optimization
+    @config.patch({"sencores": 8, "co_optimizing_lx_planning": False})
     def test_pointwise_work_div_hint_applied(self):
         M, N = 128, 64
         x = torch.randn(M, N, dtype=torch.float16).to("spyre")
@@ -275,7 +278,7 @@ class TestNamedWorkDivisionHint(InductorTestCase):
         self._assert_user_hint_logged()
         self.assertIn("sympify('c0'): (sympify('128'), 4)", source_codes[0])
 
-    @config.patch({"sencores": 8})
+    @config.patch({"sencores": 8, "co_optimizing_lx_planning": False})
     def test_matmul_work_div_hint_maps_by_name(self):
         M, K, N = 128, 256, 64
         x = torch.randn(M, K, dtype=torch.float16).to("spyre")
@@ -756,6 +759,7 @@ def test_lx_relayout_normalizes_ownership_and_lowers_only_in_superdsc():
         # solver sets supports_paired_buffers. Pin it explicitly so this test
         # keeps exercising relayout regardless of the default layout_solver.
         "layout_solver": "greedy",
+        "co_optimizing_lx_planning": False,
     }
 )
 @pytest.mark.parametrize("second_consumer", ["pointwise", "matmul_lhs", "matmul_rhs"])
