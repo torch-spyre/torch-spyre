@@ -4848,6 +4848,56 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "67x71x256": (cached_randn((67, 71, 256), dtype=torch.float32),),
             },
         },
+        (
+            "test_exp_fp16",
+            "test_unary_op",
+        ): {
+            "ops_dict": {"exp": torch.exp},
+            "param_sets": {
+                "256": (
+                    cached_randn(
+                        (256,),
+                    ),
+                ),
+                "67x256": (
+                    cached_randn(
+                        (67, 256),
+                    ),
+                ),
+                "67x71x256": (
+                    cached_randn(
+                        (67, 71, 256),
+                    ),
+                ),
+                "nearmax": (torch.tensor([[10.0, 10.5, 11.0]], dtype=torch.float16),),
+                "overflow": (torch.tensor([[15.0, 20.0, 50.0]], dtype=torch.float16),),
+                "underflow": (
+                    torch.tensor([[-50.0, -100.0, -200.0]], dtype=torch.float16),
+                ),
+                "mixed": (torch.tensor([[-20.0, 0.0, 10.0]], dtype=torch.float16),),
+            },
+        },
+        (
+            "test_exp_fp32",
+            "test_unary_op",
+        ): {
+            "ops_dict": {"exp": torch.exp},
+            "param_sets": {
+                "256": (cached_randn((256,), dtype=torch.float32),),
+                "67x256": (cached_randn((67, 256), dtype=torch.float32),),
+                "67x71x256": (cached_randn((67, 71, 256), dtype=torch.float32),),
+                "31": (cached_randn((31,), dtype=torch.float32),),
+                "67x31": (cached_randn((67, 31), dtype=torch.float32),),
+                "3x7x31": (cached_randn((3, 7, 31), dtype=torch.float32),),
+                "nearmax": (
+                    torch.tensor([[85.0, 86.0, 87.0, 88.0]], dtype=torch.float32),
+                ),
+                "underflow": (torch.tensor([[-100.0, -200.0]], dtype=torch.float32),),
+                "mixed": (
+                    torch.tensor([[-50.0, 0.0, 50.0, 88.0]], dtype=torch.float32),
+                ),
+            },
+        },
         ("test_eq_scalar", "test_scalar_comparison_base"): {
             "param_sets": {
                 "int_42": (

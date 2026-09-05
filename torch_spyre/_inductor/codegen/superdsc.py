@@ -281,7 +281,10 @@ def _get_coordinate_mask(
     # EVERY padded output dim so its lanes are contraction-neutral. In practice
     # SDPA pads only the stick dim, so this emits a single-dim mask; the multi-dim
     # case is unexercised (see the BANDAGE note on _POINTWISE_PADDING_MASK_VALUE).
-    mask_pointwise = op in _POINTWISE_PADDING_MASK_VALUE
+    # fp32 hardware does not support SAMV stick masking; skip for fp32 outputs.
+    mask_pointwise = (
+        op in _POINTWISE_PADDING_MASK_VALUE and arg.data_format != DataFormats.IEEE_FP32
+    )
     return {
         dim: [[iteration_space[dim] - padding, padding]]
         for dim, padding in dim_padding.items()
