@@ -90,7 +90,7 @@ from torch_spyre._inductor.scratchpad.utils import (
     _get_buffer_user_deps,
     _would_produce_lx_back_gap,
     OP_OUTPUT_NOT_GOOD_FOR_LX_REUSE,
-    counted_loop_lifetime_end_overrides,
+    counted_loop_lifetime_overrides,
 )
 from torch_spyre._inductor.scratchpad.graph_editor import GraphEditor
 from torch_spyre._inductor.ir import FixedTiledLayout, SpyreEmptyFallback
@@ -134,11 +134,11 @@ _LX_ALLOCATION_GRANULARITY_BYTES = 128
 
 
 def _safe_in_place_parents(
-    parents: Sequence[str], lifetime_end_overrides: dict[str, int]
+    parents: Sequence[str], lifetime_override_names: set[str]
 ) -> list[str]:
     """Drop handoffs from parents that remain live through a counted loop."""
 
-    return [parent for parent in parents if parent not in lifetime_end_overrides]
+    return [parent for parent in parents if parent not in lifetime_override_names]
 
 
 def _extern_kernel_in_live_range(graph: GraphLowering, uses: list[int]) -> bool:
@@ -687,6 +687,7 @@ class ScratchpadAllocator:
         lifetimes: dict[str, list[int]],
         ncores: dict[str, int],
         ncores_reasons: dict[str, str],
+        lifetime_start_overrides: Optional[dict[str, int]] = None,
         lifetime_end_overrides: Optional[dict[str, int]] = None,
     ) -> list[LifetimeBoundBuffer]:
         """Build one :class:`LifetimeBoundBuffer` per buffer, barred or not.
@@ -702,7 +703,11 @@ class ScratchpadAllocator:
         :meth:`_input_residency_reason` and their footprint is computed
         here rather than read off ``mem_usage`` (which covers ops only).
         """
+        lifetime_start_overrides = lifetime_start_overrides or {}
         lifetime_end_overrides = lifetime_end_overrides or {}
+        lifetime_override_names = set(lifetime_start_overrides) | set(
+            lifetime_end_overrides
+        )
         buffers: list[LifetimeBoundBuffer] = []
         for output_name, info in mem_usage.items():
             uses = lifetimes.get(output_name, [])
@@ -722,9 +727,10 @@ class ScratchpadAllocator:
                     # this list inside the shared ``in_place`` dict (matches the copy
                     # in ``_build_cd_bound_buffers``).
                     in_place_parents=_safe_in_place_parents(
-                        in_place.get(output_name, []), lifetime_end_overrides
+                        in_place.get(output_name, []), lifetime_override_names
                     ),
                     residency_reason=reasons.get(output_name),
+                    lifetime_start_override=lifetime_start_overrides.get(output_name),
                     lifetime_end_override=lifetime_end_overrides.get(output_name),
                 )
             )
@@ -757,6 +763,7 @@ class ScratchpadAllocator:
                     first_use_is_read=True,
                     in_place_parents=[],
                     residency_reason=reason,
+                    lifetime_start_override=lifetime_start_overrides.get(input_name),
                     lifetime_end_override=lifetime_end_overrides.get(input_name),
                 )
             )
@@ -770,7 +777,7 @@ class ScratchpadAllocator:
             # consumer is a built candidate with matching per-core size, device
             # layout, a pointwise producer, and no core-division mismatch is there
             # anything safe to merge.
-            if reason is not None or input_name in lifetime_end_overrides:
+            if reason is not None or input_name in lifetime_override_names:
                 continue
             last_use = uses[-1]
             consumer_op = graph.operations[last_use]
@@ -932,7 +939,9 @@ class ScratchpadAllocator:
         t0 = time.perf_counter()
         if lifetimes is None:
             lifetimes = calculate_liveness(graph)
-        lifetime_end_overrides = counted_loop_lifetime_end_overrides(graph)
+        lifetime_start_overrides, lifetime_end_overrides = (
+            counted_loop_lifetime_overrides(graph)
+        )
         ncores, ncores_reasons = get_ncores_for_buffers(graph)
         t1 = time.perf_counter()
         mem_usage = mem_usage_by_buf(graph, cache)
@@ -972,6 +981,7 @@ class ScratchpadAllocator:
             lifetimes=lifetimes,
             ncores=ncores,
             ncores_reasons=ncores_reasons,
+            lifetime_start_overrides=lifetime_start_overrides,
             lifetime_end_overrides=lifetime_end_overrides,
         )
         if lx_relayout_plans:
@@ -1008,6 +1018,8 @@ class ScratchpadAllocator:
             return
         for buffer in buffers:
             buffer.uses = [2 * use + 1 for use in buffer.uses]
+            if buffer.lifetime_start_override is not None:
+                buffer.lifetime_start_override *= 2
             if buffer.lifetime_end_override is not None:
                 buffer.lifetime_end_override *= 2
 
@@ -1021,22 +1033,12 @@ class ScratchpadAllocator:
 
         for source_entries in entries_by_source.values():
             source = source_entries[0][0]
-            original_end = source.lifetime_end_override
-            transfer_ticks = []
             for _, plan, original_ticks in source_entries:
                 consumer_ticks = [2 * tick + 1 for tick in original_ticks]
                 transfer_tick = consumer_ticks[0] - 1
-                transfer_ticks.append(transfer_tick)
                 source.uses = sorted(
                     {use for use in source.uses if use not in consumer_ticks}
                     | {transfer_tick}
-                )
-                nominal_destination_end = consumer_ticks[-1] + 1
-                destination_end = (
-                    original_end
-                    if original_end is not None
-                    and original_end > nominal_destination_end
-                    else None
                 )
                 destination = LifetimeBoundBuffer(
                     plan.destination_name,
@@ -1044,17 +1046,16 @@ class ScratchpadAllocator:
                         source.size, _LX_ALLOCATION_GRANULARITY_BYTES
                     ),
                     [transfer_tick, *consumer_ticks],
-                    lifetime_end_override=destination_end,
                 )
                 buffers.insert(buffers.index(source), destination)
                 source.paired_with.append(destination)
 
-            # Once relayout owns every later read, the extended lifetime moves
-            # from the source to its destinations. A same-view reader after the
-            # last transfer still needs the original source through the loop.
-            remaining_reads = source.uses[0 if source.first_use_is_read else 1 :]
-            if not any(use > max(transfer_ticks) for use in remaining_reads):
-                source.lifetime_end_override = None
+            # A counted-loop override describes the source value crossing an
+            # iteration boundary.  The relayout copy is materialized inside the
+            # LoopSpec and is recreated on every iteration, so it keeps its
+            # ordinary short lifetime.  The source itself must retain both
+            # overrides even when every textual consumer was redirected: the
+            # inserted copy reads it again on the next runtime iteration.
 
     def _allocated_lx_relayout_sources(
         self, allocation: Sequence[LifetimeBoundBuffer]
@@ -2015,7 +2016,12 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             op.name: self._op_inputs_good_for_lx_inplace(op) for op in graph.operations
         }
         lifetimes = calculate_liveness(graph)
-        lifetime_end_overrides = counted_loop_lifetime_end_overrides(graph)
+        lifetime_start_overrides, lifetime_end_overrides = (
+            counted_loop_lifetime_overrides(graph)
+        )
+        lifetime_override_names = set(lifetime_start_overrides) | set(
+            lifetime_end_overrides
+        )
         for buf_name, info in mem_usage.items():
             allow_inplace[buf_name] = []
             if not in_place_allowed[buf_name]:
@@ -2035,7 +2041,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                 # them). Skip them, matching the base allocator's guard.
                 if input_buf not in mem_usage or not lifetimes[input_buf]:
                     continue
-                if input_buf in lifetime_end_overrides:
+                if input_buf in lifetime_override_names:
                     continue
                 in_layout = graph.get_buffer(input_buf).layout
                 if not hasattr(in_layout, "device_layout"):
@@ -2097,7 +2103,12 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         solver compares those total footprints.
         """
         lifetimes = calculate_liveness(graph)
-        lifetime_end_overrides = counted_loop_lifetime_end_overrides(graph)
+        lifetime_start_overrides, lifetime_end_overrides = (
+            counted_loop_lifetime_overrides(graph)
+        )
+        lifetime_override_names = set(lifetime_start_overrides) | set(
+            lifetime_end_overrides
+        )
         mem_usage = mem_usage_by_buf(graph)
         in_place = {} if in_place is None else in_place
         op_by_name = {op.name: op for op in graph.operations}
@@ -2148,6 +2159,9 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                         parents=[],
                         cd_parent_matches={},
                         residency_reason=None,
+                        lifetime_start_override=lifetime_start_overrides.get(
+                            input_name
+                        ),
                         lifetime_end_override=lifetime_end_overrides.get(input_name),
                         boundary=BufferType.Input,
                     )
@@ -2161,7 +2175,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
 
             buf_divisions = divisions[output_name]
             parents = _safe_in_place_parents(
-                in_place.get(output_name, []), lifetime_end_overrides
+                in_place.get(output_name, []), lifetime_override_names
             )
             size = info["size"]  # total footprint; solver divides per chosen cd
             parent_proj = info["op_inputs"].copy()
@@ -2191,7 +2205,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             # clone, so they are skipped.
             out_layout = graph.get_buffer(output_name).layout
             for clone_name in last_consumer_clones.get(output_name, []):
-                if clone_name in lifetime_end_overrides:
+                if clone_name in lifetime_override_names:
                     continue
                 if clone_name in parents:
                     continue
@@ -2227,6 +2241,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                     parents=parent_proj,
                     cd_parent_matches=cd_parent_matches,
                     residency_reason=residency_reason,
+                    lifetime_start_override=lifetime_start_overrides.get(output_name),
                     lifetime_end_override=lifetime_end_overrides.get(output_name),
                     boundary=BufferType.Output
                     if output_name in graph_output_names

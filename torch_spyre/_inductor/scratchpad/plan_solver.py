@@ -71,7 +71,8 @@ class LifetimeBoundBuffer:
     would let such a buffer pass as an in-place parent.
 
     ``start_time`` and ``end_time`` are convenience properties derived from
-    ``uses``: ``uses[0]`` and ``uses[-1] + 1`` respectively.
+    ``uses`` and optional counted-loop overrides.  The overrides widen storage
+    liveness without adding fake accesses to ``uses``.
     """
 
     name: str
@@ -87,6 +88,10 @@ class LifetimeBoundBuffer:
     # Keep this separate from ``uses``: it changes address overlap, but must not
     # manufacture a read or inflate residency/spill benefit.
     lifetime_end_override: Optional[int] = None
+    # Optional inclusive lifetime start for storage reused by a counted loop.
+    # A loop-crossing value is live before its first textual read on every
+    # runtime iteration after the first.
+    lifetime_start_override: Optional[int] = None
     # Buffers that must be placed atomically with this one. Despite the name,
     # this is one-to-many: only the group root carries the complete partner list.
     paired_with: list["LifetimeBoundBuffer"] = field(
@@ -117,6 +122,12 @@ class LifetimeBoundBuffer:
                 f"{self.lifetime_end_override} before nominal exclusive end "
                 f"{self.uses[-1] + 1}"
             )
+        if self.lifetime_start_override is not None and self.uses:
+            assert self.lifetime_start_override <= self.uses[0], (
+                f"buffer {self.name} has lifetime_start_override="
+                f"{self.lifetime_start_override} after nominal start "
+                f"{self.uses[0]}"
+            )
 
     @property
     def read_count(self) -> int:
@@ -135,7 +146,9 @@ class LifetimeBoundBuffer:
 
     @property
     def start_time(self) -> int:
-        return self.uses[0]
+        nominal = self.uses[0]
+        override = self.lifetime_start_override
+        return min(nominal, override if override is not None else nominal)
 
     @property
     def end_time(self) -> int:
