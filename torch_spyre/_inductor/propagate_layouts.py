@@ -153,6 +153,38 @@ def same_device_size(t1: torch.dtype, t2: torch.dtype) -> bool:
     return get_elem_in_stick(t1) == get_elem_in_stick(t2)
 
 
+def _compact_broadcast_device_dims(stl: SpyreTensorLayout) -> SpyreTensorLayout:
+    """Remove physical extent from logical stride-zero dimensions.
+
+    The generic layout constructor retains a broadcast dimension's logical
+    extent in ``device_size`` even though its zero ``stride_map`` makes every
+    access land at coordinate zero.  That is useful for host transfers, which
+    materialize expanded tensors, but it needlessly multiplies the allocation
+    and span of compiler-generated overlapping buffers such as coarse-tile read
+    copies.  Collapse every such non-stick device dimension to one.  The final
+    device dimension remains a full hardware stick; making its stride sparse is
+    enough to represent a broadcast stick.
+    """
+    device_size = list(stl.device_size)
+    stride_map = list(stl.stride_map)
+    changed = False
+    for dim, stride in enumerate(stride_map):
+        if stride != 0:
+            continue
+        stride_map[dim] = -1
+        if dim != len(device_size) - 1:
+            device_size[dim] = 1
+        changed = True
+    if not changed:
+        return stl
+    return SpyreTensorLayout(
+        device_size,
+        stride_map,
+        stl.device_dtype,
+        stl.element_arrangement,
+    )
+
+
 def infer_bool_device_dtype(args: list[PropArg]) -> DataFormats:
     """Infer the on-device format for a torch.bool pointwise output.
 
@@ -1822,6 +1854,8 @@ def compute_layouts(
             op, output, output_dep, args[0].dep, args[0].layout, stl
         )
         layouts.extend(result)
+    if any(stride == 0 for stride in output.stride):
+        layouts = [_compact_broadcast_device_dims(stl) for stl in layouts]
     if not layouts:
         raise Unsupported(
             f"{op.get_name()} ({aten_op}): no supported output layout found for "
