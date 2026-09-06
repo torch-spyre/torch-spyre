@@ -1697,6 +1697,25 @@ def to_dtype(x, dst_dtype, use_compute_types=True):
     )
 
 
+@register_spyre_lowering(torch.ops.spyre.adapt_dtype.default, type_promotion_kind=None)
+def lower_adapt_dtype(x, dtype, only_if=None):
+    if only_if is not None and x.get_dtype() != only_if:
+        return x
+
+    if x.get_dtype() == dtype:
+        return x
+    return to_dtype(x, dtype)
+
+
+@register_spyre_lowering(
+    torch.ops.spyre.adapt_dtype_scalar.default, type_promotion_kind=None
+)
+def lower_adapt_dtype_scalar(x, dtype, only_if=None):
+    if only_if is None or (only_if == torch.int64 and isinstance(x, int)):
+        return float(x) if dtype.is_floating_point else int(x)
+    return x
+
+
 def with_int64_fallback(fn, *args, convert_output=True):
     """
     Helper to handle int64 operations by converting to fp32.

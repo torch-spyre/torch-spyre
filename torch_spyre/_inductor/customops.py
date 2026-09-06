@@ -790,6 +790,75 @@ def _(input: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
     return torch.empty_like(input, dtype=dtype)
 
 
+@torch.library.custom_op("spyre::adapt_dtype", mutates_args=(), device_types="spyre")
+def adapt_dtype(
+    input: torch.Tensor,
+    dtype: torch.dtype,
+    only_if: Optional[torch.dtype] = None,
+) -> torch.Tensor:
+    """
+    Adapt tensor data type to a target dtype for Spyre.
+
+    Used primarily in decompositions (e.g. division, arithmetic) to perform
+    type conversions without exposing explicit conversion nodes in the FX graph.
+    If `only_if` is specified, conversion is only performed when the input
+    matches `only_if`; otherwise it acts as a no-op identity pass-through.
+
+    Args:
+        input: Input Tensor to adapt.
+        dtype: Target torch.dtype to convert to.
+        only_if: Optional source dtype condition. If provided, conversion is
+            only applied if input's dtype matches `only_if`.
+
+    Returns:
+        Tensor converted to `dtype`, or unchanged input if only_if
+        does not match or input is already of target dtype.
+    """
+    if only_if is not None and input.dtype != only_if:
+        return input
+
+    if input.dtype == dtype:
+        return input
+    return input.to(dtype=dtype)
+
+
+@adapt_dtype.register_fake
+def _(
+    input: torch.Tensor,
+    dtype: torch.dtype,
+    only_if: Optional[torch.dtype] = None,
+) -> torch.Tensor:
+    if only_if is not None and input.dtype != only_if:
+        return input
+
+    if input.dtype == dtype:
+        return input
+    return torch.empty_like(input, dtype=dtype)
+
+
+@torch.library.custom_op("spyre::adapt_dtype_scalar", mutates_args=())
+def adapt_dtype_scalar(
+    input: torch.types.Number,
+    dtype: torch.dtype,
+    only_if: Optional[torch.dtype] = None,
+) -> torch.types.Number:
+    """Adapt scalar data type to a target dtype."""
+    if only_if is None or (only_if == torch.int64 and isinstance(input, int)):
+        return float(input) if dtype.is_floating_point else int(input)
+    return input
+
+
+@adapt_dtype_scalar.register_fake
+def _(
+    input: torch.types.Number,
+    dtype: torch.dtype,
+    only_if: Optional[torch.dtype] = None,
+) -> torch.types.Number:
+    if only_if is None or (only_if == torch.int64 and isinstance(input, int)):
+        return float(input) if dtype.is_floating_point else int(input)
+    return input
+
+
 @torch.library.custom_op("spyre::qfp8ch", mutates_args=(), device_types="spyre")
 def qfp8ch(input: torch.Tensor) -> torch.Tensor:
     """

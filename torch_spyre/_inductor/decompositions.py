@@ -152,6 +152,27 @@ def register_spyre_decompositions(ops: OpOrOps):
     eager-mode dispatch reaches it too. This is required for
     ``CompositeImplicitAutograd`` ops (``rms_norm``, ``layer_norm``, ...); it
     is harmless for the rest.
+
+    ``NotImplemented`` as a return value
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    Returning ``NotImplemented`` from a registered decomposition is **only
+    valid inside ``torch.compile``'s decomp pass** (``make_fx`` tracing).
+    There it acts as a skip signal: the tracing machinery leaves the op
+    un-decomposed and Inductor lowers it directly via the upstream lowering
+    table.
+
+    In **eager mode** the same function is wrapped by ``_OPWrapper`` and
+    executed via ``torch.compile(fn)(*args)``.  When the compiled function
+    returns ``NotImplemented``, that Python sentinel is handed back to
+    PyTorch's C++ dispatch layer, which attempts to cast it to a Tensor and
+    raises::
+
+        RuntimeError: Unable to cast NotImplemented to Tensor
+
+    Therefore any decomposition that returns ``NotImplemented`` for some
+    inputs **must not be called eagerly** with those inputs.  The standard
+    safeguard is to pass ``run_eager=False`` to ``compare_with_cpu()`` in the
+    corresponding test, which skips the eager execution path.
     """
     return decomp.register_decomposition(ops, spyre_decompositions)
 
@@ -192,6 +213,15 @@ class _OPWrapper:
     subsequent eager calls reuse the compiled entry point. When invoked from
     inside an active ``torch.compile`` context, the wrapped function is called
     directly — re-entering ``torch.compile`` would be wrong.
+
+    .. warning:: ``NotImplemented`` is not safe here.
+        If the wrapped decomposition returns ``NotImplemented`` (the standard
+        decomp-table skip signal inside ``make_fx``), ``torch.compile(fn)``
+        propagates that Python sentinel as the return value.  PyTorch's C++
+        dispatch layer then tries to cast it to a ``Tensor`` and raises
+        ``RuntimeError: Unable to cast NotImplemented to Tensor``.
+        Decompositions that return ``NotImplemented`` for certain inputs must
+        not be invoked eagerly with those inputs (use ``run_eager=False``).
     """
 
     def __init__(self, fn):
@@ -1502,3 +1532,94 @@ def spyre_index_add(
     updated = gathered + source
     indices: list[Optional[torch.Tensor]] = [None] * dim + [index]
     return torch.index_put(self, indices, updated, accumulate=False)
+
+
+def _adapt_dtype(v, to_dtype: torch.dtype, only_if: Optional[torch.dtype] = None):
+    """Adapt tensor or scalar data type to `to_dtype`, optionally only if matching `only_if`."""
+    if isinstance(v, torch.Tensor):
+        return torch.ops.spyre.adapt_dtype(v, to_dtype, only_if=only_if)
+    return torch.ops.spyre.adapt_dtype_scalar(v, to_dtype, only_if=only_if)
+
+
+def _broadcast_if_tensors(a, b):
+    """Broadcast two tensor operands to a common shape if their shapes differ."""
+    if isinstance(a, torch.Tensor) and isinstance(b, torch.Tensor):
+        if a.shape != b.shape:
+            return torch.broadcast_tensors(a, b)
+    return a, b
+
+
+@register_spyre_decompositions(
+    [
+        torch.ops.aten.div.Tensor,
+        torch.ops.aten.div.Tensor_mode,
+        torch.ops.aten.div.Scalar,
+        torch.ops.aten.div.Scalar_mode,
+    ]
+)
+def spyre_div(x: torch.Tensor, y, *, rounding_mode=None) -> torch.Tensor:
+    """Decompose torch.div for Spyre."""
+    xf = _adapt_dtype(x, to_dtype=torch.float32, only_if=torch.int64)
+    yf = _adapt_dtype(y, to_dtype=torch.float32, only_if=torch.int64)
+    xf, yf = _broadcast_if_tensors(xf, yf)
+
+    if rounding_mode == "floor":
+        qf = torch.ops.prims.div(xf, yf)
+        qf = torch.ops.aten.floor.default(qf)
+
+        # Quotient correction based on remainder bounds.
+        #
+        #   Correct floor-division results satisfy:
+        #        0 <= r < yf
+        #   where r = xf - qf * yf.
+        #
+        #   Assuming the divider can introduce at most
+        #   a +/-1 quotient error:
+        #
+        #        r >= yf => qf underestimated by 1
+        #        r <  0  => qf overestimated by 1
+        r = xf - qf * yf
+        qf = torch.where(r >= yf, qf + 1, qf)
+        qf = torch.where(r < 0, qf - 1, qf)
+
+        return _adapt_dtype(qf, to_dtype=x.dtype)
+
+    elif rounding_mode == "trunc":
+        # TODO: Use PR #3610 for trunc div
+        qf = torch.ops.prims.div(xf, yf)
+        qf = _adapt_dtype(qf, to_dtype=torch.int64, only_if=torch.float32)
+        qf = _adapt_dtype(qf, to_dtype=torch.float32, only_if=torch.int64)
+
+        # Quotient correction based on remainder bounds.
+        #
+        #   Correct trunc-division results satisfy:
+        #       -yf < r < yf
+        #   where r = xf - qf * yf.
+        #
+        #   Assuming the divider can introduce at most
+        #   a +/-1 quotient error:
+        #
+        #        r >= yf   => qf underestimated by 1
+        #        r <= -yf  => qf overestimated by 1
+        r = xf - qf * yf
+        qf = torch.where(r >= yf, qf + 1, qf)
+        qf = torch.where(r <= -yf, qf - 1, qf)
+        return _adapt_dtype(qf, to_dtype=torch.int64, only_if=torch.float32)
+
+    else:
+        return torch.ops.prims.div(xf, yf)
+
+
+@register_spyre_decompositions(
+    [torch.ops.aten.true_divide.Tensor, torch.ops.aten.true_divide.Scalar]
+)
+def spyre_true_divide(x: torch.Tensor, y) -> torch.Tensor:
+    """Decompose aten.true_divide for Spyre (always true division).
+
+    Adapts int64 inputs to fp32 via `_adapt_dtype`, leaving other dtypes
+    unchanged for native division. `y` may be a Tensor or a Python scalar.
+    """
+    xf = _adapt_dtype(x, to_dtype=torch.float32, only_if=torch.int64)
+    yf = _adapt_dtype(y, to_dtype=torch.float32, only_if=torch.int64)
+    xf, yf = _broadcast_if_tensors(xf, yf)
+    return torch.ops.prims.div(xf, yf)

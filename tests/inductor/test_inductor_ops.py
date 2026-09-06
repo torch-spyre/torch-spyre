@@ -69,14 +69,6 @@ POINTWISE_BINARY_OPS_DICT = {
     "maximum": torch.maximum,
 }
 
-POINTWISE_BINARY_OPS_INT64_DICT = {
-    "add": torch.add,
-    "mul": torch.mul,
-    "sub": torch.sub,
-    "minimum": torch.minimum,
-    "maximum": torch.maximum,
-}
-
 CORE_REDUCTION_OPS_DICT = {
     "sum": torch.sum,
     "mean": torch.mean,
@@ -536,6 +528,23 @@ FP32_EPS = torch.finfo(torch.float32).eps  # 1.1920928955078125e-07
 FP16_EPS = torch.finfo(torch.float16).eps  # 0.0009765625
 
 
+def _replace_near_zero(t: torch.Tensor) -> None:
+    """Replace near-zero values in *t* in-place to avoid division-by-zero.
+
+    The threshold (EPS) is chosen per dtype:
+      - int64  → 1
+      - float32 → FP32_EPS
+      - other  → FP16_EPS
+    """
+    if t.dtype == torch.int64:
+        eps = 1
+    elif t.dtype == torch.float32:
+        eps = FP32_EPS
+    else:
+        eps = FP16_EPS
+    t[torch.abs(t) < eps] = eps
+
+
 def _attention_fn(q, k, v, scale=True):
     d_k = q.size(-1)
     scores = q @ k.transpose(-2, -1)
@@ -893,7 +902,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             "test_pointwise_binary_op_int64",
             "test_binary_op",
         ): {
-            "ops_dict": POINTWISE_BINARY_OPS_INT64_DICT,
+            "ops_dict": POINTWISE_BINARY_OPS_DICT,
             "param_sets": {
                 "1d": (
                     torch.randint(-100, 100, (256,), dtype=torch.int64),
@@ -3260,6 +3269,10 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "2d": (cached_randn((512, 1024), dtype=torch.float16), 1.0),
                 "3d": (cached_randn((8, 64, 1024), dtype=torch.float16), 1.5),
                 "4d": (cached_randn((2, 4, 64, 1024), dtype=torch.float16), 2.4),
+                "1d_fp32": (cached_randn((1024,), dtype=torch.float32), 3.0),
+                "2d_fp32": (cached_randn((512, 1024), dtype=torch.float32), 1.0),
+                "3d_fp32": (cached_randn((8, 64, 1024), dtype=torch.float32), 1.5),
+                "4d_fp32": (cached_randn((2, 4, 64, 1024), dtype=torch.float32), 2.4),
             },
         },
         ("test_linear", "test_linear_fn"): {
@@ -5787,6 +5800,111 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "fp16_3d": (cached_randn((3, 5, 256), dtype=torch.float16),),
             },
         },
+        ("test_div_rounding_mode", "test_div_rounding_mode_cpu"): {
+            "param_sets": {
+                # fp16: use integer-valued inputs (randint cast to fp16) so the
+                # quotient can be computed exactly.
+                "floor_fp16_rand_2d": (
+                    "floor",
+                    torch.randint(
+                        -100,
+                        101,
+                        (67, 256),
+                        generator=torch.Generator().manual_seed(0xAF01),
+                    ).to(torch.float16),
+                    torch.randint(
+                        2,
+                        11,
+                        (67, 256),
+                        generator=torch.Generator().manual_seed(0xAF02),
+                    ).to(torch.float16),
+                ),
+                "floor_fp32_rand_2d": (
+                    "floor",
+                    cached_randn((67, 256), dtype=torch.float32, scale=50.0),
+                    cached_randn(
+                        (67, 256),
+                        dtype=torch.float32,
+                        abs=True,
+                        scale=10.0,
+                        differentiation=1,
+                    ),
+                ),
+                "floor_int64_rand_2d": (
+                    "floor",
+                    cached_randn(
+                        (67, 256), dtype=torch.float16, scale=200.0, differentiation=2
+                    ).to(torch.int64),
+                    cached_randn(
+                        (67, 256),
+                        dtype=torch.float16,
+                        abs=True,
+                        scale=20.0,
+                        differentiation=3,
+                    ).to(torch.int64),
+                ),
+                "floor_fp16_tensor_scalar": (
+                    "floor",
+                    torch.tensor([-10.5, -20.3, 30.7, -5.2], dtype=torch.float16),
+                    2.0,
+                ),
+                "floor_fp32_tensor_scalar": (
+                    "floor",
+                    torch.tensor([-10.5, -20.3, 30.7, -5.2], dtype=torch.float32),
+                    2.0,
+                ),
+                "floor_int64_tensor_scalar": (
+                    "floor",
+                    torch.tensor([-11, -21, 31, -7], dtype=torch.int64),
+                    2,
+                ),
+                "trunc_int64_rand_2d": (
+                    "trunc",
+                    cached_randn(
+                        (67, 256), dtype=torch.float16, scale=200.0, differentiation=6
+                    ).to(torch.int64),
+                    cached_randn(
+                        (67, 256),
+                        dtype=torch.float16,
+                        abs=True,
+                        scale=20.0,
+                        differentiation=7,
+                    ).to(torch.int64),
+                ),
+                # ── trunc fp16/fp32: not yet implemented ─────────────────────────
+                # The Spyre lowering raises Unsupported for trunc on float types.
+                "trunc_fp16_rand_2d": (
+                    "trunc",
+                    cached_randn(
+                        (67, 256), dtype=torch.float16, scale=50.0, differentiation=4
+                    ),
+                    cached_randn(
+                        (67, 256),
+                        dtype=torch.float16,
+                        abs=True,
+                        scale=10.0,
+                        differentiation=5,
+                    ),
+                ),
+                "trunc_fp32_rand_2d": (
+                    "trunc",
+                    cached_randn(
+                        (67, 256), dtype=torch.float32, scale=50.0, differentiation=4
+                    ),
+                    cached_randn(
+                        (67, 256),
+                        dtype=torch.float32,
+                        abs=True,
+                        scale=10.0,
+                        differentiation=5,
+                    ),
+                ),
+            },
+            "expect_fail": [
+                "trunc_fp16_rand_2d",
+                "trunc_fp32_rand_2d",
+            ],
+        },
     }
 
     def __init__(self, *args, **kwargs):
@@ -5900,8 +6018,8 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
     def test_binary_op(self, op, a, b):
         if op == torch.div:
             # TODO: Division by 0 or near-zero differs on Spyre from CPU, sidestep for now.
-            tiny_value_mask = torch.abs(b) < FP16_EPS
-            b[tiny_value_mask] = FP16_EPS
+            if isinstance(b, torch.Tensor):
+                _replace_near_zero(b)
 
         self.compare_with_cpu(op, a, b)
 
@@ -8489,6 +8607,19 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         x = cached_xavier((1, 16, 4096))
         w = cached_xavier((6144, 4096))
         self.compare_with_cpu(fn, x, w, atol=0.5, rtol=0.1)
+
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+    @pytest.mark.filterwarnings("ignore:Backend Spyre does not support int64")
+    def test_div_rounding_mode_cpu(self, rounding_mode, x, y):
+        """Test torch.div with different rounding modes."""
+
+        def fn(a, b):
+            return torch.div(a, b, rounding_mode=rounding_mode)
+
+        if isinstance(y, torch.Tensor):
+            _replace_near_zero(y)
+
+        self.compare_with_cpu(fn, x, y)
 
 
 _TEST_LARGE_MATMUL_FP32_PROXY_SHAPES = _derive_test_large_matmul_fp32_proxy_shapes(
