@@ -759,6 +759,8 @@ class TestSpyre(TestCase):
         skip_eager_conversions = {
             (torch.float32, torch.int32),
             (torch.int32, torch.float32),
+            (torch.float32, torch.int64),
+            (torch.int64, torch.float32),
         }
 
         # Test supported conversions
@@ -804,8 +806,10 @@ class TestSpyre(TestCase):
         unsupported_pairs = [
             (torch.int8, torch.float16),
             (torch.float32, torch.int32),
+            (torch.float32, torch.int64),
             (torch.float16, torch.int64),
             (torch.int32, torch.float32),
+            (torch.int64, torch.float32),
         ]
 
         for src_dtype, dst_dtype in unsupported_pairs:

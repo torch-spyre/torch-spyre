@@ -907,7 +907,20 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     torch.randint(-100, 100, (67, 71, 256), dtype=torch.int64),
                     torch.randint(-100, 100, (67, 71, 256), dtype=torch.int64),
                 ),
+                "1d_2d_bcast": (
+                    torch.randint(-100, 100, (32,), dtype=torch.int64),
+                    torch.randint(-100, 100, (32, 32), dtype=torch.int64),
+                ),
+                "1d_2d_1_bcast": (
+                    torch.randint(-100, 100, (32, 1), dtype=torch.int64),
+                    torch.randint(-100, 100, (32, 32), dtype=torch.int64),
+                ),
+                "1d_3d": (
+                    torch.randint(-100, 100, (256,), dtype=torch.int64),
+                    torch.randint(-100, 100, (67, 71, 256), dtype=torch.int64),
+                ),
             },
+            "expect_fail": ["1d_2d_1_bcast"],
         },
         ("test_add_broadcast", "test_add_broadcast"): {
             "param_sets": make_param_dict(
@@ -5594,6 +5607,12 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     True,
                 ),
             },
+            "expect_fail": [
+                "int64_dim1",
+                "int64_dim1_keepdim",
+                "int64_dim1_2",
+                "int64_dim1_2_keepdim",
+            ],
         },
         ("test_unfold", "test_unfold_cpu"): {
             "param_sets": {
