@@ -57,6 +57,7 @@ import contextlib
 import dataclasses
 import enum
 import functools
+import logging
 from collections.abc import Callable, Iterator, Sequence
 from typing import TYPE_CHECKING, Any, ClassVar, NoReturn
 
@@ -68,14 +69,23 @@ from torch_spyre._inductor.codegen.opspec_utils import (
     align_reshape_plan,
     buf_id,
     core_divisions,
+    operand_indexing,
     per_core_extent,
     placeholder_axes,
     reduction_indexing,
     row_major_strides,
 )
 from torch_spyre._inductor.constants import STAGGERED_EAS
+from torch_spyre._inductor.logging_utils import get_inductor_logger
 from torch_spyre._inductor.op_spec import LoopSpec, OpSpec, TensorArg, UnimplementedOp
 from torch_spyre._inductor.pass_utils import coeff_through_floor
+
+# The module's one logger, and the reason it has one is ``PlanFusion``: a table
+# that declines silently is worse than an extra import, and the resources a
+# fusion strands have to be reported somewhere.
+# ``logging_utils`` is not ``mlir_ktdp``, so the constraint this module actually
+# carries -- ``build_kernel_plan`` imports no dialect -- is untouched.
+logger = get_inductor_logger("codegen.ktir")
 
 # The dialect handles: one module-level name each, None until _load_dialects()
 # binds them.  Under TYPE_CHECKING they are the real imports, so `ir.Module` and
@@ -83,14 +93,23 @@ from torch_spyre._inductor.pass_utils import coeff_through_floor
 # this module requires no dialect build.
 if TYPE_CHECKING:
     from mlir_ktdp import ir
-    from mlir_ktdp.dialects import arith, func, ktdp, linalg, scf, spyreop, tensor
+    from mlir_ktdp.dialects import (
+        arith,
+        func,
+        ktdp,
+        linalg,
+        math,
+        scf,
+        spyreop,
+        tensor,
+    )
 else:
-    ir = arith = func = ktdp = linalg = scf = spyreop = tensor = None
+    ir = arith = func = ktdp = linalg = math = scf = spyreop = tensor = None
 
 
 def _load_dialects() -> None:
     """Bind the dialect handles into this module, once.  The only import site."""
-    global ir, arith, func, ktdp, linalg, scf, spyreop, tensor
+    global ir, arith, func, ktdp, linalg, math, scf, spyreop, tensor
     if ir is not None:
         return
     from mlir_ktdp import ir as _ir
@@ -98,16 +117,18 @@ def _load_dialects() -> None:
     from mlir_ktdp.dialects import func as _func
     from mlir_ktdp.dialects import ktdp as _ktdp
     from mlir_ktdp.dialects import linalg as _linalg
+    from mlir_ktdp.dialects import math as _math
     from mlir_ktdp.dialects import scf as _scf
     from mlir_ktdp.dialects import spyreop as _spyreop
     from mlir_ktdp.dialects import tensor as _tensor
 
-    ir, arith, func, ktdp, linalg, scf, spyreop, tensor = (
+    ir, arith, func, ktdp, linalg, math, scf, spyreop, tensor = (
         _ir,
         _arith,
         _func,
         _ktdp,
         _linalg,
+        _math,
         _scf,
         _spyreop,
         _tensor,
@@ -134,7 +155,7 @@ def dialect_available() -> bool:
 #
 # A message never claims a consumer is the blocker, because a consumer's answer
 # is not a property of this file: the same emitted text is accepted or rejected
-# depending on which dbo-opt build and which device.mlir it meets (``verify.py``
+# depending on which backend build and which device spec it meets (``verify.py``
 # is where that is observed, against a real one).  A refusal here says what this
 # emitter does not build.
 #
@@ -180,6 +201,15 @@ class ElemTypes:
     dtypes that map to them, and the unsupported-dtype rejection are one place.
     The two fp16 device formats both map to ``f16``; extend ``NAMES`` (never fall
     through silently) as new dtypes are supported.
+
+    ``FUSED`` is the second key: ``ElementArrangement.EXX2`` -- "reduction mode:
+    two values per stick" -- is a buffer holding a mean and a mean of squares
+    TOGETHER, which the dialect spells as one element of ``!spyreop.fp16_fused``
+    rather than as two of ``f16``.  So the lookup is
+    ``(device_dtype, element_arrangement) -> spelling``: the arrangement selects
+    the table and the dtype the row.  MEASURED: ``ir.Type.parse`` resolves both
+    fused spellings once ``ktdp.register_dialects`` has run, so ``named_type``
+    needs nothing added for them.
     """
 
     NAMES: ClassVar[dict[DataFormats, str]] = {
@@ -190,20 +220,36 @@ class ElemTypes:
         DataFormats.IEEE_INT32: "i32",
     }
 
+    # Only the two formats the dialect has a fused spelling for.  An arrangement
+    # this table has no row for is refused rather than silently unfused: a pair
+    # read as a single float is the wrong half of a statistic, and it would
+    # compile.
+    FUSED: ClassVar[dict[DataFormats, str]] = {
+        DataFormats.IEEE_FP16: "!spyreop.fp16_fused",
+        DataFormats.SEN169_FP16: "!spyreop.fp16_fused",
+        DataFormats.IEEE_FP32: "!spyreop.fp32_fused",
+    }
+
     storage: str
     value: str
 
     @classmethod
-    def of(cls, dtype: DataFormats) -> ElemTypes:
-        """The storage/value pair for a device dtype, or raise.
+    def of(cls, dtype: DataFormats, arrangement: Any = None) -> ElemTypes:
+        """The storage/value pair for a device dtype and arrangement, or raise.
 
         One ``device_dtype`` means one type on both sides today; a load that
         reinterprets is why the record has two fields.
+
+        ``arrangement`` is a *type* selection and not a stride adjustment (the
+        pair is one element, so ``_arrangement_layout`` leaves the extent alone
+        for it), which is why it is read here as well as there.
         """
-        name = cls.NAMES.get(dtype)
+        table = cls.FUSED if arrangement is ElementArrangement.EXX2 else cls.NAMES
+        name = table.get(dtype)
         if name is None:
             raise NotImplementedError(
                 f"OpSpec->KTIR: unsupported device dtype {dtype!r}"
+                + (" at element arrangement EXX2" if table is cls.FUSED else "")
             )
         return cls(storage=name, value=name)
 
@@ -255,7 +301,19 @@ class Layout:
 
 @dataclasses.dataclass(frozen=True)
 class Buffer:
-    """One unique buffer referenced by the kernel; sole input to a memory view."""
+    """One ACCESS's view of a buffer; sole input to a memory view.
+
+    Two kinds of field, and the difference is why there is a record per access
+    rather than one per buffer: ``buf_id``, ``arg_index`` and ``base_elements``
+    are IDENTITY and ADDRESS, which every access to the buffer shares (they key
+    ``plan.parameters`` and ``KtirBuilder.bases``), while ``layout``, ``elems`` and
+    ``space`` are how THIS access views it, and two stages legitimately differ (see
+    ``KernelPlan._access_of`` for the measured case that needs this).
+
+    ``KernelPlan.buffers`` holds one of these per ``buf_id`` -- the first seen --
+    and what it is held for is the identity half: the signature has one parameter
+    per buffer however many ways the stages view it.
+    """
 
     buf_id: str  # opspec_utils.buf_id(arg)
     arg_index: int  # position in the kernel call; -1 => not a kernel argument
@@ -280,15 +338,16 @@ class Access:
     ``scf.for`` for the rest.  A division and a loop differ only in where that
     index comes from, so one matrix covers both.  The record holds
     the coefficients only -- the variables exist during emission, not during
-    planning -- and the builder zips them against the loops it has open.  This is
-    the design's ``base_map`` as a matrix; the builder spells it the way
-    hand-written loop kernels do, an identity ``base_map`` with one index
-    expression per view dim, rather than a non-identity map over the induction
-    variables.  The matrix is the same either way.
+    planning -- and the builder zips them against the loops it has open.  The
+    builder spells it the way hand-written loop kernels do, an identity ``base_map``
+    with one index expression per view dim, rather than a non-identity map over the
+    induction variables; the matrix is the same either way.
 
     ``elems`` is the access's own element type pair: a tile of an internal buffer
     has no ``Buffer`` to read one from, and a load that reinterprets would differ
-    from its buffer's storage type anyway.
+    from its buffer's storage type anyway.  Its DERIVATION is the buffer's
+    arrangement unless the recipe says the operand reads the buffer unfused
+    (``Recipe.unfused``), which is why it is passed in rather than read off the arg.
 
     ``buffer`` is what the access is a tile *of*, so a record carries its own way
     back to the view; ``None`` for an internal (threaded) buffer, which has no
@@ -348,14 +407,24 @@ class Indexing:
     No ``extents`` field: ``linalg.generic`` infers its loop bounds from the
     operand shapes and the maps, so nothing would read one.
 
-    A row is a bare dim index per position, which is every map in scope and not
-    every map there is: a *linearised* map such as
+    ``None`` in a row is the CONSTANT 0 result position: an axis the operand does
+    not walk, read at its first element for every iteration.  It is what the three
+    broadcast forms are made of -- ``(d0,d1,d2) -> (d1, 0)`` reads a statistic at
+    the head of its stick, ``(d0,d1) -> (d0, 0)`` splats it back across one, and
+    ``(d0,d1,d2) -> (d0, 0, d2)`` reads one row of a weight for every row of the
+    output.  Zero and not an arbitrary constant, because a tile is placed by its
+    access indices and an operand axis that walks nothing is read at the tile's own
+    origin; a non-zero offset would be an addressing decision, and addressing is
+    ``Access.index_coeffs``' business.
+
+    A row is otherwise a bare dim index per position, which is every map in scope
+    and not every map there is: a *linearised* map such as
     ``(d0, d1, d2, d3, d4) -> (d0, d2 * 64 + d3, d4)`` needs (coefficient, dim)
     terms, so nothing here generalises to one for free.
     """
 
     iters: tuple[str, ...]  # PARALLEL | REDUCTION, one per iteration dim
-    maps: tuple[tuple[int, ...], ...]  # [operand][result position] -> dim
+    maps: tuple[tuple[int | None, ...], ...]  # [operand][position] -> dim or const 0
 
 
 @dataclasses.dataclass(frozen=True)
@@ -382,6 +451,13 @@ class ComputeStep:
     the order the builder is called with them.  A tuple rather than a dict so the
     record stays hashable and frozen like every other field, and empty for every
     op that is a pure function of its operands, which is almost all of them.
+
+    ``stage`` is this step's position in the kernel's stage order, counted over
+    the whole step tree (loop bodies included) by ``KernelPlan._stages``.  One
+    compute is one stage, which is the backend's own granularity: MEASURED, one
+    compute becomes one ``local_schedule`` module.  It is on the step because the
+    memory views a step tiles are per stage (see ``KtirBuilder.view``), so the
+    emitter needs to know which stage is asking before it can answer with a view.
     """
 
     op: str  # a KtirBuilder.RECIPES key
@@ -390,6 +466,7 @@ class ComputeStep:
     out: Access
     out_buf_id: str
     store: bool
+    stage: int = 0
     reduce_dims: tuple[int, ...] = ()
     indexing: Indexing | None = None
     attrs: tuple[tuple[str, float], ...] = ()
@@ -398,6 +475,14 @@ class ComputeStep:
     # no spec.  The format rather than the arm itself, because an arm holds a
     # deferred dialect reference and a step stays dialect-free.
     dtype: DataFormats | None = None
+    # Whether any operand was broadcast against the output.  Carried for exactly
+    # the reason ``dtype`` is: emission re-resolves the arm and has no spec in
+    # reach to ask.  The two fields together are the ``Request`` the plan
+    # dispatched on, so the arm emission resolves is the arm the surface on this
+    # step was chosen from -- and neither field pulls a dialect handle onto the
+    # step.  It is not derivable from ``surface`` alone: a GENERIC step is what a
+    # broadcast operand forces, but also what any scalar PAYLOAD needs.
+    broadcast: bool = False
 
 
 def dtype_of(spec: OpSpec) -> DataFormats:
@@ -589,6 +674,16 @@ def _grown_extent(tile: Any, levels: Sequence[Level], steps: Sequence[int]) -> A
     return _static(extent)
 
 
+def _arrangement(arg: TensorArg) -> Any:
+    """``arg``'s element arrangement, read in one place.
+
+    ``getattr`` because the field is a late addition to ``TensorArg`` and this
+    module is handed args built by other layers; the default is the standard
+    order, which is what an arg that does not carry the field means.
+    """
+    return getattr(arg, "element_arrangement", None)
+
+
 def _arrangement_layout(
     arrangement: Any, extent: tuple[Any, ...], strides: tuple[Any, ...]
 ) -> tuple[tuple[Any, ...], tuple[Any, ...]]:
@@ -599,8 +694,22 @@ def _arrangement_layout(
     stride selector, of the shape the SDSC path already uses for a stick split.
 
     Label: ``staggered-element-arrangement``.
+
+    ``EXX2`` passes through with STANDARD, and that is the whole of its layout
+    rule: a mean and a mean of squares held together are ONE element of
+    ``!spyreop.fp16_fused``, so the buffer has the rank, extent and row-major
+    strides its ``device_size`` states and the pair is a fact about the element
+    TYPE (``ElemTypes.of``) rather than about the addressing.  MEASURED against a
+    hand-written reference module for this op, whose fused output view is
+    ``memref<256x64x!spyreop.fp16_fused>`` -- the same 256x64 an f16 output of
+    that reduction would have, at the same strides.
     """
-    if arrangement in (None, ElementArrangement.STANDARD, ElementArrangement.QFP8CH):
+    if arrangement in (
+        None,
+        ElementArrangement.STANDARD,
+        ElementArrangement.QFP8CH,
+        ElementArrangement.EXX2,
+    ):
         return extent, strides
     if arrangement in STAGGERED_EAS:
         _unimplemented(
@@ -634,7 +743,7 @@ def _layout(
         for i in range(len(tile))
     )
     extent, strides = _arrangement_layout(
-        getattr(arg, "element_arrangement", None),
+        _arrangement(arg),
         extent,
         tuple(row_major_strides(extent)),
     )
@@ -731,6 +840,32 @@ def _squeezed(arg: TensorArg, axes: Sequence[int]) -> TensorArg:
     )
 
 
+def _reads_stick_head(arg: TensorArg) -> bool:
+    """Whether this INPUT reads a statistic sitting at the head of each stick.
+
+    The signature of one: the innermost device axis carries a CONSTANT coordinate
+    -- so no iteration dim walks it -- over a whole stick of elements.  That is
+    what a reduction writes (MEASURED: our on-stick reductions produce
+    ``[.., 64]`` at coordinate ``0``, because the hardware writes a whole stick at
+    a time and the opaque reduction needs the rest of the stick to get the result
+    to element 0), and a consumer of it wants the one element at the head.
+
+    Asked of INPUTS only, and the producer is why: its output has exactly this
+    shape and must keep writing all 64 lanes.
+
+    Not "extent 1 already": a tile of one element is not a statistic read, it is
+    an operand somebody already described that way, and there is nothing to narrow.
+
+    A COARSE-TILED arg carries no coordinates at all (it addresses through
+    ``device_tile_advance_expr``), so there is nothing here to read and it is not
+    one of these: the question is about a coordinate, not about an extent.
+    """
+    if not arg.is_input or not len(arg.device_coordinates):
+        return False
+    coord = arg.device_coordinates[-1]
+    return not getattr(coord, "free_symbols", None) and int(arg.device_size[-1]) > 1
+
+
 def _reduce_surface(
     iters: Sequence[str], in_map: Sequence[int], out_map: Sequence[int]
 ) -> Surface:
@@ -759,19 +894,75 @@ def _reduce_surface(
     )
 
 
+def _reduction_nest(
+    spec: OpSpec,
+) -> tuple[TensorArg, tuple[str, ...], tuple[int, ...], tuple[int, ...]]:
+    """The iteration nest ``spec``'s reduction asks for, derived once.
+
+    ``(out, iters, in_map, out_map)``, where ``out`` is the output arg with its
+    placeholder axes squeezed away -- the same arg every later derivation in
+    ``_compute_step`` uses, which is why the squeeze belongs here rather than
+    beside the caller: a second derivation of this nest would be a second answer
+    to drift from.
+
+    Roles are read straight off ``args`` rather than through
+    ``validated_roles``, which asks ``RECIPES`` for the arity: this runs on
+    prospective fusion survivors too, and a fusion table must be able to ask
+    about a spec before deciding to give it a name the table has a recipe for.
+    Every reduction in scope is unary, so a non-unary one is refused here rather
+    than unpacked.
+    """
+    inputs = [arg for arg in spec.args if arg.is_input]
+    outputs = [arg for arg in spec.args if not arg.is_input]
+    if len(inputs) != 1 or len(outputs) != 1:
+        raise NotImplementedError(
+            f"OpSpec->KTIR: reduction {spec.op!r} takes {len(inputs)} input(s) and "
+            f"writes {len(outputs)} output(s); a reduction here is one of each"
+        )
+    [source], [out] = inputs, outputs
+    placeholder = placeholder_axes(
+        out.device_coordinates, [int(s) for s in out.device_size]
+    )
+    if placeholder:
+        # The projection leaves an axis the op does not write in the output as a
+        # unit extent; the reduced tile does not have it at all.
+        out = _squeezed(out, placeholder)
+    iters, in_map, out_map = reduction_indexing(
+        source.device_coordinates,
+        [int(s) for s in source.device_size],
+        out.device_coordinates,
+        [int(s) for s in out.device_size],
+    )
+    return out, tuple(iters), tuple(in_map), tuple(out_map)
+
+
+def _reduction_surface(spec: OpSpec) -> Surface:
+    """Which surface ``_compute_step`` will choose for this reduction.
+
+    Extracted from ``_compute_step`` so the fusion table's viability predicates
+    can ask the question before the step exists, and so there is exactly ONE
+    derivation of it: if a second derivation drifts from this one, a fusion admits
+    a form the device computes wrongly.
+
+    For a reduction, ``Surface.GENERIC`` is "on-stick": the within-stick axis is
+    among the reduced dims, so the nest is not what ``linalg.reduce`` means.
+    """
+    _out, iters, in_map, out_map = _reduction_nest(spec)
+    return _reduce_surface(iters, in_map, out_map)
+
+
 def _parallel_surface(
     arm: Arm, operands: int, rank: int
 ) -> tuple[Surface, Indexing | None]:
-    """Which shape carries a non-reducing payload, and what it has to state.
+    """Which shape carries a non-reducing payload whose operands are ALIGNED.
 
-    Nothing is *derived* here and nothing needs to be: the pointwise arm's
-    alignment refusal has already established that every operand's coordinates
-    and extents equal the output's, which is precisely the identity condition, so
-    the maps are known rather than read off the coordinates.  Deriving them
-    instead would make the emitted form of ``add`` hostage to the dim-reuse rule
-    ``reduction_indexing`` needs -- a coordinate list that repeated a
-    classification would yield a non-identity map and silently turn a
-    ``linalg.add`` into a ``linalg.generic``.
+    Nothing is *derived* here and nothing needs to be: ``align_reshape_plan`` has
+    already answered that every operand's coordinates and extents equal the
+    output's, which is precisely the identity condition, so the maps are known
+    rather than read off the coordinates.  Deriving them instead would make the
+    emitted form of ``add`` hostage to the dim-reuse rule ``reduction_indexing``
+    needs -- a coordinate list that repeated a classification would yield a
+    non-identity map and silently turn a ``linalg.add`` into a ``linalg.generic``.
 
     So the choice is only about spelling, and it follows from the binding: a
     ``NAMED`` builder is an op the dialect already has, which says its own
@@ -779,6 +970,9 @@ def _parallel_surface(
     maps and the all-parallel iterators itself -- which only a generic can do.
     That second arm is where a ``spyreop`` intrinsic lands: it is a scalar builder,
     so there is nothing to call it but a region.
+
+    ``_broadcast_surface`` is the other arm of the same question, for operands
+    alignment says do NOT match the output.
     """
     if arm.kind is BindingKind.NAMED:
         return Surface.BARE, None
@@ -789,11 +983,61 @@ def _parallel_surface(
     )
 
 
+def _broadcast_surface(
+    arm: Arm,
+    out: TensorArg,
+    inputs: Sequence[TensorArg],
+    accesses: dict[str, Access],
+) -> tuple[Surface, Indexing | None]:
+    """The same question for operands that do NOT all match the output.
+
+    ``align_reshape_plan`` is the switch between this and ``_parallel_surface``:
+    it answers ``None`` exactly when an operand's coordinates and extents are the
+    output's, and an operand it has something to say about is one whose map row has
+    to be read off the coordinates (``operand_indexing``).
+
+    Every row is derived, including the aligned operands' (which come back as the
+    identity), because ``indexing_maps`` is one attribute: a generic states a row
+    per operand or none at all.  The result's row is the identity, because a
+    pointwise op writes every element of its output once.
+
+    The extents compared are the TILE extents from ``accesses``, not the buffers':
+    a ``linalg`` operand's shape is what was loaded, and a broadcast operand is
+    loaded at one element on the axis it does not walk.
+    """
+    out_extent = accesses[buf_id(out)].extent
+    rank = len(out_extent)
+    rows = tuple(
+        operand_indexing(
+            list(arg.device_coordinates),
+            accesses[buf_id(arg)].extent,
+            list(out.device_coordinates),
+            out_extent,
+        )
+        for arg in inputs
+    )
+    if arm.kind is BindingKind.NAMED:
+        # A named linalg op states its own indexing, which is the identity, so
+        # there is nowhere to put a derived row.  Refused rather than forced into a
+        # generic: what would go in that generic's body is a scalar spelling of the
+        # op (``arith.subf`` for ``linalg.sub``) that no recipe declares, and
+        # calling a whole-op builder with two scalars does not build.
+        raise NotImplementedError(
+            f"OpSpec->KTIR: operand of {out.name!r}'s op is broadcast against the "
+            f"output ({rows}), but the op is a named linalg op, which states its "
+            "own indexing; broadcast operands are supported on ops whose payload "
+            "is a scalar builder"
+        )
+    identity = tuple(range(rank))
+    return Surface.GENERIC, Indexing(iters=(PARALLEL,) * rank, maps=(*rows, identity))
+
+
 def _access(
     arg: TensorArg,
     extent: Sequence[Any],
     rows: Sequence[Sequence[int]],
     layout: Layout,
+    elems: ElemTypes,
     buffer: Buffer | None = None,
 ) -> Access:
     """The access record for one ``(OpSpec, TensorArg)``.
@@ -821,7 +1065,7 @@ def _access(
     return Access(
         extent=extent,
         index_coeffs=index_coeffs,
-        elems=ElemTypes.of(arg.device_dtype),
+        elems=elems,
         buffer=buffer,
     )
 
@@ -830,8 +1074,8 @@ def _access(
 # KernelPlan: everything the builder is given
 # ---------------------------------------------------------------------------
 #
-# The plan is the whole instruction list: the grid, the buffers whose views and
-# func parameters the kernel opens with, and the step tree that goes in its body.
+# The plan is the whole instruction list: the grid, the buffers whose func
+# parameters the kernel opens with, and the step tree that goes in its body.
 # It is built by one walk of the spec tree, which is where the derivations run
 # and therefore where every rejection is raised.  Emission consumes the plan and
 # reads no spec, so it cannot discover a reason to refuse half-way through.
@@ -855,9 +1099,14 @@ def is_internal(arg: TensorArg) -> bool:
 
     The two emitters answer differently because their granularity differs: one
     ``sdsc_execute`` per OpSpec forces SDSC to materialise the intermediate into
-    the allocation it was given, while one KTIR func for the whole kernel lets it
-    stay an SSA value -- no store, no view, no parameter, and no address for the
-    scheduler to honour, which is what "the scheduler owns buffering" means here.
+    the allocation it was given, while one KTIR func for the whole kernel CAN
+    keep it as an SSA value -- no store, no view, no parameter, and no address
+    for the scheduler to honour.
+
+    Can, not must, and the difference is why this predicate is not the same
+    question as "how is this buffer handled": threading only carries a value that
+    never crosses a compute stage, and ``_check_threaded_buffers`` states what
+    happens to the rest.
     """
     # Named positively: an allocation this emitter does not recognise at all is
     # not silently threaded, it reaches ``_buffer`` and is refused there.
@@ -912,7 +1161,7 @@ class PlanOptions:
     instead of a func argument, because ``ktdp.load`` requires a static memref
     offset, which a constant base gives only when the consumer is a ``linalg``
     op.  Canonical KTIR is symbolic; baking is the dataflow-scheduler#65
-    workaround that dbo-opt requires.  The SDSC path makes the same choice from
+    workaround that the backend compiler requires.  The SDSC path makes the same choice from
     ``config.bundle_symbolic_args``.
     """
 
@@ -984,6 +1233,10 @@ class KernelPlan:
         self._divisors: dict = {}
         self.buffers: dict[str, Buffer] = {}
         self.steps: tuple[Step, ...] = ()
+        # Handed out by ``_stages``, one per ``ComputeStep``, across the whole
+        # tree: a step in a loop body is as much a stage as a top-level one, and
+        # the count is what says how many stages the kernel has.
+        self._next_stage = 0
 
     @property
     def parameters(self) -> list[Buffer]:
@@ -992,6 +1245,11 @@ class KernelPlan:
         Ascending ``arg_index`` matches the positional order ``call_kernel``
         passes to ``.run(...)``, so the emitted func signature lines up with
         that binding.
+
+        KNOWN GAP: a plan-time fusion can delete a buffer the caller still
+        passes, so with the planners off this list can be one shorter than the
+        call site's argument list.  Invisible on the path that runs, whose bases
+        are baked constants and whose func takes no arguments.
         """
         return sorted(
             (e for e in self.buffers.values() if e.arg_index >= 0),
@@ -1000,6 +1258,13 @@ class KernelPlan:
 
     def add_specs(self, specs: Sequence[OpSpec | LoopSpec | UnimplementedOp]) -> None:
         """Plan ``specs`` into this plan's grid, buffers and steps."""
+        # FIRST, and before ``_divisions``: fusing first is what makes the grid a
+        # fact about the ops the kernel actually runs.  ``_divisions`` insists every
+        # op ask for the same division, and the two specs of an absmax pair name
+        # theirs in different symbol namespaces, so a divided pair is
+        # self-contradictory right up until the fusion deletes one of them.  The
+        # result is held, so ``_stages`` walks the same vector ``_divisions`` saw.
+        specs = apply_plan_fusions(specs)
         self._symbols, self.divisions = _divisions(specs)
         self._divisors = {
             symbol: division.div
@@ -1009,10 +1274,11 @@ class KernelPlan:
         for division in self.divisions:
             cores *= division.div
         self.grid = (cores,)
-        self.steps = self._steps(specs, ())
-        self._check_internal_buffers(self.steps)
+        self._next_stage = 0
+        self.steps = self._stages(specs, ())
+        self._check_threaded_buffers(self.steps)
 
-    def _check_internal_buffers(self, steps: Sequence[Step]) -> None:
+    def _check_threaded_buffers(self, steps: Sequence[Step]) -> None:
         """A threaded buffer must be produced before it is read, and then read.
 
         A threaded value has no memory behind it, so the kernel has to contain
@@ -1021,9 +1287,25 @@ class KernelPlan:
         the kernel boundary disagree -- and the buffer needs materialising
         instead.  Refused here rather than emitted: an unread producer would
         silently write nowhere, and an unproduced consumer has no value to read.
+
+        Both ends present is not sufficient: a threaded value must also not cross
+        a COMPUTE STAGE, which is asked here too.  MEASURED: the backend compiler *aborts*
+        on such a kernel rather than refusing it, so letting one through returns a
+        crash rather than a diagnosis.
+
+        The refusal names the two planning flags because they are the fix.  A
+        buffer is threaded only because memory planning CLAIMED it (``lx`` /
+        ``hbm_pool``), which is what keeps it out of ``spyre_kernel_args`` at
+        ``arg_index == -1``; MEASURED with both planners off, the same intermediate
+        arrives as an ordinary ``hbm`` buffer the wrapper allocates and passes, and
+        a two-stage kernel then compiles and runs correctly with no emitter change.
         """
         unread: dict[str, None] = {}  # threaded, produced, not yet read
         produced: set[str] = set()
+        # The stage each threaded buffer was produced in, so that a read from a
+        # different one is recognised.  The stage counter runs across the whole
+        # tree, so "another stage" is exactly "another step", loop bodies included.
+        produced_in: dict[str, int] = {}
 
         def walk(steps: Sequence[Step]) -> None:
             for step in steps:
@@ -1041,9 +1323,23 @@ class KernelPlan:
                             "op in this kernel produces it; its producer is in "
                             "another kernel, which needs the buffer materialised"
                         )
+                    if produced_in[read_id] != step.stage:
+                        raise NotImplementedError(
+                            f"OpSpec->KTIR: buffer {read_id!r} is an intermediate "
+                            "this kernel owns, so it is threaded as a value -- but "
+                            f"it is written in stage {produced_in[read_id]} and read "
+                            f"in stage {step.stage}, and a value cannot cross a "
+                            "compute stage: the backend aborts on it. Memory "
+                            "planning claimed this buffer, which is what makes it "
+                            "threaded; set LX_PLANNING=0 and HBM_POOL_PLANNING=0 so "
+                            "it stays an ordinary HBM buffer that the wrapper "
+                            "allocates and passes, and this kernel emits a store "
+                            "and a load instead"
+                        )
                     unread.pop(read_id, None)
                 if not step.store:
                     produced.add(step.out_buf_id)
+                    produced_in[step.out_buf_id] = step.stage
                     unread[step.out_buf_id] = None
 
         walk(steps)
@@ -1056,13 +1352,19 @@ class KernelPlan:
                 "materialised"
             )
 
-    def _steps(self, specs, loops: Sequence[LoopSpec]) -> tuple[Step, ...]:
+    def _stages(self, specs, loops: Sequence[LoopSpec]) -> tuple[Step, ...]:
         """Recursive: the steps for one spec list, inside the ``loops`` chain.
 
         ``loops`` is the enclosing ``LoopSpec`` chain, outermost-first, which is
         what ``_levels`` zips ``OpSpec.tiled_symbols`` against.  A nested list
         becomes a nested ``LoopStep.body``, so the step tree's nesting is the
         spec tree's nesting and the emitter never has to work out the depth.
+
+        Named for the stage rather than the step because numbering the stages is
+        what this walk does that emission cannot: a spec is a stage, and only the
+        walk sees the specs in one order across the nesting.  ``self._next_stage``
+        rather than a parameter, so the recursion cannot restart the count in a
+        loop body and hand two stages the same number.
         """
         steps: list[Step] = []
         for entry in specs:
@@ -1080,7 +1382,7 @@ class KernelPlan:
                         "a symbolic trip count is not supported yet"
                     )
                 steps.append(
-                    LoopStep(trip=trip, body=self._steps(entry.body, [*loops, entry]))
+                    LoopStep(trip=trip, body=self._stages(entry.body, [*loops, entry]))
                 )
                 continue
             if not isinstance(entry, OpSpec):
@@ -1092,11 +1394,12 @@ class KernelPlan:
                     f"OpSpec->KTIR: op {entry.op!r} is not supported yet "
                     f"(registered: {sorted(KtirBuilder.RECIPES)})"
                 )
-            # One question about the op name, then one about its format: whether
-            # the op exists at all is the table's business, and which of its
-            # spellings this request reaches is the recipe's.
-            arm = KtirBuilder.RECIPES[entry.op].arm(dtype_of(entry))
-            if (arm.kind is BindingKind.COMBINER) != bool(entry.is_reduction):
+            # The RECIPE and not an arm: reduction-ness is an op fact, which every
+            # arm agrees on, and asking it without an arm is what lets the ONE arm
+            # selection happen later in ``_compute_step``, once the operands have
+            # been squeezed and it is known whether any of them is broadcast.
+            recipe = KtirBuilder.RECIPES[entry.op]
+            if recipe.reduces != bool(entry.is_reduction):
                 # Two independent statements of one bit -- what the recipe's
                 # binding accumulates, and what the frontend labelled the request
                 # -- and both directions are silent if unchecked.  An 'add' asked
@@ -1107,13 +1410,17 @@ class KernelPlan:
                 # one thing the plan/emission split exists to rule out.
                 raise NotImplementedError(
                     f"OpSpec->KTIR: op {entry.op!r} is registered as "
-                    f"{arm.kind.name} but this spec asks for "
+                    f"{_arms(recipe.arms)[0].kind.name} but this spec asks for "
                     f"{'a reduction' if entry.is_reduction else 'an elementwise op'}"
                 )
-            steps.append(self._compute_step(entry, loops))
+            stage = self._next_stage
+            self._next_stage += 1
+            steps.append(self._compute_step(entry, loops, stage))
         return tuple(steps)
 
-    def _compute_step(self, spec: OpSpec, loops: Sequence[LoopSpec]) -> ComputeStep:
+    def _compute_step(
+        self, spec: OpSpec, loops: Sequence[LoopSpec], stage: int
+    ) -> ComputeStep:
         """One op: roles/arity, aliasing, alignment, its buffers and its accesses.
 
         Every derivation for this op runs here, once: the layout and per-level
@@ -1122,10 +1429,8 @@ class KernelPlan:
         emission has nothing left to derive.
         """
         out, inputs = validated_roles(spec)
-        out_extents = [int(s) for s in out.device_size]
         dtype = dtype_of(spec)
         recipe = KtirBuilder.RECIPES[spec.op]
-        arm = recipe.arm(dtype)
         for arg in inputs:
             # In-place (input buffer aliases the output) is not supported yet.
             if buf_id(arg) == buf_id(out):
@@ -1134,33 +1439,22 @@ class KernelPlan:
                 )
         reduce_dims: tuple[int, ...] = ()
         indexing: Indexing | None = None
-        args = list(spec.args)
         if spec.is_reduction:
             # What iteration nest a reduction wants is a fact about its operands'
             # coordinates, so it is derived here (once) and carried on the step,
-            # not re-derived from the op name at emit time.  Every reduction in
-            # scope is unary, which is why the derivation takes one input.
-            [source] = inputs
-            placeholder = placeholder_axes(out.device_coordinates, out_extents)
-            if placeholder:
-                # The projection leaves an axis the op does not write in the output
-                # as a unit extent; the reduced tile does not have it at all.
-                # Squeezing the arg here, once and before ``_access_of``, is what
-                # keeps every derivation after this point unaware that a reduction
-                # is different: the output's view, tile, per-core division and
-                # stored tensor are all the same (lower) rank.  It stays gated on
-                # ``is_reduction`` because an *accepted* pointwise spec can carry a
-                # unit constant axis on its inputs too, and squeezing only the
-                # output would hand ``linalg.add`` operands of two ranks.
-                squeezed = _squeezed(out, placeholder)
-                args = [squeezed if arg is out else arg for arg in args]
+            # not re-derived from the op name at emit time.
+            squeezed, iters, in_map, out_map = _reduction_nest(spec)
+            if squeezed is not out:
+                # ``_reduction_nest`` squeezed the output's placeholder axes away.
+                # Substituting the squeezed arg here, once and before
+                # ``_access_of``, is what keeps every derivation after this point
+                # unaware that a reduction is different: the output's view, tile,
+                # per-core division and stored tensor are all the same (lower)
+                # rank.  It stays gated on ``is_reduction`` because an *accepted*
+                # pointwise spec can carry a unit constant axis on its inputs too,
+                # and squeezing only the output would hand ``linalg.add`` operands
+                # of two ranks.
                 out = squeezed
-            iters, in_map, out_map = reduction_indexing(
-                source.device_coordinates,
-                [int(s) for s in source.device_size],
-                out.device_coordinates,
-                [int(s) for s in out.device_size],
-            )
             surface = _reduce_surface(iters, in_map, out_map)
             reduce_dims = tuple(
                 dim for dim, iterator in enumerate(iters) if iterator == REDUCTION
@@ -1170,25 +1464,88 @@ class KernelPlan:
                 # travel with the step: the input covers three of four dims and
                 # the lane axis is reduced on the way in and kept on the way out.
                 indexing = Indexing(iters=iters, maps=(in_map, out_map))
-        else:
-            surface, indexing = _parallel_surface(arm, len(inputs), len(out_extents))
-            for arg in inputs:
-                # Reject broadcast / transpose operands: only operands whose
-                # device axes already match the output tile exactly are supported.
-                if (
-                    align_reshape_plan(
-                        list(arg.device_coordinates),
-                        [int(s) for s in arg.device_size],
-                        list(out.device_coordinates),
-                        out_extents,
-                    )
-                    is not None
-                ):
-                    raise NotImplementedError(
-                        "OpSpec->KTIR: broadcast / reshape operands not supported yet"
-                    )
         levels = _levels(spec, loops)
-        accesses = {buf_id(arg): self._access_of(arg, levels) for arg in args}
+        broadcast = False
+        if not spec.is_reduction:
+            # A read of a statistic is squeezed the way its PRODUCER's output was,
+            # so the reader's access has the rank of the buffer the producer
+            # registered -- MEASURED, a reduction writes ``(256, 64)`` and its
+            # consumer's spec describes the same buffer as ``(1, 256, 64)``.
+            #
+            # Pointwise only, and ``_reduction_nest`` is the reason: it reads the
+            # INPUT's coordinates straight off the spec to derive ``in_map``, so
+            # squeezing a reduction's input here would leave the map describing a
+            # rank the loaded tensor no longer has.
+            inputs = [
+                _squeezed(
+                    arg,
+                    placeholder_axes(
+                        arg.device_coordinates, [int(s) for s in arg.device_size]
+                    ),
+                )
+                if _reads_stick_head(arg)
+                else arg
+                for arg in inputs
+            ]
+            # ``align_reshape_plan`` is the SWITCH, not a refusal (see
+            # ``_broadcast_surface``).  Asked of every operand, because it is a
+            # property of the whole op: one broadcast operand makes the op a
+            # generic, and the aligned operands then need their (identity) rows
+            # stated alongside it.  Here rather than below the accesses, because the
+            # ARM is chosen on it and the surface is chosen from the arm; what needs
+            # the accesses is ``_broadcast_surface``, whose map rows are about TILE
+            # extents, and that call stays below them.
+            broadcast = any(
+                align_reshape_plan(
+                    list(arg.device_coordinates),
+                    [int(s) for s in arg.device_size],
+                    list(out.device_coordinates),
+                    [int(s) for s in out.device_size],
+                )
+                is not None
+                for arg in inputs
+            )
+        # The op's spelling, chosen ONCE, from the whole request: the format, plus
+        # whether an operand is broadcast (never, for a reduction, whose shape comes
+        # from ``_reduce_surface`` -- the arm is asked for there only so that an op
+        # that does not exist at this format is refused by the plan regardless).
+        arm = recipe.arm(dtype, broadcast=broadcast)
+        # Positions are the inputs in operand order and then the result, which is
+        # what ``Recipe.unfused`` names: the element type an access reads a buffer
+        # AT is the op's business, not the buffer's arrangement (see ``unfused``).
+        accesses: dict[str, Access] = {}
+        for position, arg in enumerate((*inputs, out)):
+            access = self._access_of(
+                arg,
+                levels,
+                head=_reads_stick_head(arg),
+                unfused=position in recipe.unfused,
+            )
+            earlier = accesses.get(buf_id(arg))
+            if earlier is not None and earlier.elems != access.elems:
+                # Two accesses to one buffer at two element types WITHIN ONE STAGE.
+                # The views are keyed ``(stage, buf_id)``, so the second would
+                # silently take the first's view and load the wrong element type --
+                # refused rather than keyed more finely, because neither target
+                # needs it: the chain's stage 2 reads the pair base only as f16,
+                # and the two types it does need are in two different stages.
+                raise NotImplementedError(
+                    f"OpSpec->KTIR: op {spec.op!r} reads buffer {buf_id(arg)!r} as "
+                    f"both {earlier.elems.storage} and {access.elems.storage} in one "
+                    "stage; a stage has one view per buffer, so two element types "
+                    "in one stage are not supported"
+                )
+            accesses[buf_id(arg)] = access
+        if not spec.is_reduction:
+            # The two shapes a pointwise op can take, on the same bit that chose
+            # the arm: the arm says what can be spelled, ``broadcast`` says what
+            # has to be.
+            if broadcast:
+                surface, indexing = _broadcast_surface(arm, out, inputs, accesses)
+            else:
+                surface, indexing = _parallel_surface(
+                    arm, len(inputs), len(accesses[buf_id(out)].extent)
+                )
         # Every division must move this op's output: cores divide work by writing
         # different elements, so a division no output axis follows is cores
         # duplicating each other rather than sharing.  An *input* may legitimately
@@ -1204,11 +1561,9 @@ class KernelPlan:
                     "same elements; dividing the within-stick axis or a reduced "
                     "axis (which needs a cross-core combine) reads like this"
                 )
-        # The scalar arguments the payload builder takes beyond its operands are
-        # read here, once, from the spec's ``op_info`` -- the same place-and-time
-        # discipline as ``reduce_dims`` and ``indexing`` -- so emission has nothing
-        # left to derive and a malformed ``op_info`` is refused by the plan rather
-        # than by a KeyError with a half-built module in hand.
+        # The scalar arguments the payload builder takes beyond its operands, read
+        # from ``op_info`` here so that a malformed one is refused by the plan
+        # rather than by a KeyError with a half-built module in hand.
         attrs: tuple[tuple[str, float], ...] = ()
         if recipe.attrs is not None:
             attrs = tuple(recipe.attrs(spec.op_info).items())
@@ -1218,41 +1573,76 @@ class KernelPlan:
             ins=tuple((buf_id(arg), accesses[buf_id(arg)]) for arg in inputs),
             out=accesses[buf_id(out)],
             out_buf_id=buf_id(out),
+            stage=stage,
             reduce_dims=reduce_dims,
             indexing=indexing,
             attrs=attrs,
             dtype=dtype,
+            broadcast=broadcast,
             # An internal buffer never reaches memory: it is threaded as a value,
             # so it gets no store, no func parameter, no view and no address.
             store=not is_internal(out),
         )
 
-    def _access_of(self, arg: TensorArg, levels: Sequence[Level]) -> Access:
+    def _access_of(
+        self,
+        arg: TensorArg,
+        levels: Sequence[Level],
+        *,
+        head: bool = False,
+        unfused: bool = False,
+    ) -> Access:
         """``arg``'s access at this depth, registering its buffer on the way.
 
-        The buffer is registered first and handed to the access, so the record
-        carries its own way back to the view the builder will bind for it.  The
-        first record seen for a ``buf_id`` wins, which is the one every later
-        access to that buffer points at.
+        The buffer record is built here and handed to the access, so the record
+        carries its own way back to the view the builder will bind for it.  Each
+        access gets its OWN record; ``self.buffers`` keeps the first one seen for a
+        ``buf_id``, and what it is kept for is identity and the func signature --
+        one parameter per buffer however many ways the stages view it.
+
+        ``head`` narrows the TILE to one element on the innermost axis and leaves
+        the VIEW alone -- the buffer is a whole stick per statistic either way, and
+        which part of it this access reads is not a property of the buffer.  It is a
+        hard constraint and not an optimisation: MEASURED against a hand-written
+        negative reference module, a tile covering the whole innermost dimension is
+        ``error: the tile covers more than the first element of its innermost
+        dimension``, because the mean of squares sits sixteen bytes along the mean
+        and a wider tile puts that offset on the next statistic.
+
+        ``unfused`` is the recipe's word that THIS operand reads the buffer at its
+        plain element type although the buffer holds fused statistics -- the mean
+        out of the head of a pair's stick, as ``f16``.
         """
         layout, q = _solve_layout(arg, levels)
-        elems = ElemTypes.of(arg.device_dtype)
+        elems = ElemTypes.of(arg.device_dtype, None if unfused else _arrangement(arg))
         buffer = None
         if not is_internal(arg):
-            buffer = self.buffers.setdefault(
-                buf_id(arg),
-                _buffer(arg, layout, elems, bake_addresses=self.options.bake_addresses),
+            # A ``Buffer`` PER ACCESS, built from this arg's own layout and element
+            # types, and the registry keeps the first one.  The record does double
+            # duty -- identity and address, which must be shared because
+            # ``plan.parameters`` and ``KtirBuilder.bases`` are keyed by ``buf_id``;
+            # geometry and element type, which are per access.  Sharing both through
+            # one ``setdefault`` makes every stage's view of a buffer take the FIRST
+            # stage's element type, and MEASURED, a layernorm chain needs two: one
+            # base is viewed as ``memref<48x64x!spyreop.fp16_fused>`` where the pair
+            # is written and as ``memref<48x64xf16>`` where the mean is read out of
+            # the stick head.
+            buffer = _buffer(
+                arg, layout, elems, bake_addresses=self.options.bake_addresses
             )
+            self.buffers.setdefault(buf_id(arg), buffer)
         # The divisions are the outermost levels, so their steps come first.
         extent, rows = _divide(arg, self._symbols, self._divisors)
-        return _access(arg, extent, [*rows, *q], layout, buffer)
+        if head:
+            extent = (*extent[:-1], 1)
+        return _access(arg, extent, [*rows, *q], layout, elems, buffer)
 
 
 def _base_address_elements(arg: TensorArg) -> int:
     """``arg``'s buffer base address in ELEMENTS, for the baked form only.
 
     Read from ``allocation["hbm"]``, the same field the SDSC path resolves into
-    the bundle start address (``superdsc.py:774`` -> ``startAddressCoreCorelet_``).
+    the bundle start address (``startAddressCoreCorelet_`` in ``superdsc``).
     Its units follow ``config.bundle_symbolic_args``: baked gives a byte address
     (arg 1 -> ``{'hbm': 17179869184}``), symbolic a bare sentinel ``arg_index``
     (arg 1 -> ``{'hbm': 1}``).  A memref offset indexes the *element* type, so
@@ -1298,6 +1688,363 @@ def build_kernel_plan(
     if not plan.buffers:
         raise NotImplementedError("OpSpec->KTIR: no OpSpec to emit")
     return plan
+
+
+# ---------------------------------------------------------------------------
+# PlanFusion: OpSpec sequences the device computes as one op, fused at PLAN time
+# ---------------------------------------------------------------------------
+#
+# A SPECIALIZED FUSER FOR KTIR OPS.  Not general-purpose, and it must not grow
+# into one: everything below is licensed by the fact that this module knows what
+# it is about to emit and what the consequences of that emission are.  An
+# upstream pass has no such licence, which is why this is not upstream.
+#
+# A fusion is not a legality decision.  The torch-spyre machinery already made
+# that one, by handing this emitter a kernel holding both ops; the table only
+# says WHICH sequences the device computes as one instruction, and declines on
+# anything it does not recognise rather than guessing.  So every fusion here is
+# OPPORTUNISTIC -- a strict subset of the scheduler's own fusion decisions,
+# converting a chosen fusion into a better kernel and never creating one.
+#
+# A SPAN is the run of CONSECUTIVE OpSpecs a pattern matched -- ``specs[i:i+n]``
+# for a pattern of n slots -- and it is the unit everything here works on: what a
+# pattern matches and what a rewrite consumes.  For the one entry shipped, a span
+# is two specs, an ``abs`` and the ``max`` that reads it.
+#
+# AN ENTRY IS A PATTERN AND A RESULT NAME.  The pattern is positional op names
+# and reduction flags, a prefilter deciding which spans are considered at all;
+# the result name is what the collapsed span is called.  The rewrite is SHARED
+# (``_collapse_producer``) because nothing in it is specific to one entry: every
+# condition it checks is a fact about deleting a producer and reading its source
+# in its place.  There is exactly ONE rewrite, so no field names it; a field
+# selecting the rewrite earns its place when there is a second thing to select.
+#
+# THERE IS NO KTIR COST MODEL.  Without a cost function over emitted kernels
+# there is no basis on which to justify a MANDATORY fusion, so opportunistic is
+# the most that can be defended.
+
+_ABSMAX_OP = "absmax"
+
+
+@dataclasses.dataclass(frozen=True)
+class PlanFusion:
+    """One sequence of OpSpecs the device computes as a single op.
+
+    ``pattern``    ``(op name, is_reduction)`` per slot, in vector order.  A
+                   cheap positional prefilter and nothing else: it decides which
+                   spans the rewrite is even asked about, and it is deliberately
+                   not where conditions live.
+    ``result_op``  what the collapsed span is called.  A ``RECIPES`` key if the
+                   kernel is to emit, but nothing here checks that: an
+                   unemittable result is ``_stages``' refusal to make, and it
+                   names the op.
+    ``viable``     ``(fused) -> bool``: is the form about to be emitted one the
+                   device computes CORRECTLY?  Separate from the rewrite because
+                   it is a fact about the RESULT op on this hardware rather than
+                   about collapsing anything, so it is the entry's only claim
+                   about the device.  ``None`` means unconditional.
+    ``why``        the device fact that makes the fusion a fusion.
+    ``name``       for the logs.  A decline is silent by design -- almost every
+                   span in every kernel is one -- so the name is what makes "why
+                   did my absmax not fuse" answerable at ``debug``.
+
+    Nothing validates the fields: an entry is source, and a malformed one fails
+    where it is written the first time it is exercised rather than at import.
+    """
+
+    name: str
+    pattern: tuple[tuple[str, bool], ...]
+    result_op: str
+    why: str
+    viable: Callable[[OpSpec], bool] | None = None
+
+
+def _decline(reason: str, *args: Any) -> None:
+    """Log why a rewrite is declining, at ``debug``.
+
+    Called immediately before the ``return None`` it explains, so the reason
+    sits on the condition that produced it: a table that declines silently makes
+    "why did my absmax not fuse" a question only this module can answer.  The
+    pattern misses are the one class of decline with no line, because every span
+    in every kernel that is not this pattern is one.
+    """
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug("plan fusion declines: " + reason, *args)
+    return None
+
+
+def _roles(spec: OpSpec) -> tuple[TensorArg, list[TensorArg]] | None:
+    """``(output, inputs)`` for ``spec``, or None if it does not have exactly one.
+
+    Read directly rather than through ``validated_roles``, which asks ``RECIPES``
+    for the arity and would raise on ``abs`` -- an op with no recipe, and
+    deliberately none, because the fused body is the only shape the device takes
+    it in.  Returns None rather than raising: this is a matcher, and a spec whose
+    roles it cannot read is a spec it declines.
+    """
+    inputs = [arg for arg in spec.args if arg.is_input]
+    outputs = [arg for arg in spec.args if not arg.is_input]
+    if len(outputs) != 1:
+        return None
+    return outputs[0], inputs
+
+
+def _readers(link: str, specs: Sequence[Any]) -> tuple[tuple[OpSpec, TensorArg], ...]:
+    """Every READ of buffer ``link`` in ``specs``, as ``(spec, arg)`` pairs.
+
+    One entry per input arg naming it, so a spec reading the same buffer twice is
+    listed twice.  That is the count the callers want: a producer may be deleted
+    only when the read that replaces it is the only read there is, and an
+    intermediate that survives needs one load per read.
+
+    Loop bodies included, because a nested op reads the same buffer namespace.
+    The scope is the list it is handed, which is also the limit: a fusion inside
+    a ``LoopSpec`` body cannot see a reader outside that body, the same blind
+    spot the recursion has.  Safe only in combination with ``kernel_local`` on
+    the buffer -- a reader in another kernel is one no scope here would show.
+    """
+    return tuple(
+        (spec, arg)
+        for spec in _op_specs(specs)
+        for arg in spec.args
+        if arg.is_input and buf_id(arg) == link
+    )
+
+
+def _access_preserving(source: TensorArg, result: TensorArg) -> bool:
+    """Whether an op writes its result exactly where it read its source.
+
+    Same ``device_size``, same ``device_coordinates`` and same ``device_dtype``,
+    which is what lets a consumer read the source in place of the result: the
+    consumer's own description of its input then already describes the source,
+    and nothing has to be translated between the two specs' iteration-space
+    namespaces.  Anything that moves, resizes or reformats an element is not a
+    drop-in.  The format is part of it because the rewrite hands the survivor the
+    SOURCE's ``device_dtype``, so a converting producer would silently change what
+    the survivor reads.
+
+    Measured necessary, and it is the one condition whose absence is silent:
+    without it a BROADCASTING ``abs`` fuses, and the ``absmax`` that comes out
+    carries a [2, 256, 64] memory view over a 128-element buffer -- which
+    the backend compiler ACCEPTS. An out-of-bounds read that compiles is worse
+    than any refusal, so this is checked here and not left to a consumer.
+    """
+    return (
+        list(source.device_size) == list(result.device_size)
+        and list(source.device_coordinates) == list(result.device_coordinates)
+        and source.device_dtype == result.device_dtype
+    )
+
+
+def _collapse_producer(
+    span: Sequence[OpSpec], specs: Sequence[Any], result_op: str
+) -> OpSpec | None:
+    """A pair into one ``result_op`` reading the producer's own source.
+
+    The one rewrite the table has, and it is shared: ``span`` is a producer and
+    the consumer that survives it, and the only thing an entry contributes is
+    the name the survivor comes out under.  None DECLINES, which is not an
+    error: a span that is not this shape reaches ``_stages``, whose per-op refusal
+    ("op 'abs' is not supported yet") is the truth about it.
+
+    The producer is DELETED, not threaded.  The device primitive standing behind
+    an entry does the pointwise pass's work inside the surviving op -- the min/max
+    unit takes the absolute value as a mode bit -- so there is no intermediate left
+    to put anywhere.  A fusion whose ops both survive would instead leave a value
+    crossing a compute stage, which aborts the backend outright.
+
+    Deleting the producer is what every condition below is about:
+
+    * it must be unary, or there is no single source to read instead of it;
+    * it must be ACCESS-PRESERVING, or the survivor's description of its input
+      does not describe that source;
+    * the link must be KERNEL-LOCAL and must be read exactly ONCE, by the
+      survivor.  Two halves of one condition: locality (``TensorArg``, filled by
+      the scheduler) rules out a reader this spec list cannot see, and the count
+      rules out ``a = abs(x); amax(a, -1) + sum(a, -1)``, where the second
+      consumer sits AFTER the pair -- so the pair is still adjacent, and a
+      matcher trusting adjacency deletes a buffer the ``sum`` still reads.
+
+    Only buffer IDENTITY moves across: name, arg index, allocation, format.  The
+    extents and coordinates stay the survivor's own, because each spec writes
+    its coordinates against its own iteration-space symbols and splicing one
+    into the other would mix two namespaces -- a kernel that compiles and
+    addresses the wrong elements, which is the worst failure available here.
+    """
+    # A pair, because collapsing a producer into its consumer is what this is;
+    # an entry pairing a pattern of another length with it is a typo in the
+    # table, and one that fails here the first time the pattern matches.
+    producer, survivor = span
+    roles = _roles(producer)
+    if roles is None:
+        _decline("%r does not write exactly one output", producer.op)
+        return None
+    producer_out, producer_ins = roles
+    if len(producer_ins) != 1:
+        _decline("producer %r is not unary", producer.op)
+        return None
+    [source] = producer_ins
+    if not _access_preserving(source, producer_out):
+        _decline(
+            "producer %r is not access-preserving, so its source is not a "
+            "drop-in for its result",
+            producer.op,
+        )
+        return None
+    if not producer_out.kernel_local:
+        _decline(
+            "link %s is not kernel-local, so deleting its producer would strand "
+            "a reader outside this kernel",
+            buf_id(producer_out),
+        )
+        return None
+    link = buf_id(producer_out)
+    reads = _readers(link, specs)
+    if len(reads) != 1 or reads[0][0] is not survivor:
+        _decline(
+            "link %s is read %d time(s) in this kernel, not once by %r",
+            link,
+            len(reads),
+            survivor.op,
+        )
+        return None
+    [(_reader, read)] = reads
+    args = [
+        (
+            dataclasses.replace(
+                arg,
+                name=source.name,
+                arg_index=source.arg_index,
+                allocation=dict(source.allocation),
+                device_dtype=source.device_dtype,
+            )
+            if arg is read
+            else arg
+        )
+        for arg in survivor.args
+    ]
+    return dataclasses.replace(survivor, op=result_op, args=args)
+
+
+PLAN_FUSIONS: tuple[PlanFusion, ...] = (
+    PlanFusion(
+        name="absmax",
+        pattern=(("abs", False), ("max", True)),
+        result_op=_ABSMAX_OP,
+        # False for fp32 on-stick absmax, which compiles and returns garbage.
+        # MEASURED on device: for this one combination the backend emits its
+        # ``SFP_SPLAT``/``SFP_REDUCE`` at ``mode=fp16`` on 4-byte lanes, so the
+        # answer is NaN / ~1e38 with no diagnostic anywhere.  Declining costs a
+        # working two-op kernel that this emitter cannot build either -- there is
+        # no ``abs`` recipe -- so it buys a refusal in place of a wrong answer,
+        # and nothing else.
+        #
+        # "On-stick" is exactly ``Surface.GENERIC`` for a reduction: the
+        # within-stick axis is among the reduced dims, so the nest is not what
+        # ``linalg.reduce`` means.  Asked of ``_reduction_surface``, which is the
+        # derivation ``_compute_step`` itself will run, so the question cannot
+        # drift from the emission.
+        viable=lambda fused: not (
+            dtype_of(fused) is DataFormats.IEEE_FP32
+            and _reduction_surface(fused) is Surface.GENERIC
+        ),
+        why=(
+            "the min/max unit takes the absolute value as a mode bit, so max(|x|) "
+            "is one reduction and not a pointwise pass plus a reduction; and a "
+            "standalone math.absf is refused by the backend anyway, so this is the "
+            "only shape it takes an abs in"
+        ),
+    ),
+)
+
+
+def apply_plan_fusions(
+    specs: Sequence[Any], table: Sequence[PlanFusion] = PLAN_FUSIONS
+) -> tuple[Any, ...]:
+    """``specs`` with every table match collapsed.
+
+    Recurses into ``LoopSpec`` bodies because ``_divisions`` reads every op at
+    every depth (``_op_specs``) and this runs before it.
+
+    Matching is POSITIONAL and adjacent, which is what the vector is: a linear
+    step order the emitted kernel executes in sequence.  A dataflow matcher
+    would find pairs this misses, but it would then have to prove reordering
+    them into adjacency is legal, which is a scheduling decision this layer has
+    declined to make.  Adjacency is therefore not relied on for soundness: the
+    condition it used to stand in for -- one reader of the link buffer -- is
+    checked directly by the rewrite.
+    """
+    out: list[Any] = []
+    i = 0
+    while i < len(specs):
+        entry = specs[i]
+        if isinstance(entry, LoopSpec):
+            # ``LoopSpec.body`` is declared a list, so the rebuilt body is one:
+            # this is the contract's own type and not a copy taken for safety.
+            body = apply_plan_fusions(entry.body, table)
+            out.append(dataclasses.replace(entry, body=list(body)))
+            i += 1
+            continue
+        for fusion in table:
+            fused = _apply(fusion, specs, i)
+            if fused is None:
+                continue
+            logger.debug(
+                "plan fusion %r collapsed op %r into %r; buffer %s ceased to exist",
+                fusion.name,
+                entry.op,
+                fused.op,
+                ", ".join(buf_id(a) for a in entry.args if not a.is_input),
+            )
+            out.append(fused)
+            i += len(fusion.pattern)
+            break
+        else:
+            out.append(entry)
+            i += 1
+    return tuple(out)
+
+
+def _apply(fusion: PlanFusion, specs: Sequence[Any], i: int) -> OpSpec | None:
+    """The fused spec for ``specs[i : i + len(pattern)]``, or None: not a match.
+
+    Three questions in order of cost, and the order is the point: the pattern is
+    a positional comparison over every span of every kernel, the rewrite runs
+    only on spans that pass it, and viability is asked of the spec the rewrite
+    produced rather than of one it has to imagine.
+    """
+    # An empty pattern would match at zero length everywhere and advance the walk
+    # by nothing.  A table is source, so this is a typo two hundred lines away
+    # and not a vector to decline.
+    assert fusion.pattern, f"fusion {fusion.name!r} has an empty pattern"
+    span = specs[i : i + len(fusion.pattern)]
+    if len(span) != len(fusion.pattern):
+        return None
+    for (op, is_reduction), spec in zip(fusion.pattern, span, strict=True):
+        if not isinstance(spec, OpSpec):
+            return None
+        if spec.op != op or bool(spec.is_reduction) != is_reduction:
+            return None
+    fused = _collapse_producer(span, specs, fusion.result_op)
+    if fused is None:
+        return None
+    if fusion.viable is not None:
+        try:
+            ok = fusion.viable(fused)
+        except NotImplementedError as exc:
+            # A derivation is entitled to refuse a shape it does not handle, and
+            # a fusion nobody can decide about is one to leave alone: propagating
+            # would turn a missing fusion into a crash blaming the derivation.
+            _decline("viability of %r is undecidable: %s", fused.op, exc)
+            return None
+        if not ok:
+            _decline(
+                "%r is not viable on this operand (dtype/surface); the device "
+                "computes this form incorrectly",
+                fused.op,
+            )
+            return None
+    return fused
 
 
 def validated_roles(spec: OpSpec) -> tuple[TensorArg, list[TensorArg]]:
@@ -1350,9 +2097,14 @@ class BindingKind(enum.Enum):
 
     No separate ``reduces`` flag: reducing *is* ``kind is COMBINER``, because a
     named linalg op is elementwise and a parallel-body payload does not
-    accumulate.  The kind belongs to the ``Arm`` and not to the ``Recipe``
-    because it varies with the format: ``add`` is a named ``linalg`` op at floats
-    and a ``spyreop`` payload at four-byte integers.
+    accumulate.  (``Recipe.reduces`` reads it off an arm for the whole op, which
+    is sound because every arm of an op must agree on it.)
+
+    The kind belongs to the ``Arm`` and not to the ``Recipe`` because it varies
+    with what is asked for: ``add`` is a named ``linalg`` op at floats, a
+    ``spyreop`` payload at four-byte integers, and an ``arith`` payload whenever
+    an operand is broadcast, since only a generic's region can state a derived map
+    row (``request_scalar_when_broadcast``).
     """
 
     NAMED = enum.auto()
@@ -1382,6 +2134,19 @@ class Arm:
     dtypes: tuple[DataFormats, ...] = ()
 
 
+def _written_here(fold: Callable[..., Any]) -> Callable[[], Callable[..., Any]]:
+    """An ``Arm.binding`` for a body written here rather than named by a dialect.
+
+    ``binding`` is a zero-argument callable because most of them are a dialect
+    attribute -- ``lambda: arith.addf`` -- and the attribute cannot be reached at
+    import time: the dialect handles are ``None`` until ``_load_dialects`` binds
+    them.  A body written here as a Python function needs no such deferral, since
+    it resolves ``arith`` and ``math`` inside its own body when it is called; this
+    exists so the entry does not have to spell that as a lambda returning a lambda.
+    """
+    return lambda: fold
+
+
 def _arms(arms: Arm | tuple[Arm, ...]) -> tuple[Arm, ...]:
     """\\p arms as a tuple, whether it was written as one arm or several.
 
@@ -1394,6 +2159,106 @@ def _arms(arms: Arm | tuple[Arm, ...]) -> tuple[Arm, ...]:
 
 
 @dataclasses.dataclass(frozen=True)
+class Request:
+    """What a spec asks of an op, in the terms an arm can be chosen on.
+
+    Every field is derivable from the SPEC ALONE -- no layout, no level, no core
+    count -- and that invariant is what keeps selection orderable: the plan can
+    answer all of them before it needs an arm, and a step can carry them so
+    emission resolves the same arm with no spec in reach.  A discriminant that
+    needed a layout could only be asked after the accesses were built, which is
+    after the arm is needed to choose the surface those accesses feed.
+    """
+
+    dtype: DataFormats | None
+    # Whether any operand is broadcast against the output -- that is,
+    # ``align_reshape_plan`` has something to say about one of them.  A broadcast
+    # operand's map row has to be STATED, and only a generic can state one, so
+    # this bit decides whether a whole-op ``NAMED`` arm can serve the request at
+    # all.
+    broadcast: bool = False
+
+
+# How a recipe picks among its arms, given what the spec asks for.  A dispatcher
+# may only NARROW -- it returns one of the arms it was handed -- which
+# ``Recipe.arm`` asserts, so a dispatcher cannot invent a spelling the table does
+# not declare.
+Dispatch = Callable[[tuple[Arm, ...], Request], Arm]
+
+
+def request_by_dtype(arms: tuple[Arm, ...], request: Request) -> Arm:
+    """The default: the arm claiming the format, else the one claiming the rest.
+
+    A format nothing claims falls to an arm with an empty ``dtypes``; if no arm
+    takes the unlisted formats either, the op does not exist at this one.
+
+    With more than one such arm -- which ``Recipe.__post_init__`` allows only for
+    arms of DIFFERENT kinds, one channel each -- the FIRST wins, so an entry lists
+    the spelling it wants by default first.  ``add``'s ``linalg.add`` is ahead of
+    its ``arith.addf`` for exactly that reason.
+    """
+    dtype = request.dtype
+    for candidate in arms:
+        if dtype is not None and dtype in candidate.dtypes:
+            return candidate
+    for candidate in arms:
+        if not candidate.dtypes:
+            return candidate
+    raise NotImplementedError(
+        f"OpSpec->KTIR: no arm for {dtype.name if dtype else 'an unknown format'} "
+        f"(registered: {sorted(d.name for a in arms for d in a.dtypes)})"
+    )
+
+
+# The device formats an ``arith`` FLOAT scalar cannot take, out of the formats
+# ``ElemTypes.NAMES`` supports (one, today: the ``i32`` row).  Kept in step with
+# that table by ``TestArmDispatch``.
+#
+# Named here rather than spelled as ``Arm.dtypes`` on the float scalars, because
+# ``dtypes`` is a POSITIVE claim and an explicit claim beats a dtype-less one
+# (``request_by_dtype``): a scalar arm that listed the float formats would
+# out-claim the dtype-less ``NAMED`` arm on the ALIGNED path and turn every
+# ``linalg.add`` into a generic.  So the scalar arms stay dtype-less, and what a
+# dtype-less scalar arm does not serve is stated once, here, where it is read.
+_INTEGER_FORMATS: tuple[DataFormats, ...] = (DataFormats.IEEE_INT32,)
+
+
+def request_scalar_when_broadcast(arms: tuple[Arm, ...], request: Request) -> Arm:
+    """``request_by_dtype``, but a broadcast operand may not reach a NAMED arm.
+
+    Filtered on ``kind`` because ``kind`` IS the distinction being made: a
+    ``NAMED`` builder states its own (identity) indexing and has nowhere to put a
+    derived map row, while a ``PAYLOAD`` scalar goes in a generic's region, which
+    states every row.
+
+    It DELEGATES rather than replacing, so the format still picks among what is
+    left: an int32 broadcast ``add`` lands on ``spyreop.addi32toi32`` and not on
+    ``arith.addf``.  And it filters only when the request really is broadcast, so
+    an aligned operand keeps the named op it always had.
+
+    A dtype-less scalar arm is an ``arith`` float builder (``_INTEGER_FORMATS``),
+    so it is not eligible for an integer request: ``arith.subf`` of two ``i32``
+    values does not verify, and letting one through would emit invalid IR for a
+    request the plan could have refused.  ``sub`` has no integer intrinsic to fall
+    to, so at int32 nothing survives the filter at all.
+
+    ``and eligible`` is that case: the whole set goes through, the named arm comes
+    back, and ``_broadcast_surface`` refuses naming the reason (an op whose only
+    spelling states its own indexing) -- a better answer than "no arm for
+    IEEE_INT32" for an op that plainly has one at that format.
+    """
+    eligible = tuple(
+        arm
+        for arm in arms
+        if arm.kind is not BindingKind.NAMED
+        and (arm.dtypes or request.dtype not in _INTEGER_FORMATS)
+    )
+    return request_by_dtype(
+        eligible if request.broadcast and eligible else arms, request
+    )
+
+
+@dataclasses.dataclass(frozen=True)
 class Recipe:
     # Both ``arity`` and ``attrs`` are properties of the *op*, invariant across
     # formats, which is why they sit here and not on an arm: 'add' takes two
@@ -1402,18 +2267,35 @@ class Recipe:
     # apart on arity.
     arity: int
     # One ``Arm`` or a tuple of them; ``__post_init__`` promotes the bare one, so
-    # the field is a tuple by the time anything reads it.  Written this way because
-    # an op with a single spelling is the overwhelming majority and ``arms=Arm(...)``
-    # is what that op means -- the ``(...,)`` around it would be noise on eleven of
-    # the thirteen entries, and a stray missing comma turns a tuple into an ``Arm``
-    # silently.
+    # the field is a tuple by the time anything reads it.  Beware that a stray
+    # missing comma turns an intended tuple into a single ``Arm`` silently.
     arms: Arm | tuple[Arm, ...]
+    # Which operand positions this op reads (or writes) at the buffer's PLAIN
+    # element type although the buffer's ``element_arrangement`` says it holds
+    # fused statistics.  Positions are the inputs in operand order and then the
+    # result last -- the order ``Indexing.maps`` takes -- so ``arity`` is the
+    # result's position.
+    #
+    # It is on the RECIPE because it is a fact about the op and not about the
+    # buffer.  MEASURED on the real layernorm vector, ``element_arrangement`` says
+    # only "this buffer holds two values to a stick" -- it is propagated to every
+    # arg naming a statistic buffer and does not say how an operand READS it, and
+    # two ops read one such buffer two ways.  So the arrangement is the default and
+    # the recipe has the last word.
+    unfused: tuple[int, ...] = ()
     # How to read the op's scalar arguments out of a spec's ``op_info``, for the
     # few ops whose builder takes more than operands (softplus).  ``None`` when
     # the op is a pure function of its operands, which is almost all of them.
     # A reader rather than the values themselves, because where they live in
     # ``op_info`` is the op's own business and the plan should not have to know.
     attrs: Callable[[dict[str, Any]], dict[str, float]] | None = None
+    # How this op picks among its arms; the default is the format alone, and an op
+    # whose spelling also turns on whether an operand is broadcast says so here.
+    #
+    # A plain function and not a ``staticmethod``: the generated ``__init__``
+    # binds it as an INSTANCE attribute, and instance attributes are not
+    # descriptors, so ``self.dispatch(arms, request)`` passes no ``self``.
+    dispatch: Dispatch = request_by_dtype
 
     def __post_init__(self) -> None:
         if self.arity < 1:
@@ -1421,35 +2303,68 @@ class Recipe:
         arms = _arms(self.arms)
         if not arms:
             raise ValueError("OpSpec->KTIR: a recipe needs at least one arm")
-        if sum(1 for arm in arms if not arm.dtypes) > 1:
+        # Ambiguity is per KIND, not per recipe.  Two arms of the SAME kind with
+        # the same claim are genuinely ambiguous -- nothing tells them apart, so
+        # which one wins would be a fact about declaration order.  Two of
+        # different kinds are the two channels a dispatcher discriminates on: fp16
+        # ``add`` needs both a dtype-less ``linalg.add`` and a dtype-less
+        # ``arith.addf``, one for aligned operands and one for broadcast.
+        for kind in {arm.kind for arm in arms}:
+            of_kind = [arm for arm in arms if arm.kind is kind]
+            if sum(1 for arm in of_kind if not arm.dtypes) > 1:
+                raise ValueError(
+                    "OpSpec->KTIR: at most one arm may claim the unlisted formats"
+                )
+            claimed = [dtype for arm in of_kind for dtype in arm.dtypes]
+            if len(claimed) != len(set(claimed)):
+                raise ValueError(
+                    "OpSpec->KTIR: two arms claim the same format: "
+                    f"{sorted({d.name for d in claimed if claimed.count(d) > 1})}"
+                )
+        # Reduction-ness is asked of the RECIPE (``reduces``), before any arm is
+        # chosen, so every arm has to answer it the same way or the property is
+        # reading one arm and speaking for the others.
+        if len({arm.kind is BindingKind.COMBINER for arm in arms}) > 1:
             raise ValueError(
-                "OpSpec->KTIR: at most one arm may claim the unlisted formats"
+                "OpSpec->KTIR: an op's arms must agree on whether it reduces, but "
+                f"{sorted({arm.kind.name for arm in arms})} do not"
             )
-        claimed = [dtype for arm in arms for dtype in arm.dtypes]
-        if len(claimed) != len(set(claimed)):
+        if any(not 0 <= position <= self.arity for position in self.unfused):
             raise ValueError(
-                "OpSpec->KTIR: two arms claim the same format: "
-                f"{sorted({d.name for d in claimed if claimed.count(d) > 1})}"
+                f"OpSpec->KTIR: unfused positions {self.unfused} name an operand "
+                f"an arity-{self.arity} op does not have (the result is "
+                f"{self.arity})"
             )
         object.__setattr__(self, "arms", arms)
 
-    def arm(self, dtype: DataFormats | None) -> Arm:
-        """The arm \\p dtype reaches, or raise.
+    @property
+    def reduces(self) -> bool:
+        """Whether this op accumulates -- an op fact, not an arm fact.
 
-        A format nothing claims falls to the arm with an empty ``dtypes``; if no
-        arm takes the unlisted formats either, the op does not exist at this one.
+        Sound because ``__post_init__`` makes every arm agree on it, so any arm
+        answers for the recipe.  It exists so that the family check in ``_stages``
+        gets its one bit without selecting an arm, which it cannot do yet.
+        """
+        return _arms(self.arms)[0].kind is BindingKind.COMBINER
+
+    def arm(self, dtype: DataFormats | None, *, broadcast: bool = False) -> Arm:
+        """The arm this request reaches, or raise.
+
+        ``dtype`` stays positional because it is the one discriminant every op
+        has; the rest of the request is keyword-only with a default, so a caller
+        that has not derived a discriminant yet need not name it.
         """
         arms = _arms(self.arms)
-        for candidate in arms:
-            if dtype is not None and dtype in candidate.dtypes:
-                return candidate
-        for candidate in arms:
-            if not candidate.dtypes:
-                return candidate
-        raise NotImplementedError(
-            f"OpSpec->KTIR: no arm for {dtype.name if dtype else 'an unknown format'} "
-            f"(registered: {sorted(d.name for a in arms for d in a.dtypes)})"
+        chosen = self.dispatch(arms, Request(dtype=dtype, broadcast=broadcast))
+        # A dispatcher may narrow, never invent.  Identity rather than equality:
+        # what is being asserted is that the arm came from THIS recipe, and two
+        # structurally equal arms are two declarations rather than one.  An
+        # assertion because a dispatcher is code in this module, so failing it is a
+        # bug here and not an unsupported request.
+        assert any(chosen is candidate for candidate in arms), (
+            f"dispatcher {self.dispatch!r} returned an arm this recipe does not hold"
         )
+        return chosen
 
 
 # ---------------------------------------------------------------------------
@@ -1530,7 +2445,11 @@ class KtirBuilder:
         # Requires the live context entered by create().
         self.index_t = ir.IndexType.get()
         self.block_args: list = []
-        self.views: dict[str, Any] = {}
+        # ``(stage, buf_id) -> view``, filled by ``view()`` on demand: one view
+        # per stage that tiles the buffer, never one per buffer.
+        self.views: dict[tuple[int, str], Any] = {}
+        # ``buf_id -> base address``, bound once by ``open_kernel``.
+        self.bases: dict[str, Any] = {}
         self.c0 = None
         self._text: str | None = None
 
@@ -1581,7 +2500,7 @@ class KtirBuilder:
         return self.val(arith.ConstantOp(self.index_t, int(value)))
 
     @staticmethod
-    def _affine_map(rank: int, row: Sequence[int]):
+    def _affine_map(rank: int, row: Sequence[int | None]):
         """One ``Indexing`` row as a projection of a ``rank``-dim iteration nest.
 
         ``(0, 1, 2)`` of rank 4 is ``(d0, d1, d2, d3) -> (d0, d1, d2)``: the row is
@@ -1589,27 +2508,45 @@ class KtirBuilder:
         symbols, and one expression per entry.  Returns the map itself and not an
         ``ir.AffineMapAttr`` -- ``indexing_maps`` takes maps, and an attribute
         raises there.
+
+        ``None`` is the constant 0 position, so ``(1, None)`` of rank 3 is
+        ``(d0, d1, d2) -> (d1, 0)``: a broadcast operand read at the head of the
+        axis it does not walk.  ``get_constant`` is the mechanism ``coord_set``
+        already builds its bounds out of.
         """
         return ir.AffineMap.get(
-            rank, 0, [ir.AffineExpr.get_dim(int(dim)) for dim in row]
+            rank,
+            0,
+            [
+                ir.AffineExpr.get_constant(0)
+                if dim is None
+                else ir.AffineExpr.get_dim(int(dim))
+                for dim in row
+            ],
         )
 
     # -- module scaffolding ------------------------------------------------
 
     @contextlib.contextmanager
     def open_kernel(self, kernel_name: str) -> Iterator[None]:
-        """Open the kernel func with its views bound, and emit its body into it.
+        """Open the kernel func with its bases bound, and emit its body into it.
 
-        ``module { func.func @kernel_name(...) { %c0, one memory view per buffer,
-        <body>, return } }``.  The signature and the views are two faces of one
-        decision -- where a base address comes from -- so they are made together
-        here rather than in two functions a caller has to order correctly.  All of
-        it comes off ``self.plan``, the plan this builder was created for.
+        ``module { func.func @kernel_name(...) { %c0, <body>, return } }``.  The
+        signature and the base addresses are two faces of one decision -- where a
+        base address comes from -- so they are made together here rather than in
+        two functions a caller has to order correctly.  All of it comes off
+        ``self.plan``, the plan this builder was created for.
 
         Baked bases need no func arguments and appear as ``arith.constant``s;
         symbolic bases are one ``index`` parameter each, in ``plan.parameters``
         order.  Deleting the baked arm reverts the dataflow-scheduler#65
         workaround.
+
+        The bases, and not the views: a view belongs to the stage that tiles it
+        (``view()``), because two stages sharing one view abort the backend
+        (``ComputeStep.stage``).  A base is per buffer and shared by every stage,
+        which is why it stays here -- one func parameter or one constant per
+        buffer either way, whatever the stages then do with it.
         """
         baked = self.plan.options.bake_addresses
         buffers = self.plan.parameters
@@ -1641,7 +2578,7 @@ class KtirBuilder:
                                 f"baked plan without an address for {buffer.buf_id}"
                             )
                             base = self.icst_index(buffer.base_elements)
-                        self.views[buffer.buf_id] = self.memory_view(base, buffer)
+                        self.bases[buffer.buf_id] = base
                     yield
                     func.ReturnOp([])  # no operands, matching the signature
             # Printed while the context is still alive.
@@ -1728,8 +2665,11 @@ class KtirBuilder:
         (a method and an arm), and a test parses this ``match`` to catch the
         second one being forgotten.
         """
-        arm = self.RECIPES[step.op].arm(step.dtype)
-        ins = [self.operand(buf_id, access) for buf_id, access in step.ins]
+        # The step's whole ``Request``, so this resolves the arm the plan chose the
+        # surface from: an op with two spellings would otherwise get the default
+        # one here and a body the surface below does not fit.
+        arm = self.RECIPES[step.op].arm(step.dtype, broadcast=step.broadcast)
+        ins = [self.operand(buf_id, access, step.stage) for buf_id, access in step.ins]
         match step.surface:
             case Surface.BARE:
                 value = self._emit_bare(arm.binding(), ins, step)
@@ -1739,7 +2679,9 @@ class KtirBuilder:
                 value = self._emit_generic(arm.binding(), ins, step)
             case _:
                 raise AssertionError(f"unplanned surface {step.surface} of {step.op!r}")
-        self.result(step.out_buf_id, step.out if step.store else None, value)
+        self.result(
+            step.out_buf_id, step.out if step.store else None, value, step.stage
+        )
 
     # -- ktdp shapes -------------------------------------------------------
 
@@ -1752,12 +2694,8 @@ class KtirBuilder:
         sizes = [int(e) for e in buffer.layout.extent]
         strides = [int(s) for s in buffer.layout.strides]
         memref_t = ir.MemRefType.get(sizes, self.named_type(buffer.elems.storage))
-        # ``memory_space`` was the last attribute built as text, because no
-        # builder was exposed for it; ktir-mlir-frontend#61 adds one, so it now
-        # goes through the same verifier-checked API as everything else and a
-        # rename breaks type checking rather than failing at runtime.
-        #
-        # The builder takes the tablegen-generated ``MemorySpaceKind``, not a
+        # The ``memory_space`` builder takes the tablegen-generated
+        # ``MemorySpaceKind``, not a
         # spelling, so the mapping names enum members.  ``global_`` carries the
         # trailing underscore mlir-tblgen adds to escape the Python keyword.
         # Keyed lookup rather than a fallback, so a space this mapping has not
@@ -1782,8 +2720,30 @@ class KtirBuilder:
             )
         )
 
-    def access_tile(self, access: Access):
-        """``ktdp.construct_access_tile`` for ``access``, into its buffer's view.
+    def view(self, stage: int, buffer: Buffer):
+        """``stage``'s memory view of ``buffer``, emitted at first use in it.
+
+        One view per (stage, buffer) and not one per buffer: sharing a view
+        between two stages ABORTS the backend rather than refusing -- MEASURED on
+        a hand-written reference chain of six computes, where deduping its seven
+        duplicate views onto four aborts while the duplicates it ships with
+        compile clean.  A stage's schedule is extracted
+        into its own module, and the view has to go with it, so a second stage's
+        use of the same view is a use the extraction cannot erase.
+
+        At first use rather than up front, so a stage emits views for the buffers
+        it tiles and no others.  A stage is one ``ComputeStep``, all of whose ops
+        are emitted contiguously at one insertion point, so the view a stage
+        emits dominates every tile that reads it -- including inside a loop body,
+        where the whole stage lives.
+        """
+        key = (stage, buffer.buf_id)
+        if key not in self.views:
+            self.views[key] = self.memory_view(self.bases[buffer.buf_id], buffer)
+        return self.views[key]
+
+    def access_tile(self, access: Access, stage: int):
+        """``ktdp.construct_access_tile`` for ``access``, into ``stage``'s view.
 
         The per-dim index is ``sum_l coeffs[i][l] * iv_l`` over the induction
         variables of the loops this builder has open -- the record holds the
@@ -1815,7 +2775,7 @@ class KtirBuilder:
         return self.val(
             ktdp.construct_access_tile(
                 result=ktdp.AccessTileType.get(sizes, ir.IndexType.get()),
-                base=self.views[access.buffer.buf_id],
+                base=self.view(stage, access.buffer),
                 # How the view is indexed, and the order of the tile's own axes.
                 # Both identity: the tile covers the view one-to-one.
                 base_map=identity,
@@ -1827,7 +2787,7 @@ class KtirBuilder:
             )
         )
 
-    def operand(self, buf_id: str, access: Access):
+    def operand(self, buf_id: str, access: Access, stage: int):
         """An input operand's value: a live produced value, or an access + load.
 
         Reusing a produced value is what register-threaded fused intermediates
@@ -1841,10 +2801,10 @@ class KtirBuilder:
             list(access.extent), self.named_type(access.elems.value)
         )
         return self.val(
-            ktdp.load(result=tensor_t, access_tile=self.access_tile(access))
+            ktdp.load(result=tensor_t, access_tile=self.access_tile(access, stage))
         )
 
-    def result(self, buf_id: str, access: Access | None, value) -> None:
+    def result(self, buf_id: str, access: Access | None, value, stage: int) -> None:
         """Dispose of an op's result: thread it, or store it through ``access``.
 
         The mirror of ``operand`` on the way out.  ``access is None`` is an
@@ -1854,7 +2814,7 @@ class KtirBuilder:
         if access is None:
             self.env.bind_produced(buf_id, value)
         else:
-            ktdp.store(data_tile=value, access_tile=self.access_tile(access))
+            ktdp.store(data_tile=value, access_tile=self.access_tile(access, stage))
 
     # -- compute -----------------------------------------------------------
     #
@@ -1867,15 +2827,31 @@ class KtirBuilder:
     #
     # A repeated key here is ruff F601, so an op cannot be declared twice.
     RECIPES: ClassVar[dict[str, Recipe]] = {
-        # ``add`` and ``mul`` are the two ops with more than one spelling: a named
-        # linalg op at floats, and a ``spyreop`` intrinsic at four-byte integers
-        # that splits its operands into halves and finds the carry with a pair of
-        # scale factors.  The float arm lists no formats, so it takes every format
-        # the integer arm does not claim.
+        # ``add``, ``mul`` and ``sub`` are the ops with more than one spelling, on
+        # two discriminants at once:
+        #
+        #   * the FORMAT -- a named linalg op at floats, and a ``spyreop``
+        #     intrinsic at four-byte integers that splits its operands into halves
+        #     and finds the carry with a pair of scale factors.  A float arm lists
+        #     no formats, so it takes every format the integer arm does not claim.
+        #   * whether an operand is BROADCAST -- a named linalg op states its own
+        #     identity indexing, so a broadcast operand's derived map row has
+        #     nowhere to go (``_broadcast_surface``).  The ``arith`` scalar goes in
+        #     a generic's region, which states every row, so
+        #     ``request_scalar_when_broadcast`` reaches for it exactly then.
+        #     MEASURED: this is what softmax's ``x - rowmax`` needs, and with it
+        #     the KTIR path's softmax matches the SDSC path's exactly (verify.py).
+        #
+        # The named arm is FIRST in each entry because two dtype-less arms of
+        # different kinds resolve in declaration order (``request_by_dtype``), and
+        # the aligned operands that keep the named op are the common case: every
+        # emitter golden is a named ``add``.
         "add": Recipe(
             arity=2,
+            dispatch=request_scalar_when_broadcast,
             arms=(
                 Arm(kind=BindingKind.NAMED, binding=lambda: linalg.add),
+                Arm(kind=BindingKind.PAYLOAD, binding=lambda: arith.addf),
                 Arm(
                     kind=BindingKind.PAYLOAD,
                     binding=lambda: spyreop.addi32toi32,
@@ -1885,8 +2861,10 @@ class KtirBuilder:
         ),
         "mul": Recipe(
             arity=2,
+            dispatch=request_scalar_when_broadcast,
             arms=(
                 Arm(kind=BindingKind.NAMED, binding=lambda: linalg.mul),
+                Arm(kind=BindingKind.PAYLOAD, binding=lambda: arith.mulf),
                 Arm(
                     kind=BindingKind.PAYLOAD,
                     binding=lambda: spyreop.muli32toi32,
@@ -1894,11 +2872,90 @@ class KtirBuilder:
                 ),
             ),
         ),
+        # No integer arm: there is no ``subi32toi32`` intrinsic, so an int32
+        # broadcast ``sub`` still reaches ``_broadcast_surface``'s refusal -- the
+        # scalar arm it would need does not exist at that format.  A missing op,
+        # not a dispatch gap.
         "sub": Recipe(
-            arity=2, arms=Arm(kind=BindingKind.NAMED, binding=lambda: linalg.sub)
+            arity=2,
+            dispatch=request_scalar_when_broadcast,
+            arms=(
+                Arm(kind=BindingKind.NAMED, binding=lambda: linalg.sub),
+                Arm(kind=BindingKind.PAYLOAD, binding=lambda: arith.subf),
+            ),
         ),
         "sum": Recipe(
             arity=1, arms=Arm(kind=BindingKind.COMBINER, binding=lambda: arith.addf)
+        ),
+        "max": Recipe(
+            arity=1,
+            arms=Arm(kind=BindingKind.COMBINER, binding=lambda: arith.maximumf),
+        ),
+        "min": Recipe(
+            arity=1,
+            arms=Arm(kind=BindingKind.COMBINER, binding=lambda: arith.minimumf),
+        ),
+        "prod": Recipe(
+            arity=1, arms=Arm(kind=BindingKind.COMBINER, binding=lambda: arith.mulf)
+        ),
+        # Two callers reach this one recipe, which is why it is a recipe and not a
+        # special case.  ``torch.any`` lowers to a genuine ``absmax`` reduction
+        # (``lower_any_dim`` / ``lower_any_def`` in lowering.py), so the frontend
+        # names this op itself; and the fusion table rewrites an ``abs`` feeding a
+        # ``max`` into this same name, because the device computes both the same
+        # way.
+        # A combiner is just a callable, so this one emits three ops instead of
+        # one -- the shape the device matches -- and needs no new surface.
+        #
+        # ``max(|acc|, |x|)``, and the body ORDER is a pattern key rather than a
+        # computation: the device pattern matches exactly three ops -- ``math.absf``
+        # at [0] and [1] and ``arith.maxnumf`` at [2] -- and replaces the whole
+        # generic with one ``simdreduction_minmax`` whose ``x1``/``x2`` immediates
+        # put the min/max unit in its absolute-value mode.  So nothing below is
+        # lowered: the abs is a mode bit on the hardware compare, and these ops
+        # exist to be recognised.  Python's left-to-right argument evaluation is
+        # what emits them in the order the match requires, so a "simplification"
+        # that reorders the expression -- or that writes ``maximumf``, the spelling
+        # the bare ``max`` reduction uses, in place of ``maxnumf`` -- breaks the
+        # match, and it breaks it SILENTLY: it fails as a non-match, not an error.
+        _ABSMAX_OP: Recipe(
+            arity=1,
+            arms=Arm(
+                kind=BindingKind.COMBINER,
+                binding=_written_here(
+                    lambda accumulated, element: arith.maxnumf(
+                        math.absf(element), math.absf(accumulated)
+                    )
+                ),
+            ),
+        ),
+        # The reduction that leaves a mean and a mean of squares in one element.
+        #
+        # Registered COMBINER because it reduces, and the equality check in
+        # ``_stages`` is what ties those two statements together -- but the
+        # binding IGNORES ``accumulated``, which no other combiner does.  That is
+        # the same category as ``absmax`` above and carries the same warning: the
+        # body is a MARKER FOR A DEVICE PATTERN, not a fold.  MEASURED, the
+        # device's own unfusing pass replaces this op with the two
+        # reductions it stands for -- the value accumulated and its square, each
+        # scaled by one over the count on the way in -- so nothing below lowers
+        # the generic as written.  If that pattern does not match, the generic
+        # means "the last element wins", and it fails as a NON-MATCH rather than
+        # as an error.
+        #
+        # The accumulator is still what types the result: ``%out`` is
+        # ``!spyreop.fp16_fused`` because the output buffer's arrangement says so
+        # (EXX2), and ``spyreop.exx2_fused`` returns exactly that from an f16.
+        # ``spyreop.exx2``, the unfused two-result form, is a different op and is
+        # not registered.
+        "exx2": Recipe(
+            arity=1,
+            arms=Arm(
+                kind=BindingKind.COMBINER,
+                binding=_written_here(
+                    lambda accumulated, element: spyreop.exx2_fused(element)
+                ),
+            ),
         ),
         # The unary float ops whose payload is one ``spyreop`` scalar intrinsic.
         # There is no named linalg op behind any of them, so they are PAYLOADs and
@@ -1917,6 +2974,14 @@ class KtirBuilder:
         # Not here: the remaining integer/address intrinsics (addi64toi64,
         # idx32toaddr) and other pointwise ops the device has no intrinsic for
         # (log, tanh, erf, relufwd).
+        # Not here: ``abs``.  A PAYLOAD arm bound to ``math.absf`` does emit, but
+        # into a generic of its OWN, which is the wrong shape for the only thing
+        # that wants it: the device reduces along the stick with an opaque SIMD
+        # reduction matched by a PDL pattern in the device spec
+        # (``KTIR_DEVICE_MLIR``) against the BODY of one reducing
+        # ``linalg.generic``, and its ``absmax`` kind wants that body to be three
+        # ops.  So ``abs_max`` is one fused combiner to build, not a pointwise op
+        # to thread into a separate reduction.
         "exp": Recipe(
             arity=1, arms=Arm(kind=BindingKind.PAYLOAD, binding=lambda: spyreop.exp)
         ),
@@ -1934,9 +2999,42 @@ class KtirBuilder:
         "gelufwd": Recipe(
             arity=1, arms=Arm(kind=BindingKind.PAYLOAD, binding=lambda: spyreop.gelu)
         ),
+        # The FUSED spelling, arity 1: the frontend hands this op one input
+        # carrying the (mean, mean-of-squares) pair as one element of
+        # ``!spyreop.fp16_fused``, which is what ``exx2_fused`` wrote.  The
+        # two-operand ``spyreop.layernormscale``, which takes the mean and the mean
+        # of squares apart, is what the backend's own unfusing pass
+        # produces BELOW us -- MEASURED against a hand-written reference module for
+        # this op -- so binding it here would be doing the backend's job with an
+        # operand nobody supplies.
         "layernormscale": Recipe(
             arity=1,
-            arms=Arm(kind=BindingKind.PAYLOAD, binding=lambda: spyreop.layernormscale),
+            arms=Arm(
+                kind=BindingKind.PAYLOAD,
+                binding=lambda: spyreop.layernormscale_fused,
+            ),
+            # The RESULT (position 1, arity being 1) is a plain float, whatever the
+            # output buffer's arrangement says.  MEASURED: the frontend flags that
+            # buffer ``EXX2`` too -- it propagates the flag to every arg naming a
+            # statistic buffer -- and the op is
+            # ``... : !spyreop.fp16_fused -> f16``.
+            unfused=(1,),
+        ),
+        # The normalisation itself: five operands, positional, no attributes.
+        # MEASURED against a hand-written reference module -- the printed form
+        # is ``spyreop.layernormnorm %x squares %sq scale %sc weight %w bias %b``,
+        # and the builder takes them in that order.
+        #
+        # ``squares`` (1) and ``scale`` (2) are read UNFUSED, and MEASURED on the
+        # real ``F.layer_norm`` vector both of their args carry ``EXX2``: the flag
+        # follows the BUFFER and is propagated to every arg naming one.  This op
+        # reads a plain ``f16`` out of the head of each stick in both cases --
+        # MEASURED on a hand-written reference chain, where both views are
+        # ``memref<48x64xf16>`` over bases the fused view also covers.
+        "layernormnorm": Recipe(
+            arity=5,
+            arms=Arm(kind=BindingKind.PAYLOAD, binding=lambda: spyreop.layernormnorm),
+            unfused=(1, 2),
         ),
         "softplus": Recipe(
             arity=1,
@@ -2019,13 +3117,18 @@ class KtirBuilder:
         """
         extents, elt_t, dest = self._destination(step)
 
-        def body(accumulated, element):
+        # ``linalg.reduce`` binds its region as (input element, init accumulator),
+        # in that order -- MLIR's choice, not ours, and the printer names them
+        # ``%in`` and ``%init`` to say so.  The parameters are therefore named in
+        # THAT order and the fold is written acc-first, which is the order a
+        # combiner means: ``acc = combine(acc, x)``.
+        def body(element, accumulated):
             return combine(accumulated, element)
 
         # The region builder reads the block argument types off the annotations,
         # and the element type is only known here, so they are set rather than
         # written.
-        body.__annotations__ = {"accumulated": elt_t, "element": elt_t}
+        body.__annotations__ = {"element": elt_t, "accumulated": elt_t}
         return linalg.reduce(
             result=[ir.RankedTensorType.get(extents, elt_t)],
             inputs=list(ins),
@@ -2060,8 +3163,15 @@ class KtirBuilder:
         reducing = bool(step.reduce_dims)
         attrs = dict(step.attrs)
 
+        # A generic's region binds one argument per input and then the ``outs``
+        # accumulator, so a reducing nest's accumulator arrives LAST.  A combiner
+        # wants it first (see ``_emit_reduce``), hence the rotation; a parallel
+        # nest drops it and keeps the inputs in the order the op names them,
+        # which is the order ``sub`` and ``realdiv`` pin.
         def body(*args):
-            return payload(*(args if reducing else args[:-1]), **attrs)
+            if reducing:
+                return payload(args[-1], *args[:-1], **attrs)
+            return payload(*args[:-1], **attrs)
 
         return linalg.generic(
             inputs=list(ins),
