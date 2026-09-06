@@ -6,6 +6,7 @@ test_suite_config:
       tests:
         - names:
             - TestFP8Operations::test_(quantize_dequantize_fp8_small_range|quantize_dequantize_fp8_medium_range|quantize_dequantize_fp8_boundary_cases|quantize_dequantize_fp8_production_shapes|qfp8ch_basic_conversion|fp8todl16_basic_conversion).*
+            - TestFP8Operations::test_(quantscalepertokenfp8_basic|quantscalepertokenfp8_numerical_correctness|quantscalepertokenfp8_custom_scale_ub|quantscalepertokenfp8_production_shapes|quantscalepertokenfp8_zero_input_handling|quantscalepertokenfp8_with_quantize_integration|quantscalepertokenfp8_edge_cases|quantscalepertokenfp8_scale_ub_validation).*
           mode: mandatory_success
           tags:
             - ops__inductor-fp8

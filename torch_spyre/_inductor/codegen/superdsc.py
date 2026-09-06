@@ -20,9 +20,8 @@ from typing import Any
 from sympy import Expr, Integer, Symbol
 from torch._inductor.virtualized import V
 
-from torch_spyre._C import DataFormats
+from torch_spyre._C import DataFormats, ElementArrangement
 from torch_spyre._inductor import config as _spyre_config
-from torch_spyre._C import ElementArrangement
 from torch_spyre._inductor.constants import (
     CONV2D_DIM_LABELS,
     CONV2D_FWD_OP,
@@ -41,6 +40,7 @@ from torch_spyre._inductor.constants import (
     OUTPUT_DIM_LABELS,
     POOL_DIM_LABELS,
     POOL_OPS,
+    QUANTSCALEPERTOKENFP8_OP,
     RESTICKIFY_OP,
     TOPK_OPS,
     KEEP_BY_INDEX_OP,
@@ -1538,6 +1538,9 @@ def _create_sdsc_tensors(
 def _get_op_func(op: str, is_reduction: bool, output_scales: dict) -> str:
     if _is_pool(op) or _is_conv(op):
         return op
+    # quantscalepertokenfp8 maps directly to deeptools operator (no "nonstick" suffix)
+    if op == QUANTSCALEPERTOKENFP8_OP:
+        return op
     if (
         is_reduction
         and not _is_matmul(op)
@@ -1954,7 +1957,11 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
     # virtual mb=1 row when the op's tensor has only the stick dim.
     mb_sym: Symbol | None = None
     if (
-        (DtypeOpTable.is_dtype_op(op_spec.op) or op_spec.op == "qfp8ch")
+        (
+            DtypeOpTable.is_dtype_op(op_spec.op)
+            or op_spec.op == "qfp8ch"
+            or op_spec.op == QUANTSCALEPERTOKENFP8_OP
+        )
         and op_spec.op != IDENTITY_OP
         and op_stick_dim is not None
         and all(d is op_stick_dim for d in op_dim_order)
@@ -2295,6 +2302,10 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
                             f"ways; expected work division to block it unless the "
                             f"memory-span limit required the split."
                         )
+    # quantscalepertokenfp8 requires only input tensor (not output) to match DDL template
+    if op_spec.op == QUANTSCALEPERTOKENFP8_OP:
+        num_inputs = 1
+
     # Pool-specific SDSC field values (#3510).  Empty for non-pool ops.
     pool_sdsc_fields = (
         _avgpool_sdsc_fields(sdsc_iteration_space, pool_params_out) if is_pool else {}

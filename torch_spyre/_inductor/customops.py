@@ -13,13 +13,16 @@
 # limitations under the License.
 
 from typing import Optional, Sequence
+
 import torch
 import torch._dynamo
 import torch._higher_order_ops.effects
-from torch._inductor.fx_passes.reinplace import inplaceable_ops, InplaceableOp
+from torch._inductor.fx_passes.reinplace import InplaceableOp, inplaceable_ops
+
 from torch_spyre.ops.eager import compile_once
 from torch_spyre.ops.fallbacks import warn_fallback
 
+from .constants import FP8_E4M3FN_MAX
 from .errors import Unsupported
 
 aten = torch.ops.aten
@@ -814,6 +817,63 @@ def qfp8ch(input: torch.Tensor) -> torch.Tensor:
 def _(input: torch.Tensor) -> torch.Tensor:
     # Output is FP8 with same shape as input
     return torch.empty(input.size(), dtype=torch.float8_e4m3fn, device=input.device)
+
+
+@torch.library.custom_op(
+    "spyre::quantscalepertokenfp8", mutates_args=(), device_types="spyre"
+)
+def quantscalepertokenfp8(
+    input: torch.Tensor, scale_ub: float = FP8_E4M3FN_MAX
+) -> torch.Tensor:
+    """
+    Compute per-token quantization scale for FP8 conversion.
+
+    Maps to the deeptools ``quantscalepertokenfp8`` fused operator.
+    The hardware executes the following sequence of FP16 operations per token:
+
+    1. ``amax = max(abs(input), dim=-1, keepdim=True)``
+       — absolute-maximum reduction over the hidden (stick) dimension.
+    2. ``scale = amax * mulConst``
+       — multiply by ``mulConst`` (= ``1 / scale_ub``, FP16-encoded).
+    3. ``scale = max(scale, clipMin)``
+       — clamp from below; ``clipMin`` = ``QUANTSCALEPERTOKENFP8_CLIP_MIN``
+       (prevents the scale from collapsing to zero for all-zero or very small tokens).
+    4. ``scale = min(scale, clipMax)``
+       — clamp from above; ``clipMax`` = ``QUANTSCALEPERTOKENFP8_CLIP_MAX``
+       (prevents FP16 overflow for very large tokens).
+
+    The FP16 encoding of ``mulConst`` introduces up to one ULP of rounding
+    relative to a float32 reference, so device output may differ from a plain
+    ``amax / scale_ub`` by up to ~2 × FP16 epsilon (≈ 9.8e-4 relative error).
+
+    Args:
+        input: Input tensor (FP16), shape [*, hidden].
+        scale_ub: Upper bound for scaling; ``mulConst = 1 / scale_ub`` is
+            FP16-encoded before use on device.
+            Default: ``FP8_E4M3FN_MAX`` (448.0).
+
+    Returns:
+        Per-token scale tensor (FP16), shape [*, 1].
+
+    Example:
+        >>> x = torch.randn(2, 4, 4096, dtype=torch.float16, device='spyre')
+        >>> scale = torch.ops.spyre.quantscalepertokenfp8(x)
+        >>> # scale.shape = [2, 4, 1]
+        >>> x_fp8 = torch.ops.spyre.quantize_fp8_with_scale(x, scale)
+    """
+    pass
+
+
+@quantscalepertokenfp8.register_fake
+def _(input: torch.Tensor, scale_ub: float = FP8_E4M3FN_MAX) -> torch.Tensor:
+    if input.ndim < 1:
+        raise ValueError(
+            "quantscalepertokenfp8 requires input with at least 1 dimension "
+            "(the hidden dim to reduce), got a scalar (ndim=0)."
+        )
+    out_shape = list(input.shape)
+    out_shape[-1] = 1
+    return torch.empty(out_shape, dtype=input.dtype, device=input.device)
 
 
 @torch.library.custom_op(
