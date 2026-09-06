@@ -24,6 +24,7 @@ from torch._inductor.ir import (
 )
 from torch._inductor.virtualized import V
 from torch._inductor.ops_handler import WrapperHandler
+from torch.utils._sympy.value_ranges import ValueRanges, bound_sympy
 
 import sympy
 
@@ -682,9 +683,26 @@ def _would_produce_lx_back_gap(
                     if device_size[d] > 1:
                         return True
                     continue
-                sym = next(iter(syms))
-                it_dim_size = int(dep.ranges[sym])
-                if device_size[d] > it_dim_size:
+                if any(sym not in dep.ranges for sym in syms):
+                    continue
+                # A device coordinate may be walked by several iteration symbols
+                # (``2*d0 + floor(d2/64)``), so the covered extent is the
+                # expression's upper bound over their ranges, not one symbol's
+                # range. Picking one out of the ``free_symbols`` *set* also made
+                # the verdict depend on PYTHONHASHSEED.
+                covered = (
+                    int(
+                        bound_sympy(
+                            coord_expr,
+                            {
+                                sym: ValueRanges(0, int(dep.ranges[sym]) - 1)
+                                for sym in syms
+                            },
+                        ).upper
+                    )
+                    + 1
+                )
+                if device_size[d] > covered:
                     return True
     return False
 

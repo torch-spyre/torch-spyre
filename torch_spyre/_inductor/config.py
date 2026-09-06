@@ -163,7 +163,7 @@ sdsc_cache: bool = os.environ.get("SPYRE_INDUCTOR_SDSC_CACHE", "1") == "1"
 
 # Layout solver class used by default in scratchpad.allocator.ScratchpadAllocator.
 # Options:
-#  "greedy":       GreedyLayoutSolver (default),
+#  "greedy":       GreedyLayoutSolver,
 #  "bestfit":      BestFitLayoutSolver,
 #  "firstfit":     FirstFitLayoutSolver,
 #  "simulated_annealing":  SimulatedAnnealingLayoutSolver, or -- when
@@ -171,7 +171,7 @@ sdsc_cache: bool = os.environ.get("SPYRE_INDUCTOR_SDSC_CACHE", "1") == "1"
 #              joint work-division + LX-placement annealer. Two different
 #              solvers sharing one config value, not one solver in two modes.
 #  "cpsat":    CpSatLayoutSolver (OR-Tools CP-SAT joint core-division +
-#              LX placement, minimizing HBM transfer traffic).
+#              LX placement, minimizing HBM transfer traffic) (default).
 #
 # For "cpsat" and "simulated_annealing" the value names a solver *family* whose
 # joint-ness is selected by ``co_optimizing_lx_planning``; for the gap-based

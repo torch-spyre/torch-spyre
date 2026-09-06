@@ -14,7 +14,7 @@
 
 """Cross-check our SPYRE_PROFILE_SYNC min-of-N against the PyTorch profiler.
 
-The torch.profiler ``PrivateUse1`` activity (needs the kineto-spyre wheel -- see
+The torch.profiler ``PrivateUse1`` activity (see
 docs/source/user_guide/profiling/pytorch_profiler.md) reports a **"Self SPYRE"**
 column = the TRUE per-kernel device time. Two uses:
 
@@ -1156,12 +1156,14 @@ def _run():
         k_med = k_min = k_mean = k_std = k_cv = memset = other = 0.0
     # A profiler that produced no Spyre events yields 0.0 here, which reads as a
     # valid degenerate measurement rather than a failure. Say so loudly: the usual
-    # cause is a kineto build that does not match this PyTorch version, and a
-    # silent kernel_us=0 would be folded into the database as real data.
+    # cause is a torch_spyre build with USE_SPYRE_PROFILER=0 or a libaiupti that
+    # does not match this PyTorch version, and a silent kernel_us=0 would be
+    # folded into the database as real data.
     if not kernels or k_med <= 0.0:
         print(
             "WARNING: the profiler reported no Spyre device time. "
-            "Check that the kineto-spyre build matches this PyTorch version "
+            "Check that torch_spyre was built with USE_SPYRE_PROFILER=1 and "
+            "that libaiupti matches this PyTorch version "
             "(docs/source/user_guide/profiling/pytorch_profiler.md). "
             "The measurement below is NOT usable.",
             file=sys.stderr,

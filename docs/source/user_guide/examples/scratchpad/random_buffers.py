@@ -39,7 +39,7 @@ from torch_spyre._inductor.scratchpad.cooling_schedules import (
     ExponentialCoolingSchedule,
 )
 from torch_spyre._inductor.scratchpad.simulated_annealing import (
-    SimulatedAnnealingSolverWithBuffers,
+    SimulatedAnnealingLayoutSolver,
 )
 from torch_spyre._inductor.scratchpad.firstfit_bestfit_solver import (
     FirstFitLayoutSolver,
@@ -83,7 +83,7 @@ ff_quality = sum(b.size for b in ff_buffers if b.address is not None)
 print(f"First-fit quality: {ff_quality}/{total_size}")
 
 # Simulated annealing, seeded from the first-fit ordering.
-solver = SimulatedAnnealingSolverWithBuffers(
+solver = SimulatedAnnealingLayoutSolver(
     buffers,
     capacity,
     alignment=1,

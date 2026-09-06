@@ -1117,6 +1117,10 @@ self.passes = [
     _maybe_coarse_tile_hints,      # reorder_unhinted_interlopers + hints_to_coarse_tile_groups
                                    # + coarse_tile, on host-side FixedLayout
     #
+    # Matmul K padding (pre-stickification)
+    insert_bmm_padding,            # pads y's K on host FixedLayout; stickification
+                                   # lays out / restickifies the padded buffer
+    #
     # Tensor Layout (Stickification)
     split_multi_ops,
     propagate_spyre_tensor_layouts,
@@ -1125,7 +1129,7 @@ self.passes = [
     finalize_layouts,
     insert_restickify,
     insert_post_mutation_restickify,
-    insert_bmm_padding,
+    insert_restickify_padding,
     #
     dedup_and_promote_constants,
     #
@@ -1164,11 +1168,13 @@ post-stickification slot below, because span arithmetic needs
 `FixedTiledLayout.device_layout` (device size, stride map), which does not
 exist yet pre-stickification.
 
-**Must run after stickify and padding.**  `propagate_spyre_tensor_layouts`,
-`insert_restickify`, and `insert_bmm_padding` establish the final tiled
-memory layout for each tensor.  The span-overflow half of coarse tiling
-must see the post-stickify, post-padding shapes or it will split on the
-wrong dimension or produce a non-stick-aligned inner size.
+**Must run after stickify and padding.**  `insert_bmm_padding` (which runs
+before stickification so the padded buffer is laid out like any other),
+`propagate_spyre_tensor_layouts`, `insert_restickify`, and
+`insert_restickify_padding` establish the final tiled memory layout for each
+tensor.  The span-overflow half of coarse tiling must see the post-stickify,
+post-padding shapes or it will split on the wrong dimension or produce a
+non-stick-aligned inner size.
 
 **Must run before `work_distribution`.**  `work_distribution` commits
 symbol-keyed `iteration_space_ownership` on each `ir.Operation` to assign

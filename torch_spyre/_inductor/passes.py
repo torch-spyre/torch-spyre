@@ -464,6 +464,17 @@ class CustomPreSchedulingPasses:
             _maybe_reorder_unhinted_interlopers,
             _maybe_coarse_tile_hints,
             #
+            # Matmul K padding (pre-stickification)
+            # Pads y's K to a stick boundary while every buffer still has a
+            # plain host FixedLayout.  The padded buffer then flows through
+            # stickification like a user-written F.pad: propagate_spyre_tensor_layouts
+            # picks its layout and finalize_layouts plans any restickify it needs
+            # (e.g. a transposed nn.Linear weight, issue #4208).  Running after
+            # insert_restickify would have to pad a restickify output, whose
+            # device layout and index expressions cannot be reconciled with a
+            # grown host extent.
+            insert_bmm_padding,
+            #
             # Tensor Layout (Stickification)
             split_multi_ops,
             propagate_spyre_tensor_layouts,
@@ -475,7 +486,6 @@ class CustomPreSchedulingPasses:
             enforce_indirect_access_layout,
             insert_post_mutation_restickify,
             insert_restickify_padding,
-            insert_bmm_padding,
             #
             dedup_and_promote_constants,
             #

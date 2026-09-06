@@ -7,8 +7,10 @@ Two modes are available:
 
 1. **CPU-only** — no extra install; measures host-side Python and
    `torch.compile` activity.
-2. **CPU + PrivateUse1** — measures CPU *and* Spyre-side kernel activity;
-   requires the [`kineto-spyre`][kineto-spyre] PyTorch wheel.
+2. **CPU + PrivateUse1** — measures CPU *and* Spyre-side kernel activity.
+   No extra install either: the AIUPTI/Kineto activity-tracing support is
+   built directly into `torch_spyre`'s native extension (gated by the
+   `USE_SPYRE_PROFILER` build flag, on by default).
 
 ## CPU-only (no extra install)
 
@@ -29,16 +31,7 @@ Inductor stage.
 
 ## CPU + PrivateUse1
 
-Install a matching [`kineto-spyre`][kineto-spyre] wheel for your
-PyTorch version (check the [releases page][kineto-spyre-releases] for
-the current combination). Example URL for PyTorch 2.10.0:
-
-```bash
-uv pip install --no-deps --force-reinstall \
-  https://github.com/IBM/kineto-spyre/releases/download/torch-2.10.0.aiu.kineto.1.1.1/torch-2.10.0+aiu.kineto.1.1.1-cp312-cp312-linux_x86_64.whl
-```
-
-Then profile with `ProfilerActivity.PrivateUse1`:
+Profile with `ProfilerActivity.PrivateUse1`:
 
 ```python
 import torch
@@ -177,6 +170,4 @@ Full reference lives in the upstream
 - [Device monitoring](device_monitoring.md) — `aiu-smi` telemetry
   alongside `torch.profiler`
 
-[kineto-spyre]: https://github.com/IBM/kineto-spyre
-[kineto-spyre-releases]: https://github.com/IBM/kineto-spyre/releases
 [torch-profiler-docs]: https://pytorch.org/docs/stable/profiler.html

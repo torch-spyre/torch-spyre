@@ -548,6 +548,79 @@ class TestSpyreTensorLayout(TestCase):
             "Expected cache hit when SpyreTensorLayout is the same as previous call",
         )
 
+    def test_flattened_attention_view_feeds_linear_across_compiles(self):
+        """A BLHD-backed BHLD result must be safe for a later projection.
+
+        Attention kernels naturally produce ``[B,H,L,D]`` with token-major
+        backing storage. A separately compiled transpose+reshape therefore
+        returns a logically contiguous ``[B,L,H*D]`` view whose device layout
+        still has H and D factorized. The next compiled linear must canonicalize
+        that input instead of presenting two contraction dimensions to the
+        backend.
+        """
+        B, L, H, D = 1, 8, 32, 128
+        hidden = H * D
+        torch.manual_seed(0xAFFE)
+        x = torch.randn(B, L, hidden, dtype=torch.float16)
+        weight = torch.randn(hidden, hidden, dtype=torch.float16) / hidden**0.5
+        residual = torch.randn(B, L, hidden, dtype=torch.float16)
+        expected = torch.nn.functional.linear(x, weight) + residual
+
+        def project(x, weight, residual):
+            return torch.nn.functional.linear(x, weight) + residual
+
+        factorized_layout = SpyreTensorLayout(
+            [L, D // 64, H, 64],
+            [hidden, 64, D, 1],
+            get_device_dtype(torch.float16),
+        )
+        flattened = x.to(device_layout=factorized_layout)
+        self.assertEqual(flattened.device_tensor_layout(), factorized_layout)
+        actual = torch.compile(project, dynamic=False)(
+            flattened, weight.to("spyre"), residual.to("spyre")
+        ).cpu()
+        torch.testing.assert_close(actual, expected, atol=0.02, rtol=0.02)
+
+    @parametrize("H,N_KV,LQ", [(4, 2, 8), (32, 8, 1)])
+    def test_sdpa_output_feeds_linear_in_same_graph(self, H, N_KV, LQ):
+        """A fused SDPA -> BL(H*D) view -> linear gets one contraction dim."""
+        B, LK, D = 1, 64, 128
+        hidden = H * D
+        q = torch.randn(B, H, LQ, D, dtype=torch.float16)
+        k = torch.randn(B, N_KV, LK, D, dtype=torch.float16)
+        v = torch.randn(B, N_KV, LK, D, dtype=torch.float16)
+        weight = torch.randn(hidden, hidden, dtype=torch.float16) / hidden**0.5
+        query_positions = torch.arange(LK - LQ, LK).view(1, 1, LQ, 1)
+        key_positions = torch.arange(LK).view(1, 1, 1, LK)
+        mask = torch.where(
+            key_positions <= query_positions,
+            torch.tensor(0.0, dtype=torch.float16),
+            torch.tensor(torch.finfo(torch.float16).min / 2, dtype=torch.float16),
+        )
+
+        def attention_project(q, k, v, mask, weight):
+            out = torch.nn.functional.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                attn_mask=mask,
+                dropout_p=0.0,
+                scale=D**-0.5,
+                enable_gqa=True,
+            )
+            out = out.transpose(1, 2).reshape(B, LQ, hidden)
+            return torch.nn.functional.linear(out, weight)
+
+        expected = attention_project(q, k, v, mask, weight)
+        actual = torch.compile(attention_project, dynamic=False)(
+            q.to("spyre"),
+            k.to("spyre"),
+            v.to("spyre"),
+            mask.to("spyre"),
+            weight.to("spyre"),
+        ).cpu()
+        torch.testing.assert_close(actual, expected, atol=0.1, rtol=0.1)
+
 
 if __name__ == "__main__":
     run_tests()

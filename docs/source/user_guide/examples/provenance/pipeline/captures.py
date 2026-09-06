@@ -57,10 +57,25 @@ def _safe(obj: Any) -> str:
 
 
 def _first_source_line(stack_trace: Any) -> str | None:
+    """Return the deepest actual source line from a Python stack trace.
+
+    Python 3.11+ appends a caret-underline line (e.g. ``^^^^^^^^^^^``) below
+    the source line it points at, so the last non-empty line is not always
+    source text; skip trailing lines that are pure caret/tilde markers.
+
+    Assumes a stack-only trace, as Dynamo's ``meta["stack_trace"]`` is. A
+    full ``traceback.format_exc()`` blob also ends in an exception-message
+    line (e.g. ``TypeError: ...``), which this does not attempt to detect
+    or skip.
+    """
     if not isinstance(stack_trace, str):
         return None
     lines = [ln.strip() for ln in stack_trace.splitlines() if ln.strip()]
-    return lines[-1] if lines else None
+    for line in reversed(lines):
+        if line and set(line) <= {"^", "~"}:
+            continue
+        return line
+    return None
 
 
 def _node_name(n: Any) -> str:

@@ -34,6 +34,7 @@
 #include "logging.h"
 #include "module.h"
 #include "spyre_allocator.h"
+#include "spyre_composite_address.h"
 #include "spyre_error.h"
 #include "spyre_guard.h"
 #include "spyre_mem.h"
@@ -193,16 +194,11 @@ void SpyreStream::copyAsync(const at::Tensor& src,
     // Get SpyreTensorLayout using the public API
     SpyreTensorLayout stl = get_spyre_tensor_layout(*dev_tensor);
 
-    // Extract device allocation from Spyre tensor storage
-    auto* spyre_impl =
-        static_cast<SpyreTensorImpl*>(dev_tensor->unsafeGetTensorImpl());
-    auto& storage = spyre_impl->storage();
-    auto* ctx = static_cast<SharedOwnerCtx*>(storage.data_ptr().get_context());
-
     DataConversionInfo dci = generate_dci(
         cpu_tensor, dev_tensor, stl, cpu_tensor->storage_offset(), host2device);
 
-    copyAsyncImpl(cpu_ptr, &ctx->composite_addr, &dci, host2device);
+    copyAsyncImpl(cpu_ptr, get_composite_address(*dev_tensor), &dci,
+                  host2device);
 
   } else {
     TORCH_CHECK(false, "Unsupported copy types: src on ", src.device(),

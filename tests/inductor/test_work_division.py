@@ -12,8 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 import unittest
+from collections import namedtuple
 from contextlib import ExitStack
+from typing import NamedTuple
 from unittest.mock import MagicMock, patch
 
 import sympy
@@ -37,6 +40,7 @@ from torch_spyre._inductor.constants import (
     DEPTHWISE_CONV2D_OP,
 )
 from torch_spyre._inductor.pass_utils import SchedNodeArg
+from torch_spyre._inductor.scratchpad import allocator as allocator_module
 from torch_spyre._inductor.scratchpad.allocator import (
     CoOptimizingAllocator,
     CoreDivision,
@@ -47,6 +51,7 @@ from torch_spyre._inductor.work_division import (
     _cost_model_matmul_planner,
     _default_split,
     enumerate_work_division_candidates,
+    work_division_context_for_op,
     work_division_splits_are_legal,
     multi_dim_iteration_space_split,
     span_reduction_pass,
@@ -293,6 +298,391 @@ class TestWorkDivisionCandidates(unittest.TestCase):
         ):
             candidates = enumerate_work_division_candidates(op, 8)
         self.assertEqual(candidates, [{x: 1}, {x: 2}])
+
+
+class _Probe(NamedTuple):
+    """One externally supplied split and the verdict each entry point owes it.
+
+    ``committed`` is :func:`work_division_splits_are_legal` -- the op's own
+    constraints plus the committed span floors, asked of a split that is
+    already committed. ``proposed`` is :meth:`WorkDivisionContext.is_legal`,
+    which adds the case's core budget and the ``MAX_SPAN_BYTES`` cap. They
+    differ exactly where those two extra rules bite.
+    """
+
+    splits: dict
+    committed: bool
+    proposed: bool
+
+
+def _by_name(splits):
+    """A split keyed by symbol name. sympy symbols are unorderable, so a raw
+    symbol-keyed dict makes ``assertEqual``'s diff machinery raise instead of
+    printing what differs."""
+    return {v.name: factor for v, factor in splits.items()}
+
+
+class _CandidateCase:
+    """One (op, patched context) scenario and the answers it must produce.
+
+    ``candidates`` is the whole enumeration, in ``axes`` order; each entry in
+    ``probes`` is a :class:`_Probe`, a split supplied from outside the
+    enumeration. Both are literals, so a rule change fails here and is re-read
+    rather than re-derived.
+    """
+
+    def __init__(
+        self,
+        name,
+        op,
+        it_space,
+        output_td,
+        max_cores,
+        axes,
+        candidates,
+        probes,
+        input_tds=(),
+        it_space_adjusted=None,
+        stick_vars=None,
+        constraints=None,
+        symbol_meta=None,
+    ):
+        self.name = name
+        self.op = op
+        self.it_space = it_space
+        self.output_td = output_td
+        self.max_cores = max_cores
+        self.axes = tuple(axes)
+        self.candidates = list(candidates)
+        self.probes = list(probes)
+        self.input_tds = list(input_tds)
+        self.it_space_adjusted = (
+            it_space if it_space_adjusted is None else it_space_adjusted
+        )
+        self.stick_vars = stick_vars or {}
+        self.constraints = constraints or ConstraintResult()
+        self.symbol_meta = symbol_meta
+
+    def patches(self):
+        """Patch the module inputs a work-division context is derived from."""
+        rw = MagicMock(
+            writes=[self.output_td.dep], reads=[td.dep for td in self.input_tds]
+        )
+        stack = ExitStack()
+        for target, kwargs in [
+            ("iteration_space_from_op", {"return_value": self.it_space}),
+            (
+                "collect_tensor_deps",
+                {"return_value": (self.input_tds, self.output_td)},
+            ),
+            ("op_read_writes", {"return_value": rw}),
+            ("get_mem_deps_from_rw", {"return_value": []}),
+            (
+                "adjust_it_space_for_sticks",
+                {"return_value": (self.it_space_adjusted, self.stick_vars)},
+            ),
+            (
+                "collect_work_division_constraints",
+                {"return_value": self.constraints},
+            ),
+        ] + (
+            []
+            if self.symbol_meta is None
+            else [("_collect_symbol_metadata", {"return_value": self.symbol_meta})]
+        ):
+            stack.enter_context(
+                patch(
+                    f"torch_spyre._inductor.work_division.{target}",
+                    **kwargs,
+                )
+            )
+        return stack
+
+
+def _candidate_cases():
+    """A corpus exercising every branch a candidate is judged by: the three
+    factor bases, the core budget, the span cap, the span floor, the
+    reduction-count rule, blocked dims and hard domains."""
+    x, y, m, k0, k1 = (_isym(n) for n in ("x", "y", "m", "k0", "k1"))
+
+    floor_op = _computed_buffer((8,), name="span_floor")
+    floor_op._work_division_span_min_splits = {x: 2}
+
+    red_out = _tensor_dep("reduction_out", (8,), (m,))
+    red_in = _tensor_dep("reduction_in", (8, 4, 4), (m, k0, k1))
+
+    blocked_out = _tensor_dep("blocked_out", (8, 16), (x, y))
+    stick_out = _tensor_dep("stick_out", (4096, 65536), (x, y))
+
+    return [
+        _CandidateCase(
+            name="span_floor",
+            op=floor_op,
+            it_space={x: 8},
+            output_td=_tensor_dep("span_floor", (8,), (x,)),
+            constraints=ConstraintResult(allowed_splits={x: frozenset({1, 2, 4})}),
+            max_cores=8,
+            axes=(x,),
+            # The floor of 2 removes the unsplit candidate; 8 is outside the
+            # allowed domain.
+            candidates=[{x: 2}, {x: 4}],
+            probes=[
+                _Probe(
+                    {x: 1}, committed=False, proposed=False
+                ),  # below the committed floor of 2
+                # Omits the floored axis, so no factor is checked against a
+                # domain and only the floor itself can reject.
+                _Probe({}, committed=False, proposed=False),
+                _Probe({x: 2}, committed=True, proposed=True),
+                _Probe({x: 4}, committed=True, proposed=True),
+                _Probe(
+                    {x: 8}, committed=False, proposed=False
+                ),  # outside the allowed domain
+            ],
+        ),
+        _CandidateCase(
+            name="two_dims",
+            op=_computed_buffer((8, 16), name="two_dims"),
+            it_space={x: 8, y: 16},
+            output_td=_tensor_dep("two_dims", (8, 16), (x, y)),
+            max_cores=32,
+            axes=(x, y),
+            # The full cross product minus the corner where the product of the
+            # factors exceeds 32 cores.
+            candidates=[
+                {x: 1, y: 1},
+                {x: 1, y: 2},
+                {x: 1, y: 4},
+                {x: 1, y: 8},
+                {x: 1, y: 16},
+                {x: 2, y: 1},
+                {x: 2, y: 2},
+                {x: 2, y: 4},
+                {x: 2, y: 8},
+                {x: 2, y: 16},
+                {x: 4, y: 1},
+                {x: 4, y: 2},
+                {x: 4, y: 4},
+                {x: 4, y: 8},
+                {x: 8, y: 1},
+                {x: 8, y: 2},
+                {x: 8, y: 4},
+            ],
+            # Splits are validated without a core budget, so the 128-core
+            # {8, 16} is legal even though it is not an enumerated candidate.
+            probes=[
+                _Probe({x: 1, y: 1}, committed=True, proposed=True),
+                _Probe({x: 4, y: 4}, committed=True, proposed=True),
+                _Probe(
+                    {x: 8, y: 16}, committed=True, proposed=False
+                ),  # 128 cores: over budget, still committable
+            ],
+        ),
+        _CandidateCase(
+            name="two_reductions",
+            op=_computed_buffer((8,), name="reduction_out"),
+            it_space={m: 8, k0: 4, k1: 4},
+            output_td=red_out,
+            input_tds=[red_in],
+            max_cores=32,
+            axes=(m, k0, k1),
+            # At most one of k0/k1 is ever split, so the (k0, k1) plane keeps
+            # only its two axes and not their product.
+            candidates=[
+                {m: 1, k0: 1, k1: 1},
+                {m: 1, k0: 1, k1: 2},
+                {m: 1, k0: 1, k1: 4},
+                {m: 1, k0: 2, k1: 1},
+                {m: 1, k0: 4, k1: 1},
+                {m: 2, k0: 1, k1: 1},
+                {m: 4, k0: 1, k1: 1},
+                {m: 8, k0: 1, k1: 1},
+            ],
+            probes=[
+                _Probe({m: 2, k0: 1, k1: 1}, committed=True, proposed=True),
+                _Probe({m: 1, k0: 4, k1: 1}, committed=True, proposed=True),
+                _Probe(
+                    {m: 1, k0: 2, k1: 2}, committed=False, proposed=False
+                ),  # two split reduction dims
+            ],
+        ),
+        _CandidateCase(
+            name="blocked_dim",
+            op=_computed_buffer((8, 16), name="blocked_out"),
+            it_space={x: 8, y: 16},
+            output_td=blocked_out,
+            constraints=ConstraintResult(
+                blocked={y}, allowed_splits={x: frozenset({1, 2, 8})}
+            ),
+            max_cores=32,
+            axes=(x, y),
+            # y is blocked, so it stays at 1 throughout; x is held to its
+            # allowed domain.
+            candidates=[{x: 1, y: 1}, {x: 2, y: 1}, {x: 8, y: 1}],
+            probes=[
+                _Probe({x: 2, y: 1}, committed=True, proposed=True),
+                _Probe(
+                    {x: 2, y: 2}, committed=False, proposed=False
+                ),  # splits a blocked dim
+                _Probe(
+                    {x: 4, y: 1}, committed=False, proposed=False
+                ),  # outside x's allowed domain
+            ],
+        ),
+        _CandidateCase(
+            name="stick_basis_and_span_cap",
+            op=_computed_buffer((4096, 65536), name="stick_out"),
+            it_space={x: 4096, y: 65536},
+            it_space_adjusted={x: 4096, y: 1024},
+            stick_vars={y: 64},
+            output_td=stick_out,
+            max_cores=32,
+            axes=(x, y),
+            # y unsplit would leave a per-core span over MAX_SPAN_BYTES, so
+            # every candidate splits it at least twice.
+            candidates=[
+                {x: 1, y: 2},
+                {x: 1, y: 4},
+                {x: 1, y: 8},
+                {x: 1, y: 16},
+                {x: 1, y: 32},
+                {x: 2, y: 2},
+                {x: 2, y: 4},
+                {x: 2, y: 8},
+                {x: 2, y: 16},
+                {x: 4, y: 2},
+                {x: 4, y: 4},
+                {x: 4, y: 8},
+                {x: 8, y: 2},
+                {x: 8, y: 4},
+                {x: 16, y: 2},
+            ],
+            # The span cap is not one of an op's own constraints, so a
+            # committed {x: 1, y: 1} stays legal despite being excluded above.
+            probes=[
+                _Probe(
+                    {x: 1, y: 1}, committed=True, proposed=False
+                ),  # over the span cap, still committable
+                _Probe({x: 4, y: 1}, committed=True, proposed=False),  # likewise
+                _Probe({x: 8, y: 4}, committed=True, proposed=True),
+            ],
+        ),
+        _CandidateCase(
+            name="symbolic_granularity",
+            op=_computed_buffer((1024,), name="symbolic_out"),
+            it_space={x: 1024},
+            output_td=_tensor_dep("symbolic_out", (1024,), (x,)),
+            symbol_meta={x: (1024, 256)},
+            max_cores=32,
+            axes=(x,),
+            # Factors come off the granularity, capped by the core budget.
+            candidates=[{x: 1}, {x: 2}, {x: 4}, {x: 8}, {x: 16}, {x: 32}],
+            probes=[
+                _Probe({x: 1}, committed=True, proposed=True),
+                _Probe({x: 4}, committed=True, proposed=True),
+                _Probe({x: 8}, committed=True, proposed=True),
+            ],
+        ),
+    ]
+
+
+class TestWorkDivisionContextAnswers(unittest.TestCase):
+    """What the candidate seam answers, pinned to literals: the enumeration a
+    core budget yields, the verdict an already-committed split gets, and the
+    context's agreement with both."""
+
+    def test_candidate_lists_are_the_expected_enumeration(self):
+        rejected = []
+        for case in _candidate_cases():
+            with self.subTest(case.name):
+                with case.patches():
+                    actual = enumerate_work_division_candidates(case.op, case.max_cores)
+                    ctx = work_division_context_for_op(case.op, case.max_cores)
+                    domains = [ctx.factor_domain(v) for v in case.axes]
+                self.assertEqual(
+                    [_by_name(c) for c in actual],
+                    [_by_name(c) for c in case.candidates],
+                )
+                self.assertTrue(
+                    case.candidates, "case would prove nothing: no candidates"
+                )
+                rejected.append(
+                    len(case.candidates) < math.prod(len(d) for d in domains)
+                )
+        # At least one case must exercise the whole-split predicate rather than
+        # riding on the per-axis domains alone.
+        self.assertTrue(any(rejected))
+
+    def test_legality_verdicts_are_the_expected_verdicts(self):
+        """Both entry points, on splits supplied from outside the enumeration:
+        ``is_legal`` is asked directly, so a rule it forgets cannot hide behind
+        candidates pre-filtered through :meth:`factor_domain`."""
+        seen = set()
+        for case in _candidate_cases():
+            with self.subTest(case.name):
+                for probe in case.probes:
+                    with case.patches():
+                        committed = work_division_splits_are_legal(
+                            case.op, probe.splits
+                        )
+                        proposed = work_division_context_for_op(
+                            case.op, case.max_cores
+                        ).is_legal(probe.splits)
+                    self.assertEqual(
+                        (committed, proposed),
+                        (probe.committed, probe.proposed),
+                        _by_name(probe.splits),
+                    )
+                    seen.add((probe.committed, probe.proposed))
+        # Agreeing everywhere, or agreeing with each other everywhere, would
+        # prove nothing about the rules or about the difference between them.
+        self.assertEqual(
+            seen, {(True, True), (False, False), (True, False)}, sorted(seen)
+        )
+
+    def test_is_legal_rejects_splits_no_factor_domain_would_produce(self):
+        """``is_legal`` asked about malformed splits, which only a caller that
+        proposes rather than enumerates can supply. ``two_dims`` has no hard
+        allowed-split domains, so the op's own domains constrain nothing here
+        and the axis's factor domain is the only thing that can reject."""
+        case = next(c for c in _candidate_cases() if c.name == "two_dims")
+        x, y = case.axes
+        foreign = _isym("not_an_axis")
+        with case.patches():
+            ctx = work_division_context_for_op(case.op, case.max_cores)
+            self.assertEqual(ctx.constraints.allowed_splits, {})
+            for splits, legal, why in [
+                ({x: 4, y: 4}, True, "divisors of both axes"),
+                ({x: 4}, True, "an omitted axis is unsplit, not illegal"),
+                ({x: 3, y: 1}, False, "3 does not divide 8"),
+                ({x: 0, y: 1}, False, "zero would divide by zero downstream"),
+                ({x: -2, y: 1}, False, "negative factor"),
+                ({foreign: 2}, False, "axis of no iteration space"),
+            ]:
+                with self.subTest(why):
+                    self.assertEqual(ctx.is_legal(splits), legal, _by_name(splits))
+
+    def test_context_answers_match_the_enumeration(self):
+        """The seam itself: the context's axis order is the one a candidate is
+        keyed by, and every enumerated candidate is one the context calls legal
+        and whose factors come from its own per-axis domains."""
+        for case in _candidate_cases():
+            with self.subTest(case.name):
+                with case.patches():
+                    ctx = work_division_context_for_op(case.op, case.max_cores)
+                    candidates = enumerate_work_division_candidates(
+                        case.op, case.max_cores
+                    )
+                    self.assertEqual(ctx.axes, list(case.axes))
+                    domains = {v: ctx.factor_domain(v) for v in ctx.axes}
+                    self.assertTrue(all(ctx.is_legal(c) for c in candidates))
+                    self.assertTrue(
+                        all(
+                            split in domains[v]
+                            for c in candidates
+                            for v, split in c.items()
+                        )
+                    )
 
 
 class TestWorkDivisionSplitLegality(unittest.TestCase):
@@ -987,6 +1377,220 @@ class TestSpanReductionConstraints(unittest.TestCase):
             span_reduction_pass(op, [], 32)
         self.assertEqual(apply_splits.call_args.args[1], {})
         self.assertEqual(must_split.call_args.args[-1], {r0, r1})
+
+
+_FakeView = namedtuple("_FakeView", "work_slice_dims")
+
+
+class TestResidencyEdgeMatching(unittest.TestCase):
+    """The compatibility seam: the pairs :class:`ResidencyEdge` admits for a
+    corpus of policy cases, and the pairwise :meth:`ResidencyEdge.compatible`
+    a generator would call agreeing with the table it replaces."""
+
+    def setUp(self):
+        x, y = _isym("x"), _isym("y")
+        self.view_a = _FakeView(((0, 4),))
+        self.view_b = _FakeView(((0, 2),))
+        self.view_wide = _FakeView(((0, 2), (1, 2)))
+
+        def _div(splits, reduction=None):
+            return CoreDivision(
+                output_splits=dict(splits), reduction_splits=dict(reduction or {})
+            )
+
+        # Consumer: a 4-core slicing, a 2-core one, an 8-core one that slices
+        # the buffer the same way as the first (the stale-LX case), and a
+        # 4-core one slicing two device dims -- the only consumer the wide
+        # parent candidate could pair with, so the matmul guard is what
+        # rejects it rather than a view mismatch.
+        self.consumer_divs = [
+            _div({x: 4}),
+            _div({x: 2}),
+            _div({x: 8}),
+            _div({x: 2, y: 2}),
+        ]
+        self.consumer_views = [
+            self.view_a,
+            self.view_b,
+            self.view_a,
+            self.view_wide,
+        ]
+        # Every parent offers the same two candidates; what differs is the
+        # policy each one trips.
+        self.parent_divs = [_div({x: 4}), _div({x: 2})]
+
+        self.parents = {
+            # Plain match, plus the cores_used guard on consumer index 2.
+            "plain": ([self.view_a, self.view_b], [False, False], [True, True], False),
+            # A partial-reduction write can't host a readable residency.
+            "partial": ([self.view_a, self.view_b], [True, False], [True, True], False),
+            # An unrepresentable slicing is never pinned on.
+            "unrepr": (
+                [self.view_a, self.view_b],
+                [False, False],
+                [False, True],
+                False,
+            ),
+            # A matmul split across >1 device dim: only the primary split is
+            # carried, so the wide candidate drops out and the narrow stays.
+            "matmul": (
+                [self.view_wide, self.view_b],
+                [False, False],
+                [True, True],
+                True,
+            ),
+        }
+        self.op_by_name = {
+            name: self._op(name) for name in list(self.parents) + ["spilled", "clone"]
+        }
+        self.consumer_op = self._op("consumer")
+        self.divisions = {
+            name: self.parent_divs for name in list(self.parents) + ["spilled", "clone"]
+        }
+        self.residency = dict.fromkeys(self.op_by_name, None)
+        self.residency["spilled"] = "no room"
+        self.parent_names = list(self.parents) + ["spilled", "clone", "not_a_buffer"]
+        self.rw = {
+            self.consumer_op: MagicMock(
+                reads=[
+                    MemoryDep(name, x, (x,), (8,))
+                    for name in list(self.parents) + ["spilled", "clone"]
+                ],
+                writes=[MemoryDep("consumer", x, (x,), (8,))],
+            ),
+            **{
+                op: MagicMock(
+                    writes=[MemoryDep(name, x, (x,), (8,))],
+                    reads=[MemoryDep("src", x, (x,), (8,))],
+                )
+                for name, op in self.op_by_name.items()
+            },
+        }
+        # A clone whose write carries a dim its reads do not: it broadcasts,
+        # so no per-core slice of it is produced core-locally.
+        self.rw[self.op_by_name["clone"]] = MagicMock(
+            writes=[MemoryDep("clone", 16 * x + y, (x, y), (8, 16))],
+            reads=[MemoryDep("src", x, (x,), (8,))],
+        )
+
+    @staticmethod
+    def _op(name):
+        op = MagicMock(spec=ComputedBuffer)
+        op.get_name.return_value = name
+        return op
+
+    def _view_for_div(self, op, dep, buf_name, division, prep_cache):
+        name = op.get_name()
+        if name == "consumer":
+            index = self.consumer_divs.index(division)
+            return (self.consumer_views[index], False, True)
+        views, partial, repr_ok, _matmul = self.parents.get(
+            name, ([self.view_a, self.view_b], [False, False], [True, True], False)
+        )
+        index = self.parent_divs.index(division)
+        return (views[index], partial[index], repr_ok[index])
+
+    def _patches(self):
+        stack = ExitStack()
+        for target, kwargs in [
+            ("_view_for_div", {"side_effect": self._view_for_div}),
+            ("op_read_writes", {"side_effect": lambda op: self.rw[op]}),
+            (
+                "op_short_name",
+                {
+                    "side_effect": lambda op: (
+                        "clone" if op.get_name() == "clone" else "pointwise"
+                    )
+                },
+            ),
+            (
+                "_is_matmul_op",
+                {"side_effect": lambda op: op.get_name() == "matmul"},
+            ),
+        ]:
+            stack.enter_context(
+                patch(
+                    f"torch_spyre._inductor.scratchpad.allocator.{target}",
+                    **kwargs,
+                )
+            )
+        return stack
+
+    def _table(self, allocator):
+        return allocator._cd_parent_matches(
+            self.consumer_op,
+            self.consumer_divs,
+            self.parent_names,
+            self.divisions,
+            self.op_by_name,
+            {},
+            self.residency,
+        )
+
+    def test_match_table_is_the_expected_pairs(self):
+        allocator = CoOptimizingAllocator(MagicMock(), size=1)
+        with self._patches():
+            actual = self._table(allocator)
+        # Producers excluded outright ("spilled", "clone") get no entry at all;
+        # "plain" is the only one keeping the wide parent candidate. Consumer
+        # index 2 slices the buffer like index 0 but on 8 cores, so the
+        # cores_used guard drops it everywhere.
+        self.assertEqual(
+            actual,
+            {
+                "plain": [(0, 0), (1, 1)],
+                "partial": [(1, 1)],
+                "unrepr": [(1, 1)],
+                "matmul": [(1, 1)],
+            },
+        )
+
+    def test_compatible_agrees_with_the_table(self):
+        allocator = CoOptimizingAllocator(MagicMock(), size=1)
+        with self._patches():
+            table = self._table(allocator)
+            for parent, pairs in table.items():
+                edge = allocator_module.build_residency_edge(
+                    parent,
+                    self.op_by_name[parent],
+                    self.consumer_op,
+                    self.rw[self.consumer_op].reads,
+                    self.residency[parent],
+                    {},
+                )
+                for i, parent_div in enumerate(self.parent_divs):
+                    for j, consumer_div in enumerate(self.consumer_divs):
+                        self.assertEqual(
+                            edge.compatible(parent_div, consumer_div),
+                            (i, j) in pairs,
+                            f"{parent} ({i}, {j})",
+                        )
+
+    def test_excluded_edges_have_no_edge_object(self):
+        with self._patches():
+            for parent, reason in [
+                ("spilled", "residency"),
+                ("clone", "frame-changing clone"),
+            ]:
+                self.assertIsNone(
+                    allocator_module.build_residency_edge(
+                        parent,
+                        self.op_by_name[parent],
+                        self.consumer_op,
+                        self.rw[self.consumer_op].reads,
+                        self.residency[parent],
+                        {},
+                    ),
+                    reason,
+                )
+
+    def test_no_consumer_op_matches_nothing(self):
+        allocator = CoOptimizingAllocator(MagicMock(), size=1)
+        with self._patches():
+            self.assertEqual(
+                allocator._cd_parent_matches(None, [], [], {}, {}, {}, self.residency),
+                {},
+            )
 
 
 class TestCoOptimizingAllocator(unittest.TestCase):

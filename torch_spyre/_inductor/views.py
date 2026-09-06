@@ -729,6 +729,27 @@ class AlignmentInputs:
     restored_ranges: dict[sympy.Symbol, sympy.Expr | int | float]
 
 
+class UnalignedStickSplit(Unsupported):
+    """A global alignment boundary cuts through one tensor's physical stick."""
+
+    def __init__(
+        self,
+        tensor_index: int,
+        variable: sympy.Symbol,
+        boundary: int,
+        stick_size: int,
+    ) -> None:
+        self.tensor_index = tensor_index
+        self.variable = variable
+        self.boundary = boundary
+        self.stick_size = stick_size
+        super().__init__(
+            "tensor alignment boundary "
+            f"{boundary} for {variable} cuts tensor {tensor_index}'s "
+            f"physical stick of {stick_size} elements"
+        )
+
+
 def build_alignment_inputs(
     iteration_space: Dict[sympy.Symbol, Tuple[sympy.Expr, int]],
     tensors: list[Dict[str, list[sympy.Expr]]],
@@ -880,6 +901,37 @@ def align_tensors_pure(
 
     # sort splits
     splits = {var: sorted(val) for var, val in splits.items()}
+
+    # When a tensor has the canonical pair of an outer-stick coordinate and an
+    # innermost stick coordinate for the same variable, every interior boundary
+    # must fall between physical sticks.  A boundary inside a stick cannot be
+    # represented as a device dimension: the outer-stick adjustment below would
+    # truncate it to zero (for example 16 // 32), or to an incorrect nonzero
+    # extent (for example 48 // 32).  Do not apply this restriction merely
+    # because the innermost coordinate uses the variable: arbitrary coordinate
+    # expressions in preceding dimensions can legally split it at other points.
+    # The final boundary is the logical range endpoint, so a partial last stick
+    # (for example 7 int32 elements in a 32-element stick) remains valid.
+    for tensor_index, (terms, var, physical_stick_size) in enumerate(
+        zip(all_terms, stick_dim, stick_size)
+    ):
+        if var is None:
+            # A constant/broadcast innermost coordinate has no stick loop to split.
+            continue
+        has_outer_stick_coordinate = any(
+            term.var == var and term.den == physical_stick_size for term in terms[:-1]
+        )
+        if not has_outer_stick_coordinate:
+            continue
+        for boundary_expr in splits[var][1:-1]:
+            boundary = _concrete_alignment_value(boundary_expr)
+            if boundary % int(physical_stick_size) != 0:
+                raise UnalignedStickSplit(
+                    tensor_index,
+                    var,
+                    int(boundary),
+                    int(physical_stick_size),
+                )
 
     # create new vars, var ranges, and work division for each variable
     # with one var per segment (split[i], split[i+1])
@@ -1095,17 +1147,26 @@ def tiling_expr_to_device_expr(
     out = sympy.S.Zero
     n = len(stride_map)
     vars = index.free_symbols
+    terms = index.args if isinstance(index, sympy.Add) else (index,)
     for var in vars:
-        # index.xreplace({var: 1}) can degenerate to the bare Python int 1
-        # (not sympy.Integer(1)) when `index` is itself exactly the single
-        # symbol being replaced (e.g. index == var, coefficient 1, no other
-        # additive term) -- sympy auto-simplifies Mul(1, var) to var, and
-        # substituting var -> 1 into var alone returns the literal object
-        # passed in. sympy.sympify coerces that raw int back to a proper
-        # sympy numeric type so the second .xreplace call below (which
-        # every other, non-degenerate case already returns) does not crash
-        # with "'int' object has no attribute 'xreplace'".
-        step = sympy.sympify(index.xreplace({var: 1})).xreplace({v: 0 for v in vars})
+        # step must be var's own coefficient, not index's value at var=1 --
+        # those only coincide when index has zero constant term. `index` can
+        # legitimately carry one here: _general_tile_advance builds it from
+        # dep.index, which bakes in literal offsets from Python-level slicing
+        # (e.g. key[..., start:end, :] for KV-block >= 1 contributes a
+        # constant +start*row_stride term alongside the tiled-dim symbol).
+        # Evaluating at var=1 folded that unrelated constant straight into
+        # the per-level advance coefficient (issue: S=128 flash-attention,
+        # second head-tile group's second KV block reading the wrong head).
+        # Isolate var's own additive term first (mirrors coeff_through_floor
+        # in pass_utils.py -- not reused directly to avoid a views<->pass_utils
+        # import cycle), then take its coefficient, looking through one
+        # floor() layer since a term can be floor(k*var/d).
+        own_term = next((t for t in terms if var in t.free_symbols), sympy.S.Zero)
+        if isinstance(own_term, sympy.floor):
+            step = own_term.args[0].coeff(var)
+        else:
+            step = own_term.coeff(var)
         j = -1  # device dimension for var
         for i in range(n):
             if (

@@ -109,6 +109,32 @@ on:
         type: boolean
         default: false
 
+      # pytorch/pytorch dispatch path only (build_test_pytorch_source.yaml):
+      # override the pinned pytorch-cpu wheel with the exact PyTorch build
+      # torch-spyre's _C.so is compiled against. Empty (default) = every
+      # existing caller keeps installing the pinned wheel unchanged.
+      pytorch_wheel_artifact_name:
+        description: >-
+          Name of a prebuilt PyTorch wheel artifact to install in place of
+          the pinned pytorch-cpu wheel (e.g. a from-source build at a given
+          pytorch_sha). Empty (default) = keep the pinned wheel.
+        required: false
+        type: string
+        default: ''
+
+      # Same pytorch/pytorch dispatch path: skip build_torch_spyre entirely
+      # and install a torch-spyre wheel built elsewhere (e.g. against that
+      # same from-source PyTorch) instead. Empty (default) = every existing
+      # caller keeps building its own wheel unchanged.
+      torch_spyre_wheel_artifact_name:
+        description: >-
+          Name of a prebuilt torch-spyre wheel artifact to install instead of
+          building one. When set, the build_torch_spyre job is skipped.
+          Empty (default) = build torch-spyre from source as usual.
+        required: false
+        type: string
+        default: ''
+
     secrets:
       # ClickHouse connection for the perf job's inline benchmark ingest. The
       # perf report.xml is written on the card runner and is NOT uploaded as an
@@ -271,9 +297,11 @@ jobs:
   build_torch_spyre:
     name: Build torch-spyre wheel (once)
     # Prebaked path skips the build entirely — torch_spyre is already editable-
-    # installed in the baked dev image. (Guarded first so the normal condition is
-    # only evaluated off the prebaked path.)
-    if: ${{ !inputs.prebaked_image && (inputs.rpm_names == '' || inputs.build_torch_spyre) }}
+    # installed in the baked dev image. Same for the wheel-artifact override
+    # path (torch_spyre_wheel_artifact_name set) -- a prebuilt wheel from
+    # elsewhere is installed instead, below. (Guarded first so the normal
+    # condition is only evaluated off those two paths.)
+    if: ${{ !inputs.prebaked_image && inputs.torch_spyre_wheel_artifact_name == '' && (inputs.rpm_names == '' || inputs.build_torch_spyre) }}
     # Compile-only: needs the backend image + SDK toolchain but NO physical Spyre
     # card, so it targets the cardless spyre_pf_x0 pool. This leaves the scarce
     # card runners (spyre_pf_x1/x2) for the test jobs below.
@@ -411,8 +439,23 @@ jobs:
       # Skipped on the RPM path (build_torch_spyre skipped) AND on the prebaked
       # path (torch_spyre already editable-installed in the baked image).
       - name: Install prebuilt torch-spyre
-        if: ${{ !inputs.prebaked_image && needs.build_torch_spyre.result == 'success' }}
+        if: >-
+          ${{ !inputs.prebaked_image &&
+          (needs.build_torch_spyre.result == 'success' || inputs.torch_spyre_wheel_artifact_name != '') }}
         uses: ./.github/actions/install-prebuilt-torch-spyre
+        with:
+          artifact_name: ${{ inputs.torch_spyre_wheel_artifact_name || 'torch-spyre-wheel' }}
+
+      # pytorch/pytorch dispatch path only (build_test_pytorch_source.yaml):
+      # override the pinned pytorch-cpu wheel install-prebuilt-torch-spyre's
+      # `uv sync` just resolved, with the exact PyTorch build torch-spyre's
+      # _C.so is ABI-bound to. Must run AFTER install-prebuilt-torch-spyre so
+      # it wins. No-op (skipped) for every existing caller.
+      - name: Install prebuilt PyTorch
+        if: ${{ inputs.pytorch_wheel_artifact_name != '' }}
+        uses: ./.github/actions/install-prebuilt-pytorch
+        with:
+          artifact_name: ${{ inputs.pytorch_wheel_artifact_name }}
 
       - name: Derive report paths
         run: |
@@ -571,8 +614,23 @@ jobs:
           torch_spyre_dir: ${{ inputs.prebaked_image && env.PREBAKED_TORCH_SPYRE_DIR || 'torch-spyre' }}
 
       - name: Install prebuilt torch-spyre
-        if: ${{ !inputs.prebaked_image && needs.build_torch_spyre.result == 'success' }}
+        if: >-
+          ${{ !inputs.prebaked_image &&
+          (needs.build_torch_spyre.result == 'success' || inputs.torch_spyre_wheel_artifact_name != '') }}
         uses: ./.github/actions/install-prebuilt-torch-spyre
+        with:
+          artifact_name: ${{ inputs.torch_spyre_wheel_artifact_name || 'torch-spyre-wheel' }}
+
+      # pytorch/pytorch dispatch path only (build_test_pytorch_source.yaml):
+      # override the pinned pytorch-cpu wheel install-prebuilt-torch-spyre's
+      # `uv sync` just resolved, with the exact PyTorch build torch-spyre's
+      # _C.so is ABI-bound to. Must run AFTER install-prebuilt-torch-spyre so
+      # it wins. No-op (skipped) for every existing caller.
+      - name: Install prebuilt PyTorch
+        if: ${{ inputs.pytorch_wheel_artifact_name != '' }}
+        uses: ./.github/actions/install-prebuilt-pytorch
+        with:
+          artifact_name: ${{ inputs.pytorch_wheel_artifact_name }}
 
       - name: Run perf benchmark (make tests TEST_TYPE=perf)
         run: |
@@ -748,8 +806,23 @@ jobs:
       # Install the wheel built once by build_torch_spyre — no recompile.
       # Skipped on the RPM path (build skipped) AND on the prebaked path.
       - name: Install prebuilt torch-spyre
-        if: ${{ !inputs.prebaked_image && needs.build_torch_spyre.result == 'success' }}
+        if: >-
+          ${{ !inputs.prebaked_image &&
+          (needs.build_torch_spyre.result == 'success' || inputs.torch_spyre_wheel_artifact_name != '') }}
         uses: ./.github/actions/install-prebuilt-torch-spyre
+        with:
+          artifact_name: ${{ inputs.torch_spyre_wheel_artifact_name || 'torch-spyre-wheel' }}
+
+      # pytorch/pytorch dispatch path only (build_test_pytorch_source.yaml):
+      # override the pinned pytorch-cpu wheel install-prebuilt-torch-spyre's
+      # `uv sync` just resolved, with the exact PyTorch build torch-spyre's
+      # _C.so is ABI-bound to. Must run AFTER install-prebuilt-torch-spyre so
+      # it wins. No-op (skipped) for every existing caller.
+      - name: Install prebuilt PyTorch
+        if: ${{ inputs.pytorch_wheel_artifact_name != '' }}
+        uses: ./.github/actions/install-prebuilt-pytorch
+        with:
+          artifact_name: ${{ inputs.pytorch_wheel_artifact_name }}
 
       - name: Derive report paths
         run: |
@@ -956,8 +1029,23 @@ jobs:
           runner_labels: ${{ format('["x86_64","{0}","{1}","{2}"]', matrix.suite.runner || 'spyre_pf_x1', inputs.runner_label, inputs.image_label) }}
 
       - name: Install prebuilt torch-spyre
-        if: ${{ !inputs.prebaked_image && needs.build_torch_spyre.result == 'success' }}
+        if: >-
+          ${{ !inputs.prebaked_image &&
+          (needs.build_torch_spyre.result == 'success' || inputs.torch_spyre_wheel_artifact_name != '') }}
         uses: ./.github/actions/install-prebuilt-torch-spyre
+        with:
+          artifact_name: ${{ inputs.torch_spyre_wheel_artifact_name || 'torch-spyre-wheel' }}
+
+      # pytorch/pytorch dispatch path only (build_test_pytorch_source.yaml):
+      # override the pinned pytorch-cpu wheel install-prebuilt-torch-spyre's
+      # `uv sync` just resolved, with the exact PyTorch build torch-spyre's
+      # _C.so is ABI-bound to. Must run AFTER install-prebuilt-torch-spyre so
+      # it wins. No-op (skipped) for every existing caller.
+      - name: Install prebuilt PyTorch
+        if: ${{ inputs.pytorch_wheel_artifact_name != '' }}
+        uses: ./.github/actions/install-prebuilt-pytorch
+        with:
+          artifact_name: ${{ inputs.pytorch_wheel_artifact_name }}
 
       - name: Derive report paths
         run: |
@@ -1049,8 +1137,23 @@ jobs:
           runner_labels: ${{ format('["x86_64","spyre_pf_x2","{0}","{1}"]', inputs.runner_label, inputs.image_label) }}
 
       - name: Install prebuilt torch-spyre
-        if: ${{ !inputs.prebaked_image && needs.build_torch_spyre.result == 'success' }}
+        if: >-
+          ${{ !inputs.prebaked_image &&
+          (needs.build_torch_spyre.result == 'success' || inputs.torch_spyre_wheel_artifact_name != '') }}
         uses: ./.github/actions/install-prebuilt-torch-spyre
+        with:
+          artifact_name: ${{ inputs.torch_spyre_wheel_artifact_name || 'torch-spyre-wheel' }}
+
+      # pytorch/pytorch dispatch path only (build_test_pytorch_source.yaml):
+      # override the pinned pytorch-cpu wheel install-prebuilt-torch-spyre's
+      # `uv sync` just resolved, with the exact PyTorch build torch-spyre's
+      # _C.so is ABI-bound to. Must run AFTER install-prebuilt-torch-spyre so
+      # it wins. No-op (skipped) for every existing caller.
+      - name: Install prebuilt PyTorch
+        if: ${{ inputs.pytorch_wheel_artifact_name != '' }}
+        uses: ./.github/actions/install-prebuilt-pytorch
+        with:
+          artifact_name: ${{ inputs.pytorch_wheel_artifact_name }}
 
       - name: Derive report paths
         run: |

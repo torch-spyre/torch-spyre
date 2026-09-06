@@ -76,10 +76,11 @@ to the hardware bound.
 
 The numerator comes from a compiler artifact. When the compiler runs
 with `SENPERFORMANCE=2`, it writes an `ideal_cycles.json` file per
-kernel under `inductor-spyre/sdsc.bundle.mlir/perf/` in the Inductor
-cache directory (`TORCHINDUCTOR_CACHE_DIR`). The `TOTAL` entry in that file
-gives the kernel's ideal cycle count. Convert cycles to time with the
-core clock frequency:
+kernel under `inductor-spyre/<kernel-bundle-dir>/perf/` in the Inductor
+cache directory (`TORCHINDUCTOR_CACHE_DIR`) — `<kernel-bundle-dir>` is the
+same per-bundle directory that holds `bundle.mlir` and the `sdsc_*.json`
+files for that kernel. The `TOTAL` entry in that file gives the kernel's
+ideal cycle count. Convert cycles to time with the core clock frequency:
 
 ```text
 ideal_ms  = ideal_cycles / core_frequency_mhz / 1000
