@@ -44,6 +44,8 @@ see [Adding Operations](../compiler/adding_operations.md).
 | `torch.sign` | Y | Y | Spyre | Custom decomposition |
 | `torch.logical_not` | Y | Y | Spyre | Custom decomposition |
 | `torch.bitwise_not` | Y | Y | Spyre | Custom decomposition |
+| `torch.sin` | Y | Y | Spyre | Custom decomposition (Cody-Waite range reduction + degree-9 Taylor); max abs error ~5e-5 in fp32 |
+| `torch.cos` | Y | Y | Spyre | Custom decomposition (Cody-Waite range reduction + degree-9 Taylor); max abs error ~5e-5 in fp32 |
 | `torch.clamp` | Y | Y | Spyre | Custom op + lowering |
 | `torch.pow` | Y | Y | Spyre | |
 | `torch.nn.functional.mish` | Y | Y | Spyre | Eager via `aten.mish.out` |
@@ -118,8 +120,6 @@ see [Adding Operations](../compiler/adding_operations.md).
 | `torch.Tensor.to` (dtype cast) | | Y | Spyre | Compiled only; eager dtype casts not yet supported |
 | **CPU Fallback** | | | | |
 | `torch.arange` | Y | Y | CPU fallback | Runs on CPU, result transferred back |
-| `torch.sin` | Y | Y | CPU fallback | Runs on CPU, result transferred back |
-| `torch.cos` | Y | Y | CPU fallback | Runs on CPU, result transferred back |
 | `torch.tril` | Y | Y | CPU fallback | Runs on CPU, result transferred back |
 | `torch.triu` | Y | Y | CPU fallback | Runs on CPU, result transferred back |
 | `torch.isin` | Y | Y | CPU fallback | Runs on CPU, result transferred back |

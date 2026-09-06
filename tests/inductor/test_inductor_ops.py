@@ -7029,8 +7029,8 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
     def test_fallback_cpu(self, x):
         def fn(t):
             t = torch.exp(t)  # compiled op
-            t = torch.sin(t)  # fallback op
-            t = torch.exp(t)  # compiled op
+            t = torch.cumsum(t.clamp(-1, 1), dim=-1)  # fallback op (aten.cumsum)
+            t = torch.exp(t.clamp(-1, 1))  # compiled op (clamp keeps exp safe)
             return t
 
         with pytest.warns(UserWarning) as record:

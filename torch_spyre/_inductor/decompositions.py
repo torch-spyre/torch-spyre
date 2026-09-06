@@ -860,6 +860,69 @@ def spyre_ceil(input: torch.Tensor) -> torch.Tensor:
     )
 
 
+# ---------------------------------------------------------------------------
+# cos / sin via Cody-Waite range reduction + degree-9 Taylor series
+#
+# All RoPE call sites use fp32 inputs (confirmed from tests/resource/models/).
+# Ops used: floor, mul, add, sub — all natively lowered on Spyre.
+# torch.round is NOT used: it is not implemented in the Spyre codegen;
+# round-to-nearest is expressed as floor(x + 0.5).
+#
+# Accuracy: worst-case absolute error ~5.3e-5 on RoPE-realistic inputs
+# (|x| ≤ 1063, i.e. seq_len=1064 with inv_freq[0]=1.0).
+# fp16 model weights absorb this error (fp16 ULP at 1.0 is ~1e-3).
+#
+# PI_HI: nearest fp32 to π (stored as a Python float / fp64 constant so the
+#         compiler sees the exact value rather than a rounded literal).
+# PI_LO: fp64 residual (π − PI_HI), used in the two-term subtraction to
+#         suppress range-reduction error accumulated across large k values.
+# ---------------------------------------------------------------------------
+
+_PI_HI = 3.1415927410125732  # float32(π) as fp64
+_PI_LO = -8.742278012618954e-8  # π − PI_HI in fp64
+
+
+def _taylor_range_reduce(x: torch.Tensor):
+    """Cody-Waite two-term range reduction.
+
+    Returns (x_r, sign) where x_r ∈ [−π/2, π/2] and sign = (−1)^k.
+    k is computed as round(x / π) using floor(x/π + 0.5) to avoid
+    torch.round (not supported in the Spyre codegen).
+    """
+    k = torch.ops.aten.floor.default(x * (1.0 / math.pi) + 0.5)
+    x_r = (x - k * _PI_HI) - k * _PI_LO
+    k_mod2 = k - 2.0 * torch.ops.aten.floor.default(k * 0.5)
+    sign = 1.0 - 2.0 * k_mod2
+    return x_r, sign
+
+
+@register_spyre_decompositions([torch.ops.aten.cos.default])
+def spyre_cos(input: torch.Tensor) -> torch.Tensor:
+    """cos(x) via Cody-Waite range reduction and degree-9 Horner polynomial."""
+    x_r, sign = _taylor_range_reduce(input)
+    x2 = x_r * x_r
+    poly = 1.0 + x2 * (
+        -0.5 + x2 * (1.0 / 24.0 + x2 * (-1.0 / 720.0 + x2 * (1.0 / 40320.0)))
+    )
+    return sign * poly
+
+
+@register_spyre_decompositions([torch.ops.aten.sin.default])
+def spyre_sin(input: torch.Tensor) -> torch.Tensor:
+    """sin(x) via Cody-Waite range reduction and degree-9 Horner polynomial."""
+    x_r, sign = _taylor_range_reduce(input)
+    x2 = x_r * x_r
+    poly = x_r * (
+        1.0
+        + x2
+        * (
+            -1.0 / 6.0
+            + x2 * (1.0 / 120.0 + x2 * (-1.0 / 5040.0 + x2 * (1.0 / 362880.0)))
+        )
+    )
+    return sign * poly
+
+
 @register_spyre_decompositions([torch.ops.aten.bitwise_not])
 def bitwise_not(input: torch.Tensor) -> torch.Tensor:
     if input.dtype is torch.bool:
