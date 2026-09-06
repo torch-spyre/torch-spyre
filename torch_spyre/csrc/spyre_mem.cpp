@@ -396,20 +396,26 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
   int64_t dev_offset = dev_tensor->storage_offset();
   int64_t device_offset = 0;
 
+  // While the source strides may differ than the destination strides when the
+  // source in non-dense or overlapping, the source sizes should always match
+  // the destination sizes.
+  //
+  // This is assumed to be true for the following logic, so this check should
+  // not be removed unless the following logic is updated accordingly.
   TORCH_CHECK(cpu_sizes == dev_sizes,
               "Invalid device sizes for host sizes. Expected: ", cpu_sizes,
-              ", got:", dev_sizes);
+              ", got: ", dev_sizes);
 
   if (host2device) {
     TORCH_CHECK(dev_sizes == dma_sizes,
                 "Invalid dma sizes for device sizes. Expected: ", dev_sizes,
-                ", got:", dma_sizes);
+                ", got: ", dma_sizes);
     TORCH_CHECK(dev_strides == dma_strides,
                 "Invalid dma strides for device strides. Expected: ",
-                dev_strides, ", got:", dma_strides);
+                dev_strides, ", got: ", dma_strides);
     TORCH_CHECK(
         dev_offset == 0,
-        "Invalid destination storage offset. Expected: 0, got:", dev_offset);
+        "Invalid destination storage offset. Expected: 0, got: ", dev_offset);
     if (cpu_strides != dev_strides) {
       // If the dev_strides do not match the cpu_strides then the cpu_tensor is
       // slice and/or expanded.
@@ -471,6 +477,9 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
       std::sort(cpu_order.begin(), cpu_order.end(),
                 [&cpu_strides, &cpu_sizes](int64_t i1, int64_t i2) {
                   if (cpu_strides[i1] == cpu_strides[i2]) {
+                    if (cpu_sizes[i1] == 1 && cpu_sizes[i2] == 1) {
+                      return i1 < i2;
+                    }
                     return cpu_sizes[i1] == 1;
                   }
                   return cpu_strides[i1] < cpu_strides[i2];
@@ -481,6 +490,9 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
       for (const auto& i : cpu_order) {
         const int64_t cpu_stride = cpu_strides[i];
         const int64_t dev_stride = dst_strides[i];
+        TORCH_CHECK(
+            dev_stride > 0,
+            "Invalid destination stride. Expected > 0, got: ", dev_stride);
         const int64_t slice = cpu_stride / dev_stride / current_slices;
         if (slice > 1) {
           slices.insert({dev_stride, slice});
@@ -501,7 +513,7 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
   } else {
     TORCH_CHECK(
         cpu_offset == 0,
-        "Invalid destination storage offset. Expected: 0, got:", cpu_offset);
+        "Invalid destination storage offset. Expected: 0, got: ", cpu_offset);
     cpu_sizes = dma_sizes;
     cpu_strides = dma_strides;
     if (c10::multiply_integers(dma_sizes) > dev_tensor->numel()) {
@@ -563,6 +575,9 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
       std::sort(dma_order.begin(), dma_order.end(),
                 [&dma_strides, &dma_sizes](int64_t i1, int64_t i2) {
                   if (dma_strides[i1] == dma_strides[i2]) {
+                    if (dma_strides[i1] != 1 && dma_strides[i2] != 1) {
+                      return i1 > i2;
+                    }
                     return dma_sizes[i1] != 1;
                   }
                   return dma_strides[i1] > dma_strides[i2];
@@ -574,6 +589,10 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
           dev_order.begin(), dev_order.end(),
           [&adjusted_dev_strides, &adjusted_dev_sizes](int64_t i1, int64_t i2) {
             if (adjusted_dev_strides[i1] == adjusted_dev_strides[i2]) {
+              if (adjusted_dev_strides[i1] != 1 &&
+                  adjusted_dev_strides[i2] != 1) {
+                return i1 > i2;
+              }
               return adjusted_dev_sizes[i1] != 1;
             }
             return adjusted_dev_strides[i1] > adjusted_dev_strides[i2];
@@ -892,8 +911,10 @@ at::Tensor spyre_copy_from(const at::Tensor& self, const at::Tensor& dst,
     if (self.is_privateuseone()) {
       auto* spyre_impl =
           static_cast<SpyreTensorImpl*>(self.unsafeGetTensorImpl());
+      const bool expanded = std::ranges::any_of(
+          self.strides(), [](const int64_t& stride) { return stride < 1; });
       const int64_t dma_numel = c10::multiply_integers(spyre_impl->dma_sizes);
-      if (dma_numel < self.numel()) {
+      if (expanded || dma_numel < self.numel()) {
         non_overlapping_and_dense = false;
         c10::IntArrayRef alloc_sizes(spyre_impl->dma_sizes);
         c10::IntArrayRef alloc_strides(spyre_impl->dma_strides);
@@ -923,11 +944,6 @@ at::Tensor spyre_copy_from(const at::Tensor& self, const at::Tensor& dst,
         std::vector<int64_t> view_sizes(dma_rank, 1);
         for (int i = 0; i < self_rank; i++) {
           const int64_t stride = self.strides()[i];
-          if (stride < 1) {
-            // Expanded dimension are not supported within sliced tensors.
-            non_overlapping_and_dense = false;
-            break;
-          }
           const int64_t size = self.sizes()[i];
           if (size == 1) continue;
           for (int j = 0; j < dma_rank; j++) {

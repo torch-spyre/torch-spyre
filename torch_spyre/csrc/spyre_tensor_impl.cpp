@@ -119,12 +119,8 @@ static std::vector<int64_t> dim_map_to_stride_map(
     int32_t d = dim_map[j];
     if (d == -1 || host_size[d] == 1) {
       stride_map[j] = -1;
-    } else if (last_stride[d] == -1) {
-      stride_map[j] = host_stride[d];
-      last_stride[d] = std::min(stride_map[j] * device_size[j],
-                                host_stride[d] * host_size[d]);
     } else {
-      stride_map[j] = last_stride[d];
+      stride_map[j] = last_stride[d] == -1 ? host_stride[d] : last_stride[d];
       last_stride[d] = std::min(stride_map[j] * device_size[j],
                                 host_stride[d] * host_size[d]);
     }

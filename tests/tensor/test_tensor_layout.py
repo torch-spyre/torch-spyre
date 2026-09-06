@@ -429,7 +429,7 @@ class TestSpyreTensorLayout(TestCase):
             ([128, 40], [1, 128]),
         ],
     )
-    def test_to_spyre_layout_explicit_permuted_sliced_batch(self, sizes, strides):
+    def test_to_spyre_permuted_sliced_batch(self, sizes, strides):
         x = torch.empty_strided(sizes, strides, dtype=torch.float16).uniform_(0, 1)
         x_sliced = x[(sizes[0] // 2) :, :]
         x_dev = x_sliced.to("spyre")
@@ -442,7 +442,7 @@ class TestSpyreTensorLayout(TestCase):
             ([128, 40], [1, 128]),
         ],
     )
-    def test_to_spyre_layout_explicit_permuted_sliced_other(self, sizes, strides):
+    def test_to_spyre_permuted_sliced_other(self, sizes, strides):
         x = torch.empty_strided(sizes, strides, dtype=torch.float16).uniform_(0, 1)
         x_sliced = x[:, (sizes[1] // 2) :]
         x_dev = x_sliced.to("spyre")
