@@ -32,6 +32,7 @@ from .oot_test_utilities import (
     _OOT_PLATFORM_ARCH,
     _extract_base_module_name,
     _get_privateuse1_device_type,
+    _log_warning,
 )
 
 # Resolve the registered backend name once at import time.
@@ -510,12 +511,31 @@ class _OOTModuleListPatcher:
         if self._included_modules:
             existing_names = {m.name for m in self._modules_instance.module_info_list}
 
+            # @modules(module_db) snapshots the db at DECORATION time
+            # (`self.module_info_list = list(module_info_iterable)` in
+            # common_modules.py), i.e. when the test file is imported. Modules
+            # registered from edits.modules.include land in module_db later,
+            # during _load_test_suite_config() inside instantiate_test(), so
+            # they are absent from that snapshot and must be injected here --
+            # by their full YAML name, which is the name registration gave them
+            # (see _make_named_module_info_cls). Without this step a YAML-only
+            # module is never a candidate at all, and the filter below has
+            # nothing to keep.
+            for full_name in sorted(self._included_modules):
+                mod_info = module_db_by_name.get(full_name)
+                if mod_info is not None and mod_info.name not in existing_names:
+                    self._modules_instance.module_info_list.append(mod_info)
+                    existing_names.add(mod_info.name)
+
             # Extract base names from YAML names (strip suffixes)
             included_base_names = {
                 _extract_base_module_name(name) for name in self._included_modules
             }
 
-            # Try to find modules in module_db by base name
+            # Try to find modules in module_db by base name. This covers an
+            # include entry that names an upstream module_db module rather than
+            # a YAML-registered one (no suffix to strip, or a suffix used only
+            # to distinguish several entries of the same upstream class).
             for base_name in included_base_names:
                 # Try exact match first
                 mod_info = module_db_by_name.get(base_name)
@@ -530,14 +550,27 @@ class _OOTModuleListPatcher:
                 if mod_info is not None:
                     if mod_info.name not in existing_names:
                         self._modules_instance.module_info_list.append(mod_info)
+                        existing_names.add(mod_info.name)
 
         # filter to global.supported_modules OR included_modules
         # If we have included_modules but no supported_modules, filter to ONLY included_modules
         # This allows per-test module selection via edits.modules.include
         if self._supported_modules is not None or self._included_modules:
-            # Extract base module names from included_modules (strip suffixes like _93b52f93)
-            # YAML names: GraniteRotaryEmbedding_93b52f93
-            # ModuleInfo.name: GraniteRotaryEmbedding
+            # Two distinct name spaces have to be matched here.
+            #
+            # A module registered from edits.modules.include keeps the YAML's
+            # own `name` as its ModuleInfo.name (see _make_named_module_info_cls
+            # in oot_test_common_methods_invocations.py), suffix included --
+            # that is what keeps several entries for the same class (one per
+            # layer, per phase, ...) distinct, both here and in the generated
+            # test name. So those match on the FULL name.
+            #
+            # Entries injected from upstream module_db above were looked up by
+            # base name, so their ModuleInfo.name has no suffix and matches on
+            # the BASE name. Keeping both conditions means a YAML name like
+            # GraniteRMSNorm_4096_layer0 selects the registered per-layer entry
+            # without also having to exist in module_db.
+            included_full_names = set(self._included_modules)
             included_base_names = {
                 _extract_base_module_name(name) for name in self._included_modules
             }
@@ -549,16 +582,32 @@ class _OOTModuleListPatcher:
                     self._supported_modules is not None
                     and m.name in self._supported_modules
                 )
-                or m.name in included_base_names  # Use base names for matching
+                or m.name in included_full_names  # YAML-registered (suffixed)
+                or m.name in included_base_names  # module_db-injected
                 or (
                     self._supported_modules is not None
                     and f"torch.{m.name}" in self._supported_modules
                 )
+                or f"torch.{m.name}" in included_full_names
                 or f"torch.{m.name}"
                 in included_base_names  # Use base names for matching
             ]
             if filtered:
                 self._modules_instance.module_info_list[:] = filtered
+            elif self._included_modules:
+                # An include list that matches nothing is a config/registration
+                # error, not a request to run everything. Falling through to
+                # "leave the list untouched" silently substitutes whatever
+                # upstream module_db happens to hold, which then shows up as a
+                # handful of unrelated modules skipping -- and an exit code of
+                # 0. Say so instead.
+                _log_warning(
+                    "edits.modules.include matched no module in the @modules "
+                    f"list: {sorted(self._included_modules)}. The module list is "
+                    "left unfiltered, so unrelated upstream modules may run or "
+                    "skip. Check that each include entry was registered "
+                    "(module_path importable) and that its name matches."
+                )
 
         # apply edits.modules.exclude
         if self._excluded_modules:

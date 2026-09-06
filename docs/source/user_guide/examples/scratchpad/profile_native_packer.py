@@ -118,7 +118,7 @@ from torch_spyre._inductor.scratchpad.simulated_annealing import (  # noqa: E402
 # The canonical instance generator: the very one the native-vs-Python
 # differential suite and the SA equivalence test drive. The old benchmark
 # inlined its own copy, which can wire a *write-only* in-place parent -- a
-# relationship current validation rejects outright (assert_in_place_parent_is_read),
+# relationship current validation rejects outright (check_in_place_parent_is_read),
 # so that copy no longer runs on this tree at all past n~8. Importing the test's
 # version fixes that and makes the workload provenance exact.
 from tests.inductor.test_perm_layout_solver import _random_buffers  # noqa: E402

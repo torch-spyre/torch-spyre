@@ -19,7 +19,7 @@ from typing import Optional
 from torch_spyre._inductor.scratchpad.plan_solver import (
     LifetimeBoundBuffer,
     MemoryPlanSolver,
-    _assert_in_place_relationships,
+    _check_in_place_relationships,
 )
 from torch_spyre._inductor.logging_utils import get_inductor_logger
 
@@ -192,7 +192,7 @@ class GreedyLayoutSolver(MemoryPlanSolver):
         assert all(buf.address is None for buf in buffers), (
             "Buffers cannot be previously or partially planned"
         )
-        _assert_in_place_relationships(buffers)
+        _check_in_place_relationships(buffers)
 
         # Barred buffers keep address=None and never enter the time-stepping
         # loop, so they can neither be placed nor occupy space others need.

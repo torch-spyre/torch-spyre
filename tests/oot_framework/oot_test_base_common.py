@@ -6,6 +6,8 @@ Shared class and methods for all OOT PyTorch test overrides.
 
 import os
 import json
+import unittest
+from functools import wraps
 from typing import Dict, List, Optional, Set, Tuple
 import warnings
 
@@ -793,8 +795,26 @@ class OOTTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa: F
                 # SKIPPED lines per test.
                 #
                 # Deleting the method entirely removes it from the class so
-                # pytest never collects it
-                delattr(cls, method_name)
+                # pytest never collects it -- EXCEPT when method_name is
+                # identical to the untouched, undecorated method still sitting
+                # on generic_cls's own __dict__ (true for any test with no
+                # dtype/device suffix, e.g. a plain method with no @dtypes/
+                # @ops parametrization). `cls` is built as
+                # type(class_name, (base, generic_cls), {}), so delattr only
+                # removes cls's own override and unmasks the inherited
+                # original, which then runs unfiltered (see issue: YAML
+                # mode:skip silently ignored, tests reaching hardcoded
+                # GPU_TYPE/cuda calls). Fall back to a skip stub in that case.
+                if generic_cls is not None and method_name in generic_cls.__dict__:
+                    _skip_reason = reason or "Skipped by OOT config"
+
+                    @wraps(test)
+                    def _skip(self, _reason=_skip_reason):
+                        raise unittest.SkipTest(_reason)
+
+                    setattr(cls, method_name, _skip)
+                else:
+                    delattr(cls, method_name)
                 continue
 
             # Following lines has been commented out to disable generating

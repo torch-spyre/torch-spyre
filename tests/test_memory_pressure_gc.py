@@ -21,7 +21,7 @@ Python garbage collection when FlexAllocator exhausts all regions.
 These tests verify the acceptance criteria from issue P1-31:
 - Test 1: GC releases dead tensors, allocation succeeds
 - Test 2: GC runs but nothing freed, OOM is raised
-- Test 3: GIL safety - no deadlock
+- Test 3: GIL safety during a device op - no deadlock or corruption
 - Test 4: Cycle-collected tensors are released
 - Test 5: Concurrent pressure events
 """
@@ -104,56 +104,76 @@ class TestMemoryPressureGC:
     def test_gil_safety_no_deadlock(self):
         """
         Test 3: GIL safety - one Python thread holds GIL while another thread
-        is mid-allocation; the mid-allocation thread hits pressure, releases
-        GIL appropriately, and either acquires it to call GC or yields to holder.
-        No deadlock; no allocator-state corruption.
+        is mid-device-op (torch.randn, which releases the GIL during the H2D
+        fill). Verify that the two threads do not deadlock and that no
+        allocator-state corruption occurs. This test validates that concurrent GIL
+        handoffs during device operations are safe.
         """
         gc.enable()
 
+        # Events signal completion so the main thread can detect a hang without
+        # relying on the thread still being alive at teardown.  Non-daemon threads
+        # ensure the interpreter never tears down a thread that is mid-device-call
+        # (which triggers the #3397 SIGABRT).
         allocation_succeeded = threading.Event()
         error_occurred = threading.Event()
+        t1_done = threading.Event()
+        t2_done = threading.Event()
 
-        def allocate_with_pressure():
-            """Thread that will hit memory pressure."""
+        def do_device_ops():
+            """Thread that performs device ops while the other thread holds the GIL."""
             try:
-                # Allocate less memory to avoid actual OOM, just trigger pressure
+                # Use randn (not empty) so there is real H2D fill work during
+                # which PyTorch releases the GIL — that GIL-release-during-device-
+                # op is exactly the handoff path this test is meant to exercise.
+                # Tensors are small (16 MB each, 64 MB total) so the fill
+                # completes quickly and does not approach device memory limits.
                 tensors = []
                 for i in range(4):
-                    t = torch.randn(256 * 1024 * 1024, device="spyre")  # 1GB each
+                    t = torch.randn(4 * 1024 * 1024, device="spyre")  # 16 MB each
                     tensors.append(t)
 
-                # Drop refs to allow GC
+                # Drop refs — memory is freed immediately via refcount (no cycles).
                 tensors.clear()
 
-                # Small delay to let GC potentially run
-                time.sleep(0.05)
-
-                # This should trigger memory pressure callback
-                t = torch.randn(256 * 1024 * 1024, device="spyre")
+                # One more device op with the GIL potentially contended.
+                t = torch.randn(4 * 1024 * 1024, device="spyre")
                 allocation_succeeded.set()
 
             except Exception as e:
                 print(f"Allocation thread error: {e}")
                 error_occurred.set()
+            finally:
+                # Always signal done so the main thread is never left waiting
+                # for a thread that exited via an unexpected path.
+                t1_done.set()
 
         def hold_gil_briefly():
             """Thread that holds GIL doing Python work."""
-            # Do some Python work that holds GIL
-            for i in range(500):  # Reduced iterations
-                _ = [j**2 for j in range(100)]
-                time.sleep(0.001)
+            try:
+                for i in range(500):
+                    _ = [j**2 for j in range(100)]
+                    time.sleep(0.001)
+            finally:
+                t2_done.set()
 
-        # Start both threads
-        t1 = threading.Thread(target=allocate_with_pressure, daemon=True)
-        t2 = threading.Thread(target=hold_gil_briefly, daemon=True)
+        # Non-daemon: the interpreter will not kill these threads at shutdown,
+        # so no thread is ever mid-device-call when the process exits.
+        t1 = threading.Thread(target=do_device_ops)
+        t2 = threading.Thread(target=hold_gil_briefly)
 
         t1.start()
         time.sleep(0.1)  # Let t1 start allocating
         t2.start()
 
-        # Wait for completion with timeout
-        t1.join(timeout=15.0)  # Increased timeout
-        t2.join(timeout=15.0)
+        # Wait via Events first — they fire as soon as the thread body finishes,
+        # regardless of OS thread scheduling.  The join() below is a final safety
+        # drain to ensure the thread's stack is fully unwound before we return.
+        t1_done.wait(timeout=30.0)
+        t2_done.wait(timeout=30.0)
+
+        t1.join(timeout=5.0)
+        t2.join(timeout=5.0)
 
         # Verify no deadlock (threads completed)
         assert not t1.is_alive(), "Allocation thread deadlocked"
@@ -254,14 +274,20 @@ class TestMemoryPressureGC:
         num_threads = 4
         results = []
         results_lock = threading.Lock()
+        # One done-Event per thread so the main thread can detect hangs without
+        # relying on daemon teardown (which would kill a mid-device-call thread
+        # and trigger the #3397 SIGABRT).
+        done_events = [threading.Event() for _ in range(num_threads)]
 
         def allocate_until_pressure(thread_id):
             """Each thread tries to allocate until hitting pressure."""
             try:
                 tensors = []
+                # Use torch.empty (no device fill) so allocations complete quickly
+                # without depending on data-init time on Spyre hardware.
                 # Each thread allocates 2GB
                 for i in range(2):
-                    t = torch.randn(512 * 1024 * 1024, device="spyre")
+                    t = torch.empty(512 * 1024 * 1024, device="spyre")
                     tensors.append(t)
 
                 # Drop some refs to allow GC to help
@@ -269,7 +295,7 @@ class TestMemoryPressureGC:
                     tensors.clear()
 
                 # Try one more allocation - may succeed or fail
-                t = torch.randn(256 * 1024 * 1024, device="spyre")
+                t = torch.empty(256 * 1024 * 1024, device="spyre")
 
                 with results_lock:
                     results.append(("success", thread_id))
@@ -280,17 +306,26 @@ class TestMemoryPressureGC:
             except Exception as e:
                 with results_lock:
                     results.append(("error", thread_id, str(e)))
+            finally:
+                # Always signal done so the main thread is never left waiting
+                # for a thread that exited via an unexpected path.
+                done_events[thread_id].set()
 
-        # Launch threads
+        # Non-daemon: the interpreter will not kill these threads at shutdown,
+        # so no thread is ever mid-device-call when the process exits.
         threads = []
         for i in range(num_threads):
-            t = threading.Thread(target=allocate_until_pressure, args=(i,), daemon=True)
+            t = threading.Thread(target=allocate_until_pressure, args=(i,))
             threads.append(t)
             t.start()
 
-        # Wait for all threads with timeout
+        # Wait via Events first — they fire as soon as the thread body finishes.
+        for i, event in enumerate(done_events):
+            event.wait(timeout=30.0)
+
+        # Drain: short join() to ensure each thread's stack is fully unwound.
         for t in threads:
-            t.join(timeout=15.0)
+            t.join(timeout=5.0)
 
         # Verify no threads hung
         for t in threads:

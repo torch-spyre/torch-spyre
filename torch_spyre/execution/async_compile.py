@@ -55,10 +55,6 @@ def _check_ktir_device_prerequisites() -> None:
     """
     missing = []
 
-    if _spyre_config.bundle_symbolic_args:
-        # The env var, not just config: prepare_kernel.cpp reads it directly.
-        missing.append("set BUNDLE_SYMBOLIC_ARGS=0 (baked addresses are required)")
-
     if not _spyre_config.ktir_device_mlir:
         missing.append("set KTIR_DEVICE_MLIR to a .mlir declaring the target device")
 
@@ -110,7 +106,10 @@ class SpyreAsyncCompile(AsyncCompile):
         )
 
     def sdsc(
-        self, kernel_name: str, specs: Sequence[OpSpec | LoopSpec | UnimplementedOp]
+        self,
+        kernel_name: str,
+        specs: Sequence[OpSpec | LoopSpec | UnimplementedOp],
+        pool_size: int = 0,
     ):
         unimp = find_unimplemented(list(specs))
         if unimp is not None:
@@ -121,7 +120,7 @@ class SpyreAsyncCompile(AsyncCompile):
 
         # Generate SDSC Bundle from OpSpecs
         output_dir = get_output_dir(kernel_name)
-        generate_bundle(kernel_name, output_dir, specs)
+        generate_bundle(kernel_name, output_dir, specs, pool_size=pool_size)
 
         self._provenance_attempt_count += 1
         try:

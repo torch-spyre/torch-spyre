@@ -27,7 +27,7 @@ Some of the key features of the Spyre device are listed below:
 * It delivers exceptional AI compute, exceeding 300 TOPS per card, while consuming just 75W.
 * PCIe gen5 x16 host interface (PCIe form factor card).
 * Each core has a 2 MB LX scratchpad (SRAM), shared between the two corelets within the core.
-* Each core has a 255.996 MiB limit on the contiguous device-memory span it can address. This is a hardware constraint on the addressable range, distinct from the 2 MB LX scratchpad capacity.
+* Each core has a 256 MB limit on the contiguous device-memory span it can address. This is a hardware constraint on the addressable range, distinct from the 2 MB LX scratchpad capacity.
 
 ### Core microarchitecture
 
@@ -75,5 +75,5 @@ Refer to the official product pages and IBM Research blogs to learn more about t
 * [Enhancing enterprise AI with the IBM Spyre Accelerator](https://research.ibm.com/blog/spyre-for-z) — Spyre for IBM Z mainframe AI inference
 * [Expanding AI model training and inference for the open-source community](https://research.ibm.com/blog/pytorch-expanding-ai-model-training-and-inference-for-the-open-source-community) — Spyre in the PyTorch ecosystem
 
-**Internal reference**
+**See also**
 * [Dataflow Architecture Reference](dataflow_architecture.md)

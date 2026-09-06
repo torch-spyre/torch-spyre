@@ -25,6 +25,22 @@ from torch_spyre.profiler._ffdc import CATEGORY_COMPILE_FRONTEND, try_collect
 
 _autoload_lock = threading.Lock()
 
+# Set for the duration of a Spyre ``compile_fx`` call (the ``_wrapper`` Spyre
+# branch below). Read by the invoke_subgraph decomposition monkey-patch
+# (torch_spyre/_monkey_patch.py) to decide whether a nested_compile_region /
+# invoke_subgraph HOP body that inherits its decompositions (config is None)
+# should be re-traced with the Spyre decomp table. The HOP body is re-traced
+# INSIDE the compile_fx call (AOTAutograd / proxy tracing), so this flag is
+# active exactly when the extract runs. Thread-local because compiles can run
+# concurrently and this must not leak the Spyre table into an unrelated
+# CPU-only compile on another thread.
+_compile_state = threading.local()
+
+
+def in_spyre_compile() -> bool:
+    """True while a Spyre ``compile_fx`` is on the stack for this thread."""
+    return getattr(_compile_state, "in_spyre_compile", False)
+
 
 def _spyre_inner_compile(*args: Any, **kwargs: Any) -> Any:
     """Wrapper around ``compile_fx_inner`` that pins a picklable ``get_decomp_fn``.
@@ -153,8 +169,18 @@ def enable_spyre_compile_fx_wrapper():
                     # module-level callable so the FX graph cache key stays
                     # serializable.
                     kwargs.setdefault("inner_compile", _spyre_inner_compile)
-                    with enable_spyre_context(example_inputs):
-                        return _orig(gm, example_inputs, *args, **kwargs)
+                    # Mark this thread as inside a Spyre compile so the
+                    # invoke_subgraph HOP re-trace (which happens within this
+                    # _orig call) threads the Spyre decomp table into its
+                    # subgraph bodies. Save/restore to stay correct under
+                    # nested compile_fx calls.
+                    _prev_in_spyre = getattr(_compile_state, "in_spyre_compile", False)
+                    _compile_state.in_spyre_compile = True
+                    try:
+                        with enable_spyre_context(example_inputs):
+                            return _orig(gm, example_inputs, *args, **kwargs)
+                    finally:
+                        _compile_state.in_spyre_compile = _prev_in_spyre
 
                 # Non-Spyre graphs: no FFDC — avoids capturing unrelated CPU
                 # compiles.

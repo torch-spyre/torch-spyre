@@ -60,7 +60,7 @@ def _random_buffers(rng, n, horizon=12, max_size=200):
             child = buffers[child_i]
             if parent.read_count == 0:
                 # A write-only parent has nothing to hand over, so the pair is
-                # not expressible at all (see ``assert_in_place_parent_is_read``).
+                # not expressible at all (see ``check_in_place_parent_is_read``).
                 # Drawing one is possible because a base buffer may land on a
                 # single-tick lifetime; skip rather than reshaping the parent,
                 # which could invalidate a pair already wired to it.

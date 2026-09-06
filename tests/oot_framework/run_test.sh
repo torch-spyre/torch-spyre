@@ -1119,6 +1119,7 @@ _cls_${cls} = _pre_import_classes.get('${cls}')
 if _cls_${cls} is None:
     raise RuntimeError('Could not find original class ${cls} in pre-import of module ${module_name}')
 globals().setdefault('${cls}', _cls_${cls})
+_flatten_same_named_bases(_cls_${cls})
 _instantiate(_cls_${cls}, globals())
 _restore_staticmethods(_cls_${cls}, globals())
 "
@@ -1314,6 +1315,53 @@ def _restore_staticmethods(original_cls, scope):
                 desc = _inspect.getattr_static(original_cls, attr, None)
                 if isinstance(desc, staticmethod):
                     setattr(obj, attr, desc)
+
+# ---------------------------------------------------------------------------
+# @<config>.patch(...)-as-class-decorator flattening
+#
+# Some upstream test files decorate a TestCase subclass itself, e.g.:
+#   @inductor_config.patch(fx_graph_cache=False)
+#   class TestPatternMatcherLogging(LoggingTestCase):
+#       def test_foo(self, records): ...
+#
+# torch._inductor.config.patch's ContextDecorator, applied to a class,
+# returns a NEW class -- also named "TestPatternMatcherLogging" -- that
+# subclasses the original and only adds config-patching setUp/tearDown.
+# All the real test_* methods stay on the ORIGINAL (inner) class; the name
+# bound at module level after the decorator runs is the OUTER (wrapper)
+# class, whose OWN __dict__ has no test methods at all.
+#
+# instantiate_device_type_tests() computes its test list from
+# generic_test_class.__dict__.keys() -- the outer class's OWN dict only,
+# never inherited members. For a class shaped like this, that list comes
+# back empty, so instantiate_device_type_tests() silently does nothing:
+# no suffixing, no YAML mode:skip/mandatory_success/xfail filtering. The
+# raw, unsuffixed test methods still end up reachable on the generated
+# PRIVATEUSE1 subclass purely through Python inheritance (outer -> inner),
+# so pytest collects and runs them completely unfiltered -- e.g. hitting a
+# hardcoded GPU_TYPE="cuda" in the test body with
+# "AssertionError: Torch not compiled with CUDA enabled", regardless of
+# what the YAML config says.
+#
+# Fix: before injection, walk the class's MRO for any ancestor sharing the
+# exact same __name__ (i.e. a decorator-inserted same-named wrapper) and
+# copy its test_* methods onto the target class's own __dict__ so
+# instantiate_device_type_tests() actually sees them.
+# ---------------------------------------------------------------------------
+def _flatten_same_named_bases(cls):
+    for base in cls.__mro__[1:]:
+        if base.__name__ != cls.__name__:
+            continue
+        for name, obj in list(base.__dict__.items()):
+            if not name.startswith("test"):
+                continue
+            if name not in cls.__dict__:
+                setattr(cls, name, obj)
+            # Remove from the pre-decorator ancestor too -- otherwise it
+            # stays reachable through inheritance even after
+            # instantiate_device_type_tests()'s own cleanup deletes the
+            # (now correctly suffixed and filtered) copy on cls itself.
+            delattr(base, name)
 
 # ---------------------------------------------------------------------------
 # Inject instantiate_device_type_tests for all classes needing injection,
@@ -1732,13 +1780,29 @@ _run_pytest_isolated() {
         }
 
         if [[ "$_dir" == *"/distributed"* ]] || [[ "$_dir" == *"/distributed" ]]; then
-            # Check that AIU_WORLD_SIZE is set
-            if [[ -z "${AIU_WORLD_SIZE:-}" ]]; then
-                echo "Error: AIU_WORLD_SIZE environment variable is not set" >&2
-                exit 1
+            # Determine _NPROC from SPYRE_DEVICES if set, otherwise fall back to
+            # AIU_WORLD_SIZE.  SPYRE_DEVICES is a comma-separated list of device
+            # indices (e.g. "0,2,3").
+
+            # Only used for count
+            local -a _SPYRE_DEVICE_IDS=()
+            if [[ -n "${SPYRE_DEVICES:-}" ]]; then
+                IFS=',' read -r -a _SPYRE_DEVICE_IDS <<< "${SPYRE_DEVICES}"
+                _NPROC="${#_SPYRE_DEVICE_IDS[@]}"
+                # Cache the original AIU_WORLD_SIZE so it can be restored after torchrun exits
+                _AIU_WORLD_SIZE_ORIG="${AIU_WORLD_SIZE:-}"
+                export AIU_WORLD_SIZE="$_NPROC"
+                echo "[torch_oot_device_tests_run] SPYRE_DEVICES='${SPYRE_DEVICES}' -> nproc=${_NPROC} (AIU_WORLD_SIZE overridden for this run)"
+            else
+                # SPYRE_DEVICES not set: require AIU_WORLD_SIZE.
+                if [[ -z "${AIU_WORLD_SIZE:-}" ]]; then
+                    echo "Error: neither SPYRE_DEVICES nor AIU_WORLD_SIZE is set" >&2
+                    exit 1
+                fi
+                _NPROC="${AIU_WORLD_SIZE}"
+                _AIU_WORLD_SIZE_ORIG="${AIU_WORLD_SIZE}"
+                echo "[torch_oot_device_tests_run] AIU_WORLD_SIZE='${AIU_WORLD_SIZE}' -> nproc=${_NPROC}"
             fi
-            # Use torchrun for distributed tests
-            _NPROC="${AIU_WORLD_SIZE}"
             echo "[torch_oot_device_tests_run] Running distributed test with torchrun (nproc=$_NPROC)"
 
             # Set environment variables for split_output.sh
@@ -1791,6 +1855,14 @@ _run_pytest_isolated() {
 
             # Clean up log directory
             rm -rf "${_LOGDIR}"
+
+            # Restore AIU_WORLD_SIZE to its original value now that torchrun has exited.
+            # If it was unset before we overrode it, unset it again.
+            if [[ -z "$_AIU_WORLD_SIZE_ORIG" ]]; then
+                unset AIU_WORLD_SIZE
+            else
+                export AIU_WORLD_SIZE="$_AIU_WORLD_SIZE_ORIG"
+            fi
         else
             echo "[torch_oot_device_tests_run] Running serial test"
             # Regular pytest for non-distributed tests.
@@ -2617,72 +2689,24 @@ for i in "${!RUN_FILES[@]}"; do
     fi
 
     # ---------------------------------------------------------------------------
-    # -m marker pre-flight
+    # -m is intentionally NOT pre-flighted here.
     #
-    # When a -m MARKEXPR is present, probe whether this specific file has any
-    # tests that match it before running.  The probe uses --collect-only which
-    # is fast as no test execution happens and runs from the file's own directory
-    # so conftest.py files are discovered correctly.
+    # This used to run a --collect-only probe first and strip -m from the real
+    # invocation whenever the probe reported 0 collected (exit code 5), on the
+    # theory that a 0-match probe means "this marker family isn't used in this
+    # file". That inference is unsound: a 0-collected probe can also mean the
+    # probe itself failed to complete cleanly (e.g. a slow cold collection of a
+    # large merged file), which is indistinguishable from a real 0-match once
+    # stderr is discarded. On a merged multi-config run, this silently dropped
+    # --skip-slow's `-m not slow__plat_<arch>` filter for large files like
+    # test_inductor_ops.py, letting ~1hr `test_large_matmul*` tests run
+    # unfiltered — see issue where standalone runs correctly filtered while
+    # `make tests TEST_TYPE=unit` did not.
     #
-    # If the probe finds 0 matching tests (exit code 5) the -m flag is stripped
-    # from _FILE_PYTEST_ARGS so the file's tests all run normally --
-    # the marker filter applies to files that USE that marker
-    # family; files that don't use it are unaffected. This fallback is for
-    # op__/dtype__/module__/platform__-style tags, where a per-file 0-match
-    # just means "this marker family isn't used here". It does NOT apply to
-    # testtype__<label> (see _OOTTestTypeMarkerPatcher): that tag is a
-    # whole-file inclusion marker driven by the config's
-    # test_suite_config.labels, so a 0-match genuinely means this file's
-    # config doesn't carry the requested label and the file must stay
-    # excluded, not fall back to running unfiltered. -m is left in place for
-    # that case; the real run below will also report 0 collected (exit 5),
-    # which the exit-code handling further down already treats as
-    # NOTEST/warning-only, not a failure.
-    #
+    # -m is always left in place; a genuine 0-match on the real run below
+    # already reports exit code 5, which the exit-code handling further down
+    # treats as NOTEST/warning-only, not a failure.
     # ---------------------------------------------------------------------------
-    _HAS_M=0
-    for _a in "${_EXTRA_NO_XML[@]+"${_EXTRA_NO_XML[@]}"}"; do
-        [[ "$_a" == "-m" ]] && { _HAS_M=1; break; }
-    done
-
-    if [[ $_HAS_M -eq 1 ]]; then
-        # Extract just the -m args for the probe (no --junit-xml, no -v, etc.)
-        _PROBE_ARGS=()
-        _take_next=0
-        for _a in "${_EXTRA_NO_XML[@]+"${_EXTRA_NO_XML[@]}"}"; do
-            if [[ $_take_next -eq 1 ]]; then
-                _PROBE_ARGS+=("$_a")
-                _take_next=0
-                continue
-            fi
-            if [[ "$_a" == "-m" ]]; then
-                _PROBE_ARGS+=("$_a")
-                _take_next=1
-            fi
-        done
-
-        # `|| _probe_exit=$?` is required: exit 5 (nothing collected) is the
-        # expected signal here, and under `set -e` a bare subshell would abort
-        # the whole run before the exit code could be inspected.
-        _probe_exit=0
-        (cd "$run_dir" && python3 -m pytest "$run_basename" \
-            "${_PROBE_ARGS[@]}" --collect-only -q 2>/dev/null) || _probe_exit=$?
-
-        if [[ $_probe_exit -eq 5 && "${_PROBE_ARGS[*]}" == *"testtype__"* ]]; then
-            echo "[torch_oot_device_tests_run] -m filter matched 0 tests in $(basename "$original_file") (testtype__ label not present) -- file excluded" >&2
-        elif [[ $_probe_exit -eq 5 ]]; then
-            # 0 tests match this marker in this file — strip -m from args.
-            echo "[torch_oot_device_tests_run] -m filter matched 0 tests in $(basename "$original_file"), running without -m" >&2
-            _ARGS_NO_M=()
-            _skip_m=0
-            for _a in "${_FILE_PYTEST_ARGS[@]+"${_FILE_PYTEST_ARGS[@]}"}"; do
-                if [[ $_skip_m -eq 1 ]]; then _skip_m=0; continue; fi
-                if [[ "$_a" == "-m" ]]; then _skip_m=1; continue; fi
-                _ARGS_NO_M+=("$_a")
-            done
-            _FILE_PYTEST_ARGS=("${_ARGS_NO_M[@]}")
-        fi
-    fi
 
     # -----------------------------------------------------------------------
     # Run pytest for this file.

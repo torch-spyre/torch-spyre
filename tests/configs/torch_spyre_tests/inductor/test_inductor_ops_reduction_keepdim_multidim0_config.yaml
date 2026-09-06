@@ -8,4 +8,6 @@ test_suite_config:
             - TestOps::test_reduce_multidim_keepdim0.*
             - TestOps::test_reduce_edge_multidim_keepdim0.*
             - TestOps::test_mean_layout_multidim_keepdim0.*
+            - TestOps::test_any_multidim.*
+            - TestOps::test_all_multidim.*
           mode: mandatory_success

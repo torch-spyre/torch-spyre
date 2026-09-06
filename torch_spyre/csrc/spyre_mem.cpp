@@ -38,6 +38,7 @@
 #include "logging.h"
 #include "module.h"
 #include "spyre_allocator.h"
+#include "spyre_composite_address.h"
 #include "spyre_storage_impl.h"
 #include "spyre_stream.h"
 #include "spyre_tensor_impl.h"
@@ -353,18 +354,26 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
   TORCH_CHECK(cpu_format_host != DataFormats::INVALID &&
                   cpu_format_dev != DataFormats::INVALID,
               "Unsupported CPU tensor dtype for DMA transfer: ", cpu_str_type);
-  const auto [dev_format_host, dev_format_dev] =
-      stringToDTDataFormatPair(dev_str_type);
-  TORCH_CHECK(
-      dev_format_host != DataFormats::INVALID &&
-          dev_format_dev != DataFormats::INVALID,
-      "Unsupported Spyre tensor dtype for DMA transfer: ", dev_str_type);
 
+  // stl.device_dtype is the authoritative on-device element format.  For bool
+  // tensors it may differ from the type-map default (SEN169_FP16): an fp32
+  // comparison result is physically stored as IEEE_FP32 (32 elems/stick).
+  //
+  // IEEE_FP32 bool tensors are on-device intermediates produced by the
+  // compiler; they are always read D2H and never written H2D.  Guard against
+  // that assumption being violated so a future regression fails loudly rather
+  // than silently transferring data with the wrong element size.
+  TORCH_CHECK(
+      !(host2device && dev_tensor->scalar_type() == c10::ScalarType::Bool &&
+        stl.device_dtype == DataFormats::IEEE_FP32),
+      "Unexpected H2D transfer to a bool tensor with IEEE_FP32 device format; "
+      "fp32-format bool tensors are on-device intermediates and should never "
+      "be H2D transfer destinations");
   DataConversionInfo dci{};
   dci.dci_dsName_ = "DCI-Tensor-0";
   dci.isHostToSen_ = host2device;
-  dci.dataformat_src_ = host2device ? cpu_format_host : dev_format_dev;
-  dci.dataformat_dst_ = host2device ? dev_format_dev : cpu_format_host;
+  dci.dataformat_src_ = host2device ? cpu_format_host : stl.device_dtype;
+  dci.dataformat_dst_ = host2device ? stl.device_dtype : cpu_format_host;
   TORCH_CHECK(
       isDCIConversionSupported(dci.dataformat_src_, dci.dataformat_dst_),
       "Unsupported DCI data format conversion: src=",
@@ -1119,18 +1128,14 @@ at::Tensor spyre_fill_tensor(const at::Tensor& self, double value) {
               "spyre_fill_tensor: tensor must be on spyre device");
   TORCH_CHECK(self.numel() > 0, "spyre_fill_tensor: cannot fill empty tensor");
 
-  // Get the device allocation (CompositeAddress) from the spyre tensor
-  auto* spyre_impl = static_cast<SpyreTensorImpl*>(self.unsafeGetTensorImpl());
-  auto& storage = spyre_impl->storage();
-  auto* ctx = static_cast<SharedOwnerCtx*>(storage.data_ptr().get_context());
-
   // Map torch dtype to DataFormats for the value->pattern conversion, which
   // fillAsync performs internally.
   DataFormats dtype = get_device_dtype(self.scalar_type());
 
   // Launch a device-side MEMORY_FILL DMA via the typed fillAsync overload.
   SpyreStream stream;
-  stream.fillAsync(&ctx->composite_addr, value, dtype, /*use_dmai=*/true);
+  stream.fillAsync(get_composite_address(self), value, dtype,
+                   /*use_dmai=*/true);
 
   return self;
 }

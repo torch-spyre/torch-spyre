@@ -637,6 +637,12 @@ Environment Variables
        (see ``torch_spyre.logging_config``)
    * - ``TORCH_SPYRE_DOWNCAST_WARN=0``
      - Suppress int64 → int32 downcast warnings
+   * - ``TORCH_SPYRE_FFDC=1``
+     - Enable first-failure data capture at write time. Retrieve the report
+       with :func:`torch.spyre.get_diagnostic_report`
+   * - ``TORCH_SPYRE_NUM_HOST_COMPUTE_STREAMS``
+     - Size of the host-compute stream pool used by program correction
+       (default ``4``, maximum ``8``)
    * - ``SPYRE_INDUCTOR_LOG=1``
      - *Deprecated*. Use ``TORCH_LOGS='torch_spyre.inductor'``. Enables Spyre
        Inductor logging (INFO level)
@@ -673,8 +679,11 @@ Environment Variables
    * - ``HBM_POOL_PLANNING``
      - Enable HBM-pool planning for intermediates not in LX
        (default ``1``)
-   * - ``GLOBAL_STICK_OPTIMIZER``
-     - Enable the global stick-dimension optimizer (default ``1``)
+   * - ``FRONTEND_POOL_ALLOCATION``
+     - Allocate each SDSC bundle's HBM pool as a front-end PyTorch tensor
+       passed in as ``%pool_base_addr``, instead of the backend
+       self-allocating via ``sdscbundle.device_mem_allocate``
+       (default ``0``)
    * - ``SPYRE_CORE_ID_K_FAST_EMISSION``
      - Permute physical core IDs at SDSC emission so K-collaborator cores
        sit on adjacent ring positions, reducing PSUM chain hops (default
@@ -683,8 +692,8 @@ Environment Variables
      - Emit LPDDR5 tensor addresses as runtime symbols rather than baked
        integers (default ``1``)
    * - ``LAYOUT_SOLVER``
-     - LX scratchpad layout solver strategy: ``greedy`` (default),
-       ``bestfit``, ``firstfit``, ``cpsat``, ``simulated_annealing``.
+     - LX scratchpad layout solver strategy: ``cpsat`` (default),
+       ``greedy``, ``bestfit``, ``firstfit``, ``simulated_annealing``.
        See :doc:`/compiler/scratchpad_planning`
    * - ``SPYRE_INDUCTOR_ENABLE_REDUCTION_TILING``
      - Enable reduction tiling in the pre-scheduling pipeline (default
@@ -692,6 +701,10 @@ Environment Variables
    * - ``SPYRE_LOG_PASSES``
      - Comma-separated list of pass names after which to log the
        op-spec IR at pipeline stage boundaries (default empty)
+   * - ``SPYRE_DUMP_COST``
+     - Print the predicted-runtime report after pre-scheduling: one total
+       plus a per-kernel breakdown (default ``0``).
+       See :doc:`/compiler/cost_model`
    * - ``TORCH_SPYRE_NATIVE_PACKER``
      - Use the C++ permutation-layout packer accelerator in the
        simulated-annealing layout solver (default ``1``; set ``0`` to force

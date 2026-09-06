@@ -24,6 +24,7 @@ from torch._inductor.ir import (
 )
 from torch._inductor.virtualized import V
 from torch._inductor.ops_handler import WrapperHandler
+from torch.utils._sympy.value_ranges import ValueRanges, bound_sympy
 
 import sympy
 
@@ -38,29 +39,16 @@ from torch_spyre._inductor.pass_utils import (
 from torch._inductor.ir import MutationLayoutSHOULDREMOVE, ComputedBuffer
 from torch_spyre._inductor.scratchpad.plan_solver import LifetimeBoundBuffer
 
-# Op outputs eligible for LX-pinning. `amax` is the lowered form of
-# `max`; both names are listed to match whichever the IR shows.
-OP_OUTPUT_GOOD_FOR_LX_REUSE = frozenset(
+# Op outputs NOT eligible for LX-pinning; every other op is eligible by
+# default. `convolution` is aten's direct-conv op name and `conv2d` is the
+# depthwise (`torch.ops.spyre.conv2d`) op name -- both are listed because a
+# stride-2 direct-lowered conv miscomputes (shuffled spatial elements) when
+# its output is pinned to LX; see the direct-lowering codegen follow-up
+# tracked from PR #3284.
+OP_OUTPUT_NOT_GOOD_FOR_LX_REUSE = frozenset(
     {
-        "max",
-        "amax",
-        "maximum",
-        "sum",
-        "clone",
-        "exp",
-        "sub",
-        "mul",
-        "mean",
-        "add",
-        "rsqrt",
-        "neg",
-        "mm",
-        "bmm",
-        "batched_matmul",
-        "div",
-        "realdiv",
-        "expand",
-        "silu",
+        "convolution",
+        "conv2d",
     }
 )
 
@@ -73,12 +61,12 @@ def clone_at_graph_boundaries() -> bool:
     """True when clone ops are eligible for LX, enabling clone insertion at graph
     input/output boundaries so those buffers can also be LX-pinned.
 
-    Gated by listing "clone" in OP_OUTPUT_GOOD_FOR_LX_REUSE. It intentionally
-    does NOT consult ``allow_all_ops_in_lx_planning``: that flag widens
-    intermediate-output eligibility and is set broadly (e.g. the LX-planning
-    op suite), so coupling it here would silently turn on the boundary clone
-    path in contexts that don't intend to exercise it."""
-    return "clone" in OP_OUTPUT_GOOD_FOR_LX_REUSE
+    Gated by "clone" being absent from OP_OUTPUT_NOT_GOOD_FOR_LX_REUSE. It
+    intentionally does NOT consult ``allow_all_ops_in_lx_planning``: that flag
+    widens intermediate-output eligibility and is set broadly (e.g. the
+    LX-planning op suite), so coupling it here would silently turn on the
+    boundary clone path in contexts that don't intend to exercise it."""
+    return "clone" not in OP_OUTPUT_NOT_GOOD_FOR_LX_REUSE
 
 
 def calculate_liveness(graph: GraphLowering) -> dict[str, list[int]]:
@@ -113,6 +101,92 @@ def calculate_liveness(graph: GraphLowering) -> dict[str, list[int]]:
             if not uses or uses[-1] != i:
                 uses.append(i)
     return liveness
+
+
+def counted_loop_lifetime_end_overrides(graph: GraphLowering) -> dict[str, int]:
+    """Return exclusive lifetime ends for values reused by counted loops.
+
+    The graph contains one textual copy of a loop body.  Ordinary liveness
+    therefore sees only the first runtime iteration and may reuse a value's LX
+    address later in that body, even though the next iteration reads it again.
+    A value born outside a loop and read inside it must stay alive through that
+    loop.  This records that storage fact without adding a fake read to
+    :func:`calculate_liveness`.
+    """
+
+    def group_path(op: Operation) -> tuple[int, ...]:
+        return tuple(getattr(getattr(op, "loop_info", None), "loop_group_id", ()) or ())
+
+    loop_end: dict[tuple[int, ...], int] = {}
+    birth_group: dict[str, tuple[int, ...]] = {
+        name: () for name in graph.graph_input_names
+    }
+    last_access: dict[str, int] = {}
+    last_read: dict[str, int] = {}
+
+    for index, op in enumerate(graph.operations):
+        path = group_path(op)
+        for depth in range(1, len(path) + 1):
+            loop_end[path[:depth]] = index
+        rw = op_read_writes(op)
+        for dep in rw.writes:
+            birth_group.setdefault(dep.name, path)
+            last_access[dep.name] = index
+        for dep in rw.reads:
+            birth_group.setdefault(dep.name, ())
+            last_access[dep.name] = index
+            last_read[dep.name] = index
+
+    overrides: dict[str, int] = {}
+    crossed_loops: set[tuple[int, ...]] = set()
+    for index, op in enumerate(graph.operations):
+        consumer_path = group_path(op)
+        if not consumer_path:
+            continue
+        for dep in op_read_writes(op).reads:
+            producer_path = birth_group.get(dep.name, ())
+            common = 0
+            while (
+                common < len(producer_path)
+                and common < len(consumer_path)
+                and producer_path[common] == consumer_path[common]
+            ):
+                common += 1
+            if common == len(consumer_path):
+                continue
+            enclosing_loop = consumer_path[: common + 1]
+            end = loop_end[enclosing_loop] + 1
+            if end > last_access.get(dep.name, index) + 1:
+                overrides[dep.name] = max(overrides.get(dep.name, 0), end)
+                crossed_loops.add(enclosing_loop)
+
+    # A value that crosses `enclosing_loop`'s boundary (above) must stay valid
+    # across every runtime iteration of that loop. But the graph holds only one
+    # textual copy of the loop body, so any OTHER value that is born and fully
+    # consumed entirely inside that same loop looks, under plain liveness, like
+    # it occupies a short, disjoint tick range that never overlaps the
+    # crossing value's -- even though that loop-local value is actually
+    # rewritten fresh on every iteration, including iterations after the one
+    # the crossing value's own reads happen to fall in. Sharing an LX address
+    # between the two is therefore unsafe: a later iteration's rewrite of the
+    # loop-local value can land between two of the crossing value's reads and
+    # clobber it. Extending the loop-local value's own end_time to also cover
+    # the whole loop forces `overlaps_in_time` to see the conflict for every
+    # solver, instead of leaving it to placement-order luck. A value that is
+    # never read again by anything (write-only) cannot be clobbered before its
+    # next read -- it has none -- so only values with at least one recorded
+    # read are candidates here; `last_read`, not `last_access`, decides
+    # whether that read already falls before the loop's end.
+    if crossed_loops:
+        for name, path in birth_group.items():
+            if name not in last_read:
+                continue
+            for loop in crossed_loops:
+                if path[: len(loop)] == loop:
+                    end = loop_end[loop] + 1
+                    if end > last_read[name] + 1:
+                        overrides[name] = max(overrides.get(name, 0), end)
+    return overrides
 
 
 def mem_usage_by_buf(
@@ -243,6 +317,17 @@ def _is_tiled_advancing(op: Operation) -> bool:
     all. A loop-internal buffer (e.g. drained by a copy op every iteration)
     can be tiled yet have its own write pinned at a fixed address; such a
     buffer is LX-eligible.
+
+    Also checks ``squeezed_advance_output``: a dim tiled down to per-tile
+    extent 1 (e.g. a coarse-tiled batch dim with one tile per iteration) is
+    squeezed out of the write's own index entirely, so it never appears in
+    ``output_tiled_dims`` even though the write's device address genuinely
+    advances every iteration (see ``loop_info.py``'s
+    ``squeezed_advance_output`` docstring). Missing this let a
+    mutation_write_back accumulator (e.g. flash attention's running max/
+    denominator carry) reside in LX, where the advance later crashed --
+    or, if the crash path were ever bypassed, silently pinned every
+    iteration to the same address.
     """
     layout = getattr(op, "layout", None)
     if not isinstance(layout, FixedTiledLayout):
@@ -250,7 +335,10 @@ def _is_tiled_advancing(op: Operation) -> bool:
     loop_info = getattr(op, "loop_info", None)
     if loop_info is None:
         return False
-    return any(dims for dims in loop_info.output_tiled_dims)
+    if any(dims for dims in loop_info.output_tiled_dims):
+        return True
+    squeezed_advance_output = getattr(loop_info, "squeezed_advance_output", None) or []
+    return any(level for level in squeezed_advance_output)
 
 
 def _is_read_advancing_anywhere(
@@ -297,6 +385,19 @@ def _is_read_advancing_anywhere(
         # continue` never contributes a term for such a level, so the
         # resulting device_tile_advance_expr is None, not merely small.
         if any(loop_info.tiled_dims_per_read[dep_idx]):
+            return True
+        # Mirror _is_tiled_advancing's squeezed_advance_output check on the
+        # read side: a dim tiled down to per-tile extent 1 is squeezed out
+        # of this read's own index, so it never appears in
+        # tiled_dims_per_read even though the read's device address
+        # genuinely advances every iteration (see loop_info.py's
+        # squeezed_advance_per_read docstring).
+        squeezed_advance_per_read = (
+            getattr(loop_info, "squeezed_advance_per_read", None) or []
+        )
+        if dep_idx < len(squeezed_advance_per_read) and any(
+            squeezed_advance_per_read[dep_idx]
+        ):
             return True
     return False
 
@@ -416,16 +517,9 @@ def _get_buffer_user_deps(
 
 
 def _op_num_cores(op: Operation) -> int:
-    """Cores implied by op.op_it_space_splits (defaults to 1 when unset).
-
-    `op_it_space_splits` is set conditionally by span_reduction_pass /
-    work_distribution; ops that don't get split (e.g. trivial pointwise
-    on a small output) leave the attribute unset. Match the existing
-    convention (pass_utils.py, work_division.py) and treat missing as
-    no-split → 1 core.
-    """
-    splits: tuple[dict, dict] = getattr(op, "op_it_space_splits", ({}, {}))
-    return math.prod([s for p in splits for s in p.values()])
+    """Cores implied by symbol-keyed ownership (defaults to one)."""
+    ownership = getattr(op, "iteration_space_ownership", None)
+    return math.prod(ownership.work_slices.values()) if ownership is not None else 1
 
 
 def get_ncores_for_buffers(
@@ -589,9 +683,26 @@ def _would_produce_lx_back_gap(
                     if device_size[d] > 1:
                         return True
                     continue
-                sym = next(iter(syms))
-                it_dim_size = int(dep.ranges[sym])
-                if device_size[d] > it_dim_size:
+                if any(sym not in dep.ranges for sym in syms):
+                    continue
+                # A device coordinate may be walked by several iteration symbols
+                # (``2*d0 + floor(d2/64)``), so the covered extent is the
+                # expression's upper bound over their ranges, not one symbol's
+                # range. Picking one out of the ``free_symbols`` *set* also made
+                # the verdict depend on PYTHONHASHSEED.
+                covered = (
+                    int(
+                        bound_sympy(
+                            coord_expr,
+                            {
+                                sym: ValueRanges(0, int(dep.ranges[sym]) - 1)
+                                for sym in syms
+                            },
+                        ).upper
+                    )
+                    + 1
+                )
+                if device_size[d] > covered:
                     return True
     return False
 
@@ -707,3 +818,37 @@ def quality_plot(
         ax2.plot(temperature_logs, "g", lw=1)
 
     return fig
+
+
+# Microseconds are the universal currency; every µs quantity is converted to an
+# integer on this scale by exactly one rounding step, so accumulation is pure
+# integer. 1e6 gives picosecond resolution -- ample for the smallest memory
+# terms -- while Python's arbitrary-precision ints keep large sums exact.
+US_FIXED_POINT_SCALE = 1_000_000
+
+
+def to_fixed_us(us: float) -> int:
+    """Map a non-negative microsecond quantity to the fixed-point integer scale
+    with a single deterministic round-half-up step.
+
+    Round-half-up on non-negative inputs is order-independent and platform-stable
+    (no banker's rounding), which is what the determinism guarantee needs. An
+    infinite cost (an infeasible split) is a caller error, flagged rather than
+    silently mapped.
+    """
+    if not math.isfinite(us) or us < 0.0:
+        raise ValueError(f"cost must be finite and non-negative, got {us!r}")
+    return int(us * US_FIXED_POINT_SCALE + 0.5)
+
+
+def hbm_bytes_per_us() -> float:
+    """HBM bandwidth as bytes per microsecond, sourced from the native cost model
+    (``_HBM_BW_GBS`` GB/s x 1000) so the memory objective and the cost model's
+    own traffic term use the identical constant.
+
+    Imported lazily so the fixed-point helper above stays importable without
+    pulling in torch.
+    """
+    from torch_spyre._inductor import work_division  # noqa: PLC0415
+
+    return float(work_division._HBM_BW_GBS) * 1000.0

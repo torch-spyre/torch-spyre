@@ -61,7 +61,7 @@ def _random_buffers(rng, n, horizon=12, max_size=200, inplace_prob=0.25):
             child = buffers[child_i]
             if parent.read_count == 0:
                 # A write-only parent has nothing to hand over, so the pair is
-                # not expressible at all (see ``assert_in_place_parent_is_read``).
+                # not expressible at all (see ``check_in_place_parent_is_read``).
                 # Drawing one is possible because a base buffer may land on a
                 # single-tick lifetime; skip rather than reshaping the parent,
                 # which could invalidate a pair already wired to it.
@@ -276,20 +276,10 @@ class SkeletonTestsMixin(MixinBase):
 
     def test_invalid_permutation_rejected(self):
         buffers = [_buf("a", 64, 0, 1), _buf("b", 64, 0, 1)]
-        with self.assertRaises(AssertionError):
+        with self.assertRaises(ValueError):
             self.make_plan(buffers, [0, 0], capacity=128)
-        with self.assertRaises(AssertionError):
+        with self.assertRaises(ValueError):
             self.make_plan(buffers, [0], capacity=128)
-
-    def test_write_only_in_place_parent_rejected(self):
-        # "a" is a computed buffer whose only use is its write, so it is never
-        # read and has no storage to hand over; "b" declaring it as an in-place
-        # parent is not expressible. Rejected while resolving declared pairs, so
-        # it fires for both concrete plans.
-        parent = LifetimeBoundBuffer("a", 64, [0])
-        child = LifetimeBoundBuffer("b", 64, [0, 2], in_place_parents=["a"])
-        with self.assertRaises(AssertionError):
-            self.make_plan([parent, child], [0, 1], capacity=256)
 
     def test_single_use_input_in_place_parent_allowed(self):
         # The same shape is legal when the parent is a graph input: all its uses
@@ -606,7 +596,7 @@ class ContactProfileTests(TestCase):
                 # it a geometrically valid parent (parent.end == child.start + 1)
                 # *and* that is read before the handoff. A single-tick parent has
                 # only its write, so it has nothing to hand over and the pair is
-                # not expressible (see ``assert_in_place_parent_is_read``).
+                # not expressible (see ``check_in_place_parent_is_read``).
                 parent_opts = [
                     [None]
                     + [
@@ -1137,8 +1127,77 @@ class FastRotateTests(TestCase):
             self.assertEqual(fast.inplace_reuse, chain.inplace_reuse, tag)
 
 
+class EligibilityConstructionMixin(MixinBase):
+    """Constructing a plan with some buffers ineligible up front, for every
+    packer. Run natively too because the native constructor's ``eligible=``
+    branch (and its length check) is otherwise dead: every other native
+    construction in the suite passes four positional arguments."""
+
+    plan_class: type = None  # type: ignore[assignment]
+
+    BUFFERS = [("a", 64), ("b", 50), ("c", 40)]
+
+    def _buffers(self):
+        return [_buf(name, size, 0, 3) for name, size in self.BUFFERS]
+
+    def _plan(self, buffers, **kwargs):
+        return self.plan_class(buffers, list(range(len(buffers))), 10_000, 1, **kwargs)
+
+    def test_matches_the_reference_with_initial_eligibility(self):
+        buffers = self._buffers()
+        elig = [True, False, True]
+        plan = self._plan(buffers, eligible=list(elig))
+        ref = ReferencePermutationBasedLayoutSolver(
+            buffers, [0, 1, 2], 10_000, 1, eligible=list(elig)
+        )
+        # b is transparent (HBM, no address) and c rests on a, not on b.
+        self.assertEqual(list(plan.addresses), [0, None, 64])
+        self.assertEqual(list(plan.addresses), list(ref.addresses))
+        self.assertEqual(plan.quality(), ref.quality())
+        self.assertEqual(plan.count_allocated(), ref.count_allocated())
+
+    def test_all_eligible_matches_the_default(self):
+        default = self._plan(self._buffers())
+        explicit = self._plan(self._buffers(), eligible=[True, True, True])
+        self.assertEqual(list(explicit.addresses), list(default.addresses))
+        self.assertEqual(explicit.quality(), default.quality())
+
+    def test_construction_matches_a_later_set_eligible(self):
+        # The constructed state must be the state set_eligible reaches, not just
+        # a plausible one: the two write the same flags through different paths.
+        constructed = self._plan(self._buffers(), eligible=[True, False, True])
+        toggled = self._plan(self._buffers())
+        toggled.set_eligible(1, False)
+        self.assertEqual(list(toggled.addresses), list(constructed.addresses))
+        self.assertEqual(toggled.quality(), constructed.quality())
+
+    def test_bad_eligible_length_rejected(self):
+        buffers = self._buffers()
+        for bad in ([], [True, False], [True] * 4):
+            with self.assertRaises(ValueError):
+                self._plan(buffers, eligible=bad)
+
+
+class ReferenceSolverEligibilityConstructionTests(
+    EligibilityConstructionMixin, TestCase
+):
+    plan_class = ReferencePermutationBasedLayoutSolver
+
+
+class PermutationBasedLayoutSolverEligibilityConstructionTests(
+    EligibilityConstructionMixin, TestCase
+):
+    plan_class = PermutationBasedLayoutSolver
+
+
+class NativeSolverEligibilityConstructionTests(EligibilityConstructionMixin, TestCase):
+    plan_class = NativePermutationLayoutSolver
+
+
 class EligibilityConstructionTests(TestCase):
-    """Constructing a plan with some buffers ineligible up front."""
+    """What initial ineligibility does to the incremental packer's own state:
+    the flags it stores and the contact profiles it keeps. The behaviour every
+    packer shares is in :class:`EligibilityConstructionMixin`."""
 
     def plan(self, buffers, permutation, eligible, capacity=10_000, alignment=1):
         return PermutationBasedLayoutSolver(
@@ -1149,11 +1208,6 @@ class EligibilityConstructionTests(TestCase):
         buffers = [_buf("a", 64, 0, 2), _buf("b", 50, 0, 2)]
         plan = PermutationBasedLayoutSolver(buffers, [0, 1], 10_000, 1)
         self.assertEqual(plan._eligible, [True, True])
-
-    def test_bad_eligible_length_rejected(self):
-        buffers = [_buf("a", 64, 0, 2)]
-        with self.assertRaises(AssertionError):
-            self.plan(buffers, [0], eligible=[True, False])
 
     def test_ineligible_buffer_is_transparent(self):
         # b ineligible: routed to HBM (no address, no quality), and c stacks
@@ -1171,16 +1225,6 @@ class EligibilityConstructionTests(TestCase):
         self.assertEqual(_above_named(plan, "b"), [(0, 3, None)])
         _check_consistency(self, plan)
         _check_contact_faithful(self, plan)
-
-    def test_matches_reference_with_initial_eligibility(self):
-        buffers = [_buf("a", 64, 0, 3), _buf("b", 50, 0, 3), _buf("c", 40, 0, 3)]
-        elig = [True, False, True]
-        fast = self.plan(buffers, [0, 1, 2], eligible=elig)
-        ref = ReferencePermutationBasedLayoutSolver(
-            buffers, [0, 1, 2], 10_000, 1, eligible=list(elig)
-        )
-        self.assertEqual(fast.addresses, ref.addresses)
-        self.assertEqual(fast.quality(), ref.quality())
 
 
 class ResizeTests(TestCase):
@@ -1431,6 +1475,23 @@ class NativeSolverDifferentialTests(TestCase):
         ref_plan = ReferencePermutationBasedLayoutSolver(buffers, perm, 10_000, 1)
         self._assert_equal(py_plan, cpp_plan, "pokethrough fast path")
         self._assert_equal(ref_plan, cpp_plan, "pokethrough fast path vs reference")
+
+    def test_native_solver_honors_lifetime_end_override(self):
+        persistent = LifetimeBoundBuffer(
+            "persistent",
+            64,
+            [0, 1],
+            lifetime_end_override=5,
+        )
+        later = LifetimeBoundBuffer("later", 64, [2, 3])
+        buffers = [persistent, later]
+        permutation = [0, 1]
+
+        py_plan = PermutationBasedLayoutSolver(buffers, permutation, 10_000, 1)
+        cpp_plan = NativePermutationLayoutSolver(buffers, permutation, 10_000, 1)
+
+        self._assert_equal(py_plan, cpp_plan, "lifetime end override")
+        self.assertNotEqual(cpp_plan.addresses[0], cpp_plan.addresses[1])
 
     def test_random_mixed_sequences_match_python(self):
         seeds = 4000 if _STRESS else 800
@@ -1761,43 +1822,171 @@ class ProfileTests(TestCase):
         p.validate()
 
 
-class NativeGuardTests(TestCase):
-    """The C++ accelerator validates out-of-range / degenerate arguments and
-    raises (like ``swap()`` already did, and like the Python packer's fail-fast
-    asserts) instead of corrupting the heap or crashing. Regression coverage for
-    the memory-safety review's ASan-confirmed findings (bad ``idx``/``i``/``j``
-    into resize/rotate/set_eligible, empty ``uses``, zero alignment)."""
+class IndexGuardTestsMixin(MixinBase):
+    """Every packer rejects a buffer index outside ``range(len(buffers))``.
+
+    The randomized differential tests draw only valid indices, so this is the
+    one class of input where the packers could disagree unobserved -- and they
+    did: Python read ``idx=-1`` as the last buffer and quietly operated on it
+    where the native packer raised."""
+
+    plan_class: type = None  # type: ignore[assignment]
+
+    BAD_INDICES = (-1, 3, 999)
 
     def _plan(self, n=3):
         bufs = [_buf(f"b{i}", 64, 0, 3) for i in range(n)]
-        return NativePermutationLayoutSolver(bufs, list(range(n)), 10_000, 128)
+        return self.plan_class(bufs, list(range(n)), 10_000, 128)
 
     def test_resize_index_out_of_range_raises(self):
-        p = self._plan()
-        for bad in (-1, 3, 999):
+        plan = self._plan()
+        for bad in self.BAD_INDICES:
             with self.assertRaises(ValueError):
-                p.resize(bad, 100)
-
-    def test_rotate_index_out_of_range_raises(self):
-        p = self._plan()
-        for i, j in ((5, 0), (0, 5), (-1, 0), (0, -1)):
-            with self.assertRaises(ValueError):
-                p.rotate(i, j)
+                plan.resize(bad, 100)
 
     def test_set_eligible_index_out_of_range_raises(self):
-        p = self._plan()
-        for bad in (-1, 3, 999):
+        # ``flag=True`` is the flag the aliased buffer already carries, so an
+        # unchecked ``-1`` would take the no-op path and return 0.0.
+        plan = self._plan()
+        for bad in self.BAD_INDICES:
             with self.assertRaises(ValueError):
-                p.set_eligible(bad, False)
+                plan.set_eligible(bad, True)
+
+    def test_top_or_inf_index_out_of_range_raises(self):
+        plan = self._plan()
+        for bad in self.BAD_INDICES:
+            with self.assertRaises(ValueError):
+                plan.top_or_inf(bad)
+
+    def test_swap_index_out_of_range_raises(self):
+        # A swap position needs a successor to swap with, so the last position
+        # (2 of 0..2 here) is out of range as well.
+        plan = self._plan()
+        for bad in (-1, 2, 3, 999):
+            with self.assertRaises(ValueError):
+                plan.swap(bad)
+
+    def test_rotate_index_out_of_range_raises(self):
+        plan = self._plan()
+        # (3, 0) and (0, 3) sit at exactly ``n``, the boundary a ``<=`` typo
+        # would let through; (999, 999) is the pair the ``i == j`` no-op would
+        # swallow.
+        for i, j in ((3, 0), (0, 3), (5, 0), (0, 5), (-1, 0), (0, -1), (999, 999)):
+            with self.assertRaises(ValueError):
+                plan.rotate(i, j)
+
+    def test_is_fully_allocated_index_out_of_range_raises(self):
+        plan = self._plan()
+        for bad in self.BAD_INDICES:
+            with self.assertRaises(ValueError):
+                plan.is_fully_allocated(bad)
+
+    def test_overlaps_index_out_of_range_raises(self):
+        # Both positions: either one alone reads as the last buffer when
+        # unchecked, and ``overlaps`` is symmetric enough to hide that.
+        plan = self._plan()
+        for i, j in ((-1, 0), (0, -1), (3, 0), (0, 3), (999, 999)):
+            with self.assertRaises(ValueError):
+                plan.overlaps(i, j)
+
+
+class ReferenceSolverIndexGuardTests(IndexGuardTestsMixin, TestCase):
+    plan_class = ReferencePermutationBasedLayoutSolver
+
+
+class PermutationBasedLayoutSolverIndexGuardTests(IndexGuardTestsMixin, TestCase):
+    plan_class = PermutationBasedLayoutSolver
+
+
+class NativeSolverIndexGuardTests(IndexGuardTestsMixin, TestCase):
+    plan_class = NativePermutationLayoutSolver
+
+
+class ConstructorGuardTestsMixin(MixinBase):
+    """Every packer rejects the degenerate constructor arguments. Regression
+    coverage for the memory-safety review's ASan-confirmed findings on the
+    native side; on the Python side these went unchecked, so a negative
+    alignment produced aliased addresses rather than an error."""
+
+    plan_class: type = None  # type: ignore[assignment]
 
     def test_empty_uses_raises(self):
         bad = LifetimeBoundBuffer(name="x", size=64, uses=[], in_place_parents=[])
         with self.assertRaises(ValueError):
-            NativePermutationLayoutSolver([bad], [0], 10_000, 128)
+            self.plan_class([bad], [0], 10_000, 128)
 
-    def test_zero_alignment_raises(self):
+    def test_non_positive_alignment_raises(self):
+        # -128 is the interesting one: _align_up would round *down*, seating two
+        # co-live buffers at one address instead of stacking them.
+        for bad in (0, -128):
+            with self.assertRaises(ValueError):
+                self.plan_class([_buf("a", 64, 0, 3)], [0], 10_000, bad)
+
+    def test_negative_size_raises(self):
         with self.assertRaises(ValueError):
-            NativePermutationLayoutSolver([_buf("a", 64, 0, 3)], [0], 10_000, 0)
+            self.plan_class([_buf("a", -64, 0, 3)], [0], 10_000, 128)
+
+    def test_last_use_at_int64_max_raises(self):
+        # end_time is uses[-1] + 1, which overflows the native packer's int64.
+        huge = LifetimeBoundBuffer(
+            name="x", size=64, uses=[0, 2**63 - 1], in_place_parents=[]
+        )
+        with self.assertRaises(ValueError):
+            self.plan_class([huge], [0], 10_000, 128)
+
+
+class ReferenceSolverConstructorGuardTests(ConstructorGuardTestsMixin, TestCase):
+    plan_class = ReferencePermutationBasedLayoutSolver
+
+
+class PermutationBasedLayoutSolverConstructorGuardTests(
+    ConstructorGuardTestsMixin, TestCase
+):
+    plan_class = PermutationBasedLayoutSolver
+
+
+class NativeSolverConstructorGuardTests(ConstructorGuardTestsMixin, TestCase):
+    plan_class = NativePermutationLayoutSolver
+
+
+class InPlaceRejectionTestsMixin(MixinBase):
+    """Every packer rejects the declared in-place pairs the plan invariants
+    forbid, so that ``TORCH_SPYRE_NATIVE_PACKER=0`` selects the same packer and
+    not a stricter one."""
+
+    plan_class: type = None  # type: ignore[assignment]
+
+    def _plan(self, buffers):
+        return self.plan_class(buffers, [0, 1], 10_000, 128)
+
+    def test_write_only_parent_rejected(self):
+        # p is written at tick 0 and never read, so it has no live storage to
+        # hand to c.
+        buffers = [_buf("p", 64, 0, 1), _buf("c", 32, 0, 3, ["p"])]
+        with self.assertRaises(ValueError):
+            self._plan(buffers)
+
+    def test_multi_tick_overlap_rejected(self):
+        # p is live through tick 3 and c from tick 1: three ticks of overlap
+        # rather than the single handoff tick, so co-locating them would alias
+        # two buffers that are live together.
+        buffers = [_buf("p", 64, 0, 4), _buf("c", 32, 1, 4, ["p"])]
+        with self.assertRaises(ValueError):
+            self._plan(buffers)
+
+
+class ReferenceSolverInPlaceRejectionTests(InPlaceRejectionTestsMixin, TestCase):
+    plan_class = ReferencePermutationBasedLayoutSolver
+
+
+class PermutationBasedLayoutSolverInPlaceRejectionTests(
+    InPlaceRejectionTestsMixin, TestCase
+):
+    plan_class = PermutationBasedLayoutSolver
+
+
+class NativeSolverInPlaceRejectionTests(InPlaceRejectionTestsMixin, TestCase):
+    plan_class = NativePermutationLayoutSolver
 
 
 class NativePermutationViewTests(TestCase):

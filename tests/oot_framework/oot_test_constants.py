@@ -72,6 +72,7 @@ _VALID_INIT_STRATEGIES = {
     "eye",
     "full",
     "file",
+    "cumsum_offsets",
 }
 
 _VALID_TEST_MODES = {MODE_MANDATORY_SUCCESS, MODE_XFAIL, MODE_XFAIL_STRICT, MODE_SKIP}

@@ -67,6 +67,7 @@ The following environment variables control the level of diagnostic output:
 | `SPYRE_INDUCTOR_LOG_LEVEL=DEBUG` | *Deprecated.* Use `TORCH_LOGS="+torch_spyre.inductor"` instead (DEBUG level) |
 | `SPYRE_LOG_FILE=path/to/file.log` | Redirect Spyre Inductor log output to a file |
 | `TORCH_SPYRE_DOWNCAST_WARN=0` | Suppress int64→int32 warnings |
+| `SPYRE_VALIDATE_OP_SPECS` | OpSpec invariant checking at each pipeline stage boundary (after creation, simplification, and before bundle generation). Enabled by default; set to `0` to disable. Catches invalid specs early with descriptive errors |
 | `TORCH_LOGS="+inductor"` | PyTorch provided tool to selectively enable Inductor or other parts of the `torch.compile` to the log |
 
 ### Programmatic Logging Control

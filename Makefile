@@ -91,10 +91,21 @@ ifeq ($(TEST_TYPE),perf)
 	@test -f "$(RESULTS_DIR)/report.xml" || \
 		{ echo "ERROR: spyre-perf-suite did not emit $(RESULTS_DIR)/report.xml" >&2; \
 		  exit 1; }
+# The single-card and multi-card legs run as two separate run_test.sh
+# invocations, and run_test.sh writes the caller's --junit-xml destination with
+# a truncating merge once per invocation. If both legs share one
+# --junit-xml=FILE the second leg overwrites the first, so only one leg's
+# results survive. Give each leg its own file when the caller asked for a
+# report: the single-card leg keeps the requested path (so existing consumers
+# see the same name), and the multi-card leg writes a "<stem>-multi-card.xml"
+# sibling. CI ingesters glob *.xml, so both files are collected. With no
+# --junit-xml the sed is a no-op and both legs run with PYTEST_ARGS unchanged.
 else ifneq ($(wildcard $(TEST_CONFIGS)/.),)
 	@rc=0; \
-	$(MAKE) tests-single-card TEST_TYPE="$(TEST_TYPE)" TEST_CONFIGS="$(TEST_CONFIGS)" PYTEST_ARGS="$(PYTEST_ARGS)" || rc=1; \
-	$(MAKE) tests-multi-card TEST_TYPE="$(TEST_TYPE)" PYTEST_ARGS="$(PYTEST_ARGS)" || rc=1; \
+	_single_args='$(PYTEST_ARGS)'; \
+	_multi_args="$$(printf '%s' '$(PYTEST_ARGS)' | sed -E 's#(--junit-xml[= ]+[^ ]*)\.xml#\1-multi-card.xml#')"; \
+	$(MAKE) tests-single-card TEST_TYPE="$(TEST_TYPE)" TEST_CONFIGS="$(TEST_CONFIGS)" PYTEST_ARGS="$$_single_args" || rc=1; \
+	$(MAKE) tests-multi-card TEST_TYPE="$(TEST_TYPE)" PYTEST_ARGS="$$_multi_args" || rc=1; \
 	exit $$rc
 else
 	@if [ ! -f "$(TEST_CONFIGS)" ]; then \

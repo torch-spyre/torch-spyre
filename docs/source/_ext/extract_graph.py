@@ -25,6 +25,7 @@ No imports of torch or torch_spyre are needed — extraction is purely syntactic
 """
 
 import ast
+import functools
 import json
 import subprocess
 from pathlib import Path
@@ -58,9 +59,125 @@ def _normalize_op_name(raw):
     return raw
 
 
-def _extract_list_ops(list_node):
-    """Extract op names from an ast.List of Attribute references."""
+# Module-level calls that register eager kernels for a list of ops.
+_EAGER_REGISTRARS = ("register_torch_compile_kernel", "register_inplace_kernels")
+
+# In-place names the naming rule produces but ``_functional_sibling`` rejects,
+# so no kernel is registered: ``pow.Scalar(Scalar, Tensor)`` has operands
+# swapped relative to ``pow_.Scalar(Tensor, Scalar)``.
+_NO_INPLACE_SIBLING = frozenset({"pow"})
+
+
+def _inplace_name(op):
+    """``aten.mul`` -> ``aten.mul_``, or ``None`` if there is no in-place form.
+
+    The trailing ``_`` attaches to the op name, which is the last dotted
+    component before any overload: ``aten.ne.Tensor`` -> ``aten.ne_.Tensor``.
+
+    Mirrors the naming rule ``register_inplace_kernels`` relies on, then drops
+    the shapes that never yield a registration: ``.out`` variants (they write
+    through an explicit out-arg), already-in-place names, the operand-swapped
+    ``pow`` pair, and -- when torch is importable -- names ATen does not define
+    at all. Without this the ~37 derived in-place kernels are missing from the
+    graph entirely.
+    """
+    parts = op.split(".")
+    if len(parts) < 2:
+        return None
+    # Split name from overload: with 3+ components the last is the overload
+    # (``aten.ne.Tensor``); with 2 only a known lowercase overload is one
+    # (``aten.silu.out``), otherwise the last component is the name itself.
+    if len(parts) > 2 or parts[-1] in ("out", "default"):
+        name_idx = len(parts) - 2
+    else:
+        name_idx = len(parts) - 1
+    name = parts[name_idx]
+    overloads = parts[name_idx + 1 :]
+    # ``.out``/``.Tensor_out`` write through an explicit out-arg; there is no
+    # in-place sibling to register.
+    if (
+        name.endswith("_")
+        or name in _NO_INPLACE_SIBLING
+        or any(o == "out" or o.endswith("_out") for o in overloads)
+    ):
+        return None
+    parts[name_idx] = name + "_"
+    candidate = ".".join(parts)
+    return candidate if _inplace_op_exists(candidate) else None
+
+
+@functools.lru_cache(maxsize=1)
+def _real_aten():
+    """``torch.ops.aten`` if it can answer existence questions, else ``None``.
+
+    Extraction must keep working with no torch *and* under the docs build's
+    ``autodoc_mock_imports`` (see module docstring), where a mock would claim
+    every name exists and silently prune nothing -- or raise on ``in``. The
+    negative probe rejects such a stand-in: a real ATen has no ``definitely_``
+    ``not_an_op``, a mock happily returns one.
+    """
+    try:
+        import torch
+
+        aten = torch.ops.aten
+        if getattr(aten, "definitely_not_an_op_zzz", None) is not None:
+            return None
+        # A real packet answers ``overloads()`` with a list of str.
+        if not isinstance(aten.mul_.overloads(), (list, tuple)):
+            return None
+        return aten
+    except Exception:
+        return None
+
+
+def _inplace_op_exists(op):
+    """Whether ``op`` is a real ATen overload, when that can be checked cheaply.
+
+    An unusable torch (absent or mocked) means "assume it exists", keeping the
+    syntactic guess. When a real one is importable this prunes names like
+    ``aten.mm_``/``aten.cat_`` that the naming rule produces but ATen does not
+    define, so the graph matches what actually gets registered.
+    """
+    aten = _real_aten()
+    if aten is None:
+        return True
+
+    packet, _, overload = op.partition(".")[2].partition(".")
+    try:
+        aten_packet = getattr(aten, packet, None)
+        if aten_packet is None:
+            return False
+        if not overload:
+            # No overload named: the packet existing is the whole question. Do
+            # not require a ``default`` -- ``mul_`` only has
+            # ``Scalar``/``Tensor``.
+            return True
+        return overload in aten_packet.overloads()
+    except Exception:
+        return False
+
+
+def _module_list_bindings(tree):
+    """Map module-level ``NAME = [...]`` assignments to their ast.List node."""
+    bindings = {}
+    for stmt in tree.body:
+        if isinstance(stmt, ast.Assign) and isinstance(stmt.value, ast.List):
+            for target in stmt.targets:
+                if isinstance(target, ast.Name):
+                    bindings[target.id] = stmt.value
+    return bindings
+
+
+def _extract_list_ops(list_node, list_bindings=None):
+    """Extract op names from an ast.List of Attribute references.
+
+    ``list_bindings`` (from :func:`_module_list_bindings`) lets a bare name be
+    resolved, so ``register_torch_compile_kernel(COMPILED_OPS)`` is parsed the
+    same as an inline list literal.
+    """
     ops = []
+    if isinstance(list_node, ast.Name) and list_bindings:
+        list_node = list_bindings.get(list_node.id, list_node)
     if not isinstance(list_node, ast.List):
         return ops
     for elt in list_node.elts:
@@ -320,13 +437,22 @@ def extract_eager_kernels(filepath):
     source = Path(filepath).read_text()
     tree = ast.parse(source)
     rel_path = str(filepath)
+    list_bindings = _module_list_bindings(tree)
 
     for node in ast.walk(tree):
         if isinstance(node, ast.Call):
             func_name = _resolve_attr(node.func)
-            if func_name == "register_torch_compile_kernel" and node.args:
-                ops = _extract_list_ops(node.args[0])
+            if func_name in _EAGER_REGISTRARS and node.args:
+                inplace = func_name == "register_inplace_kernels"
+                ops = _extract_list_ops(node.args[0], list_bindings)
                 for op in ops:
+                    # ``register_inplace_kernels`` consumes the functional list
+                    # and registers the ``foo_`` sibling of each entry, so the
+                    # graph node is the in-place name, not the one in the list.
+                    if inplace:
+                        op = _inplace_name(op)
+                        if op is None:
+                            continue
                     eager_id = f"eager::{op}"
                     op_id = f"op::{op}"
                     nodes.append(

@@ -43,8 +43,7 @@ def _assert_copy_back_preserved(source: str) -> None:
     assert any("copy_" in line for line in source.splitlines() if "sdsc_fused_" in line)
 
 
-@pytest.mark.parametrize("global_stick_optimizer", [True, False])
-def test_mm_out_copy_back_into_input_is_elided(global_stick_optimizer):
+def test_mm_out_copy_back_into_input_is_elided():
     torch.manual_seed(0xAFFE)
     x = torch.randn(SIZE, SIZE, dtype=torch.float16)
     y = torch.randn(SIZE, SIZE, dtype=torch.float16)
@@ -57,10 +56,7 @@ def test_mm_out_copy_back_into_input_is_elided(global_stick_optimizer):
 
     expected_z = z.clone()
     expected = fn(x, y, expected_z, w)
-    with patch.object(
-        inductor_config, "global_stick_optimizer", global_stick_optimizer
-    ):
-        actual, source, device_args = _compile_and_source(fn, x, y, z, w)
+    actual, source, device_args = _compile_and_source(fn, x, y, z, w)
 
     torch.testing.assert_close(actual.cpu(), expected, atol=0.1, rtol=0.1)
     torch.testing.assert_close(device_args[2].cpu(), expected_z, atol=0.1, rtol=0.1)

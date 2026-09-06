@@ -17,6 +17,7 @@ test_suite_config:
             # concat / pad
             - TestOps::test_cat.*
             - TestOps::test_pad.*
+            - TestOps::test_keep_by_index.*
           mode: mandatory_success
           tags:
             - ops__inductor_misc_shape

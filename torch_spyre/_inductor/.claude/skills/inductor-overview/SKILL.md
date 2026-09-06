@@ -25,6 +25,14 @@ your code. See
 for the cache-layer breakdown and where to find generated SDSC/superdsc
 JSON, MLIR bundles, and `output_code.py` for a given compilation.
 
+## Getting log/debug output
+
+Unsure which `TORCH_LOGS` setting, component name, or env var turns on
+Spyre logging (Python or C++)? Use the sibling `logging` skill in this
+same `.claude/skills/` directory — it covers the `torch_spyre.*` vs.
+`spyre.*` namespace split, the `+`/`-`/no-prefix level syntax, and why
+dynamic per-pass loggers can't be targeted directly in `TORCH_LOGS`.
+
 ## Layout and stride semantics
 
 `stride_map`, `device_stride`, and `pytorch_stride` measure three

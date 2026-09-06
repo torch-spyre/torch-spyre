@@ -27,7 +27,7 @@ KTIR emitter is simply the first such consumer (hence the KTIR references
 below); future emitters are intended to share them, which is why the module is
 named for the ``OpSpec`` it reads rather than for KTIR.
 
-``__all__`` is the contract: those four are what a consumer may import.  Anything
+``__all__`` is the contract: those names are what a consumer may import.  Anything
 underscore-prefixed is a step inside one of them -- reachable from a test, but not
 something to build on.
 """
@@ -42,11 +42,14 @@ from torch.utils._sympy.functions import FloorDiv, ModularIndexing
 from torch_spyre._inductor.op_spec import OpSpec, TensorArg
 
 __all__ = [
+    "PARALLEL",
+    "REDUCTION",
     "align_reshape_plan",
     "buf_id",
     "core_divisions",
     "per_core_extent",
-    "reduced_axes",
+    "placeholder_axes",
+    "reduction_indexing",
     "row_major_strides",
 ]
 
@@ -240,68 +243,147 @@ def align_reshape_plan(
     return (reshape_to, broadcast_to)
 
 
-def reduced_axes(
+def placeholder_axes(
+    coords: Sequence[sympy.Expr], extent: Sequence[int]
+) -> tuple[int, ...]:
+    """Output axes standing in for something the op does not write.
+
+    A projection keeps an axis the op does not produce in the output's
+    ``device_size`` as a unit extent at a constant coordinate, so the output is
+    the same rank as the input even though it carries less.  A consumer wants
+    those axes gone: the accepted KTIR form stores a rank-2 tile into a rank-2
+    view, and keeping them would demand a reshape between the compute op and the
+    store.
+
+    **Unary on purpose** -- it asks nothing about the inputs.  A constant
+    coordinate alone does not identify a placeholder: an on-stick reduction's
+    output carries *two* constant coordinates, one a placeholder and one the
+    broadcast lane the store really walks, and only the extent separates them.
+    Folding this into a relational helper is what made the on-stick shape reach a
+    coordinate-matching refusal before anyone could ask the unary question.
+    """
+    return tuple(
+        axis
+        for axis, coord in enumerate(coords)
+        if _dim_info(coord)[0] == _DIM_CONST and int(extent[axis]) == 1
+    )
+
+
+# The two ``linalg`` iterator names, as ``iterator_types`` spells them.  Produced
+# here because ``reduction_indexing`` is what decides which dim is which; a
+# consumer that builds a ``linalg.generic`` passes them through unchanged.
+PARALLEL = "parallel"
+REDUCTION = "reduction"
+
+
+def reduction_indexing(
     in_coords: Sequence[sympy.Expr],
     in_extent: Sequence[int],
     out_coords: Sequence[sympy.Expr],
     out_extent: Sequence[int],
-) -> tuple[tuple[int, ...], tuple[int, ...]]:
-    """``(reduced, placeholder)`` axes for one reduction.
+) -> tuple[tuple[str, ...], tuple[int, ...], tuple[int, ...]]:
+    """``(iters, in_map, out_map)`` for one unary reduction over a squeezed output.
 
-    ``reduced`` is the input device axes the reduction consumes, in increasing
-    order, and ``placeholder`` is the output axes that are only standing in for
-    them: the projection keeps a reduced axis in the output's ``device_size`` as a
-    unit extent with a constant coordinate, so the output is the same rank as the
-    input even though it carries less.  A consumer wants the reduced axis gone
-    (the accepted KTIR form stores a rank-2 tile into a rank-2 view), so a
-    consumer of this helper drops those axes.
+    The iteration nest a reduction wants, stated as the three things a
+    ``linalg.generic`` would have to say and a ``linalg.reduce`` says implicitly:
+    one iterator per iteration dim, and per operand one dim index per result
+    position (a *projection*, so ``(0, 1, 2)`` is ``(d0..d3) -> (d0,d1,d2)``).
+    Plain tuples rather than dialect types, so this module keeps knowing nothing
+    about MLIR.
 
-    Which axes survive is read from the coordinates -- an output axis matches an
-    input axis when their ``(kind, sym)`` classifications agree (see
-    ``_dim_info``) -- rather than from the op name or a position convention, so a
-    reduction over the middle axis of a stick-tiled tile is described as exactly
-    that.
+    An iteration dim is a distinct ``(kind, sym)`` classification of a device
+    coordinate (see ``_dim_info``), numbered in the order the *input* axes
+    introduce them.  Two things follow that a set-complement over kept axes
+    cannot express:
 
-    Raises ``NotImplementedError`` when the surviving axes are permuted (which
-    needs a transpose, not a reduce) or when a surviving extent changes, either
-    of which would make the reduce silently read the wrong elements.
+    * an output axis whose coordinate is a bare constant of extent > 1 is not a
+      placeholder but a **broadcast lane** -- a real iteration dim the store walks
+      that the input does not have -- so it gets a fresh dim rather than a
+      refusal.  That is the whole on-stick reduction, and the axis a reduction
+      reduces on the way in can therefore be kept on the way out.
+    * an axis can be both, which is why the answer is per-operand maps and not a
+      flat list of reduced axes.
+
+    ``out_coords``/``out_extent`` must already have their placeholder axes dropped
+    (``placeholder_axes``): an extent-1 constant would otherwise be
+    indistinguishable from a degenerate broadcast lane.
+
+    Refuses three shapes, each of which would otherwise read the wrong elements
+    silently: a kept axis that matches no input axis or matches one out of
+    increasing order (that is a transpose, which needs a restickify); a kept axis
+    whose extent changed; and a nest in which nothing reduces at all.  The last
+    is not implied by the caller having labelled the spec a reduction -- that says
+    what was *asked for*, this reads what the coordinates *are* -- and without it
+    an all-parallel nest reaches ``dimensions = []``, which does not build.
     """
-    in_info = [_dim_info(c) for c in in_coords]
-    placeholder = tuple(
-        axis
-        for axis, coord in enumerate(out_coords)
-        if _dim_info(coord)[0] == _DIM_CONST and int(out_extent[axis]) == 1
-    )
-    surviving = [axis for axis in range(len(out_coords)) if axis not in placeholder]
-    out_info = [_dim_info(out_coords[axis]) for axis in surviving]
-    kept: list[int] = []
-    position = 0
-    for axis, info in enumerate(out_info):
-        while position < len(in_info) and in_info[position] != info:
-            position += 1
-        if position == len(in_info):
+    dims: list[tuple[str, sympy.Symbol | None]] = []
+    extents: list[int] = []
+    in_map: list[int] = []
+    for axis, coord in enumerate(in_coords):
+        info = _dim_info(coord)
+        size = int(in_extent[axis])
+        if info in dims:
+            # A repeated classification is one dim walked twice, so the two axes
+            # must agree about how far it runs.
+            dim = dims.index(info)
+            if extents[dim] != size:
+                raise NotImplementedError(
+                    f"OpSpec reduction: input device axes {in_map.index(dim)} and "
+                    f"{axis} are both {coord!r} but run {extents[dim]} and {size} "
+                    "elements; one iteration dim cannot have two ranges"
+                )
+        else:
+            dims.append(info)
+            extents.append(size)
+            dim = len(dims) - 1
+        in_map.append(dim)
+
+    # Only the dims the input introduced are matchable; anything past this is a
+    # broadcast lane allocated below, and a second one must not match the first.
+    from_input = len(dims)
+    out_map: list[int] = []
+    matched: list[int] = []  # the input dims kept, in output order
+    for axis, coord in enumerate(out_coords):
+        info = _dim_info(coord)
+        size = int(out_extent[axis])
+        if info in dims[:from_input]:
+            dim = dims.index(info)
+            if extents[dim] != size:
+                raise NotImplementedError(
+                    f"OpSpec reduction: kept output axis {axis} has extent {size} "
+                    f"but its input axis has extent {extents[dim]}; a reduction "
+                    "does not resize an axis it keeps"
+                )
+            matched.append(dim)
+        elif info == (_DIM_CONST, None):
+            # The broadcast lane: a real iteration dim with no input axis behind
+            # it.  ``placeholder_axes`` has already taken the extent-1 constants,
+            # so what is left here carries elements.
+            dims.append(info)
+            extents.append(size)
+            dim = len(dims) - 1
+        else:
             raise NotImplementedError(
-                f"OpSpec reduction: output device axis {surviving[axis]} "
-                f"({out_coords[surviving[axis]]!r}) does not match a later input "
-                "axis; the surviving axes are permuted, which needs a transpose "
-                "rather than a reduction"
+                f"OpSpec reduction: output device axis {axis} ({coord!r}) matches "
+                "no input axis; the surviving axes are permuted, which needs a "
+                "transpose rather than a reduction"
             )
-        kept.append(position)
-        position += 1
-    for axis, source in enumerate(kept):
-        if int(out_extent[surviving[axis]]) != int(in_extent[source]):
-            raise NotImplementedError(
-                f"OpSpec reduction: surviving axis {surviving[axis]} has extent "
-                f"{out_extent[surviving[axis]]} but its input axis {source} has "
-                f"extent {in_extent[source]}; a reduction does not resize a kept axis"
-            )
-    reduced = tuple(axis for axis in range(len(in_info)) if axis not in set(kept))
+        out_map.append(dim)
+
+    # A pure reduction preserves the row-major order of the axes it keeps.
+    if any(matched[i] >= matched[i + 1] for i in range(len(matched) - 1)):
+        raise NotImplementedError(
+            "OpSpec reduction: the surviving axes are permuted, which needs a "
+            "transpose rather than a reduction"
+        )
+    reduced = set(range(len(dims))) - set(out_map)
     if not reduced:
         raise NotImplementedError(
             "OpSpec reduction: the output carries every input device axis, so "
             "there is no axis to reduce"
         )
-    return reduced, placeholder
+    iters = tuple(REDUCTION if dim in reduced else PARALLEL for dim in range(len(dims)))
+    return iters, tuple(in_map), tuple(out_map)
 
 
 # ---------------------------------------------------------------------------

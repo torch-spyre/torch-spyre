@@ -30,6 +30,24 @@ on:
         description: Exact pytorch/pytorch commit SHA to build
         required: true
         type: string
+      run_torch_spyre_tests:
+        description: >-
+          Also run torch-spyre's own test suite (tests/, via _test_matrix.yaml)
+          against the wheels the `build` job produces, in addition to the
+          upstream-beta suites. Non-blocking: a failure here does not fail
+          this workflow. Default false -- manual workflow_dispatch opt-in only.
+        required: false
+        type: boolean
+        default: false
+      torch_spyre_test_type:
+        description: >-
+          Suite subset for the torch-spyre test run when
+          run_torch_spyre_tests is true. Forwarded verbatim to
+          _test_matrix.yaml's test_type input: smoke | unit | integration |
+          regression | trunk | suite_<group> | <label>.
+        required: false
+        type: string
+        default: regression
 
 defaults:
   run:
@@ -85,7 +103,14 @@ jobs:
           verbose: 'true'
 
       - name: Install uv
-        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          # latest-known, not "latest": it resolves to the newest uv whose checksum is
+          # bundled INTO this setup-uv pin, resolved locally with no release lookup. A
+          # just-published release is not yet mirrored on releases.astral.sh, so "latest"
+          # 404s there and falls back to GitHub Releases, which rate-limits (429) once the
+          # fleet requests it concurrently. Bumping setup-uv moves this version forward.
+          version: latest-known
 
       - name: Write dispatch payload to file
         env:
@@ -106,6 +131,7 @@ jobs:
 
 
       - name: 'Report stage: torch_build'
+        continue-on-error: true
         run: |
           echo "T_TORCH_BUILD_START=$(date +%s)" >> "$GITHUB_ENV"
           uv run --with clickhouse-connect --with regex \
@@ -120,7 +146,14 @@ jobs:
             --pytorch-sha "${{ inputs.pytorch_sha }}" \
             --torch-spyre-sha "${{ github.sha }}"
 
+      # Own job-name (not "test"), same-job-paired with the completed call below.
+      - name: Report build started to pytorch/pytorch
+        uses: ./.github/actions/report-ci-started
+        with:
+          job_name: linux-x86_64 / pytorch / build
+
       - name: Build PyTorch from source
+        id: build_pytorch
         uses: ./.github/actions/build-pytorch-from-source
 
       - name: Upload PyTorch wheel
@@ -132,6 +165,7 @@ jobs:
           retention-days: 5
 
       - name: 'Report stage: torch_spyre_build'
+        continue-on-error: true
         run: |
           echo "T_TORCH_SPYRE_BUILD_START=$(date +%s)" >> "$GITHUB_ENV"
           uv run --with clickhouse-connect --with regex \
@@ -147,7 +181,26 @@ jobs:
             --torch-spyre-sha "${{ github.sha }}"
 
       - name: Build torch-spyre against local PyTorch
+        id: build_torch_spyre
         uses: ./.github/actions/build-torch-spyre-local-pytorch
+
+      - name: Compute build conclusion
+        id: build_conclusion
+        if: always()
+        run: |
+          if [ "${{ steps.build_pytorch.outcome }}" = "success" ] && [ "${{ steps.build_torch_spyre.outcome }}" = "success" ]; then
+            echo "conclusion=success" >> "$GITHUB_OUTPUT"
+          else
+            echo "conclusion=failure" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Report build completed to pytorch/pytorch
+        if: always()
+        uses: ./.github/actions/report-ci-completed
+        with:
+          job_name: linux-x86_64 / pytorch / build
+          conclusion: ${{ steps.build_conclusion.outputs.conclusion }}
+          pytorch_sha: ${{ inputs.pytorch_sha }}
 
       - name: Upload torch-spyre wheel
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -157,12 +210,6 @@ jobs:
           if-no-files-found: error
           retention-days: 5
 
-      # - name: Report CI started to pytorch/pytorch
-      #   continue-on-error: true
-      #   uses: pytorch/test-infra/.github/actions/cross-repo-ci-relay-callback@main
-      #   with:
-      #     status: in_progress
-
       - name: Compute build durations
         id: compute_durations
         run: |
@@ -171,6 +218,7 @@ jobs:
           echo "torch_spyre_build_seconds=$(( NOW - T_TORCH_SPYRE_BUILD_START ))" >> "$GITHUB_OUTPUT"
 
       - name: 'Report stage: running_tests'
+        continue-on-error: true
         run: |
           uv run --with clickhouse-connect --with regex \
             torch-spyre/.github/scripts/ingest_pytorch_dispatch.py \
@@ -184,35 +232,50 @@ jobs:
             --pytorch-sha "${{ inputs.pytorch_sha }}" \
             --torch-spyre-sha "${{ github.sha }}"
 
-  # ---------------------------------------------------------------------------
-  # Run every upstream-beta suite (as a per-suite matrix, with retry/stall-
-  # watching/JUnit-XML reporting) against the wheel `build` just packaged.
-  # Shared with upstream_tests_beta.yaml so the suite list has a single
-  # source of truth.
-  # ---------------------------------------------------------------------------
-  test:
-    needs: build
-    uses: ./.github/workflows/_upstream_tests_beta_matrix.yaml
-    with:
-      artifact_name: torch-spyre-wheel-${{ inputs.pytorch_sha }}
-      pytorch_sha: ${{ inputs.pytorch_sha }}
-      pytorch_wheel_artifact_name: pytorch-wheel-${{ inputs.pytorch_sha }}
-      mode: validate
 
   # ---------------------------------------------------------------------------
-  # Aggregate the per-suite JUnit XMLs the `test` matrix uploaded (one per
-  # suite, instead of the single combined report this job used to produce
-  # inline) and report final counts + timings back into ClickHouse.
+  # Run every upstream-beta suite (as a per-suite matrix, with retry/stall-
+  # watching/JUnit-XML reporting) against the wheel `build` just packaged,
+  # then aggregate the per-suite JUnit XMLs it uploaded and report final
+  # counts + timings (ClickHouse, pytorch/pytorch CRCR, RHEL Results Relay).
+  # Shared with upstream_tests_beta.yaml so the suite list has a single
+  # source of truth.
+  #
+  # Dispatched via a step (github-script + createWorkflowDispatch, mirroring
+  # trigger_other_repos-style dispatch) rather than a job-level `uses:`, so
+  # this job can wrap the dispatch with CRCR in_progress/completed callback
+  # steps -- the CRCR check-run is scoped per-job, so both callbacks have to
+  # originate from the same job as each other (see build's commented-out
+  # in_progress step, moved out of that job for the same reason). The
+  # reporting steps live in this same job (rather than a separate `report`
+  # job) for the same reason plus one more: only here can the "completed"
+  # CRCR callback carry real pass/fail/skip/total counts -- mode: validate
+  # means the dispatched matrix run's own conclusion is almost always
+  # "success" even when tests failed, so the JUnit counts are the only
+  # trustworthy signal.
+  #
+  # if: always() at the job level so the reporting steps still run even
+  # when `build` failed -- the dispatch/wait step is individually gated on
+  # needs.build.result == 'success' so it doesn't attempt to use wheels
+  # that were never produced.
   # ---------------------------------------------------------------------------
-  report:
-    name: Report results
-    needs: [build, test]
+  test:
+    name: Run upstream-beta test matrix and report results
+    needs: build
     if: always()
     runs-on:
       - x86_64
       - spyre_pf_x0
       - linux
       - image_spyre_backend
+    timeout-minutes: 120
+    permissions:
+      # Needed to dispatch and poll _upstream_tests_beta_matrix.yaml below
+      # (createWorkflowDispatch / listWorkflowRuns / getWorkflowRun). Capped
+      # by the caller's own token -- push-pytorch-dispatch-to-clickhouse.yaml
+      # must also grant `actions: write`.
+      actions: write
+      id-token: write
     env:
       CLICKHOUSE_HOST: ${{ secrets.CLICKHOUSE_HOST_DEV }}
       CLICKHOUSE_PORT: ${{ secrets.CLICKHOUSE_PORT_DEV }}
@@ -220,13 +283,26 @@ jobs:
       CLICKHOUSE_PASS: ${{ secrets.CLICKHOUSE_PASS_DEV }}
       CLICKHOUSE_DB: ${{ secrets.CLICKHOUSE_DB_DEV }}
     steps:
+      - name: Checkout composite actions
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          sparse-checkout: .github/actions
+          sparse-checkout-cone-mode: false
+
       - name: Checkout torch-spyre
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           path: torch-spyre
 
       - name: Install uv
-        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          # latest-known, not "latest": it resolves to the newest uv whose checksum is
+          # bundled INTO this setup-uv pin, resolved locally with no release lookup. A
+          # just-published release is not yet mirrored on releases.astral.sh, so "latest"
+          # 404s there and falls back to GitHub Releases, which rate-limits (429) once the
+          # fleet requests it concurrently. Bumping setup-uv moves this version forward.
+          version: latest-known
 
       # actions4gh/setup-gh@v1.0.2 extracts the gh tarball but never lands
       # the binary on PATH before it calls `gh auth login`, so every job
@@ -262,13 +338,90 @@ jobs:
             printf '%s' "$PAYLOAD_JSON" > payload.json
           fi
 
+      - name: Report CI started to pytorch/pytorch
+        uses: ./.github/actions/report-ci-started
+        with:
+          job_name: linux-x86_64 / pytorch / test
+
+      - name: Dispatch and wait for upstream-beta test matrix
+        id: dispatch
+        if: needs.build.result == 'success'
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        env:
+          PYTORCH_SHA: ${{ inputs.pytorch_sha }}
+        with:
+          script: |
+            const workflowFile = '_upstream_tests_beta_matrix.yaml';
+            const correlationId = `${context.runId}-${context.runNumber}-${Date.now()}`;
+            const pytorchSha = process.env.PYTORCH_SHA;
+
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: workflowFile,
+              ref: context.ref,
+              inputs: {
+                artifact_name: `torch-spyre-wheel-${pytorchSha}`,
+                pytorch_sha: pytorchSha,
+                pytorch_wheel_artifact_name: `pytorch-wheel-${pytorchSha}`,
+                mode: 'validate',
+                correlation_id: correlationId,
+                source_run_id: `${context.runId}`,
+              },
+            });
+
+            const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+            let run;
+            // Poll for the dispatched run to appear (createWorkflowDispatch
+            // returns nothing, so it has to be found by its run-name).
+            for (let attempt = 0; !run && attempt < 30; attempt++) {
+              await sleep(10000);
+              const { data } = await github.rest.actions.listWorkflowRuns({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                workflow_id: workflowFile,
+                event: 'workflow_dispatch',
+              });
+              run = data.workflow_runs.find((r) => r.name && r.name.includes(correlationId));
+            }
+            if (!run) {
+              core.setFailed(`Could not find dispatched run for correlation_id ${correlationId}`);
+              return;
+            }
+            core.info(`Found dispatched run ${run.id} (${run.html_url})`);
+            core.setOutput('run_id', `${run.id}`);
+
+            // Poll until it finishes. mode: validate means the matrix
+            // itself never fails on test failures, so this only fails on
+            // an infra-level problem (e.g. the run erroring out or timing
+            // out) -- test-result failures are non-blocking, same as the
+            // job-level `uses:` this replaces.
+            let conclusion = run.conclusion;
+            for (let attempt = 0; run.status !== 'completed' && attempt < 700; attempt++) {
+              await sleep(30000);
+              const { data } = await github.rest.actions.getWorkflowRun({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                run_id: run.id,
+              });
+              run = data;
+              conclusion = run.conclusion;
+            }
+            if (run.status !== 'completed') {
+              core.setFailed(`Dispatched run ${run.id} did not complete in time`);
+              return;
+            }
+            core.info(`Dispatched run ${run.id} completed with conclusion: ${conclusion}`);
+            core.setOutput('conclusion', conclusion);
+
       - name: Download all JUnit XML artifacts from the test matrix
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           python3 torch-spyre/.github/scripts/download_run_xml_artifacts.py \
             --repo "${{ github.repository }}" \
-            --run-id "${{ github.run_id }}" \
+            --run-id "${{ steps.dispatch.outputs.run_id }}" \
             --output-dir xml_artifacts
 
       - name: Parse test results (counts)
@@ -292,11 +445,29 @@ jobs:
           if-no-files-found: warn
           retention-days: 30
 
+      # Only a genuine 'success' when tests actually ran (total > 0) -- a
+      # build/test job that reports 'success' without collecting any tests
+      # (e.g. a matrix/artifact-download problem) must not be recorded as a
+      # passing run. Computed once and reused below.
+      - name: Compute test conclusion
+        id: test_conclusion
+        env:
+          TEST_RESULTS_JSON: ${{ steps.test_results.outputs.test_results_json }}
+        run: |
+          TOTAL=$(echo "$TEST_RESULTS_JSON" | jq '.total')
+          FAILED=$(echo "$TEST_RESULTS_JSON" | jq '.failed')
+          if [ "$TOTAL" -gt 0 ] && [ "$FAILED" -eq 0 ]; then
+            echo "conclusion=success" >> "$GITHUB_OUTPUT"
+          else
+            echo "conclusion=failure" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: 'Report stage: completed'
+        continue-on-error: true
         env:
           TEST_RESULTS_JSON: ${{ steps.test_results.outputs.test_results_json }}
           MAX_DURATION_SECONDS: ${{ steps.test_results.outputs.max_duration_seconds }}
-          CONCLUSION: ${{ (needs.build.result == 'success' && needs.test.result == 'success') && 'success' || 'failure' }}
+          CONCLUSION: ${{ steps.test_conclusion.outputs.conclusion }}
           # Empty whenever `build` failed before reaching compute_durations
           # (e.g. the PyTorch/torch-spyre build itself failed) — omitted
           # below rather than passed through, since build_stage_result_payload.py
@@ -327,11 +498,38 @@ jobs:
             --torch-spyre-sha "${{ github.sha }}" \
             --result-payload-file result_payload.json
 
-      # - name: Report CI completed to pytorch/pytorch
-      #   if: always()
-      #   continue-on-error: true
-      #   uses: pytorch/test-infra/.github/actions/cross-repo-ci-relay-callback@main
-      #   with:
-      #     status: completed
-      #     conclusion: ${{ (needs.build.result == 'success' && needs.test.result == 'success') && 'success' || 'failure' }}
-      #     test-results: ${{ steps.test_results.outputs.test_results_json }}
+      - name: Report CI completed to pytorch/pytorch
+        if: always()
+        uses: ./.github/actions/report-ci-completed
+        with:
+          job_name: linux-x86_64 / pytorch / test
+          conclusion: ${{ steps.test_conclusion.outputs.conclusion }}
+          pytorch_sha: ${{ inputs.pytorch_sha }}
+          test_results_json: ${{ steps.test_results.outputs.test_results_json }}
+
+  # ---------------------------------------------------------------------------
+  # Manual opt-in only (run_torch_spyre_tests, surfaced as a workflow_dispatch
+  # input on push-pytorch-dispatch-to-clickhouse.yaml): run torch-spyre's own
+  # test suite -- the same _test_matrix.yaml used by tests.yaml/PR CI -- against
+  # the exact wheels `build` just produced, instead of rebuilding them.
+  # Non-blocking: this must never fail the overall run or feed the
+  # pytorch/pytorch CRCR / ClickHouse reporting in `test` above. Same
+  # mechanism the `test` job's dispatch step uses (mode: validate, forwarded
+  # to run_test.sh's own --mode flag) rather than continue-on-error -- GitHub
+  # Actions does not support continue-on-error on a job that calls a
+  # reusable workflow via `uses:`.
+  # ---------------------------------------------------------------------------
+  torch_spyre_tests:
+    name: Run torch-spyre tests
+    needs: build
+    if: ${{ inputs.run_torch_spyre_tests }}
+    uses: ./.github/workflows/_test_matrix.yaml
+    secrets: inherit
+    with:
+      runner_label: linux
+      extra_test_flags: -v -m "not xfail" --mode=validate
+      extra_test_flags_multi_spyre: -v --mode=validate
+      checkout_pytorch: false
+      test_type: ${{ inputs.torch_spyre_test_type }}
+      pytorch_wheel_artifact_name: pytorch-wheel-${{ inputs.pytorch_sha }}
+      torch_spyre_wheel_artifact_name: torch-spyre-wheel-${{ inputs.pytorch_sha }}

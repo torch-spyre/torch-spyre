@@ -15,6 +15,8 @@ __all__: list[str] = [
     "SpyreStreamError",
     "SpyreDeviceState",
     "SpyreTensorLayout",
+    "SymbolicArg",
+    "SymbolicArgKind",
     "_SpyreStreamBase",
     "current_stream",
     "default_stream",
@@ -347,6 +349,42 @@ def get_downcast_warning() -> bool:
 def get_elem_in_stick(arg0: torch.dtype) -> int: ...
 def get_spyre_tensor_layout(arg0: torch.Tensor) -> SpyreTensorLayout: ...
 
+class SymbolicArgKind:
+    """
+    Members:
+
+      kAddress
+
+      kDimension
+    """
+
+    kAddress: typing.ClassVar[SymbolicArgKind]
+    kDimension: typing.ClassVar[SymbolicArgKind]
+    __members__: typing.ClassVar[dict[str, SymbolicArgKind]]
+    def __eq__(self, other: typing.Any) -> bool: ...
+    def __hash__(self) -> int: ...
+    def __init__(self, value: typing.SupportsInt) -> None: ...
+    def __int__(self) -> int: ...
+    def __repr__(self) -> str: ...
+    @property
+    def name(self) -> str: ...
+    @property
+    def value(self) -> int: ...
+
+class SymbolicArg:
+    kind: SymbolicArgKind
+    value: int
+    tensor_id: int
+    dim_index: int
+    def __init__(
+        self,
+        kind: SymbolicArgKind,
+        tensor_id: int,
+        dim_index: int = -1,
+        value: int = -1,
+    ) -> None: ...
+    def __repr__(self) -> str: ...
+
 class JobPlan:
     """
     A torch-spyre internal container for executing a unit of work.
@@ -370,7 +408,9 @@ class JobPlan:
         ...
 
 def launch_jobplan(
-    job_plan: JobPlan, args: collections.abc.Sequence[torch.Tensor]
+    job_plan: JobPlan,
+    args: collections.abc.Sequence[torch.Tensor],
+    symbolic_args: list[SymbolicArg] = ...,
 ) -> None:
     """
     Launch a prepared JobPlan with the given tensor arguments.
@@ -378,6 +418,7 @@ def launch_jobplan(
     Args:
         job_plan: The JobPlan to execute
         args: Sequence of input/output tensors
+        symbolic_args: Optional typed per-symbol payload. Defaults to empty.
     """
     ...
 

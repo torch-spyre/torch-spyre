@@ -25,6 +25,7 @@
 #include <spyrecode-host-functions/sendataconvert/sen_data_convert.h>
 #include <util/sendefs/sendefs.h>
 
+#include <cstdint>
 #include <cstdlib>     // std::getenv
 #include <filesystem>  // NOLINT(build/c++17)
 #include <flex/flex.hpp>
@@ -49,6 +50,7 @@
 #include "perm_layout_native.h"
 #include "prepare_kernel.h"
 #include "spyre_allocator.h"
+#include "spyre_composite_address.h"
 #include "spyre_device_enum.h"
 #include "spyre_error.h"
 #include "spyre_generator_impl.h"
@@ -76,6 +78,22 @@ void set_downcast_warn_enabled(bool enabled) {
   g_downcast_warn_enabled.store(enabled, std::memory_order_relaxed);
 }
 
+// SPYRE_HAZARD_TRACKER: on = split the correction triple across S_prep/S_dev
+// and let flex insert the cross-stream H2D->Compute edge. off = single-stream
+// floor (all on S_dev; FIFO enforces the edge). Default OFF to match flex: if
+// we split but flex isn't tracking, nothing enforces H2D->Compute and results
+// go wrong. Read once in init_from_env; latched into each stream's
+// track_hazards. Env-only by design: flex latches the same value at
+// RuntimeContext construction and cannot register the default stream
+// afterward, so there is no runtime setter -- a post-startup flip would leave
+// S_dev unregistered and route H2D to S_prep with no H2D->Compute edge minted.
+std::atomic<bool> g_hazard_tracker_enabled{
+    false};  // default OFF (matches flex)
+
+bool get_hazard_tracker_enabled() {
+  return g_hazard_tracker_enabled.load(std::memory_order_relaxed);
+}
+
 // Optional: initialize from env at module init
 static void init_from_env() {
   if (const char* v = std::getenv(SPYRE_DOWNCAST_ENV)) {
@@ -84,6 +102,15 @@ static void init_from_env() {
     for (auto& c : s) c = std::tolower(c);
     bool enable = !(s == "0" || s == "false" || s == "off");
     g_downcast_warn_enabled.store(enable, std::memory_order_relaxed);
+  }
+  // SPYRE_HAZARD_TRACKER: match flex's BooleanEnvVar grammar exactly, since
+  // flex reads the same var. On = {"1","true","t","yes","y"} (case-sensitive);
+  // anything else is off. Defaults OFF when unset.
+  if (const char* v = std::getenv("SPYRE_HAZARD_TRACKER")) {
+    const std::string s(v);
+    const bool enable =
+        (s == "1" || s == "true" || s == "t" || s == "yes" || s == "y");
+    g_hazard_tracker_enabled.store(enable, std::memory_order_relaxed);
   }
 }
 
@@ -119,17 +146,14 @@ void _startRuntime() {
               "Device index out of bounds. logical_device_id=",
               logical_device_id, ", number of visible devices=", num_devices);
 
-  std::shared_ptr<flex::RuntimeContext> runtime;
-  auto s = flex::initializeRuntime(&runtime, logical_device_id);
+  // create() never returns null: it returns the singleton or throws.
+  flex::RuntimeContext* runtime =
+      flex::RuntimeContext::create(logical_device_id);
   init_from_env();
-  if (runtime) {
-    GlobalRuntime::set(runtime);
-    DEBUGINFO(s);
-    DEBUGINFO("runtime started with logical_device_id ", logical_device_id);
-  } else {
-    DEBUGINFO("runtime FAILED TO START.");
-    throw std::runtime_error("Failed to initialize Spyre runtime. ");
-  }
+  GlobalRuntime::set(runtime);
+  // SPYRE_HAZARD_TRACKER (read in init_from_env) is latched per stream at
+  // creation via track_hazards; nothing to toggle on the runtime here.
+  DEBUGINFO("runtime started with logical_device_id ", logical_device_id);
 }
 void startRuntime() {
   static std::once_flag flag;
@@ -377,6 +401,8 @@ PYBIND11_MODULE(_C, m) {
         "Return whether downcast warnings are enabled.");
   m.def("set_downcast_warning", &spyre::set_downcast_warn_enabled,
         "Enable/disable downcast warnings for this process.");
+  m.def("get_hazard_tracker_enabled", &spyre::get_hazard_tracker_enabled,
+        "Whether the flex per-region hazard tracker is enabled.");
   m.def("get_elem_in_stick", &spyre::get_elem_in_stick);
   m.def("get_device_dtype", &spyre::get_device_dtype);
 
@@ -400,6 +426,36 @@ PYBIND11_MODULE(_C, m) {
   m.def("fill_tensor", &spyre::spyre_fill_tensor,
         "Fill a spyre tensor with a scalar value using device-side FillDMA",
         py::arg("self"), py::arg("value"));
+
+  // Read-only view of a device tensor's CompositeAddress (chunk geometry).
+  // The handle keeps the source tensor's allocation alive for its lifetime.
+  py::class_<spyre::CompositeChunkInfo>(m, "CompositeChunkInfo")
+      .def_readonly("region_id", &spyre::CompositeChunkInfo::region_id)
+      .def_readonly("offset", &spyre::CompositeChunkInfo::offset)
+      .def_readonly("size", &spyre::CompositeChunkInfo::size)
+      .def_readonly("domain_id", &spyre::CompositeChunkInfo::domain_id)
+      .def("__repr__", [](const spyre::CompositeChunkInfo& c) {
+        return "<CompositeChunkInfo region_id=" + std::to_string(c.region_id) +
+               " offset=" + std::to_string(c.offset) +
+               " size=" + std::to_string(c.size) +
+               " domain_id=" + std::to_string(c.domain_id) + ">";
+      });
+
+  py::class_<spyre::CompositeAddressHandle>(m, "CompositeAddressHandle")
+      .def_property_readonly("total_size",
+                             &spyre::CompositeAddressHandle::total_size,
+                             "Total physical (padded/tiled) byte size of the "
+                             "allocation")
+      .def_property_readonly("num_chunks",
+                             &spyre::CompositeAddressHandle::num_chunks,
+                             "Number of device chunks the allocation spans")
+      .def("chunks", &spyre::CompositeAddressHandle::chunks,
+           "Per-chunk geometry, in order");
+
+  m.def("get_composite_address", &spyre::get_composite_address_handle,
+        "Return a read-only handle over the device address backing a Spyre "
+        "tensor's storage; the handle keeps that allocation alive",
+        py::arg("tensor"));
 
   // Stream management functions
   m.def("get_stream_from_pool", &spyre::getStreamFromPool, py::arg("device"),
@@ -476,20 +532,10 @@ PYBIND11_MODULE(_C, m) {
           "get_step_type",
           [](const spyre::JobPlan& plan, size_t idx) {
             TORCH_CHECK(idx < plan.steps.size(), "Step index out of range");
-            const auto& step = plan.steps[idx];
-            if (dynamic_cast<const spyre::JobPlanStepH2D*>(step.get())) {
-              return "H2D";
-            } else if (dynamic_cast<const spyre::JobPlanStepD2H*>(step.get())) {
-              return "D2H";
-            } else if (dynamic_cast<const spyre::JobPlanStepCompute*>(
-                           step.get())) {
-              return "Compute";
-            } else if (dynamic_cast<const spyre::JobPlanStepHostCompute*>(
-                           step.get())) {
-              return "HostCompute";
-            } else {
-              return "Unknown";
-            }
+            // Single source of truth for step-type identification (also used by
+            // the P2-14 ordering validator). Returns
+            // HostCompute/H2D/D2H/Compute or Unknown.
+            return spyre::stepKindName(spyre::classifyStep(*plan.steps[idx]));
           },
           py::arg("idx"), "Get the type of step at the given index")
       .def(
@@ -500,6 +546,15 @@ PYBIND11_MODULE(_C, m) {
           },
           py::arg("idx"),
           "Get the pipeline_barrier flag for the step at the given index")
+      .def(
+          "get_step_stream_role",
+          [](const spyre::JobPlan& plan, size_t idx) {
+            TORCH_CHECK(idx < plan.steps.size(), "Step index out of range");
+            return plan.steps[idx]->role() == spyre::StreamRole::Prep ? "Prep"
+                                                                      : "Dev";
+          },
+          py::arg("idx"),
+          "Get the stream role (Prep/Dev) for the step at the given index")
       .def(
           "get_step_name",
           [](const spyre::JobPlan& plan,
@@ -524,6 +579,29 @@ PYBIND11_MODULE(_C, m) {
                " pinned_buffers=" + std::to_string(plan.pinned_buffers.size()) +
                ">";
       });
+  // Symbolic argument payload types
+  py::enum_<spyre::SymbolicArgKind>(m, "SymbolicArgKind")
+      .value("kAddress", spyre::SymbolicArgKind::kAddress)
+      .value("kDimension", spyre::SymbolicArgKind::kDimension);
+
+  py::class_<spyre::SymbolicArg>(m, "SymbolicArg")
+      .def(py::init([](spyre::SymbolicArgKind kind, int64_t tensor_id,
+                       int64_t dim_index, int64_t value) {
+             return spyre::SymbolicArg{kind, tensor_id, dim_index, value};
+           }),
+           py::arg("kind"), py::arg("tensor_id"),
+           py::arg("dim_index") = int64_t{-1}, py::arg("value") = int64_t{-1})
+      .def_readwrite("kind", &spyre::SymbolicArg::kind)
+      .def_readwrite("value", &spyre::SymbolicArg::value)
+      .def_readwrite("tensor_id", &spyre::SymbolicArg::tensor_id)
+      .def_readwrite("dim_index", &spyre::SymbolicArg::dim_index)
+      .def("__repr__", [](const spyre::SymbolicArg& a) {
+        return "<SymbolicArg kind=" +
+               std::to_string(static_cast<int32_t>(a.kind)) +
+               " tensor_id=" + std::to_string(a.tensor_id) +
+               " dim_index=" + std::to_string(a.dim_index) + ">";
+      });
+
   m.def("prepare_kernel", &spyre::prepareKernel, py::arg("spyrecode_dir"),
         py::arg("stream") = nullptr, py::arg("profiler_name") = std::nullopt,
         "Prepare a kernel from a SpyreCode directory and return a JobPlan.\n\n"
@@ -537,15 +615,95 @@ PYBIND11_MODULE(_C, m) {
         "Returns:\n"
         "    Prepared JobPlan ready for execution");
   // Bind the current-stream overload (resolves the current stream internally).
-  m.def("launch_jobplan",
-        static_cast<void (*)(const spyre::JobPlan&,
-                             const std::vector<at::Tensor>&)>(
-            &spyre::launchJobPlan),
-        py::arg("job_plan"), py::arg("args"),
-        "Launch a prepared JobPlan with the given tensor arguments.\n\n"
-        "Args:\n"
-        "    job_plan: The JobPlan to execute\n"
-        "    args: Sequence of input/output tensors");
+  // Without symbolic_args (back-compat, empty payload → legacy address loop).
+  m.def(
+      "launch_jobplan",
+      static_cast<void (*)(  // NOLINT(whitespace/parens)
+          const spyre::JobPlan&, const std::vector<at::Tensor>&,
+          std::vector<spyre::SymbolicArg>)>(&spyre::launchJobPlan),
+      py::arg("job_plan"), py::arg("args"),
+      py::arg("symbolic_args") = std::vector<spyre::SymbolicArg>{},
+      "Launch a prepared JobPlan with the given tensor arguments.\n\n"
+      "Args:\n"
+      "    job_plan: The JobPlan to execute\n"
+      "    args: Sequence of input/output tensors\n"
+      "    symbolic_args: Optional typed per-symbol payload. When non-empty,\n"
+      "        JobPlanStepHostCompute resolves each correction slot by kind\n"
+      "        rather than blindly iterating tensors. Empty (default)\n"
+      "        preserves today's legacy behavior.");
+
+  // Test-only seam: exposes JobPlanStepHostCompute::resolveSymbolicArgs so
+  // that Python tests can assert on the ordered int64 vector that would be
+  // handed to deeptools, without needing a live HCM or device execution.
+  // The "_" prefix signals this is not part of the stable public API.
+  m.def("_resolve_symbolic_args",
+        &spyre::JobPlanStepHostCompute::resolveSymbolicArgs, py::arg("tensors"),
+        py::arg("symbolic_args"),
+        "Test-only: resolve a symbolic_args payload to a list of int64 DMVA "
+        "addresses.\n\n"
+        "Calls JobPlanStepHostCompute::resolveSymbolicArgs — the same function "
+        "used by the typed-payload resolution path at launch time — so the "
+        "result is identical to what would be passed to deeptools.");
+
+  // ── Two-stream overlap: step-ordering validator + test hooks ──
+
+  // Direct binding of the pure P2-14 ordering checker so a role-misplacement
+  // rejection can be tested without constructing real steps (a real HostCompute
+  // needs a deeptools::Hcm + pinned buffers). Takes parallel lists of StepKind
+  // names ("HostCompute"/"H2D"/... per stepKindName) and StreamRole names
+  // ("Prep"/"Dev"), returns "" when valid or a human-readable error otherwise.
+  m.def(
+      "check_job_plan_step_ordering",
+      [](const std::vector<std::string>& kind_names,
+         const std::vector<std::string>& role_names) {
+        TORCH_CHECK(kind_names.size() == role_names.size(),
+                    "kind_names/role_names length mismatch: ",
+                    kind_names.size(), " vs ", role_names.size());
+        std::vector<spyre::StepKind> kinds;
+        std::vector<spyre::StreamRole> roles;
+        kinds.reserve(kind_names.size());
+        roles.reserve(role_names.size());
+        for (const auto& n : kind_names) {
+          kinds.push_back(spyre::stepKindFromName(n));
+        }
+        for (const auto& n : role_names) {
+          roles.push_back(spyre::streamRoleFromName(n));
+        }
+        return spyre::checkJobPlanStepOrdering(kinds, roles);
+      },
+      py::arg("kind_names"), py::arg("role_names"),
+      "Validate a projected two-stream step ordering; '' if valid else the "
+      "error message.");
+
+  // ── Test-only validator projection hook (#7a) ──
+  // Projects a REAL prepared plan's steps through the SAME path validate()
+  // uses -- classifyStep(*step) + step->role() -- in a caller-specified index
+  // order, then runs the ordering checker. Exercises the JobPlanStep->(kind,
+  // role) projection end-to-end, where a real plan-wiring bug would live (the
+  // check_job_plan_step_ordering binding takes name lists and bypasses this
+  // projection). Passing a permuted `order` injects a role-ordering
+  // violation over the real step objects. Returns '' if valid else the error.
+  m.def(
+      "_test_project_and_check_ordering",
+      [](const spyre::JobPlan& plan, const std::vector<size_t>& order) {
+        std::vector<spyre::StepKind> kinds;
+        std::vector<spyre::StreamRole> roles;
+        kinds.reserve(order.size());
+        roles.reserve(order.size());
+        for (size_t idx : order) {
+          TORCH_CHECK(idx < plan.steps.size(),
+                      "_test_project_and_check_ordering: step index ", idx,
+                      " out of range (", plan.steps.size(), " steps)");
+          const auto& step = plan.steps[idx];
+          kinds.push_back(spyre::classifyStep(*step));
+          roles.push_back(step->role());
+        }
+        return spyre::checkJobPlanStepOrdering(kinds, roles);
+      },
+      py::arg("plan"), py::arg("order"),
+      "TEST-ONLY: project REAL plan steps (classifyStep + role(), exactly as "
+      "validate() does) in the given index order, then run the ordering "
+      "checker. Returns '' if valid else the error message.");
 
   // Allocator statistics functions
   m.def(

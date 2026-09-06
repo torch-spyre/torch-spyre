@@ -46,10 +46,10 @@ if report is not None:
 `get_diagnostic_report()` can still read already-written reports even if
 that variable is unset later.
 
-This gate is intentionally separate from `USE_SPYRE_PROFILER` (the CMake
-/ Kineto profiler build flag). FFDC capture does not require a profiler
-build, and pods do not enable `TORCH_SPYRE_FFDC` by default — set it
-explicitly for the failing run.
+This gate is intentionally separate from `USE_SPYRE_PROFILER` (the
+`setup.py` Kineto profiler build flag). FFDC capture does not require a
+profiler build, and pods do not enable `TORCH_SPYRE_FFDC` by default.
+Set it explicitly for the failing run.
 
 With `TORCH_SPYRE_FFDC=1` set, frontend-compile, backend-compile,
 runtime-launch, and unimplemented-operation hooks write a report

@@ -27,6 +27,7 @@
 #include "logging.h"
 #include "module.h"
 #include "spyre_allocator.h"
+#include "spyre_composite_address.h"
 #include "spyre_stream.h"
 #include "types_mapping.h"
 
@@ -350,12 +351,11 @@ void SpyreCCLBackend::prepare_tensor(const at::Tensor& input_tensor,
   spyre_comms::TensorInfo tensor_info = getTensorInfo(input_tensor);
   *output_tensor =
       spyre_comms::Tensor(tensor_info, input_tensor.storage().data_ptr().get());
-  // Update the data pointer on the object since it was eagerly allocated.
-  // composite_addr is a member of SharedOwnerCtx which is owned by the tensor's
-  // DataPtr; use the borrowing setter so spyre-comms never tries to delete it.
-  auto* ctx = static_cast<spyre::SharedOwnerCtx*>(
-      input_tensor.storage().data_ptr().get_context());
-  output_tensor->SetSpyreDeviceAddressBorrowed(&ctx->composite_addr);
+  // Update the data pointer on the object with a borrowed pointer to the
+  // tensor's flex::CompositeAddress; the borrowing setter ensures spyre-comms
+  // will never try to delete it.
+  output_tensor->SetSpyreDeviceAddressBorrowed(
+      spyre::get_composite_address(input_tensor));
 }
 
 /**

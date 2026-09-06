@@ -5,14 +5,14 @@ resolution-markers = [
     "python_full_version >= '3.15' and sys_platform == 'win32'",
     "python_full_version >= '3.15' and sys_platform == 'emscripten'",
     "python_full_version >= '3.15' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32'",
+    "python_full_version >= '3.15' and sys_platform == 'darwin'",
     "python_full_version == '3.14.*' and sys_platform == 'win32'",
     "python_full_version == '3.14.*' and sys_platform == 'emscripten'",
     "python_full_version == '3.14.*' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32'",
+    "python_full_version == '3.14.*' and sys_platform == 'darwin'",
     "python_full_version >= '3.12' and python_full_version < '3.14' and sys_platform == 'win32'",
     "python_full_version >= '3.12' and python_full_version < '3.14' and sys_platform == 'emscripten'",
     "python_full_version >= '3.12' and python_full_version < '3.14' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32'",
-    "python_full_version >= '3.15' and sys_platform == 'darwin'",
-    "python_full_version == '3.14.*' and sys_platform == 'darwin'",
     "python_full_version >= '3.12' and python_full_version < '3.14' and sys_platform == 'darwin'",
     "python_full_version < '3.12' and sys_platform == 'win32'",
     "python_full_version < '3.12' and sys_platform == 'emscripten'",
@@ -222,14 +222,6 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/df/bf/f7da0350254c0ed7c72f3e33cef02e048281fec7ecec5f032d4aac52226b/jinja2-3.1.6.tar.gz", hash = "sha256:0137fb05990d35f1275a587e9aee6d56da821fc83491a0fb838183be43f66d6d", size = 245115, upload-time = "2025-03-05T20:05:02.478Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/62/a1/3d680cbfd5f4b8f15abc1d571870c5fc3e594bb582bc3b64ea099db13e56/jinja2-3.1.6-py3-none-any.whl", hash = "sha256:85ece4451f492d0c13c5dd7c13a64681a86afae63a5f347908daf103ce6d2f67", size = 134899, upload-time = "2025-03-05T20:05:00.369Z" },
-]
-
-[[package]]
-name = "ktir-mlir-frontend"
-version = "0.1.0"
-source = { git = "https://github.com/torch-spyre/ktir-mlir-frontend.git?rev=05e7a0ff814ebefb6e78450b1ec0e871c488c8bc#05e7a0ff814ebefb6e78450b1ec0e871c488c8bc" }
-dependencies = [
-    { name = "nanobind", marker = "python_full_version >= '3.12'" },
 ]
 
 [[package]]
@@ -451,15 +443,6 @@ wheels = [
 ]
 
 [[package]]
-name = "nanobind"
-version = "2.14.0"
-source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/1f/23/a6fdf94de7bf760da93a115593cc1756a7b3d408c12681df9e4c63bf11e3/nanobind-2.14.0.tar.gz", hash = "sha256:0cf1477d8b1697abc1454028b6469e7113d9aa6ba3ced8b102cc569affbacb13", size = 1053642, upload-time = "2026-08-07T06:07:51.605Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/94/17/fba47a85a7b0bfb9ab5a5100e8a26b361b881089c7d8cad9a95f895f1546/nanobind-2.14.0-py3-none-any.whl", hash = "sha256:a57cd4fe613db78410ca13ba007a3ffaf3125b831d8be46ec7f4351e8cf6e513", size = 269917, upload-time = "2026-08-07T06:07:50.045Z" },
-]
-
-[[package]]
 name = "networkx"
 version = "3.6.1"
 source = { registry = "https://pypi.org/simple" }
@@ -596,14 +579,14 @@ resolution-markers = [
     "python_full_version >= '3.15' and sys_platform == 'win32'",
     "python_full_version >= '3.15' and sys_platform == 'emscripten'",
     "python_full_version >= '3.15' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32'",
+    "python_full_version >= '3.15' and sys_platform == 'darwin'",
     "python_full_version == '3.14.*' and sys_platform == 'win32'",
     "python_full_version == '3.14.*' and sys_platform == 'emscripten'",
     "python_full_version == '3.14.*' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32'",
+    "python_full_version == '3.14.*' and sys_platform == 'darwin'",
     "python_full_version >= '3.12' and python_full_version < '3.14' and sys_platform == 'win32'",
     "python_full_version >= '3.12' and python_full_version < '3.14' and sys_platform == 'emscripten'",
     "python_full_version >= '3.12' and python_full_version < '3.14' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32'",
-    "python_full_version >= '3.15' and sys_platform == 'darwin'",
-    "python_full_version == '3.14.*' and sys_platform == 'darwin'",
     "python_full_version >= '3.12' and python_full_version < '3.14' and sys_platform == 'darwin'",
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/22/fd/89965aa4ac08c74998539fcbf24fa3540f3e15237fbeb6bcf9c908f4aade/numpy-2.5.1.tar.gz", hash = "sha256:a48a113e6afea91f5608793bafa7ef2ad481fefbda87ec5069f483de61cb9fa3", size = 20755553, upload-time = "2026-07-04T17:08:00.933Z" }
@@ -1254,13 +1237,13 @@ resolution-markers = [
     "python_full_version >= '3.15' and sys_platform == 'win32'",
     "python_full_version >= '3.15' and sys_platform == 'emscripten'",
     "python_full_version >= '3.15' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32'",
+    "python_full_version >= '3.15' and sys_platform == 'darwin'",
     "python_full_version == '3.14.*' and sys_platform == 'win32'",
     "python_full_version == '3.14.*' and sys_platform == 'emscripten'",
     "python_full_version == '3.14.*' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32'",
     "python_full_version >= '3.12' and python_full_version < '3.14' and sys_platform == 'win32'",
     "python_full_version >= '3.12' and python_full_version < '3.14' and sys_platform == 'emscripten'",
     "python_full_version >= '3.12' and python_full_version < '3.14' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32'",
-    "python_full_version >= '3.15' and sys_platform == 'darwin'",
     "python_full_version < '3.12' and sys_platform == 'win32'",
     "python_full_version < '3.12' and sys_platform == 'emscripten'",
     "python_full_version < '3.12' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32'",
@@ -1310,6 +1293,7 @@ source = { editable = "." }
 dependencies = [
     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
     { name = "numpy", version = "2.5.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
+    { name = "ortools", marker = "platform_machine != 'ppc64le' and platform_machine != 's390x'" },
     { name = "psutil" },
     { name = "regex" },
     { name = "torch", version = "2.13.0", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "python_full_version < '3.15' and sys_platform == 'darwin'" },
@@ -1333,7 +1317,7 @@ build = [
     { name = "wheel" },
 ]
 cpsat = [
-    { name = "ortools", marker = "platform_machine != 's390x'" },
+    { name = "ortools", marker = "platform_machine != 'ppc64le' and platform_machine != 's390x'" },
 ]
 lint = [
     { name = "mypy" },
@@ -1347,11 +1331,6 @@ test = [
     { name = "pytest-xdist" },
 ]
 
-[package.dev-dependencies]
-ktir = [
-    { name = "ktir-mlir-frontend", marker = "python_full_version >= '3.12'" },
-]
-
 [package.metadata]
 requires-dist = [
     { name = "build", marker = "extra == 'build'" },
@@ -1362,7 +1341,8 @@ requires-dist = [
     { name = "ninja", marker = "extra == 'build'" },
     { name = "numpy" },
     { name = "numpy", marker = "extra == 'build'" },
-    { name = "ortools", marker = "platform_machine != 's390x' and extra == 'cpsat'", specifier = ">=9.0" },
+    { name = "ortools", marker = "platform_machine != 'ppc64le' and platform_machine != 's390x'", specifier = ">=9.0" },
+    { name = "ortools", marker = "platform_machine != 'ppc64le' and platform_machine != 's390x' and extra == 'cpsat'", specifier = ">=9.0" },
     { name = "pre-commit", marker = "extra == 'lint'", specifier = "~=4.6.0" },
     { name = "psutil" },
     { name = "pydantic", marker = "extra == 'test'" },
@@ -1379,9 +1359,6 @@ requires-dist = [
     { name = "wheel", marker = "extra == 'build'" },
 ]
 provides-extras = ["cpsat", "build", "test", "lint"]
-
-[package.metadata.requires-dev]
-ktir = [{ name = "ktir-mlir-frontend", marker = "python_full_version >= '3.12'", git = "https://github.com/torch-spyre/ktir-mlir-frontend.git?rev=05e7a0ff814ebefb6e78450b1ec0e871c488c8bc" }]
 
 [[package]]
 name = "types-pyyaml"

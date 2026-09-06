@@ -12,10 +12,10 @@ see [Adding Operations](../compiler/adding_operations.md).
 |-----------|:-----:|:--------:|-----------|-------|
 | **Matrix Operations** | | | | |
 | `torch.mm` | Y | Y | Spyre | |
-| `torch.matmul` | | Y | Spyre | |
+| `torch.matmul` | Y | Y | Spyre | Decomposes to `mm`/`bmm`, both of which have eager kernels |
 | `torch.addmm` | Y | Y | Spyre | Decomposed to `mm` + `add` |
 | `torch.bmm` | Y | Y | Spyre | |
-| `torch._scaled_mm` | | Y | Spyre | Compiled only; lowering in `_inductor/lowering.py` |
+| `torch._scaled_mm` | | Y | Spyre | Compiled only; decomposed to `spyre.scaled_mm` (decomposition in `_inductor/decompositions.py`, lowering in `_inductor/lowering.py`) |
 | `torch.nn.functional.linear` | Y | Y | Spyre | Decomposed to `matmul` + `add` |
 | `torch.nn.functional.conv2d` | Y | Y | Spyre | Custom decomposition (`conv2d_via_bmm`); CPU fallback for the im2col step |
 | `torch.nn.functional.avg_pool2d` | | Y | Spyre | Compiled only; custom lowering |
@@ -54,7 +54,7 @@ see [Adding Operations](../compiler/adding_operations.md).
 | `torch.div` | Y | Y | Spyre | |
 | `torch.maximum` | Y | Y | Spyre | |
 | `torch.minimum` | Y | Y | Spyre | |
-| `torch.bitwise_and` | Y | Y | Spyre | Custom decomposition |
+| `torch.bitwise_and` | Y | Y | Spyre | Custom decomposition; boolean inputs run on Spyre (`logical_and`), integer inputs decompose through `bitwise_or`, which falls back to CPU |
 | `torch.where` | Y | Y | Spyre | `where.self` registered eagerly; `where.Scalar*` overloads via custom decomposition; `where.default` (condition-only form) falls back to CPU |
 | **Comparison** | | | | |
 | `torch.eq` | Y | Y | Spyre | |
@@ -93,6 +93,7 @@ see [Adding Operations](../compiler/adding_operations.md).
 | `torch.Tensor.unfold` | Y | Y | Spyre | View op |
 | `torch.flip` | Y | Y | Spyre | Custom decomposition to `index_select` gathers; reversing the last (stick) dimension is unsupported and raises |
 | `torch.split` | | Y | Spyre | Compiled only (lowers via `aten.slice`) |
+| `torch.slice_scatter` | | Y | Spyre | Compiled only (`lower_slice_scatter`); unit-step slices only, strided writes raise `Unsupported` |
 | `torch.expand` | | Y | Spyre | Compiled only; supported when followed by a materializing op (e.g. `clone`, `contiguous`). Used internally by `ones`, `pad`, and SDPA decompositions |
 | `torch.narrow` / `torch.select` | | Y | Spyre | Compiled only; basic slicing works (see `test_slice` / `test_split`); broader `narrow`/`select` coverage in development |
 | **Tensor Creation** | | | | |
@@ -111,6 +112,7 @@ see [Adding Operations](../compiler/adding_operations.md).
 | **Indexing** | | | | |
 | `torch.embedding` | Y | Y | Spyre | Registered on the compiled path (`ops/eager.py`) |
 | `torch.index_select` | Y | Y | Spyre | Registered on the compiled path (`ops/eager.py`) |
+| `torch.masked_scatter` | Y | Y | Spyre | Custom decomposition; supported for masks that broadcast along the last (stick) dimension, other masks raise `Unsupported` |
 | **Utility** | | | | |
 | `torch.item` | Y | Y | Spyre | Copies to CPU, returns Python scalar |
 | `torch.Tensor.to` (dtype cast) | | Y | Spyre | Compiled only; eager dtype casts not yet supported |
@@ -133,8 +135,9 @@ see [Adding Operations](../compiler/adding_operations.md).
 >
 > - **Eager** — supported when running operations directly on a Spyre
 >   tensor without `torch.compile`. Eager ops are registered via
->   `torch_spyre/ops/eager.py`, `torch_spyre/ops/fallbacks.py` and
->   select decompositions.
+>   `torch_spyre/ops/eager.py`, `torch_spyre/ops/fallbacks.py`, and the
+>   Spyre decomposition table, which installs a PrivateUse1 eager kernel
+>   for every aten-namespace decomposition (`decompositions.py`).
 > - **Compiled** — supported when using `torch.compile(model)` with the
 >   model on a Spyre device (Inductor routes to the Spyre backend
 >   automatically).
@@ -143,9 +146,10 @@ see [Adding Operations](../compiler/adding_operations.md).
 >   the compiler — a warning is emitted when fallback occurs.
 >
 > View ops have **partial support**: some shapes and dimension
-> combinations may trigger internal recompilation or are not yet
-> implemented (e.g., `expand`, `narrow`). This is an active area of
-> development.
+> combinations may trigger internal recompilation, and a few
+> operand patterns raise `Unsupported` (for example, reversing the
+> stick dimension with `flip`, or `expand` without a following
+> materializing op). This is an active area of development.
 >
 > This table reflects the operations validated in the torch-spyre test
 > suite (`tests/inductor/test_inductor_ops.py`). Coverage

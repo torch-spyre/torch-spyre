@@ -195,10 +195,11 @@ class TestTransposeEdge:
         assert torch.allclose(slice1.cpu(), y_cpu[:2, :16, :8, :4])
 
     # --- Materialized copy after transpose (#1859) ---
-    @pytest.mark.xfail(
-        reason="Issue #1859: dxp_standalone SIGABRT on transpose+clone bundle generation.",
-    )
     def test_transpose_then_clone(self, execution_mode):
+        if execution_mode == "eager":
+            pytest.xfail(
+                "Issue #1859: dxp_standalone SIGABRT on transpose+clone bundle generation."
+            )
         x = cached_randn((72, 91), dtype=torch.float16)
         _compare_mode(execution_mode, lambda t: t.transpose(0, 1).clone(), x)
 

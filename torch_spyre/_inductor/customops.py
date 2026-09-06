@@ -15,6 +15,7 @@
 from typing import Optional, Sequence
 import torch
 import torch._dynamo
+import torch._higher_order_ops.effects
 from torch._inductor.fx_passes.reinplace import inplaceable_ops, InplaceableOp
 from torch_spyre.ops.eager import compile_once
 from torch_spyre.ops.fallbacks import warn_fallback
@@ -151,7 +152,61 @@ def _(x: torch.Tensor, k: int, dim: int) -> torch.Tensor:
     norm_dim = dim % len(x.size())
     out_size = list(x.size())
     out_size[norm_dim] = k
-    return x.new_empty(out_size, dtype=torch.int64)
+    # Index materializes in the input dtype, not int64: a float that lies it
+    # is an index. Matches lower_topkindex (dst_dtype = x.get_dtype()).
+    return x.new_empty(out_size, dtype=x.dtype)
+
+
+@torch.library.custom_op("spyre::keep_by_index", mutates_args=(), device_types="spyre")
+def keep_by_index(
+    values: torch.Tensor,
+    indices: torch.Tensor,
+    dim: int,
+    fill_value: torch.types.Number,
+) -> torch.Tensor:
+    pass
+
+
+@keep_by_index.register_fake
+def _(
+    values: torch.Tensor,
+    indices: torch.Tensor,
+    dim: int,
+    fill_value: torch.types.Number,
+) -> torch.Tensor:
+    return values.new_empty(values.size())
+
+
+@torch.library.register_kernel("spyre::keep_by_index", ["cpu"])
+def keep_by_index_cpu(
+    values: torch.Tensor,
+    indices: torch.Tensor,
+    dim: int,
+    fill_value: torch.types.Number,
+) -> torch.Tensor:
+    # Normalize dim to handle negative indices
+    dim = dim % values.ndim
+    indices_long = indices.to(torch.long)
+
+    # Create mask: for each position in output, check if value[dim] matches any index
+    mask = torch.zeros_like(values, dtype=torch.bool)
+
+    # For each k in the indices dimension, check which values match
+    for k in range(indices.shape[dim]):
+        idx_k = indices_long.select(dim, k)  # values.shape with dim removed
+        idx_k = idx_k.unsqueeze(dim)  # add back dimension
+
+        # Create coordinate tensor reshaped for broadcasting
+        shape = [1] * values.ndim
+        shape[dim] = values.shape[dim]
+        coords = torch.arange(
+            values.shape[dim], device=values.device, dtype=torch.long
+        ).view(shape)
+
+        # Mark where values[dim] == indices[k, ...]
+        mask = mask | (coords == idx_k)
+
+    return torch.where(mask, values, torch.full_like(values, fill_value))
 
 
 @torch.library.custom_op("spyre::gelu", mutates_args=(), device_types="spyre")
@@ -232,7 +287,16 @@ def _(input: torch.Tensor):
 @torch.library.custom_op(
     "spyre::copy_from_d2d", mutates_args=("dst",), device_types="spyre"
 )
-@compile_once("spyre.copy_from_d2d")
+# dynamic=False: dynamo's auto-dynamic promotes a SIZE to a symbol after the
+# second distinct value, exactly as it does for ints (fought off below with
+# specialize_int) -- and the Spyre lowering then silently bakes ONE concrete
+# extent into the SDSC while dynamo reuses the "dynamic" graph for every later
+# size. A d2d copy of a prefix view then writes the baked extent, not the
+# view's (#3826: overran dst and corrupted attention write-back downstream).
+# Static per-shape traces are the codebase's standing pattern -- every other
+# compile_once site already passes dynamic=False -- and cache_size_limit is
+# bumped to 1024 for precisely this one-binary-per-variant regime.
+@compile_once("spyre.copy_from_d2d", dynamic=False)
 def copy_from_d2d(
     src: torch.Tensor,
     dst: torch.Tensor,
@@ -273,45 +337,86 @@ def _(
     pass
 
 
-# Copy src into dst in-place (the mutating primitive).
-# No @compile_once needed: the body calls aten::copy_ which dispatches
-# through spyre__copy_from → copy_from_d2d / copy_tensor — no cycle back
-# to spyre::copy_ itself.
-@torch.library.custom_op("spyre::copy_", mutates_args=("dst",), device_types="spyre")
-def copy_(src: torch.Tensor, dst: torch.Tensor) -> torch.Tensor:
-    dst.copy_(src)
-    return dst
+@torch.library.custom_op("spyre::to_dtype_d2d", mutates_args=(), device_types="spyre")
+@compile_once("spyre.to_dtype_d2d", dynamic=False)
+def to_dtype_d2d(
+    src: torch.Tensor,
+    dtype: torch.dtype,
+    src_off: int,
+    compiled,
+) -> torch.Tensor:
+    """Run an eager same-device dtype conversion as a compiled Spyre op.
+
+    The explicit offset is required for the same reason as copy_from_d2d:
+    Inductor otherwise drops a graph input view's storage offset. Returning the
+    converted tensor (rather than mutating a preallocated destination) also lets
+    ``propagate_layouts`` attach the conversion's staggered element arrangement
+    to the compiled graph's output layout.
+    """
+    with torch._dynamo.config.patch(specialize_int=True):
+        return compiled(src, dtype, src_off)
 
 
-@copy_.register_fake
+@to_dtype_d2d.register_fake
+def _(src: torch.Tensor, dtype: torch.dtype, src_off: int) -> torch.Tensor:
+    return torch.empty_like(src, dtype=dtype)
+
+
+# Copy src into dst, guaranteed to survive both Inductor's remove_noop_ops
+# pass (unlike aten.copy_, this op is not in noop_registry) and
+# AOTAutograd's dead-code elimination when dst is never read again in the
+# same trace (issue #4126). Use this to guarantee a copy survives to the
+# coarse tile validator.
+#
+# mutates_args=() (not ("dst",)) so the schema carries no alias_info. This
+# is required for two independent reasons that turn out to be the same
+# underlying constraint:
+#   1. It lets this op be called from inside a decomposition traced by
+#      torch.compile (e.g. spyre__sdpa_overrideable) without tripping
+#      aot_autograd's assert_functional_graph, which rejects any node
+#      whose OpOverload schema is_mutable.
+#   2. It is a precondition for effects registration below: has_effects()
+#      unconditionally returns False for any op with an aliasing schema,
+#      so a mutates_args=("dst",) op can never be made DCE-safe this way.
+#
+# CALLERS MUST REASSIGN THE RETURN VALUE: dst = copy_forced(src, dst).
+# Because this op has no alias_info, AOTAutograd never threads its
+# mutation into the caller's own dataflow -- unlike the old
+# mutates_args=("dst",) design, whose auto_functionalized_v2 getitem was
+# spliced back into every later read of dst automatically. Here, a
+# discarded return value means later reads of the old `dst` Python
+# variable see the *pre-copy* value; only the reassigned variable sees
+# the write. A void call (`copy_forced(src, dst)` with no reassignment)
+# is only correct when dst is never read again in the same trace.
+#
+# _register_effectful_op below wraps every call in
+# torch.ops.higher_order.with_effects at trace time, threading a token
+# through it. That keeps the call node alive through ordinary FX DCE
+# regardless of whether the caller's dst is read again -- unlike a
+# mutates_args-based op, whose auto_functionalized_v2 getitem is silently
+# removed when unread (see issue #4126). Inductor's own generic
+# with_effects lowering delegates straight to lower_spyre_copy_forced
+# below and marks the resulting scheduler op has_side_effects=True, so it
+# is additionally protected from the scheduler's own DCE (see
+# _spyre_scheduler_node_has_side_effects in patches.py).
+@torch.library.custom_op("spyre::copy_forced", mutates_args=(), device_types="spyre")
+def copy_forced(src: torch.Tensor, dst: torch.Tensor) -> torch.Tensor:
+    return torch.empty_like(dst).copy_(src)
+
+
+@copy_forced.register_fake
 def _(src: torch.Tensor, dst: torch.Tensor) -> torch.Tensor:
-    return dst
+    return torch.empty_like(dst)
 
 
-@torch.library.register_kernel("spyre::copy_", ["cpu"])
-def copy__cpu(src: torch.Tensor, dst: torch.Tensor) -> torch.Tensor:
-    dst.copy_(src)
-    return dst
+@torch.library.register_kernel("spyre::copy_forced", ["cpu"])
+def copy_forced_cpu(src: torch.Tensor, dst: torch.Tensor) -> torch.Tensor:
+    return torch.empty_like(dst).copy_(src)
 
 
-# Functional (out-of-place) wrapper for spyre::copy_.
-# Returns a new tensor equal to dst with src written into it.
-# The graph sees a pure value-producing node; Inductor's reinplacer will
-# rewrite copy_f → copy_ (in-place) wherever it is safe to do so.
-@torch.library.custom_op("spyre::copy_f", mutates_args=(), device_types="spyre")
-def copy_f(src: torch.Tensor, dst: torch.Tensor) -> torch.Tensor:
-    result = dst.clone()
-    torch.ops.spyre.copy_(src, result)
-    return result
-
-
-@copy_f.register_fake
-def _(src: torch.Tensor, dst: torch.Tensor) -> torch.Tensor:
-    return dst.clone()
-
-
-inplaceable_ops[torch.ops.spyre.copy_f.default] = InplaceableOp(
-    torch.ops.spyre.copy_.default, 1
+torch._higher_order_ops.effects._register_effectful_op(
+    torch.ops.spyre.copy_forced.default,
+    torch._higher_order_ops.effects._EffectType.ORDERED,
 )
 
 
@@ -320,7 +425,10 @@ inplaceable_ops[torch.ops.spyre.copy_f.default] = InplaceableOp(
 @torch.library.custom_op(
     "spyre::overwrite", mutates_args=("output",), device_types="spyre"
 )
-@compile_once("spyre.overwrite")
+# dynamic=False for the same reason as copy_from_d2d above (#3826): a varying
+# input size must trigger a fresh static trace, never an auto-dynamic graph
+# whose frozen extent scatters the wrong number of elements.
+@compile_once("spyre.overwrite", dynamic=False)
 def overwrite(
     input: torch.Tensor,
     output: torch.Tensor,
@@ -901,7 +1009,7 @@ def stagger_to_standard_ea(x: torch.Tensor) -> torch.Tensor:
     # Each fp16 stick (64 elements) staggers independently with half=32.
     FP16_STICK = 64
     half = FP16_STICK // 2  # 32 — fixed, independent of n
-    P = torch.zeros(n, n, dtype=torch.float16, device="cpu")
+    P = torch.zeros(n, n, dtype=x.dtype, device="cpu")
     for phys_j in range(n):
         stick_base = (phys_j // FP16_STICK) * FP16_STICK
         local_phys = phys_j % FP16_STICK

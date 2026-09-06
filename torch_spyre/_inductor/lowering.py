@@ -31,11 +31,10 @@ from .constants import (
     COPY_BACK_CANDIDATE_ATTR,
     BATCH_MATMUL_FP8_OP,
     DEPTHWISE_CONV2D_OP,
-    SHARED_WEIGHT_UNIT_BMM_CUSTOM_META_KEY,
-    SHARED_WEIGHT_UNIT_BMM_INFO_KEY,
 )
 from . import config
 import torch_spyre._inductor.customops  # noqa: F401
+import torch_spyre._inductor.distributed.spyre_library  # noqa: F401
 from torch_spyre.ops.fallbacks import fallback_ops
 from .ir import (
     SpyreReduction,
@@ -43,6 +42,7 @@ from .ir import (
     SpyreEmptyFallback,
     BroadcastAsyncFallback,
     WaitWorkFallback,
+    AllGatherAsyncFallback,
     AllReduceAsyncFallback,
 )
 from torch_spyre._C import get_elem_in_stick
@@ -62,15 +62,6 @@ _lowerings_nesting = 0
 # The specific spyre lowerings will be registered into this dictionary
 # and merged with the in-tree lowerings when needed
 spyre_lowerings: dict[Union[Callable[..., Any], str], Callable[..., Any]] = {}
-
-
-def _current_fx_custom_meta() -> dict[str, Any]:
-    node = V.get_current_node()
-    meta = getattr(node, "meta", None)
-    if not isinstance(meta, dict):
-        return {}
-    custom = meta.get("custom")
-    return custom if isinstance(custom, dict) else {}
 
 
 def register_spyre_lowering(
@@ -524,18 +515,11 @@ def lower_bmm(x, y):
     else:
         raise Unsupported(f"BMM with input shapes {x.get_size()} and {y.get_size()}")
 
-    custom_meta = _current_fx_custom_meta()
-    op_info = {}
-    if SHARED_WEIGHT_UNIT_BMM_CUSTOM_META_KEY in custom_meta:
-        op_info[SHARED_WEIGHT_UNIT_BMM_INFO_KEY] = custom_meta[
-            SHARED_WEIGHT_UNIT_BMM_CUSTOM_META_KEY
-        ]
-
     if reduction_numel == 1:
         # Reduction degenerates to a pointwise mul
         result = lowering.mul(x, y)
     else:
-        reduction_kwargs = dict(
+        result = Reduction.create(
             reduction_type=BATCH_MATMUL_OP,
             input_node=[x, y],
             device=x.get_device(),
@@ -545,10 +529,6 @@ def lower_bmm(x, y):
             ranges=ranges,
             reduction_ranges=[reduction_numel],
         )
-        if op_info:
-            result = SpyreReduction.create(op_info=op_info, **reduction_kwargs)
-        else:
-            result = Reduction.create(**reduction_kwargs)
 
     result.realize()
 
@@ -1122,6 +1102,49 @@ def lower_clamp(x, min=None, max=None):
     return pw
 
 
+@register_spyre_lowering(torch.ops.spyre.keep_by_index)
+def lower_keep_by_index(values, indices, dim, fill_value):
+    from .pass_utils import concretize_expr
+
+    x_size = values.get_size()
+    ndim = len(x_size)
+
+    # Concretize dim if symbolic
+    if isinstance(dim, sympy.Basic):
+        norm_dim = int(concretize_expr(dim)) % ndim
+    else:
+        norm_dim = dim % ndim
+
+    indices_size = indices.get_size()
+    values_loader = values.make_loader()
+    indices_loader = indices.make_loader()
+
+    ranges = list(x_size)
+    reduction_ranges = [indices_size[norm_dim]]
+
+    def inner_fn(index, rindex):
+        values_index = list(index)
+        # indices has K at norm_dim position
+        indices_index = list(index)
+        indices_index[norm_dim] = rindex[0]
+        return (values_loader(values_index), indices_loader(indices_index))
+
+    op_info = {"constants": {"maskval": fill_value}}
+    result = SpyreReduction.create(
+        reduction_type="keepbyindex",
+        input_node=[values, indices],
+        device=values.get_device(),
+        dst_dtype=values.get_dtype(),
+        src_dtype=values.get_dtype(),
+        inner_fn=inner_fn,
+        ranges=ranges,
+        reduction_ranges=reduction_ranges,
+        op_info=op_info,
+    )
+    result.realize()
+    return result
+
+
 @register_spyre_lowering(torch.ops.aten.clone.default, type_promotion_kind=None)
 def clone(x, *, memory_format=None):
     result = lowering.clone(x, memory_format=memory_format)
@@ -1264,10 +1287,45 @@ def lower_spyre_from_d2d(src, dst, src_off, dst_off):
     lowering.mutate_to(dst, src)
 
 
-@register_spyre_lowering(torch.ops.spyre.copy_)
-def lower_spyre_copy_(src, dst):
-    lowering.mutate_to(dst, src)
+@register_spyre_lowering(torch.ops.spyre.to_dtype_d2d, type_promotion_kind=None)
+def lower_spyre_to_dtype_d2d(src, dtype, src_off):
+    # Like copy_from_d2d, preserve a sliced eager input's storage offset when it
+    # becomes a graph input to the standalone compiled conversion.
+    src = _reoffset(src, src_off)
+    return to_dtype(src, dtype)
+
+
+def _build_mutation_lowering(src, dst):
+    # Builds an explicit MutationLayoutSHOULDREMOVE buffer so the mutation into dst
+    # survives regardless of what the scheduler would otherwise decide.
+    # mutate_to() has multiple code paths and does not always mutate, so
+    # the buffer is constructed by hand here instead.
+    src = lowering.to_dtype(src, dst.get_dtype())
+    src = lowering.expand(src, dst.get_size())
+
+    pw = Pointwise.create(
+        device=dst.get_device(),
+        dtype=dst.get_dtype(),
+        inner_fn=src.make_loader(),
+        ranges=list(dst.get_size()),
+    )
+
+    dst.realize()
+
+    buffer = ir.ComputedBuffer(
+        name=None,
+        layout=ir.MutationLayoutSHOULDREMOVE(dst),
+        data=pw.data.data,
+    )
+    buffer.name = V.graph.register_buffer(buffer)
+    V.graph.register_operation(buffer)
+
     return dst
+
+
+@register_spyre_lowering(torch.ops.spyre.copy_forced)
+def lower_spyre_copy_forced(src, dst):
+    return _build_mutation_lowering(src, dst)
 
 
 @register_spyre_lowering(torch.ops.spyre.overwrite)
@@ -1347,7 +1405,7 @@ def lower_full(size, fill_value, dtype=None, layout=None, device=None, pin_memor
     assert not pin_memory, f"doesn't support pin_memory={pin_memory}"
     if dtype is None:
         dtype = torch.get_default_dtype()
-    if dtype not in (torch.float16, torch.float32):
+    if dtype not in (torch.float16, torch.bfloat16, torch.float32):
         return ir.TensorBox.create(
             ir.FallbackKernel.create(
                 torch.ops.aten.full.default,
@@ -1502,7 +1560,19 @@ def lower_cat(inputs, dim=0):
 @register_spyre_lowering(
     torch.ops.aten.constant_pad_nd.default, type_promotion_kind=None
 )
-def lower_constant_pad_nd(input, pad, value=0, align_to_stick=False):
+def lower_constant_pad_nd(
+    input, pad, value=0, align_to_stick=False, output_stride=None
+):
+    # output_stride, when given, is the host stride the *output* buffer must
+    # be allocated with (e.g. to match a non-row-major source buffer's
+    # physical layout -- see pass_utils.py's lower_pad_sequence).  It must be
+    # applied at allocation time via lowering.empty_strided, not patched onto
+    # output.layout afterward: ir.SliceView.create's fast path (taken because
+    # a freshly-allocated ComputedBuffer is_storage_and_layout) snapshots
+    # old_layout.stride into a brand-new, independent FixedLayout on the
+    # ReinterpretView it returns, with no back-reference to output.layout --
+    # every fill_padding/copy slice built below would keep using the stale
+    # stride regardless of any later reassignment of output.layout.
     # pad is in reverse dim order: (left_last, right_last, left_2nd_last, right_2nd_last, ...)
     bounds = list(reversed(list(zip(pad[::2], pad[1::2]))))
     sizes = input.get_size()
@@ -1542,7 +1612,12 @@ def lower_constant_pad_nd(input, pad, value=0, align_to_stick=False):
 
     dtype = input.get_dtype()
     device = input.get_device()
-    output = lowering.empty(output_size, dtype=dtype, device=device)
+    if output_stride is not None:
+        output = lowering.empty_strided(
+            output_size, output_stride, dtype=dtype, device=device
+        )
+    else:
+        output = lowering.empty(output_size, dtype=dtype, device=device)
     pad_constant = lower_constant(value, dtype, device)
 
     # Fill padding regions. If align_to_stick is enabled, use stick-aligned offsets.
@@ -1793,6 +1868,43 @@ def lower_prod_dim(x, dim, keepdim=False):
     return with_int64_fallback(_prod_dim_impl, x)
 
 
+@register_spyre_lowering(torch.ops.aten.any.dim, type_promotion_kind=None)
+@register_spyre_lowering(torch.ops.aten.any.dims, type_promotion_kind=None)
+def lower_any_dim(x, dim, keepdim=False):
+    x = to_dtype(x, torch.float16)
+    x.realize()
+
+    # Handle both single dimension and tuple of dimensions
+    axis = [dim] if isinstance(dim, int) else list(dim)
+
+    kwargs = lowering._make_reduction_inner(
+        x, axis=axis, keepdims=keepdim, dtype=x.dtype, override_return_dtype=None
+    )
+    result = Reduction.create(
+        reduction_type="absmax",
+        input_node=x,
+        **kwargs,
+    )
+    result.realize()
+    return to_dtype(result, torch.bool)
+
+
+@register_spyre_lowering(torch.ops.aten.any.default, type_promotion_kind=None)
+def lower_any_def(x):
+    x = to_dtype(x, torch.float16)
+    x.realize()
+    kwargs = lowering._make_reduction_inner(
+        x, axis=None, keepdims=None, dtype=x.dtype, override_return_dtype=None
+    )
+    result = Reduction.create(
+        reduction_type="absmax",
+        input_node=x,
+        **kwargs,
+    )
+    result.realize()
+    return to_dtype(result, torch.bool)
+
+
 # ============================================================================
 # Direct c10d Lowerings
 # ============================================================================
@@ -1845,6 +1957,37 @@ def lower_c10d_wait_tensor_async(tensor):
         WaitWorkFallback(
             torch.ops.spyre.wait_work.default,
             tensor,
+        )
+    )
+
+
+@register_spyre_lowering(torch.ops._c10d_functional.all_gather_into_tensor.default)
+def lower_c10d_all_gather_async(tensor, group_size, group_name):
+    """
+    Direct lowering for _c10d_functional.all_gather_into_tensor using ASYNC pattern.
+
+    Creates an async all_gather operation that returns immediately without blocking.
+    Output tensor has shape[0] = input.shape[0] * group_size (concatenation of all ranks).
+
+    Flow:
+      _c10d_functional.all_gather_into_tensor → This lowering
+      → AllGatherAsyncFallback → Generated code:
+      torch.ops.spyre.all_gather_async() → C++ → spyre-comms (non-blocking)
+    """
+    logger.info(
+        "Lowering _c10d_functional.all_gather_into_tensor to "
+        "SpyreAllGatherAsyncFallback (group_size=%s, group_name='%s')",
+        group_size,
+        group_name,
+    )
+
+    tensor.realize()
+    return ir.TensorBox.create(
+        AllGatherAsyncFallback(
+            torch.ops.spyre.all_gather_async.default,
+            tensor,
+            group_size,
+            group_name,
         )
     )
 
