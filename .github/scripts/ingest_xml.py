@@ -932,6 +932,12 @@ def v2_test_case_id(component: str, classname: str, name: str, tags) -> str:
     INSIDE the hash, so re-tagging mints a new identity; trend queries must
     therefore group on (component, classname, name), never on test_case_id.
     """
+    if not (_v2_norm(component) and _v2_norm(name)):
+        # Same collision hazard as v2_run_uid: an empty field still hashes to a real,
+        # stable uuid that every other such case shares. The v2 table's CONSTRAINTs
+        # reject component='' / name='' anyway. classname is legitimately empty for a
+        # module-level test, so it is NOT required.
+        return ""
     norm = sorted({t for t in (_v2_norm(x) for x in (tags or [])) if t})
     return str(
         uuid.uuid5(
@@ -1015,10 +1021,17 @@ def insert_v2(client, component: str, run_uid: str, cases: list) -> int:
     if not cases:
         return 0
     ident_rows, run_rows = {}, []
+
+    skipped_unidentifiable = 0
     for c in cases:
         tags = v2_tags_for_case(c)
         classname, name = c.get("classname", ""), c.get("name", "")
         tcid = v2_test_case_id(component, classname, name, tags)
+        if not tcid:
+            # Refused identity: writing the row anyway would collide it with every
+            # other unidentifiable case rather than merely orphaning it.
+            skipped_unidentifiable += 1
+            continue
         # Deduped by id within the leg: identical identity rows are one fact, and
         # test_cases is a plain MergeTree (a content hash re-writes an identical row,
         # so collapsing would only be cosmetic -- but writing it N times is not).
@@ -1050,6 +1063,12 @@ def insert_v2(client, component: str, run_uid: str, cases: list) -> int:
             "fail_message",
         ],
     )
+    if skipped_unidentifiable:
+        print(
+            f"  [warn] v2: {skipped_unidentifiable} case(s) skipped -- no derivable "
+            f"test_case_id (empty name?); they would have collided, not merely orphaned",
+            file=sys.stderr,
+        )
     return len(run_rows)
 
 
