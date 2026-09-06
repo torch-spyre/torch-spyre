@@ -882,6 +882,10 @@ class SuperDSCScheduling(BaseScheduling):
 
         pool_sizes = getattr(V.graph, "hbm_pool_sizes", {})
         kernel = SpyreKernel(pool_size=pool_sizes.get(node.get_name(), 0))
+        # Before any spec is built: create_tensor_arg reads this to decide whether
+        # a buffer is kernel-local.  _codegen_into_kernel may reach further inner
+        # nodes, so the set can be a subset -- which errs towards declining.
+        kernel.fused_node_names = OrderedSet(n.get_name() for n in nodes)
         all_schedule_nodes: list[SchedulerNode] = []
         with kernel:
             self._codegen_into_kernel(nodes, kernel, all_schedule_nodes)
@@ -918,6 +922,8 @@ class SuperDSCScheduling(BaseScheduling):
 
         pool_sizes = getattr(V.graph, "hbm_pool_sizes", {})
         kernel = SpyreKernel(pool_size=pool_sizes.get(node.get_name(), 0))
+        # See codegen_node: set before any spec is built, and possibly a subset.
+        kernel.fused_node_names = OrderedSet(n.get_name() for n in inner_nodes)
         all_schedule_nodes: list[SchedulerNode] = []
         with kernel:
             self._codegen_into_kernel(inner_nodes, kernel, all_schedule_nodes)
