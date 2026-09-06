@@ -194,8 +194,8 @@ void SpyreStream::copyAsync(const at::Tensor& src,
     // Get SpyreTensorLayout using the public API
     SpyreTensorLayout stl = get_spyre_tensor_layout(*dev_tensor);
 
-    DataConversionInfo dci = generate_dci(
-        cpu_tensor, dev_tensor, stl, host2device);
+    DataConversionInfo dci =
+        generate_dci(cpu_tensor, dev_tensor, stl, host2device);
 
     copyAsyncImpl(cpu_ptr, get_composite_address(*dev_tensor), &dci,
                   host2device);
