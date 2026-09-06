@@ -19,6 +19,7 @@
 #include <c10/core/DispatchKey.h>
 #include <c10/core/DispatchKeySet.h>
 
+#include <algorithm>
 #include <string>
 #include <utility>
 #include <vector>
@@ -118,12 +119,10 @@ static std::vector<int64_t> dim_map_to_stride_map(
     int32_t d = dim_map[j];
     if (d == -1 || host_size[d] == 1) {
       stride_map[j] = -1;
-    } else if (last_stride[d] == -1) {
-      stride_map[j] = host_stride[d];
-      last_stride[d] = stride_map[j] * device_size[j];
     } else {
-      stride_map[j] = last_stride[d];
-      last_stride[d] = stride_map[j] * device_size[j];
+      stride_map[j] = last_stride[d] == -1 ? host_stride[d] : last_stride[d];
+      last_stride[d] = std::min(stride_map[j] * device_size[j],
+                                host_stride[d] * host_size[d]);
     }
   }
   return stride_map;
@@ -141,6 +140,8 @@ void SpyreTensorLayout::init(std::vector<int64_t> host_size,
                              std::vector<int64_t> host_strides,
                              c10::ScalarType dtype,
                              std::vector<int32_t> dim_order) {
+  TORCH_CHECK(host_size.size() == host_strides.size(),
+              "Incompatible host_size and host_strides");
   TORCH_CHECK((host_size.size() == dim_order.size()) ||
                   (((host_size.size() + 1) == dim_order.size()) &&
                    dim_order.back() == -1),

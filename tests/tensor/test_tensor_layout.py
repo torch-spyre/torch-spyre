@@ -72,7 +72,7 @@ class TestSpyreTensorLayout(TestCase):
 
         stl = SpyreTensorLayout([512, 8, 256], [2048, 256, 1], torch.float16, [0, 2, 1])
         self.assertEqual(stl.device_size, [256, 1, 512, 64])
-        self.assertEqual(stl.stride_map, [1, 16384, 2048, 256])
+        self.assertEqual(stl.stride_map, [1, 2048, 2048, 256])
 
         stl = SpyreTensorLayout([512, 8, 256], [2048, 256, 1], torch.float16, [1, 0, 2])
         self.assertEqual(stl.device_size, [512, 4, 8, 64])
@@ -84,7 +84,7 @@ class TestSpyreTensorLayout(TestCase):
 
         stl = SpyreTensorLayout([512, 8, 256], [2048, 256, 1], torch.float16, [2, 0, 1])
         self.assertEqual(stl.device_size, [512, 1, 256, 64])
-        self.assertEqual(stl.stride_map, [2048, 16384, 1, 256])
+        self.assertEqual(stl.stride_map, [2048, 2048, 1, 256])
 
         stl = SpyreTensorLayout([512, 8, 256], [2048, 256, 1], torch.float16, [2, 1, 0])
         self.assertEqual(stl.device_size, [8, 8, 256, 64])
@@ -420,11 +420,32 @@ class TestSpyreTensorLayout(TestCase):
         x = torch.empty_strided(sizes, strides, dtype=torch.float16).uniform_(0, 1)
         x_sliced = x[:, sizes[1] // 2 :]
         x_dev = x_sliced.to("spyre")
-        # Sliced tensors (that are not sliced along the batch dimension) are
-        # non-dense but produce dense tensors when transferred across devices.
-        # This requires an update the the stride_map after the device transfer
-        # for all non-dense dimensions.
-        # Once this is implemented, this test should pass.
+        self.assertEqual(x_sliced.contiguous(), x_dev.cpu())
+
+    @parametrize(
+        "sizes,strides",
+        [
+            ([40, 128], [1, 40]),
+            ([128, 40], [1, 128]),
+        ],
+    )
+    def test_to_spyre_permuted_sliced_batch(self, sizes, strides):
+        x = torch.empty_strided(sizes, strides, dtype=torch.float16).uniform_(0, 1)
+        x_sliced = x[(sizes[0] // 2) :, :]
+        x_dev = x_sliced.to("spyre")
+        self.assertEqual(x_sliced.contiguous(), x_dev.cpu())
+
+    @parametrize(
+        "sizes,strides",
+        [
+            ([40, 128], [1, 40]),
+            ([128, 40], [1, 128]),
+        ],
+    )
+    def test_to_spyre_permuted_sliced_other(self, sizes, strides):
+        x = torch.empty_strided(sizes, strides, dtype=torch.float16).uniform_(0, 1)
+        x_sliced = x[:, (sizes[1] // 2) :]
+        x_dev = x_sliced.to("spyre")
         self.assertEqual(x_sliced.contiguous(), x_dev.cpu())
 
     @unittest.skip(
