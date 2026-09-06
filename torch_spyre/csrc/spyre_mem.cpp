@@ -396,8 +396,8 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
   int64_t dev_offset = dev_tensor->storage_offset();
   int64_t device_offset = 0;
 
-  // While the source strides may differ than the destination strides when the
-  // source in non-dense or overlapping, the source sizes should always match
+  // While the source strides may differ from the destination strides when the
+  // source is non-dense or overlapping, the source sizes should always match
   // the destination sizes.
   //
   // This is assumed to be true for the following logic, so this check should
@@ -418,7 +418,7 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
         "Invalid destination storage offset. Expected: 0, got: ", dev_offset);
     if (cpu_strides != dev_strides) {
       // If the dev_strides do not match the cpu_strides then the cpu_tensor is
-      // slice and/or expanded.
+      // sliced and/or expanded.
       //
       // In these cases we update the stride_map of the SpyreTensorLayout to
       // reflect the cpu_strides instead of the dma_strides.
@@ -538,8 +538,6 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
 
       cpu_sizes = cpu_tensor->sizes().vec();
       cpu_strides = cpu_tensor->strides().vec();
-
-      DEBUGINFO("dst: ", cpu_sizes, " : ", cpu_strides);
 
       // Inflate or deflate cpu_sizes, cpu_strides, dev_sizes, and dev_strides
       // to the same rank as dma_sizes and dma_strides.
