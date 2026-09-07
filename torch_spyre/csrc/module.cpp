@@ -251,6 +251,19 @@ PYBIND11_MODULE(_C, m) {
       },
       py::arg("key"), "Return registered debug-handle IDs without mutation");
   m.def(
+      "lookup_bundle_dir_prefix",
+      [](const std::string& name_base) -> py::object {
+        const auto sdsc_bundle_dir_prefix = spyre::lookupBundleDirPrefix(name_base);
+        if (sdsc_bundle_dir_prefix.empty()) {
+          return py::none();
+        }
+        return py::cast(sdsc_bundle_dir_prefix);
+      },
+      py::arg("name_base"), "Return the SDSC bundle directory prefix for an activity name base");
+   m.def(
+      "activity_name_base", &spyre::activityNameBase,
+      py::arg("profiler_name"), "Return the activity base name from the profiler event name");
+  m.def(
       "kernel_provenance_registry_stats",
       []() {
         const auto stats = spyre::kernelProvenanceRegistryStats();
