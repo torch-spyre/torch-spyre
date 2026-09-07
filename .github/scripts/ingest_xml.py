@@ -378,6 +378,171 @@ def _null_tag(value):
 # ---------------------------------------------------------------------------
 # ── BENCHMARK ClickHouse insertion ─────────────────────────────────────────
 # ---------------------------------------------------------------------------
+# schema-v2 benchmark write path. Same dimension+fact split as test_cases /
+# test_case_runs, and the SAME derived run_uid, which is what finally lets a perf
+# number name the artifact it measured: v1 minted run_id = uuid4().int >> 64 per XML
+# file, unrecomputable by anyone, and artifact_results.run_id consequently joined
+# benchmark_runs.run_id in 0 of 34 rows.
+# ---------------------------------------------------------------------------
+
+# Identity discriminators, NOT measurements: these say which benchmark this is, so
+# they belong in the dimension's props and in its hash. batch_size is set on 40/40
+# model rows and 0/297 op rows -- a discriminator, not a number measured.
+_V2_BENCH_PROP_KEYS = (
+    "record_type",
+    "config_name",
+    "input_shapes",
+    "run_mode",
+    "kernel_name",
+    "is_total",
+    "batch_size",
+    "prompt_length",
+)
+
+# Everything the producer measured, keyed verbatim. A Map, not columns: the v1
+# sparsity is per record_type (mem_size_mb 152/297 op vs 0/40 model, batch_size the
+# inverse), so no wide column set fits and each new metric would need a DDL change.
+_V2_BENCH_METRIC_KEYS = (
+    "total_duration_ms",
+    "cpu_ms",
+    "spyre_ms",
+    "kernel_mean_ms",
+    "memory_transfer_mean_ms",
+    "compile_ms",
+    "runtime_ms",
+    "mem_size_mb",
+    "pt_util_percent",
+    "duration_ms",
+    "torch_spyre_ms",
+    "sendnn_ms",
+    "ratio",
+)
+
+
+# In the benchmark_id hash, not merely in props: one operation_name occurs at more
+# than one record_type in prod (granite as model AND op, matmul/attention likewise),
+# and the config keys separate the granite variants, so hashing name+tags alone
+# merges genuinely different benchmarks into one identity.
+_V2_BENCH_ID_KEYS = (
+    "record_type",
+    "config_name",
+    "input_shapes",
+    "run_mode",
+    "kernel_name",
+    "is_total",
+)
+
+
+def v2_benchmark_id(name: str, tags, disc=None) -> str:
+    """uuid5 over name + sorted tags + the identity discriminators in
+    _V2_BENCH_ID_KEYS. Same refuse-on-empty rule as v2_test_case_id: an empty name
+    still hashes to a real uuid, so every unidentifiable benchmark would collide on
+    ONE id rather than merely being orphaned."""
+    if not _v2_norm(name):
+        return ""
+    tag_part = ",".join(sorted({_v2_norm(t) for t in (tags or []) if _v2_norm(t)}))
+    disc = disc or {}
+    disc_part = ",".join(
+        f"{k}={_v2_norm(disc.get(k))}" for k in _V2_BENCH_ID_KEYS
+    )
+    return str(
+        uuid.uuid5(V2_NAMESPACE, f"{_v2_norm(name)}|{tag_part}|{disc_part}")
+    )
+
+
+def v2_benchmark_tables_present(client) -> bool:
+    return _table_exists(client, "benchmarks") and _table_exists(client, "benchmark_results")
+
+
+def v2_benchmarks_already_ingested(client, run_uid: str) -> bool:
+    """benchmark_results is a plain MergeTree with no dedup key, so a re-ingest
+    doubles every measurement behind an average."""
+    rows = client.query(
+        "SELECT count() FROM benchmark_results WHERE run_uid = {run_uid:UUID}",
+        parameters={"run_uid": run_uid},
+    ).result_rows
+    return bool(rows and rows[0][0] > 0)
+
+
+def _v2_bench_backend(rec: dict) -> str:
+    """Which implementation produced these numbers. v1 put torch_spyre_ms and
+    sendnn_ms on one row, yet co-populated them in 0 of 5,722 rows -- they were
+    never one measurement. As rows they compare by self-join and the ratio derives."""
+    if rec.get("sendnn_ms") is not None and rec.get("torch_spyre_ms") is None:
+        return "sendnn"
+    return "torch-spyre"
+
+
+def insert_benchmarks_v2(client, run_uid: str, records: list) -> int:
+    """Write benchmarks (identity) + benchmark_results (measurements) for one run.
+
+    Dropped from v2 deliberately: regression_status and ratio (verdicts with no
+    recorded baseline -- derived in v_benchmark_regression / v_benchmark_backend_compare
+    instead), and every run-context column (reached through run_uid).
+    """
+    if not records:
+        return 0
+    ident_rows, fact_rows = {}, []
+    skipped = 0
+    for rec in records:
+        name = rec.get("operation_name") or ""
+        tags = sorted({t for t in (rec.get("tags") or []) if t})
+        bid = v2_benchmark_id(name, tags, rec)
+        if not bid:
+            skipped += 1
+            continue
+        props = {
+            k: str(rec[k])
+            for k in _V2_BENCH_PROP_KEYS
+            if rec.get(k) is not None and str(rec[k]) != ""
+        }
+        measurements = {
+            k: float(rec[k]) for k in _V2_BENCH_METRIC_KEYS if rec.get(k) is not None
+        }
+        if not measurements:
+            # chk_measurements refuses an empty map: a benchmark row that measured
+            # nothing is a parse failure, not a result.
+            skipped += 1
+            continue
+        ident_rows[bid] = [bid, name, tags, props]
+        num_runs = rec.get("num_runs")
+        fact_rows.append(
+            [
+                run_uid,
+                bid,
+                _v2_bench_backend(rec),
+                measurements,
+                int(num_runs) if num_runs is not None else 0,
+                {},
+            ]
+        )
+    client.insert(
+        "benchmarks",
+        list(ident_rows.values()),
+        column_names=["benchmark_id", "name", "tags", "props"],
+    )
+    client.insert(
+        "benchmark_results",
+        fact_rows,
+        column_names=[
+            "run_uid",
+            "benchmark_id",
+            "backend",
+            "measurements",
+            "iterations",
+            "props",
+        ],
+    )
+    if skipped:
+        print(
+            f"  [warn] v2: {skipped} benchmark(s) skipped -- no derivable "
+            f"benchmark_id or no measurements",
+            file=sys.stderr,
+        )
+    return len(fact_rows)
+
+
+# ---------------------------------------------------------------------------
 
 
 def insert_benchmark_run(client, run_id: int, run_meta: dict) -> None:
@@ -1217,6 +1382,24 @@ def main():
             insert_benchmark_run(client, run_id, run_meta)
             insert_perf_kernels(client, run_id, kernels)
 
+            # Additive v2 write: the same measurements under a DERIVED run_uid, so a
+            # perf number can name the artifact it measured. Guarded on both tables
+            # existing so this deploys before the migration.
+            if v2_benchmark_tables_present(client):
+                _src, _ext = v2_source_and_external_run_id(args, str(run_id))
+                _v2_uid = v2_run_uid(_src, _ext, args.platform or "", "perf")
+                if not _v2_uid:
+                    print(
+                        "  [warn] v2 skipped: run_uid not derivable "
+                        f"(source={_src!r} external_run_id={_ext!r})",
+                        file=sys.stderr,
+                    )
+                elif v2_benchmarks_already_ingested(client, _v2_uid):
+                    print(f"  v2: already ingested run_uid={_v2_uid} — skipping")
+                else:
+                    _n = insert_benchmarks_v2(client, _v2_uid, kernels)
+                    print(f"  v2: {_n} benchmark_results under run_uid={_v2_uid}")
+
             total_kernels += len(kernels)
             print(f"  Inserted {len(kernels)} kernel rows")
 
@@ -1256,6 +1439,24 @@ def main():
 
             insert_benchmark_run(client, run_id, run_meta)
             insert_perf_benchmarks(client, run_id, benchmarks)
+
+            # Additive v2 write: the same measurements under a DERIVED run_uid, so a
+            # perf number can name the artifact it measured. Guarded on both tables
+            # existing so this deploys before the migration.
+            if v2_benchmark_tables_present(client):
+                _src, _ext = v2_source_and_external_run_id(args, str(run_id))
+                _v2_uid = v2_run_uid(_src, _ext, args.platform or "", "perf")
+                if not _v2_uid:
+                    print(
+                        "  [warn] v2 skipped: run_uid not derivable "
+                        f"(source={_src!r} external_run_id={_ext!r})",
+                        file=sys.stderr,
+                    )
+                elif v2_benchmarks_already_ingested(client, _v2_uid):
+                    print(f"  v2: already ingested run_uid={_v2_uid} — skipping")
+                else:
+                    _n = insert_benchmarks_v2(client, _v2_uid, benchmarks)
+                    print(f"  v2: {_n} benchmark_results under run_uid={_v2_uid}")
 
             total_benchmarks += len(benchmarks)
             print(f"  Inserted {len(benchmarks)} benchmark rows")
