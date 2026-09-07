@@ -398,6 +398,10 @@ _V2_BENCH_PROP_KEYS = (
     "batch_size",
     "prompt_length",
 )
+# Deliberately NOT here and NOT in the id hash: `metric`. It selects the backend, so
+# the same kernel measured on cpu and on spyre is ONE benchmark with two backend
+# rows -- putting it in the identity would split them and make the comparison a
+# cross-identity join instead of a self-join.
 
 # Everything the producer measured, keyed verbatim. A Map, not columns: the v1
 # sparsity is per record_type (mem_size_mb 152/297 op vs 0/40 model, batch_size the
@@ -464,10 +468,23 @@ def v2_benchmarks_already_ingested(client, run_uid: str) -> bool:
     return bool(rows and rows[0][0] > 0)
 
 
+# perf_kernels.metric is the real backend axis: cpu_kernel_ms on 16,734 prod rows,
+# spyre_kernel_ms on 3,475. Its torch_spyre_ms/sendnn_ms/ratio columns are NULL on all
+# 20,209 rows, so the comparison v1 looks like it stores was never actually written.
+_V2_BACKEND_BY_METRIC = {
+    "cpu_kernel_ms": "cpu",
+    "spyre_kernel_ms": "spyre",
+    "sendnn_ms": "sendnn",
+}
+
+
 def _v2_bench_backend(rec: dict) -> str:
-    """Which implementation produced these numbers. v1 put torch_spyre_ms and
-    sendnn_ms on one row, yet co-populated them in 0 of 5,722 rows -- they were
-    never one measurement. As rows they compare by self-join and the ratio derives."""
+    """Which implementation produced these numbers, so the same benchmark measured on
+    two backends compares by self-join instead of by a stored ratio that can disagree
+    with its operands."""
+    metric = (rec.get("metric") or "").strip()
+    if metric in _V2_BACKEND_BY_METRIC:
+        return _V2_BACKEND_BY_METRIC[metric]
     if rec.get("sendnn_ms") is not None and rec.get("torch_spyre_ms") is None:
         return "sendnn"
     return "torch-spyre"
@@ -518,7 +535,7 @@ def insert_benchmarks_v2(client, run_uid: str, records: list) -> int:
         )
     client.insert(
         "benchmarks",
-        list(ident_rows.values()),
+        v2_new_identity_rows(client, "benchmarks", "benchmark_id", ident_rows),
         column_names=["benchmark_id", "name", "tags", "props"],
     )
     client.insert(
@@ -1177,6 +1194,27 @@ def v2_already_ingested(client, run_uid: str, component: str) -> bool:
     return bool(rows and rows[0][0] > 0)
 
 
+def v2_new_identity_rows(client, table: str, id_col: str, ident_rows: dict) -> list:
+    """Return only the identity rows this dimension does not already hold.
+
+    Both dimensions are plain MergeTree, so re-inserting a known identity appends a
+    duplicate row rather than collapsing it: one benchmark seen in 36 runs became 36
+    rows, and every reader then has to remember to dedup. Deduping in-run is not
+    enough because the collision is ACROSS runs.
+    """
+    if not ident_rows:
+        return []
+    ids = list(ident_rows)
+    known = {
+        r[0]
+        for r in client.query(
+            f"SELECT {id_col} FROM {table} WHERE {id_col} IN {{ids:Array(UUID)}}",
+            parameters={"ids": ids},
+        ).result_rows
+    }
+    return [row for i, row in ident_rows.items() if str(i) not in {str(k) for k in known}]
+
+
 def insert_v2(client, component: str, run_uid: str, cases: list) -> int:
     """Write test_cases (identity) + test_case_runs (outcome) for one leg.
 
@@ -1213,7 +1251,7 @@ def insert_v2(client, component: str, run_uid: str, cases: list) -> int:
         )
     client.insert(
         "test_cases",
-        list(ident_rows.values()),
+        v2_new_identity_rows(client, "test_cases", "test_case_id", ident_rows),
         column_names=["test_case_id", "component", "classname", "name", "tags"],
     )
     client.insert(
