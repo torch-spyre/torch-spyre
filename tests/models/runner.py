@@ -85,9 +85,12 @@ def make_tensor_from_conf(
     init_args = dict(tconf.get("init_args", {}))
 
     with torch.random.fork_rng(devices=[]):
-        assert init == "rand" or init == "randint" or init == "xavier", (
-            f"Unknown init: {init}"
-        )
+        assert (
+            init == "rand"
+            or init == "randint"
+            or init == "xavier"
+            or init == "cumsum_offsets"
+        ), f"Unknown init: {init}"
         if seed is not None:
             torch.manual_seed(int(seed))
         if init == "rand":
@@ -114,6 +117,19 @@ def make_tensor_from_conf(
             t = torch.nn.init.xavier_uniform_(
                 torch.empty(tuple(shape), dtype=dtype, device="cpu")
             )
+        elif init == "cumsum_offsets":
+            # for torch._grouped_mm
+            total = int(init_args.get("total", -1))
+            if total < 0:
+                raise ValueError(
+                    "Invalid value (total for cumsum_offsets): must be provided (via init_args) and must be positive"
+                )
+            counts = torch.zeros(shape[0], dtype=dtype, device="cpu")
+            counts.scatter_add_(
+                0, torch.randint(0, shape[0], (total,)), torch.ones(total, dtype=dtype)
+            )
+            t = torch.cumsum(counts, dim=0, dtype=dtype)
+            assert t[-1] == total
         else:
             raise ValueError(f"Unknown init: {init}")
 
@@ -265,6 +281,11 @@ def parse_dtype(spec) -> torch.dtype:
     )
 
 
+# Seed offset for kwmap tensors, kept clear of the per-input seed range
+# (seed + i * 1000) so kwmap and inputs never draw identical data.
+KWMAP_SEED_OFFSET = 1_000_000
+
+
 def make_SampleInput(
     case: Dict[str, Any], seed, dtype: torch.dtype, test_device: torch.device
 ) -> SampleInput:
@@ -316,8 +337,38 @@ def make_SampleInput(
             raise ValueError(f"Unknown input entry: {inp}")
 
     attrs: dict[Any, Any] = dict(case.get("attrs", {}))
-    for key, value in case.get("kwmap", {}).items():
-        if key == "dtype":
+    # kwmap tensors get seeds from a separate block so they never collide with
+    # the per-input seeds derived above (seed + i * 1000).
+    kwmap_seed_base = None if seed is None else int(seed) + KWMAP_SEED_OFFSET
+    for k, (key, value) in enumerate(case.get("kwmap", {}).items()):
+        kw_seed = None if kwmap_seed_base is None else kwmap_seed_base + k * 1000
+
+        # A kwmap value may be a tensor spec using the same schema as an
+        # "inputs" entry, e.g.
+        #   kwmap:
+        #     offs:
+        #       tensor:
+        #         shape: [1, 24]
+        #         stride: [24, 1]
+        #         dtype: torch.float32
+        #         init: rand
+        if isinstance(value, dict) and "tensor" in value:
+            tensor_conf = value["tensor"]
+            value = make_tensor_from_conf(
+                tensor_conf,
+                dtype=parse_dtype(tensor_conf.get("dtype", dtype_str)),
+                seed=kw_seed,
+            )
+        elif isinstance(value, dict) and "tensor_list" in value:
+            value = [
+                make_tensor_from_conf(
+                    t,
+                    dtype=parse_dtype(t.get("dtype", dtype_str)),
+                    seed=(None if kw_seed is None else kw_seed + j),
+                )
+                for j, t in enumerate(value["tensor_list"])
+            ]
+        elif key == "dtype":
             value = parse_dtype(value)
         else:
             if isinstance(value, str):

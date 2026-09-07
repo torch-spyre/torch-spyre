@@ -33,11 +33,11 @@ from torch._inductor.graph import GraphLowering
 from torch._inductor.virtualized import V
 from ..errors import Unsupported
 from ..pass_utils import (
+    find_reduction_var,
     host_coordinates,
     device_coordinates,
     indirect_sizes_from_op,
     op_out_coords,
-    find_reduction_var,
 )
 from ..ir import SpyreConstantFallback
 from ..propagate_hints import DimHint, get_op_hints
@@ -117,6 +117,14 @@ def _untracked_name(context: str, sym, size: int) -> str:
     return name
 
 
+def _input_range_for_symbol(inputs: list[MemoryDep], sym: sympy.Symbol) -> sympy.Expr:
+    """Return ``sym``'s range from the input dependency that defines it."""
+    for inp in inputs:
+        if sym in inp.index.free_symbols and sym in inp.ranges:
+            return inp.ranges[sym]
+    raise Unsupported(f"reduction variable {sym} has no range in any input")
+
+
 def _consume_names(remaining: list[str], layout_size: int) -> list[str]:
     """Return the prefix of remaining whose declared sizes multiply to layout_size."""
     product = 1
@@ -179,9 +187,12 @@ def compute_input_named_dims(dep: MemoryDep, op=None, ind_sizes=None) -> dict:
             # One loop var covers all fused names (e.g. a flat [A, B*D*E] read)
             result.setdefault(loop_vars[0], []).extend(names)
         elif len(loop_vars) == 0:
-            # This layout dim is index-selected by a gather/scatter index
-            # symbol (e.g. `tmp0`).  Raise for anything else — a constant
-            # or unexpected coord should not be silently skipped.
+            # This layout dim is either fixed to a constant source slice, or
+            # index-selected by a gather/scatter symbol (e.g. ``tmp0``).
+            # Its name was consumed above to keep later dimensions aligned,
+            # but there is no iteration variable to attach it to.
+            if not coord.free_symbols:
+                continue
             sym = _lone_sym(coord)
             if sym is not None and is_indirect(sym.name):
                 continue
@@ -290,9 +301,9 @@ def _compute_named_dims(op, inputs):
         named_dims.extend(names)
     reduction_named_dims = None
     if isinstance(op.data, Reduction):
-        reduction_sym = find_reduction_var(inputs[0], output_dep)
+        reduction_sym = find_reduction_var(inputs, output_dep)
         if reduction_sym not in loop_var_dims:
-            size = int(inputs[0].ranges[reduction_sym])
+            size = int(_input_range_for_symbol(inputs, reduction_sym))
             loop_var_dims[reduction_sym] = [
                 _untracked_name(op.get_name(), reduction_sym, size)
             ]

@@ -564,6 +564,65 @@ def test_bmm_xt_yt(bmm_tensors_ab_ba):
     _compare(lambda x, y: torch.matmul(x.transpose(1, 2), y.transpose(1, 2)), x, y)
 
 
+def test_matmul_unit_n_2d():
+    """2D matmul where N=1 (output is a column vector)."""
+    x = torch.rand(5, 64, dtype=torch.float16)
+    y = torch.rand(64, 1, dtype=torch.float16)
+    _compare(lambda x, y: x @ y, x, y)
+
+
+def test_matmul_unit_n_2d_reduce():
+    """2D matmul where Y is sparse"""
+    x = torch.rand(5, 64, dtype=torch.float16)
+    y = torch.rand(64, 64, dtype=torch.float16)
+    _compare(lambda x, y: x @ y.sum(dim=-1, keepdim=True), x, y)
+
+
+def test_bmm_unit_m():
+    """M=1 matmul: x is a 2D matmul output consumed as x[:1] by a second linear."""
+    a = torch.randn((128, 256), dtype=torch.float16) * 0.1
+    w1 = torch.randn((256, 256), dtype=torch.float16) * 0.1
+    w2 = torch.randn((128, 256), dtype=torch.float16) * 0.1
+
+    def fn(a, w1, w2):
+        x = a @ w1
+        return torch.nn.functional.linear(x[:1], w2)
+
+    _compare(fn, a, w1, w2)
+
+
+def test_bmm_unit_n():
+    """Batched matmul with N=1 output dimension (decode-style query matmul).
+
+    Both x and y are (32, 1, 128); y is transposed before the matmul giving
+    out: (32, 1, 1).  When N=1 the N symbol is constant-folded away, producing
+    a sparse y layout.  Verifies the compiler handles it correctly.
+    """
+    x = torch.randn((32, 1, 128), dtype=torch.float16) * 0.1
+    y = torch.randn((32, 1, 128), dtype=torch.float16) * 0.1
+    _compare(lambda x, y: torch.matmul(x, y.transpose(1, 2)), x, y)
+
+
+def test_bmm_unit_self_1():
+    """Self-matmul where N=1: same tensor for both operands with a sparse y layout."""
+    x = torch.randn((32, 1, 128), dtype=torch.float16) * 0.1
+    _compare(lambda x: torch.matmul(x, x.transpose(1, 2)), x)
+
+
+def test_bmm_unit_self_2():
+    """Self-matmul where M=N=2: exercises restickify occurrence-counter bookkeeping for the self-alias case."""
+    x = torch.randn((32, 2, 128), dtype=torch.float16) * 0.1
+    _compare(lambda x: torch.matmul(x, x.transpose(1, 2)), x)
+
+
+def test_bmm_self():
+    """Self-matmul: same tensor for both operands, forcing the optimizer to
+    distinguish the LHS and RHS restickify edges even though both reads share
+    one deduplicated MemoryDep."""
+    x = torch.randn((32, 2, 128), dtype=torch.float16) * 0.1
+    _compare(lambda x: torch.matmul(x, x.transpose(1, 2)), x, optimal_cost=x.numel())
+
+
 # ------- FallbackKernel + restickify regression test ---------
 
 

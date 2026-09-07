@@ -25,6 +25,71 @@ from torch._inductor.virtualized import V
 from .errors import Unsupported
 
 
+def _mixed_radix_digits(expr, var, var_range, mods):
+    """Describe an exact quotient/remainder digit chain for ``var``.
+
+    A flattened loop variable commonly reaches a pre-flatten view as adjacent
+    mixed-radix digits, for example ``Mod(hd, 128)`` and
+    ``Mod(FloorDiv(hd, 128), 32)`` for a flattened ``H*D`` axis. Multiple Mods
+    are safe in that case: each digit addresses a distinct tensor dimension.
+
+    Return the digits in low-to-high order, or ``None`` when the expressions
+    overlap, leave a gap, or do not cover the variable's full range. Keeping
+    this recognition deliberately strict preserves rejection of ambiguous
+    combinations such as ``Mod(x, 4) + Mod(x, 6)``.
+    """
+    term = expr.xreplace({s: 0 for s in expr.free_symbols - {var}})
+    var_terms = [addend for addend in sympy.Add.make_args(term) if addend.has(var)]
+    if len(var_terms) != len(mods):
+        return None
+
+    digits = []
+    for node in mods:
+        containing = [addend for addend in var_terms if addend.has(node)]
+        if len(containing) != 1:
+            return None
+        addend = containing[0]
+        if len([m for m in addend.atoms(sympy.Mod) if m.has(var)]) != 1:
+            return None
+
+        base, modulus = node.args
+        if base == var:
+            divisor = sympy.S.One
+        elif isinstance(base, FloorDiv) and base.args[0] == var:
+            divisor = base.args[1]
+        else:
+            return None
+
+        coeff = sympy.simplify(addend / node)
+        if (
+            coeff.has(var)
+            or coeff.is_Rational is not True
+            or coeff <= 0
+            or (coeff.numerator != 1 and coeff.denominator != 1)
+        ):
+            return None
+        if any(not value.is_Integer or value <= 0 for value in (divisor, modulus)):
+            return None
+        digits.append(
+            {
+                "node": node,
+                "modulus": modulus,
+                "divisor": divisor,
+                "coeff": coeff,
+            }
+        )
+
+    digits.sort(key=lambda digit: int(digit["divisor"]))
+    if digits[0]["divisor"] != 1:
+        return None
+    for low, high in zip(digits, digits[1:]):
+        if sympy.simplify(low["divisor"] * low["modulus"] - high["divisor"]) != 0:
+            return None
+    if sympy.simplify(digits[-1]["divisor"] * digits[-1]["modulus"] - var_range) != 0:
+        return None
+    return digits
+
+
 def find_repeat_vars(index_exprs, var_ranges):
     repeat_info = {}
     for var, var_range in var_ranges.items():
@@ -34,12 +99,16 @@ def find_repeat_vars(index_exprs, var_ranges):
             for m in all_mods:
                 if m.has(var):
                     mods.append(m)
-            if len(mods) != 1:
-                if len(mods) > 1:
+            if len(mods) > 1:
+                digits = _mixed_radix_digits(expr, var, var_range, mods)
+                if digits is None:
                     raise Unsupported(
                         f"variable {var} (range {var_range}) appears in multiple Mod "
                         f"expressions {mods} and cannot be mapped to coordinates."
                     )
+                repeat_info[var] = {"kind": "mixed_radix", "digits": digits}
+                break
+            if len(mods) == 0:
                 continue
             node = mods[0]
             base, modulus = node.args
@@ -330,6 +399,13 @@ def compute_coordinates(
             elif info["kind"] == "mul_mod":
                 coeff = info["coeff"]
                 add_term(var=info["node"], step=coeff, limit=coeff * info["modulus"])
+            elif info["kind"] == "mixed_radix":
+                for digit in info["digits"]:
+                    add_term(
+                        var=digit["node"],
+                        step=digit["coeff"],
+                        limit=digit["coeff"] * digit["modulus"],
+                    )
             continue
 
         # compute index({var=1}) and index({var=var_ranges[var]})
@@ -442,6 +518,53 @@ def normalize_coordinates(
     device dims with a constant zero coordinate are dropped, and do not stop
     the dims on either side of them from fusing.
     """
+
+    def normalize_var_expr(term, var, var_range, dim_size):
+        """Convert one single-variable coordinate term to ``Term``.
+
+        ``Mod(FloorDiv(var, divisor), radix)`` is one digit of a
+        mixed-radix decomposition. Its equivalent normalized form is
+        ``(var % (divisor * radix)) // divisor``; retaining both bounds is
+        essential when ``align_tensors`` splits the original loop variable.
+        """
+        coeff = sympy.S.One
+        body = term
+        if term.func == sympy.Mul and term.args[0].is_rational:
+            coeff, body = term.args
+            # TODO: handle non-unit fractions
+            # https://github.com/torch-spyre/torch-spyre/issues/1353
+            assert coeff.numerator == 1 or coeff.denominator == 1, (
+                f"Unsupported coordinate expression {term}"
+            )
+
+        divisor = sympy.S.One
+        modulus = var_range
+        if body == var:
+            pass
+        elif isinstance(body, FloorDiv) and body.args[0] == var:
+            divisor = body.args[1]
+        elif body.func == sympy.Mod:
+            base, radix = body.args
+            if base == var:
+                modulus = radix
+            elif isinstance(base, FloorDiv) and base.args[0] == var:
+                divisor = base.args[1]
+                modulus = divisor * radix
+            else:
+                raise Unsupported(
+                    f"Unsupported modular coordinate expression {body} for {var}"
+                )
+        else:
+            raise Unsupported(f"Unsupported coordinate expression {term}")
+
+        return Term(
+            coeff.numerator,
+            coeff.denominator * divisor,
+            var,
+            modulus,
+            dim_size,
+        )
+
     # terms in non-increasing stride order
     terms = []
 
@@ -489,28 +612,7 @@ def normalize_coordinates(
 
             # extract term for each var
             term = expr.xreplace({v: 0 for v in vars - {var}}) - offset
-            # pattern match expression tree, there is small number of possibilities
-            if term.is_symbol:
-                dim_terms.append(
-                    Term(sympy.S.One, sympy.S.One, var, var_range, dim_size)
-                )
-            elif term.func == sympy.Mod:
-                dim_terms.append(
-                    Term(sympy.S.One, sympy.S.One, var, term.args[1], dim_size)
-                )
-            elif term.func == sympy.Mul and term.args[0].is_rational:
-                expr0, expr1 = term.args
-                mod = expr1.args[1] if expr1.func == sympy.Mod else var_range
-                # TODO: handle non-unit fractions
-                # https://github.com/torch-spyre/torch-spyre/issues/1353
-                assert expr0.numerator == 1 or expr0.denominator == 1, (
-                    f"Unsupported coordinate expression {expr}"
-                )
-                dim_terms.append(
-                    Term(expr0.numerator, expr0.denominator, var, mod, dim_size)
-                )
-            else:
-                assert False, f"Unsupported coordinate expression {expr}"
+            dim_terms.append(normalize_var_expr(term, var, var_range, dim_size))
         # sort dim_terms in increasing (num, mod) order so that z + offset
         # vars (num=1, mod=1) always sort before real iteration vars (num=1, mod=N)
         # when num is equal
@@ -625,6 +727,27 @@ class AlignmentInputs:
     repeat_info: dict[sympy.Symbol, dict]
     concrete_ranges: dict[sympy.Symbol, int | float]
     restored_ranges: dict[sympy.Symbol, sympy.Expr | int | float]
+
+
+class UnalignedStickSplit(Unsupported):
+    """A global alignment boundary cuts through one tensor's physical stick."""
+
+    def __init__(
+        self,
+        tensor_index: int,
+        variable: sympy.Symbol,
+        boundary: int,
+        stick_size: int,
+    ) -> None:
+        self.tensor_index = tensor_index
+        self.variable = variable
+        self.boundary = boundary
+        self.stick_size = stick_size
+        super().__init__(
+            "tensor alignment boundary "
+            f"{boundary} for {variable} cuts tensor {tensor_index}'s "
+            f"physical stick of {stick_size} elements"
+        )
 
 
 def build_alignment_inputs(
@@ -778,6 +901,37 @@ def align_tensors_pure(
 
     # sort splits
     splits = {var: sorted(val) for var, val in splits.items()}
+
+    # When a tensor has the canonical pair of an outer-stick coordinate and an
+    # innermost stick coordinate for the same variable, every interior boundary
+    # must fall between physical sticks.  A boundary inside a stick cannot be
+    # represented as a device dimension: the outer-stick adjustment below would
+    # truncate it to zero (for example 16 // 32), or to an incorrect nonzero
+    # extent (for example 48 // 32).  Do not apply this restriction merely
+    # because the innermost coordinate uses the variable: arbitrary coordinate
+    # expressions in preceding dimensions can legally split it at other points.
+    # The final boundary is the logical range endpoint, so a partial last stick
+    # (for example 7 int32 elements in a 32-element stick) remains valid.
+    for tensor_index, (terms, var, physical_stick_size) in enumerate(
+        zip(all_terms, stick_dim, stick_size)
+    ):
+        if var is None:
+            # A constant/broadcast innermost coordinate has no stick loop to split.
+            continue
+        has_outer_stick_coordinate = any(
+            term.var == var and term.den == physical_stick_size for term in terms[:-1]
+        )
+        if not has_outer_stick_coordinate:
+            continue
+        for boundary_expr in splits[var][1:-1]:
+            boundary = _concrete_alignment_value(boundary_expr)
+            if boundary % int(physical_stick_size) != 0:
+                raise UnalignedStickSplit(
+                    tensor_index,
+                    var,
+                    int(boundary),
+                    int(physical_stick_size),
+                )
 
     # create new vars, var ranges, and work division for each variable
     # with one var per segment (split[i], split[i+1])
@@ -993,17 +1147,26 @@ def tiling_expr_to_device_expr(
     out = sympy.S.Zero
     n = len(stride_map)
     vars = index.free_symbols
+    terms = index.args if isinstance(index, sympy.Add) else (index,)
     for var in vars:
-        # index.xreplace({var: 1}) can degenerate to the bare Python int 1
-        # (not sympy.Integer(1)) when `index` is itself exactly the single
-        # symbol being replaced (e.g. index == var, coefficient 1, no other
-        # additive term) -- sympy auto-simplifies Mul(1, var) to var, and
-        # substituting var -> 1 into var alone returns the literal object
-        # passed in. sympy.sympify coerces that raw int back to a proper
-        # sympy numeric type so the second .xreplace call below (which
-        # every other, non-degenerate case already returns) does not crash
-        # with "'int' object has no attribute 'xreplace'".
-        step = sympy.sympify(index.xreplace({var: 1})).xreplace({v: 0 for v in vars})
+        # step must be var's own coefficient, not index's value at var=1 --
+        # those only coincide when index has zero constant term. `index` can
+        # legitimately carry one here: _general_tile_advance builds it from
+        # dep.index, which bakes in literal offsets from Python-level slicing
+        # (e.g. key[..., start:end, :] for KV-block >= 1 contributes a
+        # constant +start*row_stride term alongside the tiled-dim symbol).
+        # Evaluating at var=1 folded that unrelated constant straight into
+        # the per-level advance coefficient (issue: S=128 flash-attention,
+        # second head-tile group's second KV block reading the wrong head).
+        # Isolate var's own additive term first (mirrors coeff_through_floor
+        # in pass_utils.py -- not reused directly to avoid a views<->pass_utils
+        # import cycle), then take its coefficient, looking through one
+        # floor() layer since a term can be floor(k*var/d).
+        own_term = next((t for t in terms if var in t.free_symbols), sympy.S.Zero)
+        if isinstance(own_term, sympy.floor):
+            step = own_term.args[0].coeff(var)
+        else:
+            step = own_term.coeff(var)
         j = -1  # device dimension for var
         for i in range(n):
             if (
