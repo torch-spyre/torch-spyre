@@ -887,6 +887,10 @@ def parse_test_xml(xml_path: Path):
         "triggered_at": triggered_at,
         "total_tests": len(raw_cases),
         "passed": counts.get("passed", 0),
+        # error is counted INSIDE failed on purpose, and `errors` below is a subset,
+        # not an additional bucket: passed+failed+skipped+xfail+xpass must equal
+        # total_tests, which holds on all 341,161 prod test_runs rows. Splitting error
+        # out of failed would break that invariant for every consumer.
         "failed": counts.get("failed", 0) + counts.get("error", 0),
         "skipped": counts.get("skipped", 0),
         "xfail": counts.get("xfail", 0),
@@ -1540,10 +1544,15 @@ def main():
             if existing.result_rows[0][0] > 0:
                 print(f"  Already ingested — skipping {run['filename']}")
                 continue
+            # `errors` is printed separately from `failed` even though it is a SUBSET of
+            # it: a run whose outcomes are pytest errors could not start (bad import,
+            # unloadable model), which is a different triage path from N regressions.
+            # Observed reading as "failed=581" for 581 errors.
             print(
                 f"  run_id={run_id}  tests={run['total_tests']}  "
-                f"passed={run['passed']}  failed={run['failed']}  "
-                f"xpass={run['xpass']}  xfail={run['xfail']}  skipped={run['skipped']}"
+                f"passed={run['passed']}  failed={run['failed']}"
+                + (f" (of which errors={run['errors']})" if run['errors'] else "")
+                + f"  xpass={run['xpass']}  xfail={run['xfail']}  skipped={run['skipped']}"
             )
 
             insert_run(client, run_id, run, args)
