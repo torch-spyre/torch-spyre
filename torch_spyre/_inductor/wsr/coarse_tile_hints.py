@@ -279,7 +279,7 @@ def reorder_unhinted_interlopers(graph: GraphLowering) -> None:
           (a) Move before: insert at run_start, run_start += 1, j stays
               (the rotate shifts subsequent ops left so ops[j] is fresh).
           (b) Move after: pop(j), insert at run_end-1, j stays.
-          (c) Neither legal → RuntimeError.
+          (c) Neither legal → leave it in place and end the current run.
         run_end is the index one past the *last* same-key op in ops[j+1:],
         found by scanning backward.  Using the last op (not just the next)
         ensures the move-after target span covers the full remaining run,
@@ -298,9 +298,10 @@ def reorder_unhinted_interlopers(graph: GraphLowering) -> None:
     When both directions are legal the op is moved before the run (closer
     to its original position).
 
-    Raises RuntimeError if an interloper cannot be moved in either
-    direction (data-flow dependencies anchor it between hinted ops that
-    share the same hint key).
+    If data-flow dependencies anchor an interloper between hinted ops with
+    the same key, it remains in place and splits them into separate runs.
+    This preserves the graph's topological order; the later grouping pass
+    already treats an unhinted op as a run boundary.
     """
     ops = graph.operations
     i = 0
@@ -409,13 +410,14 @@ def reorder_unhinted_interlopers(graph: GraphLowering) -> None:
                 # Insert at run_end-1 to land just after that last hinted op.
                 ops.insert(run_end - 1, ops.pop(j))
                 continue
-            run_ops = [ops[k].get_name() for k in range(run_start, j)]
-            raise RuntimeError(
-                f"Cannot reorder unhinted op '{candidate.get_name()}': "
-                f"data-flow deps prevent moving it before or after the "
-                f"hint-group run [{', '.join(run_ops)}] "
-                f"(hint_ids={sorted(key)})"
+            hints_logger.debug(
+                "Leaving dependency-anchored unhinted op '%s' in place; "
+                "it splits the hint-group run [%s] (hint_ids=%s)",
+                candidate.get_name(),
+                ", ".join(ops[k].get_name() for k in range(run_start, j)),
+                sorted(key),
             )
+            break
         i = j
 
 

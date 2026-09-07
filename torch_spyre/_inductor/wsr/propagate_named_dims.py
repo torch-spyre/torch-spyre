@@ -187,9 +187,12 @@ def compute_input_named_dims(dep: MemoryDep, op=None, ind_sizes=None) -> dict:
             # One loop var covers all fused names (e.g. a flat [A, B*D*E] read)
             result.setdefault(loop_vars[0], []).extend(names)
         elif len(loop_vars) == 0:
-            # This layout dim is index-selected by a gather/scatter index
-            # symbol (e.g. `tmp0`).  Raise for anything else — a constant
-            # or unexpected coord should not be silently skipped.
+            # This layout dim is either fixed to a constant source slice, or
+            # index-selected by a gather/scatter symbol (e.g. ``tmp0``).
+            # Its name was consumed above to keep later dimensions aligned,
+            # but there is no iteration variable to attach it to.
+            if not coord.free_symbols:
+                continue
             sym = _lone_sym(coord)
             if sym is not None and is_indirect(sym.name):
                 continue
