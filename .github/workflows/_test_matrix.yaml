@@ -77,6 +77,15 @@ on:
         required: false
         type: boolean
         default: true
+      enable_tier_delta:
+        description: >
+          Skip configs whose tiers already have results for this commit+arch, so a
+          regression run after an integration run executes only what regression adds.
+          Off by default: a delta must be asked for. Degrades to the full tier on any
+          ClickHouse error, so it can never under-test silently.
+        type: boolean
+        default: false
+        required: false
       test_type:
         description: >-
           Suite subset to run: smoke | unit | integration | regression |
@@ -209,6 +218,7 @@ jobs:
           sparse-checkout: |
             ${{ (inputs.test_type || 'regression') == 'trunk' && 'tests/configs' || 'tests/configs/torch_spyre_tests' }}
             tests/oot_framework/utils/filter_configs.py
+            .github/scripts/resolve_covered_tiers.py
             .github/runner_overrides.yaml
           sparse-checkout-cone-mode: false
 
@@ -216,6 +226,13 @@ jobs:
         id: filter
         env:
           RAW_TEST_TYPE: ${{ inputs.test_type || 'regression' }}
+          ENABLE_TIER_DELTA: ${{ inputs.enable_tier_delta }}
+          DELTA_SHA: ${{ inputs.ref || github.event.pull_request.head.sha || github.sha }}
+          DELTA_ARCH: ${{ inputs.runner_label }}
+          SPYRE_CH_URL: ${{ vars.SPYRE_CH_URL }}
+          SPYRE_CH_V2_DB: ${{ vars.SPYRE_CH_V2_DB }}
+          SPYRE_CH_USER: ${{ vars.SPYRE_CH_USER }}
+          SPYRE_CH_TOKEN: ${{ secrets.SPYRE_CH_TOKEN }}
         run: |
           # Prebaked: read the configs baked in the dev image; else the checkout cwd.
           # cd into the source root so every path below stays repo-relative and
@@ -248,16 +265,34 @@ jobs:
           # tests/scripts/check_test_coverage.sh greps workflow YAMLs for a
           # literal `--config-dir <path>` token to detect dynamic coverage,
           # and can't resolve a variable.
+          # Tiers already covered for this commit+arch. Empty unless the delta is
+          # enabled AND the lookup succeeds -- the script prints nothing and exits 0
+          # on any failure, so an unreachable ClickHouse runs the full tier.
+          EXCLUDE_TIERS=""
+          if [ "${ENABLE_TIER_DELTA}" = "true" ] && [ -n "${SPYRE_CH_URL:-}" ]; then
+            EXCLUDE_TIERS=$(python3 .github/scripts/resolve_covered_tiers.py \
+              --commit-sha "${DELTA_SHA}" \
+              --arch "${DELTA_ARCH}" \
+              --test-type "${RAW_TEST_TYPE}" || true)
+          fi
+          _delta_args=""
+          if [ -n "${EXCLUDE_TIERS}" ]; then
+            _delta_args="--exclude-tiers ${EXCLUDE_TIERS}"
+            echo "tier delta: skipping configs already covered by ${EXCLUDE_TIERS}"
+          fi
+
           if [ "${RAW_TEST_TYPE}" = "trunk" ]; then
             matrix=$(python3 tests/oot_framework/utils/filter_configs.py \
               --config-dir tests/configs \
               --test-type "${RAW_TEST_TYPE}" \
+              ${_delta_args} \
               --runner-map .github/runner_overrides.yaml \
               --format matrix-json)
           else
             matrix=$(python3 tests/oot_framework/utils/filter_configs.py \
               --config-dir tests/configs/torch_spyre_tests \
               --test-type "${RAW_TEST_TYPE}" \
+              ${_delta_args} \
               --runner-map .github/runner_overrides.yaml \
               --format matrix-json)
           fi
