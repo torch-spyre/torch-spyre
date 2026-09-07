@@ -138,6 +138,11 @@ def _load_runner_map(runner_map_path: str) -> dict:
     return {k: str(v) for k, v in data.items()}
 
 
+# The tier ladder. A config's labels also carry suite groups and one-off markers;
+# those are not tiers and must never make a config look already-covered.
+TIER_LABELS = ("smoke", "unit", "integration", "regression", "trunk")
+
+
 def _matches(labels: list, config_path: Path, test_type: str) -> bool:
     """Return True if *config_path* should be included for *test_type*.
 
@@ -157,6 +162,27 @@ def _matches(labels: list, config_path: Path, test_type: str) -> bool:
         return stem.startswith(group + "_") or stem == group
 
     return test_type in labels
+
+
+def _already_covered(labels: list, exclude_tiers: list) -> bool:
+    """True when this config was already executed by one of the covered tiers.
+
+    The test is whether any ALREADY-COVERED tier selects this config -- not whether
+    every tier it declares is covered. A config labeled
+    [unit, regression, integration, trunk] was already run by the integration run,
+    so a later regression run re-executes identical work; its `trunk` label is
+    irrelevant because no trunk run happened.
+
+    Set difference over DECLARED labels, never a ladder. Measured on the 213 live
+    configs: all 59 integration configs also declare regression, so integration is
+    an exact subset here and the regression delta is 73 configs. That is a property
+    of these files, NOT a rule -- prod showed 616 case-level
+    integration-not-in-trunk violations, so inferring the ladder instead of reading
+    the labels would silently drop real tests.
+    """
+    if not exclude_tiers:
+        return False
+    return any(t in labels for t in exclude_tiers)
 
 
 # ---------------------------------------------------------------------------
@@ -195,6 +221,16 @@ def main() -> None:
         ),
     )
     ap.add_argument(
+        "--exclude-tiers",
+        default="",
+        help=(
+            "Comma-separated tiers whose results already exist for this artifact. "
+            "A config is dropped only when EVERY tier it declares is in this list, "
+            "so it adds nothing to run. Empty (the default) runs the full tier -- "
+            "which is what an unreachable ClickHouse degrades to."
+        ),
+    )
+    ap.add_argument(
         "--format",
         choices=["paths", "matrix-json"],
         default="paths",
@@ -210,19 +246,28 @@ def main() -> None:
         sys.exit(f"ERROR: --config-dir does not exist: {config_dir}")
 
     test_type = args.test_type.strip()
+    exclude_tiers = [t.strip() for t in (args.exclude_tiers or "").split(",") if t.strip()]
+    # Never let a tier suppress itself: an explicit rerun of a tier must re-execute.
+    exclude_tiers = [t for t in exclude_tiers if t != test_type]
 
     runner_map: dict = {}
     if args.runner_map:
         runner_map = _load_runner_map(args.runner_map)
 
     results = []
+    skipped_covered = 0
     for cfg in sorted(config_dir.rglob("*.yaml")):
         try:
             labels = _load_labels(cfg)
         except Exception as exc:  # noqa: BLE001
             print(f"WARNING: skipping {cfg} ({exc})", file=sys.stderr)
             continue
-        if _matches(labels, cfg, test_type):
+        if not _matches(labels, cfg, test_type):
+            continue
+        if _already_covered(labels, exclude_tiers):
+            skipped_covered += 1
+            continue
+        if True:
             rel = str(cfg.relative_to(config_dir))
             results.append(
                 {
@@ -232,6 +277,13 @@ def main() -> None:
                     "path": str(cfg),
                 }
             )
+
+    if skipped_covered:
+        print(
+            f"delta: skipped {skipped_covered} config(s) whose tiers are all already "
+            f"covered ({','.join(exclude_tiers)})",
+            file=sys.stderr,
+        )
 
     if not results:
         print(
