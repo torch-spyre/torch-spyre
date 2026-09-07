@@ -232,22 +232,6 @@ jobs:
             --pytorch-sha "${{ inputs.pytorch_sha }}" \
             --torch-spyre-sha "${{ github.sha }}"
 
-      # upstream HUD requires same check_run_id
-      # however check_run_id differs across jobs
-      # therefore we need to have both the callbacks
-      # under the same job.
-      # so moving this to final job.
-      # - name: Report CI started to pytorch/pytorch
-      #   # Only repository_dispatch (real PR-triggered CI) needs an
-      #   # in_progress ping -- pytorch/pytorch's CRCR only watches those
-      #   # runs live. Nightly (schedule) doesn't need one, and
-      #   # workflow_dispatch (manual/ad-hoc) is never relayed at all.
-      #   if: github.event_name == 'repository_dispatch'
-      #   continue-on-error: true
-      #   uses: pytorch/test-infra/.github/actions/cross-repo-ci-relay-callback@main
-      #   with:
-      #     status: in_progress
-      #     job-name: linux-x86_64 / pytorch / test
 
   # ---------------------------------------------------------------------------
   # Run every upstream-beta suite (as a per-suite matrix, with retry/stall-
@@ -291,6 +275,7 @@ jobs:
       # by the caller's own token -- push-pytorch-dispatch-to-clickhouse.yaml
       # must also grant `actions: write`.
       actions: write
+      id-token: write
     env:
       CLICKHOUSE_HOST: ${{ secrets.CLICKHOUSE_HOST_DEV }}
       CLICKHOUSE_PORT: ${{ secrets.CLICKHOUSE_PORT_DEV }}
