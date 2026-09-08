@@ -15,12 +15,11 @@
 
 """Inductor logging utilities using unified hierarchical configuration.
 
-This module provides the new hierarchical logger API and preserves
-backward-compatible helper functions used elsewhere in the codebase.
+This module provides the hierarchical logger API for Spyre Inductor
+components.
 """
 
 import logging
-import os
 
 from torch_spyre import logging_config
 
@@ -37,7 +36,7 @@ def _reinitialize():
     Called when _needs_reinit is True (set by tests to pick up changed
     environment variables between test cases).
     """
-    global _INDUCTOR_LOGGING_ENABLED, _needs_reinit
+    global _needs_reinit
     _loggers.clear()
     logging_config._initialized = False
     logging_config._config.clear()
@@ -45,7 +44,6 @@ def _reinitialize():
     logging_config._python_logging_configured = False
     logging_config.initialize()
     logging_config.configure_python_logging()
-    _INDUCTOR_LOGGING_ENABLED = _get_env_bool("SPYRE_INDUCTOR_LOG", False)
     _needs_reinit = False
 
 
@@ -91,29 +89,6 @@ def update_log_level(name: str, level: str):
 
     if full_name in _loggers:
         _loggers[full_name].setLevel(int(logging_config.get_log_level(full_name)))
-
-
-def _get_env_bool(var: str, default: bool) -> bool:
-    """Backward-compatible helper to parse boolean environment variables."""
-    return os.getenv(var, str(int(default))).lower() in ("1", "true", "yes")
-
-
-# Module-level cache for inductor logging enabled state
-_INDUCTOR_LOGGING_ENABLED: bool = _get_env_bool("SPYRE_INDUCTOR_LOG", False)
-
-
-def is_inductor_logging_enabled() -> bool:
-    """Check if inductor logging is enabled via environment variable.
-
-    This is a backward-compatible function that checks the SPYRE_INDUCTOR_LOG
-    environment variable. Returns True if logging is enabled, False otherwise.
-
-    Returns:
-        True if SPYRE_INDUCTOR_LOG is set to a truthy value, False otherwise
-    """
-    if _needs_reinit:
-        _reinitialize()
-    return _INDUCTOR_LOGGING_ENABLED
 
 
 # Convenience loggers for common components
