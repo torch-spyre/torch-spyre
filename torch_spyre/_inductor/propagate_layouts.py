@@ -215,14 +215,8 @@ def _compute_dim_order(stick_dim, size, coords, canonical: bool = False):
     a dim whose coordinate was simplified away, and because ``SpyreTensorLayout``
     fills device slots innermost-outward that relocated dim consumes a real slot
     and shifts H/W -- silently transposing the output's spatial axes relative to
-    the input's, so the pooling window is applied to the wrong axis.  Measured
-    2026-09-04: a 16x16 maxpool with ``kernel=(7,6) stride=(3,2)`` returned real
-    input elements from transposed windows, and pinning the canonical order fixes
-    it while leaving the mirror orientation (which already worked) unchanged.
+    the input's, so the pooling window is applied to the wrong axis.
 
-    Same defect and same remedy as ``_depthwise_conv_layouts`` on branch
-    ``conv1d-new``, which pins the canonical order for depthwise conv2d/conv1d
-    after an N==1 strided depthwise returned numbers off by up to 26.
     """
     if canonical:
         return [d for d in range(len(size)) if d != stick_dim] + [stick_dim]

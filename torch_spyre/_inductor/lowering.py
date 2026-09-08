@@ -770,15 +770,10 @@ def _pool2d_pair(value, default=None):
     return h, w
 
 
-# Value that will fill the explicitly-materialized max_pool2d pad halo.  See the
-# rationale on constants.FP16_MIN: it must be the most extreme *finite* fp16
-# value, because -inf mis-encodes to NaN and max(x, NaN) == NaN would poison the
-# entire reduction rather than only the padded lanes.
+# Value that will fill the explicitly-materialized max_pool2d pad halo.
 #
 # Currently referenced only from the commented-out halo call in
 # lower_max_pool2d_with_indices (padding is gated off there -- see that comment).
-# Kept because the *choice of value* is the subtle part and belongs next to its
-# rationale, not rediscovered when padding is re-enabled.
 _MAX_POOL_PAD_VALUE = FP16_MIN
 
 
@@ -789,8 +784,7 @@ def _max_pool2d_indices_are_used() -> bool:
     indices.  ``aten.max_pool2d_with_indices`` is nominally two-output even for a
     plain ``torch.max_pool2d`` call, but AOT's DCE drops the unused
     ``getitem(1)`` before Inductor lowers the graph -- so the surviving users are
-    an accurate signal of whether indices are really needed (verified: a
-    values-only call reaches lowering with only ``getitem(0)``).
+    an accurate signal of whether indices are really needed.
 
     Conservative on anything unexpected: if the node or its users cannot be
     inspected, report True so the op falls back rather than silently returning
@@ -825,10 +819,7 @@ def _lower_pool2d(
     """Build a windowed 2D pooling ``SpyreReduction`` for ``op``.
 
     Shared by ``lower_avg_pool2d`` (``avgpoolfwd``) and
-    ``lower_max_pool2d_with_indices`` (``maxpoolfwd``): both are the same
-    sliding-window single-input reduction over ``[kH, kW]``, differing only in
-    the opfunc string and in the constants they declare (avgpool adds
-    ``scaling_factor``, which codegen turns into ``nmap``).
+    ``lower_max_pool2d_with_indices`` (``maxpoolfwd``).
 
     ``padding`` must already be zero here -- callers that support padding
     materialize it into ``x`` first (see ``lower_max_pool2d_with_indices``),
@@ -866,16 +857,6 @@ def _lower_pool2d(
     # rather than fall back, because a silent wrong answer is what this guard
     # exists to prevent.
     #
-    # Verified 2026-09-04 to be independent of work division (identical wrong
-    # value at SENCORES 1/2/8/32).  N=1 is correct at every geometry, and N>=2 is
-    # correct whenever both spatial extents exceed 1 (e.g. 2x64x16x16 k4 s5 ->
-    # out 3x3 is bit-exact).
-    #
-    # NOTE: the previous "stride < kernel" rejection was REMOVED here.  The
-    # canonical-dim-order fix in propagate_layouts.py made overlapping windows
-    # correct -- k=(2,2)s=(1,1), k=(3,3)s=(1,1), k=(4,4)s=(2,2) and
-    # k=(5,5)s=(2,2) are all bit-exact under a ramp -- so that guard was
-    # rejecting geometries the hardware handles.
     # ``x.get_size()`` yields sympy Integers, so ``isinstance(N, int)`` is False
     # even for a static batch -- concretize instead, and treat a genuinely
     # symbolic batch as potentially > 1.
@@ -888,10 +869,6 @@ def _lower_pool2d(
     if (
         (H_out == 1 or W_out == 1)
         and (n_batch is None or n_batch > 1)
-        # Debug-only escape so this geometry's SDSC can still be dumped and
-        # diffed while the batch defect is open.  Scoped to this one guard (it no
-        # longer bypasses anything else) and it permits WRONG VALUES -- remove it
-        # with the guard once the defect is fixed.
         and os.environ.get("TORCH_SPYRE_POOL_UNSAFE") != "1"
     ):
         raise Unsupported(
@@ -937,10 +914,6 @@ def _lower_pool2d(
         reduction_ranges=[kH, kW],
         op_info={"constants": constants},
     )
-    # Realize so the pool becomes its own ComputedBuffer: codegen's
-    # kernel_store_reduction reads op_info (pool constants) off node.data.op_info,
-    # which only exists when the SpyreReduction is realized rather than fused into
-    # a consumer.
     result.realize()
     return result
 
@@ -1067,16 +1040,7 @@ def lower_max_pool2d_with_indices(
         # path, and max(x, NaN) == NaN would poison the whole reduction rather
         # than just the padded lanes.)
         #
-        # It is gated off because materializing that halo is not yet expressible:
-        # a Spyre pool sees C as the stick (innermost) dim, so its input is a
-        # physically-NHWC buffer viewed as NCHW, and constant_pad_nd on the H/W
-        # axes of that permuted view produces a stick expression the backend
-        # rejects ("Unexpected stick expression 9: expected Mod(var, 64), a bare
-        # variable, 0, or ...").  That is a constant_pad_nd limitation, not a pool
-        # one -- it reproduces with the pad alone and no pool in the graph.
-        # Raising here makes the graph fall back cleanly instead of failing later
-        # with that opaque stick error.  Re-enable the halo (drop this raise) once
-        # pad-on-permuted-view is supported.
+        # It is gated off because materializing that halo is not yet expressible.
         # The one line to restore when that is fixed:
         #   pooled_input = lower_constant_pad_nd(
         #       x, [pW, pW, pH, pH], _MAX_POOL_PAD_VALUE

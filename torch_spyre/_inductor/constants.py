@@ -203,17 +203,9 @@ CONV2D_LAYOUT_LABELS = ["OUTPUT", "INPUT", "KERNEL", "KERNEL_IDX"]
 
 # Most extreme *finite* fp16 values, used as max/min reduction identities.
 #
-# Deliberately not +-inf: encode_constant() (module.cpp ->
-# deeptools::FloatToFp16Bin) mis-encodes IEEE +-inf as a NaN bit pattern rather
-# than the fp16 infinity encoding (confirmed empirically: -inf round-trips to
-# NaN, not 0xFC00).  For a max reduction that is fatal rather than merely
-# lossy -- max(x, NaN) == NaN, so a single NaN-seeded lane poisons the whole
-# reduction result, not just that lane.  These finite extremes lose (FP16_MIN
-# under max) / win (FP16_MAX under min) against any real fp16 value while still
-# encoding correctly.
-#
 # Used by codegen for reduction padding masks (_get_mask_value) and by the
 # max_pool2d lowering to fill the explicitly-materialized pad halo.
+# See codegen/superdsc.py for more details
 FP16_MAX = 65504.0
 FP16_MIN = -65504.0
 
@@ -221,10 +213,6 @@ AVGPOOL2D_OP = "avgpoolfwd"
 MAXPOOL2D_OP = "maxpoolfwd"
 # Pool opfunc names, mirroring TOPK_OPS. Add minpool here as it lands so
 # _is_pool stays a single membership test rather than a growing chain of ==.
-# Membership in this set is what activates the whole shared pool path for an
-# opfunc: _is_pool / _align_pool_dim_labels / _avgpool_sdsc_fields / _get_op_func
-# in codegen, the ki/kj-unsplit guard, reduction_window_blocked_vars, and
-# _K_SPLIT_COMBINE_SUPPORTED in work division.
 POOL_OPS = {AVGPOOL2D_OP, MAXPOOL2D_OP}
 
 # Conv opfunc names. conv2d is a two-input reduction (activation + weight) with

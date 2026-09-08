@@ -1258,13 +1258,7 @@ def generate_sdsc(
         (stride < kernel): e.g. in=8, cores=6 gives 1 < kernel, so the ki loop
         has nothing to distribute.
 
-        Applies to every windowed op -- conv2d and the pools alike.  For a
-        non-overlapping window (stride == kernel) the window span and the plain
-        per-core division coincide, so this changed nothing for the stride==kernel
-        pool cases that already worked; it is what makes an *overlapping* pool
-        window (e.g. maxpool k=4 s=2) distributable at all.  Gating it to conv2d
-        was why such pools failed in the backend with
-        "[distributeElemArrToTemporalLoops] Not enough elements to distribute".
+        Applies to every windowed op -- conv2d and the pools alike.
         """
         ps = sdsc_spec.padding_sizes.get(str(dim)) if is_input else None
         if ps is not None and "windowDim_" in ps:
@@ -1369,11 +1363,8 @@ def generate_sdsc(
                     for dim, num_wk_slices in sdsc_spec.work_slices.items()
                     if str(dim) not in sdsc_spec.window_dims
                 },
-                # Window dims (ki/kj) are reduction dims, not work-division dims:
-                # they are never split across cores and the reference SDSCs from
-                # the SendNN toolchain omit them from both work-slice maps.  The
-                # internal core_id_to_wk_slice keeps them (tensor codegen indexes
-                # it by every iteration-space dim), so filter only on emit.
+                # Window dims (ki/kj) are not real dims of any tensor for pool
+                # operations and hence should not be emitted
                 "coreIdToWkSlice_": {
                     core: {
                         dim: slc

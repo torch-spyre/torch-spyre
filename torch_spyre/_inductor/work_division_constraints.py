@@ -221,9 +221,7 @@ def conv_spatial_blocked_vars(ctx: WorkDivConstraintContext) -> ConstraintResult
         # Pools record their geometry under "constants", not "conv_params", so
         # they never reached this block -- yet the same reasoning applies: a
         # strided pool's spatial split produces the same incorrect per-core
-        # addressing.  The SendNN reference for a split strided pool
-        # (maxpool_sltk, 1x64x16x16 k4 s5) splits only the OUTER spatial dim and
-        # leaves the innermost one whole (numWkSlicesPerDim_ i=3, j=1).
+        # addressing.
         pool_params = op_info.get("constants")
         if not isinstance(pool_params, dict) or "stride_w" not in pool_params:
             return ConstraintResult()
@@ -241,10 +239,7 @@ def conv_spatial_blocked_vars(ctx: WorkDivConstraintContext) -> ConstraintResult
 
     write = typing.cast(MemoryDep, next(iter(op_read_writes(ctx.op).writes)))
     # Conv blocks both output spatial dims; a strided pool only needs the
-    # INNERMOST one blocked.  The SendNN reference for a split strided pool
-    # (maxpool_sltk, 1x64x16x16 k4 s5) splits the outer spatial dim 3 ways and
-    # keeps the inner one whole -- numWkSlicesPerDim_ i=3, j=1 -- so blocking
-    # both would leave work division on the table for no correctness gain.
+    # INNERMOST one blocked.
     spatial = list(write.ranges)[-2:] if is_conv_op else list(write.ranges)[-1:]
     blocked = {
         sym
