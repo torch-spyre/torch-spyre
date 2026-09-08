@@ -156,6 +156,74 @@ class _ScatterScenarios:
         ).to("cpu")
         torch.testing.assert_close(actual, expected)
 
+    def test_index_copy_transposed_source(self):
+        """Scatter a computed ``[B, L, H, D] -> [B, H, L, D]`` view.
+
+        RoPE produces K in this form before writing it into a pinned KV cache.
+        The cache is longer than K, so an inserted restickify must retain K's
+        source geometry rather than inheriting the destination extent.  The
+        scatter must not require an explicit ``contiguous()`` in the model.
+        """
+        Bn, H, L, D, M = 1, 8, 320, 256, 384
+        dtype = torch.bfloat16
+        generator = torch.Generator().manual_seed(0)
+        src = torch.randn(Bn, L, H, D, dtype=dtype, generator=generator)
+        freqs = torch.randn(Bn, L, 2, 2, D // 2, dtype=dtype, generator=generator)
+        dst = torch.zeros(Bn, H, M, D, dtype=dtype)
+        cache_layout = SpyreTensorLayout(
+            device_size=[
+                M,
+                H,
+                D // get_elem_in_stick(dtype),
+                Bn,
+                get_elem_in_stick(dtype),
+            ],
+            stride_map=[D, M * D, get_elem_in_stick(dtype), H * M * D, 1],
+            device_dtype=get_device_dtype(dtype),
+        )
+
+        def apply_rope(src, freqs):
+            source = src.transpose(1, 2)
+            source = source.transpose(1, 2).reshape(Bn, L, H, 2, D // 2)
+            return (
+                freqs[:, :, None, :, :, :]
+                .mul(source.unsqueeze(-3))
+                .sum(4, keepdim=True)
+                .flatten(3)
+                .transpose(1, 2)
+            )
+
+        def kernel(dst, src, freqs, idx):
+            source = apply_rope(src, freqs)
+            dst.index_copy_(2, idx, source)
+            return dst
+
+        def kernel_with_contiguous_source(dst, src, freqs, idx):
+            source = apply_rope(src, freqs).contiguous()
+            dst.index_copy_(2, idx, source)
+            return dst
+
+        spyre_src = src.to("spyre")
+        spyre_freqs = freqs.to("spyre")
+        idx = torch.arange(L, dtype=torch.int64)
+        expected = kernel(dst.clone(), src, freqs, idx)
+        actual = torch.compile(kernel, dynamic=False)(
+            dst.to("spyre", device_layout=cache_layout),
+            spyre_src,
+            spyre_freqs,
+            idx.to("spyre"),
+        ).to("cpu")
+        contiguous_actual = torch.compile(kernel_with_contiguous_source, dynamic=False)(
+            dst.to("spyre", device_layout=cache_layout),
+            spyre_src,
+            spyre_freqs,
+            idx.to("spyre"),
+        ).to("cpu")
+        torch.testing.assert_close(actual, contiguous_actual)
+        # CPU and Spyre may accumulate the two-term bf16 RoPE reduction in a
+        # different order; layout corruption is orders of magnitude larger.
+        torch.testing.assert_close(actual, expected, atol=0.03, rtol=0.02)
+
     def test_index_put_p7(self):
         """y[idx] = src -- 1-D scatter with an odd (non-power-of-2) P=7."""
         M, N, P = 16, 1024, 7

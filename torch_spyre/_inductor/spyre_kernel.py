@@ -36,8 +36,6 @@ from torch._inductor.virtualized import V
 from .constants import (
     SPYRE_FP32_OPS,
     SPYRE_INT32_OPS,
-    BATCH_MATMUL_OP,
-    BATCH_MATMUL_FP8_OP,
     CONV_OPS,
     DEPTHWISE_CONV_REDUCTION_OPS,
     IDENTITY_OP,
@@ -46,7 +44,6 @@ from .constants import (
     RESTICKIFY_OP,
     SEGMENT_OFFSETS,
     TWO_INPUT_REDUCTION_OPS,
-    SHARED_WEIGHT_UNIT_BMM_INFO_KEY,
 )
 from . import config as _spyre_config
 from .core_mapping import (
@@ -59,15 +56,15 @@ from .ir import FixedTiledLayout
 from .scratchpad.lx_relayout import work_division_from_view
 from .pass_utils import (
     AlignmentAccess,
+    build_operation_alignment_inputs,
     concretize_expr,
     compute_symbolic_bounds,
     finite_upper_or_none,
     iteration_space,
+    iteration_space_with_splits,
     indirect_access_subs_from_kernel,
     is_restickify_coords,
     alignment_coordinates,
-    build_operation_alignment_inputs,
-    iteration_space_with_splits,
 )
 from .views import (
     AlignmentInputs,
@@ -103,76 +100,6 @@ class TensorAccess(RValue):
     name: str
     index: sympy.Expr
     layout: FixedTiledLayout
-
-
-def _preserve_shared_weight_unit_bmm_dim(
-    op: str,
-    it_space: dict[sympy.Symbol, tuple[sympy.Expr, int]],
-    args: Sequence[TensorArg],
-    op_info: dict[str, Any],
-) -> dict[sympy.Symbol, tuple[sympy.Expr, int]]:
-    # TensorArg layout is normalized in-place below to match the surrounding
-    # OpSpec construction helpers.
-    if SHARED_WEIGHT_UNIT_BMM_INFO_KEY not in op_info:
-        return it_space
-    if op not in [BATCH_MATMUL_OP, BATCH_MATMUL_FP8_OP]:
-        return it_space
-    if len(it_space) != 3 or len(args) < 3:
-        return it_space
-    info = op_info.get(SHARED_WEIGHT_UNIT_BMM_INFO_KEY)
-    if not isinstance(info, dict) or info.get("batch_dim") != 0:
-        return it_space
-
-    unit_sym = sympy.Symbol("_spyre_bmm_unit")
-    suffix = 0
-    while unit_sym in it_space:
-        suffix += 1
-        unit_sym = sympy.Symbol(f"_spyre_bmm_unit_{suffix}")
-
-    def _unit_indices(arg: TensorArg) -> list[int]:
-        return [
-            idx
-            for idx, (size, coord) in enumerate(
-                zip(arg.device_size[:-1], arg.device_coordinates[:-1])
-            )
-            if concretize_expr(size) == 1 and coord == 0
-        ]
-
-    target_args = (args[0], args[-1])
-    # The unit-BMM marker is only valid for plain rank-3 BMMs after layout
-    # construction. If a target tensor still carries extra physical axes, such
-    # as attention heads from SDPA, rewriting one axis into the BMM iteration
-    # space can produce an illegal SDSC layout.
-    if any(len(arg.device_size) > 4 for arg in target_args):
-        return it_space
-    unit_idxs_by_arg = [_unit_indices(arg) for arg in target_args]
-
-    if all(len(unit_idxs) == 0 for unit_idxs in unit_idxs_by_arg):
-        for arg in target_args:
-            if len(arg.device_size) < 2:
-                return it_space
-            insert_at = len(arg.device_size) - 1
-            arg.device_size.insert(insert_at, 1)
-            arg.device_coordinates.insert(insert_at, sympy.S.Zero)
-        unit_idxs_by_arg = [_unit_indices(arg) for arg in target_args]
-
-    if not all(len(unit_idxs) == 1 for unit_idxs in unit_idxs_by_arg):
-        return it_space
-
-    rewrite_targets = [
-        (arg, unit_idxs[0]) for arg, unit_idxs in zip(target_args, unit_idxs_by_arg)
-    ]
-
-    for arg, unit_idx in rewrite_targets:
-        arg.device_coordinates[unit_idx] = unit_sym
-        nonstick = list(range(len(arg.device_size) - 1))
-        order = [unit_idx] + [i for i in reversed(nonstick) if i != unit_idx]
-        order.append(len(arg.device_size) - 1)
-        arg.device_size[:] = [arg.device_size[i] for i in order]
-        arg.device_coordinates[:] = [arg.device_coordinates[i] for i in order]
-
-    logger.info("Preserving shared-weight unit BMM dim %s", unit_sym)
-    return {unit_sym: (sympy.S.One, 1), **it_space}
 
 
 @dataclass
@@ -720,7 +647,25 @@ class SpyreKernel(Kernel[CSEVariable]):
                 for dep in ir_node.get_read_writes().reads
                 if isinstance(dep, MemoryDep)
             ]
-            matching_idx = [i for i, dep in enumerate(read_deps) if dep.name == name]
+            # `name` has already been resolved through mutation_real_name by
+            # load() (e.g. coarse_tile_copy_buf19's dep is named "buf19" --
+            # tiled_op's own output identity -- but load() passes in "buf2",
+            # buf19's MutationLayoutSHOULDREMOVE target, since that's the
+            # actual underlying buffer). dep.name is the pre-resolution
+            # identity, so it must go through the same resolution before
+            # comparing, or a dep on a mutation alias never matches its own
+            # resolved name and this falls through to "no advance" every
+            # time (issue: flash-v2's B-tiled denominator/output copy-out
+            # reads silently pinned to tile 0).
+            scheduler = getattr(V.graph, "scheduler", None)
+            mutation_real_name = (
+                scheduler.mutation_real_name if scheduler is not None else {}
+            )
+            matching_idx = [
+                i
+                for i, dep in enumerate(read_deps)
+                if mutation_real_name.get(dep.name, dep.name) == name
+            ]
             if not matching_idx:
                 return None
             # Positional tie-break: if this buffer is read more than once,
@@ -900,9 +845,6 @@ class SpyreKernel(Kernel[CSEVariable]):
         ir_node = self.current_node.node  # ComputedBuffer
         it_space_extended = iteration_space_with_splits(
             ir_node, self.current_node.read_writes, it_space
-        )
-        it_space_extended = _preserve_shared_weight_unit_bmm_dim(
-            op, it_space_extended, args, op_info
         )
         alignment_inputs = build_operation_alignment_inputs(
             it_space,

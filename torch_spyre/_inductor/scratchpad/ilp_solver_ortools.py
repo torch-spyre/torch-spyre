@@ -640,7 +640,7 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         buffers: Sequence[LifetimeBoundBuffer],
         size: int,
         alignment: int = 128,
-        time_limit_seconds: float = 600.0,
+        time_limit_seconds: float = 120.0,
         bottom_justify: bool = True,
     ) -> None:
         if cp_model is None:
