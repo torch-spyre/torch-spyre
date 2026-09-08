@@ -65,8 +65,18 @@ RegistryState& registryState() {
 // name-base → sdsc_bundle_dir_prefix registry, populated unconditionally
 // at prepare_kernel time so the activity handler can emit sdsc_bundle_dir_prefix
 // even when no provenance key is present on the event.
+//
+// No mutex is needed today: all writes happen serially on the main Python
+// thread during the compile phase (sdsc() is synchronous, not pool-submitted),
+// and all reads — from the AIUPTI activity handler and the lookup_bundle_dir_prefix
+// Python binding — happen strictly after every write is complete. The Python GIL
+// additionally serialises any concurrent Python-side caller against an
+// in-progress write.
+//
+// NOTE: If torch-spyre moves to concurrent SDSC bundle generation or to concurrent
+// activity-buffer draining then the mutex will need to be added.
 struct BundleDirPrefixRegistry {
-  std::shared_mutex mutex;
+  // std::shared_mutex mutex;
   std::unordered_map<std::string, std::string> entries;
 };
 
@@ -139,15 +149,17 @@ std::string activityNameBase(const std::string& activity_name) {
 }
 
 void registerBundleDirPrefix(const std::string& name_base,
-                              std::string sdsc_bundle_dir_prefix) {
+                               std::string sdsc_bundle_dir_prefix) {
   auto& reg = bundleDirPrefixRegistry();
-  std::unique_lock<std::shared_mutex> lock(reg.mutex);
+  // No lock needed; see BundleDirPrefixRegistry for the full rationale.
+  // std::unique_lock<std::shared_mutex> lock(reg.mutex);
   reg.entries.emplace(name_base, std::move(sdsc_bundle_dir_prefix));
 }
 
 std::string lookupBundleDirPrefix(const std::string& name_base) {
   auto& reg = bundleDirPrefixRegistry();
-  std::shared_lock<std::shared_mutex> lock(reg.mutex);
+  // No lock needed; see BundleDirPrefixRegistry for the full rationale.
+  // std::shared_lock<std::shared_mutex> lock(reg.mutex);
   const auto it = reg.entries.find(name_base);
   return it != reg.entries.end() ? it->second : std::string{};
 }
