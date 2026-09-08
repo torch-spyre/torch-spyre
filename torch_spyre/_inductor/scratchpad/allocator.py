@@ -304,7 +304,7 @@ class ScratchpadAllocator:
                     "__name__",
                     type(self.layout_planning).__name__,
                 )
-                logger.warning(
+                logger.debug(
                     "LX relayout is not supported by %s; continuing without relayout",
                     solver_name,
                 )
@@ -2444,7 +2444,7 @@ def select_allocator() -> ScratchpadAllocator:
 
     if config.co_optimizing_lx_planning:
         if config.lx_planner_relayout:
-            logger.warning(
+            logger.debug(
                 "LX relayout is not supported by CoOptimizingAllocator; "
                 "continuing without relayout"
             )
