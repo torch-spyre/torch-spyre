@@ -24,7 +24,7 @@ from typing import Any, Callable
 
 from sympy import Expr, Integer, Mod, Symbol, floor, sympify
 
-from .constants import BYTES_PER_STICK
+from torch_spyre._C import DataFormats, get_device_size_in_bytes
 from .op_spec import TensorWorkDivision
 
 
@@ -661,7 +661,7 @@ def derive_operation_mapping(
 
 def partition_physical_span_bytes(
     device_size: Sequence[int],
-    elems_per_stick: int,
+    device_dtype: DataFormats,
     split_by_device_dim: Mapping[int, int],
 ) -> int:
     """Bound a standard-layout partition, retaining physical gaps between rows.
@@ -675,6 +675,7 @@ def partition_physical_span_bytes(
 
     if not device_size or any(extent <= 0 for extent in device_size):
         raise ValueError("device extents must be positive")
+    elems_per_stick = device_dtype.elems_per_stick()
     if elems_per_stick <= 0:
         raise ValueError("elems_per_stick must be positive")
     for dim, split in split_by_device_dim.items():
@@ -692,7 +693,7 @@ def partition_physical_span_bytes(
         slice_extent = (extent + split - 1) // split
         span_sticks += (slice_extent - 1) * stride_sticks
         stride_sticks *= extent
-    return span_sticks * BYTES_PER_STICK
+    return get_device_size_in_bytes([span_sticks, elems_per_stick], device_dtype)
 
 
 def core_mappings_equal(

@@ -302,7 +302,7 @@ def partition_footprint(layout: FixedTiledLayout, view: PerCoreView) -> int:
         raise ValueError("relayout footprint requires standard element arrangement")
     return partition_physical_span_bytes(
         tuple(int(size) for size in device_layout.device_size),
-        int(device_layout.elems_per_stick()),
+        device_layout.device_dtype,
         dict(view.work_slice_dims),
     )
 
