@@ -455,14 +455,14 @@ def v2_benchmark_id(name: str, tags, disc=None) -> str:
 
 
 def v2_benchmark_tables_present(client) -> bool:
-    return _table_exists(client, "benchmarks") and _table_exists(client, "benchmark_results")
+    return _table_exists(client, "benchmarks") and _table_exists(client, "benchmark_runs")
 
 
 def v2_benchmarks_already_ingested(client, run_uid: str) -> bool:
-    """benchmark_results is a plain MergeTree with no dedup key, so a re-ingest
+    """benchmark_runs is a plain MergeTree with no dedup key, so a re-ingest
     doubles every measurement behind an average."""
     rows = client.query(
-        "SELECT count() FROM benchmark_results WHERE run_uid = {run_uid:UUID}",
+        "SELECT count() FROM benchmark_runs WHERE run_uid = {run_uid:UUID}",
         parameters={"run_uid": run_uid},
     ).result_rows
     return bool(rows and rows[0][0] > 0)
@@ -491,7 +491,7 @@ def _v2_bench_backend(rec: dict) -> str:
 
 
 def insert_benchmarks_v2(client, run_uid: str, records: list) -> int:
-    """Write benchmarks (identity) + benchmark_results (measurements) for one run.
+    """Write benchmarks (identity) + benchmark_runs (measurements) for one run.
 
     Dropped from v2 deliberately: regression_status and ratio (verdicts with no
     recorded baseline -- derived in v_benchmark_regression / v_benchmark_backend_compare
@@ -539,7 +539,7 @@ def insert_benchmarks_v2(client, run_uid: str, records: list) -> int:
         column_names=["benchmark_id", "name", "tags", "props"],
     )
     client.insert(
-        "benchmark_results",
+        "benchmark_runs",
         fact_rows,
         column_names=[
             "run_uid",
@@ -1440,7 +1440,7 @@ def main():
                     print(f"  v2: already ingested run_uid={_v2_uid} — skipping")
                 else:
                     _n = insert_benchmarks_v2(client, _v2_uid, kernels)
-                    print(f"  v2: {_n} benchmark_results under run_uid={_v2_uid}")
+                    print(f"  v2: {_n} benchmark_runs under run_uid={_v2_uid}")
 
             total_kernels += len(kernels)
             print(f"  Inserted {len(kernels)} kernel rows")
@@ -1498,7 +1498,7 @@ def main():
                     print(f"  v2: already ingested run_uid={_v2_uid} — skipping")
                 else:
                     _n = insert_benchmarks_v2(client, _v2_uid, benchmarks)
-                    print(f"  v2: {_n} benchmark_results under run_uid={_v2_uid}")
+                    print(f"  v2: {_n} benchmark_runs under run_uid={_v2_uid}")
 
             total_benchmarks += len(benchmarks)
             print(f"  Inserted {len(benchmarks)} benchmark rows")
