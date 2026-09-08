@@ -17,7 +17,29 @@ import pytest
 import torch
 import torch._dynamo as dynamo
 
+from torch_spyre._inductor.dtype_ops import DtypeOpTable
+
 from utils_inductor import DEVICE, cached_randn, compare_with_cpu
+
+
+def _dtype_name(dt):
+    return str(dt).split(".")[-1]
+
+
+_DTYPE_CONVERSION_PAIRS = [
+    pytest.param(src, dst, id=f"{_dtype_name(src)}-{_dtype_name(dst)}")
+    for src, dst in DtypeOpTable.get_dtype_pairs()
+    if src not in (torch.float8_e4m3fn, torch.int32)
+    and dst not in (torch.float8_e4m3fn, torch.int32)
+]
+
+# FIXME: Remove these once the issue with CPU vs Spyre dtype mismatch error is fixed
+_DTYPE_PROMOTION_XFAIL = [
+    (torch.bfloat16, torch.float16),
+    (torch.float32, torch.float16),
+    (torch.float16, torch.bfloat16),
+    (torch.float32, torch.bfloat16),
+]
 
 
 def _compare_modes(execution_mode, fn, *args, atol=0.1, rtol=0.1):
@@ -372,6 +394,29 @@ class TestDatatypeScalarOperations:
         x = cached_randn((10, 10), dtype=torch.float32) * 1e-10
         # For large numbers, atol must be large, but rtol is the real gate
         _compare_modes(execution_mode, large_scalar_mul, x, atol=1e25, rtol=1e-3)
+
+    @pytest.mark.parametrize("src_dtype,dst_dtype", _DTYPE_CONVERSION_PAIRS)
+    def test_dtype_conversion(self, execution_mode, src_dtype, dst_dtype):
+        """Type conversions with scalars"""
+
+        def convert_scalar(s):
+            return s.to(dst_dtype)
+
+        s = torch.tensor(2.0, dtype=src_dtype)
+        _compare_modes(execution_mode, convert_scalar, s, atol=1e-3, rtol=1e-3)
+
+    @pytest.mark.parametrize("src_dtype,dst_dtype", _DTYPE_CONVERSION_PAIRS)
+    def test_dtype_promotion(self, execution_mode, src_dtype, dst_dtype):
+        """Type promotion with scalars"""
+        if (src_dtype, dst_dtype) in _DTYPE_PROMOTION_XFAIL:
+            pytest.xfail(reason="Spyre vs CPU dtype mismatch due to type promotion")
+
+        def promote_scalar(x, s):
+            return x + s
+
+        x = torch.ones(64, dtype=dst_dtype)
+        s = torch.tensor(2.0, dtype=src_dtype)
+        _compare_modes(execution_mode, promote_scalar, x, s, atol=1e-3, rtol=1e-3)
 
     @torch._dynamo.config.patch(assume_static_by_default=False)
     def test_dtype_conversion_with_symbolic_dimensions(self, execution_mode):
