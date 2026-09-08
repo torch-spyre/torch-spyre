@@ -34,7 +34,13 @@ hbm_pool_planning: bool = os.getenv("HBM_POOL_PLANNING", "1").lower() in (
 # graph still has LX-resident across such a call survives whatever the
 # opaque call's own kernel does to LX. Defaults on; set
 # ENABLE_LX_CONTEXT_SWITCHING=0 to disable for debugging/bisection.
-enable_lx_context_switching: bool = _get_env_bool("ENABLE_LX_CONTEXT_SWITCHING", True)
+enable_lx_context_switching: bool = os.getenv(
+    "ENABLE_LX_CONTEXT_SWITCHING", "1"
+).lower() in (
+    "1",
+    "true",
+    "yes",
+)
 
 # Select who allocates the HBM pool for an SDSC bundle's intermediates:
 # False (default) has the backend self-allocate via
