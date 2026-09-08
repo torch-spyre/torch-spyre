@@ -179,79 +179,79 @@ inline std::string runtimeCbidName(AIUpti_runtime_api_trace_cbid cbid) {
     // name, so the label shown to the user comes from here. A cbid missing from
     // this switch renders as "Unknown CBID <n>" rather than failing.
     case AIUPTI_RUNTIME_TRACE_CBID_COLL_ALLREDUCE:
-      return "aiuCollAllreduce";
+      return "aiuCommsCollAllreduce";
     case AIUPTI_RUNTIME_TRACE_CBID_COLL_ALLGATHER:
-      return "aiuCollAllgather";
+      return "aiuCommsCollAllgather";
     case AIUPTI_RUNTIME_TRACE_CBID_COLL_GATHER:
-      return "aiuCollGather";
+      return "aiuCommsCollGather";
     case AIUPTI_RUNTIME_TRACE_CBID_COLL_GATHERV:
-      return "aiuCollGatherv";
+      return "aiuCommsCollGatherv";
     case AIUPTI_RUNTIME_TRACE_CBID_COLL_REDUCE:
-      return "aiuCollReduce";
+      return "aiuCommsCollReduce";
     case AIUPTI_RUNTIME_TRACE_CBID_COLL_BROADCAST:
-      return "aiuCollBroadcast";
+      return "aiuCommsCollBroadcast";
     case AIUPTI_RUNTIME_TRACE_CBID_COLL_BARRIER:
-      return "aiuCollBarrier";
+      return "aiuCommsCollBarrier";
     case AIUPTI_RUNTIME_TRACE_CBID_WORK_SCHED_START:
-      return "aiuWorkScheduleStart";
+      return "aiuCommsWorkSchedStart";
     case AIUPTI_RUNTIME_TRACE_CBID_WORK_SCHED_WAIT:
-      return "aiuWorkScheduleWait";
+      return "aiuCommsWorkSchedWait";
     case AIUPTI_RUNTIME_TRACE_CBID_COLL_ALLREDUCE_SETUP:
-      return "aiuCollAllreduceSetup";
+      return "aiuCommsCollAllreduceSetup";
     case AIUPTI_RUNTIME_TRACE_CBID_COLL_ALLGATHER_SETUP:
-      return "aiuCollAllgatherSetup";
+      return "aiuCommsCollAllgatherSetup";
     case AIUPTI_RUNTIME_TRACE_CBID_COLL_GATHER_SETUP:
-      return "aiuCollGatherSetup";
+      return "aiuCommsCollGatherSetup";
     case AIUPTI_RUNTIME_TRACE_CBID_COLL_GATHERV_SETUP:
-      return "aiuCollGathervSetup";
+      return "aiuCommsCollGathervSetup";
     case AIUPTI_RUNTIME_TRACE_CBID_COLL_REDUCE_SETUP:
-      return "aiuCollReduceSetup";
+      return "aiuCommsCollReduceSetup";
     case AIUPTI_RUNTIME_TRACE_CBID_COLL_BROADCAST_SETUP:
-      return "aiuCollBroadcastSetup";
+      return "aiuCommsCollBroadcastSetup";
     case AIUPTI_RUNTIME_TRACE_CBID_WORK_SCHED_PHASE_RECORDING:
-      return "aiuWorkSchedulePhaseRecording";
+      return "aiuCommsWorkSchedPhaseRecord";
     case AIUPTI_RUNTIME_TRACE_CBID_WORK_SCHED_PHASE_WIREUP:
-      return "aiuWorkSchedulePhaseWireup";
+      return "aiuCommsWorkSchedPhaseWireup";
     case AIUPTI_RUNTIME_TRACE_CBID_WORK_SCHED_MSG_INFO_MGR:
-      return "aiuWorkScheduleMsgInfoMgr";
+      return "aiuCommsWorkSchedMsgInfoMgr";
     case AIUPTI_RUNTIME_TRACE_CBID_WORK_SCHED_HDMA_RT_MGR:
-      return "aiuWorkScheduleHdmaRtMgr";
+      return "aiuCommsWorkSchedHdmaRtMgr";
     case AIUPTI_RUNTIME_TRACE_CBID_WORK_SCHED_PHASE_LAUNCH:
-      return "aiuWorkSchedulePhaseLaunch";
+      return "aiuCommsWorkSchedPhaseLaunch";
     case AIUPTI_RUNTIME_TRACE_CBID_OP_SYNCHRONIZE:
-      return "aiuOpSynchronize";
+      return "aiuCommsOpSync";
     case AIUPTI_RUNTIME_TRACE_CBID_OP_D2H_TRANSFER:
-      return "aiuOpD2HTransfer";
+      return "aiuCommsOpD2HXfer";
     case AIUPTI_RUNTIME_TRACE_CBID_OP_H2D_TRANSFER:
-      return "aiuOpH2DTransfer";
+      return "aiuCommsOpH2DXfer";
     case AIUPTI_RUNTIME_TRACE_CBID_OP_SEND_DATA:
-      return "aiuOpSendData";
+      return "aiuCommsOpSendData";
     case AIUPTI_RUNTIME_TRACE_CBID_OP_MULTICAST_SEND_DATA:
-      return "aiuOpMulticastSendData";
+      return "aiuCommsOpMcastSendData";
     case AIUPTI_RUNTIME_TRACE_CBID_OP_RECV_DATA:
-      return "aiuOpRecvData";
+      return "aiuCommsOpRecvData";
     case AIUPTI_RUNTIME_TRACE_CBID_OP_BROADCAST_DATA:
-      return "aiuOpBroadcastData";
+      return "aiuCommsOpBcastData";
     case AIUPTI_RUNTIME_TRACE_CBID_OP_GATHER_DATA:
-      return "aiuOpGatherData";
+      return "aiuCommsOpGatherData";
     case AIUPTI_RUNTIME_TRACE_CBID_OP_ALLGATHER_DATA:
-      return "aiuOpAllgatherData";
+      return "aiuCommsOpAllgatherData";
     case AIUPTI_RUNTIME_TRACE_CBID_OP_BINARY_COMPUTE:
-      return "aiuOpBinaryCompute";
+      return "aiuCommsOpBinaryComp";
     case AIUPTI_RUNTIME_TRACE_CBID_OP_COPY:
-      return "aiuOpCopy";
+      return "aiuCommsOpCopy";
     case AIUPTI_RUNTIME_TRACE_CBID_BUNDLE_GENERATE:
-      return "aiuBundleGenerate";
+      return "aiuCommsBundleGen";
     case AIUPTI_RUNTIME_TRACE_CBID_ARTIFACT_LOAD_TO_DEVICE:
-      return "aiuArtifactLoadToDevice";
+      return "aiuCommsArtifactLoad";
     case AIUPTI_RUNTIME_TRACE_CBID_ARTIFACT_LAUNCH_COMPUTE_OP:
-      return "aiuArtifactLaunchComputeOp";
+      return "aiuCommsArtifactLaunchOp";
     case AIUPTI_RUNTIME_TRACE_CBID_COST_ESTIMATE:
-      return "aiuCostEstimate";
+      return "aiuCommsCostEst";
     case AIUPTI_RUNTIME_TRACE_CBID_BENCH_PAIRWISE:
-      return "aiuBenchPairwise";
+      return "aiuCommsBenchPairwise";
     case AIUPTI_RUNTIME_TRACE_CBID_BENCH_ALLREDUCE:
-      return "aiuBenchAllreduce";
+      return "aiuCommsBenchAllreduce";
     default:
       break;
   }
