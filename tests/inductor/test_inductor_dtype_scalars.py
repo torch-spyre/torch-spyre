@@ -699,10 +699,24 @@ class TestNegativeScalarOperations:
     def test_requires_grad_scalar_operation(self, execution_mode):
         """requires_grad preserved on forward."""
 
+        # torch.compile + requires_grad traces backward; autograd then calls
+        # getStream on every index where hasPrimaryContext is true. Spyre
+        # reports a primary context on every visible card, so a serial
+        # process with device_count() > 1 dies in initializeStreamPool (#3599).
+        # pytest.xfail() here stops the body (YAML xfail would still run it).
+        # --parallel pins one card per worker, so this gate does not fire there.
+        if execution_mode == "compiled" and torch.spyre.device_count() > 1:
+            pytest.xfail(
+                "torch.compile + requires_grad hits in-process multi-device "
+                "stream init; Spyre allows one device per process (see #3443/#3599)"
+            )
+
         def grad_mul(x):
             return x * 0.125
 
-        x = cached_randn((10, 10))
+        # cached_randn is lru_cached; clone so requires_grad does not leak
+        # into later tests that reuse the same cache key (e.g. chained mul).
+        x = cached_randn((10, 10)).clone()
         x.requires_grad = True
         result = _run_spyre(execution_mode, grad_mul, x)
         assert result.shape == x.shape
