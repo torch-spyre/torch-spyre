@@ -1110,6 +1110,7 @@ def test_kernel_time_overlap(tmp_path):
 def _find_duplicate_kernel_start_timestamps(events):
     """Return complete Spyre kernel events and duplicate start timestamp groups."""
     kernel_events = []
+    # Group by stream and timestamp so matching timestamps on different streams are allowed.
     timestamp_groups = {}
 
     for event in events:
