@@ -66,12 +66,12 @@ RegistryState& registryState() {
 // at prepare_kernel time so the activity handler can emit sdsc_bundle_dir_prefix
 // even when no provenance key is present on the event.
 //
-// No mutex is needed today: all writes happen serially on the main Python
-// thread during the compile phase (sdsc() is synchronous, not pool-submitted),
-// and all reads — from the AIUPTI activity handler and the lookup_bundle_dir_prefix
-// Python binding — happen strictly after every write is complete. The Python GIL
-// additionally serialises any concurrent Python-side caller against an
-// in-progress write.
+// No mutex is needed today: all writes happen serially on the torch-spyre main
+// thread during the compile phase (async_compile.sdsc() executes synchronously
+// on the main thread), and all reads from the AIUPTI activity handler and the
+// lookup_bundle_dir_prefix Python binding — happen strictly after every write
+// is complete. The Python GIL additionally serialises any concurrent Python-side
+// caller against an in-progress write.
 //
 // NOTE: If torch-spyre moves to concurrent SDSC bundle generation or to concurrent
 // activity-buffer draining then the mutex will need to be added.

@@ -63,7 +63,7 @@ class SpyreSDSCKernelRunner:
         code_dir: str,
         kernel_provenance: KernelProvenanceDescriptor | None = None,
         symbol_kinds: list[SymbolKind] | None = None,
-        sdsc_bundle_dir_prefix: str = None,
+        sdsc_bundle_dir_prefix: str | None = None,
     ):
         self.kernel_name = name
         self.code_dir = code_dir

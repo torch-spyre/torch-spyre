@@ -122,7 +122,7 @@ def _check_backend_compiler_on_path() -> None:
         )
 
 
-def get_output_dir(kernel_name: str, sdsc_bundle_dir_prefix: str = None):
+def get_output_dir(kernel_name: str, sdsc_bundle_dir_prefix: str | None = None):
     spyre_dir = os.path.join(cache_dir(), "inductor-spyre")
     os.makedirs(spyre_dir, exist_ok=True)
     safe_name = _safe_kernel_name(kernel_name)
@@ -650,7 +650,12 @@ class SpyreAsyncCompile(AsyncCompile):
                 )
                 raise
 
-        return SpyreSDSCKernelRunner(kernel_name, output_dir, sdsc_bundle_dir_prefix)
+        return SpyreSDSCKernelRunner(
+            kernel_name,
+            output_dir,
+            kernel_provenance=None,
+            sdsc_bundle_dir_prefix=sdsc_bundle_dir_prefix
+        )
 
     def wait(self, scope: dict[str, Any]) -> None:
         try:
