@@ -11,7 +11,7 @@ different artifact_id and cannot match. There is no way for these results to bel
 to different bytes than the run about to execute.
 
 The product repo does not know its own artifact_id -- the orchestrator writes that on
-artifact_results, keyed by run_uid -- so the artifact is reached the other way round:
+artifact_results, keyed by run_id -- so the artifact is reached the other way round:
 --commit-sha resolves the artifacts whose runs carry this sha, and coverage is read
 for those. A commit maps to several artifacts (one per component/arch), so the lookup
 is scoped by arch and requires the run to have actually reported.
@@ -49,14 +49,14 @@ TIER_TAG_PREFIX = "testtype__"
 
 # Coverage for the artifacts built from this commit, on this arch. Joined through
 # artifacts.sources -- Array(Tuple(repo, git_ref, git_sha)) -- because a GHA run knows
-# its sha, not its artifact_id (the orchestrator owns artifact_id, keyed by run_uid).
+# its sha, not its artifact_id (the orchestrator owns artifact_id, keyed by run_id).
 # NOT artifacts.props['commit_sha']: that key does not exist, and a Map miss returns
 # empty rather than erroring, so keying on it would silently report "nothing covered"
 # forever -- a full run every time, which is safe but makes the feature dead code.
 QUERY = """
 SELECT DISTINCT tag
 FROM {db}.test_case_runs AS r
-INNER JOIN {db}.artifact_results AS ar USING (run_uid)
+INNER JOIN {db}.artifact_results AS ar USING (run_id)
 INNER JOIN (
     SELECT artifact_id, tupleElement(s, 3) AS git_sha
     FROM {db}.artifacts
