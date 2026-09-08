@@ -2161,6 +2161,12 @@ _run_parallel_across_cards() {
     # Fan out collection: one background probe per file, bounded to _n_cards
     # concurrent jobs. Each writes matched node IDs to _collect_out_files[i].
     local -a _collect_out_files=()
+    # Raw stdout capture (before grep filtering) -- preserves pytest error output that goes to stdout (exit 2).
+    local -a _collect_raw_files=()
+    # Parallel array to _collect_out_files, indexed the same way, holding each probe's stderr path.
+    local -a _collect_err_files=()
+    # Parallel array holding each probe's own exit code, to catch a signal kill (e.g. OOM) even when stdout/stderr are both empty.
+    local -a _collect_exit_files=()
     local -a _collect_pids=()
     for i in "${!RUN_FILES[@]}"; do
         local _rf="${RUN_FILES[$i]}"
@@ -2168,17 +2174,34 @@ _run_parallel_across_cards() {
         _rd="$(dirname "$_rf")"
         _rb="$(basename "$_rf")"
         local _cout="/tmp/_spyre_collect_ids_${$}_${i}.tmp"
-        _collect_out_files+=("$_cout")
+        _collect_out_files[$i]="$_cout"
+        # Raw stdout from the probe before grep filtering -- needed for diagnostics when exit code != 0
+        # but the error went to stdout (e.g. pytest exit 2 / collection error with -q --no-header).
+        local _craw="/tmp/_spyre_collect_raw_${$}_${i}.tmp"
+        _collect_raw_files[$i]="$_craw"
+        # Captured instead of discarded, so a probe that collects nothing can say why.
+        local _cerr="/tmp/_spyre_collect_err_${$}_${i}.tmp"
+        _collect_err_files[$i]="$_cerr"
+        # Same index-alignment reasoning as _collect_out_files above.
+        local _cexit="/tmp/_spyre_collect_exit_${$}_${i}.tmp"
+        _collect_exit_files[$i]="$_cexit"
 
         echo "[torch_oot_device_tests_run]   collecting: $(basename "${TEST_FILES[$i]}")"
 
         (
+            set +euo pipefail
             export SPYRE_TEST_FILE="$_rf"
             export OOT_TEST_FILE="$_rf"
+            # Give this probe its own Inductor cache dir so concurrent collect-only imports can't race on the same shutil.rmtree() target (see the identical fix for the per-card execution subshells below).
+            # Keyed by file index i (unique per file) rather than by slot (i % _n_cards), which would share a directory across sequential probes in the same slot and reintroduce the race when a prior probe's teardown rmtree races against the next probe's import.
+            _probe_base_cache="${TORCHINDUCTOR_CACHE_DIR:-/tmp/torchinductor_${USER:-$(id -un)}}"
+            export TORCHINDUCTOR_CACHE_DIR="${_probe_base_cache}__collect_${i}"
             cd "$_rd" && python3 -m pytest "$_rb" \
                 "${_collect_args[@]+"${_collect_args[@]}"}" \
-                --collect-only -q --no-header 2>/dev/null \
-            | grep '\.py::' > "$_cout" || true
+                --collect-only -q --no-header 2>"$_cerr" \
+            | tee "$_craw" | grep '\.py::' > "$_cout"
+            # python3's own exit code (PIPESTATUS[0], not grep's), so a signal kill shows up even with empty stdout/stderr.
+            echo "${PIPESTATUS[0]}" > "$_cexit"
         ) &
         _collect_pids+=($!)
 
@@ -2203,10 +2226,70 @@ _run_parallel_across_cards() {
         [[ -f "$_cout" ]] && _raw_ids="$(< "$_cout")"
         rm -f "$_cout"
 
+        # A signal-killed probe (empty stdout + empty stderr + exit >=128) is usually a concurrent-import
+        # memory spike, not a real 0-match file -- retry it alone, with no concurrent siblings, before giving up.
+        if [[ -z "$_raw_ids" && ! -s "$_cerr" ]]; then
+            local _pexit=""
+            [[ -f "$_cexit" ]] && _pexit="$(< "$_cexit")"
+            if [[ "$_pexit" =~ ^[0-9]+$ && "$_pexit" -ge 128 ]]; then
+                echo "[torch_oot_device_tests_run_serial]   $(basename "$_of") collect-only was signal-killed (exit ${_pexit}) -- retrying alone." >&2
+                local _rf2="${RUN_FILES[$i]}"
+                local _rout="/tmp/_spyre_collect_retry_ids_${$}_${i}.tmp"
+                local _rerr="/tmp/_spyre_collect_retry_err_${$}_${i}.tmp"
+                (
+                    set +euo pipefail
+                    export SPYRE_TEST_FILE="$_rf2"
+                    export OOT_TEST_FILE="$_rf2"
+                    # A dedicated cache dir for the retry too, so it can't collide with whatever else is still running.
+                    export TORCHINDUCTOR_CACHE_DIR="${TORCHINDUCTOR_CACHE_DIR:-/tmp/torchinductor_${USER:-$(id -un)}}__retry_${i}"
+                    local _rraw="/tmp/_spyre_collect_retry_raw_${$}_${i}.tmp"
+                    cd "$(dirname "$_rf2")" && python3 -m pytest "$(basename "$_rf2")" \
+                        "${_collect_args[@]+"${_collect_args[@]}"}" \
+                        --collect-only -q --no-header 2>"$_rerr" \
+                    | tee "$_rraw" | grep '\.py::' > "$_rout"
+                )
+                _raw_ids="$(< "$_rout")"
+                rm -f "$_rout"
+                if [[ -n "$_raw_ids" ]]; then
+                    echo "[torch_oot_device_tests_run_serial]   retry succeeded for $(basename "$_of")." >&2
+                    rm -f "$_rerr" "$_rraw"
+                elif [[ -s "$_rerr" ]]; then
+                    _cerr="$_rerr"
+                    rm -f "$_rraw"
+                elif [[ -s "$_rraw" ]]; then
+                    # Retry error went to stdout (exit 2 / collection error) -- redirect into _cerr so the outer warning block prints it.
+                    _cerr="$_rraw"
+                else
+                    rm -f "$_rerr" "$_rraw"
+                fi
+            fi
+        fi
+
+        local _craw="${_collect_raw_files[$i]:-}"
         if [[ -z "$_raw_ids" ]]; then
             echo "[torch_oot_device_tests_run_serial]   WARNING: no test IDs collected from $(basename "$_of") -- it will be skipped in parallel mode." >&2
+            local _pexit=""
+            [[ -f "$_cexit" ]] && _pexit="$(< "$_cexit")"
+            if [[ -s "$_cerr" ]]; then
+                echo "[torch_oot_device_tests_run_serial]   ----- collect-only stderr for $(basename "$_of") -----" >&2
+                sed 's/^/[torch_oot_device_tests_run_serial]   /' "$_cerr" >&2
+                echo "[torch_oot_device_tests_run_serial]   ----- end stderr -----" >&2
+            fi
+            if [[ -s "$_craw" ]]; then
+                echo "[torch_oot_device_tests_run_serial]   ----- collect-only stdout for $(basename "$_of") (exit ${_pexit:-?}) -----" >&2
+                sed 's/^/[torch_oot_device_tests_run_serial]   /' "$_craw" >&2
+                echo "[torch_oot_device_tests_run_serial]   ----- end stdout -----" >&2
+            elif ! [[ -s "$_cerr" ]]; then
+                if [[ "$_pexit" =~ ^[0-9]+$ && "$_pexit" -ge 128 ]]; then
+                    echo "[torch_oot_device_tests_run_serial]   collect-only produced no output -- python3 exited with code ${_pexit} (signal $(( _pexit - 128 )), likely OOM-killed if that's SIGKILL/9)." >&2
+                else
+                    echo "[torch_oot_device_tests_run_serial]   collect-only produced no output -- python3 exit code: ${_pexit:-unknown}." >&2
+                fi
+            fi
+            rm -f "$_cerr" "$_cexit" "$_craw"
             continue
         fi
+        rm -f "$_cerr" "$_cexit" "$_craw"
 
         while IFS= read -r _id; do
             [[ -z "$_id" ]] && continue

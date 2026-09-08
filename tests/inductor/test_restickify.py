@@ -30,7 +30,7 @@ from unittest.mock import patch
 
 import torch
 from torch._inductor.virtualized import V
-from torch.spyre import SpyreTensorLayout
+from torch_spyre._C import SpyreTensorLayout
 
 import torch_spyre._inductor.optimize_restickify as _optimize_restickify
 from torch._inductor.exc import InductorError
