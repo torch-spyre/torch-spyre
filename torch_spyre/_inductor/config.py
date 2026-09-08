@@ -28,6 +28,20 @@ hbm_pool_planning: bool = os.getenv("HBM_POOL_PLANNING", "1").lower() in (
     "yes",
 )
 
+# Bracket risky FallbackKernel calls (opaque device dispatches with no native
+# Spyre lowering, e.g. custom ops or ops/eager.py's nested-torch.compile'd
+# eager kernels) with per-buffer LX dump/restore clones, so a buffer this
+# graph still has LX-resident across such a call survives whatever the
+# opaque call's own kernel does to LX. Defaults on; set
+# ENABLE_LX_CONTEXT_SWITCHING=0 to disable for debugging/bisection.
+enable_lx_context_switching: bool = os.getenv(
+    "ENABLE_LX_CONTEXT_SWITCHING", "1"
+).lower() in (
+    "1",
+    "true",
+    "yes",
+)
+
 # Select who allocates the HBM pool for an SDSC bundle's intermediates:
 # False (default) has the backend self-allocate via
 # sdscbundle.device_mem_allocate, exactly matching pre-existing behavior.
