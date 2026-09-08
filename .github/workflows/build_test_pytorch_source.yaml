@@ -199,6 +199,7 @@ jobs:
         uses: ./.github/actions/report-ci-completed
         with:
           job_name: linux-x86_64 / pytorch / build
+          rh_job_name: linux-x86_64-spyre / pytorch / build
           conclusion: ${{ steps.build_conclusion.outputs.conclusion }}
           pytorch_sha: ${{ inputs.pytorch_sha }}
 
@@ -503,6 +504,7 @@ jobs:
         uses: ./.github/actions/report-ci-completed
         with:
           job_name: linux-x86_64 / pytorch / test
+          rh_job_name: linux-x86_64-spyre / pytorch / test
           conclusion: ${{ steps.test_conclusion.outputs.conclusion }}
           pytorch_sha: ${{ inputs.pytorch_sha }}
           test_results_json: ${{ steps.test_results.outputs.test_results_json }}
