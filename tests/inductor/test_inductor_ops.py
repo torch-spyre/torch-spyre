@@ -567,7 +567,10 @@ def _pattern_param_sets():
         out[f"{key}_eager"] = (variant, "eager", *tensor_args)
         out[f"{key}_compiled"] = (variant, "compiled", *tensor_args)
 
-    torch.manual_seed(0xAFFE)
+    # Seed only the CPU generator to avoid torch.manual_seed() seeding all
+    # registered custom devices (including Spyre), which triggers _lazy_init()
+    # → start_runtime() at class-definition time during --collect-only probes.
+    torch.default_generator.manual_seed(0xAFFE)
 
     qa = cached_randn((2, 8, 128, 64), dtype=torch.float16, differentiation=1)
     ka = cached_randn((2, 8, 128, 64), dtype=torch.float16, differentiation=2)
@@ -773,8 +776,6 @@ def _build_fp32_proxy_cpu_refs(
 
 
 class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
-    torch.manual_seed(0xAFFE)  # seeds cached_randn/cached_xavier calls in PARAMS below
-
     def setUp(self):
         super().setUp()
         torch.manual_seed(0xAFFE)
