@@ -110,18 +110,21 @@ def _preserve_shared_weight_unit_bmm_dim(
     it_space: dict[sympy.Symbol, tuple[sympy.Expr, int]],
     args: Sequence[TensorArg],
     op_info: dict[str, Any],
-) -> dict[sympy.Symbol, tuple[sympy.Expr, int]]:
-    # TensorArg layout is normalized in-place below to match the surrounding
-    # OpSpec construction helpers.
+) -> tuple[dict[sympy.Symbol, tuple[sympy.Expr, int]], frozenset[int]]:
+    # OpSpec construction helpers. Returns (it_space, rewritten_arg_ids), where
+    # rewritten_arg_ids holds id(arg) for every TensorArg mutated in place, so
+    # callers can tell exactly which args' Python-side layout no longer
+    # matches whatever separate layout representation they built earlier.
+    no_rewrite: frozenset[int] = frozenset()
     if SHARED_WEIGHT_UNIT_BMM_INFO_KEY not in op_info:
-        return it_space
+        return it_space, no_rewrite
     if op not in [BATCH_MATMUL_OP, BATCH_MATMUL_FP8_OP]:
-        return it_space
+        return it_space, no_rewrite
     if len(it_space) != 3 or len(args) < 3:
-        return it_space
+        return it_space, no_rewrite
     info = op_info.get(SHARED_WEIGHT_UNIT_BMM_INFO_KEY)
     if not isinstance(info, dict) or info.get("batch_dim") != 0:
-        return it_space
+        return it_space, no_rewrite
 
     unit_sym = sympy.Symbol("_spyre_bmm_unit")
     suffix = 0
@@ -144,20 +147,22 @@ def _preserve_shared_weight_unit_bmm_dim(
     # as attention heads from SDPA, rewriting one axis into the BMM iteration
     # space can produce an illegal SDSC layout.
     if any(len(arg.device_size) > 4 for arg in target_args):
-        return it_space
+        return it_space, no_rewrite
     unit_idxs_by_arg = [_unit_indices(arg) for arg in target_args]
 
     if all(len(unit_idxs) == 0 for unit_idxs in unit_idxs_by_arg):
+        # Check both target_args before mutating either, so this bail-out
+        # can never leave one arg mutated without being reported below.
+        if any(len(arg.device_size) < 2 for arg in target_args):
+            return it_space, no_rewrite
         for arg in target_args:
-            if len(arg.device_size) < 2:
-                return it_space
             insert_at = len(arg.device_size) - 1
             arg.device_size.insert(insert_at, 1)
             arg.device_coordinates.insert(insert_at, sympy.S.Zero)
         unit_idxs_by_arg = [_unit_indices(arg) for arg in target_args]
 
     if not all(len(unit_idxs) == 1 for unit_idxs in unit_idxs_by_arg):
-        return it_space
+        return it_space, no_rewrite
 
     rewrite_targets = [
         (arg, unit_idxs[0]) for arg, unit_idxs in zip(target_args, unit_idxs_by_arg)
@@ -166,13 +171,14 @@ def _preserve_shared_weight_unit_bmm_dim(
     for arg, unit_idx in rewrite_targets:
         arg.device_coordinates[unit_idx] = unit_sym
         nonstick = list(range(len(arg.device_size) - 1))
-        order = [unit_idx] + [i for i in reversed(nonstick) if i != unit_idx]
+        order = [unit_idx] + [i for i in nonstick if i != unit_idx]
         order.append(len(arg.device_size) - 1)
         arg.device_size[:] = [arg.device_size[i] for i in order]
         arg.device_coordinates[:] = [arg.device_coordinates[i] for i in order]
 
     logger.info("Preserving shared-weight unit BMM dim %s", unit_sym)
-    return {unit_sym: (sympy.S.One, 1), **it_space}
+    rewritten_ids = frozenset(id(arg) for arg in target_args)
+    return {unit_sym: (sympy.S.One, 1), **it_space}, rewritten_ids
 
 
 @dataclass
@@ -901,8 +907,8 @@ class SpyreKernel(Kernel[CSEVariable]):
         it_space_extended = iteration_space_with_splits(
             ir_node, self.current_node.read_writes, it_space
         )
-        it_space_extended = _preserve_shared_weight_unit_bmm_dim(
-            op, it_space_extended, args, op_info
+        it_space_extended, unit_bmm_rewritten_arg_ids = (
+            _preserve_shared_weight_unit_bmm_dim(op, it_space_extended, args, op_info)
         )
         alignment_inputs = build_operation_alignment_inputs(
             it_space,
@@ -911,6 +917,22 @@ class SpyreKernel(Kernel[CSEVariable]):
             repeat_info=self._alignment_repeat_info,
             aligned_iteration_space=it_space_extended,
         )
+        # _preserve_shared_weight_unit_bmm_dim rewrites the Python-side
+        # device_size/device_coordinates of the matched TensorArgs in-place to
+        # hoist the synthetic _spyre_bmm_unit dim to the front, but the C++
+        # SpyreTensorLayout used by build_operation_alignment_inputs is a
+        # separate object that has no way to represent that synthetic symbol,
+        # so it is expected to disagree with the Python-side layout for
+        # exactly those args. Propagate the reordered layout back into
+        # alignment_inputs only for the args _preserve reported as rewritten,
+        # so align_tensors_pure (called from simplify_op_spec) starts from the
+        # correct physical ordering there. Every other arg and every op
+        # that never triggers this rewrite is left untouched, so the
+        # sanity check below stays a real check for them.
+        for arg, tensor in zip(args, alignment_inputs.tensors):
+            if id(arg) in unit_bmm_rewritten_arg_ids:
+                tensor["coordinates"] = list(arg.device_coordinates)
+                tensor["size"] = list(arg.device_size)
         for arg, tensor in zip(args, alignment_inputs.tensors):
             if list(arg.device_coordinates) != tensor["coordinates"]:
                 raise RuntimeError(

@@ -3654,9 +3654,13 @@ class TestSharedWeightUnitBmmLayout(unittest.TestCase):
         args = [input_arg, kernel_arg, output_arg]
         op_info = {SHARED_WEIGHT_UNIT_BMM_INFO_KEY: {"batch_dim": 0}}
 
-        iteration_space = _preserve_shared_weight_unit_bmm_dim(
+        iteration_space, rewritten_arg_ids = _preserve_shared_weight_unit_bmm_dim(
             "batchmatmul", iteration_space, args, op_info
         )
+        self.assertEqual(
+            rewritten_arg_ids, frozenset({id(input_arg), id(output_arg)})
+        )
+        self.assertNotIn(id(kernel_arg), rewritten_arg_ids)
         sdsc_spec, _ = parse_op_spec(
             OpSpec(
                 op="batchmatmul",
@@ -3676,11 +3680,11 @@ class TestSharedWeightUnitBmmLayout(unittest.TestCase):
         output_layout = sdsc_spec.layouts[sdsc_spec.args[-1].layout]
         self.assertEqual(
             [str(dim) for dim in input_layout["dim_order"]],
-            ["mb", "in", "x"],
+            ["in", "mb", "x"],
         )
         self.assertEqual(
             [str(dim) for dim in output_layout["dim_order"]],
-            ["mb", "out", "x"],
+            ["out", "mb", "x"],
         )
 
     def test_unit_bmm_preserve_skips_higher_rank_attention_layout(self):
@@ -3725,7 +3729,7 @@ class TestSharedWeightUnitBmmLayout(unittest.TestCase):
         }
         op_info = {SHARED_WEIGHT_UNIT_BMM_INFO_KEY: {"batch_dim": 0}}
 
-        new_iteration_space = _preserve_shared_weight_unit_bmm_dim(
+        new_iteration_space, rewritten_arg_ids = _preserve_shared_weight_unit_bmm_dim(
             "batchmatmul",
             iteration_space,
             [input_arg, kernel_arg, output_arg],
@@ -3733,6 +3737,7 @@ class TestSharedWeightUnitBmmLayout(unittest.TestCase):
         )
 
         self.assertIs(new_iteration_space, iteration_space)
+        self.assertEqual(rewritten_arg_ids, frozenset())
         self.assertNotIn("_spyre_bmm_unit", {str(dim) for dim in iteration_space})
         self.assertEqual(input_arg.device_size, [512, 32, 2, 1, 64])
         self.assertEqual(
@@ -3777,6 +3782,200 @@ class TestSharedWeightUnitBmmLayout(unittest.TestCase):
             SHARED_WEIGHT_UNIT_BMM_CUSTOM_META_KEY,
             bmm.meta.get("custom") or {},
         )
+
+    # -- Contract tests for _preserve_shared_weight_unit_bmm_dim's
+    # (it_space, rewritten_arg_ids) return value. Issue #4155.
+
+    def _make_valid_batchmatmul_case(self):
+        """Baseline Normal-branch case (#4155 shape M=256,K=1024,N=1024).
+        Guard-clause tests below start from a copy and break one precondition.
+        """
+        c0 = Symbol("c0")
+        c1 = Symbol("c1")
+        c2 = Symbol("c2")
+        input_arg = TensorArg(
+            is_input=True,
+            arg_index=0,
+            device_dtype=_FP16,
+            device_size=[256, 16, 1, 64],
+            device_coordinates=[c0, floor(c2 / 64), Integer(0), Mod(c2, 64)],
+            allocation={"hbm": 0},
+        )
+        kernel_arg = TensorArg(
+            is_input=True,
+            arg_index=1,
+            device_dtype=_FP16,
+            device_size=[16, 1024, 64],
+            device_coordinates=[floor(c1 / 64), c2, Mod(c1, 64)],
+            allocation={"hbm": 0x400000000},
+        )
+        output_arg = TensorArg(
+            is_input=False,
+            arg_index=2,
+            device_dtype=_FP16,
+            device_size=[256, 16, 1, 64],
+            device_coordinates=[c0, floor(c1 / 64), Integer(0), Mod(c1, 64)],
+            allocation={"hbm": 0x800000000},
+        )
+        iteration_space = {
+            c0: (Integer(256), 4),
+            c1: (Integer(1024), 8),
+            c2: (Integer(1024), 1),
+        }
+        args = [input_arg, kernel_arg, output_arg]
+        op_info = {SHARED_WEIGHT_UNIT_BMM_INFO_KEY: {"batch_dim": 0}}
+        return args, iteration_space, op_info
+
+    @staticmethod
+    def _snapshot_args(args):
+        return [(list(a.device_size), list(a.device_coordinates)) for a in args]
+
+    def _assert_args_unchanged(self, args, snapshot):
+        for arg, (size_before, coords_before) in zip(args, snapshot):
+            self.assertEqual(arg.device_size, size_before)
+            self.assertEqual(arg.device_coordinates, coords_before)
+
+    def test_preserve_noop_when_op_is_not_batchmatmul(self):
+        args, it_space, op_info = self._make_valid_batchmatmul_case()
+        snapshot = self._snapshot_args(args)
+
+        new_it_space, rewritten = _preserve_shared_weight_unit_bmm_dim(
+            "add", it_space, args, op_info
+        )
+
+        self.assertEqual(rewritten, frozenset())
+        self.assertIs(new_it_space, it_space)
+        self._assert_args_unchanged(args, snapshot)
+
+    def test_preserve_noop_when_op_info_missing_marker(self):
+        args, it_space, _ = self._make_valid_batchmatmul_case()
+        snapshot = self._snapshot_args(args)
+
+        new_it_space, rewritten = _preserve_shared_weight_unit_bmm_dim(
+            "batchmatmul", it_space, args, {}
+        )
+
+        self.assertEqual(rewritten, frozenset())
+        self.assertIs(new_it_space, it_space)
+        self._assert_args_unchanged(args, snapshot)
+
+    def test_preserve_noop_when_iteration_space_wrong_length(self):
+        for bad_len in (2, 4):
+            with self.subTest(bad_len=bad_len):
+                args, it_space, op_info = self._make_valid_batchmatmul_case()
+                bad_it_space = dict(it_space)
+                if bad_len == 2:
+                    bad_it_space.pop(next(iter(bad_it_space)))
+                else:
+                    bad_it_space[Symbol("c3")] = (Integer(64), 1)
+                snapshot = self._snapshot_args(args)
+
+                new_it_space, rewritten = _preserve_shared_weight_unit_bmm_dim(
+                    "batchmatmul", bad_it_space, args, op_info
+                )
+
+                self.assertEqual(rewritten, frozenset())
+                self.assertIs(new_it_space, bad_it_space)
+                self._assert_args_unchanged(args, snapshot)
+
+    def test_preserve_noop_when_target_arg_rank_exceeds_four(self):
+        args, it_space, op_info = self._make_valid_batchmatmul_case()
+        input_arg = args[0]
+        # 5th physical axis, as SDPA attention heads would add.
+        input_arg.device_size.insert(0, 2)
+        input_arg.device_coordinates.insert(0, Symbol("z0"))
+        snapshot = self._snapshot_args(args)
+
+        new_it_space, rewritten = _preserve_shared_weight_unit_bmm_dim(
+            "batchmatmul", it_space, args, op_info
+        )
+
+        self.assertEqual(rewritten, frozenset())
+        self.assertIs(new_it_space, it_space)
+        self._assert_args_unchanged(args, snapshot)
+
+    def test_preserve_noop_when_batch_dim_is_not_zero(self):
+        args, it_space, _ = self._make_valid_batchmatmul_case()
+        op_info = {SHARED_WEIGHT_UNIT_BMM_INFO_KEY: {"batch_dim": 1}}
+        snapshot = self._snapshot_args(args)
+
+        new_it_space, rewritten = _preserve_shared_weight_unit_bmm_dim(
+            "batchmatmul", it_space, args, op_info
+        )
+
+        self.assertEqual(rewritten, frozenset())
+        self.assertIs(new_it_space, it_space)
+        self._assert_args_unchanged(args, snapshot)
+
+    def test_preserve_normal_branch_reports_exactly_input_and_output_args(self):
+        args, it_space, op_info = self._make_valid_batchmatmul_case()
+        input_arg, kernel_arg, output_arg = args
+
+        new_it_space, rewritten_arg_ids = _preserve_shared_weight_unit_bmm_dim(
+            "batchmatmul", it_space, args, op_info
+        )
+
+        self.assertEqual(
+            rewritten_arg_ids, frozenset({id(input_arg), id(output_arg)})
+        )
+        self.assertNotIn(id(kernel_arg), rewritten_arg_ids)
+        self.assertIn("_spyre_bmm_unit", {str(s) for s in new_it_space})
+        # Change A: reversed() bug would produce [1, 16, 256, 64] here.
+        self.assertEqual(input_arg.device_size, [1, 256, 16, 64])
+        self.assertEqual(output_arg.device_size, [1, 256, 16, 64])
+        self.assertEqual(kernel_arg.device_size, [16, 1024, 64])
+
+    def test_insert_branch_checks_both_targets_before_mutating_either(self):
+        """Pre-fix bug: the insert-branch loop could mutate args[0] before
+        discovering args[-1] fails its size guard, leaving args[0] mutated
+        with no signal. Constructs that exact scenario.
+        """
+        c0 = Symbol("c0")
+        c1 = Symbol("c1")
+        c2 = Symbol("c2")
+        # args[0]: no unit dim, len(device_size)==2 passes the guard alone.
+        input_arg = TensorArg(
+            is_input=True,
+            arg_index=0,
+            device_dtype=_FP16,
+            device_size=[64, 64],
+            device_coordinates=[c0, Mod(c0, 64)],
+            allocation={"hbm": 0},
+        )
+        kernel_arg = TensorArg(
+            is_input=True,
+            arg_index=1,
+            device_dtype=_FP16,
+            device_size=[64, 64],
+            device_coordinates=[c1, Mod(c1, 64)],
+            allocation={"hbm": 0x400000000},
+        )
+        # args[-1]: len(device_size)==1 fails the guard.
+        output_arg = TensorArg(
+            is_input=False,
+            arg_index=2,
+            device_dtype=_FP16,
+            device_size=[64],
+            device_coordinates=[Mod(c2, 64)],
+            allocation={"hbm": 0x800000000},
+        )
+        args = [input_arg, kernel_arg, output_arg]
+        snapshot = self._snapshot_args(args)
+        iteration_space = {
+            c0: (Integer(64), 1),
+            c1: (Integer(64), 1),
+            c2: (Integer(64), 1),
+        }
+        op_info = {SHARED_WEIGHT_UNIT_BMM_INFO_KEY: {"batch_dim": 0}}
+
+        new_it_space, rewritten_arg_ids = _preserve_shared_weight_unit_bmm_dim(
+            "batchmatmul", iteration_space, args, op_info
+        )
+
+        self.assertEqual(rewritten_arg_ids, frozenset())
+        self.assertIs(new_it_space, iteration_space)
+        # Pre-fix, input_arg would have device_size == [64, 1, 64] here.
+        self._assert_args_unchanged(args, snapshot)
 
 
 # ===========================================================================
