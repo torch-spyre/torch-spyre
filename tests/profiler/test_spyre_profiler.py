@@ -1119,6 +1119,7 @@ def _find_duplicate_kernel_start_timestamps(events):
             continue
 
         timestamp = event.get("ts")
+        stream_id = event.get("tid")
         name = event.get("name", "unknown")
 
         assert (
@@ -1132,18 +1133,20 @@ def _find_duplicate_kernel_start_timestamps(events):
 
         kernel_events.append(event)
 
-        if timestamp not in timestamp_groups:
-            timestamp_groups[timestamp] = []
+        group_key = (stream_id, timestamp)
 
-        timestamp_groups[timestamp].append(event)
+        if group_key not in timestamp_groups:
+            timestamp_groups[group_key] = []
+
+        timestamp_groups[group_key].append(event)
 
     duplicate_groups = [
-        (timestamp, grouped_events)
-        for timestamp, grouped_events in timestamp_groups.items()
+        (stream_id, timestamp, grouped_events)
+        for (stream_id, timestamp), grouped_events in timestamp_groups.items()
         if len(grouped_events) > 1
     ]
 
-    duplicate_groups.sort(key=lambda group: group[0])
+    duplicate_groups.sort(key=lambda group: (group[0], group[1]))
 
     return kernel_events, duplicate_groups
 
@@ -1151,23 +1154,97 @@ def _find_duplicate_kernel_start_timestamps(events):
 def test_find_duplicate_kernel_start_timestamps():
     """Verify duplicate start timestamp detection with synthetic kernel events."""
     clean_events = [
-        {"ph": "X", "cat": "kernel", "name": "kernel_1", "ts": 0, "dur": 10},
-        {"ph": "X", "cat": "kernel", "name": "kernel_2", "ts": 10, "dur": 10},
+        {
+            "ph": "X",
+            "cat": "kernel",
+            "name": "kernel_1",
+            "ts": 0,
+            "dur": 10,
+            "tid": 1,
+        },
+        {
+            "ph": "X",
+            "cat": "kernel",
+            "name": "kernel_2",
+            "ts": 10,
+            "dur": 10,
+            "tid": 1,
+        },
     ]
 
     duplicate_events = [
-        {"ph": "X", "cat": "kernel", "name": "kernel_1", "ts": 0, "dur": 10},
-        {"ph": "X", "cat": "kernel", "name": "kernel_2", "ts": 0, "dur": 5},
+        {
+            "ph": "X",
+            "cat": "kernel",
+            "name": "kernel_1",
+            "ts": 0,
+            "dur": 10,
+            "tid": 1,
+        },
+        {
+            "ph": "X",
+            "cat": "kernel",
+            "name": "kernel_2",
+            "ts": 0,
+            "dur": 5,
+            "tid": 1,
+        },
+    ]
+
+    different_stream_events = [
+        {
+            "ph": "X",
+            "cat": "kernel",
+            "name": "kernel_stream_1",
+            "ts": 0,
+            "dur": 10,
+            "tid": 1,
+        },
+        {
+            "ph": "X",
+            "cat": "kernel",
+            "name": "kernel_stream_2",
+            "ts": 0,
+            "dur": 5,
+            "tid": 2,
+        },
+    ]
+
+    kernel_cpu_same_timestamp = [
+        {
+            "ph": "X",
+            "cat": "kernel",
+            "name": "kernel_1",
+            "ts": 0,
+            "dur": 10,
+            "tid": 1,
+        },
+        {
+            "ph": "X",
+            "cat": "cpu_op",
+            "name": "cpu_op_1",
+            "ts": 0,
+            "dur": 10,
+            "tid": 1,
+        },
     ]
 
     kernel_memory_same_timestamp = [
-        {"ph": "X", "cat": "kernel", "name": "kernel_1", "ts": 0, "dur": 10},
+        {
+            "ph": "X",
+            "cat": "kernel",
+            "name": "kernel_1",
+            "ts": 0,
+            "dur": 10,
+            "tid": 1,
+        },
         {
             "ph": "X",
             "cat": "gpu_memcpy",
             "name": "Memcpy (HtoD)",
             "ts": 0,
             "dur": 10,
+            "tid": 1,
         },
     ]
 
@@ -1176,6 +1253,12 @@ def test_find_duplicate_kernel_start_timestamps():
     )
     duplicate_kernel_events, duplicate_groups = _find_duplicate_kernel_start_timestamps(
         duplicate_events
+    )
+    different_stream_kernel_events, different_stream_duplicates = (
+        _find_duplicate_kernel_start_timestamps(different_stream_events)
+    )
+    cpu_kernel_events, cpu_kernel_duplicates = _find_duplicate_kernel_start_timestamps(
+        kernel_cpu_same_timestamp
     )
     memory_kernel_events, memory_duplicates = _find_duplicate_kernel_start_timestamps(
         kernel_memory_same_timestamp
@@ -1187,11 +1270,18 @@ def test_find_duplicate_kernel_start_timestamps():
     assert len(duplicate_kernel_events) == 2
     assert len(duplicate_groups) == 1
 
-    duplicate_timestamp, kernels = duplicate_groups[0]
+    duplicate_stream_id, duplicate_timestamp, kernels = duplicate_groups[0]
+    assert duplicate_stream_id == 1
     assert duplicate_timestamp == 0
     assert len(kernels) == 2
     assert kernels[0]["name"] == "kernel_1"
     assert kernels[1]["name"] == "kernel_2"
+
+    assert len(different_stream_kernel_events) == 2
+    assert different_stream_duplicates == []
+
+    assert len(cpu_kernel_events) == 1
+    assert cpu_kernel_duplicates == []
 
     assert len(memory_kernel_events) == 1
     assert memory_duplicates == []
@@ -1273,7 +1363,7 @@ def test_duplicate_kernel_start_timestamps(tmp_path):
     if duplicate_groups:
         duplicate_details = []
 
-        for timestamp, grouped_events in duplicate_groups[:10]:
+        for stream_id, timestamp, grouped_events in duplicate_groups[:10]:
             event_details = []
 
             for event in grouped_events:
@@ -1285,7 +1375,9 @@ def test_duplicate_kernel_start_timestamps(tmp_path):
                 )
                 event_details.append(details)
 
-            duplicate_details.append(f"ts={timestamp}: {', '.join(event_details)}")
+            duplicate_details.append(
+                f"tid={stream_id}, ts={timestamp}: {', '.join(event_details)}"
+            )
 
         pytest.fail(
             f"{len(duplicate_groups)} duplicate kernel start timestamp group(s) "
