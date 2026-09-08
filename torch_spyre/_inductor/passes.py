@@ -35,6 +35,7 @@ from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import Operation
 from torch._inductor.scheduler import BaseSchedulerNode
 
+from . import timing_recorder
 from .logging_utils import get_inductor_logger
 from .provenance import SpyreGraphTransformObserver, reset_provenance_warnings
 
@@ -108,6 +109,11 @@ logger = get_inductor_logger("passes")
 
 def _get_pass_name(pass_fn: Callable) -> str:
     """Get a human-readable name for a pass function."""
+    # A PatternMatcherPass is registered as its bound `apply`, so every one of
+    # them would otherwise report the same name.
+    pattern_name = getattr(getattr(pass_fn, "__self__", None), "pass_name", None)
+    if isinstance(pattern_name, str) and pattern_name:
+        return pattern_name
     if hasattr(pass_fn, "__name__"):
         return pass_fn.__name__
     if hasattr(pass_fn, "__func__"):
@@ -171,11 +177,30 @@ class _SpyreGraphPassPipeline(CustomGraphPass):
     def __call__(self, graph: torch.fx.graph.Graph) -> None:
         if not self._has_spyre_device(graph):
             return
+        pipeline = type(self).__name__
+        # len(graph.nodes) walks the node list, so only count when recording, and
+        # count outside the region being described so the walk is not attributed
+        # to it.
+        counting = timing_recorder.is_enabled()
         # FX-graph passes are already observed by upstream Inductor's
         # GraphTransformObserver (populates node.meta["from_node"]); no Spyre
         # observer is wrapped here.
-        for p in self.passes:
-            p(graph)
+        with timing_recorder.stage(
+            f"pipeline:{pipeline}",
+            passes=len(self.passes),
+            input_nodes=len(graph.nodes) if counting else 0,
+        ) as pipeline_event:
+            for p in self.passes:
+                name = _get_pass_name(p) if counting else ""
+                with timing_recorder.stage(
+                    f"pass:{pipeline}:{name}",
+                    input_nodes=len(graph.nodes) if counting else 0,
+                ) as event:
+                    p(graph)
+                if counting:
+                    event.meta["output_nodes"] = len(graph.nodes)
+        if counting:
+            pipeline_event.meta["output_nodes"] = len(graph.nodes)
 
     def uuid(self) -> Any | None:
         return _uuid(self.passes)
@@ -196,14 +221,23 @@ class _SpyreNodePassPipeline(CustomSchedulerPass):
         # This pipeline is a per-compile entry point for the observed passes,
         # so clear the dedup here so each compile warns afresh.
         reset_provenance_warnings()
-        for pass_fn in self.passes:
-            name = _get_pass_name(pass_fn)
-            observer = SpyreGraphTransformObserver(target, name, kind="node")
-            with observer:
-                target = pass_fn(target)
-                # Reconcile the returned list while recursively inspecting the
-                # underlying buffers through scheduler get_nodes().
-                observer.target = target
+        pipeline = type(self).__name__
+        with timing_recorder.stage(
+            f"pipeline:{pipeline}", passes=len(self.passes), input_nodes=len(target)
+        ) as pipeline_event:
+            for pass_fn in self.passes:
+                name = _get_pass_name(pass_fn)
+                observer = SpyreGraphTransformObserver(target, name, kind="node")
+                with observer:
+                    with timing_recorder.stage(
+                        f"pass:{pipeline}:{name}", input_nodes=len(target)
+                    ) as event:
+                        target = pass_fn(target)
+                    event.meta["output_nodes"] = len(target)
+                    # Reconcile the returned list while recursively inspecting
+                    # the underlying buffers through scheduler get_nodes().
+                    observer.target = target
+        pipeline_event.meta["output_nodes"] = len(target)
         return target
 
     def uuid(self) -> Any | None:
@@ -513,20 +547,70 @@ class CustomPreSchedulingPasses:
         # so clear the dedup here so each compile warns afresh.
         reset_provenance_warnings()
 
-        if logger.isEnabledFor(logging.INFO):
-            logger.info(
-                "BEFORE PRE-SCHEDULING\n%s", format_operations(graph.operations)
-            )
+        pipeline = type(self).__name__
+        with timing_recorder.stage(
+            f"pipeline:{pipeline}",
+            passes=len(self.passes),
+            input_operations=len(graph.operations),
+        ) as pipeline_event:
+            # Formatting the whole IR is not free on a real graph, so it gets its
+            # own region rather than disappearing into the pipeline's self time.
+            if logger.isEnabledFor(logging.INFO):
+                with timing_recorder.stage(f"stage:{pipeline}:log_before"):
+                    logger.info(
+                        "BEFORE PRE-SCHEDULING\n%s", format_operations(graph.operations)
+                    )
 
+            with timing_recorder.stage(f"stage:{pipeline}:pass_loop"):
+                self._run_pass_loop(graph)
+
+            if logger.isEnabledFor(logging.INFO):
+                with timing_recorder.stage(f"stage:{pipeline}:log_after"):
+                    logger.info(
+                        "AFTER PRE-SCHEDULING\n%s", format_operations(graph.operations)
+                    )
+
+            # Predicted runtime for this graph, or None when config.cost_model is off.
+            # Kept OUTSIDE self.passes on purpose: it only reads the IR, so hashing it
+            # into the Inductor cache key (see _uuid) would invalidate caches for a
+            # report that cannot change the compiled result. The pass stores the report
+            # per-thread, readable as `last_cost_report`, so another pass or an external
+            # tool can compare two plans by total_us without compiling or running it.
+            #
+            # BEFORE the per-op dump on purpose: the report is the answer -- one number
+            # and a per-kernel breakdown -- while the dump is the evidence behind it,
+            # hundreds of lines on a real graph. Printing the evidence first buries the
+            # answer.
+            with timing_recorder.stage(f"stage:{pipeline}:cost_model"):
+                cost_model_pass(graph)
+            with timing_recorder.stage(f"stage:{pipeline}:cost_dump"):
+                dump_cost_model(graph.operations)
+            # Keep rich symbol-keyed ownership through every pre-Scheduler reader;
+            # legacy coefficient transport exists only for Scheduler/codegen.
+            with timing_recorder.stage(f"stage:{pipeline}:finalize_work_division"):
+                finalize_work_division_for_scheduler(graph)
+
+        pipeline_event.meta["output_operations"] = len(graph.operations)
+
+    def _run_pass_loop(self, graph: GraphLowering) -> None:
+        """Run the pass list. Split out so it gets its own timed region."""
+        pipeline = type(self).__name__
         for pass_fn in self.passes:
             pass_name = _get_pass_name(pass_fn)
             # `graph` is the same object throughout -- passes mutate
             # `graph.operations` in place -- so before/after reconciliation
             # is exact here.
             with SpyreGraphTransformObserver(graph, pass_name, kind="graphlowering"):
-                t0 = time.perf_counter()
-                pass_fn(graph)
-                elapsed_ms = (time.perf_counter() - t0) * 1000
+                with timing_recorder.stage(
+                    f"pass:{pipeline}:{pass_name}",
+                    input_operations=len(graph.operations),
+                ) as event:
+                    t0 = time.perf_counter()
+                    pass_fn(graph)
+                    elapsed_ms = (time.perf_counter() - t0) * 1000
+                # Counted after the region closes, so counting is never charged
+                # to the work it describes.
+                event.meta["output_operations"] = len(graph.operations)
 
             if logger.isEnabledFor(logging.INFO):
                 logger.info(
@@ -538,24 +622,6 @@ class CustomPreSchedulingPasses:
                 logger.debug(
                     "AFTER %s\n%s", pass_name, format_operations(graph.operations)
                 )
-
-        if logger.isEnabledFor(logging.INFO):
-            logger.info("AFTER PRE-SCHEDULING\n%s", format_operations(graph.operations))
-        # Predicted runtime for this graph, or None when config.cost_model is off.
-        # Kept OUTSIDE self.passes on purpose: it only reads the IR, so hashing it
-        # into the Inductor cache key (see _uuid) would invalidate caches for a
-        # report that cannot change the compiled result. The pass stores the report
-        # per-thread, readable as `last_cost_report`, so another pass or an external
-        # tool can compare two plans by total_us without compiling or running either.
-        #
-        # BEFORE the per-op dump on purpose: the report is the answer -- one number and
-        # a per-kernel breakdown -- while the dump is the evidence behind it, hundreds
-        # of lines on a real graph. Printing the evidence first buries the answer.
-        cost_model_pass(graph)
-        dump_cost_model(graph.operations)
-        # Keep rich symbol-keyed ownership through every pre-Scheduler reader;
-        # legacy coefficient transport exists only for Scheduler/codegen.
-        finalize_work_division_for_scheduler(graph)
 
     def uuid(self) -> Any | None:
         return _uuid(self.passes)

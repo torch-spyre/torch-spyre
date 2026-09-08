@@ -54,6 +54,16 @@ class TestGetPassName:
         callable_obj = MyCallablePass()
         assert _get_pass_name(callable_obj) == "MyCallablePass"
 
+    def test_pattern_matcher_passes_are_distinguishable(self):
+        # Registered as bound `apply` methods, so __name__ alone collides.
+        from torch._inductor.pattern_matcher import PatternMatcherPass
+
+        first = PatternMatcherPass(pass_name="unflatten_mm_to_bmm")
+        second = PatternMatcherPass(pass_name="unflatten_bmm_batch_dims")
+
+        assert _get_pass_name(first.apply) == "unflatten_mm_to_bmm"
+        assert _get_pass_name(second.apply) == "unflatten_bmm_batch_dims"
+
     def test_decorated_function_preserves_name(self):
         def decorator(fn):
             @functools.wraps(fn)

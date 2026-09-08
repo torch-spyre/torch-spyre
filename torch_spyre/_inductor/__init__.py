@@ -87,6 +87,7 @@ def enable_spyre_compile_fx_wrapper():
         patch_inductor_fusions()
 
         _orig = cfx.compile_fx
+        from torch_spyre._inductor import timing_recorder
         from torch_spyre._inductor.logging_utils import get_inductor_logger
 
         logger = get_inductor_logger("compile_fx_wrapper")
@@ -177,8 +178,12 @@ def enable_spyre_compile_fx_wrapper():
                     _prev_in_spyre = getattr(_compile_state, "in_spyre_compile", False)
                     _compile_state.in_spyre_compile = True
                     try:
-                        with enable_spyre_context(example_inputs):
-                            return _orig(gm, example_inputs, *args, **kwargs)
+                        # The outermost region of one Spyre compile: every other
+                        # timed region nests inside it, so a frontend total is
+                        # this minus the per-kernel backend calls.
+                        with timing_recorder.stage("stage:compile_fx:spyre_compile"):
+                            with enable_spyre_context(example_inputs):
+                                return _orig(gm, example_inputs, *args, **kwargs)
                     finally:
                         _compile_state.in_spyre_compile = _prev_in_spyre
 

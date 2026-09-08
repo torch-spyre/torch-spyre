@@ -75,6 +75,7 @@ def enable_spyre_context(example_inputs: list[InputType]):
         CustomPostFusionPasses,
         CustomPreSchedulingPasses,
     )
+    from torch_spyre._inductor import timing_recorder
     from torch_spyre._inductor.propagate_hints import recover_spyre_hints
 
     # *) Inductor config tweaks (saved/restored)
@@ -126,7 +127,10 @@ def enable_spyre_context(example_inputs: list[InputType]):
                 recover_spyre_hints(self.graph)
             _pre_scheduling_pass(self)
             setattr(self, "_spyre_pre_scheduling_complete", True)
-        old_update_scheduler(self)
+        # Upstream scheduler construction, which the pre-scheduling pipeline runs
+        # immediately before. Timed separately so the two are not conflated.
+        with timing_recorder.stage("stage:GraphLowering:update_scheduler"):
+            old_update_scheduler(self)
 
     GraphLowering._update_scheduler = _spyre_update_scheduler  # type: ignore[method-assign]
 
