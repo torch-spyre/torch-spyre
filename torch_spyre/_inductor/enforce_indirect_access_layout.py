@@ -28,6 +28,7 @@ graph output) or inserts a spyre.restickify copy in the required layout.
 """
 
 import sympy
+import torch
 
 from torch._inductor.dependencies import MemoryDep
 from torch._inductor.graph import GraphLowering
@@ -38,7 +39,7 @@ from torch._inductor.ir import (
     Scatter,
     StorageBox,
 )
-from torch_spyre._C import SpyreTensorLayout
+from torch_spyre._C import DataFormats, SpyreTensorLayout
 
 from .constants import ELIDED_COPY_BACK_ATTR
 from .errors import Unsupported
@@ -51,11 +52,17 @@ from .ir import FixedTiledLayout
 from .logging_utils import get_inductor_logger
 from .op_spec import IndirectAccess
 from .pass_utils import (
+    AlignmentAccess,
     _build_indirect_store_subs,
+    _find_scatter_index_buf_names,
+    build_operation_alignment_inputs,
+    concretize_expr,
     device_coordinates,
     indirect_info_from_op,
+    iteration_space_from_op,
     padded_entry_output_stl,
 )
+from .views import AlignmentInputs, UnalignedStickSplit, align_tensors_pure
 from . import config
 
 logger = get_inductor_logger("enforce_indirect_access_layout")
@@ -282,6 +289,197 @@ def _insert_relayout_copy(
         for o in operations
         if isinstance(o, ComputedBuffer) and o.get_name() == consumer_name
     )
+
+
+def _dense_scatter_source_stl(value_layout: FixedTiledLayout) -> SpyreTensorLayout:
+    """Build a dense layout for a direct scatter source.
+
+    ReStickifyOpHBM operates on the physical DL16 format, shared by logical
+    float16 and bfloat16 tensors.  Keep the source's logical dtype and element
+    arrangement while returning its host dimensions to their canonical order.
+    """
+    source_stl = value_layout.device_layout
+    if source_stl.device_dtype != DataFormats.SEN169_FP16:
+        raise Unsupported(
+            "scatter source alignment requires materialization, but "
+            f"ReStickifyOpHBM does not support {source_stl.device_dtype}"
+        )
+    size = [concretize_expr(value) for value in value_layout.size]
+    stride = [concretize_expr(value) for value in value_layout.stride]
+    return SpyreTensorLayout(
+        size,
+        stride,
+        value_layout.dtype,
+        list(range(len(size))),
+        source_stl.element_arrangement,
+    )
+
+
+def _is_synthetic_restickify(buf) -> bool:
+    """Return whether ``buf`` was produced by the restickify insertion pass."""
+    if not isinstance(buf, ComputedBuffer) or len(buf.origins) != 1:
+        return False
+    return next(iter(buf.origins)).target is torch.ops.spyre.restickify.default
+
+
+def _scatter_alignment_inputs(
+    graph: GraphLowering,
+    op: ComputedBuffer,
+    *,
+    layout_overrides: dict[str, SpyreTensorLayout] | None = None,
+) -> AlignmentInputs | None:
+    """Reconstruct codegen's alignment input for a committed scatter op."""
+    overrides = layout_overrides or {}
+    read_writes = op.get_read_writes()
+    write_dep = next(
+        (dep for dep in read_writes.writes if isinstance(dep, MemoryDep)), None
+    )
+    if write_dep is None:
+        return None
+
+    output_layout = _output_real_layout(op)
+    if not isinstance(output_layout, FixedTiledLayout):
+        return None
+    _, indirect_sizes = _scatter_access_subs_and_sizes(op, output_layout, write_dep)
+
+    accesses: list[AlignmentAccess] = []
+    for dep in read_writes.reads:
+        if not isinstance(dep, MemoryDep):
+            continue
+        buf = graph.get_buffer(dep.name)
+        layout = _real_layout(buf)
+        if not isinstance(layout, FixedTiledLayout):
+            return None
+        accesses.append(
+            AlignmentAccess(overrides.get(dep.name, layout.device_layout), dep.index)
+        )
+    accesses.append(AlignmentAccess(output_layout.device_layout, write_dep.index))
+    return build_operation_alignment_inputs(
+        iteration_space_from_op(op),
+        accesses,
+        indirect_sizes=indirect_sizes,
+        op=op,
+        read_writes=read_writes,
+    )
+
+
+def _materialize_unaligned_scatter_source(
+    graph: GraphLowering,
+    op: ComputedBuffer,
+    index_names: set[str],
+) -> ComputedBuffer:
+    """Densify the direct source when it cuts through an index stick.
+
+    Tensor alignment merges factorization boundaries from every operand.  A
+    transposed direct source can contribute an internal boundary that falls
+    inside the int32 index tensor's 32-element physical stick.  Such a split is
+    not representable and used to truncate the index's outer-stick extent to
+    zero.  Materialize just the direct source in a canonical dense DL16 layout;
+    the destination and index layouts remain unchanged.
+
+    PyTorch lowering represents every ``Scatter`` as a ``ComputedBuffer`` with
+    a ``MutationLayoutSHOULDREMOVE`` target, which is the invariant required by
+    ``_resolve_mutation_target`` below.
+    """
+    alignment_inputs = _scatter_alignment_inputs(graph, op)
+    if alignment_inputs is None:
+        return op
+    try:
+        align_tensors_pure(alignment_inputs)
+        return op
+    except UnalignedStickSplit as error:
+        alignment_error = error
+
+    target_name, _ = _resolve_mutation_target(op)
+    # ``indirect_info_from_op`` can expose placeholder names when it cannot
+    # pair a scatter symbol with its real index buffer.  Also exclude index
+    # tensors recovered directly from the Scatter closure so they are never
+    # mistaken for a source candidate.
+    index_names = index_names | _find_scatter_index_buf_names(op)
+    # A fused Scatter retains no distinguished source edge.  Its remaining
+    # direct reads are therefore candidates, not assumptions: accept one only
+    # when substituting its dense layout makes the complete alignment valid.
+    direct_deps = [
+        dep
+        for dep in op.get_read_writes().reads
+        if isinstance(dep, MemoryDep)
+        and dep.name not in index_names
+        and dep.name != target_name
+    ]
+    for dep in direct_deps:
+        source_buf = graph.get_buffer(dep.name)
+        source_layout = _real_layout(source_buf)
+        if not isinstance(source_layout, FixedTiledLayout):
+            logger.debug(
+                "enforce_indirect_access_layout: scatter source candidate %s "
+                "has non-tiled layout %s",
+                dep.name,
+                type(source_layout).__name__,
+            )
+            continue
+        # ReStickify cannot materialize a non-DL16 source.  It may be an
+        # unrelated direct operand, so keep looking for a feasible candidate;
+        # if none resolves the split, preserve the original alignment error.
+        if source_layout.device_layout.device_dtype != DataFormats.SEN169_FP16:
+            logger.debug(
+                "enforce_indirect_access_layout: scatter source candidate %s "
+                "uses unsupported ReStickify format %s",
+                dep.name,
+                source_layout.device_layout.device_dtype,
+            )
+            continue
+        dense_stl = _dense_scatter_source_stl(source_layout)
+        if dense_stl == source_layout.device_layout:
+            logger.debug(
+                "enforce_indirect_access_layout: scatter source candidate %s "
+                "is already dense",
+                dep.name,
+            )
+            continue
+        candidate_inputs = _scatter_alignment_inputs(
+            graph, op, layout_overrides={dep.name: dense_stl}
+        )
+        if candidate_inputs is None:
+            logger.debug(
+                "enforce_indirect_access_layout: could not reconstruct alignment "
+                "inputs for scatter source candidate %s",
+                dep.name,
+            )
+            continue
+        try:
+            align_tensors_pure(candidate_inputs)
+        except UnalignedStickSplit as candidate_error:
+            logger.debug(
+                "enforce_indirect_access_layout: dense scatter source candidate "
+                "%s leaves alignment invalid: %s",
+                dep.name,
+                candidate_error,
+            )
+            continue
+
+        logger.info(
+            "enforce_indirect_access_layout: materializing scatter source %s "
+            "in a dense DL16 layout before %s",
+            dep.name,
+            op.get_name(),
+        )
+        if _is_synthetic_restickify(source_buf):
+            # Layout propagation may already have inserted a private restickify
+            # for this scatter edge.  Retarget that copy directly: inserting a
+            # second copy here would read an intermediate whose physical
+            # geometry was already chosen from the scatter destination and can
+            # therefore be too large for the logical source (for example a
+            # 64-token K tensor feeding a 384-token KV cache).
+            source_buf.layout = _fixed_tiled(source_layout, dense_stl)
+            return op
+        return _insert_relayout_copy(
+            graph,
+            op,
+            source_buf,
+            _fixed_tiled(source_layout, dense_stl),
+        )
+
+    raise alignment_error
 
 
 def _value_bufs_for_op(
@@ -673,6 +871,12 @@ def enforce_indirect_access_layout(graph: GraphLowering) -> None:
         _pad_output_for_stick_aligned_split(original_op)
 
         op = original_op
+        if is_scatter:
+            op = _materialize_unaligned_scatter_source(graph, op, dep_names)
+            if op is not original_op:
+                requirement = _get_indirect_access_dim_order_requirements(op)
+                assert requirement is not None
+                dep_names, access_subs, sizes = requirement
         value_bufs = _value_bufs_for_op(graph, op, access_subs, sizes)
         for value_buf in value_bufs:
             value_layout = _real_layout(value_buf)
@@ -695,7 +899,7 @@ def enforce_indirect_access_layout(graph: GraphLowering) -> None:
                 for sym in access_subs.values()
                 if isinstance(sym, IndirectAccess)
             }
-            index_name = next(iter(index_names & dep_names), None)
+            index_name = min(index_names & dep_names, default=None)
             if index_name is None:
                 continue
             index_dep = next(
@@ -726,4 +930,4 @@ def enforce_indirect_access_layout(graph: GraphLowering) -> None:
 
         # For scatter ops, ensure scatter destination dimension 0 (scatter index) is outermost
         if is_scatter and is_mutation:
-            _enforce_scatter_destination_layout(graph, original_op, requirement)
+            _enforce_scatter_destination_layout(graph, op, requirement)

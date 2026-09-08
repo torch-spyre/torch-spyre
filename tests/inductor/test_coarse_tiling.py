@@ -78,6 +78,7 @@ from torch_spyre._inductor.wsr.coarse_tile import (
     _RetiledBufferInfo,
     _apply_plan,
     _compute_fill_loop_info_planned,
+    _compute_read_copy_strides,
     _consumer_own_dim_symbol,
     _divide_ranges,
     _full_buffer_read_deps,
@@ -5959,9 +5960,6 @@ class TestInsertAllReadCopyOps(unittest.TestCase):
         ]
         self.assertEqual(len(copy_bufs), 2)
 
-    @unittest.skip(
-        "non-divisible padding raises Unsupported after row-major fallback removal"
-    )
     def test_offset_read_gets_its_own_copy(self):
         """a+shift(a)-style: two reads of the same buffer with identical
         per-var index coefficients but a different constant offset must
@@ -6032,6 +6030,10 @@ class TestInsertAllReadCopyOps(unittest.TestCase):
             if isinstance(op, ComputedBuffer) and op.get_name() != "tiled_op0"
         ]
         self.assertEqual(len(copy_bufs), 2)
+        self.assertEqual(
+            [list(copy_buf.layout.stride) for copy_buf in copy_bufs],
+            [[Integer(8), Integer(1)], [Integer(8), Integer(1)]],
+        )
 
     def test_disable_flag_skips_everything(self):
         """An empty read_copy_plans dict (the insert_read_copies=False case)
@@ -7462,21 +7464,21 @@ class TestReorderUnhintedInterlopers(unittest.TestCase):
         self.assertEqual(self._run([a, x, b]), ["a", "b", "x"])
 
     def test_interloper_move_after_blocked_by_hinted_reader(self):
-        # x reads a (blocks move-before) AND b reads x (blocks move-after) → error.
+        # x reads a (blocks move-before) AND b reads x (blocks move-after).
+        # Keep x in place and split the hinted ops into separate runs.
         a = _make_rui_op("a", hint_ids=(0,))
         x = _make_rui_op("x", reads=("a",))
         b = _make_rui_op("b", reads=("x",), hint_ids=(0,))
         c = _make_rui_op("c", hint_ids=(0,))
-        with self.assertRaises(RuntimeError):
-            self._run([a, x, b, c])
+        self.assertEqual(self._run([a, x, b, c]), ["a", "x", "b", "c"])
 
     def test_interloper_blocked_both_directions(self):
-        # x reads a (blocks move-before) AND b reads x (blocks move-after) → error.
+        # x reads a (blocks move-before) AND b reads x (blocks move-after).
+        # The original topological order is already valid and is preserved.
         a = _make_rui_op("a", hint_ids=(0,))
         x = _make_rui_op("x_out", reads=("a",))
         b = _make_rui_op("b", reads=("x_out",), hint_ids=(0,))
-        with self.assertRaises(RuntimeError):
-            self._run([a, x, b])
+        self.assertEqual(self._run([a, x, b]), ["a", "x_out", "b"])
 
     def test_non_computed_buffer_breaks_run(self):
         # A non-ComputedBuffer between two hinted ops cannot be reordered.
@@ -7602,13 +7604,12 @@ class TestReorderUnhintedInterlopers(unittest.TestCase):
     def test_mutating_interloper_blocked(self):
         # x mutates buffer 'a' produced by a hinted op; x cannot legally move
         # before the run (would run before 'a' is produced) and b reads x so
-        # x cannot move after — should raise RuntimeError.
+        # x cannot move after. Keep it in place as the run boundary.
         a = _make_rui_op("a", hint_ids=(0,))
         x = _make_rui_op("x", mutates=("a",))  # mutation dep on a
         b = _make_rui_op("b", reads=("x",), hint_ids=(0,))
         c = _make_rui_op("c", hint_ids=(0,))
-        with self.assertRaises(RuntimeError):
-            self._run([a, x, b, c])
+        self.assertEqual(self._run([a, x, b, c]), ["a", "x", "b", "c"])
 
 
 # ===========================================================================
@@ -7984,6 +7985,12 @@ class TestTileHelpers(unittest.TestCase):
     def test_compute_tile_stride_3d_padding(self):
         self.assertEqual(
             compute_tile_stride([8, 16, 32], [544, 32, 1], [2, 4, 8]), [34, 8, 1]
+        )
+
+    def test_compute_read_copy_strides_non_divisible_padded_extent(self):
+        self.assertEqual(
+            _compute_read_copy_strides([32, 640, 128], [81920, 128, 1], [8, 192, 128]),
+            [24576, 128, 1],
         )
 
     def test_compute_tile_offset_1d(self):
