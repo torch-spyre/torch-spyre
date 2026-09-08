@@ -154,6 +154,7 @@ def enable_spyre_compile_fx_wrapper():
             try:
                 if uses_spyre:
                     torch.spyre._impl._lazy_init()
+
                     # AOTAutograd uses the dict passed via ``decompositions=``
                     # to decompose the joint graph; Spyre-specific
                     # decompositions must be applied at this stage so ops like

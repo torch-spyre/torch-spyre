@@ -14,6 +14,7 @@
 
 
 import dataclasses
+from typing import Any
 
 from sympy import Symbol
 
@@ -196,11 +197,38 @@ def num_bytes(df: DataFormats) -> int:
     return 128 // num_elems
 
 
-def generate_constant_info(data_format, constants, num_cores):
+def generate_constant_info(
+    data_format: DataFormats,
+    constants: dict[str, Any],
+    num_cores: int,
+) -> dict[str, Any] | str:
+    """Generate constant information for SDSC.
+
+    Args:
+        data_format: The data format for encoding constants
+        constants: Dictionary of constant name to value
+        num_cores: Number of cores
+
+    Returns:
+        Dictionary of constant information for SDSC JSON, or the literal string "{}"
+        for the empty-constants case (required by DeepTools SDSC JSON consumer).
+    """
+    # NOTE: Returns the literal string "{}" for the empty-constants case (not an
+    # empty dict) — required by the DeepTools SDSC JSON consumer which distinguishes
+    # between a missing constantInfo_ field and an empty one.
     if len(constants.keys()) == 0:
         return "{}"
-    constant_info = {}
+
+    constant_info: dict[str, Any] = {}
     for name, value in constants.items():
+        try:
+            encoded_value = encode_constant(value, data_format)
+        except (ValueError, TypeError) as e:
+            raise ValueError(
+                f"Cannot encode constant '{name}' with value {value} "
+                f"(type: {type(value).__name__}) to {data_format.name}: {e}"
+            ) from e
+
         ci = {
             "dataFormat_": data_format.name,
             "name_": name,
@@ -211,7 +239,7 @@ def generate_constant_info(data_format, constants, num_cores):
                     {"factor_": 1, "label_": "corelet"},
                     {"factor_": 1, "label_": "time"},
                 ],
-                "data_": {"[0, 0, 0]": [encode_constant(value, data_format)]},
+                "data_": {"[0, 0, 0]": [encoded_value]},
             },
         }
         constant_info[f"{len(constant_info)}"] = ci

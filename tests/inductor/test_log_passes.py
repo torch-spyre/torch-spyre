@@ -208,8 +208,8 @@ class TestPerPassLoggingIntegration:
         # Logger level too high — DEBUG guard blocks output
         with config.patch({"log_passes": "all"}):
             with patch("torch_spyre._inductor.passes.logger") as mock_logger:
-                mock_logger.isEnabledFor.side_effect = (
-                    lambda level: level != logging.DEBUG
+                mock_logger.isEnabledFor.side_effect = lambda level: (
+                    level != logging.DEBUG
                 )
                 passes_obj(graph)
 
