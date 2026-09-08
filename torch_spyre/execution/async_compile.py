@@ -564,9 +564,17 @@ class SpyreAsyncCompile(AsyncCompile):
             fh.write(ktir_text)
         logger.debug("OpSpec->KTIR: wrote %s", ktir_path)
 
-        return self._compile_ktir_with_dbo(kernel_name, ktir_path, output_dir, sdsc_bundle_dir_prefix)
+        return self._compile_ktir_with_dbo(
+            kernel_name, ktir_path, output_dir, sdsc_bundle_dir_prefix
+        )
 
-    def _compile_ktir_with_dbo(self, kernel_name: str, ktir_path: str, output_dir: str, sdsc_bundle_dir_prefix: str):
+    def _compile_ktir_with_dbo(
+        self,
+        kernel_name: str,
+        ktir_path: str,
+        output_dir: str,
+        sdsc_bundle_dir_prefix: str,
+    ):
         """Compile ``ktir_path`` with ``dbo-opt`` and return a runner for it.
 
         ``--export-dir`` receives the per-kernel output dir, under which dbo-opt
@@ -654,7 +662,7 @@ class SpyreAsyncCompile(AsyncCompile):
             kernel_name,
             output_dir,
             kernel_provenance=None,
-            sdsc_bundle_dir_prefix=sdsc_bundle_dir_prefix
+            sdsc_bundle_dir_prefix=sdsc_bundle_dir_prefix,
         )
 
     def wait(self, scope: dict[str, Any]) -> None:

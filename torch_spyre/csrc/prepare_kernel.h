@@ -205,8 +205,7 @@ class JobPlanBuilder {
  * @return Prepared JobPlan
  */
 std::unique_ptr<JobPlan> prepareKernel(
-    const std::string& spyrecode_dir,
-    const SpyreStream* stream = nullptr,
+    const std::string& spyrecode_dir, const SpyreStream* stream = nullptr,
     std::optional<std::string> profiler_name = std::nullopt,
     std::string sdsc_bundle_dir_prefix = {});
 

@@ -75,7 +75,10 @@ class _PrereqCase(unittest.TestCase):
 
     def compile(self):
         return _compiler()._compile_ktir_with_dbo(
-            "ktir_fused_add_0", self.ktir_path, self.output_dir, self.sdsc_bundle_dir_prefix
+            "ktir_fused_add_0",
+            self.ktir_path,
+            self.output_dir,
+            self.sdsc_bundle_dir_prefix,
         )
 
     def _write_spyrecode(self):

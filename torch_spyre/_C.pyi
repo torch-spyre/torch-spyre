@@ -433,6 +433,7 @@ def prepare_kernel(
     spyrecode_dir: str,
     stream: _SpyreStreamBase | None = None,
     profiler_name: str | None = None,
+    sdsc_bundle_dir_prefix: str | None = "",
 ) -> JobPlan:
     """
     Prepare a kernel from a SpyreCode directory and return a JobPlan.

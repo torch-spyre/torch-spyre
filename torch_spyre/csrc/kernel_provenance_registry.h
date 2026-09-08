@@ -46,7 +46,7 @@ std::string activityNameBase(const std::string& activity_name);
  * kernel regardless of whether provenance is present.
  */
 void registerBundleDirPrefix(const std::string& name_base,
-                              std::string sdsc_bundle_dir_prefix);
+                             std::string sdsc_bundle_dir_prefix);
 
 /**
  * Return the SDSC bundle directory prefix for an activity name base, or an

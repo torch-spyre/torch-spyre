@@ -780,10 +780,10 @@ JobPlanBuilder::ValidationResult JobPlanBuilder::validate(
 
 std::unique_ptr<JobPlan> JobPlanBuilder::build() {
   // Register the SDSC bundle directory prefix for this kernel so the activity
-  // handler can emit sdsc_bundle_dir_prefix unconditionally in trace args metadata.
-  // The name base mirrors how translateComputeOnDevice forms the step name:
-  // prefer profiler_name_ (stable provenance name), otherwise use the fallback
-  // directory path that lands in the activity name.
+  // handler can emit sdsc_bundle_dir_prefix unconditionally in trace args
+  // metadata. The name base mirrors how translateComputeOnDevice forms the step
+  // name: prefer profiler_name_ (stable provenance name), otherwise use the
+  // fallback directory path that lands in the activity name.
   if (!sdsc_bundle_dir_prefix_.empty()) {
     std::string name_base;
     if (profiler_name_.has_value() && !profiler_name_->empty()) {
@@ -820,12 +820,11 @@ std::unique_ptr<JobPlan> JobPlanBuilder::build() {
   return job_plan;
 }
 
-std::unique_ptr<JobPlan> prepareKernel(
-    const std::string& spyrecode_dir, const SpyreStream* stream,
-    std::optional<std::string> profiler_name,
-    std::string sdsc_bundle_dir_prefix) {
-  JobPlanBuilder builder(spyrecode_dir,
-                         stream, std::move(profiler_name),
+std::unique_ptr<JobPlan> prepareKernel(const std::string& spyrecode_dir,
+                                       const SpyreStream* stream,
+                                       std::optional<std::string> profiler_name,
+                                       std::string sdsc_bundle_dir_prefix) {
+  JobPlanBuilder builder(spyrecode_dir, stream, std::move(profiler_name),
                          std::move(sdsc_bundle_dir_prefix));
   auto jobplan = builder.build();
 

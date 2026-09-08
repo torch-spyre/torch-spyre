@@ -883,7 +883,10 @@ class TestPrepareKernel:
                 profiler_name=profiler_name,
                 sdsc_bundle_dir_prefix=sdsc_bundle_dir_prefix,
             )
-        assert torch_spyre._C.lookup_bundle_dir_prefix(profiler_name) == sdsc_bundle_dir_prefix
+        assert (
+            torch_spyre._C.lookup_bundle_dir_prefix(profiler_name)
+            == sdsc_bundle_dir_prefix
+        )
 
     def test_sdsc_bundle_dir_prefix_registered_without_provenance_profiler_name(self):
         """Without a profiler_name (no provenance key), the prefix is still
@@ -906,19 +909,38 @@ class TestPrepareKernel:
             # in translateComputeOnDevice: <sdsc_dir>/<spyreCodeDir>/bundle.mlir
             sdsc_dir = os.path.basename(tmpdir)
             expected_name_base = os.path.join(sdsc_dir, "spyreCodeDir", "bundle.mlir")
-            assert torch_spyre._C.lookup_bundle_dir_prefix(expected_name_base) == sdsc_bundle_dir_prefix
+            assert (
+                torch_spyre._C.lookup_bundle_dir_prefix(expected_name_base)
+                == sdsc_bundle_dir_prefix
+            )
+
 
 @pytest.mark.parametrize(
     ("profiler_name", "expected_activity_name_base"),
-        [
-            ("spyre_kernel_v1_fused_mm_aaaaaaaaaaaaaaaa", "spyre_kernel_v1_fused_mm_aaaaaaaaaaaaaaaa"),
-            ("spyre_kernel_v1_fused_mm_aaaaaaaaaaaaaaaa#17", "spyre_kernel_v1_fused_mm_aaaaaaaaaaaaaaaa"),
-            ("spyre_kernel_v1_fused_mm_aaaaaaaaaaaaaaaa#step", "spyre_kernel_v1_fused_mm_aaaaaaaaaaaaaaaa#step"),
-            ("spyre_kernel_v1_fused_mm_aaaaaaaaaaaaaaaa#", "spyre_kernel_v1_fused_mm_aaaaaaaaaaaaaaaa"),
-        ],
-    )
+    [
+        (
+            "spyre_kernel_v1_fused_mm_aaaaaaaaaaaaaaaa",
+            "spyre_kernel_v1_fused_mm_aaaaaaaaaaaaaaaa",
+        ),
+        (
+            "spyre_kernel_v1_fused_mm_aaaaaaaaaaaaaaaa#17",
+            "spyre_kernel_v1_fused_mm_aaaaaaaaaaaaaaaa",
+        ),
+        (
+            "spyre_kernel_v1_fused_mm_aaaaaaaaaaaaaaaa#step",
+            "spyre_kernel_v1_fused_mm_aaaaaaaaaaaaaaaa#step",
+        ),
+        (
+            "spyre_kernel_v1_fused_mm_aaaaaaaaaaaaaaaa#",
+            "spyre_kernel_v1_fused_mm_aaaaaaaaaaaaaaaa",
+        ),
+    ],
+)
 def test_activity_name_base(profiler_name, expected_activity_name_base):
-    assert torch_spyre._C.activity_name_base(profiler_name) == expected_activity_name_base
+    assert (
+        torch_spyre._C.activity_name_base(profiler_name) == expected_activity_name_base
+    )
+
 
 # The canonical correction triple, as parallel (StepKind, StreamRole) name
 # lists: [HostCompute(Prep), H2D(Prep), Compute(Dev)]. This is what
