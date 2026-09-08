@@ -1429,18 +1429,18 @@ def main():
             # existing so this deploys before the migration.
             if v2_benchmark_tables_present(client):
                 _src, _ext = v2_source_and_external_run_id(args, str(run_id))
-                _v2_uid = v2_run_id(_src, _ext, args.platform or "", "perf")
-                if not _v2_uid:
+                _v2_run_id = v2_run_id(_src, _ext, args.platform or "", "perf")
+                if not _v2_run_id:
                     print(
                         "  [warn] v2 skipped: run_id not derivable "
                         f"(source={_src!r} external_run_id={_ext!r})",
                         file=sys.stderr,
                     )
-                elif v2_benchmarks_already_ingested(client, _v2_uid):
-                    print(f"  v2: already ingested run_id={_v2_uid} — skipping")
+                elif v2_benchmarks_already_ingested(client, _v2_run_id):
+                    print(f"  v2: already ingested run_id={_v2_run_id} — skipping")
                 else:
-                    _n = insert_benchmarks_v2(client, _v2_uid, kernels)
-                    print(f"  v2: {_n} benchmark_runs under run_id={_v2_uid}")
+                    _n = insert_benchmarks_v2(client, _v2_run_id, kernels)
+                    print(f"  v2: {_n} benchmark_runs under run_id={_v2_run_id}")
 
             total_kernels += len(kernels)
             print(f"  Inserted {len(kernels)} kernel rows")
@@ -1487,18 +1487,18 @@ def main():
             # existing so this deploys before the migration.
             if v2_benchmark_tables_present(client):
                 _src, _ext = v2_source_and_external_run_id(args, str(run_id))
-                _v2_uid = v2_run_id(_src, _ext, args.platform or "", "perf")
-                if not _v2_uid:
+                _v2_run_id = v2_run_id(_src, _ext, args.platform or "", "perf")
+                if not _v2_run_id:
                     print(
                         "  [warn] v2 skipped: run_id not derivable "
                         f"(source={_src!r} external_run_id={_ext!r})",
                         file=sys.stderr,
                     )
-                elif v2_benchmarks_already_ingested(client, _v2_uid):
-                    print(f"  v2: already ingested run_id={_v2_uid} — skipping")
+                elif v2_benchmarks_already_ingested(client, _v2_run_id):
+                    print(f"  v2: already ingested run_id={_v2_run_id} — skipping")
                 else:
-                    _n = insert_benchmarks_v2(client, _v2_uid, benchmarks)
-                    print(f"  v2: {_n} benchmark_runs under run_id={_v2_uid}")
+                    _n = insert_benchmarks_v2(client, _v2_run_id, benchmarks)
+                    print(f"  v2: {_n} benchmark_runs under run_id={_v2_run_id}")
 
             total_benchmarks += len(benchmarks)
             print(f"  Inserted {len(benchmarks)} benchmark rows")
