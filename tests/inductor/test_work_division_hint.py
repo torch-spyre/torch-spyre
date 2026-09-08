@@ -47,7 +47,7 @@ import torch_spyre._inductor.scratchpad.lx_relayout as lx_relayout_module
 import torch_spyre._inductor.scheduler as scheduler_module
 import torch_spyre._inductor.work_division as _wd
 import torch_spyre._inductor.wsr.propagate_named_dims as _pnd
-from torch_spyre._C import DataFormats, ElementArrangement
+from torch_spyre._C import DataFormats, SpyreTensorLayout
 from torch_spyre._inductor.codegen.superdsc import compile_op_spec, parse_op_spec
 from torch_spyre._inductor.constants import (
     BATCH_MATMUL_OP,
@@ -1334,11 +1334,8 @@ def test_relayout_footprint_uses_device_storage_not_host_strides(host_strides):
     # Its old HOST-stride measurement reserved only 256 / 2176 bytes. The
     # device-storage bound is 8192 / 245760 regardless of the host permutation.
     layout = object.__new__(FixedTiledLayout)
-    layout.device_layout = SimpleNamespace(
-        device_size=(8, 1, 2, 128, 64),
-        stride_map=host_strides,
-        elems_per_stick=lambda: 64,
-        element_arrangement=ElementArrangement.STANDARD,
+    layout.device_layout = SpyreTensorLayout(
+        [8, 1, 2, 128, 64], list(host_strides), DataFormats.SEN169_FP16
     )
     source = PerCoreView(
         ((0, 8), (2, 2), (3, 2)),
