@@ -495,6 +495,7 @@ class _SympyExprToCpSat(Printer):
                 #   max 0.074% deviation with 8 segments;
                 #   max 0.019% deviation with 12 segments;
                 #   no deviation with 16 segments.
+                # script at https://github.com/user-attachments/files/31975789/approximate-power.py
                 return sympy.Piecewise(
                     (0.139980295504224 * arg + 0.860019704495776, arg <= 5),
                     (0.0287191888771944 * arg + 1.45940018593522, True),
