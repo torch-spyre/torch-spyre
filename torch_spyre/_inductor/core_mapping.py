@@ -24,6 +24,7 @@ from typing import Any, Callable
 
 from sympy import Expr, Integer, Mod, Symbol, floor, sympify
 
+from .constants import BYTES_PER_STICK
 from .op_spec import TensorWorkDivision
 
 
@@ -656,6 +657,42 @@ def derive_operation_mapping(
             return candidate
 
     raise ValueError("no operation core mapping satisfies every LX tensor owner")
+
+
+def partition_physical_span_bytes(
+    device_size: Sequence[int],
+    elems_per_stick: int,
+    split_by_device_dim: Mapping[int, int],
+) -> int:
+    """Bound a standard-layout partition, retaining physical gaps between rows.
+
+    Device dimensions are stored in decreasing physical-stride order. The
+    layout's ``stride_map`` instead addresses HOST memory and must not size LX.
+    A backend may pack a partition more tightly; retaining the original device
+    strides is a conservative bound. The final dimension is one complete stick
+    and is never split. This measures placement, not the split-cost estimate.
+    """
+
+    if not device_size or any(extent <= 0 for extent in device_size):
+        raise ValueError("device extents must be positive")
+    if elems_per_stick <= 0:
+        raise ValueError("elems_per_stick must be positive")
+    for dim, split in split_by_device_dim.items():
+        if dim < 0 or dim >= len(device_size) or split <= 0:
+            raise ValueError(f"invalid split {split} on device dimension {dim}")
+    if device_size[-1] != elems_per_stick:
+        raise ValueError("physical span requires one complete final stick dimension")
+    if split_by_device_dim.get(len(device_size) - 1, 1) != 1:
+        raise ValueError("the final stick dimension cannot be split")
+
+    span_sticks = stride_sticks = 1
+    for dim in reversed(range(len(device_size) - 1)):
+        extent = device_size[dim]
+        split = split_by_device_dim.get(dim, 1)
+        slice_extent = (extent + split - 1) // split
+        span_sticks += (slice_extent - 1) * stride_sticks
+        stride_sticks *= extent
+    return span_sticks * BYTES_PER_STICK
 
 
 def core_mappings_equal(

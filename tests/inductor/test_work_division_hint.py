@@ -28,7 +28,7 @@ from typing import Any
 from unittest.mock import patch as mock_patch
 
 import pytest
-from sympy import floor, Integer, Mod, Symbol
+from sympy import Eq, floor, Integer, Mod, Piecewise, Symbol
 import torch
 import torch.fx.traceback
 from torch.fx.graph_module import GraphModule
@@ -47,13 +47,14 @@ import torch_spyre._inductor.scratchpad.lx_relayout as lx_relayout_module
 import torch_spyre._inductor.scheduler as scheduler_module
 import torch_spyre._inductor.work_division as _wd
 import torch_spyre._inductor.wsr.propagate_named_dims as _pnd
-from torch_spyre._C import DataFormats
+from torch_spyre._C import DataFormats, ElementArrangement
 from torch_spyre._inductor.codegen.superdsc import compile_op_spec, parse_op_spec
 from torch_spyre._inductor.constants import (
     BATCH_MATMUL_OP,
     IDENTITY_OP,
 )
 from torch_spyre._inductor.errors import Unsupported
+from torch_spyre._inductor.ir import FixedTiledLayout
 from torch_spyre._inductor.loop_info import CarriedReductionRecord
 from torch_spyre._inductor.scratchpad.lx_relayout import (
     LXRelayoutPlan,
@@ -679,6 +680,83 @@ def _allocation_graph(*operation_names):
 
 
 @pytest.mark.parametrize(
+    ("source", "destination", "source_num_cores", "destination_num_cores", "supported"),
+    [
+        # Grouped contraction of two dimensions.
+        (
+            _view({0: 4, 1: 8}, {0: floor(_CORE_ID / 8), 1: Mod(_CORE_ID, 8)}, 32),
+            _view(
+                {0: 2, 1: 4},
+                {0: floor(_CORE_ID / 16), 1: Mod(floor(_CORE_ID / 4), 4)},
+                32,
+            ),
+            32,
+            32,
+            True,
+        ),
+        # Combined gather/broadcast is not enabled at this level.
+        (
+            _view({2: 32}, {2: Mod(_CORE_ID, 32)}, 32),
+            _view(
+                {1: 8, 3: 2}, {1: Mod(_CORE_ID, 8), 3: Mod(floor(_CORE_ID / 16), 2)}, 32
+            ),
+            32,
+            32,
+            False,
+        ),
+        # A larger domain need not replicate slices evenly: each source feeds
+        # four cores and each destination core has one source.
+        (
+            _view({0: 2}, {0: Mod(_CORE_ID, 2)}, 2),
+            _view(
+                {0: 4},
+                {
+                    0: Piecewise(
+                        (0, Eq(_CORE_ID, 0)),
+                        (1, _CORE_ID < 4),
+                        (2, Eq(_CORE_ID, 4)),
+                        (3, True),
+                    )
+                },
+                8,
+            ),
+            2,
+            8,
+            True,
+        ),
+        # Same domain, uniform fan-in and fan-out of eight, yet one replica of
+        # one slice and seven of the other: no emitted movement fills that.
+        (
+            _view({0: 8}, {0: Mod(_CORE_ID, 8)}, 8),
+            _view({1: 2}, {1: Piecewise((0, Eq(_CORE_ID, 0)), (1, True))}, 8),
+            8,
+            8,
+            False,
+        ),
+        # Ownership described on another core domain than the transfer.
+        (
+            _view({0: 2}, {0: Mod(_CORE_ID, 2)}, 4),
+            _view({0: 2}, {0: floor(_CORE_ID / 16)}, 32),
+            2,
+            32,
+            False,
+        ),
+    ],
+)
+def test_movement_rule_reads_the_owner_maps(
+    source, destination, source_num_cores, destination_num_cores, supported
+):
+    """The backend moves complete partitions; one rule certifies them."""
+
+    assert (
+        lx_relayout_module.movement_supported(
+            source, destination, source_num_cores, destination_num_cores
+        )
+        is supported
+    )
+
+
+@pytest.mark.parametrize(
     ("view", "device_size", "coordinates", "extents", "expected"),
     [
         # A fused loop over two physical axes projects to one 32-way division
@@ -853,6 +931,7 @@ def test_lx_relayout_planner_rejects_equal_projected_ownership():
             lx_relayout_module, "iteration_space_from_op", return_value={m: 32}
         ),
         mock_patch.object(lx_relayout_module, "is_restickify_op", return_value=False),
+        mock_patch.object(lx_relayout_module, "partition_footprint", return_value=128),
     ):
         assert lx_relayout_module.collect_lx_relayout_plans(graph) == []
 
@@ -1070,6 +1149,72 @@ def test_lx_relayout_consumers_share_destination_view(second_consumer):
         "sencores": 32,
         "lx_planning": True,
         "allow_all_ops_in_lx_planning": True,
+        "lx_planner_relayout": True,
+        "layout_solver": "greedy",
+    }
+)
+@pytest.mark.parametrize(
+    "broadcast", [False, True], ids=["gather", "broadcast_2_to_32"]
+)
+def test_grouped_lx_relayout_device(broadcast):
+    """Check numerical results, exact core domains, and the emitted LX copy.
+
+    Gather assembles eight key fragments within each head. Broadcast keeps
+    two complete output-column slices and sends each to sixteen consumers.
+    Neither case may silently fall back to an HBM copy.
+    """
+
+    torch.manual_seed(0)
+    if broadcast:
+        batch, query, key, width = 1, 16, 64, 128
+        producer = {"D": 2}
+        consumer = {"Lq": 16, "D": 2}
+        source_cores = 2
+    else:
+        batch, query, key, width = 4, 8, 128, 64
+        producer = {"H": 4, "Lk": 8}
+        consumer = {"H": 4, "Lq": 8}
+        source_cores = 32
+    value = torch.randn(batch, key, width, dtype=torch.float16)
+    attention = torch.randn(batch, query, key, dtype=torch.float16)
+    for name, size in (("H", batch), ("Lk", key), ("Lq", query), ("D", width)):
+        _declare_tensor_dim(name, size)
+
+    def fn(value, attention):
+        with spyre_hint(work_div=producer):
+            hidden = torch.neg(value)
+        with spyre_hint(work_div=consumer):
+            return torch.bmm(attention, hidden)
+
+    device_args = (
+        _name_tensor_dims(value.to("spyre"), ["H", "Lk", "D"]),
+        _name_tensor_dims(attention.to("spyre"), ["H", "Lq", "Lk"]),
+    )
+    torch._inductor.codecache.FxGraphCache.clear()
+    with _capture_backend_output_dirs() as output_dirs:
+        actual, code = run_and_get_code(
+            torch.compile(fn, dynamic=False, options={"epilogue_fusion": False}),
+            *device_args,
+        )
+    torch.testing.assert_close(actual.cpu(), fn(value, attention), rtol=2e-2, atol=2e-1)
+    relayouts = [
+        block
+        for block in "\n".join(code).split("OpSpec(")
+        if "op='identity'" in block[:100]
+        and block.count("allocation={'lx':") == 2
+        and block.count("TensorWorkDivision(") == 2
+    ]
+    assert len(relayouts) == 1
+    domains = re.findall(r"num_cores=(\d+)", relayouts[0])
+    assert domains == [str(source_cores), "32"]
+    _assert_lx_only_relayout_payload(output_dirs)
+
+
+@config.patch(
+    {
+        "sencores": 32,
+        "lx_planning": True,
+        "allow_all_ops_in_lx_planning": True,
         "layout_solver": "greedy",
     }
 )
@@ -1178,6 +1323,37 @@ def test_lx_relayout_allocation_is_atomic_in_one_greedy_solve(caplog):
         "rejected LX relayout group source=source" in record.message
         for record in caplog.records
     )
+
+
+@pytest.mark.parametrize(
+    "host_strides",
+    [(128, -1, 65536, 1, 1024), (128, -1, 64, 1024, 1)],
+)
+def test_relayout_footprint_uses_device_storage_not_host_strides(host_strides):
+    # The first layout is the actual restickified K page from serving prefill.
+    # Its old HOST-stride measurement reserved only 256 / 2176 bytes. The
+    # device-storage bound is 8192 / 245760 regardless of the host permutation.
+    layout = object.__new__(FixedTiledLayout)
+    layout.device_layout = SimpleNamespace(
+        device_size=(8, 1, 2, 128, 64),
+        stride_map=host_strides,
+        elems_per_stick=lambda: 64,
+        element_arrangement=ElementArrangement.STANDARD,
+    )
+    source = PerCoreView(
+        ((0, 8), (2, 2), (3, 2)),
+        (
+            (0, Mod(floor(_CORE_ID / 2), 8)),
+            (2, Mod(_CORE_ID, 2)),
+            (3, Mod(floor(_CORE_ID / 16), 2)),
+        ),
+        num_cores=32,
+    )
+    destination = PerCoreView(
+        ((2, 2),), ((2, Mod(floor(_CORE_ID / 16), 2)),), num_cores=32
+    )
+    assert lx_relayout_module.partition_footprint(layout, source) == 8192
+    assert lx_relayout_module.partition_footprint(layout, destination) == 245760
 
 
 def _assert_live_buffers_do_not_share_addresses(graph, buffers, limit):

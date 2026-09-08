@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import collections
 import dataclasses
 import math
 from collections.abc import Mapping, Sequence
@@ -28,11 +29,13 @@ from torch._inductor.ir import (
     Operation,
     Pointwise,
 )
+from torch_spyre._C import ElementArrangement
 
 from .. import config
 from ..core_mapping import (
     core_mappings_equal,
     owner_slots,
+    partition_physical_span_bytes,
     _loop_regions,
     _LOOP_POINT,
     _MAX_EXACT_DIRECT_AXIS_POINTS,
@@ -66,6 +69,8 @@ class LXRelayoutPlan:
     source_view: PerCoreView
     destination_view: PerCoreView
     num_cores: int
+    source_footprint_bytes: int = 0
+    destination_footprint_bytes: int = 0
     source_address: int | None = None
     destination_address: int | None = None
 
@@ -291,22 +296,93 @@ def _core_slices(view: PerCoreView, num_cores: int) -> dict[int, dict[int, int]]
     return dict(enumerate(rows))
 
 
-def movement_supported(source, destination, source_num_cores, destination_num_cores):
-    """The original relayout: two complete, distinct partitions of the same cores."""
-    if source_num_cores != destination_num_cores or source_num_cores <= 0:
+def partition_footprint(layout: FixedTiledLayout, view: PerCoreView) -> int:
+    device_layout = layout.device_layout
+    if device_layout.element_arrangement != ElementArrangement.STANDARD:
+        raise ValueError("relayout footprint requires standard element arrangement")
+    return partition_physical_span_bytes(
+        tuple(int(size) for size in device_layout.device_size),
+        int(device_layout.elems_per_stick()),
+        dict(view.work_slice_dims),
+    )
+
+
+def _overlap(a: int, an: int, b: int, bn: int) -> bool:
+    return a * bn < (b + 1) * an and b * an < (a + 1) * bn
+
+
+def movement_supported(
+    source: PerCoreView,
+    destination: PerCoreView,
+    source_num_cores: int,
+    destination_num_cores: int,
+) -> bool:
+    """Extend the original full-partition check to gathers and broadcasts.
+
+    Edges are ownership intersections, never a separate geometry calculation.
+    A complete source may feed uniformly repeated destination slices. Across
+    unequal core counts, only even broadcasts (one source per destination) are
+    supported. Equal destination slices have identical sources by construction.
+    """
+
+    num_cores = source_num_cores
+    source_splits = dict(source.work_slice_dims)
+    destination_splits = dict(destination.work_slice_dims)
+    destination_slices = math.prod(destination_splits.values())
+    if (
+        num_cores <= 0
+        or destination_num_cores < num_cores
+        or source.num_cores != num_cores
+        or destination.num_cores != destination_num_cores
+        or destination_num_cores % num_cores
+        or math.prod(source_splits.values()) != num_cores
+        or destination_slices <= 0
+        or destination_num_cores % destination_slices
+        or (num_cores == destination_num_cores and source.same_partition(destination))
+    ):
         return False
-    if source.same_partition(destination):
-        return False
-    for view in (source, destination):
-        if math.prod(dict(view.work_slice_dims).values()) != source_num_cores:
-            return False
-        rows = _core_slices(view, source_num_cores)
-        if (
-            len({tuple(sorted(row.items())) for row in rows.values()})
-            != source_num_cores
+    if num_cores == destination_num_cores and destination_slices < num_cores:
+        if any(
+            source_splits.get(dim, 1) % destination_splits.get(dim, 1)
+            for dim in source_splits.keys() | destination_splits.keys()
         ):
             return False
-    return True
+    source_map = _core_slices(source, num_cores)
+    destination_map = _core_slices(destination, destination_num_cores)
+    dims = set(source_splits) | set(destination_splits)
+    edges = {
+        (s_core, d_core)
+        for s_core, s_slice in source_map.items()
+        for d_core, d_slice in destination_map.items()
+        if all(
+            _overlap(
+                s_slice.get(dim, 0),
+                source_splits.get(dim, 1),
+                d_slice.get(dim, 0),
+                destination_splits.get(dim, 1),
+            )
+            for dim in dims
+        )
+    }
+    fanout = [sum(src == core for src, _ in edges) for core in range(num_cores)]
+    fanin = [
+        sum(dst == core for _, dst in edges) for core in range(destination_num_cores)
+    ]
+    replicas = collections.Counter(
+        tuple(sorted(row.items())) for row in destination_map.values()
+    )
+    return bool(edges) and all(
+        (
+            len(set(fanout)) == 1,
+            len(set(fanin)) == 1,
+            len({tuple(sorted(row.items())) for row in source_map.values()})
+            == num_cores,
+            len(replicas) == destination_slices,
+            num_cores != destination_num_cores or len(set(replicas.values())) == 1,
+            num_cores == destination_num_cores
+            or (fanout[0] == destination_num_cores // num_cores and fanin[0] == 1),
+        )
+    )
 
 
 def _single_write(op: ComputedBuffer, name: str) -> MemoryDep | None:
@@ -461,8 +537,23 @@ def collect_lx_relayout_plans(
                     "cannot represent: consumer ownership is partial or unrepresentable"
                 )
                 break
-            if consumer_num_cores != source_num_cores:
-                rejection_reason = "cannot emit: different core counts"
+            if consumer_num_cores < source_num_cores:
+                rejection_reason = (
+                    "cannot emit: consumer uses fewer physical cores than producer"
+                )
+                break
+            if consumer_num_cores > source_num_cores and not _is_matmul_op(consumer):
+                rejection_reason = (
+                    "cannot emit: grouped broadcast requires a matmul consumer"
+                )
+                break
+            if (
+                consumer_num_cores > source_num_cores
+                and consumer_num_cores != config.sencores
+            ):
+                rejection_reason = (
+                    "cannot emit: grouped broadcast must target all compute cores"
+                )
                 break
             consumer_coordinates = try_device_coordinates(
                 producer.layout.device_layout, dep, None
@@ -487,7 +578,24 @@ def collect_lx_relayout_plans(
                 )
                 break
 
-            failure = "cannot emit: unsupported ownership transfer"
+            destination_owners = math.prod(dict(view.work_slice_dims).values())
+            if consumer_num_cores > source_num_cores:
+                failure = (
+                    "cannot emit: grouped destination does not evenly "
+                    "broadcast the source"
+                )
+            elif destination_owners < source_num_cores:
+                if not is_matmul:
+                    rejection_reason = (
+                        "cannot emit: grouped gather requires a matmul consumer"
+                    )
+                    break
+                failure = (
+                    "cannot emit: grouped destination does not evenly contract "
+                    "the source"
+                )
+            else:
+                failure = "cannot emit: unsupported ownership transfer"
 
             try:
                 supported = movement_supported(
@@ -506,7 +614,13 @@ def collect_lx_relayout_plans(
             )
 
         # Reuse the ownership comparison and preserve first-consumer order.
-        destinations: list[tuple[PerCoreView, list[str]]] = []
+        destinations: list[tuple[PerCoreView, int, list[str]]] = []
+        if rejection_reason is None:
+            try:
+                source_footprint = partition_footprint(producer.layout, source_view)
+            except (TypeError, ValueError) as exc:
+                rejection_reason = f"allocation: source footprint is unavailable: {exc}"
+
         if rejection_reason is None:
             for (
                 consumer_name,
@@ -553,12 +667,25 @@ def collect_lx_relayout_plans(
                 ):
                     rejection_reason = reason
                     break
-                for group_view, consumers in destinations:
-                    if group_view.same_partition(destination_view):
+                try:
+                    destination_footprint = partition_footprint(
+                        producer.layout, destination_view
+                    )
+                except (TypeError, ValueError) as exc:
+                    rejection_reason = (
+                        f"allocation: destination footprint is unavailable: {exc}"
+                    )
+                    break
+                for group_view, footprint, consumers in destinations:
+                    if footprint == destination_footprint and group_view.same_partition(
+                        destination_view
+                    ):
                         consumers.append(consumer_name)
                         break
                 else:
-                    destinations.append((destination_view, [consumer_name]))
+                    destinations.append(
+                        (destination_view, destination_footprint, [consumer_name])
+                    )
 
         if rejection_reason is None:
             result.extend(
@@ -568,9 +695,12 @@ def collect_lx_relayout_plans(
                     source_view=source_view,
                     destination_view=destination_view,
                     num_cores=source_num_cores,
+                    source_footprint_bytes=source_footprint,
+                    destination_footprint_bytes=destination_footprint,
                 )
                 for (
                     destination_view,
+                    destination_footprint,
                     consumer_names,
                 ) in destinations
             )
