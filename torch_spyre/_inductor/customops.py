@@ -19,6 +19,7 @@ import torch._higher_order_ops.effects
 from torch._inductor.fx_passes.reinplace import inplaceable_ops, InplaceableOp
 from torch_spyre.ops.eager import compile_once
 from torch_spyre.ops.fallbacks import warn_fallback
+from .propagate_hints import spyre_hint
 
 from .errors import Unsupported
 
@@ -1048,3 +1049,105 @@ def _(input: torch.Tensor, dim: int, keepdim: bool = False) -> torch.Tensor:
     else:
         out_shape = out_shape[:dim] + out_shape[dim + 1 :]
     return torch.empty(out_shape, dtype=input.dtype, device=input.device)
+
+
+# Mamba-2 SSD device kernels (compiled by the driver in tests/inductor/test_ssd.py).
+def _ssd_build_decay_matrix(decay_before, decay_cumsum, strict_mask):
+    """Scan decay-matrix run rows (BH,C,C); the (BH,1,C) final row is host-built."""
+    outer = decay_before.unsqueeze(-1) - decay_cumsum.unsqueeze(-2)
+    return torch.exp(torch.clamp(outer, max=0.0)) * strict_mask
+
+
+def _ssd_build_intra_decay(g_row, g_col, causal_mask):
+    """(BH,C,L,L) bounded intra-chunk decay mask (masked fallback path)."""
+    outer = g_row - g_col.unsqueeze(-2)
+    return torch.exp(torch.clamp(outer, max=0.0)) * causal_mask
+
+
+def _ssd_fused_cblock(
+    a,
+    cumsum_tri,
+    c_proj,
+    b_proj,
+    causal_mask,
+    x,
+    decay_run,
+    decay_final,
+    init_state=None,
+    init_col=None,
+    bh_tiles=4,
+    cblock=64,
+):
+    """Factored intra + C-block inter-chunk scan + off-diagonal combine.
+    bh_tiles: spyre_hint batch-tile count for B*nheads.
+    cblock: C-row scan block size (one 64-elem stick); NCB = C // cblock.
+    """
+    c = decay_run.shape[-1]
+    ncb = max(1, c // cblock)
+    with spyre_hint(num_tiles_per_dim={"BH": bh_tiles}):
+        a_c = a * 1.0  # #3381: input -> ComputedBuffer
+        x_c = x * 1.0
+        dr = decay_run * 1.0
+        df = decay_final * 1.0
+
+        intra_cumsum = torch.matmul(a_c, cumsum_tri)  # (BH,C,L) = g
+        total = a_c.sum(dim=-1, keepdim=True)
+        shifted = intra_cumsum - 0.5 * total
+        half_tot = torch.exp(0.5 * total).unsqueeze(-1)
+        c_scaled = c_proj * torch.exp(shifted).unsqueeze(-1)
+        b_scaled_t = (b_proj * torch.exp(-shifted).unsqueeze(-1)).transpose(-1, -2)
+        attn = torch.matmul(c_scaled, b_scaled_t) * causal_mask
+        y_diag = torch.matmul(attn, x_c)  # (BH,C,L,P)
+        chunk_states = torch.matmul(b_scaled_t, x_c * half_tot)
+        bh_c, _, n, p = chunk_states.shape
+        cs_np = chunk_states.reshape(bh_c, c, n * p)  # (BH,C,N*P)
+
+        with spyre_hint(work_div={"C": ncb}):
+            scan = torch.matmul(dr, cs_np)  # (BH,C,N*P) run rows
+        if init_state is not None:
+            scan = scan + init_col[:, :c] * init_state
+        rolled = scan.reshape(bh_c, c, n, p)
+        y_grouped = torch.matmul(c_scaled, rolled) * half_tot + y_diag
+
+        scan_final = torch.matmul(df, cs_np)  # (BH,1,N*P) final row
+        if init_state is not None:
+            scan_final = scan_final + init_col[:, c : c + 1] * init_state
+    return y_grouped, scan_final
+
+
+def _ssd_fused_masked(
+    a,
+    cumsum_tri,
+    c_proj,
+    b_proj,
+    decay_intra,
+    x,
+    decay_matrix,
+    init_state=None,
+    init_col=None,
+    bh_tiles=4,
+):
+    """fp16-overflow fallback: dense (BH,C,L,L) intra mask + dense (BH,C+1,C) scan.
+    bh_tiles: spyre_hint batch-tile count for B*nheads.
+    """
+    with spyre_hint(num_tiles_per_dim={"BH": bh_tiles}):
+        a_c = a * 1.0
+        c_c = c_proj * 1.0
+        b_c = b_proj * 1.0
+        x_c = x * 1.0
+        intra_cumsum = torch.matmul(a_c, cumsum_tri)  # (BH,C,L)
+        total = a_c.sum(dim=-1, keepdim=True)
+        decay_to_end = torch.exp(total - intra_cumsum)
+        attn = torch.matmul(c_c, b_c.transpose(-1, -2)) * decay_intra
+        y_diag = torch.matmul(attn, x_c)
+        b_decayed = b_c * decay_to_end.unsqueeze(-1)
+        chunk_states = torch.matmul(b_decayed.transpose(-1, -2), x_c)
+
+        bh, c, n, p = chunk_states.shape
+        scan_out = torch.matmul(decay_matrix, chunk_states.reshape(bh, c, n * p))
+        if init_state is not None:
+            scan_out = scan_out + init_col * init_state  # (BH,C+1,N*P)
+        rolled_states = scan_out[:, :c].reshape(bh, c, n, p)
+        y_off = torch.matmul(c_c, rolled_states)
+        y_off = y_off * torch.exp(intra_cumsum).unsqueeze(-1)
+        return y_off + y_diag, scan_out
