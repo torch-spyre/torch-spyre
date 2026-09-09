@@ -1349,6 +1349,115 @@ register_multicore_variants(
     counts=(32,),
 )
 
+
+# ---------------------------------------------------------------------------
+# 1-D value table. Registered separately from the main gather scenarios because
+# these assert exact values (expect_close=True) rather than allowing the
+# known-gap xfail, and two core counts are enough to cover the work division.
+# ---------------------------------------------------------------------------
+class _Gather1DTableScenario:
+    """x[i] where x is a 1-D table.
+
+    A 1-D table has only its stick dimension to be indexed on, so the value
+    tensor is re-tiled to one entry per stick. A gather is a pure copy, so
+    these require an exact match.
+    """
+
+    to_spyre = staticmethod(plain_to_spyre)
+
+    # Lengths either side of a stick boundary (64 elements at float16). The
+    # device extent rounds up to whole sticks, so these catch an entry count
+    # taken from the device dims rather than from the table.
+    LENGTHS = (2, 63, 64, 65, 100, 127, 128, 129, 192, 256)
+
+    # Larger tables, where the stick-per-entry cost starts to show.
+    LARGE_LENGTHS = (1000, 4096, 65536)
+
+    def _table(self, entries):
+        # arange is exact in float16 to 2048, so each entry equals its own
+        # index and a wrong address shows up as an obviously wrong number.
+        if entries <= 2048:
+            return self.to_spyre(torch.arange(entries, dtype=torch.float16))
+        return self.to_spyre(torch.rand(entries, dtype=torch.float16))
+
+    def _run(self, x, i):
+        run_e2e(self, lambda x, i: x[i], x, i, expect_close=True, atol=0, rtol=0)
+
+    def test_gather_1d_table(self):
+        """A per-expert scale table indexed by top-k ids."""
+        i = torch.randint(0, 128, (24, 8), dtype=torch.int32).to("spyre")
+        self._run(self._table(128), i)
+
+    def test_gather_1d_table_across_stick_boundaries(self):
+        """Indices either side of a stick edge."""
+        i = torch.tensor([0, 1, 63, 64, 65, 127], dtype=torch.int32).to("spyre")
+        self._run(self._table(128), i)
+
+    def test_gather_1d_table_more_reads_than_entries(self):
+        """192 tokens picking 8 experts each: 1536 reads from 128 entries."""
+        i = torch.randint(0, 128, (192, 8), dtype=torch.int32).to("spyre")
+        self._run(self._table(128), i)
+
+    def test_gather_1d_table_every_read_the_same_entry(self):
+        """Every read on entry 99, in the partly used last stick."""
+        i = torch.full((24, 8), 99, dtype=torch.int32).to("spyre")
+        self._run(self._table(100), i)
+
+    def test_gather_1d_table_bfloat16(self):
+        """bfloat16, the dtype the reported model uses."""
+        for entries in (63, 100, 128, 192, 256):
+            with self.subTest(entries=entries):
+                x = self.to_spyre(torch.arange(entries, dtype=torch.bfloat16))
+                i = torch.arange(entries, dtype=torch.int32).to("spyre")
+                self._run(x, i)
+
+    def test_gather_1d_table_int64_index(self):
+        """An int64 index, which is what ordinary PyTorch produces."""
+        i = torch.arange(128, dtype=torch.int64).to("spyre")
+        self._run(self._table(128), i)
+
+    def test_gather_1d_table_feeding_an_op(self):
+        """The gather consumed by a multiply, as the model composes it.
+
+        Not expected to pass: a fused gather diverges on this backend for 2-D
+        sources too, so run_e2e records it as an expected failure.
+        """
+        x = self._table(128)
+        i = torch.randint(0, 128, (24, 8), dtype=torch.int32).to("spyre")
+        w = self.to_spyre(torch.rand(24, 8, dtype=torch.float16))
+        run_e2e(self, lambda x, i, w: x[i] * w, x, i, w)
+
+    def test_gather_1d_table_float32(self):
+        """float32, which puts 32 elements in a stick instead of 64.
+
+        Not expected to pass: ReStickifyOpHBM is not registered for float32.
+        """
+        x = self.to_spyre(torch.arange(192, dtype=torch.float32))
+        i = torch.arange(192, dtype=torch.int32).to("spyre")
+        run_e2e(self, lambda x, i: x[i], x, i)
+
+    def test_gather_1d_table_lengths_read_exhaustively(self):
+        """Every entry read once, at each length."""
+        for entries in self.LENGTHS:
+            with self.subTest(entries=entries):
+                i = torch.arange(entries, dtype=torch.int32).to("spyre")
+                self._run(self._table(entries), i)
+
+    def test_gather_1d_table_lengths_read_randomly(self):
+        """The same lengths plus larger ones, read by a short random index."""
+        for entries in self.LENGTHS + self.LARGE_LENGTHS:
+            with self.subTest(entries=entries):
+                i = torch.randint(0, entries, (24, 8), dtype=torch.int32)
+                self._run(self._table(entries), i.to("spyre"))
+
+
+register_multicore_variants(
+    _Gather1DTableScenario,
+    "TestGather1DTable",
+    globals(),
+    counts=(1, 32),
+)
+
 if __name__ == "__main__":
     from torch._inductor.test_case import run_tests
 
