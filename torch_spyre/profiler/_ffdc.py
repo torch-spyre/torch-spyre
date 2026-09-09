@@ -29,6 +29,8 @@ Usage:
         collect,
     )
     report = collect(exc, failure_category=CATEGORY_COMPILE_FRONTEND)
+    missing = report["collector"]["missing_fields"]  # names from REQUIRED_FIELDS
+    report["collector"]["completeness_pct"]  # non-None share of REQUIRED_FIELDS
 """
 
 import functools

@@ -277,7 +277,7 @@ Capture and retrieval can use different environment variables:
 | `environment` | Values of `TORCH_SPYRE_FFDC`, `TORCH_COMPILE_DEBUG`, `DUMP_SPYRE_CODE`, `SENCORES`, and other captured env vars |
 | `runtime` | `kernel_name` and `code_dir` when a backend or runtime hook attached them (not frontend) |
 | `hardware_state` | `spyre_available` and any probe notes |
-| `collector` | `completeness_pct`, `missing_fields`, `collector_errors` — whether capture itself succeeded |
+| `collector` | `completeness_pct` is the non-`None` share of `REQUIRED_FIELDS` in `torch_spyre/profiler/_ffdc.py`; `missing_fields` lists the rest; `success` / `collector_errors` say whether capture itself raised |
 | `_report_path` | Absolute path to the loaded JSON file on the host that produced it |
 
 ### Compiler artifacts FFDC searches for
@@ -354,15 +354,18 @@ directory as an artifact.
 
 - FFDC is opt-in. If `TORCH_SPYRE_FFDC=1` was not set when the failure
   happened, no new report is written.
-- Capture happens only at hooked call sites: `compile_fx` (frontend);
-  `async_compile.sdsc` / `dxp_standalone` and
-  `async_compile._compile_ktir_with_dbo` / `dbo-opt` (backend tools);
-  `SpyreSDSCKernelRunner.run` / `launch_jobplan` (`runtime_launch`); and
-  `SpyreUnimplementedRunner.run` (`unimplemented`). Emit helpers
-  (`generate_bundle` / `generate_ktir`), pre-tool checks, and
-  `prepare_kernel` in `SpyreSDSCKernelRunner.__init__` are not separately
-  hooked; if they surface through `compile_fx`, they are labeled
-  `compile_frontend`. There is no separate per-pass category today.
+- Capture happens only at hooked call sites: `compile_fx`
+  (`compile_frontend`); `async_compile.sdsc` / `dxp_standalone` and
+  `async_compile._compile_ktir_with_dbo` / `dbo-opt`
+  (`compile_backend`); `SpyreSDSCKernelRunner.run` / `launch_jobplan`
+  (`runtime_launch`); and `SpyreUnimplementedRunner.run`
+  (`unimplemented`). `dbo-opt` is a backend-tool hook, not
+  `compile_frontend`.
+- Emit helpers (`generate_bundle` / `generate_ktir`), pre-tool checks,
+  and `prepare_kernel` in `SpyreSDSCKernelRunner.__init__` are not
+  separately hooked; if they surface through `compile_fx`, they are
+  labeled `compile_frontend`. There is no separate per-pass category
+  today.
 - `hardware_state` is intentionally lightweight today: it records
   `spyre_available` plus a short note when the probe times out, errors,
   or simply finds no Spyre hardware available (the common case off-pod).
