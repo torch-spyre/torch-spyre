@@ -8490,6 +8490,38 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         w = cached_xavier((6144, 4096))
         self.compare_with_cpu(fn, x, w, atol=0.5, rtol=0.1)
 
+    def test_index_select_reshape_matmul_4033(self):
+        """Regression test for issue #4033: fused index_select + reshape + matmul.
+
+        Verifies that the specific kernel pattern (multi-index gather + reshape
+        + matmul with NKV=4, NQ=4, D=128, PAGES=2, BLOCK=128) compiles and
+        runs correctly. This was the exact configuration that triggered
+        the dead arguments bug where gather indices were still passed to kernel
+        .run() calls despite being simplified away.
+        See: https://github.com/torch-spyre/torch-spyre/issues/4033
+        """
+        NKV = 4
+        NQ = 4
+        D = 128
+        PAGES = 2
+        BLOCK = 128
+        H = NKV * NQ
+
+        def fn(query, query_idx, k_pages, page_idx):
+            q = query.index_select(0, query_idx).reshape(NKV, NQ, 1, D)
+            k = k_pages.index_select(0, page_idx).reshape(NKV, 1, BLOCK, D)
+            return torch.matmul(q, k)
+
+        torch.manual_seed(0)
+        k_pages = torch.randn(PAGES, BLOCK, NKV, D, dtype=torch.float16).mul_(0.1)
+        query = torch.randn(1, H * D, dtype=torch.float16).reshape(1, H, D).contiguous()
+        query_idx = torch.zeros(1, dtype=torch.int32)
+        page_idx = torch.zeros(1, dtype=torch.int32)
+
+        self.compare_with_cpu(
+            fn, query, query_idx, k_pages, page_idx, atol=0.2, rtol=0.2, run_eager=False
+        )
+
 
 _TEST_LARGE_MATMUL_FP32_PROXY_SHAPES = _derive_test_large_matmul_fp32_proxy_shapes(
     TestOps.PARAMS[("test_large_matmul", "test_mm_relaxed")]["param_sets"]
