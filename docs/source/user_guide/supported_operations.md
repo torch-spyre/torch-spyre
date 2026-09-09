@@ -76,6 +76,8 @@ see [Adding Operations](../compiler/adding_operations.md).
 | `torch.linalg.matrix_norm` | | Y | Spyre | Compiled only; eager misroutes the `ord` argument |
 | `torch.linalg.norm` | | Y | Spyre | Compiled only; eager misroutes the `ord` argument |
 | `torch.aminmax` | | Y | Spyre | Compiled only; eager not yet supported |
+| `torch.any` | Y | Y | Spyre | Custom lowering; reduces over `dim`/`dims` or the full tensor |
+| `torch.all` | Y | Y | Spyre | Custom decomposition (`abs` + `amin`) |
 | **View Ops** [^views] | | | | |
 | `torch.reshape` / `torch.view` | | Y | Spyre | Includes `_reshape_alias` (a C++ device view, not an Inductor lowering) |
 | `torch.transpose` | Y | Y | Spyre | |
@@ -112,6 +114,7 @@ see [Adding Operations](../compiler/adding_operations.md).
 | **Indexing** | | | | |
 | `torch.embedding` | Y | Y | Spyre | Registered on the compiled path (`ops/eager.py`) |
 | `torch.index_select` | Y | Y | Spyre | Registered on the compiled path (`ops/eager.py`) |
+| `torch.index_add` | | Y | Spyre | Compiled only; custom decomposition (gather + add + overwrite-scatter); requires unique indices |
 | `torch.masked_scatter` | Y | Y | Spyre | Custom decomposition; supported for masks that broadcast along the last (stick) dimension, other masks raise `Unsupported` |
 | **Utility** | | | | |
 | `torch.item` | Y | Y | Spyre | Copies to CPU, returns Python scalar |
@@ -128,7 +131,6 @@ see [Adding Operations](../compiler/adding_operations.md).
 | `torch.argmax` | Y | Y | CPU fallback | Runs on CPU, result transferred back |
 | `torch.argmin` | Y | Y | CPU fallback | Runs on CPU, result transferred back |
 | `torch.cumsum` | Y | Y | CPU fallback | Runs on CPU, result transferred back |
-| `torch.any` | Y | | CPU fallback | `all_out` overload only; runs on CPU |
 | `torch.index_copy` | Y | | CPU fallback | Eager only; runs on CPU |
 
 > **Column key:**
