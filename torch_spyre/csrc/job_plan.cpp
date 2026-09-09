@@ -124,8 +124,8 @@ void JobPlanStepCompute::construct(LaunchContext& ctx,
   const flex::CompositeAddress* dynamic_address = nullptr;
   if (ctx.dynamic_alloc) {
     dynamic_address =
-        &static_cast<SharedOwnerCtx*>(ctx.dynamic_alloc->get_context())
-             ->composite_addr;
+        &(static_cast<SharedOwnerCtx*>(ctx.dynamic_alloc->get_context())
+              ->composite_addr);
   }
 
   auto* params = flex::createComputeParams(

@@ -267,7 +267,8 @@ void JobPlanBuilder::executeAllocate(const nlohmann::json& cmd) {
 
   auto& allocator = SpyreAllocator::instance();
   flex::AllocationDirective directive(flex::PlacementPolicy::Bind, {0},
-                                      std::nullopt, flex::MemoryType::ProgramStatic);
+                                      std::nullopt,
+                                      flex::MemoryType::ProgramStatic);
   c10::DataPtr allocated_ptr = allocator.allocate(static_size, directive);
 
   job_allocation_.emplace_back(
