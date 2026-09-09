@@ -160,6 +160,61 @@ class TestSpyreStream(TestCase):
         self.assertTrue(stream2.query())
         self.assertEqual(c.shape, (3, 3))
 
+    def test_reentrant_same_stream_context(self):
+        """Re-entering the *same* Stream instance must not clobber the
+        state needed to restore the stream that was active before the
+        outermost `with` block.
+
+        Regression test: __enter__ used to save the previous stream into a
+        single `_prev_stream` attribute, so nesting the same instance (e.g.
+        via `with s: with s: ...`, or the aliasing `torch_spyre.stream(s)`
+        helper) overwrote the outer value and left the wrong stream current
+        after the outer block exited.
+        """
+        outer_stream = torch.spyre.current_stream()
+        # s = torch.Stream(self.device)
+        s = torch.spyre.Stream(self.device)
+
+        print(f"outer_stream: {outer_stream}", flush=True)
+        print(f"s: {s}", flush=True)
+        # print(outer_stream, flush=True)
+        # print(s, flush=True)
+
+        with s:
+            with s:
+                torch.randn(3, 3, device="spyre")
+
+                print(
+                    f"torch.spyre.current_stream(): {torch.spyre.current_stream()}",
+                    flush=True,
+                )
+                # print(torch.spyre.current_stream(), flush=True)
+
+            print(
+                f"torch.spyre.current_stream(): {torch.spyre.current_stream()}",
+                flush=True,
+            )
+            # print(torch.spyre.current_stream(), flush=True)
+
+            # The inner __exit__ must restore `s`, not the stream that was
+            # current before the outer __enter__.
+            self.assertEqual(torch.spyre.current_stream(), s)
+
+        self.assertEqual(torch.spyre.current_stream(), outer_stream)
+
+    def test_stream_context_restores_on_exception(self):
+        """The displaced stream must be restored even if the `with` body
+        raises."""
+        outer_stream = torch.spyre.current_stream()
+        # s = torch.Stream(self.device)
+        s = torch.spyre.Stream(self.device)
+
+        with self.assertRaises(ValueError):
+            with s:
+                raise ValueError("boom")
+
+        self.assertEqual(torch.spyre.current_stream(), outer_stream)
+
     def test_stream_priority_levels(self):
         """Test creating streams with different priority levels."""
         high_priority = torch.Stream(self.device, priority=-1)
