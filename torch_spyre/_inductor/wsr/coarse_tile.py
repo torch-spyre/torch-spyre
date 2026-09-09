@@ -3856,6 +3856,10 @@ def _active_full_sizes_from_strides(
                 )
             result[k] = matching_sizes[0]
         else:
+            # No raw-layout stride survives in this coordinate space, so
+            # there is no authoritative padded backing extent to prefer.
+            # This is the dense-reshape fallback: recover the outer extent
+            # from the buffer's logical numel and the view stride.
             result[k] = sympy.prod(buffer_sizes) // active_strides[k]
     return result
 
@@ -5936,6 +5940,10 @@ def _is_dense_full_buffer_view(
     against the tile-local Hkv stride corrupts it.  We can recognize the safe
     case without view metadata when both layouts are dense and the affine
     index is a complete, bijective permutation/reshape of the new buffer.
+
+    A missed recognition is safe but conservative: ``False`` keeps the
+    caller on the general retile/``Unsupported`` path rather than accepting
+    an unproven full-buffer mapping.
     """
 
     def _equal(lhs: Expr, rhs: Expr) -> bool:
