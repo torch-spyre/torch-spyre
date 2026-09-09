@@ -22,6 +22,8 @@ import argparse
 import os
 import platform as _platform
 import sys
+
+import v2_schema
 import uuid
 import xml.etree.ElementTree as etree
 from collections import Counter, defaultdict
@@ -1247,8 +1249,11 @@ def v2_new_identity_rows(client, table: str, id_col: str, ident_rows: dict) -> l
 def insert_v2(client, component: str, run_id: str, cases: list) -> int:
     """Write test_cases (identity) + test_case_runs (outcome) for one leg.
 
-    Dropped from v2 deliberately: filename, suite_name, runner_run_id, and every
-    stored counter -- all derivable, and a stored counter invites drift.
+    Rows are built as dicts and ordered by v2_schema, so a field cannot be assigned to the
+    wrong column and the column order lives in exactly one place.
+
+    Dropped from v2 deliberately: filename, suite_name, runner_run_id, and every stored
+    counter -- all derivable, and a stored counter invites drift.
     """
     if not cases:
         return 0
@@ -1264,51 +1269,38 @@ def insert_v2(client, component: str, run_id: str, cases: list) -> int:
             # other unidentifiable case rather than merely orphaning it.
             skipped_unidentifiable += 1
             continue
-        # Deduped by id within the leg: identical identity rows are one fact, and
-        # test_cases is a plain MergeTree (a content hash re-writes an identical row,
-        # so collapsing would only be cosmetic -- but writing it N times is not).
-        ident_rows[tcid] = [tcid, component, classname, name, tags]
+        # Keyed by id: identical identity rows within a leg are one fact.
+        ident_rows[tcid] = {
+            "test_case_id": tcid,
+            "component": component,
+            "classname": classname,
+            "name": name,
+            "tags": tags,
+        }
         run_rows.append(
-            [
-                run_id,
-                tcid,
-                component,
-                c.get("status", ""),
-                float(c.get("duration_s", 0) or 0),
-                (c.get("fail_message") or "")[:8192],
-            ]
+            {
+                "run_id": run_id,
+                "test_case_id": tcid,
+                "component": component,
+                "status": c.get("status", ""),
+                "duration_s": float(c.get("duration_s", 0) or 0),
+                "fail_message": (c.get("fail_message") or "")[:8192],
+            }
         )
-    client.insert(
-        "test_cases",
-        v2_new_identity_rows(client, "test_cases", "test_case_id", ident_rows),
-        column_names=["test_case_id", "component", "classname", "name", "tags"],
-    )
-    client.insert(
-        "test_case_runs",
-        run_rows,
-        column_names=[
-            "run_id",
-            "test_case_id",
-            "component",
-            "status",
-            "duration_s",
-            "fail_message",
-        ],
-    )
+    # Cross-run dedup, not just in-leg: test_cases is a plain MergeTree, so re-inserting a
+    # known identity appends a duplicate instead of collapsing it.
+    v2_schema.insert_identities(client, v2_schema.TEST_CASES, ident_rows)
+    v2_schema.insert(client, v2_schema.TEST_CASE_RUNS, run_rows)
     if skipped_unidentifiable:
         print(
-            f"  [warn] v2: {skipped_unidentifiable} case(s) skipped -- no derivable "
-            f"test_case_id (empty name?); they would have collided, not merely orphaned",
+            f"  [warn] v2: {skipped_unidentifiable} case(s) skipped -- identity not derivable",
             file=sys.stderr,
         )
     return len(run_rows)
 
-
 # ---------------------------------------------------------------------------
 # ── Main ───────────────────────────────────────────────────────────────────
 # ---------------------------------------------------------------------------
-
-
 def _runner_run_id(args, run_id: str) -> str:
     """This leg's own run id: --gha-run-id when GHA-dispatched, else the same uuid as run_id."""
     raw = (getattr(args, "gha_run_id", "") or "").strip()
