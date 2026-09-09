@@ -21,7 +21,17 @@ HERE = Path(__file__).resolve().parent / "v2_schema.py"
 
 
 def fingerprint(path: Path) -> str:
-    return ast.dump(ast.parse(path.read_text(encoding="utf-8")))
+    """A signature of the module's MEANING, insensitive to formatting and import order.
+
+    Import statements are sorted before dumping: each repo pins its own ruff, and their
+    isort rules order `typing` against `collections.abc` differently, so the raw AST differs
+    on files that are otherwise the same code. Comparing raw dumps reported those as drift.
+    """
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    imports = [n for n in tree.body if isinstance(n, (ast.Import, ast.ImportFrom))]
+    rest = [n for n in tree.body if not isinstance(n, (ast.Import, ast.ImportFrom))]
+    tree.body = sorted(imports, key=ast.dump) + rest
+    return ast.dump(tree)
 
 
 def main(argv):
