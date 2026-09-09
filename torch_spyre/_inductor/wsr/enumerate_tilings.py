@@ -245,6 +245,21 @@ def enumerate_tile_options(
         if counts:
             per_dim.append((host_dim, counts))
 
+    # Axes are emitted outermost-first in ascending host_dim order: per_dim is
+    # built over range(n_out) and itertools.combinations preserves it. That
+    # canonical ordering is load-bearing, not cosmetic. TileSpec order is
+    # semantic -- levels nest, so a swapped pair is a different plan -- yet a
+    # swapped pair has the *same* per-tile shape, so predict_frame reports
+    # identical ranges/layout/indices for both and nothing downstream can
+    # prefer one. Emitting only the canonical order is what stops
+    # derive_tiling_groups -- which breaks a run on full ordered
+    # ``spec == current_spec`` -- from silently splitting two shape-equivalent
+    # ops into separate loop groups, losing the fusion. Keep any new option
+    # canonically ordered. Mixing an output axis with a reduction axis in one
+    # spec (impossible today: the reduction options below are single-level)
+    # would further make the relative nesting semantic -- reduction-outer
+    # partially accumulates every output tile on each pass, reduction-inner
+    # completes each one before moving on.
     for k in range(1, min(max_dims, len(per_dim)) + 1):
         for dims_combo in itertools.combinations(per_dim, k):
             dim_indices = [d for d, _ in dims_combo]

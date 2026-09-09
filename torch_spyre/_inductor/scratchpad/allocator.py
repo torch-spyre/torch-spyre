@@ -63,6 +63,7 @@ from torch_spyre._inductor.scratchpad.plan_solver import (
     MemoryPlanSolver,
     SolveError,
     BufferType,
+    TileSpec,
 )
 from torch_spyre._inductor.scratchpad.greedy_solver import GreedyLayoutSolver
 from torch_spyre._inductor.scratchpad.firstfit_bestfit_solver import (
@@ -293,11 +294,18 @@ class ScratchpadAllocator:
         """Run pre-passes, assign LX addresses to eligible buffers, then run post-passes.
 
         This is a template method: the skeleton (pre-passes ->
-        generate buffers -> solve -> commit -> record reasons -> push -> log ->
-        post-passes) is fixed, while subclasses override the ``_prepare_buffers``
-        / ``_solve`` / ``_post_solve`` / ``_record_spill_reasons`` hooks to swap
-        in their buffer type, solver call, and post-solve commit. The base hooks
-        implement the fixed-division, placement-only flow.
+        generate buffers -> solve -> materialize -> commit -> record reasons ->
+        push -> log -> post-passes) is fixed, while subclasses override the
+        ``_prepare_buffers`` / ``_solve`` / ``_materialize_selection`` /
+        ``_post_solve`` / ``_record_spill_reasons`` hooks to swap in their buffer
+        type, solver call, and post-solve commit. The base hooks implement the
+        fixed-division, placement-only flow.
+
+        Subclasses override hooks, never this body. A solve that must act on its
+        own result -- coarse tiling applies the tilings it selected and re-plans
+        the mutated graph -- does so through ``_materialize_selection`` rather
+        than by copying the skeleton: a copy silently misses every later change
+        to the shared steps (it already did, on ``_solve``'s arity).
 
         Args:
             graph: Lowered graph whose buffers will be assigned LX scratchpad
@@ -307,6 +315,7 @@ class ScratchpadAllocator:
         buffers = self._prepare_buffers(graph)
         solver = self._build_solver(buffers)
         allocation = self._solve(solver, graph)
+        solver, allocation = self._materialize_selection(graph, solver, allocation)
         accepted_lx_relayouts = self._finalize_lx_relayout_allocation(allocation)
         self._post_solve(graph, allocation)
         reasons = self._get_spill_reasons(solver, allocation)
@@ -344,6 +353,24 @@ class ScratchpadAllocator:
     def _solve(self, solver: MemoryPlanSolver, graph: GraphLowering) -> Sequence[Any]:
         """Assign LX addresses. Base: placement-only ``plan_layout``."""
         return solver.plan_layout(log_lx_usage=True)
+
+    def _materialize_selection(
+        self,
+        graph: GraphLowering,
+        solver: MemoryPlanSolver,
+        allocation: Sequence[Any],
+    ) -> tuple[MemoryPlanSolver, Sequence[Any]]:
+        """Act on what the solve *chose* before the choice is committed.
+
+        Returns the ``(solver, allocation)`` the rest of :meth:`plan_allocation`
+        commits, so an override that mutates the graph and re-plans hands back
+        the second solve's pair -- ``_get_spill_reasons`` must be asked about the
+        solver that produced the allocation it is passed.
+
+        Base: a placement-only solve selects nothing to materialize, so the first
+        solve stands.
+        """
+        return solver, allocation
 
     def _finalize_lx_relayout_allocation(
         self,
@@ -1256,8 +1283,19 @@ def _lx_planning_size() -> int:
     return round_up_to_alignment(frontend_reservation, _LX_ALLOCATION_GRANULARITY_BYTES)
 
 
-def _core_division(op: Operation, splits: dict[sympy.Symbol, int]) -> CoreDivision:
-    """Classify one symbol-keyed candidate for its producing operation."""
+def _core_division(
+    op: Operation,
+    splits: dict[sympy.Symbol, int],
+    tiling: "TileSpec | None" = None,
+) -> CoreDivision:
+    """Classify one symbol-keyed candidate for its producing operation.
+
+    ``tiling`` is the coarse tiling the candidate was enumerated under, carried
+    onto the division so the pair travels together. Output/reduction
+    classification asks only whether a symbol *appears* in the write index,
+    which a tiling rescales but never eliminates, so it is tiling-invariant and
+    the same test serves both frames.
+    """
     rw = op_read_writes(op)
     write = next((d for d in rw.writes if isinstance(d, MemoryDep)), None)
     if write is None:
@@ -1268,7 +1306,11 @@ def _core_division(op: Operation, splits: dict[sympy.Symbol, int]) -> CoreDivisi
     reduction = {
         s: int(v) for s, v in splits.items() if write.index.coeff(s) == 0 and v > 1
     }
-    return CoreDivision(output_splits=output, reduction_splits=reduction)
+    return CoreDivision(
+        output_splits=output,
+        reduction_splits=reduction,
+        tiling=tiling if tiling is not None else TileSpec(),
+    )
 
 
 def _division_splits(op: Operation, division: CoreDivision) -> dict[sympy.Symbol, int]:
@@ -1289,16 +1331,53 @@ def _view_for_div(
     """One candidate division's per-core view of ``buf_name``.
 
     ``prep_cache`` holds the candidate-invariant (sympy-heavy) context, keyed by
-    ``(op name, dep, buf_name)``: a producer's write-dep and a consumer's
+    ``(op name, dep, buf_name, tiling)``: a producer's write-dep and a consumer's
     read-dep on the same buffer can be equal ``MemoryDep``s, so the op name
     keeps their preps distinct while a parent read by several consumers reuses
-    its write-view prep.
+    its write-view prep. The tiling is part of the key because a candidate's
+    view is taken on its *tiled* frame -- two candidates differing only in
+    tiling see different divided ranges and a different resized layout, so they
+    must not share a prep. Every ``division.tiling`` is the empty spec unless
+    the solver is choosing tilings, so the key is unchanged in effect otherwise.
     """
-    key = (op.get_name(), dep, buf_name)
+    key = (op.get_name(), dep, buf_name, division.tiling)
     if key not in prep_cache:
-        prep_cache[key] = _prepare_per_core_view(op, dep, buf_name)
+        prep_cache[key] = _prep_for_division(op, dep, buf_name, division)
     return _per_core_view_from_prep(
         prep_cache[key], _division_splits(op, division), division.reduction_splits
+    )
+
+
+def _prep_for_division(
+    op: Operation, dep: MemoryDep, buf_name: str, division: CoreDivision
+):
+    """The ``_prepare_per_core_view`` prep for one candidate division.
+
+    Untiled: the committed layout, exactly as an untiled candidate has always
+    been prepped. Tiled: the *predicted* per-tile frame
+    (``wsr.tile_prediction.predict_frame``) supplies the divided iteration
+    space and rescaled indices, and -- when ``buf_name`` is the op's own output
+    -- the resized layout, since the committed layout is still untiled at solve
+    time. Imported lazily so the solver-facing modules stay free of the
+    predictor.
+
+    ``predict_frame`` reports an unpredictable candidate by returning ``None``
+    rather than raising, so that a spec the solver merely *enumerated* is
+    pruned instead of failing the compile. ``None`` is forwarded here as the
+    prep, which ``_per_core_view_from_prep`` already maps to the
+    unrepresentable view -- the same sink an unviewable buffer takes -- so such
+    a candidate can never be priced as though it had a frame.
+    """
+    if division.tiling.is_untiled:
+        return _prepare_per_core_view(op, dep, buf_name)
+    from torch_spyre._inductor.wsr.tile_prediction import predict_frame
+
+    frame = predict_frame(op, division.tiling)
+    if frame is None:
+        return None
+    override = frame.layout if buf_name == op.get_name() else None
+    return _prepare_per_core_view(
+        op, dep, buf_name, parts=frame.view_parts(), buf_layout=override
     )
 
 
@@ -1800,6 +1879,128 @@ def _enum_split_options(
     return _legal_split_options(op, options.values())
 
 
+def _spec_contains(spec: TileSpec, pin: TileSpec) -> bool:
+    """True if every ``pin`` axis appears in ``spec`` in pin order (a sub-nest).
+
+    Subsequence, not equality: a pin fixes some levels and the solve is free to
+    nest discovered levels inside or outside them, so a spec honours the pin as
+    long as the pin's axes occur within it, in the same relative order. Axis
+    identity is exact -- ``TileAxis`` is frozen, so ``in`` matches host_dim,
+    count and is_reduction together, which is what makes a pin's *count* binding
+    and not just its axis.
+    """
+    remaining = iter(spec.axes)
+    return all(axis in remaining for axis in pin.axes)
+
+
+def _op_read_span_is_evaluable(op: Operation) -> bool:
+    """True when the read-distance filter can compute concrete post-tile spans.
+
+    The span math needs a ``ComputedBuffer`` with a ``FixedTiledLayout`` whose
+    ``device_layout`` is fully static (integer sizes, strides, stride map, stick
+    size). For anything else -- a symbolic shape, a layout without
+    ``device_layout`` -- the filter cannot prove a violation, so it leaves the
+    option set untouched (fail open) rather than dropping candidates it cannot
+    evaluate.
+    """
+    from torch_spyre._inductor.wsr.span_overflow_hint_analysis import (
+        _layout_has_static_span_metadata,
+    )
+
+    if not isinstance(op, ComputedBuffer):
+        return False
+    try:
+        layout = op.get_layout()
+    except (AttributeError, TypeError, ValueError, RuntimeError):
+        return False
+    if getattr(layout, "device_layout", None) is None:
+        return False
+    try:
+        return _layout_has_static_span_metadata(layout)
+    except (AttributeError, TypeError, ValueError):
+        return False
+
+
+def _spec_within_read_distance(
+    op: ComputedBuffer, spec: TileSpec, max_cores: int
+) -> bool:
+    """True when tiling ``op`` by ``spec`` keeps every per-core read span within
+    ``MAX_SPAN_BYTES`` (the MVLOC read-distance limit).
+
+    Reuses ``_remaining_span_candidates_after_tile`` -- the post-tile span
+    validator the span-overflow planner uses -- so a candidate is admitted only
+    when it leaves no overflowing span, exactly as ``_search_min_cost_tile_plan``
+    requires. The untiled ``spec`` (no axes) validates the op's own full-size
+    read, so an op whose untiled read already overflows fails here.
+
+    ``max_cores`` matches the planner's ``config.sencores`` gate, so the two
+    agree on what "fits". Fails open: any evaluation error (e.g. a post-tile
+    layout that cannot be reconstructed for this candidate) keeps the spec
+    rather than dropping a possibly-valid tiling.
+    """
+    from torch_spyre._inductor.wsr.span_overflow_hint_analysis import (
+        _remaining_span_candidates_after_tile,
+    )
+
+    split_by_host_dim = {
+        axis.host_dim: axis.count for axis in spec.axes if not axis.is_reduction
+    }
+    k_split = next((axis.count for axis in spec.axes if axis.is_reduction), None)
+    try:
+        remaining = _remaining_span_candidates_after_tile(
+            op, max_cores, split_by_host_dim, k_split=k_split
+        )
+    except (
+        Unsupported,
+        AttributeError,
+        TypeError,
+        ValueError,
+        RuntimeError,
+        KeyError,
+        IndexError,
+    ):
+        return True
+    return not remaining
+
+
+def _drop_read_distance_violations(
+    op: Operation, options: list[TileSpec], max_cores: int
+) -> list[TileSpec]:
+    """Drop every discovered tiling whose per-core span exceeds the read-distance
+    limit, raising ``Unsupported`` when none fit.
+
+    The CP-SAT discovery path (``auto_coarse_tiling``) enumerates tilings with no
+    span term in its cost model, so a chosen ``TileSpec`` is never otherwise
+    checked against ``MAX_SPAN_BYTES``. This applies the span-overflow planner's
+    own gate to the discovered option set: a coarse tiling only shrinks a
+    per-core span, so an op under no pressure loses nothing, but the untiled
+    option (and any tiling that fails to bring an overflowing read back under the
+    limit) is removed for an op whose full-size read overflows -- the solve is
+    then forced to pick a tiling that fits. When *no* candidate satisfies the
+    limit it raises rather than returning an empty set, matching
+    ``_search_min_cost_tile_plan``: an op that cannot be tiled to fit must abort,
+    not fall through to an over-span plan.
+
+    Ops whose span is not statically evaluable are returned unchanged (fail
+    open): the filter only drops what it can prove violates the limit.
+    """
+    if not _op_read_span_is_evaluable(op):
+        return options
+    surviving = [
+        spec for spec in options if _spec_within_read_distance(op, spec, max_cores)
+    ]
+    if not surviving:
+        from torch_spyre._inductor.work_division import MAX_SPAN_BYTES
+
+        raise Unsupported(
+            f"Cannot tile {op.get_name()}: no discovered coarse tiling keeps the "
+            "per-core read span within the read-distance limit of "
+            f"{MAX_SPAN_BYTES / (1024**2):.3f} MB; the untiled read and every "
+            "candidate tiling overflow it."
+        )
+    return surviving
+
+
 class CoOptimizingAllocator(ScratchpadAllocator):
     def __init__(
         self,
@@ -1882,11 +2083,47 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         # kernel: bundle membership decides input dedup, the arity derate and the
         # underfill derate, so a graph that fuses into several kernels is
         # mispriced when scored flat.
+        if config.unified_tiling:
+            # The cost model is flat in both axes the tiling search moves along:
+            # it has no term for tile size and none for cut count, so every
+            # candidate tiling scores identically and the choice falls to
+            # whichever optimum the multi-worker portfolio reaches first (the
+            # same graph drew 1, 2, 3 or 4 cuts run to run at one identical
+            # objective value). Worse, it is not merely uninformative there --
+            # #3810 makes it raise on symbolic args once an op is output-tiled,
+            # so the re-plan silently loses the runtime term anyway, and it
+            # prices residency the scheduler later revokes. Hand the solver no
+            # cost expression at all and let its lexicographic ladder rank
+            # residency, cuts, parallelism and division shape instead. Off this
+            # path the expression is unchanged and still the objective.
+            logger.debug(
+                "cost objective skipped: unified_tiling makes tile size and cut "
+                "count decision axes the cost model cannot score"
+            )
+            cost_expr = None
+            result = solver.plan_layout_and_core_divisions(cost_expr)
+            assert not any(buffer.lx_relayout_plans for buffer in result), (
+                "CoOptimizingAllocator does not support LX relayout"
+            )
+            return result
+
         try:
             cost_expr = sympy.sympify(
                 predict_by_bundle(graph.operations, op_features, params=_COST_PARAMS)
             )
-        except (ValueError, RuntimeError):
+        except (ValueError, RuntimeError, TypeError):
+            # ``TypeError`` covers the symbolic-argument gap in the cost model
+            # (#3810): the output-dim coarse-tiling underfill derate compares
+            # ``coarse_underfill_eff``'s result with a plain Python ``min`` /
+            # ``>=``, which raises "cannot determine truth value of Relational"
+            # as soon as an argument carries a solver variable (``is_lx_*``).
+            # That is reachable only once an op is output-tiled, i.e. on the
+            # re-plan after ``CoarseTilingPass``, so it did not exist before the
+            # solver could choose tilings.  Dropping the objective is the
+            # documented best-effort fallback, but it is a real loss -- the
+            # re-plan then optimizes placement with no runtime term at all --
+            # so the cost model should be made symbol-safe rather than left to
+            # this catch.
             cost_expr = None
         result = solver.plan_layout_and_core_divisions(cost_expr)
         assert not any(buffer.lx_relayout_plans for buffer in result), (
@@ -1918,6 +2155,116 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         # pull the selected core division from the dependent buffers when the graph
         # is updated with clones in ``_push_allocation``.
         self._commit_divisions(graph, allocation)
+        self._log_solver_decisions(graph, allocation)
+
+    def _log_solver_decisions(
+        self, graph: GraphLowering, allocation: Sequence[Any]
+    ) -> None:
+        """Dump what the joint solve actually decided, per buffer.
+
+        The solve's own output is otherwise invisible: the spill log reports
+        residency but not the chosen division or tiling, and nothing reports
+        whether that choice survived ``_commit_divisions`` -- which silently
+        skips any op lacking ``iteration_space_ownership``, i.e. every op
+        synthesised after the work-division pass ran. Pairing this against the
+        emitted ``OpSpec`` work slices is how a decided-but-discarded division
+        shows up.
+        """
+        if not logger.isEnabledFor(logging.DEBUG):
+            return
+        op_by_name = {op.name: op for op in graph.operations}
+        for buf in allocation:
+            divisions = getattr(buf, "core_divisions", None) or []
+            chosen = getattr(buf, "chosen_division", None)
+            cd = divisions[chosen] if chosen is not None and divisions else None
+            op = op_by_name.get(buf.name)
+            info = getattr(op, "loop_info", None)
+            group = getattr(info, "loop_group_id", None)
+            propagation = getattr(info, "propagation", None)
+            logger.debug(
+                "solver_out: %s group=%s kind=%s loop=%s div=%s tiling=%s lx=%s "
+                "size=%s committed=%s",
+                buf.name,
+                group if group is not None else "-",
+                getattr(propagation, "kind", "-"),
+                getattr(info, "loop_count", "-"),
+                cd.label if cd is not None else "-",
+                cd.tiling.label if cd is not None else "-",
+                buf.address,
+                buf.size,
+                "yes"
+                if getattr(op, "iteration_space_ownership", None) is not None
+                else "NO(skipped)",
+            )
+
+    def _materialize_selection(
+        self,
+        graph: GraphLowering,
+        solver: MemoryPlanSolver,
+        allocation: Sequence[Any],
+    ) -> tuple[MemoryPlanSolver, Sequence[Any]]:
+        """Apply the coarse tilings the joint solve selected, then re-plan.
+
+        The first solve chooses core divisions *and* tilings jointly, pricing the
+        tiled candidates through their predicted (``wsr.tile_prediction``) views.
+        If it picks a non-empty tiling for any op, ``CoarseTilingPass`` applies
+        exactly those choices (mutating the IR the same way a pre-stickification
+        hint would), and the allocation is redone over the materialized graph so
+        new boundary buffers get placed and the applied ops get their final
+        divisions. The second pass enumerates no further tilings
+        (``_suppress_tiling``), so it terminates, and it mirrors the hint path
+        (allocate an already-tiled graph).
+
+        Ordering is solve-before-apply: a ``SolveError`` from the first solve
+        propagates over the *unmutated* graph, so ``scratchpad_planning``'s greedy
+        fallback never runs on a half-tiled graph (a second-solve ``SolveError``
+        falls back over the fully-tiled graph, which is a valid outcome).
+
+        Both the second solver and its allocation are returned: the caller reads
+        spill reasons off the solver that produced the allocation it commits, so
+        returning one without the other would report the first solve's reasons
+        against the second solve's plan.
+        """
+        choices = self._chosen_tilings(graph, allocation)
+        if logger.isEnabledFor(logging.DEBUG):
+            for name, spec in choices.items():
+                logger.debug("chosen_tiling: %s -> %s", name, spec.label)
+        if not choices:
+            return solver, allocation
+
+        from torch_spyre._inductor.scratchpad.coarse_tiling import CoarseTilingPass
+
+        op_count = len(graph.operations)
+        CoarseTilingPass(choices).apply_pass(graph)
+        assert len(graph.operations) >= op_count, (
+            "coarse tiling apply must not drop operations"
+        )
+        # Re-plan over the materialized tiling. Pre-passes are empty for this
+        # allocator; suppress further tiling so the second solve only places.
+        self._suppress_tiling = True
+        try:
+            buffers = self._prepare_buffers(graph)
+            solver = self._build_solver(buffers)
+            allocation = self._solve(solver, graph)
+        finally:
+            self._suppress_tiling = False
+        return solver, allocation
+
+    def _chosen_tilings(
+        self, graph: GraphLowering, allocation: Sequence[Any]
+    ) -> dict[str, TileSpec]:
+        """The non-empty tiling the solve chose for each op, keyed by operation
+        name (the key ``CoarseTilingPass``/``derive_tiling_groups`` consume)."""
+        op_by_name = {op.name: op for op in graph.operations}
+        choices: dict[str, TileSpec] = {}
+        for buf in allocation:
+            op = op_by_name.get(buf.name)
+            if op is None or buf.chosen_division is None:
+                continue
+            cd = buf.core_divisions[buf.chosen_division]
+            if not cd.tiling.is_untiled:
+                choices[op.get_operation_name()] = cd.tiling
+        return choices
 
     def _get_spill_reasons(
         self,
@@ -1998,24 +2345,143 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             return _legal_fixed_division(op, fixed, str(exc))
         cds: list[CoreDivision] = []
         seen: set[tuple] = set()
-        for candidate in candidates:
-            division = _core_division(op, candidate)
-            key = (
-                tuple(
-                    sorted(
-                        division.output_splits.items(), key=lambda item: str(item[0])
+        # Each tiling option gets its own division enumeration: the legal split
+        # set is tiling-relative -- a tiled dim has fewer/other divisors and a
+        # smaller per-core span. The untiled option reuses the already-enumerated
+        # `candidates`; a non-empty option re-enumerates on the tiled frame.
+        # Divisions are symbol-keyed and a tiling rescales indices without
+        # renaming loop symbols, so both frames' keys are directly comparable.
+        for tiling in self._tiling_candidates(op, max_cores):
+            if tiling.is_untiled:
+                tiled_candidates = candidates
+            else:
+                try:
+                    tiled_candidates = enumerate_work_division_candidates(
+                        op, max_cores, tiling=tiling
                     )
-                ),
-                tuple(
-                    sorted(
-                        division.reduction_splits.items(), key=lambda item: str(item[0])
+                except Unsupported as exc:
+                    logger.debug(
+                        "skip tiled division for %s under %s: %s",
+                        op.name,
+                        tiling.label,
+                        exc,
                     )
-                ),
-            )
-            if key not in seen:
-                seen.add(key)
-                cds.append(division)
+                    continue
+            for candidate in tiled_candidates:
+                division = _core_division(op, candidate, tiling)
+                key = (
+                    tuple(
+                        sorted(
+                            division.output_splits.items(),
+                            key=lambda item: str(item[0]),
+                        )
+                    ),
+                    tuple(
+                        sorted(
+                            division.reduction_splits.items(),
+                            key=lambda item: str(item[0]),
+                        )
+                    ),
+                    tiling,
+                )
+                if key not in seen:
+                    seen.add(key)
+                    cds.append(division)
         return cds or _legal_fixed_division(op, fixed, "no enumerable candidate")
+
+    def _tiling_candidates(self, op: Operation, max_cores: int) -> list[TileSpec]:
+        """Coarse-tiling options to pair with ``op``'s divisions.
+
+        With unified tiling off the only option is the untiled ``TileSpec``, so
+        enumeration and every downstream plan stay bit-identical to today. With
+        it on (the CP-SAT co-opt path), the solve is the single authority on
+        coarse tiling -- the pre-stickification hint pass has stood down
+        (``_solver_owns_tiling``), so a caller's hint reaches here as data on
+        ``op.dim_hints`` rather than as an already-applied tiling. Two roles:
+
+        - A **carried pin** (a hint the caller placed) is *mandatory*: the option
+          set is reduced to the tilings that contain it and untiled is dropped,
+          so the solve can only pick a tiling that honours the pin. This is what
+          lets a pin compose with discovery in one solve instead of being applied
+          in a separate, earlier phase (which could not nest). The pin is honored
+          under unified tiling whether or not discovery is on.
+        - **Discovery** (an extra ``auto_coarse_tiling`` turns on) offers an
+          *un-pinned* op the output-axis tilings it could take, minus any whose
+          per-core read span would still exceed the read-distance limit
+          (``MAX_SPAN_BYTES``); the untiled option is dropped too when the op's
+          own full-size read overflows, and an op with no fitting tiling raises
+          ``Unsupported`` (see :func:`_drop_read_distance_violations`). Without
+          discovery an un-pinned op stays untiled.
+
+        Filtered by op kind either way:
+
+        - **Restickify** offers nothing, pin or no pin: no tiling form is correct
+          post-stickification.
+        - **Everything else** -- pointwise, reduction, *and matmul* -- offers only
+          output-axis tilings (``is_clean``). That single filter, plus the
+          enumerator's refusal to emit the stick (innermost) dim, already drops
+          the numerically fragile forms for every op kind, so matmul needs no
+          guard of its own: a matmul's K/reduction axis is not an output axis and
+          is excluded (reduction tiling routes through the accumulator/combine
+          path, ~2 orders off CPU -- see ``_mlp_case``), and its N/stick dim is
+          never emitted. What remains for a matmul is row/M-axis output tiling,
+          which is correct and backend-accepted (see
+          ``test_hint_matmul_row_tiling``), so a pin or a discovered tiling on
+          that axis is honored the same as for any other op.
+
+        (The ``_resize_device_layout`` gap #3218 that rejects a tile-sized read
+        copy is confined to the span-overflow path, where a matmul feeds a
+        differently-shaped consumer -- a separate mechanism, still xfailed, not
+        reached by the ordinary M-axis output tiling offered here.)
+
+        An op already tiled (``loop_info`` set, e.g. by a prior apply) is left
+        untouched, so the solve never re-tiles or un-tiles it.
+        """
+        untiled = [TileSpec()]
+        if getattr(self, "_suppress_tiling", False):
+            return untiled
+        if not (config.unified_tiling and config.layout_solver == "cpsat"):
+            return untiled
+        if getattr(op, "loop_info", None) is not None:
+            return untiled
+        if self._get_op_name(op) == "restickify":
+            return untiled
+        from torch_spyre._inductor.scratchpad.coarse_tiling import (
+            dim_hints_to_tile_spec,
+        )
+        from torch_spyre._inductor.wsr.enumerate_tilings import enumerate_tile_options
+
+        try:
+            # enumerate_tile_options returns untiled first; the is_clean filter
+            # keeps it and the output-only specs, preserving that order.
+            options = [t for t in enumerate_tile_options(op) if t.is_clean]
+        except Unsupported:
+            options = list(untiled)
+
+        try:
+            pin = dim_hints_to_tile_spec(op, getattr(op, "dim_hints", []))
+        except Unsupported:
+            pin = TileSpec()
+        if not pin.is_untiled:
+            # Mandatory pin: keep only pin-honouring tilings, drop untiled, and
+            # always offer the bare pin so a pin the enumerator does not reach on
+            # its own (a legal tiling it happens not to emit) is never lost.
+            honoring = [t for t in options if _spec_contains(t, pin)]
+            if pin not in honoring:
+                honoring.append(pin)
+            return honoring
+
+        if not config.auto_coarse_tiling:
+            return untiled
+        # Discovery offers an unpinned op tilings the solve is free to pick, but
+        # the CP-SAT cost model carries no span term, so a discovered TileSpec is
+        # never otherwise checked against the hardware read-distance limit
+        # (MAX_SPAN_BYTES) the span-overflow planner enforces. Drop any candidate
+        # whose per-core read span would still overflow that limit -- including
+        # the untiled option when the op's own full-size read overflows -- so the
+        # solve can never choose a tiling that reintroduces the very span
+        # violation coarse tiling exists to prevent, and abort when none fit.
+        return _drop_read_distance_violations(op, options, max_cores)
 
     def _commit_divisions(
         self,

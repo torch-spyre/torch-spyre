@@ -227,6 +227,32 @@ native_layout_packer: bool = os.getenv("TORCH_SPYRE_NATIVE_PACKER", "1").lower()
     "yes",
 )
 
+# Unified coarse-tiling: let the co-optimizing CP-SAT solve carry coarse-tiling
+# candidates on its core divisions and apply the tiling it selects, rather than
+# only honouring pre-stickification hints. Both gates default off and are inert
+# unless the joint CP-SAT co-opt path is active (co_optimizing_lx_planning and
+# layout_solver == "cpsat"); the machinery warns once and no-ops otherwise.
+#   unified_tiling     -- master switch for the solver-driven tiling machinery.
+#   auto_coarse_tiling -- also discover tilings for un-hinted ops (needs
+#                         unified_tiling; off => every un-hinted op stays untiled).
+unified_tiling: bool = os.environ.get("UNIFIED_TILING", "0") == "1"
+auto_coarse_tiling: bool = os.environ.get("AUTO_COARSE_TILING", "0") == "1"
+
+# Break exact ties in the joint solve toward fewer coarse-tiling *cuts*: a tiled
+# op with a consumer under a different tiling (or none), which
+# ``derive_tiling_groups`` turns into a loop-group boundary costing a full-sized
+# HBM buffer, a copy op and a bundle split -- none of which exist yet when the
+# tiling is chosen.
+#
+# This is strictly a tiebreak, not a cost: the cut count is minimised only
+# *after* the cost objective has been solved and locked at its optimum, so it
+# can never trade a worse plan for fewer boundaries. That matters because the
+# cost expression is currently degenerate with respect to tiling (it carries no
+# tiling term at all), leaving competing tilings exactly equal and the
+# multi-worker portfolio to pick between them arbitrarily -- the same graph
+# draws 1, 2, 3 or 4 cuts run to run at one identical objective value.
+coarse_tile_cut_tiebreak: bool = os.environ.get("COARSE_TILE_CUT_TIEBREAK", "1") == "1"
+
 # When symbolic cost_expr fails, use the fallback cost instead of erroring out
 _cpsat_warn_on_cost_expr: bool = True
 # Enable persistent on-disk caching of compiled Spyre kernels across

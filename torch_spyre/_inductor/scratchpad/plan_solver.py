@@ -161,10 +161,16 @@ class TileAxis:
     """One coarse-tiling level.
 
     ``host_dim`` is a *positional* index: into ``op_out_coords(op)`` for an
-    output axis, or into the op's ordered reduction loop variables (see
-    :func:`wsr.coarse_tile.reduction_loop_vars`) for a reduction axis.
+    output axis, or into ``op.data.reduction_ranges`` for a reduction axis.
     ``is_reduction`` selects which frame ``host_dim`` indexes. ``count`` is the
     split factor -- how many equal tiles the axis is cut into.
+
+    The reduction frame is the **unsqueezed** ``reduction_ranges``, not the
+    squeezed ``wsr.coarse_tile.reduction_loop_vars``: a size-1 reduction dim
+    still occupies a position here even though it carries no loop variable.
+    Resolve a position to its loop variable through
+    :func:`wsr.coarse_tile.reduction_loop_var_by_ranges_pos`, which is the only
+    place the two frames are bridged.
     """
 
     host_dim: int

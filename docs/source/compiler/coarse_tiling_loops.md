@@ -2257,6 +2257,7 @@ landed.
 | `torch_spyre/_inductor/loop_info.py` | Layer 1: `CoarseTileInfo` dataclass; `copy_op_metadata` |
 | `torch_spyre/_inductor/wsr/coarse_tile_hints.py` | `reorder_unhinted_interlopers()` reorders interlopers before grouping |
 | `torch_spyre/_inductor/wsr/coarse_tile.py` | Layer 1: `coarse_tile()` stamps `loop_info` and rewrites ranges; `_plan_tiling_propagation` plus the `_insert_all_read_copy_ops`/`_insert_all_reduction_ops`/`_insert_all_write_copy_ops` passes handle the data perimeter |
+| `torch_spyre/_inductor/wsr/tile_prediction.py` | `predict_frame()`: reads the frame a candidate tiling *would* leave behind, without mutating IR, by composing the same helpers `_apply_plan` applies |
 | `torch_spyre/_inductor/insert_restickify.py` | `finalize_layouts` commits each op's chosen `FixedTiledLayout` and, for a tiled-reduction op, propagates that layout onto `accum_full` so fill/combine/copy all agree on device coordinates; also stamps a restickify node's `loop_info` from the op it feeds so the node lands in the same loop group |
 | `torch_spyre/_inductor/scheduler.py` | Layer 2: `CountedLoopSchedulerNode`, `build_loop_scheduler_nodes`, `_codegen_counted_loop`, `_regroup_by_outer_loop_key` |
 | `torch_spyre/_inductor/op_spec.py` | Layer 3: `LoopSpec` and `OpSpec` dataclasses |
@@ -2296,6 +2297,15 @@ non-empty exactly when the op was codegen'd inside a `CountedLoopSchedulerNode`.
 It is a `list[list[Symbol]]` (innermost first) derived from the per-level
 tiled dims in `loop_info.loop_tiled_dims` on the corresponding
 `ir.Operation`, selected from the scheduler-level `iteration_space` keys.
+
+**Prediction is in the pre-tiling symbol namespace**: `predict_frame()`
+returns `iter_space`/`write_index`/`read_index` keyed by the op's *committed*
+loop symbols, because that is what the untiled deps it is paired with use.
+Applying the tiling renumbers those symbols (see the appendix on
+`_divide_ranges`), so a predicted frame must never be matched against a
+post-apply dep by symbol — the namespaces overlap, so a mismatch silently reads
+the wrong dim instead of raising.  The symbol-free fields (`ranges`,
+`reduction_ranges`, `layout`) are exact against the applied op.
 
 **Pass ordering**: coarse tiling must run after stickify/padding and
 before `span_reduction`, `cost_model_matmul_division`, `work_distribution`,
@@ -2514,6 +2524,28 @@ and they are staged deliberately rather than combined:
    itself never mutates `data.ranges` — it computes what the post-mutation
    extents *would be* analytically via `_planned_tile_extents`, reading the
    still-untouched `data.ranges`/`data.reduction_ranges`.
+
+   One consequence is easy to miss: shrinking `data.ranges` also renames the
+   op's *iteration symbols*.  Because `get_read_writes()` is uncached (see
+   "Why dependency info never goes stale" below), the next call after the
+   rewrite re-runs `extract_read_writes -> index_vars_squeeze`, whose
+   `SqueezeView.squeezer` drops every dim of size 1 and mints `d0, d1, ...`
+   from a fresh counter over the survivors.  A dim tiled to a per-tile extent
+   of 1 therefore loses its loop symbol entirely and every symbol after it
+   renumbers — ranges `[4, 128, 256]` tiled on dim 1 by 128 leaves
+   `{d0: 4, d1: 256}`, not `{d0: 4, d1: 1, d2: 256}`.  Absorbing that is the
+   whole job of the `squeezed_advance` machinery threaded through
+   `_propagate_tiled_op`, `_propagate_mutation_write_back`, `_insert_copy_op`
+   and `_insert_one_read_copy`.  Only the dep view squeezes: `data.ranges`,
+   `layout.size`, `layout.stride` and the `SpyreTensorLayout` all keep full
+   rank with the unit dim in place, so a *layout* prediction is exact even
+   when a tiled dim divides to 1.  `_divide_ranges` carries
+   `work_div_loop_info` across the renumbering via
+   `_capture_logical_iteration_symbols` + `_order_preserving_symbol_remap`
+   (falling back to `_fused_iteration_symbol_remap` when logical dims fuse
+   into one loop symbol), dropping torch-spyre's own `op_read_writes` memo
+   first; any other symbol-keyed metadata that must survive tiling needs the
+   same treatment.
 
 2. **`_patch_retiled_load_indexes`** fixes a different problem: *other* ops
    whose captured load index still carries the pre-tiling stride

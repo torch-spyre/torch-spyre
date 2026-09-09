@@ -20,6 +20,7 @@ import sympy
 import logging
 import math
 from collections.abc import Callable
+from typing import TYPE_CHECKING
 
 from sympy import Expr, Integer, Symbol, divisors
 from torch._inductor.dependencies import MemoryDep
@@ -71,6 +72,9 @@ from .work_division_constraints import (
     collect_work_division_constraints,
     has_qfp8wt_tensor,
 )
+
+if TYPE_CHECKING:
+    from .scratchpad.plan_solver import TileSpec
 
 logger = get_inductor_logger("work_division")
 
@@ -933,10 +937,40 @@ class WorkDivisionContext:
 
 
 def work_division_context_for_op(
-    op: ComputedBuffer, max_cores: int | None = None
-) -> WorkDivisionContext:
-    """Build the context for ``op``, doing the candidate-invariant work once."""
+    op: ComputedBuffer,
+    max_cores: int | None = None,
+    tiling: "TileSpec | None" = None,
+) -> "WorkDivisionContext | None":
+    """Build the context for ``op``, doing the candidate-invariant work once.
+
+    When ``tiling`` is a non-empty :class:`~.scratchpad.plan_solver.TileSpec`
+    the context describes the *per-tile* frame: each tiled dim's iteration
+    extent is divided by its tile count, so factor domains and per-core spans
+    are the tiled op's, not the whole op's. A division is only meaningful
+    relative to a tiling -- the legal set moves with it -- so the two are
+    chosen together.
+
+    Returns ``None`` -- and only ever -- when ``tiling`` is one
+    :func:`~.wsr.tile_prediction.predict_frame` cannot predict onto ``op``,
+    which is also the tiling ``coarse_tiling`` could not lower. Such a spec has
+    no per-tile frame, so it has no legal divisions either; the caller drops
+    it. An untiled call never returns ``None``.
+
+    The divided iteration space is read off ``predict_frame`` rather than
+    recomputed. That is the single gate: ``_predict_iter_space`` resolves every
+    axis unguarded and is only sound behind ``_rejection_reason``, so calling
+    it directly would raise ``IndexError``/``KeyError`` on a spec the predictor
+    rejects by value, and would silently disagree with the frame the allocator
+    prices the same candidate on.
+    """
     it_space = iteration_space_from_op(op)
+    if tiling is not None and not tiling.is_untiled:
+        from .wsr.tile_prediction import predict_frame
+
+        frame = predict_frame(op, tiling)
+        if frame is None:
+            return None
+        it_space = frame.iter_space
     input_tds, output_td = collect_tensor_deps(
         op,
         _apply_input_layout_overrides(op, get_mem_deps_from_rw(op_read_writes(op))),
@@ -981,6 +1015,7 @@ def work_division_context_for_op(
 def enumerate_work_division_candidates(
     op: ComputedBuffer,
     max_cores: int,
+    tiling: "TileSpec | None" = None,
 ) -> list[dict[Symbol, int]]:
     """Every split (``dict[Symbol, int]``, as :func:`apply_splits` takes) that
     :meth:`WorkDivisionContext.is_legal` admits under ``max_cores``, drawn from
@@ -988,10 +1023,16 @@ def enumerate_work_division_candidates(
     leaves its dim unsplit. Both halves are the context's, leaving only
     the cross product here; a caller that would rather propose one split at a
     time uses the context directly.
+
+    Empty for a ``tiling`` that has no per-tile frame (see
+    :func:`work_division_context_for_op`) -- an unpredictable spec has no legal
+    division, so it drops out of the menu here rather than downstream.
     """
     # TODO: Enumerate compute bound ops and for seeds or compute optimized
     # work division where HBM bandwidth can saturate compute.
-    ctx = work_division_context_for_op(op, max_cores)
+    ctx = work_division_context_for_op(op, max_cores, tiling)
+    if ctx is None:
+        return []
     axes = ctx.axes
     return [
         splits
@@ -1016,6 +1057,7 @@ def work_division_splits_are_legal(
         return True
 
     ctx = work_division_context_for_op(op)
+    assert ctx is not None  # untiled: never rejected
     return ctx.obeys_op_constraints(splits) and ctx.meets_span_floors(splits)
 
 
