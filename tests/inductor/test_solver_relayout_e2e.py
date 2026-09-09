@@ -66,6 +66,10 @@ class _Observed:
         from torch_spyre._inductor import op_spec as opspec_mod
 
         self.plans: list = []
+        # The committed path's own plans for the SAME committed graph, taken at
+        # the moment the solver's plans are materialized (see
+        # assert_fired_edges_are_committed_eligible).
+        self.committed: list = []
         self.demotions: list = []
         self.emitted: set[tuple[int, int]] = set()  # (src, dst) LX addresses
         # One entry per emitted LX relayout op, recorded where spyre_kernel
@@ -83,10 +87,14 @@ class _Observed:
         def spy_materialize(graph, plans):
             from torch_spyre._inductor.pass_utils import op_read_writes
             from torch_spyre._inductor.scratchpad.lx_relayout import (
+                collect_lx_relayout_plans,
                 materialized_lx_relayouts,
             )
 
             self.plans.extend(plans)
+            # Divisions are committed by now and nothing is materialized yet:
+            # exactly the state the committed collector expects.
+            self.committed.extend(collect_lx_relayout_plans(graph))
             result = real_materialize(graph, plans)
             self.copies = {
                 edge: copy_name
@@ -169,6 +177,40 @@ class _Observed:
                     f"{consumer} does not read the relayout copy {copy_name} "
                     f"(reads {sorted(self.consumer_reads[consumer])})"
                 )
+        self.assert_fired_edges_are_committed_eligible()
+
+    def assert_fired_edges_are_committed_eligible(self) -> None:
+        """Parity with the committed path.
+
+        The solver enumerates candidates before divisions exist, so it mirrors
+        the committed path's eligibility gates instead of calling them. Those
+        gates are being rewritten under it (#4284, #3440, #4153). This pins the
+        one direction that must always hold: every edge the solver fired is one
+        the committed collector, run on the same committed graph, also
+        certifies, with the same physical source and destination ownership and
+        core count. (The reverse need not hold: the solver may decline an
+        eligible edge on economics or capacity.) A solver segment's consumers
+        are a subset of the committed plan's, which groups every consumer of a
+        destination view together.
+        """
+        for plan in self.plans:
+            twins = [
+                c
+                for c in self.committed
+                if c.source_name == plan.source_name
+                and set(plan.consumer_names) <= set(c.consumer_names)
+                and c.num_cores == plan.num_cores
+                and c.source_view.same_partition(plan.source_view)
+                and c.destination_view.same_partition(plan.destination_view)
+            ]
+            assert twins, (
+                f"solver fired {plan.source_name} -> {plan.consumer_names} "
+                f"(src {dict(plan.source_view.work_slice_dims)}, dst "
+                f"{dict(plan.destination_view.work_slice_dims)}, {plan.num_cores} "
+                "cores) but the committed collector certifies no such edge on the "
+                "committed graph; committed plans: "
+                f"{[(c.source_name, c.consumer_names, dict(c.source_view.work_slice_dims), dict(c.destination_view.work_slice_dims)) for c in self.committed]}"
+            )
 
     def assert_nothing_emitted(self) -> None:
         """No plan, no demotion, and no identity op codegen took for an LX
