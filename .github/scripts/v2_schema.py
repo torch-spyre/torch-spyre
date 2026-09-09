@@ -101,6 +101,8 @@ TEST_CASES = Table(
 
 TEST_CASE_RUNS = Table(
     name="test_case_runs",
+    # props carries source_file, the per-XML discriminator the dedup checks: a sharded run is
+    # many files under ONE run_id, so a run-level check would let the first shard block the rest.
     columns=(
         "run_id",
         "test_case_id",
@@ -108,6 +110,7 @@ TEST_CASE_RUNS = Table(
         "status",
         "duration_s",
         "fail_message",
+        "props",
     ),
     required=("component",),
 )

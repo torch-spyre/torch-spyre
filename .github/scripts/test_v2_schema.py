@@ -51,6 +51,7 @@ def test_column_order_matches_the_pre_refactor_lists():
         "status",
         "duration_s",
         "fail_message",
+        "props",
     ]
     assert list(BENCHMARKS.columns) == ["benchmark_id", "name", "tags", "props"]
     assert list(BENCHMARK_RUNS.columns) == [
@@ -139,6 +140,7 @@ def test_every_ddl_allowed_status_is_accepted(status):
             "status": status,
             "duration_s": 1.0,
             "fail_message": "",
+            "props": {},
         }
     )
     assert row[3] == status
@@ -154,6 +156,7 @@ def test_status_outside_the_ddl_check_is_refused_before_the_server_sees_it():
                 "status": "PASSED",
                 "duration_s": 1.0,
                 "fail_message": "",
+                "props": {},
             }
         )
 
@@ -174,6 +177,7 @@ def test_insert_passes_column_names_and_ordered_rows():
                 "status": "passed",
                 "duration_s": 0.5,
                 "fail_message": "",
+                "props": {"source_file": "a.xml"},
             }
         ],
     )
@@ -181,7 +185,7 @@ def test_insert_passes_column_names_and_ordered_rows():
     table, rows, cols = c.inserts[0]
     assert table == "test_case_runs"
     assert cols == list(TEST_CASE_RUNS.columns)
-    assert rows == [["r", "t", "c", "passed", 0.5, ""]]
+    assert rows == [["r", "t", "c", "passed", 0.5, "", {"source_file": "a.xml"}]]
 
 
 def test_insert_of_nothing_does_not_call_the_client():
@@ -266,3 +270,38 @@ def test_registry_covers_exactly_the_four_v2_tables():
         "benchmarks",
         "benchmark_runs",
     }
+
+
+# ── sharded runs: many xml files under ONE run_id ────────────────────────────────────────
+
+
+def test_props_carries_the_source_file_discriminator():
+    # The dedup keys on it, so it must survive row assembly in the right column.
+    row = TEST_CASE_RUNS.row(
+        {
+            "run_id": "r",
+            "test_case_id": "t",
+            "component": "c",
+            "status": "passed",
+            "duration_s": 0.1,
+            "fail_message": "",
+            "props": {"source_file": "junit__shard_3.xml"},
+        }
+    )
+    assert row[-1] == {"source_file": "junit__shard_3.xml"}
+    assert TEST_CASE_RUNS.columns[-1] == "props"
+
+
+def test_props_may_be_empty_when_no_source_file_is_known():
+    row = TEST_CASE_RUNS.row(
+        {
+            "run_id": "r",
+            "test_case_id": "t",
+            "component": "c",
+            "status": "passed",
+            "duration_s": 0.1,
+            "fail_message": "",
+            "props": {},
+        }
+    )
+    assert row[-1] == {}

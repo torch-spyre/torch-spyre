@@ -1216,16 +1216,38 @@ def v2_tables_present(client) -> bool:
     )
 
 
-def v2_already_ingested(client, run_id: str, component: str) -> bool:
-    """test_case_runs is a plain MergeTree with no dedup key, so a double ingest of one
-    leg DOUBLES its counts -- and the v2 schema dropped the stored counters precisely
-    because they are derived from these rows. This check is what keeps that correct.
-    Scoped by component as well as run_id to hit the ORDER BY prefix."""
-    rows = client.query(
-        "SELECT count() FROM test_case_runs "
-        "WHERE component = {component:String} AND run_id = {run_id:UUID}",
-        parameters={"component": component, "run_id": run_id},
-    ).result_rows
+def v2_already_ingested(
+    client, run_id: str, component: str, source_file: str = ""
+) -> bool:
+    """Has THIS source file's rows for this run already landed?
+
+    test_case_runs is a plain MergeTree with no dedup key, so a double ingest of one leg
+    DOUBLES its counts -- and v2 dropped the stored counters precisely because they are
+    derived from these rows. This check is what keeps that correct.
+
+    Scoped by source file, not just run_id: a sharded run is MANY xml files under ONE
+    run_id (the pipeline passes --xml-dir with every shard in a single invocation), so a
+    run-level check lets the first shard block all the others. Measured on a real
+    Spyre-Next run: 9 of 10 cases silently dropped across 7 shards.
+
+    `props['source_file']` carries the discriminator. props is a Map outside every key, so
+    recording it costs no sort-order change.
+    """
+    if source_file:
+        rows = client.query(
+            "SELECT count() FROM test_case_runs "
+            "WHERE component = {component:String} AND run_id = {run_id:UUID} "
+            "AND props['source_file'] = {sf:String}",
+            parameters={"component": component, "run_id": run_id, "sf": source_file},
+        ).result_rows
+    else:
+        # No discriminator given: fall back to the run-level check rather than skip
+        # dedup entirely, so a caller that cannot name the file is still protected.
+        rows = client.query(
+            "SELECT count() FROM test_case_runs "
+            "WHERE component = {component:String} AND run_id = {run_id:UUID}",
+            parameters={"component": component, "run_id": run_id},
+        ).result_rows
     return bool(rows and rows[0][0] > 0)
 
 
@@ -1252,7 +1274,9 @@ def v2_new_identity_rows(client, table: str, id_col: str, ident_rows: dict) -> l
     ]
 
 
-def insert_v2(client, component: str, run_id: str, cases: list) -> int:
+def insert_v2(
+    client, component: str, run_id: str, cases: list, source_file: str = ""
+) -> int:
     """Write test_cases (identity) + test_case_runs (outcome) for one leg.
 
     Rows are built as dicts and ordered by v2_schema, so a field cannot be assigned to the
@@ -1291,6 +1315,9 @@ def insert_v2(client, component: str, run_id: str, cases: list) -> int:
                 "status": c.get("status", ""),
                 "duration_s": float(c.get("duration_s", 0) or 0),
                 "fail_message": (c.get("fail_message") or "")[:8192],
+                # Names the xml this row came from, so a sharded run dedups per
+                # file instead of the first shard blocking the rest.
+                "props": ({"source_file": source_file} if source_file else {}),
             }
         )
     # Cross-run dedup, not just in-leg: test_cases is a plain MergeTree, so re-inserting a
@@ -1647,10 +1674,14 @@ def main():
                             f"--trigger-type is the field usually missing",
                             file=sys.stderr,
                         )
-                    elif v2_already_ingested(v2client, _v2_run_id, V2_COMPONENT):
+                    elif v2_already_ingested(
+                        v2client, _v2_run_id, V2_COMPONENT, xml_path.name
+                    ):
                         print(f"  v2: already ingested run_id={_v2_run_id} — skipping")
                     else:
-                        _n = insert_v2(v2client, V2_COMPONENT, _v2_run_id, cases)
+                        _n = insert_v2(
+                            v2client, V2_COMPONENT, _v2_run_id, cases, xml_path.name
+                        )
                         print(f"  v2: {_n} test_case_runs under run_id={_v2_run_id}")
             except Exception as _v2_err:
                 print(
