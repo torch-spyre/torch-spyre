@@ -13,8 +13,16 @@
 # limitations under the License.
 
 """IR-level pass to pad y's K (row) dimension to a stick boundary for
-BATCH_MATMUL_OP operations.  Runs in CustomPreSchedulingPasses immediately
-after insert_restickify, when every ComputedBuffer has a FixedTiledLayout.
+BATCH_MATMUL_OP operations.  Runs in CustomPreSchedulingPasses before
+stickification, while every buffer still carries a plain host FixedLayout.
+
+Padding before stickification means the padded buffer is laid out and, if
+needed, restickified like any user-written F.pad: propagate_spyre_tensor_layouts
+chooses its device layout and finalize_layouts plans a restickify when the
+matmul reads it through a view whose stick dim does not match (a transposed
+nn.Linear weight, issue #4208).  Padding after insert_restickify would instead
+have to grow a restickify output, whose device layout and index expressions
+cannot be reconciled with a larger host extent.
 
 Only y is padded; x is left untouched.
 
@@ -26,9 +34,8 @@ For y, the following IR sequence is emitted:
 
 y's padded buffer is built at the full K_padded host size by lower_pad_sequence.
 reduction_ranges stays at K; the K→K_padded extension happens at SDSC codegen
-time: _extend_matmul_k_to_padded in superdsc.py reads K_padded from y's
-device_size and widens sdsc_iteration_space[K] to K_padded before
-_create_sdsc_tensors runs.
+time: _extend_matmul_k_to_padded in superdsc.py rounds sdsc_iteration_space[K]
+up to the stick boundary before _create_sdsc_tensors runs.
 
 x is left physically untouched.  The hardware masks within-stick elements of x
 beyond the true K to zero, so extending the SDSC iteration to K_padded does not
@@ -45,17 +52,20 @@ M=1 (decode phase) correctly.
 
 from typing import Optional
 
+import sympy
 import torch
 from sympy import Expr
 from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import (
     Buffer,
     ComputedBuffer,
+    FixedLayout,
     Operation,
     Pointwise,
     Reduction,
     TensorBox,
 )
+from torch._inductor.ops_handler import WrapperHandler
 from torch._inductor.virtualized import V
 
 from .constants import BATCH_MATMUL_FP8_OP, BATCH_MATMUL_OP
@@ -147,57 +157,110 @@ def _find_arg_fx_node(arg_name: str) -> Optional[torch.fx.Node]:
     return candidates[0] if candidates else None
 
 
+class _PaddedLoadHandler(WrapperHandler):
+    """Redirect every ``load`` of ``orig_name`` to ``padded_name``, re-striding
+    the index.
+
+    The matmul's inner_fn loads y through whatever view the graph applied (a
+    plain ``[K, N]`` buffer, a transposed ``nn.Linear`` weight, an unsqueezed
+    batch dim, ...), so the flat index it produces is expressed against y's own
+    host strides.  The padded buffer holds the same logical coordinates at the
+    strides of the padded shape.  Each load's index is therefore decomposed
+    into host coordinates against y's layout and re-composed with the padded
+    buffer's indexer.
+
+    This wraps the live index (see CLAUDE.md "Compiler Pass Conventions")
+    rather than re-deriving y's coordinates from the matmul's dim order, so
+    any view stays correct by construction.
+    """
+
+    def __init__(
+        self,
+        inner,
+        orig_name: str,
+        orig_size: list[int],
+        orig_stride: list[int],
+        padded_name: str,
+        padded_indexer,
+        var_ranges: dict,
+    ):
+        super().__init__(inner)
+        self._orig_name = orig_name
+        self._orig_size = orig_size
+        self._orig_stride = orig_stride
+        self._padded_name = padded_name
+        self._padded_indexer = padded_indexer
+        self._var_ranges = var_ranges
+
+    def load(self, name, index):
+        if name != self._orig_name:
+            return super().load(name, index)
+        index = concretize_index(sympy.sympify(index), set(self._var_ranges))
+        coords = compute_coordinates(
+            self._orig_size, self._orig_stride, self._var_ranges, index
+        )
+        return super().load(self._padded_name, self._padded_indexer(coords))
+
+
 def _rebuild_matmul(
     op: ComputedBuffer,
+    y_buf: Buffer,
     y_padded_buf: Buffer,
-    y_k_dim: int,
     operations: list[Operation],
 ) -> ComputedBuffer:
     """Rebuild the matmul ComputedBuffer so y's loader reads from the padded buffer.
 
-    Preserves the original inner_fn's x loading unchanged; only replaces y's
-    loader with one that reads from the padded buffer.  reduction_ranges stays
+    Wraps the original inner_fn with ``_PaddedLoadHandler`` so x's loading (and
+    any view applied to y) is preserved unchanged; only the buffer y's loads
+    resolve to, and the strides of their index, change.  reduction_ranges stays
     at K; the K→K_padded extension happens at SDSC codegen time via
     _extend_matmul_k_to_padded in superdsc.py.
 
-    y's non-batch dims are [K, N] in the common case, but need not be --
-    e.g. a coarse-tile read-copy buffer for a loop-invariant y can be
-    transposed ([N, K]), see test_bmm_read_copy_y_unaligned_k_pads.
-    ``y_k_dim`` (the same host dim insert_bmm_padding padded) says which
-    non-batch position K actually occupies in y_padded_buf; N takes
-    whichever position is left.
+    y's host dims are [.., K, N] in the common case, but need not be: a
+    transposed ``nn.Linear`` weight is [N, K] (issue #4208), and a coarse-tile
+    read-copy buffer for a loop-invariant y can be transposed and column-major
+    (see test_bmm_read_copy_y_unaligned_k_pads).  Re-striding the live load
+    index covers all of these without knowing which position K occupies.
     """
     reduction = op.data
     assert isinstance(reduction, Reduction)
 
     orig_inner_fn = reduction.inner_fn
-    y_padded_loader = y_padded_buf.make_loader()
-    y_ndim = len(y_padded_buf.get_size())
-    y_batch_ndim = y_ndim - 2
-    # y_k_dim is a host-dim index into the whole buffer; translate to a
-    # position within the two non-batch dims (0 or 1).
-    y_k_local = y_k_dim - y_batch_ndim
-    assert y_k_local in (0, 1), (
-        f"_rebuild_matmul: y_k_dim={y_k_dim} not in y's non-batch dims "
-        f"(y_batch_ndim={y_batch_ndim})"
-    )
+    y_name = y_buf.get_name()
+    y_layout = y_buf.get_layout()
+    y_size = [concretize_expr(s) for s in y_layout.size]
+    y_stride = [concretize_expr(s) for s in y_layout.stride]
+    padded_name = y_padded_buf.get_name()
+    padded_indexer = y_padded_buf.get_layout().make_indexer()
 
     def new_inner_fn(
         index,
         reduction_index,
         _orig_inner_fn=orig_inner_fn,
-        _y_loader=y_padded_loader,
-        _y_batch_ndim=y_batch_ndim,
-        _y_k_local=y_k_local,
+        _reduction=reduction,
     ):
-        # x_val comes from the original inner_fn; discard its y and replace below.
-        x_val, _ = _orig_inner_fn(index, reduction_index)
-        non_batch = [None, None]
-        non_batch[_y_k_local] = reduction_index[0]
-        non_batch[1 - _y_k_local] = index[-1]
-        y_index = list(index[:_y_batch_ndim]) + non_batch
-        y_val = _y_loader(y_index)
-        return (x_val, y_val)
+        # Loop-variable ranges are needed to decompose a flat index into
+        # coordinates.  Read them from the reduction at call time so later
+        # passes that re-range the op (coarse tiling) stay consistent.
+        var_ranges = {
+            sym: rng
+            for sym, rng in [
+                *zip(index, _reduction.ranges),
+                *zip(reduction_index, _reduction.reduction_ranges),
+            ]
+            if isinstance(sym, sympy.Symbol)
+        }
+        handler = _PaddedLoadHandler(
+            V.ops,
+            y_name,
+            y_size,
+            y_stride,
+            padded_name,
+            padded_indexer,
+            var_ranges,
+        )
+        with V.set_ops_handler(handler):
+            return _orig_inner_fn(index, reduction_index)
 
     object.__setattr__(reduction, "inner_fn", new_inner_fn)
     # reduction_ranges stays at K; no extension here.
@@ -270,9 +333,7 @@ def insert_bmm_padding(graph: GraphLowering) -> None:
         # y's K host dim: the dim whose host coordinate contains reduction_var.
         y_buf_tmp = graph.get_buffer(y_dep.name)
         y_host_k_dim: int | None = None
-        if y_buf_tmp is not None and isinstance(
-            y_buf_tmp.get_layout(), FixedTiledLayout
-        ):
+        if y_buf_tmp is not None and isinstance(y_buf_tmp.get_layout(), FixedLayout):
             y_h_coords = host_coordinates(y_buf_tmp.get_layout(), y_dep, None)
             y_host_k_dim = next(
                 (
@@ -314,8 +375,7 @@ def insert_bmm_padding(graph: GraphLowering) -> None:
         # accumulates no contribution from those rows.
         # lower_pad_sequence builds the padded buffer at K_padded host size;
         # reduction_ranges is NOT changed.  superdsc._extend_matmul_k_to_padded
-        # widens sdsc_iteration_space[K] to K_padded at SDSC codegen time,
-        # reading K_padded from y's device_layout.device_size.
+        # widens sdsc_iteration_space[K] to K_padded at SDSC codegen time.
         y_size = [concretize_expr(s) for s in y_buf.get_size()]
         if y_host_k_dim is None:
             y_k_dim = len(y_size) - 2
@@ -325,7 +385,8 @@ def insert_bmm_padding(graph: GraphLowering) -> None:
         y_padded_size[y_k_dim] = k_padded
         y_fx_node = _find_arg_fx_node(y_name)
 
-        y_orig_stl = y_buf.get_layout().device_layout
+        # No orig_stl: this pass runs before stickification, so the new ops keep
+        # host FixedLayouts and propagate_spyre_tensor_layouts lays them out.
         y_padded_buf, y_new_ops = lower_pad_sequence(
             y_fx_node,
             padded_size=y_padded_size,
@@ -333,7 +394,6 @@ def insert_bmm_padding(graph: GraphLowering) -> None:
             dtype=dtype,
             dim=y_k_dim,
             insert_before=matmul_fx_node,
-            orig_stl=y_orig_stl,
             arg_buf=y_buf if y_fx_node is None else None,
         )
 
@@ -351,8 +411,8 @@ def insert_bmm_padding(graph: GraphLowering) -> None:
 
         # --- Rebuild matmul inner_fn to load y from the padded buffer ---
         # x is left entirely untouched: the original inner_fn's x loader is
-        # preserved as-is.  Only y's loader is replaced with the padded buffer.
-        _rebuild_matmul(op, y_padded_buf, y_k_dim, operations)
+        # preserved as-is.  Only y's loads are redirected to the padded buffer.
+        _rebuild_matmul(op, y_buf, y_padded_buf, operations)
 
 
 # --------------------------------------------------------------------------- #
