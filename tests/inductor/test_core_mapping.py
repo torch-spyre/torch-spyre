@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import copy
+import dataclasses
 import math
 from types import SimpleNamespace
 
@@ -20,6 +21,7 @@ import pytest
 import sympy
 
 import torch_spyre._inductor.codegen.superdsc as superdsc_module
+import torch_spyre._inductor.core_mapping as core_mapping_module
 import torch_spyre._inductor.pass_utils as pass_utils_module
 from torch_spyre._C import DataFormats, ElementArrangement
 from torch_spyre._inductor.codegen.superdsc import parse_op_spec
@@ -34,8 +36,15 @@ from torch_spyre._inductor.core_mapping import (
     derive_operation_mapping,
     derive_partition_mapping,
     finalize_tensor_work_divisions,
+    remap_work_division,
 )
-from torch_spyre._inductor.op_spec import OpSpec, TensorArg, TensorWorkDivision
+from torch_spyre._inductor.op_spec import (
+    OpSpec,
+    TensorArg,
+    TensorWorkDivision,
+    is_lx_relayout_identity,
+)
+from torch_spyre._inductor.pass_utils import PerCoreView, per_core_views_equal
 from torch_spyre._inductor.spyre_kernel import simplify_op_spec
 from torch_spyre._inductor.views import (
     align_tensors,
@@ -51,6 +60,91 @@ def _coordinates(splits, num_cores, **kwargs):
         tuple(int(mapping[dim].subs(core_id, core)) for dim in dims)
         for core in range(num_cores)
     ]
+
+
+_CORE_ID = sympy.Symbol("core_id")
+
+
+def test_owner_maps_compare_physical_owners_not_sympy_spelling():
+    """Equivalent spellings compare equal; unsplit dimensions describe nothing."""
+
+    head, local = sympy.symbols("head local")
+    same = _CORE_ID - 4 * sympy.floor(_CORE_ID / 4)
+    reordered = sympy.floor(_CORE_ID / 2)
+    left = TensorWorkDivision(
+        {head: 4, local: 1}, {head: sympy.Mod(_CORE_ID, 4), local: sympy.S.Zero}
+    )
+    equivalent = TensorWorkDivision({head: 4}, {head: same}, num_cores=4)
+
+    assert left.physical_core_count == 4
+    assert left != equivalent and left.same_ownership(equivalent)
+    assert not left.same_ownership(
+        TensorWorkDivision({head: 4}, {head: reordered}, num_cores=4)
+    )
+
+    view = PerCoreView(((0, 4),), ((0, sympy.Mod(_CORE_ID, 4)),), num_cores=8)
+    equivalent_view = PerCoreView(
+        ((0, 4), (1, 1)), ((0, same), (1, sympy.S.Zero)), num_cores=8
+    )
+    assert view != equivalent_view and view.same_partition(equivalent_view)
+    assert per_core_views_equal(view, equivalent_view)
+    assert per_core_views_equal(None, None)
+    assert not view.same_partition(
+        PerCoreView(((0, 4),), ((0, reordered),), num_cores=8)
+    )
+
+
+@pytest.mark.parametrize("slot", [sympy.Rational(1, 2), sympy.Symbol("unresolved")])
+def test_owner_slots_must_be_concrete_integers(slot):
+    dim = sympy.Symbol("dim")
+    division = TensorWorkDivision({dim: 2}, {dim: slot}, num_cores=2)
+    with pytest.raises(ValueError, match="non-integral"):
+        division.to_core_slices(2)
+    assert not core_mappings_equal({dim: slot}, {dim: slot}, 2)
+    with pytest.raises(ValueError, match=f"non-integral owner slot {slot} on core 0"):
+        core_mapping_module.owner_slots({dim: slot}, {dim: 2}, 2)
+    view = PerCoreView(((0, 2),), ((0, slot),), num_cores=2)
+    from torch_spyre._inductor.scratchpad.lx_relayout import _core_slices
+
+    with pytest.raises(ValueError, match="non-integral"):
+        _core_slices(view, 2)
+
+
+def test_owner_evaluation_reuse_keeps_domain_and_range_checks():
+    dim = sympy.Symbol("dim")
+    direct = {dim: _CORE_ID}
+    wrapped = {dim: sympy.Mod(_CORE_ID, 4)}
+    evaluate = core_mapping_module._owner_at_core
+    evaluate.cache_clear()
+    assert core_mappings_equal(direct, wrapped, 4)
+    misses = evaluate.cache_info().misses
+    assert core_mapping_module.owner_slots(direct, {dim: 4}, 4) == tuple(
+        {dim: core} for core in range(4)
+    )
+    assert evaluate.cache_info().misses == misses
+    # Reusing earlier points must not hide a difference on a larger domain.
+    assert not core_mappings_equal(direct, wrapped, 8)
+    with pytest.raises(ValueError, match="outside split 2 on core 2"):
+        core_mapping_module.owner_slots(direct, {dim: 2}, 4)
+    with pytest.raises(ValueError, match="owner slot -1 outside split 2 on core 0"):
+        core_mapping_module.owner_slots({dim: sympy.S.NegativeOne}, {dim: 2}, 4)
+    assert not core_mappings_equal(direct, direct, 0)
+    evaluate.cache_clear()
+
+
+def test_owner_evaluation_keeps_short_circuit_order():
+    class FailsOnLaterCore(sympy.Function):
+        @classmethod
+        def eval(cls, value):
+            if value == 1:
+                raise NotImplementedError("later core must not be evaluated")
+            if value == 0:
+                return sympy.Integer(0)
+
+    dim = sympy.Symbol("dim")
+    assert not core_mappings_equal(
+        {dim: FailsOnLaterCore(_CORE_ID)}, {dim: sympy.Integer(1)}, 2
+    )
 
 
 def test_default_mapping_preserves_existing_core_order():
@@ -168,6 +262,80 @@ def test_group_topology_does_not_follow_final_loop_reordering():
     )
 
 
+def test_remap_work_division_accepts_equivalent_merged_owner_slots():
+    first, second, merged = sympy.symbols("first second merged")
+    core_id = sympy.Symbol("core_id")
+    division = TensorWorkDivision(
+        {first: 4, second: 4},
+        {
+            first: sympy.Mod(core_id, 4),
+            second: core_id - 4 * sympy.floor(core_id / 4),
+        },
+        num_cores=8,
+    )
+
+    remapped = remap_work_division(
+        division,
+        {first: ((merged, 4),), second: ((merged, 4),)},
+    )
+
+    assert remapped.physical_core_count == 8
+    assert remapped.work_slices == {merged: 4}
+    assert core_mappings_equal(
+        {merged: remapped.core_id_to_work_slice[merged]},
+        {merged: sympy.Mod(core_id, 4)},
+        8,
+    )
+
+
+def test_remap_work_division_rejects_conflicting_merged_owner_slots():
+    first, second, merged = sympy.symbols("first second merged")
+    core_id = sympy.Symbol("core_id")
+    division = TensorWorkDivision(
+        {first: 4, second: 4},
+        {
+            first: sympy.Mod(core_id, 4),
+            second: sympy.floor(core_id / 2),
+        },
+        num_cores=8,
+    )
+
+    with pytest.raises(ValueError, match="conflicting normalized ownership"):
+        remap_work_division(
+            division,
+            {first: ((merged, 4),), second: ((merged, 4),)},
+        )
+
+
+def test_identity_with_equivalent_owner_spelling_is_not_a_relayout():
+    head = sympy.Symbol("head")
+    core_id = sympy.Symbol("core_id")
+    base = TensorArg(
+        True,
+        0,
+        DataFormats.SEN169_FP16,
+        [4, 64],
+        [head, head],
+        {"lx": 0},
+        work_division=TensorWorkDivision(
+            {head: 4},
+            {head: sympy.Mod(core_id, 4)},
+            num_cores=4,
+        ),
+    )
+    destination = dataclasses.replace(
+        base,
+        is_input=False,
+        work_division=TensorWorkDivision(
+            {head: 4},
+            {head: core_id - 4 * sympy.floor(core_id / 4)},
+            num_cores=4,
+        ),
+    )
+
+    assert not is_lx_relayout_identity("identity", (base, destination))
+
+
 def test_late_mapping_rejects_geometry_that_does_not_fill_groups():
     h, query = sympy.symbols("h query")
     with pytest.raises(ValueError, match="does not match operation split"):
@@ -281,6 +449,28 @@ def test_operation_mapping_rejects_conflicting_lx_tensor_owners():
         derive_operation_mapping(
             {shared: (8, 2), extra: (8, 2)},
             divisions,
+        )
+
+
+def test_operation_mapping_bounds_aligned_owner_dimension_permutations():
+    dims = sympy.symbols("d0:6")
+    core_id = sympy.Symbol("core_id")
+    division = TensorWorkDivision(
+        {dim: 2 for dim in dims},
+        {
+            dim: sympy.Mod(sympy.floor(core_id / (2**index)), 2)
+            for index, dim in enumerate(dims)
+        },
+        num_cores=64,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="too many aligned tensor-owned dimensions.*6 > 5",
+    ):
+        derive_operation_mapping(
+            {dim: (sympy.Integer(2), 2) for dim in dims},
+            [division],
         )
 
 
@@ -401,7 +591,10 @@ def _bmm_op_spec(op: str) -> OpSpec:
 
 @pytest.mark.parametrize("op", [BATCH_MATMUL_OP, BATCH_MATMUL_FP8_OP])
 @pytest.mark.parametrize("reduction_contiguous", [False, True])
-def test_planner_and_sdsc_use_the_same_mapping(monkeypatch, op, reduction_contiguous):
+@pytest.mark.parametrize("dim_splits", [(2, 4, 4), (1, 1, 4)])
+def test_planner_and_sdsc_use_the_same_mapping(
+    monkeypatch, op, reduction_contiguous, dim_splits
+):
     class FakeReduction:
         def __init__(self, reduction_type):
             self.reduction_type = reduction_type
@@ -425,7 +618,23 @@ def test_planner_and_sdsc_use_the_same_mapping(monkeypatch, op, reduction_contig
 
     op_spec = _bmm_op_spec(op)
     dims = tuple(op_spec.iteration_space)
-    splits = dict(zip(dims, (2, 4, 4)))
+    splits = dict(zip(dims, dim_splits))
+    op_spec.iteration_space = {
+        dim: (extent, splits[dim])
+        for dim, (extent, _) in op_spec.iteration_space.items()
+    }
+    monkeypatch.setattr(
+        pass_utils_module,
+        "iteration_space_from_op",
+        lambda _: {dim: extent for dim, (extent, _) in op_spec.iteration_space.items()},
+    )
+    ownership = pass_utils_module.make_iteration_space_ownership(
+        FakeComputedBuffer(op), splits
+    )
+    assert ownership.num_cores == math.prod(dim_splits)
+    assert dataclasses.replace(
+        ownership, num_cores=None
+    ).physical_core_count == math.prod(dim_splits)
     prep = pass_utils_module._ViewPrep(
         iter_space=op_spec.iteration_space,
         write_index=dims[0],
@@ -442,8 +651,8 @@ def test_planner_and_sdsc_use_the_same_mapping(monkeypatch, op, reduction_contig
         num_stick_stride=0,
         is_matmul=pass_utils_module._is_matmul_op(FakeComputedBuffer(op)),
     )
-    planner_view, _, representable = pass_utils_module._per_core_view_from_prep(
-        prep, splits, {dims[2]: 4}
+    planner_view, partial, representable = pass_utils_module._per_core_view_from_prep(
+        prep, ownership.work_slices, {dims[2]: dim_splits[2]}
     )
 
     op_spec.core_id_to_work_slice = derive_operation_mapping(
@@ -454,9 +663,15 @@ def test_planner_and_sdsc_use_the_same_mapping(monkeypatch, op, reduction_contig
     sdsc_output_mapping = {
         device_dim: sdsc_spec.core_id_to_work_slice[renamed[dim]]
         for device_dim, dim in enumerate(dims[:2])
+        if splits[dim] > 1
     }
     assert representable
+    assert partial
+    assert planner_view.num_cores == ownership.num_cores
     assert dict(planner_view.core_to_slot) == sdsc_output_mapping
+    if dim_splits[:2] == (1, 1):
+        assert planner_view.work_slice_dims == ()
+        assert not planner_view.same_partition(PerCoreView((), (), num_cores=1))
 
 
 def test_flattened_iteration_span_is_not_a_single_axis_view():

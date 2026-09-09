@@ -52,7 +52,7 @@ from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.op_spec import IndirectAccess, TensorWorkDivision
 
 from . import config
-from .core_mapping import core_to_slice_mapping
+from .core_mapping import core_to_slice_mapping, same_owner_maps
 from .constants import (
     ELIDED_COPY_BACK_ATTR,
     KEEP_BY_INDEX_OP,
@@ -1715,7 +1715,11 @@ def splits_by_index_coeff(
 def make_iteration_space_ownership(
     op: Operation, splits: dict[sympy.Symbol, int]
 ) -> TensorWorkDivision:
-    """Return complete symbol-keyed ownership for ``op``'s iteration space."""
+    """Return ownership of all iteration axes, including reduction axes.
+
+    Keep the physical core count explicit: an output view may omit an axis
+    being summed without reducing the number of participating cores.
+    """
     iter_space = iteration_space_from_op(op)
     work_slices = {sym: int(splits.get(sym, 1)) for sym in iter_space}
     dim_splits = tuple(work_slices.values())
@@ -2748,6 +2752,8 @@ class PerCoreView:
       pairs giving each core's position along that split dim.
     - num_cores: physical cores over which ``core_to_slot`` is defined. This
       can exceed the number of logical slices when data is replicated.
+      If omitted, the split product is used. Views that omit a reduction axis
+      or describe broadcast copies must retain the explicit physical count.
 
     The first two fields are keyed by the buffer's device-dim index — not by
     op-local iter symbols — so the value depends only on the buffer's physical
@@ -2762,6 +2768,34 @@ class PerCoreView:
     work_slice_dims: tuple[tuple[int, int], ...]
     core_to_slot: tuple[tuple[int, Expr], ...]
     num_cores: int | None = None
+
+    def same_partition(self, other: object) -> bool:
+        """Whether both views assign every physical core the same buffer slice."""
+
+        if not isinstance(other, PerCoreView):
+            return False
+
+        def cores(view: PerCoreView) -> int:
+            if view.num_cores is not None:
+                return view.num_cores
+            return math.prod(split for _, split in view.work_slice_dims)
+
+        return same_owner_maps(
+            dict(self.work_slice_dims),
+            dict(self.core_to_slot),
+            cores(self),
+            dict(other.work_slice_dims),
+            dict(other.core_to_slot),
+            cores(other),
+        )
+
+
+def per_core_views_equal(left: PerCoreView | None, right: PerCoreView | None) -> bool:
+    """None-aware physical-partition comparison."""
+
+    if left is None or right is None:
+        return left is right
+    return left.same_partition(right)
 
 
 def _is_matmul_op(op: Operation) -> bool:

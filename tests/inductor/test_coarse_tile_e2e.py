@@ -6260,6 +6260,7 @@ class TestCoarseTileMoEBroadcastMatmulE2E(InductorTestCase):
     def test_unsqueeze_broadcast_matmul_keeps_copy_for_different_core_views(self):
         """A legal but different source ownership cannot replace the copy."""
         from torch_spyre._inductor import spyre_hint
+        from torch_spyre._inductor.pass_utils import PerCoreView
 
         E, T, H, F = 3, 64, 64, 64
         x = torch.randn(T, H, dtype=torch.float16).to("spyre")
@@ -6275,6 +6276,9 @@ class TestCoarseTileMoEBroadcastMatmulE2E(InductorTestCase):
             with spyre_hint(num_tiles_per_dim={"E": E}):
                 return torch.matmul(x.unsqueeze(0), w)
 
+        output_view = PerCoreView((), (), num_cores=1)
+        staged_view = PerCoreView((), (), num_cores=2)
+        direct_view = PerCoreView((), (), num_cores=4)
         with (
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
@@ -6282,10 +6286,10 @@ class TestCoarseTileMoEBroadcastMatmulE2E(InductorTestCase):
             mock_patch(
                 "torch_spyre._inductor.read_copy_elision._per_core_view_on_buf",
                 side_effect=[
-                    ("output", None, True),
-                    ("output", None, True),
-                    ("staged-weight", None, True),
-                    ("direct-weight", None, True),
+                    (output_view, None, True),
+                    (output_view, None, True),
+                    (staged_view, None, True),
+                    (direct_view, None, True),
                 ],
             ),
         ):

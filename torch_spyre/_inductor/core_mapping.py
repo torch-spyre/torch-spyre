@@ -18,11 +18,90 @@ from __future__ import annotations
 
 import math
 from collections.abc import Mapping, Sequence
+from functools import lru_cache
 from itertools import permutations
+from typing import Any
 
-from sympy import Expr, Integer, Mod, Symbol, floor
+from sympy import Expr, Integer, Mod, Symbol, floor, sympify
 
 from .op_spec import TensorWorkDivision
+
+
+# pass_utils imports this module; keep its PerCoreView type out of this layer.
+# TensorWorkDivision imports the comparator only when its method is called.
+_MAX_OWNER_PERMUTATION_DIMS = 5
+
+
+# Room for 128 distinct formulas on a 32-core device; eviction only repeats work.
+@lru_cache(maxsize=4096)
+def _owner_at_core(expression: Expr, core: int) -> Expr:
+    """Reuse pure substitution, not a validity or ownership decision.
+
+    One core at a time preserves callers' short-circuit and error ordering.
+    No buffer, layout, split count or graph state participates in this result.
+    """
+    return expression.subs(Symbol("core_id"), core)
+
+
+def owner_slots(
+    slots: Mapping[Any, Expr], splits: Mapping[Any, int], num_cores: int
+) -> tuple[dict[Any, int], ...]:
+    """Evaluate owner formulas on every core: one slot per split dimension.
+
+    A slot that is not a concrete integer inside its split raises ``ValueError``.
+    """
+
+    if num_cores <= 0:
+        raise ValueError(f"physical core count must be positive, got {num_cores}")
+    if splits.keys() != slots.keys():
+        raise ValueError(
+            "ownership split and owner-slot dimensions differ: "
+            f"{sorted(map(str, splits))} != {sorted(map(str, slots))}"
+        )
+    rows = []
+    for core in range(num_cores):
+        row = {}
+        for dim, split in splits.items():
+            value = _owner_at_core(sympify(slots[dim]), core)
+            if value.free_symbols or value.is_integer is not True:
+                raise ValueError(f"non-integral owner slot {value} on core {core}")
+            if not 0 <= int(value) < int(split):
+                raise ValueError(
+                    f"owner slot {int(value)} outside split {split} on core {core}"
+                )
+            row[dim] = int(value)
+        rows.append(row)
+    return tuple(rows)
+
+
+def same_owner_maps(
+    left_splits: Mapping[Any, int],
+    left_slots: Mapping[Any, Expr],
+    left_cores: int,
+    right_splits: Mapping[Any, int],
+    right_slots: Mapping[Any, Expr],
+    right_cores: int,
+) -> bool:
+    """Whether two owner maps give every physical core the same slice.
+
+    Unsplit dimensions describe no ownership and are ignored. Equivalent SymPy
+    spellings compare equal; a missing owner formula is a mismatch.
+    """
+
+    left = {dim: int(split) for dim, split in left_splits.items() if int(split) > 1}
+    right = {dim: int(split) for dim, split in right_splits.items() if int(split) > 1}
+    if left != right or left_cores != right_cores:
+        return False
+    if not left:
+        return True
+    try:
+        return core_mappings_equal(
+            {dim: left_slots[dim] for dim in left},
+            {dim: right_slots[dim] for dim in right},
+            left_cores,
+        )
+    except KeyError:
+        return False
 
 
 def core_to_slice_mapping(
@@ -194,6 +273,7 @@ def remap_work_division(
     physical partition does not change; only the symbols used to describe it do.
     """
 
+    num_cores = division.physical_core_count
     new_splits: dict[Symbol, int] = {}
     new_core_map: dict[Symbol, Expr] = {}
     for old_dim, split in division.work_slices.items():
@@ -218,8 +298,17 @@ def remap_work_division(
             if factor == 1:
                 continue
             new_slot = Mod(floor(slot / slot_stride), factor)
-            previous = (new_splits.get(new_dim), new_core_map.get(new_dim))
-            if previous[0] is not None and previous != (factor, new_slot):
+            previous_split = new_splits.get(new_dim)
+            previous_slot = new_core_map.get(new_dim)
+            if previous_split is not None and (
+                previous_split != factor
+                or previous_slot is None
+                or not core_mappings_equal(
+                    {new_dim: previous_slot},
+                    {new_dim: new_slot},
+                    num_cores,
+                )
+            ):
                 raise ValueError(f"conflicting normalized ownership on {new_dim}")
             new_splits[new_dim] = factor
             new_core_map[new_dim] = new_slot
@@ -227,7 +316,7 @@ def remap_work_division(
     return TensorWorkDivision(
         new_splits,
         new_core_map,
-        num_cores=division.num_cores,
+        num_cores=num_cores,
     )
 
 
@@ -287,12 +376,14 @@ def derive_operation_mapping(
     for division in tensor_divisions:
         if division is None:
             continue
-        if division.work_slices and division.num_cores not in (None, num_cores):
+        if division.work_slices and division.physical_core_count != num_cores:
             raise ValueError(
                 "LX tensor ownership and operation use different core domains: "
-                f"{division.num_cores} != {num_cores}"
+                f"{division.physical_core_count} != {num_cores}"
             )
         for dim, split in division.work_slices.items():
+            if int(split) <= 1:
+                continue
             if dim not in split_by_dim:
                 raise ValueError(f"LX tensor dimension {dim} is not in the operation")
             if split_by_dim[dim] != int(split):
@@ -315,6 +406,11 @@ def derive_operation_mapping(
 
     # Tensor-owned dimensions occupy the outer, contiguous groups. At most five
     # dimensions can be split on 32 cores, so trying their radix orders is small.
+    if len(constrained) > _MAX_OWNER_PERMUTATION_DIMS:
+        raise ValueError(
+            "too many aligned tensor-owned dimensions for bounded core-order "
+            f"search: {len(constrained)} > {_MAX_OWNER_PERMUTATION_DIMS}"
+        )
     for order in permutations(constrained):
         candidate = derive_core_mapping(
             dims,
@@ -333,17 +429,30 @@ def derive_operation_mapping(
 
 
 def core_mappings_equal(
-    left: Mapping[Symbol, Expr],
-    right: Mapping[Symbol, Expr],
+    left: Mapping[Any, Expr],
+    right: Mapping[Any, Expr],
     num_cores: int,
 ) -> bool:
     """Return whether two symbolic mappings assign every core identically."""
 
     if left.keys() != right.keys():
         return False
-    core_id = Symbol("core_id")
-    return all(
-        int(left[dim].subs(core_id, core)) == int(right[dim].subs(core_id, core))
-        for dim in left
-        for core in range(num_cores)
-    )
+    if num_cores <= 0:
+        return False
+    try:
+        for dim in left:
+            for core in range(num_cores):
+                values = [
+                    _owner_at_core(sympify(mapping[dim]), core)
+                    for mapping in (left, right)
+                ]
+                if any(
+                    value.free_symbols or value.is_integer is not True
+                    for value in values
+                ):
+                    return False
+                if values[0] != values[1]:
+                    return False
+        return True
+    except (TypeError, ValueError):
+        return False
