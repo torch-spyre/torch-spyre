@@ -3870,6 +3870,13 @@ def _insert_one_read_copy(
     if isinstance(full_buf, StorageBox):
         full_buf = full_buf.data
 
+    # Keep track of the offset already represented by dep.index.  Graph-input
+    # storage offsets are repaired later by propagate_spyre_tensor_layouts(),
+    # after this pre-stickify pass has created the copy.  Unlike an ordinary
+    # lowered op, the generated copy below starts from dep.index directly, so
+    # it must observe any layout-offset change that happens after this point.
+    initial_source_offset = full_buf.layout.offset
+
     # Derive copy buffer strides using compute_tile_stride.
     # dep.size is the full loop iteration space (output + reduction dims) and
     # may have higher rank than the tensor (e.g. for a Reduction reading
@@ -3954,6 +3961,8 @@ def _insert_one_read_copy(
         idx,
         _dep=dep,
         _full_name=full_buf.get_name(),
+        _full_buf=full_buf,
+        _initial_source_offset=initial_source_offset,
         _active_idx=active_idx,
         _compact=compact_invariant,
     ):
@@ -3965,6 +3974,7 @@ def _insert_one_read_copy(
             full_idx = idx
         subs = dict(zip(_dep.var_names, full_idx))
         flat_index = sympy_subs(_dep.index, subs)
+        flat_index += _full_buf.layout.offset - _initial_source_offset
         return V.ops.load(_full_name, flat_index)
 
     # Construct under sizing_op's origins so data.origins is non-empty —
