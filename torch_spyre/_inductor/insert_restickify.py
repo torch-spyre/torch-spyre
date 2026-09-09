@@ -98,10 +98,19 @@ class InputEdgeSwapHandler(WrapperHandler):
         if targets:
             target = targets[0]
         else:
-            # occurrence exceeds the number of plan entries for this (name, index).
-            # This happens when multiple reads share the same dep.index and only one
-            # restickify node was emitted (because they all need the same layout).
-            # All such reads must go to the same restickified buffer.
+            # occurrence has no explicit plan entry for this (name, dep_index).
+            # Two sub-cases:
+            # 1. occurrence > all planned occurrences: multiple reads share the same
+            #    dep.index and only one restickify was emitted (all need the same
+            #    layout). Route to the unique restickified buffer.
+            # 2. occurrence < some planned occurrence: a self-alias edge that needed
+            #    no restickify was deliberately skipped in the plan (its occurrence
+            #    was advanced without recording an entry). This occurrence should
+            #    stay on the original buffer.
+            min_planned = min(exp for exp, _ in matching)
+            if occurrence < min_planned:
+                # Gap: this occurrence precedes the first restickify — stay original.
+                return super().load(self._name_map.get(name, name), index)
             unique_targets = {new_name for _, new_name in matching}
             assert len(unique_targets) == 1, (
                 f"ambiguous fallback for load {name}[{index}] occurrence {occurrence}: "
@@ -571,6 +580,11 @@ def finalize_layouts(graph: GraphLowering) -> None:
             in_stl = in_layout.device_layout
             restick_stl = edge.layout(in_stl, target_stl)
             if restick_stl is None:
+                # No restickify needed for this edge, but still advance the occurrence
+                # counter so a later edge for the same dep (self-alias) gets the right
+                # occurrence number and isn't conflated with this one by the fallback
+                # path in InputEdgeSwapHandler.
+                edge_occurrences[key] = edge_occurrences.get(key, 0) + 1
                 continue
             if restick_stl is EdgeCostMap.INFEASIBLE:
                 raise AssertionError(

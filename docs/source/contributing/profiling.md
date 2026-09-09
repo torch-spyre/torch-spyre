@@ -20,9 +20,9 @@ several:
 |---|---|---|
 | Python API | `torch_spyre/profiler/` | `profile_spyre()` wrapper, `torch.spyre.memory_*` |
 | C++ registration | `torch_spyre/csrc/profiler/` | PrivateUse1 observer, kineto wiring |
-| Build | `setup.py` | Guarded by the `USE_SPYRE_PROFILER` env var |
+| Build | `setup.py` | Guarded by the `USE_SPYRE_PROFILER` env var; links `libaiupti` and Kineto headers bundled with PyTorch itself |
 | Tests | `tests/profiler/` | Skip-marked when `USE_SPYRE_PROFILER` is off |
-| External | [`kineto-spyre`][kineto-spyre], [`aiu-trace-analyzer`][ata] | Versioned separately |
+| External | [`aiu-trace-analyzer`][ata] | Versioned separately |
 | Docs | `docs/source/user_guide/profiling/` | User-visible additions |
 
 Plan PRs accordingly. See [PR scope](#pr-scope) below.
@@ -61,7 +61,7 @@ tag when one is obvious:
 [profiler][memory] Stub torch.spyre.memory_allocated()
 [profiler][trace] Group runtime events under PerfettoSpyreRuntime track
 [profiler][test] Add scaffold with USE_SPYRE_PROFILER skip markers
-[profiler][docs] Document kineto-spyre wheel install
+[profiler][docs] Document PrivateUse1 profiling setup
 ```
 
 Tooling that slices profiler work looks for this tag in `main` history
@@ -150,19 +150,6 @@ Use Perfetto for analysis and presentation, but reach for
 events on the same thread overlap.
 :::
 
-## Coordinating with kineto-spyre
-
-[`kineto-spyre`][kineto-spyre] is a separate repository on its own release
-cadence. If your change needs a new kineto-spyre symbol or behaviour:
-
-1. Land the change in kineto-spyre **first**, with its own PR and release.
-2. Pin the new kineto-spyre version in torch-spyre's requirements.
-3. Open the torch-spyre PR with a description line like
-   *"Requires `kineto-spyre>=X.Y.Z`."*
-
-Do not couple a torch-spyre PR to an unreleased kineto-spyre commit.
-Reviewers cannot run it and CI cannot reproduce it.
-
 ## Documentation expectations
 
 If you change something a user can see (a new API, a new env var, a new
@@ -185,5 +172,4 @@ right people automatically. If GitHub does not auto-request a lead,
 request one manually.
 
 [rfc-0601]: https://github.com/torch-spyre/rfcs/blob/main/0601-SpyreProfilingToolkit/0601-SpyreProfilingToolkitRFC.md
-[kineto-spyre]: https://github.com/IBM/kineto-spyre
 [ata]: https://github.com/IBM/aiu-trace-analyzer

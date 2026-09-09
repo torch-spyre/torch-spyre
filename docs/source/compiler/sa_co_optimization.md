@@ -62,22 +62,36 @@ accumulation to reorder.
 
 ## The objective
 
-**`BundleCostObjective`** sums the cost model's per-fused-bundle predictions. It prices compute as
-well as traffic, so a division can pay for itself. It memoizes per bundle and tracks which
-buffers dirtied which bundle, which is what keeps an incremental re-score affordable against a
-`predict_ops` call that costs 3–10 µs per bundle.
+**`cost_expr`** is `CoOptimizingAllocator._solve`'s symbolic prediction for the whole graph —
+`sympy.sympify(predict_by_bundle(graph.operations, op_features, params=_COST_PARAMS))`, built from
+every buffer's own `sym_is_lx`/`sym_core_divs` (the same symbols the CP-SAT engine's cost
+expression is built from). `plan_layout_and_core_divisions(cost_expr)` compiles it once, per
+solve, into a fast `(chosen, resident) -> fixed-point ns` callable (`_build_score_fn`): every free
+symbol in the expression maps back to a getter built off THESE buffers — an argument's residency
+from whether its owning buffer's name is in `resident`, a split symbol's value from
+`core_divisions[chosen[idx]]`. The compiled formula is evaluated fresh every step; unlike the
+`BundleCostObjective` it replaced, there is no incremental per-bundle memoization or dirty
+tracking, and so nothing to invalidate on a rejected move.
 
-The engine builds it itself from the ambient `V.graph`, because it has to: the objective needs
-per-division `OpFeatures` and the bundle grouping, and the allocator's `CoreDivisionSolverFactory`
-passes only `(buffers, size, alignment)`.
-
-**Memory-only** is the fallback, taken when there is no live graph — the normal case for anything
-driving serialized captures, including the tests. It counts the HBM traffic a spill adds over
+**Memory-only** is the fallback, taken when `cost_expr` is `None` (the normal case for anything
+driving serialized captures, including the tests) or when it can't be compiled here — an
+unrecognized free symbol (e.g. a dynamic-shape symbol the allocator's build left in), or a
+construction error `_build_score_fn` catches. It counts the HBM traffic a spill adds over
 residency, converted once to fixed-point microseconds. Being *differential*, a resident buffer
 contributes exactly zero and only spilled buffers are summed. Its weakness is why the cost model
 replaced it: a core division only matters through what it lets fit, so on a graph where
 everything fits, every division scores the same and the search has nothing to optimize. The
 engine logs which objective it took.
+
+:::{warning}
+Building `cost_expr` symbolically shares a real limitation with the CP-SAT path: a few cost-model
+code paths (`_is_broadcast_op`, `_transport_kind`, and the standalone-reduction/loop-reread rows)
+decide their branch by reading `ArgTraffic.mem`, which raises on a symbolic `is_lx` — so any op
+whose special bandwidth rate depends on residency (a broadcast, `cat0`/`cat1`, `transpose_outer`,
+or a `sumcol`-style reduction) either drops that rate silently or, if the read raises, sinks the
+whole expression back to the memory-only fallback. There is no per-bundle escape hatch for this
+the way `BundleCostObjective`'s concrete `predict_ops` calls had.
+:::
 
 :::{warning}
 The cost objective's plans are cheaper **by the cost model's own reckoning**. No device time has
@@ -109,12 +123,11 @@ shape-invariant guarantees — output contract, geometric validity, `>=` baselin
 `cooptimization_captures_large.json` holds 25–100 buffer graphs for the same guarantees at scale,
 opt-in via `SA_COOPT_LARGE_CAPTURES=1` because they are slow.
 
-The cost objective needs features as well, so it is driven from
-`cooptimization_captures_regen.json` paired with `cooptimization_op_features.json`. The two must
-come from the same compile: every Inductor graph names its buffers `buf0..`, so names collide
-across unrelated graphs without lining up. Scores are **not comparable** between the two corpora
-— they were captured from different pipeline revisions. Regenerating either requires a Spyre
-machine, since the feature extractor reads live Inductor IR.
+`cost_expr` needs features as well, so building or checking one against the captured corpus needs
+`cooptimization_op_features.json` alongside the buffer captures above. The two must come from the
+same compile: every Inductor graph names its buffers `buf0..`, so names collide across unrelated
+graphs without lining up. Regenerating it requires a Spyre machine, since the feature extractor
+reads live Inductor IR.
 
 One contract is worth stating because it was wrong for a while. The allocator sets
 `parents = info["op_inputs"]` without intersecting the solver's buffer set, so an op's graph

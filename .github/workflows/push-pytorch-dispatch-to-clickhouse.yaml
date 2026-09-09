@@ -9,18 +9,22 @@ name: push-pytorch-dispatch-to-clickhouse
 #   nightly runs.
 # - gate_and_build / build_and_test: on repository_dispatch, gates on
 #   "merged PR targeting main" and extracts the merge commit SHA. On
-#   schedule, or workflow_dispatch with no pytorch_sha input, instead
-#   resolves the exact upstream commit pytorch/pytorch's own "nightly"
-#   branch was cut from (same approach as pytorch-redhat-ci's
-#   crcr-nightly.yml). A workflow_dispatch run that *does* supply
-#   pytorch_sha builds that exact commit instead, skipping nightly
-#   resolution entirely. Either way it kicks off the build-from-source +
-#   upstream test pipeline in build_test_pytorch_source.yaml.
+#   schedule, or workflow_dispatch with neither pytorch_sha nor
+#   pytorch_branch given, instead resolves the exact upstream commit
+#   pytorch/pytorch's own "nightly" branch was cut from (same approach as
+#   pytorch-redhat-ci's crcr-nightly.yml). A workflow_dispatch run that
+#   supplies pytorch_sha builds that exact commit instead, skipping nightly
+#   resolution entirely; one that supplies pytorch_branch (and no
+#   pytorch_sha) resolves and builds that branch's current HEAD. Either way
+#   it kicks off the build-from-source + upstream test pipeline in
+#   build_test_pytorch_source.yaml.
 run-name: >-
   ${{
     github.event_name == 'schedule' && 'PyTorch CRCR Nightly Trigger (cron)' ||
     (github.event_name == 'workflow_dispatch' && github.event.inputs.pytorch_sha != '' &&
       format('PyTorch CRCR Manual Trigger - {0}', github.event.inputs.pytorch_sha)) ||
+    (github.event_name == 'workflow_dispatch' && github.event.inputs.pytorch_branch != '' &&
+      format('PyTorch CRCR Manual Trigger - {0}', github.event.inputs.pytorch_branch)) ||
     github.event_name == 'workflow_dispatch' && 'PyTorch CRCR Nightly Trigger (manual)' ||
     format(
       'PyTorch CRCR CI Trigger - {0}',
@@ -44,6 +48,14 @@ on:
         description: >-
           Exact pytorch/pytorch commit SHA to build. Leave empty to resolve
           and build the current nightly (same as the scheduled cron run).
+          Takes precedence over pytorch_branch if both are given.
+        required: false
+        type: string
+      pytorch_branch:
+        description: >-
+          pytorch/pytorch branch to build the current HEAD of (e.g.
+          "release/2.13"). Ignored if pytorch_sha is also given. Leave both
+          empty to resolve and build the current nightly.
         required: false
         type: string
       run_torch_spyre_tests:
@@ -182,6 +194,7 @@ jobs:
           PAYLOAD_JSON: ${{ toJSON(github.event.client_payload) }}
           EVENT_TYPE: ${{ github.event.client_payload.event_type }}
           EXPLICIT_SHA: ${{ github.event.inputs.pytorch_sha }}
+          EXPLICIT_BRANCH: ${{ github.event.inputs.pytorch_branch }}
         run: |
           set -euo pipefail
 
@@ -192,6 +205,24 @@ jobs:
           if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${EXPLICIT_SHA}" ]; then
             echo "Manual trigger: building explicit pytorch_sha=${EXPLICIT_SHA}"
             echo "pytorch_sha=${EXPLICIT_SHA}" >> "$GITHUB_OUTPUT"
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # ---- Manual path: workflow_dispatch with an explicit
+          # pytorch_branch input (and no pytorch_sha). Resolve that branch's
+          # current HEAD on pytorch/pytorch and build it -- same
+          # git ls-remote approach used below to resolve a merged PR's base
+          # branch HEAD.
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${EXPLICIT_BRANCH}" ]; then
+            echo "Manual trigger: resolving HEAD of pytorch/pytorch@${EXPLICIT_BRANCH}"
+            SHA=$(git ls-remote https://github.com/pytorch/pytorch.git "refs/heads/${EXPLICIT_BRANCH}" | cut -f1)
+            if [ -z "${SHA}" ]; then
+              echo "::error::Could not resolve HEAD of pytorch/pytorch@${EXPLICIT_BRANCH}"
+              exit 1
+            fi
+            echo "Resolved pytorch/pytorch@${EXPLICIT_BRANCH} -> ${SHA}"
+            echo "pytorch_sha=${SHA}" >> "$GITHUB_OUTPUT"
             echo "should_build=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -324,6 +355,15 @@ jobs:
     needs: gate_and_build
     if: ${{ needs.gate_and_build.outputs.should_build == 'true' }}
     uses: ./.github/workflows/build_test_pytorch_source.yaml
+    permissions:
+      contents: read
+      id-token: write
+      # Needed by build_test_pytorch_source.yaml's "test" job to dispatch and
+      # poll _upstream_tests_beta_matrix.yaml via the GitHub API
+      # (createWorkflowDispatch / listWorkflowRuns / getWorkflowRun) --
+      # without it the GITHUB_TOKEN gets a 403 "Resource not accessible by
+      # integration". Scoped to this job only, not the whole workflow.
+      actions: write
     secrets: inherit
     with:
       pytorch_sha: ${{ needs.gate_and_build.outputs.pytorch_sha }}

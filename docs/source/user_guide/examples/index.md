@@ -29,7 +29,10 @@ common Torch-Spyre use cases.
 | `distributed/broadcast.py` | Broadcast collective on Spyre |
 | `distributed/gather.py` | Gather collective on Spyre |
 | `distributed/reduce.py` | Reduce collective on Spyre |
-| `broadcast_demo_multirank.py` | Multi-rank broadcast walkthrough with pre- and post-broadcast computation |
+| `distributed/compiled/broadcast_demo_multirank.py` | Multi-rank broadcast walkthrough with pre- and post-broadcast computation |
+| `distributed/compiled/all_gather_demo_multirank.py` | Multi-rank all-gather walkthrough |
+| `distributed/compiled/all_reduce_demo_multirank.py` | Multi-rank allreduce via `torch.compile`'s plan/run collective ops |
+| `distributed/compiled/all_reduce_demo_multicalls_multirank.py` | Multi-rank allreduce with multiple compiled calls sharing one plan |
 
 ## Scratchpad Planning Examples
 
