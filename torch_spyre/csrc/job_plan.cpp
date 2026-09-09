@@ -24,6 +24,7 @@
 #include <vector>
 
 #include "flex/memory_interface/raii_buffer.hpp"
+#include "flex/runtime_stream/operations/runtime_operation_host_produce.hpp"
 #include "spyre_allocator.h"
 #include "spyre_composite_address.h"
 #include "spyre_stream.h"
@@ -169,9 +170,9 @@ void JobPlanStepHostCompute::construct(LaunchContext& ctx,
   static constexpr size_t kAlign = 4096;
 
   // Build the producer body.  All three source cases produce the same type
-  // (RaiiBuffer) via different fill strategies; the kind label is always
-  // "correction" for logs/profiler.
-  std::function<std::shared_ptr<flex::RaiiBuffer>()> producer;
+  // (shared_ptr<RaiiBuffer>) via different fill strategies; the kind label
+  // "correction" surfaces in logs/profiler only.
+  flex::RuntimeOperationHostProduce::Producer producer;
 
   if (input_buffer_ != nullptr) {
     // Case 1: input_buffer_ is provided — use it directly as the source.
@@ -232,12 +233,22 @@ void JobPlanStepHostCompute::construct(LaunchContext& ctx,
     };
   }
 
-  // Produce the staged buffer on the caller thread (same thread that produced
-  // it before via the inline HostCallback synchronize path).
-  auto staged = producer();
+  // Wrap in a RuntimeOperationHostProduce so the correction producer uses
+  // the same uniform HostProduce type as the DCI path in flex.  The kind
+  // label "correction" surfaces in logs/profiler but never selects a code path.
+  flex::RuntimeOperationHostProduce produce_op(std::move(producer),
+                                               /*kind=*/"correction");
 
-  // Launch the correction H2D with the staged buffer attached as the source.
+  // Run the producer on the caller thread and obtain the staged buffer.
+  // output_buffer_ is not written; the correction bytes live only in the
+  // RaiiBuffer returned here and are freed when the DMA completion callback
+  // fires (see params->callback below).
+  auto staged = produce_op.produce();
+
+  // Launch the correction H2D with the staged buffer as the source.
   // The RaiiBuffer lifetime is extended by the completion callback set below.
+  // Nothing reads output_buffer_ after this point — the D2H readback path
+  // uses a separate buffer map (pinned_buffer_map_) and is untouched.
   auto* params = flex::createDmaParams(staged->Pointer(), correction_size_,
                                        /*to_device=*/true, &device_address_);
   params->pipeline_barrier = pipeline_barrier_;
