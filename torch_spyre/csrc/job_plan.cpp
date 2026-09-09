@@ -190,12 +190,14 @@ void JobPlanStepHostCompute::construct(LaunchContext& ctx,
     return;
   }
 
-  // Case 2: fake symbols (ishape_ is {0})
-  // When ishape_ == {0} this step carries no real input data; the host
-  // callback should be a no-op so that fake/test symbols don't accidentally
-  // invoke deeptools with a null input pointer.
+  // Case 2: zero host-supplied symbols (ishape_ == {0})
+  // nullptr is the documented zero-symbol input — DataConvertInfoGenerate
+  // branches on it (DataConvertInfoGenerate.cpp:148) and runs with an empty
+  // symbol set. output_buffer_ must still be filled before the H2D DMA.
   if (ishape_.size() == 1 && ishape_[0] == 0) {
-    launch_host_callback([](void*) {});
+    launch_host_callback([this](void*) {
+      deeptools::processComputeOnHostCommand(*hcm_, output_buffer_, nullptr);
+    });
     return;
   }
 
