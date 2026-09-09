@@ -34,6 +34,7 @@ from torch_spyre._inductor.codegen.compute_ops import (
     _per_core_symbolic_dim_info,
     _symbolic_split_info,
     _tensor_has_symbolic_split,
+    generate_constant_info,
 )
 from torch_spyre._inductor.codegen.superdsc import (
     _align_pool_dim_labels,
@@ -765,3 +766,38 @@ class TestGenerateSdscSymbolicPerCoreAddresses(InductorTestCase):
         self.assertTrue(
             any(sk.is_derived_symbolic for sk in symbol_kinds[first_address:])
         )
+
+
+class TestMaskingConstId(InductorTestCase):
+    """maskingConstId_ must resolve to the samv-maskvalue constant.
+
+    Constant ids are positions in the constants dict, so an op that carries its
+    own constants shifts samv-maskvalue off id 0. Hardcoding 0 there made the
+    backend splat the padding lanes with scaling_factor instead of the mask
+    value, corrupting every non-stick-aligned mean reduction (#4390).
+    """
+
+    def _ids_to_names(self, constants):
+        info = generate_constant_info(DataFormats.SEN169_FP16, constants, 1)
+        return {cid: entry["name_"] for cid, entry in info.items()}
+
+    def test_constants_dict_preserves_insertion_order(self):
+        # The whole scheme rests on dict order being insertion order, not
+        # sorted: "samv-maskvalue" sorts before "scaling_factor" but must come
+        # second when inserted second.
+        constants = {"scaling_factor": 1.0 / 9, "samv-maskvalue": 0.0}
+        self.assertEqual(list(constants), ["scaling_factor", "samv-maskvalue"])
+        self.assertEqual(self._ids_to_names(constants)["1"], "samv-maskvalue")
+
+    def test_masking_const_id_follows_preceding_constants(self):
+        # A reduction carrying scaling_factor (mean) shifts the mask value to 1;
+        # one carrying nothing else (sum) leaves it at 0. In both cases the
+        # index recorded at insertion time must name samv-maskvalue.
+        for preceding, expected in (({}, "0"), ({"scaling_factor": 1.0 / 9}, "1")):
+            constants = dict(preceding)
+            recorded = len(constants)
+            constants["samv-maskvalue"] = 0.0
+            self.assertEqual(str(recorded), expected)
+            self.assertEqual(
+                self._ids_to_names(constants)[str(recorded)], "samv-maskvalue"
+            )
