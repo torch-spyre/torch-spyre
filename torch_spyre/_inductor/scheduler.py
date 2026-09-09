@@ -524,7 +524,7 @@ def demote_incoherent_lx_buffers(
             if (
                 source_view is None
                 or destination_view is None
-                or source_view == destination_view
+                or source_view.same_partition(destination_view)
                 or len(reads) != 1
                 or len(writes) != 1
                 or reads[0].name != plan.source_name
@@ -576,7 +576,7 @@ def demote_incoherent_lx_buffers(
                 culprit = f"{node.get_name()} view unrepresentable"
                 break
             if expected is not None:
-                if view != expected:
+                if not view.same_partition(expected):
                     culprit = f"{node.get_name()} view {view} != {expected}"
                     break
                 if not _ownership_projectable(node, dep, name, expected):
@@ -585,7 +585,7 @@ def demote_incoherent_lx_buffers(
                 continue
             if ref is None:
                 ref = view
-            elif view != ref:
+            elif not view.same_partition(ref):
                 culprit = f"{node.get_name()} disagrees: {view} != {ref}"
                 break
         if culprit is None:
@@ -703,7 +703,7 @@ def verify_carried_reduction_ownership(
                 )
             if expected_view is None:
                 expected_view = view
-            elif view != expected_view:
+            elif not view.same_partition(expected_view):
                 raise Unsupported(
                     f"carried reduction {op_name} {access} ownership {view} "
                     f"does not match accumulator ownership {expected_view}"

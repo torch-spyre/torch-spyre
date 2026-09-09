@@ -396,6 +396,16 @@ PYBIND11_MODULE(_C, m) {
            [](const DataFormats& df) { return spyre::elems_per_stick(df); });
 
   m.def("get_spyre_tensor_layout", &spyre::get_spyre_tensor_layout);
+  m.def("get_device_size_in_bytes",
+        py::overload_cast<const spyre::SpyreTensorLayout&>(
+            &spyre::get_device_size_in_bytes),
+        py::arg("layout"),
+        "Return padded storage bytes for a layout with known device geometry.");
+  m.def("get_device_size_in_bytes",
+        py::overload_cast<const std::vector<int64_t>&, const DataFormats&>(
+            &spyre::get_device_size_in_bytes),
+        py::arg("device_size"), py::arg("device_dtype"),
+        "Return whole-stick storage bytes; reject undefined format geometry.");
   m.def("set_spyre_tensor_layout", &spyre::set_spyre_tensor_layout);
   m.def("get_downcast_warning", &spyre::get_downcast_warn_enabled,
         "Return whether downcast warnings are enabled.");

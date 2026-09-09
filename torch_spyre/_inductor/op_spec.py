@@ -17,6 +17,7 @@ from __future__ import annotations
 
 from collections import OrderedDict
 import dataclasses
+import math
 import threading
 from typing import Any, Literal, Sequence
 
@@ -153,6 +154,39 @@ class TensorWorkDivision:
     core_id_to_work_slice: dict[Symbol, Expr]
     num_cores: int | None = None
 
+    @property
+    def physical_core_count(self) -> int:
+        """Physical core domain over which the owner expressions are defined."""
+
+        return (
+            self.num_cores
+            if self.num_cores is not None
+            else math.prod(int(split) for split in self.work_slices.values())
+        )
+
+    def same_ownership(self, other: object) -> bool:
+        """Whether both values assign every physical core the same slice.
+
+        Structural equality remains the dataclass value-syntax comparison.
+        Ownership decisions use this evaluated comparison instead, so equivalent
+        SymPy spellings compare equal. Unsplit dimensions do not describe
+        ownership and are ignored.
+        """
+
+        if not isinstance(other, TensorWorkDivision):
+            return False
+        # core_mapping imports this module's TensorWorkDivision.
+        from .core_mapping import same_owner_maps
+
+        return same_owner_maps(
+            self.work_slices,
+            self.core_id_to_work_slice,
+            self.physical_core_count,
+            other.work_slices,
+            other.core_id_to_work_slice,
+            other.physical_core_count,
+        )
+
     def remap_symbols(self, symbol_mapping: dict[Symbol, Symbol]) -> TensorWorkDivision:
         """Return this ownership expressed in remapped loop symbols."""
 
@@ -171,12 +205,19 @@ class TensorWorkDivision:
     def to_core_slices(self, num_cores: int) -> dict[str, dict[str, int]]:
         """Expand symbolic ownership into DeepTools' per-core slice map."""
 
+        if num_cores <= 0:
+            raise ValueError(f"physical core count must be positive, got {num_cores}")
         core_id = Symbol("core_id")
         result = {}
         for core in range(num_cores):
             slots = {}
             for dim, expression in self.core_id_to_work_slice.items():
-                slot = int(sympify(expression).subs(core_id, core))
+                value = sympify(expression).subs(core_id, core)
+                if value.free_symbols or value.is_integer is not True:
+                    raise ValueError(
+                        f"core {core} owns non-integral {dim} slot {value}"
+                    )
+                slot = int(value)
                 split = self.work_slices[dim]
                 if not 0 <= slot < split:
                     raise ValueError(
@@ -247,7 +288,7 @@ def is_lx_relayout_identity(op: str, args: Sequence[TensorArg]) -> bool:
         and "lx" in destination.allocation
         and source.work_division is not None
         and destination.work_division is not None
-        and source.work_division != destination.work_division
+        and not source.work_division.same_ownership(destination.work_division)
     )
 
 
