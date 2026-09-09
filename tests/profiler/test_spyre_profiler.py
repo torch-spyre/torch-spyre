@@ -1132,12 +1132,8 @@ def _find_duplicate_kernel_start_timestamps(events):
             f"(ts={timestamp})"
         )
 
-        assert (
-            isinstance(stream_id, int)
-            and not isinstance(stream_id, bool)
-        ), (
-            f"Spyre kernel event {name} must have a valid stream ID "
-            f"(tid={stream_id})"
+        assert isinstance(stream_id, int) and not isinstance(stream_id, bool), (
+            f"Spyre kernel event {name} must have a valid stream ID (tid={stream_id})"
         )
 
         kernel_events.append(event)
