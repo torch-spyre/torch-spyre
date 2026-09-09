@@ -1619,29 +1619,33 @@ def main():
                 insert_cases(client, run_id, cases, workflow=args.workflow)
                 insert_properties(client, run_id, cases)
 
-            # v2 tables, alongside v1. Guarded so this script still runs against a
-            # database where the migration has not landed.
-            if v2client is not None and v2_tables_present(v2client):
-                _v2_source, _v2_ext = v2_source_and_external_run_id(args, run_id)
-                _v2_tier = (getattr(args, "trigger_type", "") or "").strip()
-                _v2_run_id = v2_run_id(
-                    _v2_source, _v2_ext, args.platform or run["platform"], _v2_tier
-                )
-                if not _v2_run_id:
-                    # Loud, because a blank run_id means these cases reach v2 unjoinable
-                    # to any artifact -- and that reads downstream as "no tests ran".
-                    print(
-                        f"  [warn] v2 skipped: run_id not derivable "
-                        f"(source={_v2_source} ext={_v2_ext!r} "
-                        f"arch={args.platform or run['platform']!r} tier={_v2_tier!r}); "
-                        f"--trigger-type is the field usually missing",
-                        file=sys.stderr,
+            # v2 tables, alongside v1. Failure here must never cost a v1 row: v1 is still
+            # authoritative, so the experimental write is contained rather than allowed to
+            # abort the loop and drop every remaining file's v1 insert.
+            try:
+                if v2client is not None and v2_tables_present(v2client):
+                    _v2_source, _v2_ext = v2_source_and_external_run_id(args, run_id)
+                    _v2_tier = (getattr(args, "trigger_type", "") or "").strip()
+                    _v2_run_id = v2_run_id(
+                        _v2_source, _v2_ext, args.platform or run["platform"], _v2_tier
                     )
-                elif v2_already_ingested(v2client, _v2_run_id, V2_COMPONENT):
-                    print(f"  v2: already ingested run_id={_v2_run_id} — skipping")
-                else:
-                    _n = insert_v2(v2client, V2_COMPONENT, _v2_run_id, cases)
-                    print(f"  v2: {_n} test_case_runs under run_id={_v2_run_id}")
+                    if not _v2_run_id:
+                        # Loud, because a blank run_id means these cases reach v2 unjoinable
+                        # to any artifact -- and that reads downstream as "no tests ran".
+                        print(
+                            f"  [warn] v2 skipped: run_id not derivable "
+                            f"(source={_v2_source} ext={_v2_ext!r} "
+                            f"arch={args.platform or run['platform']!r} tier={_v2_tier!r}); "
+                            f"--trigger-type is the field usually missing",
+                            file=sys.stderr,
+                        )
+                    elif v2_already_ingested(v2client, _v2_run_id, V2_COMPONENT):
+                        print(f"  v2: already ingested run_id={_v2_run_id} — skipping")
+                    else:
+                        _n = insert_v2(v2client, V2_COMPONENT, _v2_run_id, cases)
+                        print(f"  v2: {_n} test_case_runs under run_id={_v2_run_id}")
+            except Exception as _v2_err:
+                print(f"  [warn] v2 write failed, v1 unaffected: {_v2_err!r}", file=sys.stderr)
 
             total_cases += len(cases)
             if args.write_v1:
