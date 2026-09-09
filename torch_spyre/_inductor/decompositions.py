@@ -993,6 +993,16 @@ def _taylor_dtypes(input: torch.Tensor) -> tuple[torch.dtype, torch.dtype]:
     outright.  It matters only because the bodies above are plain torch
     functions the CPU-side accuracy tests call directly, and this never narrows
     one of those.
+
+    Complex is the one dtype aten accepts that these bodies do not serve, and it
+    needs no guard because it cannot arrive: ``.to("spyre")`` rejects a complex
+    tensor outright (``Spyre backend does not support dtype ComplexFloat``), so
+    no Spyre compile ever sees one.  Called directly on CPU it raises
+    ``NotImplementedError`` from ``torch.floor``, which is the right answer --
+    range-reducing a complex argument against pi is meaningless, ``cos(a+bi)``
+    needing ``cosh``/``sinh`` instead.  Should complex placement ever land,
+    cos/sin would need a complex guard or a fallback registration, since they no
+    longer appear in ``register_fallback_default``.
     """
     _, result_dtype = elementwise_dtypes(
         input, type_promotion_kind=ELEMENTWISE_TYPE_PROMOTION_KIND.INT_TO_FLOAT
@@ -1004,8 +1014,10 @@ def _taylor_dtypes(input: torch.Tensor) -> tuple[torch.dtype, torch.dtype]:
 def spyre_cos(input: torch.Tensor) -> torch.Tensor:
     """cos(x) via Cody-Waite range reduction and degree-9 Horner polynomial.
 
-    Serves every dtype aten accepts, so no CPU fallback is needed: the body runs
-    at fp32 or wider and the result carries aten's own dtype.
+    Serves every real dtype aten accepts, so no CPU fallback is needed: the body
+    runs at fp32 or wider and the result carries aten's own dtype.  Complex is
+    aten's one dtype this does not serve, and is unreachable on this backend
+    rather than guarded against -- see ``_taylor_dtypes``.
     """
     compute_dtype, result_dtype = _taylor_dtypes(input)
     out = _taylor_cos(input.to(compute_dtype))
@@ -1016,8 +1028,10 @@ def spyre_cos(input: torch.Tensor) -> torch.Tensor:
 def spyre_sin(input: torch.Tensor) -> torch.Tensor:
     """sin(x) via Cody-Waite range reduction and degree-9 Horner polynomial.
 
-    Serves every dtype aten accepts, so no CPU fallback is needed: the body runs
-    at fp32 or wider and the result carries aten's own dtype.
+    Serves every real dtype aten accepts, so no CPU fallback is needed: the body
+    runs at fp32 or wider and the result carries aten's own dtype.  Complex is
+    aten's one dtype this does not serve, and is unreachable on this backend
+    rather than guarded against -- see ``_taylor_dtypes``.
     """
     compute_dtype, result_dtype = _taylor_dtypes(input)
     out = _taylor_sin(input.to(compute_dtype))

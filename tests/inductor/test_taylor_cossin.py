@@ -182,8 +182,11 @@ def test_registered_as_decomposition_and_not_a_fallback(op_name):
     ``spyre_decompositions``, so a stray ``fallback_ops`` entry would not shadow
     the decomposition on the compile path -- but it would still register an eager
     CPU-offload kernel and advertise a CPU path that nothing needs, since the
-    decomposition's own promotion lets it serve every dtype aten accepts.
-    Assert both directions so neither drifts back.
+    decomposition's own promotion lets it serve every real dtype aten accepts.
+    (Complex is the one it does not, and needs no fallback either: a complex
+    tensor cannot be placed on a Spyre device at all, so no compile sees one --
+    ``_taylor_dtypes`` documents this.)  Assert both directions so neither
+    drifts back.
     """
     op = getattr(torch.ops.aten, op_name).default
     assert op in get_spyre_decomp_table(), (
