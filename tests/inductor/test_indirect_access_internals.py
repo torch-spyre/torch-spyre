@@ -63,6 +63,9 @@ from torch_spyre._inductor.op_spec import (  # noqa: E402
     TensorArg,
     UnimplementedOp,
 )
+from torch_spyre._inductor.pass_utils import (  # noqa: E402
+    _non_indirect_coord_syms,
+)
 from torch_spyre.execution.async_compile import SpyreAsyncCompile  # noqa: E402
 
 
@@ -153,6 +156,41 @@ class TestIndirectAccessAtom(IndirectAccessTestCase):
         self.assertEqual(len(out.atoms(IndirectAccess)), 2)
         self.assertNotIn(t0, out.free_symbols)
         self.assertNotIn(t1, out.free_symbols)
+
+
+# ===========================================================================
+# Layer 1b: Split-guard symbol extraction from device coordinates
+# ===========================================================================
+class TestNonIndirectCoordSyms(IndirectAccessTestCase):
+    """The syms this reports are the ones work division must not split, so a
+    shared gather table keeps the same base address on every core.
+    """
+
+    def test_pure_data_coords_all_reported(self):
+        c0, c1 = sympy.symbols("c0 c1")
+        self.assertEqual(_non_indirect_coord_syms([c0, c1]), {c0, c1})
+
+    def test_bare_indirect_coord_reports_nothing(self):
+        idx = sympy.Symbol("idx")
+        self.assertEqual(_non_indirect_coord_syms([IndirectAccess(idx)]), set())
+
+    def test_fused_entry_coord_still_reports_its_data_sym(self):
+        """A paged cache folds block index and within-block offset into one
+        coordinate; d0 addresses into the shared table (#3984).
+        """
+        d0 = sympy.Symbol("d0")
+        coord = d0 + 128 * IndirectAccess(sympy.Symbol("idx"))
+        self.assertEqual(_non_indirect_coord_syms([coord]), {d0})
+
+    def test_fused_coord_alongside_plain_coords(self):
+        d0, d1, d2 = sympy.symbols("d0 d1 d2")
+        coords = [
+            d0 + 128 * IndirectAccess(sympy.Symbol("idx")),
+            d1,
+            sympy.floor(d2 / 64),
+            sympy.Mod(d2, 64),
+        ]
+        self.assertEqual(_non_indirect_coord_syms(coords), {d0, d1, d2})
 
 
 # ===========================================================================

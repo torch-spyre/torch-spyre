@@ -28,7 +28,7 @@ The PyTorch Dispatcher routes each operation to the correct device implementatio
 Torch-Spyre registers `spyre` as a PyTorch device using the
 `PrivateUse1` mechanism — the standard PyTorch pathway for out-of-tree
 accelerators. Registration happens in `torch_spyre/__init__.py`'s
-`_autoload()`:
+`_autoload_impl()`, invoked by the run-once `_autoload()` entry point:
 
 ```python
 torch.utils.rename_privateuse1_backend("spyre")
@@ -56,7 +56,7 @@ The count itself comes from `flex::getNumDevices`.
 
 | File | Responsibility |
 |------|---------------|
-| `csrc/module.cpp` | pybind11 entry point for the `_C` extension module. Device registration itself happens in `torch_spyre/__init__.py::_autoload()`. |
+| `csrc/module.cpp` | pybind11 entry point for the `_C` extension module. Device registration itself happens in `torch_spyre/__init__.py::_autoload_impl()`. |
 | `csrc/spyre_tensor_impl.cpp` | `SpyreTensorImpl`, the device tensor backing store. |
 | `csrc/spyre_mem.cpp` | Device tensor factory ops (`spyre_empty*`, `resize_`) and host↔device copy: builds the `DataConversionInfo` (DCI) descriptors via `generate_dci` that drive `copyAsync` transfers between host memory and LPDDR5. |
 | `csrc/spyre_allocator.cpp` | `SpyreAllocator`, which bridges PyTorch's `c10::Allocator` to `flex::FlexAllocator`. |
@@ -153,7 +153,11 @@ Physical-frame (PF) and virtual-frame (VF) execution are *not* allocator strateg
 
 Eager kernels reach the Spyre dispatch key from two Python sources.
 
-The first is manual registrations in [`torch_spyre/ops/eager.py`](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/ops/eager.py), which use `register_torch_compile_kernel` to register 45+ ops (arithmetic, comparison, reduction, activation, and view ops) for the PrivateUse1 dispatch key.
+The first is manual registrations in [`torch_spyre/ops/eager.py`](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/ops/eager.py), which use `register_torch_compile_kernel` to register the 45+ ops in `COMPILED_OPS` (arithmetic, comparison, reduction, activation, and view ops) for the PrivateUse1 dispatch key.
+
+In-place variants are *derived* from that same list by `register_inplace_kernels`, not listed separately: each `foo_` overload whose signature matches its functional `foo` sibling gets a kernel that computes functionally and writes back with `self.copy_()`. In-place ops must never be added to `COMPILED_OPS` directly — a standalone-compiled in-place kernel bakes its write-destination address at trace time and can clobber an unrelated live buffer, whereas `copy_` is addressed at runtime.
+
+The match requires the same overload name *and* an identical argument signature modulo the `(a!)` write-alias, so a same-named pair with different operand order is rejected rather than mis-paired: `pow_.Scalar(Tensor self, Scalar exponent)` versus `pow.Scalar(Scalar self, Tensor exponent)` would otherwise yield a kernel computing `other ** self`. The kernel also enforces PyTorch's in-place dtype contract, raising if the promoted result cannot be cast back to `self`.
 
 The second is CPU fallbacks in [`torch_spyre/ops/fallbacks.py`](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/ops/fallbacks.py), registered through `@register_fallback` (or the `register_fallback_default` helper for plain pass-throughs). These cover the long tail: `arange`, `embedding`, `cumsum`, `tril`/`triu`, `isin`, `bitwise_xor`/`bitwise_or`, `argmax`, and similar.
 
@@ -179,7 +183,7 @@ Streams are implemented in `torch_spyre/streams.py` (Python) and
 
 ### Stream Pool
 
-Each device keeps a fixed pool of streams (see `csrc/spyre_stream.cpp`). Stream `0` is the default. Streams `1` through `32` form the low-priority pool (`priority == 0`); streams `33` through `64` form the high-priority pool (any non-zero priority). Each pool holds 32 streams per device and allocates round-robin.
+Each device keeps a fixed pool of streams (see `csrc/spyre_stream.cpp`). Stream `0` is the default. Streams `1` through `32` form the low-priority pool (`priority == 0`); streams `33` through `64` form the high-priority pool (any non-zero priority). Each pool holds 32 streams per device and allocates round-robin. Stream IDs `65` and above are reserved for the host-compute pool that program correction runs on; its size is set by `TORCH_SPYRE_NUM_HOST_COMPUTE_STREAMS` (default 4, maximum 8).
 
 On input, `priority` is a binary switch: `0` selects the low-priority pool and any non-zero value selects the high-priority pool. The `Stream.priority` getter does not echo the constructor value back. It reports `0` for low-priority streams and `-1` for high-priority streams, matching `torch.cuda.Stream.priority`. The asymmetry is implemented in `csrc/spyre_stream.cpp` `SpyreStream::priority`.
 

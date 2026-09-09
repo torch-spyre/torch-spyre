@@ -214,5 +214,165 @@ class TestD2HFromTensorSegment(TestCase):
                 torch_spyre._C.launch_jobplan(job_plan, [inp, out])
 
 
+class TestSymbolicArg(TestCase):
+    """
+    Unit tests for the SymbolicArg typed payload.
+
+    Notes:
+        Tests will need to be reworked once kdimension is implemented.
+    """
+
+    def test_kdimension_entry_reaches_construct_and_raises(self):
+        """A kDimension entry traverses Python → pybind → LaunchContext →
+        construct() and raises 'kDimension is not yet implemented'.
+
+        Uses a real-symbols ComputeOnHost step (non-{0} ishape) so the
+        payload is consumed rather than short-circuited by the fake-symbols
+        nullptr path.  The raise proves the entry survived the full carrier
+        path and was read positionally from slot 0.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            spyrecode_dir = tpk().create_mock_spyrecode(
+                tmpdir, exec_command="ComputeOnHost"
+            )
+            job_plan = torch_spyre._C.prepare_kernel(spyrecode_dir)
+
+            t = torch.zeros(64, dtype=torch.float16, device="spyre")
+            payload = [
+                torch_spyre._C.SymbolicArg(
+                    kind=torch_spyre._C.SymbolicArgKind.kDimension,
+                    tensor_id=0,
+                    dim_index=0,
+                )
+            ]
+
+            stream = torch.Stream("spyre")
+            with stream:
+                with pytest.raises(
+                    RuntimeError, match="kDimension is not yet implemented"
+                ):
+                    torch_spyre._C.launch_jobplan(job_plan, [t], symbolic_args=payload)
+
+    def test_symbolic_arg_attributes_and_repr_roundtrip(self):
+        """SymbolicArg fields and repr survive pybind construction.
+
+        No hardware required — pure Python boundary check.
+        """
+        addr_arg = torch_spyre._C.SymbolicArg(
+            kind=torch_spyre._C.SymbolicArgKind.kAddress,
+            tensor_id=1,
+        )
+        self.assertEqual(addr_arg.kind, torch_spyre._C.SymbolicArgKind.kAddress)
+        self.assertEqual(addr_arg.tensor_id, 1)
+        self.assertEqual(addr_arg.dim_index, -1)
+        self.assertEqual(addr_arg.value, -1)
+
+        dim_arg = torch_spyre._C.SymbolicArg(
+            kind=torch_spyre._C.SymbolicArgKind.kDimension,
+            tensor_id=0,
+            dim_index=2,
+            value=48,
+        )
+        self.assertEqual(dim_arg.kind, torch_spyre._C.SymbolicArgKind.kDimension)
+        self.assertEqual(dim_arg.tensor_id, 0)
+        self.assertEqual(dim_arg.dim_index, 2)
+        self.assertEqual(dim_arg.value, 48)
+
+        r = repr(addr_arg)
+        self.assertIn("tensor_id=1", r)
+        self.assertIn("dim_index=-1", r)
+
+    def test_tensor_id_out_of_range_raises(self):
+        """A payload entry whose tensor_id exceeds the tensor list length
+        raises a loud bounds-check error rather than silently reading OOB.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            spyrecode_dir = tpk().create_mock_spyrecode(
+                tmpdir, exec_command="ComputeOnHost"
+            )
+            job_plan = torch_spyre._C.prepare_kernel(spyrecode_dir)
+
+            t = torch.zeros(64, dtype=torch.float16, device="spyre")
+            # tensor list has 1 entry (index 0); tensor_id=5 is out of range
+            payload = [
+                torch_spyre._C.SymbolicArg(
+                    kind=torch_spyre._C.SymbolicArgKind.kAddress,
+                    tensor_id=5,
+                )
+            ]
+
+            stream = torch.Stream("spyre")
+            with stream:
+                with pytest.raises(RuntimeError, match="tensor_id=5 out of range"):
+                    torch_spyre._C.launch_jobplan(job_plan, [t], symbolic_args=payload)
+
+    def test_kaddress_ordering_forward_and_reversed_differ(self):
+        """Forward and reversed payloads over two tensors produce different
+        resolved vectors, each matching the expected per-slot address.
+
+        Uses _resolve_symbolic_args, which calls
+        JobPlanStepHostCompute::resolveSymbolicArgs — the same function used
+        by the typed-payload resolution path at launch time — so the result is
+        identical to what would be passed to deeptools.
+        """
+        t0 = torch.zeros(64, dtype=torch.float16, device="spyre")
+        t1 = torch.zeros(64, dtype=torch.float16, device="spyre")
+
+        kAddr = torch_spyre._C.SymbolicArgKind.kAddress
+
+        # Ground-truth address for each tensor: resolve each alone at slot 0
+        # so the result is independent of ordering.
+        addr_t0 = torch_spyre._C._resolve_symbolic_args(
+            [t0], [torch_spyre._C.SymbolicArg(kind=kAddr, tensor_id=0)]
+        )[0]
+        addr_t1 = torch_spyre._C._resolve_symbolic_args(
+            [t1], [torch_spyre._C.SymbolicArg(kind=kAddr, tensor_id=0)]
+        )[0]
+
+        # Tensors must be at distinct addresses — if they coincidentally share
+        # one the reversed payload would produce the same vector and the
+        # ordering assertion would be meaningless.
+        self.assertNotEqual(
+            addr_t0,
+            addr_t1,
+            "t0 and t1 share a device address; ordering test would be meaningless",
+        )
+
+        payload_fwd = [
+            torch_spyre._C.SymbolicArg(kind=kAddr, tensor_id=0),
+            torch_spyre._C.SymbolicArg(kind=kAddr, tensor_id=1),
+        ]
+        payload_rev = [
+            torch_spyre._C.SymbolicArg(kind=kAddr, tensor_id=1),
+            torch_spyre._C.SymbolicArg(kind=kAddr, tensor_id=0),
+        ]
+
+        resolved_fwd = torch_spyre._C._resolve_symbolic_args([t0, t1], payload_fwd)
+        resolved_rev = torch_spyre._C._resolve_symbolic_args([t0, t1], payload_rev)
+
+        # The two vectors must differ.
+        self.assertNotEqual(
+            resolved_fwd,
+            resolved_rev,
+            "Forward and reversed payloads produced identical resolved vectors",
+        )
+
+        # Forward: slot 0 → t0, slot 1 → t1.
+        self.assertEqual(
+            resolved_fwd[0], addr_t0, "slot 0 of forward payload must be addr_t0"
+        )
+        self.assertEqual(
+            resolved_fwd[1], addr_t1, "slot 1 of forward payload must be addr_t1"
+        )
+
+        # Reversed: slot 0 → t1, slot 1 → t0.
+        self.assertEqual(
+            resolved_rev[0], addr_t1, "slot 0 of reversed payload must be addr_t1"
+        )
+        self.assertEqual(
+            resolved_rev[1], addr_t0, "slot 1 of reversed payload must be addr_t0"
+        )
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

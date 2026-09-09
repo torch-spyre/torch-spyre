@@ -20,9 +20,22 @@ from unittest.mock import patch
 
 import sympy
 import torch
+from torch import fx
+from torch._inductor.graph import GraphLowering
+from torch._inductor.ir import (
+    ComputedBuffer,
+    FixedLayout,
+    InputBuffer,
+    MutationLayoutSHOULDREMOVE,
+    Pointwise,
+    StorageBox,
+    TensorBox,
+)
+from torch._inductor.virtualized import V
 
 from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.pass_utils import (
+    _repoint_mutation_targets,
     compute_granularity,
     compute_max_size,
     compute_symbolic_bounds,
@@ -370,6 +383,99 @@ class TestPassUtils(unittest.TestCase):
         max_size, granularity = result
         assert max_size == 256
         assert granularity == 8
+
+
+class TestRepointMutationTargets(unittest.TestCase):
+    """Unit tests for ``pass_utils._repoint_mutation_targets``.
+
+    Regression coverage for issue #3944/#3945: reconstructing a
+    ``ComputedBuffer`` (``replace_computed_buffer_body``,
+    ``redirect_computed_buffer_reads``) must not leave a mutation op's
+    ``MutationLayoutSHOULDREMOVE.target`` pointing at the orphaned
+    pre-reconstruction object. These tests exercise ``_repoint_mutation_targets``
+    directly against real IR objects, independent of any particular pass
+    that calls it, so the fix stays pinned even if coarse-tiling (the pass
+    that originally exposed the bug) is refactored away.
+    """
+
+    def setUp(self):
+        gm = fx.symbolic_trace(lambda: None)
+        self._graph_ctx = V.set_graph_handler(GraphLowering(gm))
+        self._graph_ctx.__enter__()
+        self.addCleanup(self._graph_ctx.__exit__, None, None, None)
+
+    @staticmethod
+    def _make_buffer(name):
+        """A minimal real ComputedBuffer(Pointwise) reading one InputBuffer."""
+        inp = InputBuffer(
+            name=f"in_{name}",
+            layout=FixedLayout(torch.device("cpu"), torch.float32, [8], [1]),
+        )
+        V.graph.name_to_buffer[inp.get_name()] = inp
+        box = TensorBox(StorageBox(inp))
+        pw = Pointwise.create(
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+            inner_fn=lambda index: box.make_loader()(index),
+            ranges=[8],
+        )
+        buf = ComputedBuffer(
+            name=name,
+            layout=FixedLayout(torch.device("cpu"), torch.float32, [8], None),
+            data=pw.data.data,  # TensorBox -> StorageBox -> Pointwise
+        )
+        buf.operation_name = name
+        V.graph.name_to_buffer[name] = buf
+        return buf
+
+    def test_bare_target_repointed(self):
+        old_buf = self._make_buffer("old")
+        new_buf = self._make_buffer("new")
+        mutation_layout = MutationLayoutSHOULDREMOVE(old_buf)
+        mut_op = SimpleNamespace(layout=mutation_layout)
+
+        _repoint_mutation_targets([mut_op], old_buf, new_buf)
+
+        self.assertIs(mutation_layout.target, new_buf)
+
+    def test_boxed_target_repointed(self):
+        """target wrapped as TensorBox(StorageBox(old_buf))."""
+        old_buf = self._make_buffer("old")
+        new_buf = self._make_buffer("new")
+        wrapped_target = TensorBox(StorageBox(old_buf))
+        mutation_layout = MutationLayoutSHOULDREMOVE(wrapped_target)
+        mut_op = SimpleNamespace(layout=mutation_layout)
+
+        _repoint_mutation_targets([mut_op], old_buf, new_buf)
+
+        # The wrapper object identity itself is untouched -- only the
+        # innermost slot holding old_buf is repointed.
+        self.assertIs(mutation_layout.target, wrapped_target)
+        self.assertIs(wrapped_target.data.data, new_buf)
+
+    def test_unrelated_op_untouched(self):
+        """An op whose target already points elsewhere must not be touched."""
+        old_buf = self._make_buffer("old")
+        new_buf = self._make_buffer("new")
+        other_buf = self._make_buffer("other")
+        mutation_layout = MutationLayoutSHOULDREMOVE(other_buf)
+        mut_op = SimpleNamespace(layout=mutation_layout)
+
+        _repoint_mutation_targets([mut_op], old_buf, new_buf)
+
+        self.assertIs(mutation_layout.target, other_buf)
+
+    def test_non_mutation_op_untouched(self):
+        """An op with a plain (non-mutation) layout must be skipped safely."""
+        old_buf = self._make_buffer("old")
+        new_buf = self._make_buffer("new")
+        plain_op = SimpleNamespace(layout=old_buf.layout)
+
+        # Must not raise even though `plain_op.layout` isn't a
+        # MutationLayoutSHOULDREMOVE.
+        _repoint_mutation_targets([plain_op], old_buf, new_buf)
+
+        self.assertIs(plain_op.layout, old_buf.layout)
 
 
 if __name__ == "__main__":

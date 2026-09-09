@@ -7,8 +7,10 @@ Two modes are available:
 
 1. **CPU-only** — no extra install; measures host-side Python and
    `torch.compile` activity.
-2. **CPU + PrivateUse1** — measures CPU *and* Spyre-side kernel activity;
-   requires the [`kineto-spyre`][kineto-spyre] PyTorch wheel.
+2. **CPU + PrivateUse1** — measures CPU *and* Spyre-side kernel activity.
+   No extra install either: the AIUPTI/Kineto activity-tracing support is
+   built directly into `torch_spyre`'s native extension (gated by the
+   `USE_SPYRE_PROFILER` build flag, on by default).
 
 ## CPU-only (no extra install)
 
@@ -16,7 +18,7 @@ Two modes are available:
 import torch
 from torch.profiler import profile, ProfilerActivity
 
-compiled = torch.compile(model, backend="spyre")
+compiled = torch.compile(model)
 
 with profile(activities=[ProfilerActivity.CPU]) as prof:
     output = compiled(x_spyre)
@@ -29,16 +31,7 @@ Inductor stage.
 
 ## CPU + PrivateUse1
 
-Install a matching [`kineto-spyre`][kineto-spyre] wheel for your
-PyTorch version (check the [releases page][kineto-spyre-releases] for
-the current combination). Example URL for PyTorch 2.10.0:
-
-```bash
-uv pip install --no-deps --force-reinstall \
-  https://github.com/IBM/kineto-spyre/releases/download/torch-2.10.0.aiu.kineto.1.1.1/torch-2.10.0+aiu.kineto.1.1.1-cp312-cp312-linux_x86_64.whl
-```
-
-Then profile with `ProfilerActivity.PrivateUse1`:
+Profile with `ProfilerActivity.PrivateUse1`:
 
 ```python
 import torch
@@ -56,13 +49,32 @@ with profile(
 ### Print aggregates
 
 ```python
-print(prof.key_averages().table(sort_by="cpu_time_total", row_limit=10).replace("CUDA", "AIU"))
-print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10).replace("CUDA", "AIU"))
+print(prof.key_averages().table(sort_by="cpu_time_total", row_limit=10))
+print(prof.key_averages().table(sort_by="device_time_total", row_limit=10))
 ```
 
-The `.replace("CUDA", "AIU")` is a cosmetic workaround — the profiler's
-internal column category is still named after CUDA; native renaming is
-on the roadmap.
+The table groups time by operator. `Self CPU` is host-side time spent
+in the operator itself. `SPYRE total` is the device-side time attributed
+to it. The layout looks like this:
+
+```text
+---------------------------  ------------  ------------  ------------  ------------
+                       Name     Self CPU     CPU total   SPYRE total    # of Calls
+---------------------------  ------------  ------------  ------------  ------------
+             aten::mm          1.20ms         4.80ms        9.30ms            96
+      aten::scaled_dot_...     0.40ms         2.10ms        3.70ms            48
+             aten::add         0.30ms         0.90ms        0.80ms           192
+    TorchDynamo Cache Lookup   0.05ms         0.05ms        0.00ms             1
+---------------------------  ------------  ------------  ------------  ------------
+Self CPU time total: 6.40ms
+Self SPYRE time total: 14.10ms
+```
+
+The values above are illustrative. Absolute numbers depend on the model,
+the batch and sequence configuration, and the build. Read the shape, not
+the magnitudes: a large `SPYRE total` next to a small `Self CPU` marks a
+device-bound operator (`aten::mm` here), which is the expected profile
+for compute-heavy matmul layers.
 
 ### Export a trace for viewers
 
@@ -158,6 +170,4 @@ Full reference lives in the upstream
 - [Device monitoring](device_monitoring.md) — `aiu-smi` telemetry
   alongside `torch.profiler`
 
-[kineto-spyre]: https://github.com/IBM/kineto-spyre
-[kineto-spyre-releases]: https://github.com/IBM/kineto-spyre/releases
 [torch-profiler-docs]: https://pytorch.org/docs/stable/profiler.html

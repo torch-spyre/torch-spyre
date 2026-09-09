@@ -23,13 +23,16 @@ from typing import Mapping, Optional
 
 import torch
 
-from torch_spyre._C import DataFormats
+from torch_spyre._C import DataFormats, get_device_dtype, ElementArrangement
 from torch_spyre._inductor.constants import (
     IDENTITY_OP,
     DL16TOFP32_OP,
     FP32TODL16_OP,
     FP8TODL16_OP,
+    FP32TOINT32_OP,
+    INT32TOFP32_OP,
 )
+from torch_spyre._inductor.errors import Unsupported
 
 # Spyre has no native bool: a bool tensor reuses whichever physical format
 # produced it (e.g. fp16 vs fp32 comparison results). Maps that format to
@@ -43,6 +46,61 @@ _BOOL_EQUIVALENT_DTYPES: Mapping[DataFormats, torch.dtype] = {
 def bool_equivalent_dtype(device_dtype: DataFormats) -> Optional[torch.dtype]:
     """Logical dtype matching a bool's physical format, or None if unsupported."""
     return _BOOL_EQUIVALENT_DTYPES.get(device_dtype)
+
+
+def _build_ea_map(fp16_dtypes: list) -> dict:
+    EA = ElementArrangement
+    FP32 = torch.float32
+
+    ea_map = {}
+    for FP16 in fp16_dtypes:
+        ea_map[(FP16, FP32, EA.STANDARD)] = EA.DL16_TO_FP32
+        ea_map[(FP16, FP32, EA.FP32_TO_DL16)] = EA.STANDARD
+        ea_map[(FP32, FP16, EA.STANDARD)] = EA.FP32_TO_DL16
+        ea_map[(FP32, FP16, EA.DL16_TO_FP32)] = EA.STANDARD
+
+    return ea_map
+
+
+def bool_layout_dtype(
+    device_dtype: DataFormats, context: str = "result"
+) -> torch.dtype:
+    """Return the logical dtype to build a bool tensor's layout with.
+
+    ``get_elem_in_stick(torch.bool)`` hardcodes the SEN169_FP16 stick size of
+    64, so any layout built from a bool's *logical* dtype silently assumes an
+    fp16 format. Callers must instead resolve the stick size from the bool's
+    real physical format via this function.
+
+    Raises Unsupported if `device_dtype` has no bool-equivalent dtype.
+    """
+    dtype_for_layout = bool_equivalent_dtype(device_dtype)
+    if dtype_for_layout is None:
+        raise Unsupported(
+            f"torch.bool {context} of operand with device format {device_dtype}"
+        )
+    return dtype_for_layout
+
+
+def resolve_output_formats(
+    output_dtype: torch.dtype,
+    bool_device_dtype: Optional[DataFormats],
+    context: str = "result",
+) -> tuple[DataFormats, torch.dtype]:
+    """Resolve an op output's ``(device_dtype, layout_dtype)`` pair.
+
+    Non-bool outputs derive both from ``output_dtype``. For bool outputs,
+    ``get_device_dtype(torch.bool)`` hardcodes SEN169_FP16 -- wrong for e.g. a
+    float32 comparison result -- so the caller supplies the real on-device
+    format in ``bool_device_dtype`` (read off the producing operand(s)).
+
+    Callers needing only the layout dtype should call `bool_layout_dtype`
+    directly rather than discarding half of this pair.
+    """
+    if output_dtype == torch.bool:
+        assert bool_device_dtype is not None, "bool output needs bool_device_dtype"
+        return bool_device_dtype, bool_layout_dtype(bool_device_dtype, context)
+    return get_device_dtype(output_dtype), output_dtype
 
 
 class DtypeOpTable:
@@ -68,11 +126,21 @@ class DtypeOpTable:
         (torch.float8_e4m3fn, torch.float16),
     ]
 
+    _FP32_TO_INT32_DTYPES = [
+        (torch.float32, torch.int32),
+    ]
+
+    _INT32_TO_FP32_DTYPES = [
+        (torch.int32, torch.float32),
+    ]
+
     _TYPECAST_OPS_TABLE = {
         **{pair: IDENTITY_OP for pair in _IDENTITY_DTYPES},
         **{pair: DL16TOFP32_OP for pair in _FP16_TO_FP32_DTYPES},
         **{pair: FP32TODL16_OP for pair in _FP32_TO_FP16_DTYPES},
         **{pair: FP8TODL16_OP for pair in _FP8_TO_FP16_DTYPES},
+        **{pair: FP32TOINT32_OP for pair in _FP32_TO_INT32_DTYPES},
+        **{pair: INT32TOFP32_OP for pair in _INT32_TO_FP32_DTYPES},
     }
 
     _TYPECAST_OP_NAMES = set(_TYPECAST_OPS_TABLE.values())
@@ -83,6 +151,9 @@ class DtypeOpTable:
     # over a DMA-copied host buffer with a different HBM ordering yields shuffled
     # elements, so host bool InputBuffers feeding one must fall back to CPU.
     _STICK_REORDERING_OPS = {DL16TOFP32_OP, FP32TODL16_OP, FP8TODL16_OP}
+
+    _FP16_TYPES = [torch.float16, torch.bfloat16]
+    _EA_MAP = _build_ea_map(_FP16_TYPES)
 
     @classmethod
     def get_operator(
@@ -128,6 +199,11 @@ class DtypeOpTable:
         codegen (spyre_kernel.to_dtype) instead resolves from the one real
         device_dtype.
 
+        The looseness is structural, not an oversight: this runs from the
+        convert_element_type lowering, which decides the CPU fallback before
+        layout propagation has assigned any device_dtype. Keying on the real
+        format would mean deferring that fallback decision to a later pass.
+
         This "any format" looseness is safe only while every dst reachable from
         a bool resolves to a supported op under *both* SEN169_FP16 (fp16) and
         IEEE_FP32 (fp32) -- true for the current table, so the predicate and its
@@ -155,3 +231,28 @@ class DtypeOpTable:
     @classmethod
     def is_dtype_op(cls, op: str) -> bool:
         return op in cls._TYPECAST_OP_NAMES
+
+    @classmethod
+    def op_names(cls) -> frozenset[str]:
+        """All op names this table can produce (e.g. for op-name validation)."""
+        return frozenset(cls._TYPECAST_OP_NAMES)
+
+    @classmethod
+    def fp16_types(cls) -> list:
+        return cls._FP16_TYPES
+
+    @classmethod
+    def ea_map(cls, src_dtype, dst_dtype, src_ea) -> ElementArrangement:
+        fmt = cls._EA_MAP.get((src_dtype, dst_dtype, src_ea))
+        if fmt is not None:
+            return fmt
+
+        if (src_dtype in cls._FP16_TYPES and dst_dtype == torch.float32) or (
+            src_dtype == torch.float32 and dst_dtype in cls._FP16_TYPES
+        ):
+            raise Unsupported(
+                f"{src_dtype}→{dst_dtype} conversion with unsupported input EA: {src_ea}"
+            )
+
+        # Other type conversions default to STANDARD
+        return ElementArrangement.STANDARD

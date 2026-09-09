@@ -8,10 +8,10 @@ working on next.
 
 Scratchpad planning runs by default. The pass is gated by `lx_planning`,
 which has defaulted to `1` since [#2459](https://github.com/torch-spyre/torch-spyre/pull/2459).
-The greedy solver (`config.layout_solver = "greedy"`) is the default.
-First-fit, best-fit, and an OR-Tools CP-SAT solver (`"cpsat"`) are
-available as opt-ins; `layout_solver` can also be set from the
-`LAYOUT_SOLVER` environment variable.
+The OR-Tools CP-SAT solver (`config.layout_solver = "cpsat"`) is the
+default. Greedy, first-fit, and best-fit are available as opt-ins;
+`layout_solver` can also be set from the `LAYOUT_SOLVER` environment
+variable.
 
 Co-optimization with work distribution is opt-in.
 `config.co_optimizing_lx_planning` (`CO_OPTIMIZING_LX_PLANNING=1`)
@@ -19,8 +19,9 @@ defaults to off. It enlarges each op's set of candidate splits — pointwise
 dim-flips, the matmuls' tilings offered to neighbours, cross-matmul split
 transfer, a shared batch-major `B/M` tiling for matmuls and reductions —
 then searches the cross-product for the assignment that minimizes HBM
-traffic. The seed (work-division's choice) is always retained, so the
-result is never worse than work division alone.
+traffic. Every candidate, including work division's seed, must satisfy hard
+work-division constraints; generated alternatives also pass stick validation.
+An op with no legal candidate raises `Unsupported`.
 :::
 
 **Quick navigation:**
@@ -33,6 +34,7 @@ result is never worse than work division alone.
 - [Implementation](#implementation)
 - [Solvers](#solvers)
 - [Co-optimization with work-distribution](#co-optimization-with-work-distribution)
+- [LX context switching](#lx-context-switching)
 - [Current limitations](#current-limitations)
 - [Target patterns](#target-patterns)
 - [Future work](#future-work)
@@ -61,7 +63,7 @@ The compiler picks which buffers live where.
 | Usable LX per core | ~1.55 MB | `round_up_128(int(((2<<20) - (64<<10)) * (1 - frac_avail)))` |
 | Alignment | 128-byte (stick) | implicit |
 | Cores | 1 to 32 | `SENCORES` |
-| Per-core HBM span limit | (255.996 MiB) | hardware, separate from LX |
+| Per-core HBM span limit | (256 MB) | hardware, separate from LX |
 | Inter-core data ring | yes | not yet used by compiler |
 | Inter-core reduce-sum ring | yes | not yet used by compiler |
 
@@ -138,6 +140,7 @@ deadcode_elimination
 propagate_named_dims                  # named-dimension metadata (pre-stickification)
 assign_dim_hints
 _maybe_coarse_tile_hints              # hint-driven coarse tiling, when hints produce groups
+insert_bmm_padding                    # pad matmul y's K (pre-stickification)
 split_multi_ops
 propagate_spyre_tensor_layouts        # assign FixedTiledLayout
 validate_ops
@@ -146,10 +149,10 @@ finalize_layouts
 insert_restickify
 enforce_indirect_access_layout
 insert_post_mutation_restickify
-insert_bmm_padding
+insert_restickify_padding
 dedup_and_promote_constants
 _maybe_coarse_tile_span_overflow      # span-overflow coarse tiling (post-stickification)
-span_reduction                        # work-division: enforce 255.996 MiB span
+span_reduction                        # work-division: enforce 256 MB span
 cost_model_matmul_division            # work-division: matmul cost model
 work_distribution                     # work-division: default distributor
 _maybe_scratchpad_planning            # ← THIS PASS, gated by config.lx_planning
@@ -157,9 +160,10 @@ _maybe_scratchpad_planning            # ← THIS PASS, gated by config.lx_planni
 
 Two ordering constraints fix this slot:
 
-- **Work division must run first.** Scratchpad planning needs
-  `op_it_space_splits` to compute per-core buffer sizes. Work division
-  also decides whether adjacent ops have compatible core splits.
+- **Work division must run first.** Scratchpad planning reads the
+  symbol-keyed `iteration_space_ownership` committed by work division to
+  compute per-core buffer sizes. Work division also decides whether adjacent
+  ops have compatible core splits.
   Incompatible splits trigger `core_div_mismatch` and disqualify shared
   buffers from LX (see [Current limitations](#current-limitations)).
 - **Stickification must run first.** All buffers need `FixedTiledLayout`
@@ -331,7 +335,7 @@ The checks, in evaluation order (the first failure is the reason reported):
 
 | Reason | Why |
 |---|---|
-| `op not allowed` | not a `ComputedBuffer`, a mutation layout, or an op name outside `OP_OUTPUT_GOOD_FOR_LX_REUSE` (the debug flag `config.allow_all_ops_in_lx_planning` bypasses the op-name gate) |
+| `op not allowed` | not a `ComputedBuffer`, a mutation layout, or an op name inside `OP_OUTPUT_NOT_GOOD_FOR_LX_REUSE` (the debug flag `config.allow_all_ops_in_lx_planning` bypasses the op-name gate) |
 | `unsized (no device layout)` | no computable footprint (e.g. a `MultiOutputLayout` tuple op) |
 | `mutation target` | filled by offset writes, so one LX base mis-addresses it |
 | `tiled (advancing)` | LX addresses cannot be `affine.apply` symbols; the advancing-tile check reads `loop_info` (the sole source of truth for per-tile geometry) |
@@ -399,9 +403,9 @@ Once `layout.allocation["lx"]` is set:
 `config.layout_solver`
 (`"greedy" | "firstfit" | "bestfit" | "cpsat" | "simulated_annealing"`)
 picks the solver; it defaults from the `LAYOUT_SOLVER` environment
-variable (falling back to `"greedy"`).
+variable (falling back to `"cpsat"`).
 
-### GreedyLayoutSolver (default)
+### GreedyLayoutSolver
 
 Walks transition points in chronological order. At each point it
 deallocates expired buffers, then for each newly-live buffer:
@@ -467,6 +471,11 @@ single-pass solvers. See
 [Simulated Annealing Layout Planner](simulated_annealing_layout.md) for the
 algorithm and the tunable schedule parameters.
 
+Note this is placement-only. With `co_optimizing_lx_planning` the same config
+value instead selects `SaCoOptimizingSolver`, a *different* class that anneals
+the core divisions and the placement jointly — see
+[Joint core-division + LX placement](sa_co_optimization.md).
+
 ## Co-optimization with work-distribution
 
 Work division optimizes each op independently for parallelism. Adjacent
@@ -489,12 +498,20 @@ the winning assignment back before the standard allocator flow.
 :::
 
 Each op's candidate list is built by `_enum_split_options`, dispatching
-on op type. The seed (work division's choice) is always option 0 and is
-always retained, so the worst case matches work division. Every non-seed
-candidate is deduped by canonical key and filtered through
-`_split_fits_sticks`, which rejects factors that overflow a stickified
-dim's stick count (those would abort the SuperDSC bundler) or that land on
-a collapsed/broadcast dim.
+on op type. Generated alternatives are deduped by canonical key and filtered
+through `_split_fits_sticks`, which rejects factors that overflow a stickified
+dim's stick count (those would abort the SuperDSC bundler) or that land on a
+collapsed/broadcast dim. The upstream seed is already stick-valid from work
+division. Every candidate, including the seed, must satisfy hard
+work-division constraints: blocked axes remain unsplit and split domains
+restrict legal factors. Candidate divisions remain symbol-keyed in their
+producing operation's iteration space. Fixed candidates and the solver's
+selected candidate are revalidated from that symbol-keyed map before commit;
+LX planning never decodes candidates through the legacy coefficient-keyed
+Scheduler transport. Cross-operation compatibility is derived from physical
+`PerCoreView` ownership rather than comparing those local symbols, so an LX
+candidate remains faithful through selection and commit even when adjacent
+operations use different iteration-symbol names.
 
 **Pointwise ops** get their seed, dim-flip variants (move the seed's
 single output-dim factor onto each compatible alternative output dim,
@@ -560,6 +577,74 @@ the producer/consumer slicing-match constraints to the CP-SAT solver,
 which chooses the core divisions and LX placements jointly in one
 constraint model. It falls back to the greedy allocator when `ortools`
 is unavailable.
+
+### Joint SA co-optimization
+
+Setting `layout_solver = "simulated_annealing"` together with
+`co_optimizing_lx_planning` routes through the same `CoOptimizingAllocator`,
+driven by `SaCoOptimizingSolver`, which anneals the division vector and the
+layout permutation as one joint state and scores it with the cost model. See
+[Joint core-division + LX placement](sa_co_optimization.md).
+
+## LX context switching
+
+LX data corruption (clobbering) can happen when two conditions hold together: (1) two
+*separate* `torch.compile`s each plan their own LX addresses independently, with no shared view
+of what the other has pinned; and (2) one runs nested inside the other — a `FallbackKernel`'s
+eager body launching a second, separately-compiled Spyre program (via a nested `torch.compile`,
+or any eager op compiled standalone through `ops/eager.py`) — while the outer graph still needs
+a buffer it already has LX-resident. The inner compile has no knowledge of that buffer and may
+reuse its address for its own scratch:
+
+```
+op0 (write r -> LX)  ...  FallbackKernel (opaque)  ...  op1 (read r <- LX)
+```
+
+An earlier fix (PR3683) closed this by refusing LX residency outright to any buffer live
+across such a call (`_extern_kernel_in_live_range` in `allocator.py`) — correct, but every
+access to that buffer then pays a full HBM round trip, not just the one crossing: cost scales
+as `(1 + read_count)·size/BW`, growing with reuse.
+
+`LxContextSwitchingPass`
+(`torch_spyre/_inductor/scratchpad/lx_context_switching.py`) protects the residency directly
+instead of giving it up. For each LX-resident buffer whose lifetime strictly straddles a risky
+`FallbackKernel`, it inserts a **dump** clone (LX → HBM) immediately before the call and a
+**restore** clone (HBM → LX, back to the buffer's exact original address) immediately after
+it. The bracketed call itself is never modified; ordering is enforced purely through
+`GraphLowering.additional_buffer_deps`/`additional_star_deps`, upstream's own mechanism for a
+fake, non-lifetime-extending ordering dependency. Cost is a fixed `2·size/BW`, independent of
+how many times the buffer is reused elsewhere.
+
+Not every `FallbackKernel` needs bracketing. A cheap classification skips it entirely when the
+op is a confirmed CPU-only fallback (`ops/fallbacks.py`'s shared, once-verified `_fallback`
+body) or explicitly opted out via `mark_lx_safe(op)` for an op whose author has confirmed that
+no intermediate buffers will ever write into LX. Otherwise, the buffer-lifetime check above
+is the load-bearing gate — classifying op behavior by namespace or registry proved unreliable
+in general, since `ops/eager.py` compiles plenty of aten ops (`mm`, `add`, `softmax`,
+`embedding`, …) standalone, and any of them can appear as the risky call.
+
+Measured on an 8-layer, 512×512 fp16 repro (`read_count = 1` per bracketed buffer,
+`tests/inductor/test_lx_context_switching.py`):
+
+| Configuration | Correctness | `kernel_ms` | HBM crossings for `r` |
+|---|---|---|---|
+| No fix | ❌ (`diff > 0`) | 0.313 | 0 (fully LX, but corrupted) |
+| Context switching (default) | ✅ | 0.386–0.388 | 2 — fixed dump + restore |
+| PR3683 guard alone | ✅ | 0.395–0.396 | 2 — this buffer's own write + read, both via HBM |
+
+These costs are equal in bytes moved at `read_count = 1`, yet the guard still measures
+consistently slower: HBM reads/writes actually happen in small chunks, so an op processing data
+directly from HBM must frequently reverse the traffic direction on the memory bus, lowering
+effective bandwidth. When the data fits on LX, moving it there entirely before processing needs
+no such direction-reversal. The guard pays that penalty on every touch of `r`; context
+switching only pays it for the dump/restore pair.
+
+Both mechanisms are gated by one flag, `config.enable_lx_context_switching`
+(`ENABLE_LX_CONTEXT_SWITCHING`, default on): **on**, `_extern_kernel_in_live_range` is skipped
+and `LxContextSwitchingPass` is registered as a `post_optimization_pass` instead; **off**, the
+guard runs exactly as PR3683 shipped it and the new pass is never registered. It is a real
+either/or, not a partial toggle, so old and new behavior stay directly comparable while the new
+mechanism earns trust in production; removing the guard entirely is a follow-up once it does.
 
 ## Current limitations
 

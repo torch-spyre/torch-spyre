@@ -38,15 +38,18 @@ def main() -> None:
         [
             "gh",
             "api",
+            "--paginate",
             f"/repos/{args.repo}/actions/runs/{args.run_id}/artifacts",
             "--jq",
-            '[.artifacts[] | select(.name | endswith(".xml")) | {id: .id, name: .name}]',
+            '.artifacts[] | select(.name | endswith(".xml")) | {id: .id, name: .name}',
         ],
         capture_output=True,
         check=True,
         text=True,
     )
-    artifacts = json.loads(listing.stdout)
+    artifacts = [
+        json.loads(line) for line in listing.stdout.splitlines() if line.strip()
+    ]
 
     for artifact in artifacts:
         zip_path = out_dir / f"{artifact['name']}.zip"

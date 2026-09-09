@@ -1,0 +1,5 @@
+test_suite_config:
+  labels: [unit, regression, integration, trunk]
+  files:
+    - path: ${TORCH_DEVICE_ROOT}/tests/inductor/test_opspec_tiling.py
+      unlisted_test_mode: mandatory_success

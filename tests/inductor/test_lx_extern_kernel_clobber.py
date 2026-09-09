@@ -50,6 +50,7 @@ import torch
 
 import torch_spyre  # noqa: F401
 from torch._inductor.ir import ExternKernel
+from torch_spyre._inductor.ir import SpyreEmptyFallback
 from torch_spyre._inductor.scratchpad.allocator import _extern_kernel_in_live_range
 
 
@@ -86,6 +87,12 @@ def test_extern_kernel_in_live_range():
     assert not _extern_kernel_in_live_range(spanning, [0])
     assert not _extern_kernel_in_live_range(_FakeGraph([plain, plain, plain]), [0, 2])
     assert not _extern_kernel_in_live_range(spanning, [])
+
+    # spyre.empty is represented as an ExternKernel in the IR, but its codegen
+    # only allocates storage. It launches no program and cannot clobber LX.
+    empty = Mock(spec=SpyreEmptyFallback)
+    allocation_only = _FakeGraph([plain, empty, plain])
+    assert not _extern_kernel_in_live_range(allocation_only, [0, 2])
 
 
 @pytest.mark.parametrize("layers", [1, 4])

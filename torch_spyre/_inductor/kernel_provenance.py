@@ -32,10 +32,16 @@ import base64
 import dataclasses
 import hashlib
 import json
+import math
 from collections.abc import Iterator, Mapping, Sequence
 
 import sympy
 
+from torch_spyre._inductor.constants import MATMUL_REDUCTION_OPS
+from torch_spyre._inductor.core_mapping import (
+    core_mappings_equal,
+    derive_core_mapping,
+)
 from torch_spyre._inductor.op_spec import (
     DebugHandle,
     LoopSpec,
@@ -60,6 +66,7 @@ _EXPECTED_OP_SPEC_SCHEMA = {
     "args": "Sequence[TensorArg]",
     "op_info": "dict[str, Any]",
     "tiled_symbols": "list[list[Symbol]]",
+    "core_id_to_work_slice": "dict[Symbol, Expr] | None",
     "tiled_symbol_trip_counts": "dict[Symbol, int]",
     "symbolic_dim_bounds": "dict[str, tuple[int, int]]",
     "node_output_ranges": "tuple[Expr, ...] | None",
@@ -80,6 +87,7 @@ _EXPECTED_TENSOR_ARG_SCHEMA = {
 _EXPECTED_TENSOR_WORK_DIVISION_SCHEMA = {
     "work_slices": "dict[Symbol, int]",
     "core_id_to_work_slice": "dict[Symbol, Expr]",
+    "num_cores": "int | None",
 }
 _EXPECTED_LOOP_SPEC_SCHEMA = {
     "count": "Expr",
@@ -232,7 +240,7 @@ def _validate_finalized_schema() -> None:
 
 def _canonical_spec(spec: object) -> object:
     if isinstance(spec, OpSpec):
-        return {
+        result = {
             "kind": "op",
             "op": spec.op,
             "is_reduction": spec.is_reduction,
@@ -260,6 +268,16 @@ def _canonical_spec(spec: object) -> object:
                 str(spec.debug_handle.id) if spec.debug_handle is not None else None
             ),
         }
+        # Preserve existing v1 identities when the explicit mapping is exactly
+        # the mapping older codegen would have derived. Only a non-canonical
+        # assignment adds information to the bundle identity.
+        if spec.core_id_to_work_slice is not None and not _is_canonical_core_mapping(
+            spec
+        ):
+            result["core_id_to_work_slice"] = _canonical_value(
+                spec.core_id_to_work_slice
+            )
+        return result
     if isinstance(spec, LoopSpec):
         return {
             "kind": "loop",
@@ -267,6 +285,21 @@ def _canonical_spec(spec: object) -> object:
             "body": [_canonical_spec(child) for child in spec.body],
         }
     raise TypeError(f"Unsupported finalized kernel spec: {type(spec).__qualname__}")
+
+
+def _is_canonical_core_mapping(spec: OpSpec) -> bool:
+    dims = tuple(spec.iteration_space)
+    splits = tuple(int(spec.iteration_space[dim][1]) for dim in dims)
+    contiguous_dim = dims[-1] if dims and spec.op in MATMUL_REDUCTION_OPS else None
+    expected = derive_core_mapping(
+        dims,
+        splits,
+        math.prod(splits),
+        contiguous_dim=contiguous_dim,
+    )
+    return core_mappings_equal(
+        spec.core_id_to_work_slice or {}, expected, math.prod(splits)
+    )
 
 
 def _canonical_tensor_arg(arg: TensorArg) -> object:
@@ -289,6 +322,7 @@ def _canonical_tensor_arg(arg: TensorArg) -> object:
             "core_id_to_work_slice": _canonical_value(
                 arg.work_division.core_id_to_work_slice
             ),
+            "num_cores": arg.work_division.num_cores,
         }
     return result
 

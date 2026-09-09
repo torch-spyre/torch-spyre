@@ -38,11 +38,10 @@ from torch._inductor.scheduler import BaseSchedulerNode
 from .logging_utils import get_inductor_logger
 from .provenance import SpyreGraphTransformObserver, reset_provenance_warnings
 
-from .padding import insert_bmm_padding
+from .padding import insert_bmm_padding, insert_restickify_padding
 from .temp_passes import (
     bmm_unflatten_pass,
     decompose_addmm,
-    mark_direct_unit_bmm_pass,
     mm_to_bmm_pass,
 )
 from .wsr.coarse_tile import validate_coarse_tile_groups
@@ -54,7 +53,6 @@ from .wsr.coarse_tile_hints import (
 from . import config
 from .propagate_hints import (
     collect_spyre_hints,
-    recover_spyre_hints,
 )
 from .wsr.propagate_named_dims import (
     propagate_named_dims,
@@ -70,6 +68,7 @@ from .insert_restickify import (
     finalize_layouts,
     insert_post_mutation_restickify,
     insert_restickify,
+    validate_no_restickify_on_mutation_targets,
 )
 from .enforce_indirect_access_layout import enforce_indirect_access_layout
 from .hbm_pool_planning import hbm_pool_planning
@@ -78,7 +77,7 @@ from .work_division import (
     work_distribution,
     cost_model_matmul_division,
 )
-from .pass_utils import format_operations
+from .pass_utils import format_operations, finalize_work_division_for_scheduler
 from .scratchpad.allocator import (
     scratchpad_planning,
 )
@@ -87,10 +86,12 @@ from .scheduler import (
     align_lx_producer_loop_order,
     build_loop_scheduler_nodes,
     demote_incoherent_lx_buffers,
+    verify_carried_reduction_ownership,
 )
 from .constants import DEVICE_NAME
 from .deadcode_elimination import deadcode_elimination
 from .dedup_constants import dedup_and_promote_constants
+from .read_copy_elision import elide_proven_read_copies
 from .wsr.coarse_tile import coarse_tile_post_stickify, coarse_tile_pre_stickify
 from .dump_cost_model import dump_cost_model
 
@@ -238,7 +239,6 @@ class CustomPostPasses(_SpyreGraphPassPipeline):
     def __init__(self):
         super().__init__(
             [
-                recover_spyre_hints,
                 # Undo the post-grad re-fusion of add(input, mm(a, b)) back into
                 # aten.addmm, so the resulting mul.Scalar alpha/beta nodes (whose
                 # constants are materialized later by the LoopLevel IR multi-ops
@@ -246,7 +246,6 @@ class CustomPostPasses(_SpyreGraphPassPipeline):
                 # falling back to extern_kernels.addmm.
                 decompose_addmm,
                 mm_to_bmm_pass.apply,
-                mark_direct_unit_bmm_pass,
                 bmm_unflatten_pass.apply,
             ]
         )
@@ -295,7 +294,12 @@ class CustomPostFusionPasses(_SpyreNodePassPipeline):
         # hbm_pool_planning runs after spyre_fuse_nodes so it can compute
         # bundle-scoped live ranges.
         super().__init__(
-            [demote_incoherent_lx_buffers, spyre_fuse_nodes, hbm_pool_planning]
+            [
+                demote_incoherent_lx_buffers,
+                spyre_fuse_nodes,
+                hbm_pool_planning,
+                verify_carried_reduction_ownership,
+            ]
         )
 
 
@@ -460,6 +464,17 @@ class CustomPreSchedulingPasses:
             _maybe_reorder_unhinted_interlopers,
             _maybe_coarse_tile_hints,
             #
+            # Matmul K padding (pre-stickification)
+            # Pads y's K to a stick boundary while every buffer still has a
+            # plain host FixedLayout.  The padded buffer then flows through
+            # stickification like a user-written F.pad: propagate_spyre_tensor_layouts
+            # picks its layout and finalize_layouts plans any restickify it needs
+            # (e.g. a transposed nn.Linear weight, issue #4208).  Running after
+            # insert_restickify would have to pad a restickify output, whose
+            # device layout and index expressions cannot be reconciled with a
+            # grown host extent.
+            insert_bmm_padding,
+            #
             # Tensor Layout (Stickification)
             split_multi_ops,
             propagate_spyre_tensor_layouts,
@@ -467,9 +482,10 @@ class CustomPreSchedulingPasses:
             optimize_restickify_locations,
             finalize_layouts,
             insert_restickify,
+            validate_no_restickify_on_mutation_targets,
             enforce_indirect_access_layout,
             insert_post_mutation_restickify,
-            insert_bmm_padding,
+            insert_restickify_padding,
             #
             dedup_and_promote_constants,
             #
@@ -484,6 +500,9 @@ class CustomPreSchedulingPasses:
             #
             # LX Planning
             _maybe_scratchpad_planning,
+            # Preserve copies through physical planning, then remove only
+            # those whose direct-read form is proven equivalent.
+            elide_proven_read_copies,
         ]
 
     def __call__(self, graph: GraphLowering) -> None:
@@ -534,6 +553,9 @@ class CustomPreSchedulingPasses:
         # of lines on a real graph. Printing the evidence first buries the answer.
         cost_model_pass(graph)
         dump_cost_model(graph.operations)
+        # Keep rich symbol-keyed ownership through every pre-Scheduler reader;
+        # legacy coefficient transport exists only for Scheduler/codegen.
+        finalize_work_division_for_scheduler(graph)
 
     def uuid(self) -> Any | None:
         return _uuid(self.passes)

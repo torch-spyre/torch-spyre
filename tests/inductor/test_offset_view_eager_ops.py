@@ -144,3 +144,41 @@ class TestOffsetViewListArgs:
         got = torch.stack([k, v], dim=0).to("cpu")
         ref = torch.stack([qkv[..., Q : Q + KV], qkv[..., Q + KV : TOTAL]], dim=0)
         torch.testing.assert_close(got.float(), ref.float(), atol=ATOL, rtol=0)
+
+
+class TestPrefixViewSliceWrite:
+    """Eager d2d slice writes from a PREFIX VIEW must honor the view's size.
+
+    Regression test for #3826. ``copy_from_d2d`` is compiled through
+    ``compile_once``; without ``dynamic=False`` there, dynamo's auto-dynamic
+    promoted the source's row dim to a symbol after repeated calls at distinct
+    lengths, and the Spyre lowering silently baked ONE concrete extent into the
+    reused graph -- so a later write copied the frozen extent (the base's 64
+    rows on the reporting stack), overrunning the destination window. Found in
+    the wild as attention write-back corrupting other sequences in a batch.
+
+    The ladder below uses several distinct lengths on purpose: the first call
+    is always correct (fresh static trace) and the corruption only appears once
+    auto-dynamic would have kicked in, so a single-length test cannot regress
+    this.
+    """
+
+    def test_prefix_view_write_honors_view_extent_across_lengths(self):
+        torch.manual_seed(0)
+        for qlen in (16, 32, 48, 24, 40):
+            src_cpu = torch.randn(64, 32, 128, dtype=torch.float16)
+            dst = torch.zeros(96, 32, 128, dtype=torch.float16).to("spyre")
+            dst[32 : 32 + qlen] = src_cpu.to("spyre")[:qlen]
+            got = dst.to("cpu")
+            outside = torch.ones(96, dtype=torch.bool)
+            outside[32 : 32 + qlen] = False
+            assert torch.all(got[outside] == 0), (
+                f"qlen={qlen}: write escaped the destination window "
+                f"(view extent ignored)"
+            )
+            torch.testing.assert_close(
+                got[32 : 32 + qlen].float(),
+                src_cpu[:qlen].float(),
+                atol=1e-2,
+                rtol=0,
+            )

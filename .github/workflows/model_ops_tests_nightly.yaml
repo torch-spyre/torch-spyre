@@ -118,6 +118,8 @@ jobs:
             config: Mistral-Small-3.2-24B-Instruct-2506.yaml
           - name: Mistral Small 3.2 24B Instruct 2506 Spyre
             config: Mistral-Small-3.2-24B-Instruct-2506_spyre.yaml
+          - name: Gemma 4 26B A4B IT Spyre
+            config: gemma-4-26B-A4B-it_spyre.yaml
           - name: Gemma 4 12B Instruct Spyre
             config: gemma-4-12B-it_spyre.yaml
           - name: Qwen 2.5

@@ -28,24 +28,24 @@
 #include <unordered_map>
 #include <vector>
 
+#include "job_plan.h"
+
 using json = nlohmann::json;
 
 namespace spyre {
-
-// Forward declarations
-class JobPlan;
 
 class SpyreStream;
 
 // Launch a JobPlan on an explicit stream. The whole plan is submitted to this
 // single stream, preserving cross-step ordering.
 void launchJobPlan(const JobPlan& job_plan, const std::vector<at::Tensor>& args,
-                   const SpyreStream& stream);
+                   const SpyreStream& stream,
+                   std::vector<SymbolicArg> symbolic_args = {});
 
 // Launch a JobPlan on the calling thread's current stream. The current stream
 // is resolved exactly once here, at the public boundary, then threaded
 // explicitly into the launch path.
-void launchJobPlan(const JobPlan& job_plan,
-                   const std::vector<at::Tensor>& args);
+void launchJobPlan(const JobPlan& job_plan, const std::vector<at::Tensor>& args,
+                   std::vector<SymbolicArg> symbolic_args = {});
 
 }  // namespace spyre

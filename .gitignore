@@ -400,6 +400,11 @@ stubs
 
 # provenance audit outputs
 provenance_capture_raw.json
+
 # Cost-model measurement database: fetched, not committed (tools/cost_model/records.py)
 tools/cost_model/sweep_records.json
 tools/cost_model/sweep_records.json.part
+
+# OpSpec lab outputs
+captured/
+op_spec_out/

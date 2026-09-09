@@ -95,7 +95,7 @@
   <!-- ROW 3 — Hardware -->
   <rect x="52"  y="260" width="358" height="40" rx="3" fill="#374151"/>
   <text x="231" y="276" text-anchor="middle" font-size="11.5" font-weight="700" fill="#FFFFFF">flex Runtime</text>
-  <text x="231" y="291" text-anchor="middle" font-size="10.5" fill="#e8edf2">initializeRuntime() · runJobPlan()</text>
+  <text x="231" y="291" text-anchor="middle" font-size="10.5" fill="#e8edf2">RuntimeContext::create() · runJobPlan()</text>
 
   <rect x="420" y="260" width="370" height="40" rx="3" fill="#374151"/>
   <text x="605" y="276" text-anchor="middle" font-size="11.5" font-weight="700" fill="#FFFFFF">Spyre Accelerator</text>

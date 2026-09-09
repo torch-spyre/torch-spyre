@@ -6,6 +6,8 @@ Shared class and methods for all OOT PyTorch test overrides.
 
 import os
 import json
+import unittest
+from functools import wraps
 from typing import Dict, List, Optional, Set, Tuple
 import warnings
 
@@ -58,6 +60,7 @@ from oot_framework.oot_test_config_models import (
     TestEntry,
 )
 from oot_framework.oot_test_common_methods_invocations import (
+    _make_named_module_info_cls,
     create_module_inputs_func_from_yaml,
     create_module_inputs_func_from_config,
 )
@@ -282,6 +285,11 @@ class OOTTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa: F
             )
             return
 
+        # The YAML's `name` has to win over the class-derived one so several
+        # entries for the same class (one per layer, per phase, ...) each get a
+        # distinct test name instead of colliding.
+        named_module_info_cls = _make_named_module_info_cls(ModuleInfo)
+
         # Get existing module names to avoid duplicates
         existing_names = {m.name for m in module_db}
         for i, module_item in enumerate(modules_named_items):
@@ -339,12 +347,13 @@ class OOTTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa: F
                     if resolved_dtypes
                     else (torch.float32, torch.float16, torch.bfloat16)
                 )
-                module_info = ModuleInfo(
+                module_info = named_module_info_cls(
                     module_cls,
                     module_inputs_func=create_module_inputs_func_from_yaml(module_item),
                     skips=(),
                     decorators=None,
                     dtypes=dtypes,
+                    oot_name=module_name,
                 )
                 # ModuleInfo has no field for this, and upstream never looks at
                 # it; attach it so device-specific tests can read the YAML's
@@ -786,8 +795,26 @@ class OOTTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa: F
                 # SKIPPED lines per test.
                 #
                 # Deleting the method entirely removes it from the class so
-                # pytest never collects it
-                delattr(cls, method_name)
+                # pytest never collects it -- EXCEPT when method_name is
+                # identical to the untouched, undecorated method still sitting
+                # on generic_cls's own __dict__ (true for any test with no
+                # dtype/device suffix, e.g. a plain method with no @dtypes/
+                # @ops parametrization). `cls` is built as
+                # type(class_name, (base, generic_cls), {}), so delattr only
+                # removes cls's own override and unmasks the inherited
+                # original, which then runs unfiltered (see issue: YAML
+                # mode:skip silently ignored, tests reaching hardcoded
+                # GPU_TYPE/cuda calls). Fall back to a skip stub in that case.
+                if generic_cls is not None and method_name in generic_cls.__dict__:
+                    _skip_reason = reason or "Skipped by OOT config"
+
+                    @wraps(test)
+                    def _skip(self, _reason=_skip_reason):
+                        raise unittest.SkipTest(_reason)
+
+                    setattr(cls, method_name, _skip)
+                else:
+                    delattr(cls, method_name)
                 continue
 
             # Following lines has been commented out to disable generating

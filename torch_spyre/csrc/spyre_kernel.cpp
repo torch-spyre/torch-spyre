@@ -39,14 +39,15 @@
 namespace spyre {
 
 void launchJobPlan(const JobPlan& job_plan, const std::vector<at::Tensor>& args,
-                   const SpyreStream& stream) {
-  stream.launch(job_plan, args);
+                   const SpyreStream& stream,
+                   std::vector<SymbolicArg> symbolic_args) {
+  stream.launch(job_plan, args, std::move(symbolic_args));
 }
 
-void launchJobPlan(const JobPlan& job_plan,
-                   const std::vector<at::Tensor>& args) {
+void launchJobPlan(const JobPlan& job_plan, const std::vector<at::Tensor>& args,
+                   std::vector<SymbolicArg> symbolic_args) {
   auto stream = getCurrentStream(c10::Device(c10::DeviceType::PrivateUse1, -1));
-  launchJobPlan(job_plan, args, stream);
+  launchJobPlan(job_plan, args, stream, std::move(symbolic_args));
 }
 
 }  // namespace spyre

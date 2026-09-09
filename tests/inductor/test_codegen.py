@@ -16,6 +16,7 @@ import warnings
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import regex as re
 import sympy
 import torch
 from torch.testing import FileCheck
@@ -33,12 +34,14 @@ from torch_spyre._inductor.codegen.compute_ops import (
     _per_core_symbolic_dim_info,
     _symbolic_split_info,
     _tensor_has_symbolic_split,
+    generate_constant_info,
 )
 from torch_spyre._inductor.codegen.superdsc import (
     _align_pool_dim_labels,
     _resolve_sdsc_size,
     compile_op_spec,
 )
+from torch_spyre._inductor.core_mapping import derive_operation_mapping
 from torch_spyre._inductor.op_spec import OpSpec, TensorArg
 from torch_spyre._inductor.work_division import (
     _collect_symbol_metadata,
@@ -46,6 +49,26 @@ from torch_spyre._inductor.work_division import (
     _valid_divisor_basis,
     adjust_it_space_for_sticks,
 )
+
+
+def _total_core_split(source: str) -> int:
+    """Return the product of split factors in the emitted ``iteration_space``.
+
+    Co-optimization spreads the work division across several ``c`` dims rather
+    than loading all cores onto ``c0``, so the total core usage is the product
+    of the per-dim split factors (e.g. ``c0:(256, 2), c1:(128, 4), c2:(512, 4)``
+    uses ``2 * 4 * 4 == 32`` cores).
+    """
+    match = re.search(r"iteration_space=\{([^}]*)\}", source)
+    assert match, "no iteration_space found in emitted source"
+    factors = [
+        int(f) for f in re.findall(r"sympify\('\d+'\),\s*(\d+)\)", match.group(1))
+    ]
+    assert factors, f"no split factors found in {match.group(1)!r}"
+    product = 1
+    for f in factors:
+        product *= f
+    return product
 
 
 class TestSpyreConfig(InductorTestCase):
@@ -61,9 +84,10 @@ class TestSpyreConfig(InductorTestCase):
         out, source_codes = run_and_get_code(comp_fn, x)
         # print("test_config_default")
         # print(source_codes[0])
-        FileCheck().check("sdsc_fused_abs").check(
-            f"sympify('c0'): (sympify('256'), {config.sencores})"
-        ).run(source_codes[0])
+        FileCheck().check("sdsc_fused_abs").run(source_codes[0])
+        # Co-optimization spreads the split across dims; the product of the
+        # per-dim split factors must add up to the configured core count.
+        self.assertEqual(_total_core_split(source_codes[0]), config.sencores)
 
     @config.patch({"sencores": 64})
     def test_config_too_many_sencores(self):
@@ -85,9 +109,10 @@ class TestSpyreConfig(InductorTestCase):
         out, source_codes = run_and_get_code(cfn, x)
         # print("test_sencores 16")
         # print(source_codes[0])
-        FileCheck().check("sdsc_fused_abs").check(
-            f"sympify('c0'): (sympify('256'), {config.sencores})"
-        ).run(source_codes[0])
+        FileCheck().check("sdsc_fused_abs").run(source_codes[0])
+        # Co-optimization spreads the split across dims; the product of the
+        # per-dim split factors must add up to the configured core count.
+        self.assertEqual(_total_core_split(source_codes[0]), config.sencores)
 
     @config.patch({"sencores": 32})
     def test_symbolic_batch_dim_pointwise_split(self):
@@ -107,30 +132,10 @@ class TestSpyreConfig(InductorTestCase):
         _, source_codes = run_and_get_code(comp_fn, x.to("spyre"), y.to("spyre"))
         # Iteration space embeds (size_expr, split). The symbolic batch dim's
         # split must equal SENCORES=32; the static stick dim's split must be 1.
-        FileCheck().check("sdsc_fused_add").check(", 32)").check(", 1)").run(
-            source_codes[0]
-        )
-
-    # Need a test where changing dxp_lx_frac_avail changes the generated OpSpec
-    # @config.patch({"dxp_lx_frac_avail": 0.01, "lx_planning": True})
-    # def test_config_dxp_lx_frac_avail(self):
-    #    fn = torch.abs
-    #    x = torch.randn((256, 128, 512)).to("spyre")
-    #
-    #    comp_fn = torch.compile(fn)
-    #    out, source_codes = run_and_get_code(comp_fn, x)
-    #    #print("test_conf_dxp_lx_frac_avail")
-    #    #print(source_codes[0])
-
-    # Need a test where setting lx_planning to True generates a different OpSpec
-    # @config.patch({'lx_planning': True})
-    # def test_config_lx_planning(self):
-    #    fn = torch.abs
-    #    x = torch.randn((256, 128, 512)).to("spyre")
-    #
-    #    comp_fn = torch.compile(fn)
-    #    out, source_codes = run_and_get_code(comp_fn, x)
-    #    #print(source_codes[0])
+        FileCheck().check("sdsc_fused_add").run(source_codes[0])
+        # Co-optimization spreads the split across dims; the product of the
+        # per-dim split factors must add up to the configured core count.
+        self.assertEqual(_total_core_split(source_codes[0]), config.sencores)
 
     # ------------------------------------------------------------------
     # Unit tests for the symbolic-shape sidecar in work_division.py
@@ -446,13 +451,15 @@ class TestSdscJsonSymbolicDimSmoke(InductorTestCase):
                 allocation={"hbm": hbm_base},
             )
 
+        iteration_space = {
+            c_row: (s0, 1),
+            c_col: (sympy.Integer(256), 1),
+        }
         return OpSpec(
             op="add",
             is_reduction=False,
-            iteration_space={
-                c_row: (s0, 1),
-                c_col: (sympy.Integer(256), 1),
-            },
+            iteration_space=iteration_space,
+            core_id_to_work_slice=derive_operation_mapping(iteration_space),
             args=[
                 _tensor_arg(True, 0, self._HBM_BASE),
                 _tensor_arg(True, 1, self._HBM_BASE + 0x1000),
@@ -664,13 +671,15 @@ class TestGenerateSdscSymbolicPerCoreAddresses(InductorTestCase):
                 allocation={"hbm": hbm_base},
             )
 
+        iteration_space = {
+            c_row: (s0, self._NUM_CORES),
+            c_col: (sympy.Integer(256), 1),
+        }
         return OpSpec(
             op="add",
             is_reduction=False,
-            iteration_space={
-                c_row: (s0, self._NUM_CORES),
-                c_col: (sympy.Integer(256), 1),
-            },
+            iteration_space=iteration_space,
+            core_id_to_work_slice=derive_operation_mapping(iteration_space),
             args=[
                 _tensor_arg(True, 0, self._HBM_BASE),
                 _tensor_arg(True, 1, self._HBM_BASE + 0x1000),
@@ -757,3 +766,38 @@ class TestGenerateSdscSymbolicPerCoreAddresses(InductorTestCase):
         self.assertTrue(
             any(sk.is_derived_symbolic for sk in symbol_kinds[first_address:])
         )
+
+
+class TestMaskingConstId(InductorTestCase):
+    """maskingConstId_ must resolve to the samv-maskvalue constant.
+
+    Constant ids are positions in the constants dict, so an op that carries its
+    own constants shifts samv-maskvalue off id 0. Hardcoding 0 there made the
+    backend splat the padding lanes with scaling_factor instead of the mask
+    value, corrupting every non-stick-aligned mean reduction (#4390).
+    """
+
+    def _ids_to_names(self, constants):
+        info = generate_constant_info(DataFormats.SEN169_FP16, constants, 1)
+        return {cid: entry["name_"] for cid, entry in info.items()}
+
+    def test_constants_dict_preserves_insertion_order(self):
+        # The whole scheme rests on dict order being insertion order, not
+        # sorted: "samv-maskvalue" sorts before "scaling_factor" but must come
+        # second when inserted second.
+        constants = {"scaling_factor": 1.0 / 9, "samv-maskvalue": 0.0}
+        self.assertEqual(list(constants), ["scaling_factor", "samv-maskvalue"])
+        self.assertEqual(self._ids_to_names(constants)["1"], "samv-maskvalue")
+
+    def test_masking_const_id_follows_preceding_constants(self):
+        # A reduction carrying scaling_factor (mean) shifts the mask value to 1;
+        # one carrying nothing else (sum) leaves it at 0. In both cases the
+        # index recorded at insertion time must name samv-maskvalue.
+        for preceding, expected in (({}, "0"), ({"scaling_factor": 1.0 / 9}, "1")):
+            constants = dict(preceding)
+            recorded = len(constants)
+            constants["samv-maskvalue"] = 0.0
+            self.assertEqual(str(recorded), expected)
+            self.assertEqual(
+                self._ids_to_names(constants)[str(recorded)], "samv-maskvalue"
+            )

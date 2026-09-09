@@ -95,14 +95,6 @@ test_suite_config:
       unlisted_test_mode: skip
       tests:
         - names:
-            - TestExecutionTrace::test_execution_trace_with_kineto
-            - TestExecutionTrace::test_execution_trace_alone
-            - TestExecutionTrace::test_execution_trace_env_disabled
-            - TestExecutionTrace::test_execution_trace_start_stop
-            - TestExecutionTrace::test_execution_trace_repeat_in_loop
-          mode: mandatory_success
-
-        - names:
             # AssertionError: Scalars are not close! Expected 0 but got 3.
             # ET output dir has 3 unexpected files when env-var should
             # disable trace collection. Likely env-var check not honored
@@ -110,6 +102,11 @@ test_suite_config:
             - TestExecutionTrace::test_execution_trace_env_enabled_with_kineto
             # SKIPPED: "torch.compile is not supported on python 3.12+" —
             # payload() also calls z.backward() (Spyre is inference-only).
+            - TestExecutionTrace::test_execution_trace_with_kineto
+            - TestExecutionTrace::test_execution_trace_alone
+            - TestExecutionTrace::test_execution_trace_env_disabled
+            - TestExecutionTrace::test_execution_trace_start_stop
+            - TestExecutionTrace::test_execution_trace_repeat_in_loop
             - TestExecutionTrace::test_execution_trace_with_pt2
             - TestExecutionTrace::test_execution_trace_env_enabled_with_pt2
           mode: skip

@@ -15,6 +15,7 @@ value loaded at runtime from a separate index tensor.
 - [Op spec layout](#op-spec-layout)
 - [Fusion](#fusion)
 - [Current limitations](#current-limitations)
+- [Multi-Core Work Division](indirect_access_work_division.md)
 
 ---
 

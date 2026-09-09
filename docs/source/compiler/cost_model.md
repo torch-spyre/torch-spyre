@@ -19,10 +19,11 @@ the compiler consumes it yet.
 
 ## Where it runs
 
-The pass runs immediately after the pre-scheduling pipeline, at the point where the
-loop-level IR is final: layouts resolved, restickify inserted, coarse tiling applied, work
-division committed, scratchpad placement done. Nothing after this changes what the program
-moves or computes — only how it is packaged into kernels.
+The pass runs after LX planning and before the final Scheduler-boundary work-division
+conversion, at the point where the loop-level IR is final: layouts resolved, restickify
+inserted, coarse tiling applied, symbol-keyed work division committed, scratchpad placement
+done. Nothing after this changes what the program moves or computes — only how it is
+packaged into kernels.
 
 ```text
                         torch.compile
@@ -42,6 +43,10 @@ moves or computes — only how it is packaged into kernels.
                           cost_model_pass ◀───┘   off unless config.cost_model
                                   │                is set — otherwise it returns
                                   │                before touching the graph
+                          dump_cost_model
+                                  │
+                  finalize Scheduler transport
+                                  │
       ┌───────────────────────────┴──────┐
       │ group ops into the kernels the   │
       │ backend will fuse, then price    │

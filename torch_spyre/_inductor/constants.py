@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import torch
+
 from torch_spyre._C import ElementArrangement
 
 BATCH_MATMUL_OP = "batchmatmul"
@@ -20,6 +21,7 @@ IDENTITY_OP = "identity"
 RESTICKIFY_OP = "ReStickifyOpHBM"
 DEPTHWISE_CONV2D_OP = "depthwiseconv2dnative"
 BATCH_MATMUL_FP8_OP = "batchmatmulfp8"
+KEEP_BY_INDEX_OP = "keepbyindex"
 MATMUL_REDUCTION_OPS = frozenset({BATCH_MATMUL_OP, BATCH_MATMUL_FP8_OP})
 
 # Reduction ops that cannot reduce along the stick dimension.
@@ -31,6 +33,8 @@ REDUCTIONS_NON_STICK_DIM_ONLY = {"prod"}
 DL16TOFP32_OP = "dl16tofp32"
 FP32TODL16_OP = "fp32todl16"
 FP8TODL16_OP = "fp8todl16"
+FP32TOINT32_OP = "fp32toint32"
+INT32TOFP32_OP = "int32tofp32"
 
 DEVICE_NAME = "spyre"
 
@@ -110,13 +114,6 @@ COPY_BACK_CANDIDATE_ATTR = "_spyre_copy_back_candidate"
 # compute mutation op from a pure-copy mutation op.
 ELIDED_COPY_BACK_ATTR = "_spyre_writes_copy_back_target"
 
-# FX ``custom`` metadata key for BMMs created from a shared 2D weight whose
-# logical batch dim is statically 1.  The downstream OpSpec key carries the same
-# fact after lowering, where FX metadata is no longer directly available.
-SHARED_WEIGHT_UNIT_BMM_CUSTOM_META_KEY = "_spyre_shared_weight_unit_bmm"
-SHARED_WEIGHT_UNIT_BMM_INFO_KEY = "shared_weight_unit_bmm"
-
-
 SEGMENT_OFFSETS = [
     0x0,
     0x400000000,
@@ -129,6 +126,12 @@ SEGMENT_OFFSETS = [
 
 INTERMEDIATES_SEGMENT = 0x0
 SEGMENT_SIZE = 0x400000000
+
+# The intermediates pool must leave headroom below the full segment size --
+# 2 GiB is reserved for other segment-7 consumers (e.g. kernel-address/dim
+# symbol bookkeeping), so the pool itself may never grow to claim the whole
+# segment.
+MAX_POOL_SIZE_BYTES = SEGMENT_SIZE - 2 * 1024**3
 
 SPYRE_FP32_OPS = [
     "add",
@@ -147,6 +150,7 @@ SPYRE_FP32_OPS = [
     "neg",
     "exp",
     "sigmoid",
+    "silu",
     "exx2",
     "layernormnorm",
     "identity",
@@ -167,10 +171,36 @@ SPYRE_FP32_OPS = [
     "prod",
 ]
 
+# Operations the device has a 32-bit integer intrinsic for: `spyreop.addi32toi32`
+# and `spyreop.muli32toi32`, each splitting its operands into halves and finding
+# the carry with a pair of scale factors.  Separate from SPYRE_FP32_OPS because
+# the two are different templates reached by the same op name, and only the KTIR
+# path can spell them -- SDSC still relabels IEEE_INT32 as SENUINT32 for indices.
+SPYRE_INT32_OPS = [
+    "add",
+    "mul",
+]
+
 # FP8 E4M3 numeric limits
 FP8_E4M3FN_INFO = torch.finfo(torch.float8_e4m3fn)
 FP8_E4M3FN_MAX = float(FP8_E4M3FN_INFO.max)
 FP8_E4M3FN_MIN = float(FP8_E4M3FN_INFO.min)
+
+# clipMin for quantscalepertokenfp8: lower clamp bound for the computed scale.
+# Passed as a float; encode_constant will encode it to SEN169_FP16 (== 4096 / 0x1000).
+QUANTSCALEPERTOKENFP8_CLIP_MIN = 1.1920928955078125e-07
+
+# clipMax for quantscalepertokenfp8: upper clamp bound for the computed scale.
+# float32 max saturates to SEN169_FP16's maximum finite value (32255 / 0x7DFF).
+# Passed as a float; encode_constant will encode it via the normal path.
+QUANTSCALEPERTOKENFP8_CLIP_MAX = float(torch.finfo(torch.float32).max)
+
+
+# Operation name for per-token FP8 quantization scale computation
+# NOTE: quantscalepertokenfp8 is NOT in SPYRE_FP8_OPS because it takes FP16 input
+# and produces FP16 scales (not FP8 data). SPYRE_FP8_OPS contains only ops that
+# produce or consume FP8 tensors.
+QUANTSCALEPERTOKENFP8_OP = "quantscalepertokenfp8"
 
 # Operations that directly handle FP8 dtypes (SEN143_FP8)
 SPYRE_FP8_OPS = {
@@ -181,6 +211,8 @@ SPYRE_FP8_OPS = {
 }
 
 TOPK_OPS = {"topkvalue", "topkindex"}
+_MAX_K_PER_CORE = 4
+TOPK_MAX_K_PER_CORE = _MAX_K_PER_CORE
 
 LAYOUT_LABELS = ["OUTPUT", "KERNEL", "INPUT", "KERNEL_IDX"]
 MATMUL_LAYOUT_LABELS = ["INPUT", "KERNEL", "OUTPUT", "KERNEL_IDX"]
@@ -199,6 +231,28 @@ CONV2D_FWD_OP = "conv2d"
 # depthwise conv2d (spyre.conv2d, PR #3510) op strings are convolutions for the
 # purposes of codegen dispatch (_is_conv). DEPTHWISE_CONV2D_OP is defined above.
 CONV_OPS = {CONV2D_FWD_OP, DEPTHWISE_CONV2D_OP}
+
+# Two-input reductions dispatched together in spyre_kernel.store_reduction:
+# matmul (activation @ weight) and conv2d (activation * weight, reduced over
+# in/ki/kj) both build [input, weight, output] tensor args.
+TWO_INPUT_REDUCTION_OPS = frozenset(
+    {BATCH_MATMUL_OP, BATCH_MATMUL_FP8_OP, CONV2D_FWD_OP, KEEP_BY_INDEX_OP}
+)
+
+# Depthwise conv is a two-input reduction like TWO_INPUT_REDUCTION_OPS but is
+# dispatched in its own branch in spyre_kernel.store_reduction because it
+# builds its tensor args differently (one filter per input channel).
+DEPTHWISE_CONV_REDUCTION_OPS = frozenset({DEPTHWISE_CONV2D_OP})
+
+# Single-input reductions: everything store_reduction dispatches to its
+# fallback branch (exactly one input TensorArg). These are PyTorch/Inductor
+# reduction_type strings (sum/mean/max/min/prod) plus Spyre-specific reduction
+# ops (exx2, topkvalue/topkindex, avgpoolfwd) -- there is no upstream registry
+# of supported reduction_type strings to derive this from, so it is written
+# down here explicitly.
+SINGLE_INPUT_REDUCTION_OPS = frozenset(
+    {"sum", "mean", "max", "min", "prod", "exx2", *TOPK_OPS, AVGPOOL2D_OP}
+)
 
 # Populate more valid labels from deeptools here if needed
 INPUT_DIM_LABELS = ["mb", "x", "y", "i", "j", "ki", "kj"]

@@ -14,6 +14,7 @@
 
 
 import dataclasses
+from typing import Any
 
 from sympy import Symbol
 
@@ -196,11 +197,38 @@ def num_bytes(df: DataFormats) -> int:
     return 128 // num_elems
 
 
-def generate_constant_info(data_format, constants, num_cores):
+def generate_constant_info(
+    data_format: DataFormats,
+    constants: dict[str, Any],
+    num_cores: int,
+) -> dict[str, Any] | str:
+    """Generate constant information for SDSC.
+
+    Args:
+        data_format: The data format for encoding constants
+        constants: Dictionary of constant name to value
+        num_cores: Number of cores
+
+    Returns:
+        Dictionary of constant information for SDSC JSON, or the literal string "{}"
+        for the empty-constants case (required by DeepTools SDSC JSON consumer).
+    """
+    # NOTE: Returns the literal string "{}" for the empty-constants case (not an
+    # empty dict) — required by the DeepTools SDSC JSON consumer which distinguishes
+    # between a missing constantInfo_ field and an empty one.
     if len(constants.keys()) == 0:
         return "{}"
-    constant_info = {}
+
+    constant_info: dict[str, Any] = {}
     for name, value in constants.items():
+        try:
+            encoded_value = encode_constant(value, data_format)
+        except (ValueError, TypeError) as e:
+            raise ValueError(
+                f"Cannot encode constant '{name}' with value {value} "
+                f"(type: {type(value).__name__}) to {data_format.name}: {e}"
+            ) from e
+
         ci = {
             "dataFormat_": data_format.name,
             "name_": name,
@@ -211,7 +239,7 @@ def generate_constant_info(data_format, constants, num_cores):
                     {"factor_": 1, "label_": "corelet"},
                     {"factor_": 1, "label_": "time"},
                 ],
-                "data_": {"[0, 0, 0]": [encode_constant(value, data_format)]},
+                "data_": {"[0, 0, 0]": [encoded_value]},
             },
         }
         constant_info[f"{len(constant_info)}"] = ci
@@ -380,7 +408,7 @@ def gen_coord_info_value(
                     {"factor_": nsplits, "label_": "core_fold"},
                     {"factor_": 1, "label_": "corelet_fold"},
                     {"factor_": 1, "label_": "row_fold"},
-                    {"factor_": (size // 128), "label_": "elem_arr_3"},
+                    {"factor_": -(-size // 128), "label_": "elem_arr_3"},
                     {"factor_": 8, "label_": "elem_arr_2"},
                     {"factor_": 2, "label_": "elem_arr_1"},
                     {"factor_": 8, "label_": "elem_arr_0"},
@@ -411,9 +439,9 @@ def gen_coord_info_value(
                     {"factor_": 1, "label_": "corelet_fold"},
                     {"factor_": 1, "label_": "row_fold"},
                     {
-                        "factor_": 1
-                        if is_stick_reduction
-                        else (size // elems_per_stick),
+                        "factor_": (
+                            1 if is_stick_reduction else -(-size // elems_per_stick)
+                        ),
                         "label_": "elem_arr_1",
                     },
                     {"factor_": elems_per_stick, "label_": "elem_arr_0"},
@@ -687,6 +715,7 @@ def generate_sdsc(
     operation_work_division = TensorWorkDivision(
         {dim: int(split) for dim, split in sdsc_spec.work_slices.items()},
         {dim: sdsc_spec.core_id_to_work_slice[dim] for dim in sdsc_spec.work_slices},
+        num_cores=sdsc_spec.num_cores,
     )
     for tensor in sdsc_spec.args:
         if tensor.work_division is None:
@@ -1362,9 +1391,7 @@ def generate_sdsc(
                                 str(dim): mask_range
                                 for dim, mask_range in sdsc_spec.coordinate_masking.items()
                             },
-                            "maskingConstId_": 0
-                            if sdsc_spec.coordinate_masking
-                            else -1,
+                            "maskingConstId_": sdsc_spec.masking_const_id,
                             # Emit dimToSymbolMapping_ only when there are symbolic dims;
                             # the runtime uses it to bind runtime shape values to symbols.
                             **(
@@ -1548,7 +1575,8 @@ def generate_sdsc(
                                         ),
                                         "coreIdToWkSlice_": (
                                             tensor.work_division.to_core_slices(
-                                                sdsc_spec.num_cores
+                                                tensor.work_division.num_cores
+                                                or sdsc_spec.num_cores
                                             )
                                             if sdsc_spec.opfunc == "shuffle"
                                             and tensor.work_division is not None

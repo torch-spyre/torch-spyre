@@ -17,15 +17,41 @@ import sys
 from typing import Literal
 
 from torch.utils._config_module import install_config_module
-from .logging_utils import _get_env_bool
 
 lx_planning: bool = os.environ.get("LX_PLANNING", "1") == "1"
 co_optimizing_lx_planning: bool = (
     os.environ.get("CO_OPTIMIZING_LX_PLANNING", "0") == "1"
 )
-hbm_pool_planning: bool = _get_env_bool("HBM_POOL_PLANNING", True)
+hbm_pool_planning: bool = os.getenv("HBM_POOL_PLANNING", "1").lower() in (
+    "1",
+    "true",
+    "yes",
+)
 
-global_stick_optimizer: bool = os.environ.get("GLOBAL_STICK_OPTIMIZER", "1") == "1"
+# Bracket risky FallbackKernel calls (opaque device dispatches with no native
+# Spyre lowering, e.g. custom ops or ops/eager.py's nested-torch.compile'd
+# eager kernels) with per-buffer LX dump/restore clones, so a buffer this
+# graph still has LX-resident across such a call survives whatever the
+# opaque call's own kernel does to LX. Defaults on; set
+# ENABLE_LX_CONTEXT_SWITCHING=0 to disable for debugging/bisection.
+enable_lx_context_switching: bool = os.getenv(
+    "ENABLE_LX_CONTEXT_SWITCHING", "1"
+).lower() in (
+    "1",
+    "true",
+    "yes",
+)
+
+# Select who allocates the HBM pool for an SDSC bundle's intermediates:
+# False (default) has the backend self-allocate via
+# sdscbundle.device_mem_allocate, exactly matching pre-existing behavior.
+# True has the front end allocate a real PyTorch tensor (via
+# spyre_empty_with_layout) and pass its address in as %pool_base_addr.
+frontend_pool_allocation: bool = os.getenv("FRONTEND_POOL_ALLOCATION", "0").lower() in (
+    "1",
+    "true",
+    "yes",
+)
 
 # Emit a native conv2d SDSC (opFuncName="conv2d" on the "pt" unit) instead of
 # the im2col+matmul decomposition (conv2d_via_bmm_decomp). Off by default: the
@@ -59,7 +85,11 @@ ktir_device_mlir: str = os.environ.get("KTIR_DEVICE_MLIR", "")
 
 # Materialize compatible producer/consumer LX ownership changes as identity copies.
 # Set SPYRE_LX_PLANNER_RELAYOUT=0 to disable this optimization.
-lx_planner_relayout: bool = _get_env_bool("SPYRE_LX_PLANNER_RELAYOUT", True)
+lx_planner_relayout: bool = os.getenv("SPYRE_LX_PLANNER_RELAYOUT", "1").lower() in (
+    "1",
+    "true",
+    "yes",
+)
 
 allow_all_ops_in_lx_planning: bool = False
 
@@ -86,6 +116,14 @@ ignore_work_division_hints: bool = (
 )
 
 ignore_wsr_hints: bool = os.environ.get("SPYRE_INDUCTOR_IGNORE_HINTS", "0") == "1"
+
+# Temporary kill switch for removing a proven-redundant read copy after LX
+# planning.  A failed proof leaves the original graph unchanged.
+read_copy_elision: bool = os.getenv("SPYRE_READ_COPY_ELISION", "1").lower() in (
+    "1",
+    "true",
+    "yes",
+)
 
 # Per-pass operation logging for CustomPreSchedulingPasses.
 # Set to "all" or "1" to log after every pass, or a comma-separated list of
@@ -139,12 +177,6 @@ core_id_k_fast_emission: bool = (
     os.environ.get("SPYRE_CORE_ID_K_FAST_EMISSION", "1") == "1"
 )
 
-# When True, disable PyTorch's remove_noop_ops elimination of aten.copy.default.
-# Required for WSR variants that intentionally insert copies (e.g. flash_v2)
-# inside WSR loops. Off by default — enabling this for models that don't need
-# it may prevent harmless copy removal and hurt performance.
-disable_copy_opt: bool = os.environ.get("DISABLE_COPY_OPT", "0") == "1"
-
 # When True (default), HBM tensor addresses are emitted as runtime symbols
 # with !sdscbundle.input_arg<index> parameters and input_arg_extract ops
 # in the bundle.mlir.
@@ -153,18 +185,56 @@ disable_copy_opt: bool = os.environ.get("DISABLE_COPY_OPT", "0") == "1"
 # emitter, i.e. also requires ktir_emitter=True / TORCH_SPYRE_KTIR=1.)
 bundle_symbolic_args: bool = os.environ.get("BUNDLE_SYMBOLIC_ARGS", "1") == "1"
 
+# Cache and reuse sdsc.json files during codegen when two OpSpecs produce
+# identical SuperDSC content, reducing bundle size for programs with loops.
+# Set SPYRE_INDUCTOR_SDSC_CACHE=0 to disable.
+sdsc_cache: bool = os.environ.get("SPYRE_INDUCTOR_SDSC_CACHE", "1") == "1"
+
 # Layout solver class used by default in scratchpad.allocator.ScratchpadAllocator.
 # Options:
-#  "greedy":       GreedyLayoutSolver (default),
+#  "greedy":       GreedyLayoutSolver,
 #  "bestfit":      BestFitLayoutSolver,
 #  "firstfit":     FirstFitLayoutSolver,
-#  "simulated_annealing":  SimulatedAnnealingLayoutSolver,
+#  "simulated_annealing":  SimulatedAnnealingLayoutSolver, or -- when
+#              ``co_optimizing_lx_planning`` is set -- SaCoOptimizingSolver, the
+#              joint work-division + LX-placement annealer. Two different
+#              solvers sharing one config value, not one solver in two modes.
 #  "cpsat":    CpSatLayoutSolver (OR-Tools CP-SAT joint core-division +
-#              LX placement, minimizing HBM transfer traffic).
+#              LX placement, minimizing HBM transfer traffic) (default).
+#
+# For "cpsat" and "simulated_annealing" the value names a solver *family* whose
+# joint-ness is selected by ``co_optimizing_lx_planning``; for the gap-based
+# solvers that same flag instead wraps them in ExhaustiveSearchSolver.
 
-# TODO(isuruf): Change to firstfit when deeptools PR4298 lands
 layout_solver: Literal[
     "greedy", "bestfit", "firstfit", "cpsat", "simulated_annealing"
-] = os.environ.get("LAYOUT_SOLVER", "greedy")  # type: ignore[assignment]
+] = os.environ.get("LAYOUT_SOLVER", "cpsat")  # type: ignore[assignment]
+
+# OpSpec validation at pipeline stage boundaries. Enabled by default to catch
+# invariant violations early. Set SPYRE_VALIDATE_OP_SPECS=0 to disable.
+validate_op_specs: bool = os.environ.get("SPYRE_VALIDATE_OP_SPECS", "1") == "1"
+
+# Use the C++ (native) permutation-layout packer accelerator, which both
+# simulated-annealing solvers drive (the layout-only one and the joint
+# co-optimizer). The native and Python packers are behaviourally identical
+# (verified bit-for-bit); the native one is faster. Set
+# False (or ``TORCH_SPYRE_NATIVE_PACKER=0``/``false``, which backs this default)
+# to force the pure-Python packer. A missing native class is a stale or
+# incomplete build, not a supported mode, and raises rather than falling back.
+native_layout_packer: bool = os.getenv("TORCH_SPYRE_NATIVE_PACKER", "1").lower() in (
+    "1",
+    "true",
+    "yes",
+)
+
+# When symbolic cost_expr fails, use the fallback cost instead of erroring out
+_cpsat_warn_on_cost_expr: bool = True
+# Enable persistent on-disk caching of compiled Spyre kernels across
+# invocations.
+# Set SPYRE_KERNEL_CACHE=0 to disable.
+# To force recompilation (bypass lookup but still save), use the standard
+# PyTorch flag: TORCHINDUCTOR_FORCE_DISABLE_CACHES=1 / set
+# torch._inductor.config.force_disable_caches = True.
+spyre_kernel_cache: bool = os.environ.get("SPYRE_KERNEL_CACHE", "0") == "1"
 
 install_config_module(sys.modules[__name__])

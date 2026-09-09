@@ -15,7 +15,7 @@
 
   <!-- ========================= TOP: source program ========================= -->
   <rect x="40" y="68" width="900" height="135" rx="8" fill="#f1f5f9" stroke="#475569" stroke-width="1.2"/>
-  <text x="60" y="89" font-size="11" font-weight="bold" fill="#0f172a">The program (run with torch.compile, backend="spyre"):</text>
+  <text x="60" y="89" font-size="11" font-weight="bold" fill="#0f172a">The program (tensors on the spyre device, run with torch.compile):</text>
   <text x="60" y="110" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11" fill="#0f172a">x = torch.rand(50, 10, 200, dtype=torch.float16)   <tspan fill="#475569"># a 3-D tensor</tspan></text>
   <text x="60" y="126" font-family="ui-monospace, monospace" font-size="11" fill="#0f172a">y = torch.rand(500, 200,   dtype=torch.float16)    <tspan fill="#475569"># a 2-D tensor</tspan></text>
   <text x="60" y="148" font-family="ui-monospace, monospace" font-size="11" fill="#0f172a">def f(x, y):</text>

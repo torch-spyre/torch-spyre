@@ -29,7 +29,10 @@ common Torch-Spyre use cases.
 | `distributed/broadcast.py` | Broadcast collective on Spyre |
 | `distributed/gather.py` | Gather collective on Spyre |
 | `distributed/reduce.py` | Reduce collective on Spyre |
-| `broadcast_demo_multirank.py` | Multi-rank broadcast walkthrough with pre- and post-broadcast computation |
+| `distributed/compiled/broadcast_demo_multirank.py` | Multi-rank broadcast walkthrough with pre- and post-broadcast computation |
+| `distributed/compiled/all_gather_demo_multirank.py` | Multi-rank all-gather walkthrough |
+| `distributed/compiled/all_reduce_demo_multirank.py` | Multi-rank allreduce via `torch.compile`'s plan/run collective ops |
+| `distributed/compiled/all_reduce_demo_multicalls_multirank.py` | Multi-rank allreduce with multiple compiled calls sharing one plan |
 
 ## Scratchpad Planning Examples
 
@@ -41,6 +44,7 @@ resulting buffer layouts. They require `matplotlib` and `numpy`.
 | `scratchpad/toy_layout.py` | Plot the layout for a fixed ordering of four buffers, with no annealing |
 | `scratchpad/random_buffers.py` | Compare first-fit against simulated-annealing quality on a set of random buffers |
 | `scratchpad/inplace_annealing.py` | Convergence study on an 18-buffer workload with in-place reuse |
+| `scratchpad/profile_native_packer.py` | Paired A/B benchmark of the C++ packer against the Python one, with dispersion statistics (needs neither `matplotlib` nor `numpy`; see [results](../../compiler/native_packer_performance.md)) |
 
 ## Provenance Audit
 

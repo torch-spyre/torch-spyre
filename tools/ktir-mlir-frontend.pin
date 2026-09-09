@@ -1,0 +1,13 @@
+# The ktir-mlir-frontend commit the OpSpec->KTIR emitter is tested against.
+#
+# This lives here, not in pyproject.toml, on purpose.  `uv lock --check` demands
+# exact correspondence between pyproject.toml and uv.lock in both directions, and
+# CI runs `pre-commit run --all-files`, which ignores the `files:` gate on the
+# check-requirements-dev hook.  So an unpinned URL in pyproject.toml would break
+# every unrelated PR the moment this repo gets a commit, and a pinned one would
+# put a top-level-approval file in the path of every routine bump.  Keeping the
+# dependency out of pyproject.toml/uv.lock entirely leaves the lock check stable
+# forever and makes a bump a one-line change to this file.
+#
+# Bump: edit the line below, then re-run tools/install-ktir.sh.
+91455932139b219653f2396b0861b7aaf1961d6b
