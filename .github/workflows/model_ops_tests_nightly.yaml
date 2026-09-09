@@ -126,6 +126,10 @@ jobs:
             config: Qwen2.5-7B-Instruct.yaml
           - name: Qwen 2.5 7B Spyre
             config: Qwen2.5-7B-Instruct_spyre.yaml
+          - name: Roberta Base Squad2
+            config: roberta-base-squad2.yaml
+          - name: Roberta Base Squad2 Spyre
+            config: roberta-base-squad2_spyre.yaml
 
     steps:
       # Sparse checkout into the GHA workspace so the local composite
