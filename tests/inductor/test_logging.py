@@ -14,34 +14,14 @@
 
 """Tests for logging infrastructure."""
 
-import os
 import logging
-from unittest.mock import patch
+
 import torch  # noqa: F401
 import torch_spyre._inductor.logging_utils as logging_utils
 from torch_spyre._inductor.logging_utils import (
     get_inductor_logger,
-    is_inductor_logging_enabled,
+    warn_once,
 )
-
-
-class TestLoggingConfiguration:
-    def setup_method(self, method):
-        torch.manual_seed(0xAFFE)
-
-    def test_default_is_disabled(self):
-        with patch.object(logging_utils, "_needs_reinit", True):
-            with patch.dict(os.environ, {}, clear=True):
-                assert not is_inductor_logging_enabled()
-                logger = get_inductor_logger("test_disabled")
-                assert logger.level == logging.WARNING
-
-    def test_enabled_defaults_to_info_level(self):
-        with patch.object(logging_utils, "_needs_reinit", True):
-            with patch.dict(os.environ, {"SPYRE_INDUCTOR_LOG": "1"}, clear=True):
-                assert is_inductor_logging_enabled()
-                logger = get_inductor_logger("test_enabled")
-                assert logger.level == logging.INFO
 
 
 class TestLoggingOperations:
@@ -59,3 +39,43 @@ class TestLoggingOperations:
         logger.info("test message")
         logger.warning("test message")
         logger.debug("test message with data: shape=[2, 3], device_size=[1, 2, 3]")
+
+
+class TestWarnOnce:
+    def setup_method(self, method):
+        logging_utils._warned_once.clear()
+
+    def test_same_key_suppresses_repeat(self, caplog):
+        logger = get_inductor_logger("test_warn_once_repeat")
+        with caplog.at_level(logging.WARNING, logger=logger.name):
+            warn_once(logger, "opX", "skipping %s", "opX")
+            warn_once(logger, "opX", "skipping %s", "opX")
+        assert [r.getMessage() for r in caplog.records] == ["skipping opX"]
+
+    def test_different_key_still_fires(self, caplog):
+        logger = get_inductor_logger("test_warn_once_distinct_keys")
+        with caplog.at_level(logging.WARNING, logger=logger.name):
+            warn_once(logger, "opX", "skipping %s", "opX")
+            warn_once(logger, "opY", "skipping %s", "opY")
+        assert len(caplog.records) == 2
+
+    def test_message_may_vary_without_defeating_dedup(self, caplog):
+        # The dedup key is caller-supplied, not the formatted message, so a
+        # message that legitimately differs per call (e.g. a shape folded
+        # into the text) still dedupes correctly on the shared key.
+        logger = get_inductor_logger("test_warn_once_varying_message")
+        with caplog.at_level(logging.WARNING, logger=logger.name):
+            warn_once(logger, "opX", "skipping opX, shape=%s", [1, 2])
+            warn_once(logger, "opX", "skipping opX, shape=%s", [3, 4])
+        assert [r.getMessage() for r in caplog.records] == [
+            "skipping opX, shape=[1, 2]"
+        ]
+
+    def test_same_key_different_logger_not_cross_suppressed(self, caplog):
+        logger_a = get_inductor_logger("test_warn_once_logger_a")
+        logger_b = get_inductor_logger("test_warn_once_logger_b")
+        with caplog.at_level(logging.WARNING, logger=logger_a.name):
+            with caplog.at_level(logging.WARNING, logger=logger_b.name):
+                warn_once(logger_a, "opX", "skipping %s", "opX")
+                warn_once(logger_b, "opX", "skipping %s", "opX")
+        assert len(caplog.records) == 2

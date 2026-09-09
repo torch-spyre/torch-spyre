@@ -48,6 +48,7 @@ from torch_spyre._inductor.views import (
     compute_coordinates,
     normalize_coordinates,
     tiling_expr_to_device_expr,
+    UnalignedStickSplit,
 )
 from torch.utils._sympy.functions import FloorDiv, ModularIndexing
 
@@ -209,6 +210,154 @@ class TestCoordinates(TestCase):
             high_var = remap[hd][1][0]
             self.assertEqual(iteration_space[high_var][0], 32)
             self.assertTrue(all(size > 0 for size in tensors[0]["size"]))
+
+    def test_align_tensors_rejects_internal_boundary_inside_stick(self):
+        """A peer's factorization must not split an int32 physical stick."""
+        entry, head, width = sympy.symbols(
+            "entry head width", integer=True, nonnegative=True
+        )
+        indirect = sympy.Symbol("indirect", integer=True, nonnegative=True)
+        tensors = [
+            {
+                "size": [2, 32],
+                "coordinates": [
+                    sympy.floor(entry / 32),
+                    sympy.Mod(entry, 32),
+                ],
+            },
+            {
+                "size": [128, 8, 4, 1, 64],
+                "coordinates": [
+                    head + 8 * sympy.Mod(entry, 16),
+                    sympy.floor(entry / 16),
+                    sympy.floor(width / 64),
+                    sympy.S.Zero,
+                    sympy.Mod(width, 64),
+                ],
+            },
+            {
+                "size": [128, 8, 4, 1, 64],
+                "coordinates": [
+                    indirect,
+                    head,
+                    sympy.floor(width / 64),
+                    sympy.S.Zero,
+                    sympy.Mod(width, 64),
+                ],
+            },
+        ]
+
+        with self.assertRaisesRegex(
+            UnalignedStickSplit,
+            r"boundary 16 for entry cuts tensor 0.*stick of 32",
+        ):
+            align_tensors(
+                {entry: (64, 2), head: (8, 1), width: (256, 1)},
+                tensors,
+                {indirect: 128},
+            )
+
+    def test_align_tensors_rejects_nonzero_truncated_stick_split(self):
+        """Reject a sub-stick split even when integer division is nonzero."""
+        entry, head, width = sympy.symbols(
+            "entry head width", integer=True, nonnegative=True
+        )
+        tensors = [
+            {
+                "size": [3, 32],
+                "coordinates": [
+                    sympy.floor(entry / 32),
+                    sympy.Mod(entry, 32),
+                ],
+            },
+            {
+                "size": [384, 2, 4, 1, 64],
+                "coordinates": [
+                    head + 8 * sympy.Mod(entry, 48),
+                    sympy.floor(entry / 48),
+                    sympy.floor(width / 64),
+                    sympy.S.Zero,
+                    sympy.Mod(width, 64),
+                ],
+            },
+        ]
+
+        with self.assertRaisesRegex(
+            UnalignedStickSplit,
+            r"boundary 48 for entry cuts tensor 0.*stick of 32",
+        ):
+            align_tensors(
+                {entry: (96, 3), head: (8, 1), width: (256, 1)},
+                tensors,
+            )
+
+    def test_align_tensors_accepts_noncanonical_stick_variable_split(self):
+        """A shared variable need not describe canonical outer-stick tiling."""
+        entry = sympy.Symbol("entry", integer=True, nonnegative=True)
+        _, aligned, _ = align_tensors(
+            {entry: (4, 2)},
+            [
+                {
+                    "size": [2, 64],
+                    "coordinates": [sympy.floor(entry / 2), entry],
+                }
+            ],
+        )
+
+        self.assertTrue(all(size > 0 for tensor in aligned for size in tensor["size"]))
+
+    def test_align_tensors_accepts_stick_aligned_source(self):
+        """A dense scatter source contributes no sub-stick index boundary."""
+        entry, head, width = sympy.symbols(
+            "entry head width", integer=True, nonnegative=True
+        )
+        tensors = [
+            {
+                "size": [2, 32],
+                "coordinates": [
+                    sympy.floor(entry / 32),
+                    sympy.Mod(entry, 32),
+                ],
+            },
+            {
+                "size": [64, 8, 4, 1, 64],
+                "coordinates": [
+                    entry,
+                    head,
+                    sympy.floor(width / 64),
+                    sympy.S.Zero,
+                    sympy.Mod(width, 64),
+                ],
+            },
+        ]
+
+        _, aligned, _ = align_tensors(
+            {entry: (64, 2), head: (8, 1), width: (256, 1)}, tensors
+        )
+
+        self.assertTrue(all(size > 0 for tensor in aligned for size in tensor["size"]))
+
+    def test_align_tensors_accepts_partial_stick_endpoint(self):
+        """A short final stick is legal because its endpoint is not a split."""
+        entry = sympy.Symbol("entry", integer=True, nonnegative=True)
+        _, aligned, _ = align_tensors(
+            {entry: (7, 1)},
+            [
+                {
+                    "size": [1, 32],
+                    "coordinates": [
+                        sympy.floor(entry / 32),
+                        sympy.Mod(entry, 32),
+                    ],
+                },
+                {
+                    "size": [7, 64],
+                    "coordinates": [entry, sympy.S.Zero],
+                },
+            ],
+        )
+
+        self.assertTrue(all(size > 0 for tensor in aligned for size in tensor["size"]))
 
     def test_compute_coordinates_rejects_overlapping_moduli(self):
         """Multiple Mods remain unsupported unless they form one digit chain."""

@@ -25,12 +25,15 @@ import unittest
 import sympy
 import torch
 
-from torch_spyre._C import SpyreTensorLayout, get_device_dtype
+from torch_spyre._C import ElementArrangement, SpyreTensorLayout, get_device_dtype
 from torch_spyre._inductor.enforce_indirect_access_layout import (
+    _dense_scatter_source_stl,
     _dim_order_is_compliant,
     _indirect_stride_idx,
     _build_required_stl,
 )
+from torch_spyre._inductor.errors import Unsupported
+from torch_spyre._inductor.ir import FixedTiledLayout
 from torch_spyre._inductor.op_spec import IndirectAccess
 
 
@@ -174,6 +177,55 @@ class TestBuildRequiredStl(unittest.TestCase):
         self.assertEqual(required_stl.device_size[1], 2)
         # Stick stays at end
         self.assertEqual(required_stl.device_size[3], 1)
+
+
+class TestDenseScatterSourceStl(unittest.TestCase):
+    def test_preserves_logical_dtype_and_element_arrangement(self):
+        host_size = [1, 64, 8, 2, 1, 128]
+        host_stride = [131072, 2048, 256, 128, 128, 1]
+        source_stl = SpyreTensorLayout(
+            [128, 8, 4, 1, 64],
+            [256, 32768, 64, 262144, 1],
+            get_device_dtype(torch.bfloat16),
+            ElementArrangement.FP32_TO_DL16,
+        )
+        layout = FixedTiledLayout(
+            torch.device("spyre"),
+            torch.bfloat16,
+            host_size,
+            host_stride,
+            source_stl,
+        )
+
+        dense = _dense_scatter_source_stl(layout)
+
+        self.assertEqual(dense.device_dtype, source_stl.device_dtype)
+        self.assertEqual(dense.element_arrangement, source_stl.element_arrangement)
+        self.assertEqual(
+            dense,
+            SpyreTensorLayout(
+                host_size,
+                host_stride,
+                torch.bfloat16,
+                list(range(len(host_size))),
+                source_stl.element_arrangement,
+            ),
+        )
+
+    def test_rejects_non_dl16_source(self):
+        host_size = [64, 32]
+        host_stride = [32, 1]
+        source_stl = SpyreTensorLayout(host_size, torch.float32)
+        layout = FixedTiledLayout(
+            torch.device("spyre"),
+            torch.float32,
+            host_size,
+            host_stride,
+            source_stl,
+        )
+
+        with self.assertRaisesRegex(Unsupported, "ReStickifyOpHBM does not support"):
+            _dense_scatter_source_stl(layout)
 
 
 if __name__ == "__main__":
