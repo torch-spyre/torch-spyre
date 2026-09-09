@@ -34,6 +34,7 @@ An op with no legal candidate raises `Unsupported`.
 - [Implementation](#implementation)
 - [Solvers](#solvers)
 - [Co-optimization with work-distribution](#co-optimization-with-work-distribution)
+- [LX context switching](#lx-context-switching)
 - [Current limitations](#current-limitations)
 - [Target patterns](#target-patterns)
 - [Future work](#future-work)
@@ -584,6 +585,66 @@ Setting `layout_solver = "simulated_annealing"` together with
 driven by `SaCoOptimizingSolver`, which anneals the division vector and the
 layout permutation as one joint state and scores it with the cost model. See
 [Joint core-division + LX placement](sa_co_optimization.md).
+
+## LX context switching
+
+LX data corruption (clobbering) can happen when two conditions hold together: (1) two
+*separate* `torch.compile`s each plan their own LX addresses independently, with no shared view
+of what the other has pinned; and (2) one runs nested inside the other — a `FallbackKernel`'s
+eager body launching a second, separately-compiled Spyre program (via a nested `torch.compile`,
+or any eager op compiled standalone through `ops/eager.py`) — while the outer graph still needs
+a buffer it already has LX-resident. The inner compile has no knowledge of that buffer and may
+reuse its address for its own scratch:
+
+```
+op0 (write r -> LX)  ...  FallbackKernel (opaque)  ...  op1 (read r <- LX)
+```
+
+An earlier fix (PR3683) closed this by refusing LX residency outright to any buffer live
+across such a call (`_extern_kernel_in_live_range` in `allocator.py`) — correct, but every
+access to that buffer then pays a full HBM round trip, not just the one crossing: cost scales
+as `(1 + read_count)·size/BW`, growing with reuse.
+
+`LxContextSwitchingPass`
+(`torch_spyre/_inductor/scratchpad/lx_context_switching.py`) protects the residency directly
+instead of giving it up. For each LX-resident buffer whose lifetime strictly straddles a risky
+`FallbackKernel`, it inserts a **dump** clone (LX → HBM) immediately before the call and a
+**restore** clone (HBM → LX, back to the buffer's exact original address) immediately after
+it. The bracketed call itself is never modified; ordering is enforced purely through
+`GraphLowering.additional_buffer_deps`/`additional_star_deps`, upstream's own mechanism for a
+fake, non-lifetime-extending ordering dependency. Cost is a fixed `2·size/BW`, independent of
+how many times the buffer is reused elsewhere.
+
+Not every `FallbackKernel` needs bracketing. A cheap classification skips it entirely when the
+op is a confirmed CPU-only fallback (`ops/fallbacks.py`'s shared, once-verified `_fallback`
+body) or explicitly opted out via `mark_lx_safe(op)` for an op whose author has confirmed that
+no intermediate buffers will ever write into LX. Otherwise, the buffer-lifetime check above
+is the load-bearing gate — classifying op behavior by namespace or registry proved unreliable
+in general, since `ops/eager.py` compiles plenty of aten ops (`mm`, `add`, `softmax`,
+`embedding`, …) standalone, and any of them can appear as the risky call.
+
+Measured on an 8-layer, 512×512 fp16 repro (`read_count = 1` per bracketed buffer,
+`tests/inductor/test_lx_context_switching.py`):
+
+| Configuration | Correctness | `kernel_ms` | HBM crossings for `r` |
+|---|---|---|---|
+| No fix | ❌ (`diff > 0`) | 0.313 | 0 (fully LX, but corrupted) |
+| Context switching (default) | ✅ | 0.386–0.388 | 2 — fixed dump + restore |
+| PR3683 guard alone | ✅ | 0.395–0.396 | 2 — this buffer's own write + read, both via HBM |
+
+These costs are equal in bytes moved at `read_count = 1`, yet the guard still measures
+consistently slower: HBM reads/writes actually happen in small chunks, so an op processing data
+directly from HBM must frequently reverse the traffic direction on the memory bus, lowering
+effective bandwidth. When the data fits on LX, moving it there entirely before processing needs
+no such direction-reversal. The guard pays that penalty on every touch of `r`; context
+switching only pays it for the dump/restore pair.
+
+Both mechanisms are gated by one flag, `config.enable_lx_context_switching`
+(`ENABLE_LX_CONTEXT_SWITCHING`, default on): **on**, `_extern_kernel_in_live_range` is skipped
+and `LxContextSwitchingPass` is registered as a `post_optimization_pass` instead; **off**, the
+guard runs exactly as PR3683 shipped it and the new pass is never registered. It is a real
+either/or, not a partial toggle, so old and new behavior stay directly comparable while the new
+mechanism earns trust in production; removing the guard entirely is a follow-up once it does.
 
 ## Current limitations
 
