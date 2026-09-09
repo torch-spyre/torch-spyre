@@ -409,6 +409,8 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
                         p for p in b.in_place_parents if p in self._name_to_idx
                     ],
                     residency_reason=b.residency_reason,
+                    lifetime_start_override=b.lifetime_start_override,
+                    lifetime_end_override=b.lifetime_end_override,
                 )
             )
         return out

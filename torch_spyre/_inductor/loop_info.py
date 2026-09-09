@@ -210,8 +210,12 @@ class ReadCopyEntry:
         this entry is their authority during copy construction.
     loop_invariant:
         True only when every consumer reads the same source slice on every
-        trip of the surrounding counted loop.  Such a copy is a preheader
-        operation, not part of the loop body.
+        trip of the surrounding counted loop. This permits compact staging;
+        placement is controlled independently by ``hoist``.
+    hoist:
+        Whether to emit the copy in the counted-loop preheader. Repeated
+        invariant windows from one source may deliberately remain in the loop
+        so their LX lifetimes do not overlap.
     """
 
     copy_name: str
@@ -224,6 +228,7 @@ class ReadCopyEntry:
         tuple[tuple[int, sympy.Expr, sympy.Expr], ...], ...
     ] = ()
     loop_invariant: bool = False
+    hoist: bool | None = None
 
 
 @dataclass(frozen=True)

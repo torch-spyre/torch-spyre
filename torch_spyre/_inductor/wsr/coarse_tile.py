@@ -3818,6 +3818,7 @@ def _insert_one_read_copy(
     *,
     predivision_unit_steps: tuple[tuple[tuple[int, Expr, Expr], ...], ...] = (),
     loop_invariant: bool = False,
+    hoist: bool | None = None,
 ) -> str:
     """Build and insert one tile-sized copy op for a single full-buffer read.
 
@@ -4164,7 +4165,8 @@ def _insert_one_read_copy(
     if hasattr(copy_buf, "work_div_loop_info"):
         del copy_buf.work_div_loop_info  # type: ignore[attr-defined]
 
-    if loop_invariant:
+    hoist = loop_invariant if hoist is None else hoist
+    if hoist:
         # No loop metadata means codegen emits this copy once before the first
         # loop-body consumer.  The copy has its own iteration symbols, so the
         # consumer's named work-division request must not be reused on it
@@ -4883,10 +4885,36 @@ def _plan_read_copies(
                     ),
                 )
             )
+        # Hoisting several different invariant windows from one source makes
+        # all of them live across the entire counted loop. This is disastrous
+        # for unrolled attention masks: N KV blocks consume N independent mask
+        # tiles. Keep each copy compact, but execute it in the loop next to its
+        # consumer so those tiles can reuse one LX address.
+        entries = _place_invariant_read_copies(entries)
         if entries:
             plans[stamped_group_id] = ReadCopyPlan(entries=tuple(entries))
 
     return plans
+
+
+def _place_invariant_read_copies(
+    entries: list[ReadCopyEntry],
+) -> list[ReadCopyEntry]:
+    """Hoist one invariant source window, but sink repeated source windows."""
+
+    invariant_windows_per_source = collections.Counter(
+        entry.dep.name for entry in entries if entry.loop_invariant
+    )
+    return [
+        dataclasses.replace(
+            entry,
+            hoist=(
+                entry.loop_invariant
+                and invariant_windows_per_source[entry.dep.name] == 1
+            ),
+        )
+        for entry in entries
+    ]
 
 
 def _insert_all_read_copy_ops(
@@ -4921,6 +4949,7 @@ def _insert_all_read_copy_ops(
                 insert_before_op=insert_before_op,
                 predivision_unit_steps=entry.predivision_unit_steps,
                 loop_invariant=entry.loop_invariant,
+                hoist=entry.hoist,
             )
             for consumer_name in entry.consumer_op_names:
                 consumer = name_to_op[consumer_name]

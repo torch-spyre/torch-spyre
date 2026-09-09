@@ -100,6 +100,7 @@ from .dump_cost_model import dump_cost_model
 # ``from .cost_model_pass import LAST_REPORT`` would bind one thread's value forever.
 from . import cost_model_pass as cost_model_pass_module
 from .cost_model_pass import CostReport, cost_model_pass
+from .operation_scheduling import schedule_loop_body_for_liveness
 from .split_multi_ops import split_multi_ops, validate_ops
 
 
@@ -497,6 +498,10 @@ class CustomPreSchedulingPasses:
             # Core Division
             span_reduction,
             _distribute_work,
+            #
+            # Give scratchpad planning the same loop-body order codegen will
+            # restore after Inductor's own DFS topological sort.
+            schedule_loop_body_for_liveness,
             #
             # LX Planning
             _maybe_scratchpad_planning,

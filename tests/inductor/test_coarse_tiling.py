@@ -2004,6 +2004,7 @@ class TestCoarseTile(unittest.TestCase):
 
         from torch_spyre._inductor.scratchpad.utils import (
             counted_loop_lifetime_end_overrides,
+            counted_loop_lifetime_overrides,
         )
 
         _dep = namedtuple("_dep", ["name"])
@@ -2048,6 +2049,166 @@ class TestCoarseTile(unittest.TestCase):
         # and consumed inside the loop: no extension.  ``arg0`` is only read
         # outside the loop: no extension.
         self.assertEqual(overrides, {"crossing": 4, "arg1": 4})
+
+        starts, ends = counted_loop_lifetime_overrides(
+            SimpleNamespace(operations=operations, graph_input_names=["arg0", "arg1"])
+        )
+        self.assertEqual(starts, {"crossing": 0, "arg1": 1})
+        self.assertEqual(ends, overrides)
+
+    def test_counted_loop_crossing_uses_full_loop_bounds_only(self):
+        """Crossing values cover the loop without widening local temporaries.
+
+        In particular, an input first read in the middle of the textual body is
+        already live at loop entry on every runtime iteration after the first.
+        Giving that input a start override protects it from early temporaries;
+        leaving the temporaries' own bounds alone lets disjoint early/late
+        values reuse one LX address.
+        """
+        from collections import namedtuple
+
+        from torch_spyre._inductor.scratchpad.plan_solver import LifetimeBoundBuffer
+        from torch_spyre._inductor.scratchpad.utils import (
+            calculate_liveness,
+            counted_loop_lifetime_overrides,
+        )
+
+        _dep = namedtuple("_dep", ["name"])
+
+        def _stub_read_writes(op, reads, writes):
+            op.get_read_writes.return_value = SimpleNamespace(
+                reads={_dep(name) for name in reads},
+                writes={_dep(name) for name in writes},
+            )
+
+        crossing = _make_op(_make_pointwise([Integer(16)]), "crossing")
+        _stub_read_writes(crossing, reads=["arg0"], writes=["crossing"])
+        early_writer = _make_hinted_op(_make_pointwise([Integer(16)]), "early_writer")
+        _stub_read_writes(early_writer, reads=[], writes=["early"])
+        early_reader = _make_hinted_op(_make_pointwise([Integer(16)]), "early_reader")
+        _stub_read_writes(early_reader, reads=["early"], writes=["early_out"])
+        crossing_reader = _make_hinted_op(
+            _make_pointwise([Integer(16)]), "crossing_reader"
+        )
+        _stub_read_writes(
+            crossing_reader,
+            reads=["crossing", "arg1"],
+            writes=["crossing_out"],
+        )
+        late_writer = _make_hinted_op(_make_pointwise([Integer(16)]), "late_writer")
+        _stub_read_writes(late_writer, reads=[], writes=["late"])
+        late_reader = _make_hinted_op(_make_pointwise([Integer(16)]), "late_reader")
+        _stub_read_writes(late_reader, reads=["late"], writes=["late_out"])
+
+        operations = [
+            crossing,
+            early_writer,
+            early_reader,
+            crossing_reader,
+            late_writer,
+            late_reader,
+        ]
+        coarse_tile_post_stickify(
+            _graph(operations),
+            [
+                (
+                    [
+                        early_writer,
+                        early_reader,
+                        crossing_reader,
+                        late_writer,
+                        late_reader,
+                    ],
+                    [(0, Integer(4))],
+                )
+            ],
+        )
+        graph = SimpleNamespace(
+            operations=operations, graph_input_names=["arg0", "arg1"]
+        )
+        lifetimes = calculate_liveness(graph)
+        starts, ends = counted_loop_lifetime_overrides(graph)
+
+        self.assertEqual(starts, {"crossing": 0, "arg1": 1})
+        self.assertEqual(ends, {"crossing": 6, "arg1": 6})
+        self.assertNotIn("early", starts | ends)
+        self.assertNotIn("late", starts | ends)
+
+        def _bound(name, *, is_input=False):
+            return LifetimeBoundBuffer(
+                name,
+                128,
+                lifetimes[name],
+                first_use_is_read=is_input,
+                lifetime_start_override=starts.get(name),
+                lifetime_end_override=ends.get(name),
+            )
+
+        crossing_buf = _bound("crossing")
+        input_buf = _bound("arg1", is_input=True)
+        early_buf = _bound("early")
+        late_buf = _bound("late")
+        self.assertTrue(crossing_buf.overlaps_in_time(early_buf))
+        self.assertTrue(crossing_buf.overlaps_in_time(late_buf))
+        self.assertTrue(input_buf.overlaps_in_time(early_buf))
+        self.assertTrue(input_buf.overlaps_in_time(late_buf))
+        self.assertFalse(early_buf.overlaps_in_time(late_buf))
+
+    def test_counted_loop_nested_crossings_use_innermost_crossed_bounds(self):
+        """A value born in an outer loop spans only the nested loop it enters."""
+        from collections import namedtuple
+
+        from torch_spyre._inductor.scratchpad.utils import (
+            counted_loop_lifetime_overrides,
+        )
+
+        _dep = namedtuple("_dep", ["name"])
+
+        def _op(name, path, reads=(), writes=()):
+            op = _make_op(_make_pointwise([Integer(16)]), name)
+            op.loop_info = SimpleNamespace(loop_group_id=path)
+            op.get_read_writes.return_value = SimpleNamespace(
+                reads={_dep(dep) for dep in reads},
+                writes={_dep(dep) for dep in writes},
+            )
+            return op
+
+        operations = [
+            _op("outer_producer", (0,), writes=["outer_value"]),
+            _op("inner_early", (0, 1), writes=["inner_value"]),
+            _op(
+                "inner_reader",
+                (0, 1),
+                reads=["outer_value", "arg_inner"],
+                writes=["inner_out"],
+            ),
+            _op("inner_tail", (0, 1), reads=["inner_value"], writes=["tail_out"]),
+            _op("outer_tail", (0,), reads=["arg_outer"], writes=["outer_out"]),
+        ]
+
+        starts, ends = counted_loop_lifetime_overrides(
+            SimpleNamespace(
+                operations=operations,
+                graph_input_names=["arg_inner", "arg_outer"],
+            )
+        )
+
+        self.assertEqual(
+            starts,
+            {
+                "outer_value": 0,
+                "arg_inner": 0,
+                "arg_outer": 0,
+            },
+        )
+        self.assertEqual(
+            ends,
+            {
+                "outer_value": 4,
+                "arg_inner": 5,
+            },
+        )
+        self.assertNotIn("inner_value", starts | ends)
 
     def test_end_to_end_shares_one_copy_across_group(self):
         """Full coarse_tile() entry point: two hint-driven ops in one group
@@ -2665,6 +2826,19 @@ class TestBuildLoopSchedulerNodes(unittest.TestCase):
 
         self.assertEqual(result, [copy, created[0]])
         self.assertEqual(created[0].snodes, [first, consumer])
+
+    def test_prescheduling_order_is_restored_after_inductor_toposort(self):
+        sched = _make_scheduler()
+        early_op = _make_ir_op((0,), Integer(4))
+        late_op = _make_ir_op((0,), Integer(4))
+        early_op._spyre_preschedule_order = 10
+        late_op._spyre_preschedule_order = 11
+        early = _make_snode(sched, early_op, "early")
+        late = _make_snode(sched, late_op, "late")
+
+        _result, created = self._run([late, early])
+
+        self.assertEqual(created[0].snodes, [early, late])
 
     def test_two_separate_groups(self):
         sched = _make_scheduler()
@@ -5644,6 +5818,7 @@ class TestReadCopyPlanDataclasses(unittest.TestCase):
         self.assertEqual(entry.consumer_op_names, ("op0", "op1"))
         self.assertEqual(entry.predivision_unit_steps, ())
         self.assertTrue(entry.loop_invariant)
+        self.assertIsNone(entry.hoist)
         with self.assertRaises(Exception):
             entry.copy_name = "other"  # frozen -> raises FrozenInstanceError
 
@@ -5651,6 +5826,40 @@ class TestReadCopyPlanDataclasses(unittest.TestCase):
         self.assertEqual(plan.entries, (entry,))
         with self.assertRaises(Exception):
             plan.entries = ()
+
+    def test_repeated_invariant_windows_are_sunk_into_the_loop(self):
+        from torch._inductor.dependencies import MemoryDep
+        from torch_spyre._inductor.loop_info import ReadCopyEntry
+        from torch_spyre._inductor.wsr.coarse_tile import (
+            _place_invariant_read_copies,
+        )
+
+        def entry(copy_name, source_name, offset=0, *, invariant=True):
+            return ReadCopyEntry(
+                copy_name=copy_name,
+                dep=MemoryDep(
+                    name=source_name,
+                    index=sympy.Integer(offset),
+                    var_names=(),
+                    size=(),
+                ),
+                insert_before_op_name="consumer",
+                sizing_op_name="consumer",
+                sizing_read_index=0,
+                consumer_op_names=("consumer",),
+                loop_invariant=invariant,
+            )
+
+        placed = _place_invariant_read_copies(
+            [
+                entry("mask0", "mask", 0),
+                entry("mask1", "mask", 256),
+                entry("weight", "weight"),
+                entry("advancing", "input", invariant=False),
+            ]
+        )
+
+        assert [item.hoist for item in placed] == [False, False, True, False]
 
 
 class TestReadCopyElisionProof(unittest.TestCase):

@@ -182,10 +182,9 @@ def _regroup_by_outer_loop_key(
     ordering purposes — its dependency set is the union of its members' real
     unmet_dependencies on buffers produced outside the group — and run a
     dependency-respecting DFS (mirroring topological_sort_schedule's own
-    shape) over {merged units, ungrouped nodes}. Each unit then expands back
-    into its original members in their original relative order, which is
-    always safe because that intra-group order is coarse_tile's deliberate
-    op sequence, not something this pass reorders.
+    shape) over {merged units, ungrouped nodes}. Each unit then expands in the
+    pre-scheduling order captured immediately before LX planning. This is the
+    same dependency-valid order in which coarse_tile built the loop body.
 
     The result is a valid topological order (edges are the real edges of the
     original graph) in which every outermost loop group is contiguous by
@@ -195,6 +194,17 @@ def _regroup_by_outer_loop_key(
     for node in nodes:
         for name in node.get_buffer_names():
             name_to_node[name] = node
+
+    original_node_order = {id(node): index for index, node in enumerate(nodes)}
+
+    def preschedule_order(node: BaseSchedulerNode) -> int:
+        orders = [
+            getattr(snode.node, "_spyre_preschedule_order", None)
+            for snode in node.get_nodes()
+            if isinstance(snode, SchedulerNode) and snode.node is not None
+        ]
+        known = [order for order in orders if isinstance(order, int)]
+        return min(known) if known else original_node_order[id(node)]
 
     outer_key_to_unit: dict[object, list[BaseSchedulerNode]] = {}
     units: list[Union[BaseSchedulerNode, list[BaseSchedulerNode]]] = []
@@ -214,6 +224,14 @@ def _regroup_by_outer_loop_key(
             units.append(unit)
         unit.append(node)
         unit_of_node[id(node)] = unit
+
+    # Scratchpad addresses were assigned against graph.operations immediately
+    # before Scheduler construction. Inductor subsequently performs a DFS
+    # topological sort that is free to reverse independent recurrence branches.
+    # Restore the allocator's explicit order inside each loop unit so codegen's
+    # real lifetimes match the ones used for LX placement.
+    for unit in outer_key_to_unit.values():
+        unit.sort(key=preschedule_order)
 
     def unit_key(unit) -> int:
         return id(unit)

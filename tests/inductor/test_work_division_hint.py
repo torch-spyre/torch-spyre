@@ -895,7 +895,7 @@ def _assert_live_buffers_do_not_share_addresses(graph, buffers, limit):
             )
 
 
-def test_lx_relayout_copies_loop_lifetime_to_every_destination():
+def test_lx_relayout_keeps_crossing_source_live_and_destinations_ephemeral():
     plans = [
         _relayout_plan("source", ("consumer_a", "consumer_b")),
         LXRelayoutPlan(
@@ -912,15 +912,30 @@ def test_lx_relayout_copies_loop_lifetime_to_every_destination():
             for name in ("producer", "consumer_a", "consumer_b", "consumer_c")
         ]
     )
-    source = LifetimeBoundBuffer("source", 64, [0, 1, 2, 3], lifetime_end_override=6)
+    source = LifetimeBoundBuffer(
+        "source",
+        64,
+        [1, 2, 3],
+        first_use_is_read=True,
+        lifetime_start_override=0,
+        lifetime_end_override=6,
+    )
     source.lx_relayout_plans = list(plans)
     buffers = [source]
     ScratchpadAllocator(GreedyLayoutSolver, 256)._append_lx_relayout_destinations(
         graph, buffers
     )
 
-    assert source.lifetime_end_override is None
-    assert [buffer.lifetime_end_override for buffer in source.paired_with] == [12, 12]
+    assert source.lifetime_start_override == 0
+    assert source.lifetime_end_override == 12
+    assert [buffer.lifetime_start_override for buffer in source.paired_with] == [
+        None,
+        None,
+    ]
+    assert [buffer.lifetime_end_override for buffer in source.paired_with] == [
+        None,
+        None,
+    ]
     tail = LifetimeBoundBuffer("tail", 64, [8, 11])
     buffers.append(tail)
     _assert_live_buffers_do_not_share_addresses(graph, buffers, 384)
@@ -941,7 +956,7 @@ def test_lx_relayout_keeps_source_lifetime_for_later_original_reader():
     )
 
     assert source.lifetime_end_override == 8
-    assert source.paired_with[0].lifetime_end_override == 8
+    assert source.paired_with[0].lifetime_end_override is None
     tail = LifetimeBoundBuffer("tail", 64, [6, 7])
     buffers.append(tail)
     _assert_live_buffers_do_not_share_addresses(graph, buffers, 384)
