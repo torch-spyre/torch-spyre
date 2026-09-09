@@ -1379,12 +1379,14 @@ def piecewise(*args):
     """``piecewise``, symbolic-aware, mirroring the :func:`sympy.Piecewise`
     API: each argument is an ``(expr, cond)`` pair, evaluated in order.
     Dispatches to ``sympy.Piecewise`` when a condition is symbolic, otherwise
-    returns the evaluated value."""
+    returns the evaluated value. The last ``cond`` must be a catch-all (e.g.
+    ``True``) so the non-symbolic loop always returns."""
     if any(isinstance(cond, sympy.Basic) for _expr, cond in args):
         return sympy.Piecewise(*args)
     for expr, cond in args:
         if cond:
             return expr
+    raise ValueError("piecewise(...) requires a catch-all True branch")
 
 
 _PT_ROWS = 8  # PT block rows per corelet

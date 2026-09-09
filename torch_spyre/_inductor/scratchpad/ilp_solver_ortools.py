@@ -271,6 +271,7 @@ _operator_map = {
     "<=": operator.le,
     ">": operator.gt,
     "==": operator.eq,
+    "!=": operator.ne,
 }
 
 
@@ -568,6 +569,10 @@ class _SympyExprToCpSat(Printer):
     @staticmethod
     def _min_piecewise_expand(expr):
         # re-writes 2.1*Min(x, y) as Min(2.1*x, 2.1*y)
+        # len(expr.args) may exceed 2 when extra scalar factors ride alongside
+        # the leading number and the (single) Min/Max/Piecewise factor this
+        # rewrites, e.g. 2.1*a*Min(x, y); only the first such factor is expanded
+        # per call, with the rest folded back in as a plain multiplier.
         if len(expr.args) < 2 or not isinstance(expr.args[0], sympy.Number):
             return expr
         if any(
