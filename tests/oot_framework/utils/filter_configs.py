@@ -246,7 +246,9 @@ def main() -> None:
         sys.exit(f"ERROR: --config-dir does not exist: {config_dir}")
 
     test_type = args.test_type.strip()
-    exclude_tiers = [t.strip() for t in (args.exclude_tiers or "").split(",") if t.strip()]
+    exclude_tiers = [
+        t.strip() for t in (args.exclude_tiers or "").split(",") if t.strip()
+    ]
     # Never let a tier suppress itself: an explicit rerun of a tier must re-execute.
     exclude_tiers = [t for t in exclude_tiers if t != test_type]
 

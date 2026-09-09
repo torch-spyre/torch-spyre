@@ -76,9 +76,16 @@ def _quote(value: str) -> str:
     return "'" + str(value).replace("\\", "\\\\").replace("'", "\\'") + "'"
 
 
-def covered_tiers(url: str, user: str, token: str, db: str,
-                  commit_sha: str, arch: str, horizon: int,
-                  timeout: int = 20) -> list[str]:
+def covered_tiers(
+    url: str,
+    user: str,
+    token: str,
+    db: str,
+    commit_sha: str,
+    arch: str,
+    horizon: int,
+    timeout: int = 20,
+) -> list[str]:
     sql = QUERY.format(
         db=db,
         commit_sha=_quote(commit_sha),
@@ -86,12 +93,15 @@ def covered_tiers(url: str, user: str, token: str, db: str,
         tiers="(" + ",".join(_quote(TIER_TAG_PREFIX + t) for t in TIER_LABELS) + ")",
         horizon=int(horizon),
     )
-    endpoint = url.rstrip("/") + "/?" + urllib.parse.urlencode(
-        {"database": db, "default_format": "TSVRaw"}
+    endpoint = (
+        url.rstrip("/")
+        + "/?"
+        + urllib.parse.urlencode({"database": db, "default_format": "TSVRaw"})
     )
     req = urllib.request.Request(endpoint, data=sql.encode(), method="POST")
     if user:
         import base64
+
         cred = base64.b64encode(f"{user}:{token}".encode()).decode()
         req.add_header("Authorization", f"Basic {cred}")
     with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -100,51 +110,72 @@ def covered_tiers(url: str, user: str, token: str, db: str,
     for line in body.splitlines():
         tag = line.strip()
         if tag.startswith(TIER_TAG_PREFIX):
-            found.add(tag[len(TIER_TAG_PREFIX):])
+            found.add(tag[len(TIER_TAG_PREFIX) :])
     # Bare tier names out: filter_configs.py matches config labels, which are bare.
     return [t for t in TIER_LABELS if t in found]
 
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--commit-sha", required=True,
-                    help="Commit the tests will run against. Coverage is only "
-                         "inherited from runs of artifacts built from this exact sha.")
+    ap.add_argument(
+        "--commit-sha",
+        required=True,
+        help="Commit the tests will run against. Coverage is only "
+        "inherited from runs of artifacts built from this exact sha.",
+    )
     ap.add_argument("--arch", required=True, help="Arch the tests RAN on")
-    ap.add_argument("--test-type", default="",
-                    help="Tier about to run; excluded from the output so a rerun "
-                         "of the same tier is never suppressed by its own results.")
-    ap.add_argument("--horizon-days", type=int,
-                    default=int(os.getenv("SPYRE_REUSE_HORIZON_DAYS", "14")),
-                    help="Ignore results older than this. Bounds how stale an "
-                         "inherited pass can be.")
+    ap.add_argument(
+        "--test-type",
+        default="",
+        help="Tier about to run; excluded from the output so a rerun "
+        "of the same tier is never suppressed by its own results.",
+    )
+    ap.add_argument(
+        "--horizon-days",
+        type=int,
+        default=int(os.getenv("SPYRE_REUSE_HORIZON_DAYS", "14")),
+        help="Ignore results older than this. Bounds how stale an "
+        "inherited pass can be.",
+    )
     ap.add_argument("--format", choices=["csv", "json"], default="csv")
     args = ap.parse_args()
 
     url = os.getenv("SPYRE_CH_URL", "").strip()
     db = os.getenv("SPYRE_CH_V2_DB", "").strip()
     if not url or not db:
-        print("resolve_covered_tiers: SPYRE_CH_URL/SPYRE_CH_V2_DB unset -- "
-              "running the full tier", file=sys.stderr)
+        print(
+            "resolve_covered_tiers: SPYRE_CH_URL/SPYRE_CH_V2_DB unset -- "
+            "running the full tier",
+            file=sys.stderr,
+        )
         _emit([], args.format)
         return
 
     try:
         tiers = covered_tiers(
-            url, os.getenv("SPYRE_CH_USER", "default"),
-            os.getenv("SPYRE_CH_TOKEN", ""), db,
-            args.commit_sha, args.arch, args.horizon_days,
+            url,
+            os.getenv("SPYRE_CH_USER", "default"),
+            os.getenv("SPYRE_CH_TOKEN", ""),
+            db,
+            args.commit_sha,
+            args.arch,
+            args.horizon_days,
         )
     except Exception as exc:  # noqa: BLE001
-        print(f"resolve_covered_tiers: lookup failed ({exc}) -- "
-              f"running the full tier", file=sys.stderr)
+        print(
+            f"resolve_covered_tiers: lookup failed ({exc}) -- running the full tier",
+            file=sys.stderr,
+        )
         _emit([], args.format)
         return
 
     requested = args.test_type.strip()
     tiers = [t for t in tiers if t != requested]
-    print(f"resolve_covered_tiers: already covered for {args.commit_sha[:12]} "
-          f"[{args.arch}]: {tiers or 'nothing'}", file=sys.stderr)
+    print(
+        f"resolve_covered_tiers: already covered for {args.commit_sha[:12]} "
+        f"[{args.arch}]: {tiers or 'nothing'}",
+        file=sys.stderr,
+    )
     _emit(tiers, args.format)
 
 
