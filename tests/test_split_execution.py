@@ -39,7 +39,7 @@ _PIPELINE_DEPTH = 4
 
 
 def _sync_all(device: torch.device) -> None:
-    """Drain both S_dev and S_prep (ID 65). Safe to call with the split on or off."""
+    """Drain both S_dev and S_prep (ID 65). Ensures both streams are completely idle before checking results"""
     torch.accelerator.synchronize(device)
     prep = _spyre_C.host_compute_stream_by_id(_HOST_COMPUTE_STREAM_START, device)
     prep.synchronize()
