@@ -418,6 +418,19 @@ def test_low_precision_compiles_and_accurate(op_name, dtype, tol):
     CPU fallback included.  Scoring against the original tensor would charge the
     decomposition for that and mask the thing under test; bf16 is unaffected
     (H2D is bit-exact) and takes the same path here.
+
+    Codegen note, recorded for future reference and not addressed here: this is
+    the one path whose intermediates do not all fit in LX.  ``output_code.py``
+    under ``TORCH_COMPILE_DEBUG=1`` shows a single 25-OpSpec fused kernel
+    (identical for fp16 and bf16) in which ``OpSpec(op='dl16tofp32')`` at op #0
+    writes its widened fp32 to an HBM pool buffer rather than to LX -- re-read
+    twice, since the widened value has two users -- and op #23 writes back to
+    that same buffer for ``OpSpec(op='fp32todl16')`` at op #24 to narrow into the
+    output.  So two intermediates round-trip through HBM, both belonging to the
+    conversions rather than to the polynomial; the fp32 and integral paths keep
+    every intermediate in LX with one HBM write for the result.  Worth revisiting
+    only if an fp16 cos/sin call site turns out to be hot -- every supported
+    model is fp32 here.
     """
     op = getattr(torch, op_name)
     x = torch.linspace(-1000.0, 1000.0, 4096, dtype=dtype)
@@ -488,6 +501,22 @@ def test_integral_promotes_on_device(op_name, dtype, cast_offloads):
       than read the buffer back shuffled.  A device-computed bool takes the
       native path, and bool -> fp16 is an IDENTITY byte copy that is safe even
       from host.  So this offload is a correctness guard, not a gap.
+
+    The split is visible in ``output_code.py`` under ``TORCH_COMPILE_DEBUG=1``,
+    and it is the *only* difference between these dtypes: the FX graph is
+    identical for all of them -- one
+    ``prims.convert_element_type(arg0_1, torch.float32)`` node ahead of the
+    polynomial nodes -- so the divergence is entirely in how that one node
+    lowers.  int32 fuses it into the kernel as ``OpSpec(op='int32tofp32')`` at op
+    #0, widening ``IEEE_INT32`` straight into LX at no HBM cost; int64 / int8 /
+    host-bool instead emit
+    ``buf0 = torch.ops.spyre.to_dtype_cpu.default(arg0_1, torch.float32)`` in
+    ``call()`` ahead of the kernel, whose OpSpec list then starts at ``mul``.
+    Recorded for future reference rather than as a task: it is a D2H+H2D round
+    trip on an unaligned buffer, but the polynomial is unaffected either way --
+    every remaining op stays on device with all intermediates in LX and one HBM
+    write for the result -- and no LLM workload calls cos/sin on an integral
+    tensor today.
 
     ``cast_offloads`` records which dtypes offload, and the allowance is by
     warning text so a cos/sin offload still fails the test.  Either way it is the
