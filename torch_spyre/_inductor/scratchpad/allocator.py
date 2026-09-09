@@ -1848,6 +1848,23 @@ def _enum_split_options(
     return _legal_split_options(op, options.values())
 
 
+def _intern_view_group(groups: dict[PerCoreView, int], view: PerCoreView) -> int:
+    """Group index of ``view`` among ``groups``, keyed by physical ownership.
+
+    A dict keyed on ``PerCoreView`` interns by structural equality, so two slot
+    spellings of one partition (``core_id`` and ``core_id % 4`` over four cores)
+    would become two groups and the solver would price two shuffles where one
+    copy serves both consumers. Look up by ``same_partition`` instead and only
+    then mint a new index; the first spelling seen stays the dict key.
+    """
+    for known, index in groups.items():
+        if known.same_partition(view):
+            return index
+    index = len(groups)
+    groups[view] = index
+    return index
+
+
 class CoOptimizingAllocator(ScratchpadAllocator):
     def __init__(
         self,
@@ -2664,13 +2681,16 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             candidates: list[RelayoutCandidate] = []
             # Destination views are interned per parent across every consumer
             # of this solve: two consumers whose candidates land on the same
-            # view of the same parent share one group, hence one shuffle.
+            # physical view of the same parent share one group, hence one
+            # shuffle (interned by ownership, so spelling cannot split a group).
             view_groups = self._relayout_view_groups.setdefault(parent, {})
             for i, pv in enumerate(prod_views):
                 if pv is None or _candidate_tiled(parent_divs[i]):
                     continue
                 for j, cv in enumerate(cons_views):
-                    if cv is None or pv == cv:
+                    # Physical ownership, not structural equality: two slot
+                    # spellings of one partition are a match, never a shuffle.
+                    if cv is None or pv.same_partition(cv):
                         continue
                     if _candidate_tiled(consumer_divs[j]):
                         continue
@@ -2707,7 +2727,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                                 consumer=consumer_op.get_name(),
                                 source_division=i,
                                 consumer_division=j,
-                                group=view_groups.setdefault(cv, len(view_groups)),
+                                group=_intern_view_group(view_groups, cv),
                                 source_view=pv,
                                 destination_view=cv,
                                 num_cores=ncores,

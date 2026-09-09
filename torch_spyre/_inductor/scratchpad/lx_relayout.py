@@ -119,7 +119,7 @@ class RelayoutCandidate:
     cost_ns: float
 
     def __post_init__(self) -> None:
-        if self.source_view == self.destination_view:
+        if self.source_view.same_partition(self.destination_view):
             raise ValueError(
                 f"relayout candidate {self.parent} -> {self.consumer} has equal "
                 "views; that pair belongs to cd_parent_matches"
@@ -216,8 +216,12 @@ class RelayoutSegment:
             for m in members[1:]:
                 agree = (
                     m.candidate.source_division == first.candidate.source_division
-                    and m.candidate.source_view == first.candidate.source_view
-                    and m.candidate.destination_view == first.candidate.destination_view
+                    and m.candidate.source_view.same_partition(
+                        first.candidate.source_view
+                    )
+                    and m.candidate.destination_view.same_partition(
+                        first.candidate.destination_view
+                    )
                     and m.candidate.num_cores == first.candidate.num_cores
                     and m.destination_address == first.destination_address
                 )
@@ -545,6 +549,71 @@ def movement_supported(
     )
 
 
+def solver_relayout_movement_supported(
+    source: PerCoreView, destination: PerCoreView, num_cores: int
+) -> bool:
+    """The movement shapes the solver may PRICE: uniform full permutations only.
+
+    Two gates answer two different questions. The committed path's movement gate
+    (``_compatible_partitions`` today; ``movement_supported`` once the
+    ownership-flow rewrite lands, widened to grouped gathers and broadcasts by
+    #3440) decides what the emitter CAN move. This gate decides what the fitted
+    relayout law can price, which is narrower and must stay narrower however the
+    committed gate grows: ``relayout_ns`` was fitted on uniform permutations,
+    where every core sends to and receives from the same number of cores, both
+    sides have ``num_cores`` distinct owners, and both split products equal
+    ``num_cores``. Pricing a multicast or a broadcast with permutation constants
+    would hand the objective a number the law never measured, so such pairs are
+    declined here and stay unpriced until their own term is calibrated.
+
+    Deliberately self-contained (it shares only ``_core_slices`` with the
+    committed gate) so the committed gate can be replaced underneath without
+    the solver's admission set changing by accident. The contract is
+    "never looser than the committed gate", pinned by
+    ``test_solver_gate_is_never_looser_than_the_committed_gate``.
+    """
+    if source.same_partition(destination):
+        return False
+    source_rows = _core_slices(source, num_cores)
+    destination_rows = _core_slices(destination, num_cores)
+    source_splits = dict(source.work_slice_dims)
+    destination_splits = dict(destination.work_slice_dims)
+    if (
+        math.prod(source_splits.values()) != num_cores
+        or math.prod(destination_splits.values()) != num_cores
+    ):
+        return False
+    distinct = lambda rows: len({tuple(sorted(r.items())) for r in rows.values()})  # noqa: E731
+    if distinct(source_rows) != num_cores or distinct(destination_rows) != num_cores:
+        return False
+
+    def slices_overlap(a: int, an: int, b: int, bn: int) -> bool:
+        # Slot a of an equal parts against slot b of bn equal parts, as
+        # half-open intervals on the same unit axis.
+        return a * bn < (b + 1) * an and b * an < (a + 1) * bn
+
+    dims = set(source_splits) | set(destination_splits)
+    edges = {
+        (s_core, d_core)
+        for s_core, s_slice in source_rows.items()
+        for d_core, d_slice in destination_rows.items()
+        if all(
+            slices_overlap(
+                s_slice.get(dim, 0),
+                source_splits.get(dim, 1),
+                d_slice.get(dim, 0),
+                destination_splits.get(dim, 1),
+            )
+            for dim in dims
+        )
+    }
+    if not edges:
+        return False
+    fanout = {sum(src == core for src, _ in edges) for core in range(num_cores)}
+    fanin = {sum(dst == core for _, dst in edges) for core in range(num_cores)}
+    return len(fanout) == 1 and len(fanin) == 1
+
+
 def _single_write(op: ComputedBuffer, name: str) -> MemoryDep | None:
     writes = [
         dep
@@ -673,12 +742,14 @@ def solver_relayout_pair_cost(
 
     ``None`` when the pair cannot host a relayout, or should not be offered:
 
-    - equal views need no relayout (that pair belongs to ``cd_parent_matches``);
-    - ``_compatible_partitions`` rejects everything but a full permutation
-      (uniform fanout/fanin, ``num_cores`` distinct owners on BOTH sides, split
-      products equal to ``num_cores``) - grouped gathers (#3440) fall out here,
-      exactly as on the committed path, and stay unpriced until their own term
-      is calibrated;
+    - views with the same physical ownership need no relayout (that pair
+      belongs to ``cd_parent_matches``), compared with ``same_partition`` so a
+      differently spelled slot expression cannot masquerade as movement;
+    - ``solver_relayout_movement_supported`` rejects everything but a uniform
+      full permutation (``num_cores`` distinct owners on BOTH sides, split
+      products equal to ``num_cores``, uniform fanout/fanin) - grouped gathers
+      and broadcasts (#3440) fall out here and stay unpriced until their own
+      term is calibrated, whatever the committed path's movement gate admits;
     - a governing split outside the law's fitted range [2, 8] is DECLINED, not
       clamped: the reporting path clamps because the shuffle it prices already
       exists, but the solver must never be offered an option at a price the
@@ -691,9 +762,7 @@ def solver_relayout_pair_cost(
     its split); the caller's cores_used equality gate guarantees that, and
     ``_core_slices`` asserts it rather than tolerating an out-of-range slot.
     """
-    if source_view == destination_view:
-        return None
-    if not _compatible_partitions(source_view, destination_view, num_cores):
+    if not solver_relayout_movement_supported(source_view, destination_view, num_cores):
         return None
     run_elems, split = governing_run_split(source_view, destination_view, device_dims)
     if run_elems <= 0 or not 2 <= split <= 8:
