@@ -30,7 +30,7 @@ import warnings
 from pathlib import Path
 
 import torch_spyre
-from torch_spyre.ops.eager import RetileWarning
+from torch_spyre.ops.eager import HostStagedCopyWarning, RetileWarning
 from torch_spyre.ops.fallbacks import FallbackWarning
 
 
@@ -148,7 +148,7 @@ class TestFallbacks(TestCase):
             self.assertEqual(id(buffer_spyre), id(output_spyre))
 
 
-_WARNING_TYPES = (FallbackWarning, RetileWarning)
+_WARNING_TYPES = (FallbackWarning, RetileWarning, HostStagedCopyWarning)
 _IMPORT_TIMEOUT_S = 130  # Hang guard for the subprocess's torch import.
 
 
