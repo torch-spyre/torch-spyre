@@ -502,6 +502,7 @@ jobs:
 
       - name: Upload JUnit XML report
         if: always()
+        continue-on-error: true  # transient artifact-service 403s must not fail a job whose tests passed
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: ${{ env.REPORT_NAME }}
@@ -857,6 +858,7 @@ jobs:
 
       - name: Upload JUnit XML report
         if: always()
+        continue-on-error: true  # transient artifact-service 403s must not fail a job whose tests passed
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: ${{ env.REPORT_NAME }}
@@ -1075,6 +1077,7 @@ jobs:
       # overwrite: true replaces the failed first attempt's report (same REPORT_NAME) so downstream consumers see only the corrected result, not a name conflict.
       - name: Upload JUnit XML report
         if: always()
+        continue-on-error: true  # transient artifact-service 403s must not fail a job whose tests passed
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: ${{ env.REPORT_NAME }}
@@ -1181,6 +1184,7 @@ jobs:
 
       - name: Upload JUnit XML report
         if: always()
+        continue-on-error: true  # transient artifact-service 403s must not fail a job whose tests passed
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: ${{ env.REPORT_NAME }}
