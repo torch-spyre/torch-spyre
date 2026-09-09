@@ -659,7 +659,7 @@ def must_split_vars(
             best = best_within or best_above
 
             if best is None:
-                logger.warning(
+                logger.info(
                     f"No valid split combo found for tensor {td.dep.name} "
                     f"coord={coord} under accumulated_splits={accumulated_splits}. "
                     f"Skipping."

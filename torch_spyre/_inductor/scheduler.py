@@ -645,7 +645,7 @@ def verify_carried_reduction_ownership(
                 f"non-device layout {type(layout).__name__}"
             )
         if "lx" not in layout.allocation:
-            logger.warning(
+            logger.info(
                 "carried reduction %s remained in HBM; execution is correct but "
                 "the persistent-LX performance contract was not realized",
                 record.accumulator_name,

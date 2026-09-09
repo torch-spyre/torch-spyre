@@ -5714,8 +5714,8 @@ class TestCoarseTileReductionDim0E2E(InductorTestCase):
         torch.testing.assert_close(carried_result, ordinary_result, atol=1.0, rtol=0.05)
         torch.testing.assert_close(carried_result, cpu_result, atol=1.0, rtol=0.05)
 
-    def test_carried_sum_hbm_fallback_is_correct_and_visible(self):
-        """Capacity spill keeps correct execution and emits a warning."""
+    def test_carried_sum_hbm_fallback_is_correct(self):
+        """Capacity spill keeps correct execution."""
 
         E, T, H = 2, 64, 64
         values = torch.randn(E, T, H, dtype=torch.float16) * 0.1
@@ -5743,7 +5743,6 @@ class TestCoarseTileReductionDim0E2E(InductorTestCase):
                     "dxp_lx_frac_avail": 1.0,
                 }
             ),
-            self.assertLogs("spyre.inductor.scheduler", level="WARNING") as logs,
         ):
             compare_with_cpu(
                 fn,
@@ -5754,7 +5753,6 @@ class TestCoarseTileReductionDim0E2E(InductorTestCase):
                 atol=0.05,
                 rtol=0.05,
             )
-        self.assertTrue(any("remained in HBM" in line for line in logs.output))
 
     def test_carried_sum_requires_explicit_work_div(self):
         """Without row ownership, the existing reduction path is unchanged."""
