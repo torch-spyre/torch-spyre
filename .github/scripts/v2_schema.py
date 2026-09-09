@@ -17,6 +17,15 @@ Nothing here may be imported from another repo or installed as a package: this f
 and a drift check keeps the copies honest. Per-repo variation is one constant, COMPONENT,
 which is why a class hierarchy would have been the wrong shape.
 
+WHY NOT THE DRIVER'S OWN SCHEMA SUPPORT. clickhouse-connect has none to use. Its `ColumnDef`
+is what DESCRIBE TABLE returns -- it reads a live table's schema, it cannot declare one or check
+a row against it -- and `Client.insert` takes "a sequence of sequences" plus an ordered column-name
+list, so positional rows are the native API shape rather than a style choice here. Passing
+`column_names='*'` only moves the order to whatever the server currently reports, which couples
+every row to the live DDL instead of removing the hazard. A declarative layer does exist in
+clickhouse-sqlalchemy, and it would subsume most of this file -- but adding a dependency is what
+the `uv run --no-project` runtime above rules out. Revisit if that constraint ever lifts.
+
 WHAT IT DELIBERATELY DOES NOT DO. No runtime type coercion (duration_s typed Float32 accepts
 a str), no ClickHouse type mapping, and no identity computation -- run_id and test_case_id
 arrive already computed by the uuid5 helpers, which are untouched by design: changing them

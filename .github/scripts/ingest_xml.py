@@ -23,14 +23,20 @@ import os
 import platform as _platform
 import sys
 
-import v2_schema
 import uuid
 import xml.etree.ElementTree as etree
 from collections import Counter, defaultdict
 from datetime import UTC, datetime
 from pathlib import Path
 
+# v2_schema is a SIBLING file, not an installed package: this script is copied into three
+# repos and run by path (`uv run --no-project .../ingest_xml.py`), so its own directory is only
+# on sys.path when it is the entry point. A test that loads it via spec_from_file_location, or
+# any caller importing it as a module, would otherwise fail at this import.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
 import clickhouse_connect
+import v2_schema
 import regex as re
 
 # ---------------------------------------------------------------------------
