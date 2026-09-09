@@ -136,6 +136,10 @@ class SDSCSpec:
     )
     indirect_access_indices: list[int] = dataclasses.field(default_factory=list)
     debug_handle: DebugHandle | None = None
+    # Index of "samv-maskvalue" in constants_. Constant ids are assigned by
+    # insertion order, so this is only 0 when the op carries no other constants;
+    # ops that do (mean/avgpool add scaling_factor first) shift it (see #4390).
+    masking_const_id: int = -1
     # Generic pool/window fields.  Neutral defaults mean generate_sdsc treats a
     # non-pool op exactly as before; parse_op_spec fills these for pool ops via
     # _avgpool_sdsc_fields, so compute_ops.py stays free of op-specific logic.
@@ -2237,7 +2241,11 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
     coordinate_masking = _get_coordinate_mask(
         sdsc_iteration_space, args[-1], padding, op_spec.op
     )
+    masking_const_id = -1
     if coordinate_masking:
+        # Constant ids follow insertion order, so capture the index here rather
+        # than assuming 0 -- ops with their own constants shift it (see #4390).
+        masking_const_id = len(constants)
         constants["samv-maskvalue"] = _get_mask_value(op_spec.op)
 
     # Forward conv2d (#3284), like matmul, counts only the non-output args as
@@ -2385,6 +2393,7 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
             layouts=layouts,
             args=args,
             constants=constants,
+            masking_const_id=masking_const_id,
             conv_params=conv_params,
             coordinate_masking=coordinate_masking,
             symbolic_dims=symbolic_dims,

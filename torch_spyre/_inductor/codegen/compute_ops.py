@@ -1391,9 +1391,7 @@ def generate_sdsc(
                                 str(dim): mask_range
                                 for dim, mask_range in sdsc_spec.coordinate_masking.items()
                             },
-                            "maskingConstId_": 0
-                            if sdsc_spec.coordinate_masking
-                            else -1,
+                            "maskingConstId_": sdsc_spec.masking_const_id,
                             # Emit dimToSymbolMapping_ only when there are symbolic dims;
                             # the runtime uses it to bind runtime shape values to symbols.
                             **(
