@@ -5830,6 +5830,48 @@ class TestInsertAllReadCopyOps(unittest.TestCase):
         self.assertTrue(hasattr(copy_buf, "loop_info"))
         self.assertEqual(full_deps[0].name, entry.dep.name)
 
+    def test_read_copy_observes_late_source_layout_offset(self):
+        """A generated copy must not freeze the source's initial offset.
+
+        Eager graph-input view offsets are attached during layout propagation,
+        after pre-stickify coarse tiling inserts read copies.  Model that pass
+        ordering by changing the source layout offset after copy insertion and
+        verify the synthesized body reads from the repaired position.
+        """
+        from torch._inductor.ir import ComputedBuffer
+
+        from torch_spyre._inductor.pass_utils import invalidate_op_read_writes
+        from torch_spyre._inductor.wsr.coarse_tile import (
+            _insert_all_read_copy_ops,
+            _plan_read_copies,
+        )
+
+        tiled_op, _full_deps, operations = _make_full_buffer_read_fixture()
+        source_buf = operations[0]
+        source_buf.layout.offset = Integer(64)
+        invalidate_op_read_writes(tiled_op)
+        plans = _plan_read_copies(operations, [((0,), [tiled_op], {})])
+        entry = plans[(0,)].entries[0]
+
+        _insert_all_read_copy_ops(operations, plans)
+        copy_buf = next(
+            op
+            for op in operations
+            if isinstance(op, ComputedBuffer) and op.get_name() == entry.copy_name
+        )
+        source_buf.layout.offset = Integer(512)
+
+        class _Recorder(list):
+            def load(self, name, index):
+                self.append((name, index))
+                return 0.0
+
+        reads = _Recorder()
+        with V.set_ops_handler(reads):
+            copy_buf.data.inner_fn([Integer(2), Integer(3)])
+
+        self.assertEqual(reads, [(source_buf.get_name(), Integer(771))])
+
     def test_invariant_broadcast_copy_drops_absent_loop_dim(self):
         """A fixed [H] input read by an [E,H] loop is staged as [H], not
         materialized as the expanded [E,H] view."""
