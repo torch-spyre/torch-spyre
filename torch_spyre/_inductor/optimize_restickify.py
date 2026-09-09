@@ -287,10 +287,25 @@ class FixedInOutNode(RestickNodeCost):
         ]
         return cls(edge_costs, required_out_stl=out_stl, required_in_stls=req_stls)
 
+    def _out_stick_compatible(self, out_stl: "SpyreTensorLayout") -> bool:
+        """True if out_stl is stick-compatible with required_out_stl."""
+        if out_stl == self.required_out_stl:
+            return True
+        ec = self.edge_costs[0]
+        needed, _ = compute_restickify_needed(
+            self.required_out_stl,
+            ec._target_dep_layout,
+            ec._target_dep,
+            out_stl,
+            ec._target_dep,
+            None,
+        )
+        return not needed
+
     def cost(
         self, in_layouts: "list[SpyreTensorLayout]", out_stl: "SpyreTensorLayout"
     ) -> float:
-        if out_stl != self.required_out_stl:
+        if not self._out_stick_compatible(out_stl):
             return INF
         return sum(
             ec.cost(lk, rk)
@@ -301,7 +316,7 @@ class FixedInOutNode(RestickNodeCost):
         return list(zip(self.edge_costs, self.required_in_stls))
 
     def min_input_cost(self, dep_name, in_stl, out_stl):
-        if out_stl != self.required_out_stl:
+        if not self._out_stick_compatible(out_stl):
             return INF
         matching = [
             (ec, req)
