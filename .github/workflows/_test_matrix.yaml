@@ -162,6 +162,8 @@ on:
         required: false
       CLICKHOUSE_DB:
         required: false
+      SPYRE_CH_TOKEN:
+        required: false
 
 defaults:
   run:
@@ -275,9 +277,11 @@ jobs:
               --arch "${DELTA_ARCH}" \
               --test-type "${RAW_TEST_TYPE}" || true)
           fi
-          _delta_args=""
+          # Array, not a string: expands to zero words when empty, so no unquoted
+          # word-splitting is needed to pass 0-or-2 args.
+          _delta_args=()
           if [ -n "${EXCLUDE_TIERS}" ]; then
-            _delta_args="--exclude-tiers ${EXCLUDE_TIERS}"
+            _delta_args=(--exclude-tiers "${EXCLUDE_TIERS}")
             echo "tier delta: skipping configs already covered by ${EXCLUDE_TIERS}"
           fi
 
@@ -285,14 +289,14 @@ jobs:
             matrix=$(python3 tests/oot_framework/utils/filter_configs.py \
               --config-dir tests/configs \
               --test-type "${RAW_TEST_TYPE}" \
-              ${_delta_args} \
+              "${_delta_args[@]}" \
               --runner-map .github/runner_overrides.yaml \
               --format matrix-json)
           else
             matrix=$(python3 tests/oot_framework/utils/filter_configs.py \
               --config-dir tests/configs/torch_spyre_tests \
               --test-type "${RAW_TEST_TYPE}" \
-              ${_delta_args} \
+              "${_delta_args[@]}" \
               --runner-map .github/runner_overrides.yaml \
               --format matrix-json)
           fi

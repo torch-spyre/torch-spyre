@@ -21,15 +21,15 @@ Usage (called by the GHA workflow):
 import argparse
 import os
 import platform as _platform
-import regex as re
 import sys
 import uuid
+import xml.etree.ElementTree as etree
 from collections import Counter, defaultdict
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
-import xml.etree.ElementTree as etree
 import clickhouse_connect
+import regex as re
 
 # ---------------------------------------------------------------------------
 # Helpers shared by both pipelines
@@ -123,7 +123,7 @@ def parse_benchmark_xml(
     try:
         created_at = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
     except ValueError:
-        created_at = datetime.now(timezone.utc)
+        created_at = datetime.now(UTC)
 
     # ── extract testsuite-level version_info ───────────────────────────────
     version_info = None
@@ -293,7 +293,7 @@ def parse_kernel_xml(
             suite.get("timestamp", "").replace("Z", "+00:00")
         )
     except ValueError:
-        created_at = datetime.now(timezone.utc)
+        created_at = datetime.now(UTC)
 
     version_info = None
     suite_props = suite.find("properties")
@@ -446,16 +446,14 @@ def v2_benchmark_id(name: str, tags, disc=None) -> str:
         return ""
     tag_part = ",".join(sorted({_v2_norm(t) for t in (tags or []) if _v2_norm(t)}))
     disc = disc or {}
-    disc_part = ",".join(
-        f"{k}={_v2_norm(disc.get(k))}" for k in _V2_BENCH_ID_KEYS
-    )
-    return str(
-        uuid.uuid5(V2_NAMESPACE, f"{_v2_norm(name)}|{tag_part}|{disc_part}")
-    )
+    disc_part = ",".join(f"{k}={_v2_norm(disc.get(k))}" for k in _V2_BENCH_ID_KEYS)
+    return str(uuid.uuid5(V2_NAMESPACE, f"{_v2_norm(name)}|{tag_part}|{disc_part}"))
 
 
 def v2_benchmark_tables_present(client) -> bool:
-    return _table_exists(client, "benchmarks") and _table_exists(client, "benchmark_runs")
+    return _table_exists(client, "benchmarks") and _table_exists(
+        client, "benchmark_runs"
+    )
 
 
 def v2_benchmarks_already_ingested(client, run_id: str) -> bool:
@@ -850,7 +848,7 @@ def parse_test_xml(xml_path: Path):
     try:
         triggered_at = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
     except ValueError:
-        triggered_at = datetime.now(timezone.utc)
+        triggered_at = datetime.now(UTC)
 
     raw_cases = []
     for tc in suite.findall(".//testcase"):
@@ -1147,7 +1145,12 @@ def v2_test_case_id(component: str, classname: str, name: str, tags) -> str:
         uuid.uuid5(
             V2_NAMESPACE,
             V2_SEP.join(
-                (_v2_norm(component), _v2_norm(classname), _v2_norm(name), ",".join(norm))
+                (
+                    _v2_norm(component),
+                    _v2_norm(classname),
+                    _v2_norm(name),
+                    ",".join(norm),
+                )
             ),
         )
     )
@@ -1200,7 +1203,9 @@ def v2_source_and_external_run_id(args, run_id: str):
 def v2_tables_present(client) -> bool:
     """v2 write path is skipped unless BOTH tables exist, so this script can be
     deployed before the migration without erroring on every run."""
-    return _table_exists(client, "test_case_runs") and _table_exists(client, "test_cases")
+    return _table_exists(client, "test_case_runs") and _table_exists(
+        client, "test_cases"
+    )
 
 
 def v2_already_ingested(client, run_id: str, component: str) -> bool:
@@ -1234,7 +1239,9 @@ def v2_new_identity_rows(client, table: str, id_col: str, ident_rows: dict) -> l
             parameters={"ids": ids},
         ).result_rows
     }
-    return [row for i, row in ident_rows.items() if str(i) not in {str(k) for k in known}]
+    return [
+        row for i, row in ident_rows.items() if str(i) not in {str(k) for k in known}
+    ]
 
 
 def insert_v2(client, component: str, run_id: str, cases: list) -> int:
@@ -1395,7 +1402,7 @@ def main():
 
     print(
         f"Connecting to ClickHouse at "
-        f"{os.environ['CLICKHOUSE_HOST']}:{os.environ.get('CLICKHOUSE_PORT', 443)} ..."
+        f"{os.environ['CLICKHOUSE_HOST']}:{os.environ.get('CLICKHOUSE_PORT', '443')} ..."
     )
     client = get_client()
     # Separate connection for the v2 tables -- see get_v2_client() for why sharing v1's
@@ -1403,8 +1410,10 @@ def main():
     # "v2 not configured" and skips.
     v2client = get_v2_client() if args.write_v2 else None
     if args.write_v2 and v2client is None:
-        print("  WARN --schema asked for v2 but CLICKHOUSE_DB_V2 is unset — v2 rows skipped",
-              file=sys.stderr)
+        print(
+            "  WARN --schema asked for v2 but CLICKHOUSE_DB_V2 is unset — v2 rows skipped",
+            file=sys.stderr,
+        )
     client.command("SELECT 1")
     print("Connected.\n")
 
@@ -1608,7 +1617,7 @@ def main():
             print(
                 f"  run_id={run_id}  tests={run['total_tests']}  "
                 f"passed={run['passed']}  failed={run['failed']}"
-                + (f" (of which errors={run['errors']})" if run['errors'] else "")
+                + (f" (of which errors={run['errors']})" if run["errors"] else "")
                 + f"  xpass={run['xpass']}  xfail={run['xfail']}  skipped={run['skipped']}"
             )
 
@@ -1645,7 +1654,10 @@ def main():
                         _n = insert_v2(v2client, V2_COMPONENT, _v2_run_id, cases)
                         print(f"  v2: {_n} test_case_runs under run_id={_v2_run_id}")
             except Exception as _v2_err:
-                print(f"  [warn] v2 write failed, v1 unaffected: {_v2_err!r}", file=sys.stderr)
+                print(
+                    f"  [warn] v2 write failed, v1 unaffected: {_v2_err!r}",
+                    file=sys.stderr,
+                )
 
             total_cases += len(cases)
             if args.write_v1:
