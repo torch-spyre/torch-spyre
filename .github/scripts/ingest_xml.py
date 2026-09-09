@@ -906,15 +906,33 @@ def parse_test_xml(xml_path: Path):
 # ---------------------------------------------------------------------------
 
 
-def get_client():
+def get_client(database: str | None = None):
     return clickhouse_connect.get_client(
         host=os.environ["CLICKHOUSE_HOST"],
         port=int(os.environ.get("CLICKHOUSE_PORT", 443)),
         user=os.environ.get("CLICKHOUSE_USER", "default"),
         password=os.environ["CLICKHOUSE_PASS"],
-        database=os.environ.get("CLICKHOUSE_DB", "spyre"),
+        database=database or os.environ.get("CLICKHOUSE_DB", "spyre"),
         secure=True,
     )
+
+
+def get_v2_client():
+    """A SECOND connection, bound to the v2 database, or None when none is configured.
+
+    v2 needs its own connection rather than sharing v1's: `benchmark_runs` exists in BOTH
+    generations with incompatible shapes -- v1's has (run_id UInt64, source_file), v2's has
+    (run_id UUID) and no source_file -- so the two dedup queries, both naming the table
+    unqualified, cannot both resolve correctly through one `database=`. Verified on prod:
+    spyre.benchmark_runs has source_file, spyre_v2.benchmark_runs does not.
+
+    Returns None when CLICKHOUSE_DB_V2 is unset, which is what makes --schema v1 (the default)
+    cost nothing: no second connection is opened.
+    """
+    db = os.environ.get("CLICKHOUSE_DB_V2", "").strip()
+    if not db:
+        return None
+    return get_client(database=db)
 
 
 def insert_run(client, run_id: str, run: dict, args):
@@ -1339,7 +1357,29 @@ def main():
         "The benchmark XML carries no per-case platform tag, so the caller "
         "supplies it; defaults to the ingest host's arch.",
     )
+    # Which schema generation to write. Defaults to v1 ONLY, so an un-updated caller keeps
+    # behaving exactly as before -- this script runs from inside a BAKED image, so old images
+    # and new ones coexist for as long as it takes every product image to be rebuilt.
+    #
+    # v1 is not a permanent home: test_runs, run_properties, perf_benchmarks and perf_kernels
+    # have NO v2 equivalent because v2 replaces them outright -- run_properties becomes
+    # test_cases.tags, test_runs is derivable from test_case_runs, and the two perf tables
+    # collapse into benchmarks + benchmark_runs. The v2 DDL in spyre-frameworks deliberately
+    # does not define them. Both is the migration window; v2 is the destination.
+    parser.add_argument(
+        "--schema",
+        choices=["v1", "v2", "both"],
+        default=os.environ.get("INGEST_SCHEMA", "v1"),
+        help="Which schema generation to write: v1 (default, the legacy tables), v2 (the "
+        "replacement tables only), or both (the migration window). Also settable via "
+        "INGEST_SCHEMA so a workflow can set it once for every leg.",
+    )
     args = parser.parse_args()
+    # Resolved once here rather than re-tested at each call site, so the two paths cannot
+    # drift into disagreeing about what was asked for.
+    args.write_v1 = args.schema in ("v1", "both")
+    args.write_v2 = args.schema in ("v2", "both")
+    print(f"  schema={args.schema} (v1={args.write_v1} v2={args.write_v2})")
 
     if args.xml_file:
         xml_files = [Path(args.xml_file)]
@@ -1358,16 +1398,23 @@ def main():
         f"{os.environ['CLICKHOUSE_HOST']}:{os.environ.get('CLICKHOUSE_PORT', 443)} ..."
     )
     client = get_client()
+    # Separate connection for the v2 tables -- see get_v2_client() for why sharing v1's
+    # cannot work. None when CLICKHOUSE_DB_V2 is unset, which every v2 site treats as
+    # "v2 not configured" and skips.
+    v2client = get_v2_client() if args.write_v2 else None
+    if args.write_v2 and v2client is None:
+        print("  WARN --schema asked for v2 but CLICKHOUSE_DB_V2 is unset — v2 rows skipped",
+              file=sys.stderr)
     client.command("SELECT 1")
     print("Connected.\n")
 
-    # CREATE TABLE IF NOT EXISTS elsewhere won't add a column to an existing table
-    client.command(
-        "ALTER TABLE benchmark_runs ADD COLUMN IF NOT EXISTS workflow String DEFAULT ''"
-    )
-    client.command(
-        "ALTER TABLE benchmark_runs ADD COLUMN IF NOT EXISTS platform String DEFAULT ''"
-    )
+    # No schema mutation here, deliberately. This used to ALTER benchmark_runs on EVERY run to
+    # add workflow/platform -- a migration in the wrong place: it demanded DDL rights on every
+    # invocation, reshaped a table other producers share, and ran before any XML was read, so
+    # under --schema v2 it failed the whole ingest with UNKNOWN_TABLE for a v1 table nothing
+    # was going to write. Both columns have been live on prod for months, and the v2 tables
+    # have neither and need neither. Schema changes belong in the DDL, not in the writer;
+    # _absent_columns() below already degrades gracefully if a column really is missing.
 
     total_cases = 0
     total_benchmarks = 0
@@ -1408,26 +1455,30 @@ def main():
             if run_meta is None:
                 continue
 
-            existing = client.query(
-                "SELECT count() FROM benchmark_runs WHERE source_file = {sf:String}",
-                parameters={"sf": run_meta["source_file"]},
-            )
-            if existing.result_rows[0][0] > 0:
-                print(
-                    f"  Already ingested kernels — skipping {run_meta['source_file']}"
+            # v1-table read, so it only applies when v1 is being written. The v2 path has its
+            # own dedup (v2_benchmarks_already_ingested) against its own table.
+            if args.write_v1:
+                existing = client.query(
+                    "SELECT count() FROM benchmark_runs WHERE source_file = {sf:String}",
+                    parameters={"sf": run_meta["source_file"]},
                 )
-                continue
+                if existing.result_rows[0][0] > 0:
+                    print(
+                        f"  Already ingested kernels — skipping {run_meta['source_file']}"
+                    )
+                    continue
 
             run_id = uuid.uuid4().int >> 64
             print(f"  run_id={run_id}  kernels={len(kernels)}")
 
-            insert_benchmark_run(client, run_id, run_meta)
-            insert_perf_kernels(client, run_id, kernels)
+            if args.write_v1:
+                insert_benchmark_run(client, run_id, run_meta)
+                insert_perf_kernels(client, run_id, kernels)
 
             # Additive v2 write: the same measurements under a DERIVED run_id, so a
             # perf number can name the artifact it measured. Guarded on both tables
             # existing so this deploys before the migration.
-            if v2_benchmark_tables_present(client):
+            if v2client is not None and v2_benchmark_tables_present(v2client):
                 _src, _ext = v2_source_and_external_run_id(args, str(run_id))
                 _v2_run_id = v2_run_id(_src, _ext, args.platform or "", "perf")
                 if not _v2_run_id:
@@ -1436,10 +1487,10 @@ def main():
                         f"(source={_src!r} external_run_id={_ext!r})",
                         file=sys.stderr,
                     )
-                elif v2_benchmarks_already_ingested(client, _v2_run_id):
+                elif v2_benchmarks_already_ingested(v2client, _v2_run_id):
                     print(f"  v2: already ingested run_id={_v2_run_id} — skipping")
                 else:
-                    _n = insert_benchmarks_v2(client, _v2_run_id, kernels)
+                    _n = insert_benchmarks_v2(v2client, _v2_run_id, kernels)
                     print(f"  v2: {_n} benchmark_runs under run_id={_v2_run_id}")
 
             total_kernels += len(kernels)
@@ -1465,27 +1516,30 @@ def main():
                 continue
 
             # Deduplication: skip if source_file already in benchmark_runs
-            existing = client.query(
-                "SELECT count() FROM benchmark_runs WHERE source_file = {sf:String}",
-                parameters={"sf": run_meta["source_file"]},
-            )
-            if existing.result_rows[0][0] > 0:
-                print(
-                    f"  Already ingested benchmark — skipping {run_meta['source_file']}"
+            # Same as the kernel path above: a v1-table read, gated on v1 being written.
+            if args.write_v1:
+                existing = client.query(
+                    "SELECT count() FROM benchmark_runs WHERE source_file = {sf:String}",
+                    parameters={"sf": run_meta["source_file"]},
                 )
-                continue
+                if existing.result_rows[0][0] > 0:
+                    print(
+                        f"  Already ingested benchmark — skipping {run_meta['source_file']}"
+                    )
+                    continue
 
             # benchmark_runs.run_id is UInt64 — use a random 64-bit int
             run_id = uuid.uuid4().int >> 64  # positive 64-bit int
             print(f"  run_id={run_id}  benchmarks={len(benchmarks)}")
 
-            insert_benchmark_run(client, run_id, run_meta)
-            insert_perf_benchmarks(client, run_id, benchmarks)
+            if args.write_v1:
+                insert_benchmark_run(client, run_id, run_meta)
+                insert_perf_benchmarks(client, run_id, benchmarks)
 
             # Additive v2 write: the same measurements under a DERIVED run_id, so a
             # perf number can name the artifact it measured. Guarded on both tables
             # existing so this deploys before the migration.
-            if v2_benchmark_tables_present(client):
+            if v2client is not None and v2_benchmark_tables_present(v2client):
                 _src, _ext = v2_source_and_external_run_id(args, str(run_id))
                 _v2_run_id = v2_run_id(_src, _ext, args.platform or "", "perf")
                 if not _v2_run_id:
@@ -1494,10 +1548,10 @@ def main():
                         f"(source={_src!r} external_run_id={_ext!r})",
                         file=sys.stderr,
                     )
-                elif v2_benchmarks_already_ingested(client, _v2_run_id):
+                elif v2_benchmarks_already_ingested(v2client, _v2_run_id):
                     print(f"  v2: already ingested run_id={_v2_run_id} — skipping")
                 else:
-                    _n = insert_benchmarks_v2(client, _v2_run_id, benchmarks)
+                    _n = insert_benchmarks_v2(v2client, _v2_run_id, benchmarks)
                     print(f"  v2: {_n} benchmark_runs under run_id={_v2_run_id}")
 
             total_benchmarks += len(benchmarks)
@@ -1521,29 +1575,32 @@ def main():
             # Dedup on (run_id, filename): re-ingesting the SAME test run must be idempotent,
             # but two distinct runs must never collapse. runner_run_id mirrors run_id for a Jenkins/standalone leg, so it's only an independent signal for a GHA numeric id.
             runner_run_id = _runner_run_id(args, run_id)
-            existing = client.query(
-                "SELECT count() FROM test_runs "
-                "WHERE run_id = {run_id:String} AND filename = {filename:String}",
-                parameters={"run_id": run_id, "filename": run["filename"]},
-            )
-            if (
-                existing.result_rows[0][0] == 0
-                and runner_run_id
-                and runner_run_id != run_id
-            ):
-                # A GHA re-ingest mints a fresh uuid4, so fall back to the numeric run id
-                # to keep that path idempotent.
+            # v1-table reads, so gated on v1 being written. v2 dedups on its own table via
+            # v2_already_ingested(run_id, component).
+            if args.write_v1:
                 existing = client.query(
-                    "SELECT count() FROM test_runs WHERE "
-                    "runner_run_id = {runner_run_id:String} AND filename = {filename:String}",
-                    parameters={
-                        "runner_run_id": runner_run_id,
-                        "filename": run["filename"],
-                    },
+                    "SELECT count() FROM test_runs "
+                    "WHERE run_id = {run_id:String} AND filename = {filename:String}",
+                    parameters={"run_id": run_id, "filename": run["filename"]},
                 )
-            if existing.result_rows[0][0] > 0:
-                print(f"  Already ingested — skipping {run['filename']}")
-                continue
+                if (
+                    existing.result_rows[0][0] == 0
+                    and runner_run_id
+                    and runner_run_id != run_id
+                ):
+                    # A GHA re-ingest mints a fresh uuid4, so fall back to the numeric run id
+                    # to keep that path idempotent.
+                    existing = client.query(
+                        "SELECT count() FROM test_runs WHERE "
+                        "runner_run_id = {runner_run_id:String} AND filename = {filename:String}",
+                        parameters={
+                            "runner_run_id": runner_run_id,
+                            "filename": run["filename"],
+                        },
+                    )
+                if existing.result_rows[0][0] > 0:
+                    print(f"  Already ingested — skipping {run['filename']}")
+                    continue
             # `errors` is printed separately from `failed` even though it is a SUBSET of
             # it: a run whose outcomes are pytest errors could not start (bad import,
             # unloadable model), which is a different triage path from N regressions.
@@ -1555,15 +1612,16 @@ def main():
                 + f"  xpass={run['xpass']}  xfail={run['xfail']}  skipped={run['skipped']}"
             )
 
-            insert_run(client, run_id, run, args)
+            if args.write_v1:
+                insert_run(client, run_id, run, args)
 
-            # The (run_id, filename) dedup above already covers this file; a run_id-only recheck here would skip a second file sharing the same run_id.
-            insert_cases(client, run_id, cases, workflow=args.workflow)
-            insert_properties(client, run_id, cases)
+                # The (run_id, filename) dedup above already covers this file; a run_id-only recheck here would skip a second file sharing the same run_id.
+                insert_cases(client, run_id, cases, workflow=args.workflow)
+                insert_properties(client, run_id, cases)
 
             # v2 tables, alongside v1. Guarded so this script still runs against a
             # database where the migration has not landed.
-            if v2_tables_present(client):
+            if v2client is not None and v2_tables_present(v2client):
                 _v2_source, _v2_ext = v2_source_and_external_run_id(args, run_id)
                 _v2_tier = (getattr(args, "trigger_type", "") or "").strip()
                 _v2_run_id = v2_run_id(
@@ -1579,17 +1637,18 @@ def main():
                         f"--trigger-type is the field usually missing",
                         file=sys.stderr,
                     )
-                elif v2_already_ingested(client, _v2_run_id, V2_COMPONENT):
+                elif v2_already_ingested(v2client, _v2_run_id, V2_COMPONENT):
                     print(f"  v2: already ingested run_id={_v2_run_id} — skipping")
                 else:
-                    _n = insert_v2(client, V2_COMPONENT, _v2_run_id, cases)
+                    _n = insert_v2(v2client, V2_COMPONENT, _v2_run_id, cases)
                     print(f"  v2: {_n} test_case_runs under run_id={_v2_run_id}")
 
             total_cases += len(cases)
-            print(
-                f"  Inserted {len(cases)} test cases + "
-                f"{sum(len(c['properties']) for c in cases)} properties"
-            )
+            if args.write_v1:
+                print(
+                    f"  Inserted {len(cases)} test cases + "
+                    f"{sum(len(c['properties']) for c in cases)} properties"
+                )
 
     print(f"\nDone. {len(xml_files)} file(s) processed.")
     print(f"  Test cases ingested:  {total_cases}")
