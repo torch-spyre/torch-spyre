@@ -23,7 +23,7 @@ from typing import Mapping, Optional
 
 import torch
 
-from torch_spyre._C import DataFormats, get_device_dtype
+from torch_spyre._C import DataFormats, get_device_dtype, ElementArrangement
 from torch_spyre._inductor.constants import (
     IDENTITY_OP,
     DL16TOFP32_OP,
@@ -46,6 +46,20 @@ _BOOL_EQUIVALENT_DTYPES: Mapping[DataFormats, torch.dtype] = {
 def bool_equivalent_dtype(device_dtype: DataFormats) -> Optional[torch.dtype]:
     """Logical dtype matching a bool's physical format, or None if unsupported."""
     return _BOOL_EQUIVALENT_DTYPES.get(device_dtype)
+
+
+def _build_ea_map(fp16_dtypes: list) -> dict:
+    EA = ElementArrangement
+    FP32 = torch.float32
+
+    ea_map = {}
+    for FP16 in fp16_dtypes:
+        ea_map[(FP16, FP32, EA.STANDARD)] = EA.DL16_TO_FP32
+        ea_map[(FP16, FP32, EA.FP32_TO_DL16)] = EA.STANDARD
+        ea_map[(FP32, FP16, EA.STANDARD)] = EA.FP32_TO_DL16
+        ea_map[(FP32, FP16, EA.DL16_TO_FP32)] = EA.STANDARD
+
+    return ea_map
 
 
 def bool_layout_dtype(
@@ -138,6 +152,9 @@ class DtypeOpTable:
     # elements, so host bool InputBuffers feeding one must fall back to CPU.
     _STICK_REORDERING_OPS = {DL16TOFP32_OP, FP32TODL16_OP, FP8TODL16_OP}
 
+    _FP16_TYPES = [torch.float16, torch.bfloat16]
+    _EA_MAP = _build_ea_map(_FP16_TYPES)
+
     @classmethod
     def get_operator(
         cls, src_dtype: torch.dtype, dst_dtype: torch.dtype
@@ -219,3 +236,23 @@ class DtypeOpTable:
     def op_names(cls) -> frozenset[str]:
         """All op names this table can produce (e.g. for op-name validation)."""
         return frozenset(cls._TYPECAST_OP_NAMES)
+
+    @classmethod
+    def fp16_types(cls) -> list:
+        return cls._FP16_TYPES
+
+    @classmethod
+    def ea_map(cls, src_dtype, dst_dtype, src_ea) -> ElementArrangement:
+        fmt = cls._EA_MAP.get((src_dtype, dst_dtype, src_ea))
+        if fmt is not None:
+            return fmt
+
+        if (src_dtype in cls._FP16_TYPES and dst_dtype == torch.float32) or (
+            src_dtype == torch.float32 and dst_dtype in cls._FP16_TYPES
+        ):
+            raise Unsupported(
+                f"{src_dtype}→{dst_dtype} conversion with unsupported input EA: {src_ea}"
+            )
+
+        # Other type conversions default to STANDARD
+        return ElementArrangement.STANDARD

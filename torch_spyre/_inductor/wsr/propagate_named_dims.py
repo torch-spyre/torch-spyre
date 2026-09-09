@@ -111,9 +111,7 @@ def _lone_sym(coord: sympy.Expr) -> sympy.Symbol | None:
 def _untracked_name(context: str, sym, size: int) -> str:
     name = f"_untracked_{size}"
     _named_dims.setdefault(name, size)
-    logger.warning(
-        f"{context}: loop var {sym} has no named dim mapping -- using {name}"
-    )
+    logger.debug(f"{context}: loop var {sym} has no named dim mapping -- using {name}")
     return name
 
 
@@ -137,7 +135,7 @@ def _consume_names(remaining: list[str], layout_size: int) -> list[str]:
         product *= _named_dims[name]
         if product == layout_size:
             return remaining[: i + 1]
-    logger.warning(
+    logger.debug(
         f"_consume_names: no prefix of {remaining} multiplies to {layout_size}"
     )
     return []
@@ -187,9 +185,12 @@ def compute_input_named_dims(dep: MemoryDep, op=None, ind_sizes=None) -> dict:
             # One loop var covers all fused names (e.g. a flat [A, B*D*E] read)
             result.setdefault(loop_vars[0], []).extend(names)
         elif len(loop_vars) == 0:
-            # This layout dim is index-selected by a gather/scatter index
-            # symbol (e.g. `tmp0`).  Raise for anything else — a constant
-            # or unexpected coord should not be silently skipped.
+            # This layout dim is either fixed to a constant source slice, or
+            # index-selected by a gather/scatter symbol (e.g. ``tmp0``).
+            # Its name was consumed above to keep later dimensions aligned,
+            # but there is no iteration variable to attach it to.
+            if not coord.free_symbols:
+                continue
             sym = _lone_sym(coord)
             if sym is not None and is_indirect(sym.name):
                 continue

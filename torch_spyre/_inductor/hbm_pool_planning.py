@@ -587,7 +587,7 @@ def hbm_pool_planning(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]
         peak = allocator.get_peak_usage()
         pool_extent = allocator.get_pool_end()
         if overflowed:
-            logger.warning(
+            logger.info(
                 "hbm_pool_planning: bundle=%s  %d intermediate(s) did not fit in "
                 "the %.2f GB pool budget and fell back to standalone HBM",
                 bundle_name,

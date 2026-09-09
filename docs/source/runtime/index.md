@@ -28,7 +28,7 @@ The PyTorch Dispatcher routes each operation to the correct device implementatio
 Torch-Spyre registers `spyre` as a PyTorch device using the
 `PrivateUse1` mechanism — the standard PyTorch pathway for out-of-tree
 accelerators. Registration happens in `torch_spyre/__init__.py`'s
-`_autoload()`:
+`_autoload_impl()`, invoked by the run-once `_autoload()` entry point:
 
 ```python
 torch.utils.rename_privateuse1_backend("spyre")
@@ -56,7 +56,7 @@ The count itself comes from `flex::getNumDevices`.
 
 | File | Responsibility |
 |------|---------------|
-| `csrc/module.cpp` | pybind11 entry point for the `_C` extension module. Device registration itself happens in `torch_spyre/__init__.py::_autoload()`. |
+| `csrc/module.cpp` | pybind11 entry point for the `_C` extension module. Device registration itself happens in `torch_spyre/__init__.py::_autoload_impl()`. |
 | `csrc/spyre_tensor_impl.cpp` | `SpyreTensorImpl`, the device tensor backing store. |
 | `csrc/spyre_mem.cpp` | Device tensor factory ops (`spyre_empty*`, `resize_`) and host↔device copy: builds the `DataConversionInfo` (DCI) descriptors via `generate_dci` that drive `copyAsync` transfers between host memory and LPDDR5. |
 | `csrc/spyre_allocator.cpp` | `SpyreAllocator`, which bridges PyTorch's `c10::Allocator` to `flex::FlexAllocator`. |

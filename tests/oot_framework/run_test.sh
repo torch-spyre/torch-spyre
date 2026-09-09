@@ -2101,9 +2101,17 @@ except Exception as e:
 # ---------------------------------------------------------------------------
 _run_parallel_across_cards() {
     local _n_cards="$1"
+    # The caller now passes only the RUN_FILES indices eligible for round-robin (distributed tests are excluded, see below).
+    shift
+    local -a _target_idx=("$@")
+    # An empty target set (e.g. a distributed-only invocation) means there is nothing to parallelize.
+    if [[ ${#_target_idx[@]} -eq 0 ]]; then
+        echo "[torch_oot_device_tests_run_parallel] No non-distributed files to parallelize -- skipping."
+        return
+    fi
 
     echo ""
-    echo "[torch_oot_device_tests_run_parallel] --parallel: collecting test IDs from ${#RUN_FILES[@]} file(s) to distribute across ${_n_cards} card(s)..."
+    echo "[torch_oot_device_tests_run_parallel] --parallel: collecting test IDs from ${#_target_idx[@]} file(s) to distribute across ${_n_cards} card(s)..."
 
     # Timestamp the collection phase so its cost is visible in the run log.
     # Collection re-imports torch + each OOT wrapper per file, so this phase
@@ -2161,24 +2169,45 @@ _run_parallel_across_cards() {
     # Fan out collection: one background probe per file, bounded to _n_cards
     # concurrent jobs. Each writes matched node IDs to _collect_out_files[i].
     local -a _collect_out_files=()
+    # Parallel array to _collect_out_files, indexed the same way, holding each probe's stderr path.
+    local -a _collect_err_files=()
+    # Parallel array holding each probe's own exit code, to catch a signal kill (e.g. OOM) even when stdout/stderr are both empty.
+    local -a _collect_exit_files=()
     local -a _collect_pids=()
-    for i in "${!RUN_FILES[@]}"; do
+    # Only walk the non-distributed subset handed in by the caller, not every resolved file.
+    for i in "${_target_idx[@]}"; do
         local _rf="${RUN_FILES[$i]}"
         local _rd _rb
         _rd="$(dirname "$_rf")"
         _rb="$(basename "$_rf")"
         local _cout="/tmp/_spyre_collect_ids_${$}_${i}.tmp"
-        _collect_out_files+=("$_cout")
+        # Assigned by RUN_FILES index, not appended -- _target_idx can skip values (distributed files excluded), so a plain += would misalign once any index is missing.
+        _collect_out_files[$i]="$_cout"
+        # Captured instead of discarded, so a probe that collects nothing can say why.
+        local _cerr="/tmp/_spyre_collect_err_${$}_${i}.tmp"
+        _collect_err_files[$i]="$_cerr"
+        # Same index-alignment reasoning as _collect_out_files above.
+        local _cexit="/tmp/_spyre_collect_exit_${$}_${i}.tmp"
+        _collect_exit_files[$i]="$_cexit"
 
         echo "[torch_oot_device_tests_run]   collecting: $(basename "${TEST_FILES[$i]}")"
 
         (
+            # A 0-match --collect-only (or a killed probe) is expected/handled below, not a script-ending error.
+            set +euo pipefail
             export SPYRE_TEST_FILE="$_rf"
             export OOT_TEST_FILE="$_rf"
+            # Give this probe its own Inductor cache dir so concurrent collect-only imports can't race on the same shutil.rmtree() target (see the identical fix for the per-card execution subshells below).
+            _probe_base_cache="${TORCHINDUCTOR_CACHE_DIR:-/tmp/torchinductor_${USER:-$(id -un)}}"
+            # Bucketed by the same concurrency bound as the probe throttle, not by file, so the directory count stays fixed instead of growing with the file list.
+            _probe_slot=$(( i % _n_cards ))
+            export TORCHINDUCTOR_CACHE_DIR="${_probe_base_cache}__collect_slot${_probe_slot}"
             cd "$_rd" && python3 -m pytest "$_rb" \
                 "${_collect_args[@]+"${_collect_args[@]}"}" \
-                --collect-only -q --no-header 2>/dev/null \
-            | grep '\.py::' > "$_cout" || true
+                --collect-only -q --no-header 2>"$_cerr" \
+            | grep '\.py::' > "$_cout"
+            # python3's own exit code (PIPESTATUS[0], not grep's), so a signal kill shows up even with empty stdout/stderr.
+            echo "${PIPESTATUS[0]}" > "$_cexit"
         ) &
         _collect_pids+=($!)
 
@@ -2195,18 +2224,75 @@ _run_parallel_across_cards() {
 
     # Read back each file's collected IDs in file order, preserving the exact
     # ordering the original serial loop produced.
-    for i in "${!RUN_FILES[@]}"; do
+    # Same non-distributed subset as the collection loop above, so indices line up.
+    for i in "${_target_idx[@]}"; do
         local _of="${TEST_FILES[$i]}"
         local _cout="${_collect_out_files[$i]}"
+        local _cerr="${_collect_err_files[$i]}"
+        local _cexit="${_collect_exit_files[$i]}"
 
         local _raw_ids=""
         [[ -f "$_cout" ]] && _raw_ids="$(< "$_cout")"
         rm -f "$_cout"
 
+        # A signal-killed probe (empty stdout + empty stderr + exit >=128) is usually a concurrent-import
+        # memory spike, not a real 0-match file -- retry it alone, with no concurrent siblings, before giving up.
+        if [[ -z "$_raw_ids" && ! -s "$_cerr" ]]; then
+            local _pexit=""
+            [[ -f "$_cexit" ]] && _pexit="$(< "$_cexit")"
+            if [[ "$_pexit" =~ ^[0-9]+$ && "$_pexit" -ge 128 ]]; then
+                echo "[torch_oot_device_tests_run_serial]   $(basename "$_of") collect-only was signal-killed (exit ${_pexit}) -- retrying alone." >&2
+                local _rf2="${RUN_FILES[$i]}"
+                local _rout="/tmp/_spyre_collect_retry_ids_${$}_${i}.tmp"
+                local _rerr="/tmp/_spyre_collect_retry_err_${$}_${i}.tmp"
+                (
+                    set +euo pipefail
+                    export SPYRE_TEST_FILE="$_rf2"
+                    export OOT_TEST_FILE="$_rf2"
+                    # A dedicated cache dir for the retry too, so it can't collide with whatever else is still running.
+                    export TORCHINDUCTOR_CACHE_DIR="${TORCHINDUCTOR_CACHE_DIR:-/tmp/torchinductor_${USER:-$(id -un)}}__retry_${i}"
+                    cd "$(dirname "$_rf2")" && python3 -m pytest "$(basename "$_rf2")" \
+                        "${_collect_args[@]+"${_collect_args[@]}"}" \
+                        --collect-only -q --no-header 2>"$_rerr" \
+                    | grep '\.py::' > "$_rout"
+                )
+                _raw_ids="$(< "$_rout")"
+                rm -f "$_rout"
+                if [[ -n "$_raw_ids" ]]; then
+                    echo "[torch_oot_device_tests_run_serial]   retry succeeded for $(basename "$_of")." >&2
+                    rm -f "$_rerr"
+                elif [[ -s "$_rerr" ]]; then
+                    # The retry's own stderr is more relevant than the original (empty) one if it failed for a different reason.
+                    # Kept (not removed here) -- the outer block below reads and cleans up whatever _cerr now points to.
+                    _cerr="$_rerr"
+                else
+                    rm -f "$_rerr"
+                fi
+            fi
+        fi
+
         if [[ -z "$_raw_ids" ]]; then
             echo "[torch_oot_device_tests_run_serial]   WARNING: no test IDs collected from $(basename "$_of") -- it will be skipped in parallel mode." >&2
+            # The probe's own stderr is the only record of why -- print it here instead of losing it.
+            if [[ -s "$_cerr" ]]; then
+                echo "[torch_oot_device_tests_run_serial]   ----- collect-only stderr for $(basename "$_of") -----" >&2
+                sed 's/^/[torch_oot_device_tests_run_serial]   /' "$_cerr" >&2
+                echo "[torch_oot_device_tests_run_serial]   ----- end stderr -----" >&2
+            else
+                # Empty stdout AND empty stderr means the probe never got to print anything -- almost
+                # always a signal kill (SIGKILL/OOM being the common case), not a catchable Python error.
+                local _pexit=""
+                [[ -f "$_cexit" ]] && _pexit="$(< "$_cexit")"
+                if [[ "$_pexit" =~ ^[0-9]+$ && "$_pexit" -ge 128 ]]; then
+                    echo "[torch_oot_device_tests_run_serial]   collect-only produced no stderr either -- python3 exited with code ${_pexit} (signal $(( _pexit - 128 )), likely OOM-killed if that's SIGKILL/9)." >&2
+                else
+                    echo "[torch_oot_device_tests_run_serial]   collect-only produced no stderr either -- python3 exit code: ${_pexit:-unknown}." >&2
+                fi
+            fi
+            rm -f "$_cerr" "$_cexit"
             continue
         fi
+        rm -f "$_cerr" "$_cexit"
 
         while IFS= read -r _id; do
             [[ -z "$_id" ]] && continue
@@ -2228,7 +2314,8 @@ _run_parallel_across_cards() {
     done
 
     local _collect_elapsed=$(( SECONDS - _collect_start ))
-    echo "[torch_oot_device_tests_run_parallel] Collection phase completed in ${_collect_elapsed}s (${#RUN_FILES[@]} file(s), up to ${_n_cards} concurrent probe(s))."
+    # Report against the actual candidate set rather than every resolved file, now that distributed files are routed elsewhere.
+    echo "[torch_oot_device_tests_run_parallel] Collection phase completed in ${_collect_elapsed}s (${#_target_idx[@]} file(s), up to ${_n_cards} concurrent probe(s))."
 
     local _total="${#_all_node_ids[@]}"
     if [[ $_total -eq 0 ]]; then
@@ -2647,6 +2734,21 @@ _run_parallel_across_cards() {
 # ---------------------------------------------------------------------------
 # 13. Parallel or serial execution
 # ---------------------------------------------------------------------------
+# Collective-comm tests need torchrun to assign RANK/WORLD_SIZE per rank, so they can't be split as independent single-card pytest runs the way --parallel splits everything else.
+_DIST_FILE_IDX=()
+# Everything that isn't a distributed test stays eligible for the round-robin card split.
+_NONDIST_FILE_IDX=()
+# Classify every resolved file once, up front, so both execution paths below agree on the split.
+for i in "${!RUN_FILES[@]}"; do
+    _fdir="$(dirname "${RUN_FILES[$i]}")"
+    # Mirrors the distributed check _run_pytest_isolated already uses to decide when to invoke torchrun.
+    if [[ "$_fdir" == *"/distributed"* ]] || [[ "$_fdir" == *"/distributed" ]]; then
+        _DIST_FILE_IDX+=("$i")
+    else
+        _NONDIST_FILE_IDX+=("$i")
+    fi
+done
+
 if [[ $_PARALLEL -eq 1 ]]; then
     _N_CARDS=$(_detect_spyre_card_count)
     echo "[torch_oot_device_tests_run_info] Detected ${_N_CARDS} Spyre card(s)."
@@ -2656,11 +2758,19 @@ if [[ $_PARALLEL -eq 1 ]]; then
     fi
 fi
 
-if [[ $_PARALLEL -eq 1 ]]; then
-    _run_parallel_across_cards "$_N_CARDS"
-else
+# Only the non-distributed subset ever goes through the round-robin card split.
+if [[ $_PARALLEL -eq 1 && ${#_NONDIST_FILE_IDX[@]} -gt 0 ]]; then
+    _run_parallel_across_cards "$_N_CARDS" "${_NONDIST_FILE_IDX[@]}"
+fi
 
-for i in "${!RUN_FILES[@]}"; do
+# Distributed files always run here via the torchrun-aware path; everything runs here when --parallel was never requested.
+if [[ $_PARALLEL -eq 1 ]]; then
+    _SERIAL_FILE_IDX=("${_DIST_FILE_IDX[@]+"${_DIST_FILE_IDX[@]}"}")
+else
+    _SERIAL_FILE_IDX=("${!RUN_FILES[@]}")
+fi
+
+for i in "${_SERIAL_FILE_IDX[@]+"${_SERIAL_FILE_IDX[@]}"}"; do
     run_file="${RUN_FILES[$i]}"
     original_file="${TEST_FILES[$i]}"
     run_dir="$(dirname "$run_file")"
@@ -2849,8 +2959,6 @@ for i in "${!RUN_FILES[@]}"; do
             ;;
     esac
 done
-
-fi  # end of serial-vs-parallel branch
 
 # ---------------------------------------------------------------------------
 # Merge all XML shards into the final output path requested by the caller.
