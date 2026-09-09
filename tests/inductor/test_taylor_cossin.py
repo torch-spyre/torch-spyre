@@ -157,6 +157,18 @@ _UPCAST_DTYPES = [
     pytest.param(torch.bfloat16, 8e-3, id="bf16"),
 ]
 
+# Every integral and boolean dtype ``aten.cos`` / ``aten.sin`` accept.  All of
+# them promote to the default floating dtype, so all of them are the
+# decomposition's business, whether or not Spyre has a device format for them.
+_ATEN_INTEGRAL_DTYPES = [
+    torch.int64,
+    torch.int32,
+    torch.int16,
+    torch.int8,
+    torch.uint8,
+    torch.bool,
+]
+
 # ---------------------------------------------------------------------------
 # Section 0: registration -- cheap guard, no device needed
 # ---------------------------------------------------------------------------
@@ -184,7 +196,7 @@ def test_registered_as_decomposition_and_not_a_fallback(op_name):
     )
 
 
-@pytest.mark.parametrize("dtype", [torch.int32, torch.int64, torch.bool])
+@pytest.mark.parametrize("dtype", _ATEN_INTEGRAL_DTYPES)
 @pytest.mark.parametrize("op_name", ["cos", "sin"])
 def test_promotes_integral_and_bool_to_float(op_name, dtype):
     """Integral / bool input promotes to a float result, exactly as aten does.
@@ -194,6 +206,11 @@ def test_promotes_integral_and_bool_to_float(op_name, dtype):
     ``torch._refs.cos`` is built with.  Assert against ``torch.cos`` /
     ``torch.sin`` rather than a hardcoded fp32 so this keeps holding if the
     default dtype changes.
+
+    Parametrized over *every* integral and boolean dtype ``aten.cos`` accepts,
+    not just the ones Spyre has a device format for, because these bodies are
+    plain torch functions: the promotion has to be right before the question of
+    what the device can hold even arises.
 
     Without the promotion the result is cast back to the integral input dtype and
     truncates to 0 / +-1 -- measured max error 0.58 int32, 0.99 int64, 0.46 bool.
@@ -346,11 +363,9 @@ def _compile_on_spyre(op, x, *, allow_fallback=None):
     Any FallbackWarning fails the test: a CPU offload here would mean the
     decomposition did not take effect, which is the whole point of the change.
     ``allow_fallback`` is a message substring for the one warning that is not
-    about that -- see ``test_integral_promotes_on_device``, where an int64 or
-    bool -> fp32 *conversion* offloads because ``DtypeOpTable`` has no device
-    kernel for that cast.  That is the cast op's gap, unrelated to whether
-    cos/sin decomposed, so it is allowed by name rather than by silencing the
-    category.
+    about that -- see ``test_integral_promotes_on_device``, where the *input
+    conversion* offloads for reasons that belong to the cast op rather than to
+    cos/sin.  It is allowed by name rather than by silencing the category.
     """
 
     @torch.compile(dynamic=False)
@@ -413,14 +428,26 @@ def test_low_precision_compiles_and_accurate(op_name, dtype, tol):
     torch.testing.assert_close(out, ref, atol=tol, rtol=tol)
 
 
-@pytest.mark.parametrize(
-    "dtype, cast_offloads",
-    [
-        pytest.param(torch.int32, False, id="int32"),
-        pytest.param(torch.int64, True, id="int64"),
-        pytest.param(torch.bool, True, id="bool"),
-    ],
-)
+# Integral dtypes that can actually reach the device, out of
+# ``_ATEN_INTEGRAL_DTYPES``.  Two are excluded, neither for a cos/sin reason:
+#
+# * int16 is refused at H2D -- "Unsupported DCI data format conversion: src=9
+#   dst=9 (cpu_type=int16, dev_type=int16)" -- so no int16 tensor exists on
+#   device for cos/sin to serve.  ``test_promotes_integral_and_bool_to_float``
+#   still covers the promotion on the CPU side.
+# * uint8 places and reads back exactly, and the compiled result is correct, but
+#   the process then dies in senlib at teardown (SIGSEGV, reproduced standalone
+#   with an H2D roundtrip and no cos/sin in the graph).  Excluded so it cannot
+#   take the suite down; the crash is a backend issue, not this decomposition's.
+_DEVICE_INTEGRAL_DTYPES = [
+    pytest.param(torch.int32, False, id="int32"),
+    pytest.param(torch.int64, True, id="int64"),
+    pytest.param(torch.int8, True, id="int8"),
+    pytest.param(torch.bool, True, id="bool"),
+]
+
+
+@pytest.mark.parametrize("dtype, cast_offloads", _DEVICE_INTEGRAL_DTYPES)
 @pytest.mark.parametrize("op_name", ["cos", "sin"])
 def test_integral_promotes_on_device(op_name, dtype, cast_offloads):
     """Integral / bool cos-sin runs on device, promoted, and cos/sin itself
@@ -430,11 +457,44 @@ def test_integral_promotes_on_device(op_name, dtype, cast_offloads):
     runs on device for every integral dtype and only the *input cast* differs.
     int32 -> fp32 is element-size preserving, so no stick reordering is emitted
     and the promotion costs nothing in layout terms -- nothing offloads at all.
-    int64 -> fp32 and bool -> fp32 have no device kernel in ``DtypeOpTable``, so
-    ``torch.ops.spyre.to_dtype_cpu`` handles the cast and warns; ``cast_offloads``
-    records which dtypes that applies to, and the allowance is by warning text so
-    a cos/sin offload still fails the test.  Narrowing that gap is the cast op's
-    job, not this decomposition's.
+    int64 / int8 -> fp32 and bool -> fp32 do offload the cast, for reasons that
+    differ per dtype and none of which is cos/sin's:
+
+    * int64 has no *distinct* device representation today: int32 is its only
+      physical form (H2D downcasts it -- "Backend Spyre does not support int64" in
+      ``types_mapping.h`` -- and ``get_device_dtype(torch.int64)`` is
+      ``IEEE_INT32`` at 32 elements per stick, indistinguishable from int32).
+      That is a deliberate choice rather than a hardware ceiling: the full int64
+      range could be carried across the mantissa bits of several fp32 elements,
+      but no LLM workload has called for it, so the backend downcasts instead.
+      Either way there is no int64 -> fp32 conversion for the backend to support:
+      the conversion that would actually execute is int32 -> fp32, already in the
+      table as ``int32tofp32``.  The offload happens because the support check is
+      keyed on the *logical* torch dtype -- ``is_supported(int64, float32)`` is
+      False, so ``convert_element_type`` takes the CPU path before any physical
+      format is consulted.  Resolving the source through ``get_device_dtype``
+      first, as bool sources already do via ``get_bool_src_operator``, would keep
+      it on device.  A needless host round-trip, not a cast the device cannot
+      perform.
+    * int8 does have a device format of its own (``SENINT8``), and there the gap
+      is the plain one: ``DtypeOpTable`` carries no int8 -> fp32 entry at all, so
+      the cast has nowhere to go but CPU.  The promoted polynomial still runs on
+      device and the result matches aten.
+    * bool -> fp32 *is* supported (``is_supported`` returns True, via
+      ``dl16tofp32``).  It offloads here because these inputs are *host* bools:
+      a DMA-copied bool InputBuffer has a different HBM element ordering, and
+      ``dl16tofp32`` reorders sticks, so ``to_dtype`` in
+      ``_inductor/lowering.py`` deliberately routes that one case to CPU rather
+      than read the buffer back shuffled.  A device-computed bool takes the
+      native path, and bool -> fp16 is an IDENTITY byte copy that is safe even
+      from host.  So this offload is a correctness guard, not a gap.
+
+    ``cast_offloads`` records which dtypes offload, and the allowance is by
+    warning text so a cos/sin offload still fails the test.  Either way it is the
+    cast op's business, not this decomposition's: cos/sin of an int64 or bool
+    tensor works, and the assertions below check dtype and value against aten.
+    For int64 the only real caveat is the range Spyre supports at all, since H2D
+    truncates int64 to int32 before any op sees the tensor.
 
     Shape (4, 17) is deliberately not stick-aligned: unlike the fp16/bf16 path
     (see the module docstring on #2818) the integral promotion has no stick-count
