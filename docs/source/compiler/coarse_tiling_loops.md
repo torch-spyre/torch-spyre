@@ -2061,73 +2061,22 @@ emitted by `codegen_kernel()`.  When it encounters a `LoopSpec` it
 emits SDSC JSON files for each `OpSpec` in the body (recursively) and
 wraps those executions in an `scf.for` in `bundle.mlir`.
 
-### Changes to `SuperDSCScheduling.codegen_node()`
+### Preparing and emitting counted-loop kernels
 
-`codegen_node` already handles `FusedSchedulerNode | SchedulerNode`.
-`CountedLoopSchedulerNode` is recognized by an `isinstance` check:
-
-```python
-def codegen_node(
-    self,
-    node: Union[FusedSchedulerNode, SchedulerNode, CountedLoopSchedulerNode],
-) -> None:
-    if isinstance(node, CountedLoopSchedulerNode):
-        self._codegen_counted_loop(node)
-        return
-    # existing flat-list path unchanged
-    ...
-
-def _codegen_counted_loop(self, node: CountedLoopSchedulerNode) -> None:
-    inner_nodes = [
-        n for n in node.get_nodes()
-        if n.get_name() not in self.scheduler.removed_ops
-    ]
-    kernel = SpyreKernel()
-    all_schedule_nodes = []
-    with kernel:
-        for inner in inner_nodes:
-            if isinstance(inner, CountedLoopSchedulerNode):
-                self._codegen_loop_body(inner, kernel, all_schedule_nodes)
-            else:
-                sched = self.generate_node_schedule([inner])
-                all_schedule_nodes.extend(sched)
-                for snode in sched:
-                    var_ranges = iteration_space(snode)
-                    vs = list(var_ranges.keys())
-                    index_vars = [vs[:len(snode._body.iter_vars)],
-                                  vs[len(snode._body.iter_vars):]]
-                    snode.codegen(index_vars)
-
-    # Compute tiled symbols for depth 0 from any leaf SchedulerNode.
-    outer_tiled_syms = []
-    for inner in inner_nodes:
-        ref = _find_leaf_sched_node(inner)
-        if ref is not None:
-            outer_tiled_syms = _tiled_syms_for_sched_node_at_depth(ref, 0)
-            break
-
-    # Wrap the collected inner specs in a LoopSpec
-    kernel.wrap_op_specs_in_loop(node.loop_count)
-
-    with V.set_kernel_handler(kernel):
-        src_code = kernel.codegen_kernel()
-    kernel_name = self.define_kernel(src_code, all_schedule_nodes, kernel)
-    ...
-```
-
-`_codegen_loop_body` handles nested `CountedLoopSchedulerNode`s: it
-codegens the body ops into the existing kernel, then wraps only the newly
-added `op_specs` entries in an inner `LoopSpec`.  The outer
-`_codegen_counted_loop` then wraps everything in the outer `LoopSpec` via
-`wrap_op_specs_in_loop`.
+`prepare_kernel` handles both ordinary bundles and `CountedLoopSchedulerNode`s
+before HBM-pool planning. `_codegen_into_kernel` runs leaf operations through the
+existing handlers; `_codegen_loop_body` recursively adds nested loops to the same
+kernel, wrapping only their newly added `op_specs` entries in an inner `LoopSpec`.
+For the outer counted loop, `prepare_kernel` calls `wrap_op_specs_in_loop` once.
 
 `SpyreKernel.wrap_op_specs_in_loop(count)` replaces the flat `self.op_specs`
 list with `[LoopSpec(count=count, body=self.op_specs)]`.
+`generate_node_schedule` flattens any fused nodes inside the loop group into
+leaf `SchedulerNode`s.
 
-`generate_node_schedule` handles `FusedSchedulerNode`s that may appear
-among the inner nodes (e.g. from earlier passes that fused nodes within
-the same loop group) by flattening them into their constituent
-`SchedulerNode`s.
+`codegen_node` consumes this same prepared kernel. It does not rebuild the loop
+body: it binds the final HBM pool size, addresses, and argument list, then emits
+one SuperDSC bundle for the entire `LoopSpec` tree.
 
 ### Serialization in `codegen_kernel()`
 
@@ -2258,7 +2207,7 @@ landed.
 | `torch_spyre/_inductor/wsr/coarse_tile_hints.py` | `reorder_unhinted_interlopers()` reorders interlopers before grouping |
 | `torch_spyre/_inductor/wsr/coarse_tile.py` | Layer 1: `coarse_tile()` stamps `loop_info` and rewrites ranges; `_plan_tiling_propagation` plus the `_insert_all_read_copy_ops`/`_insert_all_reduction_ops`/`_insert_all_write_copy_ops` passes handle the data perimeter |
 | `torch_spyre/_inductor/insert_restickify.py` | `finalize_layouts` commits each op's chosen `FixedTiledLayout` and, for a tiled-reduction op, propagates that layout onto `accum_full` so fill/combine/copy all agree on device coordinates; also stamps a restickify node's `loop_info` from the op it feeds so the node lands in the same loop group |
-| `torch_spyre/_inductor/scheduler.py` | Layer 2: `CountedLoopSchedulerNode`, `build_loop_scheduler_nodes`, `_codegen_counted_loop`, `_regroup_by_outer_loop_key` |
+| `torch_spyre/_inductor/scheduler.py` | Layer 2: `CountedLoopSchedulerNode`, `build_loop_scheduler_nodes`, `prepare_kernel`, `_codegen_loop_body`, `_regroup_by_outer_loop_key` |
 | `torch_spyre/_inductor/op_spec.py` | Layer 3: `LoopSpec` and `OpSpec` dataclasses |
 | `torch_spyre/_inductor/spyre_kernel.py` | Layer 3: serializes `LoopSpec` tree in `codegen_kernel()`; `wrap_op_specs_in_loop()` |
 | `torch_spyre/_inductor/codegen/bundle.py` | Layer 3: emits `scf.for` wrapping `affine.apply`/`sdsc_execute` in `bundle.mlir` |

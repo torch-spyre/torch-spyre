@@ -337,6 +337,7 @@ The checks, in evaluation order (the first failure is the reason reported):
 |---|---|
 | `op not allowed` | not a `ComputedBuffer`, a mutation layout, or an op name inside `OP_OUTPUT_NOT_GOOD_FOR_LX_REUSE` (the debug flag `config.allow_all_ops_in_lx_planning` bypasses the op-name gate) |
 | `unsized (no device layout)` | no computable footprint (e.g. a `MultiOutputLayout` tuple op) |
+| `empty tensor` | A zero-sized tensor needs no LX reservation |
 | `mutation target` | filled by offset writes, so one LX base mis-addresses it |
 | `tiled (advancing)` | LX addresses cannot be `affine.apply` symbols; the advancing-tile check reads `loop_info` (the sole source of truth for per-tile geometry) |
 | `read by restickify (cross-frame barrier)` | the read and write frames are transposes, so a per-core LX slice is not self-sufficient (the buffer a restickify reads; its own output is safe and is not barred) |

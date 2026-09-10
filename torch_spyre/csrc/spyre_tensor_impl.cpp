@@ -18,6 +18,7 @@
 
 #include <c10/core/DispatchKey.h>
 #include <c10/core/DispatchKeySet.h>
+#include <util/sendefs/dataType.h>
 
 #include <string>
 #include <utility>
@@ -28,15 +29,21 @@
 
 namespace spyre {
 
-#define BYTES_IN_STICK 128
-
 int64_t elems_per_stick(const DataFormats& df) {
   // TODO(dgrove-oss): DeepTools dataFormatToStickSize map is incomplete!
-  if (df == DataFormats::IEEE_INT32) {
-    return 32;
+  auto it = dataFormatToStickSize.find(df);
+  if (it != dataFormatToStickSize.end() && it->second > 0) {
+    return static_cast<int64_t>(it->second);
   }
-  auto fp_elems = dataFormatToStickSize[df];
-  return static_cast<int64_t>(fp_elems);
+  // DCI already accepts these storage formats, missing from the map above.
+  // Complete their geometry without enabling unmapped compute formats.
+  if (df == DataFormats::IEEE_INT32 || df == DataFormats::IEEE_INT64 ||
+      df == DataFormats::BOOL || df == DataFormats::BFLOAT16) {
+    return getNumElemsInStick(df);
+  }
+  // Capability queries use zero for unsupported geometry; storage sizing below
+  // rejects it rather than allocating an unknown format.
+  return 0;
 }
 
 /* Returns default tiling of tensor dimensions on the device.
@@ -295,10 +302,24 @@ void SpyreTensorImpl::shallow_copy_from(
   this->spyre_layout = spyre_impl->spyre_layout;
 }
 
-uint64_t get_device_size_in_bytes(SpyreTensorLayout stl) {
-  uint64_t size_bytes = BYTES_IN_STICK;
-  for (int i = stl.device_size.size() - 2; i >= 0; i--) {
-    size_bytes *= stl.device_size[i];
+uint64_t get_device_size_in_bytes(const SpyreTensorLayout& stl) {
+  return get_device_size_in_bytes(stl.device_size, stl.device_dtype);
+}
+
+uint64_t get_device_size_in_bytes(const std::vector<int64_t>& device_size,
+                                  const DataFormats& device_dtype) {
+  // Size complete device sticks, including padding and sparse positions. The
+  // trailing extent may expose fewer values, but does not shorten a stick.
+  // A compute format without storage geometry must not be sized by bit width.
+  const auto elems = elems_per_stick(device_dtype);
+  TORCH_CHECK(elems > 0, "No device stick geometry for data format ",
+              static_cast<int>(device_dtype));
+  const auto bits = getSizeInBits(device_dtype);
+  TORCH_CHECK(bits > 0, "No device element width for data format ",
+              static_cast<int>(device_dtype));
+  uint64_t size_bytes = (elems * bits + 7) / 8;
+  for (int i = static_cast<int>(device_size.size()) - 2; i >= 0; i--) {
+    size_bytes *= device_size[i];
   }
   return size_bytes;
 }
