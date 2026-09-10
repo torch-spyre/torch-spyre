@@ -196,6 +196,179 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             "aten.mm.default should be replaced by bmm/batched_matmul after passes"
         )
 
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+    @pytest.mark.filterwarnings("ignore::UserWarning")
+    def test_unflatten_bmm_bypasses_only_its_broadcast_clone(self):
+        from torch._dynamo.testing import InductorAndRecordGraphs
+        import torch._inductor.config as config
+
+        config.force_disable_caches = True
+
+        def fn(x, w):
+            expanded = w.expand(3, 17, 128, 64).clone()
+            return x @ expanded, expanded + 1
+
+        x = torch.randn(3, 17, 32, 128, device="spyre", dtype=torch.float16)
+        w = torch.randn(1, 17, 128, 64, device="spyre", dtype=torch.float16)
+        expected = fn(x.cpu(), w.cpu())
+        torch.compiler.reset()
+        backend = InductorAndRecordGraphs()
+        actual = torch.compile(fn, backend=backend)(x, w)
+
+        for result, reference in zip(actual, expected, strict=True):
+            torch.testing.assert_close(result.cpu(), reference, atol=0.1, rtol=0.1)
+
+        graph = backend.inductor_graphs[0].graph
+        matmul = next(
+            node
+            for node in graph.nodes
+            if node.op == "call_function"
+            and node.target == torch.ops.spyre.batched_matmul.default
+        )
+        assert tuple(matmul.args[1].meta["val"].shape) == (1, 17, 128, 64)
+        assert any(
+            node.op == "call_function"
+            and node.target == torch.ops.aten.clone.default
+            and tuple(node.meta["val"].shape) == (3, 17, 128, 64)
+            for node in graph.nodes
+        )
+
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+    @pytest.mark.filterwarnings("ignore::UserWarning")
+    def test_unflatten_bmm_elides_dead_multi_axis_broadcast_clone(self):
+        from torch._dynamo.testing import InductorAndRecordGraphs
+        import torch._inductor.config as config
+
+        config.force_disable_caches = True
+
+        def fn(x, w):
+            return x @ w.expand(4, 8, 128, 64).clone()
+
+        x = torch.randn(4, 8, 32, 128, device="spyre", dtype=torch.float16)
+        w = torch.randn(1, 1, 128, 64, device="spyre", dtype=torch.float16)
+        expected = fn(x.cpu(), w.cpu())
+        torch.compiler.reset()
+        backend = InductorAndRecordGraphs()
+        actual = torch.compile(fn, backend=backend)(x, w)
+
+        torch.testing.assert_close(actual.cpu(), expected, atol=0.1, rtol=0.1)
+
+        graph = backend.inductor_graphs[0].graph
+        matmul = next(
+            node
+            for node in graph.nodes
+            if node.op == "call_function"
+            and node.target == torch.ops.spyre.batched_matmul.default
+        )
+        assert tuple(matmul.args[1].meta["val"].shape) == (1, 1, 128, 64)
+        assert not any(
+            node.op == "call_function" and node.target == torch.ops.aten.clone.default
+            for node in graph.nodes
+        )
+
+    def test_unflatten_bmm_only_bypasses_batch_broadcast_clone(self):
+        from torch.fx.experimental.proxy_tensor import make_fx
+        from torch_spyre._inductor.temp_passes import bmm_unflatten_pass
+
+        x = torch.randn(4, 8, 32, 128)
+        # Preserve matrix-axis broadcasts inside or outside the clone, and
+        # clones that materialize a permuted tensor without batch expansion.
+        for rhs_shape, permute, outer_matrix_broadcast in (
+            ((1, 1, 1, 64), False, False),
+            ((4, 128, 8, 64), True, False),
+            ((1, 1, 1, 64), False, True),
+        ):
+            with self.subTest(rhs_shape=rhs_shape, outer=outer_matrix_broadcast):
+
+                def fn(x, w):
+                    if permute:
+                        w = w.permute(0, 2, 1, 3)
+                    if outer_matrix_broadcast:
+                        w = w.expand(4, 8, 1, 64).clone().expand(4, 8, 128, 64)
+                    else:
+                        w = w.expand(4, 8, 128, 64).clone()
+                    return torch.bmm(
+                        x.reshape(32, 32, 128), w.reshape(32, 128, 64)
+                    ).reshape(4, 8, 32, 64)
+
+                graph = make_fx(fn)(x, torch.randn(rhs_shape)).graph
+                assert bmm_unflatten_pass.apply(graph) == 1
+                graph.lint()
+
+                matmul = next(
+                    node
+                    for node in graph.nodes
+                    if node.op == "call_function"
+                    and node.target == torch.ops.spyre.batched_matmul.default
+                )
+                assert tuple(matmul.args[1].meta["val"].shape) == (4, 8, 128, 64)
+                assert any(
+                    node.op == "call_function"
+                    and node.target == torch.ops.aten.clone.default
+                    for node in graph.nodes
+                )
+
+    def test_unflatten_bmm_elides_decomposition_broadcast_clone(self):
+        from torch.fx.experimental.proxy_tensor import make_fx
+        from torch_spyre._inductor.temp_passes import bmm_unflatten_pass
+
+        def fn(x, w):
+            return x @ w
+
+        # Only one batch axis broadcasts: flattening the expanded batch axes
+        # needs a clone. With w[1,1,K,N], both strides are zero and it need not.
+        graph = make_fx(fn)(
+            torch.zeros(4, 8, 32, 128), torch.zeros(1, 8, 128, 64)
+        ).graph
+        bmm = next(
+            node
+            for node in graph.nodes
+            if node.op == "call_function" and node.target == torch.ops.aten.bmm.default
+        )
+        rhs_clone = bmm.args[1].args[0]
+        assert rhs_clone.target == torch.ops.aten.clone.default
+        rhs_expand = rhs_clone.args[0]
+        assert rhs_expand.target == torch.ops.aten.expand.default
+        rhs_source = rhs_expand.args[0]
+        assert rhs_source.op == "placeholder"
+
+        assert bmm_unflatten_pass.apply(graph) == 1
+        graph.lint()
+        matmul = next(
+            node
+            for node in graph.nodes
+            if node.op == "call_function"
+            and node.target == torch.ops.spyre.batched_matmul.default
+        )
+        assert matmul.args[1] is rhs_source
+        assert tuple(matmul.args[1].meta["val"].shape) == (1, 8, 128, 64)
+        assert not any(
+            node.op == "call_function" and node.target == torch.ops.aten.clone.default
+            for node in graph.nodes
+        )
+
+    def test_unflatten_bmm_broadcast_does_not_add_shape_guards(self):
+        from torch.fx.experimental.proxy_tensor import make_fx
+        from torch_spyre._inductor.temp_passes import bmm_unflatten_pass
+
+        def fn(x, w):
+            return x @ w.expand(x.shape[0], x.shape[1], *w.shape[-2:]).clone()
+
+        graph = make_fx(fn, tracing_mode="symbolic")(
+            torch.randn(4, 8, 32, 128), torch.randn(1, 1, 128, 64)
+        ).graph
+        x = next(node for node in graph.nodes if node.op == "placeholder")
+        shape_env = x.meta["val"].fake_mode.shape_env
+        guards = tuple(shape_env.guards)
+
+        assert bmm_unflatten_pass.apply(graph) == 1
+        graph.lint()
+        assert tuple(shape_env.guards) == guards
+        assert not any(
+            node.op == "call_function" and node.target == torch.ops.aten.clone.default
+            for node in graph.nodes
+        )
+
     def test_mixed_device_seq(self):
         model = torch.compile(torch.sin)
         cpu_1 = torch._inductor.utils.get_code(model, torch.randn(5))[0]
