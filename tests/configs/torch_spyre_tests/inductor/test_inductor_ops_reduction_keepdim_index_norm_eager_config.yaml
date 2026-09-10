@@ -15,13 +15,17 @@ test_suite_config:
             - TestOps::test_linalg_norm_keepdim.*
             - TestOps::test_argmin_keepdim0
             - TestOps::test_min_tuple_output_keepdim0
-            - TestOps::test_logsumexp_keepdim0_known_xfail
+            - TestOps::test_logsumexp_keepdim0
             # test_mean has a param named "3d_dim0_keepdim" whose instantiated name
             # contains "keepdim" — the old .*keepdim.* pattern matched it here.
             # The base method test_mean belongs to misc, but this one specific param
             # variant was collected in the reductions shard via substring match.
             - TestOps::test_mean_3d_dim0_keepdim
             - TestOps::test_index_copy_.*
+            # Regression guard for the multi-arg pointwise dim_order projection
+            # onto an operand that outranks the gather's output (negative
+            # rank_diff), which raised "Incompatible host_size and dim_order".
+            - TestOps::test_gather_from_.*
             # Regression guard for LX producer/consumer core->slice agreement
             # (#3374, #3387). Asserts both values and that the buffer stays in LX.
             - TestOps::test_shared_input_two_reductions.*

@@ -214,6 +214,54 @@ def _compute_dim_order(stick_dim, size, coords):
     return dim_order
 
 
+# Longest dim_order get_generic_stick_layout (spyre_tensor_impl.cpp) can tile.
+# A length-7 dim_order is accepted only for a sparse stick (trailing -1).
+_MAX_DIM_ORDER_LEN = 7
+
+
+def project_dim_order(dim_order, out_rank, arg_rank):
+    """Re-express an output dim_order as a dim_order for one of its operands.
+
+    ``dim_order`` is a permutation of host dim indices with the stick dim last
+    (see `_compute_dim_order`); a trailing ``-1`` instead means the stick maps
+    to no host dim at all (sparse stick). `SpyreTensorLayout` requires
+    ``len(dim_order) == rank``, or ``rank + 1`` when the last entry is ``-1``.
+
+    Operands are right-aligned against the output, numpy-broadcast style, so
+    operand dim ``i`` corresponds to output dim ``i + rank_diff``.
+
+    Two cases the naive ``[d - rank_diff for d in dim_order if d >= rank_diff]``
+    got wrong:
+
+    - ``rank_diff < 0`` (operand of *higher* rank than the output — an
+      `aten.index` gather whose value operand keeps its pre-view rank, say).
+      The operand's extra leading dims never received entries, so the projection
+      came up short and tripped the rank check in `spyre_tensor_impl.cpp`
+      ("Incompatible host_size and dim_order").
+    - The trailing ``-1`` was silently dropped whenever ``rank_diff >= 0``,
+      because ``-1 >= rank_diff`` is false. That does not raise: it builds a
+      *dense*-stick operand layout to stand in for a sparse-stick output, so
+      the feasibility test below silently answered for the wrong layout.
+    """
+    sparse = bool(dim_order) and dim_order[-1] == -1
+    core = dim_order[:-1] if sparse else list(dim_order)
+    rank_diff = out_rank - arg_rank
+
+    if rank_diff >= 0:
+        # Broadcast: the operand lacks the output's leading dims. Drop them.
+        projected = [d - rank_diff for d in core if d >= rank_diff]
+    else:
+        # The operand carries dims the output does not. Keep the right-aligned
+        # correspondence for the shared trailing dims and give the extra leading
+        # dims entries of their own, outermost first.
+        extra = -rank_diff
+        projected = list(range(extra)) + [d + extra for d in core]
+
+    if sparse:
+        projected.append(-1)
+    return projected
+
+
 def _pick_stick_dim(stick_expr, out_coords) -> int:
     """Map a stick expression to an output dimension index, or -1 if it doesn't survive."""
     maybe = matching_dim(out_coords, stick_expr)
@@ -1476,9 +1524,19 @@ def _multi_arg_pointwise_layouts(
 
     def _is_supported_layout(dim_order):
         for arg in args:
-            # Project output dim_order to input, dropping leading dims missing due to broadcast.
-            rank_diff = len(output.size) - len(arg.layout.size)
-            projected_dim_order = [d - rank_diff for d in dim_order if d >= rank_diff]
+            projected_dim_order = project_dim_order(
+                dim_order, len(output.size), len(arg.layout.size)
+            )
+            # get_generic_stick_layout (spyre_tensor_impl.cpp) tiles dim_orders
+            # of length 1..7, and length 7 only for a sparse stick. Projecting
+            # onto a higher-rank operand can exceed that; report the layout as
+            # unsupported rather than letting the constructor's TORCH_CHECK
+            # escape as a hard error.
+            if len(projected_dim_order) > _MAX_DIM_ORDER_LEN or (
+                len(projected_dim_order) == _MAX_DIM_ORDER_LEN
+                and projected_dim_order[-1] != -1
+            ):
+                return False
             c_in_size = [concretize_expr(s) for s in arg.layout.size]
             c_in_stride = [concretize_expr(s) for s in arg.layout.stride]
             in_stl = SpyreTensorLayout(
