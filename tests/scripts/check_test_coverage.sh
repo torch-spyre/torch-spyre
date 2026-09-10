@@ -58,6 +58,11 @@ IGNORED_TEST_FILES=(
   # lane provides, so it is skip-only in CI. Revisit when a KTIR/mlir_ktdp lane
   # exists.
   "inductor/test_ktir_emitter.py"
+  # 1p5-emulation thin slice: requires a synthetic multi-domain topology set via
+  # FLEX_NUM_MEMORY_DOMAINS / FLEX_MAX_REGIONS on the command line (read once at
+  # runtime start), on live 1p0-PF. No CI lane provides this, so the test skips
+  # itself under a default sweep. Revisit if a PF emulation lane is added.
+  "test_interleave_thin_slice.py"
 )
 
 # ── Ignore list: config files ─────────────────────────────────────────────────
