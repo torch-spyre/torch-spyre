@@ -1,0 +1,41 @@
+test_suite_config:
+  labels: [core, full, device_critical]
+  files:
+    - path: ${TORCH_DEVICE_ROOT}/tests/inductor/test_autotiling_baseline.py
+      unlisted_test_mode: skip
+      tests:
+        - names:
+            - TestOps::test_S0_baseline_correctness.*
+            - TestOps::test_S1_pass_through.*
+            - TestOps::test_S4_boundary.*
+          mode: mandatory_success
+          tags:
+            - span_overflow__s0_s1_s4
+    - path: ${TORCH_DEVICE_ROOT}/tests/inductor/test_autotiling_spanoverflow_core.py
+      unlisted_test_mode: skip
+      tests:
+        - names:
+            - TestOps::test_S2_trigger_a_vocab_width_op.*
+          mode: mandatory_success
+          tags:
+            - span_overflow__s2_core
+
+    - path: ${TORCH_DEVICE_ROOT}/tests/inductor/test_autotiling_spanoverflow_model_shapes.py
+      unlisted_test_mode: skip
+      tests:
+        - names:
+            - TestOps::test_S2_trigger_a_vocab_width_op.*
+          mode: mandatory_success
+          tags:
+            - span_overflow__s2_model_shapes
+
+    - path: ${TORCH_DEVICE_ROOT}/tests/inductor/test_autotiling_totaloverflow.py
+      unlisted_test_mode: skip
+      tests:
+        - names:
+            - TestOps::test_S9_production_stress.*
+          mode: mandatory_success
+          tags:
+            - span_overflow__s9
+    - path: ${TORCH_DEVICE_ROOT}/tests/inductor/test_autotiling_automanual.py
+      unlisted_test_mode: mandatory_success
