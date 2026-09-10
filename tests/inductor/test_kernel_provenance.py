@@ -711,8 +711,8 @@ class TestKernelProvenancePropagation:
         )
         prepare_kernel.assert_called_once_with(
             "/tmp/kernel/spyreCodeDir",
-            profiler_name=_event_name(descriptor),
-            sdsc_bundle_dir_prefix=None,
+            profiler_event_name=_event_name(descriptor),
+            sdsc_bundle_dir_prefix="",
         )
 
     def test_runner_preserves_legacy_prepare_call_without_descriptor(self):
@@ -732,7 +732,7 @@ class TestKernelProvenancePropagation:
         assert runner.profiler_event_name is None
         prepare_kernel.assert_called_once_with(
             "/tmp/kernel/spyreCodeDir",
-            sdsc_bundle_dir_prefix=None,
+            sdsc_bundle_dir_prefix="",
         )
         register_kernel_provenance.assert_not_called()
 

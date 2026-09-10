@@ -432,7 +432,7 @@ def launch_jobplan(
 def prepare_kernel(
     spyrecode_dir: str,
     stream: _SpyreStreamBase | None = None,
-    profiler_name: str | None = None,
+    profiler_event_name: str | None = None,
     sdsc_bundle_dir_prefix: str | None = "",
 ) -> JobPlan:
     """
@@ -442,7 +442,7 @@ def prepare_kernel(
         spyrecode_dir: Path to the SpyreCode directory
         stream: Stream to use for initialization transfers.
             If None, uses the current stream. Defaults to None.
-        profiler_name: Bounded base name for profiler-visible compute events.
+        profiler_event_name: Bounded base name for profiler-visible compute events.
             If None, uses the existing SpyreCode or directory-derived name.
 
     Returns:

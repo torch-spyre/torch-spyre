@@ -263,7 +263,7 @@ PYBIND11_MODULE(_C, m) {
       py::arg("name_base"),
       "Return the SDSC bundle directory prefix for an activity name base");
   m.def("activity_name_base", &spyre::activityNameBase,
-        py::arg("profiler_name"),
+        py::arg("profiler_event_name"),
         "Return the activity base name from the profiler event name");
   m.def(
       "kernel_provenance_registry_stats",
@@ -633,7 +633,8 @@ PYBIND11_MODULE(_C, m) {
       });
 
   m.def("prepare_kernel", &spyre::prepareKernel, py::arg("spyrecode_dir"),
-        py::arg("stream") = nullptr, py::arg("profiler_name") = std::nullopt,
+        py::arg("stream") = nullptr,
+        py::arg("profiler_event_name") = std::nullopt,
         py::arg("sdsc_bundle_dir_prefix") = std::string{},
         "Prepare a kernel from a SpyreCode directory and return a JobPlan.\n\n"
         "Args:\n"
@@ -641,7 +642,7 @@ PYBIND11_MODULE(_C, m) {
         "    stream (SpyreStream, optional): Stream to use for initialization "
         "transfers.\n"
         "        If None, uses the current stream. Defaults to None.\n"
-        "    profiler_name (str, optional): Bounded base name for "
+        "    profiler_event_name (str, optional): Bounded base name for "
         "profiler-visible compute events. Defaults to None.\n"
         "    sdsc_bundle_dir_prefix (str, optional): 8-char hex prefix of the "
         "SDSC bundle directory; emitted as args.sdsc_bundle_dir_prefix "

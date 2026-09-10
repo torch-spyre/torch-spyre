@@ -220,9 +220,9 @@ class TestPrepareKernel:
             # First step should be ComputeSpecialize
             assert job_plan.get_step_type(0) == "Compute"
 
-    def test_profiler_name_overrides_spyrecode_name_and_adds_step_suffix(self):
+    def test_profiler_event_name_overrides_spyrecode_name_and_adds_step_suffix(self):
         """Compiler provenance name identifies every device-compute step."""
-        profiler_name = "spyre_kernel_v1_fused_mm_" + "a" * 16
+        profiler_event_name = "spyre_kernel_v1_fused_mm_" + "a" * 16
         job_exec_plan = [
             {
                 "command": "ComputeOnDevice",
@@ -243,16 +243,16 @@ class TestPrepareKernel:
 
             job_plan = torch_spyre._C.prepare_kernel(
                 spyrecode_dir,
-                profiler_name=profiler_name,
+                profiler_event_name=profiler_event_name,
             )
 
-            assert job_plan.get_step_name(0) == f"{profiler_name}#0"
-            assert job_plan.get_step_name(1) == f"{profiler_name}#1"
+            assert job_plan.get_step_name(0) == f"{profiler_event_name}#0"
+            assert job_plan.get_step_name(1) == f"{profiler_event_name}#1"
 
-    def test_profiler_name_accepts_exact_aiupti_limit(self):
+    def test_profiler_event_name_accepts_exact_aiupti_limit(self):
         """The finalized name may fill the AIUPTI buffer through byte 127."""
         suffix = "#0"
-        profiler_name = "p" * (
+        profiler_event_name = "p" * (
             torch_spyre._C.AIUPTI_ACTIVITY_NAME_MAX_BYTES - len(suffix)
         )
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -260,15 +260,15 @@ class TestPrepareKernel:
 
             job_plan = torch_spyre._C.prepare_kernel(
                 spyrecode_dir,
-                profiler_name=profiler_name,
+                profiler_event_name=profiler_event_name,
             )
 
-            assert job_plan.get_step_name(0) == profiler_name + suffix
+            assert job_plan.get_step_name(0) == profiler_event_name + suffix
 
-    def test_profiler_name_rejects_final_name_over_aiupti_limit(self):
+    def test_profiler_event_name_rejects_final_name_over_aiupti_limit(self):
         """The C++ boundary checks the name after adding the step suffix."""
         suffix = "#0"
-        profiler_name = "p" * (
+        profiler_event_name = "p" * (
             torch_spyre._C.AIUPTI_ACTIVITY_NAME_MAX_BYTES - len(suffix) + 1
         )
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -280,10 +280,10 @@ class TestPrepareKernel:
             ):
                 torch_spyre._C.prepare_kernel(
                     spyrecode_dir,
-                    profiler_name=profiler_name,
+                    profiler_event_name=profiler_event_name,
                 )
 
-    def test_spyrecode_compute_name_is_preserved_without_profiler_name(self):
+    def test_spyrecode_compute_name_is_preserved_without_profiler_event_name(self):
         """Existing named SpyreCode plans retain their current behavior."""
         with tempfile.TemporaryDirectory() as tmpdir:
             spyrecode_dir = self.create_mock_spyrecode(
@@ -872,35 +872,37 @@ class TestPrepareKernel:
             )
             assert "HostCompute" in err_permuted
 
-    def test_sdsc_bundle_dir_prefix_registered_via_provenance_profiler_name(self):
-        """prepare_kernel with profiler_name registers the prefix under that name."""
-        profiler_name = "spyre_kernel_v1_fused_mm_" + "a" * 16
+    def test_sdsc_bundle_dir_prefix_registered_via_provenance_profiler_event_name(self):
+        """prepare_kernel with profiler_event_name registers the prefix under that name."""
+        profiler_event_name = "spyre_kernel_v1_fused_mm_" + "a" * 16
         sdsc_bundle_dir_prefix = uuid.uuid4().hex[:8]
         with tempfile.TemporaryDirectory() as tmpdir:
             spyrecode_dir = self.create_mock_spyrecode(tmpdir)
             torch_spyre._C.prepare_kernel(
                 spyrecode_dir,
-                profiler_name=profiler_name,
+                profiler_event_name=profiler_event_name,
                 sdsc_bundle_dir_prefix=sdsc_bundle_dir_prefix,
             )
         assert (
-            torch_spyre._C.lookup_bundle_dir_prefix(profiler_name)
+            torch_spyre._C.lookup_bundle_dir_prefix(profiler_event_name)
             == sdsc_bundle_dir_prefix
         )
 
-    def test_sdsc_bundle_dir_prefix_registered_without_provenance_profiler_name(self):
-        """Without a profiler_name (no provenance key), the prefix is still
+    def test_sdsc_bundle_dir_prefix_registered_without_provenance_profiler_event_name(
+        self,
+    ):
+        """Without a profiler_event_name (no provenance key), the prefix is still
         registered under the directory-derived name_base and can be looked up.
 
         This is the critical case: kernels compiled without a kernel-provenance
-        descriptor have no profiler_name, so the activity handler must still be
+        descriptor have no profiler_event_name, so the activity handler must still be
         able to emit sdsc_bundle_dir_prefix by falling back to the directory
         path as the registry key.
         """
         sdsc_bundle_dir_prefix = uuid.uuid4().hex[:8]
         with tempfile.TemporaryDirectory() as tmpdir:
             spyrecode_dir = self.create_mock_spyrecode(tmpdir)
-            # No profiler_name — no provenance key is generated.
+            # No profiler_event_name — no provenance key is generated.
             torch_spyre._C.prepare_kernel(
                 spyrecode_dir,
                 sdsc_bundle_dir_prefix=sdsc_bundle_dir_prefix,
@@ -916,29 +918,34 @@ class TestPrepareKernel:
 
 
 @pytest.mark.parametrize(
-    ("profiler_name", "expected_activity_name_base"),
+    ("profiler_event_name", "expected_activity_name_base"),
     [
         (
-            "spyre_kernel_v1_fused_mm_aaaaaaaaaaaaaaaa",
-            "spyre_kernel_v1_fused_mm_aaaaaaaaaaaaaaaa",
+            "spyre_kernel_v1_fused_add_aaaaaaaaaaaaaaaa",
+            "spyre_kernel_v1_fused_add_aaaaaaaaaaaaaaaa",
         ),
         (
             "spyre_kernel_v1_fused_mm_aaaaaaaaaaaaaaaa#17",
             "spyre_kernel_v1_fused_mm_aaaaaaaaaaaaaaaa",
         ),
         (
-            "spyre_kernel_v1_fused_mm_aaaaaaaaaaaaaaaa#step",
-            "spyre_kernel_v1_fused_mm_aaaaaaaaaaaaaaaa#step",
+            "spyre_kernel_v1_fused_bmm_expand_silu_aaaaaaaaaaaaaaaa#step",
+            "spyre_kernel_v1_fused_bmm_expand_silu_aaaaaaaaaaaaaaaa#step",
         ),
         (
-            "spyre_kernel_v1_fused_mm_aaaaaaaaaaaaaaaa#",
-            "spyre_kernel_v1_fused_mm_aaaaaaaaaaaaaaaa",
+            "spyre_kernel_v1_fused_scaled_dot_product_fused_attention_overrideable_aaaaaaaaaaaaaaaa#",
+            "spyre_kernel_v1_fused_scaled_dot_product_fused_attention_overrideable_aaaaaaaaaaaaaaaa",
+        ),
+        (
+            "deadbeef_sdsc_fused_linear/spyreCodeDir/bundle.mlir#2",
+            "deadbeef_sdsc_fused_linear/spyreCodeDir/bundle.mlir",
         ),
     ],
 )
-def test_activity_name_base(profiler_name, expected_activity_name_base):
+def test_activity_name_base(profiler_event_name, expected_activity_name_base):
     assert (
-        torch_spyre._C.activity_name_base(profiler_name) == expected_activity_name_base
+        torch_spyre._C.activity_name_base(profiler_event_name)
+        == expected_activity_name_base
     )
 
 
