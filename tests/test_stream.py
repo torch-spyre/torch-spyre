@@ -175,31 +175,15 @@ class TestSpyreStream(TestCase):
         # s = torch.Stream(self.device)
         s = torch.spyre.Stream(self.device)
 
-        print(f"outer_stream: {outer_stream}", flush=True)
-        print(f"s: {s}", flush=True)
-        # print(outer_stream, flush=True)
-        # print(s, flush=True)
-
         with s:
             with s:
                 torch.randn(3, 3, device="spyre")
-
-                print(
-                    f"torch.spyre.current_stream(): {torch.spyre.current_stream()}",
-                    flush=True,
-                )
-                # print(torch.spyre.current_stream(), flush=True)
-
-            print(
-                f"torch.spyre.current_stream(): {torch.spyre.current_stream()}",
-                flush=True,
-            )
-            # print(torch.spyre.current_stream(), flush=True)
 
             # The inner __exit__ must restore `s`, not the stream that was
             # current before the outer __enter__.
             self.assertEqual(torch.spyre.current_stream(), s)
 
+        # use proper comparisonn
         self.assertEqual(torch.spyre.current_stream(), outer_stream)
 
     def test_stream_context_restores_on_exception(self):
