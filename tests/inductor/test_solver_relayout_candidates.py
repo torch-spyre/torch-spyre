@@ -41,8 +41,18 @@ _CORE_ID = Symbol("core_id")
 # are the two views of the canonical measured configuration: producer
 # {B:4, M:2} against consumer {B:2, M:4} on 8 cores.
 _DEVICE_DIMS = [256, 8, 8, 64]
-_SRC = PerCoreView(((0, 2), (2, 4)), ((0, floor(_CORE_ID / 4)), (2, Mod(_CORE_ID, 4))))
-_DST = PerCoreView(((0, 4), (2, 2)), ((0, floor(_CORE_ID / 2)), (2, Mod(_CORE_ID, 2))))
+# Views carry their physical core count explicitly, as production views built
+# by work_division_from_view do; the committed gate rejects views that omit it.
+_SRC = PerCoreView(
+    ((0, 2), (2, 4)),
+    ((0, floor(_CORE_ID / 4)), (2, Mod(_CORE_ID, 4))),
+    num_cores=8,
+)
+_DST = PerCoreView(
+    ((0, 4), (2, 2)),
+    ((0, floor(_CORE_ID / 2)), (2, Mod(_CORE_ID, 2))),
+    num_cores=8,
+)
 _OUT_ELEMS = 256 * 8 * 8 * 64  # 2.10 MB at fp16
 _DTYPE_BYTES = 2
 
@@ -115,9 +125,12 @@ def test_split_product_must_equal_core_count():
     # a 4-core solve. (A view whose slot expression is out of range for
     # num_cores is a caller error, not a declined pair - the allocator's
     # cores_used equality gate guarantees views are built for num_cores
-    # before pricing.)
+    # before pricing.) The views omit their physical count so the split-product
+    # gate, not the ownership-domain check, is what declines the pair.
+    src = PerCoreView(_SRC.work_slice_dims, _SRC.core_to_slot)
+    dst = PerCoreView(_DST.work_slice_dims, _DST.core_to_slot)
     assert (
-        solver_relayout_pair_cost(_SRC, _DST, 4, _DEVICE_DIMS, _OUT_ELEMS, _DTYPE_BYTES)
+        solver_relayout_pair_cost(src, dst, 4, _DEVICE_DIMS, _OUT_ELEMS, _DTYPE_BYTES)
         is None
     )
 
@@ -148,7 +161,6 @@ def test_coarse_tiled_endpoints_are_declined_at_the_edge_gate():
             @property
             def layout(self):
                 type(self).layout_accessed = True
-                return None
 
         obj = _Probe.__new__(_Probe)
         obj.loop_info = object() if tiled else None
@@ -191,10 +203,10 @@ def _committed_gate(source, destination, num_cores):
 # Two owners replicated over eight cores (a broadcast source), and the same
 # ownership as _SRC's dim-2 quarter spelled two ways over four cores.
 _TWO_OWNERS_ON_8 = PerCoreView(((2, 2),), ((2, Mod(_CORE_ID, 2)),), num_cores=8)
-_QUARTER_PLAIN = PerCoreView(((2, 4),), ((2, _CORE_ID),))
-_QUARTER_MOD = PerCoreView(((2, 4),), ((2, Mod(_CORE_ID, 4)),))
+_QUARTER_PLAIN = PerCoreView(((2, 4),), ((2, _CORE_ID),), num_cores=4)
+_QUARTER_MOD = PerCoreView(((2, 4),), ((2, Mod(_CORE_ID, 4)),), num_cores=4)
 _HALF_ON_4 = PerCoreView(
-    ((0, 2), (2, 2)), ((0, floor(_CORE_ID / 2)), (2, Mod(_CORE_ID, 2)))
+    ((0, 2), (2, 2)), ((0, floor(_CORE_ID / 2)), (2, Mod(_CORE_ID, 2))), num_cores=4
 )
 
 _GATE_CASES = [
@@ -208,7 +220,7 @@ _GATE_CASES = [
     pytest.param(_QUARTER_PLAIN, _HALF_ON_4, 4, True, id="permutation_on_4"),
     pytest.param(
         _SRC,
-        PerCoreView(((2, 4),), ((2, Mod(_CORE_ID, 4)),)),
+        PerCoreView(((2, 4),), ((2, Mod(_CORE_ID, 4)),), num_cores=8),
         8,
         False,
         id="grouped_gather",
