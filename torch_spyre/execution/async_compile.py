@@ -17,11 +17,14 @@ import shutil
 import subprocess
 import tempfile
 import uuid
-from typing import Any, cast
 from collections.abc import Sequence
+from concurrent.futures import Future, TimeoutError as FuturesTimeoutError
+from typing import Any, cast
 
 import torch
-from torch._inductor.async_compile import AsyncCompile
+from torch._inductor.async_compile import AsyncCompile, get_compile_threads
+from torch._inductor.codecache import CodeCacheFuture
+from torch._inductor.compile_worker.subproc_pool import SubprocException
 from torch._inductor.runtime.runtime_utils import cache_dir
 from torch_spyre._inductor import config as _spyre_config
 from torch_spyre._inductor.logging_utils import get_inductor_logger
@@ -86,24 +89,20 @@ def get_output_dir(kernel_name: str):
     return kernel_output_dir
 
 
-def _compile_to_dir(
-    kernel_name: str,
-    compile_dir: str,
-    specs,
-    pool_size: int,
-) -> None:
-    """Run generate_bundle then dxp_standalone for ``specs`` into ``compile_dir``.
+def _run_dxp(kernel_name: str, compile_dir: str, env: dict[str, str]) -> str:
+    """Compile one materialized bundle and return its directory.
 
-    Shared by the cache-miss path and the no-cache path so that any change to
-    the compilation sequence is applied in both places automatically.
+    This function is module-level and its arguments are intentionally simple so
+    Inductor's subprocess compile pool can pickle and execute it.  Bundle
+    generation remains in the parent process; workers only invoke DXP and never
+    construct a runner or touch the device runtime.
     """
-    generate_bundle(kernel_name, compile_dir, specs, pool_size=pool_size)
-
     with torch.profiler.record_function(f"dxp_standalone:{kernel_name}"):
         try:
             subprocess.run(
                 ["dxp_standalone", "-d", compile_dir],
                 check=True,
+                env=env,
             )
         except subprocess.CalledProcessError as exc:
             try_collect(
@@ -114,6 +113,59 @@ def _compile_to_dir(
                 code_dir=compile_dir,
             )
             raise
+    return compile_dir
+
+
+class _SpyreCompileFuture(CodeCacheFuture):
+    """Resolve one DXP task and construct its runner in the parent process."""
+
+    def __init__(
+        self,
+        task: Future[str],
+        kernel_name: str,
+        compile_dir: str,
+        kernel_provenance,
+        cache_key: str | None = None,
+    ) -> None:
+        self._task = task
+        self._kernel_name = kernel_name
+        self._compile_dir = compile_dir
+        self._kernel_provenance = kernel_provenance
+        self._cache_key = cache_key
+        self._runner: SpyreSDSCKernelRunner | None = None
+        self._failure_dir_moved = False
+
+    def result(self, timeout: float | None = None):
+        if self._runner is not None:
+            return self._runner
+
+        try:
+            self._task.result(timeout=timeout)
+        except FuturesTimeoutError:
+            # The worker is still active; do not move its directory out from
+            # underneath it.  AsyncCompile.wait() adds the timeout diagnostic.
+            raise
+        except SubprocException as exc:
+            self._move_failed_cache_entry()
+            raise exc.with_name(self._kernel_name) from exc
+        except Exception:
+            self._move_failed_cache_entry()
+            raise
+
+        code_dir = self._compile_dir
+        if self._cache_key is not None:
+            code_dir = commit_compile_dir(self._compile_dir, self._cache_key)
+        self._runner = SpyreSDSCKernelRunner(
+            self._kernel_name,
+            code_dir,
+            kernel_provenance=self._kernel_provenance,
+        )
+        return self._runner
+
+    def _move_failed_cache_entry(self) -> None:
+        if self._cache_key is not None and not self._failure_dir_moved:
+            _move_to_failed_dir(self._compile_dir)
+            self._failure_dir_moved = True
 
 
 class SpyreAsyncCompile(AsyncCompile):
@@ -142,6 +194,24 @@ class SpyreAsyncCompile(AsyncCompile):
             "SpyreAsyncCompile does not support the cpp() path; CPU kernels "
             "go through cpp_pybinding (cpu_backend='cpp')."
         )
+
+    def _submit_dxp(self, kernel_name: str, compile_dir: str) -> Future[str] | None:
+        """Submit DXP to Inductor's process pool, or compile synchronously."""
+        if _spyre_config.async_dxp_compile and get_compile_threads() > 1:
+            # The first use creates the pool and submits its readiness probe.
+            # Waiting for that short probe guarantees the first Spyre kernel is
+            # parallel too, rather than accidentally compiling it inline.
+            self.wait_pool_ready()
+            if self.use_process_pool():
+                return self.process_pool().submit(
+                    _run_dxp,
+                    kernel_name,
+                    compile_dir,
+                    dict(os.environ),
+                )
+
+        _run_dxp(kernel_name, compile_dir, dict(os.environ))
+        return None
 
     def sdsc(
         self,
@@ -216,7 +286,18 @@ class SpyreAsyncCompile(AsyncCompile):
                 # so the rename in commit_compile_dir is atomic on POSIX.
                 compile_dir: str = allocate_compile_dir(cache_key)
                 try:
-                    _compile_to_dir(kernel_name, compile_dir, specs, pool_size)
+                    generate_bundle(
+                        kernel_name, compile_dir, specs, pool_size=pool_size
+                    )
+                    task = self._submit_dxp(kernel_name, compile_dir)
+                    if task is not None:
+                        return _SpyreCompileFuture(
+                            task,
+                            kernel_name,
+                            compile_dir,
+                            kernel_provenance,
+                            cache_key=cache_key,
+                        )
                     cached_dir = commit_compile_dir(compile_dir, cache_key)
                     logger.debug("Kernel compiled and cached at: %s", cached_dir)
                     return SpyreSDSCKernelRunner(
@@ -231,7 +312,15 @@ class SpyreAsyncCompile(AsyncCompile):
         # Caching disabled (SPYRE_KERNEL_CACHE=0 or force_disable_caches).
         # Compile into a throw-away temp dir that lives for this process only.
         output_dir = get_output_dir(kernel_name)
-        _compile_to_dir(kernel_name, output_dir, specs, pool_size)
+        generate_bundle(kernel_name, output_dir, specs, pool_size=pool_size)
+        task = self._submit_dxp(kernel_name, output_dir)
+        if task is not None:
+            return _SpyreCompileFuture(
+                task,
+                kernel_name,
+                output_dir,
+                kernel_provenance,
+            )
         return SpyreSDSCKernelRunner(
             kernel_name,
             output_dir,
