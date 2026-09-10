@@ -422,6 +422,63 @@ def spyre_softplus(
     return torch.ops.spyre.softplus(input * beta, 1.0, threshold) * inv_beta
 
 
+def _pow_by_squaring(input: torch.Tensor, exponent: int) -> torch.Tensor:
+    """``input ** exponent`` for ``exponent >= 1`` as a chain of ``mul`` ops.
+
+    Binary square-and-multiply, so ~2*log2(n) multiplies. That is optimal for
+    every exponent below 15 and never more than one multiply above optimal
+    through at least n=40, so the addition-chain search that would close the
+    gap is not worth the table it needs.
+    """
+    result = None
+    square = input
+    while exponent:
+        if exponent & 1:
+            result = square if result is None else torch.mul(result, square)
+        exponent >>= 1
+        if exponent:
+            square = torch.mul(square, square)
+    return result
+
+
+@register_spyre_decompositions([torch.ops.aten.pow.Tensor_Scalar])
+def spyre_pow_tensor_scalar(
+    input: torch.Tensor, exponent: Union[int, float]
+) -> torch.Tensor:
+    """``pow`` with a scalar exponent: an exact primitive where one exists, a
+    multiply chain for any other integer, and ``exp(n * log(x))`` otherwise.
+
+    Limitation: a negative base with a non-integer exponent returns a finite
+    garbage value where CPU returns NaN.
+    """
+    if isinstance(exponent, bool):
+        exponent = int(exponent)
+    if not input.dtype.is_floating_point:
+        # TODO: support integer bases; needs aten's promotion rules plus device
+        # support for integer multiply chains.
+        raise Unsupported(f"pow with a non-floating-point base: {input.dtype}")
+
+    # int, float, or SymFloat depending on the trace, and not stable across runs.
+    e = float(exponent)
+    if e == 1.0:
+        # Returning the input rather than a copy is legal because a
+        # decomposition runs on a functionalized graph; callers must not rely on
+        # either identity, since aten's contract is only that the value matches.
+        return input
+    if e == -1.0:
+        return torch.reciprocal(input)
+    if e == 0.5:
+        return torch.sqrt(input)
+    if e == -0.5:
+        return torch.rsqrt(input)
+    if e == 0.0:
+        return torch.ones_like(input)
+    if e.is_integer():
+        magnitude = _pow_by_squaring(input, abs(int(e)))
+        return torch.reciprocal(magnitude) if e < 0 else magnitude
+    return torch.exp(e * torch.log(input))
+
+
 @register_spyre_decompositions([torch.ops.aten.linear.default])
 def spyre_linear(
     input: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None
