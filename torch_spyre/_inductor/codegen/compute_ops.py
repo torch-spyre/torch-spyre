@@ -19,7 +19,10 @@ from typing import Any
 from sympy import Symbol
 
 from torch_spyre._C import DataFormats, encode_constant
-from torch_spyre._inductor.constants import CONV2D_DIM_LABELS, DEPTHWISE_CONV2D_OP
+from torch_spyre._inductor.constants import (
+    CONV2D_DIM_LABELS,
+    DEPTHWISE_CONV2D_OP,
+)
 from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.op_spec import TensorWorkDivision
 from torch_spyre._inductor.pass_utils import coeff_through_floor
