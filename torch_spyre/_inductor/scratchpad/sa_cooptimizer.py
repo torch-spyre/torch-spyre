@@ -51,6 +51,7 @@ from typing import TYPE_CHECKING, Any, Optional, Union, cast
 
 import sympy
 
+from torch_spyre._inductor.scratchpad.division_generation import undeclared_splits
 from torch_spyre._inductor.scratchpad.firstfit_bestfit_solver import (
     FirstFitLayoutSolver,
 )
@@ -130,15 +131,6 @@ def _canonical_key(division: "CoreDivision") -> tuple:
         tuple(sorted(division.reduction_syms, key=str)),
         division.tiling,
     )
-
-
-def _undeclared_splits(config: "DivisionConfig", sym_core_divs: dict) -> set:
-    """The split keys of ``config`` that ``sym_core_divs`` declares no symbol for.
-
-    Empty is the contract :meth:`SaCoOptimizingSolver._build_configs` states and
-    a config generator has to meet; anything in here would be priced as unsplit.
-    """
-    return set(config.splits) - set(sym_core_divs)
 
 
 @dataclass(frozen=True, eq=False)
@@ -475,7 +467,7 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
             self._bufs, self._configs, self._sym_core_divs
         ):
             for config in configs:
-                undeclared = _undeclared_splits(config, declared)
+                undeclared = undeclared_splits(config.division, declared)
                 assert not undeclared, (
                     f"buffer {buf.name}: config {config.key} splits "
                     f"{sorted(str(key) for key in undeclared)}, which the cost "
