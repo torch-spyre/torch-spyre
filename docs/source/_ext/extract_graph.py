@@ -1011,6 +1011,8 @@ def build_graph(torch_spyre_root):
         root / "__init__.py",
         root / "logging_config.py",
         root / "profiler" / "_ffdc.py",
+        root / "_inductor" / "dump_common.py",
+        root / "_inductor" / "dump_cost_model.py",
     ]:
         if extra_config.exists():
             n, e = _run_file_extractor(extract_config, extra_config, repo_root)

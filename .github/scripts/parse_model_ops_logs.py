@@ -16,10 +16,10 @@ JSON output schema (array of objects)
   run_id              : GHA run ID string
   suite_name          : human-readable model suite (from filename)
   model_name          : config stem, e.g. "gpt-oss-20b"
-  yaml_file           : config filename, e.g. "gpt-oss-20b_spyre.yaml"
+  yaml_file           : config filename, e.g. "gpt-oss-20b.yaml"
   operation           : torch op name, e.g. "torch.mul"
   classification      : "spyre_enabled" | "not_implemented" | "cpu_fallback"
-  test_name           : pytest node id, e.g. "test_model_ops_db_torch_mul__1_spyre_float16"
+  test_name           : pytest node id, e.g. "test_model_ops_db_torch_mul__1_float16"
   status              : "XPASS" | "XFAIL" | "FALLBACK"
   input_shapes        : list[str] of per-tensor shape strings, e.g. ["[1,12,4096]"]
   input_strides       : list[str] of per-tensor stride strings
@@ -108,8 +108,8 @@ RE_TEST_INLINE = re.compile(
 
 # [TAGS = tag1 tag2 …] block on the test result line.
 # We only want the last token — the yaml test-case tag, which always starts
-# with "torch." (e.g. torch.lt.2_spyre, torch.sym_sum.3, torch.float.4).
-# Structure: model__x dtype__x op__x platform__x86_64 [modifier] <torch.op.N[_spyre]>
+# with "torch." (e.g. torch.lt.2, torch.sym_sum.3, torch.float.4).
+# Structure: model__x dtype__x op__x platform__x86_64 [modifier] <torch.op.N>
 RE_TAGS = re.compile(r"\[TAGS\s*=[^\]]*\s(?P<tag>torch\.[\w.]+)\s*\]")
 
 # GHA stall-watcher variant — the stall message interrupts the line so the
@@ -136,7 +136,7 @@ RE_TEST_SEP_ONLY = re.compile(
 RE_XPASS_ALONE = re.compile(r"^XPASS\b")
 RE_XFAIL_ALONE = re.compile(r"^XFAIL\b")
 
-# Legacy: "Op: torch.mul | Test: test_model_ops_db_torch_mul__1_spyre_float16"
+# Legacy: "Op: torch.mul | Test: test_model_ops_db_torch_mul__1_float16"
 RE_OP_LINE = re.compile(
     r"Op:\s+(?P<op>[\w.]+)\s+\|\s+Test:\s+(?P<test>test_model_ops_db_[\w]+)"
 )
@@ -269,17 +269,17 @@ def _op_from_test_name(test_name: str) -> str:
 
     Examples
     --------
-    test_model_ops_db_torch_mul__1_spyre_float16
+    test_model_ops_db_torch_mul__1_float16
         → torch.mul
-    test_model_ops_db_torch_Tensor_contiguous__49_spyre_float16
+    test_model_ops_db_torch_Tensor_contiguous__49_float16
         → torch.Tensor.contiguous
-    test_model_ops_db_torch_nn_functional_linear__23_spyre_float16
+    test_model_ops_db_torch_nn_functional_linear__23_float16
         → torch.nn.functional.linear
-    test_model_ops_db_torch___eq____43_spyre_int64
+    test_model_ops_db_torch___eq____43_int64
         → torch.__eq__
-    test_model_ops_db_torch__C__log_api_usage_once__16_spyre_float16
+    test_model_ops_db_torch__C__log_api_usage_once__16_float16
         → torch._C._log_api_usage_once
-    test_model_ops_db_torch_index_copy_out__43_spyre_float16
+    test_model_ops_db_torch_index_copy_out__43_float16
         → torch.index_copy_
     """
     # Strip known prefix
@@ -382,7 +382,8 @@ def _suite_from_filename(filename: str):
 
 def _yaml_file_from_model_name(model_name: str) -> str:
     """Best-effort guess at the yaml filename."""
-    # e.g. "gpt-oss-20b-spyre" → "gpt-oss-20b_spyre.yaml"
+    # e.g. "gpt-oss-20b" → "gpt-oss-20b.yaml"
+    # Note: should not meet the following case, but leave it for safety
     # Suite names ending in " Spyre" map to _spyre.yaml
     slug = re.sub(r"-spyre$", "_spyre", model_name)
     return f"{slug}.yaml"

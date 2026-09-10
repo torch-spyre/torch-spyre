@@ -39,8 +39,13 @@ from unittest import TestCase, mock
 
 import sympy
 from torch._inductor.dependencies import MemoryDep
+from torch._inductor.ir import ExternKernel, FallbackKernel
 
-from torch_spyre._inductor.scratchpad.utils import _would_produce_lx_back_gap
+from torch_spyre._inductor import config
+from torch_spyre._inductor.scratchpad.utils import (
+    _would_produce_lx_back_gap,
+    get_ncores_for_buffers,
+)
 
 _COORDS = "torch_spyre._inductor.scratchpad.utils.device_coordinates"
 
@@ -139,6 +144,31 @@ class BackGapTest(TestCase):
         gap. This is why the check needs real range analysis and not ``subs``.
         """
         self.assertFalse(_back_gap(sympy.Mod(d0, 5), 4, {d0: 8}))
+
+
+class ExternalOperandTest(TestCase):
+    def test_external_operands_never_publish_physical_ownership(self):
+        graph = SimpleNamespace(try_get_buffer=lambda name: None)
+        for op_type in (ExternKernel, FallbackKernel):
+            for cores in (1, 32):
+                with self.subTest(op=op_type.__name__, cores=cores):
+                    op = mock.Mock(spec=op_type)
+                    op.get_name.return_value = "opaque"
+                    with (
+                        config.patch({"sencores": cores}),
+                        mock.patch(
+                            "torch_spyre._inductor.scratchpad.utils._get_buffer_user_deps",
+                            return_value={_BUF: [(op, None)]},
+                        ),
+                        mock.patch(
+                            "torch_spyre._inductor.scratchpad.utils._per_core_view_on_buf"
+                        ) as project,
+                    ):
+                        counts, reasons, views = get_ncores_for_buffers(graph)
+                    self.assertEqual(counts, {_BUF: -1})
+                    self.assertIn("FallbackKernel/ExternKernel", reasons[_BUF])
+                    self.assertEqual(views, {})
+                    project.assert_not_called()
 
 
 if __name__ == "__main__":
