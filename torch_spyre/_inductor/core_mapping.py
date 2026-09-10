@@ -24,6 +24,7 @@ from typing import Any, Callable
 
 from sympy import Expr, Integer, Mod, Symbol, floor, sympify
 
+from torch_spyre._C import DataFormats, get_device_size_in_bytes
 from .op_spec import TensorWorkDivision
 
 
@@ -241,6 +242,188 @@ def direct_axis_ownership_failure(
         return None
     except _EVALUATION_ERRORS as exc:
         return f"unsupported ownership evaluation: {type(exc).__name__}: {exc}"
+
+
+def decompose_fused_split_view(
+    fused_symbol: Symbol,
+    fused_split: int,
+    fused_slot_expr: Expr,
+    tensor_ownership: TensorWorkDivision,
+    loop_extents: Mapping[Symbol, int],
+    device_size: Sequence[int],
+    device_coordinates: Sequence[Expr],
+    num_cores: int,
+    *,
+    rejection_reasons: list[str] | None = None,
+) -> tuple[tuple[tuple[int, int], ...], tuple[tuple[int, Expr], ...]] | None:
+    """Express one contiguous fused-loop partition on physical device axes.
+
+    Each loop partition must fill one rectangle of the same shape. The existing
+    mapping generator must reproduce those rectangles' origins in partition
+    order; substituting the committed loop owner then preserves physical cores.
+    """
+
+    def reject(reason: str) -> None:
+        if rejection_reasons is not None:
+            rejection_reasons.append(reason)
+
+    try:
+        fused_split = int(fused_split)
+        num_cores = int(num_cores)
+        if fused_split <= 1 or num_cores <= 0 or num_cores % fused_split:
+            reject("unsupported ownership input: fused split must divide the cores")
+            return None
+        if len(device_size) != len(device_coordinates):
+            reject("unsupported ownership input: sizes and coordinates differ in rank")
+            return None
+        extent_expr = sympify(loop_extents[fused_symbol])
+        if extent_expr.free_symbols or extent_expr.is_integer is not True:
+            reject(
+                f"unsupported ownership input: fused extent {extent_expr} not concrete"
+            )
+            return None
+        extent = int(extent_expr)
+        if extent <= 0 or extent % fused_split:
+            reject(f"unsupported ownership input: fused extent {extent} not divisible")
+            return None
+        if extent + fused_split > _MAX_EXACT_OWNERSHIP_POINTS:
+            reject(
+                f"proof limit: fused decomposition needs {extent + fused_split} states; limit is {_MAX_EXACT_OWNERSHIP_POINTS}"
+            )
+            return None
+        core_id = Symbol("core_id")
+        fused_slot_expr = sympify(fused_slot_expr)
+        if fused_slot_expr.free_symbols - {core_id}:
+            reject(
+                "unsupported ownership expression: fused owner has unresolved symbols"
+            )
+            return None
+
+        # Judge broadcast multiplicity using the complete tuple of tensor-owned
+        # axes. A V page, for example, is owned by (batch x KV-head, D): either
+        # axis alone looks repeated in non-contiguous groups, while the pair is
+        # one canonical 16-owner partition broadcast to the two query groups.
+        # Operation axes absent from this tensor are deliberately excluded, so
+        # truly interleaved broadcast groups still require a richer ownership
+        # model and remain fail-closed.
+        if (
+            int(tensor_ownership.work_slices.get(fused_symbol, 1)) != fused_split
+            or tensor_ownership.physical_core_count != num_cores
+            or not core_mappings_equal(
+                {fused_symbol: tensor_ownership.core_id_to_work_slice[fused_symbol]},
+                {fused_symbol: fused_slot_expr},
+                num_cores,
+            )
+            or select_unique_partition_division(
+                tuple(tensor_ownership.work_slices),
+                tensor_ownership.work_slices,
+                num_cores,
+                tensor_ownership.same_ownership,
+                rejection_reasons=rejection_reasons,
+            )
+            is None
+        ):
+            reject(
+                "no certified decomposition: tensor ownership has no canonical order"
+            )
+            return None
+
+        driven = tuple(
+            axis
+            for axis, coordinate in enumerate(device_coordinates)
+            if fused_symbol in sympify(coordinate).free_symbols
+        )
+        if not 2 <= len(driven) <= 5:
+            reject(
+                f"proof limit: fused loop drives {len(driven)} axes; 2 to 5 supported"
+            )
+            return None
+        if any(
+            sympify(device_coordinates[axis]).free_symbols != {fused_symbol}
+            for axis in driven
+        ):
+            reject(
+                "unsupported ownership expression: fused axis depends on other loops"
+            )
+            return None
+        device_extents = {}
+        for axis in driven:
+            device_extent = sympify(device_size[axis])
+            if device_extent.free_symbols or device_extent.is_integer is not True:
+                reject(
+                    f"unsupported ownership input: axis {axis} extent is not concrete"
+                )
+                return None
+            device_extents[axis] = int(device_extent)
+        regions = _loop_regions(
+            extent,
+            tuple(
+                sympify(device_coordinates[axis]).xreplace({fused_symbol: _LOOP_POINT})
+                for axis in driven
+            ),
+            tuple(device_extents[axis] for axis in driven),
+            fused_split,
+            rectangles=True,
+        )
+        origins = [tuple(low for low, _ in bounds) for bounds in regions]
+        shapes = {tuple(high - low + 1 for low, high in bounds) for bounds in regions}
+        if len(shapes) != 1:
+            reject(
+                "unsupported physical ownership: fused partitions are not one rectangle shape"
+            )
+            return None
+        widths = next(iter(shapes))
+        if any(device_extents[axis] % width for axis, width in zip(driven, widths)):
+            reject(
+                "unsupported physical ownership: rectangles do not divide device extents"
+            )
+            return None
+        factors = {
+            axis: device_extents[axis] // width for axis, width in zip(driven, widths)
+        }
+        split_dims = tuple(
+            (axis, factor) for axis, factor in factors.items() if factor > 1
+        )
+        if not split_dims:
+            reject("no certified decomposition: no physical dimension is split")
+            return None
+
+        synthetic = {axis: Symbol(f"physical_dim_{axis}") for axis in driven}
+        expected = tuple(
+            {
+                synthetic[axis]: lo // width
+                for axis, lo, width in zip(driven, row, widths)
+            }
+            for row in origins
+        )
+        if any(lo % width for row in origins for lo, width in zip(row, widths)):
+            reject("ownership mismatch: one loop partition crosses physical slices")
+            return None
+        for order in permutations(driven):
+            mapping = core_to_slice_mapping(
+                tuple(synthetic[axis] for axis in order),
+                tuple(factors[axis] for axis in order),
+                fused_split,
+            )
+            if (
+                owner_slots(
+                    mapping,
+                    {synthetic[axis]: factor for axis, factor in factors.items()},
+                    fused_split,
+                )
+                == expected
+            ):
+                return tuple(sorted(split_dims)), tuple(
+                    sorted(
+                        (axis, mapping[synthetic[axis]].subs(core_id, fused_slot_expr))
+                        for axis, _ in split_dims
+                    )
+                )
+        reject("no certified decomposition: no canonical physical order matched")
+        return None
+    except _EVALUATION_ERRORS as exc:
+        reject(f"unsupported ownership evaluation: {type(exc).__name__}: {exc}")
+        return None
 
 
 def select_unique_partition_division(
@@ -656,6 +839,43 @@ def derive_operation_mapping(
             return candidate
 
     raise ValueError("no operation core mapping satisfies every LX tensor owner")
+
+
+def partition_physical_span_bytes(
+    device_size: Sequence[int],
+    device_dtype: DataFormats,
+    split_by_device_dim: Mapping[int, int],
+) -> int:
+    """Bound a standard-layout partition, retaining physical gaps between rows.
+
+    Device dimensions are stored in decreasing physical-stride order. The
+    layout's ``stride_map`` instead addresses HOST memory and must not size LX.
+    A backend may pack a partition more tightly; retaining the original device
+    strides is a conservative bound. The final dimension is one complete stick
+    and is never split. This measures placement, not the split-cost estimate.
+    """
+
+    if not device_size or any(extent <= 0 for extent in device_size):
+        raise ValueError("device extents must be positive")
+    elems_per_stick = device_dtype.elems_per_stick()
+    if elems_per_stick <= 0:
+        raise ValueError("elems_per_stick must be positive")
+    for dim, split in split_by_device_dim.items():
+        if dim < 0 or dim >= len(device_size) or split <= 0:
+            raise ValueError(f"invalid split {split} on device dimension {dim}")
+    if device_size[-1] != elems_per_stick:
+        raise ValueError("physical span requires one complete final stick dimension")
+    if split_by_device_dim.get(len(device_size) - 1, 1) != 1:
+        raise ValueError("the final stick dimension cannot be split")
+
+    span_sticks = stride_sticks = 1
+    for dim in reversed(range(len(device_size) - 1)):
+        extent = device_size[dim]
+        split = split_by_device_dim.get(dim, 1)
+        slice_extent = (extent + split - 1) // split
+        span_sticks += (slice_extent - 1) * stride_sticks
+        stride_sticks *= extent
+    return get_device_size_in_bytes([span_sticks, elems_per_stick], device_dtype)
 
 
 def core_mappings_equal(
