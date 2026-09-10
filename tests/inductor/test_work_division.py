@@ -43,6 +43,7 @@ from torch_spyre._inductor.constants import (
 )
 from torch_spyre._inductor.pass_utils import PerCoreView, SchedNodeArg
 from torch_spyre._inductor.scratchpad import allocator as allocator_module
+from torch_spyre._inductor.scratchpad import division_generation
 from torch_spyre._inductor.scratchpad.allocator import (
     CoOptimizingAllocator,
     CoreDivision,
@@ -1887,6 +1888,9 @@ class TestResidencyEdgeMatching(unittest.TestCase):
         return (views[index], partial[index], repr_ok[index])
 
     def _patches(self):
+        # ``op_read_writes`` is called from both modules -- the allocator reads
+        # the consumer's, the edge its producer's -- so each name is patched
+        # wherever it is bound.
         stack = ExitStack()
         for target, kwargs in [
             ("_view_for_div", {"side_effect": self._view_for_div}),
@@ -1904,12 +1908,9 @@ class TestResidencyEdgeMatching(unittest.TestCase):
                 {"side_effect": lambda op: op.get_name() == "matmul"},
             ),
         ]:
-            stack.enter_context(
-                patch(
-                    f"torch_spyre._inductor.scratchpad.allocator.{target}",
-                    **kwargs,
-                )
-            )
+            for module in (allocator_module, division_generation):
+                if hasattr(module, target):
+                    stack.enter_context(patch.object(module, target, **kwargs))
         return stack
 
     def _table(self, allocator):
@@ -1999,7 +2000,7 @@ class TestResidencyEdgeMatching(unittest.TestCase):
         with self._patches():
             table = self._table(allocator)
             for parent, pairs in table.items():
-                edge = allocator_module.build_residency_edge(
+                edge = division_generation.build_residency_edge(
                     parent,
                     self.op_by_name[parent],
                     self.consumer_op,
@@ -2039,7 +2040,7 @@ class TestResidencyEdgeMatching(unittest.TestCase):
                 ("spilled", "residency"),
             ]:
                 self.assertIsNone(
-                    allocator_module.build_residency_edge(
+                    division_generation.build_residency_edge(
                         parent,
                         self.op_by_name[parent],
                         self.consumer_op,
@@ -2205,6 +2206,8 @@ class TestCoOptimizingAllocator(unittest.TestCase):
                 "torch_spyre._inductor.scratchpad.allocator.op_read_writes",
                 return_value=rw,
             ),
+            # ``_core_division`` reads the write dep from its own module.
+            patch.object(division_generation, "op_read_writes", return_value=rw),
             patch(
                 "torch_spyre._inductor.scratchpad.allocator._split_fits_sticks",
                 return_value=True,
@@ -2311,6 +2314,8 @@ class TestCoOptimizingAllocator(unittest.TestCase):
                 "torch_spyre._inductor.scratchpad.allocator.op_read_writes",
                 return_value=rw,
             ),
+            # ``_core_division`` reads the write dep from its own module.
+            patch.object(division_generation, "op_read_writes", return_value=rw),
             patch(
                 "torch_spyre._inductor.scratchpad.allocator._split_fits_sticks",
                 return_value=True,
