@@ -1182,6 +1182,9 @@ if '_cls_${cls}' in globals():
 import sys as _sys, os as _os
 _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
 
+# Loads the generated __oot_conftest_${original_stem}.py as a plugin -- it isn't named conftest.py, so pytest won't auto-discover it here (outside any repo's tree).
+pytest_plugins = ["__oot_conftest_${original_stem}"]
+
 # Ensure the spyre tests directory is on sys.path before any torch imports.
 # torch.testing._internal.common_device_type uses runpy to load
 # TORCH_TEST_DEVICES (oot_test_base_common.py), which imports spyre_*
@@ -1404,6 +1407,21 @@ import torch.testing._internal.common_utils as _cu
 _dl = getattr(_cu, 'DEVICE_LIST_SUPPORT_PROFILING_TEST', None)
 if _dl is not None and 'privateuse1' not in _dl:
     _cu.DEVICE_LIST_SUPPORT_PROFILING_TEST = list(_dl) + ['privateuse1']
+
+import os
+
+# pytest's own summary only shows the xfail marker's static reason, hiding the actual error -- print it too.
+def _xfail_failure_message(report):
+    longrepr = report.longrepr
+    reprcrash = getattr(longrepr, "reprcrash", None)
+    message = reprcrash.message if reprcrash is not None else str(longrepr)
+    message = " ".join(message.split())
+    return message[:300] + "..." if len(message) > 300 else message
+
+
+def pytest_runtest_logreport(report):
+    if report.when == "call" and report.skipped and getattr(report, "wasxfail", None) is not None:
+        os.write(1, f"  [XFAIL ERROR = {_xfail_failure_message(report)}]\n".encode())
 CONFTEST_EOF
 
     WRAPPER_FILES+=("$wrapper_path" "$conftest_path")
