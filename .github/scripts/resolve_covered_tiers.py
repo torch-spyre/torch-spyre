@@ -47,6 +47,8 @@ TIER_TAG_PREFIX = "testtype__"
 # prod, integration ⊄ trunk had 616 case-level violations, so ladder inference would
 # silently drop real tests.
 
+# ClickHouse bound params are written {{name:Type}} here because this string goes through
+# .format() for `db`/`horizon` -- single braces would be consumed as format fields.
 # Coverage for the artifacts built from this commit, on this arch. Joined through
 # artifacts.sources -- Array(Tuple(repo, git_ref, git_sha)) -- because a GHA run knows
 # its sha, not its artifact_id (the orchestrator owns artifact_id, keyed by run_id).
@@ -64,16 +66,12 @@ INNER JOIN (
 ) AS a ON a.artifact_id = ar.artifact_id
 INNER JOIN {db}.test_cases AS c USING (test_case_id)
 ARRAY JOIN c.tags AS tag
-WHERE a.git_sha = {commit_sha}
-  AND ar.arch = {arch}
+WHERE a.git_sha = {{commit_sha:String}}
+  AND ar.arch = {{arch:String}}
   AND ar.state IN ('passed', 'failed')
-  AND tag IN {tiers}
+  AND tag IN {{tiers:Array(String)}}
   AND r.ts >= now() - INTERVAL {horizon} DAY
 """.strip()
-
-
-def _quote(value: str) -> str:
-    return "'" + str(value).replace("\\", "\\\\").replace("'", "\\'") + "'"
 
 
 def covered_tiers(
@@ -86,17 +84,28 @@ def covered_tiers(
     horizon: int,
     timeout: int = 20,
 ) -> list[str]:
-    sql = QUERY.format(
-        db=db,
-        commit_sha=_quote(commit_sha),
-        arch=_quote(arch),
-        tiers="(" + ",".join(_quote(TIER_TAG_PREFIX + t) for t in TIER_LABELS) + ")",
-        horizon=int(horizon),
-    )
+    # Only `db` and `horizon` are interpolated: a database is an identifier and an INTERVAL
+    # takes a literal, neither of which ClickHouse binds. Both are ours, not caller input --
+    # db from the environment, horizon coerced to int here.
+    sql = QUERY.format(db=db, horizon=int(horizon))
+    # Values bind as param_<name>, read back by {name:Type} in the query. The HTTP API
+    # supports this with no client library, which matters because this script is stdlib-only:
+    # it runs in the GHA matrix job, where clickhouse_connect is not installed.
     endpoint = (
         url.rstrip("/")
         + "/?"
-        + urllib.parse.urlencode({"database": db, "default_format": "TSVRaw"})
+        + urllib.parse.urlencode(
+            {
+                "database": db,
+                "default_format": "TSVRaw",
+                "param_commit_sha": commit_sha,
+                "param_arch": arch,
+                # A bound Array literal, so a tier name can never be read as SQL.
+                "param_tiers": "["
+                + ",".join(f"'{TIER_TAG_PREFIX}{t}'" for t in TIER_LABELS)
+                + "]",
+            }
+        )
     )
     req = urllib.request.Request(endpoint, data=sql.encode(), method="POST")
     if user:

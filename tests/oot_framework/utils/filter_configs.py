@@ -225,9 +225,10 @@ def main() -> None:
         default="",
         help=(
             "Comma-separated tiers whose results already exist for this artifact. "
-            "A config is dropped only when EVERY tier it declares is in this list, "
-            "so it adds nothing to run. Empty (the default) runs the full tier -- "
-            "which is what an unreachable ClickHouse degrades to."
+            "A config is dropped when ANY tier it declares is in this list: that tier "
+            "already covered the config, so re-running it adds nothing. Empty (the "
+            "default) runs the full tier -- which is what an unreachable ClickHouse "
+            "degrades to."
         ),
     )
     ap.add_argument(
@@ -269,16 +270,15 @@ def main() -> None:
         if _already_covered(labels, exclude_tiers):
             skipped_covered += 1
             continue
-        if True:
-            rel = str(cfg.relative_to(config_dir))
-            results.append(
-                {
-                    "name": _display_name(cfg, config_dir),
-                    "config": rel,
-                    "runner": runner_map.get(rel, "spyre_pf_x1"),
-                    "path": str(cfg),
-                }
-            )
+        rel = str(cfg.relative_to(config_dir))
+        results.append(
+            {
+                "name": _display_name(cfg, config_dir),
+                "config": rel,
+                "runner": runner_map.get(rel, "spyre_pf_x1"),
+                "path": str(cfg),
+            }
+        )
 
     if skipped_covered:
         print(
