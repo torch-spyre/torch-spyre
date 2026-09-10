@@ -86,17 +86,39 @@ def _work_slices(op, write_index, read_index, iteration_space, work_slices=None)
     )
 
 
-def _cores(op, work_slices=None) -> int:
+def _resolved_work_slices(op, work_slices=None) -> dict:
+    """The op's complete symbol-keyed core-split map (``{}`` when unavailable):
+    the explicit candidate during LX planning, else the committed ownership."""
     try:
         rw = op.get_read_writes()
         write_index = next(iter(rw.writes)).index
         read_index = next((d.index for d in rw.reads), write_index)
         it_space = iteration_space_from_op(op)
-        return math.prod(
-            _work_slices(op, write_index, read_index, it_space, work_slices).values()
-        )
+        return _work_slices(op, write_index, read_index, it_space, work_slices) or {}
+    except Exception:  # noqa: BLE001 - best-effort feature extraction
+        return {}
+
+
+def _cores(op, work_slices=None) -> int:
+    slices = _resolved_work_slices(op, work_slices)
+    return math.prod(slices.values()) if slices else 1
+
+
+def _replication(index, slices: dict):
+    """How many cores each load this read's bytes: the product of the op's core
+    splits on iteration symbols the read index does not contain. A split on a dim
+    the read indexes hands each core a different slice (no replication); a split on
+    a dim it does not index puts the same slice on every core of that split. The
+    symbols are the op's own iteration symbols, so indirect-access symbols in the
+    index are simply never split keys. Splits may be solver symbols (co-optimizing
+    path), in which case the product is a sympy expression, like ``cores``."""
+    if index is None or not slices:
+        return 1
+    try:
+        present = set(getattr(index, "free_symbols", ()) or ())
     except Exception:  # noqa: BLE001 - best-effort feature extraction
         return 1
+    return math.prod(split for sym, split in slices.items() if sym not in present)
 
 
 def _mem_of_layout(layout) -> str:
@@ -600,7 +622,8 @@ def extract_op_features(
     out_dims = _device_dims(op.get_layout()) or out_size
     out_elems = _prod_ints(out_dims)
 
-    cores = _cores(op, work_slices)
+    slices = _resolved_work_slices(op, work_slices)
+    cores = math.prod(slices.values()) if slices else 1
 
     # Cross-core ring combine: work division splits OUTPUT dims first, then the reduced
     # axis with leftover cores -> the reduced axis is split only when out_elems < cores.
@@ -766,6 +789,10 @@ def extract_op_features(
                     else in_factor
                 ),
                 is_boundary=(None if graph_inputs is None else name in graph_inputs),
+                # Matmul consumers only: rung-G verified a pointwise broadcast
+                # operand loads once per kernel, the relayout sweep measured a bmm
+                # operand loading once per replicated core (cost_model.ArgTraffic).
+                replication=_replication(index, slices) if is_matmul else 1,
             )
         )
 

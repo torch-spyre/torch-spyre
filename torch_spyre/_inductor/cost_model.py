@@ -64,6 +64,13 @@ Model (per fused bundle / single-op kernel):
   30-33us, both far below the full 3-pass add (52us). A per-core reload would have added
   ~cores*C and pushed bcast up toward add; it did not -- so the operand costs a single
   load regardless of how the work splits across cores.
+- MATMUL operands are the exception (``ArgTraffic.replication``): a bmm whose core split
+  lies on a dim an operand does not index (M-split -> B, N-split -> A) makes every core
+  in that split load its own full copy of the operand's slice from HBM. The grouped
+  LX-relayout sweep (2026-09-09, 43 gather/broadcast rows, replication 2-16) measured
+  the consumer-from-HBM time as ~2.5us + f*B at 60-67 GB/s -- f times the one-load
+  bytes -- and the once-per-input count under-predicted the demote penalty 10-40x.
+  Residency removes all f loads; a resident graph input keeps only its clone-in load.
 
 Byte counts use each arg's DEVICE layout (stick-padded ``device_size``), not the torch
 logical shape -- so a reduction's reduced input is naturally full-sized and stick
@@ -198,6 +205,18 @@ class ArgTraffic:
     # ``_fused_hbm_bytes`` de-duplicates on. Meaningless, and left True, on an arg
     # that is not a boundary arg.
     owns_boundary_charge: bool = True
+    # How many cores each read this arg's bytes from HBM: the product of the
+    # consumer's core splits on iteration dims this arg's read index does NOT
+    # contain. Every such split places a full copy of the arg's slice on another
+    # core, and each core performs its own load, so the HBM bytes scale by this
+    # factor when the arg is not LX-resident. 1 for an arg indexed by every split
+    # dim (a permutation; each core reads exactly its own slice). Stamped for
+    # MATMUL consumers only: the grouped-relayout sweep (2026-09-09) measured a
+    # bmm reading a replicated operand at f x bytes (2.5 us + f*B at 60-67 GB/s),
+    # while the rung-G probe verified that a POINTWISE broadcast operand is loaded
+    # once, not per core (see ``broadcast``). May be a sympy expression of the
+    # solver's split symbols in the co-optimizing path.
+    replication: int = 1
 
     @property
     def is_graph_boundary(self) -> bool:
@@ -217,10 +236,22 @@ class ArgTraffic:
         bundle is priced like any other arg: the clone loaded it, so residency does
         free this read, and without residency every bundle re-reads it from HBM.
         ``is_lx`` may be a solver decision variable, so the residency factor stays
-        arithmetic (``1 - is_lx``) rather than a branch."""
+        arithmetic (``1 - is_lx``) rather than a branch.
+
+        A replicated operand (``replication`` > 1) is loaded by every core that
+        holds a copy when it comes from HBM. Residency removes all but the one
+        clone-in load of a boundary arg, so the boundary charge is
+        ``is_lx + replication * (1 - is_lx)`` times the one-load size: exactly the
+        old ``elems * loop_factor`` when replication is 1, and still linear in
+        ``is_lx``."""
+        # A bool residency next to a symbolic replication (a fixed-residency buffer
+        # read under a solver-chosen split) must add as 0/1, not as a sympy Boolean.
+        is_lx = int(self.is_lx) if isinstance(self.is_lx, bool) else self.is_lx
         if self.is_graph_boundary and self.owns_boundary_charge:
-            return self.elems * self.loop_factor
-        return self.elems * self.loop_factor * (1 - self.is_lx)
+            return (
+                self.elems * self.loop_factor * (is_lx + self.replication * (1 - is_lx))
+            )
+        return self.elems * self.loop_factor * self.replication * (1 - is_lx)
 
     @property
     def mem(self) -> str:
@@ -1102,6 +1133,17 @@ def relayout_ns(o: "OpFeatures", params: "CostParams | None" = None) -> float:
     )
 
 
+def _max_traffic(a, b):
+    """``max`` for byte counts that may be sympy expressions of the solver's
+    residency / split symbols (the co-optimizing path): Python's ``max`` compares
+    with ``>`` and raises on a symbolic relational, so fall back to ``sympy.Max``
+    when either side is symbolic. Two structurally equal expressions still collapse
+    to one, and numeric inputs take the plain ``max``."""
+    if isinstance(a, sympy.Basic) or isinstance(b, sympy.Basic):
+        return sympy.Max(a, b)
+    return max(a, b)
+
+
 def _fused_hbm_bytes(ops: list) -> tuple:
     """(read, write) HBM bytes for a FUSED bundle, counting each distinct EXTERNAL graph
     input (``ArgTraffic.is_graph_boundary`` on a read) ONCE even if several fused ops
@@ -1118,7 +1160,7 @@ def _fused_hbm_bytes(ops: list) -> tuple:
             b = a.hbm_elems() * o.dtype_bytes
             if a.role == "input" and a.is_graph_boundary:
                 if a.name in ext_in:
-                    ext_in[a.name] = max(ext_in[a.name], b)
+                    ext_in[a.name] = _max_traffic(ext_in[a.name], b)
                 else:
                     ext_in[a.name] = b
             elif a.role == "input":
@@ -1907,6 +1949,7 @@ def explain(ops: list, params: CostParams | None = None) -> str:
                     if a.owns_boundary_charge
                     else " graph boundary (charged to an earlier bundle)"
                 )
+            rp = f" x{a.replication} replicas" if a.replication != 1 else ""
             counted = a.hbm_elems() * o.dtype_bytes
             dev = a.dims if a.dims else [a.elems]
             log = f"torch {a.logical} -> " if a.logical else ""
@@ -1919,7 +1962,7 @@ def explain(ops: list, params: CostParams | None = None) -> str:
             lines.append(
                 f"      {a.role:<6} {a.name:<22} {log}device {dev} in {mem_repr}"
                 f"  | {a.elems} elems x {o.dtype_bytes}B = {a.elems * o.dtype_bytes} B"
-                f" (hbm counted: {counted} B){lf}{bc}{bd}"
+                f" (hbm counted: {counted} B){lf}{rp}{bc}{bd}"
             )
     if any(getattr(o, "is_matmul", False) for o in ops) and p.use_bundled_cost_model:
         return _explain_matmul_bundled(lines, ops, p)
