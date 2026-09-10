@@ -84,7 +84,6 @@ def _candidate(
         group=group,
         source_view=_view(0),
         destination_view=_view(group + 1),
-        num_cores=4,
         cost_ns=cost_ns,
         # P is 64 bytes over 4 cores; a permutation of an outer split keeps
         # the equal share as its per-core span on both sides.
@@ -483,4 +482,8 @@ def test_fired_groups_regroup_edges_by_source_and_view():
             [c1, ChosenRelayout(_candidate("C2", 0, 5000.0), 64)]
         )
     with pytest.raises(ValueError, match="equal views"):
-        RelayoutCandidate("P", "C", 0, 0, 0, _view(0), _view(0), 4, 1.0, 16, 16)
+        RelayoutCandidate("P", "C", 0, 0, 0, _view(0), _view(0), 1.0, 16, 16)
+    # The core counts are the views': a view without one cannot be a candidate.
+    bare = PerCoreView(((1, 4),), ((1, sympy.Mod(_CORE + 1, 4)),))
+    with pytest.raises(ValueError, match="no physical core count"):
+        RelayoutCandidate("P", "C", 0, 0, 0, _view(0), bare, 1.0, 16, 16)

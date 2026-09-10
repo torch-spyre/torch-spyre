@@ -105,8 +105,10 @@ class RelayoutCandidate:
     (``RelayoutCopyBuffer``), so the solver prices and places the group once,
     not per edge.
 
-    Both views are built for ``num_cores`` (every core's owner slot within its
-    split); the enumeration's ``cores_used`` equality gate guarantees that.
+    Each view carries the physical core count it was built for (every core's
+    owner slot within its split), so ``num_cores`` is the source view's; the
+    enumeration's ``cores_used`` gate guarantees the views were built for the
+    divisions being paired.
 
     ``source_footprint_bytes`` / ``destination_footprint_bytes`` are the
     per-core LX spans of the two views (:func:`partition_footprint`, the bound
@@ -123,12 +125,26 @@ class RelayoutCandidate:
     group: int
     source_view: PerCoreView
     destination_view: PerCoreView
-    num_cores: int
     cost_ns: float
     source_footprint_bytes: int
     destination_footprint_bytes: int
 
+    @property
+    def num_cores(self) -> int:
+        """The source's core count, carried by the source view (the plan's
+        ``num_cores``, as the committed collector records it)."""
+        return cast(int, self.source_view.num_cores)
+
     def __post_init__(self) -> None:
+        for side, view in (
+            ("source", self.source_view),
+            ("destination", self.destination_view),
+        ):
+            if view.num_cores is None:
+                raise ValueError(
+                    f"relayout candidate {self.parent} -> {self.consumer}: the {side} "
+                    "view carries no physical core count"
+                )
         if self.source_view.same_partition(self.destination_view):
             raise ValueError(
                 f"relayout candidate {self.parent} -> {self.consumer} has equal "

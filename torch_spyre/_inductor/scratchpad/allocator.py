@@ -2829,7 +2829,6 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                             group=_intern_view_group(view_groups, cv),
                             source_view=pv,
                             destination_view=cv,
-                            num_cores=ncores,
                             cost_ns=cost,
                             source_footprint_bytes=source_span,
                             destination_footprint_bytes=destination_span,
