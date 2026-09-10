@@ -95,7 +95,12 @@ from .pass_utils import (
     iter_var_id,
     rescale_stl_for_dtype,
 )
-from .optimize_restickify import AllSameNode, AnyInNode, FixedInOutNode
+from .optimize_restickify import (
+    AllSameNode,
+    AnyInNode,
+    FixedInOutNode,
+    _topk_surviving_coords,
+)
 from .views import compute_coordinates, matching_dim
 
 # ---------------------------------------------------------------------------
@@ -1643,21 +1648,22 @@ def _topk_layouts(
     reduction_var = find_reduction_var((x.dep,), output_dep)
 
     # Coords that survive the reduction into the output.
-    surviving_coords = [
-        c
-        for c in x_coords
-        if len(c.free_symbols) > 0 and matching_dim(out_coords, c) is not None
-    ]
+    surviving_coords = _topk_surviving_coords(x_coords, out_coords)
 
     # Collect candidate output stick dims. A valid input stick passes through;
     # a stick on the reduction var requires a restickify, so every surviving
-    # coord becomes a candidate.
+    # coord becomes a candidate. If no surviving coord exists (e.g. every
+    # other dim has host size 1, as with shape (1, N) and dim=1), fall back
+    # to no stick (None) -- same synthetic-stick fallback exx2 always uses.
     out_stick_dims: set[int | None] = set()
     for stl in x.layouts:
         x_stick_expr = device_coordinates(stl, x.dep, None)[-1]
         if reduction_var in x_stick_expr.free_symbols:
-            for c in surviving_coords:
-                out_stick_dims.add(matching_dim(out_coords, c))
+            if surviving_coords:
+                for c in surviving_coords:
+                    out_stick_dims.add(matching_dim(out_coords, c))
+            else:
+                out_stick_dims.add(None)
         else:
             out_stick_dims.add(matching_dim(out_coords, x_stick_expr))
 
