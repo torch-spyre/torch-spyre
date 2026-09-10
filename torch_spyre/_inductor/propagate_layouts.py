@@ -1649,34 +1649,27 @@ def _topk_layouts(
         if len(c.free_symbols) > 0 and matching_dim(out_coords, c) is not None
     ]
 
-    # Collect candidate output stick dims. A valid input stick passes through;
-    # a stick on the reduction var requires a restickify, so every surviving
-    # coord becomes a candidate.
-    out_stick_dims: set[int | None] = set()
-    for stl in x.layouts:
-        x_stick_expr = device_coordinates(stl, x.dep, None)[-1]
-        if reduction_var in x_stick_expr.free_symbols:
-            for c in surviving_coords:
-                out_stick_dims.add(matching_dim(out_coords, c))
-        else:
-            out_stick_dims.add(matching_dim(out_coords, x_stick_expr))
+    # The reduction dim must not be the stick, so pin x to a layout that keeps
+    # it off the stick; a restickify is scheduled when the producer differs.
+    x_req_stl = _find_layout_avoiding_var_on_stick(x, reduction_var, "topk")
 
-    # Build one output STL per candidate stick dim.
-    # Note: the stick dim STL will never be added so will never be
-    #       selected as a candidate output STL
+    # Output sticks on whichever surviving coord x's required layout sticks on.
+    x_stick_expr = device_coordinates(x_req_stl, x.dep, None)[-1]
+    out_stick_dim = matching_dim(out_coords, x_stick_expr)
+    if out_stick_dim is None and surviving_coords:
+        out_stick_dim = matching_dim(out_coords, surviving_coords[0])
+
     c_size = [concretize_expr(s) for s in output.size]
     c_stride = [concretize_expr(s) for s in output.stride]
-    results: list[SpyreTensorLayout] = []
-    for out_stick_dim in out_stick_dims:
-        if out_stick_dim is None:
-            out_dim_order = list(range(len(output.size))) + [-1]
-        else:
-            out_dim_order = [d for d in range(len(output.size)) if d != out_stick_dim]
-            out_dim_order += [out_stick_dim]
-        results.append(SpyreTensorLayout(c_size, c_stride, output.dtype, out_dim_order))
+    if out_stick_dim is None:
+        out_dim_order = list(range(len(output.size))) + [-1]
+    else:
+        out_dim_order = [d for d in range(len(output.size)) if d != out_stick_dim]
+        out_dim_order += [out_stick_dim]
+    out_stl = SpyreTensorLayout(c_size, c_stride, output.dtype, out_dim_order)
 
-    op.restick_cost_fn = AllSameNode.from_args(args, results, output_dep, op)
-    return results
+    op.restick_cost_fn = FixedInOutNode.from_args([x], out_stl, [x_req_stl], op)
+    return [out_stl]
 
 
 def _keep_by_index_layouts(
