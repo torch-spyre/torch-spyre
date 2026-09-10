@@ -164,8 +164,21 @@ def rescale_stl_for_dtype(
     # left as-is.
     for i, s in enumerate(stl.stride_map):
         if s == in_eps:
-            out_device_size[i] = stl.device_size[i] * in_eps // out_eps
+            new_num_sticks = stl.device_size[i] * in_eps // out_eps
+            out_device_size[i] = new_num_sticks
             out_stride_map[i] = out_eps
+            # Fix outer-dim row strides.  stride_map[k] for k < i encodes the
+            # number of host elements to skip per outer-dim step.  After the
+            # stick depth changes from in_eps to out_eps, the device row pitch
+            # widens from old_num_sticks*in_eps to new_num_sticks*out_eps.
+            # compute_coordinates uses stride_map values directly for
+            # next_stride computation, so an un-updated outer stride causes
+            # Mod(c1, old_pitch) in the outer fp32 stick coordinate and makes
+            # the partner fp32 stick unreachable (issue #3999).
+            new_row_pitch = new_num_sticks * out_eps
+            for k in range(i):
+                if out_stride_map[k] > 0:
+                    out_stride_map[k] = new_row_pitch
             break
     return SpyreTensorLayout(
         out_device_size,

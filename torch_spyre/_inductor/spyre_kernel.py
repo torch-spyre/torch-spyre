@@ -20,7 +20,7 @@ import itertools
 import torch
 import sympy
 
-from torch_spyre._C import DataFormats, ElementArrangement
+from torch_spyre._C import DataFormats, ElementArrangement, get_elem_in_stick
 
 from torch._inductor.codegen.common import (
     CSEVariable,
@@ -34,6 +34,8 @@ from torch._inductor.virtualized import V
 
 
 from .constants import (
+    DL16TOFP32_OP,
+    FP32TODL16_OP,
     SPYRE_FP32_OPS,
     SPYRE_INT32_OPS,
     CONV_OPS,
@@ -999,6 +1001,42 @@ class SpyreKernel(Kernel[CSEVariable]):
             and hasattr(ir_node.data, "ranges")
             else None
         )
+        needs_dl16fp32_padding = op in (DL16TOFP32_OP, FP32TODL16_OP) or any(
+            arg.element_arrangement == ElementArrangement.DL16_TO_FP32 for arg in args
+        )
+        if needs_dl16fp32_padding:
+            stick_size = max(
+                get_elem_in_stick(torch.float16),
+                *(arg.device_dtype.elems_per_stick() for arg in args),
+            )
+            # Derive the stick-driving symbol from the output arg's stick
+            # coordinate (device_coordinates[-1]).  The output is the last
+            # element of args; its stick expression was computed in
+            # create_tensor_arg from the committed FixedTiledLayout, so its
+            # free symbols contain exactly the iteration variable that drives
+            # the stick.  This is the canonical source — no insertion-order
+            # assumption is required.
+            out_stick_coord = args[-1].device_coordinates[-1]
+            stick_syms = out_stick_coord.free_symbols & it_space_extended.keys()
+            if not stick_syms:
+                # Broadcast or constant stick: no iteration symbol to pad.
+                pass
+            else:
+                # Pick the symbol with the smallest denominator in the stick
+                # expression (the one that increments every element, not every
+                # N sticks).  For floor(c1/32) that is c1; for a plain c1 it
+                # is also c1.  Ties broken alphabetically for determinism.
+                stick_sym = min(
+                    stick_syms,
+                    key=lambda s: (int(out_stick_coord.coeff(s) or 1), str(s)),
+                )
+                stick_extent = it_space_extended[stick_sym][0]
+                it_space_extended = dict(it_space_extended)
+                it_space_extended[stick_sym] = (
+                    ((stick_extent + stick_size - 1) // stick_size) * stick_size,
+                    it_space_extended[stick_sym][1],
+                )
+
         op_spec = OpSpec(
             op,
             is_reduction,
@@ -1014,7 +1052,7 @@ class SpyreKernel(Kernel[CSEVariable]):
         self._alignment_repeat_info_by_spec[id(op_spec)] = {
             symbol: dict(info) for symbol, info in self._alignment_repeat_info.items()
         }
-        if op != RESTICKIFY_OP:
+        if op != RESTICKIFY_OP and not needs_dl16fp32_padding:
             self._alignment_inputs_by_spec[id(op_spec)] = alignment_inputs
         return op_spec
 
@@ -1735,6 +1773,7 @@ def simplify_op_spec(
         _restickify_restore_elided_dim(op_spec)
 
     it_space = op_spec.iteration_space
+
     if alignment_inputs is None:
         new_op_space_splits, new_tensors, work_division_remap = align_tensors(
             it_space,

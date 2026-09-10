@@ -29,7 +29,9 @@ from torch_spyre._inductor.constants import (
     CONV_DIM_LABELS,
     CONV_OPS,
     DEPTHWISE_CONV2D_OP,
+    DL16TOFP32_OP,
     FP32TOINT32_OP,
+    FP32TODL16_OP,
     IDENTITY_OP,
     INPUT_DIM_LABELS,
     INT32TOFP32_OP,
@@ -1822,6 +1824,51 @@ def _extend_restickify_to_padded(
         )
 
 
+def _extend_dl16fp32_to_padded(
+    op_spec: "OpSpec",
+    sdsc_iteration_space: dict,
+    symbol_mapping: dict,
+) -> None:
+    """Round the fp16 stick dim up to the next fp16 stick boundary for
+    dl16tofp32 / fp32todl16.
+
+    These ops use an interleaved shuffle that distributes one fp16 stick across
+    two fp32 sticks (even positions → stick N, odd positions → stick N+1).
+    When the last fp16 stick is only partially filled (e.g. 96 elements → the
+    last stick holds 32 real + 32 padding), fp32todl16 must still read BOTH
+    partner fp32 sticks to reconstruct it.  With the logical iteration extent
+    (96) the coordinate floor(c1/32) only reaches sticks 0-2; stick 3 is never
+    visited, corrupting the output.
+
+    Rounding 96 → 128 (next multiple of fp16 stick size 64) forces the loop to
+    cover sticks 0-3, making the partner stick visible.
+
+    Only the stick-driving SDSC symbol (e.g. 'out') is extended; outer
+    dimensions such as the batch/row count ('mb') must not be padded.
+    """
+    if op_spec.op not in (DL16TOFP32_OP, FP32TODL16_OP):
+        return
+
+    # The fp16 stick size is the larger of the two dtypes involved (fp16 has 64
+    # elems/stick, fp32 has 32; we always round to the fp16 boundary).
+    fp16_stick_size = max(arg.device_dtype.elems_per_stick() for arg in op_spec.args)
+
+    # Identify the stick-driving SDSC symbol from any arg's device_coordinates.
+    # All args in a dl16tofp32/fp32todl16 op share the same stick variable.
+    stick_sym = None
+    for arg in op_spec.args:
+        _, s = _get_device_dim_order(arg, symbol_mapping)
+        if s is not None and s in sdsc_iteration_space:
+            stick_sym = s
+            break
+    if stick_sym is None:
+        return
+
+    _round_up_to_stick(
+        sdsc_iteration_space, stick_sym, fp16_stick_size, "_extend_dl16fp32_to_padded"
+    )
+
+
 def _inject_implicit_conv_kernel_dims(
     is_conv2d: bool,
     op_spec: OpSpec,
@@ -2154,6 +2201,8 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
         _extend_matmul_k_to_padded(op_spec, sdsc_iteration_space, symbol_mapping)
     elif is_restickify:
         _extend_restickify_to_padded(op_spec, sdsc_iteration_space, symbol_mapping)
+    else:
+        _extend_dl16fp32_to_padded(op_spec, sdsc_iteration_space, symbol_mapping)
 
     # Grow the index-entry iteration to the padded output device_size so a
     # partial-last-stick gather splits stick-aligned across cores. The output's
