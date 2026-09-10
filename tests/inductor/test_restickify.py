@@ -79,6 +79,23 @@ def _compile_and_run_plan_capture(fn, *args):
     return spyre_result, captured.get("plan", {})
 
 
+def _compile_and_run_nonstick_capture(fn, *args):
+    import torch_spyre._inductor.passes as _passes
+
+    captured = {}
+    finalize_layouts = _passes.finalize_layouts
+
+    def capturing_finalize_layouts(graph):
+        finalize_layouts(graph)
+        captured["plan"] = dict(V.graph.restickify_plan)
+        captured["nonstick_log"] = dict(getattr(V.graph, "nonstick_reorder_log", {}))
+
+    with patch.object(_passes, "finalize_layouts", capturing_finalize_layouts):
+        spyre_result = _compile_and_run(fn, args, DEVICE)
+
+    return spyre_result, captured.get("plan", {}), captured.get("nonstick_log", {})
+
+
 def _strict_size1_input_arm(fn, x, expected_arm):
     """Run ``fn`` (a size-1 new-stick / output-elided restickify), assert the
     result matches CPU bit-exactly, AND assert _pad_restickify_input took the
@@ -2600,3 +2617,89 @@ def test_round_up_to_stick_geometry():
     assert round_up_to_stick(70, torch.float16) == 128
     assert round_up_to_stick(128, torch.float16) == 128
     assert round_up_to_stick(129, torch.float16) == 192
+
+
+# ---------------------------------------------------------------------------
+# nonstick_dim_order tests
+# ---------------------------------------------------------------------------
+
+
+def test_nonstick_no_reorder_when_large_dim_already_at_slot():
+    """Pass must not move a dim when slot already holds the largest dim.
+
+    Layout: [broadcast_outside, outer_stick, large_dim, inner_stick]
+    idc=['0', 'floor(d1/64)', 'd0', 'Mod(d1, 64)'] — outer_stick=1, slot=2,
+    large M dim (d0) is already at slot.  The outside dim (index 0) has
+    coordinate '0' (broadcast) and is not a useful candidate.  No reorder.
+
+    Uses bmm with batch=55, M=1, K=99.
+    """
+
+    def fn(x, w):
+        y = x * 2.0
+        return torch.bmm(y, w)
+
+    x = torch.randn(55, 1, 99, dtype=torch.float16)
+    w = torch.randn(55, 99, 128, dtype=torch.float16)
+
+    spyre_result, _, nonstick_log = _compile_and_run_nonstick_capture(
+        fn,
+        x.to(DEVICE),
+        w.to(DEVICE),
+    )
+    cpu_result = fn(x, w)
+    torch.testing.assert_close(spyre_result.cpu(), cpu_result, atol=0.1, rtol=0.1)
+
+    assert not nonstick_log, (
+        "Expected no reorder when large dim is already at slot, "
+        f"but got: {[(k, [list(s.device_size) for s in v]) for k, v in nonstick_log.items()]}"
+    )
+
+
+def test_nonstick_reorder_pointwise_into_matmul():
+    """Pointwise feeding a bmm gets largest non-stick dim moved into the stick sandwich slot.
+
+    x has shape [2, 55, 99] and is tiled as device_size=[55, 2, 2, 64] —
+    batch=2 at position 2, M=55 at position 0 (large), outer_stick=floor(d/64)
+    at position 1, inner=Mod(d,64) at last. The pass swaps the largest non-frozen
+    dim (55 at position 0) into slot outer_stick+1=2, giving device_size=[2, 2, 55, 64].
+
+    K=99 > 64 is required so the stick dimension actually splits (outer_stick at
+    a non-last device position with room between it and the stick inner).
+    """
+
+    def fn(x, w):
+        y = x * 2.0
+        return torch.bmm(y, w)
+
+    x = torch.randn(2, 55, 99, dtype=torch.float16)
+    w = torch.randn(2, 99, 128, dtype=torch.float16)
+
+    spyre_result, _, nonstick_log = _compile_and_run_nonstick_capture(
+        fn,
+        x.to(DEVICE),
+        w.to(DEVICE),
+    )
+    cpu_result = fn(x, w)
+    torch.testing.assert_close(spyre_result.cpu(), cpu_result, atol=0.1, rtol=0.1)
+
+    # The pass reorders the pointwise buffer (buf0) that feeds the bmm.
+    # x=[2,55,2] → device_size=[55,2,2,64] → outer_stick=1, slot=2 → [2,2,55,64].
+    assert nonstick_log, "Expected nonstick_reorder_log to be non-empty"
+    reordered_any = False
+    for buf_name, stl_list in nonstick_log.items():
+        for stl in stl_list:
+            device_size = list(stl.device_size)
+            if len(device_size) < 3:
+                continue
+            nonstick = device_size[:-1]
+            # device_size[-2] is the sandwich slot. Only check buffers where
+            # the slot dim is actually the largest — buffers whose idc couldn't
+            # be resolved are left unchanged and don't satisfy this property.
+            if device_size[-2] != max(nonstick):
+                continue
+            reordered_any = True
+    assert reordered_any, (
+        f"Expected at least one buffer with largest non-stick dim in slot n-2. "
+        f"nonstick_log={[(k, [list(s.device_size) for s in v]) for k, v in nonstick_log.items()]}"
+    )

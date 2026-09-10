@@ -71,6 +71,7 @@ from .insert_restickify import (
     validate_no_restickify_on_mutation_targets,
 )
 from .enforce_indirect_access_layout import enforce_indirect_access_layout
+from .nonstick_dim_order import reorder_nonstick_dims
 from .hbm_pool_planning import hbm_pool_planning
 from .work_division import (
     span_reduction,
@@ -473,6 +474,7 @@ class CustomPreSchedulingPasses:
             # Tensor Layout (Stickification)
             split_multi_ops,
             propagate_spyre_tensor_layouts,
+            reorder_nonstick_dims,
             validate_ops,
             optimize_restickify_locations,
             finalize_layouts,
