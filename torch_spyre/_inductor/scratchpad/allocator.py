@@ -65,7 +65,9 @@ from torch_spyre._inductor.scratchpad.plan_solver import (
     MemoryPlanSolver,
     SolveError,
     BufferType,
-    relayout_symbol,
+    RelayoutCopyBuffer,
+    build_relayout_copy,
+    relayout_copy_name,
 )
 from torch_spyre._inductor.scratchpad.greedy_solver import GreedyLayoutSolver
 from torch_spyre._inductor.scratchpad.firstfit_bestfit_solver import (
@@ -104,9 +106,9 @@ from torch_spyre._inductor import config
 from torch_spyre._inductor.logging_utils import get_inductor_logger
 from torch_spyre._inductor.loop_info import CarriedReductionRecord
 from torch_spyre._inductor.scratchpad.lx_relayout import (
+    FiredRelayoutGroup,
     LXRelayoutPlan,
     RelayoutCandidate,
-    RelayoutSegment,
     _unsupported_relayout_transition_reason,
     collect_lx_relayout_plans,
     materialize_lx_relayouts,
@@ -1906,6 +1908,14 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         # point requires the core-division interface.
         self.layout_planning: Optional[CoreDivisionSolverFactory] = layout_planning
         self.prune = prune
+        # Whether the engine can decide LX relayouts (place a RelayoutCopyBuffer
+        # under the coupling its docstring lists). Probed on an empty solver the
+        # way select_allocator probes joint-ness, because the factory may be a
+        # function rather than a class. Engines that cannot are never handed a
+        # copy, and their objective never carries a relayout term.
+        self._decides_lx_relayouts: bool = bool(
+            getattr(layout_planning([], size), "decides_lx_relayouts", False)
+        )
 
     def _prepare_buffers(self, graph: GraphLowering) -> Sequence[Any]:
         in_place = self._determine_in_place_division_invariant(graph)
@@ -1961,22 +1971,19 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         except (ValueError, RuntimeError):
             cost_expr = None
 
-        # One additive symbol per relayout GROUP (a source and one destination
-        # view, however many consumers share it); the solver binds each to the
-        # float-weighted sum over the group's per-source-division literals, so
-        # the objective charges exactly the chosen shuffle's fitted cost, once,
-        # and zero when the group is off. Skipped when the bundle scoring
-        # failed: the solver then runs its fallback objective, under which
-        # every relayout edge is pinned off.
+        # One price term per relayout copy (a source and one destination view,
+        # however many consumers share it): the fitted shuffle cost of the
+        # source's chosen division, charged while the copy is resident. Built
+        # from symbols every engine binds (is_lx, division), so the objective
+        # stays self-describing. Skipped when the bundle scoring failed: the
+        # solver then runs its fallback objective, under which every copy is
+        # pinned out.
         if cost_expr is not None:
-            groups = {
-                candidate.group_key
-                for buf in solver.buffers
-                for entries in getattr(buf, "cd_parent_relayouts", {}).values()
-                for candidate in entries
-            }
-            for parent, group in sorted(groups):
-                cost_expr = cost_expr + relayout_symbol(parent, group)
+            for copy in sorted(
+                (b for b in solver.buffers if isinstance(b, RelayoutCopyBuffer)),
+                key=lambda b: b.name,
+            ):
+                cost_expr = cost_expr + copy.cost_term()
         result = solver.plan_layout_and_core_divisions(cost_expr)
         assert not any(buffer.lx_relayout_plans for buffer in result), (
             "CoOptimizingAllocator does not support LX relayout"
@@ -2007,45 +2014,50 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         allocation: Sequence[LifetimeBoundBuffer],
         graph: GraphLowering,
     ) -> list[LXRelayoutPlan]:
-        """Turn the solver's fired relayout edges into materializable plans.
+        """Turn the solver's fired relayouts into materializable plans.
 
         The solver already guaranteed everything the greedy path checks after
-        the fact: both endpoints are placed (the destination rectangle's
-        presence literal IS the decision variable), the pair's divisions are
-        pinned by the same literals that carried the cost, and the 2D
-        no-overlap kept source and destination disjoint. The fired
-        ``ChosenRelayout`` records carry the views the enumeration priced, so
-        nothing is re-derived here: the segments are regrouped by run head,
-        the committed divisions are checked against the ones the candidates
-        were priced under, and ``materialize_lx_relayouts`` gets one plan per
-        segment with solved addresses.
+        the fact: the copy's residency IS the decision, the served consumers'
+        division pairs are pinned by the literals that require the copy
+        resident, and the 2D no-overlap kept source and copy disjoint. The
+        fired ``ChosenRelayout`` records carry the views the enumeration
+        priced, so nothing is re-derived here: the fired edges regroup by
+        (source, destination view), the committed divisions and the copy's
+        address are checked against them, and ``materialize_lx_relayouts``
+        gets one plan per fired group.
         """
         by_name = {b.name: b for b in allocation}
-        segments = RelayoutSegment.from_chosen(
+        fired = FiredRelayoutGroup.from_chosen(
             chosen
             for consumer in allocation
             for chosen in getattr(consumer, "chosen_relayouts", {}).values()
         )
         plans: list[LXRelayoutPlan] = []
-        for segment in segments:
-            source = by_name[segment.parent]
-            assert source.chosen_division == segment.source_division, (
-                f"relayout segment {segment.parent}/g{segment.group} chose source "
-                f"division {segment.source_division} but {source.chosen_division} "
+        for group in fired:
+            source = by_name[group.parent]
+            copy = by_name[relayout_copy_name(group.parent, group.group)]
+            assert source.chosen_division == group.source_division, (
+                f"relayout group {group.parent}/g{group.group} chose source "
+                f"division {group.source_division} but {source.chosen_division} "
                 "was committed"
             )
             assert source.address is not None, (
-                f"relayout source {segment.parent} has no LX address"
+                f"relayout source {group.parent} has no LX address"
             )
-            for member in segment.members:
+            assert copy.address == group.destination_address, (
+                f"relayout group {group.parent}/g{group.group}: consumers read the "
+                f"copy at {group.destination_address} but it was placed at "
+                f"{copy.address}"
+            )
+            for member in group.members:
                 consumer = by_name[member.candidate.consumer]
                 assert consumer.chosen_division == member.candidate.consumer_division, (
-                    f"relayout pair ({segment.source_division}, "
+                    f"relayout pair ({group.source_division}, "
                     f"{member.candidate.consumer_division}) disagrees with committed "
-                    f"division {consumer.chosen_division} on {segment.parent} -> "
+                    f"division {consumer.chosen_division} on {group.parent} -> "
                     f"{consumer.name}"
                 )
-            plans.append(segment.plan(source.address))
+            plans.append(group.plan(source.address))
         return plans
 
     def _post_solve(
@@ -2071,7 +2083,9 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         }
         _, reasons, views = get_ncores_for_buffers(graph)
         for buffer in allocation:
-            if buffer.address is None:
+            # A relayout copy is not a graph buffer: materialize_lx_relayouts
+            # creates its destination, carrying the plan's view.
+            if buffer.address is None or isinstance(buffer, RelayoutCopyBuffer):
                 continue
             view = source_views.get(buffer.name) or views.get(buffer.name)
             if view is None:
@@ -2467,7 +2481,39 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                     else BufferType.Intermediate,
                 )
             )
+        buffers.extend(self._relayout_copy_buffers(buffers))
         return buffers
+
+    @staticmethod
+    def _relayout_copy_buffers(
+        buffers: Sequence[CoreDivisionBuffer],
+    ) -> list[RelayoutCopyBuffer]:
+        """One :class:`RelayoutCopyBuffer` per relayout group enumerated across
+        ``buffers``: the destination the solver places, live from the group's
+        first consumer to its last, carrying every priced candidate that lands
+        on it. A group whose source is not among the buffers has nothing to
+        shuffle from and gets no copy; the solver then ignores its candidates.
+        """
+        by_name = {b.name: b for b in buffers}
+        groups: dict[tuple[str, int], list[RelayoutCandidate]] = {}
+        for consumer in buffers:
+            for candidates in consumer.cd_parent_relayouts.values():
+                for candidate in candidates:
+                    groups.setdefault(candidate.group_key, []).append(candidate)
+        ticks = {b.name: b.start_time for b in buffers}
+        copies: list[RelayoutCopyBuffer] = []
+        for (parent, group), candidates in sorted(groups.items()):
+            source = by_name.get(parent)
+            if source is None:
+                logger.debug(
+                    "[lx solver relayout] %s/g%d: source is not in the solve; "
+                    "no copy built",
+                    parent,
+                    group,
+                )
+                continue
+            copies.append(build_relayout_copy(source, group, candidates, ticks))
+        return copies
 
     def _eligible_clone_inputs(
         self, graph: GraphLowering, lifetimes: dict[str, list[int]]
@@ -2628,7 +2674,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         """
         if not config.lx_solver_relayout or config.ktir_emitter:
             return {}
-        if consumer_op is None:
+        if not self._decides_lx_relayouts or consumer_op is None:
             return {}
         relayouts: dict[str, list[RelayoutCandidate]] = {}
         for parent in parent_names:

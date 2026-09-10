@@ -327,12 +327,11 @@ class CoreDivisionBuffer(LifetimeBoundBuffer):
     )
     chosen_division: Optional[int] = None
     # Solver-chosen relayouts feeding this consumer: parent_buf_name -> the
-    # fired candidate with its destination address (bytes) and run head.
-    # Written back by the CP-SAT solver when a relayout edge fires. Consumers
-    # of one (parent, group) that the solver bridged into one SEGMENT share a
-    # destination address and name the segment's earliest consumer as
-    # ``run_head``; the commit path materializes one plan per segment
-    # (``RelayoutSegment.from_chosen``).
+    # fired candidate with the destination address (bytes) of the group's copy
+    # (:class:`RelayoutCopyBuffer`). Written back by the solver when this
+    # consumer reads the parent through a resident copy. Every consumer served
+    # by one copy carries the same address; the commit path materializes one
+    # plan per fired group (``FiredRelayoutGroup.from_chosen``).
     chosen_relayouts: dict[str, "ChosenRelayout"] = field(default_factory=dict)
     boundary: BufferType = BufferType.Intermediate
 
@@ -359,6 +358,18 @@ class CoreDivisionBuffer(LifetimeBoundBuffer):
     def sym_cores(self) -> sympy.Symbol:
         output, reduction = self.sym_core_divs
         return math.prod(output.values()) * math.prod(reduction.values())
+
+    @property
+    def sym_division(self) -> sympy.Symbol:
+        """The chosen index into ``core_divisions`` as an objective unknown.
+
+        The per-axis split symbols (:attr:`sym_core_divs`) carry the division's
+        *shape* into the cost model; this carries its *identity*, for terms that
+        are tables over candidates rather than functions of the splits - the
+        relayout price (:meth:`RelayoutCopyBuffer.cost_term`) is one. Engines
+        bind it to their division variable (CP-SAT) or to the chosen index (the
+        annealer's ``chosen``)."""
+        return division_symbol(self.name)
 
     @property
     def sym_core_divs(self) -> tuple[dict, dict]:
@@ -389,19 +400,148 @@ class CoreDivisionBuffer(LifetimeBoundBuffer):
         return (sym_output_splits, sym_reduction_splits)
 
 
-def relayout_symbol(parent: str, group: int) -> sympy.Symbol:
-    """The sympy symbol carrying one relayout GROUP's cost in the objective.
+def division_symbol(buffer_name: str) -> sympy.Symbol:
+    """The objective symbol for ``buffer_name``'s chosen division index (see
+    :attr:`CoreDivisionBuffer.sym_division`). One constructor so a term built
+    from a buffer's *name* (a relayout copy pricing its source) and the
+    engine's binding built from the buffer agree on name and assumptions."""
+    return sympy.Symbol(f"division_{buffer_name}", integer=True, nonnegative=True)
 
-    A group is one (source, destination per-core view) pair. The solver
-    splits the group's consumers into segments (see the solver's
-    ``_RelayoutGroup``), one shuffle each, and binds this symbol to the sum of
-    those per-segment charges. Shared by the allocator (which appends the symbol to the cost
-    expression) and the CP-SAT solver (which binds it to the float-weighted
-    sum over the group's per-source-division literals), so the two sides can
-    never disagree on name or assumptions - a mismatch would be a NameError at
-    lambdify time.
+
+RELAYOUT_COPY_PREFIX = "__spyre_lx_relayout__:copy:"
+
+
+def relayout_copy_name(parent: str, group: int) -> str:
+    """Name of the copy buffer for relayout group ``group`` of ``parent``.
+
+    Shares the ``__spyre_lx_relayout__:`` prefix of the materialized
+    destination buffers so every synthetic-name gate in the allocator (nothing
+    to push, nothing to commit) applies, and differs from them so a copy can
+    never be mistaken for the buffer ``materialize_lx_relayouts`` creates."""
+    return f"{RELAYOUT_COPY_PREFIX}{parent}:g{group}"
+
+
+@dataclass
+class RelayoutCopyBuffer(CoreDivisionBuffer):
+    """The LX destination of one relayout group, as a buffer the solver places.
+
+    A group is one (source buffer, destination per-core view) pair, however many
+    consumers read it. Modelling its destination as an ordinary buffer is what
+    keeps the relayout decision solver-agnostic:
+
+    * **The decision is residency.** ``sym_is_lx`` of this buffer means "the
+      shuffle fires", so any engine that decides residency can decide relayouts.
+    * **Placement comes free.** The copy occupies real LX from the group's first
+      consumer to its last inside whatever no-overlap or packing the engine
+      already runs, so capacity vetoes it like any other buffer. One copy serves
+      every consumer of the group: the model never re-shuffles a view it
+      released, it spills the source instead.
+    * **The price is a plain objective term.** :meth:`cost_term` charges the
+      shuffle, priced by the SOURCE's chosen division, through the shared sympy
+      objective, so every engine charges it the same way and none needs a
+      private cost binding.
+
+    What an engine must add itself is the coupling this buffer cannot express as
+    data: a resident copy needs its source resident under a priced division, a
+    consumer reads the copy only under a division pair its candidates list, and
+    a resident copy must serve at least one consumer (``CpSatLayoutSolver``
+    carries the CP-SAT encoding; the annealer does not decide relayouts yet and
+    is never handed a copy, see ``CoOptimizingAllocator``).
+
+    ``size`` is the SOURCE's total footprint and ``core_divisions`` holds one
+    division sliced ``num_cores`` ways, so the per-core footprint every engine
+    derives (``size / output_partition``) is the destination's. ``parents`` is
+    deliberately empty: the source edge is a relayout coupling, not a
+    slicing-match edge, and listing it would make engines that gate residency on
+    ``cd_parent_matches`` refuse the source outright.
     """
-    return sympy.Symbol(f"relayout_ns__{parent}__g{group}", nonnegative=True)
+
+    relayout_parent: str = ""
+    group: int = -1
+    # Every priced (source division, consumer division) pair landing on this
+    # group's destination view, across all its consumers.
+    candidates: tuple["RelayoutCandidate", ...] = ()
+
+    @property
+    def num_cores(self) -> int:
+        return self.core_divisions[0].output_partition
+
+    @property
+    def group_key(self) -> tuple[str, int]:
+        return self.relayout_parent, self.group
+
+    @property
+    def consumers(self) -> tuple[str, ...]:
+        return tuple(sorted({c.consumer for c in self.candidates}))
+
+    def candidates_for(self, consumer: str) -> list["RelayoutCandidate"]:
+        return [c for c in self.candidates if c.consumer == consumer]
+
+    @property
+    def cost_by_source_division(self) -> dict[int, float]:
+        """Shuffle price per source division. The destination view is fixed by
+        the group and the source view by the division, so every candidate with
+        the same source division prices identically; a disagreement means the
+        enumeration and the interning disagree, which is asserted, not
+        averaged."""
+        prices: dict[int, float] = {}
+        for c in self.candidates:
+            known = prices.setdefault(c.source_division, c.cost_ns)
+            assert abs(known - c.cost_ns) <= 1e-6 * max(1.0, abs(c.cost_ns)), (
+                f"relayout group {self.relayout_parent}/g{self.group}: candidates "
+                f"disagree on the price for source division {c.source_division}: "
+                f"{known} vs {c.cost_ns}"
+            )
+        return prices
+
+    def cost_term(self) -> sympy.Expr:
+        """The group's objective contribution: the fitted shuffle price of the
+        source's chosen division, charged once, only while the copy is resident.
+
+        ``is_lx_copy * sum_i price_i * KroneckerDelta(division_source, i)`` -
+        every factor is a symbol an engine already binds (:attr:`sym_is_lx`,
+        :attr:`sym_division`), so it lowers wherever the rest of the objective
+        does: CP-SAT reifies the delta to a literal, ``lambdify`` evaluates it.
+        Deltas rather than ``Eq``: sympy forbids arithmetic on relationals.
+        """
+        source = division_symbol(self.relayout_parent)
+        return self.sym_is_lx * sum(
+            price * sympy.KroneckerDelta(source, i)
+            for i, price in sorted(self.cost_by_source_division.items())
+        )
+
+
+def build_relayout_copy(
+    parent: CoreDivisionBuffer,
+    group: int,
+    candidates: Sequence["RelayoutCandidate"],
+    consumer_ticks: dict[str, int],
+) -> RelayoutCopyBuffer:
+    """The copy buffer for one relayout group, live from the group's first
+    consumer tick to its last. ``consumer_ticks`` maps each consumer to the
+    schedule position at which it reads (its own ``start_time``); the shuffle
+    that fills the copy is scheduled directly before the first of them."""
+    ordered = tuple(
+        sorted(
+            candidates,
+            key=lambda c: (c.consumer, c.source_division, c.consumer_division),
+        )
+    )
+    assert ordered, f"relayout group {parent.name}/g{group} has no candidates"
+    cores = {c.num_cores for c in ordered}
+    assert len(cores) == 1, (
+        f"relayout group {parent.name}/g{group} mixes core counts {sorted(cores)}"
+    )
+    assert all(c.parent == parent.name and c.group == group for c in ordered)
+    return RelayoutCopyBuffer(
+        name=relayout_copy_name(parent.name, group),
+        size=parent.size,
+        uses=sorted({consumer_ticks[c.consumer] for c in ordered}),
+        core_divisions=[CoreDivision(output_splits={"relayout_copy": cores.pop()})],
+        relayout_parent=parent.name,
+        group=group,
+        candidates=ordered,
+    )
 
 
 def check_in_place_parent_is_read(
@@ -576,6 +716,13 @@ class CoreDivisionLayoutSolver(MemoryPlanSolver):
     Such a solver still satisfies :meth:`plan_layout` -- placement-only is the
     special case where there is nothing to choose.
     """
+
+    # Whether this engine decides LX relayouts: places a
+    # :class:`RelayoutCopyBuffer` under the coupling its docstring lists and
+    # writes ``chosen_relayouts`` back on the consumers it serves. The allocator
+    # enumerates candidates and builds copies only for engines that say so; the
+    # others never see a copy and their objective carries no relayout term.
+    decides_lx_relayouts: bool = False
 
     @abstractmethod
     def plan_layout_and_core_divisions(

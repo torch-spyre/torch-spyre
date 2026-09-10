@@ -67,6 +67,22 @@ a merged unit to one rectangle over the union of its members' lifetimes, which i
 conservative enough that the squeeze can occasionally need more room than the
 solver's own answer; when it would not fit, the solver's offsets are kept.
 
+**LX relayouts** ride on the same machinery. The allocator hands the solver one
+``RelayoutCopyBuffer`` per relayout group (a source and one destination per-core
+view, however many consumers read it), live from the group's first consumer to
+its last; the copy's residency IS the decision to shuffle, its rectangle sits in
+the same 2D no-overlap as every other buffer, and its price is an ordinary term
+of the shared objective (``RelayoutCopyBuffer.cost_term``: the fitted shuffle
+cost of the source's chosen division, charged while the copy is resident). What
+this module adds is only the coupling the data cannot carry
+(``_constrain_relayout_copies`` and the relaxed gate in
+``constrain_residency``): a resident copy needs its source resident under a
+division it was priced for, a consumer reads the copy only under a division
+pair its candidates list, and a resident copy serves at least one consumer. The
+gate thus becomes "slicing match, or a resident copy serving this edge". Under
+the fallback objective a shuffle is unpriced and would look free, so every copy
+is pinned out there.
+
 The same model also serves plain :class:`LifetimeBoundBuffer`s via
 ``plan_layout`` (the ``MemoryPlanSolver`` contract the placement-only allocator
 calls). Those buffers carry no candidate divisions, so the division-dependent
@@ -103,19 +119,16 @@ else:
     except ImportError:  # pragma: no cover - exercised only when ortools is absent
         cp_model = None
 
-from torch_spyre._inductor.scratchpad.lx_relayout import (
-    ChosenRelayout,
-    RelayoutCandidate,
-)
+from torch_spyre._inductor.scratchpad.lx_relayout import ChosenRelayout
 from torch_spyre._inductor.scratchpad.plan_solver import (
     CoreDivisionBuffer,
     ceil_div,
     CoreDivisionLayoutSolver,
     LifetimeBoundBuffer,
+    RelayoutCopyBuffer,
     SolveError,
     BufferType,
     _check_in_place_relationships,
-    relayout_symbol,
 )
 from torch_spyre._inductor import config
 
@@ -165,194 +178,6 @@ def _gate_divisions(model, compatible, src_div, dst_div, enforce_lit) -> None:
         model.Add(dst_div == j).OnlyEnforceIf(lit)
         pair_lits.append(lit)
     model.AddBoolOr(pair_lits).OnlyEnforceIf(enforce_lit)
-
-
-class _GroupConsumer:
-    """One consumer's stake in a relayout group: its own destination rectangle
-    (present iff it fires into the group) and the bridges that may join it to
-    the neighbouring consumers of the same view."""
-
-    def __init__(self, tick: int):
-        self.tick = tick  # the consumer's schedule position (constant)
-        self.pairs_by_div: dict[int, list] = {}  # source div i -> its pair lits
-        self.present: Any = None  # fires into this group (OR of its pair lits)
-        self.end: Any = None  # destination interval end (tick + 1, or a later tick)
-        self.offset: Any = None  # destination LX offset (alignment units)
-        self.incoming: list = []  # bridges from earlier consumers
-        self.outgoing: list = []  # bridges to later consumers
-        self.pays: dict[int, object] = {}  # source div i -> "starts a segment"
-
-
-class _RelayoutGroup:
-    """All consumers that could read one source through one destination
-    per-core view, and the segment model that decides how many shuffles serve
-    them.
-
-    Every consumer in the group gets its own destination rectangle, present iff
-    its edge fires into the group. Between each ordered pair of consumers
-    (earlier tick first) a *bridge* literal lets the later one inherit the
-    earlier one's copy: the earlier rectangle is extended to abut the later
-    consumer's tick, the two offsets are pinned equal, and the later consumer
-    pays no shuffle. A maximal run of bridged consumers is a *segment*: one
-    shuffle, one continuous residency. No bridges is the per-edge policy (one
-    tick, one shuffle each); all bridges is one long-lived shared copy. The
-    solver chooses the segmentation on cost: a bridge saves a shuffle and
-    occupies LX over the gap, and that occupancy is priced by whatever it
-    displaces (the spill terms already in the objective).
-
-    The shuffle's geometry and price depend on the SOURCE division ``i`` (the
-    destination view is fixed by the group), so the per-segment charge is
-    ``cost_by_div[i]`` for the chosen ``i``.
-    """
-
-    def __init__(
-        self, model, parent: str, group: int, cores_used: int, dest_units: int
-    ):
-        self.parent = parent
-        self.group = group
-        self.cores_used = cores_used
-        self.dest_units = dest_units  # per-core destination footprint (constant)
-        # candidate -> pair lit; wired to division pins in constrain_residency
-        self.members: dict[RelayoutCandidate, object] = {}
-        self.cost_by_div: dict[int, float] = {}
-        self.consumers: dict[str, _GroupConsumer] = {}
-        self.bridges: dict[tuple[str, str], object] = {}  # (earlier, later) -> lit
-
-    def add_member(self, model, candidate: RelayoutCandidate) -> None:
-        i, cost = candidate.source_division, candidate.cost_ns
-        lit = model.new_bool_var(
-            f"rpair_{self.parent}__g{self.group}__{candidate.consumer}"
-            f"_{i}_{candidate.consumer_division}"
-        )
-        self.members[candidate] = lit
-        if i in self.cost_by_div:
-            # The destination view IS the group and the source view is fixed
-            # by i, so every member prices identically; a mismatch means the
-            # enumeration and the interning disagree.
-            assert abs(self.cost_by_div[i] - cost) <= 1e-6 * max(1.0, abs(cost)), (
-                f"relayout group {self.parent}/g{self.group}: members disagree on "
-                f"the price for source division {i}: {self.cost_by_div[i]} vs {cost}"
-            )
-        self.cost_by_div[i] = cost
-
-    def link(self, model, bufs, horizon: int, capacity_units: int) -> None:
-        tag = f"{self.parent}__g{self.group}"
-        for candidate, lit in self.members.items():
-            child = candidate.consumer
-            c = self.consumers.setdefault(child, _GroupConsumer(bufs[child].start_time))
-            c.pairs_by_div.setdefault(candidate.source_division, []).append(lit)
-        for child, c in self.consumers.items():
-            lits = [lit for ls in c.pairs_by_div.values() for lit in ls]
-            c.present = model.new_bool_var(f"rdest_{tag}__{child}")
-            for lit in lits:
-                model.add_implication(lit, c.present)
-            model.add_bool_or(lits).only_enforce_if(c.present)
-            c.end = model.new_int_var(c.tick + 1, horizon, f"rdest_end_{tag}__{child}")
-            c.offset = model.new_int_var(
-                0, max(0, capacity_units - 1), f"rdest_off_{tag}__{child}"
-            )
-        ordered = sorted(self.consumers.items(), key=lambda kv: kv[1].tick)
-        for a, (name_a, ca) in enumerate(ordered):
-            for name_b, cb in ordered[a + 1 :]:
-                if cb.tick == ca.tick:
-                    continue  # same tick: nothing to hold across
-                b = model.new_bool_var(f"rbridge_{tag}__{name_a}__{name_b}")
-                model.add_implication(b, ca.present)
-                model.add_implication(b, cb.present)
-                # Inherit: the earlier copy lives until the later consumer's
-                # tick and sits at the same offset, so the two rectangles abut
-                # in time at one slot (which the 2D no-overlap accepts).
-                model.add(ca.end == cb.tick).only_enforce_if(b)
-                model.add(ca.offset == cb.offset).only_enforce_if(b)
-                ca.outgoing.append(b)
-                cb.incoming.append(b)
-                self.bridges[(name_a, name_b)] = b
-        for child, c in self.consumers.items():
-            model.add_at_most_one(c.outgoing)
-            model.add_at_most_one(c.incoming)
-            # Without an outgoing bridge the copy lives exactly this tick.
-            model.add(c.end == c.tick + 1).only_enforce_if(
-                [b.Not() for b in c.outgoing]
-            )
-            # pays[i]: this consumer STARTS a segment under source division i,
-            # i.e. it fires with division i and inherits nothing.
-            for i, lits in c.pairs_by_div.items():
-                fires_i = model.new_bool_var(f"rfire_{tag}__{child}__div{i}")
-                for lit in lits:
-                    model.add_implication(lit, fires_i)
-                model.add_bool_or(lits).only_enforce_if(fires_i)
-                z = model.new_bool_var(f"rpays_{tag}__{child}__div{i}")
-                model.add_implication(z, fires_i)
-                for b in c.incoming:
-                    model.add_implication(z, b.Not())
-                model.add_bool_or([z, fires_i.Not(), *c.incoming])
-                c.pays[i] = z
-
-    def cost_terms(self):
-        """The group's objective contribution: one shuffle per segment, at the
-        price of the chosen source division."""
-        return sum(
-            self.cost_by_div[i] * z
-            for c in self.consumers.values()
-            for i, z in c.pays.items()
-        )
-
-    def run_head(self, solver, child: str) -> str:
-        """The earliest consumer of the segment ``child`` reads from."""
-        head = child
-        while True:
-            fired = [
-                a
-                for (a, b_name), lit in self.bridges.items()
-                if b_name == head and solver.BooleanValue(lit)
-            ]
-            if not fired:
-                return head
-            (head,) = fired
-
-
-def _build_relayout_groups(
-    model, bufs: dict[str, "_LifetimeBufferWithCpVars"], capacity_units: int
-) -> dict[tuple[str, int], _RelayoutGroup]:
-    """Mint the relayout group, pair, presence and bridge literals from the
-    static candidate tables, before any constraint is built: the destination
-    rectangles (``_add_no_overlap_2d``) and the residency gate
-    (``constrain_residency``) both reference them, and the rectangles are
-    built first."""
-    groups: dict[tuple[str, int], _RelayoutGroup] = {}
-    for sb in bufs.values():
-        for parent, entries in getattr(sb.buffer, "cd_parent_relayouts", {}).items():
-            if not entries:
-                continue
-            pw = bufs.get(parent)
-            if pw is None:
-                # The parent is not part of this solve: nothing to shuffle
-                # from, so the edge can never fire (its pair lits are never
-                # minted and extraction must not find it set).
-                model.add(sb.relayout_vars[parent] == 0)
-                continue
-            for candidate in entries:
-                key = candidate.group_key
-                if key not in groups:
-                    groups[key] = _RelayoutGroup(
-                        model,
-                        parent,
-                        candidate.group,
-                        candidate.num_cores,
-                        ceil_div(pw.buffer.size, candidate.num_cores),
-                    )
-                g = groups[key]
-                # A group is one destination view, and a view is built for one
-                # core count; the enumeration's cores_used gate guarantees this.
-                assert g.cores_used == candidate.num_cores, (
-                    f"relayout group {parent}/g{candidate.group} mixes core counts "
-                    f"{g.cores_used} and {candidate.num_cores}"
-                )
-                g.add_member(model, candidate)
-    horizon = max((sb.end_time for sb in bufs.values()), default=0) + 1
-    for g in groups.values():
-        g.link(model, bufs, horizon, capacity_units)
-    return groups
 
 
 @dataclass
@@ -407,13 +232,12 @@ class _LifetimeBufferWithCpVars(Generic[_BufT]):
         }
         self.core_cost = None
         # Relayout state (populated only by the joint subclass; kept here so
-        # every solver method can iterate uniformly). relayout_vars: one edge
-        # BoolVar per parent this buffer could relayout-read; relayout_pair_lits:
-        # per parent, the (lit, RelayoutCandidate) pairs of that edge, whose
-        # lits are minted by the solver's group registry and wired to the
-        # division pins in constrain_residency.
-        self.relayout_vars: dict[str, object] = {}
-        self.relayout_pair_lits: dict[str, list] = {}
+        # every solver method can iterate uniformly). Per parent this buffer
+        # could read through a relayout copy: the (served literal, copy wrapper)
+        # pairs minted in constrain_residency. A served literal means "this
+        # consumer reads the parent from that copy", which pins the division
+        # pair and requires the copy resident.
+        self.relayout_reads: dict[str, list[tuple[Any, Any]]] = {}
 
     # -- producer/consumer edges (joint model only; none when division-fixed) --
     @property
@@ -448,7 +272,7 @@ class _LifetimeBufferWithCpVars(Generic[_BufT]):
         reads_served = b.read_count - (1 if b.first_use_is_read else 0)
         return (reads_served + (1 if is_intermediate else 0)) * b.size
 
-    def constrain_residency(self, model, kids, bufs, groups) -> None:
+    def constrain_residency(self, model, kids, bufs, copies) -> None:
         """Placement-only: any buffer may reside, so there is no slicing gate."""
 
     def constrain_merge(self, model, parent: "_LifetimeBufferWithCpVars", edge) -> None:
@@ -532,14 +356,24 @@ class _CoreDivisionBufferWithCpVars(_LifetimeBufferWithCpVars[CoreDivisionBuffer
         m.add_element(self.division, cores_used, self.cores)
         m.add_element(self.division, core_cost, self.core_cost)
 
-        # One decision variable per relayout-eligible producer edge. The
-        # RelayoutCandidate records arrive on the buffer from the allocator's
-        # enumeration (cd_parent_relayouts).
-        for parent, candidates in b.cd_parent_relayouts.items():
-            if candidates:
-                self.relayout_vars[parent] = m.new_bool_var(
-                    f"relayout_{parent}__{b.name}"
-                )
+        # Reified ``division == i`` literals, minted on demand and shared between
+        # the relayout coupling and the objective's KroneckerDelta lowering so
+        # one decision is one literal.
+        self._division_is: dict[int, Any] = {}
+        # For a relayout copy only: the served literals of the consumer edges
+        # it can carry, filled by the sources' constrain_residency and consumed
+        # by _constrain_relayout_copies ("a resident copy serves someone").
+        self.serves: list[Any] = []
+
+    def division_is(self, i: int) -> Any:
+        """The literal ``division == i`` (both directions enforced)."""
+        lit = self._division_is.get(i)
+        if lit is None:
+            lit = self.model.new_bool_var(f"div_{self.name}_is_{i}")
+            self.model.add(self.division == i).only_enforce_if(lit)
+            self.model.add(self.division != i).only_enforce_if(lit.Not())
+            self._division_is[i] = lit
+        return lit
 
     @property
     def parents(self) -> list[str]:
@@ -548,9 +382,10 @@ class _CoreDivisionBufferWithCpVars(_LifetimeBufferWithCpVars[CoreDivisionBuffer
     def match_pairs(self, parent: str) -> list[tuple[int, int]]:
         return self.buffer.cd_parent_matches.get(parent, [])
 
-    def constrain_residency(self, model, kids, bufs, groups) -> None:
+    def constrain_residency(self, model, kids, bufs, copies) -> None:
         """Slicing-consistency gate: a resident buffer's division must match
-        *every* consumer's division under the ``cd_parent_matches`` pairs.
+        *every* consumer's division under the ``cd_parent_matches`` pairs, or
+        the consumer must read it through a resident relayout copy.
 
         This is the part of residency that genuinely depends on the solver's
         free variables, so it stays here as a constraint. The precomputable
@@ -558,45 +393,48 @@ class _CoreDivisionBufferWithCpVars(_LifetimeBufferWithCpVars[CoreDivisionBuffer
         pair -- are decided by the allocator and arrive as ``read_count`` /
         ``residency_reason``. A consumer with no compatible pair still lands
         correctly if it slips through: ``_gate_divisions`` forces ``in_buffer``
-        false when the pair list is empty."""
+        false when the pair list is empty.
+
+        ``copies`` maps a relayout group key to the wrapper of its
+        ``RelayoutCopyBuffer``. For each consumer edge with priced candidates
+        on a group that has a copy in this solve, a *served* literal says "the
+        consumer reads this buffer from that copy": it pins the division pair
+        to one the candidates list (``_gate_divisions`` over the group's
+        pairs) and requires the copy resident. The gate then relaxes to
+        "match or served". The served literals are recorded on the consumer
+        (``relayout_reads``) for extraction and on the copy's tally for the
+        "a resident copy serves someone" constraint."""
         for child, compatible in kids:
             child_w = bufs[child]
-            relayout_lit = child_w.relayout_vars.get(self.name)
-            if relayout_lit is None:
+            served: list = []
+            by_group: dict[tuple[str, int], list] = {}
+            for candidate in child_w.buffer.cd_parent_relayouts.get(self.name, ()):
+                if candidate.group_key in copies:
+                    by_group.setdefault(candidate.group_key, []).append(candidate)
+            for key, candidates in sorted(by_group.items()):
+                copy_w = copies[key]
+                lit = model.new_bool_var(f"served_{self.name}__{child}__g{key[1]}")
+                _gate_divisions(
+                    model,
+                    [(c.source_division, c.consumer_division) for c in candidates],
+                    self.division,
+                    child_w.division,
+                    lit,
+                )
+                model.add_implication(lit, copy_w.in_buffer)
+                served.append(lit)
+                child_w.relayout_reads.setdefault(self.name, []).append((lit, copy_w))
+                copy_w.serves.append(lit)
+            if not served:
                 _gate_divisions(
                     model, compatible, self.division, child_w.division, self.in_buffer
                 )
                 continue
-            # Relayout relaxes the gate on this edge: residency needs a slicing
-            # MATCH or an active RELAYOUT (whose own pair table then pins the
-            # division pair). The source must be resident to be shuffled from.
             match_lit = model.new_bool_var(f"match_{self.name}__{child}")
             _gate_divisions(
                 model, compatible, self.division, child_w.division, match_lit
             )
-            model.add_bool_or([match_lit, relayout_lit]).only_enforce_if(self.in_buffer)
-            model.add_implication(relayout_lit, self.in_buffer)
-            # The pair lits were minted by the group registry (they also drive
-            # the shared destination rectangles, which are built before this
-            # constraint); here they get their division pins and their edge.
-            pair_lits = []
-            for candidate in child_w.buffer.cd_parent_relayouts[self.name]:
-                lit = groups[candidate.group_key].members[candidate]
-                model.add(self.division == candidate.source_division).only_enforce_if(
-                    lit
-                )
-                model.add(
-                    child_w.division == candidate.consumer_division
-                ).only_enforce_if(lit)
-                # A pair lit implies its edge: the group cost (sum over the
-                # group's per-source-division lits) can then never charge an
-                # inactive edge, and extraction reads the chosen pair directly.
-                model.add_implication(lit, relayout_lit)
-                pair_lits.append((lit, candidate))
-            model.add_bool_or([lit for lit, _ in pair_lits]).only_enforce_if(
-                relayout_lit
-            )
-            child_w.relayout_pair_lits[self.name] = pair_lits
+            model.add_bool_or([match_lit, *served]).only_enforce_if(self.in_buffer)
 
     def constrain_merge(self, model, parent, edge) -> None:
         """An active merge means the child reuses the parent's exact per-core
@@ -813,6 +651,21 @@ class _SympyExprToCpSat(Printer):
         self._sym_map[expr.name] = cp_var
         return cp_var
 
+    def _print_KroneckerDelta(self, expr):
+        """``KroneckerDelta(division_X, k)`` -> the reified literal
+        ``division == k`` of buffer X (``_CoreDivisionBufferWithCpVars.
+        division_is``), so a table term such as the relayout price lowers to a
+        product of literals. sympy canonicalises the argument order, so the
+        symbol and the constant are found by type, not position."""
+        symbols = [a for a in expr.args if isinstance(a, sympy.Symbol)]
+        constants = [a for a in expr.args if isinstance(a, sympy.Integer)]
+        if len(symbols) != 1 or len(constants) != 1:
+            raise NotImplementedError(f"not implemented. expr: {expr}")
+        wrapper = self._sym_map.get(f"_division_of_{symbols[0].name}")
+        if wrapper is None:
+            raise NotImplementedError(f"no division variable for {symbols[0]}")
+        return wrapper.division_is(int(constants[0]))
+
     def _print_Pow(self, expr):
         return self._print(expr.base) ** self._print(expr.exp)
 
@@ -878,6 +731,8 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
     in-place lifetime shortening) and the lexicographic objective
     (residency, then parallelism, then division balance).
     """
+
+    decides_lx_relayouts = True
 
     def __init__(
         self,
@@ -1015,6 +870,13 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         sym_map = {}
         for t in tensors.values():
             sym_map[t.buffer.sym_is_lx.name] = t.in_buffer
+            if not isinstance(t, _CoreDivisionBufferWithCpVars):
+                continue
+            # The division index itself, and the wrapper behind it for the
+            # KroneckerDelta lowering (a table over candidates, e.g. the
+            # relayout price, selects by identity rather than by split shape).
+            sym_map[t.buffer.sym_division.name] = t.division
+            sym_map[f"_division_of_{t.buffer.sym_division.name}"] = t
             sym_core_divs = t.buffer.sym_core_divs
             for splits, cp_splits, cp_splits_raw in zip(
                 sym_core_divs,
@@ -1027,16 +889,6 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
                     sym_map[f"_buffer_{symbol.name}"] = t
                     sym_map[f"_raw_{symbol.name}"] = cp_splits_raw[key]
 
-        # Each relayout GROUP's cost symbol binds to the float-weighted sum
-        # over its per-source-division literals: a member pair lit implies its
-        # group's g_i and pins the division pair, so the sum charges exactly the
-        # chosen geometry's fitted cost, once per group however many consumers
-        # share it, and zero when the group is off. Linear, so it never touches
-        # the log/Min/Max lowering. (sym_map is keyed by symbol NAME, and the
-        # printer resolves a direct binding before its lazy inv_/log2_
-        # construction.)
-        for (parent, group), g in self._relayout_groups.items():
-            sym_map[relayout_symbol(parent, group).name] = g.cost_terms()
         try:
             cp_cost = _SympyExprToCpSat(model, sym_map).convert(cost_expr)
             if not isinstance(cp_cost, (int, float)):
@@ -1061,14 +913,13 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         cost_expr: sympy.Expr | None,
     ) -> dict[str, LifetimeBoundBuffer]:
         children_of = self._get_children(tensors)
-        # Relayout groups first: the destination rectangles (inside the
-        # in-place relaxation's 2D no-overlap) and the residency gate both
-        # reference the group and pair literals.
-        self._relayout_groups = _build_relayout_groups(
-            model, tensors, self._capacity_units
-        )
+        # Relayout copies are ordinary buffers to the placement model (the
+        # in-place relaxation and its 2D no-overlap need nothing special); the
+        # residency gate and the coupling below reference them by group.
+        copies = self._relayout_copies(tensors)
         self._add_inplace_relaxation(model, tensors)
-        self._add_core_division(model, tensors, children_of, forced_reasons)
+        self._add_core_division(model, tensors, children_of, forced_reasons, copies)
+        self._constrain_relayout_copies(model, tensors, copies)
 
         solver = cp_model.CpSolver()
         if self._time_limit_seconds:
@@ -1098,10 +949,9 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
             # Fallback discipline: the traffic objective below knows no relayout
             # price, and an unpriced shuffle looks free - the exact degeneracy
             # the cost term exists to remove. No relayout decision may be made
-            # under this objective.
-            for sb in tensors.values():
-                for lit in sb.relayout_vars.values():
-                    model.add(lit == 0)
+            # under this objective, so every copy is pinned out.
+            for copy_w in copies.values():
+                model.add(copy_w.in_buffer == 0)
             # Residency (the hard priority): minimize total HBM transfer traffic so
             # as much as possible stays resident in LX.
             hbm_terms = [
@@ -1183,6 +1033,50 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
                 )
 
         return final_tensors
+
+    @staticmethod
+    def _relayout_copies(
+        bufs: dict[str, _LifetimeBufferWithCpVars],
+    ) -> dict[tuple[str, int], _CoreDivisionBufferWithCpVars]:
+        """group key -> wrapper of the group's ``RelayoutCopyBuffer`` (whose
+        ``serves`` tally the residency gate fills with the served literals of
+        the consumer edges it can carry)."""
+        copies: dict[tuple[str, int], _CoreDivisionBufferWithCpVars] = {}
+        for w in bufs.values():
+            if isinstance(w.buffer, RelayoutCopyBuffer):
+                assert isinstance(w, _CoreDivisionBufferWithCpVars)
+                copies[w.buffer.group_key] = w
+        return copies
+
+    @staticmethod
+    def _constrain_relayout_copies(
+        model: "cp_model.CpModel",
+        bufs: dict[str, _LifetimeBufferWithCpVars],
+        copies: dict[tuple[str, int], _CoreDivisionBufferWithCpVars],
+    ) -> None:
+        """The coupling a ``RelayoutCopyBuffer`` cannot carry as data: a resident
+        copy needs its source resident under one of the divisions it was priced
+        for (its ``cost_term`` is a table over exactly those), and must serve at
+        least one consumer (a copy nobody reads is a shuffle for nothing; the
+        price already discourages it, this makes it infeasible). The consumer
+        side -- reading the copy pins the division pair and requires the copy
+        resident -- lives in ``constrain_residency``. A copy whose source is not
+        in this solve, or has no division to choose, can never fire."""
+        for copy_w in copies.values():
+            source = bufs.get(copy_w.buffer.relayout_parent)
+            if source is None or not isinstance(source, _CoreDivisionBufferWithCpVars):
+                model.add(copy_w.in_buffer == 0)
+                continue
+            model.add_implication(copy_w.in_buffer, source.in_buffer)
+            priced = [
+                source.division_is(i)
+                for i in sorted(copy_w.buffer.cost_by_source_division)
+            ]
+            model.add_bool_or(priced).only_enforce_if(copy_w.in_buffer)
+            if copy_w.serves:
+                model.add_bool_or(copy_w.serves).only_enforce_if(copy_w.in_buffer)
+            else:
+                model.add(copy_w.in_buffer == 0)
 
     def _add_inplace_relaxation(
         self,
@@ -1301,38 +1195,6 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
                     f"y_{sb.name}",
                 )
             )
-        # Relayout destinations: one optional rectangle per (group, consumer),
-        # present iff that consumer fires into the group. Its start is the
-        # consumer's tick; its end is tick + 1, or a later consumer's tick when
-        # a bridge lets that consumer inherit the copy (the two rectangles then
-        # abut in time at one offset, which this constraint accepts, exactly as
-        # in-place merges do). The source keeps its full lifetime, so nothing
-        # on that side changes. See _RelayoutGroup for the segment model.
-        horizon = max((sb.end_time for sb in bufs.values()), default=0) + 1
-        for (parent, group), g in self._relayout_groups.items():
-            for child, c in g.consumers.items():
-                tag = f"{parent}__g{group}__{child}"
-                length = model.new_int_var(
-                    1, max(1, horizon - c.tick), f"rdest_len_{tag}"
-                )
-                model.add(length == c.end - c.tick)
-                model.add(
-                    c.offset + g.dest_units <= self._capacity_units
-                ).only_enforce_if(c.present)
-                x_intervals.append(
-                    model.new_optional_interval_var(
-                        c.tick, length, c.end, c.present, f"rdest_x_{tag}"
-                    )
-                )
-                y_intervals.append(
-                    model.new_optional_interval_var(
-                        c.offset,
-                        g.dest_units,
-                        c.offset + g.dest_units,
-                        c.present,
-                        f"rdest_y_{tag}",
-                    )
-                )
         model.add_no_overlap_2d(x_intervals, y_intervals)
 
     def _get_children(
@@ -1356,6 +1218,7 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         bufs: dict[str, _LifetimeBufferWithCpVars],
         children_of: dict[str, list[tuple[str, list[tuple[int, int]]]]],
         forced: dict[str, str],
+        copies: dict[tuple[str, int], _CoreDivisionBufferWithCpVars],
     ) -> None:
         """Pin out every buffer ``forced`` non-resident (decided declaratively by
         :meth:`MemoryPlanSolver.partition`) and install the per-buffer residency
@@ -1365,9 +1228,7 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         for name in forced:
             model.add(bufs[name].in_buffer == 0)
         for sb in bufs.values():
-            sb.constrain_residency(
-                model, children_of.get(sb.name, []), bufs, self._relayout_groups
-            )
+            sb.constrain_residency(model, children_of.get(sb.name, []), bufs, copies)
 
     # ------------------------------------------------------------------
     # Extract
@@ -1393,33 +1254,11 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         }
         footprint = {name: sb.footprint(solver) for name, sb in bufs.items()}
 
-        # Read back fired relayout edges: the chosen candidate, the
-        # destination's solved offset (alignment units; the caller scales to
-        # bytes) and the segment head. Recorded on the buffer for the commit path.
-        relayout_fired = False
-        for sb in bufs.values():
-            for src_name, lit in sb.relayout_vars.items():
-                if not solver.BooleanValue(lit):
-                    continue
-                relayout_fired = True
-                candidate = next(
-                    c
-                    for plit, c in sb.relayout_pair_lits[src_name]
-                    if solver.BooleanValue(plit)
-                )
-                g = self._relayout_groups[candidate.group_key]
-                gc = g.consumers[sb.name]
-                assert solver.BooleanValue(gc.present)
-                sb.buffer.chosen_relayouts[src_name] = ChosenRelayout(
-                    candidate, solver.Value(gc.offset), g.run_head(solver, sb.name)
-                )
-
         offsets: Optional[dict[str, int]] = None
-        # Bottom-justify slides placement units below the solver's offsets, but
-        # it knows nothing about relayout destination rectangles - a slide
-        # could move a buffer into a destination's space. Keep the solver's own
-        # (always-legal) offsets whenever a relayout fired.
-        if self._bottom_justify and not relayout_fired:
+        # Relayout copies are resident buffers like any other here, so the
+        # justify pass slides them with everything else and can never move a
+        # buffer into a copy's space.
+        if self._bottom_justify:
             # A placement unit is a connected component of active merge edges: its
             # members share one base (the merge equalities), so the component
             # slides as a single block and in-place reuse is preserved.
@@ -1467,6 +1306,33 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
                 t.address = None
             else:
                 t.address = offsets[name]
+
+        # Read back the relayouts: a consumer whose served literal is set reads
+        # its parent from that copy, under the division pair the literal
+        # pinned. Recorded on the consumer with the copy's FINAL address (after
+        # the justify slide) for the commit path.
+        for name, sb in bufs.items():
+            for source_name, reads in sb.relayout_reads.items():
+                fired = [copy_w for lit, copy_w in reads if solver.BooleanValue(lit)]
+                if not fired:
+                    continue
+                assert len(fired) == 1, (
+                    f"{name} reads {source_name} through {len(fired)} copies at once"
+                )
+                (copy_w,) = fired
+                assert copy_w.name not in spilled, (
+                    f"{name} reads {source_name} from a spilled copy {copy_w.name}"
+                )
+                i = solver.Value(bufs[source_name].division)
+                j = solver.Value(sb.division)
+                (candidate,) = [
+                    c
+                    for c in copy_w.buffer.candidates_for(name)
+                    if c.source_division == i and c.consumer_division == j
+                ]
+                sb.buffer.chosen_relayouts[source_name] = ChosenRelayout(
+                    candidate, offsets[copy_w.name]
+                )
         return by_name
 
     @staticmethod

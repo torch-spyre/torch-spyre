@@ -93,16 +93,17 @@ class RelayoutCandidate:
     unchanged through the CP-SAT model, the extraction and the commit path: the
     solver keys its pair literal by this record, extraction attaches the solved
     placement (:class:`ChosenRelayout`), and the commit path folds the fired
-    members of one segment into a :class:`LXRelayoutPlan`
-    (:class:`RelayoutSegment`). Nothing downstream re-derives a view, a core
+    members of one fired group into a :class:`LXRelayoutPlan`
+    (:class:`FiredRelayoutGroup`). Nothing downstream re-derives a view, a core
     count or a price from primitives, so a change to what a relayout *is*
     (another lowering kind, a measured footprint) is a change to this record
     and to the enumeration that builds it, nowhere else.
 
     ``group`` identifies the DESTINATION per-core view of ``parent``, interned
     per parent by the allocator for one solve: every candidate that lands on
-    the same view of the same parent shares one shuffle and one LX destination,
-    so the solver prices and places the group once, not per edge.
+    the same view of the same parent shares one shuffle and one LX destination
+    (``RelayoutCopyBuffer``), so the solver prices and places the group once,
+    not per edge.
 
     Both views are built for ``num_cores`` (every core's owner slot within its
     split); the enumeration's ``cores_used`` equality gate guarantees that.
@@ -133,17 +134,16 @@ class RelayoutCandidate:
 
 @dataclasses.dataclass(frozen=True)
 class ChosenRelayout:
-    """A fired :class:`RelayoutCandidate` with its solved placement.
+    """A fired :class:`RelayoutCandidate` with the solved address of its copy.
 
-    ``run_head`` names the earliest consumer of the SEGMENT this consumer reads
-    from: consumers of one group that the solver bridged onto one copy share a
-    destination address and a head, and the commit path materializes one plan
-    per head (:meth:`RelayoutSegment.from_chosen`).
+    Every consumer of one (parent, group) the solver served reads the group's
+    single copy (``RelayoutCopyBuffer``), so all of them carry the same
+    address; the commit path folds them into one plan
+    (:meth:`FiredRelayoutGroup.from_chosen`).
     """
 
     candidate: RelayoutCandidate
     destination_address: int
-    run_head: str
 
     def scaled(self, alignment: int) -> ChosenRelayout:
         """The same choice with the address converted from alignment units."""
@@ -153,25 +153,23 @@ class ChosenRelayout:
 
 
 @dataclasses.dataclass(frozen=True)
-class RelayoutSegment:
-    """A maximal run of consumers the solver bridged onto ONE relayout copy.
+class FiredRelayoutGroup:
+    """The consumers of one (parent, destination view) the solver served from
+    the group's copy: one shuffle, one LX residency at ``destination_address``.
 
-    One segment is one shuffle and one continuous LX residency at
-    ``destination_address``; its members share the source division and the
-    destination view by construction (they are members of one group whose
-    rectangles were pinned to one offset by the bridge literals), which
+    Members share the source division, both views and the address by
+    construction (they read one buffer the solver placed once), which
     :meth:`from_chosen` verifies rather than trusts.
     """
 
     parent: str
     group: int
-    run_head: str
     members: tuple[ChosenRelayout, ...]
 
     @property
     def candidate(self) -> RelayoutCandidate:
         """A representative member; every field the plan needs agrees across
-        the segment (checked in :meth:`from_chosen`)."""
+        the group (checked in :meth:`from_chosen`)."""
         return self.members[0].candidate
 
     @property
@@ -199,18 +197,19 @@ class RelayoutSegment:
         )
 
     @classmethod
-    def from_chosen(cls, chosen: Iterable[ChosenRelayout]) -> list[RelayoutSegment]:
-        """Regroup fired edges by segment: (parent, destination view, head).
+    def from_chosen(cls, chosen: Iterable[ChosenRelayout]) -> list[FiredRelayoutGroup]:
+        """Regroup fired edges by (parent, destination view).
 
         Deterministic order (sorted keys, members sorted by consumer name) so
         plan construction, and hence destination naming, is reproducible.
         """
-        by_segment: dict[tuple[str, int, str], list[ChosenRelayout]] = {}
+        by_group: dict[tuple[str, int], list[ChosenRelayout]] = {}
         for ch in chosen:
-            key = (ch.candidate.parent, ch.candidate.group, ch.run_head)
-            by_segment.setdefault(key, []).append(ch)
-        segments: list[RelayoutSegment] = []
-        for (parent, group, head), members in sorted(by_segment.items()):
+            by_group.setdefault((ch.candidate.parent, ch.candidate.group), []).append(
+                ch
+            )
+        groups: list[FiredRelayoutGroup] = []
+        for (parent, group), members in sorted(by_group.items()):
             members.sort(key=lambda ch: ch.candidate.consumer)
             first = members[0]
             for m in members[1:]:
@@ -227,11 +226,11 @@ class RelayoutSegment:
                 )
                 if not agree:
                     raise AssertionError(
-                        f"relayout segment {parent}/g{group}@{head}: members "
-                        f"disagree on geometry or placement: {first} vs {m}"
+                        f"relayout group {parent}/g{group}: members disagree on "
+                        f"geometry or placement: {first} vs {m}"
                     )
-            segments.append(cls(parent, group, head, tuple(members)))
-        return segments
+            groups.append(cls(parent, group, tuple(members)))
+        return groups
 
 
 def work_division_from_view(

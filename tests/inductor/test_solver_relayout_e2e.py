@@ -560,3 +560,63 @@ def test_coarse_tiled_edges_are_never_offered(monkeypatch):
     assert recorded == []
     ref = ((torch.abs(ha.float()) + hb.float()) * 2).to(torch.float16)
     torch.testing.assert_close(out.cpu(), ref, rtol=2**-8, atol=2**-6)
+
+
+def test_sa_cooptimizer_keeps_its_objective_and_decides_no_relayout(monkeypatch):
+    """The simulated-annealing engine does not decide relayouts yet, so the
+    allocator must hand it neither candidates nor copies, and its objective
+    must carry no relayout term: with one it cannot bind, the annealer would
+    silently drop the WHOLE cost objective and fall back to memory-only
+    scoring (the regression this guards). Same hinted graph as the natural
+    firing test above, under the annealer: it compiles, computes the right
+    numbers, fires nothing, and scores with the real cost expression."""
+    import torch_spyre._inductor.wsr.propagate_named_dims as _pnd
+    from torch_spyre._inductor import spyre_hint
+    from torch_spyre._inductor.scratchpad import sa_cooptimizer as sa_mod
+
+    observed = _Observed(monkeypatch, force=False)
+    score_fns: list = []
+    real_build = sa_mod.SaCoOptimizingSolver._build_score_fn
+
+    def spy_build(self, cost_expr):
+        fn = real_build(self, cost_expr)
+        score_fns.append((cost_expr, fn))
+        return fn
+
+    monkeypatch.setattr(sa_mod.SaCoOptimizingSolver, "_build_score_fn", spy_build)
+
+    def fn(t):
+        with spyre_hint(work_div={"B": 4, "M": 2}):
+            hidden = torch.neg(t)
+        with spyre_hint(work_div={"B": 2, "M": 4}):
+            return torch.relu(hidden)
+
+    torch.manual_seed(0)
+    host = torch.randn(8, 256, 512, dtype=torch.float16)
+    for name, size in (("B", 8), ("M", 256), ("K", 512)):
+        _pnd.declare_tensor_dim(name, size)
+    x = _pnd.name_tensor_dims(host.to("spyre"), ["B", "M", "K"])
+    with config.patch(
+        {
+            "co_optimizing_lx_planning": True,
+            "layout_solver": "simulated_annealing",
+        }
+    ):
+        out = torch.compile(fn, dynamic=False)(x)
+
+    observed.assert_nothing_emitted()
+    assert score_fns, "the annealer never built a score function"
+    for cost_expr, score_fn in score_fns:
+        assert cost_expr is not None, "the allocator produced no cost expression"
+        assert not any(
+            str(sym).startswith(("is_lx___spyre_lx_relayout__", "relayout"))
+            for sym in cost_expr.free_symbols
+        ), (
+            f"relayout term handed to an engine that cannot decide relayouts: {cost_expr}"
+        )
+        assert score_fn is not None, (
+            "the annealer fell back to the memory-only objective: a symbol in the "
+            "cost expression could not be bound"
+        )
+    ref = torch.relu(torch.neg(host.float())).to(torch.float16)
+    torch.testing.assert_close(out.cpu(), ref, rtol=1e-3, atol=1e-3)
