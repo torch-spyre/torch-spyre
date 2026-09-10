@@ -707,6 +707,58 @@ class TestSpyre(TestCase):
             ),
         )
 
+    def test_h2d_copy_into_subview(self):
+        """H2D copy into a slice of a larger Spyre allocation must write to the
+        correct position without corrupting surrounding device elements.
+
+        Regression: copying CPU data into spyre[:n] or spyre[-n:] (where n is
+        smaller than one stick's worth of elements) raised
+        'Invalid device sizes and stride map for host sizes and strides'.
+        """
+        N = 64  # small enough that both bugs fire without a huge allocation
+        n = 9   # smaller than one stick (32 elems for int32, 64 for float16)
+        sentinel = -1
+
+        # --- int32: verify head and tail slices land at correct offsets ---
+        cpu_src = torch.arange(N, dtype=torch.int32)
+        spyre_base = torch.full(N, sentinel, dtype=torch.int32, device="spyre")
+
+        spyre_base[:n].copy_(cpu_src[:n])
+        spyre_base[-n:].copy_(cpu_src[-n:])
+
+        result = spyre_base.cpu()
+        self.assertEqual(result[:n], cpu_src[:n])    # head at offset 0
+        self.assertTrue(torch.all(result[n:-n] == sentinel))
+        self.assertEqual(result[-n:], cpu_src[-n:])  # tail at offset N-n
+
+    def test_h2d_subview_copy_preserves_out_of_slot_dtype_precision(self):
+        """H2D copy into a sub-view must not degrade out-of-slot elements.
+
+        When src and dst differ in dtype, the internal staging buffer must use
+        dst's dtype so that existing device elements are read and written back
+        at full precision.  Out-of-slot elements are never touched by the copy
+        and must be bitwise identical after the round-trip.
+
+        Uses int32 for the base so the tail check is bitwise exact — no
+        floating-point tolerance can mask a corruption.  The float16 source
+        still exercises the dtype-mismatch path in the staging buffer.
+        """
+        N = 64
+        n = 9  # sub-stick head slice
+
+        sentinel = 0x12345678
+        spyre_base = torch.full((N,), sentinel, dtype=torch.int32, device="spyre")
+        spyre_base[:n].copy_(torch.ones(n, dtype=torch.float16))
+
+        result = spyre_base.cpu()
+
+        self.assertEqual(result[:n], torch.ones(n, dtype=torch.int32))
+        # Bitwise check: out-of-slot elements must be untouched
+        self.assertTrue(
+            torch.all(result[n:] == sentinel),
+            msg=f"out-of-slot elements corrupted: {result[n:]}",
+        )
+
     def test_scalar_tensor(self):
         """Test to ensure we have scalar tensor on Spyre"""
         scalar = torch.tensor(3.14, dtype=torch.float16, device="spyre")
