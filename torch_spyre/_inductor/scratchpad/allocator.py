@@ -106,12 +106,13 @@ from torch_spyre._inductor import config
 from torch_spyre._inductor.logging_utils import get_inductor_logger
 from torch_spyre._inductor.loop_info import CarriedReductionRecord
 from torch_spyre._inductor.scratchpad.lx_relayout import (
-    FiredRelayoutGroup,
-    LXRelayoutPlan,
-    RelayoutCandidate,
     _unsupported_relayout_transition_reason,
     collect_lx_relayout_plans,
+    FiredRelayoutGroup,
+    LXRelayoutPlan,
     materialize_lx_relayouts,
+    partition_footprint,
+    RelayoutCandidate,
     solver_relayout_edge_context,
     solver_relayout_pair_cost,
     work_division_from_view,
@@ -2750,6 +2751,26 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                 tiling = getattr(cd, "tiling", None)
                 return tiling is not None and not getattr(tiling, "is_untiled", True)
 
+            # The per-core LX span of a view (#3440's reservation for a relayout
+            # member). Unavailable (non-standard arrangement, an unsplittable
+            # stick axis) is a decline, as on the committed path: without a
+            # size the copy cannot be placed, so the pair is never offered.
+            spans: dict[PerCoreView, Optional[int]] = {}
+
+            def _span(view: PerCoreView) -> Optional[int]:
+                if view not in spans:
+                    try:
+                        spans[view] = partition_footprint(parent_op.layout, view)
+                    except (TypeError, ValueError) as exc:
+                        logger.debug(
+                            "[lx solver relayout] %s: span unavailable for view %s: %s",
+                            parent,
+                            dict(view.work_slice_dims),
+                            exc,
+                        )
+                        spans[view] = None
+                return spans[view]
+
             pair_cost: dict[tuple, Optional[float]] = {}
             candidates: list[RelayoutCandidate] = []
             # Destination views are interned per parent across every consumer
@@ -2793,20 +2814,26 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                             pv, cv, ncores, device_dims, out_elems, dtype_bytes
                         )
                     cost = pair_cost[key]
-                    if cost is not None:
-                        candidates.append(
-                            RelayoutCandidate(
-                                parent=parent,
-                                consumer=consumer_op.get_name(),
-                                source_division=i,
-                                consumer_division=j,
-                                group=_intern_view_group(view_groups, cv),
-                                source_view=pv,
-                                destination_view=cv,
-                                num_cores=ncores,
-                                cost_ns=cost,
-                            )
+                    if cost is None:
+                        continue
+                    source_span, destination_span = _span(pv), _span(cv)
+                    if source_span is None or destination_span is None:
+                        continue
+                    candidates.append(
+                        RelayoutCandidate(
+                            parent=parent,
+                            consumer=consumer_op.get_name(),
+                            source_division=i,
+                            consumer_division=j,
+                            group=_intern_view_group(view_groups, cv),
+                            source_view=pv,
+                            destination_view=cv,
+                            num_cores=ncores,
+                            cost_ns=cost,
+                            source_footprint_bytes=source_span,
+                            destination_footprint_bytes=destination_span,
                         )
+                    )
             if candidates:
                 relayouts[parent] = candidates
                 logger.debug(

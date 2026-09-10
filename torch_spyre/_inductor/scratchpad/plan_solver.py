@@ -448,9 +448,11 @@ class RelayoutCopyBuffer(CoreDivisionBuffer):
     carries the CP-SAT encoding; the annealer does not decide relayouts yet and
     is never handed a copy, see ``CoOptimizingAllocator``).
 
-    ``size`` is the SOURCE's total footprint and ``core_divisions`` holds one
+    ``size`` is the destination's per-core span (the candidates'
+    ``destination_footprint_bytes``, the bound the committed path reserves for
+    a relayout destination) times ``num_cores``, and ``core_divisions`` holds one
     division sliced ``num_cores`` ways, so the per-core footprint every engine
-    derives (``size / output_partition``) is the destination's. ``parents`` is
+    derives (``size / output_partition``) is exactly that span. ``parents`` is
     deliberately empty: the source edge is a relayout coupling, not a
     slicing-match edge, and listing it would make engines that gate residency on
     ``cd_parent_matches`` refuse the source outright.
@@ -533,11 +535,19 @@ def build_relayout_copy(
         f"relayout group {parent.name}/g{group} mixes core counts {sorted(cores)}"
     )
     assert all(c.parent == parent.name and c.group == group for c in ordered)
+    # One destination view per group, hence one span; the candidates were
+    # measured against the same layout, so a disagreement is an enumeration
+    # error, not something to take the max of.
+    spans = {c.destination_footprint_bytes for c in ordered}
+    assert len(spans) == 1, (
+        f"relayout group {parent.name}/g{group} mixes destination spans {sorted(spans)}"
+    )
+    num_cores = cores.pop()
     return RelayoutCopyBuffer(
         name=relayout_copy_name(parent.name, group),
-        size=parent.size,
+        size=spans.pop() * num_cores,
         uses=sorted({consumer_ticks[c.consumer] for c in ordered}),
-        core_divisions=[CoreDivision(output_splits={"relayout_copy": cores.pop()})],
+        core_divisions=[CoreDivision(output_splits={"relayout_copy": num_cores})],
         relayout_parent=parent.name,
         group=group,
         candidates=ordered,

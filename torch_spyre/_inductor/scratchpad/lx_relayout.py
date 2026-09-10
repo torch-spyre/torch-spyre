@@ -107,6 +107,13 @@ class RelayoutCandidate:
 
     Both views are built for ``num_cores`` (every core's owner slot within its
     split); the enumeration's ``cores_used`` equality gate guarantees that.
+
+    ``source_footprint_bytes`` / ``destination_footprint_bytes`` are the
+    per-core LX spans of the two views (:func:`partition_footprint`, the bound
+    the committed path reserves for a relayout member since #3440), measured
+    once at enumeration: the copy buffer is sized from the destination span and
+    the plan hands both to the allocator, so the solver never reserves less for
+    a shuffle than the committed path would.
     """
 
     parent: str
@@ -118,12 +125,21 @@ class RelayoutCandidate:
     destination_view: PerCoreView
     num_cores: int
     cost_ns: float
+    source_footprint_bytes: int
+    destination_footprint_bytes: int
 
     def __post_init__(self) -> None:
         if self.source_view.same_partition(self.destination_view):
             raise ValueError(
                 f"relayout candidate {self.parent} -> {self.consumer} has equal "
                 "views; that pair belongs to cd_parent_matches"
+            )
+        if self.source_footprint_bytes <= 0 or self.destination_footprint_bytes <= 0:
+            raise ValueError(
+                f"relayout candidate {self.parent} -> {self.consumer} has no "
+                f"measured span (source {self.source_footprint_bytes}, destination "
+                f"{self.destination_footprint_bytes} bytes); a candidate whose "
+                "footprint is unavailable must be declined at enumeration"
             )
 
     @property
@@ -192,6 +208,8 @@ class FiredRelayoutGroup:
             c.source_view,
             c.destination_view,
             c.num_cores,
+            source_footprint_bytes=c.source_footprint_bytes,
+            destination_footprint_bytes=c.destination_footprint_bytes,
             source_address=source_address,
             destination_address=self.destination_address,
         )
@@ -222,6 +240,10 @@ class FiredRelayoutGroup:
                         first.candidate.destination_view
                     )
                     and m.candidate.num_cores == first.candidate.num_cores
+                    and m.candidate.source_footprint_bytes
+                    == first.candidate.source_footprint_bytes
+                    and m.candidate.destination_footprint_bytes
+                    == first.candidate.destination_footprint_bytes
                     and m.destination_address == first.destination_address
                 )
                 if not agree:

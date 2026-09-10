@@ -278,6 +278,28 @@ def test_same_ownership_in_two_spellings_is_not_a_relayout():
             destination_view=_QUARTER_MOD,
             num_cores=4,
             cost_ns=1.0,
+            source_footprint_bytes=1,
+            destination_footprint_bytes=1,
+        )
+
+
+def test_candidate_without_a_measured_span_is_rejected():
+    """The committed path declines a relayout whose span it cannot measure
+    (#3440); the solver path must not carry such a candidate into a solve,
+    where a zero-sized copy would place for free."""
+    with pytest.raises(ValueError, match="no measured span"):
+        RelayoutCandidate(
+            parent="buf0",
+            consumer="buf1",
+            source_division=0,
+            consumer_division=1,
+            group=0,
+            source_view=_SRC,
+            destination_view=_DST,
+            num_cores=8,
+            cost_ns=1.0,
+            source_footprint_bytes=128,
+            destination_footprint_bytes=0,
         )
 
 

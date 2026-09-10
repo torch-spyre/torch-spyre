@@ -187,8 +187,9 @@ class _Observed:
         gates are being rewritten under it (#4284, #3440, #4153). This pins the
         one direction that must always hold: every edge the solver fired is one
         the committed collector, run on the same committed graph, also
-        certifies, with the same physical source and destination ownership and
-        core count. (The reverse need not hold: the solver may decline an
+        certifies, with the same physical source and destination ownership,
+        core count and per-core LX spans (the sizes both allocators reserve for
+        the shuffle's endpoints, #3440). (The reverse need not hold: the solver may decline an
         eligible edge on economics or capacity.) A solver segment's consumers
         are a subset of the committed plan's, which groups every consumer of a
         destination view together.
@@ -202,14 +203,17 @@ class _Observed:
                 and c.num_cores == plan.num_cores
                 and c.source_view.same_partition(plan.source_view)
                 and c.destination_view.same_partition(plan.destination_view)
+                and c.source_footprint_bytes == plan.source_footprint_bytes
+                and c.destination_footprint_bytes == plan.destination_footprint_bytes
             ]
             assert twins, (
                 f"solver fired {plan.source_name} -> {plan.consumer_names} "
                 f"(src {dict(plan.source_view.work_slice_dims)}, dst "
                 f"{dict(plan.destination_view.work_slice_dims)}, {plan.num_cores} "
-                "cores) but the committed collector certifies no such edge on the "
-                "committed graph; committed plans: "
-                f"{[(c.source_name, c.consumer_names, dict(c.source_view.work_slice_dims), dict(c.destination_view.work_slice_dims)) for c in self.committed]}"
+                f"cores, spans {plan.source_footprint_bytes}/"
+                f"{plan.destination_footprint_bytes} B) but the committed collector "
+                "certifies no such edge on the committed graph; committed plans: "
+                f"{[(c.source_name, c.consumer_names, dict(c.source_view.work_slice_dims), dict(c.destination_view.work_slice_dims), c.source_footprint_bytes, c.destination_footprint_bytes) for c in self.committed]}"
             )
 
     def assert_nothing_emitted(self) -> None:

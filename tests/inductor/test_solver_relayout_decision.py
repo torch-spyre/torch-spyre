@@ -68,7 +68,9 @@ def _view(slot: int) -> PerCoreView:
     return PerCoreView(((1, 4),), ((1, sympy.Mod(_CORE + slot, 4)),), 4)
 
 
-def _candidate(consumer, i, cost_ns, group=0, j=0) -> RelayoutCandidate:
+def _candidate(
+    consumer, i, cost_ns, group=0, j=0, destination_span=16
+) -> RelayoutCandidate:
     """The priced candidate the allocator would enumerate for P -> consumer under
     source division ``i`` / consumer division ``j``, landing on destination
     view ``group``. The solver only carries the views, so their exact geometry
@@ -84,6 +86,10 @@ def _candidate(consumer, i, cost_ns, group=0, j=0) -> RelayoutCandidate:
         destination_view=_view(group + 1),
         num_cores=4,
         cost_ns=cost_ns,
+        # P is 64 bytes over 4 cores; a permutation of an outer split keeps
+        # the equal share as its per-core span on both sides.
+        source_footprint_bytes=16,
+        destination_footprint_bytes=destination_span,
     )
 
 
@@ -161,12 +167,47 @@ def test_copy_buffer_is_the_destination_the_allocator_would_build():
     )
     assert copy.relayout_parent == "P" and copy.group == 0
     assert copy.consumers == ("C1", "C2")
-    # Live from the first consumer's tick to the last's; the source's total
-    # footprint sliced num_cores ways is the destination's per-core footprint.
+    # Live from the first consumer's tick to the last's; the per-core footprint
+    # is the destination view's measured span, sliced num_cores ways.
     assert (copy.start_time, copy.end_time) == (1, 3)
     assert copy.size == 64 and copy.num_cores == 4 and copy.min_footprint == 16
     assert copy.parents == [] and copy.cd_parent_matches == {}
     assert copy.cost_by_source_division == {0: 5000.0}
+
+
+def test_copy_is_sized_by_the_destination_span_not_the_source_share():
+    """A view that splits an inner device dim spans more LX per core than its
+    equal share (#3440 reserves the span for the committed destination). The
+    copy must reserve the same, or the solver packs a neighbour into bytes the
+    shuffle will write."""
+    p = _producer([0, 3])
+    c1 = _consumer("C1", 1, 2, [_candidate("C1", 0, 5000.0, destination_span=48)])
+    c2 = _consumer("C2", 2, 3, [_candidate("C2", 0, 5000.0, destination_span=48)])
+    (copy,) = CoOptimizingAllocator._relayout_copy_buffers([p, c1, c2])
+    assert copy.size == 48 * 4 and copy.min_footprint == 48, (
+        "per-core footprint must be the destination span, not size / num_cores"
+    )
+    # Members of one group land on one view, so they were measured alike; a
+    # disagreement is an enumeration error, never averaged or maxed away.
+    c3 = _consumer("C3", 2, 3, [_candidate("C3", 0, 5000.0, destination_span=32)])
+    with pytest.raises(AssertionError, match="mixes destination spans"):
+        CoOptimizingAllocator._relayout_copy_buffers([p, c1, c3])
+
+
+def test_plan_carries_the_measured_spans():
+    """The plan hands the allocator the spans the enumeration measured, so the
+    committed side sizes source and destination exactly as the solver did."""
+    fired = ChosenRelayout(_candidate("C1", 0, 5000.0, destination_span=48), 16)
+    (group,) = FiredRelayoutGroup.from_chosen([fired])
+    plan = group.plan(source_address=0)
+    assert (plan.source_footprint_bytes, plan.destination_footprint_bytes) == (16, 48)
+    with pytest.raises(AssertionError, match="disagree"):
+        FiredRelayoutGroup.from_chosen(
+            [
+                fired,
+                ChosenRelayout(_candidate("C2", 0, 5000.0, destination_span=32), 16),
+            ]
+        )
 
 
 def test_price_term_charges_the_chosen_source_division_while_resident():
@@ -442,4 +483,4 @@ def test_fired_groups_regroup_edges_by_source_and_view():
             [c1, ChosenRelayout(_candidate("C2", 0, 5000.0), 64)]
         )
     with pytest.raises(ValueError, match="equal views"):
-        RelayoutCandidate("P", "C", 0, 0, 0, _view(0), _view(0), 4, 1.0)
+        RelayoutCandidate("P", "C", 0, 0, 0, _view(0), _view(0), 4, 1.0, 16, 16)
