@@ -669,6 +669,25 @@ class TestSpyre(TestCase):
             torch.tensor([[5, 6, 7, 8]] * 3, dtype=torch.float16),
         )
 
+        data = [
+            [float(i) for i in range(0, 20)],
+            [float(i) for i in range(20, 40)],
+            [float(i) for i in range(40, 60)],
+            [float(i) for i in range(60, 80)],
+        ]
+
+        # Slice then expand to original sizes: destination sizes == source sizes
+        # exercises the edge case where the device tensor sizes and dma_sizes
+        # have the same number of elements yet the sizes represent a expanded
+        # slice and the dma_sizes represent the original data.
+        base = torch.tensor(data, dtype=torch.float16, device="spyre")
+        sliced_expanded = base[1:2].expand(4, 20)
+        self.assertEqual(sliced_expanded.storage_offset(), 20)
+        self.assertEqual(
+            sliced_expanded.cpu(),
+            torch.tensor([data[1]] * 4, dtype=torch.float16),
+        )
+
     def test_d2h_copy_of_strided_slice(self):
         """D2H of a strided slice (e.g. t[::2]) must produce the slice's
         logical values, not over-DMA the parent's full allocation."""
