@@ -63,6 +63,7 @@ from torch_spyre._inductor.work_division import (
     _view_for_div,
 )
 from torch_spyre._inductor.errors import Unsupported
+from torch_spyre._inductor.wsr.enumerate_tilings import build_tiling_space
 from torch_spyre._inductor.scratchpad.plan_solver import (
     cost_expr_record,
     CoreDivision,
@@ -2018,6 +2019,48 @@ class _DivisionMap(NamedTuple):
     enumerated: set[str]
 
 
+# Whether anything applies a solver's chosen ``TileSpec``s to the graph by
+# running ``scratchpad.coarse_tiling.CoarseTilingPass`` over them. **Nothing
+# does yet** -- the pass exists and is tested, but no allocator builds one from
+# a solve's result. (Not imported from beside that pass: ``coarse_tiling``
+# imports this module, so the constant would be circular there.)
+#
+# It gates whether the solver is offered coarse tilings at all, and it is not a
+# user setting -- which engine runs is the only switch a user has, and a
+# setting could only disagree with this. Until it holds, the solver must not be
+# allowed to choose a tiling, and not merely because the choice would be
+# wasted: the search prices the *per-tile* footprint and the packer lays LX out
+# by it, while the untiled graph writes the full extent. The reserved interval
+# is then a fraction of the real one, so the bytes above it are handed to
+# whatever the packer put there next, or run off the end of the region.
+#
+# Measured with the gate forced open. On a real compile
+# (``test_mlp__simulated_annealing_sc32_coopt``) a resident buffer reserves 256
+# bytes and will write 16,384 -- 64x -- and nothing breaks only because it is
+# the sole resident buffer and LX has room; the numerical check passes, so the
+# error is invisible there. Add a second resident buffer and it bites both ways:
+# ``~/coopt-repro/stage3_unapplied_tiling_overlap.py`` shows a 16,128-byte
+# overlap between two live buffers in one arrangement, and a 12,768-byte
+# overrun of the LX region in another.
+#
+# **Delete this when the apply step lands** -- do not leave it standing at
+# True. It marks a missing implementation, not a mode: once an apply round
+# exists the conjunct is vacuous, and a constant pinned True is a config flag
+# wearing a different hat, which is the thing this deliberately is not. The
+# predicate below then reduces to the solver check alone (or, if the apply
+# turns out to be wired per route, to an instance question about *this*
+# allocator -- either way, not a module constant).
+#
+# What does stay is ``_commit_divisions``' refusal to commit a tiled division
+# on a resident buffer. That is an invariant rather than a not-implemented
+# marker, and the apply round makes it more useful, not less: it can fail per
+# op in ways the solve cannot predict (``validate_coarse_tile_groups`` on a
+# split hint scope, ``coarse_tile`` on a divisibility violation), and the
+# moment one of those degrades from a raise to a skip, an op priced as tiled
+# is running untiled again.
+TILE_CHOICES_ARE_APPLIED = False
+
+
 class CoOptimizingAllocator(ScratchpadAllocator):
     def __init__(
         self,
@@ -2452,6 +2495,8 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         region.
         """
         op_by_name = {op.name: op for op in graph.operations}
+        tiled = []
+        tiled_resident = []
         for buf in allocation:
             op = op_by_name.get(buf.name)
             if op is None or buf.chosen_division is None:
@@ -2459,9 +2504,34 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             if not hasattr(op, "iteration_space_ownership"):
                 continue
             cd = buf.core_divisions[buf.chosen_division]
+            if not cd.tiling.is_untiled:
+                tiled.append(f"{buf.name}={cd.tiling.label}")
+                if buf.address is not None:
+                    tiled_resident.append(buf.name)
             if not _split_option_is_legal(op, cd.splits):
                 raise Unsupported(f"{op.name}: chosen split violates hard domain.")
             commit_iteration_space_ownership(op, cd.splits)
+        if tiled:
+            # Said out loud rather than dropped quietly: the split half of a
+            # chosen division is committed here, the tiling half has no apply
+            # step yet, so such a run plans against a per-tile footprint the
+            # graph will not have.
+            logger.warning(
+                "chose a coarse tiling for %d op(s) that nothing applies: %s",
+                len(tiled),
+                ", ".join(tiled),
+            )
+        if tiled_resident:
+            # The sharp case, and the reason this is not merely a lost
+            # optimization: an LX address was spaced by a per-core size divided
+            # by a tile count the graph will not have, so this buffer and the
+            # one above it can overlap.
+            raise Unsupported(
+                "coarse tiling was chosen for LX-resident buffer(s) "
+                f"{', '.join(sorted(tiled_resident))}, but no pass applies a "
+                "TileSpec yet, so their LX addresses are spaced by a footprint "
+                "the graph will not have"
+            )
 
     def _determine_in_place_division_invariant(
         self, graph: GraphLowering
@@ -2896,12 +2966,32 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         never look at a space. Building one is not free -- a
         ``WorkDivisionContext`` and a factor domain per axis, per buffer -- so an
         engine that would ignore the answer does not pay for it.
+
+        Which engine it is *is* the switch, as far as a user is concerned:
+        ``select_allocator`` reaches this solver from exactly two settings
+        (``co_optimizing_lx_planning`` plus
+        ``layout_solver = "simulated_annealing"``), and a separate flag on top
+        could only ever disagree with them.
         """
         return self.layout_planning is SaCoOptimizingSolver
 
-    @staticmethod
+    @property
+    def _solver_chooses_tilings(self) -> bool:
+        """Whether the solver this allocator feeds picks coarse tilings too.
+
+        Only a generated division can carry a ``TileSpec`` -- the enumeration
+        has none to offer, so an engine that indexes it could not choose one if
+        it wanted to. Hence :attr:`_solver_generates_divisions`.
+
+        The other conjunct is not a choice at all but a precondition:
+        ``TILE_CHOICES_ARE_APPLIED`` says whether anything applies a chosen
+        ``TileSpec`` to the graph. While nothing does, offering one is unsafe
+        rather than merely useless -- see that constant.
+        """
+        return TILE_CHOICES_ARE_APPLIED and self._solver_generates_divisions
+
     def _division_space(
-        op: Operation, buffer: CoreDivisionBuffer
+        self, op: Operation, buffer: CoreDivisionBuffer
     ) -> Optional[OpSplitSpace]:
         """The op's split space, priced through ``buffer``'s own cost symbols.
 
@@ -2910,8 +3000,16 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         which is why the space is attached here rather than where the candidates
         are enumerated. A split on an axis outside it would be priced as
         unsplit, so the space is what holds a generated division to it.
+
+        The tiling half is attached only for the solver that can use it (see
+        :attr:`_solver_chooses_tilings`): deriving it costs a stick-alignment
+        analysis per output dim, so an engine that would ignore the answer does
+        not pay for it.
         """
-        return build_op_split_space(op, config.sencores, buffer.sym_core_divs)
+        tiling = build_tiling_space(op) if self._solver_chooses_tilings else None
+        return build_op_split_space(
+            op, config.sencores, buffer.sym_core_divs, tiling=tiling
+        )
 
     def _eligible_clone_inputs(
         self, graph: GraphLowering, lifetimes: dict[str, list[int]]

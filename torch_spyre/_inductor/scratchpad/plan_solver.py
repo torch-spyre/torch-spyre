@@ -192,7 +192,8 @@ class TileSpec:
     because tile levels *nest*: swapping two levels is a different plan. Frozen
     and hashable so ``==`` is exactly the "same tiling shape" test the group
     derivation keys on. The empty spec is *untiled*, and is the inert default
-    every :class:`CoreDivision` carries while ``auto_coarse_tiling`` is off.
+    every :class:`CoreDivision` carries unless a solver chose otherwise -- only
+    the SA co-optimizer does.
     """
 
     axes: tuple[TileAxis, ...] = ()
@@ -223,6 +224,12 @@ class TileSpec:
         :attr:`tile_count`.
         """
         return math.prod(a.count for a in self.axes if not a.is_reduction)
+
+    @property
+    def is_clean(self) -> bool:
+        """True when no reduction axis is tiled, so every tile of the output is
+        final rather than a partial sum."""
+        return not any(a.is_reduction for a in self.axes)
 
     @property
     def label(self) -> str:
@@ -341,9 +348,9 @@ class CoreDivisionBuffer(LifetimeBoundBuffer):
         A tiled candidate's own buffer is per-tile scratch, so its footprint
         shrinks by the output tile count as well as the core count -- this is
         the LX-residency win entering the footprint math. Reduction tile levels
-        are excluded (see :attr:`TileSpec.output_tile_count`); with
-        ``auto_coarse_tiling`` off every ``cd.tiling`` is empty and this reduces
-        to the previous ``ceil_div(size, output_partition)`` exactly."""
+        are excluded (see :attr:`TileSpec.output_tile_count`); where no
+        solver chose a tiling every ``cd.tiling`` is empty and this reduces to
+        ``ceil_div(size, output_partition)`` exactly."""
         if not self.core_divisions:
             return self.size
         return min(

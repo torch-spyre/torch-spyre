@@ -55,10 +55,13 @@ from torch_spyre._inductor.scratchpad.allocator import (
 from torch_spyre._inductor.scratchpad.greedy_solver import GreedyLayoutSolver
 from torch_spyre._inductor.scratchpad.plan_solver import (
     CoreDivisionBuffer,
+    TileAxis,
+    TileSpec,
 )
 from torch_spyre._inductor.scratchpad.utils import (
     is_empty_tiled_layout,
 )
+from torch_spyre._inductor.wsr.enumerate_tilings import TilingSpace
 from torch_spyre._inductor.work_division import (
     TensorDep,
     undeclared_splits,
@@ -2533,6 +2536,102 @@ class TestOpSplitSpace(unittest.TestCase):
             )
 
 
+_SPEC_ON_DIM_0 = TileSpec((TileAxis(host_dim=0, count=2),))
+_SPEC_ON_DIM_1 = TileSpec((TileAxis(host_dim=1, count=2),))
+
+
+class TestOpSplitSpaceTiling(unittest.TestCase):
+    """The tiling half of the space: a coarse tiling and a core division are
+    one candidate, and the tiling narrows what the division may be."""
+
+    def setUp(self):
+        self.x, self.y = _isym("x"), _isym("y")
+        # Host dim 0 has extent 8 -- four divisors untiled, fewer per tile.
+        self.op = _computed_buffer((8, 128), name="tiled")
+        self.case = _CandidateCase(
+            name="tiling",
+            op=self.op,
+            it_space={self.x: 8, self.y: 128},
+            output_td=_tensor_dep("tiled", (8, 128), (self.x, self.y)),
+            max_cores=32,
+            axes=(self.x, self.y),
+            candidates=[],
+            probes=[],
+        )
+        self.tiling = TilingSpace(
+            op=self.op,
+            max_dims=2,
+            output_counts={0: [2, 4]},
+            reduction_counts={},
+        )
+
+    @contextmanager
+    def _space(self, tiling):
+        with self.case.patches():
+            yield work_division_module.build_op_split_space(
+                self.op, self.case.max_cores, tiling=tiling
+            )
+
+    def test_a_tile_level_narrows_the_axis_it_cuts(self):
+        """The ragged half: coarse tiling emits equal tiles, so a core split of
+        a tiled axis has to divide the *per-tile* extent."""
+        tiled = TileSpec((TileAxis(host_dim=0, count=4),))
+        with self._space(self.tiling) as space:
+            self.assertEqual(space.factor_domain(self.x), [1, 2, 4, 8])
+            self.assertEqual(space.factor_domain(self.x, tiled), [1, 2])
+            # The untouched axis keeps its whole domain.
+            self.assertEqual(
+                space.factor_domain(self.y, tiled), space.factor_domain(self.y)
+            )
+            self.assertTrue(space.admits({self.x: 4, self.y: 1}))
+            self.assertFalse(space.admits({self.x: 4, self.y: 1}, tiled))
+            self.assertTrue(space.admits({self.x: 2, self.y: 1}, tiled))
+
+    def test_a_tiling_the_op_cannot_take_is_refused_with_its_splits(self):
+        with self._space(self.tiling) as space:
+            self.assertFalse(space.admits({self.x: 1, self.y: 1}, _SPEC_ON_DIM_1))
+            self.assertFalse(space.admits_tiling(_SPEC_ON_DIM_1))
+
+    def test_a_step_moves_one_axis_or_one_level_but_never_both(self):
+        untiled = TileSpec()
+        with self._space(self.tiling) as space:
+            seed = space.division({self.x: 2, self.y: 1})
+            moves = space.neighbours(seed)
+            for division in moves:
+                changed_tiling = division.tiling != untiled
+                changed_splits = division.output_splits != seed.output_splits
+                self.assertNotEqual(changed_tiling, changed_splits, division.label)
+            # Both kinds are offered, and a tiling step keeps the splits.
+            self.assertIn(
+                (2, TileSpec((TileAxis(host_dim=0, count=2),))),
+                [(d.output_splits.get(self.x, 1), d.tiling) for d in moves],
+            )
+            self.assertIn(4, [d.output_splits.get(self.x, 1) for d in moves])
+
+    def test_the_split_steps_at_a_tiling_stay_inside_its_narrower_domain(self):
+        tiled = TileSpec((TileAxis(host_dim=0, count=4),))
+        with self._space(self.tiling) as space:
+            at_tiling = space.neighbours(space.division({self.x: 1}, tiled))
+            for division in at_tiling:
+                if division.tiling == tiled:
+                    self.assertIn(division.output_splits.get(self.x, 1), (1, 2))
+
+    def test_without_a_tiling_space_nothing_is_tiled_and_nothing_is_offered(self):
+        """What every engine but the SA co-optimizer gets: the answers are
+        the ones a space that never knew about tilings gave."""
+        with self._space(None) as space:
+            self.assertFalse(space.admits_tiling(_SPEC_ON_DIM_0))
+            self.assertFalse(space.admits({self.x: 1}, _SPEC_ON_DIM_0))
+            self.assertEqual(space.tiling_options(TileSpec()), [])
+            seed = space.division({self.x: 2, self.y: 1})
+            self.assertTrue(all(d.tiling.is_untiled for d in space.neighbours(seed)))
+        with self._space(self.tiling) as tiled_space:
+            self.assertGreater(
+                len(tiled_space.neighbours(tiled_space.division({self.x: 2}))),
+                len(space.neighbours(seed)),
+            )
+
+
 class TestResidencyEdgeInversion(unittest.TestCase):
     """Propagating a division across an edge by *constructing* the other end's
     division instead of scanning its menu for a compatible entry."""
@@ -2578,7 +2677,7 @@ class TestResidencyEdgeInversion(unittest.TestCase):
         legality rules :class:`TestOpSplitSpace` covers."""
         context = MagicMock()
         context.axes = list(domains)
-        context.is_legal.side_effect = lambda splits: True
+        context.is_legal.side_effect = lambda splits, tile_counts=None: True
         return work_division_module.OpSplitSpace(
             op=op,
             context=context,
@@ -2724,7 +2823,9 @@ class TestResidencyEdgeInversion(unittest.TestCase):
         space = self._space(
             self.consumer, {self.r: [1, 2, 4, 8], self.c: [1, 2]}, {self.r, self.c}
         )
-        space.context.is_legal.side_effect = lambda splits: splits[self.r] != 4
+        space.context.is_legal.side_effect = (
+            lambda splits, tile_counts=None: splits[self.r] != 4
+        )
         with self._geometry():
             edge = self._edge()
             self.assertIsNone(

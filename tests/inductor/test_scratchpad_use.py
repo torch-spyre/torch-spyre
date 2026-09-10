@@ -2426,5 +2426,98 @@ class TestGeneratedCoreDivisions(BaseTestScratchpadUsage):
         )
 
 
+class TestCoarseTilingIsGatedOnItsApplyStep(unittest.TestCase):
+    """Who may choose a coarse tiling, and what stops a choice nothing applies.
+
+    Two conjuncts, and only one of them is a choice: which engine is running
+    (the user's, through ``co_optimizing_lx_planning`` and ``layout_solver``),
+    and whether anything applies a chosen ``TileSpec`` (not a setting at all).
+    """
+
+    @staticmethod
+    def _annealer():
+        from torch_spyre._inductor.scratchpad import allocator as allocator_module
+        from torch_spyre._inductor.scratchpad.sa_cooptimizer import (
+            SaCoOptimizingSolver,
+        )
+
+        return allocator_module.CoOptimizingAllocator(
+            layout_planning=SaCoOptimizingSolver, size=1
+        )
+
+    @staticmethod
+    def _cpsat():
+        from torch_spyre._inductor.scratchpad import allocator as allocator_module
+        from torch_spyre._inductor.scratchpad.ilp_solver_ortools import (
+            CpSatLayoutSolver,
+        )
+
+        return allocator_module.CoOptimizingAllocator(
+            layout_planning=CpSatLayoutSolver, size=1
+        )
+
+    @unittest.skipUnless(_HAS_ORTOOLS, "the other engine here is cpsat")
+    def test_no_engine_is_offered_tilings_while_nothing_applies_them(self):
+        self.assertFalse(self._annealer()._solver_chooses_tilings)
+        self.assertFalse(self._cpsat()._solver_chooses_tilings)
+
+    @unittest.skipUnless(_HAS_ORTOOLS, "the other engine here is cpsat")
+    def test_once_they_are_applied_only_the_annealer_is_offered_them(self):
+        """Only a search that generates divisions can carry a ``TileSpec`` --
+        the enumerated menu has none to offer -- so an engine that indexes the
+        menu could not use a tiling space even if handed one."""
+        from torch_spyre._inductor.scratchpad import allocator as allocator_module
+
+        with patch.object(allocator_module, "TILE_CHOICES_ARE_APPLIED", True):
+            self.assertTrue(self._annealer()._solver_chooses_tilings)
+            self.assertFalse(self._cpsat()._solver_chooses_tilings)
+
+    def test_a_tiling_on_a_resident_buffer_is_refused_not_ignored(self):
+        """The belt-and-braces guard, for the two conjuncts getting out of step.
+
+        A resident buffer's LX layout was computed from its per-core footprint
+        divided by the tile count; if the graph is never tiled it writes the
+        full extent, over whatever the packer put above it or off the end of
+        the region. Silently -- which is why the commit refuses rather than
+        dropping the tiling half. Quantified in
+        ``~/coopt-repro/stage3_unapplied_tiling_overlap.py`` (a 16,128-byte
+        overlap, or a 12,768-byte overrun) and seen at 64x on a real compile.
+        """
+        from torch_spyre._inductor.errors import Unsupported
+        from torch_spyre._inductor.scratchpad import allocator as allocator_module
+        from torch_spyre._inductor.scratchpad.plan_solver import (
+            CoreDivision,
+            CoreDivisionBuffer,
+            TileAxis,
+            TileSpec,
+        )
+
+        graph = SimpleNamespace(
+            operations=[SimpleNamespace(name="buf0", iteration_space_ownership=None)]
+        )
+        buf = CoreDivisionBuffer(
+            name="buf0",
+            size=1024,
+            uses=[0, 1],
+            first_use_is_read=False,
+            in_place_parents=[],
+            residency_reason=None,
+            core_divisions=[CoreDivision(tiling=TileSpec((TileAxis(0, 4),)))],
+            chosen_division=0,
+        )
+        alloc = self._annealer()
+        with (
+            patch.object(allocator_module, "_split_option_is_legal", return_value=True),
+            patch.object(allocator_module, "commit_iteration_space_ownership"),
+            patch.object(allocator_module, "_division_splits", return_value={}),
+        ):
+            buf.address = None
+            alloc._commit_divisions(graph, [buf])  # spilled: warned, not refused
+            buf.address = 0
+            with self.assertRaises(Unsupported) as caught:
+                alloc._commit_divisions(graph, [buf])
+        self.assertIn("buf0", str(caught.exception))
+
+
 if __name__ == "__main__":
     unittest.main()
