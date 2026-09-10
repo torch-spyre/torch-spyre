@@ -3060,6 +3060,23 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
         raw_infos.assert_not_called()
 
     def test_bmm_k_hint_rejects_broadcast_output_symbol_mismatch(self):
+        """A broadcast output leaks a non-reduction symbol into the K search.
+
+        ``out_dep``'s index is ``m * 64 + n`` -- the batch symbol ``b`` is
+        broadcast away and so absent from it -- while the input deps still range
+        over ``b``. ``reduction_loop_vars`` is "input symbols not in the output
+        index", so it reports ``[b, k]``: *longer* than ``reduction_ranges``,
+        which holds K alone. The two lists therefore do not correspond
+        positionally and no ``reduction_ranges`` position can be resolved, which
+        is what this rejects.
+
+        The reported position is ``None`` rather than a number.
+        ``reduction_loop_vars.index(k)`` used to answer ``1``, but that is an
+        index into ``[b, k]`` -- ``reduction_ranges`` has length 1, so position 1
+        does not exist in the frame the message names. See
+        ``coarse_tile.reduction_loop_var_by_ranges_pos``, which detects the
+        non-correspondence instead of indexing through it.
+        """
         op = _reduction_op(
             (1, 16, 64), reduction_ranges=(64,), reduction_type=BATCH_MATMUL_OP
         )
@@ -3073,7 +3090,9 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
         )
         op.layout = layout
 
-        with self.assertRaisesRegex(Unsupported, "maps to reduction range position 1"):
+        with self.assertRaisesRegex(
+            Unsupported, "maps to reduction range position None, expected 0"
+        ):
             _dims_to_hints(op, ((0, 4, True),), [_SPAN_OVERFLOW_HINT_ID])
 
     def test_bmm_mixed_output_and_k_input_span_becomes_output_candidate(self):
