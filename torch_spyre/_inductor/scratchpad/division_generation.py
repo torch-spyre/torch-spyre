@@ -315,8 +315,8 @@ class ResidencyEdge:
         if self._cores_used(parent_splits) != self._cores_used(consumer_splits):
             return False
         parent_view = self.parent_view(parent_splits)
-        return parent_view is not None and parent_view == self.consumer_view(
-            consumer_splits
+        return parent_view is not None and parent_view.same_partition(
+            self.consumer_view(consumer_splits)
         )
 
     def consumer_division_for(
@@ -426,7 +426,7 @@ class ResidencyEdge:
             if parent_view is not None
             for j, consumer_view in enumerate(consumer_views)
             if consumer_view is not None
-            and parent_view == consumer_view
+            and parent_view.same_partition(consumer_view)
             and self._cores_used(parent_divisions[i])
             == self._cores_used(consumer_divisions[j])
         ]

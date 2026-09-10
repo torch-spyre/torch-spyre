@@ -1149,10 +1149,44 @@ _FLAT_DOMAIN = [1, 2, 4, 8]  # divisors of the 8-stick inner host dim
 
 
 def _reproduces(prep, splits, target):
+    """Whether ``splits`` slices the buffer the way ``target`` does.
+
+    ``same_partition``, not ``==``, because that is the question the production
+    comparison asks -- two records differing only in spelling describe one
+    slicing. Verifying through ``==`` would pass whatever the production
+    predicate happened to be.
+    """
     view, _partial, representable = pass_utils_module._per_core_view_from_prep(
         prep, splits
     )
-    return representable and view == target
+    return representable and target.same_partition(view)
+
+
+def test_two_views_can_describe_one_partition_without_being_equal():
+    """Why the edge comparison is ``same_partition`` and not ``==``: a view is a
+    record, and three ways of writing one down describe the same slicing -- an
+    equivalent slot formula, the physical core count left implicit, and a
+    dimension listed with a split of 1, which owns nothing."""
+    from torch.utils._sympy.functions import FloorDiv
+
+    core_id = sympy.Symbol("core_id")
+    spelled_out = PerCoreView(
+        work_slice_dims=((0, 4), (1, 1)),
+        core_to_slot=((0, FloorDiv(core_id, 2)), (1, sympy.Integer(0))),
+        num_cores=4,
+    )
+    terse = PerCoreView(
+        work_slice_dims=((0, 4),),
+        core_to_slot=((0, sympy.floor(core_id / 2)),),
+    )
+    assert spelled_out != terse
+    assert spelled_out.same_partition(terse)
+    assert terse.same_partition(spelled_out)
+
+    # Not everything unequal is the same partition: the slot formula is what
+    # decides, so a different one is a different slicing.
+    other = dataclasses.replace(terse, core_to_slot=((0, sympy.Mod(core_id, 4)),))
+    assert not terse.same_partition(other)
 
 
 def _producer_prep():
@@ -1293,6 +1327,31 @@ def test_inverse_backtracks_past_a_candidate_the_caller_rejects():
     assert rejected == [first]
     assert second == {a: 1, b: 4, col: 1}
     assert _reproduces(prep, second, target)
+
+
+def test_inverse_accepts_a_target_that_records_the_partition_differently():
+    """The inverse compares partitions, not records. A target whose dims are
+    listed in the other order is the same slicing, and the search has to find
+    it -- an ``==`` here would call a live edge unreachable."""
+    prep, head, flat = _producer_prep()
+    view, _partial, representable = pass_utils_module._per_core_view_from_prep(
+        prep, {head: 4, flat: 2}
+    )
+    assert representable
+    assert len(view.work_slice_dims) == 2
+
+    restated = dataclasses.replace(
+        view,
+        work_slice_dims=view.work_slice_dims[::-1],
+        core_to_slot=view.core_to_slot[::-1],
+    )
+    assert restated != view
+    assert restated.same_partition(view)
+
+    domains = {head: _HEAD_DOMAIN, flat: _FLAT_DOMAIN}
+    splits = pass_utils_module.invert_per_core_view(prep, restated, domains)
+    assert splits == {head: 4, flat: 2}
+    assert _reproduces(prep, splits, restated)
 
 
 def test_inverse_declines_a_view_no_legal_split_reproduces():

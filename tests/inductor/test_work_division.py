@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import dataclasses
 import itertools
 import math
 import unittest
@@ -2661,6 +2662,38 @@ class TestResidencyEdgeInversion(unittest.TestCase):
                     self.consumer_space,
                 )
             )
+
+    def test_compatibility_compares_partitions_not_records(self):
+        """A view is a record of a slicing, and two records can describe one
+        slicing -- so the edge asks ``same_partition``, not ``==``. Here the
+        consumer's view is restated with its dims in the other order, which
+        ``==`` calls a mismatch and the buffer's geometry does not."""
+        parent_division = CoreDivision({self.x: 4, self.y: 2})
+        consumer_division = CoreDivision({self.r: 4, self.c: 2})
+        with self._geometry():
+            edge = self._edge()
+            view = edge.consumer_view(consumer_division.splits)
+            self.assertEqual(len(view.work_slice_dims), 2)
+            restated = dataclasses.replace(
+                view,
+                work_slice_dims=view.work_slice_dims[::-1],
+                core_to_slot=view.core_to_slot[::-1],
+            )
+            self.assertNotEqual(restated, view)
+            with patch.object(
+                division_generation.ResidencyEdge,
+                "consumer_view",
+                return_value=restated,
+            ):
+                self.assertTrue(
+                    edge.compatible(parent_division.splits, consumer_division.splits)
+                )
+                self.assertEqual(
+                    edge.match_pairs(
+                        [parent_division.splits], [consumer_division.splits]
+                    ),
+                    [(0, 0)],
+                )
 
     def test_the_write_side_policy_rides_along_inside_the_inversion(self):
         """The producer's filters are geometry-blind, so they go in ``accept``

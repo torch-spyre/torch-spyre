@@ -3760,7 +3760,7 @@ def invert_per_core_view(
             if accept is not None and not accept(candidate):
                 continue
             view, _partial, representable = _per_core_view_from_prep(prep, candidate)
-            if representable and view == target:
+            if representable and view.same_partition(target):
                 return dict(candidate)
     return None
 
