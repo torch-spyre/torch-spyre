@@ -762,8 +762,8 @@ class TestHbmPoolPlanningE2E(InductorTestCase):
         real_get_output_dir = async_compile_mod.get_output_dir
         output_dirs_by_kernel = {}
 
-        def _recording_get_output_dir(kernel_name):
-            output_dir = real_get_output_dir(kernel_name)
+        def _recording_get_output_dir(kernel_name, sdsc_bundle_dir_prefix=None):
+            output_dir = real_get_output_dir(kernel_name, sdsc_bundle_dir_prefix)
             output_dirs_by_kernel[kernel_name] = output_dir
             return output_dir
 
