@@ -108,7 +108,7 @@ from ..loop_info import (
     ReductionPlan,
     copy_op_metadata,
 )
-from ..propagate_hints import get_op_hints
+from ..propagate_hints import exclude_op_hint_keys, get_op_hints
 from .propagate_named_dims import (
     _DimPropInfo,
     _get_dim_prop_info,
@@ -4223,6 +4223,11 @@ def _insert_one_read_copy(
     # let work-division planning choose from the copy's actual dimensions.
     if hasattr(copy_buf, "work_div_loop_info"):
         del copy_buf.work_div_loop_info  # type: ignore[attr-defined]
+    # Removing positional names alone leaves the consumer's raw hint visible
+    # through shared origins. Preserve provenance and all other hint kinds,
+    # but make the copy's independent work-division choice explicit to every
+    # hint consumer, including placement-aware candidate selection.
+    exclude_op_hint_keys(copy_buf, "work_div")
 
     if loop_invariant:
         # No loop metadata means codegen emits this copy once before the first

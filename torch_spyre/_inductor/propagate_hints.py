@@ -93,9 +93,25 @@ def spyre_hint(**kwargs: Any):
     return torch.fx.traceback.annotate({f"_hint_{_id}": kwargs})
 
 
+def exclude_op_hint_keys(op: Operation, *keys: str) -> None:
+    """Detach hint kinds that a transform did not transfer to its new work.
+
+    Origins describe source provenance, not necessarily this operation's
+    directives. Keep those shared FX nodes intact; record applicability on the
+    new operation instead. One-to-one rewrites preserve this immutable set via
+    copy_op_metadata. This must not be used to override a user's own operation.
+    """
+    op._excluded_spyre_hint_keys = getattr(  # type: ignore[attr-defined]
+        op, "_excluded_spyre_hint_keys", frozenset()
+    ).union(keys)
+
+
 def get_op_hints(op: Operation) -> dict[int, dict[str, Any]]:
     """
-    Return all hints for an Operation keyed by hint id.
+    Return applicable hints for an Operation keyed by hint id.
+
+    Generated operations can retain origins without inheriting every directive
+    on those origins. Filtering is per hint kind across all nested scopes.
     """
     custom = None
     for fx_node in getattr(op, "origins", ()):
@@ -106,11 +122,14 @@ def get_op_hints(op: Operation) -> dict[int, dict[str, Any]]:
     if not custom:
         return {}
 
+    excluded: frozenset[str] = getattr(op, "_excluded_spyre_hint_keys", frozenset())
     hints: dict[int, dict[str, Any]] = {}
     for k, v in custom.items():
         m = _HINT_RE.match(k)
         if m:
-            hints[int(m.group(1))] = v
+            hints[int(m.group(1))] = {
+                key: value for key, value in v.items() if key not in excluded
+            }
     return hints
 
 

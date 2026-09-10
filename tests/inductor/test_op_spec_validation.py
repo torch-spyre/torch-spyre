@@ -25,7 +25,15 @@ import sympy
 from sympy import Integer, Symbol
 
 from torch_spyre._C import DataFormats
-from torch_spyre._inductor.op_spec import LoopSpec, OpSpec, TensorArg, UnimplementedOp
+from torch_spyre._inductor import config
+from torch_spyre._inductor.op_spec import (
+    LX_RELAYOUT_INFO_KEY,
+    LoopSpec,
+    OpSpec,
+    TensorArg,
+    TensorWorkDivision,
+    UnimplementedOp,
+)
 from torch_spyre._inductor.op_spec_validation import (
     BINARY_OPS,
     STICK_STAGE,
@@ -42,6 +50,20 @@ from torch_spyre._inductor.constants import KEEP_BY_INDEX_OP
 
 _C_ROW = Symbol("c_row")
 _C_COL = Symbol("c_col")
+_CORE_ID = Symbol("core_id")
+
+
+def _mark_as_lx_relayout(op: OpSpec) -> None:
+    source, destination = op.args
+    source.allocation = {"lx": 0}
+    destination.allocation = {"lx": 128}
+    source.work_division = TensorWorkDivision(
+        {_C_ROW: 2}, {_C_ROW: sympy.floor(_CORE_ID / 2)}, num_cores=4
+    )
+    destination.work_division = TensorWorkDivision(
+        {_C_ROW: 4}, {_C_ROW: _CORE_ID}, num_cores=4
+    )
+    op.op_info[LX_RELAYOUT_INFO_KEY] = "broadcast"
 
 
 def _make_tensor_arg(is_input: bool = True, arg_index: int = 0) -> TensorArg:
@@ -101,6 +123,15 @@ def _make_matmul_op_spec() -> OpSpec:
 
 
 class TestValidateOpSpecsHappyPath(unittest.TestCase):
+    @config.patch({"sencores": 4})
+    def test_completed_reduction_route(self):
+        op = _make_valid_op_spec("identity")
+        op.args = [op.args[0], op.args[-1]]
+        _mark_as_lx_relayout(op)
+        op.producer_consumers = ((1, (0, 1)), (3, (2, 3)))
+
+        validate_op_specs([op], stage="test")
+
     def test_empty_list(self):
         validate_op_specs([], stage="test")
 
@@ -157,6 +188,18 @@ class TestValidateOpSpecsHappyPath(unittest.TestCase):
 
 
 class TestValidateOpSpecsErrors(unittest.TestCase):
+    @config.patch({"sencores": 4})
+    def test_completed_reduction_route_must_cover_each_destination_once(self):
+        op = _make_valid_op_spec("identity")
+        op.args = [op.args[0], op.args[-1]]
+        _mark_as_lx_relayout(op)
+        op.producer_consumers = ((1, (0, 1)), (3, (1, 2)))
+
+        with self.assertRaises(OpSpecValidationError) as ctx:
+            validate_op_specs([op], stage="test")
+
+        self.assertIn("exactly one source", str(ctx.exception))
+
     def test_unexpected_type_in_list(self):
         with self.assertRaises(OpSpecValidationError) as ctx:
             validate_op_specs(["not_an_op_spec"], stage="test_stage")

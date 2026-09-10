@@ -36,12 +36,20 @@ import inspect
 import textwrap
 
 import regex
+from typing import NoReturn
 import sympy
 
-from . import constants
+from . import config, constants
 from .dtype_ops import DtypeOpTable
 from .logging_utils import get_inductor_logger
-from .op_spec import IndirectAccess, LoopSpec, OpSpec, TensorArg, UnimplementedOp
+from .op_spec import (
+    IndirectAccess,
+    LoopSpec,
+    OpSpec,
+    TensorArg,
+    UnimplementedOp,
+    is_lx_relayout_identity,
+)
 
 logger = get_inductor_logger("op_spec_validation")
 
@@ -236,7 +244,74 @@ def _validate_op_spec(op_spec: OpSpec, stage: str, loop_depth: int) -> None:
     _check_symbol_consistency(op_spec, stage)
     _check_tiled_symbols(op_spec, stage, loop_depth)
     _check_stick_constraints(op_spec, stage)
+    _check_completed_reduction_route(op_spec, stage)
     _check_op_specific_constraints(op_spec, stage)
+
+
+def _check_completed_reduction_route(op_spec: OpSpec, stage: str) -> None:
+    """Validate the completed-reduction route certified during planning."""
+
+    routes = op_spec.producer_consumers
+    if not routes:
+        return
+
+    def reject(message: str, detail: str = "") -> NoReturn:
+        raise OpSpecValidationError(op_spec, message, detail, stage)
+
+    if not is_lx_relayout_identity(op_spec.op, op_spec.args, op_spec.op_info):
+        reject(
+            "completed-reduction routes require a certified LX identity copy",
+            f"Got op={op_spec.op!r}, args={len(op_spec.args)}",
+        )
+    source_division = op_spec.args[0].work_division
+    destination_division = op_spec.args[-1].work_division
+    if source_division is None or destination_division is None:
+        reject("completed-reduction routes require both tensor divisions")
+    source_count = source_division.physical_core_count
+    destination_count = destination_division.physical_core_count
+    sources: set[int] = set()
+    destinations: set[int] = set()
+    for source, consumers in routes:
+        if source in sources:
+            reject(
+                "completed-reduction source cores must be unique",
+                f"Duplicate source core {source}",
+            )
+        sources.add(source)
+        if not consumers:
+            reject(
+                "each completed-reduction source must feed a consumer",
+                f"Source core {source} has no consumers",
+            )
+        for core, domain in [
+            (source, source_count),
+            *((consumer, destination_count) for consumer in consumers),
+        ]:
+            if not isinstance(core, int) or not 0 <= core < domain <= config.sencores:
+                reject(
+                    "completed-reduction routes must name configured cores",
+                    f"Got core {core!r} for tensor domain {domain} / "
+                    f"{config.sencores} configured cores",
+                )
+        for consumer in consumers:
+            if consumer in destinations:
+                reject(
+                    "each destination core must have exactly one source",
+                    f"Destination core {consumer} appears more than once",
+                )
+            destinations.add(consumer)
+    expected = set(range(destination_count))
+    if destinations != expected:
+        reject(
+            "completed-reduction routes must cover every destination core",
+            f"Got {sorted(destinations)}, expected {sorted(expected)}",
+        )
+    fanouts = {len(consumers) for _, consumers in routes}
+    if len(fanouts) != 1:
+        reject(
+            "completed-reduction routes require uniform fanout",
+            f"Got fanouts {sorted(fanouts)}",
+        )
 
 
 def _check_mandatory_fields(op_spec: OpSpec, stage: str) -> None:

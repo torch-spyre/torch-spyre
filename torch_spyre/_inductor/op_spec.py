@@ -364,6 +364,9 @@ class OpSpec:
     # node exposes no data.ranges.
     node_output_ranges: tuple[Expr, ...] | None = None
     debug_handle: DebugHandle | None = None
+    # Final source-core -> destination-core routes for a completed-reduction
+    # LX broadcast. Empty for ordinary operations and all-core relayouts.
+    producer_consumers: tuple[tuple[int, tuple[int, ...]], ...] = ()
 
 
 # --- Module-level constant tensor cache --------------------------------------

@@ -375,6 +375,7 @@ class CoarseTileInfo:
 _SPYRE_METADATA_ATTRS = (
     "dim_hints",
     "work_div_loop_info",
+    "_excluded_spyre_hint_keys",
     "iteration_space_ownership",
     "_work_division_span_min_splits",
     "loop_info",

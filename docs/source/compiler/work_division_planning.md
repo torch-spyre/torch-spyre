@@ -584,6 +584,60 @@ A graph-aware co-optimisation pass exists and is opt-in via
 grow the LX planner's legal-reuse set. See the
 [scratchpad planning](scratchpad_planning.md) doc for details.
 
+## Placement-Aware Work Selection
+
+With LX relayout enabled and the greedy placement solver, the allocator also
+compares the default divisions with one whole-graph alternative: move part of
+each operation's existing output split to its outermost physical output axis.
+This can reduce the address range needed by each core without changing the core
+count. Compound coordinates, user hints and reduction splits are not changed.
+Both choices go through the existing ownership checks and paired-buffer placement;
+the bundle cost includes the resulting HBM traffic and added LX transfers. Only
+the winning choice is committed, before scheduling. This is a bounded heuristic,
+not an exhaustive search or a guarantee of lower measured latency.
+This compact alternative considers only operations with static iteration extents,
+and is offered only when it changes an ordinary matmul. FP8 matmul
+divisions are unchanged: their compute is not yet covered by this cost extractor.
+Input loads and graph-output
+drains are included even when the buffer
+is placed in LX. A tie, unavailable prediction or failed candidate placement
+keeps the existing choice; a baseline that cannot be priced is never replaced.
+Ownership and allocation assertions remain mandatory, not cost-model fallbacks.
+Without eligible input-stage alternatives it runs two trial placements followed
+by normal placement, keeping trial state out of the committed graph.
+`SPYRE_LX_PLANNER_RELAYOUT=1` enables this
+comparison with the greedy solver. Other solvers retain their existing behavior.
+An explicit work-division hint protects that operation, not all its neighbors;
+the usual ownership checks still decide whether their data can stay in LX.
+Model initialization may take longer; measure warmed inference separately from
+compilation. Turning the switch off restores the original selection path.
+
+The default-on `consumer_compatible_input_staging` option extends the same
+chooser; it does not change work distribution, order-only anchoring, scheduling
+or codegen. A loop-external single-input pointwise stage over an immutable graph
+input can propose the exact partition required by all its current matmul readers.
+The initial cost/coverage fence accepts FP16/BF16 stages in SEN169_FP16 device
+storage and ordinary matmuls with FP16/BF16 outputs, not FP8 matmul compute.
+This is not a claim that other formats cannot represent the movement: the
+current cost extractor uses host byte widths, which must match device storage.
+Unknown uses, mutations, aliases, conflicting readers, explicit hints and
+unrepresentable or illegal partitions decline. An unavailable legal domain
+skips that optional candidate, not compilation. A reader's partial reduction
+output does not make its input partial; producer partial writes still decline.
+
+Agreement proves compatibility, not profitability. Each alternative pays for
+input reads, producer computation, transfers, capacity pressure and spills in
+the existing placement/cost comparison. Nothing forces LX residency. The
+stage-only alternative is considered even when no matmul division changes.
+For the compact alternative, stages are rebuilt against that trial's readers,
+never copied from the baseline. At most four trials (baseline, compact, stage,
+compact plus stage) precede normal placement. The sole winning commit retains
+the existing signal that discards stale plans; ties keep the ordinary choice.
+This bounded search is not a measured performance guarantee. Compilation can
+take longer. `SPYRE_CONSUMER_COMPATIBLE_INPUT_STAGING=0` removes only the stage
+candidates; the relayout and paired-solver prerequisites remain mandatory.
+The shared final aligned mapping and backend interface are unchanged.
+
 ## User Work-Division Hints
 
 Users can override the automatic work-distribution choice with

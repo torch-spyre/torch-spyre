@@ -1018,6 +1018,9 @@ class SpyreKernel(Kernel[CSEVariable]):
             tiled_symbol_trip_counts=tiled_symbol_trip_counts,
             symbolic_dim_bounds=symbolic_dim_bounds,
             node_output_ranges=node_output_ranges,
+            producer_consumers=(
+                relayout_plans[0].producer_consumers if relayout_plans else ()
+            ),
             debug_handle=debug_handle,
         )
         # Finish the operation here, while its inputs and its node are live.
@@ -1582,6 +1585,8 @@ def _codegen_op_spec_list(specs, buf: IndentedBuffer, sympy_str) -> None:
                         )
                         + "),"
                     )
+                if op_spec.producer_consumers:
+                    buf.writeline(f"producer_consumers={op_spec.producer_consumers!r},")
                 if op_spec.debug_handle is not None:
                     # Source-to-kernel provenance must survive the OpSpec ->
                     # generated-source -> exec round-trip. DebugHandle/SourceLoc

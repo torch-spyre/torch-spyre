@@ -83,7 +83,8 @@ ktir_emitter: bool = os.environ.get("TORCH_SPYRE_KTIR", "0") == "1"
 # A .mlir declaring the target device, passed to the backend compiler.
 ktir_device_mlir: str = os.environ.get("KTIR_DEVICE_MLIR", "")
 
-# Enable certified LX ownership changes.
+# Enable certified LX ownership changes: movement, exact fused-axis views,
+# consumer-compatible producer order, and same-core restickify residency.
 # Set SPYRE_LX_PLANNER_RELAYOUT=0 to disable these optional optimizations, not
 # ownership validation. This does not change the allocator or LX memory budget.
 lx_planner_relayout: bool = os.getenv("SPYRE_LX_PLANNER_RELAYOUT", "1").lower() in (
@@ -93,6 +94,13 @@ lx_planner_relayout: bool = os.getenv("SPYRE_LX_PLANNER_RELAYOUT", "1").lower() 
 )
 
 allow_all_ops_in_lx_planning: bool = False
+
+# Offer reader-compatible input stages to the existing placement-aware chooser.
+# These are candidates, never forced splits or residency. The relayout and
+# paired-solver prerequisites still apply; this switch only removes candidates.
+consumer_compatible_input_staging: bool = os.getenv(
+    "SPYRE_CONSUMER_COMPATIBLE_INPUT_STAGING", "1"
+).lower() in ("1", "true", "yes")
 
 dxp_lx_frac_avail: float = float(os.environ.get("DXP_LX_FRAC_AVAIL", "0.2"))
 
