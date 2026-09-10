@@ -115,6 +115,34 @@ class TestLaunchJobPlan(TestCase):
                 with pytest.raises(RuntimeError, match="Expect one DCI"):
                     torch_spyre._C.launch_jobplan(job_plan, [])
 
+    def test_fake_symbol_noop_does_not_raise(self):
+        """A HostCompute step with ishape==[0] (fake-symbol sentinel) must launch
+        without raising.
+
+        Before this fix the fake-symbol path called
+        deeptools::processComputeOnHostCommand with a null input pointer, which
+        is unsafe. The fix replaces it with a true no-op callback. This test
+        proves the no-op path completes cleanly.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            test_pk = tpk()
+            spyrecode_dir = test_pk.create_mock_spyrecode(
+                tmpdir,
+                exec_command="ComputeOnHost",
+                exec_properties={
+                    "ohandle": "output_buffer",
+                    "size": "1024",
+                    "ishape": ["0"],  # fake-symbol sentinel → no-op callback
+                    "ihandle": "",
+                    "hcm": {"vdci": {}, "senConstants": []},
+                },
+            )
+            job_plan = torch_spyre._C.prepare_kernel(spyrecode_dir)
+            stream = torch.Stream("spyre")
+            # Must NOT raise — the no-op callback does nothing and returns cleanly.
+            with stream:
+                torch_spyre._C.launch_jobplan(job_plan, [])
+
 
 def _build_d2h_jobplan(tmpdir: str, dev_ptr: int, size_bytes: int):
     """Build a JobPlan with a single D2H DataTransfer step from dev_ptr.
