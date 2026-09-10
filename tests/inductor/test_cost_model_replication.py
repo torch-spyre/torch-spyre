@@ -22,6 +22,7 @@ the rule at the three places it lives: the arg's byte function, the extractor's
 stamp, and the fused-bundle de-duplication that has to tolerate the symbolic result.
 """
 
+import pytest
 import sympy
 import torch
 
@@ -29,7 +30,14 @@ import torch_spyre  # noqa: F401
 import torch_spyre._inductor.wsr.propagate_named_dims as _pnd
 from torch_spyre._inductor import config, cost_model, spyre_hint
 from torch_spyre._inductor import cost_model_pass as cmp
-from torch_spyre._inductor.cost_model import ArgTraffic, OpFeatures, _fused_hbm_bytes
+from torch_spyre._inductor.cost_model import (
+    ArgTraffic,
+    CostParams,
+    OpFeatures,
+    _fused_hbm_bytes,
+    _replicated_operand_reads,
+    predict_ops,
+)
 from torch_spyre._inductor.dump_cost_model import _replication
 
 ELEMS = 4096
@@ -130,6 +138,97 @@ def test_fused_dedup_tolerates_two_symbolic_readers_of_one_input():
         [_op(_arg(2, resident=False)), _op(_arg(3, resident=False))]
     )
     assert r == (2 + 3) * BYTES  # interior buffers are not de-duplicated
+
+
+# ------------------------------------------------------- per-core read rate
+
+
+def _matmul(*inputs, out_elems=64, cores=32):
+    """A bmm with a tiny output so the read/write turnaround term is identical
+    across the variants compared below (min(R, W) stays W)."""
+    return OpFeatures(
+        name="bmm",
+        is_reduction=True,
+        out_elems=out_elems,
+        cores=cores,
+        dtype_bytes=2,
+        args=[ArgTraffic("buf9", "output", False, out_elems), *inputs],
+        is_matmul=True,
+    )
+
+
+def test_replicated_operand_reads_are_priced_at_the_per_core_ceiling():
+    p = CostParams()
+    rep = _matmul(_arg(1, resident=False), _arg(8, resident=False))
+    flat = _matmul(_arg(1, resident=False), _arg(1, resident=False))
+    # The replicated operand leaves the shared pool (one load at the peak) and is
+    # charged as f loads at the per-core rate, each core reading its own copy.
+    expected = (
+        8 * BYTES / 32 / p.mm_replicated_read_gbps_per_core - BYTES / p.bw_peak_gbps
+    )
+    assert predict_ops([rep], p) - predict_ops([flat], p) == pytest.approx(
+        expected, rel=1e-6
+    )
+
+
+def test_the_ladder_law_reproduces_a_measured_rung():
+    # Rows-per-core ladder 2026-09-10: f=8, 256 KiB operand, 32 cores, 64 KiB per
+    # core -> 29.7 / 29.9 / 29.8 / 29.4 / 28.8 us at 1 / 2 / 4 / 8 / 16 rows per core.
+    p = CostParams()
+    tensor_bytes, f = 256 * 1024, 8
+    op = _matmul(
+        _arg(1, resident=False),
+        ArgTraffic("buf0", "input", False, tensor_bytes // 2, replication=f),
+    )
+    rep_bytes, ns = _replicated_operand_reads([op], p)
+    assert rep_bytes == f * tensor_bytes
+    assert ns / 1000 == pytest.approx(29.7, rel=0.1)
+
+
+def test_a_resident_operand_has_no_per_core_reads():
+    assert _arg(8, resident=True).replicated_hbm_elems() == 0
+    # A resident boundary operand keeps its one clone-in load, which is an aggregate
+    # transfer and stays with the ordinary bytes, not the per-core term.
+    a = _arg(8, resident=True, boundary=True)
+    assert (a.replicated_hbm_elems(), a.hbm_elems()) == (0, ELEMS)
+    p = CostParams()
+    assert _replicated_operand_reads([_matmul(a)], p) == (0, 0)
+
+
+def test_per_core_pricing_is_symbolic_and_matches_the_numeric_path():
+    """The co-optimizer scores this expression with the solver's split and
+    residency symbols; at the chosen point it must equal the committed-path
+    number, and ``replication / cores`` must cancel to the inverse of the split
+    the operand indexes, the form the CP-SAT printer lowers (``inv_`` symbols)."""
+    p = CostParams()
+    s_m, s_n, is_lx = sympy.symbols("s_m s_n is_lx")
+    sym = _matmul(
+        _arg(1, resident=False),
+        ArgTraffic("buf0", "input", is_lx, ELEMS, replication=s_n),
+        cores=s_m * s_n,
+    )
+    num = _matmul(
+        _arg(1, resident=False),
+        ArgTraffic("buf0", "input", False, ELEMS, replication=8),
+        cores=32,
+    )
+    _bytes, ns = _replicated_operand_reads([sym], p)
+    assert (
+        sympy.simplify(
+            ns - BYTES * (1 - is_lx) / (s_m * p.mm_replicated_read_gbps_per_core)
+        )
+        == 0
+    )
+    expr = predict_ops([sym], p)
+    at_point = sympy.lambdify([s_m, s_n, is_lx], expr, modules="math")
+    assert at_point(4, 8, 0) == pytest.approx(predict_ops([num], p), rel=1e-9)
+    # resident: the operand costs nothing, whatever the split
+    resident = _matmul(
+        _arg(1, resident=False),
+        ArgTraffic("buf0", "input", True, ELEMS, replication=8),
+        cores=32,
+    )
+    assert at_point(4, 8, 1) == pytest.approx(predict_ops([resident], p), rel=1e-9)
 
 
 # -------------------------------------------------------- extractor, on device

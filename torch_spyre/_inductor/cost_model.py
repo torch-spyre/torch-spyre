@@ -70,6 +70,9 @@ Model (per fused bundle / single-op kernel):
   LX-relayout sweep (2026-09-09, 43 gather/broadcast rows, replication 2-16) measured
   the consumer-from-HBM time as ~2.5us + f*B at 60-67 GB/s -- f times the one-load
   bytes -- and the once-per-input count under-predicted the demote penalty 10-40x.
+  Those loads also run at a PER-CORE ceiling (~2.3 GB/s per core; flat in rows per
+  core and in core count, rows-per-core ladder 2026-09-10), so they are priced as
+  per-core bytes over ``mm_replicated_read_gbps_per_core`` rather than at BW_PEAK.
   Residency removes all f loads; a resident graph input keeps only its clone-in load.
 
 Byte counts use each arg's DEVICE layout (stick-padded ``device_size``), not the torch
@@ -251,6 +254,17 @@ class ArgTraffic:
             return (
                 self.elems * self.loop_factor * (is_lx + self.replication * (1 - is_lx))
             )
+        return self.elems * self.loop_factor * self.replication * (1 - is_lx)
+
+    def replicated_hbm_elems(self):
+        """The share of :meth:`hbm_elems` that is a per-core replica load: all of a
+        non-resident replicated operand's loads, none once it is resident. A resident
+        boundary arg's remaining clone-in load is one aggregate transfer, so it stays
+        with the ordinary bytes. Zero when ``replication`` is 1 (nothing to price
+        differently), so callers can subtract it from ``hbm_elems`` unconditionally."""
+        if isinstance(self.replication, int) and self.replication == 1:
+            return 0
+        is_lx = int(self.is_lx) if isinstance(self.is_lx, bool) else self.is_lx
         return self.elems * self.loop_factor * self.replication * (1 - is_lx)
 
     @property
@@ -643,6 +657,18 @@ class CostParams:
     # these data.
     mm_bw_read_gbps: float = 150.0
     mm_bw_write_gbps: float = 150.0
+    # REPLICATED matmul operand read (``ArgTraffic.replication`` > 1): every core of the
+    # replicating split loads its own copy of the operand's slice, and it does so at a
+    # PER-CORE ceiling, not at the shared HBM peak. Rows-per-core ladder (2026-09-10,
+    # 13 rungs) plus the grouped-relayout sweep (2026-09-09, 43 rows): the consumer's
+    # read time is FLAT in query rows per core (1..16) and in the core count (4..32),
+    # and scales only with the bytes each core reads -- 56 points fit
+    # ``t = per_core_bytes / 2.27 GB/s`` with a ~0 intercept, 46 of them within 10%.
+    # So the term is per-core bytes over this rate; the shared peak never binds below
+    # 64 cores (32 x 2.3 = 74 GB/s < 150). Applied to replicated operand bytes ONLY:
+    # whether a matmul's non-replicated operand reads share the ceiling was not
+    # measured (every row here read a replicated operand), so those keep mm_bw_read.
+    mm_replicated_read_gbps_per_core: float = 2.3
     # DEFAULT-LAYOUT BMM slow compute rate (cat 4). A batched matmul whose BOTH rank-3
     # operands carry the COMPILER-DEFAULT [0,1,2] device tile order -- the batch dim B
     # sits just inside the stick (device pos -2) -- runs the systolic array at a much
@@ -1171,6 +1197,43 @@ def _fused_hbm_bytes(ops: list) -> tuple:
     return r, w
 
 
+def _replicated_operand_reads(ops: list, p: "CostParams") -> tuple:
+    """(bytes, ns) of the REPLICATED matmul operand loads in a bundle.
+
+    These bytes are already inside ``_fused_hbm_bytes``'s read total (that is the
+    replication count of #4454); this prices them at the per-core ceiling instead of
+    the shared peak, so the caller subtracts ``bytes`` from R and adds ``ns``. Each
+    core reads ``bytes / cores`` of the operand, at
+    ``mm_replicated_read_gbps_per_core``. Boundary (graph-input) args are
+    de-duplicated by name with the same ``max`` rule as ``_fused_hbm_bytes`` so the
+    subtraction can never exceed what was counted. With symbolic splits this is
+    ``B * (1 - is_lx) / prod(indexed splits)``: sympy cancels ``replication / cores``
+    to the inverse of the splits the operand indexes, which the CP-SAT printer lowers
+    as ``inv_`` symbols and ``lambdify`` evaluates directly."""
+    total_bytes = 0
+    ns = 0
+    ext: dict = {}
+    for o in ops:
+        for a in o.args:
+            if a.role != "input":
+                continue
+            b = a.replicated_hbm_elems() * o.dtype_bytes
+            if isinstance(b, int) and b == 0:
+                continue
+            if a.is_graph_boundary:
+                if a.name in ext:
+                    ext[a.name] = (_max_traffic(ext[a.name][0], b), o.cores)
+                else:
+                    ext[a.name] = (b, o.cores)
+            else:
+                total_bytes += b
+                ns += b / o.cores / p.mm_replicated_read_gbps_per_core
+    for b, cores in ext.values():
+        total_bytes += b
+        ns += b / cores / p.mm_replicated_read_gbps_per_core
+    return total_bytes, ns
+
+
 def _loop_reread_bytes(ops: list) -> float:
     """HBM bytes re-read because an operand is LOOP-INVARIANT under coarse tiling.
 
@@ -1582,6 +1645,10 @@ def predict_ops(ops: list, params: CostParams | None = None) -> float:
     """
     p = params or CostParams()
     r, w = _fused_hbm_bytes(ops)
+    # Replicated matmul operand loads leave the shared-bandwidth pool and are priced
+    # at the per-core ceiling (CostParams.mm_replicated_read_gbps_per_core).
+    rep_bytes, rep_ns = _replicated_operand_reads(ops, p)
+    r = r - rep_bytes
     # HBM. Pointwise/reduction/transport keep the single-BW turnaround model.
     _pat_bw = {
         "restickify": p.bw_restickify_gbps,
@@ -1615,6 +1682,11 @@ def predict_ops(ops: list, params: CostParams | None = None) -> float:
         mem = 0.0
         for o in ops:
             ro, wo = o.read_bytes(), o.write_bytes()
+            ro = (
+                ro
+                - sum(a.replicated_hbm_elems() for a in o.args if a.role == "input")
+                * o.dtype_bytes
+            )
             bw = _eff_bw(o)
             if bw:
                 mem += (ro + wo) / bw
@@ -1667,22 +1739,23 @@ def predict_ops(ops: list, params: CostParams | None = None) -> float:
         mem = (r + w) / p.bw_peak_gbps + p.rw_turnaround_ns_per_byte * min(r, w)
     else:
         mem = (r + w) / p.bw_peak_gbps + p.rw_turnaround_ns_per_byte * min(r, w)
-        # NOTE: a multi-op dependent chain (e.g. add3/add4 = chained binary adds) runs
-        # slower than its byte count because the intermediate is written then read back
-        # through HBM -- a READ-AFTER-WRITE dependency ACROSS op boundaries. That
-        # is a program-level / coarse-tiling effect, NOT a single-op cost, so it is
-        # deliberately NOT modeled here. `add_n` is not a native op; the single-op model
-        # stays pure.
-        #
-        # SIZE OF THE GAP, measured on one build (2026-08-07, 78 pointwise rows): the
-        # fused chains under-predict by -9.3 % on average, rising with chain depth --
-        # add -5 %, add3 -10 %, add4 -15 %, add6 -16 %. `add_indep2` is the control that
-        # identifies it: two INDEPENDENT adds, more bytes than add3 and the same op
-        # count, predicted to -0.9 %. Two alternative readings are ruled out by the same
-        # data -- op count (add_indep2 has two ops) and the read/write ratio (add, add5
-        # and add6 all run at R:W = 2:1 and err -2 %, -15 %, -15 %). What remains is the
-        # dependency itself. A byte-keyed read-after-write term, unified with the coarse
-        # LX-spill derate below, is the natural next step.
+    mem = mem + rep_ns
+    # NOTE: a multi-op dependent chain (e.g. add3/add4 = chained binary adds) runs
+    # slower than its byte count because the intermediate is written then read back
+    # through HBM -- a READ-AFTER-WRITE dependency ACROSS op boundaries. That
+    # is a program-level / coarse-tiling effect, NOT a single-op cost, so it is
+    # deliberately NOT modeled here. `add_n` is not a native op; the single-op model
+    # stays pure.
+    #
+    # SIZE OF THE GAP, measured on one build (2026-08-07, 78 pointwise rows): the
+    # fused chains under-predict by -9.3 % on average, rising with chain depth --
+    # add -5 %, add3 -10 %, add4 -15 %, add6 -16 %. `add_indep2` is the control that
+    # identifies it: two INDEPENDENT adds, more bytes than add3 and the same op
+    # count, predicted to -0.9 %. Two alternative readings are ruled out by the same
+    # data -- op count (add_indep2 has two ops) and the read/write ratio (add, add5
+    # and add6 all run at R:W = 2:1 and err -2 %, -15 %, -15 %). What remains is the
+    # dependency itself. A byte-keyed read-after-write term, unified with the coarse
+    # LX-spill derate below, is the natural next step.
     # OUTPUT-dim (pointwise) coarse-tiling underfill: a short per-core tile underfills
     # the streaming pipeline, derating the bandwidth term. The smallest tile in the
     # bundle governs (worst underfill). 1.0 (no derate) when nothing is output-tiled.
@@ -1763,6 +1836,8 @@ def _explain_matmul_bundled(lines: list, ops: list, p: CostParams) -> str:
     underfill/compute/split-shape breakdown and returns the joined string.
     """
     R, W = _fused_hbm_bytes(ops)  # external input counted once (fused kernel)
+    rep_bytes, rep_ns = _replicated_operand_reads(ops, p)
+    R = R - rep_bytes
     base = R / p.mm_bw_read_gbps + W / p.mm_bw_write_gbps
     turn = p.rw_turnaround_ns_per_byte * min(R, W)
     # Underfill derate (output-dim tiling): smallest per-core tile governs.
@@ -1802,11 +1877,21 @@ def _explain_matmul_bundled(lines: list, ops: list, p: CostParams) -> str:
         parts = f"[{parts}] / eff_underfill"
     if mm_us > 0:
         parts = f"compute + {parts}"
+    if rep_bytes:
+        parts = (
+            f"{parts} + replicated_bytes/cores/{p.mm_replicated_read_gbps_per_core:g}"
+        )
     lines.append(f"  -- prediction (turnaround, bundled matmul model): T = {parts} --")
     lines.append(f"     R={R}B (read)   W={W}B (write)")
     lines.extend(mm_lines)
     blab = f"R/{p.mm_bw_read_gbps:.0f} + W/{p.mm_bw_write_gbps:.0f}"
     lines.append(f"     base = {blab} = {base / 1000:.2f} us")
+    if rep_bytes:
+        lines.append(
+            f"     replicated operand reads = {rep_bytes} B / cores / "
+            f"{p.mm_replicated_read_gbps_per_core:g} GB/s per core = "
+            f"{rep_ns / 1000:.2f} us"
+        )
     lines.append(
         f"     turn = a*min(R,W) = {p.rw_turnaround_ns_per_byte}*{min(R, W)} "
         f"= {turn / 1000:.2f} us"
