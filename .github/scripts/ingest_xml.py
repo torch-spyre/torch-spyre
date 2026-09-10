@@ -445,17 +445,34 @@ _V2_BENCH_ID_KEYS = (
 )
 
 
-def v2_benchmark_id(name: str, tags, disc=None) -> str:
-    """uuid5 over name + sorted tags + the identity discriminators in
+# Segregates this producer's benchmarks from every other one: in the identity hash and
+# leading both perf sort keys, exactly as component is for test_cases/test_case_runs.
+# Defined here rather than beside V2_COMPONENT so it precedes its first use -- a later
+# definition raises only at call time, which no import-level check would catch.
+V2_BENCH_COMPONENT = "torch-spyre"
+
+
+def v2_benchmark_id(component: str, name: str, tags, disc=None) -> str:
+    """uuid5 over component + name + sorted tags + the identity discriminators in
     _V2_BENCH_ID_KEYS. Same refuse-on-empty rule as v2_test_case_id: an empty name
     still hashes to a real uuid, so every unidentifiable benchmark would collide on
-    ONE id rather than merely being orphaned."""
+    ONE id rather than merely being orphaned.
+
+    component leads the string, matching the spyre-inference vLLM writer. The two
+    producers carry DIFFERENT discriminator key sets (this one has config_name /
+    input_shapes / kernel_name / is_total; vLLM has tensor_parallel / input_len /
+    output_len), which is fine precisely because component leads: no id from one
+    producer can ever equal one from the other, so each set only has to be internally
+    consistent. If a single component were ever written by both, they would have to
+    agree on the keys as well."""
     if not _v2_norm(name):
         return ""
     tag_part = ",".join(sorted({_v2_norm(t) for t in (tags or []) if _v2_norm(t)}))
     disc = disc or {}
     disc_part = ",".join(f"{k}={_v2_norm(disc.get(k))}" for k in _V2_BENCH_ID_KEYS)
-    return str(uuid.uuid5(V2_NAMESPACE, f"{_v2_norm(name)}|{tag_part}|{disc_part}"))
+    return str(
+        uuid.uuid5(V2_NAMESPACE, f"{component}|{_v2_norm(name)}|{tag_part}|{disc_part}")
+    )
 
 
 def v2_benchmark_tables_present(client) -> bool:
@@ -510,7 +527,7 @@ def insert_benchmarks_v2(client, run_id: str, records: list) -> int:
     for rec in records:
         name = rec.get("operation_name") or ""
         tags = sorted({t for t in (rec.get("tags") or []) if t})
-        bid = v2_benchmark_id(name, tags, rec)
+        bid = v2_benchmark_id(V2_BENCH_COMPONENT, name, tags, rec)
         if not bid:
             skipped += 1
             continue
@@ -527,12 +544,13 @@ def insert_benchmarks_v2(client, run_id: str, records: list) -> int:
             # nothing is a parse failure, not a result.
             skipped += 1
             continue
-        ident_rows[bid] = [bid, name, tags, props]
+        ident_rows[bid] = [bid, V2_BENCH_COMPONENT, name, tags, props]
         num_runs = rec.get("num_runs")
         fact_rows.append(
             [
                 run_id,
                 bid,
+                V2_BENCH_COMPONENT,
                 _v2_bench_backend(rec),
                 measurements,
                 int(num_runs) if num_runs is not None else 0,
@@ -542,7 +560,7 @@ def insert_benchmarks_v2(client, run_id: str, records: list) -> int:
     client.insert(
         "benchmarks",
         v2_new_identity_rows(client, "benchmarks", "benchmark_id", ident_rows),
-        column_names=["benchmark_id", "name", "tags", "props"],
+        column_names=["benchmark_id", "component", "name", "tags", "props"],
     )
     client.insert(
         "benchmark_runs",
@@ -550,6 +568,7 @@ def insert_benchmarks_v2(client, run_id: str, records: list) -> int:
         column_names=[
             "run_id",
             "benchmark_id",
+            "component",
             "backend",
             "measurements",
             "iterations",
