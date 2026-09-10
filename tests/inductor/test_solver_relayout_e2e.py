@@ -124,14 +124,14 @@ class _Observed:
             self.emitted.add(pair)
             return pair
 
-        def spy_identity_codegen(op, args):
-            result = real_identity(op, args)
+        def spy_identity_codegen(op, args, op_info=None):
+            result = real_identity(op, args, op_info)
             if result:
                 _check(args)
             return result
 
-        def spy_identity_kernel(op, args):
-            result = real_identity(op, args)
+        def spy_identity_kernel(op, args, op_info=None):
+            result = real_identity(op, args, op_info)
             if result:
                 self.emitted_ops.append(_check(args))
             return result

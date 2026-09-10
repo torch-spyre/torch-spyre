@@ -660,6 +660,7 @@ def _unsupported_relayout_transition_reason(
 
 
 def solver_relayout_edge_context(
+    graph: GraphLowering,
     producer: Operation,
     consumer: Operation,
     source_name: str,
@@ -671,8 +672,9 @@ def solver_relayout_edge_context(
     committed graph, restricted to what does not depend on a chosen division, so
     the solver's candidate enumeration can run them once per edge before any
     per-division-pair work. Returns ``(write_dep, read_dep, producer_coords,
-    consumer_coords, producer_symbols, consumer_symbols)``, or ``None`` when the
-    edge can never host a relayout.
+    consumer_coords, producer_space, consumer_space)`` - the two spaces are the
+    loop-symbol -> extent mappings ``work_division_from_view`` projects into -
+    or ``None`` when the edge can never host a relayout.
     """
     # A coarse-tiled endpoint can never host a relayout. The fitted law has
     # no loop_trip factor (the committed-path planner already guarantees "a
@@ -691,7 +693,7 @@ def solver_relayout_edge_context(
         not isinstance(producer, ComputedBuffer)
         or not isinstance(producer.layout, FixedTiledLayout)
         or (write_dep := _single_write(producer, source_name)) is None
-        or not _is_activation_source(operations, producer)
+        or not _is_activation_source(graph, operations, producer)
     ):
         return None
     if not isinstance(consumer, ComputedBuffer) or isinstance(
@@ -724,8 +726,8 @@ def solver_relayout_edge_context(
         read_dep,
         producer_coords,
         consumer_coords,
-        tuple(iteration_space_from_op(producer)),
-        tuple(iteration_space_from_op(consumer)),
+        iteration_space_from_op(producer),
+        iteration_space_from_op(consumer),
     )
 
 

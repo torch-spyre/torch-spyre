@@ -14,6 +14,7 @@
 
 import functools
 import logging
+import math
 import time
 from abc import ABC, abstractmethod
 from collections import defaultdict
@@ -318,7 +319,7 @@ class ScratchpadAllocator:
         solver = self._build_solver(buffers)
         allocation = self._solve(solver, graph)
         accepted_lx_relayouts = self._finalize_lx_relayout_allocation(allocation, graph)
-        self._post_solve(graph, allocation)
+        self._post_solve(graph, allocation, accepted_lx_relayouts)
         reasons = self._get_spill_reasons(solver, allocation)
         self._push_allocation(graph, allocation, accepted_lx_relayouts)
         self._log_lx_pinning(graph, reasons)
@@ -387,8 +388,14 @@ class ScratchpadAllocator:
             self._clear_lx_relayout_groups(allocation, rejected)
         return self._accepted_plans(allocation)
 
-    def _post_solve(self, graph: GraphLowering, allocation: Sequence[Any]) -> None:
-        """Hook run after the solve, before reasons/push. Base: nothing to commit."""
+    def _post_solve(
+        self,
+        graph: GraphLowering,
+        allocation: Sequence[Any],
+        accepted_lx_relayouts: Sequence[LXRelayoutPlan],
+    ) -> None:
+        """Hook run after the solve and the relayout finalization, before
+        reasons/push. Base: nothing to commit."""
 
     def _get_spill_reasons(
         self, solver: MemoryPlanSolver, allocation: Sequence[LifetimeBoundBuffer]
@@ -2041,16 +2048,32 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             plans.append(segment.plan(source.address))
         return plans
 
-    def _post_solve(self, graph: GraphLowering, allocation: Sequence[Any]) -> None:
+    def _post_solve(
+        self,
+        graph: GraphLowering,
+        allocation: Sequence[Any],
+        accepted_lx_relayouts: Sequence[LXRelayoutPlan],
+    ) -> None:
         # The divisions must be committed such that any buffer clones can correctly
         # pull the selected core division from the dependent buffers when the graph
         # is updated with clones in ``_push_allocation``.
         self._commit_divisions(graph, allocation)
+        # A solver-fired relayout source stays resident under ITS committed view
+        # while the consumer it feeds will read the shuffled copy under another.
+        # The judge runs on the pre-materialization graph, where that consumer
+        # still reads the source directly, so it reports the pair as a
+        # mismatch and withholds a view. The plan carries the source view the
+        # enumeration priced and the solver committed, so it is authoritative
+        # here - the same precedence the fixed-division allocator gives
+        # ``plan.source_view`` when it builds its buffers.
+        source_views = {
+            plan.source_name: plan.source_view for plan in accepted_lx_relayouts
+        }
         _, reasons, views = get_ncores_for_buffers(graph)
         for buffer in allocation:
             if buffer.address is None:
                 continue
-            view = views.get(buffer.name)
+            view = source_views.get(buffer.name) or views.get(buffer.name)
             if view is None:
                 reason = reasons.get(buffer.name, "physical ownership was not accepted")
                 raise Unsupported(f"{buffer.name}: {reason}")
@@ -2375,6 +2398,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                 residency_by_buf,
             )
             cd_parent_relayouts = self._cd_parent_relayouts(
+                graph,
                 op,
                 buf_divisions,
                 parent_proj,
@@ -2580,6 +2604,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
 
     def _cd_parent_relayouts(
         self,
+        graph: GraphLowering,
         consumer_op: Optional[Operation],
         consumer_divs: list[CoreDivision],
         parent_names: list[str],
@@ -2614,11 +2639,11 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                 continue
             parent_op = op_by_name[parent]
             context = solver_relayout_edge_context(
-                parent_op, consumer_op, parent, op_by_name
+                graph, parent_op, consumer_op, parent, op_by_name
             )
             if context is None:
                 continue
-            write_dep, read_dep, prod_coords, cons_coords, prod_syms, cons_syms = (
+            write_dep, read_dep, prod_coords, cons_coords, prod_space, cons_space = (
                 context
             )
             parent_divs = divisions[parent]
@@ -2656,11 +2681,13 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             # below compares source and destination divisions for equality.
             projected: dict[tuple, Optional[TensorWorkDivision]] = {}
 
-            def _projected(view, coords, syms, frame) -> Optional[TensorWorkDivision]:
+            def _projected(view, coords, space, frame) -> Optional[TensorWorkDivision]:
                 key = (view, frame)
                 if key not in projected:
                     try:
-                        projected[key] = work_division_from_view(view, coords, syms)
+                        projected[key] = work_division_from_view(
+                            view, device_dims, coords, space
+                        )
                     except ValueError:
                         projected[key] = None
                 return projected[key]
@@ -2697,10 +2724,10 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                     ncores = parent_divs[i].cores_used
                     if ncores != consumer_divs[j].cores_used:
                         continue
-                    if _projected(pv, prod_coords, prod_syms, "prod") is None:
+                    if _projected(pv, prod_coords, prod_space, "prod") is None:
                         continue
-                    src_division = _projected(pv, cons_coords, cons_syms, "cons")
-                    dst_division = _projected(cv, cons_coords, cons_syms, "cons")
+                    src_division = _projected(pv, cons_coords, cons_space, "cons")
+                    dst_division = _projected(cv, cons_coords, cons_space, "cons")
                     if src_division is None or dst_division is None:
                         continue
                     # Distinct per-core views that collapse to one logical work

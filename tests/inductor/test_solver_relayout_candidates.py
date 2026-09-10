@@ -154,9 +154,11 @@ def test_coarse_tiled_endpoints_are_declined_at_the_edge_gate():
         obj.loop_info = object() if tiled else None
         return obj
 
+    # No graph: both gates under test sit before the first use of it.
+    graph = None
     for prod_tiled, cons_tiled in ((True, False), (False, True), (True, True)):
         prod, cons = probe(prod_tiled), probe(cons_tiled)
-        assert solver_relayout_edge_context(prod, cons, "buf0", {}) is None
+        assert solver_relayout_edge_context(graph, prod, cons, "buf0", {}) is None
         assert not type(prod).layout_accessed and not type(cons).layout_accessed, (
             "a coarse-tiled endpoint reached checks past the loop_info gate"
         )
@@ -164,7 +166,7 @@ def test_coarse_tiled_endpoints_are_declined_at_the_edge_gate():
     # Control: an untiled pair proceeds past the gate into the layout check,
     # proving the probes are capable of registering deeper progression.
     prod, cons = probe(False), probe(False)
-    assert solver_relayout_edge_context(prod, cons, "buf0", {}) is None
+    assert solver_relayout_edge_context(graph, prod, cons, "buf0", {}) is None
     assert type(prod).layout_accessed
 
 
