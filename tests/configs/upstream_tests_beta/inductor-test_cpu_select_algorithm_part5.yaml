@@ -9,24 +9,24 @@ test_suite_config:
         # They are classified as mandatory_success because they test core functionalities that must pass for the backend to be considered operational.
         # The relevance of these tests is determined by the backend's support for specific data types and operations, particularly bfloat16 and float16, which are critical for performance on AI accelerators.
         - names:
-            - TestSelectAlgorithm::test_bmm_amp
-            - TestSelectAlgorithm::test_bmm_self_permute
-            - TestSelectAlgorithm::test_bmm_with_broadcasted_mat1
-            - TestSelectAlgorithm::test_bmm_with_pointwise
-            - TestSelectAlgorithm::test_grouped_linear_invalid
-            - TestSelectAlgorithm::test_qlinear_unary_with_computed_buffer_x_zp
-            - TestSelectAlgorithm::test_quantized_linear_with_pointwise
-            - TestSelectAlgorithmDynamicShapes::test_bmm_dynamic_bm_stride
+            - TestSelectAlgorithm::test_cpp_coordinate_descent_tuning
+            - TestSelectAlgorithm::test_grouped_linear_epilogue
+            - TestSelectAlgorithm::test_int4_concat_woq_mm
+            - TestSelectAlgorithm::test_int4_woq_mm_amx
+            - TestSelectAlgorithm::test_linear_thread_factors
+            - TestSelectAlgorithm::test_linear_thread_factors_k_slicing_misaligned_cache_blocks
+            - TestSelectAlgorithm::test_linear_with_transpose
+            - TestSelectAlgorithm::test_linear_with_unary_binary
+            - TestSelectAlgorithm::test_qlinear_unary_with_dynamic_x_scale
+            - TestSelectAlgorithm::test_quantized_linear_amx
           mode: mandatory_success
 
         # These tests exercise various linear and batch matrix multiplication (bmm) operations with different data types and tensor shapes.
         # They are classified as xfail on the backend due to unsupported dynamic shapes and certain fused epilogues, which are not fully supported by the current implementation.
         # The most relevant backend capabilities include handling bfloat16 and float32 data types, but limitations in dynamic shape support and fused operations lead to these tests failing.
         - names:
-            - TestSelectAlgorithm::test_aoti_linear_multi_view_operations
-            - TestSelectAlgorithm::test_bmm_with_fused_epilogues
-            - TestSelectAlgorithm::test_int4_woq_mm_avx512
-            - TestSelectAlgorithm::test_qlinear_pointwise_int8_layout
+            - TestSelectAlgorithm::test_linear_to_lowp_fp
+            - TestSelectAlgorithm::test_linear_with_input_of_flexible_layout
           mode: xfail
 
   global:
