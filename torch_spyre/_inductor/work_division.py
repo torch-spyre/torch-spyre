@@ -1507,6 +1507,12 @@ def _matmul_split_cost(
     """
     (B, b), (M, m), (N, n), (K, k) = b_axis, m_axis, n_axis, k_axis
     cores_used = b * m * n * k
+    # SYMBOLIC SPLITS SKIP THE BUDGET CHECK (`isinstance` is False for a sympy
+    # expression), and the fall-through cost is not merely mispriced but NEGATIVE
+    # outside the budget -- what a minimizing objective seeks. Valid only within
+    # `max_cores`, therefore, and it is the CALLER that has to hold that: the symbolic
+    # expression is built over one enumerated CoreDivision per op, which
+    # `CoOptimizingAllocator._division_map` asserts is within budget (issue #4387).
     if cores_used == 0 or (isinstance(cores_used, int) and cores_used > max_cores):
         return math.inf
 

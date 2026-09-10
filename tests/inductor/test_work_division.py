@@ -1753,6 +1753,59 @@ class TestCoOptimizingAllocator(unittest.TestCase):
                 allocator._enumerate_core_divisions(op, max_cores=32), [fixed]
             )
 
+    def test_over_budget_candidate_menu_is_rejected(self):
+        """An over-budget division must not reach the menu. Nothing downstream
+        catches one: both engines pin an op's split symbols to a single enumerated
+        candidate, and ``_matmul_split_cost``'s budget guard no-ops on symbolic
+        splits, so an over-budget candidate is scored NEGATIVE and a minimizing
+        solve prefers it (issue #4387). The prune path is the one that could admit
+        one -- ``_legal_split_options`` tests stick validity and hard domains, never
+        a core budget -- so it is the one exercised here.
+        """
+        batch, m = _isym("batch"), _isym("m")
+        op = _computed_buffer((4, 64), name="over_budget_out")
+        graph = MagicMock(operations=[op])
+        allocator = CoOptimizingAllocator(MagicMock(), size=1, prune=True)
+        over_budget = {batch: 4, m: 16}  # 64 cores against a 32-core budget
+        rw = MagicMock(
+            writes=[MemoryDep(op.name, 64 * batch + m, (batch, m), (4, 64))],
+            reads=[],
+        )
+
+        with (
+            patch.object(allocator_module.config, "sencores", 32),
+            patch(
+                "torch_spyre._inductor.scratchpad.allocator."
+                "ops_in_offset_mutation_component",
+                return_value=set(),
+            ),
+            patch(
+                "torch_spyre._inductor.scratchpad.allocator."
+                "_find_distinct_matmul_splits",
+                return_value=((), ()),
+            ),
+            patch(
+                "torch_spyre._inductor.scratchpad.allocator._enum_split_options",
+                return_value=[over_budget],
+            ),
+            patch(
+                "torch_spyre._inductor.scratchpad.allocator.op_read_writes",
+                return_value=rw,
+            ),
+            patch(
+                "torch_spyre._inductor.scratchpad.allocator._split_fits_sticks",
+                return_value=True,
+            ),
+            patch(
+                "torch_spyre._inductor.scratchpad.allocator._split_option_is_legal",
+                return_value=True,
+            ),
+            self.assertRaisesRegex(
+                AssertionError, r"over_budget_out: .*over the 32-core budget"
+            ),
+        ):
+            allocator._division_map(graph)
+
 
 class TestTopKConstraints(unittest.TestCase):
     def test_topk_uses_minimum_supported_split_domains(self):
