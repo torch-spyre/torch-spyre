@@ -111,9 +111,7 @@ def _lone_sym(coord: sympy.Expr) -> sympy.Symbol | None:
 def _untracked_name(context: str, sym, size: int) -> str:
     name = f"_untracked_{size}"
     _named_dims.setdefault(name, size)
-    logger.warning(
-        f"{context}: loop var {sym} has no named dim mapping -- using {name}"
-    )
+    logger.debug(f"{context}: loop var {sym} has no named dim mapping -- using {name}")
     return name
 
 
@@ -137,7 +135,7 @@ def _consume_names(remaining: list[str], layout_size: int) -> list[str]:
         product *= _named_dims[name]
         if product == layout_size:
             return remaining[: i + 1]
-    logger.warning(
+    logger.debug(
         f"_consume_names: no prefix of {remaining} multiplies to {layout_size}"
     )
     return []

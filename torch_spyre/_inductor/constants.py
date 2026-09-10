@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import torch
+
 from torch_spyre._C import ElementArrangement
 
 BATCH_MATMUL_OP = "batchmatmul"
@@ -184,6 +185,22 @@ SPYRE_INT32_OPS = [
 FP8_E4M3FN_INFO = torch.finfo(torch.float8_e4m3fn)
 FP8_E4M3FN_MAX = float(FP8_E4M3FN_INFO.max)
 FP8_E4M3FN_MIN = float(FP8_E4M3FN_INFO.min)
+
+# clipMin for quantscalepertokenfp8: lower clamp bound for the computed scale.
+# Passed as a float; encode_constant will encode it to SEN169_FP16 (== 4096 / 0x1000).
+QUANTSCALEPERTOKENFP8_CLIP_MIN = 1.1920928955078125e-07
+
+# clipMax for quantscalepertokenfp8: upper clamp bound for the computed scale.
+# float32 max saturates to SEN169_FP16's maximum finite value (32255 / 0x7DFF).
+# Passed as a float; encode_constant will encode it via the normal path.
+QUANTSCALEPERTOKENFP8_CLIP_MAX = float(torch.finfo(torch.float32).max)
+
+
+# Operation name for per-token FP8 quantization scale computation
+# NOTE: quantscalepertokenfp8 is NOT in SPYRE_FP8_OPS because it takes FP16 input
+# and produces FP16 scales (not FP8 data). SPYRE_FP8_OPS contains only ops that
+# produce or consume FP8 tensors.
+QUANTSCALEPERTOKENFP8_OP = "quantscalepertokenfp8"
 
 # Operations that directly handle FP8 dtypes (SEN143_FP8)
 SPYRE_FP8_OPS = {
