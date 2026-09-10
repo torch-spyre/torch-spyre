@@ -47,7 +47,7 @@ repos:
       - id: yamlfmt
         args: [--mapping, '2', --sequence, '4', --offset, '2', --preserve_null, --implicit_start]
         files: \.(yml|yaml)$
-        exclude: codegen/.*
+        exclude: codegen/.*|tests/helm-charts/templates/.*
   - repo: local
     hooks:
       - id: forbid-pytest-ini

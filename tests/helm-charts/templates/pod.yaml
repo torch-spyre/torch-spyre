@@ -1,0 +1,247 @@
+# ──────────────────────────────────────────────────────────────────────────────
+#  Pod: spyre-dashboard
+#  Strategy  : initContainer clones branch -> emptyDir -> nginx:alpine serves it
+#  Port      : 8080
+#
+#  ClickHouse additions:
+#    - clickhouse-config volume (from new ConfigMap)
+#    - patch-dashboard initContainer (runs after git-clone, patches dashboard.html)
+#    - nginx server block includes nginx-ch.conf for /clickhouse/ proxy
+#    - ClickHouse credentials injected from K8s Secret via env vars
+# ──────────────────────────────────────────────────────────────────────────────
+apiVersion: v1
+kind: Pod
+metadata:
+  name: {{ include "spyre-dashboard.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "spyre-dashboard.labels" . | nindent 4 }}
+spec:
+  restartPolicy: Always
+
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: {{ .Values.security.runAsUser }}
+    runAsGroup: {{ .Values.security.runAsGroup }}
+    fsGroup: {{ .Values.security.fsGroup }}
+
+  volumes:
+    - name: html-dir
+      emptyDir: {}
+    - name: ssh-key
+      secret:
+        secretName: {{ .Values.ssh.secretName }}
+        defaultMode: 0400
+    - name: passwd-volume
+      configMap:
+        name: {{ include "spyre-dashboard.fullname" . }}-passwd
+    # Holds patch-dashboard.sh and nginx-ch.conf
+    - name: clickhouse-config
+      configMap:
+        name: {{ include "spyre-dashboard.fullname" . }}-clickhouse-config
+        defaultMode: 0755   # patch-dashboard.sh must be executable
+    - name: ch-token
+      secret:
+        secretName: {{ .Values.clickhouse.tokenSecret }}
+
+  # ── initContainer 1: shallow-clone the dashboard branch ────────────────────
+  initContainers:
+    - name: git-clone
+      image: {{ .Values.image.git }}
+      imagePullPolicy: {{ .Values.image.pullPolicy }}
+
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: {{ .Values.security.runAsUser }}
+        runAsGroup: {{ .Values.security.runAsGroup }}
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop: ["ALL"]
+
+      command: ["/bin/sh", "-c"]
+      args:
+        - |
+          # HOME must be writable for .ssh; /tmp is always safe under any UID
+          export HOME=/tmp/gituser
+          mkdir -p "$HOME/.ssh"
+
+          # Copy the mounted key — secret is mode 0400, owned by root,
+          # so we copy rather than symlink
+          cp /ssh/id_rsa "$HOME/.ssh/id_rsa"
+          chmod 600 "$HOME/.ssh/id_rsa"
+
+          # Skip host-key verification to avoid ssh-keyscan needing to write
+          # to /.ssh/known_hosts (which is root-owned and unwritable).
+          # Acceptable for an internal CI tool; swap StrictHostKeyChecking=no
+          # for a pinned known_hosts file if stricter security is required.
+          export GIT_SSH_COMMAND="ssh -i $HOME/.ssh/id_rsa -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+
+          # Clone into /html/repo (not /html directly) so that on pod restarts
+          # the emptyDir mount point itself is never the clone target.
+          # git refuses to clone into a non-empty directory, and emptyDir
+          # persists across container (not pod) restarts, so /html would still
+          # contain the previous clone on a crash-loop. Cloning into a subdir
+          # and doing rm -rf /html/repo first avoids that entirely.
+          rm -rf /html/repo
+
+          # Shallow clone — only the target branch, fastest possible
+          git clone \
+            --branch {{ .Values.git.branch }} \
+            --single-branch \
+            --depth 1 \
+            {{ .Values.git.repo }} \
+            /html/repo
+
+          # Ensure nginx (same UID) can read all cloned files
+          chmod -R 755 /html/repo
+
+          echo "Clone complete. Contents of {{ .Values.git.dashboardPath }}:"
+          ls /html/repo/{{ .Values.git.dashboardPath }}/
+
+      volumeMounts:
+        - name: html-dir
+          mountPath: /html
+        - name: ssh-key
+          mountPath: /ssh
+          readOnly: true
+        - name: passwd-volume
+          mountPath: /etc/passwd
+          subPath: passwd
+
+  # ── initContainer 2: patch dashboard.html with ClickHouse config ───────────
+  # Runs after git-clone. Injects <meta> tags and spyre-clickhouse.js <script>
+  # tag into dashboard.html. Credentials come from K8s Secrets via env vars.
+    - name: patch-dashboard
+      image: {{ .Values.image.git }}
+      imagePullPolicy: {{ .Values.image.pullPolicy }}
+
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: {{ .Values.security.runAsUser }}
+        runAsGroup: {{ .Values.security.runAsGroup }}
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop: ["ALL"]
+
+      command: ["/bin/sh", "/clickhouse-config/patch-dashboard.sh"]
+
+      env:
+        - name: SPYRE_CH_WORKFLOW
+          value: {{ .Values.clickhouse.defaultWorkflow | quote }}
+        - name: SPYRE_CH_AUTOLOAD
+          value: {{ .Values.clickhouse.autoload | quote }}
+
+      volumeMounts:
+        - name: html-dir
+          mountPath: /html
+        - name: clickhouse-config
+          mountPath: /clickhouse-config
+          readOnly: true
+        - name: passwd-volume
+          mountPath: /etc/passwd
+          subPath: passwd
+
+  # ── Main container: nginx serves the cloned + patched files ────────────────
+  containers:
+    - name: dashboard
+      image: {{ .Values.image.nginx }}
+      imagePullPolicy: {{ .Values.image.pullPolicy }}
+
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: {{ .Values.security.runAsUser }}
+        runAsGroup: {{ .Values.security.runAsGroup }}
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop: ["ALL"]
+
+      ports:
+        - containerPort: {{ .Values.service.targetPort }}
+          protocol: TCP
+
+      command: ["/bin/sh", "-c"]
+      args:
+        - |
+          # Install envsubst (not included in nginx:alpine)
+          apk add --no-cache gettext
+
+          # Render nginx proxy config with token from secret — never exposed to browser
+          CH_TOKEN=$(cat /run/secrets/ch-token/{{ .Values.clickhouse.tokenSecretKey }}) \
+            envsubst '${CH_TOKEN}' \
+            < /clickhouse-config/nginx-ch.conf.tmpl \
+            > /tmp/nginx-ch.conf
+
+          cat > /tmp/nginx.conf << 'NGINXEOF'
+          worker_processes auto;
+          pid /tmp/nginx.pid;
+          error_log /dev/stderr warn;
+
+          events { worker_connections 1024; }
+
+          http {
+            include       /etc/nginx/mime.types;
+            default_type  application/octet-stream;
+            access_log    /dev/stdout;
+
+            client_body_temp_path /tmp/client_temp;
+            proxy_temp_path       /tmp/proxy_temp;
+            fastcgi_temp_path     /tmp/fastcgi_temp;
+            uwsgi_temp_path       /tmp/uwsgi_temp;
+            scgi_temp_path        /tmp/scgi_temp;
+
+            server {
+              listen {{ .Values.service.targetPort }};
+              server_name _;
+
+              root  /html/repo/{{ .Values.git.dashboardPath }};
+              index dashboard.html index.html;
+
+              location / {
+                try_files $uri $uri/ /dashboard.html;
+              }
+
+              include /tmp/nginx-ch.conf;
+
+              add_header X-Content-Type-Options  nosniff;
+              add_header X-Frame-Options         SAMEORIGIN;
+              add_header Cache-Control           "no-store, no-cache, must-revalidate";
+            }
+          }
+          NGINXEOF
+
+          exec nginx -c /tmp/nginx.conf -g "daemon off;"
+
+
+      resources:
+        requests:
+          cpu: {{ .Values.resources.requests.cpu | quote }}
+          memory: {{ .Values.resources.requests.memory | quote }}
+        limits:
+          cpu: {{ .Values.resources.limits.cpu | quote }}
+          memory: {{ .Values.resources.limits.memory | quote }}
+
+      volumeMounts:
+        - name: html-dir
+          mountPath: /html
+          readOnly: true
+        # Needed at runtime so nginx can read nginx-ch.conf on startup
+        - name: clickhouse-config
+          mountPath: /clickhouse-config
+          readOnly: true
+        - name: ch-token
+          mountPath: /run/secrets/ch-token
+          readOnly: true
+
+      livenessProbe:
+        httpGet:
+          path: /
+          port: {{ .Values.service.targetPort }}
+        initialDelaySeconds: 10
+        periodSeconds: 15
+
+      readinessProbe:
+        httpGet:
+          path: /
+          port: {{ .Values.service.targetPort }}
+        initialDelaySeconds: 5
+        periodSeconds: 5

@@ -1,0 +1,19 @@
+# ──────────────────────────────────────────────────────────────────────────────
+#  Service — ClusterIP so the Route can reach the pod
+# ──────────────────────────────────────────────────────────────────────────────
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "spyre-dashboard.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "spyre-dashboard.labels" . | nindent 4 }}
+spec:
+  selector:
+    {{- include "spyre-dashboard.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ .Values.service.port }}
+      targetPort: {{ .Values.service.targetPort }}
+      protocol: TCP
+  type: ClusterIP
