@@ -560,6 +560,43 @@ def _to_cpu(result, device):
         return result
 
 
+def _release_compiled_kernels():
+    """Purge Inductor module caches and run GC to free FlexAllocator LX regions.
+
+    The SpyreSDSCKernelRunner (and its C++ JobPlan / flex::CompositeAddress)
+    lives inside the Inductor-generated module object.  That module is kept
+    alive by two strong references: PyCodeCache.cache and sys.modules.  Both
+    must be cleared before gc.collect() can drop the refcount to zero and
+    trigger the JobPlan destructor that returns the LX allocation.
+
+    Call this both *before* compiling (to free the previous test's kernel) and
+    *after* execution (to free the current test's kernel immediately, rather
+    than letting it accumulate until the next test's pre-compile cleanup).
+    """
+    try:
+        import gc
+        import torch._inductor.codecache as codecache
+
+        for key in list(sys.modules.keys()):
+            if "torch_inductor_code" in key or key.startswith(
+                "__torch_inductor_code"
+            ):
+                sys.modules.pop(key, None)
+        if hasattr(codecache, "PyCodeCache") and hasattr(
+            codecache.PyCodeCache, "cache"
+        ):
+            codecache.PyCodeCache.cache.clear()
+        if hasattr(codecache, "AotAndInlinedModulesCache") and hasattr(
+            codecache.AotAndInlinedModulesCache, "cache"
+        ):
+            codecache.AotAndInlinedModulesCache.cache.clear()
+        if hasattr(torch, "compiler") and hasattr(torch.compiler, "reset"):
+            torch.compiler.reset()
+        gc.collect()
+    except Exception:
+        pass
+
+
 def _compile_and_run(
     fn,
     args,
@@ -573,36 +610,11 @@ def _compile_and_run(
     torch._dynamo.reset_code_caches()
     torch._inductor.codecache.FxGraphCache.clear()
 
-    # Release device program memory held by previously compiled kernels.
-    # Clear Python module caches and their sys.modules entries so the module
-    # objects (and the SpyreSDSCKernelRunner / jobplan handles they own) are
-    # immediately unreferenced and destroyed by CPython's reference counting
-    # before the next kernel is loaded by prepare_kernel.  Without the
-    # sys.modules purge the modules remain alive despite PyCodeCache.cache
-    # being cleared, keeping FlexAllocator slots occupied and causing OOM on
-    # cards with limited free space (e.g. 1-card regression runs at
-    # sencores=32).
-    try:
-        import gc
-        import torch._inductor.codecache as codecache
-
-        if hasattr(codecache, "PyCodeCache") and hasattr(
-            codecache.PyCodeCache, "cache"
-        ):
-            for key in list(codecache.PyCodeCache.cache.keys()):
-                sys.modules.pop(key, None)
-            codecache.PyCodeCache.cache.clear()
-        if hasattr(codecache, "AotAndInlinedModulesCache") and hasattr(
-            codecache.AotAndInlinedModulesCache, "cache"
-        ):
-            for key in list(codecache.AotAndInlinedModulesCache.cache.keys()):
-                sys.modules.pop(key, None)
-            codecache.AotAndInlinedModulesCache.cache.clear()
-        if hasattr(torch, "compiler") and hasattr(torch.compiler, "reset"):
-            torch.compiler.reset()
-        gc.collect()
-    except Exception:
-        pass
+    # Release device program memory held by the *previous* compiled kernel.
+    # Without this, each test's kernel accumulates in the FlexAllocator LX
+    # region (limited to ~150 MB on a single card at sencores=32) and the
+    # suite OOMs after ~30 tests.
+    _release_compiled_kernels()
 
     device = torch.device(device) if isinstance(device, str) else device
     device_args = [
@@ -621,6 +633,12 @@ def _compile_and_run(
                 source_check(source_codes[0])
         else:
             result = comp_func(*device_args, **device_kwargs)
+
+        # Drop the compiled callable and purge module caches immediately so
+        # the current test's JobPlan destructor fires before the next test
+        # starts — not deferred until the next test's pre-compile cleanup.
+        del comp_func
+        _release_compiled_kernels()
     else:
         result = fn(*device_args, **device_kwargs)
 
