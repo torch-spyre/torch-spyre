@@ -106,6 +106,10 @@ jobs:
             config: granite-4.1-8b.yaml
           - name: Granite 4.1 8B Spyre
             config: granite-4.1-8b_spyre.yaml
+          - name: Granite Embedding 278M Multilingual
+            config: granite-embedding-278m-multilingual.yaml
+          - name: Granite Embedding 278M Multilingual Spyre
+            config: granite-embedding-278m-multilingual_spyre.yaml
           - name: Meta Llama 3.1 8B Instruct
             config: Meta-Llama-3.1-8B-Instruct.yaml
           - name: Meta Llama 3.1 8B Instruct Spyre

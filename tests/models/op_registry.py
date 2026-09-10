@@ -108,6 +108,14 @@ def _tensor_long(x: torch.Tensor) -> torch.Tensor:
     return x.long()
 
 
+def _torch_gather(x: torch.Tensor, index: torch.Tensor, dim: int) -> torch.Tensor:
+    # YAMLs record gather(input, dim=..., index=...) as two positional inputs
+    # plus dim in kwargs, which is not torch.gather's (input, dim, index)
+    # order. dim is deliberately required: a config that fails to supply it
+    # must raise, not silently gather along dim 0 and return a wrong result.
+    return torch.gather(x, dim, index)
+
+
 def _tensor_to(x: torch.Tensor, *args, **kwargs) -> torch.Tensor:
     # allow YAML to pass (dtype/device/etc.) via args/kwargs
     return x.to(*args, **kwargs)
@@ -456,6 +464,7 @@ OP_REGISTRY: Dict[str, OpAdapter] = {
     "torch.int": OpAdapter("torch.int", _tensor_int),
     "torch.long": OpAdapter("torch.long", _tensor_long),
     "torch.to": OpAdapter("torch.to", _tensor_to),
+    "torch.gather": OpAdapter("torch.gather", _torch_gather),
     "torch.type_as": OpAdapter("torch.Tensor.type_as", torch.Tensor.type_as),
     # Creation
     "torch.empty_like": OpAdapter("torch.empty_like", torch.empty_like),
