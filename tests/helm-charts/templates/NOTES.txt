@@ -1,0 +1,24 @@
+Spyre Dashboard deployed successfully!
+
+Release : {{ .Release.Name }}
+Namespace: {{ .Release.Namespace }}
+
+{{- if .Values.route.enabled }}
+
+Your dashboard is publicly accessible at:
+  https://{{ .Release.Name }}-{{ .Release.Namespace }}.apps.fmaas-backend.fmaas.res.ibm.com/
+  (if route.host was left empty — OpenShift auto-generates the hostname above)
+{{- end }}
+
+Watch the pod come up (initContainer clones git, then nginx starts):
+  oc get pod -w
+
+Check init logs (git clone):
+  oc logs <pod-name> -c git-clone
+
+Check nginx logs:
+  oc logs <pod name> -c dashboard
+
+To update the dashboard after pushing new commits to {{ .Values.git.branch }}:
+  oc delete pod <pod name>
+  helm upgrade {{ .Release.Name }} . -n {{ .Release.Namespace }}
