@@ -1,0 +1,693 @@
+model: bert-large-uncased
+defaults:
+  dtype: fp16
+  seed: 123
+  atol: 0.005
+  rtol: 0.005
+cases:
+  - name: torch.getitem.1
+    op: torch.getitem
+    inputs:
+      - tensor:
+          shape: [1, 512]
+          stride: [512, 1]
+          storage_offset: 0
+          dtype: torch.int64
+          device: cuda
+          init: randint
+          init_args:
+            high: 1000
+      - py: (slice(None, None, None), slice(0, 13, None))
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/models/bert/modeling_bert.py#L84 in forward, code: position_ids
+      = self.position_ids[:, past_key_values_length : seq_length + past_key_values_length]'
+    marks:
+      - constant
+
+  - name: torch.nn.functional.embedding.1
+    op: torch.nn.functional.embedding
+    inputs:
+      - tensor:
+          shape: [1, 13]
+          stride: [13, 1]
+          storage_offset: 0
+          dtype: torch.int64
+          device: cuda
+          init: randint
+          init_args:
+            high: 1000
+      - tensor:
+          shape: [30522, 1024]
+          stride: [1024, 1]
+          storage_offset: 0
+          dtype: torch.float32
+          device: cuda
+          init: rand
+      - value: 0
+      - value: null
+      - value: 2.0
+      - value: false
+      - value: false
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/models/bert/modeling_bert.py#L99 in forward, code: inputs_embeds
+      = self.word_embeddings(input_ids)'
+    marks:
+      - fp32operation
+      - constant
+
+  - name: torch.nn.functional.embedding.2
+    op: torch.nn.functional.embedding
+    inputs:
+      - tensor:
+          shape: [1, 13]
+          stride: [13, 1]
+          storage_offset: 0
+          dtype: torch.int64
+          device: cuda
+          init: randint
+          init_args:
+            high: 2
+      - tensor:
+          shape: [2, 1024]
+          stride: [1024, 1]
+          storage_offset: 0
+          dtype: torch.float32
+          device: cuda
+          init: rand
+      - value: null
+      - value: null
+      - value: 2.0
+      - value: false
+      - value: false
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/models/bert/modeling_bert.py#L100 in forward, code: token_type_embeddings
+      = self.token_type_embeddings(token_type_ids)'
+    marks:
+      - fp32operation
+      - constant
+
+  - name: torch.add.1
+    op: torch.add
+    inputs:
+      - tensor:
+          shape: [1, 13, 1024]
+          stride: [13312, 1024, 1]
+          storage_offset: 0
+          dtype: torch.float32
+          device: cuda
+          init: rand
+      - tensor:
+          shape: [1, 13, 1024]
+          stride: [13312, 1024, 1]
+          storage_offset: 0
+          dtype: torch.float32
+          device: cuda
+          init: rand
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/models/bert/modeling_bert.py#L101 in forward, code: embeddings
+      = inputs_embeds + token_type_embeddings'
+    marks:
+      - fp32operation
+
+  - name: torch.nn.functional.embedding.3
+    op: torch.nn.functional.embedding
+    inputs:
+      - tensor:
+          shape: [1, 13]
+          stride: [512, 1]
+          storage_offset: 0
+          dtype: torch.int64
+          device: cuda
+          init: randint
+          init_args:
+            high: 512
+      - tensor:
+          shape: [512, 1024]
+          stride: [1024, 1]
+          storage_offset: 0
+          dtype: torch.float32
+          device: cuda
+          init: rand
+      - value: null
+      - value: null
+      - value: 2.0
+      - value: false
+      - value: false
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/models/bert/modeling_bert.py#L103 in forward, code: position_embeddings
+      = self.position_embeddings(position_ids)'
+    marks:
+      - fp32operation
+      - constant
+
+  - name: torch.nn.functional.layer_norm.1
+    op: torch.nn.functional.layer_norm
+    inputs:
+      - tensor:
+          shape: [1, 13, 1024]
+          stride: [13312, 1024, 1]
+          storage_offset: 0
+          dtype: torch.float32
+          device: cuda
+          init: rand
+      - value: (1024,)
+      - tensor:
+          shape: [1024]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.float32
+          device: cuda
+          init: rand
+      - tensor:
+          shape: [1024]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.float32
+          device: cuda
+          init: rand
+      - value: 1.0e-12
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/models/bert/modeling_bert.py#L106 in forward, code: embeddings
+      = self.LayerNorm(embeddings)'
+    marks:
+      - fp32operation
+      - constant
+
+  - name: torch.nn.functional.dropout.1
+    op: torch.nn.functional.dropout
+    inputs:
+      - tensor:
+          shape: [1, 13, 1024]
+          stride: [13312, 1024, 1]
+          storage_offset: 0
+          dtype: torch.float32
+          device: cuda
+          init: rand
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/models/bert/modeling_bert.py#L107 in forward, code: embeddings
+      = self.dropout(embeddings)'
+    marks:
+      - fp32operation
+      - constant
+    kwmap:
+      p: 0.1
+      training: false
+      inplace: false
+
+  - name: torch.arange.1
+    op: torch.arange
+    inputs:
+      - value: 1
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/masking_utils.py#L507 in sdpa_mask, code: batch_arange = torch.arange(batch_size,
+      device=device)'
+    marks:
+      - constant
+
+    kwmap:
+      device: cuda
+  - name: torch.add.2
+    op: torch.add
+    inputs:
+      - tensor:
+          shape: [13]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int64
+          device: cuda
+          init: randint
+          init_args:
+            high: 1000
+      - value: 0
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/masking_utils.py#L509 in sdpa_mask, code: q_arange = torch.arange(q_length,
+      device=device) + q_offset'
+    marks:
+      - constant
+
+  - name: torch.getitem.2
+    op: torch.getitem
+    inputs:
+      - tensor:
+          shape: [1]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int64
+          device: cuda
+          init: randint
+          init_args:
+            high: 1000
+      - py: (slice(None, None, None), None, None, None)
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/masking_utils.py#L364 in _non_vmap_expansion_sdpa, code: batch_indices
+      = batch_indices[:, None, None, None]'
+    marks:
+      - constant
+
+  - name: torch.getitem.3
+    op: torch.getitem
+    inputs:
+      - tensor:
+          shape: [13]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int64
+          device: cuda
+          init: randint
+          init_args:
+            high: 1000
+      - py: (None, None, slice(None, None, None), None)
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/masking_utils.py#L366 in _non_vmap_expansion_sdpa, code: q_indices
+      = q_indices[None, None, :, None]'
+    marks:
+      - constant
+
+  - name: torch.new_ones.1
+    op: torch.new_ones
+    inputs:
+      - tensor:
+          shape: [1, 1, 13, 1]
+          stride: [13, 13, 1, 1]
+          storage_offset: 0
+          dtype: torch.int64
+          device: cuda
+          init: randint
+          init_args:
+            high: 1000
+      - value: ()
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/masking_utils.py#L54 in and_mask, code: result = q_idx.new_ones((),
+      dtype=torch.bool)'
+    marks:
+      - constant
+
+    kwmap:
+      dtype: torch.bool
+  - name: torch.ge.1
+    op: torch.ge
+    inputs:
+      - tensor:
+          shape: [1, 1, 13, 1]
+          stride: [13, 13, 1, 1]
+          storage_offset: 0
+          dtype: torch.int64
+          device: cuda
+          init: randint
+          init_args:
+            high: 1000
+      - value: 0
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/masking_utils.py#L89 in bidirectional_mask_function, code: return
+      q_idx >= 0'
+    marks:
+      - constant
+
+  - name: torch.to.1
+    op: torch.to
+    inputs:
+      - tensor:
+          shape: [1, 1, 13, 1]
+          stride: [13, 13, 1, 1]
+          storage_offset: 0
+          dtype: torch.bool
+          device: cuda
+      - value: cpu
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/masking_utils.py#L56 in and_mask, code: result = result & mask(batch_idx,
+      head_idx, q_idx, kv_idx).to(result.device)'
+    marks:
+      - constant
+
+  - name: torch.and_.1
+    op: torch.and_
+    inputs:
+      - tensor:
+          shape: [1, 1, 13, 1]
+          stride: [13, 13, 1, 1]
+          storage_offset: 0
+          dtype: torch.bool
+          device: cuda
+      - tensor:
+          shape: [1, 1, 13, 1]
+          stride: [13, 13, 1, 1]
+          storage_offset: 0
+          dtype: torch.bool
+          device: cuda
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/masking_utils.py#L56 in and_mask, code: result = result & mask(batch_idx,
+      head_idx, q_idx, kv_idx).to(result.device)'
+
+  - name: torch.getitem.4
+    op: torch.getitem
+    inputs:
+      - tensor:
+          shape: [1, 13]
+          stride: [13, 1]
+          storage_offset: 0
+          dtype: torch.bool
+          device: cuda
+      - tensor_list:
+          - shape: [1, 1, 1, 1]
+            stride: [1, 1, 1, 1]
+            storage_offset: 0
+            dtype: torch.int64
+            device: cuda
+            init: randint
+            init_args:
+              high: 1
+          - shape: [1, 1, 1, 13]
+            stride: [13, 13, 13, 1]
+            storage_offset: 0
+            dtype: torch.int64
+            device: cuda
+            init: randint
+            init_args:
+              high: 13
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/masking_utils.py#L177 in inner_mask, code: return padding_mask[batch_idx,
+      kv_idx]'
+    marks:
+      - constant
+
+  - name: torch.to.2
+    op: torch.to
+    inputs:
+      - tensor:
+          shape: [1, 1, 1, 13]
+          stride: [13, 13, 13, 1]
+          storage_offset: 0
+          dtype: torch.bool
+          device: cuda
+      - value: cpu
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/masking_utils.py#L56 in and_mask, code: result = result & mask(batch_idx,
+      head_idx, q_idx, kv_idx).to(result.device)'
+    marks:
+      - constant
+
+  - name: torch.and_.2
+    op: torch.and_
+    inputs:
+      - tensor:
+          shape: [1, 1, 13, 1]
+          stride: [13, 13, 1, 1]
+          storage_offset: 0
+          dtype: torch.bool
+          device: cuda
+      - tensor:
+          shape: [1, 1, 1, 13]
+          stride: [13, 13, 13, 1]
+          storage_offset: 0
+          dtype: torch.bool
+          device: cuda
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/masking_utils.py#L56 in and_mask, code: result = result & mask(batch_idx,
+      head_idx, q_idx, kv_idx).to(result.device)'
+
+  - name: torch.Tensor.expand.1
+    op: torch.Tensor.expand
+    inputs:
+      - tensor:
+          shape: [1, 1, 13, 13]
+          stride: [169, 169, 13, 1]
+          storage_offset: 0
+          dtype: torch.bool
+          device: cuda
+      - value: 1
+      - value: -1
+      - value: 13
+      - value: 13
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/masking_utils.py#L518 in sdpa_mask, code: attention_mask = attention_mask.expand(batch_size,
+      -1, q_length, kv_length)'
+    marks:
+      - constant
+
+  - name: torch.nn.functional.linear.1
+    op: torch.nn.functional.linear
+    inputs:
+      - tensor:
+          shape: [1, 13, 1024]
+          stride: [13312, 1024, 1]
+          storage_offset: 0
+          dtype: torch.float32
+          device: cuda
+          init: xavier
+      - tensor:
+          shape: [1024, 1024]
+          stride: [1024, 1]
+          storage_offset: 0
+          dtype: torch.float32
+          device: cuda
+          init: xavier
+      - tensor:
+          shape: [1024]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.float32
+          device: cuda
+          init: rand
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/models/bert/modeling_bert.py#L175 in forward, code: query_layer
+      = self.query(hidden_states).view(*hidden_shape).transpose(1, 2)'
+    marks:
+      - fp32operation
+
+  - name: torch.Tensor.view.1
+    op: torch.Tensor.view
+    inputs:
+      - tensor:
+          shape: [1, 13, 1024]
+          stride: [13312, 1024, 1]
+          storage_offset: 0
+          dtype: torch.float32
+          device: cuda
+          init: rand
+      - value: 1
+      - value: 13
+      - value: -1
+      - value: 64
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/models/bert/modeling_bert.py#L175 in forward, code: query_layer
+      = self.query(hidden_states).view(*hidden_shape).transpose(1, 2)'
+    marks:
+      - fp32operation
+      - constant
+
+  - name: torch.transpose.1
+    op: torch.transpose
+    inputs:
+      - tensor:
+          shape: [1, 13, 16, 64]
+          stride: [13312, 1024, 64, 1]
+          storage_offset: 0
+          dtype: torch.float32
+          device: cuda
+          init: rand
+      - value: 1
+      - value: 2
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/models/bert/modeling_bert.py#L175 in forward, code: query_layer
+      = self.query(hidden_states).view(*hidden_shape).transpose(1, 2)'
+    marks:
+      - fp32operation
+      - constant
+
+  - name: torch.nn.functional.scaled_dot_product_attention.1
+    op: torch.nn.functional.scaled_dot_product_attention
+    inputs:
+      - tensor:
+          shape: [1, 16, 13, 64]
+          stride: [13312, 64, 1024, 1]
+          storage_offset: 0
+          dtype: torch.float32
+          device: cuda
+          init: rand
+      - tensor:
+          shape: [1, 16, 13, 64]
+          stride: [13312, 64, 1024, 1]
+          storage_offset: 0
+          dtype: torch.float32
+          device: cuda
+          init: rand
+      - tensor:
+          shape: [1, 16, 13, 64]
+          stride: [13312, 64, 1024, 1]
+          storage_offset: 0
+          dtype: torch.float32
+          device: cuda
+          init: rand
+      - tensor:
+          shape: [1, 1, 13, 13]
+          stride: [169, 169, 13, 1]
+          storage_offset: 0
+          dtype: torch.bool
+          device: cuda
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/integrations/sdpa_attention.py#L154 in sdpa_attention_forward,
+      code: attn_output = torch.nn.functional.scaled_dot_product_attention('
+    marks:
+      - fp32operation
+
+    kwmap:
+      dropout_p: 0.0
+      scale: 0.125
+      is_causal: false
+  - name: torch.transpose.2
+    op: torch.transpose
+    inputs:
+      - tensor:
+          shape: [1, 16, 13, 64]
+          stride: [13312, 64, 1024, 1]
+          storage_offset: 0
+          dtype: torch.float32
+          device: cuda
+          init: rand
+      - value: 1
+      - value: 2
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/integrations/sdpa_attention.py#L164 in sdpa_attention_forward,
+      code: attn_output = attn_output.transpose(1, 2).contiguous()'
+    marks:
+      - fp32operation
+      - constant
+
+  - name: torch.Tensor.contiguous.1
+    op: torch.Tensor.contiguous
+    inputs:
+      - tensor:
+          shape: [1, 13, 16, 64]
+          stride: [13312, 1024, 64, 1]
+          storage_offset: 0
+          dtype: torch.float32
+          device: cuda
+          init: rand
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/integrations/sdpa_attention.py#L164 in sdpa_attention_forward,
+      code: attn_output = attn_output.transpose(1, 2).contiguous()'
+    marks:
+      - fp32operation
+
+  - name: torch.reshape.1
+    op: torch.reshape
+    inputs:
+      - tensor:
+          shape: [1, 13, 16, 64]
+          stride: [13312, 1024, 64, 1]
+          storage_offset: 0
+          dtype: torch.float32
+          device: cuda
+          init: rand
+      - value: (1, 13, -1)
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/models/bert/modeling_bert.py#L202 in forward, code: attn_output
+      = attn_output.reshape(*input_shape, -1).contiguous()'
+    marks:
+      - fp32operation
+      - constant
+
+  - name: torch.Tensor.contiguous.2
+    op: torch.Tensor.contiguous
+    inputs:
+      - tensor:
+          shape: [1, 13, 1024]
+          stride: [13312, 1024, 1]
+          storage_offset: 0
+          dtype: torch.float32
+          device: cuda
+          init: rand
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/models/bert/modeling_bert.py#L202 in forward, code: attn_output
+      = attn_output.reshape(*input_shape, -1).contiguous()'
+    marks:
+      - fp32operation
+
+  - name: torch.nn.functional.linear.2
+    op: torch.nn.functional.linear
+    inputs:
+      - tensor:
+          shape: [1, 13, 1024]
+          stride: [13312, 1024, 1]
+          storage_offset: 0
+          dtype: torch.float32
+          device: cuda
+          init: xavier
+      - tensor:
+          shape: [4096, 1024]
+          stride: [1024, 1]
+          storage_offset: 0
+          dtype: torch.float32
+          device: cuda
+          init: xavier
+      - tensor:
+          shape: [4096]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.float32
+          device: cuda
+          init: rand
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/models/bert/modeling_bert.py#L335 in forward, code: hidden_states
+      = self.dense(hidden_states)'
+    marks:
+      - fp32operation
+
+  - name: torch.nn.functional.gelu.1
+    op: torch.nn.functional.gelu
+    inputs:
+      - tensor:
+          shape: [1, 13, 4096]
+          stride: [53248, 4096, 1]
+          storage_offset: 0
+          dtype: torch.float32
+          device: cuda
+          init: rand
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/activations.py#L89 in forward, code: return self.act(input)'
+    marks:
+      - fp32operation
+
+  - name: torch.nn.functional.linear.3
+    op: torch.nn.functional.linear
+    inputs:
+      - tensor:
+          shape: [1, 13, 4096]
+          stride: [53248, 4096, 1]
+          storage_offset: 0
+          dtype: torch.float32
+          device: cuda
+          init: xavier
+      - tensor:
+          shape: [1024, 4096]
+          stride: [4096, 1]
+          storage_offset: 0
+          dtype: torch.float32
+          device: cuda
+          init: xavier
+      - tensor:
+          shape: [1024]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.float32
+          device: cuda
+          init: rand
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/models/bert/modeling_bert.py#L348 in forward, code: hidden_states
+      = self.dense(hidden_states)'
+    marks:
+      - fp32operation
+
+  - name: torch.nn.functional.gelu.2
+    op: torch.nn.functional.gelu
+    inputs:
+      - tensor:
+          shape: [1, 13, 1024]
+          stride: [13312, 1024, 1]
+          storage_offset: 0
+          dtype: torch.float32
+          device: cuda
+          init: rand
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/activations.py#L89 in forward, code: return self.act(input)'
+    marks:
+      - fp32operation
+
+  - name: torch.nn.functional.linear.4
+    op: torch.nn.functional.linear
+    inputs:
+      - tensor:
+          shape: [1, 13, 1024]
+          stride: [13312, 1024, 1]
+          storage_offset: 0
+          dtype: torch.float32
+          device: cuda
+          init: xavier
+      - tensor:
+          shape: [30522, 1024]
+          stride: [1024, 1]
+          storage_offset: 0
+          dtype: torch.float32
+          device: cuda
+          init: xavier
+      - tensor:
+          shape: [30522]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.float32
+          device: cuda
+          init: rand
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/models/bert/modeling_bert.py#L495 in forward, code: hidden_states
+      = self.decoder(hidden_states)'
+    marks:
+      - fp32operation
+
