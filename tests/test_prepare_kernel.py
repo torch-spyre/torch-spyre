@@ -99,6 +99,8 @@ class TestPrepareKernel:
         exec_command="ComputeOnDevice",
         exec_properties=None,
         job_exec_plan=None,
+        static_size="1024",
+        dynamic_size="0",
     ):
         """Create a mock SpyreCode directory structure for testing.
 
@@ -106,6 +108,11 @@ class TestPrepareKernel:
             tmpdir: Temporary directory path
             exec_command: Command type for JobExecPlan (default: "ComputeOnDevice")
             exec_properties: Properties dict for the exec command (default: auto-generated)
+            job_exec_plan: Full JobExecPlan to use verbatim (default: auto-generated)
+            static_size: Allocate 'static_size' property -- the segment-7 program
+                allocation made once during PrepareKernel
+            dynamic_size: Allocate 'dynamic_size' property -- the segment-6 region
+                allocated per launch ("0" means the job has no dynamic region)
 
         Returns:
             Path to the SpyreCode directory
@@ -157,7 +164,13 @@ class TestPrepareKernel:
         # Create a minimal spyrecode.json
         spyrecode_json = {
             "JobPreparationPlan": [
-                {"command": "Allocate", "properties": {"size": "1024"}},
+                {
+                    "command": "Allocate",
+                    "properties": {
+                        "static_size": static_size,
+                        "dynamic_size": dynamic_size,
+                    },
+                },
                 {
                     "command": "InitTransfer",
                     "properties": {
@@ -207,8 +220,141 @@ class TestPrepareKernel:
             spyrecode_dir = self.create_mock_spyrecode(tmpdir)
             job_plan = torch_spyre._C.prepare_kernel(spyrecode_dir)
 
-            # Should match the allocated size (1024 bytes)
+            # Should match the allocated static size (1024 bytes)
             assert job_plan.job_allocation_size() == 1024
+
+    def test_job_plan_dynamic_size_defaults_to_zero(self):
+        """A job with no dynamic region reports dynamic_size() == 0.
+
+        0 is what makes SpyreStream::launch() skip the per-launch segment-6
+        allocation entirely, so this is the "no dynamic region" contract and not
+        just an uninitialized default.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            spyrecode_dir = self.create_mock_spyrecode(tmpdir, dynamic_size="0")
+            job_plan = torch_spyre._C.prepare_kernel(spyrecode_dir)
+
+            assert job_plan.dynamic_size() == 0
+
+    def test_job_plan_static_and_dynamic_sizes_are_independent(self):
+        """static_size and dynamic_size are parsed into separate fields.
+
+        Uses two distinct values so a swapped assignment in executeAllocate --
+        which would leave both accessors "working" under equal sizes -- fails
+        here instead of silently sizing segment 6 from the segment-7 number.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            spyrecode_dir = self.create_mock_spyrecode(
+                tmpdir, static_size="1024", dynamic_size="2048"
+            )
+            job_plan = torch_spyre._C.prepare_kernel(spyrecode_dir)
+
+            assert job_plan.job_allocation_size() == 1024
+            assert job_plan.dynamic_size() == 2048
+
+    def test_job_plan_repr_reports_dynamic_size(self):
+        """__repr__ surfaces dynamic_size alongside the static allocation."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            spyrecode_dir = self.create_mock_spyrecode(
+                tmpdir, static_size="1024", dynamic_size="2048"
+            )
+            job_plan = torch_spyre._C.prepare_kernel(spyrecode_dir)
+
+            r = repr(job_plan)
+            assert "dynamic_size=2048" in r
+            assert "job_allocation_size=1024" in r
+
+    def test_allocate_missing_static_size(self):
+        """Allocate without 'static_size' is rejected by name.
+
+        The property is required with no fallback to the pre-segment-6 'size'
+        key, so a producer that still emits 'size' must fail loudly rather than
+        allocate 0 bytes on segment 7.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            spyrecode_dir = self._write_spyrecode_with_allocate_props(
+                tmpdir, {"size": "1024", "dynamic_size": "0"}
+            )
+
+            with pytest.raises(
+                RuntimeError,
+                match="Allocate command missing 'static_size' property",
+            ):
+                torch_spyre._C.prepare_kernel(spyrecode_dir)
+
+    def test_stoull_allocate_negative_dynamic_size(self):
+        """A negative 'dynamic_size' is rejected by its own safe_stoull call.
+
+        static_size is left valid so the failure is attributable to the
+        dynamic_size parse: the two sizes go through separate safe_stoull calls
+        with separate error labels.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            spyrecode_dir = self._write_spyrecode_with_allocate_props(
+                tmpdir, {"static_size": "1024", "dynamic_size": "-8"}
+            )
+
+            with pytest.raises(
+                RuntimeError,
+                match=(
+                    "Invalid Allocate dynamic size value '-8': "
+                    "negative value not allowed for unsigned integer"
+                ),
+            ):
+                torch_spyre._C.prepare_kernel(spyrecode_dir)
+
+    def test_allocate_missing_dynamic_size(self):
+        """Allocate without 'dynamic_size' is rejected by name.
+
+        dynamic_size is mandatory rather than defaulted, so a producer emitting
+        only static_size is a real failure mode worth pinning.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            spyrecode_dir = self._write_spyrecode_with_allocate_props(
+                tmpdir, {"static_size": "1024"}
+            )
+
+            with pytest.raises(
+                RuntimeError,
+                match="Allocate command missing 'dynamic_size' property",
+            ):
+                torch_spyre._C.prepare_kernel(spyrecode_dir)
+
+    def _write_spyrecode_with_allocate_props(self, tmpdir, allocate_props):
+        """Write mock SpyreCode whose Allocate carries exactly allocate_props.
+
+        create_mock_spyrecode always emits both size keys, so it cannot express
+        an Allocate with a property missing; this writes the JSON directly.
+        """
+        spyrecode_dir = os.path.join(tmpdir, "spyreCodeDir")
+        os.makedirs(spyrecode_dir, exist_ok=True)
+
+        spyrecode_json = {
+            "JobPreparationPlan": [
+                {"command": "Allocate", "properties": allocate_props},
+                {
+                    "command": "InitTransfer",
+                    "properties": {
+                        "init_bin_file": "init_binary.bin",
+                        "dev_ptr": "120259084288",
+                        "size": "1024",
+                    },
+                },
+            ],
+            "JobExecPlan": [
+                {
+                    "command": "ComputeOnDevice",
+                    "properties": {"job_bin_ptr": "120259084288"},
+                }
+            ],
+        }
+
+        with open(os.path.join(spyrecode_dir, "spyrecode.json"), "w") as f:
+            json.dump(spyrecode_json, f, indent=2)
+        with open(os.path.join(spyrecode_dir, "init_binary.bin"), "wb") as f:
+            f.write(b"\x00" * 1024)
+
+        return spyrecode_dir
 
     def test_job_plan_step_type(self):
         """Test JobPlan.get_step_type() method."""
@@ -602,7 +748,12 @@ class TestPrepareKernel:
                 torch_spyre._C.prepare_kernel(spyrecode_dir)
 
     def test_stoull_allocate_negative_size(self):
-        """Test that negative size in Allocate command is rejected."""
+        """Test that negative static_size in Allocate command is rejected.
+
+        dynamic_size is left valid so the negative value actually reaches
+        safe_stoull -- a missing dynamic_size would trip the required-property
+        TORCH_CHECK first and this would stop testing safe_stoull at all.
+        """
         with tempfile.TemporaryDirectory() as tmpdir:
             job_exec_plan = [
                 {
@@ -616,7 +767,13 @@ class TestPrepareKernel:
 
             spyrecode_json = {
                 "JobPreparationPlan": [
-                    {"command": "Allocate", "properties": {"size": "-1024"}},
+                    {
+                        "command": "Allocate",
+                        "properties": {
+                            "static_size": "-1024",
+                            "dynamic_size": "0",
+                        },
+                    },
                     {
                         "command": "InitTransfer",
                         "properties": {
@@ -642,7 +799,7 @@ class TestPrepareKernel:
                 torch_spyre._C.prepare_kernel(spyrecode_dir)
 
     def test_stoull_allocate_negative_size_with_leading_whitespace(self):
-        """Test that negative size with leading whitespace is rejected."""
+        """Test that negative static_size with leading whitespace is rejected."""
         with tempfile.TemporaryDirectory() as tmpdir:
             job_exec_plan = [
                 {
@@ -656,7 +813,13 @@ class TestPrepareKernel:
 
             spyrecode_json = {
                 "JobPreparationPlan": [
-                    {"command": "Allocate", "properties": {"size": "  -512"}},
+                    {
+                        "command": "Allocate",
+                        "properties": {
+                            "static_size": "  -512",
+                            "dynamic_size": "0",
+                        },
+                    },
                     {
                         "command": "InitTransfer",
                         "properties": {

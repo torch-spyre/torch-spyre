@@ -272,6 +272,30 @@ struct LaunchContext {
    * for existing callers that pass no payload.
    */
   std::vector<SymbolicArg> symbolic_args;
+
+  /**
+   * @brief Device memory for the job's dynamic region (optional)
+   *
+   * Allocated per launch by SpyreStream::launch() and freed once the device is
+   * done with it, unlike JobPlan::job_allocation which is allocated during
+   * PrepareKernel and lives for the JobPlan's lifetime. flex maps this to
+   * segment 6 while the static allocation stays on segment 7.
+   *
+   * Every Compute step in the plan shares this one region: all Compute steps
+   * are Dev-role, so per-stream FIFO serializes them and no two are ever live
+   * in the region at once. Each compute op holds a refcount through its flex
+   * callback, so the region is freed when the last one completes and no step
+   * needs to know it is the last.
+   *
+   * Holds the c10::DataPtr, not the CompositeAddress moved out of it:
+   * CompositeAddress's move constructor zeroes the source's cached size, so
+   * moving it out would leave SpyreAllocator::ReportAndDelete recording a
+   * 0-byte release against a full-size recordAlloc — allocated_bytes would
+   * climb once per launch and read as a leak.
+   *
+   * Null when JobPlan::dynamic_size is 0.
+   */
+  std::shared_ptr<c10::DataPtr> dynamic_alloc;
 };
 
 /**
@@ -670,6 +694,13 @@ struct JobPlan {
    * One entry per program.
    */
   std::vector<std::string> inits;
+
+  /**
+   * @brief Dynamic allocation size
+   *
+   * Allocated and deallocated per JobPlan execution.
+   */
+  size_t dynamic_size = 0;
 };
 
 /**
