@@ -6420,6 +6420,27 @@ def _replace_group_op(
             return
 
 
+def _retile_elision_record(
+    record: object, infos_by_name: dict[str, _RetiledBufferInfo]
+) -> ReadCopyElisionRecord | None:
+    """Apply the same non-weight retile to the saved direct-read candidate.
+
+    This is not a safety decision: post-allocation elision still proves every
+    address and owner. If the transformation changes either side of the saved
+    weight copy, decline instead of pretending its original contract survived.
+    """
+    if not isinstance(record, ReadCopyElisionRecord):
+        return None
+    if {record.source_name, record.copy_name}.intersection(infos_by_name):
+        return None
+
+    def direct_inner(*args, _original=record.direct_inner_fn, _infos=infos_by_name):
+        with V.set_ops_handler(_RetileLoadIndexHandler(V.ops, _infos)):
+            return _original(*args)
+
+    return dataclasses.replace(record, direct_inner_fn=direct_inner)
+
+
 def _patch_retiled_load_indexes(
     group_id: tuple[int, ...],
     group_ops: list[Operation],
@@ -6449,6 +6470,9 @@ def _patch_retiled_load_indexes(
             continue
 
         orig_inner = op.data.inner_fn
+        direct_record = _retile_elision_record(
+            getattr(op, "_read_copy_elision_record", None), infos_by_name
+        )
 
         def new_inner_fn(
             *args,
@@ -6466,6 +6490,8 @@ def _patch_retiled_load_indexes(
             pass_name="coarse_tile",
             reason="rewrite retiled load indexes",
         )
+        if direct_record is not None:
+            new_op._read_copy_elision_record = direct_record  # type: ignore[attr-defined]
         _replace_group_op(group_ops, op, new_op)
         V.graph.name_to_buffer[new_op.get_name()] = new_op
 

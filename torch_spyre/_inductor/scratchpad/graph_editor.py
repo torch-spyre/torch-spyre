@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import dataclasses
+
 from torch.fx.graph import Graph
 from torch._inductor.dependencies import MemoryDep
 from torch._inductor.graph import GraphLowering
@@ -39,6 +41,7 @@ from torch._inductor.ir import (
 from torch._inductor.lowering import clone as clone_lowering, lowerings
 
 from torch_spyre._inductor.ir import FixedTiledLayout
+from torch_spyre._inductor.loop_info import ReadCopyElisionRecord
 from torch_spyre._inductor.split_multi_ops import _origin_in_graph
 
 
@@ -310,6 +313,24 @@ class GraphEditor:
             old_loop.data, name_map={old_name: new_name}
         )
         old_loop.data = new_loop
+        # A relayout of the other operand must also update the saved direct
+        # weight-read candidate. Keeping the old closure would read the
+        # pre-relayout operand; blindly copying the record is not sufficient.
+        record = getattr(old_loop, "_read_copy_elision_record", None)
+        if isinstance(record, ReadCopyElisionRecord):
+            if old_name in (record.source_name, record.copy_name):
+                del old_loop._read_copy_elision_record
+            else:
+
+                def direct_inner(*args, _original=record.direct_inner_fn):
+                    with V.set_ops_handler(
+                        self._NameSwapHandler(V.ops, {old_name: new_name})
+                    ):
+                        return _original(*args)
+
+                old_loop._read_copy_elision_record = dataclasses.replace(
+                    record, direct_inner_fn=direct_inner
+                )
         # The dependency set changed; force the next query to retrace the loop.
         invalidate_op_read_writes(old_loop)
 
