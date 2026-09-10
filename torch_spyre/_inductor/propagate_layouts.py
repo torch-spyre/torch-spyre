@@ -548,7 +548,28 @@ def _single_arg_op_layout(
                 # reverse staggered-to-STANDARD restoration. It needs no
                 # expansion: preserve the stick selected before the upcast.
 
-                return layouts
+                # An unaligned input can rescale to a degenerate device size
+                # (e.g. a size-1 num-sticks dim rescaling to 0). Drop any such
+                # candidate rather than silently returning a broken layout;
+                # only raise if every candidate -- including the restickified
+                # alternatives above -- turned out degenerate.
+                valid_layouts = [
+                    layout
+                    for layout in layouts
+                    if all(size > 0 for size in layout.device_size)
+                ]
+                if not valid_layouts:
+                    output_layout = layouts[0]
+                    raise Unsupported(
+                        "Spyre staggered dtype conversion does not support an "
+                        "unaligned layout that produces a non-positive device "
+                        f"dimension: output_device_size={output_layout.device_size}, "
+                        f"input_device_size={stl.device_size}, "
+                        f"input_stick_size={stl.device_size[-1]}, "
+                        f"output_stick_size={get_elem_in_stick(output.dtype)}"
+                    )
+
+                return valid_layouts
 
             # Dense reconstruction from the output host size. When the input
             # stick dim is unaligned, force a full input-stick depth so stick
