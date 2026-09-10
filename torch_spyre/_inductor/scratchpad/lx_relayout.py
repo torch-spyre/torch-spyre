@@ -106,9 +106,10 @@ class RelayoutCandidate:
     not per edge.
 
     Each view carries the physical core count it was built for (every core's
-    owner slot within its split), so ``num_cores`` is the source view's; the
-    enumeration's ``cores_used`` gate guarantees the views were built for the
-    divisions being paired.
+    owner slot within its split), so ``num_cores`` is the source view's and
+    ``destination_num_cores`` the destination view's; the enumeration's
+    ``cores_used`` gates guarantee the views were built for the divisions
+    being paired.
 
     ``source_footprint_bytes`` / ``destination_footprint_bytes`` are the
     per-core LX spans of the two views (:func:`partition_footprint`, the bound
@@ -135,6 +136,14 @@ class RelayoutCandidate:
         ``num_cores``, as the committed collector records it)."""
         return cast(int, self.source_view.num_cores)
 
+    @property
+    def destination_num_cores(self) -> int:
+        """The consumer's core count, carried by the destination view: equal to
+        ``num_cores`` for permutations and gathers, a multiple of it for a
+        broadcast (#3440), where the copy lives on the destination's cores while
+        the plan's ``num_cores`` stays the source's."""
+        return cast(int, self.destination_view.num_cores)
+
     def __post_init__(self) -> None:
         for side, view in (
             ("source", self.source_view),
@@ -145,6 +154,14 @@ class RelayoutCandidate:
                     f"relayout candidate {self.parent} -> {self.consumer}: the {side} "
                     "view carries no physical core count"
                 )
+        if self.destination_num_cores < self.num_cores or (
+            self.destination_num_cores % self.num_cores
+        ):
+            raise ValueError(
+                f"relayout candidate {self.parent} -> {self.consumer}: destination "
+                f"on {self.destination_num_cores} cores is not a multiple of the "
+                f"source's {self.num_cores}"
+            )
         if self.source_view.same_partition(self.destination_view):
             raise ValueError(
                 f"relayout candidate {self.parent} -> {self.consumer} has equal "
@@ -256,6 +273,8 @@ class FiredRelayoutGroup:
                         first.candidate.destination_view
                     )
                     and m.candidate.num_cores == first.candidate.num_cores
+                    and m.candidate.destination_num_cores
+                    == first.candidate.destination_num_cores
                     and m.candidate.source_footprint_bytes
                     == first.candidate.source_footprint_bytes
                     and m.candidate.destination_footprint_bytes
@@ -586,69 +605,36 @@ def movement_supported(
     )
 
 
-def solver_relayout_movement_supported(
-    source: PerCoreView, destination: PerCoreView, num_cores: int
-) -> bool:
-    """The movement shapes the solver may PRICE: uniform full permutations only.
+def core_domain_rejection(source_num_cores: int, consumer_num_cores: int) -> str | None:
+    """Why a producer on ``source_num_cores`` may not feed a consumer on
+    ``consumer_num_cores`` through a relayout, from the core counts alone, or
+    ``None`` when they are compatible. Equal counts are always fine
+    (permutations and gathers). A larger consumer domain is a grouped broadcast
+    (#3440), which the emitter supports only onto every compute core; the
+    geometric half of that rule (an even multiple, one source per destination
+    core) is :func:`movement_supported`'s. Shared by the committed collector and
+    the solver's enumeration so the two paths cannot drift."""
+    if consumer_num_cores < source_num_cores:
+        return "cannot emit: consumer uses fewer physical cores than producer"
+    if consumer_num_cores > source_num_cores and consumer_num_cores != config.sencores:
+        return "cannot emit: grouped broadcast must target all compute cores"
+    return None
 
-    Two gates answer two different questions. The committed path's movement gate
-    (``_compatible_partitions`` today; ``movement_supported`` once the
-    ownership-flow rewrite lands, widened to grouped gathers and broadcasts by
-    #3440) decides what the emitter CAN move. This gate decides what the fitted
-    relayout law can price, which is narrower and must stay narrower however the
-    committed gate grows: ``relayout_ns`` was fitted on uniform permutations,
-    where every core sends to and receives from the same number of cores, both
-    sides have ``num_cores`` distinct owners, and both split products equal
-    ``num_cores``. Pricing a multicast or a broadcast with permutation constants
-    would hand the objective a number the law never measured, so such pairs are
-    declined here and stay unpriced until their own term is calibrated.
 
-    Deliberately self-contained (it shares only ``_core_slices`` with the
-    committed gate) so the committed gate can be replaced underneath without
-    the solver's admission set changing by accident. The contract is
-    "never looser than the committed gate", pinned by
-    ``test_solver_gate_is_never_looser_than_the_committed_gate``.
-    """
-    if source.same_partition(destination):
-        return False
-    source_rows = _core_slices(source, num_cores)
-    destination_rows = _core_slices(destination, num_cores)
-    source_splits = dict(source.work_slice_dims)
-    destination_splits = dict(destination.work_slice_dims)
-    if (
-        math.prod(source_splits.values()) != num_cores
-        or math.prod(destination_splits.values()) != num_cores
-    ):
-        return False
-    distinct = lambda rows: len({tuple(sorted(r.items())) for r in rows.values()})  # noqa: E731
-    if distinct(source_rows) != num_cores or distinct(destination_rows) != num_cores:
-        return False
-
-    def slices_overlap(a: int, an: int, b: int, bn: int) -> bool:
-        # Slot a of an equal parts against slot b of bn equal parts, as
-        # half-open intervals on the same unit axis.
-        return a * bn < (b + 1) * an and b * an < (a + 1) * bn
-
-    dims = set(source_splits) | set(destination_splits)
-    edges = {
-        (s_core, d_core)
-        for s_core, s_slice in source_rows.items()
-        for d_core, d_slice in destination_rows.items()
-        if all(
-            slices_overlap(
-                s_slice.get(dim, 0),
-                source_splits.get(dim, 1),
-                d_slice.get(dim, 0),
-                destination_splits.get(dim, 1),
-            )
-            for dim in dims
-        )
-    }
-    if not edges:
-        return False
-    fanout = {sum(src == core for src, _ in edges) for core in range(num_cores)}
-    fanin = {sum(dst == core for _, dst in edges) for core in range(num_cores)}
-    return len(fanout) == 1 and len(fanin) == 1
+def grouped_gather_rejection(
+    consumer: Operation, source_num_cores: int, destination_view: PerCoreView
+) -> str | None:
+    """Why ``consumer``'s ``destination_view`` may not be a grouped gather of a
+    producer on ``source_num_cores``, or ``None``. A destination with fewer
+    owners than the source has cores assembles each slice from several source
+    slices (#3440), which the emitter supports for a matmul consumer only; a
+    complete partition (a permutation) or a broadcast is not a gather and passes.
+    The consumer half of the rule; the geometry is :func:`movement_supported`'s.
+    Shared by the committed collector and the solver's enumeration."""
+    owners = math.prod(dict(destination_view.work_slice_dims).values())
+    if owners < source_num_cores and not _is_matmul_op(consumer):
+        return "cannot emit: grouped gather requires a matmul consumer"
+    return None
 
 
 def lx_solver_relayout() -> bool:
@@ -788,6 +774,8 @@ def solver_relayout_pair_cost(
     out_elems: int,
     dtype_bytes: int,
     params=None,
+    *,
+    destination_num_cores: int | None = None,
 ) -> float | None:
     """Price one candidate relayout (source view -> destination view), in ns.
 
@@ -796,11 +784,20 @@ def solver_relayout_pair_cost(
     - views with the same physical ownership need no relayout (that pair
       belongs to ``cd_parent_matches``), compared with ``same_partition`` so a
       differently spelled slot expression cannot masquerade as movement;
-    - ``solver_relayout_movement_supported`` rejects everything but a uniform
-      full permutation (``num_cores`` distinct owners on BOTH sides, split
-      products equal to ``num_cores``, uniform fanout/fanin) - grouped gathers
-      and broadcasts (#3440) fall out here and stay unpriced until their own
-      term is calibrated, whatever the committed path's movement gate admits;
+    - ``movement_supported``, the committed path's own gate (#3440), admits
+      what the emitter can move: uniform permutations, grouped gathers and
+      grouped broadcasts, so the solver never prices a movement the emitter
+      cannot execute; the enumeration adds the collector's consumer rules
+      (:func:`core_domain_rejection`, :func:`grouped_gather_rejection`) on top. A
+      grouped movement is priced by the same law as a permutation of the same
+      tensor on the SOURCE's cores, keyed on the finer side's geometry as
+      always: ``cores=num_cores`` makes the law's per-core bytes the source
+      slice, which is what every destination core receives in a broadcast. The
+      grouped-relayout sweep (2026-09-09, 43 rows) measured the grouped
+      shuffle's marginal cost at or below that law (<= 0.3 us gathers, <= 1.6
+      us broadcasts, flat in fan-out), so this over-states, never under-states,
+      the shuffle; the decision is dominated by the consumer's replicated HBM
+      re-read on the demote side, priced by the cost model since #4454;
     - a governing split outside the law's fitted range [2, 8] is DECLINED, not
       clamped: the reporting path clamps because the shuffle it prices already
       exists, but the solver must never be offered an option at a price the
@@ -809,11 +806,15 @@ def solver_relayout_pair_cost(
     The price is ``relayout_ns`` on a minimal feature vector - the same function
     the reporting path uses, so the two paths cannot drift.
 
-    Both views must be built FOR ``num_cores`` (every core's owner slot within
-    its split); the caller's cores_used equality gate guarantees that, and
-    ``_core_slices`` asserts it rather than tolerating an out-of-range slot.
+    Each view must be built FOR its own core count (every core's owner slot
+    within its split): the source for ``num_cores``, the destination for
+    ``destination_num_cores`` (the source's count when omitted). The caller's
+    cores_used gates guarantee that, and ``_core_slices`` asserts it rather
+    than tolerating an out-of-range slot.
     """
-    if not solver_relayout_movement_supported(source_view, destination_view, num_cores):
+    if not movement_supported(
+        source_view, destination_view, num_cores, destination_num_cores or num_cores
+    ):
         return None
     run_elems, split = governing_run_split(source_view, destination_view, device_dims)
     if run_elems <= 0 or not 2 <= split <= 8:
@@ -940,20 +941,12 @@ def collect_lx_relayout_plans(
                     "cannot represent: consumer ownership is unrepresentable"
                 )
                 break
-            if consumer_num_cores < source_num_cores:
-                rejection_reason = (
-                    "cannot emit: consumer uses fewer physical cores than producer"
-                )
+            rejection_reason = core_domain_rejection(
+                source_num_cores, consumer_num_cores
+            )
+            if rejection_reason is not None:
                 break
             is_matmul = _is_matmul_op(consumer)
-            if (
-                consumer_num_cores > source_num_cores
-                and consumer_num_cores != config.sencores
-            ):
-                rejection_reason = (
-                    "cannot emit: grouped broadcast must target all compute cores"
-                )
-                break
             consumer_coordinates = try_device_coordinates(
                 producer.layout.device_layout, dep, None
             )
@@ -976,6 +969,11 @@ def collect_lx_relayout_plans(
                 )
                 break
 
+            rejection_reason = grouped_gather_rejection(
+                consumer, source_num_cores, view
+            )
+            if rejection_reason is not None:
+                break
             destination_owners = math.prod(dict(view.work_slice_dims).values())
             if consumer_num_cores > source_num_cores:
                 failure = (
@@ -983,11 +981,6 @@ def collect_lx_relayout_plans(
                     "broadcast the source"
                 )
             elif destination_owners < source_num_cores:
-                if not is_matmul:
-                    rejection_reason = (
-                        "cannot emit: grouped gather requires a matmul consumer"
-                    )
-                    break
                 failure = (
                     "cannot emit: grouped destination does not evenly contract "
                     "the source"

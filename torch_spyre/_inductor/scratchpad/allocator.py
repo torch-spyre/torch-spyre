@@ -109,6 +109,8 @@ from torch_spyre._inductor.scratchpad.lx_relayout import (
     _unsupported_relayout_transition_reason,
     collect_lx_relayout_plans,
     FiredRelayoutGroup,
+    core_domain_rejection,
+    grouped_gather_rejection,
     lx_solver_relayout,
     LXRelayoutPlan,
     materialize_lx_relayouts,
@@ -2790,7 +2792,13 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                     if _candidate_tiled(consumer_divs[j]):
                         continue
                     ncores = parent_divs[i].cores_used
-                    if ncores != consumer_divs[j].cores_used:
+                    dst_cores = consumer_divs[j].cores_used
+                    # The committed collector's consumer rules (#3440): the core
+                    # domains, then the gather rule on the destination view; the
+                    # geometric half is movement_supported's, inside the pair cost.
+                    if core_domain_rejection(ncores, dst_cores):
+                        continue
+                    if grouped_gather_rejection(consumer_op, ncores, cv):
                         continue
                     if _projected(pv, prod_coords, prod_space, "prod") is None:
                         continue
@@ -2809,10 +2817,16 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                         is not None
                     ):
                         continue
-                    key = (pv, cv, ncores)
+                    key = (pv, cv, ncores, dst_cores)
                     if key not in pair_cost:
                         pair_cost[key] = solver_relayout_pair_cost(
-                            pv, cv, ncores, device_dims, out_elems, dtype_bytes
+                            pv,
+                            cv,
+                            ncores,
+                            device_dims,
+                            out_elems,
+                            dtype_bytes,
+                            destination_num_cores=dst_cores,
                         )
                     cost = pair_cost[key]
                     if cost is None:

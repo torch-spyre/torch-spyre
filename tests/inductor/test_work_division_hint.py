@@ -19,10 +19,7 @@ import json
 import logging
 import logging.handlers
 import math
-import os
-from pathlib import Path
 import regex as re
-import subprocess
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch as mock_patch
@@ -56,6 +53,7 @@ from torch_spyre._inductor.constants import (
 from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.ir import FixedTiledLayout
 from torch_spyre._inductor.loop_info import CarriedReductionRecord
+from utils_inductor import assert_lx_only_relayout_payload, capture_backend_output_dirs
 from torch_spyre._inductor.scratchpad.lx_relayout import (
     LXRelayoutPlan,
     work_division_from_view,
@@ -73,7 +71,6 @@ from torch_spyre._inductor.spyre_kernel import SpyreKernel, _iter_op_specs
 from torch_spyre._inductor.scratchpad.plan_solver import LifetimeBoundBuffer
 from torch_spyre._inductor.core_mapping import remap_work_division
 from torch_spyre._inductor.spyre_kernel import simplify_op_spec
-import torch_spyre.execution.async_compile as async_compile_module
 
 _LAUNCH_JOBPLAN = "torch_spyre.execution.kernel_runner.launch_jobplan"
 _PREPARE_KERNEL = "torch_spyre.execution.kernel_runner.prepare_kernel"
@@ -100,58 +97,8 @@ def _emitted_kernels():
         yield kernels
 
 
-@contextmanager
-def _capture_backend_output_dirs():
-    output_dirs = []
-    get_output_dir = async_compile_module.get_output_dir
-
-    def capture(kernel_name):
-        output_dir = get_output_dir(kernel_name)
-        output_dirs.append(Path(output_dir))
-        return output_dir
-
-    with mock_patch.object(async_compile_module, "get_output_dir", side_effect=capture):
-        yield output_dirs
-
-
-def _assert_lx_only_relayout_payload(output_dirs):
-    # Inspect the backend payload for the same bundle whose values were checked.
-    # This debug lowering is not a second device execution or a timing sample.
-    for output_dir in output_dirs:
-        subprocess.run(
-            ["dxp_standalone", "-d", output_dir, "--use-dxp"],
-            check=True,
-            env={**os.environ, "DXP_DEBUG": "1"},
-        )
-    payloads = [
-        json.loads(path.read_text())
-        for output_dir in output_dirs
-        for path in output_dir.glob("debug/sdsc_*/*.out.out.out.json")
-    ]
-    assert payloads, "DeepTools emitted no debug SDSC payloads"
-    nodes = []
-    pending = list(payloads)
-    while pending:
-        value = pending.pop()
-        if isinstance(value, dict):
-            nodes.append(value)
-            pending.extend(value.values())
-        elif isinstance(value, list):
-            pending.extend(value)
-    lx_ops = [
-        node
-        for node in nodes
-        if isinstance(node.get("op"), dict) and node["op"].get("name") == "STCDPOpLx"
-    ]
-    assert len(lx_ops) == 1
-    op_names = [node["name"] for node in nodes if isinstance(node.get("name"), str)]
-    assert not any(
-        token in name.lower()
-        for name in op_names
-        for token in ("dma", "restickify", "stcdpophbm")
-    )
-    labeled_ds = lx_ops[0]["labeledDs_"]
-    assert labeled_ds and all(ds["hbmSize_"] == 0 for ds in labeled_ds)
+_capture_backend_output_dirs = capture_backend_output_dirs
+_assert_lx_only_relayout_payload = assert_lx_only_relayout_payload
 
 
 class TestNamedWorkDivisionHint(InductorTestCase):

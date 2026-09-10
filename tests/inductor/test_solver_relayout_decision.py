@@ -62,14 +62,15 @@ _CORE = sympy.Symbol("core_id")
 _PER_CORE = 16  # P is 64 bytes sliced 4 ways
 
 
-def _view(slot: int) -> PerCoreView:
-    """A 4-way per-core view of device dim 1; ``slot`` rotates the ownership so
-    distinct slots are distinct (relayout-compatible) views."""
-    return PerCoreView(((1, 4),), ((1, sympy.Mod(_CORE + slot, 4)),), 4)
+def _view(slot: int, num_cores: int = 4) -> PerCoreView:
+    """A 4-way per-core view of device dim 1 on ``num_cores`` cores; ``slot``
+    rotates the ownership so distinct slots are distinct (relayout-compatible)
+    views. More cores than owners is a broadcast destination."""
+    return PerCoreView(((1, 4),), ((1, sympy.Mod(_CORE + slot, 4)),), num_cores)
 
 
 def _candidate(
-    consumer, i, cost_ns, group=0, j=0, destination_span=16
+    consumer, i, cost_ns, group=0, j=0, destination_span=16, destination_cores=4
 ) -> RelayoutCandidate:
     """The priced candidate the allocator would enumerate for P -> consumer under
     source division ``i`` / consumer division ``j``, landing on destination
@@ -83,7 +84,7 @@ def _candidate(
         consumer_division=j,
         group=group,
         source_view=_view(0),
-        destination_view=_view(group + 1),
+        destination_view=_view(group + 1, destination_cores),
         cost_ns=cost_ns,
         # P is 64 bytes over 4 cores; a permutation of an outer split keeps
         # the equal share as its per-core span on both sides.
@@ -191,6 +192,66 @@ def test_copy_is_sized_by_the_destination_span_not_the_source_share():
     c3 = _consumer("C3", 2, 3, [_candidate("C3", 0, 5000.0, destination_span=32)])
     with pytest.raises(AssertionError, match="mixes destination spans"):
         CoOptimizingAllocator._relayout_copy_buffers([p, c1, c3])
+
+
+def test_a_broadcast_copy_lives_on_the_destination_cores():
+    """A source on 4 cores feeding a matmul on 8 (#3440 broadcast): the copy is
+    the destination, so it is sliced the destination's way, one span per
+    destination core, while the plan keeps the source's core count."""
+    p = _producer([0, 3])
+    c = _consumer(
+        "C",
+        1,
+        2,
+        [_candidate("C", 0, 5000.0, destination_span=48, destination_cores=8)],
+    )
+    (copy,) = CoOptimizingAllocator._relayout_copy_buffers([p, c])
+    assert copy.num_cores == 8 and copy.size == 48 * 8 and copy.min_footprint == 48
+    (group,) = FiredRelayoutGroup.from_chosen(
+        [ChosenRelayout(_candidate("C", 0, 5000.0, destination_cores=8), 16)]
+    )
+    plan = group.plan(source_address=0)
+    assert plan.num_cores == 4, "the plan's core count is the source's (#3440)"
+    assert plan.destination_view.num_cores == 8
+    with pytest.raises(ValueError, match="not a multiple"):
+        _candidate("C", 0, 5000.0, destination_cores=6)
+    with pytest.raises(ValueError, match="no physical core count"):
+        RelayoutCandidate("P", "C", 0, 0, 0, _view(0), _view(1, None), 1.0, 16, 16)
+    with pytest.raises(AssertionError, match="mixes destination core counts"):
+        CoOptimizingAllocator._relayout_copy_buffers(
+            [p, c, _consumer("D", 1, 2, [_candidate("D", 0, 5000.0)])]
+        )
+
+
+def test_one_destination_may_be_fed_from_sources_on_different_core_counts():
+    """A producer's division menu spans core counts; under broadcast admission
+    several of its divisions can land on the same 32-core matmul view. The copy
+    is that view, so it is built once, and each source division keeps its own
+    price in the table."""
+    p = _producer([0, 3], divisions=2)
+    c = _consumer(
+        "C",
+        1,
+        2,
+        [
+            _candidate("C", 0, 5000.0, destination_cores=8),  # source on 4 cores
+            RelayoutCandidate(
+                parent="P",
+                consumer="C",
+                source_division=1,
+                consumer_division=0,
+                group=0,
+                source_view=_view(0, 2),  # a source division on 2 cores
+                destination_view=_view(1, 8),
+                cost_ns=3000.0,
+                source_footprint_bytes=32,
+                destination_footprint_bytes=16,
+            ),
+        ],
+    )
+    (copy,) = CoOptimizingAllocator._relayout_copy_buffers([p, c])
+    assert copy.num_cores == 8 and copy.size == 16 * 8
+    assert copy.cost_by_source_division == {0: 5000.0, 1: 3000.0}
 
 
 def test_plan_carries_the_measured_spans():

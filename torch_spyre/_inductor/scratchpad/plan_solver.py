@@ -450,9 +450,11 @@ class RelayoutCopyBuffer(CoreDivisionBuffer):
 
     ``size`` is the destination's per-core span (the candidates'
     ``destination_footprint_bytes``, the bound the committed path reserves for
-    a relayout destination) times ``num_cores``, and ``core_divisions`` holds one
-    division sliced ``num_cores`` ways, so the per-core footprint every engine
-    derives (``size / output_partition``) is exactly that span. ``parents`` is
+    a relayout destination) times the DESTINATION's core count, and
+    ``core_divisions`` holds one division sliced that many ways, so the
+    per-core footprint every engine derives (``size / output_partition``) is
+    exactly that span. For a broadcast the copy therefore lives on the
+    consumer's cores while its source stays on fewer. ``parents`` is
     deliberately empty: the source edge is a relayout coupling, not a
     slicing-match edge, and listing it would make engines that gate residency on
     ``cd_parent_matches`` refuse the source outright.
@@ -530,9 +532,15 @@ def build_relayout_copy(
         )
     )
     assert ordered, f"relayout group {parent.name}/g{group} has no candidates"
-    cores = {c.num_cores for c in ordered}
+    # The copy is the destination: its geometry is the destination view's span on
+    # the destination's cores. Candidates on one destination view may come from
+    # source divisions on DIFFERENT core counts (a producer's menu spans 1..32
+    # cores; every one of them may broadcast to a 32-core matmul consumer), each
+    # priced by its own source division, so only the destination count must agree.
+    cores = {c.destination_num_cores for c in ordered}
     assert len(cores) == 1, (
-        f"relayout group {parent.name}/g{group} mixes core counts {sorted(cores)}"
+        f"relayout group {parent.name}/g{group} mixes destination core counts "
+        f"{sorted(cores)}"
     )
     assert all(c.parent == parent.name and c.group == group for c in ordered)
     # One destination view per group, hence one span; the candidates were

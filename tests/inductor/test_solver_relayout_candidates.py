@@ -22,15 +22,17 @@ drift apart.
 """
 
 import pytest
-from sympy import Mod, Symbol, floor
+from sympy import Eq, Mod, Piecewise, Symbol, floor
 
 from torch_spyre._inductor.dump_cost_model import governing_run_split
 from torch_spyre._inductor.pass_utils import PerCoreView
 from torch_spyre._inductor.scratchpad import lx_relayout
 from torch_spyre._inductor.scratchpad.allocator import _intern_view_group
+from torch_spyre._inductor import config
 from torch_spyre._inductor.scratchpad.lx_relayout import (
+    core_domain_rejection,
+    grouped_gather_rejection,
     RelayoutCandidate,
-    solver_relayout_movement_supported,
     solver_relayout_pair_cost,
 )
 
@@ -88,18 +90,24 @@ def test_equal_views_are_not_a_relayout():
     )
 
 
-def test_grouped_gather_is_declined():
+def test_grouped_gather_is_priced_like_a_permutation_of_the_same_tensor():
     # Destination with 4 distinct owners on 8 cores is a grouped gather
-    # (#3440): a multicast, not a permutation. Its term is uncalibrated, so
-    # the enumeration must decline to price it rather than use permutation
-    # constants (same stance as the extractor).
-    grouped = PerCoreView(((2, 4),), ((2, Mod(_CORE_ID, 4)),))
-    assert (
-        solver_relayout_pair_cost(
-            _SRC, grouped, 8, _DEVICE_DIMS, _OUT_ELEMS, _DTYPE_BYTES
-        )
-        is None
+    # (#3440): each destination slice is assembled from two source slices and
+    # held by two cores. The sweep measured the grouped shuffle at or below the
+    # permutation law, so it is priced by that law on the finer side's geometry,
+    # exactly as a permutation between the same two views would be.
+    grouped = PerCoreView(((2, 4),), ((2, Mod(_CORE_ID, 4)),), num_cores=8)
+    cost = solver_relayout_pair_cost(
+        _SRC, grouped, 8, _DEVICE_DIMS, _OUT_ELEMS, _DTYPE_BYTES
     )
+    assert cost is not None and cost > 0
+    run, split = governing_run_split(_SRC, grouped, _DEVICE_DIMS)
+    assert (run, split) == governing_run_split(_SRC, _SRC, _DEVICE_DIMS), (
+        "the source is the finer side of a gather and governs the price"
+    )
+    assert cost == solver_relayout_pair_cost(
+        _SRC, _DST, 8, _DEVICE_DIMS, _OUT_ELEMS, _DTYPE_BYTES
+    ), "same tensor, same cores, same governing geometry: same price"
 
 
 def test_split_past_fitted_range_is_declined_not_clamped():
@@ -193,13 +201,6 @@ def test_coarse_tiled_endpoints_are_declined_at_the_edge_gate():
 # declined whatever the committed gate says.
 
 
-def _committed_gate(source, destination, num_cores):
-    """The committed path's movement gate under either spelling of the stack."""
-    if hasattr(lx_relayout, "_compatible_partitions"):
-        return lx_relayout._compatible_partitions(source, destination, num_cores)
-    return lx_relayout.movement_supported(source, destination, num_cores, num_cores)
-
-
 # Two owners replicated over eight cores (a broadcast source), and the same
 # ownership as _SRC's dim-2 quarter spelled two ways over four cores.
 _TWO_OWNERS_ON_8 = PerCoreView(((2, 2),), ((2, Mod(_CORE_ID, 2)),), num_cores=8)
@@ -208,50 +209,6 @@ _QUARTER_MOD = PerCoreView(((2, 4),), ((2, Mod(_CORE_ID, 4)),), num_cores=4)
 _HALF_ON_4 = PerCoreView(
     ((0, 2), (2, 2)), ((0, floor(_CORE_ID / 2)), (2, Mod(_CORE_ID, 2))), num_cores=4
 )
-
-_GATE_CASES = [
-    # (source, destination, num_cores, solver_admits)
-    pytest.param(_SRC, _DST, 8, True, id="canonical_permutation"),
-    pytest.param(_DST, _SRC, 8, True, id="canonical_permutation_reversed"),
-    pytest.param(_SRC, _SRC, 8, False, id="same_view"),
-    pytest.param(
-        _QUARTER_PLAIN, _QUARTER_MOD, 4, False, id="same_ownership_two_spellings"
-    ),
-    pytest.param(_QUARTER_PLAIN, _HALF_ON_4, 4, True, id="permutation_on_4"),
-    pytest.param(
-        _SRC,
-        PerCoreView(((2, 4),), ((2, Mod(_CORE_ID, 4)),), num_cores=8),
-        8,
-        False,
-        id="grouped_gather",
-    ),
-    pytest.param(_TWO_OWNERS_ON_8, _SRC, 8, False, id="broadcast_2_to_8"),
-    pytest.param(_SRC, _TWO_OWNERS_ON_8, 8, False, id="gather_8_to_2"),
-    pytest.param(_SRC, _DST, 4, False, id="split_product_not_core_count"),
-]
-
-
-@pytest.mark.parametrize("source, destination, num_cores, solver_admits", _GATE_CASES)
-def test_solver_gate_is_never_looser_than_the_committed_gate(
-    source, destination, num_cores, solver_admits
-):
-    # A view built for 8 cores asked about 4 is a caller error inside
-    # _core_slices (it raises); the gate contract is "declined", as for the
-    # pair cost, so treat a raise as a decline here.
-    try:
-        solver = solver_relayout_movement_supported(source, destination, num_cores)
-    except ValueError:
-        solver = False
-    assert solver is solver_admits
-    if solver:
-        try:
-            committed = _committed_gate(source, destination, num_cores)
-        except (TypeError, ValueError):
-            committed = False
-        assert committed, (
-            "the solver admitted a movement the committed path cannot emit; the "
-            "solver gate must never be looser than the committed gate"
-        )
 
 
 def test_same_ownership_in_two_spellings_is_not_a_relayout():
@@ -301,6 +258,53 @@ def test_candidate_without_a_measured_span_is_rejected():
         )
 
 
+# Two complete column slices on 2 cores, each fed to four of 8 destination cores
+# (#3440's "larger domain" broadcast case), and the same ownership described on
+# a core domain that is not the transfer's.
+_TWO_ON_2 = PerCoreView(((0, 2),), ((0, Mod(_CORE_ID, 2)),), num_cores=2)
+_FOUR_ON_8 = PerCoreView(
+    ((0, 4),),
+    (
+        (
+            0,
+            Piecewise(
+                (0, Eq(_CORE_ID, 0)), (1, _CORE_ID < 4), (2, Eq(_CORE_ID, 4)), (3, True)
+            ),
+        ),
+    ),
+    num_cores=8,
+)
+_TWO_ON_4 = PerCoreView(((0, 2),), ((0, Mod(_CORE_ID, 2)),), num_cores=4)
+_TWO_ON_32 = PerCoreView(((0, 2),), ((0, floor(_CORE_ID / 16)),), num_cores=32)
+
+
+def test_broadcast_to_a_larger_core_domain_is_admitted_and_priced():
+    """A broadcast crosses core counts; the price takes the destination's for
+    the gate and prices on the SOURCE's cores: the law's per-core bytes are then
+    the source slice, which is what every destination core receives, and the
+    sweep found broadcast time flat in fan-out."""
+    assert lx_relayout.movement_supported(_TWO_ON_2, _FOUR_ON_8, 2, 8)
+    dims = [256, 8, 8, 64]
+    cost = solver_relayout_pair_cost(
+        _TWO_ON_2, _FOUR_ON_8, 2, dims, 256 * 8 * 8 * 64, 2, destination_num_cores=8
+    )
+    assert cost is not None and cost > 0
+    # Ownership described on another core domain than the transfer: declined.
+    assert not lx_relayout.movement_supported(_TWO_ON_4, _TWO_ON_32, 2, 32)
+    assert (
+        solver_relayout_pair_cost(
+            _TWO_ON_4,
+            _TWO_ON_32,
+            2,
+            dims,
+            256 * 8 * 8 * 64,
+            2,
+            destination_num_cores=32,
+        )
+        is None
+    )
+
+
 def test_destination_views_are_interned_by_ownership():
     """Two consumers whose candidates land on the same physical view of one
     parent must share ONE group (one shuffle serves both), even when the two
@@ -311,3 +315,25 @@ def test_destination_views_are_interned_by_ownership():
     assert _intern_view_group(groups, _HALF_ON_4) == 1  # different owners -> new group
     assert _intern_view_group(groups, _QUARTER_PLAIN) == 0
     assert list(groups) == [_QUARTER_PLAIN, _HALF_ON_4]  # first spelling stays the key
+
+
+def test_consumer_rules_are_shared_with_the_committed_collector(monkeypatch):
+    """The consumer half of #3440's movement rules, one function per rule, used
+    by the committed collector and the solver's enumeration alike: the core
+    domains must be equal or the consumer must span every compute core, and a
+    grouped gather (fewer destination owners than source cores) needs a matmul
+    consumer, while a permutation or a broadcast destination does not."""
+    matmul, pointwise = object(), object()
+    monkeypatch.setattr(lx_relayout, "_is_matmul_op", lambda op: op is matmul)
+    with config.patch({"sencores": 32}):
+        assert core_domain_rejection(8, 8) is None
+        assert core_domain_rejection(2, 32) is None
+        assert "fewer physical cores" in core_domain_rejection(32, 8)
+        assert "all compute cores" in core_domain_rejection(2, 16)
+    grouped = PerCoreView(((2, 4),), ((2, Mod(_CORE_ID, 4)),), num_cores=8)
+    assert grouped_gather_rejection(matmul, 8, grouped) is None
+    assert "requires a matmul consumer" in grouped_gather_rejection(
+        pointwise, 8, grouped
+    )
+    assert grouped_gather_rejection(pointwise, 8, _DST) is None  # a permutation
+    assert grouped_gather_rejection(pointwise, 2, _FOUR_ON_8) is None  # a broadcast
