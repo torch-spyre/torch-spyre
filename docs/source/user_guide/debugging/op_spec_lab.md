@@ -55,6 +55,7 @@ emitted file is one kernel, not one operation. The softmax above is six.
 | `--kernel NAME` | Only emit kernels whose name contains `NAME` |
 | `--save-inputs` | Dump recorded argument values to a `.pt`, for a replay whose inputs are the real ones. Without it, integer args replay as zeros |
 | `--no-execute` | Stub the backend compile and launch, so no device is needed |
+| `--emitter ktir` | Target the KTIR emitter instead of SuperDSC. See [Capturing for KTIR](#capturing-for-ktir) |
 | `--no-explain-header` | Omit the decoded explanation from each emitted file |
 
 The stale-`fxgraph`-cache trap is handled for you: `capture.py` patches
@@ -84,6 +85,7 @@ torch-spyre installed. This is the header of
 # Source program:  <your checkout>/tests/op_specs/programs/01_add.py
 # Kernel:          1 of 1 compiled from that program
 # Environment:     torch 2.13.0+cpu, SENCORES=32, bundle_symbolic_args=True
+# Emitter:         sdsc (generate_bundle)
 # Kernel args:     3 in the spec, 3 observed at .run()
 #
 # Run it:
@@ -142,6 +144,44 @@ device and no `dxp_standalone`, so it is the stage to use when the question is
 Then edit a field and re-run. That is the whole point of the file being
 standalone: change a `device_size`, a work division or a coordinate expression,
 diff the resulting `bundle.mlir`, and you are probing the backend directly.
+
+### Capturing for KTIR
+
+`--stage ktir` is the same stage for the other emitter: it writes
+`<kernel>.ktir` — the [KTDP-dialect MLIR](../../compiler/ktir.md) that
+`generate_ktir` produces from the same OpSpec list — and stops. It needs no
+device and no `dbo-opt`, only the `mlir_ktdp` bindings (`uv sync --group ktir`).
+
+A script captured on the default path cannot use it. The buffer names
+`generate_ktir` keys its register threading on are populated by
+`create_tensor_arg` only under `config.ktir_emitter`, so an SDSC capture carries
+`name=None` everywhere and emission refuses it. Capture with `--emitter ktir`
+instead, which turns that config on for the run:
+
+```bash
+python tests/op_specs/capture.py my_repro.py --emitter ktir --no-execute --out captured/
+python captured/ktir_fused_add_0.py --stage ktir
+```
+
+The header names which emitter compiled each kernel, and the emitted script pins
+it: a KTIR capture's `--stage run` goes through `async_compile.ktir`, never
+`sdsc`. That is not a preference. Under the KTIR emitter a spec's HBM addresses
+may be baked absolute rather than symbolic, and `generate_bundle` rejects those
+outright rather than miscompile them — so the emitter that built a spec is the
+one certain to accept it, and the header offers that stage alone. Both stages
+stay on the CLI for the cases where the other emitter does accept the spec.
+
+Two things follow from `--emitter ktir` being a *capture-time* choice:
+
+- **It works with no device and no backend compiler at all.** Canonical KTIR
+  spells base addresses as func arguments and never reads `allocation["hbm"]`, so
+  `BUNDLE_SYMBOLIC_ARGS=1` — the default — is fine. With `--no-execute` the whole
+  loop runs on a laptop.
+- **Expect refusals.** The emitter is narrower than SuperDSC today: LX and
+  HBM-pool intermediates are either threaded as SSA values or refused, and one
+  kernel whose ops disagree about work division cannot share a grid. Those arrive
+  as `Unimplemented` with a label naming the capability, which is the emitter
+  telling you what it does not build yet — not a broken capture.
 
 ### 4. Interpret
 
