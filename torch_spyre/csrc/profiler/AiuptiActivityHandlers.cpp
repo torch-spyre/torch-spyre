@@ -174,6 +174,8 @@ inline std::string runtimeCbidName(AIUpti_runtime_api_trace_cbid cbid) {
       return "aiuIssueCallback";
     case AIUPTI_RUNTIME_TRACE_CBID_VERIFY_ASYC_MSGS:
       return "aiuVerifyAsyncMsgs";
+    case AIUPTI_RUNTIME_TRACE_CBID_SUBMIT_TO_HARDWARE:
+      return "aiuSubmitToHardware";
     default:
       break;
   }
