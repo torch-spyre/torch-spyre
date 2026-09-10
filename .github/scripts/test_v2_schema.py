@@ -19,11 +19,13 @@ class FakeClient:
     def __init__(self, known=()):
         self.known = list(known)
         self.inserts = []
+        self.queries = []
 
-    def insert(self, table, rows, column_names=None):
-        self.inserts.append((table, rows, column_names))
+    def insert(self, table, rows, column_names=None, database=None):
+        self.inserts.append((table, rows, column_names, database))
 
     def query(self, sql, parameters=None):
+        self.queries.append(sql)
         asked = set(parameters["ids"])
 
         class R:
@@ -35,8 +37,8 @@ class FakeClient:
 # ── column order is the pre-refactor order, exactly ─────────────────────────────────────
 
 
-def test_column_order_matches_the_pre_refactor_lists():
-    # These are the literal column_names lists the three scripts passed before the refactor.
+def test_column_order_matches_the_ddl():
+    # The DDL's column order, which is what an insert without column_names would rely on.
     assert list(TEST_CASES.columns) == [
         "test_case_id",
         "component",
@@ -53,10 +55,17 @@ def test_column_order_matches_the_pre_refactor_lists():
         "fail_message",
         "props",
     ]
-    assert list(BENCHMARKS.columns) == ["benchmark_id", "name", "tags", "props"]
+    assert list(BENCHMARKS.columns) == [
+        "benchmark_id",
+        "component",
+        "name",
+        "tags",
+        "props",
+    ]
     assert list(BENCHMARK_RUNS.columns) == [
         "run_id",
         "benchmark_id",
+        "component",
         "backend",
         "measurements",
         "iterations",
@@ -182,7 +191,7 @@ def test_insert_passes_column_names_and_ordered_rows():
         ],
     )
     assert n == 1
-    table, rows, cols = c.inserts[0]
+    table, rows, cols, _db = c.inserts[0]
     assert table == "test_case_runs"
     assert cols == list(TEST_CASE_RUNS.columns)
     assert rows == [["r", "t", "c", "passed", 0.5, "", {"source_file": "a.xml"}]]
@@ -305,3 +314,59 @@ def test_props_may_be_empty_when_no_source_file_is_known():
         }
     )
     assert row[-1] == {}
+
+
+# ── the db qualifier: one client, two generations ────────────────────────────────────────
+
+
+def test_qualified_prefixes_the_database_when_given():
+    assert TEST_CASE_RUNS.qualified("spyre_v2") == "spyre_v2.test_case_runs"
+
+
+def test_qualified_stays_bare_without_a_database():
+    # "" and None both mean "the connection's own database" -- v1's callers pass neither.
+    assert TEST_CASE_RUNS.qualified("") == "test_case_runs"
+    assert TEST_CASE_RUNS.qualified(None) == "test_case_runs"
+
+
+def test_insert_routes_rows_to_the_named_database():
+    """The whole point of the single-client refactor: `benchmark_runs` exists in v1 AND v2
+    with incompatible shapes, so the database must travel with the CALL."""
+    c = FakeClient()
+    insert(
+        c,
+        BENCHMARK_RUNS,
+        [
+            {
+                "run_id": "r",
+                "benchmark_id": "b",
+                "component": "torch-spyre",
+                "backend": "cpu",
+                "measurements": {"m": 1.0},
+                "iterations": 1,
+                "props": {},
+            }
+        ],
+        db="spyre_v2",
+    )
+    assert c.inserts[0][3] == "spyre_v2"
+
+
+def test_identity_dedup_reads_the_named_database():
+    c = FakeClient()
+    insert_identities(
+        c,
+        TEST_CASES,
+        {
+            "i": {
+                "test_case_id": "i",
+                "component": "c",
+                "classname": "k",
+                "name": "n",
+                "tags": [],
+            }
+        },
+        db="spyre_v2",
+    )
+    assert "spyre_v2.test_cases" in c.queries[0]
+    assert c.inserts[0][3] == "spyre_v2"

@@ -85,7 +85,7 @@ inputs:
     default: ''
   clickhouse-db-v2:
     description: >
-      Schema-v2 database. A SEPARATE connection from clickhouse-db, because test_cases and
+      Schema-v2 database. Every v2 statement is qualified with it, because test_cases and
       benchmark_runs exist in both generations with incompatible shapes. Empty makes the v2
       write a no-op, so an un-updated caller is unaffected.
     required: false
@@ -209,8 +209,8 @@ runs:
         [ -n "${CH_PORT_IN}" ] && export CLICKHOUSE_PORT="${CH_PORT_IN}"
         [ -n "${CH_USER_IN}" ] && export CLICKHOUSE_USER="${CH_USER_IN}"
         [ -n "${CH_DB_IN}" ] && export CLICKHOUSE_DB="${CH_DB_IN}"
-        # Only exported when non-empty: get_v2_client() treats an unset value as "v2 not
-        # configured" and opens no second connection, which is what makes the default free.
+        # Only exported when non-empty: v2_database() treats an unset value as "v2 not
+        # configured", which is what makes the v1 default cost nothing.
         [ -n "${CH_DB_V2_IN}" ] && export CLICKHOUSE_DB_V2="${CH_DB_V2_IN}"
         [ -n "${SCHEMA_IN}" ] && export INGEST_SCHEMA="${SCHEMA_IN}"
         # Only pass --platform when non-empty; an empty value would override the

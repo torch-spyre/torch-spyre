@@ -475,17 +475,18 @@ def v2_benchmark_id(component: str, name: str, tags, disc=None) -> str:
     )
 
 
-def v2_benchmark_tables_present(client) -> bool:
-    return _table_exists(client, "benchmarks") and _table_exists(
-        client, "benchmark_runs"
+def v2_benchmark_tables_present(client, db: str) -> bool:
+    return _table_exists(client, "benchmarks", db) and _table_exists(
+        client, "benchmark_runs", db
     )
 
 
-def v2_benchmarks_already_ingested(client, run_id: str) -> bool:
+def v2_benchmarks_already_ingested(client, db: str, run_id: str) -> bool:
     """benchmark_runs is a plain MergeTree with no dedup key, so a re-ingest
     doubles every measurement behind an average."""
     rows = client.query(
-        "SELECT count() FROM benchmark_runs WHERE run_id = {run_id:UUID}",
+        f"SELECT count() FROM {v2_schema.BENCHMARK_RUNS.qualified(db)} "
+        "WHERE run_id = {run_id:UUID}",
         parameters={"run_id": run_id},
     ).result_rows
     return bool(rows and rows[0][0] > 0)
@@ -513,7 +514,7 @@ def _v2_bench_backend(rec: dict) -> str:
     return "torch-spyre"
 
 
-def insert_benchmarks_v2(client, run_id: str, records: list) -> int:
+def insert_benchmarks_v2(client, db: str, run_id: str, records: list) -> int:
     """Write benchmarks (identity) + benchmark_runs (measurements) for one run.
 
     Dropped from v2 deliberately: regression_status and ratio (verdicts with no
@@ -544,37 +545,27 @@ def insert_benchmarks_v2(client, run_id: str, records: list) -> int:
             # nothing is a parse failure, not a result.
             skipped += 1
             continue
-        ident_rows[bid] = [bid, V2_BENCH_COMPONENT, name, tags, props]
+        ident_rows[bid] = {
+            "benchmark_id": bid,
+            "component": V2_BENCH_COMPONENT,
+            "name": name,
+            "tags": tags,
+            "props": props,
+        }
         num_runs = rec.get("num_runs")
         fact_rows.append(
-            [
-                run_id,
-                bid,
-                V2_BENCH_COMPONENT,
-                _v2_bench_backend(rec),
-                measurements,
-                int(num_runs) if num_runs is not None else 0,
-                {},
-            ]
+            {
+                "run_id": run_id,
+                "benchmark_id": bid,
+                "component": V2_BENCH_COMPONENT,
+                "backend": _v2_bench_backend(rec),
+                "measurements": measurements,
+                "iterations": int(num_runs) if num_runs is not None else 0,
+                "props": {},
+            }
         )
-    client.insert(
-        "benchmarks",
-        v2_new_identity_rows(client, "benchmarks", "benchmark_id", ident_rows),
-        column_names=["benchmark_id", "component", "name", "tags", "props"],
-    )
-    client.insert(
-        "benchmark_runs",
-        fact_rows,
-        column_names=[
-            "run_id",
-            "benchmark_id",
-            "component",
-            "backend",
-            "measurements",
-            "iterations",
-            "props",
-        ],
-    )
+    v2_schema.insert_identities(client, v2_schema.BENCHMARKS, ident_rows, db=db)
+    v2_schema.insert(client, v2_schema.BENCHMARK_RUNS, fact_rows, db=db)
     if skipped:
         print(
             f"  [warn] v2: {skipped} benchmark(s) skipped -- no derivable "
@@ -654,11 +645,16 @@ def _absent_columns(client, table: str, columns) -> set[str]:
     return {c for c in columns if c not in present}
 
 
-def _table_exists(client, table: str) -> bool:
+def _table_exists(client, table: str, db: str = "") -> bool:
+    """Does `table` exist in `db` (default: the connection's own database)?
+
+    Explicit db rather than currentDatabase(): one client now serves both generations, so
+    "which database" is a property of the CALL, not of the connection.
+    """
     rows = client.query(
         "SELECT count() FROM system.tables "
-        "WHERE database = currentDatabase() AND name = {t:String}",
-        parameters={"t": table},
+        "WHERE database = {db:String} AND name = {t:String}",
+        parameters={"db": db or client.database, "t": table},
     ).result_rows
     return bool(rows and rows[0][0])
 
@@ -931,33 +927,27 @@ def parse_test_xml(xml_path: Path):
 # ---------------------------------------------------------------------------
 
 
-def get_client(database: str | None = None):
+def get_client():
     return clickhouse_connect.get_client(
         host=os.environ["CLICKHOUSE_HOST"],
         port=int(os.environ.get("CLICKHOUSE_PORT", 443)),
         user=os.environ.get("CLICKHOUSE_USER", "default"),
         password=os.environ["CLICKHOUSE_PASS"],
-        database=database or os.environ.get("CLICKHOUSE_DB", "spyre"),
+        database=os.environ.get("CLICKHOUSE_DB", "spyre"),
         secure=True,
     )
 
 
-def get_v2_client():
-    """A SECOND connection, bound to the v2 database, or None when none is configured.
+def v2_database() -> str:
+    """The v2 database name, or "" when v2 is not configured.
 
-    v2 needs its own connection rather than sharing v1's: `benchmark_runs` exists in BOTH
-    generations with incompatible shapes -- v1's has (run_id UInt64, source_file), v2's has
-    (run_id UUID) and no source_file -- so the two dedup queries, both naming the table
-    unqualified, cannot both resolve correctly through one `database=`. Verified on prod:
-    spyre.benchmark_runs has source_file, spyre_v2.benchmark_runs does not.
-
-    Returns None when CLICKHOUSE_DB_V2 is unset, which is what makes --schema v1 (the default)
-    cost nothing: no second connection is opened.
+    A NAME rather than a second connection: the same instance holds both generations, so one
+    client serves both provided every v2 statement is QUALIFIED. Qualifying is not optional --
+    `benchmark_runs` exists in both with incompatible shapes (v1 has run_id UInt64 +
+    source_file, v2 has run_id UUID and no source_file), so an unqualified name resolves
+    against whichever database the connection holds and silently hits the wrong table.
     """
-    db = os.environ.get("CLICKHOUSE_DB_V2", "").strip()
-    if not db:
-        return None
-    return get_client(database=db)
+    return os.environ.get("CLICKHOUSE_DB_V2", "").strip()
 
 
 def insert_run(client, run_id: str, run: dict, args):
@@ -1227,16 +1217,16 @@ def v2_source_and_external_run_id(args, run_id: str):
     return "local", run_id
 
 
-def v2_tables_present(client) -> bool:
+def v2_tables_present(client, db: str) -> bool:
     """v2 write path is skipped unless BOTH tables exist, so this script can be
     deployed before the migration without erroring on every run."""
-    return _table_exists(client, "test_case_runs") and _table_exists(
-        client, "test_cases"
+    return _table_exists(client, "test_case_runs", db) and _table_exists(
+        client, "test_cases", db
     )
 
 
 def v2_already_ingested(
-    client, run_id: str, component: str, source_file: str = ""
+    client, db: str, run_id: str, component: str, source_file: str = ""
 ) -> bool:
     """Has THIS source file's rows for this run already landed?
 
@@ -1252,9 +1242,10 @@ def v2_already_ingested(
     `props['source_file']` carries the discriminator. props is a Map outside every key, so
     recording it costs no sort-order change.
     """
+    table = v2_schema.TEST_CASE_RUNS.qualified(db)
     if source_file:
         rows = client.query(
-            "SELECT count() FROM test_case_runs "
+            f"SELECT count() FROM {table} "
             "WHERE component = {component:String} AND run_id = {run_id:UUID} "
             "AND props['source_file'] = {sf:String}",
             parameters={"component": component, "run_id": run_id, "sf": source_file},
@@ -1263,38 +1254,15 @@ def v2_already_ingested(
         # No discriminator given: fall back to the run-level check rather than skip
         # dedup entirely, so a caller that cannot name the file is still protected.
         rows = client.query(
-            "SELECT count() FROM test_case_runs "
+            f"SELECT count() FROM {table} "
             "WHERE component = {component:String} AND run_id = {run_id:UUID}",
             parameters={"component": component, "run_id": run_id},
         ).result_rows
     return bool(rows and rows[0][0] > 0)
 
 
-def v2_new_identity_rows(client, table: str, id_col: str, ident_rows: dict) -> list:
-    """Return only the identity rows this dimension does not already hold.
-
-    Both dimensions are plain MergeTree, so re-inserting a known identity appends a
-    duplicate row rather than collapsing it: one benchmark seen in 36 runs became 36
-    rows, and every reader then has to remember to dedup. Deduping in-run is not
-    enough because the collision is ACROSS runs.
-    """
-    if not ident_rows:
-        return []
-    ids = list(ident_rows)
-    known = {
-        r[0]
-        for r in client.query(
-            f"SELECT {id_col} FROM {table} WHERE {id_col} IN {{ids:Array(UUID)}}",
-            parameters={"ids": ids},
-        ).result_rows
-    }
-    return [
-        row for i, row in ident_rows.items() if str(i) not in {str(k) for k in known}
-    ]
-
-
 def insert_v2(
-    client, component: str, run_id: str, cases: list, source_file: str = ""
+    client, db: str, component: str, run_id: str, cases: list, source_file: str = ""
 ) -> int:
     """Write test_cases (identity) + test_case_runs (outcome) for one leg.
 
@@ -1341,8 +1309,8 @@ def insert_v2(
         )
     # Cross-run dedup, not just in-leg: test_cases is a plain MergeTree, so re-inserting a
     # known identity appends a duplicate instead of collapsing it.
-    v2_schema.insert_identities(client, v2_schema.TEST_CASES, ident_rows)
-    v2_schema.insert(client, v2_schema.TEST_CASE_RUNS, run_rows)
+    v2_schema.insert_identities(client, v2_schema.TEST_CASES, ident_rows, db=db)
+    v2_schema.insert(client, v2_schema.TEST_CASE_RUNS, run_rows, db=db)
     if skipped_unidentifiable:
         print(
             f"  [warn] v2: {skipped_unidentifiable} case(s) skipped -- identity not derivable",
@@ -1450,11 +1418,11 @@ def main():
         f"{os.environ['CLICKHOUSE_HOST']}:{os.environ.get('CLICKHOUSE_PORT', '443')} ..."
     )
     client = get_client()
-    # Separate connection for the v2 tables -- see get_v2_client() for why sharing v1's
-    # cannot work. None when CLICKHOUSE_DB_V2 is unset, which every v2 site treats as
-    # "v2 not configured" and skips.
-    v2client = get_v2_client() if args.write_v2 else None
-    if args.write_v2 and v2client is None:
+    # One client, both generations: v2 is reached by QUALIFYING every statement with this
+    # database name (see v2_database). "" means v2 is not configured, which every v2 site
+    # treats as "skip".
+    v2db = v2_database() if args.write_v2 else ""
+    if args.write_v2 and not v2db:
         print(
             "  WARN --schema asked for v2 but CLICKHOUSE_DB_V2 is unset — v2 rows skipped",
             file=sys.stderr,
@@ -1532,7 +1500,7 @@ def main():
             # Additive v2 write: the same measurements under a DERIVED run_id, so a
             # perf number can name the artifact it measured. Guarded on both tables
             # existing so this deploys before the migration.
-            if v2client is not None and v2_benchmark_tables_present(v2client):
+            if v2db and v2_benchmark_tables_present(client, v2db):
                 _src, _ext = v2_source_and_external_run_id(args, str(run_id))
                 _v2_run_id = v2_run_id(_src, _ext, args.platform or "", "perf")
                 if not _v2_run_id:
@@ -1541,10 +1509,10 @@ def main():
                         f"(source={_src!r} external_run_id={_ext!r})",
                         file=sys.stderr,
                     )
-                elif v2_benchmarks_already_ingested(v2client, _v2_run_id):
+                elif v2_benchmarks_already_ingested(client, v2db, _v2_run_id):
                     print(f"  v2: already ingested run_id={_v2_run_id} — skipping")
                 else:
-                    _n = insert_benchmarks_v2(v2client, _v2_run_id, kernels)
+                    _n = insert_benchmarks_v2(client, v2db, _v2_run_id, kernels)
                     print(f"  v2: {_n} benchmark_runs under run_id={_v2_run_id}")
 
             total_kernels += len(kernels)
@@ -1593,7 +1561,7 @@ def main():
             # Additive v2 write: the same measurements under a DERIVED run_id, so a
             # perf number can name the artifact it measured. Guarded on both tables
             # existing so this deploys before the migration.
-            if v2client is not None and v2_benchmark_tables_present(v2client):
+            if v2db and v2_benchmark_tables_present(client, v2db):
                 _src, _ext = v2_source_and_external_run_id(args, str(run_id))
                 _v2_run_id = v2_run_id(_src, _ext, args.platform or "", "perf")
                 if not _v2_run_id:
@@ -1602,10 +1570,10 @@ def main():
                         f"(source={_src!r} external_run_id={_ext!r})",
                         file=sys.stderr,
                     )
-                elif v2_benchmarks_already_ingested(v2client, _v2_run_id):
+                elif v2_benchmarks_already_ingested(client, v2db, _v2_run_id):
                     print(f"  v2: already ingested run_id={_v2_run_id} — skipping")
                 else:
-                    _n = insert_benchmarks_v2(v2client, _v2_run_id, benchmarks)
+                    _n = insert_benchmarks_v2(client, v2db, _v2_run_id, benchmarks)
                     print(f"  v2: {_n} benchmark_runs under run_id={_v2_run_id}")
 
             total_benchmarks += len(benchmarks)
@@ -1677,7 +1645,7 @@ def main():
             # authoritative, so the experimental write is contained rather than allowed to
             # abort the loop and drop every remaining file's v1 insert.
             try:
-                if v2client is not None and v2_tables_present(v2client):
+                if v2db and v2_tables_present(client, v2db):
                     _v2_source, _v2_ext = v2_source_and_external_run_id(args, run_id)
                     _v2_tier = (getattr(args, "trigger_type", "") or "").strip()
                     _v2_run_id = v2_run_id(
@@ -1694,12 +1662,12 @@ def main():
                             file=sys.stderr,
                         )
                     elif v2_already_ingested(
-                        v2client, _v2_run_id, V2_COMPONENT, xml_path.name
+                        client, v2db, _v2_run_id, V2_COMPONENT, xml_path.name
                     ):
                         print(f"  v2: already ingested run_id={_v2_run_id} — skipping")
                     else:
                         _n = insert_v2(
-                            v2client, V2_COMPONENT, _v2_run_id, cases, xml_path.name
+                            client, v2db, V2_COMPONENT, _v2_run_id, cases, xml_path.name
                         )
                         print(f"  v2: {_n} test_case_runs under run_id={_v2_run_id}")
             except Exception as _v2_err:

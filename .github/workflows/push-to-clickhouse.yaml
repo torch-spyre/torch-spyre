@@ -77,10 +77,10 @@ jobs:
       CLICKHOUSE_USER: ${{ inputs.clickhouse_env != 'dev' && secrets.CLICKHOUSE_USER || secrets.CLICKHOUSE_USER_DEV }}
       CLICKHOUSE_PASS: ${{ inputs.clickhouse_env != 'dev' && secrets.CLICKHOUSE_PASS || secrets.CLICKHOUSE_PASS_DEV }}
       CLICKHOUSE_DB: ${{ inputs.clickhouse_env != 'dev' && secrets.CLICKHOUSE_DB || secrets.CLICKHOUSE_DB_DEV }}
-      # The schema-v2 database, a SEPARATE connection from CLICKHOUSE_DB. Needed because
-      # test_cases and benchmark_runs exist in both generations with incompatible shapes, so
-      # one database binding cannot serve both. Empty/unset makes the v2 write a no-op, which
-      # is what keeps an un-updated caller behaving exactly as before.
+      # The schema-v2 database. Every v2 statement is QUALIFIED with it rather than opening a
+      # second connection, because test_cases and benchmark_runs exist in both generations
+      # with incompatible shapes and an unqualified name would hit the wrong one. Empty/unset
+      # makes the v2 write a no-op, which keeps an un-updated caller behaving as before.
       CLICKHOUSE_DB_V2: ${{ inputs.clickhouse_env != 'dev' && secrets.CLICKHOUSE_DB_V2 || secrets.CLICKHOUSE_DB_V2_DEV }}
       # Dual-write during the migration window: v1 stays authoritative, v2 accumulates the
       # same runs so the new schema can be validated against real traffic before anything
