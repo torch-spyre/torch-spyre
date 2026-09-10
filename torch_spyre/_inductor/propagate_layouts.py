@@ -16,6 +16,7 @@
 from collections import Counter
 from typing import NamedTuple
 
+import enum
 import logging
 import math
 
@@ -78,6 +79,7 @@ from .ir import (
     WaitWorkFallback,
 )
 from .pass_utils import (
+    compute_restickify_needed,
     compute_restickify_target_layout,
     concretize_expr,
     find_matmul_generated_var,
@@ -673,9 +675,9 @@ def _clone_layout(
         return [out_stl]
 
     # Case 2: Find alternative dimension to swap with the current stick dimension.
-    # TODO: FixedInOutNode only supports a single required STL, so we select
-    # a layout where restickify is feasible to avoid optimizer rejection.
-    # Consider implementing a cost node that supports multiple required STLs.
+    # Keep clone's existing single-target policy. Optional input_stl_choices
+    # are currently supplied only by the enabled standard batch-matmul path;
+    # extending clone's candidate construction is separate work.
     out_coords = host_coordinates(output, output_dep, None)
     in_layout = args[0].layout
     in_host_coords = host_coordinates(in_layout, in_dep, None)
@@ -1040,6 +1042,69 @@ def find_stick_compatible_input_layout(
     )
 
 
+def _matmul_generated_var(
+    op: Operation,
+    x_dep: MemoryDep,
+    y_dep: MemoryDep,
+    output_dep: MemoryDep,
+    m_size: int,
+) -> sympy.Symbol:
+    """The matmul's generated variable N: the single stick-role rule for input2 (y).
+
+    Shared by ``_matmul_layouts`` (which fixes y's required layout from it) and
+    the indexed-selection consumer proof, so both read one interpretation.
+
+    M == 1: M has no loop symbol after size-one simplification, so N leaks into
+    x's dep index (x iterates over both N and K because M contributes nothing)
+    and the set-exclusion ``(y & out) - x`` returns the empty set. N is instead
+    the output dep's last variable: Inductor's matmul lowering places N last in
+    ranges regardless of M's size (M=1 folds M's loop symbol away but does not
+    reorder the output dep).
+    """
+    if m_size == 1:
+        if not output_dep.var_names:
+            raise Unsupported(
+                f"{op.data.reduction_type}: M=1 matmul but output dep has no vars"
+            )
+        return output_dep.var_names[-1]
+    return find_matmul_generated_var(y_dep, x_dep, output_dep, op)
+
+
+def _matmul_operand_stick_vars(op, x_dep, y_dep, output_dep):
+    """One operand contract for layout construction and optional candidates.
+
+    Input x carries K; input y carries N. A unit N has no loop symbol and
+    requires the existing sparse-stick construction instead of a guessed axis.
+    """
+    reduction_var = find_reduction_var((x_dep,), output_dep)
+    generated_var = (
+        None
+        if get_matmul_n_size(op) == 1
+        else _matmul_generated_var(op, x_dep, y_dep, output_dep, get_matmul_m_size(op))
+    )
+    return reduction_var, generated_var
+
+
+def _matmul_input_layout_choices(arg, variable, op_type, role, ordinary):
+    """Legal operand targets, without making the first candidate mandatory.
+
+    Each offered input gets the same existing stick-rule query. Incompatible
+    inputs may need a conversion, which the normal edge-cost chooser prices.
+    Keep the ordinary target as the fallback and on cost ties.
+    """
+    choices = [ordinary]
+    for layout in arg.layouts:
+        try:
+            required = find_stick_compatible_input_layout(
+                PropArg(arg.dep, arg.layout, [layout]), variable, op_type, role
+            )
+        except Unsupported:
+            continue
+        if required is not None and required not in choices:
+            choices.append(required)
+    return choices
+
+
 def _matmul_layouts(
     op: Operation,
     output: FixedLayout,
@@ -1111,7 +1176,9 @@ def _matmul_layouts(
     #   Input1 (x): stick on reduction_var (loop var absent from output)
     #   Input2 (y): stick on generated_var (loop var present in output, absent from x)
     #   Output:     stick on generated_var
-    reduction_var = find_reduction_var((x.dep,), output_dep)
+    reduction_var, generated_var = _matmul_operand_stick_vars(
+        op, x.dep, y.dep, output_dep
+    )
     n_size = get_matmul_n_size(op)
     m_size = get_matmul_m_size(op)
 
@@ -1133,21 +1200,9 @@ def _matmul_layouts(
         out_dims = len(output.size)
         out_stick_dim = out_dims - 1
     elif m_size == 1:
-        # M has no loop symbol after size-one simplification.  N leaks into x's
-        # dep index (x iterates over both N and K because M=1 contributes nothing),
-        # so the normal set-exclusion (y & out) - x returns set().  Skip
-        # find_matmul_generated_var and read N directly from the output dep.
         x_req_stl = find_stick_compatible_input_layout(
             x, reduction_var, data.reduction_type, "x"
         )
-        if not output_dep.var_names:
-            raise Unsupported(
-                f"{data.reduction_type}: M=1 matmul but output dep has no vars"
-            )
-        # N is always last in output_dep.var_names: Inductor's matmul lowering
-        # places N last in ranges regardless of M's size (M=1 folds M's loop
-        # symbol away but does not reorder the output dep).
-        generated_var = output_dep.var_names[-1]
         y_req_stl = find_stick_compatible_input_layout(
             y, generated_var, data.reduction_type, "y"
         )
@@ -1157,7 +1212,6 @@ def _matmul_layouts(
         x_req_stl = find_stick_compatible_input_layout(
             x, reduction_var, data.reduction_type, "x"
         )
-        generated_var = find_matmul_generated_var(y.dep, x.dep, output_dep, op)
         y_req_stl = find_stick_compatible_input_layout(
             y, generated_var, data.reduction_type, "y"
         )
@@ -1184,11 +1238,31 @@ def _matmul_layouts(
 
     out_stl = SpyreTensorLayout(c_size, c_stride, output.dtype, out_dim_order)
 
+    input_choices = None
+    if (
+        config.indexed_selection_consumer_layout
+        and data.reduction_type == BATCH_MATMUL_OP
+        and generated_var is not None
+        and all(
+            stl.element_arrangement == ElementArrangement.STANDARD
+            for arg in (x, y)
+            for stl in arg.layouts
+        )
+    ):
+        input_choices = [
+            _matmul_input_layout_choices(
+                x, reduction_var, data.reduction_type, "x", x_req_stl
+            ),
+            _matmul_input_layout_choices(
+                y, generated_var, data.reduction_type, "y", y_req_stl
+            ),
+        ]
     op.restick_cost_fn = FixedInOutNode.from_args(
         [x, y],
         out_stl,
         [x_req_stl, y_req_stl],
         op,
+        input_stl_choices=input_choices,
     )
     return [out_stl]
 
@@ -1273,6 +1347,307 @@ def _conv_layouts(
         [x, y], out_stl, [x_req_stl, y_req_stl], op
     )
     return [out_stl]
+
+
+class _IndexedSelectionDecision(enum.Enum):
+    """Why an indexed selection is, or is not, offered an entry-contiguous layout."""
+
+    ELIGIBLE = enum.auto()
+    DISABLED = enum.auto()
+    NOT_INDEXED_SELECTION = enum.auto()
+    NON_STANDARD_ARRANGEMENT = enum.auto()
+    NO_ENTRY_DIM = enum.auto()
+    ENTRY_IS_STICK = enum.auto()
+    NO_CONSUMER = enum.auto()
+    ESCAPES_GRAPH = enum.auto()
+    MUTATED = enum.auto()
+    MUTATION_INFO_UNAVAILABLE = enum.auto()
+    AMBIGUOUS_STICK_DIM = enum.auto()
+    CONSUMER_NOT_BATCH_MATMUL = enum.auto()
+    CONSUMER_ROLE_UNRESOLVED = enum.auto()
+    CONSUMER_READ_UNSUPPORTED = enum.auto()
+    CONSUMER_STICK_MISMATCH = enum.auto()
+    OUTPUT_WRITE_UNSUPPORTED = enum.auto()
+    ALREADY_OFFERED = enum.auto()
+
+
+def _indexed_selection_entry_dim(
+    op: Operation,
+    output: FixedLayout,
+    output_dep: MemoryDep,
+    index_names: set[str],
+    ind_sizes,
+) -> int | None:
+    """Return the output dim that selects entries (the index tensor's row), or None.
+
+    Derived from access expressions, not positions: the index tensor is read at
+    a coordinate built from exactly one output iteration variable, and the entry
+    dim is the output dim whose host coordinate is exactly that variable.
+    Ambiguous or absent structure returns None so callers stay conservative.
+    """
+    out_coords = host_coordinates(output, output_dep, ind_sizes)
+    entry_vars: set[sympy.Symbol] = set()
+    for dep in op.get_read_writes().reads:
+        if not isinstance(dep, MemoryDep) or dep.name not in index_names:
+            continue
+        loop_vars = {s for s in dep.index.free_symbols if s in dep.ranges}
+        if len(loop_vars) != 1:
+            return None
+        entry_vars |= loop_vars
+    if len(entry_vars) != 1:
+        return None
+    (entry_var,) = entry_vars
+    matches = [d for d, coord in enumerate(out_coords) if coord == entry_var]
+    if len(matches) != 1:
+        return None
+    return matches[0]
+
+
+def _entry_contiguous_stl(
+    c_size: list[int],
+    c_stride: list[int],
+    entry_dim: int,
+    stick_dim: int,
+    dtype: torch.dtype,
+) -> SpyreTensorLayout:
+    """Build the explicit device layout with the entry dim outermost.
+
+    Device order is ``entry, <remaining dims in logical order>, stick//S, S``:
+    every selected entry occupies one contiguous physical slab, and the stick
+    dim keeps the coarse/fine split the default constructor would give it.
+    ``stride_map`` follows the constructor's convention: the host stride per
+    device dim, ``S * stride`` for the coarse stick index, and ``-1`` for a
+    size-one or broadcast dim (whose device extent collapses to one).
+    """
+    stick_size = get_elem_in_stick(dtype)
+    order = [entry_dim] + [
+        d for d in range(len(c_size)) if d not in (entry_dim, stick_dim)
+    ]
+    device_size: list[int] = []
+    stride_map: list[int] = []
+    for d in order:
+        if c_size[d] == 1 or c_stride[d] == 0:
+            device_size.append(1)
+            stride_map.append(-1)
+        else:
+            device_size.append(c_size[d])
+            stride_map.append(c_stride[d])
+    device_size.append((c_size[stick_dim] + stick_size - 1) // stick_size)
+    stride_map.append(stick_size * c_stride[stick_dim])
+    device_size.append(stick_size)
+    stride_map.append(c_stride[stick_dim])
+    return SpyreTensorLayout(device_size, stride_map, get_device_dtype(dtype))
+
+
+def _batch_matmul_required_stick_var(
+    consumer: Operation, dep: MemoryDep
+) -> sympy.Symbol | None:
+    """The loop variable a batch matmul needs on the stick of the operand read by ``dep``.
+
+    Uses the same role rules as ``_matmul_layouts``: input2 (y) carries the
+    generated variable from ``_matmul_generated_var`` (which owns the M == 1
+    case), input1 (x) carries ``find_reduction_var``'s reduction variable K.
+    Returns None for the shape ``_matmul_layouts`` gives y a sparse stick
+    (N == 1), for a self-matmul, or when a rule raises, so the caller declines
+    rather than guessing.
+    """
+    rw = consumer.get_read_writes()
+    reads = [d for d in rw.reads if isinstance(d, MemoryDep)]
+    write_dep = next(iter(rw.writes), None)
+    if write_dep is None or len(reads) != 2:
+        return None
+    x_dep, y_dep = identify_matmul_inputs(reads, write_dep)
+    if x_dep == y_dep:
+        return None
+    try:
+        reduction_var, generated_var = _matmul_operand_stick_vars(
+            consumer, x_dep, y_dep, write_dep
+        )
+        if generated_var is None:
+            return None
+        if dep == x_dep:
+            return reduction_var
+        if dep == y_dep:
+            return generated_var
+    except Unsupported:
+        return None
+    return None
+
+
+def _indexed_selection_consumer_check(
+    candidate: SpyreTensorLayout,
+    buf_name: str,
+    stick_size: int,
+) -> _IndexedSelectionDecision:
+    """Prove every consumer's read of ``candidate`` is a stick-compatible batch matmul operand.
+
+    "Every consumer" is closed over the whole graph, not just ComputedBuffers:
+    a buffer that escapes as a graph output or is mutated in place has a reader
+    or writer this proof cannot see, and any non-ComputedBuffer reader (an
+    extern/fallback kernel, a device copy, a StarDep-style whole-buffer read)
+    declines too, since its access pattern is not a matmul operand read. A
+    ComputedBuffer consumer accepts the candidate exactly when the existing
+    matmul machinery would read it without a restickify: the operand's required
+    layout comes from ``find_stick_compatible_input_layout`` with the candidate
+    as the only offered layout, and ``compute_restickify_needed`` must report
+    the candidate stick-compatible with that requirement -- the same two
+    functions ``_matmul_layouts`` and the beam's edge costs use. Anything else
+    declines with a named reason.
+    """
+    graph = V.graph
+    if buf_name in set(graph.get_output_names()):
+        return _IndexedSelectionDecision.ESCAPES_GRAPH
+    mutated_buffers = getattr(graph, "mutated_buffers", None)
+    if mutated_buffers is None:
+        return _IndexedSelectionDecision.MUTATION_INFO_UNAVAILABLE
+    if buf_name in mutated_buffers:
+        return _IndexedSelectionDecision.MUTATED
+    # This pass runs on the completed GraphLowering operation list, not an
+    # incrementally lowered prefix. Later graph rewrites retain the ordinary
+    # layout checks; this scan proves compatibility with the current readers.
+    consumers: list[tuple[Operation, MemoryDep]] = []
+    for o in graph.operations:
+        for d in o.get_read_writes().reads:
+            if getattr(d, "name", None) != buf_name:
+                continue
+            if not isinstance(o, ComputedBuffer) or not isinstance(d, MemoryDep):
+                return _IndexedSelectionDecision.CONSUMER_NOT_BATCH_MATMUL
+            consumers.append((o, d))
+    if not consumers:
+        return _IndexedSelectionDecision.NO_CONSUMER
+    for consumer, dep in consumers:
+        data = consumer.data
+        if not (isinstance(data, Reduction) and data.reduction_type == BATCH_MATMUL_OP):
+            # Quantized/FP8 operands need their own arrangement coverage before
+            # this optional candidate can be offered to those consumers.
+            return _IndexedSelectionDecision.CONSUMER_NOT_BATCH_MATMUL
+        required_var = _batch_matmul_required_stick_var(consumer, dep)
+        if required_var is None:
+            return _IndexedSelectionDecision.CONSUMER_ROLE_UNRESOLVED
+        coords = try_device_coordinates(candidate, dep, None)
+        if coords is None or not is_stick_expr_offset_free(coords[-1], stick_size):
+            return _IndexedSelectionDecision.CONSUMER_READ_UNSUPPORTED
+        host_layout = graph.get_buffer(buf_name).get_layout()
+        try:
+            required_stl = find_stick_compatible_input_layout(
+                PropArg(dep, host_layout, [candidate]),
+                required_var,
+                data.reduction_type,
+                "indexed_selection",
+            )
+            needed, _ = compute_restickify_needed(
+                candidate, host_layout, dep, required_stl, dep, consumer
+            )
+        except Unsupported:
+            return _IndexedSelectionDecision.CONSUMER_STICK_MISMATCH
+        if needed:
+            return _IndexedSelectionDecision.CONSUMER_STICK_MISMATCH
+    return _IndexedSelectionDecision.ELIGIBLE
+
+
+def _offer_indexed_selection_layouts(
+    op: Operation,
+    output: FixedLayout,
+    output_dep: MemoryDep,
+    results: list[SpyreTensorLayout],
+    index_names: set[str],
+    ind_sizes,
+    dtype_for_layout: torch.dtype,
+    output_ea: ElementArrangement,
+) -> list[SpyreTensorLayout]:
+    """Offer entry-contiguous candidates for an indexed selection feeding batch matmuls.
+
+    Enabled by default (``config.indexed_selection_consumer_layout``). For each
+    already-accepted candidate -- whose stick choice the input checks above have
+    validated -- build the layout that keeps every selected entry contiguous
+    (see ``_entry_contiguous_stl``), then require (1) the selection's own write
+    to that layout has an offset-free stick that no index symbol reaches, and
+    (2) every consumer is a batch matmul whose operand read is stick-compatible
+    with it. Candidates are appended, preserving ordinary choices on equal cost.
+    The matmul exposes all its legal input targets to the existing edge-cost
+    chooser; no required operand layout is forced by prepending this candidate.
+    Anything unproven declines with a logged reason. This models conversion
+    costs only; later work-division benefits still require device measurement.
+    """
+    if not config.indexed_selection_consumer_layout:
+        return results
+    buf_name = op.get_name()
+    if not index_names or not ind_sizes:
+        _log_indexed_selection(
+            buf_name, _IndexedSelectionDecision.NOT_INDEXED_SELECTION
+        )
+        return results
+    if output_ea != ElementArrangement.STANDARD:
+        _log_indexed_selection(
+            buf_name, _IndexedSelectionDecision.NON_STANDARD_ARRANGEMENT
+        )
+        return results
+    entry_dim = _indexed_selection_entry_dim(
+        op, output, output_dep, index_names, ind_sizes
+    )
+    if entry_dim is None:
+        _log_indexed_selection(buf_name, _IndexedSelectionDecision.NO_ENTRY_DIM)
+        return results
+
+    stick_size = get_elem_in_stick(dtype_for_layout)
+    c_size = [concretize_expr(s) for s in output.size]
+    c_stride = [concretize_expr(s) for s in output.stride]
+    seen = {(tuple(r.device_size), tuple(r.stride_map)) for r in results}
+    offered: list[SpyreTensorLayout] = []
+    for base in results:
+        # Recover the accepted candidate's stick dim from its fine stick stride.
+        stick_dims = [d for d, hs in enumerate(c_stride) if hs == base.stride_map[-1]]
+        if len(stick_dims) != 1:
+            _log_indexed_selection(
+                buf_name, _IndexedSelectionDecision.AMBIGUOUS_STICK_DIM
+            )
+            continue
+        stick_dim = stick_dims[0]
+        if stick_dim == entry_dim:
+            _log_indexed_selection(buf_name, _IndexedSelectionDecision.ENTRY_IS_STICK)
+            continue
+        candidate = _entry_contiguous_stl(
+            c_size, c_stride, entry_dim, stick_dim, dtype_for_layout
+        )
+        key = (tuple(candidate.device_size), tuple(candidate.stride_map))
+        if key in seen:
+            _log_indexed_selection(buf_name, _IndexedSelectionDecision.ALREADY_OFFERED)
+            continue
+        out_coords = try_device_coordinates(candidate, output_dep, ind_sizes)
+        if (
+            out_coords is None
+            or not is_stick_expr_offset_free(out_coords[-1], stick_size)
+            or any(sym in out_coords[-1].free_symbols for sym in ind_sizes)
+        ):
+            _log_indexed_selection(
+                buf_name, _IndexedSelectionDecision.OUTPUT_WRITE_UNSUPPORTED
+            )
+            continue
+        decision = _indexed_selection_consumer_check(candidate, buf_name, stick_size)
+        _log_indexed_selection(buf_name, decision, candidate)
+        if decision is _IndexedSelectionDecision.ELIGIBLE:
+            offered.append(candidate)
+            seen.add(key)
+    return results + offered
+
+
+def _log_indexed_selection(
+    buf_name: str,
+    decision: _IndexedSelectionDecision,
+    candidate: SpyreTensorLayout | None = None,
+) -> None:
+    level = (
+        logging.INFO
+        if decision is _IndexedSelectionDecision.ELIGIBLE
+        else logging.DEBUG
+    )
+    logger.log(
+        level,
+        "indexed_selection_consumer_layout: %s decision=%s%s",
+        buf_name,
+        decision.name,
+        f" candidate={candidate}" if candidate is not None else "",
+    )
 
 
 def _multi_arg_pointwise_layouts(
@@ -1618,6 +1993,19 @@ def _multi_arg_pointwise_layouts(
             f"coordinates={out_coords}. Input EAs: "
             f"{[a.layouts[0].element_arrangement for a in args if a.layouts]}"
         )
+
+    # Indexed selection feeding batch matmuls: optionally offer entry-contiguous
+    # layouts first (private experiment control; see _offer_indexed_selection_layouts).
+    results = _offer_indexed_selection_layouts(
+        op,
+        output,
+        output_dep,
+        results,
+        ind_names,
+        ind_sizes,
+        out_dtype_for_layout,
+        output_ea,
+    )
 
     if len(results) > 1:
         logger.info(

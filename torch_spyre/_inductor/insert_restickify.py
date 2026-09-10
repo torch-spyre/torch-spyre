@@ -578,6 +578,7 @@ def finalize_layouts(graph: GraphLowering) -> None:
                 )
                 in_layout = in_layout.real_layout()
             in_stl = in_layout.device_layout
+            target_stl = cost_fn.select_input_stl(edge, in_stl, target_stl)
             restick_stl = edge.layout(in_stl, target_stl)
             if restick_stl is None:
                 # No restickify needed for this edge, but still advance the occurrence
