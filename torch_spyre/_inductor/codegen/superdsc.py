@@ -469,8 +469,11 @@ def _get_padded_iteration_space(
         stick_dim_order = layout["stick_dim_order"]
         stick_size = layout["stick_size"]
         dev_size = op_spec_arg.device_size[-2::-1]
-        for idx, dim in enumerate(dim_order):
-            if idx >= len(dev_size) or dim not in stick_dim_order:
+        # Virtual dims (e.g. mb_sym for dtype-conversion ops) are prepended
+        # to dim_order but not reflected in device_size. Align from the end.
+        device_dim_order = dim_order[len(dim_order) - len(dev_size) :]
+        for idx, dim in enumerate(device_dim_order):
+            if dim not in stick_dim_order:
                 continue
             effective_stick_size = (
                 stick_size[0] if len(stick_size) == 1 else stick_size[0] * stick_size[1]
