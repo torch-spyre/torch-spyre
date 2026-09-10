@@ -44,7 +44,10 @@ from torch._inductor.lowering import clone as clone_lowering
 from torch_spyre._inductor import config
 from torch_spyre._inductor.ir import FixedTiledLayout
 from torch_spyre._inductor.logging_utils import get_inductor_logger, warn_once
-from torch_spyre._inductor.pass_utils import copy_op_metadata
+from torch_spyre._inductor.pass_utils import (
+    copy_op_metadata,
+    register_operation_after_graph_edit,
+)
 from torch_spyre._inductor.scratchpad.allocator import ScratchpadOptimizationPass
 from torch_spyre._inductor.scratchpad.graph_editor import GraphEditor
 from torch_spyre._inductor.scratchpad.utils import calculate_liveness
@@ -233,7 +236,7 @@ def _dump_buffers(
         copy_op_metadata(buf, dump_buf)  # keep it in buf's coarse-tile/loop-group
         dump_buf.op_it_space_splits = getattr(buf, "op_it_space_splits", ({}, {}))
         dump_buf.name = graph.register_buffer(dump_buf)
-        graph.register_operation(dump_buf)
+        register_operation_after_graph_edit(graph, dump_buf)
 
         # Reposition into graph.operations right before target_op
         # (remove()+insert(), same pattern GraphEditor.push_allocation_with_clone
@@ -302,7 +305,7 @@ def _restore_buffers(
         # clones around a buffer that no longer resides on LX at all).
         restore_buf.op_it_space_splits = getattr(buf, "op_it_space_splits", ({}, {}))
         restore_buf.name = graph.register_buffer(restore_buf)
-        graph.register_operation(restore_buf)
+        register_operation_after_graph_edit(graph, restore_buf)
 
         graph.operations.remove(restore_buf)
         graph.operations.insert(graph.operations.index(target_op) + 1, restore_buf)
