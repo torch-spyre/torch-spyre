@@ -21,6 +21,16 @@ test_suite_config:
             - TestSelectAlgorithm::test_quantized_linear_with_pointwise
             - TestSelectAlgorithm::test_quantized_linear_with_pointwise_binary
           mode: mandatory_success
+        # Upstream inductor cpp GEMM autotune asserts L1_cache_size > 0; s390x
+        # and ppc64le never populate that field (pytorch/pytorch#195363).
+        # Xfail on those arches only; x86 still requires this test to pass.
+        # See issue #3902.
+        - names:
+            - TestSelectAlgorithm::test_linear_with_embedding
+          mode: xfail
+          tags:
+            - platform__s390x
+            - platform__ppc64le
         # These tests exercise various linear and batch matrix multiplication operations with different data types and tensor layouts.
         # They are classified as xfail due to unsupported dynamic shapes and fused epilogues, which are not yet supported by the Spyre backend.
         # The relevant Spyre limitations include lack of support for dynamic tensor shapes and certain fused operations, particularly with bfloat16 and float16 data types.

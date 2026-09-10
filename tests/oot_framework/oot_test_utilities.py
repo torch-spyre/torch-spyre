@@ -341,6 +341,34 @@ def _select_entry_by_op_index(method_name: str) -> Optional[Any]:
     return model_ops_entry_by_unique_name.get(m.group("unique"))
 
 
+def _platform_tags(entry: Any) -> List[str]:
+    """Return YAML tags on *entry* that gate the entry to a host architecture."""
+    return [
+        t for t in (getattr(entry, "tags", None) or []) if t.startswith("platform__")
+    ]
+
+
+def _filter_entries_by_platform(entries: Sequence[Any]) -> List[Any]:
+    """Keep platform-restricted YAML entries only on the matching arch.
+
+    An entry with no ``platform__*`` tags applies everywhere. An entry tagged
+    ``platform__s390x`` / ``platform__ppc64le`` applies only on those arches.
+    When any matching platform-specific entry exists, those take precedence
+    over unrestricted entries so an s390x/ppc64le xfail can override a
+    global mandatory_success.
+    """
+    current = f"platform__{_OOT_PLATFORM_ARCH}"
+    matching_specific: List[Any] = []
+    unrestricted: List[Any] = []
+    for entry in entries:
+        ptags = _platform_tags(entry)
+        if not ptags:
+            unrestricted.append(entry)
+        elif current in ptags:
+            matching_specific.append(entry)
+    return matching_specific or unrestricted
+
+
 def _select_entry_for_variant(
     entries: List[Any],
     method_name: str,
@@ -354,6 +382,8 @@ def _select_entry_for_variant(
     effective dtype set.
 
     Selection rules:
+      0. Platform tags (``platform__<arch>``) — a tagged entry applies only
+         on that arch and, when it matches, overrides untagged entries.
       1. Entry whose effective dtype set contains the variant's dtype.
       2. Entry with no dtype restriction (effective set is None) acts as
          a wildcard / fallback.
@@ -364,6 +394,10 @@ def _select_entry_for_variant(
     """
     # Deferred imports to avoid circular dependency at module level.
     from .oot_test_matching import extract_dtype_from_name, parse_dtype
+
+    entries = _filter_entries_by_platform(entries)
+    if not entries:
+        return None
 
     if len(entries) == 1:
         return entries[0]
@@ -409,8 +443,13 @@ def _extract_op_name_from_method(
         return None
     remainder = method_name[len(base_test_name) + 1 :]  # "add_<device>_float16"
     # op name is the first segment before the device suffix
-    if f"_{oot_device_type}_" in remainder:
-        return remainder.split(f"_{oot_device_type}_")[0]
+    device_infix = f"_{oot_device_type}_"
+    if device_infix in remainder:
+        return remainder.split(device_infix)[0]
+    # OpDTypes.none tests have no dtype suffix: test_dtypes_bitwise_and_spyre
+    device_suffix = f"_{oot_device_type}"
+    if remainder.endswith(device_suffix) and remainder != oot_device_type:
+        return remainder[: -len(device_suffix)]
     return None
 
 
