@@ -265,11 +265,12 @@ def test_solver_relayout_materializes_and_runs(monkeypatch):
     torch.testing.assert_close(out.cpu(), ref, rtol=1e-3, atol=1e-3)
 
 
-def test_flag_off_materializes_nothing(monkeypatch):
-    """The kill switch: with the feature default-on, SPYRE_LX_SOLVER_RELAYOUT=0
-    (config.lx_solver_relayout=False) must disarm every relayout decision and
-    leave the co-optimizing solve exactly as it was before this feature."""
+def test_an_unsupporting_solver_materializes_nothing(monkeypatch):
+    """``lx_solver_relayout()`` says whether the configured solver decides
+    relayouts; when it does not, no candidate is enumerated and the
+    co-optimizing solve is exactly what it was before this feature."""
     observed = _arm_forced(monkeypatch)
+    monkeypatch.setattr(alloc_mod, "lx_solver_relayout", lambda: False)
 
     def fn(t):
         return torch.relu(torch.neg(t)) + 1.0
@@ -277,13 +278,7 @@ def test_flag_off_materializes_nothing(monkeypatch):
     torch.manual_seed(0)
     host = torch.randn(8, 256, 512, dtype=torch.float16)
     x = host.to("spyre")
-    with config.patch(
-        {
-            "co_optimizing_lx_planning": True,
-            "layout_solver": "cpsat",
-            "lx_solver_relayout": False,
-        }
-    ):
+    with config.patch(_COOPT):
         out = torch.compile(fn, dynamic=False)(x)
 
     observed.assert_nothing_emitted()

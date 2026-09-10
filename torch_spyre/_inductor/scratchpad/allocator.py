@@ -109,6 +109,7 @@ from torch_spyre._inductor.scratchpad.lx_relayout import (
     _unsupported_relayout_transition_reason,
     collect_lx_relayout_plans,
     FiredRelayoutGroup,
+    lx_solver_relayout,
     LXRelayoutPlan,
     materialize_lx_relayouts,
     partition_footprint,
@@ -2671,9 +2672,9 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         ``collect_lx_relayout_plans``; the per-pair gates (permutation
         compatibility, projectable ownership on both frames, the law's fitted
         split range) live in ``solver_relayout_pair_cost``. Gated on
-        ``config.lx_solver_relayout``.
+        ``lx_solver_relayout()`` (the solver kind decides relayouts).
         """
-        if not config.lx_solver_relayout or config.ktir_emitter:
+        if not lx_solver_relayout() or config.ktir_emitter:
             return {}
         if not self._decides_lx_relayouts or consumer_op is None:
             return {}
@@ -2943,11 +2944,11 @@ def select_allocator() -> ScratchpadAllocator:
     )
 
     if config.co_optimizing_lx_planning:
-        if config.lx_planner_relayout and not config.lx_solver_relayout:
+        if config.lx_planner_relayout and not lx_solver_relayout():
             logger.debug(
-                "LX relayout is not supported by CoOptimizingAllocator; "
-                "continuing without relayout (the solver-decided path is "
-                "available via SPYRE_LX_SOLVER_RELAYOUT=1)"
+                "layout_solver=%s does not decide LX relayouts; continuing "
+                "without relayout",
+                config.layout_solver,
             )
         if config.layout_solver == "simulated_annealing":
             return CoOptimizingAllocator(

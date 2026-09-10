@@ -319,7 +319,7 @@ class CoreDivisionBuffer(LifetimeBoundBuffer):
     # consumer's slicing: the two views differ but are relayout-compatible (a
     # permutation), priced by the fitted relayout law. Sibling of
     # ``cd_parent_matches`` (which holds the free, equal-view pairs); populated
-    # only under ``config.lx_solver_relayout``, for the CP-SAT solver's
+    # only when ``lx_relayout.lx_solver_relayout()`` holds, for the CP-SAT solver's
     # relayout decision variables. The record carries the views, core count,
     # group and price, so the solver and the commit path never re-derive them.
     cd_parent_relayouts: dict[str, list["RelayoutCandidate"]] = field(

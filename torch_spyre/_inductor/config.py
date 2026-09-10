@@ -92,18 +92,6 @@ lx_planner_relayout: bool = os.getenv("SPYRE_LX_PLANNER_RELAYOUT", "1").lower() 
     "yes",
 )
 
-# Enumerate priced relayout candidates per division pair for the CP-SAT joint
-# solver, which decides each edge against the fitted shuffle cost. Off by
-# default until the solver can also materialize what it decides.
-# Relayout decisions inside the CP-SAT solver (priced by the fitted law in
-# cost_model.relayout_ns). Active only under the co-optimizing cpsat
-# configuration; SPYRE_LX_SOLVER_RELAYOUT=0 is the kill switch.
-lx_solver_relayout: bool = os.getenv("SPYRE_LX_SOLVER_RELAYOUT", "1").lower() in (
-    "1",
-    "true",
-    "yes",
-)
-
 allow_all_ops_in_lx_planning: bool = False
 
 dxp_lx_frac_avail: float = float(os.environ.get("DXP_LX_FRAC_AVAIL", "0.2"))

@@ -635,6 +635,18 @@ def solver_relayout_movement_supported(
     return len(fanout) == 1 and len(fanin) == 1
 
 
+def lx_solver_relayout() -> bool:
+    """Whether the configured layout solver decides LX relayouts.
+
+    The committed collector decides them under ``greedy`` (#3439, #3440); the
+    co-optimizing CP-SAT solver decides them itself (#4203). Simulated annealing
+    does not yet (#4425). A function on the solver choice rather than a separate
+    option, so there is nothing to keep in sync and it can be deleted once every
+    solver supports relayouts.
+    """
+    return config.layout_solver in ("greedy", "cpsat")
+
+
 def _single_write(op: ComputedBuffer, name: str) -> MemoryDep | None:
     writes = [
         dep
