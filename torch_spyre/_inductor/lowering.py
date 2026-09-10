@@ -1739,6 +1739,26 @@ def with_int64_fallback(fn, *args, convert_output=True):
     return output
 
 
+@register_spyre_lowering(torch.ops.aten.where.self, type_promotion_kind=None)
+def lower_where(condition, self, other):
+    # where3 requires all three operands to share the same dtype (same stick size).
+    # fp16/bfloat16 is the native format — bool condition is fp16-backed (64
+    # elems/stick) and pairs directly with fp16 values. For all other dtypes,
+    # force fp32: cast condition and values to IEEE_FP32 (32 elems/stick), run
+    # where3, then cast the result back.
+    #   - fp32:  no-op casts; host bool condition falls back to CPU via DL16TOFP32
+    #   - int32: INT32TOFP32 (Spyre-native); result back via FP32TOINT32 (Spyre)
+    #   - int64: CPU fallback for both directions
+    val_dtype = self.get_dtype() if hasattr(self, "get_dtype") else None
+    if val_dtype in (torch.float16, torch.bfloat16):
+        return lowering.where(condition, self, other)
+    cond_fp32 = to_dtype(condition, torch.float32)
+    self_fp32 = to_dtype(self, torch.float32)
+    other_fp32 = to_dtype(other, torch.float32)
+    result_fp32 = lowering.where(cond_fp32, self_fp32, other_fp32)
+    return to_dtype(result_fp32, val_dtype)
+
+
 @register_spyre_lowering(
     torch.ops.aten.add.Tensor,
     type_promotion_kind=None,
