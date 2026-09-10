@@ -6014,6 +6014,167 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 f"{(result.float() - expected).abs().max().item()}"
             )
 
+    # Diagnostic tests for #3770: a device-tensor view sliced on the
+    # outermost dim at a non-zero storage_offset, fed to torch.compile,
+    # silently reads storage element 0 (or otherwise wrong storage) instead
+    # of the view's real offset.
+    #
+    # The issue's own isolation table does not establish whether the wrong
+    # result is a first-trace correctness bug or a graph-reuse-across-calls
+    # bug, and its repro is specifically a BATCHED matmul (torch.bmm) on an
+    # outer/batch-dim slice of an [E, H, F] expert-weight tensor -- a shape
+    # no existing test_storage_offset_placeholder* case covers (those cover
+    # only lo=1 and only pointwise ops or a non-batch mm). The tests below
+    # are deliberately split one-hypothesis-per-test so a failure pinpoints
+    # the mechanism instead of conflating them:
+    #
+    #   A. fresh trace only, pointwise op,     outer-dim offset, lo=4
+    #   B. fresh trace only, batched matmul,   outer-dim offset, lo=4
+    #   C. same compiled callable reused,      pointwise op,     lo varies
+    #   D. same compiled callable reused,      batched matmul,   lo varies
+    #
+    # (A) is expected to pass (covered in spirit by the existing
+    # 2d_offset_dim0/3d_offset_dim0 param sets, just not at lo=4) and is
+    # included as a control. (B) is new coverage for the issue's actual
+    # op shape with no reuse involved -- if this alone fails, the bug is in
+    # single-trace batched-op offset handling, not caching/guards. (C) and
+    # (D) test the graph-reuse hypothesis: dynamo's TENSOR_MATCH guard keys
+    # on dtype/device/size/stride but NOT storage_offset (see the
+    # specialize_int comment on spyre.copy_from_d2d in customops.py, which
+    # works around exactly this for the d2d-copy path by passing the offset
+    # as an explicit guarded int) -- if (A)/(B) pass but (C)/(D) fail, the
+    # bug is reuse of a stale offset-0 trace, not layout computation itself.
+    def test_storage_offset_placeholder_lo4_fresh_trace_pointwise(self):
+        """(A) control: single fresh trace, outer-dim offset lo=4, pointwise.
+
+        No reuse involved -- a fresh torch.compile per call via
+        _compile_and_run. Expected to pass; failure here would mean even
+        basic offset-4 layout computation is broken, independent of #3770's
+        batched-matmul specifics.
+        """
+
+        def fn(x):
+            return x + x
+
+        base = cached_randn((8, 128), differentiation="ph_lo4_pointwise")
+        cpu_view = base.clone()[4:6, :]
+        expected = fn(cpu_view).float()
+
+        dev_view = base.clone().to("spyre")[4:6, :]
+        result = _compile_and_run(fn, [dev_view], "spyre", compile=True)
+        assert torch.allclose(result.float(), expected, atol=0.1, rtol=0.1), (
+            f"max abs diff: {(result.float() - expected).abs().max().item()} -- "
+            "fresh-trace offset-4 layout computation itself is broken (see #3770)"
+        )
+
+    def test_storage_offset_placeholder_lo4_fresh_trace_bmm(self):
+        """(B) Direct repro of #3770's exact op shape, single fresh trace.
+
+        [E, H, F] expert-weight tensor sliced to a [Ec, H, F] chunk at
+        chunk offset lo=4 (silently wrong per the issue: mean_rel ~1.30 vs.
+        the CPU fp32 reference's ~0.005), fed through torch.bmm -- batched
+        over the expert/chunk dim, the same dim the offset lives on. Only
+        ONE call, so a failure here isolates a single-trace bug in how the
+        batch-iteration address combines with the placeholder's own
+        storage_offset, with no graph reuse involved at all.
+        """
+
+        def fn(w_chunk, x):
+            # [Ec, H, F] x [Ec, F, N] -> [Ec, H, N], one matmul per expert
+            # in the chunk -- shaped like the chunked expert FFN.
+            return torch.bmm(w_chunk, x)
+
+        E, H, F, N = 8, 32, 64, 32
+        Ec = 2
+        lo = 4
+        base_w = cached_randn((E, H, F), differentiation="ph_moe_expert_w_lo4")
+        x = cached_randn((Ec, F, N), differentiation="ph_moe_expert_x_lo4").to("spyre")
+        cpu_w_chunk = base_w.clone()[lo : lo + Ec]
+        expected = fn(cpu_w_chunk, x.cpu()).float()
+
+        dev_w_chunk = base_w.clone().to("spyre")[lo : lo + Ec]
+        result = _compile_and_run(fn, [dev_w_chunk, x], "spyre", compile=True)
+        mean_rel = (
+            (result.float() - expected).abs().mean()
+            / expected.abs().mean().clamp(min=1e-6)
+        ).item()
+        assert torch.allclose(result.float(), expected, atol=0.1, rtol=0.1), (
+            f"mean_rel={mean_rel:.4f}, max abs diff: "
+            f"{(result.float() - expected).abs().max().item()} -- single "
+            "fresh-trace bmm on an outer/batch-dim offset chunk is wrong "
+            "with NO reuse involved (see #3770)"
+        )
+
+    def test_storage_offset_placeholder_reused_graph_distinct_offsets(self):
+        """(C) Same compiled callable, same shape, offset 0 then offset != 0.
+
+        Chunk 0 (offset 0) must compile correctly; subsequent calls at the
+        same shape but different offsets must NOT silently reuse an earlier
+        cached graph and read from the wrong offset.
+        """
+
+        def fn(x):
+            return x + x
+
+        base = cached_randn((8, 128), differentiation="ph_reuse_graph_offsets")
+        dev_base = base.clone().to("spyre")
+        comp = torch.compile(fn, dynamic=False)
+
+        for lo in (0, 4, 1, 6):
+            with self.subTest(lo=lo):
+                dev_view = dev_base[lo : lo + 1, :]
+                cpu_view = base.clone()[lo : lo + 1, :]
+                expected = fn(cpu_view).float()
+                result = comp(dev_view).cpu()
+                assert torch.allclose(result.float(), expected, atol=0.1, rtol=0.1), (
+                    f"lo={lo}: max abs diff: "
+                    f"{(result.float() - expected).abs().max().item()} -- "
+                    "compiled graph likely reused a stale storage_offset=0 "
+                    "trace (see #3770)"
+                )
+
+    def test_storage_offset_placeholder_moe_expert_chunk_matmul(self):
+        """(D) Same compiled callable reused, chunked MoE expert-weight bmm.
+
+        Mirrors the issue's isolation data across BOTH offsets with a single
+        compiled callable -- an [E, H, F] expert-weight tensor sliced into
+        per-chunk [Ec, H, F] views on the outermost (expert) dim, fed to the
+        SAME compiled matmul both at chunk offset 0 (correct per the issue)
+        and chunk offset lo=4 (silently wrong per the issue). If (B) above
+        already fails on lo=4 alone, this test failing too does not add
+        information about reuse specifically -- compare results across (B)
+        and (D) rather than reading (D) in isolation.
+        """
+
+        def fn(w_chunk, x):
+            # [Ec, H, F] x [Ec, F, N] -> [Ec, H, N], one matmul per expert
+            # in the chunk -- shaped like the chunked expert FFN.
+            return torch.bmm(w_chunk, x)
+
+        E, H, F, N = 8, 32, 64, 32
+        Ec = 2
+        base_w = cached_randn((E, H, F), differentiation="ph_moe_expert_w")
+        x = cached_randn((Ec, F, N), differentiation="ph_moe_expert_x").to("spyre")
+        dev_base_w = base_w.clone().to("spyre")
+        comp = torch.compile(fn, dynamic=False)
+
+        for lo in (0, 4):
+            with self.subTest(lo=lo):
+                w_chunk = dev_base_w[lo : lo + Ec]
+                cpu_w_chunk = base_w.clone()[lo : lo + Ec]
+                expected = fn(cpu_w_chunk, x.cpu()).float()
+                result = comp(w_chunk, x).cpu()
+                mean_rel = (
+                    (result.float() - expected).abs().mean()
+                    / expected.abs().mean().clamp(min=1e-6)
+                ).item()
+                assert torch.allclose(result.float(), expected, atol=0.1, rtol=0.1), (
+                    f"lo={lo}: mean_rel={mean_rel:.4f}, max abs diff: "
+                    f"{(result.float() - expected).abs().max().item()} -- "
+                    "expert chunk at nonzero storage_offset read the wrong "
+                    "storage (see #3770)"
+                )
+
     def test_binary_op_stick_crossing_last_dim(self):
         """A pointwise binary op whose stick (last) dim spans multiple sticks
         with an extent coprime with the committed core split must stay

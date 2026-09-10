@@ -2201,7 +2201,25 @@ def propagate_spyre_tensor_layouts(
                 new_layout = _eager_view_input_layout(real_input, ptl, name)
                 if new_layout is not None:
                     tb.data.data.layout = new_layout
-                tb.layouts = [stl]
+                    # For sub-region slices, compute device layout for the slice's
+                    # shape (not base's). For pure-offset views, keep original layout.
+                    # See #3770.
+                    is_sub_region = (
+                        real_input._base is not None
+                        and tuple(real_input.stride())
+                        == tuple(real_input._base.stride())
+                        and tuple(real_input.size()) != tuple(real_input._base.size())
+                    )
+                    if is_sub_region:
+                        slice_stl = SpyreTensorLayout(
+                            [concretize_expr(s) for s in new_layout.size],
+                            new_layout.dtype,
+                        )
+                        tb.layouts = [slice_stl]
+                    else:
+                        tb.layouts = [stl]
+                else:
+                    tb.layouts = [stl]
 
     # Alt layout each graph input has been forced to by a mutation write, so a
     # second write can detect a conflicting alt.
