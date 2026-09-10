@@ -19,6 +19,8 @@
 #include <ATen/ATen.h>
 #include <c10/util/intrusive_ptr.h>
 
+#include <flex/memory_interface/shared_host_pool.hpp>
+
 #include "module.h"
 
 namespace spyre {
@@ -32,6 +34,10 @@ at::Tensor spyre_empty_strided(c10::IntArrayRef size, c10::IntArrayRef stride,
 at::Tensor spyre_copy_from(const at::Tensor& self, const at::Tensor& dst,
                            bool non_blocking);
 
+void copy_tensor_raw(const at::Tensor& dev_tensor,
+                     const flex::SharedHostPool& pool, size_t slot_id,
+                     bool to_device, bool non_blocking = false);
+
 /**
  * Fill a spyre tensor with a scalar value using device-side FillDMA.
  *
@@ -39,8 +45,8 @@ at::Tensor spyre_copy_from(const at::Tensor& self, const at::Tensor& dst,
  * on-device without allocating a host buffer or performing an H2D DMA.
  *
  * @param self The spyre tensor to fill (in-place)
- * @param value The fill value as a double (converted to the correct hardware
- *              pattern based on the tensor's dtype)
+ * @param value The fill value as a double (converted to the correct
+ * hardware pattern based on the tensor's dtype)
  * @return The filled tensor (same as self)
  */
 at::Tensor spyre_fill_tensor(const at::Tensor& self, double value);
