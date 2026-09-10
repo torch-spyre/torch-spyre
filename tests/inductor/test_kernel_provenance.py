@@ -29,7 +29,9 @@ from torch_spyre._C import (
     DataFormats,
     ElementArrangement,
     extract_kernel_provenance_key as extract_kernel_provenance_key_cpp,
+    SymbolicArgKind,
 )
+from torch_spyre._inductor.codegen.compute_ops import SymbolKind
 from torch_spyre._inductor.op_spec import (
     DebugHandle,
     IndirectAccess,
@@ -706,3 +708,50 @@ class TestKernelProvenancePropagation:
         assert runner.profiler_event_name is None
         prepare_kernel.assert_called_once_with("/tmp/kernel/spyreCodeDir")
         register_kernel_provenance.assert_not_called()
+
+
+class TestSpyreSDSCKernelRunnerSymbolicArgs:
+    """Unit tests for the _symbolic_args payload built at construction time.
+
+    No device or C++ RuntimeContext required — construction does not call
+    prepare_kernel.
+    """
+
+    def _make_runner(self, symbol_kinds):
+        return SpyreSDSCKernelRunner(
+            "test_kernel", "/tmp/kernel", symbol_kinds=symbol_kinds
+        )
+
+    def test_no_symbol_kinds_leaves_symbolic_args_none(self):
+        """Without symbol_kinds, _symbolic_args must be None (no payload)."""
+        runner = self._make_runner([])
+        assert runner._symbolic_args is None
+
+    def test_non_pool_symbol_kinds_map_arg_index_directly(self):
+        """Non-pool symbol_kinds: tensor_id == sk.arg_index for each entry."""
+        symbol_kinds = [SymbolKind.kernel(0), SymbolKind.kernel(2)]
+        runner = self._make_runner(symbol_kinds)
+
+        assert runner._symbolic_args is not None
+        assert len(runner._symbolic_args) == 2
+        assert runner._symbolic_args[0].kind == SymbolicArgKind.kAddress
+        assert runner._symbolic_args[0].tensor_id == 0
+        assert runner._symbolic_args[1].kind == SymbolicArgKind.kAddress
+        assert runner._symbolic_args[1].tensor_id == 2
+
+    def test_pool_first_symbol_kinds_offsets_kernel_tensor_ids(self):
+        """Pool-first symbol_kinds: pool entry gets tensor_id=0; remaining
+        entries get tensor_id=sk.arg_index+1 to account for the pool tensor
+        that call_kernel prepends to args.
+        """
+        symbol_kinds = [SymbolKind.pool(), SymbolKind.kernel(0)]
+        runner = self._make_runner(symbol_kinds)
+
+        assert runner._symbolic_args is not None
+        assert len(runner._symbolic_args) == 2
+        # Pool slot → tensor_id=0 (the pool tensor prepended by call_kernel).
+        assert runner._symbolic_args[0].kind == SymbolicArgKind.kAddress
+        assert runner._symbolic_args[0].tensor_id == 0
+        # Kernel tensor at arg_index=0 → tensor_id=1 (+1 for pool offset).
+        assert runner._symbolic_args[1].kind == SymbolicArgKind.kAddress
+        assert runner._symbolic_args[1].tensor_id == 1

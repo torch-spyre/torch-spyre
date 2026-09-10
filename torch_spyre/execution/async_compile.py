@@ -91,13 +91,18 @@ def _compile_to_dir(
     compile_dir: str,
     specs,
     pool_size: int,
-) -> None:
+):
     """Run generate_bundle then dxp_standalone for ``specs`` into ``compile_dir``.
 
     Shared by the cache-miss path and the no-cache path so that any change to
     the compilation sequence is applied in both places automatically.
+
+    Returns:
+        The list of ``SymbolKind`` values produced by ``generate_bundle``,
+        describing the kind (address symbol vs. dimension argument) of each
+        symbol in the compiled bundle.
     """
-    generate_bundle(kernel_name, compile_dir, specs, pool_size=pool_size)
+    symbol_kinds = generate_bundle(kernel_name, compile_dir, specs, pool_size=pool_size)
 
     with torch.profiler.record_function(f"dxp_standalone:{kernel_name}"):
         try:
@@ -114,6 +119,7 @@ def _compile_to_dir(
                 code_dir=compile_dir,
             )
             raise
+    return symbol_kinds
 
 
 class SpyreAsyncCompile(AsyncCompile):
@@ -216,11 +222,16 @@ class SpyreAsyncCompile(AsyncCompile):
                 # so the rename in commit_compile_dir is atomic on POSIX.
                 compile_dir: str = allocate_compile_dir(cache_key)
                 try:
-                    _compile_to_dir(kernel_name, compile_dir, specs, pool_size)
+                    symbol_kinds = _compile_to_dir(
+                        kernel_name, compile_dir, specs, pool_size
+                    )
                     cached_dir = commit_compile_dir(compile_dir, cache_key)
                     logger.debug("Kernel compiled and cached at: %s", cached_dir)
                     return SpyreSDSCKernelRunner(
-                        kernel_name, cached_dir, kernel_provenance=kernel_provenance
+                        kernel_name,
+                        cached_dir,
+                        kernel_provenance=kernel_provenance,
+                        symbol_kinds=symbol_kinds,
                     )
                 except Exception:  # subprocess.CalledProcessError:
                     # Move the failed dir to failed/ for manual debugging
@@ -231,11 +242,12 @@ class SpyreAsyncCompile(AsyncCompile):
         # Caching disabled (SPYRE_KERNEL_CACHE=0 or force_disable_caches).
         # Compile into a throw-away temp dir that lives for this process only.
         output_dir = get_output_dir(kernel_name)
-        _compile_to_dir(kernel_name, output_dir, specs, pool_size)
+        symbol_kinds = _compile_to_dir(kernel_name, output_dir, specs, pool_size)
         return SpyreSDSCKernelRunner(
             kernel_name,
             output_dir,
             kernel_provenance=kernel_provenance,
+            symbol_kinds=symbol_kinds,
         )
 
     def ktir(

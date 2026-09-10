@@ -66,7 +66,7 @@ def generate_bundle(
     output_dir: str,
     specs: Sequence,
     pool_size: int = 0,
-):
+) -> list[SymbolKind]:
     """Output the SDSC Bundle for the OpSpecs in output_dir.
 
     ``specs`` is a list of ``OpSpec | LoopSpec`` entries (nested ``LoopSpec``
@@ -275,13 +275,18 @@ def generate_bundle(
         # Otherwise (default), pool allocation is emitted in the body as
         # device_mem_allocate, not as a function parameter.
         emit_pool_param = has_pool and _spyre_config.frontend_pool_allocation
+        # Built in lock-step with the params list so the two can never diverge.
+        # Dimension symbols excluded until kDimension is implemented.
+        param_symbol_kinds: list[SymbolKind] = []
         if emit_pool_param or kernel_arg_sym_indices or dimension_sym_indices:
             params = []
             if emit_pool_param:
                 params.append("%pool_base_addr: !sdscbundle.input_arg<index>")
+                param_symbol_kinds.append(SymbolKind.pool())
             for sym_idx in kernel_arg_sym_indices:
                 ai = symbol_kinds[sym_idx].arg_index
                 params.append(f"%arg_{ai}_base_addr: !sdscbundle.input_arg<index>")
+                param_symbol_kinds.append(symbol_kinds[sym_idx])
             for sym_idx in dimension_sym_indices:
                 dim_sk = symbol_kinds[sym_idx]
                 params.append(
@@ -471,6 +476,8 @@ def generate_bundle(
         bundle_path = os.path.join(output_dir, "bundle.mlir")
         with open(bundle_path, "r") as bf:
             sdsc_log.info("BUNDLE MLIR [bundle.mlir]\n%s", bf.read())
+
+    return param_symbol_kinds
 
 
 # ---------------------------------------------------------------------------
