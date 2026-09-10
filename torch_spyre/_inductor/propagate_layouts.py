@@ -346,6 +346,36 @@ def _check_supported_input_sticks(args: list[PropArg], op_label: str) -> None:
             )
 
 
+def _qfp8ch_stl(stl: SpyreTensorLayout, out_dtype: torch.dtype) -> SpyreTensorLayout:
+    """Output layout of ``qfp8ch``: fp16 (64/stick) -> fp8 (128/stick) quantization.
+
+    Propagates the input device layout, preserving any padding, and rescales
+    the stick depth the way ``rescale_stl_for_dtype`` does, except that the
+    num-sticks dim rounds UP: an fp16 tensor whose stick-indexing dim holds an
+    odd number of 64-element sticks ends in one partially filled 128-element
+    fp8 stick. That is a legitimate layout for this op -- the fp8->fp16
+    conversion that consumes it rebuilds a dense layout from the host size,
+    treating the partial stick exactly like any other unaligned stick dim --
+    so it must never floor to a size-0 dim (issue #3604).
+    """
+    in_eps = stl.device_size[-1]
+    out_eps = get_elem_in_stick(out_dtype)
+    out_device_size = list(stl.device_size)
+    out_stride_map = list(stl.stride_map)
+    out_device_size[-1] = out_eps
+    for i, s in enumerate(stl.stride_map):
+        if s == in_eps:
+            out_device_size[i] = -(-(stl.device_size[i] * in_eps) // out_eps)
+            out_stride_map[i] = out_eps
+            break
+    return SpyreTensorLayout(
+        out_device_size,
+        out_stride_map,
+        get_device_dtype(out_dtype),
+        ElementArrangement.QFP8CH,
+    )
+
+
 def _qfp8wt_stl(
     output: FixedLayout,
     in_layout: FixedLayout,
@@ -568,8 +598,10 @@ def _single_arg_op_layout(
         case spyreop.qfp8ch.default:
             # fp16 (64 elems/stick) -> fp8 (128 elems/stick) quantization.
             # Propagate the input device layout and rescale for the dtype change,
-            # preserving any padding present in the input STL.
-            return [rescale_stl_for_dtype(stl, output.dtype, ElementArrangement.QFP8CH)]
+            # preserving any padding present in the input STL. Not
+            # rescale_stl_for_dtype: an fp16 tensor with an odd stick count
+            # ends in a partially filled fp8 stick, which that helper rejects.
+            return [_qfp8ch_stl(stl, output.dtype)]
 
         case spyreop.qfp8wt.default:
             # fp16 -> fp8 weight quantization with 2D-stick layout [2, 64].
