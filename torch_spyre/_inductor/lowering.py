@@ -57,6 +57,11 @@ from .ir import (
 )
 from .logging_utils import get_inductor_logger
 
+from torch._prims_common import (
+    ELEMENTWISE_TYPE_PROMOTION_KIND,
+    elementwise_dtypes,
+)
+
 logger = get_inductor_logger("lowering")
 
 # A module-level lock + nesting counter to make the CM reentrant/thread-safe
@@ -1802,6 +1807,194 @@ def lower_minimum(x, y):
 )
 def lower_maximum(x, y):
     return with_int64_fallback(lowering.maximum, x, y)
+
+
+# ---------------------------------------------------------------------------
+# Comparison ops: aten.{eq,ne,lt,le,gt,ge}.Tensor / aten.{eq,ne,lt,le,gt,ge}.Scalar
+#
+# Spyre's hardware compare instructions only accept fp32 (and fp16) operands --
+# an integer compare reports "Unsupported: lesserequal on DataFormats.IEEE_INT32"
+# -- so integer OPERANDS must be converted to float before the native op runs.
+# Only the operands change: the RESULT stays torch.bool, which is what
+# aten.{eq,ne,lt,le,gt,ge} return. On device a bool is stored in an fp16/fp32
+# width physical format, and _BOOL_EQUIVALENT_DTYPES in dtype_ops.py maps that
+# physical format back to the dtype its layout is built from, so the logical
+# dtype can stay bool. Returning a float dtype instead would diverge from torch
+# semantics and make the result illegal as a `where` predicate.
+#
+# CAVEAT (int -> float is lossy): fp32 has a 24-bit significand, so integers
+# above 2**24 do not survive the conversion. Two distinct ints that round to the
+# same float compare EQUAL, which silently inverts eq/ne/lt/ge. The hardware has
+# no integer compare, so a single fp32 element cannot be exact; the limitation is
+# pinned by the `bigint` test cases rather than left for a model to discover. (An
+# int compared against an fp16 tensor promotes to fp16, dropping the threshold to
+# 2**11 -- but eager promotes identically, so that one is a torch semantic, not a
+# divergence.)
+#
+# POSSIBLE FUTURE EXTENSION: a full 32- or 64-bit integer *is* representable
+# exactly across the mantissas of several fp32 elements -- split the value into
+# 24-bit-or-less limbs and compare limb by limb, most significant first. That
+# would make the compare exact for the whole integer range, at the cost of a
+# multi-element expansion in the lowering and the layout to carry it. One fp32
+# element is used here deliberately, not by oversight: every integer that reaches
+# a comparison in an LLM (token ids, vocabulary bounds, positions, sequence
+# lengths, mask indices) is orders of magnitude below 2**24, so a single element
+# is already exact for all practical use. The limb form stays available if a
+# workload ever needs the full range.
+#
+# Each op is split into a .Tensor overload (broadcast=True) and a .Scalar
+# overload.  Both delegate to a shared ``_lower_cmp_impl`` helper so the
+# promotion logic lives in exactly one place.
+# ---------------------------------------------------------------------------
+
+
+def _make_cmp_pointwise(op_name: str):
+    """Return a broadcast-capable pointwise lowering for a comparison op."""
+    return lowering.make_pointwise(
+        lowering.ops_wrapper(op_name), override_return_dtype=torch.bool
+    )
+
+
+def _cmp_operand_dtype(tensors):
+    """Common operand dtype for a comparison, following torch's promotion.
+
+    Integers promote to float (the hardware has no integer compare) and mixed
+    float widths promote to the wider one -- exactly what
+    ELEMENTWISE_TYPE_PROMOTION_KIND.INT_TO_FLOAT computes for these operands.
+    Deriving the target from torch rather than hardcoding fp32 keeps the
+    comparison's semantics identical to eager, and makes a mixed-dtype pair
+    resolve to ONE dtype instead of reaching the native op in two different
+    physical formats.
+
+    Note this cannot reproduce torch's 0-dim promotion category (where ``fp16_1d
+    <= fp32_0d`` promotes to fp16, not fp32): ``broadcast=True`` on the .Tensor
+    registration means Inductor has already expanded 0-dim operands by the time
+    the lowering runs, so the distinction is not recoverable here. The comparison
+    is therefore done in fp32 where eager would do it in fp16, which differs only
+    when rounding the fp32 operand to fp16 changes the outcome.
+
+    Unifying the dtype does not make every mixed pair run on device, and the
+    three outcomes are worth keeping straight:
+
+    * fp16 <-> fp32 goes through dl16tofp32 / fp32todl16, which are
+      STICK-REORDERING conversions (see _STICK_REORDERING_OPS in dtype_ops.py):
+      the converted operand ends up with a staggered element arrangement. That is
+      legal on device and is NOT refused here -- propagate_layouts.py allows a
+      staggered operand to combine with a STANDARD one that broadcasts at the
+      stick dim, and rejects the rest. Both branches still fail overall, but for
+      two different reasons, and neither is this lowering's to fix:
+
+      - no stick-dim broadcaster: propagate_layouts.py refuses the operand
+        combination outright, which is a clean compile error.
+      - with a stick-dim broadcaster: the mask is computed CORRECTLY but carries
+        the staggered EA, and the D2H copy-out ignores element_arrangement and
+        reads the buffer as STANDARD, so the mask comes back PERMUTED with no
+        error. That is a pre-existing backend defect in the copy-out path, not in
+        any lowering: a staggered EA is legitimately consumed by a following
+        graph (the EA is stamped on the live tensor and honoured on device), so
+        the value itself is fine -- only the host readback is wrong. It is also
+        not specific to comparisons; plain ``add``/``mul`` on the same operands
+        hit it identically through stock Inductor promotion, as does a bare
+        ``x.float()`` returned directly, which is why device numerics must be
+        checked as ``.cpu().float()`` and never ``.float().cpu()``.
+
+      Both branches are expect_fail in the tests.
+    * int32 -> fp32 (int32tofp32) keeps the element byte size, so the EA is
+      unchanged and the comparison runs entirely on device.
+    * int32/int64 -> fp16 is not in DtypeOpTable at all, so ``to_dtype`` falls
+      back to a host cast. Those pairs produce the right answer and raise no EA
+      question -- no stick reordering is emitted -- but at the cost of a D2H/H2D
+      round-trip, and the fallback is only visible as a FallbackWarning.
+
+    All-``torch.bool`` operands are returned unchanged, deliberately diverging
+    from torch (which would promote them to fp32). A device bool is already stored
+    in an fp16/fp32-width numeric format, so it compares directly; promoting it
+    would insert a conversion that buys nothing and, from an fp16-layout bool,
+    would be EA-changing. Comparisons involving a bool operand -- against another
+    bool or against a numeric scalar -- agree with eager either way.
+    """
+    if all(t.get_dtype() == torch.bool for t in tensors):
+        return torch.bool
+    _, operand_dtype = elementwise_dtypes(
+        *(torch.empty(0, dtype=t.get_dtype()) for t in tensors),
+        type_promotion_kind=ELEMENTWISE_TYPE_PROMOTION_KIND.INT_TO_FLOAT,
+    )
+    return operand_dtype
+
+
+def _lower_cmp_impl(x, y, pointwise_fn):
+    """Convert both operands to a common float dtype, then apply pointwise_fn.
+
+    The operand dtype is computed from the TENSOR operands only, and a Python
+    scalar is then coerced to that dtype's kind (int -> float) rather than
+    converted. This is a mechanical constraint, not a semantic choice:
+    ``type_promotion_kind=None`` on the registration tells Inductor not to wrap
+    scalars, so a scalar arrives as a bare Python number with no ``get_dtype``
+    and ``to_dtype`` cannot be applied to it.
+
+    Leaving it out of the promotion does not change the answer. A Python scalar is
+    torch's weakest promotion category, so it never widens the tensor it is
+    compared against, and for every dtype the backend supports the result is the
+    same either way: fp16 tensor stays fp16 (``fp16_tensor <= 0.5`` is an fp16
+    compare, as in eager), and int32/int64 land on fp32 from INT_TO_FLOAT alone.
+    The lone exception is a bool tensor, where torch would promote to fp32 and
+    _cmp_operand_dtype deliberately does not -- see its docstring.
+    """
+    tensors = [v for v in (x, y) if hasattr(v, "get_dtype")]
+    operand_dtype = _cmp_operand_dtype(tensors)
+
+    def convert(v):
+        if hasattr(v, "get_dtype"):
+            if v.get_dtype() == operand_dtype:
+                return v
+            return to_dtype(v, operand_dtype)
+        if operand_dtype.is_floating_point and isinstance(v, int):
+            return float(v)
+        return v
+
+    return pointwise_fn(convert(x), convert(y))
+
+
+def _register_cmp_lowerings(aten_op, op_name: str):
+    """Register .Tensor and .Scalar lowerings for one comparison op."""
+    pw = _make_cmp_pointwise(op_name)
+
+    # override_return_dtype=torch.bool must be passed here as well as to
+    # make_pointwise. register_spyre_lowering forwards it to Inductor's
+    # process-global op_dtype_propagation_rules, and omitting it overwrites
+    # torch's own rule for this op name with OpDtypeRule(None, None). That
+    # registry is never restored -- unlike the lowering overlay, which
+    # enable_spyre_lowerings() saves and restores -- so a missing override
+    # breaks codegen for the cpp/triton backends in the same process, in
+    # compiles that never touch Spyre at all.
+    @register_spyre_lowering(
+        getattr(torch.ops.aten, aten_op).Tensor,
+        name=aten_op,
+        type_promotion_kind=None,
+        override_return_dtype=torch.bool,
+        broadcast=True,
+    )
+    def _tensor(x, y):
+        return _lower_cmp_impl(x, y, pw)
+
+    @register_spyre_lowering(
+        getattr(torch.ops.aten, aten_op).Scalar,
+        name=aten_op,
+        type_promotion_kind=None,
+        override_return_dtype=torch.bool,
+    )
+    def _scalar(x, y):
+        return _lower_cmp_impl(x, y, pw)
+
+    return _tensor, _scalar
+
+
+lower_eq_tensor, lower_eq_scalar = _register_cmp_lowerings("eq", "eq")
+lower_ne_tensor, lower_ne_scalar = _register_cmp_lowerings("ne", "ne")
+lower_lt_tensor, lower_lt_scalar = _register_cmp_lowerings("lt", "lt")
+lower_le_tensor, lower_le_scalar = _register_cmp_lowerings("le", "le")
+lower_gt_tensor, lower_gt_scalar = _register_cmp_lowerings("gt", "gt")
+lower_ge_tensor, lower_ge_scalar = _register_cmp_lowerings("ge", "ge")
 
 
 @register_spyre_lowering(torch.ops.spyre.qfp8ch)

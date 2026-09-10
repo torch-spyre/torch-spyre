@@ -1990,17 +1990,511 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
             },
         },
-        ("test_cmp_scalar_int64", "test_cmp_scalar_int64_cpu"): {
+        # -----------------------------------------------------------------------
+        # int64 scalar comparisons: all 6 ops, multiple shapes.
+        # The int64→fp32 conversion falls back to CPU (FallbackWarning expected);
+        # the comparison itself runs compiled on Spyre.
+        # -----------------------------------------------------------------------
+        ("test_cmp_int64_scalar", "test_cmp_int64_scalar_cpu"): {
             "ops_dict": {
+                "eq": torch.eq,
                 "ne": torch.ne,
+                "lt": torch.lt,
+                "le": torch.le,
+                "gt": torch.gt,
+                "ge": torch.ge,
             },
             "param_sets": {
-                # [1, 64] int64 non-contiguous (stride (64,1)) != scalar
-                "ne_1x64_int64_noncontig_eager": (
+                # 1-D: model case — e.g. expert_ids_g >= num_experts
+                # (grouped_mm_experts_forward in HuggingFace Transformers MoE)
+                # https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/integrations/moe.py#L426
+                "1d_272_scalar128": (
+                    torch.randint(0, 1000, (272,), dtype=torch.int64),
+                    128,
+                ),
+                # 1-D: stick-aligned
+                "1d_256_scalar128": (
+                    torch.randint(0, 1000, (256,), dtype=torch.int64),
+                    128,
+                ),
+                # 1-D: small non-aligned
+                "1d_44_scalar32": (
+                    torch.randint(0, 1000, (44,), dtype=torch.int64),
+                    32,
+                ),
+                # 2-D: stick-aligned last dim
+                "2d_4x64_scalar500": (
+                    torch.randint(0, 1000, (4, 64), dtype=torch.int64),
+                    500,
+                ),
+                # 2-D: non-aligned last dim (restickified by layout propagation)
+                "2d_7x44_scalar32": (
+                    torch.randint(0, 1000, (7, 44), dtype=torch.int64),
+                    32,
+                ),
+                # 2-D: non-contiguous int64 (stride (64,1)) vs scalar
+                "2d_1x64_noncontig_scalar0": (
                     torch.randint(0, 100, (1, 64), dtype=torch.int64).as_strided(
                         (1, 64), (64, 1)
                     ),
                     0,
+                ),
+                # 3-D: stick-aligned
+                "3d_2x4x64_scalar500": (
+                    torch.randint(0, 1000, (2, 4, 64), dtype=torch.int64),
+                    500,
+                ),
+                # 3-D: non-aligned
+                "3d_3x5x44_scalar32": (
+                    torch.randint(0, 1000, (3, 5, 44), dtype=torch.int64),
+                    32,
+                ),
+                # 4-D: stick-aligned
+                "4d_2x3x4x64_scalar500": (
+                    torch.randint(0, 1000, (2, 3, 4, 64), dtype=torch.int64),
+                    500,
+                ),
+                # 4-D: non-aligned
+                "4d_2x3x4x44_scalar32": (
+                    torch.randint(0, 1000, (2, 3, 4, 44), dtype=torch.int64),
+                    32,
+                ),
+            },
+        },
+        # -----------------------------------------------------------------------
+        # int64 tensor-vs-tensor comparisons: all 6 ops, multiple shapes.
+        # -----------------------------------------------------------------------
+        ("test_cmp_int64_tensor", "test_cmp_int64_tensor_cpu"): {
+            "ops_dict": {
+                "eq": torch.eq,
+                "ne": torch.ne,
+                "lt": torch.lt,
+                "le": torch.le,
+                "gt": torch.gt,
+                "ge": torch.ge,
+            },
+            "param_sets": {
+                "1d_64": (
+                    torch.randint(0, 1000, (64,), dtype=torch.int64),
+                    torch.randint(0, 1000, (64,), dtype=torch.int64),
+                ),
+                # 1-D: non-stick-aligned (CPU fallback for int32tofp32 on 1D non-32-aligned)
+                "1d_272": (
+                    torch.randint(0, 1000, (272,), dtype=torch.int64),
+                    torch.randint(0, 1000, (272,), dtype=torch.int64),
+                ),
+                "1d_44": (
+                    torch.randint(0, 1000, (44,), dtype=torch.int64),
+                    torch.randint(0, 1000, (44,), dtype=torch.int64),
+                ),
+                "2d_4x64": (
+                    torch.randint(0, 1000, (4, 64), dtype=torch.int64),
+                    torch.randint(0, 1000, (4, 64), dtype=torch.int64),
+                ),
+                "2d_7x44": (
+                    torch.randint(0, 1000, (7, 44), dtype=torch.int64),
+                    torch.randint(0, 1000, (7, 44), dtype=torch.int64),
+                ),
+                "3d_2x4x64": (
+                    torch.randint(0, 1000, (2, 4, 64), dtype=torch.int64),
+                    torch.randint(0, 1000, (2, 4, 64), dtype=torch.int64),
+                ),
+                "3d_3x5x44": (
+                    torch.randint(0, 1000, (3, 5, 44), dtype=torch.int64),
+                    torch.randint(0, 1000, (3, 5, 44), dtype=torch.int64),
+                ),
+                # broadcast: [1,1,1,2048] vs [1,1,heads,1] — typical attention mask pattern
+                "4d_broadcast_12heads": (
+                    torch.randint(0, 1000, (2048,), dtype=torch.int64).as_strided(
+                        [1, 1, 1, 2048], [2048, 2048, 2048, 1]
+                    ),
+                    torch.randint(0, 1000, (12,), dtype=torch.int64).as_strided(
+                        [1, 1, 12, 1], [12, 12, 1, 1]
+                    ),
+                ),
+                "4d_broadcast_14heads": (
+                    torch.randint(0, 1000, (2048,), dtype=torch.int64).as_strided(
+                        [1, 1, 1, 2048], [2048, 2048, 2048, 1]
+                    ),
+                    torch.randint(0, 1000, (14,), dtype=torch.int64).as_strided(
+                        [1, 1, 14, 1], [14, 14, 1, 1]
+                    ),
+                ),
+                "4d_broadcast_855heads": (
+                    torch.randint(0, 1000, (2048,), dtype=torch.int64).as_strided(
+                        [1, 1, 1, 2048], [2048, 2048, 2048, 1]
+                    ),
+                    torch.randint(0, 1000, (855,), dtype=torch.int64).as_strided(
+                        [1, 1, 855, 1], [855, 855, 1, 1]
+                    ),
+                ),
+                "4d_broadcast_41heads": (
+                    torch.randint(0, 1000, (2048,), dtype=torch.int64).as_strided(
+                        [1, 1, 1, 2048], [2048, 2048, 2048, 1]
+                    ),
+                    torch.randint(0, 1000, (41,), dtype=torch.int64).as_strided(
+                        [1, 1, 41, 1], [41, 41, 1, 1]
+                    ),
+                ),
+                "4d_broadcast_29heads": (
+                    torch.randint(0, 1000, (2048,), dtype=torch.int64).as_strided(
+                        [1, 1, 1, 2048], [2048, 2048, 2048, 1]
+                    ),
+                    torch.randint(0, 1000, (29,), dtype=torch.int64).as_strided(
+                        [1, 1, 29, 1], [29, 29, 1, 1]
+                    ),
+                ),
+            },
+        },
+        # -----------------------------------------------------------------------
+        # int32 scalar comparisons: all 6 ops, multiple shapes.
+        # int32 inputs are cast to fp32 inside the lowering (int32tofp32 OpFunc).
+        # -----------------------------------------------------------------------
+        ("test_cmp_int32_scalar", "test_cmp_int32_scalar_cpu"): {
+            "ops_dict": {
+                "eq": torch.eq,
+                "ne": torch.ne,
+                "lt": torch.lt,
+                "le": torch.le,
+                "gt": torch.gt,
+                "ge": torch.ge,
+            },
+            "expect_fail": ["1d_44_scalar32"],
+            "param_sets": {
+                # 1-D: stick-aligned
+                "1d_256_scalar128": (
+                    torch.randint(0, 1000, (256,), dtype=torch.int32),
+                    128,
+                ),
+                # 1-D: non-aligned
+                "1d_44_scalar32": (
+                    torch.randint(0, 1000, (44,), dtype=torch.int32),
+                    32,
+                ),
+                # 2-D: stick-aligned last dim
+                "2d_4x64_scalar500": (
+                    torch.randint(0, 1000, (4, 64), dtype=torch.int32),
+                    500,
+                ),
+                # 2-D: non-aligned last dim
+                "2d_7x44_scalar32": (
+                    torch.randint(0, 1000, (7, 44), dtype=torch.int32),
+                    32,
+                ),
+                # 3-D
+                "3d_2x4x64_scalar500": (
+                    torch.randint(0, 1000, (2, 4, 64), dtype=torch.int32),
+                    500,
+                ),
+                # 4-D
+                "4d_2x3x4x64_scalar500": (
+                    torch.randint(0, 1000, (2, 3, 4, 64), dtype=torch.int32),
+                    500,
+                ),
+            },
+        },
+        # -----------------------------------------------------------------------
+        # int32 tensor-vs-tensor comparisons: all 6 ops, multiple shapes.
+        # -----------------------------------------------------------------------
+        ("test_cmp_int32_tensor", "test_cmp_int32_tensor_cpu"): {
+            "ops_dict": {
+                "eq": torch.eq,
+                "ne": torch.ne,
+                "lt": torch.lt,
+                "le": torch.le,
+                "gt": torch.gt,
+                "ge": torch.ge,
+            },
+            "expect_fail": ["1d_44"],
+            "param_sets": {
+                # 1-D: stick-aligned
+                "1d_64": (
+                    torch.randint(0, 1000, (64,), dtype=torch.int32),
+                    torch.randint(0, 1000, (64,), dtype=torch.int32),
+                ),
+                # 1-D: non-aligned
+                "1d_44": (
+                    torch.randint(0, 1000, (44,), dtype=torch.int32),
+                    torch.randint(0, 1000, (44,), dtype=torch.int32),
+                ),
+                # 2-D
+                "2d_4x64": (
+                    torch.randint(0, 1000, (4, 64), dtype=torch.int32),
+                    torch.randint(0, 1000, (4, 64), dtype=torch.int32),
+                ),
+                "2d_7x44": (
+                    torch.randint(0, 1000, (7, 44), dtype=torch.int32),
+                    torch.randint(0, 1000, (7, 44), dtype=torch.int32),
+                ),
+                # 3-D
+                "3d_2x4x64": (
+                    torch.randint(0, 1000, (2, 4, 64), dtype=torch.int32),
+                    torch.randint(0, 1000, (2, 4, 64), dtype=torch.int32),
+                ),
+                # broadcast: [1,1,1,64] vs [1,1,8,1]
+                "4d_broadcast": (
+                    torch.randint(0, 1000, (64,), dtype=torch.int32).as_strided(
+                        [1, 1, 1, 64], [64, 64, 64, 1]
+                    ),
+                    torch.randint(0, 1000, (8,), dtype=torch.int32).as_strided(
+                        [1, 1, 8, 1], [8, 8, 1, 1]
+                    ),
+                ),
+            },
+        },
+        # -----------------------------------------------------------------------
+        # Python scalar operands, across tensor dtypes and scalar KINDS.
+        #
+        # A Python number dispatches the .Scalar overload, and
+        # type_promotion_kind=None means Inductor does not wrap it: it reaches the
+        # lowering as a bare int/float with no get_dtype, so to_dtype cannot be
+        # applied and only its kind is coerced (int -> float). The operand dtype
+        # therefore comes from the TENSOR alone.
+        #
+        # That is safe because a Python scalar is torch's weakest promotion
+        # category and never widens the tensor it is compared against -- fp16 x
+        # 2.5 stays an fp16 compare, as in eager. The one case where this file's
+        # helper deliberately disagrees with torch is a bool tensor (torch would
+        # promote to fp32; a device bool is already stored in a numeric fp16/fp32
+        # format and compares directly), which is why bool x scalar is covered
+        # here: the existing scalar families are int32/int64/float only.
+        #
+        # Scalars that do not survive the operand dtype are included on purpose --
+        # 1e5 overflows fp16 to inf, and eager does the same, so they agree.
+        # -----------------------------------------------------------------------
+        ("test_cmp_scalar_dtypes", "test_cmp_scalar_dtypes_cpu"): {
+            "ops_dict": {
+                "eq": torch.eq,
+                "ne": torch.ne,
+                "lt": torch.lt,
+                "le": torch.le,
+                "gt": torch.gt,
+                "ge": torch.ge,
+            },
+            "param_sets": {
+                # bool tensor: the all-bool short-circuit in _cmp_operand_dtype
+                "bool_int_scalar": (torch.tensor([True, False] * 128), 1),
+                "bool_float_scalar": (torch.tensor([True, False] * 128), 0.5),
+                # float tensor vs the OTHER kind of scalar than its own
+                "fp16_int_scalar": (
+                    torch.ceil(cached_randn((256,), abs=True, scale=10.0)).to(
+                        dtype=torch.float16
+                    ),
+                    3,
+                ),
+                "fp32_int_scalar": (
+                    torch.ceil(
+                        cached_randn((256,), abs=True, scale=10.0, dtype=torch.float32)
+                    ),
+                    3,
+                ),
+                # scalar not representable in the operand dtype: fp16 -> inf
+                "fp16_overflow_scalar": (
+                    torch.ceil(cached_randn((256,), abs=True, scale=10.0)).to(
+                        dtype=torch.float16
+                    ),
+                    100000.0,
+                ),
+                # int tensor vs a float scalar: promotes to fp32 either way
+                "int32_float_scalar": (
+                    torch.randint(0, 100, (256,), dtype=torch.int32),
+                    2.5,
+                ),
+            },
+        },
+        # -----------------------------------------------------------------------
+        # Mixed-dtype comparisons: the two operands do not share a dtype, so the
+        # lowering has to promote them to a common one (torch semantics: the wider
+        # float wins, an integer promotes to the other side's float type).
+        #
+        # fp16 x fp32 -> fp32: dl16tofp32 is a STICK-REORDERING conversion.
+        # expect_fail for two different reasons depending on the operand:
+        #   - no stick-dim broadcaster: propagate_layouts.py rejects the mixed-EA
+        #     pointwise op (clean compile error).
+        #   - with a stick-dim broadcaster: the compare is computed correctly but
+        #     the staggered result reads back PERMUTED -- a pre-existing defect in
+        #     the copy-out path (see issue #4393), not in this lowering.
+        #     These two xfail on a NUMERIC mismatch; they should XPASS once
+        #     copy-out honours element_arrangement.
+        #
+        # int32 x fp32 -> fp32: int32tofp32 is 4B->4B, EA unchanged, on device.
+        # int32 x fp16 -> fp16: int32->fp16 absent from DtypeOpTable, cast on HOST.
+        # -----------------------------------------------------------------------
+        ("test_cmp_mixed_dtype", "test_cmp_mixed_dtype_cpu"): {
+            "ops_dict": {
+                "eq": torch.eq,
+                "ne": torch.ne,
+                "lt": torch.lt,
+                "le": torch.le,
+                "gt": torch.gt,
+                "ge": torch.ge,
+            },
+            "expect_fail": [
+                "fp16_fp32_1d256",
+                "fp32_fp16_1d256",
+                "fp16_fp32_2d4x64",
+                "fp32_fp16_2d4x64",
+                "fp16_fp32_bcast_stick",
+                "fp16_fp32_bcast_0dim",
+            ],
+            "param_sets": {
+                # fp16 -> fp32 is stick-reordering: blocked by mixed EA
+                "fp16_fp32_1d256": (
+                    torch.ceil(cached_randn((256,), abs=True, scale=10.0)).to(
+                        dtype=torch.float16
+                    ),
+                    torch.ceil(
+                        cached_randn((256,), abs=True, scale=9.9, dtype=torch.float32)
+                    ),
+                ),
+                "fp32_fp16_1d256": (
+                    torch.ceil(
+                        cached_randn((256,), abs=True, scale=10.0, dtype=torch.float32)
+                    ),
+                    torch.ceil(cached_randn((256,), abs=True, scale=9.9)).to(
+                        dtype=torch.float16
+                    ),
+                ),
+                "fp16_fp32_2d4x64": (
+                    torch.ceil(cached_randn((4, 64), abs=True, scale=10.0)).to(
+                        dtype=torch.float16
+                    ),
+                    torch.ceil(
+                        cached_randn((4, 64), abs=True, scale=9.9, dtype=torch.float32)
+                    ),
+                ),
+                "fp32_fp16_2d4x64": (
+                    torch.ceil(
+                        cached_randn((4, 64), abs=True, scale=10.0, dtype=torch.float32)
+                    ),
+                    torch.ceil(cached_randn((4, 64), abs=True, scale=9.9)).to(
+                        dtype=torch.float16
+                    ),
+                ),
+                # broadcaster at stick dim: compute correct, readback PERMUTED (#4393)
+                "fp16_fp32_bcast_stick": (
+                    torch.ceil(cached_randn((4, 64), abs=True, scale=10.0)).to(
+                        dtype=torch.float16
+                    ),
+                    torch.ceil(
+                        cached_randn((4, 1), abs=True, scale=9.9, dtype=torch.float32)
+                    ),
+                ),
+                "fp16_fp32_bcast_0dim": (
+                    torch.ceil(cached_randn((4, 64), abs=True, scale=10.0)).to(
+                        dtype=torch.float16
+                    ),
+                    torch.tensor(2.0, dtype=torch.float32),
+                ),
+                # int32 -> fp16: cast on HOST (eager_fallback), compare on device
+                "int32_fp16_1d256": (
+                    torch.randint(0, 100, (256,), dtype=torch.int32),
+                    torch.ceil(cached_randn((256,), abs=True, scale=50.0)).to(
+                        dtype=torch.float16
+                    ),
+                ),
+                "fp16_int32_1d256": (
+                    torch.ceil(cached_randn((256,), abs=True, scale=50.0)).to(
+                        dtype=torch.float16
+                    ),
+                    torch.randint(0, 100, (256,), dtype=torch.int32),
+                ),
+                "int32_fp16_2d4x64": (
+                    torch.randint(0, 100, (4, 64), dtype=torch.int32),
+                    torch.ceil(cached_randn((4, 64), abs=True, scale=50.0)).to(
+                        dtype=torch.float16
+                    ),
+                ),
+                # int32 -> fp32: 4B->4B, EA unchanged, genuinely on device
+                "int32_fp32_1d256": (
+                    torch.randint(0, 100, (256,), dtype=torch.int32),
+                    torch.ceil(
+                        cached_randn((256,), abs=True, scale=50.0, dtype=torch.float32)
+                    ),
+                ),
+                "int32_fp32_2d4x64": (
+                    torch.randint(0, 100, (4, 64), dtype=torch.int32),
+                    torch.ceil(
+                        cached_randn((4, 64), abs=True, scale=50.0, dtype=torch.float32)
+                    ),
+                ),
+                # int64 x float16 -> float16: int64->fp16 absent from DtypeOpTable,
+                # cast runs on HOST (eager_fallback), compare on device in fp16
+                "int64_fp16_1d256": (
+                    torch.randint(0, 100, (256,), dtype=torch.int64),
+                    torch.ceil(cached_randn((256,), abs=True, scale=50.0)).to(
+                        dtype=torch.float16
+                    ),
+                ),
+                "fp16_int64_1d256": (
+                    torch.ceil(cached_randn((256,), abs=True, scale=50.0)).to(
+                        dtype=torch.float16
+                    ),
+                    torch.randint(0, 100, (256,), dtype=torch.int64),
+                ),
+                # int64 x float32 -> float32: int64->fp32 falls back to CPU,
+                # compare on device in fp32
+                "int64_fp32_1d256": (
+                    torch.randint(0, 100, (256,), dtype=torch.int64),
+                    torch.ceil(
+                        cached_randn((256,), abs=True, scale=50.0, dtype=torch.float32)
+                    ),
+                ),
+                "fp32_int64_1d256": (
+                    torch.ceil(
+                        cached_randn((256,), abs=True, scale=50.0, dtype=torch.float32)
+                    ),
+                    torch.randint(0, 100, (256,), dtype=torch.int64),
+                ),
+                # int64 x int32 -> float32: both cast to fp32
+                "int64_int32_1d256": (
+                    torch.randint(0, 100, (256,), dtype=torch.int64),
+                    torch.randint(0, 100, (256,), dtype=torch.int32),
+                ),
+                "int32_int64_1d256": (
+                    torch.randint(0, 100, (256,), dtype=torch.int32),
+                    torch.randint(0, 100, (256,), dtype=torch.int64),
+                ),
+            },
+        },
+        # -----------------------------------------------------------------------
+        # Large integers: int -> fp32 is LOSSY above 2**24.
+        # fp32 has a 24-bit significand; two distinct ints that round to the same
+        # float compare EQUAL, inverting the answer for every op.
+        # expect_fail to record the boundary; control cases below 2**24 pass.
+        # See _cmp_operand_dtype in lowering.py for the design note.
+        # -----------------------------------------------------------------------
+        ("test_cmp_bigint", "test_cmp_bigint_cpu"): {
+            "ops_dict": {
+                "eq": torch.eq,
+                "ne": torch.ne,
+                "lt": torch.lt,
+                "le": torch.le,
+                "gt": torch.gt,
+                "ge": torch.ge,
+            },
+            "expect_fail": ["int32_2e9", "int64_2e9", "int32_max"],
+            "param_sets": {
+                "int32_2e9": (
+                    torch.tensor([2000000000, 2000000001] * 32, dtype=torch.int32),
+                    torch.tensor([2000000001, 2000000000] * 32, dtype=torch.int32),
+                ),
+                "int64_2e9": (
+                    torch.tensor([2000000000, 2000000001] * 32, dtype=torch.int64),
+                    torch.tensor([2000000001, 2000000000] * 32, dtype=torch.int64),
+                ),
+                "int32_max": (
+                    torch.tensor([2147483647, 2147483646] * 32, dtype=torch.int32),
+                    torch.tensor([2147483646, 2147483647] * 32, dtype=torch.int32),
+                ),
+                # control: below 2**24 every integer is exact in fp32
+                "int32_small": (
+                    torch.tensor([1000, 1001] * 32, dtype=torch.int32),
+                    torch.tensor([1001, 1000] * 32, dtype=torch.int32),
+                ),
+                "int64_small": (
+                    torch.tensor([1000, 1001] * 32, dtype=torch.int64),
+                    torch.tensor([1001, 1000] * 32, dtype=torch.int64),
                 ),
             },
         },
@@ -6110,9 +6604,36 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         )
         self.compare_with_cpu(op, x, y, run_eager=eager_supported)
 
-    def test_cmp_scalar_int64_cpu(self, op, x, scalar):
-        # Test comparison ops with int64 tensors and scalar values.
-        self.compare_with_cpu(op, x, scalar, run_eager=True, run_compile=False)
+    def test_cmp_int64_scalar_cpu(self, op, x, scalar):
+        # int64 scalar comparison (int64→fp32 falls back to CPU for the cast).
+        # run_eager stays on: the eager path passes for these, and the family this
+        # replaced (test_cmp_scalar_int64) was eager-only, so turning it off would
+        # drop working coverage rather than add any.
+        self.compare_with_cpu(op, x, scalar, run_eager=True)
+
+    def test_cmp_int64_tensor_cpu(self, op, x, y):
+        # int64 tensor-vs-tensor comparison.
+        self.compare_with_cpu(op, x, y, run_eager=True)
+
+    def test_cmp_int32_scalar_cpu(self, op, x, scalar):
+        # int32 scalar comparison (int32→fp32 cast in the lowering).
+        self.compare_with_cpu(op, x, scalar, run_eager=True)
+
+    def test_cmp_int32_tensor_cpu(self, op, x, y):
+        # int32 tensor-vs-tensor comparison.
+        self.compare_with_cpu(op, x, y, run_eager=True)
+
+    def test_cmp_scalar_dtypes_cpu(self, op, x, scalar):
+        # Python scalar operands: the scalar is coerced by kind, not converted.
+        self.compare_with_cpu(op, x, scalar, run_eager=True)
+
+    def test_cmp_mixed_dtype_cpu(self, op, x, y):
+        # Operands with different dtypes: the lowering promotes both to one dtype.
+        self.compare_with_cpu(op, x, y, run_eager=True)
+
+    def test_cmp_bigint_cpu(self, op, x, y):
+        # Integers large enough that int→fp32 loses the distinction between them.
+        self.compare_with_cpu(op, x, y, run_eager=True)
 
     def test_linear_fn(self, x, weight, bias):
         # NOTE: relaxing atol from 2e-1 to 3e-1 for multi-dim work division, single element fails without
