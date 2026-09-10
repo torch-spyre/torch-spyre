@@ -130,7 +130,14 @@ jobs:
       image_label: ${{ inputs.runner_label || 'image_spyre_backend' }}
       extra_test_flags: -v -m "not xfail"
       extra_test_flags_multi_spyre: -v
-      checkout_pytorch: false
+      # On push (trunk) the matrix scans the whole tests/configs/ tree, which
+      # includes upstream configs whose `path:` references ${TORCH_ROOT} (the
+      # pytorch source tree, e.g. upstream_tests_beta/profiler-test_profiler).
+      # The spyre-backend runner image carries no pytorch source, so run_test.sh
+      # cannot resolve TORCH_ROOT and hard-exits. checkout-pytorch is the only
+      # step that sets TORCH_ROOT, so enable it on the push path. PRs
+      # (regression) do not schedule those configs and skip the checkout.
+      checkout_pytorch: ${{ github.event_name == 'push' }}
       ref: ${{ inputs.ref || '' }}
       repository: ${{ inputs.repository || '' }}
       rpm_location: ${{ inputs.rpm_location || '' }}
