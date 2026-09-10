@@ -59,8 +59,9 @@ class TestSpyreCCLBackend(TestCase):
         output = f"{proc.stdout}\n{proc.stderr}"
         assert proc.returncode != 0, output
         # - Torch Spyre will catch and throw with the message:
-        #   LOCAL_RANK must be a valid integer (no digits found): 'invalid'
-        assert "LOCAL_RANK must be a valid integer" in output, output
+        #   LOCAL_RANK is not a valid integer: 'invalid'
+        #   (raised from torch_spyre/csrc/spyre_guard.cpp)
+        assert "LOCAL_RANK is not a valid integer" in output, output
 
     def test_parse_local_rank_negative_raises(self) -> None:
         proc = self._run_local_rank_script("-1")
