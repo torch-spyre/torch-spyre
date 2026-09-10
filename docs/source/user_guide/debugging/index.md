@@ -132,8 +132,8 @@ if report is not None:
     print(report["_report_path"])
 ```
 
-See the [FFDC guide](../profiling/ffdc.md) for report locations,
-artifact interpretation, and pod/CI workflow.
+See the [FFDC guide](../profiling/ffdc.md) for the retrieve
+workflow, report schema, and per-category triage.
 
 ---
 

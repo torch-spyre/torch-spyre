@@ -62,8 +62,9 @@ if report is not None:
     print(report["_report_path"])
 ```
 
-See the [FFDC user guide](ffdc.md) for failure categories, report
-locations, pod/CI workflow, and JSON triage. The
+See the [FFDC user guide](ffdc.md) for the enable → fail → retrieve
+→ triage workflow, failure categories, report schema, and
+interpretation notes. The
 [API reference](../../api/torch_spyre.rst) documents the function
 contract.
 
@@ -110,7 +111,7 @@ The module also exposes `reset_accumulated_memory_stats()` and
   enumeration, runtime/driver variables used by `aiu-smi` and
   `aiu-trace-analyzer`
 - [FFDC (First Failure Data Capture)](ffdc.md) — automatic failure
-  reports, report locations, and triage workflow
+  reports, schema, and triage workflow
 - [PyTorch Profiler](pytorch_profiler.md) — `torch.profiler` usage, CPU
   today, device-side preview
 - [Device monitoring](device_monitoring.md) — `aiu-smi` setup
