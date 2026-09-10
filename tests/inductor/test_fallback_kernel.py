@@ -47,11 +47,13 @@ the Spyre device to guard against regressions.
 """
 
 import unittest
+import warnings
 
 import torch
 import torch.nn.functional as F
 
 from torch_spyre._inductor import config
+from torch_spyre.ops.eager import RetileWarning
 
 
 DEVICE = "spyre"
@@ -483,7 +485,14 @@ class TestFallbackResultNonCanonicalTiling(unittest.TestCase):
 
         args = [t.to(DEVICE) for t in (x, cache)] + [pos.to(DEVICE)]
         compiled = torch.compile(fn, fullgraph=True, dynamic=False, backend="inductor")
-        out = compiled(*args).cpu().float()
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always", RetileWarning)
+            out = compiled(*args).cpu().float()
+
+        self.assertFalse(
+            any(isinstance(w.message, RetileWarning) for w in caught),
+            "index_select should normalize its result on device",
+        )
 
         # A tile permutation preserves norms, so compare elementwise. Tolerance
         # is the fp16 accumulation floor; the bug produced errors of O(1..7).
@@ -515,10 +524,46 @@ class TestFallbackResultNonCanonicalTiling(unittest.TestCase):
             return joined * scale
 
         expected = fn(half.float(), scale.float())
-        out = torch.compile(fn, fullgraph=True, dynamic=False, backend="inductor")(
-            half.to(DEVICE), scale.to(DEVICE)
+        compiled = torch.compile(fn, fullgraph=True, dynamic=False, backend="inductor")
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always", RetileWarning)
+            out = compiled(half.to(DEVICE), scale.to(DEVICE))
+
+        self.assertFalse(
+            any(isinstance(w.message, RetileWarning) for w in caught),
+            "cat should normalize its result on device",
         )
         torch.testing.assert_close(out.cpu().float(), expected, atol=5e-2, rtol=5e-2)
+
+    def test_gemma_eager_results_normalize_without_host(self):
+        """The reduced mean and embedding shapes seen in Gemma avoid host repair."""
+        x = torch.randn(1, 64, self.INNER, dtype=DTYPE)
+        weight = torch.randn(32, self.INNER, dtype=DTYPE)
+        indices = torch.arange(64, dtype=torch.int64).remainder(32).view(1, 64)
+
+        cases = (
+            (
+                "mean",
+                lambda: x.to(DEVICE).mean(dim=-1, keepdim=True),
+                x.float().mean(dim=-1, keepdim=True),
+            ),
+            (
+                "embedding",
+                lambda: F.embedding(indices.to(DEVICE), weight.to(DEVICE)),
+                F.embedding(indices, weight).float(),
+            ),
+        )
+        for name, run, expected in cases:
+            with self.subTest(name=name):
+                with warnings.catch_warnings(record=True) as caught:
+                    warnings.simplefilter("always", RetileWarning)
+                    out = run().cpu().float()
+
+                self.assertFalse(
+                    any(isinstance(w.message, RetileWarning) for w in caught),
+                    f"{name} should normalize its result on device",
+                )
+                torch.testing.assert_close(out, expected, atol=5e-2, rtol=5e-2)
 
 
 class TestPermutedEagerResultNotNormalized(unittest.TestCase):
