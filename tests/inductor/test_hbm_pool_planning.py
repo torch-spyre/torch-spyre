@@ -690,8 +690,10 @@ class TestHbmPoolPlanningE2E(InductorTestCase):
 
     @config.patch({"lx_planning": False})
     def test_bundle_pool_size_threaded_from_hbm_pool_sizes(self):
-        """codegen_node must look up this bundle's own pool_size from
-        V.graph.hbm_pool_sizes, not a stale graph-global scalar.
+        """codegen_node must bind this bundle's own pool_size from
+        V.graph.hbm_pool_sizes before printing its kernel, not a stale
+        graph-global scalar. Pooling runs after the kernel is prepared, so
+        the value is observed at the binding point.
 
         lx_planning is disabled here so the `a = x + y` intermediate isn't
         claimed by LX scratchpad planning first -- with LX planning on,
@@ -704,11 +706,11 @@ class TestHbmPoolPlanningE2E(InductorTestCase):
         from torch_spyre._inductor.spyre_kernel import SpyreKernel
 
         seen_pool_sizes = []
-        orig_init = SpyreKernel.__init__
+        orig_codegen_kernel = SpyreKernel.codegen_kernel
 
-        def _recording_init(self, pool_size=0, **kwargs):
-            seen_pool_sizes.append(pool_size)
-            orig_init(self, pool_size=pool_size, **kwargs)
+        def _recording_codegen_kernel(self):
+            seen_pool_sizes.append(self.pool_size)
+            return orig_codegen_kernel(self)
 
         def fn(x, y):
             a = x + y
@@ -719,7 +721,7 @@ class TestHbmPoolPlanningE2E(InductorTestCase):
         y = torch.randn(64, 64, dtype=torch.float16, device="spyre")
 
         with (
-            mock_patch.object(SpyreKernel, "__init__", _recording_init),
+            mock_patch.object(SpyreKernel, "codegen_kernel", _recording_codegen_kernel),
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
             mock_patch("subprocess.run"),
