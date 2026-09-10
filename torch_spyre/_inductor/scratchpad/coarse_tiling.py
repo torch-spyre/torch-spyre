@@ -556,9 +556,9 @@ class CoarseTilingPass(ScratchpadOptimizationPass):
     loop group, provided each in-group consumer reads its producer tile by tile
     (else ``Unsupported``); the pass mints hint ids and a group-id offset from
     bases derived off the graph, stamps each op's ``dim_hints`` from its own
-    spec, validates group contiguity, then calls ``coarse_tile``. With empty (or all-untiled) ``choices`` it is a no-op and
-    the op count is unchanged -- which is what keeps it inert while
-    ``auto_coarse_tiling`` is off.
+    spec, validates group contiguity, then calls ``coarse_tile``. With empty (or
+    all-untiled) ``choices`` it is a no-op and the op count is unchanged -- which
+    is what keeps it inert until a solver hands it real choices.
     """
 
     def __init__(self, choices: Mapping[str, TileSpec]):

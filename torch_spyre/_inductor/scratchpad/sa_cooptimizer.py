@@ -55,6 +55,7 @@ from typing import TYPE_CHECKING, Any, Optional, Union, cast
 import sympy
 
 from torch_spyre._inductor.work_division import (
+    UNTILED as _UNTILED,
     OpSplitSpace,
     ResidencyEdge,
 )
@@ -67,6 +68,8 @@ from torch_spyre._inductor.scratchpad.plan_solver import (
     CoreDivisionBuffer,
     CoreDivisionLayoutSolver,
     LifetimeBoundBuffer,
+    TileAxis,
+    TileSpec,
     ceil_div,
 )
 from torch_spyre._C import NativePermutationLayoutSolver
@@ -141,6 +144,26 @@ def _canonical_key(division: "CoreDivision") -> tuple:
     )
 
 
+def _split_key(key: tuple) -> tuple:
+    """``key`` with the tiling dropped -- the part an *edge* compares.
+
+    A per-core view is a function of the splits alone, so two configs differing
+    only in their tiling slice the buffer identically and every edge relation
+    owes them the same verdict. Projecting here is what lets the enumerated
+    pair table, whose entries are all untiled, answer for a tiled config at
+    all. (What a tiling does change about an edge -- a consumer in another
+    tiling group reading the whole output rather than the per-tile scratch --
+    is a *cost*, not a compatibility, and is not priced yet.)
+
+    Only the tiling is dropped. A key carrying a fourth element is a menu
+    position disambiguated by :meth:`SaCoOptimizingSolver._build_sources`
+    because it repeats an earlier entry's split map, and those two entries are
+    physically distinct -- keeping them apart is exactly an edge's job, so the
+    disambiguator survives the projection.
+    """
+    return key[:2] + key[3:]
+
+
 @dataclass(frozen=True, eq=False)
 class DivisionConfig:
     """One op's work division as a value -- the annealer's state element.
@@ -198,6 +221,16 @@ class DivisionConfig:
     def output_partition(self) -> int:
         return self.division.output_partition
 
+    @property
+    def tiling(self) -> "TileSpec":
+        return self.division.tiling
+
+    @property
+    def output_tile_count(self) -> int:
+        """Loop tiles the op's own output is cut into, over output axes only --
+        the second factor its per-core footprint shrinks by."""
+        return self.division.tiling.output_tile_count
+
 
 def _one_axis_apart(left: "CoreDivision", right: "CoreDivision") -> bool:
     """Whether two divisions differ in exactly one axis's factor.
@@ -222,13 +255,15 @@ class _DivisionSource:
     handed it rather than holding one.
 
     The two structural moves ask for different scales. :meth:`neighbours` is
-    *one axis's factor*, which is what a flip takes -- ~7 legal factors per axis,
-    a list to pick from rather than an interval to propose over with a cooling
-    scale. But an op's legal divisions are not connected by one-axis moves (the
-    core budget blocks a factor going up, a span floor blocks it coming down),
-    so a search with only local moves does worse: +0.9% on the corpus.
-    :meth:`anchor` is the long-range draw that pays for it, and recolor is where
-    it belongs, since a flooded region is a coordinated change anyway.
+    *one step* -- one axis's factor, or one coarse tile level -- which is what a
+    flip takes: ~7 legal factors per axis, a list to pick from rather than an
+    interval to propose over with a cooling scale. But an op's legal divisions
+    are not connected by one-axis moves (the core budget blocks a factor going
+    up, a span floor blocks it coming down), so a search with only local moves
+    does worse: +0.9% on the corpus. :meth:`anchor` is the long-range draw that
+    pays for it, and recolor is where it belongs, since a flooded region is a
+    coordinated change anyway -- and, once tilings are in, since a tiling group
+    *is* a region that agrees on one ``TileSpec``.
     """
 
     def seed(self) -> DivisionConfig:
@@ -247,15 +282,15 @@ class _DivisionSource:
         over-approximation; :meth:`anchor` is what actually decides."""
         raise NotImplementedError
 
-    def _one_axis_moves(self, config: DivisionConfig) -> list[DivisionConfig]:
+    def _step_moves(self, config: DivisionConfig) -> list[DivisionConfig]:
         raise NotImplementedError
 
     def neighbours(self, config: DivisionConfig) -> list[DivisionConfig]:
-        """The divisions one axis away from ``config``. Memoized by choice,
-        since a search revisits states."""
+        """The divisions one step from ``config`` -- one axis's factor or one
+        tile level. Memoized by choice, since a search revisits states."""
         cached = self._neighbour_cache.get(config.key)
         if cached is None:
-            cached = self._one_axis_moves(config)
+            cached = self._step_moves(config)
             self._neighbour_cache[config.key] = cached
         return cached
 
@@ -299,7 +334,7 @@ class _MenuDivisions(_DivisionSource):
     def can_split(self) -> bool:
         return bool(self.splitting)
 
-    def _one_axis_moves(self, config: DivisionConfig) -> list[DivisionConfig]:
+    def _step_moves(self, config: DivisionConfig) -> list[DivisionConfig]:
         return [
             candidate
             for candidate in self.configs
@@ -334,7 +369,9 @@ class _GeneratedDivisions(_DivisionSource):
         return self._config_cache[key]
 
     def can_move(self) -> bool:
-        return any(len(factors) > 1 for factors in self.space.factor_domains.values())
+        return any(
+            len(factors) > 1 for factors in self.space.factor_domains.values()
+        ) or not (self.space.tiling is None or self.space.tiling.is_empty)
 
     def can_split(self) -> bool:
         return any(
@@ -342,14 +379,15 @@ class _GeneratedDivisions(_DivisionSource):
             for axis, factors in self.space.factor_domains.items()
         )
 
-    def _one_axis_moves(self, config: DivisionConfig) -> list[DivisionConfig]:
+    def _step_moves(self, config: DivisionConfig) -> list[DivisionConfig]:
         return [
             self.config_for(division)
             for division in self.space.neighbours(config.division)
         ]
 
     def anchor(self, config: DivisionConfig, rng) -> Optional[DivisionConfig]:
-        """Redraw every axis, keeping each draw that leaves the division legal.
+        """Redraw the tiling, then every axis, keeping each draw that leaves
+        the division legal.
 
         The generated stand-in for drawing uniformly from a menu's splitting
         entries: it reaches divisions many axis-steps away, and it costs one
@@ -360,19 +398,50 @@ class _GeneratedDivisions(_DivisionSource):
         The axes go in a random order: a draw is judged against the factors the
         axes after it still hold, so a fixed order would block raising an early
         axis wherever a later one holds the core budget.
+
+        The tiling is drawn *first* because the space is ragged in that order:
+        a tile level narrows the axis it cuts, so drawing the splits under the
+        chosen tiling reaches states that drawing them first cannot. A space
+        with no tiling half draws nothing here and leaves the trajectory of a
+        tiling-unaware search untouched.
         """
         splits = self.space.splits(config.division)
+        tiling = self._draw_tiling(splits, rng)
         axes = list(self.space.axes)
         rng.shuffle(axes)
         for axis in axes:
             candidate = dict(splits)
             candidate[axis] = rng.choice(self.space.factor_domains[axis])
-            if self.space.admits(candidate):
+            if self.space.admits(candidate, tiling):
                 splits = candidate
-        division = self.space.division(splits)
+        division = self.space.division(splits, tiling)
         if division.output_partition <= 1:
             return None
         return self.config_for(division)
+
+    def _draw_tiling(self, splits: dict, rng) -> "TileSpec":
+        """A tiling for a recolor to flood, drawn one output dim at a time.
+
+        Each tileable dim offers its legal counts plus ``None`` for "leave this
+        one alone", so an anchor is untiled with probability ``1/(k+1)`` per dim
+        rather than always tiled -- undividing a region has to stay reachable.
+        A draw that would make ``splits`` illegal is dropped, which keeps the
+        pair jointly legal without a second pass.
+        """
+        space = self.space.tiling
+        if space is None:
+            return _UNTILED
+        tiling = _UNTILED
+        for host_dim in space.output_dims:
+            count = rng.choice([None, *space.output_counts[host_dim]])
+            if count is None:
+                continue
+            candidate = TileSpec(
+                tiling.axes + (TileAxis(host_dim=host_dim, count=count),)
+            )
+            if self.space.admits(splits, candidate):
+                tiling = candidate
+        return tiling
 
 
 class _EdgeRelation:
@@ -404,6 +473,16 @@ class _TableRelation(_EdgeRelation):
     config, which is why a graph where only some ops have a split space is not a
     mixture of two answers: a generated division is one the enumeration would
     have carried, so its key is a key the table knows.
+
+    Every entry is untiled, since the enumeration carries no tilings, so the
+    projection is onto :func:`_split_key` -- the table answers for a tiled
+    config the same way it answers for its untiled twin, which is what the
+    geometry says. What it cannot do is *carry* a tiling across the edge: the
+    division it hands back is a menu entry, so a flood crossing a table edge
+    leaves the far side untiled. That is only ever a lost group, and the edges
+    that take this path are the ones whose far side has no tiling space to
+    speak of anyway (a clone parent, a non-``ComputedBuffer`` op, a
+    division-pinned op).
     """
 
     pairs: frozenset
@@ -411,13 +490,13 @@ class _TableRelation(_EdgeRelation):
     up: dict
 
     def compatible(self, parent: DivisionConfig, child: DivisionConfig) -> bool:
-        return (parent.key, child.key) in self.pairs
+        return (_split_key(parent.key), _split_key(child.key)) in self.pairs
 
     def child_for(self, parent: DivisionConfig) -> Optional[DivisionConfig]:
-        return self.down.get(parent.key)
+        return self.down.get(_split_key(parent.key))
 
     def parent_for(self, child: DivisionConfig) -> Optional[DivisionConfig]:
-        return self.up.get(child.key)
+        return self.up.get(_split_key(child.key))
 
 
 def _table_relation(
@@ -434,13 +513,15 @@ def _table_relation(
     """
     pc, cc = parent_menu.configs, child_menu.configs
     pairs = sorted(set(pairs))
-    key_pairs = frozenset((pc[ip].key, cc[ic].key) for ip, ic in pairs)
+    key_pairs = frozenset(
+        (_split_key(pc[ip].key), _split_key(cc[ic].key)) for ip, ic in pairs
+    )
     down: dict = {}
     up: dict = {}
     for ip, ic in sorted(pairs, key=lambda p: (p[1], p[0])):
-        down.setdefault(pc[ip].key, cc[ic])
+        down.setdefault(_split_key(pc[ip].key), cc[ic])
     for ip, ic in pairs:
-        up.setdefault(cc[ic].key, pc[ip])
+        up.setdefault(_split_key(cc[ic].key), pc[ip])
     return _TableRelation(key_pairs, down, up)
 
 
@@ -462,6 +543,11 @@ class _ViewRelation(_EdgeRelation):
     its solutions by enumeration order -- re-attaching generation to the menu it
     exists to replace. Both picks are compatible and both are deterministic;
     which one a flood is better off with is unmeasured.
+
+    Propagation is memoized on the *whole* key where compatibility is memoized
+    on the split half: the division constructed on the far side carries the
+    near side's tiling where it can, so which tiling was asked for changes the
+    answer even though the verdict does not.
     """
 
     edge: "ResidencyEdge"
@@ -472,7 +558,9 @@ class _ViewRelation(_EdgeRelation):
     _up: dict = field(default_factory=dict, repr=False)
 
     def compatible(self, parent: DivisionConfig, child: DivisionConfig) -> bool:
-        pair = (parent.key, child.key)
+        # Memoized on the split halves alone, matching ``ResidencyEdge`` --
+        # the views it compares do not see a tiling.
+        pair = (_split_key(parent.key), _split_key(child.key))
         if pair not in self._compatible:
             self._compatible[pair] = self.edge.compatible(
                 parent.division.splits, child.division.splits
@@ -806,14 +894,29 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
 
     def _per_core_size(self, idx: int, config: DivisionConfig) -> int:
         """Per-core footprint of buffer ``idx`` under ``config``:
-        ``ceil_div(total_size, output_partition)``, using the substrate's integer
-        helper so this rounds identically to every other footprint-division site.
+        ``ceil_div(total_size, output_partition * output_tile_count)``, using
+        the substrate's integer helper so this rounds identically to every
+        other footprint-division site -- ``CoreDivisionBuffer.min_footprint``
+        divides by the same product.
+
+        The tile count is the whole payoff channel for tiling. Every
+        tiling-sensitive term in the cost model is a derate bounded by 1.0, and
+        an untiled op has a working set of 0 by definition, so the objective
+        can rank tilings against each other but never above not tiling. What a
+        tiling can do is bring this footprint under :attr:`limit` in
+        :meth:`_eligible`, which is an engine threshold rather than a cost
+        term, and be paid for afterwards in the traffic residency frees.
+
+        Optimistic while it stands alone: this is the *per-tile* scratch, and
+        an op whose output escapes its tiling group also needs a full-extent
+        companion buffer that nothing sizes yet.
 
         Clamped non-negative so the packer never sees a negative size from the
         ``mem_usage`` ``-1`` sentinel; what stops an unsized buffer from looking
         *placeable* at zero footprint is
         :meth:`_assert_unsized_buffers_are_pinned`."""
-        return max(0, ceil_div(self._bufs[idx].size, config.output_partition))
+        divisor = config.output_partition * config.output_tile_count
+        return max(0, ceil_div(self._bufs[idx].size, divisor))
 
     def _eligible(self, idx: int) -> bool:
         """Whether buffer ``idx`` may be LX-resident under the current ``W``
@@ -1127,8 +1230,8 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
             self.packer.rotate(self._rng.randrange(n), self._rng.randrange(n))
         elif name == "flip":
             idx = self._rng.choice(self._flippable_ops)
-            # One axis's factor, drawn uniformly from the divisions an axis-step
-            # away.
+            # One axis's factor, or one coarse tile level, drawn uniformly
+            # from the divisions a step away.
             options = self._sources[idx].neighbours(self.chosen[idx])
             if not options:
                 return

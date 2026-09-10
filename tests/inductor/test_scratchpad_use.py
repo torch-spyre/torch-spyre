@@ -2586,5 +2586,52 @@ class TestGeneratedCoreDivisions(BaseTestScratchpadUsage):
         )
 
 
+class TestCoarseTilingIsGatedOnItsApplyStep(unittest.TestCase):
+    """Who may choose a coarse tiling, and what stops a choice nothing applies.
+
+    Two conjuncts, and only one of them is a choice: which engine is running
+    (the user's, through ``co_optimizing_lx_planning`` and ``layout_solver``),
+    and whether anything applies a chosen ``TileSpec`` (not a setting at all).
+    """
+
+    @staticmethod
+    def _annealer():
+        from torch_spyre._inductor.scratchpad import allocator as allocator_module
+        from torch_spyre._inductor.scratchpad.sa_cooptimizer import (
+            SaCoOptimizingSolver,
+        )
+
+        return allocator_module.CoOptimizingAllocator(
+            layout_planning=SaCoOptimizingSolver, size=1
+        )
+
+    @staticmethod
+    def _cpsat():
+        from torch_spyre._inductor.scratchpad import allocator as allocator_module
+        from torch_spyre._inductor.scratchpad.ilp_solver_ortools import (
+            CpSatLayoutSolver,
+        )
+
+        return allocator_module.CoOptimizingAllocator(
+            layout_planning=CpSatLayoutSolver, size=1
+        )
+
+    @unittest.skipUnless(_HAS_ORTOOLS, "the other engine here is cpsat")
+    def test_no_engine_is_offered_tilings_while_nothing_applies_them(self):
+        self.assertFalse(self._annealer()._solver_chooses_tilings)
+        self.assertFalse(self._cpsat()._solver_chooses_tilings)
+
+    @unittest.skipUnless(_HAS_ORTOOLS, "the other engine here is cpsat")
+    def test_once_they_are_applied_only_the_annealer_is_offered_them(self):
+        """Only a search that generates divisions can carry a ``TileSpec`` --
+        the enumerated menu has none to offer -- so an engine that indexes the
+        menu could not use a tiling space even if handed one."""
+        from torch_spyre._inductor.scratchpad import allocator as allocator_module
+
+        with patch.object(allocator_module, "TILE_CHOICES_ARE_APPLIED", True):
+            self.assertTrue(self._annealer()._solver_chooses_tilings)
+            self.assertFalse(self._cpsat()._solver_chooses_tilings)
+
+
 if __name__ == "__main__":
     unittest.main()

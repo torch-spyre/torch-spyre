@@ -2626,6 +2626,13 @@ class _DivisionMap(NamedTuple):
     enumerated: set[str]
 
 
+# Whether anything applies a solver's chosen ``TileSpec``s to the graph. Nothing
+# does yet, and offering a tiling until then is unsafe: the search prices the
+# per-tile footprint and the packer lays LX out by it, while the untiled graph
+# writes the full extent. Delete this, not set it True, when the apply step lands.
+TILE_CHOICES_ARE_APPLIED = False
+
+
 class CoOptimizingAllocator(ScratchpadAllocator):
     def __init__(
         self,
@@ -4036,13 +4043,40 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         never look at a space. Building one is not free -- a
         ``WorkDivisionContext`` and a factor domain per axis, per buffer -- so an
         engine that would ignore the answer does not pay for it.
+
+        Which engine it is *is* the switch, as far as a user is concerned:
+        ``select_allocator`` reaches this solver from exactly two settings
+        (``co_optimizing_lx_planning`` plus
+        ``layout_solver = "simulated_annealing"``), and a separate flag on top
+        could only ever disagree with them.
         """
         return self.layout_planning is SaCoOptimizingSolver
 
-    @staticmethod
-    def _division_space(op: Operation) -> Optional[OpSplitSpace]:
-        """The op's split space."""
-        return build_op_split_space(op, config.sencores)
+    @property
+    def _solver_chooses_tilings(self) -> bool:
+        """Whether the solver this allocator feeds picks coarse tilings too.
+
+        Only a generated division can carry a ``TileSpec`` -- the enumeration
+        has none to offer, so an engine that indexes it could not choose one if
+        it wanted to. Hence :attr:`_solver_generates_divisions`, gated on
+        ``TILE_CHOICES_ARE_APPLIED``.
+        """
+        return TILE_CHOICES_ARE_APPLIED and self._solver_generates_divisions
+
+    def _division_space(self, op: Operation) -> Optional[OpSplitSpace]:
+        """The op's split space.
+
+        The tiling half is attached only for the solver that can use it (see
+        :attr:`_solver_chooses_tilings`): deriving it costs a stick-alignment
+        analysis per output dim, so an engine that would ignore the answer does
+        not pay for it.
+        """
+        # Local: enumerate_tilings imports scratchpad.coarse_tiling, which
+        # imports this module.
+        from torch_spyre._inductor.wsr.enumerate_tilings import build_tiling_space
+
+        tiling = build_tiling_space(op) if self._solver_chooses_tilings else None
+        return build_op_split_space(op, config.sencores, tiling=tiling)
 
     def _eligible_clone_inputs(
         self, graph: GraphLowering, lifetimes: dict[str, list[int]]
