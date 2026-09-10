@@ -1481,13 +1481,16 @@ def _multi_arg_pointwise_layouts(
             projected_dim_order = [d - rank_diff for d in dim_order if d >= rank_diff]
             c_in_size = [concretize_expr(s) for s in arg.layout.size]
             c_in_stride = [concretize_expr(s) for s in arg.layout.stride]
-            in_stl = SpyreTensorLayout(
-                c_in_size,
-                c_in_stride,
-                out_dtype_for_layout,
-                projected_dim_order,
-                output_ea,
-            )
+            try:
+                in_stl = SpyreTensorLayout(
+                    c_in_size,
+                    c_in_stride,
+                    out_dtype_for_layout,
+                    projected_dim_order,
+                    output_ea,
+                )
+            except RuntimeError:
+                return False
             coord = try_device_coordinates(in_stl, arg.dep, ind_sizes)
             if coord is None or not is_stick_expr_offset_free(coord[-1], stick_size):
                 return False
