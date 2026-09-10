@@ -104,6 +104,7 @@ import math
 import os
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
+from functools import cached_property
 from typing import TYPE_CHECKING, Any, Generic, Optional, TypeVar, cast
 import sympy
 from sympy.printing.printer import Printer
@@ -290,6 +291,27 @@ class _LifetimeBufferWithCpVars(Generic[_BufT]):
 
 
 @dataclass
+class _DivisionLiterals(dict):
+    """``i -> literal(division == i)``, minted on first lookup.
+
+    A ``dict`` with ``__missing__`` rather than a ``defaultdict``: the factory
+    needs the key to build the literal and to reify both directions of the
+    equality, so the same literal can stand for ``division == i`` wherever the
+    model asks for it.
+    """
+
+    def __init__(self, model: Any, name: str, division: Any) -> None:
+        super().__init__()
+        self._model, self._name, self._division = model, name, division
+
+    def __missing__(self, i: int) -> Any:
+        lit = self._model.new_bool_var(f"div_{self._name}_is_{i}")
+        self._model.add(self._division == i).only_enforce_if(lit)
+        self._model.add(self._division != i).only_enforce_if(lit.Not())
+        self[i] = lit
+        return lit
+
+
 class _CoreDivisionBufferWithCpVars(_LifetimeBufferWithCpVars[CoreDivisionBuffer]):
     """The joint-model wrapper: a :class:`CoreDivisionBuffer` plus the vars for
     its chosen core division (``division``), the per-core footprint that
@@ -356,24 +378,21 @@ class _CoreDivisionBufferWithCpVars(_LifetimeBufferWithCpVars[CoreDivisionBuffer
         m.add_element(self.division, cores_used, self.cores)
         m.add_element(self.division, core_cost, self.core_cost)
 
-        # Reified ``division == i`` literals, minted on demand and shared between
-        # the relayout coupling and the objective's KroneckerDelta lowering so
-        # one decision is one literal.
-        self._division_is: dict[int, Any] = {}
         # For a relayout copy only: the served literals of the consumer edges
         # it can carry, filled by the sources' constrain_residency and consumed
         # by _constrain_relayout_copies ("a resident copy serves someone").
         self.serves: list[Any] = []
 
+    @cached_property
+    def division_literals(self) -> "_DivisionLiterals":
+        """Reified ``division == i`` literals, minted on first use and shared
+        between the relayout coupling and the objective's KroneckerDelta
+        lowering, so one decision is one literal."""
+        return _DivisionLiterals(self.model, self.name, self.division)
+
     def division_is(self, i: int) -> Any:
         """The literal ``division == i`` (both directions enforced)."""
-        lit = self._division_is.get(i)
-        if lit is None:
-            lit = self.model.new_bool_var(f"div_{self.name}_is_{i}")
-            self.model.add(self.division == i).only_enforce_if(lit)
-            self.model.add(self.division != i).only_enforce_if(lit.Not())
-            self._division_is[i] = lit
-        return lit
+        return self.division_literals[i]
 
     @property
     def parents(self) -> list[str]:
