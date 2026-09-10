@@ -297,6 +297,11 @@ def _core_slices(view: PerCoreView, num_cores: int) -> dict[int, dict[int, int]]
 
 
 def partition_footprint(layout: FixedTiledLayout, view: PerCoreView) -> int:
+    """Measure a relayout candidate in normalized standard device layout.
+
+    FixedTiledLayout can wrap an explicit device shape, so its type alone does
+    not guarantee a complete final stick axis. The span helper validates it.
+    """
     device_layout = layout.device_layout
     if device_layout.element_arrangement != ElementArrangement.STANDARD:
         raise ValueError("relayout footprint requires standard element arrangement")
@@ -342,6 +347,8 @@ def movement_supported(
     ):
         return False
     if num_cores == destination_num_cores and destination_slices < num_cores:
+        # This level only contracts existing source axes. #4152 lifts this
+        # scope restriction for combined gather/broadcast on other axes.
         if any(
             source_splits.get(dim, 1) % destination_splits.get(dim, 1)
             for dim in source_splits.keys() | destination_splits.keys()
@@ -373,12 +380,18 @@ def movement_supported(
     )
     return bool(edges) and all(
         (
+            # Every source sends to the same number of destination cores.
             len(set(fanout)) == 1,
+            # Every destination receives from the same number of source cores.
             len(set(fanin)) == 1,
+            # Every source slice is present exactly once.
             len({tuple(sorted(row.items())) for row in source_map.values()})
             == num_cores,
+            # Every distinct destination slice is covered.
             len(replicas) == destination_slices,
+            # Within one core domain, each slice has equally many copies.
             num_cores != destination_num_cores or len(set(replicas.values())) == 1,
+            # A larger domain only broadcasts: one source per destination.
             num_cores == destination_num_cores
             or (fanout[0] == destination_num_cores // num_cores and fanin[0] == 1),
         )
@@ -542,7 +555,8 @@ def collect_lx_relayout_plans(
                     "cannot emit: consumer uses fewer physical cores than producer"
                 )
                 break
-            if consumer_num_cores > source_num_cores and not _is_matmul_op(consumer):
+            is_matmul = _is_matmul_op(consumer)
+            if consumer_num_cores > source_num_cores and not is_matmul:
                 rejection_reason = (
                     "cannot emit: grouped broadcast requires a matmul consumer"
                 )
@@ -566,7 +580,6 @@ def collect_lx_relayout_plans(
             consumer_space = iteration_space_from_op(consumer)
             if view.same_partition(source_view):
                 continue
-            is_matmul = _is_matmul_op(consumer)
             if is_matmul and len(deps) != 2:
                 rejection_reason = (
                     "cannot emit: matmul consumer does not have two inputs"
@@ -616,6 +629,10 @@ def collect_lx_relayout_plans(
         # Reuse the ownership comparison and preserve first-consumer order.
         destinations: list[tuple[PerCoreView, int, list[str]]] = []
         if rejection_reason is None:
+            # Both footprint checks are before placement: an invalid or
+            # unsupported candidate size declines this optional relayout,
+            # with the exact reason logged below, leaving the original buffer.
+            # This does not waive layout/codegen validation or catch assertions.
             try:
                 source_footprint = partition_footprint(producer.layout, source_view)
             except (TypeError, ValueError) as exc:

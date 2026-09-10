@@ -664,13 +664,17 @@ def partition_physical_span_bytes(
     device_dtype: DataFormats,
     split_by_device_dim: Mapping[int, int],
 ) -> int:
-    """Bound a standard-layout partition, retaining physical gaps between rows.
+    """Bound a normalized standard-layout partition, including gaps between rows.
 
     Device dimensions are stored in decreasing physical-stride order. The
     layout's ``stride_map`` instead addresses HOST memory and must not size LX.
     A backend may pack a partition more tightly; retaining the original device
-    strides is a conservative bound. The final dimension is one complete stick
-    and is never split. This measures placement, not the split-cost estimate.
+    strides is a conservative bound. The caller must supply a final dimension
+    of exactly ``device_dtype.elems_per_stick()`` elements, with no split on
+    that axis. Host-shape SpyreTensorLayout construction provides this form;
+    an explicit device shape is not guaranteed to. Non-positive extents and
+    invalid split axes/factors also raise ValueError, never a guessed size.
+    This measures placement, not the split-cost estimate.
     """
 
     if not device_size or any(extent <= 0 for extent in device_size):

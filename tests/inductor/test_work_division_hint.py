@@ -694,7 +694,8 @@ def _allocation_graph(*operation_names):
             32,
             True,
         ),
-        # Combined gather/broadcast is not enabled at this level.
+        # Scope cut, not an edge-model limitation: #4152 enables this
+        # combined gather/broadcast and changes the expectation to True.
         (
             _view({2: 32}, {2: Mod(_CORE_ID, 32)}, 32),
             _view(
