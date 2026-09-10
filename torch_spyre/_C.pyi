@@ -45,6 +45,7 @@ __all__: list[str] = [
     "register_kernel_provenance",
     "set_downcast_warning",
     "set_spyre_tensor_layout",
+    "spyre_empty_reserved",
     "spyre_empty_with_layout",
     "start_runtime",
     "to_with_layout",
@@ -455,6 +456,20 @@ def set_downcast_warning(arg0: bool) -> None:
     """
 
 def set_spyre_tensor_layout(arg0: torch.Tensor, arg1: SpyreTensorLayout) -> None: ...
+def spyre_empty_reserved(
+    size: tuple[int, ...],
+    stride: tuple[int, ...],
+    dtype: torch.dtype,
+    dim: int,
+    max_size: int,
+) -> torch.Tensor:
+    """
+    Allocate a Spyre tensor whose physical layout/storage are sized for
+    dim `dim` == `max_size`, while its logical (PyTorch-visible)
+    size/stride stay at `size`/`stride`. Backs
+    tensor.to("spyre", max=...).
+    """
+
 def spyre_empty_with_layout(
     arg0: tuple[int, ...],
     arg1: tuple[int, ...],

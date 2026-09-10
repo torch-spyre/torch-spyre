@@ -175,6 +175,18 @@ class SpyreTensorImpl : public at::TensorImpl {
   std::vector<int64_t> dma_sizes;
   std::vector<int64_t> dma_strides;
 
+  /**
+   * When set, this tensor's physical allocation (spyre_layout/storage) is
+   * sized for host_size[*reserved_dim] == *reserved_max rather than the
+   * tensor's current logical size at that dim. Used to support
+   * `tensor.to("spyre", max=...)`: the buffer is allocated once for the
+   * declared ceiling so later in-place resizes to a smaller/larger (but
+   * still <= max) concrete shape never require reallocation or invalidate
+   * the compiled graph's layout guard.
+   */
+  std::optional<int64_t> reserved_dim;
+  std::optional<int64_t> reserved_max;
+
   SpyreTensorImpl(c10::Storage&& storage, c10::DispatchKeySet key_set,
                   const caffe2::TypeMeta& dtype);
 
