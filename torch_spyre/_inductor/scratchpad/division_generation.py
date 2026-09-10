@@ -32,10 +32,12 @@ candidate at a time. This module holds the per-candidate side:
   :meth:`ResidencyEdge.consumer_division_for` and its mirror *construct* the
   other end's division rather than looking it up.
 
-``allocator.py`` materializes the edge relation as the ``cd_parent_matches``
-pair table every engine consumes today. Nothing here decides *which* candidate
-to take: the space and the edge are pure oracles, so a search owns its own
-proposal distribution and its own randomness.
+``allocator.py`` hands both to the solver on each buffer (``division_space`` and
+``residency_edges``), and *also* materializes the edge relation as the
+``cd_parent_matches`` pair table, which the CP-SAT and DFS engines still consume
+and which serves as the fallback wherever a space could not be derived. Nothing
+here decides *which* candidate to take: the space and the edge are pure oracles,
+so a search owns its own proposal distribution and its own randomness.
 """
 
 import math

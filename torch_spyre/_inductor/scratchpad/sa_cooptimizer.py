@@ -767,6 +767,20 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         # undividing to atomic flips. Static; what a given step can actually
         # draw is :meth:`_DivisionSource.anchor`.
         self._anchor_candidates = [i for i in range(n) if self._sources[i].can_split()]
+        generated = sum(
+            isinstance(source, _GeneratedDivisions) for source in self._sources
+        )
+        view_relations = sum(
+            isinstance(relation, _ViewRelation) for relation in self._relations.values()
+        )
+        logger.debug(
+            "division sources: %d generated / %d from the menu; edge relations: "
+            "%d per candidate / %d from the pair table",
+            generated,
+            n - generated,
+            view_relations,
+            len(self._relations) - view_relations,
+        )
         self._precompute_spill_costs()
 
     def _edge_relation(self, p_idx: int, c_idx: int, p_name: str) -> _EdgeRelation:
