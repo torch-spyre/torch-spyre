@@ -64,8 +64,8 @@ paths to link into the report.
 |---|---|---|---|
 | `compile_frontend` | Frontend | `torch.compile()` / Spyre Inductor frontend fails (including decomposition and lowering paths that surface through `compile_fx`) | `torch_spyre/_inductor/__init__.py` |
 | `compile_backend` | Backend | `dxp_standalone` / bundle compilation fails while generating op-spec / MLIR artifacts | `torch_spyre/execution/async_compile.py` |
-| `runtime_launch` | Runtime | Kernel launch or `launch_jobplan` fails on device | `torch_spyre/execution/kernel_runner.py` (`SpyreSDSCKernelRunner`) |
-| `unimplemented` | Runtime | An op reaches the runtime without a Spyre lowering | `torch_spyre/execution/kernel_runner.py` (`SpyreUnimplementedRunner`) |
+| `runtime_launch` | Runtime | Kernel launch or `launch_jobplan` fails on device | `torch_spyre/execution/kernel_runner.py` (`SpyreSDSCKernelRunner.run`) |
+| `unimplemented` | Runtime | An op reaches the runtime without a Spyre lowering | `torch_spyre/execution/kernel_runner.py` (`SpyreUnimplementedRunner.run`) |
 | `unknown` | — | Manual collection or empty category input normalized at capture time | `torch_spyre/profiler/_ffdc.py` |
 
 FFDC never changes program behaviour: hooks use nested `try/except` so
@@ -208,9 +208,16 @@ To exercise runtime hooks on hardware without a full model failure:
 TORCH_SPYRE_FFDC=1 TORCH_COMPILE_DEBUG=1 python tools/ffdc_trigger.py
 ```
 
+The tool prints `export TORCHINDUCTOR_CACHE_DIR=...`. A new interpreter
+does not inherit that isolated cache unless you export it (otherwise
+`cache_dir()` assigns the default shared cache and
+`get_diagnostic_report()` will miss the reports this run just wrote).
+If the tool created the isolated dir, it is left on disk.
+
 Print the exact report path that `get_diagnostic_report()` would return:
 
 ```bash
+export TORCHINDUCTOR_CACHE_DIR=<path printed by the tool>
 python - <<'PY'
 import torch
 import torch_spyre
@@ -219,6 +226,10 @@ report = torch.spyre.get_diagnostic_report()
 print(report["_report_path"] if report is not None else "No FFDC report found")
 PY
 ```
+
+The tool also prints a commented `rm -rf <dir>` for an auto-created
+cache. Uncomment and run it **after** retrieve (the reports live under
+that tree).
 
 Copy it to your laptop (replace `<pod>` and use the exact path printed above —
 the filename's category prefix depends on which hook fired:
