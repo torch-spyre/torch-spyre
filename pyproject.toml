@@ -91,7 +91,7 @@ package-dir = { torch_spyre = "torch_spyre" }
 package-data = { torch_spyre = ["*.dll", "*.dylib", "*.so"] }
 
 [tool.setuptools.packages.find]
-exclude = ["tests", "extensions"]  # exclude packages matching these glob patterns (empty by default)
+exclude = ["tests*", "extensions*"]  # glob patterns: the trailing * also excludes tests.* / extensions.* subpackages, not just the bare top-level name
 
 [tool.setuptools.dynamic]
 version = {attr = "torch_spyre.version.__version__"}  # any module attribute compatible with ast.literal_eval
