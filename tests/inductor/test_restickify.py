@@ -2624,6 +2624,38 @@ def test_round_up_to_stick_geometry():
 # ---------------------------------------------------------------------------
 
 
+def test_nonstick_no_reorder_when_large_dim_already_at_slot():
+    """Pass must not move a dim when slot already holds the largest dim.
+
+    Layout: [broadcast_outside, outer_stick, large_dim, inner_stick]
+    idc=['0', 'floor(d1/64)', 'd0', 'Mod(d1, 64)'] — outer_stick=1, slot=2,
+    large M dim (d0) is already at slot.  The outside dim (index 0) has
+    coordinate '0' (broadcast) and is not a useful candidate.  No reorder.
+
+    Uses bmm with batch=55, M=1, K=99.
+    """
+
+    def fn(x, w):
+        y = x * 2.0
+        return torch.bmm(y, w)
+
+    x = torch.randn(55, 1, 99, dtype=torch.float16)
+    w = torch.randn(55, 99, 128, dtype=torch.float16)
+
+    spyre_result, _, nonstick_log = _compile_and_run_nonstick_capture(
+        fn,
+        x.to(DEVICE),
+        w.to(DEVICE),
+    )
+    cpu_result = fn(x, w)
+    torch.testing.assert_close(spyre_result.cpu(), cpu_result, atol=0.1, rtol=0.1)
+
+    assert not nonstick_log, (
+        "Expected no reorder when large dim is already at slot, "
+        f"but got: {[(k, [list(s.device_size) for s in v]) for k, v in nonstick_log.items()]}"
+    )
+
+
 def test_nonstick_reorder_pointwise_into_matmul():
     """Pointwise feeding a bmm gets largest non-stick dim moved into the stick sandwich slot.
 

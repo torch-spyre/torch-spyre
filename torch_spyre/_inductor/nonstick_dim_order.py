@@ -76,6 +76,14 @@ def _reorder_stl(
         return stl  # unsplit stick, no slot to fill
 
     slot = outer_stick + 1
+    logger.debug(
+        "nonstick_dim_order: %s idc=%s outer_stick=%d slot=%d n=%d",
+        name,
+        [str(x) for x in idc],
+        outer_stick,
+        slot,
+        n,
+    )
     if slot >= n - 1:
         logger.debug(
             "nonstick_dim_order: skipping %s — no room between stick dims"
@@ -86,12 +94,14 @@ def _reorder_stl(
         )
         return stl
 
-    # Frozen dims: the two stick dims must not move.
-    frozen = {outer_stick, n - 1}
-    candidates = [d for d in range(n) if d not in frozen]
+    # Only move dims from outside (before outer_stick) into the slot,
+    # and only if the largest outside dim is bigger than what's already there.
+    candidates = list(range(outer_stick))
+    if not candidates:
+        return stl
     largest = max(candidates, key=lambda d: device_size[d])
-    if largest == slot:
-        return stl  # already optimal
+    if device_size[largest] <= device_size[slot]:
+        return stl  # already optimal or nothing to gain
 
     # Swap largest into slot.
     new_order = list(range(n))
@@ -117,7 +127,6 @@ def _backward_pass(graph: GraphLowering) -> set[str]:
         if op.data.reduction_type not in MATMUL_REDUCTION_OPS:
             continue
         out_name = op.get_name()
-        # TODO: also reorder the matmul's own output (currently disabled).
         # if out_name not in graph_inputs:
         #     targets.add(out_name)
         for dep in op.get_read_writes().reads:
