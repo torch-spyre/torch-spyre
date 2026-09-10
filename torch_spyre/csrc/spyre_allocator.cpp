@@ -17,6 +17,7 @@
 
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <utility>
 
 #include "logging.h"
@@ -163,8 +164,26 @@ c10::DataPtr SpyreAllocator::allocate(
   auto flex_alloc = getFlexAllocator();
 
   // Allocate first-class raw storage via CompositeAddress.
-  flex::CompositeAddress composite_addr =
-      flex_alloc->allocate(nbytes, directive);
+  //
+  // If this thread holds the GIL, release it for the duration of this call.
+  // If FlexAllocator hits memory pressure it invokes memoryPressureCallback(),
+  // which must acquire the GIL to run PyGC_Collect(). If this (Python) thread
+  // kept holding the GIL while blocked here, that acquire could never
+  // succeed, inverting the documented allocator_mutex_ -> GIL lock order and
+  // deadlocking against whichever thread ends up running the callback. See
+  // docs/source/runtime/memory_pressure_gc.md.
+  //
+  // Some callers (e.g. TimestampCalibrator, compiled Inductor kernels, sendnn
+  // operations) invoke allocate() without holding the GIL at all;
+  // py::gil_scoped_release requires the GIL to be held on construction, so
+  // it is only used when PyGILState_Check() confirms that precondition.
+  flex::CompositeAddress composite_addr = [&]() {
+    std::optional<py::gil_scoped_release> release;
+    if (PyGILState_Check()) {
+      release.emplace();
+    }
+    return flex_alloc->allocate(nbytes, directive);
+  }();
 
   DEBUGINFO("allocated ", composite_addr);
   // FlexAllocator rounds up to DEVICE_ALIGNMENT (128 bytes), so the actual
