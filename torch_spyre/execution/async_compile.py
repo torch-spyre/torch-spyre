@@ -269,10 +269,15 @@ class SpyreAsyncCompile(AsyncCompile):
         # them baked into constants (dataflow-scheduler#65), so this path -- the
         # one that runs dbo-opt -- asks for that form; the emitter itself has no
         # opinion about the backend.  Drop the argument when #65 is fixed.
+        #
+        # The same predicate ``call_kernel`` passes a pool tensor by, so the
+        # signature opens with a matching slot.  Read from config here: the
+        # emitter reads no config.
         ktir_text = generate_ktir(
             kernel_name,
             specs,
             bake_addresses=not _spyre_config.bundle_symbolic_args,
+            frontend_pool_allocation=_spyre_config.pool_allocated_by_frontend(),
         )
 
         # Persist the emitted KTIR as a text file in the same per-kernel output
