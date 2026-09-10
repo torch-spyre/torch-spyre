@@ -115,7 +115,7 @@ static void init_from_env() {
 }
 
 void _startRuntime() {
-  DEBUGINFO("starting runtime");
+  SPYRE_RUNTIME_DEBUG() << __func__ << ": starting runtime";
   // Determine logical device index with priority:
   //   1. tls_idx (non-zero) — set via explicit set_device() call
   //   2. LOCAL_RANK env var — set by torchrun per process
@@ -153,7 +153,9 @@ void _startRuntime() {
   GlobalRuntime::set(runtime);
   // SPYRE_HAZARD_TRACKER (read in init_from_env) is latched per stream at
   // creation via track_hazards; nothing to toggle on the runtime here.
-  DEBUGINFO("runtime started with logical_device_id ", logical_device_id);
+  SPYRE_RUNTIME_DEBUG() << __func__
+                        << ": runtime started with logical_device_id "
+                        << logical_device_id;
 }
 void startRuntime() {
   static std::once_flag flag;

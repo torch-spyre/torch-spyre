@@ -207,6 +207,10 @@ Logger::LogStream Logger::critical() {
                    min_level_ <= LogLevel::CRITICAL);
 }
 
+Logger::LogStream Logger::stream() {
+  return LogStream(component_, requested_level_, true);
+}
+
 // LogStream implementation
 Logger::LogStream::LogStream(const std::string& component, LogLevel level,
                              bool enabled)
