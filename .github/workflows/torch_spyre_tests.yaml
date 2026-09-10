@@ -72,6 +72,7 @@ concurrency:
 permissions:
   contents: read
   checks: write
+  actions: read
   pull-requests: read # so that gh pr view can fetch the file list
 
 jobs:
@@ -171,6 +172,20 @@ jobs:
     needs: [changes, run-tests]
     if: always()
     steps:
+      - name: Check all suites passed
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [[ "${{ needs.test.result }}" == "success" ]]; then
+            echo "All test suites passed."
+            exit 0
+          fi
+          # Fetch job results for this run and list which suites failed.
+          failed=$(gh api \
+            "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/jobs?per_page=100" \
+            --jq '[.jobs[] | select(.conclusion == "failure") | .name] | join("\n")')
+          echo "The following test suite(s) failed:"
+          echo "$failed"
       - name: Evaluate test results
         run: |-
           RESULT="${{ needs.run-tests.result }}"
