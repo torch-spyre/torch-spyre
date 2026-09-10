@@ -212,6 +212,17 @@ runs:
           _JUNIT_FLAG=""
           if [[ -n "${{ inputs.junit_xml_path }}" ]]; then
             _JUNIT_FLAG="--junit-xml=${{ inputs.junit_xml_path }}"
+            # Each attempt writes the same path, so a retry overwrites its
+            # predecessor and only the LAST attempt is ever ingested. Keep the
+            # superseded XML under an -attemptN name so a suite that passed and
+            # was then killed in teardown is still visible downstream.
+            if [[ $attempt -gt 1 && -f "${{ inputs.junit_xml_path }}" ]]; then
+              _prev_attempt=$(( attempt - 1 ))
+              _keep="${{ inputs.junit_xml_path }}"
+              _keep="${_keep%.xml}-attempt${_prev_attempt}.xml"
+              cp -f "${{ inputs.junit_xml_path }}" "$_keep" 2>/dev/null \
+                && echo "Preserved attempt ${_prev_attempt} report: $(basename "$_keep")"
+            fi
           fi
 
           if [[ -n "$xdist_flag" ]]; then
