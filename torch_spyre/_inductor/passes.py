@@ -39,6 +39,7 @@ from .logging_utils import get_inductor_logger
 from .provenance import SpyreGraphTransformObserver, reset_provenance_warnings
 
 from .padding import insert_bmm_padding, insert_restickify_padding
+from .require_layout_pass import apply_require_layout, assert_require_layout_consumed
 from .temp_passes import (
     bmm_unflatten_pass,
     decompose_addmm,
@@ -220,19 +221,22 @@ class CustomPreGradPasses(_SpyreGraphPassPipeline):
 
 
 class CustomPrePasses(_SpyreGraphPassPipeline):
-    """
-    This inductor extension point enables Spyre-specific passes to run on the
-    post-grad FX graph early in the sequence defined in `post_grad.post_grad_passes`.
+    """Run early post-grad passes before AOT retracing can replace FX nodes.
+
+    ``apply_require_layout`` moves marker requests to producer metadata, then
+    ``collect_spyre_hints`` snapshots that metadata for recovery after retracing.
     """
 
     def __init__(self):
-        super().__init__([collect_spyre_hints])
+        super().__init__([apply_require_layout, collect_spyre_hints])
 
 
 class CustomPostPasses(_SpyreGraphPassPipeline):
-    """
-    This inductor extension point enables Spyre-specific passes to run on the
-    post-grad FX graph late in the sequence defined in `post_grad.post_grad_passes`.
+    """Run late post-grad passes after Spyre graph normalization.
+
+    Reapplying ``apply_require_layout`` is intentional and idempotent: it
+    attaches any marker surviving earlier rewrites before BMM normalization.
+    Markers removed by ``CustomPrePasses`` make this call a no-op.
     """
 
     def __init__(self):
@@ -245,6 +249,7 @@ class CustomPostPasses(_SpyreGraphPassPipeline):
                 # falling back to extern_kernels.addmm.
                 decompose_addmm,
                 mm_to_bmm_pass.apply,
+                apply_require_layout,
                 bmm_unflatten_pass.apply,
             ]
         )
@@ -473,6 +478,7 @@ class CustomPreSchedulingPasses:
             # Tensor Layout (Stickification)
             split_multi_ops,
             propagate_spyre_tensor_layouts,
+            assert_require_layout_consumed,
             validate_ops,
             optimize_restickify_locations,
             finalize_layouts,
