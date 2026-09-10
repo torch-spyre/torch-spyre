@@ -9,24 +9,26 @@ test_suite_config:
         # They are classified as mandatory_success because they test core functionalities that must pass for the backend to be considered operational.
         # The relevance of these tests is determined by the backend's support for specific data types and operations, particularly bfloat16 and float16, which are critical for performance on AI accelerators.
         - names:
-            - TestSelectAlgorithm::test_bmm_amp
-            - TestSelectAlgorithm::test_bmm_self_permute
-            - TestSelectAlgorithm::test_bmm_with_broadcasted_mat1
-            - TestSelectAlgorithm::test_bmm_with_pointwise
-            - TestSelectAlgorithm::test_grouped_linear_invalid
-            - TestSelectAlgorithm::test_qlinear_unary_with_computed_buffer_x_zp
-            - TestSelectAlgorithm::test_quantized_linear_with_pointwise
-            - TestSelectAlgorithmDynamicShapes::test_bmm_dynamic_bm_stride
+            - TestSelectAlgorithm::test_bmm_amx
+            - TestSelectAlgorithm::test_bmm_freezing
+            - TestSelectAlgorithm::test_int4_woq_mm_with_small_buffer_config
+            - TestSelectAlgorithm::test_linear_amx
+            - TestSelectAlgorithm::test_linear_input_transpose
+            - TestSelectAlgorithm::test_linear_with_binary_input_3d
+            - TestSelectAlgorithm::test_linear_with_embedding
+            - TestSelectAlgorithm::test_qlinear_binary_with_computed_buffer_x_zp
+            - TestSelectAlgorithm::test_quantized_linear_with_pointwise_binary
           mode: mandatory_success
 
         # These tests exercise various linear and batch matrix multiplication (bmm) operations with different data types and tensor shapes.
         # They are classified as xfail on the backend due to unsupported dynamic shapes and certain fused epilogues, which are not fully supported by the current implementation.
         # The most relevant backend capabilities include handling bfloat16 and float32 data types, but limitations in dynamic shape support and fused operations lead to these tests failing.
         - names:
-            - TestSelectAlgorithm::test_aoti_linear_multi_view_operations
-            - TestSelectAlgorithm::test_bmm_with_fused_epilogues
-            - TestSelectAlgorithm::test_int4_woq_mm_avx512
-            - TestSelectAlgorithm::test_qlinear_pointwise_int8_layout
+            - TestSelectAlgorithm::test_bmm_flexible_layout
+            - TestSelectAlgorithm::test_linear_local_and_global_buffer_dynamic_shapes
+            - TestSelectAlgorithm::test_linear_with_in_out_buffer
+            - TestSelectAlgorithm::test_linear_with_indirect_indexing
+            - TestSelectAlgorithmDynamicShapes::test_bmm_epilogue_dynamic_reshape
           mode: xfail
 
   global:
