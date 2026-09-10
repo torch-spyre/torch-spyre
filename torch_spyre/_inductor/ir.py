@@ -491,6 +491,28 @@ def _compute_device_num_elems(layout: "FixedLayout") -> int:
     return int(V.graph.sizevars.guarding_hint_or_throw(numel))
 
 
+def _emit_plan_once(wrapper: PythonWrapperCodegen, plan_line: str) -> None:
+    """Emit *plan_line* into the wrapper header exactly once per wrapper instance.
+
+    Each collective codegen method needs to write a plan call (e.g.
+    ``allreduce_plan(...)``) into the module-level header so it runs once at
+    graph load rather than on every forward pass.  Using ``wrapper._emitted_plans``
+    (a set attached to the wrapper object) ensures deduplication even when
+    multiple coalesced tensors share the same shape and would otherwise emit
+    identical plan lines.
+
+    Attaching state to the wrapper is fragile if Inductor ever reuses or clones
+    wrapper objects, but it mirrors the existing pattern established by the
+    broadcast/allgather/allreduce fallbacks.  Centralising the guard here means
+    only this one place needs updating if the approach changes.
+    """
+    if not hasattr(wrapper, "_emitted_plans"):
+        wrapper._emitted_plans = set()
+    if plan_line not in wrapper._emitted_plans:
+        wrapper.header.writeline(plan_line)
+        wrapper._emitted_plans.add(plan_line)
+
+
 class BroadcastAsyncFallback(ir.ExternKernel):
     """IR node for spyre.broadcast_async — emits a runtime call to async broadcast.
 
@@ -515,11 +537,7 @@ class BroadcastAsyncFallback(ir.ExternKernel):
             f"{plan_var} = torch.ops.spyre.broadcast_plan("
             f"{num_elems}, {dtype_code}, {src_rank}, '{group_name}')"
         )
-        if not hasattr(wrapper, "_emitted_plans"):
-            wrapper._emitted_plans = set()
-        if plan_line not in wrapper._emitted_plans:
-            wrapper.header.writeline(plan_line)
-            wrapper._emitted_plans.add(plan_line)
+        _emit_plan_once(wrapper, plan_line)
 
         # Emit run call in body (per-invocation)
         wrapper.writeline(
@@ -592,11 +610,7 @@ class AllGatherAsyncFallback(ir.ExternKernel):
             f"{plan_var} = torch.ops.spyre.allgather_plan("
             f"{num_elems}, {dtype_code}, {group_size}, '{group_name}')"
         )
-        if not hasattr(wrapper, "_emitted_plans"):
-            wrapper._emitted_plans = set()
-        if plan_line not in wrapper._emitted_plans:
-            wrapper.header.writeline(plan_line)
-            wrapper._emitted_plans.add(plan_line)
+        _emit_plan_once(wrapper, plan_line)
 
         # Emit run call in body (per-invocation)
         wrapper.writeline(
@@ -645,6 +659,82 @@ class AllGatherAsyncFallback(ir.ExternKernel):
         V.graph.register_operation(self)
 
 
+class ReduceScatterAsyncFallback(ir.ExternKernel):
+    """IR node for spyre.reduce_scatter_async.
+
+    Starts the reduce_scatter operation asynchronously and returns immediately.
+    Output tensor has shape[0] = input.shape[0] // group_size.
+    """
+
+    def codegen(self, wrapper: PythonWrapperCodegen) -> None:
+        """Emit plan call in header (compile-time) and run call in body (runtime)."""
+        input_tensor = self.inputs[0]
+        input_name = input_tensor.codegen_reference()
+        reduce_op, group_size, group_name = self.constant_args
+        output_name = self.get_name()
+
+        input_layout = input_tensor.get_layout()
+        dtype_code = _dtype_to_int(input_layout.dtype)
+        num_elems = _compute_device_num_elems(input_layout)
+
+        plan_var = f"_rs_plan_{output_name}"
+        plan_line = (
+            f"{plan_var} = torch.ops.spyre.reducescatter_plan("
+            f"{num_elems}, {dtype_code}, {group_size}, "
+            f"'{reduce_op}', '{group_name}')"
+        )
+        _emit_plan_once(wrapper, plan_line)
+
+        # Emit run call in body (per-invocation)
+        wrapper.writeline(
+            f"{output_name} = torch.ops.spyre.reducescatter_run("
+            f"{input_name}, {plan_var}, {group_size})"
+        )
+
+        logger.debug(
+            "Codegen reducescatter plan+run: %s -> %s "
+            "(reduce_op=%s, group_size=%s, group='%s')",
+            input_name,
+            output_name,
+            reduce_op,
+            group_size,
+            group_name,
+        )
+
+    def should_allocate(self) -> bool:
+        return False
+
+    def get_mutation_names(self) -> Sequence[str]:
+        return []
+
+    def get_unbacked_symbol_defs(self) -> OrderedSet[sympy.Symbol]:
+        return OrderedSet()
+
+    def __init__(
+        self,
+        op_overload: torch._ops.OpOverload,
+        x: IRNode,
+        reduce_op: str,
+        group_size: int,
+        group_name: str,
+    ) -> None:
+        in_layout = x.get_layout()
+        out_size = list(in_layout.size)
+        out_size[0] = out_size[0] // group_size
+        out_stride = ir.FlexibleLayout.contiguous_strides(out_size)
+        layout = FixedLayout(in_layout.device, in_layout.dtype, out_size, out_stride)
+        super().__init__(
+            None,
+            layout,
+            [x],
+            (reduce_op, group_size, group_name),
+            python_kernel_name="torch.ops.spyre.reducescatter_run",
+            op_overload=op_overload,
+        )
+        self.name = V.graph.register_buffer(self)
+        V.graph.register_operation(self)
+
+
 class AllReduceAsyncFallback(ir.ExternKernel):
     """IR node for spyre.all_reduce_async.
 
@@ -672,11 +762,7 @@ class AllReduceAsyncFallback(ir.ExternKernel):
             f"{plan_var} = torch.ops.spyre.allreduce_plan("
             f"{num_elems}, {dtype_code}, '{reduce_op}', '{group_name}')"
         )
-        if not hasattr(wrapper, "_emitted_plans"):
-            wrapper._emitted_plans = set()
-        if plan_line not in wrapper._emitted_plans:
-            wrapper.header.writeline(plan_line)
-            wrapper._emitted_plans.add(plan_line)
+        _emit_plan_once(wrapper, plan_line)
 
         # Emit run call in body
         wrapper.writeline(
