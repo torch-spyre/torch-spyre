@@ -45,6 +45,7 @@ test_suite_config:
             - LxPlanning.*::test_mean_3d_dim1_lx_planning_(pointwise|reduction)
             - LxPlanning.*::test_mean_default.*_lx_planning_(pointwise|reduction)
             - LxPlanning.*::test_normal_randn_cpu.*_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_compiled_randn_fallback_cpu.*_lx_planning_(pointwise|reduction)
             - LxPlanning.*::test_overwrite.*_lx_planning_(pointwise|reduction)
             - LxPlanning.*::test_tril.*_lx_planning_(pointwise|reduction)
             - LxPlanning.*::test_triu.*_lx_planning_(pointwise|reduction)

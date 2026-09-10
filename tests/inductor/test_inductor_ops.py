@@ -7361,6 +7361,23 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         y_cpu = torch.randn(3, 5, device="cpu", generator=gen)
         torch.testing.assert_close(y_spyre.to("cpu"), y_cpu, rtol=0.1, atol=0.1)
 
+    def test_compiled_randn_fallback_cpu(self):
+        """Test that compiled torch.randn with a seeded generator produces matching results."""
+
+        def fn(x):
+            return x * 2 + torch.randn(64, 256, dtype=torch.float16, device=x.device)
+
+        compiled = torch.compile(fn)
+        x_spyre = torch.full((64, 256), 3.0, dtype=torch.float16, device="spyre")
+        compiled(x_spyre)  # warmup: compile before seeding so RNG state matches
+        torch.manual_seed(42)
+        y_spyre = compiled(x_spyre)
+
+        x_cpu = torch.full((64, 256), 3.0, dtype=torch.float16)
+        torch.manual_seed(42)
+        y_cpu = fn(x_cpu)
+        torch.testing.assert_close(y_spyre.cpu(), y_cpu, rtol=0.1, atol=0.1)
+
     def test_uniform_cpu(self):
         """Test that tensor.uniform_() produces values in [0, 1)."""
         x_spyre = torch.tensor(
