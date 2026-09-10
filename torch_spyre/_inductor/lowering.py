@@ -13,6 +13,8 @@
 # limitations under the License.
 
 
+import operator
+import os
 import logging
 import math
 import threading
@@ -40,6 +42,8 @@ from .constants import (
     CONV2D_FWD_OP,
     COPY_BACK_CANDIDATE_ATTR,
     DEPTHWISE_CONV2D_OP,
+    FP16_MIN,
+    MAXPOOL2D_OP,
     FP8_E4M3FN_MAX,
     QUANTSCALEPERTOKENFP8_CLIP_MAX,
     QUANTSCALEPERTOKENFP8_CLIP_MIN,
@@ -760,6 +764,164 @@ def lower_topkindex(x, k, dim):
     return result
 
 
+def _pool2d_pair(value, default=None):
+    """Normalize an int-or-pair pooling argument to a ``(h, w)`` tuple."""
+    if value is None:
+        value = default
+    if isinstance(value, int):
+        return value, value
+    h, w = value
+    return h, w
+
+
+# Value that will fill the explicitly-materialized max_pool2d pad halo.
+#
+# Currently referenced only from the commented-out halo call in
+# lower_max_pool2d_with_indices (padding is gated off there -- see that comment).
+_MAX_POOL_PAD_VALUE = FP16_MIN
+
+
+def _max_pool2d_indices_are_used() -> bool:
+    """True if the current ``max_pool2d_with_indices`` node's indices are consumed.
+
+    ``maxpoolfwd`` computes only the window max, so this lowering cannot produce
+    indices.  ``aten.max_pool2d_with_indices`` is nominally two-output even for a
+    plain ``torch.max_pool2d`` call, but AOT's DCE drops the unused
+    ``getitem(1)`` before Inductor lowers the graph -- so the surviving users are
+    an accurate signal of whether indices are really needed.
+
+    Conservative on anything unexpected: if the node or its users cannot be
+    inspected, report True so the op falls back rather than silently returning
+    bogus indices.
+    """
+    node = getattr(V.graph, "current_node", None)
+    if node is None:
+        return True
+    try:
+        users = list(node.users)
+    except Exception:  # pragma: no cover - defensive
+        return True
+    for user in users:
+        # Anything other than a getitem on this multi-output node is opaque, so
+        # assume it may observe the indices.
+        if user.op != "call_function" or user.target is not operator.getitem:
+            return True
+        if user.args[1:] != (0,):
+            return True
+    return False
+
+
+def _lower_pool2d(
+    op,
+    x,
+    kernel_size,
+    stride,
+    padding,
+    *,
+    extra_constants=None,
+):
+    """Build a windowed 2D pooling ``SpyreReduction`` for ``op``.
+
+    Shared by ``lower_avg_pool2d`` (``avgpoolfwd``) and
+    ``lower_max_pool2d_with_indices`` (``maxpoolfwd``).
+
+    ``padding`` must already be zero here -- callers that support padding
+    materialize it into ``x`` first (see ``lower_max_pool2d_with_indices``),
+    because the SDSC pad lanes are ``NOZEROPAD`` and so carry adjacent HBM
+    contents rather than a reduction identity.
+
+    Returns ``None`` if the kernel is degenerate along either axis (``k == 1``),
+    letting the caller delegate to an in-tree lowering: ``op`` is a *windowed*
+    reduction, and a 1-wide kernel has no pooling window along that axis (it is
+    an identity or a strided subsample), which the pool datapath cannot express
+    -- the DDL rejects a windowless pool ("Unknown primary dimension kind ...
+    for a window dimension").  ``_align_pool_dim_labels`` in codegen also relies
+    on both window dims always surviving for a pool SpyreReduction.
+    """
+    kH, kW = _pool2d_pair(kernel_size)
+    sH, sW = _pool2d_pair(stride, default=kernel_size)
+    pH, pW = _pool2d_pair(padding, default=0)
+    assert pH == 0 and pW == 0, (
+        f"_lower_pool2d requires padding to be materialized by the caller; "
+        f"got pad_h={pH}, pad_w={pW}"
+    )
+
+    if kH == 1 or kW == 1:
+        return None
+
+    N, C, H_in, W_in = x.get_size()
+
+    H_out = (H_in - kH) // sH + 1
+    W_out = (W_in - kW) // sW + 1
+
+    # A pool whose batch is 2 or more AND whose output has a size-1 spatial
+    # extent reads from the WRONG BATCH: output batch n takes its window from
+    # another batch's image.  The SDSC compiles and the values are real input
+    # elements, so this is invisible without a positional-ramp input -- raise
+    # rather than fall back, because a silent wrong answer is what this guard
+    # exists to prevent.
+    #
+    # ``x.get_size()`` yields sympy Integers, so ``isinstance(N, int)`` is False
+    # even for a static batch -- concretize instead, and treat a genuinely
+    # symbolic batch as potentially > 1.
+    from .pass_utils import concretize_expr
+
+    try:
+        n_batch: int | None = int(concretize_expr(N))
+    except (TypeError, ValueError):
+        n_batch = None
+    if (
+        (H_out == 1 or W_out == 1)
+        and (n_batch is None or n_batch > 1)
+        and os.environ.get("TORCH_SPYRE_POOL_UNSAFE") != "1"
+    ):
+        raise Unsupported(
+            f"pool with batch={n_batch if n_batch is not None else N} "
+            f"and a size-1 spatial output "
+            f"({H_out}x{W_out}) is not supported: the output reads from the "
+            "wrong batch. Batch 1 is correct at any geometry, and batch > 1 is "
+            "correct when both spatial output extents exceed 1."
+        )
+
+    constants = {
+        "kernel_h": kH,
+        "kernel_w": kW,
+        "stride_h": sH,
+        "stride_w": sW,
+        "pad_h": pH,
+        "pad_w": pW,
+        # True input extents.  Codegen needs these to emit paddingSizes_
+        # totalSize_/unneededPad_: when stride > kernel the window span
+        # ``(out-1)*stride + kernel`` UNDERRUNS the input (k=4 s=6 on 8 spans
+        # only 4 of 8 columns), and the SDSC must declare the real extent plus
+        # the unread slack rather than silently shrinking the tensor.
+        "in_h": H_in,
+        "in_w": W_in,
+    }
+    constants.update(extra_constants or {})
+
+    def inner_fn(index, reduction_index):
+        n, c, ho, wo = index
+        kh, kw = reduction_index
+        hi = ho * sH + kh
+        wi = wo * sW + kw
+        return x.make_loader()([n, c, hi, wi])
+
+    result = SpyreReduction.create(
+        reduction_type=op,
+        input_node=x,
+        device=x.get_device(),
+        dst_dtype=x.get_dtype(),
+        src_dtype=x.get_dtype(),
+        inner_fn=inner_fn,
+        ranges=[N, C, H_out, W_out],
+        reduction_ranges=[kH, kW],
+        op_info={"constants": constants},
+    )
+    result.realize()
+    return result
+
+
 @register_spyre_lowering(torch.ops.aten.avg_pool2d.default)
 def lower_avg_pool2d(
     x,
@@ -777,24 +939,28 @@ def lower_avg_pool2d(
     if divisor_override is not None:
         raise Unsupported("avg_pool2d divisor_override not supported")
 
-    kH, kW = (kernel_size, kernel_size) if isinstance(kernel_size, int) else kernel_size
-    stride = stride if stride is not None else kernel_size
-    sH, sW = (stride, stride) if isinstance(stride, int) else stride
-    padding = padding if padding else 0
-    pH, pW = (padding, padding) if isinstance(padding, int) else padding
+    kH, kW = _pool2d_pair(kernel_size)
+    sH, sW = _pool2d_pair(stride, default=kernel_size)
+    pH, pW = _pool2d_pair(padding if padding else 0)
 
     if pH > 0 or pW > 0:
         raise Unsupported("avg_pool2d with non-zero padding not yet supported")
 
-    if kH == 1 or kW == 1:
-        # avgpoolfwd is a windowed reduction; a 1-wide kernel has no pooling
-        # window along that axis (it is an identity or a strided subsample),
-        # which the pool datapath cannot express — the DDL rejects a windowless
-        # pool ("Unknown primary dimension kind ... for a window dimension").
-        # Spyre also has no eager avg_pool2d kernel to fall back to.  So delegate
-        # to the in-tree Inductor lowering, which decomposes avg_pool2d into
-        # pointwise/reduction ops the Spyre backend does support and keeps k=1
-        # on-device.
+    result = _lower_pool2d(
+        AVGPOOL2D_OP,
+        x,
+        (kH, kW),
+        (sH, sW),
+        (pH, pW),
+        # scaling_factor is the window mean multiplier; codegen emits it as the
+        # `nmap` opConst.
+        extra_constants={"scaling_factor": 1.0 / (kH * kW)},
+    )
+    if result is None:
+        # Degenerate k==1 window (see _lower_pool2d).  Spyre has no eager
+        # avg_pool2d kernel to fall back to, so delegate to the in-tree Inductor
+        # lowering, which decomposes avg_pool2d into pointwise/reduction ops the
+        # Spyre backend does support and keeps k=1 on-device.
         return lowering.avg_pool2d(
             x,
             [kH, kW],
@@ -804,48 +970,101 @@ def lower_avg_pool2d(
             count_include_pad,
             divisor_override,
         )
-
-    N, C, H_in, W_in = x.get_size()
-
-    H_out = (H_in + 2 * pH - kH) // sH + 1
-    W_out = (W_in + 2 * pW - kW) // sW + 1
-
-    op_info = {
-        "constants": {
-            "kernel_h": kH,
-            "kernel_w": kW,
-            "stride_h": sH,
-            "stride_w": sW,
-            "pad_h": pH,
-            "pad_w": pW,
-            "scaling_factor": 1.0 / (kH * kW),
-        },
-    }
-
-    def inner_fn(index, reduction_index):
-        n, c, ho, wo = index
-        kh, kw = reduction_index
-        hi = ho * sH - pH + kh
-        wi = wo * sW - pW + kw
-        return x.make_loader()([n, c, hi, wi])
-
-    result = SpyreReduction.create(
-        reduction_type=AVGPOOL2D_OP,
-        input_node=x,
-        device=x.get_device(),
-        dst_dtype=x.get_dtype(),
-        src_dtype=x.get_dtype(),
-        inner_fn=inner_fn,
-        ranges=[N, C, H_out, W_out],
-        reduction_ranges=[kH, kW],
-        op_info=op_info,
-    )
-    # Realize so the pool becomes its own ComputedBuffer: codegen's
-    # kernel_store_reduction reads op_info (pool constants) off node.data.op_info,
-    # which only exists when the SpyreReduction is realized rather than fused into
-    # a consumer.
-    result.realize()
     return result
+
+
+@register_spyre_lowering(torch.ops.aten.max_pool2d_with_indices.default)
+def lower_max_pool2d_with_indices(
+    x,
+    kernel_size,
+    stride=None,
+    padding=0,
+    dilation=1,
+    ceil_mode=False,
+):
+    """Direct lowering of fp16 max_pool2d to a native ``maxpoolfwd`` SDSC.
+
+    ``torch.max_pool2d`` / ``F.max_pool2d`` always trace to
+    ``aten.max_pool2d_with_indices`` (there is no path that reaches
+    ``aten.max_pool2d.default``), so this is the op that must be lowered.  It is
+    nominally two-output ``(values, indices)``, but ``maxpoolfwd`` computes only
+    the window max -- its computeOp has one input and one output.  So this
+    lowering is **values-only**: it returns the pooled values plus an
+    ``indices`` placeholder, and any graph that actually consumes the indices
+    raises ``Unsupported`` (see ``_max_pool2d_indices_unsupported``).  Callers
+    that need indices (``return_indices=True``) therefore fall back rather than
+    silently receiving wrong indices.
+
+    ``aten.max_pool2d_with_indices`` is in Inductor's own decomposition table,
+    so it is listed in ``spyre_decompositions_to_exclude`` to survive to here.
+    """
+    if _max_pool2d_indices_are_used():
+        raise Unsupported(
+            "max_pool2d with return_indices=True not supported: the maxpoolfwd "
+            "datapath computes window values only, not argmax indices"
+        )
+    if ceil_mode:
+        raise Unsupported("max_pool2d ceil_mode not supported")
+    dH, dW = _pool2d_pair(dilation, default=1)
+    if dH != 1 or dW != 1:
+        raise Unsupported(
+            f"max_pool2d dilation={(dH, dW)} not supported (only dilation==1)"
+        )
+
+    kH, kW = _pool2d_pair(kernel_size)
+    sH, sW = _pool2d_pair(stride, default=kernel_size)
+    pH, pW = _pool2d_pair(padding if padding else 0)
+
+    if pH < 0 or pW < 0:
+        raise Unsupported(f"max_pool2d negative padding={(pH, pW)}")
+    if pH > kH // 2 or pW > kW // 2:
+        # Matches aten's own check: pad must not exceed half the kernel.
+        raise Unsupported(
+            f"max_pool2d padding={(pH, pW)} too large for kernel {(kH, kW)}"
+        )
+
+    if kH == 1 or kW == 1:
+        # Degenerate k==1 window (see _lower_pool2d).  Delegate to the in-tree
+        # lowering, which keeps the pool on-device as pointwise/reduction IR and
+        # produces real indices too.
+        return lowering.max_pool2d_with_indices(
+            x, [kH, kW], [sH, sW], [pH, pW], [dH, dW], ceil_mode
+        )
+
+    pooled_input = x
+    if pH > 0 or pW > 0:
+        # The intended implementation is the explicit halo below: the SDSC pad
+        # lanes are NOZEROPAD (_memorg_extra emits isPadded=1/isZeroPadded=0), so
+        # a padded pool read span pulls adjacent HBM rather than an identity
+        # value -- for a max reduction any such lane that exceeds the real window
+        # would win.  There is no -inf pad-fill PadType, so the halo has to be
+        # materialized with the max identity and the pool itself run unpadded.
+        # (The fill is _FP16_MIN, not float("-inf"), for the same reason codegen
+        # uses it for _get_mask_value("max"): -inf encodes as NaN through this
+        # path, and max(x, NaN) == NaN would poison the whole reduction rather
+        # than just the padded lanes.)
+        #
+        # It is gated off because materializing that halo is not yet expressible.
+        # The one line to restore when that is fixed:
+        #   pooled_input = lower_constant_pad_nd(
+        #       x, [pW, pW, pH, pH], _MAX_POOL_PAD_VALUE
+        #   )
+        raise Unsupported(
+            f"max_pool2d padding={(pH, pW)} not yet supported: the pad halo "
+            "cannot be materialized on the physically-NHWC pool input "
+            "(constant_pad_nd on a permuted NCHW view yields an unsupported "
+            "stick expression)"
+        )
+
+    values = _lower_pool2d(MAXPOOL2D_OP, pooled_input, (kH, kW), (sH, sW), (0, 0))
+    assert values is not None, "k==1 window handled above"
+
+    # aten.max_pool2d_with_indices is two-output, so the lowering must return a
+    # 2-tuple even though maxpoolfwd produces values only.  The indices slot is
+    # provably dead here: _max_pool2d_indices_are_used() above already bailed out
+    # if anything consumed it, so this placeholder is never read or codegen'd.
+    # It exists to satisfy the op schema's arity, not to carry a value.
+    return values, None
 
 
 @register_spyre_lowering(torch.ops.aten.convolution.default)

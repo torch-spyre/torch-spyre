@@ -139,6 +139,15 @@ spyre_decompositions_to_exclude = [
     # decomps and let the mm/bmm survive to mm_to_bmm_pass (2.11 behavior).
     torch.ops.aten.mm,
     torch.ops.aten.bmm,
+    # torch.max_pool2d / F.max_pool2d always trace to
+    # aten.max_pool2d_with_indices, which Inductor decomposes into a
+    # pointwise/reduction nest. Spyre lowers it directly to a native
+    # ``maxpoolfwd`` SDSC (see ``lower_max_pool2d_with_indices``), so the
+    # upstream decomposition must be dropped for that lowering to be reached at
+    # all. The lowering itself re-delegates to
+    # ``lowering.max_pool2d_with_indices`` for the cases maxpoolfwd cannot
+    # express (k==1 windows), so dropping the decomp loses no coverage.
+    torch.ops.aten.max_pool2d_with_indices,
 ]
 
 OpOrOps = Union[torch._ops.OperatorBase, Sequence[torch._ops.OperatorBase]]

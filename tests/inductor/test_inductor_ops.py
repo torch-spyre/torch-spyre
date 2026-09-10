@@ -5518,6 +5518,30 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "2x3x8x8": (cached_randn((2, 3, 8, 8)),),
             },
         },
+        # max_pool2d lowers to a native maxpoolfwd SDSC (lower_max_pool2d_with_indices).
+        # Coverage mirrors avg_pool2d because both share the one pool datapath, whose
+        # DDL only accepts non-overlapping windows: stride < kernel fails in
+        # distributeElemArrToTemporalLoops ("Not enough elements to distribute") for
+        # maxpool and avgpool alike, so every case here keeps stride == kernel.
+        # Non-square k/s is exercised since the H and W window dims are independent
+        # SDSC fields.  padding>0 is not covered: the lowering raises Unsupported
+        # because the pad halo cannot be materialized on the physically-NHWC input.
+        ("test_max_pool2d", "test_max_pool2d_base"): {
+            "ops_dict": {
+                "k2s2": lambda x: F.max_pool2d(x, kernel_size=2, stride=2),
+                "k4s4": lambda x: F.max_pool2d(x, kernel_size=4, stride=4),
+                "k2x4s2x4": lambda x: F.max_pool2d(
+                    x, kernel_size=(2, 4), stride=(2, 4)
+                ),
+            },
+            "param_sets": {
+                "1x3x8x8": (cached_randn((1, 3, 8, 8)),),
+                "1x3x24x24": (cached_randn((1, 3, 24, 24)),),
+                "2x3x8x8": (cached_randn((2, 3, 8, 8)),),
+                # C=64 == one full stick, the aligned-channel case.
+                "1x64x8x8": (cached_randn((1, 64, 8, 8)),),
+            },
+        },
         ("test_repeat", "test_repeat_cpu"): {
             "param_sets": {
                 "1d_1": (cached_randn((64), dtype=torch.float16), 1),
@@ -8091,6 +8115,19 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         # run_eager=False: Spyre has no eager avg_pool2d kernel
         # (aten::avg_pool2d.out is unregistered for the 'spyre' backend), so only
         # the compiled path is valid for this op.
+        def fn(t):
+            return op(t.permute(0, 3, 1, 2))
+
+        x_nhwc = x.permute(0, 2, 3, 1).contiguous()
+        self.compare_with_cpu(fn, x_nhwc, atol=0.1, rtol=0.1, run_eager=False)
+
+    def test_max_pool2d_base(self, op, x):
+        # Same NHWC-in / permute-inside-fn setup as test_avg_pool2d_base: a Spyre
+        # pool needs C as the stick (innermost) dim, so pass a physically-NHWC
+        # tensor and let the compiled graph carry the NHWC->NCHW permute.
+        #
+        # run_eager=False: Spyre has no eager max_pool2d kernel, so only the
+        # compiled path is valid here.
         def fn(t):
             return op(t.permute(0, 3, 1, 2))
 

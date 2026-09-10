@@ -1287,16 +1287,36 @@ def generate_sdsc(
         each core.  Dividing the *total* padded input span by the core count
         instead (the plain path) undercounts for an overlapping window
         (stride < kernel): e.g. in=8, cores=6 gives 1 < kernel, so the ki loop
-        has nothing to distribute.  Conv-only: avgpool keeps the plain path (for
-        its non-overlapping stride==kernel windows the two coincide anyway).
+        has nothing to distribute.
+
+        Applies to every windowed op -- conv2d and the pools alike.
         """
         ps = sdsc_spec.padding_sizes.get(str(dim)) if is_input else None
-        if sdsc_spec.opfunc == "conv2d" and ps is not None and "windowDim_" in ps:
+        if ps is not None and "windowDim_" in ps:
             out_per_core = sdsc_spec.iteration_space[dim] // nsplits
             stride = int(ps.get("stride_", 1))
             dilation = int(ps.get("dilation_", 1))
             k = int(sdsc_spec.iteration_space.get(Symbol(ps["windowDim_"]), 1))
-            return (out_per_core - 1) * stride + dilation * (k - 1) + 1
+            span = (out_per_core - 1) * stride + dilation * (k - 1) + 1
+            # The window span is what each core READS, and it equals the axis
+            # extent only when the windows tile it exactly.  When stride > kernel
+            # the span UNDERRUNS the declared extent (k=4 s=6 on 8: span 4 of 8),
+            # and on an unsplit axis the coordinate fold must still expose the
+            # whole extent -- a known-good SendNN SDSC for that shape emits
+            # elem_arr_0 factor 8, not 4, alongside totalSize_ 8.  Exposing only
+            # the span there reads a short extent and returns elements from the
+            # wrong window.  Only widen when unsplit: with nsplits > 1 the span is
+            # deliberately the per-core read (see _coord_core_stride).
+            # elem_arr_0 must expose the extent this stage addresses, which is
+            # the window span PLUS any declared slack -- the SendNN reference for
+            # a split strided pool (maxpool_sltk, 1x64x16x16 k4 s5, i split 3)
+            # emits elem_arr_0 factor 6 = span 4 + unneededPad_ 2, not the bare
+            # span.  Exposing only the span reads a short extent per core and
+            # returns elements from the wrong window.
+            declared = int(ps.get("totalSize_", span))
+            if nsplits == 1:
+                return max(span, declared)
+            return max(span, span + int(ps.get("unneededPad_", 0)))
         return (
             _coord_size(str(dim), sdsc_spec.iteration_space[dim], is_input) // nsplits
         )
@@ -1305,14 +1325,19 @@ def generate_sdsc(
         """Core-fold stride (advance per core) for a windowed input spatial dim.
 
         Returns ``out_per_core * stride`` -- how far the input window origin moves
-        between adjacent cores -- so overlapping windows (conv stride < kernel)
-        step correctly while each core still reads the full window span
-        (_coord_per_core_size).  Returns None for non-windowed dims (and for
-        avgpool), where gen_coord_info_value defaults the core stride to the
-        per-core size -- so avgpool's original behavior is unchanged.
+        between adjacent cores -- so overlapping windows (stride < kernel) step
+        correctly while each core still reads the full window span
+        (_coord_per_core_size).  Returns None for non-windowed dims, where
+        gen_coord_info_value defaults the core stride to the per-core size.
+
+        Must stay in lockstep with _coord_per_core_size: that helper widens each
+        core's read to the window span, which for an overlapping window is wider
+        than the stride between cores.  Defaulting the stride to the (now wider)
+        per-core size would over-advance and skip input rows, so both helpers
+        cover the same ops -- conv2d and the pools.
         """
         ps = sdsc_spec.padding_sizes.get(str(dim)) if is_input else None
-        if sdsc_spec.opfunc == "conv2d" and ps is not None and "windowDim_" in ps:
+        if ps is not None and "windowDim_" in ps:
             out_per_core = sdsc_spec.iteration_space[dim] // nsplits
             return out_per_core * int(ps.get("stride_", 1))
         return None
@@ -1367,8 +1392,18 @@ def generate_sdsc(
                 "numWkSlicesPerDim_": {
                     str(dim): num_wk_slices
                     for dim, num_wk_slices in sdsc_spec.work_slices.items()
+                    if str(dim) not in sdsc_spec.window_dims
                 },
-                "coreIdToWkSlice_": core_id_to_wk_slice,
+                # Window dims (ki/kj) are not real dims of any tensor for pool
+                # operations and hence should not be emitted
+                "coreIdToWkSlice_": {
+                    core: {
+                        dim: slc
+                        for dim, slc in slices.items()
+                        if dim not in sdsc_spec.window_dims
+                    }
+                    for core, slices in core_id_to_wk_slice.items()
+                },
                 "coreIdToDscSchedule": {
                     str(c): [[-1, 0, 0, 0]] for c in range(sdsc_spec.num_cores)
                 },
