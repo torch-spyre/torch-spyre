@@ -83,7 +83,7 @@ torch-spyre installed. This is the header of
 #
 # Source program:  <your checkout>/tests/op_specs/programs/01_add.py
 # Kernel:          1 of 1 compiled from that program
-# Environment:     torch 2.13.0+cpu, SENCORES=32, bundle_symbolic_args=True
+# Environment:     torch 2.14.0+cpu, SENCORES=32, bundle_symbolic_args=True
 # Kernel args:     3 in the spec, 3 observed at .run()
 #
 # Run it:
