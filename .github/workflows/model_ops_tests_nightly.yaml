@@ -84,7 +84,7 @@ jobs:
     #     config: <filename inside tests/configs/model_ops_tests/>
     #
     # The JUnit XML report is automatically named after the config file, e.g.:
-    #   granite-4.1-8b_spyre.yaml  ->  granite-4.1-8b_spyre.xml
+    #   granite-4.1-8b.yaml  ->  granite-4.1-8b.xml
     # ---------------------------------------------------------------------------
     strategy:
       fail-fast: false   # run all suites even if one fails
@@ -92,40 +92,24 @@ jobs:
         suite:
           - name: GPT OSS 20B
             config: gpt-oss-20b.yaml
-          - name: GPT OSS 20B Spyre
-            config: gpt-oss-20b_spyre.yaml
           - name: Granite 3.3 8B Instruct FMS
             config: granite-3.3-8b-instruct-fms.yaml
-          - name: Granite 3.3 8B Instruct FMS Spyre
-            config: granite-3.3-8b-instruct-fms_spyre.yaml
           - name: Granite 3.3 8B Instruct
             config: granite-3.3-8b-instruct.yaml
-          - name: Granite 3.3 8B Instruct Spyre
-            config: granite-3.3-8b-instruct_spyre.yaml
           - name: Granite 4.1 8B
             config: granite-4.1-8b.yaml
-          - name: Granite 4.1 8B Spyre
-            config: granite-4.1-8b_spyre.yaml
           - name: Meta Llama 3.1 8B Instruct
             config: Meta-Llama-3.1-8B-Instruct.yaml
-          - name: Meta Llama 3.1 8B Instruct Spyre
-            config: Meta-Llama-3.1-8B-Instruct_spyre.yaml
           - name: Ministral 3 14B Instruct 2512
             config: Ministral-3-14B-Instruct-2512.yaml
-          - name: Ministral 3 14B Instruct 2512 Spyre
-            config: Ministral-3-14B-Instruct-2512_spyre.yaml
           - name: Mistral Small 3.2 24B Instruct 2506
             config: Mistral-Small-3.2-24B-Instruct-2506.yaml
-          - name: Mistral Small 3.2 24B Instruct 2506 Spyre
-            config: Mistral-Small-3.2-24B-Instruct-2506_spyre.yaml
-          - name: Gemma 4 26B A4B IT Spyre
-            config: gemma-4-26B-A4B-it_spyre.yaml
-          - name: Gemma 4 12B Instruct Spyre
-            config: gemma-4-12B-it_spyre.yaml
+          - name: Gemma 4 26B A4B IT
+            config: gemma-4-26B-A4B-it.yaml
+          - name: Gemma 4 12B Instruct
+            config: gemma-4-12B-it.yaml
           - name: Qwen 2.5
             config: Qwen2.5-7B-Instruct.yaml
-          - name: Qwen 2.5 7B Spyre
-            config: Qwen2.5-7B-Instruct_spyre.yaml
 
     steps:
       # Sparse checkout into the GHA workspace so the local composite

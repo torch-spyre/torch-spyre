@@ -25,6 +25,7 @@ from torch_spyre._inductor.logging_utils import get_inductor_logger
 from enum import Enum
 
 if TYPE_CHECKING:
+    from torch_spyre._inductor.pass_utils import PerCoreView
     from torch_spyre._inductor.scratchpad.lx_relayout import LXRelayoutPlan
 
 logger = get_inductor_logger("scratchpad.plan_solver")
@@ -96,6 +97,9 @@ class LifetimeBoundBuffer:
     lx_relayout_plans: list["LXRelayoutPlan"] = field(
         default_factory=list, repr=False, compare=False
     )
+    # The physical per-core ownership accepted by the residency judge. Placement
+    # writes this beside the LX address; it must never derive another view.
+    lx_view: Optional["PerCoreView"] = field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         # Not also asserted non-empty: buffers are sometimes registered before
