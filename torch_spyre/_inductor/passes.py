@@ -35,6 +35,7 @@ from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import Operation
 from torch._inductor.scheduler import BaseSchedulerNode
 
+from .graph_validation import validate_graph
 from .logging_utils import get_inductor_logger
 from .provenance import SpyreGraphTransformObserver, reset_provenance_warnings
 
@@ -513,6 +514,7 @@ class CustomPreSchedulingPasses:
                 "BEFORE PRE-SCHEDULING\n%s", format_operations(graph.operations)
             )
 
+        prev_buf_count = len(graph.buffers)
         for pass_fn in self.passes:
             pass_name = _get_pass_name(pass_fn)
             # `graph` is the same object throughout -- passes mutate
@@ -522,6 +524,14 @@ class CustomPreSchedulingPasses:
                 t0 = time.perf_counter()
                 pass_fn(graph)
                 elapsed_ms = (time.perf_counter() - t0) * 1000
+
+            if config.validate_graph_invariants:
+                validate_graph(
+                    graph,
+                    pass_name=pass_name,
+                    prev_buffer_count=prev_buf_count,
+                )
+            prev_buf_count = len(graph.buffers)
 
             if logger.isEnabledFor(logging.INFO):
                 logger.info(
