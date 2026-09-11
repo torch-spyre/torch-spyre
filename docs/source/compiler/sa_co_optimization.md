@@ -29,10 +29,21 @@ the search parameters are module constants in `sa_cooptimizer.py`.
 ## The search
 
 The state is the pair `(pi, W)`: the layout permutation `pi`, held in a composed
-`PermutationBasedLayoutSolver` packer, and the division vector `W`, one menu index per buffer. The
-seed is every buffer at menu index 0 with `pi` from a FirstFit pass. One geometric cool runs
+`PermutationBasedLayoutSolver` packer, and the division vector `W`, one `DivisionConfig` per
+buffer. A config is a division as a *value* — the `CoreDivision` itself, a canonical hashable key
+identifying the choice it makes, and the `menu_index` it was enumerated at. The seed is every
+buffer at its first candidate with `pi` from a FirstFit pass. One geometric cool runs
 `clamp(40n, 200, 15000)` steps at fixed proposal weights, and the best state seen is what gets
 written back — so the result is never worse than the seed.
+
+Three parts still read a config's `menu_index` rather than the config itself: the
+`cd_parent_matches` pair tables that gate residency across an edge, the flip move's wrap-around
+arithmetic over the menu, and the `chosen_division` written back for the allocator to re-index
+`core_divisions` with. Everything else reads the config, so a division the engine *generates*
+rather than enumerates already works throughout the rest. Note that a menu carries the same choice
+at several positions — a factor-1 axis is dropped from the sparse split map, so `{d0: 2, d1: 1}`
+enumerates as a second copy of `{d0: 2}` — and two such configs compare equal while their menu
+positions differ.
 
 Three move types:
 
@@ -43,10 +54,11 @@ Three move types:
   score-identical positions that a permutation move usually offers. Its weight drops to 0 while
   every eligible buffer is resident — `pi` only decides which eligible buffers win LX, so with all
   of them already in, only a structural move can still pay.
-* **flip** (weight 0.3) — move one buffer to a different entry in its own division menu, then
-  ripple: resize its per-core footprint and refresh LX-eligibility for it and its parents.
+* **flip** (weight 0.3) — move one buffer to the config at a different entry in its own division
+  menu, then ripple: resize its per-core footprint and refresh LX-eligibility for it and its
+  parents.
 * **recolor** (weight 0.2) — flood the `cd_parent_matches` relation bidirectionally from a
-  non-trivial (split) anchor tiling and recolor everything it reaches.
+  non-trivial (split) anchor config and recolor everything it reaches.
 
 Both structural moves carry a short cold layout burst, so `pi` has adapted to the new footprints
 before the compound move is judged as a unit by one Metropolis test. The burst stops early for the
@@ -68,10 +80,14 @@ every buffer's own `sym_is_lx`/`sym_core_divs` (the same symbols the CP-SAT engi
 expression is built from). `plan_layout_and_core_divisions(cost_expr)` compiles it once, per
 solve, into a fast `(chosen, resident) -> fixed-point ns` callable (`_build_score_fn`): every free
 symbol in the expression maps back to a getter built off THESE buffers — an argument's residency
-from whether its owning buffer's name is in `resident`, a split symbol's value from
-`core_divisions[chosen[idx]]`. The compiled formula is evaluated fresh every step; unlike the
-`BundleCostObjective` it replaced, there is no incremental per-bundle memoization or dirty
-tracking, and so nothing to invalidate on a rejected move.
+from whether its owning buffer's name is in `resident`, a split symbol's value from the config
+`chosen[idx]` itself. The symbols come from a *declaration* frozen per buffer before the search
+(`_build_configs`): one symbol per stride coefficient seen across that buffer's candidates. A
+config splitting an axis outside its declaration would be priced at the symbol's default of 1
+rather than rejected, so the declaration is checked where configs enter the state. The compiled
+formula is evaluated fresh every step; unlike the `BundleCostObjective` it replaced, there is no
+incremental per-bundle memoization or dirty tracking, and so nothing to invalidate on a rejected
+move.
 
 **Memory-only** is the fallback, taken when `cost_expr` is `None` (the normal case for anything
 driving serialized captures, including the tests) or when it can't be compiled here — an

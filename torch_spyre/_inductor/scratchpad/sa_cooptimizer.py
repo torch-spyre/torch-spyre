@@ -20,17 +20,17 @@ substrate's CP-SAT and DFS solvers. It anneals the joint state ``(pi, W)``:
 * ``pi`` -- the layout permutation, held in a *composed* (not subclassed)
   :class:`PermutationBasedLayoutSolver` packer, because this loop mixes move
   types and scores a richer objective than the packer's own ``quality()``.
-* ``W`` -- the work division, one ``chosen_division`` menu index per buffer.
+* ``W`` -- the work division, one :class:`DivisionConfig` per buffer.
 
 Moves are reorder, atomic division flip, and region-recolor; each structural
 move runs as a compound move+burst judged as a unit by one Metropolis test.
 Region-recolor floods the ``cd_parent_matches`` relation bidirectionally from a
-non-trivial (split) anchor tiling, so the region *is* the flood's reach and
+non-trivial (split) anchor config, so the region *is* the flood's reach and
 boundaries emerge for free; an edge with no compatible index becomes an accepted
 internal seam.
 
-Best-seen over ``(pi, W)`` from the seed state (every op at index 0, ``pi`` from
-FirstFit) keeps every returned state no worse than that baseline.
+Best-seen over ``(pi, W)`` from the seed state (every op at its seed config,
+``pi`` from FirstFit) keeps every returned state no worse than that baseline.
 
 Determinism: a seeded ``Random`` over index-ordered domains and the integer
 fixed-point score make a run bit-for-bit reproducible.
@@ -46,6 +46,7 @@ import math
 import random as rnd
 import statistics
 from collections.abc import Sequence
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Optional, Union, cast
 
 import sympy
@@ -117,6 +118,82 @@ def _work_slices(op, division: "CoreDivision") -> dict:
     }
 
 
+def _canonical_key(division: "CoreDivision") -> tuple:
+    """A hashable identity for ``division`` within its op's symbol namespace.
+
+    Split keys are the producer's own iteration symbols, so this compares only
+    within one operation -- the scope ``CoreDivision.signature_key`` already
+    documents. Unlike that one it is *total*: it keeps the reduction splits and
+    the tiling, so two divisions share a key only when they are the same choice.
+    """
+
+    def splits(mapping: dict) -> tuple:
+        return tuple(sorted(mapping.items(), key=lambda item: str(item[0])))
+
+    return (
+        splits(division.output_splits),
+        splits(division.reduction_splits),
+        division.tiling,
+    )
+
+
+def _undeclared_splits(config: "DivisionConfig", sym_core_divs: tuple) -> set:
+    """The split keys of ``config`` that ``sym_core_divs`` declares no symbol for.
+
+    Empty is the contract :meth:`SaCoOptimizingSolver._build_configs` states and
+    a config generator has to meet; anything in here would be priced as unsplit.
+    """
+    out_syms, red_syms = sym_core_divs
+    return (set(config.output_splits) - set(out_syms)) | (
+        set(config.reduction_splits) - set(red_syms)
+    )
+
+
+@dataclass(frozen=True, eq=False)
+class DivisionConfig:
+    """One op's work division as a value -- the annealer's state element.
+
+    ``chosen[i]`` holds one of these rather than a menu position, so a config the
+    engine *generates* rather than enumerates is usable wherever a menu entry is.
+    Equality and hashing are :attr:`key`'s, which makes two configs equal exactly
+    when they are the same *choice*, and lets a generated set be deduplicated or
+    memoized. That is deliberately coarser than menu position: a menu carries the
+    same choice at several positions (see
+    :meth:`SaCoOptimizingSolver._build_configs`), and those compare equal.
+
+    ``menu_index`` is provenance: the position this config came from in its
+    buffer's ``core_divisions``. It is what the three parts still keyed by menu
+    position read -- the ``cd_parent_matches`` pair tables
+    (:meth:`SaCoOptimizingSolver._eligible`,
+    :meth:`SaCoOptimizingSolver._flood_region`), the flip move's wrap-around
+    arithmetic, and the ``chosen_division`` handed back to the allocator, which
+    re-indexes the menu with it. Those three are what a generator has to answer
+    for; everything else in the engine now reads the config.
+    """
+
+    division: "CoreDivision"
+    key: tuple
+    menu_index: int
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, DivisionConfig) and self.key == other.key
+
+    def __hash__(self) -> int:
+        return hash(self.key)
+
+    @property
+    def output_splits(self) -> dict:
+        return self.division.output_splits
+
+    @property
+    def reduction_splits(self) -> dict:
+        return self.division.reduction_splits
+
+    @property
+    def output_partition(self) -> int:
+        return self.division.output_partition
+
+
 class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
     """SA joint core-division + LX-placement engine.
 
@@ -159,10 +236,13 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         # (see :meth:`_build_score_fn`); ``None`` until then, which also means
         # "no usable cost expression" -- the memory-only objective's signal.
         self._score_fn: Any = None
+        # The division vector ``W``: one config per buffer, positionally. Set at
+        # the seed (see :meth:`_seed_configs`); declared here for the types.
+        self.chosen: list[DivisionConfig]
         # Best-seen over the anneal (set in _anneal, read in _step); declared for
         # the types.
         self._best_score: int
-        self._best_snap: tuple[Packer, list[int], int]
+        self._best_snap: tuple[Packer, list[DivisionConfig], int]
         # Number of buffers passing :meth:`_eligible` under the live ``W``. Kept
         # as a count, not a mask: the two ripple sites already evaluate
         # ``_eligible`` over the buffers a move can change, so they carry the
@@ -194,17 +274,20 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         if n == 0:
             return list(self._bufs)
 
+        self._rng = rnd.Random(_SEED)
+        # Before the score function, which prices the configs the topology pass
+        # builds against the symbol set it freezes. Consumes no randomness, so
+        # the search trajectory is unaffected by running first.
+        self._precompute_topology()
+
         self._score_fn = self._build_score_fn(cost_expr)
         if self._score_fn is None:
             logger.info(
                 "no usable cost expression; falling back to the memory-only objective"
             )
 
-        self._rng = rnd.Random(_SEED)
-        self._precompute_topology()
-
-        # Seed: every op at the committed division (index 0); pi from FirstFit.
-        self.chosen = [0] * n
+        # Seed: every op at its committed division; pi from FirstFit.
+        self.chosen = self._seed_configs()
         self.packer = self._build_seed_packer()
 
         self._anneal()
@@ -215,6 +298,14 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         """Compile ``cost_expr`` into a ``(chosen, resident) -> fixed-point ns``
         callable, or ``None`` if it can't be evaluated from only this solver's
         own buffers.
+
+        Every free symbol becomes a getter over the live state: a residency
+        symbol from whether its buffer's name is in ``resident``, a split symbol
+        from ``chosen[idx]`` -- the config itself, so a generated one prices
+        exactly as a menu entry does. The symbols come from the *declaration*
+        :meth:`_build_configs` froze, which is also what makes that so: a config
+        splitting an axis the declaration has no symbol for would be priced at
+        the default of 1 rather than rejected.
 
         ``None`` (no expression, or a symbol this can't place -- e.g. a dynamic-
         shape symbol the allocator's build left in) falls back to the
@@ -227,14 +318,14 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
             value_of[buf.sym_is_lx] = lambda chosen, resident, name=buf.name: (
                 1 if name in resident else 0
             )
-            out_syms, red_syms = buf.sym_core_divs
+            out_syms, red_syms = self._sym_core_divs[idx]
             for key, sym in out_syms.items():
-                value_of[sym] = lambda chosen, resident, idx=idx, key=key, buf=buf: (
-                    buf.core_divisions[chosen[idx]].output_splits.get(key, 1)
+                value_of[sym] = lambda chosen, resident, idx=idx, key=key: (
+                    chosen[idx].output_splits.get(key, 1)
                 )
             for key, sym in red_syms.items():
-                value_of[sym] = lambda chosen, resident, idx=idx, key=key, buf=buf: (
-                    buf.core_divisions[chosen[idx]].reduction_splits.get(key, 1)
+                value_of[sym] = lambda chosen, resident, idx=idx, key=key: (
+                    chosen[idx].reduction_splits.get(key, 1)
                 )
         try:
             free = sorted(cost_expr.free_symbols, key=str)
@@ -278,15 +369,16 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
 
     def _precompute_topology(self) -> None:
         """Precompute the division-invariant graph structure used every step:
-        the name->index map, each buffer's parent indices, and -- keyed by parent
-        index -- its children with the ``(parent_div, child_div)`` pairs that keep
-        that edge tiling-compatible.
+        the per-buffer configs, the name->index map, each buffer's parent
+        indices, and -- keyed by parent index -- its children with the
+        ``(parent_div, child_div)`` pairs that keep that edge compatible.
 
         No consumer *count* is derived here: :meth:`_spill_cost` scales by
         reads-served instead. ``_children`` remains available for the cohort
         multiplicity when op metadata is wired in.
         """
         self._assert_unsized_buffers_are_pinned()
+        self._build_configs()
         bufs = self._bufs
         self._name_to_idx = {b.name: i for i, b in enumerate(bufs)}
         n = len(bufs)
@@ -324,17 +416,64 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         self._edge_pairs: dict[tuple[int, int], frozenset] = {
             (i, c): pairs for i in range(n) for c, pairs in self._children[i]
         }
-        # Non-trivial (split) menu indices per op -- the only legal recolor
-        # anchors, so recolor stays a coordinated *splitting* move and leaves
-        # undividing to atomic flips.
+        # Non-trivial (split) configs per op -- the only legal recolor anchors,
+        # so recolor stays a coordinated *splitting* move and leaves undividing
+        # to atomic flips. In menu order, which is the order the anchor draw
+        # indexes.
         self._nontrivial_menu = [
-            sorted(
-                j for j, cd in enumerate(b.core_divisions) if cd.output_partition > 1
-            )
-            for b in bufs
+            [config for config in configs if config.output_partition > 1]
+            for configs in self._configs
         ]
         self._anchor_candidates = [i for i in range(n) if self._nontrivial_menu[i]]
         self._precompute_spill_costs()
+
+    def _build_configs(self) -> None:
+        """Turn each buffer's candidate menu into :class:`DivisionConfig` values
+        and freeze the symbol set those configs are priced over.
+
+        The symbol set is the *declaration*: ``sym_core_divs`` carries one symbol
+        per stride coefficient seen across a buffer's candidates, and
+        :meth:`_build_score_fn` values only those. A config splitting an axis
+        outside it would be priced at the symbol's default of 1 -- a wrong
+        answer, silently. A menu meets the declaration by construction, since the
+        declaration is derived from it; checking it here is what makes the
+        contract hold for a config that did not come from a menu.
+
+        Keys are *not* distinct within a menu, and are not required to be: the
+        enumerator emits the same division at several positions, because a
+        factor-1 axis is omitted from the sparse split map and so ``{d0: 2,
+        d1: 1}`` and ``{d0: 2}`` are one division (measured on softmax under
+        ``simulated_annealing`` + co-optimization: four of ``arg0_1``'s 20
+        candidates repeat an earlier one). Two such positions are the same
+        *choice*, which is what a key compares -- so equal keys carrying
+        different ``menu_index`` are expected, and collapsing them is a change to
+        the move alphabet that belongs with generation, not with this change of
+        representation.
+        """
+        self._sym_core_divs = [b.sym_core_divs for b in self._bufs]
+        self._configs = [
+            [
+                DivisionConfig(cd, _canonical_key(cd), index)
+                for index, cd in enumerate(b.core_divisions)
+            ]
+            for b in self._bufs
+        ]
+        for buf, configs, declared in zip(
+            self._bufs, self._configs, self._sym_core_divs
+        ):
+            for config in configs:
+                undeclared = _undeclared_splits(config, declared)
+                assert not undeclared, (
+                    f"buffer {buf.name}: config {config.key} splits "
+                    f"{sorted(str(key) for key in undeclared)}, which the cost "
+                    "expression declares no symbol for, so those splits would be "
+                    "priced as unsplit"
+                )
+
+    def _seed_configs(self) -> list[DivisionConfig]:
+        """The seed division vector: every op at its committed division, the
+        candidate the allocator enumerates first."""
+        return [configs[0] for configs in self._configs]
 
     def _precompute_spill_costs(self) -> None:
         """Cache the loop-invariant inputs to :meth:`_score`. A move changes only
@@ -345,8 +484,8 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
 
     # -- division-dependent derivations --------------------------------------
 
-    def _per_core_size(self, idx: int, div_idx: int) -> int:
-        """Per-core footprint of buffer ``idx`` under menu index ``div_idx``:
+    def _per_core_size(self, idx: int, config: DivisionConfig) -> int:
+        """Per-core footprint of buffer ``idx`` under ``config``:
         ``ceil_div(total_size, output_partition)``, using the substrate's integer
         helper so this rounds identically to every other footprint-division site.
 
@@ -354,8 +493,7 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         ``mem_usage`` ``-1`` sentinel; what stops an unsized buffer from looking
         *placeable* at zero footprint is
         :meth:`_assert_unsized_buffers_are_pinned`."""
-        part = self._bufs[idx].core_divisions[div_idx].output_partition
-        return max(0, ceil_div(self._bufs[idx].size, part))
+        return max(0, ceil_div(self._bufs[idx].size, config.output_partition))
 
     def _eligible(self, idx: int) -> bool:
         """Whether buffer ``idx`` may be LX-resident under the current ``W``
@@ -376,9 +514,12 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
             return False
         if self._per_core_size(idx, self.chosen[idx]) > self.limit:
             return False
-        ci = self.chosen[idx]
+        # The pair tables are menu-position keyed, so this is one of the three
+        # sites reading a config's provenance (see :class:`DivisionConfig`).
+        ci = self.chosen[idx].menu_index
         return all(
-            (ci, self.chosen[c_idx]) in pairs for c_idx, pairs in self._children[idx]
+            (ci, self.chosen[c_idx].menu_index) in pairs
+            for c_idx, pairs in self._children[idx]
         )
 
     def _all_eligible_resident(self) -> bool:
@@ -414,10 +555,10 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         return out
 
     def _build_seed_packer(self) -> Packer:
-        """Build the packer for the seed state: per-core sizes at index 0, a
-        FirstFit-derived ``pi``, and the seed eligibility mask."""
+        """Build the packer for the seed state: the per-core sizes ``chosen``
+        implies, a FirstFit-derived ``pi``, and the seed eligibility mask."""
         n = len(self._bufs)
-        sizes = [self._per_core_size(i, 0) for i in range(n)]
+        sizes = [self._per_core_size(i, self.chosen[i]) for i in range(n)]
         eligible = [self._eligible(i) for i in range(n)]
         self._n_eligible = sum(eligible)
 
@@ -499,19 +640,17 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
 
     def _flippable(self) -> list[int]:
         """Buffer indices whose division menu offers an alternative (>1 entry)."""
-        return [
-            i for i in range(len(self._bufs)) if len(self._bufs[i].core_divisions) > 1
-        ]
+        return [i for i in range(len(self._bufs)) if len(self._configs[i]) > 1]
 
-    def _atomic_flip(self, idx: int, new_div: int) -> None:
-        """Change buffer ``idx``'s division to ``new_div`` and ripple: resize its
+    def _atomic_flip(self, idx: int, config: DivisionConfig) -> None:
+        """Change buffer ``idx``'s division to ``config`` and ripple: resize its
         per-core footprint, then refresh eligibility for ``idx`` and its parents.
         Those are the only buffers a flip can change, since eligibility depends on
         an op's own division and its children's."""
         affected = sorted({idx} | self._parents_idx[idx])
         before = sum(self._eligible(x) for x in affected)
-        self.chosen[idx] = new_div
-        self.packer.resize(idx, self._per_core_size(idx, new_div))
+        self.chosen[idx] = config
+        self.packer.resize(idx, self._per_core_size(idx, config))
         after = 0
         for x in affected:
             flag = self._eligible(x)
@@ -519,41 +658,45 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
             self.packer.set_eligible(x, flag)
         self._n_eligible += after - before
 
-    def _flood_region(self, anchor: int, tiling: int) -> dict[int, int]:
-        """Flood the ``cd_parent_matches`` relation from ``(anchor, tiling)`` to a
-        menu-index assignment over the reachable region.
+    def _flood_region(
+        self, anchor: int, config: DivisionConfig
+    ) -> dict[int, DivisionConfig]:
+        """Flood the ``cd_parent_matches`` relation from ``(anchor, config)`` to a
+        config assignment over the reachable region.
 
-        Bidirectional: from an assigned op ``u`` (index ``iu``), a child ``c`` joins
-        at the smallest ``ic`` with ``(iu, ic)`` compatible, and a parent ``p`` at
-        the smallest ``ip`` with ``(ip, iu)`` compatible. The reachable set *is* the
-        region; an edge with no compatible index is simply not extended across --
-        an accepted internal seam, never a failure.
+        Bidirectional: from an assigned op ``u`` at menu position ``iu``, a child
+        ``c`` joins at the smallest ``ic`` with ``(iu, ic)`` compatible, and a
+        parent ``p`` at the smallest ``ip`` with ``(ip, iu)`` compatible -- the
+        second of the three sites reading a config's provenance, since the pair
+        tables are menu-position keyed. The reachable set *is* the region; an edge
+        with no compatible index is simply not extended across -- an accepted
+        internal seam, never a failure.
 
         First-assignment-wins with a min-index frontier and sorted candidates makes
         this independent of ``cd_parent_matches`` list order.
         """
-        assignment = {anchor: tiling}
+        assignment = {anchor: config}
         heap = [anchor]
         while heap:
             u = heapq.heappop(heap)
-            iu = assignment[u]
+            iu = assignment[u].menu_index
             for c in self._children_idx[u]:  # down: u -> c
                 if c in assignment:
                     continue
                 cands = sorted(ic for ip, ic in self._edge_pairs[(u, c)] if ip == iu)
                 if cands:
-                    assignment[c] = cands[0]
+                    assignment[c] = self._configs[c][cands[0]]
                     heapq.heappush(heap, c)
             for p in sorted(self._parents_idx[u]):  # up: p -> u
                 if p in assignment:
                     continue
                 cands = sorted(ip for ip, ic in self._edge_pairs[(p, u)] if ic == iu)
                 if cands:
-                    assignment[p] = cands[0]
+                    assignment[p] = self._configs[p][cands[0]]
                     heapq.heappush(heap, p)
         return assignment
 
-    def _apply_recolor(self, assignment: dict[int, int]) -> None:
+    def _apply_recolor(self, assignment: dict[int, DivisionConfig]) -> None:
         """Commit a flooded region coloring: set every region op's division, resize
         its footprint, and refresh eligibility for the region plus the parents of
         region ops (the same ripple as a flip, unioned over the region)."""
@@ -564,8 +707,8 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
             affected |= self._parents_idx[op]
         affected_sorted = sorted(affected)
         before = sum(self._eligible(x) for x in affected_sorted)
-        for op, div in assignment.items():
-            self.chosen[op] = div
+        for op, config in assignment.items():
+            self.chosen[op] = config
         for op in sorted(assignment):
             self.packer.resize(op, self._per_core_size(op, self.chosen[op]))
         after = 0
@@ -577,11 +720,11 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
 
     def _recolor(self) -> None:
         """One region-recolor move: a uniform anchor op (so a region is hit
-        ∝ its op-count), a random non-trivial anchor tiling, flood, recolor,
+        ∝ its op-count), a random non-trivial anchor config, flood, recolor,
         burst."""
         anchor = self._rng.choice(self._anchor_candidates)
-        tiling = self._rng.choice(self._nontrivial_menu[anchor])
-        self._apply_recolor(self._flood_region(anchor, tiling))
+        config = self._rng.choice(self._nontrivial_menu[anchor])
+        self._apply_recolor(self._flood_region(anchor, config))
         self._burst()
 
     def _burst(self) -> None:
@@ -608,14 +751,16 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
 
     # -- state snapshots -----------------------------------------------------
 
-    def _snapshot(self) -> tuple[Packer, list[int], int]:
+    def _snapshot(self) -> tuple[Packer, list[DivisionConfig], int]:
         """An independent copy of the joint state ``(pi, W)``: the packer's
         dynamic layout (``copy`` shares only plan-lifetime structures) plus the
         division vector, and the eligible count ``W`` implies -- rebuilding that
-        from ``W`` would cost an O(n) pass the restore does not otherwise need."""
+        from ``W`` would cost an O(n) pass the restore does not otherwise need.
+        Configs are immutable values, so the shallow list copy is a full copy of
+        ``W``."""
         return (self.packer.copy(), list(self.chosen), self._n_eligible)
 
-    def _adopt(self, snap: tuple[Packer, list[int], int]) -> None:
+    def _adopt(self, snap: tuple[Packer, list[DivisionConfig], int]) -> None:
         """Install ``snap`` as the live state by *taking ownership* of it -- no
         copy, so the engine goes on mutating those objects and the caller must
         treat ``snap`` as dead from here on. Zero-copy because a step already pays
@@ -657,9 +802,16 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
             self.packer.rotate(self._rng.randrange(n), self._rng.randrange(n))
         elif name == "flip":
             idx = self._rng.choice(self._flippable_ops)
-            menu = len(self._bufs[idx].core_divisions)
+            # Still menu-position arithmetic -- the third provenance site, and
+            # deliberately unchanged: generating the alternative instead is the
+            # next stage's move, and keeping it here is what makes this one a
+            # pure change of representation.
+            configs = self._configs[idx]
+            menu = len(configs)
             offset = self._rng.randrange(1, menu)  # a different index, wrap-around
-            self._atomic_flip(idx, (self.chosen[idx] + offset) % menu)
+            self._atomic_flip(
+                idx, configs[(self.chosen[idx].menu_index + offset) % menu]
+            )
             self._burst()
         elif name == "recolor":
             self._recolor()
@@ -834,7 +986,7 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         """Commit the best state to the buffers and record spill causes."""
         for i, b in enumerate(self._bufs):
             addr = self.packer.addresses[i]
-            b.chosen_division = self.chosen[i]
+            b.chosen_division = self.chosen[i].menu_index
             b.address = addr
             if addr is None:
                 self.spill_reasons[b.name] = b.residency_reason or _SOLVER_CHOSE_SPILL
