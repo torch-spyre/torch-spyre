@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import math
 from typing import Any, Callable, Optional, Sequence, TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -29,7 +28,7 @@ from torch._inductor.ir import (
     ReductionHint,
     TensorBox,
 )
-from torch_spyre._C import SpyreTensorLayout
+from torch_spyre._C import SpyreTensorLayout, get_device_size_in_bytes
 
 from torch._inductor.codegen.wrapper import (
     PythonWrapperCodegen,
@@ -476,19 +475,16 @@ def _dtype_to_int(dtype: torch.dtype) -> int:
     return code
 
 
-_STICK_BYTES = 128
-
-
 def _compute_device_num_elems(layout: "FixedLayout") -> int:
-    """Compute flat 1D device element count from a layout.
+    """Count storage in the scalar-type units passed to the collective planner.
 
     For FixedTiledLayout (has device_layout), uses the actual device size.
     For plain FixedLayout (intermediates), falls back to logical numel.
     """
     if isinstance(layout, FixedTiledLayout):
-        stl = layout.device_layout
-        num_sticks = math.prod(stl.device_size[:-1])
-        size_bytes = num_sticks * _STICK_BYTES
+        size_bytes = get_device_size_in_bytes(layout.device_layout)
+        # The plan receives layout.dtype too. Device element count alone would
+        # change byte coverage when host and device widths differ (e.g. int64).
         element_size = torch.tensor([], dtype=layout.dtype).element_size()
         return size_bytes // element_size
     numel = sympy.prod(layout.size)

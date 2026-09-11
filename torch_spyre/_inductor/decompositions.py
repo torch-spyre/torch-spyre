@@ -492,6 +492,7 @@ def spyre__sdpa_overrideable(
     # instead normalized PER BLOCK inside the loop (keys_T's .contiguous() and
     # the per-block v_blk.contiguous()), each a bounded [B, H, kv_block_size, D]
     # copy (kv_block_size <= 2048, see below), never the full [B, H, S_kv, D].
+    original_query_strides = query.stride()
     query = query.contiguous()
 
     expansion = num_heads // num_kvheads
@@ -721,7 +722,7 @@ def spyre__sdpa_overrideable(
     # (physical [B, S, H, D]) it is the swapped-dim layout. Reproduce the meta's
     # dim-order permutation so both cases match exactly.
     dim_order = sorted(
-        range(query.dim()), key=lambda i: query.stride()[i], reverse=True
+        range(query.dim()), key=lambda i: original_query_strides[i], reverse=True
     )
     permuted = output.permute(dim_order).contiguous()
     inverse_permute = [dim_order.index(i) for i in range(len(dim_order))]
