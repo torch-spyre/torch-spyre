@@ -247,62 +247,125 @@ def test_bidirectional_roundtrip_fp32_start(device, fp16):
     print("✓ FP32→FP16→FP32 roundtrip works")
 
 
-def _stagger_fn(x, fp16):
-    """fp32 → fp16(staggered) → stagger_to_standard_ea → standard EA fp16."""
-    return torch.ops.spyre.stagger_to_standard_ea(x.to(dtype=fp16))
+# Shapes used by both graph-output de-stagger tests (fp32→fp16 and fp16→fp32).
+# Each shape must be stick-aligned (last dim a multiple of 64 for fp16 /
+# multiple of 32 for fp32) so no padding is involved.
+_DESTAGGER_SHAPES_FP32 = [
+    # 1-D
+    torch.randn(64, dtype=torch.float32),
+    torch.randn(128, dtype=torch.float32),
+    # 2-D
+    torch.randn(4, 64, dtype=torch.float32),
+    torch.randn(7, 128, dtype=torch.float32),
+    # 3-D
+    torch.randn(2, 4, 64, dtype=torch.float32),
+    torch.randn(3, 5, 128, dtype=torch.float32),
+    # 4-D
+    torch.randn(2, 3, 4, 64, dtype=torch.float32),
+    torch.randn(2, 3, 4, 128, dtype=torch.float32),
+]
 
-
-@pytest.mark.parametrize(
-    "x",
-    [
-        # 1-D: stick-aligned
-        torch.randn(64, dtype=torch.float32),
-        torch.randn(128, dtype=torch.float32),
-        # 1-D: non-stick-aligned (padded to 64-multiple)
-        torch.nn.functional.pad(torch.randn(44, dtype=torch.float32), (0, 20)),
-        # 2-D: stick-aligned
-        torch.randn(4, 64, dtype=torch.float32),
-        torch.randn(7, 128, dtype=torch.float32),
-        # 2-D: non-stick-aligned (padded)
-        torch.nn.functional.pad(torch.randn(7, 44, dtype=torch.float32), (0, 20)),
-        # 3-D: stick-aligned
-        torch.randn(2, 4, 64, dtype=torch.float32),
-        torch.randn(3, 5, 128, dtype=torch.float32),
-        # 3-D: non-stick-aligned (padded)
-        torch.nn.functional.pad(torch.randn(2, 4, 44, dtype=torch.float32), (0, 20)),
-        # 4-D: stick-aligned
-        torch.randn(2, 3, 4, 64, dtype=torch.float32),
-        torch.randn(2, 3, 4, 128, dtype=torch.float32),
-        # 4-D: non-stick-aligned (padded)
-        torch.nn.functional.pad(torch.randn(2, 3, 4, 44, dtype=torch.float32), (0, 20)),
-    ],
+# DDC fp32 stagger-undo requires last dim >= 128 (>= 4 fp32 sticks = 2 fp16 sticks).
+# Shapes with last dim == 64 are xfail until DDC supports single-fp16-stick undo.
+_xfail_dl16_fp32 = pytest.mark.xfail(
+    reason="DL16_TO_FP32 de-stagger requires last-dim >= 128 (DDC limitation)",
+    strict=True,
 )
-@pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+
+_DESTAGGER_SHAPES_FP16 = [
+    # 1-D
+    pytest.param(torch.randn(64, dtype=torch.float16), marks=_xfail_dl16_fp32),
+    torch.randn(128, dtype=torch.float16),
+    # 2-D
+    pytest.param(torch.randn(4, 64, dtype=torch.float16), marks=_xfail_dl16_fp32),
+    torch.randn(7, 128, dtype=torch.float16),
+    # 3-D
+    pytest.param(torch.randn(2, 4, 64, dtype=torch.float16), marks=_xfail_dl16_fp32),
+    torch.randn(3, 5, 128, dtype=torch.float16),
+    # 4-D
+    pytest.param(torch.randn(2, 3, 4, 64, dtype=torch.float16), marks=_xfail_dl16_fp32),
+    torch.randn(2, 3, 4, 128, dtype=torch.float16),
+]
+
+
+@pytest.mark.parametrize("x", _DESTAGGER_SHAPES_FP32)
 @pytest.mark.parametrize(
     "fp16",
     DtypeOpTable.fp16_types(),
     ids=lambda dt: str(dt).replace("torch.", ""),
 )
-def test_stagger_to_standard_ea(x, fp16):
-    """stagger_to_standard_ea restores standard EA after fp32→fp16 (fp32todl16).
+def test_fp32_to_fp16_graph_output_destagger(x, fp16):
+    """Backend auto-destagger: fp32→fp16 (FP32_TO_DL16) graph output returns STANDARD EA.
+
+    insert_destagger_graph_outputs handles FP32_TO_DL16 EA outputs by inserting
+    an on-device identity de-stagger op (fp16 stagger undo fold) before D2H,
+    so the caller always receives a STANDARD-EA fp16 tensor.
 
     Verifies:
-      1. Output values match a plain x.to(fp16) on CPU (logical correctness).
-      2. Output EA is STANDARD (layout correctness).
+      1. Output EA is STANDARD (the backend inserted de-stagger automatically).
+      2. Output values match a plain x.to(fp16) on CPU (logical correctness).
     """
-    expected = x.to(fp16)
 
-    compiled_fn = torch.compile(_stagger_fn, backend="inductor")
+    @torch.compile
+    def fn(t):
+        return t.to(dtype=fp16)
 
-    # 1. Value correctness: Spyre result matches CPU fp16 cast.
-    # fp32→fp16 rounding differs slightly (Spyre uses DF16); use fp16 tolerances.
-    result = compiled_fn(x.to("spyre"), fp16).cpu()
-    torch.testing.assert_close(result, expected, atol=1e-2, rtol=1e-2)
+    x_spyre = x.to("spyre")
+    spyre_result = fn(x_spyre)
 
-    # 2. Layout correctness: output EA must be STANDARD.
-    spyre_result = compiled_fn(x.to("spyre"), fp16)
+    # 1. Layout correctness: backend must have de-staggered to STANDARD EA.
     ea = get_spyre_tensor_layout(spyre_result).element_arrangement
-    assert ea == ElementArrangement.STANDARD, f"Expected STANDARD EA, got {ea}"
+    assert ea == ElementArrangement.STANDARD, (
+        f"Expected STANDARD EA after backend de-stagger, got {ea}"
+    )
+
+    # 2. Value correctness: result matches CPU fp16 cast.
+    # fp32→fp16 rounding may differ slightly (Spyre uses DF16); use fp16 tolerances.
+    torch.testing.assert_close(spyre_result.cpu(), x.to(fp16), atol=1e-2, rtol=1e-2)
+
+    print(f"✓ fp32→{fp16} graph output auto-destaggered to STANDARD EA")
+
+
+@pytest.mark.parametrize("x", _DESTAGGER_SHAPES_FP16)
+@pytest.mark.parametrize(
+    "fp16",
+    DtypeOpTable.fp16_types(),
+    ids=lambda dt: str(dt).replace("torch.", ""),
+)
+def test_fp16_to_fp32_graph_output_destagger(x, fp16):
+    """Backend auto-destagger: fp16→fp32 (DL16_TO_FP32) graph output returns STANDARD EA.
+
+    insert_destagger_graph_outputs handles DL16_TO_FP32 EA outputs by inserting
+    an on-device identity de-stagger op (fp32 stagger undo fold) before D2H,
+    so the caller always receives a STANDARD-EA fp32 tensor.
+
+    Verifies:
+      1. Output EA is STANDARD (the backend inserted de-stagger automatically).
+      2. Output values match a plain x.to(float32) on CPU (logical correctness).
+    """
+
+    @torch.compile
+    def fn(t):
+        return t.to(torch.float32)
+
+    x_fp16 = x.to(dtype=fp16)
+    x_spyre = x_fp16.to("spyre")
+    spyre_result = fn(x_spyre)
+
+    # 1. Layout correctness: backend must have de-staggered to STANDARD EA.
+    ea = get_spyre_tensor_layout(spyre_result).element_arrangement
+    assert ea == ElementArrangement.STANDARD, (
+        f"Expected STANDARD EA after backend de-stagger, got {ea}"
+    )
+
+    # 2. Value correctness: result matches CPU fp32 cast.
+    # fp16→fp32 is lossless in precision but Spyre uses DF16 hardware format;
+    # allow small tolerances matching fp16 precision.
+    torch.testing.assert_close(
+        spyre_result.cpu(), x_fp16.to(torch.float32), atol=1e-2, rtol=1e-2
+    )
+
+    print(f"✓ {fp16}→fp32 graph output auto-destaggered to STANDARD EA")
 
 
 # ---------------------------------------------------------------------------

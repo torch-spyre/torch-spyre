@@ -42,6 +42,7 @@ from .constants import (
     DEPTHWISE_CONV2D_OP,
     KEEP_BY_INDEX_OP,
     POOL_OPS,
+    STAGGERED_EAS,
     _MAX_K_PER_CORE,
     TOPK_MAX_K_PER_CORE,
     TOPK_OPS,
@@ -113,6 +114,7 @@ def collect_work_division_constraints(
         coarse_tile_local_dim_split_domains,
         plain_reduction_k_split_domains,
         restickify_padding_blocked_vars,
+        staggered_ea_identity_stick_blocked_vars,
         qfp8wt_split_domains,
         qfp8wt_matmul_k_split_domains,
         topk_split_domains,
@@ -547,6 +549,29 @@ def restickify_padding_blocked_vars(
         if concretize_expr(ctx.it_space[dim]) % stick_size
     }
     return ConstraintResult(blocked=padded)
+
+
+def staggered_ea_identity_stick_blocked_vars(
+    ctx: WorkDivConstraintContext,
+) -> ConstraintResult:
+    """Block stick-dim splits on DL16_TO_FP32/FP32_TO_DL16 identity (destagger) nodes.
+
+    The stagger fold structure (4-level elem_arr) must see a complete 64-fp16-element
+    block per core. Splitting the stick dimension across cores would give each core a
+    partial block, which the DDC address generator cannot handle. Block all stick
+    variables for any single-input Pointwise whose input carries a staggered EA
+    and whose output EA differs (i.e. it is a de-stagger identity op).
+    """
+    if not isinstance(ctx.op.data, Pointwise) or len(ctx.input_tds) != 1:
+        return ConstraintResult()
+
+    in_ea = getattr(ctx.input_tds[0].layout.device_layout, "element_arrangement", None)
+    out_ea = getattr(ctx.output_td.layout.device_layout, "element_arrangement", None)
+    # Only applies when the input is staggered and output is STANDARD (de-stagger).
+    if in_ea not in STAGGERED_EAS or out_ea == in_ea:
+        return ConstraintResult()
+
+    return ConstraintResult(blocked=set(ctx.stick_vars.keys()))
 
 
 def has_qfp8wt_tensor(tds: "list[TensorDep]") -> bool:
