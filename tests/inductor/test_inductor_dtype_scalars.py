@@ -562,9 +562,9 @@ class TestNegativeScalarOperations:
         assert result.shape == x.shape
 
     # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1740
-    # AttributeError: 'UnimplementedOp' object has no attribute 'iteration_space'
     @pytest.mark.xfail(
-        reason="backend: Negative base with fractional power not implemented"
+        reason="aten::isnan has no spyre kernel, and rsqrt of a negative base "
+        "returns a finite value rather than NaN"
     )
     def test_negative_power_nan_result(self, execution_mode):
         """Negative base with fractional power -> NaN."""

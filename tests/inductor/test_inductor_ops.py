@@ -942,6 +942,82 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
             },
         },
+        # pow translates to a single exact op: ones_like at 0, the input itself
+        # at 1, reciprocal at -1, sqrt at 0.5, rsqrt at -0.5.
+        ("test_pow_primitive", "test_pow"): {
+            "param_sets": {
+                "0_fp16_1d": ((80,), 0, 0.005),
+                "0_fp16_2d": ((67, 80), 0, 0.005),
+                "0_fp16_3d": ((67, 71, 80), 0, 0.005),
+                "1_fp16_1d": ((80,), 1, 0.005),
+                "1_fp16_2d": ((67, 80), 1, 0.005),
+                "1_fp16_3d": ((67, 71, 80), 1, 0.005),
+                "neg1_fp16_1d": ((80,), -1, 0.005),
+                "neg1_fp16_2d": ((67, 80), -1, 0.005),
+                "neg1_fp16_3d": ((67, 71, 80), -1, 0.005),
+                "half_fp16_1d": ((80,), 0.5, 0.005),
+                "half_fp16_2d": ((67, 80), 0.5, 0.005),
+                "half_fp16_3d": ((67, 71, 80), 0.5, 0.005),
+                "neg_half_fp16_1d": ((80,), -0.5, 0.005),
+                "neg_half_fp16_2d": ((67, 80), -0.5, 0.005),
+                "neg_half_fp16_3d": ((67, 71, 80), -0.5, 0.005),
+            },
+        },
+        # pow translates to a chain of mul ops by square-and-multiply, with
+        # reciprocal on top when n < 0; n = +-2 is the chain of length one. Each
+        # multiply costs about one ULP, so the tolerance tracks |n|. Measured
+        # maxima are roughly half of each value; re-measure before adding an
+        # exponent.
+        ("test_pow_int", "test_pow"): {
+            "param_sets": {
+                "2_fp16_1d": ((80,), 2, 0.005),
+                "2_fp16_2d": ((67, 80), 2, 0.005),
+                "2_fp16_3d": ((67, 71, 80), 2, 0.005),
+                "neg2_fp16_1d": ((80,), -2, 0.005),
+                "neg2_fp16_2d": ((67, 80), -2, 0.005),
+                "neg2_fp16_3d": ((67, 71, 80), -2, 0.005),
+                "3_fp16_1d": ((80,), 3, 0.006),
+                "3_fp16_2d": ((67, 80), 3, 0.006),
+                "3_fp16_3d": ((67, 71, 80), 3, 0.006),
+                "neg3_fp16_1d": ((80,), -3, 0.005),
+                "neg3_fp16_2d": ((67, 80), -3, 0.005),
+                "neg3_fp16_3d": ((67, 71, 80), -3, 0.005),
+                "4_fp16_1d": ((80,), 4, 0.01),
+                "4_fp16_2d": ((67, 80), 4, 0.01),
+                "4_fp16_3d": ((67, 71, 80), 4, 0.01),
+                "5_fp16_1d": ((80,), 5, 0.012),
+                "5_fp16_2d": ((67, 80), 5, 0.012),
+                "5_fp16_3d": ((67, 71, 80), 5, 0.012),
+                "8_fp16_1d": ((80,), 8, 0.02),
+                "8_fp16_2d": ((67, 80), 8, 0.02),
+                "8_fp16_3d": ((67, 71, 80), 8, 0.02),
+                "15_fp16_1d": ((80,), 15, 0.04),
+                "15_fp16_2d": ((67, 80), 15, 0.04),
+                "15_fp16_3d": ((67, 71, 80), 15, 0.04),
+            },
+        },
+        # pow translates to exp(n * log(x)), the branch for a non-integer
+        # exponent -- one ULP either way, since a single exp and log cost far less
+        # than a mul chain of the same |n|. Stick-aligned here, since exp is the
+        # one branch an unaligned extent breaks.
+        ("test_pow_nonint", "test_pow"): {
+            "param_sets": {
+                "0.3_fp16_1d": ((256,), 0.3, 0.005),
+                "0.3_fp16_2d": ((67, 256), 0.3, 0.005),
+                "0.3_fp16_3d": ((67, 71, 256), 0.3, 0.005),
+                "2.5_fp16_1d": ((256,), 2.5, 0.005),
+                "2.5_fp16_2d": ((67, 256), 2.5, 0.005),
+                "2.5_fp16_3d": ((67, 71, 256), 2.5, 0.005),
+                "0.3_fp16_2d_unaligned": ((67, 80), 0.3, 0.005),
+                "2.5_fp16_2d_unaligned": ((67, 80), 2.5, 0.005),
+            },
+            # exp miscompiles on an unaligned trailing extent (issue #3799);
+            # the same extent passes through a mul chain in test_pow_int.
+            "expect_fail": [
+                "0.3_fp16_2d_unaligned",
+                "2.5_fp16_2d_unaligned",
+            ],
+        },
         ("test_add_scalar", "test_unary_op_cpu"): {
             "ops_dict": {
                 "add_scalar_5": lambda x: torch.add(x, 5.0),
@@ -5886,6 +5962,24 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
     def test_unary_op_cpu(self, op, x):
         self.compare_with_cpu(op, x)
+
+    def test_pow(self, shape, exponent, err):
+        """``pow`` over a positive base near 1, where x**n stays in DLFloat16's
+        normal range across the whole exponent sweep -- a wider base underflows
+        the CPU reference itself, charging the backend for its error.
+        """
+        base = cached_randn(shape, differentiation="pow_base", abs=True, scale=0.15)
+        self.compare_with_cpu(
+            lambda x: torch.pow(x, exponent), base + 0.9, atol=err, rtol=err
+        )
+
+    def test_pow_int_base_is_unsupported(self):
+        """An integer base fails at compile time rather than silently."""
+        x = torch.randint(1, 5, (64,), dtype=torch.int32).to("spyre")
+        # Inductor wraps a decomposition's exception, so match on the message
+        # rather than on Unsupported itself.
+        with self.assertRaisesRegex(Exception, "non-floating-point base"):
+            torch.compile(lambda t: torch.pow(t, 2), dynamic=False)(x)
 
     @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_fallback_unary_op_cpu(self, op, x):
