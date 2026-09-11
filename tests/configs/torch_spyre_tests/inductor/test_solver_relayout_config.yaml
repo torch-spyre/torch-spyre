@@ -1,0 +1,16 @@
+# Solver-relayout feature tests: candidate enumeration and pricing
+# (device-free), CP-SAT decision behavior on handcrafted instances
+# (device-free), and end-to-end firing on compiled graphs (device).
+# The tests patch their own solver configuration, so no special
+# environment is needed. The one skipped E2E test documents its own
+# unskip condition (a coarse-tiled decline test blocked on an upstream
+# symbolic-objective crash).
+test_suite_config:
+  labels: [regression, trunk]
+  files:
+    - path: ${TORCH_DEVICE_ROOT}/tests/inductor/test_solver_relayout_candidates.py
+      unlisted_test_mode: mandatory_success
+    - path: ${TORCH_DEVICE_ROOT}/tests/inductor/test_solver_relayout_decision.py
+      unlisted_test_mode: mandatory_success
+    - path: ${TORCH_DEVICE_ROOT}/tests/inductor/test_solver_relayout_e2e.py
+      unlisted_test_mode: mandatory_success
