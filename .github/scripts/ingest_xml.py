@@ -1225,6 +1225,82 @@ def v2_tables_present(client, db: str) -> bool:
     )
 
 
+def copy_reused_cases(client, db: str, run_id: str, component: str, covered) -> int:
+    """Copy a covering run's case rows into THIS run, so a delta run reports its whole tier.
+
+    A delta run executes only the set difference of a tier -- measured on torch-spyre, a
+    regression run that reuses integration runs 75 of 136 configs, and 19 of 136 if it also
+    reuses unit. The other rows would simply be absent, so every reader sees a small green
+    run instead of a fully covered tier. Writing them makes `GROUP BY run_id` correct with
+    no union view and nothing for the UI to know about.
+
+    `props['ran_in']` is PRESERVED, never overwritten with this run_id. That is what makes
+    this recursive for free: a copy of a copy still names the run that really executed the
+    case, so there is no chain to walk and no cycle to guard against.
+
+    `covered` is [(tier, covering_run_id), ...]. Idempotent by the same dedup the executed
+    rows use -- (component, run_id, props['source_file']) -- because the copies land under a
+    NEW run_id, so re-running refuses them rather than doubling the counts.
+    """
+    if not covered:
+        return 0
+    total = 0
+    runs = v2_schema.TEST_CASE_RUNS.qualified(db)
+    for tier, src_run in covered:
+        if not src_run:
+            continue
+        # Guard on the SOURCE run, not the tier: v2_already_ingested keys on
+        # props['source_file'], which these copies inherit from the source row, so it cannot
+        # see a re-copy -- without a guard here a second call doubled 4 rows to 8.
+        #
+        # Keyed on ran_in rather than on the tier tag because the tags OVERLAP: the same case
+        # commonly carries testtype__integration AND testtype__regression, so a tier-keyed
+        # check refused a legitimate second tier copy from the same run. Asking "have this
+        # run's rows already arrived here" is the question that actually needs answering, and
+        # a second tier from the same source adds no rows anyway -- the case set is already
+        # present, which is exactly the dedup this table needs.
+        already = client.query(
+            f"SELECT count() FROM {runs} "
+            "WHERE run_id = {run_id:UUID} AND component = {component:String} "
+            "  AND props['ran_in'] = {src:String}",
+            parameters={"run_id": run_id, "component": component, "src": str(src_run)},
+        ).result_rows
+        if already and already[0][0] > 0:
+            print(
+                f"  v2: cases from {src_run} already present in {run_id} "
+                f"({already[0][0]} rows) -- skipping {tier}",
+                file=sys.stderr,
+            )
+            continue
+        # Only the cases carrying this tier's tag: the covering run may have executed a
+        # wider set, and importing all of it would credit this tier with foreign cases.
+        cases = v2_schema.TEST_CASES.qualified(db)
+        client.command(
+            f"INSERT INTO {runs} "
+            "(run_id, test_case_id, component, status, duration_s, fail_message, props) "
+            "SELECT {run_id:UUID}, cr.test_case_id, cr.component, cr.status, cr.duration_s, "
+            # mapContains rather than a bare lookup: an older row predating ran_in has no
+            # such key, and defaulting it to the SOURCE run keeps that row honest instead of
+            # silently claiming this run executed it.
+            "       cr.fail_message, "
+            "       mapUpdate(cr.props, map('ran_in', "
+            "           if(mapContains(cr.props,'ran_in'), cr.props['ran_in'], toString(cr.run_id)))) "
+            f"FROM {runs} AS cr "
+            f"INNER JOIN {cases} AS c ON c.test_case_id = cr.test_case_id "
+            "     AND c.component = cr.component "
+            "WHERE cr.run_id = {src:UUID} AND cr.component = {component:String} "
+            "  AND has(c.tags, concat('testtype__', {tier:String}))",
+            parameters={
+                "run_id": run_id,
+                "src": src_run,
+                "component": component,
+                "tier": tier,
+            },
+        )
+        total += 1
+    return total
+
+
 def v2_already_ingested(
     client, db: str, run_id: str, component: str, source_file: str = ""
 ) -> bool:
@@ -1302,9 +1378,20 @@ def insert_v2(
                 "status": c.get("status", ""),
                 "duration_s": float(c.get("duration_s", 0) or 0),
                 "fail_message": (c.get("fail_message") or "")[:8192],
-                # Names the xml this row came from, so a sharded run dedups per
-                # file instead of the first shard blocking the rest.
-                "props": ({"source_file": source_file} if source_file else {}),
+                # source_file names the xml this row came from, so a sharded run dedups
+                # per file instead of the first shard blocking the rest.
+                # ran_in names the run that ACTUALLY EXECUTED this case. For a case this
+                # run ran it is this run_id; a reuse copy carries the original executor's
+                # (see copy_reused_cases). Every "how much did we execute" query must
+                # filter props['ran_in'] = run_id -- without it, reuse copies inflate the
+                # count. Queries asking "what does this run report for the tier" want the
+                # unfiltered total, which is the point of writing the copies at all.
+                "props": (
+                    {
+                        "ran_in": run_id,
+                        **({"source_file": source_file} if source_file else {}),
+                    }
+                ),
             }
         )
     # Cross-run dedup, not just in-leg: test_cases is a plain MergeTree, so re-inserting a
