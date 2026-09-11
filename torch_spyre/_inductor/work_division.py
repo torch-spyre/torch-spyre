@@ -60,6 +60,7 @@ from .pass_utils import (
     device_coordinates,
     finite_upper_or_none,
     get_mem_deps_from_rw,
+    input_layout_for_operation,
     iteration_space_from_op,
     commit_iteration_space_ownership,
     op_read_writes,
@@ -473,6 +474,11 @@ def get_per_core_span(
 ) -> int:
     """Compute per-core memory span in bytes for a tensor under the given splits.
 
+    This is a pre-placement split-selection estimate.  LX capacity checks use
+    the finalized stick-aligned device layout instead; the two calculations
+    must not be merged unless they are proved equal for aligned shapes.  Track
+    that possible consolidation under #3049.
+
     coordinate expressions from compute_coordinates() in views.py are sums of
     independent single-variable terms, so max of the full expression equals the
     sum of per-variable maxima obtained by zeroing out all other variables.
@@ -659,7 +665,7 @@ def must_split_vars(
             best = best_within or best_above
 
             if best is None:
-                logger.warning(
+                logger.info(
                     f"No valid split combo found for tensor {td.dep.name} "
                     f"coord={coord} under accumulated_splits={accumulated_splits}. "
                     f"Skipping."
@@ -1894,10 +1900,13 @@ def _apply_input_layout_overrides(
     The same tag is also used by SpyreKernel.create_tensor_arg, so work
     division and codegen agree on the input layout.
     """
-    overrides: dict[str, FixedTiledLayout] = getattr(op, "_input_layout_overrides", {})
-    if not overrides:
-        return args
-    return [SchedNodeArg(a.dep, overrides.get(a.dep.name, a.layout)) for a in args]
+    return [
+        SchedNodeArg(
+            arg.dep,
+            input_layout_for_operation(op, arg.dep.name, arg.layout),
+        )
+        for arg in args
+    ]
 
 
 def span_reduction(graph: GraphLowering) -> None:

@@ -13,3 +13,7 @@
 # limitations under the License.
 
 """Working Set Reduction (coarse-tiling) pass implementations."""
+
+from torch_spyre._inductor.wsr.for_each_tile import Gather, for_each_tile
+
+__all__ = ["Gather", "for_each_tile"]
