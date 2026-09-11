@@ -611,6 +611,22 @@ def _single_arg_op_layout(
     )
     if out_stl is not None:
         return [out_stl]
+    """
+    # Note: Added this for add tests with broadcast, but other CI tests failed.
+    #       Maybe another approach required
+    #
+    # Try to preserve input layout, fall back to scanning all output dims.
+    # For pointwise ops, only preserve if the stick dim maps to a real output dim.
+    # If out_stick_dim is -1 (e.g. broadcast input with constant stick_expr 0),
+    # bypass _output_stl_from_stick_expr so -1 is not treated as a reduction sentinel.
+    out_coords = host_coordinates(output, output_dep, None)
+    if _pick_stick_dim(stick_expr, out_coords) != -1:
+        out_stl = _output_stl_from_stick_expr(
+            stick_expr, output, output_dep, c_size, c_stride, out_dtype_for_layout
+        )
+        if out_stl is not None:
+            return [out_stl]
+    """
     return _candidate_output_stls(
         output,
         output_dep,

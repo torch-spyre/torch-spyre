@@ -128,10 +128,12 @@ class DtypeOpTable:
 
     _FP32_TO_INT32_DTYPES = [
         (torch.float32, torch.int32),
+        (torch.float32, torch.int64),
     ]
 
     _INT32_TO_FP32_DTYPES = [
         (torch.int32, torch.float32),
+        (torch.int64, torch.float32),
     ]
 
     _TYPECAST_OPS_TABLE = {

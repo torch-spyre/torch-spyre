@@ -2049,6 +2049,18 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
         dim_splits = {mb_sym: 1, **dim_splits}
         work_slices = {mb_sym: 1, **work_slices}
         op_dim_order = [mb_sym] + op_dim_order
+        # mb_sym was injected because there is no outer dim beyond the stick
+        # (pure 1D iteration space). In this case _get_padded_iteration_space
+        # will skip the stick-dim alignment check: device_size[-2::-1] for a
+        # 1D tensor (e.g. [8, 32]) has length 1, so the loop exits before
+        # reaching the `out` entry at idx=1. Round up explicitly here so the
+        # SFP scheduler always receives a full-stick slab per core.
+        _round_up_to_stick(
+            sdsc_iteration_space,
+            op_stick_dim,
+            op_spec.args[0].device_dtype.elems_per_stick(),
+            "dtype_op_mb_inject",
+        )
 
     # Inject missing dimensions into index tensors: P=1 (no loops) or
     # absent stick coordinate (size-1 logical dim).
