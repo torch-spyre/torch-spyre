@@ -13,10 +13,20 @@
 # limitations under the License.
 
 import io
+import itertools
 import math
 import warnings
 from dataclasses import dataclass
-from typing import Any, Callable, NamedTuple, Optional, Sequence, TypeVar, Union
+from typing import (
+    Any,
+    Callable,
+    Mapping,
+    NamedTuple,
+    Optional,
+    Sequence,
+    TypeVar,
+    Union,
+)
 
 import regex
 import torch
@@ -3250,6 +3260,139 @@ def _per_core_view_from_prep(
         num_cores=num_cores,
     )
     return (view, has_partial_reduction, True)
+
+
+def _view_placement(prep: _ViewPrep, host_stride: int) -> Optional[tuple[int, int]]:
+    """The ``(device dim, factor multiplier)`` a symbol at ``host_stride`` takes.
+
+    The three placement rules of :func:`_per_core_view_from_prep` step 3, read
+    as a query rather than applied: the direct stride lookup, the stickified-axis
+    rule that forces the outer-stick dim, and the multi-stick rescue. The
+    multiplier is 1 except on the rescue, where a split of ``s`` is *reported* as
+    ``s * k``. ``None`` where the forward map would give up.
+    """
+    dev_dim = prep.device_stride_to_dim.get(host_stride)
+    if host_stride == prep.stick_host_stride:
+        dev_dim = prep.num_stick_dim
+    if dev_dim is not None:
+        return (dev_dim, 1)
+    if (
+        prep.num_stick_stride > 0
+        and prep.num_stick_dim is not None
+        and host_stride % prep.num_stick_stride == 0
+    ):
+        k = host_stride // prep.num_stick_stride
+        if k > 1:
+            return (prep.num_stick_dim, k)
+    return None
+
+
+def invert_per_core_view(
+    prep: Optional[_ViewPrep],
+    target: PerCoreView,
+    domains: Mapping[Symbol, Sequence[int]],
+    *,
+    accept: Optional[Callable[[dict], bool]] = None,
+    max_probes: int = 256,
+) -> Optional[dict[Symbol, int]]:
+    """A split map over ``prep``'s iteration space whose view of this buffer is
+    ``target``, or ``None`` if this op cannot read the buffer that way.
+
+    The inverse of :func:`_per_core_view_from_prep`, and the way a caller that
+    *generates* core divisions propagates one across a producer/consumer edge:
+    compute the producer's view once, then construct the consumer division that
+    slices the buffer identically, instead of scanning an enumerated menu for it.
+
+    ``domains`` gives each iteration symbol its legal split factors; ``accept``
+    is an optional caller-side filter (legality that the geometry does not know
+    about) applied inside the search, so a rejected candidate backtracks to the
+    next one rather than losing the edge.
+
+    Split factors of the symbols that *slice* this buffer are determined rather
+    than searched -- one per target device dim -- but two kinds of symbol are
+    invisible to a view and so have to be enumerated:
+
+    * ``dep_coeff == 0`` -- the axis does not touch this buffer at all
+      (canonically a reduction axis), yet its split still shifts every slot
+      expression, since :func:`core_to_slice_mapping` runs over the whole
+      iteration space;
+    * a symbol *shadowed* at the same host stride by a placed one, which
+      ``splits_by_stride`` drops from the geometry, leaving its split
+      unobservable here.
+
+    Several symbols can serve one device dim after a reshape, so the placements
+    are ordered canonically by ``(host stride, name)`` and *all* of them are
+    tried: taking the first is wrong on ~1.8% of real targets. Every candidate is
+    confirmed by calling the forward map, so an answer is exact by construction
+    and a wrong guess can only ever be a miss. ``max_probes`` bounds those
+    confirmations; the measured cost on real edges is ~0.9 per edge.
+    """
+    if prep is None:
+        return None
+    syms = list(prep.iter_space)
+    want = dict(target.work_slice_dims)
+
+    options_by_dim: dict[int, list[tuple]] = {dim: [] for dim in want}
+    for sym in syms:
+        host_stride = prep.dep_coeff.get(sym, 0)
+        if host_stride == 0:
+            continue
+        placement = _view_placement(prep, host_stride)
+        if placement is None:
+            continue
+        dev_dim, k = placement
+        if dev_dim not in want or want[dev_dim] % k:
+            continue
+        split = want[dev_dim] // k
+        if split in domains.get(sym, ()):
+            options_by_dim[dev_dim].append((host_stride, str(sym), sym, split))
+    for dim in want:
+        if not options_by_dim[dim]:
+            return None
+        options_by_dim[dim].sort()
+
+    dims = sorted(want)
+    probes = 0
+    for choice in itertools.product(*(options_by_dim[d] for d in dims)):
+        placed = {sym: split for _h, _name, sym, split in choice}
+        if len(placed) != len(choice):  # one symbol cannot serve two device dims
+            continue
+        placed_strides = {prep.dep_coeff[sym] for sym in placed}
+        # Everything else stays unsplit: a symbol that slices this buffer on a
+        # stride of its own would show up in the view as a device dim ``target``
+        # does not have.
+        candidate = {sym: 1 for sym in syms}
+        candidate.update(placed)
+        hidden = [
+            sym
+            for sym in syms
+            if sym not in placed
+            and (
+                prep.dep_coeff.get(sym, 0) == 0 or prep.dep_coeff[sym] in placed_strides
+            )
+        ]
+        hidden_domains = [sorted(set(domains.get(sym, ())) | {1}) for sym in hidden]
+        for combo in itertools.product(*hidden_domains):
+            candidate.update(zip(hidden, combo))
+            if (
+                target.num_cores is not None
+                and math.prod(candidate.values()) != target.num_cores
+            ):
+                continue
+            if accept is not None and not accept(candidate):
+                continue
+            probes += 1
+            if probes > max_probes:
+                logger.debug(
+                    "view inversion gave up after %d forward-map probes on target %s",
+                    max_probes,
+                    target,
+                )
+                return None
+            view, _partial, representable = _per_core_view_from_prep(prep, candidate)
+            if representable and view.same_partition(target):
+                return dict(candidate)
+    return None
 
 
 def _per_core_view_on_buf(

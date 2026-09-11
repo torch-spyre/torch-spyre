@@ -26,6 +26,10 @@ from enum import Enum
 
 if TYPE_CHECKING:
     from torch_spyre._inductor.pass_utils import PerCoreView
+    from torch_spyre._inductor.scratchpad.division_generation import (
+        OpSplitSpace,
+        ResidencyEdge,
+    )
     from torch_spyre._inductor.scratchpad.lx_relayout import LXRelayoutPlan
 
 logger = get_inductor_logger("scratchpad.plan_solver")
@@ -184,7 +188,8 @@ class TileSpec:
     because tile levels *nest*: swapping two levels is a different plan. Frozen
     and hashable so ``==`` is exactly the "same tiling shape" test the group
     derivation keys on. The empty spec is *untiled*, and is the inert default
-    every :class:`CoreDivision` carries while ``auto_coarse_tiling`` is off.
+    every :class:`CoreDivision` carries unless a solver chose otherwise -- only
+    the SA co-optimizer does.
     """
 
     axes: tuple[TileAxis, ...] = ()
@@ -310,6 +315,17 @@ class CoreDivisionBuffer(LifetimeBoundBuffer):
     # an absent/empty entry means no compatible division, so the gate forbids
     # the merge/residency across that edge.
     cd_parent_matches: dict[str, list[tuple[int, int]]] = field(default_factory=dict)
+    # The same relation per candidate rather than per pair: one edge per divided
+    # producer this buffer reads, keyed as ``cd_parent_matches`` is. A solver
+    # that generates divisions asks these instead of indexing the table, and
+    # constructs the division on the other end of an edge by inverting the view.
+    # Empty where the allocator has not built them (they need the live ops).
+    residency_edges: dict[str, "ResidencyEdge"] = field(default_factory=dict)
+    # This buffer's producing op's legal divisions as a space to move in --
+    # ``core_divisions`` without materializing it. ``None`` for a buffer whose
+    # menu is not an enumeration to begin with: an input clone, a non-pointwise
+    # op, an op pinned to its committed division.
+    division_space: Optional["OpSplitSpace"] = None
     chosen_division: Optional[int] = None
     boundary: BufferType = BufferType.Intermediate
 
@@ -322,9 +338,9 @@ class CoreDivisionBuffer(LifetimeBoundBuffer):
         A tiled candidate's own buffer is per-tile scratch, so its footprint
         shrinks by the output tile count as well as the core count -- this is
         the LX-residency win entering the footprint math. Reduction tile levels
-        are excluded (see :attr:`TileSpec.output_tile_count`); with
-        ``auto_coarse_tiling`` off every ``cd.tiling`` is empty and this reduces
-        to the previous ``ceil_div(size, output_partition)`` exactly."""
+        are excluded (see :attr:`TileSpec.output_tile_count`); where no
+        solver chose a tiling every ``cd.tiling`` is empty and this reduces to
+        ``ceil_div(size, output_partition)`` exactly."""
         if not self.core_divisions:
             return self.size
         return min(

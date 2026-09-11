@@ -19,7 +19,8 @@ import itertools
 import sympy
 import logging
 import math
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
+from types import MappingProxyType
 
 from sympy import Expr, Integer, Symbol, divisors
 from torch._inductor.dependencies import MemoryDep
@@ -833,8 +834,9 @@ class WorkDivisionContext:
     # Hard per-axis floors ``span_reduction_pass`` has already committed.
     span_min_splits: dict[Symbol, int]
     # factor_domain is asked once per axis by the enumeration and again per
-    # candidate by is_legal; the derivation is sympy-heavy, so memoize it.
-    _factor_domains: dict[Symbol, list[int]] = dataclasses.field(
+    # candidate by is_legal; the derivation is sympy-heavy, so memoize it --
+    # keyed by (axis, tile count), since a coarse tiling narrows the domain.
+    _factor_domains: dict[tuple[Symbol, int], list[int]] = dataclasses.field(
         default_factory=dict, init=False, repr=False, compare=False
     )
 
@@ -843,7 +845,7 @@ class WorkDivisionContext:
         """The divisible axes, in the order a candidate split is keyed by."""
         return list(self.it_space_adjusted)
 
-    def factor_domain(self, v: Symbol) -> list[int]:
+    def factor_domain(self, v: Symbol, tile_count: int = 1) -> list[int]:
         """Ascending legal per-dim factors for axis ``v``: those that divide it.
 
         Mirrors ``must_split_vars.valid_splits``, minus that helper's own
@@ -851,27 +853,63 @@ class WorkDivisionContext:
         allowed-split domains and by any span floor ``span_reduction_pass``
         committed. The committed floor is applied here, so ``1`` is absent
         wherever a floor or an exact domain excludes it.
+
+        ``tile_count`` is the number of coarse loop tiles the axis is cut into,
+        so the factors must divide the *per-tile* extent: a core split still
+        has to be exact, and ``coarse_tile`` emits equal tiles. An axis whose
+        basis the tile count does not divide (the basis can be a stick count or
+        a granularity where the tiling counts elements) is treated as
+        unsplittable rather than approximated -- conservative, and only
+        reachable off the stick dim, which is untileable anyway.
         """
-        if v not in self._factor_domains:
+        key = (v, tile_count)
+        if key not in self._factor_domains:
             if v in self.symbol_meta:
                 basis = self.symbol_meta[v][1]  # granularity
             elif v in self.stick_vars:
                 basis = concretize_expr(self.it_space_adjusted[v])  # stick count
             else:
                 basis = concretize_expr(self.it_space[v])  # element count
-            self._factor_domains[v] = _legal_split_factors(
-                v, basis, self.constraints.allowed_splits, self.span_min_splits
-            )
-        return self._factor_domains[v]
+            if tile_count > 1 and basis % tile_count:
+                domain = [s for s in self.factor_domain(v) if s == 1]
+            else:
+                domain = _legal_split_factors(
+                    v,
+                    basis // tile_count,
+                    self.constraints.allowed_splits,
+                    self.span_min_splits,
+                )
+            self._factor_domains[key] = domain
+        return self._factor_domains[key]
 
-    def is_legal(self, splits: dict[Symbol, int]) -> bool:
+    def is_legal(
+        self,
+        splits: dict[Symbol, int],
+        tile_counts: Mapping[Symbol, int] = MappingProxyType({}),
+    ) -> bool:
         """Whether a proposed split is permissible, on every count.
 
         Total, so a caller proposing a split it did not enumerate gets the same
         verdict as one drawing its factors from :meth:`factor_domain`.
+
+        ``tile_counts`` is the coarse tiling the split rides on, per axis; the
+        default is untiled, which is every caller that does not choose one.
+        Only the exact-divisibility half of the interaction is modelled (see
+        :meth:`factor_domain`). The other half is not: ``get_per_core_span``
+        divides each dim's range by its split count, so a tiling shrinks the
+        span and would let both ``MAX_SPAN_BYTES`` and the committed floors
+        admit *smaller* splits than they do untiled. Here they are still judged
+        against the untiled spans, so a split a tiling would have made legal is
+        refused -- a lost option, never a wrong verdict.
+
+        Not a local fix, which is why it is left: the floor is not a filter to
+        relax but a decision already taken. ``span_reduction_pass`` set
+        ``op._work_division_span_min_splits`` *and* called ``apply_splits``, so
+        those splits are committed to the op's iteration-space ownership, and
+        the span arithmetic itself runs off the untiled op's tensor deps.
         """
         return (
-            self._factors_in_domain(splits)
+            self._factors_in_domain(splits, tile_counts)
             and self._within_core_budget(splits)
             and self._one_reduction_split_at_most(splits)
             and self._spans_within_cap(splits)
@@ -902,7 +940,9 @@ class WorkDivisionContext:
             splits.get(v, 1) >= minimum for v, minimum in self.span_min_splits.items()
         )
 
-    def _factors_in_domain(self, splits: dict[Symbol, int]) -> bool:
+    def _factors_in_domain(
+        self, splits: dict[Symbol, int], tile_counts: Mapping[Symbol, int]
+    ) -> bool:
         """Nothing else in :meth:`is_legal` rejects a factor that simply does
         not divide its axis: :meth:`_in_split_domains` iterates the op's *hard*
         domains, which for most axes are empty. Only a caller proposing a split
@@ -910,7 +950,8 @@ class WorkDivisionContext:
         arithmetic divides by the factors.
         """
         return all(
-            v in self.it_space_adjusted and factor in self.factor_domain(v)
+            v in self.it_space_adjusted
+            and factor in self.factor_domain(v, tile_counts.get(v, 1))
             for v, factor in splits.items()
         )
 
