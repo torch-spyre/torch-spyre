@@ -42,8 +42,16 @@ def _hints_levels(ops: list[Operation]) -> list[tuple]:
     hint_id, pick the best DimHint across all ops: one with loop_var is not None
     beats one with loop_var=None.  Hints that are broadcast at every op
     (loop_var=None everywhere) are dropped.  Hints with split_count==1 are
-    dropped (tiling by 1 is a no-op).  Returns pairs sorted by hint_id
-    ascending (outermost-first).
+    dropped as a tiling-by-1 no-op -- UNLESS ``loop_var_range`` is set, in
+    which case that trip count (not the literal ``split_count``) is the
+    effective count: a WhileLoop-splice hint (see
+    ``for_each_tile_lowering.py``'s ``_synthesize_dim_hints_for_group``)
+    always carries ``split_count=1`` and relies on ``loop_var_range`` alone
+    to say how many times the loop actually runs, so treating it like an
+    ordinary split_count==1 no-op silently drops the entire hint group and
+    the loop body never gets tiled into a real ``scf.for`` (see issue with
+    for_each_tile carry-mode online-softmax numerical mismatch). Returns
+    pairs sorted by hint_id ascending (outermost-first).
 
     is_reduction is intentionally absent from the returned pairs: it is a
     per-op, per-dimension property consulted directly from each op's own
@@ -63,6 +71,9 @@ def _hints_levels(ops: list[Operation]) -> list[tuple]:
     levels = []
     for h in sorted(best.values(), key=lambda x: x.hint_id):
         if h.loop_var is None:
+            continue
+        if h.loop_var_range is not None:
+            levels.append((h.hint_id, sympy.sympify(h.loop_var_range)))
             continue
         if h.split_count == 1:
             hints_logger.debug(

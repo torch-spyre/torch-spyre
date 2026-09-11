@@ -71,6 +71,7 @@ from .pass_utils import (
     input_layout_for_operation,
     is_restickify_coords,
     alignment_coordinates,
+    loop_var_ranges_from_dim_hints,
 )
 from .views import align_tensors, tiling_expr_to_device_expr
 from .logging_utils import get_inductor_logger
@@ -794,11 +795,22 @@ class SpyreKernel(Kernel[CSEVariable]):
 
         if "lx" in tensor.layout.allocation and tensor.layout.lx_view is None:
             raise ValueError(f"LX buffer {name} has no physical ownership")
+
+        # Merge in WhileLoop-splice loop_var trip counts (e.g. u0) stashed on
+        # the current op's dim_hints -- self.indirect_sizes only accumulates
+        # entries from indirect_indexing() calls (gather/scatter), but a
+        # tiled per-iteration symbol needs the same {symbol: valid_range}
+        # treatment even though it is not an indirect access. See
+        # loop_var_ranges_from_dim_hints's docstring.
+        indirect_sizes = {
+            **self.indirect_sizes,
+            **loop_var_ranges_from_dim_hints(self.current_node.node),
+        }
         device_coords = alignment_coordinates(
             tensor.layout.device_layout,
             tensor.index,
             it_space,
-            self.indirect_sizes,
+            indirect_sizes,
             repeat_info_out=self._alignment_repeat_info,
         )
         work_division = work_division_from_view(

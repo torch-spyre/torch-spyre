@@ -74,12 +74,14 @@ from torch._inductor.ops_handler import WrapperHandler
 from torch._inductor.graph import GraphLowering
 from torch._inductor.utils import sympy_index_symbol, sympy_subs
 from torch._inductor.ir import (
+    Buffer,
     ComputedBuffer,
     FixedLayout,
     InputBuffer,
     IRNode,
     Layout,
     Loops,
+    MutableBox,
     MutationLayoutSHOULDREMOVE,
     Operation,
     Pointwise,
@@ -108,7 +110,7 @@ from ..loop_info import (
     ReductionPlan,
     copy_op_metadata,
 )
-from ..propagate_hints import get_op_hints
+from ..propagate_hints import DimHint, get_op_hints
 from .propagate_named_dims import (
     _DimPropInfo,
     _get_dim_prop_info,
@@ -122,6 +124,7 @@ from ..pass_utils import (
     indirect_sizes_from_op,
     invalidate_op_read_writes,
     iteration_space_from_op,
+    loop_var_ranges_from_dim_hints,
 )
 from ..ir import FixedTiledLayout, SpyreConstantFallback, _resize_device_layout
 from .tile import compute_tile_index, compute_tile_stride, decompose_index_for_tiling
@@ -486,21 +489,22 @@ def plan_coarse_tile_groups(
             read_deps = [d for d in rw.reads if isinstance(d, MemoryDep)]
             write_deps = [d for d in rw.writes if isinstance(d, MemoryDep)]
 
-            hint_id_to_ranges_pos: dict[int, int] = {
-                h.hint_id: pos
-                for h in getattr(op, "dim_hints", [])
-                if h.loop_var is not None and not h.is_reduction
-                if (pos := _loop_var_to_ranges_pos(op_out, h.loop_var)) is not None
-            }
+            # _hint_ranges_pos returns (position, is-a-reduction-dim) and is
+            # authoritative on which channel the dim lands in -- see its
+            # docstring for why a WhileLoop-splice hint's own is_reduction
+            # cannot decide that per op.
+            hint_id_to_ranges_pos: dict[int, int] = {}
             hint_id_to_reduction_ranges_pos: dict[int, int] = {}
-            if isinstance(op.data, Reduction):
-                hint_id_to_reduction_ranges_pos = {
-                    h.hint_id: pos
-                    for h in getattr(op, "dim_hints", [])
-                    if h.loop_var is not None and h.is_reduction
-                    if (pos := _loop_var_to_reduction_ranges_pos(op, h.loop_var))
-                    is not None
-                }
+            for h in getattr(op, "dim_hints", []):
+                if h.loop_var is None:
+                    continue
+                pos, resolved_is_reduction = _hint_ranges_pos(op, h, op_out)
+                if pos is None:
+                    continue
+                if resolved_is_reduction:
+                    hint_id_to_reduction_ranges_pos[h.hint_id] = pos
+                else:
+                    hint_id_to_ranges_pos[h.hint_id] = pos
 
             op_tiled_dims: list[list[int]] = []
             op_tiled_reduction_dims: list[list[int]] = []
@@ -615,8 +619,22 @@ def _compute_full_ranges_planned(
     already the undivided, full shape here -- return it unchanged rather
     than multiplying by loop_count again (which would double the extent of
     every tiled dim).
+
+    A WhileLoop-splice loop_var-hinted dim is the one exception: unlike an
+    ordinary hint (whose division hasn't happened yet at planning time),
+    op.data.ranges[d] for such a dim is PERMANENTLY per-iteration-sized --
+    there is no earlier "undivided" state to read back, since _divide_ranges
+    never touches it (see _loop_var_hinted_ranges). The full, materialized
+    extent this copy-out's full_buf must allocate is therefore
+    op.data.ranges[d] * loop_var_range: the per-iteration extent times the
+    trip count, the one place that multiplication belongs (every other
+    consumer of loop_var_range treats it purely as a multiplier for
+    per-level *advance*, not for sizing an actual buffer dimension).
     """
-    return list(op.data.ranges)
+    ranges = list(op.data.ranges)
+    for d, loop_var_range in _loop_var_hinted_ranges(op).items():
+        ranges[d] = ranges[d] * loop_var_range
+    return ranges
 
 
 def _compute_per_tile_ranges_planned(
@@ -629,10 +647,18 @@ def _compute_per_tile_ranges_planned(
     returns a fresh list instead of writing through op.data/op.layout. A dim
     tiled at more than one level is divided by every such level's count, matching
     _divide_ranges being called once per level in the transformation loop.
+
+    A dim carrying a WhileLoop-splice loop_var hint is exempt -- see
+    _loop_var_hinted_ranges's docstring: op.data.ranges[d] is already the
+    per-iteration (per-tile) extent for such a dim, so it is left unchanged
+    rather than divided again.
     """
+    hinted_ranges = _loop_var_hinted_ranges(op)
     ranges = list(op.data.ranges)
     for count, dims in zip(info.loop_count, info.loop_tiled_dims):
         for d in dims:
+            if d in hinted_ranges:
+                continue
             if 0 <= d < len(ranges):
                 r = ranges[d]
                 if isinstance(r, (int, sympy.Integer)) and isinstance(
@@ -805,7 +831,21 @@ def _plan_tiling_propagation(
             if info is None:
                 continue
 
-            has_tiled_reduction = any(info.loop_tiled_reduction_dims)
+            # Only count a reduction-tiled level that _group_reduction_
+            # tiled_levels_in_group also counts -- i.e. exclude WhileLoop-
+            # splice hint levels (see that function's docstring). A
+            # WhileLoop-splice level's "reduction across iterations" is the
+            # loop's own carry semantics (buf7 = acc + buf6, carried by the
+            # while_loop itself): it needs no fill/combine accumulator of
+            # its own. Building one anyway (as an unfiltered `any(...)`
+            # here would) layers a second, redundant accumulation mechanism
+            # on top of the loop's carry -- a real bug, not just wasted
+            # work, since the fill op reseeds the accumulator to the
+            # reduction identity on a schedule that doesn't match the
+            # while_loop's own carry-in/carry-out timing.
+            has_tiled_reduction = any(
+                info.loop_tiled_reduction_dims[i] for i in group_reduction_tiled_levels
+            )
             if isinstance(op.data, Reduction) and has_tiled_reduction:
                 reduction_type = op.data.reduction_type
                 identity = _reduction_identity_value(reduction_type, op.get_dtype())
@@ -972,6 +1012,32 @@ def _plan_tiling_propagation(
                             full_ranges=full_ranges,
                             full_strides=tuple(mut_target.layout.stride),
                             is_graph_output=True,
+                        )
+                        continue
+                    # A WhileLoop-splice stacking write (see
+                    # while_loop_bridge.py's CarryBinding.stacking) already
+                    # targets the final, full-size destination: the bridge
+                    # folded that buffer's layout to the flat result shape at
+                    # splice time precisely so this write could advance
+                    # through it directly. So there is nothing to copy OUT
+                    # of -- allocating a second full buffer and draining into
+                    # it (the copy_out path below) would double-buffer the
+                    # result, and the drain's own read would inherit this
+                    # write's per-iteration offset, reading a moving window
+                    # of a scratch that never moves. mutation_write_back is
+                    # the matching shape: it sets output_tiled_dims on this
+                    # op's own write and allocates nothing.
+                    if (
+                        mut_target is not None
+                        and _splice_loop_vars(op)
+                        and _splice_write_targets_full_buffer(op, mut_target)
+                    ):
+                        full_ranges = _compute_full_ranges_planned(op, info)
+                        info.propagation = PropagationPlan(
+                            kind="mutation_write_back",
+                            full_ranges=full_ranges,
+                            full_strides=tuple(mut_target.layout.stride),
+                            is_graph_output=target_is_output,
                         )
                         continue
                     # Locally-created mutation target that IS the graph
@@ -1203,13 +1269,31 @@ def _planned_tile_extents_per_level(
     level gets a DISTINCT extent value per level here: level i's extent is
     final_extent * (product of counts at every level strictly more-inner
     than i that also tiles this same dim).
+
+    A dim carrying a WhileLoop-splice loop_var hint (see
+    _loop_var_hinted_ranges/_loop_var_hinted_reduction_ranges) is exempt
+    from the divide-by-count model entirely: op.data.ranges[d] (or
+    reduction_ranges[d]) is ALREADY the per-iteration extent, and the
+    hint's loop_var_range (the loop's trip count) is a multiplier over a
+    larger extent that is never materialized as a real dim anywhere --
+    never a divisor. For such a dim, final_extent is op.data.ranges[d]
+    unchanged, and _per_level_extent_for uses loop_var_range (not the
+    level's own count) when it extrapolates outward past that dim's own
+    level.
     """
+    hinted_ranges = _loop_var_hinted_ranges(op)
+    hinted_reduction_ranges = _loop_var_hinted_reduction_ranges(op)
+
     counts_by_dim: dict[int, Expr] = {}
     counts_by_reduction_dim: dict[int, Expr] = {}
     for level_idx, (_, count) in enumerate(levels):
         for d in op_tiled_dims[level_idx]:
+            if d in hinted_ranges:
+                continue
             counts_by_dim[d] = counts_by_dim.get(d, sympy.Integer(1)) * count
         for d in op_tiled_reduction_dims[level_idx]:
+            if d in hinted_reduction_ranges:
+                continue
             counts_by_reduction_dim[d] = (
                 counts_by_reduction_dim.get(d, sympy.Integer(1)) * count
             )
@@ -1231,12 +1315,16 @@ def _planned_tile_extents_per_level(
         d: _divided(op.data.ranges[d], count, f"loop var d{d}")
         for d, count in counts_by_dim.items()
     }
+    for d in hinted_ranges:
+        final_dim_extents[d] = op.data.ranges[d]
     final_reduction_extents = {}
     if isinstance(op.data, Reduction):
         final_reduction_extents = {
             d: _divided(op.data.reduction_ranges[d], count, f"reduction dim {d}")
             for d, count in counts_by_reduction_dim.items()
         }
+        for d in hinted_reduction_ranges:
+            final_reduction_extents[d] = op.data.reduction_ranges[d]
 
     n_output_dims = len(op.data.ranges) if hasattr(op.data, "ranges") else 0
 
@@ -1244,6 +1332,7 @@ def _planned_tile_extents_per_level(
         final_extent: Expr,
         tiled_at_level: list[list[int]],
         dim_id: int,
+        loop_var_range: Expr | None,
     ) -> dict[int, Expr]:
         # tiled_at_level[level_idx] is the list of dims tiled at that level
         # (op_tiled_dims or op_tiled_reduction_dims); find every level index
@@ -1254,21 +1343,34 @@ def _planned_tile_extents_per_level(
         result: dict[int, Expr] = {}
         # Walk innermost-to-outermost; each step outward multiplies by the
         # next-inner level's own count, so an outer level's extent equals
-        # the final extent times every more-inner level's count.
+        # the final extent times every more-inner level's count. For a
+        # loop_var-hinted dim, use its loop_var_range (the trip count that
+        # is a multiplier over a never-materialized larger extent) instead
+        # of the level's own count -- there is exactly one such level per
+        # WhileLoop-splice hint_id, so this only ever fires once, but stays
+        # general in case a future caller nests one under another.
         running_extent = final_extent
         for level_idx in reversed(levels_tiling_dim):
             result[level_idx] = running_extent
-            running_extent = running_extent * levels[level_idx][1]
+            step = levels[level_idx][1] if loop_var_range is None else loop_var_range
+            running_extent = running_extent * step
         return result
 
     per_level_output: list[dict[int, Expr]] = [dict() for _ in levels]
     for d, final_extent in final_dim_extents.items():
-        level_extents = _per_level_extent_for(final_extent, op_tiled_dims, d)
+        level_extents = _per_level_extent_for(
+            final_extent, op_tiled_dims, d, hinted_ranges.get(d)
+        )
         for level_idx, extent in level_extents.items():
             per_level_output[level_idx][d] = extent
     for d, final_extent in final_reduction_extents.items():
         dim_key = n_output_dims + d
-        level_extents = _per_level_extent_for(final_extent, op_tiled_reduction_dims, d)
+        level_extents = _per_level_extent_for(
+            final_extent,
+            op_tiled_reduction_dims,
+            d,
+            hinted_reduction_ranges.get(d),
+        )
         for level_idx, extent in level_extents.items():
             per_level_output[level_idx][dim_key] = extent
 
@@ -1391,19 +1493,58 @@ def _tiled_dims_for_dep(
     the returned tuples keep the ORIGINAL raw key, since that -- not the
     squeezed number -- is what every caller stores and what
     _host_dim_to_index_symbol re-squeezes for itself later.
+
+    A raw dim tiled by a synthesized WhileLoop-splice DimHint (Task 5's
+    _synthesize_dim_hints_for_group) has no d<N> symbol at all: its real
+    per-iteration symbol is the spliced body's own unbacked loop_var (e.g.
+    u0), folded directly into dep.index by construction -- it is never
+    renamed into the d<N> squeezed namespace, so the d-prefix membership
+    test below can never see it. Resolve such a dim's real symbol via
+    ir_node.dim_hints (the same hint_id->position mapping
+    plan_coarse_tile_groups already uses to build per_level_extents in the
+    first place -- see _loop_var_to_ranges_pos/
+    _loop_var_to_reduction_ranges_pos) and test dep.index's coefficient on
+    that symbol directly, instead of name-matching.
     """
+    pos_to_loop_var: dict[int, sympy.Symbol] = {}
+    hints = getattr(ir_node, "dim_hints", None) or ()
+    if hints:
+        out_coords = op_out_coords(ir_node)
+        # Reduction-dim keys in per_level_extents are offset by the RAW
+        # (un-squeezed) output-dim count -- see
+        # _planned_tile_extents_per_level's `dim_key = n_output_dims + d`
+        # and its own comment on why this offset is distinct from the
+        # SQUEEZED n_output_dims _raw_to_squeezed_pos uses. Apply the same
+        # offset here so pos_to_loop_var's keys line up with
+        # per_level_extents' actual keys.
+        n_output_dims = (
+            len(ir_node.data.ranges) if hasattr(ir_node.data, "ranges") else 0
+        )
+        for hint in hints:
+            if hint.loop_var is None or hint.loop_var_range is None:
+                continue
+            pos, is_reduction = _hint_ranges_pos(ir_node, hint, out_coords)
+            if pos is None:
+                continue
+            pos_to_loop_var[(n_output_dims + pos) if is_reduction else pos] = (
+                hint.loop_var
+            )
+
     dep_dims = {
         int(str(sym)[1:])
         for sym in dep.index.free_symbols
         if str(sym).startswith("d") and str(sym)[1:].isdigit()
     }
     raw_to_squeezed = _raw_to_squeezed_pos(ir_node)
+
+    def _dim_is_read(d: int) -> bool:
+        loop_var = pos_to_loop_var.get(d)
+        if loop_var is not None:
+            return dep.index.coeff(loop_var) != 0
+        return raw_to_squeezed.get(d, d) in dep_dims
+
     return [
-        [
-            (d, extent)
-            for d, extent in level.items()
-            if raw_to_squeezed.get(d, d) in dep_dims
-        ]
+        [(d, extent) for d, extent in level.items() if _dim_is_read(d)]
         for level in per_level_extents
     ]
 
@@ -1677,19 +1818,41 @@ def _group_reduction_tiled_levels_in_group(
     plan_coarse_tile_groups's hint_id_to_reduction_ranges_pos, gated on
     isinstance(op.data, Reduction)), so this scan only needs to inspect
     Reduction ops; a Pointwise-only group always yields an empty set.
+
+    A level whose hint is a WhileLoop-splice hint (``loop_var_range is not
+    None``, see propagate_hints.py's DimHint docstring) is excluded even
+    when some Reduction op tiles a reduction dim there. Both of this
+    function's callers exist to catch a same-outer-group Pointwise sibling
+    that would see a still-partial sum -- a real hazard for an ordinary
+    spyre_hint() reduction group, where nothing else re-runs the Pointwise
+    op once the reduction's own inner loop finishes accumulating. A
+    WhileLoop-splice level has no such hazard: the group is one iteration
+    of the spliced body, and a Pointwise op there (e.g. an accumulator's
+    ``acc + p @ v_tile``) is SUPPOSED to fold each iteration's per-tile
+    partial into the carry -- that folding, plus the carry-back across
+    iterations, is exactly how the reduction completes over the whole
+    loop. Flagging it as premature (or deferring it to copy_out) would
+    treat the loop's own carry semantics as a bug.
     """
     reduction_levels: set[int] = set()
     for o in group_ops:
         if not isinstance(o, ComputedBuffer) or not isinstance(o.data, Reduction):
             continue
-        hint_id_to_reduction_ranges_pos: dict[int, int] = {
-            h.hint_id: pos
-            for h in getattr(o, "dim_hints", [])
-            if h.loop_var is not None and h.is_reduction
-            if (pos := _loop_var_to_reduction_ranges_pos(o, h.loop_var)) is not None
-        }
+        o_out = op_out_coords(o)
+        hint_id_to_reduction_ranges_pos: dict[int, int] = {}
+        hint_id_to_loop_var_range: dict[int, object] = {}
+        for h in getattr(o, "dim_hints", []):
+            if h.loop_var is None:
+                continue
+            pos, resolved_is_reduction = _hint_ranges_pos(o, h, o_out)
+            if pos is None or not resolved_is_reduction:
+                continue
+            hint_id_to_reduction_ranges_pos[h.hint_id] = pos
+            hint_id_to_loop_var_range[h.hint_id] = h.loop_var_range
         for level_idx, (hint_id, _count) in enumerate(levels):
-            if hint_id in hint_id_to_reduction_ranges_pos:
+            if hint_id in hint_id_to_reduction_ranges_pos and (
+                hint_id_to_loop_var_range.get(hint_id) is None
+            ):
                 reduction_levels.add(level_idx)
     return reduction_levels
 
@@ -1792,11 +1955,242 @@ def _loop_var_to_ranges_pos(out_coords: list, sym: sympy.Symbol) -> int | None:
     Looks up sym in the op's output coordinates — the only reliable mapping
     from a loop variable symbol to its data.ranges position, since dep var
     numbering skips size-1 dims while data.ranges does not.
+
+    Matches if sym is the coordinate's sole free symbol (the ordinary
+    ``spyre_hint()`` case -- also covers a non-polynomial wrapper like
+    ``floor(h)``, whose ``.coeff(sym)`` is 0 even though sym is clearly its
+    only variable) OR sym has a nonzero coefficient in the coordinate (the
+    WhileLoop-splice case below). A coefficient-only test would silently
+    drop the ordinary case whenever compute_coordinates wraps a non-innermost
+    dim's coordinate in ``floor()``, which it does whenever the dim isn't
+    the fastest-varying one -- exactly span-overflow's tiled H dim (BHLD's
+    dim 1) in a real (non-test-stubbed) op_out_coords call, so this must stay
+    a two-way OR, not a coefficient-only test.
+
+    A WhileLoop-splice loop_var (e.g. u0, see for_each_tile_lowering.py's
+    _synthesize_dim_hints_for_group) can share a device coordinate with an
+    already-tiled ordinary dim when the spliced body's per-iteration advance
+    lands in the same host dim as that dim's own tiling -- e.g. coordinate
+    ``d0 + 2*u0`` for a 2-row-per-iteration write into a dim tiled to size 2
+    -- so requiring sym to be the ONLY free symbol never matches that case;
+    the coefficient test is what catches it. Callers that consume this
+    position (_tiled_dims_for_dep's _dim_is_read) already use the same
+    coefficient test to decide whether a dependency reads a dim, so this
+    keeps the two symbol/pos mappings consistent for that case.
     """
     for i, coord in enumerate(out_coords):
-        if len(coord.free_symbols) == 1 and next(iter(coord.free_symbols)) == sym:
+        free = coord.free_symbols
+        if sym not in free:
+            continue
+        if len(free) == 1 or coord.coeff(sym) != 0:
             return i
     return None
+
+
+def _splice_loop_vars(op: ComputedBuffer) -> set[sympy.Symbol]:
+    """Every WhileLoop-splice loop_var symbol folded into op's own indices.
+
+    Identified, as everywhere else in this file, by the DimHint carrying a
+    non-None ``loop_var_range`` (see propagate_hints.py's DimHint
+    docstring); ordinary ``spyre_hint()`` loop vars are real ``dep.ranges``
+    keys and never appear here.
+    """
+    return set(loop_var_ranges_from_dim_hints(op))
+
+
+def _splice_write_targets_full_buffer(op: ComputedBuffer, mut_target: Buffer) -> bool:
+    """Whether op's spliced write already addresses mut_target's whole extent.
+
+    The positive case is a WhileLoop-splice stacking write (see
+    while_loop_bridge.py's ``CarryBinding.stacking``): the bridge folded
+    ``mut_target``'s layout to the final result shape, so this op's
+    per-iteration write covers ``numel(mut_target) / trip_count`` elements
+    of it, advancing one tile per trip -- exactly the ``mutation_write_back``
+    shape.
+
+    The test is that ``mut_target`` is genuinely LARGER than one tile: an
+    ordinary in-place mutation (``copy_forced(src, acc)``, flash attention's
+    accumulators) writes the target's full extent every iteration, so the
+    two numels are equal there and this returns False, leaving those on
+    their existing path. Comparing numels rather than shapes keeps this
+    robust to the squeeze/rank differences between ``op.data.ranges`` and a
+    buffer's own size that this file deals with elsewhere.
+    """
+    ranges = getattr(getattr(op, "data", None), "ranges", None)
+    if not ranges:
+        return False
+    try:
+        target_numel = sympy.prod([sympy.sympify(s) for s in mut_target.get_size()])
+    except (AttributeError, TypeError):
+        return False
+    op_numel = sympy.prod([sympy.sympify(r) for r in ranges])
+    diff = sympy.simplify(target_numel - op_numel)
+    return bool(diff.is_positive)
+
+
+def _loop_var_pos_from_reads(
+    op: ComputedBuffer, sym: sympy.Symbol
+) -> "tuple[int | None, bool]":
+    """Resolve a WhileLoop-splice loop_var's tiled-dim position via the reads.
+
+    ``_loop_var_to_ranges_pos`` can only find ``sym`` when it literally
+    appears in the op's own OUTPUT coordinates. That holds for every
+    ordinary ``spyre_hint()`` scope (the op is the full, untiled write and
+    the hint tiles one of its own output dims) and for a WhileLoop-splice
+    op whose write really does advance per iteration (e.g. the map-mode
+    carry's in-place tile write, ``6*d0 + d1 + 12*u0``).
+
+    It does NOT hold for a spliced body op whose write is a per-iteration
+    SCRATCH buffer -- the shape ``for_each_tile``'s body naturally produces
+    for anything but the final store. ``split_m_fn``'s matmul is exactly
+    that: it writes ``while_loop_body_graph_0_0_buf5`` at ``6*d0 + d1``
+    (same tile-local address every trip -- the scratch is reused in place)
+    while READING X's stacked leaf at ``12*d0 + d2 + 24*u0`` (a genuinely
+    advancing window). With no output occurrence of ``u0``, the op lands
+    with no tiled dim at all, ``tiled_dims_per_read`` comes back empty, and
+    ``_read_copy_hoist_decision`` then wrongly classifies the advancing X
+    read as ELIGIBLE/loop-invariant -- hoisting it out of the loop so every
+    iteration recomputes tile 0.
+
+    Recover the position from the reads instead: a spliced body op's
+    loop_var always advances by exactly one whole extent of some dep var
+    ``v`` (that is what "one tile per iteration" means), i.e.
+
+        dep.index.coeff(sym) == dep.index.coeff(v) * dep.ranges[v]
+
+    ``v`` is then mapped back to a position through the op's own output
+    coordinates (an output dim, as for ``split_m_fn``'s M) or, when ``v`` is
+    one of the op's reduction vars, through ``reduction_loop_vars`` (a
+    reduction dim, as for ``split_k_fn``'s K -- its matmul reads X at
+    ``12*d0 + d1 + 3*u0`` where ``d1`` is the K reduction var of extent 3).
+    Both channels are the same ones ``_loop_var_to_ranges_pos`` /
+    ``_loop_var_to_reduction_ranges_pos`` already use for the direct lookup.
+
+    Returns ``(pos, is_reduction)``, or ``(None, False)`` when no read
+    exhibits that relationship -- so a genuinely loop-invariant op still
+    records no tiled dim, the correct outcome (see
+    ``_synthesize_dim_hints_for_group``'s docstring).
+
+    Ambiguity: ``sym_coeff == var_coeff * rng`` is a NUMERIC coincidence
+    whenever ``var``'s own extent happens to equal the loop's real
+    per-trip stride divided by ``var_coeff`` -- which is exactly what
+    happens when a matmul's inner reduction dim's size coincides with the
+    splice's tile size (e.g. flash-attention's online-softmax body,
+    where D == SOFTMAX_TILE_SIZE: ``p @ v_tile``'s D-contraction var
+    satisfies the equation against V's stacked-leaf read purely because
+    ``D * 1 == tile_size``, even though ``sym`` (the splice loop var)
+    doesn't advance D at all -- it advances the leaf's own outer/stacking
+    dim, which has no representation in this op's ``dep.ranges``).
+
+    An output-channel match (``var`` is one of the op's own output dims)
+    is trustworthy on a single read: ``_loop_var_to_ranges_pos`` checks it
+    against the op's real output coordinates, an independent structural
+    fact, not just this one dep's coefficients. A reduction-channel match
+    (``var`` is one of the op's reduction vars) has no such independent
+    check available -- ``reduction_loop_vars`` only tells us ``var`` is
+    *a* reduction var of this op, not that ``sym`` is what advances it.
+
+    Require CORROBORATION when the same read has more than one candidate
+    var satisfying the equation -- that is precisely the ambiguous case
+    above, where a genuine advancing var and a coincidentally-matching one
+    could both appear on the same dep and cannot be told apart locally.
+    There, only trust a reduction-channel match when at least two of the
+    op's reads independently agree on the same ``(var, sym)`` relationship
+    (as split_k_fn's genuine case does -- both matmul operands carry
+    ``u0`` and both agree on the K reduction var).
+
+    But when a read has EXACTLY ONE candidate var, there is no competing
+    interpretation of that read to disambiguate against, so a reduction-
+    channel match there is trustworthy on its own -- the same footing as
+    an output-channel match. This matters for an accumulator body's
+    second matmul (e.g. ``acc + p @ v_tile``): only the carry-in operand
+    (``v_tile``'s stacked-leaf read) ever carries ``sym`` at all -- the
+    other operand (``p``) is always the previous stage's tile-local
+    scratch and never mentions ``sym`` -- so a second corroborating read
+    can never exist, even though the single read's match is unambiguous.
+    """
+    rw = op.get_read_writes()
+    out_coords = op_out_coords(op)
+    red_vars = reduction_loop_vars(op) if isinstance(op.data, Reduction) else []
+    reduction_matches: dict[sympy.Symbol, int] = {}
+    for dep in rw.reads:
+        if not isinstance(dep, MemoryDep):
+            continue
+        index = dep.index
+        if not isinstance(index, sympy.Basic) or sym not in index.free_symbols:
+            continue
+        sym_coeff = index.coeff(sym)
+        if sym_coeff == 0:
+            continue
+        read_reduction_candidates: list[sympy.Symbol] = []
+        for var, rng in dep.ranges.items():
+            var_coeff = index.coeff(var)
+            if var_coeff == 0:
+                continue
+            if sympy.simplify(sym_coeff - var_coeff * rng) != 0:
+                continue
+            pos = _loop_var_to_ranges_pos(out_coords, var)
+            if pos is not None:
+                return pos, False
+            if var in red_vars:
+                read_reduction_candidates.append(var)
+        if len(read_reduction_candidates) == 1:
+            var = read_reduction_candidates[0]
+            reduction_matches[var] = reduction_matches.get(var, 0) + 2
+        else:
+            for var in read_reduction_candidates:
+                reduction_matches[var] = reduction_matches.get(var, 0) + 1
+    for var, count in reduction_matches.items():
+        if count >= 2:
+            return red_vars.index(var), True
+    return None, False
+
+
+def _hint_ranges_pos(
+    op: ComputedBuffer, hint: DimHint, out_coords: list
+) -> "tuple[int | None, bool]":
+    """One DimHint's loop_var -> (position, is-a-reduction-dim).
+
+    The single resolution every WhileLoop-splice-aware caller in this module
+    uses, so the position a dim is planned at, divided at, and advanced at
+    can never disagree. The position indexes ``op.data.ranges`` when the
+    second element is False and ``op.data.reduction_ranges`` when it is True.
+
+    ``DimHint.is_reduction`` is the caller's declared intent; the returned
+    flag is what actually resolved. They agree for every ordinary
+    ``spyre_hint()`` scope. For a WhileLoop-splice hint the resolution is
+    authoritative: the synthesizer stamps one hint per op for the whole
+    level and cannot know, per op, whether that level lands on an output dim
+    or a reduction dim of THAT op (``split_m_fn``'s matmul: output dim M;
+    ``split_k_fn``'s matmul: reduction dim K -- same synthesized hint, same
+    loop_var, opposite answers).
+
+    The read-side fallback (``_loop_var_pos_from_reads``) fires ONLY for a
+    WhileLoop-splice hint, identified exactly as everywhere else in this
+    file by ``loop_var_range is not None`` (see propagate_hints.py's
+    DimHint docstring). An ordinary ``spyre_hint()`` scope keeps the
+    pre-existing output-coordinates-only behaviour unchanged: its op is the
+    full, untiled write, so its loop_var is always present in the output
+    coordinates, and a read-derived guess there could only ever contradict
+    the authoritative output mapping.
+    """
+    if hint.loop_var_range is None:
+        # Ordinary spyre_hint() scope: unchanged pre-existing behaviour, with
+        # the hint's own is_reduction selecting the lookup channel.
+        if hint.is_reduction:
+            if not isinstance(op.data, Reduction):
+                return None, True
+            return _loop_var_to_reduction_ranges_pos(op, hint.loop_var), True
+        return _loop_var_to_ranges_pos(out_coords, hint.loop_var), False
+
+    pos = _loop_var_to_ranges_pos(out_coords, hint.loop_var)
+    if pos is not None:
+        return pos, False
+    if isinstance(op.data, Reduction):
+        rpos = _loop_var_to_reduction_ranges_pos(op, hint.loop_var)
+        if rpos is not None:
+            return rpos, True
+    return _loop_var_pos_from_reads(op, hint.loop_var)
 
 
 def reduction_loop_vars(op: ComputedBuffer) -> list[sympy.Symbol]:
@@ -1829,6 +2223,75 @@ def _loop_var_to_reduction_ranges_pos(
         return reduction_loop_vars(op).index(sym)
     except ValueError:
         return None
+
+
+def _loop_var_hinted_ranges(op: ComputedBuffer) -> dict[int, Expr]:
+    """Return {pos in op.data.ranges: loop_var_range} for op's dim_hints.
+
+    A WhileLoop-splice-synthesized DimHint (Task 5's
+    _synthesize_dim_hints_for_group) marks its dim via loop_var_range being
+    non-None -- see propagate_hints.py's DimHint docstring. For such a dim,
+    op.data.ranges[pos] is ALREADY the per-iteration extent (the spliced
+    body op's own shape); the hint's loop_var_range (the loop's trip count)
+    is a multiplier over a larger extent that is never materialized as a
+    real dim anywhere -- never a divisor of op.data.ranges[pos]. Callers
+    that would otherwise divide a tiled dim's range by the level's loop
+    count (_planned_tile_extents_per_level, _compute_per_tile_ranges_planned,
+    _divide_ranges) must check this first and skip the divide for any pos
+    present here, matching the resolution pattern _tiled_dims_for_dep
+    already uses (pos_to_loop_var, built the same way, for its own
+    coefficient-based dep.index test).
+    """
+    hints = getattr(op, "dim_hints", None) or ()
+    if not hints:
+        return {}
+    var_ranges = loop_var_ranges_from_dim_hints(op)
+    if not var_ranges:
+        return {}
+    out_coords = op_out_coords(op)
+    result: dict[int, Expr] = {}
+    for hint in hints:
+        if hint.loop_var is None:
+            continue
+        rng = var_ranges.get(hint.loop_var)
+        if rng is None:
+            continue
+        # _hint_ranges_pos decides which channel this hint's dim lands in,
+        # not hint.is_reduction -- keep that single decision so the ranges
+        # this exempts from division are exactly the ones planning tiled.
+        pos, is_reduction = _hint_ranges_pos(op, hint, out_coords)
+        if pos is not None and not is_reduction:
+            result[pos] = rng
+    return result
+
+
+def _loop_var_hinted_reduction_ranges(op: ComputedBuffer) -> dict[int, Expr]:
+    """Return {pos in op.data.reduction_ranges: loop_var_range} for dim_hints.
+
+    Reduction-dim counterpart of _loop_var_hinted_ranges -- see its
+    docstring for why a loop_var-hinted reduction dim must never be divided
+    by the level's loop count either.
+    """
+    hints = getattr(op, "dim_hints", None) or ()
+    if not hints or not isinstance(op.data, Reduction):
+        return {}
+    var_ranges = loop_var_ranges_from_dim_hints(op)
+    if not var_ranges:
+        return {}
+    out_coords = op_out_coords(op)
+    result: dict[int, Expr] = {}
+    for hint in hints:
+        if hint.loop_var is None:
+            continue
+        rng = var_ranges.get(hint.loop_var)
+        if rng is None:
+            continue
+        # Same single-decision rule as _loop_var_hinted_ranges: the channel
+        # comes from _hint_ranges_pos, not from hint.is_reduction.
+        pos, is_reduction = _hint_ranges_pos(op, hint, out_coords)
+        if pos is not None and is_reduction:
+            result[pos] = rng
+    return result
 
 
 def _reduction_identity_value(
@@ -2038,6 +2501,12 @@ def _divide_ranges(
     ``tiled_dims`` is a list of positional indices into ``data.ranges``.
     All indices must be valid; an out-of-bounds index is a caller bug.
 
+    A dim carrying a WhileLoop-splice loop_var hint is exempt from the
+    divide -- see _loop_var_hinted_ranges's docstring: op.data.ranges[i] is
+    already the per-iteration extent for such a dim, so it is left
+    unchanged (and its layout.size entry, further below, likewise stays at
+    its current value rather than shrinking).
+
     Also updates ``op.layout.size``, ``op.layout.stride``, and
     ``op.layout.device_layout`` so the layout describes the smaller per-tile
     buffer, not the full tensor.  Contiguous host strides are recomputed from
@@ -2052,6 +2521,8 @@ def _divide_ranges(
     if not ranges:
         return _DivideRangesResult(None, None)
 
+    hinted_ranges = _loop_var_hinted_ranges(op)
+
     before_symbols = None
     fused_before_symbols = None
     if tiled_dims and hasattr(op, "work_div_loop_info"):
@@ -2065,6 +2536,8 @@ def _divide_ranges(
             f"coarse_tile: op {op.get_name()!r} tiled dim {i} out of bounds "
             f"(ranges has {len(ranges)} entries)"
         )
+        if i in hinted_ranges:
+            continue
         r = ranges[i]
         if isinstance(r, (int, sympy.Integer)) and isinstance(
             loop_count, (int, sympy.Integer)
@@ -2145,6 +2618,8 @@ def _divide_ranges(
     # by multiplying tiled dims back up: old[i] = new[i] * loop_count.
     old_host_size = [int(s) for s in layout.size]
     for i in tiled_dims:
+        if i in hinted_ranges:
+            continue
         old_host_size[i] = int(new_size[i] * loop_count)
     new_size_ints = [int(s) for s in new_size]
     # Recover the authoritative stick host dim from coordinate identity so
@@ -2167,11 +2642,17 @@ def _divide_reduction_ranges(
     Unlike _divide_ranges, does NOT update op.layout.size/stride — the
     output buffer shape is determined by data.ranges (non-reduction dims)
     and is unchanged by reduction-dim tiling.
+
+    A reduction dim carrying a WhileLoop-splice loop_var hint is exempt --
+    see _loop_var_hinted_reduction_ranges's docstring: reduction_ranges[i]
+    is already the per-iteration extent for such a dim, so it is left
+    unchanged.
     """
     data = op.data
     assert isinstance(data, Reduction)
     if not tiled_dims:
         return None
+    hinted_reduction_ranges = _loop_var_hinted_reduction_ranges(op)
     before_symbols = None
     fused_before_symbols = None
     if hasattr(op, "work_div_loop_info"):
@@ -2186,6 +2667,8 @@ def _divide_reduction_ranges(
             f"coarse_tile: op {op.get_name()!r} tiled reduction dim {i} out of bounds "
             f"(reduction_ranges has {len(reduction_ranges)} entries)"
         )
+        if i in hinted_reduction_ranges:
+            continue
         r = reduction_ranges[i]
         if isinstance(r, (int, sympy.Integer)) and isinstance(
             loop_count, (int, sympy.Integer)
@@ -2857,6 +3340,8 @@ def _propagate_mutation_write_back(
     loop_info.output_tiled_dims = output_tiled_dims
     loop_info.squeezed_advance_output = squeezed_advance if write_deps else []
 
+    _rebase_splice_write_offset(op)
+
     logger.debug(
         "coarse_tile: mutation_write_back %s output_tiled_dims=%s "
         "squeezed_advance_output=%s",
@@ -2864,6 +3349,64 @@ def _propagate_mutation_write_back(
         output_tiled_dims,
         loop_info.squeezed_advance_output,
     )
+
+
+def _rebase_splice_write_offset(op: ComputedBuffer) -> None:
+    """Pin a spliced write's mutation-target offset to its iteration-0 base.
+
+    A WhileLoop-splice body op that writes one tile per iteration in place
+    carries the per-iteration offset in its MutationLayoutSHOULDREMOVE
+    target's own layout: upstream builds
+    ``ReinterpretView(carry, size=[tile], stride=[...], offset=<stride>*u0)``
+    and ``MutationLayoutSHOULDREMOVE.make_indexer`` delegates straight to
+    it, so the store index comes out as ``6*d0 + d1 + 12*u0`` -- the tile's
+    absolute address, correct as a statement of intent and exactly what
+    planning above needs in order to place the tiled dim at all.
+
+    But it must not survive into codegen. Once ``output_tiled_dims`` is set
+    (just above), ``SpyreKernel._general_tile_advance`` emits a
+    ``device_tile_advance_expr`` that already steps this write one whole
+    tile per trip. Leaving the ``u0`` term in the index too would apply the
+    same offset twice, and would leak a raw unbacked symbol into
+    ``device_coordinates`` -- which ``op_spec_validation``'s
+    ``_check_symbol_consistency`` rejects, since it is not an
+    ``iteration_space`` key.
+
+    So rebase the target view to iteration 0 and let the advance own the
+    step, mirroring what ``_copy_inner_fn`` does for the read side. The
+    ``FixedLayout`` object being edited belongs solely to this
+    ``ReinterpretView`` (verified: the carry buffer, the body placeholder
+    and the graph output's own view each hold a distinct layout object), and
+    the ``ReinterpretView`` itself is left in place -- see
+    while_loop_bridge.py's ``_substitute_direct_input_refs`` docstring for
+    why its identity and rank must not change. ``FixedLayout.offset`` is a
+    plain attribute on a non-frozen class, unlike ``ReinterpretView``
+    itself, so it can be rebound directly.
+    """
+    layout = getattr(op, "layout", None)
+    if not isinstance(layout, MutationLayoutSHOULDREMOVE):
+        return
+    loop_vars = _splice_loop_vars(op)
+    if not loop_vars:
+        return
+    target = layout.target
+    while isinstance(target, MutableBox):
+        target = target.data
+    target_layout = getattr(target, "layout", None)
+    if target_layout is None:
+        return
+    offset = sympy.sympify(target_layout.offset)
+    if not (offset.free_symbols & loop_vars):
+        return
+    rebased = sympy_subs(offset, {sym: sympy.Integer(0) for sym in loop_vars})
+    logger.debug(
+        "coarse_tile: rebased splice write offset for %s: %s -> %s",
+        op.get_name(),
+        offset,
+        rebased,
+    )
+    target_layout.offset = rebased
+    invalidate_op_read_writes(op)
 
 
 def _propagate_tiled_op(
@@ -3679,7 +4222,20 @@ def _rescale_index(
         structurally and, if that's inconclusive, after simplifying the
         quotient (mirrors the structural-vs-simplified fallback this
         function has always used for coefficient matching).
+
+        A zero `full_stride` (a broadcast/absent dimension, see
+        _patch_consumer_to_read_copy's tile_strides padding) never matches
+        any term: dividing by it produces sympy's `zoo` (complex infinity)
+        rather than raising, and `zoo * loop_var` deceptively passes the
+        coeff==1/no-leftover-symbol checks above (its free_symbols are just
+        the loop_var's, same as a real match) -- silently producing a `nan`
+        rescaled index several steps later instead of a loud failure. A term
+        can only "divide evenly" into a stride that actually advances a
+        dimension.
         """
+        if full_stride == 0:
+            return False, sympy.Integer(0)
+
         stride_syms = full_stride.free_symbols
 
         def _is_clean(quotient: Expr) -> bool:
@@ -4007,6 +4563,22 @@ def _insert_one_read_copy(
             for pos, ts in zip(active_idx, active_tile_strides):
                 tile_strides[pos] = ts
 
+    # A WhileLoop-splice loop_var (e.g. u0, see for_each_tile_lowering.py's
+    # _synthesize_dim_hints_for_group) folded into dep.index is the
+    # consumer's per-iteration OFFSET into full_buf, not one of its
+    # iteration variables. The copy buffer holds exactly one tile and is
+    # refilled every trip, and the per-trip step is already carried
+    # separately by copy_buf's own tiled_dims_per_read ->
+    # SpyreKernel._general_tile_advance device_tile_advance_expr (set just
+    # below for a non-invariant copy). Leaving the term in the index too
+    # would apply the same offset twice -- and, worse, leak a raw unbacked
+    # symbol into device_coordinates, which op_spec_validation's
+    # _check_symbol_consistency rejects since it is not an iteration_space
+    # key. Pin it to its iteration-0 base here; the advance supplies the
+    # rest. (For a loop-invariant copy the term is absent by construction --
+    # that is what "invariant" means -- so this substitution is a no-op.)
+    loop_var_zeros = {sym: sympy.Integer(0) for sym in _splice_loop_vars(sizing_op)}
+
     def _copy_inner_fn(
         idx,
         _dep=dep,
@@ -4015,6 +4587,7 @@ def _insert_one_read_copy(
         _initial_source_offset=initial_source_offset,
         _active_idx=active_idx,
         _compact=compact_invariant,
+        _loop_var_zeros=loop_var_zeros,
     ):
         if _compact:
             full_idx = [sympy.Integer(0)] * len(_dep.var_names)
@@ -4023,6 +4596,7 @@ def _insert_one_read_copy(
         else:
             full_idx = idx
         subs = dict(zip(_dep.var_names, full_idx))
+        subs.update(_loop_var_zeros)
         flat_index = sympy_subs(_dep.index, subs)
         flat_index += _full_buf.layout.offset - _initial_source_offset
         return V.ops.load(_full_name, flat_index)
@@ -4629,6 +5203,32 @@ def _patch_consumer_to_read_copy(
         if host_stride not in dep_strides:
             full_strides.append(host_stride)
             dep_strides.add(host_stride)
+    # dep.var_names is Inductor's own squeezed d<N> namespace and never
+    # includes a WhileLoop-splice loop_var (e.g. u0, Task 5's
+    # _synthesize_dim_hints_for_group) -- such a symbol is folded directly
+    # into dep.index by construction and is never renamed into d<N> (see
+    # _tiled_dims_for_dep's docstring for the identical gap on the
+    # read-copy planning side). consumer's own retraced index still
+    # carries a real term for it, so _rescale_index needs an explicit
+    # entry here too, or that term is silently left unmatched. The copy
+    # buffer holds exactly one tile at a time and is refilled fresh on
+    # every WhileLoop iteration by _insert_one_read_copy's own read of the
+    # full buffer (which already incorporates the loop_var unmodified,
+    # since it is absent from _dep.var_names there too) -- so the copy's
+    # own tile-local address space has no distinct axis for it: any load
+    # through the copy must resolve to the same position regardless of
+    # the loop_var's value. Appending only to full_strides here is
+    # sufficient -- the zero-padding of tile_strides to full_strides'
+    # length below already supplies the matching 0 entry, the same
+    # "no advance" convention used for host-layout strides absent from
+    # dep.var_names.
+    for hint in getattr(consumer, "dim_hints", None) or ():
+        if hint.loop_var is None or hint.loop_var in dep.var_names:
+            continue
+        coeff = dep.index.coeff(hint.loop_var)
+        if coeff != 0 and coeff not in dep_strides:
+            full_strides.append(coeff)
+            dep_strides.add(coeff)
     copy_buf = next(
         op
         for op in operations

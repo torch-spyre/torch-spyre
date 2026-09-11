@@ -50,6 +50,7 @@ from .wsr.coarse_tile_hints import (
     hints_to_coarse_tile_groups,
     reorder_unhinted_interlopers,
 )
+from .wsr.for_each_tile_lowering import splice_while_loops
 from . import config
 from .propagate_hints import (
     collect_spyre_hints,
@@ -336,16 +337,48 @@ def _maybe_coarse_tile_hints(graph: GraphLowering) -> None:
 
     span_overflow_groups is intentionally absent: it requires FixedTiledLayout
     (device_layout) and must run post-stickification.
+
+    spyre_hint()-based coarse tiling is on a deprecation path in favor of
+    for_each_tile (splice_while_loops, which runs earlier in this pipeline).
+    If splice_while_loops already coarse-tiled anything this compile, it has
+    already called coarse_tile_pre_stickify itself per spliced WhileLoop, and
+    every op it transformed still carries the DimHints it synthesized (see
+    for_each_tile_lowering.py's _synthesize_dim_hints_for_group) -- assign_dim_
+    hints runs after it but does not clear those. Re-deriving groups here via
+    hints_to_coarse_tile_groups would sweep those same ops into a second,
+    spurious group and re-plan them against their now-already-rewritten reads
+    (e.g. a read-copy's index, which deliberately no longer carries the
+    WhileLoop-splice loop_var -- see _insert_one_read_copy), silently
+    overwriting the correct plan with an empty one. Since the two mechanisms
+    are mutually exclusive within a single compile in practice, skip this
+    pass entirely once splice_while_loops has done anything, rather than
+    teaching hints_to_coarse_tile_groups to filter WhileLoop-splice hints out.
     """
     if config.ignore_wsr_hints:
+        return
+    if any(
+        getattr(h, "loop_var_range", None) is not None
+        for op in graph.operations
+        for h in getattr(op, "dim_hints", []) or []
+    ):
         return
     groups = hints_to_coarse_tile_groups(graph)
     if not groups:
         return
+    # Compute offset to avoid loop_group_id collision with any while-loop
+    # groups already stamped by splice_while_loops (which runs earlier in
+    # the pipeline and calls coarse_tile_pre_stickify per spliced WhileLoop,
+    # each starting its own local group_idx_offset at 0).
+    used_ids = [
+        op.loop_info.loop_group_id[0]
+        for op in graph.operations
+        if hasattr(op, "loop_info") and op.loop_info is not None
+    ]
+    group_idx_offset = max(used_ids, default=-1) + 1
     op_order = {id(op): idx for idx, op in enumerate(graph.operations)}
     groups.sort(key=lambda group: op_order.get(id(group[0][0]), len(op_order)))
     validate_coarse_tile_groups(groups)
-    coarse_tile_pre_stickify(graph, groups=groups)
+    coarse_tile_pre_stickify(graph, groups=groups, group_idx_offset=group_idx_offset)
 
 
 @_runs(
@@ -444,6 +477,7 @@ class CustomPreSchedulingPasses:
 
     def __init__(self):
         self.passes = [
+            splice_while_loops,
             deadcode_elimination,
             #
             # Working Set Reduction (hint-driven, pre-stickification)
