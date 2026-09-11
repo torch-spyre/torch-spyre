@@ -519,6 +519,9 @@ class CostParams:
     # geometry, no trend). NO loop_trip factor: a relayout inside a coarse-tiling loop
     # is structurally impossible today (the planner rejects coarse_tile_copy
     # consumers).
+    # The negative intercept is the fitted value, not a typo: a small-run
+    # extrapolation artifact of the linear-in-log2(split) per-run form. The
+    # split clamp to [2, 8] keeps the per-run term positive over its domain.
     relayout_run_a_ns: float = -1.14  # per-run cost intercept
     relayout_run_b_ns: float = 3.92  # per-run cost log2(split) slope
     relayout_span_gbps: float = 547.0  # per-core stride-limited walk rate

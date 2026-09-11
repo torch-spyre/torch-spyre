@@ -14,9 +14,10 @@
 
 from __future__ import annotations
 
+import collections
 import dataclasses
 import math
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from typing import cast
 
 import sympy
@@ -28,11 +29,13 @@ from torch._inductor.ir import (
     Operation,
     Pointwise,
 )
+from torch_spyre._C import ElementArrangement
 
 from .. import config
 from ..core_mapping import (
     core_mappings_equal,
     owner_slots,
+    partition_physical_span_bytes,
     _loop_regions,
     _LOOP_POINT,
     _MAX_EXACT_DIRECT_AXIS_POINTS,
@@ -40,6 +43,8 @@ from ..core_mapping import (
     _EVALUATION_ERRORS,
     select_unique_partition_division,
 )
+from ..cost_model import OpFeatures, relayout_ns
+from ..dump_cost_model import governing_run_split
 from ..ir import FixedTiledLayout
 from ..logging_utils import get_inductor_logger
 from ..op_spec import TensorWorkDivision
@@ -66,6 +71,8 @@ class LXRelayoutPlan:
     source_view: PerCoreView
     destination_view: PerCoreView
     num_cores: int
+    source_footprint_bytes: int = 0
+    destination_footprint_bytes: int = 0
     source_address: int | None = None
     destination_address: int | None = None
 
@@ -76,6 +83,211 @@ class LXRelayoutPlan:
     @property
     def edge(self) -> tuple[str, str]:
         return self.source_name, self.destination_name
+
+
+@dataclasses.dataclass(frozen=True)
+class RelayoutCandidate:
+    """One priced way for a divided producer to stay LX-resident for one consumer.
+
+    Born in the allocator's enumeration (``_cd_parent_relayouts``) and carried
+    unchanged through the CP-SAT model, the extraction and the commit path: the
+    solver keys its pair literal by this record, extraction attaches the solved
+    placement (:class:`ChosenRelayout`), and the commit path folds the fired
+    members of one fired group into a :class:`LXRelayoutPlan`
+    (:class:`FiredRelayoutGroup`). Nothing downstream re-derives a view, a core
+    count or a price from primitives, so a change to what a relayout *is*
+    (another lowering kind, a measured footprint) is a change to this record
+    and to the enumeration that builds it, nowhere else.
+
+    ``group`` identifies the DESTINATION per-core view of ``parent``, interned
+    per parent by the allocator for one solve: every candidate that lands on
+    the same view of the same parent shares one shuffle and one LX destination
+    (``RelayoutCopyBuffer``), so the solver prices and places the group once,
+    not per edge.
+
+    Each view carries the physical core count it was built for (every core's
+    owner slot within its split), so ``num_cores`` is the source view's and
+    ``destination_num_cores`` the destination view's; the enumeration's
+    ``cores_used`` gates guarantee the views were built for the divisions
+    being paired.
+
+    ``source_footprint_bytes`` / ``destination_footprint_bytes`` are the
+    per-core LX spans of the two views (:func:`partition_footprint`, the bound
+    the committed path reserves for a relayout member since #3440), measured
+    once at enumeration: the copy buffer is sized from the destination span and
+    the plan hands both to the allocator, so the solver never reserves less for
+    a shuffle than the committed path would.
+    """
+
+    parent: str
+    consumer: str
+    source_division: int
+    consumer_division: int
+    group: int
+    source_view: PerCoreView
+    destination_view: PerCoreView
+    cost_ns: float
+    source_footprint_bytes: int
+    destination_footprint_bytes: int
+
+    @property
+    def num_cores(self) -> int:
+        """The source's core count, carried by the source view (the plan's
+        ``num_cores``, as the committed collector records it)."""
+        return cast(int, self.source_view.num_cores)
+
+    @property
+    def destination_num_cores(self) -> int:
+        """The consumer's core count, carried by the destination view: equal to
+        ``num_cores`` for permutations and gathers, a multiple of it for a
+        broadcast (#3440), where the copy lives on the destination's cores while
+        the plan's ``num_cores`` stays the source's."""
+        return cast(int, self.destination_view.num_cores)
+
+    def __post_init__(self) -> None:
+        for side, view in (
+            ("source", self.source_view),
+            ("destination", self.destination_view),
+        ):
+            if view.num_cores is None:
+                raise ValueError(
+                    f"relayout candidate {self.parent} -> {self.consumer}: the {side} "
+                    "view carries no physical core count"
+                )
+        if self.destination_num_cores < self.num_cores or (
+            self.destination_num_cores % self.num_cores
+        ):
+            raise ValueError(
+                f"relayout candidate {self.parent} -> {self.consumer}: destination "
+                f"on {self.destination_num_cores} cores is not a multiple of the "
+                f"source's {self.num_cores}"
+            )
+        if self.source_view.same_partition(self.destination_view):
+            raise ValueError(
+                f"relayout candidate {self.parent} -> {self.consumer} has equal "
+                "views; that pair belongs to cd_parent_matches"
+            )
+        if self.source_footprint_bytes <= 0 or self.destination_footprint_bytes <= 0:
+            raise ValueError(
+                f"relayout candidate {self.parent} -> {self.consumer} has no "
+                f"measured span (source {self.source_footprint_bytes}, destination "
+                f"{self.destination_footprint_bytes} bytes); a candidate whose "
+                "footprint is unavailable must be declined at enumeration"
+            )
+
+    @property
+    def group_key(self) -> tuple[str, int]:
+        """The solver's registry key: one destination view of one parent."""
+        return self.parent, self.group
+
+
+@dataclasses.dataclass(frozen=True)
+class ChosenRelayout:
+    """A fired :class:`RelayoutCandidate` with the solved address of its copy.
+
+    Every consumer of one (parent, group) the solver served reads the group's
+    single copy (``RelayoutCopyBuffer``), so all of them carry the same
+    address; the commit path folds them into one plan
+    (:meth:`FiredRelayoutGroup.from_chosen`).
+    """
+
+    candidate: RelayoutCandidate
+    destination_address: int
+
+    def scaled(self, alignment: int) -> ChosenRelayout:
+        """The same choice with the address converted from alignment units."""
+        return dataclasses.replace(
+            self, destination_address=self.destination_address * alignment
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class FiredRelayoutGroup:
+    """The consumers of one (parent, destination view) the solver served from
+    the group's copy: one shuffle, one LX residency at ``destination_address``.
+
+    Members share the source division, both views and the address by
+    construction (they read one buffer the solver placed once), which
+    :meth:`from_chosen` verifies rather than trusts.
+    """
+
+    parent: str
+    group: int
+    members: tuple[ChosenRelayout, ...]
+
+    @property
+    def candidate(self) -> RelayoutCandidate:
+        """A representative member; every field the plan needs agrees across
+        the group (checked in :meth:`from_chosen`)."""
+        return self.members[0].candidate
+
+    @property
+    def source_division(self) -> int:
+        return self.candidate.source_division
+
+    @property
+    def destination_address(self) -> int:
+        return self.members[0].destination_address
+
+    @property
+    def consumer_names(self) -> tuple[str, ...]:
+        return tuple(m.candidate.consumer for m in self.members)
+
+    def plan(self, source_address: int) -> LXRelayoutPlan:
+        c = self.candidate
+        return LXRelayoutPlan(
+            self.parent,
+            self.consumer_names,
+            c.source_view,
+            c.destination_view,
+            c.num_cores,
+            source_footprint_bytes=c.source_footprint_bytes,
+            destination_footprint_bytes=c.destination_footprint_bytes,
+            source_address=source_address,
+            destination_address=self.destination_address,
+        )
+
+    @classmethod
+    def from_chosen(cls, chosen: Iterable[ChosenRelayout]) -> list[FiredRelayoutGroup]:
+        """Regroup fired edges by (parent, destination view).
+
+        Deterministic order (sorted keys, members sorted by consumer name) so
+        plan construction, and hence destination naming, is reproducible.
+        """
+        by_group: dict[tuple[str, int], list[ChosenRelayout]] = {}
+        for ch in chosen:
+            by_group.setdefault((ch.candidate.parent, ch.candidate.group), []).append(
+                ch
+            )
+        groups: list[FiredRelayoutGroup] = []
+        for (parent, group), members in sorted(by_group.items()):
+            members.sort(key=lambda ch: ch.candidate.consumer)
+            first = members[0]
+            for m in members[1:]:
+                agree = (
+                    m.candidate.source_division == first.candidate.source_division
+                    and m.candidate.source_view.same_partition(
+                        first.candidate.source_view
+                    )
+                    and m.candidate.destination_view.same_partition(
+                        first.candidate.destination_view
+                    )
+                    and m.candidate.num_cores == first.candidate.num_cores
+                    and m.candidate.destination_num_cores
+                    == first.candidate.destination_num_cores
+                    and m.candidate.source_footprint_bytes
+                    == first.candidate.source_footprint_bytes
+                    and m.candidate.destination_footprint_bytes
+                    == first.candidate.destination_footprint_bytes
+                    and m.destination_address == first.destination_address
+                )
+                if not agree:
+                    raise AssertionError(
+                        f"relayout group {parent}/g{group}: members disagree on "
+                        f"geometry or placement: {first} vs {m}"
+                    )
+            groups.append(cls(parent, group, tuple(members)))
+        return groups
 
 
 def work_division_from_view(
@@ -291,22 +503,150 @@ def _core_slices(view: PerCoreView, num_cores: int) -> dict[int, dict[int, int]]
     return dict(enumerate(rows))
 
 
-def movement_supported(source, destination, source_num_cores, destination_num_cores):
-    """The original relayout: two complete, distinct partitions of the same cores."""
-    if source_num_cores != destination_num_cores or source_num_cores <= 0:
+def partition_footprint(layout: FixedTiledLayout, view: PerCoreView) -> int:
+    """Measure a relayout candidate in normalized standard device layout.
+
+    FixedTiledLayout can wrap an explicit device shape, so its type alone does
+    not guarantee a complete final stick axis. The span helper validates it.
+    """
+    device_layout = layout.device_layout
+    if device_layout.element_arrangement != ElementArrangement.STANDARD:
+        raise ValueError("relayout footprint requires standard element arrangement")
+    return partition_physical_span_bytes(
+        tuple(int(size) for size in device_layout.device_size),
+        device_layout.device_dtype,
+        dict(view.work_slice_dims),
+    )
+
+
+def _overlap(a: int, an: int, b: int, bn: int) -> bool:
+    return a * bn < (b + 1) * an and b * an < (a + 1) * bn
+
+
+def movement_supported(
+    source: PerCoreView,
+    destination: PerCoreView,
+    source_num_cores: int,
+    destination_num_cores: int,
+) -> bool:
+    """Extend the original full-partition check to gathers and broadcasts.
+
+    Edges are ownership intersections, never a separate geometry calculation.
+    A complete source may feed uniformly repeated destination slices. Across
+    unequal core counts, only even broadcasts (one source per destination) are
+    supported. Equal destination slices have identical sources by construction.
+    """
+
+    num_cores = source_num_cores
+    source_splits = dict(source.work_slice_dims)
+    destination_splits = dict(destination.work_slice_dims)
+    destination_slices = math.prod(destination_splits.values())
+    if (
+        num_cores <= 0
+        or destination_num_cores < num_cores
+        or source.num_cores != num_cores
+        or destination.num_cores != destination_num_cores
+        or destination_num_cores % num_cores
+        or math.prod(source_splits.values()) != num_cores
+        or destination_slices <= 0
+        or destination_num_cores % destination_slices
+        or (num_cores == destination_num_cores and source.same_partition(destination))
+    ):
         return False
-    if source.same_partition(destination):
-        return False
-    for view in (source, destination):
-        if math.prod(dict(view.work_slice_dims).values()) != source_num_cores:
-            return False
-        rows = _core_slices(view, source_num_cores)
-        if (
-            len({tuple(sorted(row.items())) for row in rows.values()})
-            != source_num_cores
+    if num_cores == destination_num_cores and destination_slices < num_cores:
+        # This level only contracts existing source axes. #4152 lifts this
+        # scope restriction for combined gather/broadcast on other axes.
+        if any(
+            source_splits.get(dim, 1) % destination_splits.get(dim, 1)
+            for dim in source_splits.keys() | destination_splits.keys()
         ):
             return False
-    return True
+    source_map = _core_slices(source, num_cores)
+    destination_map = _core_slices(destination, destination_num_cores)
+    dims = set(source_splits) | set(destination_splits)
+    edges = {
+        (s_core, d_core)
+        for s_core, s_slice in source_map.items()
+        for d_core, d_slice in destination_map.items()
+        if all(
+            _overlap(
+                s_slice.get(dim, 0),
+                source_splits.get(dim, 1),
+                d_slice.get(dim, 0),
+                destination_splits.get(dim, 1),
+            )
+            for dim in dims
+        )
+    }
+    fanout = [sum(src == core for src, _ in edges) for core in range(num_cores)]
+    fanin = [
+        sum(dst == core for _, dst in edges) for core in range(destination_num_cores)
+    ]
+    replicas = collections.Counter(
+        tuple(sorted(row.items())) for row in destination_map.values()
+    )
+    return bool(edges) and all(
+        (
+            # Every source sends to the same number of destination cores.
+            len(set(fanout)) == 1,
+            # Every destination receives from the same number of source cores.
+            len(set(fanin)) == 1,
+            # Every source slice is present exactly once.
+            len({tuple(sorted(row.items())) for row in source_map.values()})
+            == num_cores,
+            # Every distinct destination slice is covered.
+            len(replicas) == destination_slices,
+            # Within one core domain, each slice has equally many copies.
+            num_cores != destination_num_cores or len(set(replicas.values())) == 1,
+            # A larger domain only broadcasts: one source per destination.
+            num_cores == destination_num_cores
+            or (fanout[0] == destination_num_cores // num_cores and fanin[0] == 1),
+        )
+    )
+
+
+def core_domain_rejection(source_num_cores: int, consumer_num_cores: int) -> str | None:
+    """Why a producer on ``source_num_cores`` may not feed a consumer on
+    ``consumer_num_cores`` through a relayout, from the core counts alone, or
+    ``None`` when they are compatible. Equal counts are always fine
+    (permutations and gathers). A larger consumer domain is a grouped broadcast
+    (#3440), which the emitter supports only onto every compute core; the
+    geometric half of that rule (an even multiple, one source per destination
+    core) is :func:`movement_supported`'s. Shared by the committed collector and
+    the solver's enumeration so the two paths cannot drift."""
+    if consumer_num_cores < source_num_cores:
+        return "cannot emit: consumer uses fewer physical cores than producer"
+    if consumer_num_cores > source_num_cores and consumer_num_cores != config.sencores:
+        return "cannot emit: grouped broadcast must target all compute cores"
+    return None
+
+
+def grouped_gather_rejection(
+    consumer: Operation, source_num_cores: int, destination_view: PerCoreView
+) -> str | None:
+    """Why ``consumer``'s ``destination_view`` may not be a grouped gather of a
+    producer on ``source_num_cores``, or ``None``. A destination with fewer
+    owners than the source has cores assembles each slice from several source
+    slices (#3440), which the emitter supports for a matmul consumer only; a
+    complete partition (a permutation) or a broadcast is not a gather and passes.
+    The consumer half of the rule; the geometry is :func:`movement_supported`'s.
+    Shared by the committed collector and the solver's enumeration."""
+    owners = math.prod(dict(destination_view.work_slice_dims).values())
+    if owners < source_num_cores and not _is_matmul_op(consumer):
+        return "cannot emit: grouped gather requires a matmul consumer"
+    return None
+
+
+def lx_solver_relayout() -> bool:
+    """Whether the configured layout solver decides LX relayouts.
+
+    The committed collector decides them under ``greedy`` (#3439, #3440); the
+    co-optimizing CP-SAT solver decides them itself (#4203). Simulated annealing
+    does not yet (#4425). A function on the solver choice rather than a separate
+    option, so there is nothing to keep in sync and it can be deleted once every
+    solver supports relayouts.
+    """
+    return config.layout_solver in ("greedy", "cpsat")
 
 
 def _single_write(op: ComputedBuffer, name: str) -> MemoryDep | None:
@@ -352,6 +692,145 @@ def _unsupported_relayout_transition_reason(
             "logical work division"
         )
     return None
+
+
+def solver_relayout_edge_context(
+    graph: GraphLowering,
+    producer: Operation,
+    consumer: Operation,
+    source_name: str,
+    operations: dict[str, Operation],
+) -> tuple | None:
+    """Division-independent relayout eligibility of one producer->consumer edge.
+
+    The same structural gates ``collect_lx_relayout_plans`` applies on the
+    committed graph, restricted to what does not depend on a chosen division, so
+    the solver's candidate enumeration can run them once per edge before any
+    per-division-pair work. Returns ``(write_dep, read_dep, producer_coords,
+    consumer_coords, producer_space, consumer_space)`` - the two spaces are the
+    loop-symbol -> extent mappings ``work_division_from_view`` projects into -
+    or ``None`` when the edge can never host a relayout.
+    """
+    # A coarse-tiled endpoint can never host a relayout. The fitted law has
+    # no loop_trip factor (the committed-path planner already guarantees "a
+    # relayout cannot be inside a coarse-tiling loop"), a tiled producer's
+    # buffer is per-tile scratch rather than the full tensor, and a tiled
+    # consumer reads cross-group data through a per-iteration staging op.
+    # The MutationLayout check below only screens the loop's DRAIN op; the
+    # staging and tiled compute ops are plain Pointwise buffers, so the
+    # loop_info presence is the reliable marker.
+    if (
+        getattr(producer, "loop_info", None) is not None
+        or getattr(consumer, "loop_info", None) is not None
+    ):
+        return None
+    if (
+        not isinstance(producer, ComputedBuffer)
+        or not isinstance(producer.layout, FixedTiledLayout)
+        or (write_dep := _single_write(producer, source_name)) is None
+        or not _is_activation_source(graph, operations, producer)
+    ):
+        return None
+    if not isinstance(consumer, ComputedBuffer) or isinstance(
+        consumer.layout, MutationLayoutSHOULDREMOVE
+    ):
+        return None
+    if not _is_matmul_op(consumer) and not isinstance(consumer.data, Pointwise):
+        return None
+    consumer_deps = [
+        d for d in op_read_writes(consumer).reads if isinstance(d, MemoryDep)
+    ]
+    if any(d.is_indirect() for d in consumer_deps):
+        return None
+    if _is_matmul_op(consumer) and len(consumer_deps) != 2:
+        return None
+    source_reads = [d for d in consumer_deps if d.name == source_name]
+    if len(source_reads) != 1:
+        return None
+    read_dep = source_reads[0]
+    producer_coords = try_device_coordinates(
+        producer.layout.device_layout, write_dep, None
+    )
+    consumer_coords = try_device_coordinates(
+        producer.layout.device_layout, read_dep, None
+    )
+    if producer_coords is None or consumer_coords is None:
+        return None
+    return (
+        write_dep,
+        read_dep,
+        producer_coords,
+        consumer_coords,
+        iteration_space_from_op(producer),
+        iteration_space_from_op(consumer),
+    )
+
+
+def solver_relayout_pair_cost(
+    source_view: PerCoreView,
+    destination_view: PerCoreView,
+    num_cores: int,
+    device_dims: Sequence[int],
+    out_elems: int,
+    dtype_bytes: int,
+    params=None,
+    *,
+    destination_num_cores: int | None = None,
+) -> float | None:
+    """Price one candidate relayout (source view -> destination view), in ns.
+
+    ``None`` when the pair cannot host a relayout, or should not be offered:
+
+    - views with the same physical ownership need no relayout (that pair
+      belongs to ``cd_parent_matches``), compared with ``same_partition`` so a
+      differently spelled slot expression cannot masquerade as movement;
+    - ``movement_supported``, the committed path's own gate (#3440), admits
+      what the emitter can move: uniform permutations, grouped gathers and
+      grouped broadcasts, so the solver never prices a movement the emitter
+      cannot execute; the enumeration adds the collector's consumer rules
+      (:func:`core_domain_rejection`, :func:`grouped_gather_rejection`) on top. A
+      grouped movement is priced by the same law as a permutation of the same
+      tensor on the SOURCE's cores, keyed on the finer side's geometry as
+      always: ``cores=num_cores`` makes the law's per-core bytes the source
+      slice, which is what every destination core receives in a broadcast. The
+      grouped-relayout sweep (2026-09-09, 43 rows) measured the grouped
+      shuffle's marginal cost at or below that law (<= 0.3 us gathers, <= 1.6
+      us broadcasts, flat in fan-out), so this over-states, never under-states,
+      the shuffle; the decision is dominated by the consumer's replicated HBM
+      re-read on the demote side, priced by the cost model since #4454;
+    - a governing split outside the law's fitted range [2, 8] is DECLINED, not
+      clamped: the reporting path clamps because the shuffle it prices already
+      exists, but the solver must never be offered an option at a price the
+      law was not fitted for.
+
+    The price is ``relayout_ns`` on a minimal feature vector - the same function
+    the reporting path uses, so the two paths cannot drift.
+
+    Each view must be built FOR its own core count (every core's owner slot
+    within its split): the source for ``num_cores``, the destination for
+    ``destination_num_cores`` (the source's count when omitted). The caller's
+    cores_used gates guarantee that, and ``_core_slices`` asserts it rather
+    than tolerating an out-of-range slot.
+    """
+    if not movement_supported(
+        source_view, destination_view, num_cores, destination_num_cores or num_cores
+    ):
+        return None
+    run_elems, split = governing_run_split(source_view, destination_view, device_dims)
+    if run_elems <= 0 or not 2 <= split <= 8:
+        return None
+    features = OpFeatures(
+        name="lx_relayout",
+        is_reduction=False,
+        out_elems=out_elems,
+        cores=num_cores,
+        dtype_bytes=dtype_bytes,
+        args=[],
+        is_lx_relayout=True,
+        relayout_run_elems=run_elems,
+        relayout_split=split,
+    )
+    return relayout_ns(features, params)
 
 
 def collect_lx_relayout_plans(
@@ -452,18 +931,22 @@ def collect_lx_relayout_plans(
             if any(d.is_indirect() for d in deps):
                 rejection_reason = "cannot emit: consumer uses indirect access"
                 break
-            view, consumer_partial, representable = _per_core_view_on_buf(
+            view, _, representable = _per_core_view_on_buf(
                 consumer, dep, source_name, cache
             )
             consumer_num_cores = _op_num_cores(consumer)
-            if view is None or consumer_partial or not representable:
+            # A split reduction makes the consumer's output partial, not its input.
+            if view is None or not representable:
                 rejection_reason = (
-                    "cannot represent: consumer ownership is partial or unrepresentable"
+                    "cannot represent: consumer ownership is unrepresentable"
                 )
                 break
-            if consumer_num_cores != source_num_cores:
-                rejection_reason = "cannot emit: different core counts"
+            rejection_reason = core_domain_rejection(
+                source_num_cores, consumer_num_cores
+            )
+            if rejection_reason is not None:
                 break
+            is_matmul = _is_matmul_op(consumer)
             consumer_coordinates = try_device_coordinates(
                 producer.layout.device_layout, dep, None
             )
@@ -475,7 +958,6 @@ def collect_lx_relayout_plans(
             consumer_space = iteration_space_from_op(consumer)
             if view.same_partition(source_view):
                 continue
-            is_matmul = _is_matmul_op(consumer)
             if is_matmul and len(deps) != 2:
                 rejection_reason = (
                     "cannot emit: matmul consumer does not have two inputs"
@@ -487,7 +969,24 @@ def collect_lx_relayout_plans(
                 )
                 break
 
-            failure = "cannot emit: unsupported ownership transfer"
+            rejection_reason = grouped_gather_rejection(
+                consumer, source_num_cores, view
+            )
+            if rejection_reason is not None:
+                break
+            destination_owners = math.prod(dict(view.work_slice_dims).values())
+            if consumer_num_cores > source_num_cores:
+                failure = (
+                    "cannot emit: grouped destination does not evenly "
+                    "broadcast the source"
+                )
+            elif destination_owners < source_num_cores:
+                failure = (
+                    "cannot emit: grouped destination does not evenly contract "
+                    "the source"
+                )
+            else:
+                failure = "cannot emit: unsupported ownership transfer"
 
             try:
                 supported = movement_supported(
@@ -506,7 +1005,17 @@ def collect_lx_relayout_plans(
             )
 
         # Reuse the ownership comparison and preserve first-consumer order.
-        destinations: list[tuple[PerCoreView, list[str]]] = []
+        destinations: list[tuple[PerCoreView, int, list[str]]] = []
+        if rejection_reason is None:
+            # Both footprint checks are before placement: an invalid or
+            # unsupported candidate size declines this optional relayout,
+            # with the exact reason logged below, leaving the original buffer.
+            # This does not waive layout/codegen validation or catch assertions.
+            try:
+                source_footprint = partition_footprint(producer.layout, source_view)
+            except (TypeError, ValueError) as exc:
+                rejection_reason = f"allocation: source footprint is unavailable: {exc}"
+
         if rejection_reason is None:
             for (
                 consumer_name,
@@ -553,12 +1062,25 @@ def collect_lx_relayout_plans(
                 ):
                     rejection_reason = reason
                     break
-                for group_view, consumers in destinations:
-                    if group_view.same_partition(destination_view):
+                try:
+                    destination_footprint = partition_footprint(
+                        producer.layout, destination_view
+                    )
+                except (TypeError, ValueError) as exc:
+                    rejection_reason = (
+                        f"allocation: destination footprint is unavailable: {exc}"
+                    )
+                    break
+                for group_view, footprint, consumers in destinations:
+                    if footprint == destination_footprint and group_view.same_partition(
+                        destination_view
+                    ):
                         consumers.append(consumer_name)
                         break
                 else:
-                    destinations.append((destination_view, [consumer_name]))
+                    destinations.append(
+                        (destination_view, destination_footprint, [consumer_name])
+                    )
 
         if rejection_reason is None:
             result.extend(
@@ -568,9 +1090,12 @@ def collect_lx_relayout_plans(
                     source_view=source_view,
                     destination_view=destination_view,
                     num_cores=source_num_cores,
+                    source_footprint_bytes=source_footprint,
+                    destination_footprint_bytes=destination_footprint,
                 )
                 for (
                     destination_view,
+                    destination_footprint,
                     consumer_names,
                 ) in destinations
             )
