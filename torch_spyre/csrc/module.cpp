@@ -50,6 +50,7 @@
 #include "perm_layout_native.h"
 #include "prepare_kernel.h"
 #include "spyre_allocator.h"
+#include "spyre_composite_address.h"
 #include "spyre_device_enum.h"
 #include "spyre_error.h"
 #include "spyre_generator_impl.h"
@@ -395,6 +396,16 @@ PYBIND11_MODULE(_C, m) {
            [](const DataFormats& df) { return spyre::elems_per_stick(df); });
 
   m.def("get_spyre_tensor_layout", &spyre::get_spyre_tensor_layout);
+  m.def("get_device_size_in_bytes",
+        py::overload_cast<const spyre::SpyreTensorLayout&>(
+            &spyre::get_device_size_in_bytes),
+        py::arg("layout"),
+        "Return padded storage bytes for a layout with known device geometry.");
+  m.def("get_device_size_in_bytes",
+        py::overload_cast<const std::vector<int64_t>&, const DataFormats&>(
+            &spyre::get_device_size_in_bytes),
+        py::arg("device_size"), py::arg("device_dtype"),
+        "Return whole-stick storage bytes; reject undefined format geometry.");
   m.def("set_spyre_tensor_layout", &spyre::set_spyre_tensor_layout);
   m.def("get_downcast_warning", &spyre::get_downcast_warn_enabled,
         "Return whether downcast warnings are enabled.");
@@ -425,6 +436,36 @@ PYBIND11_MODULE(_C, m) {
   m.def("fill_tensor", &spyre::spyre_fill_tensor,
         "Fill a spyre tensor with a scalar value using device-side FillDMA",
         py::arg("self"), py::arg("value"));
+
+  // Read-only view of a device tensor's CompositeAddress (chunk geometry).
+  // The handle keeps the source tensor's allocation alive for its lifetime.
+  py::class_<spyre::CompositeChunkInfo>(m, "CompositeChunkInfo")
+      .def_readonly("region_id", &spyre::CompositeChunkInfo::region_id)
+      .def_readonly("offset", &spyre::CompositeChunkInfo::offset)
+      .def_readonly("size", &spyre::CompositeChunkInfo::size)
+      .def_readonly("domain_id", &spyre::CompositeChunkInfo::domain_id)
+      .def("__repr__", [](const spyre::CompositeChunkInfo& c) {
+        return "<CompositeChunkInfo region_id=" + std::to_string(c.region_id) +
+               " offset=" + std::to_string(c.offset) +
+               " size=" + std::to_string(c.size) +
+               " domain_id=" + std::to_string(c.domain_id) + ">";
+      });
+
+  py::class_<spyre::CompositeAddressHandle>(m, "CompositeAddressHandle")
+      .def_property_readonly("total_size",
+                             &spyre::CompositeAddressHandle::total_size,
+                             "Total physical (padded/tiled) byte size of the "
+                             "allocation")
+      .def_property_readonly("num_chunks",
+                             &spyre::CompositeAddressHandle::num_chunks,
+                             "Number of device chunks the allocation spans")
+      .def("chunks", &spyre::CompositeAddressHandle::chunks,
+           "Per-chunk geometry, in order");
+
+  m.def("get_composite_address", &spyre::get_composite_address_handle,
+        "Return a read-only handle over the device address backing a Spyre "
+        "tensor's storage; the handle keeps that allocation alive",
+        py::arg("tensor"));
 
   // Stream management functions
   m.def("get_stream_from_pool", &spyre::getStreamFromPool, py::arg("device"),

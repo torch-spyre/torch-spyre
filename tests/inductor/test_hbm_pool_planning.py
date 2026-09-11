@@ -119,7 +119,7 @@ class TestAllocator(unittest.TestCase):
         self.assertEqual(allocator.get_pool_end(), 80)
 
 
-def _make_ftl_buffer(name, host_size=(64,), dim_order=(0,)):
+def _make_ftl_buffer(name, host_size=(64,), dim_order=(0,), dtype=torch.float16):
     """Real ComputedBuffer with a FixedTiledLayout, for pool-eligibility tests.
 
     Mirrors _make_ftl_op in test_coarse_tiling.py:1187, trimmed to what
@@ -130,20 +130,20 @@ def _make_ftl_buffer(name, host_size=(64,), dim_order=(0,)):
     device_layout = SpyreTensorLayout(
         list(host_size),
         strides,
-        torch.float16,
+        dtype,
         list(dim_order),
         ElementArrangement.STANDARD,
     )
     layout = FixedTiledLayout(
         torch.device("cpu"),
-        torch.float16,
+        dtype,
         [Integer(s) for s in host_size],
         [Integer(s) for s in strides],
         device_layout,
     )
     pw = Pointwise(
         device=torch.device("cpu"),
-        dtype=torch.float16,
+        dtype=dtype,
         inner_fn=lambda index: Integer(1),
         ranges=[Integer(s) for s in host_size],
     )
@@ -208,6 +208,34 @@ class TestHbmPoolPlanningPerBundle(unittest.TestCase):
 
     def tearDown(self):
         self._graph_ctx.__exit__(None, None, None)
+
+    def test_storage_bytes_and_collective_units(self):
+        from torch_spyre._inductor.hbm_pool_planning import _compute_size_bytes
+        from torch_spyre._inductor.ir import _compute_device_num_elems
+
+        for dtype, expected in [
+            (torch.float16, 256),
+            (torch.float32, 384),
+            (torch.float8_e4m3fn, 128),
+            (torch.int64, 384),
+            (torch.bool, 256),
+            (torch.uint8, 384),
+        ]:
+            with self.subTest(dtype=dtype):
+                layout = _make_ftl_buffer("sized", (65,), dtype=dtype).get_layout()
+                self.assertEqual(_compute_size_bytes("sized"), expected)
+                # The collective plan receives this host dtype with the count.
+                self.assertEqual(
+                    _compute_device_num_elems(layout)
+                    * torch.empty((), dtype=dtype).element_size(),
+                    expected,
+                )
+
+        with patch(
+            "torch_spyre._inductor.hbm_pool_planning.get_device_size_in_bytes",
+            return_value=129,
+        ):
+            self.assertEqual(_compute_size_bytes("sized"), 256)
 
     def test_buffer_local_to_one_bundle_is_pool_eligible(self):
         """A buffer written and read within the same bundle gets an
@@ -662,8 +690,10 @@ class TestHbmPoolPlanningE2E(InductorTestCase):
 
     @config.patch({"lx_planning": False})
     def test_bundle_pool_size_threaded_from_hbm_pool_sizes(self):
-        """codegen_node must look up this bundle's own pool_size from
-        V.graph.hbm_pool_sizes, not a stale graph-global scalar.
+        """codegen_node must bind this bundle's own pool_size from
+        V.graph.hbm_pool_sizes before printing its kernel, not a stale
+        graph-global scalar. Pooling runs after the kernel is prepared, so
+        the value is observed at the binding point.
 
         lx_planning is disabled here so the `a = x + y` intermediate isn't
         claimed by LX scratchpad planning first -- with LX planning on,
@@ -676,11 +706,11 @@ class TestHbmPoolPlanningE2E(InductorTestCase):
         from torch_spyre._inductor.spyre_kernel import SpyreKernel
 
         seen_pool_sizes = []
-        orig_init = SpyreKernel.__init__
+        orig_codegen_kernel = SpyreKernel.codegen_kernel
 
-        def _recording_init(self, pool_size=0, **kwargs):
-            seen_pool_sizes.append(pool_size)
-            orig_init(self, pool_size=pool_size, **kwargs)
+        def _recording_codegen_kernel(self):
+            seen_pool_sizes.append(self.pool_size)
+            return orig_codegen_kernel(self)
 
         def fn(x, y):
             a = x + y
@@ -691,7 +721,7 @@ class TestHbmPoolPlanningE2E(InductorTestCase):
         y = torch.randn(64, 64, dtype=torch.float16, device="spyre")
 
         with (
-            mock_patch.object(SpyreKernel, "__init__", _recording_init),
+            mock_patch.object(SpyreKernel, "codegen_kernel", _recording_codegen_kernel),
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
             mock_patch("subprocess.run"),
@@ -888,6 +918,51 @@ class TestHbmPoolPlanningE2E(InductorTestCase):
 
         self.assertIn("async_compile.sdsc(", src)
         self.assertNotIn("pool_size", src)
+
+    @config.patch({"lx_planning": False})
+    def test_alias_read_in_another_bundle_blocks_pool_eligibility(self):
+        """A co-allocated sibling read by another bundle must keep the whole
+        allocation off the pool.
+
+        copy_forced's lowering builds a MutationLayoutSHOULDREMOVE buffer, so
+        several names share one layout.allocation dict. Assigning a pool offset
+        writes into that shared dict, relocating EVERY name on it -- including
+        names that were never pool candidates and so were never passed to
+        _is_cross_bundle. When such a sibling is read by another bundle, that
+        bundle addresses it pool-relative while owning no pool, and
+        generate_bundle asserts `pool_size=0 out of range ... for a bundle with
+        a pool symbol present`.
+
+        Three names on one allocation are required, which is why `acc` is
+        written by TWO copy_forced calls: the zeros buffer and the first copy's
+        result are written and read entirely inside the first bundle, so both
+        are candidates; the second copy's result is read by the cat bundle, so
+        it is correctly rejected -- and then dragged into the pool anyway by
+        the two that were accepted. This mirrors sliding-window attention,
+        where `output` is the dst of both the accumulator update and the final
+        divide, and the per-block results are read by torch.cat.
+        """
+
+        def fn(x, y):
+            outs = []
+            for i in range(2):
+                acc = torch.zeros_like(x)
+                acc = torch.ops.spyre.copy_forced(x * (i + 1) + y, acc)
+                acc = torch.ops.spyre.copy_forced(acc * 2, acc)
+                outs.append(acc)
+            return torch.cat(outs, dim=0)
+
+        x = torch.randn(64, 64, dtype=torch.float16, device="spyre")
+        y = torch.randn(64, 64, dtype=torch.float16, device="spyre")
+
+        with (
+            mock_patch(_LAUNCH_JOBPLAN),
+            mock_patch(_PREPARE_KERNEL),
+            mock_patch("subprocess.run"),
+        ):
+            # Without the alias-read guard this raises InductorError from
+            # generate_bundle's pool_size assertion.
+            torch.compile(fn)(x, y)
 
 
 if __name__ == "__main__":

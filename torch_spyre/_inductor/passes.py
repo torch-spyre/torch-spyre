@@ -42,7 +42,6 @@ from .padding import insert_bmm_padding, insert_restickify_padding
 from .temp_passes import (
     bmm_unflatten_pass,
     decompose_addmm,
-    mark_direct_unit_bmm_pass,
     mm_to_bmm_pass,
 )
 from .wsr.coarse_tile import validate_coarse_tile_groups
@@ -84,9 +83,8 @@ from .scratchpad.allocator import (
 )
 from .fusion import spyre_fuse_nodes
 from .scheduler import (
-    align_lx_producer_loop_order,
     build_loop_scheduler_nodes,
-    demote_incoherent_lx_buffers,
+    prepare_spyre_kernels,
     verify_carried_reduction_ownership,
 )
 from .constants import DEVICE_NAME
@@ -247,7 +245,6 @@ class CustomPostPasses(_SpyreGraphPassPipeline):
                 # falling back to extern_kernels.addmm.
                 decompose_addmm,
                 mm_to_bmm_pass.apply,
-                mark_direct_unit_bmm_pass,
                 bmm_unflatten_pass.apply,
             ]
         )
@@ -268,13 +265,9 @@ class CustomPreFusionPasses(_SpyreNodePassPipeline):
     # are visible to SuperDSCScheduling.can_fuse_vertical/horizontal (which return
     # False), so loop groups survive Inductor fusion intact.
     def __init__(self):
-        # align_lx_producer_loop_order runs before build_loop_scheduler_nodes so
-        # it still sees plain SchedulerNodes (the only kind that can reorder
-        # their loops) rather than CountedLoopSchedulerNode wrappers.
         super().__init__(
             [
                 propagate_mutation_layouts,
-                align_lx_producer_loop_order,
                 build_loop_scheduler_nodes,
             ]
         )
@@ -290,15 +283,15 @@ class CustomPostFusionPasses(_SpyreNodePassPipeline):
     """
 
     def __init__(self):
-        # demote_incoherent_lx_buffers runs first: it re-checks LX core->slice
-        # coherence now that loop orders are final, and anything it demotes must
-        # still be visible to hbm_pool_planning as an unclaimed intermediate.
-        # hbm_pool_planning runs after spyre_fuse_nodes so it can compute
-        # bundle-scoped live ranges.
+        # Fusion fixes the final loop coordinates. Every bundle's kernel is
+        # then prepared once, with the real finalization, while HBM fallback
+        # is still available. HBM planning claims anything preparation demotes
+        # before the carried-reduction pass checks that its required stages
+        # still exist; emission binds only what pooling decided.
         super().__init__(
             [
-                demote_incoherent_lx_buffers,
                 spyre_fuse_nodes,
+                prepare_spyre_kernels,
                 hbm_pool_planning,
                 verify_carried_reduction_ownership,
             ]
@@ -466,6 +459,17 @@ class CustomPreSchedulingPasses:
             _maybe_reorder_unhinted_interlopers,
             _maybe_coarse_tile_hints,
             #
+            # Matmul K padding (pre-stickification)
+            # Pads y's K to a stick boundary while every buffer still has a
+            # plain host FixedLayout.  The padded buffer then flows through
+            # stickification like a user-written F.pad: propagate_spyre_tensor_layouts
+            # picks its layout and finalize_layouts plans any restickify it needs
+            # (e.g. a transposed nn.Linear weight, issue #4208).  Running after
+            # insert_restickify would have to pad a restickify output, whose
+            # device layout and index expressions cannot be reconciled with a
+            # grown host extent.
+            insert_bmm_padding,
+            #
             # Tensor Layout (Stickification)
             split_multi_ops,
             propagate_spyre_tensor_layouts,
@@ -477,7 +481,6 @@ class CustomPreSchedulingPasses:
             enforce_indirect_access_layout,
             insert_post_mutation_restickify,
             insert_restickify_padding,
-            insert_bmm_padding,
             #
             dedup_and_promote_constants,
             #

@@ -14,12 +14,11 @@
 
 import functools
 import logging
-import math
 import time
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from collections.abc import Iterable, Sequence
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from typing import Any, Callable, cast, Optional
 
 import sympy
@@ -28,16 +27,18 @@ from torch._inductor.ir import (
     TensorBox,
     ComputedBuffer,
     ExternKernel,
+    FallbackKernel,
     MutationLayoutSHOULDREMOVE,
     Operation,
     Pointwise,
     Reduction,
     ReinterpretView,
 )
-from torch._inductor.dependencies import MemoryDep
+from torch._inductor.dependencies import Dep, MemoryDep
 from torch._inductor.graph import GraphLowering
 
 from torch_spyre._inductor.pass_utils import (
+    PerCoreView,
     commit_iteration_space_ownership,
     concretize_expr,
     indirect_info_from_op,
@@ -48,6 +49,7 @@ from torch_spyre._inductor.pass_utils import (
     _is_matmul_op,
     op_short_name,
 )
+from torch_spyre._C import get_device_size_in_bytes
 from torch_spyre._inductor.work_division import (
     enumerate_work_division_candidates,
     work_division_splits_are_legal,
@@ -83,6 +85,7 @@ from torch_spyre._inductor.scratchpad.utils import (
     ops_in_offset_mutation_component,
     get_op_pointwise_inputs,
     buffer_not_read_in_full,
+    is_empty_tiled_layout,
     get_ncores_for_buffers,
     _is_tiled_advancing,
     _is_read_advancing_anywhere,
@@ -165,6 +168,32 @@ def _extern_kernel_in_live_range(graph: GraphLowering, uses: list[int]) -> bool:
         and not isinstance(graph.operations[i], SpyreEmptyFallback)
         for i in range(min(uses), max(uses) + 1)
     )
+
+
+def _multi_output_extern_kernel_in_live_range(
+    graph: GraphLowering, uses: list[int]
+) -> bool:
+    """True if a genuinely multi-output FallbackKernel runs while the buffer is live.
+
+    ``LxContextSwitchingPass`` (lx_context_switching.py's ``_select_bracket_targets``)
+    does not bracket multi-output FallbackKernels -- WeakDep target resolution in
+    ``_order_around_bracket`` is only confirmed correct for single-output kernels --
+    so a buffer whose only risky crossing is one of those gets no dump/restore
+    protection from the pass. Unlike the single-output case, this check runs
+    unconditionally (not gated on config.enable_lx_context_switching): the flag
+    only chooses between the old guard and the new pass for cases the new pass
+    actually handles, and this is not one of them.
+    """
+    if not uses:
+        return False
+    for i in range(min(uses), max(uses) + 1):
+        op = graph.operations[i]
+        if not isinstance(op, FallbackKernel):
+            continue
+        outputs = getattr(op, "outputs", None)
+        if outputs is not None and len(outputs) > 1:
+            return True
+    return False
 
 
 def _is_carried_reduction_storage(op: Any) -> bool:
@@ -303,7 +332,7 @@ class ScratchpadAllocator:
                     "__name__",
                     type(self.layout_planning).__name__,
                 )
-                logger.warning(
+                logger.debug(
                     "LX relayout is not supported by %s; continuing without relayout",
                     solver_name,
                 )
@@ -484,6 +513,10 @@ class ScratchpadAllocator:
             # MultiOutputLayout tuple op). There is nothing to place, and the
             # checks below would raise.
             return "unsized (no device layout)"
+        if is_empty_tiled_layout(op.layout):
+            # The joint solver does not consult the fixed-division judge until
+            # after placement, so it must share this pre-allocation exclusion.
+            return "empty tensor"
         if name in mutated_buffers and not _is_carried_reduction_storage(op):
             return "mutation target"
         # The shared carried-reduction contract names exactly one accumulator
@@ -491,8 +524,9 @@ class ScratchpadAllocator:
         # lifetime.  The general mutation gate remains unchanged otherwise.
         if _is_tiled_advancing(op) or _is_read_advancing_anywhere(name, buf_user_deps):
             # LX addresses cannot be expressed as affine.apply symbols today (see
-            # compute_ops.py's is_tiled_lx check), so a buffer whose address
-            # advances per coarse-tile iteration must stay in HBM, where that is
+            # compute_ops.py's generate_sdsc, which raises NotImplementedError via
+            # _tensor_tiled_by_symbol for exactly this case), so a buffer whose
+            # address advances per coarse-tile iteration must stay in HBM, where that is
             # supported -- whether the advance is on this buffer's own write
             # (_is_tiled_advancing) or on some other op's read of it
             # (_is_read_advancing_anywhere, e.g. a fixed-write full buffer
@@ -501,8 +535,25 @@ class ScratchpadAllocator:
         restickify = self._restickify_barrier(graph, name, uses)
         if restickify is not None:
             return restickify
-        if _extern_kernel_in_live_range(graph, uses):
+        # PR3683's guard: reject residency outright rather than let LX context
+        # switching (dump/restore around the risky call) handle it. Kept behind
+        # the flag, not deleted, so the old (conservative) and new (context
+        # switching) behaviors can still be compared -- see
+        # LxContextSwitchingPass in lx_context_switching.py, which is the intended
+        # long-term replacement for this check.
+        if not config.enable_lx_context_switching and _extern_kernel_in_live_range(
+            graph, uses
+        ):
             return "extern kernel user or live across extern kernel"
+        # Unconditional, regardless of the flag above: LxContextSwitchingPass does
+        # not bracket multi-output FallbackKernels (see
+        # _multi_output_extern_kernel_in_live_range's docstring), so a buffer live
+        # across one gets no protection from either mechanism unless residency is
+        # refused here.
+        if config.enable_lx_context_switching and (
+            _multi_output_extern_kernel_in_live_range(graph, uses)
+        ):
+            return "live across multi-output extern kernel"
         if self._is_index_or_indirectly_accessed(graph, name, uses, op):
             # Index tensors and the value tensors they index into are read via
             # data-dependent (indirect) addressing, must stay in hbm.
@@ -556,11 +607,19 @@ class ScratchpadAllocator:
         """
         if not clone_at_graph_boundaries():
             return "graph input (no clone)"
+        if is_empty_tiled_layout(getattr(graph.try_get_buffer(name), "layout", None)):
+            return "empty tensor"
         if self._read_count(uses) == 0:
             return "no consumer reads it from LX"
         if self._is_index_or_indirectly_accessed(graph, name, uses, None):
             return "index tensor or indirectly accessed"
-        if _extern_kernel_in_live_range(graph, uses):
+        # See the matching comment in _buffer_residency_reason: kept behind
+        # config.enable_lx_context_switching rather than deleted, so the
+        # PR3683 guard and LxContextSwitchingPass's dump/restore can be
+        # compared during rollout.
+        if not config.enable_lx_context_switching and _extern_kernel_in_live_range(
+            graph, uses
+        ):
             return "extern kernel user or live across extern kernel"
         if not GraphEditor.all_uses_are_rewritable(graph, uses):
             return "use is not rewritable to the clone"
@@ -613,7 +672,7 @@ class ScratchpadAllocator:
             or isinstance(getattr(go, "data", None), ReinterpretView)
         }
         if division_is_fixed and ncores is None:
-            ncores, ncores_reasons = get_ncores_for_buffers(graph)
+            ncores, ncores_reasons, _ = get_ncores_for_buffers(graph)
         ncores = ncores or {}
         ncores_reasons = ncores_reasons or {}
         buf_user_deps = _get_buffer_user_deps(graph)
@@ -686,6 +745,7 @@ class ScratchpadAllocator:
         lifetimes: dict[str, list[int]],
         ncores: dict[str, int],
         ncores_reasons: dict[str, str],
+        lx_views: dict[str, PerCoreView],
         lifetime_end_overrides: Optional[dict[str, int]] = None,
     ) -> list[LifetimeBoundBuffer]:
         """Build one :class:`LifetimeBoundBuffer` per buffer, barred or not.
@@ -725,6 +785,7 @@ class ScratchpadAllocator:
                     ),
                     residency_reason=reasons.get(output_name),
                     lifetime_end_override=lifetime_end_overrides.get(output_name),
+                    lx_view=lx_views.get(output_name),
                 )
             )
 
@@ -757,6 +818,7 @@ class ScratchpadAllocator:
                     in_place_parents=[],
                     residency_reason=reason,
                     lifetime_end_override=lifetime_end_overrides.get(input_name),
+                    lx_view=lx_views.get(input_name),
                 )
             )
 
@@ -865,7 +927,7 @@ class ScratchpadAllocator:
         num_cores = ncores.get(name, -1)
         if dev_layout is None or num_cores < 1:
             return 0
-        return math.prod(dev_layout.device_size[:-1]) * 128 // num_cores
+        return get_device_size_in_bytes(dev_layout) // num_cores
 
     def _determine_in_place(
         self,
@@ -932,19 +994,21 @@ class ScratchpadAllocator:
         if lifetimes is None:
             lifetimes = calculate_liveness(graph)
         lifetime_end_overrides = counted_loop_lifetime_end_overrides(graph)
-        ncores, ncores_reasons = get_ncores_for_buffers(graph)
+        ncores, ncores_reasons, lx_views = get_ncores_for_buffers(graph)
         t1 = time.perf_counter()
         mem_usage = mem_usage_by_buf(graph, cache)
         for plan in lx_relayout_plans:
-            for name in (plan.source_name, plan.destination_name):
-                if name not in mem_usage:
-                    continue
-                ncores[name] = plan.num_cores
-                ncores_reasons.pop(name, None)
-                mem_usage[name]["size_per_core"] = (
-                    mem_usage[name]["size"] // plan.num_cores
-                )
-                mem_usage[name]["core_div_mismatch"] = False
+            name = plan.source_name
+            if name not in mem_usage:
+                continue
+            ncores[name] = plan.source_view.num_cores or plan.num_cores
+            ncores_reasons.pop(name, None)
+            lx_views[name] = plan.source_view
+            # Only sources exist in the graph here. Each private destination
+            # receives its own view and bound in _append_lx_relayout_destinations.
+            # Retain the existing equal-share size at this prerequisite.
+            mem_usage[name]["size_per_core"] = mem_usage[name]["size"] // plan.num_cores
+            mem_usage[name]["core_div_mismatch"] = False
         t2 = time.perf_counter()
         if timings is not None:
             timings["residency"] += t1 - t0
@@ -971,6 +1035,7 @@ class ScratchpadAllocator:
             lifetimes=lifetimes,
             ncores=ncores,
             ncores_reasons=ncores_reasons,
+            lx_views=lx_views,
             lifetime_end_overrides=lifetime_end_overrides,
         )
         if lx_relayout_plans:
@@ -1040,10 +1105,12 @@ class ScratchpadAllocator:
                 destination = LifetimeBoundBuffer(
                     plan.destination_name,
                     round_up_to_alignment(
-                        source.size, _LX_ALLOCATION_GRANULARITY_BYTES
+                        source.size,
+                        _LX_ALLOCATION_GRANULARITY_BYTES,
                     ),
                     [transfer_tick, *consumer_ticks],
                     lifetime_end_override=destination_end,
+                    lx_view=plan.destination_view,
                 )
                 buffers.insert(buffers.index(source), destination)
                 source.paired_with.append(destination)
@@ -1161,27 +1228,40 @@ class ScratchpadAllocator:
             buf = graph.get_buffer(b.name)
             if b.name in inputs:
                 new_buffer = graph_editor.push_allocation_with_clone(
-                    buf, buffer_users[b.name], input=True
+                    buf,
+                    buffer_users[b.name],
+                    input=True,
+                    lx_view=b.lx_view,
                 )
-                self._set_one_allocation(new_buffer, b.address)
+                self._set_one_allocation(new_buffer, b.address, b.lx_view)
 
             elif b.name in outputs:
                 new_buffer = graph_editor.push_allocation_with_clone(
                     buf, buffer_users[b.name], input=False
                 )
-                self._set_one_allocation(buf, b.address)
+                self._set_one_allocation(buf, b.address, b.lx_view)
                 graph_editor.change_graph_output(buf, new_buffer)
 
             else:
-                self._set_one_allocation(buf, b.address)
+                self._set_one_allocation(buf, b.address, b.lx_view)
 
         # Keep graph mutation last and in pre-scheduling: solver retries require
         # the original graph, and post-grad no-op elimination has already run.
         materialize_lx_relayouts(graph, accepted_lx_relayouts)
 
-    def _set_one_allocation(self, buf: TensorBox | ComputedBuffer, address: int):
+    def _set_one_allocation(
+        self,
+        buf: TensorBox | ComputedBuffer,
+        address: int,
+        lx_view: PerCoreView | None,
+    ) -> None:
+        if lx_view is None:
+            raise RuntimeError(
+                f"LX placement for {buf.get_name()} has no accepted physical ownership"
+            )
         layout = buf.get_layout()
         layout.allocation["lx"] = address
+        layout.lx_view = lx_view
 
 
 def _lx_planning_size() -> int:
@@ -1225,6 +1305,182 @@ def _division_splits(op: Operation, division: CoreDivision) -> dict[sympy.Symbol
         sym: int(division.output_splits.get(sym, division.reduction_splits.get(sym, 1)))
         for sym in iteration_space_from_op(op)
     }
+
+
+def _view_for_div(
+    op: Operation,
+    dep: MemoryDep,
+    buf_name: str,
+    division: CoreDivision,
+    prep_cache: dict,
+):
+    """One candidate division's per-core view of ``buf_name``.
+
+    ``prep_cache`` holds the candidate-invariant (sympy-heavy) context, keyed by
+    ``(op name, dep, buf_name)``: a producer's write-dep and a consumer's
+    read-dep on the same buffer can be equal ``MemoryDep``s, so the op name
+    keeps their preps distinct while a parent read by several consumers reuses
+    its write-view prep.
+    """
+    key = (op.get_name(), dep, buf_name)
+    if key not in prep_cache:
+        prep_cache[key] = _prepare_per_core_view(op, dep, buf_name)
+    return _per_core_view_from_prep(
+        prep_cache[key], _division_splits(op, division), division.reduction_splits
+    )
+
+
+def _is_frame_changing_clone(op: Operation, buf_name: str) -> bool:
+    """True if ``op`` is a clone whose output ``buf_name`` has an iteration
+    dimension that none of its inputs carry -- i.e. it broadcasts a dim
+    (e.g. GQA broadcasting K/V over the query-group axis). Such a clone reads
+    its input in a different frame than it writes its output, so a per-core
+    slice of the output cannot be produced from a core-local slice of the
+    input; pinning the output mis-addresses (cf. the restickify barrier)."""
+    if op_short_name(op) != "clone":
+        return False
+    rw = op_read_writes(op)
+    write = next(
+        (w for w in rw.writes if w.name == buf_name and hasattr(w, "index")), None
+    )
+    if write is None:
+        return False
+    read_syms: set = set()
+    for r in rw.reads:
+        if hasattr(r, "index"):
+            read_syms |= set(r.index.free_symbols)
+    # A write-only free symbol means the clone expands (broadcasts) that dim.
+    return bool(set(write.index.free_symbols) - read_syms)
+
+
+@dataclass
+class ResidencyEdge:
+    """One producer-buffer -> consumer edge, with its residency policy applied.
+
+    Owns both halves of "can these two candidates share a residency": the
+    *geometry* -- the same per-core slicing of the buffer, compared in the
+    buffer's own device-dim frame, on the same total core count -- and the
+    *policy* filters that decide a candidate can host a readable residency at
+    all. Built once per edge by :func:`build_residency_edge`, which returns
+    ``None`` for an edge excluded outright, so a caller that generates
+    candidates instead of enumerating them cannot apply the geometry and forget
+    the filters.
+
+    Excluded outright (the producer then falls back to HBM, always correct): a
+    producer that can never be resident, and a frame-changing (broadcasting)
+    clone, whose per-core slice cannot be produced core-locally at all -- the
+    single-frame view comparison misses that, and the broadcast read from HBM
+    is globally correct. Excluded per candidate: see :meth:`parent_view` and
+    :meth:`consumer_view`.
+    """
+
+    buf_name: str
+    parent_op: Operation
+    consumer_op: Operation
+    write_dep: MemoryDep
+    read_dep: MemoryDep
+    # An SDSC carries only a matmul's primary split, so a multi-dim-split matmul
+    # output cannot be coherently LX-pinned even when views match -- a consumer
+    # would read per-core LX holding only a fragment. (Mirrors #2745's
+    # ``get_ncores_for_buffers`` matmul guard for the greedy path.)
+    parent_is_matmul: bool
+    prep_cache: dict
+
+    def parent_view(self, division: CoreDivision) -> Optional[PerCoreView]:
+        """The producer's write-view under ``division``, or ``None`` when that
+        candidate cannot host a readable residency: a partial-reduction write
+        (output not final), an unrepresentable slicing, or a matmul output
+        split across more than one device dim."""
+        view, partial, repr_ok = _view_for_div(
+            self.parent_op, self.write_dep, self.buf_name, division, self.prep_cache
+        )
+        if not repr_ok or partial:
+            return None
+        if self.parent_is_matmul and len(view.work_slice_dims) > 1:
+            return None
+        return view
+
+    def consumer_view(self, division: CoreDivision) -> Optional[PerCoreView]:
+        """The consumer's read-view under ``division``, or ``None`` when its
+        slicing of the buffer is unrepresentable -- we never pin on a slicing
+        we cannot verify."""
+        view, _partial, repr_ok = _view_for_div(
+            self.consumer_op, self.read_dep, self.buf_name, division, self.prep_cache
+        )
+        return view if repr_ok else None
+
+    def compatible(
+        self, parent_division: CoreDivision, consumer_division: CoreDivision
+    ) -> bool:
+        """Whether the two candidates induce the same per-core slicing of the
+        buffer on the same total core count. Equal views alone are not enough:
+        a producer on N and a consumer on M > N cores can share a slicing while
+        the consumer's extra (broadcast-axis) cores hold no copy and would read
+        stale LX."""
+        if parent_division.cores_used != consumer_division.cores_used:
+            return False
+        parent_view = self.parent_view(parent_division)
+        return parent_view is not None and parent_view.same_partition(
+            self.consumer_view(consumer_division)
+        )
+
+    def match_pairs(
+        self,
+        parent_divisions: Sequence[CoreDivision],
+        consumer_divisions: Sequence[CoreDivision],
+    ) -> list[tuple[int, int]]:
+        """Compatible ``(parent index, consumer index)`` pairs, with each side's
+        view computed once per candidate rather than once per pair."""
+        parent_views = [self.parent_view(cd) for cd in parent_divisions]
+        consumer_views = [self.consumer_view(cd) for cd in consumer_divisions]
+        return [
+            (i, j)
+            for i, parent_view in enumerate(parent_views)
+            if parent_view is not None
+            for j, consumer_view in enumerate(consumer_views)
+            if consumer_view is not None
+            and parent_view.same_partition(consumer_view)
+            and parent_divisions[i].cores_used == consumer_divisions[j].cores_used
+        ]
+
+
+def build_residency_edge(
+    buf_name: str,
+    parent_op: Operation,
+    consumer_op: Operation,
+    consumer_reads: Iterable[Dep],
+    residency_reason: Optional[str],
+    prep_cache: dict,
+) -> Optional[ResidencyEdge]:
+    """The :class:`ResidencyEdge` for this producer-consumer pair, or ``None``
+    when the edge can never host a residency."""
+    if residency_reason is not None:
+        return None
+    if _is_frame_changing_clone(parent_op, buf_name):
+        return None
+    write_dep = next(
+        (
+            w
+            for w in op_read_writes(parent_op).writes
+            if w.name == buf_name and hasattr(w, "index")
+        ),
+        None,
+    )
+    read_dep = next(
+        (r for r in consumer_reads if r.name == buf_name and hasattr(r, "index")),
+        None,
+    )
+    if write_dep is None or read_dep is None:
+        return None
+    return ResidencyEdge(
+        buf_name=buf_name,
+        parent_op=parent_op,
+        consumer_op=consumer_op,
+        write_dep=write_dep,
+        read_dep=read_dep,
+        parent_is_matmul=_is_matmul_op(parent_op),
+        prep_cache=prep_cache,
+    )
 
 
 def _fixed_core_division(op: Operation) -> CoreDivision:
@@ -1364,7 +1620,7 @@ def _matmul_axis_parse(op: Operation) -> dict[str, tuple[sympy.Symbol, int, int]
     for role, stride in zip(("N", "M", "B"), sorted(out_syms)):
         sym = out_syms[stride]
         roles[role] = (sym, sizes[stride], seed[sym])
-    k_sym = next(iter(k_syms))
+    k_sym = min(k_syms, key=str)
     roles["K"] = (
         k_sym,
         concretize_expr(iteration_space_from_op(op)[k_sym]),
@@ -1617,6 +1873,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
     def _solve(self, solver: MemoryPlanSolver, graph: GraphLowering) -> Sequence[Any]:
         assert isinstance(solver, CoreDivisionLayoutSolver)
         bufmap = {buf.name: buf for buf in solver.buffers}
+        is_lx = {name: buf.sym_is_lx for name, buf in bufmap.items()}
 
         # Keyed by buffer name, which is what ``predict_by_bundle`` needs to match
         # features to the ops in each estimated bundle. ``mem_usage_by_buf`` keys
@@ -1631,7 +1888,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             if output_name not in bufmap:
                 continue
             op_features[output_name] = self._extract_op_features(
-                graph, output_name, bufmap
+                graph, output_name, bufmap, is_lx
             )
 
         from torch_spyre._inductor.cost_model import predict_by_bundle
@@ -1665,14 +1922,16 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         )
         return result
 
-    def _extract_op_features(self, graph, output_name, buffers):
+    def _extract_op_features(self, graph, output_name, buffers, is_lx):
         """Build symbolic OpFeatures for one ComputedBuffer op (best-effort).
 
         Same extraction as dump_cost_model.extract_op_features, but keyed off
-        each buffer's *symbolic* is_lx/cores/core-division vars (sym_is_lx,
-        sym_core_divs) instead of concrete values, so the
-        resulting OpFeatures can be fed to predict_ops() to build a cost
-        expression over the solver's own decision variables.
+        each buffer's *symbolic* core-division vars (sym_core_divs) instead of
+        concrete values, so the resulting OpFeatures can be fed to
+        predict_ops() to build a cost expression over the solver's own
+        decision variables. Residency is likewise symbolic: ``is_lx`` (the
+        name -> ``sym_is_lx`` map) is passed straight into the extractor so
+        every arg is stamped with its symbolic placement as it is built.
         """
         from torch_spyre._inductor.dump_cost_model import extract_op_features
         from torch_spyre._inductor.scratchpad.sa_cooptimizer import _work_slices
@@ -1680,13 +1939,22 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         sym_core_divs = buffers[output_name].sym_core_divs
         op = graph.get_buffer(output_name)
         ws = _work_slices(op, CoreDivision(sym_core_divs[0], sym_core_divs[1]))
-        return extract_op_features(op, ws, buffers=buffers)
+        return extract_op_features(op, ws, is_lx)
 
     def _post_solve(self, graph: GraphLowering, allocation: Sequence[Any]) -> None:
         # The divisions must be committed such that any buffer clones can correctly
         # pull the selected core division from the dependent buffers when the graph
         # is updated with clones in ``_push_allocation``.
         self._commit_divisions(graph, allocation)
+        _, reasons, views = get_ncores_for_buffers(graph)
+        for buffer in allocation:
+            if buffer.address is None:
+                continue
+            view = views.get(buffer.name)
+            if view is None:
+                reason = reasons.get(buffer.name, "physical ownership was not accepted")
+                raise Unsupported(f"{buffer.name}: {reason}")
+            buffer.lx_view = view
 
     def _get_spill_reasons(
         self,
@@ -1956,7 +2224,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                     graph.operations[last_use].name, []
                 ).append(input_name)
                 dev_layout = graph.get_buffer(input_name).layout.device_layout
-                size = math.prod(dev_layout.device_size[:-1]) * 128
+                size = get_device_size_in_bytes(dev_layout)
                 buffers.append(
                     CoreDivisionBuffer(
                         input_name,
@@ -2055,28 +2323,6 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             )
         return buffers
 
-    def _is_frame_changing_clone(self, op: Operation, buf_name: str) -> bool:
-        """True if ``op`` is a clone whose output ``buf_name`` has an iteration
-        dimension that none of its inputs carry -- i.e. it broadcasts a dim
-        (e.g. GQA broadcasting K/V over the query-group axis). Such a clone reads
-        its input in a different frame than it writes its output, so a per-core
-        slice of the output cannot be produced from a core-local slice of the
-        input; pinning the output mis-addresses (cf. the restickify barrier)."""
-        if self._get_op_name(op) != "clone":
-            return False
-        rw = op_read_writes(op)
-        write = next(
-            (w for w in rw.writes if w.name == buf_name and hasattr(w, "index")), None
-        )
-        if write is None:
-            return False
-        read_syms: set = set()
-        for r in rw.reads:
-            if hasattr(r, "index"):
-                read_syms |= set(r.index.free_symbols)
-        # A write-only free symbol means the clone expands (broadcasts) that dim.
-        return bool(set(write.index.free_symbols) - read_syms)
-
     def _eligible_clone_inputs(
         self, graph: GraphLowering, lifetimes: dict[str, list[int]]
     ) -> list[str]:
@@ -2117,7 +2363,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         finding the intersection of core divisions.
         """
         clone_divs: list[CoreDivision] = []
-        clone_views: list[tuple] = []  # parallel: the view each clone div reproduces
+        clone_views: list[PerCoreView] = []
         matches: dict[str, list[tuple[int, int]]] = {}
         for consumer in consumers:
             cname = consumer.get_name()
@@ -2138,7 +2384,14 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             for j, (view, _, repr_ok) in enumerate(views):
                 if not repr_ok:
                     continue
-                k = next((idx for idx, v in enumerate(clone_views) if v == view), None)
+                k = next(
+                    (
+                        idx
+                        for idx, candidate in enumerate(clone_views)
+                        if candidate.same_partition(view)
+                    ),
+                    None,
+                )
                 if k is None:
                     cd = consumer_divs[j]
                     per_sym = _division_splits(consumer, cd)
@@ -2176,19 +2429,12 @@ class CoOptimizingAllocator(ScratchpadAllocator):
     ) -> dict[str, list[tuple[int, int]]]:
         """Physical slicing-match pairs for each divided producer this op reads.
 
-        For producer ``P`` feeding this consumer, a ``(P_div_idx,
-        consumer_div_idx)`` pair is compatible iff the two divisions induce the
-        *same per-core slicing of ``P``* (``P``'s write-view equals the
-        consumer's read-view, both via ``_per_core_view_on_buf`` in ``P``'s
-        device-dim frame) AND use the *same total core count*. This is the
-        per-core-view comparison ``get_ncores_for_buffers`` uses -- correct across
-        reductions/reshapes, where a coeff-keyed signature would conflate axes.
-
-        Excluded from matching (producer then falls back to HBM, always correct):
-        a producer that can never be resident (``residency_by_buf`` reason is not
-        ``None``); a producer candidate whose write carries a partial reduction
-        (output not final); and either side's candidate whose slicing of ``P`` is
-        unrepresentable -- we never pin on a slicing we cannot verify.
+        One :class:`ResidencyEdge` per producer decides both which candidate
+        pairs are compatible and which producers are excluded from matching
+        altogether; this is the pair-table materialization of it. The pairing is
+        the per-core-view comparison ``get_ncores_for_buffers`` uses -- correct
+        across reductions/reshapes, where a coeff-keyed signature would conflate
+        axes.
         """
         if consumer_op is None:
             return {}
@@ -2197,102 +2443,28 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         for parent in parent_names:
             if parent not in op_by_name:
                 continue
-            if residency_by_buf.get(parent, "not in graph") is not None:
-                continue
-            parent_divs = divisions[parent]
-            parent_op = op_by_name[parent]
-            # Frame-changing (broadcasting) clone barrier: the output reads its
-            # input in a different frame (e.g. GQA broadcasting K/V over the
-            # query-group axis), so a per-core slice can't be produced
-            # core-locally. The single-frame view comparison misses this; keep
-            # it in HBM (the broadcast read is globally correct).
-            if self._is_frame_changing_clone(parent_op, parent):
-                continue
-            write_dep = next(
-                (
-                    w
-                    for w in op_read_writes(parent_op).writes
-                    if w.name == parent and hasattr(w, "index")
-                ),
-                None,
+            edge = build_residency_edge(
+                parent,
+                op_by_name[parent],
+                consumer_op,
+                consumer_reads,
+                residency_by_buf.get(parent, "not in graph"),
+                prep_cache,
             )
-            read_dep = next(
-                (r for r in consumer_reads if r.name == parent and hasattr(r, "index")),
-                None,
-            )
-            if write_dep is None or read_dep is None:
+            if edge is None:
                 continue
-
-            # Producer view per candidate; ``None`` marks one that can't host a
-            # readable residency: a partial-reduction write, an unrepresentable
-            # slicing, or a matmul output split across >1 device dim. The SDSC
-            # for a matmul carries only the primary split, so a multi-dim-split
-            # output (M-split x N-stick-split) can't be coherently LX-pinned even
-            # when views match -- a consumer would read per-core LX holding only
-            # a fragment. (Mirrors #2745's ``get_ncores_for_buffers`` matmul
-            # guard for the greedy path.)
-            parent_is_matmul = _is_matmul_op(parent_op)
-            prod_views: list[Optional[tuple]] = [
-                view
-                if (
-                    repr_ok
-                    and not partial
-                    and not (parent_is_matmul and len(view.work_slice_dims) > 1)
-                )
-                else None
-                for view, partial, repr_ok in self._views_for_divs(
-                    parent_op, write_dep, parent, parent_divs, prep_cache
-                )
-            ]
-            cons_views: list[Optional[tuple]] = [
-                view if repr_ok else None
-                for view, _partial, repr_ok in self._views_for_divs(
-                    consumer_op, read_dep, parent, consumer_divs, prep_cache
-                )
-            ]
-
-            # A matched pair needs equal per-core slicing AND equal total core
-            # count: equal views alone aren't enough, since a producer on N and
-            # consumer on M>N cores can share a slicing while the consumer's
-            # extra (broadcast-axis) cores hold no copy and would read stale LX.
-            # The joint solver re-divides per buffer and can hit this; a rejected
-            # pair just falls back to HBM.
-            pairs = [
-                (i, j)
-                for i, pv in enumerate(prod_views)
-                if pv is not None
-                for j, cv in enumerate(cons_views)
-                if cv is not None
-                and pv == cv
-                and parent_divs[i].cores_used == consumer_divs[j].cores_used
-            ]
-            matches[parent] = pairs
+            matches[parent] = edge.match_pairs(divisions[parent], consumer_divs)
         return matches
 
     @staticmethod
     def _views_for_divs(op, dep, buf_name, divs, prep_cache: dict):
         """Per-core views of ``buf_name`` for each candidate division of ``op``.
 
-        Prepares the candidate-invariant context once (``_prepare_per_core_view``
-        -- the sympy-heavy op-level work) and evaluates every candidate from it
-        via ``_per_core_view_from_prep``, so cost scales with the op rather than
-        its candidate count.
-
-        ``prep_cache`` is keyed by ``(op name, dep, buf_name)``: a producer's
-        write-dep and a consumer's read-dep on the same buffer can be equal
-        ``MemoryDep``s, so the op name keeps their preps distinct while a parent
-        read by several consumers reuses its write-view prep.
+        The candidate-invariant prep is computed once and shared through
+        ``prep_cache``, so cost scales with the op rather than its candidate
+        count.
         """
-        key = (op.get_name(), dep, buf_name)
-        out = []
-        for cd in divs:
-            if key not in prep_cache:
-                prep_cache[key] = _prepare_per_core_view(op, dep, buf_name)
-            splits = _division_splits(op, cd)
-            out.append(
-                _per_core_view_from_prep(prep_cache[key], splits, cd.reduction_splits)
-            )
-        return out
+        return [_view_for_div(op, dep, buf_name, cd, prep_cache) for cd in divs]
 
 
 def _make_cpsat_solver(
@@ -2365,9 +2537,24 @@ def select_allocator() -> ScratchpadAllocator:
             f"Invalid layout_solver config option '{config.layout_solver}'."
         )
 
+    # LxContextSwitchingPass replaces PR3683's blanket "never pin a buffer to
+    # LX across an extern kernel" guard with a real fix (bracket the risky
+    # call with per-buffer dump/restore instead). Both are gated by the same
+    # flag -- see the matching comments on _extern_kernel_in_live_range's two
+    # call sites -- so this list is empty exactly when that guard is active.
+    # Imported locally: lx_context_switching imports ScratchpadOptimizationPass
+    # from this module, so a top-level import here would be circular.
+    from torch_spyre._inductor.scratchpad.lx_context_switching import (
+        LxContextSwitchingPass,
+    )
+
+    post_optimization_passes: list[ScratchpadOptimizationPass] = (
+        [LxContextSwitchingPass()] if config.enable_lx_context_switching else []
+    )
+
     if config.co_optimizing_lx_planning:
         if config.lx_planner_relayout:
-            logger.warning(
+            logger.debug(
                 "LX relayout is not supported by CoOptimizingAllocator; "
                 "continuing without relayout"
             )
@@ -2386,14 +2573,21 @@ def select_allocator() -> ScratchpadAllocator:
                 ),
                 size=size,
                 prune=True,
+                post_optimization_passes=post_optimization_passes,
             )
         # The isinstance check above just proved this factory's solver is a
         # CoreDivisionLayoutSolver at runtime; narrow the static type to match.
         return CoOptimizingAllocator(
-            layout_planning=cast(CoreDivisionSolverFactory, solver_cls), size=size
+            layout_planning=cast(CoreDivisionSolverFactory, solver_cls),
+            size=size,
+            post_optimization_passes=post_optimization_passes,
         )
 
-    return ScratchpadAllocator(layout_planning=solver_cls, size=size)
+    return ScratchpadAllocator(
+        layout_planning=solver_cls,
+        size=size,
+        post_optimization_passes=post_optimization_passes,
+    )
 
 
 def scratchpad_planning(

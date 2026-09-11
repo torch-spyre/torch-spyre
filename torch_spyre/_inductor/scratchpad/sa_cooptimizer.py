@@ -48,6 +48,8 @@ import statistics
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any, Optional, Union, cast
 
+import sympy
+
 from torch_spyre._inductor.scratchpad.firstfit_bestfit_solver import (
     FirstFitLayoutSolver,
 )
@@ -65,12 +67,10 @@ from torch_spyre._inductor.scratchpad.permutation_layout import (
     make_permutation_packer,
 )
 from torch_spyre._inductor.scratchpad import utils
-from torch_spyre._inductor.cost_model import OpFeatures
 from torch_spyre._inductor.logging_utils import get_inductor_logger
 from torch_spyre._inductor.pass_utils import iteration_space_from_op
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
-    from torch_spyre._inductor.scratchpad.cost_objective import BundleCostObjective
     from torch_spyre._inductor.scratchpad.plan_solver import CoreDivision
 
 logger = get_inductor_logger("scratchpad.sa_cooptimizer")
@@ -117,69 +117,6 @@ def _work_slices(op, division: "CoreDivision") -> dict:
     }
 
 
-def features_for_division(op, division: "CoreDivision") -> Optional[OpFeatures]:
-    """``OpFeatures`` for ``op`` as if it were divided per ``division``.
-
-    Returns ``None`` when the op cannot be featurized (the extractor is
-    best-effort and swallows its own failures, so a ``None`` here means the op
-    itself was rejected, not that the division was bad).
-
-    The candidate is passed as a complete symbol-keyed map, leaving the live
-    operation and its Scheduler-boundary transport untouched.
-    """
-    from torch_spyre._inductor.dump_cost_model import extract_op_features
-
-    try:
-        return extract_op_features(op, _work_slices(op, division))
-    except Exception:  # noqa: BLE001 - featurization is best-effort by design
-        logger.debug("could not featurize op for a candidate division", exc_info=True)
-        return None
-
-
-def features_for_menu(op, divisions) -> list[Optional[OpFeatures]]:
-    """``features_for_division`` over a buffer's whole candidate menu, index for
-    index with ``divisions`` so a menu index selects its features directly."""
-    return [features_for_division(op, cd) for cd in divisions]
-
-
-def _bundle_objective(
-    buffers: Sequence["CoreDivisionBuffer"],
-) -> Optional["BundleCostObjective"]:
-    """Build a :class:`BundleCostObjective` from the live Inductor graph.
-
-    Per-division ``OpFeatures`` and the fused-bundle grouping are read off
-    ``V.graph``, which is ambient while the allocator runs -- this solver *is* an
-    Inductor pass. Only the buffer order comes from the arguments.
-
-    Returns ``None`` when there is no live graph, in which case the caller falls
-    back to the memory-only objective and logs it.
-    """
-    from torch._inductor.virtualized import V
-
-    from torch_spyre._inductor.fusion import estimate_bundles
-    from torch_spyre._inductor.scratchpad.cost_objective import BundleCostObjective
-
-    # Unset, ``V.graph`` is a ``NullHandler`` rather than ``None``, so detect the
-    # live graph by what this needs from it rather than by identity.
-    graph: Any = getattr(V, "graph", None)
-    if graph is None:
-        return None
-    if not hasattr(graph, "operations") or not hasattr(graph, "get_buffer"):
-        return None
-
-    features: dict[str, list] = {}
-    for buf in buffers:
-        try:
-            op = graph.get_buffer(buf.name)
-        except Exception:  # noqa: BLE001 - not every solver buffer is a graph buffer
-            continue
-        features[buf.name] = features_for_menu(op, buf.core_divisions)
-    bundles = [
-        [op.get_name() for op in group] for group in estimate_bundles(graph.operations)
-    ]
-    return BundleCostObjective([b.name for b in buffers], features, bundles)
-
-
 class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
     """SA joint core-division + LX-placement engine.
 
@@ -218,16 +155,10 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         self._bufs: Sequence[CoreDivisionBuffer] = cast(
             "list[CoreDivisionBuffer]", list(buffers)
         )
-        # The cost model prices compute as well as traffic, so it replaces the
-        # memory-only objective outright. It builds itself from the live graph,
-        # which is what lets it be unconditional: the allocator's
-        # ``CoreDivisionSolverFactory`` passes only (buffers, size, alignment), so
-        # an objective could never arrive from the caller.
-        self._cost_objective = _bundle_objective(self._bufs)
-        if self._cost_objective is None:
-            logger.info(
-                "no live Inductor graph; falling back to the memory-only objective"
-            )
+        # Built from ``cost_expr`` once ``plan_layout_and_core_divisions`` has it
+        # (see :meth:`_build_score_fn`); ``None`` until then, which also means
+        # "no usable cost expression" -- the memory-only objective's signal.
+        self._score_fn: Any = None
         # Best-seen over the anneal (set in _anneal, read in _step); declared for
         # the types.
         self._best_score: int
@@ -252,16 +183,22 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         )
 
     def plan_layout_and_core_divisions(
-        self, cost_expr=None
+        self, cost_expr: Optional[sympy.Expr] = None
     ) -> list[CoreDivisionBuffer]:
         """Anneal the joint ``(pi, W)`` state and write ``chosen_division`` /
         ``address`` back to each buffer; populate ``spill_reasons``. Returns the
-        solver's own buffers. Single-use: construct a fresh solver per set."""
-        # TODO: use cost_expr here -- states are scored by self._cost_objective.
+        solver's own buffers. Single-use: construct a fresh solver per set.
+        """
         self.spill_reasons = {}
         n = len(self._bufs)
         if n == 0:
             return list(self._bufs)
+
+        self._score_fn = self._build_score_fn(cost_expr)
+        if self._score_fn is None:
+            logger.info(
+                "no usable cost expression; falling back to the memory-only objective"
+            )
 
         self._rng = rnd.Random(_SEED)
         self._precompute_topology()
@@ -273,6 +210,45 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         self._anneal()
         self._write_back()
         return list(self._bufs)
+
+    def _build_score_fn(self, cost_expr: Optional[sympy.Expr]):
+        """Compile ``cost_expr`` into a ``(chosen, resident) -> fixed-point ns``
+        callable, or ``None`` if it can't be evaluated from only this solver's
+        own buffers.
+
+        ``None`` (no expression, or a symbol this can't place -- e.g. a dynamic-
+        shape symbol the allocator's build left in) falls back to the
+        memory-only objective
+        """
+        if cost_expr is None:
+            return None
+        value_of: dict = {}  # sympy.Symbol -> (chosen, resident) -> number
+        for idx, buf in enumerate(self._bufs):
+            value_of[buf.sym_is_lx] = lambda chosen, resident, name=buf.name: (
+                1 if name in resident else 0
+            )
+            out_syms, red_syms = buf.sym_core_divs
+            for key, sym in out_syms.items():
+                value_of[sym] = lambda chosen, resident, idx=idx, key=key, buf=buf: (
+                    buf.core_divisions[chosen[idx]].output_splits.get(key, 1)
+                )
+            for key, sym in red_syms.items():
+                value_of[sym] = lambda chosen, resident, idx=idx, key=key, buf=buf: (
+                    buf.core_divisions[chosen[idx]].reduction_splits.get(key, 1)
+                )
+        try:
+            free = sorted(cost_expr.free_symbols, key=str)
+            if any(sym not in value_of for sym in free):
+                return None
+            fn = sympy.lambdify(free, cost_expr, modules="math")
+        except (ValueError, TypeError, ZeroDivisionError, RuntimeError):
+            return None
+
+        def score(chosen, resident) -> int:
+            ns = fn(*(value_of[sym](chosen, resident) for sym in free))
+            return utils.to_fixed_us(max(0.0, ns) / 1000.0)
+
+        return score
 
     # -- static topology (division-invariant) --------------------------------
 
@@ -504,13 +480,13 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         ``spill_cost() * (1 - in_buffer)``.
         """
         addresses = self.packer.addresses
-        if self._cost_objective is not None:
+        if self._score_fn is not None:
             resident = frozenset(
                 b.name
                 for b, address in zip(self._bufs, addresses)
                 if address is not None
             )
-            return self._cost_objective.score(self.chosen, resident)
+            return self._score_fn(self.chosen, resident)
 
         traffic = sum(
             cost
@@ -644,14 +620,8 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         copy, so the engine goes on mutating those objects and the caller must
         treat ``snap`` as dead from here on. Zero-copy because a step already pays
         one O(n) packer copy for its snapshot.
-
-        Restoring rewinds ``(pi, W)`` behind the cost objective's back. Its cached
-        bundle *values* stay valid (they are keyed on state), but the baseline it
-        diffs against no longer describes the live state, so invalidate that.
         """
         self.packer, self.chosen, self._n_eligible = snap
-        if self._cost_objective is not None:
-            self._cost_objective.invalidate()
 
     # -- move selection & execution -----------------------------------------
 

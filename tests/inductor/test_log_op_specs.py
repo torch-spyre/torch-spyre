@@ -206,17 +206,19 @@ def _make_test_kernel():
     kernel.args.python_argdefs.return_value = (None, [])
     kernel.spyre_kernel_args = []
     kernel._alignment_repeat_info = {}
-    kernel._alignment_repeat_info_by_spec = {}
-    kernel._alignment_access_by_tensor_arg = {}
-    kernel._alignment_inputs_by_spec = {}
+    kernel.failed_node = None
     kernel.pool_size = 0
     return kernel
 
 
 class TestSpyreKernelLogging:
-    """Tests for logger.info calls in SpyreKernel.codegen_kernel."""
+    """Tests for logger.info calls in SpyreKernel.check_op_specs.
 
-    def test_logs_at_both_stages(self):
+    Operations are finished as they are created, so the sequence is logged
+    once, in its finished form, after loop wrapping.
+    """
+
+    def test_logs_the_finished_sequence_once(self):
         logger = logging.getLogger("spyre.inductor.spyre_kernel")
         with patch.object(logger, "isEnabledFor", return_value=True):
             with patch.object(logger, "info") as mock_info:
@@ -225,15 +227,12 @@ class TestSpyreKernelLogging:
                     return_value="<formatted>",
                 ) as mock_fmt:
                     kernel = _make_test_kernel()
-
-                    with patch("torch_spyre._inductor.spyre_kernel.simplify_op_spec"):
-                        kernel.codegen_kernel()
+                    kernel.check_op_specs()
 
                     info_calls = mock_info.call_args_list
                     labels = [c.args[0] for c in info_calls if "OP SPECS" in c.args[0]]
-                    assert any("CREATION/LOOP-WRAPPING" in lbl for lbl in labels)
-                    assert any("SIMPLIFICATION" in lbl for lbl in labels)
-                    assert mock_fmt.call_count >= 2
+                    assert labels == ["OP SPECS AFTER SIMPLIFICATION\n%s"]
+                    assert mock_fmt.call_count == 1
 
     def test_no_formatting_when_logging_disabled(self):
         logger = logging.getLogger("spyre.inductor.spyre_kernel")
@@ -242,9 +241,7 @@ class TestSpyreKernelLogging:
                 "torch_spyre._inductor.spyre_kernel.format_op_spec_list"
             ) as mock_fmt:
                 kernel = _make_test_kernel()
-
-                with patch("torch_spyre._inductor.spyre_kernel.simplify_op_spec"):
-                    kernel.codegen_kernel()
+                kernel.check_op_specs()
 
                 mock_fmt.assert_not_called()
 

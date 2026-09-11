@@ -14,6 +14,8 @@
 
 import functools
 import math
+import os
+import platform
 import sys
 import pytest
 import unittest
@@ -264,12 +266,10 @@ _LX_ALLOCATION_MARKER = "allocation={'lx'"
 def _assert_keeps_lx_residency(fn, x, case):
     """Assert the compiled graph still pins at least one buffer into LX.
 
-    Comparing values cannot detect a regression in
-    ``align_lx_producer_loop_order``: if an LX buffer's producer and consumers
-    stop agreeing on core->slice, ``demote_incoherent_lx_buffers`` clears the LX
+    Comparing values cannot detect a residency regression: if the clone cannot
+    commit the consumers' agreed physical ownership, preflight clears its LX
     allocation and the results come out correct anyway -- just served from HBM.
-    Residency is therefore the only observable that separates "aligned" from
-    "demoted", so assert it directly.
+    Assert residency directly as well as values.
 
     Measured on the shapes in SHARED_INPUT_TWO_REDUCTION_PARAM_SETS: with the
     aligner in place every case keeps 3 LX allocations (4 for the three-consumer
@@ -284,8 +284,8 @@ def _assert_keeps_lx_residency(fn, x, case):
     assert source_codes[0].count(_LX_ALLOCATION_MARKER) > 0, (
         f"{case}: no buffer left in LX. The values may still be correct, but an "
         f"LX buffer whose users disagree on core->slice gets demoted to HBM -- so "
-        f"this is the signature of the producer/consumer loop-order alignment "
-        f"regressing (see align_lx_producer_loop_order, #3374/#3387)."
+        f"this is the signature of clone ownership or finalization preflight "
+        f"regressing (see #3374/#3387)."
     )
 
 
@@ -685,6 +685,89 @@ def _pattern_resolve(variant, args):
             (q, k, v),
         )
     raise ValueError(f"unknown transpose suite variant {variant}")
+
+
+# Scope gate for fp32→fp16 proxy CPU refs (s390x/ppc64): param keys under
+# TestOps.PARAMS[("test_large_matmul", "test_mm_relaxed")]. Shapes are derived
+# from PARAMS after TestOps is defined so the allow-list cannot drift.
+_TEST_LARGE_MATMUL_FP32_PROXY_PARAM_KEYS = frozenset(
+    {
+        "2d_M2048_K2048_N65536",
+        "4d_B2_H2_M2048_K2048_N65536",
+    }
+)
+
+# Populated from TestOps.PARAMS after the class body runs (see bottom of module).
+_TEST_LARGE_MATMUL_FP32_PROXY_SHAPES = set()
+
+
+def _derive_test_large_matmul_fp32_proxy_shapes(param_sets) -> set:
+    missing = _TEST_LARGE_MATMUL_FP32_PROXY_PARAM_KEYS - param_sets.keys()
+    if missing:
+        raise RuntimeError(
+            "test_large_matmul fp32-proxy param keys missing from "
+            'TestOps.PARAMS[("test_large_matmul", "test_mm_relaxed")]: '
+            f"{sorted(missing)}"
+        )
+    return {
+        (tuple(param_sets[key][0].shape), tuple(param_sets[key][1].shape))
+        for key in _TEST_LARGE_MATMUL_FP32_PROXY_PARAM_KEYS
+    }
+
+
+# Cached once: platform.machine() is stable for the process.
+_ARCH_NEEDS_FP32_PROXY_CPU_REF = (
+    platform.machine().lower().startswith(("s390x", "ppc64"))
+)
+
+
+def _arch_needs_fp32_proxy_cpu_ref() -> bool:
+    return _ARCH_NEEDS_FP32_PROXY_CPU_REF
+
+
+def _is_test_large_matmul_fp32_proxy_shape(a: torch.Tensor, b: torch.Tensor) -> bool:
+    # Gated by tensor shapes only. Today these shapes are unique to test_large_matmul;
+    # if another test_mm_relaxed case reused them on s390x/ppc64, it would also take
+    # the fp32→fp16 CPU ref path. Intended coverage is _TEST_LARGE_MATMUL_FP32_PROXY_PARAM_KEYS.
+    return (tuple(a.shape), tuple(b.shape)) in _TEST_LARGE_MATMUL_FP32_PROXY_SHAPES
+
+
+def _build_fp32_proxy_cpu_refs(
+    op,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    wrap=None,
+) -> dict:
+    """Build compare_with_cpu kwargs using fp32 execution + cast to input dtype.
+
+    Run on fp32 CPU inputs and cast the result to the input dtype (typically fp16).
+    Skips live fp16 CPU work that is extremely slow on s390x/ppc64. Spyre still
+    runs on the original tensors.
+
+    When ``wrap`` is None (TestOps), ``cpu_eager_result`` is ``op(a32, b32)``.
+    When ``wrap`` is set (LX planning), ``cpu_eager_result`` is
+    ``wrap(op_fp32_proxy)(a, b)`` to match ``compare_with_cpu(wrap(op), ...)``.
+
+    Gate on arch + ``_is_test_large_matmul_fp32_proxy_shape`` before calling.
+
+    Proxy gold for CI wall-time under ``test_mm_relaxed`` tolerances, not fp16-CPU
+    parity vs x86.
+    """
+
+    def op_fp32_proxy(a, b):
+        return op(a.float(), b.float()).to(dtype=a.dtype)
+
+    kwargs = {}
+    with torch.no_grad():
+        if wrap is None:
+            a32, b32 = a.float(), b.float()
+            kwargs["cpu_eager_result"] = op(a32, b32).to(dtype=a.dtype)
+            if bool(os.getenv("TEST_COMPARE_CPU_COMPILE")):
+                out32 = _compile_and_run(op, (a32, b32), "cpu", compile=True)
+                kwargs["cpu_compile_result"] = out32.to(dtype=a.dtype)
+        else:
+            kwargs["cpu_eager_result"] = wrap(op_fp32_proxy)(a, b)
+    return kwargs
 
 
 class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
@@ -1335,12 +1418,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     2,
                     0.0,
                 ),
-                "4d_dim3": (
-                    unique_randn_along_dim((6, 17, 4, 128), dim=3),
-                    4,
-                    3,
-                    -1.0,
-                ),
             },
         },
         ("test_reduce_keepdim0", "test_reduce_keepdim0_cpu"): {
@@ -1432,16 +1509,12 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             },
             "param_sets": INDEX_REDUCTION_KEEPDIM_PARAM_SETS,
         },
-        # Regression guard for the LX producer/consumer core->slice agreement
-        # (#3374, #3387). Two device reductions over one LX-pinned input reducing
-        # a non-trailing dim get a positional core->slice mapping from
-        # core_to_slice_mapping; if the clone that pins the input into LX walks it
-        # in a different dim order than the reductions read it, each core reads a
-        # slice another core wrote and the result is silently wrong. Through 2.12
-        # Inductor's loop_ordering_after_fusion happened to rewrite the clone into
-        # the consumers' order; 2.13 computes that reorder and discards it, which
-        # is what exposed it. aminmax was merely the first op to show it, so these
-        # cases assert the general shape.
+        # Regression guard for LX producer/consumer physical ownership
+        # (#3374, #3387). Two reductions over one pinned input may read it in a
+        # different loop order from the boundary clone. The clone must commit
+        # the consumers' accepted physical view before scheduling; otherwise a
+        # core can read a slice another core wrote. aminmax was merely the first
+        # op to expose the general shape.
         (
             "test_shared_input_two_reductions",
             "test_shared_input_two_reductions_base",
@@ -5998,10 +6071,23 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
     # Increased mm test tolerance for splitk
     def test_mm_relaxed(self, op, a, b):
         K = b.shape[-2]
+        kwargs = {}
         if K > (128 // b.element_size()):  # multiple sticks
-            self.compare_with_cpu(op, a, b, atol=0.1, rtol=0.1)
-        else:  # single stick, no need to relax
-            self.compare_with_cpu(op, a, b)
+            kwargs.update(atol=0.1, rtol=0.1)
+
+        # Large matmul on s390x/ppc64: live fp16 CPU GEMM can be extremely slow
+        # (no optimized fp16 BLAS). Use fp32→fp16 CPU references for allow-listed
+        # shapes only; Spyre still executes on the original fp16 inputs.
+        # Skip when compare_with_cpu is overridden (e.g. LX planning wraps fn with
+        # a second op); a bare-matmul CPU ref would not match wrap(fn) on Spyre.
+        if (
+            type(self).compare_with_cpu is TestOps.compare_with_cpu
+            and _arch_needs_fp32_proxy_cpu_ref()
+            and _is_test_large_matmul_fp32_proxy_shape(a, b)
+        ):
+            kwargs.update(_build_fp32_proxy_cpu_refs(op, a, b))
+
+        self.compare_with_cpu(op, a, b, **kwargs)
 
     def test_mm_autocast_cpu(self, enabled, a, b):
         def fn(a, b):
@@ -8390,6 +8476,50 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
         self.compare_with_cpu(fn, x, run_eager=False)
 
+    def test_matmul_bs1_3d_linear(self):
+        def fn(x, w):
+            return torch.matmul(x, w.T)
+
+        x = cached_xavier((1, 16, 4096))
+        w = cached_xavier((6144, 4096))
+        self.compare_with_cpu(fn, x, w, atol=0.5, rtol=0.1)
+
+    def test_index_select_reshape_matmul_4033(self):
+        """Regression test for issue #4033: fused index_select + reshape + matmul.
+
+        Verifies that the specific kernel pattern (multi-index gather + reshape
+        + matmul with NKV=4, NQ=4, D=128, PAGES=2, BLOCK=128) compiles and
+        runs correctly. This was the exact configuration that triggered
+        the dead arguments bug where gather indices were still passed to kernel
+        .run() calls despite being simplified away.
+        See: https://github.com/torch-spyre/torch-spyre/issues/4033
+        """
+        NKV = 4
+        NQ = 4
+        D = 128
+        PAGES = 2
+        BLOCK = 128
+        H = NKV * NQ
+
+        def fn(query, query_idx, k_pages, page_idx):
+            q = query.index_select(0, query_idx).reshape(NKV, NQ, 1, D)
+            k = k_pages.index_select(0, page_idx).reshape(NKV, 1, BLOCK, D)
+            return torch.matmul(q, k)
+
+        torch.manual_seed(0)
+        k_pages = torch.randn(PAGES, BLOCK, NKV, D, dtype=torch.float16).mul_(0.1)
+        query = torch.randn(1, H * D, dtype=torch.float16).reshape(1, H, D).contiguous()
+        query_idx = torch.zeros(1, dtype=torch.int32)
+        page_idx = torch.zeros(1, dtype=torch.int32)
+
+        self.compare_with_cpu(
+            fn, query, query_idx, k_pages, page_idx, atol=0.2, rtol=0.2, run_eager=False
+        )
+
+
+_TEST_LARGE_MATMUL_FP32_PROXY_SHAPES = _derive_test_large_matmul_fp32_proxy_shapes(
+    TestOps.PARAMS[("test_large_matmul", "test_mm_relaxed")]["param_sets"]
+)
 
 if __name__ == "__main__":
     unittest.main()

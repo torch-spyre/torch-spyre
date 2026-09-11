@@ -1,0 +1,70 @@
+name: jenkins-connectivity-check
+
+# Manual-only diagnostic: does a self-hosted (torch-cicd) runner have an
+# outbound network path to our internal TaaS Jenkins? Jenkins itself sits on
+# a 9.x IBM-intranet-only address and cannot accept inbound webhooks from
+# github.com directly (confirmed by the TaaS platform team) -- this checks
+# whether the REVERSE direction (runner -> Jenkins, plain egress) works,
+# which would let a workflow act as a comment-triggered bridge instead.
+#
+# Not wired to any real event on purpose: this is throwaway diagnostic
+# tooling, not a build/test job, so it stays workflow_dispatch-only.
+on:
+  workflow_dispatch:
+    inputs:
+      target_url:
+        description: >-
+          Full URL to test (e.g. the generic-webhook-trigger endpoint:
+          https://<jenkins-host>/generic-webhook-trigger/invoke). Required.
+        required: true
+      compare_url:
+        description: >-
+          Optional second URL to test alongside target_url -- e.g. the known
+          github.com webhook gateway path (https://<jenkins-host>/github-webhook/)
+          for comparison, since that one path is already known to work from
+          github.com itself and gives a useful baseline.
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  connectivity-check:
+    name: Check runner -> Jenkins reachability
+    runs-on:
+      - x86_64
+      - linux
+      - image_ingest
+    timeout-minutes: 5
+    steps:
+      - name: Resolve + connect to target_url
+        run: |
+          set -u
+          check() {
+            local label="$1" url="$2"
+            [ -z "$url" ] && return 0
+            local host
+            host=$(python3 -c "from urllib.parse import urlparse; print(urlparse('$url').hostname)")
+            echo "::group::${label}: ${url} (host=${host})"
+            echo "-- DNS resolution --"
+            getent hosts "$host" || echo "DNS resolution FAILED for $host"
+            echo "-- HTTP connect (10s timeout) --"
+            # -sS: quiet but show errors. --max-time: hard cap so a hang doesn't
+            # eat the job budget. -o /dev/null: body doesn't matter, just the
+            # connection outcome. -w: surface exit-relevant timing/code data.
+            http_code=$(curl -sS -o /dev/null --max-time 10 \
+              -w 'HTTP %{http_code} | connect=%{time_connect}s total=%{time_total}s\n' \
+              "$url" 2>&1) && rc=0 || rc=$?
+            echo "$http_code"
+            if [ "$rc" -eq 0 ]; then
+              echo "RESULT: connection succeeded (any HTTP status here means TCP connect worked)"
+            else
+              # curl exit codes worth distinguishing: 6=couldn't resolve host,
+              # 7=couldn't connect (refused/unreachable), 28=timed out.
+              echo "RESULT: curl exit code $rc (6=DNS failure, 7=connection refused/unreachable, 28=timeout -- see https://curl.se/libcurl/c/libcurl-errors.html)"
+            fi
+            echo "::endgroup::"
+          }
+          check "target_url" "${{ inputs.target_url }}"
+          check "compare_url" "${{ inputs.compare_url }}"

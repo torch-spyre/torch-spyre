@@ -84,6 +84,7 @@ from torch._inductor.ir import (
     Operation,
     Pointwise,
     Reduction,
+    ReinterpretView,
     StorageBox,
     TensorBox,
 )
@@ -108,6 +109,12 @@ from ..loop_info import (
     copy_op_metadata,
 )
 from ..propagate_hints import get_op_hints
+from .propagate_named_dims import (
+    _DimPropInfo,
+    _get_dim_prop_info,
+    _get_layout,
+    _lone_sym,
+)
 from ..pass_utils import (
     op_out_coords,
     host_coordinates,
@@ -123,11 +130,12 @@ logger = get_inductor_logger("coarse_tile")
 
 
 class _RetiledBufferInfo(NamedTuple):
-    """Host strides before and after a buffer is resized for a coarse tile."""
+    """Host shape/strides before and after a coarse-tile resize."""
 
     old_stride: tuple[Expr, ...]
     new_stride: tuple[Expr, ...]
     old_size: tuple[Expr, ...]
+    new_size: tuple[Expr, ...]
 
 
 class _ReadCopyHoistDecision(enum.Enum):
@@ -991,6 +999,39 @@ def _plan_tiling_propagation(
                             consumer_lookup_name=mut_target_name,
                         )
                         continue
+                    # Locally-created mutation target with NO outside
+                    # consumer and NOT a graph output, but still read by
+                    # another op inside this SAME loop group (e.g. flash
+                    # attention's real_max: copy_forced(running_max,
+                    # real_max) writes real_max, and the *next* tile
+                    # iteration's `torch.maximum(real_max, block_max)` reads
+                    # it back -- a pure intra-loop carry with no reader at
+                    # all outside the loop). Such a target still needs its
+                    # write to land at a fresh per-tile address each
+                    # iteration -- otherwise every iteration after the first
+                    # reads back the wrong (stale/aliased) tile's value.
+                    # There is no separate copy-out to insert (nothing
+                    # outside reads it), so mutation_write_back is the right
+                    # shape: it sets output_tiled_dims on the op's own write
+                    # directly, with no full-buffer allocation.
+                    if mut_target is not None:
+                        in_loop_carry = any(
+                            isinstance(candidate, ComputedBuffer)
+                            and candidate is not op
+                            and _reads_buffer(candidate, mut_target_name)
+                            and name_to_group_outer_key.get(candidate.get_name())
+                            == info.loop_group_id[0]
+                            for candidate in group_ops
+                        )
+                        if in_loop_carry:
+                            full_ranges = _compute_full_ranges_planned(op, info)
+                            info.propagation = PropagationPlan(
+                                kind="mutation_write_back",
+                                full_ranges=full_ranges,
+                                full_strides=tuple(mut_target.layout.stride),
+                                is_graph_output=False,
+                            )
+                            continue
                 info.propagation = PropagationPlan(kind="loop_internal")
                 continue
 
@@ -1029,6 +1070,18 @@ def _zero_reads_of_fixed_buffers_planned(
     there is no reader-before-producer ordering hazard to work around --
     this always sees the complete, final fixed set on its one and only
     pass.
+
+    "mutation_write_back" is deliberately excluded: that kind means the
+    op's own write genuinely advances per iteration (its target -- e.g. a
+    flash-attention running max/denominator carry -- is read back by name
+    on a later iteration, see the in_loop_carry check above), just via the
+    squeezed_advance_output side channel rather than output_tiled_dims
+    when the advancing dim divides to per-tile extent 1. Treating such an
+    op as "fixed" here would zero its own output_tiled_dims (when that
+    happens to be nonempty pre-squeeze) and any sibling's
+    tiled_dims_per_read of it, erasing the only signal
+    _propagate_mutation_write_back and the scratchpad allocator have for
+    routing it away from LX -- see issue #4126.
     """
     fixed_names = {
         op.get_name()
@@ -1036,6 +1089,7 @@ def _zero_reads_of_fixed_buffers_planned(
         if isinstance(op, ComputedBuffer)
         and (info := plan.get(id(op))) is not None
         and info.propagation is not None
+        and info.propagation.kind != "mutation_write_back"
         and any(dims for dims in info.loop_tiled_dims)
     }
     if not fixed_names:
@@ -2075,7 +2129,7 @@ def _divide_ranges(
     _clear_cache(layout, _LAYOUT_FREE_SYMS_KEY)
     _clear_cache(op, _COMPUTED_BUF_FREE_SYMS_KEY)
     retiled_info = (
-        _RetiledBufferInfo(old_stride, tuple(layout.stride), old_size)
+        _RetiledBufferInfo(old_stride, tuple(layout.stride), old_size, tuple(new_size))
         if tiled_dims and old_stride != tuple(layout.stride)
         else None
     )
@@ -2227,7 +2281,10 @@ def _apply_plan(
                 prior = retiled_infos.get(name)
                 retiled_infos[name] = (
                     _RetiledBufferInfo(
-                        prior.old_stride, retiled_info.new_stride, prior.old_size
+                        prior.old_stride,
+                        retiled_info.new_stride,
+                        prior.old_size,
+                        retiled_info.new_size,
                     )
                     if prior is not None
                     else retiled_info
@@ -2743,14 +2800,47 @@ def _propagate_mutation_write_back(
     """
     loop_info = op.loop_info  # type: ignore[attr-defined]
     op_ranges = list(op.data.ranges)  # already divided by _apply_plan
+    mut_target = op.layout.get_buffer()  # type: ignore[attr-defined]
+    full_sizes = list(mut_target.get_size())
+
+    # A raw dim tiled to per-tile extent 1 is squeezed out of op_ranges
+    # entirely -- index_vars_squeeze mints no d{i} symbol for it, so
+    # _tiled_dims_for_dep's dep_dims membership test always drops it no
+    # matter what extent we compute below (issue #4126's real_max/
+    # denominator carries hit exactly this: their B-tile dim divides to
+    # extent 1). Mirror _insert_copy_op's squeezed_advance_output
+    # construction here: for each such dim, record (host_stride, extent)
+    # pairs per tiling level, independent of dep.index's free symbols, so
+    # SpyreKernel._general_tile_advance can add the device-address
+    # contribution as an extra term instead of by substitution.
+    squeeze_pos: dict[int, int] = {}
+    it_idx = 0
+    for host_idx, r in enumerate(op_ranges):
+        if int(r) != 1:
+            squeeze_pos[host_idx] = it_idx
+            it_idx += 1
 
     write_level_extents: list[dict[int, sympy.Expr]] = [
         {} for _ in loop_info.loop_tiled_dims
+    ]
+    squeezed_advance: list[list[tuple[sympy.Expr, sympy.Expr]]] = [
+        [] for _ in loop_info.loop_tiled_dims
     ]
     for d in {d for level in loop_info.loop_tiled_dims for d in level}:
         levels_tiling_d = [
             i for i, dims in enumerate(loop_info.loop_tiled_dims) if d in dims
         ]
+        if d not in squeeze_pos:
+            # Squeezed out of op's own write -- use mut_target's own
+            # (undivided) sizes for the host_stride, not op_ranges (a dim
+            # to the right that is itself tiled has already been divided
+            # down in op_ranges, which would undercount the stride).
+            host_stride = sympy.prod(full_sizes[d + 1 :])
+            running = sympy.Integer(1)
+            for level_idx in reversed(levels_tiling_d):
+                squeezed_advance[level_idx].append((host_stride, running))
+                running = running * loop_info.loop_count[level_idx]
+            continue
         running = sympy.sympify(op_ranges[d])
         for level_idx in reversed(levels_tiling_d):
             write_level_extents[level_idx][d] = running
@@ -2765,11 +2855,14 @@ def _propagate_mutation_write_back(
         else []
     )
     loop_info.output_tiled_dims = output_tiled_dims
+    loop_info.squeezed_advance_output = squeezed_advance if write_deps else []
 
     logger.debug(
-        "coarse_tile: mutation_write_back %s output_tiled_dims=%s",
+        "coarse_tile: mutation_write_back %s output_tiled_dims=%s "
+        "squeezed_advance_output=%s",
         op.get_name(),
         output_tiled_dims,
+        loop_info.squeezed_advance_output,
     )
 
 
@@ -2864,16 +2957,86 @@ def _propagate_tiled_op(
     # reconciling the op's *input* layouts, and there is no compatibility
     # check analogous to finalize_layouts's is_elided/is_carry_into_accum
     # guard on that path.
-    _insert_copy_op(op, full_buf, operations)
-    # The tiled op's own buffer is always loop-internal scratch here: it is
-    # fully drained by the copy op inserted above before the next iteration
-    # overwrites it, so its own write must not advance at any level.
-    loop_info.output_tiled_dims = []
+    _insert_copy_op(
+        op,
+        full_buf,
+        operations,
+        tiled_op_write_advances=propagation.consumer_lookup_name is not None,
+    )
+    if propagation.consumer_lookup_name is not None:
+        # op.layout is MutationLayoutSHOULDREMOVE targeting a pre-existing,
+        # locally-created buffer (e.g. copy_forced(src, acc) where acc is a
+        # loop-carried accumulator also read later, by name, inside the SAME
+        # loop group -- flash-attention's real_max/denominator/output). That
+        # in-loop read already advances per tile (it goes through the normal
+        # read-copy machinery keyed on the mutation target's name), so the
+        # direct write into the target must ALSO advance per tile to stay
+        # consistent with it -- leaving it at [] silently pins every tile's
+        # write to the same address, so tile 1+ never actually lands and the
+        # next iteration's read of the "accumulator" reads back tile 0's
+        # value every time. Use the same write_level_extents math
+        # _propagate_mutation_write_back uses for its own direct write.
+        write_deps = [
+            dep for dep in op.get_read_writes().writes if isinstance(dep, MemoryDep)
+        ]
+        if write_deps:
+            op_ranges = list(op.data.ranges)
+            # A raw dim tiled to per-tile extent 1 (e.g. flash attention's
+            # B-tile dim on real_max/denominator/output) is squeezed out of
+            # op_ranges entirely -- no d{i} symbol survives for it, so
+            # _tiled_dims_for_dep always drops it below no matter what
+            # extent write_level_extents carries. Mirror
+            # _propagate_mutation_write_back's squeezed_advance_output
+            # construction: use full_ranges (op's own undivided sizes, same
+            # raw dim order) for the host_stride of such dims, independent
+            # of dep.index's free symbols.
+            squeeze_pos: dict[int, int] = {}
+            it_idx = 0
+            for host_idx, r in enumerate(op_ranges):
+                if int(r) != 1:
+                    squeeze_pos[host_idx] = it_idx
+                    it_idx += 1
+            write_level_extents: list[dict[int, Expr]] = [
+                {} for _ in loop_info.loop_tiled_dims
+            ]
+            squeezed_advance: list[list[tuple[Expr, Expr]]] = [
+                [] for _ in loop_info.loop_tiled_dims
+            ]
+            for d in {d for level in loop_info.loop_tiled_dims for d in level}:
+                levels_tiling_d = [
+                    i for i, dims in enumerate(loop_info.loop_tiled_dims) if d in dims
+                ]
+                if d not in squeeze_pos:
+                    host_stride = sympy.prod(list(full_ranges)[d + 1 :])
+                    running = sympy.Integer(1)
+                    for level_idx in reversed(levels_tiling_d):
+                        squeezed_advance[level_idx].append((host_stride, running))
+                        running = running * loop_info.loop_count[level_idx]
+                    continue
+                running = sympy.sympify(op_ranges[d])
+                for level_idx in reversed(levels_tiling_d):
+                    write_level_extents[level_idx][d] = running
+                    running = running * loop_info.loop_count[level_idx]
+            loop_info.output_tiled_dims = _tiled_dims_for_dep(
+                write_deps[0], write_level_extents, op
+            )
+            loop_info.squeezed_advance_output = squeezed_advance
+        else:
+            loop_info.output_tiled_dims = []
+    else:
+        # The tiled op's own buffer is loop-internal scratch here: it is
+        # fully drained by the copy op inserted above before the next
+        # iteration overwrites it, so its own write must not advance at any
+        # level.
+        loop_info.output_tiled_dims = []
 
     # Patch outside consumers and graph outputs to read full_buf.
     full_name = full_buf.get_name()
     retile_info = _RetiledBufferInfo(
-        old_stride, tuple(full_buf.layout.stride), old_size
+        old_stride,
+        tuple(full_buf.layout.stride),
+        old_size,
+        tuple(full_buf.layout.size),
     )
     _patch_consumers(
         outside_consumers, read_lookup_name, full_name, operations, retile_info
@@ -3153,6 +3316,7 @@ def _insert_copy_op(
     tiled_op: ComputedBuffer,
     full_buf: ComputedBuffer,
     operations: list[Operation],
+    tiled_op_write_advances: bool = False,
 ) -> None:
     """Insert a copy op after tiled_op that writes each tile into full_buf.
 
@@ -3164,6 +3328,17 @@ def _insert_copy_op(
     into full_buf; loop_tiled_dims being set makes SpyreKernel stamp
     tiled_symbols on the OpSpec and bundle.mlir emit affine.apply for the
     per-iteration output address.
+
+    tiled_op_write_advances must be True when the caller has routed
+    tiled_op's OWN write through a per-tile-advancing target instead of
+    loop-internal scratch -- the `propagation.consumer_lookup_name is not
+    None` case in _propagate_tiled_op, where tiled_op's write lands in a
+    real accumulator buffer (e.g. flash attention's real_max/denominator/
+    output) that a later loop iteration reads back by name and that must
+    therefore actually move each iteration. This copy op's READ side reads
+    that same buffer, so it must advance too, or every iteration reads back
+    tile 0's slice regardless of which tile is current (issue: flash-v2's
+    B-tiled denominator/output collapsing every batch to batch 0's values).
     """
     copy_data = Pointwise(
         device=tiled_op.get_device(),
@@ -3185,13 +3360,61 @@ def _insert_copy_op(
     # (positionally different from tiled_op's).  The read and write sides need
     # DIFFERENT extents, because they address differently sized buffers:
     #
-    # READS re-read tiled_op's already-divided per-tile buffer, which is
-    # scratch reused in place every iteration -- it does not move, so it
-    # must not advance at any level (the copy op is not itself re-divided).
-    # See _fixed_level_extents for why "not advance" means omitting the
-    # dim, not giving it extent 1.
+    # READS normally re-read tiled_op's already-divided per-tile buffer,
+    # which is scratch reused in place every iteration -- it does not move,
+    # so it must not advance at any level (the copy op is not itself
+    # re-divided). See _fixed_level_extents for why "not advance" means
+    # omitting the dim, not giving it extent 1.
+    #
+    # tiled_op_write_advances=True overrides this: the caller has routed
+    # tiled_op's own write into a real per-tile-advancing accumulator
+    # buffer instead of scratch (propagation.consumer_lookup_name is not
+    # None in _propagate_tiled_op -- flash attention's real_max/
+    # denominator/output carried across loop iterations). This copy op
+    # reads that same buffer, so its read must advance in lockstep with
+    # tiled_op's write, using the identical squeeze-aware extents
+    # construction _propagate_tiled_op uses there (a raw dim tiled to
+    # per-tile extent 1, e.g. the B-tile dim, is squeezed out of
+    # tiled_op.data.ranges entirely and must go through squeezed_advance
+    # instead of read_level_extents -- see squeezed_advance_output's
+    # docstring). Leaving this at _fixed_level_extents here silently pins
+    # every iteration's read to tile 0's address: the next iteration's
+    # "fresh" tile read is actually tile 0's stale value every time
+    # (confirmed via test_flash_v2_tile_B: spyre batch 1's entire output
+    # was a verbatim copy of batch 0's).
     tiled_op_info = tiled_op.loop_info  # type: ignore[attr-defined]
-    read_level_extents = _fixed_level_extents(tiled_op_info.loop_tiled_dims)
+    read_squeezed_advance: list[list[tuple[Expr, Expr]]] = [
+        [] for _ in tiled_op_info.loop_tiled_dims
+    ]
+    if tiled_op_write_advances:
+        tiled_op_ranges = list(tiled_op.data.ranges)
+        tiled_op_squeeze_pos: dict[int, int] = {}
+        it_idx = 0
+        for host_idx, r in enumerate(tiled_op_ranges):
+            if int(r) != 1:
+                tiled_op_squeeze_pos[host_idx] = it_idx
+                it_idx += 1
+        read_level_extents: list[dict[int, Expr]] = [
+            {} for _ in tiled_op_info.loop_tiled_dims
+        ]
+        full_sizes_for_read = list(full_buf.get_size())
+        for d in {d for level in tiled_op_info.loop_tiled_dims for d in level}:
+            levels_tiling_d = [
+                i for i, dims in enumerate(tiled_op_info.loop_tiled_dims) if d in dims
+            ]
+            if d not in tiled_op_squeeze_pos:
+                host_stride = sympy.prod(full_sizes_for_read[d + 1 :])
+                running = sympy.Integer(1)
+                for level_idx in reversed(levels_tiling_d):
+                    read_squeezed_advance[level_idx].append((host_stride, running))
+                    running = running * tiled_op_info.loop_count[level_idx]
+                continue
+            running = sympy.sympify(tiled_op_ranges[d])
+            for level_idx in reversed(levels_tiling_d):
+                read_level_extents[level_idx][d] = running
+                running = running * tiled_op_info.loop_count[level_idx]
+    else:
+        read_level_extents = _fixed_level_extents(tiled_op_info.loop_tiled_dims)
     # The WRITE targets full_buf, which is NOT divided, so its store base must
     # advance a whole tile per iteration -- the same real per-level extents
     # plan_coarse_tile_groups derives for an op's own reads/write via
@@ -3311,6 +3534,11 @@ def _insert_copy_op(
         tiled_dims_per_read=tiled_dims_per_read,
         output_tiled_dims=output_tiled_dims,
         squeezed_advance_output=squeezed_advance if copy_writes else [],
+        squeezed_advance_per_read=(
+            [read_squeezed_advance] * len(copy_reads)
+            if tiled_op_write_advances and copy_reads
+            else []
+        ),
     )
 
     V.graph.name_to_buffer[copy_name] = copy_buf
@@ -3384,13 +3612,18 @@ class _NameSwapHandler(WrapperHandler):
     def load(self, name, index):
         if name in self._name_map:
             new_name, full_strides, tile_strides = self._name_map[name]
-            new_index = _rescale_index(index, full_strides, tile_strides)
+            new_index = _rescale_index(
+                index, full_strides, tile_strides, strip_constant=True
+            )
             return super().load(new_name, new_index)
         return super().load(name, index)
 
 
 def _rescale_index(
-    index: Expr, full_strides: list[Expr], tile_strides: list[Expr]
+    index: Expr,
+    full_strides: list[Expr],
+    tile_strides: list[Expr],
+    strip_constant: bool = False,
 ) -> Expr:
     """Rescale an affine index's per-dimension coefficients.
 
@@ -3481,7 +3714,8 @@ def _rescale_index(
     new_index: Expr = sympy.Integer(0)
     for term in sympy.Add.make_args(index):
         if term.is_number:
-            new_index += term
+            if not strip_constant:
+                new_index += term
             continue
         for i, (full_stride, tile_stride) in enumerate(remaining):
             matched, loop_var_part = _divides_evenly(term, full_stride)
@@ -3495,6 +3729,139 @@ def _rescale_index(
                 f"in index {index}; full_strides={full_strides}"
             )
     return new_index
+
+
+def _compute_read_copy_strides(
+    full_sizes: list[Expr],
+    full_strides: list[Expr],
+    copy_sizes: list[Expr],
+) -> list[Expr]:
+    """Resize source strides for a compact read-copy allocation.
+
+    Unlike an ordinary tensor tile, a staged read may cover a proper slice whose
+    extent does not divide the backing buffer (for example, 192 columns from a
+    640-column source).  Preserve the source layout's proportional padding while
+    shrinking each already-processed physical dimension to the copy extent.
+    """
+    copy_strides = [sympy.S.Zero] * len(copy_sizes)
+    dims = [
+        d
+        for d, (size, stride) in enumerate(zip(full_sizes, full_strides))
+        if size != 1 and stride != 0
+    ]
+    dims.sort(key=lambda d: full_strides[d])
+    cumulative_scale: Expr = sympy.S.One
+    for d in dims:
+        resized_stride = sympy.cancel(sympy.sympify(full_strides[d]) / cumulative_scale)
+        if resized_stride.is_integer is False:
+            raise Unsupported(
+                f"source stride {full_strides[d]} at dim {d} cannot be "
+                f"resized by cumulative scale {cumulative_scale}"
+            )
+        if copy_sizes[d] > 1:
+            copy_strides[d] = resized_stride
+        cumulative_scale *= sympy.cancel(
+            sympy.sympify(full_sizes[d]) / sympy.sympify(copy_sizes[d])
+        )
+    return copy_strides
+
+
+def _propagate_read_copy_named_dims(copy_buf: ComputedBuffer, dep: MemoryDep) -> None:
+    """Give a read-copy staging buffer the named dims its source dep carries.
+
+    propagate_named_dims (and assign_dim_hints's cleanup right after it) runs
+    long before coarse_tile inserts read-copy ops, so by this point the global
+    _named_dims size registry has already been cleared and every op-level
+    _dim_prop_info has already been deleted (assign_dim_hints's documented
+    contract) -- only a graph *input* TensorBox still carries one. A copy_buf
+    built here starts with no _dim_prop_info at all: any op that reads the
+    copy instead of the original buffer sees an untracked dim, even when the
+    source was fully named (e.g. via a spyre_hint on the fill that created
+    it). This can't reuse compute_input_named_dims -- it needs the (by-now
+    gone) _named_dims registry to size-match fused/split dims.  A read-copy
+    never fuses or splits dims, though (copy_buf's own ranges are dep's
+    ranges 1:1, in dep.var_names order -- see the tile_ranges construction
+    above), so a plain positional zip of the source's named_dims against its
+    own non-size-1 loop vars (found the same way compute_input_named_dims
+    does, via host_coordinates) is enough, with no size lookups needed.
+    """
+    dpi = _get_dim_prop_info(dep)
+    named_dims = dpi.named_dims if dpi is not None else None
+    if not named_dims:
+        return
+    layout = _get_layout(dep)
+    if layout is None:
+        return
+    coords = host_coordinates(layout, dep, None)
+    remaining = list(named_dims)
+    loop_var_dims: dict[sympy.Symbol, list[str]] = {}
+    for i, coord in enumerate(coords):
+        if not remaining:
+            break
+        if int(layout.size[i]) == 1:
+            continue
+        name = remaining.pop(0)
+        sym = _lone_sym(coord)
+        if sym is not None and sym in dep.ranges:
+            loop_var_dims.setdefault(sym, []).append(name)
+    if not loop_var_dims:
+        return
+    flat_named_dims = []
+    for var_name in dep.var_names:
+        flat_named_dims.extend(loop_var_dims.get(var_name, []))
+    copy_buf._dim_prop_info = _DimPropInfo(  # type: ignore[attr-defined]
+        named_dims=flat_named_dims,
+        loop_var_dims=loop_var_dims,
+    )
+
+
+def _active_full_sizes_from_strides(
+    buffer_sizes: list[Expr],
+    buffer_strides: list[Expr],
+    active_strides: list[Expr],
+) -> list[Expr]:
+    """Recover physical extents for a read's active coordinate dimensions.
+
+    Adjacent active strides determine every inner extent.  The outermost
+    extent normally comes from ``numel / stride`` when the read is through a
+    reshape whose coordinate strides do not occur in the raw buffer layout.
+    That quotient is invalid for a prefix view of padded storage, however: a
+    ``[8, 8192, 128]`` cache may retain the backing allocation's
+    ``[1081344, 128, 1]`` strides (8448 rows per head), making the quotient
+    floor to seven.  When the outer active stride is present in the buffer's
+    own layout, its corresponding logical size is authoritative.
+    """
+    if not active_strides:
+        return []
+
+    order = sorted(range(len(active_strides)), key=lambda k: active_strides[k])
+    result: list[Expr] = [sympy.Integer(0)] * len(active_strides)
+    for pos, k in enumerate(order):
+        if pos + 1 < len(order):
+            result[k] = active_strides[order[pos + 1]] // active_strides[k]
+            continue
+
+        matching_sizes = [
+            size
+            for size, stride in zip(buffer_sizes, buffer_strides, strict=True)
+            if size != 1 and sympy.simplify(stride - active_strides[k]) == 0
+        ]
+        if matching_sizes:
+            # Non-overlapping layouts have at most one non-unit dimension at
+            # a given stride.  Unit dimensions were intentionally ignored.
+            if any(size != matching_sizes[0] for size in matching_sizes[1:]):
+                raise Unsupported(
+                    "cannot infer an unambiguous outer extent for active "
+                    f"stride {active_strides[k]} from sizes {matching_sizes}"
+                )
+            result[k] = matching_sizes[0]
+        else:
+            # No raw-layout stride survives in this coordinate space, so
+            # there is no authoritative padded backing extent to prefer.
+            # This is the dense-reshape fallback: recover the outer extent
+            # from the buffer's logical numel and the view stride.
+            result[k] = sympy.prod(buffer_sizes) // active_strides[k]
+    return result
 
 
 def _insert_one_read_copy(
@@ -3559,6 +3926,13 @@ def _insert_one_read_copy(
     if isinstance(full_buf, StorageBox):
         full_buf = full_buf.data
 
+    # Keep track of the offset already represented by dep.index.  Graph-input
+    # storage offsets are repaired later by propagate_spyre_tensor_layouts(),
+    # after this pre-stickify pass has created the copy.  Unlike an ordinary
+    # lowered op, the generated copy below starts from dep.index directly, so
+    # it must observe any layout-offset change that happens after this point.
+    initial_source_offset = full_buf.layout.offset
+
     # Derive copy buffer strides using compute_tile_stride.
     # dep.size is the full loop iteration space (output + reduction dims) and
     # may have higher rank than the tensor (e.g. for a Reduction reading
@@ -3607,26 +3981,20 @@ def _insert_one_read_copy(
         # [Lq, D] before being read -- full_buf stays 1D/stride=[1] forever,
         # so no stride in its layout equals the viewed coordinate space's
         # per-dim strides). Derive full sizes purely from the active
-        # strides themselves instead: in a dense coordinate space, each
-        # dim's full size is (stride of the next-larger active dim) /
-        # (this dim's own stride), and the outermost active dim's full size
-        # is full_buf's total element count / its own stride -- true
-        # regardless of any reshape, since numel is view-invariant.
+        # strides themselves instead: each inner dim's physical extent is
+        # (stride of the next-larger active dim) / (this dim's own stride).
+        # The helper below resolves the outermost extent from an exact raw
+        # layout-stride match when possible, falling back to numel/stride for
+        # dense reshaped coordinate spaces.  The exact match matters for a
+        # prefix view of padded storage, whose numel excludes the padding.
         active_full_strides = [full_coeff[i] for i in active_idx]
-        order = sorted(range(len(active_idx)), key=lambda k: active_full_strides[k])
-        total_elems = sympy.prod(full_buf.get_size())
-        active_full_sizes: list[Expr] = [sympy.Integer(0)] * len(active_idx)
-        for pos, k in enumerate(order):
-            next_stride = (
-                active_full_strides[order[pos + 1]] if pos + 1 < len(order) else None
-            )
-            active_full_sizes[k] = (
-                total_elems // active_full_strides[k]
-                if next_stride is None
-                else next_stride // active_full_strides[k]
-            )
+        active_full_sizes = _active_full_sizes_from_strides(
+            list(full_buf.get_size()),
+            list(full_buf.get_stride()),
+            active_full_strides,
+        )
         active_tile_ranges = [dep.size[i] for i in active_idx]
-        active_tile_strides = compute_tile_stride(
+        active_tile_strides = _compute_read_copy_strides(
             active_full_sizes, active_full_strides, active_tile_ranges
         )
         # active_tile_strides[i] corresponds to active_idx[i]: both are indexed
@@ -3643,6 +4011,8 @@ def _insert_one_read_copy(
         idx,
         _dep=dep,
         _full_name=full_buf.get_name(),
+        _full_buf=full_buf,
+        _initial_source_offset=initial_source_offset,
         _active_idx=active_idx,
         _compact=compact_invariant,
     ):
@@ -3654,6 +4024,7 @@ def _insert_one_read_copy(
             full_idx = idx
         subs = dict(zip(_dep.var_names, full_idx))
         flat_index = sympy_subs(_dep.index, subs)
+        flat_index += _full_buf.layout.offset - _initial_source_offset
         return V.ops.load(_full_name, flat_index)
 
     # Construct under sizing_op's origins so data.origins is non-empty —
@@ -3846,6 +4217,7 @@ def _insert_one_read_copy(
     copy_buf.origins = sizing_op.origins
     copy_buf.operation_name = copy_name
     copy_op_metadata(sizing_op, copy_buf)
+    _propagate_read_copy_named_dims(copy_buf, dep)
     # This is a new operation with its own iteration space.  The source
     # operation's d0/d1/... names have no positional meaning for the copy, so
     # let work-division planning choose from the copy's actual dimensions.
@@ -4183,6 +4555,14 @@ def _insert_one_read_copy(
         tiled_dims_per_read=tiled_dims_per_read,
         output_tiled_dims=output_tiled_dims,
         squeezed_advance_per_read=[squeezed_advance] if copy_reads else [],
+        # copy_buf's own write is always scratch reused in place every
+        # iteration (never advancing) -- unlike squeezed_advance_per_read
+        # above, there is no fresh per-write computation here to override
+        # sizing_op_info.squeezed_advance_output with, so it must be forced
+        # to [] explicitly or it silently carries over sizing_op's own
+        # (unrelated) output advance via this dataclasses.replace, wrongly
+        # marking this LX write as advancing.
+        squeezed_advance_output=[],
         propagation=PropagationPlan(kind="loop_internal"),
     )
 
@@ -5313,6 +5693,7 @@ def _propagate_tiled_reduction_op(
         tuple(op.layout.stride),
         tuple(accum_full.layout.stride),
         op_size,
+        tuple(accum_full.layout.size),
     )
     _patch_consumers(all_consumers, buf_name, accum_name, operations, retile_info)
     if is_graph_output:
@@ -5437,6 +5818,19 @@ def _patch_consumers(
         if not hasattr(new_consumer, "loop_info"):
             continue
         new_loop_info = new_consumer.loop_info  # type: ignore[attr-defined]
+
+        # A Pass-1 read-copy is different from the original logical
+        # consumers covered below.  _insert_one_read_copy already builds its
+        # tiled_dims_per_read (and squeezed_advance_per_read) as an advancing
+        # read of the full logical source; Pass 3 is only making that source
+        # concrete by renaming the tile-local producer to its full copy-out.
+        # Keep that metadata verbatim.  Recomputing it from the copy op's own
+        # ranges is also structurally invalid when its dependency iteration
+        # space is squeezed relative to the sizing op whose raw dim numbers
+        # loop_tiled_dims retains (for example [[1], [2]] with a rank-2 copy).
+        if new_consumer.get_name().startswith("coarse_tile_read_copy_"):
+            continue
+
         new_reads = [
             r for r in new_consumer.get_read_writes().reads if isinstance(r, MemoryDep)
         ]
@@ -5492,30 +5886,186 @@ def _squeezed_retile_dims(
     derived against this buffer's (by-then tile-local, size-1) layout, so
     ``compute_tile_index``/``_retile_load_index`` has no atom to rescale for
     that dim: rescaling can only touch coefficients already present in the
-    incoming index (see ``_retile_load_index``'s docstring). Restricted to
-    dims where ``new_stride[d] != 0`` -- a dim that stays size-1 (or
-    genuinely strideless) in the new buffer too contributes nothing and
-    needs no term.
+    incoming index (see ``_retile_load_index``'s docstring).
 
-    Also restricted to dims where the *consumer's own* output is non-unit
-    for that raw dim (``consumer.data.ranges[d] != 1``). When the consumer's
-    own output dim is unit-size too (e.g. a coarse-tiled dim of extent 1,
-    such as B=1 when only H is tiled), there is no real loop variable for it
-    anywhere in this trace -- the consumer's own write index squeezes it out
-    exactly like the read did, so its only valid coordinate is the constant
-    0, not a symbol. Minting one anyway causes a name collision with an
-    unrelated, already-present symbol in the same dense numbering scheme
-    (both derived independently, so nothing stops them picking the same
-    name for two different logical slots), silently corrupting that other
-    symbol's coefficient instead of erroring.
+    A nonzero stride does *not* prove that a dimension became real: ordinary
+    contiguous tensors retain nonzero strides on size-one dimensions.  Add a
+    term only for an actual extent transition from one in the tile-local
+    buffer to non-one in the full buffer.  In particular, decode attention's
+    ``[B,H,Lq,D]`` output has ``Lq == 1`` in both buffers; treating its Lq
+    stride as evidence of growth aliases the flattened projection's output-N
+    loop onto Lq and turns a 4K read into a bogus 16M read.
+
+    Re-minting uses a raw producer dimension as a positional consumer output
+    dimension.  That mapping is valid only when the complete shapes agree.
+    Rank-changing or shape-changing views need semantic view metadata to
+    recover a missing coordinate; guessing positionally would silently read
+    the wrong dimension, so reject such a true-growth case explicitly.
     """
-    return [
+    grown_dims = [
         d
         for d in range(len(info.old_size))
         if info.old_size[d] == 1
+        and info.new_size[d] != 1
         and info.new_stride[d] != sympy.S.Zero
-        and int(consumer.data.ranges[d]) != 1
     ]
+    if not grown_dims:
+        return []
+
+    consumer_ranges = tuple(consumer.data.ranges)
+    if len(consumer_ranges) < len(info.new_size):
+        raise Unsupported(
+            "coarse_tile: cannot restore dimensions squeezed from a retiled "
+            "producer through a rank-changing consumer view; "
+            f"producer old_size={info.old_size}, new_size={info.new_size}, "
+            f"consumer ranges={consumer_ranges}, grown_dims={grown_dims}"
+        )
+
+    # A unit consumer axis selects coordinate zero and needs no symbol.  For
+    # every axis that does need a symbol, require the complete output shape to
+    # match the producer shape before treating raw positions as identities.
+    result = [d for d in grown_dims if int(consumer_ranges[d]) != 1]
+    if result and any(
+        sympy.simplify(actual - expected) != 0
+        for actual, expected in zip(consumer_ranges, info.new_size)
+    ):
+        raise Unsupported(
+            "coarse_tile: cannot restore dimensions squeezed from a retiled "
+            "producer through a shape-changing consumer view; "
+            f"producer old_size={info.old_size}, new_size={info.new_size}, "
+            f"consumer ranges={consumer_ranges}, grown_dims={grown_dims}"
+        )
+    return result
+
+
+def _is_dense_full_buffer_view(
+    index: Expr, info: _RetiledBufferInfo, consumer: ComputedBuffer
+) -> bool:
+    """Whether ``index`` already densely addresses the complete new buffer.
+
+    A rank-changing view can flatten a dimension that was unit-sized in the
+    tile but is real in the full buffer.  For example, GQA flattens
+    ``[Hkv=8, group=4]`` into ``[heads=32]``.  Its flattened coefficient is
+    already the full buffer's group stride, so decomposing that coefficient
+    against the tile-local Hkv stride corrupts it.  We can recognize the safe
+    case without view metadata when both layouts are dense and the affine
+    index is a complete, bijective permutation/reshape of the new buffer.
+
+    A missed recognition is safe but conservative: ``False`` keeps the
+    caller on the general retile/``Unsupported`` path rather than accepting
+    an unproven full-buffer mapping.
+    """
+
+    def _equal(lhs: Expr, rhs: Expr) -> bool:
+        return sympy.simplify(lhs - rhs) == 0
+
+    target_dims = [
+        (stride, size)
+        for size, stride in zip(info.new_size, info.new_stride, strict=True)
+        if size != 1
+    ]
+    if any(stride == sympy.S.Zero for stride, _ in target_dims):
+        return False
+    target_dims.sort(key=lambda pair: pair[0])
+    running = sympy.Integer(1)
+    for stride, size in target_dims:
+        if not _equal(stride, running):
+            return False
+        running *= size
+    target_numel = running
+
+    consumer_ranges = tuple(consumer.data.ranges)
+    reduction_ranges = tuple(getattr(consumer.data, "reduction_ranges", None) or ())
+
+    try:
+        atoms, offset = decompose_index_for_tiling(
+            index, {sym: 1 for sym in index.free_symbols}
+        )
+    except Unsupported:
+        return False
+    if offset != 0 or len(atoms) != len(index.free_symbols):
+        return False
+
+    symbol_numbers: dict[sympy.Symbol, int] = {}
+    for _coefficient, symbol in atoms:
+        name = symbol.name
+        split = len(name)
+        while split > 0 and name[split - 1].isdigit():
+            split -= 1
+        if split == len(name):
+            return False
+        symbol_numbers[symbol] = int(name[split:])
+
+    nonunit_ranges = [size for size in consumer_ranges if size != 1]
+    all_ranges = [*consumer_ranges, *reduction_ranges]
+    nonunit_all_ranges = [size for size in all_ranges if size != 1]
+    nonunit_reduction_ranges = [size for size in reduction_ranges if size != 1]
+    extent_maps: list[dict[sympy.Symbol, Expr]] = []
+    # Some retraces preserve raw dimension numbers (_i1/_i2/_i3 when raw dim
+    # 0 is unit), while extract_read_writes renumbers them densely (d0/d1/d2).
+    if all(number < len(consumer_ranges) for number in symbol_numbers.values()):
+        extent_maps.append(
+            {
+                symbol: consumer_ranges[number]
+                for symbol, number in symbol_numbers.items()
+            }
+        )
+    if all(number < len(nonunit_ranges) for number in symbol_numbers.values()):
+        extent_maps.append(
+            {
+                symbol: nonunit_ranges[number]
+                for symbol, number in symbol_numbers.items()
+            }
+        )
+    if all(number < len(all_ranges) for number in symbol_numbers.values()):
+        extent_maps.append(
+            {symbol: all_ranges[number] for symbol, number in symbol_numbers.items()}
+        )
+    if all(number < len(nonunit_all_ranges) for number in symbol_numbers.values()):
+        extent_maps.append(
+            {
+                symbol: nonunit_all_ranges[number]
+                for symbol, number in symbol_numbers.items()
+            }
+        )
+    # Some inner_fn traces use an independent r0/r1/... namespace for
+    # reduction indices rather than continuing the d-numbering after outputs.
+    if all(
+        symbol.name.lstrip("_").startswith("r") and number < len(reduction_ranges)
+        for symbol, number in symbol_numbers.items()
+    ):
+        extent_maps.append(
+            {
+                symbol: reduction_ranges[number]
+                for symbol, number in symbol_numbers.items()
+            }
+        )
+    if all(
+        symbol.name.lstrip("_").startswith("r")
+        and number < len(nonunit_reduction_ranges)
+        for symbol, number in symbol_numbers.items()
+    ):
+        extent_maps.append(
+            {
+                symbol: nonunit_reduction_ranges[number]
+                for symbol, number in symbol_numbers.items()
+            }
+        )
+
+    for extent_map in extent_maps:
+        indexed_dims = sorted(
+            ((coefficient, extent_map[symbol]) for coefficient, symbol in atoms),
+            key=lambda pair: pair[0],
+        )
+        running = sympy.Integer(1)
+        for coefficient, extent in indexed_dims:
+            if not _equal(coefficient, running):
+                break
+            running *= extent
+        else:
+            if _equal(running, target_numel):
+                return True
+    return False
 
 
 def _index_var_prefix(free_symbols: "OrderedSet[Expr] | set[Expr]") -> str:
@@ -5535,7 +6085,7 @@ def _index_var_prefix(free_symbols: "OrderedSet[Expr] | set[Expr]") -> str:
     from any sibling symbol already present in the index instead of
     assuming one.
     """
-    for sym in free_symbols:
+    for sym in sorted(free_symbols, key=str):
         name = sym.name
         i = len(name)
         while i > 0 and name[i - 1].isdigit():
@@ -5619,7 +6169,13 @@ def _index_already_at_new_scale(
         if s != 1 and t != 0
     ]
     old_set = {info.old_stride[d] for d in dims}
-    new_set = {info.new_stride[d] for d in dims}
+    # A dimension that a later nested tiling level squeezes to one has a zero
+    # final stride.  It cannot contribute an atom to an already-retiled load,
+    # so including that zero in ``new_set`` makes the equality test fail and
+    # causes the fresh index to be rewritten a second time.  In GQA this
+    # misidentifies the surviving Hkv coefficient as the now-squeezed group
+    # coefficient and drops Hkv from every downstream read.
+    new_set = {info.new_stride[d] for d in dims if info.new_stride[d] != sympy.S.Zero}
     return coeffs == new_set and coeffs != old_set
 
 
@@ -5628,13 +6184,22 @@ def _retile_load_index(
     index: Expr,
     info: _RetiledBufferInfo,
     consumer: "ComputedBuffer | None" = None,
+    preserve_target_stride_atoms: bool = False,
 ) -> Expr:
     """Rewrite a load index using compute_tile_index.  Raises Unsupported if
     the index cannot be decomposed (non-affine, or stride not in info.old_stride).
 
     Used by _RetileLoadIndexHandler and _NameAndIndexSwapHandler during real
-    codegen.  In both cases the incoming index has coefficients equal to
-    info.old_stride and the call rewrites them to info.new_stride.
+    codegen.  Most incoming index coefficients are expressed in
+    ``info.old_stride`` and are rewritten to ``info.new_stride``.  An outside
+    view can, however, derive some coefficients from the full destination
+    layout before its producer is redirected.  In the tile-to-full direction,
+    ``preserve_target_stride_atoms`` keeps an atom whose coefficient exactly
+    matches an unambiguous regular ``new_stride`` entry and exceeds the source
+    tile's maximum physical offset (proving that it cannot be source-local).
+    Remaining atoms still use ``compute_tile_index`` so view-combined
+    tile-local coefficients retain the general decomposition supported by that
+    helper.
 
     When ``consumer`` is given AND has no loop_info of its own (i.e. it is an
     "outside" consumer with no enclosing coarse-tile loop nest), any dim
@@ -5672,9 +6237,18 @@ def _retile_load_index(
     """
 
     loop_syms = index.free_symbols
-    if not loop_syms:
+    dense_full_view = (
+        consumer is not None
+        and preserve_target_stride_atoms
+        and _is_dense_full_buffer_view(index, info, consumer)
+    )
+    if dense_full_view:
         new_index = index
-    elif _index_already_at_new_scale(index, loop_syms, info):
+    elif not loop_syms:
+        new_index = index
+    elif not preserve_target_stride_atoms and _index_already_at_new_scale(
+        index, loop_syms, info
+    ):
         # This consumer's index was traced *after* the producer's layout was
         # already mutated to new_stride (e.g. built/retraced during Pass
         # 1/2/3, from a same-name replacement object resynced into group_ops
@@ -5685,15 +6259,51 @@ def _retile_load_index(
         # issue found via test_copy_running_max_4d_H4_Lq4.
         new_index = index
     else:
+        index_to_retile = index
+        preserved_index = sympy.S.Zero
+        if preserve_target_stride_atoms:
+            source_max_offset = sympy.simplify(
+                sum(
+                    (old_size - 1) * old_stride
+                    for old_size, old_stride in zip(info.old_size, info.old_stride)
+                    if old_size != 1 and old_stride != sympy.S.Zero
+                )
+            )
+            regular_source_strides = {
+                sympy.simplify(old_stride)
+                for old_size, old_stride in zip(info.old_size, info.old_stride)
+                if old_size != 1 and old_stride != sympy.S.Zero
+            }
+            regular_target_strides = {
+                sympy.simplify(new_stride)
+                for new_size, new_stride in zip(info.new_size, info.new_stride)
+                if new_size != 1
+                and new_stride != sympy.S.Zero
+                and sympy.simplify(new_stride) not in regular_source_strides
+            }
+            for term in index.as_ordered_terms():
+                term_syms = term.free_symbols & loop_syms
+                if len(term_syms) != 1:
+                    continue
+                sym = next(iter(term_syms))
+                coeff = sympy.simplify(term.coeff(sym))
+                exceeds_source_span = sympy.simplify(
+                    coeff - source_max_offset
+                ).is_positive
+                if coeff in regular_target_strides and exceeds_source_span is True:
+                    preserved_index += term
+            index_to_retile = sympy.expand(index - preserved_index)
+
         new_index = compute_tile_index(
-            index,
+            index_to_retile,
             {sym: 1 for sym in loop_syms},
             info.old_size,
             info.old_stride,
             info.new_stride,
         )
+        new_index += preserved_index
 
-    if consumer is not None:
+    if consumer is not None and not dense_full_view:
         for d in _squeezed_retile_dims(info, consumer):
             # A consumer read by multiple _patch_consumers redirects (e.g.
             # buf24 reading both a _divide_ranges-mutated buffer and a
@@ -5721,10 +6331,15 @@ def _retile_load_index(
                 new_index += sym * info.new_stride[d]
 
     logger.debug(
-        "coarse_tile: retiled load index for %s: %s -> %s",
+        "coarse_tile: retiled load index for %s: %s -> %s "
+        "(old_size=%s old_stride=%s new_size=%s new_stride=%s)",
         buf_name,
         index,
         new_index,
+        info.old_size,
+        info.old_stride,
+        info.new_size,
+        info.new_stride,
     )
     return new_index
 
@@ -5769,7 +6384,11 @@ class _NameAndIndexSwapHandler(WrapperHandler):
     def load(self, name, index):
         if name in self._infos_by_old_name:
             index = _retile_load_index(
-                name, index, self._infos_by_old_name[name], self._consumer
+                name,
+                index,
+                self._infos_by_old_name[name],
+                self._consumer,
+                preserve_target_stride_atoms=True,
             )
         return super().load(self._name_map.get(name, name), index)
 
@@ -5852,7 +6471,19 @@ def _patch_retiled_load_indexes(
 
 
 def _patch_graph_outputs(old_name: str, new_buf: ComputedBuffer) -> None:
-    """Replace references to old_name in V.graph.graph_outputs with new_buf."""
+    """Replace references to old_name in V.graph.graph_outputs with new_buf.
+
+    A graph output is often not the tiled op's ComputedBuffer directly, but a
+    ReinterpretView over it (e.g. from a trailing unsqueeze/view the caller
+    applied to the reduction's result) wrapping a StorageBox wrapping the
+    ComputedBuffer. That ReinterpretView's own layout is computed from the
+    op's true (pre-coarse-tiling) shape, so it already describes the correct
+    full-sized addressing -- only its underlying storage still points at the
+    tile-local scratch buffer. Unwrap through StorageBox *and*
+    ReinterpretView, and when a ReinterpretView is found, repoint its own
+    `.data` in place (preserving its layout) rather than substituting a bare
+    TensorBox that would discard the view's reshape/stride.
+    """
     try:
         outputs = V.graph.graph_outputs
     except Exception:
@@ -5860,10 +6491,21 @@ def _patch_graph_outputs(old_name: str, new_buf: ComputedBuffer) -> None:
 
     new_tb = TensorBox(StorageBox(new_buf))
     for i, out in enumerate(outputs):
-        # Unwrap StorageBox layers to reach ComputedBuffer without going into
-        # the ComputedBuffer's inner data (Pointwise / Reduction).
+        # Unwrap StorageBox/ReinterpretView layers to reach ComputedBuffer
+        # without going into the ComputedBuffer's inner data (Pointwise /
+        # Reduction). Track the last ReinterpretView seen so we can patch its
+        # storage in place instead of discarding its view metadata.
         candidate = out
-        while isinstance(candidate, StorageBox):
+        last_reinterpret_view = None
+        while isinstance(candidate, (StorageBox, ReinterpretView)):
+            if isinstance(candidate, ReinterpretView):
+                last_reinterpret_view = candidate
             candidate = candidate.data
-        if isinstance(candidate, ComputedBuffer) and candidate.get_name() == old_name:
+        if not (
+            isinstance(candidate, ComputedBuffer) and candidate.get_name() == old_name
+        ):
+            continue
+        if last_reinterpret_view is not None:
+            object.__setattr__(last_reinterpret_view, "data", StorageBox(new_buf))
+        else:
             outputs[i] = new_tb

@@ -18,18 +18,21 @@ from typing import Any, Optional
 from torch._inductor.dependencies import MemoryDep
 from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import (
+    ExternKernel,
     Operation,
     IRNode,
     Pointwise,
 )
 from torch._inductor.virtualized import V
 from torch._inductor.ops_handler import WrapperHandler
+from torch.utils._sympy.value_ranges import ValueRanges, bound_sympy
 
 import sympy
 
-from torch_spyre._inductor import config
+from torch_spyre._C import get_device_size_in_bytes
 from torch_spyre._inductor.ir import FixedTiledLayout
 from torch_spyre._inductor.pass_utils import (
+    PerCoreView,
     _per_core_view_on_buf,
     concretize_expr,
     op_read_writes,
@@ -121,6 +124,7 @@ def counted_loop_lifetime_end_overrides(graph: GraphLowering) -> dict[str, int]:
         name: () for name in graph.graph_input_names
     }
     last_access: dict[str, int] = {}
+    last_read: dict[str, int] = {}
 
     for index, op in enumerate(graph.operations):
         path = group_path(op)
@@ -133,8 +137,10 @@ def counted_loop_lifetime_end_overrides(graph: GraphLowering) -> dict[str, int]:
         for dep in rw.reads:
             birth_group.setdefault(dep.name, ())
             last_access[dep.name] = index
+            last_read[dep.name] = index
 
     overrides: dict[str, int] = {}
+    crossed_loops: set[tuple[int, ...]] = set()
     for index, op in enumerate(graph.operations):
         consumer_path = group_path(op)
         if not consumer_path:
@@ -154,6 +160,34 @@ def counted_loop_lifetime_end_overrides(graph: GraphLowering) -> dict[str, int]:
             end = loop_end[enclosing_loop] + 1
             if end > last_access.get(dep.name, index) + 1:
                 overrides[dep.name] = max(overrides.get(dep.name, 0), end)
+                crossed_loops.add(enclosing_loop)
+
+    # A value that crosses `enclosing_loop`'s boundary (above) must stay valid
+    # across every runtime iteration of that loop. But the graph holds only one
+    # textual copy of the loop body, so any OTHER value that is born and fully
+    # consumed entirely inside that same loop looks, under plain liveness, like
+    # it occupies a short, disjoint tick range that never overlaps the
+    # crossing value's -- even though that loop-local value is actually
+    # rewritten fresh on every iteration, including iterations after the one
+    # the crossing value's own reads happen to fall in. Sharing an LX address
+    # between the two is therefore unsafe: a later iteration's rewrite of the
+    # loop-local value can land between two of the crossing value's reads and
+    # clobber it. Extending the loop-local value's own end_time to also cover
+    # the whole loop forces `overlaps_in_time` to see the conflict for every
+    # solver, instead of leaving it to placement-order luck. A value that is
+    # never read again by anything (write-only) cannot be clobbered before its
+    # next read -- it has none -- so only values with at least one recorded
+    # read are candidates here; `last_read`, not `last_access`, decides
+    # whether that read already falls before the loop's end.
+    if crossed_loops:
+        for name, path in birth_group.items():
+            if name not in last_read:
+                continue
+            for loop in crossed_loops:
+                if path[: len(loop)] == loop:
+                    end = loop_end[loop] + 1
+                    if end > last_read[name] + 1:
+                        overrides[name] = max(overrides.get(name, 0), end)
     return overrides
 
 
@@ -170,7 +204,7 @@ def mem_usage_by_buf(
     """
     # The mismatch reasons are surfaced by the residency path; here only the
     # per-buffer core count (with -1 marking a mismatch) drives mem_usage.
-    num_cores_per_op, _ = get_ncores_for_buffers(graph, cache)
+    num_cores_per_op, _, _ = get_ncores_for_buffers(graph, cache)
     mem_usage: dict = {}
 
     for op in graph.operations:
@@ -202,9 +236,7 @@ def mem_usage_by_buf(
             }
             continue
         dev_layout = layout.device_layout
-        dev_size = (
-            math.prod(dev_layout.device_size[:-1]) * 128
-        )  # num_sticks * bytes_per_stick
+        dev_size = get_device_size_in_bytes(dev_layout)
         mem_usage[buf_name] = {
             "size": dev_size,
             "size_per_core": dev_size // num_cores,
@@ -213,6 +245,24 @@ def mem_usage_by_buf(
         }
 
     return mem_usage
+
+
+def is_empty_tiled_layout(layout: object) -> bool:
+    """A valid empty tensor needs no LX placement or input clone.
+
+    Native stickification preserves zero outer extents. Do not confuse those
+    with malformed negative extents, a missing stick axis, or a zero physical
+    extent on a logically nonempty tensor: those still need strict validation.
+    """
+    if not isinstance(layout, FixedTiledLayout) or 0 not in layout.size:
+        return False
+    device_size = layout.device_layout.device_size
+    return (
+        bool(device_size)
+        and device_size[-1] > 0
+        and all(extent >= 0 for extent in device_size)
+        and 0 in device_size[:-1]
+    )
 
 
 def buffer_not_read_in_full(graph: GraphLowering, buf_name: str) -> bool:
@@ -285,6 +335,17 @@ def _is_tiled_advancing(op: Operation) -> bool:
     all. A loop-internal buffer (e.g. drained by a copy op every iteration)
     can be tiled yet have its own write pinned at a fixed address; such a
     buffer is LX-eligible.
+
+    Also checks ``squeezed_advance_output``: a dim tiled down to per-tile
+    extent 1 (e.g. a coarse-tiled batch dim with one tile per iteration) is
+    squeezed out of the write's own index entirely, so it never appears in
+    ``output_tiled_dims`` even though the write's device address genuinely
+    advances every iteration (see ``loop_info.py``'s
+    ``squeezed_advance_output`` docstring). Missing this let a
+    mutation_write_back accumulator (e.g. flash attention's running max/
+    denominator carry) reside in LX, where the advance later crashed --
+    or, if the crash path were ever bypassed, silently pinned every
+    iteration to the same address.
     """
     layout = getattr(op, "layout", None)
     if not isinstance(layout, FixedTiledLayout):
@@ -292,7 +353,10 @@ def _is_tiled_advancing(op: Operation) -> bool:
     loop_info = getattr(op, "loop_info", None)
     if loop_info is None:
         return False
-    return any(dims for dims in loop_info.output_tiled_dims)
+    if any(dims for dims in loop_info.output_tiled_dims):
+        return True
+    squeezed_advance_output = getattr(loop_info, "squeezed_advance_output", None) or []
+    return any(level for level in squeezed_advance_output)
 
 
 def _is_read_advancing_anywhere(
@@ -339,6 +403,19 @@ def _is_read_advancing_anywhere(
         # continue` never contributes a term for such a level, so the
         # resulting device_tile_advance_expr is None, not merely small.
         if any(loop_info.tiled_dims_per_read[dep_idx]):
+            return True
+        # Mirror _is_tiled_advancing's squeezed_advance_output check on the
+        # read side: a dim tiled down to per-tile extent 1 is squeezed out
+        # of this read's own index, so it never appears in
+        # tiled_dims_per_read even though the read's device address
+        # genuinely advances every iteration (see loop_info.py's
+        # squeezed_advance_per_read docstring).
+        squeezed_advance_per_read = (
+            getattr(loop_info, "squeezed_advance_per_read", None) or []
+        )
+        if dep_idx < len(squeezed_advance_per_read) and any(
+            squeezed_advance_per_read[dep_idx]
+        ):
             return True
     return False
 
@@ -460,17 +537,20 @@ def _get_buffer_user_deps(
 def _op_num_cores(op: Operation) -> int:
     """Cores implied by symbol-keyed ownership (defaults to one)."""
     ownership = getattr(op, "iteration_space_ownership", None)
-    return math.prod(ownership.work_slices.values()) if ownership is not None else 1
+    return ownership.physical_core_count if ownership is not None else 1
 
 
 def get_ncores_for_buffers(
     graph: GraphLowering, cache: Optional[dict] = None
-) -> tuple[dict[str, int], dict[str, str]]:
+) -> tuple[dict[str, int], dict[str, str], dict[str, PerCoreView]]:
     """
-    Return ``(num_cores, mismatch_reasons)``, where ``num_cores`` maps each
+    Return ``(num_cores, mismatch_reasons, accepted_views)``, where ``num_cores`` maps each
     buffer name to the number of cores used by all the operations that use the
     buffer (``-1`` on a core-division mismatch) and ``mismatch_reasons`` maps
-    each mismatched buffer name to a human-readable reason for the ``-1``.
+    each mismatched buffer name to a human-readable reason for the ``-1``, and
+    ``accepted_views`` carries the exact physical view approved by the judge.
+
+    Run before allocator post-optimization passes add dump/restore writes.
 
     Pass an optional `cache` dict to memoize `_per_core_view_on_buf`
     results across calls (e.g. across co-opt search leaves). Safe to
@@ -479,81 +559,107 @@ def get_ncores_for_buffers(
     """
     result: dict[str, int] = {}
     mismatch_reasons_cache: dict[str, str] = {}
-    using_multicore = config.sencores > 1
+    accepted_views: dict[str, PerCoreView] = {}
     buf_user_deps = _get_buffer_user_deps(graph)
     for buf_name, users in buf_user_deps.items():
+        layout = getattr(graph.try_get_buffer(buf_name), "layout", None)
+        if is_empty_tiled_layout(layout):
+            # Reject before the unsplit whole-buffer view shortcut and before
+            # positive-partition footprint measurement. The existing rejection
+            # state also prevents publishing an LX view for an input clone.
+            result[buf_name] = -1
+            mismatch_reasons_cache[buf_name] = "empty tensor"
+            continue
         # this dict includes graph input and output
-        if using_multicore and len(users) > 1:
-            # A K-split-reduction writer leaves partial sums on most cores (only
-            # k-last cores hold the final value), so it's unsafe on LX even if
-            # geometry matches — the `flag` gate applies to write-deps only.
-            ref_view = None
-            ref_op_name = None
-            mismatch_reason = None
-            writer_cores = None
-            for op, dep in users:
-                view, flag, _ = _per_core_view_on_buf(op, dep, buf_name, cache)
-                if ref_view is None:
-                    ref_view = view
-                op_rw = op_read_writes(op)
-                if dep in op_rw.writes:
-                    # Size by the writer's core count (the writer sets per-core
-                    # footprint size/writer_cores; readers touch only their slice),
-                    # not max() over users. One writer per buffer (it's named after
-                    # its producing op; an in-place op recurs as a reader, not a
-                    # second writer). _op_num_cores folds in K-split factors, an
-                    # unfaithful output divisor — but a K-split sets `flag` and is
-                    # rejected below, so writer_cores divides only for output splits.
-                    writer_cores = _op_num_cores(op)
-                    if flag:
-                        mismatch_reason = f"K-split writer '{op.get_name()}'"
-                        break
-                else:
-                    # Broadcast-read guard. `view` is how this consumer slices the
-                    # buffer; its core count is the product of the split factors.
-                    # When a consumer splits an iteration axis the buffer does not
-                    # have (e.g. a GEMM's free/N dim over a shared activation, or
-                    # its M dim over a shared weight), that split contracts out of
-                    # the view, so the view covers fewer cores than the op runs.
-                    # An LX (per-core scratchpad) buffer would then live on
-                    # view_cores cores but be read by op_cores; the cores without
-                    # a local copy read stale scratchpad -> wrong results. There is
-                    # no single-base LX broadcast, so treat it as a core-division
-                    # mismatch and keep the buffer in HBM (correct, just unpinned).
-                    # This is not writer-relative: it catches broadcast reads even
-                    # when the buffer has no in-graph writer (a graph input cloned
-                    # into LX) or when a producer's view happens to match the
-                    # broadcast footprint -- cases the `view != ref_view` check
-                    # below cannot see.
-                    # work_slice_dims entries are (device-dim, split factor);
-                    # the per-dim core count is the split factor.
-                    view_cores = math.prod(f for _, f in view.work_slice_dims)
-                    if view_cores != _op_num_cores(op):
-                        mismatch_reason = (
-                            f"broadcast read on '{op.get_name()}': view covers "
-                            f"{view_cores} cores but op runs {_op_num_cores(op)}"
-                        )
-                        break
-                if view != ref_view:
+        if any(isinstance(user, ExternKernel) for user, _ in users):
+            # An opaque operation needs a materialized HBM tensor as its own
+            # argument or result, even on one core. Dump/restore protects other
+            # LX buffers merely live across that call; it does not change this
+            # direct-operand contract.
+            result[buf_name] = -1
+            mismatch_reasons_cache[buf_name] = (
+                f"FallbackKernel/ExternKernel user among {[u.get_name() for u, _ in users]}"
+            )
+            continue
+        # _get_buffer_user_deps creates an entry only while appending its first
+        # dependency, so every value in this dictionary is non-empty.
+        # A K-split-reduction writer leaves partial sums on most cores (only
+        # k-last cores hold the final value), so it's unsafe on LX even if
+        # geometry matches — the `flag` gate applies to write-deps only.
+        ref_view = None
+        ref_op_name = None
+        mismatch_reason = None
+        writer_cores = None
+        for op, dep in users:
+            view, flag, representable = _per_core_view_on_buf(op, dep, buf_name, cache)
+            if not representable:
+                mismatch_reason = (
+                    f"ownership on '{op.get_name()}' cannot be represented "
+                    "by the physical buffer layout"
+                )
+                break
+            if ref_view is None:
+                ref_view = view
+                ref_op_name = op.get_name()
+            op_rw = op_read_writes(op)
+            if dep in op_rw.writes:
+                # Size by the writer's core count (the writer sets per-core
+                # footprint size/writer_cores; readers touch only their slice),
+                # not max() over users. One writer per buffer (it's named after
+                # its producing op; an in-place op recurs as a reader, not a
+                # second writer). _op_num_cores folds in K-split factors, an
+                # unfaithful output divisor — but a K-split sets `flag` and is
+                # rejected below, so writer_cores divides only for output splits.
+                writer_cores = _op_num_cores(op)
+                if flag:
+                    mismatch_reason = f"K-split writer '{op.get_name()}'"
+                    break
+            else:
+                # Broadcast-read guard. `view` is how this consumer slices the
+                # buffer; its core count is the product of the split factors.
+                # When a consumer splits an iteration axis the buffer does not
+                # have (e.g. a GEMM's free/N dim over a shared activation, or
+                # its M dim over a shared weight), that split contracts out of
+                # the view, so the view covers fewer cores than the op runs.
+                # An LX (per-core scratchpad) buffer would then live on
+                # view_cores cores but be read by op_cores; the cores without
+                # a local copy read stale scratchpad -> wrong results. There is
+                # no single-base LX broadcast, so treat it as a core-division
+                # mismatch and keep the buffer in HBM (correct, just unpinned).
+                # This is not writer-relative: it catches broadcast reads even
+                # when the buffer has no in-graph writer (a graph input cloned
+                # into LX) or when a producer's view happens to match the
+                # broadcast footprint -- cases the partition-equivalence
+                # check below cannot see.
+                # work_slice_dims entries are (device-dim, split factor);
+                # the per-dim core count is the split factor.
+                view_cores = math.prod(f for _, f in view.work_slice_dims)
+                if view_cores != _op_num_cores(op):
                     mismatch_reason = (
-                        f"op '{ref_op_name}' ref {ref_view} != '{op.get_name()}' {view}"
+                        f"broadcast read on '{op.get_name()}': view covers "
+                        f"{view_cores} cores but op runs {_op_num_cores(op)}"
                     )
                     break
-            if mismatch_reason is not None:
-                num_cores = -1
-                mismatch_reasons_cache[buf_name] = mismatch_reason
-            elif writer_cores is not None:
-                num_cores = writer_cores
-            else:
-                # No writer (graph input, produced outside the graph): fall back
-                # to the users' (matching) max count.
-                num_cores = max(_op_num_cores(op) for op, _ in users)
-        elif using_multicore:
-            num_cores = _op_num_cores(users[0][0])
+            if ref_view is not None and not view.same_partition(ref_view):
+                mismatch_reason = (
+                    f"op '{ref_op_name}' ref {ref_view} != '{op.get_name()}' {view}"
+                )
+                break
+        if mismatch_reason is not None:
+            num_cores = -1
+            mismatch_reasons_cache[buf_name] = mismatch_reason
         else:
-            num_cores = 1
+            # No writer (graph input, produced outside the graph): fall back
+            # to the users' (matching) max count.
+            num_cores = (
+                writer_cores
+                if writer_cores is not None
+                else max(_op_num_cores(op) for op, _ in users)
+            )
+            assert ref_view is not None
+            accepted_views[buf_name] = ref_view
         result[buf_name] = num_cores
-    return result, mismatch_reasons_cache
+    return result, mismatch_reasons_cache, accepted_views
 
 
 class _GetLoadStoreIndices(WrapperHandler):
@@ -624,9 +730,26 @@ def _would_produce_lx_back_gap(
                     if device_size[d] > 1:
                         return True
                     continue
-                sym = next(iter(syms))
-                it_dim_size = int(dep.ranges[sym])
-                if device_size[d] > it_dim_size:
+                if any(sym not in dep.ranges for sym in syms):
+                    continue
+                # A device coordinate may be walked by several iteration symbols
+                # (``2*d0 + floor(d2/64)``), so the covered extent is the
+                # expression's upper bound over their ranges, not one symbol's
+                # range. Picking one out of the ``free_symbols`` *set* also made
+                # the verdict depend on PYTHONHASHSEED.
+                covered = (
+                    int(
+                        bound_sympy(
+                            coord_expr,
+                            {
+                                sym: ValueRanges(0, int(dep.ranges[sym]) - 1)
+                                for sym in syms
+                            },
+                        ).upper
+                    )
+                    + 1
+                )
+                if device_size[d] > covered:
                     return True
     return False
 

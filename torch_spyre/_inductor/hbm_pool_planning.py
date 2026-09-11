@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import math
 from typing import Callable
 from sympy import Symbol
 from torch._inductor.scheduler import (
@@ -23,6 +22,7 @@ from torch._inductor.scheduler import (
 )
 from torch._inductor.ir import FallbackKernel
 from torch._inductor.virtualized import V
+from torch_spyre._C import get_device_size_in_bytes
 from .constants import MAX_POOL_SIZE_BYTES, INTERMEDIATES_SEGMENT
 from .ir import FixedTiledLayout, SpyreEmptyFallback
 from .logging_utils import get_inductor_logger
@@ -30,7 +30,9 @@ from .scheduler import CountedLoopSchedulerNode
 from . import config
 
 logger = get_inductor_logger("HBM_POOL_PLANNING")
-_STICK_BYTES = 128
+
+# Address alignment required by the native allocator, not a data-format size.
+_HBM_ALLOCATION_ALIGNMENT_BYTES = 128
 _BYTES_PER_GB = 1024**3
 
 
@@ -116,9 +118,8 @@ def _compute_size_bytes(name: str) -> int:
         f"hbm_pool_planning: expected FixedTiledLayout for {name}, got {type(layout)}"
     )
     dev_layout = layout.device_layout
-    num_sticks = math.prod(dev_layout.device_size[:-1])
-    size_bytes = num_sticks * _STICK_BYTES
-    return _align_up(size_bytes, _STICK_BYTES)
+    size_bytes = get_device_size_in_bytes(dev_layout)
+    return _align_up(size_bytes, _HBM_ALLOCATION_ALIGNMENT_BYTES)
 
 
 def _compute_live_ranges(
@@ -320,17 +321,27 @@ def hbm_pool_planning(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]
     # aliased names (see _alloc_id) are attributed to the same underlying
     # storage even though they share no name-based dependency edge.
     #
-    # Deliberately write-keyed only: the sole Inductor mechanism that makes
-    # two distinct buffer names share the literal id(layout.allocation)
-    # object is MutationLayoutSHOULDREMOVE, which always attaches to a
-    # write (set via `src.data.layout = MutationLayoutSHOULDREMOVE(dst)` in
-    # Inductor's realize_into/mark_buffer_mutated) -- so walking .writes
-    # alone is provably complete. Inductor's read-only aliasing mechanism
-    # (NonOwningLayout, used for views) builds a new Layout object rather
-    # than sharing one, and such buffers are excluded from pool eligibility
-    # entirely by the isinstance(layout, FixedTiledLayout) checks in
-    # _is_intermediate/_alloc_id, independent of bundle analysis.
+    # The sole Inductor mechanism that makes two distinct buffer names
+    # share the literal id(layout.allocation) object is
+    # MutationLayoutSHOULDREMOVE, which always attaches to a write (set via
+    # `src.data.layout = MutationLayoutSHOULDREMOVE(dst)` in Inductor's
+    # realize_into/mark_buffer_mutated). Inductor's read-only aliasing
+    # mechanism (NonOwningLayout, used for views) builds a new Layout object
+    # rather than sharing one, and such buffers are excluded from pool
+    # eligibility entirely by the isinstance(layout, FixedTiledLayout) checks
+    # in _is_intermediate/_alloc_id, independent of bundle analysis.
     alloc_id_bundles: dict[int, set[str]] = {}
+    # id(layout.allocation) -> every bundle that READ a name resolving to
+    # that allocation dict.  Required, not merely symmetric with the writer
+    # map above: assigning a pool offset writes into the shared allocation
+    # dict (`layout.allocation["hbm_pool"] = offset` below), which relocates
+    # EVERY name resolving to it -- including names that were never pool
+    # candidates and so were never passed to _is_cross_bundle. A co-allocated
+    # sibling read by another bundle would then be addressed pool-relative in
+    # a bundle that owns no pool, tripping generate_bundle's pool_size
+    # assertion. Keying reads by allocation lets _is_cross_bundle reject the
+    # whole allocation when any name on it is read outside its writer.
+    alloc_id_reader_bundles: dict[int, set[str]] = {}
 
     for bundle in nodes:
         bundle_name = bundle.get_name()
@@ -348,6 +359,10 @@ def hbm_pool_planning(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]
             for dep in node.read_writes.reads:
                 if dep.name not in graph_inputs:
                     buffer_reader_bundles.setdefault(dep.name, set()).add(bundle_name)
+                    if (alloc_id := _alloc_id(dep.name)) is not None:
+                        alloc_id_reader_bundles.setdefault(alloc_id, set()).add(
+                            bundle_name
+                        )
         # SpyreEmptyFallback nodes allocate a buffer but emit no dep-tracked
         # write, so they never appear via the dep walk above.  Collect them
         # explicitly, using the underlying buffer's name (node.node.get_name())
@@ -389,8 +404,25 @@ def hbm_pool_planning(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]
                 sorted(alloc_id_bundles[alloc_id]),
             )
             return True
-        readers = buffer_reader_bundles.get(name, set())
         writer = buffer_writer_bundle.get(name)
+        if alloc_id is not None:
+            # Allocation-scoped, not name-scoped: pooling this name writes
+            # the offset into the allocation dict every co-allocated name
+            # shares, so a read of ANY of those names from another bundle
+            # makes the whole allocation ineligible -- the sibling is not
+            # itself a candidate and would never be checked on its own.
+            alias_readers = alloc_id_reader_bundles.get(alloc_id, set())
+            alias_writers = alloc_id_bundles.get(alloc_id, {writer})
+            if alias_readers - alias_writers:
+                logger.debug(
+                    "hbm_pool_planning: %s shares its allocation with a "
+                    "buffer read in another bundle %s -- excluding from "
+                    "pool eligibility",
+                    name,
+                    sorted(alias_readers - alias_writers),
+                )
+                return True
+        readers = buffer_reader_bundles.get(name, set())
         return bool(readers - {writer})
 
     all_candidates = {
@@ -556,7 +588,7 @@ def hbm_pool_planning(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]
         peak = allocator.get_peak_usage()
         pool_extent = allocator.get_pool_end()
         if overflowed:
-            logger.warning(
+            logger.info(
                 "hbm_pool_planning: bundle=%s  %d intermediate(s) did not fit in "
                 "the %.2f GB pool budget and fell back to standalone HBM",
                 bundle_name,

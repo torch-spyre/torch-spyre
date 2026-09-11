@@ -75,5 +75,5 @@ Refer to the official product pages and IBM Research blogs to learn more about t
 * [Enhancing enterprise AI with the IBM Spyre Accelerator](https://research.ibm.com/blog/spyre-for-z) — Spyre for IBM Z mainframe AI inference
 * [Expanding AI model training and inference for the open-source community](https://research.ibm.com/blog/pytorch-expanding-ai-model-training-and-inference-for-the-open-source-community) — Spyre in the PyTorch ecosystem
 
-**Internal reference**
+**See also**
 * [Dataflow Architecture Reference](dataflow_architecture.md)
