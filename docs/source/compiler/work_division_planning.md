@@ -579,9 +579,12 @@ Aligned splits (LX reuse possible)        Mismatched splits (DDR round-trip)
         ✓ reuse                                   ✗ DDR reload
 ```
 
-A graph-aware co-optimisation pass exists and is opt-in via
-`CO_OPTIMIZING_LX_PLANNING=1`. It aligns splits across adjacent ops to
-grow the LX planner's legal-reuse set. See the
+A graph-aware co-optimisation pass runs by default
+(`CO_OPTIMIZING_LX_PLANNING=0` opts out). It aligns splits across adjacent
+ops to grow the LX planner's legal-reuse set. Ops whose per-core addressing
+the joint solver cannot safely re-slice — windowed pools, `keep_by_index`
+and fp8-matmul layout groups, indirect-access ops, offset-slice reads and
+sliced in-place mutations — keep the division this pass chose. See the
 [scratchpad planning](scratchpad_planning.md) doc for details.
 
 ## User Work-Division Hints
@@ -635,6 +638,16 @@ the resulting per-core span exceeds the hardware limit.
 
 Set `SPYRE_INDUCTOR_IGNORE_HINTS=1` to ignore `spyre_hint(work_div={...})`
 annotations and use the automatic work-distribution planner.
+
+:::{note}
+Work-division hints also hold under co-optimization, which is on by default. An
+op whose hint resolves onto its own dimensions is pinned to the division this
+pass committed, so the joint solver cannot re-slice it. The pin covers the whole
+op: dimensions the hint does not name stay unsplit even when that leaves cores
+idle, and a neighbouring buffer whose division no longer matches the hinted op
+may be kept out of LX. Ops in the hint scope that have none of the hinted
+dimensions are not pinned.
+:::
 
 ## Limitations and Future Work
 

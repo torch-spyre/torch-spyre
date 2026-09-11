@@ -192,6 +192,32 @@ class TestNamedWorkDivisionHint(InductorTestCase):
     def _fake_output_td(self, coord_vars):
         return SimpleNamespace(device_coords=[*coord_vars, Integer(0)])
 
+    def _compile_partially_hinted_add(self) -> str:
+        """Compile ``x + y`` over (B=8, M=128, N=64) with only B hinted.
+
+        B and M are both free, splittable, non-stick dims (N is one fp16 stick),
+        and ``work_div={"B": 2}`` uses 2 of ``sencores=8``. That separates the
+        three outcomes: unpinned, the joint solve takes M:8 and leaves B whole;
+        the whole-op pin commits B:2, M:1; a per-dim pin would commit B:2, M:4.
+        """
+        B, M, N = 8, 128, 64
+        x = torch.randn(B, M, N, dtype=torch.float16).to("spyre")
+        y = torch.randn(B, M, N, dtype=torch.float16).to("spyre")
+        _declare_tensor_dim("B", B)
+        _declare_tensor_dim("M", M)
+        _declare_tensor_dim("N", N)
+        _name_tensor_dims(x, ["B", "M", "N"])
+        _name_tensor_dims(y, ["B", "M", "N"])
+
+        def fn(x, y):
+            with spyre_hint(work_div={"B": 2}):
+                return x + y
+
+        result, source_codes = run_and_get_code(torch.compile(fn, dynamic=False), x, y)
+        torch.testing.assert_close(result.cpu(), x.cpu() + y.cpu())
+        self._assert_user_hint_logged()
+        return source_codes[0]
+
     def test_resolve_work_div_hint_preserves_hint_order(self):
         h = Symbol("H")
         lq = Symbol("Lq")
@@ -382,6 +408,24 @@ class TestNamedWorkDivisionHint(InductorTestCase):
         self._assert_user_hint_logged()
         self.assertIn("sympify('c0'): (sympify('128'), 2)", source_codes[0])
         self.assertIn("sympify('c2'): (sympify('256'), 4)", source_codes[0])
+
+    @config.patch({"sencores": 8, "co_optimizing_lx_planning": True})
+    def test_partial_work_div_hint_leaves_unhinted_dims_unsplit(self):
+        # The hint survives co-optimization (unpinned, the joint solve would take
+        # M:8 and leave B whole) and pins the op's whole committed division, so M
+        # stays unsplit even though 6 cores are idle. A per-dim pin would split M
+        # by 4 here.
+        source = self._compile_partially_hinted_add()
+        self.assertIn("sympify('c0'): (sympify('8'), 2)", source)
+        self.assertIn("sympify('c1'): (sympify('128'), 1)", source)
+
+    @config.patch({"sencores": 8, "co_optimizing_lx_planning": False})
+    def test_partial_work_div_hint_matches_without_co_optimization(self):
+        # Without co-optimization work division is the only decision, so the
+        # division must be the same one the co-optimized pin commits.
+        source = self._compile_partially_hinted_add()
+        self.assertIn("sympify('c0'): (sympify('8'), 2)", source)
+        self.assertIn("sympify('c1'): (sympify('128'), 1)", source)
 
     @pytest.mark.xfail(
         strict=True,
@@ -972,6 +1016,7 @@ def test_lx_relayout_normalizes_ownership_and_lowers_only_in_superdsc():
         # solver sets supports_paired_buffers. Pin it explicitly so this test
         # keeps exercising relayout regardless of the default layout_solver.
         "layout_solver": "greedy",
+        "co_optimizing_lx_planning": False,
     }
 )
 @pytest.mark.parametrize(

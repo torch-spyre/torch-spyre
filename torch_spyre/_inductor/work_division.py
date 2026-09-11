@@ -1032,8 +1032,21 @@ def _work_div_hint_by_name(op: ComputedBuffer) -> dict[str, int]:
     return dim_to_split
 
 
-def _has_work_div_hint(op: ComputedBuffer) -> bool:
+def has_work_div_hint(op: ComputedBuffer) -> bool:
     return any(hint_dict.get("work_div") for hint_dict in get_op_hints(op).values())
+
+
+def has_resolved_work_div_hint(op: ComputedBuffer) -> bool:
+    """Whether ``work_distribution_pass`` commits ``op``'s division from its hint.
+
+    ``spyre_hint`` annotates every node in its scope, so an op can carry a
+    ``work_div`` hint naming none of its dims; that op gets a default split.
+    """
+    return (
+        isinstance(op.data, (Pointwise, Reduction))
+        and has_work_div_hint(op)
+        and _resolve_work_div_hint(op, iteration_space_from_op(op)) is not None
+    )
 
 
 def _resolve_work_div_hint(
@@ -1958,7 +1971,7 @@ def _cost_model_divide_op(op: ComputedBuffer, max_cores: int) -> bool:
         return False
     if op.data.reduction_type != BATCH_MATMUL_OP:
         return False
-    if not config.ignore_work_division_hints and _has_work_div_hint(op):
+    if not config.ignore_work_division_hints and has_work_div_hint(op):
         # User hints take ownership of the split decision; do not override them.
         return False
 
