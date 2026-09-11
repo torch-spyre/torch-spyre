@@ -218,6 +218,16 @@ jobs:
             config: inductor-test_custom_op_autotune.yaml
           - name: Inducotr test custom post grad passes
             config: inductor-test_custom_post_grad_passes.yaml
+          # These three configs carry the trunk label and mandatory_success
+          # entries, so they must run somewhere. The trunk scan no longer
+          # schedules the upstream_tests_beta/ subtree (see _test_matrix.yaml),
+          # so list them here to run under this dedicated pytorch-checkout job.
+          - name: Optimizer LR scheduler
+            config: optim-test_lrscheduler.yaml
+          - name: Profiler tree
+            config: profiler-test_profiler_tree.yaml
+          - name: Prims
+            config: test_prims.yaml
           # All xfail tests. Will result in zero tests collected in "no xfail" mode.
           # There are some mandatory success tests which have been commented out due a potential exclude bug.
           # Once the bug is resolved, this config can be enabled.
