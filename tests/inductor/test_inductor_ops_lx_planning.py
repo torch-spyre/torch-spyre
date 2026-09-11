@@ -148,6 +148,15 @@ INHERITED_TEST_ATTRIBUTES = [
 ]
 
 POINTWISE_TEST_FAILURES = []
+REDUCTION_TEST_FAILURES = [
+    # Cross-core fp16 accumulation at sencores=32 produces values outside
+    # atol=1.0 for these ops. Tracked separately; skip until fixed.
+    "test_rmsnorm_manual_2d",
+    "test_scalar_cpu_add_4d",
+    "test_scalar_cpu_sub_4d",
+    "test_scalar_cpu_mul_4d",
+    "test_scalar_cpu_combined_4d",
+]
 
 
 class _LxPlanningTwoOpTestBase(unittest.TestCase):
@@ -230,17 +239,6 @@ _copy_canonical_tests(
     POINTWISE_TEST_FAILURES if not tests_lx_planning_run_skips else None,
     INHERITED_TEST_ATTRIBUTES,
 )
-
-
-REDUCTION_TEST_FAILURES = [
-    # Cross-core fp16 accumulation at sencores=32 produces values outside
-    # atol=1.0 for these ops. Tracked separately; skip until fixed.
-    "test_rmsnorm_manual_2d",
-    "test_scalar_cpu_add_4d",
-    "test_scalar_cpu_sub_4d",
-    "test_scalar_cpu_mul_4d",
-    "test_scalar_cpu_combined_4d",
-]
 
 
 class LxPlanningTwoOpReductionTest(_LxPlanningTwoOpTestBase):
