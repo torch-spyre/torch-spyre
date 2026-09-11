@@ -62,9 +62,11 @@ class _Result:
 class FakeClient:
     """Answers system.columns / system.tables from a declared schema."""
 
-    def __init__(self, tables=None, already_ingested=0):
+    def __init__(self, tables=None, already_ingested=0, database="spyre"):
         # {table: [column, ...]}
         self.tables = tables if tables is not None else {}
+        # _table_exists reads client.database when no explicit db is passed.
+        self.database = database
         self.already_ingested = already_ingested
         self.inserts = []
         self.commands = []
@@ -82,7 +84,7 @@ class FakeClient:
     def command(self, sql):
         self.commands.append(sql)
 
-    def insert(self, table, rows, column_names=None):
+    def insert(self, table, rows, column_names=None, database=None):
         self.inserts.append((table, rows, column_names))
 
 
