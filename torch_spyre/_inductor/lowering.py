@@ -1701,6 +1701,50 @@ def to_dtype(x, dst_dtype, use_compute_types=True):
     )
 
 
+# Dtypes whose physical device representation is IEEE_INT32 and for which the
+# backend has a native integer add/mul intrinsic (addi32toi32 / muli32toi32).
+# torch.int64 tensors are stored as IEEE_INT32 on device (they hold values that
+# fit in 32 bits); torch.int32 is the straightforward case.
+_NATIVE_INTEGER_DTYPES = (torch.int32, torch.int64)
+
+
+def _is_native_integer_tensor(x) -> bool:
+    """Return True if x is an integer tensor whose device format is IEEE_INT32.
+
+    Only torch.int32 and torch.int64 qualify -- both are physically stored as
+    IEEE_INT32 on Spyre and have a backend native intrinsic for add and mul.
+    Scalar constants are excluded: addi32toi32 / muli32toi32 require both
+    operands to be fully-tiled tensor buffers.  Use _is_integer_scalar to detect
+    Python int scalars, and _materialize_native_integer_scalar to expand them to
+    a full-size tensor before selecting the native path.
+    """
+    return (
+        not isinstance(x, (bool, int, float))
+        and hasattr(x, "get_dtype")
+        and x.get_dtype() in _NATIVE_INTEGER_DTYPES
+    )
+
+
+def _is_integer_scalar(x) -> bool:
+    """Return True for Python int scalars that can use the native integer path."""
+    return isinstance(x, int) and not isinstance(x, bool)
+
+
+def _materialize_native_integer_scalar(value: int, tensor) -> object:
+    """Expand an integer scalar to a full-size constant tensor matching tensor's shape.
+
+    Uses lower_full (which now supports int32/int64 via SpyreConstantFallback) so
+    that the result has the correct fully-tiled device layout expected by
+    addi32toi32 / muli32toi32.
+    """
+    return lower_full(
+        tensor.get_size(),
+        value,
+        dtype=tensor.get_dtype(),
+        device=tensor.get_device(),
+    )
+
+
 def with_int64_fallback(fn, *args, convert_output=True):
     """
     Helper to handle int64 operations by converting to fp32.
@@ -1745,16 +1789,31 @@ def with_int64_fallback(fn, *args, convert_output=True):
     broadcast=True,
 )
 def lower_add(x, y, *, alpha=1):
+    # Materialise integer scalars as full-size tensors so addi32toi32 sees
+    # two fully-tiled operands (a scalar-broadcast layout segfaults dxp_standalone).
+    if _is_integer_scalar(y) and _is_native_integer_tensor(x):
+        y = _materialize_native_integer_scalar(y, x)
+    elif _is_integer_scalar(x) and _is_native_integer_tensor(y):
+        x = _materialize_native_integer_scalar(x, y)
+    native_integer = _is_native_integer_tensor(x) and _is_native_integer_tensor(y)
     if alpha != 1:
         alpha_tensor = lower_full(
             y.get_size(),
-            float(alpha),
+            alpha if native_integer else float(alpha),
             dtype=y.get_dtype(),
             device=y.get_device(),
         )
         alpha_tensor.realize()
-        y = with_int64_fallback(lowering.mul, y, alpha_tensor)
+        # Keep native integer scaling in integer format.
+        if native_integer:
+            y = lowering.mul(y, alpha_tensor)
+        else:
+            y = with_int64_fallback(lowering.mul, y, alpha_tensor)
         y.realize()
+    if native_integer:
+        # SDSC selects addi32toi32 for native integer operands.
+        return lowering.add(x, y)
+    # Use the existing int64 conversion fallback for non-native operands.
     return with_int64_fallback(lowering.add, x, y)
 
 
@@ -1764,6 +1823,14 @@ def lower_add(x, y, *, alpha=1):
     broadcast=True,
 )
 def lower_mul(x, y):
+    # Same scalar materialisation as lower_add: muli32toi32 requires both
+    # operands to be fully-tiled tensor buffers.
+    if _is_integer_scalar(y) and _is_native_integer_tensor(x):
+        y = _materialize_native_integer_scalar(y, x)
+    elif _is_integer_scalar(x) and _is_native_integer_tensor(y):
+        x = _materialize_native_integer_scalar(x, y)
+    if _is_native_integer_tensor(x) and _is_native_integer_tensor(y):
+        return lowering.mul(x, y)
     return with_int64_fallback(lowering.mul, x, y)
 
 

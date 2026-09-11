@@ -1603,9 +1603,14 @@ def spyre_prod_dim_int(
     out_shape = list(input.shape)
     reduce_size = out_shape.pop(dim)
     acc = torch.ones(out_shape, dtype=input.dtype, device=input.device)
+    input_on_cpu = input.cpu()
+    for i in range(reduce_size):
+        input_cpu = input_on_cpu.select(dim, index=i).to(input.device)
+        acc = acc * input_cpu
+    """
     for i in range(reduce_size):
         acc = acc * input.select(dim, i)
-
+    """
     if keepdim:
         acc = acc.unsqueeze(dim)
 

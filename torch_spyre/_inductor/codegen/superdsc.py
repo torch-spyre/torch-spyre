@@ -1089,30 +1089,23 @@ def _get_tensor_layout_labels(use_op_dims: bool, op_name: str) -> list[str]:
 
 
 def _get_data_format(op, device_dtype):
-    """Re-label int32 tensor data formats to fp32 for SDSC compatibility.
+    """Return the SDSC descriptor format for a tensor.
 
-    NOTE: This is NOT a data conversion.
-    This is only a temporary re-labeling of the same 32 bit data.
-    The underlying data remains unchanged.
-
-    In the long term, SDSC should accept int32 as the data format.
-    Such re-labeling will become unnecessary.
-    See backend issue deeptools#4307.
+    This is metadata relabeling only; the underlying 32-bit data is unchanged.
+    Native integer add/mul use SENUINT32 tensor descriptors in the SDSC DDL,
+    while identity retains its existing fp32 compatibility relabeling.
     """
-    if device_dtype == DataFormats.IEEE_INT32 and op == IDENTITY_OP:
-        return DataFormats.IEEE_FP32
+    if device_dtype == DataFormats.IEEE_INT32:
+        if op in ("add", "mul"):
+            return DataFormats.SENUINT32
+        if op == IDENTITY_OP:
+            return DataFormats.IEEE_FP32
     return device_dtype
 
 
 def _get_sdsc_spec_data_format(op, arg_data_format):
-    """Re-label int32 ops' SDSC spec data_format to fp32 for backend compatibility.
-
-    For fp32<->int32 dtype-conversion ops, the SDSC spec must report fp32 as
-    the op's data format, but unlike `_get_data_format`'s IDENTITY_OP case,
-    the int32 tensor descriptor itself stays int32.
-    See backend issue deeptools#4307.
-    """
-    if op in (FP32TOINT32_OP, INT32TOFP32_OP):
+    """Return the SDSC compute format for an operation."""
+    if op in (FP32TOINT32_OP, INT32TOFP32_OP, "addi32toi32", "muli32toi32"):
         return DataFormats.IEEE_FP32
     return arg_data_format
 
@@ -1613,7 +1606,17 @@ def _create_sdsc_tensors(
     return sdsc_args, layouts, missing_dim
 
 
-def _get_op_func(op: str, is_reduction: bool, output_scales: dict) -> str:
+def _get_op_func(
+    op: str,
+    is_reduction: bool,
+    output_scales: dict,
+    data_format: DataFormats | None = None,
+) -> str:
+    if data_format == DataFormats.IEEE_INT32:
+        if op == "add":
+            return "addi32toi32"
+        if op == "mul":
+            return "muli32toi32"
     if _is_pool(op) or _is_conv(op):
         return op
     # quantscalepertokenfp8 maps directly to deeptools operator (no "nonstick" suffix)
@@ -2440,13 +2443,22 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
         else {}
     )
 
+    value_arg_index = 1 if indirect_access_indices else 0
+    source_data_format = op_spec.args[value_arg_index].device_dtype
+    opfunc = (
+        "shuffle"
+        if is_relayout
+        else _get_op_func(
+            op_spec.op,
+            op_spec.is_reduction,
+            args[-1].scales,
+            source_data_format,
+        )
+    )
+
     return (
         SDSCSpec(
-            opfunc=(
-                "shuffle"
-                if is_relayout
-                else _get_op_func(op_spec.op, op_spec.is_reduction, args[-1].scales)
-            ),
+            opfunc=opfunc,
             # Forward conv2d (#3284) is a native "pt" (processing-tile) op like
             # matmul; depthwise conv2d (#3510) runs on the "sfp" unit. `is_conv`
             # matches both, so dispatch forward explicitly and leave depthwise
@@ -2455,9 +2467,9 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
             if (is_matmul or op_spec.op == CONV2D_FWD_OP)
             else "sfp",
             data_format=_get_sdsc_spec_data_format(
-                op_spec.op,
-                args[1 if indirect_access_indices else 0].data_format,
-            ),  # TODO: op_spec needs operation data format. Use value tensor (args[1]) for indirect access ops
+                opfunc,
+                args[value_arg_index].data_format,
+            ),
             num_inputs=num_inputs,
             iteration_space=sdsc_iteration_space,
             num_cores=num_cores,
