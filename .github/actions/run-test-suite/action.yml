@@ -265,6 +265,11 @@ runs:
 
           _STALLED=0
           [[ -f "${stall_flag}.stalled" ]] && _STALLED=1
+          # Surfaced for the stall-retry race check below: whether this
+          # attempt's own failure was RAS::VFIO::DeviceOpenFail, not just any
+          # failure exit code.
+          _DEVICE_OPEN_FAIL=0
+          grep -q 'RAS::VFIO::DeviceOpenFail' "$log_file" 2>/dev/null && _DEVICE_OPEN_FAIL=1
           rm -f "$log_file" "$stall_flag" "${stall_flag}.done" "${stall_flag}.stalled"
         }
 
@@ -306,14 +311,30 @@ runs:
           echo "AIU card released after ${_waited}s"
         fi
 
-        echo "=== Attempt 2/2 (stall retry): ${{ inputs.suite_name }} ==="
-        run_attempt "-n1"
+        # _vfio_holder_pids only sees a holder while its PID is still alive in
+        # /proc. SIGKILL reaps the killed process fast enough that /proc goes
+        # clean well before the VFIO driver actually finishes releasing the
+        # device, so the wait loop above can report "all clear" while a
+        # retry would still hit RAS::VFIO::DeviceOpenFail. Treat that one
+        # failure signature on attempt 2 as the same transient race and give
+        # it a few short-backoff device-open retries before giving up.
+        _DEVICE_OPEN_RETRY_MAX=3
+        for ((_i = 1; _i <= _DEVICE_OPEN_RETRY_MAX; _i++)); do
+          echo "=== Attempt 2/2 (stall retry, device-open try ${_i}/${_DEVICE_OPEN_RETRY_MAX}): ${{ inputs.suite_name }} ==="
+          run_attempt "-n1"
 
-        if [[ $TEST_EXIT -eq 0 ]]; then
-          echo "=== Attempt 2 PASSED ==="
-          echo "${{ inputs.suite_name }} tests done"
-          exit 0
-        fi
+          if [[ $TEST_EXIT -eq 0 ]]; then
+            echo "=== Attempt 2 PASSED ==="
+            echo "${{ inputs.suite_name }} tests done"
+            exit 0
+          fi
+
+          if [[ $_DEVICE_OPEN_FAIL -ne 1 || $_i -ge $_DEVICE_OPEN_RETRY_MAX ]]; then
+            break
+          fi
+          echo "    --> Attempt 2 hit RAS::VFIO::DeviceOpenFail — card release still racing; retrying device-open after backoff"
+          sleep 5
+        done
 
         echo "=== Attempt 2 FAILED (exit=${TEST_EXIT}) — leaving further retry to the pod-level retry"
         exit 1
