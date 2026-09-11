@@ -365,7 +365,7 @@ def _qfp8wt_stl(
         in_layout: Inductor ``FixedLayout`` for the op's input tensor.
     """
     in_eps = get_elem_in_stick(in_layout.dtype)
-    stick_dim_size = in_layout.size[-1]
+    stick_dim_size = concretize_expr(in_layout.size[-1])
     unaligned = stick_dim_size % in_eps
     outer_sizes = [concretize_expr(s) for s in output.size[:-1]]
     outer_strides = [concretize_expr(s) for s in output.stride[:-1]]
@@ -2289,7 +2289,7 @@ def propagate_spyre_tensor_layouts(
                     # Treat the mutation op like a normal pointwise op: run
                     # _multi_arg_pointwise_layouts with the non-target inputs.
                     # This enforces input-compatibility and slice constraints,
-                    # so the backend DDL slice check passes.
+                    # so the backend slice check passes.
                     rw = op.get_read_writes()
                     output_dep = next(iter(rw.writes))
                     all_args = _get_prop_args(rw.reads)

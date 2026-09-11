@@ -1207,8 +1207,6 @@ def _create_sdsc_tensors(
     matmul_n_dim = injected_dims.get("matmul_n_dim")
 
     for i, arg in enumerate(op_spec.args):
-        is_fp8_mm_kernel_arg = arg.element_arrangement == ElementArrangement.QFP8WT
-
         # Step 1: Determine dimension order and stick dimension.
         # Index tensors use their pre-computed layout (their coords have no IndirectAccess).
         if has_indirect_access and i in index_tensor_layouts:
@@ -1536,10 +1534,16 @@ def _create_sdsc_tensors(
         effective_stick = [op_stick_dim if stick_dim is None else stick_dim]
         layout_labels = _get_tensor_layout_labels(use_op_dims, op_spec.op)
 
-        # Special handling for FP8 matmul KERNEL tensor
+        # Special handling for QFP8WT KERNEL tensors.
+        # Both qfp8wt (weight quantization) and batchmatmulfp8 (the consumer) require
+        # a 2D stick [2, stick_size/2]. fp8todl16 also carries a QFP8WT-arranged
+        # tensor as input but uses a 1D flat FP8 input.
         dtype_stick_size = arg.device_dtype.elems_per_stick()
         layout_stick_size = [dtype_stick_size]
-        if is_fp8_mm_kernel_arg:
+        if arg.element_arrangement == ElementArrangement.QFP8WT and op_spec.op in (
+            "batchmatmulfp8",
+            "qfp8wt",
+        ):
             # FP8 KERNEL needs 2D stick: [2, stick_size/2]
             layout_stick_size = [2, dtype_stick_size // 2]
             # Use the last two dimensions from dim_order for 2D stick

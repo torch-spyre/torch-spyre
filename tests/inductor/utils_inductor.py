@@ -37,13 +37,27 @@ def _make_generator(*args) -> torch.Generator:
     return gen
 
 
-# shape is a tuple of integers representing dimension of the tensor
-# to avoid using the same cached tensor of the same shape, add a unique
-# differentiation argument
 @functools.lru_cache(maxsize=None)
 def cached_randn(
     shape, differentiation=None, abs=False, dtype=torch.float16, scale=1.0
 ):
+    """Return a deterministically-seeded random tensor, cached by arguments.
+
+    Args:
+        shape: Tuple of ints giving the tensor dimensions.
+        differentiation: Optional hashable value added to the cache key so two
+            calls with the same shape but different ``differentiation`` values
+            return independent tensors rather than the same cached one.
+        abs: If True, return the absolute value of the generated tensor.
+        dtype: Output dtype (default: float16).
+        scale: Variance multiplier applied as ``randn(...) * scale``. A value of
+            1.0 gives unit-variance outputs; larger values spread the range.
+            Also seeds the RNG so the same (shape, scale) always yields the same
+            values across test runs.
+
+    Returns:
+        A cached CPU tensor of the requested shape and dtype.
+    """
     gen = _make_generator(shape, differentiation, abs, dtype, scale)
     out = torch.randn(shape, dtype=dtype, generator=gen) * scale
     return out if not abs else torch.abs(out)
