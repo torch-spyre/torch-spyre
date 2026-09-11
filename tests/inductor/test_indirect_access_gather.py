@@ -1349,6 +1349,286 @@ register_multicore_variants(
     counts=(32,),
 )
 
+
+# ---------------------------------------------------------------------------
+# 1-D value table. Registered separately from the main gather scenarios because
+# these assert exact values (expect_close=True) rather than allowing the
+# known-gap xfail, and two core counts are enough to cover the work division.
+# ---------------------------------------------------------------------------
+class _Gather1DTableScenario:
+    """x[i] where x is a 1-D table, on its own and feeding other ops.
+
+    A 1-D table has only its stick dimension to be indexed on, so the value
+    tensor is re-tiled to one entry per stick. That leaves the gather output
+    with one element per stick, which an ordinary operand does not match, so a
+    fused op needs the operand restickified to agree.
+
+    A bare gather is a pure copy and must match CPU exactly. Anything doing
+    arithmetic rounds, so those use the default float tolerance.
+    """
+
+    to_spyre = staticmethod(plain_to_spyre)
+
+    # --- table lengths ----------------------------------------------------
+
+    # Lengths either side of a stick boundary (64 elements at float16). The
+    # device extent rounds up to whole sticks, so these catch an entry count
+    # taken from the device dims rather than from the table.
+    LENGTHS = (2, 63, 64, 65, 100, 127, 128, 129, 192, 256)
+
+    # Larger tables, where the stick-per-entry cost starts to show.
+    LARGE_LENGTHS = (1000, 4096, 65536)
+
+    # --- operand shapes against a [24, 8] result --------------------------
+
+    # [24, 8] needs no broadcast. The rest each drop a dim the result has, so
+    # the operand's target layout has to collapse that dim rather than copy it.
+    OPERAND_SHAPES = ((24, 8), (24, 1), (1, 8), (8,), (1, 1))
+
+    # --- helpers ----------------------------------------------------------
+
+    def _table(self, entries):
+        # arange is exact in float16 to 2048, so each entry equals its own
+        # index and a wrong address shows up as an obviously wrong number.
+        if entries <= 2048:
+            return self.to_spyre(torch.arange(entries, dtype=torch.float16))
+        return self.to_spyre(torch.rand(entries, dtype=torch.float16))
+
+    def _index(self, entries=128, shape=(24, 8)):
+        return torch.randint(0, entries, shape, dtype=torch.int32).to("spyre")
+
+    def _operand(self, shape):
+        # Away from zero so a division stays well conditioned.
+        return self.to_spyre(torch.rand(*shape, dtype=torch.float16) + 0.5)
+
+    def _run(self, x, i):
+        run_e2e(self, lambda x, i: x[i], x, i, expect_close=True, atol=0, rtol=0)
+
+    def _run_fused(self, fn, *args):
+        run_e2e(self, fn, *args, expect_close=True)
+
+    # --- the gather on its own --------------------------------------------
+
+    def test_gather_1d_table(self):
+        """A per-expert scale table indexed by top-k ids."""
+        self._run(self._table(128), self._index())
+
+    def test_gather_1d_table_across_stick_boundaries(self):
+        """Indices either side of a stick edge."""
+        i = torch.tensor([0, 1, 63, 64, 65, 127], dtype=torch.int32).to("spyre")
+        self._run(self._table(128), i)
+
+    def test_gather_1d_table_more_reads_than_entries(self):
+        """192 tokens picking 8 experts each: 1536 reads from 128 entries."""
+        self._run(self._table(128), self._index(shape=(192, 8)))
+
+    def test_gather_1d_table_every_read_the_same_entry(self):
+        """Every read on entry 99, in the partly used last stick."""
+        i = torch.full((24, 8), 99, dtype=torch.int32).to("spyre")
+        self._run(self._table(100), i)
+
+    def test_gather_1d_table_bfloat16(self):
+        """bfloat16, the dtype the reported model uses."""
+        for entries in (63, 100, 128, 192, 256):
+            with self.subTest(entries=entries):
+                x = self.to_spyre(torch.arange(entries, dtype=torch.bfloat16))
+                i = torch.arange(entries, dtype=torch.int32).to("spyre")
+                self._run(x, i)
+
+    def test_gather_1d_table_int64_index(self):
+        """An int64 index, which is what ordinary PyTorch produces."""
+        i = torch.arange(128, dtype=torch.int64).to("spyre")
+        self._run(self._table(128), i)
+
+    # --- table lengths ----------------------------------------------------
+
+    def test_gather_1d_table_lengths_read_exhaustively(self):
+        """Every entry read once, at each length."""
+        for entries in self.LENGTHS:
+            with self.subTest(entries=entries):
+                i = torch.arange(entries, dtype=torch.int32).to("spyre")
+                self._run(self._table(entries), i)
+
+    def test_gather_1d_table_lengths_read_randomly(self):
+        """The same lengths plus larger ones, read by a short random index."""
+        for entries in self.LENGTHS + self.LARGE_LENGTHS:
+            with self.subTest(entries=entries):
+                i = torch.randint(0, entries, (24, 8), dtype=torch.int32)
+                self._run(self._table(entries), i.to("spyre"))
+
+    # --- arithmetic on the gathered values --------------------------------
+
+    def test_gather_1d_table_times_tensor(self):
+        """The model expression: weights * scale[index]."""
+        self._run_fused(
+            lambda x, i, w: x[i] * w,
+            self._table(128),
+            self._index(),
+            self._operand((24, 8)),
+        )
+
+    def test_gather_1d_table_plus_tensor(self):
+        self._run_fused(
+            lambda x, i, w: x[i] + w,
+            self._table(128),
+            self._index(),
+            self._operand((24, 8)),
+        )
+
+    def test_gather_1d_table_divided_by_tensor(self):
+        self._run_fused(
+            lambda x, i, w: x[i] / w,
+            self._table(128),
+            self._index(),
+            self._operand((24, 8)),
+        )
+
+    def test_gather_1d_table_maximum_with_tensor(self):
+        """A binary op that is not plain arithmetic."""
+        self._run_fused(
+            lambda x, i, w: torch.maximum(x[i], w),
+            self._table(128),
+            self._index(),
+            self._operand((24, 8)),
+        )
+
+    def test_gather_1d_table_operand_first(self):
+        """The gather on the right-hand side of the op."""
+        self._run_fused(
+            lambda x, i, w: w * x[i],
+            self._table(128),
+            self._index(),
+            self._operand((24, 8)),
+        )
+
+    def test_gather_1d_table_chained_ops(self):
+        """Several operations over the gathered values."""
+        self._run_fused(
+            lambda x, i, w, v: (x[i] + w) * v * 2.0,
+            self._table(128),
+            self._index(),
+            self._operand((24, 8)),
+            self._operand((24, 8)),
+        )
+
+    def test_gather_1d_table_two_tables(self):
+        """Two 1-D gathers feeding the same op."""
+        y = self.to_spyre(torch.arange(128, dtype=torch.float16) * 0.5)
+        self._run_fused(
+            lambda x, i, y, j: x[i] * y[j],
+            self._table(128),
+            self._index(),
+            y,
+            self._index(),
+        )
+
+    def test_gather_1d_table_unary(self):
+        """A unary on the gathered values.
+
+        The table is scaled down because exp of an index-valued table overflows
+        float16 long before it says anything about the layout.
+        """
+        small = self.to_spyre(torch.arange(128, dtype=torch.float16) / 64.0)
+        self._run_fused(lambda x, i: x[i].exp(), small, self._index())
+
+    # --- operands that broadcast ------------------------------------------
+
+    def test_gather_1d_table_operand_shapes(self):
+        """Every operand shape that broadcasts into a [24, 8] result."""
+        for shape in self.OPERAND_SHAPES:
+            with self.subTest(operand=shape):
+                self._run_fused(
+                    lambda x, i, w: x[i] * w,
+                    self._table(128),
+                    self._index(),
+                    self._operand(shape),
+                )
+
+    def test_gather_1d_table_operand_shapes_other_result(self):
+        """The same sharing patterns against a differently shaped result."""
+        for shape in ((12, 4), (12, 1), (1, 4), (4,)):
+            with self.subTest(operand=shape):
+                self._run_fused(
+                    lambda x, i, w: x[i] * w,
+                    self._table(128),
+                    self._index(shape=(12, 4)),
+                    self._operand(shape),
+                )
+
+    def test_gather_1d_table_operand_shapes_1d_result(self):
+        """A one-dimensional result, so there is a single dim to share over."""
+        for shape in ((192,), (1,)):
+            with self.subTest(operand=shape):
+                self._run_fused(
+                    lambda x, i, w: x[i] * w,
+                    self._table(128),
+                    self._index(shape=(192,)),
+                    self._operand(shape),
+                )
+
+    def test_gather_1d_table_zero_dim_operand(self):
+        """A 0-d tensor operand, which shares over every dim at once."""
+        self._run_fused(
+            lambda x, i, w: x[i] * w,
+            self._table(128),
+            self._index(),
+            self.to_spyre(torch.tensor(2.5, dtype=torch.float16)),
+        )
+
+    def test_gather_1d_table_scalar(self):
+        """A plain Python scalar, which brings no layout of its own."""
+        self._run_fused(lambda x, i: x[i] * 2.0, self._table(128), self._index())
+
+    # --- reductions over the gathered values ------------------------------
+
+    def test_gather_1d_table_summed_over_experts(self):
+        self._run_fused(lambda x, i: x[i].sum(dim=1), self._table(128), self._index())
+
+    def test_gather_1d_table_summed_over_tokens(self):
+        self._run_fused(lambda x, i: x[i].sum(dim=0), self._table(128), self._index())
+
+    def test_gather_1d_table_max_over_tokens(self):
+        self._run_fused(lambda x, i: x[i].amax(dim=0), self._table(128), self._index())
+
+    def test_gather_1d_table_mean_keepdim(self):
+        """A reduction that keeps the reduced dim as size 1."""
+        self._run_fused(
+            lambda x, i: x[i].mean(dim=1, keepdim=True),
+            self._table(128),
+            self._index(),
+        )
+
+    def test_gather_1d_table_fused_then_reduced(self):
+        """Multiply and then reduce, as a router does."""
+        self._run_fused(
+            lambda x, i, w: (x[i] * w).sum(dim=1),
+            self._table(128),
+            self._index(),
+            self._operand((24, 8)),
+        )
+
+    # --- known gap ---------------------------------------------------------
+
+    @pytest.mark.skip(
+        reason="Issues #2544 / #2560: RESTICKIFY_OP is not in SPYRE_FP32_OPS"
+    )
+    def test_gather_1d_table_float32(self):
+        """float32, which puts 32 elements in a stick instead of 64.
+
+        Re-tiling works; the restickify it needs is not registered for float32.
+        """
+        x = self.to_spyre(torch.arange(192, dtype=torch.float32))
+        i = torch.arange(192, dtype=torch.int32).to("spyre")
+        run_e2e(self, lambda x, i: x[i], x, i)
+
+
+register_multicore_variants(
+    _Gather1DTableScenario,
+    "TestGather1DTable",
+    globals(),
+    counts=(1, 32),
+)
+
 if __name__ == "__main__":
     from torch._inductor.test_case import run_tests
 

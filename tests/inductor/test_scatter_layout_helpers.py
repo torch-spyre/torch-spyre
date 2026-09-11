@@ -17,7 +17,8 @@
 Tests the core layout-checking logic in enforce_indirect_access_layout.py:
 - _dim_order_is_compliant: checks if indirect dim is at device position 0
 - _indirect_stride_idx: finds which coordinate carries IndirectAccess
-- _build_required_stl: constructs compliant layout by rotating dimensions
+- _build_required_stl: constructs compliant layout by rotating dimensions,
+  or by re-tiling when the indexed coordinate is inside the stick
 """
 
 import unittest
@@ -31,6 +32,7 @@ from torch_spyre._inductor.enforce_indirect_access_layout import (
     _dim_order_is_compliant,
     _indirect_stride_idx,
     _build_required_stl,
+    _is_permutation_of,
 )
 from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.ir import FixedTiledLayout
@@ -177,6 +179,72 @@ class TestBuildRequiredStl(unittest.TestCase):
         self.assertEqual(required_stl.device_size[1], 2)
         # Stick stays at end
         self.assertEqual(required_stl.device_size[3], 1)
+
+
+class TestIndirectInsideStick(unittest.TestCase):
+    """The re-tile taken when the indexed coordinate is the stick.
+
+    Rotating cannot repair that case: it lists the stick twice and grows the
+    rank, which the gather then reads garbage through.
+    """
+
+    def _table_stl(self):
+        # A 128-entry bf16 table: the indexed dim is split across dim 0 and
+        # the stick, so the index lands inside the stick.
+        return SpyreTensorLayout(
+            device_size=[2, 1, 64],
+            stride_map=[64, -1, 1],
+            device_dtype=get_device_dtype(torch.bfloat16),
+        )
+
+    def test_retiles_to_one_entry_per_stick(self):
+        """Entries get their own outermost dim; the stick maps to no host dim."""
+        required_stl = _build_required_stl(
+            self._table_stl(), indirect_device_pos=2, host_size=[128]
+        )
+
+        # The layout a host [N, 1] input already receives.
+        self.assertEqual(list(required_stl.device_size), [128, 1, 64])
+        self.assertEqual(list(required_stl.stride_map), [1, -1, -1])
+
+    def test_entry_count_comes_from_the_host_extent(self):
+        """A 100-entry table keeps its length, not the 128 slots it sits in."""
+        required_stl = _build_required_stl(
+            self._table_stl(), indirect_device_pos=2, host_size=[100]
+        )
+
+        self.assertEqual(list(required_stl.device_size), [100, 1, 64])
+
+    def test_retile_is_not_a_permutation(self):
+        """A re-tile has to go through a copy, not a producer relabel."""
+        original_stl = self._table_stl()
+        required_stl = _build_required_stl(
+            original_stl, indirect_device_pos=2, host_size=[128]
+        )
+
+        self.assertFalse(_is_permutation_of(original_stl, required_stl))
+
+    def test_rotation_is_a_permutation(self):
+        """A rotation only reorders dims, so relabelling stays safe."""
+        original_stl = SpyreTensorLayout(
+            device_size=[2, 8, 64, 1],
+            stride_map=[512, 64, 1, 1],
+            device_dtype=get_device_dtype(torch.float16),
+        )
+        required_stl = _build_required_stl(original_stl, indirect_device_pos=1)
+
+        self.assertTrue(_is_permutation_of(original_stl, required_stl))
+
+    def test_rejects_tiles_spanning_two_host_dims(self):
+        """Merging is refused when the dims are not tiles of one host dim."""
+        # Stride 128 with an inner size of 64 leaves a gap.
+        stl = SpyreTensorLayout(
+            device_size=[4, 1, 64],
+            stride_map=[128, -1, 1],
+            device_dtype=get_device_dtype(torch.bfloat16),
+        )
+        with self.assertRaises(Unsupported):
+            _build_required_stl(stl, indirect_device_pos=2, host_size=[256])
 
 
 class TestDenseScatterSourceStl(unittest.TestCase):
