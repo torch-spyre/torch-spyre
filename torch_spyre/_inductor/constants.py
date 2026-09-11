@@ -16,9 +16,6 @@ import torch
 
 from torch_spyre._C import ElementArrangement
 
-# A stick is a 128-byte aligned chunk: 64 elements at fp16/bf16, 32 at fp32.
-BYTES_PER_STICK = 128
-
 BATCH_MATMUL_OP = "batchmatmul"
 IDENTITY_OP = "identity"
 RESTICKIFY_OP = "ReStickifyOpHBM"

@@ -2011,6 +2011,27 @@ def stick_compatible(coords: "list[list[sympy.Expr]]") -> bool:
     return len(stick_vars) <= 1 and stick_vars.isdisjoint(nonstick_vars)
 
 
+def _elided_stick_target(
+    out_stl: SpyreTensorLayout,
+    out_idc: list,
+    bcast_syms: set,
+    device_dtype,
+) -> SpyreTensorLayout:
+    """Build the output's layout, collapsing dims the input broadcasts over.
+
+    A dim carrying a symbol the input lacks becomes size 1: the input has one
+    value there for all of the output's. The stick is emptied.
+    """
+    device_size, stride_map = [], []
+    for dim, coord in enumerate(out_idc[:-1]):
+        broadcast = bool(coord.free_symbols & bcast_syms)
+        device_size.append(1 if broadcast else out_stl.device_size[dim])
+        stride_map.append(-1 if broadcast else out_stl.stride_map[dim])
+    device_size.append(out_stl.device_size[-1])
+    stride_map.append(-1)
+    return SpyreTensorLayout(device_size, stride_map, device_dtype)
+
+
 def compute_restickify_needed(
     in_stl: SpyreTensorLayout,
     in_host: FixedLayout,
@@ -2123,6 +2144,16 @@ def compute_restickify_needed(
             f"k_chunk_dim not found in sparse-N=1 restickify path: "
             f"stride_map={sm}, elem_stride={elem_stride}, stick_size={stick_size}"
         )
+
+    if target_stick == sympy.S.Zero and in_stick_offset_free:
+        # One element per stick: a gather from a re-tiled table, or a
+        # reduction over the stick dim. The helper below only moves a stick
+        # between host dims, so build the target here instead.
+        bcast_syms = out_dep.index.free_symbols - in_dep.index.free_symbols
+        if in_dep.index == out_dep.index.subs({sym: 0 for sym in bcast_syms}):
+            return True, _elided_stick_target(
+                out_stl, out_idc, bcast_syms, in_stl.device_dtype
+            )
 
     if target_stick == sympy.S.Zero and not in_stick_offset_free:
         # No output dim carries the input's stick var, so compute_restickify_target_layout

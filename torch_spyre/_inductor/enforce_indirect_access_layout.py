@@ -43,7 +43,7 @@ from torch._inductor.ir import (
 )
 from torch_spyre._C import DataFormats, SpyreTensorLayout
 
-from .constants import BYTES_PER_STICK, ELIDED_COPY_BACK_ATTR
+from .constants import ELIDED_COPY_BACK_ATTR
 from .errors import Unsupported
 from .insert_restickify import (
     _create_restickify_node,
@@ -53,7 +53,6 @@ from .insert_restickify import (
 from .ir import FixedTiledLayout
 from .logging_utils import get_inductor_logger
 from .op_spec import IndirectAccess
-from .work_division import MAX_SPAN_BYTES
 from .pass_utils import (
     AlignmentAccess,
     _build_indirect_store_subs,
@@ -66,9 +65,11 @@ from .pass_utils import (
     padded_entry_output_stl,
 )
 from .views import AlignmentInputs, UnalignedStickSplit, align_tensors_pure
+from .work_division import MAX_SPAN_BYTES
 from . import config
 
 logger = get_inductor_logger("enforce_indirect_access_layout")
+_STICK_BYTES = 128
 
 
 def _pad_output_for_stick_aligned_split(op: ComputedBuffer) -> bool:
@@ -239,6 +240,7 @@ def _build_entry_per_stick_stl(
         )
     entries = extents[0] if extents else 1
 
+    assert 0 in mapped, f"leading dim is not part of the tiling: {stride_map}"
     new_device_size = [entries]
     new_stride_map = [min(stride_map[i] for i in mapped)]
     for i in range(1, len(device_size) - 1):
@@ -249,7 +251,7 @@ def _build_entry_per_stick_stl(
     new_stride_map.append(-1)
 
     # A stick per entry, so a large table can outgrow the span limit.
-    retiled_bytes = prod(new_device_size[:-1]) * BYTES_PER_STICK
+    retiled_bytes = prod(new_device_size[:-1]) * _STICK_BYTES
     if retiled_bytes > MAX_SPAN_BYTES:
         raise Unsupported(
             f"cannot re-tile value tensor: one entry per stick would take "
