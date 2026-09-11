@@ -1245,6 +1245,11 @@ def test_lx_relayout_read_expansion_device(reader, enabled):
     """A reader's own reduction does not make its input partial."""
     torch.manual_seed(0)
     value = torch.randn(8, 128, 256, dtype=torch.float16) * 0.01
+    if reader != "split_matmul":
+        # Exact in IEEE and device FP16; distinguish movement from input rounding.
+        value = (
+            ((torch.arange(value.numel()) % 127 - 63) / 64).half().reshape(value.shape)
+        )
     weight = torch.randn(8, 256, 64, dtype=torch.float16) * 0.01
     for name, size in (("H", 8), ("M", 128), ("K", 256), ("N", 64)):
         _declare_tensor_dim(name, size)
@@ -1265,6 +1270,8 @@ def test_lx_relayout_read_expansion_device(reader, enabled):
         _name_tensor_dims(value.to("spyre"), ["H", "M", "K"]),
         _name_tensor_dims(weight.to("spyre"), ["H", "K", "N"]),
     )
+    if reader != "split_matmul":
+        torch.testing.assert_close(args[0].cpu(), value, rtol=0, atol=0)
     torch._dynamo.reset()
     torch._inductor.codecache.FxGraphCache.clear()
     with (
@@ -1289,6 +1296,17 @@ def test_lx_relayout_read_expansion_device(reader, enabled):
     if enabled:
         assert re.findall(r"num_cores=(\d+)", copies[0]) == ["8", "32"]
         _assert_lx_only_relayout_payload(directories)
+    if reader == "split_matmul":
+        matmuls = [
+            root
+            for directory in directories
+            for path in directory.glob("sdsc_*.json")
+            for name, root in json.loads(path.read_text()).items()
+            if name.endswith(BATCH_MATMUL_OP)
+        ]
+        assert len(matmuls) == 1
+        assert matmuls[0]["numCoresUsed_"] == 32
+        assert matmuls[0]["numWkSlicesPerDim_"]["in"] == 4
 
 
 @config.patch(
