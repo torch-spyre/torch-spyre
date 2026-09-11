@@ -81,6 +81,7 @@ from .pass_utils import format_operations, finalize_work_division_for_scheduler
 from .scratchpad.allocator import (
     scratchpad_planning,
 )
+from .scratchpad.lx_relayout import anchor_lx_relayout_ownership
 from .fusion import spyre_fuse_nodes
 from .scheduler import (
     build_loop_scheduler_nodes,
@@ -404,13 +405,14 @@ def _distribute_work(graph: GraphLowering) -> None:
     work_distribution(graph, preassigned_ops)
 
 
-@_runs(scratchpad_planning)
+@_runs(anchor_lx_relayout_ownership, scratchpad_planning)
 def _maybe_scratchpad_planning(graph: GraphLowering) -> None:
     if not config.lx_planning:
         return
     # The allocator (and its layout solver) is selected from config by
     # scratchpad_planning -> select_allocator; no allocator wiring here.
-    scratchpad_planning(graph)
+    plans = anchor_lx_relayout_ownership(graph)
+    scratchpad_planning(graph, lx_relayout_plans=plans)
 
 
 class CustomPreSchedulingPasses:
