@@ -2079,5 +2079,122 @@ class TestBoundaryCloneInPlace(BaseTestScratchpadUsage):
         )
 
 
+class TestGeneratedCoreDivisions(BaseTestScratchpadUsage):
+    """The generation seam on real graphs: the per-candidate machinery the SA
+    co-optimizer asks instead of the enumerated menu and its pair table.
+
+    Assertion-style, like :class:`TestBoundaryCloneInPlace` -- they inspect what
+    the allocator hands the solver rather than sweeping models. The unit tests
+    for these seams (``test_work_division.py``) build their own contexts and
+    preps; what only a real compile can check is that the two answers agree on
+    *live* ops, which is what a generated division rests on."""
+
+    def _captured_buffers(self, fn, x):
+        """The buffer list the co-optimizing allocator built, plus the result.
+
+        The assertions run inside the spy: the split space and the residency
+        edges hold live Inductor IR, which needs the virtualized compile context
+        that ``torch.compile`` tears down on exit."""
+        from torch_spyre._inductor.scratchpad.allocator import CoOptimizingAllocator
+
+        checked: list[tuple[str, str]] = []
+        orig = CoOptimizingAllocator._build_cd_bound_buffers
+
+        def spy(inner_self, *args, **kwargs):
+            buffers = orig(inner_self, *args, **kwargs)
+            self._check_buffers(buffers, checked)
+            return buffers
+
+        with patch.object(CoOptimizingAllocator, "_build_cd_bound_buffers", spy):
+            with ts_inductor_config.patch(
+                lx_planning=True,
+                layout_solver="simulated_annealing",
+                co_optimizing_lx_planning=True,
+                sencores=32,
+                _cpsat_warn_on_cost_expr=False,
+            ):
+                result = torch.compile(fn, fullgraph=True)(x).to("cpu")
+        return checked, result
+
+    def _check_buffers(self, buffers, checked):
+        """Every claim the engine makes about a live buffer, per buffer."""
+        by_name = {b.name: b for b in buffers}
+        for buf in buffers:
+            space = buf.division_space
+            if space is not None:
+                # The menu is exactly what the space admits, which is what makes
+                # a generated division one the enumeration would have carried.
+                for division in buf.core_divisions:
+                    self.assertTrue(
+                        space.admits(space.splits(division)),
+                        f"{buf.name}: menu entry {division.label} not admitted",
+                    )
+                menu = {division.label for division in buf.core_divisions}
+                for neighbour in space.neighbours(buf.core_divisions[0]):
+                    self.assertIn(neighbour.label, menu, buf.name)
+                checked.append(("space", buf.name))
+            # The pair table is a projection of the edges, so the two agree on
+            # every row -- and where both ends generate, so does the inverse
+            # that replaces the row.
+            self.assertEqual(
+                set(buf.residency_edges) - set(buf.cd_parent_matches),
+                set(),
+                buf.name,
+            )
+            for parent, edge in buf.residency_edges.items():
+                pairs = buf.cd_parent_matches[parent]
+                parent_divisions = by_name[parent].core_divisions
+                self.assertEqual(
+                    edge.match_pairs(parent_divisions, buf.core_divisions),
+                    pairs,
+                    f"{buf.name} <- {parent}",
+                )
+                checked.append(("edge", buf.name))
+                parent_space = by_name[parent].division_space
+                if parent_space is None or space is None:
+                    continue
+                for i, parent_division in enumerate(parent_divisions):
+                    constructed = edge.consumer_division_for(parent_division, space)
+                    compatible = [j for ip, j in pairs if ip == i]
+                    if constructed is None:
+                        self.assertFalse(
+                            compatible,
+                            f"{buf.name} <- {parent}: no inverse for candidate "
+                            f"{i}, but the table pairs it with {compatible}",
+                        )
+                        continue
+                    self.assertIn(
+                        constructed.label,
+                        [buf.core_divisions[j].label for j in compatible],
+                        f"{buf.name} <- {parent}: inverse of candidate {i}",
+                    )
+                    checked.append(("inverse", buf.name))
+
+    @unittest.skipUnless(_HAS_ORTOOLS, "co-optimizing path needs ortools")
+    def test_generated_divisions_agree_with_the_enumeration_on_a_real_graph(self):
+        x = self.rand_device((64, 1024))
+
+        def fn(x):
+            a = x + 1.0
+            b = a * 2.0
+            return torch.nn.functional.softmax(b, dim=-1)
+
+        checked, result = self._captured_buffers(fn, x)
+        kinds = {kind for kind, _name in checked}
+        # Non-vacuity: all three claims have to have been made on something.
+        self.assertIn("space", kinds, "no buffer got a split space")
+        self.assertIn("edge", kinds, "no buffer got a residency edge")
+        self.assertIn("inverse", kinds, "no edge exercised the view inverse")
+        self.assertTrue(
+            torch.allclose(
+                torch.nn.functional.softmax((x.to("cpu") + 1.0) * 2.0, dim=-1),
+                result,
+                atol=1e-2,
+                rtol=1e-3,
+            ),
+            "generated core divisions changed the numerical result",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

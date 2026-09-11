@@ -878,3 +878,190 @@ def test_reshape_changes_per_core_ownership_within_one_device_axis(
         {consumer_head: 16, consumer_outer: 2, consumer_inner: 1},
     )
     assert outer_split_representable
+
+
+# The inverse of the per-core view: given a producer's slicing of a buffer,
+# rebuild the split map a consumer needs to read it the same way. Every case
+# below verifies the answer by calling the forward map on it, which is the
+# soundness argument -- a wrong inverse can only ever be a miss.
+
+_HEAD_DOMAIN = [1, 2, 4, 8, 16]  # divisors of the 16-element outer host dim
+_FLAT_DOMAIN = [1, 2, 4, 8]  # divisors of the 8-stick inner host dim
+
+
+def _reproduces(prep, splits, target):
+    view, _partial, representable = pass_utils_module._per_core_view_from_prep(
+        prep, splits
+    )
+    return representable and view == target
+
+
+def _producer_prep():
+    """A 2D stickified buffer sliced by an outer axis and a stick-counted one."""
+    head, flat = sympy.symbols("head flat", integer=True, nonnegative=True)
+    prep, _ = _prepare_compound_axis_view({head: 16, flat: 512}, 512 * head + flat)
+    return prep, head, flat
+
+
+def _consumer_prep(*, swap_axis_order=False, reduction=False):
+    """The same buffer as a *different* op sees it: its own axis names, its own
+    iteration order, and optionally a reduction axis the producer has not got."""
+    row, col, red = sympy.symbols("row col red", integer=True, nonnegative=True)
+    space = {col: 512, row: 16} if swap_axis_order else {row: 16, col: 512}
+    if reduction:
+        space[red] = 64
+    prep, _ = _prepare_compound_axis_view(space, 512 * row + col)
+    return prep, row, col, red
+
+
+def test_inverse_rebuilds_a_split_on_a_differently_named_iteration_space():
+    prep, head, flat = _producer_prep()
+    target, _, representable = pass_utils_module._per_core_view_from_prep(
+        prep, {head: 4, flat: 2}
+    )
+    assert representable
+    assert target.work_slice_dims == ((2, 2), (3, 4))
+
+    consumer, row, col, red = _consumer_prep(reduction=True)
+    splits = pass_utils_module.invert_per_core_view(
+        consumer,
+        target,
+        {row: _HEAD_DOMAIN, col: _FLAT_DOMAIN, red: [1, 2, 4]},
+    )
+    assert splits == {row: 4, col: 2, red: 1}
+    assert _reproduces(consumer, splits, target)
+
+
+def test_inverse_round_trips_every_representable_split_of_one_prep():
+    """The claim the search rests on: what the forward map can express, the
+    inverse can rebuild."""
+    prep, head, flat = _producer_prep()
+    domains = {head: _HEAD_DOMAIN, flat: _FLAT_DOMAIN}
+    inverted = 0
+    for head_split in _HEAD_DOMAIN:
+        for flat_split in _FLAT_DOMAIN:
+            splits = {head: head_split, flat: flat_split}
+            view, _partial, representable = pass_utils_module._per_core_view_from_prep(
+                prep, splits
+            )
+            if not representable or not view.work_slice_dims:
+                continue
+            got = pass_utils_module.invert_per_core_view(prep, view, domains)
+            assert got is not None, splits
+            assert _reproduces(prep, got, view)
+            inverted += 1
+    assert inverted >= 10
+
+
+def test_inverse_searches_an_axis_the_view_cannot_see():
+    """A reduction axis does not slice the buffer, so it leaves no trace in
+    ``work_slice_dims`` -- but its factor still shifts every slot expression, so
+    it has to be searched rather than solved."""
+    head, flat, k = sympy.symbols("head flat k", integer=True, nonnegative=True)
+    prep, _ = _prepare_compound_axis_view(
+        {head: 16, flat: 512, k: 64}, 512 * head + flat
+    )
+    target, _, representable = pass_utils_module._per_core_view_from_prep(
+        prep, {head: 2, flat: 1, k: 2}
+    )
+    assert representable
+    assert target.work_slice_dims == ((3, 2),)
+    assert target.num_cores == 4
+
+    consumer, row, col, red = _consumer_prep(reduction=True)
+    domains = {row: _HEAD_DOMAIN, col: _FLAT_DOMAIN, red: [1, 2, 4]}
+    assert pass_utils_module.invert_per_core_view(consumer, target, domains) == {
+        row: 2,
+        col: 1,
+        red: 2,
+    }
+    # Without the freedom on that axis there is no answer at all: two cores'
+    # worth of the division is invisible in the view.
+    assert (
+        pass_utils_module.invert_per_core_view(consumer, target, {**domains, red: [1]})
+        is None
+    )
+
+
+def test_inverse_recovers_a_split_shadowed_at_one_host_stride():
+    """``splits_by_stride`` is keyed by host stride, so of two axes sharing one
+    stride only the later reaches the geometry; the other's factor is
+    unobservable and has to be searched too."""
+    a, b, col = sympy.symbols("a b col", integer=True, nonnegative=True)
+    prep, _ = _prepare_compound_axis_view(
+        {a: 4, b: 4, col: 512}, 512 * a + 512 * b + col
+    )
+    assert prep.dep_coeff[a] == prep.dep_coeff[b]
+    target, _, representable = pass_utils_module._per_core_view_from_prep(
+        prep, {a: 2, b: 2, col: 1}
+    )
+    assert representable
+    assert (target.work_slice_dims, target.num_cores) == (((3, 2),), 4)
+
+    domains = {a: [1, 2, 4], b: [1, 2, 4], col: _FLAT_DOMAIN}
+    splits = pass_utils_module.invert_per_core_view(prep, target, domains)
+    assert splits == {a: 2, b: 2, col: 1}
+    assert _reproduces(prep, splits, target)
+
+
+def test_inverse_backtracks_past_a_candidate_the_caller_rejects():
+    """Several axes can serve one device dim, so a candidate the caller's own
+    legality filter turns down must fall through to the next -- taking the first
+    placement is wrong on a real fraction of edges."""
+    a, b, col = sympy.symbols("a b col", integer=True, nonnegative=True)
+    prep, _ = _prepare_compound_axis_view(
+        {a: 4, b: 4, col: 512}, 512 * a + 512 * b + col
+    )
+    domains = {a: [1, 2, 4], b: [1, 2, 4], col: _FLAT_DOMAIN}
+    target, _, _ = pass_utils_module._per_core_view_from_prep(
+        prep, {a: 4, b: 1, col: 1}
+    )
+
+    first = pass_utils_module.invert_per_core_view(prep, target, domains)
+    assert first == {a: 4, b: 1, col: 1}
+
+    rejected: list[dict] = []
+
+    def accept(candidate):
+        if not rejected:
+            rejected.append(dict(candidate))
+            return False
+        return True
+
+    second = pass_utils_module.invert_per_core_view(
+        prep, target, domains, accept=accept
+    )
+    assert rejected == [first]
+    assert second == {a: 1, b: 4, col: 1}
+    assert _reproduces(prep, second, target)
+
+
+def test_inverse_declines_a_view_no_legal_split_reproduces():
+    """A consumer that iterates the two sliced axes in the other order assigns
+    the slices to different cores, and no factor choice repairs that."""
+    prep, head, flat = _producer_prep()
+    target, _, _ = pass_utils_module._per_core_view_from_prep(prep, {head: 4, flat: 2})
+
+    consumer, row, col, _red = _consumer_prep(swap_axis_order=True)
+    domains = {row: _HEAD_DOMAIN, col: _FLAT_DOMAIN}
+    assert pass_utils_module.invert_per_core_view(consumer, target, domains) is None
+    # Not a miss: an exhaustive scan of the same domains finds nothing either.
+    assert not [
+        (row_split, col_split)
+        for row_split in _HEAD_DOMAIN
+        for col_split in _FLAT_DOMAIN
+        if _reproduces(consumer, {row: row_split, col: col_split}, target)
+    ]
+
+
+def test_inverse_gives_up_rather_than_probing_without_bound():
+    prep, head, flat = _producer_prep()
+    target, _, _ = pass_utils_module._per_core_view_from_prep(prep, {head: 4, flat: 2})
+    domains = {head: _HEAD_DOMAIN, flat: _FLAT_DOMAIN}
+    assert pass_utils_module.invert_per_core_view(prep, target, domains) is not None
+    assert (
+        pass_utils_module.invert_per_core_view(prep, target, domains, max_probes=0)
+        is None
+    )
+    # An unrepresentable edge has no prep, and so no inverse.
+    assert pass_utils_module.invert_per_core_view(None, target, domains) is None
