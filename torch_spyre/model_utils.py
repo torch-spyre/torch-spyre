@@ -292,9 +292,11 @@ def _transfer_module(
     """
     if _module_overrides_apply(module):
         module._apply(
-            lambda t: _dma_to_spyre_default(t, target_dtype=dtype)
-            if t is not None and t.device.type != DEVICE_NAME
-            else t
+            lambda t: (
+                _dma_to_spyre_default(t, target_dtype=dtype)
+                if t is not None and t.device.type != DEVICE_NAME
+                else t
+            )
         )
         return
 

@@ -1622,8 +1622,10 @@ making any new ones. The exact buffer allocation depends on whether tiling
 is flat (reduction dim only) or nested (outer output dim + inner reduction
 dim):
 
-**Flat (K-only) tiling** — a single `accum_full` HBM buffer is allocated.
-The fill and combine ops both target `accum_full` directly.
+**Flat (reduction-dim only) tiling** — a single `accum_full` HBM buffer is
+allocated.  The fill and combine ops both target `accum_full` directly.  The
+reduction dim here is BMM `k` or the reduced axis of a `sum`/`prod`/`max`/`min`
+reduction (the span-overflow pass now routes both).
 
 1. **Allocate `accum_full`** with the full output shape (`data.ranges`,
    which is already the full output since only `reduction_ranges` was

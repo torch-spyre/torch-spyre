@@ -1812,12 +1812,31 @@ def reduction_loop_vars(op: ComputedBuffer) -> list[sympy.Symbol]:
     through it: ``_loop_var_to_reduction_ranges_pos`` (loop_var -> position) and
     coarse tiling's reduction-axis lowering (its inverse, position -> loop_var,
     in ``scratchpad.coarse_tiling.tile_spec_to_dim_hints``).
+
+    A fused pointwise prologue can make the reduction read more than one
+    operand (e.g. ``(x * bias[:, None]).sum(1)``), and a broadcast operand
+    carries a strict subset of the reduction symbols (often none).  Pick the
+    read dep that indexes the *most* reduction symbols, so a leading broadcast
+    operand neither yields an empty result nor a short, mis-positioned list
+    (consumers index this positionally by reduction-range position).
     """
     assert isinstance(op.data, Reduction)
     rw = op.get_read_writes()
     out_dep = next(iter(rw.writes))
     out_syms = out_dep.index.free_symbols
-    in_dep = next(d for d in rw.reads if hasattr(d, "index"))
+    # isinstance, not hasattr(d, "index"): StarDep.index is a property that
+    # raises NotImplementedError rather than being absent, and hasattr only
+    # swallows AttributeError -- a StarDep anywhere in rw.reads (e.g. a
+    # bucketize read) would otherwise crash this list comprehension, which
+    # (unlike the single next(...) it replaced) evaluates the predicate on
+    # every dep rather than stopping at the first match.
+    in_deps = [d for d in rw.reads if isinstance(d, MemoryDep)]
+    if not in_deps:
+        return []
+    in_dep = max(
+        in_deps,
+        key=lambda d: len([s for s in d.ranges if s not in out_syms]),
+    )
     return [s for s in in_dep.ranges if s not in out_syms]
 
 
