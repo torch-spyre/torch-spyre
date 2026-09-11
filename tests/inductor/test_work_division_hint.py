@@ -868,27 +868,29 @@ def test_lx_relayout_activation_policy_is_source_wide():
         assert lx_relayout_module._is_activation_source(graph, {"input": dep}, producer)
 
 
-def test_lx_relayout_planner_rejects_equal_projected_ownership():
-    m = Symbol("m")
-    source_view = PerCoreView(
-        ((1, 32),),
-        ((1, Mod(_CORE_ID, 32)),),
-        num_cores=32,
-    )
-    destination_view = PerCoreView(
-        ((0, 32),),
-        ((0, Mod(_CORE_ID, 32)),),
-        num_cores=32,
-    )
-    coordinates = [m, m]
-    source_work_division = work_division_from_view(
-        source_view, [32, 32], coordinates, {m: 32}
-    )
-    destination_work_division = work_division_from_view(
-        destination_view, [32, 32], coordinates, {m: 32}
-    )
-    assert source_view != destination_view
-    assert source_work_division == destination_work_division
+@config.patch({"sencores": 32, "lx_planner_relayout": True})
+@pytest.mark.parametrize(
+    "reader", ["collapsed", "split_matmul", "pointwise", "reduction"]
+)
+def test_lx_relayout_planner_uses_projected_read_ownership(reader):
+    m, n = Symbol("m"), Symbol("n")
+    source_cores = 32 if reader == "collapsed" else 8
+    if reader == "collapsed":
+        source_view = _view({1: 32}, {1: Mod(_CORE_ID, 32)}, 32)
+        destination_view = _view({0: 32}, {0: Mod(_CORE_ID, 32)}, 32)
+        coordinates, space = [m, m], {m: 32}
+        assert source_view != destination_view
+        assert work_division_from_view(
+            source_view, [32, 32], coordinates, space
+        ).same_ownership(
+            work_division_from_view(destination_view, [32, 32], coordinates, space)
+        )
+    else:
+        source_view = _view({0: 8}, {0: _CORE_ID}, 8)
+        destination_view = _view(
+            {0: 8, 1: 4}, {0: Mod(_CORE_ID, 8), 1: floor(_CORE_ID / 8)}, 32
+        )
+        coordinates, space = [m, n], {m: 32, n: 32}
 
     source_dep = SimpleNamespace(name="source", is_indirect=lambda: False)
     producer = SimpleNamespace(
@@ -898,7 +900,7 @@ def test_lx_relayout_planner_rejects_equal_projected_ownership():
     )
     consumer = SimpleNamespace(
         layout=SimpleNamespace(),
-        data=SimpleNamespace(),
+        data=object() if reader == "reduction" else SimpleNamespace(),
         get_name=lambda: "consumer",
     )
     graph = SimpleNamespace(operations=[producer, consumer])
@@ -906,7 +908,10 @@ def test_lx_relayout_planner_rejects_equal_projected_ownership():
     def read_writes(op):
         if op is producer:
             return SimpleNamespace(reads=[], writes=[source_dep])
-        return SimpleNamespace(reads=[source_dep], writes=[])
+        reads = [source_dep]
+        if reader == "split_matmul":
+            reads.append(SimpleNamespace(name="weight", is_indirect=lambda: False))
+        return SimpleNamespace(reads=reads, writes=[])
 
     with (
         mock_patch.object(lx_relayout_module, "MemoryDep", SimpleNamespace),
@@ -921,20 +926,35 @@ def test_lx_relayout_planner_rejects_equal_projected_ownership():
             "_per_core_view_on_buf",
             side_effect=[
                 (source_view, False, True),
-                (destination_view, False, True),
+                (destination_view, reader == "split_matmul", True),
             ],
         ),
-        mock_patch.object(lx_relayout_module, "_op_num_cores", return_value=32),
+        mock_patch.object(
+            lx_relayout_module,
+            "_op_num_cores",
+            side_effect=lambda op: source_cores if op is producer else 32,
+        ),
+        mock_patch.object(
+            lx_relayout_module,
+            "_is_matmul_op",
+            side_effect=lambda op: op is consumer and reader == "split_matmul",
+        ),
         mock_patch.object(
             lx_relayout_module, "try_device_coordinates", return_value=coordinates
         ),
         mock_patch.object(
-            lx_relayout_module, "iteration_space_from_op", return_value={m: 32}
+            lx_relayout_module, "iteration_space_from_op", return_value=space
         ),
         mock_patch.object(lx_relayout_module, "is_restickify_op", return_value=False),
         mock_patch.object(lx_relayout_module, "partition_footprint", return_value=128),
     ):
-        assert lx_relayout_module.collect_lx_relayout_plans(graph) == []
+        plans = lx_relayout_module.collect_lx_relayout_plans(graph)
+        if reader in ("collapsed", "reduction"):
+            assert plans == []
+        else:
+            assert len(plans) == 1
+            assert plans[0].num_cores == source_cores
+            assert plans[0].destination_view.same_partition(destination_view)
 
 
 def _compile_spec(spec, normalize=True):
@@ -1209,6 +1229,59 @@ def test_grouped_lx_relayout_device(broadcast):
     domains = re.findall(r"num_cores=(\d+)", relayouts[0])
     assert domains == [str(source_cores), "32"]
     _assert_lx_only_relayout_payload(output_dirs)
+
+
+@config.patch(
+    {
+        "sencores": 32,
+        "lx_planning": True,
+        "allow_all_ops_in_lx_planning": True,
+        "layout_solver": "greedy",
+    }
+)
+@pytest.mark.parametrize(
+    "split_matmul", [False, True], ids=["pointwise", "split_matmul"]
+)
+@pytest.mark.parametrize("enabled", [False, True])
+def test_lx_relayout_read_expansion_device(split_matmul, enabled):
+    """A reader's own reduction does not make its input partial."""
+    torch.manual_seed(0)
+    value = torch.randn(8, 128, 256, dtype=torch.float16) * 0.01
+    weight = torch.randn(8, 256, 64, dtype=torch.float16) * 0.01
+    for name, size in (("H", 8), ("M", 128), ("K", 256), ("N", 64)):
+        _declare_tensor_dim(name, size)
+
+    def fn(value, weight):
+        with spyre_hint(work_div={"H": 8}):
+            hidden = -value
+        with spyre_hint(work_div={"H": 8, "K" if split_matmul else "M": 4}):
+            return torch.bmm(hidden, weight) if split_matmul else torch.relu(hidden)
+
+    args = (
+        _name_tensor_dims(value.to("spyre"), ["H", "M", "K"]),
+        _name_tensor_dims(weight.to("spyre"), ["H", "K", "N"]),
+    )
+    torch._dynamo.reset()
+    torch._inductor.codecache.FxGraphCache.clear()
+    with (
+        config.patch(lx_planner_relayout=enabled),
+        _capture_backend_output_dirs() as directories,
+    ):
+        actual, code = run_and_get_code(
+            torch.compile(fn, dynamic=False, options={"epilogue_fusion": False}), *args
+        )
+    torch.testing.assert_close(actual.cpu(), fn(value, weight), rtol=2e-2, atol=2e-2)
+    copies = [
+        block
+        for block in "\n".join(code).split("OpSpec(")
+        if "op='identity'" in block[:100]
+        and block.count("allocation={'lx':") == 2
+        and block.count("TensorWorkDivision(") == 2
+    ]
+    assert len(copies) == int(enabled)
+    if enabled:
+        assert re.findall(r"num_cores=(\d+)", copies[0]) == ["8", "32"]
+        _assert_lx_only_relayout_payload(directories)
 
 
 @config.patch(

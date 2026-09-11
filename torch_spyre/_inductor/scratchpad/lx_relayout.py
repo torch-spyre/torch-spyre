@@ -541,13 +541,14 @@ def collect_lx_relayout_plans(
             if any(d.is_indirect() for d in deps):
                 rejection_reason = "cannot emit: consumer uses indirect access"
                 break
-            view, consumer_partial, representable = _per_core_view_on_buf(
+            view, _, representable = _per_core_view_on_buf(
                 consumer, dep, source_name, cache
             )
             consumer_num_cores = _op_num_cores(consumer)
-            if view is None or consumer_partial or not representable:
+            # A split reduction makes the consumer's output partial, not its input.
+            if view is None or not representable:
                 rejection_reason = (
-                    "cannot represent: consumer ownership is partial or unrepresentable"
+                    "cannot represent: consumer ownership is unrepresentable"
                 )
                 break
             if consumer_num_cores < source_num_cores:
@@ -556,11 +557,6 @@ def collect_lx_relayout_plans(
                 )
                 break
             is_matmul = _is_matmul_op(consumer)
-            if consumer_num_cores > source_num_cores and not is_matmul:
-                rejection_reason = (
-                    "cannot emit: grouped broadcast requires a matmul consumer"
-                )
-                break
             if (
                 consumer_num_cores > source_num_cores
                 and consumer_num_cores != config.sencores
