@@ -208,6 +208,10 @@ jobs:
     outputs:
       matrix: ${{ steps.filter.outputs.matrix }}
       resolved_test_type: ${{ steps.filter.outputs.resolved_test_type }}
+      # [{tier, covering_run}, ...] for the tiers this run SKIPS. The ingest copies those
+      # runs' case rows in, so a delta run reports its whole tier rather than only the part
+      # it executed. Empty ([] or "") whenever the delta is off or the lookup fails.
+      covered_runs: ${{ steps.filter.outputs.covered_runs }}
     steps:
       # NORMAL: sparse-checkout the configs from github.com at the requested ref.
       - if: ${{ !inputs.prebaked_image }}
@@ -270,13 +274,24 @@ jobs:
           # Tiers already covered for this commit+arch. Empty unless the delta is
           # enabled AND the lookup succeeds -- the script prints nothing and exits 0
           # on any failure, so an unreachable ClickHouse runs the full tier.
+          # ONE lookup for both consumers: --format both prints the bare tier CSV on line 1
+          # (what filter_configs matches) and the json with covering run ids on line 2 (what
+          # the ingest copies from). head/tail rather than a shell json parser -- an embedded
+          # python -c here would need every line indented or its unindented lines terminate
+          # this block scalar and break the workflow.
           EXCLUDE_TIERS=""
+          COVERED_RUNS="[]"
           if [ "${ENABLE_TIER_DELTA}" = "true" ] && [ -n "${SPYRE_CH_URL:-}" ]; then
-            EXCLUDE_TIERS=$(python3 .github/scripts/resolve_covered_tiers.py \
+            _delta_out=$(python3 .github/scripts/resolve_covered_tiers.py \
               --commit-sha "${DELTA_SHA}" \
               --arch "${DELTA_ARCH}" \
-              --test-type "${RAW_TEST_TYPE}" || true)
+              --test-type "${RAW_TEST_TYPE}" \
+              --format both || true)
+            EXCLUDE_TIERS=$(printf '%s\n' "${_delta_out}" | head -1)
+            COVERED_RUNS=$(printf '%s\n' "${_delta_out}" | tail -1)
+            [ -n "${COVERED_RUNS}" ] || COVERED_RUNS="[]"
           fi
+          echo "covered_runs=${COVERED_RUNS}" >> "$GITHUB_OUTPUT"
           # Array, not a string: expands to zero words when empty, so no unquoted
           # word-splitting is needed to pass 0-or-2 args.
           _delta_args=()
