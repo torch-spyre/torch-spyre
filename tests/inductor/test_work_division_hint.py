@@ -1239,11 +1239,9 @@ def test_grouped_lx_relayout_device(broadcast):
         "layout_solver": "greedy",
     }
 )
-@pytest.mark.parametrize(
-    "split_matmul", [False, True], ids=["pointwise", "split_matmul"]
-)
+@pytest.mark.parametrize("reader", ["pointwise", "split_matmul", "restickify"])
 @pytest.mark.parametrize("enabled", [False, True])
-def test_lx_relayout_read_expansion_device(split_matmul, enabled):
+def test_lx_relayout_read_expansion_device(reader, enabled):
     """A reader's own reduction does not make its input partial."""
     torch.manual_seed(0)
     value = torch.randn(8, 128, 256, dtype=torch.float16) * 0.01
@@ -1254,8 +1252,14 @@ def test_lx_relayout_read_expansion_device(split_matmul, enabled):
     def fn(value, weight):
         with spyre_hint(work_div={"H": 8}):
             hidden = -value
-        with spyre_hint(work_div={"H": 8, "K" if split_matmul else "M": 4}):
-            return torch.bmm(hidden, weight) if split_matmul else torch.relu(hidden)
+        with spyre_hint(work_div={"H": 8, "M" if reader == "pointwise" else "K": 4}):
+            if reader == "restickify":
+                return hidden.transpose(1, 2).contiguous()
+            return (
+                torch.bmm(hidden, weight)
+                if reader == "split_matmul"
+                else torch.relu(hidden)
+            )
 
     args = (
         _name_tensor_dims(value.to("spyre"), ["H", "M", "K"]),
@@ -1270,7 +1274,10 @@ def test_lx_relayout_read_expansion_device(split_matmul, enabled):
         actual, code = run_and_get_code(
             torch.compile(fn, dynamic=False, options={"epilogue_fusion": False}), *args
         )
-    torch.testing.assert_close(actual.cpu(), fn(value, weight), rtol=2e-2, atol=2e-2)
+    tolerance = 2e-2 if reader == "split_matmul" else 0
+    torch.testing.assert_close(
+        actual.cpu(), fn(value, weight), rtol=tolerance, atol=tolerance
+    )
     copies = [
         block
         for block in "\n".join(code).split("OpSpec(")
