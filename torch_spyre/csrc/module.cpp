@@ -407,6 +407,8 @@ PYBIND11_MODULE(_C, m) {
         py::arg("device_size"), py::arg("device_dtype"),
         "Return whole-stick storage bytes; reject undefined format geometry.");
   m.def("set_spyre_tensor_layout", &spyre::set_spyre_tensor_layout);
+  m.def("get_spyre_tensor_sizes", &spyre::get_spyre_tensor_sizes);
+  m.def("get_spyre_tensor_strides", &spyre::get_spyre_tensor_strides);
   m.def("get_downcast_warning", &spyre::get_downcast_warn_enabled,
         "Return whether downcast warnings are enabled.");
   m.def("set_downcast_warning", &spyre::set_downcast_warn_enabled,

@@ -79,6 +79,7 @@ from .pass_utils import (
     host_coordinates,
     identify_matmul_inputs,
     is_restickify_coords,
+    _is_compact_node,
     lower_pad_sequence,
     redirect_computed_buffer_reads,
     replace_computed_buffer_body,
@@ -512,6 +513,8 @@ def is_restickify_op(op: Operation, graph: GraphLowering) -> bool:
     if not isinstance(out_layout, FixedTiledLayout):
         return False
     if not isinstance(op.data, Pointwise):
+        return False
+    if _is_compact_node(op):
         return False
 
     in_dep, _in_buf, in_layout = _restickify_input(op, graph)
