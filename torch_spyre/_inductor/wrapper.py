@@ -20,6 +20,8 @@ from torch._inductor.codegen.wrapper import (
     PythonWrapperCodegen,
     SubgraphPythonWrapperCodegen,
 )
+from torch._inductor import config, ir
+from torch._dynamo.utils import counters
 from torch._inductor.ir import GraphPartitionSignature
 from torch._inductor.virtualized import V
 from torch._inductor.sizevars import SizeVarAllocator
@@ -74,6 +76,58 @@ class _SpyreWrapperCodegenMixin(PythonWrapperCodegen):
         device = node.layout.device
         self.writeline(
             f'{node.get_name()} = spyre_constant_tensor({value}, torch.device("{device}"), {dtype})'
+        )
+
+    def _generate_extern_kernel_alloc_helper(self, extern_kernel, args):
+        """Mark calls whose eager result is consumed inside this graph.
+
+        Spyre eager kernels normally preserve their actual device layout at an
+        eager boundary.  A ``FallbackKernel`` output, however, is assigned a
+        canonical layout by Inductor before the runtime eager call occurs.  The
+        marker lets the eager dispatcher normalize only this in-graph case.
+        """
+        if not isinstance(extern_kernel, ir.FallbackKernel):
+            return super()._generate_extern_kernel_alloc_helper(extern_kernel, args)
+
+        no_return = isinstance(extern_kernel.layout, ir.NoneLayout)
+        output_name = extern_kernel.get_name()
+        origin_node = extern_kernel.get_origin_node()
+        kernel_name = extern_kernel.get_kernel_name()
+        ending = self.ending
+        if config.memory_planning and "view_as_complex" in kernel_name:
+            ending = f".clone(){ending}"
+
+        comma = ", " if args else ""
+        call = f"_run_compiled_fallback({kernel_name}{comma}{', '.join(args)}){ending}"
+        if no_return:
+            self.writeline(f"{self.declare}{call}")
+        else:
+            self.writeline(f"{self.declare}{output_name} = {call}")
+            if (
+                self.supports_intermediate_hooks
+                and config.generate_intermediate_hooks
+                and origin_node is not None
+            ):
+                counters["inductor"]["intermediate_hooks"] += 1
+                self.writeline(
+                    f"run_intermediate_hooks({origin_node.name!r}, {output_name})"
+                )
+
+    def generate_fallback_kernel_with_runtime_lookup(
+        self,
+        buf_name,
+        python_kernel_name,
+        get_args,
+        op_overload,
+        raw_args,
+        outputs,
+    ) -> None:
+        """Apply the same marker to runtime-looked-up fallback overloads."""
+        args = list(get_args())
+        comma = ", " if args else ""
+        self.writeline(
+            f"{buf_name} = _run_compiled_fallback("
+            f"{python_kernel_name}{comma}{', '.join(args)})"
         )
 
     def _is_hbm_pool_buffer(self, buffer: BufferLike) -> bool:
@@ -148,6 +202,7 @@ class SpyrePythonWrapperCodegen(_SpyreWrapperCodegenMixin, PythonWrapperCodegen)
                 from torch_spyre.execution.async_compile import SpyreAsyncCompile
                 from torch_spyre._C import DataFormats, ElementArrangement, SpyreTensorLayout, spyre_empty_with_layout, set_spyre_tensor_layout
                 import subprocess
+                from torch_spyre.ops.eager import _run_compiled_fallback
             """,
             strip=True,
         )

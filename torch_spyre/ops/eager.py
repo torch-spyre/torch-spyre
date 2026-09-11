@@ -20,6 +20,7 @@ import warnings
 import functools
 import inspect
 import operator
+import threading
 
 
 aten = torch.ops.aten
@@ -97,6 +98,37 @@ class RetileWarning(UserWarning):
 warnings.simplefilter("once", RetileWarning)
 
 
+_compiled_fallback_state = threading.local()
+
+
+def _run_compiled_fallback(op, *args, **kwargs):
+    """Invoke an eager op on behalf of an Inductor ``FallbackKernel``.
+
+    Direct eager calls are device-layout boundaries: their returned tensor
+    carries its real ``SpyreTensorLayout``, and a later compiled graph reads
+    that layout from the real graph input.  A fallback *inside* a compiled
+    graph is different: layout propagation currently assigns its output the
+    canonical, size-derived layout without observing the eager result.  Mark
+    just those calls so ``_make_offset_safe_dispatch`` can make that assumed
+    layout true without canonicalizing ordinary eager-boundary results.
+
+    A depth rather than a boolean keeps nested composite fallbacks balanced.
+    The state is thread-local because generated graph wrappers can run from
+    independent application threads.
+    """
+
+    previous_depth = getattr(_compiled_fallback_state, "depth", 0)
+    _compiled_fallback_state.depth = previous_depth + 1
+    try:
+        return op(*args, **kwargs)
+    finally:
+        _compiled_fallback_state.depth = previous_depth
+
+
+def _in_compiled_fallback():
+    return bool(getattr(_compiled_fallback_state, "depth", 0))
+
+
 def _normalize_result_layout(x):
     """Return a copy of a Spyre tensor whose device layout is the *canonical* one
     for its logical shape.
@@ -106,6 +138,10 @@ def _normalize_result_layout(x):
     restickify to make that assumption true — so an eager kernel returning a
     differently-tiled buffer is read by the wrong tiling, silently. Rebuilding
     the result here makes the assumption hold.
+
+    This helper is only called while a generated compiled graph is executing a
+    fallback.  Direct eager results deliberately retain their real layout so a
+    subsequent compilation can accept it at the graph boundary.
 
     Only whole buffers are considered. ``device_tensor_layout()`` describes the
     tensor's BASE allocation, not the view, so for any view it reports a layout
@@ -315,7 +351,7 @@ def _make_offset_safe_dispatch(op):
 
         result = compiled(*args, **kwargs)
 
-        if normalize_results:
+        if normalize_results and _in_compiled_fallback():
             result = _map_result(result, _normalize_result_layout)
 
         if write_back:
