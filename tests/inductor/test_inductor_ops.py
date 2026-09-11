@@ -4152,8 +4152,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         ("test_mean_keepdim1", "test_mean_eager"): {
             "ops_dict": {"mean": torch.mean},
             "expect_fail": [
-                "fp16_3d_dim_2",
-                "fp16_3d_dim_neg1",
                 "fp32_3d_dim_2",
                 "fp32_3d_dim_neg1",
             ],
