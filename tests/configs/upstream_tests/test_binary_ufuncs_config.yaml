@@ -1,0 +1,38 @@
+test_suite_config:
+  files:
+    - path: ${TORCH_ROOT}/test/test_binary_ufuncs.py
+      unlisted_test_mode: skip
+      tests:
+        # add/sub/mul: contiguous vs transposed tensor layout correctness.
+        # div excluded: div_floor/trunc rounding modes internally use
+        # _index_put_impl_ and aten.eq.Scalar which are not supported on Spyre;
+        # those failures are unrelated to binary op dtype behavior.
+        - names:
+            - TestBinaryUfuncs::test_contig_vs_transposed
+          mode: mandatory_success
+          edits:
+            ops:
+              include:
+                - name: add
+                - name: sub
+                - name: mul
+            dtypes:
+              include:
+                - name: float16
+                - name: bfloat16
+                - name: float32
+            functions:
+              cpu_move:
+                - name: assertEqual
+                - name: assertTrue
+                - name: assertNotEqual
+
+  global:
+    supported_dtypes:
+      - name: float16
+      - name: bfloat16
+      - name: float32
+    supported_ops:
+      - name: add
+      - name: sub
+      - name: mul

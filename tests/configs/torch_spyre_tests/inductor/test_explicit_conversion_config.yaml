@@ -1,0 +1,66 @@
+test_suite_config:
+  labels: [unit, regression, trunk]
+  files:
+    - path: ${TORCH_DEVICE_ROOT}/tests/inductor/test_inductor_dtype_conversion.py
+      unlisted_test_mode: skip
+      tests:
+        - names:
+            - TestExplicitConversion::test_to_dtype_fp16_to_fp32_2d_stick_aligned
+            - TestExplicitConversion::test_to_dtype_fp16_to_fp32_fp32_stick_aligned
+            - TestExplicitConversion::test_to_dtype_bf16_to_fp32_2d_stick_aligned
+            - TestExplicitConversion::test_to_dtype_fp16_to_fp32_unaligned_4x16
+            - TestExplicitConversion::test_to_dtype_fp16_to_fp32_unaligned_4x68
+            - TestExplicitConversion::test_to_dtype_chain_fp16_fp32_bf16
+            - TestExplicitConversion::test_neg_fp16_dtype_preserved_after_explicit_cast
+            - TestExplicitConversion::test_abs_fp16_dtype_preserved
+            - TestExplicitConversion::test_to_dtype_work_division_fp16_fp32_sencores4
+            - TestExplicitConversion::test_to_dtype_transposed_fp16_to_fp32
+            - TestExplicitConversion::test_to_dtype_expanded_view_fp16_to_fp32
+            - TestExplicitConversion::test_float_shortcut_value_correctness
+            - TestExplicitConversion::test_bfloat16_shortcut_from_fp16_value_correctness
+            - TestExplicitConversion::test_special_values_nan_inf_preserved_through_fp16_fp32_conversion
+            - TestExplicitConversion::test_same_dtype_cast_is_noop_in_compiled_graph
+            - TestExplicitConversion::test_fp32_to_bool_compiled
+            - TestExplicitConversion::test_wa_exp_add_3d_stick_aligned
+            - TestExplicitConversion::test_wa_exp_sub_3d_stick_aligned
+            - TestExplicitConversion::test_wa_exp_mul_4d_stick_aligned
+            - TestExplicitConversion::test_explicit_fp16_to_fp32_chained_add_mul_3d
+          mode: mandatory_success
+
+        - names:
+            - TestModelIntegration::test_compiled_linear_fp16
+          mode: mandatory_success
+
+        # SKIP — non-contiguous fp16 source: slice (4,128)[:, :64] row stride 128 > logical extent; to_dtype wrong values
+        - names:
+            - TestExplicitConversion::test_wa_exp_add_non_contiguous_2d
+          mode: skip
+
+        # SKIP #2205 — FP32TODL16_OP output in DL16_TO_FP32 arrangement; D2H reads garbled values
+        - names:
+            - TestExplicitConversion::test_half_shortcut_value_correctness
+            - TestExplicitConversion::test_bfloat16_shortcut_from_fp32_value_correctness
+          mode: skip
+
+        # SKIP #2204 — unaligned shapes: padding propagation failure in to_dtype
+        - names:
+            - TestExplicitConversion::test_explicit_fp16_to_fp32_add_3d_unaligned
+            - TestExplicitConversion::test_explicit_fp16_to_fp32_add_4d_unaligned
+          mode: skip
+
+        # SKIP #2847 — eager .to(dtype) on Spyre tensor returns wrong result
+        - names:
+            - TestExplicitConversion::test_eager_to_dtype_fp32_to_fp16
+          mode: skip
+
+        # SKIP #2851 — stride-2 slice: unsupported stick expression
+        - names:
+            - TestExplicitConversion::test_to_dtype_strided_slice_fp16_to_fp32
+          mode: skip
+
+  global:
+    supported_dtypes:
+      - name: float16
+      - name: bfloat16
+      - name: float32
+      - name: bool
