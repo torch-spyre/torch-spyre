@@ -245,7 +245,7 @@ register_fallback_default(
         aten.ne.Scalar_out,
         aten.isin,
         aten.tril,
-        aten.triu,
+        aten.triu.out,
         aten.bitwise_xor.Tensor,
         aten.bitwise_xor.Tensor_out,
         aten.bitwise_or.Tensor,
@@ -264,6 +264,14 @@ register_fallback_default(
 # The kernel itself is registered in ops.py.
 fallback_ops.append(aten.normal_.default)
 fallback_ops.append(getattr(aten.random_, "from"))
+
+
+@register_fallback(["spyre::triu_cpu"])
+def spyre__triu_cpu(input, diagonal=0, **kwargs):
+    """
+    CPU fallback for torch.triu on dtypes with no Spyre elementwise support.
+    """
+    return torch.triu(input, diagonal)
 
 
 @register_fallback(["spyre::max_dim_int64_fallback"])
