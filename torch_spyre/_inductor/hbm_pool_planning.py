@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import math
 from typing import Callable
 from sympy import Symbol
 from torch._inductor.scheduler import (
@@ -23,6 +22,7 @@ from torch._inductor.scheduler import (
 )
 from torch._inductor.ir import FallbackKernel
 from torch._inductor.virtualized import V
+from torch_spyre._C import get_device_size_in_bytes
 from .constants import MAX_POOL_SIZE_BYTES, INTERMEDIATES_SEGMENT
 from .ir import FixedTiledLayout, SpyreEmptyFallback
 from .logging_utils import get_inductor_logger
@@ -30,7 +30,9 @@ from .scheduler import CountedLoopSchedulerNode
 from . import config
 
 logger = get_inductor_logger("HBM_POOL_PLANNING")
-_STICK_BYTES = 128
+
+# Address alignment required by the native allocator, not a data-format size.
+_HBM_ALLOCATION_ALIGNMENT_BYTES = 128
 _BYTES_PER_GB = 1024**3
 
 
@@ -116,9 +118,8 @@ def _compute_size_bytes(name: str) -> int:
         f"hbm_pool_planning: expected FixedTiledLayout for {name}, got {type(layout)}"
     )
     dev_layout = layout.device_layout
-    num_sticks = math.prod(dev_layout.device_size[:-1])
-    size_bytes = num_sticks * _STICK_BYTES
-    return _align_up(size_bytes, _STICK_BYTES)
+    size_bytes = get_device_size_in_bytes(dev_layout)
+    return _align_up(size_bytes, _HBM_ALLOCATION_ALIGNMENT_BYTES)
 
 
 def _compute_live_ranges(
