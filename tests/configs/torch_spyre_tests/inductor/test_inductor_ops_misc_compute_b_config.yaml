@@ -69,4 +69,5 @@ test_suite_config:
             # restickify add on padded dim tests
             - TestOps::test_restickify_add_transpose.*
             - TestOps::test_prod.*
+            - TestOps::test_div_rounding_mode.*
           mode: mandatory_success
