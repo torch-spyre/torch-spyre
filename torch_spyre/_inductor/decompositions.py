@@ -977,8 +977,8 @@ def _taylor_dtypes(input: torch.Tensor) -> tuple[torch.dtype, torch.dtype]:
     The compute dtype is *not* taken from the same call, and this is deliberate.
     ``elementwise_dtypes`` derives it through ``get_computation_dtype``, which
     reads ``torch._prims_common._computation_dtype_map`` -- and
-    ``torch_spyre._inductor.patches.spyre_data_types`` deliberately empties that
-    map for the whole Inductor compile, so upstream refs do not silently widen
+    ``torch_spyre._inductor.patches.spyre_data_types`` deliberately replaces that
+    map with identity entries for the whole Inductor compile, so refs do not widen
     fp16 to fp32 on a device whose native dtype is fp16.  Inside a Spyre compile
     it therefore reports ``compute=float16`` for fp16 input where an eager call
     reports ``compute=float32``; wearing ``elementwise_type_promotion_wrapper``
@@ -992,7 +992,14 @@ def _taylor_dtypes(input: torch.Tensor) -> tuple[torch.dtype, torch.dtype]:
     which is not a claim that Spyre executes fp64 -- H2D rejects a Double tensor
     outright.  It matters only because the bodies above are plain torch
     functions the CPU-side accuracy tests call directly, and this never narrows
-    one of those.
+    one of those.  Eager dispatch cannot arrive here with fp64 either, even
+    though ``_register_spyre_dispatchkey_kernels_permanently`` installs a
+    PrivateUse1 kernel for ``aten.cos`` / ``aten.sin``: that key selects on
+    device, not dtype, so a CPU fp64 tensor takes the CPU kernel, and no fp64
+    tensor can sit on a Spyre device to route here -- placement raises
+    ``Spyre backend does not support dtype Double``, and widening an
+    already-placed tensor via ``.to(torch.float64)`` dies with SIGFPE inside the
+    cast (measured; issue #1201's territory, nothing to do with this body).
 
     Complex is the one dtype aten accepts that these bodies do not serve, and it
     needs no guard because it cannot arrive: ``.to("spyre")`` rejects a complex
