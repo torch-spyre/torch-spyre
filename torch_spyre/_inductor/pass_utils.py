@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import io
+import itertools
 import math
 import warnings
 from dataclasses import dataclass
@@ -68,6 +69,7 @@ from .views import (
     build_alignment_inputs,
     compute_coordinates,
     matching_dim,
+    normalize_coordinates,
 )
 
 # PyTorch's default lower bound for size symbols (sizes 0/1 are specialised).
@@ -1300,6 +1302,39 @@ def try_device_coordinates(
         return device_coordinates(stl, dep, indirect_sizes)
     except Unsupported:
         return None
+
+
+def coordinates_normalizable(
+    stl: SpyreTensorLayout,
+    dep: MemoryDep,
+    indirect_sizes: "dict[sympy.Symbol, int] | None" = None,
+) -> bool:
+    """Whether every device coordinate of this access survives normalization.
+
+    ``try_device_coordinates`` only validates the stick expression, but codegen
+    later runs ``normalize_coordinates`` over *all* device dims, and that step
+    accepts a strictly smaller grammar (``num*(var%mod)//den + offset``).  A
+    layout whose row span is incommensurate with the access's host strides
+    yields a non-affine ``Mod(k*var, m)`` on a non-stick dim, which passes the
+    stick check and only fails at codegen.  Use this to reject such a candidate
+    while alternatives are still available.
+    """
+    try:
+        coords = alignment_coordinates(stl, dep.index, dep.ranges, indirect_sizes)
+        counter = itertools.count()
+        normalize_coordinates(
+            dict(dep.ranges),
+            stl.device_size,
+            coords,
+            lambda: Symbol(f"_probe{next(counter)}"),
+            indirect_sizes,
+        )
+    except (Unsupported, AssertionError):
+        # normalize_var_expr signals an unrepresentable term either way: the
+        # non-unit-fraction coefficient case is an assert, the modular case
+        # raises Unsupported.
+        return False
+    return True
 
 
 def _find_entry_output_dim(op) -> "tuple[int, int, int] | None":

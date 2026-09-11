@@ -80,6 +80,7 @@ from .ir import (
 from .pass_utils import (
     compute_restickify_target_layout,
     concretize_expr,
+    coordinates_normalizable,
     find_matmul_generated_var,
     find_reduction_var,
     get_matmul_m_size,
@@ -346,6 +347,36 @@ def _check_supported_input_sticks(args: list[PropArg], op_label: str) -> None:
             )
 
 
+def _convert_reads_whole_input(
+    in_layout: FixedLayout,
+    output: FixedLayout,
+    dep: MemoryDep,
+    output_dep: MemoryDep,
+) -> bool:
+    """Whether a dtype conversion traverses its input exactly as it writes its output.
+
+    Only then may the conversion inherit the input buffer's
+    ``device_size``/``stride_map`` (rescaled for the new stick depth). When the
+    read is a *slice* of a wider buffer -- Gemma's ``q_norm``/``k_norm`` upcast
+    part of the fused QKV projection into a fresh, narrower per-head buffer --
+    the inherited row span belongs to the input buffer while the elements land
+    in a buffer with a different row stride. ``compute_coordinates`` then folds
+    that mismatch into the outer coordinate as ``Mod(a*var, b)`` with
+    ``a/b = row_out/row_in`` in lowest terms, which either falls outside the
+    normalization grammar (``a != 1``, a codegen-time hard error) or, worse, is
+    representable but addresses the wrong sticks (``a == 1``, silently wrong
+    results). Mirrors the identical-access test the general convert path uses,
+    minus the element-width condition -- rescaling the stick depth is exactly
+    what this path is for.
+    """
+    return (
+        list(in_layout.size) == list(output.size)
+        and dep.index == output_dep.index
+        and host_coordinates(in_layout, dep, None)
+        == host_coordinates(output, output_dep, None)
+    )
+
+
 def _qfp8wt_stl(
     output: FixedLayout,
     in_layout: FixedLayout,
@@ -502,11 +533,15 @@ def _single_arg_op_layout(
             # Two strategies, chosen by whether a staggered EA is involved:
             #
             # 1. Staggered conversions (RMSNorm up/down-cast and their
-            #    restoration: STANDARD<->DL16_TO_FP32 / FP32_TO_DL16). The
-            #    staggered element ordering only exists on the physical device
-            #    layout, so we must propagate the input's device_size/stride_map
-            #    and rescale just the stick depth via rescale_stl_for_dtype.
-            #    Reconstructing from the logical host size would lose it.
+            #    restoration: STANDARD<->DL16_TO_FP32 / FP32_TO_DL16) that
+            #    traverse the whole input. The staggered element ordering only
+            #    exists on the physical device layout, so propagate the input's
+            #    device_size/stride_map and rescale just the stick depth via
+            #    rescale_stl_for_dtype; reconstructing from the logical host size
+            #    would lose the stick choice a downstream reduction needs.
+            #    Inheriting is only sound for an identical access -- see
+            #    _convert_reads_whole_input; a sliced read falls through to (2),
+            #    which still stamps the staggered EA.
             #
             # 2. Plain conversions (e.g. fp8->fp16 after qfp8ch). Here the input
             #    device layout can be degenerate — qfp8ch rescales a size-1
@@ -515,7 +550,10 @@ def _single_arg_op_layout(
             #    changing the layout rank and downstream graph partitioning.
             #    Rebuild a clean dense layout from the output host size instead,
             #    as the general (non-EA) convert path does.
-            if fmt in STAGGERED_EAS or input_ea in STAGGERED_EAS:
+            staggered = fmt in STAGGERED_EAS or input_ea in STAGGERED_EAS
+            if staggered and _convert_reads_whole_input(
+                in_layout, output, dep, output_dep
+            ):
                 layouts = [rescale_stl_for_dtype(stl, output.dtype, fmt)]
 
                 # A conversion that creates a staggered EA must also expose
@@ -548,7 +586,18 @@ def _single_arg_op_layout(
                 # reverse staggered-to-STANDARD restoration. It needs no
                 # expansion: preserve the stick selected before the upcast.
 
-                return layouts
+                # Last-resort guard: device_coordinates only validates the stick
+                # expression, so a candidate whose *non-stick* coordinate is
+                # outside the normalization grammar survives until codegen's
+                # normalize_coordinates rejects it. Drop those while the dense
+                # reconstruction below is still reachable.
+                layouts = [
+                    out_stl
+                    for out_stl in layouts
+                    if coordinates_normalizable(out_stl, output_dep)
+                ]
+                if layouts:
+                    return layouts
 
             # Dense reconstruction from the output host size. When the input
             # stick dim is unaligned, force a full input-stick depth so stick
