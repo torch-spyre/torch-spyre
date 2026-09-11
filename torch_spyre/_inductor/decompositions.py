@@ -31,6 +31,7 @@ from typing import Any, Callable, Optional, Sequence, Union
 
 import torch
 import torch._decomp as decomp
+from torch._prims_common import ELEMENTWISE_TYPE_PROMOTION_KIND, elementwise_dtypes
 
 from .constants import DEVICE_NAME, FP8_E4M3FN_MAX, FP8_E4M3FN_MIN
 from .errors import Unsupported
@@ -1128,6 +1129,190 @@ def spyre_ceil(input: torch.Tensor) -> torch.Tensor:
     return torch.ops.aten.neg.default(
         torch.ops.aten.floor.default(torch.ops.aten.neg.default(input))
     )
+
+
+# ---------------------------------------------------------------------------
+# cos / sin via Cody-Waite range reduction + degree-9 Taylor series
+#
+# All RoPE call sites use fp32 inputs (confirmed from tests/resource/models/).
+# Ops used: floor, mul, add, sub — all natively lowered on Spyre.
+# torch.round is NOT used: it is not implemented in the Spyre codegen;
+# round-to-nearest is expressed as floor(x + 0.5).
+#
+# Accuracy (fp32 input, measured against an fp64 reference): worst-case absolute
+# error ~5.3e-5 for both cos and sin on RoPE-realistic inputs (|x| ≤ 1063, i.e.
+# seq_len=1064 with inv_freq[0]=1.0).  On a dense linspace sweep the two differ:
+# cos is the limiting op at ~2.5e-5 even for |x| ≤ π, because the polynomial
+# partially cancels near |x_r| = π/2; sin stays at ~3.7e-6 there.  Safe
+# tolerance for both: 1e-4.  The downstream fp16 cast in model inference absorbs
+# this entirely (fp16 ULP at 1.0 is ~1e-3).
+#
+# Narrower dtypes are computed in fp32 and cast back.  The range reduction needs
+# k = floor(x/π + 0.5) to resolve x against π, and a 10- or 7-bit mantissa runs
+# out of bits as |x| grows: evaluated at fp16 width the error reaches ~0.75 at
+# |x| ≤ 1000, i.e. unusable rather than merely coarse.  Computing the whole body
+# in fp32 fixes it — measured on device, against cos of the value the device
+# actually holds, the error is 4.9e-4 (one fp16 ULP, i.e. optimal) at every range
+# from π to 1000, versus 0.75 without the upcast.  A reduction-only fp32 window
+# is also honored but is weaker (2.4e-3), so the whole body is upcast.
+#
+# Note when validating fp16 against a CPU reference: Spyre's fp16 is a 1-6-9
+# format (9 mantissa bits, not IEEE's 10), so H2D re-rounds an IEEE fp16 input by
+# up to 1 ULP.  That shifts cos/sin by up to 0.5 at |x| ~ 1000 no matter how the
+# op is implemented — it hits a CPU fallback identically (measured 0.495 for
+# both) — so a *device* result must be compared against cos of the round-tripped
+# input, not of the original.  Tolerances below are stated on that basis.
+#
+# KNOWN LIMITATION for fp16/bf16, issue #2818, not introduced here: the fp32
+# window this decomposition opens closes with an fp32 -> fp16/bf16 cast, and that
+# cast is wrong on device unless the innermost dim spans an EVEN number of fp32
+# sticks, i.e. ceil(size[-1] / 32) % 2 == 0.  Two 32-element fp32 sticks pair
+# into one 64-element fp16 stick, and an odd count leaves a dangling half stick
+# where "the fp32 tensor is allocated with a stick of 32 elements but the SDSC
+# shapes are asking for 64" (#2818).  Measured on a sweep of (4, N): correct at
+# N = 48, 64, 112, 128, 192, 240, 256, 320 (even stick counts); wrong or a hard
+# "Invalid device sizes and stride map" at N = 16, 32, 65, 80, 96, 129, 160, 224
+# (odd), with over half the elements taking values that are not in the correct
+# result at all.  Note the rule is the stick pairing, not "multiple of 64":
+# N = 48 is correct and N = 96 is not.
+#
+# This is a backend cast defect, not a cos/sin one, and it is not this
+# decomposition's to fix: a bare ``(x.float() * 2.0).to(torch.float16)`` on the
+# same shapes is wrong by the same amount with no cos/sin in the graph, while a
+# pure fp16 pointwise op (abs, mul) is bit-exact there.  It is also not #4392
+# (no zero-sized device dim appears on these graphs, and a ceil in
+# ``rescale_stl_for_dtype`` changes nothing) and not #4393 (the output carries a
+# STANDARD element arrangement, and a following compiled graph reads back the
+# same wrong values, so the device data itself is wrong rather than merely
+# permuted on copy-out).  RoPE head dims (64, 128) are even-stick and unaffected.
+#
+# PI_HI: nearest fp32 to π (stored as a Python float / fp64 constant so the
+#         compiler sees the exact value rather than a rounded literal).
+# PI_LO: fp64 residual (π − PI_HI), used in the two-term subtraction to
+#         suppress range-reduction error accumulated across large k values.
+# ---------------------------------------------------------------------------
+
+_PI_HI = 3.1415927410125732  # float32(π) as fp64
+_PI_LO = -8.742278012618954e-8  # π − PI_HI in fp64
+
+
+def _taylor_range_reduce(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Cody-Waite two-term range reduction.
+
+    Returns (x_r, sign) where x_r ∈ [−π/2, π/2] and sign = (−1)^k.
+    k is computed as round(x / π) using floor(x/π + 0.5) to avoid
+    torch.round (not supported in the Spyre codegen).
+    """
+    k = torch.ops.aten.floor.default(x * (1.0 / math.pi) + 0.5)
+    x_r = (x - k * _PI_HI) - k * _PI_LO
+    k_mod2 = k - 2.0 * torch.ops.aten.floor.default(k * 0.5)
+    sign = 1.0 - 2.0 * k_mod2
+    return x_r, sign
+
+
+def _taylor_cos(x: torch.Tensor) -> torch.Tensor:
+    """Degree-9 Horner cos. Caller must widen to fp32 (see the accuracy note)."""
+    x_r, sign = _taylor_range_reduce(x)
+    x2 = x_r * x_r
+    poly = 1.0 + x2 * (
+        -0.5 + x2 * (1.0 / 24.0 + x2 * (-1.0 / 720.0 + x2 * (1.0 / 40320.0)))
+    )
+    return sign * poly
+
+
+def _taylor_sin(x: torch.Tensor) -> torch.Tensor:
+    """Degree-9 Horner sin. Caller must widen to fp32 (see the accuracy note)."""
+    x_r, sign = _taylor_range_reduce(x)
+    x2 = x_r * x_r
+    poly = x_r * (
+        1.0
+        + x2
+        * (
+            -1.0 / 6.0
+            + x2 * (1.0 / 120.0 + x2 * (-1.0 / 5040.0 + x2 * (1.0 / 362880.0)))
+        )
+    )
+    return sign * poly
+
+
+def _taylor_dtypes(input: torch.Tensor) -> tuple[torch.dtype, torch.dtype]:
+    """Compute and result dtypes for a cos/sin body, as aten defines them.
+
+    The result dtype is aten's, asked of aten rather than reimplemented:
+    ``ELEMENTWISE_TYPE_PROMOTION_KIND.INT_TO_FLOAT`` is the kind
+    ``torch._refs.cos`` is built with, so integral and boolean input yield the
+    default floating dtype (nothing is truncated back to an integral dtype) and
+    floating input is returned at its own width.
+
+    The compute dtype is *not* taken from the same call, and this is deliberate.
+    ``elementwise_dtypes`` derives it through ``get_computation_dtype``, which
+    reads ``torch._prims_common._computation_dtype_map`` -- and
+    ``torch_spyre._inductor.patches.spyre_data_types`` deliberately replaces that
+    map with identity entries for the whole Inductor compile, so refs do not widen
+    fp16 to fp32 on a device whose native dtype is fp16.  Inside a Spyre compile
+    it therefore reports ``compute=float16`` for fp16 input where an eager call
+    reports ``compute=float32``; wearing ``elementwise_type_promotion_wrapper``
+    here looks idiomatic but widens nothing on the path that matters (measured:
+    0.7501 max error at fp16, identical to no upcast at all, against 5.0e-4 for
+    the explicit ``.to`` below).  cos/sin need the wider window for the range
+    reduction regardless of that policy, so they ask for it in the graph with an
+    explicit cast, which lowers to ``aten._to_copy`` and survives.
+
+    fp64 falls out of ``promote_types``: computation and result are both fp64,
+    which is not a claim that Spyre executes fp64 -- H2D rejects a Double tensor
+    outright.  It matters only because the bodies above are plain torch
+    functions the CPU-side accuracy tests call directly, and this never narrows
+    one of those.  Eager dispatch cannot arrive here with fp64 either, even
+    though ``_register_spyre_dispatchkey_kernels_permanently`` installs a
+    PrivateUse1 kernel for ``aten.cos`` / ``aten.sin``: that key selects on
+    device, not dtype, so a CPU fp64 tensor takes the CPU kernel, and no fp64
+    tensor can sit on a Spyre device to route here -- placement raises
+    ``Spyre backend does not support dtype Double``, and widening an
+    already-placed tensor via ``.to(torch.float64)`` dies with SIGFPE inside the
+    cast (measured; issue #1201's territory, nothing to do with this body).
+
+    Complex is the one dtype aten accepts that these bodies do not serve, and it
+    needs no guard because it cannot arrive: ``.to("spyre")`` rejects a complex
+    tensor outright (``Spyre backend does not support dtype ComplexFloat``), so
+    no Spyre compile ever sees one.  Called directly on CPU it raises
+    ``NotImplementedError`` from ``torch.floor``, which is the right answer --
+    range-reducing a complex argument against pi is meaningless, ``cos(a+bi)``
+    needing ``cosh``/``sinh`` instead.  Should complex placement ever land,
+    cos/sin would need a complex guard or a fallback registration, since they no
+    longer appear in ``register_fallback_default``.
+    """
+    _, result_dtype = elementwise_dtypes(
+        input, type_promotion_kind=ELEMENTWISE_TYPE_PROMOTION_KIND.INT_TO_FLOAT
+    )
+    return torch.promote_types(result_dtype, torch.float32), result_dtype
+
+
+@register_spyre_decompositions([torch.ops.aten.cos.default])
+def spyre_cos(input: torch.Tensor) -> torch.Tensor:
+    """cos(x) via Cody-Waite range reduction and degree-9 Horner polynomial.
+
+    Serves every real dtype aten accepts, so no CPU fallback is needed: the body
+    runs at fp32 or wider and the result carries aten's own dtype.  Complex is
+    aten's one dtype this does not serve, and is unreachable on this backend
+    rather than guarded against -- see ``_taylor_dtypes``.
+    """
+    compute_dtype, result_dtype = _taylor_dtypes(input)
+    out = _taylor_cos(input.to(compute_dtype))
+    return out if out.dtype == result_dtype else out.to(result_dtype)
+
+
+@register_spyre_decompositions([torch.ops.aten.sin.default])
+def spyre_sin(input: torch.Tensor) -> torch.Tensor:
+    """sin(x) via Cody-Waite range reduction and degree-9 Horner polynomial.
+
+    Serves every real dtype aten accepts, so no CPU fallback is needed: the body
+    runs at fp32 or wider and the result carries aten's own dtype.  Complex is
+    aten's one dtype this does not serve, and is unreachable on this backend
+    rather than guarded against -- see ``_taylor_dtypes``.
+    """
+    compute_dtype, result_dtype = _taylor_dtypes(input)
+    out = _taylor_sin(input.to(compute_dtype))
+    return out if out.dtype == result_dtype else out.to(result_dtype)
 
 
 @register_spyre_decompositions([torch.ops.aten.bitwise_not])
