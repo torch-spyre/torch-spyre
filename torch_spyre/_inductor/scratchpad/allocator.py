@@ -1006,8 +1006,11 @@ class ScratchpadAllocator:
             lx_views[name] = plan.source_view
             # Only sources exist in the graph here. Each private destination
             # receives its own view and bound in _append_lx_relayout_destinations.
-            # Retain the existing equal-share size at this prerequisite.
-            mem_usage[name]["size_per_core"] = mem_usage[name]["size"] // plan.num_cores
+            # Shared sources keep the largest physical span; ordinary buffers
+            # keep mem_usage_by_buf's equal-share size unchanged.
+            mem_usage[name]["size_per_core"] = max(
+                mem_usage[name]["size_per_core"], plan.source_footprint_bytes
+            )
             mem_usage[name]["core_div_mismatch"] = False
         t2 = time.perf_counter()
         if timings is not None:
@@ -1105,7 +1108,7 @@ class ScratchpadAllocator:
                 destination = LifetimeBoundBuffer(
                     plan.destination_name,
                     round_up_to_alignment(
-                        source.size,
+                        plan.destination_footprint_bytes or source.size,
                         _LX_ALLOCATION_GRANULARITY_BYTES,
                     ),
                     [transfer_tick, *consumer_ticks],

@@ -24,6 +24,7 @@ from typing import Any, Callable
 
 from sympy import Expr, Integer, Mod, Symbol, floor, sympify
 
+from torch_spyre._C import DataFormats, get_device_size_in_bytes
 from .op_spec import TensorWorkDivision
 
 
@@ -93,6 +94,36 @@ def owner_slots(
             row[dim] = int(value)
         rows.append(row)
     return tuple(rows)
+
+
+def _overlap(a: int, an: int, b: int, bn: int) -> bool:
+    return a * bn < (b + 1) * an and b * an < (a + 1) * bn
+
+
+def transfer_edges(
+    source_splits: Mapping[Any, int],
+    destination_splits: Mapping[Any, int],
+    source_map: Mapping[int, Mapping[Any, int]],
+    destination_map: Mapping[int, Mapping[Any, int]],
+) -> set[tuple[int, int]]:
+    """Ownership intersections for ordinary and completed-result copies.
+
+    Both partitions must describe the same coordinate domain.
+    """
+    return {
+        (s_core, d_core)
+        for s_core, s_slice in source_map.items()
+        for d_core, d_slice in destination_map.items()
+        if all(
+            _overlap(
+                s_slice.get(dim, 0),
+                source_splits.get(dim, 1),
+                d_slice.get(dim, 0),
+                destination_splits.get(dim, 1),
+            )
+            for dim in source_splits.keys() | destination_splits.keys()
+        )
+    }
 
 
 def same_owner_maps(
@@ -656,6 +687,47 @@ def derive_operation_mapping(
             return candidate
 
     raise ValueError("no operation core mapping satisfies every LX tensor owner")
+
+
+def partition_physical_span_bytes(
+    device_size: Sequence[int],
+    device_dtype: DataFormats,
+    split_by_device_dim: Mapping[int, int],
+) -> int:
+    """Bound a normalized standard-layout partition, including gaps between rows.
+
+    Device dimensions are stored in decreasing physical-stride order. The
+    layout's ``stride_map`` instead addresses HOST memory and must not size LX.
+    A backend may pack a partition more tightly; retaining the original device
+    strides is a conservative bound. The caller must supply a final dimension
+    of exactly ``device_dtype.elems_per_stick()`` elements, with no split on
+    that axis. Host-shape SpyreTensorLayout construction provides this form;
+    an explicit device shape is not guaranteed to. Non-positive extents and
+    invalid split axes/factors also raise ValueError, never a guessed size.
+    This measures placement, not the split-cost estimate.
+    """
+
+    if not device_size or any(extent <= 0 for extent in device_size):
+        raise ValueError("device extents must be positive")
+    elems_per_stick = device_dtype.elems_per_stick()
+    if elems_per_stick <= 0:
+        raise ValueError("elems_per_stick must be positive")
+    for dim, split in split_by_device_dim.items():
+        if dim < 0 or dim >= len(device_size) or split <= 0:
+            raise ValueError(f"invalid split {split} on device dimension {dim}")
+    if device_size[-1] != elems_per_stick:
+        raise ValueError("physical span requires one complete final stick dimension")
+    if split_by_device_dim.get(len(device_size) - 1, 1) != 1:
+        raise ValueError("the final stick dimension cannot be split")
+
+    span_sticks = stride_sticks = 1
+    for dim in reversed(range(len(device_size) - 1)):
+        extent = device_size[dim]
+        split = split_by_device_dim.get(dim, 1)
+        slice_extent = (extent + split - 1) // split
+        span_sticks += (slice_extent - 1) * stride_sticks
+        stride_sticks *= extent
+    return get_device_size_in_bytes([span_sticks, elems_per_stick], device_dtype)
 
 
 def core_mappings_equal(

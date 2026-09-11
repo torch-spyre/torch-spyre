@@ -18,6 +18,7 @@ from dataclasses import replace
 import json
 import logging
 import logging.handlers
+import collections
 import math
 import os
 from pathlib import Path
@@ -28,7 +29,7 @@ from typing import Any
 from unittest.mock import patch as mock_patch
 
 import pytest
-from sympy import floor, Integer, Mod, Symbol
+from sympy import Eq, floor, Integer, Mod, Piecewise, Symbol
 import torch
 import torch.fx.traceback
 from torch.fx.graph_module import GraphModule
@@ -47,13 +48,14 @@ import torch_spyre._inductor.scratchpad.lx_relayout as lx_relayout_module
 import torch_spyre._inductor.scheduler as scheduler_module
 import torch_spyre._inductor.work_division as _wd
 import torch_spyre._inductor.wsr.propagate_named_dims as _pnd
-from torch_spyre._C import DataFormats
+from torch_spyre._C import DataFormats, SpyreTensorLayout
 from torch_spyre._inductor.codegen.superdsc import compile_op_spec, parse_op_spec
 from torch_spyre._inductor.constants import (
     BATCH_MATMUL_OP,
     IDENTITY_OP,
 )
 from torch_spyre._inductor.errors import Unsupported
+from torch_spyre._inductor.ir import FixedTiledLayout
 from torch_spyre._inductor.loop_info import CarriedReductionRecord
 from torch_spyre._inductor.scratchpad.lx_relayout import (
     LXRelayoutPlan,
@@ -679,6 +681,84 @@ def _allocation_graph(*operation_names):
 
 
 @pytest.mark.parametrize(
+    ("source", "destination", "source_num_cores", "destination_num_cores", "supported"),
+    [
+        # Grouped contraction of two dimensions.
+        (
+            _view({0: 4, 1: 8}, {0: floor(_CORE_ID / 8), 1: Mod(_CORE_ID, 8)}, 32),
+            _view(
+                {0: 2, 1: 4},
+                {0: floor(_CORE_ID / 16), 1: Mod(floor(_CORE_ID / 4), 4)},
+                32,
+            ),
+            32,
+            32,
+            True,
+        ),
+        # Scope cut, not an edge-model limitation: #4152 enables this
+        # combined gather/broadcast and changes the expectation to True.
+        (
+            _view({2: 32}, {2: Mod(_CORE_ID, 32)}, 32),
+            _view(
+                {1: 8, 3: 2}, {1: Mod(_CORE_ID, 8), 3: Mod(floor(_CORE_ID / 16), 2)}, 32
+            ),
+            32,
+            32,
+            False,
+        ),
+        # A larger domain need not replicate slices evenly: each source feeds
+        # four cores and each destination core has one source.
+        (
+            _view({0: 2}, {0: Mod(_CORE_ID, 2)}, 2),
+            _view(
+                {0: 4},
+                {
+                    0: Piecewise(
+                        (0, Eq(_CORE_ID, 0)),
+                        (1, _CORE_ID < 4),
+                        (2, Eq(_CORE_ID, 4)),
+                        (3, True),
+                    )
+                },
+                8,
+            ),
+            2,
+            8,
+            True,
+        ),
+        # Same domain, uniform fan-in and fan-out of eight, yet one replica of
+        # one slice and seven of the other: no emitted movement fills that.
+        (
+            _view({0: 8}, {0: Mod(_CORE_ID, 8)}, 8),
+            _view({1: 2}, {1: Piecewise((0, Eq(_CORE_ID, 0)), (1, True))}, 8),
+            8,
+            8,
+            False,
+        ),
+        # Ownership described on another core domain than the transfer.
+        (
+            _view({0: 2}, {0: Mod(_CORE_ID, 2)}, 4),
+            _view({0: 2}, {0: floor(_CORE_ID / 16)}, 32),
+            2,
+            32,
+            False,
+        ),
+    ],
+)
+def test_movement_rule_reads_the_owner_maps(
+    source, destination, source_num_cores, destination_num_cores, supported
+):
+    """The backend moves complete partitions; one rule certifies them."""
+
+    assert (
+        lx_relayout_module.movement_supported(
+            source, destination, source_num_cores, destination_num_cores
+        )
+        is supported
+    )
+
+
+@pytest.mark.parametrize(
     ("view", "device_size", "coordinates", "extents", "expected"),
     [
         # A fused loop over two physical axes projects to one 32-way division
@@ -789,27 +869,29 @@ def test_lx_relayout_activation_policy_is_source_wide():
         assert lx_relayout_module._is_activation_source(graph, {"input": dep}, producer)
 
 
-def test_lx_relayout_planner_rejects_equal_projected_ownership():
-    m = Symbol("m")
-    source_view = PerCoreView(
-        ((1, 32),),
-        ((1, Mod(_CORE_ID, 32)),),
-        num_cores=32,
-    )
-    destination_view = PerCoreView(
-        ((0, 32),),
-        ((0, Mod(_CORE_ID, 32)),),
-        num_cores=32,
-    )
-    coordinates = [m, m]
-    source_work_division = work_division_from_view(
-        source_view, [32, 32], coordinates, {m: 32}
-    )
-    destination_work_division = work_division_from_view(
-        destination_view, [32, 32], coordinates, {m: 32}
-    )
-    assert source_view != destination_view
-    assert source_work_division == destination_work_division
+@config.patch({"sencores": 32, "lx_planner_relayout": True})
+@pytest.mark.parametrize(
+    "reader", ["collapsed", "split_matmul", "pointwise", "reduction"]
+)
+def test_lx_relayout_planner_uses_projected_read_ownership(reader):
+    m, n = Symbol("m"), Symbol("n")
+    source_cores = 32 if reader == "collapsed" else 8
+    if reader == "collapsed":
+        source_view = _view({1: 32}, {1: Mod(_CORE_ID, 32)}, 32)
+        destination_view = _view({0: 32}, {0: Mod(_CORE_ID, 32)}, 32)
+        coordinates, space = [m, m], {m: 32}
+        assert source_view != destination_view
+        assert work_division_from_view(
+            source_view, [32, 32], coordinates, space
+        ).same_ownership(
+            work_division_from_view(destination_view, [32, 32], coordinates, space)
+        )
+    else:
+        source_view = _view({0: 8}, {0: _CORE_ID}, 8)
+        destination_view = _view(
+            {0: 8, 1: 4}, {0: Mod(_CORE_ID, 8), 1: floor(_CORE_ID / 8)}, 32
+        )
+        coordinates, space = [m, n], {m: 32, n: 32}
 
     source_dep = SimpleNamespace(name="source", is_indirect=lambda: False)
     producer = SimpleNamespace(
@@ -819,7 +901,7 @@ def test_lx_relayout_planner_rejects_equal_projected_ownership():
     )
     consumer = SimpleNamespace(
         layout=SimpleNamespace(),
-        data=SimpleNamespace(),
+        data=object() if reader == "reduction" else SimpleNamespace(),
         get_name=lambda: "consumer",
     )
     graph = SimpleNamespace(operations=[producer, consumer])
@@ -827,7 +909,10 @@ def test_lx_relayout_planner_rejects_equal_projected_ownership():
     def read_writes(op):
         if op is producer:
             return SimpleNamespace(reads=[], writes=[source_dep])
-        return SimpleNamespace(reads=[source_dep], writes=[])
+        reads = [source_dep]
+        if reader == "split_matmul":
+            reads.append(SimpleNamespace(name="weight", is_indirect=lambda: False))
+        return SimpleNamespace(reads=reads, writes=[])
 
     with (
         mock_patch.object(lx_relayout_module, "MemoryDep", SimpleNamespace),
@@ -842,19 +927,65 @@ def test_lx_relayout_planner_rejects_equal_projected_ownership():
             "_per_core_view_on_buf",
             side_effect=[
                 (source_view, False, True),
-                (destination_view, False, True),
+                (destination_view, reader == "split_matmul", True),
             ],
         ),
-        mock_patch.object(lx_relayout_module, "_op_num_cores", return_value=32),
+        mock_patch.object(
+            lx_relayout_module,
+            "_op_num_cores",
+            side_effect=lambda op: source_cores if op is producer else 32,
+        ),
+        mock_patch.object(
+            lx_relayout_module,
+            "_is_matmul_op",
+            side_effect=lambda op: op is consumer and reader == "split_matmul",
+        ),
         mock_patch.object(
             lx_relayout_module, "try_device_coordinates", return_value=coordinates
         ),
         mock_patch.object(
-            lx_relayout_module, "iteration_space_from_op", return_value={m: 32}
+            lx_relayout_module, "iteration_space_from_op", return_value=space
         ),
         mock_patch.object(lx_relayout_module, "is_restickify_op", return_value=False),
+        mock_patch.object(lx_relayout_module, "partition_footprint", return_value=128),
     ):
-        assert lx_relayout_module.collect_lx_relayout_plans(graph) == []
+        plans = lx_relayout_module.collect_lx_relayout_plans(graph)
+        if reader in ("collapsed", "reduction"):
+            assert plans == []
+        else:
+            assert len(plans) == 1
+            assert plans[0].num_cores == source_cores
+            assert plans[0].destination_view.same_partition(destination_view)
+
+
+def _completed_route_spec(
+    source, destination, shape, coords, space, routes, destination_offset
+):
+    """Build a routed identity, preserving each fixture's original LX offset."""
+
+    extents = {dim: extent for dim, (extent, _) in space.items()}
+    base = TensorArg(True, -1, DataFormats.SEN169_FP16, shape, coords, {"lx": 0})
+    return OpSpec(
+        IDENTITY_OP,
+        False,
+        space,
+        [
+            replace(
+                base,
+                work_division=work_division_from_view(source, shape, coords, extents),
+            ),
+            replace(
+                base,
+                is_input=False,
+                allocation={"lx": destination_offset},
+                work_division=work_division_from_view(
+                    destination, shape, coords, extents
+                ),
+            ),
+        ],
+        {LX_RELAYOUT_INFO_KEY: True},
+        producer_consumers=routes,
+    )
 
 
 def _compile_spec(spec, normalize=True):
@@ -1070,24 +1201,178 @@ def test_lx_relayout_consumers_share_destination_view(second_consumer):
         "sencores": 32,
         "lx_planning": True,
         "allow_all_ops_in_lx_planning": True,
+        "lx_planner_relayout": True,
         "layout_solver": "greedy",
     }
 )
-def test_unhinted_moe_down_route_uses_the_production_hbm_fallback():
-    """Record the production choice for an unhinted E=2 down->route edge.
+@pytest.mark.parametrize(
+    "broadcast", [False, True], ids=["gather", "broadcast_2_to_32"]
+)
+def test_grouped_lx_relayout_device(broadcast):
+    """Check numerical results, exact core domains, and the emitted LX copy.
 
-    The only hint creates the two-expert loop; there is deliberately no work
-    division hint. At this shape the cost model splits T=4, H=4, and the F
-    reduction=2. Since the output cannot own the reduction split, the existing
-    fail-closed path keeps down->route in HBM. The full 8x4 LX acceptance gate
-    belongs to the composed MoE stack, where its ownership proposer exists.
+    Gather assembles eight key fragments within each head. Broadcast keeps
+    two complete output-column slices and sends each to sixteen consumers.
+    Neither case may silently fall back to an HBM copy.
     """
 
     torch.manual_seed(0)
+    if broadcast:
+        batch, query, key, width = 1, 16, 64, 128
+        producer = {"D": 2}
+        consumer = {"Lq": 16, "D": 2}
+        source_cores = 2
+    else:
+        batch, query, key, width = 4, 8, 128, 64
+        producer = {"H": 4, "Lk": 8}
+        consumer = {"H": 4, "Lq": 8}
+        source_cores = 32
+    value = torch.randn(batch, key, width, dtype=torch.float16)
+    attention = torch.randn(batch, query, key, dtype=torch.float16)
+    for name, size in (("H", batch), ("Lk", key), ("Lq", query), ("D", width)):
+        _declare_tensor_dim(name, size)
+
+    def fn(value, attention):
+        with spyre_hint(work_div=producer):
+            hidden = torch.neg(value)
+        with spyre_hint(work_div=consumer):
+            return torch.bmm(attention, hidden)
+
+    device_args = (
+        _name_tensor_dims(value.to("spyre"), ["H", "Lk", "D"]),
+        _name_tensor_dims(attention.to("spyre"), ["H", "Lq", "Lk"]),
+    )
+    torch._inductor.codecache.FxGraphCache.clear()
+    with _capture_backend_output_dirs() as output_dirs:
+        actual, code = run_and_get_code(
+            torch.compile(fn, dynamic=False, options={"epilogue_fusion": False}),
+            *device_args,
+        )
+    torch.testing.assert_close(actual.cpu(), fn(value, attention), rtol=2e-2, atol=2e-1)
+    relayouts = [
+        block
+        for block in "\n".join(code).split("OpSpec(")
+        if "op='identity'" in block[:100]
+        and block.count("allocation={'lx':") == 2
+        and block.count("TensorWorkDivision(") == 2
+    ]
+    assert len(relayouts) == 1
+    domains = re.findall(r"num_cores=(\d+)", relayouts[0])
+    assert domains == [str(source_cores), "32"]
+    _assert_lx_only_relayout_payload(output_dirs)
+
+
+@config.patch(
+    {
+        "sencores": 32,
+        "lx_planning": True,
+        "allow_all_ops_in_lx_planning": True,
+        "layout_solver": "greedy",
+    }
+)
+@pytest.mark.parametrize("reader", ["pointwise", "split_matmul", "restickify"])
+@pytest.mark.parametrize("enabled", [False, True])
+def test_lx_relayout_read_expansion_device(reader, enabled):
+    """A reader's own reduction does not make its input partial."""
+    torch.manual_seed(0)
+    value = torch.randn(8, 128, 256, dtype=torch.float16) * 0.01
+    if reader != "split_matmul":
+        # Exact in IEEE and device FP16; distinguish movement from input rounding.
+        value = (
+            ((torch.arange(value.numel()) % 127 - 63) / 64).half().reshape(value.shape)
+        )
+    weight = torch.randn(8, 256, 64, dtype=torch.float16) * 0.01
+    for name, size in (("H", 8), ("M", 128), ("K", 256), ("N", 64)):
+        _declare_tensor_dim(name, size)
+
+    def fn(value, weight):
+        with spyre_hint(work_div={"H": 8}):
+            hidden = -value
+        with spyre_hint(work_div={"H": 8, "M" if reader == "pointwise" else "K": 4}):
+            if reader == "restickify":
+                return hidden.transpose(1, 2).contiguous()
+            return (
+                torch.bmm(hidden, weight)
+                if reader == "split_matmul"
+                else torch.relu(hidden)
+            )
+
+    args = (
+        _name_tensor_dims(value.to("spyre"), ["H", "M", "K"]),
+        _name_tensor_dims(weight.to("spyre"), ["H", "K", "N"]),
+    )
+    if reader != "split_matmul":
+        torch.testing.assert_close(args[0].cpu(), value, rtol=0, atol=0)
+    torch._dynamo.reset()
+    torch._inductor.codecache.FxGraphCache.clear()
+    with (
+        config.patch(lx_planner_relayout=enabled),
+        _capture_backend_output_dirs() as directories,
+    ):
+        actual, code = run_and_get_code(
+            torch.compile(fn, dynamic=False, options={"epilogue_fusion": False}), *args
+        )
+    tolerance = 2e-2 if reader == "split_matmul" else 0
+    torch.testing.assert_close(
+        actual.cpu(), fn(value, weight), rtol=tolerance, atol=tolerance
+    )
+    copies = [
+        block
+        for block in "\n".join(code).split("OpSpec(")
+        if "op='identity'" in block[:100]
+        and block.count("allocation={'lx':") == 2
+        and block.count("TensorWorkDivision(") == 2
+    ]
+    assert len(copies) == int(enabled)
+    if enabled:
+        assert re.findall(r"num_cores=(\d+)", copies[0]) == ["8", "32"]
+        _assert_lx_only_relayout_payload(directories)
+    if reader == "split_matmul":
+        matmuls = [
+            root
+            for directory in directories
+            for path in directory.glob("sdsc_*.json")
+            for name, root in json.loads(path.read_text()).items()
+            if name.endswith(BATCH_MATMUL_OP)
+        ]
+        assert len(matmuls) == 1
+        assert matmuls[0]["numCoresUsed_"] == 32
+        assert matmuls[0]["numWkSlicesPerDim_"]["in"] == 4
+
+
+@config.patch(
+    {
+        "sencores": 32,
+        "lx_planning": True,
+        "allow_all_ops_in_lx_planning": True,
+        "layout_solver": "greedy",
+    }
+)
+@pytest.mark.parametrize("enabled", [False, True])
+def test_unhinted_moe_down_route_preserves_the_chosen_split(enabled):
+    """Keep the chosen E=2 down->route split while changing only its storage.
+
+    The only hint creates the two-expert loop; there is deliberately no work
+    division hint. The cost model chooses T=4, H=4 and reduction=2 in both
+    modes. ON gathers four finished H pieces into each reader's row slice;
+    OFF retains the HBM boundary. No change to the chooser is required.
+    """
+
     experts, tokens, intermediate, hidden = 2, 64, 128, 256
-    activations = torch.randn(experts, tokens, intermediate, dtype=torch.float16) * 0.01
-    weights = torch.randn(experts, intermediate, hidden, dtype=torch.float16) * 0.01
-    routes = torch.randn(experts, tokens, 1, dtype=torch.float16) * 0.01
+    # Distinct, exact normal FP16 sums: a lost piece cannot pass as rounding.
+    rows = torch.arange(experts * tokens)
+    tags = (2.0 ** (rows // 16 - 4) * (1 + 2 * ((rows // 8) % 2))).half()
+    activations = (
+        tags.reshape(experts, tokens, 1).expand(-1, -1, intermediate).contiguous()
+    )
+    column_tags = (1 + 2 * (torch.arange(hidden) // 64)).half()
+    amplitudes = (2 ** (torch.arange(intermediate) // 64)).half()
+    weights = (
+        (amplitudes[:, None] * column_tags / intermediate)[None]
+        .expand(experts, -1, -1)
+        .contiguous()
+    )
+    routes = torch.full((experts, tokens, 1), 0.5, dtype=torch.float16)
     for name, size in (
         ("E", experts),
         ("T", tokens),
@@ -1108,13 +1393,17 @@ def test_unhinted_moe_down_route_uses_the_production_hbm_fallback():
         _name_tensor_dims(routes.to("spyre"), ["E", "T", "R"]),
     )
     torch._inductor.codecache.FxGraphCache.clear()
-    with _emitted_kernels() as kernels:
+    with (
+        config.patch(lx_planner_relayout=enabled, core_id_k_fast_emission=True),
+        _emitted_kernels() as kernels,
+        _capture_backend_output_dirs() as directories,
+    ):
         actual, _ = run_and_get_code(
             torch.compile(fn, dynamic=False, options={"epilogue_fusion": False}),
             *device_args,
         )
     torch.testing.assert_close(
-        actual.cpu(), fn(activations, weights, routes), rtol=0.05, atol=0.05
+        actual.cpu(), fn(activations, weights, routes), rtol=0, atol=0
     )
     specs = [spec for kernel in kernels for spec in _iter_op_specs(kernel.op_specs)]
     bmm_specs = [spec for spec in specs if spec.op == BATCH_MATMUL_OP]
@@ -1125,6 +1414,25 @@ def test_unhinted_moe_down_route_uses_the_production_hbm_fallback():
     assert [split for split in splits if split > 1] == [4, 4, 2]
     assert math.prod(splits) == config.sencores
     down_arg = next(arg for arg in bmm_specs[0].args if not arg.is_input)
+    if enabled:
+        copies = [spec for spec in specs if spec.producer_consumers]
+        assert len(copies) == 1
+        copy = copies[0]
+        assert set(down_arg.allocation) == {"lx"}
+        assert copy.args[0].allocation == down_arg.allocation
+        assert set(copy.args[-1].allocation) == {"lx"}
+        assert [core for core, _ in copy.producer_consumers] == list(range(1, 32, 2))
+        assert collections.Counter(
+            core for _, readers in copy.producer_consumers for core in readers
+        ) == {core: 4 for core in range(32)}
+        assert any(
+            arg.is_input and arg.allocation == copy.args[-1].allocation
+            for spec in specs
+            if spec.op != IDENTITY_OP
+            for arg in spec.args
+        )
+        _assert_lx_only_relayout_payload(directories)
+        return
     assert set(down_arg.allocation) == {"hbm_pool"}
     assert down_arg.work_division is None
     down_address = down_arg.allocation["hbm_pool"]
@@ -1178,6 +1486,34 @@ def test_lx_relayout_allocation_is_atomic_in_one_greedy_solve(caplog):
         "rejected LX relayout group source=source" in record.message
         for record in caplog.records
     )
+
+
+@pytest.mark.parametrize(
+    "host_strides",
+    [(128, -1, 65536, 1, 1024), (128, -1, 64, 1024, 1)],
+)
+def test_relayout_footprint_uses_device_storage_not_host_strides(host_strides):
+    # The first layout is the actual restickified K page from serving prefill.
+    # Its old HOST-stride measurement reserved only 256 / 2176 bytes. The
+    # device-storage bound is 8192 / 245760 regardless of the host permutation.
+    layout = object.__new__(FixedTiledLayout)
+    layout.device_layout = SpyreTensorLayout(
+        [8, 1, 2, 128, 64], list(host_strides), DataFormats.SEN169_FP16
+    )
+    source = PerCoreView(
+        ((0, 8), (2, 2), (3, 2)),
+        (
+            (0, Mod(floor(_CORE_ID / 2), 8)),
+            (2, Mod(_CORE_ID, 2)),
+            (3, Mod(floor(_CORE_ID / 16), 2)),
+        ),
+        num_cores=32,
+    )
+    destination = PerCoreView(
+        ((2, 2),), ((2, Mod(floor(_CORE_ID / 16), 2)),), num_cores=32
+    )
+    assert lx_relayout_module.partition_footprint(layout, source) == 8192
+    assert lx_relayout_module.partition_footprint(layout, destination) == 245760
 
 
 def _assert_live_buffers_do_not_share_addresses(graph, buffers, limit):
@@ -1372,6 +1708,282 @@ def test_carried_reduction_stages_compile_to_a_drain():
 
     torch.testing.assert_close(actual.cpu(), fn(values), atol=0.05, rtol=0.05)
     assert "coarse_tile_reduction_drain" in "\n".join(code)
+
+
+@pytest.mark.parametrize("k", [2, 3, 4])
+def test_completed_reduction_reads_only_terminal_writers(k):
+    source = _view({0: 2}, {0: floor(_CORE_ID / k)}, 2 * k)
+    destination = _view(
+        {0: 2, 1: k}, {0: floor(_CORE_ID / k), 1: Mod(_CORE_ID, k)}, 2 * k
+    )
+    derive = lx_relayout_module.derive_completed_reduction_routes
+    assert derive(source, destination, k) == (
+        (k - 1, tuple(range(k))),
+        (2 * k - 1, tuple(range(k, 2 * k))),
+    )
+    for bad_source, bad_target in (
+        (_view({0: 2}, {0: Mod(_CORE_ID, 2)}, 2 * k), destination),
+        (
+            source,
+            replace(
+                destination, core_to_slot=((0, floor(_CORE_ID / k)), (1, Integer(0)))
+            ),
+        ),
+    ):
+        with pytest.raises(ValueError):
+            derive(bad_source, bad_target, k)
+    compact = _view({0: 2}, {0: _CORE_ID}, 2)
+    if k == 3:
+        with pytest.raises(ValueError):
+            derive(source, compact, k)
+    else:
+        assert derive(source, compact, k) == ((k - 1, (0,)), (2 * k - 1, (1,)))
+
+
+@config.patch(
+    {
+        "sencores": 32,
+        "lx_planning": True,
+        "allow_all_ops_in_lx_planning": True,
+        "layout_solver": "greedy",
+        "core_id_k_fast_emission": True,
+    }
+)
+@pytest.mark.parametrize(
+    "k,out_split,consumer_out,matmul_reader",
+    [
+        (2, 1, 1, False),
+        (4, 1, 1, False),
+        (4, 2, 2, False),
+        (2, 2, 1, False),
+        (4, 2, 1, False),
+        (2, 4, 1, False),
+        (2, 4, 2, True),
+    ],
+)
+@pytest.mark.parametrize("enabled", [False, True])
+def test_completed_reduction_broadcast_device(
+    k, out_split, consumer_out, matmul_reader, enabled
+):
+    """Distinct exact sums catch copying a partial answer or an unwritten core."""
+    rows, reduction, columns = 512, 256, max(128, 64 * out_split)
+    row_ids = torch.arange(rows)
+    tags = (2.0 ** (row_ids // 32 - 5) * (1 + 2 * ((row_ids // 16) % 2))).half()[
+        :, None
+    ]
+    column_tags = (1 + 2 * (torch.arange(columns) // 64)).half()[None, :]
+    amplitudes = 2 ** (torch.arange(reduction) // (reduction // k))
+    x = tags.expand(rows, reduction).contiguous()
+    weight = amplitudes[:, None].half() * column_tags / reduction
+    expected = -tags * column_tags * ((2**k - 1) / k)
+    torch.testing.assert_close(
+        -(x.float() @ weight.float()), expected.float(), rtol=0, atol=0
+    )
+    rhs = torch.full((columns, 64), 1 / columns, dtype=torch.float16)
+    if matmul_reader:
+        expected = (tags * column_tags.mean() * ((2**k - 1) / k)).expand(rows, 64)
+    for name, size in (("M", rows), ("K", reduction), ("N", columns), ("P", 64)):
+        _declare_tensor_dim(name, size)
+
+    def fn(x, weight, rhs):
+        with spyre_hint(work_div={"M": 32 // (k * out_split), "K": k, "N": out_split}):
+            hidden = x @ weight
+        with spyre_hint(work_div={"M": 32 // consumer_out, "N": consumer_out}):
+            return hidden @ rhs if matmul_reader else -hidden
+
+    args = (
+        _name_tensor_dims(x.to("spyre"), ["M", "K"]),
+        _name_tensor_dims(weight.to("spyre"), ["K", "N"]),
+        _name_tensor_dims(rhs.to("spyre"), ["N", "P"]),
+    )
+    torch._dynamo.reset()
+    torch._inductor.codecache.FxGraphCache.clear()
+    with (
+        config.patch(lx_planner_relayout=enabled),
+        _capture_backend_output_dirs() as directories,
+    ):
+        actual, code = run_and_get_code(
+            torch.compile(fn, dynamic=False, options={"epilogue_fusion": False}), *args
+        )
+    torch.testing.assert_close(actual.cpu(), expected, rtol=0, atol=0)
+    roots = [
+        root
+        for directory in directories
+        for file in directory.glob("sdsc_*.json")
+        for root in json.loads(file.read_text()).values()
+    ]
+    copies = [root for root in roots if root.get("prodConsList")]
+    assert len(copies) == int(enabled)
+    if enabled:
+        routes = copies[0]["prodConsList"]
+        assert sorted(map(int, routes)) == list(range(k - 1, 32, k))
+        assert collections.Counter(
+            c for readers in routes.values() for c in readers
+        ) == {core: out_split // consumer_out for core in range(32)}
+        _assert_lx_only_relayout_payload(directories)
+        assert "producer_consumers=" in "\n".join(code)
+
+
+def test_completed_reduction_split_is_independent_of_output_split():
+    m, n, k = Symbol("m"), Symbol("n"), Symbol("k")
+    prep = SimpleNamespace(
+        iter_space=(m, n, k),
+        write_index=128 * m + n,
+        stick_host_stride=1,
+    )
+    op = SimpleNamespace(
+        iteration_space_ownership=SimpleNamespace(work_slices={m: 2, n: 4, k: 4})
+    )
+
+    with (
+        mock_patch("torch_spyre._inductor.pass_utils._is_matmul_op", return_value=True),
+        mock_patch(
+            "torch_spyre._inductor.pass_utils._prepare_per_core_view",
+            return_value=prep,
+        ),
+    ):
+        get_split = lx_relayout_module.completed_reduction_split_on_buf
+        assert get_split(op, SimpleNamespace(), "result") == 4
+
+        op.iteration_space_ownership.work_slices[n] = 1
+        assert get_split(op, SimpleNamespace(), "result") == 4
+
+
+@config.patch({"sencores": 8})
+def test_completed_reduction_routes_survive_alignment_unchanged():
+    m, n = Symbol("m"), Symbol("n")
+    coordinates = [Mod(n, 32), floor(n / 32), Mod(m, 64)]
+    source_view = PerCoreView(((1, 2),), ((1, floor(_CORE_ID / 4)),), num_cores=8)
+    destination_view = PerCoreView(
+        ((1, 2), (2, 4)),
+        ((1, floor(_CORE_ID / 4)), (2, Mod(_CORE_ID, 4))),
+        num_cores=8,
+    )
+    planned_routes = ((3, (0, 1, 2, 3)), (7, (4, 5, 6, 7)))
+    spec = _completed_route_spec(
+        source_view,
+        destination_view,
+        [32, 8, 64],
+        coordinates,
+        {n: (Integer(256), 2), m: (Integer(64), 4)},
+        planned_routes,
+        256,
+    )
+
+    root, allocations = _compile_spec(spec)
+
+    assert set(root["dscs_"][0]) == {"shuffle"}
+    assert spec.producer_consumers == planned_routes
+    assert root["prodConsList"] == {"3": [0, 1, 2, 3], "7": [4, 5, 6, 7]}
+    assert root["numCoresUsed_"] == 2
+    source_map, destination_map = [
+        node["coordinates_"]["coreIdToWkSlice_"] for node in allocations
+    ]
+    assert set(source_map) == {"3", "7"}
+    assert set(destination_map) == {str(core) for core in range(8)}
+
+
+@config.patch({"sencores": 32})
+def test_completed_reduction_can_copy_to_its_sixteen_consumers():
+    # PR783's emitted B8/N2/K2 order: adjacent cores contribute to one result.
+    source = _view(
+        {0: 8, 1: 2},
+        {0: Mod(floor(_CORE_ID / 2), 8), 1: floor(_CORE_ID / 16)},
+        32,
+    )
+    destination = _view({0: 8, 1: 2}, {0: Mod(_CORE_ID, 8), 1: floor(_CORE_ID / 8)}, 16)
+    routes = lx_relayout_module.derive_completed_reduction_routes(
+        source, destination, 2
+    )
+    assert routes == tuple((2 * core + 1, (core,)) for core in range(16))
+    assert not lx_relayout_module.movement_supported(source, destination, 32, 16)
+
+    b, n, stick = Symbol("b"), Symbol("n"), Symbol("stick")
+    spec = _completed_route_spec(
+        source,
+        destination,
+        [8, 128, 64],
+        [b, n, stick],
+        {b: (Integer(8), 8), n: (Integer(128), 2), stick: (Integer(64), 1)},
+        routes,
+        65536,
+    )
+    from torch_spyre._inductor.op_spec_validation import (
+        _check_completed_reduction_route,
+        OpSpecValidationError,
+    )
+
+    _check_completed_reduction_route(spec, "test")
+    for invalid in (routes[:-1], ((1, (16,)), *routes[1:])):
+        with pytest.raises(OpSpecValidationError):
+            _check_completed_reduction_route(
+                replace(spec, producer_consumers=invalid), "test"
+            )
+    root, allocations = _compile_spec(spec)
+    assert root["coreFoldProp_"]["factor_"] == 32
+    assert root["prodConsList"] == {str(2 * c + 1): [c] for c in range(16)}
+    source_map, destination_map = [
+        allocation["coordinates_"]["coreIdToWkSlice_"] for allocation in allocations
+    ]
+    assert set(source_map) == {str(2 * c + 1) for c in range(16)}
+    assert set(destination_map) == {str(c) for c in range(16)}
+
+
+@config.patch({"sencores": 32})
+def test_completed_reduction_gathers_finished_output_halves():
+    source = _view(
+        {0: 8, 2: 2},
+        {0: Mod(floor(_CORE_ID / 2), 8), 2: floor(_CORE_ID / 16)},
+        32,
+    )
+    destination = _view({0: 8, 1: 4}, {0: Mod(_CORE_ID, 8), 1: floor(_CORE_ID / 8)}, 32)
+    routes = lx_relayout_module.derive_completed_reduction_routes(
+        source, destination, 2
+    )
+    assert routes == tuple(
+        (core, tuple(range((core // 2) % 8, 32, 8))) for core in range(1, 32, 2)
+    )
+    compact = _view({0: 8, 1: 2}, {0: Mod(_CORE_ID, 8), 1: floor(_CORE_ID / 8)}, 16)
+    with pytest.raises(
+        ValueError, match="unsupported completed-reduction ownership geometry"
+    ):
+        lx_relayout_module.derive_completed_reduction_routes(source, compact, 2)
+    b, m, n = Symbol("b"), Symbol("m"), Symbol("n")
+    spec = _completed_route_spec(
+        source,
+        destination,
+        [8, 4, 2, 64],
+        [b, m, floor(n / 64), Mod(n, 64)],
+        {b: (Integer(8), 8), m: (Integer(4), 4), n: (Integer(128), 1)},
+        routes,
+        65536,
+    )
+    from torch_spyre._inductor.op_spec_validation import (
+        _check_completed_reduction_route,
+        OpSpecValidationError,
+    )
+
+    _check_completed_reduction_route(spec, "test")
+    for invalid in (
+        routes[:-1],
+        ((1, (0, 0, 8, 16, 24)), *routes[1:]),
+        ((0, routes[0][1]), *routes[1:]),
+        ((1, routes[1][1]), (3, routes[0][1]), *routes[2:]),
+    ):
+        with pytest.raises(OpSpecValidationError):
+            _check_completed_reduction_route(
+                replace(spec, producer_consumers=invalid), "test"
+            )
+    root, allocations = _compile_spec(spec)
+    assert root["prodConsList"] == {
+        str(core): list(readers) for core, readers in routes
+    }
+    assert root["numCoresUsed_"] == 16
+    source_map, destination_map = [
+        allocation["coordinates_"]["coreIdToWkSlice_"] for allocation in allocations
+    ]
+    assert set(source_map) == {str(core) for core in range(1, 32, 2)}
+    assert set(destination_map) == {str(core) for core in range(32)}
 
 
 def aot_backend(gm: GraphModule, example_inputs: Sequence[InputType]):

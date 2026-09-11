@@ -3268,7 +3268,7 @@ def _per_core_view_on_buf(
     op/edge should call those two directly to amortize the op-level precompute.
 
     Returns `(view, has_partial_reduction, representable)`. ``has_partial_reduction``
-    is True when the op has a reduction split (partial sums left on most cores);
+    is True when the op has a reduction split (not every core writes a result);
     callers act on it only for write-deps. ``representable`` is False only on the
     give-up cases (a split that slices this buffer can't be placed on a device
     dim), which cross-op comparisons must treat as a non-match. Pass `cache` to
@@ -3332,6 +3332,44 @@ def _per_core_view_on_buf(
     if cache is not None:
         cache[key] = result
     return result
+
+
+def completed_reduction_split_on_buf(
+    op: Operation,
+    dep: MemoryDep,
+    buf_name: str,
+) -> int | None:
+    """Return the committed reduction split for a matmul result.
+
+    The completed value is on the last reduction slice regardless of OUT.
+    Retain the output-axis ambiguity check when certifying this geometry.
+    """
+
+    if not _is_matmul_op(op):
+        return None
+    prep = _prepare_per_core_view(op, dep, buf_name)
+    ownership = getattr(op, "iteration_space_ownership", None)
+    if prep is None or ownership is None:
+        return None
+    reduction_splits = [
+        int(ownership.work_slices.get(sym, 1))
+        for sym in prep.iter_space
+        if prep.write_index.coeff(sym) == 0
+        and int(ownership.work_slices.get(sym, 1)) > 1
+    ]
+    if len(reduction_splits) != 1 or prep.stick_host_stride is None:
+        return None
+
+    # Matmul OUT is the output tensor's stick dimension; size-one OUT can
+    # have no loop symbol.
+    output_symbols = [
+        sym
+        for sym in prep.iter_space
+        if prep.write_index.coeff(sym) == prep.stick_host_stride
+    ]
+    if len(output_symbols) > 1:
+        return None
+    return reduction_splits[0]
 
 
 def format_operations(operations: list[Operation]) -> str:

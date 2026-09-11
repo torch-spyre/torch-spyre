@@ -583,9 +583,9 @@ def get_ncores_for_buffers(
             continue
         # _get_buffer_user_deps creates an entry only while appending its first
         # dependency, so every value in this dictionary is non-empty.
-        # A K-split-reduction writer leaves partial sums on most cores (only
-        # k-last cores hold the final value), so it's unsafe on LX even if
-        # geometry matches — the `flag` gate applies to write-deps only.
+        # A K-split writer stores results only on the last reduction cores.
+        # Ordinary LX placement cannot expose the unwritten buffers; explicit
+        # completed-result copies select those writers in the relayout planner.
         ref_view = None
         ref_op_name = None
         mismatch_reason = None
