@@ -41,6 +41,7 @@ from .pass_utils import (
     device_coordinates,
     find_matmul_generated_var,
     identify_matmul_inputs,
+    per_core_views_equal,
     replace_computed_buffer_body,
 )
 from .wsr.coarse_tile import (
@@ -297,7 +298,7 @@ def _prove_matmul_direct_read(
     source_view, _, source_ok = _per_core_view_on_buf(
         direct_op, weight_dep, record.source_name
     )
-    if not old_ok or not new_ok or old_view != new_view:
+    if not old_ok or not new_ok or not per_core_views_equal(old_view, new_view):
         return None, "output core ownership changed"
     if not copy_ok or not source_ok:
         return None, "weight core ownership is not representable"
@@ -305,7 +306,7 @@ def _prove_matmul_direct_read(
     # assigning different source slices to the same core.  The staging copy
     # is the behavior being replaced, so the direct HBM read must preserve
     # its exact physical core-to-slice map.
-    if copy_view != source_view:
+    if not per_core_views_equal(copy_view, source_view):
         return None, (
             "direct source ownership does not match the staged copy: "
             f"{source_view} != {copy_view}"

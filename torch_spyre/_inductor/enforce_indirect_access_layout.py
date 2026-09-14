@@ -60,6 +60,7 @@ from .pass_utils import (
     device_coordinates,
     indirect_info_from_op,
     iteration_space_from_op,
+    iteration_space_with_splits,
     padded_entry_output_stl,
 )
 from .views import AlignmentInputs, UnalignedStickSplit, align_tensors_pure
@@ -354,12 +355,12 @@ def _scatter_alignment_inputs(
             AlignmentAccess(overrides.get(dep.name, layout.device_layout), dep.index)
         )
     accesses.append(AlignmentAccess(output_layout.device_layout, write_dep.index))
+    space = iteration_space_from_op(op)
     return build_operation_alignment_inputs(
-        iteration_space_from_op(op),
+        space,
         accesses,
+        iteration_space_with_splits(op, read_writes, space),
         indirect_sizes=indirect_sizes,
-        op=op,
-        read_writes=read_writes,
     )
 
 

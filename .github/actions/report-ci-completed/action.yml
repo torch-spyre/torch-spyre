@@ -6,7 +6,10 @@ description: >-
 
 inputs:
   job_name:
-    description: CRCR/RHEL job-name, e.g. "linux-x86_64 / pytorch / build"
+    description: CRCR job-name, e.g. "linux-x86_64 / pytorch / build"
+    required: true
+  rh_job_name:
+    description: job-name for TorchedHat/pytorch-redhat-ci, e.g. "linux-x86_64-spyre / pytorch / build"
     required: true
   conclusion:
     description: success | failure | cancelled
@@ -88,7 +91,7 @@ runs:
         WORKFLOW_NAME: ${{ github.workflow }}
         DELIVERY_ID: ${{ inputs.pytorch_sha }}
         CONCLUSION: ${{ inputs.conclusion }}
-        JOB_NAME: ${{ inputs.job_name }}
+        JOB_NAME: ${{ inputs.rh_job_name }}
       run: |
         PAYLOAD=$(jq -n \
           --arg delivery_id "$DELIVERY_ID" \
