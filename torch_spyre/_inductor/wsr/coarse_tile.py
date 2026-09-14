@@ -2545,6 +2545,15 @@ def _divide_ranges(
     if not isinstance(data, (Pointwise, Reduction)):
         return _DivideRangesResult(None, None)
 
+    # Keep this a true no-op when this level does not tile an output dim.
+    # In particular, a reduction-only level can be processed after one of
+    # its producers has already been retiled.  Invalidating the reduction's
+    # cached read/write dependencies here would then rebuild them against the
+    # producer's per-tile (possibly size-one) layout and lose the reduction
+    # symbol before _divide_reduction_ranges has a chance to remap it.
+    if not tiled_dims:
+        return _DivideRangesResult(None, None)
+
     ranges = list(data.ranges)
     if not ranges:
         return _DivideRangesResult(None, None)

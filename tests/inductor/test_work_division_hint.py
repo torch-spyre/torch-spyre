@@ -1646,6 +1646,51 @@ def test_carried_reduction_stages_compile_to_a_drain():
     assert "coarse_tile_reduction_drain" in "\n".join(code)
 
 
+@config.patch(
+    {
+        "sencores": 32,
+        "lx_planning": True,
+        "allow_all_ops_in_lx_planning": True,
+        "layout_solver": "greedy",
+    }
+)
+def test_carried_reduction_after_tiled_pointwise_producer():
+    """A producer retile must not erase the reduction's named E symbol."""
+
+    torch.manual_seed(0)
+    experts, tokens, hidden = 2, 64, 64
+    values = torch.randn(experts, tokens, hidden, dtype=torch.float16) * 0.1
+    routing = torch.randn(tokens, experts, 1, dtype=torch.float16) * 0.1
+    for name, size in (
+        ("E", experts),
+        ("T", tokens),
+        ("H", hidden),
+        ("ONE", 1),
+    ):
+        _declare_tensor_dim(name, size)
+
+    def fn(values, routing):
+        with spyre_hint(named_dims=["E", "T", "ONE"]):
+            route = routing.permute(1, 0, 2).contiguous().clone()
+        with spyre_hint(
+            num_tiles_per_dim={"E": experts},
+            work_div={"T": 32},
+        ):
+            return (values * route).sum(dim=0)
+
+    device_values = _name_tensor_dims(values.to("spyre"), ["E", "T", "H"])
+    device_routing = routing.to("spyre")
+    torch._inductor.codecache.FxGraphCache.clear()
+    actual, code = run_and_get_code(
+        torch.compile(fn, dynamic=False, options={"epilogue_fusion": False}),
+        device_values,
+        device_routing,
+    )
+
+    torch.testing.assert_close(actual.cpu(), fn(values, routing), atol=0.05, rtol=0.05)
+    assert "coarse_tile_reduction_drain" in "\n".join(code)
+
+
 def aot_backend(gm: GraphModule, example_inputs: Sequence[InputType]):
     decompositions = get_decompositions(
         [
