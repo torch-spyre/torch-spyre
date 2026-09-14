@@ -403,6 +403,42 @@ def _convert_reads_whole_input(
     )
 
 
+def _find_num_sticks_dim(stl: SpyreTensorLayout) -> int | None:
+    stick_stride = stl.stride_map[-1]
+    if stick_stride <= 0:
+        return None
+    target = stick_stride * stl.device_size[-1]  # stride_map[-1] * eps
+    last = len(stl.device_size) - 1
+    return next(
+        (i for i in range(last) if stl.stride_map[i] == target),
+        None,
+    )
+
+
+def _fp32_to_dl16_stl(
+    stl: SpyreTensorLayout, out_dtype: torch.dtype
+) -> SpyreTensorLayout:
+    """Return the output layout for FP32_TO_DL16 conversion."""
+    in_eps = stl.device_size[-1]
+    out_eps = get_elem_in_stick(out_dtype)
+    out_device_size = list(stl.device_size)
+    out_stride_map = list(stl.stride_map)
+    # change stick size: 32 -> 64
+    out_device_size[-1] = out_eps
+    ns = _find_num_sticks_dim(stl)
+    if ns is not None:
+        # rescale num-sticks dim with ceil division
+        out_device_size[ns] = -(-(stl.device_size[ns] * in_eps) // out_eps)
+        # update its stride consistently
+        out_stride_map[ns] = out_eps * stl.stride_map[-1]
+    return SpyreTensorLayout(
+        out_device_size,
+        out_stride_map,
+        get_device_dtype(out_dtype),
+        ElementArrangement.FP32_TO_DL16,
+    )
+
+
 def _qfp8ch_stl(stl: SpyreTensorLayout, out_dtype: torch.dtype) -> SpyreTensorLayout:
     """Output layout of ``qfp8ch``: fp16 (64/stick) -> fp8 (128/stick) quantization.
 
@@ -609,7 +645,10 @@ def _single_arg_op_layout(
             if staggered and _convert_reads_whole_input(
                 in_layout, output, dep, output_dep
             ):
-                layouts = [rescale_stl_for_dtype(stl, output.dtype, fmt)]
+                if fmt == ElementArrangement.FP32_TO_DL16:
+                    layouts = [_fp32_to_dl16_stl(stl, output.dtype)]
+                else:
+                    layouts = [rescale_stl_for_dtype(stl, output.dtype, fmt)]
 
                 # A conversion that creates a staggered EA must also expose
                 # outputs reachable by restickifying its STANDARD input first.
@@ -633,7 +672,12 @@ def _single_arg_op_layout(
                         )
                         if target_stl is None:
                             continue
-                        candidate = rescale_stl_for_dtype(target_stl, output.dtype, fmt)
+                        if fmt == ElementArrangement.FP32_TO_DL16:
+                            candidate = _fp32_to_dl16_stl(target_stl, output.dtype)
+                        else:
+                            candidate = rescale_stl_for_dtype(
+                                target_stl, output.dtype, fmt
+                            )
                         if candidate not in layouts:
                             layouts.append(candidate)
 
