@@ -951,7 +951,7 @@ class TestFfdcAsyncCompile:
         )
 
         mod = _reimport(monkeypatch, "torch_spyre.execution.async_compile")
-        monkeypatch.setattr(mod, "get_output_dir", lambda name: out_dir)
+        monkeypatch.setattr(mod, "get_output_dir", lambda name, prefix=None: out_dir)
         monkeypatch.setattr(mod, "generate_bundle", lambda *a, **k: None)
         monkeypatch.setattr(mod, "find_unimplemented", lambda specs: None)
         return mod, out_dir
@@ -1030,7 +1030,7 @@ class TestFfdcKernelRunner:
                 monkeypatch,
                 "torch_spyre._C",
                 launch_jobplan=_launch,
-                prepare_kernel=lambda path: "fake_jobplan",
+                prepare_kernel=lambda path, **kw: "fake_jobplan",
                 register_kernel_provenance=lambda *a, **k: True,
             )
         if "torch_spyre._inductor" not in sys.modules:
@@ -1057,7 +1057,7 @@ class TestFfdcKernelRunner:
 
         mod = _reimport(monkeypatch, "torch_spyre.execution.kernel_runner")
         monkeypatch.setattr(mod, "launch_jobplan", _launch)
-        monkeypatch.setattr(mod, "prepare_kernel", lambda path: "fake_jobplan")
+        monkeypatch.setattr(mod, "prepare_kernel", lambda path, **kw: "fake_jobplan")
         monkeypatch.setattr(mod, "register_kernel_provenance", lambda *a, **k: True)
         return mod
 

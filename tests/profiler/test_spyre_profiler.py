@@ -15,6 +15,8 @@
 import inspect
 import json
 import math
+import os
+import tempfile
 import unittest
 
 import pytest
@@ -442,6 +444,65 @@ def test_kineto_memcpy_and_memset_events_captured():
     assert memset_events, (
         "Expected at least one memset event in the AIUPTI-backed trace"
     )
+
+
+@pytest.mark.requires_spyre_profiler
+def test_sdsc_bundle_dir_prefix_in_kernel_event_args(monkeypatch):
+    """Verify the SDSC bundle directory prefix in the kernel event args"""
+    sdsc_bundle_dir_path = "/tmp/kernel/"
+    os.makedirs(sdsc_bundle_dir_path, exist_ok=True)
+
+    def patched_get_output_dir(kernel_name, sdsc_bundle_dir_prefix=None):
+        return tempfile.mkdtemp(
+            dir=sdsc_bundle_dir_path, prefix=f"{sdsc_bundle_dir_prefix}_{kernel_name}_"
+        )
+
+    import torch_spyre.execution.async_compile as ac
+
+    monkeypatch.setattr(ac, "get_output_dir", patched_get_output_dir)
+
+    x = torch.randn((10, 10), dtype=torch.float16, device="spyre")
+
+    _ = torch.add(x, x)
+    torch.spyre.synchronize()
+
+    with profile(
+        activities=[ProfilerActivity.CPU, ProfilerActivity.PrivateUse1]
+    ) as prof:
+        _ = torch.add(x, x)
+        torch.spyre.synchronize()
+
+    with TemporaryFileName(mode="w+") as fname:
+        prof.export_chrome_trace(fname)
+        with open(fname) as f:
+            trace = json.load(f)
+
+    events = trace["traceEvents"]
+    assert events, (
+        "No trace events captured; profiler produced an empty traceEvents list"
+    )
+
+    sdsc_bundle_dir_prefixes = [
+        os.path.basename(entry.path).split("_")[0]
+        for entry in os.scandir(sdsc_bundle_dir_path)
+        if entry.is_dir()
+    ]
+    kernel_events = [e for e in events if e.get("cat") == "kernel"]
+    assert kernel_events, (
+        "No kernel-category events found in profiler trace; cannot verify sdsc_bundle_dir_prefix"
+    )
+
+    for ke in kernel_events:
+        ke_args = ke.get("args")
+        assert ke_args is not None, f"Kernel event '{ke.get('name')}' has no args field"
+        ke_prefix = ke_args.get("sdsc_bundle_dir_prefix")
+        assert ke_prefix is not None, (
+            f"Kernel event '{ke.get('name')}' args missing 'sdsc_bundle_dir_prefix' key"
+        )
+        assert ke_prefix in sdsc_bundle_dir_prefixes, (
+            f"Kernel event '{ke.get('name')}' has sdsc_bundle_dir_prefix '{ke_prefix}' "
+            f"not found in {sdsc_bundle_dir_prefixes}"
+        )
 
 
 @pytest.mark.requires_spyre_profiler

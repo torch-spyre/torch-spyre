@@ -51,11 +51,12 @@ class JobPlanBuilder {
    * @param spyrecode_dir Path to the SpyreCode directory
    * @param stream Optional stream to use for init transfers. If nullptr, uses
    * the current stream from getCurrentStream()
-   * @param profiler_name Optional bounded base name for profiler-visible
+   * @param profiler_event_name Optional bounded base name for profiler-visible
    * compute events. A JobExecPlan step suffix is added to each compute command.
    */
   JobPlanBuilder(const std::string& spyrecode_dir, const SpyreStream* stream,
-                 std::optional<std::string> profiler_name = std::nullopt);
+                 std::optional<std::string> profiler_event_name = std::nullopt,
+                 std::string sdsc_bundle_dir_prefix = {});
 
   /**
    * @brief Build the JobPlan
@@ -146,7 +147,10 @@ class JobPlanBuilder {
   /// Stream used for initialization transfers during preparation
   const SpyreStream stream_;
   /// Optional compiler-generated base name for profiler-visible compute events
-  const std::optional<std::string> profiler_name_;
+  const std::optional<std::string> profiler_event_name_;
+  /// 8-char hex prefix of the SDSC bundle directory (emitted in trace
+  /// args as sdsc_bundle_dir_prefix regardless of whether provenance is set)
+  const std::string sdsc_bundle_dir_prefix_;
   /// Device memory allocation for the job (set during preparation and moved to
   /// JobPlan in translation)
   std::vector<flex::CompositeAddress> job_allocation_;
@@ -189,12 +193,13 @@ class JobPlanBuilder {
  * @param spyrecode_dir Path to the SpyreCode directory
  * @param stream Optional stream to use for init transfers. If nullptr, uses the
  * current stream from getCurrentStream()
- * @param profiler_name Optional bounded base name for profiler-visible compute
- * events. A JobExecPlan step suffix is added to each compute command.
+ * @param profiler_event_name Optional bounded base name for profiler-visible
+ * compute events. A JobExecPlan step suffix is added to each compute command.
  * @return Prepared JobPlan
  */
 std::unique_ptr<JobPlan> prepareKernel(
     const std::string& spyrecode_dir, const SpyreStream* stream = nullptr,
-    std::optional<std::string> profiler_name = std::nullopt);
+    std::optional<std::string> profiler_event_name = std::nullopt,
+    std::string sdsc_bundle_dir_prefix = {});
 
 }  // namespace spyre
