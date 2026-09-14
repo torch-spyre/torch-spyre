@@ -122,7 +122,16 @@ def _compact_kv(batch, kvheads, capacity, cache_seqlen, head_dim=64):
 
 
 def _to_cache_position_first(tensor):
-    """Move a KV cache with the device layout used by model cache updates."""
+    """Move a KV cache with the device layout used by model cache updates.
+
+    The logical tensor remains ``[B, Hkv, capacity, D]``, but the device axes
+    are ``[capacity, Hkv, ceil(D / eps), B, eps]``. Their stride map is the
+    corresponding row-major logical stride ``[D, capacity*D, eps,
+    Hkv*capacity*D, 1]``. This is the same mapping constructed by
+    ``hf_common._cache_position_first_stl``: putting cache position at device
+    dim 0 lets the model's logical-dim-2 ``index_copy`` update rows without a
+    cache relayout before attention reads them.
+    """
     from torch_spyre._C import SpyreTensorLayout, get_device_dtype
 
     batch, kvheads, capacity, head_dim = tensor.shape

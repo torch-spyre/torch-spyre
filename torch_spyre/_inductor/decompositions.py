@@ -1397,7 +1397,11 @@ def spyre_sliding_window_attention(
     Strictly causal square prefill uses static per-block KV windows. Generic
     masks and every other shape read the complete cache allocation in bounded
     chunks, so changing mask contents never changes the graph. A ragged query
-    length is padded up rather than refused.
+    length is padded up rather than refused. In particular, decode with a
+    runtime mask scales with the physical cache width, not only
+    ``window_size``. Callers should therefore keep decode caches compact (about
+    one window plus query-block staggering); a full-length cache remains
+    correct but intentionally receives no hidden position-dependent fast path.
     """
     num_heads = query.size(1)
     head_dim = query.size(3)
