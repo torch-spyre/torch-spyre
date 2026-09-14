@@ -249,10 +249,10 @@ class SDSCSpec:
 # through the broken infinity path.
 #
 # That underflow is supplied by guard_exp_underflow (temp_passes.py), not by the
-# hardware: the device's exp saturates at the smallest subnormal instead of
-# underflowing, and returns 2**-24 for every input below about -17. Masking here is
-# contraction-neutral only because that pass subtracts the device's own saturation
-# value back off; -1e4 alone would leave every padding lane weighted 2**-24.
+# hardware: the device's fp16 exp saturates at a nonzero floor instead of
+# underflowing. Masking here is contraction-neutral only because that pass selects
+# an exact, layout-preserving zero for underflowed lanes; -1e4 alone would leave
+# every padding lane with a nonzero weight.
 #
 # The max/min reduction identities below have the same encode_constant bug:
 # _get_mask_value("max") fed float("-inf") through the same broken path, so a
