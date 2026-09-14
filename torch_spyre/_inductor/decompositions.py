@@ -57,29 +57,31 @@ logger = get_inductor_logger("decompositions")
 
 
 _SDPA_MAX_SEQUENCE_TILE_SIZE = 512
+_SDPA_GQA_MAX_KV_TILE_SIZE = 1024
 _SDPA_MAX_TILE_PAIRS_PER_LOOP_GROUP = 16
 _SDPA_PREFERRED_HEADS_PER_TILE = (4, 2, 1)
 _SDPA_MHA_MAX_HEAD_WORK_DIVISION = 4
-_SDPA_GQA_MAX_HEAD_WORK_DIVISION = 8
 _SDPA_LIVE_SCORE_BUFFER_ALLOWANCE = 2
 _SDPA_LIVE_QUERY_BUFFER_ALLOWANCE = 2
 _SDPA_TARGET_KV_BYTES_PER_CORE = 1024 * 1024
+_SDPA_LOW_KV_HEAD_TARGET_BYTES_PER_CORE = 2 * 1024 * 1024
 
 # Decode has a very different working set from prefill: Lq == 1 leaves enough
 # LX for substantially longer K/V blocks, but backend scheduling has sharp
 # geometry-dependent cliffs before capacity is exhausted.  These policies are
-# the stable minima from sweeps at Lkv=512, 1024, and 8192.  Unknown geometries
+# the stable minima from sweeps between Lkv=512 and 8192. Unknown geometries
 # retain the conservative 512-token block and no explicit work division.
 #
-# Values are (maximum K/V block size, logical-head work-division split).
-_SDPA_DECODE_POLICIES: dict[tuple[int, int, int], tuple[int, int | None]] = {
+# Values are maximum K/V block sizes. Native GQA sweeps found that head/group
+# work division loses to ordinary scheduling for decode.
+_SDPA_DECODE_POLICIES: dict[tuple[int, int, int], int] = {
     # Granite 3.3 8B
-    (32, 8, 128): (4096, None),
+    (32, 8, 128): 8192,
     # Gemma 4 12B/26B local attention
-    (16, 8, 256): (2048, None),
-    # Gemma 4 12B and 26B global attention, respectively
-    (16, 1, 512): (512, 16),
-    (16, 2, 512): (256, 8),
+    (16, 8, 256): 8192,
+    # Gemma 4 12B and 26B global attention
+    (16, 1, 512): 8192,
+    (16, 2, 512): 8192,
 }
 
 
@@ -148,20 +150,20 @@ def _sdpa_full_core_work_division(
     """Find placeable head/query splits that keep every core occupied.
 
     MHA can split its physical head dimension up to the previously proven
-    four-way partition. GQA expansion represents the logical head dimension as
-    ``[num_kvheads, expansion]``; only a split contained by the expansion axis
-    is reliably placeable. Cap that split at eight: Gemma global attention is
-    faster at 8x4 than at 16x2 even though both occupy all 32 cores.
+    four-way partition. Native GQA represents logical heads as
+    ``[num_kvheads, expansion]``. Measurements show that preserving both axes
+    and distributing query rows alone is faster than splitting either head
+    axis, so only use this path when query rows can occupy every core exactly.
     """
     if num_cores < 1:
         return None
 
-    if num_heads == num_kvheads:
-        max_head_split = _SDPA_MHA_MAX_HEAD_WORK_DIVISION
-    else:
-        if num_heads % num_kvheads:
+    if num_heads != num_kvheads:
+        if num_heads % num_kvheads or max_seqlen_q % num_cores:
             return None
-        max_head_split = min(_SDPA_GQA_MAX_HEAD_WORK_DIVISION, num_heads // num_kvheads)
+        return {"max_seqlen_q": num_cores}
+
+    max_head_split = _SDPA_MHA_MAX_HEAD_WORK_DIVISION
     max_head_split = min(max_head_split, num_heads, num_cores)
     for head_split in range(max_head_split, 0, -1):
         if num_cores % head_split != 0 or num_heads % head_split != 0:
@@ -180,12 +182,9 @@ def _sdpa_lx_budget_bytes() -> int:
     return _lx_planning_size()
 
 
-def _sdpa_kv_work_division(
-    *, head_split: int, query_split: int, kv_block_size: int, is_gqa: bool
-) -> int:
+def _sdpa_kv_work_division(*, query_split: int, kv_block_size: int) -> int:
     """Choose a useful, exact KV split without forcing maximum occupancy."""
-    preferred = query_split if not is_gqa else max(4, 16 // head_split)
-    preferred = min(preferred, kv_block_size)
+    preferred = min(query_split, kv_block_size)
     for kv_split in range(preferred, 0, -1):
         if kv_block_size % kv_split == 0:
             return kv_split
@@ -264,30 +263,22 @@ def _select_sdpa_tiling(
 
     # Decode has no useful query-axis parallelism, and coarse head tiling
     # repeats the online-softmax body.  Keep all heads in one coarse tile.
-    # Most geometries are fastest with ordinary scheduling, but very high GQA
-    # ratios benefit from splitting the expanded logical-head axis explicitly.
-    # The K/V block cap is performance-driven and deliberately independent of
-    # the LX limit: sweeps show discontinuities well before capacity is full.
+    # Native GQA geometries are fastest with ordinary scheduling. The K/V block
+    # cap is performance-driven and deliberately independent of the LX limit:
+    # sweeps show discontinuities well before capacity is full.
     if max_seqlen_q == 1:
-        block_limit, head_split = _SDPA_DECODE_POLICIES.get(
+        block_limit = _SDPA_DECODE_POLICIES.get(
             (num_heads, num_kvheads, head_dim),
-            (_SDPA_MAX_SEQUENCE_TILE_SIZE, None),
+            _SDPA_MAX_SEQUENCE_TILE_SIZE,
         )
+        # Gemma 4 26B global has a short-context scheduling cliff: K256 wins at
+        # 512/1024/2048, while one full block wins at 4K and the measured 8K.
+        if (num_heads, num_kvheads, head_dim) == (16, 2, 512):
+            block_limit = 256 if max_seqlen_kv <= 2048 else 8192
         selected_kv_block_size = min(max_seqlen_kv, block_limit)
         selected_kv_block_size = max(64, selected_kv_block_size // 64 * 64)
         decode_work_div = None
         heads_per_core = num_heads
-        if (
-            head_split is not None
-            and head_split <= num_cores
-            and num_heads % head_split == 0
-        ):
-            decode_work_div = {
-                "num_heads": head_split,
-                "max_seqlen_q": 1,
-                "max_seqlen_kv": 1,
-            }
-            heads_per_core = num_heads // head_split
         score_bytes_per_core, estimated_live_bytes_per_core = (
             _sdpa_estimated_live_bytes_per_core(
                 batch_size=batch_size,
@@ -329,18 +320,29 @@ def _select_sdpa_tiling(
         num_heads, num_kvheads, max_seqlen_q, num_cores
     )
     if work_div is not None and max_seqlen_q <= _SDPA_MAX_SEQUENCE_TILE_SIZE:
-        heads_per_core = num_heads // work_div["num_heads"]
+        head_split = work_div.get("num_heads", 1)
+        heads_per_core = num_heads // head_split
+        kv_heads_per_core = num_kvheads // head_split
         query_rows_per_core = max_seqlen_q // work_div["max_seqlen_q"]
         kv_bytes_per_token_per_core = (
-            batch_size * heads_per_core * head_dim * element_size
+            batch_size * kv_heads_per_core * head_dim * element_size
+        )
+        target_kv_bytes_per_core = (
+            _SDPA_LOW_KV_HEAD_TARGET_BYTES_PER_CORE
+            if num_heads != num_kvheads and num_kvheads <= 2
+            else _SDPA_TARGET_KV_BYTES_PER_CORE
         )
         target_kv_block_size = max(
             64,
-            (_SDPA_TARGET_KV_BYTES_PER_CORE // kv_bytes_per_token_per_core // 64) * 64,
+            (target_kv_bytes_per_core // kv_bytes_per_token_per_core // 64) * 64,
         )
         selected_kv_block_size = min(
             max_seqlen_kv,
-            _SDPA_MAX_SEQUENCE_TILE_SIZE,
+            (
+                _SDPA_MAX_SEQUENCE_TILE_SIZE
+                if num_heads == num_kvheads
+                else _SDPA_GQA_MAX_KV_TILE_SIZE
+            ),
             target_kv_block_size,
         )
         selected_kv_block_size = max(64, selected_kv_block_size // 64 * 64)
@@ -378,12 +380,11 @@ def _select_sdpa_tiling(
         num_kv_blocks = (
             max_seqlen_kv + selected_kv_block_size - 1
         ) // selected_kv_block_size
-        work_div["max_seqlen_kv"] = _sdpa_kv_work_division(
-            head_split=work_div["num_heads"],
-            query_split=work_div["max_seqlen_q"],
-            kv_block_size=selected_kv_block_size,
-            is_gqa=num_heads != num_kvheads,
-        )
+        if num_heads == num_kvheads:
+            work_div["max_seqlen_kv"] = _sdpa_kv_work_division(
+                query_split=work_div["max_seqlen_q"],
+                kv_block_size=selected_kv_block_size,
+            )
         return _SDPATilingConfig(
             strategy=("work_divided" if num_kv_blocks == 1 else "work_divided_tiled"),
             reason=reason,
