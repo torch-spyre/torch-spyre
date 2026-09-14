@@ -287,6 +287,62 @@ def _unflatten_bmm_batch_dims(
     if not _shapes_statically_equal(output_shape, (*lhs_batch, lhs_rows, rhs_columns)):
         return
 
+    # A size-one RHS batch dimension can be read as a broadcast by the native
+    # N-D BMM. Bypass this consumer's materialized clone without deleting it
+    # or changing any other users. The matmul decomposition may add one
+    # view-only expand around the user's clone; look through only that wrapper.
+    rhs_broadcast = (
+        rhs_orig
+        if isinstance(rhs_orig, torch.fx.Node)
+        and rhs_orig.op == "call_function"
+        and rhs_orig.target == aten.expand.default
+        else None
+    )
+    rhs_clone_input = rhs_broadcast.args[0] if rhs_broadcast is not None else rhs_orig
+    rhs_clone = (
+        rhs_clone_input
+        if isinstance(rhs_clone_input, torch.fx.Node)
+        and rhs_clone_input.op == "call_function"
+        and rhs_clone_input.target == aten.clone.default
+        else None
+    )
+    rhs_expand = (
+        rhs_clone.args[0]
+        if rhs_clone is not None
+        and isinstance(rhs_clone.args[0], torch.fx.Node)
+        and rhs_clone.args[0].op == "call_function"
+        and rhs_clone.args[0].target == aten.expand.default
+        else None
+    )
+    rhs_source = rhs_expand.args[0] if rhs_expand is not None else None
+    expanded_shape = _node_shape(rhs_expand) if rhs_expand is not None else None
+    rhs_source_shape = (
+        _node_shape(rhs_source) if isinstance(rhs_source, torch.fx.Node) else None
+    )
+    if (
+        expanded_shape is not None
+        and rhs_source_shape is not None
+        and len(rhs_source_shape) == len(expanded_shape) == len(rhs_orig_shape)
+    ):
+        batch_dims = tuple(zip(rhs_source_shape[:-2], expanded_shape[:-2], strict=True))
+        # No-op expands can wrap a clone that materializes a permuted layout.
+        # Like the reshape proof above, this must not add symbolic shape guards.
+        if (
+            _shapes_statically_equal(rhs_source_shape[-2:], expanded_shape[-2:])
+            and _shapes_statically_equal(expanded_shape[-2:], rhs_orig_shape[-2:])
+            and all(
+                statically_known_true(sym_eq(rhs_dim, 1))
+                or statically_known_true(sym_eq(rhs_dim, expanded_dim))
+                for rhs_dim, expanded_dim in batch_dims
+            )
+            and any(
+                statically_known_true(sym_eq(rhs_dim, 1))
+                and statically_known_true(expanded_dim != 1)
+                for rhs_dim, expanded_dim in batch_dims
+            )
+        ):
+            rhs_orig = rhs_source
+
     # Replace the 3D bmm with a spyre.batched_matmul that accepts N-D inputs.
     # Using aten.bmm.default with >3D args would crash FakeTensorUpdater.
     with graph.inserting_before(node):
@@ -303,19 +359,21 @@ def _unflatten_bmm_batch_dims(
     graph.erase_node(output_view)
     graph.erase_node(node)
 
-    # Clean up dead reshape nodes
+    # Clean up the dead view chain. A broadcasted RHS may contain both
+    # clone(expand(...)); remove them only when this BMM was their last user.
     for reshape_node in (lhs_reshape, rhs_reshape):
         if not reshape_node.users:
-            expand_node = reshape_node.args[0]
+            input_node = reshape_node.args[0]
             graph.erase_node(reshape_node)
-            # Also remove the expand if it's now unused
-            if (
-                isinstance(expand_node, torch.fx.Node)
-                and expand_node.op == "call_function"
-                and expand_node.target == aten.expand.default
-                and not expand_node.users
+            while (
+                isinstance(input_node, torch.fx.Node)
+                and input_node.op == "call_function"
+                and input_node.target in (aten.clone.default, aten.expand.default)
+                and not input_node.users
             ):
-                graph.erase_node(expand_node)
+                next_node = input_node.args[0]
+                graph.erase_node(input_node)
+                input_node = next_node
 
 
 def decompose_addmm(graph: torch.fx.Graph) -> None:
