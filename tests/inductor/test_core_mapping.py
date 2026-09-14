@@ -53,6 +53,29 @@ from torch_spyre._inductor.views import (
 )
 
 
+@pytest.mark.parametrize(
+    "dtype",
+    [
+        DataFormats.SEN169_FP16,
+        DataFormats.IEEE_FP32,
+        DataFormats.SEN143_FP8,
+        DataFormats.SENINT4,
+        DataFormats.BFLOAT16,
+    ],
+)
+def test_partition_span_uses_device_storage_geometry(dtype):
+    eps = dtype.elems_per_stick()
+    size = [8, 4, eps]
+    # Inner-row splitting leaves gaps: 8 rows, first 2 of 4 sticks per row.
+    # The last accessed stick is 7*4+1, so the span is 30 complete sticks.
+    assert (
+        core_mapping_module.partition_physical_span_bytes(size, dtype, {1: 2}) == 3840
+    )
+    assert (
+        core_mapping_module.partition_physical_span_bytes(size, dtype, {0: 2}) == 2048
+    )
+
+
 _CORE_ID = sympy.Symbol("core_id")
 _FUSED = sympy.Symbol("fused")
 

@@ -6767,8 +6767,22 @@ def _make_tiled_reduction_op(
     loop_count,
     loop_tiled_dims,
 ):
-    """Return a ComputedBuffer mock that looks like a stamped tiled Reduction op."""
+    """Return a ComputedBuffer mock that looks like a stamped tiled Reduction op.
+
+    Builds a real output write dep (output dims only) and a real input read
+    dep (output dims + reduction dims, using sympy_index_symbol's d{i}
+    convention so reduction_loop_vars/_loop_var_to_reduction_ranges_pos can
+    find the reduction symbols -- see op_out_coords and reduction_loop_vars
+    in wsr/coarse_tile.py). Also stamps one reduction DimHint per reduction
+    dim at hint_id=0, matching TestPlanTilingPropagation._plan_for's levels
+    (which pair every level with literal hint_id 0), so
+    _group_reduction_tiled_levels_in_group/_plan_tiling_propagation's
+    has_tiled_reduction check (added by a462da6d) can recognize the tiled
+    reduction dim instead of seeing an empty dim_hints list.
+    """
+    from torch._inductor.dependencies import MemoryDep
     from torch._inductor.ir import ComputedBuffer, FixedLayout, Reduction
+    from torch_spyre._inductor.propagate_hints import DimHint
 
     data = MagicMock(spec=Reduction)
     data.ranges = list(ranges)
@@ -6782,11 +6796,13 @@ def _make_tiled_reduction_op(
         strides.insert(0, s)
         s = s * r
     layout = MagicMock(spec=FixedLayout)
+    layout.size = list(ranges)
     layout.stride = strides
 
     op = MagicMock(spec=ComputedBuffer)
     op.data = data
     op.layout = layout
+    op.get_layout.return_value = layout
     op.get_operation_name.return_value = name
     op.get_name.return_value = name
     op.loop_info = CoarseTileInfo(
@@ -6794,7 +6810,53 @@ def _make_tiled_reduction_op(
         loop_count=list(loop_count),
         loop_tiled_dims=[list(d) for d in loop_tiled_dims],
     )
-    op.get_read_writes.return_value = _make_rw_with_reads()
+
+    n_out = len(ranges)
+    out_syms = [sympy_index_symbol(f"d{i}") for i in range(n_out)]
+    red_syms = [
+        sympy_index_symbol(f"d{n_out + i}") for i in range(len(reduction_ranges))
+    ]
+
+    # Output dep: index/ranges cover only the output dims, matching
+    # op_out_coords's expectation of a real write dep -- reduction_ranges
+    # dims never appear in the output index.
+    out_dep = MagicMock(spec=MemoryDep)
+    out_dep.name = name
+    out_dep.index = (
+        sympy.Add(*out_syms)
+        if len(out_syms) > 1
+        else (out_syms[0] if out_syms else sympy.Integer(0))
+    )
+    out_dep.index = sympy.sympify(out_dep.index)
+    out_dep.ranges = dict(zip(out_syms, ranges))
+    out_dep.is_indirect.return_value = False
+
+    # Input dep: index/ranges cover output dims + reduction dims, so
+    # reduction_loop_vars can set-subtract out_syms from in_dep.ranges to
+    # recover the reduction symbols, in reduction_ranges order.
+    all_syms = out_syms + red_syms
+    in_dep = MagicMock(spec=MemoryDep)
+    in_dep.name = f"{name}_in"
+    in_dep.index = sympy.Add(*all_syms) if len(all_syms) > 1 else all_syms[0]
+    in_dep.index = sympy.sympify(in_dep.index)
+    in_dep.ranges = dict(zip(all_syms, list(ranges) + list(reduction_ranges)))
+    in_dep.is_indirect.return_value = False
+
+    rw = _make_rw_with_reads()
+    rw.reads = [in_dep]
+    rw.writes = [out_dep]
+    op.get_read_writes.return_value = rw
+
+    op.dim_hints = [
+        DimHint(
+            dim_names=[f"R{i}"],
+            split_count=1,
+            loop_var=red_syms[i],
+            is_reduction=True,
+            hint_id=0,
+        )
+        for i in range(len(reduction_ranges))
+    ]
     op.origins = OrderedSet()
     return op
 

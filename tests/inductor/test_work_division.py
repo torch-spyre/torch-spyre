@@ -15,6 +15,7 @@
 import math
 import unittest
 from contextlib import ExitStack
+from types import SimpleNamespace
 from typing import NamedTuple
 from unittest.mock import MagicMock, patch
 
@@ -30,7 +31,7 @@ from torch._inductor.ir import (
     Reduction,
 )
 
-from torch_spyre._C import ElementArrangement, SpyreTensorLayout
+from torch_spyre._C import DataFormats, ElementArrangement, SpyreTensorLayout
 from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.ir import FixedTiledLayout
 from torch_spyre._inductor.constants import (
@@ -43,9 +44,14 @@ from torch_spyre._inductor.scratchpad import allocator as allocator_module
 from torch_spyre._inductor.scratchpad.allocator import (
     CoOptimizingAllocator,
     CoreDivision,
+    ScratchpadAllocator,
 )
+from torch_spyre._inductor.scratchpad.greedy_solver import GreedyLayoutSolver
 from torch_spyre._inductor.scratchpad.plan_solver import (
     CoreDivisionBuffer,
+)
+from torch_spyre._inductor.scratchpad.utils import (
+    is_empty_tiled_layout,
 )
 from torch_spyre._inductor.work_division import (
     TensorDep,
@@ -116,6 +122,60 @@ def _computed_buffer(shape, name="buf0", reduction_type=None, reduction_ranges=(
     op = ComputedBuffer(name=name, layout=layout, data=data)
     op.operation_name = name
     return op
+
+
+class TestEmptyLxEligibility(unittest.TestCase):
+    def test_empty_tensors_are_rejected_before_lx_sizing(self):
+        """A valid empty tensor clears no eligibility path.
+
+        Native stickification preserves zero outer extents. A zero physical
+        extent on a logically nonempty tensor (a one-stick FP16 tensor
+        quantized to FP8 rescales to zero FP8 sticks) is not an empty tensor.
+        """
+
+        empty = _fixed_tiled_layout((0, 64))
+        nonempty = _fixed_tiled_layout((64, 64))
+        zero_extent = _fixed_tiled_layout((64, 64))
+        zero_extent.device_layout = SpyreTensorLayout(
+            [1, 0, 64],
+            [64, 64, 1],
+            DataFormats.SEN169_FP16,
+            ElementArrangement.STANDARD,
+        )
+        self.assertEqual(
+            [
+                is_empty_tiled_layout(layout)
+                for layout in (empty, nonempty, zero_extent)
+            ],
+            [True, False, False],
+        )
+
+        graph = SimpleNamespace(
+            try_get_buffer=lambda _name: SimpleNamespace(layout=empty)
+        )
+        allocator = ScratchpadAllocator(GreedyLayoutSolver, 2**20)
+        with patch.object(
+            allocator_module, "clone_at_graph_boundaries", return_value=True
+        ):
+            reason = allocator._input_residency_reason(
+                graph, "value", [0, 1], division_is_fixed=False
+            )
+        self.assertEqual(reason, "empty tensor")
+        with patch.object(allocator, "_op_output_good_for_lx_reuse", return_value=True):
+            reason = allocator._buffer_residency_reason(
+                graph,
+                "value",
+                [0, 1],
+                SimpleNamespace(layout=empty),
+                mutated_buffers=set(),
+                graph_output_names=set(),
+                reinterpret_output_names=set(),
+                ncores={},
+                ncores_reasons={},
+                division_is_fixed=False,
+                buf_user_deps={},
+            )
+        self.assertEqual(reason, "empty tensor")
 
 
 def _make_context(
