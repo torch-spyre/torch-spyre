@@ -2051,13 +2051,17 @@ class _DivisionMap(NamedTuple):
 # turns out to be wired per route, to an instance question about *this*
 # allocator -- either way, not a module constant).
 #
-# What does stay is ``_commit_divisions``' refusal to commit a tiled division
-# on a resident buffer. That is an invariant rather than a not-implemented
-# marker, and the apply round makes it more useful, not less: it can fail per
-# op in ways the solve cannot predict (``validate_coarse_tile_groups`` on a
-# split hint scope, ``coarse_tile`` on a divisibility violation), and the
-# moment one of those degrades from a raise to a skip, an op priced as tiled
-# is running untiled again.
+# ``_commit_divisions``' refusal to commit a tiled division on a resident
+# buffer goes with it, and has to be *rewritten* rather than kept. As written
+# it asks only whether a tiling was chosen for a resident buffer -- and LX
+# residency is this feature's payoff channel, so the same predicate would then
+# refuse exactly the outcomes the search exists to produce. What deserves to
+# survive is the narrower question the apply round can actually ask: whether
+# the tiling this buffer was *priced* at is the one the graph ended up with. It
+# can fail per op in ways the solve cannot predict
+# (``validate_coarse_tile_groups`` on a split hint scope, ``coarse_tile`` on a
+# divisibility violation), and the moment one of those degrades from a raise to
+# a skip, an op priced as tiled is running untiled again.
 TILE_CHOICES_ARE_APPLIED = False
 
 
@@ -2526,6 +2530,12 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             # optimization: an LX address was spaced by a per-core size divided
             # by a tile count the graph will not have, so this buffer and the
             # one above it can overlap.
+            #
+            # Gated on the apply step being *missing*, not on a tiling having
+            # been chosen. Once a pass applies a TileSpec the replacement
+            # question is whether the applied tiling is the one this buffer was
+            # priced at; refusing a tiled resident buffer outright would refuse
+            # the whole point of choosing tilings jointly with residency.
             raise Unsupported(
                 "coarse tiling was chosen for LX-resident buffer(s) "
                 f"{', '.join(sorted(tiled_resident))}, but no pass applies a "
@@ -3006,7 +3016,11 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         analysis per output dim, so an engine that would ignore the answer does
         not pay for it.
         """
-        tiling = build_tiling_space(op) if self._solver_chooses_tilings else None
+        tiling = (
+            build_tiling_space(op, include_reductions=False)
+            if self._solver_chooses_tilings
+            else None
+        )
         return build_op_split_space(
             op, config.sencores, buffer.sym_core_divs, tiling=tiling
         )

@@ -105,6 +105,13 @@ _MOVE_WEIGHTS = {"reorder": 0.5, "flip": 0.3, "recolor": 0.2}
 # the new footprints before a compound structural move is judged.
 _BURST_FRACTION = 0.1
 
+# How often a recolor anchor is drawn untiled outright (see
+# ``_GeneratedDivisions._draw_tiling``). Flat, and deliberately not a per-dim
+# opt-out: the tiling axis has no downward pressure in the objective, so the
+# probability of proposing an untiled region must not decay with the number of
+# tileable dims.
+_UNTILED_ANCHOR_PROB = 0.5
+
 # The geometric cool spans t0 down to t0 / _COOLING_SPAN.
 _COOLING_SPAN = 1000.0
 
@@ -428,9 +435,26 @@ class _GeneratedDivisions(_DivisionSource):
         chosen tiling reaches states that drawing them first cannot. A space
         with no tiling half draws nothing here and leaves the trajectory of a
         tiling-unaware search untouched.
+
+        For that to hold, the draw is judged on the *tiling's* own legality and
+        not against the incoming splits: a tiling whose only legal companions
+        are smaller splits -- which is precisely the footprint-shrinking state
+        the tiling axis exists to reach -- would otherwise be rejected before
+        the redraw that would supply them. Splits the drawn tiling cannot take
+        are dropped to all-ones first, so the redraw climbs out of a legal
+        state rather than never starting. If even all-ones is illegal there
+        (a committed span floor), the tiling is given up instead: the incoming
+        splits are legal untiled, since a tiled domain is a subset of the
+        untiled one.
         """
         splits = self.space.splits(config.division)
-        tiling = self._draw_tiling(splits, rng)
+        tiling = self._draw_tiling(rng)
+        if not self.space.admits(splits, tiling):
+            floor = dict.fromkeys(self.space.axes, 1)
+            if self.space.admits(floor, tiling):
+                splits = floor
+            else:
+                tiling = _UNTILED
         for axis in self.space.axes:
             candidate = dict(splits)
             candidate[axis] = rng.choice(self.space.factor_domains[axis])
@@ -441,17 +465,26 @@ class _GeneratedDivisions(_DivisionSource):
             return None
         return self.config_for(division)
 
-    def _draw_tiling(self, splits: dict, rng) -> "TileSpec":
+    def _draw_tiling(self, rng) -> "TileSpec":
         """A tiling for a recolor to flood, drawn one output dim at a time.
 
-        Each tileable dim offers its legal counts plus ``None`` for "leave this
-        one alone", so an anchor is untiled with probability ``1/(k+1)`` per dim
-        rather than always tiled -- undividing a region has to stay reachable.
-        A draw that would make ``splits`` illegal is dropped, which keeps the
-        pair jointly legal without a second pass.
+        Untiled is drawn *flat*, at ``_UNTILED_ANCHOR_PROB``, before the per-dim
+        draw starts. Per-dim opt-outs alone would leave the untiled anchor at
+        the **product** ``prod_d 1/(k_d + 1)`` over the tileable dims -- about
+        1/289 at two dims and ``_MAX_SPLITS_PER_DIM`` counts, 1/4913 at three --
+        so undividing a region would vanish exactly as the search gained room to
+        over-divide it. Nothing else pushes the tiling axis down: the objective
+        sees a tiling only through a monotone per-core footprint, so a tiling
+        move is score-neutral (accepted unconditionally) or score-improving, and
+        recolor is the only long-range move there is.
+
+        Each tileable dim then offers its legal counts plus ``None`` for "leave
+        this one alone". A level the space does not admit is dropped, which
+        keeps the result a legal tiling without a second pass; whether the
+        *splits* can live with it is :meth:`anchor`'s to settle.
         """
         space = self.space.tiling
-        if space is None:
+        if space is None or rng.random() < _UNTILED_ANCHOR_PROB:
             return _UNTILED
         tiling = _UNTILED
         for host_dim in space.output_dims:
@@ -461,7 +494,7 @@ class _GeneratedDivisions(_DivisionSource):
             candidate = TileSpec(
                 tiling.axes + (TileAxis(host_dim=host_dim, count=count),)
             )
-            if self.space.admits(splits, candidate):
+            if self.space.admits_tiling(candidate):
                 tiling = candidate
         return tiling
 

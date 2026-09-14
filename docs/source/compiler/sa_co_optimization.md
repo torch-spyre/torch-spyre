@@ -80,20 +80,39 @@ than alongside them. It has to be joint: tiling rewrites index expressions and
 The tiling half of the space is `TilingSpace` (`wsr/enumerate_tilings.py`), whose predicates
 `enumerate_tile_options` is now the cross product over — the same relationship
 `WorkDivisionContext` has to `enumerate_work_division_candidates`, so a spec the space admits is one
-the list carries. Whether it is attached at all is
+the list carries. Level order is **canonical** for that to hold in both directions: an output spec's
+levels ascend by `host_dim`, `admits` refuses any other order, and the move alphabet has no reorder
+step. Nest order is therefore not a decision variable — no term in the objective depends on it, so
+carrying both orders of a nest would double the state space, hand the applier an order chosen by
+coin flip, fragment a tiling group on a distinction without a difference, and buy nothing.
+ Whether it is attached at all is
 `CoOptimizingAllocator._solver_chooses_tilings`, and there is no flag: only a search that generates
 divisions can carry a `TileSpec`, so the engine *is* the switch, and `select_allocator` reaches this
 one from exactly two settings — `co_optimizing_lx_planning` plus
 `layout_solver = "simulated_annealing"`. Handed no tiling space, the space has no tiling half, every
 division is untiled, and the search draws and proposes exactly what it did before the field existed.
 
+Two scope limits are enforced rather than merely intended. An op that already carries `dim_hints` —
+the marker the hint pass (430) and the span-overflow pass (448) both leave set — gets an empty space,
+because `CoarseTilingPass` stamps `op.dim_hints` wholesale and would clobber the group that op is
+already part of. And v1 is **output axes only**: no move ever adds a reduction level, and
+`OpSplitSpace.admits_tiling` refuses a spec carrying one outright, since `tile_counts` skips
+reduction levels and would leave such an axis judged against its untiled extent. `TilingSpace.is_empty`
+is defined against the moves for the same reason — an op whose only tileable axis is a reduction one
+is one a generating search can do nothing with, and calling it movable spends a step of the budget on
+every flip drawn for it.
+
 The predicate has a second conjunct that is not a choice: `TILE_CHOICES_ARE_APPLIED`, which says
 whether anything runs `CoarseTilingPass` over a solve's chosen specs. **Nothing does yet**, so today
 no engine is offered tilings and this whole section is dead code waiting on its apply step — see the
 warning below for why that is a safety requirement and not caution. Wiring that step **deletes** the
 constant rather than setting it `True`: it marks a missing implementation, not a mode, and a
-constant pinned `True` would be the config flag this deliberately does not have. What survives is
-`_commit_divisions`' refusal below, which is an invariant and not a placeholder.
+constant pinned `True` would be the config flag this deliberately does not have. `_commit_divisions`'
+refusal below goes with it, and has to be *rewritten* rather than kept: as written it asks only
+whether a tiling was chosen for a resident buffer, and LX residency is this feature's payoff channel,
+so the same predicate would refuse exactly the outcomes the search exists to produce. The narrower
+question that deserves to survive is whether the tiling a buffer was *priced* at is the one the graph
+ended up with — the apply step can fail per op in ways the solve cannot predict.
 
 The space is **ragged**, and in one direction only. A tile level cuts its axis's per-tile extent, so
 a core split of that axis must divide the smaller extent — `WorkDivisionContext.factor_domain(axis,
@@ -103,7 +122,13 @@ The mirror image is deliberately not modelled. `get_per_core_span` divides each 
 split count, so a tiling shrinks the per-core span, and both `MAX_SPAN_BYTES` and the floor
 `span_reduction_pass` commits would then admit *smaller* splits — tiling would add small factors
 back. Judged untiled as they are here, per-tiling domains come out *nested* inside the untiled one
-rather than incomparable to it. That costs an option, never a verdict, but note which option: span
+rather than incomparable to it. That nesting is an **invariant**, not an apology: `_split_key` and
+`_TableRelation` assume a tiled config's split half is a key the untiled menu already carries, the
+write-back's `_menu_position` append assumes the same, and `_commit_divisions` commits the split half
+of a tiled-but-unapplied config into an untiled graph — all three are legal only because the tiled
+domain is a subset, and none of them would catch a violation. Modelling the mirror half has to come
+with those three. It costs an option, never a verdict, but note which option: span
+
 relief is the in-tree reason coarse tiling exists (`_maybe_coarse_tile_span_overflow`, pass 448), so
 this search can only find tilings that pay through LX residency, never ones that pay by making a
 bigger core split legal. Two things block doing it here — the span arithmetic runs off the untiled
@@ -136,6 +161,13 @@ two live buffers in one arrangement and a 12,768-byte overrun of the LX region i
 The per-tile footprint is also optimistic in a second way, which outlives that gate: an op whose
 output escapes its tiling group is read at full extent by the ops outside it and needs a companion
 buffer that nothing sizes yet.
+
+And the flood forms a group out of a *reachability* component, while a group has to be a contiguous
+run of the operation list. An op the relation cannot carry a tiling to — a menu-backed one, which
+`_TableRelation` leaves untiled by construction — sitting between two it can leaves the search
+pricing one group where apply time would form two, the second reading the first's full extent.
+`derive_tiling_groups` refuses that shape (one spec, two non-adjacent runs) rather than splitting it
+silently, so it surfaces as a raise instead of a wrong prediction.
 :::
 
 Three move types:
@@ -148,11 +180,20 @@ Three move types:
   every eligible buffer is resident — `pi` only decides which eligible buffers win LX, so with all
   of them already in, only a structural move can still pay.
 * **flip** (weight 0.3) — move one buffer one step: change a single axis's split factor to another
-  its domain admits, *or* edit one coarse tile level (add, remove, recount, or swap two adjacent
-  levels), then ripple, resizing its per-core footprint and refreshing LX-eligibility for it and
-  its parents. Never both at once, which is what keeps the walk local in a ragged space. Stage 0
-  measured the factor domains at ~7 legal factors per axis, which is why this is a list to draw
-  from rather than a proposal scale to cool.
+  its domain admits, *or* edit one coarse tile level (add, remove, or recount), then ripple,
+  resizing its per-core footprint and refreshing LX-eligibility for it and its parents. Never both
+  at once, which is what keeps the walk local in a ragged space. Stage 0 measured the factor domains
+  at ~7 legal factors per axis, which is why this is a list to draw from rather than a proposal
+  scale to cool.
+
+  The tile levels are **concatenated onto that list, not weighted against it**, and the draw over the
+  union is uniform — so with two tileable dims at up to 16 counts they are up to 32 entries against
+  ~7 per axis, and from the untiled state most of flip's mass goes to the tiling axis. That is an
+  implicit retune of a weight #4233 records as already optimal at the measured steps-per-buffer, and
+  it is stated rather than tuned while nothing applies a chosen tiling. It also makes `|N(x)|` vary
+  much more with state, which the uncorrected Metropolis test reads as a bias towards states with
+  more neighbours.
+
 * **recolor** (weight 0.2) — draw a splitting anchor division, flood the residency relation
   bidirectionally from it, and recolor everything it reaches.
 
@@ -165,6 +206,20 @@ Three move types:
   order, and it is drawn at all because a coarse tiling *group* is a run of consecutive ops
   agreeing on one `TileSpec` (`derive_tiling_groups`): the flood is what forms one, carrying the
   anchor's tiling to each op that can take it and leaving the far side untiled where it cannot.
+
+  The tiling draw is judged on the tiling's *own* legality, not against the incoming splits, or a
+  tiling whose only legal companions are smaller splits — exactly the footprint-shrinking state the
+  feature exists to find — would be rejected before the split redraw that would supply them. Splits
+  the drawn tiling cannot take drop to all-ones first, so the redraw climbs out of a legal state.
+
+  Untiled is drawn **flat**, at `_UNTILED_ANCHOR_PROB`, rather than as a per-dim opt-out. Per-dim
+  opt-outs alone leave the untiled anchor at the *product* over tileable dims (≈1/289 at two dims,
+  ≈1/4913 at three), so undividing a region would vanish exactly as the search gained room to
+  over-divide it — and nothing else pushes back: the objective sees a tiling only through a monotone
+  per-core footprint, so a tiling move is score-neutral (accepted unconditionally) or score-improving.
+  There is no loop-cost term yet; #4233 measures program bytes at `74,880 + 21,504 × total_tiles`,
+  with backend compile time superlinear in tile count, and names that term as the prerequisite for
+  lifting the split cap.
 
 Both structural moves carry a short cold layout burst, so `pi` has adapted to the new footprints
 before the compound move is judged as a unit by one Metropolis test. The burst stops early for the

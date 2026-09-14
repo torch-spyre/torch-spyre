@@ -61,7 +61,12 @@ from torch_spyre._inductor.scratchpad.plan_solver import (
 from torch_spyre._inductor.scratchpad.utils import (
     is_empty_tiled_layout,
 )
-from torch_spyre._inductor.wsr.enumerate_tilings import TilingSpace
+from torch_spyre._inductor.wsr.enumerate_tilings import (
+    TilingSpace,
+    build_tiling_space,
+    enumerate_tile_options,
+)
+
 from torch_spyre._inductor.work_division import (
     TensorDep,
     undeclared_splits,
@@ -2559,18 +2564,60 @@ class TestOpSplitSpaceTiling(unittest.TestCase):
             probes=[],
         )
         self.tiling = TilingSpace(
-            op=self.op,
             max_dims=2,
             output_counts={0: [2, 4]},
             reduction_counts={},
         )
 
     @contextmanager
-    def _space(self, tiling):
+    def _space(self, tiling, declaration=None):
         with self.case.patches():
             yield work_division_module.build_op_split_space(
-                self.op, self.case.max_cores, tiling=tiling
+                self.op,
+                self.case.max_cores,
+                declaration=declaration,
+                tiling=tiling,
             )
+
+    def test_a_declaration_and_a_tiling_both_bind(self):
+        """Neither check shadows the other: the tiling narrows the axis's
+        factor domain, and the declaration then refuses a split the cost
+        expression could not price -- on the same candidate."""
+        declaration = {self.x: sympy.Symbol("cd_x")}
+        tiled = TileSpec((TileAxis(host_dim=0, count=2),))
+        with self._space(self.tiling) as undeclared:
+            # Non-vacuity: the tiling alone is happy with a split on y.
+            self.assertTrue(undeclared.admits({self.x: 2, self.y: 2}, tiled))
+        with self._space(self.tiling, declaration) as space:
+            self.assertTrue(space.admits({self.x: 2, self.y: 1}, tiled))
+            # y is outside the declaration: a split there would be priced as
+            # unsplit, so it is refused however the tiling narrows x.
+            self.assertFalse(space.admits({self.x: 2, self.y: 2}, tiled))
+            self.assertFalse(  # ... and the tiling still binds under it
+                space.admits({self.x: 8, self.y: 1}, tiled)
+            )
+            self.assertTrue(space.admits({self.x: 8, self.y: 1}))
+
+    def test_the_tiling_half_agrees_with_the_enumeration(self):
+        """The seam ``test_space_admits_exactly_the_enumerated_candidates``
+        pins for the split half: what the space admits is what the list
+        carries, minus the levels whose two frames do not line up and (v1
+        scope) any reduction level."""
+        real = build_tiling_space(self.op)
+        options = enumerate_tile_options(self.op, max_options=1000)
+        self.assertGreater(len(options), 1)  # non-vacuity
+        with self._space(real) as space:
+            for spec in options:
+                resolved = all(
+                    level.host_dim in space.axis_by_host_dim
+                    for level in spec.axes
+                    if not level.is_reduction
+                )
+                self.assertEqual(
+                    space.admits_tiling(spec),
+                    resolved and spec.is_clean,
+                    spec.label,
+                )
 
     def test_a_tile_level_narrows_the_axis_it_cuts(self):
         """The ragged half: coarse tiling emits equal tiles, so a core split of
@@ -2632,6 +2679,61 @@ class TestOpSplitSpaceTiling(unittest.TestCase):
             )
 
 
+class TestAxisByHostDim(unittest.TestCase):
+    """``op.data.ranges`` keeps size-1 dims and the iteration space does not,
+    so the two frames are not positionally the same."""
+
+    def setUp(self):
+        self.d0, self.d1, self.d2 = _isym("d0"), _isym("d1"), _isym("d2")
+
+    def _op(self, ranges):
+        op = MagicMock()
+        op.data.ranges = list(ranges)
+        return op
+
+    def test_the_correspondence_is_derived_through_the_squeeze(self):
+        # ``SqueezeView.squeezer`` drops the size-1 dim, so no symbol is ever
+        # minted for host 0 and host 1 is the axis ``d0`` cuts. A positional
+        # frame would map host 1 to ``d1`` here -- the extents agree by
+        # coincidence -- and leave the actually-tiled axis unnarrowed.
+        axes = [self.d0, self.d1, self.d2]
+        it_space = {self.d0: 8, self.d1: 8, self.d2: 64}
+        mapping = work_division_module._axis_by_host_dim(
+            self._op((1, 8, 8, 64)), axes, it_space
+        )
+        self.assertEqual(mapping, {1: self.d0, 2: self.d1, 3: self.d2})
+
+    def test_a_frame_that_does_not_line_up_maps_nothing(self):
+        axes = [self.d0, self.d1]
+        it_space = {self.d0: 8, self.d1: 7}
+        self.assertEqual(
+            work_division_module._axis_by_host_dim(self._op((8, 8)), axes, it_space),
+            {},
+        )
+        # More kept dims than there are axes is the same answer.
+        self.assertEqual(
+            work_division_module._axis_by_host_dim(self._op((8, 8, 8)), axes, it_space),
+            {},
+        )
+
+    def test_an_unmapped_host_dim_cannot_be_tiled(self):
+        """The mapping is what narrows a tiled axis's core splits, so a level
+        on a dim it could not resolve is refused rather than allowed."""
+        space = work_division_module.OpSplitSpace(
+            op=MagicMock(),
+            context=MagicMock(axes=[self.d0]),
+            declaration=None,
+            output_axes=frozenset({self.d0}),
+            factor_domains={self.d0: [1, 2]},
+            tiling=TilingSpace(
+                max_dims=2, output_counts={0: [2], 1: [2]}, reduction_counts={}
+            ),
+            axis_by_host_dim={0: self.d0},
+        )
+        self.assertTrue(space.admits_tiling(TileSpec((TileAxis(0, 2),))))
+        self.assertFalse(space.admits_tiling(TileSpec((TileAxis(1, 2),))))
+
+
 class TestResidencyEdgeInversion(unittest.TestCase):
     """Propagating a division across an edge by *constructing* the other end's
     division instead of scanning its menu for a compatible entry."""
@@ -2672,19 +2774,59 @@ class TestResidencyEdgeInversion(unittest.TestCase):
         )
 
     @staticmethod
-    def _space(op, domains, output_axes):
+    def _space(op, domains, output_axes, tiling=None, axis_by_host_dim=None):
         """A space over stated domains: this class tests the edge, not the
         legality rules :class:`TestOpSplitSpace` covers."""
         context = MagicMock()
         context.axes = list(domains)
         context.is_legal.side_effect = lambda splits, tile_counts=None: True
+        context.factor_domain.side_effect = lambda axis, count=1: domains[axis]
         return work_division_module.OpSplitSpace(
             op=op,
             context=context,
             declaration=None,
             output_axes=frozenset(output_axes),
             factor_domains=domains,
+            tiling=tiling,
+            axis_by_host_dim=dict(axis_by_host_dim or {}),
         )
+
+    def _tiled_consumer_space(self, counts):
+        return self._space(
+            self.consumer,
+            {self.r: [1, 2, 4, 8], self.c: [1, 2]},
+            {self.r, self.c},
+            tiling=TilingSpace(max_dims=2, output_counts=counts, reduction_counts={}),
+            axis_by_host_dim={0: self.r},
+        )
+
+    def test_the_tiling_crosses_the_edge_where_the_far_side_can_take_it(self):
+        """What forms a tiling group at all: the run of ops the residency
+        relation reaches has to agree on one ``TileSpec``, so the inverse
+        carries it rather than re-deciding on each side."""
+        tiled = TileSpec((TileAxis(host_dim=0, count=2),))
+        consumer_space = self._tiled_consumer_space({0: [2]})
+        with self._geometry():
+            division = self._edge().consumer_division_for(
+                CoreDivision({self.x: 4}, tiling=tiled), consumer_space
+            )
+        self.assertIsNotNone(division)
+        self.assertEqual(division.tiling, tiled)
+        self.assertEqual(_by_name(division.output_splits), {"r": 4})
+
+    def test_a_tiling_the_far_side_refuses_costs_the_level_not_the_edge(self):
+        """Losing a tiling level is a worse plan; losing the edge is a worse
+        state. So the untiled inverse is taken, and the edge survives."""
+        tiled = TileSpec((TileAxis(host_dim=0, count=2),))
+        consumer_space = self._tiled_consumer_space({0: [4]})  # 2 is not offered
+        self.assertFalse(consumer_space.admits_tiling(tiled))  # non-vacuity
+        with self._geometry():
+            division = self._edge().consumer_division_for(
+                CoreDivision({self.x: 4}, tiling=tiled), consumer_space
+            )
+        self.assertIsNotNone(division)
+        self.assertTrue(division.tiling.is_untiled)
+        self.assertEqual(_by_name(division.output_splits), {"r": 4})
 
     def _edge(self):
         return work_division_module.ResidencyEdge(

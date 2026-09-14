@@ -9422,11 +9422,21 @@ class TestDeriveTilingGroups(unittest.TestCase):
     def test_consecutive_run_grouped_untiled_breaks(self):
         g = self._graph_of(["op0", "op1", "op2", "op3", "op4"])
         spec = TileSpec((TileAxis(0, 4),))
+        other = TileSpec((TileAxis(0, 2),))
         # op1,op2 tiled and consecutive -> one group; op4 tiled alone; op0/op3
         # untiled -> break the runs.
-        choices = {"op1": spec, "op2": spec, "op4": spec}
+        choices = {"op1": spec, "op2": spec, "op4": other}
         groups = derive_tiling_groups(g, choices)
         self.assertEqual(self._names(groups), [["op1", "op2"], ["op4"]])
+
+    def test_one_spec_in_two_non_adjacent_runs_is_two_groups(self):
+        # TileSpec equality is structural, so unrelated regions collide on a
+        # small alphabet. Two runs, two groups -- each mints its own hint ids.
+        g = self._graph_of(["op0", "op1", "op2", "op3", "op4"])
+        spec = TileSpec((TileAxis(0, 4),))
+        groups = derive_tiling_groups(g, {"op1": spec, "op2": spec, "op4": spec})
+        self.assertEqual(self._names(groups), [["op1", "op2"], ["op4"]])
+        self.assertEqual([s for _, s in groups], [spec, spec])
 
     def test_spec_change_breaks_the_run(self):
         g = self._graph_of(["op0", "op1"])
@@ -9539,6 +9549,30 @@ class TestCoarseTilingPassEquivalence(unittest.TestCase):
         self.assertEqual(self._loop_fields(got), ref_fields)
         self.assertEqual(list(got.data.ranges), ref_ranges)
         self.assertEqual(list(got.data.ranges), [Integer(64), Integer(64)])
+
+    def test_two_equal_spec_runs_become_two_groups_with_distinct_hint_ids(self):
+        # The fix for the structural-equality collision: op0 and op2 share a
+        # spec but op1 breaks the run, so they are two groups. Each mints its
+        # own hint id, which is what validate_coarse_tile_groups demands and
+        # what keeps their loop nests separate.
+        spec = TileSpec((TileAxis(0, 4),))
+        ops = [self._bare([256], n) for n in ("op0", "op1", "op2")]
+        g = _graph(ops)
+        groups = derive_tiling_groups(g, {"op0": spec, "op2": spec})
+        self.assertEqual(
+            [[o.get_operation_name() for o in ops_] for ops_, _ in groups],
+            [["op0"], ["op2"]],
+        )
+        CoarseTilingPass({"op0": spec, "op2": spec}).apply_pass(g)
+        hint_ids = [[h.hint_id for h in op.dim_hints] for op in (ops[0], ops[2])]
+        self.assertEqual(hint_ids, [[0], [1]])
+        self.assertNotEqual(
+            tuple(ops[0].loop_info.loop_group_id),
+            tuple(ops[2].loop_info.loop_group_id),
+        )
+        # op1 was never in a group, so it is untiled and unhinted.
+        self.assertEqual(getattr(ops[1], "dim_hints", []), [])
+        self.assertEqual(ops[1].data.ranges[0], Integer(256))
 
     def test_pass_inputs_match_hint_path_structurally(self):
         # Two independent ops in one group: prove the group derivation and

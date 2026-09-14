@@ -22,6 +22,15 @@ without materializing them. Because the enumeration *is* the cross product, a
 spec the space admits is one the list would have carried, apart from the
 ``max_options`` truncation the list applies and the space does not.
 
+Level *order* is canonical, which is what makes that equality hold in both
+directions: an output spec's levels ascend by ``host_dim``, and a spec in any
+other order is refused rather than admitted. Nest order is consequently not a
+decision variable -- no term in the cost model depends on it, so carrying both
+orders would double the state space, split a tiling group on a distinction
+without a difference, and buy nothing. Reintroduce it alongside a term that
+prices it, not before.
+
+
 The strategy is **exact divisors**: a split count is
 admissible only if it divides its dim's extent exactly, because coarse tiling
 emits equal-sized loop tiles. This is not a new rule -- it is exactly what
@@ -235,10 +244,10 @@ class TilingSpace:
     all, including the stick host dim, which :func:`build_tiling_space` drops.
     """
 
-    op: ComputedBuffer
     # Most output levels one spec may nest. Reduction levels are capped at one
     # by :meth:`admits` instead, and cannot be nested with an output level.
     max_dims: int
+
     output_counts: dict[int, list[int]]
     reduction_counts: dict[int, list[int]]
 
@@ -250,8 +259,14 @@ class TilingSpace:
 
     @property
     def is_empty(self) -> bool:
-        """True when the untiled spec is the only one this op can take."""
-        return not self.output_counts and not self.reduction_counts
+        """True when :meth:`neighbours` can never leave the untiled spec.
+
+        Defined against the *moves*, not against :meth:`enumerate`: no move ever
+        adds a reduction level, so an op with reduction counts and no output
+        counts is one a search can do nothing with, and reporting it movable
+        spends a step of the budget per flip drawn for it.
+        """
+        return not self.output_counts
 
     def counts(self, host_dim: int, is_reduction: bool = False) -> list[int]:
         """Legal split counts for one axis, in the frame ``is_reduction``
@@ -261,9 +276,10 @@ class TilingSpace:
 
     def admits(self, spec: TileSpec) -> bool:
         """Whether ``op`` may take ``spec``: every level's count legal for its
-        axis, no axis tiled twice, and the shape rules the enumerator applies
-        -- at most ``max_dims`` output levels, and a reduction level only ever
-        alone (never nested with an output axis, never two at once)."""
+        axis, no axis tiled twice, the canonical level order, and the shape
+        rules the enumerator applies -- at most ``max_dims`` output levels, and
+        a reduction level only ever alone (never nested with an output axis,
+        never two at once)."""
         if spec.is_untiled:
             return True
         axes = [(axis.is_reduction, axis.host_dim) for axis in spec.axes]
@@ -276,6 +292,8 @@ class TilingSpace:
             return False
         if not spec.is_clean:
             return spec.depth == 1
+        if any(a.host_dim >= b.host_dim for a, b in zip(spec.axes, spec.axes[1:])):
+            return False  # non-canonical level order (module docstring)
         return spec.depth <= self.max_dims
 
     def enumerate(self) -> list[TileSpec]:
@@ -310,16 +328,20 @@ class TilingSpace:
 
     def neighbours(self, spec: TileSpec) -> list[TileSpec]:
         """The specs one level-edit away from ``spec``: change a level's count,
-        remove a level, add an output level innermost, swap two adjacent
-        levels. Ordered and deduplicated, so a search proposing from this is
-        deterministic; illegal results are dropped by :meth:`admits`.
+        remove a level, add an output level. Ordered and deduplicated, so a
+        search proposing from this is deterministic; illegal results are dropped
+        by :meth:`admits`.
 
         **Output axes only**, which is the v1 scope: no move ever *adds* a
         reduction level, so a search seeded at the untiled spec never reaches
         one (a spec that already carries one can still drop it or recount it).
-        Reordering is by *adjacent* swaps alone -- they generate every
-        permutation over repeated moves, and a one-move alphabet is what makes
-        the walk local.
+
+        There is no reorder move, and an added level lands in *canonical*
+        position rather than innermost: nest order is not a decision variable
+        (see the module docstring), so a swap would be a free, always-accepted
+        step buying no information. Every candidate is canonicalized on the way
+        out, so even a non-canonical ``spec`` handed in from elsewhere has a way
+        back into the space rather than being stranded.
         """
         axes = spec.axes
         out: list[TileSpec] = []
@@ -336,13 +358,19 @@ class TilingSpace:
                 continue
             for count in self.output_counts[host_dim]:
                 out.append(TileSpec(axes + (TileAxis(host_dim=host_dim, count=count),)))
-        for i in range(len(axes) - 1):
-            out.append(TileSpec(axes[:i] + (axes[i + 1], axes[i]) + axes[i + 2 :]))
         return [
             candidate
-            for candidate in dict.fromkeys(out)
+            for candidate in dict.fromkeys(canonical_tiling(c) for c in out)
             if candidate != spec and self.admits(candidate)
         ]
+
+
+def canonical_tiling(spec: TileSpec) -> TileSpec:
+    """``spec`` with its levels in the order :meth:`TilingSpace.admits` requires
+    -- output axes before reduction axes, each ascending by ``host_dim``."""
+    return TileSpec(
+        tuple(sorted(spec.axes, key=lambda a: (a.is_reduction, a.host_dim)))
+    )
 
 
 def build_tiling_space(
@@ -350,12 +378,25 @@ def build_tiling_space(
     *,
     max_dims: int = _MAX_TILE_DIMS,
     max_splits_per_dim: int = _MAX_SPLITS_PER_DIM,
+    include_reductions: bool = True,
 ) -> TilingSpace:
     """The :class:`TilingSpace` for ``op``; empty domains for an op that cannot
-    be coarse-tiled at all, which is not an error -- untiled is always legal."""
+    be coarse-tiled at all, which is not an error -- untiled is always legal.
+
+    An op that already carries ``dim_hints`` is one of those: the hint pass and
+    the span-overflow pass both leave that marker set, and ``CoarseTilingPass``
+    stamps ``op.dim_hints`` wholesale, so offering such an op a tiling here
+    would silently clobber the group it is already part of.
+
+    ``include_reductions`` derives the reduction half, which costs a
+    stick-alignment analysis per input dep x host coord x candidate divisor.
+    Only :func:`enumerate_tile_options` reads it; a move-based search never
+    reaches a reduction level (see :meth:`TilingSpace.neighbours`), so the
+    caller that generates rather than enumerates passes ``False``.
+    """
     output_counts: dict[int, list[int]] = {}
     reduction_counts: dict[int, list[int]] = {}
-    if isinstance(op, ComputedBuffer):
+    if isinstance(op, ComputedBuffer) and not getattr(op, "dim_hints", []):
         stick_dim = _output_stick_host_dim(op)
         n_out = len(op.data.ranges) if hasattr(op.data, "ranges") else 0
         for host_dim in range(n_out):
@@ -364,13 +405,16 @@ def build_tiling_space(
             counts = _output_split_counts(op, host_dim)[:max_splits_per_dim]
             if counts:
                 output_counts[host_dim] = counts
-        if isinstance(op.data, Reduction) and config.enable_reduction_tiling:
+        if (
+            include_reductions
+            and isinstance(op.data, Reduction)
+            and config.enable_reduction_tiling
+        ):
             for red_pos in range(len(getattr(op.data, "reduction_ranges", []))):
                 counts = _reduction_split_counts(op, red_pos)[:max_splits_per_dim]
                 if counts:
                     reduction_counts[red_pos] = counts
     return TilingSpace(
-        op=op,
         max_dims=max_dims,
         output_counts=output_counts,
         reduction_counts=reduction_counts,

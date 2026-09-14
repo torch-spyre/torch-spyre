@@ -36,10 +36,19 @@ import random as rnd
 import subprocess
 import sys
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 from unittest import TestCase
+from unittest.mock import patch
 
 import sympy
+
+try:
+    from ortools.sat.python import cp_model  # noqa: F401
+
+    _HAS_ORTOOLS = True
+except ImportError:
+    _HAS_ORTOOLS = False
 
 from torch_spyre._inductor.scratchpad import utils
 from torch_spyre._inductor.scratchpad.sa_cooptimizer import (
@@ -1492,7 +1501,6 @@ def _tiling_space(output_counts=None):
     ``TilingSpace``'s business and is tested in ``test_enumerate_tilings.py``;
     here they only have to be some counts."""
     return TilingSpace(
-        op=mock.MagicMock(),
         max_dims=2,
         output_counts={0: [2, 4]} if output_counts is None else output_counts,
         reduction_counts={},
@@ -1674,6 +1682,25 @@ class GeneratedWriteBackTest(TestCase):
             buf.core_divisions[buf.chosen_division].label,
             _axis_div(d0=4, d1=2).label,
         )
+
+    def test_a_tiled_division_is_appended_and_not_deduped_against_its_twin(self):
+        """Stage 3's common path, not a corner case: ``_canonical_key`` carries
+        the tiling and no enumerated entry carries one, so *every* tiled config
+        takes the append branch -- including one whose splits the menu already
+        has."""
+        buf = _two_axis_buffer()
+        buf.division_space = _two_axis_space(tiling=_tiling_space())
+        solver = _primed_topology([buf])
+        twin = _axis_div(d0=4, d1=2)
+        self.assertIn(twin.label, [d.label for d in _TWO_AXIS_MENU])
+        tiled = CoreDivision(splits=dict(twin.splits), tiling=_TILE_4)
+        solver.chosen = [solver._sources[0].config_for(tiled)]
+        solver._write_back()
+        self.assertEqual(len(buf.core_divisions), len(_TWO_AXIS_MENU) + 1)
+        self.assertEqual(buf.chosen_division, len(_TWO_AXIS_MENU))
+        chosen = buf.core_divisions[buf.chosen_division]
+        self.assertEqual(chosen.tiling, _TILE_4)
+        self.assertEqual(chosen.output_splits, twin.output_splits)
 
     def test_a_division_the_menu_does_not_carry_is_registered(self):
         # What a truncated menu leaves -- the pruned enumeration, or (later) a
@@ -1890,3 +1917,102 @@ class MoveAlphabetTest(TestCase):
         assignment = solver._flood_region(0, anchor_config)
         self.assertEqual(set(assignment), {0, 1})
         self.assertEqual(assignment[1].key, anchor_config.key)
+
+
+class TestCoarseTilingIsGatedOnItsApplyStep(unittest.TestCase):
+    """Who may choose a coarse tiling, and what stops a choice nothing applies.
+
+    Two conjuncts, and only one of them is a choice: which engine is running
+    (the user's, through ``co_optimizing_lx_planning`` and ``layout_solver``),
+    and whether anything applies a chosen ``TileSpec`` (not a setting at all).
+    """
+
+    @staticmethod
+    def _annealer():
+        from torch_spyre._inductor.scratchpad import allocator as allocator_module
+        from torch_spyre._inductor.scratchpad.sa_cooptimizer import (
+            SaCoOptimizingSolver,
+        )
+
+        return allocator_module.CoOptimizingAllocator(
+            layout_planning=SaCoOptimizingSolver, size=1
+        )
+
+    @staticmethod
+    def _cpsat():
+        from torch_spyre._inductor.scratchpad import allocator as allocator_module
+        from torch_spyre._inductor.scratchpad.ilp_solver_ortools import (
+            CpSatLayoutSolver,
+        )
+
+        return allocator_module.CoOptimizingAllocator(
+            layout_planning=CpSatLayoutSolver, size=1
+        )
+
+    @unittest.skipUnless(_HAS_ORTOOLS, "the other engine here is cpsat")
+    def test_no_engine_is_offered_tilings_while_nothing_applies_them(self):
+        self.assertFalse(self._annealer()._solver_chooses_tilings)
+        self.assertFalse(self._cpsat()._solver_chooses_tilings)
+
+    @unittest.skipUnless(_HAS_ORTOOLS, "the other engine here is cpsat")
+    def test_once_they_are_applied_only_the_annealer_is_offered_them(self):
+        """Only a search that generates divisions can carry a ``TileSpec`` --
+        the enumerated menu has none to offer -- so an engine that indexes the
+        menu could not use a tiling space even if handed one."""
+        from torch_spyre._inductor.scratchpad import allocator as allocator_module
+
+        with patch.object(allocator_module, "TILE_CHOICES_ARE_APPLIED", True):
+            self.assertTrue(self._annealer()._solver_chooses_tilings)
+            self.assertFalse(self._cpsat()._solver_chooses_tilings)
+
+    def test_a_tiling_on_a_resident_buffer_is_refused_while_nothing_applies_it(self):
+        """The belt-and-braces guard, for the two conjuncts getting out of step.
+
+        A resident buffer's LX layout was computed from its per-core footprint
+        divided by the tile count; if the graph is never tiled it writes the
+        full extent, over whatever the packer put above it or off the end of
+        the region. Silently -- which is why the commit refuses rather than
+        dropping the tiling half. Quantified in
+        ``~/coopt-repro/stage3_unapplied_tiling_overlap.py`` (a 16,128-byte
+        overlap, or a 12,768-byte overrun) and seen at 64x on a real compile.
+
+        Pinned as the behaviour *while the apply step is missing*, which is what
+        the predicate actually tests -- no application is involved here at all.
+        The apply round replaces it with the narrower question of whether the
+        applied tiling is the one the buffer was priced at; LX residency is this
+        feature's payoff channel, so a standing refusal of every tiled resident
+        buffer would refuse the outcomes the search exists to produce.
+        """
+        from torch_spyre._inductor.errors import Unsupported
+        from torch_spyre._inductor.scratchpad import allocator as allocator_module
+        from torch_spyre._inductor.scratchpad.plan_solver import (
+            CoreDivision,
+            CoreDivisionBuffer,
+            TileAxis,
+            TileSpec,
+        )
+
+        graph = SimpleNamespace(
+            operations=[SimpleNamespace(name="buf0", iteration_space_ownership=None)]
+        )
+        buf = CoreDivisionBuffer(
+            name="buf0",
+            size=1024,
+            uses=[0, 1],
+            first_use_is_read=False,
+            in_place_parents=[],
+            residency_reason=None,
+            core_divisions=[CoreDivision(tiling=TileSpec((TileAxis(0, 4),)))],
+            chosen_division=0,
+        )
+        alloc = self._annealer()
+        with (
+            patch.object(allocator_module, "_split_option_is_legal", return_value=True),
+            patch.object(allocator_module, "commit_iteration_space_ownership"),
+        ):
+            buf.address = None
+            alloc._commit_divisions(graph, [buf])  # spilled: warned, not refused
+            buf.address = 0
+            with self.assertRaises(Unsupported) as caught:
+                alloc._commit_divisions(graph, [buf])
+        self.assertIn("buf0", str(caught.exception))
