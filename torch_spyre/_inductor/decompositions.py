@@ -65,6 +65,22 @@ _SDPA_LIVE_SCORE_BUFFER_ALLOWANCE = 2
 _SDPA_LIVE_QUERY_BUFFER_ALLOWANCE = 2
 _SDPA_TARGET_KV_BYTES_PER_CORE = 1024 * 1024
 
+_SWA_CALIBRATED_NUM_CORES = 32
+_SWA_CALIBRATED_MIN_LX_BUDGET = 1_625_344
+
+# Values are (maximum physical window, maximum explicit K/V block width). Both
+# calibrated geometries run fastest without an additional coarse head loop;
+# ordinary work division then schedules the individual operations. The sweeps
+# cover decode and 64-row query blocks, which are the only two values produced
+# by ``query_blocking``. Unknown or wider geometries retain the pre-cost-model
+# fallback.
+_SWA_POLICIES: dict[tuple[int, int, int], tuple[int, int]] = {
+    # Gemma 3 local attention, W=512 and compact capacity=576.
+    (8, 4, 256): (576, 576),
+    # Gemma 4 12B/26B local attention, W=1024 and compact capacity=1088.
+    (16, 8, 256): (1088, 512),
+}
+
 # Decode has a very different working set from prefill: Lq == 1 leaves enough
 # LX for substantially longer K/V blocks, but backend scheduling has sharp
 # geometry-dependent cliffs before capacity is exhausted.  These policies are
@@ -98,6 +114,18 @@ class _SDPATilingConfig:
     work_div: dict[str, int] | None
     score_bytes_per_core: int | None
     estimated_live_bytes_per_core: int | None
+    lx_budget_bytes: int
+
+
+@dataclasses.dataclass(frozen=True)
+class _SWATilingConfig:
+    """Static choices for one sliding-attention query block."""
+
+    strategy: str
+    reason: str
+    kv_block_size: int
+    num_kv_blocks: int
+    num_head_tiles: int
     lx_budget_bytes: int
 
 
@@ -411,6 +439,71 @@ def _select_sdpa_tiling(
         work_div=None,
         score_bytes_per_core=score_bytes_per_core,
         estimated_live_bytes_per_core=estimated_live_bytes_per_core,
+        lx_budget_bytes=lx_budget_bytes,
+    )
+
+
+def _select_swa_tiling(
+    *,
+    batch_size: int,
+    num_heads: int,
+    num_kvheads: int,
+    q_block: int,
+    buffer_width: int,
+    head_dim: int,
+    element_size: int,
+    num_cores: int,
+    lx_budget_bytes: int,
+) -> _SWATilingConfig:
+    """Choose measured SWA tiling, preserving the proven generic fallback.
+
+    Full SDPA's work-divided policy cannot be copied mechanically here. SWA's
+    mask is sliced independently for every explicit query/KV block, and a
+    query-axis work-division hint propagates onto the mask's broadcast head
+    dimension. That is not evenly divisible and is rejected before codegen.
+    More importantly, direct sweeps show a different objective optimum even
+    when the shape is accepted: Gemma 4 decode is faster with two 512-row
+    blocks than one 1088-row block.
+
+    Select only policies measured at their complete static geometry and
+    hardware budget. Batch, dtype width, core count, LX budget, heads and head
+    width are all compile-time facts, so this does not make mask contents or
+    cache position part of specialization. Everything else keeps the original
+    512-row blocks and at-most-four-head coarse tiles.
+    """
+    policy = _SWA_POLICIES.get((num_heads, num_kvheads, head_dim))
+    calibrated = (
+        policy is not None
+        and buffer_width <= policy[0]
+        and batch_size == 1
+        and element_size == 2
+        and num_cores == _SWA_CALIBRATED_NUM_CORES
+        and lx_budget_bytes >= _SWA_CALIBRATED_MIN_LX_BUDGET
+        and q_block in (1, STICK)
+    )
+
+    if calibrated:
+        assert policy is not None
+        policy_block_size = policy[1]
+        kv_block_size = min(buffer_width, policy_block_size)
+        num_kv_blocks = (buffer_width + kv_block_size - 1) // kv_block_size
+        return _SWATilingConfig(
+            strategy="calibrated" if num_kv_blocks == 1 else "calibrated_tiled",
+            reason="production geometry calibrated by SWA sweep",
+            kv_block_size=kv_block_size,
+            num_kv_blocks=num_kv_blocks,
+            num_head_tiles=1,
+            lx_budget_bytes=lx_budget_bytes,
+        )
+
+    kv_block_size = min(_SDPA_MAX_SEQUENCE_TILE_SIZE, buffer_width)
+    num_kv_blocks = (buffer_width + kv_block_size - 1) // kv_block_size
+    return _SWATilingConfig(
+        strategy="fallback" if num_kv_blocks == 1 else "fallback_tiled",
+        reason="shape or hardware is outside the calibrated SWA policies",
+        kv_block_size=kv_block_size,
+        num_kv_blocks=num_kv_blocks,
+        num_head_tiles=_sdpa_num_head_tiles(num_heads),
         lx_budget_bytes=lx_budget_bytes,
     )
 
@@ -1140,12 +1233,30 @@ def _windowed_attention(
     # tensor mask is the only source of geometry.
     buffer_width = key.size(2) if causal_plan is None else causal_plan.buffer_width
 
-    # Bound each explicit KV block to the proven SDPA tile size. Unlike a coarse
-    # tile over the reduction dimension, explicit blocks make online-softmax
-    # state ordinary functional graph values. SWA already caps Q at 64 rows, so
-    # there is no need for full SDPA's additional approximately four-way split.
-    kv_block_size = min(_SDPA_MAX_SEQUENCE_TILE_SIZE, buffer_width)
-    num_kv_blocks = (buffer_width + kv_block_size - 1) // kv_block_size
+    tiling = _select_swa_tiling(
+        batch_size=query.size(0),
+        num_heads=num_heads,
+        num_kvheads=key.size(1),
+        q_block=q_block,
+        buffer_width=buffer_width,
+        head_dim=query.size(3),
+        element_size=query.dtype.itemsize,
+        num_cores=config.sencores,
+        lx_budget_bytes=_sdpa_lx_budget_bytes(),
+    )
+    logger.debug(
+        "SWA tiling: strategy=%s reason=%s q_block=%s "
+        "buffer_width=%s kv_blocks=%s kv_block_size=%s "
+        "head_tiles=%s lx_budget_bytes=%s",
+        tiling.strategy,
+        tiling.reason,
+        q_block,
+        buffer_width,
+        tiling.num_kv_blocks,
+        tiling.kv_block_size,
+        tiling.num_head_tiles,
+        tiling.lx_budget_bytes,
+    )
     # Spyre stores fp16 and bf16 tensors in its 16-bit floating-point format.
     # Use values representable in that storage rather than bf16's wider range.
     storage_dtype = (
@@ -1174,9 +1285,9 @@ def _windowed_attention(
         # the wrong loop group (and, for batch > 1, leave a dangling scheduler
         # dependency after grouping).
         window_chunks = []
-        for kv_block in range(num_kv_blocks):
-            start = kv_block * kv_block_size
-            end = min(start + kv_block_size, buffer_width)
+        for kv_block in range(tiling.num_kv_blocks):
+            start = kv_block * tiling.kv_block_size
+            end = min(start + tiling.kv_block_size, buffer_width)
             k_blk, v_blk = torch.ops.spyre.kv_window(
                 key,
                 value,
@@ -1191,13 +1302,12 @@ def _windowed_attention(
         with spyre_hint(named_dims=["_b", "num_heads", "q_block", "head_dim"]):
             q_scaled = q_rows * scaling_factor
 
-        # Do not create a one-tile hint group. Besides doing no useful work, that
-        # group can make post-layout restickify producers appear after their
-        # consumers for small batched MHA graphs.
-        num_head_tiles = _sdpa_num_head_tiles(num_heads)
+        # Do not create a one-tile hint group. Besides doing no useful work, it
+        # can make post-layout restickify producers appear after their consumers
+        # for small batched MHA graphs.
         with (
-            spyre_hint(tiles={"num_heads": num_head_tiles})
-            if num_head_tiles > 1
+            spyre_hint(tiles={"num_heads": tiling.num_head_tiles})
+            if tiling.num_head_tiles > 1
             else nullcontext()
         ):
             running_max = None
@@ -1248,7 +1358,7 @@ def _windowed_attention(
                     assert correction is not None
                     new_output = output * correction.unsqueeze(-1) + weighted
 
-                if kv_block == num_kv_blocks - 1:
+                if kv_block == tiling.num_kv_blocks - 1:
                     # Keep the final divide in the same hint scope as its
                     # producer, as full SDPA does for split-layout outputs.
                     with spyre_hint(

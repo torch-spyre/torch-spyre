@@ -496,6 +496,12 @@ class TestCompactCache(unittest.TestCase):
         query = cached_randn((1, 16, 1, 256), differentiation=1, dtype=torch.float16)
         _compare_attention(query, key, value, 1024, query_end=1088)
 
+    def test_anchored_decode_gemma3(self):
+        # Gemma 3's production compact cache is one 576-row calibrated block.
+        key, value = _compact_kv(1, 4, 576, 576, head_dim=256)
+        query = cached_randn((1, 8, 1, 256), differentiation=1, dtype=torch.float16)
+        _compare_attention(query, key, value, 512, query_end=576)
+
     def test_runtime_decode_mask_reuses_one_graph_as_values_change(self):
         """Position and padding travel as tensor data, never Python guards."""
         batch, heads, kvheads, capacity, window = 2, 8, 2, 256, 128
