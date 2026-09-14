@@ -122,6 +122,7 @@ from ..pass_utils import (
     indirect_sizes_from_op,
     invalidate_op_read_writes,
     iteration_space_from_op,
+    op_read_writes,
 )
 from ..ir import FixedTiledLayout, SpyreConstantFallback, _resize_device_layout
 from .tile import compute_tile_index, compute_tile_stride, decompose_index_for_tiling
@@ -482,7 +483,7 @@ def plan_coarse_tile_groups(
                 continue
 
             op_out = op_out_coords(op)
-            rw = op.get_read_writes()
+            rw = op_read_writes(op)
             read_deps = [d for d in rw.reads if isinstance(d, MemoryDep)]
             write_deps = [d for d in rw.writes if isinstance(d, MemoryDep)]
 
@@ -596,7 +597,7 @@ def _find_outside_consumers_planned(
     for op in operations:
         if not isinstance(op, ComputedBuffer):
             continue
-        if not _reads_buffer(op, buf_name):
+        if not _reads_buffer_cached(op, buf_name):
             continue
         candidate_outer_key = name_to_group_outer_key.get(op.get_name())
         if candidate_outer_key is None or candidate_outer_key != outer_key:
@@ -848,7 +849,7 @@ def _plan_tiling_propagation(
                         if (
                             not isinstance(candidate, ComputedBuffer)
                             or candidate is op
-                            or not _reads_buffer(candidate, buf_name)
+                            or not _reads_buffer_cached(candidate, buf_name)
                         ):
                             continue
                         if name_to_group_outer_key.get(candidate.get_name()) != (
@@ -1018,7 +1019,7 @@ def _plan_tiling_propagation(
                         in_loop_carry = any(
                             isinstance(candidate, ComputedBuffer)
                             and candidate is not op
-                            and _reads_buffer(candidate, mut_target_name)
+                            and _reads_buffer_cached(candidate, mut_target_name)
                             and name_to_group_outer_key.get(candidate.get_name())
                             == info.loop_group_id[0]
                             for candidate in group_ops
@@ -1751,7 +1752,7 @@ def _consumers_reading_incomplete_reduction(
     for o in group_ops:
         if not isinstance(o, ComputedBuffer) or o.get_name() == buf_name:
             continue
-        if not _reads_buffer(o, buf_name):
+        if not _reads_buffer_cached(o, buf_name):
             continue
         if _reads_incomplete_reduction(
             o, group_ops, group_op_names, plan, group_reduction_tiled_levels
@@ -1777,8 +1778,14 @@ def _plan_is_loop_invariant_at_reduction_levels(
 
 
 def _op_reads(op: ComputedBuffer) -> set[str]:
-    """Return the set of buffer names op reads (via MemoryDep)."""
-    return {d.name for d in op.get_read_writes().reads if isinstance(d, MemoryDep)}
+    """Return the set of buffer names op reads (via MemoryDep).
+
+    Uses the memoized op_read_writes() helper: every call site of
+    _op_reads is confined to planning-time (zero-mutation) contexts, so a
+    memo scoped to the op instance cannot go stale here -- see
+    _reads_buffer_cached's docstring for the general argument.
+    """
+    return {d.name for d in op_read_writes(op).reads if isinstance(d, MemoryDep)}
 
 
 # ---------------------------------------------------------------------------
@@ -2092,13 +2099,14 @@ def _divide_ranges(
     # Invalidate ComputedBuffer-level caches derived from data.ranges.
     _clear_cache(op, _COMPUTED_BUF_SIZES_KEY)
     _clear_cache(op, _COMPUTED_BUF_FREE_SYMS_KEY)
+    # ranges just changed unconditionally above, so any memoized
+    # get_read_writes() result (pass_utils.op_read_writes) is stale
+    # regardless of which capture path (if any) runs below -- invalidate
+    # unconditionally rather than only inside the symbol-remap branch.
+    invalidate_op_read_writes(op)
 
     symbol_remap = None
     if before_symbols is not None or fused_before_symbols is not None:
-        # Both capture paths call the memoized iteration-space helper before
-        # ranges are rewritten.  Always invalidate it before observing the new
-        # iteration space, including the fused-dimension fallback.
-        invalidate_op_read_writes(op)
         if before_symbols is not None:
             symbol_remap = _order_preserving_symbol_remap(
                 op, before_symbols, _capture_logical_iteration_symbols(op)
@@ -2201,10 +2209,14 @@ def _divide_reduction_ranges(
             reduction_ranges[i] = sympy.sympify(r) / sympy.sympify(loop_count)
     # Reduction is a frozen dataclass; use object.__setattr__ to mutate it.
     object.__setattr__(data, "reduction_ranges", reduction_ranges)
+    # reduction_ranges just changed unconditionally above, so any memoized
+    # get_read_writes() result (pass_utils.op_read_writes) is stale
+    # regardless of whether a symbol-remap capture path runs below --
+    # invalidate unconditionally rather than only inside that branch.
+    invalidate_op_read_writes(op)
     if before_symbols is None and fused_before_symbols is None:
         return None
 
-    invalidate_op_read_writes(op)
     if before_symbols is not None:
         return _order_preserving_symbol_remap(
             op, before_symbols, _capture_logical_iteration_symbols(op)
@@ -3068,6 +3080,29 @@ def _reads_buffer(op: ComputedBuffer, buf_name: str) -> bool:
     except Exception as e:
         logger.debug(
             "_reads_buffer: get_read_writes() raised for %s: %s", op.get_name(), e
+        )
+        return False
+    return any(getattr(dep, "name", None) == buf_name for dep in rw.reads)
+
+
+def _reads_buffer_cached(op: ComputedBuffer, buf_name: str) -> bool:
+    """Planning-time analog of _reads_buffer that memoizes get_read_writes()
+    via pass_utils.op_read_writes().
+
+    Only safe to call from contexts that never mutate a *different* op's
+    inner_fn between calls for the same op -- see the zero-mutation
+    argument in coarse_tile_compile_time's design notes. Do NOT call this
+    from transform-time helpers (_propagate_tiled_op,
+    _propagate_tiled_reduction_op, _find_outside_consumers) where earlier
+    splices in the same pass can make another op's cached reads stale.
+    """
+    try:
+        rw = op_read_writes(op)
+    except Exception as e:
+        logger.debug(
+            "_reads_buffer_cached: get_read_writes() raised for %s: %s",
+            op.get_name(),
+            e,
         )
         return False
     return any(getattr(dep, "name", None) == buf_name for dep in rw.reads)
@@ -6406,7 +6441,11 @@ def _should_patch_retiled_load_indexes(
     loop_info = getattr(op, "loop_info", None)
     if loop_info is None or loop_info.loop_group_id != group_id:
         return False
-    return any(_reads_buffer(op, name) for name in retiled_names)
+    # Fetch op's own read names once (memoized via _op_reads -- safe here
+    # because _patch_retiled_load_indexes tests/mutates each op in
+    # group_ops at most once) instead of re-tracing inner_fn once per name
+    # in retiled_names.
+    return not retiled_names.isdisjoint(_op_reads(op))
 
 
 def _replace_group_op(
@@ -6459,6 +6498,7 @@ def _patch_retiled_load_indexes(
                 return _orig(*args)
 
         object.__setattr__(op.data, "inner_fn", new_inner_fn)
+        invalidate_op_read_writes(op)
         new_op = replace_computed_buffer_body(
             op,
             op.data,
