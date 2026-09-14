@@ -427,4 +427,23 @@ def test_eager_ea(src_dev, dst_dev, fp16, eager_to):
     assert_ea(z32, ea_of(src_dev))
 
 
+# The DL16TOFP32/FP32TODL16 shuffle maps one fp16 stick (64 elements) to two
+# fp32 sticks (32 elements each).  When the innermost dimension is not a
+# multiple of 64 (e.g. 96), the last fp16 stick is partially filled.
+@pytest.mark.parametrize("device", ["spyre"])
+@pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+def test_substick_fp16_fp32_fp16_roundtrip(device):
+    def fn(x):
+        return torch.add(x.to(torch.float32), 1.0).to(torch.float16)
+
+    x = torch.ones(2, 96, dtype=torch.float16)
+    cpu_result = fn(x)
+
+    compiled_fn = torch.compile(fn)
+    result = compiled_fn(x.to(device))
+
+    assert_ea(result, ElementArrangement.STANDARD)
+    torch.testing.assert_close(result.cpu(), cpu_result, rtol=1e-2, atol=1e-2)
+
+
 # Made with Bob
