@@ -244,10 +244,15 @@ class SDSCSpec:
 # pattern instead of the fp16 infinity encoding (confirmed empirically: -inf
 # round-trips to NaN, not 0xFC00), so exp(-inf) never reaches the runtime as
 # exp(-inf) -- it reaches it as exp(NaN), which poisons the output instead of
-# masking it to 0. -1e4 is finite (encodes correctly) and still underflows
-# exp() to exactly 0 in fp16 (fp16's smallest positive value is ~6e-8; anything
-# below about -12 already underflows), so it produces the same masking effect
-# without going through the broken infinity path.
+# masking it to 0. -1e4 is finite, so it encodes correctly, and it is negative enough
+# that exp() of it underflows, so it produces the same masking effect without going
+# through the broken infinity path.
+#
+# That underflow is supplied by guard_exp_underflow (temp_passes.py), not by the
+# hardware: the device's exp saturates at the smallest subnormal instead of
+# underflowing, and returns 2**-24 for every input below about -17. Masking here is
+# contraction-neutral only because that pass subtracts the device's own saturation
+# value back off; -1e4 alone would leave every padding lane weighted 2**-24.
 #
 # The max/min reduction identities below have the same encode_constant bug:
 # _get_mask_value("max") fed float("-inf") through the same broken path, so a
@@ -262,7 +267,7 @@ _FP16_MAX = 65504.0
 _FP16_MIN = -65504.0
 
 _POINTWISE_PADDING_MASK_VALUE: dict[str, float] = {
-    "exp": -1e4,  # exp(-1e4) underflows to 0 in fp16; see NOTE above.
+    "exp": -1e4,  # guard_exp_underflow makes exp(-1e4) a true 0; see NOTE above.
 }
 
 

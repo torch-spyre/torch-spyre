@@ -14,7 +14,7 @@
 
 # This file contains inductor passes that are only needed as temp fixes
 
-from math import prod
+from math import log, prod
 
 import torch
 from torch.fx.experimental.symbolic_shapes import statically_known_true, sym_eq
@@ -25,6 +25,7 @@ from torch._inductor.pattern_matcher import (
     PatternMatcherPass,
     register_graph_pattern,
 )
+from .dtype_ops import DtypeOpTable
 from .logging_utils import get_inductor_logger
 from .pass_utils import copy_fx_custom_meta
 
@@ -316,6 +317,124 @@ def _unflatten_bmm_batch_dims(
                 and not expand_node.users
             ):
                 graph.erase_node(expand_node)
+
+
+# Marks both the exp a guard was built around and the exp that measures the floor, so
+# a second run over the same graph is a no-op rather than a second guard.
+_EXP_UNDERFLOW_DONE = "_spyre_exp_underflow_done"
+
+
+def _exp_underflow_threshold(dtype: torch.dtype) -> float | None:
+    """Largest input whose ``exp()`` rounds to zero in ``dtype``, else None.
+
+    ``exp(x)`` rounds to zero once it drops below half the smallest subnormal, which
+    is ``finfo.tiny * finfo.eps`` in every IEEE binary format: -17.33 at fp16,
+    -92.88 at bf16.
+    """
+    if not dtype.is_floating_point:
+        return None
+    finfo = torch.finfo(dtype)
+    return log(finfo.tiny * finfo.eps / 2.0)
+
+
+def guard_exp_underflow(graph: torch.fx.Graph) -> None:
+    """Give ``aten.exp`` the underflow to zero that the device op does not perform.
+
+    The device's ``exp`` saturates instead of underflowing. Every fp16 input below
+    about -17 returns the smallest subnormal, 2**-24, and so does ``-inf``, where
+    IEEE gives an exact zero. Two callers read that as a zero and are quietly wrong
+    without this:
+
+      * a masked softmax -- attention adds a large negative sentinel to the scores
+        of the positions it must ignore, and at weight 2**-24 rather than 0 every
+        ignored position still contributes its value through ``matmul(probs, v)``.
+        Paged attention gathers whole pages, so the slots past a sequence's end
+        reach the output, and because vLLM hands the same block to later requests,
+        one forward pass comes to depend on the requests that held those pages
+        before it: a fresh process answers the same greedy request differently
+        until block reuse stops changing those bytes;
+      * ``_POINTWISE_PADDING_MASK_VALUE`` (codegen/superdsc.py), which seeds an
+        exp's padding lanes with -1e4 to make them contraction-neutral.
+
+    Rewritten as ``exp(x) - exp(clamp_max(x, threshold))``. Below the threshold both
+    terms are whatever value the device saturates at, so they cancel to an exact
+    zero **without this pass having to know that value** -- the second exp measures
+    the floor on the device, in device precision. Above it the second term is still
+    that floor, which is the smallest representable magnitude and therefore far
+    below the first term's ulp, so the result is unchanged.
+
+    Not knowing the floor is the point. The obvious cheaper shape, subtracting the
+    host's idea of the smallest subnormal and clamping at zero with ``relu``,
+    compiles everywhere and **does not fix the bug**: a host read-back of the probs
+    then shows exact zeros while the leak persists at half amplitude, because device
+    fp16 is DL16 (1-6-9) and the subnormal range does not survive the D2H rounding,
+    so the host constant is not the device's floor. That also rules out judging any
+    fix here by reading an intermediate back.
+
+    Selecting the zero instead -- ``where(x < threshold, 0, exp(x))`` -- is exact and
+    was the first shape tried. It does not lower: the select gives the softmax
+    numerator a third operand and a full-extent constant, and inside the SDPA
+    decomposition the stick-layout solver then has no mechanism to reconcile them
+    with the layout the matmul needs, so 14 of torch-spyre's own attention tests
+    fail to compile with ``no mechanism to resolve stick incompatibility``. A
+    multiplicative mask and ``masked_fill`` fail the same check on more tests.
+    Staying with unary ops plus one same-shape subtract is what makes this shape
+    lower: every operand carries exactly the layout the ``exp`` already had.
+
+    Rewriting at FX rather than in a lowering is also forced: ``split_multi_ops``
+    materializes each op of a multi-op pointwise body by finding the FX node that
+    produced it, so ops conjured inside an ``inner_fn`` have nothing to resolve
+    against and codegen fails with ``No FX node for buf<n>``.
+
+    fp16 family only. The device's fp32 exp saturates at 2**-17 rather than near
+    fp32's smallest subnormal, which is a much larger error of its own, and fp32 has
+    no masked-softmax caller.
+
+    Two costs. A second transcendental on the same tensor. And because the
+    subtracted term is the device's floor rather than a mathematical threshold, this
+    zeroes every input for which the device has already saturated -- measured,
+    x <= -16, where IEEE would zero only x < -17.33 -- so inputs in that gap return
+    0 instead of 2**-24 or 2**-23, the two smallest representable magnitudes, in a
+    range where the device op is already returning about half the true value.
+        """
+    for node in list(graph.nodes):
+        if node.op != "call_function" or node.target is not aten.exp.default:
+            continue
+        if node.meta.get(_EXP_UNDERFLOW_DONE):
+            continue
+        out_meta = node.meta.get("val", None)
+        if out_meta is None or out_meta.dtype not in DtypeOpTable.fp16_types():
+            continue
+        threshold = _exp_underflow_threshold(out_meta.dtype)
+        if threshold is None:
+            continue
+
+        with graph.inserting_before(node):
+            clamped = graph.call_function(
+                aten.clamp_max.default, args=(node.args[0], threshold)
+            )
+            clamped.meta["val"] = torch.empty_like(out_meta, device="meta")
+            copy_fx_custom_meta(node, clamped)
+            floor = graph.call_function(aten.exp.default, args=(clamped,))
+            floor.meta["val"] = torch.empty_like(out_meta, device="meta")
+            copy_fx_custom_meta(node, floor)
+            # This exp *is* the floor measurement; rewriting it would not terminate.
+            floor.meta[_EXP_UNDERFLOW_DONE] = True
+
+        with graph.inserting_after(node):
+            guarded = graph.call_function(aten.sub.Tensor, args=(node, floor))
+            guarded.meta["val"] = torch.empty_like(out_meta, device="meta")
+            copy_fx_custom_meta(node, guarded)
+
+        # The exp keeps feeding the subtract it now sits behind; every other reader
+        # takes the subtract. Without the callback this would rewrite the subtract's
+        # own operand into a reference to itself.
+        node.replace_all_uses_with(
+            guarded, delete_user_cb=lambda user: user is not guarded
+        )
+        node.meta[_EXP_UNDERFLOW_DONE] = True
+
+    graph.lint()
 
 
 def decompose_addmm(graph: torch.fx.Graph) -> None:
