@@ -238,11 +238,11 @@ def _select_sdpa_tiling(
     """Choose a work-divided tile when it is safe, otherwise use the fallback.
 
     Capacity is a rejection constraint, not the objective. Among feasible
-    choices, target about 1 MiB of expanded K/V data per core; local sweeps show
-    that both smaller blocks (extra online-softmax iterations) and larger blocks
-    (more local pressure) lose. Keep Lq and heads in one coarse tile whenever a
-    placeable work division can use every core. Shapes outside the calibrated
-    Lq<=512 regime retain the post-#4259 decomposition.
+    choices, target 1-2 MiB of physical K/V data per core; native-GQA sweeps
+    show that both smaller blocks (extra online-softmax iterations) and larger
+    blocks (more local pressure) lose. Keep Lq and heads in one coarse tile
+    whenever a placeable work division can use every core. Shapes outside the
+    calibrated Lq<=512 regime retain the post-#4259 decomposition.
     """
     quarter_kv_stick_aligned = max(64, ((max_seqlen_kv + 3) // 4 + 63) // 64 * 64)
     fallback_kv_block_size = min(_SDPA_MAX_SEQUENCE_TILE_SIZE, quarter_kv_stick_aligned)
