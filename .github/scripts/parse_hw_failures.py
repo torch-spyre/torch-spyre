@@ -48,14 +48,18 @@ RE_ATTEMPT_PASSED = re.compile(r"=== Attempt \d+ PASSED")
 
 # -------------------- RAS errors ------------------------
 # Matches EVERY ras_base.hpp ERRR line regardless of which fields are present.
-# The JSON object starts at '{' and ends at the first '}' that closes the root
-# object.  All known RAS blobs are single-line, so we match to end-of-line.
+# The JSON object starts at '{' and, since the blob group is greedy, ends at the
+# last '}' on the line.  Applied with .search on an ANSI-stripped line (see
+# _extract_all_ras_events), so it tolerates a "[unspecified] <color> " prefix
+# before ERRR and any trailing content after the closing '}' (e.g. a color
+# reset).  It must NOT anchor the blob to end-of-line: raw GHA logs colorize the
+# whole line, so the closing '}' is not the last character.
 RE_RAS_LINE = re.compile(
     r"ERRR\s+"
     r"(?P<day>\d{2})\.(?P<month>\d{2})\.(?P<year>\d{4})\s+"
     r"(?P<time>\d{2}:\d{2}:\d{2}\.\d+)"
     r"\s+\[.*?ras_base\.hpp.*?\]\s+"
-    r"(?P<blob>\{.+\})\s*$"
+    r"(?P<blob>\{.+\})"
 )
 
 # Also catch RuntimeError: {...RAS...} lines (Python traceback form)
@@ -343,9 +347,15 @@ def _extract_all_ras_events(chunk_lines: list[str]) -> list[dict]:
     events: list[dict] = []
     seen_blobs: set[str] = set()
 
-    for line in chunk_lines:
-        # Primary form: ERRR ... [ras_base.hpp] { ... }
-        m = RE_RAS_LINE.match(line.strip())
+    for raw_line in chunk_lines:
+        # Raw GHA logs colorize every line; strip ANSI + control chars first so
+        # both the timestamp prefix and the JSON blob are visible to the
+        # regexes.  _clean is the same stripper used on extracted field values.
+        line = _clean(raw_line)
+        # Primary form: ERRR ... [ras_base.hpp] { ... }.  Use .search, not
+        # .match: even after stripping color codes the line begins with a
+        # "[unspecified] " source prefix before ERRR.
+        m = RE_RAS_LINE.search(line)
         blob_str = None
         ts_str = None
 
