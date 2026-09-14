@@ -558,6 +558,14 @@ hop instead of several.
 
 ### Scratchpad planning
 
+With `SPYRE_LX_PLANNER_RELAYOUT=1`, a supported LX copy can connect
+different producer and reader partitions. A matmul's split reduction makes
+its output partial, not its input: input placement uses the values each
+reader actually needs. Expansion to more cores uses the same ownership
+proof for pointwise and matmul readers. Existing core-domain, capacity,
+lifetime and whole-source fallback restrictions still apply; this does
+not change the work chooser's policy.
+
 Each pass plans one op at a time. When two adjacent ops share a tensor
 but select different per-core splits for it, the LX scratchpad planner
 sees a core-division mismatch and disqualifies the shared tensor from

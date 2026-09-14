@@ -39,6 +39,18 @@ class DimHint:
     # None when op is broadcast w.r.t. this hint scope
     is_reduction: bool
     hint_id: int = 0  # the _hint_N counter value identifying the scope
+    loop_var_range: "sympy.Expr | int | None" = None
+    # Valid range (trip count) of loop_var, when loop_var is an unbacked
+    # scalar symbol that is NOT a key of any MemoryDep.ranges (e.g. the
+    # WhileLoop-splice per-iteration symbol synthesized by
+    # for_each_tile_lowering.py's _synthesize_dim_hints_for_group). Ordinary
+    # spyre_hint()-scope loop vars are real Inductor iteration-range
+    # variables already present in dep.ranges, so this stays None for them
+    # -- host_coordinates/compute_coordinates already know their range.
+    # op_out_coords uses this to give the WhileLoop symbol a real coordinate
+    # term instead of silently dropping it (see coarse_tile.py's
+    # _loop_var_to_ranges_pos, which requires the symbol to actually appear
+    # in the op's output coordinates).
 
 
 # op.dim_hints: list[DimHint]
@@ -119,8 +131,14 @@ def log_new_nodes(node: torch.fx.Node):
         node.graph.owning_module is not None
         and (meta := node.graph.owning_module.meta.get(OBSERVER_HOOKS_KEY)) is not None
     ):
-        _pass = meta["pass"]
-        subsystem = meta["subsystem"]
+        # `meta["pass"]`/`meta["subsystem"]` are only present while an
+        # `apply_graph_pass` call is in flight (patches.py pops them in its
+        # `finally`); the dict itself is never removed from gm.meta, so a
+        # node created outside that window -- e.g. by an `apply_gm_pass`
+        # call such as `decompose_scan_to_while_loop`, which never sets
+        # these keys at all -- must not KeyError here.
+        _pass = meta.get("pass", "unknown")
+        subsystem = meta.get("subsystem", "unknown")
     else:
         _pass = "unknown"
         subsystem = "unknown"

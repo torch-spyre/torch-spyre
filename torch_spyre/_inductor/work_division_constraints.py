@@ -395,10 +395,12 @@ def coarse_tile_local_dim_split_domains(
     ``tiled_dims_per_read=[[[], []]]``, ``output_tiled_dims=[]``, so this
     constraint pinned nothing for ``buf0``'s own H/B dims, leaving them
     exposed to the greedy search's independent, unpinned choice.
-    ``loop_tiled_dims`` has no such caveat: it is recomputed fresh from
-    ``ctx.op``'s own ranges at whichever point (self-planning or copy
-    construction) last stamped ``loop_info``, so it always reflects the
-    current op's own tiling.
+    ``loop_tiled_dims`` has no such caveat where it is *computed* (both the
+    self-planning path and generated-copy construction derive it from the
+    op's own ranges), but it can be *inherited* un-remapped by nodes inserted
+    after coarse tiling planned the loop group (``insert_restickify``,
+    ``_insert_combine_op``), so ``pin()`` skips positions outside
+    ``ctx.op``'s own space rather than trusting them.
 
     Each raw position is translated to an ``ctx.it_space`` symbol via
     ``ctx.op``'s own raw->squeezed table (mirroring
@@ -449,10 +451,25 @@ def coarse_tile_local_dim_split_domains(
     raw_to_squeezed = _raw_to_squeezed_pos(ctx.op)
     hinted_syms = _hinted_work_div_syms(ctx)
 
-    def pin(pos: int, extent: Expr) -> None:
-        squeezed = raw_to_squeezed.get(pos)
+    def pin(raw_pos: int, ranges: typing.Sequence[Expr], raw_base: int = 0) -> None:
+        # `raw_pos` is in loop_tiled_dims' raw numbering: output positions index
+        # data.ranges, reduction positions are offset by len(data.ranges), which
+        # the caller passes as raw_base.
+        #
+        # The extent is looked up here, not by the caller, so an inherited
+        # position past this op's own rank is skipped by the guards below instead
+        # of raising IndexError -- a restickify carrying its consumer's position 3
+        # from a 4-D space, with 3-D ranges of its own, did exactly that. Skipping
+        # matches pass_utils._excess_batch_vars and is right on the merits: such a
+        # node reports no tiled dims of its own either, so there is nothing of
+        # that dim in its space to pin.
+        local_pos = raw_pos - raw_base
+        if local_pos >= len(ranges):
+            return
+        squeezed = raw_to_squeezed.get(raw_pos)
         if squeezed is None:
             return
+        extent = ranges[local_pos]
         sym = sympy_index_symbol(f"d{squeezed}")
         if sym not in ctx.it_space:
             return
@@ -489,14 +506,14 @@ def coarse_tile_local_dim_split_domains(
     output_ranges = ctx.op.data.ranges
     for level_dims in loop_info.loop_tiled_dims:
         for pos in level_dims:
-            pin(pos, output_ranges[pos])
+            pin(pos, output_ranges)
 
     n_output_dims = len(output_ranges)
     reduction_ranges = getattr(ctx.op.data, "reduction_ranges", None)
     if reduction_ranges is not None:
         for level_dims in loop_info.loop_tiled_reduction_dims:
             for pos in level_dims:
-                pin(n_output_dims + pos, reduction_ranges[pos])
+                pin(n_output_dims + pos, reduction_ranges, raw_base=n_output_dims)
 
     return ConstraintResult(allowed_splits=allowed_splits)
 
