@@ -123,7 +123,7 @@ class PropArg(NamedTuple):
     layouts: list[SpyreTensorLayout]
 
 
-def _get_prop_args(reads) -> list[PropArg]:
+def _get_prop_args(reads, strict: bool = True) -> list[PropArg]:
     # Local to this pass — the FixedLayout/FixedTiledLayout ambiguity only exists
     # during propagation and should not infect downstream passes.
     res: list[PropArg] = []
@@ -144,6 +144,8 @@ def _get_prop_args(reads) -> list[PropArg]:
                 res.append(PropArg(arg, layout, list(buf.layouts)))
             else:
                 if not isinstance(layout, FixedTiledLayout):
+                    if not strict:
+                        continue
                     raise RuntimeError(f"{buf} does not have FixedTiledLayout")
                 res.append(PropArg(arg, layout, [layout.device_layout]))
     return res
@@ -1940,27 +1942,194 @@ def _target_device_layout(target, name: str):
     return next(iter(layouts))
 
 
+def _concrete_int(expr) -> int | None:
+    """``expr`` as a plain int, or None if it is absent or stays symbolic."""
+    if expr is None:
+        return None
+    value = concretize_expr(expr)
+    if not isinstance(value, (int, sympy.Integer)):
+        return None
+    return int(value)
+
+
+def _mutation_layout_dtype(
+    target_layout: FixedLayout, target_stl: SpyreTensorLayout
+) -> torch.dtype:
+    """Logical dtype to size a mutation target's sticks by.
+
+    A bool target's stick size comes from the format it is physically stored in
+    (``target_stl``), not from ``target_layout.dtype`` -- see
+    ``bool_layout_dtype``'s docstring.
+    """
+    if target_layout.dtype != torch.bool:
+        return target_layout.dtype
+    return bool_layout_dtype(target_stl.device_dtype, "mutation target")
+
+
+def _is_substick_write(
+    write_stick: sympy.Expr,
+    target_layout: FixedLayout,
+    output_dep: MemoryDep,
+    stick_size: int,
+) -> bool:
+    """Whether an offset-free write covers only part of a full-stick dim.
+
+    A ``[..., :32]`` slice into a 64-wide stick is offset-free yet shorter than
+    the stick, and writing it natively zeroes the tail.
+    """
+    syms = write_stick.free_symbols
+    if len(syms) != 1:
+        return False
+    extent = _concrete_int(output_dep.ranges.get(next(iter(syms))))
+    if extent is None or not 0 < extent < stick_size:
+        return False
+    # A dim naturally narrower than one stick is not a truncation.
+    out_coords = host_coordinates(target_layout, output_dep, None)
+    dim = _pick_stick_dim(write_stick, out_coords)
+    if dim < 0:
+        return False
+    dim_size = _concrete_int(target_layout.size[dim])
+    if dim_size is None:
+        return False
+    return dim_size % stick_size == 0 and dim_size > extent
+
+
+def _align_single_source_producer(
+    target_buffer,
+    alt_stl: SpyreTensorLayout,
+    consumer_counts: dict[str, int],
+) -> None:
+    """Fuse a single-source mutation target into its producer by aligning layouts.
+
+    Putting the producer on ``alt_stl`` too makes the producer -> target edge
+    layout-identical, so the target collapses to an identity that fuses into the
+    producer's kernel instead of becoming a standalone restickify in its own
+    bundle. Purely an optimization.
+    """
+    if not isinstance(target_buffer, ComputedBuffer):
+        return
+    reads = [
+        r for r in target_buffer.get_read_writes().reads if isinstance(r, MemoryDep)
+    ]
+    if len(reads) != 1:
+        return
+    producer_name = reads[0].name
+    if producer_name in V.graph.graph_inputs:
+        return
+    if consumer_counts.get(producer_name, 0) != 1:
+        return
+    producer = V.graph.try_get_buffer(producer_name)
+    if not isinstance(producer, ComputedBuffer):
+        return
+    if not isinstance(producer.data, Pointwise):
+        return
+    producer.layouts = [alt_stl]
+
+
+def _scan_mutation_layout_inputs(
+    operations: list[Operation],
+) -> tuple[dict[str, SpyreTensorLayout], dict[str, int]]:
+    """One walk of ``operations`` gathering ``(alt_stls, consumer_counts)``.
+
+    Aliasing writes into one target must agree on a single alt layout, so
+    ``alt_stls`` is keyed by buffer rather than by op. An internal buffer takes
+    the first alt found and forces the rest onto it. A graph input is
+    caller-visible, so each of its writes is checked against the recorded alt
+    and a disagreement is reported rather than silently forced.
+    """
+    groups: dict[str, list[ComputedBuffer]] = {}
+    consumer_counts: Counter[str] = Counter()
+    for op in operations:
+        if not isinstance(op, ComputedBuffer):
+            continue
+        for read in op.get_read_writes().reads:
+            if isinstance(read, MemoryDep):
+                consumer_counts[read.name] += 1
+        if not isinstance(op.layout, MutationLayoutSHOULDREMOVE):
+            continue
+        # A sliced mutate_to target collapses to a ReinterpretView.
+        target = op.layout.target
+        while isinstance(target, ReinterpretView):
+            target = target.data
+        # An unnamed target has no buffer to key a group by; the main loop
+        # skips it too.
+        name = target.get_name() if hasattr(target, "get_name") else ""
+        if not name:
+            continue
+        groups.setdefault(name, []).append(op)
+
+    alt_stls: dict[str, SpyreTensorLayout] = {}
+    for name, group in groups.items():
+        target_buffer = group[0].layout.get_buffer()
+        # A SpyreEmptyFallback has no device layout until its mutation writers
+        # have run, so it never carries an alt.
+        if isinstance(target_buffer, SpyreEmptyFallback):
+            continue
+        target_layout = target_buffer.get_layout()
+        if not isinstance(target_layout, FixedLayout):
+            continue
+        # A sliced target's own layout describes the slice, not the allocation,
+        # so synthesizing an STL from it would under-count its sticks.
+        target_stl = _target_device_layout(group[0].layout.target, name)
+        if target_stl is None:
+            target_stl = generic_layout(target_buffer)
+        is_graph_input = name in V.graph.graph_inputs
+        for op in group:
+            rw = op.get_read_writes()
+            output_dep = next(iter(rw.writes))
+            # Only the first read is offered, and strict=False drops it when it
+            # has no layout yet -- an internal buffer's producer, say. With no
+            # input the first offset-free candidate wins.
+            # TODO: offer the first read that survives _get_prop_args instead, so
+            # a leading scalar constant does not hide a usable input stick.
+            first_read = next(iter(rw.reads), None)
+            in_args = _get_prop_args([first_read], strict=False)
+            in_arg = in_args[0] if in_args else None
+            alt_stl = _find_alt_target_stl(
+                target_layout, target_stl, output_dep, in_arg
+            )
+            if alt_stl is None:
+                continue
+            if not is_graph_input:
+                alt_stls[name] = alt_stl
+                break
+            # TODO: support conflicting alts by chaining relayouts between
+            # writes through temp buffers.
+            prior_alt = alt_stls.get(name)
+            if prior_alt is not None and prior_alt != alt_stl:
+                raise Unsupported(
+                    f"multiple mutations to graph input {name} require "
+                    f"conflicting alternative layouts ({prior_alt!r} vs "
+                    f"{alt_stl!r}); chaining relayouts between writes is "
+                    f"not yet supported"
+                )
+            alt_stls[name] = alt_stl
+    return alt_stls, consumer_counts
+
+
 def _find_alt_target_stl(
     target_layout: FixedLayout,
     target_stl: SpyreTensorLayout,
     output_dep: MemoryDep,
+    in_arg: PropArg | None = None,
 ) -> SpyreTensorLayout | None:
+    """Alt SpyreTensorLayout with an offset-free stick expression for a mutation
+    target, or None if the current layout already works; raises Unsupported if no
+    alternative exists.
+
+    An offset write, or an offset-free sub-stick write (see
+    ``_is_substick_write``), needs its stick dim relocated. The first candidate
+    reachable from the write's input stick wins, meaning one an ordinary
+    stick-permutation restickify can produce, so a degenerate ``stick=0``
+    candidate cannot win a pairing the cost model would reject as a scatter.
+    Falls back to the first offset-free candidate.
     """
-    Find an alternative SpyreTensorLayout with an offset-free stick expression
-    for a mutation target. Returns None if the current layout is already valid,
-    or raises Unsupported if no valid alternative exists.
-    """
-    # A bool target's stick size comes from the format it is physically stored
-    # in (target_stl), not from target_layout.dtype -- see bool_layout_dtype's
-    # docstring.
-    dtype_for_layout = (
-        bool_layout_dtype(target_stl.device_dtype, "mutation target")
-        if target_layout.dtype == torch.bool
-        else target_layout.dtype
-    )
+    dtype_for_layout = _mutation_layout_dtype(target_layout, target_stl)
     stick_size = get_elem_in_stick(dtype_for_layout)
     write_stick = device_coordinates(target_stl, output_dep, None)[-1]
-    if is_stick_expr_offset_free(write_stick, stick_size):
+    if is_stick_expr_offset_free(write_stick, stick_size) and not (
+        _is_substick_write(write_stick, target_layout, output_dep, stick_size)
+    ):
         return None
 
     c_size = [concretize_expr(s) for s in target_layout.size]
@@ -1973,6 +2142,30 @@ def _find_alt_target_stl(
             f"no offset-free alternative stick dim for mutation target "
             f"(write stick {write_stick!r}, size={target_layout.size})"
         )
+
+    # Prefer a restickify-feasible candidate: a cost node holds one required STL,
+    # so an infeasible pairing cannot be renegotiated once committed -- see the
+    # FixedInOutNode TODO in _clone_layout.
+    if in_arg is not None:
+        in_stl = next(iter(in_arg.layouts))
+        in_dep = in_arg.dep
+        in_layout = in_arg.layout
+        in_host_coords = host_coordinates(in_layout, in_dep, None)
+        in_device_coords = device_coordinates(in_stl, in_dep, None)
+        for candidate in candidates:
+            target_stick = device_coordinates(candidate, output_dep, None)[-1]
+            if (
+                compute_restickify_target_layout(
+                    in_stl,
+                    in_layout,
+                    target_stick,
+                    in_host_coords,
+                    in_device_coords,
+                )
+                is not None
+            ):
+                return candidate
+
     return candidates[0]
 
 
@@ -2203,9 +2396,7 @@ def propagate_spyre_tensor_layouts(
                     tb.data.data.layout = new_layout
                 tb.layouts = [stl]
 
-    # Alt layout each graph input has been forced to by a mutation write, so a
-    # second write can detect a conflicting alt.
-    forced_mutation_alts: dict[str, SpyreTensorLayout] = {}
+    mutation_alts, mutation_consumer_counts = _scan_mutation_layout_inputs(operations)
 
     # Operations are in topological order (guaranteed by GraphLowering).
     # Visit them and use the input SpyreTensorLayouts and the operation being
@@ -2226,7 +2417,17 @@ def propagate_spyre_tensor_layouts(
                 # Look up the actual buffer node (unwraps TensorBox/StorageBox
                 # wrappers that coarse_tile.py places around SpyreEmptyFallback).
                 target_buf = V.graph.get_buffer(target_name) if target_name else None
+                graph_input = V.graph.graph_inputs.get(target_name)
                 target_stl = _target_device_layout(target, target_name)
+                if (
+                    target_stl is None
+                    and graph_input is None
+                    and not isinstance(target_buf, SpyreEmptyFallback)
+                ):
+                    # An internal buffer carries its STL on the producing op's
+                    # layouts, already assigned earlier in this ordered loop.
+                    layouts = getattr(target_buf, "layouts", None)
+                    target_stl = next(iter(layouts)) if layouts else None
                 if target_stl is None:
                     target_buf_layouts = getattr(target_buf, "layouts", None)
                     if not isinstance(target_buf, SpyreEmptyFallback) and (
@@ -2409,37 +2610,50 @@ def propagate_spyre_tensor_layouts(
                 output_dep = next(iter(rw.writes))
                 args = _get_prop_args(rw.reads)
 
-                # Find an alternative layout if the write has an unsupported stick
-                # expression (e.g. offset like v+32). Force the optimizer to use
-                # this layout for the mutation target.
-                # Note: SpyreEmptyFallback targets are not graph inputs so skip
-                # the alt-layout path (which only applies to graph inputs).
+                # An unsupported write stick expression (an offset like v+32, or
+                # an offset-free sub-stick write) needs the stick dim relocated
+                # onto an alt layout, chosen differently per target kind.
                 target_layout = target.get_layout()
-                if isinstance(target_layout, FixedLayout) and not isinstance(
-                    target_buf, SpyreEmptyFallback
-                ):
-                    alt_stl = _find_alt_target_stl(
-                        target_layout, target_stl, output_dep
-                    )
-                    if alt_stl is not None:
-                        graph_input = V.graph.graph_inputs.get(target_name)
-                        assert graph_input is not None
-                        # A graph input holds only one device layout, so two
-                        # writes needing different alts cannot both be expressed.
-                        # TODO: support this by chaining relayouts between writes
-                        # through temp buffers.
-                        prior_alt = forced_mutation_alts.get(target_name)
-                        if prior_alt is not None and prior_alt != alt_stl:
+                # The up-front scan is exhaustive, so a miss here means no alt is
+                # needed rather than none being available.
+                alt_stl = (
+                    mutation_alts.get(target_name)
+                    if isinstance(target_layout, FixedLayout)
+                    and not isinstance(target_buf, SpyreEmptyFallback)
+                    else None
+                )
+                if alt_stl is not None:
+                    assert isinstance(target_layout, FixedLayout)
+                    if graph_input is not None:
+                        write_stick = device_coordinates(target_stl, output_dep, None)[
+                            -1
+                        ]
+                        if is_stick_expr_offset_free(
+                            write_stick,
+                            get_elem_in_stick(
+                                _mutation_layout_dtype(target_layout, target_stl)
+                            ),
+                        ):
+                            # TODO: relocating this write needs a copy-back whose
+                            # write dep spans the caller's host space. The copy-back
+                            # takes N_ from its own write dep ranges, which describe
+                            # the relocated orientation, so its stick extent would
+                            # exceed the caller's allocation.
                             raise Unsupported(
-                                f"multiple mutations to graph input {target_name} "
-                                f"require conflicting alternative layouts "
-                                f"({prior_alt!r} vs {alt_stl!r}); chaining "
-                                f"relayouts between writes is not yet supported"
+                                f"offset-free sub-stick write to graph input "
+                                f"{target_name} is not yet supported (write stick "
+                                f"{write_stick!r}, size={target_layout.size})"
                             )
-                        forced_mutation_alts[target_name] = alt_stl
+                        # A graph input holds only one device layout.
                         graph_input.layouts = [alt_stl]
-                        op._restickify_plan = (target_name, target_stl, alt_stl)
-                        target_stl = alt_stl
+                    else:
+                        assert target_buf is not None
+                        target_buf.layouts = [alt_stl]
+                        _align_single_source_producer(
+                            target_buf, alt_stl, mutation_consumer_counts
+                        )
+                    op._restickify_plan = (target_name, target_stl, alt_stl)
+                    target_stl = alt_stl
                 op.layouts = [target_stl]
                 op.restick_cost_fn = AllSameNode.from_args(
                     args, [target_stl], output_dep, op
