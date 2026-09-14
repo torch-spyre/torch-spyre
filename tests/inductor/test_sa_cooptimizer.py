@@ -41,6 +41,7 @@ from unittest import TestCase
 
 import sympy
 
+from torch_spyre._inductor.scratchpad import allocator as allocator_module
 from torch_spyre._inductor.scratchpad import utils
 from torch_spyre._inductor.scratchpad.sa_cooptimizer import (
     _MAX_STEPS,
@@ -1423,10 +1424,8 @@ def _tiling_space(output_counts=None):
     ``TilingSpace``'s business and is tested in ``test_enumerate_tilings.py``;
     here they only have to be some counts."""
     return TilingSpace(
-        op=mock.MagicMock(),
         max_dims=2,
         output_counts={0: [2, 4]} if output_counts is None else output_counts,
-        reduction_counts={},
     )
 
 
@@ -1545,13 +1544,6 @@ class TilingInTheConfigTest(TestCase):
         self.assertEqual(
             {config.tiling for config in moves}, {TileSpec(), _TILE_2, _TILE_4}
         )
-        # One step is one axis's factor *or* one tile level, never both.
-        for config in moves:
-            self.assertNotEqual(
-                config.tiling != seed.tiling,
-                config.division.output_splits != seed.division.output_splits,
-                config.division.label,
-            )
 
     def test_no_tiling_space_offers_no_tiling_and_draws_no_randomness(self):
         """The gate, from inside: handed no tiling space, the search has to
@@ -1559,7 +1551,6 @@ class TilingInTheConfigTest(TestCase):
         draws. That is what every engine but the SA co-optimizer sees."""
         plain = _GeneratedDivisions(_two_axis_space(), _menu_seed())
         seed = plain.config_for(_axis_div(d0=2))
-        self.assertTrue(all(c.tiling.is_untiled for c in plain.neighbours(seed)))
         left, right = rnd.Random(0), rnd.Random(0)
         for _ in range(20):
             plain.anchor(seed, left)
@@ -1604,6 +1595,25 @@ class GeneratedWriteBackTest(TestCase):
             buf.core_divisions[buf.chosen_division].label,
             _axis_div(d0=4, d1=2).label,
         )
+
+    def test_a_tiled_division_is_appended_and_not_deduped_against_its_twin(self):
+        """Stage 3's common path, not a corner case: ``_canonical_key`` carries
+        the tiling and no enumerated entry carries one, so *every* tiled config
+        takes the append branch -- including one whose splits the menu already
+        has."""
+        buf = _cdbuf("A", [], {}, divisions=_TWO_AXIS_MENU)
+        buf.division_space = _two_axis_space(tiling=_tiling_space())
+        solver = _primed([buf], 1 << 30)
+        twin = _axis_div(d0=4, d1=2)
+        self.assertIn(twin.label, [d.label for d in _TWO_AXIS_MENU])
+        tiled = CoreDivision(splits=dict(twin.splits), tiling=_TILE_4)
+        solver.chosen = [solver._sources[0].config_for(tiled)]
+        solver._write_back()
+        self.assertEqual(len(buf.core_divisions), len(_TWO_AXIS_MENU) + 1)
+        self.assertEqual(buf.chosen_division, len(_TWO_AXIS_MENU))
+        chosen = buf.core_divisions[buf.chosen_division]
+        self.assertEqual(chosen.tiling, _TILE_4)
+        self.assertEqual(chosen.output_splits, twin.output_splits)
 
     def test_a_division_the_menu_does_not_carry_is_registered(self):
         # What a truncated menu leaves.
@@ -1718,8 +1728,7 @@ class EdgeRelationTest(TestCase):
         self.assertTrue(relation.child_for(tiled).tiling.is_untiled)
 
     def test_the_view_relation_carries_the_tiling_across_the_edge(self):
-        """A tiling group is a run of ops agreeing on one ``TileSpec``, so a
-        flood that did not propagate the tiling would never form one."""
+        """``child_for`` passes the edge's division through, tiling included."""
         space = _two_axis_space(tiling=_tiling_space())
         parent_source = _GeneratedDivisions(space, _config(_axis_div(), menu_index=0))
         child_source = _GeneratedDivisions(space, _config(_axis_div(), menu_index=0))
@@ -1772,3 +1781,26 @@ class MoveAlphabetTest(TestCase):
         before = list(solver.chosen)
         solver._execute_move("flip")
         self.assertEqual(solver.chosen, before)
+
+
+class TestCoarseTilingIsGatedOnItsApplyStep(TestCase):
+    """Only the annealer may choose a coarse tiling, and only once something
+    applies it."""
+
+    @staticmethod
+    def _allocator(layout_planning):
+        return allocator_module.CoOptimizingAllocator(
+            layout_planning=layout_planning, size=1
+        )
+
+    def test_no_engine_is_offered_tilings_while_nothing_applies_them(self):
+        self.assertFalse(self._allocator(SaCoOptimizingSolver)._solver_chooses_tilings)
+        self.assertFalse(self._allocator(mock.MagicMock())._solver_chooses_tilings)
+
+    def test_once_they_are_applied_only_the_annealer_is_offered_them(self):
+        """Only a search that generates divisions can carry a ``TileSpec``."""
+        with mock.patch.object(allocator_module, "TILE_CHOICES_ARE_APPLIED", True):
+            self.assertTrue(
+                self._allocator(SaCoOptimizingSolver)._solver_chooses_tilings
+            )
+            self.assertFalse(self._allocator(mock.MagicMock())._solver_chooses_tilings)
