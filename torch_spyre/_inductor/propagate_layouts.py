@@ -1499,7 +1499,10 @@ def _multi_arg_pointwise_layouts(
                 # Check if stick coordinate depends on any index symbol
                 for index_sym in ind_sizes:
                     if index_sym in stick_coord.free_symbols:
-                        return False
+                        # One non-unit dim leaves nowhere else to put the
+                        # index, so let it through and re-tile it later.
+                        if sum(1 for size in c_in_size if size != 1) > 1:
+                            return False
         return True
 
     def _try_stick_dim(stick_dim):
