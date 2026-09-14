@@ -607,12 +607,10 @@ class IndirectAccessTestCase(InductorTestCase):
         value-table / destination data dim (c1). The entry dim is the index
         tensor's stick dim, so it splits in whole 32-entry sticks: the split is
         the planner's ``core_split`` -- the largest divisor of the stick count
-        ``ceil(index_size / 32)`` that does not exceed SENCORES (so it always
-        divides evenly, and a non-power-of-two core count like 6 rounds down to
-        the nearest divisor, e.g. 8 sticks over 6 cores -> 4). The ceiling
-        handles a NON-stick-aligned count, whose partial last stick is padded up
-        to a whole stick (enforce_indirect_access_layout) so the dim still
-        splits, e.g. 40 -> 2 sticks. c1 always stays 1. Skips at sencores=1.
+        that does not exceed SENCORES (so it always divides evenly, and a
+        non-power-of-two core count like 6 rounds down to the nearest divisor,
+        e.g. 8 sticks over 6 cores -> 4). c1 always stays 1. Skips at
+        sencores=1. Partial-stick entry counts use ``assert_entry_dim_unsplit``.
 
         For power-of-two stick counts and core counts (the historical sweep)
         ``core_split`` equals ``min(sencores, sticks)`` -- this generalises it to
@@ -620,13 +618,12 @@ class IndirectAccessTestCase(InductorTestCase):
         variants introduce.
         """
         from torch_spyre._inductor import config
-        from torch_spyre._inductor.work_division import core_split
 
         n = config.sencores
         if n == 1:
             self.skipTest("no work division at sencores=1")
         sticks = -(-index_size // self.INDEX_ELEMS_PER_STICK)  # ceil division
-        expected = core_split(sticks, n)
+        expected = max(divisor for divisor in range(1, n + 1) if sticks % divisor == 0)
         self.assertIn(
             f"sympify('c0'): (sympify('{index_size}'), {expected})",
             code,
@@ -640,36 +637,30 @@ class IndirectAccessTestCase(InductorTestCase):
             "splitting a shared table/destination dim silently corrupts results",
         )
 
-    def assert_entry_dim_unsplit(self, code, index_size):
+    def assert_entry_dim_unsplit(self, code, index_size, data_size=None):
         """Assert the index/entry dim is NOT core-split at the current SENCORES.
 
-        The correct outcome when a stick-aligned split is forbidden and cannot be
-        made safe by padding -- e.g. a partial-last-stick SCATTER, whose in-place
-        destination cannot be grown to a whole stick the way a gather output can
-        (enforce_indirect_access_layout). If the dim were splittable it would
-        split by ``core_split(ceil(index_size/32), sencores)``; assert that split
-        is absent, so the guard kept the op on a single core rather than letting
-        an even slice straddle the index stick boundary. Skips at sencores=1, and
-        is a no-op when the count could not split anyway (would-be split of 1).
+        A partial last stick is padded by restickify. That padded dimension must
+        stay on one core: older code enforced this only inside SuperDSC, after
+        wrapper emission, so the wrapper could advertise a split the device did
+        not execute. Planning now blocks that split before wrapper emission.
         """
         from torch_spyre._inductor import config
-        from torch_spyre._inductor.work_division import core_split
 
         n = config.sencores
         if n == 1:
             self.skipTest("no work division at sencores=1")
-        sticks = -(-index_size // self.INDEX_ELEMS_PER_STICK)  # ceil division
-        would_be = core_split(sticks, n)
-        if would_be <= 1:
-            return  # nothing could split even if allowed; nothing to assert
-        self.assertNotIn(
-            f"sympify('c0'): (sympify('{index_size}'), {would_be})",
+        self.assertIn(
+            f"sympify('c0'): (sympify('{index_size}'), 1)",
             code,
-            f"partial-stick entry dim {index_size} must NOT be core-split "
-            f"(would be {would_be} at {n} cores if allowed); its in-place scatter "
-            "destination can't be padded to a whole stick, so the guard must keep "
-            "it single-core rather than straddle the index stick boundary",
+            f"partial-stick entry dim {index_size} must stay unsplit at {n} cores",
         )
+        if data_size is not None:
+            self.assertIn(
+                f"sympify('c1'): (sympify('{data_size}'), 1)",
+                code,
+                f"data dim {data_size} must stay unsplit at {n} cores",
+            )
 
     # -- Dimension naming helpers ----------------------------------------
     def name_dims(self, tensor, dims: dict):

@@ -679,8 +679,11 @@ Environment Variables
    * - ``HBM_POOL_PLANNING``
      - Enable HBM-pool planning for intermediates not in LX
        (default ``1``)
-   * - ``GLOBAL_STICK_OPTIMIZER``
-     - Enable the global stick-dimension optimizer (default ``1``)
+   * - ``FRONTEND_POOL_ALLOCATION``
+     - Allocate each SDSC bundle's HBM pool as a front-end PyTorch tensor
+       passed in as ``%pool_base_addr``, instead of the backend
+       self-allocating via ``sdscbundle.device_mem_allocate``
+       (default ``0``)
    * - ``SPYRE_CORE_ID_K_FAST_EMISSION``
      - Permute physical core IDs at SDSC emission so K-collaborator cores
        sit on adjacent ring positions, reducing PSUM chain hops (default
@@ -689,8 +692,8 @@ Environment Variables
      - Emit LPDDR5 tensor addresses as runtime symbols rather than baked
        integers (default ``1``)
    * - ``LAYOUT_SOLVER``
-     - LX scratchpad layout solver strategy: ``greedy`` (default),
-       ``bestfit``, ``firstfit``, ``cpsat``, ``simulated_annealing``.
+     - LX scratchpad layout solver strategy: ``cpsat`` (default),
+       ``greedy``, ``bestfit``, ``firstfit``, ``simulated_annealing``.
        See :doc:`/compiler/scratchpad_planning`
    * - ``SPYRE_INDUCTOR_ENABLE_REDUCTION_TILING``
      - Enable reduction tiling in the pre-scheduling pipeline (default
@@ -721,6 +724,29 @@ Environment Variables
        alternative to ``SPYRE_INDUCTOR_IGNORE_HINTS``.  Defaults to
        ``1`` (disabled/opt-in): set to ``0`` to enable automatic
        span-overflow coarse tiling.
+   * - ``SPYRE_INDUCTOR_SDSC_CACHE``
+     - Cache and reuse ``sdsc.json`` files during codegen when two OpSpecs
+       produce identical SuperDSC content, reducing bundle size for
+       programs with loops (default ``1``; set ``0`` to disable)
+   * - ``SPYRE_VALIDATE_OP_SPECS``
+     - Validate OpSpecs at pipeline stage boundaries to catch invariant
+       violations early (default ``1``; set ``0`` to disable)
+   * - ``SPYRE_CONV2D_DIRECT``
+     - Emit a native conv2d SDSC (``opFuncName="conv2d"`` on the ``pt``
+       unit) instead of the im2col + matmul decomposition. Off by default
+       (``0``); the decomposition remains the default path and the fallback
+       for grouped, transposed, or non-fp16 cases
+   * - ``SPYRE_INDUCTOR_DISABLE_CONV2D_SPATIAL_SPLIT``
+     - For a strided direct-lowered conv2d, forbid splitting the output
+       spatial dims across cores so each core computes whole spatial rows
+       and columns (default ``1``; set ``0`` to opt out)
+   * - ``TORCH_SPYRE_KTIR``
+     - Opt-in OpSpec-to-KTIR emitter (experimental). When enabled the
+       scheduler emits ``async_compile.ktir(...)`` instead of the SDSC
+       bundle; inert by default (``0``), leaving the SDSC path unchanged
+   * - ``KTIR_DEVICE_MLIR``
+     - Path to a ``.mlir`` file declaring the target device for the KTIR
+       execution path (default empty)
 
 **Device enumeration** (``torch_spyre/csrc/spyre_device_enum.cpp``):
 

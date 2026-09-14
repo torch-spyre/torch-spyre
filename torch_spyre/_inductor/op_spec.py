@@ -17,6 +17,7 @@ from __future__ import annotations
 
 from collections import OrderedDict
 import dataclasses
+import math
 import threading
 from typing import Any, Literal, Sequence
 
@@ -26,6 +27,9 @@ import torch
 from torch_spyre import _C
 
 from .constants import IDENTITY_OP
+
+
+LX_RELAYOUT_INFO_KEY = "lx_relayout_certified"
 
 
 class IndirectAccess(Function):
@@ -145,11 +149,46 @@ class TensorWorkDivision:
 
     Both mappings have the same symbol keys. ``work_slices`` gives each loop's
     split count and ``core_id_to_work_slice`` maps the free symbol ``core_id``
-    to that loop's owned slice.
+    to that loop's owned slice. ``num_cores`` is the physical domain of that
+    mapping; it can exceed the logical slice count for replicated ownership.
     """
 
     work_slices: dict[Symbol, int]
     core_id_to_work_slice: dict[Symbol, Expr]
+    num_cores: int | None = None
+
+    @property
+    def physical_core_count(self) -> int:
+        """Physical core domain over which the owner expressions are defined."""
+
+        return (
+            self.num_cores
+            if self.num_cores is not None
+            else math.prod(int(split) for split in self.work_slices.values())
+        )
+
+    def same_ownership(self, other: object) -> bool:
+        """Whether both values assign every physical core the same slice.
+
+        Structural equality remains the dataclass value-syntax comparison.
+        Ownership decisions use this evaluated comparison instead, so equivalent
+        SymPy spellings compare equal. Unsplit dimensions do not describe
+        ownership and are ignored.
+        """
+
+        if not isinstance(other, TensorWorkDivision):
+            return False
+        # core_mapping imports this module's TensorWorkDivision.
+        from .core_mapping import same_owner_maps
+
+        return same_owner_maps(
+            self.work_slices,
+            self.core_id_to_work_slice,
+            self.physical_core_count,
+            other.work_slices,
+            other.core_id_to_work_slice,
+            other.physical_core_count,
+        )
 
     def remap_symbols(self, symbol_mapping: dict[Symbol, Symbol]) -> TensorWorkDivision:
         """Return this ownership expressed in remapped loop symbols."""
@@ -163,17 +202,25 @@ class TensorWorkDivision:
                 symbol_mapping.get(dim, dim): sympify(slot).xreplace(symbol_mapping)
                 for dim, slot in self.core_id_to_work_slice.items()
             },
+            num_cores=self.num_cores,
         )
 
     def to_core_slices(self, num_cores: int) -> dict[str, dict[str, int]]:
         """Expand symbolic ownership into DeepTools' per-core slice map."""
 
+        if num_cores <= 0:
+            raise ValueError(f"physical core count must be positive, got {num_cores}")
         core_id = Symbol("core_id")
         result = {}
         for core in range(num_cores):
             slots = {}
             for dim, expression in self.core_id_to_work_slice.items():
-                slot = int(sympify(expression).subs(core_id, core))
+                value = sympify(expression).subs(core_id, core)
+                if value.free_symbols or value.is_integer is not True:
+                    raise ValueError(
+                        f"core {core} owns non-integral {dim} slot {value}"
+                    )
+                slot = int(value)
                 split = self.work_slices[dim]
                 if not 0 <= slot < split:
                     raise ValueError(
@@ -233,19 +280,25 @@ class TensorArg:
     work_division: TensorWorkDivision | None = None
 
 
-def is_lx_relayout_identity(op: str, args: Sequence[TensorArg]) -> bool:
-    """An LX identity whose input and output have different owners."""
+def is_lx_relayout_identity(
+    op: str,
+    args: Sequence[TensorArg],
+    op_info: dict[str, Any] | None = None,
+) -> bool:
+    """A planner-certified LX identity moving between different owners."""
 
-    if op != IDENTITY_OP or len(args) != 2:
+    if not op_info or not op_info.get(LX_RELAYOUT_INFO_KEY):
         return False
+    if op != IDENTITY_OP or len(args) != 2:
+        raise ValueError("certified LX relayout must be a two-argument identity")
     source, destination = args
-    return (
-        "lx" in source.allocation
-        and "lx" in destination.allocation
-        and source.work_division is not None
-        and destination.work_division is not None
-        and source.work_division != destination.work_division
-    )
+    if "lx" not in source.allocation or "lx" not in destination.allocation:
+        raise ValueError("certified LX relayout lost an LX allocation")
+    if source.work_division is None or destination.work_division is None:
+        raise ValueError("certified LX relayout lost a tensor work division")
+    if source.work_division.same_ownership(destination.work_division):
+        raise ValueError("certified LX relayout ownership collapsed")
+    return True
 
 
 @dataclasses.dataclass
@@ -257,6 +310,9 @@ class OpSpec:
         op: The name of the operation.
         is_reduction: Is the operation a reduction?
         iteration_space: The iteration space of the operation. The values are tuples of (range, work_division).
+        core_id_to_work_slice: The final core assignment derived from the
+            aligned iteration space. Codegen serializes this mapping but does
+            not choose or reconstruct it.
         args: The input and output arguments to the operation.
         op_info: A dictionary of auxiliary information whose content is operation-specific.
         tiled_symbols: Per-loop-level iteration-space symbols, innermost first.
@@ -291,6 +347,7 @@ class OpSpec:
     args: Sequence[TensorArg]
     op_info: dict[str, Any]
     tiled_symbols: list[list[Symbol]] = dataclasses.field(default_factory=list)
+    core_id_to_work_slice: dict[Symbol, Expr] | None = None
     tiled_symbol_trip_counts: dict[Symbol, int] = dataclasses.field(
         default_factory=dict
     )

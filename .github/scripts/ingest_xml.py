@@ -744,7 +744,7 @@ def insert_run(client, run_id: str, run: dict, args):
                 args.branch,
                 (args.sha or "").ljust(40)[:40],
                 int(args.pr_number) if args.pr_number.strip() else 0,
-                _gha_run_id(args),
+                _runner_run_id(args, run_id),
                 run["triggered_at"].replace(tzinfo=None),
                 run["total_tests"],
                 run["passed"],
@@ -766,7 +766,7 @@ def insert_run(client, run_id: str, run: dict, args):
             "branch",
             "commit_sha",
             "pr_number",
-            "gha_run_id",
+            "runner_run_id",
             "triggered_at",
             "total_tests",
             "passed",
@@ -858,17 +858,16 @@ def insert_properties(client, run_id: str, cases: list[dict]):
 # ---------------------------------------------------------------------------
 
 
-def _gha_run_id(args) -> int:
-    """The numeric GitHub Actions run id for the gha_run_id column / dedup key.
-
-    Kept strictly separate from --run-id, which carries a UUID: a non-numeric value here
-    must degrade to 0 rather than abort the whole ingest.
-    """
+def _runner_run_id(args, run_id: str) -> str:
+    """This leg's own run id: --gha-run-id when GHA-dispatched, else the same uuid as run_id."""
     raw = (getattr(args, "gha_run_id", "") or "").strip()
-    try:
-        return int(raw)
-    except (ValueError, TypeError):
-        return 0
+    if raw:
+        try:
+            int(raw)
+            return raw
+        except (ValueError, TypeError):
+            pass
+    return run_id
 
 
 def _threaded_run_id(args) -> str:
@@ -1051,21 +1050,27 @@ def main():
             run_id = _threaded_run_id(args) or str(uuid.uuid4())
 
             # Dedup on (run_id, filename): re-ingesting the SAME test run must be idempotent,
-            # but two distinct runs must never collapse. gha_run_id alone cannot do this --
-            # it is 0 on Jenkins legs, which carry a uuid instead.
-            gha_run_id = _gha_run_id(args)
+            # but two distinct runs must never collapse. runner_run_id mirrors run_id for a Jenkins/standalone leg, so it's only an independent signal for a GHA numeric id.
+            runner_run_id = _runner_run_id(args, run_id)
             existing = client.query(
                 "SELECT count() FROM test_runs "
                 "WHERE run_id = {run_id:String} AND filename = {filename:String}",
                 parameters={"run_id": run_id, "filename": run["filename"]},
             )
-            if existing.result_rows[0][0] == 0 and gha_run_id:
+            if (
+                existing.result_rows[0][0] == 0
+                and runner_run_id
+                and runner_run_id != run_id
+            ):
                 # A GHA re-ingest mints a fresh uuid4, so fall back to the numeric run id
                 # to keep that path idempotent.
                 existing = client.query(
                     "SELECT count() FROM test_runs WHERE "
-                    "gha_run_id = {gha_run_id:UInt64} AND filename = {filename:String}",
-                    parameters={"gha_run_id": gha_run_id, "filename": run["filename"]},
+                    "runner_run_id = {runner_run_id:String} AND filename = {filename:String}",
+                    parameters={
+                        "runner_run_id": runner_run_id,
+                        "filename": run["filename"],
+                    },
                 )
             if existing.result_rows[0][0] > 0:
                 print(f"  Already ingested — skipping {run['filename']}")
@@ -1078,23 +1083,9 @@ def main():
 
             insert_run(client, run_id, run, args)
 
-            # run_id is this run's own key, so the join through test_runs is unnecessary.
-            existing_cases = client.query(
-                "SELECT count() FROM test_cases WHERE run_id = {run_id:String}",
-                parameters={"run_id": run_id},
-            )
-            if existing_cases.result_rows[0][0] > 0:
-                print("  Cases already exist — skipping case+property inserts")
-            else:
-                insert_cases(client, run_id, cases, workflow=args.workflow)
-                existing_props = client.query(
-                    "SELECT count() FROM run_properties WHERE run_id = {run_id:String}",
-                    parameters={"run_id": run_id},
-                )
-                if existing_props.result_rows[0][0] > 0:
-                    print("  Properties already exist — skipping property insert")
-                else:
-                    insert_properties(client, run_id, cases)
+            # The (run_id, filename) dedup above already covers this file; a run_id-only recheck here would skip a second file sharing the same run_id.
+            insert_cases(client, run_id, cases, workflow=args.workflow)
+            insert_properties(client, run_id, cases)
 
             total_cases += len(cases)
             print(

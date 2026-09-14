@@ -99,6 +99,7 @@ def build_row(rec: dict, args) -> list:
         _str(rec.get("suite_name")),
         _int(rec.get("attempt"), 1),
         _int(rec.get("total_attempts"), 1),
+        _int(rec.get("pod_level_retry"), 0),
         _parse_ts(rec.get("ingested_at"))
         or datetime.now(timezone.utc).replace(tzinfo=None),
         # ── Outcome ───────────────────────────────────────────────────────
@@ -153,6 +154,7 @@ COLUMN_NAMES = [
     "suite_name",
     "attempt",
     "total_attempts",
+    "pod_level_retry",
     "ingested_at",
     # Outcome
     "outcome",
@@ -233,6 +235,8 @@ def ensure_extra_columns(client) -> None:
         ("ras_severity", "LowCardinality(String) DEFAULT ''"),
         ("ras_message", "String DEFAULT ''"),
         ("ras_events_json", "String DEFAULT '[]'"),
+        # True when this row came from a _test_matrix.yaml pod-level-retry job (a fresh-pod re-run), not the original job.
+        ("pod_level_retry", "Bool DEFAULT false"),
     ]
     for col_name, col_type in extras:
         try:

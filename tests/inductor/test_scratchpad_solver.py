@@ -14,7 +14,9 @@
 
 """Tests for layout solvers"""
 
+import itertools
 import json
+import math
 import os
 import subprocess
 import sys
@@ -34,12 +36,14 @@ from torch_spyre._inductor.scratchpad.plan_solver import (
     LifetimeBoundBuffer,
 )
 from torch_spyre._inductor.scratchpad.greedy_solver import GreedyLayoutSolver
+from torch_spyre._inductor.scratchpad.exhaustive_search import ExhaustiveSearchSolver
 
 try:
     from ortools.sat.python import cp_model  # noqa: F401
 
     from torch_spyre._inductor.scratchpad.ilp_solver_ortools import (
         CpSatLayoutSolver,
+        _SympyExprToCpSat,
     )
 
     _HAS_ORTOOLS = True
@@ -47,6 +51,7 @@ except ImportError:
     # Bound so class bodies below can reference it; Python evaluates a class body
     # before skipUnless can suppress the class.
     CpSatLayoutSolver = None  # type: ignore[assignment,misc]
+    _SympyExprToCpSat = None  # type: ignore[assignment,misc]
     _HAS_ORTOOLS = False
     CpSatLayoutSolver = None  # type: ignore[assignment,misc]
 
@@ -81,6 +86,46 @@ class TestCoreDivision(TestCase):
             CoreDivision(output_splits={y: 2, x: 4}).signature_key(),
             ((x, 4), (y, 2)),
         )
+
+
+class TestExhaustiveSearchResidency(TestCase):
+    def test_mismatched_consumer_spills_the_producer(self):
+        """A consumer mismatch makes its input unsafe in LX, not its output."""
+
+        producer = CoreDivisionBuffer(
+            "producer", 128, [0, 1], core_divisions=[CoreDivision()]
+        )
+        consumer = CoreDivisionBuffer(
+            "consumer",
+            128,
+            [1, 2],
+            core_divisions=[CoreDivision()],
+            parents=["producer"],
+            cd_parent_matches={"producer": []},
+        )
+        sink = CoreDivisionBuffer(
+            "sink",
+            128,
+            [2, 3],
+            core_divisions=[CoreDivision()],
+            parents=["consumer"],
+            cd_parent_matches={"consumer": [(0, 0)]},
+            residency_reason="no consumer reads it from LX",
+        )
+
+        solver = ExhaustiveSearchSolver(
+            [producer, consumer, sink],
+            size=512,
+            inner_factory=GreedyLayoutSolver,
+            alignment=1,
+        )
+        result = {
+            buffer.name: buffer for buffer in solver.plan_layout_and_core_divisions()
+        }
+
+        self.assertIsNone(result["producer"].address)
+        self.assertIsNotNone(result["consumer"].address)
+        self.assertEqual(solver.spill_reasons["producer"], "core div mismatch")
 
 
 class TestLxPlanningContract(TestCase):
@@ -1251,6 +1296,165 @@ class TestCpSatJointDivision(JointDivisionSolverTests, TestCase):
         # A resident buffer gets no spill reason.
         for name, buf in result.items():
             self.assertEqual(buf.address is None, name in solver.spill_reasons)
+
+    def test_balance_prefers_balanced_division(self):
+        # verify the solver prefers the balanced core split
+        unbalanced = CoreDivision(output_splits={256: 4})  # 4 cores, cost 16
+        balanced = CoreDivision(output_splits={256: 2, 128: 2})  # 4 cores, cost 8
+        self.assertEqual(unbalanced.cores_used, balanced.cores_used)
+        a = CoreDivisionBuffer(
+            "a",
+            400,
+            [0, 1],
+            core_divisions=[unbalanced, balanced],
+            residency_reason="no consumer reads it from LX",
+        )
+        b = CoreDivisionBuffer(
+            "b",
+            400,
+            [0, 1],
+            core_divisions=[balanced, unbalanced],
+            residency_reason="no consumer reads it from LX",
+        )
+        result = {
+            buf.name: buf
+            for buf in self.solver_class(
+                [a, b], size=256, alignment=1
+            ).plan_layout_and_core_divisions()
+        }
+        for name in ("a", "b"):
+            chosen = result[name].core_divisions[result[name].chosen_division]
+            self.assertEqual(
+                chosen.output_splits,
+                balanced.output_splits,
+                f"{name}: balance step should pick the balanced two-axis division",
+            )
+
+    def test_reciprocal_cost_expr_with_all_core_counts_positive(self):
+        # Regression for a ``MODEL_INVALID`` failure ("The domain of the
+        # divisor cannot contain 0"): a reciprocal-of-cores cost term (as the
+        # matmul pt_eff formula produces) is lowered to an ``AddDivisionEquality``
+        # whose divisor is ``t.cores`` -- CP-SAT rejects that divisor's domain
+        # if it can be 0, even when every actual candidate uses at least one
+        # core.
+        #
+        # Mirrors a real [512,4096] @ [4096,4096] matmul with two 32-core
+        # candidates that split differently across 3 vs 2 axes: {b=4, m=8} (2
+        # symbols) and {b=4, m=4, k=2} (3 symbols, reduction-split). The union
+        # of split keys across candidates is what puts 3 symbols on the
+        # buffer's ``sym_cores`` product, matching the reported repro.
+        buf = CoreDivisionBuffer(
+            "mm_out",
+            128,
+            [0, 1],
+            core_divisions=[
+                CoreDivision(output_splits={"b": 4, "m": 8}, reduction_splits={}),
+                CoreDivision(output_splits={"b": 4, "m": 4}, reduction_splits={"k": 2}),
+            ],
+        )
+        self.assertEqual(buf.core_divisions[0].cores_used, 32)
+        self.assertEqual(buf.core_divisions[1].cores_used, 32)
+
+        cost_expr = 1 / buf.sym_cores
+        result = {
+            b.name: b
+            for b in self.solver_class(
+                [buf], size=1 << 20, alignment=1
+            ).plan_layout_and_core_divisions(cost_expr)
+        }
+        self.assertIsNotNone(result["mm_out"].chosen_division)
+
+
+@unittest.skipUnless(_HAS_ORTOOLS, "cpsat printer tests need ortools")
+class TestSympyExprToCpSatPrinter(TestCase):
+    """Direct unit tests for ``_SympyExprToCpSat``'s Piecewise/relational-
+    condition lowering (``_print_Piecewise``, ``_print_condition``,
+    ``_print_And``/``_print_Or``, ``_print_Relational``) and its interval-
+    multiplication fallback for products of 3+ CP-SAT int vars
+    (``_print_multiply``). Both paths are otherwise only exercised
+    incidentally through ``_matmul_split_cost``'s own two ``piecewise()``
+    call sites (which only ever build >=/<= conditions and 2-var products)."""
+
+    @staticmethod
+    def _optimize(expr, var_domains, maximize):
+        model = cp_model.CpModel()
+        sym_map = {
+            name: model.new_int_var(lo, hi, name)
+            for name, (lo, hi) in var_domains.items()
+        }
+        cp_expr = _SympyExprToCpSat(model, dict(sym_map), {}).convert(expr)
+        if maximize:
+            model.maximize(cp_expr)
+        else:
+            model.minimize(cp_expr)
+        solver = cp_model.CpSolver()
+        status = solver.Solve(model)
+        assert status in (cp_model.OPTIMAL, cp_model.FEASIBLE), solver.StatusName(
+            status
+        )
+        return solver, sym_map
+
+    def test_piecewise_relational_lowering(self):
+        # x <= 5 picks the identity branch (max 5 over [0, 10]); x > 5 picks
+        # 2*x (max 20 at x=10), so the piecewise max over [0, 10] is 20.
+        x = sympy.Symbol("x", integer=True)
+        expr = sympy.Piecewise((x, x <= 5), (2 * x, True))
+        solver, sym_map = self._optimize(expr, {"x": (0, 10)}, maximize=True)
+        self.assertEqual(solver.ObjectiveValue(), 20)
+        self.assertEqual(solver.Value(sym_map["x"]), 10)
+
+    def test_piecewise_and_or_condition_lowering(self):
+        # Exercises _print_And and _print_Or as Piecewise conditions.
+        x, y = sympy.symbols("x y", integer=True)
+        expr = sympy.Piecewise(
+            (1, sympy.And(x >= 3, y >= 3)),
+            (2, sympy.Or(x <= 1, y <= 1)),
+            (0, True),
+        )
+        solver, _ = self._optimize(expr, {"x": (0, 5), "y": (0, 5)}, maximize=True)
+        self.assertEqual(solver.ObjectiveValue(), 2)
+
+    def test_piecewise_ne_condition_lowering(self):
+        # An Eq-conditioned Piecewise branch: sympy.Not(Eq(x, 2)) normalizes to
+        # Ne(x, 2) (rel_op "!="), which _print_Relational looks up in
+        # _operator_map. Regression for the latent != gap flagged in PR #4202
+        # review: every current piecewise() call site only builds >=/<=
+        # conditions, so this path is otherwise untested.
+        x = sympy.Symbol("x", integer=True)
+        expr = sympy.Piecewise((10, sympy.Eq(x, 2)), (x, True))
+        solver, sym_map = self._optimize(expr, {"x": (0, 5)}, maximize=True)
+        self.assertEqual(solver.ObjectiveValue(), 10)
+        self.assertEqual(solver.Value(sym_map["x"]), 2)
+
+    @staticmethod
+    def _brute_force_product_bounds(domains):
+        best_min = best_max = None
+        for combo in itertools.product(*(range(lo, hi + 1) for lo, hi in domains)):
+            p = math.prod(combo)
+            best_min = p if best_min is None else min(best_min, p)
+            best_max = p if best_max is None else max(best_max, p)
+        return best_min, best_max
+
+    def _check_multiply(self, domains, names):
+        expr = sympy.Mul(*[sympy.Symbol(n, integer=True) for n in names])
+        var_domains = dict(zip(names, domains))
+        solver_max, _ = self._optimize(expr, var_domains, maximize=True)
+        solver_min, _ = self._optimize(expr, var_domains, maximize=False)
+        expected_min, expected_max = self._brute_force_product_bounds(domains)
+        self.assertEqual(solver_max.ObjectiveValue(), expected_max)
+        self.assertEqual(solver_min.ObjectiveValue(), expected_min)
+
+    def test_multiply_three_int_vars_all_positive(self):
+        self._check_multiply([(1, 3), (2, 4), (1, 2)], ["x", "y", "z"])
+
+    def test_multiply_three_int_vars_mixed_sign(self):
+        # Negative bounds exercise the sign handling in the pairwise interval
+        # folding (each step's [lb, ub] must consider all four lb*a/lb*b/ub*a/
+        # ub*b candidates, not just the positive-bound corners).
+        self._check_multiply([(-3, 2), (-2, 4), (1, 3)], ["x", "y", "z"])
+
+    def test_multiply_four_int_vars_mixed_sign(self):
+        self._check_multiply([(-2, 3), (1, 4), (-1, 2), (2, 3)], ["x", "y", "z", "w"])
 
 
 @unittest.skipUnless(_HAS_ORTOOLS, "cpsat placement unit tests need ortools")

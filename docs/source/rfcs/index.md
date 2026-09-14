@@ -25,6 +25,7 @@ and submit a pull request.
 | [1287](https://github.com/torch-spyre/rfcs/blob/main/1287-SpyreTestFramework/1287-SpyreTestFrameworkRFC.md) | Test Suite Configuration for Upstream PyTorch Tests on OOT Devices | Testing |
 | [1358](https://github.com/torch-spyre/rfcs/blob/main/1358-CoarseTiling/1358-CoarseTiling.md) | Coarse Tiling | Compiler |
 | [1632](https://github.com/torch-spyre/rfcs/blob/main/1632-ModelEnablement/1632-ModelEnablement.md) | Model Enablement Tracking | Model enablement |
+| [1632-v2](https://github.com/torch-spyre/rfcs/blob/main/1632-ModelEnablement-v2/1632-ModelEnablement-v2.md) | Model Enablement v2 | Model enablement |
 | [1633](https://github.com/torch-spyre/rfcs/blob/main/1633-E2EModelPerf/1633-E2EModelPerf.md) | End-to-End Model Performance Testing | Performance |
 | [2676](https://github.com/torch-spyre/rfcs/blob/main/2676-SpyreMetricsApiExtension/2676-SpyreMetricsApiExtensionRFC.md) | Spyre Metrics API Extension Package | Profiling |
 | [2696](https://github.com/torch-spyre/rfcs/blob/main/2696-AiuSmiExtension/2696-AiuSmiExtensionRFC.md) | aiu-smi Extension Package | Profiling |
@@ -123,6 +124,16 @@ what actually ships in production. Proposes a dashboard with two metrics
 per model — percentage of ops covered in `torch-spyre` and percentage of
 modules covered in `vllm-spyre` — supplemented by hybrid end-to-end tests
 where unenabled modules fall back to CPU.
+
+### RFC 1632-v2 — Model Enablement v2
+
+Supersedes the original tracking framework with a label-based, test-driven
+approach built around the `hf-adapters` library, which enables models
+through minimal runtime patches rather than custom forks. Defines five test
+types — covering model loading, smoke testing, embedding comparison, and
+token-level comparison — organized into a tiered CI/CD structure spanning
+PR-level, daily, and weekly regression checks, so teams can reliably assess
+which models are production-ready.
 
 ### RFC 1633 — End-to-End Model Performance Testing
 

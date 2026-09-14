@@ -37,6 +37,7 @@ __all__: list[str] = [
     "get_downcast_warning",
     "get_elem_in_stick",
     "get_spyre_tensor_layout",
+    "get_device_size_in_bytes",
     "kernel_provenance_registry_stats",
     "launch_jobplan",
     "lookup_kernel_provenance",
@@ -347,6 +348,12 @@ def get_downcast_warning() -> bool:
     """
 
 def get_elem_in_stick(arg0: torch.dtype) -> int: ...
+@typing.overload
+def get_device_size_in_bytes(layout: SpyreTensorLayout) -> int: ...
+@typing.overload
+def get_device_size_in_bytes(
+    device_size: typing.Sequence[int], device_dtype: DataFormats
+) -> int: ...
 def get_spyre_tensor_layout(arg0: torch.Tensor) -> SpyreTensorLayout: ...
 
 class SymbolicArgKind:

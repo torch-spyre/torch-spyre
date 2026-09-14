@@ -52,12 +52,6 @@ pip install -U huggingface_hub
 
 #Download granite
 hf download ibm-granite/granite-3.3-8b-instruct --local-dir /tmp/models/granite-3.3-8b-instruct
-
-# If your environment uses PyTorch 2.11, install the matching kineto-spyre wheel. It is not required for PyTorch 2.13 and later
-# See below an example of 2.11 kineto Wheel on x86
-uv pip install --no-deps --force-reinstall \
-  https://github.com/IBM/kineto-spyre/releases/download/torch-2.11.0.aiu.kineto.1.1.2/torch-2.11.0+aiu.kineto.1.1.2-cp312-cp312-linux_x86_64.whl
-
 ```
 
 Useful environment variables (see [Environment variables](environment_variables.md)
@@ -244,7 +238,5 @@ For a Granite-class transformer the typical signals are:
 
 [fms]: https://github.com/foundation-model-stack/foundation-model-stack
 [aiu-fms]: https://github.com/foundation-model-stack/aiu-fms-testing-utils
-[kineto-spyre]: https://github.com/IBM/kineto-spyre
-[kineto-spyre-releases]: https://github.com/IBM/kineto-spyre/releases
 [ata]: https://github.com/IBM/aiu-trace-analyzer
 [rfc-0601]: https://github.com/torch-spyre/rfcs/blob/main/0601-SpyreProfilingToolkit/0601-SpyreProfilingToolkitRFC.md

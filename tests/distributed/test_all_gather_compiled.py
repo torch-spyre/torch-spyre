@@ -176,6 +176,121 @@ class TestAllGatherCompiled(TestCase):
                 f"for rank {rank} incorrect",
             )
 
+    def test_all_gather_compiled_with_interleaved_compute(self):
+        """Verify compute around compiled all_gather works correctly."""
+
+        class AllGatherWithComputeModule(torch.nn.Module):
+            def __init__(self, group_size: int, group_name: str = _GROUP_NAME):
+                super().__init__()
+                self._group_size = group_size
+                self._group_name = group_name
+
+            def forward(self, x, y):
+                x_scaled = x * 2.0
+                gathered = torch.ops._c10d_functional.all_gather_into_tensor(
+                    x_scaled, self._group_size, self._group_name
+                )
+                z = y + 1.0
+                result = torch.ops._c10d_functional.wait_tensor(gathered)
+                return result + z
+
+        x = torch.full(
+            (64,), float(self.comm_rank + 1), dtype=torch.float16, device=DEVICE
+        )
+        y = torch.ones((64 * self.comm_size,), dtype=torch.float16, device=DEVICE)
+
+        module = AllGatherWithComputeModule(group_size=self.comm_size)
+        compiled_module = torch.compile(module)
+        result = compiled_module(x, y)
+
+        result_cpu = result.to("cpu")
+        for rank in range(self.comm_size):
+            chunk = result_cpu[rank * 64 : (rank + 1) * 64]
+            # x_scaled = 2*(rank+1), gathered chunk for each rank, then +2.0 (y+1)
+            expected_val = 2.0 * (rank + 1) + 2.0
+            expected = torch.full((64,), expected_val, dtype=torch.float16)
+            self.assertTrue(
+                torch.allclose(chunk, expected),
+                f"Rank {self.comm_rank}: all_gather with compute chunk "
+                f"for rank {rank} incorrect. "
+                f"Expected {expected_val}, got {chunk[0].item()}",
+            )
+
+    def test_all_gather_compiled_sequential_same_shape(self):
+        """Two sequential all_gather calls in one graph."""
+
+        class DoubleAllGatherModule(torch.nn.Module):
+            def __init__(self, group_size: int, group_name: str = _GROUP_NAME):
+                super().__init__()
+                self._group_size = group_size
+                self._group_name = group_name
+
+            def forward(self, x):
+                y = x + x
+                gathered = torch.ops._c10d_functional.all_gather_into_tensor(
+                    y, self._group_size, self._group_name
+                )
+                g1 = torch.ops._c10d_functional.wait_tensor(gathered)
+                # Take a slice back to original chunk size for the second gather
+                chunk = g1.narrow(0, 0, x.shape[0])
+                gathered2 = torch.ops._c10d_functional.all_gather_into_tensor(
+                    chunk, self._group_size, self._group_name
+                )
+                g2 = torch.ops._c10d_functional.wait_tensor(gathered2)
+                return g2
+
+        x = torch.full(
+            (64,), float(self.comm_rank + 1), dtype=torch.float16, device=DEVICE
+        )
+        module = DoubleAllGatherModule(group_size=self.comm_size)
+        compiled_module = torch.compile(module)
+        result = compiled_module(x)
+
+        self.assertEqual(result.shape[0], 64 * self.comm_size)
+
+        # y = 2*(rank+1), first gather concatenates all ranks' values
+        # chunk = first 64 elements = rank 0's contribution = 2*(0+1) = 2.0
+        # second gather: all ranks contribute this same chunk (2.0)
+        result_cpu = result.to("cpu")
+        for rank in range(self.comm_size):
+            chunk = result_cpu[rank * 64 : (rank + 1) * 64]
+            expected = torch.full((64,), 2.0, dtype=torch.float16)
+            self.assertTrue(
+                torch.allclose(chunk, expected),
+                f"Rank {self.comm_rank}: sequential all_gather chunk "
+                f"for rank {rank} incorrect. "
+                f"Expected 2.0, got {chunk[0].item()}",
+            )
+
+    def test_all_gather_compiled_repeated_execution(self):
+        """Compiled all_gather executed multiple times (WSI reuse test).
+
+        This mimics the Granite TP pattern: a compiled graph with all_gather
+        is run repeatedly (warmup + decode steps). Catches regressions where
+        bundle artifacts are not preserved across repeated executeBundle calls
+        on the same WSI.
+        """
+        x = torch.full(
+            (128,), float(self.comm_rank), dtype=torch.float16, device=DEVICE
+        )
+        module = AllGatherCompiledModule(group_size=self.comm_size)
+        compiled_module = torch.compile(module)
+
+        for iteration in range(4):
+            result = compiled_module(x)
+            self.assertEqual(result.shape[0], 128 * self.comm_size)
+
+            result_cpu = result.to("cpu")
+            for rank in range(self.comm_size):
+                chunk = result_cpu[rank * 128 : (rank + 1) * 128]
+                expected = torch.full((128,), float(rank), dtype=torch.float16)
+                self.assertTrue(
+                    torch.allclose(chunk, expected),
+                    f"Rank {self.comm_rank}: iteration {iteration}, "
+                    f"all_gather chunk for rank {rank} incorrect. "
+                    f"Expected {float(rank)}, got {chunk[0].item()}",
+                )
+
 
 if __name__ == "__main__":
     run_tests()

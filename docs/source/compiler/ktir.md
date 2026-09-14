@@ -23,6 +23,24 @@ dialect today, both Apache-2.0:
 The torch-spyre production path still goes through SuperDSC. KTIR
 adoption is incremental: the spec is stable, the reference interpreter
 is up, and the backend lowering path is in development.
+
+Concretely: `TORCH_SPYRE_KTIR=1` plus `KTIR_DEVICE_MLIR=<path>` routes
+compilation through `async_compile.ktir()` (see
+`torch_spyre/execution/async_compile.py`), which emits KTIR and hands it
+to `dbo-opt --from-ktir` for backend lowering. That path is real and
+device-executable, but it is opt-in and off by default. In the test
+suite it is covered by three files: `tests/inductor/test_ktir_compile.py`
+mocks `subprocess.run` and `shutil.which` rather than running `dbo-opt`
+or touching hardware; `tests/inductor/test_ktir_validate.py` is a
+dialect-free rejection suite that imports neither `mlir_ktdp` nor
+`subprocess`; and `tests/inductor/test_ktir_emitter.py` is a golden-MLIR
+test that is skipped unless `mlir_ktdp` is installed. No CI
+workflow currently sets `TORCH_SPYRE_KTIR=1`/`KTIR_DEVICE_MLIR` to run
+this path against a physical device. The emitter itself
+(`torch_spyre/_inductor/codegen/ktir.py`) also depends on the `mlir_ktdp`
+bindings from `ktir-mlir-frontend`, a separate from-source build (see
+`tools/install-ktir.sh`) that is not part of the default torch-spyre
+install.
 :::
 
 ## Role in the compilation pipeline
@@ -65,7 +83,7 @@ The separation lets the compiler reason about memory layout, work
 division, and data movement independently. Spyre's hardware exposes
 HBM and per-core LX scratchpad as distinct memory spaces, so each
 `construct_memory_view` carries an explicit
-`#ktdp.spyre_memory_space<HBM>` or `<LX>` attribute. A
+`#ktdp.memory_space<global>` or `<ct_local>` attribute. A
 `construct_distributed_memory_view` variant covers the case where a
 tensor is split across many per-core scratchpad slices instead of
 sitting in a single HBM region.
@@ -84,7 +102,7 @@ func.func @add(%A: index, %B: index, %Out: index)
 
   %A_view = ktdp.construct_memory_view %A, sizes:[1024], strides:[1] {
     coordinate_set = affine_set<(d0): (0 <= d0, d0 <= 1023)>,
-    memory_space   = #ktdp.spyre_memory_space<HBM>
+    memory_space   = #ktdp.memory_space<global>
   } : memref<1024xf16>
 
   %A_tile = ktdp.construct_access_tile %A_view[%off] {

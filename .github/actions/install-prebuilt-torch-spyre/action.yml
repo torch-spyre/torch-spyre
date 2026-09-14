@@ -17,6 +17,16 @@ inputs:
     description: Name of the uploaded wheel artifact to download
     required: false
     default: torch-spyre-wheel
+  run_id:
+    description: >-
+      Workflow run ID to download the artifact from. Empty (default) =
+      current run.
+    required: false
+    default: ''
+  github_token:
+    description: Token used to look up the artifact when run_id is set
+    required: false
+    default: ''
 
 runs:
   using: composite
@@ -36,6 +46,8 @@ runs:
       with:
         name: ${{ inputs.artifact_name }}
         path: ${{ github.workspace }}/prebuilt-wheel
+        run-id: ${{ inputs.run_id }}
+        github-token: ${{ inputs.github_token }}
 
     - name: Install prebuilt wheel
       shell: bash

@@ -17,4 +17,6 @@ test_suite_config:
         - names:
             - LxPlanning.*::test_reduce_keepdim0.*_lx_planning_(pointwise|reduction)
             - LxPlanning.*::test_reduce_edge_keepdim0.*_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_any_single_dim.*_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_all_single_dim.*_lx_planning_(pointwise|reduction)
           mode: mandatory_success

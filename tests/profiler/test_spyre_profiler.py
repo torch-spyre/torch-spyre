@@ -26,6 +26,7 @@ from torch.testing._internal.common_utils import (
     TestCase,
     skipIfTorchDynamo,
 )
+from torch_spyre.constants import DEVICE_NAME
 
 Test_spyre = None
 if hasattr(torch, "spyre"):
@@ -58,19 +59,19 @@ class TestSpyreProfiler(TestCase):
         #   AIUpti_ActivityCompute (and _ActivityMemcpy) *after* the `name[128]`
         #   field. `name`'s own offset didn't move — but the record WALKER
         #   advances by sizeof(AIUpti_ActivityCompute) (libaiupti
-        #   aiupti_api.cpp::aiuptiActivityGetNextRecord). If libaiupti and
-        #   kineto-spyre are not rebuilt in lockstep they disagree on that size,
-        #   so after the first record every subsequent record is read at the
-        #   wrong offset and the kernel `name` lands on garbage bytes ->
-        #   UnicodeDecodeError when prof.events() -> _parse_kineto_results ->
-        #   evt.name() decodes it. Real fix = rebuild libaiupti + kineto-spyre
-        #   together. Tracked in #114.
+        #   aiupti_api.cpp::aiuptiActivityGetNextRecord). If the AIUPTI/Kineto
+        #   bridge built into torch_spyre is stale relative to libaiupti, they
+        #   disagree on that size, so after the first record every subsequent
+        #   record is read at the wrong offset and the kernel `name` lands on
+        #   garbage bytes -> UnicodeDecodeError when prof.events() ->
+        #   _parse_kineto_results -> evt.name() decodes it. Real fix = rebuild
+        #   against a matching libaiupti. Tracked in #114.
         #
         # Why the body is stubbed (no `as prof`, assertTrue(True)):
         #   Reading prof.events() is what triggers the buffer walk and the crash.
         #   We still run capture + teardown (the `with profile(...)` block) but
         #   never decode the corrupt kernel name. Restore the real check (below)
-        #   once the two libs are rebuilt in lockstep.
+        #   once the ABI mismatch is fixed.
         #
         # WHY STUBBING THIS ALSO "FIXED" test_event_list /
         # test_profiler_timestamp_consistency (the surprising part):
@@ -98,7 +99,7 @@ class TestSpyreProfiler(TestCase):
             with_stack=False,
         ) as prof:
             x *= 2
-            # TODO(#114): check with_stack=True once libaiupti + kineto-spyre are rebuilt in lockstep.
+            # TODO(#114): check with_stack=True once the libaiupti ABI mismatch is fixed.
         names = [e.name for e in prof.events()]
         self.assertTrue("aten::mul_" in names)
 
@@ -191,6 +192,34 @@ def test_chrome_trace_is_valid_json(tmp_path):
     assert isinstance(data, dict), "Trace JSON must be a dictionary"
     assert "traceEvents" in data, "Trace JSON must contain 'traceEvents'"
     assert len(data["traceEvents"]) > 0, "Trace JSON must contain at least one event"
+
+
+def _run_trace_analyzer_overlap_verification(trace_data):
+    """Run Trace Analyzer overlap verification and return its result and report."""
+    pytest.importorskip("aiu_trace_analyzer", minversion="1.3.0")
+    from aiu_trace_analyzer.core.acelyzer import Acelyzer
+
+    analyzer = Acelyzer(
+        ["-i", "api://jsonbuffer", "-V", "--disable_file"],
+        in_data=trace_data,
+    )
+    analyzer.run()
+    report = analyzer.get_output_data()
+
+    overlap_result = next(
+        (
+            result
+            for result in report.get("test_results", [])
+            if result.get("test") == "Compute Overlap Check"
+        ),
+        None,
+    )
+
+    assert overlap_result is not None, (
+        "AIU Trace Analyzer did not return a Compute Overlap Check result"
+    )
+
+    return overlap_result, report
 
 
 @pytest.mark.requires_spyre_profiler
@@ -357,7 +386,7 @@ def test_compiled_kernel_event_keys_match_captured_debug_handles(monkeypatch):
 def test_kineto_memcpy_and_memset_events_captured():
     """
     Confirm that H2D memcpy, D2H memcpy, and memset events are captured
-    in the kineto-spyre Chrome trace when profiling with PrivateUse1.
+    in the AIUPTI-backed Chrome trace when profiling with PrivateUse1.
 
     Triggered operations:
       - H2D: cpu_tensor.to("spyre")
@@ -387,16 +416,17 @@ def test_kineto_memcpy_and_memset_events_captured():
     events = trace["traceEvents"]
 
     # "gpu_memcpy" / "gpu_memset" are emitted by libkineto's ActivityType::type_string()
-    # (upstream kineto, not kineto-spyre-specific) and have been stable across all kineto
-    # versions used by torch-spyre. kineto-spyre maps Spyre memory activities to these
-    # standard ActivityType values; the Chrome trace writer produces these category strings.
+    # (upstream kineto, not Spyre-specific) and have been stable across all kineto
+    # versions used by torch-spyre. torch_spyre's AIUPTI bridge maps Spyre memory
+    # activities to these standard ActivityType values; the Chrome trace writer
+    # produces these category strings.
     h2d_events = [
         e
         for e in events
         if e.get("cat") == "gpu_memcpy" and "HtoD" in e.get("name", "")
     ]
     assert h2d_events, (
-        "Expected at least one H2D memcpy event in the kineto-spyre trace"
+        "Expected at least one H2D memcpy event in the AIUPTI-backed trace"
     )
 
     d2h_events = [
@@ -405,11 +435,58 @@ def test_kineto_memcpy_and_memset_events_captured():
         if e.get("cat") == "gpu_memcpy" and "DtoH" in e.get("name", "")
     ]
     assert d2h_events, (
-        "Expected at least one D2H memcpy event in the kineto-spyre trace"
+        "Expected at least one D2H memcpy event in the AIUPTI-backed trace"
     )
 
     memset_events = [e for e in events if e.get("cat") == "gpu_memset"]
-    assert memset_events, "Expected at least one memset event in the kineto-spyre trace"
+    assert memset_events, (
+        "Expected at least one memset event in the AIUPTI-backed trace"
+    )
+
+
+@pytest.mark.requires_spyre_profiler
+def test_trace_analyzer_device_overlap(tmp_path):
+    """Verify Spyre device overlaps using AIU Trace Analyzer."""
+    trace_file = tmp_path / "trace_analyzer_overlap.json"
+
+    x = torch.randn((64, 64), dtype=torch.float16, device="spyre")
+    y = torch.randn((64, 64), dtype=torch.float16, device="spyre")
+
+    with profile(
+        activities=[ProfilerActivity.CPU, ProfilerActivity.PrivateUse1]
+    ) as prof:
+        result = torch.matmul(x, y)
+        result = F.gelu(result)
+        result = torch.sum(result)
+        torch.spyre.synchronize()
+
+    prof.export_chrome_trace(str(trace_file))
+
+    assert trace_file.exists(), "Chrome trace file was not created"
+
+    trace_data = trace_file.read_bytes()
+
+    trace_json = json.loads(trace_data)
+    trace_events = trace_json.get("traceEvents", [])
+    device_events, _ = _find_device_overlaps(trace_events)
+
+    assert len(device_events) >= 2, (
+        "Expected at least two Spyre device events for Trace Analyzer overlap validation"
+    )
+
+    overlap_result, report = _run_trace_analyzer_overlap_verification(trace_data)
+
+    if overlap_result.get("result") != "pass":
+        overlap_errors = [
+            error
+            for error in report.get("errors", [])
+            if error.get("finding") == "overlaps"
+        ]
+
+        pytest.fail(
+            "AIU Trace Analyzer detected invalid Spyre device overlap(s):\n"
+            f"{overlap_errors}"
+        )
 
 
 class TestMemoryProfilerTimeline(TestCase):
@@ -515,6 +592,277 @@ class TestMemoryProfilerTimeline(TestCase):
 
         for event in expected:
             self.assertTrue(event in actual, f"event: {event} was not found in actual.")
+
+
+class TestOverExtendedKernelDurations(TestCase):
+    """Fail if kernel, H2D/D2H memcpy, or memset events exceed 1000 ms.
+
+    Chrome complete-event ``dur`` is microseconds, so 1000 ms is
+    1_000_000. That fixed threshold is the #3542 contract. Cost-model
+    thresholds and TS1-TS5 effective-frequency checks are follow-ups.
+    """
+
+    ACTIVITY_TYPES = {
+        "kernel",
+        "gpu_memcpy",
+        "gpu_memset",
+    }
+
+    def _find_over_extended_activities(self, events, threshold_ms=1000):
+        """
+        Return tracked events and any whose duration exceeds threshold_ms.
+
+        Missing or non-finite ``ts``/``dur`` fail. Non-positive ``dur`` is
+        legal (instant mem ops) and is not treated as over-extended.
+        """
+
+        threshold_us = threshold_ms * 1000
+
+        tracked_events = []
+
+        for event in events:
+            if not isinstance(event, dict):
+                continue
+
+            if event.get("ph") != "X":
+                continue
+
+            if event.get("cat") not in TestOverExtendedKernelDurations.ACTIVITY_TYPES:
+                continue
+
+            timestamp = event.get("ts")
+            duration = event.get("dur")
+            name = event.get("name", "unknown")
+
+            assert (
+                isinstance(timestamp, (int, float))
+                and not isinstance(timestamp, bool)
+                and math.isfinite(timestamp)
+            ), (
+                f"Event {name} must have a finite numeric timestamp "
+                f"(ts={timestamp}, dur={duration})"
+            )
+
+            assert (
+                isinstance(duration, (int, float))
+                and not isinstance(duration, bool)
+                and math.isfinite(duration)
+            ), (
+                f"Event {name} must have a finite numeric duration "
+                f"(ts={timestamp}, dur={duration})"
+            )
+
+            tracked_events.append(event)
+
+        over_extended = [
+            event for event in tracked_events if event["dur"] > threshold_us
+        ]
+
+        return tracked_events, over_extended
+
+    def test_find_over_extended_activities(self):
+        """Verify detection of activities that exceed the duration threshold."""
+
+        events = [
+            {
+                "ph": "X",
+                "cat": "kernel",
+                "name": "long_kernel",
+                "ts": 0,
+                "dur": 1_200_000,
+            },
+            {
+                "ph": "X",
+                "cat": "gpu_memcpy",
+                "name": "long_copy",
+                "ts": 1000,
+                "dur": 1_500_000,
+            },
+            {
+                "ph": "X",
+                "cat": "gpu_memset",
+                "name": "short_memset",
+                "ts": 3000,
+                "dur": 200_000,
+            },
+            {
+                "ph": "X",
+                "cat": "gpu_memcpy",
+                "name": "instant_copy",
+                "ts": 4000,
+                "dur": 0,
+            },
+        ]
+
+        tracked_events, over_extended = self._find_over_extended_activities(
+            events,
+            threshold_ms=1000,
+        )
+
+        self.assertEqual(len(tracked_events), 4)
+        self.assertEqual(len(over_extended), 2)
+
+        names = {event["name"] for event in over_extended}
+
+        self.assertIn("long_kernel", names)
+        self.assertIn("long_copy", names)
+        self.assertNotIn("instant_copy", names)
+
+    def test_find_over_extended_activities_invalid_events(self):
+        """Verify invalid timing data is rejected."""
+
+        missing_timestamp_event = [
+            {
+                "ph": "X",
+                "cat": "gpu_memcpy",
+                "name": "missing_ts",
+                "dur": 10,
+            }
+        ]
+
+        missing_duration_event = [
+            {
+                "ph": "X",
+                "cat": "gpu_memset",
+                "name": "missing_dur",
+                "ts": 0,
+            }
+        ]
+
+        with self.assertRaises(AssertionError):
+            self._find_over_extended_activities(missing_timestamp_event)
+
+        with self.assertRaises(AssertionError):
+            self._find_over_extended_activities(missing_duration_event)
+
+    @skipIfTorchDynamo("profiler gets ignored if dynamo activated")
+    @pytest.mark.requires_spyre_profiler
+    def test_activity_duration_limit(self):
+        """
+        Fail if any kernel, memcpy, or memset event exceeds 1000 ms.
+
+        Eager matmul/gelu is not enough to prove a chrome ``cat==kernel``
+        event. Compile the stick-aligned MLP used by the provenance test,
+        warmup outside ``profile()``, then capture H2D, the compiled
+        kernel, memset, and D2H in one trace.
+        """
+
+        torch._dynamo.reset()
+        model = _ProfilerMLP().half().to(DEVICE_NAME).eval()
+        compiled_input = torch.randn(2, 128, dtype=torch.float16, device=DEVICE_NAME)
+        compiled = torch.compile(model, fullgraph=True)
+        with torch.no_grad():
+            compiled(compiled_input)
+            torch.spyre.synchronize()
+
+        cpu_src = torch.randn(64, 64, dtype=torch.float16)
+
+        with profile(
+            activities=[ProfilerActivity.CPU, ProfilerActivity.PrivateUse1]
+        ) as prof:
+            device_tensor = cpu_src.to(DEVICE_NAME)  # H2D memcpy
+
+            with torch.no_grad():
+                compiled_out = compiled(compiled_input)
+
+            _ = torch.zeros(
+                64,
+                64,
+                dtype=torch.float16,
+                device=DEVICE_NAME,
+            )  # memset
+
+            _ = device_tensor.cpu()  # D2H memcpy
+            _ = compiled_out.cpu()
+
+            torch.spyre.synchronize()
+        with TemporaryFileName(mode="w+") as trace_file:
+            prof.export_chrome_trace(trace_file)
+
+            with open(trace_file, "r") as trace:
+                trace_data = json.load(trace)
+
+        self.assertIsInstance(
+            trace_data,
+            dict,
+            "Trace JSON must be a dictionary",
+        )
+
+        self.assertIn(
+            "traceEvents",
+            trace_data,
+            "Chrome trace is missing the 'traceEvents' key",
+        )
+
+        trace_events = trace_data["traceEvents"]
+
+        h2d_events = [
+            event
+            for event in trace_events
+            if event.get("cat") == "gpu_memcpy" and "HtoD" in event.get("name", "")
+        ]
+
+        d2h_events = [
+            event
+            for event in trace_events
+            if event.get("cat") == "gpu_memcpy" and "DtoH" in event.get("name", "")
+        ]
+
+        memset_events = [
+            event for event in trace_events if event.get("cat") == "gpu_memset"
+        ]
+
+        kernel_events = [
+            event
+            for event in trace_events
+            if event.get("cat") == "kernel" and event.get("ph") == "X"
+        ]
+
+        self.assertTrue(
+            h2d_events,
+            "Expected at least one HtoD memcpy event",
+        )
+
+        self.assertTrue(
+            d2h_events,
+            "Expected at least one DtoH memcpy event",
+        )
+
+        self.assertTrue(
+            memset_events,
+            "Expected at least one memset event",
+        )
+
+        self.assertIsInstance(
+            trace_events,
+            list,
+            "'traceEvents' must contain a list",
+        )
+
+        self.assertTrue(
+            kernel_events,
+            "Expected at least one kernel event",
+        )
+
+        tracked_events, over_extended = self._find_over_extended_activities(
+            trace_events,
+            threshold_ms=1000,
+        )
+
+        if over_extended:
+            details = []
+
+            for event in over_extended[:20]:
+                details.append(
+                    f"{event.get('cat')} "
+                    f"{event.get('name', 'unknown')} "
+                    f"(ts={event['ts']}, dur={event['dur']})"
+                )
+
+            pytest.fail(
+                f"{len(over_extended)} tracked event(s) exceeded 1000 ms:\n"
+                + "\n".join(details)
+            )
 
 
 def _find_device_overlaps(events):

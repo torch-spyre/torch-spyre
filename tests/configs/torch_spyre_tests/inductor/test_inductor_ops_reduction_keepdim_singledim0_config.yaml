@@ -7,4 +7,6 @@ test_suite_config:
         - names:
             - TestOps::test_reduce_keepdim0.*
             - TestOps::test_reduce_edge_keepdim0.*
+            - TestOps::test_any_single_dim.*
+            - TestOps::test_all_single_dim.*
           mode: mandatory_success

@@ -33,11 +33,11 @@ from torch._inductor.graph import GraphLowering
 from torch._inductor.virtualized import V
 from ..errors import Unsupported
 from ..pass_utils import (
+    find_reduction_var,
     host_coordinates,
     device_coordinates,
     indirect_sizes_from_op,
     op_out_coords,
-    find_reduction_var,
 )
 from ..ir import SpyreConstantFallback
 from ..propagate_hints import DimHint, get_op_hints
@@ -111,10 +111,16 @@ def _lone_sym(coord: sympy.Expr) -> sympy.Symbol | None:
 def _untracked_name(context: str, sym, size: int) -> str:
     name = f"_untracked_{size}"
     _named_dims.setdefault(name, size)
-    logger.warning(
-        f"{context}: loop var {sym} has no named dim mapping -- using {name}"
-    )
+    logger.debug(f"{context}: loop var {sym} has no named dim mapping -- using {name}")
     return name
+
+
+def _input_range_for_symbol(inputs: list[MemoryDep], sym: sympy.Symbol) -> sympy.Expr:
+    """Return ``sym``'s range from the input dependency that defines it."""
+    for inp in inputs:
+        if sym in inp.index.free_symbols and sym in inp.ranges:
+            return inp.ranges[sym]
+    raise Unsupported(f"reduction variable {sym} has no range in any input")
 
 
 def _consume_names(remaining: list[str], layout_size: int) -> list[str]:
@@ -129,7 +135,7 @@ def _consume_names(remaining: list[str], layout_size: int) -> list[str]:
         product *= _named_dims[name]
         if product == layout_size:
             return remaining[: i + 1]
-    logger.warning(
+    logger.debug(
         f"_consume_names: no prefix of {remaining} multiplies to {layout_size}"
     )
     return []
@@ -179,9 +185,12 @@ def compute_input_named_dims(dep: MemoryDep, op=None, ind_sizes=None) -> dict:
             # One loop var covers all fused names (e.g. a flat [A, B*D*E] read)
             result.setdefault(loop_vars[0], []).extend(names)
         elif len(loop_vars) == 0:
-            # This layout dim is index-selected by a gather/scatter index
-            # symbol (e.g. `tmp0`).  Raise for anything else — a constant
-            # or unexpected coord should not be silently skipped.
+            # This layout dim is either fixed to a constant source slice, or
+            # index-selected by a gather/scatter symbol (e.g. ``tmp0``).
+            # Its name was consumed above to keep later dimensions aligned,
+            # but there is no iteration variable to attach it to.
+            if not coord.free_symbols:
+                continue
             sym = _lone_sym(coord)
             if sym is not None and is_indirect(sym.name):
                 continue
@@ -290,9 +299,9 @@ def _compute_named_dims(op, inputs):
         named_dims.extend(names)
     reduction_named_dims = None
     if isinstance(op.data, Reduction):
-        reduction_sym = find_reduction_var(inputs[0], output_dep)
+        reduction_sym = find_reduction_var(inputs, output_dep)
         if reduction_sym not in loop_var_dims:
-            size = int(inputs[0].ranges[reduction_sym])
+            size = int(_input_range_for_symbol(inputs, reduction_sym))
             loop_var_dims[reduction_sym] = [
                 _untracked_name(op.get_name(), reduction_sym, size)
             ]
@@ -589,7 +598,21 @@ def _assign_dim_hints_impl(operations: list[Operation]) -> None:
         dp = getattr(op, "_dim_prop_info", None)
         op_hints = get_op_hints(op) if dp and dp.loop_var_dims else {}
         if not op_hints:
-            op.dim_hints = []  # type: ignore[attr-defined]
+            # Preserve any WhileLoop-splice-synthesized hints already stamped
+            # by for_each_tile_lowering.py's _synthesize_dim_hints_for_group
+            # (identified by loop_var_range is not None -- ordinary
+            # spyre_hint()-scope hints never set it). splice_while_loops runs
+            # before this pass and immediately calls coarse_tile_pre_stickify,
+            # which can synthesize fresh read-copy ComputedBuffers that
+            # inherit these hints via copy_op_metadata; such a copy has no
+            # spyre_hint() scope of its own (op_hints is empty here), so
+            # without this preservation this pass would silently wipe the
+            # loop_var/loop_var_range info those ops need for their own
+            # output coordinates to be computed correctly (see
+            # op_out_coords/loop_var_ranges_from_dim_hints).
+            existing = getattr(op, "dim_hints", None) or []
+            synthesized = [h for h in existing if h.loop_var_range is not None]
+            op.dim_hints = synthesized  # type: ignore[attr-defined]
             if dp is not None:
                 del op._dim_prop_info  # type: ignore[attr-defined]
             continue
@@ -618,7 +641,18 @@ def _assign_dim_hints_impl(operations: list[Operation]) -> None:
                 if name in reduction_dims:
                     coord_for_name[name] = sym
 
-        dim_hints = []
+        # Preserve any WhileLoop-splice-synthesized hints already stamped by
+        # for_each_tile_lowering.py's _synthesize_dim_hints_for_group
+        # (identified by loop_var_range is not None), the same as the
+        # `not op_hints` branch above -- this op may sit inside a real user
+        # spyre_hint() scope (op_hints non-empty) AND be a for_each_tile
+        # splice op at once, and the loop below must not be the only source
+        # of dim_hints in that case. The synthetic hint_id range
+        # (for_each_tile_lowering.py's _next_synthetic_hint_id_start =
+        # 1 << 30) and real user hint_ids are disjoint by construction, so no
+        # dedup is needed here.
+        existing = getattr(op, "dim_hints", None) or []
+        dim_hints = [h for h in existing if h.loop_var_range is not None]
         for hint_id, hint_dict in sorted(op_hints.items()):
             # A hint scope uses exactly one of tiles/slices/num_tiles_per_dim.
             dims: dict[str, int] = next(

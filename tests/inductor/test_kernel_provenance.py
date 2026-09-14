@@ -243,6 +243,23 @@ class TestKernelProvenanceDescriptor:
             work_division=TensorWorkDivision({c0: 2}, {c0: Symbol("core_id")}),
         )
         changed_owner = dataclasses.replace(first, args=[owned_arg])
+        changed_owner_cores = dataclasses.replace(
+            first,
+            args=[
+                dataclasses.replace(
+                    arg,
+                    work_division=TensorWorkDivision(
+                        {c0: 2}, {c0: Symbol("core_id")}, num_cores=4
+                    ),
+                )
+            ],
+        )
+        changed_core_mapping = dataclasses.replace(
+            first, core_id_to_work_slice={c0: Integer(1)}
+        )
+        canonical_core_mapping = dataclasses.replace(
+            first, core_id_to_work_slice={c0: Integer(0)}
+        )
 
         first_descriptor = build_kernel_provenance_descriptor([first])
         reordered_descriptor = build_kernel_provenance_descriptor([reordered_metadata])
@@ -251,6 +268,15 @@ class TestKernelProvenanceDescriptor:
             [changed_arrangement]
         )
         changed_owner_descriptor = build_kernel_provenance_descriptor([changed_owner])
+        changed_owner_cores_descriptor = build_kernel_provenance_descriptor(
+            [changed_owner_cores]
+        )
+        changed_core_mapping_descriptor = build_kernel_provenance_descriptor(
+            [changed_core_mapping]
+        )
+        canonical_core_mapping_descriptor = build_kernel_provenance_descriptor(
+            [canonical_core_mapping]
+        )
 
         assert first_descriptor is not None
         assert reordered_descriptor is not None
@@ -261,6 +287,9 @@ class TestKernelProvenanceDescriptor:
         assert changed_descriptor.key != first_descriptor.key
         assert changed_arrangement_descriptor.key != first_descriptor.key
         assert changed_owner_descriptor.key != first_descriptor.key
+        assert changed_owner_cores_descriptor.key != changed_owner_descriptor.key
+        assert changed_core_mapping_descriptor.key != first_descriptor.key
+        assert canonical_core_mapping_descriptor.key == first_descriptor.key
 
     def test_pins_rich_canonical_bundle_key(self):
         c0 = Symbol("c0")
@@ -641,13 +670,14 @@ class TestKernelProvenancePropagation:
                 "torch_spyre.execution.kernel_runner.prepare_kernel",
                 return_value="jobplan",
             ) as prepare_kernel,
+            patch("torch_spyre.execution.kernel_runner.torch.spyre._impl._lazy_init"),
         ):
             runner = SpyreSDSCKernelRunner(
                 "sdsc_fused_mm_0",
                 "/tmp/kernel",
                 kernel_provenance=descriptor,
             )
-
+            assert runner.jobplan == "jobplan"
         assert runner.kernel_provenance is descriptor
         assert runner.profiler_event_name == _event_name(descriptor)
         assert runner.jobplan == "jobplan"
@@ -668,9 +698,10 @@ class TestKernelProvenancePropagation:
                 "torch_spyre.execution.kernel_runner.prepare_kernel",
                 return_value="jobplan",
             ) as prepare_kernel,
+            patch("torch_spyre.execution.kernel_runner.torch.spyre._impl._lazy_init"),
         ):
             runner = SpyreSDSCKernelRunner("sdsc_fused_mm_0", "/tmp/kernel")
-
+            assert runner.jobplan == "jobplan"
         assert runner.kernel_provenance is None
         assert runner.profiler_event_name is None
         prepare_kernel.assert_called_once_with("/tmp/kernel/spyreCodeDir")

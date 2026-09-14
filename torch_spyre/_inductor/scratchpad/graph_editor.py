@@ -13,11 +13,15 @@
 # limitations under the License.
 
 from torch.fx.graph import Graph
+from torch._inductor.dependencies import MemoryDep
 from torch._inductor.graph import GraphLowering
 from torch._inductor.ops_handler import WrapperHandler
 from torch_spyre._inductor.pass_utils import (
+    PerCoreView,
     commit_iteration_space_ownership,
+    commit_tensor_work_division,
     copy_op_metadata,
+    device_coordinates,
     iteration_space_from_op,
     invalidate_op_read_writes,
     op_read_writes,
@@ -35,6 +39,7 @@ from torch._inductor.ir import (
 from torch._inductor.lowering import clone as clone_lowering, lowerings
 
 from torch_spyre._inductor.ir import FixedTiledLayout
+from torch_spyre._inductor.split_multi_ops import _origin_in_graph
 
 
 class GraphEditor:
@@ -106,8 +111,11 @@ class GraphEditor:
         *,
         input: bool,
         private: bool = False,
+        lx_view: PerCoreView | None = None,
     ) -> ComputedBuffer:
         """Insert a clone; private clones rewire only ``buffer_users``."""
+        if input and lx_view is None:
+            raise ValueError("an LX input clone requires its accepted physical view")
         if isinstance(buffer, TensorBox):
             buf_name = buffer.data.data.name  # type: ignore
         else:
@@ -116,16 +124,32 @@ class GraphEditor:
             )
             buf_name = buffer.name
         assert isinstance(buf_name, str)
-        buf_fx = list(buffer.origins)[0]  # .origin_node may not exist
+        # A buffer lowered inside an invoke_subgraph HOP inherits origins that
+        # span BOTH the parent graph (the invoke_subgraph call / get_attr nodes)
+        # and the subgraph's own compute node. inserting_after requires an anchor
+        # in the current lowering graph, so select the graph-local origin rather
+        # than list(origins)[0] (which may be a foreign parent-graph node and
+        # asserts). See split_multi_ops._origin_in_graph for the same pattern.
+        buf_fx = _origin_in_graph(buffer.origins, self.fx_graph)
+        assert buf_fx is not None, (
+            f"no origin of {buf_name} lives in the current lowering graph; "
+            f"origins={[getattr(n, 'name', n) for n in buffer.origins]}"
+        )
         old_users = list(buf_fx.users.keys())
         if private:
-            old_users = list(
-                dict.fromkeys(
-                    getattr(consumer, "origin_node", None)
-                    or next(iter(consumer.origins))
-                    for consumer in buffer_users
+            anchors = []
+            for consumer in buffer_users:
+                anchor = getattr(consumer, "origin_node", None) or _origin_in_graph(
+                    consumer.origins, self.fx_graph
                 )
-            )
+                assert anchor is not None, (
+                    f"no origin of consumer {consumer.get_name()} lives in the "
+                    "current lowering graph, so a private clone cannot be "
+                    "rewired safely; origins="
+                    f"{[getattr(n, 'name', n) for n in consumer.origins]}"
+                )
+                anchors.append(anchor)
+            old_users = list(dict.fromkeys(anchors))
         self.fx_graph.inserting_after(buf_fx)
         new_fx_node = self.fx_graph.create_node(
             "call_function", self.clone_aten_op, (buf_fx,)
@@ -162,35 +186,43 @@ class GraphEditor:
         self.lowering.register_operation(new_com_buf)
         new_buf_name = new_com_buf.get_name()
 
-        # Clone loops mirror their source/consumer symbols before Scheduler, so
-        # retain direct symbol ownership instead of round-tripping through index
-        # coefficients. A clone has no reduction split.
+        # Clone loops mirror their source/consumer symbols before Scheduler.
+        # Input ownership therefore comes directly from the accepted physical
+        # view; never rebuild its core order from index coefficients.
         metadata_owner = getattr(metadata_source, "iteration_space_ownership", None)
-        if input and metadata_owner is not None:
-            read = next(
-                (
-                    dep
-                    for dep in op_read_writes(metadata_source).reads
-                    if dep.name == buf_name
-                ),
-                None,
+        if input:
+            assert lx_view is not None
+            from torch_spyre._inductor.scratchpad.lx_relayout import (
+                work_division_from_view,
             )
-            clone_write = next(iter(op_read_writes(new_com_buf).writes))
-            by_coeff = {
-                read.index.coeff(sym): split
-                for sym, split in metadata_owner.work_slices.items()
-                if read is not None and read.index.coeff(sym) != 0
-            }
-            clone_splits = {
-                sym: by_coeff.get(clone_write.index.coeff(sym), 1)
-                for sym in iteration_space_from_op(new_com_buf)
-            }
+
+            clone_writes = [
+                dep
+                for dep in op_read_writes(new_com_buf).writes
+                if isinstance(dep, MemoryDep)
+            ]
+            if len(clone_writes) != 1:
+                raise ValueError(
+                    "LX input clone must have exactly one indexed tensor write, "
+                    f"got {len(clone_writes)}"
+                )
+            clone_write = clone_writes[0]
+            clone_space = iteration_space_from_op(new_com_buf)
+            clone_ownership = work_division_from_view(
+                lx_view,
+                clone_layout.device_layout.device_size,
+                device_coordinates(clone_layout.device_layout, clone_write, None),
+                clone_space,
+            )
+            if clone_ownership is None:
+                raise ValueError("LX clone is missing its accepted physical ownership")
+            commit_tensor_work_division(new_com_buf, clone_ownership)
         else:
             clone_splits = {
                 sym: metadata_owner.work_slices.get(sym, 1) if metadata_owner else 1
                 for sym in iteration_space_from_op(new_com_buf)
             }
-        commit_iteration_space_ownership(new_com_buf, clone_splits)
+            commit_iteration_space_ownership(new_com_buf, clone_splits)
 
         if input:
             source_users = []
@@ -231,9 +263,15 @@ class GraphEditor:
         self,
         buffer: ComputedBuffer,
         consumers: list[ComputedBuffer],
+        *,
+        lx_view: PerCoreView,
     ) -> ComputedBuffer:
         return self.push_allocation_with_clone(
-            buffer, consumers, input=True, private=True
+            buffer,
+            consumers,
+            input=True,
+            private=True,
+            lx_view=lx_view,
         )
 
     @staticmethod
