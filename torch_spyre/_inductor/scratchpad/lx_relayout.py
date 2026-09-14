@@ -346,14 +346,6 @@ def movement_supported(
         or (num_cores == destination_num_cores and source.same_partition(destination))
     ):
         return False
-    if num_cores == destination_num_cores and destination_slices < num_cores:
-        # This level only contracts existing source axes. #4152 lifts this
-        # scope restriction for combined gather/broadcast on other axes.
-        if any(
-            source_splits.get(dim, 1) % destination_splits.get(dim, 1)
-            for dim in source_splits.keys() | destination_splits.keys()
-        ):
-            return False
     source_map = _core_slices(source, num_cores)
     destination_map = _core_slices(destination, destination_num_cores)
     dims = set(source_splits) | set(destination_splits)
