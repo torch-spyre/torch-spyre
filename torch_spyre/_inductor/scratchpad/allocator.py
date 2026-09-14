@@ -52,19 +52,17 @@ from torch_spyre._inductor.pass_utils import (
 )
 from torch_spyre._C import get_device_size_in_bytes
 from torch_spyre._inductor.work_division import (
-    enumerate_work_division_candidates,
-    has_resolved_work_div_hint,
-    work_division_splits_are_legal,
-)
-from torch_spyre._inductor.errors import Unsupported
-from torch_spyre._inductor.scratchpad.division_generation import (
     OpSplitSpace,
     ResidencyEdge,
     build_op_split_space,
     build_residency_edge,
+    enumerate_work_division_candidates,
+    has_resolved_work_div_hint,
+    work_division_splits_are_legal,
     _core_division,
     _view_for_div,
 )
+from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.scratchpad.plan_solver import (
     cost_expr_record,
     CoreDivision,

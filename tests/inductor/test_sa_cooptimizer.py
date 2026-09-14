@@ -54,7 +54,7 @@ from torch_spyre._inductor.scratchpad.sa_cooptimizer import (
     _ViewRelation,
     _one_axis_apart,
 )
-from torch_spyre._inductor.scratchpad.division_generation import (
+from torch_spyre._inductor.work_division import (
     OpSplitSpace,
     undeclared_splits,
 )

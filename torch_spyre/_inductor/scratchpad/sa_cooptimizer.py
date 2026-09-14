@@ -52,7 +52,7 @@ from typing import TYPE_CHECKING, Any, Optional, Union, cast
 
 import sympy
 
-from torch_spyre._inductor.scratchpad.division_generation import (
+from torch_spyre._inductor.work_division import (
     OpSplitSpace,
     ResidencyEdge,
     undeclared_splits,

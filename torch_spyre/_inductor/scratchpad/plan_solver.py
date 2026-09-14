@@ -26,7 +26,7 @@ from enum import Enum
 
 if TYPE_CHECKING:
     from torch_spyre._inductor.pass_utils import PerCoreView
-    from torch_spyre._inductor.scratchpad.division_generation import (
+    from torch_spyre._inductor.work_division import (
         OpSplitSpace,
         ResidencyEdge,
     )
