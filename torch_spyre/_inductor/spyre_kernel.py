@@ -21,7 +21,7 @@ from abc import ABC
 import torch
 import sympy
 
-from torch_spyre._C import DataFormats, ElementArrangement
+from torch_spyre._C import DataFormats, ElementArrangement, get_elem_in_stick
 
 from torch._inductor.scheduler import SchedulerNode
 from torch._inductor.codegen.common import (
@@ -38,6 +38,7 @@ from torch._inductor.virtualized import V
 
 
 from .constants import (
+    DL16TOFP32_OP,
     SPYRE_FP32_OPS,
     SPYRE_INT32_OPS,
     CONV_OPS,
@@ -1071,6 +1072,20 @@ class SpyreKernel(Kernel[CSEVariable]):
             raise RuntimeError("LX relayout marker has no matching registered plan")
         if relayout_plans:
             op_info = {**op_info, LX_RELAYOUT_INFO_KEY: True}
+
+        if op in DL16TOFP32_OP or any(
+            arg.element_arrangement == ElementArrangement.DL16_TO_FP32 for arg in args
+        ):
+            output_stick_coord = args[-1].device_coordinates[-1]
+            stick_syms = output_stick_coord.free_symbols & it_space_extended.keys()
+            if stick_syms:
+                stick_sym = next(iter(stick_syms))
+                stick_size = get_elem_in_stick(torch.float16)
+                stick_extent, stick_split = it_space_extended[stick_sym]
+                it_space_extended[stick_sym] = (
+                    ((stick_extent + stick_size - 1) // stick_size) * stick_size,
+                    stick_split,
+                )
 
         op_spec = OpSpec(
             op,
