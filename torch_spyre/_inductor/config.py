@@ -17,20 +17,41 @@ import sys
 from typing import Literal
 
 from torch.utils._config_module import install_config_module
-from .logging_utils import _get_env_bool
 
 lx_planning: bool = os.environ.get("LX_PLANNING", "1") == "1"
 co_optimizing_lx_planning: bool = (
     os.environ.get("CO_OPTIMIZING_LX_PLANNING", "0") == "1"
 )
-hbm_pool_planning: bool = _get_env_bool("HBM_POOL_PLANNING", True)
+hbm_pool_planning: bool = os.getenv("HBM_POOL_PLANNING", "1").lower() in (
+    "1",
+    "true",
+    "yes",
+)
+
+# Bracket risky FallbackKernel calls (opaque device dispatches with no native
+# Spyre lowering, e.g. custom ops or ops/eager.py's nested-torch.compile'd
+# eager kernels) with per-buffer LX dump/restore clones, so a buffer this
+# graph still has LX-resident across such a call survives whatever the
+# opaque call's own kernel does to LX. Defaults on; set
+# ENABLE_LX_CONTEXT_SWITCHING=0 to disable for debugging/bisection.
+enable_lx_context_switching: bool = os.getenv(
+    "ENABLE_LX_CONTEXT_SWITCHING", "1"
+).lower() in (
+    "1",
+    "true",
+    "yes",
+)
 
 # Select who allocates the HBM pool for an SDSC bundle's intermediates:
 # False (default) has the backend self-allocate via
 # sdscbundle.device_mem_allocate, exactly matching pre-existing behavior.
 # True has the front end allocate a real PyTorch tensor (via
 # spyre_empty_with_layout) and pass its address in as %pool_base_addr.
-frontend_pool_allocation: bool = _get_env_bool("FRONTEND_POOL_ALLOCATION", False)
+frontend_pool_allocation: bool = os.getenv("FRONTEND_POOL_ALLOCATION", "0").lower() in (
+    "1",
+    "true",
+    "yes",
+)
 
 # Emit a native conv2d SDSC (opFuncName="conv2d" on the "pt" unit) instead of
 # the im2col+matmul decomposition (conv2d_via_bmm_decomp). Off by default: the
@@ -62,9 +83,14 @@ ktir_emitter: bool = os.environ.get("TORCH_SPYRE_KTIR", "0") == "1"
 # A .mlir declaring the target device, passed to the backend compiler.
 ktir_device_mlir: str = os.environ.get("KTIR_DEVICE_MLIR", "")
 
-# Materialize compatible producer/consumer LX ownership changes as identity copies.
-# Set SPYRE_LX_PLANNER_RELAYOUT=0 to disable this optimization.
-lx_planner_relayout: bool = _get_env_bool("SPYRE_LX_PLANNER_RELAYOUT", True)
+# Enable certified LX ownership changes.
+# Set SPYRE_LX_PLANNER_RELAYOUT=0 to disable these optional optimizations, not
+# ownership validation. This does not change the allocator or LX memory budget.
+lx_planner_relayout: bool = os.getenv("SPYRE_LX_PLANNER_RELAYOUT", "1").lower() in (
+    "1",
+    "true",
+    "yes",
+)
 
 allow_all_ops_in_lx_planning: bool = False
 
@@ -94,7 +120,11 @@ ignore_wsr_hints: bool = os.environ.get("SPYRE_INDUCTOR_IGNORE_HINTS", "0") == "
 
 # Temporary kill switch for removing a proven-redundant read copy after LX
 # planning.  A failed proof leaves the original graph unchanged.
-read_copy_elision: bool = _get_env_bool("SPYRE_READ_COPY_ELISION", True)
+read_copy_elision: bool = os.getenv("SPYRE_READ_COPY_ELISION", "1").lower() in (
+    "1",
+    "true",
+    "yes",
+)
 
 # Per-pass operation logging for CustomPreSchedulingPasses.
 # Set to "all" or "1" to log after every pass, or a comma-separated list of
@@ -111,7 +141,11 @@ log_passes: str = os.environ.get("SPYRE_LOG_PASSES", "")
 # pays ~0.2 ms off, ~0.5 ms on.  Records go to timing_out at process exit, or via
 # timing_recorder.dump_and_finalize() for callers that want them sooner.
 # Tests override with config.patch({"timing": True}) rather than the environment.
-timing: bool = _get_env_bool("TORCH_SPYRE_TIMING", False)
+timing: bool = os.getenv("TORCH_SPYRE_TIMING", "0").lower() in (
+    "1",
+    "true",
+    "yes",
+)
 
 # Destination for the timing record.  The pid is inserted before the suffix, so
 # one setting is safe when a run fans out into several processes.  Empty means
@@ -124,7 +158,11 @@ timing_out: str = os.environ.get("TORCH_SPYRE_TIMING_OUT", "")
 # dxp_standalone invocation is skipped, so the compile produces no runnable
 # kernel and calling one raises.  Never enable this to run a model -- it exists
 # so a frontend measurement does not have to pay for the backend.
-frontend_only: bool = _get_env_bool("TORCH_SPYRE_FRONTEND_ONLY", False)
+frontend_only: bool = os.getenv("TORCH_SPYRE_FRONTEND_ONLY", "0").lower() in (
+    "1",
+    "true",
+    "yes",
+)
 
 # Predicted-runtime reporting from the analytical cost model (cost_model.py,
 # cost_model_pass.py).  NOT related to work_division.cost_model_matmul_division,
@@ -216,9 +254,20 @@ validate_op_specs: bool = os.environ.get("SPYRE_VALIDATE_OP_SPECS", "1") == "1"
 # False (or ``TORCH_SPYRE_NATIVE_PACKER=0``/``false``, which backs this default)
 # to force the pure-Python packer. A missing native class is a stale or
 # incomplete build, not a supported mode, and raises rather than falling back.
-native_layout_packer: bool = _get_env_bool("TORCH_SPYRE_NATIVE_PACKER", True)
+native_layout_packer: bool = os.getenv("TORCH_SPYRE_NATIVE_PACKER", "1").lower() in (
+    "1",
+    "true",
+    "yes",
+)
 
 # When symbolic cost_expr fails, use the fallback cost instead of erroring out
 _cpsat_warn_on_cost_expr: bool = True
+# Enable persistent on-disk caching of compiled Spyre kernels across
+# invocations.
+# Set SPYRE_KERNEL_CACHE=0 to disable.
+# To force recompilation (bypass lookup but still save), use the standard
+# PyTorch flag: TORCHINDUCTOR_FORCE_DISABLE_CACHES=1 / set
+# torch._inductor.config.force_disable_caches = True.
+spyre_kernel_cache: bool = os.environ.get("SPYRE_KERNEL_CACHE", "0") == "1"
 
 install_config_module(sys.modules[__name__])

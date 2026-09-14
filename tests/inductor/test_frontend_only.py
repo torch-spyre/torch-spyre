@@ -173,16 +173,58 @@ class TestBoundary:
         sdsc_runner.assert_called_once()
         assert not isinstance(runner, SpyreFrontendOnlyRunner)
 
-    def test_mode_is_off_by_default(self):
-        # Reading config.frontend_only here would fail for anyone who has the
-        # variable exported -- exactly the people running this code -- so assert
-        # what the default actually is: absent means off.
-        from torch_spyre._inductor.logging_utils import _get_env_bool
+    def test_frontend_only_keeps_the_cache_out_of_the_path(self, tmp_path):
+        """A bundle with no backend output must never reach the kernel cache.
 
-        with patch.dict(os.environ, {}, clear=True):
-            assert _get_env_bool("TORCH_SPYRE_FRONTEND_ONLY", False) is False
-        with patch.dict(os.environ, {"TORCH_SPYRE_FRONTEND_ONLY": "1"}):
-            assert _get_env_bool("TORCH_SPYRE_FRONTEND_ONLY", False) is True
+        commit_compile_dir treats an existing entry as a lost race, so a
+        committed bundle-only dir would make that key discard every later
+        complete compile.
+        """
+        with (
+            config.patch({"frontend_only": True, "spyre_kernel_cache": True}),
+            patch.object(ac, "get_cached_kernel_dir") as lookup,
+            patch.object(ac, "allocate_compile_dir") as allocate,
+            patch.object(ac, "commit_compile_dir") as commit,
+        ):
+            runner, generate_bundle, _, subprocess_run, _ = (
+                _compile_one_kernel(tmp_path)
+            )
+
+        lookup.assert_not_called()
+        allocate.assert_not_called()
+        commit.assert_not_called()
+        subprocess_run.assert_not_called()
+        generate_bundle.assert_called_once()
+        assert isinstance(runner, SpyreFrontendOnlyRunner)
+
+    def test_cache_is_still_used_when_the_mode_is_off(self, tmp_path):
+        """The coupling is one-directional: frontend_only suppresses the cache,
+        but leaving the mode off must not."""
+        with (
+            config.patch({"frontend_only": False, "spyre_kernel_cache": True}),
+            patch.object(ac, "compute_specs_hash", return_value="deadbeef"),
+            patch.object(ac, "get_cached_kernel_dir", return_value=None) as lookup,
+            patch.object(ac, "allocate_compile_dir", return_value=str(tmp_path)),
+            patch.object(
+                ac, "commit_compile_dir", return_value=str(tmp_path)
+            ) as commit,
+        ):
+            _, generate_bundle, _, subprocess_run, _ = _compile_one_kernel(tmp_path)
+
+        lookup.assert_called_once()
+        commit.assert_called_once()
+        subprocess_run.assert_called_once()
+        generate_bundle.assert_called_once()
+
+    @pytest.mark.skipif(
+        "TORCH_SPYRE_FRONTEND_ONLY" in os.environ,
+        reason="the variable is exported here, so the default cannot be observed",
+    )
+    def test_mode_is_off_by_default(self):
+        # config.frontend_only is parsed at import, so this reads the real value
+        # rather than re-deriving it; skipped for anyone who exports the
+        # variable -- exactly the people running this code.
+        assert config.frontend_only is False
 
 
 class TestBoundaryMarker:

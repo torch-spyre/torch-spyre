@@ -355,6 +355,15 @@ jobs:
     needs: gate_and_build
     if: ${{ needs.gate_and_build.outputs.should_build == 'true' }}
     uses: ./.github/workflows/build_test_pytorch_source.yaml
+    permissions:
+      contents: read
+      id-token: write
+      # Needed by build_test_pytorch_source.yaml's "test" job to dispatch and
+      # poll _upstream_tests_beta_matrix.yaml via the GitHub API
+      # (createWorkflowDispatch / listWorkflowRuns / getWorkflowRun) --
+      # without it the GITHUB_TOKEN gets a 403 "Resource not accessible by
+      # integration". Scoped to this job only, not the whole workflow.
+      actions: write
     secrets: inherit
     with:
       pytorch_sha: ${{ needs.gate_and_build.outputs.pytorch_sha }}

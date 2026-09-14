@@ -27,6 +27,7 @@ this extraction.
 
 import math
 import os
+from typing import Mapping, Optional
 
 from torch._inductor.ir import ComputedBuffer
 
@@ -34,11 +35,6 @@ from torch._inductor.ir import ComputedBuffer
 from .constants import BATCH_MATMUL_OP
 from .cost_model import ArgTraffic, OpFeatures, explain, max
 from .pass_utils import apply_splits_from_index_coeff, iteration_space_from_op
-
-from typing import Mapping, Optional, TYPE_CHECKING
-
-if TYPE_CHECKING:
-    from torch_spyre._inductor.scratchpad.plan_solver import LifetimeBoundBuffer
 
 
 def cost_dump_enabled() -> bool:
@@ -528,7 +524,7 @@ def _relayout_features(op, out_dims):
 
 
 def extract_op_features(
-    op, work_slices=None, buffers: Optional[Mapping[str, "LifetimeBoundBuffer"]] = None
+    op, work_slices=None, is_lx: Optional[Mapping[str, bool]] = None
 ) -> OpFeatures:
     """Build OpFeatures for one ComputedBuffer op (best-effort).
 
@@ -536,10 +532,12 @@ def extract_op_features(
     planning. Otherwise committed pre-scheduler ownership is used, falling back
     to legacy coefficient-keyed Scheduler transport after finalization.
 
-    buffers is an optional name -> LifetimeBoundBuffer map used for creating a
-    symbolic cost model.
+    ``is_lx`` is a name -> residency map (e.g. a co-optimizer's per-buffer
+    symbolic ``sym_is_lx``) consulted for each arg (the op's own output and
+    every input read); a name absent from the map -- or an empty map -- falls
+    back to the arg's committed layout.
     """
-    buf = buffers.get(op.name) if buffers else None
+    is_lx = is_lx or {}
     data = getattr(op, "data", None)
     is_reduction = getattr(data, "reduction_type", None) is not None
     loop_trip, tiles_red_dim, tiles_out_dim = _loop_features(op)
@@ -567,7 +565,7 @@ def extract_op_features(
     if is_reduction:
         reduction_cores = max(1, cores // max(1, out_elems))
 
-    is_lx = buf.sym_is_lx if buf else _mem_of_layout(op.get_layout()) == "lx"
+    out_is_lx = is_lx.get(op.name, _mem_of_layout(op.get_layout()) == "lx")
 
     # Matmul (batchmatmul reduction): compute-bound -> extra additive compute term. Pull
     # MACs (M*N*K), the per-core M tile (pt_eff), and the K-split k (-> reduction_cores,
@@ -616,7 +614,7 @@ def extract_op_features(
         # same fix, as _matmul_features' batch-dim exclusion above.
         rows = (out_size[-2] if len(out_size) >= 2 else 0) or out_dims[-2]
         # full-buffer alloc: per-tile slice is rows / loop_trip
-        rows = rows / loop_trip * (1 - is_lx) + rows * is_lx
+        rows = rows / loop_trip * (1 - out_is_lx) + rows * out_is_lx
         # `loop_trip > 1` is guaranteed by the branch condition; `_row_split` can in
         # principle return 0 if a split map ever records one, and this term is a
         # diagnostic -- a ZeroDivisionError here would take down a compile for a number
@@ -657,7 +655,7 @@ def extract_op_features(
         ArgTraffic(
             name=op.get_operation_name(),
             role="output",
-            is_lx=is_lx,
+            is_lx=out_is_lx,
             elems=out_elems,
             dims=list(out_dims),
             logical=list(out_size),
@@ -699,11 +697,7 @@ def extract_op_features(
                 dims, in_elems, in_logical = list(out_dims), out_elems, []
             inp_is_lx = False
         else:
-            if buffers:
-                inp_buf = buffers.get(name)
-                inp_is_lx = inp_buf.sym_is_lx if inp_buf is not None else (mem == "lx")
-            else:
-                inp_is_lx = mem == "lx"
+            inp_is_lx = is_lx.get(name, mem == "lx")
         args.append(
             ArgTraffic(
                 name=name,

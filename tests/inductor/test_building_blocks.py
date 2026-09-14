@@ -14,6 +14,7 @@
 
 import dataclasses
 import math
+import sys
 import unittest
 from unittest import mock
 
@@ -209,32 +210,33 @@ class TestBuildingBlocks(unittest.TestCase):
         # input before its fp16-to-fp32 upcast: the reduction result is STANDARD
         # and has to broadcast along the normalized axis against the staggered
         # upcast tensor.
-        B, S, H = 1, 64, 1536
+        B, S = 1, 64
         eps = 1e-6
-        for dtype in (torch.float16, torch.bfloat16):
-            with self.subTest(dtype=dtype):
-                hidden = torch.randn(B, S, H, dtype=dtype)
-                weight = torch.randn(H, dtype=dtype)
+        for H in (1536, 3840):
+            for dtype in (torch.float16, torch.bfloat16):
+                with self.subTest(hidden_size=H, dtype=dtype):
+                    hidden = torch.randn(B, S, H, dtype=dtype)
+                    weight = torch.randn(H, dtype=dtype)
 
-                def rms_norm(hidden, weight):
-                    x = hidden.to(torch.float32)
-                    var = x.pow(2).mean(-1, keepdim=True)
-                    normed = x * torch.rsqrt(var + eps)
-                    return weight * normed.to(dtype)
+                    def rms_norm(hidden, weight):
+                        x = hidden.to(torch.float32)
+                        var = x.pow(2).mean(-1, keepdim=True)
+                        normed = x * torch.rsqrt(var + eps)
+                        return weight * normed.to(dtype)
 
-                expected = rms_norm(hidden, weight)
-                hidden_layout = SpyreTensorLayout(
-                    hidden.size(), hidden.stride(), hidden.dtype, [0, 2, 1]
-                )
-                hidden_device = hidden.to(device_layout=hidden_layout)
-                weight_device = weight.to(DEVICE)
-                actual = torch.compile(rms_norm)(hidden_device, weight_device).cpu()
-                torch.testing.assert_close(
-                    actual,
-                    expected,
-                    atol=0.1,
-                    rtol=0.1,
-                )
+                    expected = rms_norm(hidden, weight)
+                    hidden_layout = SpyreTensorLayout(
+                        hidden.size(), hidden.stride(), hidden.dtype, [0, 2, 1]
+                    )
+                    hidden_device = hidden.to(device_layout=hidden_layout)
+                    weight_device = weight.to(DEVICE)
+                    actual = torch.compile(rms_norm)(hidden_device, weight_device).cpu()
+                    torch.testing.assert_close(
+                        actual,
+                        expected,
+                        atol=0.1,
+                        rtol=0.1,
+                    )
 
     def test_chained_rms_norm_fp32_upcast(self):
         B, S, H = 1, 64, 2816
@@ -272,8 +274,9 @@ class TestBuildingBlocks(unittest.TestCase):
         # Case 3.2 of the mixed-EA rule: the *staggered* operand is the
         # size-1-stick broadcaster (fp16 produced by an fp32->fp16 downcast,
         # FP32_TO_DL16) combined with a STANDARD full operand. A broadcastable
-        # staggered operand is physically identical to STANDARD of that shape, so
-        # the op is allowed (STANDARD output).
+        # staggered operand reads only element zero of each stick, so its
+        # within-stick ordering is unobservable and the op can produce a STANDARD
+        # output.
         x = torch.randn(4, 1, dtype=torch.float32)  # -> .to(f16): staggered bcast
         w = torch.randn(4, 64, dtype=torch.float16)  # STANDARD full
 
@@ -281,6 +284,23 @@ class TestBuildingBlocks(unittest.TestCase):
             return torch.add(x.to(torch.float16), w)
 
         compare_with_cpu(fn, x, w, cpu_compile=False, run_eager=False)
+
+    def test_mixed_ea_noncanonical_staggered_broadcaster_fp16(self):
+        # Gemma 4 vision RMSNorm produces its mean in fp32, then downcasts it
+        # before subtracting it from a full bf16 activation. The downcast keeps
+        # the reduction's noncanonical device geometry, but its stick is sparse;
+        # the FP32_TO_DL16 ordering is therefore unobservable to the broadcast.
+        x = torch.rand(1, 280, 6912, dtype=torch.bfloat16)
+
+        def fn(x):
+            xf = x.to(torch.float32)
+            mean = xf.mean(-1, keepdim=True)
+            centered = xf - mean
+            variance = (centered * centered).mean(-1, keepdim=True)
+            inv = torch.rsqrt(variance + 1e-6).to(x.dtype)
+            return (x - mean.to(x.dtype)) * inv
+
+        compare_with_cpu(fn, x, cpu_compile=False, run_eager=False)
 
     def test_mixed_ea_staggered_broadcaster_fp32(self):
         # Case 3.2 with an fp32-physical staggered broadcaster (DL16_TO_FP32).
@@ -524,7 +544,43 @@ class TestBuildingBlocks(unittest.TestCase):
             reshape_output=True,
         )
 
-    @unittest.skip("Runs for long time, possibly hang.  Keeping disabled")
+    def test_siglip_multicrop_attention_span(self):
+        """A seven-crop SigLIP prefill must fit each tiled BMM under 256 MB."""
+        B, H, L, D = 7, 16, 576, 128
+        generator = torch.Generator().manual_seed(1337)
+        q = torch.randn((B, L, H, D), dtype=torch.bfloat16, generator=generator)
+        k = torch.randn((B, L, H, D), dtype=torch.bfloat16, generator=generator)
+        v = torch.randn((B, L, H, D), dtype=torch.bfloat16, generator=generator)
+
+        def sdpa(q, k, v):
+            return F.scaled_dot_product_attention(
+                q.transpose(1, 2),
+                k.transpose(1, 2),
+                v.transpose(1, 2),
+                dropout_p=0.0,
+                scale=72**-0.5,
+            )
+
+        expected = sdpa(q, k, v)
+        actual = torch.compile(sdpa, dynamic=False)(
+            q.to("spyre"), k.to("spyre"), v.to("spyre")
+        ).cpu()
+        torch.testing.assert_close(actual, expected, atol=0.2, rtol=0.2)
+
+    def test_sdpa_head_tiles_limit_heads_per_tile(self):
+        """The hint value is a tile count, not a per-tile head extent."""
+        # The backend entry point loaded by ``import torch`` has already
+        # registered this module. Fetch it without importing torch_spyre here.
+        decompositions = sys.modules["torch_spyre._inductor.decompositions"]
+        num_head_tiles = decompositions._sdpa_num_head_tiles
+
+        self.assertEqual(num_head_tiles(32), 8)
+        self.assertEqual(num_head_tiles(16), 4)
+        self.assertEqual(num_head_tiles(14), 7)
+
+    @unittest.skip(
+        "Test skipped solely because of runtime.  It passes but takes over 10 minutes."
+    )
     @mock.patch("torch_spyre._inductor.decompositions._SDPA_MAX_SEQUENCE_TILE_SIZE", 64)
     def test_granite_gqa_prefill_grouped_sixteen_by_sixteen_tiling(self):
         """Sixteen KV loop groups preserve Granite's online-softmax carries."""

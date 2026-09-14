@@ -21,7 +21,7 @@ from torch._inductor.virtualized import V
 
 from .ir import SpyreConstantFallback
 from .logging_utils import get_inductor_logger
-from .pass_utils import NameSwapHandler
+from .pass_utils import NameSwapHandler, invalidate_op_read_writes
 from .provenance import merge_provenance
 
 logger = get_inductor_logger("dedup_constants")
@@ -49,6 +49,10 @@ def _patch_inner_fn(consumer: ComputedBuffer, name_map: dict[str, str]) -> None:
 
     object.__setattr__(consumer.data, "inner_fn", _new_inner)
     ComputedBuffer.get_default_sizes_body.clear_cache(consumer)
+    # consumer's reads changed (D -> C): drop any memoized op_read_writes so
+    # later passes (e.g. work_division.span_reduction) re-trace instead of
+    # reading a stale pre-redirect dependency on the now-dropped duplicate.
+    invalidate_op_read_writes(consumer)
 
 
 def _build_reverse_consumer_index(

@@ -147,6 +147,13 @@ altogether, so `stage:compile_fx:spyre_compile` would time a cache lookup and
 the record would still look valid -- which is what the second iteration of a
 sweep does by default.
 
+The Spyre kernel cache (`SPYRE_KERNEL_CACHE=1`) is forced off for the whole run,
+so the mode needs no flag of its own. A cache hit returns a compiled kernel
+without running bundle generation or the backend, leaving nothing to measure
+while still handing back a runnable kernel -- and a bundle with no backend output
+must never be committed, because a cache entry that already exists causes every
+later complete compile for that key to be discarded.
+
 Caches stay usable afterwards. Each kernel's bundle goes to a fresh directory,
 and the generated wrapper re-enters the backend step on a cache reload, so a
 normal run reusing the same `TORCHINDUCTOR_CACHE_DIR` still compiles and runs.

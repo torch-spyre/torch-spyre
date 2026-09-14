@@ -12,15 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import tempfile
-from typing import Any, cast
-from collections.abc import Sequence
 import os
 import shutil
 import subprocess
-import torch
+import tempfile
 import uuid
+from typing import TYPE_CHECKING, Any, cast
+from collections.abc import Sequence
 
+import torch
 from torch._inductor.async_compile import AsyncCompile
 from torch._inductor.runtime.runtime_utils import cache_dir
 from torch_spyre._inductor import config as _spyre_config
@@ -42,6 +42,17 @@ from .kernel_runner import (
     SpyreSDSCKernelRunner,
     SpyreUnimplementedRunner,
 )
+from .kernel_cache import (
+    allocate_compile_dir,
+    commit_compile_dir,
+    compute_specs_hash,
+    get_cached_kernel_dir,
+    get_kernel_registry,
+    _move_to_failed_dir,
+)
+
+if TYPE_CHECKING:
+    from torch_spyre._inductor.kernel_provenance import KernelProvenanceDescriptor
 
 logger = get_inductor_logger("sdsc_compile")
 
@@ -117,6 +128,69 @@ def get_output_dir(kernel_name: str):
     return kernel_output_dir
 
 
+def _compile_to_dir(
+    kernel_name: str,
+    compile_dir: str,
+    specs,
+    pool_size: int,
+) -> bool:
+    """Run generate_bundle then dxp_standalone for ``specs`` into ``compile_dir``.
+
+    Shared by the cache-miss path and the no-cache path so that any change to
+    the compilation sequence is applied in both places automatically.
+
+    Returns False when frontend-only mode stopped before the backend, leaving
+    ``compile_dir`` holding a bundle and none of dxp_standalone's output.
+    """
+    with timing_recorder.stage(
+        "stage:SpyreAsyncCompile:generate_bundle",
+        kernel=kernel_name,
+        specs=len(specs),
+    ):
+        generate_bundle(kernel_name, compile_dir, specs, pool_size=pool_size)
+
+    # Backend input is complete. Everything above is frontend work; the
+    # subprocess below is the whole of the backend for this kernel, which is
+    # what makes this one of the two places a frontend-only compile stops. The
+    # boundary sits inside the sequence both callers share, so a later change to
+    # that sequence cannot route around it.
+    if _spyre_config.frontend_only:
+        return False
+
+    with torch.profiler.record_function(f"dxp_standalone:{kernel_name}"):
+        try:
+            with timing_recorder.stage(
+                _BACKEND_STAGE, kernel=kernel_name, tool="dxp_standalone"
+            ):
+                subprocess.run(
+                    ["dxp_standalone", "-d", compile_dir],
+                    check=True,
+                )
+        except subprocess.CalledProcessError as exc:
+            try_collect(
+                exc,
+                logger=logger,
+                failure_category=CATEGORY_COMPILE_BACKEND,
+                kernel_name=kernel_name,
+                code_dir=compile_dir,
+            )
+            raise
+    return True
+
+
+def _prepare_kernel(
+    kernel_name: str,
+    output_dir: str,
+    kernel_provenance: "KernelProvenanceDescriptor | None",
+) -> SpyreSDSCKernelRunner:
+    with timing_recorder.stage(
+        "stage:SpyreAsyncCompile:prepare_kernel", kernel=kernel_name
+    ):
+        return SpyreSDSCKernelRunner(
+            kernel_name, output_dir, kernel_provenance=kernel_provenance
+        )
+
+
 class SpyreAsyncCompile(AsyncCompile):
     """Spyre kernel compilation (`sdsc`), plus the upstream AsyncCompile.
 
@@ -153,18 +227,9 @@ class SpyreAsyncCompile(AsyncCompile):
         unimp = find_unimplemented(list(specs))
         if unimp is not None:
             logger.warning(
-                f"WARNING: Compiling unimplemented {unimp.op} to runtime exception"
+                "WARNING: Compiling unimplemented %s to runtime exception", unimp.op
             )
             return SpyreUnimplementedRunner(kernel_name, unimp.op)
-
-        # Generate SDSC Bundle from OpSpecs
-        output_dir = get_output_dir(kernel_name)
-        with timing_recorder.stage(
-            "stage:SpyreAsyncCompile:generate_bundle",
-            kernel=kernel_name,
-            specs=len(specs),
-        ):
-            generate_bundle(kernel_name, output_dir, specs, pool_size=pool_size)
 
         self._provenance_attempt_count += 1
         try:
@@ -192,40 +257,69 @@ class SpyreAsyncCompile(AsyncCompile):
                 )
             kernel_provenance = None
 
-        # Backend input is complete. Everything above is frontend work; the
-        # subprocess below is the whole of the backend for this kernel, which is
-        # what makes this one of the two places a frontend-only compile stops.
-        if _spyre_config.frontend_only:
-            return _skip_backend(kernel_name, output_dir, "dxp_standalone")
+        use_cache = (
+            _spyre_config.spyre_kernel_cache
+            and not torch._inductor.config.force_disable_caches
+            # A cache hit runs neither generate_bundle nor dxp_standalone, so a
+            # frontend-only process would measure no frontend work and still hand
+            # back a runnable kernel. Committing a bundle-only dir is worse:
+            # commit_compile_dir treats an existing dir as a lost race, so that
+            # key would discard every later complete compile.
+            and not _spyre_config.frontend_only
+        )
 
-        # Invoke backend compiler of SDSC Bundle
-        with torch.profiler.record_function(f"dxp_standalone:{kernel_name}"):
+        if use_cache:
+            # Hash the specs in-memory BEFORE any disk I/O.  On a cache hit
+            # neither generate_bundle nor dxp_standalone runs at all.
             try:
-                with timing_recorder.stage(
-                    _BACKEND_STAGE, kernel=kernel_name, tool="dxp_standalone"
-                ):
-                    subprocess.run(
-                        ["dxp_standalone", "-d", output_dir],
-                        check=True,
-                    )
-            except Exception as exc:
-                try_collect(
-                    exc,
-                    logger=logger,
-                    failure_category=CATEGORY_COMPILE_BACKEND,
-                    kernel_name=kernel_name,
-                    code_dir=output_dir,
+                cache_key = compute_specs_hash(
+                    specs, kernel_name=kernel_name, pool_size=pool_size
                 )
-                raise
+            except RuntimeError as e:
+                logger.warning(
+                    "Kernel cache disabled for %s: could not compute cache key: %s. "
+                    "Set SPYRE_KERNEL_CACHE=0 to suppress this warning.",
+                    kernel_name,
+                    e,
+                )
+            else:
+                logger.debug("Bundle cache key: %s", cache_key)
 
-        with timing_recorder.stage(
-            "stage:SpyreAsyncCompile:prepare_kernel", kernel=kernel_name
-        ):
-            return SpyreSDSCKernelRunner(
-                kernel_name,
-                output_dir,
-                kernel_provenance=kernel_provenance,
-            )
+                cached_dir = get_cached_kernel_dir(cache_key)
+                if cached_dir is not None:
+                    logger.debug("Cache HIT: Using cached kernel from: %s", cached_dir)
+                    get_kernel_registry().record_hit(cache_key)
+                    return _prepare_kernel(kernel_name, cached_dir, kernel_provenance)
+
+                logger.debug("Cache MISS: Compiling kernel")
+                get_kernel_registry().record_miss(cache_key)
+
+                # Allocate a temp dir INSIDE the cache root (same filesystem)
+                # so the rename in commit_compile_dir is atomic on POSIX.
+                compile_dir: str = allocate_compile_dir(cache_key)
+                try:
+                    completed = _compile_to_dir(
+                        kernel_name, compile_dir, specs, pool_size
+                    )
+                    # frontend_only is excluded from use_cache above, so the
+                    # backend always ran here.
+                    assert completed, "frontend-only must not reach the kernel cache"
+                    cached_dir = commit_compile_dir(compile_dir, cache_key)
+                    logger.debug("Kernel compiled and cached at: %s", cached_dir)
+                    return _prepare_kernel(kernel_name, cached_dir, kernel_provenance)
+                except Exception:  # subprocess.CalledProcessError:
+                    # Move the failed dir to failed/ for manual debugging
+                    # rather than leaving .tmp. dirs accumulating in the root.
+                    _move_to_failed_dir(compile_dir)
+                    raise
+
+        # Caching disabled (SPYRE_KERNEL_CACHE=0, force_disable_caches, or
+        # frontend-only). Compile into a throw-away temp dir that lives for this
+        # process only.
+        output_dir = get_output_dir(kernel_name)
+        if not _compile_to_dir(kernel_name, output_dir, specs, pool_size):
+            return _skip_backend(kernel_name, output_dir, "dxp_standalone")
+        return _prepare_kernel(kernel_name, output_dir, kernel_provenance)
 
     def ktir(
         self, kernel_name: str, specs: Sequence[OpSpec | LoopSpec | UnimplementedOp]
@@ -248,7 +342,7 @@ class SpyreAsyncCompile(AsyncCompile):
         unimp = find_unimplemented(list(specs))
         if unimp is not None:
             logger.warning(
-                f"WARNING: Compiling unimplemented {unimp.op} to runtime exception"
+                "WARNING: Compiling unimplemented %s to runtime exception", unimp.op
             )
             return SpyreUnimplementedRunner(kernel_name, unimp.op)
 
