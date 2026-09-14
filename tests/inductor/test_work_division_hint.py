@@ -43,6 +43,7 @@ from torch._inductor.ir import NoneLayout
 from torch._inductor.utils import run_and_get_code, InputType
 
 from torch_spyre._inductor import config, spyre_hint
+import torch_spyre._inductor.core_mapping as core_mapping_module
 import torch_spyre._inductor.scratchpad.lx_relayout as lx_relayout_module
 import torch_spyre._inductor.scheduler as scheduler_module
 import torch_spyre._inductor.work_division as _wd
@@ -694,8 +695,7 @@ def _allocation_graph(*operation_names):
             32,
             True,
         ),
-        # Scope cut, not an edge-model limitation: #4152 enables this
-        # combined gather/broadcast and changes the expectation to True.
+        # Gather then broadcast: every completed slice reaches several cores.
         (
             _view({2: 32}, {2: Mod(_CORE_ID, 32)}, 32),
             _view(
@@ -703,7 +703,7 @@ def _allocation_graph(*operation_names):
             ),
             32,
             32,
-            False,
+            True,
         ),
         # A larger domain need not replicate slices evenly: each source feeds
         # four cores and each destination core has one source.
@@ -848,6 +848,25 @@ def test_work_division_from_view_examples(
     assert division is not None
     assert division.work_slices == expected
     assert division.physical_core_count == view.num_cores
+
+
+def test_diagonal_access_cannot_become_a_complete_relayout_source():
+    loop = Symbol("loop")
+    owner = Mod(_CORE_ID, 2)
+    division = TensorWorkDivision({loop: 2}, {loop: owner}, num_cores=2)
+    diagonal = PerCoreView(((0, 2), (1, 2)), ((0, owner), (1, owner)), num_cores=2)
+
+    # Projection may describe a diagonal read. It does not authorize treating
+    # its two accessed cells as the complete four-cell physical buffer.
+    assert (
+        core_mapping_module.decompose_fused_split_view(
+            loop, 2, owner, division, {loop: 2}, (2, 2), (loop, loop), 2
+        )
+        is None
+    )
+    assert not lx_relayout_module.movement_supported(
+        diagonal, PerCoreView((), (), num_cores=2), 2, 2
+    )
 
 
 def test_lx_relayout_activation_policy_is_source_wide():
@@ -1643,6 +1662,51 @@ def test_carried_reduction_stages_compile_to_a_drain():
     )
 
     torch.testing.assert_close(actual.cpu(), fn(values), atol=0.05, rtol=0.05)
+    assert "coarse_tile_reduction_drain" in "\n".join(code)
+
+
+@config.patch(
+    {
+        "sencores": 32,
+        "lx_planning": True,
+        "allow_all_ops_in_lx_planning": True,
+        "layout_solver": "greedy",
+    }
+)
+def test_carried_reduction_after_tiled_pointwise_producer():
+    """A producer retile must not erase the reduction's named E symbol."""
+
+    torch.manual_seed(0)
+    experts, tokens, hidden = 2, 64, 64
+    values = torch.randn(experts, tokens, hidden, dtype=torch.float16) * 0.1
+    routing = torch.randn(tokens, experts, 1, dtype=torch.float16) * 0.1
+    for name, size in (
+        ("E", experts),
+        ("T", tokens),
+        ("H", hidden),
+        ("ONE", 1),
+    ):
+        _declare_tensor_dim(name, size)
+
+    def fn(values, routing):
+        with spyre_hint(named_dims=["E", "T", "ONE"]):
+            route = routing.permute(1, 0, 2).contiguous().clone()
+        with spyre_hint(
+            num_tiles_per_dim={"E": experts},
+            work_div={"T": 32},
+        ):
+            return (values * route).sum(dim=0)
+
+    device_values = _name_tensor_dims(values.to("spyre"), ["E", "T", "H"])
+    device_routing = routing.to("spyre")
+    torch._inductor.codecache.FxGraphCache.clear()
+    actual, code = run_and_get_code(
+        torch.compile(fn, dynamic=False, options={"epilogue_fusion": False}),
+        device_values,
+        device_routing,
+    )
+
+    torch.testing.assert_close(actual.cpu(), fn(values, routing), atol=0.05, rtol=0.05)
     assert "coarse_tile_reduction_drain" in "\n".join(code)
 
 
