@@ -1,4 +1,4 @@
-# Copyright 2025 The Torch-Spyre Authors.
+# Copyright 2026 The Torch-Spyre Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -17,8 +17,7 @@
 The device's fp16 exp saturates at a nonzero floor rather than underflowing, including
 for -inf. A masked softmax then gives each masked position a nonzero weight, so the
 values behind the mask reach the output through matmul(probs, v). For paged attention,
-which gathers whole KV pages, that made one request's result depend on the requests
-that previously held its pages.
+which gathers whole KV pages, that makes masked page contents affect the result.
 
 The hardware test states the invariant end to end -- varying only the masked-out
 inputs must leave the result bit-identical -- rather than inspecting the probs. That
@@ -50,11 +49,16 @@ def _run(fn, *args, mode="compile"):
 
 
 def test_threshold_is_the_round_to_zero_point():
-    # Half the smallest subnormal, which is 2**-24 at fp16 and 2**-133 at bf16.
-    assert _exp_underflow_threshold(torch.float16) == pytest.approx(-25.0 * math.log(2))
-    assert _exp_underflow_threshold(torch.bfloat16) == pytest.approx(
-        -134.0 * math.log(2)
-    )
+    # Use the representable value immediately below each mathematical midpoint.
+    for dtype, exponent in ((torch.float16, -25), (torch.bfloat16, -134)):
+        exact_midpoint = exponent * math.log(2)
+        midpoint = torch.tensor(exact_midpoint, dtype=dtype)
+        expected = midpoint.item()
+        if expected >= exact_midpoint:
+            expected = torch.nextafter(
+                midpoint, torch.tensor(float("-inf"), dtype=dtype)
+            ).item()
+        assert _exp_underflow_threshold(dtype) == expected
     assert _exp_underflow_threshold(torch.int32) is None
 
 
@@ -70,9 +74,7 @@ def test_emitted_shape_selects_a_layout_preserving_zero():
     assert len(wheres) == 1, [n.name for n in gm.graph.nodes]
     condition, zero, original = wheres[0].args
     assert condition.target is aten.le.Scalar
-    assert condition.args[1] == pytest.approx(
-        _exp_underflow_threshold(torch.float16)
-    )
+    assert condition.args[1] == pytest.approx(_exp_underflow_threshold(torch.float16))
     assert zero.target is aten.clamp.default
     assert zero.args == (original,)
     assert zero.kwargs == {"min": 0.0, "max": 0.0}
@@ -126,6 +128,23 @@ def test_guard_preserves_ordinary_exp_on_cpu():
     torch.testing.assert_close(gm(xs), expected, rtol=0, atol=0)
 
 
+def test_guard_preserves_smallest_subnormal_at_boundary():
+    class M(torch.nn.Module):
+        def forward(self, scores):
+            return torch.exp(scores)
+
+    midpoint = torch.tensor(-25.0 * math.log(2), dtype=torch.float16)
+    below = torch.nextafter(midpoint, torch.tensor(float("-inf"), dtype=torch.float16))
+    xs = torch.stack((midpoint, below))
+    gm = make_fx(M())(xs)
+    guard_exp_underflow(gm.graph)
+    gm.recompile()
+
+    got = gm(xs)
+    assert got[0] == torch.finfo(torch.float16).tiny * torch.finfo(torch.float16).eps
+    assert got[1] == 0
+
+
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
 def test_non_fp16_exp_is_not_rewritten(dtype):
     class M(torch.nn.Module):
@@ -142,8 +161,8 @@ def test_masked_softmax_ignores_the_masked_values(mode):
     """Varying only masked-out inputs must leave the result bit-identical.
 
     Mirrors a paged-attention block: 32 real keys and 96 masked ones sharing a 128-slot
-    page. The real half is byte-identical across arms, so any difference is a masked
-    position carrying weight.
+    page. The valid quarter is byte-identical across arms, so any difference is a
+    masked position carrying weight.
     """
     dtype, rows, keys, valid = torch.float16, 32, 128, 32
     sentinel = torch.finfo(dtype).min

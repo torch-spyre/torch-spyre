@@ -324,16 +324,21 @@ _EXP_UNDERFLOW_DONE = "_spyre_exp_underflow_done"
 
 
 def _exp_underflow_threshold(dtype: torch.dtype) -> float | None:
-    """Largest input whose ``exp()`` rounds to zero in ``dtype``, else None.
+    """Largest representable input whose ``exp()`` rounds to zero, else None.
 
     ``exp(x)`` rounds to zero once it drops below half the smallest subnormal, which
-    is ``finfo.tiny * finfo.eps`` in every IEEE binary format: -17.33 at fp16,
-    -92.88 at bf16.
+    is ``finfo.tiny * finfo.eps`` in every IEEE binary format. Round the mathematical
+    midpoint toward negative infinity so encoding the comparison scalar cannot move
+    it above the midpoint and incorrectly zero the smallest positive subnormal.
     """
     if not dtype.is_floating_point:
         return None
     finfo = torch.finfo(dtype)
-    return log(finfo.tiny * finfo.eps / 2.0)
+    exact_midpoint = log(finfo.tiny * finfo.eps / 2.0)
+    midpoint = torch.tensor(exact_midpoint, dtype=dtype)
+    if midpoint.item() < exact_midpoint:
+        return midpoint.item()
+    return torch.nextafter(midpoint, torch.tensor(float("-inf"), dtype=dtype)).item()
 
 
 def guard_exp_underflow(graph: torch.fx.Graph) -> None:
@@ -345,12 +350,7 @@ def guard_exp_underflow(graph: torch.fx.Graph) -> None:
 
       * a masked softmax -- attention adds a large negative sentinel to the scores
         of the positions it must ignore, and at a nonzero weight every ignored
-        position still contributes its value through ``matmul(probs, v)``.
-        Paged attention gathers whole pages, so the slots past a sequence's end
-        reach the output, and because vLLM hands the same block to later requests,
-        one forward pass comes to depend on the requests that held those pages
-        before it: a fresh process answers the same greedy request differently
-        until block reuse stops changing those bytes;
+        position still contributes its value through ``matmul(probs, v)``;
       * ``_POINTWISE_PADDING_MASK_VALUE`` (codegen/superdsc.py), which seeds an
         exp's padding lanes with -1e4 to make them contraction-neutral.
 
