@@ -141,7 +141,11 @@ log_passes: str = os.environ.get("SPYRE_LOG_PASSES", "")
 # pays ~0.2 ms off, ~0.5 ms on.  Records go to timing_out at process exit, or via
 # timing_recorder.dump_and_finalize() for callers that want them sooner.
 # Tests override with config.patch({"timing": True}) rather than the environment.
-timing: bool = _get_env_bool("TORCH_SPYRE_TIMING", False)
+timing: bool = os.getenv("TORCH_SPYRE_TIMING", "0").lower() in (
+    "1",
+    "true",
+    "yes",
+)
 
 # Destination for the timing record.  The pid is inserted before the suffix, so
 # one setting is safe when a run fans out into several processes.  Empty means
