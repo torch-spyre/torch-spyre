@@ -23,19 +23,23 @@ from torch._inductor.utils import (
     sympy_product,
 )
 from torch._inductor.dependencies import MemoryDep
-from torch._inductor.ir import NoneLayout
+from torch._inductor.ir import ComputedBuffer, NoneLayout
 from torch._inductor.scheduler import (
     BaseScheduling,
     BaseSchedulerNode,
     FusedSchedulerNode,
+    NodeUser,
+    ExternKernelSchedulerNode,
+    NopKernelSchedulerNode,
     SchedulerNode,
+    init_group_node,
 )
 from torch._inductor.virtualized import V
 from torch._inductor.codecache import code_hash
 from torch.utils._ordered_set import OrderedSet
 
 from .spyre_kernel import SpyreKernel
-from .ir import FixedTiledLayout
+from .ir import FixedTiledLayout, SpyreEmptyFallback
 from .pass_utils import iteration_space
 from .logging_utils import get_inductor_logger
 from .scratchpad.lx_relayout import (
@@ -47,6 +51,64 @@ from . import config as _spyre_config
 from .errors import Unsupported
 
 logger = get_inductor_logger("scheduler")
+
+
+def is_allocation_only_node(node: BaseSchedulerNode) -> bool:
+    """True if ``node`` owns a buffer allocation but contributes no compute.
+
+    A lowering that fills its destination through mutations (``cat``, ``stack``,
+    the coarse-tile full buffer) allocates that destination and writes it only
+    through its mutation views. The allocation emits no kernel call of its own, so
+    such a node is *eligible* to join a bundle rather than divide the run, and
+    ``codegen_node`` emits its buffer.
+
+    Eligibility is not the whole rule: whether a given allocation actually folds
+    also depends on where it sits, which
+    :func:`~torch_spyre._inductor.fusion._compute_span` decides.
+
+    Two spellings reach the scheduler, and neither is a ``SchedulerNode``:
+
+    - ``empty`` lowers to a zero-trip iteration space, which upstream marks a
+      ``NopKernelSchedulerNode``. Restricted to ``ComputedBuffer`` because that is
+      the allocating producer; other ``NopKernel`` sources have no buffer to emit.
+    - ``spyre.empty`` lowers to a ``SpyreEmptyFallback`` extern, whose ``codegen``
+      is a no-op because the allocation is the whole result.
+    """
+    if isinstance(node, NopKernelSchedulerNode):
+        return isinstance(node.node, ComputedBuffer)
+    return isinstance(node, ExternKernelSchedulerNode) and isinstance(
+        node.node, SpyreEmptyFallback
+    )
+
+
+class SuperDSCBundle(FusedSchedulerNode):
+    """A bundle of nodes codegen'd into one SuperDSC kernel.
+
+    A bundle has no loop nest of its own, so it adopts one member's ``group``
+    (the ``(device, iteration_space)`` pair) to describe itself, preferring a
+    reduction's iteration space over a pointwise one. Members that carry an
+    allocation but no compute, such as the destination of a lowering that fills
+    a buffer through mutations, have no ``group`` and are skipped when choosing.
+
+    Callers must supply at least one member carrying a ``group``; the grouping in
+    :func:`~torch_spyre._inductor.fusion.spyre_fuse_nodes` guarantees it by
+    trimming each run to the span its compute members cover.
+    """
+
+    def __init__(self, scheduler, snodes: list[BaseSchedulerNode]) -> None:
+        # Bypasses FusedSchedulerNode.__init__, whose group election reads
+        # .group off an arbitrary member; everything else it does is
+        # init_group_node.
+        BaseSchedulerNode.__init__(self, scheduler)
+        init_group_node(self, scheduler, snodes)
+        self.users: list[NodeUser] = []
+        with_group = [node for node in snodes if hasattr(node, "group")]
+        if not with_group:
+            # TODO: support bundles carrying no loop nest at all; codegen has no
+            # iteration space to emit the kernel from. Callers group nodes so this
+            # cannot arise, so reaching it means the caller broke that contract.
+            raise Unsupported("SuperDSC bundle holds no node with an iteration space")
+        self.group = max(with_group, key=lambda node: int(node.is_reduction())).group
 
 
 class CountedLoopSchedulerNode(FusedSchedulerNode):
@@ -582,6 +644,13 @@ class SuperDSCScheduling(BaseScheduling):
             done.add(node)
             if isinstance(node, SchedulerNode):
                 node_schedule.append(node)
+            elif isinstance(node, NopKernelSchedulerNode) or is_allocation_only_node(
+                node
+            ):
+                # Computes nothing, so it contributes no operation to a kernel.
+                # Where such a node owns an allocation, ``codegen_node`` emits its
+                # buffer.
+                continue
             elif isinstance(node, FusedSchedulerNode):
                 for inner in node.get_nodes():
                     if inner not in done and isinstance(inner, SchedulerNode):
@@ -647,6 +716,12 @@ class SuperDSCScheduling(BaseScheduling):
         nodes = self._live_nodes(node)
         if len(nodes) == 0:
             return
+        # A bundle member that only allocates contributes no operation to the
+        # kernel, so it is absent from the prepared node schedule and nothing
+        # else emits its buffer.
+        for member in nodes:
+            if is_allocation_only_node(member):
+                member.mark_run()
         name = node.get_name()
         leaf_names = {leaf.get_name() for leaf in _all_scheduler_nodes(nodes)}
         kernel: SpyreKernel | None = getattr(node, "prepared_kernel", None)

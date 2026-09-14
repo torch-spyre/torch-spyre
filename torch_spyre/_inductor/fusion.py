@@ -17,19 +17,22 @@ from collections.abc import Callable, Sequence
 from torch._inductor.ir import ComputedBuffer
 from torch._inductor.scheduler import (
     BaseSchedulerNode,
-    FusedSchedulerNode,
     SchedulerNode,
 )
 from . import config
 from .constants import DEVICE_NAME
-from .scheduler import CountedLoopSchedulerNode
+from .scheduler import (
+    CountedLoopSchedulerNode,
+    SuperDSCBundle,
+    is_allocation_only_node,
+)
 
 
 def _make_fused(
     nodes: list[SchedulerNode | CountedLoopSchedulerNode],
 ) -> BaseSchedulerNode | None:
     if len(nodes) > 1:
-        return FusedSchedulerNode(nodes[0].scheduler, nodes)
+        return SuperDSCBundle(nodes[0].scheduler, nodes)
     elif len(nodes) == 1:
         return nodes[0]
     return None
@@ -41,15 +44,50 @@ def _is_spyre_node(node: BaseSchedulerNode) -> bool:
     return device is not None and device.type == DEVICE_NAME
 
 
-def _is_fusable_node(node: BaseSchedulerNode) -> bool:
-    """True if ``node`` may join the run being fused: a Spyre compute node.
+def _is_compute_node(node: BaseSchedulerNode) -> bool:
+    """True if ``node`` carries a loop nest, so it can describe a bundle.
 
-    Everything else -- fallback nodes, CPU nodes, extern kernels -- forces a
-    bundle boundary.
+    A bundle needs one member's ``group`` -- the ``(device, iteration_space)``
+    pair -- to emit a kernel from, and only these node types have one.
     """
-    return isinstance(node, (SchedulerNode, CountedLoopSchedulerNode)) and (
-        _is_spyre_node(node)
+    return _is_spyre_node(node) and isinstance(
+        node, (SchedulerNode, CountedLoopSchedulerNode)
     )
+
+
+def _is_fusable_node(node: BaseSchedulerNode) -> bool:
+    """True if ``node`` may join the run being fused: a Spyre compute node, or
+    an allocation feeding one.
+
+    Everything else -- fallback nodes, CPU nodes, extern kernels that compute
+    something -- forces a bundle boundary. An allocation admitted here is only
+    kept where it is interior to the run; see :func:`_compute_span`.
+    """
+    if not _is_spyre_node(node):
+        return False
+    return _is_compute_node(node) or is_allocation_only_node(node)
+
+
+def _compute_span(run: list[BaseSchedulerNode]) -> tuple[int, int]:
+    """The half-open index range of ``run`` between its first and last compute node.
+
+    Folding an allocation into a bundle pays off only where it would otherwise
+    split a run of compute, which is to say where it is *interior*. A ``cat`` or
+    ``stack`` destination is interior by construction: the compute that fills it
+    follows it. An allocation at either end is a different animal -- coarse
+    tiling hoists its cross-tile reduction accumulators ahead of a loop group
+    precisely so they do not split it -- and absorbing one buys nothing while
+    costing an unread buffer.
+
+    Leading and trailing allocations are therefore handed back as their own
+    single-element runs, which is what they were before fusion considered them.
+    A run holding no compute at all yields no bundle to describe, so it splits
+    entirely.
+    """
+    compute = [i for i, node in enumerate(run) if _is_compute_node(node)]
+    if not compute:
+        return (0, 0)
+    return (compute[0], compute[-1] + 1)
 
 
 def group_contiguous_fusable(items: list, is_fusable: Callable) -> list[list]:
@@ -93,13 +131,16 @@ def spyre_fuse_nodes(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
         # exceed that slot count, so disable fusion when symbolic args are off.
         return nodes
 
-    # One bundle per maximal contiguous run of fusable nodes; a boundary node
-    # comes back as a single-element run, and ``_make_fused`` returns it
-    # unchanged, so this preserves the previous behaviour exactly.
+    # One bundle per maximal contiguous run of fusable nodes, trimmed to the span
+    # its compute members cover; a boundary node comes back as a single-element
+    # run, and ``_make_fused`` returns it unchanged.
     fused_nodes: list[BaseSchedulerNode] = []
     for group in group_contiguous_fusable(nodes, _is_fusable_node):
-        if fused := _make_fused(group):
+        start, stop = _compute_span(group)
+        fused_nodes.extend(group[:start])
+        if start < stop and (fused := _make_fused(group[start:stop])):
             fused_nodes.append(fused)
+        fused_nodes.extend(group[stop:] if start < stop else group)
     return fused_nodes
 
 
