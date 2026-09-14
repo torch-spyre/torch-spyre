@@ -92,6 +92,15 @@ lx_planner_relayout: bool = os.getenv("SPYRE_LX_PLANNER_RELAYOUT", "1").lower() 
     "yes",
 )
 
+# Submit independent DXP kernel compilations to Inductor's subprocess pool and
+# resolve them together at the generated wrapper's async_compile.wait() barrier.
+# This is opt-in while the parallel path is evaluated on full model compiles.
+async_dxp_compile: bool = os.getenv("SPYRE_ASYNC_DXP_COMPILE", "0").lower() in (
+    "1",
+    "true",
+    "yes",
+)
+
 allow_all_ops_in_lx_planning: bool = False
 
 dxp_lx_frac_avail: float = float(os.environ.get("DXP_LX_FRAC_AVAIL", "0.2"))
