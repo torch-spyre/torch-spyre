@@ -26,6 +26,7 @@ import torch
 
 from torch._inductor import config as t_inductor_config
 from torch._inductor.graph import GraphLowering
+from torch._inductor.ir import MutationLayoutSHOULDREMOVE
 
 from torch_spyre._inductor.passes import CustomPreSchedulingPasses
 from torch_spyre._inductor import passes
@@ -69,6 +70,30 @@ def test_nested_spyre_context_runs_pre_scheduling_once():
         GraphLowering._update_scheduler(graph)
 
     assert calls == [graph]
+
+
+def test_cooptimizing_allocator_rejects_relayout_results_without_asserts():
+    """Unsupported paired plans remain fail-closed under ``python -O``."""
+
+    import torch_spyre._inductor.cost_model as cost_model_module
+    import torch_spyre._inductor.scratchpad.allocator as allocator_module
+
+    solver = SimpleNamespace(
+        buffers=[],
+        plan_layout_and_core_divisions=lambda _cost: [
+            SimpleNamespace(lx_relayout_plans=[object()])
+        ],
+    )
+    graph = SimpleNamespace(operations=[])
+    with (
+        patch.object(allocator_module, "CoreDivisionLayoutSolver", object),
+        patch.object(allocator_module, "mem_usage_by_buf", return_value={}),
+        patch.object(cost_model_module, "predict_by_bundle", return_value=0),
+        unittest.TestCase().assertRaisesRegex(
+            AssertionError, "CoOptimizingAllocator does not support LX relayout"
+        ),
+    ):
+        allocator_module.CoOptimizingAllocator._solve(SimpleNamespace(), solver, graph)
 
 
 class CustomPreSchedulingPassesWithOurPasses(CustomPreSchedulingPasses):
@@ -159,6 +184,8 @@ class BaseTestScratchpadUsage(unittest.TestCase):
                 buf_name = op.name
                 buffer = graph.get_buffer(buf_name)
                 layout = buffer.get_layout()
+                if isinstance(layout, MutationLayoutSHOULDREMOVE):
+                    layout = layout.real_layout()
                 device_layout = layout.device_layout
                 allocation = getattr(layout, "allocation", {})
                 mem_usages[buf_name] = {
@@ -622,10 +649,10 @@ class TestCloneAtGraphBoundaries(
         """A graph input read by a reduction is LX-cloned, with the clone's
         per-core split re-keyed correctly.
 
-        push_allocation_with_clone re-keys the consumer's op_it_space_splits
-        through the buffer's strides before assigning them to the clone. A reduction consumer's split is keyed to its
-        reduced-shape output; copied verbatim it would split the wrong axis of
-        the full-shape clone (wrong values / SDSC abort at multi-core). The
+        push_allocation_with_clone projects the accepted physical view through
+        the clone's own coordinates and commits that complete division. Copying
+        a reduction consumer's logical split verbatim could split the wrong axis
+        of the full-shape clone (wrong values / SDSC abort at multi-core). The
         numerical failure only manifests when work is split across cores; here
         (sencores=1) we assert the clone is inserted and the result is correct.
         Multi-core numerical coverage lives in

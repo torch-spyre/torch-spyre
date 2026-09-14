@@ -14,7 +14,10 @@
 
 # This file contains inductor passes that are only needed as temp fixes
 
+from math import prod
+
 import torch
+from torch.fx.experimental.symbolic_shapes import statically_known_true, sym_eq
 from torch._inductor.pattern_matcher import (
     Arg,
     CallFunction,
@@ -37,6 +40,22 @@ _RESHAPE_OPS = (
 
 mm_to_bmm_pass = PatternMatcherPass(pass_name="unflatten_mm_to_bmm")
 bmm_unflatten_pass = PatternMatcherPass(pass_name="unflatten_bmm_batch_dims")
+
+
+def _node_shape(node: torch.fx.Node) -> tuple | None:
+    """Return an FX node's fake/meta shape, if one is available."""
+    if not isinstance(node, torch.fx.Node):
+        return None
+    val = node.meta.get("val")
+    shape = getattr(val, "shape", None)
+    return tuple(shape) if shape is not None else None
+
+
+def _shapes_statically_equal(lhs, rhs) -> bool:
+    """Whether two shape sequences are provably equal without adding guards."""
+    return len(lhs) == len(rhs) and statically_known_true(
+        sym_eq(tuple(lhs), tuple(rhs))
+    )
 
 
 @register_graph_pattern(
@@ -215,13 +234,58 @@ def _unflatten_bmm_batch_dims(
     if not (output_view.op == "call_function" and output_view.target in _RESHAPE_OPS):
         return
 
-    output_shape = output_view.args[1]
-    if len(output_shape) <= 3:
-        return
-
     # Get the original (pre-reshape) tensors
     lhs_orig = lhs_reshape.args[0]  # the expand or original tensor
     rhs_orig = rhs_reshape.args[0]
+
+    # Prove the entire reshape sandwich before removing it.  Equal element
+    # counts are not enough: a reshape can collapse different logical batch
+    # prefixes, interchange M/K/N, or restore the result in a different order.
+    # Reusing those operands directly would then make lower_bmm index one
+    # producer with another operand's matrix domain.
+    lhs_orig_shape = _node_shape(lhs_orig)
+    rhs_orig_shape = _node_shape(rhs_orig)
+    lhs_flat_shape = _node_shape(lhs_reshape)
+    rhs_flat_shape = _node_shape(rhs_reshape)
+    bmm_shape = _node_shape(node)
+    output_shape = _node_shape(output_view)
+    if (
+        lhs_orig_shape is None
+        or rhs_orig_shape is None
+        or lhs_flat_shape is None
+        or rhs_flat_shape is None
+        or bmm_shape is None
+        or output_shape is None
+    ):
+        return
+
+    # lower_bmm currently has a native contract for exactly two batch axes.
+    # Leave other ranks as the original, semantically valid flattened bmm.
+    if len(lhs_orig_shape) != 4 or len(rhs_orig_shape) != 4:
+        return
+
+    lhs_batch = lhs_orig_shape[:-2]
+    rhs_batch = rhs_orig_shape[:-2]
+    lhs_rows, lhs_contraction = lhs_orig_shape[-2:]
+    rhs_contraction, rhs_columns = rhs_orig_shape[-2:]
+    flat_batch = prod(lhs_batch)
+
+    if not _shapes_statically_equal(lhs_batch, rhs_batch):
+        return
+    if not statically_known_true(sym_eq(lhs_contraction, rhs_contraction)):
+        return
+    if not _shapes_statically_equal(
+        lhs_flat_shape, (flat_batch, lhs_rows, lhs_contraction)
+    ):
+        return
+    if not _shapes_statically_equal(
+        rhs_flat_shape, (flat_batch, rhs_contraction, rhs_columns)
+    ):
+        return
+    if not _shapes_statically_equal(bmm_shape, (flat_batch, lhs_rows, rhs_columns)):
+        return
+    if not _shapes_statically_equal(output_shape, (*lhs_batch, lhs_rows, rhs_columns)):
+        return
 
     # Replace the 3D bmm with a spyre.batched_matmul that accepts N-D inputs.
     # Using aten.bmm.default with >3D args would crash FakeTensorUpdater.

@@ -116,7 +116,10 @@ jobs:
           # prior attempt of this run (a runner-infra retry, not just a user re-run
           # click) leaking into the list would download and parse every one of them
           # twice, doubling every row this run produces in hw_failure_diagnostics.
+          # --method GET is required: gh api infers POST as soon as any -f/-F field is
+          # given, and this endpoint has no POST route, so filter=latest alone 404s.
           gh api \
+            --method GET \
             "/repos/${{ github.repository }}/actions/runs/${TRIGGERING_RUN_ID}/jobs" \
             --paginate \
             -f filter=latest \

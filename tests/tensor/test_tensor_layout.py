@@ -26,6 +26,7 @@ from torch.testing._internal.common_utils import (
     run_tests,
 )
 from torch.spyre import SpyreTensorLayout, get_device_dtype
+from torch_spyre._C import DataFormats, ElementArrangement, get_device_size_in_bytes
 
 
 @instantiate_parametrized_tests
@@ -35,6 +36,59 @@ class TestSpyreTensorLayout(TestCase):
 
     def test_initializes(self):
         self.assertEqual(torch._C._get_privateuse1_backend_name(), "spyre")
+
+    @parametrize(
+        "df,eps,bits",
+        [
+            (DataFormats.SEN169_FP16, 64, 16),
+            (DataFormats.IEEE_FP32, 32, 32),
+            (DataFormats.SEN143_FP8, 128, 8),
+            (DataFormats.SENINT4, 256, 4),
+            (DataFormats.SENINT2, 512, 2),
+            (DataFormats.IEEE_INT32, 32, 32),
+            (DataFormats.IEEE_INT64, 16, 64),
+            (DataFormats.BOOL, 128, 8),
+            (DataFormats.BFLOAT16, 64, 16),
+        ],
+    )
+    def test_device_storage_size(self, df, eps, bits):
+        self.assertEqual(df.elems_per_stick(), eps)
+        for ea in ElementArrangement.__members__.values():
+            # Both normal and shortened/sparse trailing extents occupy full
+            # sticks. Empty outer geometry remains empty after FP8 rescaling.
+            for outer, inner in [(3, eps), (3, 1), (0, eps)]:
+                stl = SpyreTensorLayout([outer, inner], [eps, 1], df, ea)
+                expected = outer * eps * bits // 8
+                self.assertEqual(get_device_size_in_bytes(stl), expected)
+                self.assertEqual(
+                    get_device_size_in_bytes(stl.device_size, df), expected
+                )
+
+    @parametrize(
+        "df",
+        [
+            DataFormats.INVALID,
+            DataFormats.SEN153_FP9,
+            DataFormats.SENINT24,
+            DataFormats.SEN18F_FP24,
+        ],
+    )
+    def test_unmapped_compute_format_has_no_storage_size(self, df):
+        with self.assertRaisesRegex(RuntimeError, "No device stick geometry"):
+            get_device_size_in_bytes([1, 64], df)
+
+    @parametrize(
+        "df,dtype",
+        [(DataFormats.BFLOAT16, torch.float32), (DataFormats.IEEE_INT64, torch.int32)],
+    )
+    def test_explicit_transfer_storage_roundtrip(self, df, dtype):
+        # Explicit transfer encodings differ from default compute storage.
+        x = torch.arange(64, dtype=dtype)
+        eps = df.elems_per_stick()
+        stl = SpyreTensorLayout([64 // eps, eps], [eps, 1], df)
+        y = x.to("spyre", device_layout=stl)
+        self.assertEqual(y.device_tensor_layout().device_dtype, df)
+        self.assertEqual(y.cpu(), x)
 
     def test_default_layout(self):
         stl = SpyreTensorLayout([], torch.float16)
@@ -547,6 +601,79 @@ class TestSpyreTensorLayout(TestCase):
             count_after_custom,
             "Expected cache hit when SpyreTensorLayout is the same as previous call",
         )
+
+    def test_flattened_attention_view_feeds_linear_across_compiles(self):
+        """A BLHD-backed BHLD result must be safe for a later projection.
+
+        Attention kernels naturally produce ``[B,H,L,D]`` with token-major
+        backing storage. A separately compiled transpose+reshape therefore
+        returns a logically contiguous ``[B,L,H*D]`` view whose device layout
+        still has H and D factorized. The next compiled linear must canonicalize
+        that input instead of presenting two contraction dimensions to the
+        backend.
+        """
+        B, L, H, D = 1, 8, 32, 128
+        hidden = H * D
+        torch.manual_seed(0xAFFE)
+        x = torch.randn(B, L, hidden, dtype=torch.float16)
+        weight = torch.randn(hidden, hidden, dtype=torch.float16) / hidden**0.5
+        residual = torch.randn(B, L, hidden, dtype=torch.float16)
+        expected = torch.nn.functional.linear(x, weight) + residual
+
+        def project(x, weight, residual):
+            return torch.nn.functional.linear(x, weight) + residual
+
+        factorized_layout = SpyreTensorLayout(
+            [L, D // 64, H, 64],
+            [hidden, 64, D, 1],
+            get_device_dtype(torch.float16),
+        )
+        flattened = x.to(device_layout=factorized_layout)
+        self.assertEqual(flattened.device_tensor_layout(), factorized_layout)
+        actual = torch.compile(project, dynamic=False)(
+            flattened, weight.to("spyre"), residual.to("spyre")
+        ).cpu()
+        torch.testing.assert_close(actual, expected, atol=0.02, rtol=0.02)
+
+    @parametrize("H,N_KV,LQ", [(4, 2, 8), (32, 8, 1)])
+    def test_sdpa_output_feeds_linear_in_same_graph(self, H, N_KV, LQ):
+        """A fused SDPA -> BL(H*D) view -> linear gets one contraction dim."""
+        B, LK, D = 1, 64, 128
+        hidden = H * D
+        q = torch.randn(B, H, LQ, D, dtype=torch.float16)
+        k = torch.randn(B, N_KV, LK, D, dtype=torch.float16)
+        v = torch.randn(B, N_KV, LK, D, dtype=torch.float16)
+        weight = torch.randn(hidden, hidden, dtype=torch.float16) / hidden**0.5
+        query_positions = torch.arange(LK - LQ, LK).view(1, 1, LQ, 1)
+        key_positions = torch.arange(LK).view(1, 1, 1, LK)
+        mask = torch.where(
+            key_positions <= query_positions,
+            torch.tensor(0.0, dtype=torch.float16),
+            torch.tensor(torch.finfo(torch.float16).min / 2, dtype=torch.float16),
+        )
+
+        def attention_project(q, k, v, mask, weight):
+            out = torch.nn.functional.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                attn_mask=mask,
+                dropout_p=0.0,
+                scale=D**-0.5,
+                enable_gqa=True,
+            )
+            out = out.transpose(1, 2).reshape(B, LQ, hidden)
+            return torch.nn.functional.linear(out, weight)
+
+        expected = attention_project(q, k, v, mask, weight)
+        actual = torch.compile(attention_project, dynamic=False)(
+            q.to("spyre"),
+            k.to("spyre"),
+            v.to("spyre"),
+            mask.to("spyre"),
+            weight.to("spyre"),
+        ).cpu()
+        torch.testing.assert_close(actual, expected, atol=0.1, rtol=0.1)
 
 
 if __name__ == "__main__":

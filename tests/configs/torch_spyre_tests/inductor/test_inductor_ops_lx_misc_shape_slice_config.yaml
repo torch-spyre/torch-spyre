@@ -25,8 +25,15 @@ test_suite_config:
             - LxPlanning.*::test_slice_stick_reduce_dim2_sum_3d128_01_lx_planning_reduction
             - LxPlanning.*::test_slice_stick_reduce_dim2_sum_3d64_01_lx_planning_reduction
           mode: xfail
+        # The storage_offset placeholder tests run LX planning over a
+        # restickified stick-offset input, which the non-LX shard does not
+        # exercise.  Only the pointwise wrap is listed: these tests call the
+        # module-level _compile_and_run rather than self.compare_with_cpu,
+        # which is the sole caller of wrap(), so no second op is ever
+        # attached and the reduction copy would re-run an identical body.
         - names:
             - LxPlanning.*::test_slice.*_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_storage_offset_placeholder.*_lx_planning_pointwise
           mode: mandatory_success
           tags:
             - ops__inductor_misc_shape

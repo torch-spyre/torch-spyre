@@ -24,6 +24,7 @@
 #include <vector>
 
 #include "spyre_allocator.h"
+#include "spyre_composite_address.h"
 #include "spyre_stream.h"
 #include "spyrecode-host-functions/processSpyreCodeArtifacts.h"
 
@@ -66,9 +67,7 @@ void JobPlanStepD2H::construct(LaunchContext& ctx,
                 " but only ", ctx.inputs_outputs.size(),
                 " launch args were provided");
     const auto& tensor = ctx.inputs_outputs.at(segment_id);
-    const auto& tensor_address =
-        static_cast<SharedOwnerCtx*>(tensor.storage().data_ptr().get_context())
-            ->composite_addr;
+    const auto& tensor_address = *get_composite_address(tensor);
     TORCH_CHECK(tensor_address.chunks().size() == 1,
                 "Tensor address must have 1 chunk");
     const auto& base_chunk = tensor_address.chunks()[0];
@@ -113,11 +112,7 @@ void JobPlanStepCompute::construct(LaunchContext& ctx,
   std::vector<const flex::CompositeAddress*> tensor_allocs;
   if (bind_io_addresses_) {
     for (auto& tensor : ctx.inputs_outputs) {
-      flex::CompositeAddress* address =
-          &(static_cast<SharedOwnerCtx*>(
-                tensor.storage().data_ptr().get_context())
-                ->composite_addr);
-      tensor_allocs.push_back(address);
+      tensor_allocs.push_back(get_composite_address(tensor));
     }
   }
   auto* params = flex::createComputeParams(
@@ -151,9 +146,7 @@ std::vector<int64_t> JobPlanStepHostCompute::resolveSymbolicArgs(
     switch (arg.kind) {
       case SymbolicArgKind::kAddress:
         resolved[i] = static_cast<int64_t>(allocator.compositeAddressToDmva(
-            static_cast<SharedOwnerCtx*>(
-                tensors[arg.tensor_id].storage().data_ptr().get_context())
-                ->composite_addr));
+            *get_composite_address(tensors[arg.tensor_id])));
         break;
       case SymbolicArgKind::kDimension:
         TORCH_CHECK(false,

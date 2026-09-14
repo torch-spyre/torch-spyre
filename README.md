@@ -77,6 +77,7 @@ This project contains 2 main folders for development:
 
 ## Profiling
 
-Profiling support is under active development. See `torch_spyre/profiler/` — requires the kineto-spyre wheel (version matching the PyTorch install).
-
-The kineto-spyre wheel install is required currently for `profiler/__init__.py` and `profiler/_spyre_activity.py`.
+Profiling support is under active development. See `torch_spyre/profiler/`.
+AIUPTI activity-tracing support is built directly into `torch_spyre`'s
+native extension (gated by the `USE_SPYRE_PROFILER` build flag, on by
+default); no separate wheel install is required.

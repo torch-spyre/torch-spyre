@@ -296,6 +296,7 @@ These components are defined in `DEFAULT_LOG_LEVELS` in
 | `spyre.inductor` | All Inductor compiler passes and codegen | `torch_spyre/_inductor/` |
 | `spyre.inductor.lowering` | Op lowering (ATen → Spyre IR) | `_inductor/lowering.py` |
 | `spyre.inductor.codegen` | Code generation (parent) | `_inductor/codegen/bundle.py` |
+| `spyre.inductor.sdsc` | SuperDSC bundle generation | `_inductor/codegen/bundle.py` |
 | `spyre.inductor.stickify` | Tensor stickification passes | `_inductor/insert_restickify.py` |
 | `spyre.inductor.passes` | General compiler passes | `_inductor/passes.py` |
 | `spyre.runtime` | C++ runtime (allocator, streams, distributed) | `torch_spyre/csrc/` |

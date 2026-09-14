@@ -586,7 +586,7 @@ def _check_stick_all_same(op_spec: OpSpec, stage: str) -> None:
             continue
         syms = _arg_stick_syms(arg)
         if syms:
-            stick_vars.add(next(iter(syms)))
+            stick_vars.add(min(syms, key=str))
 
     if len(stick_vars) > 1:
         coords_str = ", ".join(
@@ -608,7 +608,7 @@ def _check_stick_restickify(op_spec: OpSpec, stage: str) -> None:
     for arg in op_spec.args:
         syms = _arg_stick_syms(arg)
         if syms:
-            stick_vars.add(next(iter(syms)))
+            stick_vars.add(min(syms, key=str))
 
     if len(stick_vars) < 2:
         coords_str = ", ".join(
@@ -761,7 +761,7 @@ def _check_stick_matmul(op_spec: OpSpec, stage: str) -> None:
             on_y_stick = gen_from_b & _arg_stick_syms(y_arg)
             if len(on_y_stick) == 1:
                 gen_from_b = on_y_stick
-        generated_sym = next(iter(gen_from_b))
+        generated_sym = min(gen_from_b, key=str)
     else:
         # No generated_sym found — N=1 collapsed or symmetric. Vacuously valid.
         return
@@ -770,7 +770,7 @@ def _check_stick_matmul(op_spec: OpSpec, stage: str) -> None:
     # If reduction sym is missing (K=1 or constant-folded), skip.
     if not reduction_syms:
         return
-    reduction_sym = next(iter(reduction_syms))
+    reduction_sym = min(reduction_syms, key=str)
 
     out_stick: set[sympy.Symbol] = set()
     for arg in outputs:
