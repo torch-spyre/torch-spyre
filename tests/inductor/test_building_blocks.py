@@ -578,7 +578,9 @@ class TestBuildingBlocks(unittest.TestCase):
         self.assertEqual(num_head_tiles(16), 4)
         self.assertEqual(num_head_tiles(14), 7)
 
-    @unittest.skip("Runs for long time, possibly hang.  Keeping disabled")
+    @unittest.skip(
+        "Test skipped solely because of runtime.  It passes but takes over 10 minutes."
+    )
     @mock.patch("torch_spyre._inductor.decompositions._SDPA_MAX_SEQUENCE_TILE_SIZE", 64)
     def test_granite_gqa_prefill_grouped_sixteen_by_sixteen_tiling(self):
         """Sixteen KV loop groups preserve Granite's online-softmax carries."""

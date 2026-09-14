@@ -26,6 +26,7 @@ from torch.testing._internal.common_utils import (
     run_tests,
 )
 from torch.spyre import SpyreTensorLayout, get_device_dtype
+from torch_spyre._C import DataFormats, ElementArrangement, get_device_size_in_bytes
 
 
 @instantiate_parametrized_tests
@@ -35,6 +36,59 @@ class TestSpyreTensorLayout(TestCase):
 
     def test_initializes(self):
         self.assertEqual(torch._C._get_privateuse1_backend_name(), "spyre")
+
+    @parametrize(
+        "df,eps,bits",
+        [
+            (DataFormats.SEN169_FP16, 64, 16),
+            (DataFormats.IEEE_FP32, 32, 32),
+            (DataFormats.SEN143_FP8, 128, 8),
+            (DataFormats.SENINT4, 256, 4),
+            (DataFormats.SENINT2, 512, 2),
+            (DataFormats.IEEE_INT32, 32, 32),
+            (DataFormats.IEEE_INT64, 16, 64),
+            (DataFormats.BOOL, 128, 8),
+            (DataFormats.BFLOAT16, 64, 16),
+        ],
+    )
+    def test_device_storage_size(self, df, eps, bits):
+        self.assertEqual(df.elems_per_stick(), eps)
+        for ea in ElementArrangement.__members__.values():
+            # Both normal and shortened/sparse trailing extents occupy full
+            # sticks. Empty outer geometry remains empty after FP8 rescaling.
+            for outer, inner in [(3, eps), (3, 1), (0, eps)]:
+                stl = SpyreTensorLayout([outer, inner], [eps, 1], df, ea)
+                expected = outer * eps * bits // 8
+                self.assertEqual(get_device_size_in_bytes(stl), expected)
+                self.assertEqual(
+                    get_device_size_in_bytes(stl.device_size, df), expected
+                )
+
+    @parametrize(
+        "df",
+        [
+            DataFormats.INVALID,
+            DataFormats.SEN153_FP9,
+            DataFormats.SENINT24,
+            DataFormats.SEN18F_FP24,
+        ],
+    )
+    def test_unmapped_compute_format_has_no_storage_size(self, df):
+        with self.assertRaisesRegex(RuntimeError, "No device stick geometry"):
+            get_device_size_in_bytes([1, 64], df)
+
+    @parametrize(
+        "df,dtype",
+        [(DataFormats.BFLOAT16, torch.float32), (DataFormats.IEEE_INT64, torch.int32)],
+    )
+    def test_explicit_transfer_storage_roundtrip(self, df, dtype):
+        # Explicit transfer encodings differ from default compute storage.
+        x = torch.arange(64, dtype=dtype)
+        eps = df.elems_per_stick()
+        stl = SpyreTensorLayout([64 // eps, eps], [eps, 1], df)
+        y = x.to("spyre", device_layout=stl)
+        self.assertEqual(y.device_tensor_layout().device_dtype, df)
+        self.assertEqual(y.cpu(), x)
 
     def test_default_layout(self):
         stl = SpyreTensorLayout([], torch.float16)

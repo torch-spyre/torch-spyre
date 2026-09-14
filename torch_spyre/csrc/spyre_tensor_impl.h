@@ -150,7 +150,7 @@ class SpyreTensorLayout {
 
   std::string toString() const;
 
-  int64_t elems_per_stick() {
+  int64_t elems_per_stick() const {
     return spyre::elems_per_stick(this->device_dtype);
   }
 
@@ -203,7 +203,9 @@ class SpyreTensorImpl : public at::TensorImpl {
       const c10::intrusive_ptr<at::TensorImpl>& impl) override;
 };
 
-uint64_t get_device_size_in_bytes(SpyreTensorLayout stl);
+uint64_t get_device_size_in_bytes(const SpyreTensorLayout& stl);
+uint64_t get_device_size_in_bytes(const std::vector<int64_t>& device_size,
+                                  const DataFormats& device_dtype);
 SpyreTensorLayout get_spyre_tensor_layout(const at::Tensor& tensor);
 void set_spyre_tensor_layout(const at::Tensor& tensor,
                              const SpyreTensorLayout& stl);

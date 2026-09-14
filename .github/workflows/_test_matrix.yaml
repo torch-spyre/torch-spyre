@@ -500,14 +500,17 @@ jobs:
             rm -rf /tmp/etc/ibm/spyre/topo.json
             source /etc/profile.d/ibm-aiu-setup.sh || exit 1
 
+      # overwrite: true avoids a silent 409 on re-upload when this leg is manually re-run.
       - name: Upload JUnit XML report
         if: always()
+        continue-on-error: true  # transient artifact-service 403s must not fail a job whose tests passed
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: ${{ env.REPORT_NAME }}
           path: ${{ env.REPORT_PATH }}
           if-no-files-found: warn
           retention-days: 10
+          overwrite: true
 
       # Records this leg's suite as a uniquely-named artifact so collect_failed_suites can rebuild a retry matrix without needing this job's own (continue-on-error-muddied) conclusion.
       - name: Save suite descriptor for pod-level retry
@@ -855,14 +858,17 @@ jobs:
             rm -rf /tmp/etc/ibm/spyre/topo.json
             source /etc/profile.d/ibm-aiu-setup.sh || exit 1
 
+      # overwrite: true -- see the identical note on the `test` job's upload step above.
       - name: Upload JUnit XML report
         if: always()
+        continue-on-error: true  # transient artifact-service 403s must not fail a job whose tests passed
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: ${{ env.REPORT_NAME }}
           path: ${{ env.REPORT_PATH }}
           if-no-files-found: warn
           retention-days: 10
+          overwrite: true
 
       # See the `test` job's identical step: lets collect_failed_suites rebuild a retry matrix without relying on this job's (continue-on-error-muddied) own conclusion.
       - name: Save suite descriptor for pod-level retry
@@ -1075,6 +1081,7 @@ jobs:
       # overwrite: true replaces the failed first attempt's report (same REPORT_NAME) so downstream consumers see only the corrected result, not a name conflict.
       - name: Upload JUnit XML report
         if: always()
+        continue-on-error: true  # transient artifact-service 403s must not fail a job whose tests passed
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: ${{ env.REPORT_NAME }}
@@ -1181,6 +1188,7 @@ jobs:
 
       - name: Upload JUnit XML report
         if: always()
+        continue-on-error: true  # transient artifact-service 403s must not fail a job whose tests passed
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: ${{ env.REPORT_NAME }}
@@ -1240,29 +1248,45 @@ jobs:
           # un-paginated query would miss XML reports past the first page and
           # under-report the empty-suite check. Emit a per-object JSON stream
           # (gh rejects --slurp with --jq) and slurp it into one array.
+          # created_at lets the python step below dedupe re-run duplicates by name, keeping the newest.
           ARTIFACTS=$(gh api --paginate \
             "/repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/artifacts?per_page=100" \
-            --jq '.artifacts[] | select(.name | endswith(".xml")) | {id: .id, name: .name}' \
+            --jq '.artifacts[] | select(.name | endswith(".xml")) | {id: .id, name: .name, created_at: .created_at}' \
             | python3 -c "import json,sys; print(json.dumps([json.loads(l) for l in sys.stdin if l.strip()]))")
 
           ARTIFACTS="$ARTIFACTS" python3 <<'PYEOF'
           import json, os, subprocess
           artifacts = json.loads(os.environ['ARTIFACTS'])
           repo = "${{ github.repository }}"
+
+          # Keep only the newest artifact per name (see the created_at note above).
+          latest = {}
           for a in artifacts:
+              existing = latest.get(a["name"])
+              if existing is None or a["created_at"] > existing["created_at"]:
+                  latest[a["name"]] = a
+
+          downloaded = 0
+          for a in latest.values():
               zip_path = f"xml_artifacts/{a['name']}.zip"
-              result = subprocess.run(
-                  ["gh", "api", f"/repos/{repo}/actions/artifacts/{a['id']}/zip"],
-                  capture_output=True, check=True,
-                  env={**os.environ},
-              )
-              with open(zip_path, "wb") as f:
-                  f.write(result.stdout)
-              subprocess.run(
-                  ["unzip", "-q", "-o", zip_path, "-d", "xml_artifacts/"],
-                  check=True,
-              )
-          print(f"Downloaded {len(artifacts)} artifact(s).")
+              try:
+                  result = subprocess.run(
+                      ["gh", "api", f"/repos/{repo}/actions/artifacts/{a['id']}/zip"],
+                      capture_output=True, check=True,
+                      env={**os.environ},
+                  )
+                  with open(zip_path, "wb") as f:
+                      f.write(result.stdout)
+                  subprocess.run(
+                      ["unzip", "-q", "-o", zip_path, "-d", "xml_artifacts/"],
+                      check=True,
+                  )
+                  downloaded += 1
+              except subprocess.CalledProcessError as e:
+                  # Skip a single bad artifact instead of aborting the whole job.
+                  stderr = e.stderr.decode(errors="replace") if e.stderr else str(e)
+                  print(f"::warning::Could not download artifact {a['name']} (id {a['id']}): {stderr.strip()}")
+          print(f"Downloaded {downloaded} of {len(latest)} artifact(s).")
           PYEOF
 
       - name: Check for empty suites

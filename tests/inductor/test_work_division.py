@@ -14,7 +14,6 @@
 
 import math
 import unittest
-from collections import namedtuple
 from contextlib import ExitStack
 from typing import NamedTuple
 from unittest.mock import MagicMock, patch
@@ -39,13 +38,15 @@ from torch_spyre._inductor.constants import (
     CONV2D_FWD_OP,
     DEPTHWISE_CONV2D_OP,
 )
-from torch_spyre._inductor.pass_utils import SchedNodeArg
+from torch_spyre._inductor.pass_utils import PerCoreView, SchedNodeArg
 from torch_spyre._inductor.scratchpad import allocator as allocator_module
 from torch_spyre._inductor.scratchpad.allocator import (
     CoOptimizingAllocator,
     CoreDivision,
 )
-from torch_spyre._inductor.scratchpad.plan_solver import CoreDivisionBuffer
+from torch_spyre._inductor.scratchpad.plan_solver import (
+    CoreDivisionBuffer,
+)
 from torch_spyre._inductor.work_division import (
     TensorDep,
     _cost_model_matmul_planner,
@@ -1379,7 +1380,18 @@ class TestSpanReductionConstraints(unittest.TestCase):
         self.assertEqual(must_split.call_args.args[-1], {r0, r1})
 
 
-_FakeView = namedtuple("_FakeView", "work_slice_dims")
+def _physical_view(*splits):
+    """A real :class:`PerCoreView` whose cores own contiguous slices in
+    row-major order of ``splits`` (device-dim index, split factor)."""
+
+    core_id = sympy.Symbol("core_id")
+    num_cores = math.prod(split for _, split in splits)
+    slots = []
+    stride = num_cores
+    for dim, split in splits:
+        stride //= split
+        slots.append((dim, sympy.Mod(sympy.floor(core_id / stride), split)))
+    return PerCoreView(tuple(splits), tuple(slots), num_cores=num_cores)
 
 
 class TestResidencyEdgeMatching(unittest.TestCase):
@@ -1389,9 +1401,9 @@ class TestResidencyEdgeMatching(unittest.TestCase):
 
     def setUp(self):
         x, y = _isym("x"), _isym("y")
-        self.view_a = _FakeView(((0, 4),))
-        self.view_b = _FakeView(((0, 2),))
-        self.view_wide = _FakeView(((0, 2), (1, 2)))
+        self.view_a = _physical_view((0, 4))
+        self.view_b = _physical_view((0, 2))
+        self.view_wide = _physical_view((0, 2), (1, 2))
 
         def _div(splits, reduction=None):
             return CoreDivision(

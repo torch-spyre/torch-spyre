@@ -179,9 +179,10 @@ For the full hardware overview see
   that hard-codes "64 fp16 elements" is fp16-specific.
 - **The cost-model planner does not change correctness.** Pass 2's
   matmul split is correct on its own. The runtime benefit of any
-  K-split comes from a paired codegen layer in `codegen/superdsc.py`
-  that permutes physical core IDs so K-collaborators occupy adjacent
-  ring positions.
+  K-split comes from a paired core-ID permutation
+  (`core_to_slice_mapping` in `core_mapping.py`, applied during
+  pre-scheduling in `pass_utils.py`) that permutes physical core IDs so
+  K-collaborators occupy adjacent ring positions.
 :::
 
 ## Pass 1 — Span Reduction (`span_reduction`)
@@ -502,7 +503,8 @@ Final split: `{M: 16, N: 1, K: 2}`.
 ### Core grid
 
 The 32 cores form a 16 × 2 grid: 16 along M, paired up across the K
-split. The codegen-side permutation in `codegen/superdsc.py` (see
+split. The core-ID permutation (`core_to_slice_mapping` in
+`core_mapping.py`, applied in `pass_utils.py`; see
 [Codegen pairing for K-splits](#codegen-pairing-for-k-splits))
 arranges the K-collaborators on adjacent ring positions, so
 `(c0, c1)` accumulate M-slice 0, `(c2, c3)` accumulate M-slice 1,
@@ -531,12 +533,13 @@ commits the argmin. Pass 3 skips the op.
 
 ### Codegen pairing for K-splits
 
-When any planner selects a K-split, the SDSC emitter permutes physical
+When any planner selects a K-split, the compiler permutes physical
 core IDs so the cores collaborating on the K reduction occupy adjacent
 ring positions. The permutation is implemented in
 `core_to_slice_mapping` in `core_mapping.py`, invoked from
-`codegen/superdsc.py` with a `contiguous_dim` argument, and gated by the
-`core_id_k_fast_emission` config flag. It drops PSUM accumulation hops from
+`pass_utils.py` with a `contiguous_dim` argument, and gated by the
+`core_id_k_fast_emission` config flag (checked in `pass_utils.py` and
+`spyre_kernel.py`). It drops PSUM accumulation hops from
 `m × n` to 1, which is what makes cross-core K reductions cheap at
 runtime. The flag `SPYRE_CORE_ID_K_FAST_EMISSION` (default on)
 controls this codegen-side permutation. The name is legacy from when
