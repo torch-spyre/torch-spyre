@@ -31,6 +31,7 @@ import pytest
 from sympy import sympify
 
 import torch
+from torch._inductor.codecache import CodeCacheFuture
 
 from torch_spyre._C import DataFormats, ElementArrangement
 from torch_spyre._inductor import config as spyre_config
@@ -481,6 +482,36 @@ def test_run_recorder_records_the_first_launch_only():
     assert len(rec.args) == 3  # not 6
     assert len(inner.launches) == 2  # both still reached the real runner
     assert proxy.code_dir == inner.code_dir  # unknown attributes forward
+
+
+def test_capture_preserves_compile_future_until_runner_resolution():
+    class _FakeCompileFuture(CodeCacheFuture):
+        def __init__(self, runner):
+            self.runner = runner
+            self.timeout = None
+
+        def result(self, timeout=None):
+            self.timeout = timeout
+            return self.runner
+
+    inner = _FakeRunner()
+    future = _FakeCompileFuture(inner)
+    compiler = SpyreAsyncCompile()
+    with patch.object(SpyreAsyncCompile, "sdsc", return_value=future):
+        with capture.capture_kernels() as records:
+            scope = {"kernel": compiler.sdsc("sdsc_stub_0", [_add_op()])}
+
+    assert isinstance(scope["kernel"], CodeCacheFuture)
+    with torch._inductor.config.patch(
+        {"compile_threads": 2, "compile_worker_wait_timeout": 17}
+    ):
+        compiler.wait(scope)
+
+    assert future.timeout == 17
+    recorder = scope["kernel"]
+    assert isinstance(recorder, capture._RunRecorder)
+    assert recorder._inner is inner
+    assert recorder._rec is records[0]
 
 
 def _stub_sdsc_program(tmp_path, body):
