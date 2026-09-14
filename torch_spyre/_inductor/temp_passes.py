@@ -355,8 +355,9 @@ def guard_exp_underflow(graph: torch.fx.Graph) -> None:
         exp's padding lanes with -1e4 to make them contraction-neutral.
 
     Rewritten as ``where(x <= threshold, clamp(exp(x), 0, 0), exp(x))``. Selecting
-    rather than subtracting is required: the device floor is large enough that
-    subtracting it changes ordinary values such as ``exp(-10)`` by about 50%.
+    rather than subtracting is required: the device floor is not far below the
+    smallest results the device still returns, so subtracting it erodes genuine
+    subnormal values instead of only the ones that should have underflowed.
 
     A literal zero arm does not lower in attention: its full-extent constant carries
     a layout that the solver cannot reconcile with the softmax numerator's matmul
@@ -374,6 +375,9 @@ def guard_exp_underflow(graph: torch.fx.Graph) -> None:
     path is fp16, so bfloat16 and fp32 retain their existing behavior.
 
     The cost is a comparison, clamp, and select around the existing transcendental.
+
+    Tracked as #4517. Retire this pass once the device's exp underflows on its own;
+    the tests in tests/inductor/test_exp_underflow.py state the invariant it owes.
     """
     for node in list(graph.nodes):
         if node.op != "call_function" or node.target is not aten.exp.default:
