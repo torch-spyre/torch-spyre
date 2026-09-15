@@ -57,6 +57,11 @@ from .ir import (
 )
 from .logging_utils import get_inductor_logger
 
+from torch._prims_common import (
+    ELEMENTWISE_TYPE_PROMOTION_KIND,
+    elementwise_dtypes,
+)
+
 logger = get_inductor_logger("lowering")
 
 # A module-level lock + nesting counter to make the CM reentrant/thread-safe
@@ -1790,6 +1795,75 @@ def with_int64_fallback(fn, *args, convert_output=True):
         return to_dtype(output, torch.int64)
 
     return output
+
+
+@register_spyre_lowering(torch.ops.aten.where.self, type_promotion_kind=None)
+def lower_where(condition, self, other):
+    # where3 requires all operands to share the same stick size.
+    #
+    # VALUE DTYPE
+    # Derived from (self, other) using INT_TO_FLOAT promotion so fp16/fp32
+    # inputs stay at their native width and only integers are promoted to fp32.
+    # For integer inputs the result is cast back to the original dtype
+    # afterwards (INT_TO_FLOAT promotes the result dtype too, so result_dtype
+    # is computed separately via DEFAULT promotion to preserve int semantics).
+    #
+    # CONDITION
+    # The condition is cast to val_dtype so its physical stick size aligns with
+    # the value tensors before reaching where3. For bool conditions this is an
+    # IDENTITY cast when the bool's backing already matches val_dtype (e.g. a
+    # host fp16-backed bool cast to fp16, or a computed fp32-backed bool cast to
+    # fp32). A cross-width cast (e.g. bool32 → fp16) is a stick-reordering op
+    # (FP32TODL16) which produces a staggered EA on the condition. That stagger
+    # mismatches the STANDARD EA of the value tensors and propagate_layouts
+    # raises Unsupported via the mixed-EA case 3.3 in _multi_arg_pointwise_layouts.
+    #
+    # Behaviour per value dtype:
+    #   fp16/bf16:  no-op; condition must be fp16-backed to match stick size
+    #   fp32:       no-op; condition must be fp32-backed to match stick size
+    #   int32:      INT32TOFP32 (Spyre-native); cast back to int32 after
+    #   int64:      CPU fallback for int→fp32; cast back to int64 after
+
+    self_t = torch.empty(0, dtype=self.get_dtype())
+    other_t = torch.empty(0, dtype=other.get_dtype())
+
+    # result_dtype: what aten.where.self must return — DEFAULT promotion, which
+    # keeps integers as integers (e.g. int64 + int64 → int64).
+    result_dtype, _ = elementwise_dtypes(
+        self_t,
+        other_t,
+        type_promotion_kind=ELEMENTWISE_TYPE_PROMOTION_KIND.DEFAULT,
+    )
+
+    # val_dtype: the dtype we run the hardware op in — INT_TO_FLOAT promotes
+    # integers to fp32 since Spyre has no integer where3.
+    _, val_dtype = elementwise_dtypes(
+        self_t,
+        other_t,
+        type_promotion_kind=ELEMENTWISE_TYPE_PROMOTION_KIND.INT_TO_FLOAT,
+    )
+
+    converted_self = (
+        self if self.get_dtype() == val_dtype else to_dtype(self, val_dtype)
+    )
+    converted_other = (
+        other if other.get_dtype() == val_dtype else to_dtype(other, val_dtype)
+    )
+    converted_condition = (
+        condition
+        if condition.get_dtype() == val_dtype
+        else to_dtype(condition, val_dtype)
+    )
+
+    result = lowering.where(converted_condition, converted_self, converted_other)
+
+    # INT_TO_FLOAT promotes integers to float for the hardware op, but the
+    # caller expects the natural result dtype (e.g. int64 in, int64 out).
+    # Cast back if the working dtype diverged from the natural result dtype.
+    if result_dtype != val_dtype:
+        result = to_dtype(result, result_dtype)
+
+    return result
 
 
 @register_spyre_lowering(
