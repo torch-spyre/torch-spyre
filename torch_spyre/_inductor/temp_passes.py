@@ -14,7 +14,7 @@
 
 # This file contains inductor passes that are only needed as temp fixes
 
-from math import prod
+from math import log, prod
 
 import torch
 from torch.fx.experimental.symbolic_shapes import statically_known_true, sym_eq
@@ -316,6 +316,110 @@ def _unflatten_bmm_batch_dims(
                 and not expand_node.users
             ):
                 graph.erase_node(expand_node)
+
+
+# Marks an exp once its underflow guard has been installed, so a second run over the
+# same graph is a no-op rather than a nested guard.
+_EXP_UNDERFLOW_DONE = "_spyre_exp_underflow_done"
+
+
+def _exp_underflow_threshold(dtype: torch.dtype) -> float | None:
+    """Largest representable input whose ``exp()`` rounds to zero, else None.
+
+    ``exp(x)`` rounds to zero once it drops below half the smallest subnormal, which
+    is ``finfo.tiny * finfo.eps`` in every IEEE binary format. Round the mathematical
+    midpoint toward negative infinity so encoding the comparison scalar cannot move
+    it above the midpoint and incorrectly zero the smallest positive subnormal.
+    """
+    if not dtype.is_floating_point:
+        return None
+    finfo = torch.finfo(dtype)
+    exact_midpoint = log(finfo.tiny * finfo.eps / 2.0)
+    midpoint = torch.tensor(exact_midpoint, dtype=dtype)
+    if midpoint.item() < exact_midpoint:
+        return midpoint.item()
+    return torch.nextafter(midpoint, torch.tensor(float("-inf"), dtype=dtype)).item()
+
+
+def guard_exp_underflow(graph: torch.fx.Graph) -> None:
+    """Give ``aten.exp`` the underflow to zero that the device op does not perform.
+
+    The device's fp16 ``exp`` saturates at a nonzero floor instead of underflowing,
+    including for ``-inf``, where IEEE gives an exact zero. Two callers read that as
+    a zero and are quietly wrong without this:
+
+      * a masked softmax -- attention adds a large negative sentinel to the scores
+        of the positions it must ignore, and at a nonzero weight every ignored
+        position still contributes its value through ``matmul(probs, v)``;
+      * ``_POINTWISE_PADDING_MASK_VALUE`` (codegen/superdsc.py), which seeds an
+        exp's padding lanes with -1e4 to make them contraction-neutral.
+
+    Rewritten as ``where(x <= threshold, clamp(exp(x), 0, 0), exp(x))``. Selecting
+    rather than subtracting is required: the device floor is not far below the
+    smallest results the device still returns, so subtracting it erodes genuine
+    subnormal values instead of only the ones that should have underflowed.
+
+    A literal zero arm does not lower in attention: its full-extent constant carries
+    a layout that the solver cannot reconcile with the softmax numerator's matmul
+    layout. Deriving zero from the exp result with a unary clamp preserves that
+    layout, while the select makes only genuine fp16-underflow lanes exactly zero.
+
+    Rewriting at FX rather than in a lowering is also forced: ``split_multi_ops``
+    materializes each op of a multi-op pointwise body by finding the FX node that
+    produced it, so ops conjured inside an ``inner_fn`` have nothing to resolve
+    against and codegen fails with ``No FX node for buf<n>``.
+
+    fp16 only. Logical bfloat16 shares the same physical DL16 implementation, but
+    correcting it this way would zero representable bfloat16 results between the
+    DL16 floor and bfloat16's much lower underflow threshold. The affected attention
+    path is fp16, so bfloat16 and fp32 retain their existing behavior.
+
+    The cost is a comparison, clamp, and select around the existing transcendental.
+
+    Tracked as #4517. Retire this pass once the device's exp underflows on its own;
+    the tests in tests/inductor/test_exp_underflow.py state the invariant it owes.
+    """
+    for node in list(graph.nodes):
+        if node.op != "call_function" or node.target is not aten.exp.default:
+            continue
+        if node.meta.get(_EXP_UNDERFLOW_DONE):
+            continue
+        out_meta = node.meta.get("val", None)
+        if out_meta is None or out_meta.dtype is not torch.float16:
+            continue
+        threshold = _exp_underflow_threshold(out_meta.dtype)
+        if threshold is None:
+            continue
+
+        with graph.inserting_after(node):
+            zero = graph.call_function(
+                aten.clamp.default, args=(node,), kwargs={"min": 0.0, "max": 0.0}
+            )
+            zero.meta["val"] = torch.empty_like(out_meta, device="meta")
+            copy_fx_custom_meta(node, zero)
+        with graph.inserting_after(zero):
+            underflows = graph.call_function(
+                aten.le.Scalar, args=(node.args[0], threshold)
+            )
+            underflows.meta["val"] = torch.empty_like(
+                out_meta, dtype=torch.bool, device="meta"
+            )
+            copy_fx_custom_meta(node, underflows)
+        with graph.inserting_after(underflows):
+            guarded = graph.call_function(
+                aten.where.self, args=(underflows, zero, node)
+            )
+            guarded.meta["val"] = torch.empty_like(out_meta, device="meta")
+            copy_fx_custom_meta(node, guarded)
+
+        # The exp keeps feeding the guard it now sits behind; every other reader takes
+        # the selected result. Without the callback this would create a self-reference.
+        node.replace_all_uses_with(
+            guarded, delete_user_cb=lambda user: user not in {zero, guarded}
+        )
+        node.meta[_EXP_UNDERFLOW_DONE] = True
+
+    graph.lint()
 
 
 def decompose_addmm(graph: torch.fx.Graph) -> None:
