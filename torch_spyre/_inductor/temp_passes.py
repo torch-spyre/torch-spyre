@@ -318,6 +318,107 @@ def _unflatten_bmm_batch_dims(
                 graph.erase_node(expand_node)
 
 
+def _pad_unit_n_matmul_operand(
+    graph: torch.fx.Graph,
+    node: torch.fx.Node,
+    rhs: torch.fx.Node,
+    rhs_shape: list[int],
+) -> None:
+    """Rewrite ``matmul(x, w[..., K, 1])`` into ``matmul(x, w2)[..., 0:1]``.
+
+    The Spyre backend cannot compile a matmul whose generated (N) dimension is
+    statically 1: the size-1 range is constant-folded out of the output index
+    expression, so ``identify_matmul_inputs`` can no longer tell the generated
+    input apart from the preserved one, and even with correct identification the
+    backend DCG scheduler rejects a reuse/generated dim of size 1
+    (``inp0_reuse_dim.size() == 1``). N>=2 compiles fine.
+
+    This widens the weight to N=2 by broadcast-multiplying against a ``[..., 1,
+    2]`` tensor of ones (a real materialized ``[..., K, 2]`` buffer that lifts
+    ``w`` off its size-1 stick), runs the supported N=2 matmul, then slices
+    column 0 of the result back to the original ``[..., M, 1]`` shape. The
+    duplicated column is discarded, so numerics are identical.
+    """
+    out_meta = node.meta.get("val", None)
+    rhs_meta = rhs.meta.get("val", None)
+    if out_meta is None or rhs_meta is None:
+        return
+    rhs_dtype = rhs_meta.dtype
+
+    # ones broadcast shape: [1, ..., 1, 2] matching the weight's rank so the
+    # elementwise multiply broadcasts K down every batch dim and widens N to 2.
+    ones_shape = [1] * (len(rhs_shape) - 1) + [2]
+    widened_rhs_shape = list(rhs_shape[:-1]) + [2]
+    widened_out_shape = list(out_meta.shape[:-1]) + [2]
+
+    with graph.inserting_before(node):
+        ones = graph.call_function(
+            aten.full.default,
+            args=(ones_shape, 1),
+            kwargs={"dtype": rhs_dtype, "device": rhs_meta.device},
+        )
+        ones.meta["val"] = torch.empty(
+            ones_shape, dtype=rhs_dtype, device="meta"
+        )
+        copy_fx_custom_meta(node, ones)
+
+        widened_rhs = graph.call_function(aten.mul.Tensor, args=(rhs, ones))
+        widened_rhs.meta["val"] = torch.empty(
+            widened_rhs_shape, dtype=rhs_dtype, device="meta"
+        )
+        copy_fx_custom_meta(node, widened_rhs)
+
+        widened_mm = graph.call_function(node.target, args=(node.args[0], widened_rhs))
+        widened_mm.meta["val"] = torch.empty(
+            widened_out_shape, dtype=out_meta.dtype, device="meta"
+        )
+        copy_fx_custom_meta(node, widened_mm)
+
+        sliced = graph.call_function(
+            aten.slice.Tensor, args=(widened_mm, -1, 0, 1)
+        )
+        sliced.meta["val"] = torch.empty_like(out_meta, device="meta")
+        copy_fx_custom_meta(node, sliced)
+
+    node.replace_all_uses_with(sliced)
+    graph.erase_node(node)
+
+
+def pad_unit_n_matmul(graph: torch.fx.Graph) -> None:
+    """Pad statically-N=1 matmuls to N=2 and slice back (see helper docstring).
+
+    Runs on ``aten.mm``, ``aten.bmm`` and ``spyre.batched_matmul`` after the
+    mm->bmm unflatten passes, so it catches both the plain 2D score-head matmul
+    and any batched matmul whose weight has a trailing size-1 dimension.
+    """
+    matmul_targets = (
+        aten.mm.default,
+        aten.bmm.default,
+        torch.ops.spyre.batched_matmul.default,
+    )
+    for node in list(graph.nodes):
+        if node.op != "call_function" or node.target not in matmul_targets:
+            continue
+        if len(node.args) != 2:
+            continue
+        rhs = node.args[1]
+        if not isinstance(rhs, torch.fx.Node):
+            continue
+        rhs_shape = _node_shape(rhs)
+        if rhs_shape is None or len(rhs_shape) < 2:
+            continue
+        if not _is_static_one(rhs_shape[-1]):
+            continue
+        logger.debug(
+            "pad_unit_n_matmul: widening N=1 %s (rhs shape %s) to N=2",
+            node.target,
+            rhs_shape,
+        )
+        _pad_unit_n_matmul_operand(graph, node, rhs, rhs_shape)
+
+    graph.lint()
+
+
 def decompose_addmm(graph: torch.fx.Graph) -> None:
     """Decompose ``aten.addmm.default`` into ``add(scaled_input, alpha*mm)``.
 
