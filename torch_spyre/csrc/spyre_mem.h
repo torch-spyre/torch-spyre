@@ -51,6 +51,18 @@ at::Tensor spyre_empty_with_layout(c10::IntArrayRef size,
                                    c10::ScalarType dtype,
                                    SpyreTensorLayout device_layout);
 
+/**
+ * Allocate a Spyre tensor whose logical size/stride are `size`/`stride`
+ * (i.e. what PyTorch sees) but whose physical layout and storage are sized
+ * as if dimension `dim` were `max_size`. This lets a single allocation
+ * absorb any later in-place resize of `dim` up to `max_size` (see
+ * spyre_resize_) without reallocating or changing the SpyreTensorLayout
+ * that recompile guards compare against. Backs `tensor.to("spyre", max=)`.
+ */
+at::Tensor spyre_empty_reserved(c10::IntArrayRef size, c10::IntArrayRef stride,
+                                c10::ScalarType dtype, int64_t dim,
+                                int64_t max_size);
+
 at::Tensor empty_with_layout(
     c10::IntArrayRef size, SpyreTensorLayout device_layout,
     std::optional<c10::ScalarType> dtype_opt,

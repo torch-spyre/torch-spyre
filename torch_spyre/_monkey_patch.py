@@ -126,7 +126,45 @@ def _patch_tensor_for_spyre():
         else:
             return None
 
-    def spyre_to(self, *args, device_layout=None, **kwargs):
+    def spyre_to(self, *args, device_layout=None, max=None, **kwargs):
+        if max is not None:
+            # tensor.to("spyre", max=512): reserve the destination buffer
+            # at `max` along dim 0 instead of the current (warmup) shape,
+            # so a later in-place resize up to `max` (done by the compiled
+            # graph via aten::resize_ / spyre_resize_) never reallocates
+            # and never changes the SpyreTensorLayout the recompile guard
+            # compares against. This is what lets one compiled artifact
+            # serve any runtime batch size in [min, max] without
+            # recompiling for dynamic shape support
+            _device = kwargs.get("device", None)
+            if (
+                _device is None
+                and len(args) > 0
+                and isinstance(args[0], (str, torch.device))
+            ):
+                _device = args[0]
+            TORCH_CHECK_MSG = (
+                'max= is only supported for CPU -> "spyre" transfers, e.g. '
+                'x.to("spyre", max=512)'
+            )
+            if _device is None or torch.device(_device).type != DEVICE_NAME:
+                raise ValueError(TORCH_CHECK_MSG)
+            if self.device.type != "cpu":
+                raise ValueError(TORCH_CHECK_MSG)
+
+            # Unlike the plain `.to("spyre")` path below, which dispatches
+            # through aten::to/aten::empty_strided, this branch calls
+            # spyre_empty_reserved directly via pybind11. Any direct _C call must
+            # ensure the runtime is up itself first
+            if not torch.spyre.is_initialized():
+                torch.spyre._impl._lazy_init()
+
+            from torch_spyre._C import copy_tensor, spyre_empty_reserved
+
+            dst = spyre_empty_reserved(self.size(), self.stride(), self.dtype, 0, max)
+            copy_tensor(self, dst, non_blocking=False)
+            return dst
+
         if device_layout is None:
             # During Dynamo tracing this wrapper is an allow_in_graph leaf: keep
             # the operation device-local so Inductor sees and lowers the dtype
