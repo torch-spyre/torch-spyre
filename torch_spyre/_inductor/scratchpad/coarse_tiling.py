@@ -132,6 +132,15 @@ def derive_tiling_groups(
     connected component that skipped an intervening untiled op would be rejected
     at apply time.
 
+    A spec reappearing after the run that carried it broke is therefore refused,
+    not silently split into two groups. Whoever chose these ``choices`` walked
+    producer/consumer reachability, which is not contiguity: an op the chooser
+    could not tile -- a menu-backed one, or one already carrying ``dim_hints``
+    -- sitting in the middle of a region leaves the second half reading the
+    first half's *full* extent while the chooser priced both at the per-tile
+    footprint. Splitting quietly would turn that into a wrong prediction; the
+    raise turns it into a visible one.
+
     ``choices`` is keyed by operation name (``op.get_operation_name()``).
     """
     groups: list[tuple[list[Operation], TileSpec]] = []
@@ -152,6 +161,16 @@ def derive_tiling_groups(
     if current_ops:
         assert current_spec is not None
         groups.append((current_ops, current_spec))
+    seen: dict[TileSpec, list[Operation]] = {}
+    for group_ops, spec in groups:
+        if spec in seen:
+            raise Unsupported(
+                f"coarse tiling: {spec.label} was chosen for two non-adjacent "
+                f"runs of ops ({seen[spec][0].get_operation_name()}.. and "
+                f"{group_ops[0].get_operation_name()}..); a tiling group has to "
+                "occupy one contiguous stretch of the operation list"
+            )
+        seen[spec] = group_ops
     return groups
 
 
@@ -186,8 +205,8 @@ class CoarseTilingPass(ScratchpadOptimizationPass):
     the pass mints hint ids and a group-id offset from bases derived off the
     graph, stamps each op's ``dim_hints``, validates group contiguity, then calls
     ``coarse_tile``. With empty (or all-untiled) ``choices`` it is a no-op and
-    the op count is unchanged -- which is what keeps it inert while
-    ``auto_coarse_tiling`` is off.
+    the op count is unchanged -- which is what keeps it inert until a solver
+    hands it real choices.
     """
 
     def __init__(self, choices: Mapping[str, TileSpec]):

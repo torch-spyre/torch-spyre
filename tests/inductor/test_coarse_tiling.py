@@ -8905,11 +8905,22 @@ class TestDeriveTilingGroups(unittest.TestCase):
     def test_consecutive_run_grouped_untiled_breaks(self):
         g = self._graph_of(["op0", "op1", "op2", "op3", "op4"])
         spec = TileSpec((TileAxis(0, 4),))
+        other = TileSpec((TileAxis(0, 2),))
         # op1,op2 tiled and consecutive -> one group; op4 tiled alone; op0/op3
         # untiled -> break the runs.
-        choices = {"op1": spec, "op2": spec, "op4": spec}
+        choices = {"op1": spec, "op2": spec, "op4": other}
         groups = derive_tiling_groups(g, choices)
         self.assertEqual(self._names(groups), [["op1", "op2"], ["op4"]])
+
+    def test_one_spec_split_across_two_runs_is_refused(self):
+        # The chooser walks producer/consumer reachability, which is not
+        # contiguity. Splitting quietly would leave the second run reading the
+        # first run's full extent against a per-tile prediction.
+        g = self._graph_of(["op0", "op1", "op2", "op3", "op4"])
+        spec = TileSpec((TileAxis(0, 4),))
+        with self.assertRaises(Unsupported) as cm:
+            derive_tiling_groups(g, {"op1": spec, "op2": spec, "op4": spec})
+        self.assertIn("contiguous", str(cm.exception))
 
     def test_spec_change_breaks_the_run(self):
         g = self._graph_of(["op0", "op1"])
