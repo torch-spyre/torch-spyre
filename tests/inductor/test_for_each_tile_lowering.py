@@ -937,6 +937,106 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
                 "[K, N] shape, the reduction (K) dim",
             )
 
+    def test_nested_for_each_tile_markers_resolve_correctly(self):
+        """Two tile_dim_marker-tagged reads at two nesting levels resolve.
+
+        nested_split_m_then_k_fn wraps an outer M-tiling for_each_tile
+        around an inner K-tiling for_each_tile -- the exact ambiguity the
+        marker mechanism exists to eliminate (this is the case that would
+        have been silently wrong under the deleted
+        _loop_var_pos_from_reads heuristic). Uses plain CPU tensors: this
+        test only checks marker/splice bookkeeping (no numeric output), so
+        it does not need a real Spyre device or codegen.
+        capture_post_grad_while_loop drives a full torch.compile
+        internally (via run_and_get_code), and splice_while_loops --
+        registered as a CustomPreSchedulingPasses entry point -- runs to a
+        fixed point across both nesting levels before compilation returns
+        (its own docstring: "Runs to a fixed point (handles nested
+        for_each_tile, whose inner WhileLoop only appears after the outer
+        one's body has been spliced in)"). So by the time GraphLowering.run
+        returns, both levels' WhileLoop ops are already spliced and both
+        levels' markers already consumed.
+        """
+        import torch
+        from tests.inductor.for_each_tile_fixtures import (
+            capture_post_grad_while_loop,
+            nested_split_m_then_k_fn,
+        )
+        from torch._inductor import ir
+        from torch._inductor.graph import GraphLowering
+
+        X = torch.randn(8, 12)
+        Y = torch.randn(12, 6)
+
+        captured = {}
+        original_run = GraphLowering.run
+
+        def capturing_run(self, *args, **kwargs):
+            result = original_run(self, *args, **kwargs)
+            if "graph" not in captured:
+                captured["graph"] = self
+            return result
+
+        GraphLowering.run = capturing_run
+        try:
+            capture_post_grad_while_loop(nested_split_m_then_k_fn, (X, Y))
+        finally:
+            GraphLowering.run = original_run
+
+        graph = captured["graph"]
+        # splice_while_loops runs to a fixed point as a
+        # CustomPreSchedulingPasses entry point during compilation above;
+        # by the time GraphLowering.run returns, both the outer and inner
+        # WhileLoop have already been spliced and no ir.WhileLoop op
+        # should remain.
+        remaining_while_ops = [
+            op for op in graph.operations if isinstance(op, ir.WhileLoop)
+        ]
+        self.assertEqual(
+            remaining_while_ops,
+            [],
+            "expected both nesting levels to be fully spliced",
+        )
+        remaining_markers = [
+            op
+            for op in graph.operations
+            if hasattr(op, "data") and hasattr(op.data, "tile_marker_dim")
+        ]
+        self.assertEqual(
+            remaining_markers,
+            [],
+            "expected every marker at both nesting levels to be consumed",
+        )
+
+    @unittest.expectedFailure
+    def test_nested_for_each_tile_value_correct(self):
+        # Inherits issue #4460 (stick-layout/read-copy reconciliation gap in
+        # propagate_layouts.py) from nested_split_m_then_k_fn's inner loop,
+        # which is split_k-shaped -- the same tiling shape as split_k_fn,
+        # whose own e2e coverage (test_carry_mode_split_k in
+        # test_for_each_tile_e2e.py) is xfailed on this identical gap. Not a
+        # defect in this plan's marker mechanism; out of scope for this
+        # plan.
+        import torch
+        import torch_spyre  # noqa: F401  registers the "spyre" device
+        from torch_spyre.constants import DEVICE_NAME
+
+        from tests.inductor.for_each_tile_fixtures import (
+            nested_split_m_then_k_fn,
+            nested_split_m_then_k_reference,
+        )
+
+        torch._dynamo.reset()
+        X = torch.randn(8, 12, device=DEVICE_NAME, dtype=torch.float16)
+        Y = torch.randn(12, 6, device=DEVICE_NAME, dtype=torch.float16)
+        expected = nested_split_m_then_k_reference(X.cpu(), Y.cpu()).to(DEVICE_NAME)
+
+        compiled = torch.compile(
+            nested_split_m_then_k_fn, backend="inductor", fullgraph=True
+        )
+        actual = compiled(X, Y)
+        torch.testing.assert_close(actual.cpu(), expected.cpu(), atol=1e-2, rtol=1e-2)
+
 
 if __name__ == "__main__":
     unittest.main()
