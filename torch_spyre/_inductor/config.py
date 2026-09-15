@@ -104,6 +104,24 @@ async_dxp_compile: bool = os.getenv("SPYRE_ASYNC_DXP_COMPILE", "0").lower() in (
 
 allow_all_ops_in_lx_planning: bool = False
 
+# Enabled by default; the environment switch is an opt-out for comparisons.
+# An indexed selection
+# (gather) whose every consumer is a batch matmul is additionally offered an
+# output layout that keeps each selected entry's data physically contiguous
+# (index-entry dim outermost), so the matmul can read the selection directly
+# instead of the pipeline materializing a second, rearranged copy. Candidates
+# are only offered when the selection's write and every consumer's read are
+# proven stick-compatible; otherwise behavior is unchanged. The existing layout
+# chooser prices legal operand targets by conversion cost and keeps ordinary
+# candidates on ties. No unmeasured throughput preference or forced choice.
+indexed_selection_consumer_layout: bool = os.getenv(
+    "SPYRE_INDEXED_SELECTION_CONSUMER_LAYOUT", "1"
+).lower() in (
+    "1",
+    "true",
+    "yes",
+)
+
 dxp_lx_frac_avail: float = float(os.environ.get("DXP_LX_FRAC_AVAIL", "0.2"))
 
 sencores: int = int(os.getenv("SENCORES", "32"))
