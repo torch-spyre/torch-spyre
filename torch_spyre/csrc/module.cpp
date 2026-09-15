@@ -365,7 +365,9 @@ PYBIND11_MODULE(_C, m) {
             }
           }));
 
-  m.def("spyre_empty_with_layout", &spyre::spyre_empty_with_layout);
+  m.def("spyre_empty_with_layout", &spyre::spyre_empty_with_layout,
+        py::arg("size"), py::arg("stride"), py::arg("dtype"),
+        py::arg("device_layout"), py::arg("device") = py::none());
   m.def("empty_with_layout", &spyre::py_empty_with_layout);
   m.def("as_strided_with_layout", &spyre::as_strided_with_layout);
   m.def("reinterpret_tensor", &spyre::reinterpret_tensor);

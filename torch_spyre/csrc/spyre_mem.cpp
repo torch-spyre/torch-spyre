@@ -606,10 +606,15 @@ at::Tensor spyre_empty_strided(c10::IntArrayRef size, c10::IntArrayRef stride,
 at::Tensor spyre_empty_with_layout(c10::IntArrayRef size,
                                    c10::IntArrayRef stride,
                                    c10::ScalarType dtype,
-                                   SpyreTensorLayout device_layout) {
+                                   SpyreTensorLayout device_layout,
+                                   std::optional<c10::Device> device_opt) {
   at::detail::check_size_nonnegative(size);
-  c10::Device device =
-      c10::impl::VirtualGuardImpl{c10::DeviceType::PrivateUse1}.getDevice();
+  c10::Device device = device_opt.value_or(
+      c10::impl::VirtualGuardImpl{c10::DeviceType::PrivateUse1}.getDevice());
+  TORCH_CHECK(device.is_privateuseone(),
+              "spyre_empty_with_layout expected a Spyre device, got ", device);
+  const c10::DeviceGuard device_guard(device);
+
   size_t device_size_bytes = get_device_size_in_bytes(device_layout);
   int64_t cpu_numel = std::accumulate(size.begin(), size.end(), 1LL,
                                       std::multiplies<int64_t>());
@@ -622,7 +627,6 @@ at::Tensor spyre_empty_with_layout(c10::IntArrayRef size,
   auto spyre_storage = c10::Storage(spyre_storage_impl);
 
   // Create the Spyre Tensor
-  const c10::DeviceGuard device_guard(device);
   constexpr c10::DispatchKeySet pu1_dks(c10::DispatchKey::PrivateUse1);
   auto tensor = at::detail::make_tensor_base<SpyreTensorImpl>(
       std::move(spyre_storage), pu1_dks, c10::scalarTypeToTypeMeta(dtype));
