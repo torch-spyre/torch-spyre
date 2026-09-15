@@ -6116,6 +6116,171 @@ class TestReadCopyElisionProof(unittest.TestCase):
         self.assertIsNone(_loop_advance_bound(info, 0))
 
 
+class TestPointSpliceAdvance(unittest.TestCase):
+    """_point_splice_advance_for_dep: the per-trip step of a point read.
+
+    Paged attention's in-body page gather reads one int32 page index per trip
+    (`index = 32*u0`, no iteration var), so its advance cannot be attributed
+    to a tiled dim and travels in squeezed_advance_per_read instead. The
+    coefficient recorded here is what SpyreKernel builds the
+    device_tile_advance_expr from, so dropping it re-reads the same page every
+    trip -- which compiles and returns a plausible-looking wrong answer.
+    """
+
+    @staticmethod
+    def _dep(index, var_names=(), size=()):
+        return inductor_deps.MemoryDep(
+            name="block_table", index=index, var_names=var_names, size=size
+        )
+
+    def test_point_read_advance_is_the_loop_var_coefficient(self):
+        from torch_spyre._inductor.wsr.coarse_tile import _point_splice_advance_for_dep
+
+        u0 = sympy.Symbol("u0", integer=True)
+        advance = _point_splice_advance_for_dep(
+            self._dep(32 * u0), [(7, Integer(4))], {7: u0}
+        )
+
+        self.assertEqual(advance, [[(Integer(32), Integer(1))]])
+
+    def test_point_read_not_moving_with_the_loop_gets_no_advance(self):
+        from torch_spyre._inductor.wsr.coarse_tile import _point_splice_advance_for_dep
+
+        u0 = sympy.Symbol("u0", integer=True)
+        advance = _point_splice_advance_for_dep(
+            self._dep(Integer(0)), [(7, Integer(4))], {7: u0}
+        )
+
+        self.assertEqual(advance, [[]])
+
+    def test_dimensioned_read_is_left_to_the_tiled_dim_machinery(self):
+        """A read that has an iteration var is deliberately not covered.
+
+        Its advance belongs to a tiled dim; if that cannot be resolved the
+        plan must still be refused (UNRESOLVED_SPLICE_ADVANCE) rather than
+        silently given a dimensionless step.
+        """
+        from torch_spyre._inductor.wsr.coarse_tile import _point_splice_advance_for_dep
+
+        u0 = sympy.Symbol("u0", integer=True)
+        d0 = sympy_index_symbol("d0")
+        advance = _point_splice_advance_for_dep(
+            self._dep(32 * u0 + d0, var_names=(d0,), size=(Integer(32),)),
+            [(7, Integer(4))],
+            {7: u0},
+        )
+
+        self.assertEqual(advance, [[]])
+
+    def test_non_affine_point_read_is_rejected(self):
+        from torch_spyre._inductor.wsr.coarse_tile import _point_splice_advance_for_dep
+
+        u0 = sympy.Symbol("u0", integer=True)
+        with self.assertRaisesRegex(Unsupported, "not affine"):
+            _point_splice_advance_for_dep(self._dep(u0**2), [(7, Integer(4))], {7: u0})
+
+    def test_symbolic_stride_point_read_is_rejected(self):
+        from torch_spyre._inductor.wsr.coarse_tile import _point_splice_advance_for_dep
+
+        u0 = sympy.Symbol("u0", integer=True)
+        stride = sympy.Symbol("stride", integer=True)
+        with self.assertRaisesRegex(Unsupported, "constant stride"):
+            _point_splice_advance_for_dep(
+                self._dep(stride * u0), [(7, Integer(4))], {7: u0}
+            )
+
+    def test_rebase_handler_matches_exact_index(self):
+        from torch_spyre._inductor.wsr.coarse_tile import _PointReadRebaseHandler
+
+        u0 = sympy.Symbol("u0", integer=True)
+
+        class Recorder:
+            def __init__(self):
+                self.loads = []
+
+            def load(self, name, index):
+                self.loads.append((name, index))
+                return sympy.S.Zero
+
+        recorder = Recorder()
+        handler = _PointReadRebaseHandler(
+            recorder, {("block_table", 32 * u0): sympy.S.Zero}
+        )
+        handler.load("block_table", 32 * u0)
+        handler.load("block_table", 32 * u0 + 1)
+        handler.load("other", 32 * u0)
+
+        self.assertEqual(
+            recorder.loads,
+            [
+                ("block_table", sympy.S.Zero),
+                ("block_table", 32 * u0 + 1),
+                ("other", 32 * u0),
+            ],
+        )
+
+    def test_restickify_metadata_resolves_exact_dependency(self):
+        from torch_spyre._inductor.insert_restickify import _restickify_dep_index
+
+        u0 = sympy.Symbol("u0", integer=True)
+        deps = [self._dep(32 * u0), self._dep(32 * u0 + 1)]
+
+        self.assertEqual(
+            _restickify_dep_index(
+                deps,
+                {
+                    "arg_name": "block_table",
+                    "dep_index": 32 * u0 + 1,
+                    "occurrence": 0,
+                },
+            ),
+            1,
+        )
+
+    def test_legacy_restickify_metadata_rejects_ambiguous_name(self):
+        from torch_spyre._inductor.insert_restickify import _restickify_dep_index
+
+        u0 = sympy.Symbol("u0", integer=True)
+        deps = [self._dep(32 * u0), self._dep(32 * u0 + 1)]
+
+        with self.assertRaisesRegex(AssertionError, "matches multiple reads"):
+            _restickify_dep_index(deps, {"arg_name": "block_table"})
+
+    def test_restickify_metadata_rejects_missing_exact_dependency(self):
+        from torch_spyre._inductor.insert_restickify import _restickify_dep_index
+
+        u0 = sympy.Symbol("u0", integer=True)
+        deps = [self._dep(32 * u0)]
+
+        with self.assertRaisesRegex(AssertionError, "no matching"):
+            _restickify_dep_index(
+                deps,
+                {
+                    "arg_name": "block_table",
+                    "dep_index": 32 * u0 + 1,
+                    "occurrence": 0,
+                },
+            )
+
+    def test_point_read_is_not_staged_into_a_read_copy(self):
+        """_full_buffer_read_deps skips point reads.
+
+        A tile-scoped index is what makes a direct read of a full-size buffer
+        wrong, and a point read has none. Staging one would also mean
+        restickifying a single int32 element, which the backend has no op for.
+        """
+        op = SimpleNamespace(
+            loop_info=CoarseTileInfo(
+                loop_group_id=(0,), loop_count=[Integer(4)], loop_tiled_dims=[[]]
+            ),
+            get_read_writes=lambda: SimpleNamespace(
+                reads=OrderedSet([self._dep(32 * sympy.Symbol("u0", integer=True))])
+            ),
+        )
+
+        self.assertEqual(_full_buffer_read_deps(op), [])
+
+
 class TestInsertAllReadCopyOps(unittest.TestCase):
     """_insert_all_read_copy_ops executes a precomputed ReadCopyPlan."""
 
