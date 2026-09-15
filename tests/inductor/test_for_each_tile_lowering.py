@@ -538,94 +538,60 @@ class TestPassPipelineRegistration(unittest.TestCase):
 def test_tile_dim_marker_lowering_produces_distinct_operation():
     """lower_tile_dim_marker must NOT elide -- confirms the Pointwise.create
     fallback (spec Section 7) actually forces a distinct ir.Operation, unlike
-    the bare-identity lowering this replaces. Verifies by directly calling the
-    lowering function that it returns a materialized operation (not identity).
+    the bare-identity lowering this replaces. Captures the GraphLowering
+    directly via a GraphLowering.run monkeypatch (mirroring _post_grad_graphs'
+    own monkeypatch-capture style in for_each_tile_fixtures.py) rather than
+    TestSpliceWhileLoops._run_graph, which requires an actual scan/while_loop
+    shape this bare op call does not have.
+
+    Adaptation from the original spec: wraps the compile in
+    `torch._inductor.config.patch("force_disable_caches", True)`. Without
+    it, a second run of this exact test (fxgraph cache warm from a prior
+    run) hits FxGraphCache and skips GraphLowering.run entirely, making the
+    `captured` list empty and the test fail nondeterministically depending
+    on cache state -- not a redesign, just the same cache-disable pattern
+    already used elsewhere in this test suite (e.g. test_padding.py,
+    test_dedup_constants.py, test_inductor_fx_passes.py).
     """
     import torch
+    from torch._inductor import config as t_inductor_config
+
+    from torch._inductor.graph import GraphLowering
 
     import torch_spyre  # noqa: F401  (registers the spyre device + lowerings)
     from torch_spyre.constants import DEVICE_NAME
-    from torch_spyre._inductor.lowering import lower_tile_dim_marker
 
-    # Verify the lowering is registered.
-    from torch_spyre._inductor.lowering import spyre_lowerings
+    captured: list[GraphLowering] = []
+    original_run = GraphLowering.run
 
-    assert torch.ops.spyre.tile_dim_marker in spyre_lowerings
+    def capturing_run(self, *args, **kwargs):
+        result = original_run(self, *args, **kwargs)
+        captured.append(self)
+        return result
 
-    # Test that the lowering function is callable and returns a non-identity result.
-    # We use a simple mock TensorBox for testing.
-    class MockStorageBox:
-        def __init__(self):
-            self.realized = False
-            self.dtype = torch.float16
+    def fn(x):
+        return torch.ops.spyre.tile_dim_marker(x, 1)
 
-        def realize(self):
-            self.realized = True
-
-        def make_loader(self):
-            def loader(index):
-                return None
-
-            return loader
-
-        def get_size(self):
-            return [4, 8]
-
-    class MockTensorBox:
-        def __init__(self):
-            self.storage = MockStorageBox()
-            self.dtype = torch.float16
-
-        def get_device(self):
-            return DEVICE_NAME
-
-        def get_dtype(self):
-            return self.dtype
-
-        def get_size(self):
-            return [4, 8]
-
-        def get_traceback(self):
-            return []
-
-        @property
-        def data(self):
-            return self.storage
-
-    mock_box = MockTensorBox()
-
-    # Mock V.get_current_node to avoid needing a full IR context
-    with mock.patch(
-        "torch_spyre._inductor.lowering.V.get_current_node", return_value=None
+    X = torch.randn(4, 8, device=DEVICE_NAME)
+    with (
+        t_inductor_config.patch("force_disable_caches", True),
+        mock.patch.object(GraphLowering, "run", capturing_run),
     ):
-        try:
-            # Call the lowering. It should create a Pointwise operation.
-            result = lower_tile_dim_marker(mock_box, 1)
+        compiled = torch.compile(fn, backend="inductor", fullgraph=True)
+        compiled(X)
 
-            # Verify that result is not the same object as input
-            # (identity lowering would return the same object)
-            assert result is not mock_box, (
-                "lowering returned the input unchanged, indicating bare "
-                "identity (elision) occurred"
-            )
-
-            # Verify result has the expected structure
-            assert hasattr(result, "data"), "result missing data attribute"
-
-        except Exception:
-            # If there's an exception, it's likely due to Inductor internals
-            # we can't fully mock. The important thing is the lowering is
-            # defined and doesn't have a trivial "return x" body.
-            # Inspect the source to confirm it uses Pointwise.create.
-            import inspect
-
-            source = inspect.getsource(lower_tile_dim_marker)
-            assert "Pointwise.create" in source, (
-                "lowering should use Pointwise.create to materialize operation"
-            )
-            assert "return x" not in source or "return pw" in source, (
-                "lowering should not be a bare identity return"
-            )
+    assert captured, "GraphLowering.run was never invoked"
+    graph = captured[0]
+    marker_ops = [
+        op
+        for op in graph.operations
+        if getattr(op, "tile_marker_dim", None) is not None
+    ]
+    assert len(marker_ops) == 1, (
+        f"expected exactly one op carrying tile_marker_dim, found "
+        f"{len(marker_ops)} in {[type(o) for o in graph.operations]}"
+    )
+    assert marker_ops[0].tile_marker_dim == 1
 
 
 if __name__ == "__main__":
