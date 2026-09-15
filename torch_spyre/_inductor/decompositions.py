@@ -1375,14 +1375,14 @@ def _windowed_attention(
 
                 scores = scores + mask_rows[..., read_start + start : read_start + end]
 
-                block_max = torch.amax(scores, dim=-1)
                 # A standard additive mask may make an entire KV chunk -inf.
-                # Clamp that reduction to a finite value before subtracting it:
+                # Clamp the scores before reducing so the pointwise operation
+                # stays on the dense score layout; clamping the sparse reduction
+                # result requires an unsupported sparse/dense restickification.
                 # -inf - -inf is NaN and would otherwise poison all later chunks,
                 # including a later chunk that contains attendable keys.
-                block_max = torch.maximum(
-                    block_max,
-                    torch.full_like(block_max, finite_min),
+                block_max = torch.amax(
+                    torch.clamp_min(scores, finite_min), dim=-1
                 )
                 if kv_block == 0:
                     # Seed from real scores. Besides avoiding dead arithmetic,
