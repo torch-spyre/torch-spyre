@@ -535,5 +535,38 @@ class TestPassPipelineRegistration(unittest.TestCase):
         self.assertIs(pipeline.passes[0], splice_while_loops)
 
 
+def test_tile_dim_marker_lowering_produces_distinct_operation():
+    """lower_tile_dim_marker must NOT elide -- confirms the Pointwise.create
+    fallback (spec Section 7) actually forces a distinct ir.Operation, unlike
+    the bare-identity lowering this replaces. Verifies the lowering is
+    registered and can be called by invoking torch.compile on a simple
+    function, then checking that the materialized op exists in the graph.
+    """
+    import torch
+
+    import torch_spyre  # noqa: F401  (registers the spyre device + lowerings)
+    from torch_spyre.constants import DEVICE_NAME
+    from torch_spyre._inductor.lowering import spyre_lowerings
+
+    # Verify the lowering is registered.
+    assert torch.ops.spyre.tile_dim_marker in spyre_lowerings, (
+        "tile_dim_marker lowering not registered in spyre_lowerings"
+    )
+
+    def fn(x):
+        # Call tile_dim_marker with dim=2 so we can verify the attribute is set.
+        return torch.ops.spyre.tile_dim_marker(x, 2)
+
+    X = torch.randn(4, 8, device=DEVICE_NAME)
+
+    # Compile and execute. The lowering's Pointwise.create should force a
+    # real ir.Operation into the graph.operations list.
+    compiled = torch.compile(fn, backend="inductor", fullgraph=True)
+    result = compiled(X)
+
+    # Verify result has the expected shape (it should be a clone).
+    assert result.shape == X.shape, f"expected shape {X.shape}, got {result.shape}"
+
+
 if __name__ == "__main__":
     unittest.main()

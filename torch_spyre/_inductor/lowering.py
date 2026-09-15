@@ -1456,6 +1456,39 @@ def lower_compact(x):
     return pw
 
 
+@register_spyre_lowering(torch.ops.spyre.tile_dim_marker, type_promotion_kind=None)
+def lower_tile_dim_marker(x, dim):
+    # A bare `return x` elides before any ir.Operation is ever constructed
+    # (register_lowering's dispatch never builds a new op for an identity
+    # return) -- confirmed empirically against a live nested for_each_tile
+    # compile. Force a real, distinct ComputedBuffer into existence instead,
+    # mirroring lower_restickify's pattern, so _consume_tile_dim_markers
+    # (for_each_tile_lowering.py) has something to find, tag, and erase.
+    base = x
+    while not isinstance(base, StorageBox):
+        base = base.data
+    base.realize()
+    loader = base.make_loader()
+
+    def inner_fn(index):
+        return loader(index)
+
+    pw = Pointwise.create(
+        device=x.get_device(),
+        dtype=x.get_dtype(),
+        inner_fn=inner_fn,
+        ranges=base.get_size(),
+        origin_node=V.get_current_node(),
+        traceback=x.get_traceback(),
+    )
+    pw.realize()
+    # Stash dim as a plain attribute on the realized ComputedBuffer so
+    # _consume_tile_dim_markers can read it back without reverse-engineering
+    # it from constant_args/op_overload plumbing.
+    pw.data.data.tile_marker_dim = dim
+    return pw
+
+
 @register_spyre_lowering(torch.ops.aten.full.default, type_promotion_kind=None)
 def lower_full(size, fill_value, dtype=None, layout=None, device=None, pin_memory=None):
     assert layout in (torch.strided, None), f"doesn't support layout={layout}"
