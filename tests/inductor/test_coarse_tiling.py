@@ -1637,6 +1637,50 @@ class TestCodegenOpSpecListRoundtrip(unittest.TestCase):
 # ===========================================================================
 
 
+class TestIterationSpaceDependencies(unittest.TestCase):
+    def test_ordering_reads_preserve_dimensions_and_dependencies(self):
+        from torch._inductor.ir import ComputedBuffer
+
+        from torch_spyre._inductor.pass_utils import (
+            iteration_space,
+            iteration_space_from_op,
+        )
+
+        x, y, r = sympy.symbols("x y r", integer=True)
+        write = inductor_deps.MemoryDep("out", x * 16 + y, (x, y), (8, 16))
+        # Deliberately list the reduction dimension first in the read: output
+        # dimensions must still come first, in write order, with no duplicates.
+        read = inductor_deps.MemoryDep(
+            "in", r * 128 + x * 16 + y, (r, y, x), (32, 16, 8)
+        )
+        weak = inductor_deps.WeakDep("prior", "out")
+        star = inductor_deps.StarDep("whole_buffer")
+        for data, expected in (
+            (_make_reduction([8, 16], [32]), [(x, 8), (y, 16), (r, 32)]),
+            (_make_pointwise([8, 16]), [(x, 8), (y, 16)]),
+        ):
+            for reads in ((read,), (weak, read), (star, read), (read, star, weak)):
+                with self.subTest(reduction=len(expected) == 3, reads=reads):
+                    rw = inductor_deps.ReadWrites(
+                        reads=OrderedSet(reads),
+                        writes=OrderedSet([write]),
+                        index_exprs=OrderedSet(),
+                    )
+                    op = MagicMock(spec=ComputedBuffer)
+                    op.data = data
+                    op.get_read_writes.return_value = rw
+                    node = SimpleNamespace(node=op, read_writes=rw)
+                    original_reads, original_writes = rw.reads, rw.writes
+                    for result in (iteration_space(node), iteration_space_from_op(op)):
+                        self.assertEqual(list(result.items()), expected)
+                    self.assertIs(rw.reads, original_reads)
+                    self.assertIs(rw.writes, original_writes)
+                    self.assertEqual(tuple(rw.reads), reads)
+                    self.assertEqual(tuple(rw.writes), (write,))
+                    for actual, original in zip(rw.reads, reads):
+                        self.assertIs(actual, original)
+
+
 class TestDivideRanges(unittest.TestCase):
     def setUp(self):
         gm = fx.symbolic_trace(lambda: None)
@@ -6767,8 +6811,22 @@ def _make_tiled_reduction_op(
     loop_count,
     loop_tiled_dims,
 ):
-    """Return a ComputedBuffer mock that looks like a stamped tiled Reduction op."""
+    """Return a ComputedBuffer mock that looks like a stamped tiled Reduction op.
+
+    Builds a real output write dep (output dims only) and a real input read
+    dep (output dims + reduction dims, using sympy_index_symbol's d{i}
+    convention so reduction_loop_vars/_loop_var_to_reduction_ranges_pos can
+    find the reduction symbols -- see op_out_coords and reduction_loop_vars
+    in wsr/coarse_tile.py). Also stamps one reduction DimHint per reduction
+    dim at hint_id=0, matching TestPlanTilingPropagation._plan_for's levels
+    (which pair every level with literal hint_id 0), so
+    _group_reduction_tiled_levels_in_group/_plan_tiling_propagation's
+    has_tiled_reduction check (added by a462da6d) can recognize the tiled
+    reduction dim instead of seeing an empty dim_hints list.
+    """
+    from torch._inductor.dependencies import MemoryDep
     from torch._inductor.ir import ComputedBuffer, FixedLayout, Reduction
+    from torch_spyre._inductor.propagate_hints import DimHint
 
     data = MagicMock(spec=Reduction)
     data.ranges = list(ranges)
@@ -6782,11 +6840,13 @@ def _make_tiled_reduction_op(
         strides.insert(0, s)
         s = s * r
     layout = MagicMock(spec=FixedLayout)
+    layout.size = list(ranges)
     layout.stride = strides
 
     op = MagicMock(spec=ComputedBuffer)
     op.data = data
     op.layout = layout
+    op.get_layout.return_value = layout
     op.get_operation_name.return_value = name
     op.get_name.return_value = name
     op.loop_info = CoarseTileInfo(
@@ -6794,7 +6854,53 @@ def _make_tiled_reduction_op(
         loop_count=list(loop_count),
         loop_tiled_dims=[list(d) for d in loop_tiled_dims],
     )
-    op.get_read_writes.return_value = _make_rw_with_reads()
+
+    n_out = len(ranges)
+    out_syms = [sympy_index_symbol(f"d{i}") for i in range(n_out)]
+    red_syms = [
+        sympy_index_symbol(f"d{n_out + i}") for i in range(len(reduction_ranges))
+    ]
+
+    # Output dep: index/ranges cover only the output dims, matching
+    # op_out_coords's expectation of a real write dep -- reduction_ranges
+    # dims never appear in the output index.
+    out_dep = MagicMock(spec=MemoryDep)
+    out_dep.name = name
+    out_dep.index = (
+        sympy.Add(*out_syms)
+        if len(out_syms) > 1
+        else (out_syms[0] if out_syms else sympy.Integer(0))
+    )
+    out_dep.index = sympy.sympify(out_dep.index)
+    out_dep.ranges = dict(zip(out_syms, ranges))
+    out_dep.is_indirect.return_value = False
+
+    # Input dep: index/ranges cover output dims + reduction dims, so
+    # reduction_loop_vars can set-subtract out_syms from in_dep.ranges to
+    # recover the reduction symbols, in reduction_ranges order.
+    all_syms = out_syms + red_syms
+    in_dep = MagicMock(spec=MemoryDep)
+    in_dep.name = f"{name}_in"
+    in_dep.index = sympy.Add(*all_syms) if len(all_syms) > 1 else all_syms[0]
+    in_dep.index = sympy.sympify(in_dep.index)
+    in_dep.ranges = dict(zip(all_syms, list(ranges) + list(reduction_ranges)))
+    in_dep.is_indirect.return_value = False
+
+    rw = _make_rw_with_reads()
+    rw.reads = [in_dep]
+    rw.writes = [out_dep]
+    op.get_read_writes.return_value = rw
+
+    op.dim_hints = [
+        DimHint(
+            dim_names=[f"R{i}"],
+            split_count=1,
+            loop_var=red_syms[i],
+            is_reduction=True,
+            hint_id=0,
+        )
+        for i in range(len(reduction_ranges))
+    ]
     op.origins = OrderedSet()
     return op
 
@@ -7628,6 +7734,56 @@ class TestDivideReductionRanges(unittest.TestCase):
         self.assertEqual(
             op.work_div_loop_info,  # type: ignore[attr-defined]
             {Symbol("d0"): ["T"], Symbol("d1"): ["F"]},
+        )
+
+    def test_named_reduction_dim_is_captured_when_read_index_ignores_it(self):
+        from torch._inductor.dependencies import MemoryDep, ReadWrites
+        from torch_spyre._inductor.wsr.coarse_tile import (
+            _apply_work_div_symbol_remap,
+            _divide_reduction_ranges,
+        )
+
+        op = self._make_reduction_op(
+            ranges=[Integer(16), Integer(2816)],
+            reduction_ranges=[Integer(128)],
+        )
+        d0, d1, d2 = Symbol("d0"), Symbol("d1"), Symbol("d2")
+        dep_ranges = {d0: Integer(16), d1: Integer(2816)}
+        var_names = tuple(dep_ranges)
+        size = tuple(dep_ranges.values())
+        rw_before = ReadWrites(
+            reads=OrderedSet([MemoryDep("input", 2816 * d0 + d1, var_names, size)]),
+            writes=OrderedSet([MemoryDep("output", 2816 * d0 + d1, var_names, size)]),
+            index_exprs=OrderedSet(),
+            range_vars=[d0, d1, d2],
+            var_ranges={**dep_ranges, d2: Integer(128)},
+        )
+        rw_after = ReadWrites(
+            reads=rw_before.reads,
+            writes=rw_before.writes,
+            index_exprs=OrderedSet(),
+            range_vars=[d0, d1],
+            var_ranges=dep_ranges,
+        )
+        op.work_div_loop_info = {  # type: ignore[attr-defined]
+            d0: ["T"],
+            d1: ["H"],
+            d2: ["E"],
+        }
+
+        with (
+            patch(
+                "torch_spyre._inductor.wsr.coarse_tile.op_read_writes",
+                side_effect=(rw_before, rw_after),
+            ),
+            patch("torch_spyre._inductor.wsr.coarse_tile.invalidate_op_read_writes"),
+        ):
+            remap = _divide_reduction_ranges(op, Integer(128), [0])
+        _apply_work_div_symbol_remap(op, remap)
+
+        self.assertEqual(
+            op.work_div_loop_info,  # type: ignore[attr-defined]
+            {d0: ["T"], d1: ["H"]},
         )
 
     def test_fused_output_dims_allow_trailing_reduction_symbol_squeeze(self):
@@ -8538,6 +8694,11 @@ class TestSpyreKernelPoolSize(unittest.TestCase):
         self.assertEqual(default_kernel.pool_size, 0)
 
 
+def _is_clean(spec: TileSpec) -> bool:
+    """True when no reduction axis is tiled."""
+    return not any(a.is_reduction for a in spec.axes)
+
+
 class TestTileSpecRepresentation(unittest.TestCase):
     """TileAxis/TileSpec/CoreDivision.tiling and the min_footprint win."""
 
@@ -8547,7 +8708,7 @@ class TestTileSpecRepresentation(unittest.TestCase):
         self.assertEqual(u.depth, 0)
         self.assertEqual(u.tile_count, 1)
         self.assertEqual(u.output_tile_count, 1)
-        self.assertTrue(u.is_clean)
+        self.assertTrue(_is_clean(u))
         self.assertEqual(u.label, "untiled")
 
     def test_ordered_and_hashable_equality_is_same_shape(self):
@@ -8566,7 +8727,7 @@ class TestTileSpecRepresentation(unittest.TestCase):
         self.assertEqual(a.depth, 2)
         self.assertEqual(a.tile_count, 8)
         self.assertEqual(a.output_tile_count, 8)
-        self.assertTrue(a.is_clean)
+        self.assertTrue(_is_clean(a))
         self.assertEqual(a.label, "d0:4/d1:2")
 
     def test_reduction_axis_excluded_from_output_tile_count(self):
@@ -8574,11 +8735,11 @@ class TestTileSpecRepresentation(unittest.TestCase):
         # Reduction level counts in tile_count but not in output_tile_count.
         self.assertEqual(r.tile_count, 12)
         self.assertEqual(r.output_tile_count, 4)
-        self.assertFalse(r.is_clean)
+        self.assertFalse(_is_clean(r))
         self.assertEqual(r.label, "d0:4/~d2:3")
 
     def test_core_division_tiling_defaults_untiled_and_inert(self):
-        cd = CoreDivision(output_splits={0: 2})
+        cd = CoreDivision(splits={0: 2})
         self.assertEqual(cd.tiling, TileSpec())
         self.assertTrue(cd.tiling.is_untiled)
         # Distinct CoreDivisions do not share one mutable default.
@@ -8589,7 +8750,7 @@ class TestTileSpecRepresentation(unittest.TestCase):
             name="x",
             size=1024,
             uses=[0, 1],
-            core_divisions=[CoreDivision(output_splits={0: 2})],
+            core_divisions=[CoreDivision(splits={0: 2})],
         )
         self.assertEqual(buf.min_footprint, ceil_div(1024, 2))
 
@@ -8599,7 +8760,7 @@ class TestTileSpecRepresentation(unittest.TestCase):
             name="y",
             size=1024,
             uses=[0, 1],
-            core_divisions=[CoreDivision(output_splits={0: 2}, tiling=spec)],
+            core_divisions=[CoreDivision(splits={0: 2}, tiling=spec)],
         )
         self.assertEqual(buf.min_footprint, ceil_div(1024, 2 * spec.output_tile_count))
 
@@ -8610,7 +8771,7 @@ class TestTileSpecRepresentation(unittest.TestCase):
             name="z",
             size=1024,
             uses=[0, 1],
-            core_divisions=[CoreDivision(output_splits={0: 2}, tiling=spec)],
+            core_divisions=[CoreDivision(splits={0: 2}, tiling=spec)],
         )
         self.assertEqual(buf.min_footprint, ceil_div(1024, 2 * spec.output_tile_count))
 

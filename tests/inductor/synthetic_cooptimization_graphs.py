@@ -64,17 +64,17 @@ _SIZE = 65536  # bytes; a plausible per-buffer footprint (mirrors capture scale)
 # --- menu helpers ----------------------------------------------------------- #
 def _trivial() -> CoreDivision:
     """Index-0 committed/seed division: whole-buffer, undivided."""
-    return CoreDivision(output_splits={}, reduction_splits={})
+    return CoreDivision()
 
 
 def _osplit(k: int) -> CoreDivision:
     """An output split by ``k`` on dim 1 (output_partition == k)."""
-    return CoreDivision(output_splits={1: k}, reduction_splits={})
+    return CoreDivision(splits={1: k})
 
 
 def _rsplit(k: int) -> CoreDivision:
     """A reduction (K) split by ``k`` -- output_partition stays 1."""
-    return CoreDivision(output_splits={}, reduction_splits={1: k})
+    return CoreDivision(splits={1: k}, reduction_syms=frozenset({1}))
 
 
 # The standard three-entry output menu shared by most synthetic ops: index 0

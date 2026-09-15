@@ -25,6 +25,7 @@ from torch_spyre._inductor.pass_utils import (
     iteration_space_from_op,
     invalidate_op_read_writes,
     op_read_writes,
+    register_operation_after_graph_edit,
 )
 from torch._inductor.virtualized import V
 from torch._inductor.ir import (
@@ -183,7 +184,7 @@ class GraphEditor:
         new_com_buf.origin_node = new_fx_node
         copy_op_metadata(metadata_source, new_com_buf)
         new_com_buf.name = self.lowering.register_buffer(new_com_buf)
-        self.lowering.register_operation(new_com_buf)
+        register_operation_after_graph_edit(self.lowering, new_com_buf)
         new_buf_name = new_com_buf.get_name()
 
         # Clone loops mirror their source/consumer symbols before Scheduler.

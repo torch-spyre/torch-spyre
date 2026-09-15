@@ -93,6 +93,9 @@ def enable_spyre_context(example_inputs: list[InputType]):
         "permute_fusion": False,
         "allow_buffer_reuse": False,  # For now, as buffer reuse does not consider stride_map.
         "reorder_for_locality": False,  # Prevents unhinted ops from being moved into hinted regions.
+        # Spyre has no device-side RNG: replace_random would rewrite aten RNG ops
+        # into prims.inductor_random, whose index_expr lowering Spyre cannot codegen.
+        "fallback_random": True,
     }
 
     from torch._inductor.ir import Loops

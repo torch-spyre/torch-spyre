@@ -217,12 +217,6 @@ class TileSpec:
         return math.prod(a.count for a in self.axes if not a.is_reduction)
 
     @property
-    def is_clean(self) -> bool:
-        """True when no reduction axis is tiled (mirrors
-        :attr:`CoreDivision.is_clean`)."""
-        return not any(a.is_reduction for a in self.axes)
-
-    @property
     def label(self) -> str:
         if not self.axes:
             return "untiled"
@@ -235,59 +229,47 @@ class TileSpec:
 class CoreDivision:
     """One permissible core-division of a buffer's producing op.
 
-    ``output_splits`` / ``reduction_splits`` are keyed by the producer's
-    iteration symbols. Solvers use them to size the buffer (per-core footprint
-    = total / ``output_partition``); cross-operation compatibility is derived
-    through ``PerCoreView``, never by comparing these local symbols.
-
+    ``splits`` is keyed by the producer's iteration symbols -- one entry per
+    axis with a split factor.
+    ``reduction_syms`` names the subset of those keys that split a reduction
+    axis rather than an output axis.
     ``tiling`` pairs a coarse tiling onto this division as one candidate. The
     empty :class:`TileSpec` is untiled and inert.
     """
 
-    output_splits: dict[object, int] = field(default_factory=dict)
-    reduction_splits: dict[object, int] = field(default_factory=dict)
+    splits: dict[sympy.Symbol, int] = field(default_factory=dict)
+    reduction_syms: frozenset[sympy.Symbol] = field(default_factory=frozenset)
     tiling: TileSpec = field(default_factory=TileSpec)
 
     @property
     def cores_used(self) -> int:
-        return math.prod(self.output_splits.values()) * math.prod(
-            self.reduction_splits.values()
-        )
+        return math.prod(self.splits.values())
 
     @property
-    def is_clean(self) -> bool:
-        """True when no reduction axis is split, so the output is fully sliced
-        across cores (no per-core partial sums)."""
-        return not self.reduction_splits
+    def output_splits(self) -> dict[sympy.Symbol, int]:
+        return {s: v for s, v in self.splits.items() if s not in self.reduction_syms}
+
+    @property
+    def reduction_splits(self) -> dict[sympy.Symbol, int]:
+        return {s: v for s, v in self.splits.items() if s in self.reduction_syms}
 
     @property
     def output_partition(self) -> int:
         """How many cores the output buffer is sliced across."""
         return math.prod(self.output_splits.values())
 
-    def signature_key(self):
-        """Per-core slicing signature, or ``None`` for a reduction-split division
-        (a ``None`` never compares equal, so partial-reduction divisions never
-        match). Only used within one operation's symbol namespace."""
-        return (
-            tuple(sorted(self.output_splits.items(), key=lambda item: str(item[0])))
-            if self.is_clean
-            else None
-        )
-
     @property
     def label(self) -> str:
+        """Human-readable rendering of this division's splits, e.g.
+        ``"s0/4 ~s1/2"`` (output split by 4 on symbol 0, reduction split by 2
+        on symbol 1), or ``"whole"`` for the untouched, undivided candidate."""
         out = ",".join(
             f"s{s}/{f}"
-            for s, f in sorted(
-                self.output_splits.items(), key=lambda item: str(item[0])
-            )
+            for s, f in sorted(self.output_splits.items(), key=lambda i: str(i[0]))
         )
         red = ",".join(
             f"~s{s}/{f}"
-            for s, f in sorted(
-                self.reduction_splits.items(), key=lambda item: str(item[0])
-            )
+            for s, f in sorted(self.reduction_splits.items(), key=lambda i: str(i[0]))
         )
         return " ".join(p for p in (out, red) if p) or "whole"
 
@@ -334,11 +316,10 @@ class CoreDivisionBuffer(LifetimeBoundBuffer):
 
     @property
     def sym_cores(self) -> sympy.Symbol:
-        output, reduction = self.sym_core_divs
-        return math.prod(output.values()) * math.prod(reduction.values())
+        return math.prod(self.sym_core_divs.values())
 
     @property
-    def sym_core_divs(self) -> tuple[dict, dict]:
+    def sym_core_divs(self) -> dict[sympy.Symbol, sympy.Symbol]:
         """Symbolic stand-in for a chosen ``op_it_space_splits``: one symbol per
         stride coefficient seen across this buffer's candidate divisions, so the
         cost model can carry an undecided split as an unknown rather than a
@@ -349,21 +330,12 @@ class CoreDivisionBuffer(LifetimeBoundBuffer):
             d = {arg: None for arg in args}
             return list(d)
 
-        output_keys = unique(
-            itertools.chain.from_iterable(cd.output_splits for cd in core_divs)
-        )
-        reduction_keys = unique(
-            itertools.chain.from_iterable(cd.reduction_splits for cd in core_divs)
-        )
+        keys = unique(itertools.chain.from_iterable(cd.splits for cd in core_divs))
 
-        def sym(prefix, key):
-            return sympy.Symbol(
-                f"{prefix}_split_{self.name}_{key}", integer=True, positive=True
-            )
-
-        sym_output_splits = {key: sym("output", key) for key in output_keys}
-        sym_reduction_splits = {key: sym("reduction", key) for key in reduction_keys}
-        return (sym_output_splits, sym_reduction_splits)
+        return {
+            key: sympy.Symbol(f"split_{self.name}_{key}", integer=True, positive=True)
+            for key in keys
+        }
 
 
 def check_in_place_parent_is_read(

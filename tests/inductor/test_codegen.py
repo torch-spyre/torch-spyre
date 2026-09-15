@@ -487,6 +487,14 @@ class TestSdscJsonSymbolicDimSmoke(InductorTestCase):
 
 
 class TestTiledAwayPhysicalAxis(InductorTestCase):
+    def test_native_bmm_fake_broadcasts_gqa_axis(self):
+        query = torch.empty((1, 8, 4, 256, 128), device="meta")
+        key = torch.empty((1, 8, 1, 128, 256), device="meta")
+
+        result = torch.ops.spyre.batched_matmul(query, key)
+
+        self.assertEqual(result.shape, (1, 8, 4, 256, 256))
+
     def test_nonstick_role_uses_coordinate_axis_across_tiled_away_axis(self):
         """A constant GQA group slot must not collapse the Hkv stride."""
         d0, d1, d2, d3 = sympy.symbols("d0:4")

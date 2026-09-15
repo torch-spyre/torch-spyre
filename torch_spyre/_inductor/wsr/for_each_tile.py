@@ -221,7 +221,13 @@ def _xs_leaf(operand: torch.Tensor, spec: TileSpec) -> torch.Tensor:
         return spec.index
     moved = _movedim(operand, spec.dim, 0)
     # Splitting dim 0 is always expressible in strides, so this is a view.
-    return moved.unflatten(0, (moved.shape[0] // spec.extent, spec.extent))
+    #
+    # `torch.unflatten`, not `Tensor.unflatten`: the method has a Python body
+    # (`return super().unflatten(...)`, torch/_tensor.py) that dynamo normally
+    # never reaches. Under an active `torch.device` mode -- vLLM runs its model
+    # inside one -- DeviceContext.__torch_function__ re-dispatches into that body
+    # and dynamo cannot trace the `super()` call. The free function has no body.
+    return torch.unflatten(moved, 0, (moved.shape[0] // spec.extent, spec.extent))
 
 
 def _tile(operand: torch.Tensor, spec: TileSpec, sliced: torch.Tensor) -> torch.Tensor:
