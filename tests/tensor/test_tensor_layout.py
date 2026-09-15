@@ -19,13 +19,13 @@ import pickle
 import unittest
 
 import torch
+from torch.spyre import SpyreTensorLayout, get_device_dtype
 from torch.testing._internal.common_utils import (
     TestCase,
     instantiate_parametrized_tests,
     parametrize,
     run_tests,
 )
-from torch.spyre import SpyreTensorLayout, get_device_dtype
 from torch_spyre._C import DataFormats, ElementArrangement, get_device_size_in_bytes
 
 
@@ -774,6 +774,18 @@ class TestSpyreTensorLayout(TestCase):
             [1, 4, 64], [-1, 0, 1], fp16, ElementArrangement.STANDARD
         )
         self.assertEqual(list(ok.device_size), [1, 4, 64])
+
+    def test_unsupported_dtype_raises_at_construction(self):
+        """
+        Regression test for issue #4487: constructing SpyreTensorLayout with an
+        unsupported dtype (float64) must raise RuntimeError immediately rather
+        than silently producing an INVALID-dtype layout that later causes a
+        divide-by-zero / SIGFPE during device-size geometry calculation.
+        """
+        with self.assertRaisesRegex(
+            RuntimeError, "Spyre backend does not support dtype Double"
+        ):
+            SpyreTensorLayout([8], torch.float64)
 
 
 if __name__ == "__main__":
