@@ -51,6 +51,7 @@ from .logging_utils import get_inductor_logger
 
 from . import customops  # noqa: F401
 from . import spyre_hint
+from .wsr import for_each_tile
 from torch_spyre._C import DataFormats, get_device_dtype, get_elem_in_stick
 import torch_spyre._inductor.customops  # noqa: F401
 
@@ -1275,168 +1276,122 @@ def spyre__sdpa_overrideable(
                 f"GQA attention bias must have rank 2-5, got rank {attn_bias.dim()}"
             )
 
-    # Bound each loop group's Lq-tile x unrolled-Lk-block product. Keeping many
-    # Lk blocks together with a long Lq loop produces oversized bundles that can
-    # crash DXP or the runtime H2D launch. A sixteen-pair budget groups blocks
-    # while that is possible; once the Lq loop itself reaches that size, each Lk
-    # block gets a separate group. The functional M/denominator/output SSA
-    # carries are materialized between groups and then resume the exact same
-    # online-softmax recurrence.
-    for block_group_start in range(
-        0, tiling.num_kv_blocks, tiling.kv_blocks_per_loop_group
-    ):
-        block_group_end = min(
-            block_group_start + tiling.kv_blocks_per_loop_group,
-            tiling.num_kv_blocks,
-        )
-        with spyre_hint(tiles={"batch_size": max(1, batch_size // 2)}):
-            head_tiles = {} if use_gqa else {"num_heads": tiling.num_head_tiles}
-            with spyre_hint(tiles=head_tiles):
-                with (
-                    spyre_hint(num_tiles_per_dim={"max_seqlen_q": tiling.num_q_tiles}),
-                    (
-                        spyre_hint(work_div=tiling.work_div)
-                        if tiling.work_div is not None
-                        else contextlib.nullcontext()
-                    ),
-                ):
-                    # Materialize scaled Q inside the sequence-tile scope. It is
-                    # loop-invariant across the unrolled KV blocks below.
+    # for_each_tile requires equal-sized tiles. Preserve the cost model's block
+    # size as an upper bound and choose the nearest exact divisor. This normally
+    # leaves aligned model shapes unchanged and avoids a separately unrolled
+    # ragged tail.
+    num_kv_tiles = _num_tiles_for_max_extent(max_seqlen_kv, tiling.kv_block_size)
+    kv_tile_size = max_seqlen_kv // num_kv_tiles
+
+    kv_dim_names = (
+        ["_b", "num_kvheads", "_gqa_broadcast", "blk_len", "head_dim"]
+        if use_gqa
+        else ["_b", "num_heads", "blk_len", "head_dim"]
+    )
+    score_dim_names = (
+        [
+            "_b",
+            "num_kvheads",
+            "gqa_group_size",
+            "max_seqlen_q",
+            "blk_len",
+        ]
+        if use_gqa
+        else ["_b", "num_heads", "max_seqlen_q", "blk_len"]
+    )
+
+    loop_operands = [key, value]
+    loop_dims: list[int | None] = [-2, -2]
+    if is_causal:
+        loop_operands.append(causal_mask)
+        loop_dims.append(-1)
+    if attn_bias is not None:
+        loop_operands.append(attn_bias)
+        if attn_bias.size(-1) == max_seqlen_kv:
+            loop_dims.append(-1)
+        elif attn_bias.size(-1) == 1:
+            loop_dims.append(None)
+        else:
+            raise Unsupported(
+                "Attention bias last dimension must be 1 or the K/V sequence "
+                f"length, got {attn_bias.size(-1)} and {max_seqlen_kv}"
+            )
+
+    with spyre_hint(tiles={"batch_size": max(1, batch_size // 2)}):
+        head_tiles = {} if use_gqa else {"num_heads": tiling.num_head_tiles}
+        with spyre_hint(tiles=head_tiles):
+            with (
+                spyre_hint(num_tiles_per_dim={"max_seqlen_q": tiling.num_q_tiles}),
+                (
+                    spyre_hint(work_div=tiling.work_div)
+                    if tiling.work_div is not None
+                    else contextlib.nullcontext()
+                ),
+            ):
+                # Q is invariant across the counted Lk loop.
+                with spyre_hint(named_dims=query_dim_names):
+                    q_scaled = query * scaling_factor
+
+                def sdpa_lk_body(carry, tiles):
+                    running_max, running_denom, running_output = carry
+                    k_blk, v_blk, *mask_blocks = tiles
+                    if use_gqa:
+                        k_blk = k_blk.unsqueeze(2)
+                        v_blk = v_blk.unsqueeze(2)
+
+                    with spyre_hint(named_dims=kv_dim_names):
+                        scaled_keys = k_blk * scaling_factor
+                    with spyre_hint(named_dims=kv_dim_names):
+                        v_blk = v_blk.contiguous()
+                    keys_T = scaled_keys.transpose(-1, -2).contiguous()
+
+                    with spyre_hint(named_dims=score_dim_names):
+                        scores = (
+                            torch.ops.spyre.batched_matmul(q_scaled, keys_T)
+                            if use_gqa
+                            else torch.matmul(q_scaled, keys_T)
+                        )
+
+                    mask_index = 0
+                    if is_causal:
+                        scores = scores + mask_blocks[mask_index]
+                        mask_index += 1
+                    if attn_bias is not None:
+                        scores = scores + mask_blocks[mask_index]
+
+                    block_max = torch.amax(scores, dim=-1)
+                    new_max = torch.maximum(running_max, block_max)
+                    exp_scores = torch.exp(scores - new_max.unsqueeze(-1))
+                    correction = torch.exp(running_max - new_max)
+                    new_denom = running_denom * correction + exp_scores.sum(dim=-1)
+                    exp_scores_c = exp_scores.contiguous()
                     with spyre_hint(named_dims=query_dim_names):
-                        q_scaled = query * scaling_factor
-                    for blk in range(block_group_start, block_group_end):
-                        start = blk * tiling.kv_block_size
-                        end = min(start + tiling.kv_block_size, max_seqlen_kv)
-
-                        k_blk = key[..., start:end, :]
-                        v_blk = value[..., start:end, :]
-                        if use_gqa:
-                            k_blk = k_blk.unsqueeze(2)
-                            v_blk = v_blk.unsqueeze(2)
-
-                        kv_dim_names = (
-                            [
-                                "_b",
-                                "num_kvheads",
-                                "_gqa_broadcast",
-                                "blk_len",
-                                "head_dim",
-                            ]
+                        weighted = (
+                            torch.ops.spyre.batched_matmul(exp_scores_c, v_blk)
                             if use_gqa
-                            else ["_b", "num_heads", "blk_len", "head_dim"]
+                            else torch.matmul(exp_scores_c, v_blk)
                         )
+                    new_output = running_output * correction.unsqueeze(-1) + weighted
+                    return (new_max, new_denom, new_output), None
 
-                        # The K/V slices are produced in-graph, so they carry no
-                        # named dims and stay untiled -- forming a restickify
-                        # boundary against the tiled matmuls that consume them.
-                        # Name each slice's first consuming op so the per-chunk
-                        # key extent ("blk_len") propagates and the producers tile
-                        # with their consumers.
-                        with spyre_hint(named_dims=kv_dim_names):
-                            scaled_keys = k_blk * scaling_factor
-                        # v_blk feeds the second matmul directly (line below), so
-                        # unlike scaled_keys (re-normalized by keys_T.contiguous())
-                        # it has no downstream .contiguous() to fix its layout. For
-                        # a transposed value view the slice's physical strides stay
-                        # transposed (a pointwise op preserves its input's stride
-                        # order via pick_loop_order), which scrambles the tiled
-                        # matmul. .contiguous() lowers to aten.clone(contiguous),
-                        # which the Spyre clone override freezes to contiguous
-                        # strides -- normalizing this [B, H, blk_len, D] slice per
-                        # block without a full-tensor value.contiguous() (an OOM on
-                        # long KV). The named_dims seed lands on the resulting clone, so
-                        # blk_len still propagates.
-                        with spyre_hint(named_dims=kv_dim_names):
-                            v_blk = v_blk.contiguous()
-                        # .contiguous() materializes the transposed keys so the
-                        # scores matmul sees a clean single-contraction-dim input.
-                        # Without it the backend scheduler aborts with
-                        # out_reuse_dim.size() == 1 (L3DlOpsScheduler): the
-                        # transposed view's loop-dim-order leaves the matmul with
-                        # an ambiguous contraction dim under Lq tiling.
-                        keys_T = scaled_keys.transpose(
-                            -1, -2
-                        ).contiguous()  # batch_size, num_heads, head_dim, blk_len
-                        # A matmul output inherits no named dims from its inputs,
-                        # so naming it explicitly is what keeps the op inside the
-                        # max_seqlen_q tile region (otherwise it becomes an
-                        # untiled restickify boundary). "blk_len" is the per-chunk
-                        # key extent -- the scores' last axis.
-                        score_dim_names = (
-                            [
-                                "_b",
-                                "num_kvheads",
-                                "gqa_group_size",
-                                "max_seqlen_q",
-                                "blk_len",
-                            ]
-                            if use_gqa
-                            else ["_b", "num_heads", "max_seqlen_q", "blk_len"]
-                        )
-                        with spyre_hint(named_dims=score_dim_names):
-                            scores = (
-                                torch.ops.spyre.batched_matmul(q_scaled, keys_T)
-                                if use_gqa
-                                else torch.matmul(q_scaled, keys_T)
-                            )
-
-                        if is_causal:
-                            scores = scores + causal_mask[..., :, start:end]
-
-                        if attn_bias is not None:
-                            scores = scores + attn_bias[..., :, start:end]
-
-                        block_max = torch.amax(
-                            scores, dim=-1
-                        )  # batch_size, num_heads, max_seqlen_q sparse
-                        new_max = torch.maximum(
-                            M, block_max
-                        )  # batch_size, num_heads, max_seqlen_q sparse
-
-                        exp_scores = torch.exp(
-                            scores - new_max.unsqueeze(-1)
-                        )  # batch_size, num_heads, max_seqlen_q, blk_len
-                        correction = torch.exp(
-                            M - new_max
-                        )  # batch_size, num_heads, max_seqlen_q sparse
-
-                        # Online-softmax recurrence as FUNCTIONAL SSA -- no
-                        # in-place copy_f writeback. copy_f mutates the whole
-                        # accumulator buffer and is NOT tile-aware: under the
-                        # max_seqlen_q tile it left the second query-tile's
-                        # accumulators un-updated (0/0 -> nan, exp(-inf) -> inf).
-                        # Threading new values forward (as in the coarse-tile
-                        # flash e2e test, PR #3674) keeps each Lq tile's carry
-                        # correct. The names flow from q_scaled/the matmuls.
-                        new_denom = denominator * correction + exp_scores.sum(
-                            dim=-1
-                        )  # batch_size, num_heads, max_seqlen_q sparse
-                        # Materialize exp_scores before the second matmul for the
-                        # same reason as keys_T above -- a clean contiguous input
-                        # keeps the matmul's contraction dim unambiguous.
-                        exp_scores_c = exp_scores.contiguous()
-                        with spyre_hint(named_dims=query_dim_names):
-                            weighted = (
-                                torch.ops.spyre.batched_matmul(exp_scores_c, v_blk)
-                                if use_gqa
-                                else torch.matmul(exp_scores_c, v_blk)
-                            )
-                        new_output = (
-                            output * correction.unsqueeze(-1) + weighted
-                        )  # batch_size, num_heads, max_seqlen_q, head_dim
-
-                        if blk == tiling.num_kv_blocks - 1:
-                            # The final divide must live INSIDE the innermost tile
-                            # scope (#3674 point #4): read past the loop group it
-                            # becomes a full untiled buffer whose input
-                            # (new_output, written in the tiled region) is
-                            # split-layout, so finalize_layouts hits
-                            # restickify-infeasible. Fold it into the last KV
-                            # block so it inherits the max_seqlen_q tile.
-                            with spyre_hint(named_dims=query_dim_names):
-                                output = new_output / new_denom.unsqueeze(-1)
-                        else:
-                            M, denominator, output = new_max, new_denom, new_output
+                if num_kv_tiles == 1:
+                    # scan-to-while-loop cannot currently trace a one-trip scan
+                    # because its unrolled replacement extracts the loop index
+                    # with item(). There is no compile-time unrolling to avoid in
+                    # this case, so invoke the body directly.
+                    (M, denominator, output), _ = sdpa_lk_body(
+                        (M, denominator, output), tuple(loop_operands)
+                    )
+                else:
+                    (M, denominator, output), _ = for_each_tile(
+                        sdpa_lk_body,
+                        tuple(loop_operands),
+                        dims=tuple(loop_dims),
+                        tile_size=kv_tile_size,
+                        init=(M, denominator, output),
+                    )
+                with spyre_hint(named_dims=query_dim_names):
+                    output = output / denominator.unsqueeze(-1)
     if use_gqa:
         output = output.flatten(1, 2)
     # The reference meta kernel for this op

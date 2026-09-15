@@ -289,6 +289,16 @@ def for_each_tile(
         ``(final_carry, out)``, either of which is ``None`` for the unused mode.
     """
     operands = tuple(operands)
+    # A for_each_tile introduced by an AOT decomposition inherits the existing
+    # FakeTensorMode instead of passing through Dynamo's scalar-capture setup.
+    # Inductor's scan-to-while-loop pass calls item() on its scalar induction
+    # variable while tracing, so permit scalar outputs on that mode. The mode is
+    # local to the active compilation; direct user HOPs already get this setting
+    # from fullgraph capture.
+    if not torch.compiler.is_dynamo_compiling():
+        fake_mode = torch._guards.detect_fake_mode(operands)
+        if fake_mode is not None:
+            fake_mode.allow_scalar_outputs = True
     specs, num_tiles = _normalize_in_specs(operands, dims, tile_size)
 
     if isinstance(out_dim, Gather):
