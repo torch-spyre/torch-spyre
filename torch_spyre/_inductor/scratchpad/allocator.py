@@ -42,6 +42,7 @@ from torch_spyre._inductor.pass_utils import (
     PerCoreView,
     commit_iteration_space_ownership,
     concretize_expr,
+    indirect_access_subs_from_op,
     indirect_info_from_op,
     iteration_space_from_op,
     op_read_writes,
@@ -53,8 +54,8 @@ from torch_spyre._inductor.pass_utils import (
 )
 from torch_spyre._C import get_device_size_in_bytes
 from torch_spyre._inductor.work_division import (
-    _has_work_div_hint,
     enumerate_work_division_candidates,
+    has_work_div_hint,
     work_division_splits_are_legal,
 )
 from torch_spyre._inductor.errors import Unsupported
@@ -89,6 +90,7 @@ from torch_spyre._inductor.scratchpad.utils import (
     calculate_liveness,
     get_buffer_users,
     ops_in_offset_mutation_component,
+    dep_has_constant_offset,
     get_op_pointwise_inputs,
     buffer_not_read_in_full,
     is_empty_tiled_layout,
@@ -102,6 +104,12 @@ from torch_spyre._inductor.scratchpad.utils import (
 )
 from torch_spyre._inductor.scratchpad.graph_editor import GraphEditor
 from torch_spyre._inductor.ir import FixedTiledLayout, SpyreEmptyFallback
+from torch_spyre._inductor.constants import (
+    BATCH_MATMUL_FP8_OP,
+    DEVICE_NAME,
+    KEEP_BY_INDEX_OP,
+    POOL_OPS,
+)
 
 from torch_spyre._inductor import config
 from torch_spyre._inductor.logging_utils import get_inductor_logger
@@ -1435,6 +1443,170 @@ def _core_division(op: Operation, splits: dict[sympy.Symbol, int]) -> CoreDivisi
     return CoreDivision(splits=sparse, reduction_syms=_reduction_syms(op, sparse))
 
 
+def _is_cpu_host_buffer(op: Operation) -> bool:
+    """True for a ComputedBuffer that is not on the Spyre device.
+
+    CPU/host buffers participate in the joint division map (as producers or
+    consumers in the slicing-match) but never reside in LX and are never
+    re-sliced, so they keep their committed division.
+    """
+    if not isinstance(op, ComputedBuffer):
+        return False
+    layout = op.maybe_get_layout()
+    return layout is None or layout.device.type != DEVICE_NAME
+
+
+def _is_windowed_pool(op: Operation) -> bool:
+    """True for a windowed pool (avgpoolfwd) reduction op.
+
+    Its output spatial split cannot be re-chosen by the joint solver without
+    risking a mis-addressed per-core input; see the pin in ``_division_map``.
+    """
+    return (
+        isinstance(op, ComputedBuffer)
+        and isinstance(op.data, Reduction)
+        and op.data.reduction_type in POOL_OPS
+    )
+
+
+def _is_coarse_tiled(op: Operation) -> bool:
+    """True for an op inside a coarse-tile loop group (carries ``loop_info``)."""
+    return getattr(op, "loop_info", None) is not None
+
+
+def _drop_reduction_splits_in_coarse_group(
+    op: Operation, divs: list[CoreDivision]
+) -> list[CoreDivision]:
+    """Forbid K-splitting a matmul/reduction op inside a coarse-tile counted loop.
+
+    A coarse-tile group runs its ops inside a counted loop that already
+    accumulates across tiles (e.g. a flash-attention running sum). A candidate
+    that splits a *reduction* axis (a K-split: an axis absent from the write
+    index) adds a second, cross-core partial-sum accumulation nested inside that
+    loop nest, and the two are not combined correctly -- silently wrong output
+    (~86% element mismatch on ``buf21``, the flash-attention output matmul, tiled
+    over H). The identical K-split is correct *outside* a coarse group, so this is
+    scoped to ``loop_info`` ops and only drops reduction-split candidates --
+    output-axis splits (and single-core) are still offered, so the joint solver
+    keeps whatever safe parallelism it can. Narrower than pinning the op's whole
+    division. Never returns an empty list: if every candidate carries a reduction
+    split, the originals are kept so the solve still has something legal to pick
+    (correctness there falls back to the non-co-optimized path).
+    """
+    if not _is_coarse_tiled(op):
+        return divs
+    safe = [cd for cd in divs if not cd.reduction_splits]
+    return safe or divs
+
+
+def _is_indirect_access_op(op: Operation) -> bool:
+    """True for a gather (``index``) or scatter (``index_put``) op.
+
+    An indirect op accesses one operand through a runtime index
+    (``IndirectAccess``): a gather reads ``src[idx]``, a scatter writes
+    ``dest[idx]``. The work-division pass parallelizes these on the index-entry
+    dim and never on the shared table/destination data dim (splitting the shared
+    base is silently wrong). The joint solver does not preserve that split: a
+    scatter's entry dim reaches ``_core_division`` as a reduction split (write
+    coeff 0 through IndirectAccess) which the solver then avoids, and a gather's
+    entry split is a plain tie the memory-only objective breaks toward a single
+    core -- both drop the multicore entry-dim parallelism. Pin every indirect op
+    to its fixed (work-division) division so co-optimization keeps the entry
+    split, mirroring the keep_by_index pin. Correctness is unchanged either way
+    (the shared data dim is never split); this restores the expected parallelism.
+    """
+    return isinstance(op, ComputedBuffer) and bool(indirect_access_subs_from_op(op))
+
+
+def _reads_offset_slice(op: Operation) -> bool:
+    """True for an op that reads an input at a constant (slice) offset.
+
+    A sliced read -- ``exp(x[:, :, 32:96])`` reads its operand at index
+    ``... + 32`` -- carries a non-zero constant term in the read index.
+    Splitting the sliced dim across cores mis-addresses the per-core slice: the
+    sliced dim is a non-stick device coordinate offset into a wider operand dim
+    (``d2 + 32`` into a 128-wide dim in the restickified operand), so a per-core
+    sub-range lands at a span the DSM read address cannot express -- silent ~44%
+    error on ``exp(x[:, :, 32:96])`` over 128x192x256. The work-division pass
+    picks a safe division for these ops (it never split the offset dim); the
+    joint solver does, so pin the op to that fixed division, mirroring the
+    keep_by_index pin. Correctness is unchanged (the fixed division is what the
+    non-co-optimized path uses); only the offending split is removed. Blocking
+    the offset dim alone is not enough -- it forces the solver onto a different
+    unsafe split for a sliced reduction -- so the whole op is pinned. Indirect
+    (data-dependent) offsets are handled by ``_is_indirect_access_op``.
+
+    Shares ``dep_has_constant_offset`` with ``_writes_at_constant_offset``, the
+    write-side detector behind ``ops_in_offset_mutation_component``: both ask the
+    same question of a dep, so they must answer it the same way (in particular,
+    per-core/coarse-tile shifts are symbolic and are not offsets).
+    """
+    if not isinstance(op, ComputedBuffer):
+        return False
+    return any(dep_has_constant_offset(dep) for dep in op_read_writes(op).reads)
+
+
+def _fused_layout_group_ops(
+    graph: GraphLowering, seed_reasons: dict[str, str]
+) -> dict[str, str]:
+    """Map each op in a fused layout group to the pin reason of its seed.
+
+    ``seed_reasons`` maps a seed reduction type to the reason string reported
+    when its group is pinned; every op in that seed's group inherits it.
+
+    A group is one seed reduction plus the input producers it reads (one hop
+    back) and the consumers of its output (one hop forward): the tightly coupled
+    neighbours the work-division pass slices into a single mutually compatible
+    per-core division. The joint solver, free to divide each op independently,
+    can hand the group's members incompatible divisions and corrupt the shared
+    per-core addressing/scheduling, so the caller pins the whole group to its
+    fixed (work-division) division. Two op kinds need this identical treatment:
+
+    * ``keepbyindex`` reproduces a fragile multi-stick search layout that its
+      input restickifies and output clones carry too; an output clone splitting
+      the search axis while the reduction keeps it whole drops the second search
+      stick's kept values (silently wrong, ~2-3% of a 6x17x4x128 dim-3
+      keep_by_index). Its own unsafe splits are separately blocked by
+      ``keep_by_index_search_adjacent_blocked_vars``.
+    * ``batchmatmulfp8`` fuses the fp8 quantize of its operands and the
+      dequant/bias of its output into one SDSC bundle; leaving the matmul
+      single-core-in-LX (``{}``) while its operands split aborts DeepTools L3
+      scheduling (``distributeElemArrToTemporalLoops: Not enough elements to
+      distribute``, a 4x128 @ 128x1024 fp8 scaled_mm). Only the fused neighbours
+      need it -- the quantize chain feeding the operand producers is a separate
+      bundle -- and a plain fp16 batchmatmul (no fused quantize) is not seeded.
+
+    Both seeds are scanned in one pass, so adding a seed costs no extra graph
+    walk.
+    """
+    seeds = [
+        op
+        for op in graph.operations
+        if isinstance(op, ComputedBuffer)
+        and isinstance(op.data, Reduction)
+        and op.data.reduction_type in seed_reasons
+    ]
+    if not seeds:
+        return {}
+    # Reason per seed name, so producers and consumers inherit it below.
+    reason_of_seed = {op.name: seed_reasons[op.data.reduction_type] for op in seeds}
+    group: dict[str, str] = dict(reason_of_seed)
+    # Producers of each seed's input buffers (restickifies / fp8 quantize).
+    for seed in seeds:
+        for dep in op_read_writes(seed).reads:
+            if isinstance(dep, MemoryDep):
+                group.setdefault(dep.name, reason_of_seed[seed.name])
+    # Consumers of any seed output (output clones / dequant / bias-add).
+    for op in graph.operations:
+        if not isinstance(op, ComputedBuffer):
+            continue
+        for dep in op_read_writes(op).reads:
+            if isinstance(dep, MemoryDep) and dep.name in reason_of_seed:
+                group.setdefault(op.name, reason_of_seed[dep.name])
+                break
+    return group
+
+
 def _view_for_div(
     op: Operation,
     dep: MemoryDep,
@@ -1587,8 +1759,19 @@ def build_residency_edge(
         ),
         None,
     )
+
+    def wrapped_hasattr(obj, attr):
+        try:
+            return hasattr(obj, attr)
+        except NotImplementedError:
+            return False
+
     read_dep = next(
-        (r for r in consumer_reads if r.name == buf_name and hasattr(r, "index")),
+        (
+            r
+            for r in consumer_reads
+            if r.name == buf_name and wrapped_hasattr(r, "index")
+        ),
         None,
     )
     if write_dep is None or read_dep is None:
@@ -1602,13 +1785,6 @@ def build_residency_edge(
         parent_is_matmul=_is_matmul_op(parent_op),
         prep_cache=prep_cache,
     )
-
-
-def _op_has_work_div_hint(op: Operation) -> bool:
-    """True when a user work_div hint governs ``op``'s division."""
-    if not isinstance(op, ComputedBuffer):
-        return False
-    return _has_work_div_hint(op)
 
 
 def _fixed_core_division(op: Operation) -> CoreDivision:
@@ -1719,11 +1895,27 @@ def _split_fits_sticks(op: Operation, splits: dict[sympy.Symbol, int]) -> bool:
         return False
     sizes = _output_stride_to_device_size(op)
     for sym, factor in splits.items():
-        stride = int(write.index.coeff(sym))
+        stride = concretize_expr(write.index.coeff(sym))
         size = sizes.get(stride, 0)
         if factor > 1 and stride and (not size or size % factor):
             return False
     return True
+
+
+def _output_axis_symbols(
+    write: sympy.Expr, iter_syms: dict[sympy.Symbol, sympy.Expr]
+) -> dict[int, sympy.Symbol]:
+    """Map each output stride in ``write`` to the iteration symbol it scales.
+
+    Only iteration symbols are axes. Under dynamic shapes the index also carries
+    size symbols (``d0*s20 + d1``), whose coefficients are loop variables rather
+    than strides, so ``write.free_symbols`` cannot be used directly.
+    """
+    return {
+        concretize_expr(write.coeff(sym)): sym
+        for sym in iter_syms
+        if sym in write.free_symbols
+    }
 
 
 def _matmul_axis_parse(op: Operation) -> dict[str, tuple[sympy.Symbol, int, int]]:
@@ -1738,8 +1930,10 @@ def _matmul_axis_parse(op: Operation) -> dict[str, tuple[sympy.Symbol, int, int]
     rw = op_read_writes(op)
     write = next(iter(rw.writes)).index
     read = next((dep.index for dep in rw.reads), write)
-    out_syms = {int(write.coeff(sym)): sym for sym in write.free_symbols}
-    k_syms = read.free_symbols - write.free_symbols
+    iter_syms = iteration_space_from_op(op)
+    out_syms = _output_axis_symbols(write, iter_syms)
+    k_syms = {sym for sym in iter_syms if sym in read.free_symbols}
+    k_syms -= write.free_symbols
     if not k_syms:
         raise ValueError(f"matmul {op.get_name()} has no reduction axis")
     sizes = _output_stride_to_device_size(op)
@@ -1751,7 +1945,7 @@ def _matmul_axis_parse(op: Operation) -> dict[str, tuple[sympy.Symbol, int, int]
     k_sym = min(k_syms, key=str)
     roles["K"] = (
         k_sym,
-        concretize_expr(iteration_space_from_op(op)[k_sym]),
+        concretize_expr(iter_syms[k_sym]),
         seed[k_sym],
     )
     return roles
@@ -1775,7 +1969,7 @@ def _reduction_bm_axes(
     M. Reductions with fewer than two output axes cannot use this factorization.
     """
     write = next(iter(op_read_writes(op).writes)).index
-    out_syms = {int(write.coeff(sym)): sym for sym in write.free_symbols}
+    out_syms = _output_axis_symbols(write, iteration_space_from_op(op))
     if len(out_syms) < 2:
         return None
     m_stride, b_stride = sorted(out_syms)[-2:]
@@ -1819,7 +2013,7 @@ def _output_profile(op: Operation, splits: dict[sympy.Symbol, int]) -> dict[int,
     """
     write = next(iter(op_read_writes(op).writes)).index
     return {
-        int(write.coeff(sym)): factor
+        concretize_expr(write.coeff(sym)): factor
         for sym, factor in splits.items()
         if factor > 1 and write.coeff(sym) != 0
     }
@@ -1831,7 +2025,9 @@ def _from_output_profile(
     """Apply a transient physical output profile as a symbol-keyed candidate."""
     write = next(iter(op_read_writes(op).writes)).index
     return {
-        sym: profile.get(int(write.coeff(sym)), 1) if write.coeff(sym) != 0 else 1
+        sym: profile.get(concretize_expr(write.coeff(sym)), 1)
+        if write.coeff(sym) != 0
+        else 1
         for sym in iteration_space_from_op(op)
     }
 
@@ -2258,24 +2454,40 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         -- asserted here because nothing downstream re-checks it (issue #4387).
         """
         max_cores = config.sencores
-        fixed_division_ops = ops_in_offset_mutation_component(graph)
         profiles, matmul_roles = _find_distinct_matmul_splits(graph.operations)
 
+        # Ops pinned to their committed (work-division) division: each guard
+        # detects a distinct wrong-code or scheduling hazard the joint solver
+        # would hit by re-slicing the op, and all share the one remedy -- keep the
+        # fixed division. The graph-level group sets are loop-invariant, so build
+        # them once here rather than rescanning graph.operations for every op.
+        offset_mutation_ops = ops_in_offset_mutation_component(graph)
+        layout_group_reason = _fused_layout_group_ops(
+            graph,
+            {
+                KEEP_BY_INDEX_OP: "keep_by_index layout group",
+                BATCH_MATMUL_FP8_OP: "fp8 matmul layout group",
+            },
+        )
         result = {}
+        hinted_unpinned: list[str] = []
         for op in graph.operations:
-            if op.name in fixed_division_ops:
-                divs = _legal_fixed_division(
-                    op, [_fixed_core_division(op)], "offset mutation component"
-                )
-            elif not config.ignore_work_division_hints and _op_has_work_div_hint(op):
-                # User hints take ownership of the split decision - the same
-                # contract the committed work-division path honors
-                # (work_division.py). The committed division already reflects
-                # the hint, so pin the candidate list to it; re-dividing a
-                # hinted op would silently override the user.
-                divs = _legal_fixed_division(
-                    op, [_fixed_core_division(op)], "user work_div hint"
-                )
+            reason: Optional[str] = None
+            if _is_cpu_host_buffer(op):
+                reason = "cpu/host buffer"
+            elif op.name in offset_mutation_ops:
+                reason = "offset mutation component"
+            elif _is_windowed_pool(op):
+                reason = "windowed pool"
+            elif op.name in layout_group_reason:
+                reason = layout_group_reason[op.name]
+            elif _is_indirect_access_op(op):
+                reason = "indirect access entry split"
+            elif _reads_offset_slice(op):
+                reason = "offset slice read"
+
+            if reason is not None:
+                divs = _legal_fixed_division(op, [_fixed_core_division(op)], reason)
             elif self.prune and isinstance(op, ComputedBuffer):
                 divs = [
                     _core_division(op, splits)
@@ -2283,10 +2495,35 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                         op, _enum_split_options(op, profiles, matmul_roles)
                     )
                 ]
+                if not divs:
+                    divs = _legal_fixed_division(
+                        op, [_fixed_core_division(op)], "empty pruned candidate set"
+                    )
             else:
                 divs = self._enumerate_core_divisions(op, max_cores)
+            if reason is None:
+                # Correctness guard for matmuls/reductions inside a coarse-tile
+                # counted loop: drop K-split (reduction-axis) candidates, which
+                # the loop nest cannot accumulate correctly. No-op outside a
+                # coarse group. See _drop_reduction_splits_in_coarse_group.
+                divs = _drop_reduction_splits_in_coarse_group(op, divs)
             if not divs:
                 raise Unsupported(f"{op.name}: no legal core-division candidates.")
+            if (
+                reason is None
+                and len(divs) > 1
+                and not config.ignore_work_division_hints
+                and isinstance(op, ComputedBuffer)
+                and has_work_div_hint(op)
+            ):
+                # Hint preservation under co-optimization is not implemented yet:
+                # this op carries a user ``work_div`` hint that work division
+                # committed, but it is not pinned by any guard above and has more
+                # than one candidate, so the joint solver may pick a different
+                # division. Warn rather than pin -- pinning every hinted op would
+                # silently disable co-optimization for hinted graphs, and the
+                # solver's choice is correct, just not the one asked for.
+                hinted_unpinned.append(op.name)
             # The core budget is an invariant of the MENU, not of its consumers: both
             # engines pin an op's split symbols to one enumerated candidate, so nothing
             # downstream re-checks the product -- and `_matmul_split_cost`'s own budget
@@ -2302,6 +2539,14 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                 + ", ".join(f"{d.label} ({d.cores_used} cores)" for d in over)
             )
             result[op.name] = divs
+
+        if hinted_unpinned:
+            logger.warning(
+                "work_division_hint: co-optimization may override the hinted core "
+                "division for %s. Hint preservation under co-optimization is not "
+                "supported yet; set CO_OPTIMIZING_LX_PLANNING=0 to honour the hint.",
+                ", ".join(sorted(hinted_unpinned)),
+            )
 
         return result
 
@@ -2721,13 +2966,19 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                 if k is None:
                     cd = consumer_divs[j]
                     per_sym = cd.splits
+                    # Project onto the input: a consumer split on an axis the
+                    # input lacks (e.g. a matmul's free dim) does not slice the
+                    # input, so it must not count toward the clone's cores.
+                    # Otherwise the cores_used check below cannot reject a
+                    # broadcast read.
+                    read_syms = read_dep.index.free_symbols
                     k = len(clone_divs)
                     clone_divs.append(
                         CoreDivision(
                             splits={
                                 sym: split
                                 for sym, split in per_sym.items()
-                                if split > 1
+                                if split > 1 and sym in read_syms
                             }
                         )
                     )  # a clone op cannot have a reduction split

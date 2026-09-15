@@ -348,7 +348,10 @@ class TestNamedWorkDivisionHint(InductorTestCase):
                 allowed_splits={m: frozenset({1})},
             )
 
-    @config.patch({"sencores": 8})
+    # Patch co optimization to False as partial hinting is not currently
+    # supported for work division.
+    # TODO: Support work division hint preservation with co-optimization
+    @config.patch({"sencores": 8, "co_optimizing_lx_planning": False})
     def test_pointwise_work_div_hint_applied(self):
         M, N = 128, 64
         x = torch.randn(M, N, dtype=torch.float16).to("spyre")
@@ -366,7 +369,7 @@ class TestNamedWorkDivisionHint(InductorTestCase):
         self._assert_user_hint_logged()
         self.assertIn("sympify('c0'): (sympify('128'), 4)", source_codes[0])
 
-    @config.patch({"sencores": 8})
+    @config.patch({"sencores": 8, "co_optimizing_lx_planning": False})
     def test_matmul_work_div_hint_maps_by_name(self):
         M, K, N = 128, 256, 64
         x = torch.randn(M, K, dtype=torch.float16).to("spyre")
@@ -385,6 +388,47 @@ class TestNamedWorkDivisionHint(InductorTestCase):
         self._assert_user_hint_logged()
         self.assertIn("sympify('c0'): (sympify('128'), 2)", source_codes[0])
         self.assertIn("sympify('c2'): (sympify('256'), 4)", source_codes[0])
+
+    def _declare_k_split_matmul_inputs(self):
+        """(B=3, M=11, K=192) activation and (K, N=128) weight, named."""
+        B, M, K, N = 3, 11, 192, 128
+        x = torch.randn(B, M, K, dtype=torch.float16).to("spyre")
+        w = torch.randn(K, N, dtype=torch.float16).to("spyre")
+        for name, size in (("B", B), ("M", M), ("K", K), ("N", N)):
+            _declare_tensor_dim(name, size)
+        _name_tensor_dims(x, ["B", "M", "K"])
+        _name_tensor_dims(w, ["K", "N"])
+        return x, w
+
+    @config.patch({"sencores": 8, "co_optimizing_lx_planning": False})
+    def test_matmul_k_split_hint_rejected_for_reordered_view_operand(self):
+        # x.view(33, K) keeps x's 3D device order [M, K-stick, B] while mm writes
+        # a fresh [N-stick, B*M] buffer. A K-split across that order mismatch is
+        # lowered to wrong results (~29% of elements here), so the hint must be
+        # rejected rather than silently applied.
+        x, w = self._declare_k_split_matmul_inputs()
+
+        def fn(x, w):
+            with spyre_hint(work_div={"K": 3}):
+                return x.view(33, 192).mm(w)
+
+        with self.assertRaisesRegex(Exception, "legal splits are"):
+            torch.compile(fn, dynamic=False)(x, w)
+
+    @config.patch({"sencores": 8, "co_optimizing_lx_planning": False})
+    def test_matmul_k_split_hint_kept_when_operand_order_matches_output(self):
+        # The same operands through a 3D matmul share the output's [M, stick, B]
+        # order, so the K-split stays legal and computes the right values.
+        x, w = self._declare_k_split_matmul_inputs()
+
+        def fn(x, w):
+            with spyre_hint(work_div={"K": 3}):
+                return torch.matmul(x, w)
+
+        result, source_codes = run_and_get_code(torch.compile(fn, dynamic=False), x, w)
+        self.assertIn("(sympify('192'), 3)", source_codes[0])
+        expected = torch.matmul(x.cpu().float(), w.cpu().float()).half()
+        torch.testing.assert_close(result.cpu(), expected, atol=5e-2, rtol=5e-2)
 
     @pytest.mark.xfail(
         strict=True,
@@ -1375,6 +1419,7 @@ def test_lx_relayout_normalizes_ownership_and_lowers_only_in_superdsc():
         # solver sets supports_paired_buffers. Pin it explicitly so this test
         # keeps exercising relayout regardless of the default layout_solver.
         "layout_solver": "greedy",
+        "co_optimizing_lx_planning": False,
     }
 )
 @pytest.mark.parametrize(
@@ -1475,6 +1520,7 @@ def test_lx_relayout_consumers_share_destination_view(second_consumer):
         "allow_all_ops_in_lx_planning": True,
         "lx_planner_relayout": True,
         "layout_solver": "greedy",
+        "co_optimizing_lx_planning": False,
     }
 )
 @pytest.mark.parametrize(
@@ -1540,6 +1586,7 @@ def test_grouped_lx_relayout_device(broadcast):
         "lx_planning": True,
         "allow_all_ops_in_lx_planning": True,
         "layout_solver": "greedy",
+        "co_optimizing_lx_planning": False,
     }
 )
 @pytest.mark.parametrize("reader", ["pointwise", "split_matmul", "restickify"])
@@ -1618,6 +1665,7 @@ def test_lx_relayout_read_expansion_device(reader, enabled):
         "lx_planning": True,
         "allow_all_ops_in_lx_planning": True,
         "layout_solver": "greedy",
+        "co_optimizing_lx_planning": False,
     }
 )
 def test_unhinted_moe_down_route_uses_the_production_hbm_fallback():

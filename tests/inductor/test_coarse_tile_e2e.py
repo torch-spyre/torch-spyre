@@ -4839,6 +4839,11 @@ class TestCoarseTileSpyreHints(InductorTestCase):
             with_mask=True,
         )
 
+    @config.patch(
+        {
+            "cpsat_time_limit_seconds": 30,
+        }
+    )
     def test_hint_flash_attention_kv_chunked_prefill_8k(self):
         """Chunked prefill: a 512-token query block against an 8k K/V cache.
 
@@ -4856,6 +4861,11 @@ class TestCoarseTileSpyreHints(InductorTestCase):
             h_tiles=4, lq_tiles=2, B=1, H=8, Lq=512, Lk=8192, D=128, kv_block=2048
         )
 
+    @config.patch(
+        {
+            "cpsat_time_limit_seconds": 30,
+        }
+    )
     def test_hint_flash_attention_kv_chunked_decode_8k(self):
         """Decode: one query token, batch 4, against a full 8k K/V cache.
 
@@ -4872,6 +4882,11 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         """h_tiles == H (one head per tile) is numerically exact."""
         self._run_kv_chunked_flash(h_tiles=8, lq_tiles=2)
 
+    @config.patch(
+        {
+            "cpsat_time_limit_seconds": 30,
+        }
+    )
     def test_hint_flash_attention_kv_chunked_8_chunks(self):
         """8 unrolled K/V chunks: now succeeds with optimized layouts for constants"""
         self._run_kv_chunked_flash(
@@ -6967,6 +6982,103 @@ def test_zeros_named_dims_hint_correctness():
     # s_named is expected to fail — zeros with explicit named_dims hint is broken
     torch.testing.assert_close(got_named.cpu(), ref_named, atol=0.5, rtol=0.1)
     torch.testing.assert_close(got_likecval.cpu(), ref_likecval, atol=0.5, rtol=0.1)
+
+
+class TestCoOptKSplitCoarseGroup(InductorTestCase):
+    """Co-optimization must not K-split a matmul inside a coarse-tile group.
+
+    A matmul living inside a coarse-tile counted loop tiled over a
+    *non-reduction* axis (here the head dim ``H``) has its output/batch axes
+    consumed by the loop, so the joint (co-optimizing) solver is tempted to
+    parallelize it by splitting the *reduction* (contraction) axis across
+    cores -- a K-split. The counted loop already accumulates across tiles; a
+    K-split adds a second, cross-core partial-sum accumulation nested inside
+    that loop nest, and the two are not combined correctly, so the output is
+    silently wrong.
+
+    The identical K-split is correct *outside* a coarse group (see
+    :class:`TestCoarseTileMatmulKTilingE2E` for the supported explicit-``K``
+    tiling loop), so the fix drops only reduction-split division candidates for
+    ``loop_info`` ops (``_drop_reduction_splits_in_coarse_group`` in
+    ``scratchpad/allocator.py``); output-axis splits are still allowed.
+
+    Runs under co-optimization explicitly so the guard is exercised regardless
+    of the default.
+    """
+
+    def setUp(self):
+        super().setUp()
+        torch.manual_seed(0xA11E)
+        _pnd.reset()
+
+    @mock_patch.object(config, "co_optimizing_lx_planning", True)
+    def test_matmul_in_h_tiled_loop_not_k_split(self):
+        """Three inputs, four ops, one hint -- the smallest graph that trips it.
+
+        Reduced from a flash-attention shape by bisecting against the guard
+        (correct with ``_drop_reduction_splits_in_coarse_group``, wrong without).
+        Each element below is load-bearing: removing any one stops the joint
+        solver choosing the K-split, so the test would keep passing while
+        silently covering nothing.
+
+        * The ``exp`` producing the matmul's LHS. With the matmul reading an
+          input directly the solver takes an output-axis split and the graph is
+          correct either way.
+        * The ``/ den`` consumer *outside* the tiled region. It ties the matmul
+          output's division to a non-tiled consumer, capping the output-axis
+          parallelism available; the contraction is then the only axis left to
+          split, which is what tempts the solver into the K-split.
+        * ``Lq`` and ``Lk`` both spanning >= 2 sticks (128 at fp16). At 64 each
+          is a single stick and no reduction-split candidate survives.
+
+        ``H=4`` tiled 2 is the smallest head configuration that works: ``H=2``
+        trips a *separate* wrong-code bug (mismatches with the guard on as well),
+        so it is deliberately not used here.
+
+        Tolerances sit between two measured numbers: summing 128 fp16 products
+        and then dividing by ``den`` leaves a ~0.3% noise floor (max abs diff
+        ~0.045), while dropping the guard mismatches ~17% of elements -- a ~50x
+        margin, so the test discriminates sharply without being flaky on
+        rounding.
+        """
+        B, H, Lq, Lk, D = 1, 4, 128, 128, 64
+
+        scores_t = torch.randn(B, H, Lk, Lq, dtype=torch.float16)
+        values_t = torch.randn(B, H, Lk, D, dtype=torch.float16)
+        den_t = torch.rand(B, H, Lq, dtype=torch.float16) + 1.0
+
+        def attend(scores, values, den):
+            with spyre_hint(num_tiles_per_dim={"H": 2}):
+                weights = torch.exp(scores * 0.05)
+                # The K-split hazard lives on this contraction (over Lk):
+                out = torch.matmul(weights.transpose(-1, -2), values)
+            return out / den.unsqueeze(-1)
+
+        ref = attend(scores_t, values_t, den_t)
+
+        scores_dev = scores_t.to("spyre")
+        values_dev = values_t.to("spyre")
+        den_dev = den_t.to("spyre")
+        _declare_tensor_dim("B", B)
+        _declare_tensor_dim("H", H)
+        _declare_tensor_dim("Lq", Lq)
+        _declare_tensor_dim("Lk", Lk)
+        _declare_tensor_dim("D", D)
+        _name_tensor_dims(scores_dev, ["B", "H", "Lk", "Lq"])
+        _name_tensor_dims(values_dev, ["B", "H", "Lk", "D"])
+        _name_tensor_dims(den_dev, ["B", "H", "Lq"])
+
+        result = torch.compile(attend)(scores_dev, values_dev, den_dev).cpu()
+        torch.testing.assert_close(
+            result,
+            ref,
+            equal_nan=True,
+            atol=0.05,
+            rtol=0.15,
+            msg=lambda m: (
+                f"co-opt K-split of coarse-tiled matmul produced wrong output\n\n{m}\n"
+            ),
+        )
 
 
 if __name__ == "__main__":
