@@ -14,6 +14,8 @@
 
 # Owner(s): ["module: spyre"]
 
+import unittest
+
 import torch
 import torch.nn as nn
 from torch.testing._internal.common_utils import (
@@ -39,6 +41,21 @@ DLFLOAT16_RTOL = 2e-3
 DLFLOAT16_ATOL = 1e-4
 
 
+def _spyre_available() -> bool:
+    """Return True iff a physical Spyre device is accessible."""
+    try:
+        from torch_spyre.constants import DEVICE_NAME
+
+        torch.zeros(1, dtype=torch.float16, device=DEVICE_NAME)
+        return True
+    except Exception:
+        return False
+
+
+#: Decorator: skip the test when no Spyre hardware is present.
+requires_spyre = unittest.skipUnless(_spyre_available(), "requires Spyre hardware")
+
+
 @instantiate_parametrized_tests
 class TestLoadModelToSpyre(TestCase):
     """Tests for torch_spyre.model_utils (issue #1339)."""
@@ -48,6 +65,7 @@ class TestLoadModelToSpyre(TestCase):
 
     # ── core layout (issue #1339) ──────────────────────────────────
 
+    @requires_spyre
     def test_linear_weight_has_dim_order_swapped(self):
         """A 2D Linear weight gets stickified on dim 0 (out_features).
         For a (1024, 4096) weight, that's 1024/64 = 16 sticks on dim 0.
@@ -59,6 +77,7 @@ class TestLoadModelToSpyre(TestCase):
         layout = get_spyre_tensor_layout(dev)
         self.assertEqual(layout.device_size[0], 16)
 
+    @requires_spyre
     def test_dim_order_rejects_non_2d(self):
         """The dim_order helper only accepts 2D weights."""
         with self.assertRaises(AssertionError):
@@ -66,6 +85,7 @@ class TestLoadModelToSpyre(TestCase):
 
     # ── embedding gather-optimal (indirect-access) layout ──────────
 
+    @requires_spyre
     def test_embedding_has_indirect_access_layout(self):
         """A 2D Embedding table gets device dims [rows, D // eps, eps] with the
         vocab dim outermost. For a (1000, 256) fp16 table, eps=64, so the
@@ -83,6 +103,7 @@ class TestLoadModelToSpyre(TestCase):
             dev.cpu(), w, rtol=DLFLOAT16_RTOL, atol=DLFLOAT16_ATOL
         )
 
+    @requires_spyre
     def test_embedding_stick_size_is_dtype_aware(self):
         """elems_per_stick is 32 at fp32, so a (1000, 256) fp32 table splits
         into 256/32 = 8 sticks, not 4."""
@@ -97,6 +118,7 @@ class TestLoadModelToSpyre(TestCase):
         # to IEEE_FP32, so this round-trip is lossless -- defaults suffice.
         torch.testing.assert_close(dev.cpu(), w)
 
+    @requires_spyre
     def test_embedding_non_tiling_hidden_dim_warns_and_falls_back(self):
         """A hidden dim that isn't a multiple of the stick size warns and
         returns None so the caller uses the default layout."""
@@ -105,11 +127,13 @@ class TestLoadModelToSpyre(TestCase):
             dev = _dma_to_spyre_indirect_access(w)
         self.assertIsNone(dev)
 
+    @requires_spyre
     def test_indirect_access_rejects_non_2d(self):
         """The indirect-access helper only accepts 2D tables."""
         with self.assertRaises(AssertionError):
             _dma_to_spyre_indirect_access(torch.randn(4, dtype=torch.float16))
 
+    @requires_spyre
     def test_moe_expert_weight_layout(self):
         from torch_spyre._C import get_spyre_tensor_layout
 
@@ -122,6 +146,7 @@ class TestLoadModelToSpyre(TestCase):
             device_weight.cpu(), weight, rtol=DLFLOAT16_RTOL, atol=DLFLOAT16_ATOL
         )
 
+    @requires_spyre
     def test_moe_per_expert_scale_layout(self):
         from torch_spyre._C import get_spyre_tensor_layout
 
@@ -133,6 +158,7 @@ class TestLoadModelToSpyre(TestCase):
         self.assertEqual(list(layout.device_size), [3, 1, 64])
         torch.testing.assert_close(device_scale.cpu(), scale[:, None].expand(-1, 64))
 
+    @requires_spyre
     def test_load_model_routes_embedding_through_indirect_access(self):
         """An nn.Embedding table lands on Spyre with the indirect-access layout
         (vocab dim outermost), not the default layout."""
@@ -145,6 +171,7 @@ class TestLoadModelToSpyre(TestCase):
         layout = get_spyre_tensor_layout(model.weight)
         self.assertEqual(list(layout.device_size), [1000, 4, 64])
 
+    @requires_spyre
     def test_load_model_embedding_non_tiling_falls_back(self):
         """An embedding whose hidden dim doesn't tile still loads (default
         layout) and warns."""
@@ -155,6 +182,7 @@ class TestLoadModelToSpyre(TestCase):
 
     # ── routing ────────────────────────────────────────────────────
 
+    @requires_spyre
     def test_load_model_routes_linear_weight_through_dim_order(self):
         """Linear weight ends up on Spyre with dim_order layout;
         other params (bias) use default layout."""
@@ -169,6 +197,7 @@ class TestLoadModelToSpyre(TestCase):
         weight_layout = get_spyre_tensor_layout(model.weight)
         self.assertEqual(weight_layout.device_size[0], 2)
 
+    @requires_spyre
     def test_load_model_handles_layernorm(self):
         """Non-Linear params/buffers reach Spyre via the default path."""
         model = nn.LayerNorm(128, dtype=torch.float16)
@@ -178,6 +207,7 @@ class TestLoadModelToSpyre(TestCase):
 
     # ── _apply is honored (matches nn.Module.to semantics) ─────────
 
+    @requires_spyre
     def test_submodule_apply_override_keeps_params_on_cpu(self):
         """A child that overrides _apply governs its own subtree: its params
         stay on CPU while a sibling Linear still gets the dim_order layout."""
@@ -204,6 +234,7 @@ class TestLoadModelToSpyre(TestCase):
         self.assertEqual(model.lin.weight.device.type, "spyre")
         self.assertEqual(get_spyre_tensor_layout(model.lin.weight).device_size[0], 2)
 
+    @requires_spyre
     def test_instance_apply_override_keeps_params_on_cpu(self):
         """An instance-level _apply monkeypatch (the runner's Attention pattern)
         is honored just like a class-level override."""
@@ -223,6 +254,7 @@ class TestLoadModelToSpyre(TestCase):
             (torch.bfloat16, torch.float16),
         ],
     )
+    @requires_spyre
     def test_explicit_dtype_is_honored(self, src_dtype, target_dtype):
         """model.to('spyre', dtype=X) puts every param on device as X.
         copy_tensor (PR #2258) converts during the DMA."""
@@ -232,6 +264,7 @@ class TestLoadModelToSpyre(TestCase):
             self.assertEqual(p.device.type, "spyre")
             self.assertEqual(p.dtype, target_dtype)
 
+    @requires_spyre
     def test_dtype_none_preserves_source(self):
         """Without dtype, each tensor keeps its source dtype on device."""
         model = nn.Linear(64, 128, dtype=torch.float32)
@@ -239,6 +272,7 @@ class TestLoadModelToSpyre(TestCase):
         self.assertEqual(model.weight.dtype, torch.float32)
         self.assertEqual(model.bias.dtype, torch.float32)
 
+    @requires_spyre
     def test_unsupported_dtype_raises(self):
         """Dtypes that map to DataFormats.INVALID are rejected."""
         model = nn.Linear(4, 4)
@@ -247,6 +281,7 @@ class TestLoadModelToSpyre(TestCase):
 
     # ── idempotency ────────────────────────────────────────────────
 
+    @requires_spyre
     def test_load_model_idempotent(self):
         """Second call on an already-loaded model is a no-op
         (params already on Spyre are skipped)."""
@@ -258,6 +293,7 @@ class TestLoadModelToSpyre(TestCase):
 
     # ── nn.Module.to() patch ───────────────────────────────────────
 
+    @requires_spyre
     def test_patch_module_to_is_idempotent(self):
         original = nn.Module.to
         try:
@@ -269,6 +305,7 @@ class TestLoadModelToSpyre(TestCase):
         finally:
             nn.Module.to = original
 
+    @requires_spyre
     def test_model_to_spyre_applies_optimal_layout(self):
         """End-to-end: model.to('spyre') routes through the patched
         nn.Module.to and lands the Linear weight with dim_order layout."""
