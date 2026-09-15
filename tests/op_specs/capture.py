@@ -58,6 +58,7 @@ from unittest.mock import patch
 import torch
 
 import torch._inductor.config as inductor_config
+from torch._inductor.codecache import CodeCacheFuture
 from torch._inductor.utils import IndentedBuffer
 
 import torch_spyre  # noqa: F401  -- registers the "spyre" device
@@ -189,6 +190,27 @@ class _RunRecorder:
         return self._inner.run(*args, **kwargs)
 
 
+class _RunRecorderFuture(CodeCacheFuture):
+    """Preserve async compilation and wrap its runner after resolution."""
+
+    def __init__(
+        self,
+        inner: CodeCacheFuture,
+        rec: KernelRecord,
+        save_inputs: bool,
+    ) -> None:
+        self._inner = inner
+        self._rec = rec
+        self._save_inputs = save_inputs
+        self._runner: _RunRecorder | None = None
+
+    def result(self, timeout: float | None = None):
+        if self._runner is None:
+            runner = self._inner.result(timeout=timeout)
+            self._runner = _RunRecorder(runner, self._rec, self._save_inputs)
+        return self._runner
+
+
 @contextlib.contextmanager
 def capture_kernels(save_inputs: bool = False, no_execute: bool = False):
     """Record every sdsc() call made inside the block.
@@ -211,6 +233,8 @@ def capture_kernels(save_inputs: bool = False, no_execute: bool = False):
         )
         records.append(rec)
         runner = real_sdsc(self, kernel_name, specs, pool_size=pool_size)
+        if isinstance(runner, CodeCacheFuture):
+            return _RunRecorderFuture(runner, rec, save_inputs)
         return _RunRecorder(runner, rec, save_inputs)
 
     with contextlib.ExitStack() as stack:

@@ -112,13 +112,28 @@ jobs:
         run: |
           mkdir -p raw_logs
 
+          # Retries the job-listing call below on a transient 502 from the GitHub API.
+          retry() {
+            local max_attempts=5 attempt=1 delay=2
+            until "$@"; do
+              if [ "${attempt}" -ge "${max_attempts}" ]; then
+                echo "::error::command failed after ${attempt} attempts: $*" >&2
+                return 1
+              fi
+              echo "[retry] attempt ${attempt} failed, retrying in ${delay}s: $*" >&2
+              sleep "${delay}"
+              attempt=$((attempt + 1))
+              delay=$((delay * 2))
+            done
+          }
+
           # filter=latest is the API's own default, but pin it explicitly: jobs from a
           # prior attempt of this run (a runner-infra retry, not just a user re-run
           # click) leaking into the list would download and parse every one of them
           # twice, doubling every row this run produces in hw_failure_diagnostics.
           # --method GET is required: gh api infers POST as soon as any -f/-F field is
           # given, and this endpoint has no POST route, so filter=latest alone 404s.
-          gh api \
+          retry gh api \
             --method GET \
             "/repos/${{ github.repository }}/actions/runs/${TRIGGERING_RUN_ID}/jobs" \
             --paginate \
@@ -127,7 +142,7 @@ jobs:
           > /tmp/jobs.jsonl
 
           python3 - << 'PYEOF'
-          import json, os, re, subprocess, sys
+          import json, os, re, subprocess, sys, time
 
           repo = os.environ["GITHUB_REPOSITORY"]
           jobs = [json.loads(l) for l in open("/tmp/jobs.jsonl") if l.strip()]
@@ -158,14 +173,38 @@ jobs:
               ["--allow-escape-sequences"] if "--allow-escape-sequences" in esc else []
           )
 
+          # gh api occasionally returns a transient 5xx (mostly a 502) for the
+          # log-download endpoint; retry those with backoff rather than
+          # dropping the job's log. A 404 (e.g. a job with no logs) is not
+          # transient, so it's returned to the caller immediately instead of
+          # burning through retries.
+          def download_job_log(args, max_attempts=5, base_delay=2):
+              for attempt in range(1, max_attempts + 1):
+                  result = subprocess.run(
+                      args, capture_output=True, env={**os.environ}
+                  )
+                  if result.returncode == 0:
+                      return result
+                  err = result.stderr.decode("utf-8", "replace")
+                  transient = any(code in err for code in ("502", "503", "504"))
+                  if not transient or attempt == max_attempts:
+                      return result
+                  delay = base_delay * (2 ** (attempt - 1))
+                  print(
+                      f"  [retry] attempt {attempt}/{max_attempts} failed "
+                      f"(rc={result.returncode}), retrying in {delay}s: "
+                      f"{err.strip()}"
+                  )
+                  time.sleep(delay)
+              return result
+
           downloaded = 0
           for idx, j in enumerate(jobs):
               safe   = re.sub(r"[^\w\s\-]", "", j["name"]).strip()
               out    = f"raw_logs/{idx}_{safe}.txt"
-              result = subprocess.run(
+              result = download_job_log(
                   ["gh", "api", *esc_flag,
-                   f"/repos/{repo}/actions/jobs/{j['id']}/logs"],
-                  capture_output=True, env={**os.environ},
+                   f"/repos/{repo}/actions/jobs/{j['id']}/logs"]
               )
               if result.returncode == 0 and result.stdout:
                   open(out, "wb").write(result.stdout)

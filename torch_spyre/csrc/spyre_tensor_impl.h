@@ -132,7 +132,44 @@ class SpyreTensorLayout {
       : device_size(device_size),
         stride_map(stride_map),
         device_dtype(device_dtype),
-        element_arrangement(element_arrangement) {}
+        element_arrangement(element_arrangement) {
+    validate_shape();
+  }
+
+  /**
+   * Reject a device layout that cannot describe any tensor: every device
+   * dimension must be non-negative and stride_map must have one entry per
+   * device dimension. Validating in the constructor means no producer can
+   * hand such a layout downstream.
+   *
+   * A size-0 device dimension is deliberately accepted: it is how an empty
+   * tensor is laid out (an empty host dim maps to a zero device extent, and a
+   * zero-element host stick dim maps to zero sticks), and every consumer
+   * already handles that geometry. The size-0 dim that reached
+   * get_device_stride_infos and terminated the process with SIGFPE (issue
+   * #3604) came from flooring an inexact stick rescale on a non-empty tensor;
+   * rescale_stl_for_dtype now rejects that upstream of the constructor, and
+   * get_device_stride_infos checks every divisor before use.
+   *
+   * stride_map entries are deliberately not range-checked here: -1 marks a
+   * size-1 or sparse dimension and 0 a broadcast dimension, both legitimate.
+   * Consistency between stride_map and the host strides is only knowable at
+   * use time and is checked in get_device_stride_infos.
+   */
+  void validate_shape() const {
+    TORCH_CHECK(!device_size.empty(),
+                "Invalid SpyreTensorLayout: device_size is empty");
+    TORCH_CHECK(stride_map.size() == device_size.size(),
+                "Invalid SpyreTensorLayout: stride_map has ", stride_map.size(),
+                " entries for ", device_size.size(), " device dimensions");
+    for (size_t i = 0; i < device_size.size(); i++) {
+      TORCH_CHECK(device_size[i] >= 0,
+                  "Invalid SpyreTensorLayout: device dimension ", i,
+                  " has negative size ", device_size[i],
+                  "; every device dimension must be non-negative (device_size=",
+                  c10::ArrayRef<int64_t>(device_size), ")");
+    }
+  }
 
   /**
    * Return a copy of this layout with element_arrangement overridden.
@@ -209,6 +246,8 @@ uint64_t get_device_size_in_bytes(const std::vector<int64_t>& device_size,
 SpyreTensorLayout get_spyre_tensor_layout(const at::Tensor& tensor);
 void set_spyre_tensor_layout(const at::Tensor& tensor,
                              const SpyreTensorLayout& stl);
+std::vector<int64_t> get_spyre_tensor_sizes(const at::Tensor& tensor);
+std::vector<int64_t> get_spyre_tensor_strides(const at::Tensor& tensor);
 
 }  // namespace spyre
 
