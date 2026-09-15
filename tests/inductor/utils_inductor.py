@@ -15,6 +15,7 @@
 import copy
 import functools
 import hashlib
+import sys
 import torch
 import os
 import pytest
@@ -559,6 +560,43 @@ def _to_cpu(result, device):
         return result
 
 
+def _release_compiled_kernels():
+    """Purge Inductor module caches and run GC to free FlexAllocator LX regions.
+
+    The SpyreSDSCKernelRunner (and its C++ JobPlan / flex::CompositeAddress)
+    lives inside the Inductor-generated module object.  That module is kept
+    alive by two strong references: PyCodeCache.cache and sys.modules.  Both
+    must be cleared before gc.collect() can drop the refcount to zero and
+    trigger the JobPlan destructor that returns the LX allocation.
+
+    Call this both *before* compiling (to free the previous test's kernel) and
+    *after* execution (to free the current test's kernel immediately, rather
+    than letting it accumulate until the next test's pre-compile cleanup).
+    """
+    try:
+        import gc
+        import torch._inductor.codecache as codecache
+
+        for key in list(sys.modules.keys()):
+            if "torch_inductor_code" in key or key.startswith(
+                "__torch_inductor_code"
+            ):
+                sys.modules.pop(key, None)
+        if hasattr(codecache, "PyCodeCache") and hasattr(
+            codecache.PyCodeCache, "cache"
+        ):
+            codecache.PyCodeCache.cache.clear()
+        if hasattr(codecache, "AotAndInlinedModulesCache") and hasattr(
+            codecache.AotAndInlinedModulesCache, "cache"
+        ):
+            codecache.AotAndInlinedModulesCache.cache.clear()
+        if hasattr(torch, "compiler") and hasattr(torch.compiler, "reset"):
+            torch.compiler.reset()
+        gc.collect()
+    except Exception:
+        pass
+
+
 def _compile_and_run(
     fn,
     args,
@@ -571,6 +609,13 @@ def _compile_and_run(
     """Compile and execute function on specified device/backend, returning result on CPU."""
     torch._dynamo.reset_code_caches()
     torch._inductor.codecache.FxGraphCache.clear()
+
+    # Release device program memory held by the *previous* compiled kernel.
+    # Without this, each test's kernel accumulates in the FlexAllocator LX
+    # region (limited to ~150 MB on a single card at sencores=32) and the
+    # suite OOMs after ~30 tests.
+    _release_compiled_kernels()
+
     device = torch.device(device) if isinstance(device, str) else device
     device_args = [
         arg.to(device) if isinstance(arg, torch.Tensor) else arg for arg in args
@@ -588,6 +633,12 @@ def _compile_and_run(
                 source_check(source_codes[0])
         else:
             result = comp_func(*device_args, **device_kwargs)
+
+        # Drop the compiled callable and purge module caches immediately so
+        # the current test's JobPlan destructor fires before the next test
+        # starts — not deferred until the next test's pre-compile cleanup.
+        del comp_func
+        _release_compiled_kernels()
     else:
         result = fn(*device_args, **device_kwargs)
 
