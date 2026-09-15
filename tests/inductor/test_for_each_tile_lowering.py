@@ -944,51 +944,82 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
         around an inner K-tiling for_each_tile -- the exact ambiguity the
         marker mechanism exists to eliminate (this is the case that would
         have been silently wrong under the deleted
-        _loop_var_pos_from_reads heuristic). Uses plain CPU tensors: this
-        test only checks marker/splice bookkeeping (no numeric output), so
-        it does not need a real Spyre device or codegen.
-        capture_post_grad_while_loop drives a full torch.compile
-        internally (via run_and_get_code), and splice_while_loops --
-        registered as a CustomPreSchedulingPasses entry point -- runs to a
-        fixed point across both nesting levels before compilation returns
-        (its own docstring: "Runs to a fixed point (handles nested
-        for_each_tile, whose inner WhileLoop only appears after the outer
-        one's body has been spliced in)"). So by the time GraphLowering.run
-        returns, both levels' WhileLoop ops are already spliced and both
-        levels' markers already consumed.
+        _loop_var_pos_from_reads heuristic). This drives the REAL
+        splice_while_loops entry point (registered as this pipeline's
+        first CustomPreSchedulingPasses pass) directly, rather than
+        manually replaying splice_while_loop twice.
+
+        Requires a real Spyre-device compile, not plain CPU tensors:
+        CustomPreSchedulingPasses.__call__ early-returns
+        (_operations_have_spyre_device check) for a device-less graph, so
+        splice_while_loops -- and therefore marker consumption -- never
+        runs at all on CPU tensors. (Confirmed directly: on CPU tensors,
+        the top-level graph still has 1 unspliced ir.WhileLoop even after
+        the full compile returns, because the whole pipeline was skipped,
+        not because splicing failed.)
+
+        splice_while_loops is the pipeline's *first* pass; every later
+        pass in the pipeline (propagate_named_dims, assign_dim_hints, ...,
+        propagate_spyre_tensor_layouts) runs after it and is irrelevant to
+        what this test checks. nested_split_m_then_k_fn's inner loop is
+        split_k-shaped and inherits the pre-existing, out-of-scope issue
+        #4460 stick-layout/read-copy gap in propagate_spyre_tensor_layouts
+        (same gap test_carry_mode_split_k is xfailed for in
+        test_for_each_tile_e2e.py, and the same gap
+        test_nested_for_each_tile_value_correct below is xfailed for) the
+        moment a *later* pass runs -- so instead of driving the pipeline
+        all the way through codegen, this test monkeypatches
+        splice_while_loops itself (the name torch_spyre._inductor.passes
+        imports and calls directly) to capture graph.operations right as
+        it returns, and tolerates the InductorError the #4460 gap raises
+        afterward in a later, unrelated pass.
         """
         import torch
+        import torch_spyre  # noqa: F401  registers the "spyre" device
+        from torch_spyre.constants import DEVICE_NAME
+
+        import torch_spyre._inductor.passes as passes_mod
         from tests.inductor.for_each_tile_fixtures import (
             capture_post_grad_while_loop,
             nested_split_m_then_k_fn,
         )
         from torch._inductor import ir
-        from torch._inductor.graph import GraphLowering
+        from torch._inductor.exc import InductorError
 
-        X = torch.randn(8, 12)
-        Y = torch.randn(12, 6)
+        X = torch.randn(8, 12, device=DEVICE_NAME, dtype=torch.float16)
+        Y = torch.randn(12, 6, device=DEVICE_NAME, dtype=torch.float16)
 
         captured = {}
-        original_run = GraphLowering.run
+        original_splice_while_loops = passes_mod.splice_while_loops
 
-        def capturing_run(self, *args, **kwargs):
-            result = original_run(self, *args, **kwargs)
-            if "graph" not in captured:
-                captured["graph"] = self
+        def capturing_splice_while_loops(graph):
+            result = original_splice_while_loops(graph)
+            captured["graph"] = graph
             return result
 
-        GraphLowering.run = capturing_run
+        passes_mod.splice_while_loops = capturing_splice_while_loops
         try:
             capture_post_grad_while_loop(nested_split_m_then_k_fn, (X, Y))
+        except InductorError as exc:
+            # Expected: propagate_spyre_tensor_layouts (a later, unrelated
+            # pass) hits issue #4460 after splice_while_loops has already
+            # completed and this test's capture has already fired. Any
+            # OTHER exception is a real, unexpected finding -- do not
+            # swallow it.
+            self.assertIn(
+                "stick expression",
+                str(exc),
+                "expected the known issue #4460 stick-layout gap, got a "
+                f"different InductorError: {exc!r}",
+            )
         finally:
-            GraphLowering.run = original_run
+            passes_mod.splice_while_loops = original_splice_while_loops
 
+        self.assertIn("graph", captured, "splice_while_loops was never called/captured")
         graph = captured["graph"]
-        # splice_while_loops runs to a fixed point as a
-        # CustomPreSchedulingPasses entry point during compilation above;
-        # by the time GraphLowering.run returns, both the outer and inner
-        # WhileLoop have already been spliced and no ir.WhileLoop op
-        # should remain.
+        # Right after splice_while_loops returns, both the outer and inner
+        # WhileLoop must already be spliced and every marker at both
+        # nesting levels already consumed.
         remaining_while_ops = [
             op for op in graph.operations if isinstance(op, ir.WhileLoop)
         ]
