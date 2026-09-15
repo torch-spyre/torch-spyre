@@ -781,7 +781,9 @@ def insert_run(client, run_id: str, run: dict, args):
     )
 
 
-def insert_cases(client, run_id: str, cases: list[dict], workflow: str = ""):
+def insert_cases(
+    client, run_id: str, cases: list[dict], workflow: str = "", filename: str = ""
+):
     if not cases:
         return
     client.insert(
@@ -799,6 +801,7 @@ def insert_cases(client, run_id: str, cases: list[dict], workflow: str = ""):
                 c["fail_message"][:8192],
                 c["triggered_at"].replace(tzinfo=None),
                 workflow,
+                filename,
             ]
             for c in cases
         ],
@@ -814,6 +817,7 @@ def insert_cases(client, run_id: str, cases: list[dict], workflow: str = ""):
             "fail_message",
             "triggered_at",
             "workflow",
+            "filename",
         ],
     )
 
@@ -935,6 +939,14 @@ def main():
     client.command(
         "ALTER TABLE benchmark_runs ADD COLUMN IF NOT EXISTS platform String DEFAULT ''"
     )
+    # test_cases carries the source filename so the case-insert idempotency gate
+    # below can ask "were THIS file's cases already written", the same
+    # (run_id, filename) key test_runs dedups on. Without it a crash between the
+    # run insert and the case insert would leave that file's cases missing on a
+    # retry, and two legs that share one threaded run_id could not be told apart.
+    client.command(
+        "ALTER TABLE test_cases ADD COLUMN IF NOT EXISTS filename String DEFAULT ''"
+    )
 
     total_cases = 0
     total_benchmarks = 0
@@ -1049,21 +1061,25 @@ def main():
             # Resolved BEFORE dedup, which keys on it.
             run_id = _threaded_run_id(args) or str(uuid.uuid4())
 
-            # Dedup on (run_id, filename): re-ingesting the SAME test run must be idempotent,
-            # but two distinct runs must never collapse. runner_run_id mirrors run_id for a Jenkins/standalone leg, so it's only an independent signal for a GHA numeric id.
+            # Dedup on (run_id, filename): re-ingesting the SAME test run must
+            # be idempotent, but two distinct runs must never collapse.
+            # runner_run_id mirrors run_id for a Jenkins/standalone leg, so it is
+            # an independent signal only for a GHA numeric id.
             runner_run_id = _runner_run_id(args, run_id)
             existing = client.query(
                 "SELECT count() FROM test_runs "
                 "WHERE run_id = {run_id:String} AND filename = {filename:String}",
                 parameters={"run_id": run_id, "filename": run["filename"]},
             )
-            if (
-                existing.result_rows[0][0] == 0
-                and runner_run_id
-                and runner_run_id != run_id
-            ):
-                # A GHA re-ingest mints a fresh uuid4, so fall back to the numeric run id
-                # to keep that path idempotent.
+            # Did THIS file's run row already exist under the SAME run_id we are
+            # about to insert under? Only then can the case gate below find its
+            # cases by (run_id, filename), so only then is the crash-heal
+            # fall-through safe. A match on the runner_run_id fallback is a
+            # different run_id, so it must not fall through (see below).
+            matched_same_run_id = existing.result_rows[0][0] > 0
+            if not matched_same_run_id and runner_run_id and runner_run_id != run_id:
+                # A GHA re-ingest mints a fresh uuid4, so fall back to the
+                # numeric run id to keep that path idempotent.
                 existing = client.query(
                     "SELECT count() FROM test_runs WHERE "
                     "runner_run_id = {runner_run_id:String} AND filename = {filename:String}",
@@ -1072,26 +1088,58 @@ def main():
                         "filename": run["filename"],
                     },
                 )
-            if existing.result_rows[0][0] > 0:
-                print(f"  Already ingested — skipping {run['filename']}")
-                continue
             print(
                 f"  run_id={run_id}  tests={run['total_tests']}  "
                 f"passed={run['passed']}  failed={run['failed']}  "
                 f"xpass={run['xpass']}  xfail={run['xfail']}  skipped={run['skipped']}"
             )
 
-            insert_run(client, run_id, run, args)
+            if existing.result_rows[0][0] > 0:
+                # This file's run row is already present. If it matched only via
+                # the runner_run_id fallback (a GHA re-ingest under a fresh
+                # uuid4), the cases live under the OLD run_id, so the (run_id,
+                # filename) case gate below could not see them and would insert
+                # duplicates. Keep #4144's behavior there: skip the whole file.
+                if not matched_same_run_id:
+                    print(f"  Already ingested — skipping {run['filename']}")
+                    continue
+                # Matched under the SAME run_id: a prior ingest of THIS file may
+                # have written the run row but crashed before its cases (network
+                # drop / OOM between the two inserts). Skip only the run insert
+                # and fall through to the case gate, which re-inserts the missing
+                # cases. A fully-ingested file still finds its cases and skips.
+                print(f"  Run row already present — {run['filename']}")
+            else:
+                insert_run(client, run_id, run, args)
 
-            # The (run_id, filename) dedup above already covers this file; a run_id-only recheck here would skip a second file sharing the same run_id.
-            insert_cases(client, run_id, cases, workflow=args.workflow)
-            insert_properties(client, run_id, cases)
-
-            total_cases += len(cases)
-            print(
-                f"  Inserted {len(cases)} test cases + "
-                f"{sum(len(c['properties']) for c in cases)} properties"
+            # Gate the case + property inserts on THIS file's cases, keyed on the
+            # same (run_id, filename) as the test_runs dedup above. A run_id-only
+            # recheck was wrong: two legs share one threaded run_id, so the second
+            # file processed would see the first's cases and skip its own. Keying
+            # on filename also self-heals the crash case above: the run row exists
+            # but the cases do not, so the retry re-inserts them instead of
+            # skipping this file forever.
+            existing_cases = client.query(
+                "SELECT count() FROM test_cases "
+                "WHERE run_id = {run_id:String} AND filename = {filename:String}",
+                parameters={"run_id": run_id, "filename": run["filename"]},
             )
+            if existing_cases.result_rows[0][0] > 0:
+                print(f"  Cases already exist — skipping {run['filename']}")
+            else:
+                insert_cases(
+                    client,
+                    run_id,
+                    cases,
+                    workflow=args.workflow,
+                    filename=run["filename"],
+                )
+                insert_properties(client, run_id, cases)
+                total_cases += len(cases)
+                print(
+                    f"  Inserted {len(cases)} test cases + "
+                    f"{sum(len(c['properties']) for c in cases)} properties"
+                )
 
     print(f"\nDone. {len(xml_files)} file(s) processed.")
     print(f"  Test cases ingested:  {total_cases}")
