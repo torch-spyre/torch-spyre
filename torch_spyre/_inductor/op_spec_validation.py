@@ -30,18 +30,29 @@ Invariants checked:
 from __future__ import annotations
 
 import ast
+from collections import Counter
 from collections.abc import Sequence
 import functools
 import inspect
+import math
 import textwrap
 
 import regex
+from typing import NoReturn
 import sympy
 
-from . import constants
+from . import config, constants
+from .core_mapping import owner_slots, transfer_edges
 from .dtype_ops import DtypeOpTable
 from .logging_utils import get_inductor_logger
-from .op_spec import IndirectAccess, LoopSpec, OpSpec, TensorArg, UnimplementedOp
+from .op_spec import (
+    IndirectAccess,
+    LoopSpec,
+    OpSpec,
+    TensorArg,
+    UnimplementedOp,
+    is_lx_relayout_identity,
+)
 
 logger = get_inductor_logger("op_spec_validation")
 
@@ -236,7 +247,111 @@ def _validate_op_spec(op_spec: OpSpec, stage: str, loop_depth: int) -> None:
     _check_symbol_consistency(op_spec, stage)
     _check_tiled_symbols(op_spec, stage, loop_depth)
     _check_stick_constraints(op_spec, stage)
+    _check_completed_reduction_route(op_spec, stage)
     _check_op_specific_constraints(op_spec, stage)
+
+
+def _check_completed_reduction_route(op_spec: OpSpec, stage: str) -> None:
+    """Validate the completed-reduction route certified during planning."""
+
+    routes = op_spec.producer_consumers
+    if not routes:
+        return
+
+    def reject(message: str, detail: str = "") -> NoReturn:
+        raise OpSpecValidationError(op_spec, message, detail, stage)
+
+    if not is_lx_relayout_identity(op_spec.op, op_spec.args, op_spec.op_info):
+        reject(
+            "completed-reduction routes require a certified LX identity copy",
+            f"Got op={op_spec.op!r}, args={len(op_spec.args)}",
+        )
+    source_division = op_spec.args[0].work_division
+    destination_division = op_spec.args[-1].work_division
+    if source_division is None or destination_division is None:
+        reject("completed-reduction routes require both tensor divisions")
+    source_count = source_division.physical_core_count
+    destination_count = destination_division.physical_core_count
+    sources: set[int] = set()
+    destinations: set[int] = set()
+    edges: set[tuple[int, int]] = set()
+    for source, consumers in routes:
+        if source in sources:
+            reject(
+                "completed-reduction source cores must be unique",
+                f"Duplicate source core {source}",
+            )
+        sources.add(source)
+        if not consumers:
+            reject(
+                "each completed-reduction source must feed a consumer",
+                f"Source core {source} has no consumers",
+            )
+        for core, domain in [
+            (source, source_count),
+            *((consumer, destination_count) for consumer in consumers),
+        ]:
+            if not isinstance(core, int) or not 0 <= core < domain <= config.sencores:
+                reject(
+                    "completed-reduction routes must name configured cores",
+                    f"Got core {core!r} for tensor domain {domain} / "
+                    f"{config.sencores} configured cores",
+                )
+        for consumer in consumers:
+            if (source, consumer) in edges:
+                reject(
+                    "completed-reduction edges must be unique",
+                    f"Duplicate edge {source} -> {consumer}",
+                )
+            edges.add((source, consumer))
+            destinations.add(consumer)
+    expected = set(range(destination_count))
+    if destinations != expected:
+        reject(
+            "completed-reduction routes must cover every destination core",
+            f"Got {sorted(destinations)}, expected {sorted(expected)}",
+        )
+    fanouts = {len(consumers) for _, consumers in routes}
+    if len(fanouts) != 1:
+        reject(
+            "completed-reduction routes require uniform fanout",
+            f"Got fanouts {sorted(fanouts)}",
+        )
+    # Planning constructs these copies over one shared iteration domain; the
+    # identity marker alone does not prove that. Intersect those
+    # partitions just as the planner does; several writers supply disjoint pieces,
+    # never partial sums that still need adding.
+    try:
+        source_rows = owner_slots(
+            source_division.core_id_to_work_slice,
+            source_division.work_slices,
+            source_count,
+        )
+        destination_rows = owner_slots(
+            destination_division.core_id_to_work_slice,
+            destination_division.work_slices,
+            destination_count,
+        )
+    except ValueError as error:
+        reject("invalid completed-reduction ownership", str(error))
+    groups: dict[tuple, list[int]] = {}
+    for core, row in enumerate(source_rows):
+        groups.setdefault(tuple(row.items()), []).append(core)
+    # Planning proves contiguous K-fast groups: only their last core writes.
+    if len(groups) != math.prod(source_division.work_slices.values()) or sources != {
+        group[-1] for group in groups.values()
+    }:
+        reject("completed-reduction sources must cover every terminal owner")
+    expected_edges = transfer_edges(
+        source_division.work_slices,
+        destination_division.work_slices,
+        {core: source_rows[core] for core in sources},
+        dict(enumerate(destination_rows)),
+    )
+    if edges != expected_edges:
+        reject("completed-reduction routes must match ownership intersections")
+    if len(set(Counter(d for _, d in edges).values())) != 1:
+        reject("completed-reduction routes require uniform fanin")
 
 
 def _check_mandatory_fields(op_spec: OpSpec, stage: str) -> None:

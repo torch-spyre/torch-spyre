@@ -42,6 +42,7 @@ from ..core_mapping import (
     _MAX_EXACT_OWNERSHIP_POINTS,
     _EVALUATION_ERRORS,
     select_unique_partition_division,
+    transfer_edges,
 )
 from ..ir import FixedTiledLayout
 from ..logging_utils import get_inductor_logger
@@ -51,6 +52,7 @@ from ..pass_utils import (
     PerCoreView,
     _is_matmul_op,
     _per_core_view_on_buf,
+    completed_reduction_split_on_buf,
     iteration_space_from_op,
     op_read_writes,
     try_device_coordinates,
@@ -71,6 +73,7 @@ class LXRelayoutPlan:
     num_cores: int
     source_footprint_bytes: int = 0
     destination_footprint_bytes: int = 0
+    producer_consumers: tuple[tuple[int, tuple[int, ...]], ...] = ()
     source_address: int | None = None
     destination_address: int | None = None
 
@@ -312,10 +315,6 @@ def partition_footprint(layout: FixedTiledLayout, view: PerCoreView) -> int:
     )
 
 
-def _overlap(a: int, an: int, b: int, bn: int) -> bool:
-    return a * bn < (b + 1) * an and b * an < (a + 1) * bn
-
-
 def movement_supported(
     source: PerCoreView,
     destination: PerCoreView,
@@ -348,21 +347,9 @@ def movement_supported(
         return False
     source_map = _core_slices(source, num_cores)
     destination_map = _core_slices(destination, destination_num_cores)
-    dims = set(source_splits) | set(destination_splits)
-    edges = {
-        (s_core, d_core)
-        for s_core, s_slice in source_map.items()
-        for d_core, d_slice in destination_map.items()
-        if all(
-            _overlap(
-                s_slice.get(dim, 0),
-                source_splits.get(dim, 1),
-                d_slice.get(dim, 0),
-                destination_splits.get(dim, 1),
-            )
-            for dim in dims
-        )
-    }
+    edges = transfer_edges(
+        source_splits, destination_splits, source_map, destination_map
+    )
     fanout = [sum(src == core for src, _ in edges) for core in range(num_cores)]
     fanin = [
         sum(dst == core for _, dst in edges) for core in range(destination_num_cores)
@@ -388,6 +375,86 @@ def movement_supported(
             or (fanout[0] == destination_num_cores // num_cores and fanin[0] == 1),
         )
     )
+
+
+# Validated completed-piece routes, not hardware reduction-width limits:
+# K2/K4 on 32 cores on device; K3 on synthetic 2*K-core views on host only.
+# Three cannot divide a 32-core producer domain. Larger splits remain untested.
+_COMPLETED_REDUCTION_SPLITS = (2, 3, 4)
+# Copies to fewer cores have device coverage for this one-writer form only.
+_COMPACT_COMPLETED_REDUCTION_SPLITS = (2, 4)
+
+
+def derive_completed_reduction_routes(
+    source: PerCoreView,
+    destination: PerCoreView,
+    reduction_split: int,
+) -> tuple[tuple[int, tuple[int, ...]], ...]:
+    """Read only the last slice's completed value; the backend already sums it.
+
+    The terminal is the last core of each contiguous K-fast group even when
+    OUT is split. Earlier cores never write their result buffers. Full-domain
+    copies may assemble disjoint pieces from several completed writers. The
+    smaller-domain one-to-one extension retains the K2/K4 writer rule.
+
+    """
+    source_count, destination_count = source.num_cores, destination.num_cores
+    splits, target = dict(source.work_slice_dims), dict(destination.work_slice_dims)
+    owners = math.prod(splits.values())
+    if (
+        source_count is None
+        or destination_count is None
+        or reduction_split not in _COMPLETED_REDUCTION_SPLITS
+        or owners * reduction_split != source_count
+        or math.prod(target.values()) != destination_count
+        or not (
+            destination_count == source_count
+            or (
+                destination_count == owners
+                and reduction_split in _COMPACT_COMPLETED_REDUCTION_SPLITS
+            )
+        )
+        or (
+            destination_count != source_count
+            and any(
+                target.get(d, 1) % splits.get(d, 1)
+                for d in splits.keys() | target.keys()
+            )
+        )
+    ):
+        raise ValueError("unsupported completed-reduction ownership geometry")
+    source_map = _core_slices(source, source_count)
+    target_map = _core_slices(destination, destination_count)
+    groups: dict[tuple, list[int]] = {}
+    for core, row in source_map.items():
+        groups.setdefault(tuple(sorted(row.items())), []).append(core)
+    if (
+        len(groups) != owners
+        or len({tuple(sorted(row.items())) for row in target_map.values()})
+        != destination_count
+        or any(
+            group != list(range(group[0], group[0] + reduction_split))
+            for group in groups.values()
+        )
+    ):
+        raise ValueError(
+            "completed-reduction owners require contiguous source groups and distinct destinations"
+        )
+    terminals = {group[-1] for group in groups.values()}
+    edges = transfer_edges(splits, target, source_map, target_map)
+    routes: dict[int, list[int]] = {core: [] for core in sorted(terminals)}
+    fanins = set()
+    for destination_core in range(destination_count):
+        writers = [s for s, d in edges if d == destination_core and s in terminals]
+        if not writers or (destination_count != source_count and len(writers) != 1):
+            raise ValueError("destination has unsupported completed-result coverage")
+        fanins.add(len(writers))
+        for writer in writers:
+            routes[writer].append(destination_core)
+    counts = {len(consumers) for consumers in routes.values()}
+    if 0 in counts or len(counts) != 1 or len(fanins) != 1:
+        raise ValueError("completed-reduction routes require uniform fanin and fanout")
+    return tuple((core, tuple(consumers)) for core, consumers in routes.items())
 
 
 def _single_write(op: ComputedBuffer, name: str) -> MemoryDep | None:
@@ -467,11 +534,23 @@ def collect_lx_relayout_plans(
             cache,
         )
         source_num_cores = _op_num_cores(producer)
+        reduction = (
+            completed_reduction_split_on_buf(producer, write, source_name)
+            if partial
+            else None
+        )
         if (
             source_view is None
-            or partial
             or not representable
             or source_view.num_cores != source_num_cores
+            or (
+                partial
+                and (
+                    reduction is None
+                    or source_num_cores != config.sencores
+                    or not config.core_id_k_fast_emission
+                )
+            )
         ):
             continue
 
@@ -543,7 +622,7 @@ def collect_lx_relayout_plans(
                     "cannot represent: consumer ownership is unrepresentable"
                 )
                 break
-            if consumer_num_cores < source_num_cores:
+            if consumer_num_cores < source_num_cores and reduction is None:
                 rejection_reason = (
                     "cannot emit: consumer uses fewer physical cores than producer"
                 )
@@ -566,7 +645,7 @@ def collect_lx_relayout_plans(
                 )
                 break
             consumer_space = iteration_space_from_op(consumer)
-            if view.same_partition(source_view):
+            if reduction is None and view.same_partition(source_view):
                 continue
             if is_matmul and len(deps) != 2:
                 rejection_reason = (
@@ -585,7 +664,7 @@ def collect_lx_relayout_plans(
                     "cannot emit: grouped destination does not evenly "
                     "broadcast the source"
                 )
-            elif destination_owners < source_num_cores:
+            elif reduction is None and destination_owners < source_num_cores:
                 if not is_matmul:
                     rejection_reason = (
                         "cannot emit: grouped gather requires a matmul consumer"
@@ -599,8 +678,17 @@ def collect_lx_relayout_plans(
                 failure = "cannot emit: unsupported ownership transfer"
 
             try:
-                supported = movement_supported(
-                    source_view, view, source_num_cores, consumer_num_cores
+                routes = (
+                    derive_completed_reduction_routes(source_view, view, reduction)
+                    if reduction is not None
+                    else ()
+                )
+                supported = (
+                    bool(routes)
+                    if reduction is not None
+                    else movement_supported(
+                        source_view, view, source_num_cores, consumer_num_cores
+                    )
                 )
             except (TypeError, ValueError) as exc:
                 rejection_reason = (
@@ -611,11 +699,11 @@ def collect_lx_relayout_plans(
                 rejection_reason = failure
                 break
             transfers.append(
-                (consumer_name, consumer_coordinates, consumer_space, view)
+                (consumer_name, consumer_coordinates, consumer_space, view, routes)
             )
 
         # Reuse the ownership comparison and preserve first-consumer order.
-        destinations: list[tuple[PerCoreView, int, list[str]]] = []
+        destinations: list[tuple[PerCoreView, int, tuple, list[str]]] = []
         if rejection_reason is None:
             # Both footprint checks are before placement: an invalid or
             # unsupported candidate size declines this optional relayout,
@@ -632,6 +720,7 @@ def collect_lx_relayout_plans(
                 consumer_coordinates,
                 consumer_space,
                 destination_view,
+                routes,
             ) in transfers:
                 try:
                     source_work_division = work_division_from_view(
@@ -681,15 +770,22 @@ def collect_lx_relayout_plans(
                         f"allocation: destination footprint is unavailable: {exc}"
                     )
                     break
-                for group_view, footprint, consumers in destinations:
-                    if footprint == destination_footprint and group_view.same_partition(
-                        destination_view
+                for group_view, footprint, group_routes, consumers in destinations:
+                    if (
+                        footprint == destination_footprint
+                        and group_routes == routes
+                        and group_view.same_partition(destination_view)
                     ):
                         consumers.append(consumer_name)
                         break
                 else:
                     destinations.append(
-                        (destination_view, destination_footprint, [consumer_name])
+                        (
+                            destination_view,
+                            destination_footprint,
+                            routes,
+                            [consumer_name],
+                        )
                     )
 
         if rejection_reason is None:
@@ -702,10 +798,12 @@ def collect_lx_relayout_plans(
                     num_cores=source_num_cores,
                     source_footprint_bytes=source_footprint,
                     destination_footprint_bytes=destination_footprint,
+                    producer_consumers=routes,
                 )
                 for (
                     destination_view,
                     destination_footprint,
+                    routes,
                     consumer_names,
                 ) in destinations
             )
