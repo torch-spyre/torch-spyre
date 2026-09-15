@@ -31,7 +31,7 @@ The loader reads the checkpoint's config, picks the adapter for that model
 family, and patches one live HF model instance. Everything Spyre executes
 natively stays as it is in `transformers`. Only the operations Spyre cannot
 run natively are swapped: RoPE becomes a precomputed rotation matmul because
-Spyre has no `sin`/`cos`, RMSNorm is patched to compute in the model's device
+Spyre has no native `sin`/`cos` instruction, RMSNorm is patched to compute in the model's device
 dtype rather than the float32 upcast stock HF uses, the LM head is padded to a
 stick-aligned vocab so work division fits the 256 MB per-core span limit, the
 decoder blocks become compiled `block_forward` functions with raw-tensor KV

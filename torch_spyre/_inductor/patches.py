@@ -25,6 +25,21 @@ from torch._inductor.virtualized import V
 
 @contextmanager
 def spyre_data_types():
+    """Keep elementwise computation at the input width for the whole compile.
+
+    Upstream ``_computation_dtype_map`` sends fp16 / bf16 / complex32 to a wider
+    computation dtype, so aten refs upcast to fp32 before computing.  Spyre
+    lowers these widths natively and does not want that implicit upcast, so the
+    map is replaced with identity entries for the duration of the compile:
+    inside this CM ``get_computation_dtype(torch.float16)`` is fp16, not fp32.
+
+    Action at a distance worth knowing before you touch this: a decomposition
+    that genuinely needs a wider evaluation width can no longer get it from
+    ``elementwise_dtypes(...)[0]`` here, and must spell it with an explicit
+    ``.to(...)``.  ``_taylor_dtypes`` in ``decompositions.py`` (cos / sin) does
+    exactly that and documents why -- its Cody-Waite range reduction resolves
+    the argument against pi and loses ~0.75 absolute at a 10-bit mantissa.
+    """
     saved = torch._prims_common._computation_dtype_map
     torch._prims_common._computation_dtype_map = {
         torch.bfloat16: torch.bfloat16,
