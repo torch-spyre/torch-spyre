@@ -1381,9 +1381,7 @@ def _windowed_attention(
                 # result requires an unsupported sparse/dense restickification.
                 # -inf - -inf is NaN and would otherwise poison all later chunks,
                 # including a later chunk that contains attendable keys.
-                block_max = torch.amax(
-                    torch.clamp_min(scores, finite_min), dim=-1
-                )
+                block_max = torch.amax(torch.clamp_min(scores, finite_min), dim=-1)
                 if kv_block == 0:
                     # Seed from real scores. Besides avoiding dead arithmetic,
                     # this keeps the single-chunk decode case as the direct
