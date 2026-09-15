@@ -856,6 +856,87 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
                 "other (e.g. renamed-and-unchanged, or miscomposed) value.",
             )
 
+    def test_split_k_marker_resolves_reduction_dim(self):
+        """IR-level value assertion for split_k_fn's reduction-dim marker.
+
+        Uses self._run_graph (this class's own established pattern, see its
+        docstring above) rather than a full torch.compile capture: driving
+        split_k_fn through real codegen hits a pre-existing, out-of-scope
+        read-copy/stick-layout gap in propagate_layouts.py (tracked as issue
+        #4460, see test_carry_mode_split_k's own XFAIL docstring in
+        test_for_each_tile_e2e.py) that has nothing to do with marker
+        resolution.
+
+        split_k_fn's matmul lowers on this CPU fixture as an aten-fallback
+        ExternKernelOut -- a StarDep-shaped consumer, same as split_m_fn's
+        matmul (see test_marker_erased_and_mapped_after_split_m_splice
+        above). lookup_marker_dim deliberately returns None for a
+        StarDep-mapped entry (see its own docstring: StarDep has no
+        .index/.ranges to resolve a consumer-space position from, and its
+        only real caller, _hint_ranges_pos, already filters out every
+        non-ComputedBuffer op before calling it) -- so the reduction-dim
+        value assertion belongs on _consume_tile_dim_markers's own marker
+        map, which is what actually records K's position for this op
+        shape, not on lookup_marker_dim's consumer-space remapping.
+        """
+        from torch._inductor import ir
+        from torch._inductor.dependencies import StarDep
+
+        from torch_spyre._inductor.wsr.for_each_tile_lowering import (
+            _body_loop_var,
+            _consume_tile_dim_markers,
+            _stacking_carry_indices,
+            try_prove_for_each_tile,
+        )
+        from torch_spyre._inductor.wsr.while_loop_bridge import (
+            carry_bindings_for,
+            splice_while_loop,
+        )
+
+        import torch
+        from tests.inductor.for_each_tile_fixtures import M, K, N
+
+        X, Y = torch.randn(M, K), torch.randn(K, N)
+        graph = self._run_graph(split_k_fn, (X, Y))
+
+        while_ops = [op for op in graph.operations if isinstance(op, ir.WhileLoop)]
+        self.assertEqual(len(while_ops), 1)
+        while_op = while_ops[0]
+
+        result = try_prove_for_each_tile(while_op)
+        self.assertTrue(result.accepted)
+        loop_var = _body_loop_var(while_op)
+        self.assertIsNotNone(loop_var)
+
+        with V.set_graph_handler(graph):
+            carries = carry_bindings_for(
+                while_op, _stacking_carry_indices(while_op, loop_var)
+            )
+            group_ops = splice_while_loop(
+                graph, while_op, carries, trip_count=result.trip_count
+            )
+            marker_map = _consume_tile_dim_markers(group_ops, graph.operations)
+
+            matmul_op = next(
+                op for op in group_ops if isinstance(op, ir.ExternKernelOut)
+            )
+            matmul_name = matmul_op.get_name()
+
+            x_dim = marker_map.get((matmul_name, StarDep(name="arg0_1")))
+            y_dim = marker_map.get((matmul_name, StarDep(name="arg1_1")))
+            self.assertEqual(
+                x_dim,
+                1,
+                "split_k_fn tiles X along dims=(-1, ...) -- dim 1 of X's "
+                "[M, K] shape, the reduction (K) dim",
+            )
+            self.assertEqual(
+                y_dim,
+                0,
+                "split_k_fn tiles Y along dims=(..., 0) -- dim 0 of Y's "
+                "[K, N] shape, the reduction (K) dim",
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
