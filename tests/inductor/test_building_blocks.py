@@ -533,6 +533,11 @@ class TestBuildingBlocks(unittest.TestCase):
         self._run_granite_gqa_with_finite_broadcast_mask(LQ=128)
 
     @mock.patch("torch_spyre._inductor.decompositions._SDPA_MAX_SEQUENCE_TILE_SIZE", 64)
+    @config.patch(
+        {
+            "cpsat_time_limit_seconds": 30,
+        }
+    )
     def test_granite_gqa_prefill_four_by_four_sequence_tiling(self):
         """Exercise Granite's transposed attention inputs and fused consumer."""
         self._run_granite_gqa_with_finite_broadcast_mask(
@@ -544,6 +549,11 @@ class TestBuildingBlocks(unittest.TestCase):
             reshape_output=True,
         )
 
+    @config.patch(
+        {
+            "cpsat_time_limit_seconds": 30,
+        }
+    )
     def test_siglip_multicrop_attention_span(self):
         """A seven-crop SigLIP prefill must fit each tiled BMM under 256 MB."""
         B, H, L, D = 7, 16, 576, 128
