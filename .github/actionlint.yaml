@@ -19,3 +19,7 @@ self-hosted-runner:
     - image_torch_spyre
     - image_spyre_inference
     - image_ingest
+    # merge-queue runner sets
+    - image_spyre_backend_mq
+    - image_torch_spyre_mq
+    - image_spyre_inference_mq

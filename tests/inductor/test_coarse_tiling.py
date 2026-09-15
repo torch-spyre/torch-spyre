@@ -1637,6 +1637,50 @@ class TestCodegenOpSpecListRoundtrip(unittest.TestCase):
 # ===========================================================================
 
 
+class TestIterationSpaceDependencies(unittest.TestCase):
+    def test_ordering_reads_preserve_dimensions_and_dependencies(self):
+        from torch._inductor.ir import ComputedBuffer
+
+        from torch_spyre._inductor.pass_utils import (
+            iteration_space,
+            iteration_space_from_op,
+        )
+
+        x, y, r = sympy.symbols("x y r", integer=True)
+        write = inductor_deps.MemoryDep("out", x * 16 + y, (x, y), (8, 16))
+        # Deliberately list the reduction dimension first in the read: output
+        # dimensions must still come first, in write order, with no duplicates.
+        read = inductor_deps.MemoryDep(
+            "in", r * 128 + x * 16 + y, (r, y, x), (32, 16, 8)
+        )
+        weak = inductor_deps.WeakDep("prior", "out")
+        star = inductor_deps.StarDep("whole_buffer")
+        for data, expected in (
+            (_make_reduction([8, 16], [32]), [(x, 8), (y, 16), (r, 32)]),
+            (_make_pointwise([8, 16]), [(x, 8), (y, 16)]),
+        ):
+            for reads in ((read,), (weak, read), (star, read), (read, star, weak)):
+                with self.subTest(reduction=len(expected) == 3, reads=reads):
+                    rw = inductor_deps.ReadWrites(
+                        reads=OrderedSet(reads),
+                        writes=OrderedSet([write]),
+                        index_exprs=OrderedSet(),
+                    )
+                    op = MagicMock(spec=ComputedBuffer)
+                    op.data = data
+                    op.get_read_writes.return_value = rw
+                    node = SimpleNamespace(node=op, read_writes=rw)
+                    original_reads, original_writes = rw.reads, rw.writes
+                    for result in (iteration_space(node), iteration_space_from_op(op)):
+                        self.assertEqual(list(result.items()), expected)
+                    self.assertIs(rw.reads, original_reads)
+                    self.assertIs(rw.writes, original_writes)
+                    self.assertEqual(tuple(rw.reads), reads)
+                    self.assertEqual(tuple(rw.writes), (write,))
+                    for actual, original in zip(rw.reads, reads):
+                        self.assertIs(actual, original)
+
+
 class TestDivideRanges(unittest.TestCase):
     def setUp(self):
         gm = fx.symbolic_trace(lambda: None)
@@ -7690,6 +7734,56 @@ class TestDivideReductionRanges(unittest.TestCase):
         self.assertEqual(
             op.work_div_loop_info,  # type: ignore[attr-defined]
             {Symbol("d0"): ["T"], Symbol("d1"): ["F"]},
+        )
+
+    def test_named_reduction_dim_is_captured_when_read_index_ignores_it(self):
+        from torch._inductor.dependencies import MemoryDep, ReadWrites
+        from torch_spyre._inductor.wsr.coarse_tile import (
+            _apply_work_div_symbol_remap,
+            _divide_reduction_ranges,
+        )
+
+        op = self._make_reduction_op(
+            ranges=[Integer(16), Integer(2816)],
+            reduction_ranges=[Integer(128)],
+        )
+        d0, d1, d2 = Symbol("d0"), Symbol("d1"), Symbol("d2")
+        dep_ranges = {d0: Integer(16), d1: Integer(2816)}
+        var_names = tuple(dep_ranges)
+        size = tuple(dep_ranges.values())
+        rw_before = ReadWrites(
+            reads=OrderedSet([MemoryDep("input", 2816 * d0 + d1, var_names, size)]),
+            writes=OrderedSet([MemoryDep("output", 2816 * d0 + d1, var_names, size)]),
+            index_exprs=OrderedSet(),
+            range_vars=[d0, d1, d2],
+            var_ranges={**dep_ranges, d2: Integer(128)},
+        )
+        rw_after = ReadWrites(
+            reads=rw_before.reads,
+            writes=rw_before.writes,
+            index_exprs=OrderedSet(),
+            range_vars=[d0, d1],
+            var_ranges=dep_ranges,
+        )
+        op.work_div_loop_info = {  # type: ignore[attr-defined]
+            d0: ["T"],
+            d1: ["H"],
+            d2: ["E"],
+        }
+
+        with (
+            patch(
+                "torch_spyre._inductor.wsr.coarse_tile.op_read_writes",
+                side_effect=(rw_before, rw_after),
+            ),
+            patch("torch_spyre._inductor.wsr.coarse_tile.invalidate_op_read_writes"),
+        ):
+            remap = _divide_reduction_ranges(op, Integer(128), [0])
+        _apply_work_div_symbol_remap(op, remap)
+
+        self.assertEqual(
+            op.work_div_loop_info,  # type: ignore[attr-defined]
+            {d0: ["T"], d1: ["H"]},
         )
 
     def test_fused_output_dims_allow_trailing_reduction_symbol_squeeze(self):

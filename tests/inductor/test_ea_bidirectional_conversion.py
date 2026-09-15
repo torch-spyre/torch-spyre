@@ -305,6 +305,47 @@ def test_stagger_to_standard_ea(x, fp16):
     assert ea == ElementArrangement.STANDARD, f"Expected STANDARD EA, got {ea}"
 
 
+_SLICED_RMSNORM_SHAPES = {
+    "gemma3-1b": (4, 1, 256, 1152),
+    "gemma4-global": (32, 4, 512, 5376),
+}
+
+
+@pytest.mark.parametrize(
+    "shape", list(_SLICED_RMSNORM_SHAPES), ids=list(_SLICED_RMSNORM_SHAPES)
+)
+@pytest.mark.parametrize("part", ["q", "k"])
+def test_fp16_to_fp32_on_qkv_slice(shape, part):
+    """A staggered upcast of a fused-QKV slice uses the slice's row span."""
+    num_q_heads, num_kv_heads, head_dim, hidden = _SLICED_RMSNORM_SHAPES[shape]
+    tokens = 8
+    w_q = num_q_heads * head_dim
+    w_kv = num_kv_heads * head_dim
+    heads = num_q_heads if part == "q" else num_kv_heads
+    start = 0 if part == "q" else w_q
+    width = w_q if part == "q" else w_kv
+
+    def fn(x, w_qkv, weight):
+        qkv = x @ w_qkv
+        part_view = qkv[:, start : start + width].reshape(tokens, heads, head_dim)
+        x32 = part_view.float()
+        normalized = x32 * torch.rsqrt(x32.pow(2).mean(-1, keepdim=True) + 1e-6)
+        return (normalized * (1.0 + weight.float())).to(x.dtype), x32
+
+    args = (
+        torch.randn(tokens, hidden, dtype=torch.float16) / 8,
+        torch.randn(hidden, w_q + 2 * w_kv, dtype=torch.float16) / 8,
+        torch.randn(head_dim, dtype=torch.float16) / 8,
+    )
+    expected, _ = fn(*args)
+    result, upcast = torch.compile(fn, dynamic=False)(
+        *(arg.to(DEVICE_NAME) for arg in args)
+    )
+
+    torch.testing.assert_close(result.cpu(), expected, rtol=0.01, atol=0.03)
+    assert_ea(upcast, ElementArrangement.DL16_TO_FP32)
+
+
 # ---------------------------------------------------------------------------
 # Eager-path unit tests
 # ---------------------------------------------------------------------------

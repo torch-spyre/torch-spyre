@@ -29,12 +29,15 @@ import math
 import os
 from typing import Mapping, Optional
 
-from torch._inductor.ir import ComputedBuffer
+from torch._inductor.ir import ComputedBuffer, MutationLayoutSHOULDREMOVE
 
 
 from .constants import BATCH_MATMUL_OP
 from .cost_model import ArgTraffic, OpFeatures, explain, max
+from .logging_utils import get_logger, warn_once
 from .pass_utils import apply_splits_from_index_coeff, iteration_space_from_op
+
+logger = get_logger("cost_model")
 
 
 def cost_dump_enabled() -> bool:
@@ -523,6 +526,59 @@ def _relayout_features(op, out_dims):
         return zeros
 
 
+def _graph_boundary_names() -> tuple[set, set] | None:
+    """(graph input names, graph output names) of the graph being lowered.
+
+    ``None`` when there is no active ``V.graph`` (the extractor also runs from offline
+    tooling, and ``build_report`` is unit-testable without a ``GraphLowering``). The
+    callers leave every arg unstamped in that case, so ``ArgTraffic.is_boundary`` falls
+    back to the naming convention -- stamping ``False`` instead would be taken as an
+    authoritative "not a boundary arg" and would silently disable the external-input
+    de-duplication in ``_fused_hbm_bytes`` as well.
+    """
+    try:
+        from torch._inductor.virtualized import V
+
+        return set(V.graph.graph_input_names), set(V.graph.get_output_names())
+    except Exception:  # noqa: BLE001 - best-effort feature extraction
+        return None
+
+
+def _writes_graph_output(op, graph_outputs: set) -> bool | None:
+    """Whether ``op``'s write is the externally-visible write of a graph output.
+
+    Not simply ``op.get_name() in graph_outputs``: a ``MutationLayoutSHOULDREMOVE`` op
+    writes into ANOTHER buffer, and it is that target -- not the op's own name -- that
+    the graph returns. Same distinction ``loop_info.PropagationPlan.graph_output_name``
+    records.
+
+    ``None`` when the op cannot be read, meaning UNKNOWN. ``False`` is authoritative
+    "interior write", and unlike the input side an output arg has no naming-convention
+    fallback to recover from a wrong one -- it would silently free the store under
+    residency, which is exactly the under-charge of #4271. Unknown is not silent
+    either: nothing downstream can tell the two apart, so this is where it is said.
+    """
+    try:
+        if op.get_name() in graph_outputs:
+            return True
+        layout = op.get_layout()
+        if isinstance(layout, MutationLayoutSHOULDREMOVE):
+            return layout.get_buffer().get_name() in graph_outputs
+    except Exception as exc:  # noqa: BLE001 - best-effort feature extraction
+        name = getattr(op, "name", None) or type(op).__name__
+        warn_once(
+            logger,
+            f"graph-output-stamp:{name}",
+            "cannot tell whether %s writes a graph output (%s); its store is left "
+            "unstamped and priced as interior traffic, so LX residency will free "
+            "bytes the graph boundary still moves",
+            name,
+            exc,
+        )
+        return None
+    return False
+
+
 def extract_op_features(
     op, work_slices=None, is_lx: Optional[Mapping[str, bool]] = None
 ) -> OpFeatures:
@@ -536,8 +592,15 @@ def extract_op_features(
     symbolic ``sym_is_lx``) consulted for each arg (the op's own output and
     every input read); a name absent from the map -- or an empty map -- falls
     back to the arg's committed layout.
+
+    Each arg is also stamped with ``is_boundary``: whether ITS traffic crosses the
+    graph boundary, resolved against the arg's own role, so a buffer that is both a
+    graph input and a graph output (a returned view of an input; a mutated input that
+    is returned) needs no special case.
     """
     is_lx = is_lx or {}
+    boundary = _graph_boundary_names()
+    graph_inputs, graph_outputs = boundary if boundary is not None else (None, None)
     data = getattr(op, "data", None)
     is_reduction = getattr(data, "reduction_type", None) is not None
     loop_trip, tiles_red_dim, tiles_out_dim = _loop_features(op)
@@ -660,6 +723,15 @@ def extract_op_features(
             dims=list(out_dims),
             logical=list(out_size),
             loop_factor=out_factor,
+            # Against the op's BUFFER name (and its mutation target), not the
+            # operation name this arg carries. ``None`` means unstamped, not
+            # "not a boundary": no graph at all (see _graph_boundary_names), or
+            # an op _writes_graph_output could not read.
+            is_boundary=(
+                None
+                if graph_outputs is None
+                else _writes_graph_output(op, graph_outputs)
+            ),
         )
     )
     # Input args, from the op's reads. Each read is sized by ITS OWN buffer's device
@@ -713,6 +785,7 @@ def extract_op_features(
                     if (_levels and index is not None)
                     else in_factor
                 ),
+                is_boundary=(None if graph_inputs is None else name in graph_inputs),
             )
         )
 
@@ -774,10 +847,12 @@ def _record_last_io(feats: list) -> None:
         args = []
         for a in o.args:
             bs = a.elems * o.dtype_bytes
-            # Every HBM arg counts at its own size x loop_factor (L for a per-tile
-            # accumulator re-accessed each loop iteration, 1 otherwise); broadcast
-            # operands carry their small one-load size (counted, not zeroed). LX ~free.
-            counted = bs * a.loop_factor if a.mem == "hbm" else 0
+            # Same accounting as ``hbm_bytes()`` below, so the per-arg breakdown sums
+            # to the total: own size x loop_factor for an HBM arg (L for a per-tile
+            # accumulator re-accessed each loop iteration, 1 otherwise), the small
+            # one-load size for a broadcast operand, ~free for LX -- except a graph
+            # boundary this bundle pays for, which stays charged despite LX.
+            counted = a.hbm_elems() * o.dtype_bytes
             args.append(
                 {
                     "name": a.name,

@@ -259,16 +259,47 @@ auto get_device_stride_infos(c10::IntArrayRef sizes,
     for (int j = tile_map[i].size() - 1; j > -1; j--) {
       const int tile_index = tile_map[i][j];
       const int64_t tile_size = stl.device_size[tile_index];
+
+      // Every divisor below is checked before it is used. Integer division by
+      // zero raises SIGFPE, which is not catchable from Python: it terminates
+      // the interpreter outright, so a malformed layout would abort the process
+      // instead of surfacing a RuntimeError the caller can handle. A guard that
+      // itself kills the process is worse than no guard.
+      TORCH_CHECK(host_stride != 0,
+                  "Invalid stride map: zero DMA stride for host dimension ", i,
+                  " while mapping device dimension ", tile_index);
+
       const int64_t tile_stride = host_strides[tile_index] / host_stride;
 
       // Size 1 dimensions are ignored.
       if (tile_size == 1) continue;
+
+      // A size-0 device dimension is malformed and is NOT covered by the
+      // size-1 skip above. Letting it through sets dcsi_sizes[tile_index] to 0
+      // below, which zeroes `elements_before`, and the next iteration of this
+      // loop then evaluates `host_size % 0`. See issue #3604, where a
+      // compiler-generated layout of device_size {0, 4, 32} reached here.
+      TORCH_CHECK(tile_size > 0, "Invalid device size ", tile_size,
+                  " for device dimension ", tile_index,
+                  ": a zero-sized device dimension cannot describe host "
+                  "dimension ",
+                  i, " of size ", host_size);
+
+      TORCH_CHECK(
+          elements_before > 0,
+          "Invalid device sizes and stride map for host sizes and strides");
 
       TORCH_CHECK(
           host_size % elements_before == 0,
           "Invalid device sizes and stride map for host sizes and strides");
 
       const int64_t current_elements = host_size / elements_before;
+
+      TORCH_CHECK(tile_stride != 0, "Invalid stride map: device dimension ",
+                  tile_index, " has stride ", host_strides[tile_index],
+                  " which is smaller than the host DMA stride ", host_stride,
+                  " for host dimension ", i);
+
       const int64_t remaining_elements = current_elements / tile_stride;
 
       TORCH_CHECK(
@@ -297,6 +328,19 @@ auto get_device_stride_infos(c10::IntArrayRef sizes,
         const int next_index = tile_map[i][j];
         const int64_t next_size = stl.device_size[next_index];
         const int64_t next_stride = host_strides[next_index] / host_stride;
+
+        // Same reasoning as the divisor guards above: `next_stride` divides
+        // below and `next_size` is a modulus, so both must be non-zero or the
+        // process takes SIGFPE instead of raising.
+        TORCH_CHECK(next_stride != 0, "Invalid stride map: device dimension ",
+                    next_index, " has stride ", host_strides[next_index],
+                    " which is smaller than the host DMA stride ", host_stride,
+                    " for host dimension ", i);
+        TORCH_CHECK(next_size > 0, "Invalid device size ", next_size,
+                    " for device dimension ", next_index,
+                    ": a zero-sized device dimension cannot describe host "
+                    "dimension ",
+                    i, " of size ", host_size);
 
         const int64_t tiled_elements = current_elements / next_stride;
 
