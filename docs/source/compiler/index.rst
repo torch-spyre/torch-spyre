@@ -65,3 +65,9 @@ test coverage, bug classification), see :doc:`/contributing/op_enablement`.
    sa_co_optimization
    native_packer_performance
    hbm_pool_planning
+
+.. toctree::
+   :maxdepth: 2
+   :caption: Validation
+
+   graph_invariants
