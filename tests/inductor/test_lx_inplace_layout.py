@@ -83,6 +83,17 @@ def _capture_multi_arg_layouts(original):
 class TestLXInplaceLayout:
     """In-place layout promotion in _multi_arg_pointwise_layouts."""
 
+    def test_pointwise_dim_order_projection_handles_tiled_backing_axis(self):
+        project = propagate_layouts._project_pointwise_dim_order
+
+        assert project([0, 1, 2, 3], output_rank=4, input_rank=5) == [0, 1, 2, 3, 4]
+        assert project([2, 0, 1, 3], output_rank=4, input_rank=5) == [0, 3, 1, 2, 4]
+
+    def test_pointwise_dim_order_projection_keeps_broadcast_behavior(self):
+        project = propagate_layouts._project_pointwise_dim_order
+
+        assert project([2, 0, 1, 3], output_rank=4, input_rank=3) == [1, 0, 2]
+
     def test_add_reuses_matmul_input_layout(self):
         """The add in matmul(Q*scale, K.T) + mask reuses the matmul layout.
 

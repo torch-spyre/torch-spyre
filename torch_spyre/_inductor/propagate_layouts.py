@@ -219,6 +219,22 @@ def _compute_dim_order(stick_dim, size, coords):
     return dim_order
 
 
+def _project_pointwise_dim_order(
+    dim_order: list[int], output_rank: int, input_rank: int
+) -> list[int]:
+    """Project a pointwise output order onto a trailing-aligned input."""
+    rank_diff = output_rank - input_rank
+    if rank_diff >= 0:
+        return [d - rank_diff for d in dim_order if d >= rank_diff]
+
+    # A loop tile can be a rank-preserving view of a higher-rank backing
+    # buffer. Its extra leading axes are fixed by the loop, while the body
+    # operates on the trailing axes. Keep those backing axes in the layout
+    # permutation and shift the body's order onto the trailing dimensions.
+    leading = list(range(-rank_diff))
+    return leading + [d - rank_diff for d in dim_order]
+
+
 def _pick_stick_dim(stick_expr, out_coords) -> int:
     """Map a stick expression to an output dimension index, or -1 if it doesn't survive."""
     maybe = matching_dim(out_coords, stick_expr)
@@ -1549,9 +1565,9 @@ def _multi_arg_pointwise_layouts(
 
     def _is_supported_layout(dim_order):
         for arg in args:
-            # Project output dim_order to input, dropping leading dims missing due to broadcast.
-            rank_diff = len(output.size) - len(arg.layout.size)
-            projected_dim_order = [d - rank_diff for d in dim_order if d >= rank_diff]
+            projected_dim_order = _project_pointwise_dim_order(
+                dim_order, len(output.size), len(arg.layout.size)
+            )
             c_in_size = [concretize_expr(s) for s in arg.layout.size]
             c_in_stride = [concretize_expr(s) for s in arg.layout.stride]
             in_stl = SpyreTensorLayout(

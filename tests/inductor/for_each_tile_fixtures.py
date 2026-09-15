@@ -153,6 +153,70 @@ def online_softmax_reference(
     return acc / denom
 
 
+PAGE_POOL, PAGE_BLOCKS, PAGE_SIZE, PAGE_HS, PAGE_LQ = 8, 4, 32, 64, 32
+INT32_ELEMS_PER_STICK = 32
+PAGE_ORDER = (5, 2, 7, 0)
+
+
+def paged_gather_inputs() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """(pages, block table, query) for paged attention's in-body page gather.
+
+    The table mirrors what spyre-inference's paged attention passes: one
+    stick-wide int32 row per active block, page index at column 0.
+    """
+    torch.manual_seed(0)
+    pages = torch.randn(PAGE_POOL, PAGE_SIZE, PAGE_HS, dtype=torch.float16)
+    q = torch.randn(PAGE_LQ, PAGE_HS, dtype=torch.float16)
+    table = torch.zeros(PAGE_BLOCKS, INT32_ELEMS_PER_STICK, dtype=torch.int32)
+    for i, page in enumerate(PAGE_ORDER):
+        table[i, 0] = page
+    return pages, table, q
+
+
+def paged_gather_fn(
+    pages: torch.Tensor, table: torch.Tensor, q: torch.Tensor
+) -> torch.Tensor:
+    """Case 3 (Kind.GATHER): gather one page per trip from inside the body.
+
+    The tiled operand is the block table, not the pages: the body reads its
+    own page index out of the tile and gathers with it, so the whole page pool
+    stays invariant and only one page is live per trip. That index is a POINT
+    read -- one int32 element whose address moves with the spliced loop var and
+    which carries no iteration dim of its own -- so it is the shape coarse
+    tiling handles through squeezed_advance_per_read rather than a tiled dim
+    (see coarse_tile._point_splice_advance_for_dep). Pre-gathering the pages
+    ahead of the loop would compile without any of that, at the cost of keeping
+    the whole sequence's K/V live across it.
+    """
+
+    def body(acc, tiles):
+        table_row, pages_all, q_whole = tiles
+        page_idx = table_row[0, 0:1]
+        page = pages_all.index_select(0, page_idx).squeeze(0)
+        scores = q_whole @ page.transpose(0, 1)
+        return acc + scores @ page, None
+
+    acc0 = torch.zeros(PAGE_LQ, PAGE_HS, device=q.device, dtype=q.dtype)
+    final, _ = for_each_tile(
+        body,
+        (table, pages, q),
+        dims=(0, None, None),
+        tile_size=1,
+        init=acc0,
+    )
+    return final
+
+
+def paged_gather_reference(pages: torch.Tensor, q: torch.Tensor) -> torch.Tensor:
+    """The same accumulation in fp32 on CPU, looped in Python over PAGE_ORDER."""
+    pf, qf = pages.float(), q.float()
+    acc = torch.zeros(PAGE_LQ, PAGE_HS)
+    for p in PAGE_ORDER:
+        page = pf[p]
+        acc = acc + (qf @ page.transpose(0, 1)) @ page
+    return acc
+
+
 @contextlib.contextmanager
 def _post_grad_graphs():
     """Capture each post-grad graph right after decompose_scan_to_while_loop runs.
