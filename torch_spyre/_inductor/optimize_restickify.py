@@ -305,15 +305,18 @@ class FixedInOutNode(RestickNodeCost):
         edge_costs,
         required_out_stl: "SpyreTensorLayout",
         required_in_stls: "list[SpyreTensorLayout]",
+        out_dep: "MemoryDep",
     ):
         super().__init__(edge_costs)
         self.required_out_stl = required_out_stl
         # Parallel to edge_costs by construction in from_args (both built from the
         # same zip over args/req_stls). strict=True in min_input_cost asserts this.
         self.required_in_stls = required_in_stls
+        self._out_dep = out_dep
+        self._out_host = V.graph.get_buffer(out_dep.name).get_layout()
 
     @classmethod
-    def from_args(cls, args, out_stl, req_stls, op, exact_input_indices=None):
+    def from_args(cls, args, out_stl, req_stls, op, out_dep, exact_input_indices=None):
         assert req_stls, "FixedInOutNode.from_args: req_stls is empty"
         exact_input_indices = exact_input_indices or set()
         edge_costs = [
@@ -327,19 +330,23 @@ class FixedInOutNode(RestickNodeCost):
             )
             for i, (arg, req) in enumerate(zip(args, req_stls))
         ]
-        return cls(edge_costs, required_out_stl=out_stl, required_in_stls=req_stls)
+        return cls(
+            edge_costs,
+            required_out_stl=out_stl,
+            required_in_stls=req_stls,
+            out_dep=out_dep,
+        )
 
     def _out_stick_compatible(self, out_stl: "SpyreTensorLayout") -> bool:
         """True if out_stl is stick-compatible with required_out_stl."""
         if out_stl == self.required_out_stl:
             return True
-        ec = self.edge_costs[0]
         needed, _ = compute_restickify_needed(
             self.required_out_stl,
-            ec._target_dep_layout,
-            ec._target_dep,
+            self._out_host,
+            self._out_dep,
             out_stl,
-            ec._target_dep,
+            self._out_dep,
             None,
         )
         return not needed
