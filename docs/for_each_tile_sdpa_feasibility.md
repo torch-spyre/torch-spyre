@@ -23,10 +23,11 @@ There are three other gaps to resolve before production use:
    shorter final K/V block, so arbitrary `Lk` needs padding and masking, an exact
    divisor policy, or frontend support for a ragged final tile.
 
-The recommendation is therefore not to modify production SDPA yet. Fix and
-test nested HOP lowering first, then add destination-backed map outputs, handle
-broadcast bias and ragged `Lk`, and only then replace the hint scopes and Python
-loop while retaining the current cost model and safety limits.
+The recommendation is therefore to land only the standalone `Lk` replacement
+for now, as proposed separately in PR #4550. Do not replace the outer hint
+scopes yet. Fix and test nested HOP lowering first, then add destination-backed
+map outputs and handle broadcast bias before making the complete HOP nest the
+production implementation.
 
 ## Experiment baseline
 
@@ -42,12 +43,16 @@ PR #4518 is already in this base as commit
 fix is useful to the existing hint-based path, but it does not fix nested
 `for_each_tile` lowering.
 
-No production source was changed. A speculative compiler modification used to
-continue diagnosis past the first failure was reverted.
+This draft branch includes the proposed production replacement so the team can
+inspect and iterate on the complete shape. It is intentionally not ready to
+merge: the nested-lowering failures below are reproduced by that implementation.
+A speculative compiler modification used to continue diagnosis past the first
+failure was reverted.
 
-## Current SDPA structure
+## Original SDPA structure
 
-`spyre__sdpa_overrideable` currently chooses a tiling plan with
+Before the standalone `Lk` refactor, `spyre__sdpa_overrideable` chooses a
+tiling plan with
 `_select_sdpa_tiling` and expresses outer coarse tiling with nested
 `spyre_hint` scopes:
 
@@ -109,6 +114,14 @@ The outer levels use map mode and concatenate the returned tile along their
 respective output dimension. The `Lk` level uses reduction mode (`init=(M, l,
 O)`) and emits no per-iteration output.
 
+The draft implementation in this branch follows that structure directly. It
+bypasses one-trip map levels, retains the existing tiling cost model, uses an
+exact divisor no larger than the selected `Lk` block size, and constructs the
+sparse `M` and denominator accumulators per query tile. Masks remain separate
+operands and are sliced only along axes whose extent matches the tiled axis.
+This code is included to make the complete lowering shape reviewable; it is not
+expected to compile for shapes that exercise two or more HOP levels.
+
 ## Results
 
 ### Passing cases
@@ -127,7 +140,7 @@ The Spyre tests use FP16 operands with `D=128`, `Lq=64`, `Lk=256`, and
 The complete prototype suite reports:
 
 ```text
-Ran 9 tests in 46.607s
+Ran 9 tests in 46.525s
 OK (expected failures=4)
 ```
 
@@ -295,7 +308,7 @@ Reuse `_select_sdpa_tiling` to choose tile sizes. Express `B`, `Hkv`, `G`, and
 existing per-block K/V `.contiguous()` normalization and mask slicing. Use
 preallocated destinations at every map level.
 
-The current 16-pair bundle guard exists because Python-unrolled `Lk` multiplies
+The original 16-pair bundle guard exists because Python-unrolled `Lk` multiplies
 code size by the `Lq` trip count. A real nested `Lk` `LoopSpec` may remove that
 specific source-size problem, but the guard should remain until generated code,
 DXP compile time, and runtime launch behavior demonstrate that it is no longer
@@ -337,8 +350,10 @@ env PYTHONPATH=/tmp/torch-spyre-sdpa-fet.8jYqoJ python -c \
 
 ## Decision
 
-The rewrite should continue as compiler-enablement work, not as an SDPA
-decomposition patch yet. A standalone `Lk` HOP is proven viable, but inserting
-it inside the current outer hint-generated loops still creates the unsupported
-nested-loop condition. There is therefore no safe partial production
-replacement until nested lowering works.
+The full rewrite should continue as compiler-enablement work, not as a
+merge-ready SDPA decomposition patch yet. A standalone `Lk` HOP is proven
+viable inside the existing outer hint-generated tiling and is proposed in PR
+#4550. Replacing those outer hints with map-mode HOPs creates the unsupported
+nested-loop condition. The safe partial production step is therefore the `Lk`
+replacement; the outer `B`, `Hkv`/`H`, `G`, and `Lq` replacement must wait for
+nested lowering and the remaining map-mode issues.
