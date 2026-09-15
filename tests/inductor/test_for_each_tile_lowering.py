@@ -937,6 +937,314 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
                 "[K, N] shape, the reduction (K) dim",
             )
 
+    def test_lookup_marker_dim_resolves_reduction_dim(self):
+        """lookup_marker_dim's is_reduction=True return path (F4.1).
+
+        No existing fixture in this file reaches this path: every CPU
+        fixture's marker consumer is either a StarDep-shaped matmul
+        (split_m_fn/split_k_fn -- lookup_marker_dim returns None
+        immediately for those, see test_split_k_marker_resolves_
+        reduction_dim's own docstring) or a Pointwise ComputedBuffer
+        (split_m_elementwise_fn), never a Reduction ComputedBuffer.
+        Confirmed directly against online_softmax_fn (whose amax/sum
+        reductions read tiles derived FROM the marker's consumer, not the
+        marker itself): both of its two real markers still resolve to a
+        StarDep-shaped matmul consumer on this CPU fixture, same as split_m_
+        fn/split_k_fn -- the reduction-dim resolution path genuinely has no
+        CPU-fixture-driven route in this file, so this test builds the
+        minimal IR directly instead (per the fix-wave brief's own
+        guidance), using this class's established mock.Mock(spec=[...])
+        convention (see TestSpliceWhileLoop above).
+
+        Mirrors _hint_ranges_pos's own resolution order: op.data is a real
+        Reduction (isinstance-checked; mock.Mock(spec=Reduction) passes
+        that check), and the marker-identified MemoryDep's index (``r0 +
+        3*u0``) is built so u0's (the WhileLoop-splice loop_var) advance
+        coefficient (3) coincidentally matches r0's own coefficient (1)
+        times r0's range (3) -- the exact coefficient-coincidence equation
+        lookup_marker_dim's docstring describes. op_out_coords is
+        monkeypatched to a coordinate list that does NOT mention r0, so
+        _loop_var_to_ranges_pos misses (r0 is not an output dim) and
+        resolution must fall through to the reduction_loop_vars branch --
+        which is the one thing this test actually pins: reduction_loop_vars
+        derives r0 as op's sole reduction var (it is on the read but not on
+        the write), so the candidate's `is_reduction` flag comes out True,
+        not from a hint the test injects directly.
+        """
+        import sympy
+
+        from torch._inductor.dependencies import MemoryDep
+        from torch._inductor.ir import Reduction
+
+        import torch_spyre._inductor.wsr.coarse_tile as coarse_tile_mod
+        from torch_spyre._inductor.wsr.for_each_tile_lowering import (
+            _MARKER_MAPS,
+            clear_marker_maps,
+            lookup_marker_dim,
+        )
+
+        r0, u0 = sympy.symbols("r0 u0")
+
+        # The marker's own read: op's per-iteration advance (u0, coeff 3)
+        # coincides with r0's own coefficient (1) times r0's range (3).
+        marker_dep = MemoryDep(
+            name="marker_buf",
+            index=r0 + 3 * u0,
+            var_names=(r0,),
+            size=(sympy.Integer(3),),
+        )
+        # op's write does not mention r0 -- r0 is a pure reduction var.
+        out_dep = MemoryDep(
+            name="reduction_op",
+            index=sympy.Symbol("d0"),
+            var_names=(sympy.Symbol("d0"),),
+            size=(sympy.Integer(1),),
+        )
+
+        op = mock.Mock(spec=["get_read_writes", "get_name", "data"])
+        op.get_name.return_value = "reduction_op"
+        op.data = mock.Mock(spec=Reduction)
+        rw = mock.Mock()
+        rw.reads = [marker_dep]
+        rw.writes = {out_dep}
+        op.get_read_writes.return_value = rw
+
+        operations = ["sentinel_operations_list"]
+        clear_marker_maps()
+        self.addCleanup(clear_marker_maps)
+        _MARKER_MAPS[id(operations)] = {("reduction_op", marker_dep): 0}
+
+        graph = mock.Mock(spec=["operations"])
+        graph.operations = operations
+
+        with mock.patch.object(
+            coarse_tile_mod, "op_out_coords", return_value=[sympy.Integer(0)]
+        ):
+            with V.set_graph_handler(graph):
+                result = lookup_marker_dim(op, u0)
+
+        self.assertEqual(
+            result,
+            (0, True),
+            "expected lookup_marker_dim to resolve u0 to reduction "
+            "position 0 (is_reduction=True) via r0, the sole var in the "
+            "marker-identified dep's ranges that satisfies the "
+            "coefficient-coincidence equation",
+        )
+
+        # Non-vacuity check: with the marker map entry removed (simulating
+        # a marker that was never recorded), lookup_marker_dim must return
+        # None instead -- confirming the True-path result above is not
+        # returned unconditionally.
+        _MARKER_MAPS[id(operations)] = {}
+        with mock.patch.object(
+            coarse_tile_mod, "op_out_coords", return_value=[sympy.Integer(0)]
+        ):
+            with V.set_graph_handler(graph):
+                empty_map_result = lookup_marker_dim(op, u0)
+        self.assertIsNone(
+            empty_map_result,
+            "expected lookup_marker_dim to return None once the marker "
+            "map entry is removed -- if this fails, the reduction-dim "
+            "resolution above wasn't actually reading from the map",
+        )
+
+    def test_hint_ranges_pos_raises_on_unmarked_loop_var_gap(self):
+        """_hint_ranges_pos's raise-on-gap guard (F4.2).
+
+        Markers are authoritative and there is no fallback heuristic: an
+        op whose read index genuinely mentions a WhileLoop-splice
+        loop_var, but which resolves to no output dim, no reduction dim,
+        AND no marker-map entry, is an unrecognized shape that must raise
+        loudly (coarse_tile.py's _hint_ranges_pos, ~line 2136-2149) rather
+        than silently return a guessed/absent position. This safety
+        argument -- the entire justification in this branch for deleting
+        the old _loop_var_pos_from_reads heuristic with no fallback -- had
+        no test coverage anywhere in this file before this test.
+
+        Builds the minimal op/hint directly (this class's established
+        mock.Mock(spec=[...]) convention): op's own read index genuinely
+        mentions loop_var u0, op.data is not a Reduction (so the reduction-
+        ranges branch quickly misses), _loop_var_to_ranges_pos is
+        monkeypatched to always miss (op is not tiled along an output dim
+        for this hint), and clear_marker_maps() ensures lookup_marker_dim
+        has no map entry to resolve against either -- exhausting every
+        resolution channel _hint_ranges_pos tries before its final
+        raise-on-gap check.
+        """
+        import sympy
+
+        from torch._inductor.dependencies import MemoryDep
+
+        import torch_spyre._inductor.wsr.coarse_tile as coarse_tile_mod
+        from torch_spyre._inductor.propagate_hints import DimHint
+        from torch_spyre._inductor.wsr.for_each_tile_lowering import (
+            clear_marker_maps,
+        )
+
+        u0 = sympy.Symbol("u0")
+        d0 = sympy.Symbol("d0")
+
+        # op's own read index genuinely mentions loop_var u0 -- the one
+        # condition that must be true for a miss to raise rather than
+        # return (None, False) as a legitimate loop-invariant op would.
+        read_dep = MemoryDep(
+            name="some_buf", index=u0 + d0, var_names=(d0,), size=(sympy.Integer(4),)
+        )
+        op = mock.Mock(spec=["get_read_writes", "get_name", "data"])
+        op.get_name.return_value = "gap_op"
+        op.data = mock.Mock()  # deliberately not a Reduction instance
+        rw = mock.Mock()
+        rw.reads = [read_dep]
+        rw.writes = {mock.Mock(index=sympy.Integer(0))}
+        op.get_read_writes.return_value = rw
+
+        hint = DimHint(
+            dim_names=["u0"],
+            split_count=1,
+            loop_var=u0,
+            is_reduction=False,
+            loop_var_range=2,
+        )
+
+        clear_marker_maps()
+        self.addCleanup(clear_marker_maps)
+
+        graph = mock.Mock(spec=["operations"])
+        graph.operations = ["sentinel_operations_list"]
+
+        with mock.patch.object(
+            coarse_tile_mod, "_loop_var_to_ranges_pos", return_value=None
+        ):
+            with V.set_graph_handler(graph):
+                with self.assertRaises(
+                    AssertionError,
+                    msg="expected _hint_ranges_pos to raise when "
+                    "loop_var appears in op's own read index but resolves "
+                    "through no channel (output dim, reduction dim, or "
+                    "marker map)",
+                ):
+                    coarse_tile_mod._hint_ranges_pos(
+                        op, hint, out_coords=[sympy.Integer(0)]
+                    )
+
+        # Non-vacuity check: when the read index does NOT mention loop_var
+        # at all (a genuinely loop-invariant op), _hint_ranges_pos must NOT
+        # raise -- it must return (None, False) instead. This confirms the
+        # raise above is conditioned on "loop_var appears in the read
+        # index", not unconditional.
+        invariant_dep = MemoryDep(
+            name="some_buf", index=d0, var_names=(d0,), size=(sympy.Integer(4),)
+        )
+        invariant_op = mock.Mock(spec=["get_read_writes", "get_name", "data"])
+        invariant_op.get_name.return_value = "invariant_op"
+        invariant_op.data = mock.Mock()
+        invariant_rw = mock.Mock()
+        invariant_rw.reads = [invariant_dep]
+        invariant_rw.writes = {mock.Mock(index=sympy.Integer(0))}
+        invariant_op.get_read_writes.return_value = invariant_rw
+
+        with mock.patch.object(
+            coarse_tile_mod, "_loop_var_to_ranges_pos", return_value=None
+        ):
+            with V.set_graph_handler(graph):
+                result = coarse_tile_mod._hint_ranges_pos(
+                    invariant_op, hint, out_coords=[sympy.Integer(0)]
+                )
+        self.assertEqual(
+            result,
+            (None, False),
+            "expected a genuinely loop-invariant op (whose read index "
+            "never mentions loop_var) to resolve to (None, False) without "
+            "raising -- if this fails, the raise above isn't actually "
+            "conditioned on the mentions_loop_var check",
+        )
+
+    def test_consume_tile_dim_markers_raises_on_wrong_consumer_count(self):
+        """_consume_tile_dim_markers's consumer-count guard (F4.3).
+
+        A tile_dim_marker op is expected to have exactly one consuming
+        read within its spliced body (for_each_tile_lowering.py,
+        ~line 762-769). Zero consumers or more than one are both
+        unrecognized shapes and must raise AssertionError rather than
+        silently pick a default -- untested anywhere in this file before
+        this test. Covers both wrong-count shapes in one test (zero, then
+        two), each built directly via this class's established
+        mock.Mock(spec=[...]) convention (see TestSpliceWhileLoop above)
+        rather than a full torch.compile, since driving a real for_each_
+        tile fixture into either of these malformed shapes is not
+        possible through the ordinary lowering path -- both are meant to
+        be unreachable there, which is exactly why they need direct
+        construction to exercise at all.
+        """
+        import sympy
+
+        from torch._inductor.dependencies import MemoryDep
+        from torch_spyre._inductor.wsr.for_each_tile_lowering import (
+            _consume_tile_dim_markers,
+        )
+
+        def make_marker_op():
+            marker_op = mock.Mock(
+                name="marker_op",
+                spec=["get_read_writes", "get_name", "tile_marker_dim"],
+            )
+            marker_op.get_name.return_value = "marker_buf"
+            marker_op.tile_marker_dim = 0
+            marker_rw = mock.Mock()
+            marker_rw.reads = [
+                MemoryDep(
+                    name="input_buf", index=sympy.Integer(0), var_names=(), size=()
+                )
+            ]
+            marker_op.get_read_writes.return_value = marker_rw
+            return marker_op
+
+        def make_consumer(name):
+            consumer_op = mock.Mock(name=name, spec=["get_read_writes", "get_name"])
+            consumer_op.get_name.return_value = name
+            consumer_rw = mock.Mock()
+            consumer_rw.reads = [
+                MemoryDep(
+                    name="marker_buf", index=sympy.Integer(0), var_names=(), size=()
+                )
+            ]
+            consumer_op.get_read_writes.return_value = consumer_rw
+            return consumer_op
+
+        # Zero consumers: the marker op has no consuming read at all.
+        zero_marker_op = make_marker_op()
+        unrelated_op = mock.Mock(
+            name="unrelated_op", spec=["get_read_writes", "get_name"]
+        )
+        unrelated_op.get_name.return_value = "unrelated_op"
+        unrelated_rw = mock.Mock()
+        unrelated_rw.reads = []
+        unrelated_op.get_read_writes.return_value = unrelated_rw
+
+        zero_group_ops = [zero_marker_op, unrelated_op]
+        zero_operations = list(zero_group_ops)
+        zero_graph = mock.Mock(spec=["operations"])
+        zero_graph.operations = zero_operations
+
+        with V.set_graph_handler(zero_graph):
+            with self.assertRaisesRegex(AssertionError, r"has 0 consuming reads"):
+                _consume_tile_dim_markers(zero_group_ops, zero_operations)
+
+        # Two consumers: two distinct ops both read the marker's output.
+        two_marker_op = make_marker_op()
+        consumer_a = make_consumer("consumer_a")
+        consumer_b = make_consumer("consumer_b")
+
+        two_group_ops = [two_marker_op, consumer_a, consumer_b]
+        two_operations = list(two_group_ops)
+        two_graph = mock.Mock(spec=["operations"])
+        two_graph.operations = two_operations
+
+        with V.set_graph_handler(two_graph):
+            with self.assertRaisesRegex(AssertionError, r"has 2 consuming reads"):
+                _consume_tile_dim_markers(two_group_ops, two_operations)
+
     def test_nested_for_each_tile_markers_resolve_correctly(self):
         """Two tile_dim_marker-tagged reads at two nesting levels resolve.
 
@@ -1061,9 +1369,7 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
             "expected both nesting levels to be fully spliced",
         )
         remaining_markers = [
-            op
-            for op in operations
-            if hasattr(op, "data") and hasattr(op.data, "tile_marker_dim")
+            op for op in operations if getattr(op, "tile_marker_dim", None) is not None
         ]
         self.assertEqual(
             remaining_markers,
@@ -1089,11 +1395,11 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
             this file; see the fix-round-1 commit message) blocks
             splice_while_loops from ever attempting to splice a given
             WhileLoop at all -- a different code path.
-          - test_marker_inlined_preserves_advance_term_on_computed_buffer_
-            consumer's fake-marker-injection mutation targets the SECOND
-            assertion (remaining_markers), injected AFTER capture, so it
-            is unaffected by the live-reference-vs-snapshot issue this
-            test targets.
+          - test_nested_for_each_tile_markers_snapshot_catches_leftover_
+            marker_injection (below) targets the SECOND assertion
+            (remaining_markers) by injecting a fake marker into the
+            snapshot AFTER capture, so it is unaffected by the live-
+            reference-vs-snapshot issue this test targets.
         Neither of those exercises "splice_while_loops runs but does no
         real re-wiring work, and DCE prunes the evidence afterward
         regardless" -- the exact gap the snapshot fix above closes. Without
@@ -1157,6 +1463,118 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
             "one unspliced WhileLoop in the snapshot -- if this fails, "
             "the snapshot is no longer catching a disabled splice pass",
         )
+
+    def test_nested_for_each_tile_markers_snapshot_catches_leftover_marker_injection(
+        self,
+    ):
+        """Mutation coverage for the remaining_markers assertion (F1's fix).
+
+        Drives the exact same real capture as
+        test_nested_for_each_tile_markers_resolve_correctly (a genuine,
+        unmutated splice_while_loops run), then -- AFTER the snapshot is
+        taken -- tags one real op already in the snapshot with
+        ``tile_marker_dim = 0``, simulating a marker that for some reason
+        survived splicing/consumption. The fixed assertion
+        (``getattr(op, "tile_marker_dim", None) is not None``) must catch
+        this: it is the mutation test for the SECOND assertion in
+        test_nested_for_each_tile_markers_resolve_correctly's body
+        (remaining_markers), the counterpart to
+        test_nested_for_each_tile_markers_snapshot_catches_noop_splice_stub
+        (above), which mutates the *splice* to prove the *WhileLoop*
+        assertion is non-vacuous -- this test mutates the *marker* state
+        instead, to prove the *remaining_markers* assertion is non-vacuous.
+
+        This directly guards against F1's actual bug: the pre-fix check
+        (``hasattr(op, "data") and hasattr(op.data, "tile_marker_dim")``)
+        looked one level too deep (at ``op.data``, the Pointwise/Reduction
+        IR expression, which never carries the attribute) instead of at
+        ``op`` itself (the ComputedBuffer, which is what
+        ``lower_tile_dim_marker`` actually stamps). That pre-fix check
+        would stay vacuously ``[]`` against this exact mutation -- confirmed
+        directly while developing this fix, not merely asserted here.
+        """
+        import torch
+        import torch_spyre  # noqa: F401  registers the "spyre" device
+        from torch_spyre.constants import DEVICE_NAME
+
+        import torch_spyre._inductor.passes as passes_mod
+        from tests.inductor.for_each_tile_fixtures import (
+            capture_post_grad_while_loop,
+            nested_split_m_then_k_fn,
+        )
+        from torch._inductor.exc import InductorError
+
+        X = torch.randn(8, 12, device=DEVICE_NAME, dtype=torch.float16)
+        Y = torch.randn(12, 6, device=DEVICE_NAME, dtype=torch.float16)
+
+        captured = {}
+        original_splice_while_loops = passes_mod.splice_while_loops
+
+        def capturing_splice_while_loops(graph):
+            result = original_splice_while_loops(graph)
+            captured["operations"] = list(graph.operations)
+            return result
+
+        passes_mod.splice_while_loops = capturing_splice_while_loops
+        try:
+            capture_post_grad_while_loop(nested_split_m_then_k_fn, (X, Y))
+        except InductorError:
+            # Same tolerated, unrelated issue #4460 gap as the test this
+            # mirrors; irrelevant to this test's own mutation.
+            pass
+        finally:
+            passes_mod.splice_while_loops = original_splice_while_loops
+
+        self.assertIn(
+            "operations", captured, "splice_while_loops was never called/captured"
+        )
+        operations = captured["operations"]
+
+        # Sanity check on the real, unmutated snapshot: every marker was
+        # genuinely consumed here, same as
+        # test_nested_for_each_tile_markers_resolve_correctly asserts.
+        self.assertEqual(
+            [
+                op
+                for op in operations
+                if getattr(op, "tile_marker_dim", None) is not None
+            ],
+            [],
+            "fixture assumption violated: expected every marker already "
+            "consumed before this test's own mutation",
+        )
+
+        # The mutation: tag a real op already in the snapshot -- one that
+        # does not already carry tile_marker_dim -- to simulate a marker
+        # left behind by an incomplete splice/consumption.
+        victim = operations[0]
+        self.assertFalse(
+            hasattr(victim, "tile_marker_dim"),
+            "fixture assumption violated: victim op already carries "
+            "tile_marker_dim before injection",
+        )
+        victim.tile_marker_dim = 0
+        try:
+            remaining_markers = [
+                op
+                for op in operations
+                if getattr(op, "tile_marker_dim", None) is not None
+            ]
+            # This is the mutation catch: the fixed assertion must see the
+            # injected marker. If this assertion ever starts passing (i.e.
+            # remaining_markers == []), the remaining_markers check has
+            # regressed back to something that cannot see a real,
+            # ComputedBuffer-level tile_marker_dim tag -- e.g. F1's
+            # original one-level-too-deep `op.data` bug.
+            self.assertEqual(
+                remaining_markers,
+                [victim],
+                "expected the injected tile_marker_dim to be caught by the "
+                "remaining_markers filter -- if this fails, the filter is "
+                "no longer catching a marker tagged directly on the op",
+            )
+        finally:
+            del victim.tile_marker_dim
 
     @unittest.expectedFailure
     def test_nested_for_each_tile_value_correct(self):
