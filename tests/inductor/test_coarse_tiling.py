@@ -6144,6 +6144,8 @@ class TestInsertAllReadCopyOps(unittest.TestCase):
 
     def test_generated_read_copy_does_not_inherit_positional_work_div_names(self):
         from torch._inductor.ir import ComputedBuffer
+        from torch_spyre._inductor.propagate_hints import get_op_hints
+        from torch_spyre._inductor.work_division import _has_work_div_hint
 
         from torch_spyre._inductor.wsr.coarse_tile import (
             _insert_all_read_copy_ops,
@@ -6151,7 +6153,14 @@ class TestInsertAllReadCopyOps(unittest.TestCase):
         )
 
         op_a, op_b, _full_buf, operations = _make_two_op_shared_read_fixture()
+        origin = fx.Graph().placeholder("input")
+        original_custom = {
+            "_hint_0": {"work_div": {"T": 32}, "slices": {"E": 128}},
+            "_hint_1": {"work_div": {"H": 4}, "named_dims": ["T", "H"]},
+        }
+        origin.meta["custom"] = original_custom
         for op in (op_a, op_b):
+            op.origins = OrderedSet([origin])
             op.work_div_loop_info = {  # type: ignore[attr-defined]
                 Symbol("d0"): ["T"]
             }
@@ -6167,6 +6176,25 @@ class TestInsertAllReadCopyOps(unittest.TestCase):
         ]
         self.assertEqual(len(generated), 1)
         self.assertFalse(hasattr(generated[0], "work_div_loop_info"))
+        self.assertEqual(list(generated[0].origins), [origin])
+        self.assertFalse(_has_work_div_hint(generated[0]))
+        self.assertEqual(
+            get_op_hints(generated[0]),
+            {0: {"slices": {"E": 128}}, 1: {"named_dims": ["T", "H"]}},
+        )
+        self.assertTrue(_has_work_div_hint(op_a))
+        self.assertTrue(_has_work_div_hint(op_b))
+        self.assertEqual(origin.meta["custom"], original_custom)
+        self.assertEqual(original_custom["_hint_0"]["work_div"], {"T": 32})
+        self.assertEqual(original_custom["_hint_1"]["work_div"], {"H": 4})
+        # A subsequent one-to-one reconstruction must not resurrect the hint.
+        replacement = ComputedBuffer(
+            name="replacement", layout=generated[0].layout, data=generated[0].data
+        )
+        replacement.origins = generated[0].origins
+        copy_op_metadata(generated[0], replacement)
+        self.assertEqual(get_op_hints(replacement), get_op_hints(generated[0]))
+        self.assertFalse(_has_work_div_hint(replacement))
 
     def test_advancing_read_copy_stays_inside_loop(self):
         """Only fixed reads move to the preheader; advancing reads retain

@@ -96,6 +96,36 @@ def owner_slots(
     return tuple(rows)
 
 
+def _overlap(a: int, an: int, b: int, bn: int) -> bool:
+    return a * bn < (b + 1) * an and b * an < (a + 1) * bn
+
+
+def transfer_edges(
+    source_splits: Mapping[Any, int],
+    destination_splits: Mapping[Any, int],
+    source_map: Mapping[int, Mapping[Any, int]],
+    destination_map: Mapping[int, Mapping[Any, int]],
+) -> set[tuple[int, int]]:
+    """Ownership intersections for ordinary and completed-result copies.
+
+    Both partitions must describe the same coordinate domain.
+    """
+    return {
+        (s_core, d_core)
+        for s_core, s_slice in source_map.items()
+        for d_core, d_slice in destination_map.items()
+        if all(
+            _overlap(
+                s_slice.get(dim, 0),
+                source_splits.get(dim, 1),
+                d_slice.get(dim, 0),
+                destination_splits.get(dim, 1),
+            )
+            for dim in source_splits.keys() | destination_splits.keys()
+        )
+    }
+
+
 def same_owner_maps(
     left_splits: Mapping[Any, int],
     left_slots: Mapping[Any, Expr],

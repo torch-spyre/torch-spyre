@@ -30,6 +30,7 @@ from torch.utils._sympy.value_ranges import ValueRanges, bound_sympy
 import sympy
 
 from torch_spyre._C import get_device_size_in_bytes
+from torch_spyre._inductor.op_spec import TensorWorkDivision
 from torch_spyre._inductor.ir import FixedTiledLayout
 from torch_spyre._inductor.pass_utils import (
     PerCoreView,
@@ -194,6 +195,8 @@ def counted_loop_lifetime_end_overrides(graph: GraphLowering) -> dict[str, int]:
 def mem_usage_by_buf(
     graph: GraphLowering,
     cache: Optional[dict] = None,
+    *,
+    ownership_overrides: dict[str, TensorWorkDivision] | None = None,
 ) -> dict:
     """
     Get a summary of memory usage of each operation.
@@ -204,7 +207,9 @@ def mem_usage_by_buf(
     """
     # The mismatch reasons are surfaced by the residency path; here only the
     # per-buffer core count (with -1 marking a mismatch) drives mem_usage.
-    num_cores_per_op, _, _ = get_ncores_for_buffers(graph, cache)
+    num_cores_per_op, _, _ = get_ncores_for_buffers(
+        graph, cache, ownership_overrides=ownership_overrides
+    )
     mem_usage: dict = {}
 
     for op in graph.operations:
@@ -534,14 +539,19 @@ def _get_buffer_user_deps(
     return buf_user_deps
 
 
-def _op_num_cores(op: Operation) -> int:
+def _op_num_cores(
+    op: Operation, ownership_override: TensorWorkDivision | None = None
+) -> int:
     """Cores implied by symbol-keyed ownership (defaults to one)."""
-    ownership = getattr(op, "iteration_space_ownership", None)
+    ownership = ownership_override or getattr(op, "iteration_space_ownership", None)
     return ownership.physical_core_count if ownership is not None else 1
 
 
 def get_ncores_for_buffers(
-    graph: GraphLowering, cache: Optional[dict] = None
+    graph: GraphLowering,
+    cache: Optional[dict] = None,
+    *,
+    ownership_overrides: dict[str, TensorWorkDivision] | None = None,
 ) -> tuple[dict[str, int], dict[str, str], dict[str, PerCoreView]]:
     """
     Return ``(num_cores, mismatch_reasons, accepted_views)``, where ``num_cores`` maps each
@@ -557,6 +567,7 @@ def get_ncores_for_buffers(
     share only within a single graph, since the cache key includes the
     op name and `dep` (which carries the buffer name).
     """
+    ownership_overrides = ownership_overrides or {}
     result: dict[str, int] = {}
     mismatch_reasons_cache: dict[str, str] = {}
     accepted_views: dict[str, PerCoreView] = {}
@@ -583,15 +594,19 @@ def get_ncores_for_buffers(
             continue
         # _get_buffer_user_deps creates an entry only while appending its first
         # dependency, so every value in this dictionary is non-empty.
-        # A K-split-reduction writer leaves partial sums on most cores (only
-        # k-last cores hold the final value), so it's unsafe on LX even if
-        # geometry matches — the `flag` gate applies to write-deps only.
+        # A K-split writer stores results only on the last reduction cores.
+        # Ordinary LX placement cannot expose the unwritten buffers; explicit
+        # completed-result copies select those writers in the relayout planner.
         ref_view = None
         ref_op_name = None
         mismatch_reason = None
         writer_cores = None
         for op, dep in users:
-            view, flag, representable = _per_core_view_on_buf(op, dep, buf_name, cache)
+            ownership = ownership_overrides.get(op.get_name())
+            op_cores = _op_num_cores(op, ownership)
+            view, flag, representable = _per_core_view_on_buf(
+                op, dep, buf_name, cache, ownership_override=ownership
+            )
             if not representable:
                 mismatch_reason = (
                     f"ownership on '{op.get_name()}' cannot be represented "
@@ -610,7 +625,7 @@ def get_ncores_for_buffers(
                 # second writer). _op_num_cores folds in K-split factors, an
                 # unfaithful output divisor — but a K-split sets `flag` and is
                 # rejected below, so writer_cores divides only for output splits.
-                writer_cores = _op_num_cores(op)
+                writer_cores = op_cores
                 if flag:
                     mismatch_reason = f"K-split writer '{op.get_name()}'"
                     break
@@ -634,10 +649,10 @@ def get_ncores_for_buffers(
                 # work_slice_dims entries are (device-dim, split factor);
                 # the per-dim core count is the split factor.
                 view_cores = math.prod(f for _, f in view.work_slice_dims)
-                if view_cores != _op_num_cores(op):
+                if view_cores != op_cores:
                     mismatch_reason = (
                         f"broadcast read on '{op.get_name()}': view covers "
-                        f"{view_cores} cores but op runs {_op_num_cores(op)}"
+                        f"{view_cores} cores but op runs {op_cores}"
                     )
                     break
             if ref_view is not None and not view.same_partition(ref_view):
@@ -654,7 +669,10 @@ def get_ncores_for_buffers(
             num_cores = (
                 writer_cores
                 if writer_cores is not None
-                else max(_op_num_cores(op) for op, _ in users)
+                else max(
+                    _op_num_cores(op, ownership_overrides.get(op.get_name()))
+                    for op, _ in users
+                )
             )
             assert ref_view is not None
             accepted_views[buf_name] = ref_view
