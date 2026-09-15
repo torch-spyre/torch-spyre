@@ -354,33 +354,50 @@ _split_candidates_for_host_dim
           _post_tile_stick_alignment_error -> _within_stick_host_dim
 ```
 
-### 8. Reduction-Controlled Span: Known Unsupported Case
+### 8. Reduction-Controlled Span: Reduction-Range Tiling
 
 Example operation:
 
 ```python
 def fn(x):
-    return x.sum(dim=-1)
+    return x.sum(dim=1)  # x.shape == (1, 65536, 16, 64); reads all of x
 ```
 
-If the only overflowing input coordinate is controlled by a generic reduction
-symbol, output-range tiling cannot fix it and the output-range input scan skips
-that candidate.  BMM is the special case: when the reduction symbol is the
-single identifiable matmul `k`, the planner can use the BMM K fallback to emit
-an independent reduction-range tile plan.
+When the only overflowing input coordinate is controlled by the reduced axis,
+no output-range tile can shrink it -- the reduction range itself must be split
+and accumulated in rounds.  This is supported for:
 
-Code flow for generic reductions:
+- batch-matmul `k` (the original case); and
+- a non-matmul `Reduction` whose `reduction_type` is one of `sum`, `prod`,
+  `max`, `min` **and** which has exactly one reduction range
+  (`_supports_reduction_range_tiling`).  These recombine associatively through
+  coarse tiling's identity-fill + per-tile combine + drain path
+  (`coarse_tile._reduction_identity_value` / `_insert_combine_op`).
+
+The planner emits a `SpanOverflowTileLevel(selected_host_dim=0,
+is_reduction=True)` -- `selected_host_dim` is the reduction-range position,
+always `0` here.  It joins the same bounded search as the output axes, so the
+result can be reduction-only or a nested output+reduction plan.
+
+Code flow:
 
 ```text
-_input_span_infos_controlled_by_output_dims
-  -> coordinate free symbols include reduction-only symbol
-  -> symbol is not in output_symbol_to_dim
-  -> reduction_syms is non-empty and not the BMM K special case
-  -> continue
+_input_span_candidates
+  -> _supports_reduction_range_tiling(op) == True
+  -> _bmm_k_span_infos  (name retained; now covers sum/prod/max/min too)
+       -> reduction-only coordinate span > MAX_SPAN_BYTES
+       -> SpanOverflowCandidate(is_reduction=True)
+  -> _search_min_cost_tile_plan
+       -> _split_candidates_for_axis -> _bmm_k_split_candidates (exact divisors)
 ```
 
-Generic reduction-range tiling and combined output+reduction tiling remain
-future work.
+Still unsupported (raise `Unsupported` with a clear message rather than
+silently dropping the overflow -- `_has_untileable_reduction_span`):
+
+- `mean` (its per-tile scale factor needs separate handling);
+- `xor_sum` / `any` / welford (no Spyre kernel lowering);
+- more than one reduction range on one op (coarse tiling tiles at most one
+  reduction dim per level).
 
 ### 9. Coordinate Jointly Controlled by Two Output Symbols
 
@@ -471,11 +488,11 @@ groups:
 [([op], [(hint_id, split_count), ...])]
 ```
 
-Whether a level tiles an output range or the BMM K reduction range is stored on
-the per-op `DimHint` (`is_reduction`), not in the group-level `levels` list.
-Output-range automatic hints have `is_reduction=False`; BMM K hints have
-`is_reduction=True`. Plans containing K are emitted as independent singleton
-groups, including combined output+K plans.
+Whether a level tiles an output range or a reduction range is stored on the
+per-op `DimHint` (`is_reduction`), not in the group-level `levels` list.
+Output-range automatic hints have `is_reduction=False`; reduction-range hints
+have `is_reduction=True`. Plans containing a reduction-range level are emitted
+as independent singleton groups, including combined output+reduction plans.
 
 ## Scope
 
@@ -486,8 +503,10 @@ The production planner handles:
 - output layout span overflow;
 - reduction/BMM input span overflow when the span is controlled by output
   symbols;
-- BMM input span overflow controlled by the single K reduction symbol,
-  searched together with output dimensions to allow K-only or combined plans;
+- input span overflow controlled by the single reduction symbol -- BMM `k`, or
+  a `sum`/`prod`/`max`/`min` reduction with one reduction range -- searched
+  together with the output dimensions to allow reduction-only or combined
+  plans;
 - one or more output host dimensions per op, bounded by `_MAX_TILE_DIMS`;
 - static `FixedTiledLayout` metadata only.
 
@@ -497,8 +516,11 @@ The planner skips:
 - non-`FixedTiledLayout` ops, including mutation/copy-back intermediate layouts;
 - symbolic/dynamic layout metadata;
 - scalar/full reductions where `op.data.ranges` is empty;
-- Pointwise or Reduction ops with indirect/gather/scatter-style reads;
-- input spans controlled only by reduction symbols for non-BMM reductions;
+- Pointwise or Reduction ops with indirect/gather/scatter-style reads.
+
+It raises `Unsupported` (rather than skipping) when a reduction-only input span
+overflows but the op cannot be reduction-range tiled -- `mean`, welford, or
+more than one reduction range.
 
 ### Support Matrix
 
@@ -509,10 +531,11 @@ The planner skips:
 | Reduction output span overflow | Yes | Emit output-range tile levels if post-tile layout validates |
 | Reduction input span controlled by output dim | Yes | Emit tile for the matching output dim |
 | Coordinate jointly controlled by 2+ output symbols | Yes | Emit a candidate for each contributing dim |
-| Reduction input span controlled by reduction dim | No | Skip candidate; generic reduction-range tiling is future work |
+| `sum`/`prod`/`max`/`min` input span controlled by the single reduction dim | Yes | Emit reduction-range level (`is_reduction=True`); reduction-only or combined output+reduction |
+| `mean` / welford / multi-reduction-range input span on the reduction dim | No | Raise `Unsupported` with a clear message |
 | BMM input span controlled by `b`, `m`, or `n` | Yes | Emit tile for matching output dim |
-| BMM input span controlled by `k` | Yes | Emit K-only or combined output+K levels when full validation clears every span |
-| BMM input spans needing both output dim and `k` tiling | Yes | Search and validate output+K split combinations together |
+| BMM input span controlled by `k` | Yes | Emit reduction-only or combined output+`k` levels when full validation clears every span |
+| BMM input spans needing both output dim and `k` tiling | Yes | Search and validate output+`k` split combinations together |
 | BMM with ambiguous reduction symbols | No | Return no BMM input candidates |
 | Scalar/full reduction | No | Return `None` |
 | Symbolic layout metadata | No | Return `None` |
@@ -558,8 +581,9 @@ For `Reduction` ops, `plan_span_overflow_tile` does:
 check op/layout eligibility
 check _has_indirect_reads(op); skip if true
 skip scalar reductions
+_has_untileable_reduction_span(op); raise Unsupported if true
 collect output span candidates
-collect input span candidates controlled by output dims
+collect input span candidates (output-controlled + reduction-range)
 search for cheapest valid tile combination
 ```
 
@@ -585,11 +609,13 @@ scanning later device coordinates.  That `continue` behavior is important: a
 reduction-controlled outer coordinate must not prevent discovery of a
 more-inner output-controlled overflowing coordinate.
 
-BMM `k` is the special supported reduction symbol.  The output-range scan does
-not create B/M/N candidates for pure K-controlled spans; instead the later BMM
-K fallback can emit an independent reduction-range plan.  Generic
-reduction-only input span overflow remains a known limitation because it needs
-reduction-range tiling and partial accumulation outside the BMM-specific path.
+The output-range scan does not create B/M/N candidates for a coordinate
+controlled only by a reduction symbol.  Instead `_bmm_k_span_infos` collects
+those as `is_reduction=True` candidates for the reduction-range search -- for
+BMM `k`, or for a `sum`/`prod`/`max`/`min` reduction with one reduction range.
+`mean`, welford, and multi-reduction-range ops cannot be reduction-range tiled;
+`_has_untileable_reduction_span` detects an overflow they cannot fix and the
+planner raises `Unsupported` rather than emitting a plan that still overflows.
 
 ## BMM-Specific Symbol Mapping
 
@@ -605,9 +631,15 @@ input dependencies to identify exactly one reduction-only symbol (`k`).  If
 there is not exactly one such symbol, it returns `{}` and the BMM input-span
 path produces no candidates.
 
+The reduction-symbol derivation itself is not BMM-specific -- `_bmm_k_symbol`
+(name retained) resolves the single reduction-only input symbol for any op
+`_supports_reduction_range_tiling` accepts.  For a non-matmul reduction the
+output-symbol map is plain `_output_symbol_to_dim`; only the B/M/N naming above
+is matmul-specific.
+
 BMM input spans controlled by `b`, `m`, or `n` can be fixed by output-range
-tiling.  Pure `k` spans are handled by the BMM K fallback, which emits an
-independent reduction-range tile only when K-only validation clears every span.
+tiling.  Pure `k` spans are handled by the reduction-range search, which emits
+a reduction-range tile only when validation clears every span.
 
 ## Span Calculation
 
@@ -677,7 +709,9 @@ costs tie.
 ## Split Candidates and Cost Search
 
 For each candidate axis, `_split_candidates_for_axis` dispatches output axes to
-`_split_candidates_for_host_dim` and BMM K to `_bmm_k_split_candidates`.
+`_split_candidates_for_host_dim` and the reduction axis to
+`_bmm_k_split_candidates` (exact divisors of the reduction range; gated on
+`_supports_reduction_range_tiling`).
 
 A split candidate is legal only if:
 
@@ -883,7 +917,9 @@ automatic output-range tile plan.  Common reasons:
 - selected host dim is not in `op.data.ranges`;
 - selected range is size 1 or non-integral;
 - no legal exact divisor exists;
-- BMM K-only candidates still leave non-K span overflows;
+- a reduction-only input span overflows but the op cannot be reduction-range
+  tiled (`mean`, welford, more than one reduction range);
+- reduction-only candidates still leave non-reduction span overflows;
 - stick alignment rejects all candidates;
 - `_resize_device_layout` cannot reconstruct the post-tile layout;
 - every tried combination still leaves output/input spans above the limit;
@@ -900,10 +936,13 @@ violates the hardware span limit or silently creates unsynchronized tile loops.
 
 ## Known Limitations
 
-- Reduction-range tiling is not implemented.  Input spans controlled only by
-  reduction symbols are skipped.  If such a skipped span still exceeds the
-  hardware limit, downstream Work Division currently logs a critical overflow
-  diagnostic but does not raise before backend compilation.
+- Reduction-range tiling covers BMM `k` and single-range `sum`/`prod`/`max`/
+  `min` only.  `mean` needs per-tile scale-factor handling; `xor_sum`, `any`,
+  and welford have no Spyre kernel lowering; more than one reduction range on
+  one op is not searched (coarse tiling tiles at most one reduction dim per
+  level).  A reduction-only overflow on any of these raises `Unsupported`.
+- Combined output+reduction plans are emitted as nested levels only (outer
+  output, inner reduction) -- never a single mixed level.
 - Scalar/full reductions are skipped.
 - Indirect/gather/scatter-style Pointwise and Reduction ops are skipped because
   they require the indirect-access SDSC path.
@@ -1027,9 +1066,12 @@ Current coverage includes:
 - Pointwise output span tiling;
 - Reduction output span tiling;
 - Reduction/BMM input span tiling;
+- generic reduction-range tiling for `sum`/`prod`/`max`/`min` (planner emits an
+  `is_reduction=True` level), combined output+reduction plans, and a clear
+  `Unsupported` for `mean` / welford / multi-reduction-range overflows
+  (`TestSpanOverflowGenericReductionRangeTiling`);
 - scalar reduction skip;
 - indirect-read guards for Pointwise and Reduction;
-- reduction-controlled span known limitation;
 - BMM reduction-symbol validation;
 - input-layout stick alignment, including a symbol that jointly controls an
   input dimension together with another symbol rather than controlling it
@@ -1062,74 +1104,48 @@ Current coverage includes:
 - codegen `LoopSpec` tests for Pointwise, Reduction, and LM-head restickify
   shapes;
 - real end-to-end hardware execution and numeric validation (no kernel-launch
-  mocking) for both join cases, comparing against a CPU reference:
-  `test_pointwise_to_non_matmul_reduction_join_numeric` (forces a matching
-  plan for a `sum` reduction and its pointwise producer, since the real
-  planner's independently-chosen plans did not happen to agree for this toy
-  shape) and `test_lm_head_matmul_join_numeric` (the real
-  `vocab=49152`/`sencores=32` shape, comparing tiled vs. untiled mismatch
-  rates against the same CPU reference to separate ordinary fp16
-  accumulation noise from join-introduced error), in
-  `TestSpanOverflowNumericValidation`.
+  mocking), all in `TestSpanOverflowNumericValidation`:
+  - every producer/consumer join direction (see the matrix below), each
+    asserting the tiled result is no worse than the same graph run untiled
+    against the same CPU reference;
+  - `test_lm_head_matmul_join_numeric`, the real `vocab=49152`/`sencores=32`
+    LM-head shape;
+  - `test_generic_{sum,max,min}_reduction_range_tile_numeric` -- a forced
+    reduction-range tile on `sum`/`amax`/`amin` executed and compared to CPU,
+    exercising each identity/combine path;
+  - `test_generic_sum_reduction_range_tile_numeric_organic` -- the real
+    planner picking a reduction-range tile from a genuine (lowered-limit)
+    overflow, with no plan forcing;
+  - `test_mean_reduction_range_overflow_raises_at_compile` -- a `mean`
+    overflow fails the compile with the clear "not supported" message.
 
 Producer/consumer grouping is covered at three depths -- the grouping decision
 (mocked), codegen (compiled with kernel launch mocked, asserting one shared
-`LoopSpec`), and execution (run against a CPU reference):
+`LoopSpec`), and execution (run against a CPU reference).  All directions
+below pass; the numeric tests assert the tiled run is no worse than the same
+graph run untiled against the same CPU reference, so ordinary fp16
+accumulation noise is not mistaken for a tiling bug.
 
 | Producer -> Consumer | Grouping | Codegen | Execution |
 |---|---|---|---|
 | pointwise -> pointwise | pass | pass | pass |
 | pointwise -> reduction | pass | pass | pass |
 | reduction -> pointwise | pass | pass | pass |
-| reduction -> reduction | pass | xfail (wrong write) | xfail |
+| reduction -> reduction | pass | pass | pass |
 | reduction -> matmul | pass | pass | pass |
-| pointwise -> matmul | pass | pass | xfail (wrong numbers) |
-| matmul -> pointwise | pass | pass | xfail (wrong numbers) |
-| matmul -> reduction | pass | pass | xfail (wrong numbers) |
+| pointwise -> matmul | pass | pass | pass |
+| matmul -> pointwise | pass | pass | pass |
+| matmul -> reduction | pass | pass | pass |
 | matmul -> matmul | pass | n/a | n/a |
 | matmul -> pointwise -> matmul | pass | not tested | not tested |
 
-Each remaining xfail carries a `TODO` naming its own cause.  **#3612 ("coarse
-tiling: optional read copy") changed this picture materially and the table
-above reflects the post-#3612 state.**  Five directions that previously xfailed
-now pass: all three matmul codegen cells, and execution for
-`reduction -> pointwise` and `reduction -> matmul`.
+The read-copy path this depends on was reworked by #3612 ("coarse tiling:
+optional read copy") and the transposed post-tile layout it once built was
+fixed by #3613 (`_raw_to_squeezed_pos`).
 
-What survives is a *different* failure, and a worse-shaped one.  The three
-matmul execution cells no longer fail to compile — they compile, run, and
-return wrong numbers.  `test_lm_head_matmul_join_numeric` reports tiled
-mismatches of 48727/49152 (99.14%) against 781/49152 (1.59%) untiled on the
-same reference, which is far outside fp16 accumulation noise.  The prime
-suspect is the positional walk in the read-copy path, which pairs the buffer's
-non-unit dims against iteration extents by position: instrumenting
-`_resize_device_layout` on the `reduction -> matmul` shape shows it building
-`tile_size=[1,4,32,64]` for a buffer of `[1,20,64,32]`, i.e. with the trailing
-dims transposed.  That walk predates this branch (it comes from #3381) and is
-unchanged by it, but it should be ruled out before any of these are blamed on
-the backend again.
-
-`reduction -> reduction` codegen is also xfailed, on a *known wrong write*
-rather than an unexplained failure.  `validate_writer_tile_advance` (#3678)
-rejects the group because the synthesized copy-out writer never advances:
-`_insert_copy_op` keys its per-level extents by raw dim index, while
-`_tiled_dims_for_dep` matches those keys against the squeezed `dN` symbols of
-`dep.index`.  For a terminal reduction whose output is `[1, 20]` the leading
-unit dim squeezes away, the raw key matches nothing, and every tile is written
-on top of tile 0.  It is not gated in the pass because the same code path
-serves `reduction -> matmul`, which works; what separates them is output shape,
-not direction.  Tagged `TODO(copy-out-writer-advance)`.
-
-Only one backend-attributed xfail remains, `reduction -> reduction` execution.
-Given
-that two of the three cases originally filed under the same
-`DtException: Could not find any suitable dimension mapping` diagnosis turned
-out to be unblocked by a read-copy change rather than a backend fix, that
-attribution has not been re-established and should not be assumed.
-
-`matmul -> matmul` is marked n/a rather
-than xfail because it is refused by design -- a Reduction consumer has no
-conform path, so both plans must independently agree
-(`TODO(span-overflow-reduction-conform)`,
+`matmul -> matmul` is marked n/a rather than xfail because it is refused by
+design -- a Reduction consumer has no conform path, so both plans must
+independently agree (`TODO(span-overflow-reduction-conform)`,
 [#3625](https://github.com/torch-spyre/torch-spyre/issues/3625) — the same tag
 as the `can_conform_reduction_tile` limitation above; retire both together).
 
