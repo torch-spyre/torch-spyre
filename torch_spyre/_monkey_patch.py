@@ -343,15 +343,23 @@ def _patch_tensor_for_spyre():
         if expected_layout is None:
             return
 
+        # Guard on storage_offset to prevent graph reuse across different offsets (#3770)
+        expected_offset = value.storage_offset()
+
         # add lambda guard on tensor's child manager
         # same node as TENSOR_MATCH!
         tensor_guard_manager = self.get_guard_manager(guard)
         tensor_guard_manager.add_lambda_guard(
             lambda x: (
                 x.device.type != DEVICE_NAME
-                or x.device_tensor_layout() == expected_layout
+                or (
+                    x.device_tensor_layout() == expected_layout
+                    and x.storage_offset() == expected_offset
+                )
             ),
-            [f"SpyreTensorLayout({guard.name}) == {expected_layout}"],
+            [
+                f"SpyreTensorLayout({guard.name}) == {expected_layout} and storage_offset == {expected_offset}"
+            ],
             guard.user_stack,
         )
 
@@ -384,29 +392,30 @@ def _patch_tensor_for_spyre():
     else:
 
         def _spyre_tensor_reuse_metadata(guard, value):
-            # Standard tensor metadata (shape/stride/dtype/device/
-            # requires_grad), plus the device layout for Spyre tensors
-            # (None otherwise). Mirrors extract_tensor_metadata so the
-            # comparison is identical to stock TENSOR_MATCH on the metadata
-            # axis.
+            # Metadata including storage_offset for Spyre tensors (mirrors
+            # extract_tensor_metadata, plus offset awareness for #3770)
             layout = None
+            offset = None
             if getattr(value, "device", None) is not None and (
                 value.device.type == DEVICE_NAME
             ):
                 layout = value.device_tensor_layout()
-            return (extract_tensor_metadata(value), layout)
+                offset = value.storage_offset()
+            return (extract_tensor_metadata(value), layout, offset)
 
         def _spyre_tensor_reuse_eval(value, metadata):
-            base_metadata, expected_layout = metadata
+            base_metadata, expected_layout, expected_offset = metadata
             if not isinstance(value, torch.Tensor):
                 return False
             if extract_tensor_metadata(value) != base_metadata:
                 return False
-            # Layout only constrains Spyre tensors; mirror the runtime
-            # lambda guard: non-Spyre value OR layout matches.
+            # Spyre tensors must match both layout and offset (#3770)
             if value.device.type != DEVICE_NAME:
-                return expected_layout is None
-            return value.device_tensor_layout() == expected_layout
+                return expected_layout is None and expected_offset is None
+            return (
+                value.device_tensor_layout() == expected_layout
+                and value.storage_offset() == expected_offset
+            )
 
         _spyre_reuse_spec = GuardCheckSpec(
             get_metadata_fn=_spyre_tensor_reuse_metadata,
@@ -528,8 +537,9 @@ def _patch_fx_graph_hash():
         except RuntimeError:
             return
 
-        # extract layout from real tensors, fallback to example_inputs
+        # extract layout and offset from real tensors, fallback to example_inputs
         spyre_layouts = []
+        spyre_offsets = []
         # Use real_inputs only if it's a valid list/tuple, otherwise use example_inputs
         inputs_to_use = (
             real_inputs if isinstance(real_inputs, (list, tuple)) else example_inputs
@@ -538,13 +548,16 @@ def _patch_fx_graph_hash():
         for inp in inputs_to_use:
             if isinstance(inp, torch.Tensor):
                 layout = inp.device_tensor_layout()
+                offset = inp.storage_offset() if layout is not None else None
                 spyre_layouts.append(layout)
+                spyre_offsets.append(offset)
             else:
                 spyre_layouts.append(None)
+                spyre_offsets.append(None)
 
-        # self.spyre_layouts added as field on FxGraphHashDetails
-        # PyTorch pickles ALL fields → spyre_layouts automatically in hash
+        # Both fields are pickled into cache key to prevent reuse across offsets (#3770)
         self.spyre_layouts = spyre_layouts
+        self.spyre_offsets = spyre_offsets
 
     FxGraphHashDetails.__init__ = _spyre_init
     FxGraphHashDetails._spyre_hash_patched = True

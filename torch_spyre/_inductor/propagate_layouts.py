@@ -2427,6 +2427,38 @@ def _resolve_copy_back_candidates(operations: list[Operation]) -> None:
         operations.remove(op)
 
 
+def _is_sub_region_view(real_input: torch.Tensor) -> bool:
+    """Whether ``real_input`` is a same-order sub-region slice of its ``_base``.
+
+    The two gates below are intentionally orthogonal:
+
+      Example       | sub-region | offset | Action
+      --------------|------------|--------|-------------------------------
+      x[1:]         | y          | y      | size/stride <- base; offset
+      x[:6]         | y          | n      | size/stride <- base
+      x.t()[1:]     | n          | y      | keep view size/stride; offset
+      x.t()         | n          | n      | no rewrite
+
+    Sub-region requires stride preserved AND size differs. A pure
+    transpose differs on both, but rewriting it to base size/stride
+    would silently strip the permutation -- it falls to the offset-only
+    case instead.
+
+    Stride equality alone isn't sufficient: a size-1 dimension has an
+    arbitrary stride in PyTorch, so a transpose/permute touching one can
+    coincidentally match its base's stride tuple too. A genuine
+    sub-region can only shrink -- every dim of the view must be <= the
+    same dim of base -- which a transpose/permute never satisfies.
+    """
+    base = real_input._base
+    return (
+        base is not None
+        and tuple(real_input.stride()) == tuple(base.stride())
+        and tuple(real_input.size()) != tuple(base.size())
+        and all(real_input.size(d) <= base.size(d) for d in range(real_input.dim()))
+    )
+
+
 def _eager_view_input_layout(
     real_input: torch.Tensor,
     ptl: FixedLayout,
@@ -2443,32 +2475,7 @@ def _eager_view_input_layout(
     """
     base = real_input._base
     storage_offset = real_input.storage_offset()
-
-    # The two gates below are intentionally orthogonal:
-    #
-    #   Example       | sub-region | offset | Action
-    #   --------------|------------|--------|-------------------------------
-    #   x[1:]         | y          | y      | size/stride <- base; offset
-    #   x[:6]         | y          | n      | size/stride <- base
-    #   x.t()[1:]     | n          | y      | keep view size/stride; offset
-    #   x.t()         | n          | n      | no rewrite
-    #
-    # Sub-region requires stride preserved AND size differs. A pure
-    # transpose differs on both, but rewriting it to base size/stride
-    # would silently strip the permutation -- it falls to the offset-only
-    # branch instead.
-    #
-    # Stride equality alone isn't sufficient: a size-1 dimension has an
-    # arbitrary stride in PyTorch, so a transpose/permute touching one can
-    # coincidentally match its base's stride tuple too. A genuine
-    # sub-region can only shrink -- every dim of the view must be <= the
-    # same dim of base -- which a transpose/permute never satisfies.
-    is_sub_region = (
-        base is not None
-        and tuple(real_input.stride()) == tuple(base.stride())
-        and tuple(real_input.size()) != tuple(base.size())
-        and all(real_input.size(d) <= base.size(d) for d in range(real_input.dim()))
-    )
+    is_sub_region = _is_sub_region_view(real_input)
     if not (is_sub_region or storage_offset != 0):
         return None
 
@@ -2553,7 +2560,21 @@ def propagate_spyre_tensor_layouts(
                 new_layout = _eager_view_input_layout(real_input, ptl, name)
                 if new_layout is not None:
                     tb.data.data.layout = new_layout
-                tb.layouts = [stl]
+                    # For sub-region slices, compute device layout for the slice's
+                    # own shape -- device_tensor_layout() (stl, above) describes the
+                    # BASE allocation, not the view, so it's the wrong shape here.
+                    # For pure-offset views, keep the original (base-shaped) layout.
+                    # See #3770.
+                    if _is_sub_region_view(real_input):
+                        slice_stl = SpyreTensorLayout(
+                            [concretize_expr(s) for s in real_input.size()],
+                            new_layout.dtype,
+                        )
+                        tb.layouts = [slice_stl]
+                    else:
+                        tb.layouts = [stl]
+                else:
+                    tb.layouts = [stl]
 
     mutation_alts, mutation_consumer_counts = _scan_mutation_layout_inputs(operations)
 
