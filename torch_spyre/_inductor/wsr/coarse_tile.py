@@ -2078,7 +2078,9 @@ def _hint_ranges_pos(
     ``split_k_fn``'s matmul: reduction dim K -- same synthesized hint, same
     loop_var, opposite answers).
 
-    The read-side fallback (``_loop_var_pos_from_reads``) fires ONLY for a
+    The read-side resolution (``for_each_tile_lowering.lookup_marker_dim``,
+    a marker-map lookup -- NOT a heuristic; it replaced the deleted
+    ``_loop_var_pos_from_reads`` numeric-coincidence guess) fires ONLY for a
     WhileLoop-splice hint, identified exactly as everywhere else in this
     file by ``loop_var_range is not None`` (see propagate_hints.py's
     DimHint docstring). An ordinary ``spyre_hint()`` scope keeps the

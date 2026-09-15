@@ -53,6 +53,29 @@ def split_m_fn(X: torch.Tensor, Y: torch.Tensor) -> torch.Tensor:
     return out
 
 
+def split_m_elementwise_fn(X: torch.Tensor, Y: torch.Tensor) -> torch.Tensor:
+    """Case A variant: an elementwise op reads the marker-tagged tile first.
+
+    Unlike split_m_fn's direct ``x_tile @ y_whole`` (a matmul, which lowers
+    to an aten-fallback ExternKernelOut -- a StarDep-shaped consumer even
+    on a device-less CPU fixture), the intervening ``x_tile * 2.0``
+    lowers to a genuine Pointwise ComputedBuffer on CPU too, giving a
+    consumer that reaches for_each_tile_lowering.py's
+    ``_inline_marker_into_consumer``/``_InlineMarkerHandler`` (the
+    MemoryDep/inner_fn-backed branch of ``_consume_tile_dim_markers``)
+    without needing a real Spyre device. split_m_fn's own StarDep-shaped
+    consumer never exercises that branch at all.
+    """
+
+    def body(_, ops):
+        x_tile, y_whole = ops
+        scaled = x_tile * 2.0
+        return None, scaled @ y_whole
+
+    _, out = for_each_tile(body, (X, Y), dims=(0, None), tile_size=2, out_dim=0)
+    return out
+
+
 def split_k_fn(X: torch.Tensor, Y: torch.Tensor) -> torch.Tensor:
     """Case C: co-indexed split-K matmul; carry accumulates the partial product."""
 

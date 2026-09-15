@@ -50,7 +50,7 @@ from .wsr.coarse_tile_hints import (
     hints_to_coarse_tile_groups,
     reorder_unhinted_interlopers,
 )
-from .wsr.for_each_tile_lowering import splice_while_loops
+from .wsr.for_each_tile_lowering import clear_marker_maps, splice_while_loops
 from . import config
 from .propagate_hints import (
     collect_spyre_hints,
@@ -543,6 +543,14 @@ class CustomPreSchedulingPasses:
         # This pipeline is a per-compile entry point for the observed passes,
         # so clear the dedup here so each compile warns afresh.
         reset_provenance_warnings()
+        # Same "each compile starts from a clean slate" reason:
+        # splice_while_loops (this pipeline's first pass, below) populates
+        # for_each_tile_lowering._MARKER_MAPS, keyed by id(graph.operations).
+        # CPython can reuse a freed list's id across compiles, so a stale
+        # entry left behind by an earlier compile risks colliding with (and
+        # being silently mistaken for) this compile's own -- see
+        # clear_marker_maps()'s own docstring.
+        clear_marker_maps()
 
         if logger.isEnabledFor(logging.INFO):
             logger.info(

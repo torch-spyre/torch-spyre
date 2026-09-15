@@ -41,6 +41,7 @@ from tests.inductor.for_each_tile_fixtures import (
     capture_post_grad_while_loop,
     matmul_inputs,
     split_k_fn,
+    split_m_elementwise_fn,
     split_m_fn,
 )
 from torch_spyre._inductor.wsr.for_each_tile_lowering import (
@@ -702,6 +703,157 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
                 remaining_markers,
                 [],
                 "marker ops must be erased from graph.operations after consumption",
+            )
+
+    def test_marker_inlined_preserves_advance_term_on_computed_buffer_consumer(self):
+        """Pins the ComputedBuffer/inliner branch specifically.
+
+        test_marker_erased_and_mapped_after_split_m_splice (above) only
+        exercises split_m_fn, whose marker's sole consumer is a matmul --
+        an aten-fallback ExternKernelOut even on this device-less CPU
+        fixture, i.e. the StarDep/_substitute_direct_input_refs erasure
+        branch, NOT the ComputedBuffer/_inline_marker_into_consumer branch.
+        Real (device-backed) for_each_tile bodies commonly read a
+        marker-tagged tile from a Pointwise/Reduction ComputedBuffer
+        instead (e.g. test_carry_mode_online_softmax's ``k_tile.transpose
+        (-1, -2)``-fed matmul operand, or any elementwise op on a tile) --
+        that branch was, until this test, exercised only by e2e numeric
+        assertions on the real Spyre device, with nothing at the unit
+        level able to catch a regression to it.
+
+        split_m_elementwise_fn's ``x_tile * 2.0`` gives a genuine Pointwise
+        ComputedBuffer consumer of the marker even on CPU (matmul, unlike
+        elementwise ops, always aten-falls-back). This test pins the exact
+        regression a future "simplify back to a plain rename" would
+        reintroduce (see _consume_tile_dim_markers's own docstring): the
+        marker's own inner_fn contributes a genuine, non-identity
+        per-iteration advance term to its read index (the ``+ 24*u0`` tile-
+        slice offset) that a bare NameSwapHandler rename would silently
+        drop. Assert that term is actually still present, syntactically, on
+        the consumer's post-erasure read -- not just that erasure happened
+        at all (which test_marker_erased_and_mapped_after_split_m_splice
+        already covers, and which a buggy rename would ALSO satisfy).
+        """
+        from torch._inductor import ir
+        from torch._inductor.dependencies import MemoryDep
+
+        from torch_spyre._inductor.wsr.for_each_tile_lowering import (
+            _body_loop_var,
+            _consume_tile_dim_markers,
+            _stacking_carry_indices,
+            try_prove_for_each_tile,
+        )
+        from torch_spyre._inductor.wsr.while_loop_bridge import (
+            carry_bindings_for,
+            splice_while_loop,
+        )
+
+        (X, Y), _ref = matmul_inputs()
+        graph = self._run_graph(split_m_elementwise_fn, (X, Y))
+
+        while_ops = [op for op in graph.operations if isinstance(op, ir.WhileLoop)]
+        self.assertEqual(len(while_ops), 1)
+        while_op = while_ops[0]
+
+        result = try_prove_for_each_tile(while_op)
+        self.assertTrue(result.accepted)
+        loop_var = _body_loop_var(while_op)
+        self.assertIsNotNone(loop_var)
+
+        with V.set_graph_handler(graph):
+            carries = carry_bindings_for(
+                while_op, _stacking_carry_indices(while_op, loop_var)
+            )
+            group_ops = splice_while_loop(
+                graph, while_op, carries, trip_count=result.trip_count
+            )
+
+            marker_op = next(
+                op
+                for op in group_ops
+                if getattr(op, "tile_marker_dim", None) is not None
+            )
+            marker_name = marker_op.get_name()
+            self.assertIsInstance(marker_op, ir.ComputedBuffer)
+
+            # The marker's OWN read index (of its real upstream input) is
+            # the ground truth this test expects to survive erasure intact.
+            marker_reads = [
+                d for d in marker_op.get_read_writes().reads if isinstance(d, MemoryDep)
+            ]
+            self.assertEqual(len(marker_reads), 1)
+            marker_input_name = marker_reads[0].name
+            marker_own_index = marker_reads[0].index
+            self.assertIn(
+                loop_var,
+                marker_own_index.free_symbols,
+                "fixture assumption violated: expected the marker's own "
+                "read index to carry the per-iteration advance term "
+                f"({loop_var}); got {marker_own_index!r}",
+            )
+
+            # The consumer (split_m_elementwise_fn's `x_tile * 2.0`) must
+            # be a real ComputedBuffer -- confirming this test actually
+            # reaches _inline_marker_into_consumer, not
+            # _substitute_direct_input_refs.
+            consumer_before = next(
+                op
+                for op in group_ops
+                if isinstance(op, ir.ComputedBuffer)
+                and op is not marker_op
+                and any(
+                    isinstance(d, MemoryDep) and d.name == marker_name
+                    for d in op.get_read_writes().reads
+                )
+            )
+            consumer_name = consumer_before.get_name()
+
+            _consume_tile_dim_markers(group_ops, graph.operations)
+
+            new_consumer = next(
+                op for op in graph.operations if op.get_name() == consumer_name
+            )
+            self.assertIsInstance(new_consumer, ir.ComputedBuffer)
+            post_reads = [
+                d
+                for d in new_consumer.get_read_writes().reads
+                if isinstance(d, MemoryDep) and d.name == marker_input_name
+            ]
+            self.assertEqual(
+                len(post_reads),
+                1,
+                "expected exactly one post-erasure read of the marker's "
+                f"own upstream input {marker_input_name!r}",
+            )
+            post_index = post_reads[0].index
+
+            # The pin: the composed index must still carry loop_var's
+            # coefficient from the marker's OWN index, unchanged -- proof
+            # the marker's real per-iteration coordinate transform was
+            # composed in, not merely renamed past. A plain
+            # NameSwapHandler-style rename would instead reuse the
+            # consumer's OWN pre-erasure (marker-relative) index, which
+            # never mentioned loop_var at all -- that bug would make this
+            # specific assertion fail while still passing
+            # test_marker_erased_and_mapped_after_split_m_splice's weaker
+            # "marker map is non-empty and erasure happened" checks.
+            self.assertIn(
+                loop_var,
+                post_index.free_symbols,
+                "post-erasure consumer read lost the marker's own "
+                f"per-iteration advance term ({loop_var}) -- got "
+                f"{post_index!r}. This is the exact silent-wrong-answer "
+                "regression a plain rename-based marker erasure would "
+                "reintroduce.",
+            )
+            self.assertEqual(
+                post_index.coeff(loop_var),
+                marker_own_index.coeff(loop_var),
+                "post-erasure consumer read's loop_var coefficient must "
+                "match the marker's own index's loop_var coefficient "
+                "exactly -- the composed index should carry the marker's "
+                "real coordinate transform through unchanged, not some "
+                "other (e.g. renamed-and-unchanged, or miscomposed) value.",
             )
 
 
