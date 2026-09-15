@@ -21,7 +21,7 @@ import sympy
 
 import torch
 
-from .constants import ELIDED_COPY_BACK_ATTR
+from .constants import ELIDED_COPY_BACK_ATTR, STAGGERED_EAS
 from .ir import FixedTiledLayout, SpyreEmptyFallback
 from .optimize_restickify import AnyInNode, EdgeCostMap
 from .logging_utils import get_inductor_logger
@@ -42,7 +42,7 @@ from torch._inductor.ir import (
     StorageBox,
     TensorBox,
 )
-from torch_spyre._C import SpyreTensorLayout
+from torch_spyre._C import ElementArrangement, SpyreTensorLayout
 from torch._inductor.virtualized import V
 from torch._inductor.ops_handler import WrapperHandler
 
@@ -867,3 +867,47 @@ def validate_no_restickify_on_mutation_targets(graph: GraphLowering) -> None:
                     f"restickify inserted on mutation target buffer {target_name!r} "
                     f"as input to its own mutation op {op.get_name()!r}"
                 )
+
+
+def insert_destagger_graph_outputs(graph: GraphLowering) -> None:
+    """Insert identity de-stagger ops before graph outputs that have staggered EA.
+
+    D2H (graph output) always requires STANDARD EA — the host DMA engine reads
+    tensors sequentially and cannot interpret a staggered element ordering.  Any
+    graph output whose device layout carries DL16_TO_FP32 or FP32_TO_DL16 EA
+    gets an identity destagger op inserted on-device before the transfer.
+    """
+    from .wsr.coarse_tile import _patch_graph_outputs
+
+    operations = graph.operations
+    output_names = set(graph.get_output_names())
+
+    for op in list(operations):
+        if not isinstance(op, ComputedBuffer) or op.get_name() not in output_names:
+            continue
+        layout = getattr(op, "layout", None)
+        if not isinstance(layout, FixedTiledLayout):
+            continue
+        stl = layout.device_layout
+        if getattr(stl, "element_arrangement", None) not in STAGGERED_EAS:
+            continue
+
+        # Target layout is identical to stl but with STANDARD ElementArrangement
+        std_stl = stl.with_element_arrangement(ElementArrangement.STANDARD)
+        destagger_layout = _fixed_tiled(layout, std_stl)
+
+        # Create identity de-stagger node using _create_restickify_node machinery
+        _, destagger_buf = _create_restickify_node(
+            {"arg_name": op.get_name(), "target_layout": destagger_layout},
+            op,
+        )
+
+        # Patch graph outputs to point to destagger_buf
+        _patch_graph_outputs(op.get_name(), destagger_buf)
+
+        logger.info(
+            "insert_destagger_graph_outputs: inserted de-stagger %s -> %s (ea=%s)",
+            op.get_name(),
+            destagger_buf.get_name(),
+            stl.element_arrangement,
+        )
