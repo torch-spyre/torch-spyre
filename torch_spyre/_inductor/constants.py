@@ -171,11 +171,10 @@ SPYRE_FP32_OPS = [
     "prod",
 ]
 
-# Operations the device has a 32-bit integer intrinsic for: `spyreop.addi32toi32`
-# and `spyreop.muli32toi32`, each splitting its operands into halves and finding
-# the carry with a pair of scale factors.  Separate from SPYRE_FP32_OPS because
-# the two are different templates reached by the same op name, and only the KTIR
-# path can spell them -- SDSC still relabels IEEE_INT32 as SENUINT32 for indices.
+# Operations the device has a 32-bit integer intrinsic for: `addi32toi32` and
+# `muli32toi32`. Separate from SPYRE_FP32_OPS because the two are different
+# templates reached by the same logical op name. SDSC and KTIR select the native
+# spelling when the operation data format is IEEE_INT32.
 SPYRE_INT32_OPS = [
     "add",
     "mul",
