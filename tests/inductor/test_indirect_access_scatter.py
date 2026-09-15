@@ -342,6 +342,131 @@ class _ScatterScenarios:
 
         self._stage_and_e2e(kernel, out, src, idx, expect=SCATTER_OP_SPEC)
 
+    def test_index_copy_inplace_3d(self):
+        """out.index_copy_(0, idx, src) for 3-D tensor [rows, 8, 128] covering small
+        row counts including the P=1 single-row scatter scenario (rows in (1, 2)).
+        """
+        def store(out, index, src):
+            out.index_copy_(0, index, src)
+
+        for rows in (1, 2):
+            with self.subTest(rows=rows):
+                torch._dynamo.reset()
+                out = torch.zeros(rows, 8, 128, dtype=torch.float16, device="spyre")
+                src = torch.randn(rows, 8, 128, dtype=torch.float16).to("spyre")
+                idx = torch.arange(rows, dtype=torch.int64).to("spyre")
+                torch.compile(store, dynamic=False)(out, idx, src)
+                self.assertFalse(
+                    bool(out.cpu().eq(0).all()),
+                    f"rows={rows}: destination still all zero?",
+                )
+
+    def test_index_copy_inplace_3d_e2e(self):
+        """Regression test for index_copy_ on 3-D tensor [rows, 8, 128] covering
+        the P=1 (rows=1) single-row write path (verifying writes are not silently elided)
+        and normal scatter (rows=2), comparing results against CPU reference.
+        """
+        for rows in (1, 2):
+            with self.subTest(rows=rows):
+                torch._dynamo.reset()
+                out = torch.zeros(rows, 8, 128, dtype=torch.float16)
+                src = torch.randn(rows, 8, 128, dtype=torch.float16)
+                idx = torch.arange(rows, dtype=torch.int64)
+
+                def store(out, idx, src):
+                    out.index_copy_(0, idx, src)
+                    return out
+
+                self._assert_compiled_matches_cpu(
+                    store, out.clone().to("spyre"), idx.to("spyre"), src.to("spyre")
+                )
+
+    def test_index_put_p1_2d_e2e(self):
+        """Regression: P=1 index_put on a 2-D default-layout destination.
+
+        The core P=1 bug: Inductor eliminates the scatter-index loop when the
+        index has exactly one element.  Before the fix, _build_indirect_store_subs
+        returned no scatter symbols, requirement was None, and the destination
+        layout was never enforced -- so out[idx] = src silently wrote nothing.
+        This is the simplest 2-D manifestation of that path.
+        """
+        M, N = 64, 256
+        for idx_val in (0, M // 2, M - 1):
+            with self.subTest(idx_val=idx_val):
+                torch._dynamo.reset()
+                out = torch.zeros(M, N, dtype=torch.float16)
+                src = torch.randn(1, N, dtype=torch.float16)
+                idx = torch.tensor([idx_val], dtype=torch.int64)
+
+                def store(out, idx, src):
+                    out[idx] = src
+                    return out
+
+                self._assert_compiled_matches_cpu(
+                    store, out.clone().to("spyre"), idx.to("spyre"), src.to("spyre")
+                )
+
+    def test_index_put_p1_3d_e2e(self):
+        """Regression: P=1 index_put on a 3-D default-layout tensor.
+
+        Mirrors test_index_put_3d_dim0 but with P=1 to exercise the P=1
+        singleton-placeholder path through _p1_scatter_device_pos for a 3-D
+        shape (device layout has an extra non-stick leading dim).
+        """
+        M, N, K = 32, 8, 128
+        for idx_val in (0, M - 1):
+            with self.subTest(idx_val=idx_val):
+                torch._dynamo.reset()
+                out = torch.zeros(M, N, K, dtype=torch.float16)
+                src = torch.randn(1, N, K, dtype=torch.float16)
+                idx = torch.tensor([idx_val], dtype=torch.int64)
+
+                def store(out, idx, src):
+                    out[idx] = src
+                    return out
+
+                self._assert_compiled_matches_cpu(
+                    store, out.clone().to("spyre"), idx.to("spyre"), src.to("spyre")
+                )
+
+    def test_index_copy_p1_4d_nonleading_dim_e2e(self):
+        """Regression: P=1 index_copy_ on a 4-D tensor where the scattered dim
+        is NOT dim 0.
+
+        Mirrors test_index_put_4d_dim2_default_layout_destination (P=1 there too,
+        but via index_copy_ on dim 2 of [Bn, H, M, N]).  The default device layout
+        places dim 2 behind dim 1 (H) in device address space, so without layout
+        enforcement the single-row write lands at the wrong address or is elided.
+        """
+        Bn, H, M, N = 1, 4, 64, 256
+        dst = torch.zeros(Bn, H, M, N, dtype=torch.float16)
+        src = torch.randn(Bn, H, 1, N, dtype=torch.float16)
+        idx = torch.tensor([7], dtype=torch.int64)
+
+        def kernel(dst, idx, src):
+            dst.index_copy_(2, idx, src)
+            return dst
+
+        self._assert_compiled_matches_cpu(
+            kernel, dst.clone().to("spyre"), idx.to("spyre"), src.to("spyre")
+        )
+
+    def test_index_put_decode_e2e(self):
+        """Regression: P=1 index_put on a paged-KV-cache-shaped layout.
+
+        Symmetric to test_index_copy_decode_e2e: the same single-token decode
+        shape ([576, 8, 128], P=1) but accessed via index_put (out[idx] = src)
+        instead of index_copy.  Pins that the P=1 fix applies to both surface
+        APIs when the destination has a custom (non-default) device layout.
+        """
+        cache, src, idx = self._paged_kv_cache_operands(P=1)
+
+        def kernel(c, s, i):
+            c[i] = s
+            return c
+
+        self._assert_compiled_matches_cpu(kernel, cache, src, idx)
+
     def _paged_cache_layout(self, L=576, H=8, D=128):
         """The paged-KV-cache device layout for a [L, H, D] fp16 tensor: L
         (the indirectly-accessed dim) outermost, then H, then D split into
