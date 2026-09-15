@@ -70,6 +70,52 @@ def split_k_fn(X: torch.Tensor, Y: torch.Tensor) -> torch.Tensor:
     return final
 
 
+def nested_split_m_then_k_fn(X: torch.Tensor, Y: torch.Tensor) -> torch.Tensor:
+    """Nested case: outer for_each_tile maps M; inner for_each_tile carries K.
+
+    Each outer M-tile computes its own row-block of X @ Y via an inner
+    split-K accumulation -- two tile_dim_marker-tagged reads at two nesting
+    levels (outer's M-tile of X, inner's K-tile of X and Y), the exact
+    ambiguity shape (two markers on two different reads inside one nested
+    body) the tile-dim-marker consumption design targets.
+    """
+
+    def outer_body(_, ops):
+        x_tile, y_whole = ops
+
+        def inner_body(acc, inner_ops):
+            x_inner_tile, y_inner_tile = inner_ops
+            return acc + x_inner_tile @ y_inner_tile, None
+
+        m_tile = x_tile.shape[0]
+        final, _ = for_each_tile(
+            inner_body,
+            (x_tile, y_whole),
+            dims=(-1, 0),
+            tile_size=3,
+            init=torch.zeros(m_tile, N, device=X.device, dtype=X.dtype),
+        )
+        return None, final
+
+    _, out = for_each_tile(outer_body, (X, Y), dims=(0, None), tile_size=2, out_dim=0)
+    return out
+
+
+def nested_split_m_then_k_reference(X: torch.Tensor, Y: torch.Tensor) -> torch.Tensor:
+    """Eager Python nesting of the same tiling, for value assertions."""
+    m_tile_size, k_tile_size = 2, 3
+    rows = []
+    for m_start in range(0, X.shape[0], m_tile_size):
+        x_m_tile = X[m_start : m_start + m_tile_size]
+        acc = torch.zeros(x_m_tile.shape[0], N, device=X.device, dtype=X.dtype)
+        for k_start in range(0, X.shape[1], k_tile_size):
+            x_k_tile = x_m_tile[:, k_start : k_start + k_tile_size]
+            y_k_tile = Y[k_start : k_start + k_tile_size]
+            acc = acc + x_k_tile @ y_k_tile
+        rows.append(acc)
+    return torch.cat(rows, dim=0)
+
+
 LQ, LK, D = 128, 256, 128
 SOFTMAX_TILE_SIZE = 128
 
