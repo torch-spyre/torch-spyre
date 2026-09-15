@@ -198,7 +198,7 @@ class SpyreAsyncCompile(AsyncCompile):
 
     def _submit_dxp(self, kernel_name: str, compile_dir: str) -> Future[str] | None:
         """Submit DXP to Inductor's process pool, or compile synchronously."""
-        if _spyre_config.async_dxp_compile and get_compile_threads() > 1:
+        if get_compile_threads() > 1:
             # The first use creates the pool and submits its readiness probe.
             # Waiting for that short probe guarantees the first Spyre kernel is
             # parallel too, rather than accidentally compiling it inline.

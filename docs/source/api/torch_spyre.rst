@@ -698,6 +698,10 @@ Environment Variables
    * - ``BUNDLE_SYMBOLIC_ARGS``
      - Emit LPDDR5 tensor addresses as runtime symbols rather than baked
        integers (default ``1``)
+   * - ``TORCHINDUCTOR_COMPILE_THREADS``
+     - Number of Inductor compile workers. Independent DXP kernels compile in
+       parallel when this is greater than ``1``; a value of ``1`` executes
+       compilation inline
    * - ``LAYOUT_SOLVER``
      - LX scratchpad layout solver strategy: ``cpsat`` (default),
        ``greedy``, ``bestfit``, ``firstfit``, ``simulated_annealing``.
