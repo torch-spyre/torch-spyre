@@ -970,9 +970,28 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
         moment a *later* pass runs -- so instead of driving the pipeline
         all the way through codegen, this test monkeypatches
         splice_while_loops itself (the name torch_spyre._inductor.passes
-        imports and calls directly) to capture graph.operations right as
-        it returns, and tolerates the InductorError the #4460 gap raises
-        afterward in a later, unrelated pass.
+        imports and calls directly) to capture a *snapshot* of
+        graph.operations right as it returns, and tolerates the
+        InductorError the #4460 gap raises afterward in a later, unrelated
+        pass.
+
+        The capture must be a snapshot (``list(graph.operations)``, a new
+        list object), not a live reference to ``graph`` or to
+        ``graph.operations`` itself. ``graph.operations`` is the SAME list
+        object throughout the whole compile -- deadcode_elimination (the
+        very next pass after splice_while_loops) and every later pass keep
+        mutating it in place. Critically, DCE deletes an unspliced-but-
+        still-present WhileLoop op for a completely unrelated reason: with
+        no splice, the WhileLoop's output is never wired into anything
+        downstream, so DCE treats it as ordinary dead code and removes it
+        -- exactly as if splicing had succeeded. That means a *live* read of
+        ``graph.operations`` taken after the full compile returns cannot
+        tell "the marker/splice mechanism actually ran" apart from "the
+        marker/splice mechanism was completely disabled": both leave 0
+        WhileLoop ops by the time such a read happens. Only a snapshot
+        taken inside the monkeypatch, before DCE or any later pass can
+        touch the list again, actually pins down the state right after
+        splice_while_loops returns.
         """
         import torch
         import torch_spyre  # noqa: F401  registers the "spyre" device
@@ -995,6 +1014,15 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
         def capturing_splice_while_loops(graph):
             result = original_splice_while_loops(graph)
             captured["graph"] = graph
+            # Snapshot -- a NEW list object -- taken at the exact instant
+            # splice_while_loops returns, before deadcode_elimination (the
+            # very next pass) or anything after it can mutate
+            # graph.operations further. See this test's docstring for why
+            # a live read of graph.operations after the full compile
+            # returns cannot distinguish "spliced correctly" from
+            # "splicing was a no-op and DCE pruned the orphaned WhileLoop
+            # as unrelated dead code."
+            captured["operations"] = list(graph.operations)
             return result
 
         passes_mod.splice_while_loops = capturing_splice_while_loops
@@ -1016,13 +1044,17 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
             passes_mod.splice_while_loops = original_splice_while_loops
 
         self.assertIn("graph", captured, "splice_while_loops was never called/captured")
-        graph = captured["graph"]
-        # Right after splice_while_loops returns, both the outer and inner
-        # WhileLoop must already be spliced and every marker at both
-        # nesting levels already consumed.
-        remaining_while_ops = [
-            op for op in graph.operations if isinstance(op, ir.WhileLoop)
-        ]
+        self.assertIn(
+            "operations", captured, "splice_while_loops was never called/captured"
+        )
+        operations = captured["operations"]
+        # Right after splice_while_loops returns -- read from the snapshot,
+        # NOT from graph.operations re-read now (see docstring: DCE and
+        # later passes have already mutated that live list further by the
+        # time this line runs) -- both the outer and inner WhileLoop must
+        # already be spliced and every marker at both nesting levels
+        # already consumed.
+        remaining_while_ops = [op for op in operations if isinstance(op, ir.WhileLoop)]
         self.assertEqual(
             remaining_while_ops,
             [],
@@ -1030,13 +1062,100 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
         )
         remaining_markers = [
             op
-            for op in graph.operations
+            for op in operations
             if hasattr(op, "data") and hasattr(op.data, "tile_marker_dim")
         ]
         self.assertEqual(
             remaining_markers,
             [],
             "expected every marker at both nesting levels to be consumed",
+        )
+
+    def test_nested_for_each_tile_markers_snapshot_catches_noop_splice_stub(self):
+        """Mutation coverage for the snapshot fix above.
+
+        A `splice_while_loops` stub that does nothing but `return None` --
+        never calling the real splicer, never mutating graph.operations
+        itself -- leaves an unspliced WhileLoop genuinely present at the
+        instant it returns. Confirms the fixed (snapshot-based) test body
+        actually catches that: the snapshot must show 1 remaining
+        WhileLoop op, so the first assertion in
+        test_nested_for_each_tile_markers_resolve_correctly's body must
+        fail against it.
+
+        This is a DIFFERENT mutation from either of this file's other two
+        for-each-tile-marker mutation tests:
+          - a try_prove_for_each_tile-rejection mutation (not present in
+            this file; see the fix-round-1 commit message) blocks
+            splice_while_loops from ever attempting to splice a given
+            WhileLoop at all -- a different code path.
+          - test_marker_inlined_preserves_advance_term_on_computed_buffer_
+            consumer's fake-marker-injection mutation targets the SECOND
+            assertion (remaining_markers), injected AFTER capture, so it
+            is unaffected by the live-reference-vs-snapshot issue this
+            test targets.
+        Neither of those exercises "splice_while_loops runs but does no
+        real re-wiring work, and DCE prunes the evidence afterward
+        regardless" -- the exact gap the snapshot fix above closes. Without
+        the snapshot fix (i.e. reading live graph.operations after the
+        full compile returns), this exact stub was independently confirmed
+        to slip through: DCE deletes the orphaned, unspliced WhileLoop as
+        ordinary dead code by the time such a live read happens, so the
+        buggy test body would see 0 remaining WhileLoop ops here too --
+        indistinguishable from a correct splice.
+        """
+        import torch
+        import torch_spyre  # noqa: F401  registers the "spyre" device
+        from torch_spyre.constants import DEVICE_NAME
+
+        import torch_spyre._inductor.passes as passes_mod
+        from tests.inductor.for_each_tile_fixtures import (
+            capture_post_grad_while_loop,
+            nested_split_m_then_k_fn,
+        )
+        from torch._inductor import ir
+        from torch._inductor.exc import InductorError
+
+        X = torch.randn(8, 12, device=DEVICE_NAME, dtype=torch.float16)
+        Y = torch.randn(12, 6, device=DEVICE_NAME, dtype=torch.float16)
+
+        captured = {}
+        original_splice_while_loops = passes_mod.splice_while_loops
+
+        def noop_splice_while_loops(graph):
+            # Deliberately broken: never calls the real splicer, never
+            # rewires or mutates anything. The WhileLoop op it was handed
+            # is still fully intact in graph.operations right now.
+            captured["operations"] = list(graph.operations)
+            return None
+
+        passes_mod.splice_while_loops = noop_splice_while_loops
+        try:
+            capture_post_grad_while_loop(nested_split_m_then_k_fn, (X, Y))
+        except InductorError:
+            # With no splice at all, later passes may fail in ways that
+            # have nothing to do with issue #4460 -- any InductorError here
+            # is fine to swallow; this mutation test only cares about the
+            # snapshot taken above.
+            pass
+        finally:
+            passes_mod.splice_while_loops = original_splice_while_loops
+
+        self.assertIn(
+            "operations", captured, "noop_splice_while_loops was never called"
+        )
+        operations = captured["operations"]
+        remaining_while_ops = [op for op in operations if isinstance(op, ir.WhileLoop)]
+        # This is the mutation catch: the no-op stub leaves the WhileLoop
+        # genuinely present in the snapshot. If this assertion ever starts
+        # passing (i.e. remaining_while_ops == []), the snapshot fix has
+        # regressed back to something DCE can erase before capture.
+        self.assertEqual(
+            len(remaining_while_ops),
+            1,
+            "expected the no-op splice_while_loops stub to leave exactly "
+            "one unspliced WhileLoop in the snapshot -- if this fails, "
+            "the snapshot is no longer catching a disabled splice pass",
         )
 
     @unittest.expectedFailure
