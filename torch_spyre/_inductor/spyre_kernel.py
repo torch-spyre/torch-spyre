@@ -71,6 +71,7 @@ from .pass_utils import (
     input_layout_for_operation,
     is_restickify_coords,
     alignment_coordinates,
+    loop_var_ranges_from_dim_hints,
 )
 from .views import align_tensors, tiling_expr_to_device_expr
 from .logging_utils import get_inductor_logger
@@ -530,6 +531,11 @@ class SpyreKernel(Kernel[CSEVariable]):
         # Set by codegen_kernel(); used by call_kernel() to ensure arg_index
         # values match .run() positional args.
         self._live_call_arg_names: list[str] | None = None
+        # The op names of the scheduler nodes codegenned into this kernel, set by
+        # the scheduler before any spec is built; empty means "unknown", which
+        # makes every buffer look non-local.  Read by create_tensor_arg for
+        # TensorArg.kernel_local.
+        self.fused_node_names: OrderedSet[str] = OrderedSet()
 
     def indirect_var_names(self) -> "frozenset[str] | None":
         if not self.indirect_vars:
@@ -782,6 +788,22 @@ class SpyreKernel(Kernel[CSEVariable]):
         # SDSC literal byte-identical.
         if opspec_name is None and _spyre_config.ktir_emitter:
             opspec_name = name
+        # Same gate, and for the same reason: the KTIR plan-time fuser deletes a
+        # producer op only for a buffer nothing outside this kernel reads, and
+        # the emitter is handed one kernel's specs and cannot ask.  The upstream
+        # predicate covers every user; a graph output can have no user at all,
+        # which it does not cover.  False without a scheduler, so the fuser
+        # declines.
+        #
+        # This resolves to Scheduler.can_buffer_be_removed_through_fusion, NOT to
+        # SuperDSCScheduling's same-named override, which answers a different
+        # question (may the allocation be elided -- always no here, issue #1266).
+        kernel_local = bool(
+            _spyre_config.ktir_emitter
+            and (sched := getattr(V.graph, "scheduler", None))
+            and sched.can_buffer_be_removed_through_fusion(name, self.fused_node_names)
+            and name not in V.graph.get_output_names()
+        )
         it_space = iteration_space(current_node)
         # With dynamic=True the host index may contain symbolic strides
         # (e.g. x0*s1+x1).  Concretize size symbols so normalize_coordinates
@@ -794,11 +816,22 @@ class SpyreKernel(Kernel[CSEVariable]):
 
         if "lx" in tensor.layout.allocation and tensor.layout.lx_view is None:
             raise ValueError(f"LX buffer {name} has no physical ownership")
+
+        # Merge in WhileLoop-splice loop_var trip counts (e.g. u0) stashed on
+        # the current op's dim_hints -- self.indirect_sizes only accumulates
+        # entries from indirect_indexing() calls (gather/scatter), but a
+        # tiled per-iteration symbol needs the same {symbol: valid_range}
+        # treatment even though it is not an indirect access. See
+        # loop_var_ranges_from_dim_hints's docstring.
+        indirect_sizes = {
+            **self.indirect_sizes,
+            **loop_var_ranges_from_dim_hints(self.current_node.node),
+        }
         device_coords = alignment_coordinates(
             tensor.layout.device_layout,
             tensor.index,
             it_space,
-            self.indirect_sizes,
+            indirect_sizes,
             repeat_info_out=self._alignment_repeat_info,
         )
         work_division = work_division_from_view(
@@ -819,6 +852,7 @@ class SpyreKernel(Kernel[CSEVariable]):
             name=opspec_name,
             device_tile_advance_expr=device_tile_advance_expr,
             work_division=work_division,
+            kernel_local=kernel_local,
         )
         if (
             "lx" not in tensor.layout.allocation
@@ -1203,6 +1237,7 @@ class SpyreKernel(Kernel[CSEVariable]):
                     self.create_tensor_arg(False, real_dst_name, dst),
                 ]
                 op_indirect_var_names = None
+
             in_coords = args[-2].device_coordinates
             out_coords = args[-1].device_coordinates
             if is_restickify_coords(in_coords, out_coords):
@@ -1607,6 +1642,8 @@ def _codegen_op_spec_list(specs, buf: IndentedBuffer, sympy_str) -> None:
                             buf.writeline(f"allocation={arg.allocation!r},")
                             if arg.name is not None:
                                 buf.writeline(f"name={arg.name!r},")
+                            if arg.kernel_local:
+                                buf.writeline("kernel_local=True,")
                             if arg.device_tile_advance_expr is not None:
                                 buf.writeline(
                                     "device_tile_advance_expr="
