@@ -51,6 +51,7 @@ from ..pass_utils import (
     PerCoreView,
     _is_matmul_op,
     _per_core_view_on_buf,
+    commit_tensor_work_division,
     iteration_space_from_op,
     op_read_writes,
     try_device_coordinates,
@@ -437,6 +438,10 @@ def _unsupported_relayout_transition_reason(
 
 def collect_lx_relayout_plans(
     graph: GraphLowering,
+    *,
+    source_names: set[str] | None = None,
+    ownership_overrides: Mapping[str, TensorWorkDivision] | None = None,
+    unprojectable_sources: list[str] | None = None,
 ) -> list[LXRelayoutPlan]:
     if not config.lx_planner_relayout or config.ktir_emitter:
         return []
@@ -453,6 +458,8 @@ def collect_lx_relayout_plans(
 
     result: list[LXRelayoutPlan] = []
     for source_name, consumer_reads in reads.items():
+        if source_names is not None and source_name not in source_names:
+            continue
         producer = operations.get(source_name)
         if (
             not isinstance(producer, ComputedBuffer)
@@ -465,6 +472,7 @@ def collect_lx_relayout_plans(
             write,
             source_name,
             cache,
+            ownership_override=(ownership_overrides or {}).get(source_name),
         )
         source_num_cores = _op_num_cores(producer)
         if (
@@ -512,6 +520,7 @@ def collect_lx_relayout_plans(
         transfers = []
         seen_consumers = set()
         rejection_reason = None
+        source_unprojectable_to_consumer = False
         for consumer, dep in consumer_reads:
             consumer_name = consumer.get_name()
             if consumer_name in seen_consumers:
@@ -645,6 +654,7 @@ def collect_lx_relayout_plans(
                         "cannot represent: source ownership cannot be projected "
                         f"to consumer: {exc}"
                     )
+                    source_unprojectable_to_consumer = True
                     break
                 if source_work_division is None:
                     raise RuntimeError(
@@ -710,6 +720,8 @@ def collect_lx_relayout_plans(
                 ) in destinations
             )
         if rejection_reason is not None:
+            if unprojectable_sources is not None and source_unprojectable_to_consumer:
+                unprojectable_sources.append(source_name)
             logger.debug(
                 "rejected LX relayout candidate source=%s consumers=%s: %s",
                 source_name,
@@ -717,6 +729,129 @@ def collect_lx_relayout_plans(
                 rejection_reason,
             )
     return result
+
+
+def anchor_lx_relayout_ownership(graph: GraphLowering) -> list[LXRelayoutPlan] | None:
+    """Choose the unique canonical producer order accepted by its consumers.
+
+    Work-division split counts are already final here. This pass only changes
+    their canonical owner order, and only when the ordinary relayout planner
+    proves one unique order makes the complete source group expressible. The
+    allocator records the accepted physical view; kernel preparation consumes
+    it without choosing another owner order. Return the collected plans for
+    immediate allocation only if no ownership changed; otherwise recollect.
+    """
+
+    if (
+        not config.lx_planner_relayout
+        or config.co_optimizing_lx_planning
+        or config.ktir_emitter
+    ):
+        return None
+
+    unprojectable_sources: list[str] = []
+    plans: list[LXRelayoutPlan] | None = collect_lx_relayout_plans(
+        graph, unprojectable_sources=unprojectable_sources
+    )
+    operations = {op.get_name(): op for op in graph.operations}
+
+    def direct_consumers_match(
+        source_name: str,
+        producer: ComputedBuffer,
+        candidate: TensorWorkDivision,
+    ) -> bool:
+        """Whether every reader already agrees with ``candidate`` without movement.
+
+        This is the direct path, not a zero-transfer planner result: it has
+        fewer reader restrictions than movement planning and accepts on plain
+        partition agreement.
+        """
+
+        write = _single_write(producer, source_name)
+        readers = [
+            (consumer, dep)
+            for consumer in graph.operations
+            for dep in op_read_writes(consumer).reads
+            if isinstance(dep, MemoryDep) and dep.name == source_name
+        ]
+        if write is None or not readers:
+            return False
+        source_view, partial, representable = _per_core_view_on_buf(
+            producer, write, source_name, ownership_override=candidate
+        )
+        if partial or not representable:
+            return False
+        for consumer, dep in readers:
+            view, _, consumer_representable = _per_core_view_on_buf(
+                consumer, dep, source_name
+            )
+            # Only the read partition matters, even if this reader splits its sum.
+            if not consumer_representable or not view.same_partition(source_view):
+                logger.debug(
+                    "direct LX owner mismatch source=%s consumer=%s",
+                    source_name,
+                    consumer.get_name(),
+                )
+                return False
+        return True
+
+    for source_name in unprojectable_sources:
+        producer = operations.get(source_name)
+        if not isinstance(producer, ComputedBuffer):
+            continue
+        ownership = getattr(producer, "iteration_space_ownership", None)
+        if ownership is None:
+            continue
+        num_cores = ownership.physical_core_count
+        split_dims = tuple(
+            dim
+            for dim in iteration_space_from_op(producer)
+            if int(ownership.work_slices.get(dim, 1)) > 1
+        )
+        if len(split_dims) <= 1:
+            continue
+        if _is_matmul_op(producer) and config.core_id_k_fast_emission:
+            logger.debug(
+                "keep %s owner order: matmul K-fast emission is active",
+                source_name,
+            )
+            continue
+
+        def accepted_by_consumers(candidate: TensorWorkDivision) -> bool:
+            if direct_consumers_match(source_name, producer, candidate):
+                return True
+            # The planner is the one legality authority.  Re-run it for this
+            # source only, with the candidate owner order, so classification,
+            # complete-consumer coverage, and all fail-closed rules stay
+            # identical to the real planning pass.
+            return bool(
+                collect_lx_relayout_plans(
+                    graph,
+                    source_names={source_name},
+                    ownership_overrides={source_name: candidate},
+                )
+            )
+
+        selected = select_unique_partition_division(
+            split_dims,
+            ownership.work_slices,
+            num_cores,
+            accepted_by_consumers,
+        )
+        if selected is None:
+            logger.debug(
+                "keep %s owner order: no unique consumer-compatible order",
+                source_name,
+            )
+            continue
+        commit_tensor_work_division(producer, selected)
+        plans = None
+        logger.debug(
+            "consumer-anchored LX ownership source=%s mapping=%s",
+            source_name,
+            selected.core_id_to_work_slice,
+        )
+    return plans
 
 
 def materialize_lx_relayouts(graph: GraphLowering, plans: list[LXRelayoutPlan]) -> None:

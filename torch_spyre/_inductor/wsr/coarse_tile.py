@@ -2405,7 +2405,18 @@ def _capture_logical_iteration_symbols(
         for logical_dim, extent in logical_extents
         if sympy.sympify(extent) != 1
     ]
-    symbols = tuple(iteration_space_from_op(op))
+    rw = op_read_writes(op)
+    # range_vars retains reduction variables even when the inner function does
+    # not use them in a memory index. iteration_space_from_op cannot recover
+    # those symbols from dependencies (for example, a sum of a broadcast value).
+    traced_symbols = tuple(
+        symbol for symbol in rw.range_vars if isinstance(symbol, sympy.Symbol)
+    )
+    symbols = (
+        traced_symbols
+        if len(traced_symbols) == len(active)
+        else tuple(iteration_space_from_op(op))
+    )
     if len(active) != len(symbols):
         raise Unsupported(
             f"coarse_tile: cannot match logical dimensions to iteration symbols "

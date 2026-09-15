@@ -39,13 +39,7 @@ from torch._inductor.ir import (
 from torch._inductor.ops_handler import WrapperHandler
 from torch._inductor.scheduler import SchedulerNode
 from torch._inductor.graph import GraphLowering
-from torch._inductor.dependencies import (
-    MemoryDep,
-    ReadWrites,
-    StarDep,
-    WeakDep,
-    is_indirect,
-)
+from torch._inductor.dependencies import MemoryDep, ReadWrites, is_indirect
 from torch.fx.experimental.symbolic_shapes import free_unbacked_symbols
 from torch._inductor.virtualized import V
 from torch.utils._ordered_set import OrderedSet
@@ -1762,8 +1756,9 @@ def iteration_space(n: SchedulerNode) -> dict[sympy.Symbol, sympy.Expr]:
         # spurious dims even for multi-input reductions (matmul, conv2d, etc.).
         result = next(iter(n.read_writes.writes)).ranges.copy()
         for dep in n.read_writes.reads:
-            # Ordering-only dependencies carry no index/range information.
-            if isinstance(dep, (StarDep, WeakDep)):
+            # Ordering dependencies still constrain scheduling, but only
+            # indexed memory accesses describe iteration coordinates.
+            if not isinstance(dep, MemoryDep):
                 continue
             for sym, size in dep.ranges.items():
                 if sym not in result:
@@ -1786,7 +1781,8 @@ def iteration_space_from_op(op: ComputedBuffer) -> dict[sympy.Symbol, sympy.Expr
         # spurious dims even for multi-input reductions (matmul, conv2d, etc.).
         result = next(iter(rw.writes)).ranges.copy()
         for dep in rw.reads:
-            if isinstance(dep, (StarDep, WeakDep)):
+            # Match the scheduled helper without removing any dependencies.
+            if not isinstance(dep, MemoryDep):
                 continue
             for sym, size in dep.ranges.items():
                 if sym not in result:

@@ -68,6 +68,7 @@ from torch_spyre._inductor.op_spec import (
     TensorWorkDivision,
 )
 from torch_spyre._inductor.pass_utils import PerCoreView
+import torch_spyre._inductor.scratchpad.allocator as allocator_module
 from torch_spyre._inductor.scratchpad.allocator import ScratchpadAllocator
 from torch_spyre._inductor.scratchpad.greedy_solver import GreedyLayoutSolver
 from torch_spyre._inductor.spyre_kernel import SpyreKernel, _iter_op_specs
@@ -678,6 +679,289 @@ def _allocation_graph(*operation_names):
             SimpleNamespace(get_name=lambda name=name: name) for name in operation_names
         ]
     )
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_lx_anchor_pass_respects_planning_switch(enabled):
+    from torch_spyre._inductor import passes
+
+    graph = SimpleNamespace()
+    with (
+        config.patch({"lx_planning": enabled}),
+        mock_patch.object(passes, "anchor_lx_relayout_ownership") as anchor,
+        mock_patch.object(passes, "scratchpad_planning") as allocate,
+    ):
+        passes._maybe_scratchpad_planning(graph)
+    if enabled:
+        anchor.assert_called_once_with(graph)
+        allocate.assert_called_once_with(graph, lx_relayout_plans=anchor.return_value)
+    else:
+        anchor.assert_not_called()
+        allocate.assert_not_called()
+
+
+@pytest.mark.parametrize("plans", [[], [_relayout_plan()]])
+@pytest.mark.parametrize("prepass", [False, True])
+def test_allocator_reuses_only_unmodified_plans(plans, prepass):
+    graph = _allocation_graph()
+    allocator = ScratchpadAllocator(
+        GreedyLayoutSolver,
+        256,
+        pre_optimization_passes=[SimpleNamespace(apply_pass=lambda graph: None)]
+        if prepass
+        else [],
+    )
+    with (
+        config.patch({"lx_planner_relayout": True, "ktir_emitter": False}),
+        mock_patch.object(
+            allocator_module, "collect_lx_relayout_plans", return_value=[]
+        ) as collect,
+        mock_patch.object(allocator, "_generate_buffers", return_value=[]) as generate,
+        mock_patch.object(allocator, "_append_lx_relayout_destinations"),
+        mock_patch.object(allocator, "_build_solver", side_effect=StopIteration),
+        pytest.raises(StopIteration),
+    ):
+        allocator.plan_allocation(graph, lx_relayout_plans=plans)
+    assert collect.call_count == int(prepass)
+    assert generate.call_args.kwargs["lx_relayout_plans"] is (
+        collect.return_value if prepass else plans
+    )
+
+
+def test_plan_reuse_keeps_materialization_guard_and_retry_recollects():
+    graph = _allocation_graph()
+    allocator = ScratchpadAllocator(GreedyLayoutSolver, 256)
+    with (
+        config.patch({"lx_planner_relayout": True, "ktir_emitter": False}),
+        mock_patch.object(
+            allocator_module,
+            "materialized_lx_relayouts",
+            return_value={"copy": object()},
+        ),
+        pytest.raises(RuntimeError, match="unmaterialized graph"),
+    ):
+        allocator._prepare_buffers(graph, lx_relayout_plans=[])
+    with (
+        mock_patch.object(
+            allocator, "plan_allocation", side_effect=allocator_module.SolveError
+        ),
+        mock_patch.object(allocator_module, "ScratchpadAllocator") as fallback,
+    ):
+        allocator_module.scratchpad_planning(graph, allocator, lx_relayout_plans=[])
+    fallback.return_value.plan_allocation.assert_called_once_with(graph)
+
+
+@pytest.mark.parametrize("plans", [[], [_relayout_plan()]])
+@pytest.mark.parametrize(
+    "disabled",
+    [None, "lx_planner_relayout", "co_optimizing_lx_planning", "ktir_emitter"],
+)
+def test_anchor_returns_unchanged_plans(plans, disabled):
+    flags = {
+        "lx_planner_relayout": True,
+        "co_optimizing_lx_planning": False,
+        "ktir_emitter": False,
+    }
+    if disabled:
+        flags[disabled] = not flags[disabled]
+    with (
+        config.patch(flags),
+        mock_patch.object(
+            lx_relayout_module, "collect_lx_relayout_plans", return_value=plans
+        ) as collect,
+    ):
+        result = lx_relayout_module.anchor_lx_relayout_ownership(_allocation_graph())
+    assert result is (None if disabled else plans)
+    assert collect.call_count == int(disabled is None)
+
+
+@pytest.mark.parametrize("mode", ["unsupported_solver", "off", "ktir"])
+def test_fixed_plan_handoff_keeps_feature_gates(mode):
+    factory = SimpleNamespace(supports_paired_buffers=mode != "unsupported_solver")
+    allocator = ScratchpadAllocator(factory, 256)
+    graph = _allocation_graph()
+    with (
+        config.patch(
+            {"lx_planner_relayout": mode != "off", "ktir_emitter": mode == "ktir"}
+        ),
+        mock_patch.object(allocator_module, "collect_lx_relayout_plans") as collect,
+        mock_patch.object(allocator, "_generate_buffers", return_value=[]) as generate,
+        mock_patch.object(allocator, "_append_lx_relayout_destinations"),
+    ):
+        allocator._prepare_buffers(graph, lx_relayout_plans=[_relayout_plan()])
+    collect.assert_not_called()
+    assert generate.call_args.kwargs == (
+        {} if mode == "unsupported_solver" else {"lx_relayout_plans": []}
+    )
+
+
+def test_joint_allocation_does_not_consume_fixed_plan_handoff():
+    allocator = allocator_module.CoOptimizingAllocator(GreedyLayoutSolver, 256)
+    graph = _allocation_graph()
+    with (
+        mock_patch.object(
+            allocator, "_determine_in_place_division_invariant", return_value={}
+        ),
+        mock_patch.object(allocator, "_division_map", return_value={}),
+        mock_patch.object(
+            allocator, "_build_cd_bound_buffers", return_value=[]
+        ) as build,
+        mock_patch.object(allocator_module, "collect_lx_relayout_plans") as collect,
+    ):
+        allocator._prepare_buffers(graph, lx_relayout_plans=[_relayout_plan()])
+    collect.assert_not_called()
+    build.assert_called_once_with(graph, {}, {})
+
+
+@pytest.mark.parametrize(
+    "mode", ["copy", "direct", "split_reader", "unrepresentable_reader"]
+)
+def test_consumer_anchoring_commits_the_unique_accepted_owner_order(mode):
+    kv, batch = Symbol("kv"), Symbol("batch")
+    producer = SimpleNamespace(
+        iteration_space_ownership=TensorWorkDivision(
+            {kv: 8, batch: 4},
+            {kv: floor(_CORE_ID / 4), batch: Mod(_CORE_ID, 4)},
+            num_cores=32,
+        ),
+        get_name=lambda: "source",
+    )
+    original = producer.iteration_space_ownership
+    consumer = SimpleNamespace(get_name=lambda: "consumer")
+    dep = SimpleNamespace(name="source", is_indirect=lambda: False)
+    graph = SimpleNamespace(operations=[producer, consumer])
+    expected = _view({0: 8, 1: 4}, {0: Mod(_CORE_ID, 8), 1: floor(_CORE_ID / 8)}, 32)
+
+    def per_core_view(op, *args, **kwargs):
+        if op is consumer:
+            return expected, mode == "split_reader", mode != "unrepresentable_reader"
+        candidate = kwargs["ownership_override"]
+        return (
+            _view(
+                {0: 8, 1: 4},
+                {
+                    0: candidate.core_id_to_work_slice[kv],
+                    1: candidate.core_id_to_work_slice[batch],
+                },
+                32,
+            ),
+            False,
+            True,
+        )
+
+    def collect(_graph, **kwargs):
+        if overrides := kwargs.get("ownership_overrides"):
+            if mode != "copy":
+                return []
+            candidate = overrides["source"]
+            owners = [
+                int(candidate.core_id_to_work_slice[kv].subs(_CORE_ID, core))
+                for core in range(32)
+            ]
+            return [object()] if owners == [core % 8 for core in range(32)] else []
+        kwargs["unprojectable_sources"].append("source")
+        return []
+
+    with (
+        config.patch(
+            {
+                "lx_planner_relayout": True,
+                "co_optimizing_lx_planning": False,
+                "ktir_emitter": False,
+            }
+        ),
+        mock_patch.object(lx_relayout_module, "ComputedBuffer", SimpleNamespace),
+        mock_patch.object(lx_relayout_module, "MemoryDep", SimpleNamespace),
+        mock_patch.object(lx_relayout_module, "_is_matmul_op", return_value=False),
+        mock_patch.object(
+            lx_relayout_module,
+            "iteration_space_from_op",
+            return_value={kv: 8, batch: 4},
+        ),
+        mock_patch.object(
+            lx_relayout_module,
+            "op_read_writes",
+            side_effect=lambda op: SimpleNamespace(
+                writes=[dep] if op is producer and mode != "copy" else [],
+                reads=[dep] if op is consumer and mode != "copy" else [],
+            ),
+        ),
+        mock_patch.object(
+            lx_relayout_module,
+            "_per_core_view_on_buf",
+            side_effect=per_core_view,
+        ),
+        mock_patch.object(
+            lx_relayout_module,
+            "commit_tensor_work_division",
+            side_effect=lambda op, division: setattr(
+                op, "iteration_space_ownership", division
+            ),
+        ),
+        mock_patch.object(
+            lx_relayout_module, "collect_lx_relayout_plans", side_effect=collect
+        ),
+    ):
+        result = lx_relayout_module.anchor_lx_relayout_ownership(graph)
+        assert result == ([] if mode == "unrepresentable_reader" else None)
+
+    committed = producer.iteration_space_ownership
+    if mode == "unrepresentable_reader":
+        assert committed is original
+        return
+    assert [
+        int(committed.core_id_to_work_slice[kv].subs(_CORE_ID, core))
+        for core in range(32)
+    ] == [core % 8 for core in range(32)]
+
+
+def test_restickify_lx_read_requires_the_same_physical_owners():
+    allocator = ScratchpadAllocator(GreedyLayoutSolver, 256)
+    expected = PerCoreView(((0, 8),), ((0, Mod(_CORE_ID, 8)),), num_cores=8)
+    wrong = PerCoreView(((0, 8),), ((0, Mod(_CORE_ID + 1, 8)),), num_cores=8)
+    producer = SimpleNamespace(name="source", get_name=lambda: "source")
+    restickify = SimpleNamespace(name="restickify", get_name=lambda: "restickify")
+    graph = SimpleNamespace(operations=[producer, restickify])
+    write = SimpleNamespace(name="source", is_indirect=lambda: False)
+    read = SimpleNamespace(name="source", is_indirect=lambda: False)
+
+    def read_writes(op):
+        if op is producer:
+            return SimpleNamespace(reads=[], writes=[write])
+        return SimpleNamespace(reads=[read], writes=[])
+
+    def prove(write_view, plans=(), *, enabled=True, structural_restickify=True):
+        with (
+            config.patch({"lx_planner_relayout": enabled}),
+            mock_patch.object(
+                allocator_module,
+                "is_restickify_op",
+                return_value=structural_restickify,
+            ),
+            mock_patch.object(allocator_module, "ComputedBuffer", SimpleNamespace),
+            mock_patch.object(allocator_module, "MemoryDep", SimpleNamespace),
+            mock_patch.object(
+                allocator_module, "op_read_writes", side_effect=read_writes
+            ),
+            mock_patch.object(
+                allocator_module,
+                "_per_core_view_on_buf",
+                side_effect=lambda op, *_args: (
+                    write_view if op is producer else expected,
+                    False,
+                    True,
+                ),
+            ),
+        ):
+            return allocator._restickify_barrier(
+                graph, "source", [1], lx_relayout_plans=plans
+            )
+
+    assert prove(expected, enabled=False, structural_restickify=False) is None
+    assert prove(expected, enabled=False) == "read by restickify (cross-frame barrier)"
+    assert prove(expected) is None
+    assert prove(wrong) == "read by restickify (local-read proof failed)"
+    assert prove(wrong, [_relayout_plan("source", "restickify")]) is None
 
 
 @pytest.mark.parametrize(

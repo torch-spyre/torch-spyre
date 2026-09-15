@@ -15,7 +15,7 @@
 import types
 
 import sympy
-from torch._inductor.dependencies import WeakDep
+from torch._inductor.dependencies import MemoryDep, WeakDep
 
 import torch_spyre._inductor.pass_utils as pass_utils
 
@@ -29,7 +29,12 @@ def test_reduction_iteration_space_ignores_weak_dependencies(monkeypatch):
     output_dim = sympy.Symbol("d0")
     reduction_dim = sympy.Symbol("r0")
     write = types.SimpleNamespace(ranges={output_dim: 4})
-    read = types.SimpleNamespace(ranges={output_dim: 4, reduction_dim: 8})
+    read = MemoryDep(
+        "input",
+        output_dim * 8 + reduction_dim,
+        (output_dim, reduction_dim),
+        (4, 8),
+    )
     node = types.SimpleNamespace(
         node=types.SimpleNamespace(data=FakeReduction()),
         read_writes=types.SimpleNamespace(
