@@ -175,5 +175,6 @@ The constraints that shape KTIR's design, drawn from RFC 0682:
 - [KTIR Specification (RFC 0682)](https://github.com/torch-spyre/rfcs/blob/main/0682-KtirSpec/0682-KtirSpecRFC.md)
 - [torch-spyre/ktir-cpu](https://github.com/torch-spyre/ktir-cpu) — CPU interpreter and validator
 - [torch-spyre/ktir-mlir-frontend](https://github.com/torch-spyre/ktir-mlir-frontend) — MLIR parser and Python bindings
+- [LX relayout workload coverage](lx_relayout_workload_coverage.md) — required Granite, Gemma, and paged-attention ownership transitions
 - [Inductor Frontend](inductor_frontend.md) — current source of compiled kernels
 - [Backend Compiler](backend.md) — current target of compiled kernels
