@@ -71,7 +71,7 @@ class TestSDPATiling(unittest.TestCase):
         self.assertEqual(config.num_head_tiles, 1)
         self.assertEqual(
             config.work_div,
-            {"num_heads": 4, "max_seqlen_q": 8, "max_seqlen_kv": 4},
+            {"max_seqlen_q": 32},
         )
 
     def test_granite_long_kv_keeps_512_block_and_avoids_head_tiling(self):
@@ -87,7 +87,7 @@ class TestSDPATiling(unittest.TestCase):
         self.assertEqual(config.num_head_tiles, 1)
         self.assertEqual(
             config.work_div,
-            {"num_heads": 4, "max_seqlen_q": 8, "max_seqlen_kv": 4},
+            {"max_seqlen_q": 32},
         )
 
     def test_gemma_local_uses_smaller_kv_block_for_wide_heads(self):
@@ -103,11 +103,11 @@ class TestSDPATiling(unittest.TestCase):
         self.assertEqual(config.num_kv_blocks, 32)
         self.assertEqual(
             config.work_div,
-            {"num_heads": 2, "max_seqlen_q": 16, "max_seqlen_kv": 8},
+            {"max_seqlen_q": 32},
         )
 
-    def test_gemma_global_uses_larger_head_split_and_512_kv_block(self):
-        for num_kvheads in (1, 2):
+    def test_gemma_global_uses_query_split_and_native_kv_footprint(self):
+        for num_kvheads, expected_kv_block in ((1, 1024), (2, 1024)):
             with self.subTest(num_kvheads=num_kvheads):
                 config = self._select(
                     num_heads=16,
@@ -117,35 +117,16 @@ class TestSDPATiling(unittest.TestCase):
                 )
 
                 self.assertEqual(config.strategy, "work_divided_tiled")
-                self.assertEqual(config.kv_block_size, 512)
-                self.assertEqual(config.num_kv_blocks, 16)
-                self.assertEqual(
-                    config.work_div,
-                    {"num_heads": 8, "max_seqlen_q": 4, "max_seqlen_kv": 4},
-                )
+                self.assertEqual(config.kv_block_size, expected_kv_block)
+                self.assertEqual(config.num_kv_blocks, 8192 // expected_kv_block)
+                self.assertEqual(config.work_div, {"max_seqlen_q": 32})
 
     def test_decode_uses_geometry_calibrated_policy(self):
         cases = (
-            ("granite", 32, 8, 128, 4096, None, 540800),
-            ("gemma-local", 16, 8, 256, 2048, None, 147520),
-            (
-                "gemma-global-12b",
-                16,
-                1,
-                512,
-                512,
-                {"num_heads": 16, "max_seqlen_q": 1, "max_seqlen_kv": 1},
-                4100,
-            ),
-            (
-                "gemma-global-26b",
-                16,
-                2,
-                512,
-                256,
-                {"num_heads": 8, "max_seqlen_q": 1, "max_seqlen_kv": 1},
-                6152,
-            ),
+            ("granite", 32, 8, 128, 8192, None, 1065088),
+            ("gemma-local", 16, 8, 256, 8192, None, 540736),
+            ("gemma-global-12b", 16, 1, 512, 8192, None, 557120),
+            ("gemma-global-26b", 16, 2, 512, 8192, None, 557120),
         )
         for (
             model,
@@ -165,9 +146,7 @@ class TestSDPATiling(unittest.TestCase):
                     head_dim=head_dim,
                 )
 
-                expected_strategy = (
-                    "decode_work_divided_tiled" if work_div else "decode_tiled"
-                )
+                expected_strategy = "decode_work_divided" if work_div else "decode"
                 self.assertEqual(config.strategy, expected_strategy)
                 self.assertEqual(
                     config.reason, "single-query decode; geometry-calibrated"
@@ -179,6 +158,22 @@ class TestSDPATiling(unittest.TestCase):
                 self.assertEqual(
                     config.estimated_live_bytes_per_core, expected_live_bytes
                 )
+
+    def test_gemma_26b_global_decode_keeps_short_context_k256(self):
+        for sequence_length in (1024, 2048):
+            with self.subTest(sequence_length=sequence_length):
+                config = self._select(
+                    num_heads=16,
+                    num_kvheads=2,
+                    max_seqlen_q=1,
+                    max_seqlen_kv=sequence_length,
+                    head_dim=512,
+                )
+
+                self.assertEqual(config.strategy, "decode_tiled")
+                self.assertEqual(config.kv_block_size, 256)
+                self.assertEqual(config.num_kv_blocks, sequence_length // 256)
+                self.assertIsNone(config.work_div)
 
     def test_unknown_decode_geometry_keeps_conservative_policy(self):
         config = self._select(
@@ -196,10 +191,10 @@ class TestSDPATiling(unittest.TestCase):
 
     def test_decode_block_caps_cover_calibrated_lengths(self):
         cases = (
-            ("granite", 32, 8, 128, (512, 1024, 4096)),
-            ("gemma-local", 16, 8, 256, (512, 1024, 2048)),
-            ("gemma-global-12b", 16, 1, 512, (512, 512, 512)),
-            ("gemma-global-26b", 16, 2, 512, (256, 256, 256)),
+            ("granite", 32, 8, 128, (512, 1024, 8192)),
+            ("gemma-local", 16, 8, 256, (512, 1024, 8192)),
+            ("gemma-global-12b", 16, 1, 512, (512, 1024, 8192)),
+            ("gemma-global-26b", 16, 2, 512, (256, 256, 8192)),
         )
         for model, num_heads, num_kvheads, head_dim, expected_blocks in cases:
             for sequence_length, expected_block in zip(
