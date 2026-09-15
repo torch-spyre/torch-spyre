@@ -634,8 +634,8 @@ def _consume_tile_dim_markers(
     For each marker op (an op whose realized ComputedBuffer carries
     tile_marker_dim -- see lowering.py's lower_tile_dim_marker): find its
     single consuming use among group_ops, record
-    (consumer_op, consuming_dep) -> dim in the returned map, then erase the
-    marker and removing the marker op from `operations`.
+    (op.get_name(), dep) -> dim in the returned map, then erase the
+    marker and remove the marker op from `operations`.
 
     A marker's consumer can hold its read in either of two shapes (both
     already handled elsewhere in this package for the analogous WAR-hazard
