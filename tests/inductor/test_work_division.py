@@ -1710,7 +1710,6 @@ class TestResidencyEdgeMatching(unittest.TestCase):
             edge = allocator._loop_carry_update_edge(
                 self.consumer_op,
                 self.op_by_name,
-                self.residency,
                 {},
             )
             self.assertIsNotNone(edge)

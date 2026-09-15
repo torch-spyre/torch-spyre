@@ -2498,6 +2498,28 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         buffers: list[CoreDivisionBuffer] = []
         residency_by_buf = self._residency_by_buf(graph, mem_usage, lifetimes)
 
+        # Resolve every compiler-tagged carry before constructing any buffer.
+        # If its aliased update cannot be represented as a physical-ownership
+        # edge, fail closed by leaving the storage in HBM.  The storage usually
+        # precedes its update in graph order, so doing this up front avoids
+        # discovering the malformed contract after its solver record is built.
+        carry_update_edges: dict[str, ResidencyEdge] = {}
+        for update_op in graph.operations:
+            record = getattr(update_op, "_loop_carry_record", None)
+            if not isinstance(record, LoopCarryRecord):
+                continue
+            if record.update_name != update_op.get_name():
+                continue
+            edge = self._loop_carry_update_edge(update_op, op_by_name, prep_cache)
+            if edge is None:
+                if residency_by_buf.get(record.storage_name) is None:
+                    residency_by_buf[record.storage_name] = (
+                        "loop carry update ownership unavailable"
+                    )
+                continue
+            if residency_by_buf.get(record.storage_name) is None:
+                carry_update_edges[record.update_name] = edge
+
         input_clone_matches: dict[str, dict[str, list[tuple[int, int]]]] = {}
         # Consumer op name -> input clones for which it is the last reader, and so
         # may reuse the clone's LX slot in place (reverse-parent, #3212). Stays
@@ -2583,9 +2605,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             # the solver chooses identical physical ownership for the initial
             # storage and every update.  A relayout cannot satisfy an in-place
             # write, so this edge deliberately has match pairs only.
-            carry_edge = self._loop_carry_update_edge(
-                op, op_by_name, residency_by_buf, prep_cache
-            )
+            carry_edge = carry_update_edges.get(output_name)
             if carry_edge is not None:
                 storage_name = carry_edge.buf_name
                 update_matches = carry_edge.match_pairs(
@@ -2672,7 +2692,6 @@ class CoOptimizingAllocator(ScratchpadAllocator):
     def _loop_carry_update_edge(
         update_op: Optional[Operation],
         op_by_name: dict[str, Operation],
-        residency_by_buf: dict[str, Optional[str]],
         prep_cache: dict,
     ) -> Optional[ResidencyEdge]:
         """Return the physical-ownership edge for an aliased carry update.
@@ -2688,8 +2707,6 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         if not isinstance(record, LoopCarryRecord):
             return None
         if record.update_name != update_op.get_name():
-            return None
-        if residency_by_buf.get(record.storage_name, "not in graph") is not None:
             return None
         storage_op = op_by_name.get(record.storage_name)
         if storage_op is None or _is_frame_changing_clone(
