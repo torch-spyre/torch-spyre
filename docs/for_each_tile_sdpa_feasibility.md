@@ -119,8 +119,10 @@ bypasses one-trip map levels, retains the existing tiling cost model, uses an
 exact divisor no larger than the selected `Lk` block size, and constructs the
 sparse `M` and denominator accumulators per query tile. Masks remain separate
 operands and are sliced only along axes whose extent matches the tiled axis.
-This code is included to make the complete lowering shape reviewable; it is not
-expected to compile for shapes that exercise two or more HOP levels.
+The HOP dimensions fully describe tiling, so this version contains no
+`named_dims` hints. This code is included to make the complete lowering shape
+reviewable; it is not expected to compile for shapes that exercise two or more
+HOP levels.
 
 ## Results
 
@@ -140,7 +142,7 @@ The Spyre tests use FP16 operands with `D=128`, `Lq=64`, `Lk=256`, and
 The complete prototype suite reports:
 
 ```text
-Ran 9 tests in 46.525s
+Ran 9 tests in 45.792s
 OK (expected failures=4)
 ```
 
