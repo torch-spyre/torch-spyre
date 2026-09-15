@@ -240,6 +240,40 @@ def _body_loop_var(while_op: "ir.WhileLoop") -> sympy.Symbol | None:
 _next_synthetic_hint_id_start = 1 << 30  # reserved range, well above real hint scopes
 
 _MARKER_MAPS: dict[int, dict[tuple[str, "MemoryDep"], int]] = {}
+"""Per-compile marker-map registry, keyed by id(operations).
+
+NOT safe to let outlive one compile: CPython aggressively reuses a freed
+list's id, so a stale entry left behind by a prior compile can collide
+with -- and be silently mistaken for -- a live compile's own entry
+sharing the same buffer-name/dep-shape (confirmed empirically: running
+the same for_each_tile fixture twice in one process produces
+byte-identical (op.get_name(), dep) keys across both compiles).
+clear_marker_maps() must be called once per compile, before
+_consume_tile_dim_markers runs, to guarantee this never happens --
+passes.py's per-compile pipeline entry point does this, alongside the
+analogous reset_provenance_warnings() call, for the same "each compile
+starts from a clean slate" reason.
+"""
+
+
+def clear_marker_maps() -> None:
+    """Discard every entry in the module-level _MARKER_MAPS registry.
+
+    Must be called exactly once per compile, before _consume_tile_dim_markers
+    runs for that compile (passes.py's per-compile pipeline __call__ does
+    this, right alongside reset_provenance_warnings(), which exists for the
+    identical "each compile starts fresh" reason). Without this,
+    _MARKER_MAPS leaks for the process's entire lifetime (nothing else ever
+    deletes an entry), and -- more seriously than the leak itself --
+    id(operations) can be reused by CPython for an unrelated later compile's
+    operations list, letting that later compile's lookup_marker_dim call
+    silently resolve against a dead compile's stale entry instead of
+    raising or returning None. Confirmed empirically: two successive
+    compiles of the same fixture in one process produced identical
+    (op.get_name(), dep) keys; it happened to be harmless there only because
+    both entries stored the same dim, which is not a general guarantee.
+    """
+    _MARKER_MAPS.clear()
 
 
 def _synthesize_dim_hints_for_group(
@@ -405,13 +439,32 @@ def _delinearize_index(index: sympy.Expr, size, stride, offset) -> list[sympy.Ex
     own stride recovers ``idx[i]`` directly; a size-1 dim contributes no
     term at all (``_fixed_indexer`` skips it), so its coordinate is
     simply 0.
+
+    Two distinct dims sharing the same non-zero stride literal (a
+    degenerate/unusual layout, not observed against any fixture in this
+    repo, but not structurally impossible either) would make
+    ``remaining.coeff(st)`` silently SUM both dims' coefficients into one
+    merged coordinate instead of raising -- exactly the kind of silent
+    wrong-answer this module exists to prevent elsewhere. Guard against it
+    explicitly: raise rather than let two dims collide on one recovered
+    coordinate.
     """
     remaining = sympy.expand(index - offset)
     coords: list[sympy.Expr] = []
-    for sz, st in zip(size, stride):
+    seen_strides: dict[sympy.Expr, int] = {}
+    for i, (sz, st) in enumerate(zip(size, stride)):
         if sz == 1:
             coords.append(sympy.Integer(0))
             continue
+        if st != 0 and st in seen_strides:
+            raise AssertionError(
+                f"_delinearize_index: dims {seen_strides[st]} and {i} both "
+                f"have stride {st!r} (sizes {size!r}); cannot recover "
+                "distinct coordinates for both from a single flattened "
+                "index without conflating them."
+            )
+        if st != 0:
+            seen_strides[st] = i
         coords.append(remaining.coeff(st) if st != 0 else sympy.Integer(0))
     return coords
 
@@ -690,7 +743,16 @@ def _consume_tile_dim_markers(
 
         consumers: list[tuple[ir.Operation, Dep]] = []
         for candidate in group_ops:
-            if candidate is marker_op or id(candidate) not in group_op_ids:
+            # No `id(candidate) not in group_op_ids` check here: every
+            # candidate iterated is, by construction, an element of
+            # group_ops itself, so it is trivially always present in
+            # group_op_ids (which this loop never mutates) -- that
+            # disjunct could never be True and would only mislead a
+            # future reader into thinking group_ops/group_op_ids can
+            # desync mid-loop here. (group_op_ids IS mutated later in
+            # this function, once a marker/consumer is actually erased
+            # or replaced -- see below -- just not during this scan.)
+            if candidate is marker_op:
                 continue
             rw = candidate.get_read_writes()
             for dep in rw.reads:
@@ -863,14 +925,40 @@ def lookup_marker_dim(
     So instead of trusting the map's stored int, re-derive the consumer's
     own position the same way the deleted _loop_var_pos_from_reads did, but
     scoped to exactly the one dep the marker map already identified as the
-    tile read -- no ambiguity/corroboration logic is needed the way that
-    heuristic's cross-read guessing required, since the marker is ground
-    truth about which read is the tile: find the read's own index variable
-    `var` whose extent matches loop_var's per-trip advance
+    tile read -- no CROSS-READ ambiguity/corroboration logic is needed the
+    way that heuristic's cross-read guessing required, since the marker is
+    ground truth about which read is the tile: find the read's own index
+    variable `var` whose extent matches loop_var's per-trip advance
     (dep.index.coeff(loop_var) == dep.index.coeff(var) * dep.ranges[var]),
     then map `var` into op's own output coordinates
     (_loop_var_to_ranges_pos) or, if that misses and op is a Reduction,
     into op's own reduction vars (reduction_loop_vars.index).
+
+    A narrower, WITHIN-ONE-DEP ambiguity the deleted heuristic also guarded
+    against still applies here, and is NOT made moot by having a ground-
+    truth marker: more than one var in dep.ranges can satisfy the same
+    coefficient-coincidence equation on the SAME read (the heuristic's own
+    docstring names the motivating shape -- a reduction dim whose extent
+    numerically coincides with the tile size, e.g. flash-attention's
+    online-softmax body where D == SOFTMAX_TILE_SIZE). The deleted
+    heuristic resolved this via cross-read corroboration (trust a lone
+    per-read candidate; require a second, independently-agreeing read
+    before trusting a reduction-channel match when a read had more than
+    one candidate). That corroboration mechanism doesn't carry over as-is
+    (this function deliberately looks at only the one marker-identified
+    dep, not every read), but the underlying risk -- picking an arbitrary
+    one of several equally-plausible candidates -- is exactly what
+    "markers are authoritative, raise on gap, no fallback heuristic"
+    rules out. So: collect EVERY candidate var on the marker-identified
+    dep (don't return on the first one found), and if more than one
+    survives, raise the same actionable gap error _hint_ranges_pos raises
+    elsewhere rather than silently guess. (This has not been observed to
+    trigger against any test fixture in this repo, including
+    online-softmax's own D == SOFTMAX_TILE_SIZE coincidence -- that
+    coincidence lands on a read the marker map does NOT identify as the
+    tile, so it never reaches this per-dep candidate collection at all --
+    but the check must still exist so a future shape that does collide on
+    the marker's own dep fails loudly instead of guessing.)
 
     A mapped dep can be either a MemoryDep (ComputedBuffer/inner_fn-backed
     consumer) or a StarDep (InputsKernel-family consumer, e.g.
@@ -884,9 +972,34 @@ def lookup_marker_dim(
     `.data`/inner_fn and so is never a ComputedBuffer. A StarDep-mapped
     entry therefore never needs a resolved position in practice; return
     None for it rather than guess.
+
+    Scoped to ONLY the marker map belonging to the CURRENT compile's own
+    ``V.graph.operations`` list -- never every entry in the module-level
+    ``_MARKER_MAPS`` registry. ``_MARKER_MAPS`` is keyed by
+    ``id(operations)``, and CPython aggressively reuses a freed list's
+    id; two unrelated compiles in the same process can (and, confirmed
+    empirically, do) end up with byte-identical
+    ``(op.get_name(), dep)`` keys whenever they share a buffer-naming/dep
+    shape (e.g. two runs of the same for_each_tile fixture). Searching
+    every map in the registry, as an earlier version of this function
+    did, risks resolving a live compile's lookup against a DIFFERENT,
+    unrelated compile's stale entry -- silently returning the wrong
+    position whenever that stale entry happens to disagree (harmless only
+    by accident when the two happen to agree, as they did for the
+    same-fixture-twice repro that surfaced this). ``V.graph`` is the live
+    ``GraphLowering`` for whichever compile is currently running this
+    pass pipeline (already relied on elsewhere in this module, e.g.
+    ``V.graph.try_get_buffer`` in ``_consume_tile_dim_markers``), so
+    ``V.graph.operations`` is guaranteed to be the SAME list object
+    ``_consume_tile_dim_markers`` was given for this exact compile.
+    ``clear_marker_maps()`` (called once per compile from
+    ``passes.py``'s pipeline entry point, alongside the analogous
+    ``reset_provenance_warnings()``) additionally guarantees no entry
+    from a past compile can outlive it even under id reuse.
     """
     from torch._inductor.dependencies import Dep, MemoryDep
     from torch._inductor.ir import Reduction
+    from torch._inductor.virtualized import V
 
     from torch_spyre._inductor.wsr.coarse_tile import (
         _loop_var_to_ranges_pos,
@@ -896,7 +1009,8 @@ def lookup_marker_dim(
 
     rw = op.get_read_writes()
     op_name = op.get_name()
-    for marker_map in _MARKER_MAPS.values():
+    marker_map = _MARKER_MAPS.get(id(V.graph.operations))
+    if marker_map is not None:
         for dep in rw.reads:
             if not isinstance(dep, Dep):
                 continue
@@ -905,8 +1019,8 @@ def lookup_marker_dim(
             if not isinstance(dep, MemoryDep):
                 # StarDep-shaped mapped entry: no index/ranges to resolve a
                 # position from, and (per docstring) never actually reached
-                # by a real caller. Keep searching other reads/maps rather
-                # than claim a position that doesn't exist.
+                # by a real caller. Keep searching other reads rather than
+                # claim a position that doesn't exist.
                 continue
 
             index = dep.index
@@ -922,6 +1036,15 @@ def lookup_marker_dim(
                 if isinstance(getattr(op, "data", None), Reduction)
                 else []
             )
+            # Collect EVERY var on this one dep that satisfies the
+            # coefficient-coincidence equation -- do not return on the
+            # first match. More than one candidate here is the narrow,
+            # within-one-dep ambiguity the deleted _loop_var_pos_from_reads
+            # guarded via cross-read corroboration (see this function's
+            # own docstring); with a single ground-truth dep and no second
+            # read to corroborate against, the only safe response to
+            # multiple candidates is to raise, not to silently pick one.
+            candidates: list[tuple[int, bool, sympy.Symbol]] = []
             for var, rng in dep.ranges.items():
                 var_coeff = index.coeff(var)
                 if var_coeff == 0:
@@ -930,9 +1053,30 @@ def lookup_marker_dim(
                     continue
                 pos = _loop_var_to_ranges_pos(out_coords, var)
                 if pos is not None:
-                    return pos, False
-                if var in red_vars:
-                    return red_vars.index(var), True
+                    candidates.append((pos, False, var))
+                elif var in red_vars:
+                    candidates.append((red_vars.index(var), True, var))
+            if len(candidates) > 1:
+                names = ", ".join(str(c[2]) for c in candidates)
+                raise AssertionError(
+                    f"WhileLoop-splice hint's loop_var {loop_var} resolved "
+                    f"to {len(candidates)} candidate index variables "
+                    f"({names}) on op {op_name!r}'s marker-identified read "
+                    f"{dep!r}, all equally satisfying the coefficient-"
+                    "coincidence check. The marker map identifies WHICH "
+                    "read is the tile, but not which of that read's own "
+                    "index variables is the one loop_var actually "
+                    "advances -- a numeric coincidence between two dims' "
+                    "extents (e.g. a reduction dim's size matching the "
+                    "tile size) can satisfy the same equation for more "
+                    "than one variable. Markers are authoritative and "
+                    "there is no fallback heuristic for this: raising "
+                    "here surfaces the gap instead of silently picking "
+                    "one candidate over the other."
+                )
+            if candidates:
+                pos, is_reduction, _ = candidates[0]
+                return pos, is_reduction
     return None
 
 
