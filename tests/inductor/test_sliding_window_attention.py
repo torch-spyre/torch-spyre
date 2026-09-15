@@ -28,10 +28,13 @@ Run:
 
 import unittest
 
+import pytest
 import torch
 import torch._dynamo
 import torch.nn.functional as F
 
+from torch_spyre._inductor.decompositions import spyre_sliding_window_attention
+from torch_spyre._inductor.errors import Unsupported
 from utils_inductor import cached_randn, compare_with_cpu
 
 
@@ -220,6 +223,64 @@ def _compare_attention(
     )
 
 
+@pytest.mark.parametrize(
+    "case,match",
+    [
+        ("negative_scale", "scale=.*must be non-negative"),
+        ("nonpositive_window", "window_size=.*must be positive"),
+        ("empty_query", "query and cache lengths must be positive"),
+        ("empty_cache", "query and cache lengths must be positive"),
+        ("query_exceeds_cache", "seqlen_q=.*exceeds cache_capacity"),
+        ("unaligned_cache", "cache_capacity=.*must be a multiple"),
+        ("nondivisible_heads", "query heads must be a whole multiple"),
+        ("mask_shape", "attention_mask shape.*must be"),
+        ("mask_dtype", "attention_mask dtype.*must match"),
+        ("mask_device", "attention_mask device.*must match"),
+    ],
+)
+def test_validation_guards(case, match):
+    """Malformed calls fail at the public decomposition boundary."""
+    batch, num_heads, num_kvheads = 1, 8, 2
+    seqlen_q, cache_capacity, head_dim = 64, 64, 64
+    window_size, scale = 64, None
+
+    if case == "negative_scale":
+        scale = -1.0
+    elif case == "nonpositive_window":
+        window_size = 0
+    elif case == "empty_query":
+        seqlen_q = 0
+    elif case == "empty_cache":
+        cache_capacity = 0
+    elif case == "query_exceeds_cache":
+        seqlen_q = 128
+    elif case == "unaligned_cache":
+        cache_capacity = 65
+    elif case == "nondivisible_heads":
+        num_kvheads = 3
+
+    query = torch.empty(batch, num_heads, seqlen_q, head_dim, dtype=torch.float16)
+    key = torch.empty(batch, num_kvheads, cache_capacity, head_dim, dtype=torch.float16)
+    value = torch.empty_like(key)
+    mask_shape = (batch, 1, seqlen_q, cache_capacity)
+    if case == "mask_shape":
+        mask_shape = (batch, 1, seqlen_q, max(0, cache_capacity - 1))
+    mask_dtype = torch.float32 if case == "mask_dtype" else torch.float16
+    mask_device = "meta" if case == "mask_device" else "cpu"
+    attention_mask = torch.empty(mask_shape, dtype=mask_dtype, device=mask_device)
+
+    with pytest.raises(Unsupported, match=match):
+        spyre_sliding_window_attention(
+            query,
+            key,
+            value,
+            attention_mask,
+            window_size,
+            True,
+            scale,
+        )
+
+
 class TestSlidingWindowAttention(unittest.TestCase):
     """Shapes the op supports, against the masked reference."""
 
@@ -252,6 +313,12 @@ class TestSlidingWindowAttention(unittest.TestCase):
 
     def test_prefill_batch(self):
         query, key, value = _inputs(2, 4, 4, 256, 256)
+        _compare_attention(query, key, value, 64)
+
+    def test_prefill_batch_gqa(self):
+        # Batch > 1 makes the unit GQA mask axis load-bearing: a rank-4 mask
+        # cannot broadcast correctly against [B, Hkv, group, Lq, Lk].
+        query, key, value = _inputs(2, 8, 2, 256, 256)
         _compare_attention(query, key, value, 64)
 
     def test_prefill_head_dim_128(self):

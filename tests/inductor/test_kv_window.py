@@ -811,7 +811,7 @@ def _reference_window(cache, plan, block_index, transpose=False):
     window = cache[:, :, start : start + plan.buffer_width, :]
     if transpose:
         window = window.transpose(-1, -2)
-    return _expand_kv(window, HEADS // cache.size(1))
+    return window
 
 
 def _reference_band(plan, block_index):
@@ -822,11 +822,19 @@ def _reference_band(plan, block_index):
 class TestKVWindowOp:
     """The op on device, against slices built here.
 
-    GQA is checked one block at a time, which is what the body consumes.
-    Cat-ing several expanded windows together zeroes the leading slots on
-    device -- a backend defect unrelated to this op, and nothing on this path
-    does it.
+    GQA is checked one block at a time, which is what the body consumes. The
+    GQA case deliberately compares against an Hkv-sized reference: matching
+    its shape proves the op did not materialize an Hq-sized expanded window.
     """
+
+    def test_gqa_fake_preserves_native_kv_heads(self):
+        key = torch.empty((2, 2, 256, HEAD_DIM), device="meta")
+        value = torch.empty_like(key)
+
+        k_win, v_win = torch.ops.spyre.kv_window(key, value, 64, 128, HEADS)
+
+        assert k_win.shape == (2, 2, HEAD_DIM, 128)
+        assert v_win.shape == (2, 2, 128, HEAD_DIM)
 
     def test_key_and_value_windows(self):
         # Both outputs of one call, per block, so a failure names both which output
@@ -849,9 +857,10 @@ class TestKVWindowOp:
 
         compare_with_cpu(fn, _device_cache(1), _device_cache(2), run_eager=False)
 
-    def test_gqa_key_window_for_one_block(self):
+    def test_gqa_key_window_preserves_native_kv_heads(self):
         # Block 2 is the first whose read start is not 0, so a dropped window
-        # shift shows up here rather than passing by accident.
+        # shift shows up here rather than passing by accident. The reference
+        # has two heads, not the eight query heads passed to kv_window.
         plan = _plan(256, 256, 64)
         assert plan.read_start(0) == 0 and plan.read_start(2) > 0
 

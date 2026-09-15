@@ -30,6 +30,7 @@ see [Adding Operations](../compiler/adding_operations.md).
 | `torch.nn.functional.softplus` | Y | Y | Spyre | Custom op + lowering |
 | `torch.nn.functional.dropout` | Y | Y | Spyre | |
 | `torch.nn.functional.scaled_dot_product_attention` | Y | Y | Spyre | Custom decomposition (flash-attention-style tiled online softmax); auto-registers a PrivateUse1 kernel for eager dispatch |
+| `torch.ops.spyre.sliding_window_attention` | | Y | Spyre | Compiled-only custom op; runtime additive mask, causal and non-causal paths, native GQA |
 | **Pointwise Unary** | | | | |
 | `torch.abs` | Y | Y | Spyre | |
 | `torch.neg` | Y | Y | Spyre | |
@@ -165,6 +166,37 @@ see [Adding Operations](../compiler/adding_operations.md).
     pre-scheduling pipeline; the "Views and Index Translation" section
     of the [Inductor Front-End](../compiler/inductor_frontend.md) walks
     through how this works.
+
+## Sliding-window attention custom op
+
+`torch.ops.spyre.sliding_window_attention` has the schema:
+
+```python
+sliding_window_attention(
+    query, key, value, attention_mask, window_size, is_causal, scale=None
+) -> Tensor
+```
+
+The query shape is `[B, Hq, Lq, D]`; key and value are
+`[B, Hkv, Lk, D]`; and the additive attention mask is
+`[B, 1, Lq, Lk]`, with the same dtype and device as the query. `Hq` must be a
+whole multiple of `Hkv`. Grouped-query attention keeps K/V at their native
+head count and broadcasts them over query-head groups inside the kernel.
+`window_size`, `is_causal`, and `scale` are static model configuration, while
+all position-dependent state belongs in `attention_mask`. Changing mask values
+therefore reuses the compiled graph.
+
+For causal square prefill, the kernel uses static narrow K/V reads.
+Non-causal attention, decode, and chunked prefill scan the full physical cache
+allocation in bounded chunks and let the mask select valid tokens. Decode
+caches should consequently be compact and approximately window-sized; a
+full-context allocation is correct but makes work proportional to its full
+capacity. Unwritten cache rows must be zero-filled because their masked scores
+are still computed before the additive mask is applied.
+
+The cache capacity must be positive and a multiple of 64, and `Lq` must be in
+`[1, Lk]`. The op has no eager implementation and must be called on Spyre under
+`torch.compile(backend="inductor")`.
 
 ## Unsupported Operations
 
