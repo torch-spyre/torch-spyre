@@ -171,11 +171,18 @@ def main() -> None:
     )
     args = ap.parse_args()
 
-    url = os.getenv("SPYRE_CH_URL", "").strip()
-    db = os.getenv("SPYRE_CH_V2_DB", "").strip()
+    # The SAME credential names the ingest path uses (CLICKHOUSE_*), not a second
+    # SPYRE_CH_* set: one instance should not have two naming schemes, and the SPYRE_CH_*
+    # secrets never existed -- so this lookup always took its unset branch and every run
+    # silently executed the full tier. Host+port rather than a pre-built URL for the same
+    # reason: those are the secrets that exist.
+    host = os.getenv("CLICKHOUSE_HOST", "").strip()
+    port = os.getenv("CLICKHOUSE_PORT", "443").strip() or "443"
+    url = f"https://{host}:{port}" if host else ""
+    db = os.getenv("CLICKHOUSE_DB_V2", "").strip()
     if not url or not db:
         print(
-            "resolve_covered_tiers: SPYRE_CH_URL/SPYRE_CH_V2_DB unset -- "
+            "resolve_covered_tiers: CLICKHOUSE_HOST/CLICKHOUSE_DB_V2 unset -- "
             "running the full tier",
             file=sys.stderr,
         )
@@ -185,8 +192,8 @@ def main() -> None:
     try:
         tiers = covered_tiers(
             url,
-            os.getenv("SPYRE_CH_USER", "default"),
-            os.getenv("SPYRE_CH_TOKEN", ""),
+            os.getenv("CLICKHOUSE_USER", "default"),
+            os.getenv("CLICKHOUSE_PASS", ""),
             db,
             args.commit_sha,
             args.arch,

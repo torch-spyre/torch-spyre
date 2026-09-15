@@ -162,7 +162,9 @@ on:
         required: false
       CLICKHOUSE_DB:
         required: false
-      SPYRE_CH_TOKEN:
+      # The v2 database for the covered-tier lookup. The other four CLICKHOUSE_* secrets
+      # above already serve it -- one instance, one naming scheme.
+      CLICKHOUSE_DB_V2:
         required: false
 
 defaults:
@@ -235,10 +237,15 @@ jobs:
           ENABLE_TIER_DELTA: ${{ inputs.enable_tier_delta }}
           DELTA_SHA: ${{ inputs.ref || github.event.pull_request.head.sha || github.sha }}
           DELTA_ARCH: ${{ inputs.runner_label }}
-          SPYRE_CH_URL: ${{ vars.SPYRE_CH_URL }}
-          SPYRE_CH_V2_DB: ${{ vars.SPYRE_CH_V2_DB }}
-          SPYRE_CH_USER: ${{ vars.SPYRE_CH_USER }}
-          SPYRE_CH_TOKEN: ${{ secrets.SPYRE_CH_TOKEN }}
+          # Same secrets the ingest path uses. Previously these read a SPYRE_CH_* set of
+          # vars/secrets that was never configured in any repo or org, so the lookup always
+          # took its unset branch and every run silently ran the FULL tier -- the delta could
+          # not fire at all. Absent secrets still fail open, by design.
+          CLICKHOUSE_HOST: ${{ secrets.CLICKHOUSE_HOST }}
+          CLICKHOUSE_PORT: ${{ secrets.CLICKHOUSE_PORT }}
+          CLICKHOUSE_USER: ${{ secrets.CLICKHOUSE_USER }}
+          CLICKHOUSE_PASS: ${{ secrets.CLICKHOUSE_PASS }}
+          CLICKHOUSE_DB_V2: ${{ secrets.CLICKHOUSE_DB_V2 }}
         run: |
           # Prebaked: read the configs baked in the dev image; else the checkout cwd.
           # cd into the source root so every path below stays repo-relative and
@@ -281,7 +288,9 @@ jobs:
           # this block scalar and break the workflow.
           EXCLUDE_TIERS=""
           COVERED_RUNS="[]"
-          if [ "${ENABLE_TIER_DELTA}" = "true" ] && [ -n "${SPYRE_CH_URL:-}" ]; then
+          # Guard on the HOST, which is what the resolver needs; SPYRE_CH_URL was never set
+          # by anything, so this condition could never be true and the delta never ran.
+          if [ "${ENABLE_TIER_DELTA}" = "true" ] && [ -n "${CLICKHOUSE_HOST:-}" ]; then
             _delta_out=$(python3 .github/scripts/resolve_covered_tiers.py \
               --commit-sha "${DELTA_SHA}" \
               --arch "${DELTA_ARCH}" \
