@@ -18,6 +18,8 @@
 #include <libaiupti/aiupti_runtime_cbid.h>
 
 #include <nlohmann/json.hpp>
+#include <cstdlib>
+#include <cstring>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -174,10 +176,40 @@ inline std::string runtimeCbidName(AIUpti_runtime_api_trace_cbid cbid) {
       return "aiuIssueCallback";
     case AIUPTI_RUNTIME_TRACE_CBID_VERIFY_ASYC_MSGS:
       return "aiuVerifyAsyncMsgs";
+    case AIUPTI_RUNTIME_TRACE_CBID_CMPT_EXEC:
+      return "aiuCmptExec";
+    case AIUPTI_RUNTIME_TRACE_CBID_DMAI_EXEC:
+      return "aiuDmaIExec";
+    case AIUPTI_RUNTIME_TRACE_CBID_DMAO_EXEC:
+      return "aiuDmaOExec";
     default:
       break;
   }
   return "Unknown CBID " + std::to_string(cbid);
+}
+
+static std::vector<std::pair<std::string, std::string>> parseActivityAttributes(
+    const char* attributes, size_t capacity) {
+  std::vector<std::pair<std::string, std::string>> parsed;
+  if (attributes == nullptr) {
+    return parsed;
+  }
+  const std::string field(attributes, strnlen(attributes, capacity));
+  size_t pos = 0;
+  while (pos < field.size()) {
+    const size_t sep = field.find(';', pos);
+    const size_t end = (sep == std::string::npos) ? field.size() : sep;
+    const std::string entry = field.substr(pos, end - pos);
+    const size_t eq = entry.find('=');
+    if (eq != std::string::npos && eq > 0) {
+      parsed.emplace_back(entry.substr(0, eq), entry.substr(eq + 1));
+    }
+    if (sep == std::string::npos) {
+      break;
+    }
+    pos = sep + 1;
+  }
+  return parsed;
 }
 
 void AiuptiActivityProfilerSession::handleRuntimeActivity(
@@ -211,6 +243,30 @@ void AiuptiActivityProfilerSession::handleRuntimeActivity(
                 cbIDName) != correlateRuntimeOps_.end());
   runtime_activity->linked = linked;
   runtime_activity->addMetadata("correlation", activity->correlation_id);
+  // Collective-communication metadata, when the producer attached any. Emitted as trace args
+  // only; the timeline name stays the plain cbid name so grouping and the correlateRuntimeOps_
+  // lookup above are unaffected.
+  for (const auto& [key, value] : parseActivityAttributes(
+           activity->attributes, sizeof(activity->attributes))) {
+    if (value.empty()) {
+      continue;
+    }
+    if (key == "CollGroup") {
+      runtime_activity->addMetadataQuoted("coll_group", value);
+    } else if (key == "CollAlgo") {
+      runtime_activity->addMetadataQuoted("coll_algo", value);
+    } else if (key == "CollBytes") {
+      // Prefer a JSON number so Perfetto and pandas can aggregate on it; fall back to a quoted
+      // string if the producer ever sends something non-numeric.
+      char* parse_end = nullptr;
+      const unsigned long long bytes = std::strtoull(value.c_str(), &parse_end, 10);
+      if (parse_end != nullptr && *parse_end == '\0' && parse_end != value.c_str()) {
+        runtime_activity->addMetadata("coll_bytes", bytes);
+      } else {
+        runtime_activity->addMetadataQuoted("coll_bytes", value);
+      }
+    }
+  }
 
   switch ((AIUpti_runtime_api_trace_cbid)activity->cbid) {
     case AIUPTI_RUNTIME_TRACE_CBID_LAUNCH_CB:
@@ -313,7 +369,6 @@ inline std::string memoryCopyOperationName(uint8_t kind) {
   }
   return "<unknown>";
 }
-
 inline uint32_t getBaseResourceId(const AIUpti_ActivityMemcpy* activity) {
   return activity->copy_kind * 100;
 }
@@ -585,10 +640,10 @@ void AiuptiActivityProfilerSession::handlePtiActivity(
           reinterpret_cast<const AIUpti_ActivityMemory*>(record), logger);
       break;
     default:
-      errors_.push_back("Unexpected activity type: " +
-                        std::to_string(record->kind));
+      errors_.push_back("Unexpected activity type: " + std::to_string(record->kind));
       break;
   }
 }
 
 }  // namespace KINETO_NAMESPACE
+
