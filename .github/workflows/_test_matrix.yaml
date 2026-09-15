@@ -262,15 +262,25 @@ jobs:
               --format matrix-json)
           fi
 
-          # distributed_tests configs carry the trunk label too but are
-          # exclusively run by the test_multi_spyre job below (multi-card
-          # runners) -- strip them back out so the wider trunk scan above
-          # doesn't also schedule them through this single-card matrix.
+          # Some trunk-labeled subtrees are owned by other push-to-main
+          # workflows, so the wider trunk scan would double-run them:
+          #   - distributed_tests/  : run by the test_multi_spyre job below
+          #     (multi-card runners); scheduling them through this single-card
+          #     matrix as well would run them twice.
+          #   - upstream_tests_beta/, upstream_tests/ : run by the dedicated
+          #     upstream_tests_beta.yaml / upstream_tests.yaml workflows, which
+          #     check out the pytorch source and resolve the ${TORCH_ROOT} that
+          #     these configs' `path:` fields reference. This matrix uses the
+          #     spyre-backend image with no pytorch source, so re-running them
+          #     here both duplicates the work and fails on TORCH_ROOT.
+          # Strip all three back out so trunk keeps its wide torch_spyre_tests +
+          # model_ops_tests coverage without stepping on the dedicated workflows.
           if [ "${RAW_TEST_TYPE}" = "trunk" ]; then
             matrix=$(echo "${matrix}" | python3 -c "
           import json, sys
+          SKIP = ('distributed_tests/', 'upstream_tests_beta/', 'upstream_tests/')
           data = json.load(sys.stdin)
-          data['suite'] = [s for s in data['suite'] if not s['config'].startswith('distributed_tests/')]
+          data['suite'] = [s for s in data['suite'] if not s['config'].startswith(SKIP)]
           print(json.dumps(data))
           ")
           fi
