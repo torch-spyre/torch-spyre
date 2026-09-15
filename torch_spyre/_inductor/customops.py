@@ -36,7 +36,7 @@ def tile_dim_marker(x: torch.Tensor, dim: int) -> torch.Tensor:
 
 @tile_dim_marker.register_fake
 def _(x: torch.Tensor, dim: int) -> torch.Tensor:
-    return x.new_empty(x.size())
+    return torch.empty_like(x)
 
 
 @torch.library.custom_op("spyre::softplus", mutates_args=(), device_types="spyre")
