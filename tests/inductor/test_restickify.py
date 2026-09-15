@@ -30,7 +30,12 @@ from unittest.mock import patch
 
 import torch
 from torch._inductor.virtualized import V
-from torch.spyre import SpyreTensorLayout
+# Imported straight from the pybind11 extension, not `torch.spyre`: that
+# module's __getattr__ falls back to impl._lazy_init() for any name it
+# doesn't already expose, so `from torch.spyre import SpyreTensorLayout`
+# initializes the Spyre runtime as a side effect of this import -- i.e. at
+# module-import/collection time, before any test has run.
+from torch_spyre._C import SpyreTensorLayout
 
 import torch_spyre._inductor.optimize_restickify as _optimize_restickify
 from torch._inductor.exc import InductorError
