@@ -61,6 +61,7 @@ runs:
         date
         pwd
         whoami
+        sudo whoami || true
         id
         echo "GHA_RUNNER_POD_NODE_NAME $GHA_RUNNER_POD_NODE_NAME"
         echo "GHA_RUNNER_POD_NAME $GHA_RUNNER_POD_NAME"
