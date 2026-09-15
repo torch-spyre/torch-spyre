@@ -73,11 +73,13 @@ def _compute_span(run: list[BaseSchedulerNode]) -> tuple[int, int]:
 
     Folding an allocation into a bundle pays off only where it would otherwise
     split a run of compute, which is to say where it is *interior*. A ``cat`` or
-    ``stack`` destination is interior by construction: the compute that fills it
-    follows it. An allocation at either end is a different animal -- coarse
-    tiling hoists its cross-tile reduction accumulators ahead of a loop group
-    precisely so they do not split it -- and absorbing one buys nothing while
-    costing an unread buffer.
+    ``stack`` destination is interior whenever compute both precedes and fills
+    it, which is the common case but not a guarantee: a ``cat`` reading only
+    graph inputs has no producing compute ahead of it and so leads its run. An
+    allocation at either end is a different animal -- coarse tiling hoists its
+    cross-tile reduction accumulators ahead of a loop group precisely so they do
+    not split it -- and absorbing one buys nothing while costing an unread
+    buffer.
 
     Leading and trailing allocations are therefore handed back as their own
     single-element runs, which is what they were before fusion considered them.
