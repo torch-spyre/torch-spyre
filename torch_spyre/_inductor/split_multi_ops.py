@@ -738,10 +738,12 @@ def _get_op_name(op) -> str:
 
 
 def validate_ops(graph: GraphLowering) -> None:
-    """Validate inputs to ops have same ElementArrangement.
+    """Validate that op inputs have compatible ElementArrangements.
 
-    This pass need to be run after propagate_spyre_tensor_layouts so that it
-    has all the required SpyreTensorLayouts.
+    Compatible means all the same EA, or the broadcast pattern (exactly one
+    non-STANDARD EA mixed with STANDARD, excluding EXX2). See
+    ``is_ea_compatible``. Must run after propagate_spyre_tensor_layouts so
+    SpyreTensorLayouts are available.
     """
     for op in graph.operations:
         if not hasattr(op, "data"):
