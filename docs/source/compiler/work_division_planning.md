@@ -562,9 +562,44 @@ With `SPYRE_LX_PLANNER_RELAYOUT=1`, a supported LX copy can connect
 different producer and reader partitions. A matmul's split reduction makes
 its output partial, not its input: input placement uses the values each
 reader actually needs. Expansion to more cores uses the same ownership
-proof for pointwise and matmul readers. Existing core-domain, capacity,
-lifetime and whole-source fallback restrictions still apply; this does
+proof for pointwise, matmul and unsplit reduction readers. Existing core-domain,
+capacity, lifetime and whole-source fallback restrictions still apply; this does
 not change the work chooser's policy.
+
+After a split matmul reduction, only the last core in each contiguous reduction
+group holds a finished output piece. For example, one writer may hold output
+columns 0-63 and another columns 64-127. A reader needing columns 0-127 copies
+both pieces into their corresponding positions; it does not add them together.
+The backend's existing reduction has already added the partial answers.
+
+Every reader must receive all its requested pieces exactly once. The current
+route builder also requires each reader to use the same number of writers and
+each writer to serve the same number of readers. In the example, every reader
+collects two pieces; uneven cases such as one reader needing one writer and
+another needing two are outside this supported geometry. Copies to fewer cores
+retain the narrower rule of one completed writer per reader. These are limits
+of the current copy contract, not a requirement of reduction arithmetic.
+
+Single-axis FP16 `max` and `sum` with a static reduction extent also use the
+backend's existing cross-core combine. Their finished writer is the core
+assigned the last **reduction slice**.
+The supported ascending maps put it on the highest core of each output partition;
+the cores need not be adjacent. For example, head `h` on cores
+`h, h+8, h+16, h+24` finishes on `h+24`. The same completed-result copy machinery
+can deliver that statistic to all four cores before subtraction or normalization.
+An explicit route remains a real copy even if the source and destination request
+identical slices: only the certified source holds the completed value.
+
+This relies on the frontend's current `numCoreletsUsed_=1` emission; it does not
+model SenDNN's two-corelet, opposite-endpoint output pieces. Loop-carried and
+multi-axis plain reductions, other reduction types, FP32, and KTIR keep their
+existing split-one restriction. No extra sum/max operation is added, and the
+existing source-group, capacity and lifetime checks remain. The native split is
+legal with LX relayout off as well as on, including for unhinted operations;
+the existing chooser can therefore select a new division. FP16 sum can round
+differently when contributions are added in a different order. FP32 completion
+is outside this admission; separately, the current SDK cannot mask padded FP32
+`exp` output coordinates, which can block a non-stick softmax chain.
 
 Each pass plans one op at a time. When two adjacent ops share a tensor
 but select different per-core splits for it, the LX scratchpad planner

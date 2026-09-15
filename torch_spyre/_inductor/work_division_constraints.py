@@ -52,6 +52,7 @@ from .pass_utils import (
     indirect_forbidden_split_syms,
     is_restickify_coords,
     op_read_writes,
+    supports_split_plain_reduction,
 )
 from .logging_utils import get_inductor_logger
 from .propagate_hints import get_op_hints
@@ -266,11 +267,9 @@ def reduction_window_blocked_vars(ctx: WorkDivConstraintContext) -> ConstraintRe
 
 # These ops have dedicated cross-core hardware/codegen combine support
 # (matmul: PSUM accumulation; topk/keep_by_index/pool/conv: dedicated
-# combine codegen), so a K-split across cores is safe. Plain elementwise
-# reductions like sum/max/min/xor_sum/any are deliberately absent: they use
-# coarse_tile.py's own outer-loop accumulate path (_insert_combine_op)
-# instead, which is a different mechanism and does not enable a cross-core
-# K-split -- their absence here is not an oversight to "fix" by adding them.
+# combine codegen), so a K-split across cores is safe. Plain reductions are
+# checked separately by supports_split_plain_reduction: its single-corelet
+# FP16 max/sum combine does not complete coarse-tile loop accumulations.
 _K_SPLIT_COMBINE_SUPPORTED = {
     BATCH_MATMUL_OP,
     BATCH_MATMUL_FP8_OP,
@@ -521,23 +520,17 @@ def coarse_tile_local_dim_split_domains(
 def plain_reduction_k_split_domains(
     ctx: WorkDivConstraintContext,
 ) -> ConstraintResult:
-    """Forbid K-splits for reductions with no cross-core combine step.
+    """Only admit plain reductions whose native completion is supported.
 
-    Splitting a reduction dim across cores leaves each core holding a partial
-    result (e.g. a partial max over its own slice of the reduction range).
-    Matmul has PSUM hardware to combine those partial sums, and topk/
-    keep_by_index/pool/conv have their own dedicated combine or blocking
-    rules above. Every other reduction type (max, min, sum, prod, mean,
-    absmax, ...) has no combine step wired up anywhere in codegen: the
-    partial result is written out and never reduced further, silently
-    producing a wrong answer (issue: B+H coarse-tiled flash-attention amax,
-    where freeing up core budget let the generic work-division search reach
-    for a K-split on a plain `max` reduction). Restrict those to split=1
-    until a real combine mechanism exists for them.
+    DDL combines single-axis max/sum over the SFP ring. This does not combine
+    results from separate loop tiles; carried and other plain reductions keep
+    the split-one fence. Special reductions retain their own rules.
     """
     if not isinstance(ctx.op.data, Reduction):
         return ConstraintResult()
     if ctx.op.data.reduction_type in _K_SPLIT_COMBINE_SUPPORTED:
+        return ConstraintResult()
+    if supports_split_plain_reduction(ctx.op):
         return ConstraintResult()
     return ConstraintResult(
         allowed_splits={v: frozenset({1}) for v in ctx.reduction_vars}

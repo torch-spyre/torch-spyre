@@ -54,11 +54,13 @@ from .core_mapping import (
     derive_operation_mapping,
     finalize_tensor_work_divisions,
     remap_work_division,
+    owner_slots,
 )
 from .errors import Unsupported
 from .ir import FixedTiledLayout
 from .scratchpad.lx_relayout import (
     materialized_lx_relayout_for_destination,
+    materialized_lx_relayouts,
     work_division_from_view,
 )
 from .pass_utils import (
@@ -1030,6 +1032,9 @@ class SpyreKernel(Kernel[CSEVariable]):
             tiled_symbol_trip_counts=tiled_symbol_trip_counts,
             symbolic_dim_bounds=symbolic_dim_bounds,
             node_output_ranges=node_output_ranges,
+            producer_consumers=(
+                relayout_plans[0].producer_consumers if relayout_plans else ()
+            ),
             debug_handle=debug_handle,
         )
         # Finish the operation here, while its inputs and its node are live.
@@ -1043,6 +1048,20 @@ class SpyreKernel(Kernel[CSEVariable]):
             else None,
             repeat_info=self._alignment_repeat_info,
         )
+        if op in ("max", "sum"):
+            written_names = {
+                written.get(dep.name, dep.name)
+                for dep in self.current_node.read_writes.writes
+                if isinstance(dep, MemoryDep)
+            }
+            _check_completed_plain_reduction_writers(
+                op_spec,
+                [
+                    plan
+                    for _, plan in materialized_lx_relayouts(V.graph).values()
+                    if plan.source_name in written_names and plan.producer_consumers
+                ],
+            )
         return op_spec
 
     def remove_kernel_local_buffers(self) -> None:
@@ -1595,6 +1614,8 @@ def _codegen_op_spec_list(specs, buf: IndentedBuffer, sympy_str) -> None:
                         )
                         + "),"
                     )
+                if op_spec.producer_consumers:
+                    buf.writeline(f"producer_consumers={op_spec.producer_consumers!r},")
                 if op_spec.debug_handle is not None:
                     # Source-to-kernel provenance must survive the OpSpec ->
                     # generated-source -> exec round-trip. DebugHandle/SourceLoc
@@ -1751,6 +1772,38 @@ def _restickify_restore_elided_dim(op_spec) -> None:
         _restore(new_sym, out_arg, in_arg)
 
 
+def _check_completed_plain_reduction_writers(op_spec: OpSpec, plans) -> None:
+    """Check the prepared producer against its copies before HBM fallback closes.
+
+    The physical output view omits the reduced dimension. Its writer therefore
+    needs this preservation check after the actual alignment and finalization,
+    rather than a second predicted operation mapping.
+    """
+    if not plans:
+        return
+    output_symbols = set().union(
+        *(c.free_symbols for c in op_spec.args[-1].device_coordinates)
+    )
+    splits = {d: int(n) for d, (_, n) in op_spec.iteration_space.items()}
+    reduced = [d for d, n in splits.items() if n > 1 and d not in output_symbols]
+    if len(reduced) != 1 or op_spec.core_id_to_work_slice is None:
+        raise Unsupported(
+            "completed plain reduction needs one aligned split reduction axis "
+            "and a prepared core mapping"
+        )
+    dim = reduced[0]
+    rows = owner_slots(
+        op_spec.core_id_to_work_slice, splits, math.prod(splits.values())
+    )
+    writers = {core for core, row in enumerate(rows) if row[dim] == splits[dim] - 1}
+    if any(
+        {source for source, _ in plan.producer_consumers} != writers for plan in plans
+    ):
+        raise Unsupported(
+            "completed plain reduction writers changed during preparation"
+        )
+
+
 def _check_relayout_boundary(
     iteration_space: dict, source: TensorWorkDivision, destination: TensorWorkDivision
 ) -> None:
@@ -1831,7 +1884,9 @@ def simplify_op_spec(
             ]
 
     _finalize_tensor_work_divisions(op_spec)
-    is_relayout = is_lx_relayout_identity(op_spec.op, op_spec.args, op_spec.op_info)
+    is_relayout = is_lx_relayout_identity(
+        op_spec.op, op_spec.args, op_spec.op_info, op_spec.producer_consumers
+    )
     if is_relayout:
         source, destination = (arg.work_division for arg in op_spec.args)
         assert source is not None and destination is not None

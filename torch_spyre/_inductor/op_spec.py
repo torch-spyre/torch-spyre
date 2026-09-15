@@ -284,6 +284,7 @@ def is_lx_relayout_identity(
     op: str,
     args: Sequence[TensorArg],
     op_info: dict[str, Any] | None = None,
+    producer_consumers: tuple[tuple[int, tuple[int, ...]], ...] = (),
 ) -> bool:
     """A planner-certified LX identity moving between different owners."""
 
@@ -296,7 +297,9 @@ def is_lx_relayout_identity(
         raise ValueError("certified LX relayout lost an LX allocation")
     if source.work_division is None or destination.work_division is None:
         raise ValueError("certified LX relayout lost a tensor work division")
-    if source.work_division.same_ownership(destination.work_division):
+    if not producer_consumers and source.work_division.same_ownership(
+        destination.work_division
+    ):
         raise ValueError("certified LX relayout ownership collapsed")
     return True
 
@@ -364,6 +367,9 @@ class OpSpec:
     # node exposes no data.ranges.
     node_output_ranges: tuple[Expr, ...] | None = None
     debug_handle: DebugHandle | None = None
+    # Final source-core -> destination-core routes for a completed-reduction
+    # LX broadcast. Empty for ordinary operations and all-core relayouts.
+    producer_consumers: tuple[tuple[int, tuple[int, ...]], ...] = ()
 
 
 # --- Module-level constant tensor cache --------------------------------------

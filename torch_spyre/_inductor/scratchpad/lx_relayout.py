@@ -28,6 +28,7 @@ from torch._inductor.ir import (
     MutationLayoutSHOULDREMOVE,
     Operation,
     Pointwise,
+    Reduction,
 )
 from torch_spyre._C import ElementArrangement
 
@@ -42,6 +43,7 @@ from ..core_mapping import (
     _MAX_EXACT_OWNERSHIP_POINTS,
     _EVALUATION_ERRORS,
     select_unique_partition_division,
+    transfer_edges,
 )
 from ..ir import FixedTiledLayout
 from ..logging_utils import get_inductor_logger
@@ -51,6 +53,8 @@ from ..pass_utils import (
     PerCoreView,
     _is_matmul_op,
     _per_core_view_on_buf,
+    completed_reduction_split_on_buf,
+    completed_plain_reduction_writers,
     iteration_space_from_op,
     op_read_writes,
     try_device_coordinates,
@@ -71,6 +75,7 @@ class LXRelayoutPlan:
     num_cores: int
     source_footprint_bytes: int = 0
     destination_footprint_bytes: int = 0
+    producer_consumers: tuple[tuple[int, tuple[int, ...]], ...] = ()
     source_address: int | None = None
     destination_address: int | None = None
 
@@ -312,10 +317,6 @@ def partition_footprint(layout: FixedTiledLayout, view: PerCoreView) -> int:
     )
 
 
-def _overlap(a: int, an: int, b: int, bn: int) -> bool:
-    return a * bn < (b + 1) * an and b * an < (a + 1) * bn
-
-
 def movement_supported(
     source: PerCoreView,
     destination: PerCoreView,
@@ -348,21 +349,9 @@ def movement_supported(
         return False
     source_map = _core_slices(source, num_cores)
     destination_map = _core_slices(destination, destination_num_cores)
-    dims = set(source_splits) | set(destination_splits)
-    edges = {
-        (s_core, d_core)
-        for s_core, s_slice in source_map.items()
-        for d_core, d_slice in destination_map.items()
-        if all(
-            _overlap(
-                s_slice.get(dim, 0),
-                source_splits.get(dim, 1),
-                d_slice.get(dim, 0),
-                destination_splits.get(dim, 1),
-            )
-            for dim in dims
-        )
-    }
+    edges = transfer_edges(
+        source_splits, destination_splits, source_map, destination_map
+    )
     fanout = [sum(src == core for src, _ in edges) for core in range(num_cores)]
     fanin = [
         sum(dst == core for _, dst in edges) for core in range(destination_num_cores)
@@ -388,6 +377,106 @@ def movement_supported(
             or (fanout[0] == destination_num_cores // num_cores and fanin[0] == 1),
         )
     )
+
+
+# Validated completed-piece routes, not hardware reduction-width limits:
+# K2/K4 on 32 cores on device; K3 on synthetic 2*K-core views on host only.
+# Three cannot divide a 32-core producer domain. Larger splits remain untested.
+_COMPLETED_REDUCTION_SPLITS = (2, 3, 4)
+# Copies to fewer cores have device coverage for this one-writer form only.
+_COMPACT_COMPLETED_REDUCTION_SPLITS = (2, 4)
+
+
+def derive_completed_reduction_routes(
+    source: PerCoreView,
+    destination: PerCoreView,
+    reduction_split: int,
+    *,
+    writers: tuple[int, ...] | None = None,
+) -> tuple[tuple[int, tuple[int, ...]], ...]:
+    """Copy completed pieces; the backend has already combined their values.
+
+    Matmul finishes on the last core of each contiguous K-fast group even when
+    OUT is split. Earlier cores never write their result buffers. Full-domain
+    copies may assemble disjoint pieces from several completed writers. The
+    smaller-domain one-to-one extension retains the K2/K4 writer rule.
+    Plain reductions supply their actual terminal cores and may broadcast a
+    statistic to several cores with the same input slice.
+    """
+    source_count, destination_count = source.num_cores, destination.num_cores
+    splits, target = dict(source.work_slice_dims), dict(destination.work_slice_dims)
+    owners = math.prod(splits.values())
+    if (
+        source_count is None
+        or destination_count is None
+        or reduction_split not in _COMPLETED_REDUCTION_SPLITS
+        or owners * reduction_split != source_count
+        or (math.prod(target.values()) != destination_count and writers is None)
+        or not (
+            destination_count == source_count
+            or (
+                destination_count == owners
+                and reduction_split in _COMPACT_COMPLETED_REDUCTION_SPLITS
+            )
+        )
+        or (
+            destination_count != source_count
+            and any(
+                target.get(d, 1) % splits.get(d, 1)
+                for d in splits.keys() | target.keys()
+            )
+        )
+    ):
+        raise ValueError("unsupported completed-reduction ownership geometry")
+    source_map = _core_slices(source, source_count)
+    target_map = _core_slices(destination, destination_count)
+    groups: dict[tuple, list[int]] = {}
+    for core, row in source_map.items():
+        groups.setdefault(tuple(sorted(row.items())), []).append(core)
+    if (
+        len(groups) != owners
+        or len({tuple(sorted(row.items())) for row in target_map.values()})
+        != math.prod(target.values())
+        or (
+            writers is None
+            and any(
+                group != list(range(group[0], group[0] + reduction_split))
+                for group in groups.values()
+            )
+        )
+    ):
+        raise ValueError(
+            "completed-reduction owners require contiguous source groups and distinct destinations"
+        )
+    terminals = (
+        set(writers)
+        if writers is not None
+        else {group[-1] for group in groups.values()}
+    )
+    if len(terminals) != owners or any(
+        len(terminals.intersection(group)) != 1 for group in groups.values()
+    ):
+        raise ValueError(
+            "completed-reduction routes require one writer per source partition"
+        )
+    if terminals != {group[-1] for group in groups.values()}:
+        raise ValueError("completed-reduction writers require ascending core order")
+    edges = transfer_edges(splits, target, source_map, target_map)
+    routes: dict[int, list[int]] = {core: [] for core in sorted(terminals)}
+    fanins = set()
+    for destination_core in range(destination_count):
+        contributors = [s for s, d in edges if d == destination_core and s in terminals]
+        if not contributors or (
+            destination_count != source_count and len(contributors) != 1
+        ):
+            raise ValueError("destination has unsupported completed-result coverage")
+        fanins.add(len(contributors))
+        for writer in contributors:
+            routes[writer].append(destination_core)
+    counts = {len(consumers) for consumers in routes.values()}
+    if 0 in counts or len(counts) != 1 or len(fanins) != 1:
+        raise ValueError("completed-reduction routes require uniform fanin and fanout")
+    return tuple((core, tuple(consumers)) for core, consumers in routes.items())
 
 
 def _single_write(op: ComputedBuffer, name: str) -> MemoryDep | None:
@@ -416,6 +505,8 @@ def _is_activation_source(
 def _unsupported_relayout_transition_reason(
     source_work_division: TensorWorkDivision,
     destination_work_division: TensorWorkDivision,
+    *,
+    completed_routes: bool = False,
 ) -> str | None:
     """Reject ownership changes that the identity-copy emitter cannot represent.
 
@@ -423,11 +514,13 @@ def _unsupported_relayout_transition_reason(
     when the two tensor work divisions differ. If distinct per-core views
     project to the same work division, codegen would lower the materialized
     copy as an ordinary identity and silently omit the required cross-core
-    movement. Dropping the optimization keeps consumers on the original,
-    correctly addressed buffer.
+    movement. Completed-result routes are the exception: equal per-core slice
+    requests still need a copy when only the listed sources hold finished data.
     """
 
-    if source_work_division.same_ownership(destination_work_division):
+    if not completed_routes and source_work_division.same_ownership(
+        destination_work_division
+    ):
         return (
             "cannot emit: distinct physical ownerships collapse to the same "
             "logical work division"
@@ -467,11 +560,28 @@ def collect_lx_relayout_plans(
             cache,
         )
         source_num_cores = _op_num_cores(producer)
+        reduction = (
+            completed_reduction_split_on_buf(producer, write, source_name)
+            if partial
+            else None
+        )
+        writers = (
+            completed_plain_reduction_writers(producer, write, source_name)
+            if partial
+            else None
+        )
         if (
             source_view is None
-            or partial
             or not representable
             or source_view.num_cores != source_num_cores
+            or (
+                partial
+                and (
+                    reduction is None
+                    or source_num_cores != config.sencores
+                    or (writers is None and not config.core_id_k_fast_emission)
+                )
+            )
         ):
             continue
 
@@ -533,7 +643,7 @@ def collect_lx_relayout_plans(
             if any(d.is_indirect() for d in deps):
                 rejection_reason = "cannot emit: consumer uses indirect access"
                 break
-            view, _, representable = _per_core_view_on_buf(
+            view, consumer_partial, representable = _per_core_view_on_buf(
                 consumer, dep, source_name, cache
             )
             consumer_num_cores = _op_num_cores(consumer)
@@ -543,7 +653,7 @@ def collect_lx_relayout_plans(
                     "cannot represent: consumer ownership is unrepresentable"
                 )
                 break
-            if consumer_num_cores < source_num_cores:
+            if consumer_num_cores < source_num_cores and reduction is None:
                 rejection_reason = (
                     "cannot emit: consumer uses fewer physical cores than producer"
                 )
@@ -566,16 +676,22 @@ def collect_lx_relayout_plans(
                 )
                 break
             consumer_space = iteration_space_from_op(consumer)
-            if view.same_partition(source_view):
+            if reduction is None and view.same_partition(source_view):
                 continue
             if is_matmul and len(deps) != 2:
                 rejection_reason = (
                     "cannot emit: matmul consumer does not have two inputs"
                 )
                 break
-            if not is_matmul and not isinstance(consumer.data, Pointwise):
+            # Split plain-reduction readers remain outside this admission change.
+            if not (
+                is_matmul
+                or isinstance(consumer.data, Pointwise)
+                or (isinstance(consumer.data, Reduction) and not consumer_partial)
+            ):
                 rejection_reason = (
-                    "cannot emit: consumer is neither pointwise nor matmul"
+                    "cannot emit: consumer is neither pointwise, matmul, "
+                    "nor an unsplit reduction"
                 )
                 break
 
@@ -585,12 +701,9 @@ def collect_lx_relayout_plans(
                     "cannot emit: grouped destination does not evenly "
                     "broadcast the source"
                 )
-            elif destination_owners < source_num_cores:
-                if not is_matmul:
-                    rejection_reason = (
-                        "cannot emit: grouped gather requires a matmul consumer"
-                    )
-                    break
+            elif reduction is None and destination_owners < source_num_cores:
+                # The copy assembles complete input values. Its ownership
+                # proof does not depend on what arithmetic reads them next.
                 failure = (
                     "cannot emit: grouped destination does not evenly contract "
                     "the source"
@@ -599,8 +712,19 @@ def collect_lx_relayout_plans(
                 failure = "cannot emit: unsupported ownership transfer"
 
             try:
-                supported = movement_supported(
-                    source_view, view, source_num_cores, consumer_num_cores
+                routes = (
+                    derive_completed_reduction_routes(
+                        source_view, view, reduction, writers=writers
+                    )
+                    if reduction is not None
+                    else ()
+                )
+                supported = (
+                    bool(routes)
+                    if reduction is not None
+                    else movement_supported(
+                        source_view, view, source_num_cores, consumer_num_cores
+                    )
                 )
             except (TypeError, ValueError) as exc:
                 rejection_reason = (
@@ -611,11 +735,11 @@ def collect_lx_relayout_plans(
                 rejection_reason = failure
                 break
             transfers.append(
-                (consumer_name, consumer_coordinates, consumer_space, view)
+                (consumer_name, consumer_coordinates, consumer_space, view, routes)
             )
 
         # Reuse the ownership comparison and preserve first-consumer order.
-        destinations: list[tuple[PerCoreView, int, list[str]]] = []
+        destinations: list[tuple[PerCoreView, int, tuple, list[str]]] = []
         if rejection_reason is None:
             # Both footprint checks are before placement: an invalid or
             # unsupported candidate size declines this optional relayout,
@@ -632,6 +756,7 @@ def collect_lx_relayout_plans(
                 consumer_coordinates,
                 consumer_space,
                 destination_view,
+                routes,
             ) in transfers:
                 try:
                     source_work_division = work_division_from_view(
@@ -668,7 +793,9 @@ def collect_lx_relayout_plans(
                         "LX relayout destination lost its certified physical ownership"
                     )
                 if reason := _unsupported_relayout_transition_reason(
-                    source_work_division, destination_work_division
+                    source_work_division,
+                    destination_work_division,
+                    completed_routes=bool(routes),
                 ):
                     rejection_reason = reason
                     break
@@ -681,15 +808,22 @@ def collect_lx_relayout_plans(
                         f"allocation: destination footprint is unavailable: {exc}"
                     )
                     break
-                for group_view, footprint, consumers in destinations:
-                    if footprint == destination_footprint and group_view.same_partition(
-                        destination_view
+                for group_view, footprint, group_routes, consumers in destinations:
+                    if (
+                        footprint == destination_footprint
+                        and group_routes == routes
+                        and group_view.same_partition(destination_view)
                     ):
                         consumers.append(consumer_name)
                         break
                 else:
                     destinations.append(
-                        (destination_view, destination_footprint, [consumer_name])
+                        (
+                            destination_view,
+                            destination_footprint,
+                            routes,
+                            [consumer_name],
+                        )
                     )
 
         if rejection_reason is None:
@@ -702,10 +836,12 @@ def collect_lx_relayout_plans(
                     num_cores=source_num_cores,
                     source_footprint_bytes=source_footprint,
                     destination_footprint_bytes=destination_footprint,
+                    producer_consumers=routes,
                 )
                 for (
                     destination_view,
                     destination_footprint,
+                    routes,
                     consumer_names,
                 ) in destinations
             )
@@ -735,7 +871,9 @@ def materialize_lx_relayouts(graph: GraphLowering, plans: list[LXRelayoutPlan]) 
         if plan.source_address is None or plan.destination_address is None:
             raise RuntimeError("LX relayout plan is missing an allocated address")
         source = cast(ComputedBuffer, graph.get_buffer(plan.source_name))
-        if plan.source_view.same_partition(plan.destination_view):
+        if not plan.producer_consumers and plan.source_view.same_partition(
+            plan.destination_view
+        ):
             raise RuntimeError("LX relayout plan has identical source and destination")
         source_layout = cast(FixedTiledLayout, source.layout)
         if (

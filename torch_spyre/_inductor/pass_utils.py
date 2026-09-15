@@ -58,6 +58,7 @@ from .core_mapping import (
     core_to_slice_mapping,
     decompose_fused_split_view,
     same_owner_maps,
+    owner_slots,
 )
 from .constants import (
     ELIDED_COPY_BACK_ATTR,
@@ -3509,7 +3510,7 @@ def _per_core_view_on_buf(
     op/edge should call those two directly to amortize the op-level precompute.
 
     Returns `(view, has_partial_reduction, representable)`. ``has_partial_reduction``
-    is True when the op has a reduction split (partial sums left on most cores);
+    is True when the op has a reduction split (not every core writes a result);
     callers act on it only for write-deps. ``representable`` is False only on the
     give-up cases (a split that slices this buffer can't be placed on a device
     dim), which cross-op comparisons must treat as a non-match. Pass `cache` to
@@ -3573,6 +3574,103 @@ def _per_core_view_on_buf(
     if cache is not None:
         cache[key] = result
     return result
+
+
+def supports_split_plain_reduction(op: Operation) -> bool:
+    """Plain reductions covered by the existing single-corelet SFP combine.
+
+    Keep loop-carried reductions and other reduction types on their existing
+    paths. A split within one reduction is not completion across loop tiles.
+    """
+    return (
+        not config.ktir_emitter
+        and isinstance(op, ComputedBuffer)
+        and isinstance(op.data, Reduction)
+        and op.data.reduction_type in ("max", "sum")
+        and op.data.get_dtype() == torch.float16
+        and len(op.data.reduction_ranges) == 1
+        and isinstance(op.data.reduction_ranges[0], (int, sympy.Integer))
+        and not getattr(op, "loop_info", None)
+    )
+
+
+def completed_reduction_split_on_buf(
+    op: Operation,
+    dep: MemoryDep,
+    buf_name: str,
+) -> int | None:
+    """Return a supported committed reduction split with a native combine.
+
+    The completed value is on the last reduction slice. Matmul also retains
+    its output-axis ambiguity check; plain max/sum use explicit writer cores.
+    """
+
+    is_matmul = _is_matmul_op(op)
+    if not is_matmul and not supports_split_plain_reduction(op):
+        return None
+    prep = _prepare_per_core_view(op, dep, buf_name)
+    ownership = getattr(op, "iteration_space_ownership", None)
+    if prep is None or ownership is None:
+        return None
+    reduction_splits = [
+        int(ownership.work_slices.get(sym, 1))
+        for sym in prep.iter_space
+        if prep.write_index.coeff(sym) == 0
+        and int(ownership.work_slices.get(sym, 1)) > 1
+    ]
+    if len(reduction_splits) != 1:
+        return None
+    if not is_matmul:
+        return reduction_splits[0]
+    if prep.stick_host_stride is None:
+        return None
+
+    # Matmul OUT is the output tensor's stick dimension; size-one OUT can
+    # have no loop symbol.
+    output_symbols = [
+        sym
+        for sym in prep.iter_space
+        if prep.write_index.coeff(sym) == prep.stick_host_stride
+    ]
+    if len(output_symbols) > 1:
+        return None
+    return reduction_splits[0]
+
+
+def completed_plain_reduction_writers(
+    op: Operation,
+    dep: MemoryDep,
+    buf_name: str,
+) -> tuple[int, ...] | None:
+    """Finished writers, by reduction slice rather than numerical core order.
+
+    DDL core_to_core_communication ends corelet 0 at slice K-1. Torch-Spyre
+    emits one corelet; SenDNN's two-corelet, opposite-endpoint rule is different.
+    """
+    if not supports_split_plain_reduction(op):
+        return None
+    prep = _prepare_per_core_view(op, dep, buf_name)
+    ownership = getattr(op, "iteration_space_ownership", None)
+    if prep is None or ownership is None:
+        return None
+    reduced = [
+        sym
+        for sym in prep.iter_space
+        if prep.write_index.coeff(sym) == 0 and ownership.work_slices.get(sym, 1) > 1
+    ]
+    if len(reduced) != 1:
+        return None
+    dim = reduced[0]
+    rows = owner_slots(
+        ownership.core_id_to_work_slice,
+        ownership.work_slices,
+        ownership.physical_core_count,
+    )
+    return tuple(
+        core
+        for core, row in enumerate(rows)
+        if row[dim] == ownership.work_slices[dim] - 1
+    )
 
 
 def format_operations(operations: list[Operation]) -> str:
