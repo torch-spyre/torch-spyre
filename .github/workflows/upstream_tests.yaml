@@ -91,7 +91,7 @@ jobs:
       - x86_64
       - spyre_pf_x0
       - linux
-      - image_spyre_backend
+      - ${{ (github.event_name == 'merge_group' && 'image_spyre_backend_mq') || 'image_spyre_backend' }}
     timeout-minutes: 40
     steps:
       - name: Checkout composite actions
@@ -128,7 +128,7 @@ jobs:
       - x86_64
       - spyre_pf_x1
       - linux
-      - image_spyre_backend
+      - ${{ (github.event_name == 'merge_group' && 'image_spyre_backend_mq') || 'image_spyre_backend' }}
     timeout-minutes: 60
     env:
       # The CI env var is very important.

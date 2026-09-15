@@ -489,35 +489,57 @@ def lower_bmm(x, y):
 
     reduction_numel = x_size[-1]  # K
 
-    if x_ndim == 3 and y_ndim == 3:
-        ranges = [x_size[0], x_size[1], y_size[2]]  # B, M, N
-
-        def inner_fn(index, reduction_index):
-            i0, i1, i2 = index
-            (r0,) = reduction_index
-            tmp1 = x_loader([i0, i1, r0])
-            tmp2 = y_loader([i0, r0, i2])
-            return (tmp1, tmp2)
-    elif x_ndim == 4 and y_ndim == 4:
-        ranges = [x_size[0], x_size[1], x_size[2], y_size[-1]]
-
-        def inner_fn(index, reduction_index):
-            i0, i1, i2, i3 = index
-            (r0,) = reduction_index
-            tmp1 = x_loader([i0, i1, i2, r0])
-            tmp2 = y_loader([i0, i1, r0, i3])
-            return (tmp1, tmp2)
-    elif x_ndim == 3 and y_ndim == 2:
-        ranges = [x_size[0], x_size[1], y_size[1]]  # B, M, N
-
-        def inner_fn(index, reduction_index):
-            i0, i1, i2 = index
-            (r0,) = reduction_index
-            tmp1 = x_loader([i0, i1, r0])
-            tmp2 = y_loader([r0, i2])
-            return (tmp1, tmp2)
-    else:
+    if x_ndim < 2 or y_ndim < 2:
         raise Unsupported(f"BMM with input shapes {x.get_size()} and {y.get_size()}")
+
+    if sympy.simplify(x_size[-1] - y_size[-2]) != 0:
+        raise Unsupported(f"BMM with input shapes {x.get_size()} and {y.get_size()}")
+
+    x_batch = list(x_size[:-2])
+    y_batch = list(y_size[:-2])
+    batch_rank = max(len(x_batch), len(y_batch))
+    x_batch = [sympy.Integer(1)] * (batch_rank - len(x_batch)) + x_batch
+    y_batch = [sympy.Integer(1)] * (batch_rank - len(y_batch)) + y_batch
+    batch_ranges = []
+    x_broadcast = []
+    y_broadcast = []
+    for x_dim, y_dim in zip(x_batch, y_batch):
+        if sympy.simplify(x_dim - y_dim) == 0:
+            batch_ranges.append(x_dim)
+            x_broadcast.append(False)
+            y_broadcast.append(False)
+        elif sympy.simplify(x_dim - 1) == 0:
+            batch_ranges.append(y_dim)
+            x_broadcast.append(True)
+            y_broadcast.append(False)
+        elif sympy.simplify(y_dim - 1) == 0:
+            batch_ranges.append(x_dim)
+            x_broadcast.append(False)
+            y_broadcast.append(True)
+        else:
+            raise Unsupported(
+                f"BMM with incompatible batch shapes {x.get_size()} and {y.get_size()}"
+            )
+
+    ranges = [*batch_ranges, x_size[-2], y_size[-1]]
+    x_leading_pad = batch_rank - (x_ndim - 2)
+    y_leading_pad = batch_rank - (y_ndim - 2)
+
+    def inner_fn(index, reduction_index):
+        *batch_index, row, column = index
+        (contraction,) = reduction_index
+        x_indices = [
+            sympy.Integer(0) if is_broadcast else batch_index[dim]
+            for dim, is_broadcast in enumerate(x_broadcast)
+        ][x_leading_pad:]
+        y_indices = [
+            sympy.Integer(0) if is_broadcast else batch_index[dim]
+            for dim, is_broadcast in enumerate(y_broadcast)
+        ][y_leading_pad:]
+        return (
+            x_loader([*x_indices, row, contraction]),
+            y_loader([*y_indices, contraction, column]),
+        )
 
     if reduction_numel == 1:
         # Reduction degenerates to a pointwise mul
@@ -1395,6 +1417,37 @@ def lower_restickify(x):
         dtype=x.get_dtype(),
         inner_fn=inner_fn,
         ranges=base.get_size(),
+        origin_node=V.get_current_node(),
+        traceback=x.get_traceback(),
+    )
+
+    pw.realize()
+    return pw
+
+
+@register_spyre_lowering(torch.ops.spyre.compact)
+def lower_compact(x):
+    # Just emit a pointwise op here. At this point we only know that
+    # 1) the host output layout should be the same as the host input layout
+    # 2) the device output layout should be the default for the host layout
+    # 3) we don't know the device input layout
+    #
+    # Later, during Opspec generation we have the input device layout and
+    # there we can decide to emit an identity or restickify and slice.
+
+    # Here we don't unwrap because we need to know what dimensions
+    # Pytorch is reasoning on.
+    x.realize()
+    loader = x.make_loader()
+
+    def inner_fn(index):
+        return loader(index)
+
+    pw = Pointwise.create(
+        device=x.get_device(),
+        dtype=x.get_dtype(),
+        inner_fn=inner_fn,
+        ranges=x.get_size(),
         origin_node=V.get_current_node(),
         traceback=x.get_traceback(),
     )

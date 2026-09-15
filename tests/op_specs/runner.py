@@ -153,11 +153,15 @@ def run_op_specs(
     """
     dev_tensors = to_device(tensors, layouts)
 
-    compiler = SpyreAsyncCompile()
+    async_compile = SpyreAsyncCompile()
     if ktir_emitter:
-        runner = compiler.ktir(name, list(ops))
+        scope = {"runner": async_compile.ktir(name, list(ops))}
     else:
-        runner = compiler.sdsc(name, list(ops), pool_size=pool_size)
+        scope = {"runner": async_compile.sdsc(name, list(ops), pool_size=pool_size)}
+    # sdsc hands back a future once DXP compiles in parallel; ktir returns the
+    # runner directly, and wait() leaves a non-future untouched.
+    async_compile.wait(scope)
+    runner = scope["runner"]
     code_dir = getattr(runner, "code_dir", None)
     print(f"artifacts: {code_dir}")
 

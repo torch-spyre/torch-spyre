@@ -513,6 +513,18 @@ def restickify(  # type: ignore[empty-body]
     pass
 
 
+@torch.library.custom_op("spyre::compact", mutates_args=(), device_types="spyre")
+def compact(  # type: ignore[empty-body]
+    x: torch.Tensor,
+) -> torch.Tensor:
+    pass
+
+
+@compact.register_fake
+def _(x: torch.Tensor) -> torch.Tensor:
+    return x.new_empty(x.size())
+
+
 @torch.library.custom_op("spyre::max_dim_int64_fallback", mutates_args=())
 def max_dim_int64_fallback(
     input: torch.Tensor, dim: int, keepdim: bool = False
@@ -693,7 +705,8 @@ def batched_matmul(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:  # type: i
 
 @batched_matmul.register_fake
 def _(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-    output_shape = list(x.shape[:-1]) + [y.shape[-1]]
+    batch_shape = torch.broadcast_shapes(x.shape[:-2], y.shape[:-2])
+    output_shape = [*batch_shape, x.shape[-2], y.shape[-1]]
     return x.new_empty(output_shape)
 
 
