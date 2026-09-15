@@ -33,10 +33,12 @@ from torch._inductor.virtualized import V
 
 from . import config
 from .constants import MATMUL_REDUCTION_OPS
+from .errors import Unsupported
 from .ir import FixedTiledLayout
 from .logging_utils import get_inductor_logger
 from .loop_info import CoarseTileInfo, ReadCopyElisionRecord, copy_op_metadata
 from .pass_utils import (
+    PerCoreView,
     _per_core_view_on_buf,
     device_coordinates,
     find_matmul_generated_var,
@@ -174,6 +176,54 @@ def _clone_direct_consumer(
     return direct_op
 
 
+def _views_match_through_read_coordinates(
+    staged_view: PerCoreView,
+    staged_size,
+    staged_coordinates,
+    direct_view: PerCoreView,
+    direct_size,
+    direct_coordinates,
+) -> bool:
+    """Compare different layouts only after proving their split-axis identity.
+
+    Both coordinate lists are reads traced in the SAME matmul iteration space.
+    For example H is axis 1 of [E,H,F/64,64], but axis 2 of
+    [1,F/64,H,64]. Raw device-axis numbers cannot be compared across buffers.
+    Require a unique equal coordinate AND extent, then retain the exact
+    per-core owner check on this common physical basis. No split count or
+    loop-position approximation is permitted.
+    """
+    if len(staged_size) != len(staged_coordinates) or len(direct_size) != len(
+        direct_coordinates
+    ):
+        return False
+    mapping: dict[int, int] = {}
+    for dim, _ in staged_view.work_slice_dims:
+        if not 0 <= dim < len(staged_size):
+            return False
+        matches = [
+            target
+            for target, coordinate in enumerate(direct_coordinates)
+            if sympy.simplify(staged_size[dim] - direct_size[target]) == 0
+            and sympy.simplify(staged_coordinates[dim] - coordinate) == 0
+        ]
+        if len(matches) != 1 or matches[0] in mapping.values():
+            return False
+        mapping[dim] = matches[0]
+    if set(dict(staged_view.core_to_slot)) != set(mapping):
+        return False
+    remapped = PerCoreView(
+        work_slice_dims=tuple(
+            sorted((mapping[dim], split) for dim, split in staged_view.work_slice_dims)
+        ),
+        core_to_slot=tuple(
+            sorted((mapping[dim], owner) for dim, owner in staged_view.core_to_slot)
+        ),
+        num_cores=staged_view.num_cores,
+    )
+    return per_core_views_equal(remapped, direct_view)
+
+
 def _prove_matmul_direct_read(
     consumer: ComputedBuffer,
     copy_op: ComputedBuffer,
@@ -306,7 +356,18 @@ def _prove_matmul_direct_read(
     # assigning different source slices to the same core.  The staging copy
     # is the behavior being replaced, so the direct HBM read must preserve
     # its exact physical core-to-slice map.
-    if not per_core_views_equal(copy_view, source_view):
+    try:
+        matching_owners = _views_match_through_read_coordinates(
+            copy_view,
+            copy_layout.device_layout.device_size,
+            device_coordinates(copy_layout.device_layout, copy_dep, None),
+            source_view,
+            source_layout.device_layout.device_size,
+            device_coordinates(source_layout.device_layout, weight_dep, None),
+        )
+    except Unsupported as exc:
+        return None, f"weight layout identity is not provable: {exc}"
+    if not matching_owners:
         return None, (
             "direct source ownership does not match the staged copy: "
             f"{source_view} != {copy_view}"
