@@ -216,7 +216,7 @@ ops; custom ops lower to SuperDSC; everything else falls back to the CPU.
    sequence of native or custom ops (e.g. `aten.addmm` →
    `matmul + scale + add`).
 4. **CPU fallback** — auto-transfer for the long tail (`embedding`,
-   `arange`, `sin`, `cos`, `tril`, `triu`, ...). Transparent, but
+   `arange`, `sin`, `cos`, `tril`, ...). Transparent, but
    off the hot path only.
 
 When debugging slow models, the first question to ask is whether
