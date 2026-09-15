@@ -121,6 +121,12 @@ pre_backend = stage:compile_fx:spyre_compile
 A process that compiles several graphs has one `spyre_compile` event per
 compile, so group by it rather than summing the whole record.
 
+`backend_compile` is recorded only when DXP runs in-process. Under
+`SPYRE_ASYNC_DXP_COMPILE=1` the compile happens in a pool worker, which does not
+share this recorder, so no `backend_compile` event is emitted and the
+subtraction above would charge the backend to the frontend. Measure with the
+parallel path off.
+
 ### Skipping the backend
 
 The backend compiler -- `dxp_standalone`, or `dbo-opt` under

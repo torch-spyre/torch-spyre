@@ -83,10 +83,20 @@ ktir_emitter: bool = os.environ.get("TORCH_SPYRE_KTIR", "0") == "1"
 # A .mlir declaring the target device, passed to the backend compiler.
 ktir_device_mlir: str = os.environ.get("KTIR_DEVICE_MLIR", "")
 
-# Enable certified LX ownership changes.
+# Enable certified LX ownership changes: movement, exact fused-axis views,
+# consumer-compatible producer order, and same-core restickify residency.
 # Set SPYRE_LX_PLANNER_RELAYOUT=0 to disable these optional optimizations, not
 # ownership validation. This does not change the allocator or LX memory budget.
 lx_planner_relayout: bool = os.getenv("SPYRE_LX_PLANNER_RELAYOUT", "1").lower() in (
+    "1",
+    "true",
+    "yes",
+)
+
+# Submit independent DXP kernel compilations to Inductor's subprocess pool and
+# resolve them together at the generated wrapper's async_compile.wait() barrier.
+# This is opt-in while the parallel path is evaluated on full model compiles.
+async_dxp_compile: bool = os.getenv("SPYRE_ASYNC_DXP_COMPILE", "0").lower() in (
     "1",
     "true",
     "yes",

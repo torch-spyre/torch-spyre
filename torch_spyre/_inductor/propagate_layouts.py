@@ -92,6 +92,7 @@ from .pass_utils import (
     try_device_coordinates,
     indirect_info_from_op,
     is_keep_by_index,
+    is_sparse_stl,
     is_stick_expr_offset_free,
     is_topk,
     iter_var_id,
@@ -350,6 +351,66 @@ def _check_supported_input_sticks(args: list[PropArg], op_label: str) -> None:
             )
 
 
+def _convert_reads_whole_input(
+    in_layout: FixedLayout,
+    output: FixedLayout,
+    dep: MemoryDep,
+    output_dep: MemoryDep,
+) -> bool:
+    """Whether a dtype conversion traverses its input exactly as it writes its output.
+
+    Only then may the conversion inherit the input buffer's
+    ``device_size``/``stride_map`` (rescaled for the new stick depth). When the
+    read is a *slice* of a wider buffer -- Gemma's ``q_norm``/``k_norm`` upcast
+    part of the fused QKV projection into a fresh, narrower per-head buffer --
+    the inherited row span belongs to the input buffer while the elements land
+    in a buffer with a different row stride. ``compute_coordinates`` then folds
+    that mismatch into the outer coordinate as ``Mod(a*var, b)`` with
+    ``a/b = row_out/row_in`` in lowest terms, which either falls outside the
+    normalization grammar (``a != 1``, a codegen-time hard error) or, worse, is
+    representable but addresses the wrong sticks (``a == 1``, silently wrong
+    results). Mirrors the identical-access test the general convert path uses,
+    minus the element-width condition -- rescaling the stick depth is exactly
+    what this path is for.
+    """
+    return (
+        list(in_layout.size) == list(output.size)
+        and dep.index == output_dep.index
+        and host_coordinates(in_layout, dep, None)
+        == host_coordinates(output, output_dep, None)
+    )
+
+
+def _qfp8ch_stl(stl: SpyreTensorLayout, out_dtype: torch.dtype) -> SpyreTensorLayout:
+    """Output layout of ``qfp8ch``: fp16 (64/stick) -> fp8 (128/stick) quantization.
+
+    Propagates the input device layout, preserving any padding, and rescales
+    the stick depth the way ``rescale_stl_for_dtype`` does, except that the
+    num-sticks dim rounds UP: an fp16 tensor whose stick-indexing dim holds an
+    odd number of 64-element sticks ends in one partially filled 128-element
+    fp8 stick. That is a legitimate layout for this op -- the fp8->fp16
+    conversion that consumes it rebuilds a dense layout from the host size,
+    treating the partial stick exactly like any other unaligned stick dim --
+    so it must never floor to a size-0 dim (issue #3604).
+    """
+    in_eps = stl.device_size[-1]
+    out_eps = get_elem_in_stick(out_dtype)
+    out_device_size = list(stl.device_size)
+    out_stride_map = list(stl.stride_map)
+    out_device_size[-1] = out_eps
+    for i, s in enumerate(stl.stride_map):
+        if s == in_eps:
+            out_device_size[i] = -(-(stl.device_size[i] * in_eps) // out_eps)
+            out_stride_map[i] = out_eps
+            break
+    return SpyreTensorLayout(
+        out_device_size,
+        out_stride_map,
+        get_device_dtype(out_dtype),
+        ElementArrangement.QFP8CH,
+    )
+
+
 def _qfp8wt_stl(
     output: FixedLayout,
     in_layout: FixedLayout,
@@ -505,11 +566,15 @@ def _single_arg_op_layout(
             # Two strategies, chosen by whether a staggered EA is involved:
             #
             # 1. Staggered conversions (RMSNorm up/down-cast and their
-            #    restoration: STANDARD<->DL16_TO_FP32 / FP32_TO_DL16). The
-            #    staggered element ordering only exists on the physical device
-            #    layout, so we must propagate the input's device_size/stride_map
-            #    and rescale just the stick depth via rescale_stl_for_dtype.
-            #    Reconstructing from the logical host size would lose it.
+            #    restoration: STANDARD<->DL16_TO_FP32 / FP32_TO_DL16) that
+            #    traverse the whole input. The staggered element ordering only
+            #    exists on the physical device layout, so propagate the input's
+            #    device_size/stride_map and rescale just the stick depth via
+            #    rescale_stl_for_dtype; reconstructing from the logical host size
+            #    would lose the stick choice a downstream reduction needs.
+            #    Inheriting is only sound for an identical access -- see
+            #    _convert_reads_whole_input; a sliced read falls through to (2),
+            #    which still stamps the staggered EA.
             #
             # 2. Plain conversions (e.g. fp8->fp16 after qfp8ch). Here the input
             #    device layout can be degenerate — qfp8ch rescales a size-1
@@ -518,7 +583,10 @@ def _single_arg_op_layout(
             #    changing the layout rank and downstream graph partitioning.
             #    Rebuild a clean dense layout from the output host size instead,
             #    as the general (non-EA) convert path does.
-            if fmt in STAGGERED_EAS or input_ea in STAGGERED_EAS:
+            staggered = fmt in STAGGERED_EAS or input_ea in STAGGERED_EAS
+            if staggered and _convert_reads_whole_input(
+                in_layout, output, dep, output_dep
+            ):
                 layouts = [rescale_stl_for_dtype(stl, output.dtype, fmt)]
 
                 # A conversion that creates a staggered EA must also expose
@@ -571,8 +639,10 @@ def _single_arg_op_layout(
         case spyreop.qfp8ch.default:
             # fp16 (64 elems/stick) -> fp8 (128 elems/stick) quantization.
             # Propagate the input device layout and rescale for the dtype change,
-            # preserving any padding present in the input STL.
-            return [rescale_stl_for_dtype(stl, output.dtype, ElementArrangement.QFP8CH)]
+            # preserving any padding present in the input STL. Not
+            # rescale_stl_for_dtype: an fp16 tensor with an odd stick count
+            # ends in a partially filled fp8 stick, which that helper rejects.
+            return [_qfp8ch_stl(stl, output.dtype)]
 
         case spyreop.qfp8wt.default:
             # fp16 -> fp8 weight quantization with 2D-stick layout [2, 64].
@@ -1682,6 +1752,49 @@ def _topk_layouts(
     return results
 
 
+def _compact_layout(
+    op: Operation,
+    output: FixedLayout,
+    output_dep: MemoryDep,
+    args: list[PropArg],
+) -> list[SpyreTensorLayout]:
+    """Layout for spyre::compact: output is the default dense STL."""
+
+    if len(args) != 1:
+        raise Unsupported(f"({op.get_name()}) requires exactly one input")
+
+    in_arg = args[0]
+    out_layouts = []
+
+    for in_stl in in_arg.layouts:
+        c_size = [concretize_expr(s) for s in output.size]
+        c_stride = [concretize_expr(s) for s in output.stride]
+
+        out_stl = SpyreTensorLayout(
+            c_size, c_stride, output.dtype, list(range(len(output.size)))
+        )
+
+        in_is_sparse = is_sparse_stl(in_stl)
+        out_is_sparse = is_sparse_stl(out_stl)
+
+        if not in_is_sparse:
+            assert not out_is_sparse
+
+        restick = len(in_stl.device_size) > 1 and in_is_sparse and not out_is_sparse
+
+        if restick:
+            out_stl = SpyreTensorLayout(
+                [in_stl.elems_per_stick()] + out_stl.device_size,
+                [c_stride[0] * c_size[0]] + out_stl.stride_map,
+                out_stl.device_dtype,
+            )
+
+        out_layouts.append(out_stl)
+
+    op.restick_cost_fn = AnyInNode.from_args()
+    return out_layouts
+
+
 def _keep_by_index_layouts(
     op: Operation,
     output: FixedLayout,
@@ -1827,6 +1940,9 @@ def compute_layouts(
                 f"views not supported for spyre.layernormnorm({in_layout.size})=>{output.size})"
             )
         return _layernormnorm_layout(op, output, output_dep, args)
+
+    if aten_op == spyreop.compact.default:
+        return _compact_layout(op, output, output_dep, args)
 
     if aten_op == aten.clone.default:
         # clone materializes a new buffer in a fixed row-major layout regardless of

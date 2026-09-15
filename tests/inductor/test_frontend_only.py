@@ -46,12 +46,18 @@ def _compile_one_kernel(tmp_path):
     Everything the mode is supposed to preserve -- bundle generation and kernel
     provenance -- is patched so the test can assert it still ran, and
     subprocess.run is patched so a test failure cannot invoke the real backend.
+
+    Pinned to the synchronous DXP path: patching this module's subprocess only
+    reaches an in-process compile, and the parent records no backend stage when
+    a worker runs DXP instead.
     """
     compiler = ac.SpyreAsyncCompile.__new__(ac.SpyreAsyncCompile)
+    compiler._pending_spyre_futures = []
     compiler._provenance_attempt_count = 0
     compiler._provenance_failure_count = 0
 
     with (
+        config.patch({"async_dxp_compile": False}),
         patch.object(ac, "get_output_dir", return_value=str(tmp_path)),
         patch.object(ac, "generate_bundle") as generate_bundle,
         patch.object(
@@ -72,6 +78,7 @@ def _compile_ktir_one_kernel(tmp_path):
     class as dxp_standalone, so the mode has to stop here too.
     """
     compiler = ac.SpyreAsyncCompile.__new__(ac.SpyreAsyncCompile)
+    compiler._pending_spyre_futures = []
     ktir_path = tmp_path / "fused_add_0.ktir"
     ktir_path.write_text("// ktir")
 
@@ -129,6 +136,7 @@ class TestKtirBoundary:
         import torch_spyre._inductor.codegen.ktir as ktir_module
 
         compiler = ac.SpyreAsyncCompile.__new__(ac.SpyreAsyncCompile)
+        compiler._pending_spyre_futures = []
         emitted = patch.object(ktir_module, "generate_ktir", return_value="// ktir")
         with (
             config.patch({"frontend_only": True, "timing": True}),
@@ -186,8 +194,8 @@ class TestBoundary:
             patch.object(ac, "allocate_compile_dir") as allocate,
             patch.object(ac, "commit_compile_dir") as commit,
         ):
-            runner, generate_bundle, _, subprocess_run, _ = (
-                _compile_one_kernel(tmp_path)
+            runner, generate_bundle, _, subprocess_run, _ = _compile_one_kernel(
+                tmp_path
             )
 
         lookup.assert_not_called()

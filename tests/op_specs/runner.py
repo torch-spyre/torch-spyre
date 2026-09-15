@@ -112,7 +112,10 @@ def run_op_specs(name: str, ops: list, tensors: list, layouts=None, pool_size=0)
     """
     dev_tensors = to_device(tensors, layouts)
 
-    runner = SpyreAsyncCompile().sdsc(name, list(ops), pool_size=pool_size)
+    async_compile = SpyreAsyncCompile()
+    scope = {"runner": async_compile.sdsc(name, list(ops), pool_size=pool_size)}
+    async_compile.wait(scope)
+    runner = scope["runner"]
     code_dir = getattr(runner, "code_dir", None)
     print(f"artifacts: {code_dir}")
 
