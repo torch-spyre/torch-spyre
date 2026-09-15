@@ -84,8 +84,6 @@ class TestForEachTileE2E(unittest.TestCase):
         ref = (X.half().float()) @ (Y.half().float())
         return X.half().to(DEVICE_NAME), Y.half().to(DEVICE_NAME), ref
 
-    # xfail: _hint_ranges_pos stub raises NotImplementedError pending Task 5's marker-map lookup
-    @unittest.expectedFailure
     def test_map_mode_split_m(self):
         X_spyre, Y_spyre, ref = self._operands()
 
@@ -134,8 +132,6 @@ class TestForEachTileE2E(unittest.TestCase):
             out.cpu().float(), ref, atol=self.ATOL, rtol=self.RTOL
         )
 
-    # xfail: _hint_ranges_pos stub raises NotImplementedError pending Task 5's marker-map lookup
-    @unittest.expectedFailure
     def test_carry_mode_online_softmax(self):
         """Carry mode: 3-leaf carry (m, denom, acc), online-softmax over K/V tiles.
 

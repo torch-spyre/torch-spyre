@@ -418,8 +418,6 @@ class TestSpliceWhileLoops(unittest.TestCase):
             graph.run(*args)
         return graph
 
-    # xfail: _hint_ranges_pos stub raises NotImplementedError pending Task 5's marker-map lookup
-    @unittest.expectedFailure
     def test_map_mode_group_gets_loop_info(self):
         from torch._inductor import ir
         from torch._inductor.virtualized import V
@@ -449,8 +447,6 @@ class TestSpliceWhileLoops(unittest.TestCase):
             for op in tiled_ops:
                 self.assertTrue(op.dim_hints, f"{op} missing synthesized dim_hints")
 
-    # xfail: _hint_ranges_pos stub raises NotImplementedError pending Task 5's marker-map lookup
-    @unittest.expectedFailure
     def test_carry_mode_group_gets_loop_info(self):
         from torch._inductor import ir
         from torch._inductor.virtualized import V
@@ -596,6 +592,117 @@ def test_tile_dim_marker_lowering_produces_distinct_operation():
         f"{len(marker_ops)} in {[type(o) for o in graph.operations]}"
     )
     assert marker_ops[0].tile_marker_dim == 1
+
+
+class TestConsumeTileDimMarkers(unittest.TestCase):
+    """_consume_tile_dim_markers: marker map + marker erasure."""
+
+    def _run_graph(self, fn, args):
+        """Lower fn(*args) through a fresh GraphLowering and return it.
+
+        Same pattern as TestSpliceWhileLoops._run_graph: calling
+        GraphLowering.run() directly on a standalone instance (rather than
+        driving a full torch.compile) stops short of codegen(), so
+        splice_while_loops -- a pre-scheduling pass that only runs from
+        _update_scheduler during codegen() -- never fires. That leaves the
+        WhileLoop op intact in graph.operations for this test to splice
+        itself and inspect the intermediate (post-splice, pre-marker-
+        consumption) state, which a full torch.compile capture cannot do:
+        by the time such a capture's own GraphLowering.run returns, the
+        real pipeline has already spliced AND consumed markers on the same
+        graph object, leaving no WhileLoop for the test to find.
+        """
+        from torch._inductor.graph import GraphLowering
+
+        from tests.inductor.for_each_tile_fixtures import capture_post_grad_while_loop
+
+        _out, gm = capture_post_grad_while_loop(fn, args)
+
+        fake_mode = None
+        for node in gm.graph.nodes:
+            val = node.meta.get("val") if hasattr(node, "meta") else None
+            candidate = getattr(val, "fake_mode", None)
+            if candidate is not None:
+                fake_mode = candidate
+                break
+        assert fake_mode is not None, "could not recover a fake_mode from gm node.meta"
+
+        graph = GraphLowering(
+            gm, example_inputs=list(args), shape_env=fake_mode.shape_env
+        )
+        with V.set_graph_handler(graph), V.set_fake_mode(fake_mode):
+            graph.run(*args)
+        return graph
+
+    def test_marker_erased_and_mapped_after_split_m_splice(self):
+        from torch._inductor import ir
+
+        from torch_spyre._inductor.wsr.for_each_tile_lowering import (
+            _body_loop_var,
+            _consume_tile_dim_markers,
+            _stacking_carry_indices,
+            try_prove_for_each_tile,
+        )
+        from torch_spyre._inductor.wsr.while_loop_bridge import (
+            carry_bindings_for,
+            splice_while_loop,
+        )
+
+        (X, Y), _ref = matmul_inputs()
+        graph = self._run_graph(split_m_fn, (X, Y))
+
+        while_ops = [op for op in graph.operations if isinstance(op, ir.WhileLoop)]
+        self.assertEqual(len(while_ops), 1)
+        while_op = while_ops[0]
+
+        result = try_prove_for_each_tile(while_op)
+        self.assertTrue(result.accepted)
+        loop_var = _body_loop_var(while_op)
+        self.assertIsNotNone(loop_var)
+
+        with V.set_graph_handler(graph):
+            carries = carry_bindings_for(
+                while_op, _stacking_carry_indices(while_op, loop_var)
+            )
+            group_ops = splice_while_loop(
+                graph, while_op, carries, trip_count=result.trip_count
+            )
+
+            # lower_tile_dim_marker (lowering.py) stamps tile_marker_dim
+            # directly on the realized ComputedBuffer -- the exact object
+            # that ends up as this `op` in group_ops/graph.operations -- not
+            # on `op.data` (that is one level deeper: the Pointwise/
+            # Reduction IR expression, which never carries it). Matches the
+            # getattr(op, "tile_marker_dim", None) convention
+            # TestLowerTileDimMarker already uses above.
+            marker_dims_before = [
+                op.tile_marker_dim
+                for op in group_ops
+                if getattr(op, "tile_marker_dim", None) is not None
+            ]
+            self.assertTrue(
+                marker_dims_before, "expected at least one tile_marker_dim-tagged op"
+            )
+
+            marker_map = _consume_tile_dim_markers(group_ops, graph.operations)
+
+            self.assertTrue(
+                marker_map, "expected a non-empty (consumer_op, dep) -> dim map"
+            )
+            self.assertTrue(
+                all(isinstance(dim, int) for dim in marker_map.values()),
+            )
+
+            remaining_markers = [
+                op
+                for op in graph.operations
+                if getattr(op, "tile_marker_dim", None) is not None
+            ]
+            self.assertEqual(
+                remaining_markers,
+                [],
+                "marker ops must be erased from graph.operations after consumption",
+            )
 
 
 if __name__ == "__main__":

@@ -411,6 +411,17 @@ _SPYRE_METADATA_ATTRS = (
     # One immutable record shared by a for_each_tile carry's persistent
     # storage and its in-loop update operation.
     "_loop_carry_record",
+    # Ground-truth tiled-dim tag stamped by lower_tile_dim_marker
+    # (lowering.py) on a for_each_tile tile read; consumed and erased by
+    # _consume_tile_dim_markers (for_each_tile_lowering.py). Must survive
+    # while_loop_bridge.splice_while_loop's own redirect_computed_buffer_
+    # reads calls (e.g. "redirect while_loop carry/tile reads to persistent
+    # scratch"), which reconstruct the marker op before
+    # _consume_tile_dim_markers ever sees it -- confirmed empirically: the
+    # marker attribute was silently dropped there before this attr was
+    # added to this tuple, because copy_op_metadata only copies attrs
+    # listed here.
+    "tile_marker_dim",
 )
 
 
