@@ -565,7 +565,14 @@ def _pattern_param_sets():
         out[f"{key}_eager"] = (variant, "eager", *tensor_args)
         out[f"{key}_compiled"] = (variant, "compiled", *tensor_args)
 
-    torch.manual_seed(0xAFFE)
+    # Seed only the CPU generator: torch.manual_seed() seeds every registered
+    # device (including Spyre), which triggers Spyre's __getattr__-driven
+    # _lazy_init() at class-definition time -- i.e. during pytest
+    # --collect-only, before any real device work is requested. All shapes
+    # below come from cached_randn(), which draws from its own per-call
+    # torch.Generator (see utils_inductor.cached_randn) and never touches the
+    # default generator, so this seed is a no-op for them either way.
+    torch.default_generator.manual_seed(0xAFFE)
 
     qa = cached_randn((2, 8, 128, 64), dtype=torch.float16, differentiation=1)
     ka = cached_randn((2, 8, 128, 64), dtype=torch.float16, differentiation=2)
@@ -771,7 +778,14 @@ def _build_fp32_proxy_cpu_refs(
 
 
 class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
-    torch.manual_seed(0xAFFE)  # seeds cached_randn/cached_xavier calls in PARAMS below
+    # PARAMS below is built from cached_randn()/cached_xavier(), both of which
+    # seed their own torch.Generator per call (see utils_inductor.py) and
+    # ignore the default/global generator, so no seeding is needed here --
+    # setUp() below reseeds for whatever each test body does with the global
+    # generator at run time. A bare torch.manual_seed(0xAFFE) at class-body
+    # scope used to sit here; removed because it seeds every registered
+    # device (including Spyre), triggering Spyre's _lazy_init() at
+    # class-definition time, i.e. during pytest --collect-only.
 
     def setUp(self):
         super().setUp()

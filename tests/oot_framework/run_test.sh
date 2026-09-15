@@ -2222,11 +2222,24 @@ _run_parallel_across_cards() {
             set +euo pipefail
             export SPYRE_TEST_FILE="$_rf"
             export OOT_TEST_FILE="$_rf"
+            # Tells torch_spyre to skip real device init on torch.manual_seed()
+            # (a common module/class-body idiom in any PyTorch test file,
+            # upstream ones included) -- otherwise it lazy-inits the Spyre
+            # runtime here, with no SPYRE_DEVICES set to say which physical
+            # card to open, and start_runtime() fails looking for a PCIe
+            # address in /dev/vfio. See torch_spyre/__init__.py's
+            # _OOT_COLLECT_ONLY.
+            export OOT_COLLECT_ONLY=1
             # Give this probe its own Inductor cache dir so concurrent collect-only imports can't race on the same shutil.rmtree() target (see the identical fix for the per-card execution subshells below).
             _probe_base_cache="${TORCHINDUCTOR_CACHE_DIR:-/tmp/torchinductor_${USER:-$(id -un)}}"
-            # Bucketed by the same concurrency bound as the probe throttle, not by file, so the directory count stays fixed instead of growing with the file list.
-            _probe_slot=$(( i % _n_cards ))
-            export TORCHINDUCTOR_CACHE_DIR="${_probe_base_cache}__collect_slot${_probe_slot}"
+            # Keyed by file index i (unique per file), not by slot (i % _n_cards).
+            # A slot-keyed dir is reused by the next probe scheduled into that
+            # slot as soon as the concurrency throttle admits it, racing that
+            # probe's cache import against the previous occupant's teardown
+            # rmtree() of the same directory -- Inductor-heavy files hit this
+            # at _n_cards >= 2. Matches the retry probe below, which already
+            # keys its own cache dir by file index.
+            export TORCHINDUCTOR_CACHE_DIR="${_probe_base_cache}__collect_${i}"
             cd "$_rd" && python3 -m pytest "$_rb" \
                 "${_collect_args[@]+"${_collect_args[@]}"}" \
                 --collect-only -q --no-header 2>"$_cerr" \
@@ -2274,6 +2287,8 @@ _run_parallel_across_cards() {
                     set +euo pipefail
                     export SPYRE_TEST_FILE="$_rf2"
                     export OOT_TEST_FILE="$_rf2"
+                    # Same reason as the main probe above -- see _OOT_COLLECT_ONLY in torch_spyre/__init__.py.
+                    export OOT_COLLECT_ONLY=1
                     # A dedicated cache dir for the retry too, so it can't collide with whatever else is still running.
                     export TORCHINDUCTOR_CACHE_DIR="${TORCHINDUCTOR_CACHE_DIR:-/tmp/torchinductor_${USER:-$(id -un)}}__retry_${i}"
                     cd "$(dirname "$_rf2")" && python3 -m pytest "$(basename "$_rf2")" \

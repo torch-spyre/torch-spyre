@@ -26,6 +26,20 @@ from . import profiler
 
 _runtime_init_lock = threading.Lock()
 
+# Set by the OOT test framework's `pytest --collect-only` probes (see
+# tests/oot_framework/run_test.sh), which deliberately run without
+# SPYRE_DEVICES / real hardware since collection needs none. A bare
+# `torch.manual_seed(N)` -- one of the most common lines in any PyTorch test
+# file, ours or upstream -- reaches here via torch's own
+# _seed_custom_device(), which calls manual_seed_all() on every registered
+# accelerator unconditionally, including at plain module/class-body scope
+# (i.e. at import time, before any test runs). Letting that lazy-init the
+# Spyre runtime during collection tries to open a real VFIO device with no
+# SPYRE_DEVICES to say which one, and fails. Skipping the reseed here is
+# safe: no computation happens during collection, and the actual test run
+# (a separate pytest invocation, with SPYRE_DEVICES set) reseeds properly.
+_OOT_COLLECT_ONLY = os.getenv("OOT_COLLECT_ONLY") == "1"
+
 
 class _SpyreImpl:
     def __init__(self):
@@ -81,6 +95,8 @@ class _SpyreImpl:
         return self._in_bad_fork
 
     def manual_seed(self, seed: int, device: int | None = None) -> None:
+        if _OOT_COLLECT_ONLY:
+            return
         self._lazy_init()
         _C = self._C
 
@@ -89,6 +105,8 @@ class _SpyreImpl:
         default_generator.manual_seed(seed)
 
     def manual_seed_all(self, seed: int) -> None:
+        if _OOT_COLLECT_ONLY:
+            return
         self._lazy_init()
         _C = self._C
 
