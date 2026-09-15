@@ -87,6 +87,7 @@ class SDSCArgs:
     arg_index: int = -1
     is_index_tensor: bool = False
     related_value_tensor_idx: int = -1
+    index_tensor_dim_order: list[Symbol] | None = None
     device_tile_advance_expr: Expr | None = None
 
     def __str__(self) -> str:
@@ -1377,8 +1378,10 @@ def _create_sdsc_tensors(
             else:
                 physical_axis = None
 
-            if has_indirect_access and (
-                i in index_tensor_indices or is_indirect_value_tensor(arg)
+            if (
+                has_indirect_access
+                and (i in index_tensor_indices or is_indirect_value_tensor(arg))
+                and dim not in reduced_dims
             ):
                 scales[dim] = 1
             elif dim in reduced_dims and op_spec.op != "layernormscale":
@@ -1612,6 +1615,24 @@ def _create_sdsc_tensors(
             get_value_tensor_idx_for_index(op_spec, i) if is_idx_tensor else -1
         )
 
+        # For value tensors, store the index tensor's dim_order so per-core
+        # addressing only includes dims that are actually indexed
+        index_dim_order_for_value = None
+        if (
+            has_indirect_access
+            and related_val_idx < 0
+            and i not in index_tensor_indices
+        ):
+            # This might be a value tensor; find which index tensor uses it
+            for idx_i in index_tensor_indices:
+                if get_value_tensor_idx_for_index(op_spec, idx_i) == i:
+                    # Found the index tensor; store its dim_order
+                    index_tensor_arg = op_spec.args[idx_i]
+                    index_dim_order_for_value, _ = _get_device_dim_order(
+                        index_tensor_arg, symbol_mapping, op_spec, tensor_position=idx_i
+                    )
+                    break
+
         sdsc_arg = SDSCArgs(
             layout=label,
             dim_order=dim_order,
@@ -1626,6 +1647,7 @@ def _create_sdsc_tensors(
             arg_index=arg.arg_index,
             is_index_tensor=is_idx_tensor,
             related_value_tensor_idx=related_val_idx,
+            index_tensor_dim_order=index_dim_order_for_value,
             device_tile_advance_expr=arg.device_tile_advance_expr,
         )
         if arg.work_division is not None:
@@ -2176,32 +2198,6 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
         _extend_matmul_k_to_padded(op_spec, sdsc_iteration_space, symbol_mapping)
     elif is_restickify:
         _extend_restickify_to_padded(op_spec, sdsc_iteration_space, symbol_mapping)
-
-    # Grow the index-entry iteration to the padded output device_size so a
-    # partial-last-stick gather splits stick-aligned across cores. The output's
-    # entry-dim device_size was rounded up to the index stick multiple at layout
-    # time (enforce_indirect_access_layout); match the SDSC iteration to it BEFORE
-    # _create_sdsc_tensors so the output's per-core base stride is computed from
-    # the padded (stick-aligned) size rather than the shorter logical count.
-    # Otherwise the per-core base lands element-aligned (mid-stick) and the split
-    # miscompiles. No-op unless the output was actually padded (device_size >
-    # iteration), i.e. only for the multi-core partial-stick case.
-    if has_indirect_access and _spyre_config.sencores > 1:
-        idx_arg = op_spec.args[next(iter(index_tensor_indices))]
-        idx_stick = idx_arg.device_coordinates[-1]
-        if len(idx_stick.free_symbols) == 1:
-            entry_c = next(iter(idx_stick.free_symbols))
-            out_arg = op_spec.args[-1]
-            for pos, coord in enumerate(out_arg.device_coordinates[:-1]):
-                if coord.free_symbols == {entry_c}:
-                    entry_mb = symbol_mapping.get(entry_c)
-                    dev = int(out_arg.device_size[pos])
-                    if (
-                        entry_mb in sdsc_iteration_space
-                        and dev > sdsc_iteration_space[entry_mb]
-                    ):
-                        sdsc_iteration_space[entry_mb] = dev
-                    break
 
     # For topk: if all output dims are in the input, add a missing dimension.
     injected_dims = {"mb_sym": mb_sym} if mb_sym else {}

@@ -186,8 +186,26 @@ def core_idx_to_slice_offset(
     work_slices: dict,
 ) -> int:
     offset = sum(arg.offsets.values())
+    # Check if this is an indirect value tensor (has index_tensor_dim_order set)
+    is_value_tensor = getattr(arg, "index_tensor_dim_order", None) is not None
+
+    # For indirect value tensors, only unbounded dims (non-paged) vary address
+    max_dim_sizes = getattr(arg, "max_dim_sizes", None)
+    # Build a lookup by string name in case Symbol identity doesn't match
+    max_dim_sizes_by_str = {}
+    if max_dim_sizes and is_value_tensor:
+        for dim_sym, size in max_dim_sizes.items():
+            max_dim_sizes_by_str[str(dim_sym)] = size
+
     for dim, stride in arg.strides.items():
         if str(dim) in wk_slice and arg.scales[dim] > 0:
+            # For indirect value tensors, skip bounded dims (paged dimensions)
+            if is_value_tensor and max_dim_sizes_by_str:
+                dim_str = str(dim)
+                if dim_str in max_dim_sizes_by_str:
+                    # Skip bounded dims (they don't change per-core address)
+                    if max_dim_sizes_by_str[dim_str] > -1:
+                        continue
             offset += wk_slice[str(dim)] * stride // work_slices[dim]
     return offset
 
