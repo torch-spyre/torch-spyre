@@ -494,32 +494,8 @@ class Term:
     dim_size: sympy.Expr
     offset: sympy.Expr = sympy.S.Zero  # offset
 
-
-def normalize_coordinates(
-    var_ranges: dict[sympy.Symbol, sympy.Expr],
-    size: Sequence[sympy.Expr],
-    coordinates: Sequence[sympy.Expr],
-    synthetic_var_fn: Callable[[], sympy.Symbol],
-    indirect_sizes: "dict[sympy.Symbol, int] | None" = None,
-    compare_value: Callable[[sympy.Expr], int | float] = _concretize_for_cmp,
-) -> list[Term]:
-    """
-    Normalize coordinate expressions obtained from compute_coordinates.
-
-    If mod is absent from term assume term does not overflow dim_size.
-    Assume num or den is 1.
-
-    Break each expression into list of terms.
-    If expr has no mod, use var_range instead.
-
-    Split dimension into n dimensions if expression has n>1 terms.
-    Split dim_size into n according to iteration range of each term.
-    Fuse contiguous dimensions if corresponding terms can be fused.  Size-1
-    device dims with a constant zero coordinate are dropped, and do not stop
-    the dims on either side of them from fusing.
-    """
-
-    def normalize_var_expr(term, var, var_range, dim_size):
+    @staticmethod
+    def from_coordinate(term, var, var_range, dim_size):
         """Convert one single-variable coordinate term to ``Term``.
 
         ``Mod(FloorDiv(var, divisor), radix)`` is one digit of a
@@ -564,6 +540,31 @@ def normalize_coordinates(
             modulus,
             dim_size,
         )
+
+
+def normalize_coordinates(
+    var_ranges: dict[sympy.Symbol, sympy.Expr],
+    size: Sequence[sympy.Expr],
+    coordinates: Sequence[sympy.Expr],
+    synthetic_var_fn: Callable[[], sympy.Symbol],
+    indirect_sizes: "dict[sympy.Symbol, int] | None" = None,
+    compare_value: Callable[[sympy.Expr], int | float] = _concretize_for_cmp,
+) -> list[Term]:
+    """
+    Normalize coordinate expressions obtained from compute_coordinates.
+
+    If mod is absent from term assume term does not overflow dim_size.
+    Assume num or den is 1.
+
+    Break each expression into list of terms.
+    If expr has no mod, use var_range instead.
+
+    Split dimension into n dimensions if expression has n>1 terms.
+    Split dim_size into n according to iteration range of each term.
+    Fuse contiguous dimensions if corresponding terms can be fused.  Size-1
+    device dims with a constant zero coordinate are dropped, and do not stop
+    the dims on either side of them from fusing.
+    """
 
     # terms in non-increasing stride order
     terms = []
@@ -612,7 +613,7 @@ def normalize_coordinates(
 
             # extract term for each var
             term = expr.xreplace({v: 0 for v in vars - {var}}) - offset
-            dim_terms.append(normalize_var_expr(term, var, var_range, dim_size))
+            dim_terms.append(Term.from_coordinate(term, var, var_range, dim_size))
         # sort dim_terms in increasing (num, mod) order so that z + offset
         # vars (num=1, mod=1) always sort before real iteration vars (num=1, mod=N)
         # when num is equal

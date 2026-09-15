@@ -13,45 +13,49 @@
 # limitations under the License.
 
 
+import logging
+import math
+import threading
 from contextlib import contextmanager
+from typing import Any, Callable, Union
 from warnings import warn
 
 import sympy
 import torch
-
-from torch._inductor.ir import Reduction, Pointwise, StorageBox
-import torch._inductor.lowering as lowering
 import torch._inductor.ir as ir
-from typing import Any, Callable, Union
+import torch._inductor.lowering as lowering
+from torch._inductor.ir import Pointwise, Reduction, StorageBox
+from torch._inductor.virtualized import V
+from torch.utils._ordered_set import OrderedSet
 
+import torch_spyre._inductor.customops  # noqa: F401
+from torch_spyre._C import get_elem_in_stick
+from torch_spyre.ops.fallbacks import fallback_ops
+
+from . import config
 from .constants import (
     AVGPOOL2D_OP,
+    BATCH_MATMUL_FP8_OP,
     BATCH_MATMUL_OP,
     CONV2D_FWD_OP,
     COPY_BACK_CANDIDATE_ATTR,
-    BATCH_MATMUL_FP8_OP,
     DEPTHWISE_CONV2D_OP,
+    FP8_E4M3FN_MAX,
+    QUANTSCALEPERTOKENFP8_CLIP_MAX,
+    QUANTSCALEPERTOKENFP8_CLIP_MIN,
+    QUANTSCALEPERTOKENFP8_OP,
 )
-from . import config
-import torch_spyre._inductor.customops  # noqa: F401
-import torch_spyre._inductor.distributed.spyre_library  # noqa: F401
-from torch_spyre.ops.fallbacks import fallback_ops
+from .errors import Unsupported
 from .ir import (
-    SpyreReduction,
-    SpyreConstantFallback,
-    SpyreEmptyFallback,
-    BroadcastAsyncFallback,
-    WaitWorkFallback,
     AllGatherAsyncFallback,
     AllReduceAsyncFallback,
+    BroadcastAsyncFallback,
+    SpyreConstantFallback,
+    SpyreEmptyFallback,
+    SpyreReduction,
+    WaitWorkFallback,
 )
-from torch_spyre._C import get_elem_in_stick
-from torch._inductor.virtualized import V
-from torch.utils._ordered_set import OrderedSet
-from .errors import Unsupported
-import threading
 from .logging_utils import get_inductor_logger
-import logging
 
 logger = get_inductor_logger("lowering")
 
@@ -485,35 +489,57 @@ def lower_bmm(x, y):
 
     reduction_numel = x_size[-1]  # K
 
-    if x_ndim == 3 and y_ndim == 3:
-        ranges = [x_size[0], x_size[1], y_size[2]]  # B, M, N
-
-        def inner_fn(index, reduction_index):
-            i0, i1, i2 = index
-            (r0,) = reduction_index
-            tmp1 = x_loader([i0, i1, r0])
-            tmp2 = y_loader([i0, r0, i2])
-            return (tmp1, tmp2)
-    elif x_ndim == 4 and y_ndim == 4:
-        ranges = [x_size[0], x_size[1], x_size[2], y_size[-1]]
-
-        def inner_fn(index, reduction_index):
-            i0, i1, i2, i3 = index
-            (r0,) = reduction_index
-            tmp1 = x_loader([i0, i1, i2, r0])
-            tmp2 = y_loader([i0, i1, r0, i3])
-            return (tmp1, tmp2)
-    elif x_ndim == 3 and y_ndim == 2:
-        ranges = [x_size[0], x_size[1], y_size[1]]  # B, M, N
-
-        def inner_fn(index, reduction_index):
-            i0, i1, i2 = index
-            (r0,) = reduction_index
-            tmp1 = x_loader([i0, i1, r0])
-            tmp2 = y_loader([r0, i2])
-            return (tmp1, tmp2)
-    else:
+    if x_ndim < 2 or y_ndim < 2:
         raise Unsupported(f"BMM with input shapes {x.get_size()} and {y.get_size()}")
+
+    if sympy.simplify(x_size[-1] - y_size[-2]) != 0:
+        raise Unsupported(f"BMM with input shapes {x.get_size()} and {y.get_size()}")
+
+    x_batch = list(x_size[:-2])
+    y_batch = list(y_size[:-2])
+    batch_rank = max(len(x_batch), len(y_batch))
+    x_batch = [sympy.Integer(1)] * (batch_rank - len(x_batch)) + x_batch
+    y_batch = [sympy.Integer(1)] * (batch_rank - len(y_batch)) + y_batch
+    batch_ranges = []
+    x_broadcast = []
+    y_broadcast = []
+    for x_dim, y_dim in zip(x_batch, y_batch):
+        if sympy.simplify(x_dim - y_dim) == 0:
+            batch_ranges.append(x_dim)
+            x_broadcast.append(False)
+            y_broadcast.append(False)
+        elif sympy.simplify(x_dim - 1) == 0:
+            batch_ranges.append(y_dim)
+            x_broadcast.append(True)
+            y_broadcast.append(False)
+        elif sympy.simplify(y_dim - 1) == 0:
+            batch_ranges.append(x_dim)
+            x_broadcast.append(False)
+            y_broadcast.append(True)
+        else:
+            raise Unsupported(
+                f"BMM with incompatible batch shapes {x.get_size()} and {y.get_size()}"
+            )
+
+    ranges = [*batch_ranges, x_size[-2], y_size[-1]]
+    x_leading_pad = batch_rank - (x_ndim - 2)
+    y_leading_pad = batch_rank - (y_ndim - 2)
+
+    def inner_fn(index, reduction_index):
+        *batch_index, row, column = index
+        (contraction,) = reduction_index
+        x_indices = [
+            sympy.Integer(0) if is_broadcast else batch_index[dim]
+            for dim, is_broadcast in enumerate(x_broadcast)
+        ][x_leading_pad:]
+        y_indices = [
+            sympy.Integer(0) if is_broadcast else batch_index[dim]
+            for dim, is_broadcast in enumerate(y_broadcast)
+        ][y_leading_pad:]
+        return (
+            x_loader([*x_indices, row, contraction]),
+            y_loader([*y_indices, contraction, column]),
+        )
 
     if reduction_numel == 1:
         # Reduction degenerates to a pointwise mul
@@ -1489,6 +1515,37 @@ def lower_restickify(x):
     return pw
 
 
+@register_spyre_lowering(torch.ops.spyre.compact)
+def lower_compact(x):
+    # Just emit a pointwise op here. At this point we only know that
+    # 1) the host output layout should be the same as the host input layout
+    # 2) the device output layout should be the default for the host layout
+    # 3) we don't know the device input layout
+    #
+    # Later, during Opspec generation we have the input device layout and
+    # there we can decide to emit an identity or restickify and slice.
+
+    # Here we don't unwrap because we need to know what dimensions
+    # Pytorch is reasoning on.
+    x.realize()
+    loader = x.make_loader()
+
+    def inner_fn(index):
+        return loader(index)
+
+    pw = Pointwise.create(
+        device=x.get_device(),
+        dtype=x.get_dtype(),
+        inner_fn=inner_fn,
+        ranges=x.get_size(),
+        origin_node=V.get_current_node(),
+        traceback=x.get_traceback(),
+    )
+
+    pw.realize()
+    return pw
+
+
 @register_spyre_lowering(torch.ops.aten.full.default, type_promotion_kind=None)
 def lower_full(size, fill_value, dtype=None, layout=None, device=None, pin_memory=None):
     assert layout in (torch.strided, None), f"doesn't support layout={layout}"
@@ -1940,6 +1997,79 @@ def lower_qfp8wt(x):
     )
     pw.realize()
     return pw
+
+
+@register_spyre_lowering(torch.ops.spyre.quantscalepertokenfp8)
+def lower_quantscalepertokenfp8(x, scale_ub=FP8_E4M3FN_MAX):
+    """
+    Lower quantscalepertokenfp8 as a Reduction operation.
+
+    Maps to the deeptools ``quantscalepertokenfp8`` fused operator.
+    Uses standard reduction inner_fn pattern like exx2 and mean.
+
+    Constants forwarded to the deeptools operator:
+    - mulConst: 1/scale_ub, passed as a float and FP16-encoded by generate_constant_info
+    - clipMin: QUANTSCALEPERTOKENFP8_CLIP_MIN (1.1920928955078125e-07), float, FP16-encoded
+    - clipMax: QUANTSCALEPERTOKENFP8_CLIP_MAX (float32 max), float, FP16-encodes to 32255 / 0x7DFF
+    """
+    if x.get_size() == [] or len(x.get_size()) < 1:
+        raise ValueError(
+            "quantscalepertokenfp8 requires input with at least 1 dimension "
+            "(the hidden dim to reduce), got a scalar (ndim=0)."
+        )
+
+    # Validate scale_ub: must be a finite positive value whose reciprocal
+    # (mulConst = 1/scale_ub) is representable as a non-zero SEN169_FP16 value.
+    # SEN169_FP16 range mirrors FP16: [6.104e-5, 65504.0], so scale_ub must be
+    # in [1/65504, 1/6.104e-5] i.e. [~1.53e-5, 16384.0].
+    _fp16_max = torch.finfo(torch.float16).max  # 65504.0
+    _fp16_tiny = torch.finfo(torch.float16).tiny  # 6.103515625e-05
+
+    if not math.isfinite(scale_ub):
+        raise ValueError(
+            f"scale_ub must be a finite number, got {scale_ub}. "
+            f"Typical value is FP8_E4M3FN_MAX ({FP8_E4M3FN_MAX})"
+        )
+    if scale_ub <= 0:
+        raise ValueError(
+            f"scale_ub must be positive, got {scale_ub}. "
+            f"Typical value is FP8_E4M3FN_MAX ({FP8_E4M3FN_MAX})"
+        )
+    _mul_const_fp32 = 1.0 / scale_ub
+    if _mul_const_fp32 > _fp16_max:
+        raise ValueError(
+            f"scale_ub={scale_ub} is too small: mulConst = 1/scale_ub = {_mul_const_fp32} "
+            f"overflows FP16 (max {_fp16_max}). Minimum scale_ub is 1/{_fp16_max} ≈ {1.0 / _fp16_max:.3e}."
+        )
+    if _mul_const_fp32 < _fp16_tiny:
+        raise ValueError(
+            f"scale_ub={scale_ub} is too large: mulConst = 1/scale_ub = {_mul_const_fp32} "
+            f"underflows FP16 (smallest normal {_fp16_tiny}). Maximum scale_ub is 1/{_fp16_tiny} = {1.0 / _fp16_tiny}."
+        )
+
+    # Get reduction parameters - use standard inner_fn
+    kwargs = lowering._make_reduction_inner(
+        x, axis=[-1], keepdims=True, dtype=x.get_dtype(), override_return_dtype=None
+    )
+
+    # Compute mulConst as 1/scale_ub (will be FP16-encoded by generate_constant_info)
+    mul_const = 1.0 / scale_ub
+
+    op_info = {
+        "constants": {
+            "mulConst": mul_const,  # Float, FP16-encoded by generate_constant_info
+            "clipMin": QUANTSCALEPERTOKENFP8_CLIP_MIN,  # Float, FP16-encoded by generate_constant_info
+            "clipMax": QUANTSCALEPERTOKENFP8_CLIP_MAX,  # Float, FP16-encodes to 32255 (SEN169_FP16 max)
+        },
+    }
+
+    # Use same pattern as exx2 - pass all kwargs including inner_fn
+    result = SpyreReduction.create(
+        reduction_type=QUANTSCALEPERTOKENFP8_OP, input_node=x, op_info=op_info, **kwargs
+    )
+
+    result.realize()
+    return result
 
 
 @register_spyre_lowering(

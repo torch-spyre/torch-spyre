@@ -578,7 +578,20 @@ class TestBuildingBlocks(unittest.TestCase):
         self.assertEqual(num_head_tiles(16), 4)
         self.assertEqual(num_head_tiles(14), 7)
 
-    @unittest.skip("Runs for long time, possibly hang.  Keeping disabled")
+    def test_granite_gqa_prefill_sequence_tiling(self):
+        """Native GQA remains unexpanded when Lq exceeds one sequence tile."""
+        self._run_granite_gqa_with_finite_broadcast_mask(
+            LQ=1024,
+            dtype=torch.bfloat16,
+            name_inputs=True,
+            LK=1024,
+            transposed_inputs=True,
+            reshape_output=True,
+        )
+
+    @unittest.skip(
+        "Test skipped solely because of runtime.  It passes but takes over 10 minutes."
+    )
     @mock.patch("torch_spyre._inductor.decompositions._SDPA_MAX_SEQUENCE_TILE_SIZE", 64)
     def test_granite_gqa_prefill_grouped_sixteen_by_sixteen_tiling(self):
         """Sixteen KV loop groups preserve Granite's online-softmax carries."""

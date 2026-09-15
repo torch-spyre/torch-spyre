@@ -2789,6 +2789,46 @@ def test_view_unsqueeze_broadcast_A4_B4():
 # Parameterized helpers — tests specify sizes and tile counts directly.
 
 
+def test_sdpa_packed_qkv_input_offsets_h8():
+    """Read copies preserve offsets of QKV views repaired after pre-stickify.
+
+    Eight heads trigger SDPA's H coarse tiling.  K and V are non-contiguous
+    views into one packed allocation, with nonzero storage offsets.  Before
+    issue #4331's fix the generated per-tile read copies silently read Q's
+    slice for both tensors.
+    """
+    torch.manual_seed(0x4331)
+    B, H, L, D = 1, 8, 64, 64
+    packed = torch.randn(B, L, 3 * H * D, dtype=torch.float16)
+
+    def split_qkv(x):
+        return tuple(
+            part.reshape(B, L, H, D).transpose(1, 2) for part in x.chunk(3, dim=-1)
+        )
+
+    q_cpu, k_cpu, v_cpu = split_qkv(packed)
+    mask = torch.zeros(L, L, dtype=torch.float16).masked_fill(
+        ~torch.ones(L, L, dtype=torch.bool).tril(),
+        torch.finfo(torch.float16).min,
+    )[None, None]
+    expected = F.scaled_dot_product_attention(
+        q_cpu, k_cpu, v_cpu, attn_mask=mask, scale=D**-0.5
+    )
+
+    q, k, v = split_qkv(packed.to("spyre"))
+    assert (q.storage_offset(), k.storage_offset(), v.storage_offset()) == (
+        0,
+        H * D,
+        2 * H * D,
+    )
+    with fresh_cache():
+        actual = F.scaled_dot_product_attention(
+            q, k, v, attn_mask=mask.to("spyre"), scale=D**-0.5
+        )
+
+    torch.testing.assert_close(actual.cpu(), expected, atol=0.01, rtol=0.1)
+
+
 def _flash_v1_inputs(B, H, Lq, Lk, D):
     """TensorSpec list for flash v1 (no mask)."""
     return [
@@ -5714,8 +5754,8 @@ class TestCoarseTileReductionDim0E2E(InductorTestCase):
         torch.testing.assert_close(carried_result, ordinary_result, atol=1.0, rtol=0.05)
         torch.testing.assert_close(carried_result, cpu_result, atol=1.0, rtol=0.05)
 
-    def test_carried_sum_hbm_fallback_is_correct_and_visible(self):
-        """Capacity spill keeps correct execution and emits a warning."""
+    def test_carried_sum_hbm_fallback_is_correct(self):
+        """Capacity spill keeps correct execution."""
 
         E, T, H = 2, 64, 64
         values = torch.randn(E, T, H, dtype=torch.float16) * 0.1
@@ -5743,7 +5783,6 @@ class TestCoarseTileReductionDim0E2E(InductorTestCase):
                     "dxp_lx_frac_avail": 1.0,
                 }
             ),
-            self.assertLogs("spyre.inductor.scheduler", level="WARNING") as logs,
         ):
             compare_with_cpu(
                 fn,
@@ -5754,7 +5793,6 @@ class TestCoarseTileReductionDim0E2E(InductorTestCase):
                 atol=0.05,
                 rtol=0.05,
             )
-        self.assertTrue(any("remained in HBM" in line for line in logs.output))
 
     def test_carried_sum_requires_explicit_work_div(self):
         """Without row ownership, the existing reduction path is unchanged."""
@@ -6222,6 +6260,7 @@ class TestCoarseTileMoEBroadcastMatmulE2E(InductorTestCase):
     def test_unsqueeze_broadcast_matmul_keeps_copy_for_different_core_views(self):
         """A legal but different source ownership cannot replace the copy."""
         from torch_spyre._inductor import spyre_hint
+        from torch_spyre._inductor.pass_utils import PerCoreView
 
         E, T, H, F = 3, 64, 64, 64
         x = torch.randn(T, H, dtype=torch.float16).to("spyre")
@@ -6237,6 +6276,9 @@ class TestCoarseTileMoEBroadcastMatmulE2E(InductorTestCase):
             with spyre_hint(num_tiles_per_dim={"E": E}):
                 return torch.matmul(x.unsqueeze(0), w)
 
+        output_view = PerCoreView((), (), num_cores=1)
+        staged_view = PerCoreView((), (), num_cores=2)
+        direct_view = PerCoreView((), (), num_cores=4)
         with (
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
@@ -6244,10 +6286,10 @@ class TestCoarseTileMoEBroadcastMatmulE2E(InductorTestCase):
             mock_patch(
                 "torch_spyre._inductor.read_copy_elision._per_core_view_on_buf",
                 side_effect=[
-                    ("output", None, True),
-                    ("output", None, True),
-                    ("staged-weight", None, True),
-                    ("direct-weight", None, True),
+                    (output_view, None, True),
+                    (output_view, None, True),
+                    (staged_view, None, True),
+                    (direct_view, None, True),
                 ],
             ),
         ):

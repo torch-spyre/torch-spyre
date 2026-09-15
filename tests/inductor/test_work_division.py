@@ -14,8 +14,8 @@
 
 import math
 import unittest
-from collections import namedtuple
 from contextlib import ExitStack
+from types import SimpleNamespace
 from typing import NamedTuple
 from unittest.mock import MagicMock, patch
 
@@ -31,7 +31,7 @@ from torch._inductor.ir import (
     Reduction,
 )
 
-from torch_spyre._C import ElementArrangement, SpyreTensorLayout
+from torch_spyre._C import DataFormats, ElementArrangement, SpyreTensorLayout
 from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.ir import FixedTiledLayout
 from torch_spyre._inductor.constants import (
@@ -39,13 +39,20 @@ from torch_spyre._inductor.constants import (
     CONV2D_FWD_OP,
     DEPTHWISE_CONV2D_OP,
 )
-from torch_spyre._inductor.pass_utils import SchedNodeArg
+from torch_spyre._inductor.pass_utils import PerCoreView, SchedNodeArg
 from torch_spyre._inductor.scratchpad import allocator as allocator_module
 from torch_spyre._inductor.scratchpad.allocator import (
     CoOptimizingAllocator,
     CoreDivision,
+    ScratchpadAllocator,
 )
-from torch_spyre._inductor.scratchpad.plan_solver import CoreDivisionBuffer
+from torch_spyre._inductor.scratchpad.greedy_solver import GreedyLayoutSolver
+from torch_spyre._inductor.scratchpad.plan_solver import (
+    CoreDivisionBuffer,
+)
+from torch_spyre._inductor.scratchpad.utils import (
+    is_empty_tiled_layout,
+)
 from torch_spyre._inductor.work_division import (
     TensorDep,
     _cost_model_matmul_planner,
@@ -115,6 +122,60 @@ def _computed_buffer(shape, name="buf0", reduction_type=None, reduction_ranges=(
     op = ComputedBuffer(name=name, layout=layout, data=data)
     op.operation_name = name
     return op
+
+
+class TestEmptyLxEligibility(unittest.TestCase):
+    def test_empty_tensors_are_rejected_before_lx_sizing(self):
+        """A valid empty tensor clears no eligibility path.
+
+        Native stickification preserves zero outer extents. A zero physical
+        extent on a logically nonempty tensor (a one-stick FP16 tensor
+        quantized to FP8 rescales to zero FP8 sticks) is not an empty tensor.
+        """
+
+        empty = _fixed_tiled_layout((0, 64))
+        nonempty = _fixed_tiled_layout((64, 64))
+        zero_extent = _fixed_tiled_layout((64, 64))
+        zero_extent.device_layout = SpyreTensorLayout(
+            [1, 0, 64],
+            [64, 64, 1],
+            DataFormats.SEN169_FP16,
+            ElementArrangement.STANDARD,
+        )
+        self.assertEqual(
+            [
+                is_empty_tiled_layout(layout)
+                for layout in (empty, nonempty, zero_extent)
+            ],
+            [True, False, False],
+        )
+
+        graph = SimpleNamespace(
+            try_get_buffer=lambda _name: SimpleNamespace(layout=empty)
+        )
+        allocator = ScratchpadAllocator(GreedyLayoutSolver, 2**20)
+        with patch.object(
+            allocator_module, "clone_at_graph_boundaries", return_value=True
+        ):
+            reason = allocator._input_residency_reason(
+                graph, "value", [0, 1], division_is_fixed=False
+            )
+        self.assertEqual(reason, "empty tensor")
+        with patch.object(allocator, "_op_output_good_for_lx_reuse", return_value=True):
+            reason = allocator._buffer_residency_reason(
+                graph,
+                "value",
+                [0, 1],
+                SimpleNamespace(layout=empty),
+                mutated_buffers=set(),
+                graph_output_names=set(),
+                reinterpret_output_names=set(),
+                ncores={},
+                ncores_reasons={},
+                division_is_fixed=False,
+                buf_user_deps={},
+            )
+        self.assertEqual(reason, "empty tensor")
 
 
 def _make_context(
@@ -1379,7 +1440,18 @@ class TestSpanReductionConstraints(unittest.TestCase):
         self.assertEqual(must_split.call_args.args[-1], {r0, r1})
 
 
-_FakeView = namedtuple("_FakeView", "work_slice_dims")
+def _physical_view(*splits):
+    """A real :class:`PerCoreView` whose cores own contiguous slices in
+    row-major order of ``splits`` (device-dim index, split factor)."""
+
+    core_id = sympy.Symbol("core_id")
+    num_cores = math.prod(split for _, split in splits)
+    slots = []
+    stride = num_cores
+    for dim, split in splits:
+        stride //= split
+        slots.append((dim, sympy.Mod(sympy.floor(core_id / stride), split)))
+    return PerCoreView(tuple(splits), tuple(slots), num_cores=num_cores)
 
 
 class TestResidencyEdgeMatching(unittest.TestCase):
@@ -1389,9 +1461,9 @@ class TestResidencyEdgeMatching(unittest.TestCase):
 
     def setUp(self):
         x, y = _isym("x"), _isym("y")
-        self.view_a = _FakeView(((0, 4),))
-        self.view_b = _FakeView(((0, 2),))
-        self.view_wide = _FakeView(((0, 2), (1, 2)))
+        self.view_a = _physical_view((0, 4))
+        self.view_b = _physical_view((0, 2))
+        self.view_wide = _physical_view((0, 2), (1, 2))
 
         def _div(splits, reduction=None):
             return CoreDivision(
@@ -1740,6 +1812,59 @@ class TestCoOptimizingAllocator(unittest.TestCase):
             self.assertEqual(
                 allocator._enumerate_core_divisions(op, max_cores=32), [fixed]
             )
+
+    def test_over_budget_candidate_menu_is_rejected(self):
+        """An over-budget division must not reach the menu. Nothing downstream
+        catches one: both engines pin an op's split symbols to a single enumerated
+        candidate, and ``_matmul_split_cost``'s budget guard no-ops on symbolic
+        splits, so an over-budget candidate is scored NEGATIVE and a minimizing
+        solve prefers it (issue #4387). The prune path is the one that could admit
+        one -- ``_legal_split_options`` tests stick validity and hard domains, never
+        a core budget -- so it is the one exercised here.
+        """
+        batch, m = _isym("batch"), _isym("m")
+        op = _computed_buffer((4, 64), name="over_budget_out")
+        graph = MagicMock(operations=[op])
+        allocator = CoOptimizingAllocator(MagicMock(), size=1, prune=True)
+        over_budget = {batch: 4, m: 16}  # 64 cores against a 32-core budget
+        rw = MagicMock(
+            writes=[MemoryDep(op.name, 64 * batch + m, (batch, m), (4, 64))],
+            reads=[],
+        )
+
+        with (
+            patch.object(allocator_module.config, "sencores", 32),
+            patch(
+                "torch_spyre._inductor.scratchpad.allocator."
+                "ops_in_offset_mutation_component",
+                return_value=set(),
+            ),
+            patch(
+                "torch_spyre._inductor.scratchpad.allocator."
+                "_find_distinct_matmul_splits",
+                return_value=((), ()),
+            ),
+            patch(
+                "torch_spyre._inductor.scratchpad.allocator._enum_split_options",
+                return_value=[over_budget],
+            ),
+            patch(
+                "torch_spyre._inductor.scratchpad.allocator.op_read_writes",
+                return_value=rw,
+            ),
+            patch(
+                "torch_spyre._inductor.scratchpad.allocator._split_fits_sticks",
+                return_value=True,
+            ),
+            patch(
+                "torch_spyre._inductor.scratchpad.allocator._split_option_is_legal",
+                return_value=True,
+            ),
+            self.assertRaisesRegex(
+                AssertionError, r"over_budget_out: .*over the 32-core budget"
+            ),
+        ):
+            allocator._division_map(graph)
 
 
 class TestTopKConstraints(unittest.TestCase):

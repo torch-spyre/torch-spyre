@@ -102,6 +102,14 @@ jobs:
         with:
           verbose: 'true'
 
+      - name: Detect RHEL and GCC versions
+        id: os_info
+        run: |
+          RHEL_VERSION=$(source /etc/os-release && echo "$VERSION_ID")
+          GCC_VERSION=$(gcc -dumpversion | cut -d. -f1)
+          echo "rhel_version=$RHEL_VERSION" >> "$GITHUB_OUTPUT"
+          echo "gcc_version=$GCC_VERSION" >> "$GITHUB_OUTPUT"
+
       - name: Install uv
         uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         with:
@@ -199,7 +207,7 @@ jobs:
         uses: ./.github/actions/report-ci-completed
         with:
           job_name: linux-x86_64 / pytorch / build
-          rh_job_name: linux-x86_64-spyre / pytorch / build
+          rh_job_name: linux-rhel${{ steps.os_info.outputs.rhel_version }}-spyre-gcc${{ steps.os_info.outputs.gcc_version }}-x86_64 / build
           conclusion: ${{ steps.build_conclusion.outputs.conclusion }}
           pytorch_sha: ${{ inputs.pytorch_sha }}
 
@@ -294,6 +302,22 @@ jobs:
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           path: torch-spyre
+
+      # Caveat: this job doesn't run the tests itself -- the "Dispatch and
+      # wait" step below (line ~347) hands them off to
+      # _upstream_tests_beta_matrix.yaml on a separately-scheduled runner,
+      # so there's no direct way to read that runner's RHEL/GCC versions
+      # from here. We read them off THIS job's own runner instead, relying
+      # on it being provisioned from the same pool/image as the dispatched
+      # matrix runner. Not an issue for the `build` job above, which builds
+      # directly on the runner it reports for.
+      - name: Detect RHEL and GCC versions
+        id: os_info
+        run: |
+          RHEL_VERSION=$(source /etc/os-release && echo "$VERSION_ID")
+          GCC_VERSION=$(gcc -dumpversion | cut -d. -f1)
+          echo "rhel_version=$RHEL_VERSION" >> "$GITHUB_OUTPUT"
+          echo "gcc_version=$GCC_VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Install uv
         uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
@@ -504,7 +528,7 @@ jobs:
         uses: ./.github/actions/report-ci-completed
         with:
           job_name: linux-x86_64 / pytorch / test
-          rh_job_name: linux-x86_64-spyre / pytorch / test
+          rh_job_name: linux-rhel${{ steps.os_info.outputs.rhel_version }}-spyre-gcc${{ steps.os_info.outputs.gcc_version }}-x86_64 / test
           conclusion: ${{ steps.test_conclusion.outputs.conclusion }}
           pytorch_sha: ${{ inputs.pytorch_sha }}
           test_results_json: ${{ steps.test_results.outputs.test_results_json }}

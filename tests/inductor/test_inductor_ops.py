@@ -266,12 +266,10 @@ _LX_ALLOCATION_MARKER = "allocation={'lx'"
 def _assert_keeps_lx_residency(fn, x, case):
     """Assert the compiled graph still pins at least one buffer into LX.
 
-    Comparing values cannot detect a regression in
-    ``align_lx_producer_loop_order``: if an LX buffer's producer and consumers
-    stop agreeing on core->slice, ``demote_incoherent_lx_buffers`` clears the LX
+    Comparing values cannot detect a residency regression: if the clone cannot
+    commit the consumers' agreed physical ownership, preflight clears its LX
     allocation and the results come out correct anyway -- just served from HBM.
-    Residency is therefore the only observable that separates "aligned" from
-    "demoted", so assert it directly.
+    Assert residency directly as well as values.
 
     Measured on the shapes in SHARED_INPUT_TWO_REDUCTION_PARAM_SETS: with the
     aligner in place every case keeps 3 LX allocations (4 for the three-consumer
@@ -286,8 +284,8 @@ def _assert_keeps_lx_residency(fn, x, case):
     assert source_codes[0].count(_LX_ALLOCATION_MARKER) > 0, (
         f"{case}: no buffer left in LX. The values may still be correct, but an "
         f"LX buffer whose users disagree on core->slice gets demoted to HBM -- so "
-        f"this is the signature of the producer/consumer loop-order alignment "
-        f"regressing (see align_lx_producer_loop_order, #3374/#3387)."
+        f"this is the signature of clone ownership or finalization preflight "
+        f"regressing (see #3374/#3387)."
     )
 
 
@@ -1511,16 +1509,12 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             },
             "param_sets": INDEX_REDUCTION_KEEPDIM_PARAM_SETS,
         },
-        # Regression guard for the LX producer/consumer core->slice agreement
-        # (#3374, #3387). Two device reductions over one LX-pinned input reducing
-        # a non-trailing dim get a positional core->slice mapping from
-        # core_to_slice_mapping; if the clone that pins the input into LX walks it
-        # in a different dim order than the reductions read it, each core reads a
-        # slice another core wrote and the result is silently wrong. Through 2.12
-        # Inductor's loop_ordering_after_fusion happened to rewrite the clone into
-        # the consumers' order; 2.13 computes that reorder and discards it, which
-        # is what exposed it. aminmax was merely the first op to show it, so these
-        # cases assert the general shape.
+        # Regression guard for LX producer/consumer physical ownership
+        # (#3374, #3387). Two reductions over one pinned input may read it in a
+        # different loop order from the boundary clone. The clone must commit
+        # the consumers' accepted physical view before scheduling; otherwise a
+        # core can read a slice another core wrote. aminmax was merely the first
+        # op to expose the general shape.
         (
             "test_shared_input_two_reductions",
             "test_shared_input_two_reductions_base",
@@ -3646,6 +3640,17 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             },
             "param_sets": {
                 "2d64": (1, 32, 96, cached_randn((128, 256)), cached_randn((128, 64))),
+                # Offset sub-stick write: cols 32:64 land inside the first of
+                # the four 64-wide sticks spanning this 256-wide dim. start != 0,
+                # so relocation onto the dim-0 stick candidate handles it without
+                # needing stick-tail preserve.
+                "2d_substick_off32": (
+                    1,
+                    32,
+                    64,
+                    cached_randn((128, 256)),
+                    cached_randn((128, 32)),
+                ),
                 "2d128": (
                     1,
                     1,
@@ -3815,6 +3820,18 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     128,
                     cached_randn((2, 8, 4, 128)),
                     cached_randn((2, 8, 4, 64)),
+                ),
+                # Offset sub-stick write on the stick (last) dim: cols 32:64 are
+                # the upper half of this dim's single 64-wide stick. The write is
+                # offset (start != 0), so relocation moves it off the stick dim.
+                # (The offset-free sub-stick start=0 case additionally needs
+                # stick-tail preserve and is out of scope.)
+                "substick_off32_3d": (
+                    2,
+                    32,
+                    64,
+                    cached_randn((3, 8, 64)),
+                    cached_randn((3, 8, 32)),
                 ),
             },
         },
@@ -4158,8 +4175,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         ("test_mean_keepdim1", "test_mean_eager"): {
             "ops_dict": {"mean": torch.mean},
             "expect_fail": [
-                "fp16_3d_dim_2",
-                "fp16_3d_dim_neg1",
                 "fp32_3d_dim_2",
                 "fp32_3d_dim_neg1",
             ],
@@ -4848,6 +4863,56 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "67x71x256": (cached_randn((67, 71, 256), dtype=torch.float32),),
             },
         },
+        (
+            "test_exp_fp16",
+            "test_unary_op",
+        ): {
+            "ops_dict": {"exp": torch.exp},
+            "param_sets": {
+                "256": (
+                    cached_randn(
+                        (256,),
+                    ),
+                ),
+                "67x256": (
+                    cached_randn(
+                        (67, 256),
+                    ),
+                ),
+                "67x71x256": (
+                    cached_randn(
+                        (67, 71, 256),
+                    ),
+                ),
+                "nearmax": (torch.tensor([[10.0, 10.5, 11.0]], dtype=torch.float16),),
+                "overflow": (torch.tensor([[15.0, 20.0, 50.0]], dtype=torch.float16),),
+                "underflow": (
+                    torch.tensor([[-50.0, -100.0, -200.0]], dtype=torch.float16),
+                ),
+                "mixed": (torch.tensor([[-20.0, 0.0, 10.0]], dtype=torch.float16),),
+            },
+        },
+        (
+            "test_exp_fp32",
+            "test_unary_op",
+        ): {
+            "ops_dict": {"exp": torch.exp},
+            "param_sets": {
+                "256": (cached_randn((256,), dtype=torch.float32),),
+                "67x256": (cached_randn((67, 256), dtype=torch.float32),),
+                "67x71x256": (cached_randn((67, 71, 256), dtype=torch.float32),),
+                "31": (cached_randn((31,), dtype=torch.float32),),
+                "67x31": (cached_randn((67, 31), dtype=torch.float32),),
+                "3x7x31": (cached_randn((3, 7, 31), dtype=torch.float32),),
+                "nearmax": (
+                    torch.tensor([[85.0, 86.0, 87.0, 88.0]], dtype=torch.float32),
+                ),
+                "underflow": (torch.tensor([[-100.0, -200.0]], dtype=torch.float32),),
+                "mixed": (
+                    torch.tensor([[-50.0, 0.0, 50.0, 88.0]], dtype=torch.float32),
+                ),
+            },
+        },
         ("test_eq_scalar", "test_scalar_comparison_base"): {
             "param_sets": {
                 "int_42": (
@@ -5093,8 +5158,8 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
             },
         },
-        # Stick dim, unaligned offset: needs Step 2 (alt-layout, #2750).
-        # Must cleanly fail, not silently misbehave.
+        # Stick-dim offset at rank 1: no other dimension for the restickify
+        # pass to move the stick to, so it can never be resolved.
         (
             "test_storage_offset_placeholder_stick_dim",
             "test_storage_offset_placeholder_stick_dim_rejected",
@@ -5104,9 +5169,106 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     lambda t: t[3:],
                     cached_randn((259,), differentiation="ph_1d_offset"),
                 ),
-                "2d_last_dim_offset": (
+            },
+        },
+        # Stick-dim offsets, resolved by the restickify pass moving the stick
+        # to another dimension.  Compiled only: eager materializes an offset
+        # view through copy_from_d2d, whose flat offset % stick check is
+        # unreliable for these shapes (#3798, #3264).
+        #
+        # x + x reuses the input layout verbatim and skips address generation,
+        # so add_asym/clone/exp are the load-bearing ops here.
+        (
+            "test_storage_offset_placeholder_stick_dim_resolved",
+            "test_storage_offset_placeholder_compiled_only",
+        ): {
+            "ops_dict": {
+                "add_sym": lambda x: x + x,
+                "add_asym": lambda x: x.clone() + x,
+                "clone": torch.clone,
+                "exp": torch.exp,
+                "sum_stick": lambda x: torch.sum(x, dim=-1, keepdim=True),
+                "amax_stick": lambda x: torch.amax(x, dim=-1, keepdim=False),
+                "sum_dim0": lambda x: torch.sum(x, dim=0, keepdim=True),
+                "amax_dim0": lambda x: torch.amax(x, dim=0, keepdim=False),
+            },
+            "param_sets": {
+                "2d_off32": (
+                    lambda t: t[:, 32:96],
+                    cached_randn((128, 256), differentiation="ph_2d_off32"),
+                ),
+                "2d_off32_span128": (
+                    lambda t: t[:, 32:160],
+                    cached_randn((128, 256), differentiation="ph_2d_off32_s128"),
+                ),
+                "3d_off32": (
+                    lambda t: t[:, :, 32:96],
+                    cached_randn((128, 192, 256), differentiation="ph_3d_off32"),
+                ),
+                "3d_off32_span128": (
+                    lambda t: t[:, :, 32:160],
+                    cached_randn((128, 192, 256), differentiation="ph_3d_off32_s128"),
+                ),
+                # Only dim0 is a stick multiple, so the restickify must land
+                # there; the mirrored shape below leaves only dim1.
+                "3d_off32_dim0_alt": (
+                    lambda t: t[:, :, 32:96],
+                    cached_randn((128, 3, 256), differentiation="ph_3d_d0alt"),
+                ),
+                "3d_off32_dim1_alt": (
+                    lambda t: t[:, :, 32:96],
+                    cached_randn((2, 192, 256), differentiation="ph_3d_d1alt"),
+                ),
+                # dim0=5 is the only alternative and isn't a stick multiple,
+                # so restickify padding has to grow it (5 -> 64).
+                "2d_off1_unaligned_alt": (
                     lambda t: t[:, 1:],
                     cached_randn((5, 128), differentiation="ph_2d_last_offset"),
+                ),
+            },
+        },
+        # sum/amax over dim1, on the two shapes that isolate which dim the
+        # restickify targets.  The wide (128,192,*) shapes are deliberately not
+        # here: a 192-deep fp16 sum carries an error floor near 0.3 whatever
+        # the offset -- the same reduction on an unsliced tensor is bit-
+        # identical -- and their 16k outputs make a near-zero sum, where atol
+        # sits below that floor, near-certain.
+        (
+            "test_storage_offset_placeholder_stick_dim_reduce_dim1",
+            "test_storage_offset_placeholder_compiled_only",
+        ): {
+            "ops_dict": {
+                "sum_dim1": lambda x: torch.sum(x, dim=1, keepdim=True),
+                "amax_dim1": lambda x: torch.amax(x, dim=1, keepdim=False),
+            },
+            "param_sets": {
+                "3d_off32_dim0_alt": (
+                    lambda t: t[:, :, 32:96],
+                    cached_randn((128, 3, 256), differentiation="ph_3d_d0alt_r1"),
+                ),
+                "3d_off32_dim1_alt": (
+                    lambda t: t[:, :, 32:96],
+                    cached_randn((2, 192, 256), differentiation="ph_3d_d1alt_r1"),
+                ),
+            },
+        },
+        # Stick-dim offset on a PADDED base (row width 100 is not a stick
+        # multiple), so the offset decomposition and the stick move have to
+        # work together.  Layout-preserving ops only: exp miscomputes on any
+        # padded-row fp16 tensor, sliced or not (#3799).
+        (
+            "test_storage_offset_placeholder_stick_dim_padded",
+            "test_storage_offset_placeholder_compiled_only",
+        ): {
+            "ops_dict": {
+                "add_sym": lambda x: x + x,
+                "add_asym": lambda x: x.clone() + x,
+                "clone": torch.clone,
+            },
+            "param_sets": {
+                "2d_off1_padded": (
+                    lambda t: t[:, 1:],
+                    cached_randn((5, 100), differentiation="ph_2d_off1_padded"),
                 ),
             },
         },
@@ -6238,16 +6400,18 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         )
 
     def test_storage_offset_placeholder_stick_dim_rejected(self, slicer, base):
-        # Stick-dim placeholder offset: alt-layout retargeting not yet
-        # implemented (#2750), so compile must raise rather than silently
-        # miscompute. No eager arm: compile=False skips the Inductor pass
-        # entirely, so it can't exercise this check.
+        # No dimension for the restickify pass to move the stick to, so
+        # compile must raise rather than silently miscompute.  Matches the
+        # pass's own message: a generic "Unsupported" would also pass if the
+        # input were rejected earlier for an unrelated reason.
         def fn(x):
             return x + x
 
         dev_view = slicer(base.clone().to("spyre"))
 
-        with pytest.raises(Exception, match="Unsupported"):
+        with pytest.raises(
+            Exception, match="no mechanism to resolve stick incompatibility"
+        ):
             _compile_and_run(fn, [dev_view], "spyre", compile=True)
 
     def test_storage_offset_placeholder_vs_internal_equivalence(self):
@@ -6320,6 +6484,33 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             assert torch.allclose(result.float(), expected, atol=0.1, rtol=0.1), (
                 f"{mode_name}: max abs diff: "
                 f"{(result.float() - expected).abs().max().item()}"
+            )
+
+    def test_storage_offset_placeholder_fixed_layout_rejected(self):
+        # Fixed-layout ops need their inputs' sticks where the op dictates, so
+        # an offset stick would need a restickify before the op and another to
+        # restore the layout after.  Not implemented, so these reject.  The
+        # stick-dim counterpart of test_storage_offset_placeholder_matmul,
+        # which offsets a non-stick dim and succeeds.
+        base = cached_randn((128, 256), differentiation="ph_fixed_layout_base")
+        w = cached_randn((64, 64), differentiation="ph_fixed_layout_w")
+
+        dev_view = base.clone().to("spyre")[:, 32:96]
+        dev_w = w.clone().to("spyre")
+
+        msg = "requires a fixed input layout and double-restickify is not yet supported"
+
+        with pytest.raises(Exception, match=msg):
+            _compile_and_run(
+                lambda x, y: torch.mm(x, y), [dev_view, dev_w], "spyre", compile=True
+            )
+
+        with pytest.raises(Exception, match=msg):
+            _compile_and_run(
+                lambda x: torch.topk(x, 4, dim=-1)[0],
+                [dev_view],
+                "spyre",
+                compile=True,
             )
 
     def test_binary_op_stick_crossing_last_dim(self):
@@ -8920,6 +9111,38 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         x = cached_xavier((1, 16, 4096))
         w = cached_xavier((6144, 4096))
         self.compare_with_cpu(fn, x, w, atol=0.5, rtol=0.1)
+
+    def test_index_select_reshape_matmul_4033(self):
+        """Regression test for issue #4033: fused index_select + reshape + matmul.
+
+        Verifies that the specific kernel pattern (multi-index gather + reshape
+        + matmul with NKV=4, NQ=4, D=128, PAGES=2, BLOCK=128) compiles and
+        runs correctly. This was the exact configuration that triggered
+        the dead arguments bug where gather indices were still passed to kernel
+        .run() calls despite being simplified away.
+        See: https://github.com/torch-spyre/torch-spyre/issues/4033
+        """
+        NKV = 4
+        NQ = 4
+        D = 128
+        PAGES = 2
+        BLOCK = 128
+        H = NKV * NQ
+
+        def fn(query, query_idx, k_pages, page_idx):
+            q = query.index_select(0, query_idx).reshape(NKV, NQ, 1, D)
+            k = k_pages.index_select(0, page_idx).reshape(NKV, 1, BLOCK, D)
+            return torch.matmul(q, k)
+
+        torch.manual_seed(0)
+        k_pages = torch.randn(PAGES, BLOCK, NKV, D, dtype=torch.float16).mul_(0.1)
+        query = torch.randn(1, H * D, dtype=torch.float16).reshape(1, H, D).contiguous()
+        query_idx = torch.zeros(1, dtype=torch.int32)
+        page_idx = torch.zeros(1, dtype=torch.int32)
+
+        self.compare_with_cpu(
+            fn, query, query_idx, k_pages, page_idx, atol=0.2, rtol=0.2, run_eager=False
+        )
 
 
 _TEST_LARGE_MATMUL_FP32_PROXY_SHAPES = _derive_test_large_matmul_fp32_proxy_shapes(
