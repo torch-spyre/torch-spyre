@@ -218,10 +218,19 @@ LAYOUT_LABELS = ["OUTPUT", "KERNEL", "INPUT", "KERNEL_IDX"]
 MATMUL_LAYOUT_LABELS = ["INPUT", "KERNEL", "OUTPUT", "KERNEL_IDX"]
 CONV2D_LAYOUT_LABELS = ["OUTPUT", "INPUT", "KERNEL", "KERNEL_IDX"]
 
+# Most extreme *finite* fp16 values, used as max/min reduction identities.
+#
+# Used by codegen for reduction padding masks (_get_mask_value) and by the
+# max_pool2d lowering to fill the explicitly-materialized pad halo.
+# See codegen/superdsc.py for more details
+FP16_MAX = 65504.0
+FP16_MIN = -65504.0
+
 AVGPOOL2D_OP = "avgpoolfwd"
-# Pool opfunc names, mirroring TOPK_OPS. Add maxpool/minpool here as they land so
+MAXPOOL2D_OP = "maxpoolfwd"
+# Pool opfunc names, mirroring TOPK_OPS. Add minpool here as it lands so
 # _is_pool stays a single membership test rather than a growing chain of ==.
-POOL_OPS = {AVGPOOL2D_OP}
+POOL_OPS = {AVGPOOL2D_OP, MAXPOOL2D_OP}
 
 # Conv opfunc names. conv2d is a two-input reduction (activation + weight) with
 # windowed spatial dims -- a hybrid of the matmul and pool patterns. Kept as a
@@ -247,11 +256,11 @@ DEPTHWISE_CONV_REDUCTION_OPS = frozenset({DEPTHWISE_CONV2D_OP})
 # Single-input reductions: everything store_reduction dispatches to its
 # fallback branch (exactly one input TensorArg). These are PyTorch/Inductor
 # reduction_type strings (sum/mean/max/min/prod) plus Spyre-specific reduction
-# ops (exx2, topkvalue/topkindex, avgpoolfwd) -- there is no upstream registry
-# of supported reduction_type strings to derive this from, so it is written
-# down here explicitly.
+# ops (exx2, topkvalue/topkindex, and the POOL_OPS) -- there is no upstream
+# registry of supported reduction_type strings to derive this from, so it is
+# written down here explicitly.
 SINGLE_INPUT_REDUCTION_OPS = frozenset(
-    {"sum", "mean", "max", "min", "prod", "exx2", *TOPK_OPS, AVGPOOL2D_OP}
+    {"sum", "mean", "max", "min", "prod", "exx2", *TOPK_OPS, *POOL_OPS}
 )
 
 # Populate more valid labels from deeptools here if needed
