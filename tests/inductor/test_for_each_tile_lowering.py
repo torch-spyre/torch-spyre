@@ -656,6 +656,24 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
         return graph
 
     def test_marker_erased_and_mapped_after_split_m_splice(self):
+        """Marker resolution for split_m_fn's StarDep-shaped matmul consumer.
+
+        split_m_fn's marker's sole consumer is a matmul -- an aten-fallback
+        ExternKernelOut even on this device-less CPU fixture, i.e. the
+        StarDep/_substitute_direct_input_refs branch (see
+        test_marker_inlined_preserves_advance_term_on_computed_buffer_
+        consumer's docstring below, which pins the *other* branch
+        specifically because this test doesn't reach it). Per
+        _consume_tile_dim_markers's own docstring, that branch
+        deliberately keeps the marker materialized in graph.operations
+        (never erased) rather than erasing it the way the ComputedBuffer/
+        inline branch does -- a StarDep consumer has no inner_fn to fuse
+        the marker's per-iteration transform into, so the marker must
+        remain a real, addressable buffer for it to read. This test's name
+        predates that fix and is now a slight misnomer (nothing here is
+        erased); kept for continuity with its git history rather than
+        renamed.
+        """
         from torch._inductor import ir
 
         from torch_spyre._inductor.wsr.for_each_tile_lowering import (
@@ -714,15 +732,30 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
                 all(isinstance(dim, int) for dim in marker_map.values()),
             )
 
+            # split_m_fn's matmul is StarDep-shaped (see this test's own
+            # docstring above), so the marker(s) deliberately survive in
+            # graph.operations rather than being erased -- assert they are
+            # still present, still tagged with their original dims, and
+            # (per _validate_contiguous's gapless-contiguity requirement,
+            # see _consume_tile_dim_markers's own comment on this) still
+            # members of group_ops too.
             remaining_markers = [
                 op
                 for op in graph.operations
                 if getattr(op, "tile_marker_dim", None) is not None
             ]
             self.assertEqual(
-                remaining_markers,
-                [],
-                "marker ops must be erased from graph.operations after consumption",
+                sorted(op.tile_marker_dim for op in remaining_markers),
+                sorted(marker_dims_before),
+                "StarDep-shaped marker consumers keep their markers "
+                "materialized in graph.operations (never erased) -- see "
+                "_consume_tile_dim_markers's own docstring",
+            )
+            self.assertTrue(
+                all(op in group_ops for op in remaining_markers),
+                "surviving markers must remain members of group_ops too, "
+                "or _validate_contiguous's gapless-contiguity check on "
+                "this group would fail later",
             )
 
     def test_marker_inlined_preserves_advance_term_on_computed_buffer_consumer(self):
@@ -905,6 +938,7 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
         from torch_spyre._inductor.wsr.for_each_tile_lowering import (
             _body_loop_var,
             _consume_tile_dim_markers,
+            _marker_dim,
             _stacking_carry_indices,
             try_prove_for_each_tile,
         )
@@ -935,6 +969,26 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
             group_ops = splice_while_loop(
                 graph, while_op, carries, trip_count=result.trip_count
             )
+
+            # split_k_fn's matmul is a StarDep-shaped consumer (see this
+            # test's own docstring above), so _consume_tile_dim_markers
+            # keeps both markers materialized rather than erasing them
+            # (its own "StarDep-shaped consumer" branch comment) and
+            # redirects the matmul's input references to the markers
+            # themselves. The marker map is therefore keyed by StarDeps
+            # naming the MARKERS (buffers still present in group_ops post-
+            # call), not by the raw arg0_1/arg1_1 input names those
+            # markers used to be erased down to -- capture the marker names
+            # before the call, since group_ops is mutated in place.
+            markers_before = {
+                op.get_name(): _marker_dim(op)
+                for op in group_ops
+                if _marker_dim(op) is not None
+            }
+            self.assertEqual(
+                len(markers_before), 2, "expected exactly one marker per matmul input"
+            )
+
             marker_map = _consume_tile_dim_markers(group_ops, graph.operations)
 
             matmul_op = next(
@@ -942,8 +996,15 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
             )
             matmul_name = matmul_op.get_name()
 
-            x_dim = marker_map.get((matmul_name, StarDep(name="arg0_1")))
-            y_dim = marker_map.get((matmul_name, StarDep(name="arg1_1")))
+            x_marker_name, y_marker_name = None, None
+            for name, dim in markers_before.items():
+                if dim == 1:
+                    x_marker_name = name
+                elif dim == 0:
+                    y_marker_name = name
+
+            x_dim = marker_map.get((matmul_name, StarDep(name=x_marker_name)))
+            y_dim = marker_map.get((matmul_name, StarDep(name=y_marker_name)))
             self.assertEqual(
                 x_dim,
                 1,
@@ -1388,13 +1449,28 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
             [],
             "expected both nesting levels to be fully spliced",
         )
+        # nested_split_m_then_k_fn's inner loop is split_k-shaped (matmul
+        # consumer -- an aten-fallback ExternKernelOut, a StarDep-shaped
+        # read; see this test's own docstring above). Per
+        # _consume_tile_dim_markers's docstring, a StarDep-shaped
+        # consumer's marker is deliberately kept materialized in
+        # graph.operations (never erased) rather than erased the way a
+        # ComputedBuffer consumer's marker is -- so unlike the outer
+        # M-tiling marker (consumed by a Pointwise/Reduction ComputedBuffer
+        # inside the outer body, erased normally), the inner K-tiling
+        # marker is expected to still be present here. Exactly one marker
+        # should remain: the fixture has exactly one StarDep-shaped
+        # (matmul) marker consumer, at the inner nesting level.
         remaining_markers = [
             op for op in operations if getattr(op, "tile_marker_dim", None) is not None
         ]
         self.assertEqual(
-            remaining_markers,
-            [],
-            "expected every marker at both nesting levels to be consumed",
+            len(remaining_markers),
+            1,
+            "expected exactly one surviving marker (the inner split_k "
+            "matmul's StarDep-shaped consumer -- see "
+            "_consume_tile_dim_markers's own docstring on why that branch "
+            "keeps its marker materialized rather than erasing it)",
         )
 
     def test_nested_for_each_tile_markers_snapshot_catches_noop_splice_stub(self):
@@ -1550,24 +1626,32 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
         )
         operations = captured["operations"]
 
-        # Sanity check on the real, unmutated snapshot: every marker was
-        # genuinely consumed here, same as
-        # test_nested_for_each_tile_markers_resolve_correctly asserts.
+        # Sanity check on the real, unmutated snapshot: exactly the one
+        # StarDep-shaped (inner split_k matmul) marker survives here, same
+        # as test_nested_for_each_tile_markers_resolve_correctly asserts
+        # (see that test's docstring for why -- _consume_tile_dim_markers
+        # deliberately keeps a StarDep-shaped consumer's marker
+        # materialized rather than erasing it).
+        real_markers_before_injection = [
+            op for op in operations if getattr(op, "tile_marker_dim", None) is not None
+        ]
         self.assertEqual(
-            [
-                op
-                for op in operations
-                if getattr(op, "tile_marker_dim", None) is not None
-            ],
-            [],
-            "fixture assumption violated: expected every marker already "
-            "consumed before this test's own mutation",
+            len(real_markers_before_injection),
+            1,
+            "fixture assumption violated: expected exactly one surviving "
+            "(StarDep-branch) marker before this test's own injection",
         )
 
         # The mutation: tag a real op already in the snapshot -- one that
-        # does not already carry tile_marker_dim -- to simulate a marker
-        # left behind by an incomplete splice/consumption.
-        victim = operations[0]
+        # does not already carry tile_marker_dim -- to simulate an EXTRA
+        # marker left behind by an incomplete splice/consumption, on top
+        # of the one real survivor above.
+        victim = next(
+            op
+            for op in operations
+            if not hasattr(op, "tile_marker_dim")
+            and op not in real_markers_before_injection
+        )
         self.assertFalse(
             hasattr(victim, "tile_marker_dim"),
             "fixture assumption violated: victim op already carries "
@@ -1581,17 +1665,18 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
                 if getattr(op, "tile_marker_dim", None) is not None
             ]
             # This is the mutation catch: the fixed assertion must see the
-            # injected marker. If this assertion ever starts passing (i.e.
-            # remaining_markers == []), the remaining_markers check has
-            # regressed back to something that cannot see a real,
-            # ComputedBuffer-level tile_marker_dim tag -- e.g. F1's
-            # original one-level-too-deep `op.data` bug.
+            # injected marker IN ADDITION TO the one real survivor. If
+            # this assertion ever starts passing with victim missing, the
+            # remaining_markers check has regressed back to something that
+            # cannot see a real, ComputedBuffer-level tile_marker_dim tag
+            # -- e.g. F1's original one-level-too-deep `op.data` bug.
             self.assertEqual(
-                remaining_markers,
-                [victim],
+                sorted(remaining_markers, key=id),
+                sorted([*real_markers_before_injection, victim], key=id),
                 "expected the injected tile_marker_dim to be caught by the "
-                "remaining_markers filter -- if this fails, the filter is "
-                "no longer catching a marker tagged directly on the op",
+                "remaining_markers filter alongside the one real survivor "
+                "-- if this fails, the filter is no longer catching a "
+                "marker tagged directly on the op",
             )
         finally:
             del victim.tile_marker_dim

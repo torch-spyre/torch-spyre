@@ -493,6 +493,8 @@ def plan_coarse_tile_groups(
 
     Untiled/skipped ops (non-ComputedBuffer) have no entry.
     """
+    from torch_spyre._inductor.wsr.for_each_tile_lowering import _marker_dim
+
     plan: dict[int, CoarseTileInfo] = {}
     for group_idx, (group_ops, levels) in enumerate(groups):
         group_id: tuple[int, ...] = (group_idx,)
@@ -509,6 +511,16 @@ def plan_coarse_tile_groups(
 
         for op in group_ops:
             if not isinstance(op, ComputedBuffer):
+                continue
+            if _marker_dim(op) is not None:
+                # A tile_dim_marker op that _consume_tile_dim_markers left
+                # materialized (StarDep-shaped consumer branch -- see its
+                # own comment) is not a tile computation to plan: it never
+                # gets synthesized dim_hints (see
+                # _synthesize_dim_hints_for_group's own marker-exclusion
+                # guard), so giving it a CoarseTileInfo entry here would
+                # only make _apply_plan stamp a spurious loop_info onto it
+                # later, with no corresponding dim_hints to justify it.
                 continue
 
             op_out = op_out_coords(op)
@@ -5755,6 +5767,8 @@ def _plan_read_copies(
     op.get_read_writes() to reflect post-division ranges, neither of which
     holds before _apply_plan runs for that op's group.
     """
+    from torch_spyre._inductor.wsr.for_each_tile_lowering import _marker_dim
+
     op_position = {op.get_operation_name(): i for i, op in enumerate(operations)}
     operations_by_name = {
         op.get_name(): op for op in operations if isinstance(op, ComputedBuffer)
@@ -5770,6 +5784,16 @@ def _plan_read_copies(
             if not isinstance(op, ComputedBuffer):
                 continue
             if not isinstance(op.data, (Pointwise, Reduction)):
+                continue
+            if _marker_dim(op) is not None:
+                # A tile_dim_marker op that _consume_tile_dim_markers left
+                # materialized (StarDep-shaped consumer branch -- see its
+                # own comment) is not an ordinary tile computation: its
+                # per-iteration offset read (the very thing it exists to
+                # carry for its StarDep consumer) is not a candidate for
+                # read-copy sharing/hoisting -- that offset is exactly what
+                # _rescale_index cannot resolve, since it is real per-marker
+                # state, not a tiled dim any group member's loop divides.
                 continue
             for dep in _full_buffer_read_deps(op):
                 # dep.index.coeff(v) is a *linear* coefficient: it is blind
