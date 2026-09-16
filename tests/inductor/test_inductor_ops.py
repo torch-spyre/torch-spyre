@@ -6177,6 +6177,29 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 f"{(result.float() - expected).abs().max().item()}"
             )
 
+    def test_storage_offset_placeholder_view_then_contiguous(self):
+        """A view created in-graph inherits its input's storage offset."""
+        B, H, L, D = 1, 8, 64, 64
+        base = cached_randn(
+            (B, L, 3 * H * D), differentiation="ph_offset_view_contiguous"
+        )
+
+        def packed_k(x):
+            return x.chunk(3, dim=-1)[1].reshape(B, L, H, D).transpose(1, 2)
+
+        def fn(x):
+            return x.transpose(-1, -2).contiguous()
+
+        cpu_view = packed_k(base.clone())
+        expected = fn(cpu_view).float()
+        dev_view = packed_k(base.clone().to("spyre"))
+        assert dev_view.storage_offset() == H * D
+
+        result = _compile_and_run(fn, [dev_view], "spyre", compile=True)
+        assert torch.allclose(result.float(), expected, atol=0.1, rtol=0.1), (
+            f"max abs diff: {(result.float() - expected).abs().max().item()}"
+        )
+
     def test_storage_offset_placeholder_compiled_only(self, op, slicer, base):
         # Same as test_storage_offset_placeholder, minus the eager arm: eager
         # materializes an offset view through spyre::copy_from_d2d, which
