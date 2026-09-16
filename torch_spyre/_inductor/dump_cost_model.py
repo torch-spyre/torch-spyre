@@ -89,17 +89,39 @@ def _work_slices(op, write_index, read_index, iteration_space, work_slices=None)
     )
 
 
-def _cores(op, work_slices=None) -> int:
+def _resolved_work_slices(op, work_slices=None) -> dict:
+    """The op's complete symbol-keyed core-split map (``{}`` when unavailable):
+    the explicit candidate during LX planning, else the committed ownership."""
     try:
         rw = op.get_read_writes()
         write_index = next(iter(rw.writes)).index
         read_index = next((d.index for d in rw.reads), write_index)
         it_space = iteration_space_from_op(op)
-        return math.prod(
-            _work_slices(op, write_index, read_index, it_space, work_slices).values()
-        )
+        return _work_slices(op, write_index, read_index, it_space, work_slices) or {}
+    except Exception:  # noqa: BLE001 - best-effort feature extraction
+        return {}
+
+
+def _cores(op, work_slices=None) -> int:
+    slices = _resolved_work_slices(op, work_slices)
+    return math.prod(slices.values()) if slices else 1
+
+
+def _replication(index, slices: dict):
+    """How many cores each load this read's bytes: the product of the op's core
+    splits on iteration symbols the read index does not contain. A split on a dim
+    the read indexes hands each core a different slice (no replication); a split on
+    a dim it does not index puts the same slice on every core of that split. The
+    symbols are the op's own iteration symbols, so indirect-access symbols in the
+    index are simply never split keys. Splits may be solver symbols (co-optimizing
+    path), in which case the product is a sympy expression, like ``cores``."""
+    if index is None or not slices:
+        return 1
+    try:
+        present = set(getattr(index, "free_symbols", ()) or ())
     except Exception:  # noqa: BLE001 - best-effort feature extraction
         return 1
+    return math.prod(split for sym, split in slices.items() if sym not in present)
 
 
 def _mem_of_layout(layout) -> str:
@@ -486,6 +508,20 @@ def _per_core_run(view, device_dims) -> tuple:
     return (device_dims[d] // splits[d]) * inner, splits[d]
 
 
+def governing_run_split(source_view, destination_view, device_dims) -> tuple:
+    """(run_elems, split) of the FINER of the two views - the side the law keys on.
+
+    Governing side = smaller per-core run; on a run tie the LARGER split (at
+    equal run the higher split measured ~3.6x slower). Direction-symmetric, as
+    the fitted law requires (8.721 vs 8.701 us with the pair reversed). Shared
+    by the extractor here and the solver's candidate enumeration
+    (``lx_relayout.solver_relayout_pair_cost``) so the two paths cannot drift.
+    """
+    src = _per_core_run(source_view, device_dims)
+    dst = _per_core_run(destination_view, device_dims)
+    return min(src, dst, key=lambda t: (t[0], -t[1]))
+
+
 def _relayout_features(op, out_dims):
     """(is_lx_relayout, relayout_run_elems, relayout_split) for one op.
 
@@ -514,15 +550,19 @@ def _relayout_features(op, out_dims):
         )
         if plan is None:
             return zeros
-        src = _per_core_run(plan.source_view, out_dims)
-        dst = _per_core_run(plan.destination_view, out_dims)
-        # Governing side = the finer view: smaller per-core run; on a run tie the
-        # LARGER split (at equal run the higher split measured ~3.6x slower).
-        run_elems, split = min(src, dst, key=lambda t: (t[0], -t[1]))
+        run_elems, split = governing_run_split(
+            plan.source_view, plan.destination_view, out_dims
+        )
         if run_elems <= 0 or split <= 0:
             return zeros
         return True, run_elems, split
-    except Exception:  # noqa: BLE001 - a diagnostic feature must not sink a compile
+    except Exception as exc:  # noqa: BLE001 - a diagnostic feature must not sink a compile
+        # Deliberately broad, but never silent: a regression in the registry
+        # lookup (say an AttributeError from a PerCoreView refactor) must not
+        # masquerade as "no relayouts found" forever.
+        _relayout_logger().debug(
+            "relayout feature extraction failed for %s: %r", op.get_name(), exc
+        )
         return zeros
 
 
@@ -579,6 +619,12 @@ def _writes_graph_output(op, graph_outputs: set) -> bool | None:
     return False
 
 
+def _relayout_logger():
+    from .logging_utils import get_inductor_logger
+
+    return get_inductor_logger("dump_cost_model")
+
+
 def extract_op_features(
     op, work_slices=None, is_lx: Optional[Mapping[str, bool]] = None
 ) -> OpFeatures:
@@ -619,7 +665,8 @@ def extract_op_features(
     out_dims = _device_dims(op.get_layout()) or out_size
     out_elems = _prod_ints(out_dims)
 
-    cores = _cores(op, work_slices)
+    slices = _resolved_work_slices(op, work_slices)
+    cores = math.prod(slices.values()) if slices else 1
 
     # Cross-core ring combine: work division splits OUTPUT dims first, then the reduced
     # axis with leftover cores -> the reduced axis is split only when out_elems < cores.
@@ -786,6 +833,10 @@ def extract_op_features(
                     else in_factor
                 ),
                 is_boundary=(None if graph_inputs is None else name in graph_inputs),
+                # Matmul consumers only: rung-G verified a pointwise broadcast
+                # operand loads once per kernel, the relayout sweep measured a bmm
+                # operand loading once per replicated core (cost_model.ArgTraffic).
+                replication=_replication(index, slices) if is_matmul else 1,
             )
         )
 

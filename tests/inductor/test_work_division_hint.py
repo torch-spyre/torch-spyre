@@ -1714,7 +1714,7 @@ def test_lx_relayout_allocation_is_atomic_in_one_greedy_solve(caplog):
     solver = allocator._build_solver(buffers)
     with caplog.at_level(logging.DEBUG, logger="spyre.inductor.scratchpad.allocator"):
         allocation = allocator._solve(solver, graph)
-        allocator._finalize_lx_relayout_allocation(allocation)
+        allocator._finalize_lx_relayout_allocation(allocation, graph)
 
     by_name = {buffer.name: buffer for buffer in allocation}
     assert by_name["ordinary"].address == 0
@@ -1734,7 +1734,8 @@ def test_lx_relayout_allocation_is_atomic_in_one_greedy_solve(caplog):
 def test_relayout_footprint_uses_device_storage_not_host_strides(host_strides):
     # The first layout is the actual restickified K page from serving prefill.
     # Its old HOST-stride measurement reserved only 256 / 2176 bytes. The
-    # device-storage bound is 8192 / 245760 regardless of the host permutation.
+    # Packed device storage is 8192 / 131072 regardless of the host permutation.
+    # The replicated consumer cannot be sized by dividing the tensor by 32.
     layout = object.__new__(FixedTiledLayout)
     layout.device_layout = SpyreTensorLayout(
         [8, 1, 2, 128, 64], list(host_strides), DataFormats.SEN169_FP16
@@ -1752,7 +1753,7 @@ def test_relayout_footprint_uses_device_storage_not_host_strides(host_strides):
         ((2, 2),), ((2, Mod(floor(_CORE_ID / 16), 2)),), num_cores=32
     )
     assert lx_relayout_module.partition_footprint(layout, source) == 8192
-    assert lx_relayout_module.partition_footprint(layout, destination) == 245760
+    assert lx_relayout_module.partition_footprint(layout, destination) == 131072
 
 
 def _assert_live_buffers_do_not_share_addresses(graph, buffers, limit):

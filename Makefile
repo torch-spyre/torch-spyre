@@ -40,6 +40,14 @@ TEST_CONFIGS ?= tests/configs/torch_spyre_tests
 # labeled for full functional coverage).
 TEST_TYPE ?= regression
 
+# Tiers whose results already exist for the artifact under test, so their configs
+# need not run again. Empty by default, which keeps every existing invocation
+# byte-identical -- a delta only happens when a caller deliberately asks for one.
+# CI fills it from .github/scripts/resolve_covered_tiers.py; set it by hand to
+# reproduce a CI delta locally:
+#   make tests TEST_TYPE=regression TEST_EXCLUDE_TIERS=integration
+TEST_EXCLUDE_TIERS ?=
+
 # Where TEST_TYPE=perf writes its benchmark report. Flat /tmp/results so the CI
 # ClickHouse push step (ingest_xml.py globs *.xml non-recursively) finds it
 # alongside every other suite's JUnit XML, with no per-suite subdirectory.
@@ -50,6 +58,10 @@ CHECK_SCRIPT  := tests/scripts/check_oot_configs.py
 
 # Path to the config filter script (relative to repo root)
 FILTER_SCRIPT := tests/oot_framework/utils/filter_configs.py
+
+# Expands to nothing when TEST_EXCLUDE_TIERS is empty, so the filter command line
+# is unchanged for a full run.
+_EXCLUDE_ARG = $(if $(strip $(TEST_EXCLUDE_TIERS)),--exclude-tiers "$(strip $(TEST_EXCLUDE_TIERS))")
 
 # Config directory to scan (override to narrow/broaden the scope)
 CHECK_CONFIGS ?= tests/configs/torch_spyre_tests
@@ -104,8 +116,8 @@ else ifneq ($(wildcard $(TEST_CONFIGS)/.),)
 	@rc=0; \
 	_single_args='$(PYTEST_ARGS)'; \
 	_multi_args="$$(printf '%s' '$(PYTEST_ARGS)' | sed -E 's#(--junit-xml[= ]+[^ ]*)\.xml#\1-multi-card.xml#')"; \
-	$(MAKE) tests-single-card TEST_TYPE="$(TEST_TYPE)" TEST_CONFIGS="$(TEST_CONFIGS)" PYTEST_ARGS="$$_single_args" || rc=1; \
-	$(MAKE) tests-multi-card TEST_TYPE="$(TEST_TYPE)" PYTEST_ARGS="$$_multi_args" || rc=1; \
+	$(MAKE) tests-single-card TEST_TYPE="$(TEST_TYPE)" TEST_CONFIGS="$(TEST_CONFIGS)" TEST_EXCLUDE_TIERS="$(TEST_EXCLUDE_TIERS)" PYTEST_ARGS="$$_single_args" || rc=1; \
+	$(MAKE) tests-multi-card TEST_TYPE="$(TEST_TYPE)" TEST_EXCLUDE_TIERS="$(TEST_EXCLUDE_TIERS)" PYTEST_ARGS="$$_multi_args" || rc=1; \
 	exit $$rc
 else
 	@if [ ! -f "$(TEST_CONFIGS)" ]; then \
@@ -125,9 +137,9 @@ endif
 .PHONY: tests-single-card tests-multi-card
 tests-single-card: ## Run TEST_TYPE's non-distributed slice only (distributed_tests excluded from the scan). Needs 1 card.
 ifeq ($(TEST_TYPE),trunk)
-	$(eval _ALL := $(shell python3 $(FILTER_SCRIPT) --config-dir tests/configs --test-type trunk --format paths))
+	$(eval _ALL := $(shell python3 $(FILTER_SCRIPT) --config-dir tests/configs --test-type trunk $(_EXCLUDE_ARG) --format paths))
 else
-	$(eval _ALL := $(shell python3 $(FILTER_SCRIPT) --config-dir $(TEST_CONFIGS) --test-type "$(TEST_TYPE)" --format paths))
+	$(eval _ALL := $(shell python3 $(FILTER_SCRIPT) --config-dir $(TEST_CONFIGS) --test-type "$(TEST_TYPE)" $(_EXCLUDE_ARG) --format paths))
 endif
 	$(eval _DISTRIBUTED := $(abspath $(wildcard tests/configs/distributed_tests/*.yaml)))
 	$(eval _PATHS := $(filter-out $(_DISTRIBUTED),$(_ALL)))
@@ -138,7 +150,7 @@ endif
 	@TORCH_SPYRE_TEST_TYPE="$(TEST_TYPE)" bash tests/run_test.sh $(_PATHS) $(PYTEST_ARGS)
 
 tests-multi-card: ## Run TEST_TYPE's distributed slice only (tests/configs/distributed_tests). Needs 2 cards.
-	$(eval _PATHS := $(shell python3 $(FILTER_SCRIPT) --config-dir tests/configs/distributed_tests --test-type "$(TEST_TYPE)" --format paths))
+	$(eval _PATHS := $(shell python3 $(FILTER_SCRIPT) --config-dir tests/configs/distributed_tests --test-type "$(TEST_TYPE)" $(_EXCLUDE_ARG) --format paths))
 	@if [ -z "$(_PATHS)" ]; then \
 		echo "ERROR: no configs matched TEST_TYPE=$(TEST_TYPE) under tests/configs/distributed_tests" >&2; \
 		exit 1; \

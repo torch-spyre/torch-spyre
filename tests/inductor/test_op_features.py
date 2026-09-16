@@ -66,7 +66,7 @@ class CandidateDivisionTest(TestCase):
         """SA feature extraction neither encodes nor mutates Scheduler transport."""
         m, n, kk = sympy.symbols("m n kk")
         op = object()
-        division = CoreDivision(output_splits={m: 8}, reduction_splits={kk: 2})
+        division = CoreDivision(splits={m: 8, kk: 2}, reduction_syms=frozenset({kk}))
         expected = {m: 8, n: 1, kk: 2}
         with patch(
             "torch_spyre._inductor.scratchpad.sa_cooptimizer.iteration_space_from_op",

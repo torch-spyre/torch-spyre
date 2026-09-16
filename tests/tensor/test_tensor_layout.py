@@ -520,6 +520,27 @@ class TestSpyreTensorLayout(TestCase):
         self.assertEqual(stl.device_size, [4, 512, 64])
         self.assertEqual(stl.stride_map, [64, 256, 1])
 
+    def test_to_same_layout_honors_a_different_explicit_device(self):
+        """A matching layout must not bypass an explicit cross-device copy."""
+        if torch.spyre.device_count() < 2:
+            self.skipTest("requires at least two Spyre devices")
+
+        previous = torch.spyre.current_device()
+        target = torch.device("spyre", (previous + 1) % torch.spyre.device_count())
+        x = torch.rand([128, 256], dtype=torch.float16)
+        layout = SpyreTensorLayout(list(x.shape), x.dtype)
+        source = x.to(torch.device("spyre", previous), device_layout=layout)
+
+        result = source.to(target, device_layout=layout)
+
+        self.assertIsNot(result, source)
+        self.assertEqual(source.device, torch.device("spyre", previous))
+        self.assertEqual(result.device, target)
+        self.assertEqual(result.device_tensor_layout(), layout)
+        round_trip = result.to(source.device, device_layout=layout, copy=True)
+        torch.testing.assert_close(round_trip.cpu(), x, rtol=2e-3, atol=1e-4)
+        self.assertEqual(torch.spyre.current_device(), previous)
+
     def test_empty_layout_patched(self):
         x_stl = SpyreTensorLayout(
             [512, 8, 256], [2048, 256, 1], torch.float16, [2, 1, 0]
