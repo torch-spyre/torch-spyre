@@ -59,6 +59,7 @@ from torch_spyre._inductor.scratchpad.sa_cooptimizer import (
     SaCoOptimizingSolver,
     _canonical_key,
     _GeneratedDivisions,
+    _MenuDivisions,
     _split_key,
     _TableRelation,
     _ViewRelation,
@@ -632,7 +633,7 @@ class RegionRecolorTest(TestCase):
         # After a recolor, every op the flood reached carries the flooded config
         # and the placement the packer holds for it reflects that division's
         # footprint
-        # -- i.e. the resize ripple in ``_apply_recolor`` reached everything
+        # -- i.e. the resize ripple in ``_apply_assignment`` reached everything
         # ``_flood_region`` assigned, not just the anchor.
         resized = 0
         for case, gi, buffers in _all_cases():
@@ -641,7 +642,7 @@ class RegionRecolorTest(TestCase):
             for anchor in solver._anchor_candidates:
                 config = _splitting(solver, anchor)[0]
                 assignment = solver._flood_region(anchor, config)
-                solver._apply_recolor(assignment)
+                solver._apply_assignment(assignment)
                 addresses = solver.packer.addresses
                 tag = f"{case}[{gi}] anchor={anchor}"
                 for op, flooded in assignment.items():
@@ -2016,3 +2017,120 @@ class TestCoarseTilingIsGatedOnItsApplyStep(unittest.TestCase):
             with self.assertRaises(Unsupported) as caught:
                 alloc._commit_divisions(graph, [buf])
         self.assertIn("buf0", str(caught.exception))
+
+
+def _run_buffer(name, position, space=None):
+    """A two-axis buffer that sits at a stated operation position, so it can be
+    part of a coarse-tiling run."""
+    buf = _two_axis_buffer(name=name)
+    buf.uses = [position, position + 1]
+    buf.op_position = position
+    buf.division_space = space
+    return buf
+
+
+class ContiguousTilingRunTest(TestCase):
+    """A tiled region has to be a contiguous run of the operation list, because
+    that is what ``derive_tiling_groups`` forms and what ``_validate_contiguous``
+    demands. Both structural moves keep it so by construction rather than
+    repairing it afterwards."""
+
+    def _tiled(self, solver, idx, tiling=None):
+        source = solver._sources[idx]
+        return source.retiled(solver.chosen[idx], tiling or _TILE_4)
+
+    def test_a_run_is_the_maximal_stretch_agreeing_on_the_tiling(self):
+        bufs = [_run_buffer(n, p) for p, n in enumerate("ABC")]
+        for buf in bufs:
+            buf.division_space = _two_axis_space(tiling=_tiling_space())
+        solver = _primed_topology(bufs)
+        self.assertEqual(solver._run_bounds(0), (0, 2))  # all untiled: one run
+        solver.chosen[1] = self._tiled(solver, 1)
+        self.assertEqual(solver._run_bounds(1), (1, 1))
+        self.assertEqual(solver._run_bounds(0), (0, 0))
+        self.assertEqual(solver._run_bounds(2), (2, 2))
+        solver.chosen[0] = self._tiled(solver, 0)
+        self.assertEqual(solver._run_bounds(0), (0, 1))
+
+    def test_an_operation_with_no_buffer_breaks_a_run(self):
+        # Position 1 belongs to an operation the solver does not own -- nothing
+        # can carry a tiling to it, so it is untiled and the run stops there.
+        bufs = [_run_buffer("A", 0), _run_buffer("C", 2)]
+        for buf in bufs:
+            buf.division_space = _two_axis_space(tiling=_tiling_space())
+        solver = _primed_topology(bufs)
+        solver.chosen[0] = self._tiled(solver, 0)
+        solver.chosen[1] = self._tiled(solver, 1)
+        self.assertEqual(solver._run_bounds(0), (0, 0))
+        self.assertEqual(solver._run_bounds(2), (2, 2))
+
+    def test_the_trim_strips_a_tiling_the_anchors_run_does_not_reach(self):
+        bufs = [_run_buffer(n, p) for p, n in enumerate("ABC")]
+        for buf in bufs:
+            buf.division_space = _two_axis_space(tiling=_tiling_space())
+        solver = _primed_topology(bufs)
+        # What a flood over the residency relation can produce: A and C tiled,
+        # B (between them) left alone. Two groups at apply time, one price.
+        assignment = {0: self._tiled(solver, 0), 2: self._tiled(solver, 2)}
+        trimmed = solver._trim_tilings_to_anchor_run(0, assignment)
+        self.assertEqual(trimmed[0].tiling, _TILE_4)
+        self.assertTrue(trimmed[2].tiling.is_untiled)
+        # The splits are the flood's business and are left exactly as they were.
+        self.assertEqual(trimmed[2].output_splits, assignment[2].output_splits)
+
+    def test_the_trim_leaves_a_contiguous_region_tiled(self):
+        bufs = [_run_buffer(n, p) for p, n in enumerate("ABC")]
+        for buf in bufs:
+            buf.division_space = _two_axis_space(tiling=_tiling_space())
+        solver = _primed_topology(bufs)
+        assignment = {0: self._tiled(solver, 0), 1: self._tiled(solver, 1)}
+        trimmed = solver._trim_tilings_to_anchor_run(0, assignment)
+        self.assertEqual([trimmed[i].tiling for i in (0, 1)], [_TILE_4, _TILE_4])
+
+    def test_a_buffer_with_no_operation_position_may_hold_no_tiling(self):
+        # An input clone, or any buffer built without operation order: it is in
+        # no run, so nothing can establish that a group containing it is
+        # contiguous, and declining is the safe direction.
+        buf = _two_axis_buffer(name="A")
+        buf.division_space = _two_axis_space(tiling=_tiling_space())
+        solver = _primed_topology([buf])
+        self.assertIsNone(solver._position_of[0])
+        assignment = {0: self._tiled(solver, 0)}
+        self.assertTrue(
+            solver._trim_tilings_to_anchor_run(0, assignment)[0].tiling.is_untiled
+        )
+
+    def test_a_boundary_flip_respecs_one_whole_side_of_the_run(self):
+        bufs = [_run_buffer(n, p) for p, n in enumerate("ABCD")]
+        for buf in bufs:
+            buf.division_space = _two_axis_space(tiling=_tiling_space())
+        solver = _primed_topology(bufs)
+        solver._retile_boundary(1, self._tiled(solver, 1))
+        tiled = [i for i in range(4) if not solver.chosen[i].tiling.is_untiled]
+        # Whichever side was drawn, it is a contiguous stretch containing the
+        # drawn op and reaching one end of its run -- A..H or H..Z.
+        self.assertIn(tiled, ([0, 1], [1, 2, 3]))
+
+    def test_a_boundary_flip_truncates_at_an_op_that_refuses_the_tiling(self):
+        # C is menu-backed, so it can take no tiling at all. The walk stops
+        # there rather than skipping it (which would break contiguity) or
+        # abandoning the move (which would make long runs immovable).
+        bufs = [_run_buffer(n, p) for p, n in enumerate("ABCD")]
+        for buf in (bufs[0], bufs[1], bufs[3]):
+            buf.division_space = _two_axis_space(tiling=_tiling_space())
+        solver = _primed_topology(bufs)
+        self.assertIsInstance(solver._sources[2], _MenuDivisions)
+        with mock.patch.object(solver._rng, "random", return_value=0.0):  # forward
+            solver._retile_boundary(0, self._tiled(solver, 0))
+        tiled = [i for i in range(4) if not solver.chosen[i].tiling.is_untiled]
+        self.assertEqual(tiled, [0, 1])
+
+    def test_a_search_with_no_tiling_space_never_takes_the_boundary_arm(self):
+        bufs = [_run_buffer(n, p) for p, n in enumerate("ABCD")]
+        for buf in bufs:
+            buf.division_space = _two_axis_space()
+        solver = _primed_topology(bufs)
+        with mock.patch.object(solver, "_retile_boundary") as boundary:
+            for _ in range(200):
+                solver._execute_move("flip")
+        boundary.assert_not_called()

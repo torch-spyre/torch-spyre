@@ -329,6 +329,15 @@ class CoreDivisionBuffer(LifetimeBoundBuffer):
     # menu is not an enumeration to begin with: an input clone, a non-pointwise
     # op, an op pinned to its committed division.
     division_space: Optional["OpSplitSpace"] = None
+    # Index of this buffer's producing operation in ``graph.operations``, which
+    # is what a coarse-tiling *run* is measured over: a group has to occupy one
+    # contiguous stretch of that list, and buffer order is not operation order
+    # (input clones are prepended, and an operation producing no solver buffer
+    # has no index at all). ``None`` where there is no producing operation -- an
+    # input clone -- or where the caller does not supply one, which is what a
+    # solver reads as "operation order is unknown here, so no tiling may span
+    # more than nothing".
+    op_position: Optional[int] = None
     chosen_division: Optional[int] = None
     # Solver-chosen relayouts feeding this consumer: parent_buf_name -> the
     # fired candidate with the destination address (bytes) of the group's copy
