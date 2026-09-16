@@ -644,9 +644,11 @@ PYBIND11_MODULE(_C, m) {
         "        If None, uses the current stream. Defaults to None.\n"
         "    profiler_event_name (str, optional): Bounded base name for "
         "profiler-visible compute events. Defaults to None.\n"
-        "    sdsc_bundle_dir_prefix (str, optional): 8-char hex prefix of the "
-        "SDSC bundle directory; emitted as args.sdsc_bundle_dir_prefix "
-        "in profiler traces.\n\n"
+        "    sdsc_bundle_dir_prefix (str, optional): Hex prefix of the SDSC "
+        "bundle directory; emitted as args.sdsc_bundle_dir_prefix in profiler "
+        "traces.  Use 16 chars (first 16 of the SHA-256 cache key) on the "
+        "cached path, or 8 chars (UUID prefix) on the no-cache path. "
+        "Empty string disables registration.\n\n "
         "Returns:\n"
         "    Prepared JobPlan ready for execution");
   // Bind the current-stream overload (resolves the current stream internally).

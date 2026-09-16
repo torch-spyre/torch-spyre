@@ -192,5 +192,16 @@ class TestKtirDboSuccess(_PrereqCase):
         self.assertIsNone(run.call_args[1].get("env"))
 
 
+class TestSdscBundleDirPrefix(_PrereqCase):
+    def test_prefix_is_forwarded_to_runner(self):
+        self.sdsc_bundle_dir_prefix = "ab12cd34"
+        self._write_spyrecode()
+
+        with mock.patch(f"{_MODULE}.subprocess.run"):
+            runner = self.compile()
+
+        self.assertEqual(runner.sdsc_bundle_dir_prefix, "ab12cd34")
+
+
 if __name__ == "__main__":
     unittest.main()

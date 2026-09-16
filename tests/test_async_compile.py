@@ -18,7 +18,7 @@ from concurrent.futures import Future
 import os
 from pathlib import Path
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import patch, MagicMock
 
 import pytest
 import torch
@@ -28,6 +28,8 @@ from torch._inductor.async_compile import shutdown_compile_workers
 from torch_spyre._inductor import config as spyre_config
 from torch_spyre._inductor.codegen.compute_ops import SymbolKind
 from torch_spyre.execution import async_compile as async_compile_mod
+
+FIXED_UUID_HEX = "ab12cd34ef56ab12cd34ef56ab12cd34"
 
 
 class _RecordingPool:
@@ -383,3 +385,216 @@ def test_real_subprocess_pool_runs_backend_jobs_concurrently(tmp_path: Path):
         shutdown_compile_workers()
 
     assert {path.name for path in marker_dir.iterdir()} == {"kernel0", "kernel1"}
+
+
+def test_cache_hit_runner_gets_16char_prefix():
+    """On a cache hit, SpyreSDSCKernelRunner is returned immediately from sdsc()
+    (no future, no pool interaction) with sdsc_bundle_dir_prefix=cache_key[:16].
+    """
+    cache_key = "f4e9c2a1d3b7e6c2a9f1b4e8d2c5a7f3b1d9e4c8a6f2b5d0e3c7a9f1b8d4e2c6"
+    compiler = async_compile_mod.SpyreAsyncCompile()
+    runners_created = []
+
+    def record_runner(
+        name, code_dir, kernel_provenance=None, sdsc_bundle_dir_prefix=""
+    ):
+        runners_created.append(sdsc_bundle_dir_prefix)
+        return (name, code_dir, kernel_provenance, sdsc_bundle_dir_prefix)
+
+    with (
+        spyre_config.patch({"spyre_kernel_cache": True}),
+        patch.object(async_compile_mod, "compute_specs_hash", return_value=cache_key),
+        patch.object(
+            async_compile_mod, "get_cached_kernel_dir", return_value="/cache/key"
+        ),
+        patch.object(async_compile_mod, "find_unimplemented", return_value=None),
+        patch.object(
+            async_compile_mod, "build_kernel_provenance_descriptor", return_value=None
+        ),
+        patch.object(
+            async_compile_mod, "SpyreSDSCKernelRunner", side_effect=record_runner
+        ),
+    ):
+        scope = {"kernel": compiler.sdsc("sdsc_0", [])}
+
+        # Cache hit: runner created immediately inside sdsc(), no wait() needed
+        assert runners_created == [cache_key[:16]]
+        assert scope["kernel"][3] == cache_key[:16]
+
+
+def test_cache_miss_async_runner_gets_16char_prefix():
+    """_SpyreCompileFuture resolves with sdsc_bundle_dir_prefix=cache_key[:16]
+    on a cache miss (caching enabled, async DXP pool in use).
+    """
+    cache_key = "f4e9c2a1d3b7e6c2a9f1b4e8d2c5a7f3b1d9e4c8a6f2b5d0e3c7a9f1b8d4e2c6"
+    pool = _RecordingPool()
+    compiler = async_compile_mod.SpyreAsyncCompile()
+    runners_created = []
+
+    def record_runner(
+        name, code_dir, kernel_provenance=None, sdsc_bundle_dir_prefix=""
+    ):
+        runners_created.append(sdsc_bundle_dir_prefix)
+        return (name, code_dir, kernel_provenance, sdsc_bundle_dir_prefix)
+
+    with (
+        torch._inductor.config.patch({"compile_threads": 2}),
+        spyre_config.patch({"async_dxp_compile": True, "spyre_kernel_cache": True}),
+        patch.object(compiler, "wait_pool_ready"),
+        patch.object(compiler, "use_process_pool", return_value=True),
+        patch.object(compiler, "process_pool", return_value=pool),
+        patch.object(async_compile_mod, "compute_specs_hash", return_value=cache_key),
+        patch.object(async_compile_mod, "get_cached_kernel_dir", return_value=None),
+        patch.object(
+            async_compile_mod, "allocate_compile_dir", return_value="/tmp/key.tmp"
+        ),
+        patch.object(
+            async_compile_mod, "commit_compile_dir", return_value="/cache/key"
+        ),
+        patch.object(async_compile_mod, "generate_bundle"),
+        patch.object(async_compile_mod, "find_unimplemented", return_value=None),
+        patch.object(
+            async_compile_mod, "build_kernel_provenance_descriptor", return_value=None
+        ),
+        patch.object(
+            async_compile_mod, "SpyreSDSCKernelRunner", side_effect=record_runner
+        ),
+    ):
+        scope = {"kernel": compiler.sdsc("sdsc_0", [])}
+
+        # Before wait(): future not yet resolved, runner not yet created
+        assert not runners_created
+
+        pool.futures[0].set_result("compiled")
+        compiler.wait(scope)
+
+    # After wait(): prefix must be the first 16 chars of the cache key
+    assert runners_created == [cache_key[:16]]
+    assert scope["kernel"][3] == cache_key[:16]
+
+
+def test_cache_miss_sync_runner_gets_16char_prefix():
+    """On a cache miss with caching enabled and sync DXP, SpyreSDSCKernelRunner
+    is created immediately (no future) with sdsc_bundle_dir_prefix=cache_key[:16].
+    """
+    cache_key = "f4e9c2a1d3b7e6c2a9f1b4e8d2c5a7f3b1d9e4c8a6f2b5d0e3c7a9f1b8d4e2c6"
+    compiler = async_compile_mod.SpyreAsyncCompile()
+    runners_created = []
+
+    def record_runner(
+        name, code_dir, kernel_provenance=None, sdsc_bundle_dir_prefix=""
+    ):
+        runners_created.append(sdsc_bundle_dir_prefix)
+        return (name, code_dir, kernel_provenance, sdsc_bundle_dir_prefix)
+
+    with (
+        torch._inductor.config.patch({"compile_threads": 1}),
+        spyre_config.patch({"async_dxp_compile": False, "spyre_kernel_cache": True}),
+        patch.object(async_compile_mod, "compute_specs_hash", return_value=cache_key),
+        patch.object(async_compile_mod, "get_cached_kernel_dir", return_value=None),
+        patch.object(
+            async_compile_mod, "allocate_compile_dir", return_value="/tmp/key.tmp"
+        ),
+        patch.object(
+            async_compile_mod, "commit_compile_dir", return_value="/cache/key"
+        ),
+        patch.object(async_compile_mod, "generate_bundle"),
+        patch.object(async_compile_mod, "find_unimplemented", return_value=None),
+        patch.object(
+            async_compile_mod, "build_kernel_provenance_descriptor", return_value=None
+        ),
+        patch.object(compiler, "_submit_dxp", return_value=None),
+        patch.object(
+            async_compile_mod, "SpyreSDSCKernelRunner", side_effect=record_runner
+        ),
+    ):
+        scope = {"kernel": compiler.sdsc("sdsc_0", [])}
+
+        # Sync path: runner is created immediately, no wait() needed
+        # prefix must be the first 16 chars of the cache key
+        assert runners_created == [cache_key[:16]]
+        assert scope["kernel"][3] == cache_key[:16]
+
+
+def test_cache_disabled_async_runner_gets_8char_uuid():
+    """_SpyreCompileFuture resolves with sdsc_bundle_dir_prefix=uuid[:8] (caching disabled, async DXP)."""
+    pool = _RecordingPool()
+    compiler = async_compile_mod.SpyreAsyncCompile()
+    runners_created = []
+
+    fake_uuid = MagicMock()
+    fake_uuid.hex = FIXED_UUID_HEX
+
+    def record_runner(
+        name, code_dir, kernel_provenance=None, sdsc_bundle_dir_prefix=None
+    ):
+        runners_created.append(sdsc_bundle_dir_prefix)
+        return (name, code_dir, kernel_provenance, sdsc_bundle_dir_prefix)
+
+    with (
+        torch._inductor.config.patch({"compile_threads": 2}),
+        spyre_config.patch({"async_dxp_compile": True, "spyre_kernel_cache": False}),
+        patch.object(compiler, "wait_pool_ready"),
+        patch.object(compiler, "use_process_pool", return_value=True),
+        patch.object(compiler, "process_pool", return_value=pool),
+        patch.object(async_compile_mod, "generate_bundle"),
+        patch.object(async_compile_mod, "find_unimplemented", return_value=None),
+        patch.object(
+            async_compile_mod, "build_kernel_provenance_descriptor", return_value=None
+        ),
+        patch.object(
+            async_compile_mod, "SpyreSDSCKernelRunner", side_effect=record_runner
+        ),
+        patch.object(async_compile_mod.uuid, "uuid4", return_value=fake_uuid),
+    ):
+        scope = {"kernel": compiler.sdsc("sdsc_0", [])}
+
+        # Before wait(): future not yet resolved, runner not yet created
+        assert not runners_created
+
+        pool.futures[0].set_result("compiled")
+        compiler.wait(scope)
+
+    # After wait(): prefix must be the first 8 chars of the uuid prefix
+    expected_prefix = FIXED_UUID_HEX[:8]
+    assert runners_created == [expected_prefix]
+    assert scope["kernel"][3] == expected_prefix
+
+
+def test_cache_disabled_sync_runner_gets_8char_uuid():
+    """With caching disabled and sync DXP, SpyreSDSCKernelRunner
+    is created immediately (no future) with sdsc_bundle_dir_prefix=uuid[:8].
+    """
+    compiler = async_compile_mod.SpyreAsyncCompile()
+    runners_created = []
+
+    fake_uuid = MagicMock()
+    fake_uuid.hex = FIXED_UUID_HEX
+
+    def record_runner(
+        name, code_dir, kernel_provenance=None, sdsc_bundle_dir_prefix=""
+    ):
+        runners_created.append(sdsc_bundle_dir_prefix)
+        return (name, code_dir, kernel_provenance, sdsc_bundle_dir_prefix)
+
+    with (
+        torch._inductor.config.patch({"compile_threads": 1}),
+        spyre_config.patch({"async_dxp_compile": False, "spyre_kernel_cache": False}),
+        patch.object(async_compile_mod, "generate_bundle"),
+        patch.object(async_compile_mod, "find_unimplemented", return_value=None),
+        patch.object(
+            async_compile_mod, "build_kernel_provenance_descriptor", return_value=None
+        ),
+        patch.object(compiler, "_submit_dxp", return_value=None),
+        patch.object(
+            async_compile_mod, "SpyreSDSCKernelRunner", side_effect=record_runner
+        ),
+        patch.object(async_compile_mod.uuid, "uuid4", return_value=fake_uuid),
+    ):
+        scope = {"kernel": compiler.sdsc("sdsc_0", [])}
+
+        # Sync path: runner is created immediately, no wait() needed
+        # prefix must be the first 8 chars of the uuid prefix
+        expected_prefix = FIXED_UUID_HEX[:8]
+        assert runners_created == [expected_prefix]
+        assert scope["kernel"][3] == expected_prefix
