@@ -233,6 +233,22 @@ def _logical_split_ownership(
     )
 
 
+def _direct_source_ownership_matches(
+    consumer: ComputedBuffer,
+    direct_op: ComputedBuffer,
+    copy_dep: MemoryDep,
+    source_dep: MemoryDep,
+    copy_view,
+    source_view,
+) -> bool:
+    """Whether bypassing a staged copy preserves each core's logical slice."""
+    if per_core_views_equal(copy_view, source_view):
+        return True
+    copy_ownership = _logical_split_ownership(consumer, copy_dep)
+    source_ownership = _logical_split_ownership(direct_op, source_dep)
+    return copy_ownership is not None and copy_ownership == source_ownership
+
+
 def _clone_direct_consumer(
     consumer: ComputedBuffer, record: ReadCopyElisionRecord
 ) -> ComputedBuffer:
@@ -458,21 +474,22 @@ def _prove_matmul_direct_read(
         return None, "output core ownership changed"
     if not copy_ok:
         return None, "staged-copy core ownership is not representable"
-    if is_matmul and not source_ok:
-        return None, "direct weight core ownership is not representable"
+    if not source_ok:
+        return None, "direct-source core ownership is not representable"
     # Representability alone is insufficient: both views may be legal while
     # assigning different source slices to the same core.  The staging copy
     # is the behavior being replaced, so the direct HBM read must preserve
     # its exact physical core-to-slice map.
-    if is_matmul and not per_core_views_equal(copy_view, source_view):
+    if not _direct_source_ownership_matches(
+        consumer, direct_op, copy_dep, source_dep, copy_view, source_view
+    ):
         copy_ownership = _logical_split_ownership(consumer, copy_dep)
         source_ownership = _logical_split_ownership(direct_op, source_dep)
-        if copy_ownership is None or copy_ownership != source_ownership:
-            return None, (
-                "direct source ownership does not match the staged copy: "
-                f"physical={source_view} != {copy_view}; "
-                f"logical={source_ownership} != {copy_ownership}"
-            )
+        return None, (
+            "direct source ownership does not match the staged copy: "
+            f"physical={source_view} != {copy_view}; "
+            f"logical={source_ownership} != {copy_ownership}"
+        )
     if getattr(consumer, "op_it_space_splits", None) != getattr(
         direct_op, "op_it_space_splits", None
     ):
@@ -553,7 +570,7 @@ def elide_proven_read_copies(graph: GraphLowering) -> None:
             direct_op.data,
             operations,
             pass_name="read_copy_elision",
-            reason="read advancing matmul weights directly from HBM",
+            reason="read advancing input directly from HBM",
         )
         replacement.loop_info = direct_op.loop_info  # type: ignore[attr-defined]
         for attr in ("layouts", "restick_cost_fn", "op_it_space_splits"):

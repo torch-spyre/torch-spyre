@@ -3649,6 +3649,54 @@ class TestCoarseTileSpyreHints(InductorTestCase):
             "Expected loop count 4 in generated source",
         )
 
+    def test_pointwise_direct_read_keeps_copy_for_different_core_ownership(self):
+        """A pointwise direct read cannot change which source slice a core owns."""
+        from torch_spyre._inductor import spyre_hint
+        from torch_spyre._inductor.pass_utils import PerCoreView
+
+        A, B = 256, 128
+        x = torch.randn(A, B, dtype=torch.float16).to("spyre")
+        _declare_tensor_dim("A", A)
+        _declare_tensor_dim("B", B)
+        _name_tensor_dims(x, ["A", "B"])
+
+        def fn(x):
+            with spyre_hint(num_tiles_per_dim={"A": 4}):
+                return torch.abs(x)
+
+        output_view = PerCoreView((), (), num_cores=1)
+        staged_view = PerCoreView((), (), num_cores=2)
+        direct_view = PerCoreView((), (), num_cores=4)
+        staged_ownership = (("d0", 2, 0),)
+        direct_ownership = (("d1", 2, 0),)
+        with (
+            mock_patch(_LAUNCH_JOBPLAN),
+            mock_patch(_PREPARE_KERNEL),
+            mock_patch("subprocess.run"),
+            mock_patch(
+                "torch_spyre._inductor.read_copy_elision._per_core_view_on_buf",
+                side_effect=[
+                    (output_view, None, True),
+                    (output_view, None, True),
+                    (staged_view, None, True),
+                    (direct_view, None, True),
+                ],
+            ),
+            mock_patch(
+                "torch_spyre._inductor.read_copy_elision._logical_split_ownership",
+                side_effect=[
+                    staged_ownership,
+                    direct_ownership,
+                    staged_ownership,
+                    direct_ownership,
+                ],
+            ) as logical_ownership,
+        ):
+            _, source_codes = run_and_get_code(torch.compile(fn), x)
+
+        self.assertTrue(logical_ownership.called)
+        self.assertIn("coarse_tile_read_copy", source_codes[0])
+
     # ------------------------------------------------------------------
     # Softmax-shaped chain (pointwise-reduce-pointwise)
     # ------------------------------------------------------------------

@@ -6132,6 +6132,39 @@ class TestReadCopyElisionProof(unittest.TestCase):
 
         self.assertEqual(_loop_advance_bound(op, dep, info, 0), (0, 16384))
 
+    def test_loop_bound_maps_output_and_reduction_dims_around_squeezed_dim(self):
+        from torch._inductor.dependencies import MemoryDep
+        from torch_spyre._inductor.read_copy_elision import _loop_advance_bound
+
+        d0, d1, d2 = sympy.symbols("d0 d1 d2", integer=True)
+        op = SimpleNamespace(
+            data=SimpleNamespace(
+                ranges=[Integer(64), Integer(1)],
+                reduction_ranges=[Integer(32), Integer(16)],
+            )
+        )
+        dep = MemoryDep(
+            name="weight",
+            index=512 * d0 + 16 * d1 + d2,
+            var_names=(d0, d1, d2),
+            size=(Integer(64), Integer(32), Integer(16)),
+        )
+        info = CoarseTileInfo(
+            loop_group_id=(0,),
+            loop_count=[Integer(2)],
+            loop_tiled_dims=[[0, 2]],
+            tiled_dims_per_read=[
+                [
+                    [
+                        (0, Integer(8)),
+                        (2, Integer(4)),
+                    ]
+                ]
+            ],
+        )
+
+        self.assertEqual(_loop_advance_bound(op, dep, info, 0), (0, 4160))
+
     def test_direct_read_storage_encoding_must_match(self):
         from torch_spyre._C import ElementArrangement
         from torch_spyre._inductor.read_copy_elision import _same_storage_encoding
@@ -6157,7 +6190,11 @@ class TestReadCopyElisionProof(unittest.TestCase):
 
     def test_logical_split_ownership_ignores_physical_layout_axes(self):
         from torch._inductor.dependencies import MemoryDep
-        from torch_spyre._inductor.read_copy_elision import _logical_split_ownership
+        from torch_spyre._inductor.pass_utils import PerCoreView
+        from torch_spyre._inductor.read_copy_elision import (
+            _direct_source_ownership_matches,
+            _logical_split_ownership,
+        )
 
         head, query, feature = sympy.symbols("head query feature", integer=True)
         core_id = sympy.Symbol("core_id", integer=True)
@@ -6196,6 +6233,19 @@ class TestReadCopyElisionProof(unittest.TestCase):
         self.assertNotEqual(
             _logical_split_ownership(op, full),
             _logical_split_ownership(op, different_slice),
+        )
+
+        staged_view = PerCoreView((), (), num_cores=2)
+        direct_view = PerCoreView((), (), num_cores=4)
+        self.assertTrue(
+            _direct_source_ownership_matches(
+                op, op, transposed_tile, full, staged_view, direct_view
+            )
+        )
+        self.assertFalse(
+            _direct_source_ownership_matches(
+                op, op, different_slice, full, staged_view, direct_view
+            )
         )
 
 
