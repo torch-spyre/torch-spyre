@@ -56,11 +56,10 @@ inputs:
     default: ''
   torch-spyre-dir:
     description: >
-      Directory that already holds a checkout containing
-      .github/scripts/ingest_xml.py (e.g. the prebaked dev image source dir or
-      a per-job checkout). When set and the script is found there, the action
-      reuses it instead of a redundant sparse-checkout. Empty = always
-      sparse-checkout the script into the workspace.
+      Fallback directory containing .github/scripts/ingest_xml.py when the
+      workspace does not already have this ref's copy. The action searches
+      $GITHUB_WORKSPACE first so a prebaked product tree cannot hide a
+      newer sparse-checkout. Empty = workspace, then sparse-checkout.
     required: false
     default: ''
   clickhouse-host:
@@ -124,11 +123,11 @@ runs:
         fi
 
     # The ingest script lives under .github/scripts (a different path than the
-    # .github/actions the perf job already checks out). Reuse an on-disk copy
-    # when the caller has one (perf card runner: prebaked image or a per-job
-    # checkout); otherwise fall back to a sparse-checkout, which reproduces the
-    # push-to-clickhouse.yaml caller's original behavior (it has no product
-    # checkout).
+    # .github/actions the perf job already checks out). Prefer $GITHUB_WORKSPACE
+    # (the job's sparse-checkout of this ref) over torch-spyre-dir. Searching
+    # a prebaked tree first would keep ingest=ok until the next image bake.
+    # Fall back to torch-spyre-dir, then a sparse-checkout (push-to-clickhouse
+    # has no product checkout).
     - name: Locate ingest script (on disk)
       id: locate
       if: steps.gate.outputs.configured == 'true'
@@ -138,7 +137,7 @@ runs:
       run: |
         REL=.github/scripts/ingest_xml.py
         FOUND=""
-        for base in "${TS_DIR}" "${GITHUB_WORKSPACE}"; do
+        for base in "${GITHUB_WORKSPACE}" "${TS_DIR}"; do
           [ -n "${base}" ] || continue
           if [ -f "${base}/${REL}" ]; then
             FOUND="${base}/${REL}"

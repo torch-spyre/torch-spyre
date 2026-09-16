@@ -5,7 +5,8 @@ batch-inserts the results into ClickHouse.
 
 Supports two XML types:
   1. Pytest JUnit Test-result XMLs  --> test_runs / test_cases / run_properties
-  2. Performance benchmark XMLs (classname contains ".benchmark") --> benchmark_runs / perf_benchmarks
+  2. Performance benchmark XMLs (every classname contains "benchmark",
+     or an empty spyre-perf-suite / report.xml envelope) --> benchmark_runs / perf_benchmarks
 
 Usage (called by the GHA workflow):
     python3 ingest_xml.py \
@@ -20,6 +21,7 @@ Usage (called by the GHA workflow):
 
 import argparse
 import hashlib
+import json
 import os
 import platform as _platform
 import sys
@@ -84,14 +86,32 @@ _GRANITE_CONFIG_RE = re.compile(r"bs(?P<batch_size>\d+)(?:_pl(?P<prompt_length>\
 
 
 KERNEL_CLASSNAME = "kernel_benchmark"
+PERF_SUITE_NAME = "spyre-perf-suite"
+# version_info must name these four with a real commit. spyre-perf-suite is
+# not required until that SHA is emitted (#150).
+_REQUIRED_PROVENANCE_KEYS = ("torch-spyre", "flex", "deeptools", "spyre-comms")
+_MISSING_COMMIT = {"", "null", "N/A", "None"}
 
 
-def is_benchmark_xml(root) -> bool:
-    """Return True if every testcase has classname containing 'benchmark'."""
+def is_benchmark_xml(root, xml_path: Path | None = None) -> bool:
+    """Return True for op/model benchmark XML, including an empty envelope.
+
+    Non-empty files still require every classname to contain 'benchmark' so a
+    mixed pytest junit is never stolen. An empty file (0 testcases) has no
+    classname to inspect: treat it as a benchmark envelope only when the
+    filename is report.xml or the suite names itself spyre-perf-suite. Call
+    is_kernel_benchmark_xml() first — those classnames also contain
+    'benchmark'.
+    """
     cases = root.findall(".//testcase")
-    if not cases:
-        return False
-    return all("benchmark" in (tc.get("classname", "")) for tc in cases)
+    if cases:
+        return all("benchmark" in (tc.get("classname", "")) for tc in cases)
+    if xml_path is not None and xml_path.name == "report.xml":
+        return True
+    suite = root.find(".//testsuite")
+    return root.get("name") == PERF_SUITE_NAME or (
+        suite is not None and suite.get("name") == PERF_SUITE_NAME
+    )
 
 
 def is_kernel_benchmark_xml(root) -> bool:
@@ -384,6 +404,45 @@ def _null_tag(value):
     return None if value in (None, "", "null", "N/A") else value
 
 
+def classify_run_quality(version_info: str | None) -> tuple[str, int]:
+    """Return (quality, regression_eligible) from testsuite version_info JSON.
+
+    Incomplete provenance is still ingested (visible on Benchmark Runs) but
+    must not feed regression views. version may be JSON null; commit must be
+    a non-empty Python str. Unparseable / missing version_info is incomplete.
+    """
+    if not version_info:
+        return "incomplete", 0
+    try:
+        info = json.loads(version_info)
+    except (TypeError, ValueError):
+        return "incomplete", 0
+    if not isinstance(info, dict):
+        return "incomplete", 0
+    for key in _REQUIRED_PROVENANCE_KEYS:
+        comp = info.get(key)
+        if not isinstance(comp, dict):
+            return "incomplete", 0
+        commit = comp.get("commit")
+        if not isinstance(commit, str) or commit.strip() in _MISSING_COMMIT:
+            return "incomplete", 0
+    return "valid", 1
+
+
+def _exit_if_perf_zero(trigger_type: str, parsed_benchmarks: int) -> None:
+    """Perf ingest with 0 parsed perf_benchmarks rows is a failed validation.
+
+    `parsed_benchmarks` is records the XML produced, including files skipped as
+    already ingested. Using the insert counter would fail an idempotent retry.
+    """
+    if (trigger_type or "").strip() == "perf" and parsed_benchmarks == 0:
+        print(
+            "[error] trigger-type=perf parsed 0 benchmark records — refusing ingest=ok",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+
 # ---------------------------------------------------------------------------
 # ── BENCHMARK ClickHouse insertion ─────────────────────────────────────────
 # ---------------------------------------------------------------------------
@@ -579,7 +638,13 @@ def insert_benchmarks_v2(client, db: str, run_id: str, records: list) -> int:
 # ---------------------------------------------------------------------------
 
 
+# quality / regression_eligible come from a spyre-dashboard migration.
+# Omit rather than ALTER ADD when they have not been applied.
+_BENCHMARK_RUN_OPTIONAL_COLUMNS = ("run_type", "quality", "regression_eligible")
+
+
 def insert_benchmark_run(client, run_id: int, run_meta: dict) -> None:
+    quality, eligible = classify_run_quality(run_meta.get("version_info"))
     values = {
         "run_id": run_id,
         "source_file": run_meta["source_file"],
@@ -590,15 +655,19 @@ def insert_benchmark_run(client, run_id: int, run_meta: dict) -> None:
         # Marks the two kernel rows so they don't read as runs that measured
         # nothing. Dropped when the migration adding it has not been applied.
         "run_type": run_meta.get("run_type", "benchmark"),
+        "quality": quality,
+        "regression_eligible": eligible,
     }
     columns = list(values)
-    if _absent_columns(client, "benchmark_runs", ("run_type",)):
+    absent = _absent_columns(client, "benchmark_runs", _BENCHMARK_RUN_OPTIONAL_COLUMNS)
+    if absent:
         print(
-            "  [warn] benchmark_runs has no run_type — storing this run without "
-            "it. Apply the spyre-dashboard migration to capture it.",
+            f"  [warn] benchmark_runs has no {', '.join(sorted(absent))} — "
+            "storing this run without them. Apply the spyre-dashboard "
+            "migration to capture them.",
             file=sys.stderr,
         )
-        columns.remove("run_type")
+        columns = [c for c in columns if c not in absent]
     client.insert(
         "benchmark_runs",
         [[values[c] for c in columns]],
@@ -1552,6 +1621,7 @@ def main():
 
     if not xml_files:
         print("No XML files found — nothing to ingest.")
+        _exit_if_perf_zero(args.trigger_type, 0)
         sys.exit(0)
 
     print(
@@ -1581,6 +1651,7 @@ def main():
 
     total_cases = 0
     total_benchmarks = 0
+    parsed_benchmarks = 0
     total_kernels = 0
 
     for xml_path in xml_files:
@@ -1659,7 +1730,7 @@ def main():
             total_kernels += len(kernels)
             print(f"  Inserted {len(kernels)} kernel rows")
 
-        elif is_benchmark_xml(root):
+        elif is_benchmark_xml(root, xml_path):
             print("  Detected: performance benchmark XML")
             run_meta, benchmarks = parse_benchmark_xml(
                 xml_path, args.workflow, args.run_id, args.platform
@@ -1677,6 +1748,8 @@ def main():
             if not benchmarks:
                 print(f"  No benchmark records in {xml_path.name} — skipping header")
                 continue
+
+            parsed_benchmarks += len(benchmarks)
 
             # Deduplication: skip if source_file already in benchmark_runs
             # Same as the kernel path above: a v1-table read, gated on v1 being written.
@@ -1828,6 +1901,7 @@ def main():
     print(f"  Test cases ingested:  {total_cases}")
     print(f"  Benchmarks ingested:  {total_benchmarks}")
     print(f"  Kernels ingested:     {total_kernels}")
+    _exit_if_perf_zero(args.trigger_type, parsed_benchmarks)
 
 
 if __name__ == "__main__":

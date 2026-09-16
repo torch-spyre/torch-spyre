@@ -699,6 +699,7 @@ jobs:
           artifact_name: ${{ inputs.pytorch_wheel_artifact_name }}
 
       - name: Run perf benchmark (make tests TEST_TYPE=perf)
+        id: run-perf
         run: |
           # Prebaked: run FROM the baked source dir + its SHARED venv at
           # $HOME/.venv; normal: the checkout ('torch-spyre') + local '.venv'.
@@ -725,6 +726,7 @@ jobs:
       # The benchmark reports are not uploaded as workflow artifacts; the
       # results are consumed only by the ClickHouse ingest path.
       - name: Confirm perf report was produced
+        id: confirm-report
         run: |
           # Fail if the benchmark did not write its report. Do not echo the
           # report contents to the build log.
@@ -739,8 +741,10 @@ jobs:
       # matrix suites use. The composite action is the SAME ingest
       # implementation that workflow reuses, so there is one code path, not two.
       # Gated on CLICKHOUSE_HOST: a caller that passes no ClickHouse secrets
-      # skips the push and the perf run still succeeds.
+      # skips the push and the perf run still succeeds. Nightly has secrets, so
+      # --trigger-type perf + 0 parsed records fails the ingest step.
       - name: Ingest perf report into ClickHouse (inline, no artifact)
+        id: ingest
         if: ${{ env.CLICKHOUSE_HOST != '' }}
         uses: ./.github/actions/ingest-xml-to-clickhouse
         with:
@@ -756,12 +760,54 @@ jobs:
           trigger-type: perf
           # perf runs on x86 GitHub-hosted runners, so the rows are x86_64.
           platform: x86_64
-          torch-spyre-dir: ${{ inputs.prebaked_image && env.PREBAKED_TORCH_SPYRE_DIR || 'torch-spyre' }}
+          # Workspace sparse-checkout of this ref's .github — not the baked
+          # tree. The benchmark still runs from PREBAKED_TORCH_SPYRE_DIR.
+          torch-spyre-dir: ${{ github.workspace }}
           clickhouse-host: ${{ secrets.CLICKHOUSE_HOST }}
           clickhouse-port: ${{ secrets.CLICKHOUSE_PORT }}
           clickhouse-user: ${{ secrets.CLICKHOUSE_USER }}
           clickhouse-pass: ${{ secrets.CLICKHOUSE_PASS }}
           clickhouse-db: ${{ secrets.CLICKHOUSE_DB }}
+
+      # Four honesty lines. Echo only — never upload report.xml (public
+      # artifacts would leak benchmark numbers).
+      - name: Perf ingest banners
+        if: always()
+        env:
+          EXEC_OUTCOME: ${{ steps.run-perf.outcome }}
+          REPORT_OUTCOME: ${{ steps.confirm-report.outcome }}
+          INGEST_OUTCOME: ${{ steps.ingest.outcome }}
+        run: |
+          if [ "${EXEC_OUTCOME}" = "success" ]; then
+            EXEC=PASS
+          else
+            EXEC=FAIL
+          fi
+          if [ "${REPORT_OUTCOME}" = "success" ]; then
+            VALIDATION=PASS
+          else
+            VALIDATION=FAIL
+          fi
+          if [ "${INGEST_OUTCOME}" = "success" ]; then
+            INGEST=SUCCESS
+          elif [ "${INGEST_OUTCOME}" = "failure" ]; then
+            INGEST=FAILED
+          else
+            INGEST=SKIPPED
+          fi
+          if [ "${REPORT_OUTCOME}" != "success" ]; then
+            REASON="required result file missing/empty"
+          elif [ "${INGEST_OUTCOME}" = "failure" ]; then
+            REASON="ingest failed"
+          elif [ "${INGEST_OUTCOME}" = "skipped" ] || [ -z "${INGEST_OUTCOME}" ]; then
+            REASON="ingest not reached"
+          else
+            REASON="ok"
+          fi
+          echo "benchmark execution: ${EXEC}"
+          echo "report validation: ${VALIDATION}"
+          echo "ClickHouse ingest: ${INGEST}"
+          echo "reason: ${REASON}"
 
   # ---------------------------------------------------------------------------
   # Job 2: Multi-Spyre test matrix

@@ -60,7 +60,7 @@ jobs:
       - x86_64
       - spyre_pf_x1
       - linux
-      - image_spyre_backend
+      - image_spyre_backend_release
     timeout-minutes: 180
     env:
       # GitHub Actions sets CI=true which causes pytest inductor tests to fail.
@@ -276,8 +276,8 @@ jobs:
       - x86_64
       - spyre_pf_x0
       - linux
-      - image_spyre_backend
-    timeout-minutes: 660 # accomodate atleast 2 full sized attempts 
+      - image_spyre_backend_release
+    timeout-minutes: 660 # accomodate atleast 2 full sized attempts
     permissions:
       # Needed to dispatch and poll _upstream_tests_beta_matrix.yaml below
       # (createWorkflowDispatch / listWorkflowRuns / getWorkflowRun). Capped
@@ -392,6 +392,7 @@ jobs:
                 mode: 'validate',
                 correlation_id: correlationId,
                 source_run_id: `${context.runId}`,
+                image_label: 'image_spyre_backend_release',
               },
             });
 
