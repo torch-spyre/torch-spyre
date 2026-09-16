@@ -65,6 +65,8 @@ _SDPA_MHA_MAX_HEAD_WORK_DIVISION = 4
 _SDPA_LIVE_SCORE_BUFFER_ALLOWANCE = 2
 _SDPA_LIVE_QUERY_BUFFER_ALLOWANCE = 2
 _SDPA_TARGET_KV_BYTES_PER_CORE = 1024 * 1024
+# Gemma 4 12B/26B global attention has 16 query heads but only 1/2 KV
+# heads (D=512); sweeps of those low-Hkv geometries favored a 2 MiB target.
 _SDPA_LOW_KV_HEAD_TARGET_BYTES_PER_CORE = 2 * 1024 * 1024
 
 _SWA_CALIBRATED_NUM_CORES = 32
@@ -271,7 +273,9 @@ def _select_sdpa_tiling(
     show that both smaller blocks (extra online-softmax iterations) and larger
     blocks (more local pressure) lose. Keep Lq and heads in one coarse tile
     whenever a placeable work division can use every core. Shapes outside the
-    calibrated Lq<=512 regime retain the post-#4259 decomposition.
+    calibrated Lq<=512 regime retain the post-#4259 decomposition. Native GQA
+    preserves the ``[Hkv, group]`` axes and divides work over query rows only;
+    MHA may divide both heads and query rows.
     """
     quarter_kv_stick_aligned = max(64, ((max_seqlen_kv + 3) // 4 + 63) // 64 * 64)
     fallback_kv_block_size = min(_SDPA_MAX_SEQUENCE_TILE_SIZE, quarter_kv_stick_aligned)
@@ -471,7 +475,8 @@ def _select_swa_tiling(
     hardware budget. Batch, dtype width, core count, LX budget, heads and head
     width are all compile-time facts, so this does not make mask contents or
     cache position part of specialization. Everything else keeps the original
-    512-row blocks and at-most-four-head coarse tiles.
+    512-row blocks. MHA may use at-most-four-head coarse tiles; native GQA
+    preserves its separate KV-head and group axes, as full SDPA does.
     """
     policy = _SWA_POLICIES.get((num_heads, num_kvheads, head_dim))
     calibrated = (
@@ -505,7 +510,11 @@ def _select_swa_tiling(
         reason="shape or hardware is outside the calibrated SWA policies",
         kv_block_size=kv_block_size,
         num_kv_blocks=num_kv_blocks,
-        num_head_tiles=_sdpa_num_head_tiles(num_heads),
+        # Match full SDPA's native-GQA rule: preserve the explicit Hkv/group
+        # axes instead of coarse-tiling the flattened query-head dimension.
+        num_head_tiles=(
+            1 if num_heads != num_kvheads else _sdpa_num_head_tiles(num_heads)
+        ),
         lx_budget_bytes=lx_budget_bytes,
     )
 
@@ -833,6 +842,63 @@ def spyre_softplus(
     # reciprocal under IEEE rules rather than letting Python raise here.
     inv_beta = math.copysign(math.inf, beta) if beta == 0.0 else 1.0 / beta
     return torch.ops.spyre.softplus(input * beta, 1.0, threshold) * inv_beta
+
+
+def _pow_by_squaring(input: torch.Tensor, exponent: int) -> torch.Tensor:
+    """``input ** exponent`` for ``exponent >= 1`` as a chain of ``mul`` ops.
+
+    Binary square-and-multiply, so ~2*log2(n) multiplies. That is optimal for
+    every exponent below 15 and never more than one multiply above optimal
+    through at least n=40, so the addition-chain search that would close the
+    gap is not worth the table it needs.
+    """
+    result = None
+    square = input
+    while exponent:
+        if exponent & 1:
+            result = square if result is None else torch.mul(result, square)
+        exponent >>= 1
+        if exponent:
+            square = torch.mul(square, square)
+    return result
+
+
+@register_spyre_decompositions([torch.ops.aten.pow.Tensor_Scalar])
+def spyre_pow_tensor_scalar(
+    input: torch.Tensor, exponent: Union[int, float]
+) -> torch.Tensor:
+    """``pow`` with a scalar exponent: an exact primitive where one exists, a
+    multiply chain for any other integer, and ``exp(n * log(x))`` otherwise.
+
+    Limitation: a negative base with a non-integer exponent returns a finite
+    garbage value where CPU returns NaN.
+    """
+    if isinstance(exponent, bool):
+        exponent = int(exponent)
+    if not input.dtype.is_floating_point:
+        # TODO: support integer bases; needs aten's promotion rules plus device
+        # support for integer multiply chains.
+        raise Unsupported(f"pow with a non-floating-point base: {input.dtype}")
+
+    # int, float, or SymFloat depending on the trace, and not stable across runs.
+    e = float(exponent)
+    if e == 1.0:
+        # Returning the input rather than a copy is legal because a
+        # decomposition runs on a functionalized graph; callers must not rely on
+        # either identity, since aten's contract is only that the value matches.
+        return input
+    if e == -1.0:
+        return torch.reciprocal(input)
+    if e == 0.5:
+        return torch.sqrt(input)
+    if e == -0.5:
+        return torch.rsqrt(input)
+    if e == 0.0:
+        return torch.ones_like(input)
+    if e.is_integer():
+        magnitude = _pow_by_squaring(input, abs(int(e)))
+        return torch.reciprocal(magnitude) if e < 0 else magnitude
+    return torch.exp(e * torch.log(input))
 
 
 @register_spyre_decompositions([torch.ops.aten.linear.default])
@@ -1237,7 +1303,7 @@ def spyre_kv_window(
     buffer_width: int,
     num_heads: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """One Q block's KV window: k_win [B, Hq, E, W] transposed, v_win [B, Hq, W, E]."""
+    """One Q block's native-head KV window, with the key transposed."""
     reason = check_window_read(
         read_start=read_start,
         buffer_width=buffer_width,
@@ -1250,15 +1316,10 @@ def spyre_kv_window(
     if reason is not None:
         raise Unsupported(f"kv_window: {reason}")
 
-    # Slice before expanding: expanding first and slicing after breaks the
-    # stick-padding pass ("lower_pad_sequence: pad_extent=-129").
+    # Preserve Hkv. Native GQA adds a unit broadcast axis at the matmul rather
+    # than materializing Hq copies of each K/V window.
     k_win = key[:, :, read_start : read_start + buffer_width, :].transpose(-1, -2)
     v_win = value[:, :, read_start : read_start + buffer_width, :]
-
-    expansion = num_heads // key.size(1)
-    if expansion != 1:
-        k_win = k_win.unsqueeze(2).expand(-1, -1, expansion, -1, -1).flatten(1, 2)
-        v_win = v_win.unsqueeze(2).expand(-1, -1, expansion, -1, -1).flatten(1, 2)
     return k_win, v_win
 
 
@@ -1281,6 +1342,27 @@ def _windowed_attention(
     a mutation-based ``copy_forced`` carry is not tile-safe when the output row
     spans multiple sticks (Gemma's head_dim=256).
     """
+    num_kvheads = key.size(1)
+    gqa_group_size = num_heads // num_kvheads
+    use_gqa = gqa_group_size != 1
+
+    # Keep GQA explicit as [Hkv, group], exactly as full SDPA does. K/V retain
+    # Hkv and gain only a unit view axis for the broadcast-aware matmuls.
+    if use_gqa:
+        query = query.contiguous().unflatten(1, (num_kvheads, gqa_group_size))
+        attention_mask = attention_mask.unsqueeze(2)
+
+    query_dim_names = (
+        ["_b", "num_kvheads", "gqa_group_size", "q_block", "head_dim"]
+        if use_gqa
+        else ["_b", "num_heads", "q_block", "head_dim"]
+    )
+    score_dim_names = (
+        ["_b", "num_kvheads", "gqa_group_size", "q_block", "kv_block"]
+        if use_gqa
+        else ["_b", "num_heads", "q_block", "kv_block"]
+    )
+
     # A causal square prefill has a static narrow read plan. Generic masks and
     # runtime-positioned calls scan the complete compact allocation; their
     # tensor mask is the only source of geometry.
@@ -1330,7 +1412,7 @@ def _windowed_attention(
         )
 
         read_start = 0 if causal_plan is None else causal_plan.read_start(block_index)
-        mask_rows = attention_mask[:, :, q_start:q_end, :]
+        mask_rows = attention_mask[..., q_start:q_end, :]
 
         # Keep the multi-output custom reads outside the coarse-tile scope.
         # FallbackKernel/MultiOutput nodes do not carry named dimensions; putting
@@ -1348,11 +1430,14 @@ def _windowed_attention(
                 end - start,
                 num_heads,
             )
+            if use_gqa:
+                k_blk = k_blk.unsqueeze(2)
+                v_blk = v_blk.unsqueeze(2)
             window_chunks.append((start, end, k_blk, v_blk))
 
-        q_rows = query[:, :, q_start:q_end, :]
+        q_rows = query[..., q_start:q_end, :]
 
-        with spyre_hint(named_dims=["_b", "num_heads", "q_block", "head_dim"]):
+        with spyre_hint(named_dims=query_dim_names):
             q_scaled = q_rows * scaling_factor
 
         # Do not create a one-tile hint group. Besides doing no useful work, it
@@ -1368,11 +1453,14 @@ def _windowed_attention(
             output = None
             for kv_block, (start, end, k_blk, v_blk) in enumerate(window_chunks):
                 correction = None
-                # k_blk is already transposed to [B, Hq, D, block_width].
-                with spyre_hint(named_dims=["_b", "num_heads", "q_block", "kv_block"]):
-                    scores = torch.matmul(
-                        q_scaled, k_blk * scaling_factor
-                    )  # batch, num_heads, q_block, block_width
+                # k_blk is already transposed to [B, Hkv, D, block_width].
+                with spyre_hint(named_dims=score_dim_names):
+                    scaled_keys = k_blk * scaling_factor
+                    scores = (
+                        torch.ops.spyre.batched_matmul(q_scaled, scaled_keys)
+                        if use_gqa
+                        else torch.matmul(q_scaled, scaled_keys)
+                    )
 
                 scores = scores + mask_rows[..., read_start + start : read_start + end]
 
@@ -1400,8 +1488,12 @@ def _windowed_attention(
                     correction = torch.exp(running_max - new_max)
                     new_denominator = denominator * correction + exp_scores.sum(dim=-1)
                 exp_scores = exp_scores.contiguous()
-                with spyre_hint(named_dims=["_b", "num_heads", "q_block", "head_dim"]):
-                    weighted = torch.matmul(exp_scores, v_blk)
+                with spyre_hint(named_dims=query_dim_names):
+                    weighted = (
+                        torch.ops.spyre.batched_matmul(exp_scores, v_blk)
+                        if use_gqa
+                        else torch.matmul(exp_scores, v_blk)
+                    )
                 if kv_block == 0:
                     new_output = weighted
                 else:
@@ -1412,14 +1504,7 @@ def _windowed_attention(
                 if kv_block == tiling.num_kv_blocks - 1:
                     # Keep the final divide in the same hint scope as its
                     # producer, as full SDPA does for split-layout outputs.
-                    with spyre_hint(
-                        named_dims=[
-                            "_b",
-                            "num_heads",
-                            "q_block",
-                            "head_dim",
-                        ]
-                    ):
+                    with spyre_hint(named_dims=query_dim_names):
                         output = new_output / torch.clamp_min(
                             new_denominator, positive_min
                         ).unsqueeze(-1)
@@ -1430,7 +1515,8 @@ def _windowed_attention(
 
         out_blocks.append(output)
 
-    return torch.cat(out_blocks, dim=2)
+    output = torch.cat(out_blocks, dim=-2)
+    return output.flatten(1, 2) if use_gqa else output
 
 
 @register_spyre_decompositions([torch.ops.spyre.sliding_window_attention.default])
@@ -1459,6 +1545,7 @@ def spyre_sliding_window_attention(
     batch_size = query.size(0)
     seqlen_q = query.size(2)
     cache_capacity = key.size(2)
+    num_kvheads = key.size(1)
 
     if scale is not None and scale < 0:
         # math.sqrt would otherwise raise a bare ValueError.
@@ -1483,6 +1570,11 @@ def spyre_sliding_window_attention(
         raise Unsupported(
             f"sliding_window_attention: cache_capacity={cache_capacity} must be a "
             f"multiple of {STICK}"
+        )
+    if num_kvheads <= 0 or num_heads % num_kvheads != 0:
+        raise Unsupported(
+            "sliding_window_attention: query heads must be a whole multiple "
+            f"of KV heads, got Hq={num_heads}, Hkv={num_kvheads}"
         )
 
     expected_mask_shape = (batch_size, 1, seqlen_q, cache_capacity)

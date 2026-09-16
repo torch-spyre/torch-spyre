@@ -1062,9 +1062,11 @@ def sliding_window_attention(  # type: ignore[empty-body]
     Sliding-window attention entry point.
 
     ``query`` is ``[B, Hq, Lq, D]`` and ``key``/``value`` are
-    ``[B, Hkv, Lk, D]``; GQA is expanded internally. ``attention_mask`` is a
-    runtime additive mask with shape ``[B, 1, Lq, Lk]``. It is the sole source
-    of position-dependent state: it carries causality, the sliding window,
+    ``[B, Hkv, Lk, D]``. Native GQA preserves K/V at ``Hkv`` and broadcasts
+    them over groups of query heads rather than materializing ``Hq`` copies.
+    ``Hq`` must be a whole multiple of ``Hkv``. ``attention_mask`` is a runtime
+    additive mask with shape ``[B, 1, Lq, Lk]``. It is the sole source of
+    position-dependent state: it carries causality, the sliding window,
     unwritten cache rows, and left padding. Keeping that state in a tensor means
     changing a decode position does not specialize the compiled graph.
 
@@ -1115,10 +1117,10 @@ def kv_window(  # type: ignore[empty-body]
     Read one Q block's slice of the KV cache.
 
     key/value: [B, Hkv, Lkv, E]. Returns (k_win, v_win) covering cache rows
-    [read_start, read_start + buffer_width). k_win is [B, Hq, E, buffer_width],
-    already **transposed** -- the layout the scores matmul wants, free on a
-    slice. GQA expansion to num_heads happens here, on the slice rather than
-    on the full cache.
+    [read_start, read_start + buffer_width). k_win is
+    [B, Hkv, E, buffer_width], already **transposed** -- the layout the scores
+    matmul wants, free on a slice. Both outputs retain the native KV-head count;
+    the attention decomposition broadcasts them across query-head groups.
 
     One block per call; the memory planner reuses one window buffer across
     them, so the cost is buffer_width rows for any query length.
@@ -1165,9 +1167,9 @@ def _(
     if reason is not None:
         raise Unsupported(f"kv_window: {reason}")
 
-    batch, _, _, head_dim = key.shape
-    k_win = key.new_empty((batch, num_heads, head_dim, buffer_width))
-    v_win = value.new_empty((batch, num_heads, buffer_width, head_dim))
+    batch, num_kvheads, _, head_dim = key.shape
+    k_win = key.new_empty((batch, num_kvheads, head_dim, buffer_width))
+    v_win = value.new_empty((batch, num_kvheads, buffer_width, head_dim))
     return k_win, v_win
 
 

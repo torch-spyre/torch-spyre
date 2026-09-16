@@ -425,8 +425,9 @@ def _functional_sibling(inplace_op):
     ``other ** self``. The signature check rejects that pair.
 
     Matching on signature alone would instead reach ``pow.Tensor_Scalar``, which
-    is operand-correct, but the device's functional ``pow`` is itself wrong
-    today, so the conservative name requirement stays.
+    is operand-correct, but the other functional overloads are not usable:
+    ``pow.Scalar`` computes ``other ** self`` and ``pow.Tensor_Tensor`` raises
+    "unimplemented operation pow" -- so the conservative name requirement stays.
 
     ``None`` means the pair is not a safe functional/in-place match and the
     caller must skip it.

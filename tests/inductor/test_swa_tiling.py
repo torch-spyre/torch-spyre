@@ -90,31 +90,43 @@ class TestSWATiling(unittest.TestCase):
         self.assertEqual(config.num_kv_blocks, 3)
         self.assertEqual(config.num_head_tiles, 3)
 
-    def test_low_lx_budget_falls_back_to_coarse_head_tiling(self):
+    def test_unknown_gqa_geometry_preserves_native_head_axes(self):
+        config = self._select(
+            num_heads=12,
+            num_kvheads=3,
+            q_block=64,
+            buffer_width=2048,
+            head_dim=128,
+        )
+
+        self.assertEqual(config.strategy, "fallback_tiled")
+        self.assertEqual(config.num_head_tiles, 1)
+
+    def test_low_lx_budget_preserves_native_gqa_head_axes(self):
         config = self._select(q_block=1, lx_budget_bytes=64 * 1024)
 
         self.assertEqual(config.strategy, "fallback_tiled")
         self.assertEqual(config.kv_block_size, 512)
         self.assertEqual(config.num_kv_blocks, 3)
-        self.assertEqual(config.num_head_tiles, 4)
+        self.assertEqual(config.num_head_tiles, 1)
         self.assertEqual(
             config.reason,
             "shape or hardware is outside the calibrated SWA policies",
         )
 
-    def test_non_swept_core_count_keeps_original_fallback(self):
+    def test_non_swept_core_count_keeps_conservative_blocks(self):
         config = self._select(num_cores=16)
 
         self.assertEqual(config.strategy, "fallback_tiled")
         self.assertEqual(config.kv_block_size, 512)
-        self.assertEqual(config.num_head_tiles, 4)
+        self.assertEqual(config.num_head_tiles, 1)
 
-    def test_wider_generic_cache_keeps_original_fallback(self):
+    def test_wider_generic_cache_keeps_conservative_blocks(self):
         config = self._select(buffer_width=4096)
 
         self.assertEqual(config.strategy, "fallback_tiled")
         self.assertEqual(config.kv_block_size, 512)
-        self.assertEqual(config.num_head_tiles, 4)
+        self.assertEqual(config.num_head_tiles, 1)
 
 
 if __name__ == "__main__":

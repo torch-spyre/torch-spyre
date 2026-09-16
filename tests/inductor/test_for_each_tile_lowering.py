@@ -451,6 +451,7 @@ class TestSpliceWhileLoops(unittest.TestCase):
         from torch._inductor import ir
         from torch._inductor.virtualized import V
 
+        from torch_spyre._inductor.loop_info import LoopCarryRecord
         from torch_spyre._inductor.wsr.for_each_tile_lowering import (
             splice_while_loops,
         )
@@ -471,6 +472,25 @@ class TestSpliceWhileLoops(unittest.TestCase):
             )
             for op in tiled_ops:
                 self.assertTrue(op.dim_hints, f"{op} missing synthesized dim_hints")
+
+            records_by_name = {
+                op.get_name(): record
+                for op in graph.operations
+                if isinstance(
+                    record := getattr(op, "_loop_carry_record", None),
+                    LoopCarryRecord,
+                )
+            }
+            storage_records = {
+                name: record
+                for name, record in records_by_name.items()
+                if record.storage_name == name
+            }
+            self.assertTrue(storage_records, "expected loop-carry storage metadata")
+            for storage_name, record in storage_records.items():
+                self.assertIn(record.update_name, records_by_name)
+                self.assertIs(records_by_name[record.update_name], record)
+                self.assertEqual(records_by_name[storage_name], record)
 
 
 class TestTryProveForEachTile(unittest.TestCase):
