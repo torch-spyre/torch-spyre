@@ -390,6 +390,10 @@ class TestBuildingBlocks(unittest.TestCase):
             rtol=0.1,
         )
 
+    @mock.patch(
+        "torch_spyre._inductor.decompositions._SDPA_MAX_BURST_EFFICIENT_KV_BLOCK_SIZE",
+        64,
+    )
     @mock.patch("torch_spyre._inductor.decompositions._SDPA_MAX_SEQUENCE_TILE_SIZE", 64)
     def test_sdpa_lk_uses_for_each_tile(self):
         """Multiple K/V blocks lower to one counted loop instead of unrolling."""
