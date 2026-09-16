@@ -77,22 +77,6 @@ _SDPA_QUERY_ROWS_PER_KV_TARGET_MIB = 8
 _SDPA_BASE_BURST_EFFICIENT_KV_BLOCK_SIZE = 512
 _SDPA_MAX_BURST_EFFICIENT_KV_BLOCK_SIZE = 1024
 
-_SWA_CALIBRATED_NUM_CORES = 32
-_SWA_CALIBRATED_MIN_LX_BUDGET = 1_625_344
-
-# Values are (maximum physical window, maximum explicit K/V block width). Both
-# calibrated geometries run fastest without an additional coarse head loop;
-# ordinary work division then schedules the individual operations. The sweeps
-# cover decode and 64-row query blocks, which are the only two values produced
-# by ``query_blocking``. Unknown or wider geometries retain the pre-cost-model
-# fallback.
-_SWA_POLICIES: dict[tuple[int, int, int], tuple[int, int]] = {
-    # Gemma 3 local attention, W=512 and compact capacity=576.
-    (8, 4, 256): (576, 576),
-    # Gemma 4 12B/26B local attention, W=1024 and compact capacity=1088.
-    (16, 8, 256): (1088, 512),
-}
-
 # DPO emits about seventeen additional sdsc_execute operations for every
 # unrolled online-softmax block. Four K256 blocks can still win by retaining
 # restickified K in LX, while four K1024 blocks lose badly to one long block.
@@ -128,13 +112,20 @@ class _SDPATilingConfig:
 
 @dataclasses.dataclass(frozen=True)
 class _SWATilingConfig:
-    """Static choices for one sliding-attention query block."""
+    """Static SWA decomposition choices produced by the cost model."""
 
     strategy: str
     reason: str
     kv_block_size: int
     num_kv_blocks: int
     num_head_tiles: int
+    work_div: dict[str, int] | None
+    score_bytes_per_core: int | None
+    estimated_live_bytes_per_core: int | None
+    kv_bytes_per_core: int | None
+    restick_bytes_per_core: int | None
+    restick_lx_eligible: bool | None
+    estimated_dsc_executions: int | None
     lx_budget_bytes: int
 
 
@@ -705,60 +696,216 @@ def _select_swa_tiling(
     num_cores: int,
     lx_budget_bytes: int,
 ) -> _SWATilingConfig:
-    """Choose measured SWA tiling, preserving the proven generic fallback.
+    """Choose SWA tiling from the same compiler-visible costs as full SDPA.
 
-    Full SDPA's work-divided policy cannot be copied mechanically here. SWA's
-    mask is sliced independently for every explicit query/KV block, and a
-    query-axis work-division hint propagates onto the mask's broadcast head
-    dimension. That is not evenly divisible and is rejected before codegen.
-    More importantly, direct sweeps show a different objective optimum even
-    when the shape is accepted: Gemma 4 decode is faster with two 512-row
-    blocks than one 1088-row block.
+    SWA presents one static physical K/V window to each query block, so its
+    block selection has the same score-buffer, streaming, restickification,
+    and DPO execution tradeoffs as SDPA.  Only the dimension names differ:
+    SDPA's ``max_seqlen_q`` and ``max_seqlen_kv`` become ``q_block`` and
+    ``kv_block`` in the SWA decomposition.
 
-    Select only policies measured at their complete static geometry and
-    hardware budget. Batch, dtype width, core count, LX budget, heads and head
-    width are all compile-time facts, so this does not make mask contents or
-    cache position part of specialization. Everything else keeps the original
-    512-row blocks. MHA may use at-most-four-head coarse tiles; native GQA
-    preserves its separate KV-head and group axes, as full SDPA does.
+    The selected block size need not divide ``buffer_width``.  The caller uses
+    a counted loop for the equal-sized prefix and one direct iteration for the
+    tail, preserving burst-efficient block sizes for compact caches such as
+    1088 rows.
     """
-    policy = _SWA_POLICIES.get((num_heads, num_kvheads, head_dim))
-    calibrated = (
-        policy is not None
-        and buffer_width <= policy[0]
-        and batch_size == 1
-        and element_size == 2
-        and num_cores == _SWA_CALIBRATED_NUM_CORES
-        and lx_budget_bytes >= _SWA_CALIBRATED_MIN_LX_BUDGET
-        and q_block in (1, STICK)
+    fallback_kv_block_size = min(_SDPA_MAX_SEQUENCE_TILE_SIZE, buffer_width)
+    fallback_num_kv_blocks = (
+        buffer_width + fallback_kv_block_size - 1
+    ) // fallback_kv_block_size
+    fallback_num_head_tiles = (
+        1 if num_heads != num_kvheads else _sdpa_num_head_tiles(num_heads)
+    )
+    score_bytes_per_core: int | None = None
+    estimated_live_bytes_per_core: int | None = None
+    kv_bytes_per_core: int | None = None
+    restick_bytes_per_core: int | None = None
+    restick_lx_eligible: bool | None = None
+    estimated_dsc_executions: int | None = None
+    is_decode = q_block == 1
+    sdpa_work_div = (
+        None
+        if is_decode
+        else _sdpa_work_division(
+            num_heads,
+            num_kvheads,
+            q_block,
+            buffer_width,
+            num_cores,
+        )
     )
 
-    if calibrated:
-        assert policy is not None
-        policy_block_size = policy[1]
-        kv_block_size = min(buffer_width, policy_block_size)
-        num_kv_blocks = (buffer_width + kv_block_size - 1) // kv_block_size
-        return _SWATilingConfig(
-            strategy="calibrated" if num_kv_blocks == 1 else "calibrated_tiled",
-            reason="production geometry calibrated by SWA sweep",
-            kv_block_size=kv_block_size,
-            num_kv_blocks=num_kv_blocks,
-            num_head_tiles=1,
-            lx_budget_bytes=lx_budget_bytes,
+    reason = "compiler-cost candidate available"
+    if q_block > _SDPA_MAX_SEQUENCE_TILE_SIZE:
+        reason = "query block exceeds the calibrated work-divided limit"
+    elif not is_decode and sdpa_work_div is None:
+        reason = "no exact head/query-block work division"
+    else:
+        candidates = _sdpa_kv_candidates(
+            batch_size=batch_size,
+            num_heads=num_heads,
+            num_kvheads=num_kvheads,
+            max_seqlen_q=q_block,
+            max_seqlen_kv=buffer_width,
+            head_dim=head_dim,
+            element_size=element_size,
+            num_cores=num_cores,
+            work_div=sdpa_work_div,
         )
+        for candidate in candidates:
+            logger.debug(
+                "SWA KV candidate: K=%s blocks=%s estimated_dsc_executes=%s "
+                "score_bytes_per_core=%s live_bytes_per_core=%s "
+                "kv_bytes_per_core=%s restick_bytes_per_core=%s "
+                "restick_lx_eligible=%s feasible=%s",
+                candidate.block_size,
+                candidate.num_blocks,
+                candidate.estimated_dsc_executions,
+                candidate.score_bytes_per_core,
+                candidate.estimated_live_bytes_per_core,
+                candidate.kv_bytes_per_core,
+                candidate.restick_bytes_per_core,
+                candidate.restick_lx_eligible,
+                candidate.estimated_live_bytes_per_core <= lx_budget_bytes,
+            )
+        feasible = [
+            candidate
+            for candidate in candidates
+            if candidate.estimated_live_bytes_per_core <= lx_budget_bytes
+        ]
+        if not feasible:
+            smallest = candidates[0]
+            score_bytes_per_core = smallest.score_bytes_per_core
+            estimated_live_bytes_per_core = smallest.estimated_live_bytes_per_core
+            kv_bytes_per_core = smallest.kv_bytes_per_core
+            restick_bytes_per_core = smallest.restick_bytes_per_core
+            restick_lx_eligible = smallest.restick_lx_eligible
+            estimated_dsc_executions = smallest.estimated_dsc_executions
+            reason = "estimated per-core live footprint exceeds the LX budget"
+        else:
+            fewest_executions = min(
+                feasible,
+                key=lambda candidate: (
+                    candidate.estimated_dsc_executions,
+                    -candidate.block_size,
+                ),
+            )
+            if is_decode:
+                lx_resident = [
+                    candidate
+                    for candidate in feasible
+                    if candidate.restick_lx_eligible
+                    and candidate.block_size >= 256
+                    and candidate.num_blocks
+                    <= max(
+                        _SDPA_DECODE_MIN_LX_RESIDENT_BLOCKS,
+                        _SDPA_DECODE_MAX_MULTI_BLOCK_EXTENT // candidate.block_size,
+                    )
+                ]
+                selected = (
+                    min(
+                        lx_resident,
+                        key=lambda candidate: (
+                            candidate.estimated_dsc_executions,
+                            -candidate.block_size,
+                        ),
+                    )
+                    if lx_resident
+                    else fewest_executions
+                )
+                reason = (
+                    "single-query decode; LX-resident restickified K"
+                    if selected.restick_lx_eligible
+                    else "single-query decode; longest bursts and fewest DSC executes"
+                )
+            else:
+                assert sdpa_work_div is not None
+                query_rows_per_core = q_block // sdpa_work_div["max_seqlen_q"]
+                target_kv_bytes = _sdpa_target_kv_bytes_per_core(
+                    num_heads,
+                    num_kvheads,
+                    query_rows_per_core,
+                )
+                target_kv_block_size = _sdpa_burst_efficient_kv_block_limit(
+                    query_rows_per_core
+                )
+                burst_efficient = [
+                    candidate
+                    for candidate in feasible
+                    if candidate.kv_bytes_per_core <= target_kv_bytes
+                    and candidate.block_size <= target_kv_block_size
+                ]
+                selected = (
+                    min(
+                        burst_efficient,
+                        key=lambda candidate: (
+                            candidate.estimated_dsc_executions,
+                            -candidate.block_size,
+                        ),
+                    )
+                    if burst_efficient
+                    else feasible[0]
+                )
+                reason = "longest bursts within LX and K/V streaming targets"
 
-    kv_block_size = min(_SDPA_MAX_SEQUENCE_TILE_SIZE, buffer_width)
-    num_kv_blocks = (buffer_width + kv_block_size - 1) // kv_block_size
+            selected_work_div = (
+                dict(sdpa_work_div) if sdpa_work_div is not None else None
+            )
+            if num_heads == num_kvheads and selected_work_div is not None:
+                selected_work_div["max_seqlen_kv"] = _sdpa_kv_work_division(
+                    query_split=selected_work_div["max_seqlen_q"],
+                    kv_block_size=selected.block_size,
+                )
+            swa_work_div = (
+                {
+                    {
+                        "max_seqlen_q": "q_block",
+                        "max_seqlen_kv": "kv_block",
+                    }.get(name, name): split
+                    for name, split in selected_work_div.items()
+                }
+                if selected_work_div is not None
+                else None
+            )
+            strategy = (
+                "decode" if is_decode else "work_divided"
+            )
+            if selected.num_blocks > 1:
+                strategy += "_tiled"
+            return _SWATilingConfig(
+                strategy=strategy,
+                reason=reason,
+                kv_block_size=selected.block_size,
+                num_kv_blocks=selected.num_blocks,
+                num_head_tiles=1,
+                work_div=swa_work_div,
+                score_bytes_per_core=selected.score_bytes_per_core,
+                estimated_live_bytes_per_core=selected.estimated_live_bytes_per_core,
+                kv_bytes_per_core=selected.kv_bytes_per_core,
+                restick_bytes_per_core=selected.restick_bytes_per_core,
+                restick_lx_eligible=selected.restick_lx_eligible,
+                estimated_dsc_executions=selected.estimated_dsc_executions,
+                lx_budget_bytes=lx_budget_bytes,
+            )
+
+    if reason == "compiler-cost candidate available":
+        raise AssertionError("SWA candidate selection did not produce a result")
+
     return _SWATilingConfig(
-        strategy="fallback" if num_kv_blocks == 1 else "fallback_tiled",
-        reason="shape or hardware is outside the calibrated SWA policies",
-        kv_block_size=kv_block_size,
-        num_kv_blocks=num_kv_blocks,
-        # Match full SDPA's native-GQA rule: preserve the explicit Hkv/group
-        # axes instead of coarse-tiling the flattened query-head dimension.
-        num_head_tiles=(
-            1 if num_heads != num_kvheads else _sdpa_num_head_tiles(num_heads)
+        strategy=(
+            "fallback" if fallback_num_kv_blocks == 1 else "fallback_tiled"
         ),
+        reason=reason,
+        kv_block_size=fallback_kv_block_size,
+        num_kv_blocks=fallback_num_kv_blocks,
+        num_head_tiles=fallback_num_head_tiles,
+        work_div=None,
+        score_bytes_per_core=score_bytes_per_core,
+        estimated_live_bytes_per_core=estimated_live_bytes_per_core,
+        kv_bytes_per_core=kv_bytes_per_core,
+        restick_bytes_per_core=restick_bytes_per_core,
+        restick_lx_eligible=restick_lx_eligible,
+        estimated_dsc_executions=estimated_dsc_executions,
         lx_budget_bytes=lx_budget_bytes,
     )
 
@@ -1545,16 +1692,16 @@ def _windowed_attention(
     causal_plan: SlidingWindowPlan | None,
     q_block: int,
     padded_seqlen_q: int,
-    scaling_factor: float,
+    query_scale: float,
     num_heads: int,
 ) -> torch.Tensor:
     """Blocked online attention over each query block's physical KV window.
 
-    Both loops are unrolled at trace time, so every cache read is a bounded,
-    constant slice. Query blocks share no softmax state. Within one query block,
-    KV chunks use functional SSA carries, matching ``spyre__sdpa_overrideable``;
-    a mutation-based ``copy_forced`` carry is not tile-safe when the output row
-    spans multiple sticks (Gemma's head_dim=256).
+    Query blocks remain static and share no softmax state.  Within one query
+    block, equal-sized K/V chunks run through ``for_each_tile`` and only a
+    possible ragged tail remains direct.  Functional SSA carries match
+    ``spyre__sdpa_overrideable``; a mutation-based ``copy_forced`` carry is not
+    tile-safe when the output row spans multiple sticks (Gemma's head_dim=256).
     """
     num_kvheads = key.size(1)
     gqa_group_size = num_heads // num_kvheads
@@ -1588,7 +1735,7 @@ def _windowed_attention(
         num_kvheads=key.size(1),
         q_block=q_block,
         buffer_width=buffer_width,
-        head_dim=query.size(3),
+        head_dim=query.size(-1),
         element_size=query.dtype.itemsize,
         num_cores=config.sencores,
         lx_budget_bytes=_sdpa_lx_budget_bytes(),
@@ -1596,7 +1743,10 @@ def _windowed_attention(
     logger.debug(
         "SWA tiling: strategy=%s reason=%s q_block=%s "
         "buffer_width=%s kv_blocks=%s kv_block_size=%s "
-        "head_tiles=%s lx_budget_bytes=%s",
+        "head_tiles=%s work_div=%s score_bytes_per_core=%s "
+        "estimated_live_bytes_per_core=%s kv_bytes_per_core=%s "
+        "restick_bytes_per_core=%s restick_lx_eligible=%s "
+        "estimated_dsc_executions=%s lx_budget_bytes=%s",
         tiling.strategy,
         tiling.reason,
         q_block,
@@ -1604,6 +1754,13 @@ def _windowed_attention(
         tiling.num_kv_blocks,
         tiling.kv_block_size,
         tiling.num_head_tiles,
+        tiling.work_div,
+        tiling.score_bytes_per_core,
+        tiling.estimated_live_bytes_per_core,
+        tiling.kv_bytes_per_core,
+        tiling.restick_bytes_per_core,
+        tiling.restick_lx_eligible,
+        tiling.estimated_dsc_executions,
         tiling.lx_budget_bytes,
     )
     # Spyre stores fp16 and bf16 tensors in its 16-bit floating-point format.
@@ -1633,26 +1790,19 @@ def _windowed_attention(
         # them inside the scope can pull GQA expansion and batch dependencies into
         # the wrong loop group (and, for batch > 1, leave a dangling scheduler
         # dependency after grouping).
-        window_chunks = []
-        for kv_block in range(tiling.num_kv_blocks):
-            start = kv_block * tiling.kv_block_size
-            end = min(start + tiling.kv_block_size, buffer_width)
-            k_blk, v_blk = torch.ops.spyre.kv_window(
-                key,
-                value,
-                read_start + start,
-                end - start,
-                num_heads,
-            )
-            if use_gqa:
-                k_blk = k_blk.unsqueeze(2)
-                v_blk = v_blk.unsqueeze(2)
-            window_chunks.append((start, end, k_blk, v_blk))
+        k_window, v_window = torch.ops.spyre.kv_window(
+            key,
+            value,
+            read_start,
+            buffer_width,
+            num_heads,
+        )
+        if use_gqa:
+            k_window = k_window.unsqueeze(2)
+            v_window = v_window.unsqueeze(2)
+        mask_window = mask_rows[..., read_start : read_start + buffer_width]
 
         q_rows = query[..., q_start:q_end, :]
-
-        with spyre_hint(named_dims=query_dim_names):
-            q_scaled = q_rows * scaling_factor
 
         # Do not create a one-tile hint group. Besides doing no useful work, it
         # can make post-layout restickify producers appear after their consumers
@@ -1662,70 +1812,111 @@ def _windowed_attention(
             if tiling.num_head_tiles > 1
             else nullcontext()
         ):
-            running_max = None
-            denominator = None
-            output = None
-            for kv_block, (start, end, k_blk, v_blk) in enumerate(window_chunks):
-                correction = None
-                # k_blk is already transposed to [B, Hkv, D, block_width].
-                with spyre_hint(named_dims=score_dim_names):
-                    scaled_keys = k_blk * scaling_factor
-                    scores = (
-                        torch.ops.spyre.batched_matmul(q_scaled, scaled_keys)
-                        if use_gqa
-                        else torch.matmul(q_scaled, scaled_keys)
+            with (
+                spyre_hint(work_div=tiling.work_div)
+                if tiling.work_div is not None
+                else nullcontext()
+            ):
+                # Q and the carry seeds are invariant across the counted K/V
+                # loop.  A finite maximum keeps fully masked chunks defined:
+                # their exponentials and weighted contribution are exactly zero.
+                with spyre_hint(named_dims=query_dim_names):
+                    q_scaled = q_rows * query_scale
+                    output = torch.zeros_like(q_rows)
+                running_max_reduced = torch.full(
+                    (*q_rows.shape[:-1], STICK),
+                    finite_min,
+                    device=query.device,
+                    dtype=query.dtype,
+                )
+                denominator_reduced = torch.zeros(
+                    (*q_rows.shape[:-1], STICK),
+                    device=query.device,
+                    dtype=query.dtype,
+                )
+                with spyre_hint(named_dims=query_dim_names[:-1]):
+                    running_max = running_max_reduced.amax(dim=-1)
+                    denominator = denominator_reduced.amax(dim=-1)
+
+                def swa_kv_body(carry, tiles):
+                    running_max, denominator, output = carry
+                    k_blk, v_blk, mask_blk = tiles
+                    # ``kv_window`` already transposes K; slice that last
+                    # sequence axis directly so the HOP adds no whole-window
+                    # materialization before the matmul.
+                    with spyre_hint(named_dims=score_dim_names):
+                        scores = (
+                            torch.ops.spyre.batched_matmul(q_scaled, k_blk)
+                            if use_gqa
+                            else torch.matmul(q_scaled, k_blk)
+                        )
+                    scores = scores + mask_blk
+
+                    # Clamp before reducing so fully masked chunks do not form
+                    # ``-inf - -inf`` in the online-softmax recurrence.
+                    block_max = torch.amax(
+                        torch.clamp_min(scores, finite_min), dim=-1
                     )
-
-                scores = scores + mask_rows[..., read_start + start : read_start + end]
-
-                # A standard additive mask may make an entire KV chunk -inf.
-                # Clamp the scores before reducing so the pointwise operation
-                # stays on the dense score layout; clamping the sparse reduction
-                # result requires an unsupported sparse/dense restickification.
-                # -inf - -inf is NaN and would otherwise poison all later chunks,
-                # including a later chunk that contains attendable keys.
-                block_max = torch.amax(torch.clamp_min(scores, finite_min), dim=-1)
-                if kv_block == 0:
-                    # Seed from real scores. Besides avoiding dead arithmetic,
-                    # this keeps the single-chunk decode case as the direct
-                    # stable-softmax formula instead of involving synthetic
-                    # -inf/zero accumulators.
-                    new_max = block_max
-                    exp_scores = torch.exp(scores - new_max.unsqueeze(-1))
-                    new_denominator = exp_scores.sum(dim=-1)
-                else:
-                    assert running_max is not None
-                    assert denominator is not None
-                    assert output is not None
+                    # Form the old-max correction first.  The loop lowering can
+                    # then update running_max without a carry snapshot.
+                    correction = torch.exp(
+                        torch.clamp_max(running_max - block_max, 0.0)
+                    )
                     new_max = torch.maximum(running_max, block_max)
                     exp_scores = torch.exp(scores - new_max.unsqueeze(-1))
-                    correction = torch.exp(running_max - new_max)
                     new_denominator = denominator * correction + exp_scores.sum(dim=-1)
-                exp_scores = exp_scores.contiguous()
-                with spyre_hint(named_dims=query_dim_names):
-                    weighted = (
-                        torch.ops.spyre.batched_matmul(exp_scores, v_blk)
-                        if use_gqa
-                        else torch.matmul(exp_scores, v_blk)
-                    )
-                if kv_block == 0:
-                    new_output = weighted
-                else:
-                    assert output is not None
-                    assert correction is not None
-                    new_output = output * correction.unsqueeze(-1) + weighted
-
-                if kv_block == tiling.num_kv_blocks - 1:
-                    # Keep the final divide in the same hint scope as its
-                    # producer, as full SDPA does for split-layout outputs.
+                    exp_scores = exp_scores.contiguous()
                     with spyre_hint(named_dims=query_dim_names):
-                        output = new_output / torch.clamp_min(
-                            new_denominator, positive_min
-                        ).unsqueeze(-1)
-                else:
-                    running_max = new_max
-                    denominator = new_denominator
-                    output = new_output
+                        weighted = (
+                            torch.ops.spyre.batched_matmul(exp_scores, v_blk)
+                            if use_gqa
+                            else torch.matmul(exp_scores, v_blk)
+                        )
+                    new_output = output * correction.unsqueeze(-1) + weighted
+                    return (new_max, new_denominator, new_output), None
+
+                carry = (running_max, denominator, output)
+                full_blocks = buffer_width // tiling.kv_block_size
+                full_width = full_blocks * tiling.kv_block_size
+                if full_blocks > 1:
+                    carry, _ = for_each_tile(
+                        swa_kv_body,
+                        (
+                            k_window[..., :full_width],
+                            v_window[..., :full_width, :],
+                            mask_window[..., :full_width],
+                        ),
+                        dims=(-1, -2, -1),
+                        tile_size=tiling.kv_block_size,
+                        init=carry,
+                    )
+                elif full_blocks == 1:
+                    carry, _ = swa_kv_body(
+                        carry,
+                        (
+                            k_window[..., :full_width],
+                            v_window[..., :full_width, :],
+                            mask_window[..., :full_width],
+                        ),
+                    )
+
+                if full_width < buffer_width:
+                    carry, _ = swa_kv_body(
+                        carry,
+                        (
+                            k_window[..., full_width:],
+                            v_window[..., full_width:, :],
+                            mask_window[..., full_width:],
+                        ),
+                    )
+
+                _, denominator, output = carry
+                # Keep the final divide in the same hint scope as its producer,
+                # as full SDPA does for split-layout outputs.
+                with spyre_hint(named_dims=query_dim_names[:-1]):
+                    safe_denominator = torch.clamp_min(denominator, positive_min)
+                with spyre_hint(named_dims=query_dim_names):
+                    output = output / safe_denominator.unsqueeze(-1)
 
         out_blocks.append(output)
 
@@ -1808,12 +1999,9 @@ def spyre_sliding_window_attention(
             f"{attention_mask.device} must match query device {query.device}"
         )
 
-    # Split across query and key, not applied once to their product: keeps the
-    # intermediate in float16 range.
-    if scale is None:
-        scaling_factor = 1.0 / math.sqrt(math.sqrt(head_dim))
-    else:
-        scaling_factor = math.sqrt(scale)
+    query_scale = scale
+    if query_scale is None:
+        query_scale = 1.0 / math.sqrt(head_dim)
 
     # Pad at the front so real rows keep their relative order. Synthetic rows
     # receive an all-zero mask and are sliced from the result; this guarantees a
@@ -1882,7 +2070,7 @@ def spyre_sliding_window_attention(
         causal_plan,
         q_block,
         padded_seqlen_q,
-        scaling_factor,
+        query_scale,
         num_heads,
     )
     return output[:, :, pad_rows:, :] if pad_rows else output
