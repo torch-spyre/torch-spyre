@@ -41,6 +41,7 @@ from unittest import TestCase
 
 import sympy
 
+from torch_spyre._inductor import config as ts_config
 from torch_spyre._inductor.scratchpad import allocator as allocator_module
 from torch_spyre._inductor.scratchpad import utils
 from torch_spyre._inductor.scratchpad.sa_cooptimizer import (
@@ -1815,9 +1816,9 @@ class MoveAlphabetTest(TestCase):
         self.assertEqual(solver.chosen, before)
 
 
-class TestCoarseTilingIsGatedOnItsApplyStep(TestCase):
-    """Only the annealer may choose a coarse tiling, and only once something
-    applies it."""
+class TestCoarseTilingIsGatedOnTheFlag(TestCase):
+    """Only the annealer may choose a coarse tiling, and only with
+    ``auto_coarse_tiling`` on."""
 
     @staticmethod
     def _allocator(layout_planning):
@@ -1825,17 +1826,20 @@ class TestCoarseTilingIsGatedOnItsApplyStep(TestCase):
             layout_planning=layout_planning, size=1
         )
 
-    def test_no_engine_is_offered_tilings_while_nothing_applies_them(self):
-        self.assertFalse(self._allocator(SaCoOptimizingSolver)._solver_chooses_tilings)
-        self.assertFalse(self._allocator(mock.MagicMock())._solver_chooses_tilings)
-
-    def test_once_they_are_applied_only_the_annealer_is_offered_them(self):
+    def test_only_the_annealer_is_offered_them_and_only_with_the_flag_on(self):
         """Only a search that generates divisions can carry a ``TileSpec``."""
-        with mock.patch.object(allocator_module, "TILE_CHOICES_ARE_APPLIED", True):
-            self.assertTrue(
-                self._allocator(SaCoOptimizingSolver)._solver_chooses_tilings
-            )
-            self.assertFalse(self._allocator(mock.MagicMock())._solver_chooses_tilings)
+        for flag in (False, True):
+            with (
+                self.subTest(auto_coarse_tiling=flag),
+                mock.patch.object(ts_config, "auto_coarse_tiling", flag),
+            ):
+                self.assertEqual(
+                    self._allocator(SaCoOptimizingSolver)._solver_chooses_tilings,
+                    flag,
+                )
+                self.assertFalse(
+                    self._allocator(mock.MagicMock())._solver_chooses_tilings
+                )
 
 
 def _run_buffer(name, position, space=None):

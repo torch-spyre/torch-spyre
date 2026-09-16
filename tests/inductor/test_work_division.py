@@ -3189,6 +3189,41 @@ class TestCoOptimizingAllocator(unittest.TestCase):
         ):
             allocator._division_map(graph)
 
+    def test_a_tiling_the_applied_graph_did_not_get_is_refused(self):
+        """A tiled buffer is placed at a footprint the applied graph must have."""
+        spec = TileSpec((TileAxis(0, 4),))
+        buf = CoreDivisionBuffer(
+            name="buf0",
+            size=1024,
+            uses=[0, 1],
+            first_use_is_read=False,
+            in_place_parents=[],
+            residency_reason=None,
+            core_divisions=[CoreDivision(tiling=spec)],
+            chosen_division=0,
+        )
+        graph = SimpleNamespace(
+            get_buffer=lambda name: SimpleNamespace(
+                layout=SimpleNamespace(device_layout=object())
+            )
+        )
+        allocator = CoOptimizingAllocator(MagicMock(), size=1)
+        # Priced at 1024 bytes over 1 core x 4 tiles = 256.
+        with patch.object(
+            allocator_module, "get_device_size_in_bytes", return_value=256
+        ):
+            allocator._check_priced_footprints(graph, [buf], {"buf0": spec})
+        # The graph kept the full extent: the address is spaced for a quarter of
+        # what will be written there.
+        with (
+            patch.object(
+                allocator_module, "get_device_size_in_bytes", return_value=1024
+            ),
+            self.assertRaises(Unsupported) as caught,
+        ):
+            allocator._check_priced_footprints(graph, [buf], {"buf0": spec})
+        self.assertIn("buf0", str(caught.exception))
+
 
 class TestTopKConstraints(unittest.TestCase):
     def test_topk_uses_minimum_supported_split_domains(self):

@@ -390,11 +390,18 @@ def get_cpu_count() -> int:
 # invariant violations early. Set SPYRE_VALIDATE_OP_SPECS=0 to disable.
 validate_op_specs: bool = os.environ.get("SPYRE_VALIDATE_OP_SPECS", "1") == "1"
 
-# Solver-driven coarse tiling: let the co-optimizing CP-SAT solve choose a coarse
+# Solver-driven coarse tiling: let the co-optimizing solve choose a coarse
 # tiling for each op alongside its core division, and apply the tilings it
-# selects. Off by default, and inert unless the joint CP-SAT co-opt path is
-# active (co_optimizing_lx_planning and layout_solver == "cpsat"). Ops a
-# spyre_hint or for_each_tile loop already tiles keep that tiling.
+# selects. Off by default, and inert unless a joint co-opt path is active
+# (co_optimizing_lx_planning, with layout_solver "cpsat" or
+# "simulated_annealing"). Ops a spyre_hint or for_each_tile loop already tiles
+# keep that tiling.
+#
+# Under the SA co-optimizer, anything the apply refuses raises rather than
+# falling back, so any gap between what the search believes it may tile and
+# what ``coarse_tile`` accepts is a compile failure. And nothing yet prices the
+# loop cost above the split cap, so the search has no downward pressure on the
+# tiling axis and takes as much of it as the divisor lattice offers.
 auto_coarse_tiling: bool = os.environ.get("AUTO_COARSE_TILING", "0") == "1"
 
 # When symbolic cost_expr fails, use the fallback cost instead of erroring out
