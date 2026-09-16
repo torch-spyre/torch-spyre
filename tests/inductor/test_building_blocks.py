@@ -411,6 +411,7 @@ class TestBuildingBlocks(unittest.TestCase):
 
         torch.testing.assert_close(actual.cpu(), expected, atol=0.1, rtol=0.1)
         self.assertEqual(sum(source.count("LoopSpec(") for source in sources), 1)
+        self.assertNotIn("while_loop_carry_snapshot", "\n".join(sources))
 
     def test_causal_sdpa_unpadded_kv_no_inf(self):
         """Regression: causal SDPA must not produce inf when seqlen_kv % 64 != 0.
