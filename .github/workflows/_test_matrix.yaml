@@ -112,6 +112,15 @@ on:
       # checkout, the build_torch_spyre wheel job, and install-prebuilt-torch-spyre;
       # run the suite against the baked dir. DEFAULT false → the normal PR/nightly
       # callers (tests.yml / tests-nightly.yml) are byte-for-byte unchanged.
+      run_id:
+        description: >
+          UUID identifying this TEST RUN, minted by the dispatching orchestrator above the
+          CI split and threaded through so artifact_results (written by Jenkins) and
+          test_case_runs (written by the ingest below) carry ONE identity. Empty on a
+          GHA-initiated run, which then derives its own from the run coordinate.
+        required: false
+        type: string
+        default: ''
       prebaked_image:
         description: Test the pre-baked torch-spyre-dev image (no checkout/build). Integration path only.
         required: false
@@ -749,6 +758,9 @@ jobs:
           branch: ${{ inputs.ref || github.event.pull_request.head.sha || github.ref_name }}
           sha: ${{ inputs.ref || github.event.pull_request.head.sha || github.sha }}
           gha-run-id: ${{ github.run_id }}
+          # The orchestrator's uuid when this run was Jenkins-dispatched; empty otherwise,
+          # and the ingest then falls back to hashing its own run coordinate.
+          run-id: ${{ inputs.run_id }}
           triggered-at: ''
           # perf never runs on pull_request (see the job `if:` above), so there
           # is no PR to associate; leave empty.
