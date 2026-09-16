@@ -538,6 +538,16 @@ _K_SPLIT_COMBINE_SUPPORTED = {
 _GENERATED_COPY_OP_PREFIXES = ("coarse_tile_read_copy_", "coarse_tile_reduce_copy_")
 
 
+# Set on an operation whose coarse tiling and core division were chosen by one
+# solver, together. It exempts the op from
+# :func:`coarse_tile_local_dim_split_domains`, whose pin guards against
+# *independent* per-op choosers -- see that function. Written by whoever applies
+# such a solve (``CoOptimizingAllocator._apply_chosen_tilings``) and never
+# cleared: nothing after scratchpad planning re-derives a work division, so its
+# lifetime is the rest of the compile.
+JOINT_TILING_AND_DIVISION_ATTR = "_work_division_chosen_with_tiling"
+
+
 def _hinted_work_div_syms(ctx: WorkDivConstraintContext) -> set[Symbol]:
     """Symbols in ``ctx.it_space`` that carry an explicit user ``work_div`` hint.
 
@@ -676,6 +686,25 @@ def coarse_tile_local_dim_split_domains(
     """
     loop_info = getattr(ctx.op, "loop_info", None)
     if loop_info is None:
+        return ConstraintResult()
+
+    if getattr(ctx.op, JOINT_TILING_AND_DIVISION_ATTR, False):
+        # A solver chose this op's tiling and its core division together, so
+        # the hazard above -- independent per-op choosers disagreeing about
+        # ownership of a dim that must stay whole -- is not the position it is
+        # in. That is the same ground the ``hinted_syms`` exemption below
+        # stands on, one scope-wide decision rather than a per-op guess, and
+        # it is why this is keyed on the op rather than on a config flag: the
+        # greedy passes still run, on the same graph, and stay pinned.
+        #
+        # Measured rather than assumed: a coarse-tiled axis carrying a core
+        # division compiles and matches CPU (torch-spyre#4233, 2026-09-16).
+        # What refuses a *disagreement* is not this pin but the
+        # core-division-mismatch residency guard -- forcing one group member's
+        # tiled-axis split to differ from its neighbours' spilled it out of LX
+        # and left the numerics correct, in a 2-D group and a B+H 4-D one. The
+        # stale-cross-tile-data repro cited above could not be reproduced on
+        # that tree, which is the known gap in this reasoning.
         return ConstraintResult()
 
     if ctx.op.get_name().startswith(_GENERATED_COPY_OP_PREFIXES):
