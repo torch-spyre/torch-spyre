@@ -321,6 +321,33 @@ class TestSpliceWhileLoop(unittest.TestCase):
 
         self.assertEqual(extra_readers, [])
 
+    def test_get_read_writes_failure_raises_unsupported(self):
+        """A post-producer op whose get_read_writes() raises must not be
+        silently treated as "doesn't read the placeholder" -- that could
+        mask a real write-after-read hazard. See Unsupported's use here.
+        """
+        import torch_spyre._inductor.wsr.while_loop_bridge as bridge
+        from torch_spyre._inductor.errors import Unsupported
+
+        producer = mock.Mock(name="producer", spec=["get_operation_name", "get_name"])
+        producer.get_operation_name.return_value = "producer"
+        producer.get_name.return_value = "while_loop_body_graph_0_0_buf7"
+
+        broken_reader = mock.Mock(
+            name="broken_reader",
+            spec=["get_operation_name", "get_name", "get_read_writes"],
+        )
+        broken_reader.get_operation_name.return_value = "broken_reader"
+        broken_reader.get_name.return_value = None
+        broken_reader.get_read_writes.side_effect = RuntimeError("boom")
+
+        with self.assertRaises(Unsupported):
+            bridge._extra_readers_of_placeholder(
+                "while_loop_body_graph_0_0_arg0_1",
+                "while_loop_body_graph_0_0_buf7",
+                [producer, broken_reader],
+            )
+
 
 def _find_while_loop_ir_op(fn, args):
     """Compile fn(*args) under GraphLowering and return the WhileLoop ir.Operation.
@@ -424,6 +451,7 @@ class TestSpliceWhileLoops(unittest.TestCase):
         from torch._inductor import ir
         from torch._inductor.virtualized import V
 
+        from torch_spyre._inductor.loop_info import LoopCarryRecord
         from torch_spyre._inductor.wsr.for_each_tile_lowering import (
             splice_while_loops,
         )
@@ -444,6 +472,25 @@ class TestSpliceWhileLoops(unittest.TestCase):
             )
             for op in tiled_ops:
                 self.assertTrue(op.dim_hints, f"{op} missing synthesized dim_hints")
+
+            records_by_name = {
+                op.get_name(): record
+                for op in graph.operations
+                if isinstance(
+                    record := getattr(op, "_loop_carry_record", None),
+                    LoopCarryRecord,
+                )
+            }
+            storage_records = {
+                name: record
+                for name, record in records_by_name.items()
+                if record.storage_name == name
+            }
+            self.assertTrue(storage_records, "expected loop-carry storage metadata")
+            for storage_name, record in storage_records.items():
+                self.assertIn(record.update_name, records_by_name)
+                self.assertIs(records_by_name[record.update_name], record)
+                self.assertEqual(records_by_name[storage_name], record)
 
 
 class TestTryProveForEachTile(unittest.TestCase):

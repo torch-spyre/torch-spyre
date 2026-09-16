@@ -28,11 +28,21 @@ every rule.
 
 import dataclasses
 import typing
+
+import sympy
 from sympy import Expr, Symbol, divisors
 
 from torch._inductor.dependencies import MemoryDep
-from torch._inductor.ir import ComputedBuffer, Pointwise, Reduction
+from torch._inductor.ir import (
+    ComputedBuffer,
+    InputBuffer,
+    Pointwise,
+    Reduction,
+    StorageBox,
+    TensorBox,
+)
 from torch._inductor.utils import sympy_index_symbol
+from torch._inductor.virtualized import V
 from torch_spyre._C import ElementArrangement
 
 from .constants import (
@@ -47,8 +57,10 @@ from .constants import (
     TOPK_OPS,
 )
 from .errors import Unsupported
+from .ir import FixedTiledLayout
 from .pass_utils import (
     concretize_expr,
+    device_coordinates,
     indirect_forbidden_split_syms,
     is_restickify_coords,
     op_read_writes,
@@ -64,6 +76,15 @@ if typing.TYPE_CHECKING:
     from .work_division import TensorDep
 
 logger = get_inductor_logger("work_division_constraints")
+
+
+# A source-compatible division can use fewer cores than the staged path.  The
+# saved copy executes once per enclosing loop trip, so only steer work division
+# toward its direct form once there are enough executions to amortize that
+# tradeoff.  The two-trip boundary is deliberately conservative: naturally
+# compatible direct reads remain eligible, while this rule intervenes only to
+# change an otherwise-selected division.
+_MIN_SOURCE_AWARE_DIRECT_READ_TRIPS = 3
 
 
 @dataclasses.dataclass
@@ -111,6 +132,7 @@ def collect_work_division_constraints(
         conv_spatial_blocked_vars,
         reduction_window_blocked_vars,
         coarse_tile_local_dim_split_domains,
+        direct_read_source_stick_split_domains,
         plain_reduction_k_split_domains,
         restickify_padding_blocked_vars,
         qfp8wt_split_domains,
@@ -157,6 +179,113 @@ def collect_work_division_constraints(
             allowed_splits[sym] = allowed
 
     return ConstraintResult(blocked=blocked, allowed_splits=allowed_splits)
+
+
+def _direct_read_source_dep(
+    op: ComputedBuffer,
+) -> tuple[MemoryDep, FixedTiledLayout] | None:
+    """Recover a saved direct-read dependency without mutating the graph."""
+    record = getattr(op, "_read_copy_elision_record", None)
+    if record is None or not isinstance(op.data, Pointwise):
+        return None
+
+    try:
+        direct_data = dataclasses.replace(op.data, inner_fn=record.direct_inner_fn)
+        direct_op = ComputedBuffer(
+            name=op.get_name(),
+            layout=op.layout,
+            data=direct_data,
+            _split_size=op._split_size,
+            _original_inner_fn=op._original_inner_fn,
+            _original_ranges=op._original_ranges,
+            _original_reduction_ranges=op._original_reduction_ranges,
+        )
+        source_deps = [
+            dep
+            for dep in op_read_writes(direct_op).reads
+            if isinstance(dep, MemoryDep) and dep.name == record.source_name
+        ]
+        if len(source_deps) != 1:
+            return None
+
+        source = V.graph.get_buffer(record.source_name)
+        if isinstance(source, TensorBox):
+            source = source.data
+        if isinstance(source, StorageBox):
+            source = source.data
+        if not isinstance(source, InputBuffer):
+            return None
+        layout = source.get_layout()
+        if not isinstance(layout, FixedTiledLayout):
+            return None
+        return source_deps[0], layout
+    except Exception:
+        # This is an optional optimization constraint.  The final read-copy
+        # elision proof remains authoritative when the saved direct form can no
+        # longer be reconstructed after another IR rewrite.
+        return None
+
+
+def direct_read_source_stick_split_domains(
+    ctx: WorkDivConstraintContext,
+) -> ConstraintResult:
+    """Keep a prospective direct HBM read on whole-stick core boundaries.
+
+    Coarse tiling deliberately retains a staged copy through layout and work-
+    division planning.  The staged layout can make an iteration dimension look
+    freely splittable even when that same dimension is the physical stick of
+    the original graph input.  Choosing such a split prevents the later,
+    correctness-checked direct-read rewrite: a core cannot own four elements
+    out of a 64-element stick.
+
+    For the canonical ``(floor(v / eps), Mod(v, eps))`` representation, limit
+    the saved direct-read candidate to factors that leave every core an
+    integral number of complete sticks.  The post-allocation proof still checks
+    full physical/logical ownership equivalence; this rule only keeps the work-
+    division search from choosing a candidate that is known to be impossible.
+    """
+    loop_info = getattr(ctx.op, "loop_info", None)
+    loop_counts = getattr(loop_info, "loop_count", ())
+    try:
+        loop_trips = 1
+        for count in loop_counts:
+            loop_trips *= concretize_expr(count)
+    except Exception:
+        return ConstraintResult()
+    if loop_trips < _MIN_SOURCE_AWARE_DIRECT_READ_TRIPS:
+        return ConstraintResult()
+
+    recovered = _direct_read_source_dep(ctx.op)
+    if recovered is None:
+        return ConstraintResult()
+    source_dep, source_layout = recovered
+
+    try:
+        coordinates = device_coordinates(source_layout.device_layout, source_dep, None)
+        eps = int(source_layout.device_layout.elems_per_stick())
+    except Exception:
+        return ConstraintResult()
+    if not coordinates or eps <= 0:
+        return ConstraintResult()
+
+    stick_coord = sympy.expand(coordinates[-1])
+    allowed_splits: dict[Symbol, frozenset[int]] = {}
+    for symbol, extent_expr in ctx.it_space.items():
+        if sympy.simplify(stick_coord - sympy.Mod(symbol, eps)) != 0:
+            continue
+        try:
+            extent = concretize_expr(extent_expr)
+        except Exception:
+            continue
+        if extent < 1:
+            continue
+        allowed_splits[symbol] = frozenset(
+            factor
+            for factor in divisors(extent)
+            if factor == 1 or (extent // factor) % eps == 0
+        )
+
+    return ConstraintResult(allowed_splits=allowed_splits)
 
 
 def carried_reduction_pinned_row(

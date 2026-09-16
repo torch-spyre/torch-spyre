@@ -246,7 +246,7 @@ class GeometricValidityTest(TestCase):
             first_use_is_read=False,
             in_place_parents=list(in_place_parents),
             # The trivial division, so the per-core footprint is ``size``.
-            core_divisions=[CoreDivision(output_splits={}, reduction_splits={})],
+            core_divisions=[CoreDivision()],
             boundary=BufferType.Intermediate,
         )
         buf.chosen_division = 0
@@ -414,7 +414,7 @@ class UnsizedBufferTest(TestCase):
                 uses=[0, 1],
                 first_use_is_read=False,
                 residency_reason=reason,
-                core_divisions=[CoreDivision(output_splits={}, reduction_splits={})],
+                core_divisions=[CoreDivision()],
                 boundary=BufferType.Intermediate,
             )
 
@@ -490,10 +490,7 @@ class ImprovementSmokeTest(TestCase):
 
 def _div(partition):
     """A core division with the given output partition (1 == trivial/whole)."""
-    return CoreDivision(
-        output_splits=({1: partition} if partition > 1 else {}),
-        reduction_splits={},
-    )
+    return CoreDivision(splits=({1: partition} if partition > 1 else {}))
 
 
 def _cdbuf(name, parents, matches, size=1024, uses=(0, 1)):
@@ -1166,23 +1163,19 @@ class CostExprScoringTest(TestCase):
             in_place_parents=[],
             residency_reason=None,
             core_divisions=[
-                CoreDivision(output_splits={0: 1, 1: 1}, reduction_splits={}),
-                CoreDivision(output_splits={0: 2, 1: 1}, reduction_splits={0: 1}),
-                CoreDivision(output_splits={0: 4, 1: 2}, reduction_splits={0: 2}),
+                CoreDivision(splits={0: 1, 1: 1}),
+                CoreDivision(splits={0: 2, 1: 1, 2: 1}, reduction_syms=frozenset({2})),
+                CoreDivision(splits={0: 4, 1: 2, 2: 2}, reduction_syms=frozenset({2})),
             ],
             parents=[],
             cd_parent_matches={},
             boundary=BufferType.Intermediate,
         )
         solver = SaCoOptimizingSolver([buf], 1 << 30, 128)
-        out_syms, red_syms = buf.sym_core_divs
-        self.assertEqual(set(out_syms), {0, 1})
-        self.assertEqual(set(red_syms), {0})
+        syms = buf.sym_core_divs
+        self.assertEqual(set(syms), {0, 1, 2})
         cost_expr = (
-            out_syms[0] * 10
-            + out_syms[1] * 100
-            + red_syms[0] * 1000
-            + 5000 * (1 - buf.sym_is_lx)
+            syms[0] * 10 + syms[1] * 100 + syms[2] * 1000 + 5000 * (1 - buf.sym_is_lx)
         )
         solver.plan_layout_and_core_divisions(cost_expr)
         self.assertEqual(

@@ -942,6 +942,82 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
             },
         },
+        # pow translates to a single exact op: ones_like at 0, the input itself
+        # at 1, reciprocal at -1, sqrt at 0.5, rsqrt at -0.5.
+        ("test_pow_primitive", "test_pow"): {
+            "param_sets": {
+                "0_fp16_1d": ((80,), 0, 0.005),
+                "0_fp16_2d": ((67, 80), 0, 0.005),
+                "0_fp16_3d": ((67, 71, 80), 0, 0.005),
+                "1_fp16_1d": ((80,), 1, 0.005),
+                "1_fp16_2d": ((67, 80), 1, 0.005),
+                "1_fp16_3d": ((67, 71, 80), 1, 0.005),
+                "neg1_fp16_1d": ((80,), -1, 0.005),
+                "neg1_fp16_2d": ((67, 80), -1, 0.005),
+                "neg1_fp16_3d": ((67, 71, 80), -1, 0.005),
+                "half_fp16_1d": ((80,), 0.5, 0.005),
+                "half_fp16_2d": ((67, 80), 0.5, 0.005),
+                "half_fp16_3d": ((67, 71, 80), 0.5, 0.005),
+                "neg_half_fp16_1d": ((80,), -0.5, 0.005),
+                "neg_half_fp16_2d": ((67, 80), -0.5, 0.005),
+                "neg_half_fp16_3d": ((67, 71, 80), -0.5, 0.005),
+            },
+        },
+        # pow translates to a chain of mul ops by square-and-multiply, with
+        # reciprocal on top when n < 0; n = +-2 is the chain of length one. Each
+        # multiply costs about one ULP, so the tolerance tracks |n|. Measured
+        # maxima are roughly half of each value; re-measure before adding an
+        # exponent.
+        ("test_pow_int", "test_pow"): {
+            "param_sets": {
+                "2_fp16_1d": ((80,), 2, 0.005),
+                "2_fp16_2d": ((67, 80), 2, 0.005),
+                "2_fp16_3d": ((67, 71, 80), 2, 0.005),
+                "neg2_fp16_1d": ((80,), -2, 0.005),
+                "neg2_fp16_2d": ((67, 80), -2, 0.005),
+                "neg2_fp16_3d": ((67, 71, 80), -2, 0.005),
+                "3_fp16_1d": ((80,), 3, 0.006),
+                "3_fp16_2d": ((67, 80), 3, 0.006),
+                "3_fp16_3d": ((67, 71, 80), 3, 0.006),
+                "neg3_fp16_1d": ((80,), -3, 0.005),
+                "neg3_fp16_2d": ((67, 80), -3, 0.005),
+                "neg3_fp16_3d": ((67, 71, 80), -3, 0.005),
+                "4_fp16_1d": ((80,), 4, 0.01),
+                "4_fp16_2d": ((67, 80), 4, 0.01),
+                "4_fp16_3d": ((67, 71, 80), 4, 0.01),
+                "5_fp16_1d": ((80,), 5, 0.012),
+                "5_fp16_2d": ((67, 80), 5, 0.012),
+                "5_fp16_3d": ((67, 71, 80), 5, 0.012),
+                "8_fp16_1d": ((80,), 8, 0.02),
+                "8_fp16_2d": ((67, 80), 8, 0.02),
+                "8_fp16_3d": ((67, 71, 80), 8, 0.02),
+                "15_fp16_1d": ((80,), 15, 0.04),
+                "15_fp16_2d": ((67, 80), 15, 0.04),
+                "15_fp16_3d": ((67, 71, 80), 15, 0.04),
+            },
+        },
+        # pow translates to exp(n * log(x)), the branch for a non-integer
+        # exponent -- one ULP either way, since a single exp and log cost far less
+        # than a mul chain of the same |n|. Stick-aligned here, since exp is the
+        # one branch an unaligned extent breaks.
+        ("test_pow_nonint", "test_pow"): {
+            "param_sets": {
+                "0.3_fp16_1d": ((256,), 0.3, 0.005),
+                "0.3_fp16_2d": ((67, 256), 0.3, 0.005),
+                "0.3_fp16_3d": ((67, 71, 256), 0.3, 0.005),
+                "2.5_fp16_1d": ((256,), 2.5, 0.005),
+                "2.5_fp16_2d": ((67, 256), 2.5, 0.005),
+                "2.5_fp16_3d": ((67, 71, 256), 2.5, 0.005),
+                "0.3_fp16_2d_unaligned": ((67, 80), 0.3, 0.005),
+                "2.5_fp16_2d_unaligned": ((67, 80), 2.5, 0.005),
+            },
+            # exp miscompiles on an unaligned trailing extent (issue #3799);
+            # the same extent passes through a mul chain in test_pow_int.
+            "expect_fail": [
+                "0.3_fp16_2d_unaligned",
+                "2.5_fp16_2d_unaligned",
+            ],
+        },
         ("test_add_scalar", "test_unary_op_cpu"): {
             "ops_dict": {
                 "add_scalar_5": lambda x: torch.add(x, 5.0),
@@ -5808,6 +5884,23 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             "param_sets": SCALED_MM_TESTS,
         },
         (
+            "test_fp8_scaled_mm_granite_fp8_shapes",
+            "test_fp8_scaled_mm_granite_fp8_shapes_cpu",
+        ): {
+            "param_sets": {
+                "decode_m1_n4096_baseline": (1, 4096, 4096),
+                "decode_m2_n4096_baseline": (2, 4096, 4096),
+                "fused_qkv_n6144": (1, 4096, 6144),
+                "fused_gate_up_n25600": (1, 4096, 25600),
+                "wide_m4_n4096": (4, 4096, 4096),
+                "wide_m8_n4096": (8, 4096, 4096),
+                "prefill_warmup_m16_n4096": (16, 4096, 4096),
+                "bench_prefill_m64_n4096": (64, 4096, 4096),
+                "m8_n1024": (8, 4096, 1024),
+                "m8_n12800": (8, 4096, 12800),
+            },
+        },
+        (
             "test_multiops_split",
             "test_view_permute_mul",
         ): {
@@ -6055,6 +6148,24 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
     def test_unary_op_cpu(self, op, x):
         self.compare_with_cpu(op, x)
 
+    def test_pow(self, shape, exponent, err):
+        """``pow`` over a positive base near 1, where x**n stays in DLFloat16's
+        normal range across the whole exponent sweep -- a wider base underflows
+        the CPU reference itself, charging the backend for its error.
+        """
+        base = cached_randn(shape, differentiation="pow_base", abs=True, scale=0.15)
+        self.compare_with_cpu(
+            lambda x: torch.pow(x, exponent), base + 0.9, atol=err, rtol=err
+        )
+
+    def test_pow_int_base_is_unsupported(self):
+        """An integer base fails at compile time rather than silently."""
+        x = torch.randint(1, 5, (64,), dtype=torch.int32).to("spyre")
+        # Inductor wraps a decomposition's exception, so match on the message
+        # rather than on Unsupported itself.
+        with self.assertRaisesRegex(Exception, "non-floating-point base"):
+            torch.compile(lambda t: torch.pow(t, 2), dynamic=False)(x)
+
     @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_fallback_unary_op_cpu(self, op, x):
         self.compare_with_cpu(op, x)
@@ -6082,6 +6193,29 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 f"{mode_name}: max abs diff: "
                 f"{(result.float() - expected).abs().max().item()}"
             )
+
+    def test_storage_offset_placeholder_view_then_contiguous(self):
+        """A view created in-graph inherits its input's storage offset."""
+        B, H, L, D = 1, 8, 64, 64
+        base = cached_randn(
+            (B, L, 3 * H * D), differentiation="ph_offset_view_contiguous"
+        )
+
+        def packed_k(x):
+            return x.chunk(3, dim=-1)[1].reshape(B, L, H, D).transpose(1, 2)
+
+        def fn(x):
+            return x.transpose(-1, -2).contiguous()
+
+        cpu_view = packed_k(base.clone())
+        expected = fn(cpu_view).float()
+        dev_view = packed_k(base.clone().to("spyre"))
+        assert dev_view.storage_offset() == H * D
+
+        result = _compile_and_run(fn, [dev_view], "spyre", compile=True)
+        assert torch.allclose(result.float(), expected, atol=0.1, rtol=0.1), (
+            f"max abs diff: {(result.float() - expected).abs().max().item()}"
+        )
 
     def test_storage_offset_placeholder_compiled_only(self, op, slicer, base):
         # Same as test_storage_offset_placeholder, minus the eager arm: eager
@@ -7558,6 +7692,23 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         y_cpu = torch.randn(3, 5, device="cpu", generator=gen)
         torch.testing.assert_close(y_spyre.to("cpu"), y_cpu, rtol=0.1, atol=0.1)
 
+    def test_compiled_randn_fallback_cpu(self):
+        """Test that compiled torch.randn with a seeded generator produces matching results."""
+
+        def fn(x):
+            return x * 2 + torch.randn(64, 256, dtype=torch.float16, device=x.device)
+
+        compiled = torch.compile(fn)
+        x_spyre = torch.full((64, 256), 3.0, dtype=torch.float16, device="spyre")
+        compiled(x_spyre)  # warmup: compile before seeding so RNG state matches
+        torch.manual_seed(42)
+        y_spyre = compiled(x_spyre)
+
+        x_cpu = torch.full((64, 256), 3.0, dtype=torch.float16)
+        torch.manual_seed(42)
+        y_cpu = fn(x_cpu)
+        torch.testing.assert_close(y_spyre.cpu(), y_cpu, rtol=0.1, atol=0.1)
+
     def test_uniform_cpu(self):
         """Test that tensor.uniform_() produces values in [0, 1)."""
         x_spyre = torch.tensor(
@@ -8629,6 +8780,54 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
         compare_with_pytorch(
             spyre_fn, pytorch_fn, a, b, scale_a, scale_b, bias, atol=0.1, rtol=0.1
+        )
+
+    def test_fp8_scaled_mm_granite_fp8_shapes_cpu(self, m, k, n):
+        """Regression test for SuperDSC aborts on FP8 _scaled_mm at Granite 8B shapes.
+
+        Covers fused QKV (N=6144), fused gate_up (N=25600), and wide-M prefill
+        shapes that previously caused compilation failures (issue #4179).
+
+        Two independent fixes are exercised here:
+          Fix 1 (compute_ops.py): corrects the out/N-dim elemArr constants
+            emitted by gen_coord_info_value for the QFP8WT KERNEL weight.
+          Fix 2 (work_division.py): routes batchmatmulfp8 through the analytic
+            cost model (_cost_model_divide_op), which was previously skipped for
+            FP8 BMM ops. The cost model now produces a correct split for all N.
+        """
+        x = cached_randn(
+            (m, k), dtype=torch.float16, differentiation=("x", m, k, n), scale=0.5
+        )
+        w = cached_randn(
+            (k, n), dtype=torch.float16, differentiation=("w", m, k, n), scale=0.5
+        )
+        scale_a = torch.tensor([0.1], dtype=torch.float16)
+        scale_b = torch.tensor([0.1], dtype=torch.float16)
+
+        def spyre_fn(x, w, scale_a, scale_b):
+            xa = torch.ops.spyre.quantize_fp8_with_scale(x, scale_a)
+            wb = torch.ops.spyre.quantize_weight_fp8_with_scale(w, scale_b)
+            return torch.ops.aten._scaled_mm(
+                xa, wb, scale_a=scale_a, scale_b=scale_b, out_dtype=torch.float16
+            )
+
+        def pytorch_fn(x, w, scale_a, scale_b):
+            xa = (
+                (x / scale_a)
+                .clamp(-448.0, 448.0)
+                .to(torch.float8_e4m3fn)
+                .to(torch.float16)
+            )
+            wb = (
+                (w / scale_b)
+                .clamp(-448.0, 448.0)
+                .to(torch.float8_e4m3fn)
+                .to(torch.float16)
+            )
+            return (xa @ wb) * (scale_a * scale_b)
+
+        compare_with_pytorch(
+            spyre_fn, pytorch_fn, x, w, scale_a, scale_b, atol=2.0, rtol=0.2
         )
 
     def test_is_nonzero_cpu(self, *args):

@@ -70,20 +70,31 @@ SMALL_SIZE = 10
 ALIGNMENT = 128
 
 
+def _signature_key(cd: CoreDivision):
+    """Per-core slicing signature, or ``None`` for a reduction-split division
+    (a ``None`` never compares equal, so partial-reduction divisions never
+    match). Only used within one operation's symbol namespace."""
+    return (
+        tuple(sorted(cd.output_splits.items(), key=lambda item: str(item[0])))
+        if not cd.reduction_splits
+        else None
+    )
+
+
 class TestCoreDivision(TestCase):
     def test_symbol_keys_are_sortable_for_signature_and_label(self):
-        x, y = sympy.symbols("x y")
+        x, y, rx, ry = sympy.symbols("x y rx ry")
         division = CoreDivision(
-            output_splits={y: 2, x: 4}, reduction_splits={y: 8, x: 16}
+            splits={y: 2, x: 4, ry: 8, rx: 16}, reduction_syms=frozenset({rx, ry})
         )
 
         self.assertEqual(
             division.label,
-            "sx/4,sy/2 ~sx/16,~sy/8",
+            "sx/4,sy/2 ~srx/16,~sry/8",
         )
-        self.assertIsNone(division.signature_key())
+        self.assertIsNone(_signature_key(division))
         self.assertEqual(
-            CoreDivision(output_splits={y: 2, x: 4}).signature_key(),
+            _signature_key(CoreDivision(splits={y: 2, x: 4})),
             ((x, 4), (y, 2)),
         )
 
@@ -175,7 +186,7 @@ def _divs():
     # Two valid loop divisions: split output stride-256 axis four ways
     # (per-core footprint = total / 4), or keep the buffer whole.
     return [
-        CoreDivision(output_splits={256: 4}),
+        CoreDivision(splits={256: 4}),
         CoreDivision(),
     ]
 
@@ -1126,7 +1137,7 @@ class JointDivisionSolverTests(BaseLayoutSolverTests):
         # clean split, so their signatures agree.
         p_cd = result["P"].core_divisions[result["P"].chosen_division]
         c_cd = result["C"].core_divisions[result["C"].chosen_division]
-        self.assertEqual(p_cd.signature_key(), c_cd.signature_key())
+        self.assertEqual(_signature_key(p_cd), _signature_key(c_cd))
         self.assertEqual(p_cd.output_partition, 4)
 
     def test_no_consumer_division_buffer_is_spilled(self):
@@ -1274,13 +1285,13 @@ class TestCpSatJointDivision(JointDivisionSolverTests, TestCase):
             residency_reason="no consumer reads it from LX",
         )
         big = CoreDivisionBuffer(
-            "big", 1000, [0, 1], core_divisions=[CoreDivision(output_splits={256: 4})]
+            "big", 1000, [0, 1], core_divisions=[CoreDivision(splits={256: 4})]
         )
         C = CoreDivisionBuffer(
             "C",
             100,
             [1, 2],
-            core_divisions=[CoreDivision(output_splits={256: 4})],
+            core_divisions=[CoreDivision(splits={256: 4})],
             parents=["big"],
             residency_reason="no consumer reads it from LX",
         )
@@ -1299,8 +1310,8 @@ class TestCpSatJointDivision(JointDivisionSolverTests, TestCase):
 
     def test_balance_prefers_balanced_division(self):
         # verify the solver prefers the balanced core split
-        unbalanced = CoreDivision(output_splits={256: 4})  # 4 cores, cost 16
-        balanced = CoreDivision(output_splits={256: 2, 128: 2})  # 4 cores, cost 8
+        unbalanced = CoreDivision(splits={256: 4})  # 4 cores, cost 16
+        balanced = CoreDivision(splits={256: 2, 128: 2})  # 4 cores, cost 8
         self.assertEqual(unbalanced.cores_used, balanced.cores_used)
         a = CoreDivisionBuffer(
             "a",
@@ -1348,8 +1359,10 @@ class TestCpSatJointDivision(JointDivisionSolverTests, TestCase):
             128,
             [0, 1],
             core_divisions=[
-                CoreDivision(output_splits={"b": 4, "m": 8}, reduction_splits={}),
-                CoreDivision(output_splits={"b": 4, "m": 4}, reduction_splits={"k": 2}),
+                CoreDivision(splits={"b": 4, "m": 8}),
+                CoreDivision(
+                    splits={"b": 4, "m": 4, "k": 2}, reduction_syms=frozenset({"k"})
+                ),
             ],
         )
         self.assertEqual(buf.core_divisions[0].cores_used, 32)

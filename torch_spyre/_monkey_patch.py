@@ -181,8 +181,9 @@ def _patch_tensor_for_spyre():
         else:
             # Check if copy kwarg is explicitly set
             copy = kwargs.get("copy")
+            device = kwargs.get("device")
 
-            # Determine dtype from various possible sources
+            # Determine dtype and device from the supported Tensor.to forms.
             dtype = None
             if len(args) > 0:
                 # If args[0] is a dtype instance, use it
@@ -191,6 +192,11 @@ def _patch_tensor_for_spyre():
                 # If args[0] is a Tensor, use its dtype
                 elif isinstance(args[0], torch.Tensor):
                     dtype = args[0].dtype
+                    device = args[0].device
+                elif isinstance(args[0], (str, torch.device)):
+                    device = args[0]
+                    if len(args) > 1 and isinstance(args[1], torch.dtype):
+                        dtype = args[1]
 
             # Check for dtype in kwargs
             if dtype is None and "dtype" in kwargs:
@@ -206,10 +212,17 @@ def _patch_tensor_for_spyre():
             if dtype is None:
                 dtype = self.dtype
 
+            # The C++ allocator takes a real c10::Device so it can select the
+            # correct Spyre allocator before creating storage.  Tensor.to also
+            # accepts string destinations, so normalize that public form at
+            # the Python boundary without losing an explicit device index.
+            if device is not None:
+                device = torch.device(device)
+
             from torch_spyre._C import spyre_empty_with_layout
 
             dst = spyre_empty_with_layout(
-                self.size(), self.stride(), dtype, device_layout
+                self.size(), self.stride(), dtype, device_layout, device=device
             )
 
             if self.device.type == "cpu":
@@ -224,6 +237,7 @@ def _patch_tensor_for_spyre():
                     not copy
                     and current_layout is not None
                     and current_layout == device_layout
+                    and self.device == dst.device
                 ):
                     return self
                 else:
@@ -231,9 +245,10 @@ def _patch_tensor_for_spyre():
                     # storage_offset is dropped by Inductor, so the lowering
                     # must re-introduce it in-graph (see copy_from_d2d in
                     # customops.py and lower_spyre_from_d2d).
-                    return torch.ops.spyre.copy_from_d2d(
+                    torch.ops.spyre.copy_from_d2d(
                         self, dst, self.storage_offset(), dst.storage_offset()
                     )
+                    return dst
 
     def spyre_empty(
         *args,

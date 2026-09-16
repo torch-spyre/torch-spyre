@@ -110,10 +110,7 @@ _SOLVER_CHOSE_SPILL = "spilled by solver (no residency benefit / no room)"
 def _work_slices(op, division: "CoreDivision") -> dict:
     """Restore a complete symbol-keyed split map from a sparse candidate."""
     return {
-        symbol: (
-            division.output_splits.get(symbol, division.reduction_splits.get(symbol, 1))
-        )
-        for symbol in iteration_space_from_op(op)
+        symbol: division.splits.get(symbol, 1) for symbol in iteration_space_from_op(op)
     }
 
 
@@ -227,14 +224,12 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
             value_of[buf.sym_is_lx] = lambda chosen, resident, name=buf.name: (
                 1 if name in resident else 0
             )
-            out_syms, red_syms = buf.sym_core_divs
-            for key, sym in out_syms.items():
+            # The division's identity, for table terms over candidates (the
+            # relayout price is one; see RelayoutCopyBuffer.cost_term).
+            value_of[buf.sym_division] = lambda chosen, resident, idx=idx: chosen[idx]
+            for key, sym in buf.sym_core_divs.items():
                 value_of[sym] = lambda chosen, resident, idx=idx, key=key, buf=buf: (
-                    buf.core_divisions[chosen[idx]].output_splits.get(key, 1)
-                )
-            for key, sym in red_syms.items():
-                value_of[sym] = lambda chosen, resident, idx=idx, key=key, buf=buf: (
-                    buf.core_divisions[chosen[idx]].reduction_splits.get(key, 1)
+                    buf.core_divisions[chosen[idx]].splits.get(key, 1)
                 )
         try:
             free = sorted(cost_expr.free_symbols, key=str)

@@ -263,17 +263,6 @@ def hbm_pool_planning(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]
         and isinstance(layout := io_buf.maybe_get_layout(), FixedTiledLayout)
     }
 
-    def _is_intermediate(name: str) -> bool:
-        buf = V.graph.get_buffer(name)
-        if buf is None:
-            return False
-        layout = buf.maybe_get_layout()
-        return (
-            isinstance(layout, FixedTiledLayout)
-            and "lx" not in layout.allocation
-            and id(layout.allocation) not in io_alloc_ids
-        )
-
     def _alloc_id(name: str) -> int | None:
         """Return id(layout.allocation) for `name`, or None if unavailable.
 
@@ -302,6 +291,28 @@ def hbm_pool_planning(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]
         if isinstance(node, _kernel_arg_types)
         for dep in node.read_writes.reads
     }
+    # MutationLayoutSHOULDREMOVE can make a differently named kernel
+    # intermediate share the allocation of a fallback input. Excluding only
+    # fallback_read by name would still let that alias acquire an hbm_pool
+    # offset, which also relocates the fallback input. Pooled buffers have no
+    # Python tensor of their own, so the fallback would then emit a reference
+    # to a name that was never materialized (for example a for_each_tile
+    # accumulator passed directly to all_reduce_run).
+    fallback_read_alloc_ids = {
+        alloc_id for name in fallback_read if (alloc_id := _alloc_id(name)) is not None
+    }
+
+    def _is_intermediate(name: str) -> bool:
+        buf = V.graph.get_buffer(name)
+        if buf is None:
+            return False
+        layout = buf.maybe_get_layout()
+        return (
+            isinstance(layout, FixedTiledLayout)
+            and "lx" not in layout.allocation
+            and id(layout.allocation) not in io_alloc_ids
+            and id(layout.allocation) not in fallback_read_alloc_ids
+        )
 
     # Build per-buffer writer-bundle / reader-bundles maps by walking each
     # top-level bundle's own flattened node list once.  A buffer normally has

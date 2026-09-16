@@ -841,22 +841,18 @@ def derive_operation_mapping(
     raise ValueError("no operation core mapping satisfies every LX tensor owner")
 
 
-def partition_physical_span_bytes(
+def partition_lx_size_bytes(
     device_size: Sequence[int],
     device_dtype: DataFormats,
     split_by_device_dim: Mapping[int, int],
 ) -> int:
-    """Bound a normalized standard-layout partition, including gaps between rows.
+    """Size one core's packed slice of a normalized standard device layout.
 
-    Device dimensions are stored in decreasing physical-stride order. The
-    layout's ``stride_map`` instead addresses HOST memory and must not size LX.
-    A backend may pack a partition more tightly; retaining the original device
-    strides is a conservative bound. The caller must supply a final dimension
-    of exactly ``device_dtype.elems_per_stick()`` elements, with no split on
-    that axis. Host-shape SpyreTensorLayout construction provides this form;
-    an explicit device shape is not guaranteed to. Non-positive extents and
-    invalid split axes/factors also raise ValueError, never a guessed size.
-    This measures placement, not the split-cost estimate.
+    LX stores the local extents, not the gaps between cores' slices in the
+    whole tensor. Use this member's physical splits: replicated consumers need
+    more storage than tensor size divided by the communication core count.
+    Device extents include padding; the final axis must be a complete unsplit
+    stick. Reject uneven slices, whose local storage is not described here.
     """
 
     if not device_size or any(extent <= 0 for extent in device_size):
@@ -868,18 +864,17 @@ def partition_physical_span_bytes(
         if dim < 0 or dim >= len(device_size) or split <= 0:
             raise ValueError(f"invalid split {split} on device dimension {dim}")
     if device_size[-1] != elems_per_stick:
-        raise ValueError("physical span requires one complete final stick dimension")
+        raise ValueError("LX size requires one complete final stick dimension")
     if split_by_device_dim.get(len(device_size) - 1, 1) != 1:
         raise ValueError("the final stick dimension cannot be split")
 
-    span_sticks = stride_sticks = 1
-    for dim in reversed(range(len(device_size) - 1)):
-        extent = device_size[dim]
+    per_core_size = []
+    for dim, extent in enumerate(device_size):
         split = split_by_device_dim.get(dim, 1)
-        slice_extent = (extent + split - 1) // split
-        span_sticks += (slice_extent - 1) * stride_sticks
-        stride_sticks *= extent
-    return get_device_size_in_bytes([span_sticks, elems_per_stick], device_dtype)
+        if extent % split:
+            raise ValueError(f"device extent {extent} is not divisible by {split}")
+        per_core_size.append(extent // split)
+    return get_device_size_in_bytes(per_core_size, device_dtype)
 
 
 def core_mappings_equal(
