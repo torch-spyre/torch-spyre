@@ -1669,7 +1669,9 @@ def main():
             # existing so this deploys before the migration.
             if v2db and v2_benchmark_tables_present(client, v2db):
                 _src, _ext = v2_source_and_external_run_id(args, str(run_id))
-                _v2_run_id = v2_run_id_for(args, str(run_id), args.platform or "", "perf")
+                _v2_run_id = v2_run_id_for(
+                    args, str(run_id), args.platform or "", "perf"
+                )
                 if not _v2_run_id:
                     print(
                         "  [warn] v2 skipped: run_id not derivable "
@@ -1730,7 +1732,9 @@ def main():
             # existing so this deploys before the migration.
             if v2db and v2_benchmark_tables_present(client, v2db):
                 _src, _ext = v2_source_and_external_run_id(args, str(run_id))
-                _v2_run_id = v2_run_id_for(args, str(run_id), args.platform or "", "perf")
+                _v2_run_id = v2_run_id_for(
+                    args, str(run_id), args.platform or "", "perf"
+                )
                 if not _v2_run_id:
                     print(
                         "  [warn] v2 skipped: run_id not derivable "
