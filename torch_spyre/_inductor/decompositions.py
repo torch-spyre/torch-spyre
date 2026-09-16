@@ -62,6 +62,8 @@ _SDPA_MAX_SEQUENCE_TILE_SIZE = 512
 _SDPA_MAX_TILE_PAIRS_PER_LOOP_GROUP = 16
 _SDPA_PREFERRED_HEADS_PER_TILE = (4, 2, 1)
 _SDPA_MHA_MAX_HEAD_WORK_DIVISION = 4
+_SDPA_MHA_QUERY_ONLY_MAX_HEADS = 8
+_SDPA_MHA_QUERY_ONLY_MIN_KV_BLOCKS = 8
 _SDPA_LIVE_SCORE_BUFFER_ALLOWANCE = 2
 _SDPA_LIVE_QUERY_BUFFER_ALLOWANCE = 2
 _SDPA_TARGET_KV_BYTES_PER_CORE = 1024 * 1024
@@ -182,6 +184,7 @@ def _sdpa_work_division(
     num_heads: int,
     num_kvheads: int,
     max_seqlen_q: int,
+    max_seqlen_kv: int,
     num_cores: int,
 ) -> dict[str, int] | None:
     """Find the largest placeable head/query split.
@@ -201,6 +204,20 @@ def _sdpa_work_division(
             return None
         query_split = _largest_exact_split(max_seqlen_q, num_cores)
         return {"max_seqlen_q": query_split} if query_split > 1 else None
+
+    # A head/query split gives loop-local matmul results two physical ownership
+    # axes. The loop handoff can represent only one primary split, forcing those
+    # results through HBM. For long, low-head MHA, using query rows alone keeps
+    # the loop body and its carries LX-resident and wins back the HBM traffic.
+    # Retain the head split for short loops, where its finer-grained matmul work
+    # is faster, and for wider-head MHA, where query-only scheduling regresses.
+    if (
+        num_heads <= _SDPA_MHA_QUERY_ONLY_MAX_HEADS
+        and max_seqlen_q % num_cores == 0
+        and max_seqlen_kv
+        >= _SDPA_MHA_QUERY_ONLY_MIN_KV_BLOCKS * _SDPA_MAX_SEQUENCE_TILE_SIZE
+    ):
+        return {"max_seqlen_q": num_cores}
 
     best: tuple[int, int] | None = None
     max_head_split = min(_SDPA_MHA_MAX_HEAD_WORK_DIVISION, num_heads, num_cores)
@@ -461,7 +478,9 @@ def _select_sdpa_tiling(
     work_div = (
         None
         if is_decode
-        else _sdpa_work_division(num_heads, num_kvheads, max_seqlen_q, num_cores)
+        else _sdpa_work_division(
+            num_heads, num_kvheads, max_seqlen_q, max_seqlen_kv, num_cores
+        )
     )
 
     reason = "compiler-cost candidate available"
