@@ -28,6 +28,56 @@ import torch_spyre
 from test_prepare_kernel import TestPrepareKernel as tpk
 
 
+def _zero_symbol_hcm() -> dict:
+    """Return a valid HCM that produces a fixed payload without runtime symbols."""
+    return {
+        "vdci": {
+            "dsName_": "zero_symbol",
+            "isMarker_": 0,
+            # One DCI with no selector symbols: it is always selected.
+            "data_conversion_info_group_": [
+                {
+                    "key": [],
+                    "dci": {
+                        "dsName_": "zero_symbol",
+                        "isHostToSen_": 1,
+                        "dataformat_src_": 8,  # DataFormats::SENINT8
+                        "dataformat_dst_": 8,  # DataFormats::SENINT8
+                        "dcOpName_": 6,  # DataConvertOpFuncs::SYMBOL_SUBSTITUTE
+                        "pre_expand_dcsi_": [],
+                        "pre_input_shape_": [],
+                        "dcsi_": [],
+                        "input_shape_": [],
+                        # One element per byte: matches the 1024-byte H2D payload.
+                        "output_shape_": [1024],
+                        "post_slice_dcsi_": [],
+                        "post_output_shape_": [],
+                        "input_dimwise_ea_": [],
+                        "output_dimwise_ea_": [],
+                        "useSpi_": 0,
+                        "usePca_": 0,
+                        "usePadVal_": 0,
+                        "inputPadVal_": 0,
+                        "useWli_": 0,
+                        "dmdi_": {"perTensorInfo": []},
+                        "ssi_": {
+                            "value_and_locs_": [],  # No runtime values to patch.
+                            "inputSym_": [],  # No Deeptools input symbols.
+                            "unSubstitutedFlitStartOffset_": 0,
+                        },
+                    },
+                }
+            ],
+            "group_tags_": [],
+            "inputSym_": [],  # nullptr resolves to an empty input vector.
+            "dciIdxSym_": [],  # No symbols select a DCI-group entry.
+            "variableDefs_": [],  # No derived symbols.
+        },
+        # Host compute requires a payload constant and a trailer constant.
+        "senConstants": [{"senconst_": "00" * 1024}, {"senconst_": ""}],
+    }
+
+
 def _run_compiled_op(op_name: str) -> None:
     """
     Compile an op with SpyreCode and run it on Spyre, comparing to CPU.
@@ -114,6 +164,26 @@ class TestLaunchJobPlan(TestCase):
             with stream:
                 with pytest.raises(RuntimeError, match="Expect one DCI"):
                     torch_spyre._C.launch_jobplan(job_plan, [])
+
+    def test_zero_symbol_host_compute_does_not_raise(self):
+        """A zero-symbol HostCompute step must populate its output buffer."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            test_pk = tpk()
+            spyrecode_dir = test_pk.create_mock_spyrecode(
+                tmpdir,
+                exec_command="ComputeOnHost",
+                exec_properties={
+                    "ohandle": "output_buffer",
+                    "size": "1024",
+                    "ishape": ["0"],
+                    "ihandle": "",
+                    "hcm": _zero_symbol_hcm(),
+                },
+            )
+            job_plan = torch_spyre._C.prepare_kernel(spyrecode_dir)
+            stream = torch.Stream("spyre")
+            with stream:
+                torch_spyre._C.launch_jobplan(job_plan, [])
 
 
 def _build_d2h_jobplan(tmpdir: str, dev_ptr: int, size_bytes: int):

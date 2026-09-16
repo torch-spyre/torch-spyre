@@ -830,6 +830,25 @@ class TestPrepareKernel:
             with pytest.raises(RuntimeError, match="Step index out of range"):
                 job_plan.get_step_pipeline_barrier(999)
 
+    def test_dev_only_plan_has_all_dev_roles(self):
+        """A pure ComputeOnDevice plan assigns Dev role to every step.
+
+        Guards that the two-stream role assignment never bleeds into legacy
+        single-stream plans: every step of a plain ComputeOnDevice plan must
+        carry role=Dev, never Prep.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            spyrecode_dir = self.create_mock_spyrecode(
+                tmpdir, exec_command="ComputeOnDevice"
+            )
+            job_plan = torch_spyre._C.prepare_kernel(spyrecode_dir)
+            n = job_plan.num_steps()
+            assert n >= 1
+            roles = [job_plan.get_step_stream_role(i) for i in range(n)]
+            assert all(r == "Dev" for r in roles), (
+                f"Expected all Dev roles for a pure Compute plan, got {roles}"
+            )
+
     def test_project_real_plan_identity_valid_permuted_rejected(self):
         """#7a: project a REAL prepared plan through validate()'s exact path.
 
