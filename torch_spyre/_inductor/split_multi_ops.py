@@ -31,6 +31,7 @@ from torch._inductor.ops_handler import WrapperHandler
 from torch._inductor.virtualized import V
 from torch.utils._ordered_set import OrderedSet
 from .logging_utils import get_inductor_logger
+from .loop_info import ReadCopyElisionRecord
 from .errors import Unsupported
 from .pass_utils import replace_computed_buffer_body
 from .constants import is_ea_compatible
@@ -664,6 +665,7 @@ def _patch_original_buf(
         name_map[orig_load_names[v_in]] = new_buf
 
     orig_inner = op.data.inner_fn
+    read_copy_record = getattr(op, "_read_copy_elision_record", None)
     _cm = constant_map or {}
     _oq_snapshot = {k: collections.deque(v) for k, v in (op_queues or {}).items()}
 
@@ -674,6 +676,19 @@ def _patch_original_buf(
         inner = _SplitOpsHandler(V.ops, _nm, _cm)
         with V.set_ops_handler(_IntermediateOpHandler(inner, fresh_queues)):
             return _orig(*args)
+
+    direct_inner_fn = None
+    if isinstance(read_copy_record, ReadCopyElisionRecord):
+
+        def direct_inner_fn(
+            *args,
+            _nm=name_map,
+            _orig=read_copy_record.direct_inner_fn,
+        ):
+            fresh_queues = {k: collections.deque(v) for k, v in _oq_snapshot.items()}
+            inner = _SplitOpsHandler(V.ops, _nm, _cm)
+            with V.set_ops_handler(_IntermediateOpHandler(inner, fresh_queues)):
+                return _orig(*args)
 
     new_data = dataclasses.replace(op.data, inner_fn=new_inner_fn)
     # Preserve origins from the original data object (dataclasses.replace creates
@@ -686,6 +701,11 @@ def _patch_original_buf(
         pass_name="split_multi_ops",
         reason="rewrite original buffer body",
     )
+    if isinstance(read_copy_record, ReadCopyElisionRecord):
+        new_op._read_copy_elision_record = dataclasses.replace(  # type: ignore[attr-defined]
+            read_copy_record,
+            direct_inner_fn=direct_inner_fn,
+        )
     V.graph.name_to_buffer[new_op.get_name()] = new_op
 
 

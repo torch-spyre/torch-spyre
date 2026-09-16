@@ -6090,8 +6090,13 @@ class TestReadCopyElisionProof(unittest.TestCase):
         self.assertEqual(_affine_bounds(dep), (0, 4095))
 
     def test_loop_bound_covers_every_expert_step(self):
+        from torch._inductor.dependencies import MemoryDep
         from torch_spyre._inductor.read_copy_elision import _loop_advance_bound
 
+        op = SimpleNamespace(
+            data=SimpleNamespace(ranges=[Integer(1)], reduction_ranges=[])
+        )
+        dep = MemoryDep(name="weight", index=Integer(0), var_names=(), size=())
         info = CoarseTileInfo(
             loop_group_id=(0,),
             loop_count=[Integer(3)],
@@ -6100,20 +6105,98 @@ class TestReadCopyElisionProof(unittest.TestCase):
             squeezed_advance_per_read=[[[(Integer(4096), Integer(1))]]],
         )
 
-        self.assertEqual(_loop_advance_bound(info, 0), (0, 8192))
+        self.assertEqual(_loop_advance_bound(op, dep, info, 0), (0, 8192))
 
-    def test_unsqueezed_loop_step_is_not_elided(self):
+    def test_unsqueezed_loop_step_uses_dependency_stride(self):
+        from torch._inductor.dependencies import MemoryDep
         from torch_spyre._inductor.read_copy_elision import _loop_advance_bound
 
+        d0, d1 = sympy.symbols("d0 d1", integer=True)
+        op = SimpleNamespace(
+            data=SimpleNamespace(
+                ranges=[Integer(64), Integer(128)], reduction_ranges=[]
+            )
+        )
+        dep = MemoryDep(
+            name="weight",
+            index=128 * d0 + d1,
+            var_names=(d0, d1),
+            size=(Integer(64), Integer(128)),
+        )
         info = CoarseTileInfo(
             loop_group_id=(0,),
             loop_count=[Integer(3)],
             loop_tiled_dims=[[0]],
-            tiled_dims_per_read=[[[(0, Integer(1))]]],
-            squeezed_advance_per_read=[[[(Integer(4096), Integer(1))]]],
+            tiled_dims_per_read=[[[(0, Integer(64))]]],
         )
 
-        self.assertIsNone(_loop_advance_bound(info, 0))
+        self.assertEqual(_loop_advance_bound(op, dep, info, 0), (0, 16384))
+
+    def test_direct_read_storage_encoding_must_match(self):
+        from torch_spyre._C import ElementArrangement
+        from torch_spyre._inductor.read_copy_elision import _same_storage_encoding
+
+        def layout(*, dtype=torch.float16, device_dtype=_FP16, ea=None):
+            return SimpleNamespace(
+                dtype=dtype,
+                device_layout=SimpleNamespace(
+                    device_dtype=device_dtype,
+                    element_arrangement=ea or ElementArrangement.STANDARD,
+                ),
+            )
+
+        standard = layout()
+        self.assertTrue(_same_storage_encoding(standard, layout()))
+        self.assertFalse(
+            _same_storage_encoding(standard, layout(ea=ElementArrangement.DL16_TO_FP32))
+        )
+        self.assertFalse(
+            _same_storage_encoding(standard, layout(device_dtype=DataFormats.IEEE_FP32))
+        )
+        self.assertFalse(_same_storage_encoding(standard, layout(dtype=torch.float32)))
+
+    def test_logical_split_ownership_ignores_physical_layout_axes(self):
+        from torch._inductor.dependencies import MemoryDep
+        from torch_spyre._inductor.read_copy_elision import _logical_split_ownership
+
+        head, query, feature = sympy.symbols("head query feature", integer=True)
+        core_id = sympy.Symbol("core_id", integer=True)
+        ownership = SimpleNamespace(
+            work_slices={head: 2, query: 16, feature: 1},
+            core_id_to_work_slice={
+                head: Mod(core_id, 2),
+                query: Mod(floor(core_id / 2), 16),
+                feature: Integer(0),
+            },
+        )
+        op = SimpleNamespace(iteration_space_ownership=ownership)
+        full = MemoryDep(
+            name="full",
+            index=1048576 * head + feature,
+            var_names=(head, query, feature),
+            size=(Integer(2), Integer(64), Integer(128)),
+        )
+        transposed_tile = MemoryDep(
+            name="tile",
+            index=head + 2 * feature,
+            var_names=(head, query, feature),
+            size=(Integer(2), Integer(64), Integer(128)),
+        )
+        different_slice = MemoryDep(
+            name="other",
+            index=query + 64 * feature,
+            var_names=(head, query, feature),
+            size=(Integer(2), Integer(64), Integer(128)),
+        )
+
+        self.assertEqual(
+            _logical_split_ownership(op, full),
+            _logical_split_ownership(op, transposed_tile),
+        )
+        self.assertNotEqual(
+            _logical_split_ownership(op, full),
+            _logical_split_ownership(op, different_slice),
+        )
 
 
 class TestInsertAllReadCopyOps(unittest.TestCase):
