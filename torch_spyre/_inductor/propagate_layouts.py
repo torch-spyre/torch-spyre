@@ -2026,8 +2026,9 @@ def generic_layout(op: Operation) -> SpyreTensorLayout:
 
 def _generic_layout_for(output: FixedLayout) -> SpyreTensorLayout:
     # tl;dr: usually pick the blind identity stick-dim order; only override
-    # it for a FixedLayout whose most-contiguous dim isn't already last,
-    # since that's the one shape where the blind order is provably wrong.
+    # it for a FixedLayout whose most-contiguous REAL dim isn't already
+    # last, since that's the one shape where the blind order is provably
+    # wrong.
     #
     # Concretize for C++ SpyreTensorLayout constructor.
     c_size = [concretize_expr(s) for s in output.size]
@@ -2035,29 +2036,48 @@ def _generic_layout_for(output: FixedLayout) -> SpyreTensorLayout:
     # SpyreTensorLayout's bare (size, dtype) constructor synthesizes its own
     # row-major host strides from size alone (identity dim order, last dim =
     # stick dim) -- blind to output.stride. That's correct for the
-    # overwhelming majority of ops, including a BROADCAST layout (zero
-    # stride) like test_building_blocks' causal-SDPA buf29 -- so it's left
-    # in place except in the one case below.
+    # overwhelming majority of ops, including a purely-broadcast layout
+    # (every dim zero stride) like test_building_blocks' causal-SDPA buf29
+    # -- so it's left in place except in the one case below.
     #
     # A FixedLayout can carry a non-monotonic stride whose last dim is NOT
-    # its most-contiguous one (e.g. it's shared with a later mutation write
-    # into the same buffer, as in test_map_mode_split_m's transposed pad
-    # target, size=[6, 64] stride=[1, 6]). There the blind order picks the
-    # wrong stick dim, producing an unrepresentable stick expression
-    # downstream ("Unexpected stick expression d0 + 2*(Mod(3*d1, 32))" out of
-    # _find_alt_target_stl's device_coordinates call). The two conditions
-    # below isolate exactly that case (no zero strides, so broadcast layouts
-    # like buf29 are excluded; min stride not already last, so a natural
-    # row-major layout is untouched) and sort dims by decreasing stride
-    # (ties by original position) so the most-contiguous dim lands last,
-    # matching every other SpyreTensorLayout call site in this module (e.g.
-    # _all_constant_layouts, _make_output_stl).
+    # its most-contiguous REAL (non-broadcast) dim (e.g. it's shared with a
+    # later mutation write into the same buffer, as in
+    # test_map_mode_split_m's transposed pad target, size=[6, 64]
+    # stride=[1, 6], or issue #4460's constant_pad_nd target buf60, size=
+    # [2, 6, 64] stride=[0, 1, 6] -- a legitimate broadcast dim (stride 0,
+    # size 2) alongside two real dims that are themselves non-monotonic).
+    # There the blind order picks the wrong stick dim, producing an
+    # unrepresentable stick expression downstream ("Unexpected stick
+    # expression d0 + 2*(Mod(3*d1, 32))" out of _find_alt_target_stl's
+    # device_coordinates call).
+    #
+    # A broadcast dim (stride 0, size > 1) has no real address contribution
+    # and must never be picked as the stick dim, nor influence which real
+    # dim is most-contiguous -- ranking it by its raw stride value would
+    # place it first (0 sorts as smallest), corrupting the choice. Exclude
+    # broadcast dims from the ranking (mirroring lower_pad_sequence's own
+    # broadcast-dim exclusion in pass_utils.py) and place them ahead of the
+    # ranked real dims in dim_order; a size-1 dim's stride is irrelevant
+    # regardless.
+    #
+    # The two conditions below isolate exactly the "non-monotonic among
+    # real dims" case (at least one nonzero stride to rank; most-contiguous
+    # real dim not already last) and sort the real dims by decreasing
+    # stride (ties by original position) so the most-contiguous one lands
+    # last, matching every other SpyreTensorLayout call site in this module
+    # (e.g. _all_constant_layouts, _make_output_stl).
+    real_dims = [
+        d for d in range(len(c_size)) if not (c_stride[d] == 0 and c_size[d] > 1)
+    ]
     if (
         len(c_size) > 1
-        and all(s != 0 for s in c_stride)
-        and min(c_stride) != c_stride[-1]
+        and real_dims
+        and min(c_stride[d] for d in real_dims) != c_stride[-1]
     ):
-        dim_order = sorted(range(len(c_size)), key=lambda d: (-c_stride[d], d))
+        broadcast_dims = [d for d in range(len(c_size)) if d not in real_dims]
+        ordered_real = sorted(real_dims, key=lambda d: (-c_stride[d], d))
+        dim_order = broadcast_dims + ordered_real
         return SpyreTensorLayout(c_size, c_stride, output.dtype, dim_order)
     return SpyreTensorLayout(c_size, output.dtype)
 

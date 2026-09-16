@@ -1349,20 +1349,20 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
 
         splice_while_loops is the pipeline's *first* pass; every later
         pass in the pipeline (propagate_named_dims, assign_dim_hints, ...,
-        propagate_spyre_tensor_layouts) runs after it and is irrelevant to
-        what this test checks. nested_split_m_then_k_fn's inner loop is
-        split_k-shaped and inherits the pre-existing, out-of-scope issue
-        #4460 stick-layout/read-copy gap in propagate_spyre_tensor_layouts
-        (same gap test_carry_mode_split_k is xfailed for in
-        test_for_each_tile_e2e.py, and the same gap
-        test_nested_for_each_tile_value_correct below is xfailed for) the
-        moment a *later* pass runs -- so instead of driving the pipeline
-        all the way through codegen, this test monkeypatches
-        splice_while_loops itself (the name torch_spyre._inductor.passes
-        imports and calls directly) to capture a *snapshot* of
-        graph.operations right as it returns, and tolerates the
-        InductorError the #4460 gap raises afterward in a later, unrelated
-        pass.
+        propagate_spyre_tensor_layouts, codegen) runs after it and is
+        irrelevant to what this test checks. Issue #4460's stick-layout/
+        read-copy gap (the same gap test_carry_mode_split_k is xfailed
+        for in test_for_each_tile_e2e.py) is now fixed for this fixture's
+        shape, but nested_split_m_then_k_fn's inner loop still hits a
+        distinct, out-of-scope issue #4581 gap (an outer-tile-carry
+        symbol not recognized as indirect inside the inner WhileLoop
+        body) during codegen, well after splice_while_loops has already
+        completed -- so instead of driving the pipeline all the way
+        through codegen, this test monkeypatches splice_while_loops
+        itself (the name torch_spyre._inductor.passes imports and calls
+        directly) to capture a *snapshot* of graph.operations right as it
+        returns, and tolerates the InductorError issue #4581 raises
+        afterward in a later, unrelated pass.
 
         The capture must be a snapshot (``list(graph.operations)``, a new
         list object), not a live reference to ``graph`` or to
@@ -1418,15 +1418,15 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
         try:
             capture_post_grad_while_loop(nested_split_m_then_k_fn, (X, Y))
         except InductorError as exc:
-            # Expected: propagate_spyre_tensor_layouts (a later, unrelated
-            # pass) hits issue #4460 after splice_while_loops has already
-            # completed and this test's capture has already fired. Any
-            # OTHER exception is a real, unexpected finding -- do not
-            # swallow it.
+            # Expected: codegen (much later, unrelated to splicing) hits
+            # issue #4581 after splice_while_loops has already completed
+            # and this test's capture has already fired. Any OTHER
+            # exception is a real, unexpected finding -- do not swallow
+            # it.
             self.assertIn(
-                "stick expression",
+                "indirect symbol",
                 str(exc),
-                "expected the known issue #4460 stick-layout gap, got a "
+                "expected the known issue #4581 indirect-symbol gap, got a "
                 f"different InductorError: {exc!r}",
             )
         finally:
@@ -1683,11 +1683,15 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
 
     @unittest.expectedFailure
     def test_nested_for_each_tile_value_correct(self):
-        # Inherits issue #4460 (stick-layout/read-copy reconciliation gap in
-        # propagate_layouts.py) from nested_split_m_then_k_fn's inner loop,
-        # which is split_k-shaped -- the same tiling shape as split_k_fn,
-        # whose own e2e coverage (test_carry_mode_split_k in
-        # test_for_each_tile_e2e.py) is xfailed on this identical gap. Not a
+        # Issue #4460 (stick-layout/read-copy reconciliation gap in
+        # propagate_layouts.py, inherited from nested_split_m_then_k_fn's
+        # split_k-shaped inner loop) is fixed for this fixture's shape.
+        # Compilation now proceeds further and hits a distinct,
+        # out-of-scope issue #4581 gap (an outer-tile-carry symbol not
+        # recognized as indirect inside the inner WhileLoop body) during
+        # codegen. test_carry_mode_split_k (test_for_each_tile_e2e.py)
+        # remains xfailed on the original #4460 gap for its own shape (a
+        # StarDep-shaped matmul consumer, which does not hit #4581). Not a
         # defect in this plan's marker mechanism; out of scope for this
         # plan.
         import torch
