@@ -281,6 +281,18 @@ once rather than once each, and the turnaround and overlap terms are taken over 
 totals. Per-operation prices do not sum to the kernel price, which is why the per-operation
 column is an attribution.
 
+A matmul operand that the core split replicates is the one input charged more than once.
+When the split lies on a dimension the operand does not index, an M split for the right-hand
+operand or an N split for the left-hand one, every core of that split loads its own full copy
+of the operand's slice from HBM.
+The extractor records that factor per argument (`replication` in the report's traffic lines)
+and the HBM bytes scale by it while the operand is not LX-resident.
+Those loads run at a per-core ceiling of about 2.3 GB/s rather than at the shared HBM peak,
+so they are priced as the bytes each core reads over that rate (`mm_replicated_read_gbps_per_core`).
+Residency removes every replica load; a resident graph input keeps only its clone-in load.
+The rule is limited to matmul consumers because a pointwise kernel's broadcast operand was
+measured to load once per kernel regardless of the core split.
+
 `spyre_fuse_nodes` fuses everything it can — contiguous Spyre nodes accumulate in order, and
 only a node that is not on the device starts a new bundle. No size limit, no cost heuristic,
 no reordering. The pass applies that same rule, with two differences:

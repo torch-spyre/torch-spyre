@@ -224,6 +224,9 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
             value_of[buf.sym_is_lx] = lambda chosen, resident, name=buf.name: (
                 1 if name in resident else 0
             )
+            # The division's identity, for table terms over candidates (the
+            # relayout price is one; see RelayoutCopyBuffer.cost_term).
+            value_of[buf.sym_division] = lambda chosen, resident, idx=idx: chosen[idx]
             for key, sym in buf.sym_core_divs.items():
                 value_of[sym] = lambda chosen, resident, idx=idx, key=key, buf=buf: (
                     buf.core_divisions[chosen[idx]].splits.get(key, 1)

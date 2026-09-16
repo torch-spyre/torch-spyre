@@ -153,9 +153,9 @@ class SlidingWindowPlan:
     def read_start_logical(self, qi: int) -> int:
         """``read_start`` converted back to a logical coordinate.
 
-        ``window_band_mask`` needs this, not ``read_start``: its row side is
-        logical, so the column side must be too for ``delta = row - column``
-        to mean anything. A no-op whenever ``buffer_origin`` is 0.
+        A logical-coordinate mask needs this, not ``read_start``: its row and
+        column sides must use the same coordinate space. A no-op whenever
+        ``buffer_origin`` is 0.
         """
         return self.read_start(qi) + self.buffer_origin
 
@@ -412,47 +412,3 @@ def plan_sliding_window(
         cache_capacity=cache_capacity,
         buffer_origin=buffer_origin,
     )
-
-
-def band_valid_start(valid_start: list[int] | None) -> list[int] | None:
-    """The ``valid_start`` the band must actually apply, or None when it masks nothing.
-
-    A caller with no left padding passes zeros rather than tracking whether it has
-    any; collapsing that to None here is what keeps the band broadcast over batch
-    and keeps ``block_is_fully_attended``'s skip available.
-    """
-    if not valid_start or max(valid_start) <= 0:
-        return None
-    return list(valid_start)
-
-
-def band_batch(valid_start: list[int] | None) -> int:
-    """Leading dimension of the band: 1 unless the threshold differs per sequence.
-
-    The band is ``q_block x buffer_width`` per distinct threshold, so a uniform one
-    stays a single broadcast row rather than one copy per batch entry.
-    """
-    effective = band_valid_start(valid_start)
-    if effective is None or min(effective) == max(effective):
-        return 1
-    return len(effective)
-
-
-def check_valid_start(
-    valid_start: list[int] | None, batch: int, cache_seqlen: int
-) -> str | None:
-    """Why this ``valid_start`` is invalid, or None.
-
-    Strings not exceptions, matching ``check_window_read`` -- this module stays
-    free of torch and of the backend's error classes. Batch is a tensor property,
-    so this cannot live in ``rejection_reason``, which answers placement questions
-    from integers alone.
-    """
-    if valid_start is None:
-        return None
-    if len(valid_start) != batch:
-        return f"valid_start has {len(valid_start)} entries for a batch of {batch}"
-    for entry in valid_start:
-        if entry < 0 or entry > cache_seqlen:
-            return f"valid_start={entry} outside [0, cache_seqlen={cache_seqlen}]"
-    return None
