@@ -806,12 +806,9 @@ def _call_op(cache, plan, block_index, which, value_cache=None):
     )[which]
 
 
-def _reference_window(cache, plan, block_index, transpose=False):
+def _reference_window(cache, plan, block_index):
     start = plan.read_start(block_index)
-    window = cache[:, :, start : start + plan.buffer_width, :]
-    if transpose:
-        window = window.transpose(-1, -2)
-    return window
+    return cache[:, :, start : start + plan.buffer_width, :]
 
 
 def _reference_band(plan, block_index):
@@ -833,7 +830,7 @@ class TestKVWindowOp:
 
         k_win, v_win = torch.ops.spyre.kv_window(key, value, 64, 128, HEADS)
 
-        assert k_win.shape == (2, 2, HEAD_DIM, 128)
+        assert k_win.shape == (2, 2, 128, HEAD_DIM)
         assert v_win.shape == (2, 2, 128, HEAD_DIM)
 
     def test_key_and_value_windows(self):
@@ -851,7 +848,7 @@ class TestKVWindowOp:
                     for n in blocks
                 )
             return tuple(
-                [_reference_window(k, plan, n, transpose=True) for n in blocks]
+                [_reference_window(k, plan, n) for n in blocks]
                 + [_reference_window(v, plan, n) for n in blocks]
             )
 
@@ -867,7 +864,7 @@ class TestKVWindowOp:
         def fn(k, v):
             if k.device.type == "spyre":
                 return _call_op(k, plan, 2, 0)
-            return _reference_window(k, plan, 2, transpose=True)
+            return _reference_window(k, plan, 2)
 
         compare_with_cpu(
             fn,
@@ -884,7 +881,7 @@ class TestKVWindowOp:
         def fn(k, v):
             if k.device.type == "spyre":
                 return _call_op(k, plan, 0, 0)
-            return _reference_window(k, plan, 0, transpose=True)
+            return _reference_window(k, plan, 0)
 
         compare_with_cpu(fn, cache, cache, run_eager=False)
 

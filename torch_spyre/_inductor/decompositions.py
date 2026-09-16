@@ -704,10 +704,9 @@ def _select_swa_tiling(
     SDPA's ``max_seqlen_q`` and ``max_seqlen_kv`` become ``q_block`` and
     ``kv_block`` in the SWA decomposition.
 
-    The selected block size need not divide ``buffer_width``.  The caller uses
-    a counted loop for the equal-sized prefix and one direct iteration for the
-    tail, preserving burst-efficient block sizes for compact caches such as
-    1088 rows.
+    The selected block size is an upper bound. As in full SDPA, the caller
+    chooses the closest equal-sized tiling below that bound because
+    ``for_each_tile`` does not support a ragged final tile.
     """
     fallback_kv_block_size = min(_SDPA_MAX_SEQUENCE_TILE_SIZE, buffer_width)
     fallback_num_kv_blocks = (
@@ -1664,7 +1663,7 @@ def spyre_kv_window(
     buffer_width: int,
     num_heads: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """One Q block's native-head KV window, with the key transposed."""
+    """One Q block's native-head K/V window."""
     reason = check_window_read(
         read_start=read_start,
         buffer_width=buffer_width,
@@ -1679,7 +1678,7 @@ def spyre_kv_window(
 
     # Preserve Hkv. Native GQA adds a unit broadcast axis at the matmul rather
     # than materializing Hq copies of each K/V window.
-    k_win = key[:, :, read_start : read_start + buffer_width, :].transpose(-1, -2)
+    k_win = key[:, :, read_start : read_start + buffer_width, :]
     v_win = value[:, :, read_start : read_start + buffer_width, :]
     return k_win, v_win
 
@@ -1841,14 +1840,15 @@ def _windowed_attention(
                 def swa_kv_body(carry, tiles):
                     running_max, denominator, output = carry
                     k_blk, v_blk, mask_blk = tiles
-                    # ``kv_window`` already transposes K; slice that last
-                    # sequence axis directly so the HOP adds no whole-window
-                    # materialization before the matmul.
+                    # Match full SDPA: the scan walks K in cache order and
+                    # materializes only the bounded, transposed tile required
+                    # by the score matmul.
+                    keys_t = k_blk.transpose(-1, -2).contiguous()
                     with spyre_hint(named_dims=score_dim_names):
                         scores = (
-                            torch.ops.spyre.batched_matmul(q_scaled, k_blk)
+                            torch.ops.spyre.batched_matmul(q_scaled, keys_t)
                             if use_gqa
-                            else torch.matmul(q_scaled, k_blk)
+                            else torch.matmul(q_scaled, keys_t)
                         )
                     scores = scores + mask_blk
 
@@ -1876,37 +1876,29 @@ def _windowed_attention(
                     return (new_max, new_denominator, new_output), None
 
                 carry = (running_max, denominator, output)
-                full_blocks = buffer_width // tiling.kv_block_size
-                full_width = full_blocks * tiling.kv_block_size
-                if full_blocks > 1:
+                num_kv_tiles = _num_tiles_for_max_extent(
+                    buffer_width, tiling.kv_block_size
+                )
+                kv_tile_size = buffer_width // num_kv_tiles
+                if num_kv_tiles > 1:
                     carry, _ = for_each_tile(
                         swa_kv_body,
                         (
-                            k_window[..., :full_width],
-                            v_window[..., :full_width, :],
-                            mask_window[..., :full_width],
+                            k_window,
+                            v_window,
+                            mask_window,
                         ),
-                        dims=(-1, -2, -1),
-                        tile_size=tiling.kv_block_size,
+                        dims=(-2, -2, -1),
+                        tile_size=kv_tile_size,
                         init=carry,
                     )
-                elif full_blocks == 1:
+                else:
                     carry, _ = swa_kv_body(
                         carry,
                         (
-                            k_window[..., :full_width],
-                            v_window[..., :full_width, :],
-                            mask_window[..., :full_width],
-                        ),
-                    )
-
-                if full_width < buffer_width:
-                    carry, _ = swa_kv_body(
-                        carry,
-                        (
-                            k_window[..., full_width:],
-                            v_window[..., full_width:, :],
-                            mask_window[..., full_width:],
+                            k_window,
+                            v_window,
+                            mask_window,
                         ),
                     )
 
