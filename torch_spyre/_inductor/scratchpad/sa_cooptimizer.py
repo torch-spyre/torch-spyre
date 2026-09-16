@@ -107,9 +107,9 @@ _BURST_FRACTION = 0.1
 
 # How often a recolor anchor is drawn untiled outright (see
 # ``_GeneratedDivisions._draw_tiling``). Flat, and deliberately not a per-dim
-# opt-out: the tiling axis has no downward pressure in the objective, so the
-# probability of proposing an untiled region must not decay with the number of
-# tileable dims.
+# opt-out: the probability of proposing an untiled region must not decay with the
+# number of tileable dims. ``_companion_bytes`` prices whether to tile, but
+# nothing prices how *deep*, so the draw is what sets depth.
 _UNTILED_ANCHOR_PROB = 0.5
 
 # The geometric cool spans t0 down to t0 / _COOLING_SPAN.
@@ -504,10 +504,17 @@ class _GeneratedDivisions(_DivisionSource):
         the **product** ``prod_d 1/(k_d + 1)`` over the tileable dims -- about
         1/289 at two dims and ``_MAX_SPLITS_PER_DIM`` counts, 1/4913 at three --
         so undividing a region would vanish exactly as the search gained room to
-        over-divide it. Nothing else pushes the tiling axis down: the objective
-        sees a tiling only through a monotone per-core footprint, so a tiling
-        move is score-neutral (accepted unconditionally) or score-improving, and
-        recolor is the only long-range move there is.
+        over-divide it.
+
+        *Whether* to tile is priced: :meth:`SaCoOptimizingSolver._companion_bytes`
+        charges the full-extent companion an escaping op needs, so a tiling move
+        is no longer accepted unconditionally. *How deep* to tile is not. The
+        objective sees depth only through a monotone per-core footprint, and the
+        companion charge is a function of the buffer's size and its outside
+        readers rather than of the tile count, so a drawn tiling is as deep as
+        the draw made it. Hence the flat untiled draw: it is what keeps
+        undividing a region proposable at all, and recolor is the only
+        long-range move there is.
 
         Each tileable dim then offers its legal counts plus ``None`` for "leave
         this one alone". A level the space does not admit is dropped, which
@@ -933,6 +940,15 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         # draw is :meth:`_DivisionSource.anchor`.
         self._anchor_candidates = [i for i in range(n) if self._sources[i].can_split()]
         self._build_operation_positions()
+        # Whether any buffer can carry a tiling at all, so the companion term
+        # costs one bool per score where it cannot -- which is every graph with
+        # ``auto_coarse_tiling`` off, and the parity gate's whole corpus.
+        self._tilings_are_possible = any(
+            isinstance(source, _GeneratedDivisions)
+            and source.space.tiling is not None
+            and not source.space.tiling.is_empty
+            for source in self._sources
+        )
         generated = sum(
             isinstance(source, _GeneratedDivisions) for source in self._sources
         )
@@ -1150,9 +1166,10 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         :meth:`_eligible`, which is an engine threshold rather than a cost
         term, and be paid for afterwards in the traffic residency frees.
 
-        Optimistic while it stands alone: this is the *per-tile* scratch, and
-        an op whose output escapes its tiling group also needs a full-extent
-        companion buffer that nothing sizes yet.
+        Only the *scratch* is sized here, and rightly so: the full-extent
+        companion an escaping op also needs never enters LX (the apply mints it
+        after the addresses are final), so it competes for no space. What it
+        costs is traffic, which :meth:`_companion_bytes` charges.
 
         Clamped non-negative so the packer never sees a negative size from the
         ``mem_usage`` ``-1`` sentinel; what stops an unsized buffer from looking
@@ -1270,6 +1287,96 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         reads_served = buffer.read_count - (1 if buffer.first_use_is_read else 0)
         return (reads_served + (1 if is_intermediate else 0)) * max(0, buffer.size)
 
+    def _tiled_runs(self) -> dict[int, tuple[int, int]]:
+        """Inclusive bounds of the tiled run each tiled operation position sits
+        in; untiled positions are absent, since they mint no companion.
+
+        One left-to-right pass rather than :meth:`_run_bounds` per buffer, which
+        re-walks the whole run each time and would be quadratic on a heavily
+        tiled graph -- this runs once per score.
+        """
+        runs: dict[int, tuple[int, int]] = {}
+        start = 0
+        while start < self._n_positions:
+            spec = self._tiling_at(start)
+            end = start
+            while end + 1 < self._n_positions and self._tiling_at(end + 1) == spec:
+                end += 1
+            if not spec.is_untiled:
+                for position in range(start, end + 1):
+                    runs[position] = (start, end)
+            start = end + 1
+        return runs
+
+    def _companion_bytes(self, addresses: Sequence[Optional[int]]) -> int:
+        """HBM bytes the apply's companion buffers move that the rest of the
+        objective does not count, under the current state.
+
+        A tiling shrinks what the buffer holds at once; it does not shrink what
+        the buffer moves. For an op whose output escapes its tiling group,
+        ``CoarseTilingPass`` allocates a full-extent ``full_buf``, inserts a copy
+        op that drains one tile into it per iteration, and repoints every outside
+        consumer and any graph output at it (``wsr/coarse_tile.py``). None of
+        that is in the features: they were extracted from the untiled graph,
+        before ``_post_solve`` applies anything, so the search sees the per-tile
+        shrink and neither the copy nor the outside consumers' HBM reads. It
+        therefore over-values tiling by a quantity that does not fall with the
+        tile count -- measured as +24% of HBM traffic on
+        ``test_mlp__simulated_annealing_sc32_coopt``.
+
+        Per escaping buffer of ``size`` bytes, with ``r`` consumers outside its
+        run, the difference between the applied graph and the extracted one is:
+
+        * the copy op's read of the per-tile scratch, ``size`` when that scratch
+          is in HBM and free when it is resident;
+        * the copy op's write of ``full_buf``, ``size`` and always HBM -- except
+          for a graph output, whose externally visible write the model already
+          charges whether or not the buffer is resident (#4271), so there the
+          copy replaces a write already counted and only the op's own write into
+          scratch is new;
+        * ``r * size`` when the buffer is resident, because those consumers read
+          ``full_buf`` from HBM rather than the scratch residency freed them
+          from. Not resident, the model already charges them.
+
+        So an op whose consumers all sit inside its own run costs nothing here,
+        which is the shape the recolor flood exists to build, while tiling a
+        buffer that is not resident costs a full HBM round trip -- both of which
+        are the point.
+
+        Two known under-corrections, neither expressible from what the solver
+        holds: a consumer is counted once however many times it reads, and a
+        matmul consumer's ``replication`` (#4454) would make its read of
+        ``full_buf`` cost more than one pass.
+        """
+        if not self._tilings_are_possible:
+            return 0
+        total = 0
+        for position, (lo, hi) in self._tiled_runs().items():
+            idx = self._buffer_at[position]
+            buf = self._bufs[idx]
+            # A buffer with no operation position is in no run, so it is not
+            # here; ``_position_of`` being None on a *consumer* means the same
+            # thing, and puts it outside every run.
+            outside = sum(
+                1
+                for child_idx, _relation in self._children[idx]
+                if not (
+                    (child_position := self._position_of[child_idx]) is not None
+                    and lo <= child_position <= hi
+                )
+            )
+            is_graph_output = buf.boundary is BufferType.Output
+            if not (outside or is_graph_output):
+                # Nothing escapes: the apply keeps the buffer as loop-internal
+                # scratch and allocates no full buffer at all.
+                continue
+            size = max(0, buf.size)
+            copy_read = 0 if addresses[idx] is not None else size
+            copy_write = copy_read if is_graph_output else size
+            outside_reads = size * outside if addresses[idx] is not None else 0
+            total += copy_read + copy_write + outside_reads
+        return total
+
     def _score(self) -> int:
         """The shared objective for the current state, in integer fixed-point
         time units. A buffer with a packer address is LX-resident (its address is
@@ -1283,22 +1390,32 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         a spill adds **over** residency -- so a resident buffer contributes zero
         and only spilled ones are summed, the same shape as the CP-SAT engine's
         ``spill_cost() * (1 - in_buffer)``.
+
+        :meth:`_companion_bytes` is added to both, at the HBM rate, because
+        neither can express it: the cost expression is built once from the
+        untiled graph over splits and residency, with no symbol for a tiling, and
+        the fallback's spill costs are loop-invariant by construction. It is zero
+        unless a buffer is tiled, so a run that chooses no tiling scores exactly
+        as it did before this term existed.
         """
         addresses = self.packer.addresses
+        companions = utils.to_fixed_us(
+            self._companion_bytes(addresses) / self._hbm_bytes_per_us
+        )
         if self._score_fn is not None:
             resident = frozenset(
                 b.name
                 for b, address in zip(self._bufs, addresses)
                 if address is not None
             )
-            return self._score_fn(self.chosen, resident)
+            return self._score_fn(self.chosen, resident) + companions
 
         traffic = sum(
             cost
             for cost, address in zip(self._spill_costs, addresses)
             if address is None
         )
-        return utils.to_fixed_us(traffic / self._hbm_bytes_per_us)
+        return utils.to_fixed_us(traffic / self._hbm_bytes_per_us) + companions
 
     # -- moves ---------------------------------------------------------------
 

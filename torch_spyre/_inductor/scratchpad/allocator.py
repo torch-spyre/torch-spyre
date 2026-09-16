@@ -2469,7 +2469,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         this allocator exists for. The companion buffers the apply mints (a
         full-extent ``full_buf`` per op whose output escapes its tiling group)
         were not in the joint state, so they get no LX address and stay in HBM
-        until something prices them.
+        -- which is what the solver's ``_companion_bytes`` prices them as.
 
         **A refusal raises**, after a zero-mutation dry run so it raises on an
         untouched graph. The search is supposed to propose only tilings

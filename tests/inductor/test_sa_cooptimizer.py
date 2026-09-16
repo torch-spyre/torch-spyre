@@ -2138,3 +2138,122 @@ class ContiguousTilingRunTest(TestCase):
             for _ in range(200):
                 solver._execute_move("flip")
         boundary.assert_not_called()
+
+
+class CompanionBufferPricingTest(TestCase):
+    """A tiling shrinks what a buffer holds, not what it moves. For an op whose
+    output leaves its tiling group the apply allocates a full-extent companion,
+    drains one tile into it per iteration and repoints the outside consumers at
+    it -- none of which is in features extracted from the untiled graph. Priced
+    honestly, tiling pays for an op whose consumers stay inside its own run and
+    costs a full HBM round trip for one that is not resident."""
+
+    SIZE = 1024  # ``_two_axis_buffer``'s
+
+    def _tiled(self, solver, idx, tiling=None):
+        source = solver._sources[idx]
+        return source.retiled(solver.chosen[idx], tiling or _TILE_4)
+
+    def _solver(self, names="AB", consumers=None, tiling_space=True):
+        """Buffers at consecutive operation positions; ``consumers`` maps a
+        buffer name to the producers it reads."""
+        bufs = [_run_buffer(n, p) for p, n in enumerate(names)]
+        for buf in bufs:
+            buf.division_space = _two_axis_space(
+                tiling=_tiling_space() if tiling_space else None
+            )
+            buf.parents = list((consumers or {}).get(buf.name, []))
+        return _primed_topology(bufs)
+
+    @staticmethod
+    def _addresses(solver, resident):
+        return [0 if i in resident else None for i in range(len(solver._bufs))]
+
+    def test_an_untiled_state_prices_no_companions(self):
+        solver = self._solver(consumers={"B": ["A"]})
+        self.assertEqual(solver._companion_bytes(self._addresses(solver, {0, 1})), 0)
+
+    def test_a_search_with_no_tiling_space_prices_no_companions(self):
+        # The flag-off path: nothing can carry a tiling, so the term costs one
+        # bool per score and the objective is what it was before it existed.
+        solver = self._solver(consumers={"B": ["A"]}, tiling_space=False)
+        self.assertFalse(solver._tilings_are_possible)
+        self.assertEqual(solver._companion_bytes(self._addresses(solver, {0, 1})), 0)
+
+    def test_a_consumer_inside_the_run_costs_nothing(self):
+        # Nothing escapes, so the apply keeps the buffer as loop-internal
+        # scratch and allocates no companion -- the shape the recolor flood
+        # exists to build, and the only one where tiling is free.
+        solver = self._solver(consumers={"B": ["A"]})
+        for idx in (0, 1):
+            solver.chosen[idx] = self._tiled(solver, idx)
+        self.assertEqual(solver._run_bounds(0), (0, 1))
+        self.assertEqual(solver._companion_bytes(self._addresses(solver, {0, 1})), 0)
+
+    def test_a_resident_buffer_pays_the_copy_out_and_its_outside_readers(self):
+        # A tiled, B and C untiled and reading it: A's run is itself alone, so
+        # both readers take the full buffer from HBM, and residency of the
+        # per-tile scratch no longer serves them.
+        solver = self._solver("ABC", consumers={"B": ["A"], "C": ["A"]})
+        solver.chosen[0] = self._tiled(solver, 0)
+        self.assertEqual(solver._run_bounds(0), (0, 0))
+        self.assertEqual(
+            solver._companion_bytes(self._addresses(solver, {0})),
+            3 * self.SIZE,  # the copy's write + two full-extent reads
+        )
+
+    def test_a_spilled_buffer_pays_the_scratch_round_trip_instead(self):
+        # Not resident, the per-tile scratch is itself in HBM: the copy reads it
+        # back and writes the full buffer, and the readers were already charged.
+        # Independent of how many readers there are.
+        solver = self._solver("ABC", consumers={"B": ["A"], "C": ["A"]})
+        solver.chosen[0] = self._tiled(solver, 0)
+        self.assertEqual(
+            solver._companion_bytes(self._addresses(solver, set())), 2 * self.SIZE
+        )
+
+    def test_a_resident_tiled_graph_output_pays_nothing(self):
+        # The copy's write IS the externally visible write, which the model
+        # charges whether or not the buffer is resident (#4271), so it replaces
+        # a write already counted rather than adding one.
+        solver = self._solver("A")
+        solver._bufs[0].boundary = BufferType.Output
+        solver.chosen[0] = self._tiled(solver, 0)
+        self.assertEqual(solver._companion_bytes(self._addresses(solver, {0})), 0)
+        self.assertEqual(
+            solver._companion_bytes(self._addresses(solver, set())), 2 * self.SIZE
+        )
+
+    def test_a_consumer_with_no_operation_position_counts_as_outside(self):
+        # Nothing can carry a tiling to a buffer in no run, so a group
+        # containing it is not known to be contiguous; charging is the safe
+        # direction, matching what ``_trim_tilings_to_anchor_run`` refuses.
+        solver = self._solver("AB", consumers={"B": ["A"]})
+        solver._bufs[1].op_position = None
+        solver._precompute_topology()
+        solver.chosen = solver._seed_configs()
+        solver.chosen[0] = self._tiled(solver, 0)
+        self.assertEqual(
+            solver._companion_bytes(self._addresses(solver, {0})), 2 * self.SIZE
+        )
+
+    def test_the_run_pass_agrees_with_walking_each_position(self):
+        # ``_tiled_runs`` is the linear-time form of ``_run_bounds`` per buffer,
+        # which this pins rather than trusting.
+        solver = self._solver("ABCD")
+        for idx in (1, 2):
+            solver.chosen[idx] = self._tiled(solver, idx)
+        runs = solver._tiled_runs()
+        self.assertEqual(runs, {1: (1, 2), 2: (1, 2)})
+        for position in range(4):
+            if position in runs:
+                self.assertEqual(runs[position], solver._run_bounds(position))
+
+    def test_the_score_carries_the_companion_traffic(self):
+        solver = self._solver(consumers={"B": ["A"]})
+        before = solver._score()
+        with mock.patch.object(solver, "_companion_bytes", return_value=4096):
+            after = solver._score()
+        self.assertEqual(
+            after - before, utils.to_fixed_us(4096 / solver._hbm_bytes_per_us)
+        )
