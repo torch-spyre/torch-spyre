@@ -392,6 +392,7 @@ jobs:
                 mode: 'validate',
                 correlation_id: correlationId,
                 source_run_id: `${context.runId}`,
+                image_label: 'image_spyre_backend_release',
               },
             });
 
