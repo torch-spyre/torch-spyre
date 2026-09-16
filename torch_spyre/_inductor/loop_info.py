@@ -51,6 +51,20 @@ class CarriedReductionRecord:
 
 
 @dataclass(frozen=True)
+class LoopCarryRecord:
+    """Identity contract for one accumulator carried through a counted loop.
+
+    ``for_each_tile`` lowering rewrites the carry update as an in-place write
+    into the carry's initial storage.  Recording both ends lets scratchpad
+    planning distinguish that closed, compiler-created mutation from an
+    arbitrary user mutation, which must remain in HBM.
+    """
+
+    storage_name: str
+    update_name: str
+
+
+@dataclass(frozen=True)
 class ReductionPlan:
     """Planned shape/identity/nesting data for a tiled-reduction op.
 
@@ -261,6 +275,12 @@ class ReadCopyElisionRecord:
     copy_name: str
     source_name: str
     direct_inner_fn: object
+    direct_tiled_dims_per_level: (
+        tuple[tuple[tuple[int, sympy.Expr], ...], ...] | None
+    ) = None
+    direct_squeezed_advance_per_level: (
+        tuple[tuple[tuple[sympy.Expr, sympy.Expr], ...], ...] | None
+    ) = None
 
 
 @dataclass
@@ -388,6 +408,9 @@ _SPYRE_METADATA_ATTRS = (
     # One immutable record shared by the fill, loop combine, and final drain
     # of a loop-carried reduction.  Post-fusion verification consumes it.
     "_carried_reduction_record",
+    # One immutable record shared by a for_each_tile carry's persistent
+    # storage and its in-loop update operation.
+    "_loop_carry_record",
 )
 
 

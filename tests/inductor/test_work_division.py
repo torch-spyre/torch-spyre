@@ -34,6 +34,7 @@ from torch._inductor.ir import (
 from torch_spyre._C import DataFormats, ElementArrangement, SpyreTensorLayout
 from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.ir import FixedTiledLayout
+from torch_spyre._inductor.loop_info import CoarseTileInfo, LoopCarryRecord
 from torch_spyre._inductor.constants import (
     AVGPOOL2D_OP,
     CONV2D_FWD_OP,
@@ -69,6 +70,7 @@ from torch_spyre._inductor.work_division_constraints import (
     collect_work_division_constraints,
     conv_spatial_blocked_vars,
     coordinate_mask_blocked_vars,
+    direct_read_source_stick_split_domains,
     indirect_access_split_domains,
     keep_by_index_k_split_constraint,
     keep_by_index_pinned_search_space_vars,
@@ -122,6 +124,82 @@ def _computed_buffer(shape, name="buf0", reduction_type=None, reduction_ranges=(
     op = ComputedBuffer(name=name, layout=layout, data=data)
     op.operation_name = name
     return op
+
+
+class TestLoopCarryLxEligibility(unittest.TestCase):
+    def setUp(self):
+        self.allocator = ScratchpadAllocator(GreedyLayoutSolver, 2**20)
+
+    @staticmethod
+    def _tagged_carry(name="carry"):
+        op = _computed_buffer((64, 64), name=name)
+        op._loop_carry_record = LoopCarryRecord(
+            storage_name=name,
+            update_name="carry_update",
+        )
+        return op
+
+    def test_loop_carry_bypasses_output_profitability_denylist(self):
+        op = self._tagged_carry()
+        with patch.object(self.allocator, "_get_op_name", return_value="convolution"):
+            self.assertTrue(self.allocator._op_output_good_for_lx_reuse(op))
+
+            op._loop_carry_record = LoopCarryRecord(
+                storage_name="some_other_buffer",
+                update_name="carry_update",
+            )
+            self.assertFalse(self.allocator._op_output_good_for_lx_reuse(op))
+
+    def test_only_joint_solver_accepts_tagged_loop_carry_mutation_target(self):
+        graph = SimpleNamespace(operations=[])
+        common = dict(
+            graph=graph,
+            name="carry",
+            uses=[0, 1],
+            mutated_buffers={"carry"},
+            graph_output_names=set(),
+            reinterpret_output_names=set(),
+            ncores={},
+            ncores_reasons={},
+            division_is_fixed=False,
+            buf_user_deps={},
+        )
+        ordinary = _computed_buffer((64, 64), name="carry")
+        self.assertEqual(
+            self.allocator._buffer_residency_reason(op=ordinary, **common),
+            "mutation target",
+        )
+
+        carry = self._tagged_carry()
+        with (
+            patch.object(allocator_module, "_is_tiled_advancing", return_value=False),
+            patch.object(
+                allocator_module, "_is_read_advancing_anywhere", return_value=False
+            ),
+            patch.object(
+                allocator_module,
+                "_multi_output_extern_kernel_in_live_range",
+                return_value=False,
+            ),
+            patch.object(
+                allocator_module, "buffer_not_read_in_full", return_value=False
+            ),
+            patch.object(
+                allocator_module, "_would_produce_lx_back_gap", return_value=False
+            ),
+            patch.object(self.allocator, "_restickify_barrier", return_value=None),
+            patch.object(
+                self.allocator, "_is_index_or_indirectly_accessed", return_value=False
+            ),
+        ):
+            self.assertIsNone(
+                self.allocator._buffer_residency_reason(op=carry, **common)
+            )
+            common["division_is_fixed"] = True
+            self.assertEqual(
+                self.allocator._buffer_residency_reason(op=carry, **common),
+                "mutation target",
+            )
 
 
 class TestEmptyLxEligibility(unittest.TestCase):
@@ -201,6 +279,74 @@ def _make_context(
         reduction_vars=list(reduction_vars),
         committed_splits=committed_splits or {},
     )
+
+
+class TestDirectReadSourceStickSplitDomains(unittest.TestCase):
+    def test_only_whole_stick_partitions_are_legal(self):
+        head, feature, key = (_isym(name) for name in ("head", "feature", "key"))
+        op = _computed_buffer((2, 128, 64), name="direct_read_candidate")
+        op.loop_info = CoarseTileInfo(
+            loop_group_id=(0,),
+            loop_count=[sympy.Integer(3)],
+            loop_tiled_dims=[[]],
+        )
+        output_td = _tensor_dep("output", (2, 128, 64), (head, feature, key))
+
+        for feature_extent, expected in (
+            (128, frozenset({1, 2})),
+            (192, frozenset({1, 3})),
+            (96, frozenset({1})),
+        ):
+            with self.subTest(feature_extent=feature_extent):
+                source_layout = _fixed_tiled_layout((2, 8192, feature_extent))
+                source_dep = MemoryDep(
+                    "source",
+                    8192 * feature_extent * head + feature + feature_extent * key,
+                    (head, feature, key),
+                    (2, feature_extent, 64),
+                )
+                ctx = _make_context(
+                    op,
+                    output_td,
+                    it_space={head: 2, feature: feature_extent, key: 64},
+                )
+                with patch(
+                    "torch_spyre._inductor.work_division_constraints."
+                    "_direct_read_source_dep",
+                    return_value=(source_dep, source_layout),
+                ):
+                    result = direct_read_source_stick_split_domains(ctx)
+
+                self.assertEqual(result.allowed_splits, {feature: expected})
+
+    def test_short_loop_does_not_force_source_compatible_division(self):
+        head, feature, key = (_isym(name) for name in ("head", "feature", "key"))
+        op = _computed_buffer((2, 128, 64), name="short_direct_read_candidate")
+        op.loop_info = CoarseTileInfo(
+            loop_group_id=(0,),
+            loop_count=[sympy.Integer(2)],
+            loop_tiled_dims=[[]],
+        )
+        output_td = _tensor_dep("output", (2, 128, 64), (head, feature, key))
+        source_layout = _fixed_tiled_layout((2, 128, 128))
+        source_dep = MemoryDep(
+            "source",
+            128 * 128 * head + feature + 128 * key,
+            (head, feature, key),
+            (2, 128, 64),
+        )
+        ctx = _make_context(
+            op,
+            output_td,
+            it_space={head: 2, feature: 128, key: 64},
+        )
+        with patch(
+            "torch_spyre._inductor.work_division_constraints._direct_read_source_dep",
+            return_value=(source_dep, source_layout),
+        ):
+            result = direct_read_source_stick_split_domains(ctx)
+
+        self.assertEqual(result, ConstraintResult())
 
 
 class TestMultiDimIterationSpaceSplit(unittest.TestCase):
@@ -1618,6 +1764,33 @@ class TestResidencyEdgeMatching(unittest.TestCase):
                 "matmul": [(1, 1)],
             },
         )
+
+    def test_loop_carry_update_is_a_storage_ownership_edge(self):
+        allocator = CoOptimizingAllocator(MagicMock(), size=1)
+        storage_op = self.op_by_name["plain"]
+        record = LoopCarryRecord(
+            storage_name=storage_op.get_name(),
+            update_name=self.consumer_op.get_name(),
+        )
+        storage_op._loop_carry_record = record
+        self.consumer_op._loop_carry_record = record
+
+        with self._patches():
+            edge = allocator._loop_carry_update_edge(
+                self.consumer_op,
+                self.op_by_name,
+                {},
+            )
+            self.assertIsNotNone(edge)
+            self.assertEqual(edge.buf_name, storage_op.get_name())
+            self.assertEqual(edge.read_dep.name, storage_op.get_name())
+            self.assertEqual(
+                edge.match_pairs(
+                    [cd.splits for cd in self.parent_divs],
+                    [cd.splits for cd in self.consumer_divs],
+                ),
+                [(0, 0), (1, 1)],
+            )
 
     @staticmethod
     def _compatible(edge, parent_div, consumer_div):

@@ -715,9 +715,7 @@ def _clone_layout(
     data = op.data
 
     assert isinstance(data, Pointwise)
-    origin_node = next(iter(data.origins))
-    aten_op = origin_node.target
-    assert aten_op == aten.clone.default
+    assert any(origin.target == aten.clone.default for origin in data.origins)
 
     in_dep = args[0].dep
     in_stl = next(iter(args[0].layouts))
@@ -1944,7 +1942,7 @@ def compute_layouts(
     if aten_op == spyreop.compact.default:
         return _compact_layout(op, output, output_dep, args)
 
-    if aten_op == aten.clone.default:
+    if any(origin.target == aten.clone.default for origin in data.origins):
         # clone materializes a new buffer in a fixed row-major layout regardless of
         # input stick — equivalent to a restickify. No restickify before it is needed,
         # unless there is an offset in the stick dimension.

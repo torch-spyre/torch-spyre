@@ -29,6 +29,7 @@ import logging
 from typing import TYPE_CHECKING, Any
 
 from ..errors import Unsupported
+from ..loop_info import LoopCarryRecord
 
 if TYPE_CHECKING:
     from torch._inductor import ir
@@ -635,6 +636,14 @@ def _rewire_accumulator_output(
     while isinstance(target, ir.MutableBox):
         target = target.data
     producer.layout = ir.MutationLayoutSHOULDREMOVE(target)
+
+    storage_name = target.get_name()
+    record = LoopCarryRecord(
+        storage_name=storage_name,
+        update_name=producer.get_name(),
+    )
+    target._loop_carry_record = record
+    producer._loop_carry_record = record
 
     if while_out_name is not None:
         _repoint_refs_to_buffer(graph, while_out_name, target)

@@ -105,7 +105,7 @@ from torch_spyre._inductor.ir import FixedTiledLayout, SpyreEmptyFallback
 
 from torch_spyre._inductor import config
 from torch_spyre._inductor.logging_utils import get_inductor_logger
-from torch_spyre._inductor.loop_info import CarriedReductionRecord
+from torch_spyre._inductor.loop_info import CarriedReductionRecord, LoopCarryRecord
 from torch_spyre._inductor.padding import is_restickify_op
 from torch_spyre._inductor.scratchpad.lx_relayout import (
     _unsupported_relayout_transition_reason,
@@ -221,6 +221,19 @@ def _is_carried_reduction_storage(op: Any) -> bool:
         isinstance(record, CarriedReductionRecord)
         and record.accumulator_name == op.get_name()
     )
+
+
+def _is_loop_carry_storage(op: Any) -> bool:
+    """True only for storage explicitly created as a counted-loop carry."""
+
+    record = getattr(op, "_loop_carry_record", None)
+    return isinstance(record, LoopCarryRecord) and record.storage_name == op.get_name()
+
+
+def _is_persistent_accumulator_storage(op: Any) -> bool:
+    """Whether ``op`` has a compiler-proven persistent accumulator contract."""
+
+    return _is_carried_reduction_storage(op) or _is_loop_carry_storage(op)
 
 
 # A ``MemoryPlanSolver`` is single-use (buffers are required at construction),
@@ -465,7 +478,7 @@ class ScratchpadAllocator:
         # A planned source intentionally bypasses the profitability denylist:
         # the relayout planner has already applied its stricter structural gates.
         return (
-            _is_carried_reduction_storage(op)
+            _is_persistent_accumulator_storage(op)
             or config.allow_all_ops_in_lx_planning
             or self._get_op_name(op) not in OP_OUTPUT_NOT_GOOD_FOR_LX_REUSE
             or op.get_name() in planned_lx_buffers
@@ -566,7 +579,14 @@ class ScratchpadAllocator:
             # The joint solver does not consult the fixed-division judge until
             # after placement, so it must share this pre-allocation exclusion.
             return "empty tensor"
-        if name in mutated_buffers and not _is_carried_reduction_storage(op):
+        # A counted-loop carry may stay resident only when the joint solver can
+        # also choose the update's division.  Fixed-division placement cannot
+        # repair a mismatched update and therefore keeps the mutation target in
+        # HBM, like every other mutation.
+        loop_carry_is_safe = not division_is_fixed and _is_loop_carry_storage(op)
+        if name in mutated_buffers and not (
+            _is_carried_reduction_storage(op) or loop_carry_is_safe
+        ):
             return "mutation target"
         # The shared carried-reduction contract names exactly one accumulator
         # with one in-loop mutator and a closed fill -> combine -> drain
@@ -2478,6 +2498,28 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         buffers: list[CoreDivisionBuffer] = []
         residency_by_buf = self._residency_by_buf(graph, mem_usage, lifetimes)
 
+        # Resolve every compiler-tagged carry before constructing any buffer.
+        # If its aliased update cannot be represented as a physical-ownership
+        # edge, fail closed by leaving the storage in HBM.  The storage usually
+        # precedes its update in graph order, so doing this up front avoids
+        # discovering the malformed contract after its solver record is built.
+        carry_update_edges: dict[str, ResidencyEdge] = {}
+        for update_op in graph.operations:
+            record = getattr(update_op, "_loop_carry_record", None)
+            if not isinstance(record, LoopCarryRecord):
+                continue
+            if record.update_name != update_op.get_name():
+                continue
+            edge = self._loop_carry_update_edge(update_op, op_by_name, prep_cache)
+            if edge is None:
+                if residency_by_buf.get(record.storage_name) is None:
+                    residency_by_buf[record.storage_name] = (
+                        "loop carry update ownership unavailable"
+                    )
+                continue
+            if residency_by_buf.get(record.storage_name) is None:
+                carry_update_edges[record.update_name] = edge
+
         input_clone_matches: dict[str, dict[str, list[tuple[int, int]]]] = {}
         # Consumer op name -> input clones for which it is the last reader, and so
         # may reuse the clone's LX slot in place (reverse-parent, #3212). Stays
@@ -2556,6 +2598,34 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                 residency_by_buf,
             )
 
+            # A for_each_tile update writes through a MutationLayout whose
+            # dependency is named after the update op, even though the bytes
+            # belong to the persistent carry storage.  Model that write as a
+            # producer -> consumer edge so a resident carry is legal only when
+            # the solver chooses identical physical ownership for the initial
+            # storage and every update.  A relayout cannot satisfy an in-place
+            # write, so this edge deliberately has match pairs only.
+            carry_edge = carry_update_edges.get(output_name)
+            if carry_edge is not None:
+                storage_name = carry_edge.buf_name
+                update_matches = carry_edge.match_pairs(
+                    [cd.splits for cd in divisions[storage_name]],
+                    [cd.splits for cd in buf_divisions],
+                )
+                if storage_name in parent_proj:
+                    # If the update also reads the carry directly, both that
+                    # read and the aliased write must agree with its storage.
+                    read_matches = cd_parent_matches.get(storage_name)
+                    if read_matches is None:
+                        update_matches = []
+                    else:
+                        update_set = set(update_matches)
+                        update_matches = [p for p in read_matches if p in update_set]
+                else:
+                    parent_proj.append(storage_name)
+                cd_parent_matches[storage_name] = update_matches
+                cd_parent_relayouts.pop(storage_name, None)
+
             for input_name in parent_proj:
                 if input_name in input_clone_matches:
                     cd_parent_matches[input_name] = input_clone_matches[input_name][
@@ -2617,6 +2687,59 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             )
         buffers.extend(self._relayout_copy_buffers(buffers))
         return buffers
+
+    @staticmethod
+    def _loop_carry_update_edge(
+        update_op: Optional[Operation],
+        op_by_name: dict[str, Operation],
+        prep_cache: dict,
+    ) -> Optional[ResidencyEdge]:
+        """Return the physical-ownership edge for an aliased carry update.
+
+        Inductor names the mutation write after ``update_op`` rather than the
+        storage it aliases.  Renaming that dependency lets the ordinary
+        :class:`ResidencyEdge` machinery interpret its index against the carry
+        storage's device layout.
+        """
+        if update_op is None:
+            return None
+        record = getattr(update_op, "_loop_carry_record", None)
+        if not isinstance(record, LoopCarryRecord):
+            return None
+        if record.update_name != update_op.get_name():
+            return None
+        storage_op = op_by_name.get(record.storage_name)
+        if storage_op is None or _is_frame_changing_clone(
+            storage_op, record.storage_name
+        ):
+            return None
+        storage_write = next(
+            (
+                dep
+                for dep in op_read_writes(storage_op).writes
+                if dep.name == record.storage_name and hasattr(dep, "index")
+            ),
+            None,
+        )
+        update_write = next(
+            (
+                dep
+                for dep in op_read_writes(update_op).writes
+                if dep.name == record.update_name and hasattr(dep, "index")
+            ),
+            None,
+        )
+        if storage_write is None or update_write is None:
+            return None
+        return ResidencyEdge(
+            buf_name=record.storage_name,
+            parent_op=storage_op,
+            consumer_op=update_op,
+            write_dep=storage_write,
+            read_dep=update_write.rename({record.update_name: record.storage_name}),
+            parent_is_matmul=_is_matmul_op(storage_op),
+            prep_cache=prep_cache,
+        )
 
     @staticmethod
     def _relayout_copy_buffers(
