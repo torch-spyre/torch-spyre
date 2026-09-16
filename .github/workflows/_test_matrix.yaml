@@ -77,6 +77,15 @@ on:
         required: false
         type: boolean
         default: true
+      enable_tier_delta:
+        description: >
+          Skip configs whose tiers already have results for this commit+arch, so a
+          regression run after an integration run executes only what regression adds.
+          Off by default: a delta must be asked for. Degrades to the full tier on any
+          ClickHouse error, so it can never under-test silently.
+        type: boolean
+        default: false
+        required: false
       test_type:
         description: >-
           Suite subset to run: smoke | unit | integration | regression |
@@ -153,6 +162,10 @@ on:
         required: false
       CLICKHOUSE_DB:
         required: false
+      # The v2 database for the covered-tier lookup. The other four CLICKHOUSE_* secrets
+      # above already serve it -- one instance, one naming scheme.
+      CLICKHOUSE_DB_V2:
+        required: false
 
 defaults:
   run:
@@ -197,6 +210,10 @@ jobs:
     outputs:
       matrix: ${{ steps.filter.outputs.matrix }}
       resolved_test_type: ${{ steps.filter.outputs.resolved_test_type }}
+      # [{tier, covering_run}, ...] for the tiers this run SKIPS. The ingest copies those
+      # runs' case rows in, so a delta run reports its whole tier rather than only the part
+      # it executed. Empty ([] or "") whenever the delta is off or the lookup fails.
+      covered_runs: ${{ steps.filter.outputs.covered_runs }}
     steps:
       # NORMAL: sparse-checkout the configs from github.com at the requested ref.
       - if: ${{ !inputs.prebaked_image }}
@@ -209,6 +226,7 @@ jobs:
           sparse-checkout: |
             ${{ (inputs.test_type || 'regression') == 'trunk' && 'tests/configs' || 'tests/configs/torch_spyre_tests' }}
             tests/oot_framework/utils/filter_configs.py
+            .github/scripts/resolve_covered_tiers.py
             .github/runner_overrides.yaml
           sparse-checkout-cone-mode: false
 
@@ -216,6 +234,18 @@ jobs:
         id: filter
         env:
           RAW_TEST_TYPE: ${{ inputs.test_type || 'regression' }}
+          ENABLE_TIER_DELTA: ${{ inputs.enable_tier_delta }}
+          DELTA_SHA: ${{ inputs.ref || github.event.pull_request.head.sha || github.sha }}
+          DELTA_ARCH: ${{ inputs.runner_label }}
+          # Same secrets the ingest path uses. Previously these read a SPYRE_CH_* set of
+          # vars/secrets that was never configured in any repo or org, so the lookup always
+          # took its unset branch and every run silently ran the FULL tier -- the delta could
+          # not fire at all. Absent secrets still fail open, by design.
+          CLICKHOUSE_HOST: ${{ secrets.CLICKHOUSE_HOST }}
+          CLICKHOUSE_PORT: ${{ secrets.CLICKHOUSE_PORT }}
+          CLICKHOUSE_USER: ${{ secrets.CLICKHOUSE_USER }}
+          CLICKHOUSE_PASS: ${{ secrets.CLICKHOUSE_PASS }}
+          CLICKHOUSE_DB_V2: ${{ secrets.CLICKHOUSE_DB_V2 }}
         run: |
           # Prebaked: read the configs baked in the dev image; else the checkout cwd.
           # cd into the source root so every path below stays repo-relative and
@@ -248,16 +278,49 @@ jobs:
           # tests/scripts/check_test_coverage.sh greps workflow YAMLs for a
           # literal `--config-dir <path>` token to detect dynamic coverage,
           # and can't resolve a variable.
+          # Tiers already covered for this commit+arch. Empty unless the delta is
+          # enabled AND the lookup succeeds -- the script prints nothing and exits 0
+          # on any failure, so an unreachable ClickHouse runs the full tier.
+          # ONE lookup for both consumers: --format both prints the bare tier CSV on line 1
+          # (what filter_configs matches) and the json with covering run ids on line 2 (what
+          # the ingest copies from). head/tail rather than a shell json parser -- an embedded
+          # python -c here would need every line indented or its unindented lines terminate
+          # this block scalar and break the workflow.
+          EXCLUDE_TIERS=""
+          COVERED_RUNS="[]"
+          # Guard on the HOST, which is what the resolver needs; SPYRE_CH_URL was never set
+          # by anything, so this condition could never be true and the delta never ran.
+          if [ "${ENABLE_TIER_DELTA}" = "true" ] && [ -n "${CLICKHOUSE_HOST:-}" ]; then
+            _delta_out=$(python3 .github/scripts/resolve_covered_tiers.py \
+              --commit-sha "${DELTA_SHA}" \
+              --arch "${DELTA_ARCH}" \
+              --test-type "${RAW_TEST_TYPE}" \
+              --format both || true)
+            EXCLUDE_TIERS=$(printf '%s\n' "${_delta_out}" | head -1)
+            COVERED_RUNS=$(printf '%s\n' "${_delta_out}" | tail -1)
+            [ -n "${COVERED_RUNS}" ] || COVERED_RUNS="[]"
+          fi
+          echo "covered_runs=${COVERED_RUNS}" >> "$GITHUB_OUTPUT"
+          # Array, not a string: expands to zero words when empty, so no unquoted
+          # word-splitting is needed to pass 0-or-2 args.
+          _delta_args=()
+          if [ -n "${EXCLUDE_TIERS}" ]; then
+            _delta_args=(--exclude-tiers "${EXCLUDE_TIERS}")
+            echo "tier delta: skipping configs already covered by ${EXCLUDE_TIERS}"
+          fi
+
           if [ "${RAW_TEST_TYPE}" = "trunk" ]; then
             matrix=$(python3 tests/oot_framework/utils/filter_configs.py \
               --config-dir tests/configs \
               --test-type "${RAW_TEST_TYPE}" \
+              "${_delta_args[@]}" \
               --runner-map .github/runner_overrides.yaml \
               --format matrix-json)
           else
             matrix=$(python3 tests/oot_framework/utils/filter_configs.py \
               --config-dir tests/configs/torch_spyre_tests \
               --test-type "${RAW_TEST_TYPE}" \
+              "${_delta_args[@]}" \
               --runner-map .github/runner_overrides.yaml \
               --format matrix-json)
           fi
@@ -500,6 +563,7 @@ jobs:
             rm -rf /tmp/etc/ibm/spyre/topo.json
             source /etc/profile.d/ibm-aiu-setup.sh || exit 1
 
+      # overwrite: true avoids a silent 409 on re-upload when this leg is manually re-run.
       - name: Upload JUnit XML report
         if: always()
         continue-on-error: true  # transient artifact-service 403s must not fail a job whose tests passed
@@ -509,6 +573,7 @@ jobs:
           path: ${{ env.REPORT_PATH }}
           if-no-files-found: warn
           retention-days: 10
+          overwrite: true
 
       # Records this leg's suite as a uniquely-named artifact so collect_failed_suites can rebuild a retry matrix without needing this job's own (continue-on-error-muddied) conclusion.
       - name: Save suite descriptor for pod-level retry
@@ -856,6 +921,7 @@ jobs:
             rm -rf /tmp/etc/ibm/spyre/topo.json
             source /etc/profile.d/ibm-aiu-setup.sh || exit 1
 
+      # overwrite: true -- see the identical note on the `test` job's upload step above.
       - name: Upload JUnit XML report
         if: always()
         continue-on-error: true  # transient artifact-service 403s must not fail a job whose tests passed
@@ -865,6 +931,7 @@ jobs:
           path: ${{ env.REPORT_PATH }}
           if-no-files-found: warn
           retention-days: 10
+          overwrite: true
 
       # See the `test` job's identical step: lets collect_failed_suites rebuild a retry matrix without relying on this job's (continue-on-error-muddied) own conclusion.
       - name: Save suite descriptor for pod-level retry
@@ -1244,29 +1311,45 @@ jobs:
           # un-paginated query would miss XML reports past the first page and
           # under-report the empty-suite check. Emit a per-object JSON stream
           # (gh rejects --slurp with --jq) and slurp it into one array.
+          # created_at lets the python step below dedupe re-run duplicates by name, keeping the newest.
           ARTIFACTS=$(gh api --paginate \
             "/repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/artifacts?per_page=100" \
-            --jq '.artifacts[] | select(.name | endswith(".xml")) | {id: .id, name: .name}' \
+            --jq '.artifacts[] | select(.name | endswith(".xml")) | {id: .id, name: .name, created_at: .created_at}' \
             | python3 -c "import json,sys; print(json.dumps([json.loads(l) for l in sys.stdin if l.strip()]))")
 
           ARTIFACTS="$ARTIFACTS" python3 <<'PYEOF'
           import json, os, subprocess
           artifacts = json.loads(os.environ['ARTIFACTS'])
           repo = "${{ github.repository }}"
+
+          # Keep only the newest artifact per name (see the created_at note above).
+          latest = {}
           for a in artifacts:
+              existing = latest.get(a["name"])
+              if existing is None or a["created_at"] > existing["created_at"]:
+                  latest[a["name"]] = a
+
+          downloaded = 0
+          for a in latest.values():
               zip_path = f"xml_artifacts/{a['name']}.zip"
-              result = subprocess.run(
-                  ["gh", "api", f"/repos/{repo}/actions/artifacts/{a['id']}/zip"],
-                  capture_output=True, check=True,
-                  env={**os.environ},
-              )
-              with open(zip_path, "wb") as f:
-                  f.write(result.stdout)
-              subprocess.run(
-                  ["unzip", "-q", "-o", zip_path, "-d", "xml_artifacts/"],
-                  check=True,
-              )
-          print(f"Downloaded {len(artifacts)} artifact(s).")
+              try:
+                  result = subprocess.run(
+                      ["gh", "api", f"/repos/{repo}/actions/artifacts/{a['id']}/zip"],
+                      capture_output=True, check=True,
+                      env={**os.environ},
+                  )
+                  with open(zip_path, "wb") as f:
+                      f.write(result.stdout)
+                  subprocess.run(
+                      ["unzip", "-q", "-o", zip_path, "-d", "xml_artifacts/"],
+                      check=True,
+                  )
+                  downloaded += 1
+              except subprocess.CalledProcessError as e:
+                  # Skip a single bad artifact instead of aborting the whole job.
+                  stderr = e.stderr.decode(errors="replace") if e.stderr else str(e)
+                  print(f"::warning::Could not download artifact {a['name']} (id {a['id']}): {stderr.strip()}")
+          print(f"Downloaded {downloaded} of {len(latest)} artifact(s).")
           PYEOF
 
       - name: Check for empty suites

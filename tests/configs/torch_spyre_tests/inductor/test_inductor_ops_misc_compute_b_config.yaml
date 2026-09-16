@@ -10,7 +10,7 @@
 # compute group, assign it to whichever shard keeps the two jobs balanced.
 
 test_suite_config:
-  labels: [unit, regression, trunk]
+  labels: [unit, regression, integration, trunk]
   files:
     - path: ${TORCH_DEVICE_ROOT}/tests/inductor/test_inductor_ops.py
       unlisted_test_mode: skip
@@ -52,6 +52,7 @@ test_suite_config:
             - TestOps::test_mean_3d_dim1
             - TestOps::test_mean_default.*
             - TestOps::test_normal_randn_cpu.*
+            - TestOps::test_compiled_randn_fallback_cpu
             - TestOps::test_overwrite.*
             - TestOps::test_tril.*
             - TestOps::test_triu.*

@@ -15,6 +15,7 @@
 import math
 import unittest
 from contextlib import ExitStack
+from types import SimpleNamespace
 from typing import NamedTuple
 from unittest.mock import MagicMock, patch
 
@@ -30,9 +31,10 @@ from torch._inductor.ir import (
     Reduction,
 )
 
-from torch_spyre._C import ElementArrangement, SpyreTensorLayout
+from torch_spyre._C import DataFormats, ElementArrangement, SpyreTensorLayout
 from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.ir import FixedTiledLayout
+from torch_spyre._inductor.loop_info import LoopCarryRecord
 from torch_spyre._inductor.constants import (
     AVGPOOL2D_OP,
     CONV2D_FWD_OP,
@@ -43,9 +45,14 @@ from torch_spyre._inductor.scratchpad import allocator as allocator_module
 from torch_spyre._inductor.scratchpad.allocator import (
     CoOptimizingAllocator,
     CoreDivision,
+    ScratchpadAllocator,
 )
+from torch_spyre._inductor.scratchpad.greedy_solver import GreedyLayoutSolver
 from torch_spyre._inductor.scratchpad.plan_solver import (
     CoreDivisionBuffer,
+)
+from torch_spyre._inductor.scratchpad.utils import (
+    is_empty_tiled_layout,
 )
 from torch_spyre._inductor.work_division import (
     TensorDep,
@@ -116,6 +123,136 @@ def _computed_buffer(shape, name="buf0", reduction_type=None, reduction_ranges=(
     op = ComputedBuffer(name=name, layout=layout, data=data)
     op.operation_name = name
     return op
+
+
+class TestLoopCarryLxEligibility(unittest.TestCase):
+    def setUp(self):
+        self.allocator = ScratchpadAllocator(GreedyLayoutSolver, 2**20)
+
+    @staticmethod
+    def _tagged_carry(name="carry"):
+        op = _computed_buffer((64, 64), name=name)
+        op._loop_carry_record = LoopCarryRecord(
+            storage_name=name,
+            update_name="carry_update",
+        )
+        return op
+
+    def test_loop_carry_bypasses_output_profitability_denylist(self):
+        op = self._tagged_carry()
+        with patch.object(self.allocator, "_get_op_name", return_value="convolution"):
+            self.assertTrue(self.allocator._op_output_good_for_lx_reuse(op))
+
+            op._loop_carry_record = LoopCarryRecord(
+                storage_name="some_other_buffer",
+                update_name="carry_update",
+            )
+            self.assertFalse(self.allocator._op_output_good_for_lx_reuse(op))
+
+    def test_only_joint_solver_accepts_tagged_loop_carry_mutation_target(self):
+        graph = SimpleNamespace(operations=[])
+        common = dict(
+            graph=graph,
+            name="carry",
+            uses=[0, 1],
+            mutated_buffers={"carry"},
+            graph_output_names=set(),
+            reinterpret_output_names=set(),
+            ncores={},
+            ncores_reasons={},
+            division_is_fixed=False,
+            buf_user_deps={},
+        )
+        ordinary = _computed_buffer((64, 64), name="carry")
+        self.assertEqual(
+            self.allocator._buffer_residency_reason(op=ordinary, **common),
+            "mutation target",
+        )
+
+        carry = self._tagged_carry()
+        with (
+            patch.object(allocator_module, "_is_tiled_advancing", return_value=False),
+            patch.object(
+                allocator_module, "_is_read_advancing_anywhere", return_value=False
+            ),
+            patch.object(
+                allocator_module,
+                "_multi_output_extern_kernel_in_live_range",
+                return_value=False,
+            ),
+            patch.object(
+                allocator_module, "buffer_not_read_in_full", return_value=False
+            ),
+            patch.object(
+                allocator_module, "_would_produce_lx_back_gap", return_value=False
+            ),
+            patch.object(self.allocator, "_restickify_barrier", return_value=None),
+            patch.object(
+                self.allocator, "_is_index_or_indirectly_accessed", return_value=False
+            ),
+        ):
+            self.assertIsNone(
+                self.allocator._buffer_residency_reason(op=carry, **common)
+            )
+            common["division_is_fixed"] = True
+            self.assertEqual(
+                self.allocator._buffer_residency_reason(op=carry, **common),
+                "mutation target",
+            )
+
+
+class TestEmptyLxEligibility(unittest.TestCase):
+    def test_empty_tensors_are_rejected_before_lx_sizing(self):
+        """A valid empty tensor clears no eligibility path.
+
+        Native stickification preserves zero outer extents. A zero physical
+        extent on a logically nonempty tensor (a one-stick FP16 tensor
+        quantized to FP8 rescales to zero FP8 sticks) is not an empty tensor.
+        """
+
+        empty = _fixed_tiled_layout((0, 64))
+        nonempty = _fixed_tiled_layout((64, 64))
+        zero_extent = _fixed_tiled_layout((64, 64))
+        zero_extent.device_layout = SpyreTensorLayout(
+            [1, 0, 64],
+            [64, 64, 1],
+            DataFormats.SEN169_FP16,
+            ElementArrangement.STANDARD,
+        )
+        self.assertEqual(
+            [
+                is_empty_tiled_layout(layout)
+                for layout in (empty, nonempty, zero_extent)
+            ],
+            [True, False, False],
+        )
+
+        graph = SimpleNamespace(
+            try_get_buffer=lambda _name: SimpleNamespace(layout=empty)
+        )
+        allocator = ScratchpadAllocator(GreedyLayoutSolver, 2**20)
+        with patch.object(
+            allocator_module, "clone_at_graph_boundaries", return_value=True
+        ):
+            reason = allocator._input_residency_reason(
+                graph, "value", [0, 1], division_is_fixed=False
+            )
+        self.assertEqual(reason, "empty tensor")
+        with patch.object(allocator, "_op_output_good_for_lx_reuse", return_value=True):
+            reason = allocator._buffer_residency_reason(
+                graph,
+                "value",
+                [0, 1],
+                SimpleNamespace(layout=empty),
+                mutated_buffers=set(),
+                graph_output_names=set(),
+                reinterpret_output_names=set(),
+                ncores={},
+                ncores_reasons={},
+                division_is_fixed=False,
+                buf_user_deps={},
+            )
+        self.assertEqual(reason, "empty tensor")
 
 
 def _make_context(
@@ -1406,8 +1543,10 @@ class TestResidencyEdgeMatching(unittest.TestCase):
         self.view_wide = _physical_view((0, 2), (1, 2))
 
         def _div(splits, reduction=None):
+            output = dict(splits)
+            reduction = dict(reduction or {})
             return CoreDivision(
-                output_splits=dict(splits), reduction_splits=dict(reduction or {})
+                splits={**output, **reduction}, reduction_syms=frozenset(reduction)
             )
 
         # Consumer: a 4-core slicing, a 2-core one, an 8-core one that slices
@@ -1491,15 +1630,15 @@ class TestResidencyEdgeMatching(unittest.TestCase):
         op.get_name.return_value = name
         return op
 
-    def _view_for_div(self, op, dep, buf_name, division, prep_cache):
+    def _view_for_div(self, op, dep, buf_name, splits, prep_cache):
         name = op.get_name()
         if name == "consumer":
-            index = self.consumer_divs.index(division)
+            index = [cd.splits for cd in self.consumer_divs].index(splits)
             return (self.consumer_views[index], False, True)
         views, partial, repr_ok, _matmul = self.parents.get(
             name, ([self.view_a, self.view_b], [False, False], [True, True], False)
         )
-        index = self.parent_divs.index(division)
+        index = [cd.splits for cd in self.parent_divs].index(splits)
         return (views[index], partial[index], repr_ok[index])
 
     def _patches(self):
@@ -1557,6 +1696,45 @@ class TestResidencyEdgeMatching(unittest.TestCase):
             },
         )
 
+    def test_loop_carry_update_is_a_storage_ownership_edge(self):
+        allocator = CoOptimizingAllocator(MagicMock(), size=1)
+        storage_op = self.op_by_name["plain"]
+        record = LoopCarryRecord(
+            storage_name=storage_op.get_name(),
+            update_name=self.consumer_op.get_name(),
+        )
+        storage_op._loop_carry_record = record
+        self.consumer_op._loop_carry_record = record
+
+        with self._patches():
+            edge = allocator._loop_carry_update_edge(
+                self.consumer_op,
+                self.op_by_name,
+                {},
+            )
+            self.assertIsNotNone(edge)
+            self.assertEqual(edge.buf_name, storage_op.get_name())
+            self.assertEqual(edge.read_dep.name, storage_op.get_name())
+            self.assertEqual(
+                edge.match_pairs(
+                    [cd.splits for cd in self.parent_divs],
+                    [cd.splits for cd in self.consumer_divs],
+                ),
+                [(0, 0), (1, 1)],
+            )
+
+    @staticmethod
+    def _compatible(edge, parent_div, consumer_div):
+        """Per-pair reimplementation of what ``match_pairs`` computes in
+        batch, exercised against the same splits-dict API."""
+        if edge._cores_used(parent_div.splits) != edge._cores_used(consumer_div.splits):
+            return False
+        parent_view = edge.parent_view(parent_div.splits)
+        if parent_view is None:
+            return False
+        consumer_view = edge.consumer_view(consumer_div.splits)
+        return consumer_view is not None and parent_view.same_partition(consumer_view)
+
     def test_compatible_agrees_with_the_table(self):
         allocator = CoOptimizingAllocator(MagicMock(), size=1)
         with self._patches():
@@ -1573,7 +1751,7 @@ class TestResidencyEdgeMatching(unittest.TestCase):
                 for i, parent_div in enumerate(self.parent_divs):
                     for j, consumer_div in enumerate(self.consumer_divs):
                         self.assertEqual(
-                            edge.compatible(parent_div, consumer_div),
+                            self._compatible(edge, parent_div, consumer_div),
                             (i, j) in pairs,
                             f"{parent} ({i}, {j})",
                         )
@@ -1630,10 +1808,6 @@ class TestCoOptimizingAllocator(unittest.TestCase):
                 return_value=fixed,
             ),
             patch(
-                "torch_spyre._inductor.scratchpad.allocator._division_splits",
-                return_value={},
-            ),
-            patch(
                 "torch_spyre._inductor.scratchpad.allocator._split_option_is_legal",
                 return_value=False,
             ),
@@ -1685,9 +1859,7 @@ class TestCoOptimizingAllocator(unittest.TestCase):
         ):
             divisions = allocator._division_map(graph)[op.name]
 
-        self.assertEqual(
-            divisions, [CoreDivision(output_splits={m: 8}, reduction_splits={})]
-        )
+        self.assertEqual(divisions, [CoreDivision(splits={m: 8})])
         self.assertEqual(is_legal.call_args_list[0].args[1], safe)
         self.assertEqual(is_legal.call_args_list[1].args[1], unsafe)
 
@@ -1697,17 +1869,11 @@ class TestCoOptimizingAllocator(unittest.TestCase):
                 name=op.name,
                 size=128,
                 uses=[0],
-                core_divisions=[
-                    CoreDivision(output_splits={batch: 4}, reduction_splits={})
-                ],
+                core_divisions=[CoreDivision(splits={batch: 4})],
                 chosen_division=0,
             )
         ]
         with (
-            patch(
-                "torch_spyre._inductor.scratchpad.allocator._division_splits",
-                return_value={batch: 4},
-            ),
             patch(
                 "torch_spyre._inductor.scratchpad.allocator._split_option_is_legal",
                 return_value=False,
@@ -1725,7 +1891,7 @@ class TestCoOptimizingAllocator(unittest.TestCase):
         rw.reads = []
         allocator = CoOptimizingAllocator(MagicMock(), size=1)
 
-        fixed = CoreDivision(output_splits={1: 2}, reduction_splits={})
+        fixed = CoreDivision(splits={1: 2})
         with (
             patch(
                 "torch_spyre._inductor.scratchpad.allocator.op_read_writes",
@@ -1734,10 +1900,6 @@ class TestCoOptimizingAllocator(unittest.TestCase):
             patch(
                 "torch_spyre._inductor.scratchpad.allocator._fixed_core_division",
                 return_value=fixed,
-            ),
-            patch(
-                "torch_spyre._inductor.scratchpad.allocator._division_splits",
-                return_value={},
             ),
             patch(
                 "torch_spyre._inductor.scratchpad.allocator."
@@ -1752,6 +1914,59 @@ class TestCoOptimizingAllocator(unittest.TestCase):
             self.assertEqual(
                 allocator._enumerate_core_divisions(op, max_cores=32), [fixed]
             )
+
+    def test_over_budget_candidate_menu_is_rejected(self):
+        """An over-budget division must not reach the menu. Nothing downstream
+        catches one: both engines pin an op's split symbols to a single enumerated
+        candidate, and ``_matmul_split_cost``'s budget guard no-ops on symbolic
+        splits, so an over-budget candidate is scored NEGATIVE and a minimizing
+        solve prefers it (issue #4387). The prune path is the one that could admit
+        one -- ``_legal_split_options`` tests stick validity and hard domains, never
+        a core budget -- so it is the one exercised here.
+        """
+        batch, m = _isym("batch"), _isym("m")
+        op = _computed_buffer((4, 64), name="over_budget_out")
+        graph = MagicMock(operations=[op])
+        allocator = CoOptimizingAllocator(MagicMock(), size=1, prune=True)
+        over_budget = {batch: 4, m: 16}  # 64 cores against a 32-core budget
+        rw = MagicMock(
+            writes=[MemoryDep(op.name, 64 * batch + m, (batch, m), (4, 64))],
+            reads=[],
+        )
+
+        with (
+            patch.object(allocator_module.config, "sencores", 32),
+            patch(
+                "torch_spyre._inductor.scratchpad.allocator."
+                "ops_in_offset_mutation_component",
+                return_value=set(),
+            ),
+            patch(
+                "torch_spyre._inductor.scratchpad.allocator."
+                "_find_distinct_matmul_splits",
+                return_value=((), ()),
+            ),
+            patch(
+                "torch_spyre._inductor.scratchpad.allocator._enum_split_options",
+                return_value=[over_budget],
+            ),
+            patch(
+                "torch_spyre._inductor.scratchpad.allocator.op_read_writes",
+                return_value=rw,
+            ),
+            patch(
+                "torch_spyre._inductor.scratchpad.allocator._split_fits_sticks",
+                return_value=True,
+            ),
+            patch(
+                "torch_spyre._inductor.scratchpad.allocator._split_option_is_legal",
+                return_value=True,
+            ),
+            self.assertRaisesRegex(
+                AssertionError, r"over_budget_out: .*over the 32-core budget"
+            ),
+        ):
+            allocator._division_map(graph)
 
 
 class TestTopKConstraints(unittest.TestCase):

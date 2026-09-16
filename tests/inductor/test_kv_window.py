@@ -45,9 +45,6 @@ import torch
 from torch_spyre._inductor.sliding_window_plan import (
     STICK,
     SlidingWindowPlan,
-    band_batch,
-    band_valid_start,
-    check_valid_start,
     check_window_read,
     default_buffer_origin,
     plan_sliding_window,
@@ -792,29 +789,14 @@ def _device_cache(differentiation, seqlen_kv=256, kvheads=HEADS):
 
 
 def _call_op(cache, plan, block_index, which, value_cache=None):
-    """which: 0 -> k_win, 1 -> v_win, 2 -> band.
+    """which: 0 -> k_win, 1 -> v_win.
 
     value_cache defaults to cache: most callers only inspect k_win or the
-    band, where key and value being the same tensor is harmless. A test that
-    inspects v_win must pass a value_cache that actually differs from cache,
-    or a v_win sourced from the wrong tensor would pass unnoticed.
-
-    The window and the band are separate ops -- they share no arguments -- so
-    2 dispatches to the mask rather than indexing a third return value.
+    key window, where key and value being the same tensor is harmless. A test
+    that inspects v_win must pass a value_cache that actually differs from
+    cache, or a v_win sourced from the wrong tensor would pass unnoticed.
     """
     value_cache = cache if value_cache is None else value_cache
-    q_start, _ = plan.block_q_range(block_index)
-    if which == 2:
-        return torch.ops.spyre.window_band_mask(
-            plan.read_start(block_index),
-            plan.q_block,
-            plan.buffer_width,
-            plan.q_kv_offset + q_start,
-            plan.window_size,
-            plan.is_causal,
-            cache.dtype,
-            cache.device,
-        )
     return torch.ops.spyre.kv_window(
         cache,
         value_cache,
@@ -829,7 +811,7 @@ def _reference_window(cache, plan, block_index, transpose=False):
     window = cache[:, :, start : start + plan.buffer_width, :]
     if transpose:
         window = window.transpose(-1, -2)
-    return _expand_kv(window, HEADS // cache.size(1))
+    return window
 
 
 def _reference_band(plan, block_index):
@@ -840,16 +822,24 @@ def _reference_band(plan, block_index):
 class TestKVWindowOp:
     """The op on device, against slices built here.
 
-    GQA is checked one block at a time, which is what the body consumes.
-    Cat-ing several expanded windows together zeroes the leading slots on
-    device -- a backend defect unrelated to this op, and nothing on this path
-    does it.
+    GQA is checked one block at a time, which is what the body consumes. The
+    GQA case deliberately compares against an Hkv-sized reference: matching
+    its shape proves the op did not materialize an Hq-sized expanded window.
     """
 
-    def test_window_and_band(self):
-        # All three outputs of one call, per block, so a failure names both which
-        # output was wrong and which block. Not cat-ed across blocks: that is the
-        # defect the class docstring describes, and nothing on this path does it.
+    def test_gqa_fake_preserves_native_kv_heads(self):
+        key = torch.empty((2, 2, 256, HEAD_DIM), device="meta")
+        value = torch.empty_like(key)
+
+        k_win, v_win = torch.ops.spyre.kv_window(key, value, 64, 128, HEADS)
+
+        assert k_win.shape == (2, 2, HEAD_DIM, 128)
+        assert v_win.shape == (2, 2, 128, HEAD_DIM)
+
+    def test_key_and_value_windows(self):
+        # Both outputs of one call, per block, so a failure names both which output
+        # was wrong and which block. Not cat-ed across blocks: that is the defect
+        # the class docstring describes, and nothing on this path does it.
         plan = _plan(256, 256, 64)
 
         def fn(k, v):
@@ -857,20 +847,20 @@ class TestKVWindowOp:
             if k.device.type == "spyre":
                 return tuple(
                     _call_op(k, plan, n, which, value_cache=v)
-                    for which in (0, 1, 2)
+                    for which in (0, 1)
                     for n in blocks
                 )
             return tuple(
                 [_reference_window(k, plan, n, transpose=True) for n in blocks]
                 + [_reference_window(v, plan, n) for n in blocks]
-                + [_reference_band(plan, n) for n in blocks]
             )
 
         compare_with_cpu(fn, _device_cache(1), _device_cache(2), run_eager=False)
 
-    def test_gqa_key_window_for_one_block(self):
+    def test_gqa_key_window_preserves_native_kv_heads(self):
         # Block 2 is the first whose read start is not 0, so a dropped window
-        # shift shows up here rather than passing by accident.
+        # shift shows up here rather than passing by accident. The reference
+        # has two heads, not the eight query heads passed to kv_window.
         plan = _plan(256, 256, 64)
         assert plan.read_start(0) == 0 and plan.read_start(2) > 0
 
@@ -897,53 +887,6 @@ class TestKVWindowOp:
             return _reference_window(k, plan, 0, transpose=True)
 
         compare_with_cpu(fn, cache, cache, run_eager=False)
-
-    def test_decode_band_is_all_zeros(self):
-        # What the body relies on to skip the band add entirely.
-        plan = _plan(1, 4096, 64, q_block=1)
-        cache = _device_cache(3, seqlen_kv=4096)
-        assert torch.equal(
-            _reference_band(plan, 0), torch.zeros((1, 1, 1, 64), dtype=torch.float16)
-        )
-
-        def fn(k, v):
-            if k.device.type == "spyre":
-                return _call_op(k, plan, 0, 2)
-            return _reference_band(plan, 0)
-
-        compare_with_cpu(fn, cache, cache, run_eager=False)
-
-
-class TestValidStart:
-    """The three torch-free helpers behind the valid_start band."""
-
-    def test_none_and_all_zero_mask_nothing(self):
-        # A caller with no padding must not pay for a per-batch band.
-        assert band_valid_start(None) is None
-        assert band_valid_start([]) is None
-        assert band_valid_start([0, 0]) is None
-        assert band_batch([0, 0]) == 1
-
-    def test_uniform_nonzero_stays_broadcast(self):
-        # Same threshold for every sequence: one row of band, broadcast over batch.
-        assert band_valid_start([40, 40]) == [40, 40]
-        assert band_batch([40, 40]) == 1
-
-    def test_ragged_widens_to_batch(self):
-        assert band_batch([0, 40]) == 2
-        assert band_batch([40, 40, 7]) == 3
-
-    def test_check_rejects_wrong_length(self):
-        assert "2 entries" in check_valid_start([0, 40], 3, 1088)
-
-    def test_check_rejects_out_of_range(self):
-        assert "outside" in check_valid_start([-1], 1, 1088)
-        assert "outside" in check_valid_start([1089], 1, 1088)
-
-    def test_check_accepts_valid(self):
-        assert check_valid_start(None, 4, 1088) is None
-        assert check_valid_start([0, 40], 2, 1088) is None
-        assert check_valid_start([1088], 1, 1088) is None
 
 
 if __name__ == "__main__":

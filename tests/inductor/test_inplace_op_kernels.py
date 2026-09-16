@@ -198,10 +198,10 @@ def test_pow_inplace_is_not_paired_by_name():
     *swapped* operands, so pairing on the name alone would build a kernel that
     computes ``other ** self``. ``_functional_sibling``'s signature check
     rejects it. (Matching ``pow_.Scalar`` to ``pow.Tensor_Scalar`` by signature
-    would be operand-correct, but the device's functional ``pow`` is itself
-    wrong today -- ``torch.pow(2.0, 3.0)`` returns 16.0, and
-    ``pow.Tensor_Tensor`` raises "unimplemented operation pow" -- so the
-    conservative name requirement stays.)
+    would be operand-correct, but the other functional overloads are not usable:
+    ``pow.Scalar`` computes ``other ** self`` (``torch.pow(2.0, 3.0)`` returns
+    16.0) and ``pow.Tensor_Tensor`` raises "unimplemented operation pow" -- so
+    the conservative name requirement stays.)
     """
     from torch_spyre.ops import eager
 
@@ -212,7 +212,10 @@ def test_pow_inplace_is_not_paired_by_name():
         )
         assert not torch._C._dispatch_has_kernel_for_dispatch_key(
             op.name(), "PrivateUse1"
-        ), f"{op.name()} must not get a Spyre kernel while functional pow is wrong"
+        ), (
+            f"{op.name()} must not get a Spyre kernel; its same-named functional "
+            "overload has swapped operands"
+        )
 
 
 def test_relu_inplace_is_not_a_compiled_kernel():

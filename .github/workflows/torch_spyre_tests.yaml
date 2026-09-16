@@ -126,8 +126,9 @@ jobs:
     uses: ./.github/workflows/_test_matrix.yaml
     with:
       runner_label: linux
-      # Per-PR ephemeral image label when provided, else the standing set.
-      image_label: ${{ inputs.runner_label || 'image_spyre_backend' }}
+      # Per-PR ephemeral image label when provided, else the merge-queue or
+      # standing set for this event.
+      image_label: ${{ inputs.runner_label || (github.event_name == 'merge_group' && 'image_spyre_backend_mq') || 'image_spyre_backend' }}
       extra_test_flags: -v -m "not xfail"
       extra_test_flags_multi_spyre: -v
       checkout_pytorch: false
