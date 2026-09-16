@@ -23,3 +23,7 @@ self-hosted-runner:
     - image_spyre_backend_mq
     - image_torch_spyre_mq
     - image_spyre_inference_mq
+    # release-tier runner sets
+    - image_spyre_backend_release
+    - image_torch_spyre_release
+    - image_spyre_inference_release
