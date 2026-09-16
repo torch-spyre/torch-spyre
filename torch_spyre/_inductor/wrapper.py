@@ -65,7 +65,8 @@ class _SpyreWrapperCodegenMixin(PythonWrapperCodegen):
             f"{codegen_shape_tuple}, "
             f"{codegen_stride_tuple}, "
             f"{layout.dtype}, "
-            f"{layout.device_layout!r})"
+            f"{layout.device_layout!r}, "
+            f"device=torch.device('{layout.device}'))"
         )
 
         return out

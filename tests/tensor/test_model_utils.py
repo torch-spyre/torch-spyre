@@ -14,6 +14,8 @@
 
 # Owner(s): ["module: spyre"]
 
+from unittest import mock
+
 import torch
 import torch.nn as nn
 from torch.testing._internal.common_utils import (
@@ -24,6 +26,7 @@ from torch.testing._internal.common_utils import (
 )
 
 from torch_spyre.model_utils import (
+    _dma_to_spyre_default,
     _dma_to_spyre_dim_order_swapped,
     _dma_to_spyre_indirect_access,
     dma_moe_expert_weight_to_spyre,
@@ -63,6 +66,81 @@ class TestLoadModelToSpyre(TestCase):
         """The dim_order helper only accepts 2D weights."""
         with self.assertRaises(AssertionError):
             _dma_to_spyre_dim_order_swapped(torch.randn(4, dtype=torch.float16))
+
+    def test_dma_helpers_accept_an_explicit_device(self):
+        """All DMA helpers target another device and restore current."""
+        from torch_spyre._C import get_spyre_tensor_layout
+
+        if torch.spyre.device_count() < 2:
+            self.skipTest("requires at least two Spyre devices")
+
+        previous = torch.spyre.current_device()
+        device = torch.device("spyre", (previous + 1) % torch.spyre.device_count())
+        # The runtime currently initializes one stream-pool device per process,
+        # so exercise allocation/layout placement without starting a second
+        # device's DMA stream. Existing single-device tests cover the copies.
+        with mock.patch("torch_spyre.model_utils.copy_tensor") as copy_tensor:
+            default = _dma_to_spyre_default(
+                torch.randn(128, 256, dtype=torch.float16), device=device
+            )
+            linear = _dma_to_spyre_dim_order_swapped(
+                torch.randn(128, 256, dtype=torch.float16), device=device
+            )
+            embedding = _dma_to_spyre_indirect_access(
+                torch.randn(1000, 256, dtype=torch.float16), device=device
+            )
+            expert = dma_moe_expert_weight_to_spyre(
+                torch.randn(3, 64, 128, dtype=torch.float16), device=device
+            )
+            scale = dma_moe_per_expert_scale_to_spyre(
+                torch.arange(3, dtype=torch.float16), device=device
+            )
+
+        self.assertEqual(copy_tensor.call_count, 5)
+
+        self.assertEqual(default.device, device)
+        self.assertEqual(linear.device, device)
+        self.assertEqual(
+            list(get_spyre_tensor_layout(linear).device_size), [2, 256, 64]
+        )
+        self.assertEqual(embedding.device, device)
+        self.assertEqual(
+            list(get_spyre_tensor_layout(embedding).device_size), [1000, 4, 64]
+        )
+        self.assertEqual(expert.device, device)
+        self.assertEqual(
+            list(get_spyre_tensor_layout(expert).device_size), [3, 64, 2, 64]
+        )
+        self.assertEqual(scale.device, device)
+        self.assertEqual(list(get_spyre_tensor_layout(scale).device_size), [3, 1, 64])
+        self.assertEqual(torch.spyre.current_device(), previous)
+
+    def test_low_level_layout_allocation_uses_explicit_device(self):
+        """The layout allocator targets its device without changing the caller's."""
+        from torch_spyre._C import SpyreTensorLayout, spyre_empty_with_layout
+
+        if torch.spyre.device_count() < 2:
+            self.skipTest("requires at least two Spyre devices")
+
+        previous = torch.spyre.current_device()
+        device_index = (previous + 1) % torch.spyre.device_count()
+        device = torch.device("spyre", device_index)
+        layout = SpyreTensorLayout([128, 256], torch.float16)
+
+        tensor = spyre_empty_with_layout(
+            (128, 256), (256, 1), torch.float16, layout, device=device
+        )
+
+        self.assertEqual(tensor.device, device)
+        self.assertEqual(torch.spyre.current_device(), previous)
+
+    def test_dma_helpers_accept_an_integer_device(self):
+        """Integer destinations are normalized before entering the C++ binding."""
+        device_index = torch.spyre.current_device()
+        linear = _dma_to_spyre_dim_order_swapped(
+            torch.randn(128, 256, dtype=torch.float16), device=device_index
+        )
+        self.assertEqual(linear.device, torch.device("spyre", device_index))
 
     # ── embedding gather-optimal (indirect-access) layout ──────────
 
