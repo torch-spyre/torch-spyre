@@ -103,6 +103,7 @@ from ..loop_info import (
     CarriedReductionRecord,
     CarriedReductionSpec,
     CoarseTileInfo,
+    LoopCarryRecord,
     PropagationPlan,
     ReadCopyEntry,
     ReadCopyElisionRecord,
@@ -3791,6 +3792,17 @@ def _full_buffer_read_deps(op: ComputedBuffer) -> list[MemoryDep]:
             unwrapped = unwrapped.data
         if isinstance(unwrapped, StorageBox):
             unwrapped = unwrapped.data
+        carry_record = getattr(unwrapped, "_loop_carry_record", None)
+        if (
+            isinstance(carry_record, LoopCarryRecord)
+            and carry_record.storage_name == d.name
+        ):
+            # A non-stacking for_each_tile carry is persistent scratch, not a
+            # full tensor being windowed by this loop.  Its storage has the
+            # same logical extent on every trip, and the joint scratchpad
+            # solver constrains its physical ownership against both readers
+            # and the aliased update.  Let those users read it directly.
+            continue
         if isinstance(unwrapped, (SpyreEmptyFallback, InputBuffer)):
             result.append(d)
         elif isinstance(unwrapped, ComputedBuffer):
@@ -4252,6 +4264,28 @@ class _NameSwapHandler(WrapperHandler):
                 index, full_strides, tile_strides, strip_constant=True
             )
             return super().load(new_name, new_index)
+        return super().load(name, index)
+
+
+class _LoopVarRebaseHandler(WrapperHandler):
+    """Pin one advancing source load to its iteration-zero base address.
+
+    A spliced ``for_each_tile`` body carries its induction variable directly
+    in graph-input load indexes.  A staged read copy removes that term and
+    represents it through ``device_tile_advance_expr`` instead.  A direct
+    read restored after planning must use the same single representation;
+    otherwise the offset is applied twice and the raw unbacked symbol leaks
+    into the OpSpec coordinates.
+    """
+
+    def __init__(self, inner, source_name: str, loop_var_zeros: dict[Expr, Expr]):
+        super().__init__(inner)
+        self._source_name = source_name
+        self._loop_var_zeros = loop_var_zeros
+
+    def load(self, name, index):
+        if name == self._source_name:
+            index = sympy_subs(index, self._loop_var_zeros)
         return super().load(name, index)
 
 
@@ -5383,9 +5417,27 @@ def _patch_consumer_to_read_copy(
         not loop_invariant
         and original_read_advances
         and dep.name in V.graph.graph_input_names
-        and isinstance(consumer.data, Reduction)
-        and consumer.data.reduction_type in MATMUL_REDUCTION_OPS
+        and (
+            isinstance(consumer.data, Pointwise)
+            or (
+                isinstance(consumer.data, Reduction)
+                and consumer.data.reduction_type in MATMUL_REDUCTION_OPS
+            )
+        )
     )
+    if dep.name in V.graph.graph_input_names and isinstance(consumer.data, Pointwise):
+        logger.debug(
+            "direct-read pointwise candidate %s <- %s: dep=%s dep_idx=%s "
+            "tiled=%s squeezed=%s advances=%s selected=%s",
+            consumer.get_name(),
+            dep.name,
+            dep,
+            original_dep_idx,
+            original_loop_info.tiled_dims_per_read,
+            original_loop_info.squeezed_advance_per_read,
+            original_read_advances,
+            direct_read_candidate,
+        )
 
     def new_inner_fn(*args, _map=name_map, _orig_inner=orig_inner):
         with V.set_ops_handler(_NameSwapHandler(V.ops, _map)):
@@ -5415,11 +5467,43 @@ def _patch_consumer_to_read_copy(
             direct_inner_fn=updated_direct_inner,
         )
     if direct_read_candidate:
+        loop_var_zeros = {sym: sympy.Integer(0) for sym in _splice_loop_vars(consumer)}
+
+        def rebased_direct_inner(
+            *args,
+            _orig_inner=orig_inner,
+            _source_name=dep.name,
+            _loop_var_zeros=loop_var_zeros,
+        ):
+            with V.set_ops_handler(
+                _LoopVarRebaseHandler(V.ops, _source_name, _loop_var_zeros)
+            ):
+                return _orig_inner(*args)
+
+        direct_tiled_dims = (
+            original_loop_info.tiled_dims_per_read[original_dep_idx]
+            if original_dep_idx is not None
+            and original_dep_idx < len(original_loop_info.tiled_dims_per_read)
+            else []
+        )
+        direct_squeezed_advance = (
+            original_loop_info.squeezed_advance_per_read[original_dep_idx]
+            if original_dep_idx is not None
+            and original_dep_idx < len(original_loop_info.squeezed_advance_per_read)
+            else []
+        )
         new_op._read_copy_elision_record = ReadCopyElisionRecord(  # type: ignore[attr-defined]
             consumer_name=new_op.get_name(),
             copy_name=copy_name,
             source_name=dep.name,
-            direct_inner_fn=orig_inner,
+            direct_inner_fn=rebased_direct_inner,
+            direct_tiled_dims_per_level=tuple(
+                tuple(tuple(pair) for pair in level) for level in direct_tiled_dims
+            ),
+            direct_squeezed_advance_per_level=tuple(
+                tuple(tuple(pair) for pair in level)
+                for level in direct_squeezed_advance
+            ),
         )
 
     # new_op.loop_info (copied from consumer by copy_op_metadata inside

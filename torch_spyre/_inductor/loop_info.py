@@ -275,6 +275,12 @@ class ReadCopyElisionRecord:
     copy_name: str
     source_name: str
     direct_inner_fn: object
+    direct_tiled_dims_per_level: (
+        tuple[tuple[tuple[int, sympy.Expr], ...], ...] | None
+    ) = None
+    direct_squeezed_advance_per_level: (
+        tuple[tuple[tuple[sympy.Expr, sympy.Expr], ...], ...] | None
+    ) = None
 
 
 @dataclass

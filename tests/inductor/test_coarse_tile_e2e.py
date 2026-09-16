@@ -6257,8 +6257,8 @@ class TestCoarseTileMoEBroadcastMatmulE2E(InductorTestCase):
         src = source_codes[0]
         self.assertIn("coarse_tile_read_copy_0_arg1_1", src)
 
-    def test_unsqueeze_broadcast_matmul_keeps_copy_for_different_core_views(self):
-        """A legal but different source ownership cannot replace the copy."""
+    def test_unsqueeze_broadcast_matmul_allows_physical_view_permutation(self):
+        """Logical ownership can match when staging permutes physical axes."""
         from torch_spyre._inductor import spyre_hint
         from torch_spyre._inductor.pass_utils import PerCoreView
 
@@ -6284,6 +6284,10 @@ class TestCoarseTileMoEBroadcastMatmulE2E(InductorTestCase):
             mock_patch(_PREPARE_KERNEL),
             mock_patch("subprocess.run"),
             mock_patch(
+                "torch_spyre._inductor.read_copy_elision._loop_advance_bound",
+                return_value=(0, 8192),
+            ),
+            mock_patch(
                 "torch_spyre._inductor.read_copy_elision._per_core_view_on_buf",
                 side_effect=[
                     (output_view, None, True),
@@ -6295,7 +6299,7 @@ class TestCoarseTileMoEBroadcastMatmulE2E(InductorTestCase):
         ):
             _, source_codes = run_and_get_code(torch.compile(fn), x, w)
 
-        self.assertIn("coarse_tile_read_copy_0_arg1_1", source_codes[0])
+        self.assertNotIn("coarse_tile_read_copy_0_arg1_1", source_codes[0])
 
     def test_unsqueeze_broadcast_matmul_distinguishes_experts_exactly(self):
         """Each trip reads its own weight slab, not expert zero or stale HBM."""
