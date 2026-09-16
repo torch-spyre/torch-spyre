@@ -77,6 +77,13 @@ _SDPA_QUERY_ROWS_PER_KV_TARGET_MIB = 8
 _SDPA_BASE_BURST_EFFICIENT_KV_BLOCK_SIZE = 512
 _SDPA_MAX_BURST_EFFICIENT_KV_BLOCK_SIZE = 1024
 
+# A counted SWA K/V loop pays its carry handoff and loop-control costs for each
+# query work partition.  Prefill sweeps show that retaining at least four query
+# rows per core amortizes those costs while still exposing enough parallelism.
+# This caps only GQA's query-only work division; MHA retains SDPA's joint
+# head/query search.
+_SWA_MIN_QUERY_ROWS_PER_CORE = 4
+
 # DPO emits about seventeen additional sdsc_execute operations for every
 # unrolled online-softmax block. Four K256 blocks can still win by retaining
 # restickified K in LX, while four K1024 blocks lose badly to one long block.
@@ -723,6 +730,11 @@ def _select_swa_tiling(
     restick_lx_eligible: bool | None = None
     estimated_dsc_executions: int | None = None
     is_decode = q_block == 1
+    work_div_num_cores = num_cores
+    if num_heads != num_kvheads:
+        work_div_num_cores = min(
+            num_cores, max(1, q_block // _SWA_MIN_QUERY_ROWS_PER_CORE)
+        )
     sdpa_work_div = (
         None
         if is_decode
@@ -731,7 +743,7 @@ def _select_swa_tiling(
             num_kvheads,
             q_block,
             buffer_width,
-            num_cores,
+            work_div_num_cores,
         )
     )
 
@@ -829,24 +841,27 @@ def _select_swa_tiling(
                 target_kv_block_size = _sdpa_burst_efficient_kv_block_limit(
                     query_rows_per_core
                 )
-                burst_efficient = [
-                    candidate
-                    for candidate in feasible
-                    if candidate.kv_bytes_per_core <= target_kv_bytes
-                    and candidate.block_size <= target_kv_block_size
-                ]
-                selected = (
-                    min(
-                        burst_efficient,
-                        key=lambda candidate: (
-                            candidate.estimated_dsc_executions,
-                            -candidate.block_size,
-                        ),
-                    )
-                    if burst_efficient
-                    else feasible[0]
+                kv_bytes_per_row = (
+                    candidates[0].kv_bytes_per_core // candidates[0].block_size
                 )
-                reason = "longest bursts within LX and K/V streaming targets"
+                target_kv_extent = min(
+                    target_kv_block_size,
+                    max(1, target_kv_bytes // kv_bytes_per_row),
+                )
+                # Equal HOP tiles can leave large gaps around the analytical
+                # target.  Choose the closest physically runnable divisor,
+                # rather than always rounding down and accidentally halving
+                # the useful burst.  LX remains a hard feasibility bound;
+                # execution count and burst length break equidistant ties.
+                selected = min(
+                    feasible,
+                    key=lambda candidate: (
+                        abs(candidate.block_size - target_kv_extent),
+                        candidate.estimated_dsc_executions,
+                        -candidate.block_size,
+                    ),
+                )
+                reason = "closest exact tile to K/V streaming and burst targets"
 
             selected_work_div = (
                 dict(sdpa_work_div) if sdpa_work_div is not None else None

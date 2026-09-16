@@ -51,11 +51,11 @@ class TestSWATiling(unittest.TestCase):
         config = self._select()
 
         self.assertEqual(config.strategy, "work_divided_tiled")
-        self.assertEqual(config.kv_block_size, 136)
-        self.assertEqual(config.num_kv_blocks, 8)
+        self.assertEqual(config.kv_block_size, 272)
+        self.assertEqual(config.num_kv_blocks, 4)
         self.assertEqual(config.num_head_tiles, 1)
-        self.assertEqual(config.work_div, {"q_block": 32})
-        self.assertEqual(config.kv_bytes_per_core, 544 * 1024)
+        self.assertEqual(config.work_div, {"q_block": 16})
+        self.assertEqual(config.kv_bytes_per_core, 1088 * 1024)
 
     def test_gemma4_decode_uses_fewest_dsc_executions(self):
         config = self._select(q_block=1)
@@ -75,11 +75,11 @@ class TestSWATiling(unittest.TestCase):
             buffer_width=576,
         )
 
-        self.assertEqual(config.strategy, "work_divided_tiled")
-        self.assertEqual(config.kv_block_size, 288)
-        self.assertEqual(config.num_kv_blocks, 2)
+        self.assertEqual(config.strategy, "work_divided")
+        self.assertEqual(config.kv_block_size, 576)
+        self.assertEqual(config.num_kv_blocks, 1)
         self.assertEqual(config.num_head_tiles, 1)
-        self.assertEqual(config.work_div, {"q_block": 32})
+        self.assertEqual(config.work_div, {"q_block": 16})
 
     def test_decode_is_not_tied_to_known_model_geometry(self):
         config = self._select(
@@ -105,7 +105,7 @@ class TestSWATiling(unittest.TestCase):
         )
 
         self.assertEqual(config.strategy, "work_divided_tiled")
-        self.assertEqual(config.work_div, {"q_block": 32})
+        self.assertEqual(config.work_div, {"q_block": 16})
         self.assertEqual(config.num_head_tiles, 1)
 
     def test_mha_work_division_uses_swa_dimension_names(self):
@@ -137,7 +137,7 @@ class TestSWATiling(unittest.TestCase):
         config = self._select(num_cores=16)
 
         self.assertEqual(config.strategy, "work_divided_tiled")
-        self.assertEqual(config.kv_block_size, 136)
+        self.assertEqual(config.kv_block_size, 272)
         self.assertEqual(config.work_div, {"q_block": 16})
         self.assertEqual(config.num_head_tiles, 1)
 
