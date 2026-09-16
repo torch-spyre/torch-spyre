@@ -51,11 +51,11 @@ class TestSWATiling(unittest.TestCase):
         config = self._select()
 
         self.assertEqual(config.strategy, "work_divided_tiled")
-        self.assertEqual(config.kv_block_size, 256)
-        self.assertEqual(config.num_kv_blocks, 5)
+        self.assertEqual(config.kv_block_size, 136)
+        self.assertEqual(config.num_kv_blocks, 8)
         self.assertEqual(config.num_head_tiles, 1)
         self.assertEqual(config.work_div, {"q_block": 32})
-        self.assertEqual(config.kv_bytes_per_core, 1024 * 1024)
+        self.assertEqual(config.kv_bytes_per_core, 544 * 1024)
 
     def test_gemma4_decode_uses_fewest_dsc_executions(self):
         config = self._select(q_block=1)
@@ -76,7 +76,7 @@ class TestSWATiling(unittest.TestCase):
         )
 
         self.assertEqual(config.strategy, "work_divided_tiled")
-        self.assertEqual(config.kv_block_size, 512)
+        self.assertEqual(config.kv_block_size, 288)
         self.assertEqual(config.num_kv_blocks, 2)
         self.assertEqual(config.num_head_tiles, 1)
         self.assertEqual(config.work_div, {"q_block": 32})
@@ -117,15 +117,15 @@ class TestSWATiling(unittest.TestCase):
 
         self.assertEqual(
             config.work_div,
-            {"num_heads": 4, "q_block": 8, "kv_block": 8},
+            {"num_heads": 4, "q_block": 8},
         )
 
     def test_low_lx_budget_uses_fallback(self):
         config = self._select(lx_budget_bytes=32 * 1024)
 
         self.assertEqual(config.strategy, "fallback_tiled")
-        self.assertEqual(config.kv_block_size, 512)
-        self.assertEqual(config.num_kv_blocks, 3)
+        self.assertEqual(config.kv_block_size, 272)
+        self.assertEqual(config.num_kv_blocks, 4)
         self.assertEqual(config.num_head_tiles, 1)
         self.assertEqual(
             config.reason,
@@ -137,7 +137,7 @@ class TestSWATiling(unittest.TestCase):
         config = self._select(num_cores=16)
 
         self.assertEqual(config.strategy, "work_divided_tiled")
-        self.assertEqual(config.kv_block_size, 256)
+        self.assertEqual(config.kv_block_size, 136)
         self.assertEqual(config.work_div, {"q_block": 16})
         self.assertEqual(config.num_head_tiles, 1)
 
@@ -186,11 +186,10 @@ class TestSWATiling(unittest.TestCase):
                         )
 
                         self.assertGreaterEqual(config.kv_block_size, 64)
-                        self.assertEqual(config.kv_block_size % 64, 0)
+                        self.assertEqual(buffer_width % config.kv_block_size, 0)
                         self.assertEqual(
                             config.num_kv_blocks,
-                            (buffer_width + config.kv_block_size - 1)
-                            // config.kv_block_size,
+                            buffer_width // config.kv_block_size,
                         )
                         self.assertEqual(num_heads % config.num_head_tiles, 0)
                         if config.work_div is not None:
@@ -200,9 +199,7 @@ class TestSWATiling(unittest.TestCase):
                             if num_heads != num_kvheads:
                                 self.assertEqual(set(config.work_div), {"q_block"})
                         if not config.strategy.startswith("fallback"):
-                            self.assertIsNotNone(
-                                config.estimated_live_bytes_per_core
-                            )
+                            self.assertIsNotNone(config.estimated_live_bytes_per_core)
                             self.assertLessEqual(
                                 config.estimated_live_bytes_per_core,
                                 config.lx_budget_bytes,

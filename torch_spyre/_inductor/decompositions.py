@@ -704,14 +704,15 @@ def _select_swa_tiling(
     SDPA's ``max_seqlen_q`` and ``max_seqlen_kv`` become ``q_block`` and
     ``kv_block`` in the SWA decomposition.
 
-    The selected block size is an upper bound. As in full SDPA, the caller
-    chooses the closest equal-sized tiling below that bound because
-    ``for_each_tile`` does not support a ragged final tile.
+    Unlike full SDPA, ``for_each_tile`` does not support a ragged final tile.
+    Candidate ceilings are therefore normalized to exact divisors before
+    their costs are evaluated, and the returned block size is the physical
+    tile extent that lowering will run.
     """
-    fallback_kv_block_size = min(_SDPA_MAX_SEQUENCE_TILE_SIZE, buffer_width)
-    fallback_num_kv_blocks = (
-        buffer_width + fallback_kv_block_size - 1
-    ) // fallback_kv_block_size
+    fallback_num_kv_blocks = _num_tiles_for_max_extent(
+        buffer_width, _SDPA_MAX_SEQUENCE_TILE_SIZE
+    )
+    fallback_kv_block_size = buffer_width // fallback_num_kv_blocks
     fallback_num_head_tiles = (
         1 if num_heads != num_kvheads else _sdpa_num_head_tiles(num_heads)
     )
@@ -850,11 +851,10 @@ def _select_swa_tiling(
             selected_work_div = (
                 dict(sdpa_work_div) if sdpa_work_div is not None else None
             )
-            if num_heads == num_kvheads and selected_work_div is not None:
-                selected_work_div["max_seqlen_kv"] = _sdpa_kv_work_division(
-                    query_split=selected_work_div["max_seqlen_q"],
-                    kv_block_size=selected.block_size,
-                )
+            # The HOP loop already owns the K/V traversal and its online
+            # softmax reduction. Unlike full SDPA's statically unrolled
+            # blocks, splitting that reduction again is neither legal nor
+            # useful; preserve only the independent head/query splits.
             swa_work_div = (
                 {
                     {
@@ -866,9 +866,7 @@ def _select_swa_tiling(
                 if selected_work_div is not None
                 else None
             )
-            strategy = (
-                "decode" if is_decode else "work_divided"
-            )
+            strategy = "decode" if is_decode else "work_divided"
             if selected.num_blocks > 1:
                 strategy += "_tiled"
             return _SWATilingConfig(
@@ -891,9 +889,7 @@ def _select_swa_tiling(
         raise AssertionError("SWA candidate selection did not produce a result")
 
     return _SWATilingConfig(
-        strategy=(
-            "fallback" if fallback_num_kv_blocks == 1 else "fallback_tiled"
-        ),
+        strategy=("fallback" if fallback_num_kv_blocks == 1 else "fallback_tiled"),
         reason=reason,
         kv_block_size=fallback_kv_block_size,
         num_kv_blocks=fallback_num_kv_blocks,
@@ -1854,9 +1850,7 @@ def _windowed_attention(
 
                     # Clamp before reducing so fully masked chunks do not form
                     # ``-inf - -inf`` in the online-softmax recurrence.
-                    block_max = torch.amax(
-                        torch.clamp_min(scores, finite_min), dim=-1
-                    )
+                    block_max = torch.amax(torch.clamp_min(scores, finite_min), dim=-1)
                     # Form the old-max correction first.  The loop lowering can
                     # then update running_max without a carry snapshot.
                     correction = torch.exp(
@@ -1876,10 +1870,9 @@ def _windowed_attention(
                     return (new_max, new_denominator, new_output), None
 
                 carry = (running_max, denominator, output)
-                num_kv_tiles = _num_tiles_for_max_extent(
-                    buffer_width, tiling.kv_block_size
-                )
-                kv_tile_size = buffer_width // num_kv_tiles
+                num_kv_tiles = tiling.num_kv_blocks
+                kv_tile_size = tiling.kv_block_size
+                assert num_kv_tiles * kv_tile_size == buffer_width
                 if num_kv_tiles > 1:
                     carry, _ = for_each_tile(
                         swa_kv_body,
