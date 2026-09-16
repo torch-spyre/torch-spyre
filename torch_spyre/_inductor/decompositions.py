@@ -1123,11 +1123,9 @@ def spyre__sdpa_overrideable(
     max_seqlen_kv = key.size(2)
     head_dim = query.size(3)
 
-    scaling_factor = scale
-    if scaling_factor is None:
-        scaling_factor = 1.0 / math.sqrt(math.sqrt(head_dim))
-    else:
-        scaling_factor = math.sqrt(scaling_factor)
+    query_scale = scale
+    if query_scale is None:
+        query_scale = 1.0 / math.sqrt(head_dim)
 
     if dropout_p > 0.0:
         raise Unsupported("Attention dropout not implemented for Spyre")
@@ -1283,11 +1281,6 @@ def spyre__sdpa_overrideable(
     num_kv_tiles = _num_tiles_for_max_extent(max_seqlen_kv, tiling.kv_block_size)
     kv_tile_size = max_seqlen_kv // num_kv_tiles
 
-    kv_dim_names = (
-        ["_b", "num_kvheads", "_gqa_broadcast", "blk_len", "head_dim"]
-        if use_gqa
-        else ["_b", "num_heads", "blk_len", "head_dim"]
-    )
     score_dim_names = (
         [
             "_b",
@@ -1330,7 +1323,7 @@ def spyre__sdpa_overrideable(
             ):
                 # Q is invariant across the counted Lk loop.
                 with spyre_hint(named_dims=query_dim_names):
-                    q_scaled = query * scaling_factor
+                    q_scaled = query * query_scale
 
                 def sdpa_lk_body(carry, tiles):
                     running_max, running_denom, running_output = carry
@@ -1339,11 +1332,7 @@ def spyre__sdpa_overrideable(
                         k_blk = k_blk.unsqueeze(2)
                         v_blk = v_blk.unsqueeze(2)
 
-                    with spyre_hint(named_dims=kv_dim_names):
-                        scaled_keys = k_blk * scaling_factor
-                    with spyre_hint(named_dims=kv_dim_names):
-                        v_blk = v_blk.contiguous()
-                    keys_T = scaled_keys.transpose(-1, -2).contiguous()
+                    keys_T = k_blk.transpose(-1, -2).contiguous()
 
                     with spyre_hint(named_dims=score_dim_names):
                         scores = (
