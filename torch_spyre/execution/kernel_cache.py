@@ -19,14 +19,12 @@ import shutil
 import uuid
 from collections.abc import Sequence
 from functools import lru_cache
-from typing import Optional
 
 import torch
 from torch._inductor.codecache import code_hash
 from torch._inductor.runtime.runtime_utils import cache_dir
 
 from torch_spyre._inductor.logging_utils import get_inductor_logger
-
 
 logger = get_inductor_logger("kernel_cache")
 
@@ -44,14 +42,13 @@ _REQUIRED_ARTIFACTS = [
 _READY_SENTINEL = "ready"
 
 
-def _acquire_cache_lock(cache_root: str) -> int:
-    """Acquire an advisory lock on a file in the cache root.
+def _acquire_cache_lock(lock_path: str) -> int:
+    """Acquire an advisory lock on ``lock_path``.
 
     Returns the file descriptor; the caller must close it after the locked
     section. NFS supports flock when mounted with local_lock=none (the default
     on the CI PVC), so this serializes commits across pods.
     """
-    lock_path = os.path.join(cache_root, ".commit.lock")
     fd = os.open(lock_path, os.O_CREAT | os.O_RDWR)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX)
@@ -133,7 +130,7 @@ class _KernelHashRegistry:
         if cache_key in self._registry:
             self._registry[cache_key]["miss_count"] += 1
 
-    def get(self, cache_key: str) -> Optional[dict]:
+    def get(self, cache_key: str) -> dict | None:
         return self._registry.get(cache_key)
 
     def all_entries(self) -> dict[str, dict]:
@@ -270,9 +267,9 @@ def compute_specs_hash(
                      Must be included so that kernels that differ only in
                      their pool size get different cache keys.
     """
+    from torch_spyre._inductor import config as _spyre_config
     from torch_spyre._inductor.codegen.superdsc import compile_op_spec
     from torch_spyre._inductor.op_spec import LoopSpec, OpSpec
-    from torch_spyre._inductor import config as _spyre_config
 
     use_symbols = _spyre_config.bundle_symbolic_args
 
@@ -439,7 +436,7 @@ def _cache_shared() -> bool:
     return _spyre_config.spyre_kernel_cache_shared
 
 
-def get_cached_kernel_dir(cache_key: str) -> Optional[str]:
+def get_cached_kernel_dir(cache_key: str) -> str | None:
     """Return the cached kernel directory if all required artifacts are present.
 
     Checks for every entry in _REQUIRED_ARTIFACTS and at least one sdsc_N.json.
@@ -537,9 +534,14 @@ def _commit_compile_dir_shared(
     """Commit path used when the cache directory is shared across processes.
 
     On shared/NFS storage a directory rename can become visible to other
-    clients before the files inside it are readable. We serialize commits with
-    an advisory flock and write a sentinel file after the rename so readers
-    only treat the entry as ready once all artifacts are visible.
+    clients before the files inside it are readable. We serialize commits per
+    cache key with an advisory flock and write a sentinel file after the
+    rename so readers only treat the entry as ready once all artifacts are
+    visible.
+
+    The kernel tree is copied into a staging directory outside the lock; the
+    locked section is only a metadata check and an atomic rename, keeping the
+    critical section short.
     """
     if os.path.isdir(cached_dir) and os.path.isfile(
         os.path.join(cached_dir, _READY_SENTINEL)
@@ -549,13 +551,26 @@ def _commit_compile_dir_shared(
         logger.info("Cache race resolved: reusing existing entry at %s", cached_dir)
         return cached_dir
 
-    lock_fd = _acquire_cache_lock(cache_root)
+    # Stage the fully-built kernel tree under a unique directory while NOT
+    # holding the lock.  The heavy I/O happens here, in parallel with other
+    # keys and with readers.
+    staged_dir = os.path.join(cache_root, f"{cache_key}.staging.{uuid.uuid4().hex}")
+    try:
+        shutil.copytree(tmp_dir, staged_dir)
+    except Exception:
+        shutil.rmtree(staged_dir, ignore_errors=True)
+        raise
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    lock_path = os.path.join(cache_root, f"{cache_key}.commit.lock")
+    lock_fd = _acquire_cache_lock(lock_path)
     try:
         # Re-check under the lock.
         if os.path.isdir(cached_dir) and os.path.isfile(
             os.path.join(cached_dir, _READY_SENTINEL)
         ):
-            shutil.rmtree(tmp_dir, ignore_errors=True)
+            shutil.rmtree(staged_dir, ignore_errors=True)
             logger.info(
                 "Cache race resolved under lock: reusing existing entry at %s",
                 cached_dir,
@@ -568,11 +583,11 @@ def _commit_compile_dir_shared(
             shutil.rmtree(cached_dir, ignore_errors=True)
 
         try:
-            os.rename(tmp_dir, cached_dir)
+            os.rename(staged_dir, cached_dir)
         except OSError:
             # Another client may have created the directory between re-check
             # and rename; treat it as a race loss and clean up.
-            shutil.rmtree(tmp_dir, ignore_errors=True)
+            shutil.rmtree(staged_dir, ignore_errors=True)
             if os.path.isdir(cached_dir) and not os.path.isfile(
                 os.path.join(cached_dir, _READY_SENTINEL)
             ):
