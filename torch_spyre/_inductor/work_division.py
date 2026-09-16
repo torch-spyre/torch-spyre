@@ -445,7 +445,16 @@ def adjust_it_space_for_sticks(
                 f"(tensor {td.dep.name}); symbolic dims must be non-stick "
                 f"(e.g. the leading batch dim)."
             )
-        elems_per_stick = td.layout.device_layout.elems_per_stick()
+        if hasattr(
+            td.layout.device_layout, "element_arrangement"
+        ) and td.layout.device_layout.element_arrangement in (
+            ElementArrangement.DL16_TO_FP32,
+            ElementArrangement.FP32_TO_DL16,
+        ):
+            # Couples two FP32 sticks (64 elements total)
+            elems_per_stick = 64
+        else:
+            elems_per_stick = td.layout.device_layout.elems_per_stick()
         if stick_var not in max_elems or elems_per_stick > max_elems[stick_var]:
             max_elems[stick_var] = elems_per_stick
 

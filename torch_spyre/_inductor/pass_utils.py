@@ -229,8 +229,14 @@ def rescale_stl_for_dtype(
                     f"{stl.device_size[i]} stick(s) of {in_eps} elements, which is "
                     f"not a whole number of {out_eps}-element output sticks"
                 )
-            out_device_size[i] = total_elems // out_eps
+            new_num_sticks = total_elems // out_eps
+            out_device_size[i] = new_num_sticks
             out_stride_map[i] = out_eps
+            old_row_pitch = stl.device_size[i] * in_eps
+            new_row_pitch = new_num_sticks * out_eps
+            for k in range(i):
+                if out_stride_map[k] == old_row_pitch:
+                    out_stride_map[k] = new_row_pitch
             break
     return SpyreTensorLayout(
         out_device_size,
