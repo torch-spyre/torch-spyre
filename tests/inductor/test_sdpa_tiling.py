@@ -90,6 +90,47 @@ class TestSDPATiling(unittest.TestCase):
             {"max_seqlen_q": 32},
         )
 
+    def test_low_head_long_mha_uses_query_only_work_division(self):
+        for num_heads in (2, 4, 8):
+            with self.subTest(num_heads=num_heads):
+                config = self._select(
+                    num_heads=num_heads,
+                    num_kvheads=num_heads,
+                    max_seqlen_q=64,
+                    max_seqlen_kv=8192,
+                )
+
+                self.assertEqual(
+                    config.work_div,
+                    {"max_seqlen_q": 32, "max_seqlen_kv": 32},
+                )
+
+    def test_low_head_short_mha_keeps_head_query_work_division(self):
+        config = self._select(
+            num_heads=2,
+            num_kvheads=2,
+            max_seqlen_q=64,
+            max_seqlen_kv=512,
+        )
+
+        self.assertEqual(
+            config.work_div,
+            {"num_heads": 2, "max_seqlen_q": 16, "max_seqlen_kv": 16},
+        )
+
+    def test_wide_head_long_mha_keeps_head_query_work_division(self):
+        config = self._select(
+            num_heads=16,
+            num_kvheads=16,
+            max_seqlen_q=64,
+            max_seqlen_kv=8192,
+        )
+
+        self.assertEqual(
+            config.work_div,
+            {"num_heads": 4, "max_seqlen_q": 8, "max_seqlen_kv": 8},
+        )
+
     def test_gemma_local_uses_smaller_kv_block_for_wide_heads(self):
         config = self._select(
             num_heads=16,
