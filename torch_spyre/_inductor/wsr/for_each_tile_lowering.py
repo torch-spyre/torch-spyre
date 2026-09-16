@@ -61,7 +61,7 @@ from torch._inductor.virtualized import V
 
 if TYPE_CHECKING:
     from torch._inductor import ir
-    from torch._inductor.dependencies import MemoryDep
+    from torch._inductor.dependencies import Dep
 
 
 @dataclasses.dataclass(frozen=True)
@@ -239,7 +239,7 @@ def _body_loop_var(while_op: "ir.WhileLoop") -> sympy.Symbol | None:
 
 _next_synthetic_hint_id_start = 1 << 30  # reserved range, well above real hint scopes
 
-_MARKER_MAPS: dict[int, dict[tuple[str, "MemoryDep"], int]] = {}
+_MARKER_MAPS: dict[int, dict[tuple[str, "Dep"], int]] = {}
 """Per-compile marker-map registry, keyed by id(operations).
 
 NOT safe to let outlive one compile: CPython aggressively reuses a freed
@@ -477,14 +477,22 @@ def _delinearize_index(index: sympy.Expr, size, stride, offset) -> list[sympy.Ex
             )
         if st != 0:
             seen_strides[st] = i
+        # A size>1 broadcast dim (stride 0) contributes no term to
+        # `remaining` and its coordinate is always 0 -- but that must be
+        # special-cased rather than falling into the general
+        # `remaining.coeff(st)` branch below: sympy's `.coeff(0)` does not
+        # mean "coefficient of the constant term" here, it returns the
+        # WHOLE `remaining` expression unchanged. Using `remaining.coeff(st)`
+        # unconditionally would silently smuggle the entire remaining sum
+        # into this one dim's "coordinate" instead of 0.
         coords.append(remaining.coeff(st) if st != 0 else sympy.Integer(0))
     return coords
 
 
 def _marker_substitution(
     marker_op: "ir.Operation",
-) -> tuple[str, sympy.Expr, tuple[sympy.Symbol, ...]]:
-    """Get (marker's own input name, marker's own read index expr, var_names).
+) -> tuple[str, sympy.Expr, tuple[sympy.Symbol, ...], tuple[sympy.Expr, ...]]:
+    """Get (marker's own input name, marker's own read index expr, var_names, size).
 
     The marker's ``inner_fn`` (``lower_tile_dim_marker``, lowering.py) is
     always exactly ``return loader(index)`` -- a single load of the
@@ -503,10 +511,16 @@ def _marker_substitution(
     everywhere else (see CLAUDE.md's "wrap, never reconstruct").
 
     Returns the marker's own single MemoryDep read's ``(name, index)``,
-    where ``index`` is expressed in terms of the marker's own WRITE
-    dep's ``var_names`` (its own output-coordinate symbols, ``d0, d1,
-    ...`` in positional order) -- the caller substitutes its own
-    load-site coordinates for those symbols positionally.
+    where ``index`` is expressed in terms of the marker's own WRITE dep's
+    ``var_names`` (its own output-coordinate symbols, ``d0, d1, ...`` in
+    positional order) -- the caller substitutes its own load-site
+    coordinates for those symbols positionally. Also returns that same
+    WRITE dep's own ``size``, positionally aligned with ``var_names``: both
+    have size-1 dims already squeezed out by Inductor's
+    ``index_vars_squeeze``/canonicalize machinery, so the caller can use
+    ``size`` to tell which of the marker's *layout* dims (``_InlineMarkerHandler``'s
+    own ``self._size``, which does NOT have size-1 dims squeezed out) a
+    given ``var_names`` entry actually corresponds to.
     """
     from torch._inductor.dependencies import MemoryDep
 
@@ -521,7 +535,7 @@ def _marker_substitution(
             "body into a consumer."
         )
     write_dep, read_dep = write_deps[0], read_deps[0]
-    return read_dep.name, read_dep.index, write_dep.var_names
+    return read_dep.name, read_dep.index, write_dep.var_names, write_dep.size
 
 
 class _InlineMarkerHandler(WrapperHandler):
@@ -573,12 +587,35 @@ class _InlineMarkerHandler(WrapperHandler):
             self._marker_input_name,
             self._marker_read_index,
             self._marker_var_names,
+            self._marker_write_size,
         ) = _marker_substitution(marker_op)
 
     def load(self, name, index):
         if name == self._marker_name:
             coords = _delinearize_index(index, self._size, self._stride, self._offset)
-            subs = dict(zip(self._marker_var_names, coords))
+            # self._size (this handler's own layout.size) has NOT had size-1
+            # dims squeezed out, but self._marker_var_names/
+            # self._marker_write_size (from the marker's own WRITE dep) HAVE
+            # -- Inductor's index_vars_squeeze/canonicalize already dropped
+            # them. Zipping coords (one per self._size slot) directly against
+            # var_names (one per squeezed slot) would silently misalign and
+            # truncate the moment the two lists differ in length -- e.g. a
+            # size-1 dim anywhere but the position(s) every current fixture
+            # happens to put it at. Filter coords down to only the positions
+            # whose size is not 1 before zipping, so the two lists are
+            # positionally comparable by construction rather than by
+            # coincidence of today's fixture shapes.
+            non_unit_coords = [c for c, sz in zip(coords, self._size) if sz != 1]
+            if len(non_unit_coords) != len(self._marker_var_names):
+                raise AssertionError(
+                    f"tile_dim_marker {self._marker_name!r}: "
+                    f"{len(non_unit_coords)} non-size-1 load-site coordinates "
+                    f"(from size {self._size!r}) but "
+                    f"{len(self._marker_var_names)} marker var_names (from "
+                    f"write size {self._marker_write_size!r}); cannot "
+                    "substitute positionally."
+                )
+            subs = dict(zip(self._marker_var_names, non_unit_coords))
             # simultaneous=True is required: sympy.Expr.subs(dict) otherwise
             # applies substitutions sequentially, one symbol at a time, so a
             # dict like {d0: d1, d1: d2} first rewrites d0->d1 and THEN
@@ -640,7 +677,7 @@ def _inline_marker_into_consumer(
 def _consume_tile_dim_markers(
     group_ops: list["ir.Operation"],
     operations: list["ir.Operation"],
-) -> dict[tuple["ir.Operation", "MemoryDep"], int]:
+) -> dict[tuple[str, "Dep"], int]:
     """Find every tile_dim_marker-tagged op in group_ops, erase it, map its dim.
 
     For each marker op (an op whose realized ComputedBuffer carries
@@ -726,18 +763,17 @@ def _consume_tile_dim_markers(
     included) preserves the original name, and other Spyre metadata
     (``PropagationPlan.outside_consumer_names``, etc.) already keys by name
     for exactly this reason -- see that field's own docstring on name
-    stability. The returned map's *declared* type still reads as
-    ``dict[tuple[Operation, MemoryDep], int]`` for documentation purposes,
-    but is actually keyed by ``(op.get_name(), dep)``;
+    stability. The returned map is keyed by ``(op.get_name(), dep)`` --
     ``lookup_marker_dim`` (the map's only reader) recomputes ``op.get_name()``
-    itself, so this is invisible to every caller. For a StarDep-shaped
-    consumer the dep stored is the StarDep itself (not a MemoryDep) --
+    itself, so callers never need the key's ``str`` half spelled out
+    explicitly. For a StarDep-shaped consumer the dep stored is the StarDep
+    itself (not a MemoryDep) --
     lookup_marker_dim's own read-walk already iterates every read
     regardless of type when matching by identity/equality against the map,
     and only special-cases MemoryDep for the (inapplicable to StarDep,
     which has no index) reduction-coordinate check.
     """
-    from torch._inductor.dependencies import Dep, MemoryDep, StarDep
+    from torch._inductor.dependencies import MemoryDep, StarDep
 
     from torch_spyre._inductor.wsr.while_loop_bridge import (
         _substitute_direct_input_refs,
@@ -910,10 +946,7 @@ def _consume_tile_dim_markers(
                 group_ops.remove(marker_op)
             group_op_ids.discard(id(marker_op))
 
-    _MARKER_MAPS[id(operations)] = {
-        **_MARKER_MAPS.get(id(operations), {}),
-        **marker_map,
-    }
+    _MARKER_MAPS.setdefault(id(operations), {}).update(marker_map)
     return marker_map
 
 
