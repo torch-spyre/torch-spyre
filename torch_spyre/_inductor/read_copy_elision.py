@@ -288,8 +288,6 @@ def _prove_matmul_direct_read(
     copy_layout = copy_op.get_layout()
     if not isinstance(copy_layout, FixedTiledLayout):
         return None, "copy has no final device layout"
-    if "lx" in copy_layout.allocation:
-        return None, "LX planning retained the copy"
 
     direct_op = _clone_direct_consumer(consumer, record)
     direct_rw = direct_op.get_read_writes()
