@@ -22,6 +22,7 @@ import torch
 from .constants import DEVICE_NAME, DISTRIBUTED_BACKEND_NAME
 from . import memory
 from . import profiler
+from .layout_hints import require_layout  # noqa: F401
 
 
 _runtime_init_lock = threading.Lock()
