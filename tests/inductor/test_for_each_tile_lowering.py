@@ -14,18 +14,21 @@
 
 """IR-level / mocked-IR unit tests for WhileLoop -> for_each_tile lowering.
 
-No Spyre device or backend compiler is required. Covers three areas, each
+No Spyre device or backend compiler is required. Covers four areas, each
 in its own class group:
-  1. while_loop_bridge's generic while_loop -> coarse-tile-group bridge:
+  1. An eager-mode sanity check that the nested for_each_tile fixture's
+     reference implementation matches plain matmul (TestNestedForEach
+     TileFixture).
+  2. while_loop_bridge's generic while_loop -> coarse-tile-group bridge:
      CarryBinding/carry_bindings_for and splice_while_loop's buffer
      transplant, carry/xs-leaf read redirection, and mutated-carry
      re-read guard, exercised against hand-built mocks
      (TestCarryBindingsFor, TestSpliceWhileLoop).
-  2. for_each_tile_lowering's splice_while_loops pass and try_prove_
+  3. for_each_tile_lowering's splice_while_loops pass and try_prove_
      for_each_tile shape prover, exercised against real ir.WhileLoop
      nodes built by lowering the vendored fixtures through GraphLowering
      (TestSpliceWhileLoops, TestTryProveForEachTile).
-  3. Pass-pipeline registration: splice_while_loops runs first, ahead of
+  4. Pass-pipeline registration: splice_while_loops runs first, ahead of
      every other pre-scheduling pass (TestPassPipelineRegistration).
 
 For end-to-end compilation + numerical correctness against a CPU
@@ -35,11 +38,14 @@ reference, see test_for_each_tile_e2e.py.
 import unittest
 from unittest import mock
 
+import torch
 from torch._inductor.virtualized import V
 
 from tests.inductor.for_each_tile_fixtures import (
     capture_post_grad_while_loop,
     matmul_inputs,
+    nested_split_m_then_k_fn,
+    nested_split_m_then_k_reference,
     split_k_fn,
     split_m_elementwise_fn,
     split_m_fn,
@@ -47,6 +53,20 @@ from tests.inductor.for_each_tile_fixtures import (
 from torch_spyre._inductor.wsr.for_each_tile_lowering import (
     try_prove_for_each_tile,
 )
+
+
+class TestNestedForEachTileFixture(unittest.TestCase):
+    """Eager-mode sanity check for the nested for_each_tile fixture's reference."""
+
+    def test_reference_matches_plain_matmul(self):
+        (X, Y), expected = matmul_inputs()
+        actual = nested_split_m_then_k_reference(X, Y)
+        torch.testing.assert_close(actual, expected)
+
+    def test_eager_fn_matches_plain_matmul(self):
+        (X, Y), expected = matmul_inputs()
+        actual = nested_split_m_then_k_fn(X, Y)
+        torch.testing.assert_close(actual, expected)
 
 
 class TestCarryBindingsFor(unittest.TestCase):
