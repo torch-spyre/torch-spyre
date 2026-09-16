@@ -2254,9 +2254,23 @@ def _hint_ranges_pos(
     # unresolved marker lookup there is a genuine gap (an unrecognized
     # shape, or a marker consumed without being recorded), not a
     # loop-invariant op silently passing through.
+    #
+    # A POINT read (``dep.var_names == ()``) is excluded from this check.
+    # It has no iteration dim of its own to tag with a tile_dim_marker --
+    # paged attention's in-body page-index read is exactly this shape,
+    # ``dep.index == 32*u0`` with no ``d{i}`` coordinates at all -- so
+    # loop_var can appear in its index without ever being resolvable
+    # through the marker map. That is not a gap: it is the shape
+    # _point_splice_advance_for_dep's caller (plan_coarse_tile_groups)
+    # handles through squeezed_advance_per_read once this function returns
+    # (None, False) for it, by stashing hint.loop_var into
+    # unattributed_loop_vars. Counting it here as "mentions loop_var"
+    # would raise on every legitimate point-splice-advance read instead of
+    # letting that caller-side mechanism resolve it.
     rw = op.get_read_writes()
     mentions_loop_var = any(
         isinstance(dep, MemoryDep)
+        and dep.var_names
         and isinstance(dep.index, sympy.Basic)
         and hint.loop_var in dep.index.free_symbols
         for dep in rw.reads
