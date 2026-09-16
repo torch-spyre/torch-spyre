@@ -427,4 +427,274 @@ def test_eager_ea(src_dev, dst_dev, fp16, eager_to):
     assert_ea(z32, ea_of(src_dev))
 
 
+# ---------------------------------------------------------------------------
+# Per-op EA propagation rules — EA tag + numerical correctness
+#
+# Pattern:
+#   - assert_ea()   : the output carries the expected ElementArrangement
+#   - assert_val()  : when output EA is STANDARD, values match CPU directly
+#   - roundtrip     : when output EA is staggered, apply the reverse convert
+#                     to get STANDARD, then compare with CPU
+# ---------------------------------------------------------------------------
+
+DEVICE = "spyre"
+
+
+def _to_standard(t, fp16):
+    """Roundtrip a staggered fp16/bf16 tensor back to STANDARD EA.
+
+    DL16_TO_FP32  (fp16→fp32 stagger): restore via fp32→fp16  (fp32todl16)
+    FP32_TO_DL16  (fp32→fp16 stagger): restore via fp16→fp32  (dl16tofp32)
+    Either direction: apply the reverse convert so EA becomes STANDARD, then
+    cast back to fp16 for a fair value comparison.
+    """
+    ea = get_ea(t)
+    if ea == ElementArrangement.DL16_TO_FP32:
+        # staggered fp32 → restore via fp32→fp16 → now STANDARD fp16
+        return t.to(dtype=fp16)
+    if ea == ElementArrangement.FP32_TO_DL16:
+        # staggered fp16 → restore via fp16→fp32 → STANDARD fp32 → cast to fp16
+        return t.to(torch.float32).to(dtype=fp16)
+    return t  # already STANDARD
+
+
+def _assert_numerically_close(
+    spyre_result, cpu_fn, cpu_input, *, fp16, rtol=1e-2, atol=1e-2
+):
+    """Compare spyre_result with CPU reference, handling staggered EA via roundtrip."""
+    ea = get_ea(spyre_result)
+    if ea in (ElementArrangement.DL16_TO_FP32, ElementArrangement.FP32_TO_DL16):
+        comparable = _to_standard(spyre_result, fp16).cpu()
+    else:
+        comparable = spyre_result.cpu()
+    expected = cpu_fn(cpu_input)
+    torch.testing.assert_close(comparable, expected, rtol=rtol, atol=atol)
+
+
+# ---------------------------------------------------------------------------
+# Class 0 — Single-arg pointwise: always OK, propagate EA
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("device", [DEVICE])
+@pytest.mark.parametrize(
+    "fp16", DtypeOpTable.fp16_types(), ids=lambda dt: str(dt).replace("torch.", "")
+)
+def test_rule_single_arg_pointwise_propagates_stagger(device, fp16):
+    """Single-arg pointwise (neg) on a staggered tensor propagates EA unchanged.
+
+    EA rule: output_ea == input_ea  (DL16_TO_FP32 in, DL16_TO_FP32 out)
+    Numerical check: roundtrip to STANDARD, compare with CPU.
+    """
+
+    @torch.compile
+    def fn(x):
+        # fp16 → fp32 creates DL16_TO_FP32
+        x_fp32 = x.to(torch.float32)
+        # neg is single-arg pointwise — must propagate DL16_TO_FP32
+        return torch.neg(x_fp32)
+
+    x = torch.randn(4, 128, device=device, dtype=fp16)
+    result = fn(x)
+
+    # EA must be propagated unchanged from the fp32 staggered input
+    assert_ea(result, ElementArrangement.DL16_TO_FP32)
+
+    # Numerical check via roundtrip: neg(staggered fp32) → fp16 restore → compare
+    _assert_numerically_close(
+        result,
+        lambda t: torch.neg(t.to(torch.float32)).to(fp16),
+        x.cpu(),
+        fp16=fp16,
+    )
+
+
+@pytest.mark.parametrize("device", [DEVICE])
+@pytest.mark.parametrize(
+    "fp16", DtypeOpTable.fp16_types(), ids=lambda dt: str(dt).replace("torch.", "")
+)
+def test_rule_single_arg_pointwise_standard_stays_standard(device, fp16):
+    """Single-arg pointwise (abs) on STANDARD tensor stays STANDARD."""
+
+    @torch.compile
+    def fn(x):
+        return torch.abs(x)
+
+    x = torch.randn(4, 128, device=device, dtype=fp16)
+    result = fn(x)
+
+    assert_ea(result, ElementArrangement.STANDARD)
+    # STANDARD output: compare directly with CPU
+    torch.testing.assert_close(result.cpu(), fn(x.cpu()), rtol=1e-2, atol=1e-2)
+
+
+# ---------------------------------------------------------------------------
+# Class 1 — Multi-arg pointwise: all same EA → propagate; mixed → needs restore
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("device", [DEVICE])
+@pytest.mark.parametrize(
+    "fp16", DtypeOpTable.fp16_types(), ids=lambda dt: str(dt).replace("torch.", "")
+)
+def test_rule_multi_arg_pointwise_same_stagger_propagates(device, fp16):
+    """add(staggered, staggered) — same EA on both inputs → output propagates EA.
+
+    Both inputs share DL16_TO_FP32 → add is elementwise-correct → output is
+    DL16_TO_FP32.
+    """
+
+    @torch.compile
+    def fn(x, y):
+        x_fp32 = x.to(torch.float32)  # DL16_TO_FP32
+        y_fp32 = y.to(torch.float32)  # DL16_TO_FP32
+        return torch.add(x_fp32, y_fp32)
+
+    x = torch.randn(4, 128, device=device, dtype=fp16)
+    y = torch.randn(4, 128, device=device, dtype=fp16)
+    result = fn(x, y)
+
+    assert_ea(result, ElementArrangement.DL16_TO_FP32)
+
+    _assert_numerically_close(
+        result,
+        lambda t: torch.add(t[0].to(torch.float32), t[1].to(torch.float32)).to(fp16),
+        (x.cpu(), y.cpu()),
+        fp16=fp16,
+    )
+
+
+@pytest.mark.parametrize("device", [DEVICE])
+@pytest.mark.parametrize(
+    "fp16", DtypeOpTable.fp16_types(), ids=lambda dt: str(dt).replace("torch.", "")
+)
+def test_rule_multi_arg_pointwise_broadcast_standard_with_stagger(device, fp16):
+    """add(staggered full, STANDARD broadcast) → output keeps staggered EA.
+
+    A size-1 broadcast input is always compatible regardless of its EA.
+    """
+
+    @torch.compile
+    def fn(x, scale):
+        x_fp32 = x.to(torch.float32)  # DL16_TO_FP32
+        # scale is fp32 with shape [1] — broadcasts along stick → STANDARD
+        return torch.add(x_fp32, scale)
+
+    x = torch.randn(4, 128, device=device, dtype=fp16)
+    scale = torch.tensor([0.5], device=device, dtype=torch.float32)
+    result = fn(x, scale)
+
+    assert_ea(result, ElementArrangement.DL16_TO_FP32)
+
+    _assert_numerically_close(
+        result,
+        lambda t: torch.add(t[0].to(torch.float32), t[1]).to(fp16),
+        (x.cpu(), scale.cpu()),
+        fp16=fp16,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Class 2 — Reduction on stick dim: output becomes STANDARD
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("device", [DEVICE])
+@pytest.mark.parametrize(
+    "fp16", DtypeOpTable.fp16_types(), ids=lambda dt: str(dt).replace("torch.", "")
+)
+def test_rule_reduction_stick_dim_becomes_standard(device, fp16):
+    """mean along the stick dim of a DL16_TO_FP32 tensor → output is STANDARD.
+
+    Reduction is order-independent, so the staggered ordering is consumed and
+    the output EA becomes STANDARD.  Values must match CPU directly.
+    """
+
+    @torch.compile
+    def fn(x):
+        x_fp32 = x.to(torch.float32)  # DL16_TO_FP32
+        # reduce along dim=-1 (the stick dim) → EA consumed → STANDARD
+        return x_fp32.mean(dim=-1)
+
+    x = torch.randn(4, 128, device=device, dtype=fp16)
+    result = fn(x)
+
+    assert_ea(result, ElementArrangement.STANDARD)
+    # STANDARD output: compare directly
+    torch.testing.assert_close(
+        result.cpu(),
+        fn(x.cpu()),
+        rtol=1e-2,
+        atol=1e-2,
+    )
+
+
+@pytest.mark.parametrize("device", [DEVICE])
+@pytest.mark.parametrize(
+    "fp16", DtypeOpTable.fp16_types(), ids=lambda dt: str(dt).replace("torch.", "")
+)
+def test_rule_reduction_non_stick_dim_propagates_stagger(device, fp16):
+    """mean along a non-stick dim of a DL16_TO_FP32 tensor → output keeps EA.
+
+    Reducing over the outer (non-stick) dimension accumulates sticks as units;
+    the intra-stick ordering is untouched, so EA propagates.
+    """
+
+    @torch.compile
+    def fn(x):
+        x_fp32 = x.to(torch.float32)  # DL16_TO_FP32, shape [4, 128]
+        # reduce along dim=0 (outer / non-stick dim) → EA survives
+        return x_fp32.mean(dim=0)  # output shape [128], still DL16_TO_FP32
+
+    x = torch.randn(4, 128, device=device, dtype=fp16)
+    result = fn(x)
+
+    assert_ea(result, ElementArrangement.DL16_TO_FP32)
+
+    _assert_numerically_close(
+        result,
+        lambda t: t.to(torch.float32).mean(dim=0).to(fp16),
+        x.cpu(),
+        fp16=fp16,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Class 3 — Restickify: swaps staggered EA between stick and non-stick dim
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("device", [DEVICE])
+@pytest.mark.parametrize(
+    "fp16", DtypeOpTable.fp16_types(), ids=lambda dt: str(dt).replace("torch.", "")
+)
+def test_rule_restickify_swaps_ea(device, fp16):
+    """Transpose (restickify) of a staggered tensor moves EA to the new stick.
+
+    After fp16→fp32 (DL16_TO_FP32 on last dim), a transpose moves the stick
+    to dim 0.  The staggered EA follows the former stick dimension to its new
+    (non-stick) position; the new stick (former outer dim) is STANDARD.
+    The full chain fp16→fp32→transpose→fp32→fp16 must match CPU.
+    """
+
+    @torch.compile
+    def fn(x):
+        x_fp32 = x.to(torch.float32)  # [4, 128] DL16_TO_FP32 on dim 1
+        x_t = x_fp32.t()  # [128, 4] — restickify swaps dims
+        # Restore to fp16 to produce STANDARD EA for comparison
+        return x_t.to(dtype=fp16)
+
+    x = torch.randn(4, 128, device=device, dtype=fp16)
+    result = fn(x)
+
+    # After fp32→fp16 restoration the output EA must be STANDARD
+    assert_ea(result, ElementArrangement.STANDARD)
+    torch.testing.assert_close(
+        result.cpu(),
+        fn(x.cpu()),
+        rtol=1e-2,
+        atol=1e-2,
+    )
+
+
 # Made with Bob

@@ -67,6 +67,7 @@ from .propagate_layouts import (
 from .optimize_restickify import optimize_restickify_locations
 from .insert_restickify import (
     finalize_layouts,
+    insert_destagger_graph_outputs,
     insert_post_mutation_restickify,
     insert_restickify,
     validate_no_restickify_on_mutation_targets,
@@ -515,6 +516,7 @@ class CustomPreSchedulingPasses:
             insert_restickify,
             validate_no_restickify_on_mutation_targets,
             enforce_indirect_access_layout,
+            insert_destagger_graph_outputs,
             insert_post_mutation_restickify,
             insert_restickify_padding,
             #

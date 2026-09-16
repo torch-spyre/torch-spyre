@@ -18,7 +18,7 @@ from typing import Any
 
 from sympy import Symbol
 
-from torch_spyre._C import DataFormats, encode_constant
+from torch_spyre._C import DataFormats, ElementArrangement, encode_constant
 from torch_spyre._inductor.constants import (
     CONV2D_DIM_LABELS,
     DEPTHWISE_CONV2D_OP,
@@ -276,6 +276,7 @@ def gen_coord_info_value(
     conv_params=None,
     padding: str = "nopad",
     tensor_idx: int = -1,
+    element_arrangement: ElementArrangement = ElementArrangement.STANDARD,
     opfunc: str = "",
     core_stride: int | None = None,
 ):
@@ -365,6 +366,49 @@ def gen_coord_info_value(
                     {"factor_": 8, "label_": "elem_arr_2"},
                     {"factor_": 2, "label_": "elem_arr_1"},
                     {"factor_": 8, "label_": "elem_arr_0"},
+                ],
+            },
+        }
+    elif (
+        is_stick_dim
+        and element_arrangement == ElementArrangement.DL16_TO_FP32
+        and opfunc in ("shuffle", "identity")
+    ):
+        # Matches test_stagger_undo_fp32_1core: [out: 4/a1, 8/a8 // 2/a4, 2/a64]
+        # elemArr: 4 levels (innermost to outermost factor: 4, 8, 2, -(-size//64))
+        # alphas: 1, 8, 4, 64
+        num_64_blocks = 1 if is_stick_reduction else -(-size // 64)
+        return {
+            "spatial": 3,
+            "temporal": 0,
+            "elemArr": 4,
+            "padding": padding,
+            "folds": {
+                "dim_prop_func": [
+                    {
+                        "Affine": {
+                            "alpha_": elems_per_stick if is_stick_reduction else size,
+                            "beta_": 0,
+                        }
+                    },
+                    {"Affine": {"alpha_": 0, "beta_": 0}},
+                    {"Affine": {"alpha_": 0, "beta_": 0}},
+                    {"Affine": {"alpha_": 64, "beta_": 0}},
+                    {"Affine": {"alpha_": 4, "beta_": 0}},
+                    {"Affine": {"alpha_": 8, "beta_": 0}},
+                    {"Affine": {"alpha_": 1, "beta_": 0}},
+                ],
+                "dim_prop_attr": [
+                    {"factor_": nsplits, "label_": "core_fold"},
+                    {"factor_": 1, "label_": "corelet_fold"},
+                    {"factor_": 1, "label_": "row_fold"},
+                    {
+                        "factor_": num_64_blocks,
+                        "label_": "elem_arr_3",
+                    },
+                    {"factor_": 2, "label_": "elem_arr_2"},
+                    {"factor_": 8, "label_": "elem_arr_1"},
+                    {"factor_": 4, "label_": "elem_arr_0"},
                 ],
             },
         }
@@ -1162,6 +1206,9 @@ def generate_sdsc(
                 is_stick_dim=(dim in stick_dim_order),
                 is_stick_reduction=(scale == -2),
                 tensor_idx=tensor_idx,
+                element_arrangement=getattr(
+                    tensor, "element_arrangement", ElementArrangement.STANDARD
+                ),
                 opfunc=sdsc_spec.opfunc,
                 padding=_coord_padding(dim_str, is_input),
                 # conv_params (#3510) drives depthwise padding; core_stride

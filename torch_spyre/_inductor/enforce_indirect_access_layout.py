@@ -39,9 +39,9 @@ from torch._inductor.ir import (
     Scatter,
     StorageBox,
 )
-from torch_spyre._C import DataFormats, SpyreTensorLayout
+from torch_spyre._C import DataFormats, ElementArrangement, SpyreTensorLayout
 
-from .constants import ELIDED_COPY_BACK_ATTR
+from .constants import ELIDED_COPY_BACK_ATTR, STAGGERED_EAS
 from .errors import Unsupported
 from .insert_restickify import (
     _create_restickify_node,
@@ -913,9 +913,34 @@ def enforce_indirect_access_layout(graph: GraphLowering) -> None:
             )
             if index_dep is None:
                 continue
-            index_layout = _real_layout(graph.get_buffer(index_name))
+            index_buf = graph.get_buffer(index_name)
+            index_layout = _real_layout(index_buf)
             if not isinstance(index_layout, FixedTiledLayout):
                 continue
+
+            # EA rule: gather/scatter index input must have STANDARD EA.
+            # A staggered index encodes physical-memory positions rather than
+            # logical tensor coordinates, so the gather would read wrong elements.
+            # Insert an identity destagger op to restore STANDARD EA before use.
+            index_ea = getattr(index_layout.device_layout, "element_arrangement", None)
+            if index_ea in STAGGERED_EAS:
+                std_stl = index_layout.device_layout.with_element_arrangement(
+                    ElementArrangement.STANDARD
+                )
+                destagger_layout = _fixed_tiled(index_layout, std_stl)
+                _, destagger_buf = _create_restickify_node(
+                    {"arg_name": index_name, "target_layout": destagger_layout},
+                    index_buf,
+                )
+                logger.info(
+                    "enforce_indirect_access_layout: inserted index destagger "
+                    "%s -> %s (ea=%s) before %s",
+                    index_name,
+                    destagger_buf.get_name(),
+                    index_ea,
+                    op.get_name(),
+                )
+
             if _dim_order_is_compliant(value_stl, stride_idx):
                 continue
 
