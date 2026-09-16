@@ -15,6 +15,8 @@
 import inspect
 import json
 import math
+import os
+import tempfile
 import unittest
 
 import pytest
@@ -442,6 +444,131 @@ def test_kineto_memcpy_and_memset_events_captured():
     assert memset_events, (
         "Expected at least one memset event in the AIUPTI-backed trace"
     )
+
+
+@pytest.mark.requires_spyre_profiler
+def test_sdsc_bundle_dir_prefix_in_kernel_event_args_with_cache(monkeypatch, tmp_path):
+    """Verify the SDSC bundle directory prefix in the kernel event args when caching is enabled.
+
+    The warm-up run compiles the kernel and commits it to tmp_path/<cache_key>/.
+    The profiled run is a cache hit; the runner receives sdsc_bundle_dir_prefix=cache_key[:16].
+    We verify that prefix appears in every kernel event's args.
+    """
+    import torch_spyre.execution.async_compile as ac
+    import torch_spyre.execution.kernel_cache as kc
+
+    # Redirect the cache root to an isolated tmp_path so parallel runs don't collide.
+    monkeypatch.setattr(kc, "get_cache_root_dir", lambda: str(tmp_path))
+    monkeypatch.setattr(ac.spyre_config, "spyre_kernel_cache", True)
+
+    x = torch.randn((10, 10), dtype=torch.float16, device="spyre")
+
+    # Warm-up: compiles and commits the kernel to tmp_path/<cache_key>/
+    _ = torch.add(x, x)
+    torch.spyre.synchronize()
+
+    with profile(
+        activities=[ProfilerActivity.CPU, ProfilerActivity.PrivateUse1]
+    ) as prof:
+        # Profiled run: cache hit — runner gets sdsc_bundle_dir_prefix=cache_key[:16]
+        _ = torch.add(x, x)
+        torch.spyre.synchronize()
+
+    with TemporaryFileName(mode="w+") as fname:
+        prof.export_chrome_trace(fname)
+        with open(fname) as f:
+            trace = json.load(f)
+
+    events = trace["traceEvents"]
+    assert events, (
+        "No trace events captured; profiler produced an empty traceEvents list"
+    )
+
+    # Collect the first 16 chars of every committed cache-key dir name.
+    # Committed dirs are named <cache_key> (64 hex chars); .tmp. dirs are in-progress
+    # and are excluded. The runner receives cache_key[:16] as sdsc_bundle_dir_prefix.
+    sdsc_bundle_dir_prefixes = [
+        entry.name[:16]
+        for entry in os.scandir(str(tmp_path))
+        if entry.is_dir() and ".tmp." not in entry.name and entry.name != "failed"
+    ]
+    kernel_events = [e for e in events if e.get("cat") == "kernel"]
+    assert kernel_events, (
+        "No kernel-category events found in profiler trace; cannot verify sdsc_bundle_dir_prefix"
+    )
+
+    for ke in kernel_events:
+        ke_args = ke.get("args")
+        assert ke_args is not None, f"Kernel event '{ke.get('name')}' has no args field"
+        ke_prefix = ke_args.get("sdsc_bundle_dir_prefix")
+        assert ke_prefix is not None, (
+            f"Kernel event '{ke.get('name')}' args missing 'sdsc_bundle_dir_prefix' key"
+        )
+        assert ke_prefix in sdsc_bundle_dir_prefixes, (
+            f"Kernel event '{ke.get('name')}' has sdsc_bundle_dir_prefix '{ke_prefix}' "
+            f"not found in {sdsc_bundle_dir_prefixes}"
+        )
+
+
+@pytest.mark.requires_spyre_profiler
+def test_sdsc_bundle_dir_prefix_in_kernel_event_args_without_cache(
+    monkeypatch, tmp_path
+):
+    """Verify the SDSC bundle directory prefix in the kernel event args when caching is disabled"""
+    import torch_spyre.execution.async_compile as ac
+
+    sdsc_bundle_dir_path = str(tmp_path)
+
+    def patched_get_output_dir(kernel_name, sdsc_bundle_dir_prefix=None):
+        return tempfile.mkdtemp(
+            dir=sdsc_bundle_dir_path, prefix=f"{sdsc_bundle_dir_prefix}_{kernel_name}_"
+        )
+
+    monkeypatch.setattr(ac.spyre_config, "spyre_kernel_cache", False)
+    monkeypatch.setattr(ac, "get_output_dir", patched_get_output_dir)
+
+    x = torch.randn((10, 10), dtype=torch.float16, device="spyre")
+
+    _ = torch.add(x, x)
+    torch.spyre.synchronize()
+
+    with profile(
+        activities=[ProfilerActivity.CPU, ProfilerActivity.PrivateUse1]
+    ) as prof:
+        _ = torch.add(x, x)
+        torch.spyre.synchronize()
+
+    with TemporaryFileName(mode="w+") as fname:
+        prof.export_chrome_trace(fname)
+        with open(fname) as f:
+            trace = json.load(f)
+
+    events = trace["traceEvents"]
+    assert events, (
+        "No trace events captured; profiler produced an empty traceEvents list"
+    )
+
+    sdsc_bundle_dir_prefixes = [
+        os.path.basename(entry.path).split("_")[0]
+        for entry in os.scandir(sdsc_bundle_dir_path)
+        if entry.is_dir()
+    ]
+    kernel_events = [e for e in events if e.get("cat") == "kernel"]
+    assert kernel_events, (
+        "No kernel-category events found in profiler trace; cannot verify sdsc_bundle_dir_prefix"
+    )
+
+    for ke in kernel_events:
+        ke_args = ke.get("args")
+        assert ke_args is not None, f"Kernel event '{ke.get('name')}' has no args field"
+        ke_prefix = ke_args.get("sdsc_bundle_dir_prefix")
+        assert ke_prefix is not None, (
+            f"Kernel event '{ke.get('name')}' args missing 'sdsc_bundle_dir_prefix' key"
+        )
+        assert ke_prefix in sdsc_bundle_dir_prefixes, (
+            f"Kernel event '{ke.get('name')}' has sdsc_bundle_dir_prefix '{ke_prefix}' "
+            f"not found in {sdsc_bundle_dir_prefixes}"
+        )
 
 
 @pytest.mark.requires_spyre_profiler

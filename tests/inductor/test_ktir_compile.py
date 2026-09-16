@@ -69,12 +69,16 @@ class _PrereqCase(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         self.output_dir = tmp.name
         self.ktir_path = os.path.join(self.output_dir, "k.ktir")
+        self.sdsc_bundle_dir_prefix = None
         with open(self.ktir_path, "w") as fh:
             fh.write("module {}\n")
 
     def compile(self):
         return _compiler()._compile_ktir_with_dbo(
-            "ktir_fused_add_0", self.ktir_path, self.output_dir
+            "ktir_fused_add_0",
+            self.ktir_path,
+            self.output_dir,
+            self.sdsc_bundle_dir_prefix,
         )
 
     def _write_spyrecode(self):
@@ -186,6 +190,17 @@ class TestKtirDboSuccess(_PrereqCase):
         ):
             self.compile()
         self.assertIsNone(run.call_args[1].get("env"))
+
+
+class TestSdscBundleDirPrefix(_PrereqCase):
+    def test_prefix_is_forwarded_to_runner(self):
+        self.sdsc_bundle_dir_prefix = "ab12cd34"
+        self._write_spyrecode()
+
+        with mock.patch(f"{_MODULE}.subprocess.run"):
+            runner = self.compile()
+
+        self.assertEqual(runner.sdsc_bundle_dir_prefix, "ab12cd34")
 
 
 if __name__ == "__main__":
