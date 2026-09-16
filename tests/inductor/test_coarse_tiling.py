@@ -9550,6 +9550,33 @@ class TestCoarseTilingPassEquivalence(unittest.TestCase):
         self.assertEqual(list(got.data.ranges), ref_ranges)
         self.assertEqual(list(got.data.ranges), [Integer(64), Integer(64)])
 
+    def test_plan_only_raises_what_apply_would_but_leaves_the_graph_alone(self):
+        # For a caller that treats a refusal as fatal: it must be able to fail
+        # on an untouched graph, because the decisions are all made before any
+        # IR is rewritten but ``dim_hints`` are stamped on the way there.
+        spec = TileSpec((TileAxis(0, 4),))
+        ops = [self._bare([256], n) for n in ("op0", "op1")]
+        g = _graph(ops)
+        before = [list(op.data.ranges) for op in ops]
+        CoarseTilingPass({"op0": spec, "op1": spec}).plan_only(g)
+        self.assertEqual([list(op.data.ranges) for op in ops], before)
+        for op in ops:
+            self.assertEqual(getattr(op, "dim_hints", []), [])
+        # And it is a dry run of the real thing: applying now still works.
+        CoarseTilingPass({"op0": spec, "op1": spec}).apply_pass(g)
+        self.assertEqual([op.data.ranges[0] for op in ops], [Integer(64)] * 2)
+
+    def test_plan_only_restores_hints_when_it_raises(self):
+        # host_dim 3 does not exist on a 1-D op, so tile_spec_to_dim_hints
+        # refuses -- after the first op in the group was already stamped.
+        ops = [self._bare([256], n) for n in ("op0", "op1")]
+        g = _graph(ops)
+        spec = TileSpec((TileAxis(3, 4),))
+        with self.assertRaises(Unsupported):
+            CoarseTilingPass({"op0": spec, "op1": spec}).plan_only(g)
+        for op in ops:
+            self.assertEqual(getattr(op, "dim_hints", []), [])
+
     def test_two_equal_spec_runs_become_two_groups_with_distinct_hint_ids(self):
         # The fix for the structural-equality collision: op0 and op2 share a
         # spec but op1 breaks the run, so they are two groups. Each mints its

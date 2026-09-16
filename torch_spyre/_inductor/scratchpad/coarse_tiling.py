@@ -42,6 +42,7 @@ from ..pass_utils import op_out_coords
 from ..propagate_hints import DimHint
 from ..wsr.coarse_tile import (
     coarse_tile_post_stickify,
+    plan_coarse_tile_groups,
     reduction_loop_vars,
     validate_coarse_tile_groups,
 )
@@ -208,15 +209,19 @@ class CoarseTilingPass(ScratchpadOptimizationPass):
     def __init__(self, choices: Mapping[str, TileSpec]):
         self._choices = dict(choices)
 
-    def apply_pass(self, graph: GraphLowering) -> None:
+    def _stamped_groups(self, graph: GraphLowering) -> list[tuple]:
+        """Derive the groups and stamp each member's ``dim_hints``.
+
+        Shared by :meth:`apply_pass` and :meth:`plan_only`, which differ only in
+        whether they go on to mutate the IR.
+        """
         groups_specs = derive_tiling_groups(graph, self._choices)
         if not groups_specs:
-            return
+            return []
         # Both bases are derived off the graph *before* this pass stamps any of
         # its own hints/groups, so pre-existing (hint-driven) ids are avoided
         # and the ids this pass mints increase monotonically.
         next_hint_id = _derive_hint_id_base(graph)
-        group_idx_offset = _derive_group_idx_offset(graph)
         groups: list[tuple] = []
         for group_ops, spec in groups_specs:
             hint_ids = list(range(next_hint_id, next_hint_id + len(spec.axes)))
@@ -229,6 +234,38 @@ class CoarseTilingPass(ScratchpadOptimizationPass):
                 op.dim_hints = tile_spec_to_dim_hints(op, spec, hint_ids)
             groups.append((group_ops, levels))
         validate_coarse_tile_groups(groups)
+        return groups
+
+    def plan_only(self, graph: GraphLowering) -> None:
+        """Raise whatever :meth:`apply_pass` would raise, leaving ``graph`` as
+        it was found.
+
+        For a caller that must not be left holding a half-transformed graph: the
+        decisions are all made before any IR is rewritten
+        (``plan_coarse_tile_groups`` is explicitly zero-mutation), but
+        ``dim_hints`` are stamped along the way, so those are restored here. A
+        caller that treats a refusal as fatal can then fail on an untouched
+        graph -- which matters where something downstream (a fallback solver,
+        say) is entitled to assume the graph was never touched.
+        """
+        saved = [(op, getattr(op, "dim_hints", None)) for op in graph.operations]
+        try:
+            groups = self._stamped_groups(graph)
+            if groups:
+                plan_coarse_tile_groups(graph.operations, groups)
+        finally:
+            for op, hints in saved:
+                if hints is None:
+                    if hasattr(op, "dim_hints"):
+                        del op.dim_hints
+                else:
+                    op.dim_hints = hints
+
+    def apply_pass(self, graph: GraphLowering) -> None:
+        group_idx_offset = _derive_group_idx_offset(graph)
+        groups = self._stamped_groups(graph)
+        if not groups:
+            return
         # This pass runs inside scratchpad/LX planning -- after stickification
         # (insert_restickify) and the post-stickify span-overflow WSR pass -- so
         # every op already carries a committed FixedTiledLayout. Use the

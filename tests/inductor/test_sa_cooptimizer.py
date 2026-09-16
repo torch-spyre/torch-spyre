@@ -50,6 +50,7 @@ try:
 except ImportError:
     _HAS_ORTOOLS = False
 
+from torch_spyre._inductor import config as ts_config
 from torch_spyre._inductor.scratchpad import utils
 from torch_spyre._inductor.scratchpad.sa_cooptimizer import (
     _MAX_STEPS,
@@ -1951,38 +1952,34 @@ class TestCoarseTilingIsGatedOnItsApplyStep(unittest.TestCase):
         )
 
     @unittest.skipUnless(_HAS_ORTOOLS, "the other engine here is cpsat")
-    def test_no_engine_is_offered_tilings_while_nothing_applies_them(self):
+    def test_no_engine_is_offered_tilings_while_the_flag_is_off(self):
+        self.assertFalse(ts_config.auto_coarse_tiling)  # the shipped default
         self.assertFalse(self._annealer()._solver_chooses_tilings)
         self.assertFalse(self._cpsat()._solver_chooses_tilings)
 
     @unittest.skipUnless(_HAS_ORTOOLS, "the other engine here is cpsat")
-    def test_once_they_are_applied_only_the_annealer_is_offered_them(self):
+    def test_with_the_flag_on_only_the_annealer_is_offered_them(self):
         """Only a search that generates divisions can carry a ``TileSpec`` --
         the enumerated menu has none to offer -- so an engine that indexes the
         menu could not use a tiling space even if handed one."""
-        from torch_spyre._inductor.scratchpad import allocator as allocator_module
-
-        with patch.object(allocator_module, "TILE_CHOICES_ARE_APPLIED", True):
+        with patch.object(ts_config, "auto_coarse_tiling", True):
             self.assertTrue(self._annealer()._solver_chooses_tilings)
             self.assertFalse(self._cpsat()._solver_chooses_tilings)
 
-    def test_a_tiling_on_a_resident_buffer_is_refused_while_nothing_applies_it(self):
-        """The belt-and-braces guard, for the two conjuncts getting out of step.
+    def test_a_tiling_the_applied_graph_did_not_get_is_refused(self):
+        """The guard that replaces refusing a tiled resident buffer outright.
 
-        A resident buffer's LX layout was computed from its per-core footprint
-        divided by the tile count; if the graph is never tiled it writes the
-        full extent, over whatever the packer put above it or off the end of
-        the region. Silently -- which is why the commit refuses rather than
-        dropping the tiling half. Quantified in
-        ``~/coopt-repro/stage3_unapplied_tiling_overlap.py`` (a 16,128-byte
-        overlap, or a 12,768-byte overrun) and seen at 64x on a real compile.
+        The search placed this buffer at its total size over
+        ``output_partition * output_tile_count``; the apply divides the op's
+        ranges and rebuilds the device layout, which agrees only if that
+        resizing divides the device byte size exactly. If it comes out larger,
+        the LX interval reserved here is too small and the bytes above it belong
+        to whatever was packed next -- stage 3's overlap hazard, in the small.
 
-        Pinned as the behaviour *while the apply step is missing*, which is what
-        the predicate actually tests -- no application is involved here at all.
-        The apply round replaces it with the narrower question of whether the
-        applied tiling is the one the buffer was priced at; LX residency is this
-        feature's payoff channel, so a standing refusal of every tiled resident
-        buffer would refuse the outcomes the search exists to produce.
+        The old predicate asked whether a tiling had been chosen for a *resident*
+        buffer at all. LX residency is this feature's payoff channel, so that
+        question now has the wrong answer: it would refuse exactly the outcomes
+        the search exists to produce.
         """
         from torch_spyre._inductor.errors import Unsupported
         from torch_spyre._inductor.scratchpad import allocator as allocator_module
@@ -1993,9 +1990,7 @@ class TestCoarseTilingIsGatedOnItsApplyStep(unittest.TestCase):
             TileSpec,
         )
 
-        graph = SimpleNamespace(
-            operations=[SimpleNamespace(name="buf0", iteration_space_ownership=None)]
-        )
+        spec = TileSpec((TileAxis(0, 4),))
         buf = CoreDivisionBuffer(
             name="buf0",
             size=1024,
@@ -2003,19 +1998,28 @@ class TestCoarseTilingIsGatedOnItsApplyStep(unittest.TestCase):
             first_use_is_read=False,
             in_place_parents=[],
             residency_reason=None,
-            core_divisions=[CoreDivision(tiling=TileSpec((TileAxis(0, 4),)))],
+            core_divisions=[CoreDivision(tiling=spec)],
             chosen_division=0,
         )
+        buf.address = 0
+        graph = SimpleNamespace(
+            get_buffer=lambda name: SimpleNamespace(
+                layout=SimpleNamespace(device_layout=object())
+            )
+        )
         alloc = self._annealer()
-        with (
-            patch.object(allocator_module, "_split_option_is_legal", return_value=True),
-            patch.object(allocator_module, "commit_iteration_space_ownership"),
+        # Priced at 1024 bytes over 1 core x 4 tiles = 256.
+        with patch.object(
+            allocator_module, "get_device_size_in_bytes", return_value=256
         ):
-            buf.address = None
-            alloc._commit_divisions(graph, [buf])  # spilled: warned, not refused
-            buf.address = 0
+            alloc._check_priced_footprints(graph, [buf], {"buf0": spec})
+        # The graph kept the full extent: the address is spaced for a quarter of
+        # what will be written there.
+        with patch.object(
+            allocator_module, "get_device_size_in_bytes", return_value=1024
+        ):
             with self.assertRaises(Unsupported) as caught:
-                alloc._commit_divisions(graph, [buf])
+                alloc._check_priced_footprints(graph, [buf], {"buf0": spec})
         self.assertIn("buf0", str(caught.exception))
 
 
