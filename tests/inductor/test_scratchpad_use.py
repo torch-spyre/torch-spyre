@@ -26,13 +26,22 @@ import torch
 
 from torch._inductor import config as t_inductor_config
 from torch._inductor.graph import GraphLowering
-from torch._inductor.ir import MutationLayoutSHOULDREMOVE
+from torch._inductor.ir import (
+    ComputedBuffer,
+    FixedLayout,
+    MutationLayoutSHOULDREMOVE,
+    Pointwise,
+    ReinterpretView,
+    StorageBox,
+    TensorBox,
+)
 
 from torch_spyre._inductor.passes import CustomPreSchedulingPasses
 from torch_spyre._inductor import passes
 from torch_spyre._inductor import config as ts_inductor_config
 from torch_spyre._inductor.pass_utils import op_read_writes
 from torch_spyre._inductor.patches import enable_spyre_context
+from torch_spyre._inductor.scratchpad.graph_editor import GraphEditor
 from torch_spyre._inductor.scratchpad.utils import calculate_liveness
 
 try:
@@ -51,6 +60,47 @@ Ts = TypeVarTuple("Ts")
 # where each split list is a sorted tuple of (iteration_space_stride, factor).
 _Splits = tuple[tuple[tuple[int, int], ...], tuple[tuple[int, int], ...]]
 _AllocEntry = tuple[str, int, _Splits]
+
+
+def _graph_editor_test_buffer(name: str) -> ComputedBuffer:
+    device = torch.device("spyre")
+    return ComputedBuffer(
+        name=name,
+        layout=FixedLayout(device, torch.float16, [2, 3]),
+        data=Pointwise(
+            device=device,
+            dtype=torch.float16,
+            inner_fn=lambda _i0, _i1: 0,
+            ranges=[2, 3],
+        ),
+    )
+
+
+def test_change_graph_output_skips_unrelated_view_and_preserves_matching_view():
+    old = _graph_editor_test_buffer("old")
+    new = _graph_editor_test_buffer("new")
+    unrelated = _graph_editor_test_buffer("unrelated")
+    view_layout = FixedLayout(
+        torch.device("spyre"), torch.float16, [3, 2], [1, 3], offset=1
+    )
+    view = ReinterpretView(data=StorageBox(old), layout=view_layout)
+    output = TensorBox(StorageBox(view))
+    unrelated_view = ReinterpretView(
+        data=StorageBox(unrelated), layout=unrelated.layout
+    )
+    unrelated_output = TensorBox(StorageBox(unrelated_view))
+    lowering = SimpleNamespace(graph_outputs=[unrelated_output, output])
+    editor = object.__new__(GraphEditor)
+    editor.lowering = lowering
+
+    editor.change_graph_output(old, new)
+
+    assert lowering.graph_outputs[0] is unrelated_output
+    assert unrelated_view.data.data is unrelated
+    assert lowering.graph_outputs[1] is output
+    assert output.data.data is view
+    assert view.layout is view_layout
+    assert view.data.data is new
 
 
 def test_nested_spyre_context_runs_pre_scheduling_once():
