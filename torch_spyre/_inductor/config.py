@@ -53,6 +53,26 @@ frontend_pool_allocation: bool = os.getenv("FRONTEND_POOL_ALLOCATION", "0").lowe
     "yes",
 )
 
+
+def pool_allocated_by_frontend() -> bool:
+    """Whether the front end, rather than the backend, allocates a kernel's pool.
+
+    A choice on the SDSC path, where both mechanisms exist, and not one on the
+    KTIR path: a KTIR kernel is a bare ``module { func.func }`` with no
+    ``sdscbundle`` wrapper for ``device_mem_allocate`` to live in, so the pool can
+    only arrive as a parameter the wrapper fills. Implied there rather than asked
+    for, so that a pooled intermediate needs no flag to be emittable.
+
+    Read through this function, not off ``frontend_pool_allocation``, by whoever
+    decides to pass a pool or to give the signature a slot for one -- the two must
+    agree, and they agree by both asking here.
+    """
+    # ``install_config_module`` below moves these names onto a wrapper object, so
+    # they are attributes of this module and not globals of this function.
+    cfg = sys.modules[__name__]
+    return bool(cfg.frontend_pool_allocation or cfg.ktir_emitter)
+
+
 # Emit a native conv2d SDSC (opFuncName="conv2d" on the "pt" unit) instead of
 # the im2col+matmul decomposition (conv2d_via_bmm_decomp). Off by default: the
 # decomposition remains the default path and the fallback for cases the direct
