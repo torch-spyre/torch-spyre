@@ -191,12 +191,15 @@ def _read_copy_hoist_decision(
     WhileLoop-splice level, where the per-trip advance is a ``loop_var`` term
     folded into ``dep.index`` rather than an iteration variable: if the index
     mentions this level's ``loop_var``, the read DOES advance whatever the step
-    metadata says. Metadata that disagrees means ``_loop_var_pos_from_reads``
-    could not resolve the advance to a position (e.g. a stick-padded operand,
-    whose per-trip stride is the padded row width while the body reads only the
-    unpadded prefix). Reporting UNRESOLVED_SPLICE_ADVANCE lets the caller
-    decline the compile; ELIGIBLE would hoist the read and pin every trip to
-    tile 0 -- silently wrong output rather than an error.
+    metadata says. Metadata that disagrees means the read's per-trip advance
+    could not be reconciled with what step-metadata planning already computed
+    (e.g. a stick-padded operand, whose per-trip stride is the padded row
+    width while the body reads only the unpadded prefix) -- a shape this
+    classifier itself cannot resolve, not (as of the tile-dim-marker
+    consumption design) a case the marker map is ever consulted for.
+    Reporting UNRESOLVED_SPLICE_ADVANCE lets the caller decline the compile;
+    ELIGIBLE would hoist the read and pin every trip to tile 0 -- silently
+    wrong output rather than an error.
     """
     if source_info.kind is _ReadCopySourceKind.LOOP_PRODUCED:
         if source_info.loop_group_id != consumer_info.loop_group_id:
@@ -2056,124 +2059,6 @@ def _splice_write_targets_full_buffer(op: ComputedBuffer, mut_target: Buffer) ->
     return bool(diff.is_positive)
 
 
-def _loop_var_pos_from_reads(
-    op: ComputedBuffer, sym: sympy.Symbol
-) -> "tuple[int | None, bool]":
-    """Resolve a WhileLoop-splice loop_var's tiled-dim position via the reads.
-
-    ``_loop_var_to_ranges_pos`` can only find ``sym`` when it literally
-    appears in the op's own OUTPUT coordinates. That holds for every
-    ordinary ``spyre_hint()`` scope (the op is the full, untiled write and
-    the hint tiles one of its own output dims) and for a WhileLoop-splice
-    op whose write really does advance per iteration (e.g. the map-mode
-    carry's in-place tile write, ``6*d0 + d1 + 12*u0``).
-
-    It does NOT hold for a spliced body op whose write is a per-iteration
-    SCRATCH buffer -- the shape ``for_each_tile``'s body naturally produces
-    for anything but the final store. ``split_m_fn``'s matmul is exactly
-    that: it writes ``while_loop_body_graph_0_0_buf5`` at ``6*d0 + d1``
-    (same tile-local address every trip -- the scratch is reused in place)
-    while READING X's stacked leaf at ``12*d0 + d2 + 24*u0`` (a genuinely
-    advancing window). With no output occurrence of ``u0``, the op lands
-    with no tiled dim at all, ``tiled_dims_per_read`` comes back empty, and
-    ``_read_copy_hoist_decision`` then wrongly classifies the advancing X
-    read as ELIGIBLE/loop-invariant -- hoisting it out of the loop so every
-    iteration recomputes tile 0.
-
-    Recover the position from the reads instead: a spliced body op's
-    loop_var always advances by exactly one whole extent of some dep var
-    ``v`` (that is what "one tile per iteration" means), i.e.
-
-        dep.index.coeff(sym) == dep.index.coeff(v) * dep.ranges[v]
-
-    ``v`` is then mapped back to a position through the op's own output
-    coordinates (an output dim, as for ``split_m_fn``'s M) or, when ``v`` is
-    one of the op's reduction vars, through ``reduction_loop_vars`` (a
-    reduction dim, as for ``split_k_fn``'s K -- its matmul reads X at
-    ``12*d0 + d1 + 3*u0`` where ``d1`` is the K reduction var of extent 3).
-    Both channels are the same ones ``_loop_var_to_ranges_pos`` /
-    ``_loop_var_to_reduction_ranges_pos`` already use for the direct lookup.
-
-    Returns ``(pos, is_reduction)``, or ``(None, False)`` when no read
-    exhibits that relationship -- so a genuinely loop-invariant op still
-    records no tiled dim, the correct outcome (see
-    ``_synthesize_dim_hints_for_group``'s docstring).
-
-    Ambiguity: ``sym_coeff == var_coeff * rng`` is a NUMERIC coincidence
-    whenever ``var``'s own extent happens to equal the loop's real
-    per-trip stride divided by ``var_coeff`` -- which is exactly what
-    happens when a matmul's inner reduction dim's size coincides with the
-    splice's tile size (e.g. flash-attention's online-softmax body,
-    where D == SOFTMAX_TILE_SIZE: ``p @ v_tile``'s D-contraction var
-    satisfies the equation against V's stacked-leaf read purely because
-    ``D * 1 == tile_size``, even though ``sym`` (the splice loop var)
-    doesn't advance D at all -- it advances the leaf's own outer/stacking
-    dim, which has no representation in this op's ``dep.ranges``).
-
-    An output-channel match (``var`` is one of the op's own output dims)
-    is trustworthy on a single read: ``_loop_var_to_ranges_pos`` checks it
-    against the op's real output coordinates, an independent structural
-    fact, not just this one dep's coefficients. A reduction-channel match
-    (``var`` is one of the op's reduction vars) has no such independent
-    check available -- ``reduction_loop_vars`` only tells us ``var`` is
-    *a* reduction var of this op, not that ``sym`` is what advances it.
-
-    Require CORROBORATION when the same read has more than one candidate
-    var satisfying the equation -- that is precisely the ambiguous case
-    above, where a genuine advancing var and a coincidentally-matching one
-    could both appear on the same dep and cannot be told apart locally.
-    There, only trust a reduction-channel match when at least two of the
-    op's reads independently agree on the same ``(var, sym)`` relationship
-    (as split_k_fn's genuine case does -- both matmul operands carry
-    ``u0`` and both agree on the K reduction var).
-
-    But when a read has EXACTLY ONE candidate var, there is no competing
-    interpretation of that read to disambiguate against, so a reduction-
-    channel match there is trustworthy on its own -- the same footing as
-    an output-channel match. This matters for an accumulator body's
-    second matmul (e.g. ``acc + p @ v_tile``): only the carry-in operand
-    (``v_tile``'s stacked-leaf read) ever carries ``sym`` at all -- the
-    other operand (``p``) is always the previous stage's tile-local
-    scratch and never mentions ``sym`` -- so a second corroborating read
-    can never exist, even though the single read's match is unambiguous.
-    """
-    rw = op.get_read_writes()
-    out_coords = op_out_coords(op)
-    red_vars = reduction_loop_vars(op) if isinstance(op.data, Reduction) else []
-    reduction_matches: dict[sympy.Symbol, int] = {}
-    for dep in rw.reads:
-        if not isinstance(dep, MemoryDep):
-            continue
-        index = dep.index
-        if not isinstance(index, sympy.Basic) or sym not in index.free_symbols:
-            continue
-        sym_coeff = index.coeff(sym)
-        if sym_coeff == 0:
-            continue
-        read_reduction_candidates: list[sympy.Symbol] = []
-        for var, rng in dep.ranges.items():
-            var_coeff = index.coeff(var)
-            if var_coeff == 0:
-                continue
-            if sympy.simplify(sym_coeff - var_coeff * rng) != 0:
-                continue
-            pos = _loop_var_to_ranges_pos(out_coords, var)
-            if pos is not None:
-                return pos, False
-            if var in red_vars:
-                read_reduction_candidates.append(var)
-        if len(read_reduction_candidates) == 1:
-            var = read_reduction_candidates[0]
-            reduction_matches[var] = reduction_matches.get(var, 0) + 2
-        else:
-            for var in read_reduction_candidates:
-                reduction_matches[var] = reduction_matches.get(var, 0) + 1
-    for var, count in reduction_matches.items():
-        if count >= 2:
-            return red_vars.index(var), True
-    return None, False
-
-
 def _hint_ranges_pos(
     op: ComputedBuffer, hint: DimHint, out_coords: list
 ) -> "tuple[int | None, bool]":
@@ -2193,7 +2078,9 @@ def _hint_ranges_pos(
     ``split_k_fn``'s matmul: reduction dim K -- same synthesized hint, same
     loop_var, opposite answers).
 
-    The read-side fallback (``_loop_var_pos_from_reads``) fires ONLY for a
+    The read-side resolution (``for_each_tile_lowering.lookup_marker_dim``,
+    a marker-map lookup -- NOT a heuristic; it replaced the deleted
+    ``_loop_var_pos_from_reads`` numeric-coincidence guess) fires ONLY for a
     WhileLoop-splice hint, identified exactly as everywhere else in this
     file by ``loop_var_range is not None`` (see propagate_hints.py's
     DimHint docstring). An ordinary ``spyre_hint()`` scope keeps the
@@ -2218,7 +2105,49 @@ def _hint_ranges_pos(
         rpos = _loop_var_to_reduction_ranges_pos(op, hint.loop_var)
         if rpos is not None:
             return rpos, True
-    return _loop_var_pos_from_reads(op, hint.loop_var)
+    from torch_spyre._inductor.wsr.for_each_tile_lowering import (
+        lookup_marker_dim,
+    )
+
+    resolved = lookup_marker_dim(op, hint.loop_var)
+    if resolved is not None:
+        return resolved
+
+    # No read resolved through the marker map. That is the CORRECT,
+    # expected outcome for an op that is genuinely loop-invariant at this
+    # level -- e.g. a scalar bookkeeping op (iteration-counter update,
+    # etc.) whose reads/writes never mention hint.loop_var at all, the
+    # same "no tiled dim recorded" outcome the deleted
+    # _loop_var_pos_from_reads produced for such ops (see its own
+    # docstring and _synthesize_dim_hints_for_group's, which both treat
+    # "no dim resolves" as legitimate, not exceptional). Only raise when
+    # some read's index actually mentions loop_var -- that is the one case
+    # a for_each_tile tile read is expected to be marker-tagged, so an
+    # unresolved marker lookup there is a genuine gap (an unrecognized
+    # shape, or a marker consumed without being recorded), not a
+    # loop-invariant op silently passing through.
+    rw = op.get_read_writes()
+    mentions_loop_var = any(
+        isinstance(dep, MemoryDep)
+        and isinstance(dep.index, sympy.Basic)
+        and hint.loop_var in dep.index.free_symbols
+        for dep in rw.reads
+    )
+    if mentions_loop_var:
+        raise AssertionError(
+            f"WhileLoop-splice hint's loop_var {hint.loop_var} appears in "
+            f"op {op.get_name()!r}'s own read index, but has no "
+            "tile_dim_marker entry for it, and no output/reduction-"
+            "coordinate resolution either. Every for_each_tile tile is "
+            "tagged by tile_dim_marker at construction time "
+            "(for_each_tile.py's _tile()) -- an untagged read here means "
+            "either a for_each_tile shape this pass does not yet "
+            "recognize, or a marker that was consumed (erased) without "
+            "being recorded. Silently guessing the tiled dimension risks "
+            "the exact wrong-answer bug this mechanism replaces; raising "
+            "here surfaces the gap instead."
+        )
+    return None, False
 
 
 def reduction_loop_vars(op: ComputedBuffer) -> list[sympy.Symbol]:

@@ -29,6 +29,16 @@ from .scratchpad.lx_context_switching import mark_lx_safe
 aten = torch.ops.aten
 
 
+@torch.library.custom_op("spyre::tile_dim_marker", mutates_args=())
+def tile_dim_marker(x: torch.Tensor, dim: int) -> torch.Tensor:
+    return x.clone()
+
+
+@tile_dim_marker.register_fake
+def _(x: torch.Tensor, dim: int) -> torch.Tensor:
+    return torch.empty_like(x)
+
+
 @torch.library.custom_op("spyre::softplus", mutates_args=(), device_types="spyre")
 def softplus(
     input: torch.Tensor, beta: float = 1.0, threshold: float = 20.0

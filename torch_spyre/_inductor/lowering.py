@@ -1456,6 +1456,62 @@ def lower_compact(x):
     return pw
 
 
+@register_spyre_lowering(
+    torch.ops.spyre.tile_dim_marker,
+    type_promotion_kind=None,
+    # tile_dim_marker is called unconditionally from for_each_tile._tile(),
+    # including on device-agnostic (e.g. CPU-only) compiles that never enter
+    # enable_spyre_lowerings(). Registering it only into spyre_lowerings (the
+    # default) leaves it absent from torch._inductor.lowering.lowerings for
+    # those compiles, so Inductor's implicit_fallbacks machinery permanently
+    # installs a generic fallback_handler for it in the *global* lowerings
+    # dict. A later Spyre-context compile's enable_spyre_lowerings() then
+    # mistakes that stray fallback_handler for a legitimate pre-existing
+    # in-tree lowering, saves it, and restores it on exit -- permanently
+    # shadowing this lowering for the rest of the process. This lowering's
+    # body is device-agnostic (just realizes a ComputedBuffer), so register
+    # it directly into the real global dict at import time instead, closing
+    # the gap that lets implicit_fallbacks claim the op in the first place.
+    lowering_dict=lowering.lowerings,
+)
+def lower_tile_dim_marker(x, dim):
+    # A bare `return x` elides before any ir.Operation is ever constructed
+    # (register_lowering's dispatch never builds a new op for an identity
+    # return) -- confirmed empirically against a live nested for_each_tile
+    # compile. Force a real, distinct ComputedBuffer into existence instead,
+    # so _consume_tile_dim_markers (for_each_tile_lowering.py) has something
+    # to find, tag, and erase.
+    #
+    # Unlike lower_restickify (whose callers only ever pass whole, unsliced
+    # base tensors), _tile() calls this op on genuinely sliced/moved-dim
+    # views. Building the loader from x's own unwrapped StorageBox (as
+    # lower_restickify does) silently substitutes the base's full shape and
+    # untranslated indices for the view's -- confirmed empirically: on a
+    # narrowed tile, that reads back the whole base tensor at the wrong
+    # shape and wrong offset instead of just the tile's own values. Read
+    # through x directly instead, so the view's own indexing/shape apply.
+    x.realize()
+    loader = x.make_loader()
+
+    def inner_fn(index):
+        return loader(index)
+
+    pw = Pointwise.create(
+        device=x.get_device(),
+        dtype=x.get_dtype(),
+        inner_fn=inner_fn,
+        ranges=x.get_size(),
+        origin_node=V.get_current_node(),
+        traceback=x.get_traceback(),
+    )
+    pw.realize()
+    # Stash dim as a plain attribute on the realized ComputedBuffer so
+    # _consume_tile_dim_markers can read it back without reverse-engineering
+    # it from constant_args/op_overload plumbing.
+    pw.data.data.tile_marker_dim = dim
+    return pw
+
+
 @register_spyre_lowering(torch.ops.aten.full.default, type_promotion_kind=None)
 def lower_full(size, fill_value, dtype=None, layout=None, device=None, pin_memory=None):
     assert layout in (torch.strided, None), f"doesn't support layout={layout}"

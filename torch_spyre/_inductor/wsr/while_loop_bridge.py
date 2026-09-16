@@ -174,14 +174,24 @@ def fold_stacked_carry_layout(node: Any, trip_count: Any) -> bool:
     # The stacked axis must be the leading one, with exactly the trip count
     # as its extent, and the fold must be a pure reshape: axis 0's stride has
     # to be exactly axis 1's extent times axis 1's stride, or the merged axis
-    # cannot be described by a single stride.
+    # cannot be described by a single stride. Skip that check when axis 1
+    # has extent 1: a size-1 axis never advances, so its stride is moot for
+    # addressing purposes and Spyre's own device-layout assignment leaves it
+    # as a degenerate 0 rather than the "natural" contiguous value -- e.g. a
+    # tile_size=1 inner for_each_tile's stacking carry folds [trip, 1, *rest]
+    # with stride=[row_stride, 0, ...], which is still a pure reshape (the
+    # merged axis's extent is trip_count * 1 == trip_count) even though
+    # stride[0] != size[1] * stride[1] literally (row_stride != 1 * 0).
     if sympy.simplify(sympy.sympify(size[0]) - sympy.sympify(trip_count)) != 0:
         return False
-    if sympy.simplify(stride[0] - size[1] * stride[1]) != 0:
+    if size[1] != 1 and sympy.simplify(stride[0] - size[1] * stride[1]) != 0:
         return False
 
     new_size = [size[0] * size[1], *size[2:]]
-    new_stride = [stride[1], *stride[2:]]
+    # When axis 1 has extent 1, stride[1] is the degenerate placeholder (see
+    # above) rather than the real per-step stride -- the merged axis must
+    # step by stride[0] (how far one trip moves) instead.
+    new_stride = [stride[0] if size[1] == 1 else stride[1], *stride[2:]]
     node.layout = FixedLayout(
         layout.device, layout.dtype, new_size, new_stride, layout.offset
     )
@@ -285,6 +295,23 @@ def _substitute_direct_input_refs(
     every consumer, so the wrapped StorageBox's identity does not need to
     change, only what it points at.
 
+    A fourth read shape exists for a NESTED for_each_tile: a nested
+    `ir.WhileLoop` op (the inner loop, still an ordinary entry of `body_ops`
+    until it is itself spliced on a later fixed-point pass) holds its own
+    reads as direct object references on `.carried_inputs`/
+    `.additional_inputs` -- separate list attributes from `.inputs`
+    (`WhileLoop.__init__` assigns `self.carried_inputs = carried_inputs`
+    directly, while `.inputs` is a distinct, repacked tensor-only list built
+    by `ExternKernel.__init__` via `_split_by_sym_type`). Patching `.inputs`
+    alone leaves `.carried_inputs`/`.additional_inputs` pointing at this
+    (outer) body's own placeholder objects, which are never registered in
+    the outer graph's buffer namespace once this splice completes -- so
+    `carry_bindings_for`/`splice_while_loop`, run against the inner loop on
+    the next fixed-point pass, would resolve a stale placeholder name and
+    crash downstream (`Failed to find buffer matching name ...`) the same
+    way Bug A/Bug B did for the shapes above. Patch both lists in place,
+    same substitution rule as `.inputs`.
+
     Whole-object substitution (rebinding a list slot or `.layout.target`
     directly to the resolved replacement) is only correct when the node
     being replaced is a bare identity wrapper for the placeholder -- i.e. it
@@ -364,6 +391,16 @@ def _substitute_direct_input_refs(
         if inputs:
             for i, inp in enumerate(inputs):
                 substitute(inp, lambda r, i=i: inputs.__setitem__(i, r))
+
+        if isinstance(op, ir.WhileLoop):
+            for attr in ("carried_inputs", "additional_inputs"):
+                nested_inputs = getattr(op, attr, None)
+                if not nested_inputs:
+                    continue
+                for i, inp in enumerate(nested_inputs):
+                    substitute(
+                        inp, lambda r, lst=nested_inputs, i=i: lst.__setitem__(i, r)
+                    )
 
         layout = getattr(op, "layout", None)
         if not isinstance(layout, ir.MutationLayoutSHOULDREMOVE):

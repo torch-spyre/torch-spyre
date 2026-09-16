@@ -233,8 +233,10 @@ def _xs_leaf(operand: torch.Tensor, spec: TileSpec) -> torch.Tensor:
 def _tile(operand: torch.Tensor, spec: TileSpec, sliced: torch.Tensor) -> torch.Tensor:
     """Turn scan's step slice of the xs leaf back into the operand's own layout."""
     if spec.kind is Kind.GATHER:
-        return operand.index_select(spec.dim, sliced.reshape(1))
-    return _movedim(sliced, 0, spec.dim)
+        tile = operand.index_select(spec.dim, sliced.reshape(1))
+    else:
+        tile = _movedim(sliced, 0, spec.dim)
+    return torch.ops.spyre.tile_dim_marker(tile, spec.dim)
 
 
 def _step_counter(like: torch.Tensor) -> torch.Tensor:
