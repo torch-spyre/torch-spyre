@@ -668,7 +668,7 @@ class RegionRecolorTest(TestCase):
         # After a recolor, every op the flood reached carries the flooded config
         # and the placement the packer holds for it reflects that division's
         # footprint
-        # -- i.e. the resize ripple in ``_apply_recolor`` reached everything
+        # -- i.e. the resize ripple in ``_apply_assignment`` reached everything
         # ``_flood_region`` assigned, not just the anchor.
         resized = 0
         for case, gi, buffers in _all_cases():
@@ -677,7 +677,7 @@ class RegionRecolorTest(TestCase):
             for anchor in solver._anchor_candidates:
                 config = solver._sources[anchor].splitting[0]
                 assignment = solver._flood_region(anchor, config)
-                solver._apply_recolor(assignment)
+                solver._apply_assignment(assignment)
                 addresses = solver.packer.addresses
                 tag = f"{case}[{gi}] anchor={anchor}"
                 for op, flooded in assignment.items():
@@ -1836,3 +1836,110 @@ class TestCoarseTilingIsGatedOnItsApplyStep(TestCase):
                 self._allocator(SaCoOptimizingSolver)._solver_chooses_tilings
             )
             self.assertFalse(self._allocator(mock.MagicMock())._solver_chooses_tilings)
+
+
+def _run_buffer(name, position, space=None):
+    """A two-axis buffer that sits at a stated operation position, so it can be
+    part of a coarse-tiling run."""
+    buf = _cdbuf(name, [], {}, divisions=_TWO_AXIS_MENU)
+    buf.uses = [position, position + 1]
+    buf.op_position = position
+    buf.division_space = space
+    return buf
+
+
+def _run_solver(names, untiled=()):
+    """A primed solver over ``names`` at consecutive operation positions, each
+    with a tiling space unless named in ``untiled``. A ``None`` name leaves its
+    position to an operation with no buffer."""
+    bufs = [
+        _run_buffer(
+            name,
+            position,
+            _two_axis_space(tiling=None if name in untiled else _tiling_space()),
+        )
+        for position, name in enumerate(names)
+        if name is not None
+    ]
+    return _primed(bufs, 1 << 30)
+
+
+def _tiled(solver, idx, tiling=_TILE_4):
+    """Buffer ``idx``'s current splits under ``tiling``."""
+    return solver._sources[idx].retiled(solver.chosen[idx], tiling)
+
+
+class ContiguousTilingRunTest(TestCase):
+    """A tiling group is a contiguous run of the operation list, because that is
+    what ``derive_tiling_groups`` forms and what ``_validate_contiguous``
+    demands. Both structural moves write their tilings as contiguous stretches
+    of runs."""
+
+    def test_a_run_is_the_maximal_stretch_agreeing_on_the_tiling(self):
+        solver = _run_solver("ABC")
+        self.assertEqual(solver._run_bounds(0), (0, 2))  # all untiled: one run
+        solver.chosen[1] = _tiled(solver, 1)
+        self.assertEqual(solver._run_bounds(1), (1, 1))
+        self.assertEqual(solver._run_bounds(0), (0, 0))
+        self.assertEqual(solver._run_bounds(2), (2, 2))
+        solver.chosen[0] = _tiled(solver, 0)
+        self.assertEqual(solver._run_bounds(0), (0, 1))
+
+    def test_an_operation_with_no_buffer_breaks_a_run(self):
+        # Position 1 belongs to an operation the solver does not own -- nothing
+        # can carry a tiling to it, so it is untiled and the run stops there.
+        solver = _run_solver(["A", None, "C"])
+        solver.chosen[0] = _tiled(solver, 0)
+        solver.chosen[1] = _tiled(solver, 1)
+        self.assertEqual(solver._run_bounds(0), (0, 0))
+        self.assertEqual(solver._run_bounds(2), (2, 2))
+
+    def test_the_trim_strips_a_tiling_the_anchors_run_does_not_reach(self):
+        solver = _run_solver("ABC")
+        # What a flood over the residency relation can produce: A and C tiled,
+        # B (between them) left alone: two groups at apply time.
+        assignment = {0: _tiled(solver, 0), 2: _tiled(solver, 2)}
+        trimmed = solver._trim_tilings_to_anchor_run(0, assignment)
+        self.assertEqual(trimmed[0].tiling, _TILE_4)
+        self.assertTrue(trimmed[2].tiling.is_untiled)
+        # The splits are the flood's business and are left exactly as they were.
+        self.assertEqual(trimmed[2].splits, assignment[2].splits)
+
+    def test_a_buffer_with_no_operation_position_may_hold_no_tiling(self):
+        # An input clone, or any buffer built without operation order: it is in
+        # no run, so nothing can establish that a group containing it is
+        # contiguous, and declining is the safe direction.
+        buf = _cdbuf("A", [], {}, divisions=_TWO_AXIS_MENU)
+        buf.division_space = _two_axis_space(tiling=_tiling_space())
+        solver = _primed([buf], 1 << 30)
+        self.assertIsNone(solver._position_of[0])
+        assignment = {0: _tiled(solver, 0)}
+        self.assertTrue(
+            solver._trim_tilings_to_anchor_run(0, assignment)[0].tiling.is_untiled
+        )
+
+    def test_a_boundary_flip_respecs_one_whole_side_of_the_run(self):
+        solver = _run_solver("ABCD")
+        solver._retile_boundary(1, _tiled(solver, 1))
+        tiled = [i for i in range(4) if not solver.chosen[i].tiling.is_untiled]
+        # Whichever side was drawn, it is a contiguous stretch containing the
+        # drawn op and reaching one end of its run -- A..H or H..Z.
+        self.assertIn(tiled, ([0, 1], [1, 2, 3]))
+
+    def test_a_boundary_flip_truncates_at_an_op_that_refuses_the_tiling(self):
+        # C has no tiling space, so it can take no tiling at all. The walk stops
+        # there rather than skipping it (which would break contiguity) or
+        # abandoning the move (which would make long runs immovable).
+        solver = _run_solver("ABCD", untiled="C")
+        self.assertIsNone(_tiled(solver, 2))
+        with mock.patch.object(solver._rng, "random", return_value=0.0):  # forward
+            solver._retile_boundary(0, _tiled(solver, 0))
+        tiled = [i for i in range(4) if not solver.chosen[i].tiling.is_untiled]
+        self.assertEqual(tiled, [0, 1])
+
+    def test_a_search_with_no_tiling_space_never_takes_the_boundary_arm(self):
+        solver = _run_solver("ABCD", untiled="ABCD")
+        with mock.patch.object(solver, "_retile_boundary") as boundary:
+            for _ in range(200):
+                solver._execute_move("flip")
+        boundary.assert_not_called()

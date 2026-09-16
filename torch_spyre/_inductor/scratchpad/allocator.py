@@ -3745,6 +3745,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         mem_usage = mem_usage_by_buf(graph)
         in_place = {} if in_place is None else in_place
         op_by_name = {op.name: op for op in graph.operations}
+        position_by_name = {op.name: index for index, op in enumerate(graph.operations)}
         graph_output_names = set(graph.get_output_names())
 
         prep_cache: dict = {}
@@ -3970,6 +3971,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                 residency_reason=residency_reason,
                 lifetime_start_override=lifetime_start_overrides.get(output_name),
                 lifetime_end_override=lifetime_end_overrides.get(output_name),
+                op_position=position_by_name.get(output_name),
                 boundary=BufferType.Output
                 if output_name in graph_output_names
                 else BufferType.Intermediate,
