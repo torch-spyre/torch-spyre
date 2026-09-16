@@ -393,6 +393,39 @@ def _prove_matmul_direct_read(
     advance_bounds = _loop_advance_bound(
         direct_op, source_dep, resolved_loop_info, direct_source_idx
     )
+    if advance_bounds is None and (
+        record.direct_tiled_dims_per_level is not None
+        or record.direct_squeezed_advance_per_level is not None
+    ):
+        # Rebasing a spliced-loop source removes the induction variable from
+        # its load index.  Usually the recorded pre-rebase metadata still
+        # describes the step.  A size-one tiled dimension can already have
+        # been squeezed out, however, leaving that metadata unable to recover
+        # the source stride (for example, one expert per loop trip).  The
+        # staging copy was built before that information was lost and carries
+        # the authoritative equivalent advance; use it as a proof/codegen
+        # fallback rather than declining an otherwise safe direct read.
+        tiled_dims[direct_source_idx] = [
+            list(level) for level in copy_loop_info.tiled_dims_per_read[copy_source_idx]
+        ]
+        copy_squeezed = (
+            copy_loop_info.squeezed_advance_per_read[copy_source_idx]
+            if copy_source_idx < len(copy_loop_info.squeezed_advance_per_read)
+            else []
+        )
+        squeezed[direct_source_idx] = [list(level) for level in copy_squeezed]
+        fallback_loop_info = dataclasses.replace(
+            current_loop_info,
+            tiled_dims_per_read=tiled_dims,
+            squeezed_advance_per_read=squeezed,
+        )
+        fallback_bounds = _loop_advance_bound(
+            direct_op, source_dep, fallback_loop_info, direct_source_idx
+        )
+        if fallback_bounds is not None:
+            resolved_loop_info = fallback_loop_info
+            direct_op.loop_info = resolved_loop_info  # type: ignore[attr-defined]
+            advance_bounds = fallback_bounds
     source_numel = _static_int(sympy.prod(source_layout.size))
     logger.debug(
         "direct-read bounds for %s <- %s: source_dep=%s tiled=%s "

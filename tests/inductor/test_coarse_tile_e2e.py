@@ -6209,10 +6209,7 @@ class TestCoarseTileMoEBroadcastMatmulE2E(InductorTestCase):
             for is_input, size, advance in tensor_args
             if is_input and size == [1, T, H]
         ]
-        # The same input can occur in more than one emitted OpSpec.  Every
-        # occurrence must remain fixed while the expert-weight input advances.
-        self.assertTrue(activation_reads)
-        self.assertTrue(all(advance is None for advance in activation_reads))
+        self.assertEqual(activation_reads, [None])
 
         weight_reads = [
             advance
