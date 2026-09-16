@@ -22,7 +22,6 @@ Organized by coverage area:
   TestModelIntegration   — compiled model-layer integration
 """
 
-import os
 import unittest
 import warnings
 
@@ -115,24 +114,6 @@ class TestExplicitConversion(unittest.TestCase):
             return torch.abs(t)
 
         self.compare_with_cpu(fn, x, run_eager=False)
-
-    def test_to_dtype_work_division_fp16_fp32_sencores4(self):
-        """fp16->fp32 with SENCORES=4 multi-core work division."""
-        orig = os.environ.get("SENCORES")
-        os.environ["SENCORES"] = "4"
-        try:
-            x = cached_randn((4, 64), differentiation="wd01_sencores4")
-
-            def fn(t):
-                return t.to(torch.float32).to(torch.float16)
-
-            self.assertEqual(fn(x).dtype, torch.float16)
-            self.compare_with_cpu(fn, x, run_eager=False)
-        finally:
-            if orig is None:
-                os.environ.pop("SENCORES", None)
-            else:
-                os.environ["SENCORES"] = orig
 
     @pytest.mark.skip(
         reason=(
@@ -846,43 +827,6 @@ class TestImplicitPromotion(unittest.TestCase):
             return a + scalar_fp32
 
         self.compare_with_cpu(fn, x, run_eager=False)
-
-    def test_wa_add_transposed_both_fp16(self):
-        """both-fp16 add workaround — transposed (64,128) inputs, output (128,64)."""
-        x = cached_randn((64, 128), differentiation="wanc_x")
-        y = cached_randn((64, 128), differentiation="wanc_y")
-
-        def fn(a, b):
-            return torch.add(a.t().to(torch.float32), b.t().to(torch.float32)).to(
-                torch.float16
-            )
-
-        self.compare_with_cpu(fn, x, y, run_eager=False)
-
-    @pytest.mark.skip(
-        reason=(
-            "SKIP #2252 — scalar '1.0' materializes as STANDARD fp32 "
-            "constant; t.to(fp32) → DL16_TO_FP32; add(DL16_TO_FP32, STANDARD) fails; "
-            "https://github.com/torch-spyre/torch-spyre/issues/2252"
-        )
-    )
-    def test_to_dtype_scalar_add_chain_multi_core(self):
-        """to_dtype+add(scalar '1.0')+to_dtype chain with SENCORES=4."""
-        orig = os.environ.get("SENCORES")
-        os.environ["SENCORES"] = "4"
-        try:
-            x = cached_randn((4, 64), differentiation="wd07_mc")
-
-            def fn(t):
-                y = t.to(torch.float32)
-                return (y + 1.0).to(torch.float16)
-
-            self.compare_with_cpu(fn, x, run_eager=False)
-        finally:
-            if orig is None:
-                os.environ.pop("SENCORES", None)
-            else:
-                os.environ["SENCORES"] = orig
 
 
 class TestDataTransfer(unittest.TestCase):

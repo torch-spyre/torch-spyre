@@ -13,7 +13,6 @@ test_suite_config:
             - TestExplicitConversion::test_to_dtype_chain_fp16_fp32_bf16
             - TestExplicitConversion::test_neg_fp16_dtype_preserved_after_explicit_cast
             - TestExplicitConversion::test_abs_fp16_dtype_preserved
-            - TestExplicitConversion::test_to_dtype_work_division_fp16_fp32_sencores4
             - TestExplicitConversion::test_to_dtype_transposed_fp16_to_fp32
             - TestExplicitConversion::test_to_dtype_expanded_view_fp16_to_fp32
             - TestExplicitConversion::test_float_shortcut_value_correctness

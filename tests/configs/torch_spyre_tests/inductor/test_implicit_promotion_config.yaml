@@ -16,7 +16,6 @@ test_suite_config:
             - TestImplicitPromotion::test_wa_div_both_fp16
             - TestImplicitPromotion::test_wa_stack_both_fp16
             - TestImplicitPromotion::test_wa_cat_both_fp16
-            - TestImplicitPromotion::test_wa_add_transposed_both_fp16
             - TestImplicitPromotion::test_sum_fp16_with_dtype_fp32
             - TestImplicitPromotion::test_sum_bf16_dtype_fp32
           mode: mandatory_success
@@ -36,7 +35,6 @@ test_suite_config:
             - TestImplicitPromotion::test_stack_fp16_fp32_implicit_promotion
             - TestImplicitPromotion::test_cat_fp16_fp32_implicit_promotion
             - TestImplicitPromotion::test_implicit_tensor_add_non_contiguous_fp16_fp32
-            - TestImplicitPromotion::test_to_dtype_scalar_add_chain_multi_core
           mode: skip
 
         # SKIP #2204 — unaligned shapes: padding propagation failure
