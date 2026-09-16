@@ -64,6 +64,9 @@ from torch_spyre._inductor.work_division import (
     _view_for_div,
 )
 from torch_spyre._inductor.errors import Unsupported
+from torch_spyre._inductor.work_division_constraints import (
+    JOINT_TILING_AND_DIVISION_ATTR,
+)
 from torch_spyre._inductor.scratchpad.plan_solver import (
     ceil_div,
     cost_expr_record,
@@ -3687,6 +3690,9 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         from torch_spyre._inductor.scratchpad.coarse_tiling import CoarseTilingPass
 
         CoarseTilingPass(choices).apply_pass(graph)
+        # See ``JOINT_TILING_AND_DIVISION_ATTR``.
+        for name in tiled:
+            setattr(op_by_name[name], JOINT_TILING_AND_DIVISION_ATTR, True)
         logger.info(
             "applied a coarse tiling to %d op(s): %s",
             len(choices),
@@ -3723,6 +3729,9 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                     f"{buffer.name}: tiled as {tiling.label} but carries no device "
                     "layout to check the applied footprint against"
                 )
+            # ``_apply_chosen_tilings`` skips a buffer with no chosen division,
+            # so anything in ``tiled`` has one.
+            assert buffer.chosen_division is not None
             partition = buffer.core_divisions[buffer.chosen_division].output_partition
             applied = ceil_div(get_device_size_in_bytes(device_layout), partition)
             priced = ceil_div(buffer.size, partition * tiling.output_tile_count)
