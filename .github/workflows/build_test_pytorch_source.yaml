@@ -277,7 +277,7 @@ jobs:
       - spyre_pf_x0
       - linux
       - image_spyre_backend
-    timeout-minutes: 120
+    timeout-minutes: 660 # accomodate atleast 2 full sized attempts 
     permissions:
       # Needed to dispatch and poll _upstream_tests_beta_matrix.yaml below
       # (createWorkflowDispatch / listWorkflowRuns / getWorkflowRun). Capped
@@ -417,28 +417,93 @@ jobs:
             core.info(`Found dispatched run ${run.id} (${run.html_url})`);
             core.setOutput('run_id', `${run.id}`);
 
-            // Poll until it finishes. mode: validate means the matrix
-            // itself never fails on test failures, so this only fails on
-            // an infra-level problem (e.g. the run erroring out or timing
+            const POLL_INTERVAL_MS = 30000;
+            const MAX_WAIT_MS = 5 * 60 * 60 * 1000; // 5h ceiling per attempt
+
+            // Poll a run (or its current attempt) until it reaches a
+            // terminal state, or return null once maxWaitMs has elapsed.
+            // mode: validate means the matrix itself never fails on
+            // test failures, so a non-completing run here only means an
+            // infra-level problem (e.g. the run erroring out or timing
             // out) -- test-result failures are non-blocking, same as the
             // job-level `uses:` this replaces.
-            let conclusion = run.conclusion;
-            for (let attempt = 0; run.status !== 'completed' && attempt < 700; attempt++) {
-              await sleep(30000);
-              const { data } = await github.rest.actions.getWorkflowRun({
+            async function waitForCompletion(runId, maxWaitMs) {
+              const deadline = Date.now() + maxWaitMs;
+              let data;
+              while (Date.now() < deadline) {
+                await sleep(POLL_INTERVAL_MS);
+                ({ data } = await github.rest.actions.getWorkflowRun({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  run_id: runId,
+                }));
+                if (data.status === 'completed') {
+                  return data;
+                }
+              }
+              return null;
+            }
+
+            run = await waitForCompletion(run.id, MAX_WAIT_MS);
+            if (!run) {
+              core.setFailed(`Dispatched run ${run.id} did not complete in time`);
+              return;
+            }
+            core.info(`Dispatched run ${run.id} completed with conclusion: ${run.conclusion}`);
+
+            // Individual jobs can still fail outright on an infra-level
+            // flake (runner drop, network blip, etc.) even though the
+            // matrix's own conclusion is almost always "success" under
+            // mode: validate. Retry those a bounded number of times via
+            // GitHub's rerun-failed-jobs -- it reruns just the failed jobs
+            // in place (same run id, new attempt) rather than
+            // re-dispatching the whole matrix -- backing off a cooldown
+            // between attempts so a persistently-broken runner doesn't
+            // get hammered with immediate reruns.
+            const MAX_RERUN_ATTEMPTS = 3;
+            const COOLDOWN_BACKOFF = 2;
+            const MAX_COOLDOWN_MS = 30 * 60 * 1000;
+            let cooldownMs = 5 * 60 * 1000;
+
+            for (let rerunAttempt = 1; rerunAttempt <= MAX_RERUN_ATTEMPTS; rerunAttempt++) {
+              const { data: jobsData } = await github.rest.actions.listJobsForWorkflowRun({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                run_id: run.id,
+                filter: 'latest',
+              });
+              const failedJobs = jobsData.jobs.filter((j) => j.conclusion === 'failure');
+              if (failedJobs.length === 0) {
+                break;
+              }
+
+              core.info(
+                `${failedJobs.length} job(s) failed ` +
+                `(attempt ${rerunAttempt}/${MAX_RERUN_ATTEMPTS}) ` +
+                `(${failedJobs.map((j) => j.name).join(', ')}); ` +
+                `cooling down ${Math.round(cooldownMs / 1000)}s before re-running failed jobs.`
+              );
+              await sleep(cooldownMs);
+              cooldownMs = Math.min(cooldownMs * COOLDOWN_BACKOFF, MAX_COOLDOWN_MS);
+
+              await github.rest.actions.reRunWorkflowFailedJobs({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
                 run_id: run.id,
               });
-              run = data;
-              conclusion = run.conclusion;
+
+              // Re-running flips the run back to queued/in_progress under a
+              // new attempt -- give it a moment to register before polling.
+              await sleep(10000);
+              run = await waitForCompletion(run.id, MAX_WAIT_MS);
+              if (!run) {
+                core.setFailed(`Dispatched run ${run.id} did not complete in time after rerun attempt ${rerunAttempt}`);
+                return;
+              }
+              core.info(`Rerun attempt ${rerunAttempt} of dispatched run ${run.id} completed with conclusion: ${run.conclusion}`);
             }
-            if (run.status !== 'completed') {
-              core.setFailed(`Dispatched run ${run.id} did not complete in time`);
-              return;
-            }
-            core.info(`Dispatched run ${run.id} completed with conclusion: ${conclusion}`);
-            core.setOutput('conclusion', conclusion);
+
+            core.setOutput('conclusion', run.conclusion);
 
       - name: Download all JUnit XML artifacts from the test matrix
         env:
