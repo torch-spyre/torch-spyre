@@ -202,11 +202,20 @@ def _dma_to_spyre_indirect_access(
 def dma_moe_expert_weight_to_spyre(
     weight: torch.Tensor,
     target_dtype: torch.dtype | None = None,
+    *,
+    output_stick_tile: int | None = None,
 ) -> torch.Tensor | None:
     """Transfer ``[E, C, F]`` weights in a gather- and matmul-friendly layout.
 
-    The device layout is ``[E, C, F // eps, eps]``. Returns ``None`` when
-    ``F`` does not span complete sticks.
+    The default device layout is ``[E, C, F // eps, eps]``.
+
+    ``output_stick_tile`` selects an exact-size blocked layout
+    ``[E, (F // eps) // OT, C, OT, eps]``. Each contraction row contains
+    ``OT`` contiguous output sticks, exposing a tunable L3 load burst without
+    padding or duplicating the weight.
+
+    Returns ``None`` when ``F`` does not span complete sticks or the requested
+    output-stick tile does not divide the free dimension exactly.
     """
     assert weight.ndim == 3, "MoE expert-weight path is for rank-3 [E,C,F] only"
 
@@ -225,11 +234,34 @@ def dma_moe_expert_weight_to_spyre(
         )
         return None
 
-    layout = SpyreTensorLayout(
-        [experts, contract, free // eps, eps],
-        [contract * free, free, eps, 1],
-        get_device_dtype(dev_dtype),
-    )
+    free_sticks = free // eps
+    if output_stick_tile is not None:
+        if output_stick_tile <= 0 or free_sticks % output_stick_tile != 0:
+            warnings.warn(
+                f"MoE expert-weight output-stick tile {output_stick_tile} "
+                f"does not divide {free_sticks} free-dimension sticks; "
+                "falling back to the default layout.",
+                stacklevel=2,
+            )
+            return None
+        device_size = [
+            experts,
+            free_sticks // output_stick_tile,
+            contract,
+            output_stick_tile,
+            eps,
+        ]
+        stride_map = [
+            contract * free,
+            output_stick_tile * eps,
+            free,
+            eps,
+            1,
+        ]
+    else:
+        device_size = [experts, contract, free_sticks, eps]
+        stride_map = [contract * free, free, eps, 1]
+    layout = SpyreTensorLayout(device_size, stride_map, get_device_dtype(dev_dtype))
     dst = spyre_empty_with_layout(weight.size(), weight.stride(), dev_dtype, layout)
     copy_tensor(weight, dst, non_blocking=False)
     return dst

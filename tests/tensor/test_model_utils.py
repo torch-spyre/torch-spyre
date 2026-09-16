@@ -122,6 +122,26 @@ class TestLoadModelToSpyre(TestCase):
             device_weight.cpu(), weight, rtol=DLFLOAT16_RTOL, atol=DLFLOAT16_ATOL
         )
 
+    def test_moe_expert_weight_output_stick_tiled_layout(self):
+        from torch_spyre._C import get_spyre_tensor_layout
+
+        weight = torch.randn(3, 32, 256, dtype=torch.float16)
+        device_weight = dma_moe_expert_weight_to_spyre(weight, output_stick_tile=2)
+
+        layout = get_spyre_tensor_layout(device_weight)
+        self.assertEqual(list(layout.device_size), [3, 2, 32, 2, 64])
+        torch.testing.assert_close(
+            device_weight.cpu(), weight, rtol=DLFLOAT16_RTOL, atol=DLFLOAT16_ATOL
+        )
+
+    def test_moe_expert_weight_rejects_incompatible_output_stick_tile(self):
+        weight = torch.randn(3, 32, 256, dtype=torch.float16)
+
+        with self.assertWarnsRegex(UserWarning, "does not divide 4"):
+            device_weight = dma_moe_expert_weight_to_spyre(weight, output_stick_tile=3)
+
+        self.assertIsNone(device_weight)
+
     def test_moe_per_expert_scale_layout(self):
         from torch_spyre._C import get_spyre_tensor_layout
 
