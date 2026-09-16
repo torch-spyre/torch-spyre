@@ -1164,10 +1164,10 @@ def spyre__sdpa_overrideable(
     # query-derived seed (q_scaled, zeros_like(query), the final permute) land
     # on logical [B, H, S, D] order. We do NOT contiguify key/value wholesale --
     # that materializes a full [B, H, S_kv, D] copy that OOMs on long KV. K/V are
-    # instead normalized PER BLOCK inside the loop (keys_T's .contiguous() and
-    # the per-block v_blk.contiguous()), each a bounded [B, H, kv_block_size, D]
-    # copy chosen by the cost model, never an implicit full [B, H, S_kv, D]
-    # copy. Decode can intentionally choose a full block for short sequences.
+    # instead normalized PER BLOCK where required. The keys_T .contiguous() is a
+    # bounded [B, H, D, kv_block_size] copy chosen by the cost model, never an
+    # implicit full [B, H, S_kv, D] copy. V is read directly. Decode can
+    # intentionally choose a full block for short sequences.
     original_query_strides = query.stride()
     if num_heads % num_kvheads != 0:
         raise Unsupported(
