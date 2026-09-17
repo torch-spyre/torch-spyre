@@ -1252,11 +1252,16 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
         this test. Covers both wrong-count shapes in one test (zero, then
         two), each built directly via this class's established
         mock.Mock(spec=[...]) convention (see TestSpliceWhileLoop above)
-        rather than a full torch.compile, since driving a real for_each_
-        tile fixture into either of these malformed shapes is not
-        possible through the ordinary lowering path -- both are meant to
-        be unreachable there, which is exactly why they need direct
-        construction to exercise at all.
+        rather than a full torch.compile. The zero-consumer shape is
+        believed unreachable through the ordinary lowering path, which is
+        why it needs direct construction to exercise at all. The
+        two-consumer shape is NOT unreachable: it is reached for real by
+        for_each_tile_fixtures.py's sibling_nested_fn/sibling_nested_
+        stardep_fn (two independent WhileLoops both consuming a single
+        outer marker on their shared tiled operand via StarDep -- see
+        those fixtures' docstrings, issue #4581 territory). It is still
+        built directly here too, for a fast, isolated unit test of the
+        guard itself rather than a full torch.compile round-trip.
         """
         import sympy
 
