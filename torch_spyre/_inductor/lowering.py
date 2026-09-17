@@ -30,6 +30,7 @@ from torch.utils._ordered_set import OrderedSet
 
 import torch_spyre._inductor.customops  # noqa: F401
 from torch_spyre._C import get_elem_in_stick
+from torch_spyre._inductor.decompositions import get_spyre_decomp_table
 from torch_spyre.ops.fallbacks import fallback_ops
 
 from . import config
@@ -54,6 +55,7 @@ from .ir import (
     BroadcastAsyncFallback,
     SpyreConstantFallback,
     SpyreEmptyFallback,
+    SpyreArangeFallback,
     SpyreReduction,
     WaitWorkFallback,
 )
@@ -150,21 +152,27 @@ def register_fallback_over_decomp(fallback_ops):
     with ``override_decomp=True`` installs a lowering so that auto-path — and
     its assertion — is never reached.
 
-    An overload is eligible if it appears in either ``lowering.decompositions``
-    (the Spyre+Inductor merged table) *or* ``torch._decomp.get_decompositions``
-    (the raw upstream table that ``make_fallback``'s CI guard checks directly).
-    Checking both tables closes the gap where an overload is present in the
-    global post-autograd table (e.g. via ``_refs`` registrations) but absent
-    from Inductor's decomposition table — which is what caused the CI guard to
-    fire for ``cumsum`` and ``bitwise_xor`` after Spyre unregistered those lowerings.
+    An overload is eligible if it appears in ``lowering.decompositions`` (the
+    Spyre+Inductor merged table), in ``torch._decomp.get_decompositions`` (the
+    raw upstream table that ``make_fallback``'s CI guard checks directly), or in
+    ``get_spyre_decomp_table`` (the table ``get_decomp_fn`` supplies for Spyre).
+    An overload can be in the global post-autograd table but absent from
+    Inductor's (``bitwise_xor``), or in the Spyre table alone (``cumsum``).
+
+    Only overloads that lack a lowering are touched, so this composes with
+    ``unregister_lowerings`` (which runs first) and does not clobber Spyre's own
+    lowerings.
     """
+    spyre_decompositions = get_spyre_decomp_table()
     added = []
     for op in fallback_ops:
         for overload in lowering.get_overloads(op):
-            if (
+            carries_decomp = (
                 overload in lowering.decompositions
+                or overload in spyre_decompositions
                 or bool(torch._decomp.get_decompositions([overload]))
-            ) and overload not in lowering.lowerings:
+            )
+            if carries_decomp and overload not in lowering.lowerings:
                 lowering.make_fallback(overload, override_decomp=True)
                 added.append(overload)
     return added
@@ -1539,6 +1547,16 @@ def lower_full(size, fill_value, dtype=None, layout=None, device=None, pin_memor
         dtype=dtype,
         inner_fn=inner_fn,
         ranges=list(size),
+    )
+
+
+@register_spyre_lowering(torch.ops.spyre.arange.default, type_promotion_kind=None)
+def lower_arange(length, dtype, device, column=False):
+    op_overload = getattr(
+        torch.ops.spyre.arange, V.graph.current_node.target._overloadname
+    )
+    return ir.TensorBox.create(
+        SpyreArangeFallback(op_overload, length, dtype, device, column)
     )
 
 
