@@ -221,7 +221,7 @@ void SpyreAllocator::copy_data(void* dest, const void* src,
 
 uint64_t SpyreAllocator::compositeAddressToDmva(
     const flex::CompositeAddress& addr) const {
- return flex::compositeAddressToDmva(addr,
+  return flex::compositeAddressToDmva(addr,
                                       getFlexAllocator()->getIdToRegionMap());
 }
 
