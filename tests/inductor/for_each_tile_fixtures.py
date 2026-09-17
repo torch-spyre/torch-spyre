@@ -206,7 +206,6 @@ def triple_nested_stardep_outer_reference(
     for b_start in range(0, X.shape[0], b_tile_size):
         x_b_tile = X[b_start : b_start + b_tile_size]
         y_b_tile = Y[b_start : b_start + b_tile_size]
-        rows = []
         for b_idx in range(x_b_tile.shape[0]):
             x_b = x_b_tile[b_idx]
             y_b = y_b_tile[b_idx]
@@ -280,7 +279,6 @@ def triple_nested_stardep_middle_reference(
     for b_start in range(0, X.shape[0], b_tile_size):
         x_b_tile = X[b_start : b_start + b_tile_size] * 1.0
         y_b_tile = Y[b_start : b_start + b_tile_size]
-        rows = []
         for b_idx in range(x_b_tile.shape[0]):
             x_b = x_b_tile[b_idx]
             y_b = y_b_tile[b_idx]
@@ -351,7 +349,6 @@ def triple_nested_stardep_inner_reference(
     for b_start in range(0, X.shape[0], b_tile_size):
         x_b_tile = X[b_start : b_start + b_tile_size] * 1.0
         y_b_tile = Y[b_start : b_start + b_tile_size]
-        rows = []
         for b_idx in range(x_b_tile.shape[0]):
             x_b = x_b_tile[b_idx]
             y_b = y_b_tile[b_idx]
@@ -441,7 +438,6 @@ def triple_nested_stardep_multilevel_reference(
     for b_start in range(0, X.shape[0], b_tile_size):
         x_b_tile = X[b_start : b_start + b_tile_size]
         y_b_tile = Y[b_start : b_start + b_tile_size]
-        rows = []
         for b_idx in range(x_b_tile.shape[0]):
             x_b = x_b_tile[b_idx]
             y_b = y_b_tile[b_idx]
@@ -456,6 +452,162 @@ def triple_nested_stardep_multilevel_reference(
                 m_rows.append(acc)
             batches.append(torch.cat(m_rows, dim=0))
     return torch.cat(batches, dim=0)
+
+
+def sibling_nested_fn(X: torch.Tensor, Y: torch.Tensor) -> torch.Tensor:
+    """One outer for_each_tile level (M) whose body runs two independent
+    (non-nested, sibling) inner for_each_tile loops: one splits K over X/Y
+    for a matmul-style partial, the other splits K again over the same
+    x_tile with an elementwise scale, and the two partials are summed. Both
+    sibling loops route their tiles through elementwise ops first.
+
+    NOTE (Step 2 finding): This fixture is currently UNCOMPILABLE due to an
+    unhandled architectural case. There is exactly ONE marker here: the
+    outer for_each_tile's own dim=0 marker on x_tile itself (stamped once,
+    by the outer loop, before either sibling runs). x_tile is then handed
+    directly as an operand to both sibling_a's and sibling_b's inner
+    for_each_tile calls, each of which lowers to its own WhileLoop op. Both
+    WhileLoops end up as consumers of the single x_tile marker via StarDep
+    (whole-tensor, name-only dependency) -- so the marker has 2 consuming
+    reads, not 1. _consume_tile_dim_markers explicitly rejects markers with
+    2+ consuming reads via an assertion: "expected exactly one." This is
+    issue #4581 territory -- the sibling-nesting pattern exposes a gap in
+    the marker-resolution design where multiple independent WhileLoops at
+    the same nesting level consume a single outer tiled operand. The bug
+    site is this outer x_tile hand-off, NOT inside either sibling's own
+    K-tiling body -- don't go looking for duplicated K-dim markers there.
+    Future work: extend _consume_tile_dim_markers to handle this
+    multi-consumer case, or document it as an unsupported pattern. Fixture
+    retained as a structural probe and as documentation of this limitation.
+    """
+
+    def outer_body(_, ops):
+        x_tile, y_whole = ops
+        m_tile = x_tile.shape[0]
+
+        def sibling_a_body(acc, inner_ops):
+            x_k_tile, y_k_tile = inner_ops
+            x_k_tile = x_k_tile * 1.0
+            return acc + x_k_tile @ y_k_tile, None
+
+        partial_a, _ = for_each_tile(
+            sibling_a_body,
+            (x_tile, y_whole),
+            dims=(-1, 0),
+            tile_size=3,
+            init=torch.zeros(m_tile, N, device=X.device, dtype=X.dtype),
+        )
+
+        def sibling_b_body(acc, inner_ops):
+            (x_k_tile,) = inner_ops
+            x_k_tile = x_k_tile * 1.0
+            return acc + x_k_tile.sum(dim=-1, keepdim=True), None
+
+        partial_b, _ = for_each_tile(
+            sibling_b_body,
+            (x_tile,),
+            dims=(-1,),
+            tile_size=3,
+            init=torch.zeros(m_tile, 1, device=X.device, dtype=X.dtype),
+        )
+
+        return None, partial_a + partial_b
+
+    _, out = for_each_tile(outer_body, (X, Y), dims=(0, None), tile_size=2, out_dim=0)
+    return out
+
+
+def sibling_nested_reference(X: torch.Tensor, Y: torch.Tensor) -> torch.Tensor:
+    """Eager Python nesting of the same tiling, for value assertions."""
+    m_tile_size, k_tile_size = 2, 3
+    rows = []
+    for m_start in range(0, X.shape[0], m_tile_size):
+        x_m_tile = X[m_start : m_start + m_tile_size]
+        acc_a = torch.zeros(x_m_tile.shape[0], N, device=X.device, dtype=X.dtype)
+        for k_start in range(0, x_m_tile.shape[1], k_tile_size):
+            x_k_tile = x_m_tile[:, k_start : k_start + k_tile_size] * 1.0
+            y_k_tile = Y[k_start : k_start + k_tile_size]
+            acc_a = acc_a + x_k_tile @ y_k_tile
+        acc_b = torch.zeros(x_m_tile.shape[0], 1, device=X.device, dtype=X.dtype)
+        for k_start in range(0, x_m_tile.shape[1], k_tile_size):
+            x_k_tile = x_m_tile[:, k_start : k_start + k_tile_size] * 1.0
+            acc_b = acc_b + x_k_tile.sum(dim=-1, keepdim=True)
+        rows.append(acc_a + acc_b)
+    return torch.cat(rows, dim=0)
+
+
+def sibling_nested_stardep_fn(X: torch.Tensor, Y: torch.Tensor) -> torch.Tensor:
+    """Same sibling shape as sibling_nested_fn, but sibling A's tile feeds
+    its matmul directly (no intervening elementwise op), while sibling B
+    routes through elementwise.
+
+    NOTE (Step 2 finding): This fixture is currently UNCOMPILABLE for the
+    same architectural reason as sibling_nested_fn: there is exactly ONE
+    marker, the outer for_each_tile's dim=0 marker on x_tile itself, and
+    x_tile is handed directly to both sibling_a's and sibling_b's inner
+    for_each_tile calls. Each lowers to its own WhileLoop op, and both
+    WhileLoops consume the single x_tile marker via StarDep -- giving it 2
+    consuming reads instead of 1. The current _consume_tile_dim_markers
+    machinery rejects markers with 2+ consuming reads. This is issue #4581
+    territory; the bug site is the outer x_tile hand-off, not inside either
+    sibling's own K-tiling body. The intended differentiation (sibling A
+    STAR_DEP_KEPT, sibling B INLINE_ERASED) cannot be observed until the
+    multi-consumer marker case
+    is handled. Fixture retained as a structural probe for the eventual fix.
+    """
+
+    def outer_body(_, ops):
+        x_tile, y_whole = ops
+        m_tile = x_tile.shape[0]
+
+        def sibling_a_body(acc, inner_ops):
+            x_k_tile, y_k_tile = inner_ops
+            return acc + x_k_tile @ y_k_tile, None
+
+        partial_a, _ = for_each_tile(
+            sibling_a_body,
+            (x_tile, y_whole),
+            dims=(-1, 0),
+            tile_size=3,
+            init=torch.zeros(m_tile, N, device=X.device, dtype=X.dtype),
+        )
+
+        def sibling_b_body(acc, inner_ops):
+            (x_k_tile,) = inner_ops
+            x_k_tile = x_k_tile * 1.0
+            return acc + x_k_tile.sum(dim=-1, keepdim=True), None
+
+        partial_b, _ = for_each_tile(
+            sibling_b_body,
+            (x_tile,),
+            dims=(-1,),
+            tile_size=3,
+            init=torch.zeros(m_tile, 1, device=X.device, dtype=X.dtype),
+        )
+
+        return None, partial_a + partial_b
+
+    _, out = for_each_tile(outer_body, (X, Y), dims=(0, None), tile_size=2, out_dim=0)
+    return out
+
+
+def sibling_nested_stardep_reference(X: torch.Tensor, Y: torch.Tensor) -> torch.Tensor:
+    """Eager Python nesting of the same tiling, for value assertions."""
+    m_tile_size, k_tile_size = 2, 3
+    rows = []
+    for m_start in range(0, X.shape[0], m_tile_size):
+        x_m_tile = X[m_start : m_start + m_tile_size]
+        acc_a = torch.zeros(x_m_tile.shape[0], N, device=X.device, dtype=X.dtype)
+        for k_start in range(0, x_m_tile.shape[1], k_tile_size):
+            x_k_tile = x_m_tile[:, k_start : k_start + k_tile_size]
+            y_k_tile = Y[k_start : k_start + k_tile_size]
+            acc_a = acc_a + x_k_tile @ y_k_tile
+        acc_b = torch.zeros(x_m_tile.shape[0], 1, device=X.device, dtype=X.dtype)
+        for k_start in range(0, x_m_tile.shape[1], k_tile_size):
+            x_k_tile = x_m_tile[:, k_start : k_start + k_tile_size] * 1.0
+            acc_b = acc_b + x_k_tile.sum(dim=-1, keepdim=True)
+        rows.append(acc_a + acc_b)
+    return torch.cat(rows, dim=0)
 
 
 LQ, LK, D = 128, 256, 128
