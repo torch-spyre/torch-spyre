@@ -79,13 +79,33 @@ def _check_ktir_device_prerequisites() -> None:
         )
 
 
+# Linux caps a single path component at NAME_MAX bytes (255 on ext4/xfs/tmpfs).
+# Deeply fused kernels (e.g. Gemma-4 MoE decode) produce kernel names >250
+# chars; left whole they overflow the per-kernel dir/file name and mkdtemp
+# raises [Errno 36] ENAMETOOLONG. Truncate to a readable head: the uuid digest
+# below and mkdtemp's random suffix already guarantee uniqueness, so the tail is
+# only a human-readable aid.
+_NAME_MAX = 255
+# Budget leaves room for the longest wrapper around the name:
+#   dir:  f"{digest(8)}_{name}_" + mkdtemp's 8 random chars  => name + 18
+#   file: f"{name}.ktir"                                     => name + 5
+# 18 is the larger fixed overhead; keep a safety margin.
+_KERNEL_NAME_BUDGET = _NAME_MAX - 24
+
+
+def _safe_kernel_name(kernel_name: str) -> str:
+    """Truncate a kernel name so it fits a single NAME_MAX path component."""
+    if len(kernel_name) <= _KERNEL_NAME_BUDGET:
+        return kernel_name
+    return kernel_name[:_KERNEL_NAME_BUDGET]
+
+
 def get_output_dir(kernel_name: str):
     spyre_dir = os.path.join(cache_dir(), "inductor-spyre")
     os.makedirs(spyre_dir, exist_ok=True)
     digest = uuid.uuid4().hex[:8]
-    kernel_output_dir = tempfile.mkdtemp(
-        dir=spyre_dir, prefix=f"{digest}_{kernel_name}_"
-    )
+    safe_name = _safe_kernel_name(kernel_name)
+    kernel_output_dir = tempfile.mkdtemp(dir=spyre_dir, prefix=f"{digest}_{safe_name}_")
     return kernel_output_dir
 
 
@@ -386,7 +406,7 @@ class SpyreAsyncCompile(AsyncCompile):
         # Persist the emitted KTIR as a text file in the same per-kernel output
         # dir as sdsc's bundle.
         output_dir = get_output_dir(kernel_name)
-        ktir_path = os.path.join(output_dir, f"{kernel_name}.ktir")
+        ktir_path = os.path.join(output_dir, f"{_safe_kernel_name(kernel_name)}.ktir")
         with open(ktir_path, "w") as fh:
             fh.write(ktir_text)
         logger.debug("OpSpec->KTIR: wrote %s", ktir_path)

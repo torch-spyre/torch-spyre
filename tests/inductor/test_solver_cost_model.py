@@ -20,6 +20,9 @@ store). Before this was modelled, the objective freed every load of a resident i
 charged nobody for the clone-in -- a credit that was 65% of the predicted cost on
 softmax, and steered the anneal into plans 5-6% worse on flash.
 
+The clone-in is its own read-only pass: a resident input's readers are served from LX,
+and the clone's one load is priced separately, outside the readers' bundle turnaround.
+
 No Spyre device or backend compiler is required; features are built directly.
 """
 
@@ -33,7 +36,9 @@ import torch_spyre._inductor.dump_cost_model as dcm
 from torch_spyre._inductor import cost_model
 from torch_spyre._inductor.cost_model import (
     ArgTraffic,
+    CostParams,
     OpFeatures,
+    _clone_in_bytes,
     _fused_hbm_bytes,
     charge_boundary_reads_once,
 )
@@ -94,17 +99,26 @@ def _writer(out, *, is_boundary, resident=False):
     )
 
 
+def _loads(bundles):
+    """(reader bytes, clone-in bytes) per bundle after the once-rule."""
+    return [
+        (_fused_hbm_bytes(b)[0], _clone_in_bytes(b))
+        for b in charge_boundary_reads_once(bundles)
+    ]
+
+
 def _read_bytes(bundles):
-    return sum(_fused_hbm_bytes(b)[0] for b in charge_boundary_reads_once(bundles))
+    """Every HBM byte loaded for inputs: the readers' own and the clones'."""
+    return sum(r + c for r, c in _loads(bundles))
 
 
 # --------------------------------------------------------------- input side
 
 
-def test_a_resident_graph_input_read_is_still_charged():
+def test_a_resident_graph_inputs_load_moves_from_its_readers_to_the_clone():
     # All readers in ONE bundle: the clone-in performs the single load the bundle
-    # would have performed itself, so residency saves NOTHING. This is the exact
-    # case in the issue's corpus -- every clone-eligible input, every graph.
+    # would have performed itself, so residency saves no BYTES -- they only move from
+    # the readers, now served from LX, to the clone.
     hbm = [[_reader("C", "buf1"), _reader("D", "buf2")]]
     lx = [
         [
@@ -112,28 +126,48 @@ def test_a_resident_graph_input_read_is_still_charged():
             _reader("D", "buf2", resident={"arg0_1"}),
         ]
     ]
-    assert _read_bytes(lx) == _read_bytes(hbm)
+    assert _read_bytes(lx) == _read_bytes(hbm) == BYTES
+    assert _loads(hbm) == [(BYTES, 0)]
+    assert _loads(lx) == [(0, BYTES)]
+
+
+def test_the_clone_in_saves_the_turnaround_its_readers_no_longer_pay():
+    # The same bytes are not the same time. The clone is its own read-only pass, so
+    # its load is priced alone; the readers' bundle keeps only its writes and pays no
+    # read/write turnaround. Measured on device (x*2 + x*3, x = 16 MiB): 417 us
+    # without the clone, 222 us with it -- one read plus one write at the peak rate.
+    p = CostParams()
+    hbm = [_reader("C", "buf1"), _reader("D", "buf2")]
+    lx = [
+        _reader("C", "buf1", resident={"arg0_1"}),
+        _reader("D", "buf2", resident={"arg0_1"}),
+    ]
+    # Each reader writes BYTES to HBM, so min(R, W) is the one load of the input.
+    saved = p.rw_turnaround_ns_per_byte * BYTES
+    assert cost_model.predict_ops(hbm, p) - cost_model.predict_ops(
+        lx, p
+    ) == pytest.approx(saved)
 
 
 def test_the_clone_in_load_is_charged_once_across_bundles():
     # Readers in TWO bundles: without residency each bundle loads the input; with
-    # residency ONE clone loads it and the second bundle is served from LX. The
-    # saving is exactly one load -- not two (the bug) and not zero (charging every
-    # bundle would be the opposite error).
+    # residency ONE clone loads it and every reader is served from LX. The saving is
+    # exactly one load -- not two (the bug) and not zero (charging every bundle would
+    # be the opposite error).
     hbm = [[_reader("C", "buf1")], [_reader("D", "buf2")]]
     lx = [
         [_reader("C", "buf1", resident={"arg0_1"})],
         [_reader("D", "buf2", resident={"arg0_1"})],
     ]
     assert _read_bytes(hbm) - _read_bytes(lx) == BYTES
-    assert _read_bytes(lx) == BYTES
+    assert _loads(lx) == [(0, BYTES), (0, 0)]
 
 
 def test_charging_the_clone_in_once_does_not_disturb_a_non_resident_input():
-    # The rewrite only redistributes the boundary charge; an input in HBM is loaded
-    # by every bundle that reads it either way.
+    # The rewrite only redistributes the clone-in charge; an input in HBM is loaded
+    # by every bundle that reads it either way, and there is no clone.
     bundles = [[_reader("C", "buf1")], [_reader("D", "buf2")]]
-    assert _read_bytes(bundles) == 2 * BYTES
+    assert _loads(bundles) == [(BYTES, 0), (BYTES, 0)]
 
 
 def test_a_later_bundle_with_several_readers_still_loads_the_input_once():
@@ -152,24 +186,24 @@ def test_a_later_bundle_with_several_readers_still_loads_the_input_once():
     ]
 
 
-def test_residency_frees_a_later_multi_reader_bundle_entirely():
-    # Same shape, resident: the clone pays one load in bundle 1 and every reader in
-    # bundle 2 is served from LX. The saving must be one load, not one per reader.
+def test_residency_frees_every_reader_and_charges_one_clone_in():
+    # Same shape, resident: every reader in both bundles is served from LX, and the
+    # one clone-in lands in bundle 1 however many readers bundle 1 has.
     resident = {"arg0_1"}
     bundles = [
-        [_reader("C", "buf1", resident=resident)],
+        [
+            _reader("C", "buf1", resident=resident),
+            _reader("G", "buf5", resident=resident),
+        ],
         [
             _reader("D", "buf2", resident=resident),
             _reader("E", "buf3", resident=resident),
         ],
     ]
-    assert [_fused_hbm_bytes(b)[0] for b in charge_boundary_reads_once(bundles)] == [
-        BYTES,
-        0,
-    ]
+    assert _loads(bundles) == [(0, BYTES), (0, 0)]
 
 
-def test_a_later_bundles_readers_stay_linear_in_symbolic_residency():
+def test_readers_and_clone_in_stay_linear_in_symbolic_residency():
     # The slope, not just the constant, has to be right: an over-counted later bundle
     # over-rewards pinning the input by (readers - 1)x in the solver's objective.
     is_lx = sympy.Symbol("is_lx")
@@ -180,21 +214,24 @@ def test_a_later_bundles_readers_stay_linear_in_symbolic_residency():
             _reader("E", "buf3", resident_expr=is_lx),
         ],
     ]
-    rewritten = charge_boundary_reads_once(bundles)
-    assert (
-        sympy.simplify(_fused_hbm_bytes(rewritten[1])[0] - (BYTES - BYTES * is_lx)) == 0
-    )
+    expected = [(BYTES - BYTES * is_lx, BYTES * is_lx), (BYTES - BYTES * is_lx, 0)]
+    for (reader, clone), (want_reader, want_clone) in zip(_loads(bundles), expected):
+        assert sympy.simplify(reader - want_reader) == 0
+        assert sympy.simplify(clone - want_clone) == 0
 
 
 def test_the_once_rule_is_idempotent():
     # ``is_boundary`` survives the rewrite, so the second pass recomputes the same
     # "already seen" set and changes nothing.
-    bundles = [[_reader("C", "buf1")], [_reader("D", "buf2"), _reader("E", "buf3")]]
-    once = charge_boundary_reads_once(bundles)
-    twice = charge_boundary_reads_once(once)
-    assert [_fused_hbm_bytes(b)[0] for b in once] == [
-        _fused_hbm_bytes(b)[0] for b in twice
+    bundles = [
+        [_reader("C", "buf1", resident={"arg0_1"})],
+        [
+            _reader("D", "buf2", resident={"arg0_1"}),
+            _reader("E", "buf3", resident={"arg0_1"}),
+        ],
     ]
+    once = charge_boundary_reads_once(bundles)
+    assert _loads(once) == _loads(bundles)
 
 
 # --------------------------------------------------------------- output side
@@ -243,14 +280,17 @@ def test_predict_by_bundle_applies_the_once_rule(monkeypatch):
     assert charged_once < charged_twice
 
 
-def test_a_boundary_arg_stays_constant_under_symbolic_residency():
-    """The solver objective must stay linear in ``sym_is_lx``: a boundary arg's bytes
-    no longer depend on the residency variable at all."""
+def test_a_boundary_reads_bytes_are_conserved_under_symbolic_residency():
+    """The solver objective must stay linear in ``sym_is_lx``: residency moves a
+    boundary read's bytes between the reader and the clone without changing their sum,
+    so the variable's weight comes from where they are priced, not from how many."""
     sym = sympy.Symbol("is_lx_arg0", integer=True)
     boundary = ArgTraffic("arg0_1", "input", sym, ELEMS, is_boundary=True)
     interior = ArgTraffic("buf1", "input", sym, ELEMS, is_boundary=False)
-    assert boundary.hbm_elems() == ELEMS
+    assert sym in sympy.sympify(boundary.hbm_elems()).free_symbols
+    assert sympy.simplify(boundary.hbm_elems() + boundary.clone_in_elems()) == ELEMS
     assert sym in sympy.sympify(interior.hbm_elems()).free_symbols
+    assert interior.clone_in_elems() == 0
 
 
 def test_a_legacy_record_falls_back_to_the_arg_naming_convention():
@@ -262,7 +302,7 @@ def test_a_legacy_record_falls_back_to_the_arg_naming_convention():
         a.pop("is_boundary")
     back = cost_model.op_from_dict(d)
     assert [a.is_graph_boundary for a in back.args] == [False, True]
-    assert back.read_bytes() == BYTES
+    assert (back.read_bytes(), back.clone_in_bytes()) == (0, BYTES)
 
 
 def test_an_explicit_stamp_survives_the_round_trip():
@@ -272,7 +312,7 @@ def test_an_explicit_stamp_survives_the_round_trip():
     op.args[1].is_boundary = False
     back = cost_model.op_from_dict(cost_model.op_to_dict(op))
     assert back.args[1].is_boundary is False
-    assert back.read_bytes() == 0
+    assert (back.read_bytes(), back.clone_in_bytes()) == (0, 0)
 
 
 # --------------------------------------------------------------- stamping

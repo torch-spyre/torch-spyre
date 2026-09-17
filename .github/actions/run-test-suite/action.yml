@@ -219,7 +219,17 @@ runs:
           fifo="$(mktemp -u /tmp/test_fifo_XXXXXX)"
           mkfifo "$fifo"
 
-          tee "$log_file" < "$fifo" &
+          # Drain the FIFO to the local $log_file (the stall watcher reads it)
+          # and, when running in a container, also to PID 1's stdout. That is
+          # the pod's stdout, which the kubelet writes to /var/log/containers
+          # and the IBM Cloud Logs fluent-bit DaemonSet ingests, so the full
+          # test output reaches Cloud Logs. /proc/1/fd/1 only exists in a
+          # container; outside one (local dev) fall back to the file alone.
+          if [[ -w /proc/1/fd/1 ]]; then
+            tee "$log_file" /proc/1/fd/1 < "$fifo" &
+          else
+            tee "$log_file" < "$fifo" &
+          fi
           tee_pid=$!
 
           exec {FIFO_FD}>"$fifo"

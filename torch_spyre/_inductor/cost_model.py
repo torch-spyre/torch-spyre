@@ -49,11 +49,15 @@ Model (per fused bundle / single-op kernel):
   its allocation. LX-placed tensors don't touch HBM, and their LX traffic is treated
   as ~free (the measured per-pass LX cost is below run-to-run noise). The exception is
   a GRAPH BOUNDARY transfer (a graph input's read, a graph output's write): the planner
-  pins such a buffer by CLONING it, and the clone still moves those bytes through HBM,
-  so they stay charged when the buffer is LX-resident (``ArgTraffic.is_boundary``; issue
-  #4271). The clone-in load is charged to the first bundle that reads the input, since
-  one clone serves the whole graph (``charge_boundary_reads_once`` clears
-  ``owns_boundary_charge`` on the rest, keeping them de-duplicable). Broadcast inputs
+  pins such a buffer by CLONING it, and the clone still moves those bytes through HBM
+  (``ArgTraffic.is_boundary``; issue #4271). A graph output's write stays charged in its
+  producer's bundle when LX-resident. A resident graph input's READERS are served from
+  LX like any other resident arg; the clone's own load is a separate CLONE-IN term
+  (``ArgTraffic.clone_in_elems``), charged to the first bundle that reads the input,
+  since one clone serves the whole graph (``charge_boundary_reads_once`` clears
+  ``owns_boundary_charge`` on the rest, keeping them de-duplicable). The clone is its
+  own read-only DSC, so the term is priced at BW_PEAK OUTSIDE the bundle's turnaround and
+  compute overlap, like an LX relayout copy (measurement in ``predict_ops``). Broadcast inputs
   are loaded ONCE and reused across the broadcast dim, so they are counted at their own
   (one-row/-col) DEVICE size -- NOT scaled up to the output size (the rung-6 runs proved
   a core does not re-read the operand per output element), but NOT dropped to zero
@@ -73,7 +77,7 @@ Model (per fused bundle / single-op kernel):
   Those loads also run at a PER-CORE ceiling (~2.3 GB/s per core; flat in rows per
   core and in core count, rows-per-core ladder 2026-09-10), so they are priced as
   per-core bytes over ``mm_replicated_read_gbps_per_core`` rather than at BW_PEAK.
-  Residency removes all f loads; a resident graph input keeps only its clone-in load.
+  Residency removes all f loads; a resident graph input adds only its one clone-in load.
 
 Byte counts use each arg's DEVICE layout (stick-padded ``device_size``), not the torch
 logical shape -- so a reduction's reduced input is naturally full-sized and stick
@@ -194,20 +198,22 @@ class ArgTraffic:
     # This arg's traffic crosses the GRAPH boundary, so LX residency cannot remove it:
     # a read of a graph input, or the externally-visible write of a graph output. The
     # scratchpad planner pins such a buffer by CLONING it (allocator._push_allocation),
-    # and the clone still performs this transfer -- so it stays charged even when
-    # ``is_lx``. A property of the (tensor, op, role) triple, not of the tensor: a
-    # buffer that is both a graph input and a graph output (a returned view of an
-    # input; a mutated input that is returned) is stamped per arg, and its
-    # graph-input reads and graph-output write never collide. ``None`` = a record
-    # captured before this field existed; the name heuristic below stands in.
+    # and the clone still performs this transfer. For a graph output it stays in the
+    # producer's write even when ``is_lx``; for a graph input the reader is served
+    # from LX and the clone's load is ``clone_in_elems``. A property of the (tensor,
+    # op, role) triple, not of the tensor: a buffer that is both a graph input and a
+    # graph output (a returned view of an input; a mutated input that is returned) is
+    # stamped per arg, and its graph-input reads and graph-output write never collide.
+    # ``None`` = a record captured before this field existed; the name heuristic below
+    # stands in.
     is_boundary: bool | None = None
-    # Whether THIS bundle pays the boundary transfer, as opposed to an earlier one
-    # that already did. Orthogonal to ``is_boundary``, which stays exactly as
+    # Whether THIS bundle pays a graph input's clone-in load, as opposed to an earlier
+    # one that already did. Orthogonal to ``is_boundary``, which stays exactly as
     # extraction stamped it: one clone serves the whole graph, so
     # ``charge_boundary_reads_once`` clears this on every reader after the first
     # while leaving the arg recognisable as a graph input -- which is also the key
-    # ``_fused_hbm_bytes`` de-duplicates on. Meaningless, and left True, on an arg
-    # that is not a boundary arg.
+    # ``_fused_hbm_bytes`` and ``_clone_in_bytes`` de-duplicate on. Meaningless, and
+    # left True, on an arg that is not a graph-input read.
     owns_boundary_charge: bool = True
     # How many cores each read this arg's bytes from HBM: the product of the
     # consumer's core splits on iteration dims this arg's read index does NOT
@@ -234,39 +240,49 @@ class ArgTraffic:
         return self.role == "input" and self.name.startswith("arg")
 
     def hbm_elems(self):
-        """Device elements this arg moves through HBM, loop-scaled. Zero when the arg
-        is LX-resident -- unless this bundle pays a graph-boundary transfer, which
-        residency cannot remove. A boundary arg whose charge belongs to an earlier
-        bundle is priced like any other arg: the clone loaded it, so residency does
-        free this read, and without residency every bundle re-reads it from HBM.
-        ``is_lx`` may be a solver decision variable, so the residency factor stays
-        arithmetic (``1 - is_lx``) rather than a branch.
+        """Device elements this op's own pass moves through HBM for this arg,
+        loop-scaled. Zero when the arg is LX-resident -- including a resident graph
+        input, whose readers the clone serves from LX (its one load is
+        :meth:`clone_in_elems`, priced separately). The exception is a graph output's
+        write, which the clone-out still performs, so it stays charged. ``is_lx`` may
+        be a solver decision variable, so the residency factor stays arithmetic
+        (``1 - is_lx``) rather than a branch.
 
-        A replicated operand (``replication`` > 1) is loaded by every core that
-        holds a copy when it comes from HBM. Residency removes all but the one
-        clone-in load of a boundary arg, so the boundary charge is
-        ``is_lx + replication * (1 - is_lx)`` times the one-load size: exactly the
-        old ``elems * loop_factor`` when replication is 1, and still linear in
-        ``is_lx``."""
+        A replicated operand (``replication`` > 1) is loaded by every core that holds
+        a copy when it comes from HBM, and residency removes all of those loads."""
         # A bool residency next to a symbolic replication (a fixed-residency buffer
         # read under a solver-chosen split) must add as 0/1, not as a sympy Boolean.
         is_lx = int(self.is_lx) if isinstance(self.is_lx, bool) else self.is_lx
-        if self.is_graph_boundary and self.owns_boundary_charge:
+        if self.role == "output" and self.is_graph_boundary:
             return (
                 self.elems * self.loop_factor * (is_lx + self.replication * (1 - is_lx))
             )
         return self.elems * self.loop_factor * self.replication * (1 - is_lx)
 
+    def clone_in_elems(self):
+        """Device elements the clone of a resident graph input loads from HBM: one
+        aggregate load of ``elems``, charged only to the bundle that owns the input's
+        boundary charge (``owns_boundary_charge``), and zero for every other arg.
+
+        The clone is one untiled pass, so neither ``replication`` nor ``loop_factor``
+        scales it: the replicas and the loop iterations are what its readers would
+        otherwise load, and they read from LX instead. Linear in ``is_lx``."""
+        if not (
+            self.role == "input"
+            and self.is_graph_boundary
+            and self.owns_boundary_charge
+        ):
+            return 0
+        return self.elems * self.is_lx
+
     def replicated_hbm_elems(self):
         """The share of :meth:`hbm_elems` that is a per-core replica load: all of a
-        non-resident replicated operand's loads, none once it is resident. A resident
-        boundary arg's remaining clone-in load is one aggregate transfer, so it stays
-        with the ordinary bytes. Zero when ``replication`` is 1 (nothing to price
-        differently), so callers can subtract it from ``hbm_elems`` unconditionally."""
+        non-resident replicated operand's loads, none once it is resident. Zero when
+        ``replication`` is 1 (nothing to price differently), so callers can subtract it
+        from ``hbm_elems`` unconditionally."""
         if isinstance(self.replication, int) and self.replication == 1:
             return 0
-        is_lx = int(self.is_lx) if isinstance(self.is_lx, bool) else self.is_lx
-        return self.elems * self.loop_factor * self.replication * (1 - is_lx)
+        return self.elems * self.loop_factor * self.replication * (1 - self.is_lx)
 
     @property
     def mem(self) -> str:
@@ -351,8 +367,8 @@ class OpFeatures:
         scaled by ``loop_factor`` (L for a per-tile accumulator re-read every iteration,
         1 for an advancing tiled arg or a normal arg). A broadcast operand carries its
         real (one-row/-col) ``elems`` -- loaded once, NOT scaled to the output. A read
-        of a GRAPH INPUT stays charged when LX-resident: pinning it inserts a clone that
-        performs exactly this load (``ArgTraffic.is_boundary``).
+        of a resident GRAPH INPUT is served from LX by its clone, whose own load is
+        :meth:`clone_in_bytes`, not part of this op's read.
         """
         return (
             sum(a.hbm_elems() for a in self.args if a.role == "input")
@@ -361,16 +377,21 @@ class OpFeatures:
 
     def write_bytes(self) -> int:
         """HBM bytes WRITTEN (output args), scaled by ``loop_factor``. A GRAPH OUTPUT's
-        write stays charged when LX-resident, for the mirror-image reason
-        ``read_bytes`` gives: the clone-out still writes it to HBM."""
+        write stays charged when LX-resident: the clone-out still writes it to HBM."""
         return (
             sum(a.hbm_elems() for a in self.args if a.role == "output")
             * self.dtype_bytes
         )
 
+    def clone_in_bytes(self) -> int:
+        """HBM bytes the clones of this op's resident graph inputs load, for the inputs
+        whose clone-in this op's bundle owns (``ArgTraffic.clone_in_elems``)."""
+        return sum(a.clone_in_elems() for a in self.args) * self.dtype_bytes
+
     def hbm_bytes(self) -> int:
-        """Total HBM traffic = read + write (kept for the dump / LAST_IO totals)."""
-        return self.read_bytes() + self.write_bytes()
+        """Total HBM traffic = read + write + clone-in (kept for the dump / LAST_IO
+        totals)."""
+        return self.read_bytes() + self.write_bytes() + self.clone_in_bytes()
 
     def lx_bytes(self) -> int:
         return sum(a.elems * a.is_lx for a in self.args) * self.dtype_bytes
@@ -1237,6 +1258,22 @@ def _fused_hbm_bytes(ops: list) -> tuple:
     return r, w
 
 
+def _clone_in_bytes(ops: list):
+    """HBM bytes a bundle's input clones load: each resident graph input whose clone-in
+    this bundle owns, counted ONCE however many of the bundle's ops read it (the same
+    by-name ``max`` de-duplication as ``_fused_hbm_bytes``). Kept out of the bundle's
+    read total, because the clone is its own read-only pass: ``predict_ops`` prices it
+    alone rather than inside the bundle's read/write turnaround."""
+    ext_in: dict = {}
+    for o in ops:
+        for a in o.args:
+            b = a.clone_in_elems() * o.dtype_bytes
+            if isinstance(b, int) and b == 0:
+                continue
+            ext_in[a.name] = _max_traffic(ext_in[a.name], b) if a.name in ext_in else b
+    return sum(ext_in.values())
+
+
 def _replicated_operand_reads(ops: list, p: "CostParams") -> tuple:
     """(bytes, ns) of the REPLICATED matmul operand loads in a bundle.
 
@@ -1874,7 +1911,13 @@ def predict_ops(ops: list, params: CostParams | None = None) -> float:
     # as beside a 25 us relu, so it does not hide behind PT-array work either. See
     # relayout_ns() and the CostParams note for the fitted law and its validity range.
     rel_ns = sum(relayout_ns(o, p) for o in ops)
-    t = compute + mem_t - p.overlap_gamma * min(compute, mem_t) + rel_ns
+    # INPUT CLONE-IN: the clone of a resident graph input is likewise its own DSC, a
+    # read-only pass from HBM into LX, so it adds at BW_PEAK outside the overlap and
+    # outside the bundle's read/write turnaround, whose readers it serves from LX.
+    # Measured on x*2 + x*3 (cores=32): with the clone the fused kernel is exactly one
+    # read plus one write at 150 GB/s (113 us at x = 8 MiB, 222 us at 16 MiB).
+    clone_ns = _clone_in_bytes(ops) / p.bw_peak_gbps
+    t = compute + mem_t - p.overlap_gamma * min(compute, mem_t) + rel_ns + clone_ns
     # (A genuine-reduction cross-core ring-combine term once lived here; it is provably
     # bounded by ~cores * a tiny per-elem cost <= ~5 ns -- below run-to-run noise --
     # so it is dropped as inert. K is never split for matmul, so there is no matmul
@@ -2021,8 +2064,8 @@ def charge_boundary_reads_once(bundles: list) -> list:
     """Charge each graph input's clone-in load to the FIRST bundle that reads it.
 
     Pinning a graph input inserts ONE clone (``allocator._push_allocation``) that loads it
-    from HBM once for the whole graph; every other reader is then served from LX. Within a
-    bundle ``_fused_hbm_bytes`` already de-duplicates, so keeping the boundary charge in
+    from HBM once for the whole graph; every reader is then served from LX. Within a
+    bundle ``_clone_in_bytes`` already de-duplicates, so keeping the clone-in charge in
     the first reading bundle and clearing it in the rest prices exactly that one load, for
     any number of readers.
 
@@ -2033,10 +2076,11 @@ def charge_boundary_reads_once(bundles: list) -> list:
     ``amax`` and ``sub``). Leaving the stamp intact also makes the rewrite idempotent and
     independent of which bundle is first.
 
-    A later bundle's read is then priced like any other arg: freed by residency, because
-    the clone is what served it, and charged in full without residency, because every
-    bundle re-reads an HBM input. Which bundle is first does not depend on residency, so
-    the rewrite is static and the objective stays linear in the solver's ``sym_is_lx``.
+    Every bundle's read, the first included, is priced like any other arg: freed by
+    residency, because the clone is what served it, and charged in full without
+    residency, because every bundle re-reads an HBM input. Which bundle is first does not
+    depend on residency, so the rewrite is static and the objective stays linear in the
+    solver's ``sym_is_lx``.
     """
     seen: set = set()
     out = []
@@ -2089,14 +2133,16 @@ def explain(ops: list, params: CostParams | None = None) -> str:
             bc = " broadcast (loaded once)" if a.broadcast else ""
             lf = f" xL={a.loop_factor}" if a.loop_factor > 1 else ""
             bd = ""
-            if a.is_graph_boundary:
+            if a.is_graph_boundary and a.role == "output":
+                bd = " graph boundary (charged despite LX)"
+            elif a.is_graph_boundary:
                 bd = (
-                    " graph boundary (charged despite LX)"
+                    " graph boundary (clone-in charged here if LX)"
                     if a.owns_boundary_charge
-                    else " graph boundary (charged to an earlier bundle)"
+                    else " graph boundary (clone-in charged to an earlier bundle)"
                 )
             rp = f" x{a.replication} replicas" if a.replication != 1 else ""
-            counted = a.hbm_elems() * o.dtype_bytes
+            counted = (a.hbm_elems() + a.clone_in_elems()) * o.dtype_bytes
             dev = a.dims if a.dims else [a.elems]
             log = f"torch {a.logical} -> " if a.logical else ""
             try:
@@ -2177,8 +2223,16 @@ def explain(ops: list, params: CostParams | None = None) -> str:
     parts = "(R+W)/BW_PEAK + a*min(R,W)"
     if eff < 1.0:
         parts = f"[{parts}] / eff_underfill"
+    clone = _clone_in_bytes(ops)
+    if not (isinstance(clone, int) and clone == 0):
+        parts = f"{parts} + CLONE_IN/BW_PEAK"
     lines.append(f"  -- prediction (turnaround): T = {parts} --")
     lines.append(f"     R={R}B (read)   W={W}B (write)")
+    if not (isinstance(clone, int) and clone == 0):
+        lines.append(
+            f"     clone_in = {clone}/{p.bw_peak_gbps:.0f} = "
+            f"{clone / p.bw_peak_gbps / 1000:.2f} us (own read-only pass)"
+        )
     lines.append(f"     base = (R+W)/{p.bw_peak_gbps:.0f} = {base / 1000:.2f} us")
     lines.append(
         f"     turn = a*min(R,W) = {p.rw_turnaround_ns_per_byte}*{min(R, W)} "

@@ -902,8 +902,9 @@ def _record_last_io(feats: list) -> None:
             # to the total: own size x loop_factor for an HBM arg (L for a per-tile
             # accumulator re-accessed each loop iteration, 1 otherwise), the small
             # one-load size for a broadcast operand, ~free for LX -- except a graph
-            # boundary this bundle pays for, which stays charged despite LX.
-            counted = a.hbm_elems() * o.dtype_bytes
+            # output's write, which stays charged despite LX, and the clone-in load of
+            # a resident graph input whose clone this bundle pays for.
+            counted = (a.hbm_elems() + a.clone_in_elems()) * o.dtype_bytes
             args.append(
                 {
                     "name": a.name,
