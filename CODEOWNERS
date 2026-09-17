@@ -51,6 +51,13 @@
 /pytest_models.ini        @ashokponkumar @jabostian @anubhavjana @n-marion
 /Makefile                 @ashokponkumar @jabostian @anubhavjana @n-marion
 
+# CI libraries shipped from extensions/ (own pyproject, excluded from the torch_spyre wheel).
+# Same owners as /.github/ above: extensions/clickhouse-ingest holds the ClickHouse schema and
+# derived-identity functions the CI ingests run on, so a change here is a CI change even though
+# it lives outside /.github/. Scoped to the directory rather than all of extensions/, which also
+# holds non-CI tools (spyre-cli) that keep the default owners.
+/extensions/clickhouse-ingest/  @ashokponkumar @jabostian @anubhavjana @n-marion
+
 # ktir-mlir-frontend pin and its installer.  Two files rather than /tools/, which
 # is otherwise CI's: which frontend revision the OpSpec->KTIR emitter is tested
 # against is a fact about /torch_spyre/_inductor/.
