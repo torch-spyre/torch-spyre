@@ -6,7 +6,6 @@ inputs:
   rpm_names:
     description: A space separated list of RPM names to download and install
     required: true
-    type: string
   rpm_location:
     description: |
       Full Artifactory URL to download RPMs from (e.g.

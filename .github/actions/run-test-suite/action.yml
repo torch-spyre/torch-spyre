@@ -10,7 +10,6 @@ inputs:
   torch_spyre_dir:
     description: Path to the pre-cloned torch-spyre directory
     required: false
-    type: string
     default: torch-spyre
   venv_path:
     description: >
@@ -20,7 +19,6 @@ inputs:
       dev image. Absolute paths are used as-is; a relative path resolves
       against the process working directory. Default '.venv'.
     required: false
-    type: string
     default: .venv
   suite_name:
     description: Human-readable label (used in echo/log output)
