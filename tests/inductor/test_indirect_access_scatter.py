@@ -451,6 +451,41 @@ class _ScatterScenarios:
             kernel, dst.clone().to("spyre"), idx.to("spyre"), src.to("spyre")
         )
 
+    def test_index_copy_p1_multi_singleton_target_dim1_e2e(self):
+        """Regression: P=1 scatter targeting dim=1 on a shape with multiple singleton dimensions [1, 1, 64, 256].
+
+        When a tensor contains multiple singleton dimensions, the disambiguation logic in
+        _p1_scatter_device_pos ensures dim 1 is targeted and rotated outermost instead of
+        wrongly picking dim 0.
+        """
+        batch, num_heads, seq, head_dim = 1, 1, 64, 256
+        dst = torch.zeros(batch, num_heads, seq, head_dim, dtype=torch.float16)
+        src = torch.randn(batch, 1, seq, head_dim, dtype=torch.float16)
+        idx = torch.tensor([0], dtype=torch.int64)
+
+        def kernel(dst, idx, src):
+            dst.index_copy_(1, idx, src)
+            return dst
+
+        self._assert_compiled_matches_cpu(
+            kernel, dst.clone().to("spyre"), idx.to("spyre"), src.to("spyre")
+        )
+
+    def test_index_copy_p1_multi_singleton_target_dim2_e2e(self):
+        """Regression: P=1 scatter targeting dim=2 on a shape with multiple leading singleton dimensions [1, 1, 64, 256]."""
+        batch, num_heads, seq, head_dim = 1, 1, 64, 256
+        dst = torch.zeros(batch, num_heads, seq, head_dim, dtype=torch.float16)
+        src = torch.randn(batch, num_heads, 1, head_dim, dtype=torch.float16)
+        idx = torch.tensor([7], dtype=torch.int64)
+
+        def kernel(dst, idx, src):
+            dst.index_copy_(2, idx, src)
+            return dst
+
+        self._assert_compiled_matches_cpu(
+            kernel, dst.clone().to("spyre"), idx.to("spyre"), src.to("spyre")
+        )
+
     def test_index_put_decode_e2e(self):
         """Regression: P=1 index_put on a paged-KV-cache-shaped layout.
 
