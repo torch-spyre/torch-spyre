@@ -223,15 +223,18 @@ def triple_nested_stardep_outer_reference(
 
 
 def triple_nested_stardep_middle_fn(X: torch.Tensor, Y: torch.Tensor) -> torch.Tensor:
-    """Three levels deep (outer B, middle M, inner K); StarDep at middle only.
+    """Three levels deep (outer B, middle M, inner K); StarDep at outer AND middle.
 
-    The outer level's x_b_tile is routed through elementwise (`* 1.0`),
-    causing its markers to be INLINE_ERASED. The middle level's tiles
-    (x_m_tile, y_m_whole) are consumed directly by the inner for_each_tile
-    call (which contains matmuls), so the middle markers are STAR_DEP_KEPT
-    (2 markers). The inner level's x_k_tile is routed through elementwise
-    (`* 1.0`), causing its marker to be INLINE_ERASED. Exercises propagation
-    through exactly one more splice level above STAR_DEP_KEPT markers.
+    CORRECTED (final whole-branch review): empirical measurement
+    (instrumenting `_consume_tile_dim_markers` per splice call) shows this
+    fixture actually resolves to 1 STAR_DEP_KEPT marker at the outer level
+    (from `y_b_tile`, which is never routed through an elementwise op --
+    only `x_b_tile` gets `* 1.0`) plus 1 STAR_DEP_KEPT marker at the middle
+    level, not "2 markers at middle only" as originally documented. The
+    inner level's x_k_tile is routed through elementwise (`* 1.0`), causing
+    its marker to be INLINE_ERASED, as originally documented. Exercises
+    propagation through splice levels above two independently-resolved
+    STAR_DEP_KEPT markers, one level apart.
 
     Note: .squeeze(0) on outer tiles reconciles the outer loop's tile_size=1
     singleton batch dimension with the middle loop's 2-D input expectation.
@@ -296,12 +299,24 @@ def triple_nested_stardep_middle_reference(
 
 
 def triple_nested_stardep_inner_fn(X: torch.Tensor, Y: torch.Tensor) -> torch.Tensor:
-    """Three levels deep (outer B, middle M, inner K); StarDep at inner only.
+    """Three levels deep (outer B, middle M, inner K).
 
-    The shallowest case: outer and middle route through an elementwise op
-    (INLINE_ERASED); the inner level's tile feeds directly into the matmul
-    (STAR_DEP_KEPT), same shape as nested_split_m_then_k_fn's inner level
-    but one level deeper.
+    CORRECTED (final whole-branch review): this fixture's name/original
+    docstring claimed "StarDep at inner only," but empirical measurement
+    (instrumenting `_consume_tile_dim_markers` per splice call) shows the
+    opposite: the inner level's marker is INLINE_ERASED (matmul consumes it
+    directly, no StarDep involved), and the surviving STAR_DEP_KEPT marker
+    is at the OUTER level instead -- because `y_b_tile` is never routed
+    through an elementwise op (only `x_b_tile` gets `* 1.0`), so `y_b_tile`'s
+    marker has no fusable consumer and stays live. This fixture does not
+    currently exercise an inner-level STAR_DEP_KEPT marker at all; it
+    exercises the same outer-level-only configuration as
+    triple_nested_stardep_outer_fn/multilevel_fn, just with a different
+    middle-level structure. Left in place (removing it would lose the
+    middle-level elementwise-routing structural variation) but the name is
+    now misleading -- see follow-up note in task-6 final-review ledger
+    entry re: genuinely isolating each level would need `* 1.0` on
+    `y_b_tile` too, which is a fixture-body change, not a docstring fix.
 
     Note: .squeeze(0) on outer tiles reconciles the outer loop's tile_size=1
     singleton batch dimension with the middle loop's 2-D input expectation.
@@ -381,17 +396,28 @@ def triple_nested_stardep_multilevel_fn(
     between two independent marker_resolution stamps in the same splice
     chain that the single-level variants cannot surface.
 
-    NOTE (Step 2 finding): This fixture was intended to exercise both outer
-    and inner STAR_DEP_KEPT markers independently. However, empirical
-    verification reveals the inner-level marker is completely lost when the
-    outer level is STAR_DEP_KEPT, whereas triple_nested_stardep_inner_fn
-    (where outer is INLINE_ERASED) preserves the inner marker. This appears to
-    be a marker-pipeline bug where stacking two STAR_DEP_KEPT levels causes
-    the deeper one to disappear (likely issue #4581 territory). Therefore,
-    this fixture currently exercises only the outer 2 STAR_DEP_KEPT markers,
-    identical to triple_nested_stardep_outer_fn. The middle-level elementwise
-    is preserved as a structural probe for future investigation. See
-    task-3-report.md for full investigation and follow-up gap tracking.
+    NOTE (Step 2 finding, CORRECTED at final whole-branch review): This
+    fixture was intended to exercise both outer and inner STAR_DEP_KEPT
+    markers independently. Empirical verification (instrumenting
+    `_consume_tile_dim_markers` per splice call) confirms the inner-level
+    marker is completely lost/erased here -- but the originally-documented
+    contrast case was wrong: triple_nested_stardep_inner_fn does NOT
+    preserve an inner-level marker either (see its own corrected docstring)
+    -- its survivor is also at the outer level, via the same `y_b_tile`
+    asymmetry as this fixture. So inner-marker erasure for this operand
+    shape looks like the norm across outer_fn, inner_fn, and the
+    pre-existing nested_split_m_then_k_fn, not something specific to
+    stacking two STAR_DEP_KEPT levels. The underlying "does stacking two
+    STAR_DEP_KEPT levels lose the deeper one" question (likely issue #4581
+    territory) remains open, but this fixture's measurement alone does not
+    establish it -- a fixture where the inner marker demonstrably survives
+    in isolation (e.g. with the `y_b_tile`-style asymmetry fixed at every
+    level) would be needed to actually test that hypothesis. This fixture
+    currently exercises only the outer 2 STAR_DEP_KEPT markers, identical to
+    triple_nested_stardep_outer_fn. The middle-level elementwise is
+    preserved as a structural probe for future investigation. See
+    task-3-report.md for the original investigation and the final
+    whole-branch review's ledger entry for the correction.
 
     Note: .squeeze(0) on outer tiles reconciles the outer loop's tile_size=1
     singleton batch dimension with the middle loop's 2-D input expectation.
