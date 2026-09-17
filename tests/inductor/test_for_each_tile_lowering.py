@@ -118,6 +118,67 @@ class TestCarryBindingsFor(unittest.TestCase):
 
 
 class TestSpliceWhileLoop(unittest.TestCase):
+    def test_accumulator_view_tags_backing_storage(self):
+        """A view-backed carry records ownership on its mutable Buffer."""
+        from torch._inductor import ir
+
+        import torch_spyre._inductor.wsr.while_loop_bridge as bridge
+
+        def computed_buffer(name, size, stride):
+            data = mock.MagicMock(spec=ir.Pointwise)
+            data.ranges = list(size)
+            op = ir.ComputedBuffer(
+                name=name,
+                layout=ir.FixedLayout(
+                    device=torch.device("cpu"),
+                    dtype=torch.float32,
+                    size=list(size),
+                    stride=list(stride),
+                ),
+                data=data,
+            )
+            op.operation_name = name
+            return op
+
+        storage = computed_buffer("carry_storage", (2, 3), (3, 1))
+        target = ir.ReinterpretView(
+            data=ir.StorageBox(storage),
+            layout=ir.FixedLayout(
+                device=torch.device("cpu"),
+                dtype=torch.float32,
+                size=[3, 2],
+                stride=[1, 3],
+            ),
+        )
+        real_input = ir.TensorBox(target)
+        producer = computed_buffer("carry_update", (3, 2), (2, 1))
+        binding = bridge.CarryBinding(
+            carry_index=0,
+            initial=real_input,
+            body_output=producer,
+            scratch_name="unused_scratch",
+        )
+        graph = mock.Mock()
+        graph.operations = []
+        graph.mark_buffer_mutated = mock.Mock()
+
+        with V.set_graph_handler(graph):
+            body_ops = bridge._rewire_accumulator_output(
+                graph,
+                mock.Mock(),
+                binding,
+                [producer],
+                real_input,
+            )
+
+        self.assertEqual(body_ops, [producer])
+        self.assertIs(producer.layout.target, target)
+        record = storage._loop_carry_record
+        self.assertEqual(record.storage_name, "carry_storage")
+        self.assertEqual(record.update_name, "carry_update")
+        self.assertIs(producer._loop_carry_record, record)
+        self.assertFalse(hasattr(target, "_loop_carry_record"))
+
     def test_removes_while_op_and_inserts_body_ops(self):
         import torch_spyre._inductor.wsr.while_loop_bridge as bridge
 
@@ -1252,11 +1313,16 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
         this test. Covers both wrong-count shapes in one test (zero, then
         two), each built directly via this class's established
         mock.Mock(spec=[...]) convention (see TestSpliceWhileLoop above)
-        rather than a full torch.compile, since driving a real for_each_
-        tile fixture into either of these malformed shapes is not
-        possible through the ordinary lowering path -- both are meant to
-        be unreachable there, which is exactly why they need direct
-        construction to exercise at all.
+        rather than a full torch.compile. The zero-consumer shape is
+        believed unreachable through the ordinary lowering path, which is
+        why it needs direct construction to exercise at all. The
+        two-consumer shape is NOT unreachable: it is reached for real by
+        for_each_tile_fixtures.py's sibling_nested_fn/sibling_nested_
+        stardep_fn (two independent WhileLoops both consuming a single
+        outer marker on their shared tiled operand via StarDep -- see
+        those fixtures' docstrings, issue #4581 territory). It is still
+        built directly here too, for a fast, isolated unit test of the
+        guard itself rather than a full torch.compile round-trip.
         """
         import sympy
 
@@ -1326,6 +1392,242 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
             with self.assertRaisesRegex(AssertionError, r"has 2 consuming reads"):
                 _consume_tile_dim_markers(two_group_ops, two_operations)
 
+    def test_consume_tile_dim_markers_stamps_marker_resolution(self):
+        """_consume_tile_dim_markers stamps tile_marker_resolution per marker.
+
+        Builds two markers: one whose single consumer is an ordinary
+        ComputedBuffer-shaped read (MemoryDep, inline-erase branch) and one
+        whose single consumer is StarDep-shaped (kept-materialized branch).
+        Confirms each marker ends up stamped with the matching
+        MarkerResolution member, and that the inline-erased marker is
+        removed from operations/group_ops while the StarDep-kept one
+        survives in both -- the pre-existing behavior this task must not
+        change, now observable through the new field.
+
+        The StarDep consumer is a bare mock.Mock(spec=[...]), matching
+        test_consume_tile_dim_markers_raises_on_wrong_consumer_count's
+        convention -- that branch never calls get_read_writes() on
+        anything but the mocked reads list. The inline-erase branch is
+        different: _inline_marker_into_consumer/replace_computed_buffer_body
+        constructs a genuine new ComputedBuffer and _consume_tile_dim_
+        markers immediately re-derives its post-inline dep from a REAL
+        new_consumer.get_read_writes() call (not a mock return value), which
+        recurses into real Inductor tracing (ComputedBuffer.get_read_writes
+        -> extract_read_writes -> data.get_pointwise_size()/make_loader())
+        that only works against genuine ir.Pointwise/ir.FixedLayout objects
+        and a real SizeVarAllocator on V.graph -- a bare mock.Mock() for
+        `.data`/`.layout` (confirmed empirically) fails inside that real
+        tracing machinery well before reaching this pass's own logic, so
+        the inline marker/consumer pair here is built from minimal real IR
+        pieces instead.
+        """
+        import sympy
+
+        from torch._inductor.dependencies import MemoryDep, StarDep
+        from torch._inductor.ir import FixedLayout, Pointwise
+        from torch._inductor.sizevars import SizeVarAllocator
+        from torch._inductor.virtualized import ops
+        from torch_spyre._inductor.wsr.for_each_tile_lowering import (
+            MarkerResolution,
+            _consume_tile_dim_markers,
+            _marker_resolution,
+        )
+
+        def make_marker_op(name):
+            marker_op = mock.Mock(
+                name=name,
+                spec=[
+                    "get_read_writes",
+                    "get_name",
+                    "tile_marker_dim",
+                    "data",
+                    "layout",
+                ],
+            )
+            marker_op.get_name.return_value = name
+            marker_op.tile_marker_dim = 0
+            marker_op.data = mock.Mock()
+            marker_op.layout = mock.Mock(size=(4,), stride=(1,), offset=0)
+            marker_rw = mock.Mock()
+            d0 = sympy.Symbol("d0")
+            marker_rw.reads = [
+                MemoryDep(name="input_buf", index=d0, var_names=(d0,), size=(4,))
+            ]
+            # _marker_substitution (for_each_tile_lowering.py) also reads
+            # the marker's own WRITE dep off this same get_read_writes()
+            # call, to recover the var_names it substitutes the inline
+            # consumer's load-site coordinates into.
+            marker_rw.writes = [
+                MemoryDep(name=name, index=d0, var_names=(d0,), size=(4,))
+            ]
+            marker_op.get_read_writes.return_value = marker_rw
+            return marker_op
+
+        def make_inline_consumer(name, marker_name):
+            consumer_op = mock.Mock(
+                name=name,
+                spec=[
+                    "get_read_writes",
+                    "get_name",
+                    "get_operation_name",
+                    "data",
+                    "layout",
+                    "operation_name",
+                    "_split_size",
+                    "_original_inner_fn",
+                    "_original_ranges",
+                    "_original_reduction_ranges",
+                    "origins",
+                    "origin_node",
+                ],
+            )
+            consumer_op.get_name.return_value = name
+            consumer_op.get_operation_name.return_value = name
+
+            def inner_fn(index):
+                return ops.load(marker_name, index[0])
+
+            # A real Pointwise/FixedLayout pair -- required because
+            # _consume_tile_dim_markers calls the real
+            # ComputedBuffer.get_read_writes() on the reconstructed
+            # consumer below (see this test's docstring); a mock.Mock()
+            # `.data`/`.layout` cannot satisfy that real tracing path.
+            consumer_op.data = Pointwise(
+                device=torch.device("cpu"),
+                dtype=torch.float32,
+                inner_fn=inner_fn,
+                ranges=[sympy.Integer(4)],
+            )
+            consumer_op.layout = FixedLayout(torch.device("cpu"), torch.float32, [4])
+            consumer_op.operation_name = name
+            consumer_op._split_size = None
+            consumer_op._original_inner_fn = None
+            consumer_op._original_ranges = None
+            consumer_op._original_reduction_ranges = None
+            consumer_op.origins = set()
+            consumer_op.origin_node = None
+            consumer_rw = mock.Mock()
+            consumer_rw.reads = [
+                MemoryDep(
+                    name=marker_name, index=sympy.Integer(0), var_names=(), size=()
+                )
+            ]
+            consumer_op.get_read_writes.return_value = consumer_rw
+            return consumer_op
+
+        def make_stardep_consumer(name, marker_name):
+            consumer_op = mock.Mock(name=name, spec=["get_read_writes", "get_name"])
+            consumer_op.get_name.return_value = name
+            consumer_rw = mock.Mock()
+            consumer_rw.reads = [StarDep(name=marker_name, mode=None)]
+            consumer_op.get_read_writes.return_value = consumer_rw
+            return consumer_op
+
+        inline_marker = make_marker_op("inline_marker")
+        inline_consumer = make_inline_consumer("inline_consumer", "inline_marker")
+        stardep_marker = make_marker_op("stardep_marker")
+        stardep_consumer = make_stardep_consumer("stardep_consumer", "stardep_marker")
+
+        group_ops = [inline_marker, inline_consumer, stardep_marker, stardep_consumer]
+        operations = list(group_ops)
+        # Real SizeVarAllocator: is_zero_elements() (hit while re-tracing
+        # the reconstructed inline consumer's get_read_writes(), see this
+        # test's docstring) calls V.graph.sizevars.statically_known_true(),
+        # which a plain mock.Mock() cannot satisfy.
+        graph = mock.Mock(
+            spec=["operations", "name_to_buffer", "name_to_op", "sizevars"]
+        )
+        graph.operations = operations
+        graph.name_to_buffer = {}
+        graph.name_to_op = {}
+        graph.sizevars = SizeVarAllocator()
+
+        with V.set_graph_handler(graph):
+            _consume_tile_dim_markers(group_ops, operations)
+
+        self.assertEqual(
+            _marker_resolution(inline_marker),
+            MarkerResolution.INLINE_ERASED,
+            "expected the ComputedBuffer/MemoryDep-consumed marker to be "
+            "stamped INLINE_ERASED",
+        )
+        self.assertEqual(
+            _marker_resolution(stardep_marker),
+            MarkerResolution.STAR_DEP_KEPT,
+            "expected the StarDep-consumed marker to be stamped STAR_DEP_KEPT",
+        )
+        self.assertNotIn(
+            inline_marker,
+            operations,
+            "inline-erased marker must still be removed from operations "
+            "(pre-existing behavior, must not regress)",
+        )
+        self.assertIn(
+            stardep_marker,
+            operations,
+            "StarDep-kept marker must still remain in operations "
+            "(pre-existing behavior, must not regress)",
+        )
+
+    def test_synthesize_dim_hints_skips_only_inline_erased_markers(self):
+        """_synthesize_dim_hints_for_group's guard: skip INLINE_ERASED only.
+
+        Before this fix, the guard was `_marker_dim(op) is not None`, which
+        skips BOTH marker kinds -- silently dropping a hint for a
+        STAR_DEP_KEPT marker's own upstream read, exactly the issue #4581
+        gap. This test builds one op of each MarkerResolution kind (plus a
+        plain non-marker op as a control) and confirms only the
+        INLINE_ERASED one is skipped.
+        """
+        import sympy
+
+        from torch_spyre._inductor.wsr.for_each_tile_lowering import (
+            MarkerResolution,
+            _synthesize_dim_hints_for_group,
+        )
+
+        loop_var = sympy.Symbol("d0")
+        trip_count = sympy.Integer(4)
+
+        def make_op(name, resolution):
+            op = mock.Mock(
+                name=name, spec=["data", "dim_hints", "tile_marker_resolution"]
+            )
+            op.data = mock.Mock(reduction_type=None)
+            op.dim_hints = []
+            op.tile_marker_resolution = resolution
+            return op
+
+        inline_erased_op = make_op("inline_erased_op", MarkerResolution.INLINE_ERASED)
+        stardep_kept_op = make_op("stardep_kept_op", MarkerResolution.STAR_DEP_KEPT)
+        plain_op = mock.Mock(name="plain_op", spec=["data", "dim_hints"])
+        plain_op.data = mock.Mock(reduction_type=None)
+        plain_op.dim_hints = []
+
+        _synthesize_dim_hints_for_group(
+            [inline_erased_op, stardep_kept_op, plain_op],
+            loop_var,
+            hint_id=0,
+            trip_count=trip_count,
+        )
+
+        self.assertEqual(
+            inline_erased_op.dim_hints,
+            [],
+            "INLINE_ERASED marker must still get no synthesized hint",
+        )
+        self.assertEqual(
+            len(stardep_kept_op.dim_hints),
+            1,
+            "STAR_DEP_KEPT marker must now get a synthesized hint (the "
+            "issue #4581 fix)",
+        )
+        self.assertEqual(
+            len(plain_op.dim_hints),
+            1,
+            "an ordinary non-marker op must still get a synthesized hint",
+        )
+
     def test_nested_for_each_tile_markers_resolve_correctly(self):
         """Two tile_dim_marker-tagged reads at two nesting levels resolve.
 
@@ -1353,16 +1655,25 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
         irrelevant to what this test checks. Issue #4460's stick-layout/
         read-copy gap (the same gap test_carry_mode_split_k is xfailed
         for in test_for_each_tile_e2e.py) is now fixed for this fixture's
-        shape, but nested_split_m_then_k_fn's inner loop still hits a
-        distinct, out-of-scope issue #4581 gap (an outer-tile-carry
-        symbol not recognized as indirect inside the inner WhileLoop
-        body) during codegen, well after splice_while_loops has already
-        completed -- so instead of driving the pipeline all the way
-        through codegen, this test monkeypatches splice_while_loops
-        itself (the name torch_spyre._inductor.passes imports and calls
-        directly) to capture a *snapshot* of graph.operations right as it
-        returns, and tolerates the InductorError issue #4581 raises
-        afterward in a later, unrelated pass.
+        shape. The marker_resolution-aware guard in
+        _synthesize_dim_hints_for_group (this task's fix) makes the
+        STAR_DEP_KEPT outer marker get a synthesized dim hint it
+        previously lacked -- confirmed real progress, since the pipeline
+        now runs past the original codegen-time "indirect symbol" lookup
+        failure -- but the fixture still does not run cleanly to
+        completion: it now fails one stage further in, during
+        op_spec_validation's symbol-consistency check ("OS-5") on a
+        synthetic `identity` op inserted by splice_while_loops's carry/
+        tile-read redirect -- a distinct, not-yet-filed follow-up gap to
+        issue #4581 (see this test's tolerant except below for the exact
+        error and origin-tag lead). This test monkeypatches
+        splice_while_loops itself (the
+        name torch_spyre._inductor.passes imports and calls directly) to
+        capture a *snapshot* of graph.operations right as it returns, and
+        tolerates the new OS-5 InductorError afterward in a later,
+        unrelated pass -- the same structure the original test used for
+        the "indirect symbol" error it used to tolerate, updated to the
+        new error this fix's guard change causes the pipeline to reach.
 
         The capture must be a snapshot (``list(graph.operations)``, a new
         list object), not a live reference to ``graph`` or to
@@ -1418,16 +1729,22 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
         try:
             capture_post_grad_while_loop(nested_split_m_then_k_fn, (X, Y))
         except InductorError as exc:
-            # Expected: codegen (much later, unrelated to splicing) hits
-            # issue #4581 after splice_while_loops has already completed
+            # Expected: op_spec_validation (much later, unrelated to
+            # splicing) hits a distinct, not-yet-filed follow-up gap to
+            # issue #4581 -- an OpSpecValidationError ("OS-5" symbol-
+            # consistency check) on a synthetic `identity` op tagged
+            # reason='redirect while_loop carry/tile reads to persistent
+            # scratch' (from splice_while_loops's carry/tile-read
+            # redirect) -- after splice_while_loops has already completed
             # and this test's capture has already fired. Any OTHER
-            # exception is a real, unexpected finding -- do not swallow
-            # it.
+            # exception -- including the original "indirect symbol"
+            # error, which this guard fix should have moved the pipeline
+            # past -- is a real, unexpected finding; do not swallow it.
             self.assertIn(
-                "indirect symbol",
+                "OpSpecValidationError",
                 str(exc),
-                "expected the known issue #4581 indirect-symbol gap, got a "
-                f"different InductorError: {exc!r}",
+                "expected the known #4581 follow-up OS-5 symbol-"
+                f"consistency gap, got a different InductorError: {exc!r}",
             )
         finally:
             passes_mod.splice_while_loops = original_splice_while_loops
@@ -1472,6 +1789,243 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
             "_consume_tile_dim_markers's own docstring on why that branch "
             "keeps its marker materialized rather than erasing it)",
         )
+
+    def test_triple_nested_stardep_outer_resolves_correctly(self):
+        """Three-level nesting, STAR_DEP_KEPT at the outer level: marker
+        splicing/resolution (this plan's actual fix) completes correctly,
+        but the fixture still cannot compile to completion.
+
+        Directly analogous to test_nested_for_each_tile_markers_resolve_
+        correctly's finding for the (simpler, 2-level)
+        nested_split_m_then_k_fn fixture: splice_while_loops fully splices
+        both WhileLoop ops (0 remain) and both outer-level STAR_DEP_KEPT
+        markers survive correctly-tagged, but compilation later fails one
+        stage further in, during op_spec_validation's OS-5 symbol-
+        consistency check on a synthetic `identity` op inserted by
+        splice_while_loops's carry/tile-read redirect -- the SAME
+        not-yet-filed follow-up gap to issue #4581 documented on that test
+        and on test_nested_for_each_tile_value_correct, now independently
+        confirmed to also block depth=3 nesting (not just depth=2). Per
+        this plan's Task 2 ruling, this OS-5 gap is tracked follow-on scope,
+        not a blocker for the marker_resolution fix itself. This test
+        tolerates specifically that error (asserting "OpSpecValidationError"
+        is in the message -- narrower than a bare except, so a regression
+        to a *different* error, e.g. the original pre-fix "indirect symbol"
+        failure, still fails loudly) rather than asserting full end-to-end
+        numeric correctness, which is not currently reachable for this
+        fixture.
+        """
+        import torch
+        import torch_spyre  # noqa: F401
+        from torch_spyre.constants import DEVICE_NAME
+        from tests.inductor.for_each_tile_fixtures import (
+            capture_post_grad_while_loop,
+            triple_nested_stardep_outer_fn,
+        )
+        from torch._inductor.exc import InductorError
+
+        X = torch.randn(2, 8, 12, device=DEVICE_NAME, dtype=torch.float16)
+        Y = torch.randn(2, 12, 6, device=DEVICE_NAME, dtype=torch.float16)
+        try:
+            capture_post_grad_while_loop(triple_nested_stardep_outer_fn, (X, Y))
+        except InductorError as exc:
+            self.assertIn(
+                "OpSpecValidationError",
+                str(exc),
+                "expected the known #4581 follow-up OS-5 symbol-consistency "
+                f"gap, got a different InductorError: {exc!r}",
+            )
+
+    def test_triple_nested_stardep_middle_resolves_correctly(self):
+        """Three-level nesting, STAR_DEP_KEPT at the middle level: marker
+        splicing/resolution completes correctly, but the fixture still
+        cannot compile to completion.
+
+        Same OS-5 follow-up gap as
+        test_triple_nested_stardep_outer_resolves_correctly -- see that
+        test's docstring for the full explanation. This test tolerates
+        specifically the OS-5 OpSpecValidationError rather than asserting
+        full end-to-end numeric correctness.
+        """
+        import torch
+        import torch_spyre  # noqa: F401
+        from torch_spyre.constants import DEVICE_NAME
+        from tests.inductor.for_each_tile_fixtures import (
+            capture_post_grad_while_loop,
+            triple_nested_stardep_middle_fn,
+        )
+        from torch._inductor.exc import InductorError
+
+        X = torch.randn(2, 8, 12, device=DEVICE_NAME, dtype=torch.float16)
+        Y = torch.randn(2, 12, 6, device=DEVICE_NAME, dtype=torch.float16)
+        try:
+            capture_post_grad_while_loop(triple_nested_stardep_middle_fn, (X, Y))
+        except InductorError as exc:
+            self.assertIn(
+                "OpSpecValidationError",
+                str(exc),
+                "expected the known #4581 follow-up OS-5 symbol-consistency "
+                f"gap, got a different InductorError: {exc!r}",
+            )
+
+    def test_triple_nested_stardep_inner_resolves_correctly(self):
+        """Three-level nesting, STAR_DEP_KEPT at the inner level: marker
+        splicing/resolution completes correctly, but the fixture still
+        cannot compile to completion.
+
+        Same OS-5 follow-up gap as
+        test_triple_nested_stardep_outer_resolves_correctly -- see that
+        test's docstring for the full explanation. This test tolerates
+        specifically the OS-5 OpSpecValidationError rather than asserting
+        full end-to-end numeric correctness.
+        """
+        import torch
+        import torch_spyre  # noqa: F401
+        from torch_spyre.constants import DEVICE_NAME
+        from tests.inductor.for_each_tile_fixtures import (
+            capture_post_grad_while_loop,
+            triple_nested_stardep_inner_fn,
+        )
+        from torch._inductor.exc import InductorError
+
+        X = torch.randn(2, 8, 12, device=DEVICE_NAME, dtype=torch.float16)
+        Y = torch.randn(2, 12, 6, device=DEVICE_NAME, dtype=torch.float16)
+        try:
+            capture_post_grad_while_loop(triple_nested_stardep_inner_fn, (X, Y))
+        except InductorError as exc:
+            self.assertIn(
+                "OpSpecValidationError",
+                str(exc),
+                "expected the known #4581 follow-up OS-5 symbol-consistency "
+                f"gap, got a different InductorError: {exc!r}",
+            )
+
+    def test_triple_nested_stardep_multilevel_resolves_correctly(self):
+        """Three-level nesting, STAR_DEP_KEPT at two levels at once: marker
+        splicing/resolution completes correctly, but the fixture still
+        cannot compile to completion.
+
+        Same OS-5 follow-up gap as
+        test_triple_nested_stardep_outer_resolves_correctly -- see that
+        test's docstring for the full explanation. This test tolerates
+        specifically the OS-5 OpSpecValidationError rather than asserting
+        full end-to-end numeric correctness.
+
+        NOTE: independent of the OS-5 gap, this fixture currently exercises
+        the SAME two outer-level markers as
+        test_triple_nested_stardep_outer_resolves_correctly, not independent
+        two-marker interaction. Task 3 found that triple_nested_stardep_
+        multilevel_fn's inner-level marker is completely absent after
+        splicing when the outer level is also STAR_DEP_KEPT (a separate,
+        real, independently-confirmed finding -- see that fixture's
+        docstring in for_each_tile_fixtures.py). This test does NOT prove
+        the intended independent-multi-marker-interaction case pending a
+        fix to that inner-marker-loss finding.
+        """
+        import torch
+        import torch_spyre  # noqa: F401
+        from torch_spyre.constants import DEVICE_NAME
+        from tests.inductor.for_each_tile_fixtures import (
+            capture_post_grad_while_loop,
+            triple_nested_stardep_multilevel_fn,
+        )
+        from torch._inductor.exc import InductorError
+
+        X = torch.randn(2, 8, 12, device=DEVICE_NAME, dtype=torch.float16)
+        Y = torch.randn(2, 12, 6, device=DEVICE_NAME, dtype=torch.float16)
+        try:
+            capture_post_grad_while_loop(triple_nested_stardep_multilevel_fn, (X, Y))
+        except InductorError as exc:
+            self.assertIn(
+                "OpSpecValidationError",
+                str(exc),
+                "expected the known #4581 follow-up OS-5 symbol-consistency "
+                f"gap, got a different InductorError: {exc!r}",
+            )
+
+    def test_sibling_nested_resolves_correctly(self):
+        """Two sibling (non-nested) for_each_tile loops sharing one outer
+        marker do NOT compile -- a real, already triple-confirmed
+        architectural gap, not a fixture bug.
+
+        sibling_nested_fn's outer for_each_tile stamps exactly one dim=0
+        marker on x_tile, and hands that same x_tile directly to both
+        sibling_a's and sibling_b's inner for_each_tile calls. Each lowers
+        to its own WhileLoop op, so the single marker ends up with 2
+        consuming reads via StarDep -- but _consume_tile_dim_markers's
+        hard assertion requires exactly 1. This is issue #4581 territory
+        (out of scope for this plan); see sibling_nested_fn's docstring in
+        for_each_tile_fixtures.py for the full mechanism writeup. This test
+        asserts (a) the eager reference is correct on its own (no device,
+        no compile) and (b) compiling raises the documented assertion,
+        matched on a naming-independent substring so it survives unrelated
+        upstream op-naming shifts.
+        """
+        import torch
+        import torch_spyre  # noqa: F401
+        import pytest
+        from torch._inductor.exc import InductorError
+        from torch_spyre.constants import DEVICE_NAME
+        from tests.inductor.for_each_tile_fixtures import (
+            capture_post_grad_while_loop,
+            sibling_nested_fn,
+            sibling_nested_reference,
+        )
+
+        X = torch.randn(8, 12, dtype=torch.float16)
+        Y = torch.randn(12, 6, dtype=torch.float16)
+        expected = sibling_nested_reference(X, Y)
+        actual = sibling_nested_fn(X, Y)
+        torch.testing.assert_close(actual, expected)
+
+        X_dev = X.to(DEVICE_NAME)
+        Y_dev = Y.to(DEVICE_NAME)
+        with pytest.raises(
+            InductorError, match="consuming reads within its spliced body"
+        ):
+            capture_post_grad_while_loop(sibling_nested_fn, (X_dev, Y_dev))
+
+    def test_sibling_nested_stardep_resolves_correctly(self):
+        """Two sibling for_each_tile loops, one STAR_DEP_KEPT and one
+        INLINE_ERASED, sharing one outer marker, do NOT compile -- the same
+        real, already triple-confirmed architectural gap as
+        test_sibling_nested_resolves_correctly.
+
+        sibling_nested_stardep_fn is structurally identical to
+        sibling_nested_fn in the way that matters here: a single outer
+        dim=0 marker on x_tile is handed directly to two sibling inner
+        for_each_tile calls, each becoming its own WhileLoop consumer of
+        that one marker via StarDep -- 2 consuming reads where
+        _consume_tile_dim_markers requires exactly 1. See
+        sibling_nested_stardep_fn's docstring in for_each_tile_fixtures.py
+        for the full mechanism writeup. This test asserts (a) the eager
+        reference is correct on its own (no device, no compile) and (b)
+        compiling raises the documented assertion, matched on a naming-
+        independent substring.
+        """
+        import torch
+        import torch_spyre  # noqa: F401
+        import pytest
+        from torch._inductor.exc import InductorError
+        from torch_spyre.constants import DEVICE_NAME
+        from tests.inductor.for_each_tile_fixtures import (
+            capture_post_grad_while_loop,
+            sibling_nested_stardep_fn,
+            sibling_nested_stardep_reference,
+        )
+
+        X = torch.randn(8, 12, dtype=torch.float16)
+        Y = torch.randn(12, 6, dtype=torch.float16)
+        expected = sibling_nested_stardep_reference(X, Y)
+        actual = sibling_nested_stardep_fn(X, Y)
+        torch.testing.assert_close(actual, expected)
+
+        X_dev = X.to(DEVICE_NAME)
+        Y_dev = Y.to(DEVICE_NAME)
+        with pytest.raises(
+            InductorError, match="consuming reads within its spliced body"
+        ):
+            capture_post_grad_while_loop(sibling_nested_stardep_fn, (X_dev, Y_dev))
 
     def test_nested_for_each_tile_markers_snapshot_catches_noop_splice_stub(self):
         """Mutation coverage for the snapshot fix above.
@@ -1686,14 +2240,17 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
         # Issue #4460 (stick-layout/read-copy reconciliation gap in
         # propagate_layouts.py, inherited from nested_split_m_then_k_fn's
         # split_k-shaped inner loop) is fixed for this fixture's shape.
-        # Compilation now proceeds further and hits a distinct,
-        # out-of-scope issue #4581 gap (an outer-tile-carry symbol not
-        # recognized as indirect inside the inner WhileLoop body) during
-        # codegen. test_carry_mode_split_k (test_for_each_tile_e2e.py)
-        # remains xfailed on the original #4460 gap for its own shape (a
-        # StarDep-shaped matmul consumer, which does not hit #4581). Not a
-        # defect in this plan's marker mechanism; out of scope for this
-        # plan.
+        # The marker_resolution-aware guard in
+        # _synthesize_dim_hints_for_group (issue #4581's fix) makes real
+        # progress -- the pipeline now runs past the original codegen-time
+        # "indirect symbol" lookup failure -- but compilation still fails
+        # one stage further in, during op_spec_validation's OS-5
+        # symbol-consistency check on a synthetic `identity` op inserted by
+        # splice_while_loops's carry/tile-read redirect -- a distinct,
+        # not-yet-filed follow-up gap to #4581. test_carry_mode_split_k
+        # (test_for_each_tile_e2e.py) remains xfailed on the original #4460
+        # gap for its own shape (a StarDep-shaped matmul consumer, which
+        # does not hit #4581 or this OS-5 gap).
         import torch
         import torch_spyre  # noqa: F401  registers the "spyre" device
         from torch_spyre.constants import DEVICE_NAME

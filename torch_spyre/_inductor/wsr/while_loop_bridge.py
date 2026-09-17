@@ -672,14 +672,21 @@ def _rewire_accumulator_output(
     target = real_input
     while isinstance(target, ir.MutableBox):
         target = target.data
-    producer.layout = ir.MutationLayoutSHOULDREMOVE(target)
+    mutation_layout = ir.MutationLayoutSHOULDREMOVE(target)
+    producer.layout = mutation_layout
 
-    storage_name = target.get_name()
+    # ``target`` may be a frozen ReinterpretView (for example, an SDPA
+    # accumulator whose initial value is a view).  The carry contract belongs
+    # to the mutable backing Buffer that the allocator sees in graph.operations,
+    # not to that view.  MutationLayoutSHOULDREMOVE.get_buffer() performs the
+    # same recursive view/box unwrapping used when resolving mutation storage.
+    storage = mutation_layout.get_buffer()
+    storage_name = storage.get_name()
     record = LoopCarryRecord(
         storage_name=storage_name,
         update_name=producer.get_name(),
     )
-    target._loop_carry_record = record
+    storage._loop_carry_record = record
     producer._loop_carry_record = record
 
     if while_out_name is not None:

@@ -594,6 +594,33 @@ class TestBuildingBlocks(unittest.TestCase):
         ).cpu()
         torch.testing.assert_close(actual, expected, atol=0.2, rtol=0.2)
 
+    def test_ministral_vision_transposed_value_span(self):
+        """Stick-aligned KV tiles keep Pixtral's transposed V under 256 MiB."""
+        B, H, L, D = 1, 16, 3520, 128
+        generator = torch.Generator().manual_seed(1337)
+        q = torch.randn((B, H, L, D), dtype=torch.bfloat16, generator=generator)
+        k = torch.randn((B, H, L, D), dtype=torch.bfloat16, generator=generator)
+        v = torch.randn((B, L, H, D), dtype=torch.bfloat16, generator=generator)
+        mask = torch.zeros((B, 1, L, L), dtype=torch.bfloat16)
+
+        def sdpa(q, k, v, mask):
+            return F.scaled_dot_product_attention(
+                q,
+                k,
+                v.transpose(1, 2),
+                attn_mask=mask,
+                dropout_p=0.0,
+                scale=D**-0.5,
+            )
+
+        actual = torch.compile(sdpa, dynamic=False)(
+            q.to("spyre"),
+            k.to("spyre"),
+            v.to("spyre"),
+            mask.to("spyre"),
+        ).cpu()
+        self.assertTrue(torch.isfinite(actual).all())
+
     def test_sdpa_head_tiles_limit_heads_per_tile(self):
         """The hint value is a tile count, not a per-tile head extent."""
         # The backend entry point loaded by ``import torch`` has already
