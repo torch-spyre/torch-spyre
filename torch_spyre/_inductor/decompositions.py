@@ -3678,23 +3678,518 @@ def spyre_index_add(
     return torch.index_put(self, indices, updated, accumulate=False)
 
 
-@register_spyre_decompositions([torch.ops.aten.triu.default])
-def spyre_triu(
-    input: torch.Tensor,
+def _on_spyre(device) -> bool:
+    """Whether a factory's ``device`` argument places its result on Spyre.
+
+    An omitted device is the host's default, so it does not.
+    """
+    return device is not None and torch.device(device).type == DEVICE_NAME
+
+
+# Output types a device ramp serves.  The ramp is built on the host, so the set
+# is bounded by the shift/scale arithmetic, not by the construction.
+_RAMP_INTEGER_DTYPES = frozenset({torch.int32, torch.int64})
+_RAMP_DTYPES = frozenset(
+    {torch.float16, torch.bfloat16, torch.float32} | _RAMP_INTEGER_DTYPES
+)
+
+
+@register_spyre_decompositions([torch.ops.aten.arange.start_step])
+def arange_start_step_decomp(
+    start,
+    end,
+    step=1,
+    *,
+    dtype: Optional[torch.dtype] = None,
+    layout: Optional[torch.layout] = None,
+    device: Optional[torch.device] = None,
+    pin_memory: Optional[bool] = None,
+) -> torch.Tensor:
+    """``torch.arange(start, end, step)`` from a cached device ramp.
+
+    A repeated ``arange`` costs the arithmetic that shifts and scales the shared
+    ramp rather than a fresh copy each pass. Declines to the host fallback what
+    it cannot serve: a symbolic bound cannot size a cached buffer.
+
+    The shift and scale are exact for every served type; how far the values
+    themselves stay exact is the element type's own property.  An integer type
+    computes in ``float32`` and converts once at the end, as int64 arithmetic
+    does through ``with_int64_fallback``, so its values are exact up to 2**24.
+    """
+    assert layout in (torch.strided, None), f"doesn't support layout={layout}"
+    assert not pin_memory, f"doesn't support pin_memory={pin_memory}"
+
+    # Judge an omitted dtype by the default it will actually produce: aten
+    # infers int64 from all-integral bounds, and the default float type as soon
+    # as any bound is floating.
+    if dtype is not None:
+        out_dtype = dtype
+    elif all(isinstance(v, int) for v in (start, end, step)):
+        out_dtype = torch.int64
+    else:
+        out_dtype = torch.get_default_dtype()
+    # A host arange inside a Spyre graph stays a host op.
+    if not _on_spyre(device):
+        return NotImplemented
+    if out_dtype not in _RAMP_DTYPES:
+        return NotImplemented
+    if any(isinstance(v, (torch.SymInt, torch.Tensor)) for v in (start, end, step)):
+        return NotImplemented
+    if step == 0:
+        return NotImplemented
+
+    length = math.ceil((end - start) / step)
+    if length <= 0:
+        return torch.empty(0, dtype=out_dtype, device=device)
+    compute_dtype = torch.float32 if out_dtype in _RAMP_INTEGER_DTYPES else out_dtype
+    ramp = torch.ops.spyre.arange(length, compute_dtype, device)
+    if step != 1:
+        ramp = ramp * float(step)
+    if start != 0:
+        ramp = ramp + float(start)
+    elif compute_dtype == out_dtype:
+        # torch.arange owes its caller a mutable tensor, not the shared ramp.
+        # A pointwise add forces a fresh buffer; ``clone`` is elided here.
+        ramp = ramp + 0.0
+    return ramp if compute_dtype == out_dtype else ramp.to(out_dtype)
+
+
+@register_spyre_decompositions([torch.ops.aten.arange.default])
+def arange_decomp(
+    end,
+    *,
+    dtype: Optional[torch.dtype] = None,
+    layout: Optional[torch.layout] = None,
+    device: Optional[torch.device] = None,
+    pin_memory: Optional[bool] = None,
+) -> torch.Tensor:
+    return arange_start_step_decomp(
+        0, end, 1, dtype=dtype, layout=layout, device=device, pin_memory=pin_memory
+    )
+
+
+@register_spyre_decompositions([torch.ops.aten.arange.start])
+def arange_start_decomp(
+    start,
+    end,
+    *,
+    dtype: Optional[torch.dtype] = None,
+    layout: Optional[torch.layout] = None,
+    device: Optional[torch.device] = None,
+    pin_memory: Optional[bool] = None,
+) -> torch.Tensor:
+    return arange_start_step_decomp(
+        start, end, 1, dtype=dtype, layout=layout, device=device, pin_memory=pin_memory
+    )
+
+
+# Block edge a mask is tiled from, per element type: the largest integer that
+# type holds exactly, since the comparison reads coordinates as values and a
+# wider block lands the kept/dropped boundary a column off the diagonal.
+# Blocks keep coordinates local, so the mask's own extent is unbounded.
+#
+# Membership is also the served-dtype gate.  bfloat16's ramp is built at the
+# requested type and keeps 7 mantissa bits, so 258 collides (measured exact to
+# 257); int64 computes in float32, so it inherits that bound, not its own.
+_TRIANGULAR_BLOCK = {
+    torch.float16: 1024,
+    torch.bfloat16: 256,
+    torch.float32: 1 << 24,
+    torch.int64: 1 << 24,
+}
+
+
+# Element types the backend admits as matmul operands; ``batchmatmul`` is absent
+# from ``SPYRE_FP32_OPS``, so a wider type contracts by hand instead.
+_MATMUL_DTYPES = frozenset({torch.float16, torch.bfloat16})
+
+
+def _mask_compute_dtype(dtype: torch.dtype) -> torch.dtype:
+    """The type a coordinate mask of element type ``dtype`` computes at.
+
+    int64 reaches an exact-integer device comparison only through float32; every
+    other served type computes at its own width.
+    """
+    return torch.float32 if dtype == torch.int64 else dtype
+
+
+@dataclasses.dataclass(frozen=True)
+class _MaskKind:
+    """Which comparison a mask keeps, and where that needs no comparison at all.
+
+    ``compare`` is applied as ``compare(col_coord, row_coord)``, so it reads in
+    the same order as the predicate it names.
+
+    ``constant`` maps a block-local diagonal and block edge to the value a whole
+    block takes, or ``None`` where the band crosses the block and it needs the
+    comparison. It names the value rather than a side of the band, since which
+    side is the kept one differs per kind.
+    """
+
+    compare: Callable[[torch.Tensor, torch.Tensor], torch.Tensor]
+    constant: Callable[[int, int], float | None]
+
+
+# The bounds are the local diagonal at which a block stops needing a comparison:
+# tril covers a whole block once the band reaches its top-right corner
+# (``local == edge - 1``) and leaves it empty once the band has passed the
+# bottom-left (``local == -edge``); triu mirrors both. A one-wide diagonal band
+# never covers a block, so it only ever leaves one empty.
+_MASK_LOWER = _MaskKind(
+    compare=torch.Tensor.__le__,
+    constant=lambda local, edge: (
+        1.0 if local >= edge - 1 else 0.0 if local <= -edge else None
+    ),
+)
+_MASK_UPPER = _MaskKind(
+    compare=torch.Tensor.__ge__,
+    constant=lambda local, edge: (
+        1.0 if local <= -(edge - 1) else 0.0 if local >= edge else None
+    ),
+)
+_MASK_DIAGONAL = _MaskKind(
+    compare=torch.Tensor.__eq__,
+    constant=lambda local, edge: 0.0 if local >= edge or local <= -edge else None,
+)
+
+
+def _mask_compare(
+    rows: int,
+    cols: int,
+    kind: _MaskKind,
+    dtype: torch.dtype,
+    device: torch.device,
     diagonal: int = 0,
 ) -> torch.Tensor:
-    # Narrow integral dtypes have no on-device elementwise masking op (mul and
-    # where are both rejected for SENUINT32/SENINT8/IEEE_INT32), so keep them
-    # on the CPU fallback that aten.triu used before this decomposition existed.
-    if not (input.dtype.is_floating_point or input.dtype == torch.bool):
-        return torch.ops.spyre.triu_cpu(input, diagonal)
+    """A mask from one dense comparison, exact only within a block.
 
-    h, w = input.shape[-2], input.shape[-1]
+    Callers must keep both extents within the dtype's ``_TRIANGULAR_BLOCK``,
+    since the coordinates are held as device values; ``_mask_blocks`` is what
+    makes that true for an arbitrary mask.
 
-    # spyre::triu_mask builds [H,W] upper triangular mask on CPU and
-    # transfers it to the input device. Wrapping this in a custom op keeps the
-    # CPU-side construction opaque to torch.compile, so assert_functional_graph
-    # is satisfied and the compiled graph sees only the resulting Spyre tensor.
-    mask = torch.ops.spyre.triu_mask(h, w, diagonal, input.dtype, input.device)
-    # Masking +/-inf this way works on device but would produce NaN under IEEE
-    return input * mask
+    Width comes from broadcasting a ``[rows, 1]`` column against a ``[cols]``
+    ramp rather than from widening the column: a ``cat`` along the stick dim
+    would make the operand ``[rows, tiles, cols]``, a higher rank than the
+    output, and layout propagation projects an output dim order onto its inputs
+    assuming broadcast only drops *leading* dims, so it cannot describe such an
+    operand ("Incompatible host_size and dim_order").
+
+    The diagonal offset folds into the column ramp, whose values are a device
+    buffer rather than loop coordinates, keeping it clear of the unimplemented
+    ``index_expr``.
+    """
+    # ``column=True`` is a materialized ``[rows, 1]`` buffer rather than a view
+    # of the ramp: a ``[N]`` vector admits exactly one device layout (stick on
+    # its only dim), so comparing ``ramp[:, None]`` against ``ramp[None, :]``
+    # leaves no feasible assignment, one read having to gather across sticks or
+    # scatter within one ("no mechanism to resolve stick incompatibility").
+    row_index = torch.ops.spyre.arange(rows, dtype, device, column=True)
+    col_index = torch.ops.spyre.arange(cols, dtype, device)
+    if diagonal != 0:
+        # tril keeps col <= row + diagonal, so shifting the column coordinate
+        # down by the diagonal is the same predicate with an unshifted row.
+        col_index = col_index - float(diagonal)
+    return kind.compare(col_index, row_index).to(dtype)
+
+
+def _mask_blocks(
+    rows: int,
+    cols: int,
+    diagonal: int,
+    kind: _MaskKind,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
+    """``_build_mask`` tiled from square blocks, exact at any extent.
+
+    A block's own predicate is the global one rewritten in block-local
+    coordinates: ``col <= row + diagonal`` over a block based at
+    ``(row0, col0)`` is ``j <= i + (diagonal + row0 - col0)``. So each block is
+    the same kind of mask at its own local diagonal, and only that integer
+    varies. Coordinates stay block-local, so no coordinate above the dtype's
+    ``_TRIANGULAR_BLOCK`` is ever formed and the extent DLFloat16 can represent
+    stops bounding the mask. Only the 16-bit element types reach here in
+    practice; float32 holds every coordinate a mask needs exactly.
+
+    A block whose local diagonal puts the band beyond a corner is a constant,
+    which is what keeps the far corners off the comparison path. The rest are
+    built one per distinct local diagonal and shared across the blocks that
+    repeat it: a zero diagonal needs exactly one, since every block on the
+    diagonal is the same, and a shifted band needs two, the band straddling one
+    block column boundary.
+
+    Block edges are whole sticks, so the ``cat`` boundaries land on stick
+    boundaries and no sub-stick write is emitted. Rows and cols need not be
+    equal or a multiple of the block edge; a partial block at either far edge is
+    sliced from a full one.
+    """
+    edge = min(_TRIANGULAR_BLOCK[dtype], rows, cols)
+
+    # Keyed by local diagonal, so blocks repeating one share a buffer. Constant
+    # blocks are keyed by value, so a kind that fills with the same constant on
+    # both sides of the band (a diagonal band, both zero) builds one buffer.
+    compared: dict[int, torch.Tensor] = {}
+    fills: dict[float, torch.Tensor] = {}
+
+    def block(local: int) -> torch.Tensor:
+        value = kind.constant(local, edge)
+        if value is None:
+            if local not in compared:
+                compared[local] = _mask_compare(edge, edge, kind, dtype, device, local)
+            return compared[local]
+        if value not in fills:
+            fills[value] = torch.full((edge, edge), value, dtype=dtype, device=device)
+        return fills[value]
+
+    # A one-element ``cat`` copies rather than aliasing its operand, and a mask
+    # longer than it is wide reaches here with one tile per strip (or one strip
+    # of tiles), so both assemblies skip the cat at a single operand.
+    strips = []
+    for row in range(0, rows, edge):
+        height = min(edge, rows - row)
+        tiles = [
+            block(diagonal + row - col)[:height, : min(edge, cols - col)]
+            for col in range(0, cols, edge)
+        ]
+        strips.append(torch.cat(tiles, dim=1) if len(tiles) > 1 else tiles[0])
+    return torch.cat(strips, dim=0) if len(strips) > 1 else strips[0]
+
+
+def _build_mask(
+    rows: int,
+    cols: int,
+    diagonal: int,
+    kind: _MaskKind,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
+    """``1`` where ``kind`` keeps an element, ``0`` elsewhere.
+
+    ``_MASK_LOWER`` keeps ``col <= row + diagonal`` (``tril``), ``_MASK_UPPER``
+    keeps ``col >= row + diagonal`` (``triu``), and ``_MASK_DIAGONAL`` keeps
+    ``col == row + diagonal`` (``eye``).
+
+    Any ``diagonal`` is served, including one at or past a corner that keeps
+    everything or nothing.
+
+    Returned in ``dtype`` rather than ``bool``: the backend has no bool buffer
+    format.
+
+    Serves the element types keyed in ``_TRIANGULAR_BLOCK``, which callers check
+    before reaching here. A mask is a host ramp, one comparison and a conversion,
+    all of which the backend admits at either served width, so what bounds an
+    element type is only the integers it holds exactly.
+
+    Any extent is served, and needs no upper bound: float16 tiles past its bound
+    and float32 never reaches one. The stick dim is built up to the next boundary
+    of the dtype's own stick so every concatenated tile spans whole sticks, and
+    the requested extent is a view of that. The padding is free: a consumer's use
+    of the view fuses into the consuming op, so the slice becomes loop bounds
+    rather than a copy.
+
+    The result backs a dense ``[rows, cols]`` buffer either way, so a consumer
+    needing the mask as a monolithic matmul operand (``cumsum_decomp`` is the
+    one) is served whether the stick dim needed padding or not.
+    """
+    stick = get_elem_in_stick(dtype)
+    padded_cols = ((cols + stick - 1) // stick) * stick
+    if max(rows, padded_cols) <= _TRIANGULAR_BLOCK[dtype]:
+        # Within one block the comparison is already exact, so keep the single
+        # dense pointwise rather than routing a small mask through a 1-tile cat.
+        # Every float32 extent lands here, its coordinates being exact far past
+        # any mask built.
+        mask = _mask_compare(rows, padded_cols, kind, dtype, device, diagonal)
+    else:
+        mask = _mask_blocks(rows, padded_cols, diagonal, kind, dtype, device)
+    return mask if padded_cols == cols else mask[:, :cols]
+
+
+def _static_shape(shape) -> bool:
+    """Whether every extent is known at trace time.
+
+    A symbolic extent cannot size a cached coordinate buffer, so a mask built
+    from one keeps the eager CPU fallback. Covers the whole shape, batch dims
+    included, since those size the broadcast the mask multiplies into.
+    """
+    return not any(isinstance(v, torch.SymInt) for v in shape)
+
+
+def _triangular_decomp(self: torch.Tensor, diagonal, kind: _MaskKind):
+    """``tril``/``triu`` as device compute, masking instead of copying to host.
+
+    ``kind`` is which side of the band the mask keeps, the only difference
+    between the two. A rank above 2 masks the trailing two dims and broadcasts
+    over the batch. Any ``diagonal`` is served at any supported extent, including
+    one past a corner that keeps everything or nothing.
+
+    Returns ``NotImplemented`` for what ``_build_mask`` cannot serve, leaving an
+    ``aten`` node for the host fallback to lower. The two coexist because
+    ``get_spyre_decomp_table`` drops each ``fallback_ops`` entry before re-adding
+    the Spyre decompositions.
+    """
+    if isinstance(diagonal, (torch.SymInt, torch.Tensor)):
+        return NotImplemented
+    if self.dim() < 2 or not _static_shape(self.shape):
+        return NotImplemented
+    if self.dtype not in _TRIANGULAR_BLOCK:
+        return NotImplemented
+    rows, cols = int(self.shape[-2]), int(self.shape[-1])
+    compute_dtype = _mask_compute_dtype(self.dtype)
+    mask = _build_mask(rows, cols, int(diagonal), kind, compute_dtype, self.device)
+    kept = self.to(compute_dtype) * mask
+    if kept.dtype != self.dtype:
+        kept = kept.to(self.dtype)
+    return kept
+
+
+@register_spyre_decompositions([torch.ops.aten.tril.default])
+def tril_decomp(self: torch.Tensor, diagonal=0) -> torch.Tensor:
+    """``torch.tril``, keeping ``col <= row + diagonal``."""
+    return _triangular_decomp(self, diagonal, _MASK_LOWER)
+
+
+@register_spyre_decompositions([torch.ops.aten.triu.default])
+def triu_decomp(self: torch.Tensor, diagonal=0) -> torch.Tensor:
+    """``torch.triu``, keeping ``col >= row + diagonal``."""
+    return _triangular_decomp(self, diagonal, _MASK_UPPER)
+
+
+@register_spyre_decompositions([torch.ops.aten.eye.m])
+def eye_m_decomp(
+    n,
+    m,
+    *,
+    dtype: Optional[torch.dtype] = None,
+    layout: Optional[torch.layout] = None,
+    device: Optional[torch.device] = None,
+    pin_memory: Optional[bool] = None,
+) -> torch.Tensor:
+    """``torch.eye`` as device compute, from the mask ``tril`` already builds.
+
+    ``eye`` keeps ``col == row``, so the identity is a coordinate mask, and being
+    a factory the mask is the result rather than a multiplier. Upstream's
+    decomposition compares an ``int32`` iota instead, which the backend cannot
+    lower ("torch.bool result from operands with device format(s) IEEE_INT32").
+    Declines the rest to the host fallback (see ``tril_decomp``).
+    """
+    assert layout in (torch.strided, None), f"doesn't support layout={layout}"
+    assert not pin_memory, f"doesn't support pin_memory={pin_memory}"
+
+    out_dtype = dtype if dtype is not None else torch.get_default_dtype()
+    # A host eye inside a Spyre graph stays a host op.
+    if not _on_spyre(device):
+        return NotImplemented
+    if out_dtype not in _TRIANGULAR_BLOCK or not _static_shape((n, m)):
+        return NotImplemented
+    compute_dtype = _mask_compute_dtype(out_dtype)
+    identity = _build_mask(
+        int(n),
+        int(m),
+        0,
+        _MASK_DIAGONAL,
+        compute_dtype,
+        torch.device(device),
+    )
+    if identity.dtype != out_dtype:
+        identity = identity.to(out_dtype)
+    return identity
+
+
+@register_spyre_decompositions([torch.ops.aten.eye.default])
+def eye_decomp(
+    n,
+    *,
+    dtype: Optional[torch.dtype] = None,
+    layout: Optional[torch.layout] = None,
+    device: Optional[torch.device] = None,
+    pin_memory: Optional[bool] = None,
+) -> torch.Tensor:
+    """Square ``torch.eye``, which is ``eye.m`` at equal extents."""
+    return eye_m_decomp(
+        n, n, dtype=dtype, layout=layout, device=device, pin_memory=pin_memory
+    )
+
+
+@register_spyre_decompositions([torch.ops.aten.cumsum.default])
+def cumsum_decomp(self: torch.Tensor, dim: int, *, dtype=None) -> torch.Tensor:
+    """``torch.cumsum`` as a matmul against a lower-triangular mask.
+
+    ``out[.., i] = sum(v[.., j] for j <= i)`` is a contraction with
+    ``M[j][i] = 1 if j <= i``, so the prefix sum needs no scan primitive and the
+    accumulation lands in the matmul. Served along the last dim of a 1-D or 2-D
+    operand; everything else declines to the host fallback (see
+    ``_triangular_decomp``). An integral input, ``bool`` included, accumulates
+    as ``int64``, as aten's does, computed in the result type's compute type.
+
+    An exact mask does not make the result exact: the matmul accumulates in
+    DLFloat16, so a row sum past 1024 rounds, which bounds what a test may
+    assert rather than what may be served.  A type the matmul does not admit
+    contracts by hand instead, and gains exact accumulation at any extent.
+
+    TODO: serve a leading-dimension ``dim`` by transposing into the last one.
+    TODO: serve rank > 2, untested.
+    """
+    # aten accumulates an integral input, bool included, as int64.
+    if dtype is not None:
+        out_dtype = dtype
+    elif self.dtype.is_floating_point:
+        out_dtype = self.dtype
+    else:
+        out_dtype = torch.int64
+    if out_dtype not in _TRIANGULAR_BLOCK:
+        return NotImplemented
+    compute_dtype = _mask_compute_dtype(out_dtype)
+    if self.dim() == 1 and dim in (0, -1):
+        # A 1-D operand is computed as rows of a 2-D one. The matmul takes a
+        # single row; the hand contraction's padding write needs a second, as a
+        # write onto an extent-1 dim has no other dim to take the stick.
+        # Convert before expanding, so the rows stay a view of one converted
+        # vector rather than a materialized copy the padding write cannot read.
+        rows = 1 if compute_dtype in _MATMUL_DTYPES else 2
+        vector = self if self.dtype == compute_dtype else self.to(compute_dtype)
+        return cumsum_decomp(vector.expand(rows, -1), -1, dtype=out_dtype)[0]
+    if self.dim() != 2:
+        return NotImplemented
+    if dim not in (-1, self.dim() - 1):
+        return NotImplemented
+    if not _static_shape(self.shape):
+        return NotImplemented
+
+    # Convert the operand straight to the compute type: no intermediate
+    # conversion to the result type, which a bool could not take on device.
+    input = self if self.dtype == compute_dtype else self.to(compute_dtype)
+    cols = int(self.shape[-1])
+    if compute_dtype in _MATMUL_DTYPES:
+        # tril's keep mask transposed, so row r contracts against column i.
+        keep = _build_mask(cols, cols, 0, _MASK_UPPER, compute_dtype, self.device)
+        output = input @ keep
+    else:
+        # The same contraction by hand.  The mask is transposed relative to the
+        # matmul's because that is the only order layout propagation can place:
+        # it assumes a broadcast drops only leading dims, so a tensor both
+        # transposed and lifted to rank 3 has no feasible assignment.
+        stick = get_elem_in_stick(compute_dtype)
+        if cols < stick:
+            # TODO: serve widths below one stick. The padding write then covers
+            # part of a stick, and placing it needs a restickify that float32
+            # lacks; a write into a fresh zero fill could stay in place instead.
+            raise Unsupported(
+                f"cumsum over {cols} columns of {compute_dtype}, narrower than "
+                f"one stick ({stick} elements)"
+            )
+        padded_cols = ((cols + stick - 1) // stick) * stick
+        if padded_cols > cols:
+            # Pad to a stick boundary for the float32 reduction, scattering
+            # rather than assigning because a decomposition must stay
+            # functional.  The padding is uninitialized and may hold NaN, as
+            # matmul's does.
+            base = torch.zeros(
+                (self.shape[0], padded_cols), dtype=compute_dtype, device=self.device
+            )
+            input = torch.slice_scatter(base, input, dim=1, start=0, end=cols)
+        keep = _build_mask(
+            padded_cols, padded_cols, 0, _MASK_LOWER, compute_dtype, self.device
+        )
+        output = (input[:, None, :] * keep[None, :, :]).sum(dim=2)[:, :cols]
+
+    return output if output.dtype == out_dtype else output.to(out_dtype)
