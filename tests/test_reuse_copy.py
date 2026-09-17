@@ -39,6 +39,14 @@ import pytest
 
 _SCRIPTS = pathlib.Path(__file__).resolve().parents[1] / ".github" / "scripts"
 
+# The ingest imports the shared library from extensions/; it is in this repo, so put it on
+# sys.path rather than requiring an install for a parse-only test.
+_CHLIB = (
+    pathlib.Path(__file__).resolve().parents[1] / "extensions" / "clickhouse-ingest"
+)
+if str(_CHLIB) not in sys.path:
+    sys.path.insert(0, str(_CHLIB))
+
 
 @pytest.fixture(scope="module")
 def ing():
