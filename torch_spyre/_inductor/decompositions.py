@@ -155,18 +155,29 @@ def _num_tiles_for_max_extent(
     insufficient when it does not divide ``sequence_length``. Start with the
     minimum count that satisfies the extent cap and advance to the next exact
     divisor whose tile extent has the requested alignment. If the full extent
-    is not aligned, no exact aligned split exists and only divisibility is
-    enforced. Sequence lengths used by the adapters are normally stick-padded,
-    so this resolves after only a few candidates.
+    is not aligned, or the extent cap is smaller than the alignment, no exact
+    aligned split exists and only divisibility is enforced. Sequence lengths
+    used by the adapters are normally stick-padded, so this resolves after only
+    a few candidates.
     """
-    effective_alignment = tile_alignment if sequence_length % tile_alignment == 0 else 1
-    num_tiles = max(1, (sequence_length + max_extent - 1) // max_extent)
-    while (
-        sequence_length % num_tiles != 0
-        or (sequence_length // num_tiles) % effective_alignment != 0
-    ):
-        num_tiles += 1
-    return num_tiles
+    if sequence_length < 1 or max_extent < 1 or tile_alignment < 1:
+        raise ValueError(
+            "sequence length, maximum extent, and alignment must be positive"
+        )
+
+    alignment_is_possible = (
+        sequence_length % tile_alignment == 0 and max_extent >= tile_alignment
+    )
+    effective_alignment = tile_alignment if alignment_is_possible else 1
+    minimum_tiles = max(1, (sequence_length + max_extent - 1) // max_extent)
+    for num_tiles in range(minimum_tiles, sequence_length + 1):
+        if (
+            sequence_length % num_tiles == 0
+            and (sequence_length // num_tiles) % effective_alignment == 0
+        ):
+            return num_tiles
+
+    raise AssertionError("validated tiling inputs must have an exact tile")
 
 
 def _kv_blocks_per_loop_group(num_q_tiles: int, num_kv_blocks: int) -> int:

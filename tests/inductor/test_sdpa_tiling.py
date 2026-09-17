@@ -22,6 +22,9 @@ import torch  # noqa: F401 - loads the registered Spyre backend entry point
 _select_sdpa_tiling = sys.modules[
     "torch_spyre._inductor.decompositions"
 ]._select_sdpa_tiling
+_num_tiles_for_max_extent = sys.modules[
+    "torch_spyre._inductor.decompositions"
+]._num_tiles_for_max_extent
 
 
 class TestSDPATiling(unittest.TestCase):
@@ -51,6 +54,46 @@ class TestSDPATiling(unittest.TestCase):
             num_cores=num_cores,
             lx_budget_bytes=lx_budget_bytes,
         )
+
+    def test_exact_tile_search_is_bounded_and_returns_a_valid_split(self):
+        sequence_lengths = (*range(1, 258), 509, 512, 9973)
+        max_extents = (1, 2, 3, 7, 31, 63, 64, 65, 127, 128, 511, 512)
+        alignments = (1, 2, 3, 32, 64, 128, 1024)
+
+        for sequence_length in sequence_lengths:
+            for max_extent in max_extents:
+                for alignment in alignments:
+                    num_tiles = _num_tiles_for_max_extent(
+                        sequence_length,
+                        max_extent,
+                        tile_alignment=alignment,
+                    )
+                    tile_size = sequence_length // num_tiles
+                    alignment_is_possible = (
+                        sequence_length % alignment == 0 and max_extent >= alignment
+                    )
+
+                    self.assertLessEqual(num_tiles, sequence_length)
+                    self.assertEqual(sequence_length % num_tiles, 0)
+                    self.assertLessEqual(tile_size, max_extent)
+                    if alignment_is_possible:
+                        self.assertEqual(tile_size % alignment, 0)
+
+    def test_exact_tile_search_rejects_nonpositive_inputs(self):
+        for sequence_length, max_extent, alignment in (
+            (0, 64, 64),
+            (-1, 64, 64),
+            (64, 0, 64),
+            (64, -1, 64),
+            (64, 64, 0),
+            (64, 64, -1),
+        ):
+            with self.assertRaises(ValueError):
+                _num_tiles_for_max_extent(
+                    sequence_length,
+                    max_extent,
+                    tile_alignment=alignment,
+                )
 
     def test_mha_uses_one_block_and_full_core_work_division(self):
         config = self._select(head_dim=64)
