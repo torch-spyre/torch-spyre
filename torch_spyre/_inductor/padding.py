@@ -661,6 +661,50 @@ def _pad_restickify_output(op: Operation, graph: GraphLowering) -> None:
     )
 
 
+def _is_dense_flattened_coordinate(coord, ranges) -> bool:
+    """Return whether ``coord`` densely flattens two or more loop dimensions.
+
+    ``host_coordinates`` normally returns one loop symbol per host dimension.
+    A view may instead split one physical host dimension into several logical
+    dimensions, for example ``128 * head + feature`` for a ``[H, 128]`` view of
+    one ``H * 128`` projection dimension.  That is still a unit-stride,
+    contiguous traversal of the host dimension: ordering the symbols from the
+    innermost coefficient outwards must produce the mixed-radix strides
+    ``1, size(inner), size(inner) * size(next), ...``.
+
+    Reject nonlinear expressions and gapped or overlapping flattenings.  They need
+    the same re-base copy as an ordinary strided input.
+    """
+    syms = coord.free_symbols
+    if len(syms) < 2:
+        return False
+
+    residual = sympy.expand(coord)
+    digits: list[tuple[int, sympy.Symbol]] = []
+    for sym in syms:
+        if sym not in ranges:
+            return False
+        coeff_expr = residual.coeff(sym)
+        if coeff_expr.free_symbols or coeff_expr.is_integer is not True:
+            return False
+        coeff = concretize_expr(coeff_expr)
+        if coeff <= 0:
+            return False
+        digits.append((coeff, sym))
+        residual -= coeff_expr * sym
+
+    # A numeric constant is a slice offset and does not change contiguity.
+    if residual.free_symbols or not residual.is_number:
+        return False
+
+    expected = 1
+    for coeff, sym in sorted(digits, key=lambda item: item[0]):
+        if coeff != expected:
+            return False
+        expected *= concretize_expr(ranges[sym])
+    return True
+
+
 def _assert_input_paddable(op: ComputedBuffer, in_dep, in_layout) -> None:
     """Raise ``Unsupported`` for restickify inputs outside what the stick-boundary
     bump supports, classifying each input dim's read by its coordinate.
@@ -680,12 +724,13 @@ def _assert_input_paddable(op: ComputedBuffer, in_dep, in_layout) -> None:
         syms = coord.free_symbols
         if not syms:  # degenerate size-1 host dim, nothing to slice
             continue
-        assert len(syms) == 1, (
-            f"insert_restickify_padding: host dim {i} of {op.get_name()} "
-            f"(coord {coord}) carries multiple free symbols -- an interleaved "
-            f"index this pass's per-dim strided/sliced classification cannot "
-            f"read; a restickify input must not reach this shape"
-        )
+        if len(syms) > 1:
+            if _is_dense_flattened_coordinate(coord, in_dep.ranges):
+                continue
+            raise Unsupported(
+                f"insert_restickify_padding: host dim {i} of {op.get_name()} "
+                f"(coord {coord}) is not a dense flattened input coordinate"
+            )
         sym = next(iter(syms))
         # Strided (k not in {0, 1}), on any dim: codegen carries only a contiguous
         # tail.  A broadcast (coeff 0) is read from the device layout, not this

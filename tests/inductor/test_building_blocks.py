@@ -621,6 +621,38 @@ class TestBuildingBlocks(unittest.TestCase):
         ).cpu()
         self.assertTrue(torch.isfinite(actual).all())
 
+    def test_siglip_multicrop_attention_from_flat_projection(self):
+        """A rank-3 projection may feed the tiled K transpose without a copy.
+
+        SigLIP projects K as [B, L, H*D], views it as [B, L, H, D], and
+        transposes it to [B, H, L, D].  The per-tile K restickify therefore
+        reads the projection's last host coordinate as the dense mixed-radix
+        expression D*head + feature.  This must remain a direct read of the
+        projection rather than requiring k_blk.contiguous().
+        """
+        B, H, L, D, IN = 7, 16, 576, 128, 64
+        generator = torch.Generator().manual_seed(1337)
+        x = torch.randn((B, L, IN), dtype=torch.bfloat16, generator=generator)
+        w = torch.randn((H * D, IN), dtype=torch.bfloat16, generator=generator) / 8
+        q = torch.randn((B, H, L, D), dtype=torch.bfloat16, generator=generator)
+        v = torch.randn((B, H, L, D), dtype=torch.bfloat16, generator=generator)
+
+        def sdpa(x, w, q, v):
+            k = F.linear(x, w).view(B, L, H, D).transpose(1, 2)
+            return F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                dropout_p=0.0,
+                scale=72**-0.5,
+            )
+
+        expected = sdpa(x, w, q, v)
+        actual = torch.compile(sdpa, dynamic=False)(
+            x.to("spyre"), w.to("spyre"), q.to("spyre"), v.to("spyre")
+        ).cpu()
+        torch.testing.assert_close(actual, expected, atol=0.2, rtol=0.2)
+
     def test_sdpa_head_tiles_limit_heads_per_tile(self):
         """The hint value is a tile count, not a per-tile head extent."""
         # The backend entry point loaded by ``import torch`` has already
