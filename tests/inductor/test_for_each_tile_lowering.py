@@ -1503,6 +1503,65 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
             "(pre-existing behavior, must not regress)",
         )
 
+    def test_synthesize_dim_hints_skips_only_inline_erased_markers(self):
+        """_synthesize_dim_hints_for_group's guard: skip INLINE_ERASED only.
+
+        Before this fix, the guard was `_marker_dim(op) is not None`, which
+        skips BOTH marker kinds -- silently dropping a hint for a
+        STAR_DEP_KEPT marker's own upstream read, exactly the issue #4581
+        gap. This test builds one op of each MarkerResolution kind (plus a
+        plain non-marker op as a control) and confirms only the
+        INLINE_ERASED one is skipped.
+        """
+        import sympy
+
+        from torch_spyre._inductor.wsr.for_each_tile_lowering import (
+            MarkerResolution,
+            _synthesize_dim_hints_for_group,
+        )
+
+        loop_var = sympy.Symbol("d0")
+        trip_count = sympy.Integer(4)
+
+        def make_op(name, resolution):
+            op = mock.Mock(
+                name=name, spec=["data", "dim_hints", "tile_marker_resolution"]
+            )
+            op.data = mock.Mock(reduction_type=None)
+            op.dim_hints = []
+            op.tile_marker_resolution = resolution
+            return op
+
+        inline_erased_op = make_op("inline_erased_op", MarkerResolution.INLINE_ERASED)
+        stardep_kept_op = make_op("stardep_kept_op", MarkerResolution.STAR_DEP_KEPT)
+        plain_op = mock.Mock(name="plain_op", spec=["data", "dim_hints"])
+        plain_op.data = mock.Mock(reduction_type=None)
+        plain_op.dim_hints = []
+
+        _synthesize_dim_hints_for_group(
+            [inline_erased_op, stardep_kept_op, plain_op],
+            loop_var,
+            hint_id=0,
+            trip_count=trip_count,
+        )
+
+        self.assertEqual(
+            inline_erased_op.dim_hints,
+            [],
+            "INLINE_ERASED marker must still get no synthesized hint",
+        )
+        self.assertEqual(
+            len(stardep_kept_op.dim_hints),
+            1,
+            "STAR_DEP_KEPT marker must now get a synthesized hint (the "
+            "issue #4581 fix)",
+        )
+        self.assertEqual(
+            len(plain_op.dim_hints),
+            1,
+            "an ordinary non-marker op must still get a synthesized hint",
+        )
+
     def test_nested_for_each_tile_markers_resolve_correctly(self):
         """Two tile_dim_marker-tagged reads at two nesting levels resolve.
 
@@ -1530,16 +1589,25 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
         irrelevant to what this test checks. Issue #4460's stick-layout/
         read-copy gap (the same gap test_carry_mode_split_k is xfailed
         for in test_for_each_tile_e2e.py) is now fixed for this fixture's
-        shape, but nested_split_m_then_k_fn's inner loop still hits a
-        distinct, out-of-scope issue #4581 gap (an outer-tile-carry
-        symbol not recognized as indirect inside the inner WhileLoop
-        body) during codegen, well after splice_while_loops has already
-        completed -- so instead of driving the pipeline all the way
-        through codegen, this test monkeypatches splice_while_loops
-        itself (the name torch_spyre._inductor.passes imports and calls
-        directly) to capture a *snapshot* of graph.operations right as it
-        returns, and tolerates the InductorError issue #4581 raises
-        afterward in a later, unrelated pass.
+        shape. The marker_resolution-aware guard in
+        _synthesize_dim_hints_for_group (this task's fix) makes the
+        STAR_DEP_KEPT outer marker get a synthesized dim hint it
+        previously lacked -- confirmed real progress, since the pipeline
+        now runs past the original codegen-time "indirect symbol" lookup
+        failure -- but the fixture still does not run cleanly to
+        completion: it now fails one stage further in, during
+        op_spec_validation's symbol-consistency check ("OS-5") on a
+        synthetic `identity` op inserted by splice_while_loops's carry/
+        tile-read redirect -- a distinct, not-yet-filed follow-up gap to
+        issue #4581 (see this test's tolerant except below for the exact
+        error and origin-tag lead). This test monkeypatches
+        splice_while_loops itself (the
+        name torch_spyre._inductor.passes imports and calls directly) to
+        capture a *snapshot* of graph.operations right as it returns, and
+        tolerates the new OS-5 InductorError afterward in a later,
+        unrelated pass -- the same structure the original test used for
+        the "indirect symbol" error it used to tolerate, updated to the
+        new error this fix's guard change causes the pipeline to reach.
 
         The capture must be a snapshot (``list(graph.operations)``, a new
         list object), not a live reference to ``graph`` or to
@@ -1595,16 +1663,22 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
         try:
             capture_post_grad_while_loop(nested_split_m_then_k_fn, (X, Y))
         except InductorError as exc:
-            # Expected: codegen (much later, unrelated to splicing) hits
-            # issue #4581 after splice_while_loops has already completed
+            # Expected: op_spec_validation (much later, unrelated to
+            # splicing) hits a distinct, not-yet-filed follow-up gap to
+            # issue #4581 -- an OpSpecValidationError ("OS-5" symbol-
+            # consistency check) on a synthetic `identity` op tagged
+            # reason='redirect while_loop carry/tile reads to persistent
+            # scratch' (from splice_while_loops's carry/tile-read
+            # redirect) -- after splice_while_loops has already completed
             # and this test's capture has already fired. Any OTHER
-            # exception is a real, unexpected finding -- do not swallow
-            # it.
+            # exception -- including the original "indirect symbol"
+            # error, which this guard fix should have moved the pipeline
+            # past -- is a real, unexpected finding; do not swallow it.
             self.assertIn(
-                "indirect symbol",
+                "OpSpecValidationError",
                 str(exc),
-                "expected the known issue #4581 indirect-symbol gap, got a "
-                f"different InductorError: {exc!r}",
+                "expected the known #4581 follow-up OS-5 symbol-"
+                f"consistency gap, got a different InductorError: {exc!r}",
             )
         finally:
             passes_mod.splice_while_loops = original_splice_while_loops
@@ -1863,14 +1937,17 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
         # Issue #4460 (stick-layout/read-copy reconciliation gap in
         # propagate_layouts.py, inherited from nested_split_m_then_k_fn's
         # split_k-shaped inner loop) is fixed for this fixture's shape.
-        # Compilation now proceeds further and hits a distinct,
-        # out-of-scope issue #4581 gap (an outer-tile-carry symbol not
-        # recognized as indirect inside the inner WhileLoop body) during
-        # codegen. test_carry_mode_split_k (test_for_each_tile_e2e.py)
-        # remains xfailed on the original #4460 gap for its own shape (a
-        # StarDep-shaped matmul consumer, which does not hit #4581). Not a
-        # defect in this plan's marker mechanism; out of scope for this
-        # plan.
+        # The marker_resolution-aware guard in
+        # _synthesize_dim_hints_for_group (issue #4581's fix) makes real
+        # progress -- the pipeline now runs past the original codegen-time
+        # "indirect symbol" lookup failure -- but compilation still fails
+        # one stage further in, during op_spec_validation's OS-5
+        # symbol-consistency check on a synthetic `identity` op inserted by
+        # splice_while_loops's carry/tile-read redirect -- a distinct,
+        # not-yet-filed follow-up gap to #4581. test_carry_mode_split_k
+        # (test_for_each_tile_e2e.py) remains xfailed on the original #4460
+        # gap for its own shape (a StarDep-shaped matmul consumer, which
+        # does not hit #4581 or this OS-5 gap).
         import torch
         import torch_spyre  # noqa: F401  registers the "spyre" device
         from torch_spyre.constants import DEVICE_NAME

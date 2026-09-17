@@ -317,17 +317,21 @@ def _synthesize_dim_hints_for_group(
     for op in group_ops:
         if not hasattr(op, "data"):
             continue
-        if _marker_dim(op) is not None:
-            # A tile_dim_marker op that _consume_tile_dim_markers left
-            # materialized (StarDep-shaped consumer branch -- see its own
-            # comment) is not itself a for_each_tile tile read: it IS the
-            # marker, and its own upstream read legitimately carries a
-            # per-iteration offset with no marker-map entry to resolve
-            # against (the map is keyed by the *consumer's* name, never
-            # the marker's own). Stamping a synthesized hint here would
-            # later resolve through _hint_ranges_pos/lookup_marker_dim and
-            # hit exactly the "no tile_dim_marker entry for it" gap that
-            # mechanism raises on -- skip it.
+        if _marker_resolution(op) is MarkerResolution.INLINE_ERASED:
+            # An inline-erased tile_dim_marker op is gone from operations
+            # by the time this runs -- if group_ops still holds a stale
+            # reference to it (should not happen post-consumption, but
+            # guard defensively), it is not itself a for_each_tile tile
+            # read: it IS the marker, already fused into its consumer's
+            # inner_fn, with nothing left to hint.
+            #
+            # A STAR_DEP_KEPT marker, by contrast, is still a live member
+            # of group_ops and its own upstream read still carries a real
+            # per-iteration offset -- the next nesting level up needs a
+            # synthesized hint for it to resolve provenance through
+            # lookup_marker_dim/_hint_ranges_pos (issue #4581: the old
+            # guard, `_marker_dim(op) is not None`, skipped BOTH marker
+            # kinds here, silently starving this exact case of a hint).
             continue
         existing = list(getattr(op, "dim_hints", []) or [])
         is_reduction = getattr(op.data, "reduction_type", None) is not None
