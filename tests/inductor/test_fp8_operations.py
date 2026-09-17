@@ -25,6 +25,7 @@ import pytest
 import torch
 from torch._inductor.exc import InductorError
 from utils_inductor import (
+    DEVICE,
     cached_randn,
     compare_with_pytorch,
 )
@@ -47,6 +48,13 @@ FP16_SAFE_LARGE_VALUE = (
     30000.0  # Well below FP16 max (65504) to avoid overflow in edge case tests
 )
 MIXED_SIGNS_SCALE = 100.0  # Scale factor to test moderate value ranges with mixed positive/negative values
+
+
+def _fp8_reference_quantize_dequantize(x, scale):
+    """CPU reference for FP8 quantize→dequantize: clamp, cast to FP8, cast back, rescale."""
+    return (x / scale).clamp(FP8_E4M3FN_MIN, FP8_E4M3FN_MAX).to(torch.float8_e4m3fn).to(
+        torch.float16
+    ) * scale
 
 
 class TestFP8Operations:
@@ -76,8 +84,7 @@ class TestFP8Operations:
 
         def pytorch_fn(x, scale):
             # CPU reference: direct format conversion with identity scale
-            x_fp8 = x.clamp(FP8_E4M3FN_MIN, FP8_E4M3FN_MAX).to(torch.float8_e4m3fn)
-            return x_fp8.to(torch.float16) * scale
+            return _fp8_reference_quantize_dequantize(x, scale)
 
         compare_with_pytorch(
             spyre_fn,
@@ -119,8 +126,7 @@ class TestFP8Operations:
 
         def pytorch_fn(x, scale):
             # CPU reference: FP16 → FP8 → FP16 conversion with identity scale
-            x_fp8 = x.clamp(FP8_E4M3FN_MIN, FP8_E4M3FN_MAX).to(torch.float8_e4m3fn)
-            return x_fp8.to(torch.float16) * scale
+            return _fp8_reference_quantize_dequantize(x, scale)
 
         compare_with_pytorch(
             spyre_fn,
@@ -257,9 +263,133 @@ class TestFP8Operations:
             return torch.ops.spyre.dequantize_fp8_with_scale(x_fp8, scale)
 
         def pytorch_fn(x, scale):
-            return (x / scale).clamp(FP8_E4M3FN_MIN, FP8_E4M3FN_MAX).to(
-                torch.float8_e4m3fn
-            ).to(torch.float16) * scale
+            return _fp8_reference_quantize_dequantize(x, scale)
+
+        compare_with_pytorch(spyre_fn, pytorch_fn, x, scale, atol=0.5, rtol=0.1)
+
+    def test_quantize_dequantize_fp8_4d_shape(self):
+        """Test FP8 quantize/dequantize (qfp8ch path) with a 4D input tensor.
+
+        Exercises the general 4D compilation path for quantize_fp8_with_scale
+        (qfp8ch / activation quantization).
+        """
+        shape = (2, 4, 128, 512)
+        x = cached_randn(shape, dtype=torch.float16, scale=1.0) * 2.0 + 1.0
+        scale = torch.tensor([1.0], dtype=torch.float16)
+
+        def spyre_fn(x, scale):
+            x_fp8 = torch.ops.spyre.quantize_fp8_with_scale(x, scale)
+            return torch.ops.spyre.dequantize_fp8_with_scale(x_fp8, scale)
+
+        def pytorch_fn(x, scale):
+            return _fp8_reference_quantize_dequantize(x, scale)
+
+        compare_with_pytorch(spyre_fn, pytorch_fn, x, scale, atol=0.5, rtol=0.1)
+
+    def test_fp8_scaled_mm_separate_compilation(self):
+        """Regression test for FP8 batchmatmulfp8 SDSC crash under separate compilation.
+
+        Pre-quantizing the weight in one torch.compile call and running _scaled_mm
+        in a second torch.compile call crosses the compile boundary: the QFP8WT
+        kernel tensor arrives at the batchmatmulfp8 SDSC codegen with a
+        flat stick_size=[128] (instead of the canonical [2, 64]) because the
+        SpyreTensorLayout crossing the compile boundary loses the 2D-stick structure.
+        Without _layout_info_for_tensor restoring it, batchmatmulfp8 codegen
+        produced:
+
+            loc("bmm.ddl":22:24): error: Fixed layout with too many dimensions
+            DtException: Impossible to match for sdsc0_batchmatmulfp8
+
+        The fix lives in _layout_info_for_tensor (compute_ops.py): it detects the
+        flat stick_size=[128] at the compile boundary and restores stick_size=[2, 64].
+        """
+        M, K, N = 128, 128, 128
+        mat_a = cached_randn((M, K), dtype=torch.float16, scale=1.0)
+        mat_b = cached_randn((K, N), dtype=torch.float16, scale=1.0)
+        scale_a = torch.tensor([1.0], dtype=torch.float16)
+        scale_b = torch.max(torch.abs(mat_b)).reshape(1).to(torch.float16)
+
+        mat_a_d = mat_a.to(DEVICE)
+        mat_b_d = mat_b.to(DEVICE)
+        scale_a_d = scale_a.to(DEVICE)
+        scale_b_d = scale_b.to(DEVICE)
+
+        # Quantize activation and weight in separate compiled calls.
+        quantize_a = torch.compile(
+            lambda x, s: torch.ops.spyre.quantize_fp8_with_scale(x, s)
+        )
+        quantize_b = torch.compile(
+            lambda x, s: torch.ops.spyre.quantize_weight_fp8_with_scale(x, s)
+        )
+        q_a = quantize_a(mat_a_d, scale_a_d)
+        q_b = quantize_b(mat_b_d, scale_b_d)
+
+        # Run _scaled_mm in a third separate compiled call — this is the case
+        # that triggered the "Fixed layout with too many dimensions" crash.
+        scaled_mm = torch.compile(
+            lambda a, b: torch.ops.aten._scaled_mm(
+                a,
+                b,
+                scale_a=None,
+                scale_b=None,
+                bias=None,
+                out_dtype=torch.float16,
+            )
+        )
+        result = scaled_mm(q_a, q_b)
+
+        assert result.dtype == torch.float16, (
+            f"Expected torch.float16, got {result.dtype}"
+        )
+        assert result.shape == (M, N), f"Expected shape ({M}, {N}), got {result.shape}"
+
+    def test_quantize_weight_fp8_with_scale_eager_mode_dtype_only(self):
+        """Regression guard: quantize_weight_fp8_with_scale returns a valid FP8 tensor in eager mode.
+
+        A duplicate custom op registration with an empty body can silently overwrite
+        the real implementation at import time, causing the op to return None in eager
+        mode. A None return fails verify_fp8_dtype immediately.
+
+        This test intentionally checks dtype and shape only — not numerical correctness.
+        The qfp8wt op produces a QFP8WT 2D-stick physical layout that is opaque to
+        fp8todl16 (dequantize uses a 1D flat read), so a naive quantize→dequantize
+        roundtrip will not match a CPU reference. Numerical correctness of the
+        qfp8wt → batchmatmulfp8 path is covered by test_fp8_scaled_mm in
+        test_inductor_ops.py.
+        """
+        weight = cached_randn((128, 128), dtype=torch.float16, scale=1.0)
+        scale = torch.max(torch.abs(weight)).reshape(1)
+        weight_d = weight.to(DEVICE)
+        scale_d = scale.to(DEVICE)
+
+        # Call directly without torch.compile — exercises the compile_once eager path.
+        quantized = torch.ops.spyre.quantize_weight_fp8_with_scale(weight_d, scale_d)
+
+        verify_fp8_dtype(quantized)
+        assert quantized.shape == weight_d.shape, (
+            f"Expected shape {weight_d.shape}, got {quantized.shape}"
+        )
+
+    def test_dequantize_fp8_with_scale_eager_mode(self):
+        """Test dequantize_fp8_with_scale in eager mode.
+
+        Validates that dequantize_fp8_with_scale now works in eager mode via
+        the compile_once decorator (previously required torch.compile and
+        returned None when called directly).
+
+        Uses quantize_fp8_with_scale (qfp8ch path) to produce the FP8 input
+        since that path produces a flat QFP8CH layout compatible with
+        fp8todl16. Verifies numerical correctness via a compiled roundtrip.
+        """
+        x = cached_randn((1, 2, 8), dtype=torch.float16, scale=1.0)
+        scale = torch.tensor([1.0], dtype=torch.float16)
+
+        def spyre_fn(inp, s):
+            q = torch.ops.spyre.quantize_fp8_with_scale(inp, s)
+            return torch.ops.spyre.dequantize_fp8_with_scale(q, s)
+
+        def pytorch_fn(inp, s):
+            return _fp8_reference_quantize_dequantize(inp, s)
 
         compare_with_pytorch(spyre_fn, pytorch_fn, x, scale, atol=0.5, rtol=0.1)
 
@@ -280,9 +410,7 @@ class TestFP8Operations:
             return torch.ops.spyre.dequantize_fp8_with_scale(x_fp8, scale)
 
         def pytorch_fn(x, scale):
-            return (x / scale).clamp(FP8_E4M3FN_MIN, FP8_E4M3FN_MAX).to(
-                torch.float8_e4m3fn
-            ).to(torch.float16) * scale
+            return _fp8_reference_quantize_dequantize(x, scale)
 
         compare_with_pytorch(
             spyre_fn,

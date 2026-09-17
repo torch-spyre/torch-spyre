@@ -352,6 +352,74 @@ def test_relayout_fires_naturally_on_a_hinted_graph(monkeypatch):
     torch.testing.assert_close(out.cpu(), ref, rtol=1e-3, atol=1e-3)
 
 
+def _prices_replicated_reads() -> bool:
+    """Whether the cost model charges a replicated matmul operand per replica core
+    (#4454). Without it the demoted bmm's re-read of a broadcast operand is priced
+    once at the shared peak, ~312 ns here against a ~208 ns shuffle after the
+    overlap discount, so the solver correctly declines the wrong comparison."""
+    import dataclasses
+
+    from torch_spyre._inductor.cost_model import ArgTraffic
+
+    return "replication" in {f.name for f in dataclasses.fields(ArgTraffic)}
+
+
+@pytest.mark.parametrize(
+    "kind",
+    [
+        "gather",
+        pytest.param(
+            "broadcast",
+            marks=pytest.mark.xfail(
+                not _prices_replicated_reads(),
+                strict=True,
+                reason="broadcast admission needs #4454's replicated-read pricing",
+            ),
+        ),
+    ],
+)
+def test_grouped_relayout_fires_under_cpsat(monkeypatch, kind):
+    """#3440's grouped fixtures decided by the solver instead of the greedy
+    collector (see ``relayout_fixtures.grouped_relayout_graph``). Hints pin both
+    divisions, so no slicing match exists and the solver either buys the
+    grouped movement or demotes ``hidden`` to HBM, where every replica core
+    re-reads its slice (#4454 prices that). The only patches are read-only
+    spies; the parity spy checks the committed collector certifies the same
+    edge, and #3440's payload check that the emitted op runs in LX."""
+    from torch_spyre._inductor.scratchpad.lx_relayout import _core_slices
+
+    from relayout_fixtures import grouped_relayout_graph
+    from utils_inductor import (
+        assert_lx_only_relayout_payload,
+        capture_backend_output_dirs,
+    )
+
+    observed = _Observed(monkeypatch, force=False)
+    fn, args, reference, expect = grouped_relayout_graph(kind)
+    with (
+        config.patch({**_COOPT, "sencores": 32}),
+        capture_backend_output_dirs() as dirs,
+    ):
+        out = torch.compile(fn, dynamic=False, options={"epilogue_fusion": False})(
+            *args
+        )
+
+    observed.assert_emitted_in_lx(expected_plans=1)
+    assert_lx_only_relayout_payload(dirs)
+    (plan,) = observed.plans
+    assert plan.num_cores == expect["source_cores"], "the plan keeps the source's"
+    assert plan.destination_view.num_cores == expect["destination_cores"]
+    owners = lambda view, n: len(  # noqa: E731
+        {tuple(sorted(r.items())) for r in _core_slices(view, n).values()}
+    )
+    assert owners(plan.source_view, expect["source_cores"]) == expect["src_owners"]
+    assert (
+        owners(plan.destination_view, expect["destination_cores"])
+        == expect["dst_owners"]
+    )
+    torch.testing.assert_close(out.cpu().float(), reference, rtol=2e-2, atol=2e-1)
+
+
 def test_relayout_into_a_matmul_x_operand(monkeypatch):
     """The edge gate admits a matmul consumer; the destination view must then
     satisfy the matmul's own division rules. Pointwise producer feeding x."""

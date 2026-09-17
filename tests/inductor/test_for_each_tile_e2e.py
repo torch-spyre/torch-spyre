@@ -23,11 +23,13 @@ Minimum coverage per docs/superpowers/specs/2026-09-09-while-loop-lowering-desig
    read-copy/stick-layout gap; see that test's own docstring.
 2 (carry + Kind.SLICE tile-advancing input): covered implicitly by
    test_carry_mode_split_k, whose X/Y operands are both Kind.SLICE.
+3. Kind.GATHER: covered by test_gather_mode_paged_pages, which gathers one
+   page per trip from inside the body the way paged attention does.
 4. Multiple independent carries: covered by test_carry_mode_online_softmax
    (carry = (m, denom, acc), an online-softmax flash-attention inner loop).
-Cases 3, 5, 6 (Kind.GATHER, nested for_each_tile, and the deliberate-decline
-case) are follow-on work -- tracked as open items rather than duplicated
-here, since each needs its own fixture beyond what's vendored so far.
+Cases 5 and 6 (nested for_each_tile and the deliberate-decline case) are
+follow-on work -- tracked as open items rather than duplicated here, since
+each needs its own fixture beyond what's vendored so far.
 
 test_map_mode_split_m (map mode: Kind.SLICE + Kind.INVARIANT operands, a
 stacking carry, no user carry) passes end to end with verified numerics and
@@ -47,6 +49,9 @@ from tests.inductor.for_each_tile_fixtures import (
     matmul_inputs,
     online_softmax_fn,
     online_softmax_reference,
+    paged_gather_fn,
+    paged_gather_inputs,
+    paged_gather_reference,
     split_k_fn,
     split_m_fn,
 )
@@ -155,6 +160,37 @@ class TestForEachTileE2E(unittest.TestCase):
         torch.testing.assert_close(
             out.cpu().float(), ref, atol=self.ATOL, rtol=self.RTOL
         )
+
+    def test_gather_mode_paged_pages(self):
+        """Kind.GATHER: the body gathers its own page, one per trip.
+
+        Case 3 from the design spec's minimum coverage list, and the shape
+        paged attention actually wants: tile the block table, keep the page
+        pool invariant, and let the body read its page index out of the tile.
+        The index is a point read whose address advances with the spliced loop
+        and has no iteration dim, so this drives
+        coarse_tile._point_splice_advance_for_dep (record the per-trip
+        advance), _full_buffer_read_deps' point-read exclusion (leave the read
+        direct instead of staging a 1-element int32 into scratch),
+        _rebase_point_splice_reads (pin the index to iteration 0 so the
+        advance is not applied twice), and insert_restickify's per-dep advance
+        handover. Numerics, not just compilation: every one of those can be
+        got wrong in a way that compiles and re-reads the same page.
+
+        Two matmuls per trip and a distinct page per trip, so an advance
+        applied to the wrong operand or dropped entirely shows up as a large
+        mismatch rather than rounding.
+        """
+        pages, table, q = paged_gather_inputs()
+        ref = paged_gather_reference(pages, q)
+
+        compiled = torch.compile(paged_gather_fn, backend="inductor", fullgraph=True)
+        out = compiled(pages.to(DEVICE_NAME), table.to(DEVICE_NAME), q.to(DEVICE_NAME))
+
+        # Looser than the class defaults: the accumulator sums four
+        # score-weighted pages of magnitude ~sqrt(head_size), so fp16 matmul
+        # rounding alone reaches a couple of absolute units here.
+        torch.testing.assert_close(out.cpu().float(), ref, atol=2.0, rtol=0.05)
 
 
 if __name__ == "__main__":

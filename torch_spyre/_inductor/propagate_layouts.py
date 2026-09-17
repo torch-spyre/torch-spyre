@@ -219,6 +219,22 @@ def _compute_dim_order(stick_dim, size, coords):
     return dim_order
 
 
+def _project_pointwise_dim_order(
+    dim_order: list[int], output_rank: int, input_rank: int
+) -> list[int]:
+    """Project a pointwise output order onto a trailing-aligned input."""
+    rank_diff = output_rank - input_rank
+    if rank_diff >= 0:
+        return [d - rank_diff for d in dim_order if d >= rank_diff]
+
+    # A loop tile can be a rank-preserving view of a higher-rank backing
+    # buffer. Its extra leading axes are fixed by the loop, while the body
+    # operates on the trailing axes. Keep those backing axes in the layout
+    # permutation and shift the body's order onto the trailing dimensions.
+    leading = list(range(-rank_diff))
+    return leading + [d - rank_diff for d in dim_order]
+
+
 def _pick_stick_dim(stick_expr, out_coords) -> int:
     """Map a stick expression to an output dimension index, or -1 if it doesn't survive."""
     maybe = matching_dim(out_coords, stick_expr)
@@ -430,7 +446,7 @@ def _qfp8wt_stl(
         in_layout: Inductor ``FixedLayout`` for the op's input tensor.
     """
     in_eps = get_elem_in_stick(in_layout.dtype)
-    stick_dim_size = in_layout.size[-1]
+    stick_dim_size = concretize_expr(in_layout.size[-1])
     unaligned = stick_dim_size % in_eps
     outer_sizes = [concretize_expr(s) for s in output.size[:-1]]
     outer_strides = [concretize_expr(s) for s in output.stride[:-1]]
@@ -715,9 +731,7 @@ def _clone_layout(
     data = op.data
 
     assert isinstance(data, Pointwise)
-    origin_node = next(iter(data.origins))
-    aten_op = origin_node.target
-    assert aten_op == aten.clone.default
+    assert any(origin.target == aten.clone.default for origin in data.origins)
 
     in_dep = args[0].dep
     in_stl = next(iter(args[0].layouts))
@@ -1549,9 +1563,9 @@ def _multi_arg_pointwise_layouts(
 
     def _is_supported_layout(dim_order):
         for arg in args:
-            # Project output dim_order to input, dropping leading dims missing due to broadcast.
-            rank_diff = len(output.size) - len(arg.layout.size)
-            projected_dim_order = [d - rank_diff for d in dim_order if d >= rank_diff]
+            projected_dim_order = _project_pointwise_dim_order(
+                dim_order, len(output.size), len(arg.layout.size)
+            )
             c_in_size = [concretize_expr(s) for s in arg.layout.size]
             c_in_stride = [concretize_expr(s) for s in arg.layout.stride]
             in_stl = SpyreTensorLayout(
@@ -1944,7 +1958,7 @@ def compute_layouts(
     if aten_op == spyreop.compact.default:
         return _compact_layout(op, output, output_dep, args)
 
-    if aten_op == aten.clone.default:
+    if any(origin.target == aten.clone.default for origin in data.origins):
         # clone materializes a new buffer in a fixed row-major layout regardless of
         # input stick — equivalent to a restickify. No restickify before it is needed,
         # unless there is an offset in the stick dimension.
@@ -2012,8 +2026,9 @@ def generic_layout(op: Operation) -> SpyreTensorLayout:
 
 def _generic_layout_for(output: FixedLayout) -> SpyreTensorLayout:
     # tl;dr: usually pick the blind identity stick-dim order; only override
-    # it for a FixedLayout whose most-contiguous dim isn't already last,
-    # since that's the one shape where the blind order is provably wrong.
+    # it for a FixedLayout whose most-contiguous REAL dim isn't already
+    # last, since that's the one shape where the blind order is provably
+    # wrong.
     #
     # Concretize for C++ SpyreTensorLayout constructor.
     c_size = [concretize_expr(s) for s in output.size]
@@ -2021,29 +2036,48 @@ def _generic_layout_for(output: FixedLayout) -> SpyreTensorLayout:
     # SpyreTensorLayout's bare (size, dtype) constructor synthesizes its own
     # row-major host strides from size alone (identity dim order, last dim =
     # stick dim) -- blind to output.stride. That's correct for the
-    # overwhelming majority of ops, including a BROADCAST layout (zero
-    # stride) like test_building_blocks' causal-SDPA buf29 -- so it's left
-    # in place except in the one case below.
+    # overwhelming majority of ops, including a purely-broadcast layout
+    # (every dim zero stride) like test_building_blocks' causal-SDPA buf29
+    # -- so it's left in place except in the one case below.
     #
     # A FixedLayout can carry a non-monotonic stride whose last dim is NOT
-    # its most-contiguous one (e.g. it's shared with a later mutation write
-    # into the same buffer, as in test_map_mode_split_m's transposed pad
-    # target, size=[6, 64] stride=[1, 6]). There the blind order picks the
-    # wrong stick dim, producing an unrepresentable stick expression
-    # downstream ("Unexpected stick expression d0 + 2*(Mod(3*d1, 32))" out of
-    # _find_alt_target_stl's device_coordinates call). The two conditions
-    # below isolate exactly that case (no zero strides, so broadcast layouts
-    # like buf29 are excluded; min stride not already last, so a natural
-    # row-major layout is untouched) and sort dims by decreasing stride
-    # (ties by original position) so the most-contiguous dim lands last,
-    # matching every other SpyreTensorLayout call site in this module (e.g.
-    # _all_constant_layouts, _make_output_stl).
+    # its most-contiguous REAL (non-broadcast) dim (e.g. it's shared with a
+    # later mutation write into the same buffer, as in
+    # test_map_mode_split_m's transposed pad target, size=[6, 64]
+    # stride=[1, 6], or issue #4460's constant_pad_nd target buf60, size=
+    # [2, 6, 64] stride=[0, 1, 6] -- a legitimate broadcast dim (stride 0,
+    # size 2) alongside two real dims that are themselves non-monotonic).
+    # There the blind order picks the wrong stick dim, producing an
+    # unrepresentable stick expression downstream ("Unexpected stick
+    # expression d0 + 2*(Mod(3*d1, 32))" out of _find_alt_target_stl's
+    # device_coordinates call).
+    #
+    # A broadcast dim (stride 0, size > 1) has no real address contribution
+    # and must never be picked as the stick dim, nor influence which real
+    # dim is most-contiguous -- ranking it by its raw stride value would
+    # place it first (0 sorts as smallest), corrupting the choice. Exclude
+    # broadcast dims from the ranking (mirroring lower_pad_sequence's own
+    # broadcast-dim exclusion in pass_utils.py) and place them ahead of the
+    # ranked real dims in dim_order; a size-1 dim's stride is irrelevant
+    # regardless.
+    #
+    # The two conditions below isolate exactly the "non-monotonic among
+    # real dims" case (at least one nonzero stride to rank; most-contiguous
+    # real dim not already last) and sort the real dims by decreasing
+    # stride (ties by original position) so the most-contiguous one lands
+    # last, matching every other SpyreTensorLayout call site in this module
+    # (e.g. _all_constant_layouts, _make_output_stl).
+    real_dims = [
+        d for d in range(len(c_size)) if not (c_stride[d] == 0 and c_size[d] > 1)
+    ]
     if (
         len(c_size) > 1
-        and all(s != 0 for s in c_stride)
-        and min(c_stride) != c_stride[-1]
+        and real_dims
+        and min(c_stride[d] for d in real_dims) != c_stride[-1]
     ):
-        dim_order = sorted(range(len(c_size)), key=lambda d: (-c_stride[d], d))
+        broadcast_dims = [d for d in range(len(c_size)) if d not in real_dims]
+        ordered_real = sorted(real_dims, key=lambda d: (-c_stride[d], d))
+        dim_order = broadcast_dims + ordered_real
         return SpyreTensorLayout(c_size, c_stride, output.dtype, dim_order)
     return SpyreTensorLayout(c_size, output.dtype)
 
@@ -2649,7 +2683,7 @@ def propagate_spyre_tensor_layouts(
                     # Treat the mutation op like a normal pointwise op: run
                     # _multi_arg_pointwise_layouts with the non-target inputs.
                     # This enforces input-compatibility and slice constraints,
-                    # so the backend DDL slice check passes.
+                    # so the backend slice check passes.
                     rw = op.get_read_writes()
                     output_dep = next(iter(rw.writes))
                     all_args = _get_prop_args(rw.reads)

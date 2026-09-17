@@ -390,6 +390,33 @@ class TestBuildingBlocks(unittest.TestCase):
             rtol=0.1,
         )
 
+    @mock.patch(
+        "torch_spyre._inductor.decompositions._SDPA_MAX_BURST_EFFICIENT_KV_BLOCK_SIZE",
+        64,
+    )
+    @mock.patch("torch_spyre._inductor.decompositions._SDPA_MAX_SEQUENCE_TILE_SIZE", 64)
+    def test_sdpa_lk_uses_for_each_tile(self):
+        """Multiple K/V blocks lower to one counted loop instead of unrolling."""
+        batch, heads, query_length, kv_length, head_dim = 1, 2, 64, 128, 128
+        query = torch.randn(batch, heads, query_length, head_dim, dtype=torch.float16)
+        key = torch.randn(batch, heads, kv_length, head_dim, dtype=torch.float16)
+        value = torch.randn(batch, heads, kv_length, head_dim, dtype=torch.float16)
+
+        def sdpa(query, key, value):
+            return F.scaled_dot_product_attention(query, key, value)
+
+        expected = sdpa(query, key, value)
+        actual, sources = run_and_get_code(
+            torch.compile(sdpa, dynamic=False),
+            query.to("spyre"),
+            key.to("spyre"),
+            value.to("spyre"),
+        )
+
+        torch.testing.assert_close(actual.cpu(), expected, atol=0.1, rtol=0.1)
+        self.assertEqual(sum(source.count("LoopSpec(") for source in sources), 1)
+        self.assertNotIn("while_loop_carry_snapshot", "\n".join(sources))
+
     def test_causal_sdpa_unpadded_kv_no_inf(self):
         """Regression: causal SDPA must not produce inf when seqlen_kv % 64 != 0.
 

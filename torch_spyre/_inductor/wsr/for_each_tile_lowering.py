@@ -56,11 +56,12 @@ from typing import TYPE_CHECKING, Any
 import sympy
 import torch
 
-from torch._inductor.ops_handler import DefaultHandler
+from torch._inductor.ops_handler import DefaultHandler, WrapperHandler
 from torch._inductor.virtualized import V
 
 if TYPE_CHECKING:
     from torch._inductor import ir
+    from torch._inductor.dependencies import Dep
 
 
 @dataclasses.dataclass(frozen=True)
@@ -238,6 +239,42 @@ def _body_loop_var(while_op: "ir.WhileLoop") -> sympy.Symbol | None:
 
 _next_synthetic_hint_id_start = 1 << 30  # reserved range, well above real hint scopes
 
+_MARKER_MAPS: dict[int, dict[tuple[str, "Dep"], int]] = {}
+"""Per-compile marker-map registry, keyed by id(operations).
+
+NOT safe to let outlive one compile: CPython aggressively reuses a freed
+list's id, so a stale entry left behind by a prior compile can collide
+with -- and be silently mistaken for -- a live compile's own entry
+sharing the same buffer-name/dep-shape (confirmed empirically: running
+the same for_each_tile fixture twice in one process produces
+byte-identical (op.get_name(), dep) keys across both compiles).
+clear_marker_maps() must be called once per compile, before
+_consume_tile_dim_markers runs, to guarantee this never happens --
+passes.py's per-compile pipeline entry point does this, alongside the
+analogous reset_provenance_warnings() call, for the same "each compile
+starts from a clean slate" reason.
+"""
+
+
+def clear_marker_maps() -> None:
+    """Discard every entry in the module-level _MARKER_MAPS registry.
+
+    Must be called exactly once per compile, before _consume_tile_dim_markers
+    runs for that compile (passes.py's per-compile pipeline __call__ does
+    this, right alongside reset_provenance_warnings(), which exists for the
+    identical "each compile starts fresh" reason). Without this,
+    _MARKER_MAPS leaks for the process's entire lifetime (nothing else ever
+    deletes an entry), and -- more seriously than the leak itself --
+    id(operations) can be reused by CPython for an unrelated later compile's
+    operations list, letting that later compile's lookup_marker_dim call
+    silently resolve against a dead compile's stale entry instead of
+    raising or returning None. Confirmed empirically: two successive
+    compiles of the same fixture in one process produced identical
+    (op.get_name(), dep) keys; it happened to be harmless there only because
+    both entries stored the same dim, which is not a general guarantee.
+    """
+    _MARKER_MAPS.clear()
+
 
 def _synthesize_dim_hints_for_group(
     group_ops: list["ir.Operation"],
@@ -278,6 +315,18 @@ def _synthesize_dim_hints_for_group(
 
     for op in group_ops:
         if not hasattr(op, "data"):
+            continue
+        if _marker_dim(op) is not None:
+            # A tile_dim_marker op that _consume_tile_dim_markers left
+            # materialized (StarDep-shaped consumer branch -- see its own
+            # comment) is not itself a for_each_tile tile read: it IS the
+            # marker, and its own upstream read legitimately carries a
+            # per-iteration offset with no marker-map entry to resolve
+            # against (the map is keyed by the *consumer's* name, never
+            # the marker's own). Stamping a synthesized hint here would
+            # later resolve through _hint_ranges_pos/lookup_marker_dim and
+            # hit exactly the "no tile_dim_marker entry for it" gap that
+            # mechanism raises on -- skip it.
             continue
         existing = list(getattr(op, "dim_hints", []) or [])
         is_reduction = getattr(op.data, "reduction_type", None) is not None
@@ -367,6 +416,729 @@ def _stacking_carry_indices(
     return frozenset(stacking)
 
 
+def _marker_dim(op: "ir.Operation") -> "int | None":
+    """Return op's tile_marker_dim if it carries one, else None.
+
+    lower_tile_dim_marker (lowering.py) stamps ``tile_marker_dim`` directly
+    on the realized ``ComputedBuffer`` -- ``pw.data.data`` there, where
+    ``pw`` is the ``TensorBox`` it returns, ``pw.data`` its ``StorageBox``,
+    and ``pw.data.data`` the ``ComputedBuffer`` that ends up as this exact
+    ``op`` object in ``graph.operations``/``group_ops``. So the attribute
+    lives on ``op`` itself, not on ``op.data`` (``op.data`` is one level
+    deeper still -- the ``Pointwise``/``Reduction`` IR expression node, which
+    never carries it). Confirmed empirically: checking ``op.data`` here
+    always misses, even for a genuine marker op.
+    """
+    return getattr(op, "tile_marker_dim", None)
+
+
+def _delinearize_index(index: sympy.Expr, size, stride, offset) -> list[sympy.Expr]:
+    """Invert a FixedLayout-style flat index back into per-dim coordinates.
+
+    ``ops.load(name, index)`` always receives ``index`` already flattened
+    to a single sympy expression by the loaded buffer's own
+    ``make_indexer()`` -- see ``Buffer.make_loader``/``_fixed_indexer`` --
+    never the original ``Sequence[Expr]`` coordinate list a ``Loops``
+    ``inner_fn``'s own index is parameterized by. Inlining the marker's
+    own read (see ``_InlineMarkerHandler``) needs that coordinate list
+    back, so undo ``_fixed_indexer``'s ``sum(idx[i] * stride[i]) +
+    offset`` here: every per-dim loop-index symbol (``i0``, ``r0``, ``d0``,
+    ...) appears in exactly one additive term of that sum with
+    coefficient ``stride[i]`` (the same one-symbol-per-term linearity
+    every coordinate-recovery helper in this package already assumes --
+    see coarse_tile.py's ``_loop_var_to_ranges_pos``/the deleted
+    ``_loop_var_pos_from_reads``), so dividing each matched term by its
+    own stride recovers ``idx[i]`` directly; a size-1 dim contributes no
+    term at all (``_fixed_indexer`` skips it), so its coordinate is
+    simply 0.
+
+    Two distinct dims sharing the same non-zero stride literal (a
+    degenerate/unusual layout, not observed against any fixture in this
+    repo, but not structurally impossible either) would make
+    ``remaining.coeff(st)`` silently SUM both dims' coefficients into one
+    merged coordinate instead of raising -- exactly the kind of silent
+    wrong-answer this module exists to prevent elsewhere. Guard against it
+    explicitly: raise rather than let two dims collide on one recovered
+    coordinate.
+    """
+    remaining = sympy.expand(index - offset)
+    coords: list[sympy.Expr] = []
+    seen_strides: dict[sympy.Expr, int] = {}
+    for i, (sz, st) in enumerate(zip(size, stride)):
+        if sz == 1:
+            coords.append(sympy.Integer(0))
+            continue
+        if st != 0 and st in seen_strides:
+            raise AssertionError(
+                f"_delinearize_index: dims {seen_strides[st]} and {i} both "
+                f"have stride {st!r} (sizes {size!r}); cannot recover "
+                "distinct coordinates for both from a single flattened "
+                "index without conflating them."
+            )
+        if st != 0:
+            seen_strides[st] = i
+        # A size>1 broadcast dim (stride 0) contributes no term to
+        # `remaining` and its coordinate is always 0 -- but that must be
+        # special-cased rather than falling into the general
+        # `remaining.coeff(st)` branch below: sympy's `.coeff(0)` does not
+        # mean "coefficient of the constant term" here, it returns the
+        # WHOLE `remaining` expression unchanged. Using `remaining.coeff(st)`
+        # unconditionally would silently smuggle the entire remaining sum
+        # into this one dim's "coordinate" instead of 0.
+        coords.append(remaining.coeff(st) if st != 0 else sympy.Integer(0))
+    return coords
+
+
+def _marker_substitution(
+    marker_op: "ir.Operation",
+) -> tuple[str, sympy.Expr, tuple[sympy.Symbol, ...], tuple[sympy.Expr, ...]]:
+    """Get (marker's own input name, marker's own read index expr, var_names, size).
+
+    The marker's ``inner_fn`` (``lower_tile_dim_marker``, lowering.py) is
+    always exactly ``return loader(index)`` -- a single load of the
+    marker's own upstream input at some index that is generally NOT the
+    identity (it can carry an extra per-iteration advance term, e.g.
+    ``+ 24*u0``). Rather than re-executing that ``inner_fn`` live (which
+    would replay a stale FX ``Proxy``/``OpsValue`` captured from whatever
+    trace built the marker in the first place, crashing or silently
+    reusing the wrong graph node when spliced into a different consumer's
+    live retrace -- confirmed empirically: ``LightTracer.create_arg``
+    raises ``NotImplementedError`` on the leaked ``OpsValue``), extract the
+    marker's own read as a pure symbolic expression via
+    ``get_read_writes()`` and let the caller substitute into it -- the same
+    "index expressions are symbolic, substitute don't re-execute"
+    discipline this module and ``coarse_tile.py`` already follow
+    everywhere else (see CLAUDE.md's "wrap, never reconstruct").
+
+    Returns the marker's own single MemoryDep read's ``(name, index)``,
+    where ``index`` is expressed in terms of the marker's own WRITE dep's
+    ``var_names`` (its own output-coordinate symbols, ``d0, d1, ...`` in
+    positional order) -- the caller substitutes its own load-site
+    coordinates for those symbols positionally. Also returns that same
+    WRITE dep's own ``size``, positionally aligned with ``var_names``: both
+    have size-1 dims already squeezed out by Inductor's
+    ``index_vars_squeeze``/canonicalize machinery, so the caller can use
+    ``size`` to tell which of the marker's *layout* dims (``_InlineMarkerHandler``'s
+    own ``self._size``, which does NOT have size-1 dims squeezed out) a
+    given ``var_names`` entry actually corresponds to.
+    """
+    from torch._inductor.dependencies import MemoryDep
+
+    rw = marker_op.get_read_writes()
+    write_deps = [d for d in rw.writes if isinstance(d, MemoryDep)]
+    read_deps = [d for d in rw.reads if isinstance(d, MemoryDep)]
+    if len(write_deps) != 1 or len(read_deps) != 1:
+        raise AssertionError(
+            f"tile_dim_marker op {marker_op.get_name()!r} has "
+            f"{len(write_deps)} MemoryDep writes and {len(read_deps)} "
+            "MemoryDep reads; expected exactly 1 of each to inline its "
+            "body into a consumer."
+        )
+    write_dep, read_dep = write_deps[0], read_deps[0]
+    return read_dep.name, read_dep.index, write_dep.var_names, write_dep.size
+
+
+class _InlineMarkerHandler(WrapperHandler):
+    """Intercept a load of one erased tile_dim_marker, inlining its own body.
+
+    A plain name-swap (``pass_utils.NameSwapHandler``, via
+    ``redirect_computed_buffer_reads``) is wrong here: it rewrites
+    ``load(marker_name, index)`` to ``load(marker_input_name, index)``,
+    reusing the CONSUMER's own (already-flattened) index expression
+    unchanged. That index was computed by flattening the CONSUMER's
+    coordinate list through the MARKER's OWN layout indexer (e.g. index
+    ``12*d0 + d2`` into the marker's own ``[2, 12]``-shaped write) -- it is
+    not, and must not be reused as, an index into the marker's raw,
+    unsliced INPUT (e.g. ``arg0_1``, the whole per-trip-invariant operand,
+    whose corresponding read is ``12*d0 + d1 + 24*u0`` -- note the extra
+    ``+ 24*u0`` term the marker's own body contributes, encoding exactly the
+    per-iteration tile offset _hint_ranges_pos/lookup_marker_dim need to
+    see). Swapping only the name and keeping the consumer's own flat index
+    silently drops that offset term entirely -- every trip reads the SAME
+    window of the underlying tensor instead of advancing, a silent
+    wrong-answer bug confirmed empirically against test_map_mode_split_m
+    and test_carry_mode_online_softmax's real-device matmul consumers (see
+    _consume_tile_dim_markers's own docstring and this module's task-5
+    report for the full trace).
+
+    The correct erasure substitutes the CONSUMER's own load-site index
+    (delinearized back into per-dim coordinates by ``_delinearize_index``,
+    since ``ops.load`` always hands us an already-flattened single
+    expression, not the coordinate list the marker's own index is
+    parameterized by) for the marker's own output-coordinate symbols
+    inside the marker's own read-index expression (``_marker_substitution``)
+    -- a pure sympy substitution, never a live re-execution of the
+    marker's ``inner_fn`` (see ``_marker_substitution``'s docstring for why
+    that would be wrong). This keeps the "wrap, never reconstruct"
+    convention (CLAUDE.md, issue #2797): the marker's ORIGINAL index
+    expression is reused verbatim, never re-derived by hand -- only the
+    free variables are substituted, exactly as any other index-composition
+    in this codebase already does.
+    """
+
+    def __init__(self, inner, marker_name: str, marker_op: "ir.Operation"):
+        super().__init__(inner)
+        self._marker_name = marker_name
+        layout = marker_op.layout
+        self._size = layout.size
+        self._stride = layout.stride
+        self._offset = layout.offset
+        (
+            self._marker_input_name,
+            self._marker_read_index,
+            self._marker_var_names,
+            self._marker_write_size,
+        ) = _marker_substitution(marker_op)
+
+    def load(self, name, index):
+        if name == self._marker_name:
+            coords = _delinearize_index(index, self._size, self._stride, self._offset)
+            # self._size (this handler's own layout.size) has NOT had size-1
+            # dims squeezed out, but self._marker_var_names/
+            # self._marker_write_size (from the marker's own WRITE dep) HAVE
+            # -- Inductor's index_vars_squeeze/canonicalize already dropped
+            # them. Zipping coords (one per self._size slot) directly against
+            # var_names (one per squeezed slot) would silently misalign and
+            # truncate the moment the two lists differ in length -- e.g. a
+            # size-1 dim anywhere but the position(s) every current fixture
+            # happens to put it at. Filter coords down to only the positions
+            # whose size is not 1 before zipping, so the two lists are
+            # positionally comparable by construction rather than by
+            # coincidence of today's fixture shapes.
+            non_unit_coords = [c for c, sz in zip(coords, self._size) if sz != 1]
+            if len(non_unit_coords) != len(self._marker_var_names):
+                raise AssertionError(
+                    f"tile_dim_marker {self._marker_name!r}: "
+                    f"{len(non_unit_coords)} non-size-1 load-site coordinates "
+                    f"(from size {self._size!r}) but "
+                    f"{len(self._marker_var_names)} marker var_names (from "
+                    f"write size {self._marker_write_size!r}); cannot "
+                    "substitute positionally."
+                )
+            subs = dict(zip(self._marker_var_names, non_unit_coords))
+            # simultaneous=True is required: sympy.Expr.subs(dict) otherwise
+            # applies substitutions sequentially, one symbol at a time, so a
+            # dict like {d0: d1, d1: d2} first rewrites d0->d1 and THEN
+            # rewrites that same fresh d1 -> d2, silently merging two
+            # distinct coordinates into one (confirmed empirically: this
+            # produced a wrong composed index, e.g. 129*d2 instead of the
+            # correct 128*d1 + d2, for test_carry_mode_online_softmax's
+            # transposed k_tile read, since its coordinate permutation's
+            # target set overlaps its source set: {d0: d1, d1: d2}).
+            composed = self._marker_read_index.subs(subs, simultaneous=True)
+            return super().load(self._marker_input_name, composed)
+        return super().load(name, index)
+
+
+def _inline_marker_into_consumer(
+    consumer_op: "ir.Operation",
+    marker_op: "ir.Operation",
+    operations: list["ir.Operation"],
+) -> "ir.Operation":
+    """Erase marker_op by inlining its body into consumer_op's load of it.
+
+    See _InlineMarkerHandler for why a plain name-swap
+    (pass_utils.redirect_computed_buffer_reads) is wrong for this case.
+    Patches consumer_op.data.inner_fn in place (Loops is a frozen dataclass,
+    hence object.__setattr__ -- same as redirect_computed_buffer_reads does),
+    then delegates the reconstruct-and-swap-into-`operations` step to
+    ``pass_utils.replace_computed_buffer_body``, which already performs
+    exactly that (metadata copy, provenance, cache invalidation, mutation-
+    target/nested-WhileLoop repointing) for a caller supplying a full new
+    body object rather than a bare name map.
+    """
+    from torch._inductor.virtualized import V
+
+    from torch_spyre._inductor.pass_utils import (
+        _invalidate_body_caches,
+        replace_computed_buffer_body,
+    )
+
+    marker_name = marker_op.get_name()
+
+    orig_inner = consumer_op.data.inner_fn
+
+    def new_inner_fn(*args, _orig_inner=orig_inner):
+        with V.set_ops_handler(_InlineMarkerHandler(V.ops, marker_name, marker_op)):
+            return _orig_inner(*args)
+
+    object.__setattr__(consumer_op.data, "inner_fn", new_inner_fn)
+    _invalidate_body_caches(consumer_op.data)
+
+    return replace_computed_buffer_body(
+        consumer_op,
+        consumer_op.data,
+        operations,
+        pass_name="_consume_tile_dim_markers",
+        reason=f"inline erased tile_dim_marker {marker_name!r} body",
+    )
+
+
+def _consume_tile_dim_markers(
+    group_ops: list["ir.Operation"],
+    operations: list["ir.Operation"],
+) -> dict[tuple[str, "Dep"], int]:
+    """Find every tile_dim_marker-tagged op in group_ops, erase it, map its dim.
+
+    For each marker op (an op whose realized ComputedBuffer carries
+    tile_marker_dim -- see lowering.py's lower_tile_dim_marker): find its
+    single consuming use among group_ops, record
+    (op.get_name(), dep) -> dim in the returned map, then erase the
+    marker and remove the marker op from `operations`.
+
+    A marker's consumer can hold its read in either of two shapes (both
+    already handled elsewhere in this package for the analogous WAR-hazard
+    carry-snapshot redirect -- see while_loop_bridge.py's
+    ``_snapshot_carry_placeholder``, whose ``hasattr(reader, "data")``
+    branch is the same test used below):
+
+    - A ``ComputedBuffer`` consumer (has ``.data``, an inner_fn-backed
+      Pointwise/Reduction/Scan/Sort body): the read surfaces as a
+      ``MemoryDep`` named after the marker in ``get_read_writes().reads``.
+      Erased via ``_inline_marker_into_consumer``, which wraps (never
+      reconstructs, per CLAUDE.md) the inner_fn with ``_InlineMarkerHandler``
+      so every load of the marker re-issues the MARKER'S OWN inner_fn
+      (``marker_op.data.make_loader()``) at the consumer's load-site index,
+      rather than merely renaming past it. A plain name-swap
+      (``pass_utils.redirect_computed_buffer_reads``/``NameSwapHandler``) is
+      NOT used here: the marker's own body performs a genuine, non-identity
+      per-iteration coordinate transform (the tile's slice offset -- e.g. an
+      extra ``+ 24*u0`` advance term baked into the marker's own read index
+      by ``lower_tile_dim_marker``), which a bare name-swap would silently
+      drop, since ``NameSwapHandler.load`` passes the consumer's own index
+      straight through unchanged. Confirmed empirically (see
+      ``lookup_marker_dim``'s own docstring and this module's task-5
+      report): a plain rename produced silently wrong device-side numerics
+      on ``test_map_mode_split_m``/``test_carry_mode_online_softmax``,
+      because every loop trip ended up reading the identical (tile-0-only)
+      slice of the underlying tensor instead of advancing through it.
+    - An ``InputsKernel``-family consumer (``ExternKernelOut``,
+      ``FallbackKernel``, ``ConcatKernel``, ... -- no inner_fn, e.g. the CPU
+      aten-fallback matmul for a for_each_tile tile read on a
+      device-less/CPU fixture): the read surfaces as a ``StarDep`` (name
+      only, no index/ranges) named after the marker, and is held as a
+      direct Python object reference in the consumer's ``.inputs`` list (or
+      ``.layout.target`` for a MutationLayoutSHOULDREMOVE write) rather than
+      through any named load. Erased via
+      ``while_loop_bridge._substitute_direct_input_refs``, which patches
+      that reference in place to point at the marker's own input object
+      instead -- the same helper (and the same object-identity-preserving
+      unwrap-one-StorageBox-level care it documents) that
+      ``_snapshot_carry_placeholder`` already relies on for this exact read
+      shape.
+
+    Zero or more than one consuming use (of either shape) is an unrecognized
+    shape and raises -- this pass runs on a freshly spliced body whose only
+    consumers of a marker's output should be exactly the op(s) for_each_tile's
+    frontend wrote to read that tile; anything else means an assumption this
+    module owns (see the module docstring) no longer holds and a silent guess
+    would be worse than a loud failure.
+
+    Must run before any hint synthesis -- callers of _hint_ranges_pos
+    consult the module-level _MARKER_MAPS registry this function populates,
+    and must see every marker already resolved and erased.
+
+    Internally keyed by ``consumer_op.get_name()`` rather than
+    ``consumer_op`` itself or ``id(consumer_op)``: ``ir.Operation``/
+    ``ComputedBuffer`` are ``(unsafe_hash=False, eq=True)`` dataclasses, so
+    Python sets their ``__hash__`` to ``None`` and they cannot be dict/set
+    keys directly (see ``coarse_tile.py``'s ``plan: dict[int,
+    CoarseTileInfo]`` docstring for the same, already-established
+    convention in this codebase for using ``id()`` instead of the object).
+    But ``id(op)`` itself is NOT safe here the way it is for that other
+    convention's own single-pass, single-object lifetime: a *later*
+    coarse-tiling sub-pass (e.g. ``_insert_all_read_copy_ops`` /
+    ``_patch_consumer_to_read_copy``) can rebuild this exact consumer
+    AGAIN via ``replace_computed_buffer_body`` -- for a completely
+    unrelated read of the same op -- minting a new object with a new
+    ``id()`` before ``lookup_marker_dim`` is ever called from
+    ``_hint_ranges_pos``. Confirmed empirically
+    (test_carry_mode_online_softmax): the marker map's ``id()``-keyed entry
+    for the K-tile-marker's consumer went stale exactly this way once a
+    read-copy for its *other* read (``arg0_1``/Q, unrelated to the marker)
+    was inserted, silently orphaning an otherwise-correct, otherwise-still-
+    matching map entry. ``op.get_name()`` (the buffer name) is what stays
+    stable across such a reconstruction -- every rebuild-via-
+    ``replace_computed_buffer_body`` site in this package (this one
+    included) preserves the original name, and other Spyre metadata
+    (``PropagationPlan.outside_consumer_names``, etc.) already keys by name
+    for exactly this reason -- see that field's own docstring on name
+    stability. The returned map is keyed by ``(op.get_name(), dep)`` --
+    ``lookup_marker_dim`` (the map's only reader) recomputes ``op.get_name()``
+    itself, so callers never need the key's ``str`` half spelled out
+    explicitly. For a StarDep-shaped consumer the dep stored is the StarDep
+    itself (not a MemoryDep) --
+    lookup_marker_dim's own read-walk already iterates every read
+    regardless of type when matching by identity/equality against the map,
+    and only special-cases MemoryDep for the (inapplicable to StarDep,
+    which has no index) reduction-coordinate check.
+    """
+    from torch._inductor.dependencies import MemoryDep, StarDep
+
+    from torch_spyre._inductor.wsr.while_loop_bridge import (
+        _substitute_direct_input_refs,
+    )
+
+    marker_map: dict[tuple[str, Dep], int] = {}
+    group_op_ids = {id(op) for op in group_ops}
+
+    for marker_op in list(group_ops):
+        dim = _marker_dim(marker_op)
+        if dim is None:
+            continue
+        marker_name = marker_op.get_name()
+
+        consumers: list[tuple[ir.Operation, Dep]] = []
+        for candidate in group_ops:
+            # No `id(candidate) not in group_op_ids` check here: every
+            # candidate iterated is, by construction, an element of
+            # group_ops itself, so it is trivially always present in
+            # group_op_ids (which this loop never mutates) -- that
+            # disjunct could never be True and would only mislead a
+            # future reader into thinking group_ops/group_op_ids can
+            # desync mid-loop here. (group_op_ids IS mutated later in
+            # this function, once a marker/consumer is actually erased
+            # or replaced -- see below -- just not during this scan.)
+            if candidate is marker_op:
+                continue
+            rw = candidate.get_read_writes()
+            for dep in rw.reads:
+                if isinstance(dep, (MemoryDep, StarDep)) and dep.name == marker_name:
+                    consumers.append((candidate, dep))
+
+        if len(consumers) != 1:
+            raise AssertionError(
+                f"tile_dim_marker op {marker_name!r} has {len(consumers)} "
+                "consuming reads within its spliced body; expected exactly "
+                "one. This is an unrecognized for_each_tile shape -- "
+                "_consume_tile_dim_markers only knows how to erase a marker "
+                "whose output is read by exactly one downstream op."
+            )
+        consumer_op, consumer_dep = consumers[0]
+
+        # ComputedBuffer has no plain `.inputs` list attribute (that
+        # attribute belongs to the InputsKernel family -- FallbackKernel,
+        # ConcatKernel, etc). A ComputedBuffer's own upstream reads instead
+        # come from its inner_fn, surfaced via get_read_writes().reads --
+        # confirmed empirically against a live tile_dim_marker op, which has
+        # exactly one MemoryDep read (the tile it marks).
+        marker_reads = [
+            dep
+            for dep in marker_op.get_read_writes().reads
+            if isinstance(dep, MemoryDep)
+        ]
+        if len(marker_reads) != 1:
+            raise AssertionError(
+                f"tile_dim_marker op {marker_name!r} has "
+                f"{len(marker_reads)} MemoryDep reads; expected exactly 1 "
+                "(the tile it marks)."
+            )
+        marker_input_name = marker_reads[0].name
+
+        if hasattr(consumer_op, "data"):
+            new_consumer = _inline_marker_into_consumer(
+                consumer_op, marker_op, operations
+            )
+            # _inline_marker_into_consumer swaps `operations[op_idx]` in
+            # place but returns a new object whose reads no longer include
+            # `consumer_dep` at all -- the marker's own inner_fn (its
+            # genuine per-iteration coordinate transform, e.g. an extra
+            # `+ 24*u0` advance term) is now composed directly into the
+            # consumer's read of `marker_input_name`, replacing the old,
+            # marker-relative read. lookup_marker_dim looks up entries
+            # keyed by the CURRENT read it finds on `op` at lookup time, so
+            # the map must be keyed by that post-inline dep (the one now
+            # naming `marker_input_name`, with the marker's own index
+            # composed in), not by the stale pre-inline `consumer_dep`
+            # (which named the marker itself and will never appear among
+            # new_consumer's reads again).
+            new_reads = [
+                d
+                for d in new_consumer.get_read_writes().reads
+                if isinstance(d, MemoryDep) and d.name == marker_input_name
+            ]
+            if len(new_reads) != 1:
+                raise AssertionError(
+                    f"consumer {consumer_op.get_name()!r} has "
+                    f"{len(new_reads)} post-inline MemoryDep reads named "
+                    f"{marker_input_name!r}; expected exactly 1 (the "
+                    "inlined read that used to go through erased marker "
+                    f"{marker_name!r})."
+                )
+            new_dep = new_reads[0]
+        else:
+            # StarDep-shaped consumer (ExternKernelOut/FallbackKernel/
+            # ConcatKernel/... -- including a nested ir.WhileLoop, whose own
+            # .carried_inputs/.additional_inputs are the read shape
+            # _substitute_direct_input_refs's docstring calls its "fourth
+            # read shape"): no inner_fn to wrap, so
+            # redirect_computed_buffer_reads does not apply, and there is no
+            # load index to compose the marker's own transform into the way
+            # _inline_marker_into_consumer does for a ComputedBuffer
+            # consumer above.
+            #
+            # The marker's own ComputedBuffer performs a genuine,
+            # non-identity per-iteration coordinate transform (the tile's
+            # slice/offset -- see lower_tile_dim_marker's docstring), the
+            # same as for the ComputedBuffer-consumer branch above. Pointing
+            # the consumer's reference at the marker's own upstream input
+            # (marker_input_name, e.g. arg0_1 -- what an earlier version of
+            # this branch did via V.graph.try_get_buffer) discards that
+            # transform entirely: every consumer read then sees the raw,
+            # untiled operand with no per-iteration offset at all. Confirmed
+            # empirically on a nested for_each_tile (map/map) on the real
+            # Spyre device: the inner loop's captured outer-tile operand
+            # silently stayed pinned to outer trip 0's slice on every trip,
+            # corrupting every outer iteration after the first (~48% wrong
+            # elements) while remaining invisible on CPU eager/CPU Inductor,
+            # since neither exercises Spyre-specific codegen for a
+            # StarDep-shaped nested-WhileLoop marker consumer.
+            #
+            # The correct erasure-equivalent for this read shape is to keep
+            # the marker's ComputedBuffer materialized (never remove it from
+            # group_ops/operations) and redirect the consumer's reference to
+            # the marker ITSELF rather than to its upstream input --
+            # equivalent in effect to _inline_marker_into_consumer's
+            # per-load composition, just realized as a standalone buffer
+            # instead of fused into the consumer's own body, since a
+            # StarDep-shaped consumer has no body to fuse into. Only a
+            # stale-by-identity, same-name reference (confirmed empirically:
+            # splice_while_loop's own upstream passes can leave a consumer's
+            # direct object reference pointing at an object that predates
+            # the marker's final reconstruction, even though it already
+            # names the marker correctly) needs patching at all --
+            # _substitute_direct_input_refs's name-based resolve() is a
+            # no-op for any reference that already points at marker_op by
+            # identity, and safely repoints any reference that doesn't.
+            _substitute_direct_input_refs([consumer_op], {marker_name: marker_op})
+            new_consumer = consumer_op
+            # No object reconstruction happened (unlike the ComputedBuffer
+            # branch) -- consumer_op's own identity is unchanged, and its
+            # dep still names marker_name (the marker is not erased, so
+            # nothing renamed it) -- unlike the erase-and-redirect path this
+            # replaced, there is no post-substitution name change to
+            # re-derive a new dep from.
+            new_dep = consumer_dep
+
+        marker_map[(new_consumer.get_name(), new_dep)] = dim
+        if id(consumer_op) in group_op_ids:
+            group_op_ids.discard(id(consumer_op))
+            group_op_ids.add(id(new_consumer))
+            group_ops[group_ops.index(consumer_op)] = new_consumer
+
+        if hasattr(consumer_op, "data"):
+            # Only the ComputedBuffer/inline branch actually fuses the
+            # marker's transform into the consumer and erases the marker;
+            # the StarDep branch above deliberately keeps marker_op alive
+            # in BOTH group_ops and operations (see its comment) -- it must
+            # still codegen as a real, addressable buffer for the StarDep
+            # consumer to read, and _validate_contiguous (coarse_tile.py)
+            # requires every group's ops to occupy a gapless block of
+            # `operations`, so removing it from `operations` alone while
+            # keeping it out of `group_ops` (tried and reverted -- see git
+            # history) breaks that contiguity check for any group whose
+            # block the marker sits inside. Passes that must not treat a
+            # surviving marker as an ordinary tile op instead guard on
+            # `_marker_dim(op) is not None` individually (see
+            # _plan_read_copies in coarse_tile.py for the first such guard).
+            operations.remove(marker_op)
+            if marker_op in group_ops:
+                group_ops.remove(marker_op)
+            group_op_ids.discard(id(marker_op))
+
+    _MARKER_MAPS.setdefault(id(operations), {}).update(marker_map)
+    return marker_map
+
+
+def lookup_marker_dim(
+    op: "ir.Operation", loop_var: sympy.Symbol
+) -> "tuple[int, bool] | None":
+    """Resolve loop_var's tiled-dim position for op via the marker map.
+
+    Walks op's own reads and looks each one up in whichever _MARKER_MAPS
+    entry was populated for the operations list this op belongs to, to
+    confirm the read the marker map recorded for `op` is still present and
+    to identify which of THAT read's own index variables carries loop_var's
+    per-trip advance. Returns None if no mapped read resolves, signaling the
+    caller (coarse_tile.py's _hint_ranges_pos) to raise rather than guess.
+
+    The marker map's stored int (see _consume_tile_dim_markers) is NOT the
+    position this function returns -- it is tile_dim_marker's own `dim`
+    argument (for_each_tile.py's `spec.dim`), a position in the MARKER's
+    OWN tensor shape (the tile operand's layout), unrelated to the
+    consumer op's `data.ranges`/`data.reduction_ranges` numbering that every
+    caller of _hint_ranges_pos requires (see its own docstring: "The
+    position indexes op.data.ranges when the second element is False and
+    op.data.reduction_ranges when it is True"). Passing the marker's raw
+    dim straight through silently mis-selects the tiled position whenever
+    the tile's own shape ordering differs from the consumer's -- e.g. a
+    matmul reading a stacked tile leaf, where the marker's dim indexes the
+    2-D tile [rows, cols] but the matmul's own output/reduction dims are
+    numbered differently. Confirmed empirically: this exact bug produced
+    silently wrong (not raising) numerics on test_map_mode_split_m and
+    test_carry_mode_online_softmax's real-device matmul consumers, whose
+    CPU-fixture-based unit-test counterparts never caught it because a CPU
+    aten-fallback matmul is a StarDep consumer (see below), which never
+    reaches this position-mapping code at all.
+
+    So instead of trusting the map's stored int, re-derive the consumer's
+    own position the same way the deleted _loop_var_pos_from_reads did, but
+    scoped to exactly the one dep the marker map already identified as the
+    tile read -- no CROSS-READ ambiguity/corroboration logic is needed the
+    way that heuristic's cross-read guessing required, since the marker is
+    ground truth about which read is the tile: find the read's own index
+    variable `var` whose extent matches loop_var's per-trip advance
+    (dep.index.coeff(loop_var) == dep.index.coeff(var) * dep.ranges[var]),
+    then map `var` into op's own output coordinates
+    (_loop_var_to_ranges_pos) or, if that misses and op is a Reduction,
+    into op's own reduction vars (reduction_loop_vars.index).
+
+    A narrower, WITHIN-ONE-DEP ambiguity the deleted heuristic also guarded
+    against still applies here, and is NOT made moot by having a ground-
+    truth marker: more than one var in dep.ranges can satisfy the same
+    coefficient-coincidence equation on the SAME read (the heuristic's own
+    docstring names the motivating shape -- a reduction dim whose extent
+    numerically coincides with the tile size, e.g. flash-attention's
+    online-softmax body where D == SOFTMAX_TILE_SIZE). The deleted
+    heuristic resolved this via cross-read corroboration (trust a lone
+    per-read candidate; require a second, independently-agreeing read
+    before trusting a reduction-channel match when a read had more than
+    one candidate). That corroboration mechanism doesn't carry over as-is
+    (this function deliberately looks at only the one marker-identified
+    dep, not every read), but the underlying risk -- picking an arbitrary
+    one of several equally-plausible candidates -- is exactly what
+    "markers are authoritative, raise on gap, no fallback heuristic"
+    rules out. So: collect EVERY candidate var on the marker-identified
+    dep (don't return on the first one found), and if more than one
+    survives, raise the same actionable gap error _hint_ranges_pos raises
+    elsewhere rather than silently guess. (This has not been observed to
+    trigger against any test fixture in this repo, including
+    online-softmax's own D == SOFTMAX_TILE_SIZE coincidence -- that
+    coincidence lands on a read the marker map does NOT identify as the
+    tile, so it never reaches this per-dep candidate collection at all --
+    but the check must still exist so a future shape that does collide on
+    the marker's own dep fails loudly instead of guessing.)
+
+    A mapped dep can be either a MemoryDep (ComputedBuffer/inner_fn-backed
+    consumer) or a StarDep (InputsKernel-family consumer, e.g.
+    ExternKernelOut -- see _consume_tile_dim_markers). StarDep has no
+    .index/.ranges (.index raises NotImplementedError) and no coordinate
+    space to resolve a position in at all -- but this is moot, not a gap:
+    plan_coarse_tile_groups (coarse_tile.py, this function's only real
+    caller path) already skips every non-ComputedBuffer op before ever
+    calling _hint_ranges_pos, and every StarDep-shaped consumer
+    (ExternKernelOut and the rest of the InputsKernel family) has no
+    `.data`/inner_fn and so is never a ComputedBuffer. A StarDep-mapped
+    entry therefore never needs a resolved position in practice; return
+    None for it rather than guess.
+
+    Scoped to ONLY the marker map belonging to the CURRENT compile's own
+    ``V.graph.operations`` list -- never every entry in the module-level
+    ``_MARKER_MAPS`` registry. ``_MARKER_MAPS`` is keyed by
+    ``id(operations)``, and CPython aggressively reuses a freed list's
+    id; two unrelated compiles in the same process can (and, confirmed
+    empirically, do) end up with byte-identical
+    ``(op.get_name(), dep)`` keys whenever they share a buffer-naming/dep
+    shape (e.g. two runs of the same for_each_tile fixture). Searching
+    every map in the registry, as an earlier version of this function
+    did, risks resolving a live compile's lookup against a DIFFERENT,
+    unrelated compile's stale entry -- silently returning the wrong
+    position whenever that stale entry happens to disagree (harmless only
+    by accident when the two happen to agree, as they did for the
+    same-fixture-twice repro that surfaced this). ``V.graph`` is the live
+    ``GraphLowering`` for whichever compile is currently running this
+    pass pipeline (already relied on elsewhere in this module, e.g.
+    ``V.graph.try_get_buffer`` in ``_consume_tile_dim_markers``), so
+    ``V.graph.operations`` is guaranteed to be the SAME list object
+    ``_consume_tile_dim_markers`` was given for this exact compile.
+    ``clear_marker_maps()`` (called once per compile from
+    ``passes.py``'s pipeline entry point, alongside the analogous
+    ``reset_provenance_warnings()``) additionally guarantees no entry
+    from a past compile can outlive it even under id reuse.
+    """
+    from torch._inductor.dependencies import Dep, MemoryDep
+    from torch._inductor.ir import Reduction
+    from torch._inductor.virtualized import V
+
+    from torch_spyre._inductor.wsr.coarse_tile import (
+        _loop_var_to_ranges_pos,
+        op_out_coords,
+        reduction_loop_vars,
+    )
+
+    rw = op.get_read_writes()
+    op_name = op.get_name()
+    marker_map = _MARKER_MAPS.get(id(V.graph.operations))
+    if marker_map is not None:
+        for dep in rw.reads:
+            if not isinstance(dep, Dep):
+                continue
+            if (op_name, dep) not in marker_map:
+                continue
+            if not isinstance(dep, MemoryDep):
+                # StarDep-shaped mapped entry: no index/ranges to resolve a
+                # position from, and (per docstring) never actually reached
+                # by a real caller. Keep searching other reads rather than
+                # claim a position that doesn't exist.
+                continue
+
+            index = dep.index
+            if not isinstance(index, sympy.Basic):
+                continue
+            sym_coeff = index.coeff(loop_var)
+            if sym_coeff == 0:
+                continue
+
+            out_coords = op_out_coords(op)
+            red_vars = (
+                reduction_loop_vars(op)
+                if isinstance(getattr(op, "data", None), Reduction)
+                else []
+            )
+            # Collect EVERY var on this one dep that satisfies the
+            # coefficient-coincidence equation -- do not return on the
+            # first match. More than one candidate here is the narrow,
+            # within-one-dep ambiguity the deleted _loop_var_pos_from_reads
+            # guarded via cross-read corroboration (see this function's
+            # own docstring); with a single ground-truth dep and no second
+            # read to corroborate against, the only safe response to
+            # multiple candidates is to raise, not to silently pick one.
+            candidates: list[tuple[int, bool, sympy.Symbol]] = []
+            for var, rng in dep.ranges.items():
+                var_coeff = index.coeff(var)
+                if var_coeff == 0:
+                    continue
+                if sympy.simplify(sym_coeff - var_coeff * rng) != 0:
+                    continue
+                pos = _loop_var_to_ranges_pos(out_coords, var)
+                if pos is not None:
+                    candidates.append((pos, False, var))
+                elif var in red_vars:
+                    candidates.append((red_vars.index(var), True, var))
+            if len(candidates) > 1:
+                names = ", ".join(str(c[2]) for c in candidates)
+                raise AssertionError(
+                    f"WhileLoop-splice hint's loop_var {loop_var} resolved "
+                    f"to {len(candidates)} candidate index variables "
+                    f"({names}) on op {op_name!r}'s marker-identified read "
+                    f"{dep!r}, all equally satisfying the coefficient-"
+                    "coincidence check. The marker map identifies WHICH "
+                    "read is the tile, but not which of that read's own "
+                    "index variables is the one loop_var actually "
+                    "advances -- a numeric coincidence between two dims' "
+                    "extents (e.g. a reduction dim's size matching the "
+                    "tile size) can satisfy the same equation for more "
+                    "than one variable. Markers are authoritative and "
+                    "there is no fallback heuristic for this: raising "
+                    "here surfaces the gap instead of silently picking "
+                    "one candidate over the other."
+                )
+            if candidates:
+                pos, is_reduction, _ = candidates[0]
+                return pos, is_reduction
+    return None
+
+
 def splice_while_loops(graph) -> None:
     """CustomPreSchedulingPasses entry point: splice every for_each_tile WhileLoop.
 
@@ -409,6 +1181,8 @@ def splice_while_loops(graph) -> None:
             group_ops = splice_while_loop(
                 graph, while_op, carries, trip_count=result.trip_count
             )
+
+            _consume_tile_dim_markers(group_ops, graph.operations)
 
             _synthesize_dim_hints_for_group(
                 group_ops, loop_var, hint_id, result.trip_count

@@ -32,6 +32,7 @@ from torch._inductor.ir import (
     ComputedBuffer,
     TensorBox,
     StorageBox,
+    ReinterpretView,
     Buffer,
     Operation,
     Pointwise,
@@ -64,7 +65,7 @@ class GraphEditor:
 
     def _replace_matching_buffer(
         self,
-        buffer: TensorBox | StorageBox | Buffer,
+        buffer: TensorBox | StorageBox | ReinterpretView | Buffer,
         old_name: str,
         i: int,
         new: ComputedBuffer | TensorBox,
@@ -72,13 +73,22 @@ class GraphEditor:
         """If `buffer`'s name matches `old_name`, then replace it with `new` and return True;
         otherwise, do nothing and return False.
 
-        If `buffer` is a `TensorBox` (containing a `StorageBox`) or `StorageBox`, wrap `new` up in
-        the same way. If `new` is a `TensorBox` itself, it is assumed to be wrapped up in an
-        appropriate way."""
+        If `buffer` is a `TensorBox` (containing a `StorageBox`) or
+        `StorageBox`, wrap `new` up in the same way. Preserve a
+        `ReinterpretView` and replace only its underlying storage so that its
+        shape, strides, and offset remain intact. If `new` is a `TensorBox`
+        itself, it is assumed to be wrapped up in an appropriate way."""
         fs = []
+        last_reinterpret_view = None
         while not isinstance(buffer, Buffer):
             if isinstance(buffer, TensorBox):
                 fs.append(TensorBox)
+            elif isinstance(buffer, ReinterpretView):
+                # Keep a graph output's view metadata (shape, strides, and
+                # offset) and replace only the storage it references.  A
+                # trailing view commonly wraps SDPA outputs lowered from
+                # non-contiguous inputs.
+                last_reinterpret_view = buffer
             else:
                 assert isinstance(buffer, StorageBox), (
                     f"unexpected buffer type {type(buffer)} while replacing '{old_name}' ({buffer})"
@@ -87,10 +97,14 @@ class GraphEditor:
             buffer = buffer.data
 
         if buffer.name == old_name:
-            if not isinstance(new, TensorBox):
+            if last_reinterpret_view is not None and not isinstance(new, TensorBox):
+                object.__setattr__(last_reinterpret_view, "data", StorageBox(new))
+            elif not isinstance(new, TensorBox):
                 for f in fs[::-1]:
                     new = f(new)
-            self.lowering.graph_outputs[i] = new
+                self.lowering.graph_outputs[i] = new
+            else:
+                self.lowering.graph_outputs[i] = new
             return True
         else:
             return False

@@ -254,11 +254,14 @@ def _dims_to_hints(
                     f"host_dim={host_dim} is out of bounds for reduction ranges "
                     f"{reduction_ranges}."
                 )
+            # _bmm_k_symbol resolves the single reduction-only symbol for BMM K
+            # and, since span_overflow_hint_analysis widened its gate, for a
+            # supported non-matmul reduction (sum/prod/max/min) too.
             loop_var = _bmm_k_symbol(op)
             if loop_var is None:
                 raise Unsupported(
                     f"Cannot adapt span-overflow reduction plan for {op.get_name()}: "
-                    "could not identify the BMM K loop variable."
+                    "could not identify the reduction loop variable."
                 )
             try:
                 reduction_pos = _loop_var_to_reduction_ranges_pos(op, loop_var)
@@ -267,7 +270,7 @@ def _dims_to_hints(
             if reduction_pos != host_dim:
                 raise Unsupported(
                     f"Cannot adapt span-overflow reduction plan for {op.get_name()}: "
-                    f"BMM K loop variable {loop_var} maps to reduction range "
+                    f"reduction loop variable {loop_var} maps to reduction range "
                     f"position {reduction_pos}, expected {host_dim}."
                 )
             coord = loop_var

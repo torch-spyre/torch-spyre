@@ -34,14 +34,14 @@
 # Step 2. Define an eager CPU fallback in: torch_spyre/fallbacks.py
 #
 #    Example:
-#    @register_fallback([aten.sin.default, aten.sin.out])
-#    def spyre__sin(input, **kwargs):
-#        return torch.sin(input, **kwargs)
+#    @register_fallback([aten.tril.default, aten.tril.out])
+#    def spyre__tril(input, **kwargs):
+#        return torch.tril(input, **kwargs)
 #
-#    Note: You can identify the ATen operator name (e.g., aten.sin.default) by:
-#      * torch.ops.aten.sin.overloads() # lists overloads like ['default', 'out']
-#      * torch.ops.aten.sin.default     # OpOverload object for 'default'
-#      * torch.ops.aten.sin._schema     # shows the dispatcher schema
+#    Note: You can identify the ATen operator name (e.g., aten.tril.default) by:
+#      * torch.ops.aten.tril.overloads() # lists overloads like ['default', 'out']
+#      * torch.ops.aten.tril.default     # OpOverload object for 'default'
+#      * torch.ops.aten.tril._schema     # shows the dispatcher schema
 
 
 import functools
@@ -240,8 +240,6 @@ register_fallback_default(
         aten.cumsum,
         aten.repeat.out,
         aten.arange,
-        aten.sin,
-        aten.cos,
         aten.ne.Scalar_out,
         aten.isin,
         aten.tril,
