@@ -100,9 +100,14 @@ def v2_test_case_id(component: str, classname: str, name: str, tags) -> str:
     )
 
 
-def v2_component(args) -> str:
-    """The component to stamp on v2 rows: --component when given, else this repo's default."""
-    return (getattr(args, "component", "") or "").strip() or V2_COMPONENT_DEFAULT
+def v2_component(args, default: str = V2_COMPONENT_DEFAULT) -> str:
+    """The component to stamp on v2 rows: --component when given, else `default`.
+
+    The default is a parameter, not the module constant: each consuming repo has its own, and
+    baking one in would make an importing repo stamp another product's name -- which, since
+    component is a test_case_id hash input, silently mints a different identity.
+    """
+    return (getattr(args, "component", "") or "").strip() or default
 
 
 def v2_tags_for_case(case: dict) -> list:

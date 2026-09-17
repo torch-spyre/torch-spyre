@@ -81,3 +81,12 @@ def test_ids_are_uuid5_not_random():
     b = v2_run_id("gha", "1", "amd64", "unit")
     assert a == b
     assert uuid.UUID(a).version == 5
+
+
+def test_component_default_is_caller_supplied():
+    # Each repo has its own default. If the library baked one in, an importing repo would stamp
+    # another product's name -- and component is a test_case_id hash input, so that mints a
+    # different identity rather than merely mislabelling.
+    assert v2_component(_Args(component=""), "hf-adapters") == "hf-adapters"
+    assert v2_component(_Args(), "spyre-inference") == "spyre-inference"
+    assert v2_component(_Args(component="torch-spyre"), "hf-adapters") == "torch-spyre"
