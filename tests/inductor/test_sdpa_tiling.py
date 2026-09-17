@@ -247,10 +247,10 @@ class TestSDPATiling(unittest.TestCase):
         config = self._select(max_seqlen_q=500, max_seqlen_kv=500)
 
         self.assertEqual(config.strategy, "work_divided")
-        self.assertEqual(config.kv_block_size, 512)
+        self.assertEqual(config.kv_block_size, 500)
         self.assertEqual(
             config.work_div,
-            {"num_heads": 3, "max_seqlen_q": 10, "max_seqlen_kv": 8},
+            {"num_heads": 3, "max_seqlen_q": 10, "max_seqlen_kv": 10},
         )
 
     def test_long_queries_keep_coarse_tiling_and_loop_grouping(self):
@@ -273,6 +273,23 @@ class TestSDPATiling(unittest.TestCase):
                     config.kv_blocks_per_loop_group,
                     min(config.num_kv_blocks, max(1, 16 // config.num_q_tiles)),
                 )
+
+    def test_coarse_kv_tiles_are_exact_and_stick_aligned(self):
+        config = self._select(
+            num_heads=16,
+            num_kvheads=16,
+            max_seqlen_q=3520,
+            max_seqlen_kv=3520,
+        )
+
+        self.assertEqual(config.strategy, "coarse_tiled")
+        self.assertEqual(config.kv_block_size, 320)
+        self.assertEqual(config.num_kv_blocks, 11)
+        self.assertEqual(config.kv_block_size % 64, 0)
+        self.assertEqual(
+            config.num_kv_blocks * config.kv_block_size,
+            3520,
+        )
 
     def test_lx_budget_reduces_kv_block_until_live_values_fit(self):
         config = self._select(batch_size=2, lx_budget_bytes=300 * 1024)
