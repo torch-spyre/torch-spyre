@@ -61,7 +61,7 @@ def test_sdsc_submits_all_dxp_jobs_before_wait():
 
     with (
         torch._inductor.config.patch({"compile_threads": 2}),
-        spyre_config.patch({"async_dxp_compile": True, "spyre_kernel_cache": False}),
+        spyre_config.patch({"spyre_kernel_cache": False}),
         patch.object(compiler, "wait_pool_ready"),
         patch.object(compiler, "use_process_pool", return_value=True),
         patch.object(compiler, "process_pool", return_value=pool),
@@ -110,7 +110,7 @@ def test_async_cache_commit_is_deferred_until_wait():
 
     with (
         torch._inductor.config.patch({"compile_threads": 2}),
-        spyre_config.patch({"async_dxp_compile": True, "spyre_kernel_cache": True}),
+        spyre_config.patch({"spyre_kernel_cache": True}),
         patch.object(compiler, "wait_pool_ready"),
         patch.object(compiler, "use_process_pool", return_value=True),
         patch.object(compiler, "process_pool", return_value=pool),
@@ -145,7 +145,7 @@ def test_async_compile_failure_moves_cache_entry_at_wait():
 
     with (
         torch._inductor.config.patch({"compile_threads": 2}),
-        spyre_config.patch({"async_dxp_compile": True, "spyre_kernel_cache": True}),
+        spyre_config.patch({"spyre_kernel_cache": True}),
         patch.object(compiler, "wait_pool_ready"),
         patch.object(compiler, "use_process_pool", return_value=True),
         patch.object(compiler, "process_pool", return_value=pool),
@@ -176,7 +176,7 @@ def test_wait_drains_remaining_spyre_futures_after_failure():
 
     with (
         torch._inductor.config.patch({"compile_threads": 2}),
-        spyre_config.patch({"async_dxp_compile": True, "spyre_kernel_cache": True}),
+        spyre_config.patch({"spyre_kernel_cache": True}),
         patch.object(compiler, "wait_pool_ready"),
         patch.object(compiler, "use_process_pool", return_value=True),
         patch.object(compiler, "process_pool", return_value=pool),
@@ -252,9 +252,6 @@ def test_real_subprocess_pool_runs_dxp_jobs_concurrently(tmp_path: Path):
         with (
             torch._inductor.config.patch(
                 {"compile_threads": 2, "worker_start_method": "subprocess"}
-            ),
-            spyre_config.patch(  # type: ignore[attr-defined]
-                {"async_dxp_compile": True}
             ),
             patch.dict(
                 os.environ,
