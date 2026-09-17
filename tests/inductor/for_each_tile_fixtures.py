@@ -139,6 +139,305 @@ def nested_split_m_then_k_reference(X: torch.Tensor, Y: torch.Tensor) -> torch.T
     return torch.cat(rows, dim=0)
 
 
+B = 2
+
+
+def _batched_matmul_inputs() -> tuple[torch.Tensor, torch.Tensor]:
+    torch.manual_seed(1)
+    X = torch.randn(B, M, K)
+    Y = torch.randn(B, K, N)
+    return X, Y
+
+
+def triple_nested_stardep_outer_fn(X: torch.Tensor, Y: torch.Tensor) -> torch.Tensor:
+    """Three levels deep (outer batch B, middle M, inner K); StarDep at outer only.
+
+    The outer level's tiles (x_b_tile, y_b_tile) are consumed directly by
+    the middle for_each_tile call, which recursively contains matmul
+    reductions, so the outer markers are STAR_DEP_KEPT (2 markers). The
+    middle and inner levels both route their tiles through elementwise ops
+    first (`x_m_tile * 1.0`, `x_k_tile * 1.0`), causing their markers to
+    be INLINE_ERASED and removed from the graph. Exercises marker_resolution
+    propagating through two more splice levels above STAR_DEP_KEPT markers.
+    """
+
+    def outer_body(_, ops):
+        x_b_tile, y_b_tile = ops
+        x_b = x_b_tile.squeeze(0)
+        y_b = y_b_tile.squeeze(0)
+
+        def middle_body(_, mid_ops):
+            x_m_tile, y_m_whole = mid_ops
+            x_m_tile = x_m_tile * 1.0
+            m_tile = x_m_tile.shape[0]
+
+            def inner_body(acc, inner_ops):
+                x_k_tile, y_k_tile = inner_ops
+                x_k_tile = x_k_tile * 1.0
+                return acc + x_k_tile @ y_k_tile, None
+
+            final, _ = for_each_tile(
+                inner_body,
+                (x_m_tile, y_m_whole),
+                dims=(-1, 0),
+                tile_size=3,
+                init=torch.zeros(m_tile, N, device=X.device, dtype=X.dtype),
+            )
+            return None, final
+
+        _, mid_out = for_each_tile(
+            middle_body, (x_b, y_b), dims=(0, None), tile_size=2, out_dim=0
+        )
+        return None, mid_out
+
+    _, out = for_each_tile(outer_body, (X, Y), dims=(0, 0), tile_size=1, out_dim=0)
+    return out
+
+
+def triple_nested_stardep_outer_reference(
+    X: torch.Tensor, Y: torch.Tensor
+) -> torch.Tensor:
+    """Eager Python nesting of the same tiling, for value assertions."""
+    b_tile_size, m_tile_size, k_tile_size = 1, 2, 3
+    batches = []
+    for b_start in range(0, X.shape[0], b_tile_size):
+        x_b_tile = X[b_start : b_start + b_tile_size]
+        y_b_tile = Y[b_start : b_start + b_tile_size]
+        rows = []
+        for b_idx in range(x_b_tile.shape[0]):
+            x_b = x_b_tile[b_idx]
+            y_b = y_b_tile[b_idx]
+            m_rows = []
+            for m_start in range(0, x_b.shape[0], m_tile_size):
+                x_m_tile = x_b[m_start : m_start + m_tile_size] * 1.0
+                acc = torch.zeros(x_m_tile.shape[0], N, device=X.device, dtype=X.dtype)
+                for k_start in range(0, x_m_tile.shape[1], k_tile_size):
+                    x_k_tile = x_m_tile[:, k_start : k_start + k_tile_size] * 1.0
+                    y_k_tile = y_b[k_start : k_start + k_tile_size]
+                    acc = acc + x_k_tile @ y_k_tile
+                m_rows.append(acc)
+            rows.append(torch.cat(m_rows, dim=0))
+        batches.append(torch.stack(rows, dim=0))
+    return torch.cat(batches, dim=0)
+
+
+def triple_nested_stardep_middle_fn(X: torch.Tensor, Y: torch.Tensor) -> torch.Tensor:
+    """Three levels deep (outer B, middle M, inner K); StarDep at middle only.
+
+    The outer level's x_b_tile is routed through elementwise (`* 1.0`),
+    causing its markers to be INLINE_ERASED. The middle level's tiles
+    (x_m_tile, y_m_whole) are consumed directly by the inner for_each_tile
+    call (which contains matmuls), so the middle markers are STAR_DEP_KEPT
+    (2 markers). The inner level's x_k_tile is routed through elementwise
+    (`* 1.0`), causing its marker to be INLINE_ERASED. Exercises propagation
+    through exactly one more splice level above STAR_DEP_KEPT markers.
+    """
+
+    def outer_body(_, ops):
+        x_b_tile, y_b_tile = ops
+        x_b_tile = x_b_tile * 1.0
+        x_b = x_b_tile.squeeze(0)
+        y_b = y_b_tile.squeeze(0)
+
+        def middle_body(_, mid_ops):
+            x_m_tile, y_m_whole = mid_ops
+            m_tile = x_m_tile.shape[0]
+
+            def inner_body(acc, inner_ops):
+                x_k_tile, y_k_tile = inner_ops
+                x_k_tile = x_k_tile * 1.0
+                return acc + x_k_tile @ y_k_tile, None
+
+            final, _ = for_each_tile(
+                inner_body,
+                (x_m_tile, y_m_whole),
+                dims=(-1, 0),
+                tile_size=3,
+                init=torch.zeros(m_tile, N, device=X.device, dtype=X.dtype),
+            )
+            return None, final
+
+        _, mid_out = for_each_tile(
+            middle_body, (x_b, y_b), dims=(0, None), tile_size=2, out_dim=0
+        )
+        return None, mid_out
+
+    _, out = for_each_tile(outer_body, (X, Y), dims=(0, 0), tile_size=1, out_dim=0)
+    return out
+
+
+def triple_nested_stardep_middle_reference(
+    X: torch.Tensor, Y: torch.Tensor
+) -> torch.Tensor:
+    """Eager Python nesting of the same tiling, for value assertions."""
+    b_tile_size, m_tile_size, k_tile_size = 1, 2, 3
+    batches = []
+    for b_start in range(0, X.shape[0], b_tile_size):
+        x_b_tile = X[b_start : b_start + b_tile_size] * 1.0
+        y_b_tile = Y[b_start : b_start + b_tile_size]
+        rows = []
+        for b_idx in range(x_b_tile.shape[0]):
+            x_b = x_b_tile[b_idx]
+            y_b = y_b_tile[b_idx]
+            m_rows = []
+            for m_start in range(0, x_b.shape[0], m_tile_size):
+                x_m_tile = x_b[m_start : m_start + m_tile_size]
+                acc = torch.zeros(x_m_tile.shape[0], N, device=X.device, dtype=X.dtype)
+                for k_start in range(0, x_m_tile.shape[1], k_tile_size):
+                    x_k_tile = x_m_tile[:, k_start : k_start + k_tile_size] * 1.0
+                    y_k_tile = y_b[k_start : k_start + k_tile_size]
+                    acc = acc + x_k_tile @ y_k_tile
+                m_rows.append(acc)
+            rows.append(torch.cat(m_rows, dim=0))
+        batches.append(torch.stack(rows, dim=0))
+    return torch.cat(batches, dim=0)
+
+
+def triple_nested_stardep_inner_fn(X: torch.Tensor, Y: torch.Tensor) -> torch.Tensor:
+    """Three levels deep (outer B, middle M, inner K); StarDep at inner only.
+
+    The shallowest case: outer and middle route through an elementwise op
+    (INLINE_ERASED); the inner level's tile feeds directly into the matmul
+    (STAR_DEP_KEPT), same shape as nested_split_m_then_k_fn's inner level
+    but one level deeper.
+    """
+
+    def outer_body(_, ops):
+        x_b_tile, y_b_tile = ops
+        x_b_tile = x_b_tile * 1.0
+        x_b = x_b_tile.squeeze(0)
+        y_b = y_b_tile.squeeze(0)
+
+        def middle_body(_, mid_ops):
+            x_m_tile, y_m_whole = mid_ops
+            x_m_tile = x_m_tile * 1.0
+            m_tile = x_m_tile.shape[0]
+
+            def inner_body(acc, inner_ops):
+                x_k_tile, y_k_tile = inner_ops
+                return acc + x_k_tile @ y_k_tile, None
+
+            final, _ = for_each_tile(
+                inner_body,
+                (x_m_tile, y_m_whole),
+                dims=(-1, 0),
+                tile_size=3,
+                init=torch.zeros(m_tile, N, device=X.device, dtype=X.dtype),
+            )
+            return None, final
+
+        _, mid_out = for_each_tile(
+            middle_body, (x_b, y_b), dims=(0, None), tile_size=2, out_dim=0
+        )
+        return None, mid_out
+
+    _, out = for_each_tile(outer_body, (X, Y), dims=(0, 0), tile_size=1, out_dim=0)
+    return out
+
+
+def triple_nested_stardep_inner_reference(
+    X: torch.Tensor, Y: torch.Tensor
+) -> torch.Tensor:
+    """Eager Python nesting of the same tiling, for value assertions."""
+    b_tile_size, m_tile_size, k_tile_size = 1, 2, 3
+    batches = []
+    for b_start in range(0, X.shape[0], b_tile_size):
+        x_b_tile = X[b_start : b_start + b_tile_size] * 1.0
+        y_b_tile = Y[b_start : b_start + b_tile_size]
+        rows = []
+        for b_idx in range(x_b_tile.shape[0]):
+            x_b = x_b_tile[b_idx]
+            y_b = y_b_tile[b_idx]
+            m_rows = []
+            for m_start in range(0, x_b.shape[0], m_tile_size):
+                x_m_tile = x_b[m_start : m_start + m_tile_size] * 1.0
+                acc = torch.zeros(x_m_tile.shape[0], N, device=X.device, dtype=X.dtype)
+                for k_start in range(0, x_m_tile.shape[1], k_tile_size):
+                    x_k_tile = x_m_tile[:, k_start : k_start + k_tile_size]
+                    y_k_tile = y_b[k_start : k_start + k_tile_size]
+                    acc = acc + x_k_tile @ y_k_tile
+                m_rows.append(acc)
+            rows.append(torch.cat(m_rows, dim=0))
+        batches.append(torch.stack(rows, dim=0))
+    return torch.cat(batches, dim=0)
+
+
+def triple_nested_stardep_multilevel_fn(
+    X: torch.Tensor, Y: torch.Tensor
+) -> torch.Tensor:
+    """Three levels deep (outer B, middle M, inner K); StarDep at outer AND inner.
+
+    Combines triple_nested_stardep_outer_fn's outer STAR_DEP_KEPT markers
+    with triple_nested_stardep_inner_fn's inner STAR_DEP_KEPT marker in
+    one fixture. The outer level's tiles (x_b_tile, y_b_tile) feed directly
+    into the middle for_each_tile call (STAR_DEP_KEPT, 2 markers). The
+    middle level's x_m_tile is routed through elementwise (`* 1.0`), causing
+    its marker to be INLINE_ERASED. The inner level's tiles (x_k_tile,
+    y_k_tile) feed directly into the matmul (STAR_DEP_KEPT, 1 marker from
+    x_k_tile after the elementwise on x_m_tile). Catches any interaction
+    between two independent marker_resolution stamps in the same splice
+    chain that the single-level variants cannot surface.
+    """
+
+    def outer_body(_, ops):
+        x_b_tile, y_b_tile = ops
+        x_b = x_b_tile.squeeze(0)
+        y_b = y_b_tile.squeeze(0)
+
+        def middle_body(_, mid_ops):
+            x_m_tile, y_m_whole = mid_ops
+            x_m_tile = x_m_tile * 1.0
+            m_tile = x_m_tile.shape[0]
+
+            def inner_body(acc, inner_ops):
+                x_k_tile, y_k_tile = inner_ops
+                return acc + x_k_tile @ y_k_tile, None
+
+            final, _ = for_each_tile(
+                inner_body,
+                (x_m_tile, y_m_whole),
+                dims=(-1, 0),
+                tile_size=3,
+                init=torch.zeros(m_tile, N, device=X.device, dtype=X.dtype),
+            )
+            return None, final
+
+        _, mid_out = for_each_tile(
+            middle_body, (x_b, y_b), dims=(0, None), tile_size=2, out_dim=0
+        )
+        return None, mid_out
+
+    _, out = for_each_tile(outer_body, (X, Y), dims=(0, 0), tile_size=1, out_dim=0)
+    return out
+
+
+def triple_nested_stardep_multilevel_reference(
+    X: torch.Tensor, Y: torch.Tensor
+) -> torch.Tensor:
+    """Eager Python nesting of the same tiling, for value assertions."""
+    b_tile_size, m_tile_size, k_tile_size = 1, 2, 3
+    batches = []
+    for b_start in range(0, X.shape[0], b_tile_size):
+        x_b_tile = X[b_start : b_start + b_tile_size]
+        y_b_tile = Y[b_start : b_start + b_tile_size]
+        rows = []
+        for b_idx in range(x_b_tile.shape[0]):
+            x_b = x_b_tile[b_idx]
+            y_b = y_b_tile[b_idx]
+            m_rows = []
+            for m_start in range(0, x_b.shape[0], m_tile_size):
+                x_m_tile = x_b[m_start : m_start + m_tile_size] * 1.0
+                acc = torch.zeros(x_m_tile.shape[0], N, device=X.device, dtype=X.dtype)
+                for k_start in range(0, x_m_tile.shape[1], k_tile_size):
+                    x_k_tile = x_m_tile[:, k_start : k_start + k_tile_size]
+                    y_k_tile = y_b[k_start : k_start + k_tile_size]
+                    acc = acc + x_k_tile @ y_k_tile
+                m_rows.append(acc)
+            rows.append(torch.cat(m_rows, dim=0))
+        batches.append(torch.stack(rows, dim=0))
+    return torch.cat(batches, dim=0)
+
+
 LQ, LK, D = 128, 256, 128
 SOFTMAX_TILE_SIZE = 128
 
