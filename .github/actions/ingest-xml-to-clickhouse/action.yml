@@ -167,6 +167,8 @@ runs:
       with:
         sparse-checkout: |
           .github/scripts/ingest_xml.py
+          # Imported by the script above -- see the note in push-to-clickhouse.yaml.
+          extensions/clickhouse-ingest
         sparse-checkout-cone-mode: false
 
     - name: Set ingest script path (fallback)
@@ -193,7 +195,12 @@ runs:
         # the ingest deps never perturb the dev image's torch-spyre environment.
         uv venv
         source .venv/bin/activate
-        uv pip install requests clickhouse-driver clickhouse-connect lxml regex
+        # The shared schema/identity/write path lives in extensions/clickhouse-ingest. Installed
+        # from the checkout rather than a git URL: this action already has the tree (the caller
+        # sparse-checks .github plus, now, the extension), so no network fetch and no version to
+        # pin -- the library and the script that uses it are always the same commit.
+        uv pip install requests clickhouse-driver clickhouse-connect lxml regex \
+          "${GITHUB_WORKSPACE}/extensions/clickhouse-ingest"
 
     - name: Ingest XML files into ClickHouse
       if: steps.gate.outputs.configured == 'true'

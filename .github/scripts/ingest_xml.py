@@ -32,14 +32,12 @@ from collections import Counter, defaultdict
 from datetime import UTC, datetime
 from pathlib import Path
 
-# v2_schema is a SIBLING file, not an installed package: this script is copied into three
-# repos and run by path (`uv run --no-project .../ingest_xml.py`), so its own directory is only
-# on sys.path when it is the entry point. A test that loads it via spec_from_file_location, or
-# any caller importing it as a module, would otherwise fail at this import.
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-
 import clickhouse_connect
-import v2_schema
+
+# The shared library, installed from extensions/clickhouse-ingest. Aliased to the old module
+# name so the 40+ `v2_schema.X` call sites below stay untouched: this swaps WHERE the code lives,
+# not what it does, and a rename would bury that in noise.
+from spyre_clickhouse_ingest import schema as v2_schema
 import regex as re
 
 # ---------------------------------------------------------------------------

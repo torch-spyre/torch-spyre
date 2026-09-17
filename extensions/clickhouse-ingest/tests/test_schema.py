@@ -2,7 +2,7 @@
 built, so pair equality against the pre-refactor output is a complete correctness proof."""
 
 import pytest
-from v2_schema import (
+from spyre_clickhouse_ingest.schema import (
     BENCHMARKS,
     BENCHMARK_RUNS,
     TEST_CASES,
