@@ -118,6 +118,67 @@ class TestCarryBindingsFor(unittest.TestCase):
 
 
 class TestSpliceWhileLoop(unittest.TestCase):
+    def test_accumulator_view_tags_backing_storage(self):
+        """A view-backed carry records ownership on its mutable Buffer."""
+        from torch._inductor import ir
+
+        import torch_spyre._inductor.wsr.while_loop_bridge as bridge
+
+        def computed_buffer(name, size, stride):
+            data = mock.MagicMock(spec=ir.Pointwise)
+            data.ranges = list(size)
+            op = ir.ComputedBuffer(
+                name=name,
+                layout=ir.FixedLayout(
+                    device=torch.device("cpu"),
+                    dtype=torch.float32,
+                    size=list(size),
+                    stride=list(stride),
+                ),
+                data=data,
+            )
+            op.operation_name = name
+            return op
+
+        storage = computed_buffer("carry_storage", (2, 3), (3, 1))
+        target = ir.ReinterpretView(
+            data=ir.StorageBox(storage),
+            layout=ir.FixedLayout(
+                device=torch.device("cpu"),
+                dtype=torch.float32,
+                size=[3, 2],
+                stride=[1, 3],
+            ),
+        )
+        real_input = ir.TensorBox(target)
+        producer = computed_buffer("carry_update", (3, 2), (2, 1))
+        binding = bridge.CarryBinding(
+            carry_index=0,
+            initial=real_input,
+            body_output=producer,
+            scratch_name="unused_scratch",
+        )
+        graph = mock.Mock()
+        graph.operations = []
+        graph.mark_buffer_mutated = mock.Mock()
+
+        with V.set_graph_handler(graph):
+            body_ops = bridge._rewire_accumulator_output(
+                graph,
+                mock.Mock(),
+                binding,
+                [producer],
+                real_input,
+            )
+
+        self.assertEqual(body_ops, [producer])
+        self.assertIs(producer.layout.target, target)
+        record = storage._loop_carry_record
+        self.assertEqual(record.storage_name, "carry_storage")
+        self.assertEqual(record.update_name, "carry_update")
+        self.assertIs(producer._loop_carry_record, record)
+        self.assertFalse(hasattr(target, "_loop_carry_record"))
+
     def test_removes_while_op_and_inserts_body_ops(self):
         import torch_spyre._inductor.wsr.while_loop_bridge as bridge
 
