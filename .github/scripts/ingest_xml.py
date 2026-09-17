@@ -1383,9 +1383,15 @@ def v2_run_id_for(args, run_id: str, arch: str, tier: str) -> str:
 
 def v2_tables_present(client, db: str) -> bool:
     """v2 write path is skipped unless BOTH tables exist, so this script can be
-    deployed before the migration without erroring on every run."""
-    return _table_exists(client, "test_case_runs", db) and _table_exists(
-        client, "test_cases", db
+    deployed before the migration without erroring on every run.
+
+    Names come from the schema model, not string literals: this file is copied across the
+    product repos and the copies are compared for MEANING, so a hardcoded name here could
+    drift from the table it is meant to check while still looking correct.
+    """
+    return all(
+        bool(client.command(f"EXISTS TABLE {t.qualified(db)}"))
+        for t in (v2_schema.TEST_CASES, v2_schema.TEST_CASE_RUNS)
     )
 
 
