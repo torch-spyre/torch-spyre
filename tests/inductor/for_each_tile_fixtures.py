@@ -377,6 +377,18 @@ def triple_nested_stardep_multilevel_fn(
     x_k_tile after the elementwise on x_m_tile). Catches any interaction
     between two independent marker_resolution stamps in the same splice
     chain that the single-level variants cannot surface.
+
+    NOTE (Step 2 finding): This fixture was intended to exercise both outer
+    and inner STAR_DEP_KEPT markers independently. However, empirical
+    verification reveals the inner-level marker is completely lost when the
+    outer level is STAR_DEP_KEPT, whereas triple_nested_stardep_inner_fn
+    (where outer is INLINE_ERASED) preserves the inner marker. This appears to
+    be a marker-pipeline bug where stacking two STAR_DEP_KEPT levels causes
+    the deeper one to disappear (likely issue #4581 territory). Therefore,
+    this fixture currently exercises only the outer 2 STAR_DEP_KEPT markers,
+    identical to triple_nested_stardep_outer_fn. The middle-level elementwise
+    is preserved as a structural probe for future investigation. See
+    task-3-report.md for full investigation and follow-up gap tracking.
     """
 
     def outer_body(_, ops):
