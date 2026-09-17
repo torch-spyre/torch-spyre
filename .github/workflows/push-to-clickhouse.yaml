@@ -129,9 +129,6 @@ jobs:
           sparse-checkout: |
             .github/actions
             .github/scripts/ingest_xml.py
-            # v2_schema.py is imported as a sibling module by the script above, so it must be
-            # checked out too. Listing only the entry point makes `import v2_schema` fail at
-            # startup and every ingest run exit 1 -- no rows written, v1 or v2.
             # Imported by the script above; omitting it fails the import at startup.
             extensions/clickhouse-ingest
           sparse-checkout-cone-mode: false
