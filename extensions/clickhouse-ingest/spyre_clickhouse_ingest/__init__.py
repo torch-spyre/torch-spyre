@@ -13,6 +13,7 @@ from .identity import (
     v2_canonical_arch,
     v2_component,
     v2_run_id,
+    v2_run_id_for,
     v2_tags_for_case,
     v2_test_case_id,
 )
@@ -37,6 +38,7 @@ __all__ = [
     "v2_component",
     "v2_database",
     "v2_run_id",
+    "v2_run_id_for",
     "v2_source_and_external_run_id",
     "v2_tables_present",
     "v2_tags_for_case",

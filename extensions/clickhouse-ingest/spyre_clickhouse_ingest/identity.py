@@ -6,6 +6,8 @@ without coordinating. Changing any normalisation step here invalidates every id 
 
 import uuid
 
+from .junit import _threaded_run_id, v2_source_and_external_run_id
+
 V2_NAMESPACE = uuid.uuid5(uuid.NAMESPACE_DNS, "clickhouse-v2.spyre.ibm.com")
 
 
@@ -120,3 +122,26 @@ def v2_tags_for_case(case: dict) -> list:
             # Some emitters put the namespace__value in the property NAME instead.
             tags.add(pname)
     return sorted(tags)
+
+
+def v2_run_id_for(args, run_id: str, arch: str, tier: str) -> str:
+    """The v2 run_id for this leg: the THREADED uuid when there is one, else a derived hash.
+
+    A uuid minted above the CI split (the orchestrator's newRunId(), arriving as --run-id) is
+    the same value the Jenkins-side artifact_results writer records, so honouring it verbatim
+    makes the two tables join on one identity -- with no agreement needed on a coordinate
+    string's format, case, or arch folding.
+
+    Not folded with arch/tier: one ingest invocation carries exactly one --trigger-type, so a
+    multi-tier leg ingests once per tier and no row stands for two. artifact_results is ordered
+    by (artifact_id, result_kind, test_type, ts), so rows stay distinct without run_id being
+    unique per row.
+
+    Falls back to the coordinate hash for a leg dispatched with no uuid (a standalone
+    component-build, or a GHA-only run), which is the only case that still needs one.
+    """
+    threaded = _threaded_run_id(args)
+    if threaded:
+        return threaded
+    source, external = v2_source_and_external_run_id(args, run_id)
+    return v2_run_id(source, external, arch, tier)
