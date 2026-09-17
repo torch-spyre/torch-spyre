@@ -112,6 +112,14 @@ on:
       # checkout, the build_torch_spyre wheel job, and install-prebuilt-torch-spyre;
       # run the suite against the baked dir. DEFAULT false → the normal PR/nightly
       # callers (tests.yml / tests-nightly.yml) are byte-for-byte unchanged.
+      component:
+        description: >
+          Component to stamp on v2 ingest rows. Defaults to this repo's own product; set it
+          when this matrix runs ANOTHER component's suite, so the rows (and the test_case_id
+          they hash into) name the suite's real owner.
+        required: false
+        type: string
+        default: torch-spyre
       prebaked_image:
         description: Test the pre-baked torch-spyre-dev image (no checkout/build). Integration path only.
         required: false
@@ -753,6 +761,7 @@ jobs:
           branch: ${{ inputs.ref || github.event.pull_request.head.sha || github.ref_name }}
           sha: ${{ inputs.ref || github.event.pull_request.head.sha || github.sha }}
           gha-run-id: ${{ github.run_id }}
+          component: ${{ inputs.component || 'torch-spyre' }}
           triggered-at: ''
           # perf never runs on pull_request (see the job `if:` above), so there
           # is no PR to associate; leave empty.

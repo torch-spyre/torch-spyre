@@ -22,6 +22,14 @@ on:
         description: Workflow name (model-module-tests | upstream-tests | model-ops-tests | integration-tests)
         required: false
         default: upstream-pytorch-tests
+      component:
+        description: >-
+          Component to stamp on v2 rows. Defaults to this repo's own product; set it when the
+          triggering run executed ANOTHER component's suite, so the rows (and the test_case_id
+          they hash into) name the suite's real owner.
+        required: false
+        type: string
+        default: torch-spyre
       clickhouse_env:
         description: >-
           ClickHouse instance for a MANUAL re-ingest: "prod" (the CLICKHOUSE_*
@@ -248,6 +256,26 @@ jobs:
       # comes from this job's env block above (DEV vs PROD toggle lives there);
       # no product checkout exists here, so the action sparse-checks-out the
       # script itself when torch-spyre-dir is not passed.
+      # The orchestrator's uuid, uploaded by _test_matrix as the "run-id" artifact. This
+      # workflow runs on workflow_run, so it cannot receive it as a dispatch input. Absent on a
+      # GHA-initiated run => empty => the ingest derives its own id from the run coordinate.
+      - name: Recover threaded run_id
+        id: threaded-run-id
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          RID=""
+          AID=$(gh api --paginate \
+            "/repos/${{ github.repository }}/actions/runs/${TRIGGERING_RUN_ID}/artifacts?per_page=100" \
+            --jq '.artifacts[] | select(.name == "run-id") | .id' | head -1)
+          if [[ -n "${AID}" ]]; then
+            gh api "/repos/${{ github.repository }}/actions/artifacts/${AID}/zip" > run-id.zip || true
+            unzip -o -q run-id.zip -d run-id-dir || true
+            RID=$(tr -d '[:space:]' < run-id-dir/run-id.txt 2>/dev/null || echo "")
+          fi
+          echo "Threaded run_id: ${RID:-<none, ingest will derive>}"
+          echo "run_id=${RID}" >> "${GITHUB_OUTPUT}"
+
       - name: Ingest XML files into ClickHouse
         uses: ./.github/actions/ingest-xml-to-clickhouse
         with:
@@ -256,6 +284,8 @@ jobs:
           branch: ${{ env.TRIGGERING_BRANCH }}
           sha: ${{ env.TRIGGERING_SHA }}
           gha-run-id: ${{ env.TRIGGERING_RUN_ID }}
+          run-id: ${{ steps.threaded-run-id.outputs.run_id }}
+          component: ${{ inputs.component || 'torch-spyre' }}
           triggered-at: ${{ env.TRIGGERING_AT }}
           pr-number: ${{ steps.resolve-pr.outputs.pr_number }}
           trigger-type: ${{ steps.extract-tier.outputs.tier }}

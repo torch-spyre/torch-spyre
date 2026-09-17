@@ -99,6 +99,14 @@ on:
         required: false
         type: boolean
         default: true
+      component:
+        description: >-
+          Component to stamp on v2 ingest rows. Defaults to this repo's own product; set it
+          when this run executes ANOTHER component's suite, so the rows (and the test_case_id
+          they hash into) name the suite's real owner.
+        required: false
+        type: string
+        default: torch-spyre
       clickhouse_env:
         description: >-
           Which ClickHouse instance the perf job's inline ingest writes to:
@@ -171,6 +179,7 @@ jobs:
     uses: ./.github/workflows/_test_matrix.yaml
     with:
       runner_label: linux
+      component: ${{ inputs.component || 'torch-spyre' }}
       image_label: ${{ inputs.runner_label || 'image_spyre_backend' }}
       extra_test_flags: -v
       checkout_pytorch: false

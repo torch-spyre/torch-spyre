@@ -48,6 +48,14 @@ inputs:
     description: Suite tier (e.g. perf | regression | integration | smoke).
     required: false
     default: ''
+  component:
+    description: >
+      Component to stamp on v2 rows. Empty = the ingest script's own product. Set it when a
+      cell runs ANOTHER component's suite through this script: component is a test_case_id
+      hash input, so the wrong value gives the same test a different identity rather than
+      merely mislabelling it.
+    required: false
+    default: ''
   platform:
     description: >
       Platform arch recorded on benchmark_runs rows (e.g. x86_64). Empty =
@@ -203,6 +211,7 @@ runs:
         CH_DB_V2_IN: ${{ inputs.clickhouse-db-v2 }}
         SCHEMA_IN: ${{ inputs.schema }}
         PLATFORM_IN: ${{ inputs.platform }}
+        COMPONENT_IN: ${{ inputs.component }}
       run: |
         source .venv/bin/activate
         [ -n "${CH_PORT_IN}" ] && export CLICKHOUSE_PORT="${CH_PORT_IN}"
@@ -216,6 +225,13 @@ runs:
         # ingest script's own host-arch default with a blank string.
         PLATFORM_ARGS=()
         [ -n "${PLATFORM_IN}" ] && PLATFORM_ARGS=(--platform "${PLATFORM_IN}")
+        # Same --help probe as --platform above: a prebaked image may carry an ingest script
+        # predating --component, and passing an unknown flag makes argparse exit 2.
+        COMPONENT_ARGS=()
+        if [ -n "${COMPONENT_IN}" ] \
+           && python3 "${INGEST_SCRIPT}" --help 2>/dev/null | grep -q -- "--component"; then
+          COMPONENT_ARGS=(--component "${COMPONENT_IN}")
+        fi
         python3 "${INGEST_SCRIPT}" \
           --xml-dir "${{ inputs.xml-dir }}" \
           --workflow "${{ inputs.workflow }}" \
@@ -226,4 +242,4 @@ runs:
           --triggered-at "${{ inputs.triggered-at }}" \
           --pr-number "${{ inputs.pr-number }}" \
           --trigger-type "${{ inputs.trigger-type }}" \
-          "${PLATFORM_ARGS[@]}"
+          "${PLATFORM_ARGS[@]}" "${COMPONENT_ARGS[@]}"
