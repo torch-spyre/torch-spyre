@@ -34,9 +34,7 @@ from pathlib import Path
 
 import clickhouse_connect
 
-# The shared library, installed from extensions/clickhouse-ingest. Aliased to the old module
-# name so the 40+ `v2_schema.X` call sites below stay untouched: this swaps WHERE the code lives,
-# not what it does, and a rename would bury that in noise.
+# Aliased to `v2_schema` so the call sites below read unchanged.
 from spyre_clickhouse_ingest import schema as v2_schema
 import regex as re
 

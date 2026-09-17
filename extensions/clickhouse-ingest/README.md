@@ -2,16 +2,11 @@
 
 The schema-v2 ClickHouse schema, derived identity and write path, shared by the Spyre CI ingests.
 
-## Why this exists
+## Why it is a library
 
-`v2_schema.py` and ~16 identity/write functions were **copied** into three product repos and kept
-in sync by hand, policed by an AST drift checker (`check_v2_schema_drift.py`). The drift checker
-existed only because the copies did.
-
-The copies are not a style problem. Every id here is **derived, never minted**: two writers that
-see the same run must reach the same uuid without talking to each other. A copy that drifts by one
-normalisation step produces ids that silently never join — and the symptom is not an error, it is
-missing data that reads as *"no tests ran"*.
+Every id here is **derived, never minted**: the product ingests and the Jenkins-side writer must
+reach the same uuid for the same run without coordinating. A second copy that drifts by one
+normalisation step produces ids that silently never join — no error, just missing data.
 
 ## Install
 

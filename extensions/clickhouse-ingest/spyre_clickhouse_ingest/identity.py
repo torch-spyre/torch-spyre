@@ -1,8 +1,7 @@
 """Derived identity for schema-v2 rows: run_id, test_case_id, component, arch.
 
-Every id is DERIVED, never minted: two writers that see the same run must reach the same uuid
-without talking to each other. That is the whole reason this module is shared rather than copied
--- a second copy that drifts by one normalisation step produces ids that silently never join.
+Every id is DERIVED, never minted: independent writers must reach the same uuid for the same run
+without coordinating. Changing any normalisation step here invalidates every id already written.
 """
 
 import uuid

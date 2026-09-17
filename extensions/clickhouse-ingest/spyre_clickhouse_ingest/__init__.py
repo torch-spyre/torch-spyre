@@ -1,14 +1,7 @@
 """Shared schema-v2 ClickHouse schema, identity and write path for the Spyre CI ingests.
 
-Extracted from the three product repos' ingest scripts, which carried byte-identical copies of
-this code kept in sync by hand and policed by an AST drift checker. The drift checker existed
-only because the copies did.
-
-Why a library and not a class hierarchy: the per-repo variation is a single value, the component
-name, which is already a runtime argument (`--component`). Everything else was identical.
-
-Why not part of the `torch_spyre` package: installing that to obtain a schema module would pull
-torch/numpy/ortools, and ortools has no ppc64le/s390x wheel -- the ingest would break on p/z.
+Kept out of the `torch_spyre` package on purpose: depending on it would pull torch/numpy/ortools,
+and ortools has no ppc64le/s390x wheel, so the ingest could not run on p/z.
 """
 
 from . import schema

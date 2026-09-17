@@ -1,9 +1,7 @@
-"""Pins the derived-identity contract with GOLDEN values.
+"""Pins the derived-identity contract with golden values.
 
-These uuids are written by four independent producers (this library, the Jenkins Groovy writer,
-and two product-repo ingests). If any of them drifts, rows stop joining and the symptom is not an
-error -- it is silently missing data that reads as "no tests ran". A golden test is the only thing
-that catches a normalisation change before it ships.
+Four independent producers must agree on these uuids -- this library, the Jenkins Groovy writer,
+and the product-repo ingests. A drift does not raise; it silently stops rows joining.
 """
 
 import uuid
@@ -23,7 +21,7 @@ class _Args:
 
 
 def test_namespace_is_the_agreed_constant():
-    # Every producer derives from this. Changing it invalidates every id ever written.
+    # Changing this invalidates every id already written.
     assert str(V2_NAMESPACE) == "cb0af9bf-2858-5eab-9211-f51190531bf3"
 
 
@@ -34,32 +32,28 @@ def test_run_id_golden():
 
 
 def test_run_id_folds_arch_inside_the_hash():
-    # amd64/x86/x86-64 are one arch. The fold happens INSIDE the hash, so a producer that
-    # normalises afterwards would derive a different id for the same run.
+    # The fold happens INSIDE the hash: normalising afterwards yields a different id.
     base = v2_run_id("gha", "12345", "x86_64", "integration")
     for alias in ("amd64", "x86", "x86-64", "X86_64"):
         assert v2_run_id("gha", "12345", alias, "integration") == base
 
 
 def test_run_id_refuses_an_incomplete_key():
-    # An empty field still hashes to a real, stable uuid that every other such case shares --
-    # so the guard returns "" instead of minting a collision magnet.
+    # An empty field would hash to a real uuid shared by every other incomplete key.
     assert v2_run_id("", "12345", "amd64", "integration") == ""
     assert v2_run_id("gha", "", "amd64", "integration") == ""
     assert v2_run_id("gha", "12345", "", "integration") == ""
 
 
 def test_test_case_id_is_component_scoped():
-    # component is a hash input, so the same test under two components is two identities.
-    # That is why a borrowed ingest MUST be told the real component (--component).
+    # component is a hash input, so a borrowed ingest must be told the real component.
     a = v2_test_case_id("torch-spyre", "T", "test_x", [])
     b = v2_test_case_id("hf-adapters", "T", "test_x", [])
     assert a and b and a != b
 
 
 def test_test_case_id_sorts_tags():
-    # tags are a SET; source order is incidental. An order-sensitive hash would make two
-    # writers disagree about the same test.
+    # tags are a SET; an order-sensitive hash would make two writers disagree.
     assert v2_test_case_id("c", "T", "n", ["b", "a"]) == v2_test_case_id(
         "c", "T", "n", ["a", "b"]
     )
