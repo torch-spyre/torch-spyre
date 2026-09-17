@@ -51,6 +51,7 @@ here for read-only shape recognition rather than mutation.
 from __future__ import annotations
 
 import dataclasses
+import enum
 from typing import TYPE_CHECKING, Any
 
 import sympy
@@ -430,6 +431,36 @@ def _marker_dim(op: "ir.Operation") -> "int | None":
     always misses, even for a genuine marker op.
     """
     return getattr(op, "tile_marker_dim", None)
+
+
+class MarkerResolution(enum.Enum):
+    """How _consume_tile_dim_markers resolved one tile_dim_marker op.
+
+    INLINE_ERASED: the marker's single consumer is a ComputedBuffer (or was
+    inlined into one) -- the marker's transform was fused directly into
+    that consumer's inner_fn and the marker op was removed from both
+    operations and group_ops.
+
+    STAR_DEP_KEPT: the marker's single consumer reaches it via a StarDep,
+    not an ordinary MemoryDep -- the marker cannot be fused away and stays
+    live as a real, addressable buffer (see _consume_tile_dim_markers's own
+    comment on why removing it from operations would break
+    coarse_tile.py's _validate_contiguous gapless-block invariant).
+    """
+
+    INLINE_ERASED = "inline_erased"
+    STAR_DEP_KEPT = "star_dep_kept"
+
+
+def _marker_resolution(op: "ir.Operation") -> "MarkerResolution | None":
+    """Return op's tile_marker_resolution if it carries one, else None.
+
+    Stamped by _consume_tile_dim_markers at the same branch point that
+    decides whether to erase the marker from operations (INLINE_ERASED) or
+    keep it materialized (STAR_DEP_KEPT). Like tile_marker_dim, this lives
+    as a plain attribute on the op itself, not on op.data.
+    """
+    return getattr(op, "tile_marker_resolution", None)
 
 
 def _delinearize_index(index: sympy.Expr, size, stride, offset) -> list[sympy.Expr]:
@@ -929,7 +960,7 @@ def _consume_tile_dim_markers(
         if hasattr(consumer_op, "data"):
             # Only the ComputedBuffer/inline branch actually fuses the
             # marker's transform into the consumer and erases the marker;
-            # the StarDep branch above deliberately keeps marker_op alive
+            # the StarDep branch below deliberately keeps marker_op alive
             # in BOTH group_ops and operations (see its comment) -- it must
             # still codegen as a real, addressable buffer for the StarDep
             # consumer to read, and _validate_contiguous (coarse_tile.py)
@@ -940,11 +971,16 @@ def _consume_tile_dim_markers(
             # block the marker sits inside. Passes that must not treat a
             # surviving marker as an ordinary tile op instead guard on
             # `_marker_dim(op) is not None` individually (see
-            # _plan_read_copies in coarse_tile.py for the first such guard).
+            # _plan_read_copies in coarse_tile.py for the first such guard)
+            # -- or, where the finer INLINE_ERASED/STAR_DEP_KEPT distinction
+            # matters, on `_marker_resolution(op)`.
+            marker_op.tile_marker_resolution = MarkerResolution.INLINE_ERASED
             operations.remove(marker_op)
             if marker_op in group_ops:
                 group_ops.remove(marker_op)
             group_op_ids.discard(id(marker_op))
+        else:
+            marker_op.tile_marker_resolution = MarkerResolution.STAR_DEP_KEPT
 
     _MARKER_MAPS.setdefault(id(operations), {}).update(marker_map)
     return marker_map

@@ -1326,6 +1326,183 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
             with self.assertRaisesRegex(AssertionError, r"has 2 consuming reads"):
                 _consume_tile_dim_markers(two_group_ops, two_operations)
 
+    def test_consume_tile_dim_markers_stamps_marker_resolution(self):
+        """_consume_tile_dim_markers stamps tile_marker_resolution per marker.
+
+        Builds two markers: one whose single consumer is an ordinary
+        ComputedBuffer-shaped read (MemoryDep, inline-erase branch) and one
+        whose single consumer is StarDep-shaped (kept-materialized branch).
+        Confirms each marker ends up stamped with the matching
+        MarkerResolution member, and that the inline-erased marker is
+        removed from operations/group_ops while the StarDep-kept one
+        survives in both -- the pre-existing behavior this task must not
+        change, now observable through the new field.
+
+        The StarDep consumer is a bare mock.Mock(spec=[...]), matching
+        test_consume_tile_dim_markers_raises_on_wrong_consumer_count's
+        convention -- that branch never calls get_read_writes() on
+        anything but the mocked reads list. The inline-erase branch is
+        different: _inline_marker_into_consumer/replace_computed_buffer_body
+        constructs a genuine new ComputedBuffer and _consume_tile_dim_
+        markers immediately re-derives its post-inline dep from a REAL
+        new_consumer.get_read_writes() call (not a mock return value), which
+        recurses into real Inductor tracing (ComputedBuffer.get_read_writes
+        -> extract_read_writes -> data.get_pointwise_size()/make_loader())
+        that only works against genuine ir.Pointwise/ir.FixedLayout objects
+        and a real SizeVarAllocator on V.graph -- a bare mock.Mock() for
+        `.data`/`.layout` (confirmed empirically) fails inside that real
+        tracing machinery well before reaching this pass's own logic, so
+        the inline marker/consumer pair here is built from minimal real IR
+        pieces instead.
+        """
+        import sympy
+
+        from torch._inductor.dependencies import MemoryDep, StarDep
+        from torch._inductor.ir import FixedLayout, Pointwise
+        from torch._inductor.sizevars import SizeVarAllocator
+        from torch._inductor.virtualized import ops
+        from torch_spyre._inductor.wsr.for_each_tile_lowering import (
+            MarkerResolution,
+            _consume_tile_dim_markers,
+            _marker_resolution,
+        )
+
+        def make_marker_op(name):
+            marker_op = mock.Mock(
+                name=name,
+                spec=[
+                    "get_read_writes",
+                    "get_name",
+                    "tile_marker_dim",
+                    "data",
+                    "layout",
+                ],
+            )
+            marker_op.get_name.return_value = name
+            marker_op.tile_marker_dim = 0
+            marker_op.data = mock.Mock()
+            marker_op.layout = mock.Mock(size=(4,), stride=(1,), offset=0)
+            marker_rw = mock.Mock()
+            d0 = sympy.Symbol("d0")
+            marker_rw.reads = [
+                MemoryDep(name="input_buf", index=d0, var_names=(d0,), size=(4,))
+            ]
+            # _marker_substitution (for_each_tile_lowering.py) also reads
+            # the marker's own WRITE dep off this same get_read_writes()
+            # call, to recover the var_names it substitutes the inline
+            # consumer's load-site coordinates into.
+            marker_rw.writes = [
+                MemoryDep(name=name, index=d0, var_names=(d0,), size=(4,))
+            ]
+            marker_op.get_read_writes.return_value = marker_rw
+            return marker_op
+
+        def make_inline_consumer(name, marker_name):
+            consumer_op = mock.Mock(
+                name=name,
+                spec=[
+                    "get_read_writes",
+                    "get_name",
+                    "get_operation_name",
+                    "data",
+                    "layout",
+                    "operation_name",
+                    "_split_size",
+                    "_original_inner_fn",
+                    "_original_ranges",
+                    "_original_reduction_ranges",
+                    "origins",
+                    "origin_node",
+                ],
+            )
+            consumer_op.get_name.return_value = name
+            consumer_op.get_operation_name.return_value = name
+
+            def inner_fn(index):
+                return ops.load(marker_name, index[0])
+
+            # A real Pointwise/FixedLayout pair -- required because
+            # _consume_tile_dim_markers calls the real
+            # ComputedBuffer.get_read_writes() on the reconstructed
+            # consumer below (see this test's docstring); a mock.Mock()
+            # `.data`/`.layout` cannot satisfy that real tracing path.
+            consumer_op.data = Pointwise(
+                device=torch.device("cpu"),
+                dtype=torch.float32,
+                inner_fn=inner_fn,
+                ranges=[sympy.Integer(4)],
+            )
+            consumer_op.layout = FixedLayout(torch.device("cpu"), torch.float32, [4])
+            consumer_op.operation_name = name
+            consumer_op._split_size = None
+            consumer_op._original_inner_fn = None
+            consumer_op._original_ranges = None
+            consumer_op._original_reduction_ranges = None
+            consumer_op.origins = set()
+            consumer_op.origin_node = None
+            consumer_rw = mock.Mock()
+            consumer_rw.reads = [
+                MemoryDep(
+                    name=marker_name, index=sympy.Integer(0), var_names=(), size=()
+                )
+            ]
+            consumer_op.get_read_writes.return_value = consumer_rw
+            return consumer_op
+
+        def make_stardep_consumer(name, marker_name):
+            consumer_op = mock.Mock(name=name, spec=["get_read_writes", "get_name"])
+            consumer_op.get_name.return_value = name
+            consumer_rw = mock.Mock()
+            consumer_rw.reads = [StarDep(name=marker_name, mode=None)]
+            consumer_op.get_read_writes.return_value = consumer_rw
+            return consumer_op
+
+        inline_marker = make_marker_op("inline_marker")
+        inline_consumer = make_inline_consumer("inline_consumer", "inline_marker")
+        stardep_marker = make_marker_op("stardep_marker")
+        stardep_consumer = make_stardep_consumer("stardep_consumer", "stardep_marker")
+
+        group_ops = [inline_marker, inline_consumer, stardep_marker, stardep_consumer]
+        operations = list(group_ops)
+        # Real SizeVarAllocator: is_zero_elements() (hit while re-tracing
+        # the reconstructed inline consumer's get_read_writes(), see this
+        # test's docstring) calls V.graph.sizevars.statically_known_true(),
+        # which a plain mock.Mock() cannot satisfy.
+        graph = mock.Mock(
+            spec=["operations", "name_to_buffer", "name_to_op", "sizevars"]
+        )
+        graph.operations = operations
+        graph.name_to_buffer = {}
+        graph.name_to_op = {}
+        graph.sizevars = SizeVarAllocator()
+
+        with V.set_graph_handler(graph):
+            _consume_tile_dim_markers(group_ops, operations)
+
+        self.assertEqual(
+            _marker_resolution(inline_marker),
+            MarkerResolution.INLINE_ERASED,
+            "expected the ComputedBuffer/MemoryDep-consumed marker to be "
+            "stamped INLINE_ERASED",
+        )
+        self.assertEqual(
+            _marker_resolution(stardep_marker),
+            MarkerResolution.STAR_DEP_KEPT,
+            "expected the StarDep-consumed marker to be stamped STAR_DEP_KEPT",
+        )
+        self.assertNotIn(
+            inline_marker,
+            operations,
+            "inline-erased marker must still be removed from operations "
+            "(pre-existing behavior, must not regress)",
+        )
+        self.assertIn(
+            stardep_marker,
+            operations,
+            "StarDep-kept marker must still remain in operations "
+            "(pre-existing behavior, must not regress)",
+        )
+
     def test_nested_for_each_tile_markers_resolve_correctly(self):
         """Two tile_dim_marker-tagged reads at two nesting levels resolve.
 
