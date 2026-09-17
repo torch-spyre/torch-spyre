@@ -507,7 +507,7 @@ _V2_BENCH_ID_KEYS = (
 
 # Segregates this producer's benchmarks from every other one: in the identity hash and
 # leading both perf sort keys, exactly as component is for test_cases/test_case_runs.
-# Defined here rather than beside V2_COMPONENT so it precedes its first use -- a later
+# Defined here rather than beside V2_COMPONENT_DEFAULT so it precedes its first use -- a later
 # definition raises only at call time, which no import-level check would catch.
 V2_BENCH_COMPONENT = "torch-spyre"
 
@@ -1163,10 +1163,25 @@ def insert_properties(client, run_id: str, cases: list[dict]):
 # pipelines/lib/test_run_identity.py. Keep this block in sync with it.
 # ---------------------------------------------------------------------------
 
-# The product this script ingests for. Replaces v1's hf_/si_ table-name prefixes: one
-# v2 table pair serves all three products, discriminated by this column. It is also a
+# The product this script ingests for by DEFAULT. Replaces v1's hf_/si_ table-name prefixes:
+# one v2 table pair serves all three products, discriminated by this column. It is also a
 # test_case_id hash input, so it cannot drift from the identity it is stamped on.
-V2_COMPONENT = "torch-spyre"
+#
+# A default, not a constant: a test cell may run ANOTHER component's suite through this script
+# (hf-adapters' perf cell already does -- `ingest_script: ../torch-spyre/.github/scripts/
+# ingest_xml.py` in its config.yaml), and hardcoding the owner stamped those rows
+# 'torch-spyre'. Because component is a test_case_id hash input, that does not merely
+# mislabel: the same test reconciles to a DIFFERENT identity depending on whose script ran it,
+# and the docstring's own rule (group trends on (component, classname, name)) then splits one
+# suite across two components. --component lets the caller name the component whose suite this
+# actually is; product-test already knows it (config.yaml's `PRODUCT`).
+V2_COMPONENT_DEFAULT = "torch-spyre"
+
+
+def v2_component(args) -> str:
+    """The component to stamp on v2 rows: --component when given, else this repo's default."""
+    return (getattr(args, "component", "") or "").strip() or V2_COMPONENT_DEFAULT
+
 
 V2_NAMESPACE = uuid.uuid5(uuid.NAMESPACE_DNS, "clickhouse-v2.spyre.ibm.com")
 V2_SEP = "|"
@@ -1565,6 +1580,13 @@ def main():
     parser.add_argument("--branch", default="")
     parser.add_argument("--sha", default="")
     parser.add_argument("--run-id", default="")
+    parser.add_argument(
+        "--component",
+        default="",
+        help="Component to stamp on v2 rows. Defaults to this repo's own product; set it "
+        "when a cell runs ANOTHER component's suite through this script, so the rows (and "
+        "the test_case_id they hash into) name the suite's real owner.",
+    )
     parser.add_argument("--gha-run-id", default="")
     parser.add_argument("--triggered-at", default="")
     parser.add_argument("--pr-number", default="")
@@ -1876,12 +1898,17 @@ def main():
                             file=sys.stderr,
                         )
                     elif v2_already_ingested(
-                        client, v2db, _v2_run_id, V2_COMPONENT, xml_path.name
+                        client, v2db, _v2_run_id, v2_component(args), xml_path.name
                     ):
                         print(f"  v2: already ingested run_id={_v2_run_id} — skipping")
                     else:
                         _n = insert_v2(
-                            client, v2db, V2_COMPONENT, _v2_run_id, cases, xml_path.name
+                            client,
+                            v2db,
+                            v2_component(args),
+                            _v2_run_id,
+                            cases,
+                            xml_path.name,
                         )
                         print(f"  v2: {_n} test_case_runs under run_id={_v2_run_id}")
             except Exception as _v2_err:

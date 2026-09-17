@@ -505,3 +505,39 @@ def test_perf_reingest_of_existing_source_file_exits_zero(
     client = FakeClient(dict(FULL_RUN_SCHEMA), already_ingested=1)
     _run_main(ingest, monkeypatch, xml, client, extra_argv=["--trigger-type", "perf"])
     assert client.inserts == []
+
+
+class _Args:
+    """Minimal argparse.Namespace stand-in for the component resolver."""
+
+    def __init__(self, **kw):
+        self.__dict__.update(kw)
+
+
+def test_component_defaults_to_this_repos_product(ingest):
+    assert ingest.v2_component(_Args(component="")) == "torch-spyre"
+
+
+def test_component_honours_an_explicit_override(ingest):
+    # The borrowed-script case: hf-adapters' perf cell runs spyre-perf-suite through THIS
+    # script, so its rows must name hf-adapters, not the script's owner.
+    assert ingest.v2_component(_Args(component="hf-adapters")) == "hf-adapters"
+
+
+def test_component_treats_blank_as_absent(ingest):
+    assert ingest.v2_component(_Args(component="   ")) == "torch-spyre"
+
+
+def test_component_survives_a_caller_that_passes_no_flag(ingest):
+    # An older caller's Namespace has no `component` attribute at all; falling back rather
+    # than raising keeps the ingest working while the callers are updated.
+    assert ingest.v2_component(_Args()) == "torch-spyre"
+
+
+def test_component_changes_test_case_identity(ingest):
+    # Why a wrong stamp is not merely a mislabel: component is a test_case_id hash input, so
+    # the same test reconciles to a different identity under a different component. This is
+    # the defect --component exists to prevent.
+    a = ingest.v2_test_case_id("torch-spyre", "T", "test_x", [])
+    b = ingest.v2_test_case_id("hf-adapters", "T", "test_x", [])
+    assert a and b and a != b
