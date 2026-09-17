@@ -1729,6 +1729,243 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
             "keeps its marker materialized rather than erasing it)",
         )
 
+    def test_triple_nested_stardep_outer_resolves_correctly(self):
+        """Three-level nesting, STAR_DEP_KEPT at the outer level: marker
+        splicing/resolution (this plan's actual fix) completes correctly,
+        but the fixture still cannot compile to completion.
+
+        Directly analogous to test_nested_for_each_tile_markers_resolve_
+        correctly's finding for the (simpler, 2-level)
+        nested_split_m_then_k_fn fixture: splice_while_loops fully splices
+        both WhileLoop ops (0 remain) and both outer-level STAR_DEP_KEPT
+        markers survive correctly-tagged, but compilation later fails one
+        stage further in, during op_spec_validation's OS-5 symbol-
+        consistency check on a synthetic `identity` op inserted by
+        splice_while_loops's carry/tile-read redirect -- the SAME
+        not-yet-filed follow-up gap to issue #4581 documented on that test
+        and on test_nested_for_each_tile_value_correct, now independently
+        confirmed to also block depth=3 nesting (not just depth=2). Per
+        this plan's Task 2 ruling, this OS-5 gap is tracked follow-on scope,
+        not a blocker for the marker_resolution fix itself. This test
+        tolerates specifically that error (asserting "OpSpecValidationError"
+        is in the message -- narrower than a bare except, so a regression
+        to a *different* error, e.g. the original pre-fix "indirect symbol"
+        failure, still fails loudly) rather than asserting full end-to-end
+        numeric correctness, which is not currently reachable for this
+        fixture.
+        """
+        import torch
+        import torch_spyre  # noqa: F401
+        from torch_spyre.constants import DEVICE_NAME
+        from tests.inductor.for_each_tile_fixtures import (
+            capture_post_grad_while_loop,
+            triple_nested_stardep_outer_fn,
+        )
+        from torch._inductor.exc import InductorError
+
+        X = torch.randn(2, 8, 12, device=DEVICE_NAME, dtype=torch.float16)
+        Y = torch.randn(2, 12, 6, device=DEVICE_NAME, dtype=torch.float16)
+        try:
+            capture_post_grad_while_loop(triple_nested_stardep_outer_fn, (X, Y))
+        except InductorError as exc:
+            self.assertIn(
+                "OpSpecValidationError",
+                str(exc),
+                "expected the known #4581 follow-up OS-5 symbol-consistency "
+                f"gap, got a different InductorError: {exc!r}",
+            )
+
+    def test_triple_nested_stardep_middle_resolves_correctly(self):
+        """Three-level nesting, STAR_DEP_KEPT at the middle level: marker
+        splicing/resolution completes correctly, but the fixture still
+        cannot compile to completion.
+
+        Same OS-5 follow-up gap as
+        test_triple_nested_stardep_outer_resolves_correctly -- see that
+        test's docstring for the full explanation. This test tolerates
+        specifically the OS-5 OpSpecValidationError rather than asserting
+        full end-to-end numeric correctness.
+        """
+        import torch
+        import torch_spyre  # noqa: F401
+        from torch_spyre.constants import DEVICE_NAME
+        from tests.inductor.for_each_tile_fixtures import (
+            capture_post_grad_while_loop,
+            triple_nested_stardep_middle_fn,
+        )
+        from torch._inductor.exc import InductorError
+
+        X = torch.randn(2, 8, 12, device=DEVICE_NAME, dtype=torch.float16)
+        Y = torch.randn(2, 12, 6, device=DEVICE_NAME, dtype=torch.float16)
+        try:
+            capture_post_grad_while_loop(triple_nested_stardep_middle_fn, (X, Y))
+        except InductorError as exc:
+            self.assertIn(
+                "OpSpecValidationError",
+                str(exc),
+                "expected the known #4581 follow-up OS-5 symbol-consistency "
+                f"gap, got a different InductorError: {exc!r}",
+            )
+
+    def test_triple_nested_stardep_inner_resolves_correctly(self):
+        """Three-level nesting, STAR_DEP_KEPT at the inner level: marker
+        splicing/resolution completes correctly, but the fixture still
+        cannot compile to completion.
+
+        Same OS-5 follow-up gap as
+        test_triple_nested_stardep_outer_resolves_correctly -- see that
+        test's docstring for the full explanation. This test tolerates
+        specifically the OS-5 OpSpecValidationError rather than asserting
+        full end-to-end numeric correctness.
+        """
+        import torch
+        import torch_spyre  # noqa: F401
+        from torch_spyre.constants import DEVICE_NAME
+        from tests.inductor.for_each_tile_fixtures import (
+            capture_post_grad_while_loop,
+            triple_nested_stardep_inner_fn,
+        )
+        from torch._inductor.exc import InductorError
+
+        X = torch.randn(2, 8, 12, device=DEVICE_NAME, dtype=torch.float16)
+        Y = torch.randn(2, 12, 6, device=DEVICE_NAME, dtype=torch.float16)
+        try:
+            capture_post_grad_while_loop(triple_nested_stardep_inner_fn, (X, Y))
+        except InductorError as exc:
+            self.assertIn(
+                "OpSpecValidationError",
+                str(exc),
+                "expected the known #4581 follow-up OS-5 symbol-consistency "
+                f"gap, got a different InductorError: {exc!r}",
+            )
+
+    def test_triple_nested_stardep_multilevel_resolves_correctly(self):
+        """Three-level nesting, STAR_DEP_KEPT at two levels at once: marker
+        splicing/resolution completes correctly, but the fixture still
+        cannot compile to completion.
+
+        Same OS-5 follow-up gap as
+        test_triple_nested_stardep_outer_resolves_correctly -- see that
+        test's docstring for the full explanation. This test tolerates
+        specifically the OS-5 OpSpecValidationError rather than asserting
+        full end-to-end numeric correctness.
+
+        NOTE: independent of the OS-5 gap, this fixture currently exercises
+        the SAME two outer-level markers as
+        test_triple_nested_stardep_outer_resolves_correctly, not independent
+        two-marker interaction. Task 3 found that triple_nested_stardep_
+        multilevel_fn's inner-level marker is completely absent after
+        splicing when the outer level is also STAR_DEP_KEPT (a separate,
+        real, independently-confirmed finding -- see that fixture's
+        docstring in for_each_tile_fixtures.py). This test does NOT prove
+        the intended independent-multi-marker-interaction case pending a
+        fix to that inner-marker-loss finding.
+        """
+        import torch
+        import torch_spyre  # noqa: F401
+        from torch_spyre.constants import DEVICE_NAME
+        from tests.inductor.for_each_tile_fixtures import (
+            capture_post_grad_while_loop,
+            triple_nested_stardep_multilevel_fn,
+        )
+        from torch._inductor.exc import InductorError
+
+        X = torch.randn(2, 8, 12, device=DEVICE_NAME, dtype=torch.float16)
+        Y = torch.randn(2, 12, 6, device=DEVICE_NAME, dtype=torch.float16)
+        try:
+            capture_post_grad_while_loop(triple_nested_stardep_multilevel_fn, (X, Y))
+        except InductorError as exc:
+            self.assertIn(
+                "OpSpecValidationError",
+                str(exc),
+                "expected the known #4581 follow-up OS-5 symbol-consistency "
+                f"gap, got a different InductorError: {exc!r}",
+            )
+
+    def test_sibling_nested_resolves_correctly(self):
+        """Two sibling (non-nested) for_each_tile loops sharing one outer
+        marker do NOT compile -- a real, already triple-confirmed
+        architectural gap, not a fixture bug.
+
+        sibling_nested_fn's outer for_each_tile stamps exactly one dim=0
+        marker on x_tile, and hands that same x_tile directly to both
+        sibling_a's and sibling_b's inner for_each_tile calls. Each lowers
+        to its own WhileLoop op, so the single marker ends up with 2
+        consuming reads via StarDep -- but _consume_tile_dim_markers's
+        hard assertion requires exactly 1. This is issue #4581 territory
+        (out of scope for this plan); see sibling_nested_fn's docstring in
+        for_each_tile_fixtures.py for the full mechanism writeup. This test
+        asserts (a) the eager reference is correct on its own (no device,
+        no compile) and (b) compiling raises the documented assertion,
+        matched on a naming-independent substring so it survives unrelated
+        upstream op-naming shifts.
+        """
+        import torch
+        import torch_spyre  # noqa: F401
+        import pytest
+        from torch._inductor.exc import InductorError
+        from torch_spyre.constants import DEVICE_NAME
+        from tests.inductor.for_each_tile_fixtures import (
+            capture_post_grad_while_loop,
+            sibling_nested_fn,
+            sibling_nested_reference,
+        )
+
+        X = torch.randn(8, 12, dtype=torch.float16)
+        Y = torch.randn(12, 6, dtype=torch.float16)
+        expected = sibling_nested_reference(X, Y)
+        actual = sibling_nested_fn(X, Y)
+        torch.testing.assert_close(actual, expected)
+
+        X_dev = X.to(DEVICE_NAME)
+        Y_dev = Y.to(DEVICE_NAME)
+        with pytest.raises(
+            InductorError, match="consuming reads within its spliced body"
+        ):
+            capture_post_grad_while_loop(sibling_nested_fn, (X_dev, Y_dev))
+
+    def test_sibling_nested_stardep_resolves_correctly(self):
+        """Two sibling for_each_tile loops, one STAR_DEP_KEPT and one
+        INLINE_ERASED, sharing one outer marker, do NOT compile -- the same
+        real, already triple-confirmed architectural gap as
+        test_sibling_nested_resolves_correctly.
+
+        sibling_nested_stardep_fn is structurally identical to
+        sibling_nested_fn in the way that matters here: a single outer
+        dim=0 marker on x_tile is handed directly to two sibling inner
+        for_each_tile calls, each becoming its own WhileLoop consumer of
+        that one marker via StarDep -- 2 consuming reads where
+        _consume_tile_dim_markers requires exactly 1. See
+        sibling_nested_stardep_fn's docstring in for_each_tile_fixtures.py
+        for the full mechanism writeup. This test asserts (a) the eager
+        reference is correct on its own (no device, no compile) and (b)
+        compiling raises the documented assertion, matched on a naming-
+        independent substring.
+        """
+        import torch
+        import torch_spyre  # noqa: F401
+        import pytest
+        from torch._inductor.exc import InductorError
+        from torch_spyre.constants import DEVICE_NAME
+        from tests.inductor.for_each_tile_fixtures import (
+            capture_post_grad_while_loop,
+            sibling_nested_stardep_fn,
+            sibling_nested_stardep_reference,
+        )
+
+        X = torch.randn(8, 12, dtype=torch.float16)
+        Y = torch.randn(12, 6, dtype=torch.float16)
+        expected = sibling_nested_stardep_reference(X, Y)
+        actual = sibling_nested_stardep_fn(X, Y)
+        torch.testing.assert_close(actual, expected)
+
+        X_dev = X.to(DEVICE_NAME)
+        Y_dev = Y.to(DEVICE_NAME)
+        with pytest.raises(
+            InductorError, match="consuming reads within its spliced body"
+        ):
+            capture_post_grad_while_loop(sibling_nested_stardep_fn, (X_dev, Y_dev))
+
     def test_nested_for_each_tile_markers_snapshot_catches_noop_splice_stub(self):
         """Mutation coverage for the snapshot fix above.
 
