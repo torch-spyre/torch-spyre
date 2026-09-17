@@ -1,18 +1,20 @@
 # SDPA `for_each_tile` feasibility report
 
-Date: 2026-09-15
+Last updated: 2026-09-17
 
 ## Executive summary
 
-Rewriting the full Torch-Spyre SDPA tile nest in terms of `for_each_tile` is
-conceptually sound, but it is not ready to replace the production
-implementation. The online-softmax loop over `Lk` works on Spyre, including
-native GQA with dense bias, and the full four-level MHA and five-level GQA
-programs work and compile on CPU. The first nested `for_each_tile` combination
-does not compile on Spyre, however. A minimal two-map program fails in the same
-place as an `Lq` map containing an `Lk` reduction and the complete GQA nest.
+The branch is rebased on `upstream/main` after PRs #4550 and #4559. The merged
+`Lk` online-softmax HOP works on Spyre, including native GQA with dense bias,
+and the full four-level MHA and five-level GQA programs are numerically correct
+in CPU eager and compiled modes. PR #4559 fixes the stale nested-placeholder
+lookup that originally blocked this experiment, but nested HOPs are still not
+end-to-end executable on Spyre. A minimal two-map program, an `Lq` map around an
+`Lk` reduction, the complete GQA nest, and the production forced-tiling case all
+now reach code generation and fail on an unregistered outer-loop indirect
+symbol (issue #4581).
 
-There are three other gaps to resolve before production use:
+There are four other gaps to resolve before production use:
 
 1. Map-mode loops currently materialize scan outputs. The prototypes contain
    four copy/stack-style materialization nodes. The unmerged `scan(out=)` and
@@ -22,51 +24,50 @@ There are three other gaps to resolve before production use:
 3. `for_each_tile` requires exact tile divisibility. Production SDPA accepts a
    shorter final K/V block, so arbitrary `Lk` needs padding and masking, an exact
    divisor policy, or frontend support for a ragged final tile.
+4. The #4549 fast path relies on named work division. The no-`named_dims`
+   full-HOP version needs an axis-based equivalent to preserve that schedule.
 
-The recommendation is therefore to land only the standalone `Lk` replacement
-for now, as proposed separately in PR #4550. Do not replace the outer hint
-scopes yet. Fix and test nested HOP lowering first, then add destination-backed
-map outputs and handle broadcast bias before making the complete HOP nest the
-production implementation.
+The recommendation remains to keep the merged #4550 `Lk`-only implementation
+in production and leave this PR in draft. Finish #4581 and validate
+destination-backed map outputs, broadcast bias, and work-division parity before
+replacing the outer hint scopes.
 
 ## Experiment baseline
 
 - Repository: `torch-spyre/torch-spyre`
-- Base: current `upstream/main` at
-  `fc5b1cf79c23efa648bdcb9fe589390bdbfd8768`
+- Base: `upstream/main` at
+  `6d9ab2c1f709f1d4e87a57617a73a112dac51019`
 - Experiment branch: `codex/sdpa-for-each-tile-experiment`
 - Worktree: `/tmp/torch-spyre-sdpa-fet.8jYqoJ`
 - Prototype: `tests/inductor/test_sdpa_for_each_tile.py`
 
-PR #4518 is already in this base as commit
-`3b5381f0f083a9bfaddb9319e093c01a4dab0443`. Its reduction-symbol preservation
-fix is useful to the existing hint-based path, but it does not fix nested
-`for_each_tile` lowering.
+The base includes the merged `Lk` conversion (#4550), the current SDPA cost
+model (#4549), nested tile-dimension provenance (#4559), completed split-matmul
+LX retention (#3955), and device-aware allocation helpers (#4548). The native
+extension was rebuilt at this base before retesting.
 
 This draft branch includes the proposed production replacement so the team can
 inspect and iterate on the complete shape. It is intentionally not ready to
-merge: the nested-lowering failures below are reproduced by that implementation.
-A speculative compiler modification used to continue diagnosis past the first
-failure was reverted.
+merge: the remaining nested-lowering failure below is reproduced by that
+implementation.
 
 ## Original SDPA structure
 
-Before the standalone `Lk` refactor, `spyre__sdpa_overrideable` chooses a
-tiling plan with
-`_select_sdpa_tiling` and expresses outer coarse tiling with nested
-`spyre_hint` scopes:
+On current main, `spyre__sdpa_overrideable` chooses a tiling plan with
+`_select_sdpa_tiling`, expresses outer coarse tiling with nested `spyre_hint`
+scopes, and uses the merged carry-mode `for_each_tile` for `Lk`:
 
 - a batch tile scope;
 - a head tile scope for MHA;
 - query-sequence tiling and, for eligible shapes, named work division;
 - explicit rank-5 `[B, Hkv, G, Lq, D]` operands for native GQA; and
-- a Python `for` loop that slices K and V into `Lk` blocks.
+- a carry-mode HOP that slices K and V into `Lk` blocks.
 
-The Python `Lk` loop implements stable online softmax with three SSA values:
+The `Lk` HOP implements stable online softmax with three SSA values:
 the running maximum `M`, denominator `l`, and unnormalized output accumulator
 `O`. The loop is deliberately split into bounded groups because the generated
-bundle size scales with the `Lq`-tile by unrolled-`Lk`-block product. The current
-limit is 16 tile pairs per loop group.
+bundle size previously scaled with the `Lq`-tile by unrolled-`Lk`-block product;
+#4550 removes that Python unrolling.
 
 Any HOP rewrite must preserve the existing tiling cost model, per-block K/V
 layout normalization, GQA semantics, causal/additive mask behavior, output
@@ -121,8 +122,8 @@ sparse `M` and denominator accumulators per query tile. Masks remain separate
 operands and are sliced only along axes whose extent matches the tiled axis.
 The HOP dimensions fully describe tiling, so this version contains no
 `named_dims` hints. This code is included to make the complete lowering shape
-reviewable; it is not expected to compile for shapes that exercise two or more
-HOP levels.
+reviewable. On the current base it traces and splices every nested level, then
+fails later during Spyre code generation as described below.
 
 ## Results
 
@@ -142,14 +143,27 @@ The Spyre tests use FP16 operands with `D=128`, `Lq=64`, `Lk=256`, and
 The complete prototype suite reports:
 
 ```text
-Ran 9 tests in 45.792s
+Ran 9 tests in 46.165s
 OK (expected failures=4)
 ```
 
 The four expected failures are intentional regression tests for nested maps,
 the `Lq`/`Lk` nest, the complete GQA nest, and broadcast bias.
 
-### Blocker 1: nested HOP lowering
+Focused production-decomposition checks on the same build show:
+
+| Test | Result |
+| --- | --- |
+| `test_sdpa_lk_uses_for_each_tile` | Pass |
+| Granite GQA decode, `Lq=1`, `Lk=128` | Fails on outer symbol `u5` |
+| Granite GQA prefill, `Lq=128`, `Lk=128` | Fails on outer symbol `u5` |
+| Forced four-by-four Granite GQA, `Lq=Lk=256` | Fails on outer symbol `u42` |
+
+GQA always has at least the `Hkv -> G` map nesting in this rewrite, so even a
+one-block `Lk` case is affected. The full decomposition cannot currently serve
+as a fallback for ordinary GQA decode or prefill.
+
+### Blocker 1: outer-loop symbols in nested code generation (#4581)
 
 The minimal reproducer is two map-mode loops over a `[128, 128]` FP16 tensor:
 
@@ -179,31 +193,37 @@ _, result = for_each_tile(
 )
 ```
 
-It fails during `splice_while_loops -> coarse_tile_pre_stickify ->
-_plan_read_copies -> _full_buffer_read_deps`:
+On the old base this failed during `splice_while_loops` with a stale inner-body
+placeholder. PR #4559 fixes that failure: both loops are now spliced and their
+tile dimensions are recovered from `tile_dim_marker`. The program proceeds to
+Spyre kernel code generation, where the inner body still contains the outer
+loop variable in an address expression such as:
 
 ```text
-RuntimeError: Failed to find buffer matching name
-while_loop_body_graph_0_0_arg3_1
+tmp0 = ops.load(arg0_1, i1 + 128 * i0 + 8192 * u5)
+
+Unsupported: indirect symbol u5 not found in indirect_sizes {}
 ```
 
 The same failure occurs for the first SDPA-specific nest (`Lq` map around an
-`Lk` reduction) and for the full five-level GQA program. This establishes that
-the first blocker is generic nested-HOP lowering, not the online-softmax
-formula.
+`Lk` reduction), the complete five-level GQA program, and
+`test_granite_gqa_prefill_four_by_four_sequence_tiling` in the production
+decomposition (`u42` there). This establishes that #4559 solved dimension
+provenance and splicing, while #4581 still prevents the nested result from being
+code-generated.
 
-An experimental alias-composition change allowed lowering to pass this stale
-inner-placeholder lookup, but it then exposed independent failures:
+Three source-level workarounds were tried against the minimal reproducer:
 
-- `unexpected mutation layout` during layout finalization;
-- a nested map output retaining `FixedLayout` where work division expects a
-  `FixedTiledLayout`; and
-- a rank-5 online-softmax layout whose selected stick is incompatible with the
-  operation.
+- `.contiguous()` and `.clone()` on the outer tile are optimized as aliases and
+  retain the unresolved outer symbol;
+- an explicit pointwise materialization (`outer_tile + 0`) reaches runtime but
+  is incorrect, returning approximately all ones instead of `x + 1`; and
+- `copy_forced` with a tile-local destination fails fake propagation because a
+  generated body placeholder is not supplied.
 
-The experiment was reverted because resolving the first name lookup alone does
-not produce a correct nested implementation. Nested lowering needs an
-end-to-end layout and mutation solution rather than a narrow lookup workaround.
+None is a safe decomposition-level workaround. The compiler must register and
+transport outer loop variables when generating nested bodies; materializing the
+tile is not sufficient and can silently miscompile.
 
 ### Blocker 2: map output materialization
 
@@ -240,7 +260,7 @@ actual shape, or materialize a dense bias only at the current tile granularity.
 A full expanded-bias clone would defeat the memory objective and should be
 avoided.
 
-### Blocker 4: ragged `Lk`
+### Constraint 4: ragged `Lk`
 
 `for_each_tile` currently rejects a sliced extent that is not divisible by
 `tile_size`:
@@ -249,8 +269,9 @@ avoided.
 ValueError: ragged tiles are not supported
 ```
 
-The production Python loop uses `end = min(start + block_size, Lk)`, so its last
-block may be shorter. Reasonable options are:
+The merged #4550 implementation and this branch avoid a ragged last block by
+selecting an exact divisor no larger than the cost model's requested block.
+Other possible policies remain:
 
 1. Pad K and V to a tile multiple and add `-inf` to padded score columns. This
    is the most practical initial implementation and preserves a fixed HOP body
@@ -261,8 +282,19 @@ block may be shorter. Reasonable options are:
    conflicts with `scan`'s fixed per-step tensor shape and is the largest
    frontend/compiler change.
 
-Padding should be preferred for a first production implementation, while
-retaining a fast no-padding path for already aligned lengths.
+The exact-divisor policy is sufficient for correctness, but padding may be a
+better follow-up if awkward lengths force a very small divisor.
+
+### Constraint 5: #4549 work-division parity
+
+The #4549 cost model's calibrated fast path returns `num_q_tiles=1` and
+`num_head_tiles=1`, then relies on a `work_div` hint to distribute `H`, `Lq`,
+and, for MHA, part of `Lk` across cores. The full-HOP branch intentionally has
+no `named_dims`, so it currently consumes the selected K/V block size but does
+not reproduce that named work division. Mapping those split counts to
+additional sequential HOP tiles would not be equivalent. Once nested codegen
+works, the compiler needs either HOP-derived work division or an axis-based
+work-division interface before performance can be compared fairly with main.
 
 ## Recommended implementation sequence
 
@@ -270,13 +302,13 @@ retaining a fast no-padding path for already aligned lengths.
 
 Keep the minimal two-map test and require it to emit two nested `LoopSpec`s.
 Then enable the `Lq` map around the `Lk` reduction and require two nested
-`LoopSpec`s plus numerical agreement. The fix must cover:
+`LoopSpec`s plus numerical agreement. PR #4559 already handles recursive
+placeholder resolution and tile-dimension provenance. The remaining fix must:
 
-- recursive placeholder/alias resolution after inner `WhileLoop` splicing;
-- output and mutation layouts across nested bodies;
-- promotion of nested map destinations to `FixedTiledLayout` before work
-  division consumes them; and
-- rank-5 GQA layout selection.
+- recognize outer counted-loop variables used by an inner body's addresses;
+- carry their ranges into `indirect_sizes`/coordinate generation; and
+- preserve value correctness rather than hiding the symbol behind a
+  materialization.
 
 Do not use the complete SDPA graph as the primary debugger until these two
 small cases pass.
@@ -306,15 +338,10 @@ and densifying only an individual score tile if layout propagation requires it.
 ### 4. Replace production loops without replacing policy
 
 Reuse `_select_sdpa_tiling` to choose tile sizes. Express `B`, `Hkv`, `G`, and
-`Lq` as map-mode HOPs and `Lk` as the online-softmax reduction. Preserve the
-existing per-block K/V `.contiguous()` normalization and mask slicing. Use
-preallocated destinations at every map level.
-
-The original 16-pair bundle guard exists because Python-unrolled `Lk` multiplies
-code size by the `Lq` trip count. A real nested `Lk` `LoopSpec` may remove that
-specific source-size problem, but the guard should remain until generated code,
-DXP compile time, and runtime launch behavior demonstrate that it is no longer
-needed.
+`Lq` as map-mode HOPs and retain #4550's `Lk` online-softmax reduction. Preserve
+the current per-block K transpose/normalization, corrected carry recurrence,
+mask slicing, and output-stride contract. Add an axis-based equivalent of the
+cost model's `work_div`, then use preallocated destinations at every map level.
 
 ### 5. Validate correctness and performance before switching the default
 
@@ -330,9 +357,10 @@ long KV, and compare:
 - peak HBM/LX use and materialization count; and
 - behavior around every tiling-policy boundary.
 
-Only after those results are neutral or better should the HOP implementation
-become the default; retaining the current decomposition behind a temporary
-fallback would make rollout safer.
+Performance runs are not meaningful yet: the full branch cannot produce an
+executable, and dropping #4549's work division would compare different
+schedules. Only after correctness and work-division parity should the HOP
+implementation become the default.
 
 ## Reproduction commands
 
@@ -352,10 +380,10 @@ env PYTHONPATH=/tmp/torch-spyre-sdpa-fet.8jYqoJ python -c \
 
 ## Decision
 
-The full rewrite should continue as compiler-enablement work, not as a
-merge-ready SDPA decomposition patch yet. A standalone `Lk` HOP is proven
-viable inside the existing outer hint-generated tiling and is proposed in PR
-#4550. Replacing those outer hints with map-mode HOPs creates the unsupported
-nested-loop condition. The safe partial production step is therefore the `Lk`
-replacement; the outer `B`, `Hkv`/`H`, `G`, and `Lq` replacement must wait for
-nested lowering and the remaining map-mode issues.
+The full rewrite remains compiler-enablement work, not a merge-ready SDPA
+decomposition patch. The safe partial step—#4550's `Lk` HOP—is already merged.
+#4559 removes the original nested-placeholder blocker but does not make nested
+maps executable: #4581 still fails codegen, and a materialization workaround
+silently produces incorrect values. Keep PR #4551 draft until #4581,
+destination-backed map outputs, broadcast bias, and #4549 work-division parity
+are resolved and measured.

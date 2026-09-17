@@ -292,7 +292,7 @@ def _sdpa_kv_for_each_tile(
 
 class TestSDPAForEachTile(unittest.TestCase):
     def _check(self, *, use_gqa: bool) -> None:
-        torch.manual_seed(0)
+        torch.default_generator.manual_seed(0)
         batch, heads, groups, query_length, kv_length, head_dim = 2, 4, 2, 8, 12, 6
         if use_gqa:
             query = torch.randn(batch, heads, groups, query_length, head_dim)
@@ -371,7 +371,7 @@ class TestSDPAForEachTile(unittest.TestCase):
 
     def _check_kv_loop_spyre(self, *, broadcast_bias: bool):
         batch, heads, query_length, kv_length, head_dim = 1, 2, 64, 256, 128
-        torch.manual_seed(0)
+        torch.default_generator.manual_seed(0)
         query = torch.randn(batch, heads, query_length, head_dim, dtype=torch.float16)
         key = torch.randn(batch, heads, kv_length, head_dim, dtype=torch.float16)
         value = torch.randn(batch, heads, kv_length, head_dim, dtype=torch.float16)
@@ -419,7 +419,7 @@ class TestSDPAForEachTile(unittest.TestCase):
     def test_gqa_kv_loop_with_dense_bias_spyre(self):
         """The Lk HOP preserves native GQA without repeating K and V."""
         batch, heads, groups, query_length, kv_length, head_dim = 1, 2, 2, 64, 256, 128
-        torch.manual_seed(0)
+        torch.default_generator.manual_seed(0)
         query = torch.randn(
             batch, heads, groups, query_length, head_dim, dtype=torch.float16
         )
@@ -453,9 +453,9 @@ class TestSDPAForEachTile(unittest.TestCase):
 
     @unittest.expectedFailure
     def test_gqa_complete_tile_nest_spyre(self):
-        """All five levels currently hit the nested-placeholder compiler gap."""
+        """All five levels currently hit the nested indirect-symbol gap."""
         batch, heads, groups, query_length, kv_length, head_dim = 2, 2, 2, 32, 256, 128
-        torch.manual_seed(0)
+        torch.default_generator.manual_seed(0)
         query = torch.randn(
             batch, heads, groups, query_length, head_dim, dtype=torch.float16
         )
@@ -495,7 +495,7 @@ class TestSDPAForEachTile(unittest.TestCase):
 
     @unittest.expectedFailure
     def test_two_nested_maps_spyre(self):
-        """Minimal reproducer for nested map-mode compiler lowering."""
+        """Minimal reproducer for issue #4581's outer-loop indirect symbol."""
         x = torch.randn(128, 128, dtype=torch.float16)
 
         def fn(x):
@@ -529,7 +529,7 @@ class TestSDPAForEachTile(unittest.TestCase):
 
     @unittest.expectedFailure
     def test_query_kv_nested_spyre(self):
-        """The first SDPA nesting, Lq map around Lk reduction, is blocked."""
+        """Lq map around Lk reduction reaches issue #4581 during codegen."""
         query = torch.randn(128, 128, dtype=torch.float16)
         key = torch.randn(256, 128, dtype=torch.float16)
         value = torch.randn(256, 128, dtype=torch.float16)

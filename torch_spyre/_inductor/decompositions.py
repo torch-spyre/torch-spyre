@@ -25,7 +25,6 @@ independent from PyTorch's global ``torch._inductor.decomposition.decompositions
 registry; Spyre never mutates the global table.
 """
 
-import contextlib
 import dataclasses
 import math
 import threading
@@ -1579,14 +1578,10 @@ def spyre__sdpa_overrideable(
             # Compute the old-max correction before producing new_max. The loop
             # lowering can then update running_max in place without snapshotting
             # its old value for a later reader.
-            correction = torch.exp(
-                torch.clamp_max(block_maximum - block_max, 0.0)
-            )
+            correction = torch.exp(torch.clamp_max(block_maximum - block_max, 0.0))
             new_max = torch.maximum(block_maximum, block_max)
             exp_scores = torch.exp(scores - new_max.unsqueeze(-1))
-            new_denominator = (
-                block_denominator * correction + exp_scores.sum(dim=-1)
-            )
+            new_denominator = block_denominator * correction + exp_scores.sum(dim=-1)
             exp_scores_c = exp_scores.contiguous()
             weighted = (
                 torch.ops.spyre.batched_matmul(exp_scores_c, v_blk)
