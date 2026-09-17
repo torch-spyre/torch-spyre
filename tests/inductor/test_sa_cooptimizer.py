@@ -54,7 +54,6 @@ from torch_spyre._inductor import config as ts_config
 from torch_spyre._inductor.scratchpad import utils
 from torch_spyre._inductor.scratchpad.sa_cooptimizer import (
     _MAX_STEPS,
-    _MIN_STEPS,
     _STEPS_PER_BUFFER,
     DivisionConfig,
     SaCoOptimizingSolver,
@@ -718,20 +717,16 @@ class SnapshotRestoreTest(TestCase):
 
 
 class StepBudgetTest(TestCase):
-    """``clamp(_STEPS_PER_BUFFER * n, _MIN_STEPS, _MAX_STEPS)`` -- the same shape
-    the layout-only annealer's schedule uses, so neither engine grows without
-    bound."""
+    """``min(_STEPS_PER_BUFFER * n, _MAX_STEPS)`` -- a per-buffer rate under a
+    ceiling, so the engine does not grow without bound."""
 
     @staticmethod
     def _budget(n):
         """The budget ``_anneal`` computes for ``n`` buffers."""
-        return min(_MAX_STEPS, max(_MIN_STEPS, _STEPS_PER_BUFFER * n))
+        return min(_MAX_STEPS, _STEPS_PER_BUFFER * n)
 
-    def test_rate_applies_between_the_floor_and_the_ceiling(self):
+    def test_rate_applies_below_the_ceiling(self):
         self.assertEqual(self._budget(100), _STEPS_PER_BUFFER * 100)
-
-    def test_floor_applies_to_tiny_graphs(self):
-        self.assertEqual(self._budget(1), _MIN_STEPS)
 
     def test_ceiling_caps_large_graphs(self):
         binds_at = _MAX_STEPS // _STEPS_PER_BUFFER
