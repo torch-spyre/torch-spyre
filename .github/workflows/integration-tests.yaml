@@ -99,14 +99,6 @@ on:
         required: false
         type: boolean
         default: true
-      component:
-        description: >-
-          Component to stamp on v2 ingest rows. Defaults to this repo's own product; set it
-          when this run executes ANOTHER component's suite, so the rows (and the test_case_id
-          they hash into) name the suite's real owner.
-        required: false
-        type: string
-        default: torch-spyre
       run_id:
         description: >-
           UUID for this TEST RUN, minted by the dispatching orchestrator above the CI split.
@@ -188,7 +180,12 @@ jobs:
     uses: ./.github/workflows/_test_matrix.yaml
     with:
       runner_label: linux
-      component: ${{ inputs.component || 'torch-spyre' }}
+      # Not a workflow_dispatch input here: nothing dispatches this workflow with a
+      # component (torch-spyre's own runs are always torch-spyre, and the Jenkins gha cells
+      # send only what their config.gha.inputs map declares), and workflow_dispatch is capped
+      # at 10 inputs. A cross-component run reaches _test_matrix.yaml directly, which does
+      # take the input.
+      component: torch-spyre
       run_id: ${{ inputs.run_id }}
       image_label: ${{ inputs.runner_label || 'image_spyre_backend' }}
       extra_test_flags: -v
