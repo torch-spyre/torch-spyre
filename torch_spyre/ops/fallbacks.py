@@ -46,6 +46,7 @@
 
 import functools
 import os
+import threading
 import warnings
 
 import torch
@@ -212,19 +213,29 @@ def register_fallback(ops, device="cpu"):
 
         return _move_to_spyre(fallback_result)
 
+    def _build_kernel(fn, op=None):
+        """The host-fallback kernel for ``op``, which the warning names.
+
+        ``op`` defaults to ``fn``, as it is for an op falling back to its own
+        aten implementation.
+        """
+
+        @functools.wraps(fn)
+        def _wrapped(*args, _op=op if op is not None else fn, **kwargs):
+            warn_fallback(_op, fallback_device)
+            return _fallback(fn, *args, **kwargs)
+
+        return _wrapped
+
     def _decorator(fn):
         for op in ops:
-
-            @functools.wraps(fn)
-            def _wrapped(*args, **kwargs):
-                warn_fallback(op, fallback_device)
-                return _fallback(fn, *args, **kwargs)
-
             fallback_ops.append(op)
-
-            torch.library.register_kernel(op, ["spyre"])(_wrapped)
+            torch.library.register_kernel(op, ["spyre"])(_build_kernel(fn, op))
         return fn
 
+    # For a caller needing the host arm without registering it; see
+    # ``register_compiled_with_fallback``.
+    _decorator.build_host_kernel = _build_kernel
     return _decorator
 
 
@@ -233,17 +244,59 @@ def register_fallback_default(ops):
         register_fallback([op])(op)
 
 
+# Re-entry depth of the compiled-first route, thread-local because generated
+# graph wrappers run from independent application threads.
+_compiled_route_state = threading.local()
+
+
+def register_compiled_with_fallback(ops, device="cpu"):
+    """Register a Spyre kernel that compiles first and falls back to the host.
+
+    For an op whose Spyre decomposition covers only some shapes and element
+    types, an eager call reaches the device where that decomposition serves it
+    and the host where it declines, ``torch.compile`` deciding which.
+
+    Inductor's fallback for a declined case re-invokes the op on a Spyre tensor
+    and dispatches straight back here, so the depth guard serves that re-entry
+    from the host and terminates. Uses the same kernel slot and ``fallback_ops``
+    entry as ``register_fallback``, which is what keeps each op out of the
+    decomposition table until ``get_spyre_decomp_table`` re-adds it.
+    """
+    for op in _get_op_overloads(ops):
+        host = register_fallback([op], device).build_host_kernel(op)
+
+        def _wrapped(*args, _op=op, _host=host, **kwargs):
+            if getattr(_compiled_route_state, "depth", 0):
+                return _host(*args, **kwargs)
+            _compiled_route_state.depth = 1
+            try:
+                return torch.compile(_op, dynamic=False)(*args, **kwargs)
+            finally:
+                _compiled_route_state.depth = 0
+
+        fallback_ops.append(op)
+        torch.library.register_kernel(op, ["spyre"])(_wrapped)
+
+
 #  CPU-fallback eager operators
+
+# These carry Spyre decompositions, so an eager call compiles first and reaches
+# the host only for what they decline.
+register_compiled_with_fallback(
+    [
+        aten.tril,
+        aten.triu,
+        aten.cumsum,
+        aten.eye,
+    ]
+)
 
 register_fallback_default(
     [
-        aten.cumsum,
         aten.repeat.out,
         aten.arange,
         aten.ne.Scalar_out,
         aten.isin,
-        aten.tril,
-        aten.triu,
         aten.bitwise_xor.Tensor,
         aten.bitwise_xor.Tensor_out,
         aten.bitwise_or.Tensor,

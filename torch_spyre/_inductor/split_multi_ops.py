@@ -482,6 +482,9 @@ def _lower_fx_node(node, gl, ops, idx):
     gl.operations.remove(buf)
     ops.insert(idx, buf)
     gl.name_to_buffer[buf.get_name()] = buf
+    # A later split child resolves an input name through gl.env alone, and
+    # neither node nor buffer existed when the env was seeded, so register here.
+    gl.env[node] = tb
     return buf
 
 
@@ -578,6 +581,9 @@ def _make_intermediate_bufs(
             operations.insert(insert_idx, new_buf)
             buf_name = new_buf.get_name()
             vid_to_bufname[vid] = buf_name
+            # Reachable as an input to a later split child, which resolves an
+            # input name through gl.env alone.
+            gl.env[new_node] = tb
             # Track this materialized constant for the handler's constant_map.
             constant_map[(fill_value, out_dtype)] = buf_name
             insert_idx += 1
