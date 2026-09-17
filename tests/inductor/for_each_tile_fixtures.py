@@ -159,6 +159,9 @@ def triple_nested_stardep_outer_fn(X: torch.Tensor, Y: torch.Tensor) -> torch.Te
     first (`x_m_tile * 1.0`, `x_k_tile * 1.0`), causing their markers to
     be INLINE_ERASED and removed from the graph. Exercises marker_resolution
     propagating through two more splice levels above STAR_DEP_KEPT markers.
+
+    Note: .squeeze(0) on outer tiles reconciles the outer loop's tile_size=1
+    singleton batch dimension with the middle loop's 2-D input expectation.
     """
 
     def outer_body(_, ops):
@@ -216,8 +219,7 @@ def triple_nested_stardep_outer_reference(
                     y_k_tile = y_b[k_start : k_start + k_tile_size]
                     acc = acc + x_k_tile @ y_k_tile
                 m_rows.append(acc)
-            rows.append(torch.cat(m_rows, dim=0))
-        batches.append(torch.stack(rows, dim=0))
+            batches.append(torch.cat(m_rows, dim=0))
     return torch.cat(batches, dim=0)
 
 
@@ -231,6 +233,9 @@ def triple_nested_stardep_middle_fn(X: torch.Tensor, Y: torch.Tensor) -> torch.T
     (2 markers). The inner level's x_k_tile is routed through elementwise
     (`* 1.0`), causing its marker to be INLINE_ERASED. Exercises propagation
     through exactly one more splice level above STAR_DEP_KEPT markers.
+
+    Note: .squeeze(0) on outer tiles reconciles the outer loop's tile_size=1
+    singleton batch dimension with the middle loop's 2-D input expectation.
     """
 
     def outer_body(_, ops):
@@ -288,8 +293,7 @@ def triple_nested_stardep_middle_reference(
                     y_k_tile = y_b[k_start : k_start + k_tile_size]
                     acc = acc + x_k_tile @ y_k_tile
                 m_rows.append(acc)
-            rows.append(torch.cat(m_rows, dim=0))
-        batches.append(torch.stack(rows, dim=0))
+            batches.append(torch.cat(m_rows, dim=0))
     return torch.cat(batches, dim=0)
 
 
@@ -300,6 +304,9 @@ def triple_nested_stardep_inner_fn(X: torch.Tensor, Y: torch.Tensor) -> torch.Te
     (INLINE_ERASED); the inner level's tile feeds directly into the matmul
     (STAR_DEP_KEPT), same shape as nested_split_m_then_k_fn's inner level
     but one level deeper.
+
+    Note: .squeeze(0) on outer tiles reconciles the outer loop's tile_size=1
+    singleton batch dimension with the middle loop's 2-D input expectation.
     """
 
     def outer_body(_, ops):
@@ -357,8 +364,7 @@ def triple_nested_stardep_inner_reference(
                     y_k_tile = y_b[k_start : k_start + k_tile_size]
                     acc = acc + x_k_tile @ y_k_tile
                 m_rows.append(acc)
-            rows.append(torch.cat(m_rows, dim=0))
-        batches.append(torch.stack(rows, dim=0))
+            batches.append(torch.cat(m_rows, dim=0))
     return torch.cat(batches, dim=0)
 
 
@@ -389,6 +395,9 @@ def triple_nested_stardep_multilevel_fn(
     identical to triple_nested_stardep_outer_fn. The middle-level elementwise
     is preserved as a structural probe for future investigation. See
     task-3-report.md for full investigation and follow-up gap tracking.
+
+    Note: .squeeze(0) on outer tiles reconciles the outer loop's tile_size=1
+    singleton batch dimension with the middle loop's 2-D input expectation.
     """
 
     def outer_body(_, ops):
@@ -445,8 +454,7 @@ def triple_nested_stardep_multilevel_reference(
                     y_k_tile = y_b[k_start : k_start + k_tile_size]
                     acc = acc + x_k_tile @ y_k_tile
                 m_rows.append(acc)
-            rows.append(torch.cat(m_rows, dim=0))
-        batches.append(torch.stack(rows, dim=0))
+            batches.append(torch.cat(m_rows, dim=0))
     return torch.cat(batches, dim=0)
 
 
