@@ -384,6 +384,36 @@ class CoreDivisionBuffer(LifetimeBoundBuffer):
         return division_symbol(self.name)
 
     @property
+    def sym_tile_counts(self) -> dict[sympy.Symbol, sympy.Symbol]:
+        """Symbolic stand-in for a chosen coarse tiling: one symbol per
+        iteration axis this buffer's :attr:`division_space` offers a tile level
+        on, so the cost model can carry an undecided tile count as an unknown.
+
+        Keyed by axis rather than by buffer because a tile count divides an
+        axis's extent exactly as a core split does -- the two enter the same
+        per-core geometry, and which of an op's args a level makes
+        loop-invariant is decided by whether that axis's symbol appears in the
+        arg's index, which is static. So only the count is unknown, and a
+        candidate that leaves an axis untiled binds its symbol to 1.
+
+        Empty where tilings are not this caller's to choose: no space at all
+        (the placement-only wrap), or a space built without one, which is what
+        every engine but the SA co-optimizer gets and what
+        ``config.auto_coarse_tiling`` off leaves behind. The expression then
+        carries no tiling symbol and is the one it was before this existed.
+        """
+        space = self.division_space
+        tiling = getattr(space, "tiling", None)
+        if space is None or tiling is None:
+            return {}
+        counts = {}
+        for host_dim in tiling.output_dims:
+            axis = space.axis_by_host_dim.get(host_dim)
+            if axis is not None:
+                counts[axis] = tile_count_symbol(self.name, axis)
+        return counts
+
+    @property
     def sym_core_divs(self) -> dict[sympy.Symbol, sympy.Symbol]:
         """Symbolic stand-in for a chosen ``op_it_space_splits``: one symbol per
         stride coefficient seen across this buffer's candidate divisions, so the
@@ -401,6 +431,19 @@ class CoreDivisionBuffer(LifetimeBoundBuffer):
             key: sympy.Symbol(f"split_{self.name}_{key}", integer=True, positive=True)
             for key in keys
         }
+
+
+def tile_count_symbol(buffer_name: str, axis: sympy.Symbol) -> sympy.Symbol:
+    """The objective symbol for the coarse-tile count ``buffer_name`` takes on
+    ``axis`` (see :attr:`CoreDivisionBuffer.sym_tile_counts`). One constructor
+    so the declaration and the engine's binding agree on name and assumptions,
+    as :func:`division_symbol` does for the division index.
+
+    ``positive`` rather than ``nonnegative``: a tile count is at least 1 (the
+    untiled binding), and sympy needs that to keep an expression dividing by it
+    from being rewritten around a possible zero.
+    """
+    return sympy.Symbol(f"tiles_{buffer_name}_{axis}", integer=True, positive=True)
 
 
 def division_symbol(buffer_name: str) -> sympy.Symbol:

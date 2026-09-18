@@ -1178,6 +1178,33 @@ def undeclared_splits(division: CoreDivision, sym_core_divs: dict) -> set:
     return set(division.splits) - set(sym_core_divs)
 
 
+def undeclared_tile_axes(
+    space: "OpSplitSpace", tiling: TileSpec, sym_tile_counts: dict
+) -> set[int]:
+    """The output host dims ``tiling`` cuts that ``sym_tile_counts`` declares no
+    symbol for, as :func:`undeclared_splits` does for a division's splits.
+
+    Reported as host dims rather than axes because the two ways a level can go
+    unpriced are the same failure and one of them has no axis to name: the
+    space could not line the host dim up with an iteration axis at all
+    (``axis_by_host_dim``), or it could and the declaration was built without
+    it. Either way :meth:`SaCoOptimizingSolver._build_score_fn` prices that
+    level at the symbol default of 1, which reads as *untiled* -- so an
+    undeclared tiling is not a smaller price but the wrong one.
+
+    Reduction levels are skipped: v1 tiles output axes only, and
+    :meth:`OpSplitSpace.admits_tiling` refuses a spec carrying one.
+    """
+    missing = set()
+    for level in tiling.axes:
+        if level.is_reduction:
+            continue
+        axis = space.axis_by_host_dim.get(level.host_dim)
+        if axis is None or axis not in sym_tile_counts:
+            missing.add(level.host_dim)
+    return missing
+
+
 @dataclasses.dataclass
 class OpSplitSpace:
     """One op's legal core divisions as a space to move in, not a list.

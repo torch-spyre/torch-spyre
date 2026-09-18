@@ -68,6 +68,7 @@ from torch_spyre._inductor.scratchpad.sa_cooptimizer import (
 from torch_spyre._inductor.work_division import (
     OpSplitSpace,
     undeclared_splits,
+    undeclared_tile_axes,
 )
 from torch_spyre._inductor.wsr.enumerate_tilings import TilingSpace
 from torch_spyre._inductor.scratchpad.permutation_layout import (
@@ -1239,6 +1240,41 @@ class CostExprScoringTest(TestCase):
             utils.to_fixed_us((4 * 10 + 2 * 100 + 2 * 1000) / 1000),
         )
 
+    def test_the_tile_count_symbol_drives_the_score(self):
+        # The tiling half of the two tests above: a chosen ``TileSpec`` reaches
+        # the scorer through the per-axis symbol its buffer declares, and an
+        # axis no level cuts values at 1 rather than dropping out.
+        buf = _cdbuf("A", [], {})
+        buf.division_space = _two_axis_space(tiling=_tiling_space({0: [2, 4], 1: [2]}))
+        solver = SaCoOptimizingSolver([buf], 1 << 30, 128)
+        syms = buf.sym_tile_counts
+        # One per dim the space offers a level on, not one per axis: an axis
+        # nothing can tile carries no decision to price.
+        self.assertEqual(set(syms), {_AXIS_0, _AXIS_1})
+        cost_expr = syms[_AXIS_0] * 10 + syms[_AXIS_1] * 100
+        solver.plan_layout_and_core_divisions(cost_expr)
+        self.assertIsNotNone(solver._score_fn)
+        untiled = _config(CoreDivision(splits={_AXIS_0: 2}))
+        tiled = _config(CoreDivision(splits={_AXIS_0: 2}, tiling=_TILE_4))
+        self.assertEqual(
+            solver._score_fn([untiled], frozenset()),
+            utils.to_fixed_us((10 + 100) / 1000),
+        )
+        self.assertEqual(
+            solver._score_fn([tiled], frozenset()),
+            utils.to_fixed_us((4 * 10 + 100) / 1000),
+        )
+
+    def test_a_space_without_tilings_declares_no_tile_symbol(self):
+        # Which is what every engine but this one gets, and what this one gets
+        # with ``config.auto_coarse_tiling`` off -- so the expression is the one
+        # it was before tile symbols existed, and parity holds by construction
+        # rather than by substitution.
+        plain = _cdbuf("A", [], {})
+        self.assertEqual(plain.sym_tile_counts, {})
+        plain.division_space = _two_axis_space()
+        self.assertEqual(plain.sym_tile_counts, {})
+
     def test_unrecognized_free_symbol_falls_back_to_memory_only(self):
         # A dynamic-shape symbol (or anything else the allocator's build could
         # have left in) that isn't one of these buffers' own symbols must not
@@ -1399,6 +1435,39 @@ class ConfigDeclarationTest(TestCase):
             CoreDivision(splits={99: 2, 7: 2}, reduction_syms=frozenset([7]))
         )
         self.assertEqual(undeclared_splits(stray.division, declared), {99, 7})
+
+    def test_a_tile_level_outside_the_declaration_is_named(self):
+        space = _two_axis_space(tiling=_tiling_space())
+        declared = {_AXIS_0: sympy.Symbol("tiles_A_d0")}
+        # Host dim 0 maps to _AXIS_0 and is declared; 1 maps to _AXIS_1 and is
+        # not; 9 maps to no axis at all. The last two are the two ways a level
+        # goes unpriced and both have to be reported.
+        spec = TileSpec(
+            (
+                TileAxis(host_dim=0, count=2),
+                TileAxis(host_dim=1, count=2),
+                TileAxis(host_dim=9, count=2),
+            )
+        )
+        self.assertEqual(undeclared_tile_axes(space, spec, declared), {1, 9})
+
+    def test_a_reduction_level_is_not_asked_for_a_declaration(self):
+        # v1 tiles output axes only, and `admits_tiling` refuses a reduction
+        # level -- so one reaching here is not an undeclared price, it is a spec
+        # nothing generated. Reporting it would name a host dim in the *other*
+        # frame, which `axis_by_host_dim` does not index.
+        space = _two_axis_space(tiling=_tiling_space())
+        spec = TileSpec((TileAxis(host_dim=0, count=2, is_reduction=True),))
+        self.assertEqual(undeclared_tile_axes(space, spec, {}), set())
+
+    def test_a_tileable_dim_with_no_iteration_axis_is_refused(self):
+        # The space offers a level on host dim 3, which lines up with no
+        # iteration axis -- so a config taking it would price at 1 (untiled).
+        buf = _cdbuf("A", [], {})
+        buf.division_space = _two_axis_space(tiling=_tiling_space({0: [2], 3: [2]}))
+        solver = SaCoOptimizingSolver([buf], 1 << 30, 128)
+        with self.assertRaisesRegex(AssertionError, "priced as untiled"):
+            solver._precompute_topology()
 
     def test_a_repeated_split_map_stays_a_menu_entry_of_its_own(self):
         # A menu that carries one split map twice is a clone's: its entries are

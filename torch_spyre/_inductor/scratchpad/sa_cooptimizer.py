@@ -57,6 +57,7 @@ from torch_spyre._inductor.work_division import (
     OpSplitSpace,
     ResidencyEdge,
     undeclared_splits,
+    undeclared_tile_axes,
 )
 from torch_spyre._inductor.scratchpad.firstfit_bestfit_solver import (
     FirstFitLayoutSolver,
@@ -240,6 +241,18 @@ class DivisionConfig:
         """Loop tiles the op's own output is cut into, over output axes only --
         the second factor its per-core footprint shrinks by."""
         return self.division.tiling.output_tile_count
+
+
+def _tile_count_on(tiling: "TileSpec", host_dim: int) -> int:
+    """``tiling``'s tile count on one output host dim, 1 where it cuts none.
+
+    1 is the untiled binding rather than a missing value: a level's count is the
+    factor an axis's extent is cut by, so an axis with no level is cut once.
+    """
+    for level in tiling.axes:
+        if not level.is_reduction and level.host_dim == host_dim:
+            return level.count
+    return 1
 
 
 def _one_axis_apart(left: "CoreDivision", right: "CoreDivision") -> bool:
@@ -846,6 +859,17 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
                 value_of[sym] = lambda chosen, resident, idx=idx, key=key: (
                     chosen[idx].splits.get(key, 1)
                 )
+            # The coarse tiling's shape, per axis. A ``TileSpec`` carries its
+            # levels by host dim and the declaration is keyed by the iteration
+            # axis each cuts, so the map frozen alongside it is what bridges
+            # them. An axis no level cuts values at 1, which is the untiled
+            # binding and the reason nothing changes while no tiling is chosen.
+            for host_dim, axis in self._tile_axis_by_host_dim[idx].items():
+                value_of[self._sym_tile_counts[idx][axis]] = (
+                    lambda chosen, resident, idx=idx, host_dim=host_dim: _tile_count_on(
+                        chosen[idx].tiling, host_dim
+                    )
+                )
         try:
             free = sorted(cost_expr.free_symbols, key=str)
             if any(sym not in value_of for sym in free):
@@ -1102,10 +1126,18 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         identity of its own.
         """
         self._sym_core_divs = [b.sym_core_divs for b in self._bufs]
+        self._sym_tile_counts = [b.sym_tile_counts for b in self._bufs]
+        # Per buffer: the iteration axis each tileable output host dim cuts, so
+        # a score can read a chosen ``TileSpec``'s level back out per axis. The
+        # empty map is the ordinary case -- every engine but this one, and this
+        # one with ``config.auto_coarse_tiling`` off.
+        self._tile_axis_by_host_dim: list[dict[int, sympy.Symbol]] = []
         # Per buffer: the menu's keys by position, and the config per key.
         self._menu: list[tuple[list[tuple], dict]] = []
         self._sources: list[_DivisionSource] = []
-        for buf, declared in zip(self._bufs, self._sym_core_divs):
+        for buf, declared, declared_tiles in zip(
+            self._bufs, self._sym_core_divs, self._sym_tile_counts
+        ):
             keys: list[tuple] = []
             by_key: dict = {}
             configs: list[DivisionConfig] = []
@@ -1118,14 +1150,45 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
                     "expression declares no symbol for, so those splits would be "
                     "priced as unsplit"
                 )
+                undeclared_tiles = (
+                    undeclared_tile_axes(buf.division_space, cd.tiling, declared_tiles)
+                    if buf.division_space is not None
+                    else set()
+                )
+                assert not undeclared_tiles, (
+                    f"buffer {buf.name}: candidate {index} tiles output dims "
+                    f"{sorted(undeclared_tiles)}, which the cost expression "
+                    "declares no symbol for, so those levels would be priced as "
+                    "untiled"
+                )
                 canonical = _canonical_key(cd)
                 config = DivisionConfig(cd, index, canonical in split_maps)
                 split_maps.add(canonical)
                 keys.append(config.key)
                 by_key[config.key] = config
                 configs.append(config)
-            self._menu.append((keys, by_key))
             space = buf.division_space
+            tiling_space = space.tiling if space is not None else None
+            tileable_dims = tiling_space.output_dims if tiling_space is not None else []
+            axis_by_host_dim = {
+                host_dim: axis
+                for host_dim in tileable_dims
+                if (axis := cast(OpSplitSpace, space).axis_by_host_dim.get(host_dim))
+                in declared_tiles
+            }
+            # Every dim the space offers a level on must be one the declaration
+            # prices. Not implied by the assertion above, which can only see the
+            # menu -- and no engine enumerates tilings, so that one is vacuous
+            # until one does. This one is not: the generated configs are drawn
+            # from exactly these dims.
+            assert len(axis_by_host_dim) == len(tileable_dims), (
+                f"buffer {buf.name}: its tiling space offers levels on output "
+                f"dims {tileable_dims} but only {sorted(axis_by_host_dim)} line "
+                "up with an iteration axis the cost expression declares, so a "
+                "level on the rest would be priced as untiled"
+            )
+            self._tile_axis_by_host_dim.append(axis_by_host_dim)
+            self._menu.append((keys, by_key))
             assert space is None or len(split_maps) == len(keys), (
                 f"buffer {buf.name}: its menu repeats a split map, but its "
                 "generated configs are keyed by one, so a generated division "
