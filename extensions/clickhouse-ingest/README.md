@@ -25,11 +25,28 @@ uses. Pin a tag, not `@main`.
 
 | module | contents |
 |---|---|
-| `schema.py` | the table model: columns, order, `qualified()` |
+| `schema.py` | the table model: columns, order, DDL CHECK sets, `qualified()`, dep-entry helpers |
 | `identity.py` | `v2_run_id`, `v2_test_case_id`, `v2_component`, `v2_canonical_arch` |
 | `client.py` | `get_client`, `v2_database`, `v2_tables_present` |
 | `v2_writer.py` | `insert_v2`, `v2_already_ingested` |
 | `junit.py` | JUnit helpers + CI run-coordinate resolution |
+
+## Tables modelled
+
+`test_cases`, `test_case_runs`, `benchmarks`, `benchmark_runs` (DDL: `functional_tests_v2.sql`)
+and `artifacts`, `artifact_refs`, `artifact_tags`, `artifact_results` (DDL: `artifacts_v2.sql`).
+The DDL itself is applied by the CI pipeline that owns the warehouse, not from this repo.
+
+The model holds columns, order and the DDL's CHECK sets — not the DDL itself. `TABLES` is pinned
+as an exact set by `tests/test_schema.py`, so adding a table to the DDL without modelling it here
+fails rather than drifting. Column order was verified against the live `spyre_v2` tables when the
+artifact four were added.
+
+It also states the **dep-entry shape**, which is the one contract a reader cannot infer:
+`artifacts.identity_deps` / `context_deps` entries are `"<component>@<id12>"` (or `base=<sha>`,
+or a bare name), *not* uuids — `id12` is a hash input to `artifact_id`, so the id cannot be
+recovered from the string. Use `dep_component()` / `dep_id12()` and resolve via `props['id12']`.
+A dashboard route that assumed uuids matched zero rows and rendered nothing, with no error.
 
 ## What is deliberately NOT here
 

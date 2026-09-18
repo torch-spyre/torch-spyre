@@ -603,11 +603,24 @@ class ScratchpadAllocator:
             # (_is_read_advancing_anywhere, e.g. a fixed-write full buffer
             # copied into a nested tile every outer iteration).
             return "tiled (advancing)"
-        restickify = self._restickify_barrier(
-            graph, name, uses, lx_relayout_plans=lx_relayout_plans
-        )
-        if restickify is not None:
-            return restickify
+        if division_is_fixed:
+            # On the joint path this same geometric check runs again per
+            # candidate division pair, as part of the solver's own residency
+            # gate (``_cd_parent_matches`` / ``constrain_residency``): a
+            # restickify reader is an ordinary consumer edge there, and an
+            # edge with no compatible pair already forces ``in_buffer`` false
+            # (see ``constrain_residency``'s docstring). Applying the barrier
+            # here too would instead test the read against whatever division
+            # the op happens to carry on ``iteration_space_ownership`` before
+            # the solver has chosen anything -- stale, provisional, and
+            # unrelated to any candidate the solver could actually pick -- and
+            # can reject a buffer the solver would otherwise place correctly
+            # (issue #4655).
+            restickify = self._restickify_barrier(
+                graph, name, uses, lx_relayout_plans=lx_relayout_plans
+            )
+            if restickify is not None:
+                return restickify
         # PR3683's guard: reject residency outright rather than let LX context
         # switching (dump/restore around the risky call) handle it. Kept behind
         # the flag, not deleted, so the old (conservative) and new (context
@@ -698,9 +711,13 @@ class ScratchpadAllocator:
             return "use is not rewritable to the clone"
         if buffer_not_read_in_full(graph, name):
             return "partial/offset read"
-        restickify = self._restickify_barrier(graph, name, uses)
-        if restickify is not None:
-            return restickify
+        if division_is_fixed:
+            # See the matching comment in _buffer_residency_reason: on the
+            # joint path this is redundant with (and less accurate than) the
+            # solver's own per-candidate residency gate.
+            restickify = self._restickify_barrier(graph, name, uses)
+            if restickify is not None:
+                return restickify
         if division_is_fixed and (ncores or {}).get(name, -1) < 0:
             reason = (ncores_reasons or {}).get(name, "core div mismatch")
             return f"core div mismatch: {reason}"
@@ -804,9 +821,16 @@ class ScratchpadAllocator:
         *is* this buffer's producer) is a normal core-local write and takes the
         ordinary residency path. ``is_restickify_op`` shares the coordinate
         predicate used by codegen, so residency never depends on an operation's
-        display name. Both placement and joint allocators use this gate; the
-        joint solver still checks the selected producer/consumer views before
-        allowing residency.
+        display name.
+
+        Only the placement path (``division_is_fixed=True``) calls this: it
+        has one committed division per op and no other mechanism to catch a
+        cross-core restickify read. The joint path skips it -- the solver's
+        own per-candidate residency gate (``_cd_parent_matches`` /
+        ``constrain_residency``) subsumes it there, correctly, over every
+        division the solver could actually choose (see the call sites for
+        why testing it here, against whatever division the op happens to
+        carry pre-solve, is not just redundant but wrong; issue #4655).
         """
         readers = [
             graph.operations[u]

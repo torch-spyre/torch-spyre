@@ -20,10 +20,14 @@ and the product-repo ingests. A drift does not raise; it silently stops rows joi
 
 import uuid
 
+import pytest
+
 from spyre_clickhouse_ingest import (
     V2_NAMESPACE,
     v2_canonical_arch,
     v2_component,
+    v2_artifact_id,
+    v2_gha_artifact_id,
     v2_run_id,
     v2_test_case_id,
 )
@@ -104,3 +108,83 @@ def test_component_default_is_caller_supplied():
     assert v2_component(_Args(component=""), "hf-adapters") == "hf-adapters"
     assert v2_component(_Args(), "spyre-inference") == "spyre-inference"
     assert v2_component(_Args(component="torch-spyre"), "hf-adapters") == "torch-spyre"
+
+
+# ── artifact_id ─────────────────────────────────────────────────────────────────────────
+# These goldens are REAL artifact_ids read from the live warehouse, not values this
+# implementation produced. That is the point: three writers computed them (this library, an
+# inlined python3 script in the Jenkins-side Groovy writer, and a product ingest's own copy),
+# so pinning what is already STORED is what proves centralising the function re-keys nothing.
+
+ARTIFACT_ID_GOLDENS = [
+    # (component, artifact_name, id12, arch, expected)
+    (
+        "spyre-inference",
+        "spyre-inference-minimal",
+        "a6e224825fcf",
+        "amd64",
+        "1eef58cc-b88b-5597-97c6-6b27b8b4796f",
+    ),
+    (
+        "spyre-inference",
+        "spyre-inference-dev",
+        "492504101aed",
+        "amd64",
+        "91b58b7a-0ead-5700-bf72-2e7257322ba6",
+    ),
+    (
+        "hf-adapters",
+        "hf-adapters-minimal",
+        "be1d78c2cdfd",
+        "amd64",
+        "23aa0294-e2ff-5f48-8aca-ecd318b23a0e",
+    ),
+    # ppc64le is NOT folded, unlike amd64 -- covers both sides of v2_canonical_arch.
+    (
+        "spyre-backend",
+        "spyre-backend-minimal",
+        "cb0f2bca6527",
+        "ppc64le",
+        "d9c4fe94-894f-50f3-85f8-e9272acfedb1",
+    ),
+]
+
+
+@pytest.mark.parametrize("component,name,id12,arch,expected", ARTIFACT_ID_GOLDENS)
+def test_artifact_id_golden(component, name, id12, arch, expected):
+    assert v2_artifact_id(component, name, id12, arch) == expected
+
+
+def test_artifact_id_folds_arch_inside_the_hash():
+    # An artifact labelled amd64 by Jenkins and x86_64 by GHA is ONE artifact.
+    a = v2_artifact_id(
+        "spyre-inference", "spyre-inference-dev", "492504101aed", "amd64"
+    )
+    b = v2_artifact_id(
+        "spyre-inference", "spyre-inference-dev", "492504101aed", "x86_64"
+    )
+    assert a == b == "91b58b7a-0ead-5700-bf72-2e7257322ba6"
+
+
+def test_artifact_id_refuses_an_incomplete_key():
+    # A blank component or arch would hash to a real uuid that every incomplete artifact
+    # shares -- worse than a blank, which a writer can detect and skip.
+    assert v2_artifact_id("", "n", "i", "amd64") == ""
+    assert v2_artifact_id("c", "n", "i", "") == ""
+    # id12 is legitimately blank for a GHA-derived identity, so it is NOT required.
+    assert v2_artifact_id("c", "n", "", "amd64") != ""
+
+
+def test_gha_artifact_id_is_install_order_independent():
+    # Install order is incidental; an order-sensitive hash would mint a fresh identity for a
+    # re-run of the same environment.
+    a = v2_gha_artifact_id("torch-spyre", "base:1", "pkg-b pkg-a", "amd64")
+    b = v2_gha_artifact_id("torch-spyre", "base:1", "pkg-a,pkg-b", "amd64")
+    assert a == b != ""
+
+
+def test_gha_artifact_id_lands_in_the_same_column_as_a_built_one():
+    # It is an artifact_id, so it must be a uuid on the same derivation -- not a second,
+    # GHA-shaped identity that artifact_results would need another column for.
+    got = v2_gha_artifact_id("torch-spyre", "base:1", "pkg-a", "amd64")
+    assert uuid.UUID(got).version == 5
