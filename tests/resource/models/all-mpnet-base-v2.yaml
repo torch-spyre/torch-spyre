@@ -1,0 +1,1422 @@
+model: all-mpnet-base-v2
+defaults:
+  dtype: fp16
+  seed: 123
+  atol: 0.005
+  rtol: 0.005
+cases:
+  - name: torch.ne.1
+    op: torch.ne
+    inputs:
+      - tensor:
+          shape: [3072, 3]
+          stride: [3, 1]
+          storage_offset: 0
+          dtype: torch.int64
+          device: cuda:0
+          init: randint
+          init_args:
+            high: 1000
+      - value: 1
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/models/mpnet/modeling_mpnet.py#L879 in create_position_ids_from_input_ids,
+      code: mask = input_ids.ne(padding_idx).int()'
+    marks: constant
+  - name: torch.int.1
+    op: torch.int
+    inputs:
+      - tensor:
+          shape: [3072, 3]
+          stride: [3, 1]
+          storage_offset: 0
+          dtype: torch.bool
+          device: cuda:0
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/models/mpnet/modeling_mpnet.py#L879 in create_position_ids_from_input_ids,
+      code: mask = input_ids.ne(padding_idx).int()'
+  - name: torch.cumsum.1
+    op: torch.cumsum
+    inputs:
+      - tensor:
+          shape: [3072, 3]
+          stride: [3, 1]
+          storage_offset: 0
+          dtype: torch.int32
+          device: cuda:0
+          init: randint
+          init_args:
+            high: 1000
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/models/mpnet/modeling_mpnet.py#L880 in create_position_ids_from_input_ids,
+      code: incremental_indices = torch.cumsum(mask, dim=1).type_as(mask) * mask'
+    kwmap:
+      dim: 1
+  - name: torch.type_as.1
+    op: torch.type_as
+    inputs:
+      - tensor:
+          shape: [3072, 3]
+          stride: [3, 1]
+          storage_offset: 0
+          dtype: torch.int64
+          device: cuda:0
+          init: randint
+          init_args:
+            high: 1000
+      - tensor:
+          shape: [3072, 3]
+          stride: [3, 1]
+          storage_offset: 0
+          dtype: torch.int32
+          device: cuda:0
+          init: randint
+          init_args:
+            high: 1000
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/models/mpnet/modeling_mpnet.py#L880 in create_position_ids_from_input_ids,
+      code: incremental_indices = torch.cumsum(mask, dim=1).type_as(mask) * mask'
+  - name: torch.mul.1
+    op: torch.mul
+    inputs:
+      - tensor:
+          shape: [3072, 3]
+          stride: [3, 1]
+          storage_offset: 0
+          dtype: torch.int32
+          device: cuda:0
+          init: randint
+          init_args:
+            high: 1000
+      - tensor:
+          shape: [3072, 3]
+          stride: [3, 1]
+          storage_offset: 0
+          dtype: torch.int32
+          device: cuda:0
+          init: randint
+          init_args:
+            high: 1000
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/models/mpnet/modeling_mpnet.py#L880 in create_position_ids_from_input_ids,
+      code: incremental_indices = torch.cumsum(mask, dim=1).type_as(mask) * mask'
+  - name: torch.long.1
+    op: torch.long
+    inputs:
+      - tensor:
+          shape: [3072, 3]
+          stride: [3, 1]
+          storage_offset: 0
+          dtype: torch.int32
+          device: cuda:0
+          init: randint
+          init_args:
+            high: 1000
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/models/mpnet/modeling_mpnet.py#L881 in create_position_ids_from_input_ids,
+      code: return incremental_indices.long() + padding_idx'
+  - name: torch.add.1
+    op: torch.add
+    inputs:
+      - tensor:
+          shape: [3072, 3]
+          stride: [3, 1]
+          storage_offset: 0
+          dtype: torch.int64
+          device: cuda:0
+          init: randint
+          init_args:
+            high: 1000
+      - value: 1
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/models/mpnet/modeling_mpnet.py#L881 in create_position_ids_from_input_ids,
+      code: return incremental_indices.long() + padding_idx'
+    marks: constant
+  - name: torch.nn.functional.embedding.1
+    op: torch.nn.functional.embedding
+    inputs:
+      - tensor:
+          shape: [3072, 3]
+          stride: [3, 1]
+          storage_offset: 0
+          dtype: torch.int64
+          device: cuda:0
+          init: randint
+          init_args:
+            high: 30527
+      - tensor:
+          shape: [30527, 768]
+          stride: [768, 1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: rand
+      - value: 1
+      - value: null
+      - value: 2.0
+      - value: false
+      - value: false
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/models/mpnet/modeling_mpnet.py#L89 in forward, code: inputs_embeds
+      = self.word_embeddings(input_ids)'
+    marks: constant
+  - name: torch.nn.functional.embedding.2
+    op: torch.nn.functional.embedding
+    inputs:
+      - tensor:
+          shape: [3072, 3]
+          stride: [3, 1]
+          storage_offset: 0
+          dtype: torch.int64
+          device: cuda:0
+          init: randint
+          init_args:
+            high: 514
+      - tensor:
+          shape: [514, 768]
+          stride: [768, 1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: rand
+      - value: 1
+      - value: null
+      - value: 2.0
+      - value: false
+      - value: false
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/models/mpnet/modeling_mpnet.py#L90 in forward, code: position_embeddings
+      = self.position_embeddings(position_ids)'
+    marks: constant
+  - name: torch.add.2
+    op: torch.add
+    inputs:
+      - tensor:
+          shape: [3072, 3, 768]
+          stride: [2304, 768, 1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: rand
+      - tensor:
+          shape: [3072, 3, 768]
+          stride: [2304, 768, 1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: rand
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/models/mpnet/modeling_mpnet.py#L92 in forward, code: embeddings
+      = inputs_embeds + position_embeddings'
+  - name: torch.nn.functional.layer_norm.1
+    op: torch.nn.functional.layer_norm
+    inputs:
+      - tensor:
+          shape: [3072, 3, 768]
+          stride: [2304, 768, 1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: rand
+      - value: (768,)
+      - tensor:
+          shape: [768]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: rand
+      - tensor:
+          shape: [768]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: rand
+      - value: 1.0e-05
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/models/mpnet/modeling_mpnet.py#L93 in forward, code: embeddings
+      = self.LayerNorm(embeddings)'
+    marks: constant
+  - name: torch.nn.functional.dropout.1
+    op: torch.nn.functional.dropout
+    inputs:
+      - tensor:
+          shape: [3072, 3, 768]
+          stride: [2304, 768, 1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: rand
+      - value: 0.1
+      - value: false
+      - value: false
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/models/mpnet/modeling_mpnet.py#L94 in forward, code: embeddings
+      = self.dropout(embeddings)'
+    marks: constant
+  - name: torch.to.1
+    op: torch.to
+    inputs:
+      - tensor:
+          shape: [3072, 3]
+          stride: [3, 1]
+          storage_offset: 0
+          dtype: torch.int64
+          device: cuda:0
+          init: randint
+          init_args:
+            high: 1000
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/masking_utils.py#L824 in _preprocess_mask_arguments, code: attention_mask
+      = attention_mask.to(device=inputs_embeds.device, dtype=torch.bool)'
+    kwmap:
+      device: cuda:0
+      dtype: torch.bool
+  - name: torch.arange.1
+    op: torch.arange
+    inputs:
+      - value: 3072
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/masking_utils.py#L507 in sdpa_mask, code: batch_arange = torch.arange(batch_size,
+      device=device)'
+    marks: constant
+    kwmap:
+      device: cuda:0
+  - name: torch.add.3
+    op: torch.add
+    inputs:
+      - tensor:
+          shape: [3]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int64
+          device: cuda:0
+          init: randint
+          init_args:
+            high: 1000
+      - value: 0
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/masking_utils.py#L509 in sdpa_mask, code: q_arange = torch.arange(q_length,
+      device=device) + q_offset'
+    marks: constant
+  - name: torch.getitem.1
+    op: torch.getitem
+    inputs:
+      - tensor:
+          shape: [3072]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int64
+          device: cuda:0
+          init: randint
+          init_args:
+            high: 1000
+      - py: (slice(None, None, None), None, None, None)
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/masking_utils.py#L364 in _non_vmap_expansion_sdpa, code: batch_indices
+      = batch_indices[:, None, None, None]'
+    marks: constant
+  - name: torch.getitem.2
+    op: torch.getitem
+    inputs:
+      - tensor:
+          shape: [3]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int64
+          device: cuda:0
+          init: randint
+          init_args:
+            high: 1000
+      - py: (None, None, slice(None, None, None), None)
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/masking_utils.py#L366 in _non_vmap_expansion_sdpa, code: q_indices
+      = q_indices[None, None, :, None]'
+    marks: constant
+  - name: torch.new_ones.1
+    op: torch.new_ones
+    inputs:
+      - tensor:
+          shape: [1, 1, 3, 1]
+          stride: [3, 3, 1, 1]
+          storage_offset: 0
+          dtype: torch.int64
+          device: cuda:0
+          init: randint
+          init_args:
+            high: 1000
+      - value: ()
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/masking_utils.py#L54 in and_mask, code: result = q_idx.new_ones((),
+      dtype=torch.bool)'
+    marks: constant
+    kwmap:
+      dtype: torch.bool
+  - name: torch.ge.1
+    op: torch.ge
+    inputs:
+      - tensor:
+          shape: [1, 1, 3, 1]
+          stride: [3, 3, 1, 1]
+          storage_offset: 0
+          dtype: torch.int64
+          device: cuda:0
+          init: randint
+          init_args:
+            high: 1000
+      - value: 0
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/masking_utils.py#L89 in bidirectional_mask_function, code: return
+      q_idx >= 0'
+    marks: constant
+  - name: torch.to.2
+    op: torch.to
+    inputs:
+      - tensor:
+          shape: [1, 1, 3, 1]
+          stride: [3, 3, 1, 1]
+          storage_offset: 0
+          dtype: torch.bool
+          device: cuda:0
+      - value: cuda:0
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/masking_utils.py#L56 in and_mask, code: result = result & mask(batch_idx,
+      head_idx, q_idx, kv_idx).to(result.device)'
+    marks: constant
+  - name: torch.bitwise_and.1
+    op: torch.bitwise_and
+    inputs:
+      - tensor:
+          shape: []
+          stride: []
+          storage_offset: 0
+          dtype: torch.bool
+          device: cuda:0
+      - tensor:
+          shape: [1, 1, 3, 1]
+          stride: [3, 3, 1, 1]
+          storage_offset: 0
+          dtype: torch.bool
+          device: cuda:0
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/masking_utils.py#L56 in and_mask, code: result = result & mask(batch_idx,
+      head_idx, q_idx, kv_idx).to(result.device)'
+  - name: torch.getitem.3
+    op: torch.getitem
+    inputs:
+      - tensor:
+          shape: [3072, 3]
+          stride: [3, 1]
+          storage_offset: 0
+          dtype: torch.bool
+          device: cuda:0
+      - tensor_list:
+          - shape: [3072, 1, 1, 1]
+            stride: [1, 1, 1, 1]
+            storage_offset: 0
+            dtype: torch.int64
+            device: cuda:0
+            init: randint
+            init_args:
+              high: 3072
+          - shape: [1, 1, 1, 3]
+            stride: [3, 3, 3, 1]
+            storage_offset: 0
+            dtype: torch.int64
+            device: cuda:0
+            init: randint
+            init_args:
+              high: 3
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/masking_utils.py#L177 in inner_mask, code: return padding_mask[batch_idx,
+      kv_idx]'
+    marks: constant
+  - name: torch.to.3
+    op: torch.to
+    inputs:
+      - tensor:
+          shape: [3072, 1, 1, 3]
+          stride: [3, 3, 3, 1]
+          storage_offset: 0
+          dtype: torch.bool
+          device: cuda:0
+      - value: cuda:0
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/masking_utils.py#L56 in and_mask, code: result = result & mask(batch_idx,
+      head_idx, q_idx, kv_idx).to(result.device)'
+    marks: constant
+  - name: torch.bitwise_and.2
+    op: torch.bitwise_and
+    inputs:
+      - tensor:
+          shape: [1, 1, 3, 1]
+          stride: [3, 3, 1, 1]
+          storage_offset: 0
+          dtype: torch.bool
+          device: cuda:0
+      - tensor:
+          shape: [3072, 1, 1, 3]
+          stride: [3, 3, 3, 1]
+          storage_offset: 0
+          dtype: torch.bool
+          device: cuda:0
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/masking_utils.py#L56 in and_mask, code: result = result & mask(batch_idx,
+      head_idx, q_idx, kv_idx).to(result.device)'
+  - name: torch.Tensor.expand.1
+    op: torch.Tensor.expand
+    inputs:
+      - tensor:
+          shape: [3072, 1, 3, 3]
+          stride: [9, 9, 3, 1]
+          storage_offset: 0
+          dtype: torch.bool
+          device: cuda:0
+      - value: 3072
+      - value: -1
+      - value: 3
+      - value: 3
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/masking_utils.py#L518 in sdpa_mask, code: attention_mask = attention_mask.expand(batch_size,
+      -1, q_length, kv_length)'
+    marks: constant
+  - name: torch.tensor.1
+    op: torch.tensor
+    inputs:
+      - value: 0.0
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/masking_utils.py#L603 in eager_mask, code: mask = torch.where(mask,
+      torch.tensor(0.0, device=mask.device, dtype=dtype), min_dtype)'
+    marks: constant
+    kwmap:
+      device: cuda:0
+      dtype: torch.float16
+  - name: torch.where.1
+    op: torch.where
+    inputs:
+      - tensor:
+          shape: [3072, 1, 3, 3]
+          stride: [9, 9, 3, 1]
+          storage_offset: 0
+          dtype: torch.bool
+          device: cuda:0
+      - tensor:
+          shape: []
+          stride: []
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: rand
+      - value: -65504.0
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/masking_utils.py#L603 in eager_mask, code: mask = torch.where(mask,
+      torch.tensor(0.0, device=mask.device, dtype=dtype), min_dtype)'
+    marks: constant
+  - name: torch.arange.2
+    op: torch.arange
+    inputs:
+      - value: 3
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/models/mpnet/modeling_mpnet.py#L318 in compute_position_bias,
+      code: context_position = torch.arange(qlen, dtype=torch.long)[:, None]'
+    marks:
+      - constant
+      - tensorsoncpu
+    kwmap:
+      dtype: torch.int64
+  - name: torch.getitem.4
+    op: torch.getitem
+    inputs:
+      - tensor:
+          shape: [3]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int64
+          device: cpu
+          init: randint
+          init_args:
+            high: 1000
+      - py: (slice(None, None, None), None)
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/models/mpnet/modeling_mpnet.py#L318 in compute_position_bias,
+      code: context_position = torch.arange(qlen, dtype=torch.long)[:, None]'
+    marks:
+      - constant
+      - tensorsoncpu
+  - name: torch.sub.1
+    op: torch.sub
+    inputs:
+      - tensor:
+          shape: [1, 3]
+          stride: [3, 1]
+          storage_offset: 0
+          dtype: torch.int64
+          device: cpu
+          init: randint
+          init_args:
+            high: 1000
+      - tensor:
+          shape: [3, 1]
+          stride: [1, 1]
+          storage_offset: 0
+          dtype: torch.int64
+          device: cpu
+          init: randint
+          init_args:
+            high: 1000
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/models/mpnet/modeling_mpnet.py#L321 in compute_position_bias,
+      code: relative_position = memory_position - context_position'
+    marks: tensorsoncpu
+  - name: torch.neg.1
+    op: torch.neg
+    inputs:
+      - tensor:
+          shape: [3, 3]
+          stride: [3, 1]
+          storage_offset: 0
+          dtype: torch.int64
+          device: cpu
+          init: randint
+          init_args:
+            high: 1000
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/models/mpnet/modeling_mpnet.py#L333 in relative_position_bucket,
+      code: n = -relative_position'
+    marks: tensorsoncpu
+  - name: torch.lt.1
+    op: torch.lt
+    inputs:
+      - tensor:
+          shape: [3, 3]
+          stride: [3, 1]
+          storage_offset: 0
+          dtype: torch.int64
+          device: cpu
+          init: randint
+          init_args:
+            high: 1000
+      - value: 0
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/models/mpnet/modeling_mpnet.py#L336 in relative_position_bucket,
+      code: ret += (n < 0).to(torch.long) * num_buckets'
+    marks:
+      - constant
+      - tensorsoncpu
+  - name: torch.to.4
+    op: torch.to
+    inputs:
+      - tensor:
+          shape: [3, 3]
+          stride: [3, 1]
+          storage_offset: 0
+          dtype: torch.bool
+          device: cpu
+      - value: torch.int64
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/models/mpnet/modeling_mpnet.py#L336 in relative_position_bucket,
+      code: ret += (n < 0).to(torch.long) * num_buckets'
+    marks:
+      - constant
+      - tensorsoncpu
+  - name: torch.mul.2
+    op: torch.mul
+    inputs:
+      - tensor:
+          shape: [3, 3]
+          stride: [3, 1]
+          storage_offset: 0
+          dtype: torch.int64
+          device: cpu
+          init: randint
+          init_args:
+            high: 1000
+      - value: 16
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/models/mpnet/modeling_mpnet.py#L336 in relative_position_bucket,
+      code: ret += (n < 0).to(torch.long) * num_buckets'
+    marks:
+      - constant
+      - tensorsoncpu
+  - name: torch.add.4
+    op: torch.add
+    inputs:
+      - value: 0
+      - tensor:
+          shape: [3, 3]
+          stride: [3, 1]
+          storage_offset: 0
+          dtype: torch.int64
+          device: cpu
+          init: randint
+          init_args:
+            high: 1000
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/models/mpnet/modeling_mpnet.py#L336 in relative_position_bucket,
+      code: ret += (n < 0).to(torch.long) * num_buckets'
+    marks:
+      - constant
+      - tensorsoncpu
+  - name: torch.abs.1
+    op: torch.abs
+    inputs:
+      - tensor:
+          shape: [3, 3]
+          stride: [3, 1]
+          storage_offset: 0
+          dtype: torch.int64
+          device: cpu
+          init: randint
+          init_args:
+            high: 1000
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/models/mpnet/modeling_mpnet.py#L337 in relative_position_bucket,
+      code: n = torch.abs(n)'
+    marks: tensorsoncpu
+  - name: torch.float.1
+    op: torch.float
+    inputs:
+      - tensor:
+          shape: [3, 3]
+          stride: [3, 1]
+          storage_offset: 0
+          dtype: torch.int64
+          device: cpu
+          init: randint
+          init_args:
+            high: 1000
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/models/mpnet/modeling_mpnet.py#L343 in relative_position_bucket,
+      code: torch.log(n.float() / max_exact) / math.log(max_distance / max_exact) * (num_buckets - max_exact)'
+    marks: tensorsoncpu
+  - name: torch.truediv.1
+    op: torch.truediv
+    inputs:
+      - tensor:
+          shape: [3, 3]
+          stride: [3, 1]
+          storage_offset: 0
+          dtype: torch.float32
+          device: cpu
+          init: rand
+      - value: 8
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/models/mpnet/modeling_mpnet.py#L343 in relative_position_bucket,
+      code: torch.log(n.float() / max_exact) / math.log(max_distance / max_exact) * (num_buckets - max_exact)'
+    marks:
+      - fp32operation
+      - constant
+      - tensorsoncpu
+  - name: torch.log.1
+    op: torch.log
+    inputs:
+      - tensor:
+          shape: [3, 3]
+          stride: [3, 1]
+          storage_offset: 0
+          dtype: torch.float32
+          device: cpu
+          init: rand
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/models/mpnet/modeling_mpnet.py#L343 in relative_position_bucket,
+      code: torch.log(n.float() / max_exact) / math.log(max_distance / max_exact) * (num_buckets - max_exact)'
+    marks:
+      - fp32operation
+      - tensorsoncpu
+  - name: torch.truediv.2
+    op: torch.truediv
+    inputs:
+      - tensor:
+          shape: [3, 3]
+          stride: [3, 1]
+          storage_offset: 0
+          dtype: torch.float32
+          device: cpu
+          init: rand
+      - value: 2.772588722239781
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/models/mpnet/modeling_mpnet.py#L343 in relative_position_bucket,
+      code: torch.log(n.float() / max_exact) / math.log(max_distance / max_exact) * (num_buckets - max_exact)'
+    marks:
+      - fp32operation
+      - constant
+      - tensorsoncpu
+  - name: torch.mul.3
+    op: torch.mul
+    inputs:
+      - tensor:
+          shape: [3, 3]
+          stride: [3, 1]
+          storage_offset: 0
+          dtype: torch.float32
+          device: cpu
+          init: rand
+      - value: 8
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/models/mpnet/modeling_mpnet.py#L343 in relative_position_bucket,
+      code: torch.log(n.float() / max_exact) / math.log(max_distance / max_exact) * (num_buckets - max_exact)'
+    marks:
+      - fp32operation
+      - constant
+      - tensorsoncpu
+  - name: torch.to.5
+    op: torch.to
+    inputs:
+      - tensor:
+          shape: [3, 3]
+          stride: [3, 1]
+          storage_offset: 0
+          dtype: torch.float32
+          device: cpu
+          init: rand
+      - value: torch.int64
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/models/mpnet/modeling_mpnet.py#L344 in relative_position_bucket,
+      code: ).to(torch.long)'
+    marks:
+      - fp32operation
+      - constant
+      - tensorsoncpu
+  - name: torch.full_like.1
+    op: torch.full_like
+    inputs:
+      - tensor:
+          shape: [3, 3]
+          stride: [3, 1]
+          storage_offset: 0
+          dtype: torch.int64
+          device: cpu
+          init: randint
+          init_args:
+            high: 1000
+      - value: 15
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/models/mpnet/modeling_mpnet.py#L346 in relative_position_bucket,
+      code: val_if_large = torch.min(val_if_large, torch.full_like(val_if_large, num_buckets - 1))'
+    marks:
+      - constant
+      - tensorsoncpu
+  - name: torch.min.1
+    op: torch.min
+    inputs:
+      - tensor:
+          shape: [3, 3]
+          stride: [3, 1]
+          storage_offset: 0
+          dtype: torch.int64
+          device: cpu
+          init: randint
+          init_args:
+            high: 1000
+      - tensor:
+          shape: [3, 3]
+          stride: [3, 1]
+          storage_offset: 0
+          dtype: torch.int64
+          device: cpu
+          init: randint
+          init_args:
+            high: 1000
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/models/mpnet/modeling_mpnet.py#L346 in relative_position_bucket,
+      code: val_if_large = torch.min(val_if_large, torch.full_like(val_if_large, num_buckets - 1))'
+    marks: tensorsoncpu
+  - name: torch.where.2
+    op: torch.where
+    inputs:
+      - tensor:
+          shape: [3, 3]
+          stride: [3, 1]
+          storage_offset: 0
+          dtype: torch.bool
+          device: cpu
+      - tensor:
+          shape: [3, 3]
+          stride: [3, 1]
+          storage_offset: 0
+          dtype: torch.int64
+          device: cpu
+          init: randint
+          init_args:
+            high: 1000
+      - tensor:
+          shape: [3, 3]
+          stride: [3, 1]
+          storage_offset: 0
+          dtype: torch.int64
+          device: cpu
+          init: randint
+          init_args:
+            high: 1000
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/models/mpnet/modeling_mpnet.py#L347 in relative_position_bucket,
+      code: ret += torch.where(is_small, n, val_if_large)'
+    marks: tensorsoncpu
+  - name: torch.Tensor.add.1
+    op: torch.Tensor.add
+    inputs:
+      - tensor:
+          shape: [3, 3]
+          stride: [3, 1]
+          storage_offset: 0
+          dtype: torch.int64
+          device: cpu
+          init: randint
+          init_args:
+            high: 1000
+      - tensor:
+          shape: [3, 3]
+          stride: [3, 1]
+          storage_offset: 0
+          dtype: torch.int64
+          device: cpu
+          init: randint
+          init_args:
+            high: 1000
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/models/mpnet/modeling_mpnet.py#L347 in relative_position_bucket,
+      code: ret += torch.where(is_small, n, val_if_large)'
+    marks: tensorsoncpu
+  - name: torch.to.6
+    op: torch.to
+    inputs:
+      - tensor:
+          shape: [3, 3]
+          stride: [3, 1]
+          storage_offset: 0
+          dtype: torch.int64
+          device: cpu
+          init: randint
+          init_args:
+            high: 1000
+      - value: cuda:0
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/models/mpnet/modeling_mpnet.py#L324 in compute_position_bias,
+      code: rp_bucket = rp_bucket.to(x.device)'
+    marks:
+      - constant
+      - tensorsoncpu
+  - name: torch.nn.functional.embedding.3
+    op: torch.nn.functional.embedding
+    inputs:
+      - tensor:
+          shape: [3, 3]
+          stride: [3, 1]
+          storage_offset: 0
+          dtype: torch.int64
+          device: cuda:0
+          init: randint
+          init_args:
+            high: 32
+      - tensor:
+          shape: [32, 12]
+          stride: [12, 1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: rand
+      - value: null
+      - value: null
+      - value: 2.0
+      - value: false
+      - value: false
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/models/mpnet/modeling_mpnet.py#L325 in compute_position_bias,
+      code: values = self.relative_attention_bias(rp_bucket)'
+    marks: constant
+  - name: torch.permute.1
+    op: torch.permute
+    inputs:
+      - tensor:
+          shape: [3, 3, 12]
+          stride: [36, 12, 1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: rand
+      - value: (2, 0, 1)
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/models/mpnet/modeling_mpnet.py#L326 in compute_position_bias,
+      code: values = values.permute([2, 0, 1]).unsqueeze(0)'
+  - name: torch.unsqueeze.1
+    op: torch.unsqueeze
+    inputs:
+      - tensor:
+          shape: [12, 3, 3]
+          stride: [1, 36, 12]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: rand
+      - value: 0
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/models/mpnet/modeling_mpnet.py#L326 in compute_position_bias,
+      code: values = values.permute([2, 0, 1]).unsqueeze(0)'
+    marks: constant
+  - name: torch.Tensor.expand.2
+    op: torch.Tensor.expand
+    inputs:
+      - tensor:
+          shape: [1, 12, 3, 3]
+          stride: [12, 1, 36, 12]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: rand
+      - value: (3072, -1, 3, 3)
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/models/mpnet/modeling_mpnet.py#L327 in compute_position_bias,
+      code: values = values.expand((bsz, -1, qlen, klen)).contiguous()'
+    marks: constant
+  - name: torch.Tensor.contiguous.1
+    op: torch.Tensor.contiguous
+    inputs:
+      - tensor:
+          shape: [3072, 12, 3, 3]
+          stride: [0, 1, 36, 12]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: rand
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/models/mpnet/modeling_mpnet.py#L327 in compute_position_bias,
+      code: values = values.expand((bsz, -1, qlen, klen)).contiguous()'
+  - name: torch.nn.functional.linear.1
+    op: torch.nn.functional.linear
+    inputs:
+      - tensor:
+          shape: [3072, 3, 768]
+          stride: [2304, 768, 1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: xavier
+      - tensor:
+          shape: [768, 768]
+          stride: [768, 1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: xavier
+      - tensor:
+          shape: [768]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: rand
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/models/mpnet/modeling_mpnet.py#L145 in forward, code: q = self.q(hidden_states).view(hidden_shape).transpose(1,
+      2)'
+  - name: torch.Tensor.view.1
+    op: torch.Tensor.view
+    inputs:
+      - tensor:
+          shape: [3072, 3, 768]
+          stride: [2304, 768, 1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: rand
+      - value: (3072, 3, -1, 64)
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/models/mpnet/modeling_mpnet.py#L145 in forward, code: q = self.q(hidden_states).view(hidden_shape).transpose(1,
+      2)'
+    marks: constant
+  - name: torch.transpose.1
+    op: torch.transpose
+    inputs:
+      - tensor:
+          shape: [3072, 3, 12, 64]
+          stride: [2304, 768, 64, 1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: rand
+      - value: 1
+      - value: 2
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/models/mpnet/modeling_mpnet.py#L145 in forward, code: q = self.q(hidden_states).view(hidden_shape).transpose(1,
+      2)'
+    marks: constant
+  - name: torch.transpose.2
+    op: torch.transpose
+    inputs:
+      - tensor:
+          shape: [3072, 12, 3, 64]
+          stride: [2304, 64, 768, 1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: rand
+      - value: -1
+      - value: -2
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/models/mpnet/modeling_mpnet.py#L150 in forward, code: attention_scores
+      = torch.matmul(q, k.transpose(-1, -2))'
+    marks: constant
+  - name: torch.matmul.1
+    op: torch.matmul
+    inputs:
+      - tensor:
+          shape: [3072, 12, 3, 64]
+          stride: [2304, 64, 768, 1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: xavier
+      - tensor:
+          shape: [3072, 12, 64, 3]
+          stride: [2304, 64, 1, 768]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: xavier
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/models/mpnet/modeling_mpnet.py#L150 in forward, code: attention_scores
+      = torch.matmul(q, k.transpose(-1, -2))'
+  - name: torch.truediv.3
+    op: torch.truediv
+    inputs:
+      - tensor:
+          shape: [3072, 12, 3, 3]
+          stride: [108, 9, 3, 1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: rand
+      - value: 8.0
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/models/mpnet/modeling_mpnet.py#L151 in forward, code: attention_scores
+      = attention_scores / math.sqrt(self.attention_head_size)'
+    marks: constant
+  - name: torch.Tensor.add.2
+    op: torch.Tensor.add
+    inputs:
+      - tensor:
+          shape: [3072, 12, 3, 3]
+          stride: [108, 9, 3, 1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: rand
+      - tensor:
+          shape: [3072, 12, 3, 3]
+          stride: [108, 9, 3, 1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: rand
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/models/mpnet/modeling_mpnet.py#L155 in forward, code: attention_scores
+      += position_bias'
+  - name: torch.add.5
+    op: torch.add
+    inputs:
+      - tensor:
+          shape: [3072, 12, 3, 3]
+          stride: [108, 9, 3, 1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: rand
+      - tensor:
+          shape: [3072, 1, 3, 3]
+          stride: [9, 9, 3, 1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: rand
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/models/mpnet/modeling_mpnet.py#L158 in forward, code: attention_scores
+      = attention_scores + attention_mask'
+  - name: torch.nn.functional.softmax.1
+    op: torch.nn.functional.softmax
+    inputs:
+      - tensor:
+          shape: [3072, 12, 3, 3]
+          stride: [108, 9, 3, 1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: rand
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/models/mpnet/modeling_mpnet.py#L161 in forward, code: attention_probs
+      = nn.functional.softmax(attention_scores, dim=-1)'
+    kwmap:
+      dim: -1
+  - name: torch.nn.functional.dropout.2
+    op: torch.nn.functional.dropout
+    inputs:
+      - tensor:
+          shape: [3072, 12, 3, 3]
+          stride: [108, 9, 3, 1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: rand
+      - value: 0.1
+      - value: false
+      - value: false
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/models/mpnet/modeling_mpnet.py#L163 in forward, code: attention_probs
+      = self.dropout(attention_probs)'
+    marks: constant
+  - name: torch.matmul.2
+    op: torch.matmul
+    inputs:
+      - tensor:
+          shape: [3072, 12, 3, 3]
+          stride: [108, 9, 3, 1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: xavier
+      - tensor:
+          shape: [3072, 12, 3, 64]
+          stride: [2304, 64, 768, 1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: xavier
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/models/mpnet/modeling_mpnet.py#L165 in forward, code: c = torch.matmul(attention_probs,
+      v)'
+  - name: torch.permute.2
+    op: torch.permute
+    inputs:
+      - tensor:
+          shape: [3072, 12, 3, 64]
+          stride: [2304, 192, 64, 1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: rand
+      - value: (0, 2, 1, 3)
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/models/mpnet/modeling_mpnet.py#L167 in forward, code: c = c.permute(0,
+      2, 1, 3).contiguous()'
+    marks: constant
+  - name: torch.Tensor.contiguous.2
+    op: torch.Tensor.contiguous
+    inputs:
+      - tensor:
+          shape: [3072, 3, 12, 64]
+          stride: [2304, 64, 192, 1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: rand
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/models/mpnet/modeling_mpnet.py#L167 in forward, code: c = c.permute(0,
+      2, 1, 3).contiguous()'
+  - name: torch.Tensor.view.2
+    op: torch.Tensor.view
+    inputs:
+      - tensor:
+          shape: [3072, 3, 12, 64]
+          stride: [2304, 768, 64, 1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: rand
+      - value: 3072
+      - value: 3
+      - value: 768
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/models/mpnet/modeling_mpnet.py#L169 in forward, code: c = c.view(*new_c_shape)'
+    marks: constant
+  - name: torch.nn.functional.linear.2
+    op: torch.nn.functional.linear
+    inputs:
+      - tensor:
+          shape: [3072, 3, 768]
+          stride: [2304, 768, 1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: xavier
+      - tensor:
+          shape: [3072, 768]
+          stride: [768, 1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: xavier
+      - tensor:
+          shape: [3072]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: rand
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/models/mpnet/modeling_mpnet.py#L214 in forward, code: hidden_states
+      = self.dense(hidden_states)'
+  - name: torch.nn.functional.gelu.1
+    op: torch.nn.functional.gelu
+    inputs:
+      - tensor:
+          shape: [3072, 3, 3072]
+          stride: [9216, 3072, 1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: rand
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/activations.py#L89 in forward, code: return self.act(input)'
+  - name: torch.nn.functional.linear.3
+    op: torch.nn.functional.linear
+    inputs:
+      - tensor:
+          shape: [3072, 3, 3072]
+          stride: [9216, 3072, 1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: xavier
+      - tensor:
+          shape: [768, 3072]
+          stride: [3072, 1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: xavier
+      - tensor:
+          shape: [768]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: rand
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/models/mpnet/modeling_mpnet.py#L228 in forward, code: hidden_states
+      = self.dense(hidden_states)'
+  - name: torch.getitem.5
+    op: torch.getitem
+    inputs:
+      - tensor:
+          shape: [3072, 3, 768]
+          stride: [2304, 768, 1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: rand
+      - py: (0,)
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/models/mpnet/modeling_mpnet.py#L361 in forward, code: first_token_tensor
+      = hidden_states[:, 0]'
+    marks: constant
+  - name: torch.nn.functional.linear.4
+    op: torch.nn.functional.linear
+    inputs:
+      - tensor:
+          shape: [3072, 768]
+          stride: [2304, 1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: xavier
+      - tensor:
+          shape: [768, 768]
+          stride: [768, 1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: xavier
+      - tensor:
+          shape: [768]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: rand
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/models/mpnet/modeling_mpnet.py#L362 in forward, code: pooled_output
+      = self.dense(first_token_tensor)'
+  - name: torch.tanh.1
+    op: torch.tanh
+    inputs:
+      - tensor:
+          shape: [3072, 768]
+          stride: [768, 1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: rand
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/models/mpnet/modeling_mpnet.py#L363 in forward, code: pooled_output
+      = self.activation(pooled_output)'
+  - name: torch.unsqueeze.2
+    op: torch.unsqueeze
+    inputs:
+      - tensor:
+          shape: [3072, 3]
+          stride: [3, 1]
+          storage_offset: 0
+          dtype: torch.int64
+          device: cuda:0
+          init: randint
+          init_args:
+            high: 1000
+      - value: -1
+    description: 'site-packages/sentence_transformers/sentence_transformer/modules/pooling.py:202 in _forward_padded, code: mask = attention_mask.unsqueeze(-1).expand_as(token_embeddings).to(token_embeddings.dtype)'
+    marks: constant
+  - name: torch.expand_as.1
+    op: torch.expand_as
+    inputs:
+      - tensor:
+          shape: [3072, 3, 1]
+          stride: [3, 1, 1]
+          storage_offset: 0
+          dtype: torch.int64
+          device: cuda:0
+          init: randint
+          init_args:
+            high: 1000
+      - tensor:
+          shape: [3072, 3, 768]
+          stride: [2304, 768, 1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: rand
+    description: 'site-packages/sentence_transformers/sentence_transformer/modules/pooling.py:202 in _forward_padded, code: mask = attention_mask.unsqueeze(-1).expand_as(token_embeddings).to(token_embeddings.dtype)'
+  - name: torch.to.7
+    op: torch.to
+    inputs:
+      - tensor:
+          shape: [3072, 3, 768]
+          stride: [3, 1, 0]
+          storage_offset: 0
+          dtype: torch.int64
+          device: cuda:0
+          init: randint
+          init_args:
+            high: 1000
+      - value: torch.float16
+    description: 'site-packages/sentence_transformers/sentence_transformer/modules/pooling.py:202 in _forward_padded, code: mask = attention_mask.unsqueeze(-1).expand_as(token_embeddings).to(token_embeddings.dtype)'
+    marks: constant
+  - name: torch.mul.4
+    op: torch.mul
+    inputs:
+      - tensor:
+          shape: [3072, 3, 768]
+          stride: [2304, 768, 1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: rand
+      - tensor:
+          shape: [3072, 3, 768]
+          stride: [2304, 768, 1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: rand
+    description: 'site-packages/sentence_transformers/sentence_transformer/modules/pooling.py:203 in _forward_padded, code: mean_sum = (token_embeddings
+      * mask).sum(dim=1)'
+  - name: torch.sum.1
+    op: torch.sum
+    inputs:
+      - tensor:
+          shape: [3072, 3, 768]
+          stride: [2304, 768, 1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: rand
+    description: 'site-packages/sentence_transformers/sentence_transformer/modules/pooling.py:203 in _forward_padded, code: mean_sum = (token_embeddings
+      * mask).sum(dim=1)'
+    kwmap:
+      dim: 1
+  - name: torch.clamp.1
+    op: torch.clamp
+    inputs:
+      - tensor:
+          shape: [3072, 768]
+          stride: [768, 1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: rand
+    description: 'site-packages/sentence_transformers/sentence_transformer/modules/pooling.py:208 in _forward_padded, code: mean_mask = torch.clamp(mean_mask,
+      min=1e-9)'
+    kwmap:
+      min: 1.0e-09
+  - name: torch.truediv.4
+    op: torch.truediv
+    inputs:
+      - tensor:
+          shape: [3072, 768]
+          stride: [768, 1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: rand
+      - tensor:
+          shape: [3072, 768]
+          stride: [768, 1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: rand
+    description: 'site-packages/sentence_transformers/sentence_transformer/modules/pooling.py:211 in _forward_padded, code: output_vectors.append(mean_sum
+      / mean_mask)'
+  - name: torch.cat.1
+    op: torch.cat
+    inputs:
+      - tensor_list:
+          - shape: [3072, 768]
+            stride: [768, 1]
+            storage_offset: 0
+            dtype: torch.float16
+            device: cuda:0
+            init: rand
+    description: 'site-packages/sentence_transformers/sentence_transformer/modules/pooling.py:150 in forward, code: features["sentence_embedding"] = torch.cat(output_vectors,
+      dim=-1)'
+    kwmap:
+      dim: -1
+  - name: torch.nn.functional.normalize.1
+    op: torch.nn.functional.normalize
+    inputs:
+      - tensor:
+          shape: [3072, 768]
+          stride: [768, 1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: rand
+    description: 'site-packages/sentence_transformers/base/modules/normalize.py:42 in forward, code: features[self.module_output_name] = F.normalize(x,
+      p=2, dim=-1)'
+    kwmap:
+      p: 2
+      dim: -1
