@@ -61,7 +61,9 @@ ORIGIN_VALUES = frozenset({"built", "copied", "promoted", "upstream"})
 METHOD_VALUES = frozenset({"container-pull", "dnf", "pip", "download"})
 REF_KIND_VALUES = frozenset({"pullspec", "glob", "url"})
 RESULT_KIND_VALUES = frozenset({"functional", "performance", "image"})
-TEST_TYPE_VALUES = frozenset({"smoke", "unit", "integration", "regression", "trunk", "perf"})
+TEST_TYPE_VALUES = frozenset(
+    {"smoke", "unit", "integration", "regression", "trunk", "perf"}
+)
 STATE_VALUES = frozenset({"passed", "failed", "error", "running"})
 
 # NOT constrained, deliberately: the DDL documents tag_family as a declared, extensible set

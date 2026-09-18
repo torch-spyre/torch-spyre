@@ -405,18 +405,43 @@ def test_identity_dedup_reads_the_named_database():
 
 ARTIFACT_COLUMN_ORDER = {
     "artifacts": (
-        "artifact_id", "component", "arch", "kind", "artifact_name", "origin",
-        "identity_deps", "context_deps", "sources", "props",
+        "artifact_id",
+        "component",
+        "arch",
+        "kind",
+        "artifact_name",
+        "origin",
+        "identity_deps",
+        "context_deps",
+        "sources",
+        "props",
     ),
     "artifact_refs": (
-        "artifact_id", "method", "ref_kind", "index_uri", "ref", "content_digest", "props",
+        "artifact_id",
+        "method",
+        "ref_kind",
+        "index_uri",
+        "ref",
+        "content_digest",
+        "props",
     ),
     "artifact_tags": (
-        "tag", "tag_family", "artifact_id", "refs", "published_refs", "props",
+        "tag",
+        "tag_family",
+        "artifact_id",
+        "refs",
+        "published_refs",
+        "props",
     ),
     "artifact_results": (
-        "artifact_id", "run_id", "result_kind", "test_type", "state", "arch",
-        "duration_s", "props",
+        "artifact_id",
+        "run_id",
+        "result_kind",
+        "test_type",
+        "state",
+        "arch",
+        "duration_s",
+        "props",
     ),
 }
 
@@ -436,7 +461,9 @@ def _artifact_row(**over):
         "origin": "built",
         "identity_deps": ["flex@d026bd2d255e"],
         "context_deps": ["spyre-builder@6f55fd141011"],
-        "sources": [("https://github.com/torch-spyre/torch-spyre.git", "main", "fcac2334fd60")],
+        "sources": [
+            ("https://github.com/torch-spyre/torch-spyre.git", "main", "fcac2334fd60")
+        ],
         "props": {"id12": "2a727811ca22"},
     }
     row.update(over)
@@ -483,39 +510,67 @@ def test_artifacts_has_no_identity_dedup():
 def test_artifact_results_state_is_not_the_test_case_status_set():
     # Two vocabularies that overlap but differ: 'skipped' is a case status, never a leg state,
     # and 'running' is a leg state with no case equivalent. Declared per table for this reason.
-    ARTIFACT_RESULTS.row({
-        "artifact_id": "a", "run_id": "r", "result_kind": "functional",
-        "test_type": "smoke", "state": "running", "arch": "amd64",
-        "duration_s": 1.0, "props": {},
-    })
+    ARTIFACT_RESULTS.row(
+        {
+            "artifact_id": "a",
+            "run_id": "r",
+            "result_kind": "functional",
+            "test_type": "smoke",
+            "state": "running",
+            "arch": "amd64",
+            "duration_s": 1.0,
+            "props": {},
+        }
+    )
     with pytest.raises(SchemaError, match="state"):
-        ARTIFACT_RESULTS.row({
-            "artifact_id": "a", "run_id": "r", "result_kind": "functional",
-            "test_type": "smoke", "state": "skipped", "arch": "amd64",
-            "duration_s": 1.0, "props": {},
-        })
+        ARTIFACT_RESULTS.row(
+            {
+                "artifact_id": "a",
+                "run_id": "r",
+                "result_kind": "functional",
+                "test_type": "smoke",
+                "state": "skipped",
+                "arch": "amd64",
+                "duration_s": 1.0,
+                "props": {},
+            }
+        )
 
 
 def test_artifact_tags_does_not_constrain_tag_family():
     # The DDL declares tag_family without a CHECK -- it is an extensible set, so a new channel
     # must not be rejected here.
-    ARTIFACT_TAGS.row({
-        "tag": "some-new-channel", "tag_family": "experimental",
-        "artifact_id": "a", "refs": [], "published_refs": [], "props": {},
-    })
+    ARTIFACT_TAGS.row(
+        {
+            "tag": "some-new-channel",
+            "tag_family": "experimental",
+            "artifact_id": "a",
+            "refs": [],
+            "published_refs": [],
+            "props": {},
+        }
+    )
 
 
 def test_artifact_refs_rejects_an_unknown_method():
     with pytest.raises(SchemaError, match="method"):
-        ARTIFACT_REFS.row({
-            "artifact_id": "a", "method": "rsync", "ref_kind": "url",
-            "index_uri": "", "ref": "x", "content_digest": "", "props": {},
-        })
+        ARTIFACT_REFS.row(
+            {
+                "artifact_id": "a",
+                "method": "rsync",
+                "ref_kind": "url",
+                "index_uri": "",
+                "ref": "x",
+                "content_digest": "",
+                "props": {},
+            }
+        )
 
 
 # ── the dep-entry contract ──────────────────────────────────────────────────────────────
 # A reader that assumed these were uuids matched zero rows and rendered nothing, with no
 # error. These pin the shape so the next reader does not have to guess it.
+
 
 @pytest.mark.parametrize(
     "entry,component,id12",

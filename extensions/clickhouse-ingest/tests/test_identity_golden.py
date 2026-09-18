@@ -119,20 +119,32 @@ def test_component_default_is_caller_supplied():
 ARTIFACT_ID_GOLDENS = [
     # (component, artifact_name, id12, arch, expected)
     (
-        "spyre-inference", "spyre-inference-minimal", "a6e224825fcf", "amd64",
+        "spyre-inference",
+        "spyre-inference-minimal",
+        "a6e224825fcf",
+        "amd64",
         "1eef58cc-b88b-5597-97c6-6b27b8b4796f",
     ),
     (
-        "spyre-inference", "spyre-inference-dev", "492504101aed", "amd64",
+        "spyre-inference",
+        "spyre-inference-dev",
+        "492504101aed",
+        "amd64",
         "91b58b7a-0ead-5700-bf72-2e7257322ba6",
     ),
     (
-        "hf-adapters", "hf-adapters-minimal", "be1d78c2cdfd", "amd64",
+        "hf-adapters",
+        "hf-adapters-minimal",
+        "be1d78c2cdfd",
+        "amd64",
         "23aa0294-e2ff-5f48-8aca-ecd318b23a0e",
     ),
     # ppc64le is NOT folded, unlike amd64 -- covers both sides of v2_canonical_arch.
     (
-        "spyre-backend", "spyre-backend-minimal", "cb0f2bca6527", "ppc64le",
+        "spyre-backend",
+        "spyre-backend-minimal",
+        "cb0f2bca6527",
+        "ppc64le",
         "d9c4fe94-894f-50f3-85f8-e9272acfedb1",
     ),
 ]
@@ -145,8 +157,12 @@ def test_artifact_id_golden(component, name, id12, arch, expected):
 
 def test_artifact_id_folds_arch_inside_the_hash():
     # An artifact labelled amd64 by Jenkins and x86_64 by GHA is ONE artifact.
-    a = v2_artifact_id("spyre-inference", "spyre-inference-dev", "492504101aed", "amd64")
-    b = v2_artifact_id("spyre-inference", "spyre-inference-dev", "492504101aed", "x86_64")
+    a = v2_artifact_id(
+        "spyre-inference", "spyre-inference-dev", "492504101aed", "amd64"
+    )
+    b = v2_artifact_id(
+        "spyre-inference", "spyre-inference-dev", "492504101aed", "x86_64"
+    )
     assert a == b == "91b58b7a-0ead-5700-bf72-2e7257322ba6"
 
 

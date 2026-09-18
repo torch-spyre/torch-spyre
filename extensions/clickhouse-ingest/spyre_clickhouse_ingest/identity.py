@@ -151,7 +151,9 @@ def v2_artifact_id(component: str, artifact_name: str, id12: str, arch: str) -> 
     )
 
 
-def v2_gha_artifact_id(component: str, base_image: str, installed: str, arch: str) -> str:
+def v2_gha_artifact_id(
+    component: str, base_image: str, installed: str, arch: str
+) -> str:
     """Artifact identity for a GHA-invoked run, where no orchestrator minted an id12.
 
     A GHA leg knows what it RAN ON even without a build: the base image plus the set of
@@ -164,8 +166,12 @@ def v2_gha_artifact_id(component: str, base_image: str, installed: str, arch: st
     """
     if not (_v2_norm(component) and v2_canonical_arch(arch)):
         return ""
-    items = sorted({_v2_norm(x) for x in (installed or "").replace(",", " ").split() if x})
-    digest = hashlib.sha256(V2_SEP.join(items).encode()).hexdigest()[:12] if items else ""
+    items = sorted(
+        {_v2_norm(x) for x in (installed or "").replace(",", " ").split() if x}
+    )
+    digest = (
+        hashlib.sha256(V2_SEP.join(items).encode()).hexdigest()[:12] if items else ""
+    )
     return v2_artifact_id(component, _v2_norm(base_image), digest, arch)
 
 
