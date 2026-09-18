@@ -473,6 +473,19 @@ class TestQueryPadding:
         # a full block would be 64x the work for one row of output.
         assert query_blocking(seqlen_q) == expected
 
+    @pytest.mark.parametrize(
+        "seqlen_q,expected",
+        [
+            (512, (512, 512)),
+            (576, (192, 576)),
+            (768, (384, 768)),
+            (1024, (512, 1024)),
+            (1088, (64, 1088)),
+        ],
+    )
+    def test_uses_the_largest_exact_block_up_to_512(self, seqlen_q, expected):
+        assert query_blocking(seqlen_q, max_query_block=512) == expected
+
     @pytest.mark.parametrize("seqlen_q", [33, 100, 200, 257])
     def test_front_padding_preserves_every_real_coordinate(self, seqlen_q):
         # The claim the whole scheme rests on. Row i sits at cache coordinate

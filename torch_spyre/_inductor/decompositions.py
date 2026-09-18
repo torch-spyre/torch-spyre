@@ -39,6 +39,7 @@ from torch._prims_common import ELEMENTWISE_TYPE_PROMOTION_KIND, elementwise_dty
 from .constants import DEVICE_NAME, FP8_E4M3FN_MAX, FP8_E4M3FN_MIN
 from .errors import Unsupported
 from .sliding_window_plan import (
+    MAX_QUERY_BLOCK,
     STICK,
     SlidingWindowPlan,
     check_window_read,
@@ -2006,7 +2007,13 @@ def spyre_sliding_window_attention(
     # Pad at the front so real rows keep their relative order. Synthetic rows
     # receive an all-zero mask and are sliced from the result; this guarantees a
     # finite softmax without imposing semantics on discarded outputs.
-    q_block, padded_seqlen_q = query_blocking(seqlen_q)
+    has_narrow_static_plan = (
+        is_causal and seqlen_q == cache_capacity and window_size < cache_capacity
+    )
+    q_block, padded_seqlen_q = query_blocking(
+        seqlen_q,
+        max_query_block=(STICK if has_narrow_static_plan else MAX_QUERY_BLOCK),
+    )
     pad_rows = padded_seqlen_q - seqlen_q
 
     # Only a strictly causal square prefill has position and its upper bound
