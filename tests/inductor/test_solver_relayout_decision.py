@@ -43,6 +43,7 @@ import sympy
 pytest.importorskip("ortools")
 
 from torch_spyre._inductor.pass_utils import PerCoreView
+from torch_spyre._inductor import config
 from torch_spyre._inductor.scratchpad.allocator import CoOptimizingAllocator
 from torch_spyre._inductor.scratchpad.ilp_solver_ortools import CpSatLayoutSolver
 from torch_spyre._inductor.scratchpad.lx_relayout import (
@@ -60,6 +61,24 @@ from torch_spyre._inductor.scratchpad.plan_solver import (
 _SPILL_NS = 20000.0  # what spilling P charges in the crafted objective
 _CORE = sympy.Symbol("core_id")
 _PER_CORE = 16  # P is 64 bytes sliced 4 ways
+
+
+@pytest.mark.parametrize(
+    "cap,costs,expected",
+    [(1, {0: 10000, 1: 1000}, [1]), (1, None, [0]), (0, {0: 10000, 1: 1000}, [0, 1])],
+)
+def test_relayout_shortlist_prices_the_consumer(monkeypatch, cap, costs, expected):
+    """Saving 500 ns on a copy must not hide a 9000 ns faster consumer."""
+    monkeypatch.setattr(config, "lx_solver_relayout_groups_per_edge", cap)
+    candidates = [
+        _candidate("C", 0, 500, group=0, j=0),
+        _candidate("C", 0, 1000, group=1, j=1),
+    ]
+    divisions = [CoreDivision(splits={sympy.Symbol("d0"): 4})] * 2
+    kept = CoOptimizingAllocator._cap_relayout_groups(
+        "P", "C", candidates, divisions, costs
+    )
+    assert [c.group for c in kept] == expected
 
 
 def _view(slot: int, num_cores: int = 4) -> PerCoreView:
@@ -147,6 +166,27 @@ def _copy(result, group=0) -> RelayoutCopyBuffer:
 
 def _disjoint(a_addr, b_addr, footprint=_PER_CORE) -> bool:
     return not (a_addr < b_addr + footprint and b_addr < a_addr + footprint)
+
+
+@pytest.mark.parametrize("priced", [False, True])
+def test_priced_relayout_search_does_not_depend_on_copy_count(monkeypatch, priced):
+    from ortools.sat.python import cp_model
+
+    p = _producer([0, 1])
+    c = _consumer("C", 1, 2, [_candidate("C", 0, 5000.0)])
+    buffers = _with_copies(p, c)
+    original = cp_model.CpSolver.Solve
+    parameters = []
+
+    def solve(solver, model, *args, **kwargs):
+        parameters.append(solver.parameters.cp_model_presolve)
+        assert solver.parameters.max_time_in_seconds == 120
+        return original(solver, model, *args, **kwargs)
+
+    monkeypatch.setattr(cp_model.CpSolver, "Solve", solve)
+    result = _solve(buffers, expr=_objective(buffers) if priced else None)
+    assert parameters and all(value == (not priced) for value in parameters)
+    assert (_copy(result).address is not None) == priced
 
 
 # ---------------------------------------------------------------------------

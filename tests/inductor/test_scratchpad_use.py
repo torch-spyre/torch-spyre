@@ -1436,6 +1436,55 @@ class TestCpSatTimeoutFallback(BaseTestScratchpadUsage):
         self._assert_timeout_falls_back_to_greedy(f, (x,))
 
 
+class TestSolveErrorFallback(unittest.TestCase):
+    """The greedy fallback after a SolveError keeps the failed allocator's
+    post-allocation passes. Pure dispatch, no device needed."""
+
+    def test_fallback_keeps_lx_context_switching(self):
+        from torch_spyre._inductor.scratchpad import allocator as allocator_module
+        from torch_spyre._inductor.scratchpad.greedy_solver import GreedyLayoutSolver
+        from torch_spyre._inductor.scratchpad.lx_context_switching import (
+            LxContextSwitchingPass,
+        )
+        from torch_spyre._inductor.scratchpad.plan_solver import SolveError
+
+        graph = object()
+        with ts_inductor_config.patch(
+            layout_solver="cpsat",
+            co_optimizing_lx_planning=True,
+            enable_lx_context_switching=True,
+            _cpsat_warn_on_cost_expr=False,
+        ):
+            failing = allocator_module.select_allocator()
+            post_passes = failing.post_optimization_passes
+            self.assertTrue(
+                any(isinstance(p, LxContextSwitchingPass) for p in post_passes)
+            )
+            with (
+                patch.object(
+                    failing, "plan_allocation", side_effect=SolveError("forced")
+                ) as failed,
+                patch.object(
+                    allocator_module.ScratchpadAllocator,
+                    "plan_allocation",
+                    autospec=True,
+                ) as fallback,
+                self.assertLogs(allocator_module.logger, level="WARNING") as logs,
+            ):
+                allocator_module.scratchpad_planning(
+                    graph, failing, lx_relayout_plans=[]
+                )
+
+        failed.assert_called_once_with(graph, lx_relayout_plans=[])
+        fallback.assert_called_once()
+        greedy, replanned = fallback.call_args.args
+        self.assertIs(type(greedy), allocator_module.ScratchpadAllocator)
+        self.assertIs(greedy.layout_planning, GreedyLayoutSolver)
+        self.assertIs(greedy.post_optimization_passes, post_passes)
+        self.assertIs(replanned, graph)
+        self.assertIn("falling back to greedy", "\n".join(logs.output))
+
+
 class TestSelectAllocator(unittest.TestCase):
     """select_allocator maps config -> (allocator, solver) so the allocators
     never inspect config themselves. Pure dispatch, no device needed."""

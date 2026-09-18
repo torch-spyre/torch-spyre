@@ -33,7 +33,13 @@ from torch._inductor.ir import ComputedBuffer, MutationLayoutSHOULDREMOVE
 
 
 from .constants import BATCH_MATMUL_OP
-from .cost_model import ArgTraffic, OpFeatures, explain, max
+from .cost_model import (
+    ArgTraffic,
+    OpFeatures,
+    _matmul_axes_for_split_cost,
+    explain,
+    max,
+)
 from .logging_utils import get_logger, warn_once
 from .pass_utils import apply_splits_from_index_coeff, iteration_space_from_op
 
@@ -124,8 +130,26 @@ def _replication(index, slices: dict):
     return math.prod(split for sym, split in slices.items() if sym not in present)
 
 
+def _real_layout(layout):
+    """The layout the write actually lands in. A ``MutationLayoutSHOULDREMOVE`` op
+    writes into ANOTHER buffer, and the device size and the scratchpad allocation are
+    stamped on that target's ``FixedTiledLayout``, never on the wrapper -- which
+    defines neither attribute nor ``__getattr__``, so reading them off it silently
+    yields ``None``. One step, as upstream assumes (``stride``/``storage_size``
+    delegate to ``real_layout()`` unguarded); ``get_buffer()`` unwraps views and boxes.
+    """
+    if isinstance(layout, MutationLayoutSHOULDREMOVE):
+        try:
+            return layout.real_layout()
+        except Exception:  # noqa: BLE001 - target unresolvable: keep the old fallback
+            # (logical dims / HBM) rather than break extraction. The same op's
+            # _writes_graph_output resolves the same target and logs when it cannot.
+            return layout
+    return layout
+
+
 def _mem_of_layout(layout) -> str:
-    alloc = getattr(layout, "allocation", None)
+    alloc = getattr(_real_layout(layout), "allocation", None)
     if isinstance(alloc, dict) and "lx" in alloc:
         return "lx"
     return "hbm"
@@ -136,7 +160,7 @@ def _device_dims(layout):
     -- the TRUE shape that moves (sticks are 64 fp16 elems; a row of N rounds up to
     ceil(N/64)*64). None when the device layout isn't available (use logical instead).
     """
-    dl = getattr(layout, "device_layout", None)
+    dl = getattr(_real_layout(layout), "device_layout", None)
     ds = getattr(dl, "device_size", None) if dl is not None else None
     if not ds:
         return None
@@ -842,7 +866,7 @@ def extract_op_features(
 
     _rl = _relayout_features(op, out_dims)
 
-    return OpFeatures(
+    features = OpFeatures(
         name=_op_name(op),
         is_reduction=is_reduction,
         out_elems=out_elems,
@@ -867,6 +891,18 @@ def extract_op_features(
         relayout_run_elems=_rl[1],
         relayout_split=_rl[2],
     )
+    if is_matmul:
+        axes = _matmul_axes_for_split_cost(features)
+        if axes is not None and axes[-1]:
+            # Shared-weight matmuls multicast each physical operand slice to
+            # its consumers. The per-core replica law was measured on true
+            # BMMs; applying it here charges a shared HBM fetch repeatedly.
+            # Reuse the execution model's classification, not buffer names or
+            # graph boundaries. Coarse-loop rereads remain in loop_factor.
+            for arg in args:
+                if arg.role == "input":
+                    arg.broadcast = True
+    return features
 
 
 def extract_features(operations: list) -> list:

@@ -47,6 +47,84 @@ ELEMS, DTYPE = 1024, 2
 BYTES = ELEMS * DTYPE
 
 
+@pytest.mark.parametrize("shared_weight", [False, True])
+@pytest.mark.parametrize("k_split", [1, 2])
+def test_matmul_time_does_not_charge_unused_available_cores(shared_weight, k_split):
+    from torch_spyre._inductor.work_division import (
+        _matmul_execution_cost,
+        _matmul_split_cost,
+    )
+
+    axes = ((16, 8), (64, 1), (128, 1), (256, k_split))
+    used = 8 * k_split
+    options = dict(shared_weight=shared_weight, include_hbm=False)
+    estimate = _matmul_execution_cost(*axes, used, **options)
+    assert estimate > 0
+    assert _matmul_execution_cost(*axes, 32, **options) == pytest.approx(estimate)
+    split = sympy.Symbol("k_split", integer=True, positive=True)
+    symbolic = _matmul_execution_cost(*axes[:3], (256, split), 32, **options)
+    assert float(symbolic.subs(split, k_split)) == pytest.approx(estimate)
+    assert _matmul_split_cost(*axes, 32, **options) > _matmul_split_cost(
+        *axes, used, **options
+    )
+
+
+@pytest.mark.parametrize("shared_weight", [False, True])
+def test_split_sum_matmul_prices_one_corelet(shared_weight):
+    from torch_spyre._inductor import work_division as wd
+
+    split = sympy.Symbol("k_split", integer=True, positive=True)
+    axes = ((2, 2), (128, 2), (256, 2), (1024, split))
+    price = wd._matmul_execution_cost(
+        *axes, 32, shared_weight=shared_weight, include_hbm=False
+    )
+    coefficient = (
+        wd._PSUM_PER_CORE_ELEM_US if shared_weight else wd._BMM_PSUM_PER_CORE_ELEM_US
+    )
+    for k in (1, 2, 4):
+        compute = (2 * 128 * 256 * 1024) / (8 * k) / wd._PEAK_MACS_US_CORE
+        expected = compute * (2 if k > 1 else 1) + (k - 1) * 8192 * coefficient
+        assert float(price.subs(split, k)) == pytest.approx(expected)
+        assert wd._matmul_execution_cost(
+            *axes[:3], (1024, k), 32, shared_weight=shared_weight, include_hbm=False
+        ) == pytest.approx(expected)
+
+
+def test_joint_matmul_price_is_independent_of_standalone_preferences(monkeypatch):
+    from torch_spyre._inductor import work_division as wd
+
+    op = OpFeatures(
+        name="bmm",
+        is_reduction=True,
+        dtype_bytes=2,
+        args=[],
+        is_matmul=True,
+        out_elems=16 * 64 * 128,
+        cores=16,
+        matmul_macs=16 * 64 * 128 * 256,
+        matmul_rows_per_core=64,
+        matmul_cols_per_core=128,
+        matmul_a_bytes=64 * 256 * 2,
+        matmul_b_bytes=256 * 128 * 2,
+    )
+    params = cost_model.CostParams(use_bundled_cost_model=False)
+    before = cost_model.predict_ops([op], params)
+    axes = ((16, 8), (64, 1), (128, 1), (256, 1))
+    standalone = wd._matmul_split_cost(*axes, 32)
+    for name in (
+        "_CORE_UNDERUSE_PENALTY_US",
+        "_M_TILE_UNDERFILL_PENALTY_US",
+        "_M_LANE_UNDERUSE_PENALTY_US",
+        "_BMM_BATCH_SPLIT_PENALTY_US",
+        "_WIDE_N_TILE_PENALTY_US",
+        "_LARGE_M_TILE_SHAPE_PENALTY_US",
+        "_SHARED_DOWN_N_SPLIT_PENALTY_US",
+    ):
+        monkeypatch.setattr(wd, name, getattr(wd, name) * 2)
+    assert cost_model.predict_ops([op], params) == pytest.approx(before)
+    assert wd._matmul_split_cost(*axes, 32) > standalone
+
+
 def _reader(name, out, *, input_name="arg0_1", resident=(), resident_expr=None):
     """A pointwise op reading the graph input ``input_name`` and writing ``out``.
 
@@ -319,11 +397,19 @@ def test_an_explicit_stamp_survives_the_round_trip():
 
 
 class _FakeMutationLayout:
-    def __init__(self, target):
+    """Stands in for ``MutationLayoutSHOULDREMOVE``: it answers for the buffer it
+    writes into, and carries no ``device_layout`` / ``allocation`` of its own --
+    both live on ``real_layout()``, the target's layout."""
+
+    def __init__(self, target, real=None):
         self._target = target
+        self._real = real
 
     def get_buffer(self):
         return SimpleNamespace(get_name=lambda: self._target)
+
+    def real_layout(self):
+        return self._real
 
 
 def _op(name, layout):
@@ -492,3 +578,69 @@ def test_the_per_arg_io_breakdown_sums_to_its_own_total():
     counted = sum(a["hbm_counted"] for o in dcm.LAST_IO["ops"] for a in o["args"])
     # The clone-in load of the resident input, plus the write of the HBM output.
     assert counted == dcm.LAST_IO["hbm_bytes"] == 2 * BYTES
+
+
+# ------------------------------------------- sizing and placing a mutating write
+
+
+def test_the_wrapper_answers_neither_question_itself():
+    """What makes the fake above faithful, and the defect silent: the real class
+    defines neither attribute and no ``__getattr__`` to synthesize one, so reading
+    them off it returns ``None`` rather than raising."""
+    from torch._inductor.ir import MutationLayoutSHOULDREMOVE
+
+    assert not hasattr(MutationLayoutSHOULDREMOVE, "device_layout")
+    assert not hasattr(MutationLayoutSHOULDREMOVE, "allocation")
+    assert not hasattr(MutationLayoutSHOULDREMOVE, "__getattr__")
+
+
+def test_device_dims_come_from_the_mutation_target(monkeypatch):
+    monkeypatch.setattr(dcm, "MutationLayoutSHOULDREMOVE", _FakeMutationLayout)
+    target = SimpleNamespace(device_layout=SimpleNamespace(device_size=[4, 128]))
+    assert dcm._device_dims(_FakeMutationLayout("buf1", target)) == [4, 128]
+
+
+def test_residency_comes_from_the_mutation_target(monkeypatch):
+    """The planner stamps ``allocation`` on the target's ``FixedTiledLayout``, never
+    on the wrapper -- so a write into a resident target is HBM traffic unless the
+    wrapper is resolved."""
+    monkeypatch.setattr(dcm, "MutationLayoutSHOULDREMOVE", _FakeMutationLayout)
+    resident = SimpleNamespace(allocation={"lx": 0})
+    assert dcm._mem_of_layout(_FakeMutationLayout("buf1", resident)) == "lx"
+    assert dcm._mem_of_layout(_FakeMutationLayout("buf1", SimpleNamespace())) == "hbm"
+
+
+def test_the_extractor_sizes_and_places_a_mutating_write_by_its_target(monkeypatch):
+    """End to end, on the shape where the two errors bite: a target whose last dim is
+    stick-unaligned (100 fp16 -> 128) and LX-resident. Off the wrapper the write is
+    100 elements of HBM; off the target it is 128 elements of LX."""
+    monkeypatch.setattr(dcm, "MutationLayoutSHOULDREMOVE", _FakeMutationLayout)
+    target = SimpleNamespace(
+        device_layout=SimpleNamespace(device_size=[128]), allocation={"lx": 0}
+    )
+    op = _extractable_op("buf1", ["arg0_1"])
+    op.get_size = lambda: [100]
+    op.get_layout = lambda: _FakeMutationLayout("arg0_1", target)
+
+    from torch._inductor.virtualized import V
+
+    with V.set_graph_handler(_StubGraph(inputs=["arg0_1"], outputs=["buf9"])):
+        feats = dcm.extract_op_features(op)
+
+    write = next(a for a in feats.args if a.role == "output")
+    assert (write.elems, write.dims, write.logical) == (128, [128], [100])
+    assert write.is_lx is True
+
+
+def test_an_unresolvable_target_falls_back_rather_than_raising(monkeypatch):
+    """Both helpers are best-effort: an op whose target buffer cannot be reached keeps
+    the pre-existing logical-dims / HBM answer instead of breaking extraction (the
+    extractor-level case is pinned by the unreadable-write test above)."""
+
+    class _BrokenTarget(_FakeMutationLayout):
+        def real_layout(self):
+            raise RuntimeError("target buffer is gone")
+
+    monkeypatch.setattr(dcm, "MutationLayoutSHOULDREMOVE", _BrokenTarget)
+    assert dcm._device_dims(_BrokenTarget("buf1")) is None
+    assert dcm._mem_of_layout(_BrokenTarget("buf1")) == "hbm"

@@ -1507,29 +1507,6 @@ def _view_for_div(
     )
 
 
-def _is_frame_changing_clone(op: Operation, buf_name: str) -> bool:
-    """True if ``op`` is a clone whose output ``buf_name`` has an iteration
-    dimension that none of its inputs carry -- i.e. it broadcasts a dim
-    (e.g. GQA broadcasting K/V over the query-group axis). Such a clone reads
-    its input in a different frame than it writes its output, so a per-core
-    slice of the output cannot be produced from a core-local slice of the
-    input; pinning the output mis-addresses (cf. the restickify barrier)."""
-    if op_short_name(op) != "clone":
-        return False
-    rw = op_read_writes(op)
-    write = next(
-        (w for w in rw.writes if w.name == buf_name and hasattr(w, "index")), None
-    )
-    if write is None:
-        return False
-    read_syms: set = set()
-    for r in rw.reads:
-        if hasattr(r, "index"):
-            read_syms |= set(r.index.free_symbols)
-    # A write-only free symbol means the clone expands (broadcasts) that dim.
-    return bool(set(write.index.free_symbols) - read_syms)
-
-
 @dataclass
 class ResidencyEdge:
     """One producer-buffer -> consumer edge, with its residency policy applied.
@@ -1543,11 +1520,10 @@ class ResidencyEdge:
     candidates instead of enumerating them cannot apply the geometry and forget
     the filters.
 
-    Excluded outright (the producer then falls back to HBM, always correct): a
-    producer that can never be resident, and a frame-changing (broadcasting)
-    clone, whose per-core slice cannot be produced core-locally at all -- the
-    single-frame view comparison misses that, and the broadcast read from HBM
-    is globally correct. Excluded per candidate: see :meth:`parent_view` and
+    A producer rejected for LX is excluded outright. Otherwise, check each
+    producer-consumer edge independently. A broadcasting clone may read its
+    input from HBM and still keep its completed output in LX for a matching
+    consumer. Candidate-specific checks are in :meth:`parent_view` and
     :meth:`consumer_view`.
     """
 
@@ -1556,24 +1532,17 @@ class ResidencyEdge:
     consumer_op: Operation
     write_dep: MemoryDep
     read_dep: MemoryDep
-    # An SDSC carries only a matmul's primary split, so a multi-dim-split matmul
-    # output cannot be coherently LX-pinned even when views match -- a consumer
-    # would read per-core LX holding only a fragment. (Mirrors #2745's
-    # ``get_ncores_for_buffers`` matmul guard for the greedy path.)
-    parent_is_matmul: bool
     prep_cache: dict
 
     def parent_view(self, splits: dict[sympy.Symbol, int]) -> Optional[PerCoreView]:
         """The producer's write-view under ``division``, or ``None`` when that
         candidate cannot host a readable residency: a partial-reduction write
-        (output not final), an unrepresentable slicing, or a matmul output
-        split across more than one device dim."""
+        (output not final) or an unrepresentable slicing. Matching compares
+        the complete per-core views, including all split dimensions."""
         view, partial, repr_ok = _view_for_div(
             self.parent_op, self.write_dep, self.buf_name, splits, self.prep_cache
         )
         if not repr_ok or partial:
-            return None
-        if self.parent_is_matmul and len(view.work_slice_dims) > 1:
             return None
         return view
 
@@ -1623,18 +1592,16 @@ def build_residency_edge(
     when the edge can never host a residency."""
     if residency_reason is not None:
         return None
-    if _is_frame_changing_clone(parent_op, buf_name):
-        return None
     write_dep = next(
         (
             w
             for w in op_read_writes(parent_op).writes
-            if w.name == buf_name and hasattr(w, "index")
+            if w.name == buf_name and isinstance(w, MemoryDep)
         ),
         None,
     )
     read_dep = next(
-        (r for r in consumer_reads if r.name == buf_name and hasattr(r, "index")),
+        (r for r in consumer_reads if r.name == buf_name and isinstance(r, MemoryDep)),
         None,
     )
     if write_dep is None or read_dep is None:
@@ -1645,7 +1612,6 @@ def build_residency_edge(
         consumer_op=consumer_op,
         write_dep=write_dep,
         read_dep=read_dep,
-        parent_is_matmul=_is_matmul_op(parent_op),
         prep_cache=prep_cache,
     )
 
@@ -2737,15 +2703,13 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         if record.update_name != update_op.get_name():
             return None
         storage_op = op_by_name.get(record.storage_name)
-        if storage_op is None or _is_frame_changing_clone(
-            storage_op, record.storage_name
-        ):
+        if storage_op is None:
             return None
         storage_write = next(
             (
                 dep
                 for dep in op_read_writes(storage_op).writes
-                if dep.name == record.storage_name and hasattr(dep, "index")
+                if dep.name == record.storage_name and isinstance(dep, MemoryDep)
             ),
             None,
         )
@@ -2753,7 +2717,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             (
                 dep
                 for dep in op_read_writes(update_op).writes
-                if dep.name == record.update_name and hasattr(dep, "index")
+                if dep.name == record.update_name and isinstance(dep, MemoryDep)
             ),
             None,
         )
@@ -2765,7 +2729,6 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             consumer_op=update_op,
             write_dep=storage_write,
             read_dep=update_write.rename({record.update_name: record.storage_name}),
-            parent_is_matmul=_is_matmul_op(storage_op),
             prep_cache=prep_cache,
         )
 
@@ -2877,10 +2840,14 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             consumer_divs = divisions[cname]
             rw = op_read_writes(consumer)
             read_dep = next(
-                (r for r in rw.reads if r.name == input_name and hasattr(r, "index")),
+                (
+                    r
+                    for r in rw.reads
+                    if r.name == input_name and isinstance(r, MemoryDep)
+                ),
                 None,
             )
-            write = next((w for w in rw.writes if hasattr(w, "index")), None)
+            write = next((w for w in rw.writes if isinstance(w, MemoryDep)), None)
             if read_dep is None or write is None:
                 matches[cname] = []
                 continue
@@ -2978,16 +2945,19 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         consumer: str,
         candidates: list[RelayoutCandidate],
         consumer_divs: list[CoreDivision],
+        consumer_costs: dict[int, float] | None = None,
     ) -> list[RelayoutCandidate]:
         """Keep the candidates of the ``config.lx_solver_relayout_groups_per_edge``
         cheapest destination views of one (source, consumer) edge.
 
-        Every consumer division with a distinct read partition is its own
+        Each distinct consumer read partition is its own
         relayout group, and every group becomes a copy buffer the solver must
         place, though the consumer will read through at most one of them. A
-        group is ranked by its cheapest candidate (the best source division
-        that lands on it), ties toward the consumer division using more cores,
-        the solver's own preference. Dropping a group only removes an option:
+        group is ranked by copy plus consumer execution cost, not copy cost
+        alone: a cheap copy can feed an expensive matmul division. This is a
+        shortlist estimate, not the whole-graph objective. Ties favor more
+        consumer cores, the solver's existing preference. Dropping a group only
+        removes an option:
         a consumer division without a copy is treated exactly like an unpriced
         pair (match for free or spill), and every fired relayout is still
         certified at materialization.
@@ -3003,7 +2973,15 @@ class CoOptimizingAllocator(ScratchpadAllocator):
 
         def rank(item: tuple[int, list[RelayoutCandidate]]) -> tuple:
             group, members = item
-            best = min(c.cost_ns for c in members)
+            best = min(
+                c.cost_ns
+                + (
+                    consumer_costs[c.consumer_division]
+                    if consumer_costs is not None
+                    else 0.0
+                )
+                for c in members
+            )
             cores = max(consumer_divs[c.consumer_division].cores_used for c in members)
             return (best, -cores, group)
 
@@ -3016,6 +2994,37 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             len(by_group),
         )
         return [c for c in candidates if c.group in kept]
+
+    @staticmethod
+    def _relayout_consumer_costs(consumer_op, consumer_divs, parent, candidates):
+        """Reuse the execution model to shortlist copies feeding this consumer.
+
+        Price this input in LX and the remaining arguments in HBM. The solver
+        still decides their actual placement and prices complete bundles.
+        Extract once per consumer division, not once per source/destination pair.
+        """
+        from torch_spyre._inductor.cost_model import predict_ops
+        from torch_spyre._inductor.dump_cost_model import extract_op_features
+        from torch_spyre._inductor.scratchpad.sa_cooptimizer import _work_slices
+
+        is_lx = {dep.name: False for dep in op_read_writes(consumer_op).reads}
+        is_lx[consumer_op.get_name()] = False
+        is_lx[parent] = True
+        return {
+            j: float(
+                predict_ops(
+                    [
+                        extract_op_features(
+                            consumer_op,
+                            _work_slices(consumer_op, consumer_divs[j]),
+                            is_lx,
+                        )
+                    ],
+                    params=_COST_PARAMS,
+                )
+            )
+            for j in sorted({c.consumer_division for c in candidates})
+        }
 
     def _cd_parent_relayouts(
         self,
@@ -3065,16 +3074,9 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             # Same per-candidate view screens as _cd_parent_matches: the source
             # gets LX-pinned exactly like a matched producer, so the same
             # coherence bars apply (partial-reduction write, unrepresentable
-            # slicing, multi-dim-split matmul output).
-            parent_is_matmul = _is_matmul_op(parent_op)
+            # slicing). Movement is checked on the complete per-core views.
             prod_views: list[Optional[PerCoreView]] = [
-                view
-                if (
-                    repr_ok
-                    and not partial
-                    and not (parent_is_matmul and len(view.work_slice_dims) > 1)
-                )
-                else None
+                view if repr_ok and not partial else None
                 for view, partial, repr_ok in self._views_for_divs(
                     parent_op, write_dep, parent, parent_divs, prep_cache
                 )
@@ -3209,7 +3211,11 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                     if cost is None:
                         continue
                     source_span, destination_span = _span(pv), _span(cv)
-                    if source_span is None or destination_span is None:
+                    if (
+                        source_span is None
+                        or destination_span is None
+                        or destination_span > self.size
+                    ):
                         continue
                     candidates.append(
                         RelayoutCandidate(
@@ -3225,8 +3231,26 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                             destination_footprint_bytes=destination_span,
                         )
                     )
+            consumer_costs = None
+            cap = config.lx_solver_relayout_groups_per_edge
+            if cap > 0 and len({c.group for c in candidates}) > cap:
+                try:
+                    consumer_costs = self._relayout_consumer_costs(
+                        consumer_op, consumer_divs, parent, candidates
+                    )
+                except (ValueError, RuntimeError, TypeError) as exc:
+                    logger.warning(
+                        "relayout shortlist consumer cost unavailable for %s: %s; "
+                        "using copy cost only",
+                        consumer_op.get_name(),
+                        exc,
+                    )
             candidates = self._cap_relayout_groups(
-                parent, consumer_op.get_name(), candidates, consumer_divs
+                parent,
+                consumer_op.get_name(),
+                candidates,
+                consumer_divs,
+                consumer_costs,
             )
             if candidates:
                 relayouts[parent] = candidates
@@ -3398,12 +3422,24 @@ def scratchpad_planning(
         allocator = select_allocator()
     try:
         allocator.plan_allocation(graph, lx_relayout_plans=lx_relayout_plans)
-    except SolveError:
-        # When a solve error arises we assume a strong excpetion guarentee
-        # meaning despite the solver failing. The allocator has not mutated
-        # the state of the graph allowing a second attempt with a
-        # greedy approach.
-        logger.debug("solve error detected. falling back to greedy solver.")
+    except SolveError as error:
+        # Strong exception guarantee: SolveError comes from the solve, before the
+        # allocator commits divisions, relayouts or addresses, and select_allocator
+        # configures no pre-passes. The graph is unchanged, so greedy placement
+        # replans it with the work divisions already committed and recollects
+        # relayout plans itself.
+        # Keep the failed allocator's post-allocation passes: select_allocator
+        # adds LxContextSwitchingPass under the same flag that lets residency skip
+        # the extern-kernel liveness guard, so dropping it would leave LX buffers
+        # unprotected across FallbackKernel calls.
+        logger.warning(
+            "LX layout solve failed with layout_solver=%s (%s); falling back to "
+            "greedy LX placement with the committed work divisions",
+            config.layout_solver,
+            error,
+        )
         ScratchpadAllocator(
-            GreedyLayoutSolver, size=_lx_planning_size()
+            GreedyLayoutSolver,
+            size=_lx_planning_size(),
+            post_optimization_passes=allocator.post_optimization_passes,
         ).plan_allocation(graph)

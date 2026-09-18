@@ -1416,6 +1416,20 @@ class TestSympyExprToCpSatPrinter(TestCase):
         self.assertEqual(solver.ObjectiveValue(), 20)
         self.assertEqual(solver.Value(sym_map["x"]), 10)
 
+    def test_shared_load_penalty_lowers_for_product_degrees(self):
+        from torch_spyre._inductor.work_division import _matmul_multicast_penalty
+
+        x, y, resident = sympy.symbols("x y resident", integer=True)
+        expression = (
+            8192 / 150 * (_matmul_multicast_penalty(x * y) - 1) * (1 - resident)
+        )
+        for a, b, lx in ((2, 4, 0), (3, 4, 0), (4, 8, 0), (4, 8, 1)):
+            solver, _ = self._optimize(
+                expression, {"x": (a, a), "y": (b, b), "resident": (lx, lx)}, False
+            )
+            expected = 8192 / 150 * (_matmul_multicast_penalty(a * b) - 1) * (1 - lx)
+            self.assertAlmostEqual(solver.ObjectiveValue(), expected, places=5)
+
     def test_piecewise_and_or_condition_lowering(self):
         # Exercises _print_And and _print_Or as Piecewise conditions.
         x, y = sympy.symbols("x y", integer=True)
@@ -1438,6 +1452,78 @@ class TestSympyExprToCpSatPrinter(TestCase):
         solver, sym_map = self._optimize(expr, {"x": (0, 5)}, maximize=True)
         self.assertEqual(solver.ObjectiveValue(), 10)
         self.assertEqual(solver.Value(sym_map["x"]), 2)
+
+    def test_conditional_cost_keeps_small_coefficients(self):
+        x, enabled = sympy.symbols("x enabled", integer=True, nonnegative=True)
+        # Rounding a small coefficient to zero erases a large total cost.
+        expression = sympy.Piecewise((1e-6 * x**2, sympy.Eq(enabled, 1)), (0, True))
+        for flag in (0, 1):
+            solver, _ = self._optimize(
+                expression, {"x": (10000, 10000), "enabled": (flag, flag)}, False
+            )
+            self.assertAlmostEqual(solver.ObjectiveValue(), 100.0 * flag, places=6)
+        solver, _ = self._optimize(
+            expression + sympy.Min(0.5 * x, 3.25),
+            {"x": (10000, 10000), "enabled": (1, 1)},
+            False,
+        )
+        self.assertAlmostEqual(solver.ObjectiveValue(), 103.25, places=6)
+        solver, variables = self._optimize(
+            expression + 50 * (1 - enabled),
+            {"x": (10000, 10000), "enabled": (0, 1)},
+            False,
+        )
+        self.assertEqual(solver.Value(variables["enabled"]), 0)
+        self.assertAlmostEqual(solver.ObjectiveValue(), 50.0, places=6)
+
+    def test_unreplicated_choice_in_a_product_of_splits(self):
+        from torch_spyre._inductor.cost_model import ArgTraffic, OpFeatures, predict_ops
+
+        b, m = sympy.symbols("b m", integer=True, positive=True)
+
+        def price(replication):
+            return predict_ops(
+                [
+                    OpFeatures(
+                        "bmm",
+                        True,
+                        64,
+                        8,
+                        2,
+                        [
+                            ArgTraffic(
+                                "buf0", "input", False, 4096, replication=replication
+                            ),
+                            ArgTraffic("buf1", "output", False, 64),
+                        ],
+                        is_matmul=True,
+                    )
+                ]
+            )
+
+        expression = price(b * m)
+        for batch, rows in ((1, 1), (1, 2), (2, 1)):
+            solver, _ = self._optimize(
+                expression, {"b": (batch, batch), "m": (rows, rows)}, False
+            )
+            self.assertAlmostEqual(
+                solver.ObjectiveValue(), price(batch * rows), delta=1
+            )
+
+    def test_conditional_minmax_operands_still_lower(self):
+        x, enabled = sympy.symbols("x enabled", integer=True, nonnegative=True)
+        conditional = sympy.Piecewise((0.5 * x, sympy.Eq(enabled, 1)), (1.5 * x, True))
+        for operation in (sympy.Min, sympy.Max):
+            expression = operation(1 + sympy.Min(conditional, 3.25), 7)
+            for flag in (0, 1):
+                solver, _ = self._optimize(
+                    expression, {"x": (4, 4), "enabled": (flag, flag)}, False
+                )
+                self.assertAlmostEqual(
+                    solver.ObjectiveValue(),
+                    float(expression.subs({x: 4, enabled: flag})),
+                    places=6,
+                )
 
     @staticmethod
     def _brute_force_product_bounds(domains):
