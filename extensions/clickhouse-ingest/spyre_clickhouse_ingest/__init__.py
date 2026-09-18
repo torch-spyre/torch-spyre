@@ -30,6 +30,8 @@ from .identity import (
     v2_run_id_for,
     v2_tags_for_case,
     v2_test_case_id,
+    v2_artifact_id,
+    v2_gha_artifact_id,
 )
 from .junit import (
     extract_properties,
@@ -57,4 +59,6 @@ __all__ = [
     "v2_tables_present",
     "v2_tags_for_case",
     "v2_test_case_id",
+    "v2_artifact_id",
+    "v2_gha_artifact_id",
 ]
