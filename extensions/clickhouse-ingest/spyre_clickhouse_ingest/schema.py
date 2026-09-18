@@ -155,7 +155,7 @@ class Table:
 
 
 # ── the v2 functional/benchmark tables, columns in DDL order ────────────────────────────
-# Source of truth: spyre-frameworks pipelines/clickhouse/functional_tests_v2.sql.
+# Source of truth: the CI pipeline's functional_tests_v2.sql.
 # `ts` is omitted from every one: it is DEFAULT now() and letting the server set it keeps the
 # ingest clock out of the data.
 
@@ -207,9 +207,8 @@ BENCHMARK_RUNS = Table(
 )
 
 # ── the four v2 ARTIFACT tables, columns in DDL order ───────────────────────────────────
-# Source of truth: spyre-frameworks pipelines/clickhouse/artifacts_v2.sql. Modelled here for
-# the same reason as the tables above -- the writer (Jenkins Groovy) and the readers (this
-# library's consumers and the dashboard) had no shared statement of a row's shape, and the
+# Source of truth: the CI pipeline's artifacts_v2.sql. Modelled here for the same reason as the
+# tables above -- the writer and the readers had no shared statement of a row's shape, and the
 # artifact tables are where that actually cost us.
 #
 # `ts` omitted throughout, as above: DEFAULT now() on the server.

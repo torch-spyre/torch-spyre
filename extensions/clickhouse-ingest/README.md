@@ -34,8 +34,8 @@ uses. Pin a tag, not `@main`.
 ## Tables modelled
 
 `test_cases`, `test_case_runs`, `benchmarks`, `benchmark_runs` (DDL: `functional_tests_v2.sql`)
-and `artifacts`, `artifact_refs`, `artifact_tags`, `artifact_results` (DDL: `artifacts_v2.sql`),
-both in spyre-frameworks `pipelines/clickhouse/`.
+and `artifacts`, `artifact_refs`, `artifact_tags`, `artifact_results` (DDL: `artifacts_v2.sql`).
+The DDL itself is applied by the CI pipeline that owns the warehouse, not from this repo.
 
 The model holds columns, order and the DDL's CHECK sets — not the DDL itself. `TABLES` is pinned
 as an exact set by `tests/test_schema.py`, so adding a table to the DDL without modelling it here
