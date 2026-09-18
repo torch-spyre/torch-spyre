@@ -25,7 +25,6 @@ independent from PyTorch's global ``torch._inductor.decomposition.decompositions
 registry; Spyre never mutates the global table.
 """
 
-import contextlib
 import dataclasses
 import math
 import threading
@@ -1185,25 +1184,10 @@ def spyre__sdpa_overrideable(
     if dropout_p > 0.0:
         raise Unsupported("Attention dropout not implemented for Spyre")
 
-    # The named_dims seeds below zip names positionally to each seeded op's
-    # PHYSICAL output layout. host_coordinates derives the coord expressions
-    # from the op's physical STRIDES, so the tiler's loop-var -> logical-dim
-    # mapping follows physical stride order, not logical dim order. SDPA is
-    # routinely called with q/k/v as transpose(1, 2) views of a [B, S, H, D]
-    # tensor, so query's physical layout is [B, S, H, D] while its logical shape
-    # is [B, H, S, D]. Seeding ["_b","num_heads","max_seqlen_q",...] on such
-    # a buffer then maps the tile onto the head axis instead of the query
-    # axis and the result is wrong.
-    #
-    # Normalize the QUERY wholesale: query.contiguous() is bounded (same
-    # footprint as the `output` buffer we allocate below) and makes every
-    # query-derived seed (q_scaled, zeros_like(query), the final permute) land
-    # on logical [B, H, S, D] order. We do NOT contiguify key/value wholesale --
-    # that materializes a full [B, H, S_kv, D] copy that OOMs on long KV. K/V are
-    # instead normalized PER BLOCK where required. The keys_T .contiguous() is a
-    # bounded [B, H, D, kv_block_size] copy chosen by the cost model, never an
-    # implicit full [B, H, S_kv, D] copy. V is read directly. Decode can
-    # intentionally choose a full block for short sequences.
+    # Normalize the query to logical [B, H, S, D] order. SDPA routinely receives
+    # transpose(1, 2) views backed by [B, S, H, D] storage, while each HOP level
+    # slices a logical axis. We do not contiguify key/value wholesale because
+    # that can OOM on long KV; they are normalized one bounded tile at a time.
     original_query_strides = query.stride()
     if num_heads % num_kvheads != 0:
         raise Unsupported(
@@ -1220,24 +1204,6 @@ def spyre__sdpa_overrideable(
     query = query.contiguous()
     if use_gqa:
         query = query.unflatten(1, (num_kvheads, gqa_group_size))
-
-    query_dim_names = (
-        [
-            "_b",
-            "num_kvheads",
-            "gqa_group_size",
-            "max_seqlen_q",
-            "head_dim",
-        ]
-        if use_gqa
-        else ["_b", "num_heads", "max_seqlen_q", "head_dim"]
-    )
-    accumulator_dim_names = query_dim_names[:-1]
-    accumulator_shape = (
-        (batch_size, num_kvheads, gqa_group_size, max_seqlen_q, 64)
-        if use_gqa
-        else (batch_size, num_heads, max_seqlen_q, 64)
-    )
 
     tiling = _select_sdpa_tiling(
         batch_size=batch_size,
@@ -1271,28 +1237,6 @@ def spyre__sdpa_overrideable(
         tiling.estimated_live_bytes_per_core,
         tiling.lx_budget_bytes,
     )
-
-    with spyre_hint(named_dims=query_dim_names):
-        output = torch.zeros_like(query)
-
-    # FIXME: create a sparse M tensor via reduction
-    M_reduced = torch.full(
-        accumulator_shape,
-        float("-inf"),
-        device=query.device,
-        dtype=query.dtype,
-    )
-    with spyre_hint(named_dims=accumulator_dim_names):
-        M = M_reduced.amax(dim=-1)
-
-    # FIXME: create a sparse denominator tensor via reduction
-    denominator_reduced = torch.zeros(
-        accumulator_shape,
-        device=query.device,
-        dtype=query.dtype,
-    )
-    with spyre_hint(named_dims=accumulator_dim_names):
-        denominator = denominator_reduced.amax(dim=-1)
 
     # Precompute the causal additive mask once before entering the tiled loops.
     # Shape [1, 1, max_seqlen_q, max_seqlen_kv]: 0.0 = keep, -inf = masked.
@@ -1328,6 +1272,13 @@ def spyre__sdpa_overrideable(
             raise Unsupported(
                 f"GQA attention bias must have rank 2-5, got rank {attn_bias.dim()}"
             )
+    elif attn_bias is not None:
+        while attn_bias.dim() < 4:
+            attn_bias = attn_bias.unsqueeze(0)
+        if attn_bias.dim() != 4:
+            raise Unsupported(
+                f"MHA attention bias must have rank 2-4, got rank {attn_bias.dim()}"
+            )
 
     # for_each_tile requires equal-sized tiles. The cost model already returns
     # an exact, stick-aligned block; retain the calculation here as a safety net
@@ -1339,111 +1290,144 @@ def spyre__sdpa_overrideable(
     )
     kv_tile_size = max_seqlen_kv // num_kv_tiles
 
-    score_dim_names = (
-        [
-            "_b",
-            "num_kvheads",
-            "gqa_group_size",
-            "max_seqlen_q",
-            "blk_len",
-        ]
-        if use_gqa
-        else ["_b", "num_heads", "max_seqlen_q", "blk_len"]
+    masks = tuple(
+        mask
+        for mask in (
+            causal_mask if is_causal else None,
+            attn_bias,
+        )
+        if mask is not None
     )
 
-    loop_operands = [key, value]
-    loop_dims: list[int | None] = [-2, -2]
-    if is_causal:
-        loop_operands.append(causal_mask)
-        loop_dims.append(-1)
-    if attn_bias is not None:
-        loop_operands.append(attn_bias)
-        if attn_bias.size(-1) == max_seqlen_kv:
-            loop_dims.append(-1)
-        elif attn_bias.size(-1) == 1:
-            loop_dims.append(None)
-        else:
-            raise Unsupported(
-                "Attention bias last dimension must be 1 or the K/V sequence "
-                f"length, got {attn_bias.size(-1)} and {max_seqlen_kv}"
+    def mask_dims(axis, extent):
+        return tuple(axis if mask.size(axis) == extent else None for mask in masks)
+
+    def map_tiles(body, operands, dims, tile_size, out_dim):
+        sliced_operand, sliced_dim = next(
+            (operand, dim) for operand, dim in zip(operands, dims) if dim is not None
+        )
+        if sliced_operand.size(sliced_dim) == tile_size:
+            _, result = body(None, operands)
+            return result
+        _, result = for_each_tile(
+            body,
+            operands,
+            dims=dims,
+            tile_size=tile_size,
+            out_dim=out_dim,
+        )
+        return result
+
+    def kv_level(q_tile, k_tile, v_tile, *mask_tiles):
+        # Q is invariant across the counted Lk loop.
+        q_scaled = q_tile * query_scale
+
+        # Keep the sparse accumulator representation used by production SDPA,
+        # but size it to the current outer-loop tile.
+        tile_accumulator_shape = (*q_tile.shape[:-1], 64)
+        running_max_reduced = torch.full(
+            tile_accumulator_shape,
+            float("-inf"),
+            device=q_tile.device,
+            dtype=q_tile.dtype,
+        )
+        running_max = running_max_reduced.amax(dim=-1)
+        denominator_reduced = torch.zeros(
+            tile_accumulator_shape,
+            device=q_tile.device,
+            dtype=q_tile.dtype,
+        )
+        denominator = denominator_reduced.amax(dim=-1)
+        output_tile = torch.zeros_like(q_tile)
+
+        def sdpa_lk_body(carry, tiles):
+            block_maximum, block_denominator, block_output = carry
+            _, k_blk, v_blk, *block_masks = tiles
+            if use_gqa:
+                k_blk = k_blk.unsqueeze(2)
+                v_blk = v_blk.unsqueeze(2)
+
+            keys_T = k_blk.transpose(-1, -2).contiguous()
+            scores = (
+                torch.ops.spyre.batched_matmul(q_scaled, keys_T)
+                if use_gqa
+                else torch.matmul(q_scaled, keys_T)
             )
+            for block_mask in block_masks:
+                scores = scores + block_mask
 
-    with spyre_hint(tiles={"batch_size": max(1, batch_size // 2)}):
-        head_tiles = {} if use_gqa else {"num_heads": tiling.num_head_tiles}
-        with spyre_hint(tiles=head_tiles):
-            with (
-                spyre_hint(num_tiles_per_dim={"max_seqlen_q": tiling.num_q_tiles}),
-                (
-                    spyre_hint(work_div=tiling.work_div)
-                    if tiling.work_div is not None
-                    else contextlib.nullcontext()
-                ),
-            ):
-                # Q is invariant across the counted Lk loop.
-                with spyre_hint(named_dims=query_dim_names):
-                    q_scaled = query * query_scale
+            block_max = torch.amax(scores, dim=-1)
+            # Compute the old-max correction before producing new_max. The loop
+            # lowering can then update running_max in place without snapshotting
+            # its old value for a later reader.
+            correction = torch.exp(torch.clamp_max(block_maximum - block_max, 0.0))
+            new_max = torch.maximum(block_maximum, block_max)
+            exp_scores = torch.exp(scores - new_max.unsqueeze(-1))
+            new_denominator = block_denominator * correction + exp_scores.sum(dim=-1)
+            exp_scores_c = exp_scores.contiguous()
+            weighted = (
+                torch.ops.spyre.batched_matmul(exp_scores_c, v_blk)
+                if use_gqa
+                else torch.matmul(exp_scores_c, v_blk)
+            )
+            new_output = block_output * correction.unsqueeze(-1) + weighted
+            return (new_max, new_denominator, new_output), None
 
-                def sdpa_lk_body(carry, tiles):
-                    running_max, running_denom, running_output = carry
-                    k_blk, v_blk, *mask_blocks = tiles
-                    if use_gqa:
-                        k_blk = k_blk.unsqueeze(2)
-                        v_blk = v_blk.unsqueeze(2)
+        kv_operands = (q_tile, k_tile, v_tile, *mask_tiles)
+        kv_dims = (None, -2, -2, *mask_dims(-1, max_seqlen_kv))
+        initial = (running_max, denominator, output_tile)
+        if num_kv_tiles == 1:
+            (_, denominator, output_tile), _ = sdpa_lk_body(initial, kv_operands)
+        else:
+            (_, denominator, output_tile), _ = for_each_tile(
+                sdpa_lk_body,
+                kv_operands,
+                dims=kv_dims,
+                tile_size=kv_tile_size,
+                init=initial,
+            )
+        return output_tile / denominator.unsqueeze(-1)
 
-                    keys_T = k_blk.transpose(-1, -2).contiguous()
+    def query_level(q_tile, k_tile, v_tile, *mask_tiles):
+        operands = (q_tile, k_tile, v_tile, *mask_tiles)
+        dims = (-2, None, None, *mask_dims(-2, max_seqlen_q))
 
-                    with spyre_hint(named_dims=score_dim_names):
-                        scores = (
-                            torch.ops.spyre.batched_matmul(q_scaled, keys_T)
-                            if use_gqa
-                            else torch.matmul(q_scaled, keys_T)
-                        )
+        def body(_, tiles):
+            return None, kv_level(*tiles)
 
-                    mask_index = 0
-                    if is_causal:
-                        scores = scores + mask_blocks[mask_index]
-                        mask_index += 1
-                    if attn_bias is not None:
-                        scores = scores + mask_blocks[mask_index]
+        return map_tiles(body, operands, dims, tiling.q_tile_size, -2)
 
-                    block_max = torch.amax(scores, dim=-1)
-                    # Compute the old-max correction before producing new_max.
-                    # The loop lowering can then update running_max in place
-                    # without snapshotting its old value for a later reader.
-                    correction = torch.exp(
-                        torch.clamp_max(running_max - block_max, 0.0)
-                    )
-                    new_max = torch.maximum(running_max, block_max)
-                    exp_scores = torch.exp(scores - new_max.unsqueeze(-1))
-                    new_denom = running_denom * correction + exp_scores.sum(dim=-1)
-                    exp_scores_c = exp_scores.contiguous()
-                    with spyre_hint(named_dims=query_dim_names):
-                        weighted = (
-                            torch.ops.spyre.batched_matmul(exp_scores_c, v_blk)
-                            if use_gqa
-                            else torch.matmul(exp_scores_c, v_blk)
-                        )
-                    new_output = running_output * correction.unsqueeze(-1) + weighted
-                    return (new_max, new_denom, new_output), None
+    def group_level(q_tile, k_tile, v_tile, *mask_tiles):
+        if not use_gqa:
+            return query_level(q_tile, k_tile, v_tile, *mask_tiles)
+        operands = (q_tile, k_tile, v_tile, *mask_tiles)
+        dims = (2, None, None, *mask_dims(2, gqa_group_size))
 
-                if num_kv_tiles == 1:
-                    # scan-to-while-loop cannot currently trace a one-trip scan
-                    # because its unrolled replacement extracts the loop index
-                    # with item(). There is no compile-time unrolling to avoid in
-                    # this case, so invoke the body directly.
-                    (M, denominator, output), _ = sdpa_lk_body(
-                        (M, denominator, output), tuple(loop_operands)
-                    )
-                else:
-                    (M, denominator, output), _ = for_each_tile(
-                        sdpa_lk_body,
-                        tuple(loop_operands),
-                        dims=tuple(loop_dims),
-                        tile_size=kv_tile_size,
-                        init=(M, denominator, output),
-                    )
-                with spyre_hint(named_dims=query_dim_names):
-                    output = output / denominator.unsqueeze(-1)
+        def body(_, tiles):
+            return None, query_level(*tiles)
+
+        return map_tiles(body, operands, dims, 1, 2)
+
+    def head_level(q_tile, k_tile, v_tile, *mask_tiles):
+        head_extent = num_kvheads if use_gqa else num_heads
+        head_tile_size = 1 if use_gqa else num_heads // max(1, tiling.num_head_tiles)
+        operands = (q_tile, k_tile, v_tile, *mask_tiles)
+        dims = (1, 1, 1, *mask_dims(1, head_extent))
+
+        def body(_, tiles):
+            return None, group_level(*tiles)
+
+        return map_tiles(body, operands, dims, head_tile_size, 1)
+
+    batch_tile_count = _num_tiles_for_max_extent(batch_size, 2)
+    batch_tile_size = batch_size // batch_tile_count
+    operands = (query, key, value, *masks)
+    dims = (0, 0, 0, *mask_dims(0, batch_size))
+
+    def batch_body(_, tiles):
+        return None, head_level(*tiles)
+
+    output = map_tiles(batch_body, operands, dims, batch_tile_size, 0)
     if use_gqa:
         output = output.flatten(1, 2)
     # The reference meta kernel for this op
