@@ -34,6 +34,12 @@ INGEST_PATH = (
     Path(__file__).resolve().parents[1] / ".github" / "scripts" / "ingest_xml.py"
 )
 
+# The ingest imports the shared library from extensions/; it is in this repo, so put it on
+# sys.path rather than requiring an install for a parse-only test.
+_CHLIB = Path(__file__).resolve().parents[1] / "extensions" / "clickhouse-ingest"
+if str(_CHLIB) not in sys.path:
+    sys.path.insert(0, str(_CHLIB))
+
 
 @pytest.fixture(scope="module")
 def ingest():
@@ -538,6 +544,32 @@ def test_component_changes_test_case_identity(ingest):
     # Why a wrong stamp is not merely a mislabel: component is a test_case_id hash input, so
     # the same test reconciles to a different identity under a different component. This is
     # the defect --component exists to prevent.
-    a = ingest.v2_test_case_id("torch-spyre", "T", "test_x", [])
-    b = ingest.v2_test_case_id("hf-adapters", "T", "test_x", [])
+    # From the library, which the ingest now uses rather than a local copy.
+    from spyre_clickhouse_ingest import v2_test_case_id
+
+    a = v2_test_case_id("torch-spyre", "T", "test_x", [])
+    b = v2_test_case_id("hf-adapters", "T", "test_x", [])
     assert a and b and a != b
+
+
+def test_ingest_uses_the_shared_library_not_a_local_copy(ingest):
+    # The point of extensions/clickhouse-ingest is that ONE definition runs. A local copy that
+    # merely agrees today passes every value-based test while drifting silently, so assert
+    # object identity: editing the library must change what the ingest executes.
+    import spyre_clickhouse_ingest as lib
+
+    for name in (
+        "v2_canonical_arch",
+        "v2_component",
+        "v2_run_id_for",
+        "v2_already_ingested",
+        "insert_v2",
+        "extract_properties",
+        "promote_xpass",
+        "v2_source_and_external_run_id",
+        "get_client",
+        "v2_database",
+        "v2_tables_present",
+    ):
+        assert getattr(ingest, name) is getattr(lib, name), name
+    assert ingest.v2_schema is lib.schema

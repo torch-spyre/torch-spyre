@@ -17,8 +17,8 @@
 A relayout group's destination is a ``RelayoutCopyBuffer``: an ordinary buffer
 whose residency IS the decision to shuffle, placed by the same no-overlap as
 everything else and priced by a plain term of the shared sympy objective
-(``cost_term``). Handcrafted buffers drive the pieces directly - no graph, no
-compile:
+(``cost_term``, one ``RelayoutCharge`` node per copy). Handcrafted buffers
+drive the pieces directly - no graph, no compile:
 
 - the price term is solver-agnostic: evaluated by ``lambdify`` it charges the
   source's chosen division exactly when the copy is resident;
@@ -482,7 +482,7 @@ def test_copy_spans_a_consumer_outside_the_group():
 def test_charge_follows_the_chosen_source_division():
     """P offers two divisions whose shuffles into the same destination view
     price differently (5000 vs 3000 ns). The solver picks the cheaper source
-    division, and the KroneckerDelta term charges that price: with the
+    division, and the RelayoutCharge term charges that price: with the
     spill at 4000 only the cheaper division makes the relayout worth it."""
     bufs = _with_copies(
         _producer([0, 3], divisions=2),

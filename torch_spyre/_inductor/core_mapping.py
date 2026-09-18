@@ -80,11 +80,12 @@ def owner_slots(
             "ownership split and owner-slot dimensions differ: "
             f"{sorted(map(str, splits))} != {sorted(map(str, slots))}"
         )
+    formulas = {dim: sympify(slots[dim]) for dim in splits}
     rows = []
     for core in range(num_cores):
         row = {}
         for dim, split in splits.items():
-            value = _owner_at_core(sympify(slots[dim]), core)
+            value = _owner_at_core(formulas[dim], core)
             if value.free_symbols or value.is_integer is not True:
                 raise ValueError(f"non-integral owner slot {value} on core {core}")
             if not 0 <= int(value) < int(split):
@@ -912,19 +913,45 @@ def core_mappings_equal(
     right: Mapping[Any, Expr],
     num_cores: int,
 ) -> bool:
-    """Return whether two symbolic mappings assign every core identically."""
+    """Return whether two symbolic mappings assign every core identically.
+
+    Memoized on the two mappings: the planner compares the same handful of
+    owner formulas thousands of times (view interning, the slicing-match gate
+    and the movement gate all go through here, and structurally identical ops
+    such as attention's unrolled KV blocks induce identical views). Profiled
+    on a 304-op graph this was 5 million ``sympify`` calls.
+    """
 
     if left.keys() != right.keys():
         return False
     if num_cores <= 0:
         return False
     try:
-        for dim in left:
+        key_left = tuple(
+            sorted(
+                ((str(d), sympify(e)) for d, e in left.items()), key=lambda kv: kv[0]
+            )
+        )
+        key_right = tuple(
+            sorted(
+                ((str(d), sympify(e)) for d, e in right.items()), key=lambda kv: kv[0]
+            )
+        )
+    except (TypeError, ValueError):
+        return False
+    return _core_mappings_equal_cached(key_left, key_right, num_cores)
+
+
+@lru_cache(maxsize=65536)
+def _core_mappings_equal_cached(
+    left: tuple[tuple[str, Expr], ...],
+    right: tuple[tuple[str, Expr], ...],
+    num_cores: int,
+) -> bool:
+    try:
+        for (_, lf), (_, rf) in zip(left, right):
             for core in range(num_cores):
-                values = [
-                    _owner_at_core(sympify(mapping[dim]), core)
-                    for mapping in (left, right)
-                ]
+                values = [_owner_at_core(f, core) for f in (lf, rf)]
                 if any(
                     value.free_symbols or value.is_integer is not True
                     for value in values

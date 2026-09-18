@@ -380,6 +380,46 @@ def division_symbol(buffer_name: str) -> sympy.Symbol:
     return sympy.Symbol(f"division_{buffer_name}", integer=True, nonnegative=True)
 
 
+class RelayoutCharge(sympy.Function):
+    """``RelayoutCharge(is_lx, division, price_0, ..., price_n)``: the shuffle
+    price of a relayout copy as one objective node, ``is_lx * price[division]``.
+
+    A table lookup written as algebra (``is_lx * sum_i price_i *
+    KroneckerDelta(division, i)``) is one boolean product per priced division
+    once ``expand`` has been over it: on the 304-op spyre_attn decode graph its
+    5789 copies made a 39,948-term objective and 183 to 305 s of rewriting
+    before the solver saw it. As a single function node the term is opaque to
+    the rewrite passes and each engine lowers it in its own vocabulary: CP-SAT
+    as one ``element`` lookup plus a charge reified on residency
+    (``_SympyExprToCpSat._print_RelayoutCharge``), ``lambdify`` through
+    :meth:`_imp_`. The table is indexed by the source's division index and an
+    index past its end reads 0 (an unpriced division, which the engine forbids
+    while the copy is resident anyway).
+
+    ``eval`` folds the node to a number as soon as ``is_lx`` is 0 or both
+    ``is_lx`` and ``division`` are numeric, so a substituted objective
+    simplifies the way the algebraic form did.
+    """
+
+    is_real = True
+    is_nonnegative = True
+
+    @classmethod
+    def eval(cls, is_lx, division, *prices):
+        if is_lx.is_Number:
+            if is_lx.is_zero:
+                return sympy.S.Zero
+            if division.is_Integer:
+                i = int(division)
+                return is_lx * (prices[i] if 0 <= i < len(prices) else sympy.S.Zero)
+        return None
+
+    @staticmethod
+    def _imp_(is_lx, division, *prices):
+        i = int(round(division))
+        return is_lx * (prices[i] if 0 <= i < len(prices) else 0)
+
+
 RELAYOUT_COPY_PREFIX = "__spyre_lx_relayout__:copy:"
 
 
@@ -447,6 +487,12 @@ class RelayoutCopyBuffer(CoreDivisionBuffer):
         return self.relayout_parent, self.group
 
     @property
+    def per_core_footprint(self) -> int:
+        """The destination span: what one core must hold for the copy to be
+        resident (``size`` is that span times the destination core count)."""
+        return ceil_div(self.size, self.num_cores)
+
+    @property
     def consumers(self) -> tuple[str, ...]:
         return tuple(sorted({c.consumer for c in self.candidates}))
 
@@ -474,16 +520,21 @@ class RelayoutCopyBuffer(CoreDivisionBuffer):
         """The group's objective contribution: the fitted shuffle price of the
         source's chosen division, charged once, only while the copy is resident.
 
-        ``is_lx_copy * sum_i price_i * KroneckerDelta(division_source, i)`` -
-        every factor is a symbol an engine already binds (:attr:`sym_is_lx`,
-        :attr:`sym_division`), so it lowers wherever the rest of the objective
-        does: CP-SAT reifies the delta to a literal, ``lambdify`` evaluates it.
-        Deltas rather than ``Eq``: sympy forbids arithmetic on relationals.
+        ``RelayoutCharge(is_lx_copy, division_source, price_0, ..., price_n)``,
+        the table of prices in nanoseconds (rounded to the objective's integer
+        unit) indexed by the source's division, 0 where a division is unpriced.
+        Every argument is a symbol an engine already binds (:attr:`sym_is_lx`,
+        :attr:`sym_division`) or a constant, so it lowers wherever the rest of
+        the objective does; see :class:`RelayoutCharge` for why it is one node
+        rather than a sum of deltas.
         """
-        source = division_symbol(self.relayout_parent)
-        return self.sym_is_lx * sum(
-            price * sympy.KroneckerDelta(source, i)
-            for i, price in sorted(self.cost_by_source_division.items())
+        prices = self.cost_by_source_division
+        table = [
+            sympy.Integer(round(prices.get(i, 0.0)))
+            for i in range(max(prices, default=-1) + 1)
+        ]
+        return RelayoutCharge(
+            self.sym_is_lx, division_symbol(self.relayout_parent), *table
         )
 
 
@@ -724,6 +775,10 @@ class CoreDivisionLayoutSolver(MemoryPlanSolver):
         index of the chosen division back to ``chosen_division`` for the
         allocator to commit. Operates on :attr:`buffers`, each of which must
         carry its enumerated candidate core divisions.
+
+        ``cost_expr`` carries every :class:`RelayoutCopyBuffer`'s price as one
+        :class:`RelayoutCharge` node (:meth:`RelayoutCopyBuffer.cost_term`),
+        which each engine lowers in its own vocabulary.
 
         Returns:
             The same buffers, with placements and chosen divisions defined.

@@ -2957,16 +2957,20 @@ def _real_layout_matches_op_size(
     body's own mutation op writes only a `[2, 6]` tile of a `[4, 2, 6]`
     invariant buffer at an offset like `12*u0`).
 
-    A *static* ReinterpretView slice (concrete, symbol-free offset) of a
-    buffer that already has its own committed FixedTiledLayout is not that
-    case: the op writes a fixed sub-region of a real, already-laid-out
-    buffer once (e.g. constant_pad_nd's fill/copy ops writing the pad strip
-    vs. the copied interior of the same padded output buffer), so
-    real_layout() -- the target buffer's own layout -- is exactly right to
-    reuse, size mismatch notwithstanding: this op's write is smaller than
-    the buffer only because it is one piece of it, not because real_layout()
-    picked the wrong tiling scheme.
+    A *static*, rank-preserving ReinterpretView slice (concrete, symbol-free
+    offset) of a buffer that already has its own committed FixedTiledLayout
+    is not that case: the op writes a fixed sub-region of a real,
+    already-laid-out buffer once (e.g. constant_pad_nd's fill/copy ops writing
+    the pad strip vs. the copied interior of the same padded output buffer),
+    so real_layout() -- the target buffer's own layout -- is exactly right to
+    reuse, size mismatch notwithstanding.  A rank-changing view is different:
+    its logical coordinates cannot be indexed with the backing layout's
+    strides, even when the offset is static, so it must use the clean logical
+    layout built below.
     """
+    logical_size = list(node.data.get_size())
+    if len(logical_size) != len(real.size):
+        return False
     if list(node.get_layout().size) == list(real.size):
         return True
     target = node.get_layout().target

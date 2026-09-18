@@ -1719,6 +1719,24 @@ def _matmul_ns_bundled(ops: list, p: CostParams) -> float:
     return compute + split_ns
 
 
+def _lazy_min(r, w):
+    """``min`` of two bundle-level terms, built unevaluated when symbolic.
+
+    Under co-optimization the turnaround overlap ``min(R, W)`` and the
+    compute/memory overlap ``min(compute, mem)`` combine large sums over the
+    residency and split symbols, and an evaluated ``sympy.Min`` first asks the
+    assumptions system whether one side dominates the other
+    (``_find_localzeros``): 13.9 s per site on a 304-op graph. Every consumer
+    of the objective (the CP-SAT printer, ``lambdify``, ``evalf``) handles the
+    unevaluated node; numeric inputs take the plain ``min``.
+    """
+    if isinstance(r, sympy.Basic) or isinstance(w, sympy.Basic):
+        if getattr(r, "free_symbols", None) or getattr(w, "free_symbols", None):
+            return sympy.Min(r, w, evaluate=False)
+        return sympy.Min(r, w)
+    return min(r, w)
+
+
 def predict_ops(ops: list, params: CostParams | None = None) -> float:
     """Predicted device latency (ns) for a bundle of ops (one fused kernel).
 
@@ -1787,9 +1805,9 @@ def predict_ops(ops: list, params: CostParams | None = None) -> float:
             if bw:
                 mem += (ro + wo) / bw
             else:
-                mem += (ro + wo) / p.bw_peak_gbps + p.rw_turnaround_ns_per_byte * min(
-                    ro, wo
-                )
+                mem += (
+                    ro + wo
+                ) / p.bw_peak_gbps + p.rw_turnaround_ns_per_byte * _lazy_min(ro, wo)
     elif (
         len(ops) == 1
         and ops[0].is_reduction
@@ -1832,9 +1850,9 @@ def predict_ops(ops: list, params: CostParams | None = None) -> float:
         # config. NOTE the floor is applied to the FINAL memory time below, not here:
         # `mem` is still divided by the underfill/spill derates further down, which
         # would inflate a floor imposed at this point by 1/(eff*spill_derate).
-        mem = (r + w) / p.bw_peak_gbps + p.rw_turnaround_ns_per_byte * min(r, w)
+        mem = (r + w) / p.bw_peak_gbps + p.rw_turnaround_ns_per_byte * _lazy_min(r, w)
     else:
-        mem = (r + w) / p.bw_peak_gbps + p.rw_turnaround_ns_per_byte * min(r, w)
+        mem = (r + w) / p.bw_peak_gbps + p.rw_turnaround_ns_per_byte * _lazy_min(r, w)
     mem = mem + rep_ns
     # NOTE: a multi-op dependent chain (e.g. add3/add4 = chained binary adds) runs
     # slower than its byte count because the intermediate is written then read back
@@ -1917,7 +1935,13 @@ def predict_ops(ops: list, params: CostParams | None = None) -> float:
     # Measured on x*2 + x*3 (cores=32): with the clone the fused kernel is exactly one
     # read plus one write at 150 GB/s (113 us at x = 8 MiB, 222 us at 16 MiB).
     clone_ns = _clone_in_bytes(ops) / p.bw_peak_gbps
-    t = compute + mem_t - p.overlap_gamma * min(compute, mem_t) + rel_ns + clone_ns
+    t = (
+        compute
+        + mem_t
+        - p.overlap_gamma * _lazy_min(compute, mem_t)
+        + rel_ns
+        + clone_ns
+    )
     # (A genuine-reduction cross-core ring-combine term once lived here; it is provably
     # bounded by ~cores * a tiny per-elem cost <= ~5 ns -- below run-to-run noise --
     # so it is dropped as inert. K is never split for matmul, so there is no matmul

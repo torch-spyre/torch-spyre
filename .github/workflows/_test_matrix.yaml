@@ -365,6 +365,33 @@ jobs:
           resolved=$(echo "${RAW_TEST_TYPE}" | xargs)
           echo "resolved_test_type=$resolved" >> "$GITHUB_OUTPUT"
 
+      # The threaded run_id has to reach push-to-clickhouse.yaml, which already looks for this
+      # artifact (see its "Recover threaded run_id" step). That workflow runs on workflow_run
+      # AFTER this one, so it cannot receive a dispatch input -- and an artifact is the channel
+      # it ALREADY enumerates to find the junit XML, so the uuid rides it rather than needing a
+      # new transport or a uuid in the user-facing run-name.
+      #
+      # Without this the chain is half-built: artifact_results carries the orchestrator's uuid
+      # while the ingest derives its own, so the two never share a run_id and the
+      # artifacts -> artifact_results -> test_case_runs join stays empty. Observed exactly that
+      # -- 27 threaded rows on the Jenkins side, `Threaded run_id: <none, ingest will derive>`
+      # in every ingest log.
+      #
+      # Skipped when empty, so a GHA-initiated run uploads nothing and the ingest derives its
+      # own id, as before.
+      - name: Record threaded run_id for the ingest
+        if: ${{ inputs.run_id != '' }}
+        env:
+          THREADED_RUN_ID: ${{ inputs.run_id }}
+        run: printf '%s' "${THREADED_RUN_ID}" > run-id.txt
+      - name: Upload threaded run_id
+        if: ${{ inputs.run_id != '' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: run-id
+          path: run-id.txt
+          retention-days: 1
+
   # ---------------------------------------------------------------------------
   # Job 0b: build torch-spyre ONCE
   #
@@ -681,7 +708,11 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.event.pull_request.head.sha || github.sha }}
           repository: ${{ inputs.repository || github.event.pull_request.head.repo.full_name || github.repository }}
-          sparse-checkout: .github
+          # extensions/ too: the ingest action installs the library from this checkout,
+          # and .github alone yields the script without it.
+          sparse-checkout: |
+            .github
+            extensions/clickhouse-ingest
           sparse-checkout-cone-mode: false
 
       - if: ${{ !inputs.prebaked_image }}

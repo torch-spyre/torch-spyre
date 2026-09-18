@@ -96,9 +96,17 @@ tests: ## Run torch spyre tests, fanning out into tests-single-card + tests-mult
 # writes report.xml into RESULTS_DIR. Keeping it a mode of `tests` lets CI call
 # it through the same `make tests TEST_TYPE=...` entry point as every other
 # suite, so no new Makefile target or Jenkins wiring is needed.
+#
+# SENPERFORMANCE=2 must be in the environment before spyre-perf-suite launches
+# its benchmark subprocesses (which import torch and initialize the Spyre
+# runtime). Only then does the compiler emit the per-kernel ideal_cycles.json
+# that PT-active utilization (pt_util%) is computed from; without it that metric
+# is absent or zero. The ${VAR:-2} default leaves an inherited value (base
+# image or caller) untouched, and prefixing the command scopes the export to
+# this one invocation rather than every `make tests` target.
 ifeq ($(TEST_TYPE),perf)
 	@mkdir -p "$(RESULTS_DIR)"
-	spyre-perf-suite --no-experimental --stacks torch-spyre \
+	SENPERFORMANCE="$${SENPERFORMANCE:-2}" spyre-perf-suite --no-experimental --stacks torch-spyre \
 		--report "$(RESULTS_DIR)/report.txt"
 	@test -f "$(RESULTS_DIR)/report.xml" || \
 		{ echo "ERROR: spyre-perf-suite did not emit $(RESULTS_DIR)/report.xml" >&2; \
