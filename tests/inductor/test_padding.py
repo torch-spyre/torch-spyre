@@ -43,7 +43,10 @@ from torch_spyre._inductor import spyre_hint
 from torch_spyre._inductor.constants import BATCH_MATMUL_OP
 from torch_spyre._inductor.ir import FixedTiledLayout, SpyreConstantFallback
 from torch_spyre._inductor.passes import CustomPreSchedulingPasses
-from torch_spyre._inductor.padding import _is_dense_flattened_coordinate
+from torch_spyre._inductor.padding import (
+    _is_dense_flattened_coordinate,
+    _restickify_input_required_extent,
+)
 from torch_spyre._inductor.wsr.propagate_named_dims import (
     declare_tensor_dim,
     name_tensor_dims,
@@ -71,6 +74,49 @@ class TestRestickifyInputCoordinate(unittest.TestCase):
 
         self.assertFalse(_is_dense_flattened_coordinate(256 * head + feature, ranges))
         self.assertFalse(_is_dense_flattened_coordinate(head + 32 * feature, ranges))
+
+    def test_dense_flattened_required_extent(self) -> None:
+        batch, sequence = sympy.symbols("batch sequence", integer=True)
+
+        self.assertEqual(
+            _restickify_input_required_extent(
+                64 * batch + sequence,
+                {batch: 2, sequence: 64},
+                sequence,
+                torch.float16,
+            ),
+            128,
+        )
+        self.assertEqual(
+            _restickify_input_required_extent(
+                64 * batch + sequence + 7,
+                {batch: 2, sequence: 64},
+                sequence,
+                torch.float16,
+            ),
+            135,
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "requires a re-base copy"):
+            _restickify_input_required_extent(
+                63 * batch + sequence,
+                {batch: 2, sequence: 63},
+                sequence,
+                torch.float16,
+            )
+
+    def test_single_symbol_required_extent_preserves_split_coordinate(self) -> None:
+        sequence = sympy.symbols("sequence", integer=True)
+
+        self.assertEqual(
+            _restickify_input_required_extent(
+                sympy.floor(sequence / 64),
+                {sequence: 128},
+                sequence,
+                torch.float16,
+            ),
+            128,
+        )
 
 
 # ---------------------------------------------------------------------------

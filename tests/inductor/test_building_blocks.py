@@ -653,6 +653,55 @@ class TestBuildingBlocks(unittest.TestCase):
         ).cpu()
         torch.testing.assert_close(actual, expected, atol=0.2, rtol=0.2)
 
+    def test_grouped_sdpa_from_packed_rows(self):
+        """A packed row dimension may be viewed as batch x sequence.
+
+        The per-tile K restickify reads its physical row coordinate as the
+        dense flattening ``L * batch + sequence``.  Input padding must account
+        for all batches instead of assuming one symbol per physical dimension.
+        """
+        group, heads, head_dim = 2, 12, 64
+        generator = torch.Generator().manual_seed(4676)
+        for extent in (63, 64):
+            with self.subTest(extent=extent):
+                rows = group * extent
+                q, k, v = (
+                    torch.randn(
+                        (rows, heads, head_dim),
+                        dtype=torch.float16,
+                        generator=generator,
+                    )
+                    for _ in range(3)
+                )
+                mask = torch.zeros(group, 1, 1, extent, dtype=torch.float16)
+
+                def sdpa_grouped(q_rows, k_rows, v_rows, mask):
+                    def unpack(x):
+                        return x.reshape(group, extent, heads, head_dim).transpose(1, 2)
+
+                    attn = F.scaled_dot_product_attention(
+                        unpack(q_rows),
+                        unpack(k_rows),
+                        unpack(v_rows),
+                        attn_mask=mask,
+                        scale=head_dim**-0.5,
+                    )
+                    return attn.transpose(1, 2).reshape(rows, heads, head_dim)
+
+                expected = sdpa_grouped(q, k, v, mask)
+                actual = torch.compile(sdpa_grouped, fullgraph=True, dynamic=False)(
+                    q.to("spyre"),
+                    k.to("spyre"),
+                    v.to("spyre"),
+                    mask.to("spyre"),
+                ).cpu()
+                torch.testing.assert_close(
+                    actual,
+                    expected,
+                    atol=0.1,
+                    rtol=0.1,
+                )
+
     def test_sdpa_head_tiles_limit_heads_per_tile(self):
         """The hint value is a tile count, not a per-tile head extent."""
         # The backend entry point loaded by ``import torch`` has already

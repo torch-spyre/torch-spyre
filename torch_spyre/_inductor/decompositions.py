@@ -1338,6 +1338,17 @@ def spyre__sdpa_overrideable(
         tile_alignment=_SDPA_SEQUENCE_TILE_ALIGNMENT,
     )
     kv_tile_size = max_seqlen_kv // num_kv_tiles
+    packed_key_strides = (
+        max_seqlen_kv * num_kvheads * head_dim,
+        head_dim,
+        num_kvheads * head_dim,
+        1,
+    )
+    rebase_unaligned_packed_key = (
+        batch_size > 1
+        and key.stride() == packed_key_strides
+        and kv_tile_size % get_elem_in_stick(key.dtype) != 0
+    )
 
     score_dim_names = (
         [
@@ -1390,6 +1401,14 @@ def spyre__sdpa_overrideable(
                         k_blk = k_blk.unsqueeze(2)
                         v_blk = v_blk.unsqueeze(2)
 
+                    # A packed [B*S, H, D] input viewed as [B, H, S, D]
+                    # shares one physical row dimension between B and S.  When
+                    # the S tile is not stick-aligned, rebase it before the
+                    # transpose restickify so one batch's padded tail cannot
+                    # read the next batch's first row.  Aligned tiles retain
+                    # the direct one-copy keys_T path.
+                    if rebase_unaligned_packed_key:
+                        k_blk = k_blk.contiguous()
                     keys_T = k_blk.transpose(-1, -2).contiguous()
 
                     with spyre_hint(named_dims=score_dim_names):

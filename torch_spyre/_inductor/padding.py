@@ -705,6 +705,56 @@ def _is_dense_flattened_coordinate(coord, ranges) -> bool:
     return True
 
 
+def _restickify_input_required_extent(coord, ranges, stick_sym, dtype) -> int:
+    """Return the allocation extent needed for a restickify read window.
+
+    A view can split one physical input dimension into several logical loop
+    dimensions, so the physical coordinate may be a dense mixed-radix sum such
+    as ``64 * batch + sequence``.  The restickify reads a whole stick starting
+    at each outer digit's base.  Account for the last such base, then round only
+    the innermost (unit-stride) stick digit's extent.
+    """
+    syms = coord.free_symbols
+    if stick_sym not in syms:
+        raise Unsupported(
+            f"insert_restickify_padding: new-stick symbol {stick_sym} is absent "
+            f"from input coordinate {coord}"
+        )
+    if len(syms) == 1:
+        # Preserve the existing one-symbol behavior, including coordinates
+        # split across host dimensions with FloorDiv/Mod expressions.
+        slice_offset = concretize_expr(coord.as_coeff_Add()[0])
+        return slice_offset + round_up_to_stick(
+            concretize_expr(ranges[stick_sym]), dtype
+        )
+
+    if not _is_dense_flattened_coordinate(coord, ranges):
+        raise Unsupported(
+            f"insert_restickify_padding: input coordinate {coord} is not a "
+            "dense flattening"
+        )
+
+    stick_extent = concretize_expr(ranges[stick_sym])
+    if compute_padding(stick_extent, dtype) != 0:
+        raise Unsupported(
+            f"insert_restickify_padding: unaligned new-stick extent "
+            f"{stick_extent} in dense flattened input coordinate {coord} "
+            "requires a re-base copy"
+        )
+
+    stick_coeff = concretize_expr(sympy.expand(coord).coeff(stick_sym))
+    if stick_coeff != 1:
+        raise Unsupported(
+            f"insert_restickify_padding: new-stick symbol {stick_sym} is not "
+            f"unit-stride in input coordinate {coord}"
+        )
+
+    max_slice_start = coord.subs(stick_sym, 0)
+    for sym in syms - {stick_sym}:
+        max_slice_start = max_slice_start.subs(sym, concretize_expr(ranges[sym]) - 1)
+    return concretize_expr(max_slice_start) + round_up_to_stick(stick_extent, dtype)
+
+
 def _assert_input_paddable(op: ComputedBuffer, in_dep, in_layout) -> None:
     """Raise ``Unsupported`` for restickify inputs outside what the stick-boundary
     bump supports, classifying each input dim's read by its coordinate.
@@ -850,15 +900,14 @@ def _pad_restickify_input(op: Operation, graph: GraphLowering) -> None:
         )
         dtype = in_layout.dtype
         coord = in_host_coords[new_stick_dim]
-        syms = coord.free_symbols
-        assert len(syms) == 1
-        sym = next(iter(syms))
-        slice_offset = concretize_expr(coord.as_coeff_Add()[0])
-        slice_size = concretize_expr(in_dep.ranges[sym])
-        device_dim = _device_dim_carrying_sym(in_layout.device_layout, in_dep, sym)
+        device_dim = _device_dim_carrying_sym(
+            in_layout.device_layout, in_dep, out_stick_sym
+        )
         assert device_dim is not None
         dim_size = concretize_expr(in_layout.device_layout.device_size[device_dim])
-        padded_dim_size = slice_offset + round_up_to_stick(slice_size, dtype)
+        padded_dim_size = _restickify_input_required_extent(
+            coord, in_dep.ranges, out_stick_sym, dtype
+        )
         if padded_dim_size <= dim_size:
             return
 
