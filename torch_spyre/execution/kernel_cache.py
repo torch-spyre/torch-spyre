@@ -24,6 +24,7 @@ import torch
 from torch._inductor.codecache import code_hash
 from torch._inductor.runtime.runtime_utils import cache_dir
 
+from torch_spyre._inductor import config as _spyre_config
 from torch_spyre._inductor.logging_utils import get_inductor_logger
 
 
@@ -201,7 +202,10 @@ def _get_torch_spyre_version() -> str:
 
 def get_cache_root_dir() -> str:
     """Return the root directory for the persistent kernel cache."""
-    cache_root = os.path.join(cache_dir(), "inductor-spyre-cache")
+    cache_root = _spyre_config.spyre_kernel_cache_dir or os.path.join(
+        cache_dir(), "inductor-spyre-cache"
+    )
+    cache_root = os.path.expanduser(cache_root)
     os.makedirs(cache_root, exist_ok=True)
     return cache_root
 

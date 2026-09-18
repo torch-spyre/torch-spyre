@@ -26,7 +26,9 @@ Run with:
 """
 
 import os
+import tempfile
 import unittest
+from unittest import mock
 import torch
 import torch_spyre  # noqa: F401 — side-effects: registers Spyre backend
 
@@ -294,6 +296,58 @@ class TestNoDiskIOOnCacheHit(unittest.TestCase):
                 torch.compile(_simple_fn)(_make_input())
 
             mock_gen.assert_not_called()
+
+
+class TestCacheRootDirOverride(unittest.TestCase):
+    def test_default_root_is_under_inductor_cache_dir(self):
+        """With no override, the root stays under the Inductor cache dir."""
+        from torch._inductor.runtime.runtime_utils import cache_dir
+
+        with fresh_cache(), spyre_config.patch({"spyre_kernel_cache_dir": ""}):
+            self.assertEqual(
+                get_cache_root_dir(),
+                os.path.join(cache_dir(), "inductor-spyre-cache"),
+            )
+
+    def test_override_is_used_and_created(self):
+        """spyre_kernel_cache_dir redirects the root and creates it if missing."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = os.path.join(tmp, "shared", "kernels")
+            with spyre_config.patch({"spyre_kernel_cache_dir": root}):
+                self.assertEqual(get_cache_root_dir(), root)
+            self.assertTrue(os.path.isdir(root))
+
+    def test_override_expands_user(self):
+        """A ~-prefixed override is expanded to the home directory."""
+        with tempfile.TemporaryDirectory() as fake_home:
+            with mock.patch.dict(os.environ, {"HOME": fake_home}):
+                with spyre_config.patch(
+                    {"spyre_kernel_cache_dir": "~/spyre-kernel-cache"}
+                ):
+                    self.assertEqual(
+                        get_cache_root_dir(),
+                        os.path.join(fake_home, "spyre-kernel-cache"),
+                    )
+
+    def test_compiled_kernels_land_in_overridden_root(self):
+        """Compilation must write its cache entries into the overridden root."""
+        with fresh_cache(), tempfile.TemporaryDirectory() as tmp:
+            root = os.path.join(tmp, "kernels")
+            with spyre_config.patch(
+                {"spyre_kernel_cache": True, "spyre_kernel_cache_dir": root}
+            ):
+                torch._dynamo.reset()
+                torch.compile(_simple_fn)(_make_input())
+
+                self.assertGreater(
+                    get_cache_stats()["total_cached_kernels"],
+                    0,
+                    "Expected kernels cached in the overridden root",
+                )
+                self.assertTrue(
+                    any(os.path.isdir(os.path.join(root, d)) for d in os.listdir(root)),
+                    f"Expected cache entry directories under {root}",
+                )
 
 
 if __name__ == "__main__":
