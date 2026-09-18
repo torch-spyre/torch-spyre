@@ -27,12 +27,12 @@ Run with:
 
 import os
 import unittest
-import torch
-import torch_spyre  # noqa: F401 — side-effects: registers Spyre backend
 
-import torch_spyre._inductor.config as spyre_config
+import torch
 from torch._inductor.utils import fresh_cache
 
+import torch_spyre  # noqa: F401 — side-effects: registers Spyre backend
+import torch_spyre._inductor.config as spyre_config
 from torch_spyre.execution.kernel_cache import (
     allocate_compile_dir,
     commit_compile_dir,
@@ -112,6 +112,127 @@ class TestCacheArtifactCompleteness(unittest.TestCase):
                     has_sdsc,
                     f"No sdsc_N.json files found in cache entry '{entry}'",
                 )
+
+
+def _make_fake_entry(cache_root: str, cache_key: str, with_sentinel: bool) -> str:
+    fake_dir = os.path.join(cache_root, cache_key)
+    os.makedirs(os.path.join(fake_dir, "spyreCodeDir"), exist_ok=True)
+
+    with open(os.path.join(fake_dir, "bundle.mlir"), "w") as f:
+        f.write("fake bundle")
+    with open(os.path.join(fake_dir, "sdsc_0.json"), "w") as f:
+        f.write("{}")
+    with open(os.path.join(fake_dir, "spyreCodeDir", "spyrecode.json"), "w") as f:
+        f.write("{}")
+    with open(os.path.join(fake_dir, "spyreCodeDir", "init_binary.bin"), "wb") as f:
+        f.write(b"content")
+
+    if with_sentinel:
+        with open(os.path.join(fake_dir, "ready"), "w") as f:
+            f.write("")
+
+    return fake_dir
+
+
+class TestReadySentinel(unittest.TestCase):
+    def _patch_shared(self, value: bool):
+        """Patch the shared-cache helper so worker threads see the value."""
+        from unittest.mock import patch
+
+        return patch(
+            "torch_spyre.execution.kernel_cache._cache_shared", return_value=value
+        )
+
+    def test_entry_without_sentinel_is_cache_miss_when_shared(self):
+        """A complete entry missing the ready sentinel is a miss only when shared."""
+        with fresh_cache(), self._patch_shared(True):
+            cache_root = get_cache_root_dir()
+            fake_key = "c" + "a" * 63
+            _make_fake_entry(cache_root, fake_key, with_sentinel=False)
+
+            result = get_cached_kernel_dir(fake_key)
+            self.assertIsNone(
+                result,
+                "Expected cache miss when ready sentinel is missing",
+            )
+
+    def test_entry_without_sentinel_is_hit_when_not_shared(self):
+        """Without shared-cache mode the sentinel is not required."""
+        with fresh_cache(), self._patch_shared(False):
+            cache_root = get_cache_root_dir()
+            fake_dir = _make_fake_entry(cache_root, "c" + "a" * 63, with_sentinel=False)
+
+            result = get_cached_kernel_dir("c" + "a" * 63)
+            self.assertEqual(result, fake_dir)
+
+    def test_entry_with_sentinel_is_cache_hit(self):
+        """A complete entry with the ready sentinel must be treated as a hit."""
+        with fresh_cache(), self._patch_shared(True):
+            cache_root = get_cache_root_dir()
+            fake_dir = _make_fake_entry(cache_root, "c" + "a" * 63, with_sentinel=True)
+
+            result = get_cached_kernel_dir("c" + "a" * 63)
+            self.assertEqual(result, fake_dir)
+
+    def test_commit_writes_ready_sentinel_when_shared(self):
+        """commit_compile_dir must write the ready sentinel in shared mode."""
+        with fresh_cache(), self._patch_shared(True):
+            cache_root = get_cache_root_dir()
+            fake_key = "c" + "b" * 63
+            tmp_dir = allocate_compile_dir(fake_key)
+            _make_fake_entry(cache_root, fake_key, with_sentinel=False)
+
+            # The tmp dir must be outside the final cached dir path for rename.
+            os.rename(os.path.join(cache_root, fake_key), tmp_dir)
+            commit_compile_dir(tmp_dir, fake_key)
+
+            self.assertTrue(
+                os.path.isfile(os.path.join(cache_root, fake_key, "ready")),
+                "ready sentinel must exist after commit",
+            )
+
+    def test_commit_skips_sentinel_when_not_shared(self):
+        """commit_compile_dir must not write a sentinel in single-client mode."""
+        with fresh_cache(), self._patch_shared(False):
+            cache_root = get_cache_root_dir()
+            fake_key = "c" + "b" * 63
+            tmp_dir = allocate_compile_dir(fake_key)
+            _make_fake_entry(cache_root, fake_key, with_sentinel=False)
+
+            os.rename(os.path.join(cache_root, fake_key), tmp_dir)
+            commit_compile_dir(tmp_dir, fake_key)
+
+            self.assertFalse(
+                os.path.isfile(os.path.join(cache_root, fake_key, "ready")),
+                "ready sentinel must not exist in single-client mode",
+            )
+
+    def test_commit_replaces_partial_entry_when_shared(self):
+        """A directory without a sentinel must be replaced in shared mode."""
+        with fresh_cache(), self._patch_shared(True):
+            cache_root = get_cache_root_dir()
+            fake_key = "c" + "c" * 63
+            valid_dir = _make_fake_entry(cache_root, fake_key, with_sentinel=False)
+
+            tmp_dir = allocate_compile_dir(fake_key)
+            # Move the valid entry out of the way and into the tmp dir.
+            os.rename(valid_dir, tmp_dir)
+
+            # Recreate a partial entry in place with no sentinel.
+            partial_dir = os.path.join(cache_root, fake_key)
+            os.makedirs(os.path.join(partial_dir, "spyreCodeDir"), exist_ok=True)
+            with open(os.path.join(partial_dir, "bundle.mlir"), "w") as f:
+                f.write("corrupted")
+
+            commit_compile_dir(tmp_dir, fake_key)
+
+            with open(os.path.join(cache_root, fake_key, "bundle.mlir")) as f:
+                content = f.read()
+            self.assertEqual(content, "fake bundle")
+            self.assertTrue(
+                os.path.isfile(os.path.join(cache_root, fake_key, "ready")),
+                "ready sentinel must exist after replacement",
+            )
 
 
 class TestPartialCacheEntryTreatedAsMiss(unittest.TestCase):
@@ -236,12 +357,18 @@ class TestClearCache(unittest.TestCase):
 
 class TestAtomicCommit(unittest.TestCase):
     def test_concurrent_commit_same_key_does_not_corrupt(self):
-        """Four threads compiling the same key concurrently must leave exactly one valid entry."""
+        """Four threads compiling the same key concurrently must leave one valid entry."""
         import threading
+        from unittest.mock import patch
 
         fake_key = "c" + "b" * 63
 
-        with fresh_cache():
+        with (
+            fresh_cache(),
+            patch(
+                "torch_spyre.execution.kernel_cache._cache_shared", return_value=True
+            ),
+        ):
             errors = []
 
             def do_compile():
@@ -294,6 +421,110 @@ class TestNoDiskIOOnCacheHit(unittest.TestCase):
                 torch.compile(_simple_fn)(_make_input())
 
             mock_gen.assert_not_called()
+
+
+class TestPerKeyLockCommit(unittest.TestCase):
+    def _populate_tmp_dir(self, tmp_dir: str) -> None:
+        os.makedirs(os.path.join(tmp_dir, "spyreCodeDir"), exist_ok=True)
+        for name in ["bundle.mlir", "sdsc_0.json"]:
+            with open(os.path.join(tmp_dir, name), "w") as f:
+                f.write("content")
+        for name in ["init_binary.bin", "spyrecode.json"]:
+            with open(os.path.join(tmp_dir, "spyreCodeDir", name), "wb") as f:
+                f.write(b"content")
+
+    def test_concurrent_commit_different_keys_both_succeed(self):
+        """Per-key locks let different cache keys commit without blocking each other."""
+        import threading
+        from unittest.mock import patch
+
+        key_a = "c" + "a" * 63
+        key_b = "c" + "b" * 63
+
+        with (
+            fresh_cache(),
+            patch(
+                "torch_spyre.execution.kernel_cache._cache_shared", return_value=True
+            ),
+        ):
+            errors = []
+
+            def do_commit(key: str):
+                try:
+                    tmp_dir = allocate_compile_dir(key)
+                    self._populate_tmp_dir(tmp_dir)
+                    commit_compile_dir(tmp_dir, key)
+                except RuntimeError as e:
+                    errors.append(e)
+
+            threads = [
+                threading.Thread(target=do_commit, args=(key_a,)),
+                threading.Thread(target=do_commit, args=(key_b,)),
+            ]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+
+            self.assertEqual(errors, [], f"Concurrent commit raised errors: {errors}")
+            self.assertIsNotNone(
+                get_cached_kernel_dir(key_a),
+                "Expected a valid cache entry for key_a",
+            )
+            self.assertIsNotNone(
+                get_cached_kernel_dir(key_b),
+                "Expected a valid cache entry for key_b",
+            )
+
+    def test_shared_commit_creates_per_key_lock_file(self):
+        """A shared commit must create a lock file named after the cache key."""
+        from unittest.mock import patch
+
+        fake_key = "c" + "d" * 63
+        with (
+            fresh_cache(),
+            patch(
+                "torch_spyre.execution.kernel_cache._cache_shared", return_value=True
+            ),
+        ):
+            tmp_dir = allocate_compile_dir(fake_key)
+            self._populate_tmp_dir(tmp_dir)
+            commit_compile_dir(tmp_dir, fake_key)
+
+            lock_path = os.path.join(get_cache_root_dir(), f"{fake_key}.commit.lock")
+            self.assertTrue(
+                os.path.isfile(lock_path),
+                "Expected per-key lock file to exist after shared commit",
+            )
+
+    def test_no_leftover_staging_or_tmp_dirs_after_commit(self):
+        """After a shared commit, staging and tmp directories must be cleaned up."""
+        from unittest.mock import patch
+
+        fake_key = "c" + "e" * 63
+        with (
+            fresh_cache(),
+            patch(
+                "torch_spyre.execution.kernel_cache._cache_shared", return_value=True
+            ),
+        ):
+            tmp_dir = allocate_compile_dir(fake_key)
+            self._populate_tmp_dir(tmp_dir)
+            commit_compile_dir(tmp_dir, fake_key)
+
+            cache_root = get_cache_root_dir()
+            leftover = [
+                d
+                for d in os.listdir(cache_root)
+                if os.path.isdir(os.path.join(cache_root, d))
+                and d.startswith(fake_key)
+                and d != fake_key
+            ]
+            self.assertEqual(
+                leftover,
+                [],
+                f"Unexpected leftover directories for {fake_key}: {leftover}",
+            )
 
 
 if __name__ == "__main__":
