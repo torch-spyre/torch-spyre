@@ -390,6 +390,33 @@ class TestBuildingBlocks(unittest.TestCase):
             rtol=0.1,
         )
 
+    @mock.patch(
+        "torch_spyre._inductor.decompositions._SDPA_MAX_BURST_EFFICIENT_KV_BLOCK_SIZE",
+        64,
+    )
+    @mock.patch("torch_spyre._inductor.decompositions._SDPA_MAX_SEQUENCE_TILE_SIZE", 64)
+    def test_sdpa_lk_uses_for_each_tile(self):
+        """Multiple K/V blocks lower to one counted loop instead of unrolling."""
+        batch, heads, query_length, kv_length, head_dim = 1, 2, 64, 128, 128
+        query = torch.randn(batch, heads, query_length, head_dim, dtype=torch.float16)
+        key = torch.randn(batch, heads, kv_length, head_dim, dtype=torch.float16)
+        value = torch.randn(batch, heads, kv_length, head_dim, dtype=torch.float16)
+
+        def sdpa(query, key, value):
+            return F.scaled_dot_product_attention(query, key, value)
+
+        expected = sdpa(query, key, value)
+        actual, sources = run_and_get_code(
+            torch.compile(sdpa, dynamic=False),
+            query.to("spyre"),
+            key.to("spyre"),
+            value.to("spyre"),
+        )
+
+        torch.testing.assert_close(actual.cpu(), expected, atol=0.1, rtol=0.1)
+        self.assertEqual(sum(source.count("LoopSpec(") for source in sources), 1)
+        self.assertNotIn("while_loop_carry_snapshot", "\n".join(sources))
+
     def test_causal_sdpa_unpadded_kv_no_inf(self):
         """Regression: causal SDPA must not produce inf when seqlen_kv % 64 != 0.
 
@@ -564,6 +591,65 @@ class TestBuildingBlocks(unittest.TestCase):
         expected = sdpa(q, k, v)
         actual = torch.compile(sdpa, dynamic=False)(
             q.to("spyre"), k.to("spyre"), v.to("spyre")
+        ).cpu()
+        torch.testing.assert_close(actual, expected, atol=0.2, rtol=0.2)
+
+    def test_ministral_vision_transposed_value_span(self):
+        """Stick-aligned KV tiles keep Pixtral's transposed V under 256 MiB."""
+        B, H, L, D = 1, 16, 3520, 128
+        generator = torch.Generator().manual_seed(1337)
+        q = torch.randn((B, H, L, D), dtype=torch.bfloat16, generator=generator)
+        k = torch.randn((B, H, L, D), dtype=torch.bfloat16, generator=generator)
+        v = torch.randn((B, L, H, D), dtype=torch.bfloat16, generator=generator)
+        mask = torch.zeros((B, 1, L, L), dtype=torch.bfloat16)
+
+        def sdpa(q, k, v, mask):
+            return F.scaled_dot_product_attention(
+                q,
+                k,
+                v.transpose(1, 2),
+                attn_mask=mask,
+                dropout_p=0.0,
+                scale=D**-0.5,
+            )
+
+        actual = torch.compile(sdpa, dynamic=False)(
+            q.to("spyre"),
+            k.to("spyre"),
+            v.to("spyre"),
+            mask.to("spyre"),
+        ).cpu()
+        self.assertTrue(torch.isfinite(actual).all())
+
+    def test_siglip_multicrop_attention_from_flat_projection(self):
+        """A rank-3 projection may feed the tiled K transpose without a copy.
+
+        SigLIP projects K as [B, L, H*D], views it as [B, L, H, D], and
+        transposes it to [B, H, L, D].  The per-tile K restickify therefore
+        reads the projection's last host coordinate as the dense mixed-radix
+        expression D*head + feature.  This must remain a direct read of the
+        projection rather than requiring k_blk.contiguous().
+        """
+        B, H, L, D, IN = 7, 16, 576, 128, 64
+        generator = torch.Generator().manual_seed(1337)
+        x = torch.randn((B, L, IN), dtype=torch.bfloat16, generator=generator)
+        w = torch.randn((H * D, IN), dtype=torch.bfloat16, generator=generator) / 8
+        q = torch.randn((B, H, L, D), dtype=torch.bfloat16, generator=generator)
+        v = torch.randn((B, H, L, D), dtype=torch.bfloat16, generator=generator)
+
+        def sdpa(x, w, q, v):
+            k = F.linear(x, w).view(B, L, H, D).transpose(1, 2)
+            return F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                dropout_p=0.0,
+                scale=72**-0.5,
+            )
+
+        expected = sdpa(x, w, q, v)
+        actual = torch.compile(sdpa, dynamic=False)(
+            x.to("spyre"), w.to("spyre"), q.to("spyre"), v.to("spyre")
         ).cpu()
         torch.testing.assert_close(actual, expected, atol=0.2, rtol=0.2)
 

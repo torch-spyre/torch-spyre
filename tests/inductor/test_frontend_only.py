@@ -59,7 +59,9 @@ def _compile_one_kernel(tmp_path):
     with (
         config.patch({"async_dxp_compile": False}),
         patch.object(ac, "get_output_dir", return_value=str(tmp_path)),
-        patch.object(ac, "generate_bundle") as generate_bundle,
+        # Its return value is the bundle's symbol kinds, which _compile_to_dir
+        # iterates -- explicit rather than leaning on MagicMock iterating empty.
+        patch.object(ac, "generate_bundle", return_value=[]) as generate_bundle,
         patch.object(
             ac, "build_kernel_provenance_descriptor", return_value=None
         ) as provenance,

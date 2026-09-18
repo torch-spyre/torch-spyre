@@ -33,6 +33,12 @@ INGEST_PATH = (
     Path(__file__).resolve().parents[1] / ".github" / "scripts" / "ingest_xml.py"
 )
 
+# The ingest imports the shared library from extensions/; it is in this repo, so put it on
+# sys.path rather than requiring an install for a parse-only test.
+_CHLIB = Path(__file__).resolve().parents[1] / "extensions" / "clickhouse-ingest"
+if str(_CHLIB) not in sys.path:
+    sys.path.insert(0, str(_CHLIB))
+
 KERNEL_CLASSNAME = "spyre_perf_suite.kernel_benchmark"
 OP_CLASSNAME = "spyre_perf_suite.benchmark"
 

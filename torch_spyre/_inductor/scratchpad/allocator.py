@@ -112,6 +112,8 @@ from torch_spyre._inductor.scratchpad.lx_relayout import (
     collect_lx_relayout_plans,
     materialized_lx_relayouts,
     FiredRelayoutGroup,
+    core_domain_rejection,
+    grouped_gather_rejection,
     lx_solver_relayout,
     LXRelayoutPlan,
     materialize_lx_relayouts,
@@ -601,11 +603,24 @@ class ScratchpadAllocator:
             # (_is_read_advancing_anywhere, e.g. a fixed-write full buffer
             # copied into a nested tile every outer iteration).
             return "tiled (advancing)"
-        restickify = self._restickify_barrier(
-            graph, name, uses, lx_relayout_plans=lx_relayout_plans
-        )
-        if restickify is not None:
-            return restickify
+        if division_is_fixed:
+            # On the joint path this same geometric check runs again per
+            # candidate division pair, as part of the solver's own residency
+            # gate (``_cd_parent_matches`` / ``constrain_residency``): a
+            # restickify reader is an ordinary consumer edge there, and an
+            # edge with no compatible pair already forces ``in_buffer`` false
+            # (see ``constrain_residency``'s docstring). Applying the barrier
+            # here too would instead test the read against whatever division
+            # the op happens to carry on ``iteration_space_ownership`` before
+            # the solver has chosen anything -- stale, provisional, and
+            # unrelated to any candidate the solver could actually pick -- and
+            # can reject a buffer the solver would otherwise place correctly
+            # (issue #4655).
+            restickify = self._restickify_barrier(
+                graph, name, uses, lx_relayout_plans=lx_relayout_plans
+            )
+            if restickify is not None:
+                return restickify
         # PR3683's guard: reject residency outright rather than let LX context
         # switching (dump/restore around the risky call) handle it. Kept behind
         # the flag, not deleted, so the old (conservative) and new (context
@@ -696,9 +711,13 @@ class ScratchpadAllocator:
             return "use is not rewritable to the clone"
         if buffer_not_read_in_full(graph, name):
             return "partial/offset read"
-        restickify = self._restickify_barrier(graph, name, uses)
-        if restickify is not None:
-            return restickify
+        if division_is_fixed:
+            # See the matching comment in _buffer_residency_reason: on the
+            # joint path this is redundant with (and less accurate than) the
+            # solver's own per-candidate residency gate.
+            restickify = self._restickify_barrier(graph, name, uses)
+            if restickify is not None:
+                return restickify
         if division_is_fixed and (ncores or {}).get(name, -1) < 0:
             reason = (ncores_reasons or {}).get(name, "core div mismatch")
             return f"core div mismatch: {reason}"
@@ -802,9 +821,16 @@ class ScratchpadAllocator:
         *is* this buffer's producer) is a normal core-local write and takes the
         ordinary residency path. ``is_restickify_op`` shares the coordinate
         predicate used by codegen, so residency never depends on an operation's
-        display name. Both placement and joint allocators use this gate; the
-        joint solver still checks the selected producer/consumer views before
-        allowing residency.
+        display name.
+
+        Only the placement path (``division_is_fixed=True``) calls this: it
+        has one committed division per op and no other mechanism to catch a
+        cross-core restickify read. The joint path skips it -- the solver's
+        own per-candidate residency gate (``_cd_parent_matches`` /
+        ``constrain_residency``) subsumes it there, correctly, over every
+        division the solver could actually choose (see the call sites for
+        why testing it here, against whatever division the op happens to
+        carry pre-solve, is not just redundant but wrong; issue #4655).
         """
         readers = [
             graph.operations[u]
@@ -2032,6 +2058,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         # way select_allocator probes joint-ness, because the factory may be a
         # function rather than a class. Engines that cannot are never handed a
         # copy, and their objective never carries a relayout term.
+        self._relayout_pair_costs: dict[tuple, Optional[float]] = {}
         self._decides_lx_relayouts: bool = bool(
             getattr(layout_planning([], size), "decides_lx_relayouts", False)
         )
@@ -2121,9 +2148,10 @@ class CoOptimizingAllocator(ScratchpadAllocator):
 
         # One price term per relayout copy (a source and one destination view,
         # however many consumers share it): the fitted shuffle cost of the
-        # source's chosen division, charged while the copy is resident. Built
-        # from symbols every engine binds (is_lx, division), so the objective
-        # stays self-describing. Skipped when the bundle scoring failed: the
+        # source's chosen division, charged while the copy is resident. One
+        # RelayoutCharge node per copy, over symbols every engine binds (is_lx,
+        # division), so the objective stays self-describing and the rewrite
+        # passes never expand it. Skipped when the bundle scoring failed: the
         # solver then runs its fallback objective, under which every copy is
         # pinned out.
         if cost_expr is not None:
@@ -2685,7 +2713,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                     else BufferType.Intermediate,
                 )
             )
-        buffers.extend(self._relayout_copy_buffers(buffers))
+        buffers.extend(self._relayout_copy_buffers(buffers, self.size))
         return buffers
 
     @staticmethod
@@ -2744,12 +2772,20 @@ class CoOptimizingAllocator(ScratchpadAllocator):
     @staticmethod
     def _relayout_copy_buffers(
         buffers: Sequence[CoreDivisionBuffer],
+        capacity: int | None = None,
     ) -> list[RelayoutCopyBuffer]:
         """One :class:`RelayoutCopyBuffer` per relayout group enumerated across
         ``buffers``: the destination the solver places, live from the group's
         first consumer to its last, carrying every priced candidate that lands
         on it. A group whose source is not among the buffers has nothing to
         shuffle from and gets no copy; the solver then ignores its candidates.
+
+        ``capacity`` is the planner's per-core LX budget. A group whose
+        destination span alone exceeds it can never be resident, so building a
+        copy for it only adds a buffer the solver must place and prove out; such
+        groups get no copy either (the residency gate ignores candidates whose
+        group has none). On the 304-op decode attention graph these copies are a
+        measurable share of a model whose presolve alone outlived the time limit.
         """
         by_name = {b.name: b for b in buffers}
         groups: dict[tuple[str, int], list[RelayoutCandidate]] = {}
@@ -2759,6 +2795,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                     groups.setdefault(candidate.group_key, []).append(candidate)
         ticks = {b.name: b.start_time for b in buffers}
         copies: list[RelayoutCopyBuffer] = []
+        oversized = 0
         for (parent, group), candidates in sorted(groups.items()):
             source = by_name.get(parent)
             if source is None:
@@ -2769,7 +2806,18 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                     group,
                 )
                 continue
-            copies.append(build_relayout_copy(source, group, candidates, ticks))
+            copy = build_relayout_copy(source, group, candidates, ticks)
+            if capacity is not None and copy.per_core_footprint > capacity:
+                oversized += 1
+                continue
+            copies.append(copy)
+        if oversized:
+            logger.debug(
+                "[lx solver relayout] %d relayout group(s) skipped: destination "
+                "span exceeds the %d-byte LX budget",
+                oversized,
+                capacity,
+            )
         return copies
 
     def _eligible_clone_inputs(
@@ -2800,8 +2848,18 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         prep_cache: dict,
     ) -> tuple[list[CoreDivision], dict[str, list[tuple[int, int]]]]:
         """Determine the core divisions which are applicable to the clone
-        node based on the read per core views of the clone's consumers and
-        equivalent core count (to cover the broadcasting case)
+        node based on the read per core views of the clone's consumers.
+
+        A consumer that *broadcast-reads* the input -- its view covers fewer
+        cores than its division runs, because it splits an axis the input does
+        not have -- is skipped. There is no single-base LX broadcast, so the
+        cores without a local copy would read stale scratchpad; the same
+        predicate rejects the buffer in ``get_ncores_for_buffers``, and by then
+        the division is committed and ``_post_solve`` can only raise. This is
+        the whole broadcast defense on this edge: unlike a producer-consumer
+        edge, a clone has no write-view of its own for
+        ``ResidencyEdge.match_pairs`` to compare against, since the clone's
+        view *is* the consumer's.
 
         The applicable core divisions are found and returned as a list of
         ``CoreDivision`` objects. The mapping such that the clone output
@@ -2833,6 +2891,11 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             for j, (view, _, repr_ok) in enumerate(views):
                 if not repr_ok:
                     continue
+                # ``num_cores`` is the division's core count; the split product
+                # is what the view covers. They differ exactly on a broadcast
+                # read (see the docstring).
+                if math.prod(f for _, f in view.work_slice_dims) != view.num_cores:
+                    continue
                 k = next(
                     (
                         idx
@@ -2855,8 +2918,10 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                         )
                     )  # a clone op cannot have a reduction split
                     clone_views.append(view)
-                if clone_divs[k].cores_used == consumer_divs[j].cores_used:
-                    pairs.append((k, j))
+                # No core-count check here: ``same_partition`` already demands
+                # equal core counts, and the guard above ties each view's count
+                # to its division's.
+                pairs.append((k, j))
             matches[cname] = pairs
         # An empty ``clone_divs`` means no consumer matched the clone under any
         # division, so it has no valid core division. Return it empty rather than
@@ -2906,6 +2971,51 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                 [cd.splits for cd in consumer_divs],
             )
         return matches
+
+    @staticmethod
+    def _cap_relayout_groups(
+        parent: str,
+        consumer: str,
+        candidates: list[RelayoutCandidate],
+        consumer_divs: list[CoreDivision],
+    ) -> list[RelayoutCandidate]:
+        """Keep the candidates of the ``config.lx_solver_relayout_groups_per_edge``
+        cheapest destination views of one (source, consumer) edge.
+
+        Every consumer division with a distinct read partition is its own
+        relayout group, and every group becomes a copy buffer the solver must
+        place, though the consumer will read through at most one of them. A
+        group is ranked by its cheapest candidate (the best source division
+        that lands on it), ties toward the consumer division using more cores,
+        the solver's own preference. Dropping a group only removes an option:
+        a consumer division without a copy is treated exactly like an unpriced
+        pair (match for free or spill), and every fired relayout is still
+        certified at materialization.
+        """
+        cap = config.lx_solver_relayout_groups_per_edge
+        if cap <= 0 or not candidates:
+            return candidates
+        by_group: dict[int, list[RelayoutCandidate]] = {}
+        for candidate in candidates:
+            by_group.setdefault(candidate.group, []).append(candidate)
+        if len(by_group) <= cap:
+            return candidates
+
+        def rank(item: tuple[int, list[RelayoutCandidate]]) -> tuple:
+            group, members = item
+            best = min(c.cost_ns for c in members)
+            cores = max(consumer_divs[c.consumer_division].cores_used for c in members)
+            return (best, -cores, group)
+
+        kept = {group for group, _ in sorted(by_group.items(), key=rank)[:cap]}
+        logger.debug(
+            "[lx solver relayout] %s -> %s: keeping %d of %d destination views",
+            parent,
+            consumer,
+            len(kept),
+            len(by_group),
+        )
+        return [c for c in candidates if c.group in kept]
 
     def _cd_parent_relayouts(
         self,
@@ -3029,7 +3139,11 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                         spans[view] = None
                 return spans[view]
 
-            pair_cost: dict[tuple, Optional[float]] = {}
+            # Graph-wide cache: the same (source view, destination view, cores,
+            # tensor geometry) recurs across structurally identical ops (the
+            # unrolled KV blocks of attention), and pricing it re-runs the movement
+            # gate's per-core owner comparison each time.
+            pair_cost = self._relayout_pair_costs
             candidates: list[RelayoutCandidate] = []
             # Destination views are interned per parent across every consumer
             # of this solve: two consumers whose candidates land on the same
@@ -3047,7 +3161,13 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                     if _candidate_tiled(consumer_divs[j]):
                         continue
                     ncores = parent_divs[i].cores_used
-                    if ncores != consumer_divs[j].cores_used:
+                    dst_cores = consumer_divs[j].cores_used
+                    # The committed collector's consumer rules (#3440): the core
+                    # domains, then the gather rule on the destination view; the
+                    # geometric half is movement_supported's, inside the pair cost.
+                    if core_domain_rejection(ncores, dst_cores):
+                        continue
+                    if grouped_gather_rejection(consumer_op, ncores, cv):
                         continue
                     if _projected(pv, prod_coords, prod_space, "prod") is None:
                         continue
@@ -3066,10 +3186,24 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                         is not None
                     ):
                         continue
-                    key = (pv, cv, ncores)
+                    key = (
+                        pv,
+                        cv,
+                        ncores,
+                        dst_cores,
+                        tuple(device_dims),
+                        out_elems,
+                        dtype_bytes,
+                    )
                     if key not in pair_cost:
                         pair_cost[key] = solver_relayout_pair_cost(
-                            pv, cv, ncores, device_dims, out_elems, dtype_bytes
+                            pv,
+                            cv,
+                            ncores,
+                            device_dims,
+                            out_elems,
+                            dtype_bytes,
+                            destination_num_cores=dst_cores,
                         )
                     cost = pair_cost[key]
                     if cost is None:
@@ -3091,6 +3225,9 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                             destination_footprint_bytes=destination_span,
                         )
                     )
+            candidates = self._cap_relayout_groups(
+                parent, consumer_op.get_name(), candidates, consumer_divs
+            )
             if candidates:
                 relayouts[parent] = candidates
                 logger.debug(

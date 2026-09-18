@@ -112,6 +112,23 @@ on:
       # checkout, the build_torch_spyre wheel job, and install-prebuilt-torch-spyre;
       # run the suite against the baked dir. DEFAULT false → the normal PR/nightly
       # callers (tests.yml / tests-nightly.yml) are byte-for-byte unchanged.
+      component:
+        description: >
+          Component to stamp on v2 ingest rows. Defaults to this repo's own product; set it
+          when this matrix runs ANOTHER component's suite, so the rows (and the test_case_id
+          they hash into) name the suite's real owner.
+        required: false
+        type: string
+        default: torch-spyre
+      run_id:
+        description: >
+          UUID identifying this TEST RUN, minted by the dispatching orchestrator above the
+          CI split and threaded through so artifact_results (written by Jenkins) and
+          test_case_runs (written by the ingest below) carry ONE identity. Empty on a
+          GHA-initiated run, which then derives its own from the run coordinate.
+        required: false
+        type: string
+        default: ''
       prebaked_image:
         description: Test the pre-baked torch-spyre-dev image (no checkout/build). Integration path only.
         required: false
@@ -347,6 +364,33 @@ jobs:
           # trimmed raw input directly.
           resolved=$(echo "${RAW_TEST_TYPE}" | xargs)
           echo "resolved_test_type=$resolved" >> "$GITHUB_OUTPUT"
+
+      # The threaded run_id has to reach push-to-clickhouse.yaml, which already looks for this
+      # artifact (see its "Recover threaded run_id" step). That workflow runs on workflow_run
+      # AFTER this one, so it cannot receive a dispatch input -- and an artifact is the channel
+      # it ALREADY enumerates to find the junit XML, so the uuid rides it rather than needing a
+      # new transport or a uuid in the user-facing run-name.
+      #
+      # Without this the chain is half-built: artifact_results carries the orchestrator's uuid
+      # while the ingest derives its own, so the two never share a run_id and the
+      # artifacts -> artifact_results -> test_case_runs join stays empty. Observed exactly that
+      # -- 27 threaded rows on the Jenkins side, `Threaded run_id: <none, ingest will derive>`
+      # in every ingest log.
+      #
+      # Skipped when empty, so a GHA-initiated run uploads nothing and the ingest derives its
+      # own id, as before.
+      - name: Record threaded run_id for the ingest
+        if: ${{ inputs.run_id != '' }}
+        env:
+          THREADED_RUN_ID: ${{ inputs.run_id }}
+        run: printf '%s' "${THREADED_RUN_ID}" > run-id.txt
+      - name: Upload threaded run_id
+        if: ${{ inputs.run_id != '' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: run-id
+          path: run-id.txt
+          retention-days: 1
 
   # ---------------------------------------------------------------------------
   # Job 0b: build torch-spyre ONCE
@@ -664,7 +708,11 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.event.pull_request.head.sha || github.sha }}
           repository: ${{ inputs.repository || github.event.pull_request.head.repo.full_name || github.repository }}
-          sparse-checkout: .github
+          # extensions/ too: the ingest action installs the library from this checkout,
+          # and .github alone yields the script without it.
+          sparse-checkout: |
+            .github
+            extensions/clickhouse-ingest
           sparse-checkout-cone-mode: false
 
       - if: ${{ !inputs.prebaked_image }}
@@ -753,6 +801,10 @@ jobs:
           branch: ${{ inputs.ref || github.event.pull_request.head.sha || github.ref_name }}
           sha: ${{ inputs.ref || github.event.pull_request.head.sha || github.sha }}
           gha-run-id: ${{ github.run_id }}
+          component: ${{ inputs.component || 'torch-spyre' }}
+          # The orchestrator's uuid when this run was Jenkins-dispatched; empty otherwise,
+          # and the ingest then falls back to hashing its own run coordinate.
+          run-id: ${{ inputs.run_id }}
           triggered-at: ''
           # perf never runs on pull_request (see the job `if:` above), so there
           # is no PR to associate; leave empty.

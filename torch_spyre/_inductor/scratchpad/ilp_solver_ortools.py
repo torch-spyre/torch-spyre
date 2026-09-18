@@ -332,11 +332,35 @@ class _CoreDivisionBufferWithCpVars(_LifetimeBufferWithCpVars[CoreDivisionBuffer
         core_cost = [
             sum(split**2 for split in cd.splits.values()) for cd in b.core_divisions
         ]
+        # For a relayout copy only: the served literals of the consumer edges
+        # it can carry, filled by the sources' constrain_residency and consumed
+        # by _constrain_relayout_copies ("a resident copy serves someone").
+        self.serves: list[Any] = []
+        self.cores_used = cores_used
+        if len(b.core_divisions) == 1:
+            # Nothing to choose: bind every division-derived quantity as a
+            # constant instead of an element lookup on a fixed index. Every
+            # relayout copy is such a buffer, and with hundreds of them the
+            # free eff_size/cores/core_cost/split integers (domains up to a few
+            # thousand) behind one-entry elements made CP-SAT's presolve scale
+            # super-linearly in the copy count: 40 s at 160 copies, past the
+            # 120 s limit at 312, on the 304-op spyre_attn decode graph.
+            self.division = m.new_constant(0)
+            self.eff_size = per_core[0]
+            self.core_cost = core_cost[0]
+            self.cores = cores_used[0]
+            only = b.core_divisions[0]
+            self.cp_core_divs = {
+                key: only.splits.get(key, 1) for key in b.sym_core_divs
+            }
+            self.cp_core_divs_raw = {key: [v] for key, v in self.cp_core_divs.items()}
+            true, false = m.new_constant(1), m.new_constant(0)
+            self.division_is = lambda i: true if i == 0 else false
+            return
         self.division = m.new_int_var(0, len(b.core_divisions) - 1, f"div_{b.name}")
         self.eff_size = m.new_int_var(0, max(per_core), f"eff_size_{b.name}")
         self.core_cost = m.new_int_var(0, max(core_cost), f"core_cost_{b.name}")
         self.cores = m.new_int_var(min(cores_used), max(cores_used), f"occ_{b.name}")
-        self.cores_used = cores_used
 
         cp_core_divs: dict = {}
         cp_core_divs_raw: dict = {}
@@ -357,10 +381,6 @@ class _CoreDivisionBufferWithCpVars(_LifetimeBufferWithCpVars[CoreDivisionBuffer
         m.add_element(self.division, cores_used, self.cores)
         m.add_element(self.division, core_cost, self.core_cost)
 
-        # For a relayout copy only: the served literals of the consumer edges
-        # it can carry, filled by the sources' constrain_residency and consumed
-        # by _constrain_relayout_copies ("a resident copy serves someone").
-        self.serves: list[Any] = []
         self.division_is = cache(self._division_is)
 
     def _division_is(self, i: int) -> Any:
@@ -463,6 +483,83 @@ _inv_rel_op = {
 }
 
 
+@cache
+def get_cpu_count() -> int:
+    """CPUs this process may actually use, after spyre-inference's
+    ``threading_config.get_cpu_count``. Resolution order: ``SPYRE_NUM_CPUS``,
+    the cgroup v2 CPU quota, psutil's physical core count, ``os.cpu_count()``.
+
+    ``os.cpu_count()`` reports the host (128 on the dev pods) while the
+    container is limited to 16; CP-SAT with 8x more search workers than cores
+    thrashes instead of searching, and the oversubscription starves everything
+    else in the pod."""
+    env = os.environ.get("SPYRE_NUM_CPUS", "")
+    if env.strip().isdigit() and int(env) > 0:
+        return int(env)
+    try:
+        with open("/sys/fs/cgroup/cpu.max") as f:
+            quota, period = f.read().split()
+        if quota != "max":
+            return max(1, int(quota) // int(period))
+    except (OSError, ValueError):
+        pass
+    try:
+        import psutil
+
+        physical = psutil.cpu_count(logical=False)
+        if physical:
+            return int(physical)
+    except ImportError:
+        pass
+    return os.cpu_count() or 1
+
+
+class _LazyMin(sympy.Min):
+    """``Min`` built without canonicalization. An evaluated ``Min``/``Max`` runs
+    sympy's pairwise dominance check on its arguments (``_find_localzeros``),
+    which for the split-symbol expressions of the cost objective goes through
+    the assumptions system (``is_ge`` -> ``_monotonic_sign`` -> ``factor_terms``);
+    every rewrite pass below rebuilds these nodes, so on the 304-op spyre_attn
+    decode graph that check was ~60% of the planner's Python time (59.6 s of
+    the rewrite passes; 2.0 s with these classes). The printer lowers a
+    ``Min``/``Max`` structurally and never needs the canonical form."""
+
+    def __new__(cls, *args, **kwargs):
+        kwargs["evaluate"] = False
+        return super().__new__(cls, *args, **kwargs)
+
+
+class _LazyMax(sympy.Max):
+    """``Max`` counterpart of :class:`_LazyMin`."""
+
+    def __new__(cls, *args, **kwargs):
+        kwargs["evaluate"] = False
+        return super().__new__(cls, *args, **kwargs)
+
+
+_LAZY = {sympy.Min: _LazyMin, sympy.Max: _LazyMax}
+
+
+def _lazy_minmax(expr: sympy.Expr) -> sympy.Expr:
+    """Rebuild every ``Min``/``Max`` node of ``expr`` as its lazy counterpart.
+
+    A hand-rolled bottom-up rebuild rather than ``Basic.replace``: ``replace``
+    reconstructs a node whose children changed with its ORIGINAL class before
+    applying the substitution, so a ``Min`` nested inside a ``Max`` was
+    canonicalized once more on the way up (13 s on the 304-op graph's
+    objective). Here a ``Min``/``Max`` is built lazy in the first place and
+    every other node is rebuilt only when a child actually changed."""
+    if not expr.args:
+        return expr
+    args = [_lazy_minmax(a) for a in expr.args]
+    lazy = _LAZY.get(type(expr))
+    if lazy is not None:
+        return lazy(*args)
+    if all(a is b for a, b in zip(args, expr.args)):
+        return expr
+    return expr.func(*args)
+
+
 class _SympyExprToCpSat(Printer):
     """Translates a sympy cost expression into an OR-Tools CP-SAT expression
     over an existing ``sympy symbol -> CP-SAT var`` mapping.
@@ -484,6 +581,17 @@ class _SympyExprToCpSat(Printer):
         """Return the CP-SAT expression equivalent to ``cost_expr`` under
         ``sym_map`` (``sympy symbol -> CP-SAT var``)."""
         logger.debug("[CP-SAT layout solver] cost expr (raw): %s", cost_expr)
+        cost_expr = self._rewrite(cost_expr)
+        logger.debug("[CP-SAT layout solver] cost expr (linearized): %s", cost_expr)
+        return self._print(cost_expr)
+
+    def _rewrite(self, cost_expr: sympy.Expr) -> sympy.Expr:
+        """The symbolic rewrites that bring ``cost_expr`` into the form the
+        printer lowers: floors dropped, logs of Min/Max pushed inside, split
+        logs and inverses replaced by table symbols, scalars pushed into
+        Min/Max/Piecewise, floats truncated. Min/Max are rebuilt lazily first
+        (see :class:`_LazyMin`)."""
+        cost_expr = _lazy_minmax(cost_expr)
         cost_expr = cost_expr.replace(
             lambda e: e.func == sympy.floor,
             lambda e: e.args[0],
@@ -503,11 +611,10 @@ class _SympyExprToCpSat(Printer):
             lambda e: self._min_piecewise_expand(e),
         )
         cost_expr = cost_expr.replace(
-            lambda e: e.func in [sympy.Min, sympy.Max, sympy.Piecewise],
+            lambda e: isinstance(e, (sympy.Min, sympy.Max, sympy.Piecewise)),
             lambda e: self._truncate_floats_min(e),
         )
-        logger.debug("[CP-SAT layout solver] cost expr (linearized): %s", cost_expr)
-        return self._print(cost_expr)
+        return cost_expr
 
     @classmethod
     def _log_min(cls, expr):
@@ -801,6 +908,38 @@ class _SympyExprToCpSat(Printer):
             raise NotImplementedError(f"no division variable for {symbols[0]}")
         return wrapper.division_is(int(constants[0]))
 
+    def _print_RelayoutCharge(self, expr):
+        """``RelayoutCharge(is_lx, division_X, price_0, ...)`` (a relayout
+        copy's ``cost_term``) -> one ``element`` lookup of X's division into the
+        price table plus a charge variable equal to that price while the copy
+        is resident and 0 otherwise: two constraints per copy, against one
+        boolean product per (copy, priced division) had the table been written
+        as a sum of deltas. Divisions past the table read 0; a source that is
+        not a division-choosing buffer of this solve prices at 0, as it can
+        never fire (``_constrain_relayout_copies``)."""
+        is_lx, division, *prices = expr.args
+        table = [int(p) for p in prices]
+        lit = self._print(is_lx)
+        if division.is_Integer:
+            i = int(division)
+            return lit * (table[i] if 0 <= i < len(table) else 0)
+        wrapper = self._sym_map.get(f"_division_of_{division.name}")
+        if wrapper is None or not isinstance(wrapper, _CoreDivisionBufferWithCpVars):
+            return 0
+        table += [0] * (len(wrapper.buffer.core_divisions) - len(table))
+        table = table[: len(wrapper.buffer.core_divisions)]
+        top = max(table, default=0)
+        if top <= 0:
+            return 0
+        name = is_lx.name if is_lx.is_Symbol else str(self._count)
+        self._count += 1
+        price = self._model.new_int_var(0, top, f"relayout_price_{name}")
+        self._model.add_element(wrapper.division, table, price)
+        charge = self._model.new_int_var(0, top, f"relayout_charge_{name}")
+        self._model.add(charge == price).only_enforce_if(lit)
+        self._model.add(charge == 0).only_enforce_if(lit.Not())
+        return charge
+
     def _print_Pow(self, expr):
         if expr.exp == 2:
             base = self._print(expr.base)
@@ -897,6 +1036,8 @@ class _SympyExprToCpSat(Printer):
     def _print_Max(self, expr):
         # max range is (max(mins), max(maxes))
         args = [self._print(arg) for arg in expr.args]
+        if all(isinstance(a, (int, float)) for a in args):
+            return max(args)  # a lazy Max of constants was never folded
         bounds = map(max, zip(*[self._affine_bounds(arg) for arg in args]))
         max_var = self._model.new_int_var(*bounds, f"max_var_{self._count}")
         self._model.AddMaxEquality(max_var, args)
@@ -906,6 +1047,8 @@ class _SympyExprToCpSat(Printer):
     def _print_Min(self, expr):
         # min range is (min(mins), min(maxes))
         args = [self._print(arg) for arg in expr.args]
+        if all(isinstance(a, (int, float)) for a in args):
+            return min(args)  # a lazy Min of constants was never folded
         bounds = map(min, zip(*[self._affine_bounds(arg) for arg in args]))
         min_var = self._model.new_int_var(*bounds, f"min_var_{self._count}")
         self._model.AddMinEquality(min_var, args)
@@ -1114,8 +1257,28 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         solver = cp_model.CpSolver()
         if self._time_limit_seconds:
             solver.parameters.max_time_in_seconds = float(self._time_limit_seconds)
+        # Relayout copies whose source is in the solve are free to become
+        # resident; CP-SAT's presolve scales super-linearly in their number
+        # (see config.lx_solver_relayout_presolve_max_copies), so past the
+        # threshold search runs on the raw model instead.
+        free_copies = sum(
+            isinstance(
+                tensors.get(copy_w.buffer.relayout_parent),
+                _CoreDivisionBufferWithCpVars,
+            )
+            for copy_w in copies.values()
+        )
+        max_copies = config.lx_solver_relayout_presolve_max_copies
+        if max_copies > 0 and free_copies > max_copies:
+            solver.parameters.cp_model_presolve = False
+            logger.info(
+                "[CP-SAT layout solver] %d relayout copies exceed the presolve "
+                "threshold of %d; solving without presolve",
+                free_copies,
+                max_copies,
+            )
         solver.parameters.num_search_workers = (
-            1 if torch.are_deterministic_algorithms_enabled() else (os.cpu_count() or 1)
+            1 if torch.are_deterministic_algorithms_enabled() else get_cpu_count()
         )
         # Fixed seed so a given worker configuration is reproducible run-to-run.
         solver.parameters.random_seed = 0

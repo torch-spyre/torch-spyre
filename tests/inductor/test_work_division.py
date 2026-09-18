@@ -202,6 +202,81 @@ class TestLoopCarryLxEligibility(unittest.TestCase):
             )
 
 
+class TestRestickifyBarrierDeferredOnJointPath(unittest.TestCase):
+    """Issue #4655: the restickify barrier tests one committed division
+
+    (``op.iteration_space_ownership``) that reflects whatever a prior pass
+    happened to leave on the op, not any division the joint solver could
+    actually pick. On the joint path (``division_is_fixed=False``) that
+    committed division may disagree with a perfectly compatible candidate the
+    solver's own ``cd_parent_matches``/``constrain_residency`` gate would
+    later select, permanently barring a buffer the solver would otherwise
+    place. The fixed-division (placement) path has no such downstream gate,
+    so it must still apply the barrier up front.
+    """
+
+    def setUp(self):
+        self.allocator = CoOptimizingAllocator(lambda buffers, size: None, 2**20)
+        self.op = _computed_buffer((64, 64), name="buf")
+        self.common = dict(
+            graph=SimpleNamespace(operations=[]),
+            name="buf",
+            uses=[0, 1],
+            op=self.op,
+            mutated_buffers=set(),
+            graph_output_names=set(),
+            reinterpret_output_names=set(),
+            ncores={},
+            ncores_reasons={},
+            buf_user_deps={},
+        )
+
+    def test_joint_path_does_not_consult_the_barrier(self):
+        with (
+            patch.object(
+                self.allocator, "_op_output_good_for_lx_reuse", return_value=True
+            ),
+            patch.object(allocator_module, "is_empty_tiled_layout", return_value=False),
+            patch.object(allocator_module, "_is_tiled_advancing", return_value=False),
+            patch.object(
+                allocator_module, "_is_read_advancing_anywhere", return_value=False
+            ),
+            patch.object(
+                allocator_module,
+                "_multi_output_extern_kernel_in_live_range",
+                return_value=False,
+            ),
+            patch.object(
+                self.allocator, "_is_index_or_indirectly_accessed", return_value=False
+            ),
+            patch.object(
+                allocator_module, "buffer_not_read_in_full", return_value=False
+            ),
+            patch.object(
+                allocator_module, "_would_produce_lx_back_gap", return_value=False
+            ),
+            patch.object(
+                self.allocator,
+                "_restickify_barrier",
+                return_value="read by restickify (local-read proof failed)",
+            ) as barrier,
+        ):
+            self.assertIsNone(
+                self.allocator._buffer_residency_reason(
+                    division_is_fixed=False, **self.common
+                )
+            )
+            barrier.assert_not_called()
+
+            self.assertEqual(
+                self.allocator._buffer_residency_reason(
+                    division_is_fixed=True, **self.common
+                ),
+                "read by restickify (local-read proof failed)",
+            )
+            barrier.assert_called_once()
+
+
 class TestEmptyLxEligibility(unittest.TestCase):
     def test_empty_tensors_are_rejected_before_lx_sizing(self):
         """A valid empty tensor clears no eligibility path.
@@ -1850,6 +1925,67 @@ class TestResidencyEdgeMatching(unittest.TestCase):
                 allocator._cd_parent_matches(None, [], [], {}, {}, {}, self.residency),
                 {},
             )
+
+
+class TestCloneDivisionMatching(unittest.TestCase):
+    """The clone-in seam: the pairs a graph input's synthesized menu admits.
+
+    The sibling of :class:`TestResidencyEdgeMatching` for the one edge with no
+    producer: a clone's view *is* its consumer's, so nothing compares two views
+    here and the broadcast check in ``_clone_divisions_and_matches`` is the
+    only thing standing between a broadcast read and a plan ``_post_solve`` can
+    only reject.
+    """
+
+    def setUp(self):
+        x, y = _isym("x"), _isym("y")
+        # One consumer, three candidates. The middle one splits ``y``, an axis
+        # the input does not carry, so the split contracts out of the view and
+        # all four cores read the whole buffer.
+        self.consumer_divs = [
+            CoreDivision(splits={x: 4}),
+            CoreDivision(splits={y: 4}),
+            CoreDivision(splits={x: 2}),
+        ]
+        self.views = [
+            _physical_view((0, 4)),
+            PerCoreView(work_slice_dims=(), core_to_slot=(), num_cores=4),
+            _physical_view((0, 2)),
+        ]
+        self.consumer = MagicMock(spec=ComputedBuffer)
+        self.consumer.get_name.return_value = "consumer"
+        self.rw = MagicMock(
+            reads=[MemoryDep("inp", x, (x,), (8,))],
+            writes=[MemoryDep("consumer", x, (x,), (8,))],
+        )
+
+    def _view_for_div(self, op, dep, buf_name, splits, prep_cache):
+        index = [cd.splits for cd in self.consumer_divs].index(splits)
+        return (self.views[index], False, True)
+
+    def _menu(self):
+        allocator = CoOptimizingAllocator(MagicMock(), size=1)
+        with ExitStack() as stack:
+            for target, kwargs in [
+                ("_view_for_div", {"side_effect": self._view_for_div}),
+                ("op_read_writes", {"return_value": self.rw}),
+            ]:
+                stack.enter_context(
+                    patch(
+                        f"torch_spyre._inductor.scratchpad.allocator.{target}",
+                        **kwargs,
+                    )
+                )
+            return allocator._clone_divisions_and_matches(
+                "inp", [self.consumer], {"consumer": self.consumer_divs}, {}
+            )
+
+    def test_broadcast_read_reaches_neither_the_menu_nor_the_table(self):
+        divs, matches = self._menu()
+        self.assertEqual(
+            [cd.splits for cd in divs], [{_isym("x"): split} for split in (4, 2)]
+        )
+        self.assertEqual(matches, {"consumer": [(0, 0), (1, 2)]})
 
 
 class TestCoOptimizingAllocator(unittest.TestCase):

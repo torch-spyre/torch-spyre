@@ -1,0 +1,17 @@
+[project]
+name = "spyre-clickhouse-ingest"
+version = "0.1.0"
+description = "Shared schema-v2 ClickHouse schema, identity and write path for the Spyre CI ingests"
+readme = "README.md"
+requires-python = ">=3.11"
+# Deliberately NOT depending on torch_spyre: installing it to obtain a schema module would pull
+# torch/numpy/ortools, and ortools has no ppc64le/s390x wheel -- the ingest would break on p/z.
+# The ingest runtime is three wheels, and clickhouse-connect is the only one this package needs.
+dependencies = [
+    "clickhouse-connect>=1.3.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]

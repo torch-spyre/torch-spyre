@@ -426,7 +426,7 @@ TO_DTYPE_OP_ROUND_TRIP_PARAMS_SETS = {
         cached_randn(shape, dtype=src),
         dst,
     )
-    for src in [torch.float16, torch.float32]
+    for src in [torch.float16, torch.bfloat16, torch.float32]
     for dst in [torch.float16, torch.float32]
     if src != dst
     for shape in TO_DTYPE_OP_SHAPES
@@ -434,7 +434,7 @@ TO_DTYPE_OP_ROUND_TRIP_PARAMS_SETS = {
 
 TO_DTYPE_OP_ROUND_TRIP_EXPECT_FAIL = [
     f"{_dtype_name(src)}_to_{_dtype_name(dst)}_{shapes2key((shape,))}"
-    for src in [torch.float16, torch.float32]
+    for src in [torch.float16, torch.bfloat16, torch.float32]
     for dst in [torch.float16, torch.float32]
     if src != dst
     for shape in TO_DTYPE_OP_SHAPES_UNALIGNED
@@ -2580,13 +2580,12 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "2d": (cached_randn((256, 128), dtype=torch.float16),),
                 "3d": (cached_randn((8, 16, 256), dtype=torch.float16),),
             },
-            # PT 2.12: the 3D fp16 (8, 16, 256) shape drifts a single element
-            # (~0.34 abs, 1/32768 elems) past tolerance under exp → sin (CPU
-            # fallback) → exp. 1D/2D pass. This is a PT 2.12 CPU-reference
-            # numerics change (the baseline the test compares against), not a
-            # Spyre kernel regression — one of the pre-existing edge cases
-            # documented and xfailed in commit 3a2d482.
-            "expect_fail": ["3d"],
+            # The 3D fp16 (8, 16, 256) shape used to drift a single element
+            # (~0.34 abs, 1/32768 elems) past tolerance and was xfailed in
+            # commit 3a2d482 as a PT 2.12 CPU-reference numerics change. That
+            # drift came from the ``sin`` in the chain; the fallback vehicle is
+            # ``cumsum`` now (``sin`` has a Spyre decomposition and no longer
+            # falls back), and all three shapes pass, so the entry is gone.
         },
         (
             "test_arange",
@@ -6318,6 +6317,99 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 f"{(result.float() - expected).abs().max().item()}"
             )
 
+    def test_storage_offset_placeholder_lo4_fresh_trace_pointwise(self):
+        def fn(x):
+            return x + x
+
+        base = cached_randn((8, 128), differentiation="ph_lo4_pointwise")
+        cpu_view = base.clone()[4:6, :]
+        expected = fn(cpu_view).float()
+
+        dev_view = base.clone().to("spyre")[4:6, :]
+        result = _compile_and_run(fn, [dev_view], "spyre", compile=True)
+        assert torch.allclose(result.float(), expected, atol=0.1, rtol=0.1), (
+            f"max abs diff: {(result.float() - expected).abs().max().item()} -- "
+            "fresh-trace offset-4 layout computation itself is broken (see #3770)"
+        )
+
+    def test_storage_offset_placeholder_lo4_fresh_trace_bmm(self):
+        def fn(w_chunk, x):
+            # [Ec, H, F] x [Ec, F, N] -> [Ec, H, N], one matmul per expert
+            # in the chunk -- shaped like the chunked expert FFN.
+            return torch.bmm(w_chunk, x)
+
+        E, H, F, N = 8, 32, 64, 32
+        Ec = 2
+        lo = 4
+        base_w = cached_randn((E, H, F), differentiation="ph_moe_expert_w_lo4")
+        x = cached_randn((Ec, F, N), differentiation="ph_moe_expert_x_lo4").to("spyre")
+        cpu_w_chunk = base_w.clone()[lo : lo + Ec]
+        expected = fn(cpu_w_chunk, x.cpu()).float()
+
+        dev_w_chunk = base_w.clone().to("spyre")[lo : lo + Ec]
+        result = _compile_and_run(fn, [dev_w_chunk, x], "spyre", compile=True)
+        mean_rel = (
+            (result.float() - expected).abs().mean()
+            / expected.abs().mean().clamp(min=1e-6)
+        ).item()
+        assert torch.allclose(result.float(), expected, atol=0.1, rtol=0.1), (
+            f"mean_rel={mean_rel:.4f}, max abs diff: "
+            f"{(result.float() - expected).abs().max().item()} -- single "
+            "fresh-trace bmm on an outer/batch-dim offset chunk is wrong "
+            "with NO reuse involved (see #3770)"
+        )
+
+    def test_storage_offset_placeholder_reused_graph_distinct_offsets(self):
+        def fn(x):
+            return x + x
+
+        base = cached_randn((8, 128), differentiation="ph_reuse_graph_offsets")
+        dev_base = base.clone().to("spyre")
+        comp = torch.compile(fn, dynamic=False)
+
+        for lo in (0, 4, 1, 6):
+            with self.subTest(lo=lo):
+                dev_view = dev_base[lo : lo + 1, :]
+                cpu_view = base.clone()[lo : lo + 1, :]
+                expected = fn(cpu_view).float()
+                result = comp(dev_view).cpu()
+                assert torch.allclose(result.float(), expected, atol=0.1, rtol=0.1), (
+                    f"lo={lo}: max abs diff: "
+                    f"{(result.float() - expected).abs().max().item()} -- "
+                    "compiled graph likely reused a stale storage_offset=0 "
+                    "trace (see #3770)"
+                )
+
+    def test_storage_offset_placeholder_moe_expert_chunk_matmul(self):
+        def fn(w_chunk, x):
+            # [Ec, H, F] x [Ec, F, N] -> [Ec, H, N], one matmul per expert
+            # in the chunk -- shaped like the chunked expert FFN.
+            return torch.bmm(w_chunk, x)
+
+        E, H, F, N = 8, 32, 64, 32
+        Ec = 2
+        base_w = cached_randn((E, H, F), differentiation="ph_moe_expert_w")
+        x = cached_randn((Ec, F, N), differentiation="ph_moe_expert_x").to("spyre")
+        dev_base_w = base_w.clone().to("spyre")
+        comp = torch.compile(fn, dynamic=False)
+
+        for lo in (0, 4):
+            with self.subTest(lo=lo):
+                w_chunk = dev_base_w[lo : lo + Ec]
+                cpu_w_chunk = base_w.clone()[lo : lo + Ec]
+                expected = fn(cpu_w_chunk, x.cpu()).float()
+                result = comp(w_chunk, x).cpu()
+                mean_rel = (
+                    (result.float() - expected).abs().mean()
+                    / expected.abs().mean().clamp(min=1e-6)
+                ).item()
+                assert torch.allclose(result.float(), expected, atol=0.1, rtol=0.1), (
+                    f"lo={lo}: mean_rel={mean_rel:.4f}, max abs diff: "
+                    f"{(result.float() - expected).abs().max().item()} -- "
+                    "expert chunk at nonzero storage_offset read the wrong "
+                    "storage (see #3770)"
+                )
+
     def test_storage_offset_placeholder_fixed_layout_rejected(self):
         # Fixed-layout ops need their inputs' sticks where the op dictates, so
         # an offset stick would need a restickify before the op and another to
@@ -7354,8 +7446,8 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
     def test_fallback_cpu(self, x):
         def fn(t):
             t = torch.exp(t)  # compiled op
-            t = torch.sin(t)  # fallback op
-            t = torch.exp(t)  # compiled op
+            t = torch.cumsum(t.clamp(-1, 1), dim=-1)  # fallback op (aten.cumsum)
+            t = torch.exp(t.clamp(-1, 1))  # compiled op (clamp keeps exp safe)
             return t
 
         with pytest.warns(UserWarning) as record:
@@ -8198,6 +8290,43 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         else:
             assert result is None, (
                 f"Expected None for unsupported {src}->{dst}, got {result}"
+            )
+
+    def test_dtype_op_table_keys_are_torch_dtypes(self):
+        """DtypeOpTable keys use torch.dtype objects, not internal SEN names."""
+        table = DtypeOpTable.get_table()
+        for src, dst in table.keys():
+            assert isinstance(src, torch.dtype), (
+                f"Expected torch.dtype key, got {type(src)}: {src}"
+            )
+            assert isinstance(dst, torch.dtype), (
+                f"Expected torch.dtype key, got {type(dst)}: {dst}"
+            )
+        for src, dst in DtypeOpTable.get_dtype_pairs():
+            assert isinstance(src, torch.dtype), (
+                f"Expected torch.dtype in pairs, got {type(src)}: {src}"
+            )
+            assert isinstance(dst, torch.dtype), (
+                f"Expected torch.dtype in pairs, got {type(dst)}: {dst}"
+            )
+
+    def test_dtype_op_table_identity_pairs_symmetric(self):
+        """Identity pairs are symmetric — (A,B) identity iff (B,A) identity.
+
+        X→bool pairs are excluded: bool sources use get_bool_src_operator
+        (keyed on the physical DataFormats, not torch.dtype), so they are
+        intentionally absent from the regular get_operator table.
+        """
+        identity_pairs = [
+            (src, dst)
+            for src, dst in DtypeOpTable.get_dtype_pairs()
+            if DtypeOpTable.get_operator(src, dst) == IDENTITY_OP
+            and dst != torch.bool  # bool-src uses get_bool_src_operator
+        ]
+        for src, dst in identity_pairs:
+            rev = DtypeOpTable.get_operator(dst, src)
+            assert rev == IDENTITY_OP, (
+                f"({src},{dst}) is identity but ({dst},{src}) returned {rev}"
             )
 
     def test_to_dtype_cpu(self, x, dst_dtype):

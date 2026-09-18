@@ -1,4 +1,18 @@
-"""The v2 ClickHouse schema, as data — one module, byte-identical in all three product repos.
+# Copyright 2026 The Torch-Spyre Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""The v2 ClickHouse schema, as data — one module, imported by every consumer.
 
 WHY THIS EXISTS. Every v2 insert used to be a positional list paired with a separate
 column_names list, and the same four tables were assembled independently in three repos.
@@ -12,10 +26,11 @@ WHY A TABLE MODEL AND NOT AN INGESTER CLASS. The three ingest scripts run two wa
 directly from a checkout by GitHub Actions, and from inside a baked test image via
 `uv run --no-project --with lxml --with clickhouse-connect --with regex`. `--no-project` is
 deliberate (uv otherwise tries to sync the torch-spyre project and exits 2, dropping the
-ingest), so there is no sys.path beyond the script's own directory and those three wheels.
-Nothing here may be imported from another repo or installed as a package: this file is COPIED,
-and a drift check keeps the copies honest. Per-repo variation is one constant, COMPONENT,
-which is why a class hierarchy would have been the wrong shape.
+ingest), so there is no sys.path beyond the script's own directory and what `--with` installs.
+This module was originally COPIED per repo for that reason; it is now installed as this package
+via `--with`, so the copies and their drift check are gone. Per-repo variation is one constant,
+COMPONENT, which is why a class hierarchy would have been the wrong shape -- and why
+`v2_component` takes the default as a PARAMETER rather than reading it from here.
 
 WHY NOT THE DRIVER'S OWN SCHEMA SUPPORT. clickhouse-connect has none to use. Its `ColumnDef`
 is what DESCRIBE TABLE returns -- it reads a live table's schema, it cannot declare one or check
@@ -37,9 +52,49 @@ from dataclasses import dataclass
 from typing import Any
 from collections.abc import Sequence
 
-# The DDL's CONSTRAINT chk_status, re-expressed. It cannot be read from the server at ingest
-# time, so it is duplicated here -- keep in step with functional_tests_v2.sql.
+# The DDL's CHECK constraints, re-expressed. They cannot be read from the server at ingest
+# time, so they are duplicated here -- keep in step with functional_tests_v2.sql (status) and
+# artifacts_v2.sql (the rest).
 STATUS_VALUES = frozenset({"passed", "failed", "error", "skipped", "xfail", "xpass"})
+KIND_VALUES = frozenset({"image", "rpm", "wheel", "generic"})
+ORIGIN_VALUES = frozenset({"built", "copied", "promoted", "upstream"})
+METHOD_VALUES = frozenset({"container-pull", "dnf", "pip", "download"})
+REF_KIND_VALUES = frozenset({"pullspec", "glob", "url"})
+RESULT_KIND_VALUES = frozenset({"functional", "performance", "image"})
+TEST_TYPE_VALUES = frozenset(
+    {"smoke", "unit", "integration", "regression", "trunk", "perf"}
+)
+STATE_VALUES = frozenset({"passed", "failed", "error", "running"})
+
+# NOT constrained, deliberately: the DDL documents tag_family as a declared, extensible set
+# ('nightly | weekly | main | pr') with no CHECK, so validating it here would reject a channel
+# the schema permits. Same for arch, which carries two spellings by table family.
+
+# A dep entry in artifacts.identity_deps / context_deps is "<component>@<id12>" -- e.g.
+# 'flex@d026bd2d255e' -- or 'base=<sha256>' for a base image named by content, or a bare
+# component name when nothing pinned it. NOT a uuid: id12 is a hash INPUT to artifact_id, so
+# artifact_id cannot be recovered from the string. A reader resolves it via props['id12'].
+# This is stated here because it is the contract a reader must not guess: a dashboard route
+# that looked these up with `artifact_id IN (...)` matched zero rows and rendered nothing,
+# with no error, until it was found by querying prod.
+DEP_ENTRY_SEP = "@"
+DEP_BASE_PREFIX = "base="
+
+
+def dep_id12(entry: str) -> str:
+    """The id12 a dep entry names, or '' when it names none (bare name, or 'base=<sha>')."""
+    s = str(entry or "")
+    if not s or s.startswith(DEP_BASE_PREFIX) or DEP_ENTRY_SEP not in s:
+        return ""
+    return s.rsplit(DEP_ENTRY_SEP, 1)[1]
+
+
+def dep_component(entry: str) -> str:
+    """The component a dep entry names, without its pin."""
+    s = str(entry or "")
+    if s.startswith(DEP_BASE_PREFIX):
+        return ""
+    return s.rsplit(DEP_ENTRY_SEP, 1)[0] if DEP_ENTRY_SEP in s else s
 
 
 class SchemaError(ValueError):
@@ -58,6 +113,10 @@ class Table:
     columns: tuple[str, ...]
     # Columns that must be non-empty, mirroring the DDL's CHECK constraints.
     required: tuple[str, ...] = ()
+    # column -> the DDL CHECK's allowed set. Declared per table rather than inferred from a
+    # column name, so two tables can constrain the same name differently: `state` here is the
+    # artifact_results vocabulary, which is NOT test_case_runs' `status` set.
+    enums: tuple[tuple[str, frozenset[str]], ...] = ()
     # id column for cross-run identity dedup; None for fact tables, which append freely.
     identity: str | None = None
 
@@ -79,11 +138,12 @@ class Table:
         for col in self.required:
             if values[col] in ("", None):
                 raise SchemaError(f"{self.name}: column '{col}' must be non-empty")
-        if "status" in self.columns and values["status"] not in STATUS_VALUES:
-            raise SchemaError(
-                f"{self.name}: status {values['status']!r} violates the DDL CHECK "
-                f"(allowed: {sorted(STATUS_VALUES)})"
-            )
+        for col, allowed in self.enums:
+            if values[col] not in allowed:
+                raise SchemaError(
+                    f"{self.name}: {col} {values[col]!r} violates the DDL CHECK "
+                    f"(allowed: {sorted(allowed)})"
+                )
         return [values[c] for c in self.columns]
 
     def qualified(self, db: str | None) -> str:
@@ -96,7 +156,8 @@ class Table:
         return f"{db}.{self.name}" if db else self.name
 
 
-# ── the four v2 tables, columns in DDL order ────────────────────────────────────────────
+# ── the v2 functional/benchmark tables, columns in DDL order ────────────────────────────
+# Source of truth: the CI pipeline's functional_tests_v2.sql.
 # `ts` is omitted from every one: it is DEFAULT now() and letting the server set it keeps the
 # ingest clock out of the data.
 
@@ -121,6 +182,7 @@ TEST_CASE_RUNS = Table(
         "props",
     ),
     required=("component",),
+    enums=(("status", STATUS_VALUES),),
 )
 
 BENCHMARKS = Table(
@@ -146,7 +208,102 @@ BENCHMARK_RUNS = Table(
     required=("component",),
 )
 
-TABLES = {t.name: t for t in (TEST_CASES, TEST_CASE_RUNS, BENCHMARKS, BENCHMARK_RUNS)}
+# ── the four v2 ARTIFACT tables, columns in DDL order ───────────────────────────────────
+# Source of truth: the CI pipeline's artifacts_v2.sql. Modelled here for the same reason as the
+# tables above -- the writer and the readers had no shared statement of a row's shape, and the
+# artifact tables are where that actually cost us.
+#
+# `ts` omitted throughout, as above: DEFAULT now() on the server.
+
+ARTIFACTS = Table(
+    name="artifacts",
+    # sources is Array(Tuple(repo, git_ref, git_sha)) -- a 3-element sequence per source, in
+    # that order. identity_deps/context_deps are Array(String) of dep entries (see dep_id12).
+    columns=(
+        "artifact_id",
+        "component",
+        "arch",
+        "kind",
+        "artifact_name",
+        "origin",
+        "identity_deps",
+        "context_deps",
+        "sources",
+        "props",
+    ),
+    # arch is required by the DDL's own comment: one id12 exists per arch plus a 'multi'
+    # pointer, and dropping it collided 1,043 rows.
+    required=("component", "arch"),
+    # Not `identity=`: artifacts is plain MergeTree precisely so a duplicate artifact_id stays
+    # visible as the producer bug it is. Dedup here would hide it.
+    enums=(("kind", KIND_VALUES), ("origin", ORIGIN_VALUES)),
+)
+
+ARTIFACT_REFS = Table(
+    name="artifact_refs",
+    columns=(
+        "artifact_id",
+        "method",
+        "ref_kind",
+        "index_uri",
+        "ref",
+        "content_digest",
+        "props",
+    ),
+    required=("ref",),
+    enums=(("method", METHOD_VALUES), ("ref_kind", REF_KIND_VALUES)),
+)
+
+ARTIFACT_TAGS = Table(
+    name="artifact_tags",
+    # refs mirrors artifact_refs' shape for the tag's own published addresses; published_refs
+    # is the flat list. tag_family is NOT enum-checked -- the DDL declares it without a CHECK.
+    columns=(
+        "tag",
+        "tag_family",
+        "artifact_id",
+        "refs",
+        "published_refs",
+        "props",
+    ),
+    required=("tag",),
+)
+
+ARTIFACT_RESULTS = Table(
+    name="artifact_results",
+    # No stored counters: the v2 DDL removed total_tests/passed/failed because a stored copy is
+    # a second source of truth that drifts once a delta run copies a covering run's cases in.
+    # Readers derive them from test_case_runs.
+    columns=(
+        "artifact_id",
+        "run_id",
+        "result_kind",
+        "test_type",
+        "state",
+        "arch",
+        "duration_s",
+        "props",
+    ),
+    enums=(
+        ("result_kind", RESULT_KIND_VALUES),
+        ("test_type", TEST_TYPE_VALUES),
+        ("state", STATE_VALUES),
+    ),
+)
+
+TABLES = {
+    t.name: t
+    for t in (
+        TEST_CASES,
+        TEST_CASE_RUNS,
+        BENCHMARKS,
+        BENCHMARK_RUNS,
+        ARTIFACTS,
+        ARTIFACT_REFS,
+        ARTIFACT_TAGS,
+        ARTIFACT_RESULTS,
+    )
+}
 
 
 def insert(

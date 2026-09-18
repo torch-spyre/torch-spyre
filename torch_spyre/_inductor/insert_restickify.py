@@ -22,6 +22,7 @@ import sympy
 import torch
 
 from .constants import ELIDED_COPY_BACK_ATTR
+from .errors import Unsupported
 from .ir import FixedTiledLayout, SpyreEmptyFallback
 from .optimize_restickify import AnyInNode, EdgeCostMap
 from .logging_utils import get_inductor_logger
@@ -50,6 +51,39 @@ from torch.utils._ordered_set import OrderedSet
 
 
 logger = get_inductor_logger("insert_restickify")
+
+
+def _restickify_dep_index(
+    memory_deps: list[MemoryDep], restick_arg_info: dict
+) -> int | None:
+    """Resolve a restickify plan entry to its exact read-metadata slot."""
+    old_name = restick_arg_info["arg_name"]
+    if "dep_index" not in restick_arg_info:
+        matches = [i for i, dep in enumerate(memory_deps) if dep.name == old_name]
+        if len(matches) > 1:
+            raise AssertionError(
+                f"legacy restickify entry for {old_name!r} matches multiple reads"
+            )
+        return matches[0] if matches else None
+
+    expected_index = sympy.sympify(restick_arg_info["dep_index"])
+    matches = [
+        i
+        for i, dep in enumerate(memory_deps)
+        if dep.name == old_name and sympy.sympify(dep.index) == expected_index
+    ]
+    if len(matches) > 1:
+        raise AssertionError(
+            f"restickify edge {old_name}[{expected_index}] matches multiple "
+            "read-metadata slots"
+        )
+    if not matches:
+        raise AssertionError(
+            f"restickify edge {old_name}[{expected_index}] has no matching "
+            "read-metadata slot"
+        )
+
+    return matches[0]
 
 
 class InputEdgeSwapHandler(WrapperHandler):
@@ -325,25 +359,59 @@ def insert_restickify_on_node_inputs(
                 mem_deps = [
                     d for d in op.get_read_writes().reads if isinstance(d, MemoryDep)
                 ]
-                dep_idxs = [
-                    i
-                    for i, d in enumerate(mem_deps)
-                    if d.name == old_name and i < len(reads_per_dim)
-                ]
+                dep_idx = _restickify_dep_index(mem_deps, restick_arg_info)
+                if dep_idx is not None and dep_idx >= len(reads_per_dim):
+                    raise AssertionError(
+                        f"restickify metadata index {dep_idx} is outside "
+                        f"tiled_dims_per_read ({len(reads_per_dim)} entries)"
+                    )
                 dep_advance = (
-                    copy.deepcopy(reads_per_dim[dep_idxs[0]])
-                    if dep_idxs
+                    copy.deepcopy(reads_per_dim[dep_idx])
+                    if dep_idx is not None
                     else [[] for _ in range(n_levels)]
                 )
+                # squeezed_advance_per_read is the second, independent channel
+                # for the same per-read advance (see CoarseTileInfo), also
+                # matched to reads positionally, so it must be handed over the
+                # same way. Left shared, the stage inherits the consumer's whole
+                # list and its single read picks up whatever advance sat at
+                # index 0 -- for an in-body page gather that is the block
+                # table's per-trip step, applied to the staged pages copy.
+                adv_per_read = getattr(consumer_li, "squeezed_advance_per_read", [])
+                dep_squeezed = (
+                    copy.deepcopy(adv_per_read[dep_idx])
+                    if dep_idx is not None
+                    and adv_per_read
+                    and dep_idx < len(adv_per_read)
+                    else []
+                )
+                if restick_arg_info.get("occurrence", 0) != 0 and (
+                    any(dep_advance) or any(dep_squeezed)
+                ):
+                    raise Unsupported(
+                        f"restickify edge {old_name}[{restick_arg_info['dep_index']}] "
+                        f"occurrence {restick_arg_info['occurrence']} cannot "
+                        "transfer advancing read metadata independently"
+                    )
                 restick_li = copy.copy(consumer_li)
                 restick_li.tiled_dims_per_read = [dep_advance]
+                restick_li.squeezed_advance_per_read = (
+                    [dep_squeezed] if any(dep_squeezed) else []
+                )
                 restick_li.output_tiled_dims = [[] for _ in range(n_levels)]
                 restick_buff.loop_info = restick_li
-                if dep_idxs:
-                    consumer_li.tiled_dims_per_read = [
-                        [[] for _ in range(n_levels)] if i in dep_idxs else entry
-                        for i, entry in enumerate(reads_per_dim)
+                if dep_idx is not None:
+                    consumer_li.tiled_dims_per_read = copy.deepcopy(reads_per_dim)
+                    consumer_li.tiled_dims_per_read[dep_idx] = [
+                        [] for _ in range(n_levels)
                     ]
+                    if adv_per_read:
+                        consumer_li.squeezed_advance_per_read = copy.deepcopy(
+                            adv_per_read
+                        )
+                        consumer_li.squeezed_advance_per_read[dep_idx] = [
+                            [] for _ in range(n_levels)
+                        ]
             else:
                 restick_buff.loop_info = consumer_li
 

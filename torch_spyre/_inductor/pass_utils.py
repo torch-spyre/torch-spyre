@@ -2409,43 +2409,70 @@ def copy_fx_custom_meta(src: "torch.fx.Node", dst: "torch.fx.Node") -> None:
 def _repoint_mutation_targets(
     operations: list[Operation], old_buf: Buffer, new_buf: Buffer
 ) -> None:
-    """Repoint any ``MutationLayoutSHOULDREMOVE.target`` chain aimed at ``old_buf``.
+    """Repoint any direct object reference to ``old_buf`` still held elsewhere.
 
     Reconstructing a ``ComputedBuffer`` (see ``replace_computed_buffer_body``,
     ``redirect_computed_buffer_reads``) swaps the new object into ``operations``
-    and ``V.graph.name_to_buffer``, but a mutation op elsewhere in the graph may
-    hold a direct object reference to the old buffer via
-    ``MutationLayoutSHOULDREMOVE.target`` -- set once, at the mutation op's
-    original lowering time, and never re-resolved by name afterwards (unlike
-    ordinary reads, which always go through ``V.graph.get_buffer(name)``).  Left
-    unpatched, that op keeps mutating the orphaned old object forever: its
-    layout is never promoted past ``FixedLayout``, which later fails the
-    ``isinstance(layout, FixedTiledLayout)`` assert in
-    ``work_division._resolve_layout`` (see issue #3944/#3945).
+    and ``V.graph.name_to_buffer``, but two kinds of ops elsewhere in the graph
+    may hold a *direct* object reference to the old buffer that is never
+    re-resolved by name afterwards (unlike ordinary reads, which always go
+    through ``V.graph.get_buffer(name)``):
 
-    ``target`` may be the bare buffer, or wrapped in one or more
-    ``MutableBox``/``BaseView`` layers (``TensorBox(StorageBox(buf))``,
+    - A mutation op's ``MutationLayoutSHOULDREMOVE.target`` -- set once, at
+      the mutation op's original lowering time. Left unpatched, that op keeps
+      mutating the orphaned old object forever: its layout is never promoted
+      past ``FixedLayout``, which later fails the
+      ``isinstance(layout, FixedTiledLayout)`` assert in
+      ``work_division._resolve_layout`` (see issue #3944/#3945).
+    - A nested, not-yet-spliced ``ir.WhileLoop``'s own ``.carried_inputs``/
+      ``.additional_inputs`` -- set once, at ``ir.WhileLoop.create`` time
+      (see ``torch/_inductor/ir.py``), well before any splicing pass runs.
+      For a NESTED ``for_each_tile``, the inner ``WhileLoop`` can sit inside
+      the very ``operations`` list whose ops this function (via
+      ``redirect_computed_buffer_reads``) is reconstructing during the
+      OUTER while_loop's own splice -- so the inner loop's carry can go
+      stale one splice before it is itself spliced, producing the same
+      "stuck at FixedLayout" crash as the mutation-target case above.
+
+    ``target``/a carry entry may be the bare buffer, or wrapped in one or
+    more ``MutableBox``/``BaseView`` layers (``TensorBox(StorageBox(buf))``,
     ``ReinterpretView``, ...) -- both wrapper families expose the next layer
     as ``.data``, so a single attribute name covers both.
     """
-    for candidate in operations:
-        layout = getattr(candidate, "layout", None)
-        if not isinstance(layout, MutationLayoutSHOULDREMOVE):
-            continue
-        target = layout.target
-        if target is old_buf:
-            layout.target = new_buf
-            continue
+    from torch._inductor import ir
+
+    def _repoint_reference_chain(holder) -> None:
+        if holder is old_buf:
+            return  # caller already repoints the direct list/attr slot itself
         # Buffer/ComputedBuffer (a bare target) has no `.data`, so the walk
         # is guaranteed to terminate there without wrongly descending into
         # an already-bare buffer.
-        holder = target
         while hasattr(holder, "data"):
             inner = holder.data
             if inner is old_buf:
                 holder.data = new_buf
-                break
+                return
             holder = inner
+
+    for candidate in operations:
+        layout = getattr(candidate, "layout", None)
+        if isinstance(layout, MutationLayoutSHOULDREMOVE):
+            target = layout.target
+            if target is old_buf:
+                layout.target = new_buf
+            else:
+                _repoint_reference_chain(target)
+
+        if isinstance(candidate, ir.WhileLoop):
+            for attr in ("carried_inputs", "additional_inputs"):
+                nested_inputs = getattr(candidate, attr, None)
+                if not nested_inputs:
+                    continue
+                for i, inp in enumerate(nested_inputs):
+                    if inp is old_buf:
+                        nested_inputs[i] = new_buf
+                    else:
+                        _repoint_reference_chain(inp)
 
 
 def replace_computed_buffer_body(
@@ -2465,8 +2492,9 @@ def replace_computed_buffer_body(
     ``origin_node``, and the ``_split_size`` / ``_original_*`` fields used by
     ``get_default_sizes_body``.  The ``get_default_sizes_body`` cache is
     cleared on the new buffer so stale size results from the old body are not
-    reused.  Also repoints any ``MutationLayoutSHOULDREMOVE.target`` elsewhere
-    in ``operations`` that referenced the old object (see
+    reused.  Also repoints any ``MutationLayoutSHOULDREMOVE.target`` or
+    nested ``ir.WhileLoop.carried_inputs``/``.additional_inputs`` elsewhere in
+    ``operations`` that referenced the old object (see
     ``_repoint_mutation_targets``).
 
     Returns the replacement ComputedBuffer.
@@ -2562,7 +2590,8 @@ def redirect_computed_buffer_reads(
     ``ComputedBuffer`` so the instance-keyed ``get_default_sizes_body`` cache is
     cleanly invalidated (the reconstruct is the reason both this helper and
     ``replace_computed_buffer_body`` rebuild rather than mutate in place). Also
-    repoints any ``MutationLayoutSHOULDREMOVE.target`` elsewhere in
+    repoints any ``MutationLayoutSHOULDREMOVE.target`` or nested
+    ``ir.WhileLoop.carried_inputs``/``.additional_inputs`` elsewhere in
     ``operations`` that referenced the old object (see
     ``_repoint_mutation_targets``).
 
@@ -3542,7 +3571,7 @@ def _per_core_view_on_buf(
     op/edge should call those two directly to amortize the op-level precompute.
 
     Returns `(view, has_partial_reduction, representable)`. ``has_partial_reduction``
-    is True when the op has a reduction split (partial sums left on most cores);
+    is True when the op has a reduction split (not every core writes a result);
     callers act on it only for write-deps. ``representable`` is False only on the
     give-up cases (a split that slices this buffer can't be placed on a device
     dim), which cross-op comparisons must treat as a non-match. Pass `cache` to
@@ -3606,6 +3635,46 @@ def _per_core_view_on_buf(
     if cache is not None:
         cache[key] = result
     return result
+
+
+def completed_reduction_split_on_buf(
+    op: Operation,
+    dep: MemoryDep,
+    buf_name: str,
+) -> int | None:
+    """Return the committed reduction split for a matmul result.
+
+    The completed value is on the last reduction slice regardless of OUT.
+    Retain the output-axis ambiguity check when certifying this geometry.
+    Other reductions need their own native-combine and finished-writer rules;
+    a partial output alone does not establish this matmul contract.
+    """
+
+    if not _is_matmul_op(op):
+        return None
+    prep = _prepare_per_core_view(op, dep, buf_name)
+    ownership = getattr(op, "iteration_space_ownership", None)
+    if prep is None or ownership is None:
+        return None
+    reduction_splits = [
+        int(ownership.work_slices.get(sym, 1))
+        for sym in prep.iter_space
+        if prep.write_index.coeff(sym) == 0
+        and int(ownership.work_slices.get(sym, 1)) > 1
+    ]
+    if len(reduction_splits) != 1 or prep.stick_host_stride is None:
+        return None
+
+    # Matmul OUT is the output tensor's stick dimension; size-one OUT can
+    # have no loop symbol.
+    output_symbols = [
+        sym
+        for sym in prep.iter_space
+        if prep.write_index.coeff(sym) == prep.stick_host_stride
+    ]
+    if len(output_symbols) > 1:
+        return None
+    return reduction_splits[0]
 
 
 def format_operations(operations: list[Operation]) -> str:

@@ -433,6 +433,7 @@ COMPILED_OPS = [
     aten.where.self_out,
     aten.clamp,
     aten.constant_pad_nd,
+    aten._scaled_mm,
     aten.embedding.default,
     aten.any.default,
     aten.any.dim,

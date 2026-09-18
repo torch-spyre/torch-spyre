@@ -408,6 +408,64 @@ class TestDebugHandleStripped(unittest.TestCase):
         self.assertNotIn("debug_handle_", result["0_add"]["dscs_"][0]["add"])
 
 
+# frontend_pool_allocation flag is hashed
+class TestFrontendPoolAllocationHashed(unittest.TestCase):
+    """frontend_pool_allocation changes both the bundle signature (pool
+    base-address as first MLIR input) and the .run() ABI (tensor_id offset).
+    A kernel compiled with the flag off must never be served to a runner built
+    with the flag on, and vice-versa — so the flag must be part of the key.
+    """
+
+    def _hash_with_flag(self, flag: bool):
+        from torch_spyre.execution.kernel_cache import compute_specs_hash
+
+        op = _make_op_spec()
+        with (
+            patch(
+                "torch_spyre.execution.kernel_cache._get_dxp_version",
+                return_value="test-dxp-1.0",
+            ),
+            patch(
+                "torch_spyre.execution.kernel_cache._get_torch_spyre_version",
+                return_value="test-spyre-0.0",
+            ),
+            patch("torch_spyre._inductor.config.bundle_symbolic_args", False),
+            patch(
+                "torch_spyre._inductor.config.frontend_pool_allocation",
+                flag,
+            ),
+        ):
+            return compute_specs_hash([op], kernel_name="pool_alloc_test")
+
+    def test_flag_off_vs_on_produce_different_hashes(self):
+        """Off-vs-on must yield different cache keys to prevent a kernel
+        compiled without the pool parameter being silently reused when the
+        flag is later enabled (which would shift all tensor IDs by one)."""
+        h_off = self._hash_with_flag(False)
+        h_on = self._hash_with_flag(True)
+
+        self.assertNotEqual(
+            h_off,
+            h_on,
+            "frontend_pool_allocation=False and True must produce different "
+            "hashes — the flag changes the bundle signature and .run() ABI.",
+        )
+
+    def test_same_flag_value_produces_same_hash(self):
+        """Two compilations with the same flag value and identical ops must
+        still hit the cache (no spurious misses introduced by the change)."""
+        self.assertEqual(
+            self._hash_with_flag(False),
+            self._hash_with_flag(False),
+            "Same flag value must produce the same hash.",
+        )
+        self.assertEqual(
+            self._hash_with_flag(True),
+            self._hash_with_flag(True),
+            "Same flag value must produce the same hash.",
+        )
+
+
 # Version strings affect hash (environment independence guard)
 class TestVersionStringsHashed(unittest.TestCase):
     """Changing any version string (torch, torch_spyre, dxp) must change the hash."""
