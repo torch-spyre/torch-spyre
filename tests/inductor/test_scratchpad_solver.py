@@ -23,11 +23,14 @@ import sys
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 
+import pytest
 import sympy
+import torch
 from unittest import TestCase
 
 from torch_spyre._inductor import config
 from torch_spyre._inductor.scratchpad.allocator import _lx_planning_size
+from utils_inductor import compare_with_cpu, cached_randn
 from torch_spyre._inductor.scratchpad.plan_solver import (
     CoreDivisionLayoutSolver,
     MemoryPlanSolver,
@@ -1714,6 +1717,132 @@ class TestTopologicalSort(TestCase):
             self._names([root, mid, a, b], lambda buf: -buf.size),
             ["root", "mid", "b", "a"],
         )
+
+
+class TestPerCoreViewFrameMismatch:
+    """Regression coverage for #3084's per-core view frame-consistency fix
+    in pass_utils.py (writer/reader of the same buffer compared in
+    inconsistent logical-vs-tiled frames). Exercises current behavior."""
+
+    def setup_method(self):
+        torch.manual_seed(0xAFFE)
+
+    def test_matmul_k_split_output_feeds_second_op_multicore(self):
+        m, k, n = 64, 128, 64
+
+        def matmul_then_scale(a, b, scale):
+            mm = torch.matmul(a, b)
+            return mm * scale + mm
+
+        a = cached_randn((m, k))
+        b = cached_randn((k, n), differentiation=1)
+        scale = cached_randn((1,), differentiation=2)
+
+        with config.patch(
+            {"lx_planning": True, "allow_all_ops_in_lx_planning": True, "sencores": 8}
+        ):
+            compare_with_cpu(matmul_then_scale, a, b, scale)
+
+    def test_batched_matmul_k_split_feeds_reduction(self):
+        b, m, k, n = 2, 32, 64, 32
+
+        def bmm_then_reduce(x, y):
+            mm = torch.matmul(x, y)
+            return mm.sum(dim=-1) + mm.sum(dim=-2).sum(dim=-1, keepdim=True)
+
+        x = cached_randn((b, m, k))
+        y = cached_randn((b, k, n), differentiation=1)
+
+        with config.patch(
+            {"lx_planning": True, "allow_all_ops_in_lx_planning": True, "sencores": 8}
+        ):
+            compare_with_cpu(bmm_then_reduce, x, y)
+
+
+class TestPerCoreViewFrameMismatchExtended:
+    """Extends TestPerCoreViewFrameMismatch with a wider sencores sweep,
+    including sencores=1 to cover _per_core_view_on_buf's single-core
+    path."""
+
+    def setup_method(self):
+        torch.manual_seed(0xAFFE)
+
+    @pytest.mark.parametrize(
+        "m,k,n,sencores",
+        [
+            (64, 128, 64, 1),
+            (64, 128, 64, 4),
+            (64, 128, 64, 8),
+            (128, 256, 128, 8),
+            (32, 64, 32, 4),
+            (128, 128, 128, 16),
+        ],
+    )
+    def test_matmul_k_split_feeds_pointwise_consumer(self, m, k, n, sencores):
+        def matmul_then_scale(a, b, scale):
+            mm = torch.matmul(a, b)
+            return mm * scale + mm
+
+        a = cached_randn((m, k))
+        b = cached_randn((k, n), differentiation=1)
+        scale = cached_randn((1,), differentiation=2)
+
+        with config.patch(
+            {
+                "lx_planning": True,
+                "allow_all_ops_in_lx_planning": True,
+                "sencores": sencores,
+            }
+        ):
+            compare_with_cpu(matmul_then_scale, a, b, scale)
+
+    @pytest.mark.parametrize(
+        "b,m,k,n,sencores",
+        [
+            (2, 32, 64, 32, 1),
+            (2, 32, 64, 32, 4),
+            (2, 32, 64, 32, 8),
+            (4, 16, 32, 16, 4),
+        ],
+    )
+    def test_batched_matmul_k_split_feeds_reduction(self, b, m, k, n, sencores):
+        def bmm_then_reduce(x, y):
+            mm = torch.matmul(x, y)
+            return mm.sum(dim=-1) + mm.sum(dim=-2).sum(dim=-1, keepdim=True)
+
+        x = cached_randn((b, m, k))
+        y = cached_randn((b, k, n), differentiation=1)
+
+        with config.patch(
+            {
+                "lx_planning": True,
+                "allow_all_ops_in_lx_planning": True,
+                "sencores": sencores,
+            }
+        ):
+            compare_with_cpu(bmm_then_reduce, x, y)
+
+    @pytest.mark.parametrize(
+        "m,k,n,sencores",
+        [(64, 64, 64, 1), (64, 64, 64, 4), (64, 64, 64, 8)],
+    )
+    def test_matmul_output_feeds_second_matmul(self, m, k, n, sencores):
+        a = cached_randn((m, k))
+        b = cached_randn((k, n), differentiation=1)
+        c = cached_randn((n, m), differentiation=2)
+
+        def chained_matmul(x, y, z):
+            mid = torch.matmul(x, y)
+            return torch.matmul(mid, z) + mid.sum()
+
+        with config.patch(
+            {
+                "lx_planning": True,
+                "allow_all_ops_in_lx_planning": True,
+                "sencores": sencores,
+            }
+        ):
+            compare_with_cpu(chained_matmul, a, b, c)
 
 
 if __name__ == "__main__":

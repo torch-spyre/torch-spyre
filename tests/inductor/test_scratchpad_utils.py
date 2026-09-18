@@ -37,7 +37,11 @@ import unittest
 from types import SimpleNamespace
 from unittest import TestCase, mock
 
+import pytest
 import sympy
+import torch
+import torch._dynamo
+from torch.testing import FileCheck
 from torch._inductor.dependencies import MemoryDep
 from torch._inductor.ir import ExternKernel, FallbackKernel
 
@@ -46,6 +50,7 @@ from torch_spyre._inductor.scratchpad.utils import (
     _would_produce_lx_back_gap,
     get_ncores_for_buffers,
 )
+from utils_inductor import compare_with_cpu, cached_randn
 
 _COORDS = "torch_spyre._inductor.scratchpad.utils.device_coordinates"
 
@@ -169,6 +174,118 @@ class ExternalOperandTest(TestCase):
                     self.assertIn("FallbackKernel/ExternKernel", reasons[_BUF])
                     self.assertEqual(views, {})
                     project.assert_not_called()
+
+
+def _lx_residency_check(source: str) -> None:
+    FileCheck().check("{lx:").run(source)
+
+
+class TestBackGapProducingBufferExclusion(TestCase):
+    """A non-stick-aligned cat buffer must be excluded from LX for some
+    real residency reason, not silently placed."""
+
+    def test_gap_producing_buffer_is_excluded_from_lx(self):
+        from torch_spyre._inductor.scratchpad.allocator import ScratchpadAllocator
+
+        rows, c1, c2 = 32, 8, 120
+
+        def cat_then_use_twice(a, b):
+            cat = torch.cat([a, b], dim=-1)
+            return cat * 2 + cat
+
+        a = cached_randn((rows, c1))
+        b = cached_randn((rows, c2), differentiation=1)
+
+        captured: dict[str, "str | None"] = {}
+        orig = ScratchpadAllocator._buffer_residency_reason
+
+        def wrapper(self, graph, name, uses, op, **kwargs):
+            reason = orig(self, graph, name, uses, op, **kwargs)
+            captured[name] = reason
+            return reason
+
+        with (
+            config.patch({"lx_planning": True, "allow_all_ops_in_lx_planning": True}),
+            mock.patch.object(ScratchpadAllocator, "_buffer_residency_reason", wrapper),
+        ):
+            torch._dynamo.reset()
+            compare_with_cpu(cat_then_use_twice, a, b)
+
+        self.assertNotIn(
+            None,
+            captured.values(),
+            "Expected every buffer in this non-stick-aligned cat scenario "
+            "to be excluded from LX for some real reason (none cleanly "
+            f"placed); captured reasons: {captured}",
+        )
+
+
+def _layernorm_chain(x, weight, bias, normalized_shape):
+    # A second op after layer_norm so the normalized output is a real LX
+    # candidate, not just an unread graph output.
+    y = torch.nn.functional.layer_norm(x, normalized_shape, weight, bias, eps=1e-5)
+    return y * 2 + y
+
+
+class TestLayerNormAddressing:
+    """LayerNorm correctness and LX residency under default lx_planning,
+    including across core counts (#2533)."""
+
+    def setup_method(self):
+        torch.manual_seed(0xAFFE)
+
+    @pytest.mark.parametrize(
+        "rows,hidden,dtype",
+        [
+            (2048, 4096, torch.float16),  # Granite/Llama prefill hidden
+            (1, 4096, torch.float16),  # decode (M=1) -- boundary shape
+            (49152, 768, torch.bfloat16),  # BERT-style hidden, bf16
+            (2048, 12800, torch.float16),  # Granite intermediate-sized hidden
+            (2049, 4096, torch.float16),  # non-power-of-2 row count
+            (32, 256, torch.bfloat16),  # small shape, bf16
+        ],
+    )
+    def test_layernorm_matches_cpu_under_default_lx_planning(self, rows, hidden, dtype):
+        x = cached_randn((rows, hidden), dtype=dtype)
+        weight = cached_randn((hidden,), differentiation=1, dtype=dtype)
+        bias = cached_randn((hidden,), differentiation=2, dtype=dtype)
+
+        with config.patch({"lx_planning": True, "allow_all_ops_in_lx_planning": True}):
+            compare_with_cpu(
+                lambda x, w, b: _layernorm_chain(x, w, b, (hidden,)),
+                x,
+                weight,
+                bias,
+                atol=0.15,
+                rtol=0.15,
+                source_check=_lx_residency_check,
+            )
+
+    @pytest.mark.parametrize("sencores", [1, 4, 8, 32])
+    def test_layernorm_matches_cpu_across_sencores(self, sencores):
+        """LayerNorm's split dim is the outer (row) dim; sweep core counts
+        to exercise the per-core LX addressing path."""
+        rows, hidden = 2048, 4096
+        x = cached_randn((rows, hidden))
+        weight = cached_randn((hidden,), differentiation=1)
+        bias = cached_randn((hidden,), differentiation=2)
+
+        with config.patch(
+            {
+                "lx_planning": True,
+                "allow_all_ops_in_lx_planning": True,
+                "sencores": sencores,
+            }
+        ):
+            compare_with_cpu(
+                lambda x, w, b: _layernorm_chain(x, w, b, (hidden,)),
+                x,
+                weight,
+                bias,
+                atol=0.15,
+                rtol=0.15,
+                source_check=_lx_residency_check,
+            )
 
 
 if __name__ == "__main__":

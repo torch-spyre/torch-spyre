@@ -37,13 +37,14 @@ fp8 op tests, e.g.
 import math
 from unittest.mock import patch as mock_patch
 
+import pytest
 import torch
 import torch._dynamo
 import torch._inductor.config as inductor_config
 
 import torch_spyre._inductor.propagate_layouts as propagate_layouts
 from torch_spyre._inductor import config, spyre_hint
-from utils_inductor import DEVICE
+from utils_inductor import DEVICE, cached_randn
 
 _LAUNCH_JOBPLAN = "torch_spyre.execution.kernel_runner.launch_jobplan"
 _PREPARE_KERNEL = "torch_spyre.execution.kernel_runner.prepare_kernel"
@@ -157,3 +158,117 @@ class TestLXInplaceLayout:
                 f"  {n}: committed={c} args={a}" for n, (c, a) in captured.items()
             )
         )
+
+
+class TestFusedNodeLayoutPropagation:
+    """Extends TestLXInplaceLayout to a fused scheduling node (transpose
+    fused into matmul) and a negative case where no input shares the
+    output's frame."""
+
+    def _compile_and_capture(self, fn, *args, sencores=4):
+        wrapper, captured = _capture_multi_arg_layouts(
+            propagate_layouts._multi_arg_pointwise_layouts
+        )
+        with (
+            config.patch(
+                {
+                    "lx_planning": True,
+                    "allow_all_ops_in_lx_planning": True,
+                    "sencores": sencores,
+                }
+            ),
+            mock_patch.object(
+                propagate_layouts, "_multi_arg_pointwise_layouts", wrapper
+            ),
+            mock_patch(_LAUNCH_JOBPLAN),
+            mock_patch(_PREPARE_KERNEL),
+        ):
+            torch._dynamo.reset()
+            cfn = torch.compile(fn, backend="inductor")
+            device_args = [a.to(DEVICE) for a in args]
+            cfn(*device_args)
+        return captured
+
+    @pytest.mark.parametrize(
+        "b,h,s,d",
+        [
+            # This shape hits a pre-existing padding.py bug
+            # (_pad_restickify_input's `assert len(syms) == 1`) before
+            # compilation reaches the layout-propagation code under test.
+            pytest.param(
+                1,
+                2,
+                32,
+                16,
+                marks=pytest.mark.xfail(
+                    reason="padding.py's _pad_restickify_input assert "
+                    "len(syms) == 1 fails before reaching layout "
+                    "propagation; unrelated to what this test targets",
+                    strict=True,
+                ),
+            ),
+            (1, 4, 64, 32),
+        ],
+    )
+    def test_transpose_fused_into_matmul_promotes_layout(self, b, h, s, d):
+        """matmul(q, k.transpose(-1,-2)) -- the transpose commonly fuses
+        into the matmul's own FX node. The pointwise op reading the
+        matmul's output (here, the add after softmax) should still have
+        its layout promoted from that fused matmul's output, exactly as
+        TestLXInplaceLayout's unfused case proves."""
+        scale = 1.0 / math.sqrt(math.sqrt(d))
+
+        def fn(q, k, mask):
+            scores = torch.matmul(q * scale, k.transpose(-1, -2))
+            return scores + mask
+
+        mask_shape = (1, 1, s, s)
+        q = cached_randn((b, h, s, d))
+        k = cached_randn((b, h, s, d), differentiation=1)
+        mask = cached_randn(mask_shape, differentiation=2)
+
+        captured = self._compile_and_capture(fn, q, k, mask)
+
+        assert captured, "no multi-arg pointwise op was lowered"
+        matched = False
+        for _name, (committed, arg_layouts) in captured.items():
+            for _arg_name, arg_layout in arg_layouts.items():
+                same_footprint = math.prod(
+                    [s_ for s_ in arg_layout[0] if s_ > 0]
+                ) == math.prod([s_ for s_ in committed[0] if s_ > 0])
+                if same_footprint and arg_layout == committed:
+                    matched = True
+                    break
+            if matched:
+                break
+        assert matched, (
+            "Expected the add's committed layout to equal the fused "
+            f"matmul's output layout. Captured: {captured}"
+        )
+
+    def test_no_promotion_when_no_shared_frame(self):
+        """Negative case: when every input to a multi-arg pointwise op is
+        a pure broadcast (no input shares the output's device footprint),
+        the committed layout must NOT equal any input's layout --
+        promotion should not fire spuriously."""
+
+        def fn(a, b):
+            # a and b broadcast against each other on different axes; the
+            # add's output footprint (2,64,64) matches neither input's own
+            # (1,64,64)/(2,1,64) footprint exactly.
+            return a + b
+
+        a = cached_randn((1, 64, 64))
+        b = cached_randn((2, 1, 64), differentiation=1)
+
+        captured = self._compile_and_capture(fn, a, b)
+        assert captured, "no multi-arg pointwise op was lowered"
+        for _name, (committed, arg_layouts) in captured.items():
+            for _arg_name, arg_layout in arg_layouts.items():
+                same_footprint = math.prod(
+                    [s_ for s_ in arg_layout[0] if s_ > 0]
+                ) == math.prod([s_ for s_ in committed[0] if s_ > 0])
+                assert not (same_footprint and arg_layout == committed), (
+                    "Promotion fired for a broadcast-only input with no "
+                    f"shared frame: {committed} == {arg_layout}"
+                )
