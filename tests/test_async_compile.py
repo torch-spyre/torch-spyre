@@ -17,16 +17,20 @@
 from concurrent.futures import Future
 import os
 from pathlib import Path
+import threading
 from typing import Any
 from unittest.mock import patch
 
 import pytest
+import sympy
 import torch
 from torch._inductor.codecache import CodeCacheFuture
 from torch._inductor.async_compile import shutdown_compile_workers
 
 from torch_spyre._inductor import config as spyre_config
 from torch_spyre.execution import async_compile as async_compile_mod
+from torch_spyre._inductor.op_spec import LoopSpec
+from torch_spyre.execution.kernel_runner import SpyreSDSCKernelRunner
 
 
 class _RecordingPool:
@@ -277,3 +281,110 @@ def test_real_subprocess_pool_runs_dxp_jobs_concurrently(tmp_path: Path):
         shutdown_compile_workers()
 
     assert {path.name for path in marker_dir.iterdir()} == {"kernel0", "kernel1"}
+
+
+def test_symbolic_loop_returns_lazy_runner_without_generating_bundle():
+    compiler = async_compile_mod.SpyreAsyncCompile()
+    count = sympy.Symbol("s0", integer=True, positive=True)
+    specs = [LoopSpec(count=count, body=[], max_count=8)]
+
+    with (
+        patch.object(async_compile_mod, "generate_bundle") as generate,
+        patch.object(
+            async_compile_mod, "build_kernel_provenance_descriptor", return_value=None
+        ),
+    ):
+        runner = compiler.sdsc("dynamic", specs)
+
+    assert isinstance(runner, SpyreSDSCKernelRunner)
+    assert runner.code_dir is None
+    generate.assert_not_called()
+
+
+def test_specialize_loop_count_replaces_only_count_and_checks_bound():
+    count = sympy.Symbol("s0", integer=True, positive=True)
+    body = object()
+    specs = [LoopSpec(count=count, body=[body], max_count=8)]
+
+    result = async_compile_mod.specialize_loop_count(specs, 3)
+
+    assert result[0].count == 3
+    assert result[0].max_count == 8
+    assert result[0].body[0] is body
+    assert specs[0].count == count
+    with pytest.raises(ValueError, match="exceeds traced maximum"):
+        async_compile_mod.specialize_loop_count(specs, 9)
+
+
+def test_variant_runner_caches_one_concrete_runner_per_count():
+    count = sympy.Symbol("s0", integer=True, positive=True)
+    runner = SpyreSDSCKernelRunner(
+        "dynamic",
+        None,
+        specs=[LoopSpec(count=count, body=[], max_count=8)],
+    )
+    concrete = object()
+    compiler = async_compile_mod.SpyreAsyncCompile()
+
+    with (
+        patch.object(
+            async_compile_mod,
+            "SpyreAsyncCompile",
+            return_value=compiler,
+        ),
+        patch.object(compiler, "_sdsc_concrete", return_value=concrete) as compile_one,
+    ):
+        assert runner._variant_runner(3) is concrete
+        assert runner._variant_runner(3) is concrete
+
+    compile_one.assert_called_once()
+
+
+def test_variant_runner_single_flight_for_concurrent_same_count():
+    count = sympy.Symbol("s0", integer=True, positive=True)
+    runner = SpyreSDSCKernelRunner(
+        "dynamic",
+        None,
+        specs=[LoopSpec(count=count, body=[], max_count=8)],
+    )
+    concrete = object()
+    compiler = async_compile_mod.SpyreAsyncCompile()
+    entered = threading.Event()
+    release = threading.Event()
+
+    def compile_one(*_args):
+        entered.set()
+        assert release.wait(timeout=10)
+        return concrete
+
+    results = []
+    errors = []
+
+    def request():
+        try:
+            results.append(runner._variant_runner(4))
+        except BaseException as exc:  # pragma: no cover - diagnostic path
+            errors.append(exc)
+
+    with (
+        patch.object(
+            async_compile_mod,
+            "SpyreAsyncCompile",
+            return_value=compiler,
+        ),
+        patch.object(
+            compiler, "_sdsc_concrete", side_effect=compile_one
+        ) as compile_call,
+    ):
+        first = threading.Thread(target=request)
+        second = threading.Thread(target=request)
+        first.start()
+        assert entered.wait(timeout=10)
+        second.start()
+        release.set()
+        first.join(timeout=10)
+        second.join(timeout=10)
+
+    assert not errors
+    assert results == [concrete, concrete]
+    compile_call.assert_called_once()

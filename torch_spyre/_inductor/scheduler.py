@@ -62,25 +62,29 @@ class CountedLoopSchedulerNode(FusedSchedulerNode):
     """
 
     loop_count: sympy.Expr
+    max_loop_count: int | None
 
     def __init__(
         self,
         scheduler,
         snodes: list[BaseSchedulerNode],
         loop_count: sympy.Expr,
+        max_loop_count: int | None = None,
     ) -> None:
         super().__init__(scheduler, snodes)
         self.loop_count = loop_count
+        self.max_loop_count = max_loop_count
 
     @classmethod
     def create(  # type: ignore[override]
         cls,
         snodes: list[BaseSchedulerNode],
         loop_count: sympy.Expr,
+        max_loop_count: int | None = None,
     ) -> "CountedLoopSchedulerNode":
         scheduler = snodes[0].scheduler
         assert all(node.scheduler is scheduler for node in snodes)
-        grouped = cls(scheduler, snodes, loop_count)
+        grouped = cls(scheduler, snodes, loop_count, max_loop_count)
         for snode in snodes:
             scheduler.name_to_fused_node[snode.get_name()] = grouped
         scheduler.name_to_fused_node[grouped.get_name()] = grouped
@@ -129,8 +133,25 @@ def _loop_count(node: BaseSchedulerNode, depth: int) -> sympy.Expr:
                     f"loop_count length {len(counts)} != loop_group_id depth {len(gid)}"
                 )
                 if 0 <= depth < len(counts):
+                    runtime_count = getattr(loop_info, "runtime_loop_count", None)
+                    if runtime_count is not None:
+                        if len(counts) != 1:
+                            raise AssertionError(
+                                "a runtime-specialized for_each_tile loop must "
+                                "have exactly one nesting level"
+                            )
+                        return runtime_count
                     return counts[depth]
     raise AssertionError(f"Node {node.get_name()} has no loop_count for depth {depth}")
+
+
+def _loop_max_count(node: BaseSchedulerNode, depth: int) -> int | None:
+    for snode in node.get_nodes():
+        if isinstance(snode, SchedulerNode) and snode.node is not None:
+            loop_info = getattr(snode.node, "loop_info", None)
+            if loop_info is not None and loop_info.runtime_loop_count is not None:
+                return int(loop_info.loop_count[depth])
+    return None
 
 
 def _regroup_by_outer_loop_key(
@@ -270,7 +291,13 @@ def _build_loop_group(
 
         # Recursively wrap any deeper nesting within this run.
         inner = _build_loop_group(run, depth + 1)
-        result.append(CountedLoopSchedulerNode.create(inner, count))
+        result.append(
+            CountedLoopSchedulerNode.create(
+                inner,
+                count,
+                max_loop_count=_loop_max_count(node, depth),
+            )
+        )
 
     return result
 
@@ -637,7 +664,7 @@ class SuperDSCScheduling(BaseScheduling):
         with kernel:
             self._codegen_into_kernel(nodes, kernel)
         if isinstance(node, CountedLoopSchedulerNode):
-            kernel.wrap_op_specs_in_loop(node.loop_count)
+            kernel.wrap_op_specs_in_loop(node.loop_count, node.max_loop_count)
         kernel.check_op_specs()
         return kernel
 
@@ -714,7 +741,13 @@ class SuperDSCScheduling(BaseScheduling):
         # Wrap only the newly-added op_specs entries in this inner LoopSpec.
         body = kernel.op_specs[body_start:]
         kernel.op_specs = kernel.op_specs[:body_start]
-        kernel.op_specs.append(LoopSpec(count=node.loop_count, body=body))
+        kernel.op_specs.append(
+            LoopSpec(
+                count=node.loop_count,
+                body=body,
+                max_count=node.max_loop_count,
+            )
+        )
 
     def _codegen_into_kernel(
         self, nodes: list[BaseSchedulerNode], kernel: SpyreKernel

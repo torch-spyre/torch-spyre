@@ -38,6 +38,7 @@ reference, see test_for_each_tile_e2e.py.
 import unittest
 from unittest import mock
 
+import sympy
 import torch
 from torch._inductor.virtualized import V
 
@@ -515,6 +516,35 @@ class TestSpliceWhileLoops(unittest.TestCase):
 
 
 class TestTryProveForEachTile(unittest.TestCase):
+    def test_dynamic_index_expr_bound_is_accepted(self):
+        from torch_spyre._inductor.wsr.for_each_tile_lowering import (
+            _extract_trip_count,
+        )
+
+        bound = sympy.Symbol("s0", integer=True, positive=True)
+
+        class Data:
+            dtype = torch.bool
+
+            @staticmethod
+            def get_size():
+                return []
+
+            @staticmethod
+            def inner_fn(_):
+                step = V.ops.load("step", 0)
+                count = V.ops.index_expr(bound, torch.int64)
+                return V.ops.lt(step, count)
+
+        op = mock.Mock()
+        op.data = Data()
+        cond_graph = mock.Mock()
+        cond_graph.graph_inputs = {"step": mock.Mock()}
+        cond_graph.graph_outputs = [mock.Mock()]
+        cond_graph.operations = [op]
+
+        self.assertEqual(_extract_trip_count(cond_graph), bound)
+
     def test_map_mode_accepted_with_trip_count(self):
         (X, Y), _ref = matmul_inputs()
         while_op = _find_while_loop_ir_op(split_m_fn, (X, Y))

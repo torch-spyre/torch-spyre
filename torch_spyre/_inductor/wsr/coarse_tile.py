@@ -2864,6 +2864,7 @@ def _apply_plan(
     levels: list[tuple],
     op_to_position: dict[str, int],
     plan: dict[int, CoarseTileInfo],
+    runtime_loop_count: sympy.Expr | None = None,
 ) -> dict[str, _RetiledBufferInfo]:
     """Apply planning's decisions: divide ranges and stamp loop_info.
 
@@ -2920,7 +2921,9 @@ def _apply_plan(
                 _apply_work_div_symbol_remap(op, reduction_remap)
 
         op.loop_info = dataclasses.replace(  # type: ignore[attr-defined]
-            info, loop_group_id=stamped_group_id
+            info,
+            loop_group_id=stamped_group_id,
+            runtime_loop_count=runtime_loop_count,
         )
 
         logger.debug(
@@ -2936,6 +2939,7 @@ def coarse_tile_pre_stickify(
     graph: GraphLowering,
     groups: list[tuple],
     group_idx_offset: int = 0,
+    runtime_loop_count: sympy.Expr | None = None,
 ) -> None:
     """Hint-driven coarse tiling.  Runs PRE-stickification.
 
@@ -2958,7 +2962,13 @@ def coarse_tile_pre_stickify(
     and write copy-outs (Pass 3). See coarse_tile_post_stickify for the
     post-stickification counterpart, which never needs Pass 1.
     """
-    _coarse_tile_common(graph, groups, group_idx_offset, run_read_copies=True)
+    _coarse_tile_common(
+        graph,
+        groups,
+        group_idx_offset,
+        run_read_copies=True,
+        runtime_loop_count=runtime_loop_count,
+    )
 
 
 def coarse_tile_post_stickify(
@@ -2997,6 +3007,7 @@ def _coarse_tile_common(
     groups: list[tuple],
     group_idx_offset: int,
     run_read_copies: bool,
+    runtime_loop_count: sympy.Expr | None = None,
 ) -> None:
     """Plan then transform: stamp loop_group_id / loop_count and scale ranges.
 
@@ -3042,7 +3053,12 @@ def _coarse_tile_common(
         op_to_position = {op.get_operation_name(): i for i, op in enumerate(operations)}
         stamped_group_id = group_id + (0,) * (len(levels) - 1)
         retiled_infos = _apply_plan(
-            group_ops, stamped_group_id, levels, op_to_position, plan
+            group_ops,
+            stamped_group_id,
+            levels,
+            op_to_position,
+            plan,
+            runtime_loop_count=runtime_loop_count,
         )
         retiled_infos_by_group.append((stamped_group_id, group_ops, retiled_infos))
 

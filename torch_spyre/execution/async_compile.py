@@ -22,6 +22,7 @@ from concurrent.futures import Future, TimeoutError as FuturesTimeoutError
 from typing import Any, cast
 
 import torch
+import sympy
 from torch._inductor.async_compile import AsyncCompile, get_compile_threads
 from torch._inductor.codecache import CodeCacheFuture
 from torch._inductor.compile_worker.subproc_pool import SubprocException
@@ -56,6 +57,39 @@ logger = get_inductor_logger("sdsc_compile")
 # torch.compile forever with no diagnostic -- rather than policing slowness:
 # both finish in well under a second on a small kernel.
 _COMPILE_TIMEOUT_S = 60.0
+
+
+def _symbolic_loop_counts(specs) -> list[LoopSpec]:
+    loops = []
+    for spec in specs:
+        if isinstance(spec, LoopSpec):
+            if spec.count.free_symbols:
+                loops.append(spec)
+            loops.extend(_symbolic_loop_counts(spec.body))
+    return loops
+
+
+def specialize_loop_count(specs, loop_count: int):
+    if isinstance(loop_count, bool) or not isinstance(loop_count, int):
+        raise TypeError(f"loop_count must be a positive int, got {loop_count!r}")
+    if loop_count <= 0:
+        raise ValueError(f"loop_count must be positive, got {loop_count}")
+
+    def specialize(spec):
+        if not isinstance(spec, LoopSpec):
+            return spec
+        count = sympy.Integer(loop_count) if spec.count.free_symbols else spec.count
+        if spec.max_count is not None and loop_count > spec.max_count:
+            raise ValueError(
+                f"loop_count {loop_count} exceeds traced maximum {spec.max_count}"
+            )
+        return LoopSpec(
+            count=count,
+            body=[specialize(item) for item in spec.body],
+            max_count=spec.max_count,
+        )
+
+    return [specialize(spec) for spec in specs]
 
 
 def _check_ktir_device_prerequisites() -> None:
@@ -288,6 +322,38 @@ class SpyreAsyncCompile(AsyncCompile):
                 )
             kernel_provenance = None
 
+        symbolic_loops = _symbolic_loop_counts(finalized_specs)
+        if symbolic_loops:
+            counts = {loop.count for loop in symbolic_loops}
+            if len(counts) != 1:
+                raise ValueError(
+                    "one kernel cannot yet contain independently dynamic "
+                    f"loop counts: {sorted(map(str, counts))}"
+                )
+            if any(loop.max_count is None for loop in symbolic_loops):
+                raise ValueError("a symbolic LoopSpec.count requires max_count")
+            return SpyreSDSCKernelRunner(
+                kernel_name,
+                None,
+                kernel_provenance=kernel_provenance,
+                specs=finalized_specs,
+                pool_size=pool_size,
+            )
+
+        return self._sdsc_concrete(
+            kernel_name,
+            finalized_specs,
+            pool_size,
+            kernel_provenance,
+        )
+
+    def _sdsc_concrete(
+        self,
+        kernel_name: str,
+        specs: Sequence[OpSpec | LoopSpec],
+        pool_size: int,
+        kernel_provenance,
+    ):
         use_cache = (
             _spyre_config.spyre_kernel_cache
             and not torch._inductor.config.force_disable_caches

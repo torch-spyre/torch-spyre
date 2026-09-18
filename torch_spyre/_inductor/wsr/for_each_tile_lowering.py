@@ -86,6 +86,7 @@ class _CondInnerFnRecorder(DefaultHandler):
     def __init__(self) -> None:
         self.loads: list[tuple[str, Any]] = []
         self.constants: list[Any] = []
+        self.index_exprs: list[Any] = []
         self.compare_ops: list[str] = []
 
     def _default(self, name: str, args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:
@@ -95,6 +96,9 @@ class _CondInnerFnRecorder(DefaultHandler):
         if name == "constant":
             self.constants.append(args[0])
             return f"__constant_{len(self.constants) - 1}__"
+        if name == "index_expr":
+            self.index_exprs.append(args[0])
+            return args[0]
         if name in ("lt", "le", "gt", "ge", "eq", "ne"):
             self.compare_ops.append(name)
             return f"__cmp_{name}__"
@@ -150,7 +154,7 @@ def _extract_trip_count(cond_graph) -> sympy.Expr | None:
 
     if recorder.compare_ops != ["lt"]:
         return None
-    if len(recorder.loads) != 1 or len(recorder.constants) != 1:
+    if len(recorder.loads) != 1:
         return None
 
     (loaded_name, loaded_index) = recorder.loads[0]
@@ -159,7 +163,10 @@ def _extract_trip_count(cond_graph) -> sympy.Expr | None:
     if loaded_index != 0:
         return None
 
-    bound = recorder.constants[0]
+    bounds = [*recorder.constants, *recorder.index_exprs]
+    if len(bounds) != 1:
+        return None
+    bound = bounds[0]
     if isinstance(bound, bool):
         return None
     if not isinstance(bound, (int, sympy.Expr)):
@@ -1270,9 +1277,17 @@ def splice_while_loops(graph) -> None:
                 group_ops, loop_var, hint_id, result.trip_count
             )
 
-            levels = [(hint_id, result.trip_count)]
+            from torch_spyre._inductor.pass_utils import compute_max_size
+
+            planning_count = sympy.Integer(compute_max_size(result.trip_count))
+            levels = [(hint_id, planning_count)]
             coarse_tile_pre_stickify(
-                graph, groups=[(group_ops, levels)], group_idx_offset=group_idx
+                graph,
+                groups=[(group_ops, levels)],
+                group_idx_offset=group_idx,
+                runtime_loop_count=(
+                    result.trip_count if result.trip_count.free_symbols else None
+                ),
             )
 
             group_idx += 1
