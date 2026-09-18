@@ -403,6 +403,71 @@ class SpyreConstantFallback(ir.ExternKernel):
         V.graph.register_operation(self)
 
 
+class SpyreArangeFallback(ir.ExternKernel):
+    """IR node for a cacheable coordinate: a ramp, or a mask's row coordinate.
+
+    Emits ``spyre_arange_tensor``, which memoizes coordinates across forward
+    passes, so the construction cost is paid once per
+    ``(length, dtype, device)`` rather than on every call.  ``column`` selects
+    the shape: ``False`` for the ``[length]`` ramp, ``True`` for the
+    ``[length, 1]`` row coordinate, which share one cache entry.
+
+    Shares ``SpyreConstantFallback``'s contract: the runtime returns a shared
+    tensor, so ``should_allocate()`` is False and the node declares no mutation
+    names, keeping inductor from routing an in-place write at it.
+    """
+
+    def codegen(self, wrapper: PythonWrapperCodegen) -> None:
+        wrapper.generate_arange_tensor_fallback(self)
+
+    def should_allocate(self) -> bool:
+        return False
+
+    def get_mutation_names(self) -> Sequence[str]:
+        return []
+
+    def get_unbacked_symbol_defs(self) -> OrderedSet[sympy.Symbol]:
+        return OrderedSet()
+
+    def __init__(
+        self,
+        op_overload: torch._ops.OpOverload,
+        length,
+        dtype,
+        device,
+        column: bool = False,
+    ) -> None:
+        # A coordinate is a real buffer produced outside any kernel, so it
+        # carries its device layout from the start rather than acquiring one in
+        # finalize_layouts: no propagation step would assign it one.  For the
+        # ramp the ordinary contiguous stick layout is what makes the cached
+        # tensor interchangeable with a freshly constructed one; for the column
+        # the stick sits on the trailing extent-1 dim, which is what gives a
+        # comparison against a ramp a feasible assignment.
+        size = [length, 1] if column else [length]
+        device_layout = SpyreTensorLayout(size, dtype)
+        layout = FixedTiledLayout(
+            device,
+            dtype,
+            [sympy.Integer(v) for v in size],
+            [sympy.Integer(1)] * len(size),
+            device_layout,
+        )
+        super().__init__(
+            None,
+            layout,
+            [],
+            (length, column),
+            python_kernel_name="torch.ops.spyre.arange",
+            cpp_kernel_name="aoti_torch_arange",
+            op_overload=op_overload,
+        )
+        self.length = length
+        self.column = column
+        self.name = V.graph.register_buffer(self)
+        V.graph.register_operation(self)
+
+
 class SpyreEmptyFallback(ir.ExternKernel):
     """IR node for spyre.empty — emits spyre_empty_with_layout via make_buffer_allocation.
 

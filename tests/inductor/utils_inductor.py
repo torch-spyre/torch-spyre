@@ -71,6 +71,31 @@ def cached_randn(
 
 
 @functools.lru_cache(maxsize=None)
+def cached_randint(shape, high=8, dtype=torch.int64):
+    """Return a deterministically-seeded random integer tensor, cached by args.
+
+    The integer counterpart of :func:`cached_randn`. Values come from
+    ``[-high, high)``, small enough to stay exact through a float32 conversion.
+    """
+    gen = _make_generator(shape, high, dtype)
+    return torch.randint(-high, high, shape, dtype=dtype, generator=gen)
+
+
+@functools.lru_cache(maxsize=None)
+def alternating_signs(shape, dtype=torch.float16):
+    """``+1`` and ``-1`` alternating along the last dim.
+
+    For comparing a cumulative sum on device: every prefix sum stays in
+    ``{-1, 0, 1}``, well inside the range DLFloat16 represents exactly, so the
+    comparison measures the operation rather than the format's rounding of a
+    large running total.
+    """
+    flat = torch.ones(int(torch.tensor(shape).prod()), dtype=dtype)
+    flat[1::2] = -1
+    return flat.reshape(shape)
+
+
+@functools.lru_cache(maxsize=None)
 def cached_xavier(
     shape,
     differentiation=None,

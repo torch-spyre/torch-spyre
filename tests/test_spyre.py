@@ -754,10 +754,14 @@ class TestSpyre(TestCase):
             (torch.float32, torch.float16),
         }
 
-        # DCI doesn't support either direction for these conversions.
+        # DCI doesn't support either direction for these conversions.  The table
+        # records what a compiled kernel can convert with a device instruction,
+        # which for the integer pairs is wider than what a host copy can do.
         skip_eager_conversions = {
             (torch.float32, torch.int32),
             (torch.int32, torch.float32),
+            (torch.float32, torch.int64),
+            (torch.int64, torch.float32),
         }
 
         # Test supported conversions

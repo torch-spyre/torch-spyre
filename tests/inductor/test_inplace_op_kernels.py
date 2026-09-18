@@ -60,10 +60,13 @@ ATOL = 0.05
 
 aten = torch.ops.aten
 
-# The compile-time failure the backend raises for an unsupported rounding mode.
-# Narrower than ``Exception`` so the rounding-mode xfails cannot mask an
-# unrelated break; see :func:`test_div_rounding_mode`.
+# The failures the backend raises for an unsupported rounding mode: 'floor' has
+# no ``div_rn`` FX target, so it stops at compile time, while 'trunc' compiles
+# and the kernel runner rejects the operation on invocation.  Each is narrower
+# than ``Exception`` so the rounding-mode xfails cannot mask an unrelated
+# break; see :func:`test_div_rounding_mode`.
 _DIV_MODE_ERROR = torch._inductor.exc.InductorError
+_DIV_TRUNC_ERROR = RuntimeError
 
 # (in-place packet, overload, scalar operand) for each registered arithmetic op.
 INPLACE_SCALAR = [
@@ -294,21 +297,24 @@ def test_inplace_tensor_operand(packet):
     [
         None,
         # 'floor'/'trunc' fail in the *functional* div kernel, independently of
-        # any in-place wrapper: torch.div(x, 3.0, rounding_mode='floor') raises
-        # InductorError("No FX node for buf1") for a scalar operand and
-        # "Cannot resolve target for 'div_rn'/'truediv'" for a tensor one. The
-        # in-place kernel inherits that gap; it does not introduce it.
+        # any in-place wrapper: 'floor' needs a ``div_rn`` FX target that
+        # _OP_TARGET_TABLE does not carry, and 'trunc' has no backend operation,
+        # so it compiles and then fails on invocation. The in-place kernel
+        # inherits both gaps; it does not introduce either.
         #
-        # ``raises`` is the specific compile failure, not bare ``Exception``:
-        # these xfails must not double as a blanket licence for this path to
-        # break some other way. A wrong *value* or a failure in the derivation
-        # or ``copy_`` wrapper raises something else and still fails the suite,
+        # ``raises`` is the specific failure, not bare ``Exception``: these
+        # xfails must not double as a blanket licence for this path to break
+        # some other way. A wrong *value* or a failure in the derivation or
+        # ``copy_`` wrapper raises something else and still fails the suite,
         # while ``strict=True`` catches the day the kernel starts working.
         pytest.param(
             "floor", marks=pytest.mark.xfail(raises=_DIV_MODE_ERROR, strict=True)
         ),
         pytest.param(
-            "trunc", marks=pytest.mark.xfail(raises=_DIV_MODE_ERROR, strict=True)
+            "trunc",
+            marks=pytest.mark.xfail(
+                raises=(_DIV_MODE_ERROR, _DIV_TRUNC_ERROR), strict=True
+            ),
         ),
     ],
     ids=lambda m: str(m),

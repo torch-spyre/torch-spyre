@@ -30,6 +30,7 @@ from torch.utils._ordered_set import OrderedSet
 
 import torch_spyre._inductor.customops  # noqa: F401
 from torch_spyre._C import get_elem_in_stick
+from torch_spyre._inductor.decompositions import get_spyre_decomp_table
 from torch_spyre.ops.fallbacks import fallback_ops
 
 from . import config
@@ -52,6 +53,7 @@ from .ir import (
     BroadcastAsyncFallback,
     SpyreConstantFallback,
     SpyreEmptyFallback,
+    SpyreArangeFallback,
     SpyreReduction,
     WaitWorkFallback,
 )
@@ -143,17 +145,23 @@ def register_fallback_over_decomp(fallback_ops):
     with ``override_decomp=True`` installs a lowering so that auto-path — and
     its assertion — is never reached.
 
-    Only overloads that are in ``lowering.decompositions`` and currently lack a
-    lowering are touched, so this composes with ``unregister_lowerings`` (which
-    runs first) and does not clobber Spyre's own lowerings.
+    The assertion compares against the table ``get_decomp_fn`` supplies, which
+    for Spyre is ``get_spyre_decomp_table``, so both tables are consulted: an op
+    carrying only a Spyre decomposition is just as exposed. ``cumsum`` is in the
+    Spyre table alone.
+
+    Only overloads that lack a lowering are touched, so this composes with
+    ``unregister_lowerings`` (which runs first) and does not clobber Spyre's own
+    lowerings.
     """
+    spyre_decompositions = get_spyre_decomp_table()
     added = []
     for op in fallback_ops:
         for overload in lowering.get_overloads(op):
-            if (
-                overload in lowering.decompositions
-                and overload not in lowering.lowerings
-            ):
+            carries_decomp = (
+                overload in lowering.decompositions or overload in spyre_decompositions
+            )
+            if carries_decomp and overload not in lowering.lowerings:
                 lowering.make_fallback(overload, override_decomp=True)
                 added.append(overload)
     return added
@@ -1545,6 +1553,16 @@ def lower_full(size, fill_value, dtype=None, layout=None, device=None, pin_memor
         dtype=dtype,
         inner_fn=inner_fn,
         ranges=list(size),
+    )
+
+
+@register_spyre_lowering(torch.ops.spyre.arange.default, type_promotion_kind=None)
+def lower_arange(length, dtype, device, column=False):
+    op_overload = getattr(
+        torch.ops.spyre.arange, V.graph.current_node.target._overloadname
+    )
+    return ir.TensorBox.create(
+        SpyreArangeFallback(op_overload, length, dtype, device, column)
     )
 
 

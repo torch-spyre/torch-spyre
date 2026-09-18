@@ -773,7 +773,7 @@ class TestHbmPoolPlanningE2E(InductorTestCase):
     @config.patch({"lx_planning": False})
     @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_pool_alloc_scoped_per_bundle_across_fallback_boundary(self):
-        """A CPU-fallback op (torch.tril) splits the graph into multiple
+        """A CPU-fallback op (torch.argmax) splits the graph into multiple
         bundles. With frontend_pool_allocation at its default (False), each
         bundle's pool (if any) is allocated inside that bundle's own
         generated MLIR via sdscbundle.device_mem_allocate -- there is no
@@ -783,7 +783,8 @@ class TestHbmPoolPlanningE2E(InductorTestCase):
 
         def fn(t):
             a = torch.exp(t) * 2  # compiled bundle 1; `a` crosses the
-            b = torch.tril(a)  # fallback op -- forces a bundle boundary
+            b = torch.argmax(a, dim=-1, keepdim=True).to(torch.float16)
+            # argmax has a CPU fallback, forcing a bundle boundary
             c = torch.exp(b) * 2  # compiled bundle 2
             return c
 
@@ -862,7 +863,8 @@ class TestHbmPoolPlanningE2E(InductorTestCase):
 
         def fn(t):
             a = torch.exp(t) * 2
-            b = torch.tril(a)  # fallback op -- forces a bundle boundary
+            b = torch.argmax(a, dim=-1, keepdim=True).to(torch.float16)
+            # argmax has a CPU fallback, forcing a bundle boundary
             c = torch.exp(b) * 2
             return c
 

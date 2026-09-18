@@ -806,6 +806,28 @@ def _constant(
     return fill_value
 
 
+@torch.library.custom_op("spyre::arange", mutates_args=(), device_types="spyre")
+def spyre_arange(
+    length: int, dtype: torch.dtype, device: torch.device, column: bool = False
+) -> torch.Tensor:
+    # Marks a cacheable coordinate in the FX graph: the [0, length) ramp, or its
+    # [length, 1] column form when column is set.  Lowering turns this into a
+    # SpyreArangeFallback, whose codegen emits the memoized runtime call; this
+    # eager body serves only tracing and the non-compiled path.
+    host = torch.arange(length, dtype=dtype)
+    if column:
+        host = host.unsqueeze(-1).clone()
+    return host.to(device)
+
+
+@spyre_arange.register_fake
+def _arange(
+    length: int, dtype: torch.dtype, device: torch.device, column: bool = False
+) -> torch.Tensor:
+    size = (length, 1) if column else (length,)
+    return torch.empty(size, dtype=dtype, device=device)
+
+
 @torch.library.custom_op("spyre::to_dtype_cpu", mutates_args=(), device_types="spyre")
 def to_dtype_cpu(input: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
     warn_fallback(f"conversion from {input.dtype} to {dtype}")
