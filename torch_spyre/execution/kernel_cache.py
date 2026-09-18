@@ -447,15 +447,47 @@ def get_cached_kernel_dir(cache_key: str) -> Optional[str]:
     return cached_dir
 
 
-def allocate_compile_dir(cache_key: str) -> str:
+# Cache dirs are named by hash alone; this records which kernels map to one.
+_KERNEL_NAME_FILE = "kernel_name.txt"
+
+
+def write_kernel_name_marker(kernel_dir: str, kernel_name: str) -> None:
+    """Append kernel_name to <kernel_dir>/kernel_name.txt unless already listed.
+
+    Never raises: failing to record a name must not fail a compile.
+    """
+    if not kernel_name:
+        return
+    # A newline would corrupt the one-name-per-line format.
+    name = kernel_name.strip()
+    if not name or "\n" in name or "\r" in name:
+        return
+    marker = os.path.join(kernel_dir, _KERNEL_NAME_FILE)
+    try:
+        try:
+            with open(marker) as f:
+                if name in f.read().splitlines():
+                    return
+        except FileNotFoundError:
+            pass
+        with open(marker, "a") as f:
+            f.write(f"{name}\n")
+    except OSError as e:
+        logger.debug("Could not record kernel name %s in %s: %s", name, kernel_dir, e)
+
+
+def allocate_compile_dir(cache_key: str, kernel_name: str = "") -> str:
     """Reserve a unique temp directory inside the cache root for compilation.
 
     Placing it inside the cache root (not /tmp) ensures the subsequent rename
     in commit_compile_dir is atomic on POSIX.
+
+    ``kernel_name``, when given, is recorded in kernel_name.txt.
     """
     cache_root = get_cache_root_dir()
     tmp_dir = os.path.join(cache_root, f"{cache_key}.tmp.{uuid.uuid4().hex}")
     os.makedirs(tmp_dir, exist_ok=True)
+    write_kernel_name_marker(tmp_dir, kernel_name)
     return tmp_dir
 
 
