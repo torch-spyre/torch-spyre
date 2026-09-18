@@ -674,6 +674,13 @@ Environment Variables
    * - ``LX_PLANNING``
      - Enable LX scratchpad planning (default ``1``; set ``0`` to skip the
        ``scratchpad_planning`` pass)
+   * - ``SPYRE_LX_PLANNER_RELAYOUT``
+     - Enable certified LX-to-LX movement, exact fused-axis views,
+       consumer-compatible producer ordering and same-core restickify
+       residency (default ``1``). Set ``0`` to disable these optional
+       optimizations; ownership and capacity checks remain active. Allocator
+       selection and the LX budget are unchanged. Unsupported ownership or
+       insufficient space still uses HBM.
    * - ``CO_OPTIMIZING_LX_PLANNING``
      - Use the co-optimizing LX allocator strategy (default ``0``)
    * - ``HBM_POOL_PLANNING``
@@ -701,6 +708,14 @@ Environment Variables
    * - ``SPYRE_LOG_PASSES``
      - Comma-separated list of pass names after which to log the
        op-spec IR at pipeline stage boundaries (default empty)
+   * - ``TORCH_SPYRE_TIMING``
+     - Record structured per-compile frontend timings: one JSON event per
+       pass pipeline and per pass, with input/output graph sizes
+       (default ``0``)
+   * - ``TORCH_SPYRE_TIMING_OUT``
+     - Destination for the ``TORCH_SPYRE_TIMING`` record. The pid is
+       inserted before the suffix, so ``rec.json`` is written as
+       ``rec.<pid>.json``. Empty writes nothing (default empty)
    * - ``SPYRE_DUMP_COST``
      - Print the predicted-runtime report after pre-scheduling: one total
        plus a per-kernel breakdown (default ``0``).

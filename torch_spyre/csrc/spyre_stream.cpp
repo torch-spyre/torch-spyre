@@ -147,8 +147,8 @@ int SpyreStream::priority() const {
 bool SpyreStream::query() const {
   c10::DeviceGuard guard(stream_.device());
 
-  DEBUGINFO("SpyreStream::query() - stream ", id(), " on device ",
-            static_cast<int>(device().index()));
+  SPYRE_RUNTIME_DEBUG() << "stream " << id() << " on device "
+                        << static_cast<int>(device().index());
 
   flex::RuntimeStream* handle = resolveRuntimeHandle();
   return handle->query();
@@ -158,8 +158,8 @@ void SpyreStream::synchronize() const {
   RECORD_FUNCTION("host::synchronize", {});
   c10::DeviceGuard device_guard(stream_.device());
 
-  DEBUGINFO("SpyreStream::synchronize() - stream ", id(), " on device ",
-            static_cast<int>(device().index()));
+  SPYRE_RUNTIME_DEBUG() << "stream " << id() << " on device "
+                        << static_cast<int>(device().index());
 
   resolveRuntimeHandle()->synchronize();
 }
@@ -177,8 +177,10 @@ void SpyreStream::copyProgramAsync(
 
 void SpyreStream::copyAsync(const at::Tensor& src,
                             const at::Tensor& dst) const {
-  DEBUGINFO("src (", src.scalar_type(), ") is on:", src.device());
-  DEBUGINFO("dst (", dst.scalar_type(), ") on:", dst.device());
+  SPYRE_RUNTIME_DEBUG() << "src (" << src.scalar_type()
+                        << ") is on:" << src.device();
+  SPYRE_RUNTIME_DEBUG() << "dst (" << dst.scalar_type()
+                        << ") on:" << dst.device();
 
   // Determine copy direction
   bool host2device = src.is_cpu() && dst.is_privateuseone();

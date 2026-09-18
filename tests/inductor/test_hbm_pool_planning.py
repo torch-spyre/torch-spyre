@@ -24,7 +24,11 @@ from torch import fx
 from torch._inductor.dependencies import MemoryDep
 from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import ComputedBuffer, FlexibleLayout, Pointwise
-from torch._inductor.scheduler import FusedSchedulerNode, SchedulerNode
+from torch._inductor.scheduler import (
+    ExternKernelSchedulerNode,
+    FusedSchedulerNode,
+    SchedulerNode,
+)
 from torch._inductor.test_case import TestCase as InductorTestCase
 from torch._inductor.utils import run_and_get_code
 from torch._inductor.virtualized import V
@@ -163,7 +167,7 @@ def _make_ftl_buffer_aliased(name, alias_of, host_size=(64,), dim_order=(0,)):
     return buf
 
 
-def _make_snode_with_rw(name, writes, reads):
+def _make_snode_with_rw(name, writes, reads, node_type=SchedulerNode):
     """MagicMock SchedulerNode with real MemoryDep read_writes for the
     given buffer names, and get_nodes()/get_name() wired for
     _iter_all_nodes / bundle-name lookup.
@@ -177,7 +181,7 @@ def _make_snode_with_rw(name, writes, reads):
     tests build bundles directly (bypassing the Scheduler), fill them in
     with the same empty/zero defaults BaseSchedulerNode.__init__ uses.
     """
-    snode = MagicMock(spec=SchedulerNode)
+    snode = MagicMock(spec=node_type)
     snode.get_name.return_value = name
     snode.get_nodes.return_value = [snode]
     snode.ancestors = OrderedSet()
@@ -533,6 +537,37 @@ class TestHbmPoolPlanningPerBundle(unittest.TestCase):
         self.assertNotIn("hbm_pool", target_buf.get_layout().allocation)
         self.assertNotIn("hbm_pool", alias_buf.get_layout().allocation)
 
+    def test_alias_of_fallback_input_is_not_pool_eligible(self):
+        """An alias cannot pool storage needed as a Python fallback input.
+
+        for_each_tile rewires its body output to the initializer's storage.
+        The rewritten output and initializer have different names but share
+        one allocation dict. If the rewritten name is pooled while the
+        initializer is passed directly to an ExternKernel (such as compiled
+        all-reduce), wrapper code references an initializer tensor that was
+        never allocated.
+        """
+        target = _make_ftl_buffer("target")
+        _make_ftl_buffer_aliased("alias", alias_of=target)
+
+        write_target = _make_snode_with_rw("write_target", writes=["target"], reads=[])
+        write_alias = _make_snode_with_rw("write_alias", writes=["alias"], reads=[])
+        read_alias = _make_snode_with_rw("read_alias", writes=[], reads=["alias"])
+
+        fallback = _make_snode_with_rw(
+            "fallback",
+            writes=[],
+            reads=["target"],
+            node_type=ExternKernelSchedulerNode,
+        )
+
+        bundle = FusedSchedulerNode(
+            MagicMock(), [write_target, write_alias, read_alias, fallback]
+        )
+        hbm_pool_planning([bundle])
+
+        self.assertNotIn("hbm_pool", target.get_layout().allocation)
+
     def test_aliased_buffer_within_same_bundle_shares_one_merged_live_range(self):
         """Regression test for issue #3980: two buffer *names* that share
         the exact same FixedTiledLayout.allocation dict object -- as
@@ -738,7 +773,7 @@ class TestHbmPoolPlanningE2E(InductorTestCase):
     @config.patch({"lx_planning": False})
     @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_pool_alloc_scoped_per_bundle_across_fallback_boundary(self):
-        """A CPU-fallback op (torch.sin) splits the graph into multiple
+        """A CPU-fallback op (torch.tril) splits the graph into multiple
         bundles. With frontend_pool_allocation at its default (False), each
         bundle's pool (if any) is allocated inside that bundle's own
         generated MLIR via sdscbundle.device_mem_allocate -- there is no
@@ -748,7 +783,7 @@ class TestHbmPoolPlanningE2E(InductorTestCase):
 
         def fn(t):
             a = torch.exp(t) * 2  # compiled bundle 1; `a` crosses the
-            b = torch.sin(a)  # fallback op -- forces a bundle boundary
+            b = torch.tril(a)  # fallback op -- forces a bundle boundary
             c = torch.exp(b) * 2  # compiled bundle 2
             return c
 
@@ -827,7 +862,7 @@ class TestHbmPoolPlanningE2E(InductorTestCase):
 
         def fn(t):
             a = torch.exp(t) * 2
-            b = torch.sin(a)  # fallback op -- forces a bundle boundary
+            b = torch.tril(a)  # fallback op -- forces a bundle boundary
             c = torch.exp(b) * 2
             return c
 

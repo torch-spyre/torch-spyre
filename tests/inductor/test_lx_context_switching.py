@@ -261,8 +261,15 @@ class TestMarkLxSafe(unittest.TestCase):
 
 class TestIsCpuOnlyFallback(unittest.TestCase):
     def test_matches_registered_fallback_ops(self):
-        self.assertIn(torch.ops.aten.sin.default, fallback_ops)
-        self.assertTrue(_is_cpu_only_fallback(torch.ops.aten.sin.default))
+        # Sampled from the registry instead of naming an op: entries graduate
+        # out of fallback_ops as device support lands -- aten.sin / aten.cos
+        # did, which is what broke the aten.sin.default this used to assert --
+        # and any hardcoded name makes that a failure here rather than in the
+        # suite that owns the op.  What is worth pinning is the wiring: this
+        # helper reads the same list ops/fallbacks.py fills.
+        self.assertTrue(fallback_ops, "ops/fallbacks.py registered no fallbacks")
+        for op in fallback_ops:
+            self.assertTrue(_is_cpu_only_fallback(op), f"{op} not seen as fallback")
 
     def test_rejects_non_fallback_ops(self):
         self.assertNotIn(torch.ops.aten.mm.default, fallback_ops)

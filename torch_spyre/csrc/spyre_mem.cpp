@@ -238,16 +238,47 @@ auto get_device_stride_infos(c10::IntArrayRef sizes, c10::IntArrayRef strides,
     for (int j = tile_map[i].size() - 1; j > -1; j--) {
       const int tile_index = tile_map[i][j];
       const int64_t tile_size = stl.device_size[tile_index];
+
+      // Every divisor below is checked before it is used. Integer division by
+      // zero raises SIGFPE, which is not catchable from Python: it terminates
+      // the interpreter outright, so a malformed layout would abort the process
+      // instead of surfacing a RuntimeError the caller can handle. A guard that
+      // itself kills the process is worse than no guard.
+      TORCH_CHECK(host_stride != 0,
+                  "Invalid stride map: zero DMA stride for host dimension ", i,
+                  " while mapping device dimension ", tile_index);
+
       const int64_t tile_stride = host_strides[tile_index] / host_stride;
 
       // Size 1 dimensions are ignored.
       if (tile_size == 1) continue;
+
+      // A size-0 device dimension is malformed and is NOT covered by the
+      // size-1 skip above. Letting it through sets dcsi_sizes[tile_index] to 0
+      // below, which zeroes `elements_before`, and the next iteration of this
+      // loop then evaluates `host_size % 0`. See issue #3604, where a
+      // compiler-generated layout of device_size {0, 4, 32} reached here.
+      TORCH_CHECK(tile_size > 0, "Invalid device size ", tile_size,
+                  " for device dimension ", tile_index,
+                  ": a zero-sized device dimension cannot describe host "
+                  "dimension ",
+                  i, " of size ", host_size);
+
+      TORCH_CHECK(
+          elements_before > 0,
+          "Invalid device sizes and stride map for host sizes and strides");
 
       TORCH_CHECK(
           host_size % elements_before == 0,
           "Invalid device sizes and stride map for host sizes and strides");
 
       const int64_t current_elements = host_size / elements_before;
+
+      TORCH_CHECK(tile_stride != 0, "Invalid stride map: device dimension ",
+                  tile_index, " has stride ", host_strides[tile_index],
+                  " which is smaller than the host DMA stride ", host_stride,
+                  " for host dimension ", i);
+
       const int64_t remaining_elements = current_elements / tile_stride;
 
       TORCH_CHECK(
@@ -276,6 +307,19 @@ auto get_device_stride_infos(c10::IntArrayRef sizes, c10::IntArrayRef strides,
         const int next_index = tile_map[i][j];
         const int64_t next_size = stl.device_size[next_index];
         const int64_t next_stride = host_strides[next_index] / host_stride;
+
+        // Same reasoning as the divisor guards above: `next_stride` divides
+        // below and `next_size` is a modulus, so both must be non-zero or the
+        // process takes SIGFPE instead of raising.
+        TORCH_CHECK(next_stride != 0, "Invalid stride map: device dimension ",
+                    next_index, " has stride ", host_strides[next_index],
+                    " which is smaller than the host DMA stride ", host_stride,
+                    " for host dimension ", i);
+        TORCH_CHECK(next_size > 0, "Invalid device size ", next_size,
+                    " for device dimension ", next_index,
+                    ": a zero-sized device dimension cannot describe host "
+                    "dimension ",
+                    i, " of size ", host_size);
 
         const int64_t tiled_elements = current_elements / next_stride;
 
@@ -722,10 +766,11 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
   std::reverse(device_sizes.begin(), device_sizes.end());
   dci.input_shape_ = host2device ? cpu_sizes : device_sizes;
   dci.output_shape_ = host2device ? device_sizes : cpu_sizes;
-  if (torch_spyre::logging::legacy::is_legacy_debug_enabled()) {
+  if (SPYRE_LOG_ENABLED("spyre.runtime",
+                        torch_spyre::logging::LogLevel::DEBUG)) {
     std::stringstream s;
     dci.exportJson(s);
-    DEBUGINFO("DataConversionInfo: ", s.str());
+    SPYRE_RUNTIME_DEBUG() << "DataConversionInfo: " << s.str();
   }
   return dci;
 }
@@ -739,7 +784,7 @@ at::Tensor spyre_empty(c10::IntArrayRef size,
                        std::optional<c10::MemoryFormat> memory_format_opt) {
   c10::Device device = device_opt.value_or(
       c10::impl::VirtualGuardImpl{c10::DeviceType::PrivateUse1}.getDevice());
-  DEBUGINFO("shape=", size, " on Spyre ", device);
+  SPYRE_RUNTIME_DEBUG() << "shape=" << size << " on Spyre " << device;
   const auto dtype = c10::dtype_or_default(dtype_opt);
   TORCH_CHECK(device.is_privateuseone());
   TORCH_CHECK(c10::layout_or_default(layout_opt) == c10::Layout::Strided,
@@ -776,7 +821,7 @@ at::Tensor spyre_empty(c10::IntArrayRef size,
   spyre_tensor_impl->spyre_layout = device_layout;
   spyre_tensor_impl->dma_sizes = size.vec();
   spyre_tensor_impl->dma_strides = tensor.strides().vec();
-  DEBUGINFO("SpyreTensorLayout: ", device_layout.toString());
+  SPYRE_RUNTIME_DEBUG() << "SpyreTensorLayout: " << device_layout.toString();
   return tensor;
 }
 
@@ -801,8 +846,9 @@ at::Tensor spyre_empty_strided(c10::IntArrayRef size, c10::IntArrayRef stride,
   caffe2::TypeMeta dtype = c10::scalarTypeToTypeMeta(scalar_type);
   c10::Device device = device_opt.value_or(
       c10::impl::VirtualGuardImpl{c10::DeviceType::PrivateUse1}.getDevice());
-  DEBUGINFO("Tensor info on CPU (Size:", size, ", Stride: ", stride,
-            ", dtype: ", dtype, ") to be mapped onto device ", device);
+  SPYRE_RUNTIME_DEBUG() << "Tensor info on CPU (Size:" << size
+                        << ", Stride: " << stride << ", dtype: " << dtype
+                        << ") to be mapped onto device " << device;
   auto device_layout = SpyreTensorLayout(size.vec(), stride.vec(), scalar_type,
                                          generic_stick_dim_order(size.size()));
   size_t device_size_bytes = get_device_size_in_bytes(device_layout);
@@ -831,17 +877,22 @@ at::Tensor spyre_empty_strided(c10::IntArrayRef size, c10::IntArrayRef stride,
   spyre_tensor_impl->dma_sizes = size.vec();
   spyre_tensor_impl->dma_strides = stride.vec();
 
-  DEBUGINFO("SpyreTensorLayout: ", device_layout.toString());
+  SPYRE_RUNTIME_DEBUG() << "SpyreTensorLayout: " << device_layout.toString();
   return tensor;
 }
 
 at::Tensor spyre_empty_with_layout(c10::IntArrayRef size,
                                    c10::IntArrayRef stride,
                                    c10::ScalarType dtype,
-                                   SpyreTensorLayout device_layout) {
+                                   SpyreTensorLayout device_layout,
+                                   std::optional<c10::Device> device_opt) {
   at::detail::check_size_nonnegative(size);
-  c10::Device device =
-      c10::impl::VirtualGuardImpl{c10::DeviceType::PrivateUse1}.getDevice();
+  c10::Device device = device_opt.value_or(
+      c10::impl::VirtualGuardImpl{c10::DeviceType::PrivateUse1}.getDevice());
+  TORCH_CHECK(device.is_privateuseone(),
+              "spyre_empty_with_layout expected a Spyre device, got ", device);
+  const c10::DeviceGuard device_guard(device);
+
   size_t device_size_bytes = get_device_size_in_bytes(device_layout);
   int64_t cpu_numel = std::accumulate(size.begin(), size.end(), 1LL,
                                       std::multiplies<int64_t>());
@@ -854,7 +905,6 @@ at::Tensor spyre_empty_with_layout(c10::IntArrayRef size,
   auto spyre_storage = c10::Storage(spyre_storage_impl);
 
   // Create the Spyre Tensor
-  const c10::DeviceGuard device_guard(device);
   constexpr c10::DispatchKeySet pu1_dks(c10::DispatchKey::PrivateUse1);
   auto tensor = at::detail::make_tensor_base<SpyreTensorImpl>(
       std::move(spyre_storage), pu1_dks, c10::scalarTypeToTypeMeta(dtype));
@@ -865,14 +915,14 @@ at::Tensor spyre_empty_with_layout(c10::IntArrayRef size,
   spyre_tensor_impl->spyre_layout = device_layout;
   spyre_tensor_impl->dma_sizes = size.vec();
   spyre_tensor_impl->dma_strides = stride.vec();
-  DEBUGINFO("SpyreTensorLayout: ", device_layout.toString());
+  SPYRE_RUNTIME_DEBUG() << "SpyreTensorLayout: " << device_layout.toString();
   return tensor;
 }
 
 at::Tensor& spyre_set_storage(at::Tensor& result, at::Storage storage,
                               int64_t storage_offset, c10::IntArrayRef size,
                               c10::IntArrayRef stride) {
-  DEBUGINFO("set method");
+  SPYRE_RUNTIME_DEBUG() << "set method";
   return at::cpu::set_(result, storage, storage_offset, size, stride);
 }
 
@@ -1026,7 +1076,7 @@ at::Tensor empty_with_layout(
     std::optional<c10::MemoryFormat> memory_format_opt) {
   c10::Device device = device_opt.value_or(
       c10::impl::VirtualGuardImpl{c10::DeviceType::PrivateUse1}.getDevice());
-  DEBUGINFO("shape=", size, " on Spyre ", device);
+  SPYRE_RUNTIME_DEBUG() << "shape=" << size << " on Spyre " << device;
   const auto dtype = c10::dtype_or_default(dtype_opt);
   TORCH_CHECK(device.is_privateuseone());
   TORCH_CHECK(c10::layout_or_default(layout_opt) == c10::Layout::Strided,
@@ -1062,7 +1112,7 @@ at::Tensor empty_with_layout(
   spyre_tensor_impl->spyre_layout = device_layout;
   spyre_tensor_impl->dma_sizes = size.vec();
   spyre_tensor_impl->dma_strides = tensor.strides().vec();
-  DEBUGINFO("SpyreTensorLayout: ", device_layout.toString());
+  SPYRE_RUNTIME_DEBUG() << "SpyreTensorLayout: " << device_layout.toString();
   return tensor;
 }
 
@@ -1113,8 +1163,8 @@ const at::Tensor& spyre_resize_(
     self_impl->spyre_layout = new_layout;
     self_impl->dma_sizes = size_int.vec();
     self_impl->dma_strides = self_impl->strides().vec();
-    DEBUGINFO("resize_ to shape=", size_int,
-              " layout=", self_impl->spyre_layout.toString());
+    SPYRE_RUNTIME_DEBUG() << "to shape=" << size_int
+                          << " layout=" << self_impl->spyre_layout.toString();
     return self;
   }
   // Case 3: Reallocate — D2H → CPU resize_ → H2D. Handles expand and any
@@ -1132,8 +1182,8 @@ const at::Tensor& spyre_resize_(
   self_impl->dma_sizes = size_int.vec();
   self_impl->dma_strides = self_impl->strides().vec();
   at::_copy_from(cpu_buf, self, /*non_blocking=*/false);
-  DEBUGINFO("resize_ expand to shape=", size_int,
-            " layout=", self_impl->spyre_layout.toString());
+  SPYRE_RUNTIME_DEBUG() << "expand to shape=" << size_int
+                        << " layout=" << self_impl->spyre_layout.toString();
   return self;
 }
 

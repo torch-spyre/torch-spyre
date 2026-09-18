@@ -12,13 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from contextlib import contextmanager
 import copy
 import functools
 import hashlib
+import json
+from pathlib import Path
+import subprocess
+from unittest.mock import patch as mock_patch
 import torch
 import os
 import pytest
 from torch._inductor.utils import run_and_get_code
+
+import torch_spyre.execution.async_compile as async_compile_module
 import unittest
 
 DEVICE = torch.device("spyre")
@@ -37,13 +44,27 @@ def _make_generator(*args) -> torch.Generator:
     return gen
 
 
-# shape is a tuple of integers representing dimension of the tensor
-# to avoid using the same cached tensor of the same shape, add a unique
-# differentiation argument
 @functools.lru_cache(maxsize=None)
 def cached_randn(
     shape, differentiation=None, abs=False, dtype=torch.float16, scale=1.0
 ):
+    """Return a deterministically-seeded random tensor, cached by arguments.
+
+    Args:
+        shape: Tuple of ints giving the tensor dimensions.
+        differentiation: Optional hashable value added to the cache key so two
+            calls with the same shape but different ``differentiation`` values
+            return independent tensors rather than the same cached one.
+        abs: If True, return the absolute value of the generated tensor.
+        dtype: Output dtype (default: float16).
+        scale: Variance multiplier applied as ``randn(...) * scale``. A value of
+            1.0 gives unit-variance outputs; larger values spread the range.
+            Also seeds the RNG so the same (shape, scale) always yields the same
+            values across test runs.
+
+    Returns:
+        A cached CPU tensor of the requested shape and dtype.
+    """
     gen = _make_generator(shape, differentiation, abs, dtype, scale)
     out = torch.randn(shape, dtype=dtype, generator=gen) * scale
     return out if not abs else torch.abs(out)
@@ -772,3 +793,64 @@ def copy_tests(my_cls, other_cls, suffix, test_failures=None, xfail_prop=None):
     # Special case convenience routine
     if hasattr(my_cls, "is_dtype_supported"):
         other_cls.is_dtype_supported = my_cls.is_dtype_supported
+
+
+# ---------------------------------------------------------------- LX relayouts
+
+
+@contextmanager
+def capture_backend_output_dirs():
+    """Record the backend output directory of every kernel compiled inside."""
+    output_dirs = []
+    get_output_dir = async_compile_module.get_output_dir
+
+    def capture(kernel_name):
+        output_dir = get_output_dir(kernel_name)
+        output_dirs.append(Path(output_dir))
+        return output_dir
+
+    with mock_patch.object(async_compile_module, "get_output_dir", side_effect=capture):
+        yield output_dirs
+
+
+def assert_lx_only_relayout_payload(output_dirs):
+    """The compiled bundle's SDSC payload carries exactly one LX relayout op and
+    no HBM movement: one ``STCDPOpLx``, no op named for DMA, restickify or an
+    HBM copy, and zero ``hbmSize_`` on every labeled data structure. A debug
+    re-lowering of the same bundle, not a second device execution."""
+    for output_dir in output_dirs:
+        subprocess.run(
+            ["dxp_standalone", "-d", output_dir, "--use-dxp"],
+            check=True,
+            env={**os.environ, "DXP_DEBUG": "1"},
+        )
+    payloads = [
+        json.loads(path.read_text())
+        for output_dir in output_dirs
+        for path in output_dir.glob("debug/sdsc_*/*.out.out.out.json")
+    ]
+    assert payloads, "DeepTools emitted no debug SDSC payloads"
+    nodes = []
+    pending = list(payloads)
+    while pending:
+        value = pending.pop()
+        if isinstance(value, dict):
+            nodes.append(value)
+            pending.extend(value.values())
+        elif isinstance(value, list):
+            pending.extend(value)
+    lx_ops = [
+        node
+        for node in nodes
+        if isinstance(node.get("op"), dict) and node["op"].get("name") == "STCDPOpLx"
+    ]
+    assert len(lx_ops) == 1
+    op_names = [node["name"] for node in nodes if isinstance(node.get("name"), str)]
+    assert not any(
+        token in name.lower()
+        for name in op_names
+        for token in ("dma", "restickify", "stcdpophbm")
+    )
+    labeled_ds = lx_ops[0]["labeledDs_"]
+    assert labeled_ds and all(ds["hbmSize_"] == 0 for ds in labeled_ds)
+    return lx_ops[0]["op"]["prodConsList"]

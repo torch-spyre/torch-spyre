@@ -19,8 +19,11 @@ per-kernel report). Both are gated by ``config.cost_model``; this module only de
 WHERE the text goes -- stderr, or the file named by ``SPYRE_DUMP_COST_FILE``.
 """
 
+import logging
 import os
 import sys
+
+logger = logging.getLogger(__name__)
 
 
 def emit(text: str) -> None:
@@ -34,6 +37,24 @@ def emit(text: str) -> None:
         sys.stderr.write(text)
         sys.stderr.write("\n")
         sys.stderr.flush()
+
+
+def emit_json_line(path: str, record: dict) -> None:
+    """Append ``record`` as one JSON line to ``path`` (JSON Lines, one record per
+    dump). Instrumentation only: never raises.
+
+    Broad on purpose. ``OSError`` covers the file, but ``default=str`` reaches
+    an arbitrary ``__str__`` -- a sympy object mid-construction, say -- and a
+    dump that cannot be written must not be the reason a compile fails."""
+    import json
+
+    try:
+        line = json.dumps(record, separators=(",", ":"), default=str)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(line)
+            f.write("\n")
+    except Exception:  # noqa: BLE001 - see the docstring
+        logger.debug("cost dump to %s skipped", path, exc_info=True)
 
 
 def banner(title: str) -> str:

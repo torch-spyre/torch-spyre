@@ -926,7 +926,17 @@ class TestFfdcAsyncCompile:
         _stub_module(
             monkeypatch,
             "torch_spyre._inductor.codegen.bundle",
-            generate_bundle=lambda *a, **k: None,
+            generate_bundle=lambda *a, **k: [],
+        )
+
+        class _SymbolKind:
+            def __init__(self, **kwargs):
+                self.__dict__.update(kwargs)
+
+        _stub_module(
+            monkeypatch,
+            "torch_spyre._inductor.codegen.compute_ops",
+            SymbolKind=_SymbolKind,
         )
         if "torch_spyre._C" not in sys.modules:
             _stub_module(
@@ -938,7 +948,9 @@ class TestFfdcAsyncCompile:
             )
 
         class _Runner:
-            def __init__(self, name, code_dir, kernel_provenance=None):
+            def __init__(
+                self, name, code_dir, kernel_provenance=None, symbol_kinds=None
+            ):
                 self.kernel_name = name
                 self.code_dir = code_dir
                 self.kernel_provenance = kernel_provenance
@@ -952,7 +964,7 @@ class TestFfdcAsyncCompile:
 
         mod = _reimport(monkeypatch, "torch_spyre.execution.async_compile")
         monkeypatch.setattr(mod, "get_output_dir", lambda name: out_dir)
-        monkeypatch.setattr(mod, "generate_bundle", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "generate_bundle", lambda *a, **k: [])
         monkeypatch.setattr(mod, "find_unimplemented", lambda specs: None)
         return mod, out_dir
 

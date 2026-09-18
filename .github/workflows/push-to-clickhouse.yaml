@@ -22,6 +22,14 @@ on:
         description: Workflow name (model-module-tests | upstream-tests | model-ops-tests | integration-tests)
         required: false
         default: upstream-pytorch-tests
+      component:
+        description: >-
+          Component to stamp on v2 rows. Defaults to this repo's own product; set it when the
+          triggering run executed ANOTHER component's suite, so the rows (and the test_case_id
+          they hash into) name the suite's real owner.
+        required: false
+        type: string
+        default: torch-spyre
       clickhouse_env:
         description: >-
           ClickHouse instance for a MANUAL re-ingest: "prod" (the CLICKHOUSE_*
@@ -77,6 +85,16 @@ jobs:
       CLICKHOUSE_USER: ${{ inputs.clickhouse_env != 'dev' && secrets.CLICKHOUSE_USER || secrets.CLICKHOUSE_USER_DEV }}
       CLICKHOUSE_PASS: ${{ inputs.clickhouse_env != 'dev' && secrets.CLICKHOUSE_PASS || secrets.CLICKHOUSE_PASS_DEV }}
       CLICKHOUSE_DB: ${{ inputs.clickhouse_env != 'dev' && secrets.CLICKHOUSE_DB || secrets.CLICKHOUSE_DB_DEV }}
+      # The schema-v2 database. Every v2 statement is QUALIFIED with it rather than opening a
+      # second connection, because test_cases and benchmark_runs exist in both generations
+      # with incompatible shapes and an unqualified name would hit the wrong one. Empty/unset
+      # makes the v2 write a no-op, which keeps an un-updated caller behaving as before.
+      CLICKHOUSE_DB_V2: ${{ inputs.clickhouse_env != 'dev' && secrets.CLICKHOUSE_DB_V2 || secrets.CLICKHOUSE_DB_V2_DEV }}
+      # Dual-write during the migration window: v1 stays authoritative, v2 accumulates the
+      # same runs so the new schema can be validated against real traffic before anything
+      # depends on it. No data is ported -- v1 rows cannot produce a v2 run_id -- so `both` is
+      # how v2 gets any history at all.
+      INGEST_SCHEMA: both
 
       # Metadata about the triggering run
       TRIGGERING_RUN_ID: ${{ github.event.workflow_run.id || inputs.gha_run_id }}
@@ -111,6 +129,8 @@ jobs:
           sparse-checkout: |
             .github/actions
             .github/scripts/ingest_xml.py
+            # Imported by the script above; omitting it fails the import at startup.
+            extensions/clickhouse-ingest
           sparse-checkout-cone-mode: false
 
       # actions4gh/setup-gh@v1.0.2 extracts the gh tarball but never lands
@@ -234,6 +254,26 @@ jobs:
       # comes from this job's env block above (DEV vs PROD toggle lives there);
       # no product checkout exists here, so the action sparse-checks-out the
       # script itself when torch-spyre-dir is not passed.
+      # The orchestrator's uuid, uploaded by _test_matrix as the "run-id" artifact. This
+      # workflow runs on workflow_run, so it cannot receive it as a dispatch input. Absent on a
+      # GHA-initiated run => empty => the ingest derives its own id from the run coordinate.
+      - name: Recover threaded run_id
+        id: threaded-run-id
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          RID=""
+          AID=$(gh api --paginate \
+            "/repos/${{ github.repository }}/actions/runs/${TRIGGERING_RUN_ID}/artifacts?per_page=100" \
+            --jq '.artifacts[] | select(.name == "run-id") | .id' | head -1)
+          if [[ -n "${AID}" ]]; then
+            gh api "/repos/${{ github.repository }}/actions/artifacts/${AID}/zip" > run-id.zip || true
+            unzip -o -q run-id.zip -d run-id-dir || true
+            RID=$(tr -d '[:space:]' < run-id-dir/run-id.txt 2>/dev/null || echo "")
+          fi
+          echo "Threaded run_id: ${RID:-<none, ingest will derive>}"
+          echo "run_id=${RID}" >> "${GITHUB_OUTPUT}"
+
       - name: Ingest XML files into ClickHouse
         uses: ./.github/actions/ingest-xml-to-clickhouse
         with:
@@ -242,6 +282,8 @@ jobs:
           branch: ${{ env.TRIGGERING_BRANCH }}
           sha: ${{ env.TRIGGERING_SHA }}
           gha-run-id: ${{ env.TRIGGERING_RUN_ID }}
+          run-id: ${{ steps.threaded-run-id.outputs.run_id }}
+          component: ${{ inputs.component || 'torch-spyre' }}
           triggered-at: ${{ env.TRIGGERING_AT }}
           pr-number: ${{ steps.resolve-pr.outputs.pr_number }}
           trigger-type: ${{ steps.extract-tier.outputs.tier }}
@@ -251,6 +293,8 @@ jobs:
           clickhouse-user: ${{ env.CLICKHOUSE_USER }}
           clickhouse-pass: ${{ env.CLICKHOUSE_PASS }}
           clickhouse-db: ${{ env.CLICKHOUSE_DB }}
+          clickhouse-db-v2: ${{ env.CLICKHOUSE_DB_V2 }}
+          schema: ${{ env.INGEST_SCHEMA }}
 
       - name: Summary
         if: always()

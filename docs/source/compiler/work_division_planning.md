@@ -558,11 +558,69 @@ hop instead of several.
 
 ### Scratchpad planning
 
-Each pass plans one op at a time. When two adjacent ops share a tensor
-but select different per-core splits for it, the LX scratchpad planner
-sees a core-division mismatch and disqualifies the shared tensor from
-scratchpad reuse. The tensor is then routed through a DDR round-trip
-on the boundary, even though it could have stayed on-core.
+With `SPYRE_LX_PLANNER_RELAYOUT=1`, a supported LX copy can connect
+different producer and consumer partitions. A matmul's split reduction makes
+its output partial, not its input: input placement uses the values each
+consumer actually needs. Expansion to more cores uses the same ownership
+proof for pointwise and matmul consumers. Existing core-domain, capacity,
+lifetime and whole-source fallback restrictions still apply; this does
+not change the work chooser's policy.
+
+#### Split-K results in LX
+
+For `A[128,256] @ B[256,128]`, let eight producer cores use
+`(M,N,K)=(1,2,4)`. Each output column half is calculated by four cores,
+each adding 64 of the 256 terms. With K varying fastest, cores 0–3 calculate
+columns 0–63 and cores 4–7 calculate columns 64–127. The backend combines
+each group's partial sums. Only producer cores 3 and 7 write finished values.
+
+Let a pointwise consumer use `(M,N)=(8,1)`: consumer core `c` needs rows
+`16*c` through `16*c+15`, across all 128 columns.
+
+| Finished producer | Output held | Consumers | Piece sent to consumer `c` |
+|---|---|---|---|
+| 3 | All 128 rows, columns 0–63 | 0–7 | Its 16 rows, columns 0–63 |
+| 7 | All 128 rows, columns 64–127 | 0–7 | Its 16 rows, columns 64–127 |
+
+Each consumer assembles two **disjoint output pieces**, not two partial sums.
+No addition takes place in this copy. The reduction over K was completed by
+the producer; splitting N divided the finished output into column pieces.
+
+Planning first selects the producer cores holding finished values. It then
+uses the same partition intersections as ordinary LX copies. The frontend
+records only the finished producer cores, here `(3, 7)`, and exposes only
+those cores as holders of the input. The existing backend derives the
+connections and byte ranges from the producer and consumer placements.
+There is no separate producer-consumer list stored or emitted by the frontend.
+
+Different dimensions can require different movements in one copy. For an
+8×8 tensor, a 2×4 producer partition holds 4×2 pieces; a 4×2 consumer partition
+needs 2×4 pieces. Each producer splits its rows between two consumers, and
+each consumer collects columns from two producers. Ordinary eight-core
+copies support this combination without separate gather/scatter operations.
+Completed-result copies use the same intersections, subject to the limits below.
+
+**Current limits:**
+
+- The producer must have a supported native reduction and a proven finished
+  core for each output piece. This path admits single-corelet matmuls with contiguous K-fast
+  groups; other reductions need their own finished-producer rule, not a new
+  copying mechanism.
+- Every consumer must receive its requested pieces exactly once. Each
+  consumer must use the same number of producers, and each finished producer
+  must serve the same number of consumers. Uneven cases are not supported.
+- The copy uses either the producer's full core count or one consumer core
+  per finished producer. Copies to fewer cores currently require one
+  finished producer per consumer. Thus the ordinary 2×4 → 4×2 example above
+  does **not** imply support for a split-K producer shrinking from 16 physical
+  cores to eight consumers while each consumer collects two pieces.
+- Existing LX capacity, lifetime, layout and whole-source fallback checks
+  still apply. A legal copy is not a promise that LX has space or is faster.
+
+Without a supported relayout, different producer and consumer partitions
+prevent direct LX reuse. The following example shows that HBM fallback.
+Co-optimization can instead choose matching partitions; relayout can connect
+supported mismatched partitions without changing either operation's division.
 
 ```text
 Aligned splits (LX reuse possible)        Mismatched splits (DDR round-trip)

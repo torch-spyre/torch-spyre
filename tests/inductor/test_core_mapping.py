@@ -26,6 +26,7 @@ import torch_spyre._inductor.core_mapping as core_mapping_module
 import torch_spyre._inductor.pass_utils as pass_utils_module
 import torch_spyre._inductor.spyre_kernel as spyre_kernel_module
 from torch_spyre._C import DataFormats, ElementArrangement
+from torch_spyre._inductor.codegen.opspec_utils import per_core_extent
 from torch_spyre._inductor.codegen.superdsc import parse_op_spec
 from torch_spyre._inductor.constants import (
     BATCH_MATMUL_FP8_OP,
@@ -51,6 +52,64 @@ from torch_spyre._inductor.spyre_kernel import simplify_op_spec
 from torch_spyre._inductor.views import (
     align_tensors,
 )
+
+
+@pytest.mark.parametrize(
+    "dtype",
+    [
+        DataFormats.SEN169_FP16,
+        DataFormats.IEEE_FP32,
+        DataFormats.SEN143_FP8,
+        DataFormats.SENINT4,
+        DataFormats.BFLOAT16,
+    ],
+)
+def test_partition_lx_size_uses_device_storage_geometry(dtype):
+    eps = dtype.elems_per_stick()
+    size = [8, 4, eps]
+    # Either split stores 16 complete sticks locally; whole-tensor row gaps
+    # do not occupy LX. The native size helper also accounts for packed dtypes.
+    expected = core_mapping_module.get_device_size_in_bytes([16, eps], dtype)
+    assert core_mapping_module.partition_lx_size_bytes(size, dtype, {1: 2}) == expected
+    assert core_mapping_module.partition_lx_size_bytes(size, dtype, {0: 2}) == expected
+
+
+@pytest.mark.parametrize(
+    "size,splits,expected",
+    [
+        ([4, 512, 2, 8, 64], {1: 16, 2: 2}, 131072),
+        ([4, 512, 2, 8, 64], {1: 32}, 131072),
+        ([8, 1, 2, 128, 64], {0: 8, 2: 2, 3: 2}, 8192),
+        ([8, 1, 2, 128, 64], {2: 2}, 131072),
+    ],
+)
+def test_partition_lx_size_matches_codegen(size, splits, expected):
+    # BMM producer/consumer and K-page broadcast: use the same per-core
+    # extents that codegen supplies, not the full-tensor address span.
+    coords = list(sympy.symbols(f"dim_0:{len(size) - 1}")) + [sympy.S.Zero]
+    arg = TensorArg(True, 0, DataFormats.SEN169_FP16, size, coords, {"lx": 0})
+    local, _ = per_core_extent(arg, {coords[axis]: n for axis, n in splits.items()})
+    assert (
+        core_mapping_module.partition_lx_size_bytes(size, arg.device_dtype, splits)
+        == (core_mapping_module.get_device_size_in_bytes(local, arg.device_dtype))
+        == expected
+    )
+
+
+@pytest.mark.parametrize(
+    "size,splits",
+    [
+        ([8, 4, 64], {1: 3}),
+        ([8, 4, 32], {}),
+        ([8, 4, 64], {2: 2}),
+        ([8, 0, 64], {}),
+    ],
+)
+def test_partition_lx_size_rejects_unsupported_storage(size, splits):
+    with pytest.raises(ValueError):
+        core_mapping_module.partition_lx_size_bytes(
+            size, DataFormats.SEN169_FP16, splits
+        )
 
 
 _CORE_ID = sympy.Symbol("core_id")
@@ -232,6 +291,46 @@ def test_late_partition_mapping_repeats_contiguous_owners():
     assert _mapping_coordinates(mapping, (head,), 32) == [
         (core // 8,) for core in range(32)
     ]
+
+
+@pytest.mark.parametrize(
+    ("extent", "split", "device_size", "accepted", "owner"),
+    [
+        # A 98-wide axis must not lose f = 98 to floating-point rounding.
+        (784, 16, (8, 98), ((0, 8), (1, 2)), lambda c: (c // 2, c % 2)),
+        # The fused budget counts states: 1020 + 4 fits, 1024 + 4 does not.
+        (1020, 4, (4, 255), ((0, 4),), lambda c: (c,)),
+        (1024, 4, (4, 256), None, None),
+    ],
+)
+def test_fused_decomposition_is_exact_and_bounded(
+    extent, split, device_size, accepted, owner
+):
+    division = TensorWorkDivision({_FUSED: split}, {_FUSED: _CORE_ID}, num_cores=split)
+    reasons = []
+    result = core_mapping_module.decompose_fused_split_view(
+        _FUSED,
+        split,
+        _CORE_ID,
+        division,
+        {_FUSED: extent},
+        device_size,
+        (sympy.floor(_FUSED / device_size[1]), sympy.Mod(_FUSED, device_size[1])),
+        split,
+        rejection_reasons=reasons,
+    )
+    if accepted is None:
+        assert result is None
+        assert reasons == [
+            f"proof limit: fused decomposition needs {extent + split} states; "
+            "limit is 1024"
+        ]
+        return
+    assert result is not None and result[0] == accepted
+    assert [
+        tuple(int(slot.subs(_CORE_ID, c)) for _, slot in result[1])
+        for c in range(split)
+    ] == [owner(c) for c in range(split)]
 
 
 @pytest.mark.parametrize(
@@ -754,6 +853,118 @@ def test_stride_selected_compound_view_matches_actual_owned_values(reverse, capt
         assert actual == expected, (c, actual, expected)
 
 
+def test_fused_split_view_is_gated_and_preserves_exact_owner_order(monkeypatch):
+    fused = sympy.Symbol("fused")
+    prep = _view_prep(
+        iter_space={fused: 32},
+        write_index=fused,
+        dep_coeff={fused: 1},
+        dep_device_coordinates=(
+            sympy.floor(fused / 8),
+            sympy.Mod(fused, 8),
+            sympy.S.Zero,
+        ),
+        device_size=[4, 8, 1],
+        stride_map=[-1, -1, 1],
+        device_stride_to_dim={},
+        elems_per_stick=1,
+    )
+
+    monkeypatch.setattr(pass_utils_module.config, "lx_planner_relayout", False)
+    disabled_view, disabled_partial, disabled_representable = (
+        pass_utils_module._per_core_view_from_prep(prep, {fused: 32})
+    )
+    assert not disabled_representable
+    assert not disabled_partial
+    assert not disabled_view.work_slice_dims
+
+    monkeypatch.setattr(pass_utils_module.config, "lx_planner_relayout", True)
+    enabled_view, enabled_partial, enabled_representable = (
+        pass_utils_module._per_core_view_from_prep(prep, {fused: 32})
+    )
+    assert enabled_representable
+    assert not enabled_partial
+    assert enabled_view.work_slice_dims == ((0, 4), (1, 8))
+    assert enabled_view.same_partition(
+        PerCoreView(
+            ((0, 4), (1, 8)),
+            (
+                (0, sympy.floor(sympy.Symbol("core_id") / 8)),
+                (1, sympy.Mod(sympy.Symbol("core_id"), 8)),
+            ),
+            num_cores=32,
+        )
+    )
+
+
+@pytest.mark.parametrize(
+    "feature_owned", [True, False], ids=["v_owned_tuple", "interleaved"]
+)
+def test_fused_split_view_checks_complete_owned_tuple(monkeypatch, feature_owned):
+    query, fused, feature = sympy.symbols("query fused feature")
+    qsplit = 2 if feature_owned else 4
+    space, sizes = {query: qsplit, fused: 32}, [4, 8]
+    splits = {query: qsplit, fused: 8}
+    slots = {
+        query: sympy.Mod(_CORE_ID, 2) if feature_owned else sympy.floor(_CORE_ID / 8),
+        fused: sympy.Mod(sympy.floor(_CORE_ID / 2), 8)
+        if feature_owned
+        else sympy.Mod(_CORE_ID, 8),
+    }
+    coords = [sympy.floor(fused / 8), sympy.Mod(fused, 8)]
+    kwargs = {}
+    if feature_owned:
+        space[feature], splits[feature], slots[feature] = (
+            16,
+            2,
+            sympy.floor(_CORE_ID / 16),
+        )
+        sizes.extend((16, 1))
+        coords.extend((feature, sympy.Integer(0)))
+        kwargs = dict(
+            elems_per_stick=1,
+            stick_host_stride=1,
+            num_stick_dim=2,
+            num_stick=16,
+            num_stick_stride=1,
+        )
+    index = 16 * fused + feature if feature_owned else fused
+    prep = _view_prep(
+        iter_space=space,
+        write_index=index,
+        dep_coeff={dim: index.coeff(dim) for dim in space},
+        dep_device_coordinates=tuple(coords),
+        device_size=sizes,
+        stride_map=[-1, -1, 1, 1] if feature_owned else [-1, -1],
+        device_stride_to_dim={1: 2} if feature_owned else {},
+        is_matmul=True,
+        **kwargs,
+    )
+    ownership = TensorWorkDivision(splits, slots, num_cores=32)
+    monkeypatch.setattr(pass_utils_module.config, "lx_planner_relayout", True)
+    view, partial, representable = pass_utils_module._per_core_view_from_prep(
+        prep,
+        splits,
+        ownership=ownership,
+    )
+    assert representable == feature_owned and not partial
+    if feature_owned:
+        fslot = sympy.Mod(sympy.floor(_CORE_ID / 2), 8)
+        assert view.same_partition(
+            PerCoreView(
+                ((0, 4), (1, 2), (2, 2)),
+                (
+                    (0, sympy.floor(fslot / 2)),
+                    (1, sympy.Mod(fslot, 2)),
+                    (2, sympy.floor(_CORE_ID / 16)),
+                ),
+                num_cores=32,
+            )
+        )
+    else:
+        assert not view.work_slice_dims
+
+
 def _prepare_compound_axis_view(iter_space, index, repeat_info=None):
     device_layout = pass_utils_module.SpyreTensorLayout(
         [1, 1, 8, 16, 64],
@@ -795,6 +1006,31 @@ def _prepare_compound_axis_view(iter_space, index, repeat_info=None):
         )
     assert prep is not None
     return prep, graph
+
+
+@pytest.mark.parametrize("flat_split", [4, 8, 16, 32])
+def test_fused_view_keeps_sticks_whole(monkeypatch, flat_split):
+    head, flat = sympy.symbols("head flat", integer=True, nonnegative=True)
+    prep, _ = _prepare_compound_axis_view({head: 16, flat: 512}, 512 * head + flat)
+    splits = {head: 1, flat: flat_split}
+    ownership = TensorWorkDivision(
+        splits,
+        {head: sympy.Integer(0), flat: sympy.Mod(_CORE_ID, flat_split)},
+        flat_split,
+    )
+    monkeypatch.setattr(pass_utils_module.config, "lx_planner_relayout", True)
+    view, partial, representable = pass_utils_module._per_core_view_from_prep(
+        prep, splits, ownership=ownership
+    )
+    # A 512-value row has eight whole sticks, never sixteen half-sticks.
+    assert not partial and representable == (flat_split <= 8)
+    if representable:
+        assert (
+            core_mapping_module.partition_lx_size_bytes(
+                prep.device_size, DataFormats.SEN169_FP16, dict(view.work_slice_dims)
+            )
+            > 0
+        )
 
 
 def test_direct_axis_proof_budget_boundary():

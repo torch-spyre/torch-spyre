@@ -181,8 +181,9 @@ def _patch_tensor_for_spyre():
         else:
             # Check if copy kwarg is explicitly set
             copy = kwargs.get("copy")
+            device = kwargs.get("device")
 
-            # Determine dtype from various possible sources
+            # Determine dtype and device from the supported Tensor.to forms.
             dtype = None
             if len(args) > 0:
                 # If args[0] is a dtype instance, use it
@@ -191,6 +192,11 @@ def _patch_tensor_for_spyre():
                 # If args[0] is a Tensor, use its dtype
                 elif isinstance(args[0], torch.Tensor):
                     dtype = args[0].dtype
+                    device = args[0].device
+                elif isinstance(args[0], (str, torch.device)):
+                    device = args[0]
+                    if len(args) > 1 and isinstance(args[1], torch.dtype):
+                        dtype = args[1]
 
             # Check for dtype in kwargs
             if dtype is None and "dtype" in kwargs:
@@ -206,10 +212,17 @@ def _patch_tensor_for_spyre():
             if dtype is None:
                 dtype = self.dtype
 
+            # The C++ allocator takes a real c10::Device so it can select the
+            # correct Spyre allocator before creating storage.  Tensor.to also
+            # accepts string destinations, so normalize that public form at
+            # the Python boundary without losing an explicit device index.
+            if device is not None:
+                device = torch.device(device)
+
             from torch_spyre._C import spyre_empty_with_layout
 
             dst = spyre_empty_with_layout(
-                self.size(), self.stride(), dtype, device_layout
+                self.size(), self.stride(), dtype, device_layout, device=device
             )
 
             if self.device.type == "cpu":
@@ -224,6 +237,7 @@ def _patch_tensor_for_spyre():
                     not copy
                     and current_layout is not None
                     and current_layout == device_layout
+                    and self.device == dst.device
                 ):
                     return self
                 else:
@@ -231,9 +245,10 @@ def _patch_tensor_for_spyre():
                     # storage_offset is dropped by Inductor, so the lowering
                     # must re-introduce it in-graph (see copy_from_d2d in
                     # customops.py and lower_spyre_from_d2d).
-                    return torch.ops.spyre.copy_from_d2d(
+                    torch.ops.spyre.copy_from_d2d(
                         self, dst, self.storage_offset(), dst.storage_offset()
                     )
+                    return dst
 
     def spyre_empty(
         *args,
@@ -343,15 +358,23 @@ def _patch_tensor_for_spyre():
         if expected_layout is None:
             return
 
+        # Guard on storage_offset to prevent graph reuse across different offsets (#3770)
+        expected_offset = value.storage_offset()
+
         # add lambda guard on tensor's child manager
         # same node as TENSOR_MATCH!
         tensor_guard_manager = self.get_guard_manager(guard)
         tensor_guard_manager.add_lambda_guard(
             lambda x: (
                 x.device.type != DEVICE_NAME
-                or x.device_tensor_layout() == expected_layout
+                or (
+                    x.device_tensor_layout() == expected_layout
+                    and x.storage_offset() == expected_offset
+                )
             ),
-            [f"SpyreTensorLayout({guard.name}) == {expected_layout}"],
+            [
+                f"SpyreTensorLayout({guard.name}) == {expected_layout} and storage_offset == {expected_offset}"
+            ],
             guard.user_stack,
         )
 
@@ -384,29 +407,30 @@ def _patch_tensor_for_spyre():
     else:
 
         def _spyre_tensor_reuse_metadata(guard, value):
-            # Standard tensor metadata (shape/stride/dtype/device/
-            # requires_grad), plus the device layout for Spyre tensors
-            # (None otherwise). Mirrors extract_tensor_metadata so the
-            # comparison is identical to stock TENSOR_MATCH on the metadata
-            # axis.
+            # Metadata including storage_offset for Spyre tensors (mirrors
+            # extract_tensor_metadata, plus offset awareness for #3770)
             layout = None
+            offset = None
             if getattr(value, "device", None) is not None and (
                 value.device.type == DEVICE_NAME
             ):
                 layout = value.device_tensor_layout()
-            return (extract_tensor_metadata(value), layout)
+                offset = value.storage_offset()
+            return (extract_tensor_metadata(value), layout, offset)
 
         def _spyre_tensor_reuse_eval(value, metadata):
-            base_metadata, expected_layout = metadata
+            base_metadata, expected_layout, expected_offset = metadata
             if not isinstance(value, torch.Tensor):
                 return False
             if extract_tensor_metadata(value) != base_metadata:
                 return False
-            # Layout only constrains Spyre tensors; mirror the runtime
-            # lambda guard: non-Spyre value OR layout matches.
+            # Spyre tensors must match both layout and offset (#3770)
             if value.device.type != DEVICE_NAME:
-                return expected_layout is None
-            return value.device_tensor_layout() == expected_layout
+                return expected_layout is None and expected_offset is None
+            return (
+                value.device_tensor_layout() == expected_layout
+                and value.storage_offset() == expected_offset
+            )
 
         _spyre_reuse_spec = GuardCheckSpec(
             get_metadata_fn=_spyre_tensor_reuse_metadata,
@@ -528,8 +552,9 @@ def _patch_fx_graph_hash():
         except RuntimeError:
             return
 
-        # extract layout from real tensors, fallback to example_inputs
+        # extract layout and offset from real tensors, fallback to example_inputs
         spyre_layouts = []
+        spyre_offsets = []
         # Use real_inputs only if it's a valid list/tuple, otherwise use example_inputs
         inputs_to_use = (
             real_inputs if isinstance(real_inputs, (list, tuple)) else example_inputs
@@ -538,13 +563,16 @@ def _patch_fx_graph_hash():
         for inp in inputs_to_use:
             if isinstance(inp, torch.Tensor):
                 layout = inp.device_tensor_layout()
+                offset = inp.storage_offset() if layout is not None else None
                 spyre_layouts.append(layout)
+                spyre_offsets.append(offset)
             else:
                 spyre_layouts.append(None)
+                spyre_offsets.append(None)
 
-        # self.spyre_layouts added as field on FxGraphHashDetails
-        # PyTorch pickles ALL fields → spyre_layouts automatically in hash
+        # Both fields are pickled into cache key to prevent reuse across offsets (#3770)
         self.spyre_layouts = spyre_layouts
+        self.spyre_offsets = spyre_offsets
 
     FxGraphHashDetails.__init__ = _spyre_init
     FxGraphHashDetails._spyre_hash_patched = True

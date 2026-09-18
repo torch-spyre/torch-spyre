@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import dataclasses
 import json
 import os
 import shutil
@@ -24,6 +25,7 @@ import torch
 from torch._inductor.codecache import code_hash
 from torch._inductor.runtime.runtime_utils import cache_dir
 
+from torch_spyre._inductor.codegen.compute_ops import SymbolKind
 from torch_spyre._inductor.logging_utils import get_inductor_logger
 
 
@@ -31,8 +33,10 @@ logger = get_inductor_logger("kernel_cache")
 
 # All artifacts that dxp_standalone must produce for a valid compiled kernel.
 # A cache entry is only considered a hit if every one of these is present.
+_SYMBOL_KINDS_FILE = "symbol_kinds.json"
 _REQUIRED_ARTIFACTS = [
     "bundle.mlir",
+    _SYMBOL_KINDS_FILE,
     os.path.join("spyreCodeDir", "init_binary.bin"),
     os.path.join("spyreCodeDir", "spyrecode.json"),
 ]
@@ -364,6 +368,15 @@ def compute_specs_hash(
     # sdscbundle.device_mem_allocate <pool_size> bytes in bundle.mlir.
     content_parts.append(f"pool_size:{pool_size}".encode())
 
+    # Include frontend_pool_allocation: this flag changes both the bundle
+    # signature (adds a pool base-address parameter as the first MLIR input)
+    # and the .run() argument ABI (tensor_id indices are offset by 1 when the
+    # pool param is present).  A cached kernel compiled without it must never
+    # be reused when the flag is on, and vice-versa.
+    content_parts.append(
+        f"frontend_pool_allocation:{int(_spyre_config.frontend_pool_allocation)}".encode()
+    )
+
     content = b"||".join(content_parts)
     extra = "||".join(
         [
@@ -445,6 +458,16 @@ def get_cached_kernel_dir(cache_key: str) -> Optional[str]:
 
     logger.info("Cache HIT: Found cached kernel at %s", cached_dir)
     return cached_dir
+
+
+def save_symbol_kinds(compile_dir: str, symbol_kinds: list[SymbolKind]) -> None:
+    with open(os.path.join(compile_dir, _SYMBOL_KINDS_FILE), "w") as f:
+        json.dump([dataclasses.asdict(kind) for kind in symbol_kinds], f)
+
+
+def load_symbol_kinds(cached_dir: str) -> list[SymbolKind]:
+    with open(os.path.join(cached_dir, _SYMBOL_KINDS_FILE)) as f:
+        return [SymbolKind(**kind) for kind in json.load(f)]
 
 
 def allocate_compile_dir(cache_key: str) -> str:

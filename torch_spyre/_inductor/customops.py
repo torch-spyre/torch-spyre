@@ -25,9 +25,18 @@ from torch_spyre.ops.fallbacks import warn_fallback
 from .constants import FP8_E4M3FN_MAX
 from .errors import Unsupported
 from .scratchpad.lx_context_switching import mark_lx_safe
-from .sliding_window_plan import band_batch, band_valid_start
 
 aten = torch.ops.aten
+
+
+@torch.library.custom_op("spyre::tile_dim_marker", mutates_args=())
+def tile_dim_marker(x: torch.Tensor, dim: int) -> torch.Tensor:
+    return x.clone()
+
+
+@tile_dim_marker.register_fake
+def _(x: torch.Tensor, dim: int) -> torch.Tensor:
+    return torch.empty_like(x)
 
 
 @torch.library.custom_op("spyre::softplus", mutates_args=(), device_types="spyre")
@@ -513,6 +522,18 @@ def restickify(  # type: ignore[empty-body]
     pass
 
 
+@torch.library.custom_op("spyre::compact", mutates_args=(), device_types="spyre")
+def compact(  # type: ignore[empty-body]
+    x: torch.Tensor,
+) -> torch.Tensor:
+    pass
+
+
+@compact.register_fake
+def _(x: torch.Tensor) -> torch.Tensor:
+    return x.new_empty(x.size())
+
+
 @torch.library.custom_op("spyre::max_dim_int64_fallback", mutates_args=())
 def max_dim_int64_fallback(
     input: torch.Tensor, dim: int, keepdim: bool = False
@@ -693,7 +714,8 @@ def batched_matmul(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:  # type: i
 
 @batched_matmul.register_fake
 def _(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-    output_shape = list(x.shape[:-1]) + [y.shape[-1]]
+    batch_shape = torch.broadcast_shapes(x.shape[:-2], y.shape[:-2])
+    output_shape = [*batch_shape, x.shape[-2], y.shape[-1]]
     return x.new_empty(output_shape)
 
 
@@ -821,6 +843,20 @@ def _(input: torch.Tensor) -> torch.Tensor:
     return torch.empty(input.size(), dtype=torch.float8_e4m3fn, device=input.device)
 
 
+# Both quantize_fp8_with_scale and quantize_weight_fp8_with_scale share the same
+# four-step pipeline; the only difference is the final format-conversion kernel:
+#   1. Compute inverse scale: inv_scale = 1 / scale  (reciprocal, hardware sfp unit)
+#   2. Scale the input:       x_scaled = x * inv_scale  (POINTWISE)
+#   3. Clamp to FP8 E4M3:    x_clamped = clamp(x_scaled, -448, 448)  (POINTWISE)
+#   4. Format conversion:     qfp8ch (activation) or qfp8wt (weight)  (POINTWISE)
+#
+# The reciprocal in step 1 is emitted as a separate hardware op. For scalar or
+# broadcast scales the compiler does not currently fuse it into a single multiply,
+# so there is one sfp-unit op for 1/scale and one for x * inv_scale.  Callers with
+# a hot-path constraint can pre-compute inv_scale and pass it directly to the
+# underlying spyre.qfp8ch / spyre.qfp8wt decomposition ops instead.
+
+
 @torch.library.custom_op(
     "spyre::quantscalepertokenfp8", mutates_args=(), device_types="spyre"
 )
@@ -881,31 +917,26 @@ def _(input: torch.Tensor, scale_ub: float = FP8_E4M3FN_MAX) -> torch.Tensor:
 @torch.library.custom_op(
     "spyre::quantize_fp8_with_scale", mutates_args=(), device_types="spyre"
 )
-def quantize_fp8_with_scale(input: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
-    """
-    Quantize FP16 tensor to FP8 using pre-computed scale.
+@compile_once("spyre.quantize_fp8_with_scale")
+def quantize_fp8_with_scale(
+    input: torch.Tensor, scale: torch.Tensor, compiled
+) -> torch.Tensor:
+    """Quantize FP16 activation tensor to FP8 using a pre-computed scale.
 
-    Performs four steps:
-    1. Compute inverse scale: inv_scale = 1 / scale (reciprocal, POINTWISE on sfp unit)
-    2. Scale the input: x_scaled = x * inv_scale (POINTWISE)
-    3. Clamp to FP8 E4M3 range: x_clamped = clamp(x_scaled, -448, 448) (POINTWISE)
-    4. Convert to FP8 format: x_fp8 = qfp8ch(x_clamped) (POINTWISE format conversion)
+    Implements the four-step pipeline described above using qfp8ch for the
+    final format conversion (activation / channel layout).
 
     Args:
-        input: Input tensor (FP16) to quantize, shape [batch, seq, hidden]
+        input: FP16 activation tensor to quantize, shape [batch, seq, hidden]
         scale: Quantization scale (FP16), shape [batch, seq, 1]
 
     Returns:
-        FP8 E4M3 tensor (same shape as input)
-
-    Example:
-        >>> x = torch.randn(2, 4, 8, dtype=torch.float16, device='spyre')
-        >>> x_fp8 = torch.ops.spyre.quantize_fp8_with_scale(x, scale)
+        FP8 E4M3 tensor with the same shape as input.
 
     Note:
-        - Uses reciprocal operation (hardware sfp unit) for 1/scale computation
+        - Supports eager mode via compile_once decorator
     """
-    pass
+    return compiled(input, scale)
 
 
 @quantize_fp8_with_scale.register_fake
@@ -914,30 +945,67 @@ def _(input: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     return torch.empty(input.size(), dtype=torch.float8_e4m3fn, device=input.device)
 
 
+# NOTE: Do NOT add a second @torch.library.custom_op registration for this op.
+# A duplicate with a pass body was introduced in commit 8f2e78ff and silently
+# overwrote this implementation at import time, causing None returns in eager mode.
+@torch.library.custom_op(
+    "spyre::quantize_weight_fp8_with_scale", mutates_args=(), device_types="spyre"
+)
+@compile_once("spyre.quantize_weight_fp8_with_scale")
+def quantize_weight_fp8_with_scale(
+    input: torch.Tensor, scale: torch.Tensor, compiled
+) -> torch.Tensor:
+    """Quantize FP16 weight tensor to FP8 using a pre-computed scale.
+
+    Implements the four-step pipeline described above using qfp8wt for the
+    final format conversion (weight / kernel layout).
+
+    Args:
+        input: FP16 weight tensor to quantize
+        scale: Quantization scale (FP16)
+
+    Returns:
+        FP8 E4M3 tensor with the same shape as input.
+
+    Note:
+        - Supports eager mode via compile_once decorator
+    """
+    return compiled(input, scale)
+
+
+@quantize_weight_fp8_with_scale.register_fake
+def _(input: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    # Output is FP8 with same shape as input
+    return torch.empty(input.size(), dtype=torch.float8_e4m3fn, device=input.device)
+
+
 @torch.library.custom_op(
     "spyre::dequantize_fp8_with_scale", mutates_args=(), device_types="spyre"
 )
-def dequantize_fp8_with_scale(input: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:  # type: ignore[empty-body]
+@compile_once("spyre.dequantize_fp8_with_scale")
+def dequantize_fp8_with_scale(
+    input: torch.Tensor, scale: torch.Tensor, compiled
+) -> torch.Tensor:
     """
     Dequantize FP8 tensor to FP16 using pre-computed scale.
+
     Performs two steps:
     1. Convert FP8 to FP16: x_fp16 = fp8todl16(x) (dtype conversion)
     2. Scale the output: x_scaled = x_fp16 * scale (POINTWISE)
+
     Args:
         input: Input tensor (FP8) to dequantize, shape [batch, seq, hidden]
         scale: Dequantization scale (FP16), shape [batch, seq, 1]
+
     Returns:
         FP16 tensor (same shape as input)
-    Example:
-        >>> @torch.compile(backend='inductor')
-        >>> def dequant(x_fp8, scale):
-        >>>     return torch.ops.spyre.dequantize_fp8_with_scale(x_fp8, scale)
+
     Note:
-        - MUST use torch.compile(backend='inductor') - does not work in eager mode
+        - Supports eager mode via compile_once decorator
         - Uses fp8todl16 operation for FP8→FP16 conversion
         - Scale must be FP16, NOT FP32
     """
-    pass
+    return compiled(input, scale)
 
 
 @dequantize_fp8_with_scale.register_fake
@@ -967,21 +1035,6 @@ def _(
 ) -> torch.Tensor:
     output_shape = [mat1.shape[0], mat2.shape[-1]]
     return mat1.new_empty(output_shape, dtype=out_dtype or torch.float16)
-
-
-@torch.library.custom_op(
-    "spyre::quantize_weight_fp8_with_scale", mutates_args=(), device_types="spyre"
-)
-def quantize_weight_fp8_with_scale(
-    input: torch.Tensor, scale: torch.Tensor
-) -> torch.Tensor:
-    pass
-
-
-@quantize_weight_fp8_with_scale.register_fake
-def _(input: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
-    # Output is FP8 with same shape as input
-    return torch.empty(input.size(), dtype=torch.float8_e4m3fn, device=input.device)
 
 
 @torch.library.custom_op("spyre::qfp8wt", mutates_args=(), device_types="spyre")
@@ -1041,45 +1094,37 @@ def sliding_window_attention(  # type: ignore[empty-body]
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
+    attention_mask: torch.Tensor,
     window_size: int,
-    is_causal: bool = True,
+    is_causal: bool,
     scale: Optional[float] = None,
-    cache_seqlen: Optional[int] = None,
-    buffer_origin: Optional[int] = None,
-    valid_start: Optional[list[int]] = None,
 ) -> torch.Tensor:
     """
     Sliding-window attention entry point.
 
-    query: [B, Hq, Lq, D]; key/value: [B, Hkv, Lk, D], GQA expanded
-    internally. Query row i, at cache coordinate ``cache_seqlen - Lq + i``,
-    attends column c iff ``0 <= coordinate - c < window_size``.
-    ``is_causal=False`` raises Unsupported.
+    ``query`` is ``[B, Hq, Lq, D]`` and ``key``/``value`` are
+    ``[B, Hkv, Lk, D]``. Native GQA preserves K/V at ``Hkv`` and broadcasts
+    them over groups of query heads rather than materializing ``Hq`` copies.
+    ``Hq`` must be a whole multiple of ``Hkv``. ``attention_mask`` is a runtime
+    additive mask with shape ``[B, 1, Lq, Lk]``. It is the sole source of
+    position-dependent state: it carries causality, the sliding window,
+    unwritten cache rows, and left padding. Keeping that state in a tensor means
+    changing a decode position does not specialize the compiled graph.
 
-    ``cache_seqlen`` is how many tokens the cache has seen, as distinct from
-    ``Lk``, the rows it allocates. Defaults to ``Lk``; need not be a multiple
-    of 64. ``buffer_origin`` is the logical position held by physical row 0,
-    defaulting to ``max(0, cache_seqlen - Lk)`` -- correct only for a buffer
-    that is exactly full, holding precisely the most recent ``Lk`` positions.
-    A caller evicting at coarser granularity holds fewer live positions and
-    MUST pass its true origin, or every read lands past the data, in bounds
-    and unmasked. See ``SlidingWindowPlan`` for both.
+    ``window_size``, ``is_causal``, and ``scale`` are static model
+    configuration. ``is_causal=True`` promises that the mask never allows a
+    future key, which lets square prefill read only each query block's physical
+    causal window. ``is_causal=False`` makes no causal-layout assumption and
+    reads the complete physical cache in bounded chunks; this supports masks
+    with bidirectional regions such as Gemma 4's vision blocks. Other shapes,
+    including anchored single-token decode and chunked prefill, also consume the
+    complete fixed-shape cache because their position is runtime mask data. Use
+    a compact cache for decode so that work remains proportional to the sliding
+    window rather than the model context.
 
-    ``valid_start`` is one **logical** column coordinate per batch entry;
-    columns strictly below it are never attended, whatever the window says. It
-    exists for left-padded prompts, whose pad columns sit inside the window and
-    which an offset-and-length window cannot otherwise exclude. ``None`` or
-    all-zero costs nothing; a uniform threshold keeps the band broadcast over
-    batch; only a ragged one widens it. Coordinates are logical, matching
-    ``cache_seqlen``, so a caller passing ``buffer_origin=0`` passes physical
-    row indices.
-
-    Allocation contract: ``Lk >= round_up_to_64(window_size + Lq - 1)`` for
-    the ``Lq`` of this call, so prefill long sequences in chunks;
-    ``rejection_reason`` names the required row count when ``Lk`` is short.
-    Zero-fill the allocation -- a buffer may overshoot the written prefix,
-    and though causal masking discards those scores the multiply still
-    happens, and an additive ``-inf`` cannot rescue a ``NaN``.
+    The tensor mask always defines the exact attention semantics. Zero-fill
+    unwritten cache rows: masked scores are still computed, and adding a mask
+    cannot rescue a NaN.
 
     MUST be called under torch.compile(backend="inductor") on the spyre
     device; the real lowering is in decompositions.py. This eager body is
@@ -1093,100 +1138,12 @@ def _(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
+    attention_mask: torch.Tensor,
     window_size: int,
-    is_causal: bool = True,
+    is_causal: bool,
     scale: Optional[float] = None,
-    cache_seqlen: Optional[int] = None,
-    buffer_origin: Optional[int] = None,
-    valid_start: Optional[list[int]] = None,
 ) -> torch.Tensor:
     return query.new_empty(query.size())
-
-
-@torch.library.custom_op(
-    "spyre::window_band_mask", mutates_args=(), device_types="spyre"
-)
-def window_band_mask(
-    read_start: int,
-    q_block: int,
-    buffer_width: int,
-    q_row_origin: int,
-    window_size: int,
-    is_causal: bool,
-    dtype: torch.dtype,
-    device: torch.device,
-    valid_start: Optional[list[int]] = None,
-) -> torch.Tensor:
-    """
-    Additive band over one Q block's KV window.
-
-    Shape: [1, 1, q_block, buffer_width] normally; the leading axis is 1
-    unless ``valid_start`` differs across the batch, in which case it is B.
-    0.0 = keep, -inf = masked. The head axis stays size 1 and broadcasts,
-    which keeps this at q_block x buffer_width elements per batch row rather
-    than one copy per head.
-
-    Query row ``q_row_origin + i`` (an absolute KV-cache coordinate: row 0 of
-    this block sits at ``seqlen_kv - seqlen_q + q_block*n``) may attend column
-    ``read_start + j`` iff, with ``delta`` the difference of those two absolute
-    coordinates:
-      - causal:        0 <= delta < window_size
-      - bidirectional: abs(delta) < window_size
-
-    The band removes what the buffer over-covers: the stagger between rows
-    inside the block, and the columns a shifted ragged window drags in.
-
-    ``read_start`` here is **logical** (``read_start_logical``), not
-    buffer-relative, since ``q_row_origin`` is logical and ``delta`` subtracts
-    the two.
-
-    No ``cache_seqlen`` term, deliberately: rows satisfy ``row < cache_seqlen``
-    by construction, so causal ``delta >= 0`` already forces
-    ``column < cache_seqlen``. Only a bidirectional window, which raises
-    today, would need one.
-
-    ``valid_start``, if given, additionally excludes columns strictly below
-    its per-batch-entry threshold -- see ``sliding_window_attention``.
-
-    Built entirely on CPU so the in-place ops stay opaque to torch.compile,
-    matching spyre.causal_mask's rationale.
-    """
-    row = torch.arange(q_block, device="cpu") + q_row_origin
-    column = torch.arange(buffer_width, device="cpu") + read_start
-    delta = row.unsqueeze(-1) - column.unsqueeze(0)
-    if is_causal:
-        allowed = (delta >= 0) & (delta < window_size)
-    else:
-        allowed = delta.abs() < window_size
-    effective = band_valid_start(valid_start)
-    if effective is None:
-        allowed = allowed.unsqueeze(0)
-    elif min(effective) == max(effective):
-        # Uniform threshold: still one broadcast row, not one per sequence.
-        allowed = (allowed & (column.unsqueeze(0) >= effective[0])).unsqueeze(0)
-    else:
-        starts = torch.tensor(effective, device="cpu").view(-1, 1, 1)
-        allowed = allowed.unsqueeze(0) & (column.view(1, 1, -1) >= starts)
-    mask_cpu = torch.zeros(allowed.shape, dtype=dtype, device="cpu")
-    mask_cpu.masked_fill_(~allowed, float("-inf"))
-    return mask_cpu.unsqueeze(1).to(device=device)
-
-
-@window_band_mask.register_fake
-def _(
-    read_start: int,
-    q_block: int,
-    buffer_width: int,
-    q_row_origin: int,
-    window_size: int,
-    is_causal: bool,
-    dtype: torch.dtype,
-    device: torch.device,
-    valid_start: Optional[list[int]] = None,
-) -> torch.Tensor:
-    return torch.empty(
-        band_batch(valid_start), 1, q_block, buffer_width, dtype=dtype, device=device
-    )
 
 
 @torch.library.custom_op("spyre::kv_window", mutates_args=(), device_types="spyre")
@@ -1201,10 +1158,10 @@ def kv_window(  # type: ignore[empty-body]
     Read one Q block's slice of the KV cache.
 
     key/value: [B, Hkv, Lkv, E]. Returns (k_win, v_win) covering cache rows
-    [read_start, read_start + buffer_width). k_win is [B, Hq, E, buffer_width],
-    already **transposed** -- the layout the scores matmul wants, free on a
-    slice. GQA expansion to num_heads happens here, on the slice rather than
-    on the full cache.
+    [read_start, read_start + buffer_width). k_win is
+    [B, Hkv, E, buffer_width], already **transposed** -- the layout the scores
+    matmul wants, free on a slice. Both outputs retain the native KV-head count;
+    the attention decomposition broadcasts them across query-head groups.
 
     One block per call; the memory planner reuses one window buffer across
     them, so the cost is buffer_width rows for any query length.
@@ -1251,9 +1208,9 @@ def _(
     if reason is not None:
         raise Unsupported(f"kv_window: {reason}")
 
-    batch, _, _, head_dim = key.shape
-    k_win = key.new_empty((batch, num_heads, head_dim, buffer_width))
-    v_win = value.new_empty((batch, num_heads, buffer_width, head_dim))
+    batch, num_kvheads, _, head_dim = key.shape
+    k_win = key.new_empty((batch, num_kvheads, head_dim, buffer_width))
+    v_win = value.new_empty((batch, num_kvheads, buffer_width, head_dim))
     return k_win, v_win
 
 

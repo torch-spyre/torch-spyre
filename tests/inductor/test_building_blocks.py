@@ -390,6 +390,33 @@ class TestBuildingBlocks(unittest.TestCase):
             rtol=0.1,
         )
 
+    @mock.patch(
+        "torch_spyre._inductor.decompositions._SDPA_MAX_BURST_EFFICIENT_KV_BLOCK_SIZE",
+        64,
+    )
+    @mock.patch("torch_spyre._inductor.decompositions._SDPA_MAX_SEQUENCE_TILE_SIZE", 64)
+    def test_sdpa_lk_uses_for_each_tile(self):
+        """Multiple K/V blocks lower to one counted loop instead of unrolling."""
+        batch, heads, query_length, kv_length, head_dim = 1, 2, 64, 128, 128
+        query = torch.randn(batch, heads, query_length, head_dim, dtype=torch.float16)
+        key = torch.randn(batch, heads, kv_length, head_dim, dtype=torch.float16)
+        value = torch.randn(batch, heads, kv_length, head_dim, dtype=torch.float16)
+
+        def sdpa(query, key, value):
+            return F.scaled_dot_product_attention(query, key, value)
+
+        expected = sdpa(query, key, value)
+        actual, sources = run_and_get_code(
+            torch.compile(sdpa, dynamic=False),
+            query.to("spyre"),
+            key.to("spyre"),
+            value.to("spyre"),
+        )
+
+        torch.testing.assert_close(actual.cpu(), expected, atol=0.1, rtol=0.1)
+        self.assertEqual(sum(source.count("LoopSpec(") for source in sources), 1)
+        self.assertNotIn("while_loop_carry_snapshot", "\n".join(sources))
+
     def test_causal_sdpa_unpadded_kv_no_inf(self):
         """Regression: causal SDPA must not produce inf when seqlen_kv % 64 != 0.
 
@@ -567,6 +594,114 @@ class TestBuildingBlocks(unittest.TestCase):
         ).cpu()
         torch.testing.assert_close(actual, expected, atol=0.2, rtol=0.2)
 
+    def test_ministral_vision_transposed_value_span(self):
+        """Stick-aligned KV tiles keep Pixtral's transposed V under 256 MiB."""
+        B, H, L, D = 1, 16, 3520, 128
+        generator = torch.Generator().manual_seed(1337)
+        q = torch.randn((B, H, L, D), dtype=torch.bfloat16, generator=generator)
+        k = torch.randn((B, H, L, D), dtype=torch.bfloat16, generator=generator)
+        v = torch.randn((B, L, H, D), dtype=torch.bfloat16, generator=generator)
+        mask = torch.zeros((B, 1, L, L), dtype=torch.bfloat16)
+
+        def sdpa(q, k, v, mask):
+            return F.scaled_dot_product_attention(
+                q,
+                k,
+                v.transpose(1, 2),
+                attn_mask=mask,
+                dropout_p=0.0,
+                scale=D**-0.5,
+            )
+
+        actual = torch.compile(sdpa, dynamic=False)(
+            q.to("spyre"),
+            k.to("spyre"),
+            v.to("spyre"),
+            mask.to("spyre"),
+        ).cpu()
+        self.assertTrue(torch.isfinite(actual).all())
+
+    def test_siglip_multicrop_attention_from_flat_projection(self):
+        """A rank-3 projection may feed the tiled K transpose without a copy.
+
+        SigLIP projects K as [B, L, H*D], views it as [B, L, H, D], and
+        transposes it to [B, H, L, D].  The per-tile K restickify therefore
+        reads the projection's last host coordinate as the dense mixed-radix
+        expression D*head + feature.  This must remain a direct read of the
+        projection rather than requiring k_blk.contiguous().
+        """
+        B, H, L, D, IN = 7, 16, 576, 128, 64
+        generator = torch.Generator().manual_seed(1337)
+        x = torch.randn((B, L, IN), dtype=torch.bfloat16, generator=generator)
+        w = torch.randn((H * D, IN), dtype=torch.bfloat16, generator=generator) / 8
+        q = torch.randn((B, H, L, D), dtype=torch.bfloat16, generator=generator)
+        v = torch.randn((B, H, L, D), dtype=torch.bfloat16, generator=generator)
+
+        def sdpa(x, w, q, v):
+            k = F.linear(x, w).view(B, L, H, D).transpose(1, 2)
+            return F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                dropout_p=0.0,
+                scale=72**-0.5,
+            )
+
+        expected = sdpa(x, w, q, v)
+        actual = torch.compile(sdpa, dynamic=False)(
+            x.to("spyre"), w.to("spyre"), q.to("spyre"), v.to("spyre")
+        ).cpu()
+        torch.testing.assert_close(actual, expected, atol=0.2, rtol=0.2)
+
+    def test_grouped_sdpa_from_packed_rows(self):
+        """A packed row dimension may be viewed as batch x sequence.
+
+        The per-tile K restickify reads its physical row coordinate as the
+        dense flattening ``L * batch + sequence``.  Input padding must account
+        for all batches instead of assuming one symbol per physical dimension.
+        """
+        heads, head_dim = 12, 64
+        generator = torch.Generator().manual_seed(4676)
+        for group, extent in ((2, 63), (2, 64), (4, 512)):
+            with self.subTest(group=group, extent=extent):
+                rows = group * extent
+                q, k, v = (
+                    torch.randn(
+                        (rows, heads, head_dim),
+                        dtype=torch.float16,
+                        generator=generator,
+                    )
+                    for _ in range(3)
+                )
+                mask = torch.zeros(group, 1, 1, extent, dtype=torch.float16)
+
+                def sdpa_grouped(q_rows, k_rows, v_rows, mask):
+                    def unpack(x):
+                        return x.reshape(group, extent, heads, head_dim).transpose(1, 2)
+
+                    attn = F.scaled_dot_product_attention(
+                        unpack(q_rows),
+                        unpack(k_rows),
+                        unpack(v_rows),
+                        attn_mask=mask,
+                        scale=head_dim**-0.5,
+                    )
+                    return attn.transpose(1, 2).reshape(rows, heads, head_dim)
+
+                expected = sdpa_grouped(q, k, v, mask)
+                actual = torch.compile(sdpa_grouped, fullgraph=True, dynamic=False)(
+                    q.to("spyre"),
+                    k.to("spyre"),
+                    v.to("spyre"),
+                    mask.to("spyre"),
+                ).cpu()
+                torch.testing.assert_close(
+                    actual,
+                    expected,
+                    atol=0.1,
+                    rtol=0.1,
+                )
+
     def test_sdpa_head_tiles_limit_heads_per_tile(self):
         """The hint value is a tile count, not a per-tile head extent."""
         # The backend entry point loaded by ``import torch`` has already
@@ -577,6 +712,17 @@ class TestBuildingBlocks(unittest.TestCase):
         self.assertEqual(num_head_tiles(32), 8)
         self.assertEqual(num_head_tiles(16), 4)
         self.assertEqual(num_head_tiles(14), 7)
+
+    def test_granite_gqa_prefill_sequence_tiling(self):
+        """Native GQA remains unexpanded when Lq exceeds one sequence tile."""
+        self._run_granite_gqa_with_finite_broadcast_mask(
+            LQ=1024,
+            dtype=torch.bfloat16,
+            name_inputs=True,
+            LK=1024,
+            transposed_inputs=True,
+            reshape_output=True,
+        )
 
     @unittest.skip(
         "Test skipped solely because of runtime.  It passes but takes over 10 minutes."

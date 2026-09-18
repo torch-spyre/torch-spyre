@@ -1457,6 +1457,20 @@ def log2(arg):
     return math.log2(arg)
 
 
+def piecewise(*args):
+    """``piecewise``, symbolic-aware, mirroring the :func:`sympy.Piecewise`
+    API: each argument is an ``(expr, cond)`` pair, evaluated in order.
+    Dispatches to ``sympy.Piecewise`` when a condition is symbolic, otherwise
+    returns the evaluated value. The last ``cond`` must be a catch-all (e.g.
+    ``True``) so the non-symbolic loop always returns."""
+    if any(isinstance(cond, sympy.Basic) for _expr, cond in args):
+        return sympy.Piecewise(*args)
+    for expr, cond in args:
+        if cond:
+            return expr
+    raise ValueError("piecewise(...) requires a catch-all True branch")
+
+
 _PT_ROWS = 8  # PT block rows per corelet
 
 # Constants for the matmul cost model (_matmul_split_cost). Each is either an
@@ -1507,27 +1521,30 @@ def _matmul_split_cost(
     """
     (B, b), (M, m), (N, n), (K, k) = b_axis, m_axis, n_axis, k_axis
     cores_used = b * m * n * k
+    # SYMBOLIC SPLITS SKIP THE BUDGET CHECK (`isinstance` is False for a sympy
+    # expression), and the fall-through cost is not merely mispriced but NEGATIVE
+    # outside the budget -- what a minimizing objective seeks. Valid only within
+    # `max_cores`, therefore, and it is the CALLER that has to hold that: the symbolic
+    # expression is built over one enumerated CoreDivision per op, which
+    # `CoOptimizingAllocator._division_map` asserts is within budget (issue #4387).
     if cores_used == 0 or (isinstance(cores_used, int) and cores_used > max_cores):
         return math.inf
 
     num_elems = B * M * N * K
-    is_symbolic = isinstance(cores_used, sympy.Basic) or isinstance(
-        num_elems, sympy.Basic
-    )
-
     # Compute: per-core MACs over peak, derated when the per-core M tile is too
     # short to fill the PT pipeline. The PT array streams M in passes of
     # _PT_ROWS; below _TARGET_PT_PASSES passes its startup/drain overhead is
     # amortised over too little work, and that overhead grows sub-linearly.
     m_t = M // m if m else 1
-    pt_passes = max(1.0, m_t / _PT_ROWS)
-    pt_eff = (
-        # TODO: allow symbolic
-        1.0
-        if is_symbolic
-        else min(1.0, (pt_passes / _TARGET_PT_PASSES) ** _PT_EFFICIENCY_EXPONENT)
+    pt_eff_inv = piecewise(
+        (1, m_t >= _PT_ROWS * _TARGET_PT_PASSES),
+        (_TARGET_PT_PASSES**_PT_EFFICIENCY_EXPONENT, m_t <= _PT_ROWS),
+        (
+            ((_TARGET_PT_PASSES * _PT_ROWS) / m_t) ** _PT_EFFICIENCY_EXPONENT,
+            True,
+        ),
     )
-    compute_us = (num_elems / cores_used) / (_PEAK_MACS_US_CORE * pt_eff)
+    compute_us = pt_eff_inv * (num_elems / cores_used) / _PEAK_MACS_US_CORE
 
     # HBM: every input operand is broadcast to the cohort of cores splitting the
     # orthogonal dim. Past _COHORT_LIMIT the broadcasts contend for the shared
@@ -1536,11 +1553,8 @@ def _matmul_split_cost(
         weight_batches = 1 if shared_weight else B
         bytes_total = (B * M * K + weight_batches * K * N + B * M * N) * _DTYPE_BYTES
         fanout_split = max(m, n) if shared_weight else n
-        # TODO: Remove special casing symbolic
-        cohort_penalty = (
-            1.0
-            if is_symbolic
-            else max(1.0, (fanout_split / _COHORT_LIMIT) ** _COHORT_PENALTY_EXPONENT)
+        cohort_penalty = max(
+            1.0, (fanout_split / _COHORT_LIMIT) ** _COHORT_PENALTY_EXPONENT
         )
         hbm_us = bytes_total / (_HBM_BW_GBS * 1000) * cohort_penalty
     else:
@@ -1581,38 +1595,33 @@ def _matmul_split_cost(
     # means avoiding very wide per-core N tiles when the whole projection is
     # narrow enough that more N lanes are available. Both effects are expressed
     # as ratios rather than op names or workload-specific shapes.
-    # filled_m_tile_factor = 1.0 if m_t >= _M_TILE_UNDERFILL_TARGET else 0.0
-    # TODO: Remove special casing symbolic
-    if not is_symbolic:
-        filled_m_tile_factor = 1.0 if m_t >= _M_TILE_UNDERFILL_TARGET else 0.0
-        true_bmm_value_split_us = (
-            0.0
-            if shared_weight or n <= 1
-            else filled_m_tile_factor
-            * max(0.0, log2(max(1, K) / max(1, N)))
-            * log2(n)
-            * _LARGE_M_TILE_SHAPE_PENALTY_US
-        )
-        shared_narrow_tile_us = (
-            0.0
-            if not shared_weight
-            else filled_m_tile_factor
-            * max(0.0, log2(_SHARED_NARROW_OUTPUT_REF / max(1, N)))
-            * max(0.0, log2(max(1, n_t) / _SHARED_N_TILE_TARGET))
-            * (_LARGE_M_TILE_SHAPE_PENALTY_US / 4)
-        )
-        shared_down_n_split_us = (
-            0.0
-            if not shared_weight or n <= 1
-            else max(0.0, log2(max(1, K) / max(1, N)))
-            * log2(n)
-            * _SHARED_DOWN_N_SPLIT_PENALTY_US
-        )
-        large_m_tile_shape_us = (
-            true_bmm_value_split_us + shared_narrow_tile_us + shared_down_n_split_us
-        )
-    else:
-        large_m_tile_shape_us = 0.0
+    filled_m_tile_factor = piecewise((1, m_t >= _M_TILE_UNDERFILL_TARGET), (0, True))
+    true_bmm_value_split_us = (
+        0.0
+        if shared_weight
+        else filled_m_tile_factor
+        * max(0.0, log2(max(1, K) / max(1, N)))
+        * log2(n)
+        * _LARGE_M_TILE_SHAPE_PENALTY_US
+    )
+    shared_narrow_tile_us = (
+        0.0
+        if not shared_weight
+        else filled_m_tile_factor
+        * max(0.0, log2(_SHARED_NARROW_OUTPUT_REF / max(1, N)))
+        * max(0.0, log2(max(1, n_t) / _SHARED_N_TILE_TARGET))
+        * (_LARGE_M_TILE_SHAPE_PENALTY_US / 4)
+    )
+    shared_down_n_split_us = (
+        0.0
+        if not shared_weight
+        else max(0.0, log2(max(1, K) / max(1, N)))
+        * log2(n)
+        * _SHARED_DOWN_N_SPLIT_PENALTY_US
+    )
+    large_m_tile_shape_us = (
+        true_bmm_value_split_us + shared_narrow_tile_us + shared_down_n_split_us
+    )
 
     # Prefer using the full core budget, but keep this soft so measured-good
     # lower-core candidates can still win.
@@ -1813,12 +1822,18 @@ def _cost_model_matmul_planner(
     if math.prod(new_splits.values()) < math.prod(splits.values()):
         if not has_qfp8wt_tensor(input_tds + [output_td]):
             return splits
-        # For QFP8WT, force k_dim = 1 regardless of core count
+        # For QFP8WT, force k_dim = 1 regardless of core count.
+        # n_dim is left as the cost model's chosen n_s; any legal divisor of
+        # n_sticks is safe because N is always a multiple of 128 (one FP8
+        # stick), so size = N // n_split = 128 * (n_sticks // n_split) is
+        # always a multiple of 64 — satisfying the hardware alignment
+        # requirement enforced at codegen time.
         new_splits[k_dim] = 1
 
     logger.debug(
         f"cost_model work_division {op.get_name()}: "
-        f"b={b_combo} m={m_s} n={n_s} k={k_s} rhs_loaded_once={rhs_loaded_once} "
+        f"b={b_combo} m={m_s} n={new_splits[n_dim]} k={new_splits[k_dim]} "
+        f"rhs_loaded_once={rhs_loaded_once} "
         f"cost={best_cost:.1f}us "
         f"[B={B_total} M={M_e} K={K_e} N={N_e}]"
     )
@@ -1956,7 +1971,7 @@ def _cost_model_divide_op(op: ComputedBuffer, max_cores: int) -> bool:
     """
     if not isinstance(op.data, Reduction):
         return False
-    if op.data.reduction_type != BATCH_MATMUL_OP:
+    if op.data.reduction_type not in (BATCH_MATMUL_OP, BATCH_MATMUL_FP8_OP):
         return False
     if not config.ignore_work_division_hints and _has_work_div_hint(op):
         # User hints take ownership of the split decision; do not override them.

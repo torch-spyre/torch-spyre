@@ -51,6 +51,20 @@ class CarriedReductionRecord:
 
 
 @dataclass(frozen=True)
+class LoopCarryRecord:
+    """Identity contract for one accumulator carried through a counted loop.
+
+    ``for_each_tile`` lowering rewrites the carry update as an in-place write
+    into the carry's initial storage.  Recording both ends lets scratchpad
+    planning distinguish that closed, compiler-created mutation from an
+    arbitrary user mutation, which must remain in HBM.
+    """
+
+    storage_name: str
+    update_name: str
+
+
+@dataclass(frozen=True)
 class ReductionPlan:
     """Planned shape/identity/nesting data for a tiled-reduction op.
 
@@ -261,6 +275,12 @@ class ReadCopyElisionRecord:
     copy_name: str
     source_name: str
     direct_inner_fn: object
+    direct_tiled_dims_per_level: (
+        tuple[tuple[tuple[int, sympy.Expr], ...], ...] | None
+    ) = None
+    direct_squeezed_advance_per_level: (
+        tuple[tuple[tuple[sympy.Expr, sympy.Expr], ...], ...] | None
+    ) = None
 
 
 @dataclass
@@ -388,6 +408,20 @@ _SPYRE_METADATA_ATTRS = (
     # One immutable record shared by the fill, loop combine, and final drain
     # of a loop-carried reduction.  Post-fusion verification consumes it.
     "_carried_reduction_record",
+    # One immutable record shared by a for_each_tile carry's persistent
+    # storage and its in-loop update operation.
+    "_loop_carry_record",
+    # Ground-truth tiled-dim tag stamped by lower_tile_dim_marker
+    # (lowering.py) on a for_each_tile tile read; consumed and erased by
+    # _consume_tile_dim_markers (for_each_tile_lowering.py). Must survive
+    # while_loop_bridge.splice_while_loop's own redirect_computed_buffer_
+    # reads calls (e.g. "redirect while_loop carry/tile reads to persistent
+    # scratch"), which reconstruct the marker op before
+    # _consume_tile_dim_markers ever sees it -- confirmed empirically: the
+    # marker attribute was silently dropped there before this attr was
+    # added to this tuple, because copy_op_metadata only copies attrs
+    # listed here.
+    "tile_marker_dim",
 )
 
 
