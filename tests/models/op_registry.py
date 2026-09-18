@@ -70,8 +70,12 @@ def lazy_torch(path: str) -> Callable[..., Any]:
 
 
 def _dropout_pre(sample: SampleInput) -> SampleInput:
-    # default deterministic behavior unless case overrides
-    sample.kwargs.setdefault("training", False)
+    # F.dropout signature: dropout(input, p=0.5, training=True, inplace=False)
+    # args[0]=p, args[1]=training, args[2]=inplace (when passed positionally).
+    # Only inject training=False via kwargs if it is NOT already provided positionally.
+    training_in_args = sample.args is not None and len(sample.args) >= 2
+    if not training_in_args:
+        sample.kwargs.setdefault("training", False)
     return sample
 
 
@@ -314,13 +318,14 @@ def _tensor_add_(x: torch.Tensor, other, alpha=1):
 
 
 def _tensor_and_(x: torch.Tensor, other):
-    x &= other
-    return x
+    # Out-of-place: result = x & other (broadcasting allowed).
+    # The YAML cases model "result = result & mask(...)" which is not in-place
+    # when the shapes differ (e.g. scalar & [1,1,512,1] -> [1,1,512,1]).
+    return torch.bitwise_and(x, other)
 
 
 def _tensor_or_(x: torch.Tensor, other):
-    x |= other
-    return x
+    return torch.bitwise_or(x, other)
 
 
 def _tensor_copy_(x: torch.Tensor, source: torch.Tensor):
@@ -350,6 +355,7 @@ OP_REGISTRY: Dict[str, OpAdapter] = {
     "torch.chunk": OpAdapter("torch.chunk", torch.chunk),
     "torch.stack": OpAdapter("torch.stack", torch.stack),
     # Basic math / reductions
+    "torch.abs": OpAdapter("torch.abs", torch.abs),
     "torch.add": OpAdapter("torch.add", torch.add),
     "torch.Tensor.add": OpAdapter("torch.add", torch.add),
     "operator.__add__": OpAdapter("torch.add", torch.add),
@@ -367,6 +373,7 @@ OP_REGISTRY: Dict[str, OpAdapter] = {
     "torch.sum": OpAdapter("torch.sum", torch.sum),
     "torch.mean": OpAdapter("torch.mean", torch.mean),
     "torch.max": OpAdapter("torch.max", torch.max),
+    "torch.min": OpAdapter("torch.max", torch.min),
     "torch.softmax": OpAdapter("torch.softmax", torch.softmax),
     "torch.cumsum": OpAdapter("torch.cumsum", torch.cumsum),
     "torch.prod": OpAdapter("torch.prod", torch.prod),
@@ -426,7 +433,8 @@ OP_REGISTRY: Dict[str, OpAdapter] = {
         "_operator.setitem", _tensor_setitem_, is_inplace=True
     ),
     "torch.ops.aten.index": OpAdapter("torch.ops.aten.index", _aten_index),
-    # Scatter / copy / masking
+    # Gather / Scatter / copy / masking
+    "torch.gather": OpAdapter("torch.gather", torch.gather),
     "torch.scatter": OpAdapter("torch.scatter", torch.scatter),
     "torch.scatter_": OpAdapter("torch.scatter_", _tensor_scatter_, is_inplace=True),
     # "torch.scatter_": OpAdapter("torch.scatter_", torch.Tensor.scatter_, is_inplace=True),
@@ -448,6 +456,7 @@ OP_REGISTRY: Dict[str, OpAdapter] = {
     "torch.ne": OpAdapter("torch.ne", _torch_ne),
     "torch.gt": OpAdapter("torch.gt", _torch_gt),
     "torch.logical_and": OpAdapter("torch.logical_and", torch.logical_and),
+    "torch.bitwise_and": OpAdapter("torch.bitwise_and", torch.bitwise_and),
     "torch.bitwise_or": OpAdapter("torch.bitwise_or", torch.bitwise_or),
     "torch.or_": OpAdapter("torch.or_", _tensor_or_, is_inplace=True),
     # Type/device conversions
@@ -459,6 +468,7 @@ OP_REGISTRY: Dict[str, OpAdapter] = {
     "torch.type_as": OpAdapter("torch.Tensor.type_as", torch.Tensor.type_as),
     # Creation
     "torch.empty_like": OpAdapter("torch.empty_like", torch.empty_like),
+    "torch.full_like": OpAdapter("torch.full_like", torch.full_like),
     "torch.ge": OpAdapter("torch.ge", _torch_ge),
     "torch.histc": OpAdapter("torch.histc", torch.histc),
     "torch.clamp_": OpAdapter("torch.clamp_", _tensor_clamp_, is_inplace=True),
@@ -476,9 +486,10 @@ OP_REGISTRY: Dict[str, OpAdapter] = {
     "torch.new_ones": OpAdapter("torch.new_ones", _tensor_new_ones),
     "torch.full": OpAdapter("torch.full", torch.full),
     "torch.as_tensor": OpAdapter("torch.as_tensor", torch.as_tensor),
-    # Sort / Topk
+    # Sort / Topk / Argmax
     "torch.sort": OpAdapter("torch.sort", torch.sort),
     "torch.topk": OpAdapter("torch.topk", torch.topk),
+    "torch.argmax": OpAdapter("torch.argmax", torch.argmax),
     # normalization
     "torch.rms_norm": OpAdapter("torch.rms_norm", torch.rms_norm),
     # NNs / functionals (use F.* where appropriate)
@@ -502,6 +513,12 @@ OP_REGISTRY: Dict[str, OpAdapter] = {
     ),
     "torch.nn.functional.glu": OpAdapter(
         "torch.nn.functional.glu", torch.nn.functional.glu
+    ),
+    "torch.nn.functional.normalize": OpAdapter(
+        "torch.nn.functional.normalize", torch.nn.functional.normalize
+    ),
+    "torch.nn.functional.relu": OpAdapter(
+        "torch.nn.functional.relu", torch.nn.functional.relu
     ),
     "torch.nn.functional.silu": OpAdapter(
         "torch.nn.functional.silu", torch.nn.functional.silu
@@ -602,7 +619,7 @@ OP_REGISTRY: Dict[str, OpAdapter] = {
     ),
     # In-place add_ listed separately
     "torch.add_": OpAdapter("torch.add_", _tensor_add_, is_inplace=True),
-    "torch.and_": OpAdapter("torch.and_", _tensor_and_, is_inplace=True),
+    "torch.and_": OpAdapter("torch.and_", _tensor_and_),
     # "torch.add_": OpAdapter("torch.add_", torch.Tensor.add_, is_inplace=True),
 }
 
