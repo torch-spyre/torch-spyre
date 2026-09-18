@@ -39,7 +39,7 @@ from torch._inductor.ir import (
 from torch_spyre._C import ElementArrangement
 
 from . import config
-from .constants import BATCH_MATMUL_FP8_OP, BATCH_MATMUL_OP, DEVICE_NAME
+from .constants import BATCH_MATMUL_FP8_OP, BATCH_MATMUL_OP, DEVICE_NAME, STAGGERED_EAS
 from .errors import Unsupported
 from .ir import (
     AllGatherAsyncFallback,
@@ -445,7 +445,19 @@ def adjust_it_space_for_sticks(
                 f"(tensor {td.dep.name}); symbolic dims must be non-stick "
                 f"(e.g. the leading batch dim)."
             )
-        elems_per_stick = td.layout.device_layout.elems_per_stick()
+        output_ea = tensor_deps[-1].layout.device_layout.element_arrangement
+        if output_ea in STAGGERED_EAS:
+            # The output is a paired-stick layout (DL16_TO_FP32 or
+            # FP32_TO_DL16): two FP32 sticks are coupled into 64 elements.
+            # This covers both transitions that require paired-stick semantics:
+            #   Case A  STANDARD    -> DL16_TO_FP32 / FP32_TO_DL16
+            #   Case B  DL16_TO_FP32 -> DL16_TO_FP32
+            #           FP32_TO_DL16 -> FP32_TO_DL16
+            # The inverse conversion (staggered input, STANDARD output) does
+            # NOT reach this branch because its output EA is STANDARD.
+            elems_per_stick = 64
+        else:
+            elems_per_stick = td.layout.device_layout.elems_per_stick()
         if stick_var not in max_elems or elems_per_stick > max_elems[stick_var]:
             max_elems[stick_var] = elems_per_stick
 

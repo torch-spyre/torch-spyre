@@ -193,14 +193,30 @@ def test_fp32_to_fp16_restoration(device, fp16):
     print("✓ FP32→FP16 restoration (DL16_TO_FP32 → STANDARD) works")
 
 
+# Shapes used by both bidirectional roundtrip tests.
+# [4, 128]: stick-aligned (128 = 2 fp16 sticks of 64).
+# [4, 96]:  sub-stick (96 = 1.5 fp16 sticks; last stick is partially filled).
+_ROUNDTRIP_SHAPES = [
+    pytest.param((4, 128), id="aligned_4x128"),
+    pytest.param((4, 96), id="substick_4x96"),
+]
+
+
 @pytest.mark.parametrize("device", ["spyre"])
+@pytest.mark.parametrize("shape", _ROUNDTRIP_SHAPES)
 @pytest.mark.parametrize(
     "fp16",
     DtypeOpTable.fp16_types(),
     ids=lambda dt: str(dt).replace("torch.", ""),
 )
-def test_bidirectional_roundtrip_fp16_start(device, fp16):
-    """Test FP16→FP32→FP16 roundtrip."""
+def test_bidirectional_roundtrip_fp16_start(device, shape, fp16):
+    """Test FP16→FP32→FP16 roundtrip for stick-aligned and sub-stick shapes.
+
+    [4, 128]: 2 whole fp16 sticks — baseline case.
+    [4, 96]:  1.5 fp16 sticks (last stick partially filled).  The fp32
+              intermediate carries DL16_TO_FP32; the final fp16 output must
+              restore to STANDARD EA and match the CPU reference.
+    """
 
     @torch.compile
     def fn(x):
@@ -208,7 +224,7 @@ def test_bidirectional_roundtrip_fp16_start(device, fp16):
         x_fp32 = x.to(torch.float32)
         return x_fp32.to(dtype=fp16)
 
-    x = torch.randn(4, 128, device=device, dtype=fp16)
+    x = torch.randn(shape, device=device, dtype=fp16)
     result = fn(x)
 
     # Verify final EA is STANDARD
@@ -221,13 +237,21 @@ def test_bidirectional_roundtrip_fp16_start(device, fp16):
 
 
 @pytest.mark.parametrize("device", ["spyre"])
+@pytest.mark.parametrize("shape", _ROUNDTRIP_SHAPES)
 @pytest.mark.parametrize(
     "fp16",
     DtypeOpTable.fp16_types(),
     ids=lambda dt: str(dt).replace("torch.", ""),
 )
-def test_bidirectional_roundtrip_fp32_start(device, fp16):
-    """Test FP32→FP16→FP32 roundtrip."""
+def test_bidirectional_roundtrip_fp32_start(device, shape, fp16):
+    """Test FP32→FP16→FP32 roundtrip for stick-aligned and sub-stick shapes.
+
+    [4, 128]: 4 whole fp32 sticks — baseline case.
+    [4, 96]:  3 fp32 sticks (96/32), ceiled to 2 DL16 sticks; the fp32
+              input is padded to 4 sticks (issue #3999) before the FP32_TO_DL16
+              conversion; the restored fp32 output must be STANDARD EA and
+              match the CPU reference.
+    """
 
     @torch.compile
     def fn(x):
@@ -235,7 +259,7 @@ def test_bidirectional_roundtrip_fp32_start(device, fp16):
         x_fp16 = x.to(dtype=fp16)
         return x_fp16.to(torch.float32)
 
-    x = torch.randn(4, 128, device=device, dtype=torch.float32)
+    x = torch.randn(shape, device=device, dtype=torch.float32)
     result = fn(x)
 
     # Verify final EA is STANDARD

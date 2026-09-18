@@ -796,6 +796,92 @@ class TestSpyreTensorLayout(TestCase):
         )
         self.assertEqual(list(ok.device_size), [1, 4, 64])
 
+    def test_fp32_to_dl16_stl_output_partial_stick(self):
+        """_fp32_to_dl16_stl: 3 fp32 sticks -> 2 fp16 sticks (issue #3999).
+
+        The output-side ceil division is the existing correct behavior.
+        Verify it is preserved: 3*32=96 elements -> ceil(96/64)=2 fp16 sticks.
+        """
+        from torch_spyre._C import ElementArrangement
+        from torch_spyre._inductor.propagate_layouts import _fp32_to_dl16_stl
+
+        fp32 = get_device_dtype(torch.float32)
+        three_sticks = SpyreTensorLayout(
+            [3, 2, 32], [32, 32, 1], fp32, ElementArrangement.STANDARD
+        )
+        out = _fp32_to_dl16_stl(three_sticks, torch.float16)
+
+        # Output: 2 DL16 sticks of 64 elements.
+        self.assertEqual(list(out.device_size), [2, 2, 64])
+        self.assertEqual(list(out.stride_map), [64, 32, 1])
+        self.assertEqual(out.element_arrangement, ElementArrangement.FP32_TO_DL16)
+
+    def test_pad_fp32_to_dl16_input_partial_stick(self):
+        """_pad_fp32_to_dl16_input: 3-stick fp32 input expanded to 4 sticks (issue #3999).
+
+        After finalize_layouts, the fp32 input has device_size=[3,2,32] but the
+        FP32_TO_DL16 output requires 2*64/32=4 fp32 sticks of physical capacity.
+        _pad_fp32_to_dl16_input must grow device_size[0] from 3 to 4.
+        """
+        import unittest.mock as mock
+        from torch_spyre._C import ElementArrangement
+        from torch_spyre._inductor.ir import FixedTiledLayout
+        from torch_spyre._inductor.padding import _pad_fp32_to_dl16_input
+
+        fp32 = get_device_dtype(torch.float32)
+        fp16 = get_device_dtype(torch.float16)
+
+        # Build a fake input ComputedBuffer with a 3-stick fp32 FixedTiledLayout.
+        in_stl = SpyreTensorLayout(
+            [3, 2, 32], [32, 32, 1], fp32, ElementArrangement.STANDARD
+        )
+        in_layout = FixedTiledLayout(
+            torch.device("spyre"), torch.float32, [2, 96], [96, 1], in_stl
+        )
+        in_buf = mock.MagicMock()
+        in_buf.__class__ = __import__(
+            "torch._inductor.ir", fromlist=["ComputedBuffer"]
+        ).ComputedBuffer
+        in_buf.get_layout.return_value = in_layout
+        in_buf.layout = in_layout
+
+        # Build a fake FP32->DL16 output op with device_size=[2,2,64].
+        out_stl = SpyreTensorLayout(
+            [2, 2, 64], [64, 32, 1], fp16, ElementArrangement.FP32_TO_DL16
+        )
+        out_layout = FixedTiledLayout(
+            torch.device("spyre"), torch.float16, [2, 96], [96, 1], out_stl
+        )
+
+        # Mock the conversion op: ComputedBuffer + Pointwise + single read.
+        in_dep = mock.MagicMock()
+        in_dep.name = "buf_fp32"
+        rw = mock.MagicMock()
+        rw.reads = [in_dep]
+
+        op = mock.MagicMock()
+        op.__class__ = __import__(
+            "torch._inductor.ir", fromlist=["ComputedBuffer"]
+        ).ComputedBuffer
+        op.get_layout.return_value = out_layout
+        op.get_read_writes.return_value = rw
+        import torch._inductor.ir as _ir
+
+        op.data = _ir.Pointwise.__new__(_ir.Pointwise)
+
+        graph = mock.MagicMock()
+        graph.get_buffer.return_value = in_buf
+
+        _pad_fp32_to_dl16_input(op, graph)
+
+        # After padding, input device_size[0] must be 4 (= 2*64/32).
+        padded_layout = in_buf.layout
+        self.assertIsInstance(padded_layout, FixedTiledLayout)
+        self.assertEqual(list(padded_layout.device_layout.device_size), [4, 2, 32])
+        # stride_map and stick dim are unchanged.
+        self.assertEqual(list(padded_layout.device_layout.stride_map), [32, 32, 1])
+        self.assertEqual(padded_layout.device_layout.device_size[-1], 32)
+
 
 if __name__ == "__main__":
     run_tests()

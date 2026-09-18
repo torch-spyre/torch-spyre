@@ -63,6 +63,7 @@ from torch._inductor.ir import (
     Operation,
     Pointwise,
     Reduction,
+    StorageBox,
     TensorBox,
 )
 from torch._inductor.ops_handler import WrapperHandler
@@ -84,8 +85,9 @@ from .pass_utils import (
     redirect_computed_buffer_reads,
     replace_computed_buffer_body,
 )
+from .propagate_layouts import _find_num_sticks_dim
 from .views import compute_coordinates
-from torch_spyre._C import SpyreTensorLayout, get_elem_in_stick
+from torch_spyre._C import ElementArrangement, SpyreTensorLayout, get_elem_in_stick
 
 logger = get_inductor_logger("padding")
 
@@ -705,6 +707,17 @@ def _is_dense_flattened_coordinate(coord, ranges) -> bool:
     return True
 
 
+def _is_fp32_to_dl16_op(op: Operation) -> bool:
+    if not isinstance(op, ComputedBuffer):
+        return False
+    out_layout = op.get_layout()
+    if not isinstance(out_layout, FixedTiledLayout):
+        return False
+    return (
+        out_layout.device_layout.element_arrangement == ElementArrangement.FP32_TO_DL16
+    )
+
+
 def _assert_input_paddable(op: ComputedBuffer, in_dep, in_layout) -> None:
     """Raise ``Unsupported`` for restickify inputs outside what the stick-boundary
     bump supports, classifying each input dim's read by its coordinate.
@@ -932,6 +945,71 @@ def _pad_restickify_input(op: Operation, graph: GraphLowering) -> None:
     )
 
 
+def _pad_fp32_to_dl16_input(op: Operation, graph: GraphLowering) -> None:
+    """Expand odd fp32 input stick counts to the next even count for FP32->FP16 conversion.
+    When converting fp32 sticks (32 elems/stick) into fp16 sticks (64 elems/stick),
+    an odd number of fp32 sticks produces a partially filled fp16 stick (Issue #3999).
+    For example:
+
+    3 fp32 sticks (96 elements)
+      ->
+    2 fp16 sticks (96 elements in 128-element capacity)
+
+    To match the output capacity, the fp32 input must be expanded as well, from
+    3 fp32 sticks (96 elements) to 4 fp32 sticks (96 elements in 128-element capacity).
+
+
+    Only touches the device layout (``device_size``); host size and
+    ``stride_map`` are unchanged.
+    """
+    assert isinstance(op, ComputedBuffer)
+    out_layout = op.get_layout()
+    assert isinstance(out_layout, FixedTiledLayout)
+    out_stl = out_layout.device_layout
+
+    # fp32-to-fp16 conversion is expected to be a unary op: it reads exactly one input buffer.
+    reads = [r for r in op.get_read_writes().reads if hasattr(r, "name")]
+    if len(reads) != 1:
+        return
+
+    in_dep = reads[0]
+    raw_buf = graph.get_buffer(in_dep.name)
+    assert raw_buf is not None, in_dep.name
+    # Resolve the underlying buffer that owns the layout.
+    if isinstance(raw_buf, TensorBox):
+        # TensorBox -> StorageBox -> InputBuffer
+        inner = raw_buf.data
+        if isinstance(inner, StorageBox):
+            inner = inner.data
+        assert isinstance(inner, Buffer), type(inner)
+        in_buf: Buffer = inner
+    elif isinstance(raw_buf, ComputedBuffer):
+        in_buf = raw_buf
+    else:
+        return
+    in_layout = in_buf.get_layout()
+    if not isinstance(in_layout, FixedTiledLayout):
+        return
+
+    in_stl = in_layout.device_layout
+    num_sticks_dim = _find_num_sticks_dim(in_stl)
+    if num_sticks_dim is None:
+        return
+
+    in_eps = in_stl.device_size[-1]  # 32 for fp32
+    out_eps = out_stl.device_size[-1]  # 64 for fp16
+    out_num_sticks = out_stl.device_size[num_sticks_dim]
+
+    # Required input num-sticks = out_num_sticks * out_eps / in_eps
+    required_in_num_sticks = out_num_sticks * out_eps // in_eps
+    current_in_num_sticks = in_stl.device_size[num_sticks_dim]
+
+    if current_in_num_sticks >= required_in_num_sticks:
+        return
+
+    in_buf.layout = _pad_device_dim(in_layout, num_sticks_dim, required_in_num_sticks)
+
+
 def insert_restickify_padding(graph: GraphLowering) -> None:
     """Pad a restickify's buffers so both are stick-aligned.
 
@@ -966,3 +1044,10 @@ def insert_restickify_padding(graph: GraphLowering) -> None:
         if is_restickify_op(op, graph):
             _pad_restickify_output(op, graph)
             _pad_restickify_input(op, graph)
+
+
+def insert_staggered_ea_padding(graph: GraphLowering) -> None:
+    """Expand input capacity for staggered element-arrangement conversions."""
+    for op in list(graph.operations):
+        if _is_fp32_to_dl16_op(op):
+            _pad_fp32_to_dl16_input(op, graph)
