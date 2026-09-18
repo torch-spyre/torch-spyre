@@ -38,6 +38,7 @@ reference, see test_for_each_tile_e2e.py.
 import unittest
 from unittest import mock
 
+import sympy
 import torch
 from torch._inductor.virtualized import V
 
@@ -576,6 +577,35 @@ class TestSpliceWhileLoops(unittest.TestCase):
 
 
 class TestTryProveForEachTile(unittest.TestCase):
+    def test_dynamic_index_expr_bound_is_accepted(self):
+        from torch_spyre._inductor.wsr.for_each_tile_lowering import (
+            _extract_trip_count,
+        )
+
+        bound = sympy.Symbol("s0", integer=True, positive=True)
+
+        class Data:
+            dtype = torch.bool
+
+            @staticmethod
+            def get_size():
+                return []
+
+            @staticmethod
+            def inner_fn(_):
+                step = V.ops.load("step", 0)
+                count = V.ops.index_expr(bound, torch.int64)
+                return V.ops.lt(step, count)
+
+        op = mock.Mock()
+        op.data = Data()
+        cond_graph = mock.Mock()
+        cond_graph.graph_inputs = {"step": mock.Mock()}
+        cond_graph.graph_outputs = [mock.Mock()]
+        cond_graph.operations = [op]
+
+        self.assertEqual(_extract_trip_count(cond_graph), bound)
+
     def test_map_mode_accepted_with_trip_count(self):
         (X, Y), _ref = matmul_inputs()
         while_op = _find_while_loop_ir_op(split_m_fn, (X, Y))
@@ -709,11 +739,21 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
                 break
         assert fake_mode is not None, "could not recover a fake_mode from gm node.meta"
 
+        # Lowered on the captured graph's OWN placeholders, not on `args`:
+        # dynamo/AOT order the post-grad graph's placeholders by nothing the
+        # caller controls (paged_gather_kv_fn's q, table, k, v arrive in a
+        # different order than they are passed), so feeding `args`
+        # positionally binds inputs to the wrong placeholders and blows up
+        # in lowering on a shape mismatch. Fake tensors are what the real
+        # Inductor pipeline runs GraphLowering on anyway.
+        placeholders = [
+            node.meta["val"] for node in gm.graph.nodes if node.op == "placeholder"
+        ]
         graph = GraphLowering(
-            gm, example_inputs=list(args), shape_env=fake_mode.shape_env
+            gm, example_inputs=placeholders, shape_env=fake_mode.shape_env
         )
         with V.set_graph_handler(graph), V.set_fake_mode(fake_mode):
-            graph.run(*args)
+            graph.run(*placeholders)
         return graph
 
     def test_marker_erased_and_mapped_after_split_m_splice(self):
@@ -969,6 +1009,154 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
                 "real coordinate transform through unchanged, not some "
                 "other (e.g. renamed-and-unchanged, or miscomposed) value.",
             )
+
+    def test_marker_with_two_computed_buffer_consumers_maps_both(self):
+        """Paged attention's shape: one marker, two ComputedBuffer consumers.
+
+        paged_gather_kv_fn slices one page index out of the tiled block
+        table and hands it to two ``index_select``s (K's page and V's), so
+        the table's single dim=0 marker has two consuming reads, both
+        inline-branch shaped. _consume_tile_dim_markers asserted "expected
+        exactly one" on that until this test's fix, which blocked
+        spyre-inference's real page_attn_kernel outright -- and nothing
+        caught it: the CPU lowering suite compiles with
+        ``backend="inductor"``, which never runs this spyre pre-scheduling
+        pass at all, and this pass's own unit tests only had
+        single-consumer fixtures.
+
+        Asserts more than "it no longer raises". Each consumer must get its
+        OWN map entry (dropping either silently loses that op's tiled-dim
+        provenance), each post-inline read must still carry the marker's own
+        per-trip advance term with the marker's own coefficient (the
+        silent-wrong-numerics regression
+        test_marker_inlined_preserves_advance_term_on_computed_buffer_
+        consumer pins for one consumer -- composing the transform into the
+        first consumer and merely renaming past the second would satisfy a
+        weaker check), and the marker must end up erased, since every one of
+        its consumers took the inline branch.
+        """
+        from torch._inductor import ir
+        from torch._inductor.dependencies import MemoryDep
+
+        from torch_spyre._inductor.wsr.for_each_tile_lowering import (
+            MarkerResolution,
+            _body_loop_var,
+            _consume_tile_dim_markers,
+            _marker_resolution,
+            _stacking_carry_indices,
+            try_prove_for_each_tile,
+        )
+        from torch_spyre._inductor.wsr.while_loop_bridge import (
+            carry_bindings_for,
+            splice_while_loop,
+        )
+
+        from tests.inductor.for_each_tile_fixtures import (
+            paged_gather_kv_fn,
+            paged_gather_kv_inputs,
+        )
+
+        args = paged_gather_kv_inputs()
+        graph = self._run_graph(paged_gather_kv_fn, args)
+
+        while_ops = [op for op in graph.operations if isinstance(op, ir.WhileLoop)]
+        self.assertEqual(len(while_ops), 1)
+        while_op = while_ops[0]
+
+        result = try_prove_for_each_tile(while_op)
+        self.assertTrue(result.accepted)
+        loop_var = _body_loop_var(while_op)
+        self.assertIsNotNone(loop_var)
+
+        with V.set_graph_handler(graph):
+            carries = carry_bindings_for(
+                while_op, _stacking_carry_indices(while_op, loop_var)
+            )
+            group_ops = splice_while_loop(
+                graph, while_op, carries, trip_count=result.trip_count
+            )
+
+            markers = [
+                op
+                for op in group_ops
+                if getattr(op, "tile_marker_dim", None) is not None
+            ]
+            self.assertEqual(
+                len(markers),
+                1,
+                "fixture assumption violated: only the block table is "
+                f"tiled here, so exactly one marker is expected; got {markers!r}",
+            )
+            marker_op = markers[0]
+            marker_name = marker_op.get_name()
+
+            marker_reads = [
+                d for d in marker_op.get_read_writes().reads if isinstance(d, MemoryDep)
+            ]
+            self.assertEqual(len(marker_reads), 1)
+            marker_input_name = marker_reads[0].name
+            marker_own_index = marker_reads[0].index
+            self.assertIn(
+                loop_var,
+                marker_own_index.free_symbols,
+                "fixture assumption violated: expected the marker's own "
+                f"read index to carry the per-trip advance ({loop_var}); "
+                f"got {marker_own_index!r}",
+            )
+
+            consumer_names = {
+                op.get_name()
+                for op in group_ops
+                if isinstance(op, ir.ComputedBuffer)
+                and op is not marker_op
+                and any(
+                    isinstance(d, MemoryDep) and d.name == marker_name
+                    for d in op.get_read_writes().reads
+                )
+            }
+            self.assertEqual(
+                len(consumer_names),
+                2,
+                "fixture assumption violated: expected the page index to "
+                "be read by two separate ComputedBuffer gathers (K's and "
+                f"V's index_select); got {sorted(consumer_names)}",
+            )
+
+            marker_map = _consume_tile_dim_markers(group_ops, graph.operations)
+
+        mapped_names = {name for name, _dep in marker_map}
+        self.assertEqual(
+            mapped_names,
+            consumer_names,
+            "every consumer of the marker must get its own map entry",
+        )
+        self.assertEqual(set(marker_map.values()), {0})
+
+        for (name, dep), _dim in marker_map.items():
+            self.assertEqual(
+                dep.name,
+                marker_input_name,
+                f"{name}'s mapped dep must name the marker's own upstream "
+                "input, i.e. be the post-inline read",
+            )
+            self.assertEqual(
+                dep.index.coeff(loop_var),
+                marker_own_index.coeff(loop_var),
+                f"{name}'s post-inline read lost or altered the marker's "
+                f"own per-trip advance term ({loop_var}) -- got "
+                f"{dep.index!r}, marker's own index is {marker_own_index!r}. "
+                "Every consumer must have the marker's real coordinate "
+                "transform composed in, not just the first one.",
+            )
+
+        self.assertEqual(
+            _marker_resolution(marker_op),
+            MarkerResolution.INLINE_ERASED,
+            "with both consumers inlined, the marker no longer needs to be "
+            "materialized",
+        )
+        self.assertNotIn(marker_op, graph.operations)
+        self.assertNotIn(marker_op, group_ops)
 
     def test_split_k_marker_resolves_reduction_dim(self):
         """IR-level value assertion for split_k_fn's reduction-dim marker.
@@ -1302,27 +1490,25 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
             "conditioned on the mentions_loop_var check",
         )
 
-    def test_consume_tile_dim_markers_raises_on_wrong_consumer_count(self):
+    def test_consume_tile_dim_markers_raises_on_zero_consumers_maps_two(self):
         """_consume_tile_dim_markers's consumer-count guard (F4.3).
 
-        A tile_dim_marker op is expected to have exactly one consuming
-        read within its spliced body (for_each_tile_lowering.py,
-        ~line 762-769). Zero consumers or more than one are both
-        unrecognized shapes and must raise AssertionError rather than
-        silently pick a default -- untested anywhere in this file before
-        this test. Covers both wrong-count shapes in one test (zero, then
-        two), each built directly via this class's established
-        mock.Mock(spec=[...]) convention (see TestSpliceWhileLoop above)
-        rather than a full torch.compile. The zero-consumer shape is
-        believed unreachable through the ordinary lowering path, which is
-        why it needs direct construction to exercise at all. The
-        two-consumer shape is NOT unreachable: it is reached for real by
-        for_each_tile_fixtures.py's sibling_nested_fn/sibling_nested_
-        stardep_fn (two independent WhileLoops both consuming a single
-        outer marker on their shared tiled operand via StarDep -- see
-        those fixtures' docstrings, issue #4581 territory). It is still
-        built directly here too, for a fast, isolated unit test of the
-        guard itself rather than a full torch.compile round-trip.
+        A tile_dim_marker op is expected to have at least one consuming
+        read within its spliced body. Zero consumers is an unrecognized
+        shape and must raise AssertionError rather than silently pick a
+        default. Two or more is NOT: a marker whose tile is read by
+        several ops is resolved once per consumer, and every one of them
+        must land in the returned map -- the shape paged attention needs
+        (for_each_tile_fixtures.py's paged_gather_kv_fn: one page index,
+        one index_select per cache) and the shape
+        sibling_nested_fn/sibling_nested_stardep_fn reach via two
+        independent WhileLoops sharing one outer marker (issue #4581
+        territory; see those fixtures' docstrings). This test pins both
+        halves of that contract on mocks -- fast and isolated, per this
+        class's established mock.Mock(spec=[...]) convention (see
+        TestSpliceWhileLoop above) -- with
+        test_marker_with_two_computed_buffer_consumers_maps_both below
+        covering the multi-consumer case through a real lowering.
         """
         import sympy
 
@@ -1375,10 +1561,13 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
         zero_graph.operations = zero_operations
 
         with V.set_graph_handler(zero_graph):
-            with self.assertRaisesRegex(AssertionError, r"has 0 consuming reads"):
+            with self.assertRaisesRegex(AssertionError, r"no consuming read"):
                 _consume_tile_dim_markers(zero_group_ops, zero_operations)
 
         # Two consumers: two distinct ops both read the marker's output.
+        # Neither mock carries `.data`, so both take the StarDep branch --
+        # the marker stays materialized and both consumers must still be
+        # mapped, each under its own name.
         two_marker_op = make_marker_op()
         consumer_a = make_consumer("consumer_a")
         consumer_b = make_consumer("consumer_b")
@@ -1389,8 +1578,21 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
         two_graph.operations = two_operations
 
         with V.set_graph_handler(two_graph):
-            with self.assertRaisesRegex(AssertionError, r"has 2 consuming reads"):
-                _consume_tile_dim_markers(two_group_ops, two_operations)
+            marker_map = _consume_tile_dim_markers(two_group_ops, two_operations)
+
+        self.assertEqual(
+            sorted(name for name, _dep in marker_map),
+            ["consumer_a", "consumer_b"],
+            "both consumers of the one marker must be mapped -- dropping "
+            "either silently loses that op's tiled-dim provenance",
+        )
+        self.assertEqual(set(marker_map.values()), {0})
+        self.assertIn(
+            two_marker_op,
+            two_operations,
+            "a StarDep-shaped consumer keeps the marker materialized, and "
+            "two of them must not change that",
+        )
 
     def test_consume_tile_dim_markers_stamps_marker_resolution(self):
         """_consume_tile_dim_markers stamps tile_marker_resolution per marker.
@@ -1405,7 +1607,7 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
         change, now observable through the new field.
 
         The StarDep consumer is a bare mock.Mock(spec=[...]), matching
-        test_consume_tile_dim_markers_raises_on_wrong_consumer_count's
+        test_consume_tile_dim_markers_raises_on_zero_consumers_maps_two's
         convention -- that branch never calls get_read_writes() on
         anything but the mocked reads list. The inline-erase branch is
         different: _inline_marker_into_consumer/replace_computed_buffer_body
@@ -1945,25 +2147,31 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
 
     def test_sibling_nested_resolves_correctly(self):
         """Two sibling (non-nested) for_each_tile loops sharing one outer
-        marker do NOT compile -- a real, already triple-confirmed
-        architectural gap, not a fixture bug.
+        marker still do NOT compile -- but no longer at the marker pass.
 
         sibling_nested_fn's outer for_each_tile stamps exactly one dim=0
         marker on x_tile, and hands that same x_tile directly to both
         sibling_a's and sibling_b's inner for_each_tile calls. Each lowers
         to its own WhileLoop op, so the single marker ends up with 2
-        consuming reads via StarDep -- but _consume_tile_dim_markers's
-        hard assertion requires exactly 1. This is issue #4581 territory
-        (out of scope for this plan); see sibling_nested_fn's docstring in
+        consuming reads via StarDep. _consume_tile_dim_markers used to
+        assert on the second one; it now resolves every consumer (the
+        multi-consumer shape paged attention needs -- see
+        paged_gather_kv_fn and
+        test_marker_with_two_computed_buffer_consumers_maps_both), so this
+        fixture gets past that pass and lands in the SAME downstream
+        OpSpecValidationError symbol-consistency gap
+        triple_nested_stardep_multilevel_fn hits above (issue #4581
+        follow-up OS-5). See sibling_nested_fn's docstring in
         for_each_tile_fixtures.py for the full mechanism writeup. This test
         asserts (a) the eager reference is correct on its own (no device,
-        no compile) and (b) compiling raises the documented assertion,
-        matched on a naming-independent substring so it survives unrelated
-        upstream op-naming shifts.
+        no compile) and (b) compiling no longer fails in the marker pass,
+        and if it fails at all it is that one known downstream gap -- so a
+        future fix for OS-5 makes this test pass rather than needing an
+        edit, while a regression back to the one-consumer assertion fails
+        it.
         """
         import torch
         import torch_spyre  # noqa: F401
-        import pytest
         from torch._inductor.exc import InductorError
         from torch_spyre.constants import DEVICE_NAME
         from tests.inductor.for_each_tile_fixtures import (
@@ -1980,32 +2188,37 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
 
         X_dev = X.to(DEVICE_NAME)
         Y_dev = Y.to(DEVICE_NAME)
-        with pytest.raises(
-            InductorError, match="consuming reads within its spliced body"
-        ):
+        try:
             capture_post_grad_while_loop(sibling_nested_fn, (X_dev, Y_dev))
+        except InductorError as exc:
+            self.assertIn(
+                "OpSpecValidationError",
+                str(exc),
+                "expected the known #4581 follow-up OS-5 symbol-consistency "
+                f"gap, got a different InductorError: {exc!r}",
+            )
 
     def test_sibling_nested_stardep_resolves_correctly(self):
         """Two sibling for_each_tile loops, one STAR_DEP_KEPT and one
-        INLINE_ERASED, sharing one outer marker, do NOT compile -- the same
-        real, already triple-confirmed architectural gap as
+        INLINE_ERASED, sharing one outer marker, still do NOT compile --
+        the same remaining downstream gap as
         test_sibling_nested_resolves_correctly.
 
         sibling_nested_stardep_fn is structurally identical to
         sibling_nested_fn in the way that matters here: a single outer
         dim=0 marker on x_tile is handed directly to two sibling inner
         for_each_tile calls, each becoming its own WhileLoop consumer of
-        that one marker via StarDep -- 2 consuming reads where
-        _consume_tile_dim_markers requires exactly 1. See
+        that one marker via StarDep. _consume_tile_dim_markers resolves
+        both of them now (see test_sibling_nested_resolves_correctly), so
+        what is left is the known OS-5 symbol-consistency gap. See
         sibling_nested_stardep_fn's docstring in for_each_tile_fixtures.py
         for the full mechanism writeup. This test asserts (a) the eager
         reference is correct on its own (no device, no compile) and (b)
-        compiling raises the documented assertion, matched on a naming-
-        independent substring.
+        compiling either succeeds or fails only in that one known
+        downstream gap.
         """
         import torch
         import torch_spyre  # noqa: F401
-        import pytest
         from torch._inductor.exc import InductorError
         from torch_spyre.constants import DEVICE_NAME
         from tests.inductor.for_each_tile_fixtures import (
@@ -2022,10 +2235,15 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
 
         X_dev = X.to(DEVICE_NAME)
         Y_dev = Y.to(DEVICE_NAME)
-        with pytest.raises(
-            InductorError, match="consuming reads within its spliced body"
-        ):
+        try:
             capture_post_grad_while_loop(sibling_nested_stardep_fn, (X_dev, Y_dev))
+        except InductorError as exc:
+            self.assertIn(
+                "OpSpecValidationError",
+                str(exc),
+                "expected the known #4581 follow-up OS-5 symbol-consistency "
+                f"gap, got a different InductorError: {exc!r}",
+            )
 
     def test_nested_for_each_tile_markers_snapshot_catches_noop_splice_stub(self):
         """Mutation coverage for the snapshot fix above.

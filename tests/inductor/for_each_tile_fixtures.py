@@ -487,24 +487,25 @@ def sibling_nested_fn(X: torch.Tensor, Y: torch.Tensor) -> torch.Tensor:
     x_tile with an elementwise scale, and the two partials are summed. Both
     sibling loops route their tiles through elementwise ops first.
 
-    NOTE (Step 2 finding): This fixture is currently UNCOMPILABLE due to an
-    unhandled architectural case. There is exactly ONE marker here: the
-    outer for_each_tile's own dim=0 marker on x_tile itself (stamped once,
-    by the outer loop, before either sibling runs). x_tile is then handed
-    directly as an operand to both sibling_a's and sibling_b's inner
-    for_each_tile calls, each of which lowers to its own WhileLoop op. Both
-    WhileLoops end up as consumers of the single x_tile marker via StarDep
-    (whole-tensor, name-only dependency) -- so the marker has 2 consuming
-    reads, not 1. _consume_tile_dim_markers explicitly rejects markers with
-    2+ consuming reads via an assertion: "expected exactly one." This is
-    issue #4581 territory -- the sibling-nesting pattern exposes a gap in
-    the marker-resolution design where multiple independent WhileLoops at
-    the same nesting level consume a single outer tiled operand. The bug
-    site is this outer x_tile hand-off, NOT inside either sibling's own
-    K-tiling body -- don't go looking for duplicated K-dim markers there.
-    Future work: extend _consume_tile_dim_markers to handle this
-    multi-consumer case, or document it as an unsupported pattern. Fixture
-    retained as a structural probe and as documentation of this limitation.
+    NOTE: This fixture is still UNCOMPILABLE, but no longer at the marker
+    pass. There is exactly ONE marker here: the outer for_each_tile's own
+    dim=0 marker on x_tile itself (stamped once, by the outer loop, before
+    either sibling runs). x_tile is then handed directly as an operand to
+    both sibling_a's and sibling_b's inner for_each_tile calls, each of
+    which lowers to its own WhileLoop op. Both WhileLoops end up as
+    consumers of the single x_tile marker via StarDep (whole-tensor,
+    name-only dependency) -- so the marker has 2 consuming reads, not 1.
+    _consume_tile_dim_markers now resolves every consumer of a marker
+    rather than asserting on the second one (the multi-consumer shape
+    paged attention needs -- see paged_gather_kv_fn below), so this fixture
+    now gets past that pass and fails further downstream instead, in the
+    same OpSpecValidationError symbol-consistency gap that
+    triple_nested_stardep_multilevel_fn hits (issue #4581 follow-up OS-5:
+    an inner-level `u`-symbol reaching an OpSpec whose iteration_space only
+    has the outer level's `c` keys). The bug site is still this outer
+    x_tile hand-off, NOT inside either sibling's own K-tiling body -- don't
+    go looking for duplicated K-dim markers there. Fixture retained as a
+    structural probe and as documentation of the remaining limitation.
     """
 
     def outer_body(_, ops):
@@ -567,19 +568,21 @@ def sibling_nested_stardep_fn(X: torch.Tensor, Y: torch.Tensor) -> torch.Tensor:
     its matmul directly (no intervening elementwise op), while sibling B
     routes through elementwise.
 
-    NOTE (Step 2 finding): This fixture is currently UNCOMPILABLE for the
-    same architectural reason as sibling_nested_fn: there is exactly ONE
-    marker, the outer for_each_tile's dim=0 marker on x_tile itself, and
-    x_tile is handed directly to both sibling_a's and sibling_b's inner
-    for_each_tile calls. Each lowers to its own WhileLoop op, and both
-    WhileLoops consume the single x_tile marker via StarDep -- giving it 2
-    consuming reads instead of 1. The current _consume_tile_dim_markers
-    machinery rejects markers with 2+ consuming reads. This is issue #4581
-    territory; the bug site is the outer x_tile hand-off, not inside either
-    sibling's own K-tiling body. The intended differentiation (sibling A
-    STAR_DEP_KEPT, sibling B INLINE_ERASED) cannot be observed until the
-    multi-consumer marker case
-    is handled. Fixture retained as a structural probe for the eventual fix.
+    NOTE: This fixture is still UNCOMPILABLE for the same remaining reason
+    as sibling_nested_fn: there is exactly ONE marker, the outer
+    for_each_tile's dim=0 marker on x_tile itself, and x_tile is handed
+    directly to both sibling_a's and sibling_b's inner for_each_tile calls.
+    Each lowers to its own WhileLoop op, and both WhileLoops consume the
+    single x_tile marker via StarDep -- giving it 2 consuming reads instead
+    of 1. _consume_tile_dim_markers now resolves both of them (see
+    sibling_nested_fn's own note), so the failure has moved downstream to
+    the same OpSpecValidationError symbol-consistency gap
+    triple_nested_stardep_multilevel_fn hits (issue #4581 follow-up OS-5).
+    The bug site is the outer x_tile hand-off, not inside either sibling's
+    own K-tiling body. The intended differentiation (sibling A
+    STAR_DEP_KEPT, sibling B INLINE_ERASED) still cannot be observed end to
+    end until that downstream gap is closed. Fixture retained as a
+    structural probe for the eventual fix.
     """
 
     def outer_body(_, ops):
@@ -780,6 +783,74 @@ def paged_gather_reference(pages: torch.Tensor, q: torch.Tensor) -> torch.Tensor
     for p in PAGE_ORDER:
         page = pf[p]
         acc = acc + (qf @ page.transpose(0, 1)) @ page
+    return acc
+
+
+def paged_gather_kv_inputs() -> tuple[
+    torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+]:
+    """(k pages, v pages, block table, query) -- two pools, one shared index."""
+    torch.manual_seed(0)
+    k_pages = torch.randn(PAGE_POOL, PAGE_SIZE, PAGE_HS, dtype=torch.float16)
+    v_pages = torch.randn(PAGE_POOL, PAGE_SIZE, PAGE_HS, dtype=torch.float16)
+    q = torch.randn(PAGE_LQ, PAGE_HS, dtype=torch.float16)
+    table = torch.zeros(PAGE_BLOCKS, INT32_ELEMS_PER_STICK, dtype=torch.int32)
+    for i, page in enumerate(PAGE_ORDER):
+        table[i, 0] = page
+    return k_pages, v_pages, table, q
+
+
+def paged_gather_kv_fn(
+    k_pages: torch.Tensor,
+    v_pages: torch.Tensor,
+    table: torch.Tensor,
+    q: torch.Tensor,
+) -> torch.Tensor:
+    """paged_gather_fn with separate K and V pools -- ONE marker, TWO consumers.
+
+    The only structural difference from paged_gather_fn is the one that
+    matters to _consume_tile_dim_markers: the page index sliced out of the
+    tiled block table feeds two ``index_select``s (K's page and V's page)
+    instead of one, so the block table's single dim=0 tile_dim_marker ends up
+    with two consuming reads, both ComputedBuffer/MemoryDep-shaped. That is
+    exactly what spyre-inference's page_attn_kernel does, and it is the shape
+    an earlier "expected exactly one consumer" assertion in that pass
+    rejected outright.
+
+    Keeping K and V in separate matmuls (Q@K^T, then P@V) matters too: with
+    one shared pool, or with both gathers feeding a single elementwise
+    expression, Inductor fuses the two gathers into one pointwise
+    ComputedBuffer whose two identical marker deps dedupe to a single read --
+    which silently does not exercise the multi-consumer path at all.
+    """
+
+    def body(acc, tiles):
+        table_row, k_all, v_all, q_whole = tiles
+        page_idx = table_row[0, 0:1]
+        k_page = k_all.index_select(0, page_idx).squeeze(0)
+        v_page = v_all.index_select(0, page_idx).squeeze(0)
+        scores = q_whole @ k_page.transpose(0, 1)
+        return acc + scores @ v_page, None
+
+    acc0 = torch.zeros(PAGE_LQ, PAGE_HS, device=q.device, dtype=q.dtype)
+    final, _ = for_each_tile(
+        body,
+        (table, k_pages, v_pages, q),
+        dims=(0, None, None, None),
+        tile_size=1,
+        init=acc0,
+    )
+    return final
+
+
+def paged_gather_kv_reference(
+    k_pages: torch.Tensor, v_pages: torch.Tensor, q: torch.Tensor
+) -> torch.Tensor:
+    """The same accumulation in fp32 on CPU, looped in Python over PAGE_ORDER."""
+    kf, vf, qf = k_pages.float(), v_pages.float(), q.float()
+    acc = torch.zeros(PAGE_LQ, PAGE_HS)
+    for p in PAGE_ORDER:
+        acc = acc + (qf @ kf[p].transpose(0, 1)) @ vf[p]
     return acc
 
 

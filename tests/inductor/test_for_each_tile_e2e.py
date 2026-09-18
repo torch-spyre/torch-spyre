@@ -51,6 +51,9 @@ from tests.inductor.for_each_tile_fixtures import (
     online_softmax_reference,
     paged_gather_fn,
     paged_gather_inputs,
+    paged_gather_kv_fn,
+    paged_gather_kv_inputs,
+    paged_gather_kv_reference,
     paged_gather_reference,
     split_k_fn,
     split_m_fn,
@@ -190,6 +193,34 @@ class TestForEachTileE2E(unittest.TestCase):
         # Looser than the class defaults: the accumulator sums four
         # score-weighted pages of magnitude ~sqrt(head_size), so fp16 matmul
         # rounding alone reaches a couple of absolute units here.
+        torch.testing.assert_close(out.cpu().float(), ref, atol=2.0, rtol=0.05)
+
+    def test_gather_mode_paged_pages_kv(self):
+        """Kind.GATHER with separate K and V pools: one marker, two consumers.
+
+        Numerics for the shape spyre-inference's page_attn_kernel actually
+        has (see paged_gather_kv_fn): the page index sliced out of the tiled
+        block table feeds an index_select per cache, so the table's single
+        tile_dim_marker has two consuming reads. Compilation alone is
+        covered device-lessly by
+        TestConsumeTileDimMarkers.test_marker_with_two_computed_buffer_
+        consumers_maps_both; what only the device can show is whether the
+        marker's per-trip advance was composed into BOTH gathers. Getting
+        that wrong for one of them re-reads page PAGE_ORDER[0]'s K (or V)
+        on every trip -- a large mismatch here, and invisible on CPU.
+        """
+        k_pages, v_pages, table, q = paged_gather_kv_inputs()
+        ref = paged_gather_kv_reference(k_pages, v_pages, q)
+
+        compiled = torch.compile(paged_gather_kv_fn, backend="inductor", fullgraph=True)
+        out = compiled(
+            k_pages.to(DEVICE_NAME),
+            v_pages.to(DEVICE_NAME),
+            table.to(DEVICE_NAME),
+            q.to(DEVICE_NAME),
+        )
+
+        # Same tolerance rationale as test_gather_mode_paged_pages above.
         torch.testing.assert_close(out.cpu().float(), ref, atol=2.0, rtol=0.05)
 
 

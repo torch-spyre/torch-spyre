@@ -1339,10 +1339,12 @@ class SpyreKernel(Kernel[CSEVariable]):
             ]
             self.op_specs.append(self.create_op_spec(value.op, True, args, op_info))
 
-    def wrap_op_specs_in_loop(self, count: sympy.Expr) -> None:
+    def wrap_op_specs_in_loop(
+        self, count: sympy.Expr, max_count: int | None = None
+    ) -> None:
         """Replace the current op_specs list with a single LoopSpec of the given count."""
         body = self.op_specs
-        self.op_specs = [LoopSpec(count=count, body=body)]
+        self.op_specs = [LoopSpec(count=count, body=body, max_count=max_count)]
 
     def check_op_specs(self) -> None:
         """Validate and log the finished operation sequence after loop wrapping."""
@@ -1460,6 +1462,22 @@ class SpyreKernel(Kernel[CSEVariable]):
         )
         call_args.extend(self._live_call_arg_names)
 
+        symbolic_counts = {
+            V.graph.sizevars.simplify(loop.count)
+            for loop in _iter_loop_specs(self.op_specs)
+            if loop.count.free_symbols
+        }
+        if len(symbolic_counts) > 1:
+            raise Unsupported(
+                "one Spyre kernel cannot yet contain independently dynamic "
+                f"loop counts: {sorted(map(str, symbolic_counts))}"
+            )
+        if symbolic_counts:
+            count = next(iter(symbolic_counts))
+            for symbol in count.free_symbols:
+                wrapper.ensure_size_computed(symbol)
+            call_args.append(f"loop_count={wrapper.codegen_sizevar(count)}")
+
         call_args_str = ", ".join(call_args)
         wrapper.writeline(f"{name}.run({call_args_str})")
         if emit_pool_tensor:
@@ -1527,6 +1545,13 @@ def _iter_op_specs(specs):
             yield item
 
 
+def _iter_loop_specs(specs):
+    for item in specs:
+        if isinstance(item, LoopSpec):
+            yield item
+            yield from _iter_loop_specs(item.body)
+
+
 def uses_hbm_pool(specs) -> bool:
     """Return True if any op in ``specs`` references an HBM-pool-allocated tensor.
 
@@ -1552,6 +1577,8 @@ def _codegen_op_spec_list(specs, buf: IndentedBuffer, sympy_str) -> None:
             buf.writeline("LoopSpec(")
             with buf.indent():
                 buf.writeline(f"count={sympy_str(op_spec.count)},")
+                if op_spec.max_count is not None:
+                    buf.writeline(f"max_count={op_spec.max_count},")
                 buf.writeline("body=[")
                 with buf.indent():
                     _codegen_op_spec_list(op_spec.body, buf, sympy_str)

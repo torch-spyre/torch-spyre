@@ -413,6 +413,8 @@ class LoopSpec:
 
     Attributes:
         count: Trip count of the loop. May be a symbolic shape expression.
+        max_count: Concrete planning extent for a symbolic count. ``None`` for
+            an ordinary concrete loop.
         body: The operations to execute each iteration. Each element may be
             an OpSpec, UnimplementedOp, or a nested LoopSpec.
 
@@ -427,6 +429,7 @@ class LoopSpec:
     # list[OpSpec | UnimplementedOp | LoopSpec], typed as Any to accommodate
     # the two distinct UnimplementedOp types (op_spec vs spyre_kernel).
     body: list[Any]
+    max_count: int | None = None
 
 
 def spyre_constant_tensor(const_val, device, dtype=torch.float16):

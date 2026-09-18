@@ -295,6 +295,8 @@ class CoarseTileInfo:
     loop_count:
         List of trip counts, one per nesting level from outermost to
         innermost.  ``len(loop_count) == len(loop_group_id)`` always holds.
+        These are concrete planning maxima. A runtime-specialized loop keeps
+        its upstream backed expression separately in ``runtime_loop_count``.
     loop_tiled_dims:
         List of lists, one sub-list per nesting level.  Each sub-list
         contains the ``data.ranges`` positional indices that are tiled at
@@ -369,6 +371,9 @@ class CoarseTileInfo:
         Planned decision for how this op's result crosses its loop
         boundary, computed by ``_plan_tiling_propagation``. ``None`` until
         that planning stage runs (or for ops it doesn't cover).
+    runtime_loop_count:
+        Optional upstream-backed expression used only for ``LoopSpec.count``.
+        Buffer geometry and address planning continue to use ``loop_count``.
     """
 
     loop_group_id: tuple[int, ...]
@@ -386,6 +391,7 @@ class CoarseTileInfo:
         default_factory=list
     )
     propagation: "PropagationPlan | None" = None
+    runtime_loop_count: sympy.Expr | None = None
 
 
 # ---------------------------------------------------------------------------

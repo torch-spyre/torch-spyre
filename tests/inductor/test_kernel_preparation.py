@@ -34,6 +34,7 @@ import torch_spyre._inductor.scheduler as scheduler_module
 import torch_spyre._inductor.scratchpad.lx_relayout as lx_relayout_module
 from torch_spyre._inductor import config
 from torch_spyre._inductor.ir import FixedTiledLayout
+from torch_spyre._inductor.op_spec import LoopSpec
 from torch_spyre._inductor.pass_utils import PerCoreView
 from torch_spyre._inductor.spyre_kernel import SpyreKernel, _iter_op_specs
 
@@ -204,6 +205,27 @@ def test_a_pooled_mutation_destination_leaves_the_external_argument_list():
         assert result_arg.arg_index == 0
         kernel.call_kernel("prepared")
         assert emitted == ["prepared.run(result)"]
+
+
+def test_dynamic_loop_count_is_emitted_as_keyword_without_shifting_args():
+    emitted = []
+    count = sympy.Symbol("s0", integer=True, positive=True)
+    graph = SimpleNamespace(
+        wrapper_code=SimpleNamespace(
+            writeline=emitted.append,
+            ensure_size_computed=lambda _symbol: None,
+            codegen_sizevar=str,
+        ),
+        sizevars=SimpleNamespace(simplify=lambda expr: expr),
+    )
+
+    with V.set_graph_handler(graph):
+        kernel = SpyreKernel()
+        kernel._live_call_arg_names = ["arg0", "arg1"]
+        kernel.op_specs = [LoopSpec(count=count, body=[], max_count=8)]
+        kernel.call_kernel("dynamic")
+
+    assert emitted == ["dynamic.run(arg0, arg1, loop_count=s0)"]
 
 
 # --- the real compile -------------------------------------------------------

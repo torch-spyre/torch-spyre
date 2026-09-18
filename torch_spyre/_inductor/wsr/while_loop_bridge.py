@@ -928,9 +928,15 @@ def splice_while_loop(
         name_map[placeholder_name] = real_name
         ref_map[placeholder_name] = real_input
 
+    additional_inputs = getattr(while_op, "additional_inputs", None)
+    if not isinstance(additional_inputs, (list, tuple)):
+        additional_inputs = while_op.inputs[len(while_op.carried_inputs) :]
+    real_inputs = [*while_op.carried_inputs, *additional_inputs]
     for i in range(len(carries), len(body_graph_input_names)):
         placeholder_name = body_graph_input_names[i]
-        real_input = while_op.inputs[i]
+        real_input = real_inputs[i]
+        if not hasattr(real_input, "get_name"):
+            continue
         real_name = real_input.get_name()
         name_map[placeholder_name] = real_name
         ref_map[placeholder_name] = real_input
