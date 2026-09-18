@@ -2197,7 +2197,17 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         decision variables. The extractor reads each arg's symbolic residency
         from ``is_lx`` (built once by the caller over all of ``buffers``, not
         per op); ``buffers`` itself supplies this op's own candidate divisions.
+
+        The coarse tiling is the third undecided thing, and the one this
+        allocator used to hide from the model entirely: ``_post_solve`` applies
+        the solver's chosen tilings *after* this runs, so every op was extracted
+        at ``loop_trip=1`` and the expression carried no tiling at all. The
+        buffer's ``sym_tile_counts`` is that decision as symbols, one per axis
+        its tiling space offers a level on, and is empty for every engine and
+        every configuration that cannot choose one -- which is what leaves the
+        expression exactly as it was.
         """
+        from torch_spyre._inductor.cost_model import ProspectiveTiling
         from torch_spyre._inductor.dump_cost_model import extract_op_features
         from torch_spyre._inductor.scratchpad.sa_cooptimizer import _work_slices
 
@@ -2205,7 +2215,9 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         buffer = buffers[output_name]
         division = CoreDivision(splits=buffer.sym_core_divs)
         ws = _work_slices(op, division)
-        return extract_op_features(op, ws, is_lx=is_lx)
+        tile_counts = buffer.sym_tile_counts
+        tiling = ProspectiveTiling(tile_counts) if tile_counts else None
+        return extract_op_features(op, ws, is_lx=is_lx, tiling=tiling)
 
     def _finalize_lx_relayout_allocation(
         self,
