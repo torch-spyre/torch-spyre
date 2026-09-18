@@ -660,10 +660,10 @@ class TestBuildingBlocks(unittest.TestCase):
         dense flattening ``L * batch + sequence``.  Input padding must account
         for all batches instead of assuming one symbol per physical dimension.
         """
-        group, heads, head_dim = 2, 12, 64
+        heads, head_dim = 12, 64
         generator = torch.Generator().manual_seed(4676)
-        for extent in (63, 64):
-            with self.subTest(extent=extent):
+        for group, extent in ((2, 63), (2, 64), (4, 512)):
+            with self.subTest(group=group, extent=extent):
                 rows = group * extent
                 q, k, v = (
                     torch.randn(
