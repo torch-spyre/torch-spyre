@@ -110,6 +110,19 @@ class TestSDPATiling(unittest.TestCase):
         self.assertEqual(config.score_bytes_per_core, 192 * 1024)
         self.assertEqual(config.estimated_live_bytes_per_core, 443136)
 
+    def test_batch_coarse_tiling_reduces_per_core_live_footprint(self):
+        config = self._select(batch_size=4, head_dim=64)
+
+        self.assertEqual(config.strategy, "work_divided")
+        self.assertEqual(config.kv_block_size, 512)
+        self.assertEqual(config.num_kv_blocks, 1)
+        self.assertEqual(
+            config.work_div,
+            {"num_heads": 4, "max_seqlen_q": 8, "max_seqlen_kv": 8},
+        )
+        self.assertEqual(config.score_bytes_per_core, 384 * 1024)
+        self.assertEqual(config.estimated_live_bytes_per_core, 886272)
+
     def test_low_head_long_mha_uses_query_only_work_division(self):
         for num_heads in (2, 4, 8):
             with self.subTest(num_heads=num_heads):

@@ -146,6 +146,11 @@ def _sdpa_num_head_tiles(num_heads: int) -> int:
     return 1
 
 
+def _sdpa_num_batch_tiles(batch_size: int) -> int:
+    """Return the batch split count shared by lowering and the cost model."""
+    return max(1, batch_size // 2)
+
+
 def _num_tiles_for_max_extent(
     sequence_length: int, max_extent: int, *, tile_alignment: int = 1
 ) -> int:
@@ -525,8 +530,13 @@ def _select_sdpa_tiling(
     elif not is_decode and work_div is None:
         reason = "no exact head/sequence work division"
     else:
+        num_batch_tiles = _sdpa_num_batch_tiles(batch_size)
+        batch_rows_per_tile = (batch_size + num_batch_tiles - 1) // num_batch_tiles
         candidates = _sdpa_kv_candidates(
-            batch_size=batch_size,
+            # The outer coarse tile limits every kernel to one batch tile.
+            # Charging all physical batch rows here can reject an otherwise
+            # LX-feasible K/V block and introduce an unnecessary Lk loop.
+            batch_size=batch_rows_per_tile,
             num_heads=num_heads,
             num_kvheads=num_kvheads,
             max_seqlen_q=max_seqlen_q,
@@ -1379,7 +1389,7 @@ def spyre__sdpa_overrideable(
                 f"length, got {attn_bias.size(-1)} and {max_seqlen_kv}"
             )
 
-    with spyre_hint(tiles={"batch_size": max(1, batch_size // 2)}):
+    with spyre_hint(tiles={"batch_size": _sdpa_num_batch_tiles(batch_size)}):
         head_tiles = {} if use_gqa else {"num_heads": tiling.num_head_tiles}
         with spyre_hint(tiles=head_tiles):
             with (
