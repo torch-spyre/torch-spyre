@@ -212,7 +212,11 @@ class TimingRecorder:
 
     def dump_json(self, path: str) -> None:
         """Write the record. Safe to call more than once; each call rewrites it."""
-        tmp = f"{path}.tmp"
+        # The pid is in the temp name, not just in ``path``: an explicit destination
+        # passed to dump_and_finalize is written verbatim, so two processes sharing one
+        # would otherwise share a temp file and each could rename the other's
+        # half-written copy into place -- the exact truncation the rename prevents.
+        tmp = f"{path}.{os.getpid()}.tmp"
         with open(tmp, "w") as handle:
             # default=str: a call site may record a sympy expression or a dtype,
             # and losing the whole record to one unserializable value is worse
@@ -252,11 +256,16 @@ class TimingRecorder:
         if error is not None:
             event.error = error
         stack = self._stack()
-        # Unwind to and including this event: a region that raised past its own
-        # __exit__ would otherwise leave the stack skewed for every later timer.
-        while stack:
-            if stack.pop() is event:
-                break
+        # Unwind to and including this event, but only if it is on this thread's
+        # stack: a region entered on another thread, or closed twice, is not, and
+        # popping regardless would orphan every open parent -- their children would
+        # then record parent_ordinal None and no longer nest under the compile that
+        # produced them. Identity, not equality: _Event is a dataclass, so == would
+        # match a different event whose fields happen to agree.
+        if any(open_event is event for open_event in stack):
+            while stack:
+                if stack.pop() is event:
+                    break
 
     def _stack(self) -> list[_Event]:
         stack = getattr(self._stack_local, "stack", None)
@@ -331,6 +340,13 @@ def _git_sha(path: str) -> str:
 
 def _run_metadata() -> dict[str, Any]:
     """Substrate a record was produced on.
+
+    Read when the record is written rather than when the regions were timed, which
+    is safe because every field is fixed for the life of the process: the versions
+    and paths cannot change, and the config values come from the environment at
+    import. A caller that patches config programmatically mid-run is the one case
+    where the two differ, and a per-compile fact belongs on that compile's own
+    ``stage:compile_fx:spyre_compile`` event instead.
 
     A record that cannot say which torch-spyre it measured cannot be compared
     against a later one. ``torch_spyre.version`` appends the short sha only for

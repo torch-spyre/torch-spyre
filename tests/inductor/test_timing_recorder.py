@@ -18,6 +18,7 @@
 import contextlib
 import json
 import os
+import pathlib
 import threading
 from unittest.mock import MagicMock, patch
 
@@ -25,7 +26,7 @@ import pytest
 import torch
 
 from torch_spyre._inductor import config, timing_recorder
-from torch_spyre._inductor.timing_recorder import TimingRecorder
+from torch_spyre._inductor.timing_recorder import TimingRecorder, _Event
 
 
 @pytest.fixture(autouse=True)
@@ -129,6 +130,71 @@ class TestRecorder:
         # Ordinals are unique across threads.
         ordinals = [event.ordinal for event in recorder.events]
         assert len(set(ordinals)) == len(ordinals)
+
+    def test_closing_a_foreign_event_leaves_the_stack_alone(self):
+        """A close for an event that is not open here must not unwind what is.
+
+        Otherwise every open parent is orphaned and its later children record
+        parent_ordinal None, which detaches them from the compile that produced them.
+        """
+        recorder = TimingRecorder()
+        outer = recorder.stage("outer")
+        outer_event = outer.__enter__()
+
+        # An event this thread never opened: closing it must be a no-op on the stack.
+        foreign = _Event(
+            name="elsewhere", ordinal=999, parent_ordinal=None, t_start_ns=1
+        )
+        recorder._close_event(foreign, None)
+
+        with recorder.stage("inner") as inner:
+            pass
+        outer.__exit__(None, None, None)
+
+        assert inner.parent_ordinal == outer_event.ordinal
+        assert outer_event.parent_ordinal is None
+
+    def test_equal_but_distinct_events_are_not_confused(self):
+        """_Event is a dataclass, so == matches on fields; unwinding needs identity."""
+        recorder = TimingRecorder()
+        outer = recorder.stage("outer")
+        outer_event = outer.__enter__()
+
+        twin = _Event(
+            name=outer_event.name,
+            ordinal=outer_event.ordinal,
+            parent_ordinal=outer_event.parent_ordinal,
+            t_start_ns=outer_event.t_start_ns,
+        )
+        assert twin == outer_event  # equal by value
+        recorder._close_event(twin, None)
+
+        with recorder.stage("inner") as inner:
+            pass
+        assert inner.parent_ordinal == outer_event.ordinal
+
+    def test_temp_file_is_private_to_this_process(self, tmp_path):
+        """This process must not write through, or rename away, a shared temp name.
+
+        An explicit destination is written verbatim, so two processes can be pointed
+        at one path. If the temp name were derived from the destination alone they
+        would share it, and either could rename the other's half-written copy into
+        place -- the very truncation the atomic rename exists to prevent. The file
+        planted at the unqualified name stands in for that other process.
+        """
+        recorder = TimingRecorder()
+        with recorder.stage("only"):
+            pass
+        recorder.finalize()
+
+        path = os.fspath(tmp_path / "record.json")
+        someone_else = pathlib.Path(f"{path}.tmp")
+        someone_else.write_text("another process is mid-write")
+
+        recorder.dump_json(path)
+
+        assert json.loads(pathlib.Path(path).read_text())["events"]
+        assert someone_else.read_text() == "another process is mid-write"
 
     def test_dump_writes_one_record_and_no_leftovers(self, tmp_path):
         recorder = TimingRecorder()
