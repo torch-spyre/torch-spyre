@@ -21,6 +21,7 @@ from torch._inductor.ir import FixedLayout
 
 import torch_spyre._inductor.spyre_kernel as spyre_kernel_module
 from torch_spyre._C import DataFormats, ElementArrangement
+from torch_spyre._inductor.loop_info import CoarseTileInfo
 from torch_spyre._inductor.propagate_hints import DimHint
 from torch_spyre._inductor.propagate_layouts import _real_layout_matches_op_size
 from torch_spyre._inductor.spyre_kernel import SpyreKernel, TensorAccess
@@ -81,7 +82,13 @@ def test_spliced_loop_symbol_is_removed_from_tensor_base_coordinates():
                 is_reduction=False,
                 loop_var_range=8,
             )
-        ]
+        ],
+        loop_info=CoarseTileInfo(
+            loop_group_id=(0,),
+            loop_count=[sympy.Integer(8)],
+            loop_tiled_dims=[[0]],
+            loop_splice_vars=[loop_var],
+        ),
     )
     scheduler_node = SimpleNamespace(node=operation)
     device_layout = SimpleNamespace(
@@ -120,8 +127,10 @@ def test_spliced_loop_symbol_is_removed_from_tensor_base_coordinates():
             spyre_kernel_module, "work_division_from_view", return_value=None
         ),
         mock.patch.object(
-            kernel, "_general_tile_advance", return_value=sympy.Integer(64)
-        ),
+            kernel,
+            "_general_tile_advance_details",
+            return_value=(sympy.Integer(64), frozenset({loop_var})),
+        ) as tile_advance,
     ):
         arg = kernel.create_tensor_arg(False, "output", tensor)
 
@@ -129,3 +138,67 @@ def test_spliced_loop_symbol_is_removed_from_tensor_base_coordinates():
     assert seen["indirect_sizes"] == {}
     assert arg.device_coordinates == [inner_var]
     assert arg.device_tile_advance_expr == 64
+    tile_advance.assert_called_once_with(tensor, False, "output", frozenset({loop_var}))
+
+
+def test_spliced_loop_symbol_in_iteration_space_stays_in_base_coordinates():
+    loop_var, inner_var = sympy.symbols("u0 d0", integer=True)
+    operation = SimpleNamespace(
+        dim_hints=[
+            DimHint(
+                dim_names=["_while_loop"],
+                split_count=1,
+                loop_var=loop_var,
+                is_reduction=False,
+                loop_var_range=8,
+            )
+        ],
+        loop_info=CoarseTileInfo(
+            loop_group_id=(0,),
+            loop_count=[sympy.Integer(8)],
+            loop_tiled_dims=[[0]],
+            loop_splice_vars=[loop_var],
+        ),
+    )
+    scheduler_node = SimpleNamespace(node=operation)
+    device_layout = SimpleNamespace(
+        device_size=[64],
+        stride_map=[1],
+        device_dtype=DataFormats.SEN169_FP16,
+        element_arrangement=ElementArrangement.STANDARD,
+    )
+    layout = SimpleNamespace(
+        allocation={"hbm": 0}, lx_view=None, device_layout=device_layout
+    )
+    tensor = TensorAccess("input", 64 * loop_var + inner_var, layout)
+
+    kernel = SpyreKernel()
+    kernel.current_node = scheduler_node
+    with (
+        mock.patch.object(spyre_kernel_module._spyre_config, "ktir_emitter", False),
+        mock.patch.object(
+            spyre_kernel_module,
+            "iteration_space",
+            return_value={
+                loop_var: (sympy.Integer(8), 1),
+                inner_var: (sympy.Integer(64), 1),
+            },
+        ),
+        mock.patch.object(
+            spyre_kernel_module,
+            "alignment_coordinates",
+            side_effect=lambda _layout, index, *_args, **_kwargs: [index],
+        ),
+        mock.patch.object(
+            spyre_kernel_module, "work_division_from_view", return_value=None
+        ),
+        mock.patch.object(
+            kernel,
+            "_general_tile_advance_details",
+            return_value=(sympy.Integer(64), frozenset()),
+        ) as tile_advance,
+    ):
+        arg = kernel.create_tensor_arg(False, "output", tensor)
+
+    assert arg.device_coordinates == [64 * loop_var + inner_var]
+    tile_advance.assert_called_once_with(tensor, False, "output", frozenset())

@@ -115,6 +115,19 @@ def _untracked_name(context: str, sym, size: int) -> str:
     return name
 
 
+def _named_dims_hint_is_compatible(named_dims: list[str], layout_size) -> bool:
+    """Whether a direct ``named_dims`` hint can describe ``layout_size``.
+
+    Direct hints are positional, so both rank and every already-declared
+    extent must agree.  Unknown names are accepted and registered later by
+    propagation.
+    """
+    return len(named_dims) == len(layout_size) and all(
+        name not in _named_dims or _named_dims[name] == int(size)
+        for name, size in zip(named_dims, layout_size)
+    )
+
+
 def _input_range_for_symbol(inputs: list[MemoryDep], sym: sympy.Symbol) -> sympy.Expr:
     """Return ``sym``'s range from the input dependency that defines it."""
     for inp in inputs:
@@ -419,26 +432,50 @@ def _propagate_named_dims_impl(graph: GraphLowering) -> None:
         if op.is_no_op():
             _set_no_named_dims(op)
         elif isinstance(op, ComputedBuffer):
+            # Read-copy buffers are reconstructed from a consumer and retain
+            # its FX origins for provenance.  A named_dims scope on those
+            # origins describes the consumer, not the copied source.  The
+            # coarse-tiling pass precomputes source-relative names when they
+            # are available; preserve them here.  Otherwise fall through to
+            # ordinary input propagation instead of treating the inherited
+            # consumer annotation as a direct output annotation.
+            ignore_inherited_named_dims = bool(
+                getattr(op, "_ignore_inherited_named_dims", False)
+            )
+            if (
+                ignore_inherited_named_dims
+                and getattr(op, "_dim_prop_info", None) is not None
+            ):
+                continue
             hint = False
+            layout_size = op.get_layout().size
             for hint_dict in get_op_hints(op).values():
-                if "named_dims" in hint_dict:
-                    hint = True
+                if "named_dims" in hint_dict and not ignore_inherited_named_dims:
                     named_dims = hint_dict["named_dims"]
+                    mismatched_sizes = [
+                        (name, _named_dims[name], int(size))
+                        for name, size in zip(named_dims, layout_size)
+                        if name in _named_dims and _named_dims[name] != int(size)
+                    ]
+                    if not _named_dims_hint_is_compatible(named_dims, layout_size):
+                        # Fused and HOP-spliced operations can retain an outer
+                        # scope's annotation even when a reduction or tile view
+                        # changed the rank or extents.  Applying those names
+                        # positionally silently maps following names to the
+                        # wrong axes.  Ignore that annotation and derive the
+                        # output names from inputs.
+                        logger.debug(
+                            f"{op.get_operation_name()}: named_dims hint has "
+                            f"{len(named_dims)} name(s) {named_dims} but output "
+                            f"layout has {len(layout_size)} dim(s) "
+                            f"{list(layout_size)} (incompatible declared sizes: "
+                            f"{mismatched_sizes}); ignoring the mismatched hint"
+                        )
+                        continue
+                    hint = True
                     break
             if hint:
                 coords = op_out_coords(op)
-                layout_size = op.get_layout().size
-                # zip() below truncates to the shorter of named_dims/layout_size,
-                # so a name-count mismatch would silently drop names (leaving them
-                # unregistered) rather than fail loudly like the input path.  Warn
-                # so a bad in-graph annotation is visible instead of a no-op.
-                if len(named_dims) != len(layout_size):
-                    logger.warning(
-                        f"{op.get_operation_name()}: named_dims hint has "
-                        f"{len(named_dims)} name(s) {named_dims} but output layout "
-                        f"has {len(layout_size)} dim(s) {list(layout_size)}; "
-                        f"extra entries are ignored"
-                    )
                 loop_var_dims: dict[sympy.Symbol, list[str]] = {}
                 for i, (coord, dim_name) in enumerate(zip(coords, named_dims)):
                     # Register the size for every name (including size-1 dims) so

@@ -1032,6 +1032,42 @@ def test_constant_indexed_dim_is_consumed_without_mapping():
     )
 
 
+def test_mismatched_in_graph_named_dims_falls_back_to_input_propagation():
+    """A stale outer-scope annotation must not shift names after reduction."""
+    rows, cols = 8, 128
+    x = torch.randn(rows, cols, dtype=torch.float16, device=DEVICE)
+
+    def fn(x):
+        with _spyre_hint(named_dims=["R", "C", "stale_reduced_dim"]):
+            return x.exp()
+
+    _run_and_capture(
+        fn,
+        [x],
+        named_dims={"R": rows, "C": cols},
+        tensor_dims={x: ["R", "C"]},
+        expected_propagated_dims=["R", "C"],
+    )
+
+
+def test_incompatible_in_graph_named_dims_falls_back_to_input_propagation():
+    """A stale same-rank annotation must not rename incompatible extents."""
+    rows, cols = 8, 128
+    x = torch.randn(rows, cols, dtype=torch.float16, device=DEVICE)
+
+    def fn(x):
+        with _spyre_hint(named_dims=["R", "stale_cols"]):
+            return x.exp()
+
+    _run_and_capture(
+        fn,
+        [x],
+        named_dims={"R": rows, "C": cols, "stale_cols": cols // 2},
+        tensor_dims={x: ["R", "C"]},
+        expected_propagated_dims=["R", "C"],
+    )
+
+
 # -------- Stride-0 broadcast (torch.expand) tests --------
 
 

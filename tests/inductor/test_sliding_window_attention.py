@@ -32,6 +32,7 @@ import pytest
 import torch
 import torch._dynamo
 import torch.nn.functional as F
+from torch._inductor.utils import run_and_get_code
 
 from torch_spyre._inductor.decompositions import spyre_sliding_window_attention
 from torch_spyre._inductor.errors import Unsupported
@@ -379,9 +380,28 @@ class TestSlidingWindowAttention(unittest.TestCase):
     def test_prefill_head_dim_256_gqa(self):
         # Gemma 4's sliding layers: 16 query heads from 8 KV heads, head_dim 256,
         # W=1024. head_dim 256 is four sticks per row where the rest of this file
-        # uses one or two, and kv_window hands back a transposed slice.
+        # uses one or two, and each K window is transposed tile-by-tile.
         query, key, value = _inputs(1, 16, 8, 512, 512, head_dim=256)
         _compare_attention(query, key, value, 1024)
+
+    def test_nondivisible_kv_extent_uses_for_each_tile(self):
+        """A nondivisible selected block still lowers to one counted loop."""
+        query, key, value = _inputs(1, 16, 8, 64, 1088)
+        mask = _attention_mask(1, 64, 1088, 1024)
+        expected = _attention(query, key, value, mask, 1024)
+
+        actual, sources = run_and_get_code(
+            torch.compile(_attention, dynamic=False),
+            query.to("spyre"),
+            key.to("spyre"),
+            value.to("spyre"),
+            mask.to("spyre"),
+            1024,
+        )
+
+        torch.testing.assert_close(actual.cpu(), expected, atol=0.1, rtol=0.1)
+        self.assertEqual(sum(source.count("LoopSpec(") for source in sources), 1)
+        self.assertNotIn("while_loop_carry_snapshot", "\n".join(sources))
 
     def test_prefill_reads_a_prefix_of_a_larger_cache(self):
         # A short prefill can use the compact decode allocation already. Its KV

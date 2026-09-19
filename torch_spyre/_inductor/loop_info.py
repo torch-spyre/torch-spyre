@@ -295,6 +295,13 @@ class CoarseTileInfo:
     loop_count:
         List of trip counts, one per nesting level from outermost to
         innermost.  ``len(loop_count) == len(loop_group_id)`` always holds.
+    loop_splice_vars:
+        Synthesized ``for_each_tile`` induction variable for each nesting
+        level, or ``None`` for an ordinary ``spyre_hint`` level.  Codegen
+        uses this provenance only when the variable survives in a tensor's
+        coordinates without belonging to that operation's iteration space;
+        such a variable names the surrounding counted loop rather than an
+        operation dimension and must be represented by tile advance instead.
     loop_tiled_dims:
         List of lists, one sub-list per nesting level.  Each sub-list
         contains the ``data.ranges`` positional indices that are tiled at
@@ -374,6 +381,7 @@ class CoarseTileInfo:
     loop_group_id: tuple[int, ...]
     loop_count: list[sympy.Expr]
     loop_tiled_dims: list[list[int]]
+    loop_splice_vars: list["sympy.Symbol | None"] = field(default_factory=list)
     loop_tiled_reduction_dims: list[list[int]] = field(default_factory=list)
     tiled_dims_per_read: list[list[list[tuple[int, sympy.Expr]]]] = field(
         default_factory=list

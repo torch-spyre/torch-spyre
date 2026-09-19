@@ -117,6 +117,7 @@ from .propagate_named_dims import (
     _get_dim_prop_info,
     _get_layout,
     _lone_sym,
+    _named_dims_hint_is_compatible,
 )
 from ..pass_utils import (
     op_out_coords,
@@ -606,10 +607,21 @@ def plan_coarse_tile_groups(
                 op, read_deps, write_deps, per_level_extents
             )
 
+            hints_by_id = {hint.hint_id: hint for hint in getattr(op, "dim_hints", [])}
+            loop_splice_vars = []
+            for hint_id, _count in levels:
+                hint = hints_by_id.get(hint_id)
+                loop_splice_vars.append(
+                    hint.loop_var
+                    if hint is not None and hint.loop_var_range is not None
+                    else None
+                )
+
             plan[id(op)] = CoarseTileInfo(
                 loop_group_id=nested_group_id,
                 loop_count=counts,
                 loop_tiled_dims=op_tiled_dims,
+                loop_splice_vars=loop_splice_vars,
                 loop_tiled_reduction_dims=op_tiled_reduction_dims,
                 tiled_dims_per_read=tiled_dims_per_read,
                 output_tiled_dims=output_tiled_dims,
@@ -810,6 +822,7 @@ def _compute_fill_loop_info_planned(
     outer_counts: list[sympy.Expr] = []
     outer_tiled_dims: list[list[int]] = []
     outer_tiled_rdims: list[list[int]] = []
+    outer_splice_vars: list[sympy.Symbol | None] = []
     for i, (dims, _rdims, count) in enumerate(
         zip(info.loop_tiled_dims, tiled_rdims, info.loop_count)
     ):
@@ -817,6 +830,9 @@ def _compute_fill_loop_info_planned(
             outer_counts.append(count)
             outer_tiled_dims.append(dims)
             outer_tiled_rdims.append([])
+            outer_splice_vars.append(
+                info.loop_splice_vars[i] if i < len(info.loop_splice_vars) else None
+            )
 
     if not outer_counts:
         return None  # flat: fill runs before all loops
@@ -826,6 +842,7 @@ def _compute_fill_loop_info_planned(
         loop_group_id=outer_gid,
         loop_count=outer_counts,
         loop_tiled_dims=outer_tiled_dims,
+        loop_splice_vars=outer_splice_vars,
         loop_tiled_reduction_dims=outer_tiled_rdims,
         tiled_dims_per_read=[],
         output_tiled_dims=[],
@@ -4649,41 +4666,75 @@ def _compute_read_copy_strides(
 def _propagate_read_copy_named_dims(copy_buf: ComputedBuffer, dep: MemoryDep) -> None:
     """Give a read-copy staging buffer the named dims its source dep carries.
 
-    propagate_named_dims (and assign_dim_hints's cleanup right after it) runs
-    long before coarse_tile inserts read-copy ops, so by this point the global
-    _named_dims size registry has already been cleared and every op-level
-    _dim_prop_info has already been deleted (assign_dim_hints's documented
-    contract) -- only a graph *input* TensorBox still carries one. A copy_buf
-    built here starts with no _dim_prop_info at all: any op that reads the
-    copy instead of the original buffer sees an untracked dim, even when the
-    source was fully named (e.g. via a spyre_hint on the fill that created
-    it). This can't reuse compute_input_named_dims -- it needs the (by-now
-    gone) _named_dims registry to size-match fused/split dims.  A read-copy
-    never fuses or splits dims, though (copy_buf's own ranges are dep's
-    ranges 1:1, in dep.var_names order -- see the tile_ranges construction
-    above), so a plain positional zip of the source's named_dims against its
-    own non-size-1 loop vars (found the same way compute_input_named_dims
-    does, via host_coordinates) is enough, with no size lookups needed.
+    The ordinary hint path reaches coarse tiling after named-dimension
+    propagation, while a for_each_tile HOP is spliced and tiled before that
+    pass. In the first ordering the source's _dim_prop_info is available; in
+    the second, recover a direct in-graph annotation from the source origins.
+
+    This cannot use compute_input_named_dims: a read copy has a new, compact
+    iteration space, and the global size registry may not exist yet or may
+    already have been cleared. Read copies do not fuse or split source dims,
+    though, so mapping the source names through host_coordinates is enough.
+    Size-1 layout dimensions are skipped without shifting later names.
     """
-    dpi = _get_dim_prop_info(dep)
-    named_dims = dpi.named_dims if dpi is not None else None
-    if not named_dims:
-        return
+    # The copy is created from the consumer and therefore carries that
+    # consumer's FX origins.  Those origins are useful provenance, but their
+    # named_dims hint describes the consumer output rather than the source
+    # being staged.  Tell the later propagation pass not to interpret it as a
+    # direct annotation on this new buffer, even when the source itself has no
+    # names to preserve.
+    copy_buf._ignore_inherited_named_dims = True  # type: ignore[attr-defined]
+
     layout = _get_layout(dep)
     if layout is None:
         return
+    dpi = _get_dim_prop_info(dep)
+    named_dims = dpi.named_dims if dpi is not None else None
+    if not named_dims:
+        # for_each_tile splices and coarse-tiles its body before the ordinary
+        # named-dimension pass runs.  In that ordering the source has no
+        # _dim_prop_info yet, but an in-graph annotation is still recoverable
+        # from the source operation's own FX origins.
+        source = V.graph.get_buffer(dep.name)
+        if isinstance(source, Operation):
+            for _, hint_dict in sorted(get_op_hints(source).items()):
+                if hint_named_dims := hint_dict.get("named_dims"):
+                    if _named_dims_hint_is_compatible(hint_named_dims, layout.size):
+                        named_dims = hint_named_dims
+                        break
+                    logger.debug(
+                        "coarse_tile: ignoring incompatible named_dims hint "
+                        "%s for read-copy source %s with layout %s",
+                        hint_named_dims,
+                        dep.name,
+                        list(layout.size),
+                    )
+    if not named_dims:
+        return
     coords = host_coordinates(layout, dep, None)
+    # Direct in-graph annotations retain size-1 dimensions while MemoryDep
+    # ranges and the read-copy allocation squeeze them.  When ranks match,
+    # consume names positionally so a leading B=1 drops ``_b`` instead of
+    # shifting q_block onto head_dim.  Propagated names omit such singleton
+    # entries, so retain the compact positional walk for the other case.
+    names_by_layout_dim = (
+        [[name] for name in named_dims] if len(named_dims) == len(layout.size) else None
+    )
     remaining = list(named_dims)
     loop_var_dims: dict[sympy.Symbol, list[str]] = {}
     for i, coord in enumerate(coords):
-        if not remaining:
+        if names_by_layout_dim is None and not remaining:
             break
         if int(layout.size[i]) == 1:
             continue
-        name = remaining.pop(0)
+        names = (
+            names_by_layout_dim[i]
+            if names_by_layout_dim is not None
+            else [remaining.pop(0)]
+        )
         sym = _lone_sym(coord)
         if sym is not None and sym in dep.ranges:
-            loop_var_dims.setdefault(sym, []).append(name)
+            loop_var_dims.setdefault(sym, []).extend(names)
     if not loop_var_dims:
         return
     flat_named_dims = []
@@ -4838,13 +4889,22 @@ def _insert_one_read_copy(
     # Positions with non-zero coeff are active tensor dims; zero coeff means
     # broadcast/absent (e.g. the N dim in a Reduction reading a[M,K]).
     active_idx = [i for i, c in enumerate(full_coeff) if c != 0]
-    # A broadcast input that is fixed for the whole counted loop needs one
-    # compact staging copy of its real tensor dimensions.  Keeping the absent
-    # loop dimension would materialize the expanded [E, ...] view in HBM.
-    # A fully-broadcast scalar has no real dimensions to compact.
-    compact_invariant = loop_invariant and bool(active_idx)
-    tile_ranges = (
-        [dep.size[i] for i in active_idx] if compact_invariant else list(dep.size)
+    # A loop-invariant staging copy needs only the dimensions that its source
+    # index actually addresses.  A WhileLoop-splice copy needs the same
+    # compaction even though it advances: keeping absent output/reduction
+    # dimensions would materialize broadcast views in HBM (notably GQA's group
+    # and query axes) and can also hand later layout passes a zero-stride padded
+    # tensor.  Preserve ordinary full-rank advancing copies, whose layout is
+    # part of the existing work-division and LX-relayout contract.  A fully
+    # broadcast scalar has no real dimensions to compact.
+    compact_copy = bool(active_idx) and (
+        loop_invariant or bool(_splice_loop_vars(sizing_op))
+    )
+    tile_ranges = [dep.size[i] for i in active_idx] if compact_copy else list(dep.size)
+    dep_pos_to_copy_pos = (
+        {dep_pos: copy_pos for copy_pos, dep_pos in enumerate(active_idx)}
+        if compact_copy
+        else {pos: pos for pos in range(len(dep.size))}
     )
 
     tile_strides: list[Expr]
@@ -4880,7 +4940,7 @@ def _insert_one_read_copy(
         # active_tile_strides[i] corresponds to active_idx[i]: both are indexed
         # by position in the compressed active-dims space, so zip pairs each
         # full dep.var_names position with its computed tile stride correctly.
-        if compact_invariant:
+        if compact_copy:
             tile_strides = active_tile_strides
         else:
             tile_strides = [sympy.Integer(0)] * len(tile_ranges)
@@ -4910,7 +4970,7 @@ def _insert_one_read_copy(
         _full_buf=full_buf,
         _initial_source_offset=initial_source_offset,
         _active_idx=active_idx,
-        _compact=compact_invariant,
+        _compact=compact_copy,
         _loop_var_zeros=loop_var_zeros,
     ):
         if _compact:
@@ -5112,6 +5172,7 @@ def _insert_one_read_copy(
             tile_strides,
         )
     copy_buf = ComputedBuffer(name=copy_name, layout=copy_layout, data=copy_data)
+    copy_buf._read_copy_is_compact = compact_copy  # type: ignore[attr-defined]
     copy_buf.origins = sizing_op.origins
     copy_buf.operation_name = copy_name
     copy_op_metadata(sizing_op, copy_buf)
@@ -5334,7 +5395,10 @@ def _insert_one_read_copy(
             # This dim is squeezed out of, or simply absent from, dep's own
             # space (broadcast) -- no advance term to contribute here.
             continue
-        copy_dim = dep.var_names.index(sizing_symbol)
+        dep_dim = dep.var_names.index(sizing_symbol)
+        if dep_dim not in dep_pos_to_copy_pos:
+            continue
+        copy_dim = dep_pos_to_copy_pos[dep_dim]
         running = sympy.sympify(copy_ranges[copy_dim])
         for level_idx in reversed(levels_tiling_d):
             read_level_extents[level_idx][copy_dim] = running
@@ -5389,7 +5453,10 @@ def _insert_one_read_copy(
                 squeezed_advance[level_idx].append((candidates[0], running))
                 running *= sizing_op_info.loop_count[level_idx]
             continue
-        copy_dim_key = it_idx + reduction_squeeze_pos[d]
+        dep_dim = it_idx + reduction_squeeze_pos[d]
+        if dep_dim not in dep_pos_to_copy_pos:
+            continue
+        copy_dim_key = dep_pos_to_copy_pos[dep_dim]
         running = sympy.sympify(copy_ranges[copy_dim_key])
         for level_idx in reversed(levels_tiling_d):
             read_level_extents[level_idx][copy_dim_key] = running
@@ -5560,8 +5627,8 @@ def _patch_consumer_to_read_copy(
     )
     copy_strides = list(copy_buf.layout.stride)
     active_idx = [i for i, stride in enumerate(pre_extension_strides) if stride != 0]
-    if loop_invariant and len(copy_strides) == len(active_idx):
-        # Expand a compact invariant copy's real strides back into the
+    if getattr(copy_buf, "_read_copy_is_compact", False):
+        # Expand a compact copy's real strides back into the
         # consumer's iteration-space positions.  Broadcast loop dimensions
         # remain fixed at zero instead of shifting the real tensor strides.
         tile_strides = [sympy.Integer(0)] * len(pre_extension_strides)

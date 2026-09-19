@@ -16,6 +16,7 @@ from contextlib import contextmanager
 from functools import wraps
 
 import torch
+import sympy
 from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import (
     ComputedBuffer,
@@ -26,8 +27,48 @@ from torch._inductor.ir import (
 from torch._inductor.scheduler import SchedulerNode
 from torch._inductor.utils import InputType
 from torch._inductor.virtualized import V
+from torch.utils._ordered_set import OrderedSet
 
 from .constants import DEVICE_NAME
+
+
+def _cached_scheduler_node_symbol_uses(
+    node: SchedulerNode,
+) -> OrderedSet[sympy.Symbol]:
+    """Collect symbols without rebuilding a transformed node's dependencies.
+
+    The scheduler's ``read_writes`` is the authoritative dependency snapshot
+    after Spyre's pre-scheduling rewrites.  Re-running
+    ``ComputedBuffer.get_read_writes()`` later during graph partitioning is
+    unsafe: physical layout propagation may intentionally squeeze the output
+    layout after the logical loop body was finalized, so the two ranks no
+    longer form a valid fresh store index.  This mirrors upstream
+    ``ComputedBuffer.get_free_symbol_uses`` while sourcing its final term from
+    the scheduler snapshot.
+
+    Synthesized ``for_each_tile`` induction variables are internal to the
+    emitted counted loop, not graph-partition inputs, so exclude the variables
+    recorded by the node's splice-generated dimension hints.
+    """
+    ir_node = node.node
+    assert isinstance(ir_node, ComputedBuffer)
+
+    free_symbol_uses = ir_node.layout.get_free_symbol_uses()
+    free_symbol_uses |= ir_node.data.get_free_symbol_uses()
+    if ir_node.has_store_function():
+        free_symbol_uses |= node.read_writes.get_free_symbol_uses()
+
+    from torch._inductor.scheduler import get_layout_symints
+
+    free_symbol_uses.update(
+        *(get_layout_symints(output) for output in ir_node.get_outputs())
+    )
+    free_symbol_uses.difference_update(
+        hint.loop_var
+        for hint in getattr(ir_node, "dim_hints", [])
+        if hint.loop_var is not None and hint.loop_var_range is not None
+    )
+    return free_symbol_uses
 
 
 @contextmanager
@@ -174,6 +215,31 @@ def enable_spyre_context(example_inputs: list[InputType]):
 
     old_update_scheduler = GraphLowering._update_scheduler
 
+    # Upstream graph partitioning asks each IR node to rebuild its read/write
+    # dependencies after Spyre's post-fusion preparation has completed.  A
+    # coarse-tiled node can by then have a physically squeezed layout whose
+    # rank intentionally differs from its logical loop body, making that
+    # rebuild invalid.  Keep partition symbol discovery on the finalized
+    # SchedulerNode dependency snapshot instead.
+    import torch._inductor.scheduler as inductor_scheduler
+
+    old_get_scheduler_node_symbol_uses = (
+        inductor_scheduler.get_scheduler_node_symbol_uses
+    )
+
+    def _spyre_get_scheduler_node_symbol_uses(node):
+        if (
+            isinstance(node, SchedulerNode)
+            and isinstance(node.node, ComputedBuffer)
+            and getattr(node.node, "loop_info", None) is not None
+        ):
+            return _cached_scheduler_node_symbol_uses(node)
+        return old_get_scheduler_node_symbol_uses(node)
+
+    inductor_scheduler.get_scheduler_node_symbol_uses = (  # type: ignore[assignment]
+        _spyre_get_scheduler_node_symbol_uses
+    )
+
     _pre_scheduling_pass = CustomPreSchedulingPasses()
 
     def _spyre_update_scheduler(self: GraphLowering) -> None:
@@ -239,6 +305,9 @@ def enable_spyre_context(example_inputs: list[InputType]):
             Loops.has_large_inner_fn = old_loop
             GraphLowering._update_scheduler = old_update_scheduler  # type: ignore[method-assign]
             SchedulerNode.has_side_effects = old_scheduler_node_has_side_effects  # type: ignore[method-assign]
+            inductor_scheduler.get_scheduler_node_symbol_uses = (  # type: ignore[assignment]
+                old_get_scheduler_node_symbol_uses
+            )
 
 
 OBSERVER_HOOKS_KEY = "__spyre_hooks_meta"

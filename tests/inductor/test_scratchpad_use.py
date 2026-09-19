@@ -22,6 +22,7 @@ from typing import Callable, TypeVarTuple, Unpack, Optional, override
 
 import unittest
 from unittest.mock import patch
+import sympy
 import torch
 
 from torch._inductor import config as t_inductor_config
@@ -35,6 +36,8 @@ from torch._inductor.ir import (
     StorageBox,
     TensorBox,
 )
+from torch._inductor.virtualized import ops
+from torch.utils._ordered_set import OrderedSet
 
 from torch_spyre._inductor.passes import CustomPreSchedulingPasses
 from torch_spyre._inductor import passes
@@ -120,6 +123,54 @@ def test_nested_spyre_context_runs_pre_scheduling_once():
         GraphLowering._update_scheduler(graph)
 
     assert calls == [graph]
+
+
+def test_partition_symbol_uses_reuses_final_scheduler_dependencies():
+    """A squeezed physical layout must not retrace a higher-rank loop body."""
+    from torch._inductor.dependencies import MemoryDep, ReadWrites
+
+    from torch_spyre._inductor.loop_info import CoarseTileInfo
+    from torch_spyre._inductor.patches import _cached_scheduler_node_symbol_uses
+
+    loop_var = sympy.Symbol("u0", integer=True)
+    node = ComputedBuffer(
+        name="rank_squeezed",
+        layout=FixedLayout(torch.device("spyre"), torch.float16, [2, 3], [3, 1]),
+        data=Pointwise(
+            device=torch.device("spyre"),
+            dtype=torch.float16,
+            inner_fn=lambda index: ops.load(
+                "source", 3 * index[0] + index[1] + 6 * loop_var
+            ),
+            ranges=[2, 3],
+        ),
+    )
+    d0, d1 = sympy.symbols("d0 d1", integer=True)
+    read_writes = ReadWrites(
+        reads=OrderedSet(
+            [MemoryDep("source", 3 * d0 + d1 + 6 * loop_var, (d0, d1), (2, 3))]
+        ),
+        writes=OrderedSet([MemoryDep("rank_squeezed", 3 * d0 + d1, (d0, d1), (2, 3))]),
+        index_exprs=OrderedSet(),
+    )
+    node.layout = FixedLayout(torch.device("spyre"), torch.float16, [6], [1])
+    node.loop_info = CoarseTileInfo(
+        loop_group_id=(0,),
+        loop_count=[4],
+        loop_tiled_dims=[[0]],
+    )
+    node.dim_hints = [SimpleNamespace(loop_var=loop_var, loop_var_range=4)]
+
+    with patch.object(
+        node,
+        "get_read_writes",
+        side_effect=AssertionError("stale physical layout rank"),
+    ) as rebuilt:
+        uses = _cached_scheduler_node_symbol_uses(
+            SimpleNamespace(node=node, read_writes=read_writes)
+        )
+    rebuilt.assert_not_called()
+    assert loop_var not in uses
 
 
 def test_cooptimizing_allocator_rejects_relayout_results_without_asserts():

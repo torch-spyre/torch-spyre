@@ -1157,11 +1157,11 @@ def kv_window(  # type: ignore[empty-body]
     """
     Read one Q block's slice of the KV cache.
 
-    key/value: [B, Hkv, Lkv, E]. Returns (k_win, v_win) covering cache rows
-    [read_start, read_start + buffer_width). k_win is
-    [B, Hkv, E, buffer_width], already **transposed** -- the layout the scores
-    matmul wants, free on a slice. Both outputs retain the native KV-head count;
-    the attention decomposition broadcasts them across query-head groups.
+    key/value: [B, Hkv, Lkv, E]. Returns (k_win, v_win), both shaped
+    [B, Hkv, buffer_width, E], covering cache rows
+    [read_start, read_start + buffer_width). Both outputs retain the native
+    KV-head count; the attention decomposition broadcasts them across
+    query-head groups and transposes each bounded K tile at the matmul.
 
     One block per call; the memory planner reuses one window buffer across
     them, so the cost is buffer_width rows for any query length.
@@ -1209,7 +1209,7 @@ def _(
         raise Unsupported(f"kv_window: {reason}")
 
     batch, num_kvheads, _, head_dim = key.shape
-    k_win = key.new_empty((batch, num_kvheads, head_dim, buffer_width))
+    k_win = key.new_empty((batch, num_kvheads, buffer_width, head_dim))
     v_win = value.new_empty((batch, num_kvheads, buffer_width, head_dim))
     return k_win, v_win
 
