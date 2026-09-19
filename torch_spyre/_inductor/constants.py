@@ -138,6 +138,7 @@ SPYRE_FP32_OPS = [
     "sub",
     "mul",
     "where",
+    "where3",
     "realdiv",
     "relufwd",
     "reciprocal",

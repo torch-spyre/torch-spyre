@@ -56,7 +56,7 @@ from .core_mapping import (
     remap_work_division,
 )
 from .errors import Unsupported
-from .ir import FixedTiledLayout
+from .ir import FixedTiledLayout, SpyreConstantFallback
 from .scratchpad.lx_relayout import (
     materialized_lx_relayout_for_destination,
     work_division_from_view,
@@ -804,6 +804,20 @@ class SpyreKernel(Kernel[CSEVariable]):
             and sched.can_buffer_be_removed_through_fusion(name, self.fused_node_names)
             and name not in V.graph.get_output_names()
         )
+        # Same gate again, and the same reason as ``kernel_local``: the fact is
+        # only read by the KTIR emitter, so the SDSC literal stays byte-identical.
+        #
+        # It is asked of the BUFFER, not of the arg's shape, because the shape
+        # cannot answer it -- see TensorArg.replicated_scalar.  A
+        # ``SpyreConstantFallback`` is the one producer that fills a whole stick
+        # with one value (``spyre_constant_tensor`` allocates ``torch.empty(())``,
+        # one stick, and ``spyre_fill_tensor`` covers it with a single
+        # MEMORY_FILL over the composite address), so it is the one producer
+        # that may claim this.
+        replicated_scalar = bool(
+            _spyre_config.ktir_emitter
+            and isinstance(V.graph.try_get_buffer(name), SpyreConstantFallback)
+        )
         it_space = iteration_space(current_node)
         # With dynamic=True the host index may contain symbolic strides
         # (e.g. x0*s1+x1).  Concretize size symbols so normalize_coordinates
@@ -854,6 +868,7 @@ class SpyreKernel(Kernel[CSEVariable]):
             device_tile_advance_expr=device_tile_advance_expr,
             work_division=work_division,
             kernel_local=kernel_local,
+            replicated_scalar=replicated_scalar,
         )
         if (
             "lx" not in tensor.layout.allocation
@@ -1423,6 +1438,10 @@ class SpyreKernel(Kernel[CSEVariable]):
         real pool tensor is allocated immediately before and freed
         immediately after this kernel's .run() call, scoping its lifetime
         tightly to this one bundle's execution.
+
+        The pool tensor, when there is one, is call argument 0, ahead of the
+        tensor arguments. The KTIR emitter opens the kernel's signature with a
+        matching leading slot (``KernelPlan.parameters``).
         """
         wrapper = V.graph.wrapper_code
         call_args = []
@@ -1433,15 +1452,7 @@ class SpyreKernel(Kernel[CSEVariable]):
         # its own unique name -- so deriving the pool variable name from it
         # is collision-free without any extra bookkeeping here.
         pool_var_name = f"_pool_{name}"
-        emit_pool_tensor = uses_pool and _spyre_config.frontend_pool_allocation
-        if emit_pool_tensor and _spyre_config.ktir_emitter:
-            raise AssertionError(
-                "config.frontend_pool_allocation is not supported on the KTIR "
-                "emitter path: async_compile.ktir() takes no pool_size and the "
-                "KTIR emitter threads hbm_pool buffers as internal SSA values, "
-                "so a front-end pool argument would shift every tensor's "
-                "positional address binding."
-            )
+        emit_pool_tensor = uses_pool and _spyre_config.pool_allocated_by_frontend()
         if emit_pool_tensor:
             device = V.graph.get_current_device_or_throw()
             wrapper.writeline(
@@ -1654,6 +1665,8 @@ def _codegen_op_spec_list(specs, buf: IndentedBuffer, sympy_str) -> None:
                                 buf.writeline(f"name={arg.name!r},")
                             if arg.kernel_local:
                                 buf.writeline("kernel_local=True,")
+                            if arg.replicated_scalar:
+                                buf.writeline("replicated_scalar=True,")
                             if arg.device_tile_advance_expr is not None:
                                 buf.writeline(
                                     "device_tile_advance_expr="
