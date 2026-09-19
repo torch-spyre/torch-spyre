@@ -449,6 +449,7 @@ OP_REGISTRY: Dict[str, OpAdapter] = {
     "torch.gt": OpAdapter("torch.gt", _torch_gt),
     "torch.logical_and": OpAdapter("torch.logical_and", torch.logical_and),
     "torch.bitwise_or": OpAdapter("torch.bitwise_or", torch.bitwise_or),
+    "torch.bitwise_and": OpAdapter("torch.bitwise_and", torch.bitwise_and),
     "torch.or_": OpAdapter("torch.or_", _tensor_or_, is_inplace=True),
     # Type/device conversions
     "torch.float": OpAdapter("torch.float", _tensor_float),
@@ -602,6 +603,10 @@ OP_REGISTRY: Dict[str, OpAdapter] = {
     ),
     # In-place add_ listed separately
     "torch.add_": OpAdapter("torch.add_", _tensor_add_, is_inplace=True),
+    # NOTE: "torch.and_" stays registered in-place (is_inplace=True) below —
+    # it is a distinct, legitimate registry entry for genuine in-place callers.
+    # This PR only adds the missing out-of-place "torch.bitwise_and" above;
+    # it does not remove or alter the existing "torch.and_" entry.
     "torch.and_": OpAdapter("torch.and_", _tensor_and_, is_inplace=True),
     # "torch.add_": OpAdapter("torch.add_", torch.Tensor.add_, is_inplace=True),
 }
