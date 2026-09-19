@@ -421,7 +421,7 @@ class SpyreAsyncCompile(AsyncCompile):
 
         if use_cache:
             # Hash the specs in-memory BEFORE any disk I/O.  On a cache hit
-            # neither generate_bundle nor dxp_standalone runs at all.
+            # neither generate_bundle nor the backend compiler runs at all.
             try:
                 cache_key = compute_specs_hash(
                     specs, kernel_name=kernel_name, pool_size=pool_size
@@ -509,9 +509,9 @@ class SpyreAsyncCompile(AsyncCompile):
 
         Mirrors ``sdsc`` but emits KTIR directly instead of an SDSC bundle: the
         emitted KTIR is persisted to disk for inspection and then compiled by
-        ``dbo-opt``, which writes a ``spyreCodeDir`` in the same layout
-        ``dxp_standalone`` produces, so the result is loaded and launched by the
-        same ``SpyreSDSCKernelRunner``.
+        ``dbo-opt``, which writes a ``spyreCodeDir`` in the same layout the
+        bundle path produces, so the result is loaded and launched by the same
+        ``SpyreSDSCKernelRunner``.
         """
         # Upfront, before anything is emitted: what device execution needs is a
         # matter of configuration, so there is no reason to emit first.

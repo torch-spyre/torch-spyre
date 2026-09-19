@@ -153,8 +153,13 @@ logger = get_inductor_logger("scratchpad.allocator")
 # * ``MemTrackBundle::initializeMemoryTrackers`` uses one 128-byte stick as the
 #   LX allocation granularity (``sharedtools/mem_track_bundle.cpp``).
 #
-# Torch and DXP independently consume ``DXP_LX_FRAC_AVAIL``.  These constants
-# define the fixed part of that cross-compiler ownership contract.
+# Torch and the backend compiler independently consume ``DXP_LX_FRAC_AVAIL``:
+# dbo reads it in ``dbo/src/Transforms/ProgramLayout.cpp`` with the same 0.2
+# default.  The ``DXP_`` prefix is historical -- the variable is a cross-compiler
+# contract, so it cannot be renamed from this side alone without silently
+# reintroducing the ownership mismatch of issue #3222 (Torch would read the new
+# name while the backend kept defaulting the old one).  These constants define
+# the fixed part of that contract.
 _LX_PHYSICAL_CAPACITY_BYTES = 2 << 20
 _LX_PROGRAM_DEBUG_RESERVATION_BYTES = 64 << 10
 _LX_TRACKER_CAPACITY_BYTES = (

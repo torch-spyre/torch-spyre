@@ -7656,7 +7656,7 @@ class TestGenerateBundleMlirSymbolicArgs(unittest.TestCase):
 
         This pins the invariant a wrong-order/right-count bug would silently
         violate: the returned SymbolKind list must match the MLIR parameter
-        order positionally, which is the same order dxp_standalone stores in
+        order positionally, which is the same order the backend stores in
         inputSym_.
         """
         import regex as re

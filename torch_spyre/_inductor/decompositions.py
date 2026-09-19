@@ -188,9 +188,9 @@ def _num_tiles_for_max_extent(
 def _kv_blocks_per_loop_group(num_q_tiles: int, num_kv_blocks: int) -> int:
     """Keep each SDPA backend bundle near the proven 4-by-4 size.
 
-    DXP specializes a counted Lq loop across every unrolled Lk block.  Bundle
-    code size therefore scales with their product, not with the number of Lk
-    blocks alone. Cap that product at sixteen when possible, while retaining at
+    The backend specializes a counted Lq loop across every unrolled Lk block.
+    Bundle code size therefore scales with their product, not with the number of
+    Lk blocks alone. Cap that product at sixteen when possible, while retaining at
     least one Lk block per group. Once Lq alone needs sixteen or more tiles,
     each explicit Lk block gets its own loop group.
     """

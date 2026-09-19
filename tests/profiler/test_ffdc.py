@@ -269,7 +269,7 @@ class TestFfdcCollect:
         # Backend sdsc/dbo-opt captures then re-raises into compile_fx.
         with tempfile.TemporaryDirectory() as tmp:
             try:
-                raise RuntimeError("dxp_standalone failed")
+                raise RuntimeError("backend compiler failed")
             except RuntimeError as exc:
                 try_collect(
                     exc,
@@ -387,7 +387,7 @@ class TestFfdcCollect:
         monkeypatch.setattr(ffdc_mod, "collect", flaky)
         with tempfile.TemporaryDirectory() as tmp:
             try:
-                raise RuntimeError("dxp_standalone failed")
+                raise RuntimeError("backend compiler failed")
             except RuntimeError as exc:
                 try_collect(
                     exc,
@@ -969,7 +969,7 @@ class TestFfdcAsyncCompile:
         return mod, out_dir
 
     def test_sdsc_dxp_failure_triggers_ffdc_collect(self, monkeypatch, tmp_path):
-        """dxp_standalone failure must call try_collect then re-raise.
+        """A backend-compiler failure must call try_collect then re-raise.
 
         Patch ``try_collect`` before reimporting ``async_compile`` so the
         module-level binding picks up the fake.

@@ -35,7 +35,7 @@ Options:
     --kernel NAME     only emit kernels whose name contains NAME
     --save-inputs     also dump recorded input values to a .pt beside each
                       script, for byte-exact replay
-    --no-execute      capture without a device or dxp_standalone (see below)
+    --no-execute      capture without a device or backend compiler (see below)
     --no-explain-header
                       omit the decoded OpSpec explanation from each script
 

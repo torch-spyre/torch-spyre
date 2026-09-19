@@ -331,8 +331,8 @@ class TestBuildingBlocks(unittest.TestCase):
             f"expected a codegen failure, but the mixed-EA gate rejected it: {msg}",
         )
         self.assertTrue(
-            any(k in msg for k in ("dxp_standalone", "ddc", "sbf-")),
-            f"expected a ddc/dxp codegen-stage failure, got: {msg[:300]}",
+            any(k in msg for k in ("ddc", "sbf-")),
+            f"expected a ddc/sbf codegen-stage failure, got: {msg[:300]}",
         )
 
     def test_flash_attention(self):

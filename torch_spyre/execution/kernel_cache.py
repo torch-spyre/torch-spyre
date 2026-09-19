@@ -31,7 +31,7 @@ from torch_spyre._inductor.logging_utils import get_inductor_logger
 
 logger = get_inductor_logger("kernel_cache")
 
-# All artifacts that dxp_standalone must produce for a valid compiled kernel.
+# All artifacts the backend compiler must produce for a valid compiled kernel.
 # A cache entry is only considered a hit if every one of these is present.
 _SYMBOL_KINDS_FILE = "symbol_kinds.json"
 _REQUIRED_ARTIFACTS = [
@@ -216,7 +216,7 @@ def _strip_debug_handles(obj):
     debug_handle_ carries Inductor-assigned buffer names and source file paths
     that are process/run-specific. Including them in the cache key causes false
     misses (identical graphs with different buffer names hash differently) and
-    does not affect compilation correctness — dxp_standalone ignores the field.
+    does not affect compilation correctness — the backend ignores the field.
     """
     if isinstance(obj, dict):
         return {
@@ -235,8 +235,9 @@ def compute_specs_hash(
     The key is a SHA-256 hash covering: the JSON of every sdsc_N.json dict
     (op structure, iteration space, tiling, shapes, dtypes), the trip count of
     every LoopSpec, all baked symbol offsets (pool, kernel_slice, derived),
-    the total pool allocation size, and the versions of torch, torch_spyre,
-    dxp_standalone, and the active compile config.
+    the total pool allocation size, the versions of torch, torch_spyre and
+    the deeptools/flex toolchain, the backend compiler in use, and the active
+    compile config.
 
     Args:
         specs:       The OpSpec/LoopSpec tree to hash.
@@ -518,8 +519,9 @@ def _move_to_failed_dir(compile_dir: str) -> None:
     """Move a failed compile dir into a ``failed/`` subdirectory of the cache root.
 
     Keeps the cache root clean while still retaining failed artifacts for
-    manual debugging (``dxp_standalone -d <path>``).  If the rename itself
-    fails (e.g. cross-device move), the original path is kept and logged.
+    manual debugging (re-run dbo-opt over the dir's ``bundle.mlir``).  If the
+    rename itself fails (e.g. cross-device move), the original path is kept and
+    logged.
     """
     cache_root = get_cache_root_dir()
     failed_root = os.path.join(cache_root, "failed")
