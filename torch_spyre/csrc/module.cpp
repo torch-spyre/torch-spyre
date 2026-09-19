@@ -57,6 +57,7 @@
 #include "spyre_guard.h"
 #include "spyre_kernel.h"
 #include "spyre_mem.h"
+#include "spyre_pinned_allocator.h"
 #include "spyre_stream.h"
 #include "spyre_tensor_impl.h"
 #include "spyre_views.h"
@@ -203,6 +204,12 @@ int device_count() {
   return getVisibleDeviceCount();
 }
 
+bool is_spyre_pinned_ptr(const void* ptr) {
+  auto* allocator =
+      static_cast<SpyrePinnedAllocator*>(GetSpyrePinnedAllocator());
+  return allocator->isPinnedPtr(ptr);
+}
+
 }  // namespace spyre
 
 namespace py = pybind11;
@@ -228,6 +235,14 @@ PYBIND11_MODULE(_C, m) {
       }
       at::Generator getNewGenerator(c10::DeviceIndex device) const override {
         return spyre::detail::createSpyreGenerator(device);
+      }
+      at::Allocator* getPinnedMemoryAllocator() const override {
+        return spyre::GetSpyrePinnedAllocator();
+      }
+      bool isPinnedPtr(const void* data) const override {
+        auto* allocator = static_cast<spyre::SpyrePinnedAllocator*>(
+            spyre::GetSpyrePinnedAllocator());
+        return allocator->isPinnedPtr(data);
       }
     };
     static auto* hooks = new SpyreHooksInterface();
@@ -269,6 +284,12 @@ PYBIND11_MODULE(_C, m) {
   m.def("free_runtime", &spyre::freeRuntime);
   m.def("device_count", &spyre::getVisibleDeviceCount);
   m.def("encode_constant", &spyre::encodeConstant);
+  m.def(
+      "is_pinned_ptr",
+      [](uintptr_t ptr) {
+        return spyre::is_spyre_pinned_ptr(reinterpret_cast<void*>(ptr));
+      },
+      py::arg("ptr"), "Check whether an address is Spyre-pinned memory");
 
   // Initialize logging bindings
   torch_spyre::logging::init_logging_bindings(m);

@@ -61,6 +61,14 @@ namespace spyre {
 auto get_dim_map(c10::IntArrayRef sizes, c10::IntArrayRef strides,
                  c10::IntArrayRef device_sizes, c10::IntArrayRef stride_map)
     -> std::vector<int> {
+  TORCH_CHECK(sizes.size() == strides.size(),
+              "DMA host sizes/strides rank mismatch: ", sizes.size(), " vs ",
+              strides.size());
+  TORCH_CHECK(device_sizes.size() == stride_map.size(),
+              "DMA device sizes/stride-map rank mismatch: ",
+              device_sizes.size(), " vs ", stride_map.size());
+  TORCH_CHECK(!stride_map.empty(), "DMA device stride map must not be empty");
+
   const int host_rank = strides.size();
   const int device_rank = stride_map.size();
   const int stick_dim_index = device_rank > 2 ? device_rank - 3 : 0;
@@ -109,6 +117,14 @@ auto get_dim_map(c10::IntArrayRef sizes, c10::IntArrayRef strides,
 auto get_tile_map(c10::IntArrayRef sizes, c10::IntArrayRef strides,
                   c10::IntArrayRef device_sizes, c10::IntArrayRef stride_map)
     -> std::vector<std::vector<int>> {
+  TORCH_CHECK(sizes.size() == strides.size(),
+              "DMA host sizes/strides rank mismatch: ", sizes.size(), " vs ",
+              strides.size());
+  TORCH_CHECK(device_sizes.size() == stride_map.size(),
+              "DMA device sizes/stride-map rank mismatch: ",
+              device_sizes.size(), " vs ", stride_map.size());
+  TORCH_CHECK(!stride_map.empty(), "DMA device stride map must not be empty");
+
   const std::vector<int> dim_map =
       get_dim_map(sizes, strides, device_sizes, stride_map);
 
@@ -180,6 +196,21 @@ auto get_device_stride_infos(c10::IntArrayRef sizes,
                              bool host2device,
                              c10::IntArrayRef cpu_tensor_strides)
     -> std::vector<DataConversionStrideInfo> {
+  TORCH_CHECK(sizes.size() == spyre_dma_strides.size(),
+              "DMA sizes/device-strides rank mismatch: ", sizes.size(), " vs ",
+              spyre_dma_strides.size());
+  TORCH_CHECK(sizes.size() == cpu_tensor_strides.size(),
+              "DMA sizes/CPU-strides rank mismatch: ", sizes.size(), " vs ",
+              cpu_tensor_strides.size());
+  TORCH_CHECK(stl.device_size.size() == stl.stride_map.size(),
+              "DMA device sizes/stride-map rank mismatch: ",
+              stl.device_size.size(), " vs ", stl.stride_map.size());
+  TORCH_CHECK(!stl.stride_map.empty(),
+              "DMA device stride map must not be empty");
+  TORCH_CHECK(storage_offset >= 0,
+              "DMA CPU storage offset must be non-negative, got ",
+              storage_offset);
+
   const std::vector<std::vector<int>> tile_map =
       get_tile_map(sizes, spyre_dma_strides, stl.device_size, stl.stride_map);
 
@@ -479,7 +510,22 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
       cpu_shape = spyre_tensor_impl->dma_sizes;
       t_sizes = c10::IntArrayRef(spyre_tensor_impl->dma_sizes);
       t_dev_strides = c10::IntArrayRef(spyre_tensor_impl->dma_strides);
-      t_cpu_strides = c10::IntArrayRef(spyre_tensor_impl->dma_strides);
+
+      // A direct D2H into a destination such as channels-last must describe the
+      // actual CPU layout only when the device tensor still has its inherited
+      // physical DMA sizes and strides. Device views such as a square transpose
+      // can preserve shape while changing logical strides; preserve physical
+      // DMA strides for those views so post-transfer mapping remains correct.
+      const bool device_matches_dma_layout =
+          dev_tensor->dim() == static_cast<int64_t>(t_sizes.size()) &&
+          dev_tensor->sizes().equals(t_sizes) &&
+          dev_tensor->strides().equals(t_dev_strides);
+      const bool cpu_matches_dma_shape =
+          cpu_tensor->dim() == static_cast<int64_t>(t_sizes.size()) &&
+          cpu_tensor->sizes().equals(t_sizes);
+      t_cpu_strides = device_matches_dma_layout && cpu_matches_dma_shape
+                          ? cpu_tensor->strides()
+                          : c10::IntArrayRef(spyre_tensor_impl->dma_strides);
     }
   }
   // Reverse PyTorch ordering
@@ -703,7 +749,10 @@ at::Tensor spyre_copy_from(const at::Tensor& self, const at::Tensor& dst,
   }
 
   stream.copyAsync(*copy_from, *copy_to);
-  if (!non_blocking) {
+  // Materialized view copies read cpu_alloc immediately below, so they must
+  // complete even when the caller requested non-blocking behavior. Direct D2H
+  // keeps the destination alive through Flex and may remain asynchronous.
+  if (!non_blocking || !non_overlapping_and_dense) {
     stream.synchronize();
   }
 
