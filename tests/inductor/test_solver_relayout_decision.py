@@ -63,6 +63,24 @@ _CORE = sympy.Symbol("core_id")
 _PER_CORE = 16  # P is 64 bytes sliced 4 ways
 
 
+@pytest.mark.parametrize(
+    "cap,costs,expected",
+    [(1, {0: 10000, 1: 1000}, [1]), (1, None, [0]), (0, {0: 10000, 1: 1000}, [0, 1])],
+)
+def test_relayout_shortlist_prices_the_consumer(monkeypatch, cap, costs, expected):
+    """Saving 500 ns on a copy must not hide a 9000 ns faster consumer."""
+    monkeypatch.setattr(config, "lx_solver_relayout_groups_per_edge", cap)
+    candidates = [
+        _candidate("C", 0, 500, group=0, j=0),
+        _candidate("C", 0, 1000, group=1, j=1),
+    ]
+    divisions = [CoreDivision(splits={sympy.Symbol("d0"): 4})] * 2
+    kept = CoOptimizingAllocator._cap_relayout_groups(
+        "P", "C", candidates, divisions, costs
+    )
+    assert [c.group for c in kept] == expected
+
+
 def _view(slot: int, num_cores: int = 4) -> PerCoreView:
     """A 4-way per-core view of device dim 1 on ``num_cores`` cores; ``slot``
     rotates the ownership so distinct slots are distinct (relayout-compatible)

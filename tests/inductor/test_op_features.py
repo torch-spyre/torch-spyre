@@ -538,6 +538,19 @@ class SymbolicMatmulSplitCostTest(TestCase):
         self.assertEqual({m, n, k}, {self.M_SPLIT, self.N_SPLIT, self.K_SPLIT})
         self.assertFalse(getattr(b, "free_symbols", set()))
 
+    def test_single_batch_and_broadcast_inputs_use_shared_weight_cost(self):
+        from torch_spyre._inductor.cost_model import _matmul_axes_for_split_cost
+
+        mm = self._matmul()
+        self.assertTrue(_matmul_axes_for_split_cost(mm)[-1])
+        bmm = dataclasses.replace(mm, out_elems=4 * mm.out_elems)
+        self.assertFalse(_matmul_axes_for_split_cost(bmm)[-1])
+        inputs = [dataclasses.replace(a) for a in bmm.args]
+        inputs[-1].broadcast = True
+        self.assertTrue(
+            _matmul_axes_for_split_cost(dataclasses.replace(bmm, args=inputs))[-1]
+        )
+
     def test_a_symbolic_split_matmul_builds_a_cost_expression(self):
         expr = sympy.sympify(predict_ops([self._matmul()], self._params()))
         self.assertEqual(

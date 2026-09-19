@@ -47,6 +47,84 @@ ELEMS, DTYPE = 1024, 2
 BYTES = ELEMS * DTYPE
 
 
+@pytest.mark.parametrize("shared_weight", [False, True])
+@pytest.mark.parametrize("k_split", [1, 2])
+def test_matmul_time_does_not_charge_unused_available_cores(shared_weight, k_split):
+    from torch_spyre._inductor.work_division import (
+        _matmul_execution_cost,
+        _matmul_split_cost,
+    )
+
+    axes = ((16, 8), (64, 1), (128, 1), (256, k_split))
+    used = 8 * k_split
+    options = dict(shared_weight=shared_weight, include_hbm=False)
+    estimate = _matmul_execution_cost(*axes, used, **options)
+    assert estimate > 0
+    assert _matmul_execution_cost(*axes, 32, **options) == pytest.approx(estimate)
+    split = sympy.Symbol("k_split", integer=True, positive=True)
+    symbolic = _matmul_execution_cost(*axes[:3], (256, split), 32, **options)
+    assert float(symbolic.subs(split, k_split)) == pytest.approx(estimate)
+    assert _matmul_split_cost(*axes, 32, **options) > _matmul_split_cost(
+        *axes, used, **options
+    )
+
+
+@pytest.mark.parametrize("shared_weight", [False, True])
+def test_split_sum_matmul_prices_one_corelet(shared_weight):
+    from torch_spyre._inductor import work_division as wd
+
+    split = sympy.Symbol("k_split", integer=True, positive=True)
+    axes = ((2, 2), (128, 2), (256, 2), (1024, split))
+    price = wd._matmul_execution_cost(
+        *axes, 32, shared_weight=shared_weight, include_hbm=False
+    )
+    coefficient = (
+        wd._PSUM_PER_CORE_ELEM_US if shared_weight else wd._BMM_PSUM_PER_CORE_ELEM_US
+    )
+    for k in (1, 2, 4):
+        compute = (2 * 128 * 256 * 1024) / (8 * k) / wd._PEAK_MACS_US_CORE
+        expected = compute * (2 if k > 1 else 1) + (k - 1) * 8192 * coefficient
+        assert float(price.subs(split, k)) == pytest.approx(expected)
+        assert wd._matmul_execution_cost(
+            *axes[:3], (1024, k), 32, shared_weight=shared_weight, include_hbm=False
+        ) == pytest.approx(expected)
+
+
+def test_joint_matmul_price_is_independent_of_standalone_preferences(monkeypatch):
+    from torch_spyre._inductor import work_division as wd
+
+    op = OpFeatures(
+        name="bmm",
+        is_reduction=True,
+        dtype_bytes=2,
+        args=[],
+        is_matmul=True,
+        out_elems=16 * 64 * 128,
+        cores=16,
+        matmul_macs=16 * 64 * 128 * 256,
+        matmul_rows_per_core=64,
+        matmul_cols_per_core=128,
+        matmul_a_bytes=64 * 256 * 2,
+        matmul_b_bytes=256 * 128 * 2,
+    )
+    params = cost_model.CostParams(use_bundled_cost_model=False)
+    before = cost_model.predict_ops([op], params)
+    axes = ((16, 8), (64, 1), (128, 1), (256, 1))
+    standalone = wd._matmul_split_cost(*axes, 32)
+    for name in (
+        "_CORE_UNDERUSE_PENALTY_US",
+        "_M_TILE_UNDERFILL_PENALTY_US",
+        "_M_LANE_UNDERUSE_PENALTY_US",
+        "_BMM_BATCH_SPLIT_PENALTY_US",
+        "_WIDE_N_TILE_PENALTY_US",
+        "_LARGE_M_TILE_SHAPE_PENALTY_US",
+        "_SHARED_DOWN_N_SPLIT_PENALTY_US",
+    ):
+        monkeypatch.setattr(wd, name, getattr(wd, name) * 2)
+    assert cost_model.predict_ops([op], params) == pytest.approx(before)
+    assert wd._matmul_split_cost(*axes, 32) > standalone
+
+
 def _reader(name, out, *, input_name="arg0_1", resident=(), resident_expr=None):
     """A pointwise op reading the graph input ``input_name`` and writing ``out``.
 
