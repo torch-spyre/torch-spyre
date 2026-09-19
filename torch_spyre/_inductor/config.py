@@ -115,10 +115,11 @@ lx_solver_relayout_presolve_max_copies: int = int(
     os.getenv("SPYRE_LX_SOLVER_RELAYOUT_PRESOLVE_MAX_COPIES", "64")
 )
 
-# Submit independent DXP kernel compilations to Inductor's subprocess pool and
-# resolve them together at the generated wrapper's async_compile.wait() barrier.
-# This is opt-in while the parallel path is evaluated on full model compiles.
-async_dxp_compile: bool = os.getenv("SPYRE_ASYNC_DXP_COMPILE", "0").lower() in (
+# Submit independent backend-compiler kernel compilations to Inductor's
+# subprocess pool and resolve them together at the generated wrapper's
+# async_compile.wait() barrier. This is opt-in while the parallel path is
+# evaluated on full model compiles.
+async_backend_compile: bool = os.getenv("SPYRE_ASYNC_BACKEND_COMPILE", "0").lower() in (
     "1",
     "true",
     "yes",

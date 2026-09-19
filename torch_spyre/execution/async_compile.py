@@ -258,7 +258,7 @@ def _run_backend_compiler(
 
 
 class _SpyreCompileFuture(CodeCacheFuture):
-    """Resolve one DXP task and construct its runner in the parent process."""
+    """Resolve one backend compile task and build its runner in the parent."""
 
     def __init__(
         self,
@@ -340,9 +340,11 @@ class SpyreAsyncCompile(AsyncCompile):
             "go through cpp_pybinding (cpu_backend='cpp')."
         )
 
-    def _submit_dxp(self, kernel_name: str, compile_dir: str) -> Future[str] | None:
-        """Submit DXP to Inductor's process pool, or compile synchronously."""
-        if _spyre_config.async_dxp_compile and get_compile_threads() > 1:
+    def _submit_backend_compile(
+        self, kernel_name: str, compile_dir: str
+    ) -> Future[str] | None:
+        """Submit the backend compile to Inductor's pool, or compile inline."""
+        if _spyre_config.async_backend_compile and get_compile_threads() > 1:
             # The first use creates the pool and submits its readiness probe.
             # Waiting for that short probe guarantees the first Spyre kernel is
             # parallel too, rather than accidentally compiling it inline.
@@ -458,7 +460,7 @@ class SpyreAsyncCompile(AsyncCompile):
                         kernel_name, compile_dir, specs, pool_size
                     )
                     save_symbol_kinds(compile_dir, symbol_kinds)
-                    task = self._submit_dxp(kernel_name, compile_dir)
+                    task = self._submit_backend_compile(kernel_name, compile_dir)
                     if task is not None:
                         return self._compile_future(
                             task,
@@ -486,7 +488,7 @@ class SpyreAsyncCompile(AsyncCompile):
         # Compile into a throw-away temp dir that lives for this process only.
         output_dir = get_output_dir(kernel_name)
         symbol_kinds = _compile_to_dir(kernel_name, output_dir, specs, pool_size)
-        task = self._submit_dxp(kernel_name, output_dir)
+        task = self._submit_backend_compile(kernel_name, output_dir)
         if task is not None:
             return self._compile_future(
                 task,
