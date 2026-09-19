@@ -25,14 +25,54 @@ import clickhouse_connect
 from . import schema
 
 
-def get_client():
+def _env(name: str, default: str = "") -> str:
+    """An env var, treating BLANK as absent.
+
+    GitHub Actions exports an unset secret as the empty string, so os.environ.get(name, default)
+    returns "" and never the default -- which made every fallback below unreachable and turned a
+    missing CLICKHOUSE_PORT into `int("")` with an opaque ValueError.
+    """
+    return (os.environ.get(name) or "").strip() or default
+
+
+def get_client(*, verify: bool = True):
+    """The one ClickHouse connection factory for every ingest in this repo.
+
+    `verify` exists because one ingest talks to an endpoint whose certificate does not validate;
+    it is a parameter rather than a second copy of this function.
+    """
+    host = _env("CLICKHOUSE_HOST")
+    if not host:
+        raise SystemExit(
+            "CLICKHOUSE_HOST is unset or empty -- check the workflow's secrets mapping"
+        )
+    password = _env("CLICKHOUSE_PASS")
+    if not password:
+        raise SystemExit(
+            "CLICKHOUSE_PASS is unset or empty -- check the workflow's secrets mapping"
+        )
+    port_raw = _env("CLICKHOUSE_PORT", "443")
+    try:
+        port = int(port_raw)
+    except ValueError:
+        raise SystemExit(f"CLICKHOUSE_PORT is not a number: {port_raw!r}") from None
     return clickhouse_connect.get_client(
-        host=os.environ["CLICKHOUSE_HOST"],
-        port=int(os.environ.get("CLICKHOUSE_PORT", 443)),
-        user=os.environ.get("CLICKHOUSE_USER", "default"),
-        password=os.environ["CLICKHOUSE_PASS"],
-        database=os.environ.get("CLICKHOUSE_DB", "spyre"),
+        host=host,
+        port=port,
+        user=_env("CLICKHOUSE_USER", "default"),
+        password=password,
+        database=_env("CLICKHOUSE_DB", "spyre"),
         secure=True,
+        verify=verify,
+    )
+
+
+def client_summary() -> str:
+    """A host:port/database string for logging, read through the same resolver as the connection,
+    so a banner cannot claim a port the client did not use."""
+    return (
+        f"{_env('CLICKHOUSE_HOST')}:{_env('CLICKHOUSE_PORT', '443')}"
+        f"/{_env('CLICKHOUSE_DB', 'spyre')}"
     )
 
 

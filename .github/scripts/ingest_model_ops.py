@@ -39,7 +39,7 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-import clickhouse_connect
+from spyre_clickhouse_ingest.client import get_client as _get_client
 
 # ---------------------------------------------------------------------------
 # ClickHouse DDL
@@ -146,15 +146,9 @@ SETTINGS index_granularity = 8192
 
 
 def get_client():
-    return clickhouse_connect.get_client(
-        host=os.environ["CLICKHOUSE_HOST"],
-        port=int(os.environ.get("CLICKHOUSE_PORT", 443)),
-        user=os.environ.get("CLICKHOUSE_USER", "default"),
-        password=os.environ["CLICKHOUSE_PASS"],
-        database=os.environ.get("CLICKHOUSE_DB", "spyre"),
-        secure=True,
-        verify=False,
-    )
+    """This endpoint's certificate does not validate, hence verify=False -- the only reason this
+    wrapper exists rather than importing the shared factory directly."""
+    return _get_client(verify=False)
 
 
 def _parse_ts(ts_str: str) -> datetime:

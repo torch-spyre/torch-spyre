@@ -10,16 +10,31 @@ normalisation step produces ids that silently never join — no error, just miss
 
 ## Install
 
-No PyPI or Artifactory publish. Every consumer installs it straight from the repo, pinned:
+No PyPI or Artifactory publish. Every consumer installs it straight from the repo.
+
+Inside torch-spyre, install from the CHECKOUT, so the library is always the same commit as the
+script importing it:
+
+```
+uv pip install "${GITHUB_WORKSPACE}/extensions/clickhouse-ingest"
+```
+
+From another repo, where that path does not exist, install from git at `@main`:
 
 ```
 uv run --no-project \
-  --with "git+https://github.com/torch-spyre/torch-spyre@<tag>#subdirectory=extensions/clickhouse-ingest" \
+  --with "git+https://github.com/torch-spyre/torch-spyre@main#subdirectory=extensions/clickhouse-ingest" \
   ...
 ```
 
 Verified on a build node with the same `uv run --no-project --with` form the baked-image ingest
-uses. Pin a tag, not `@main`.
+uses.
+
+`@main` rather than a tag, deliberately: this library's whole purpose is that ONE definition of
+the derived ids runs everywhere. A consumer pinned to an older tag is a second definition again --
+it just fails later and less visibly than a copied file. The identity functions are covered by
+golden-value tests (`tests/test_identity_golden.py`), so `@main` moving is not supposed to be able
+to change an id; if it ever does, those tests are the thing that must stop it.
 
 ## Layout
 
@@ -30,6 +45,10 @@ uses. Pin a tag, not `@main`.
 | `client.py` | `get_client`, `v2_database`, `v2_tables_present` |
 | `v2_writer.py` | `insert_v2`, `v2_already_ingested` |
 | `junit.py` | JUnit helpers + CI run-coordinate resolution |
+| `hw_parse.py` | GHA log → `hw_failure_diagnostics` records (RAS events, phases, pytest counts) |
+| `hw_schema.py` | `hw_failure_diagnostics` columns + its `ADD COLUMN IF NOT EXISTS` migration |
+| `hw_diagnostics.py` | `build_row`/`insert_rows` for `hw_failure_diagnostics` |
+| `gha_logs.py` | fetching GHA job logs via `gh`, with transient-5xx retry |
 
 ## Tables modelled
 
@@ -50,8 +69,10 @@ A dashboard route that assumed uuids matched zero rows and rendered nothing, wit
 
 ## What is deliberately NOT here
 
-- **v1 write paths.** The product repos write v1 to differently-named tables (`hf_test_runs` vs
-  `test_runs`), so those stay per-repo until v1 is retired.
+- **v1 write paths whose TARGET TABLE differs per repo.** `hf_test_runs` vs `test_runs` cannot share
+  a writer, so those stay per-repo until v1 is retired. Name divergence is the blocker, not the v1
+  generation as such: `hw_failure_diagnostics` is the same table with the same columns in every repo,
+  which is why its parse/ingest lives here despite being v1.
 - **A dependency on `torch_spyre`.** Installing that to obtain a schema module would pull
   torch/numpy/ortools, and ortools has no ppc64le/s390x wheel — the ingest would break on p/z.
 

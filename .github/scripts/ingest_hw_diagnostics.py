@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """
-========================
-Reads the JSON produced by parse_hardware_failures.py and batch-inserts
-the rows into ClickHouse (hw_failure_diagnostics table).
+Reads the JSON produced by parse_hw_failures.py and batch-inserts the rows
+into ClickHouse (hw_failure_diagnostics table).
 
 Usage (called by the GHA workflow):
     python3 ingest_hw_diagnostics.py \
@@ -12,246 +11,30 @@ Usage (called by the GHA workflow):
         --sha       "abc123..." \
         --run-id    "74526099734" \
         --run-link  "https://github.com/org/repo/actions/runs/74526099734"
+
+The parse/ingest logic lives in spyre_clickhouse_ingest (extensions/clickhouse-ingest) so the
+product repos share one definition; this file is the CLI around it.
 """
 
 import argparse
-import json
-import os
 import sys
-from datetime import datetime, timezone
+from collections import Counter
 from pathlib import Path
-import clickhouse_connect
 
-# ---------------------------------------------------------------------------
-# ClickHouse connection client
-# ---------------------------------------------------------------------------
-
-
-def get_client():
-    return clickhouse_connect.get_client(
-        host=os.environ["CLICKHOUSE_HOST"],
-        port=int(os.environ.get("CLICKHOUSE_PORT", 443)),
-        user=os.environ.get("CLICKHOUSE_USER", "default"),
-        password=os.environ["CLICKHOUSE_PASS"],
-        database=os.environ.get("CLICKHOUSE_DB", "spyre"),
-        secure=True,
-    )
-
-
-# ---------------------------------------------------------------------------
-# Type coercion helpers
-# ---------------------------------------------------------------------------
-
-
-def _parse_ts(ts_str: str) -> datetime | None:
-    """ISO-8601 string → naive UTC datetime, or None."""
-    if not ts_str:
-        return None
-    try:
-        dt = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
-        return dt.replace(tzinfo=None)  # ClickHouse DateTime64 wants naive
-    except (ValueError, AttributeError):
-        return None
-
-
-def _str(val, default: str = "") -> str:
-    if val is None:
-        return default
-    return str(val).strip()
-
-
-def _int(val, default: int = 0) -> int:
-    try:
-        return int(val)
-    except (TypeError, ValueError):
-        return default
-
-
-def _detail_json(val) -> str:
-    """Serialise failure_reason_detail dict → JSON string for ClickHouse."""
-    if not val:
-        return "{}"
-    if isinstance(val, str):
-        return val
-    try:
-        return json.dumps(val, ensure_ascii=False)
-    except (TypeError, ValueError):
-        return "{}"
-
-
-# ---------------------------------------------------------------------------
-# Row builder
-# ---------------------------------------------------------------------------
-
-
-def build_row(rec: dict, args) -> list:
-    """
-    Map one JSON record → ordered list matching hw_failure_diagnostics columns.
-    Column order must match COLUMN_NAMES below exactly.
-    """
-    return [
-        # ── Identity ──────────────────────────────────────────────────────
-        _str(rec.get("run_id") or args.run_id),
-        _str(args.workflow),
-        _str(args.branch),
-        _str(args.sha)[:40].ljust(40)[:40],  # normalise to ≤40 chars
-        _str(args.run_link),
-        _str(rec.get("suite_name")),
-        _int(rec.get("attempt"), 1),
-        _int(rec.get("total_attempts"), 1),
-        _int(rec.get("pod_level_retry"), 0),
-        _parse_ts(rec.get("ingested_at"))
-        or datetime.now(timezone.utc).replace(tzinfo=None),
-        # ── Outcome ───────────────────────────────────────────────────────
-        _str(rec.get("outcome"), "unknown"),
-        rec.get("exit_code"),  # Nullable(Int32) — keep None
-        # ── Failure classification ────────────────────────────────────────
-        _str(rec.get("failure_reason"), "none"),
-        _str(rec.get("failure_phase")),
-        _str(rec.get("retry_trigger")),
-        _detail_json(rec.get("failure_reason_detail")),
-        # ── Primary RAS event ─────────────────────────────────────────────
-        _str(rec.get("ras_code")),
-        _str(rec.get("ras_name")),
-        _str(rec.get("ras_description")),
-        _str(rec.get("ras_action")),
-        _str(rec.get("ras_category")),
-        _str(rec.get("ras_severity")),
-        _str(rec.get("ras_message")),
-        _str(rec.get("ras_events_json"), "[]"),
-        # ── Hardware identifiers ──────────────────────────────────────────
-        _str(rec.get("node_name")),
-        _str(rec.get("pci_device")),
-        _str(rec.get("aiu_world_rank0")),
-        _str(rec.get("card_serial")),
-        _str(rec.get("chip_ecid_raw")),
-        _str(rec.get("chip_wafer_id")),
-        _str(rec.get("chip_mfg_x")),
-        _str(rec.get("chip_mfg_y")),
-        _str(rec.get("chip_chipy")),
-        _str(rec.get("chip_chipx")),
-        # ── Timestamps ────────────────────────────────────────────────────
-        _parse_ts(rec.get("first_error_ts")),  # Nullable(DateTime64)
-        _parse_ts(rec.get("attempt_start_ts")),
-        # ── Pytest statistics ─────────────────────────────────────────────
-        _int(rec.get("tests_collected")),
-        _int(rec.get("tests_passed")),
-        _int(rec.get("tests_failed")),
-        _int(rec.get("tests_error")),
-        # ── Stall info ────────────────────────────────────────────────────
-        _int(rec.get("stall_max_secs")),
-    ]
-
-
-# Column names — must match build_row() order and hw_failure_diagnostics DDL
-COLUMN_NAMES = [
-    # Identity
-    "run_id",
-    "workflow",
-    "branch",
-    "commit_sha",
-    "run_link",
-    "suite_name",
-    "attempt",
-    "total_attempts",
-    "pod_level_retry",
-    "ingested_at",
-    # Outcome
-    "outcome",
-    "exit_code",
-    # Failure classification
-    "failure_reason",
-    "failure_phase",
-    "retry_trigger",
-    "failure_reason_detail",
-    # RAS
-    "ras_code",
-    "ras_name",
-    "ras_description",
-    "ras_action",
-    "ras_category",
-    "ras_severity",
-    "ras_message",
-    "ras_events_json",
-    # Hardware
-    "node_name",
-    "pci_device",
-    "aiu_world_rank0",
-    "card_serial",
-    "chip_ecid_raw",
-    "chip_wafer_id",
-    "chip_mfg_x",
-    "chip_mfg_y",
-    "chip_chipy",
-    "chip_chipx",
-    # Timestamps
-    "first_error_ts",
-    "attempt_start_ts",
-    # Pytest stats
-    "tests_collected",
-    "tests_passed",
-    "tests_failed",
-    "tests_error",
-    # Stall
-    "stall_max_secs",
-]
-
-
-# ---------------------------------------------------------------------------
-# Deduplication
-# ---------------------------------------------------------------------------
-
-
-def already_ingested(client, run_id: str, workflow: str) -> bool:
-    """
-    Return True if this (run_id, workflow) pair already has rows in the table.
-    Prevents double-ingestion if the GHA job is re-run.
-    """
-    result = client.query(
-        "SELECT count() FROM hw_failure_diagnostics "
-        "WHERE run_id = {run_id:String} AND workflow = {workflow:String}",
-        parameters={"run_id": run_id, "workflow": workflow},
-    )
-    return result.result_rows[0][0] > 0
-
-
-# ---------------------------------------------------------------------------
-# Schema update helper
-# ---------------------------------------------------------------------------
-
-
-def ensure_extra_columns(client) -> None:
-    """
-    Add columns that may not exist in older deployments of the schema.
-    ALTER TABLE ADD COLUMN IF NOT EXISTS is idempotent in ClickHouse.
-    """
-    extras = [
-        ("workflow", "LowCardinality(String) DEFAULT ''"),
-        ("branch", "LowCardinality(String) DEFAULT ''"),
-        ("commit_sha", "String DEFAULT ''"),
-        ("run_link", "String DEFAULT ''"),
-        ("failure_reason_detail", "String DEFAULT '{}'"),
-        ("ras_category", "LowCardinality(String) DEFAULT ''"),
-        ("ras_severity", "LowCardinality(String) DEFAULT ''"),
-        ("ras_message", "String DEFAULT ''"),
-        ("ras_events_json", "String DEFAULT '[]'"),
-        # True when this row came from a _test_matrix.yaml pod-level-retry job (a fresh-pod re-run), not the original job.
-        ("pod_level_retry", "Bool DEFAULT false"),
-    ]
-    for col_name, col_type in extras:
-        try:
-            client.command(
-                f"ALTER TABLE hw_failure_diagnostics "
-                f"ADD COLUMN IF NOT EXISTS {col_name} {col_type}"
-            )
-        except Exception as exc:
-            # Non-fatal: log and continue (column may already exist with right type)
-            print(f"  [warn] Could not add column {col_name}: {exc}", file=sys.stderr)
-
-
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
+from spyre_clickhouse_ingest.client import client_summary, get_client
+from spyre_clickhouse_ingest.hw_diagnostics import (
+    RunContext,
+    _str,
+    build_row,
+    filter_suite_records,
+    insert_rows,
+    load_records,
+)
+from spyre_clickhouse_ingest.hw_schema import (
+    DEFAULT_TABLE,
+    already_ingested,
+    ensure_extra_columns,
+)
 
 
 def main() -> None:
@@ -263,7 +46,7 @@ def main() -> None:
     parser.add_argument(
         "--json-file",
         required=True,
-        help="Path to JSON file produced by parse_hardware_failures.py",
+        help="Path to JSON file produced by parse_hw_failures.py",
     )
     parser.add_argument(
         "--workflow", default="", help="Originating GHA workflow name (e.g. 'tests')"
@@ -282,63 +65,62 @@ def main() -> None:
     )
     parser.add_argument(
         "--table",
-        default="hw_failure_diagnostics",
-        help="Target ClickHouse table (default: hw_failure_diagnostics)",
+        default=DEFAULT_TABLE,
+        help=f"Target ClickHouse table (default: {DEFAULT_TABLE})",
     )
     args = parser.parse_args()
 
-    # ── Load JSON ──────────────────────────────────────────────────────────
     json_path = Path(args.json_file)
     if not json_path.exists():
         print(f"[error] File not found: {json_path}", file=sys.stderr)
         sys.exit(1)
 
-    with open(json_path) as fh:
-        records = json.load(fh)
-
+    records = load_records(json_path)
     if not records:
         print("[info] JSON file contains no records — nothing to ingest.")
         sys.exit(0)
 
-    # Filter out any .DS_Store / meta records that slipped through
-    records = [
-        r
-        for r in records
-        if r.get("suite_name", "").strip() and not r["suite_name"].startswith(".")
-    ]
+    # Both emptiness checks are needed, and both belong BEFORE the connect: the filter can empty a
+    # non-empty list, and the dedup step below indexes records[0]. Checking only the file left an
+    # IndexError reachable after a ClickHouse session was already open.
+    records = filter_suite_records(records)
+    if not records:
+        print("[info] No suite records after filtering — nothing to ingest.")
+        sys.exit(0)
 
     print(f"[info] Loaded {len(records)} record(s) from {json_path.name}")
 
-    # ── Connect ────────────────────────────────────────────────────────────
-    print(
-        f"[info] Connecting to ClickHouse at "
-        f"{os.environ['CLICKHOUSE_HOST']}:{os.environ.get('CLICKHOUSE_PORT', 443)} ..."
-    )
+    print(f"[info] Connecting to ClickHouse at {client_summary()} ...")
     client = get_client()
     client.command("SELECT 1")
     print("[info] Connected.\n")
 
-    # ── Ensure schema is up to date ────────────────────────────────────────
-    ensure_extra_columns(client)
+    ensure_extra_columns(client, table=args.table)
 
-    # ── Deduplication check ────────────────────────────────────────────────
-    # Use the run_id from the first record (all records in one JSON share a run)
+    # One JSON file is one run, so the first record's run_id represents the batch.
     run_id = _str(records[0].get("run_id") or args.run_id)
     workflow = _str(args.workflow)
 
-    if already_ingested(client, run_id, workflow):
+    if already_ingested(client, run_id, workflow, table=args.table):
         print(
             f"[info] run_id={run_id!r} workflow={workflow!r} already ingested "
             f"— skipping. Re-run with a different table or clear the existing rows."
         )
         sys.exit(0)
 
-    # ── Build rows ─────────────────────────────────────────────────────────
+    ctx = RunContext(
+        run_id=args.run_id,
+        workflow=args.workflow,
+        branch=args.branch,
+        sha=args.sha,
+        run_link=args.run_link,
+    )
+
     rows = []
     skipped = 0
     for rec in records:
         try:
-            rows.append(build_row(rec, args))
+            rows.append(build_row(rec, ctx))
         except Exception as exc:
             skipped += 1
             print(
@@ -354,20 +136,12 @@ def main() -> None:
         print("[error] No valid rows to insert.", file=sys.stderr)
         sys.exit(1)
 
-    # ── Insert ─────────────────────────────────────────────────────────────
     print(f"[info] Inserting {len(rows)} row(s) into {args.table} ...")
     try:
-        client.insert(
-            table=args.table,
-            data=rows,
-            column_names=COLUMN_NAMES,
-        )
+        insert_rows(client, rows, table=args.table)
     except Exception as exc:
         print(f"[error] Insert failed: {exc}", file=sys.stderr)
         sys.exit(1)
-
-    # ── Summary ────────────────────────────────────────────────────────────
-    from collections import Counter
 
     reasons: Counter = Counter(_str(r.get("failure_reason"), "none") for r in records)
     outcomes: Counter = Counter(_str(r.get("outcome"), "unknown") for r in records)

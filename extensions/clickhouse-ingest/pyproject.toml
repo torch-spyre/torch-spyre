@@ -9,6 +9,10 @@ requires-python = ">=3.11"
 # The ingest runtime is three wheels, and clickhouse-connect is the only one this package needs.
 dependencies = [
     "clickhouse-connect>=1.3.0",
+    # hw_parse imports it: the repos forbid stdlib `re` (enforce-import-regex-instead-of-re), so a
+    # module here hard-imports `regex` and must declare it or the next consumer gets ImportError.
+    # Unlike ortools it ships ppc64le/s390x wheels, so this costs the p/z ingests nothing.
+    "regex",
 ]
 
 [dependency-groups]

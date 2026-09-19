@@ -52,6 +52,10 @@ jobs:
           sparse-checkout: |
             .github/scripts/parse_hw_failures.py
             .github/scripts/ingest_hw_diagnostics.py
+            # Both scripts import it. Listing only the entry points makes the first import fail
+            # at startup, so the job exits 1 having written nothing.
+            extensions/clickhouse-ingest
+          sparse-checkout-cone-mode: false
 
       - name: Install uv
         uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
@@ -74,7 +78,15 @@ jobs:
       - name: Install Python dependencies
         run: |
           source .venv/bin/activate
-          uv pip install clickhouse-connect regex
+          # Installed from this checkout, not a git URL, so the library is always the same commit
+          # as the scripts importing it.
+          CHLIB="${GITHUB_WORKSPACE}/extensions/clickhouse-ingest"
+          if [ ! -f "${CHLIB}/pyproject.toml" ]; then
+            echo "::error::spyre-clickhouse-ingest not found at ${CHLIB} -- the checkout step must" \
+                 "sparse-checkout extensions/clickhouse-ingest with cone mode off."
+            exit 1
+          fi
+          uv pip install clickhouse-connect regex "${CHLIB}"
 
       # actions4gh/setup-gh@v1.0.2 extracts the gh tarball but never lands
       # the binary on PATH before it calls `gh auth login`, so every job
@@ -110,6 +122,9 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          # The download helper is imported from the installed library, so the venv is needed here
+          # too -- this step used to be stdlib-only.
+          source .venv/bin/activate
           mkdir -p raw_logs
 
           # Retries the job-listing call below on a transient 502 from the GitHub API.
@@ -142,88 +157,19 @@ jobs:
           > /tmp/jobs.jsonl
 
           python3 - << 'PYEOF'
-          import json, os, re, subprocess, sys, time
+          import os
 
-          repo = os.environ["GITHUB_REPOSITORY"]
-          jobs = [json.loads(l) for l in open("/tmp/jobs.jsonl") if l.strip()]
-
-          # Defensive: dedupe by job id even with filter=latest pinned above, so a
-          # duplicate entry in the API response downloads and parses each job once,
-          # not once per repeated listing.
-          seen_ids = set()
-          deduped = []
-          for j in jobs:
-              if j["id"] not in seen_ids:
-                  seen_ids.add(j["id"])
-                  deduped.append(j)
-          if len(deduped) != len(jobs):
-              print(f"[warn] jobs list had {len(jobs) - len(deduped)} duplicate id(s), deduped")
-          jobs = deduped
-
-          # gh 2.97.0 started refusing to emit a response body that contains
-          # terminal escape sequences unless --allow-escape-sequences is passed,
-          # and Actions job logs are full of them. Without the flag every
-          # download exits 1 with an empty body, raw_logs/ stays empty and the
-          # ingest is silently skipped. The flag does not exist before 2.97.0,
-          # so probe for it rather than pinning a version.
-          esc = subprocess.run(
-              ["gh", "api", "--help"], capture_output=True, text=True
-          ).stdout
-          esc_flag = (
-              ["--allow-escape-sequences"] if "--allow-escape-sequences" in esc else []
+          from spyre_clickhouse_ingest.gha_logs import (
+              download_job_logs_or_die,
+              load_jobs,
           )
 
-          # gh api occasionally returns a transient 5xx (mostly a 502) for the
-          # log-download endpoint; retry those with backoff rather than
-          # dropping the job's log. A 404 (e.g. a job with no logs) is not
-          # transient, so it's returned to the caller immediately instead of
-          # burning through retries.
-          def download_job_log(args, max_attempts=5, base_delay=2):
-              for attempt in range(1, max_attempts + 1):
-                  result = subprocess.run(
-                      args, capture_output=True, env={**os.environ}
-                  )
-                  if result.returncode == 0:
-                      return result
-                  err = result.stderr.decode("utf-8", "replace")
-                  transient = any(code in err for code in ("502", "503", "504"))
-                  if not transient or attempt == max_attempts:
-                      return result
-                  delay = base_delay * (2 ** (attempt - 1))
-                  print(
-                      f"  [retry] attempt {attempt}/{max_attempts} failed "
-                      f"(rc={result.returncode}), retrying in {delay}s: "
-                      f"{err.strip()}"
-                  )
-                  time.sleep(delay)
-              return result
-
-          downloaded = 0
-          for idx, j in enumerate(jobs):
-              safe   = re.sub(r"[^\w\s\-]", "", j["name"]).strip()
-              out    = f"raw_logs/{idx}_{safe}.txt"
-              result = download_job_log(
-                  ["gh", "api", *esc_flag,
-                   f"/repos/{repo}/actions/jobs/{j['id']}/logs"]
-              )
-              if result.returncode == 0 and result.stdout:
-                  open(out, "wb").write(result.stdout)
-                  downloaded += 1
-                  print(f"  OK  {out}")
-              else:
-                  err = result.stderr.decode("utf-8", "replace").strip()
-                  print(f"  SKIP  {j['name']} (rc={result.returncode}): {err}")
-
-          print(f"[info] downloaded {downloaded}/{len(jobs)} job logs")
-
-          # Every completed run has at least one job with a log, so zero
-          # downloads means the download mechanism itself broke -- not that the
-          # nightly produced nothing. Fail loudly here; otherwise the
-          # empty-data guard downstream skips the ingest and the job still
-          # reports success, which is how this outage stayed green for days.
-          if jobs and downloaded == 0:
-              print(f"::error::downloaded 0 of {len(jobs)} job logs -- aborting")
-              sys.exit(1)
+          # Logic lives in the library so it is testable and linted; this stays a 4-line call.
+          download_job_logs_or_die(
+              load_jobs("/tmp/jobs.jsonl"),
+              repo=os.environ["GITHUB_REPOSITORY"],
+              out_dir="raw_logs",
+          )
           PYEOF
 
       - name: Parse Logs
