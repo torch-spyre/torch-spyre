@@ -312,7 +312,7 @@ def _run_metadata() -> dict[str, Any]:
     """Substrate a record was produced on.
 
     A record that cannot say which torch-spyre it measured cannot be compared
-    against a later one. ``torch_spyre.version`` appends the short sha only for
+    against a later one. ``torch_spyre._version`` appends the short sha only for
     a source checkout -- a wheel install reports a bare version -- so ``git_sha``
     is resolved from the loaded package's directory instead. It names whichever
     checkout contains ``torch_spyre_path``, which is torch-spyre for a source
@@ -322,7 +322,7 @@ def _run_metadata() -> dict[str, Any]:
     import torch
 
     import torch_spyre
-    from torch_spyre.version import __version__ as spyre_version
+    from torch_spyre._version import __version__ as spyre_version
 
     package_dir = os.path.dirname(os.path.abspath(torch_spyre.__file__))
     return {

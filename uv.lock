@@ -1183,6 +1183,20 @@ wheels = [
 ]
 
 [[package]]
+name = "setuptools-scm"
+version = "10.2.3"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "packaging" },
+    { name = "setuptools" },
+    { name = "vcs-versioning" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/3c/87/1ff7adcf6e03021ae58ce401565be3c9b8c739a44d14a8253d38b3754117/setuptools_scm-10.2.3.tar.gz", hash = "sha256:f179ed3e2a63cf5823e5ee9aa9ca08386219400443a0553224d72dde3f206b44", size = 67696, upload-time = "2026-09-03T13:03:29.565Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/4b/00/e9c0591b77186f6c1a8479500456ee72cd30730836c58b7a8a2654909c23/setuptools_scm-10.2.3-py3-none-any.whl", hash = "sha256:7fcf8ff55c95eb8b572a23c81495e5559b9b90f3e82fcf0952bb76c37de27a81", size = 29123, upload-time = "2026-09-03T13:03:28.346Z" },
+]
+
+[[package]]
 name = "six"
 version = "1.17.0"
 source = { registry = "https://pypi.org/simple" }
@@ -1309,9 +1323,11 @@ build = [
     { name = "ninja" },
     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
     { name = "numpy", version = "2.5.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
+    { name = "packaging" },
     { name = "pyyaml" },
     { name = "regex" },
     { name = "setuptools" },
+    { name = "setuptools-scm" },
     { name = "torch", version = "2.13.0", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "python_full_version < '3.15' and sys_platform == 'darwin'" },
     { name = "torch", version = "2.13.0+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "python_full_version >= '3.15' or sys_platform != 'darwin'" },
     { name = "wheel" },
@@ -1343,6 +1359,7 @@ requires-dist = [
     { name = "numpy", marker = "extra == 'build'" },
     { name = "ortools", marker = "platform_machine != 'ppc64le' and platform_machine != 's390x'", specifier = ">=9.0" },
     { name = "ortools", marker = "platform_machine != 'ppc64le' and platform_machine != 's390x' and extra == 'cpsat'", specifier = ">=9.0" },
+    { name = "packaging", marker = "extra == 'build'" },
     { name = "pre-commit", marker = "extra == 'lint'", specifier = "~=4.6.0" },
     { name = "psutil" },
     { name = "pydantic", marker = "extra == 'test'" },
@@ -1352,6 +1369,7 @@ requires-dist = [
     { name = "regex" },
     { name = "regex", marker = "extra == 'build'" },
     { name = "setuptools", marker = "extra == 'build'", specifier = ">=77.0.3" },
+    { name = "setuptools-scm", marker = "extra == 'build'", specifier = ">=10" },
     { name = "torch", specifier = "~=2.13.0", index = "https://download.pytorch.org/whl/cpu" },
     { name = "torch", marker = "extra == 'build'", specifier = "~=2.13.0", index = "https://download.pytorch.org/whl/cpu" },
     { name = "types-pyyaml", marker = "extra == 'lint'", specifier = "~=6.0.12.20260518" },
@@ -1423,6 +1441,18 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/c8/91/86a61485e507d14a14bed223706db4fd6d95c99b452ce881a0122f2b018a/uv-0.11.33-py3-none-win32.whl", hash = "sha256:3242c8bc708b75fb72687c9a24f0e6f47c2004a3d82d32a81b06e17822708c28", size = 19394668, upload-time = "2026-07-28T10:24:51.848Z" },
     { url = "https://files.pythonhosted.org/packages/dd/be/b90df95297cdae2cbd5a83fddf429a304b17a0e9c277ca02190d995cbe09/uv-0.11.33-py3-none-win_amd64.whl", hash = "sha256:521229afa69ad5f57127de800120cb2bea1ac729a05a0851aaf920124f8edf66", size = 20185845, upload-time = "2026-07-28T10:24:54.367Z" },
     { url = "https://files.pythonhosted.org/packages/ed/3a/061c8abd15dbb60a1dce2e28b60378a70fd18152718715cf59a3799f3045/uv-0.11.33-py3-none-win_arm64.whl", hash = "sha256:3cb5b325c58a9ee5febfedf4895e0c48cc7d22d801d1b23a4b8335f16508d0da", size = 19123673, upload-time = "2026-07-28T10:24:57.05Z" },
+]
+
+[[package]]
+name = "vcs-versioning"
+version = "2.4.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "packaging" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/3e/97/792a4ef20344f9af3e16098b58b45eb5d6202259b84fc80c43bc000a5e6c/vcs_versioning-2.4.1.tar.gz", hash = "sha256:d4575de3115ec9434393c87c80ffb0eb98a16056bfe2b11ce0f3a97aff67fe0a", size = 164222, upload-time = "2026-09-16T07:47:40.267Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/d7/20/29378edc8d7d2ce41892adc1356f4c6c6ae03b945d04ca6ade61afa3d5dc/vcs_versioning-2.4.1-py3-none-any.whl", hash = "sha256:b7089ec9bef67b2cad82148366e8eac4d63173f440ec62628282b59eb96bbcb0", size = 122157, upload-time = "2026-09-16T07:47:38.811Z" },
 ]
 
 [[package]]
