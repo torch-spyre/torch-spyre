@@ -28,6 +28,56 @@ import torch_spyre
 from test_prepare_kernel import TestPrepareKernel as tpk
 
 
+def _zero_symbol_hcm() -> dict:
+    """Return a valid HCM that produces a fixed 1024-byte payload without runtime symbols."""
+    return {
+        "vdci": {
+            "dsName_": "zero_symbol",
+            "isMarker_": 0,
+            "data_conversion_info_group_": [
+                {
+                    "key": [],
+                    "dci": {
+                        "dsName_": "zero_symbol",
+                        "isHostToSen_": 1,
+                        "dataformat_src_": 8,   # DataFormats::SENINT8
+                        "dataformat_dst_": 8,   # DataFormats::SENINT8
+                        "dcOpName_": 6,         # DataConvertOpFuncs::SYMBOL_SUBSTITUTE
+                        "pre_expand_dcsi_": [],
+                        "pre_input_shape_": [],
+                        "dcsi_": [],
+                        # hostCorrectionBytes() = product(input_shape_); must match the 1024-byte payload.
+                        "input_shape_": [1024],
+                        # SymbolSubstituteOutputWords sizes its write from output_shape_.
+                        "output_shape_": [1024],
+                        "post_slice_dcsi_": [],
+                        "post_output_shape_": [],
+                        "input_dimwise_ea_": [],
+                        "output_dimwise_ea_": [],
+                        "useSpi_": 0,
+                        "usePca_": 0,
+                        "usePadVal_": 0,
+                        "inputPadVal_": 0,
+                        "useWli_": 0,
+                        "dmdi_": {"perTensorInfo": []},
+                        "ssi_": {
+                            "value_and_locs_": [],
+                            "inputSym_": [],
+                            "unSubstitutedFlitStartOffset_": 0,
+                        },
+                    },
+                }
+            ],
+            "group_tags_": [],
+            "inputSym_": [],
+            "dciIdxSym_": [],
+            "variableDefs_": [],
+        },
+        # Payload constant (1024 zero bytes) + required trailer constant.
+        "senConstants": [{"senconst_": "00" * 1024}, {"senconst_": ""}],
+    }
+
+
 def _run_compiled_op(op_name: str) -> None:
     """
     Compile an op with SpyreCode and run it on Spyre, comparing to CPU.
@@ -114,6 +164,44 @@ class TestLaunchJobPlan(TestCase):
             with stream:
                 with pytest.raises(RuntimeError, match="Expect one DCI"):
                     torch_spyre._C.launch_jobplan(job_plan, [])
+
+    def test_zero_symbol_host_compute_does_not_raise(self):
+        """A zero-symbol HCM (ishape=["0"]) must execute without error.
+
+        Exercises the nullptr branch in processComputeOnHostCommand
+        (DataConvertInfoGenerate.cpp:148) — no other test reaches this at
+        launch time. The host callback is synchronous, so launch_jobplan
+        returning cleanly proves processComputeOnHostCommand completed.
+
+        ComputeOnDevice is structurally required by the job plan validator but
+        is not under test here; the mock binary is all zeros and always faults,
+        so synchronize() raising ComputeHardwareError is the expected outcome.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            test_pk = tpk()
+            spyrecode_dir = test_pk.create_mock_spyrecode(
+                tmpdir,
+                exec_command="ComputeOnHost",
+                exec_properties={
+                    "ohandle": "output_buffer",
+                    "size": "1024",
+                    "ishape": ["0"],
+                    "oshape": ["1024"],  # mirrors compiler output (dci.output_shape_)
+                    "ihandle": "",
+                    "hcm": _zero_symbol_hcm(),
+                },
+            )
+            job_plan = torch_spyre._C.prepare_kernel(spyrecode_dir)
+            self.assertEqual(job_plan.num_steps(), 3)
+            self.assertEqual(job_plan.get_step_type(0), "HostCompute")
+            self.assertEqual(job_plan.get_step_type(1), "H2D")
+            self.assertEqual(job_plan.get_step_type(2), "Compute")
+
+            stream = torch.Stream("spyre")
+            with stream:
+                torch_spyre._C.launch_jobplan(job_plan, [])
+            with pytest.raises(RuntimeError, match="ComputeHardwareError"):
+                torch.accelerator.synchronize()
 
 
 def _build_d2h_jobplan(tmpdir: str, dev_ptr: int, size_bytes: int):
