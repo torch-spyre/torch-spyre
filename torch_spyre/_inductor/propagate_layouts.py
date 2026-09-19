@@ -1202,7 +1202,19 @@ def _matmul_layouts(
     n_size = get_matmul_n_size(op)
     m_size = get_matmul_m_size(op)
 
-    if n_size == 1:
+    if data.reduction_type == BATCH_MATMUL_FP8_OP:
+        # The QFP8WT weight uses a 2D-stick layout ([2,64]) whose stride_map
+        # does not satisfy the standard single-stick contract assumed by
+        # find_stick_compatible_input_layout / device_coordinates.  The SDSC
+        # codegen handles it as a per-tile-fixed kernel tensor, so no stick
+        # compatibility check or restickify is needed here.
+        x_req_stl = find_stick_compatible_input_layout(
+            x, reduction_var, data.reduction_type, "x"
+        )
+        y_req_stl = next(iter(y.layouts))
+        out_dims = len(output.size)
+        out_stick_dim = out_dims - 1
+    elif n_size == 1:
         # N has no loop symbol after size-one simplification, so there is no
         # generated_var to discover.  Build an explicit sparse-stick layout for y
         # so K is not mistaken for a second contraction dimension.

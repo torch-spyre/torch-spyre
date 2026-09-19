@@ -16,11 +16,11 @@
 import builtins
 import dataclasses
 import itertools
-import sympy
 import logging
 import math
 from collections.abc import Callable
 
+import sympy
 from sympy import Expr, Integer, Symbol, divisors
 from torch._inductor.dependencies import MemoryDep
 from torch._inductor.graph import GraphLowering
@@ -54,6 +54,7 @@ from .logging_utils import get_inductor_logger
 from .op_spec import IndirectAccess
 from .pass_utils import (
     SchedNodeArg,
+    commit_iteration_space_ownership,
     compute_granularity,
     compute_max_size,
     concretize_expr,
@@ -62,7 +63,6 @@ from .pass_utils import (
     get_mem_deps_from_rw,
     input_layout_for_operation,
     iteration_space_from_op,
-    commit_iteration_space_ownership,
     op_read_writes,
 )
 from .propagate_hints import get_op_hints
@@ -1499,6 +1499,10 @@ _LARGE_M_TILE_SHAPE_PENALTY_US = 20.0
 _SHARED_DOWN_N_SPLIT_PENALTY_US = 10.0
 _SHARED_NARROW_OUTPUT_REF = _TARGET_N_TILE_ELEMS * _COHORT_LIMIT
 _SHARED_N_TILE_TARGET = _TARGET_N_TILE_ELEMS // 4
+# Required n_dim split for batchmatmulfp8: pins core_fold=4 in the KERNEL tensor
+# coordInfo emitted by compute_ops.py (alpha = N//4, factor = 4). For shapes where
+# n_sticks < 4, the split is clamped to n_sticks (the largest available divisor).
+_FP8_BMM_N_SPLIT = 4
 
 
 def _matmul_split_cost(
@@ -1786,12 +1790,24 @@ def _cost_model_matmul_planner(
     n_divs = factors(n_dim, n_sticks)
     k_divs = factors(k_dim, k_sticks)
 
+    is_fp8_bmm = op.data.reduction_type == BATCH_MATMUL_FP8_OP
+    # Pin n_dim split to _FP8_BMM_N_SPLIT when enough sticks are available, or to
+    # n_sticks itself for small shapes (e.g. n_sticks=2 → split=2), so the emitted
+    # core_fold is always a valid divisor of n_sticks.
+    fp8_bmm_n_split = (
+        min(_FP8_BMM_N_SPLIT, n_sticks) if is_fp8_bmm else _FP8_BMM_N_SPLIT
+    )
+
     best = None
     best_cost = math.inf
     for b_combo in b_combos:
         b_prod = math.prod(b_combo)
+        if is_fp8_bmm and b_prod != 1:
+            continue
         for mm in m_divs:
             for nn in n_divs:
+                if is_fp8_bmm and nn != fp8_bmm_n_split:
+                    continue
                 for kk in k_divs:
                     if b_prod * mm * nn * kk > max_cores:
                         continue
@@ -1829,6 +1845,8 @@ def _cost_model_matmul_planner(
         # always a multiple of 64 — satisfying the hardware alignment
         # requirement enforced at codegen time.
         new_splits[k_dim] = 1
+        if is_fp8_bmm:
+            new_splits[n_dim] = fp8_bmm_n_split
 
     logger.debug(
         f"cost_model work_division {op.get_name()}: "
