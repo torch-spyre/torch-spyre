@@ -1,0 +1,44 @@
+name: extensions-tests
+
+on:
+  push:
+    branches: [main]
+    tags: ['*']
+  pull_request:
+    branches: [main]
+  merge_group:
+    types: [checks_requested]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+permissions:
+  contents: read
+  checks: write
+
+jobs:
+  spyre-cli-tests:
+    name: spyre-cli-tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: '3.12'
+      - name: Install uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          version: latest-known
+          enable-cache: true
+          cache-dependency-glob: extensions/spyre-cli/pyproject.toml
+      - name: Install spyre-cli with dev dependencies
+        run: |
+          uv pip install --system -e extensions/spyre-cli
+          uv pip install --system pytest
+      - name: Run spyre-cli tests
+        run: pytest extensions/spyre-cli/tests/test_core.py -v
