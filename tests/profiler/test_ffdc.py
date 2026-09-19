@@ -992,8 +992,12 @@ class TestFfdcAsyncCompile:
 
         monkeypatch.setattr(mod.subprocess, "run", fail_run)
 
-        with pytest.raises(subprocess.CalledProcessError):
+        # The compile path re-raises as RuntimeError so the message carries the
+        # command and the compiler's stderr, which capture_output would otherwise
+        # swallow; the original CalledProcessError is chained as __cause__.
+        with pytest.raises(RuntimeError) as ei:
             mod.SpyreAsyncCompile().sdsc("test_kernel", [])
+        assert isinstance(ei.value.__cause__, subprocess.CalledProcessError)
 
         assert len(calls) == 1
         assert calls[0]["failure_category"] == CATEGORY_COMPILE_BACKEND
@@ -1003,7 +1007,7 @@ class TestFfdcAsyncCompile:
     def test_sdsc_dxp_failure_preserves_error_when_ffdc_raises(
         self, monkeypatch, tmp_path
     ):
-        """FFDC collection failure must not replace CalledProcessError.
+        """FFDC collection failure must not replace the compiler error.
 
         Uses the real ``try_collect`` with a raising ``collect`` so the hook
         path is covered end-to-end (not a fake that swallows by construction).
@@ -1018,9 +1022,11 @@ class TestFfdcAsyncCompile:
 
         monkeypatch.setattr(mod.subprocess, "run", fail_run)
 
-        with pytest.raises(subprocess.CalledProcessError) as ei:
+        with pytest.raises(RuntimeError) as ei:
             mod.SpyreAsyncCompile().sdsc("test_kernel", [])
-        assert ei.value.returncode == 1
+        cause = ei.value.__cause__
+        assert isinstance(cause, subprocess.CalledProcessError)
+        assert cause.returncode == 1
 
 
 class TestFfdcKernelRunner:

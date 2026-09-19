@@ -383,6 +383,13 @@ def compute_specs_hash(
             torch.__version__,
             _get_torch_spyre_version(),
             _get_dxp_version(),
+            # Bundles are compiled by dbo-opt, not dxp_standalone.
+            # _get_dxp_version() reports the deeptools package version, which
+            # ships both binaries and so does not change when the backend does.
+            # Without this tag, entries produced by dxp_standalone stay
+            # indistinguishable -- _REQUIRED_ARTIFACTS are the same filenames --
+            # and would be served as hits, so dbo-opt would never run.
+            "backend=dbo-opt",
         ]
     )
 

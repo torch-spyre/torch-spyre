@@ -78,6 +78,7 @@ from torch_spyre._C import (  # noqa: E402
 )
 from torch_spyre._inductor.constants import IDENTITY_OP, RESTICKIFY_OP  # noqa: E402
 from torch_spyre._inductor.op_spec import find_unimplemented  # noqa: E402
+from utils_inductor import mock_backend_compiler
 
 
 class _GatherScenarios:
@@ -1003,7 +1004,7 @@ class _GatherScenarios:
         kr = "torch_spyre.execution.kernel_runner"
         x, i = self._xi(P=3, two_d=True)
         with (
-            patch("subprocess.run"),
+            mock_backend_compiler(),
             patch(f"{kr}.launch_jobplan"),
             patch(f"{kr}.prepare_kernel"),
         ):

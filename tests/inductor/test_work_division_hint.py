@@ -55,7 +55,11 @@ from torch_spyre._inductor.constants import (
 from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.ir import FixedTiledLayout
 from torch_spyre._inductor.loop_info import CarriedReductionRecord
-from utils_inductor import assert_lx_only_relayout_payload, capture_backend_output_dirs
+from utils_inductor import (
+    mock_backend_compiler,
+    assert_lx_only_relayout_payload,
+    capture_backend_output_dirs,
+)
 from torch_spyre._inductor.scratchpad.lx_relayout import (
     LXRelayoutPlan,
     work_division_from_view,
@@ -521,7 +525,7 @@ class TestNamedWorkDivisionHint(InductorTestCase):
         with (
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
-            mock_patch("subprocess.run"),
+            mock_backend_compiler(),
         ):
             _, source_codes = run_and_get_code(torch.compile(fn, dynamic=False), x)
         self.assertIn("LoopSpec(", source_codes[0])
@@ -549,7 +553,7 @@ class TestNamedWorkDivisionHint(InductorTestCase):
         with (
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
-            mock_patch("subprocess.run"),
+            mock_backend_compiler(),
         ):
             _, source_codes = run_and_get_code(torch.compile(fn, dynamic=False), x)
         self.assertIn("LoopSpec(", source_codes[0])

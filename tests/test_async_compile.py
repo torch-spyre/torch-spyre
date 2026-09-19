@@ -174,7 +174,7 @@ def test_cache_hit_reloads_symbol_kinds_from_miss(tmp_path: Path):
             "load_symbol_kinds",
             return_value=fake_symbol_kinds,
         ),
-        patch.object(async_compile_mod, "_run_dxp"),
+        patch.object(async_compile_mod, "_run_backend_compiler"),
         patch.object(async_compile_mod, "find_unimplemented", return_value=None),
         patch.object(
             async_compile_mod, "build_kernel_provenance_descriptor", return_value=None
@@ -304,22 +304,32 @@ def test_real_subprocess_pool_runs_dxp_jobs_concurrently(tmp_path: Path):
     for compile_dir in compile_dirs:
         compile_dir.mkdir()
 
-    fake_dxp = bin_dir / "dxp_standalone"
-    fake_dxp.write_text(
+    fake_compiler = bin_dir / "dbo-opt"
+    fake_compiler.write_text(
         "#!/usr/bin/env python3\n"
         "import os\n"
         "from pathlib import Path\n"
         "import sys\n"
         "import time\n"
         "marker_dir = Path(os.environ['FAKE_DXP_MARKER_DIR'])\n"
-        "(marker_dir / Path(sys.argv[2]).name).touch()\n"
+        # Read the compile dir off --export-dir rather than a positional index:
+        # the argv layout depends on whether --device is passed.
+        "export_dir = next(\n"
+        "    a.split('=', 1)[1] for a in sys.argv[1:]\n"
+        "    if a.startswith('--export-dir=')\n"
+        ")\n"
+        "(marker_dir / Path(export_dir).name).touch()\n"
+        # The caller treats a missing spyrecode.json as a failure even on exit 0.
+        "code_dir = Path(export_dir) / 'spyreCodeDir'\n"
+        "code_dir.mkdir(parents=True, exist_ok=True)\n"
+        "(code_dir / 'spyrecode.json').write_text('{}')\n"
         "deadline = time.monotonic() + 10\n"
         "while len(list(marker_dir.iterdir())) < 2:\n"
         "    if time.monotonic() >= deadline:\n"
-        "        raise SystemExit('DXP jobs did not overlap')\n"
+        "        raise SystemExit('backend compile jobs did not overlap')\n"
         "    time.sleep(0.05)\n"
     )
-    fake_dxp.chmod(0o755)
+    fake_compiler.chmod(0o755)
 
     shutdown_compile_workers()
     try:

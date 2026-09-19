@@ -799,6 +799,45 @@ def copy_tests(my_cls, other_cls, suffix, test_failures=None, xfail_prop=None):
 
 
 @contextmanager
+def mock_backend_compiler():
+    """Stub the backend compiler, writing the artifact a real one would.
+
+    Replaces ``subprocess.run`` for tests that exercise bundle emission without
+    a compiler.  A bare ``mock_patch("subprocess.run")`` is not enough: the
+    compile path treats a missing ``spyreCodeDir/spyrecode.json`` as a failure
+    even on exit 0, because the backend can return success having written
+    nothing.  So the stub creates that file, keeping the production check
+    unconditional rather than teaching it to recognise a mock.
+
+    The compile dir is read from ``--export-dir=`` in argv, so this works
+    whether or not ``--device`` is passed.
+
+    Patches ``subprocess.run`` both globally and on the module object
+    ``async_compile`` holds: call sites historically used either spelling, and a
+    stub that misses the one actually in use lets the real compiler run (or,
+    writing no artifact, trips the check above).
+    """
+
+    def fake_run(cmd, *args, **kwargs):
+        export_dir = None
+        for arg in cmd[1:] if isinstance(cmd, (list, tuple)) else []:
+            if isinstance(arg, str) and arg.startswith("--export-dir="):
+                export_dir = arg.split("=", 1)[1]
+                break
+        if export_dir:
+            code_dir = Path(export_dir) / "spyreCodeDir"
+            code_dir.mkdir(parents=True, exist_ok=True)
+            (code_dir / "spyrecode.json").write_text("{}")
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    with (
+        mock_patch("subprocess.run", side_effect=fake_run) as m,
+        mock_patch.object(async_compile_module.subprocess, "run", side_effect=fake_run),
+    ):
+        yield m
+
+
+@contextmanager
 def capture_backend_output_dirs():
     """Record the backend output directory of every kernel compiled inside."""
     output_dirs = []

@@ -53,10 +53,11 @@ from .kernel_cache import (
 
 logger = get_inductor_logger("sdsc_compile")
 
-# Wall-clock ceiling on ONE backend-compiler invocation, only used for dbo-opt
-# on the KTIR path. It bounds a wedged compiler -- which would otherwise block
-# torch.compile forever with no diagnostic -- rather than policing slowness:
-# both finish in well under a second on a small kernel.
+# Wall-clock ceiling on ONE backend-compiler invocation, applied to dbo-opt on
+# both the bundle and the KTIR path. It bounds a wedged compiler -- which would
+# otherwise block torch.compile forever with no diagnostic -- rather than
+# policing slowness: both finish in well under a second on a small kernel.
+# Raise it if a large bundle legitimately needs longer.
 _COMPILE_TIMEOUT_S = 60.0
 
 
@@ -102,6 +103,24 @@ def _safe_kernel_name(kernel_name: str) -> str:
     return kernel_name[:_KERNEL_NAME_BUDGET]
 
 
+def _check_backend_compiler_on_path() -> None:
+    """Raise unless ``dbo-opt`` can be found, before a bundle is emitted.
+
+    Deliberately narrower than ``_check_ktir_device_prerequisites``: the bundle
+    path treats ``KTIR_DEVICE_MLIR`` as optional (dbo-opt falls back to the
+    spyre_dd2_basic under DEEPTOOLS_PATH), so requiring it here would reject a
+    working setup.
+
+    ``dxp_standalone`` was invoked with no such check, so a missing binary
+    surfaced as a bare FileNotFoundError from subprocess.run. Now that dbo-opt
+    is on the path of every compile, say what to do about it instead.
+    """
+    if shutil.which("dbo-opt") is None:
+        raise RuntimeError(
+            "cannot compile the bundle: dbo-opt not found.\n  - put dbo-opt on PATH"
+        )
+
+
 def get_output_dir(kernel_name: str):
     spyre_dir = os.path.join(cache_dir(), "inductor-spyre")
     os.makedirs(spyre_dir, exist_ok=True)
@@ -130,7 +149,7 @@ def _compile_to_dir(
     Raises:
         NotImplementedError: if any dimension symbol is present, because the
             runtime kDimension payload is not yet implemented and submitting
-            such a bundle to dxp_standalone would produce a mismatched
+            such a bundle to the backend compiler would produce a mismatched
             inputSym_ slot count.
     """
     symbol_kinds = generate_bundle(kernel_name, compile_dir, specs, pool_size=pool_size)
@@ -141,22 +160,92 @@ def _compile_to_dir(
     return symbol_kinds
 
 
-def _run_dxp(kernel_name: str, compile_dir: str, env: dict[str, str]) -> str:
-    """Compile one materialized bundle and return its directory.
+def _run_backend_compiler(
+    kernel_name: str, compile_dir: str, env: dict[str, str]
+) -> str:
+    """Compile one materialized bundle with dbo-opt and return its directory.
 
     This function is module-level and its arguments are intentionally simple so
     Inductor's subprocess compile pool can pickle and execute it.  Bundle
-    generation remains in the parent process; workers only invoke DXP and never
-    construct a runner or touch the device runtime.
+    generation remains in the parent process; workers only invoke the backend
+    compiler and never construct a runner or touch the device runtime.
+
+    ``env`` is the parent's os.environ snapshot, so PATH reaches the worker and
+    the dbo-opt lookup below resolves the same binary the parent would.
     """
-    with torch.profiler.record_function(f"dxp_standalone:{kernel_name}"):
+    _check_backend_compiler_on_path()
+
+    cmd = ["dbo-opt"]
+    # Only when configured: with no --device the dataflow scheduler falls back
+    # to the spyre_dd2_basic under DEEPTOOLS_PATH, so passing an empty value
+    # would be worse than omitting the flag.  KTIR_DEVICE_MLIR is reused rather
+    # than given a bundle-path spelling of its own.
+    if _spyre_config.ktir_device_mlir:
+        cmd.append(f"--device={_spyre_config.ktir_device_mlir}")
+    cmd += [
+        f"--export-dir={compile_dir}",
+        "-kEmitSpyreCode",
+        os.path.join(compile_dir, "bundle.mlir"),
+    ]
+
+    with torch.profiler.record_function(f"dbo-opt:{kernel_name}"):
         try:
-            subprocess.run(
-                ["dxp_standalone", "-d", compile_dir],
+            # capture_output: dbo-opt is an MLIR *-opt tool, so it prints the
+            # transformed module to stdout as a matter of course.
+            # ``dxp_standalone -d`` did not, which is why nothing captured it
+            # before -- left uncaptured, every kernel dumps its whole bundle
+            # module into the user's terminal.  Capturing also makes the
+            # compiler's own diagnostics available to the error paths below.
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
                 check=True,
                 env=env,
+                timeout=_COMPILE_TIMEOUT_S,
             )
+            # The KTIR path (#3651) reports that dbo-opt can exit 0 having
+            # written nothing, so treat the artifact -- not the return code --
+            # as the success condition. Not independently confirmed for the
+            # bundle frontend, but the check is cheap either way.
+            spyrecode = os.path.join(compile_dir, "spyreCodeDir", "spyrecode.json")
+            if not os.path.exists(spyrecode):
+                raise RuntimeError(
+                    f"dbo-opt exited 0 but wrote no {spyrecode}.\n"
+                    f"command: {' '.join(cmd)}\n"
+                    f"stderr:\n{proc.stderr}"
+                )
+        except subprocess.TimeoutExpired as exc:
+            # Would otherwise land in the broad handler below, which collects
+            # correctly but re-raises a TimeoutExpired whose message says
+            # nothing about which knob relaxes it.
+            try_collect(
+                exc,
+                logger=logger,
+                failure_category=CATEGORY_COMPILE_BACKEND,
+                kernel_name=kernel_name,
+                code_dir=compile_dir,
+            )
+            raise RuntimeError(
+                f"dbo-opt timed out after {_COMPILE_TIMEOUT_S}s "
+                f"(_COMPILE_TIMEOUT_S).\ncommand: {' '.join(cmd)}"
+            ) from exc
         except subprocess.CalledProcessError as exc:
+            try_collect(
+                exc,
+                logger=logger,
+                failure_category=CATEGORY_COMPILE_BACKEND,
+                kernel_name=kernel_name,
+                code_dir=compile_dir,
+            )
+            # Re-raised as RuntimeError rather than bare: with capture_output
+            # the compiler's diagnostics no longer reach the terminal on their
+            # own, so a bare CalledProcessError would report only an exit code.
+            raise RuntimeError(
+                f"dbo-opt failed with exit code {exc.returncode}.\n"
+                f"command: {' '.join(cmd)}\nstderr:\n{exc.stderr}"
+            ) from exc
+        except Exception as exc:
             try_collect(
                 exc,
                 logger=logger,
@@ -260,13 +349,13 @@ class SpyreAsyncCompile(AsyncCompile):
             self.wait_pool_ready()
             if self.use_process_pool():
                 return self.process_pool().submit(
-                    _run_dxp,
+                    _run_backend_compiler,
                     kernel_name,
                     compile_dir,
                     dict(os.environ),
                 )
 
-        _run_dxp(kernel_name, compile_dir, dict(os.environ))
+        _run_backend_compiler(kernel_name, compile_dir, dict(os.environ))
         return None
 
     def _compile_future(
