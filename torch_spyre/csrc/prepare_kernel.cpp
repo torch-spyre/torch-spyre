@@ -258,20 +258,33 @@ void JobPlanBuilder::executeAllocate(const nlohmann::json& cmd) {
   const auto& allocate_props =
       cmd.contains("properties") ? cmd["properties"] : nlohmann::json();
 
-  TORCH_CHECK(allocate_props.contains("size"),
-              "Allocate command missing 'size' property");
+  // Validate and parse both sizes before allocating anything, so a malformed
+  // dynamic_size cannot throw with the static allocation already made.
+  TORCH_CHECK(allocate_props.contains("static_size"),
+              "Allocate command missing 'static_size' property");
 
-  std::string size_str = allocate_props["size"].get<std::string>();
-  size_t size = safe_stoull(size_str, "Allocate size");
+  std::string static_size_str =
+      allocate_props["static_size"].get<std::string>();
+  size_t static_size = safe_stoull(static_size_str, "Allocate static size");
+
+  TORCH_CHECK(allocate_props.contains("dynamic_size"),
+              "Allocate command missing 'dynamic_size' property");
+
+  std::string dynamic_size_str =
+      allocate_props["dynamic_size"].get<std::string>();
+  size_t dynamic_size = safe_stoull(dynamic_size_str, "Allocate dynamic size");
 
   auto& allocator = SpyreAllocator::instance();
   flex::AllocationDirective directive(flex::PlacementPolicy::Bind, {0},
-                                      std::nullopt, flex::MemoryType::Program);
-  c10::DataPtr allocated_ptr = allocator.allocate(size, directive);
+                                      std::nullopt,
+                                      flex::MemoryType::ProgramStatic);
+  c10::DataPtr allocated_ptr = allocator.allocate(static_size, directive);
 
   job_allocation_.emplace_back(
       std::move(static_cast<SharedOwnerCtx*>(allocated_ptr.get_context())
                     ->composite_addr));
+
+  dynamic_size_ = dynamic_size;
 }
 
 void JobPlanBuilder::executeInitTransfer(const nlohmann::json& cmd) {
@@ -646,7 +659,8 @@ std::unique_ptr<JobPlan> JobPlanBuilder::translateJobExecPlan() {
               std::move(job_allocation_),  // job_allocation
               {},                          // expected_input_shapes
               std::move(pinned_buffers),   // pinned_buffers
-              std::move(inits_)});
+              std::move(inits_),
+              dynamic_size_});
 }
 
 JobPlanBuilder::ValidationResult JobPlanBuilder::validate(
