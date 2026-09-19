@@ -1762,7 +1762,9 @@ def _topk_layouts(
             out_dim_order += [out_stick_dim]
         results.append(SpyreTensorLayout(c_size, c_stride, output.dtype, out_dim_order))
 
-    op.restick_cost_fn = AllSameNode.from_args(args, results, output_dep, op)
+    op.restick_cost_fn = AllSameNode.from_args(
+        args, results, output_dep, op, forbidden_stick_sym=reduction_var
+    )
     return results
 
 
