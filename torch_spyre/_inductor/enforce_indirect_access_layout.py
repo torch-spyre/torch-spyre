@@ -63,7 +63,12 @@ from .pass_utils import (
     iteration_space_with_splits,
     padded_entry_output_stl,
 )
-from .views import AlignmentInputs, UnalignedStickSplit, align_tensors_pure
+from .views import (
+    AlignmentInputs,
+    UnalignedStickSplit,
+    _decompose_constant_offset,
+    align_tensors_pure,
+)
 from . import config
 
 logger = get_inductor_logger("enforce_indirect_access_layout")
@@ -535,49 +540,65 @@ def _insert_mutation_relayout_copy(
     graph: GraphLowering,
     mutation_op: ComputedBuffer,
     write_dep: MemoryDep,
-    access_subs: dict,
-    sizes: dict | None,
+    access_subs: dict | None = None,
+    sizes: dict | None = None,
+    required_stl: "SpyreTensorLayout | None" = None,
 ) -> None:
     """Fix a non-compliant indirect-write layout on a MutationLayoutSHOULDREMOVE op.
 
     Inserts a copy-in / retarget / copy-back sequence around the mutation.
     For scatter ops, uses buf_tmp as the metadata source for copy-back to
     avoid inheriting the index tensor dependency from the scatter op.
+
+    When ``required_stl`` is supplied (e.g. P=1 path or precomputed destination
+    layout), the caller has already determined the required layout and the
+    write-coord detection step is skipped entirely.
     """
-    is_scatter_op = (
+    is_scatter_op = isinstance(mutation_op.data, Scatter) or (
         any(isinstance(v, IndirectAccess) for v in access_subs.values())
         if access_subs
         else False
     )
-    is_scatter_op = is_scatter_op or isinstance(mutation_op.data, Scatter)
 
-    output_stl = _output_real_layout(mutation_op).device_layout
-
-    write_stride_idx: int | None = None
-    if is_scatter_op:
-        logger.debug(
-            "enforce_indirect_layout: scatter op device_size=%s, stride_map=%s",
-            output_stl.device_size,
-            output_stl.stride_map,
-        )
-        # For scatter, get access subs and sizes, then find indirect in write coords
-        scatter_access_subs, scatter_sizes = _scatter_access_subs_and_sizes(
-            mutation_op, _output_real_layout(mutation_op), write_dep
-        )
-        write_stride_idx = _indirect_stride_idx(
-            device_coordinates(output_stl, write_dep, scatter_sizes),
-            scatter_access_subs,
-        )
-    else:
-        write_stride_idx = _indirect_stride_idx(
-            device_coordinates(output_stl, write_dep, sizes), access_subs
-        )
-        assert write_stride_idx is not None, (
-            f"expected an IndirectAccess write coordinate on {mutation_op.get_name()!r}"
-        )
-    assert write_stride_idx is not None
-    output_indirect_pos = len(output_stl.stride_map) - 1 - write_stride_idx
-    required_stl = _build_required_stl(output_stl, output_indirect_pos)
+    # Why this guard exists — two callers, two paths to required_stl:
+    #
+    # Dynamic derivation path:
+    #   When required_stl is None, derive it lazily from write coordinates.
+    #   The scatter/indirect index is a runtime symbol that appears in write_dep.index.
+    #   We walk the write coordinates and find which device dimension carries
+    #   an IndirectAccess term.
+    #
+    # Precomputed / P=1 path:
+    #   When required_stl is passed explicitly (e.g. for P=1 where Inductor
+    #   eliminates the scatter-index loop, or when the caller has already
+    #   computed the target STL), the dead walk is skipped entirely.
+    if required_stl is None:
+        output_stl = _output_real_layout(mutation_op).device_layout
+        write_stride_idx: int | None = None
+        if is_scatter_op:
+            logger.debug(
+                "enforce_indirect_layout: scatter op device_size=%s, stride_map=%s",
+                output_stl.device_size,
+                output_stl.stride_map,
+            )
+            scatter_access_subs, scatter_sizes = _scatter_access_subs_and_sizes(
+                mutation_op, _output_real_layout(mutation_op), write_dep
+            )
+            write_stride_idx = _indirect_stride_idx(
+                device_coordinates(output_stl, write_dep, scatter_sizes),
+                scatter_access_subs,
+            )
+        else:
+            assert access_subs is not None, "access_subs required when deriving layout"
+            write_stride_idx = _indirect_stride_idx(
+                device_coordinates(output_stl, write_dep, sizes), access_subs
+            )
+            assert write_stride_idx is not None, (
+                f"expected an IndirectAccess write coordinate on {mutation_op.get_name()!r}"
+            )
+        assert write_stride_idx is not None
+        output_indirect_pos = len(output_stl.stride_map) - 1 - write_stride_idx
+        required_stl = _build_required_stl(output_stl, output_indirect_pos)
 
     target_name, target_buf = _resolve_mutation_target(mutation_op)
     if target_buf is None:
@@ -663,6 +684,165 @@ def _get_indirect_access_dim_order_requirements(
     return None
 
 
+def _p1_scatter_device_pos(
+    target_stl: "SpyreTensorLayout",
+    write_dep: "MemoryDep | None" = None,
+    target_layout: "FixedTiledLayout | None" = None,
+) -> int | None:
+    """Identify the device position of the scattered dimension for a P=1 scatter.
+
+    When P=1, Inductor eliminates the scatter-index loop and the destination's
+    device layout carries the scattered dimension as a singleton placeholder:
+    ``device_size[j] == 1`` and ``stride_map[j] == -1`` (undefined stride,
+    per the FixedTiledLayout singleton convention in ir.py).
+
+    When a tensor contains multiple singleton dimensions (e.g., [batch=1, num_heads=1, seq=1, head_dim=64]),
+    stride_map has -1 for all singleton dimensions. Rather than relying solely on a left-to-right scan
+    of stride_map == -1 (which would naively return position 0), we infer the target dimension by
+    decomposing the constant write offset or non-loop symbols from write_dep.index.
+
+    Returns the device position (0-indexed from left, stick is last) of the
+    scattered dimension, or None if no singleton placeholder is found.
+    """
+    stride_map = list(target_stl.stride_map)
+    device_size = list(target_stl.device_size)
+    n = len(stride_map)
+    if n < 2:
+        return None
+
+    # Find all non-stick device dimensions that are singleton placeholders (stride_map == -1, device_size == 1).
+    matching_positions = [
+        dev_pos
+        for dev_pos in range(n - 1)
+        if int(stride_map[dev_pos]) == -1 and int(device_size[dev_pos]) == 1
+    ]
+    if not matching_positions:
+        return None
+
+    if len(matching_positions) == 1:
+        dev_pos = matching_positions[0]
+        logger.info(
+            "_p1_scatter_device_pos: found single singleton placeholder at dev_pos %d "
+            "(stride_map=%s, device_size=%s)",
+            dev_pos,
+            stride_map,
+            device_size,
+        )
+        return dev_pos
+
+    # Disambiguation for multiple singleton placeholders:
+    # 1. Try to infer from write_dep.index offset against target host strides.
+    if write_dep is not None and target_layout is not None:
+        loop_vars = set(getattr(write_dep, "ranges", {}).keys()) | set(
+            getattr(write_dep, "var_names", ())
+        )
+        const_offset = write_dep.index.xreplace(
+            {v: 0 for v in write_dep.index.free_symbols if v in loop_vars}
+        )
+        if const_offset.is_number and const_offset > 0:
+            for dev_pos in matching_positions:
+                target_host_dim = dev_pos
+                if target_host_dim < len(target_layout.stride):
+                    st = int(target_layout.stride[target_host_dim])
+                    if (
+                        st > 0
+                        and int(const_offset)
+                        % (st * int(target_layout.size[target_host_dim]))
+                        >= st
+                    ):
+                        logger.info(
+                            "_p1_scatter_device_pos: inferred dev_pos %d from constant write offset %s "
+                            "(stride_map=%s, device_size=%s)",
+                            dev_pos,
+                            const_offset,
+                            stride_map,
+                            device_size,
+                        )
+                        return dev_pos
+
+            # Also try positional offset decomposition into device coords
+            concrete_dev_size = [int(s) for s in target_stl.device_size]
+            concrete_stride_map = [
+                int(s) if int(s) > 0 else 0 for s in target_stl.stride_map
+            ]
+            coords = [sympy.S.Zero] * n
+            if _decompose_constant_offset(
+                const_offset, concrete_dev_size, concrete_stride_map, coords
+            ):
+                for dev_pos in matching_positions:
+                    if coords[dev_pos] != 0:
+                        logger.info(
+                            "_p1_scatter_device_pos: inferred dev_pos %d from decomposed offset %s "
+                            "(stride_map=%s, device_size=%s)",
+                            dev_pos,
+                            const_offset,
+                            stride_map,
+                            device_size,
+                        )
+                        return dev_pos
+
+    # 2. Check if loop variable stride coefficients in write_dep.index tell us which dims are indexed by loops.
+    # The scattered dim is absent from the loop-variable coefficients.
+    if write_dep is not None and target_layout is not None:
+        # Collect linear coefficients of all symbols appearing in write_dep.index.
+        # Use as_coefficients_dict() to properly handle all additive terms (e.g. 1024*d0 + 128*d1).
+        coeff_dict = write_dep.index.as_coefficients_dict()
+        loop_coeffs = {
+            int(c)
+            for sym, c in coeff_dict.items()
+            if sym != 1 and getattr(c, "is_number", False)
+        }
+
+        # In write_dep.ranges / var_names, each loop variable corresponds to a non-scattered host dim.
+        # Find which matching singleton positions have their host stride present in loop_coeffs.
+        indexed_positions = []
+        unindexed_positions = []
+        for dev_pos in matching_positions:
+            if dev_pos < len(target_layout.stride):
+                st = int(target_layout.stride[dev_pos])
+                # A dimension is indexed if a loop variable explicitly indexes it with stride st and size > 1.
+                # If size == 1, st*d0 where d0 range is (0..1) is degenerate (0), so any loop variable with coeff == st
+                # indexing a size > 1 loop indicates an indexed dim.
+                if st in loop_coeffs:
+                    indexed_positions.append(dev_pos)
+                else:
+                    unindexed_positions.append(dev_pos)
+
+        if unindexed_positions and indexed_positions:
+            chosen_pos = unindexed_positions[-1]
+            logger.info(
+                "_p1_scatter_device_pos: inferred dev_pos %d from absent loop stride "
+                "(stride_map=%s, device_size=%s)",
+                chosen_pos,
+                stride_map,
+                device_size,
+            )
+            return chosen_pos
+        elif len(unindexed_positions) == len(matching_positions):
+            # If all singleton dimensions share the same stride and none appear in loop coefficients,
+            # select the innermost singleton dimension (dim 1 > dim 0).
+            chosen_pos = matching_positions[-1]
+            logger.info(
+                "_p1_scatter_device_pos: inferred dev_pos %d as innermost singleton dim "
+                "(stride_map=%s, device_size=%s)",
+                chosen_pos,
+                stride_map,
+                device_size,
+            )
+            return chosen_pos
+
+    # Fallback if tie cannot be broken: return first matching position
+    dev_pos = matching_positions[0]
+    logger.info(
+        "_p1_scatter_device_pos: returning first matching singleton placeholder at dev_pos %d "
+        "(stride_map=%s, device_size=%s)",
+        dev_pos,
+        stride_map,
+        device_size,
+    )
+    return dev_pos
+
+
 def _enforce_scatter_destination_layout(
     graph: GraphLowering,
     scatter_op: ComputedBuffer,
@@ -685,6 +865,12 @@ def _enforce_scatter_destination_layout(
     layout. Only fall back to inserting a copy-in/copy-back pair (via
     _insert_mutation_relayout_copy) when that rewrite isn't available and the
     destination's own layout doesn't already satisfy the requirement.
+
+    P=1 special case: when the index has exactly one element Inductor eliminates
+    the scatter-index loop, embedding the row address as a constant in write_dep.
+    scatter_syms is empty in that case.  _p1_scatter_device_pos identifies which
+    device dimension is scattered by finding the stride absent from the
+    loop-variable coefficients, then enforces that it sits at device position 0.
     """
     write_dep = next(
         (d for d in scatter_op.get_read_writes().writes if isinstance(d, MemoryDep)),
@@ -735,17 +921,6 @@ def _enforce_scatter_destination_layout(
     loop_syms = set(write_dep.ranges.keys())
     scatter_syms = all_write_syms - loop_syms
 
-    if not scatter_syms:
-        # No scatter index symbols found (shouldn't happen for a real scatter).
-        logger.debug(
-            "scatter_destination_check: no scatter symbols found for %s",
-            scatter_op.get_name(),
-        )
-        return
-
-    # Build substitutions mapping scatter symbols to IndirectAccess markers.
-    scatter_access_subs = {sym: IndirectAccess(sym) for sym in scatter_syms}
-
     # For scatter destination compliance, check against the *target's* layout,
     # not the output layout. The write side must conform to the target's committed
     # device layout, which is where the scatter actually writes.
@@ -784,6 +959,48 @@ def _enforce_scatter_destination_layout(
             type(target_layout).__name__,
         )
         return
+
+    if not scatter_syms:
+        # P=1: the scatter-index loop was eliminated; the row address is a
+        # compile-time constant embedded in write_dep.index.  Identify the
+        # scattered device dimension via the singleton placeholder and enforce
+        # it sits at device position 0.
+        p1_dev_pos = _p1_scatter_device_pos(
+            target_stl, write_dep=write_dep, target_layout=target_fixed_tiled_layout
+        )
+        if p1_dev_pos is None:
+            logger.debug(
+                "scatter_destination_check: P=1 %s — no singleton placeholder "
+                "found, skipping enforcement",
+                scatter_op.get_name(),
+            )
+            return
+        if p1_dev_pos == 0:
+            logger.debug(
+                "scatter_destination_check: P=1 %s already compliant "
+                "(scatter dim at device pos 0)",
+                scatter_op.get_name(),
+            )
+            return
+        logger.info(
+            "scatter_destination_check: P=1 %s scatter dim at device pos %d "
+            "(not 0) — enforcing layout",
+            scatter_op.get_name(),
+            p1_dev_pos,
+        )
+        required_stl = _build_required_stl(target_stl, p1_dev_pos)
+        if isinstance(target_buf, ComputedBuffer) and _can_mutate_producer_in_place(
+            target_buf, graph.get_output_names()
+        ):
+            _rewrite_producer_layout(target_buf, required_stl)
+        else:
+            _insert_mutation_relayout_copy(
+                graph, scatter_op, write_dep, required_stl=required_stl
+            )
+        return
+
+    # Build substitutions mapping scatter symbols to IndirectAccess markers.
+    scatter_access_subs = {sym: IndirectAccess(sym) for sym in scatter_syms}
 
     # Compute write coordinates against target layout. Sizes must be resolved
     # against target's strides (not output's), since coordinates are computed
@@ -835,7 +1052,7 @@ def _enforce_scatter_destination_layout(
             "scatter_destination_check: inserting mutation relayout copy for %s",
             scatter_op.get_name(),
         )
-        _insert_mutation_relayout_copy(graph, scatter_op, write_dep, {}, None)
+        _insert_mutation_relayout_copy(graph, scatter_op, write_dep)
 
 
 def enforce_indirect_access_layout(graph: GraphLowering) -> None:
@@ -864,6 +1081,21 @@ def enforce_indirect_access_layout(graph: GraphLowering) -> None:
         requirement = _get_indirect_access_dim_order_requirements(original_op)
 
         if not requirement:
+            # For scatter ops with a mutation layout, always run the destination
+            # layout check even when requirement is None. When P=1, Inductor
+            # eliminates the index loop so _build_indirect_store_subs finds no
+            # scatter-index symbols and returns empty dep_names — requirement is
+            # None — but the destination still needs its scattered dim outermost.
+            #
+            # Note on is_mutation: in PyTorch Inductor and torch-spyre, all scatter /
+            # indirect store operations (both functional and in-place) lower to an
+            # explicit mutation with MutationLayoutSHOULDREMOVE on the destination
+            # buffer. Non-mutating indirect operations are gathers/loads (reads).
+            # Thus, is_mutation is strictly required for indirect store destination
+            # enforcement because _enforce_scatter_destination_layout unwraps and
+            # repoints the mutation target via MutationLayoutSHOULDREMOVE.
+            if is_scatter and is_mutation:
+                _enforce_scatter_destination_layout(graph, original_op, None)
             continue
         dep_names, access_subs, sizes = requirement
 
