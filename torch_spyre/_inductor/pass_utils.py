@@ -2270,11 +2270,39 @@ def _is_compact_node(current_node: ComputedBuffer | SchedulerNode) -> bool:
         return False
 
 
+def expand_sparse(
+    in_stl,
+    output: FixedLayout,
+) -> tuple[bool, SpyreTensorLayout]:
+    c_size = [concretize_expr(s) for s in output.size]
+    c_stride = [concretize_expr(s) for s in output.stride]
+
+    out_stl = SpyreTensorLayout(
+        c_size, c_stride, output.dtype, list(range(len(output.size)))
+    )
+
+    in_is_sparse = is_sparse_stl(in_stl)
+    out_is_sparse = is_sparse_stl(out_stl)
+
+    restick = len(in_stl.device_size) > 1 and in_is_sparse and not out_is_sparse
+
+    if restick:
+        out_stl = SpyreTensorLayout(
+            [in_stl.elems_per_stick()] + out_stl.device_size,
+            [c_stride[0] * c_size[0]] + out_stl.stride_map,
+            out_stl.device_dtype,
+        )
+        return True, out_stl
+
+    return False, out_stl
+
+
 def compute_restickify_needed(
     in_stl: SpyreTensorLayout,
     in_host: FixedLayout,
     in_dep: MemoryDep,
     out_stl: SpyreTensorLayout,
+    out_host: FixedLayout,
     out_dep: MemoryDep,
     op: "ComputedBuffer | None" = None,
 ) -> "tuple[bool, SpyreTensorLayout | None]":
@@ -2391,6 +2419,27 @@ def compute_restickify_needed(
         if reduction_vars:
             red_var = min(reduction_vars, key=str)
             target_stick = sympy.Mod(red_var, in_stl.elems_per_stick())
+
+    # We want to test whether a sparse to dense conversion is possible.
+    # But if there is a trailing 1 dim, the STL will create a sparse layout
+    # defeating the test.
+    dense_in_host = FixedLayout(
+        device=in_host.device,
+        dtype=in_host.dtype,
+        size=in_host.size[:],
+        stride=in_host.stride[:],
+        offset=in_host.offset,
+        is_pinned=in_host.is_pinned,
+    )
+    while len(dense_in_host._size) > 1 and dense_in_host._size[-1] == 1:
+        dense_in_host._size.pop(-1)
+        dense_in_host._stride.pop(-1)
+    # Here we test the dense_in_host instead of out_host because out_host might
+    # have extra dimensions in which the input will be broadcasted into.
+    expanded, expanded_stl = expand_sparse(in_stl, dense_in_host)
+    if expanded:
+        return True, expanded_stl
+
     return True, compute_restickify_target_layout(
         in_stl, in_host, target_stick, ic, idc
     )

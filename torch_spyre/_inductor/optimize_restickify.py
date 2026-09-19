@@ -95,7 +95,13 @@ class EdgeCostMap:
           SpyreTensorLayout  — feasible restickify target layout
         """
         needed, tgt = compute_restickify_needed(
-            in_stl, self._dep_layout, self.dep, target_stl, self._target_dep, self._op
+            in_stl,
+            self._dep_layout,
+            self.dep,
+            target_stl,
+            self._target_dep_layout,
+            self._target_dep,
+            self._op,
         )
         if not needed:
             cost = 0.0

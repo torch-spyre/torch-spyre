@@ -82,6 +82,7 @@ from .ir import (
 from .pass_utils import (
     compute_restickify_target_layout,
     concretize_expr,
+    expand_sparse,
     find_matmul_generated_var,
     find_reduction_var,
     get_matmul_m_size,
@@ -92,7 +93,6 @@ from .pass_utils import (
     try_device_coordinates,
     indirect_info_from_op,
     is_keep_by_index,
-    is_sparse_stl,
     is_stick_expr_offset_free,
     is_topk,
     iter_var_id,
@@ -224,15 +224,23 @@ def _project_pointwise_dim_order(
 ) -> list[int]:
     """Project a pointwise output order onto a trailing-aligned input."""
     rank_diff = output_rank - input_rank
+
+    if rank_diff == -1 and dim_order[-1] == -1:
+        return dim_order
+
     if rank_diff >= 0:
-        return [d - rank_diff for d in dim_order if d >= rank_diff]
+        return [
+            (d - rank_diff if d != -1 else d)
+            for d in dim_order
+            if (d >= rank_diff or d == -1)
+        ]
 
     # A loop tile can be a rank-preserving view of a higher-rank backing
     # buffer. Its extra leading axes are fixed by the loop, while the body
     # operates on the trailing axes. Keep those backing axes in the layout
     # permutation and shift the body's order onto the trailing dimensions.
     leading = list(range(-rank_diff))
-    return leading + [d - rank_diff for d in dim_order]
+    return leading + [(d - rank_diff if d != -1 else d) for d in dim_order]
 
 
 def _pick_stick_dim(stick_expr, out_coords) -> int:
@@ -1568,6 +1576,10 @@ def _multi_arg_pointwise_layouts(
             )
             c_in_size = [concretize_expr(s) for s in arg.layout.size]
             c_in_stride = [concretize_expr(s) for s in arg.layout.stride]
+            if len(c_in_size) < len(dim_order) and dim_order[-1] == -1:
+                c_in_size.append(0)
+                c_in_stride.append(0)
+            assert len(c_in_size) == len(projected_dim_order)
             in_stl = SpyreTensorLayout(
                 c_in_size,
                 c_in_stride,
@@ -1589,6 +1601,8 @@ def _multi_arg_pointwise_layouts(
                         return False
         return True
 
+    results: list[SpyreTensorLayout] = []
+
     def _try_stick_dim(stick_dim):
         dim_order = _compute_dim_order(stick_dim, c_size, out_coords)
         if _is_supported_layout(dim_order):
@@ -1597,8 +1611,6 @@ def _multi_arg_pointwise_layouts(
                     c_size, c_stride, out_dtype_for_layout, dim_order, output_ea
                 )
             )
-
-    results: list[SpyreTensorLayout] = []
 
     if can_use_same_layout:
         template_stl = next(iter(args[0].layouts))
@@ -1781,28 +1793,10 @@ def _compact_layout(
     out_layouts = []
 
     for in_stl in in_arg.layouts:
-        c_size = [concretize_expr(s) for s in output.size]
-        c_stride = [concretize_expr(s) for s in output.stride]
-
-        out_stl = SpyreTensorLayout(
-            c_size, c_stride, output.dtype, list(range(len(output.size)))
+        _, out_stl = expand_sparse(
+            in_stl,
+            output,
         )
-
-        in_is_sparse = is_sparse_stl(in_stl)
-        out_is_sparse = is_sparse_stl(out_stl)
-
-        if not in_is_sparse:
-            assert not out_is_sparse
-
-        restick = len(in_stl.device_size) > 1 and in_is_sparse and not out_is_sparse
-
-        if restick:
-            out_stl = SpyreTensorLayout(
-                [in_stl.elems_per_stick()] + out_stl.device_size,
-                [c_stride[0] * c_size[0]] + out_stl.stride_map,
-                out_stl.device_dtype,
-            )
-
         out_layouts.append(out_stl)
 
     op.restick_cost_fn = AnyInNode.from_args()
