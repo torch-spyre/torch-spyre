@@ -18,6 +18,7 @@ import functools
 import hashlib
 import json
 from pathlib import Path
+import shutil
 import subprocess
 from unittest.mock import patch as mock_patch
 import torch
@@ -852,11 +853,34 @@ def capture_backend_output_dirs():
         yield output_dirs
 
 
+def requires_dxp_standalone():
+    """Skip the calling test unless ``dxp_standalone`` is on PATH.
+
+    Bundles are compiled by dbo-opt, so dxp_standalone is no longer needed to
+    build or run a kernel.  The debug re-lowering below is the one thing that
+    still requires it: ``--use-dxp`` with ``DXP_DEBUG=1`` writes the
+    ``debug/sdsc_*/*.out.out.out.json`` payloads these assertions read, and
+    dbo-opt has no equivalent.  So the payload check is only meaningful where
+    that binary exists, and a missing one is an environment fact rather than a
+    product failure -- skip rather than fail.
+    """
+    if shutil.which("dxp_standalone") is None:
+        pytest.skip(
+            "dxp_standalone not on PATH: the --use-dxp/DXP_DEBUG debug payload "
+            "this assertion reads has no dbo-opt equivalent"
+        )
+
+
 def assert_lx_only_relayout_payload(output_dirs):
     """The compiled bundle's SDSC payload carries exactly one LX relayout op and
     no HBM movement: one ``STCDPOpLx``, no op named for DMA, restickify or an
     HBM copy, and zero ``hbmSize_`` on every labeled data structure. A debug
-    re-lowering of the same bundle, not a second device execution."""
+    re-lowering of the same bundle, not a second device execution.
+
+    Skips when dxp_standalone is unavailable -- see requires_dxp_standalone.
+    """
+    requires_dxp_standalone()
+
     for output_dir in output_dirs:
         subprocess.run(
             ["dxp_standalone", "-d", output_dir, "--use-dxp"],
