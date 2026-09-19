@@ -63,6 +63,7 @@ from .constants import (
     ELIDED_COPY_BACK_ATTR,
     KEEP_BY_INDEX_OP,
     MATMUL_REDUCTION_OPS,
+    STAGGERED_EAS,
     TOPK_OPS,
 )
 from .ir import FixedTiledLayout, SpyreConstantFallback
@@ -177,67 +178,274 @@ def rescale_stl_for_dtype(
     stl: SpyreTensorLayout,
     out_dtype: torch.dtype,
     ea: ElementArrangement,
+    *,
+    stick_extent: int | None = None,
+    host_size: "list[Expr] | list[int] | None" = None,
+    host_stride: "list[Expr] | list[int] | None" = None,
 ) -> SpyreTensorLayout:
-    """Propagate a device layout across a same-shape, differing-stick-depth dtype conversion.
+    """Propagate a device layout across a same-shape, stick-depth-changing convert.
 
     Copies the input STL's ``device_size``/``stride_map`` and rescales the stick
-    depth (the last device dim) plus, when present, the one non-stick dim whose
-    stride equals the input stick depth. This preserves any non-canonical layout
-    or padding present in the input STL instead of reconstructing a dense layout
-    from the logical size/stride.
+    depth (the last device dim) plus, when present, the one non-stick dim that
+    indexes whole sticks -- the dim whose stride is ``stride_map[-1] * in_eps``.
+    This preserves any non-canonical layout or padding present in the input STL
+    instead of reconstructing a dense layout from the logical size/stride.
 
     The input elements-per-stick is read from ``stl.device_size[-1]`` (the stick
-    dimension is always full, so it equals ``get_elem_in_stick(in_dtype)``); the
-    output count comes from ``out_dtype``.
+    dim is always full, so it equals ``get_elem_in_stick(in_dtype)``); the output
+    count comes from ``out_dtype``.
 
-    The rescale must be exact: the dim's sticks must hold a whole number of
-    output sticks. Flooring an inexact ratio either drops data (three fp32
-    sticks of 32 elements floor to one fp16 stick, losing 32 elements) or
-    floors to zero (one fp32 stick, ``1 * 32 // 64``), and a zero-sized device
-    dim used to reach ``get_device_stride_infos`` and kill the process with
-    SIGFPE (issue #3604). A conversion whose output can legitimately end in a
-    partially filled stick builds its own layout instead (see
-    ``_qfp8ch_stl`` in propagate_layouts.py).
+    The stick *count* must come from the *logical* extent of the stick axis, the
+    way the canonical constructor computes it
+    (``ceil(host_size[stick_dim] / elems_in_stick)``, ``spyre_tensor_impl.cpp``),
+    because ``device_size`` records only the padded stick *capacity* -- a lossy
+    encoding of that extent, since at fp16 every extent in ``1..64`` is one stick
+    yet those extents need one or two fp32 sticks. So pass ``stick_extent``
+    whenever the caller knows it; see issue #4392. The extent-derived arithmetic is
+    width-agnostic, with ``get_elem_in_stick`` the sole authority on the widths.
+
+    ``out_dtype`` may not be ``torch.bool``: a bool's stick width is not a property
+    of the dtype but of the operand that produced it (fp16 or fp32), and
+    ``get_elem_in_stick(torch.bool)`` hardcodes the fp16 case -- see
+    ``bool_layout_dtype``. A documented contract, not an enforced one; the convert
+    sites in ``propagate_layouts`` guard on it, the eager ``.to()`` caller carries a
+    pre-existing TODO.
+
+    The helper is exact or inert, never wrong: where the known extents *disprove*
+    every candidate num-sticks dim or pin no single count, the count is left
+    untouched rather than estimated, while the stride is rescaled regardless (it
+    does not depend on the count -- see the body). ``TestRescaleStlForDtype`` pins
+    the equivalence to canonical in tree; the commit message carries the A/B
+    against ``main``.
 
     Args:
         stl: Input device layout to rescale.
         out_dtype: Torch dtype of the conversion output.
         ea: ElementArrangement to stamp on the returned layout.
+        stick_extent: Logical extent of the host dim the num-sticks device dim
+            counts over. Identifies that dim unambiguously *and* gives the exact
+            count. Callers with an Inductor dep resolve it via
+            ``stick_extent_from_coords``.
+        host_size: Full logical shape, for callers that cannot resolve the stick
+            axis themselves -- the eager ``.to()`` path has no ``MemoryDep`` to run
+            coordinate identity against. The body picks the axis from it. Ignored
+            when ``stick_extent`` is given.
+        host_stride: Host strides matching ``host_size``. Optional but strongly
+            preferred alongside it: it makes the stick axis identifiable outright
+            rather than searched for (the body explains why), which is what lets
+            the eager path be exact without a ``MemoryDep`` -- a real ``Tensor``
+            always knows its strides. Ignored when ``stick_extent`` is given.
+
+    Returns:
+        A new ``SpyreTensorLayout`` at ``out_dtype`` and ``ea`` with ``stl``'s outer
+        geometry and padding intact, its stick depth rescaled, and -- where the
+        num-sticks dim is identifiable -- that dim's size and stride rescaled too.
 
     Raises:
-        Unsupported: If the stick-indexing dim does not rescale to a whole
-            number of output sticks.
+        Unsupported: Only on the no-extent fallback, when the capacity rescale is
+            inexact and therefore unknowable (see above). With an extent the count
+            is exact and nothing is refused.
     """
     in_eps = stl.device_size[-1]
     out_eps = get_elem_in_stick(out_dtype)
     out_device_size = list(stl.device_size)
     out_stride_map = list(stl.stride_map)
     out_device_size[-1] = out_eps
-    # Rescale the first non-stick dim that indexes whole sticks (stride == the
-    # input stick depth) by the stick-depth ratio. A staggered/sparse layout
-    # (e.g. the DL16_TO_FP32 restoration operand, whose stride_map carries
-    # sentinel -1 entries rather than a linear num-sticks stride) has no such
-    # dim; there only the stick depth changes, so a no-match is expected and
-    # left as-is.
-    for i, s in enumerate(stl.stride_map):
-        if s == in_eps:
-            total_elems = stl.device_size[i] * in_eps
-            if total_elems % out_eps != 0:
-                raise Unsupported(
-                    f"cannot rescale device layout {list(stl.device_size)} for "
-                    f"conversion to {out_dtype}: device dim {i} holds "
-                    f"{stl.device_size[i]} stick(s) of {in_eps} elements, which is "
-                    f"not a whole number of {out_eps}-element output sticks"
-                )
-            out_device_size[i] = total_elems // out_eps
-            out_stride_map[i] = out_eps
-            break
+    # Find the non-stick dim that indexes whole sticks and rescale it by the
+    # stick-depth ratio. Some layouts have no such dim (see the sentinel below);
+    # there only the stick depth changes, so a no-match is expected and left as-is.
+    #
+    # The last device dim is the stick itself, already rescaled to out_eps above;
+    # it counts elements, never sticks, so it is never a num-sticks candidate even
+    # when its stride happens to equal in_eps (host (4,32) fp32 with dim_order
+    # [1,0] gives stride_map [1024, 1, 32] == in_eps at the last dim). Selecting it
+    # would overwrite the stick depth with a stick count.
+    last = len(out_device_size) - 1
+    # ``stride_map[-1]`` is the inner-stick stride, and it *is*
+    # ``host_stride[stick_dim]`` -- which is what makes host strides an exact way to
+    # identify the stick axis (see the host_stride branch below) and what gives the
+    # num-sticks stride here without threading any host strides in: that stride is
+    # ``host_stride[stick_dim] * elems_in_stick``, of which a bare ``in_eps`` is
+    # only the host-contiguous case. Host ``(68,4)`` with ``dim_order [1,0]`` gives
+    # fp16 ``stride_map [256, 1, 4]``, whose num-sticks stride is ``4 * 64 == 256``
+    # and matches no ``== in_eps`` candidate. This agrees with ``== in_eps`` exactly
+    # when ``stride_map[-1] == 1`` -- equivalently, when the stick axis is
+    # host-contiguous, by the identity above -- and deliberately disagrees
+    # otherwise: it is a correction, not a strict generalization. Outside that case
+    # it both stops matching dims whose stride merely equals ``in_eps`` (which this
+    # predicate shows are not the num-sticks dim) and starts matching the dim that
+    # actually is one, where ``== in_eps`` found nothing and left the layout alone.
+    # That second half widens a buffer's candidate list, which is observable beyond
+    # this helper: a candidate that used to be dropped can now survive and change a
+    # downstream heuristic's inputs -- see the mixed-EA tie-break in
+    # ``_multi_arg_pointwise_layouts`` (propagate_layouts.py), which this exposed.
+    inner = stl.stride_map[-1]
+    stride_in = inner * in_eps
+    stride_out = inner * out_eps
+    # A sentinel (< 0) inner stride means the stick axis does not advance: it is an
+    # extent-1 host dim, holding one stick at every dtype, so there is no num-sticks
+    # dim to find and only the stick depth changes. Falling back to a bare
+    # ``== in_eps`` match here would rescale an unrelated outer dim that merely
+    # shares that value -- host (1,4,32) fp32 with dim_order [1,2,0] has stride_map
+    # [1, -1, 32, -1], where 32 is dim 1's outer stride.
+    candidates = (
+        [i for i, s in enumerate(stl.stride_map) if s == stride_in and i != last]
+        if inner > 0
+        else []
+    )
+    # An explicit stick_extent is authoritative; a bare host_size offers every
+    # extent and lets the validation below pick the axis.
+    if stick_extent is not None:
+        extents = [stick_extent]
+    elif host_size is not None:
+        extents = [concretize_expr(s) for s in host_size]
+        # With host strides available the stick axis is not a search at all: by the
+        # identity above, the host dim whose stride equals ``inner`` *is* that axis,
+        # so its extent is authoritative rather than merely consistent. Ties are
+        # only ever with extent-1 dims (a size-1 dim shares its neighbour's stride
+        # in any dense layout) and a size-1 dim is never the axis a longer dim
+        # sticks over, so dropping them resolves the tie; if that still leaves
+        # several, or the inner stride is a sentinel, fall through to the search.
+        if inner > 0 and host_stride is not None and len(host_stride) == len(extents):
+            strides = [concretize_expr(s) for s in host_stride]
+            dims = [i for i, s in enumerate(strides) if s == inner]
+            if len(dims) > 1:
+                sized = [i for i in dims if extents[i] != 1]
+                dims = sized if len(sized) == 1 else dims
+            if len(dims) == 1:
+                extents = [extents[dims[0]]]
+    else:
+        extents = []
+    # Every (dim, output count) an extent confirms. The stride predicate alone is
+    # ambiguous at rank >= 3 -- a (2,4,8,64) fp16 layout has stride_map
+    # [512, 64, 64, 2048, 1], matching dims 1 and 2 -- so a candidate counts as
+    # confirmed only by holding the input's own stick count, the way
+    # ``_resize_device_layout`` (ir.py) matches its tile-count dim. Writing a count
+    # into the wrong dim permutes the tensor.
+    #
+    # Requiring the survivors to *agree* matters only for a bare host_size, where
+    # two extents can confirm the same dim yet imply different output counts: host
+    # (4,63) with dim_order [1,0] is one fp16 stick, so extents 4 and 63 both give
+    # in_sticks == 1, but 1 and 2 fp32 sticks respectively. Taking the first match
+    # would pick by iteration order.
+    matches = set()
+    for extent in extents:
+        in_sticks = -(-extent // in_eps)  # ceil
+        exact = [i for i in candidates if stl.device_size[i] == in_sticks]
+        if len(exact) == 1:
+            matches.add((exact[0], -(-extent // out_eps)))  # ceil
+    if len(matches) == 1:
+        i, num_sticks = matches.pop()
+        out_device_size[i] = num_sticks
+        out_stride_map[i] = stride_out
+    elif extents:
+        # No candidate held the input's stick count for any known extent -- every
+        # candidate *disproven*, not merely unconfirmed -- or the extents disagree.
+        # Writing a count we cannot pin, or one into a dim we ruled out, permutes
+        # the tensor, so leave the count alone.
+        #
+        # The stride is a separate question: it comes from ``inner`` alone, so it can
+        # be rescaled even where the extent stayed ambiguous. That matters far more
+        # often than it sounds -- every stick-axis extent of 32 or less is one stick
+        # at both fp16 and fp32, yet its whole-stick stride scales with the stick
+        # depth either way -- so coupling the two would leave a stale stride, and a
+        # layout disagreeing with canonical, in cases the unfixed code got right.
+        if len(candidates) == 1:
+            out_stride_map[candidates[0]] = stride_out
+    elif candidates:
+        # No extent at all. No in-tree caller lands here -- both pass at least
+        # host_size, and the compile path passes both, so a None from
+        # stick_extent_from_coords still degrades to the exact stride-derived answer
+        # rather than to capacity -- so this is the safety floor for a future caller,
+        # keeping #3809's contract unchanged: capacity is all that is left, an
+        # inexact capacity rescale is unknowable, and refusing beats both flooring to
+        # zero (SIGFPE downstream, see spyre_mem.cpp, issue #3604) and clamping to a
+        # count we would be inventing.
+        #
+        # Note what this check cannot catch, which is why an extent is worth
+        # threading through: unlike the extent arithmetic above, capacity is
+        # width-sensitive. The remainder can only be nonzero when out_eps does *not*
+        # divide in_eps, so every narrowing direction -- and every direction away
+        # from an 8-bit dtype, whose width is a multiple of the others -- passes here
+        # and over-counts silently instead of refusing. Prefer host_size and
+        # host_stride, which a caller holding a Tensor or a FixedLayout always has.
+        i = candidates[0]
+        capacity = stl.device_size[i] * in_eps
+        if capacity % out_eps != 0:
+            raise Unsupported(
+                f"cannot rescale device layout {list(stl.device_size)} for "
+                f"conversion to {out_dtype}: device dim {i} holds "
+                f"{stl.device_size[i]} stick(s) of {in_eps} elements, which is "
+                f"not a whole number of {out_eps}-element output sticks"
+            )
+        out_device_size[i] = capacity // out_eps
+        out_stride_map[i] = stride_out
+    # A staggered EA is a statement about *within-stick* order: it says the
+    # conversion leaves this stick's elements interleaved rather than in host
+    # order. A sentinel inner stride means the stick axis does not advance -- an
+    # extent-1 host dim (see ``inner`` above) -- so the stick carries exactly one
+    # valid host element and there is no within-stick order to describe. Every
+    # reader agrees on where that lone element sits, so the stagger is not merely
+    # harmless here but unrepresentable, and the conversion produces an ordinary
+    # STANDARD stick.
+    #
+    # The caller cannot know this: ``ea`` reaches here from
+    # ``DtypeOpTable.ea_map``, keyed on (src dtype, dst dtype, src ea) alone
+    # (dtype_ops.py), which never sees a geometry. This is the one place that holds
+    # both, so the correction belongs here -- and being here it lands on every
+    # convert site at once (the three in ``propagate_layouts`` plus the eager
+    # ``.to()`` in ``_monkey_patch``) rather than per site.
+    #
+    # Sparsity is not a free choice: the convert copies ``stl``'s stick axis, so
+    # this fires on exactly the candidates whose *input* stick was already sparse.
+    # A buffer whose candidate list mixes the two (its list spans stick axes,
+    # offered upstream) therefore mixes EA, which is correct -- each candidate is
+    # labelled for its own geometry -- but note ``_multi_arg_pointwise_layouts``
+    # reads one EA per operand off ``layouts[0]``.
+    if ea in STAGGERED_EAS and out_stride_map[-1] < 0:
+        ea = ElementArrangement.STANDARD
     return SpyreTensorLayout(
         out_device_size,
         out_stride_map,
         get_device_dtype(out_dtype),
         ea,
     )
+
+
+def stick_extent_from_coords(
+    stl: SpyreTensorLayout,
+    in_layout: FixedLayout,
+    dep: MemoryDep,
+    host_size: "list[Expr] | list[int]",
+) -> "int | None":
+    """Valid element count along ``stl``'s stick axis, recovered by coordinate identity.
+
+    ``SpyreTensorLayout`` retains only ``device_size``/``stride_map``/
+    ``device_dtype``/``element_arrangement``: it discards its ``dim_map``, putting
+    the host<->device dim identity off the layout, and records the stick dim's
+    padded *capacity* rather than how many of those elements are valid (issue
+    #4392). Both are needed to rescale a stick count across a dtype change, and
+    both are recoverable from the owning buffer instead of being tracked on the
+    layout -- which is the workaround every caller that needs the identity has had
+    to reinvent, ``_stick_host_dim`` (coarse tiling) included.
+
+    Recovers the stick host dim exactly as ``_stick_host_dim`` does -- the
+    inner-stick device coordinate has a single free symbol that also drives
+    exactly one host coordinate, so ``matching_dim`` resolves it even when two
+    host dims share a size -- then reads the extent off ``host_size``.
+
+    Returns:
+        The extent of the stick host dim, or ``None`` when the coordinates are
+        unavailable or the identity is not unique, which leaves the caller on its
+        documented fallback rather than on a guess.
+    """
+    dev_coords = try_device_coordinates(stl, dep, None)
+    if not dev_coords:
+        return None
+    stick_hd = matching_dim(host_coordinates(in_layout, dep, None), dev_coords[-1])
+    if stick_hd is None:
+        return None
+    return concretize_expr(host_size[stick_hd])
 
 
 def op_read_writes(op: Operation) -> ReadWrites:

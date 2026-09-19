@@ -47,9 +47,14 @@ DEVICE_NAME = "spyre"
 #
 # NOTE: this is deliberately narrower than "all non-STANDARD EAs". is_ea_compatible
 # does NOT use this set — it treats any single non-STANDARD EA (except EXX2) as
-# broadcastable. QFP8CH is intentionally excluded here because membership also
-# forces the convert-preserve path, which would mishandle the degenerate qfp8ch
-# convert layout.
+# broadcastable. QFP8CH is excluded here because membership also forces the
+# convert-preserve path for fp8->fp16, and that path has never been validated for
+# it: the dense rebuild is what fp8->fp16 has always taken. (Until the #4392 fix
+# there was a second reason -- qfp8ch could produce a size-0 num-sticks dim for the
+# preserve path to inherit. That degeneracy is gone, so this is now a
+# not-yet-validated choice rather than an impossible one.) QFP8CH is also unlike
+# the staggered EAs in the codegen: ktir treats it as a plain STANDARD element
+# order, while a staggered EA has no rank/stride pair to emit at all.
 STAGGERED_EAS = frozenset(
     {
         ElementArrangement.DL16_TO_FP32,
@@ -94,11 +99,11 @@ def is_ea_compatible(eas) -> bool:
     #
     # NOTE: this accepts QFP8CH + STANDARD, but no current graph produces that
     # combination — QFP8CH tensors are consumed by an fp8 matmul or the fp8->fp16
-    # convert, never a multi-arg pointwise. So QFP8CH is intentionally kept OUT of
-    # STAGGERED_EAS (which doubles as the "convert must preserve the device
-    # layout" gate; adding QFP8CH there would mis-handle the degenerate qfp8ch
-    # convert layout). If QFP8CH broadcast ever becomes real, split those two
-    # uses rather than widening STAGGERED_EAS.
+    # convert, never a multi-arg pointwise. So QFP8CH is kept OUT of STAGGERED_EAS
+    # (which doubles as the "convert must preserve the device layout" gate, and
+    # that path is unvalidated for fp8->fp16 -- see the note on STAGGERED_EAS).
+    # If QFP8CH broadcast ever becomes real, split those two uses rather than
+    # widening STAGGERED_EAS.
     non_standard = unique - {ElementArrangement.STANDARD}
     return len(non_standard) == 1 and ElementArrangement.EXX2 not in non_standard
 
