@@ -146,7 +146,7 @@ def get_kernel_registry() -> _KernelHashRegistry:
 
 
 @lru_cache(maxsize=1)
-def _get_dxp_version() -> str:
+def _get_backend_compiler_version() -> str:
     """Return a combined deeptools+flex version string from the Spyre components file.
 
     Reads the path given by the ``LIB_VERSION_FILE`` environment variable
@@ -383,10 +383,11 @@ def compute_specs_hash(
         [
             torch.__version__,
             _get_torch_spyre_version(),
-            _get_dxp_version(),
+            _get_backend_compiler_version(),
             # Bundles are compiled by dbo-opt, not dxp_standalone.
-            # _get_dxp_version() reports the deeptools package version, which
-            # ships both binaries and so does not change when the backend does.
+            # _get_backend_compiler_version() reports the deeptools package
+            # version, which ships both binaries and so does not change when
+            # the backend does.
             # Without this tag, entries produced by dxp_standalone stay
             # indistinguishable -- _REQUIRED_ARTIFACTS are the same filenames --
             # and would be served as hits, so dbo-opt would never run.
