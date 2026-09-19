@@ -1841,7 +1841,11 @@ def simplify_op_spec(
     new_op_space_splits, new_tensors, work_division_remap = align_tensors(
         op_spec.iteration_space,
         [
-            {"size": arg.device_size, "coordinates": arg.device_coordinates}
+            {
+                "size": arg.device_size,
+                "coordinates": arg.device_coordinates,
+                "name": arg.name,
+            }
             for arg in op_spec.args
         ],
         indirect_sizes,
