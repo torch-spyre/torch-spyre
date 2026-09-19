@@ -408,3 +408,6 @@ tools/cost_model/sweep_records.json.part
 # OpSpec lab outputs
 captured/
 op_spec_out/
+
+# Local subagent-driven-development workspace (ledgers, briefs, review packages)
+.superpowers/
