@@ -787,47 +787,27 @@ class OOTTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa: F
             )
 
             if not enabled:
-                # ------- Delete rather than replace with a skip stub -------
-                # Previously this replaced the method with a unittest.SkipTest
-                # stub, causing pytest to collect and report the variant as
-                # SKIPPED. This happens for dtype-filtered variants (e.g.
-                # "Unsupported dtype: complex128") which can produce dozens of
-                # SKIPPED lines per test.
-                #
-                # Deleting the method entirely removes it from the class so
-                # pytest never collects it -- EXCEPT when method_name is
-                # identical to the untouched, undecorated method still sitting
-                # on generic_cls's own __dict__ (true for any test with no
-                # dtype/device suffix, e.g. a plain method with no @dtypes/
-                # @ops parametrization). `cls` is built as
-                # type(class_name, (base, generic_cls), {}), so delattr only
-                # removes cls's own override and unmasks the inherited
-                # original, which then runs unfiltered (see issue: YAML
-                # mode:skip silently ignored, tests reaching hardcoded
-                # GPU_TYPE/cuda calls). Fall back to a skip stub in that case.
-                if generic_cls is not None and method_name in generic_cls.__dict__:
-                    _skip_reason = reason or "Skipped by OOT config"
+                # Always install a skip stub rather than delattr-ing the
+                # method: delattr removes it from the class entirely, so
+                # pytest never collects it and it leaves no trace -- not
+                # even a skipped count -- in the JUnit XML report that
+                # CI/dashboards read.
+                _skip_reason = reason or "Skipped by OOT config"
 
-                    @wraps(test)
-                    def _skip(self, _reason=_skip_reason):
-                        raise unittest.SkipTest(_reason)
+                @wraps(test)
+                def _skip(self, _reason=_skip_reason):
+                    raise unittest.SkipTest(_reason)
 
-                    setattr(cls, method_name, _skip)
-                else:
-                    delattr(cls, method_name)
+                # pytest walks __wrapped__ chains to resolve item.obj at
+                # collection time -- @wraps(test) left it pointing at the
+                # original (possibly heavy/unsafe) test function, so pytest
+                # would run that instead of this stub. Same hazard as
+                # _xfail_wrapper below; same fix.
+                if hasattr(_skip, "__wrapped__"):
+                    del _skip.__wrapped__
+
+                setattr(cls, method_name, _skip)
                 continue
-
-            # Following lines has been commented out to disable generating
-            # the skipped tests. If you want to generate, then please uncomment
-            # these lines below and comment out the above lines.
-
-            # if not enabled:
-            #     @wraps(test)
-            #     def _skip(self, _reason=reason or "Skipped by OOT config"):
-            #         raise unittest.SkipTest(_reason)
-
-            #     setattr(cls, method_name, _skip)
-            #     continue
 
             # Collect dynamic markers (op__, dtype__, module__) that the
             # patchers attached to this specific instantiated method, and
