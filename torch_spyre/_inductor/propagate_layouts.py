@@ -784,7 +784,9 @@ def _clone_layout(
             f"Cannot find alternative layout with size={output.size} and coordinates={out_coords}"
         )
 
-    op.restick_cost_fn = FixedInOutNode.from_args(args, out_stl, [required_in_stl], op)
+    op.restick_cost_fn = FixedInOutNode.from_args(
+        args, out_stl, [required_in_stl], op, output_dep
+    )
     return [out_stl]
 
 
@@ -807,7 +809,9 @@ def _exx2_layout(
     )
     reduction_var = find_reduction_var((x.dep,), output_dep)
     req_in_stl = find_stick_compatible_input_layout(x, reduction_var, "exx2", "x")
-    op.restick_cost_fn = FixedInOutNode.from_args(args, out_stl, [req_in_stl], op)
+    op.restick_cost_fn = FixedInOutNode.from_args(
+        args, out_stl, [req_in_stl], op, output_dep
+    )
     return [out_stl]
 
 
@@ -830,7 +834,9 @@ def _layernormnorm_layout(
     req_in_stl = find_stick_compatible_input_layout(
         x, reduction_var, "layernormnorm", "x"
     )
-    op.restick_cost_fn = FixedInOutNode.from_args(args[:1], out_stl, [req_in_stl], op)
+    op.restick_cost_fn = FixedInOutNode.from_args(
+        args[:1], out_stl, [req_in_stl], op, output_dep
+    )
     return [out_stl]
 
 
@@ -1276,6 +1282,7 @@ def _matmul_layouts(
         out_stl,
         [x_req_stl, y_req_stl],
         op,
+        output_dep,
     )
     return [out_stl]
 
@@ -1357,7 +1364,7 @@ def _conv_layouts(
     c_stride = [concretize_expr(s) for s in output.stride]
     out_stl = SpyreTensorLayout(c_size, c_stride, output.dtype, out_dim_order)
     op.restick_cost_fn = FixedInOutNode.from_args(
-        [x, y], out_stl, [x_req_stl, y_req_stl], op
+        [x, y], out_stl, [x_req_stl, y_req_stl], op, output_dep
     )
     return [out_stl]
 
@@ -1885,7 +1892,7 @@ def _keep_by_index_layouts(
     out_stl = SpyreTensorLayout(c_size, c_stride, output.dtype, out_dim_order)
 
     op.restick_cost_fn = FixedInOutNode.from_args(
-        [values, indices], out_stl, [values_req_stl, indices_req_stl], op
+        [values, indices], out_stl, [values_req_stl, indices_req_stl], op, output_dep
     )
     return [out_stl]
 

@@ -271,26 +271,48 @@ class FixedInOutNode(RestickNodeCost):
         edge_costs,
         required_out_stl: "SpyreTensorLayout",
         required_in_stls: "list[SpyreTensorLayout]",
+        out_dep: "MemoryDep",
     ):
         super().__init__(edge_costs)
         self.required_out_stl = required_out_stl
         # Parallel to edge_costs by construction in from_args (both built from the
         # same zip over args/req_stls). strict=True in min_input_cost asserts this.
         self.required_in_stls = required_in_stls
+        self._out_dep = out_dep
+        self._out_host = V.graph.get_buffer(out_dep.name).get_layout()
 
     @classmethod
-    def from_args(cls, args, out_stl, req_stls, op):
+    def from_args(cls, args, out_stl, req_stls, op, out_dep):
         assert req_stls, "FixedInOutNode.from_args: req_stls is empty"
         edge_costs = [
             EdgeCostMap(arg.dep, arg.layouts, [req], arg.dep, op)
             for arg, req in zip(args, req_stls)
         ]
-        return cls(edge_costs, required_out_stl=out_stl, required_in_stls=req_stls)
+        return cls(
+            edge_costs,
+            required_out_stl=out_stl,
+            required_in_stls=req_stls,
+            out_dep=out_dep,
+        )
+
+    def _out_stick_compatible(self, out_stl: "SpyreTensorLayout") -> bool:
+        """True if out_stl is stick-compatible with required_out_stl."""
+        if out_stl == self.required_out_stl:
+            return True
+        needed, _ = compute_restickify_needed(
+            self.required_out_stl,
+            self._out_host,
+            self._out_dep,
+            out_stl,
+            self._out_dep,
+            None,
+        )
+        return not needed
 
     def cost(
         self, in_layouts: "list[SpyreTensorLayout]", out_stl: "SpyreTensorLayout"
     ) -> float:
-        if out_stl != self.required_out_stl:
+        if not self._out_stick_compatible(out_stl):
             return INF
         return sum(
             ec.cost(lk, rk)
@@ -301,7 +323,7 @@ class FixedInOutNode(RestickNodeCost):
         return list(zip(self.edge_costs, self.required_in_stls))
 
     def min_input_cost(self, dep_name, in_stl, out_stl):
-        if out_stl != self.required_out_stl:
+        if not self._out_stick_compatible(out_stl):
             return INF
         matching = [
             (ec, req)
