@@ -315,7 +315,7 @@ inline std::string memoryCopyOperationName(uint8_t kind) {
 }
 
 inline uint32_t getBaseResourceId(const AIUpti_ActivityMemcpy* activity) {
-  return activity->copy_kind * 100;
+  return activity->stream_id * 100;
 }
 
 inline uint32_t getBaseResourceId(const AIUpti_ActivityMemory* activity) {
@@ -393,6 +393,7 @@ void AiuptiActivityProfilerSession::handleMemcpyActivity(
   memcpy_activity->addMetadata("memory operation id", activity->copy_kind);
   memcpy_activity->addMetadata("bytes", activity->bytes);
   memcpy_activity->addMetadata("memory bandwidth (GB/s)", bandwidth(activity));
+  memcpy_activity->addMetadata("stream", activity->stream_id);
 
   if (memcpy_activity->resource == getBaseResourceId(activity)) {
     recordMemoryStream(memcpy_activity->device, memcpy_activity->resource,
