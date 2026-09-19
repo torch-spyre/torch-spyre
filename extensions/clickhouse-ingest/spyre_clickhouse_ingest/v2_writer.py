@@ -21,7 +21,7 @@ wrong column and the column order lives in exactly one place.
 import sys
 
 from . import schema
-from .identity import v2_tags_for_case, v2_test_case_id
+from .identity import v2_benchmark_id, v2_tags_for_case, v2_test_case_id
 
 
 def v2_already_ingested(
@@ -124,6 +124,101 @@ def insert_v2(
     if skipped_unidentifiable:
         print(
             f"  [warn] v2: {skipped_unidentifiable} case(s) skipped -- identity not derivable",
+            file=sys.stderr,
+        )
+    return len(run_rows)
+
+
+def v2_benchmarks_already_ingested(
+    client, db: str, run_id: str, component: str
+) -> bool:
+    """benchmark_runs is a plain MergeTree with no dedup key, so a double ingest doubles the
+    samples behind a mean -- which still looks plausible. Scoped to (component, run_id), not
+    to a source file: one perf leg reports all its benchmarks in a single ingest.
+    """
+    rows = client.query(
+        f"SELECT count() FROM {schema.BENCHMARK_RUNS.qualified(db)} "
+        "WHERE component = {component:String} AND run_id = {run_id:UUID}",
+        parameters={"component": component, "run_id": run_id},
+    ).result_rows
+    return bool(rows and rows[0][0] > 0)
+
+
+def insert_benchmarks_v2(
+    client, db: str, component: str, run_id: str, benchmarks: list
+) -> int:
+    """Write benchmarks (identity) + benchmark_runs (measurements) for one leg.
+
+    Each entry is a dict: name, tags, props, backend, measurements, iterations, and `disc`
+    plus `disc_keys` for the identity discriminators (see v2_benchmark_id). One row per
+    (benchmark, backend): a row per metric would multiply every trend point by the metric count.
+    """
+    if not benchmarks:
+        return 0
+    ident_rows, facts = {}, {}
+    skipped_unidentifiable = 0
+    for b in benchmarks:
+        name, tags = b.get("name", ""), b.get("tags") or []
+        disc = b.get("disc") or {}
+        bid = v2_benchmark_id(component, name, tags, disc, b.get("disc_keys") or ())
+        if not bid:
+            # Writing a refused identity would collide it with every other unidentifiable one.
+            skipped_unidentifiable += 1
+            continue
+        backend = b.get("backend", "")
+        # Keyed by id: two files reporting one benchmark merge, richer props winning, so the
+        # merge cannot drop a field the other side set.
+        prev = ident_rows.get(bid)
+        props = {k: str(v) for k, v in (b.get("props") or {}).items() if v != ""}
+        if prev:
+            merged = dict(prev["props"])
+            merged.update(props)
+            props = merged
+        ident_rows[bid] = {
+            "benchmark_id": bid,
+            "component": component,
+            "name": name,
+            "tags": sorted({t for t in tags if t}),
+            "props": props,
+        }
+        fact = facts.setdefault(
+            (bid, backend),
+            {
+                "run_id": run_id,
+                "benchmark_id": bid,
+                "component": component,
+                "backend": backend,
+                "measurements": {},
+                "iterations": 0,
+                "props": {},
+            },
+        )
+        fact["measurements"].update(b.get("measurements") or {})
+        fact["iterations"] = max(fact["iterations"], int(b.get("iterations") or 0))
+        # Merged on every entry, as the identity props are: a sparser first entry must not
+        # drop a field a later one set for the same (benchmark, backend).
+        fact["props"].update({k: str(v) for k, v in (b.get("run_props") or {}).items()})
+    # The DDL's CHECK refuses an empty map, so one unmeasured benchmark would fail the whole
+    # insert; dropped with a warning instead of losing a long perf leg to a parse gap.
+    run_rows = [f for f in facts.values() if f["measurements"]]
+    dropped = len(facts) - len(run_rows)
+    kept = {f["benchmark_id"] for f in run_rows}
+    schema.insert_identities(
+        client,
+        schema.BENCHMARKS,
+        {k: v for k, v in ident_rows.items() if k in kept},
+        db=db,
+    )
+    schema.insert(client, schema.BENCHMARK_RUNS, run_rows, db=db)
+    if skipped_unidentifiable:
+        print(
+            f"  [warn] v2: {skipped_unidentifiable} benchmark(s) skipped -- identity not "
+            "derivable",
+            file=sys.stderr,
+        )
+    if dropped:
+        print(
+            f"  [warn] v2: {dropped} benchmark(s) skipped -- no measurements parsed",
             file=sys.stderr,
         )
     return len(run_rows)

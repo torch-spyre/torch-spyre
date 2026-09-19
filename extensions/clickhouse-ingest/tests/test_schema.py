@@ -17,16 +17,16 @@ built, so pair equality against the pre-refactor output is a complete correctnes
 
 import pytest
 from spyre_clickhouse_ingest.schema import (
-    ARTIFACTS,
     ARTIFACT_REFS,
     ARTIFACT_RESULTS,
     ARTIFACT_TAGS,
-    BENCHMARKS,
+    ARTIFACTS,
     BENCHMARK_RUNS,
-    TEST_CASES,
-    TEST_CASE_RUNS,
-    TABLES,
+    BENCHMARKS,
     STATUS_VALUES,
+    TABLES,
+    TEST_CASE_RUNS,
+    TEST_CASES,
     SchemaError,
     dep_component,
     dep_id12,

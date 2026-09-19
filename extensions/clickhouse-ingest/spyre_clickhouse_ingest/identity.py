@@ -225,3 +225,26 @@ def v2_run_id_for(args, run_id: str, arch: str, tier: str) -> str:
         return threaded
     source, external = v2_source_and_external_run_id(args, run_id)
     return v2_run_id(source, external, arch, tier)
+
+
+def v2_benchmark_id(component: str, name: str, tags, disc=None, disc_keys=()) -> str:
+    """Content identity of a benchmark, so the same benchmark reconciles across runs.
+
+    component leads the hash, which is what lets each producer own its own `disc_keys` set
+    without colliding with another's. `disc_keys` is positional: reordering it mints new ids.
+    `backend` is deliberately not hashed -- it is the axis cross-backend comparison pivots on.
+    """
+    if not (_v2_norm(component) and _v2_norm(name)):
+        # An empty field hashes to a real uuid, so every unidentifiable benchmark would
+        # collide on one id rather than merely being orphaned.
+        return ""
+    tag_part = ",".join(sorted({t for t in (_v2_norm(x) for x in (tags or [])) if t}))
+    disc = disc or {}
+    # Absent keys are still emitted, so gaining a discriminator value changes only that value.
+    disc_part = ",".join(f"{k}={_v2_norm(disc.get(k))}" for k in disc_keys)
+    return str(
+        uuid.uuid5(
+            V2_NAMESPACE,
+            V2_SEP.join((_v2_norm(component), _v2_norm(name), tag_part, disc_part)),
+        )
+    )

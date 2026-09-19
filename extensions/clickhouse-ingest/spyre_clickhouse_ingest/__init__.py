@@ -24,21 +24,27 @@ from .identity import (
     V2_COMPONENT_DEFAULT,
     V2_NAMESPACE,
     V2_SEP,
+    v2_artifact_id,
+    v2_benchmark_id,
     v2_canonical_arch,
     v2_component,
+    v2_gha_artifact_id,
     v2_run_id,
     v2_run_id_for,
     v2_tags_for_case,
     v2_test_case_id,
-    v2_artifact_id,
-    v2_gha_artifact_id,
 )
 from .junit import (
     extract_properties,
     promote_xpass,
     v2_source_and_external_run_id,
 )
-from .v2_writer import insert_v2, v2_already_ingested
+from .v2_writer import (
+    insert_benchmarks_v2,
+    insert_v2,
+    v2_already_ingested,
+    v2_benchmarks_already_ingested,
+)
 
 __all__ = [
     "V2_COMPONENT_DEFAULT",
@@ -46,19 +52,22 @@ __all__ = [
     "V2_SEP",
     "extract_properties",
     "get_client",
+    "insert_benchmarks_v2",
     "insert_v2",
     "promote_xpass",
     "schema",
     "v2_already_ingested",
+    "v2_artifact_id",
+    "v2_benchmark_id",
+    "v2_benchmarks_already_ingested",
     "v2_canonical_arch",
     "v2_component",
     "v2_database",
+    "v2_gha_artifact_id",
     "v2_run_id",
     "v2_run_id_for",
     "v2_source_and_external_run_id",
     "v2_tables_present",
     "v2_tags_for_case",
     "v2_test_case_id",
-    "v2_artifact_id",
-    "v2_gha_artifact_id",
 ]

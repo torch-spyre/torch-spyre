@@ -40,9 +40,11 @@ from spyre_clickhouse_ingest import (
     V2_SEP,
     extract_properties,
     get_client,
+    insert_benchmarks_v2,
     insert_v2,
     promote_xpass,
     v2_already_ingested,
+    v2_benchmarks_already_ingested,
     v2_canonical_arch,
     v2_component,
     v2_database,
@@ -524,44 +526,10 @@ _V2_BENCH_ID_KEYS = (
 V2_BENCH_COMPONENT = "torch-spyre"
 
 
-def v2_benchmark_id(component: str, name: str, tags, disc=None) -> str:
-    """uuid5 over component + name + sorted tags + the identity discriminators in
-    _V2_BENCH_ID_KEYS. Same refuse-on-empty rule as v2_test_case_id: an empty name
-    still hashes to a real uuid, so every unidentifiable benchmark would collide on
-    ONE id rather than merely being orphaned.
-
-    component leads the string, matching the spyre-inference vLLM writer. The two
-    producers carry DIFFERENT discriminator key sets (this one has config_name /
-    input_shapes / kernel_name / is_total; vLLM has tensor_parallel / input_len /
-    output_len), which is fine precisely because component leads: no id from one
-    producer can ever equal one from the other, so each set only has to be internally
-    consistent. If a single component were ever written by both, they would have to
-    agree on the keys as well."""
-    if not _v2_norm(name):
-        return ""
-    tag_part = ",".join(sorted({_v2_norm(t) for t in (tags or []) if _v2_norm(t)}))
-    disc = disc or {}
-    disc_part = ",".join(f"{k}={_v2_norm(disc.get(k))}" for k in _V2_BENCH_ID_KEYS)
-    return str(
-        uuid.uuid5(V2_NAMESPACE, f"{component}|{_v2_norm(name)}|{tag_part}|{disc_part}")
-    )
-
-
 def v2_benchmark_tables_present(client, db: str) -> bool:
     return _table_exists(client, "benchmarks", db) and _table_exists(
         client, "benchmark_runs", db
     )
-
-
-def v2_benchmarks_already_ingested(client, db: str, run_id: str) -> bool:
-    """benchmark_runs is a plain MergeTree with no dedup key, so a re-ingest
-    doubles every measurement behind an average."""
-    rows = client.query(
-        f"SELECT count() FROM {v2_schema.BENCHMARK_RUNS.qualified(db)} "
-        "WHERE run_id = {run_id:UUID}",
-        parameters={"run_id": run_id},
-    ).result_rows
-    return bool(rows and rows[0][0] > 0)
 
 
 # perf_kernels.metric is the real backend axis: cpu_kernel_ms on 16,734 prod rows,
@@ -586,65 +554,41 @@ def _v2_bench_backend(rec: dict) -> str:
     return "torch-spyre"
 
 
-def insert_benchmarks_v2(client, db: str, run_id: str, records: list) -> int:
-    """Write benchmarks (identity) + benchmark_runs (measurements) for one run.
+def _v2_bench_entries(records: list) -> list:
+    """This producer's perf records in the shared writer's entry shape.
 
-    Dropped from v2 deliberately: regression_status and ratio (verdicts with no
-    recorded baseline -- derived in v_benchmark_regression / v_benchmark_backend_compare
-    instead), and every run-context column (reached through run_id).
+    Measurements become single-element ARRAYS: benchmark_runs stores a metric's samples, and
+    this harness reports one pre-averaged value per metric, so `iterations` carries the n
+    behind it.
+
+    Dropped from v2 deliberately: regression_status and ratio (verdicts with no recorded
+    baseline -- derived in v_benchmark_regression / v_benchmark_backend_compare instead), and
+    every run-context column (reached through run_id).
     """
-    if not records:
-        return 0
-    ident_rows, fact_rows = {}, []
-    skipped = 0
+    entries = []
     for rec in records:
-        name = rec.get("operation_name") or ""
-        tags = sorted({t for t in (rec.get("tags") or []) if t})
-        bid = v2_benchmark_id(V2_BENCH_COMPONENT, name, tags, rec)
-        if not bid:
-            skipped += 1
-            continue
-        props = {
-            k: str(rec[k])
-            for k in _V2_BENCH_PROP_KEYS
-            if rec.get(k) is not None and str(rec[k]) != ""
-        }
-        measurements = {
-            k: float(rec[k]) for k in _V2_BENCH_METRIC_KEYS if rec.get(k) is not None
-        }
-        if not measurements:
-            # chk_measurements refuses an empty map: a benchmark row that measured
-            # nothing is a parse failure, not a result.
-            skipped += 1
-            continue
-        ident_rows[bid] = {
-            "benchmark_id": bid,
-            "component": V2_BENCH_COMPONENT,
-            "name": name,
-            "tags": tags,
-            "props": props,
-        }
         num_runs = rec.get("num_runs")
-        fact_rows.append(
+        entries.append(
             {
-                "run_id": run_id,
-                "benchmark_id": bid,
-                "component": V2_BENCH_COMPONENT,
+                "name": rec.get("operation_name") or "",
+                "tags": sorted({t for t in (rec.get("tags") or []) if t}),
                 "backend": _v2_bench_backend(rec),
-                "measurements": measurements,
+                "props": {
+                    k: str(rec[k])
+                    for k in _V2_BENCH_PROP_KEYS
+                    if rec.get(k) is not None and str(rec[k]) != ""
+                },
+                "measurements": {
+                    k: [float(rec[k])]
+                    for k in _V2_BENCH_METRIC_KEYS
+                    if rec.get(k) is not None
+                },
                 "iterations": int(num_runs) if num_runs is not None else 0,
-                "props": {},
+                "disc": rec,
+                "disc_keys": _V2_BENCH_ID_KEYS,
             }
         )
-    v2_schema.insert_identities(client, v2_schema.BENCHMARKS, ident_rows, db=db)
-    v2_schema.insert(client, v2_schema.BENCHMARK_RUNS, fact_rows, db=db)
-    if skipped:
-        print(
-            f"  [warn] v2: {skipped} benchmark(s) skipped -- no derivable "
-            f"benchmark_id or no measurements",
-            file=sys.stderr,
-        )
-    return len(fact_rows)
+    return entries
 
 
 # ---------------------------------------------------------------------------
@@ -1441,10 +1385,18 @@ def main():
                         f"(source={_src!r} external_run_id={_ext!r})",
                         file=sys.stderr,
                     )
-                elif v2_benchmarks_already_ingested(client, v2db, _v2_run_id):
+                elif v2_benchmarks_already_ingested(
+                    client, v2db, _v2_run_id, V2_BENCH_COMPONENT
+                ):
                     print(f"  v2: already ingested run_id={_v2_run_id} — skipping")
                 else:
-                    _n = insert_benchmarks_v2(client, v2db, _v2_run_id, kernels)
+                    _n = insert_benchmarks_v2(
+                        client,
+                        v2db,
+                        V2_BENCH_COMPONENT,
+                        _v2_run_id,
+                        _v2_bench_entries(kernels),
+                    )
                     print(f"  v2: {_n} benchmark_runs under run_id={_v2_run_id}")
 
             total_kernels += len(kernels)
@@ -1506,10 +1458,18 @@ def main():
                         f"(source={_src!r} external_run_id={_ext!r})",
                         file=sys.stderr,
                     )
-                elif v2_benchmarks_already_ingested(client, v2db, _v2_run_id):
+                elif v2_benchmarks_already_ingested(
+                    client, v2db, _v2_run_id, V2_BENCH_COMPONENT
+                ):
                     print(f"  v2: already ingested run_id={_v2_run_id} — skipping")
                 else:
-                    _n = insert_benchmarks_v2(client, v2db, _v2_run_id, benchmarks)
+                    _n = insert_benchmarks_v2(
+                        client,
+                        v2db,
+                        V2_BENCH_COMPONENT,
+                        _v2_run_id,
+                        _v2_bench_entries(benchmarks),
+                    )
                     print(f"  v2: {_n} benchmark_runs under run_id={_v2_run_id}")
 
             total_benchmarks += len(benchmarks)
