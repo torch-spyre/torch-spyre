@@ -45,6 +45,11 @@ from torch_spyre._inductor.cost_model import (
 
 ELEMS, DTYPE = 1024, 2
 BYTES = ELEMS * DTYPE
+# These fixtures isolate BYTE accounting and the read/write turnaround, and their
+# expected values come from device runs taken at full occupancy. Build them there:
+# the bandwidth-vs-cores derate is zero at 32 cores (g(32) = 1), so a narrower
+# fixture would fold a second, unrelated effect into every saving asserted here.
+FULL_CORES = 32
 
 
 def _reader(name, out, *, input_name="arg0_1", resident=(), resident_expr=None):
@@ -58,7 +63,7 @@ def _reader(name, out, *, input_name="arg0_1", resident=(), resident_expr=None):
         name=name,
         is_reduction=False,
         out_elems=ELEMS,
-        cores=1,
+        cores=FULL_CORES,
         dtype_bytes=DTYPE,
         args=[
             ArgTraffic(
@@ -85,7 +90,7 @@ def _writer(out, *, is_boundary, resident=False):
         name="producer",
         is_reduction=False,
         out_elems=ELEMS,
-        cores=1,
+        cores=FULL_CORES,
         dtype_bytes=DTYPE,
         args=[
             ArgTraffic(
@@ -250,7 +255,7 @@ def test_a_resident_intermediate_is_still_free():
         name="reader",
         is_reduction=False,
         out_elems=ELEMS,
-        cores=1,
+        cores=FULL_CORES,
         dtype_bytes=DTYPE,
         args=[
             ArgTraffic("buf2", "output", False, ELEMS, is_boundary=False),

@@ -1577,6 +1577,187 @@ def reduction_read_bw(rows, p):
     )
 
 
+class BwCoresPenalty(sympy.Function):
+    """Extra nanoseconds one argument's HBM traffic costs because the op's core
+    division drives only part of the bus: ``k * (1/g(cores) - 1)``, charged while
+    that argument is NOT resident.
+
+    ``BwCoresPenalty(k, is_lx, anchors, cores)``:
+
+    - ``k`` is the argument's HBM bytes divided by ``bw_peak_gbps`` -- a CONSTANT,
+      which is what keeps this cheap to solve (see below).
+    - ``is_lx`` is THAT argument's own residency, not the op's output's: an HBM
+      input still loads when the output is resident, and an LX input does not load
+      when it is not. ``_bw_cores_penalty_ns`` emits one node per charged argument,
+      mirroring :func:`_fused_hbm_bytes`' accounting term for term.
+    - ``anchors`` is ``bw_cores_anchors(p)``, the g curve flattened into a
+      ``sympy.Tuple``. The node therefore carries every parameter it needs, so no
+      consumer -- the CP-SAT printer, ``lambdify``, ``evalf`` -- has to know which
+      ``CostParams`` built the objective. ``lambdify`` passes a numeric ``Tuple``
+      through untouched, which is what the annealer's scorer relies on.
+    - ``cores`` is the op's core count: an integer once the division is committed,
+      or the product of the solver's split symbols while it is not. The SAME
+      expression prices both, so a plan costs what it cost to choose.
+
+    Deliberately NOT written as ``bytes * derate``: a symbolic byte count times a
+    table lookup is BILINEAR, and the printer lowers such a product with
+    ``AddMultiplicationEquality`` over interval-multiplied bounds. With bytes in
+    the millions that produces variables with ~1e10 domains, once per argument --
+    the same wide-``_product_``-domain shape that already makes CP-SAT's presolve
+    misbehave on these models. A constant ``k`` keeps the table in nanoseconds
+    (tens of thousands) and needs no multiplication at all.
+
+    An ADDITIVE penalty over the unchanged ``(R+W)/BW_PEAK`` term, so with every op
+    at full occupancy (g=1) the prediction is byte-identical to before.
+    """
+
+    @classmethod
+    def eval(cls, k, is_lx, anchors, cores):
+        if k.is_Number and is_lx.is_Number and cores.is_Number:
+            return sympy.Float(
+                cls.penalty_ns(float(k), int(cores), tuple(anchors))
+                * (1 - float(is_lx))
+            )
+        return None
+
+    @staticmethod
+    def penalty_ns(k: float, cores, anchors) -> float:
+        """The extra ns itself: 0 at full occupancy, ``k * (1/g - 1)`` below it."""
+        g = bw_cores_g(cores, anchors)
+        if g >= 1.0:
+            return 0.0
+        return k * (1.0 / g - 1.0)
+
+    @staticmethod
+    def _imp_(k, is_lx, anchors, cores):
+        return BwCoresPenalty.penalty_ns(k, round(cores), tuple(anchors)) * (1 - is_lx)
+
+
+def bw_cores_anchors(p) -> sympy.Tuple:
+    """``CostParams.red_bw_cores_g`` flattened to ``(cores, g, cores, g, ...)``.
+
+    Carried inside every :class:`BwCoresPenalty` so the curve travels with the term
+    instead of being looked up again by whoever evaluates it -- the bug that let a
+    caller's ``CostParams`` change the base cost and not the penalty."""
+    g = p.red_bw_cores_g
+    return sympy.Tuple(*(v for c in sorted(g) for v in (c, g[c])))
+
+
+def bw_cores_g(cores, anchors) -> float:
+    """g(cores) = BW(cores)/BW(32) in [0, 1]: the fraction of full-bus bandwidth a
+    memory-bound kernel realizes with ``cores`` active cores.
+
+    The anchor table (``CostParams.red_bw_cores_g``, flattened by
+    :func:`bw_cores_anchors`) was measured on the clean plain reductions; the SHAPE
+    it encodes -- sub-linear and saturating, one core driving ~11% of the bus rather
+    than 1/32 -- is a property of the memory system and is applied to every
+    memory-bound bundle here, not only to reductions. That extrapolation is the part
+    to re-measure: it disagrees with the per-core store rate of #4668 above 4 cores,
+    and neither curve has been measured on the other's shape. ``g(32) = 1.0``
+    exactly, so every prediction on the cores=32 gold path is unchanged.
+    """
+    if cores is None:
+        return 1.0
+    flat = tuple(anchors)
+    g = {int(flat[i]): float(flat[i + 1]) for i in range(0, len(flat), 2)}
+    cores = int(cores)
+    if cores >= 32:
+        return 1.0
+    ks = sorted(g)
+    if cores <= ks[0]:
+        return g[ks[0]]
+    lc = log2(cores)
+    for a, b in zip(ks, ks[1:]):
+        if a <= cores <= b:
+            t = (lc - log2(a)) / (log2(b) - log2(a))
+            return g[a] + t * (g[b] - g[a])
+    return 1.0
+
+
+def _bw_cores_weights(ops: list) -> list:
+    """``(constant bytes, residency gate, op)`` for every argument whose HBM traffic
+    a narrow core division would slow down.
+
+    This is :func:`_fused_hbm_bytes`' accounting, split into a CONSTANT byte count
+    and the gate that switches it on, because the penalty has to stay linear. It
+    therefore keeps that function's two rules: a bundle's external graph input is
+    counted ONCE however many fused ops read it, and a graph OUTPUT's write is
+    charged even when resident, since the clone-out still performs it.
+
+    A gate of ``False``/0 means the bytes always cross; ``True``/1 means they never
+    do and the argument is dropped. An argument whose size or replication is
+    symbolic is skipped rather than approximated: a replicated matmul operand is
+    already priced per replica core by ``_replicated_operand_reads``.
+    """
+    out: list = []
+    ext_in: dict = {}  # external input name -> its one entry, deduplicated
+    for o in ops:
+        # A matmul is not what this term is about. Its cores already divide the
+        # COMPUTE time, its HBM stream is overlapped with that compute
+        # (``max(mem_t, compute)``), and its replicated operand loads are priced
+        # per core by ``_replicated_operand_reads``. Charging it again here would
+        # double-count the one effect its model already has. #4668 skips matmuls
+        # for the same reason.
+        if getattr(o, "is_matmul", False):
+            continue
+        for a in o.args:
+            # An indexed row store's write is priced by its own writing-core model
+            # (#4668). Its reads are still ordinary bus traffic and stay here.
+            if a.role == "output" and getattr(o, "is_indirect_store", False):
+                continue
+            if not isinstance(a.elems, int) or not isinstance(a.loop_factor, int):
+                continue
+            rep = a.replication
+            if not isinstance(rep, int):
+                continue
+            unit = a.elems * a.loop_factor * o.dtype_bytes
+            if a.role == "output" and a.is_graph_boundary:
+                # ``hbm_elems`` = elems*lf*(is_lx + rep*(1-is_lx)): one write that
+                # happens either way, plus the replicas that residency removes.
+                entries = [(unit, False, o)]
+                if rep > 1:
+                    entries.append((unit * (rep - 1), a.is_lx, o))
+            else:
+                entries = [(unit * rep, a.is_lx, o)]
+            if a.role == "input" and a.is_graph_boundary:
+                # One load serves the bundle; keep the largest claim, as
+                # ``_fused_hbm_bytes`` does with ``_max_traffic``.
+                prev = ext_in.get(a.name)
+                if prev is None or entries[0][0] > prev[0]:
+                    ext_in[a.name] = entries[0]
+                continue
+            out.extend(entries)
+    out.extend(ext_in.values())
+    return out
+
+
+def _bw_cores_penalty_ns(ops: list, p: "CostParams"):
+    """The bundle's whole bandwidth-vs-cores penalty: one term per charged argument.
+
+    Returns a float once every division and residency is decided, and a sympy
+    expression while the solver still holds them open -- the same arithmetic either
+    way, so the cost that chooses a plan is the cost that reports it.
+    """
+    if not config.cost_model_bw_cores_derate:
+        return 0.0
+    anchors = bw_cores_anchors(p)
+    total = 0.0
+    for weight, gate, o in _bw_cores_weights(ops):
+        if weight <= 0:
+            continue
+        cores = o.cores
+        if isinstance(gate, bool):
+            if gate:
+                continue  # decided resident: these bytes never cross the bus
+            gate = 0
+        k = weight / p.bw_peak_gbps
+        if not _is_sym(cores) and not _is_sym(gate):
+            total = total + BwCoresPenalty.penalty_ns(k, cores, anchors) * (1 - gate)
+        else:
+            total = total + BwCoresPenalty(k, gate, anchors, cores)
+    return total
+
+
 def _reduction_bw_cores_factor(cores, p):
     """g(cores)=BW(cores)/BW(32): the fraction of full-bus reduction bandwidth realized
     with `cores` active cores. Piecewise-linear in log2(cores) over the measured anchor
@@ -1935,12 +2116,28 @@ def predict_ops(ops: list, params: CostParams | None = None) -> float:
     # Measured on x*2 + x*3 (cores=32): with the clone the fused kernel is exactly one
     # read plus one write at 150 GB/s (113 us at x = 8 MiB, 222 us at 16 MiB).
     clone_ns = _clone_in_bytes(ops) / p.bw_peak_gbps
+    # BANDWIDTH vs CORES. The memory term charges HBM bytes at a bus-wide rate and
+    # never divides by the core count, so a memory-bound op's core division does not
+    # appear in the prediction at all and the co-optimizing solver has no reason to
+    # use more than one core (issue #4655). One additive term per charged argument,
+    # each a per-division constant in ns; zero at full occupancy, so nothing on the
+    # cores=32 path changes, and priced identically whether the division is still
+    # open or already committed.
+    #
+    # OUTSIDE the overlap and the derates, with `rel_ns` and `clone_ns`. Matmuls are
+    # excluded (their cores already divide compute), so for every op this charges
+    # compute is 0 and the overlap is the identity -- placing it here costs nothing
+    # in accuracy. It also keeps a solver variable out of `_lazy_min(compute, mem_t)`
+    # and out of `mem/eff`: bounding or multiplying it there is the wide-domain
+    # `_product_` shape the constant weight exists to avoid.
+    bw_cores_ns = _bw_cores_penalty_ns(ops, p)
     t = (
         compute
         + mem_t
         - p.overlap_gamma * _lazy_min(compute, mem_t)
         + rel_ns
         + clone_ns
+        + bw_cores_ns
     )
     # (A genuine-reduction cross-core ring-combine term once lived here; it is provably
     # bounded by ~cores * a tiny per-elem cost <= ~5 ns -- below run-to-run noise --

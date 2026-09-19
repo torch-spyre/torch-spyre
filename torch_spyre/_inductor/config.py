@@ -204,6 +204,16 @@ cost_model: str = os.environ.get("SPYRE_DUMP_COST", "")
 # under them. Read by the summarize-sdsc skill. Empty = off.
 dump_cost_expr_file: str = os.environ.get("SPYRE_DUMP_COST_EXPR_FILE", "")
 
+# Scale a bundle's HBM time by the measured fraction of full-bus bandwidth a
+# core division realizes (CostParams.red_bw_cores_g: one core drives ~11% of
+# the bus, not 1/32). Without it the cost model charges total bytes at the
+# shared peak, so a memory-bound op's core division does not appear in the
+# objective at all and the co-optimizing solver splits it arbitrarily.
+# Zero penalty at cores=32, so predictions at full occupancy are unchanged.
+cost_model_bw_cores_derate: bool = os.environ.get(
+    "SPYRE_COST_MODEL_BW_CORES_DERATE", "1"
+).lower() in ("1", "true", "yes")
+
 # Disable compiler-generated span-overflow coarse-tiling hints.  The global
 # SPYRE_INDUCTOR_IGNORE_HINTS flag also disables these so one switch can still
 # suppress all WSR/coarse-tiling hint paths.

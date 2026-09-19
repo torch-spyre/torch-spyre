@@ -35,6 +35,7 @@ from unittest.mock import patch
 
 import sympy
 
+from torch_spyre._inductor import config
 from torch_spyre._inductor.cost_model import (
     ArgTraffic,
     OpFeatures,
@@ -142,21 +143,41 @@ class DiscriminationTest(TestCase):
         # And the separation is large, not a rounding artifact.
         self.assertGreater(max(s[2] for s in separating), 2.0)
 
-    def test_only_matmul_and_reduction_buffers_separate(self):
-        # cost_model reads ``cores`` only under ``is_matmul`` or ``is_reduction``,
-        # so a pointwise op's cost is division-invariant by construction.
-        # Asserting the split matches that expectation keeps the fixture honest
-        # about *why* it separates.
-        for gname, bname, b in _entries():
-            feats = [op_from_dict(f) for f in b["features"] if f is not None]
-            if not feats:
-                continue
-            costs = {round(predict_ops([f]), 6) for f in feats}
-            if len(costs) > 1:
-                self.assertTrue(
-                    any(f.is_matmul or f.is_reduction for f in feats),
-                    f"{gname}/{bname} separates but is pointwise",
-                )
+    def test_only_matmul_and_reduction_buffers_separate_without_the_bw_derate(self):
+        # WITHOUT the bandwidth-vs-cores derate, cost_model reads ``cores`` only
+        # under ``is_matmul`` or ``is_reduction``, so a pointwise op's cost is
+        # division-invariant by construction. Asserting the split matches that
+        # expectation keeps the fixture honest about *why* it separates.
+        with config.patch({"cost_model_bw_cores_derate": False}):
+            for gname, bname, b in _entries():
+                feats = [op_from_dict(f) for f in b["features"] if f is not None]
+                if not feats:
+                    continue
+                costs = {round(predict_ops([f]), 6) for f in feats}
+                if len(costs) > 1:
+                    self.assertTrue(
+                        any(f.is_matmul or f.is_reduction for f in feats),
+                        f"{gname}/{bname} separates but is pointwise",
+                    )
+
+    def test_the_bw_derate_makes_pointwise_buffers_separate_too(self):
+        """The counterpart, and the defect issue #4655 is about: a memory-bound
+        pointwise op's core division was invisible to the objective, so the
+        co-optimizing solver had no reason to prefer a parallel split. With the
+        derate on, at least one pointwise buffer's cost depends on its division."""
+        pointwise_separating = []
+        with config.patch({"cost_model_bw_cores_derate": True}):
+            for gname, bname, b in _entries():
+                feats = [op_from_dict(f) for f in b["features"] if f is not None]
+                if not feats or any(f.is_matmul or f.is_reduction for f in feats):
+                    continue
+                costs = {round(predict_ops([f]), 6) for f in feats}
+                if len(costs) > 1:
+                    pointwise_separating.append(f"{gname}/{bname}")
+        self.assertTrue(
+            pointwise_separating,
+            "no pointwise buffer's cost depends on its division; the derate is inert",
+        )
 
 
 class SymbolicTiledFeatureTest(TestCase):
