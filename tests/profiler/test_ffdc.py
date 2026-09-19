@@ -960,6 +960,7 @@ class TestFfdcAsyncCompile:
             "torch_spyre.execution.kernel_runner",
             SpyreSDSCKernelRunner=_Runner,
             SpyreUnimplementedRunner=object,
+            SpyreFrontendOnlyRunner=object,
         )
 
         mod = _reimport(monkeypatch, "torch_spyre.execution.async_compile")
