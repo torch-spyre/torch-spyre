@@ -6026,6 +6026,117 @@ class TestPlanReadCopies(unittest.TestCase):
         self.assertEqual(entries_by_name["only_b_buf"].consumer_op_names, ("op_b",))
 
 
+def _committed_layout(host_size, dtype=torch.float32):
+    """A ``FixedTiledLayout`` over ``host_size`` -- what every buffer carries by
+    the time the scratchpad's coarse-tiling pass runs."""
+    from torch._inductor.ir import FlexibleLayout
+
+    from torch_spyre._C import ElementArrangement, SpyreTensorLayout
+    from torch_spyre._inductor.ir import FixedTiledLayout
+
+    strides = [int(x) for x in FlexibleLayout.contiguous_strides(host_size)]
+    return FixedTiledLayout(
+        torch.device("cpu"),
+        dtype,
+        [Integer(x) for x in host_size],
+        [Integer(x) for x in strides],
+        SpyreTensorLayout(
+            host_size,
+            strides,
+            dtype,
+            list(range(len(host_size))),
+            ElementArrangement.STANDARD,
+        ),
+    )
+
+
+class TestPostStickifyReadCopySizing(unittest.TestCase):
+    """Pass 1 runs on the post-stickify route for a caller that can place the
+    copy, and drops the reads it cannot size instead of refusing the tiling.
+
+    ``_insert_one_read_copy``'s committed-layout branch pairs the source's
+    non-unit dims with the reader's iteration extents positionally, so it needs
+    the two to be the same length and raises otherwise
+    (``TODO(span-overflow-read-copy)``). That raise is right for the
+    span-overflow caller, whose tiling is forced; for a caller that *chose* to
+    tile, staging the read is an optimization and skipping it leaves the op
+    reading the full buffer, exactly as it does with Pass 1 off.
+    """
+
+    def setUp(self):
+        gm = fx.symbolic_trace(lambda: None)
+        self._graph_ctx = V.set_graph_handler(GraphLowering(gm))
+        self._graph_ctx.__enter__()
+
+    def tearDown(self):
+        self._graph_ctx.__exit__(None, None, None)
+
+    def _fixture(self, layout=None):
+        """The shared-read fixture with the source's committed layout swapped
+        in. Rank stays 2 throughout: the readers load through the source's own
+        indexer, which asserts on a rank it was not built against, so a
+        rank-changing swap would fail there rather than at the predicate under
+        test. Unit dims give the same mismatch at equal rank, and are one of
+        the three shapes the sizing walk names."""
+        op_a, op_b, full_buf, operations = _make_two_op_shared_read_fixture()
+        if layout is not None:
+            full_buf.layout = layout
+        return op_a, op_b, full_buf, operations
+
+    def _only_dep(self, op):
+        from torch_spyre._inductor.wsr.coarse_tile import _full_buffer_read_deps
+
+        deps = list(_full_buffer_read_deps(op))
+        self.assertEqual(len(deps), 1)
+        return deps[0]
+
+    def test_an_uncommitted_layout_is_always_sizable(self):
+        # The pre-stickify caller, whose source carries a plain FixedLayout:
+        # the branch that needs the ranks to agree is not the one it takes.
+        from torch_spyre._inductor.wsr.coarse_tile import _read_copy_can_be_sized
+
+        op_a, _, _, _ = self._fixture()
+        self.assertTrue(_read_copy_can_be_sized(self._only_dep(op_a)))
+
+    def test_a_committed_layout_of_matching_rank_is_sizable(self):
+        from torch_spyre._inductor.wsr.coarse_tile import _read_copy_can_be_sized
+
+        op_a, _, _, _ = self._fixture(_committed_layout([64, 128]))
+        dep = self._only_dep(op_a)
+        self.assertEqual(len(dep.size), 2)
+        self.assertTrue(_read_copy_can_be_sized(dep))
+
+    def test_a_committed_layout_of_fewer_non_unit_dims_than_extents_is_not(self):
+        # A read whose loop carries more variables than the buffer has real
+        # dimensions -- the broadcast-operand shape, and the same count a
+        # matmul operand fails on. Unit dims do not count: they are squeezed
+        # out of the dep and reinserted by the sizing walk.
+        from torch_spyre._inductor.wsr.coarse_tile import _read_copy_can_be_sized
+
+        op_a, _, _, _ = self._fixture(_committed_layout([1, 128]))
+        self.assertFalse(_read_copy_can_be_sized(self._only_dep(op_a)))
+
+    def test_the_planner_drops_an_unsizable_read_rather_than_raising(self):
+        from torch_spyre._inductor.wsr.coarse_tile import _plan_read_copies
+
+        op_a, op_b, _, operations = self._fixture(_committed_layout([1, 128]))
+        plans = _plan_read_copies(operations, [((0,), [op_a, op_b], {})])
+        self.assertEqual(
+            [entry for plan in plans.values() for entry in plan.entries], []
+        )
+
+    def test_the_planner_keeps_a_sizable_read(self):
+        # Non-vacuity for the test above: the same fixture, same call, one
+        # entry -- so an empty plan there is the predicate and not the fixture.
+        from torch_spyre._inductor.wsr.coarse_tile import _plan_read_copies
+
+        op_a, op_b, _, operations = self._fixture(_committed_layout([64, 128]))
+        plans = _plan_read_copies(operations, [((0,), [op_a, op_b], {})])
+        self.assertEqual(
+            len([entry for plan in plans.values() for entry in plan.entries]), 1
+        )
+
+
 class TestReadCopyPlanDataclasses(unittest.TestCase):
     """ReadCopyEntry/ReadCopyPlan are plain frozen dataclasses (Task 1)."""
 

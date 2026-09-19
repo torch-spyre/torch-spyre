@@ -206,8 +206,11 @@ class CoarseTilingPass(ScratchpadOptimizationPass):
     hands it real choices.
     """
 
-    def __init__(self, choices: Mapping[str, TileSpec]):
+    def __init__(
+        self, choices: Mapping[str, TileSpec], read_copies: bool = False
+    ) -> None:
         self._choices = dict(choices)
+        self._read_copies = read_copies
 
     def _stamped_groups(self, graph: GraphLowering) -> list[tuple]:
         """Derive the groups and stamp each member's ``dim_hints``.
@@ -268,10 +271,18 @@ class CoarseTilingPass(ScratchpadOptimizationPass):
             return
         # This pass runs inside scratchpad/LX planning -- after stickification
         # (insert_restickify) and the post-stickify span-overflow WSR pass -- so
-        # every op already carries a committed FixedTiledLayout. Use the
-        # post-stickify entry point (run_read_copies=False): a read copy-in here
-        # would only be a useless HBM-to-HBM copy, exactly as the sibling
-        # post-stickify consumer (_maybe_coarse_tile_span_overflow) does.
+        # every op already carries a committed FixedTiledLayout, and the
+        # post-stickify entry point is the right one.
+        #
+        # Read copies run here where the span-overflow caller leaves them off.
+        # Its reason -- nothing minted this late can be in LX, so the copy is
+        # HBM-to-HBM -- does not hold for a caller whose whole job is to decide
+        # what is in LX: the copy is tile-sized with fresh contiguous strides,
+        # which is the cheapest thing a tiled op could hold resident, against an
+        # operand the loop otherwise re-reads from HBM every iteration.
         coarse_tile_post_stickify(
-            graph, groups=groups, group_idx_offset=group_idx_offset
+            graph,
+            groups=groups,
+            group_idx_offset=group_idx_offset,
+            run_read_copies=self._read_copies,
         )

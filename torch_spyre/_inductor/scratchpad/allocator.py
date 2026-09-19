@@ -2516,6 +2516,13 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         # from this module, so a top-level import would be circular.
         from torch_spyre._inductor.scratchpad.coarse_tiling import CoarseTilingPass
 
+        # Read copies stay off until something can place the copy. Measured:
+        # the copy this route builds is minted in ``_post_solve``, after the
+        # addresses are final, so it lands in HBM -- and a staged HBM tile
+        # replaces a source read with a write plus a read of the same size.
+        # It pays only once the copy itself can be LX-resident, which is what
+        # makes ``CoarseTilingPass``'s switch a parameter rather than a
+        # constant.
         tiling_pass = CoarseTilingPass(choices)
         tiling_pass.plan_only(graph)
         tiling_pass.apply_pass(graph)
