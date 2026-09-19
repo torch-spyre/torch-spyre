@@ -273,8 +273,7 @@ The relevant code lives under `torch_spyre/_inductor/scratchpad/`:
 | `ilp_solver_ortools.py` | `CpSatLayoutSolver` (OR-Tools CP-SAT) |
 | `simulated_annealing.py` | `SimulatedAnnealingLayoutSolver` |
 | `cooling_schedules.py` | cooling schedules for the annealing search |
-| `permutation_layout.py` | `PermutationBasedLayoutSolver` |
-| `contact_profile.py` | `Profile`, buffer-contact profiling |
+| `../../csrc/perm_layout_native.cpp` | `NativePermutationLayoutSolver`, the C++ permutation packer |
 | `graph_editor.py` | `GraphEditor`, the clone/rewrite helper used by input- and output-boundary cloning |
 | `allocator.py` | `ScratchpadAllocator`, `CoOptimizingAllocator`, and the single LX-eligibility predicate (`_residency_reasons`, one reason per buffer) |
 | `utils.py` | liveness, mem usage, op-name/eligibility helpers |

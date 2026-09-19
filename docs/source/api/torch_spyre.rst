@@ -723,12 +723,6 @@ Environment Variables
      - Print the predicted-runtime report after pre-scheduling: one total
        plus a per-kernel breakdown (default ``0``).
        See :doc:`/compiler/cost_model`
-   * - ``TORCH_SPYRE_NATIVE_PACKER``
-     - Use the C++ permutation-layout packer accelerator in the
-       simulated-annealing layout solver (default ``1``; set ``0`` to force
-       the pure-Python packer). No effect unless
-       ``LAYOUT_SOLVER=simulated_annealing``.
-       See :doc:`/compiler/simulated_annealing_layout`
    * - ``MAX_BUCKETS``
      - Maximum number of work division buckets (default ``32``)
    * - ``MIN_DEFAULT_GRANULARITY``

@@ -12,13 +12,12 @@ which contains the following files.
 
 - **`plan_solver.py`** — the shared `LifetimeBoundBuffer`
   data type, the `MemoryPlanSolver` ABC, and a simple `GreedyLayoutSolver`.
-- **`permutation_layout.py`** — the core. A *permutation* is an allocation order;
-  `PermutationBasedLayoutSolver` places each buffer on top of the earlier-placed buffers it overlaps
-  in time (with in-place reuse), and maintains all addresses **incrementally** under
-  `swap`/`rotate`. `ReferencePermutationBasedLayoutSolver` is a slow, obviously-correct O(n²)
-  rebuild used as a test oracle, not used in production code.
-- **`contact_profile.py`** — `Profile`, the contact-profile data structure the incremental solver is
-  built on.
+- **`../../csrc/perm_layout_native.cpp`** — the core, and the only packer that ships. A
+  *permutation* is an allocation order; `NativePermutationLayoutSolver` places each buffer on top of
+  the earlier-placed buffers it overlaps in time (with in-place reuse) and re-places under
+  `swap`/`rotate`/`resize`/`set_eligible`. Its from-scratch counterpart,
+  `ReferencePermutationBasedLayoutSolver`, lives in `tests/inductor/reference_perm_layout.py` and is
+  a test oracle only.
 - **`cooling_schedules.py`** — the `CoolingSchedule` family: `ExponentialCoolingSchedule` and the
   default, auto-calibrated `SelfCalibratingReheatingSchedule`.
 - **`simulated_annealing.py`** — `SimulatedAnnealingLayoutSolver`, a simulated-annealing search over allocation
@@ -31,27 +30,19 @@ a first-fit vs simulated-annealing quality comparison, and an in-place convergen
 study — live in
 [`docs/source/user_guide/examples/scratchpad/`](../user_guide/examples/index.md).
 
-**Native packer.** The permutation packer the search drives has two
-interchangeable implementations: the canonical Python
-`PermutationBasedLayoutSolver` and a C++ accelerator
-(`csrc/perm_layout_native.cpp`) that is the default. They are behaviourally
-identical — the differential and SA-equivalence tests assert bit-for-bit
-agreement on addresses, quality, allocation count, and per-operation deltas —
-and the C++ one is substantially faster: measured at roughly 14× end-to-end on
-mid-sized problems at representative capacity, though the margin depends on
-capacity pressure and narrows as the problem grows. See
-[Native packer performance](native_packer_performance.md) for the measurements
-and the harness that produced them. Select the Python packer explicitly with
-`config.native_layout_packer = False` or `TORCH_SPYRE_NATIVE_PACKER=0`. Because
-the `_C` extension is required for torch-spyre to function at all, a missing
-native packer means a stale or incomplete build and raises rather than silently
-falling back to Python.
+**Native packer.** The packer is C++ only. A Python implementation was the original one and
+served as the canonical spec until the C++ port took over as the default; it was measured at
+roughly 14× slower end-to-end on mid-sized problems at representative capacity (see
+[Native packer performance](native_packer_performance.md)) and has since been removed. Because the
+`_C` extension is required for torch-spyre to function at all, a missing native packer means a
+stale or incomplete build and raises rather than falling back.
 
-**Validation philosophy:** every incremental operation is checked against the
-from-scratch reference oracle — randomized *differential* tests, a gated *stress* suite
+**Validation philosophy:** every operation is checked against the from-scratch reference oracle in
+`tests/inductor/reference_perm_layout.py` — randomized *differential* tests, a gated *stress* suite
 (`TORCH_SPYRE_STRESS_SCRATCHPAD=1`, tens of thousands of seeds), and in places *exhaustive*
 enumeration of all small configurations. This is what makes the subtle in-place edge cases
-trustworthy.
+trustworthy. The oracle is deliberately the naive placer: it is slow, but its correctness is
+meant to be evident from reading it.
 
 **Key invariants that recur:** lifetimes are half-open; per column, address order equals permutation
 order (weakly — ties only for in-place reuse); at most two buffers share one address at one tick
@@ -59,45 +50,50 @@ order (weakly — ties only for in-place reuse); at most two buffers share one a
 
 ## How it works
 
-### The incremental placement engine
+### The placement engine
 
-`PermutationBasedLayoutSolver` is the placement engine. Given an allocation order (a permutation of
+`NativePermutationLayoutSolver` is the placement engine. Given an allocation order (a permutation of
 buffer indices), it places each buffer at `align_up(max top of the earlier-placed buffers it overlaps
-in time)`, with an in-place child allowed to reuse a parent's slot. `quality()` — the total size of
-buffers that fit under capacity — is maintained in O(1).
+in time)`, with an in-place child allowed to reuse a parent's slot. A buffer that would cross the
+capacity line is *evicted* — its address is `None`, and eviction is upward-closed, so anything that
+would rest on it is evicted too. `quality()` — the use-weighted total size of buffers that fit under
+capacity — is maintained as a running sum and read in O(1).
 
-Addresses are maintained **incrementally** rather than rebuilt. Who-is-below-whom is represented by
-*contact profiles*: a `Profile` is a step function over a buffer's lifetime giving its directly
-below/above neighbour per column. A `swap` of two adjacent permutation entries transposes them only
-over their shared column range via O(segments) splices, then propagates address changes along
-*order-above* edges (candidates bounded by a precomputed time-overlap set). An **in-place-status
-transition rule** handles the "poke-through" case: a transparent in-place child sits low while its
-taller parent pokes up to carry the buffer above it, so a change to the parent must reach that
-buffer.
+Placement is a pure function of (permutation, sizes, eligibility, lifetimes), so every mutating
+operation simply re-places every buffer in permutation order. What makes that affordable is the
+static data computed once in the constructor and shared by reference with every `copy()`: the
+per-buffer time-overlap sets (so a buffer's candidates are a filter over its overlaps rather than a
+scan of all earlier buffers), the sparse in-place-partner sets (so placement never probes an
+unrelated candidate for an in-place relationship), and the lifetime-interval decomposition.
 
-`_recompute_address` reads a buffer's placement candidates straight off its contact profile rather
-than scanning the whole overlap set. This relies on `contact_at` — the derived "what does this buffer
-rest on" view — being symmetric: it reports the `(parent, child)` in-place pair in *both* reuse
-directions, surfacing the buried co-located buffer that the in-place legality test needs. The
-candidate set built from a buffer's below-profile breakpoints is provably sufficient for the
-placement decision (backed by a sufficiency proof and exhaustive small-case checks).
+Two things ride on that interval decomposition. A buffer with no in-place partner reads its floor
+straight off a per-interval running maximum instead of gathering candidates at all. And the placement
+loop carries a **saturation early-stop**: an interval is *done* once it already holds an evicted
+buffer or every buffer alive on it has been placed, and once all intervals are done every remaining
+buffer must rest (transitively) on an evicted one, so the tail is bulk-evicted. The early-stop is
+result-identical to running the loop out; it only changes the work.
 
-For speed, each buffer's (static, sparse) in-place-partner set is precomputed, so placement never
-probes every candidate for an in-place relationship, and `_top` is inlined over a flat sizes array.
+The mutators short-circuit where the re-place provably cannot change anything: a `swap` of two
+buffers that do not overlap in time, or where either is ineligible (routed to HBM and so outside the
+stacking order), moves no address and returns a zero delta after updating the order alone. `rotate`
+does the same for an ineligible buffer.
 
-`ReferencePermutationBasedLayoutSolver` is the obviously-correct O(n²) counterpart, sharing
-`PermutationBasedLayoutSolverBase`: it rebuilds every address from scratch on each operation. It
-ships only as the differential-test oracle and a readable reference spec of the placement semantics.
+None of this changes the asymptotics: both the packer and the naive placer are quadratic in the
+worst case, and the shortcuts buy constants — which is the whole of the win, and enough of it that
+porting the genuinely sub-quadratic algorithm the original Python packer used was judged not worth
+the roughly 2.5× more C++ it would take (see
+[Native packer performance](native_packer_performance.md)).
+
+`ReferencePermutationBasedLayoutSolver` in `tests/inductor/reference_perm_layout.py` is the
+obviously-correct counterpart: it scans all earlier-placed overlapping buffers for each placement and
+takes none of the shortcuts above. It ships nowhere; it is the differential-test oracle and a
+readable reference spec of the placement semantics.
 
 ### `rotate`
 
-`rotate(i, j)` moves one permutation entry to another position, choosing between two strategies by
-distance (correctness is independent of the choice). For short moves it is a chain of adjacent
-`swap`s, most of which are O(1) no-ops. Once `|i − j|` reaches the threshold `max(2, n // 8)` it uses
-a remove/reinsert fast path: edit the permutation once, recompute addresses reusing the static
-overlap set (never the O(n²) reference scan), and patch the contact profiles for the single move —
-making the cost independent of `|i − j|`, which matters for the long dense rotations. The threshold
-is an instance attribute callers can override (set it to 1 to force the fast path on every rotate).
+`rotate(i, j)` takes one permutation entry out and reinserts it at another position. The permutation
+and its inverse are edited in one pass and the layout is re-placed, so the cost is independent of
+`|i − j|` — which is what the annealing search's long reinsertion moves need.
 
 ### The annealing search
 

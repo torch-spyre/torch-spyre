@@ -34,7 +34,7 @@
 # it cheaply considers (n-1) neighbours every iteration.
 #
 # In order to adjust this algorithm to our setting, we hold a
-# PermutationBasedLayoutSolver from plan_solver as a member. It lets us use a
+# NativePermutationLayoutSolver as a member. It lets us use a
 # permutation of buffers as a source of a layout plan, and modify the permutation
 # and see the modification in the layout plan by repeated swapping. Each
 # reinsertion sweep runs on a throwaway plan.copy(), so the live plan only performs
@@ -63,9 +63,7 @@ from torch_spyre._inductor.scratchpad.plan_solver import (
     MemoryPlanSolver,
 )
 from torch_spyre._inductor.scratchpad.greedy_solver import GreedyLayoutSolver
-from torch_spyre._inductor.scratchpad.permutation_layout import (
-    make_permutation_packer,
-)
+from torch_spyre._C import NativePermutationLayoutSolver
 
 
 class SolverToPermutation:
@@ -104,7 +102,7 @@ SolverScheduleOption: TypeAlias = CoolingSchedule | Literal["auto"]
 
 
 class SimulatedAnnealingLayoutSolver(MemoryPlanSolver):
-    """Drives simulated annealing over a :class:`PermutationBasedLayoutSolver`.
+    """Drives simulated annealing over a :class:`NativePermutationLayoutSolver`.
 
     The layout is held as a *member* (``self.plan``), not a base class. This lets
     each reinsertion sweep run on a throwaway ``plan.copy()`` while the live plan
@@ -162,7 +160,9 @@ class SimulatedAnnealingLayoutSolver(MemoryPlanSolver):
             convertor = SolverToPermutation(initial)
             self.initial = convertor.permutation(self.buffers)
 
-        self.plan = make_permutation_packer(self.buffers, self.initial, size, alignment)
+        self.plan = NativePermutationLayoutSolver(
+            self.buffers, self.initial, size, alignment
+        )
         self.quality_logs: list[list[float]] = []
         self.temperature_logs: list[list[float]] = []
         self.best_quality = self.plan.quality()
@@ -221,7 +221,7 @@ class SimulatedAnnealingLayoutSolver(MemoryPlanSolver):
         # Commit the best permutation seen, so finalize() writes it rather than
         # whatever state annealing happened to end in.
         if self.plan.permutation != self.best_permutation:
-            self.plan = make_permutation_packer(
+            self.plan = NativePermutationLayoutSolver(
                 self.buffers, list(self.best_permutation), self.size, self.alignment
             )
 
