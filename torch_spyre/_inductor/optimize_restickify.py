@@ -59,9 +59,11 @@ class EdgeCostMap:
         target_layouts: list,
         target_dep: "MemoryDep",
         op,
+        require_exact_layout: bool = False,
     ):
         self.dep = dep
         self._op = op
+        self._require_exact_layout = require_exact_layout
         self._in_layouts = in_layouts
         self._target_layouts = target_layouts
         self._target_dep = target_dep
@@ -95,7 +97,13 @@ class EdgeCostMap:
           SpyreTensorLayout  — feasible restickify target layout
         """
         needed, tgt = compute_restickify_needed(
-            in_stl, self._dep_layout, self.dep, target_stl, self._target_dep, self._op
+            in_stl,
+            self._dep_layout,
+            self.dep,
+            target_stl,
+            self._target_dep,
+            self._op,
+            require_exact_layout=self._require_exact_layout,
         )
         if not needed:
             cost = 0.0
@@ -279,10 +287,17 @@ class FixedInOutNode(RestickNodeCost):
         self.required_in_stls = required_in_stls
 
     @classmethod
-    def from_args(cls, args, out_stl, req_stls, op):
+    def from_args(cls, args, out_stl, req_stls, op, require_exact_layout: bool = False):
         assert req_stls, "FixedInOutNode.from_args: req_stls is empty"
         edge_costs = [
-            EdgeCostMap(arg.dep, arg.layouts, [req], arg.dep, op)
+            EdgeCostMap(
+                arg.dep,
+                arg.layouts,
+                [req],
+                arg.dep,
+                op,
+                require_exact_layout=require_exact_layout,
+            )
             for arg, req in zip(args, req_stls)
         ]
         return cls(edge_costs, required_out_stl=out_stl, required_in_stls=req_stls)

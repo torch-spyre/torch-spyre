@@ -851,6 +851,12 @@ def indirect_info_from_op(
     if op is None:
         return set(), {}, None
 
+    # An ExternKernel consumer (e.g. InvokeSubgraph, whose operands carry layout
+    # edges) has no ``.data`` and no inner_fn to walk, so it can hold no indirect
+    # reads. Treat it like op=None rather than AttributeError-ing on op.data.
+    if not isinstance(op, ComputedBuffer):
+        return set(), {}, None
+
     from torch._inductor.ir import Scatter
 
     # For scatter ops, extract info from the write side instead of reads.
@@ -2276,7 +2282,8 @@ def compute_restickify_needed(
     in_dep: MemoryDep,
     out_stl: SpyreTensorLayout,
     out_dep: MemoryDep,
-    op: "ComputedBuffer | None" = None,
+    op: "Operation | None" = None,
+    require_exact_layout: bool = False,
 ) -> "tuple[bool, SpyreTensorLayout | None]":
     """Determine whether a restickify is needed for one (in_stl, out_stl) pair.
 
@@ -2286,6 +2293,24 @@ def compute_restickify_needed(
     op: when provided, index-role deps (gather indices) are never stick-constrained
     and always return (False, None).
 
+    require_exact_layout: demand ``in_stl == out_stl`` rather than mere stick
+    compatibility. Stick compatibility asks only which VARIABLE sits on the stick,
+    so it accepts two layouts that agree there but distribute the remaining
+    coordinates over different device axes -- e.g. device_size [1, 32, 512, 64]
+    vs [512, 32, 1, 64], both with the same stride_map contents and the same
+    stick, differing only in which axis holds the extent-1 placeholder. That is
+    the right question for an ordinary op, whose generated addressing follows the
+    layout it was compiled against. It is the WRONG question wherever one
+    consumer is compiled against a single layout but fed buffers laid out by
+    several independent producers: codegen derives device strides from
+    ``device_size`` POSITIONALLY (``_calculate_device_stride`` in
+    codegen/superdsc.py multiplies the trailing slice, and ``dim_order`` is
+    aligned against ``device_size[-2::-1]``), so axis placement changes the
+    addresses generated, and stride_map agreement does not make the two
+    interchangeable. An ``invoke_subgraph`` body is exactly that consumer: it is
+    codegened once from the first call site and then invoked with every other
+    site's operands. Pass True there.
+
     Returns:
       (False, None)   — stick-compatible: no restickify needed
       (True, stl)     — restickify needed, stl is the target STL for the restickified input
@@ -2294,6 +2319,14 @@ def compute_restickify_needed(
     ind_names, _, ind_sizes = indirect_info_from_op(op)
     if in_dep.name in ind_names:
         return False, None
+    if require_exact_layout and in_stl != out_stl:
+        # Skip the stick-compatibility short-circuit below and go straight to
+        # target selection: out_stl is the layout the consumer was compiled
+        # against, so it is by construction the restickify target.
+        if in_stl.device_dtype != DataFormats.SEN169_FP16:
+            # ReStickifyOpHBM lowers only the native FP16 device format.
+            return True, None
+        return True, out_stl
     idc = try_device_coordinates(in_stl, in_dep, ind_sizes)
     out_idc = try_device_coordinates(out_stl, out_dep, ind_sizes)
     if idc is None or out_idc is None:
@@ -2404,6 +2437,24 @@ def copy_fx_custom_meta(src: "torch.fx.Node", dst: "torch.fx.Node") -> None:
     """
     if "custom" in src.meta:
         dst.meta["custom"] = src.meta["custom"]
+
+
+def origin_in_graph(origins, g: "torch.fx.Graph") -> "torch.fx.Node | None":
+    """Pick the origin fx.Node that belongs to graph ``g``.
+
+    A buffer lowered inside an ``invoke_subgraph`` HOP (e.g. a
+    ``nested_compile_region`` block reused across layers) inherits origins that
+    span BOTH the parent graph (the ``invoke_subgraph`` call / ``get_attr``
+    nodes) AND the subgraph's own compute nodes. ``IRNode.current_origins``
+    unions as ``old | origins`` into an insertion-ordered ``OrderedSet``, so the
+    PARENT nodes come first and a bare ``next(iter(origins))`` returns a foreign
+    parent-graph node. Filter to the graph being lowered. Returns ``None`` if no
+    origin lives in ``g``.
+    """
+    return next(
+        (n for n in origins if isinstance(n, torch.fx.Node) and n.graph is g),
+        None,
+    )
 
 
 def _repoint_mutation_targets(
