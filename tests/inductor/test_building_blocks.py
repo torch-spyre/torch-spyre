@@ -304,36 +304,16 @@ class TestBuildingBlocks(unittest.TestCase):
 
     def test_mixed_ea_staggered_broadcaster_fp32(self):
         # Case 3.2 with an fp32-physical staggered broadcaster (DL16_TO_FP32).
-        # The mixed-EA gate ALLOWS it (physically the equivalent all-STANDARD fp32
-        # broadcast), but the codegen doesn't yet emit an fp32 broadcast along
-        # the stick axis. The same crash hits a pure-STANDARD fp32
-        # [4,1]+[4,64] broadcast, so it is a separate, pre-existing codegen gap
-        # tracked in https://github.com/torch-spyre/torch-spyre/issues/4132.
-        #
-        # We assert the failure originates in *codegen*, not the mixed-EA layout
-        # gate: a plain @unittest.expectedFailure would also stay green if a future
-        # change re-tightened the gate and raised `Unsupported` before codegen,
-        # masking a regression of the path this test guards. So we require the
-        # error to be a codegen failure and NOT the gate's "mixed EA"
-        # Unsupported. Flip this to a compare_with_cpu once codegen lands.
+        # The mixed-EA gate allows it, being physically the equivalent
+        # all-STANDARD fp32 broadcast, and the backend now emits an fp32
+        # broadcast along the stick axis.
         x = torch.randn(4, 1, dtype=torch.float16)  # -> .to(f32): staggered bcast
         w = torch.randn(4, 64, dtype=torch.float32)  # STANDARD full
 
         def fn(x, w):
             return torch.add(x.to(torch.float32), w)
 
-        with self.assertRaises(Exception) as ctx:
-            compare_with_cpu(fn, x, w, cpu_compile=False, run_eager=False)
-        msg = str(ctx.exception)
-        self.assertNotIn(
-            "Multi-arg pointwise with mixed EA",
-            msg,
-            f"expected a codegen failure, but the mixed-EA gate rejected it: {msg}",
-        )
-        self.assertTrue(
-            any(k in msg for k in ("ddc", "sbf-")),
-            f"expected a ddc/sbf codegen-stage failure, got: {msg[:300]}",
-        )
+        compare_with_cpu(fn, x, w, cpu_compile=False, run_eager=False)
 
     def test_flash_attention(self):
         B, H, L, D = 1, 8, 256, 64
