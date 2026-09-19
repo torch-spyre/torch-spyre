@@ -76,11 +76,10 @@ disable_conv2d_spatial_split: bool = (
 # stable per-buffer identity. Inert by default: the SDSC/flex path is unchanged.
 ktir_emitter: bool = os.environ.get("TORCH_SPYRE_KTIR", "0") == "1"
 
-# Settings for device execution over the KTIR path. What is required is checked
-# upfront by ``_check_ktir_device_prerequisites`` in ``execution/async_compile``,
-# which names anything missing.
-
-# A .mlir declaring the target device, passed to the backend compiler.
+# A .mlir declaring the target device for the KTIR path, passed to the backend
+# compiler as ``--device``. An override, not a prerequisite: left unset the flag
+# is omitted and dbo-opt falls back to its own default, so
+# ``_check_ktir_device_prerequisites`` does not name this field.
 ktir_device_mlir: str = os.environ.get("KTIR_DEVICE_MLIR", "")
 
 # Enable certified LX ownership changes: movement, exact fused-axis views,

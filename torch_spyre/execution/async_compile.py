@@ -65,11 +65,11 @@ def _check_ktir_device_prerequisites() -> None:
 
     Names everything missing at once, so a first run does not turn one
     misconfiguration into a sequence of unrelated-looking failures.
+
+    ``ktir_device_mlir`` is deliberately not a prerequisite: dbo-opt defaults
+    ``--device`` on its own, so leaving it unset is a valid configuration.
     """
     missing = []
-
-    if not _spyre_config.ktir_device_mlir:
-        missing.append("set KTIR_DEVICE_MLIR to a .mlir declaring the target device")
 
     if shutil.which("dbo-opt") is None:
         missing.append("put dbo-opt on PATH")
@@ -472,10 +472,14 @@ class SpyreAsyncCompile(AsyncCompile):
         # idempotent read of config plus one PATH lookup.
         _check_ktir_device_prerequisites()
 
-        cmd = [
-            "dbo-opt",
-            "--from-ktir",
-            f"--device={_spyre_config.ktir_device_mlir}",
+        # --device is omitted rather than defaulted here: unset, dbo-opt takes
+        # sys-arch-spec/KTDFArchGraphDevice/spyre_dd2_basic.mlir from under
+        # DEEPTOOLS_PATH, so passing a path would only duplicate that knowledge
+        # in a second place for it to drift from.
+        cmd = ["dbo-opt", "--from-ktir"]
+        if _spyre_config.ktir_device_mlir:
+            cmd.append(f"--device={_spyre_config.ktir_device_mlir}")
+        cmd += [
             f"--export-dir={output_dir}",
             "--kEmitSpyreCode",
             ktir_path,
