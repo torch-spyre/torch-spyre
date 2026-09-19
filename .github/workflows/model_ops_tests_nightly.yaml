@@ -98,6 +98,8 @@ jobs:
             config: granite-3.3-8b-instruct.yaml
           - name: Granite 4.1 8B
             config: granite-4.1-8b.yaml
+          - name: Granite Embedding 278M Multilingual
+            config: granite-embedding-278m-multilingual.yaml
           - name: Meta Llama 3.1 8B Instruct
             config: Meta-Llama-3.1-8B-Instruct.yaml
           - name: Ministral 3 14B Instruct 2512

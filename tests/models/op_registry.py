@@ -426,6 +426,8 @@ OP_REGISTRY: Dict[str, OpAdapter] = {
         "_operator.setitem", _tensor_setitem_, is_inplace=True
     ),
     "torch.ops.aten.index": OpAdapter("torch.ops.aten.index", _aten_index),
+    "torch.gather": OpAdapter("torch.gather", torch.gather),
+    "torch.Tensor.gather": OpAdapter("torch.gather", torch.gather),
     # Scatter / copy / masking
     "torch.scatter": OpAdapter("torch.scatter", torch.scatter),
     "torch.scatter_": OpAdapter("torch.scatter_", _tensor_scatter_, is_inplace=True),
@@ -448,6 +450,7 @@ OP_REGISTRY: Dict[str, OpAdapter] = {
     "torch.ne": OpAdapter("torch.ne", _torch_ne),
     "torch.gt": OpAdapter("torch.gt", _torch_gt),
     "torch.logical_and": OpAdapter("torch.logical_and", torch.logical_and),
+    "torch.bitwise_and": OpAdapter("torch.bitwise_and", torch.bitwise_and),
     "torch.bitwise_or": OpAdapter("torch.bitwise_or", torch.bitwise_or),
     "torch.or_": OpAdapter("torch.or_", _tensor_or_, is_inplace=True),
     # Type/device conversions
