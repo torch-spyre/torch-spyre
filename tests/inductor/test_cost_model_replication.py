@@ -109,6 +109,29 @@ def test_replication_defaults_to_one_on_legacy_records():
     assert back.args[0].replication == 4
 
 
+def test_shared_load_keeps_consumer_degree_without_reloading_each_copy():
+    from torch_spyre._inductor.cost_model import _shared_operand_read_excess
+    from torch_spyre._inductor.work_division import _matmul_multicast_penalty
+
+    degree, resident = sympy.symbols("degree resident", integer=True)
+    arg = _arg(degree, resident=resident, boundary=True)
+    arg.broadcast = True
+    op, params = _op(arg), CostParams()
+    assert arg.replication == degree
+    assert arg.hbm_elems() == ELEMS * (1 - resident)
+    assert arg.replicated_hbm_elems() == 0
+    excess = _shared_operand_read_excess([op, op], params)
+    for count in (1, 8, 12, 16, 32):
+        expected = BYTES * (_matmul_multicast_penalty(count) - 1) / params.bw_peak_gbps
+        assert float(excess.subs({degree: count, resident: 0})) == pytest.approx(
+            expected
+        )
+        assert excess.subs({degree: count, resident: 1}) == 0
+    arg.broadcast = False
+    assert _shared_operand_read_excess([op], params) == 0
+    assert arg.hbm_elems() == ELEMS * degree * (1 - resident)
+
+
 # ------------------------------------------------------------------ the rule
 
 
@@ -221,12 +244,11 @@ def test_per_core_pricing_is_symbolic_and_matches_the_numeric_path():
         cores=32,
     )
     _bytes, ns = _replicated_operand_reads([sym], p)
-    assert (
-        sympy.simplify(
-            ns - BYTES * (1 - is_lx) / (s_m * p.mm_replicated_read_gbps_per_core)
-        )
-        == 0
+    expected = sympy.Piecewise(
+        (0, sympy.Eq(s_n, 1)),
+        (BYTES * (1 - is_lx) / (s_m * p.mm_replicated_read_gbps_per_core), True),
     )
+    assert sympy.simplify(ns - expected) == 0
     expr = predict_ops([sym], p)
     at_point = sympy.lambdify([s_m, s_n, is_lx], expr, modules="math")
     assert at_point(4, 8, 0) == pytest.approx(predict_ops([num], p), rel=1e-9)
@@ -237,6 +259,19 @@ def test_per_core_pricing_is_symbolic_and_matches_the_numeric_path():
         cores=32,
     )
     assert at_point(4, 8, 1) == pytest.approx(predict_ops([resident], p), rel=1e-9)
+
+    # The same symbolic menu also contains unreplicated choices. Neither those
+    # choices nor an already-substituted SymPy Integer may pay the replica rate.
+    for factor in (1, sympy.Integer(1), 2):
+        for resident in (False, True):
+            concrete = _matmul(
+                _arg(1, resident=False),
+                ArgTraffic("buf0", "input", resident, ELEMS, replication=factor),
+                cores=4 * factor,
+            )
+            assert at_point(4, factor, int(resident)) == pytest.approx(
+                float(predict_ops([concrete], p)), rel=1e-9
+            )
 
 
 # -------------------------------------------------------- extractor, on device
