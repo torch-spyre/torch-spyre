@@ -5,7 +5,7 @@ name: push-model-ops-logs-to-clickhouse
 on:
   workflow_run:
     workflows:
-      - model-ops-tests-nightly
+      - model-ops-tests
     types: [completed]
   workflow_dispatch:
     inputs:
@@ -166,7 +166,7 @@ jobs:
 
           # Every completed run has at least one job with a log, so zero
           # downloads means the download mechanism itself broke -- not that the
-          # nightly produced nothing. Fail loudly here; otherwise the
+          # run produced nothing. Fail loudly here; otherwise the
           # empty-data guard downstream skips the ingest and the job still
           # reports success, which is how this outage stayed green for days.
           if jobs and downloaded == 0:

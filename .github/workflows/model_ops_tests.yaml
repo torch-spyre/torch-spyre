@@ -29,6 +29,7 @@ defaults:
 permissions:
   contents: read
   checks: write
+  actions: read    # needed by push-model-ops-logs-to-clickhouse to fetch job logs
 
 jobs:
   # Build the torch_spyre._C extension ONCE and publish it as a wheel; every
@@ -186,3 +187,16 @@ jobs:
           path: ${{ env.REPORT_PATH }}
           if-no-files-found: warn   # warn (not fail) if pytest itself crashed
           retention-days: 10
+      # ---------------------------------------------------------------------------
+      # Write a brief summary to the job UI page.
+      # ---------------------------------------------------------------------------
+      - name: Annotate job with suite metadata
+        if: always()
+        run: |
+          {
+            echo "### Model-ops suite: ${{ matrix.suite.name }}"
+            echo "| Key | Value |"
+            echo "|---|---|"
+            echo "| Config | \`${{ matrix.suite.config }}\` |"
+            echo "| Report | \`${{ env.REPORT_NAME }}\` |"
+          } | tee -a "$GITHUB_STEP_SUMMARY"

@@ -16,7 +16,7 @@ Table lifecycle (every run):
   3. INSERT all suite rows  (ReplacingMergeTree deduplicates on suite_id)
   4. INSERT all variant rows (ReplacingMergeTree deduplicates on variant_id)
 
-All historical nightly runs are retained so the dashboard can show
+All historical runs are retained so the dashboard can show
 regression trends across builds.  Re-ingesting the same GHA run is safe
 because suite_id / variant_id are deterministic SHA-256 digests of the
 run + identifier fields — ClickHouse's ReplacingMergeTree will collapse
@@ -227,7 +227,7 @@ def ensure_tables(client) -> None:
     """
     Create both tables if they do not yet exist (idempotent).
     Existing tables — and their historical data — are left untouched so
-    the dashboard can show regression trends across nightly builds.
+    the dashboard can show regression trends across builds.
     Also runs idempotent ALTER TABLE migrations to add new columns.
     """
     print("[info] Ensuring tables exist (CREATE TABLE IF NOT EXISTS) ...")
