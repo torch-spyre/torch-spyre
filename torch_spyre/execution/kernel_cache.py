@@ -198,7 +198,19 @@ def _get_dxp_version() -> str:
 @lru_cache(maxsize=1)
 def _get_torch_spyre_version() -> str:
     """Return the torch_spyre package version string."""
-    from torch_spyre.version import __version__
+    try:
+        from torch_spyre._version import __version__
+    except ImportError as exc:
+        # _version.py is generated at build time by setuptools_scm. A missing
+        # module means the wheel was built without it, so the version is
+        # unknown -- and an unknown version must not silently become part of
+        # the cache key, or entries from different builds collide. Fail like
+        # _get_dxp_version() does above rather than substituting a placeholder.
+        raise RuntimeError(
+            "torch_spyre._version is missing; cannot determine the torch_spyre "
+            "version for the cache key. The wheel was built without "
+            "setuptools_scm. Set SPYRE_KERNEL_CACHE=0 to run without caching."
+        ) from exc
 
     return __version__
 
