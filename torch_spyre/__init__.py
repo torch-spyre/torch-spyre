@@ -388,6 +388,10 @@ def _autoload_impl():
     # to have enough cache space for all eager ops
     # You'll get recursion errors if this is exceeded
     torch._dynamo.config.cache_size_limit = 1024
+    # A second, independent cap that dynamo checks before the per-op limit
+    # above, so at its default of 256 it caps the cache whatever
+    # cache_size_limit says.
+    torch._dynamo.config.accumulated_cache_size_limit = 1024
 
     _orig_isAllocatorInitialized = torch._C._accelerator_isAllocatorInitialized
 
