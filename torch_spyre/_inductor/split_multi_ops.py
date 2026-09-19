@@ -23,6 +23,7 @@ from torch._inductor.ir import (
     MutationLayoutSHOULDREMOVE,
     Pointwise,
     Reduction,
+    TensorBox,
 )
 from torch._inductor.dependencies import MemoryDep
 from torch._inductor.graph import GraphLowering
@@ -456,9 +457,12 @@ def _find_fx_node(name, gl):
         KeyError: If no FX node is found for the given name
     """
     for n, tb in gl.env.items():
-        if isinstance(n, fx.Node) and tb is not None:
-            if tb.get_name() == name:
-                return n
+        if (
+            isinstance(n, fx.Node)
+            and isinstance(tb, TensorBox)
+            and tb.get_name() == name
+        ):
+            return n
     for n in gl.graph.nodes:
         if n.op == "placeholder" and n.name == name:
             return n
