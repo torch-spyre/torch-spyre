@@ -177,6 +177,14 @@ class RestickNodeCost(abc.ABC):
                 return ec
         return None
 
+    def select_input_stl(self, edge, in_stl, required_stl):
+        """Resolve an input requirement for its selected producer layout.
+
+        Most operations have one target. Operations accepting several targets
+        override this; costing and final conversion insertion use the same rule.
+        """
+        return required_stl
+
 
 class AllSameNode(RestickNodeCost):
     """Cost node for ops that require all inputs and outputs to share the same stick layout.
@@ -264,7 +272,11 @@ class AllSameNode(RestickNodeCost):
 
 
 class FixedInOutNode(RestickNodeCost):
-    """Cost node for ops whose input and output stick compatibility is fixed by the op (eg, matmul)."""
+    """Fixed output with operand requirements, optionally several legal targets.
+
+    The same conversion-cost rule resolves the targets during both beam search
+    and final insertion. The default remains one requirement per operand.
+    """
 
     def __init__(
         self,
@@ -279,13 +291,44 @@ class FixedInOutNode(RestickNodeCost):
         self.required_in_stls = required_in_stls
 
     @classmethod
-    def from_args(cls, args, out_stl, req_stls, op):
+    def from_args(cls, args, out_stl, req_stls, op, *, input_stl_choices=None):
         assert req_stls, "FixedInOutNode.from_args: req_stls is empty"
+        choices = (
+            [[req] for req in req_stls]
+            if input_stl_choices is None
+            else input_stl_choices
+        )
+        assert all(choices), "FixedInOutNode: empty operand constraint"
+        if input_stl_choices is not None:
+            assert len(args) == len(choices), (
+                "FixedInOutNode: incomplete operand choices"
+            )
+        assert all(
+            req in options for req, options in zip(req_stls, choices, strict=True)
+        )
         edge_costs = [
-            EdgeCostMap(arg.dep, arg.layouts, [req], arg.dep, op)
-            for arg, req in zip(args, req_stls)
+            EdgeCostMap(arg.dep, arg.layouts, options, arg.dep, op)
+            for arg, options in zip(args, choices)
         ]
         return cls(edge_costs, required_out_stl=out_stl, required_in_stls=req_stls)
+
+    def select_input_stl(self, edge, in_stl, required_stl):
+        """Minimize real conversion cost; retain the ordinary target on a tie.
+
+        This prices conversions, not matmul throughput or later core placement.
+        New physical arrangements do not get an unmeasured speed bonus.
+        """
+        if len(edge._target_layouts) == 1:
+            return required_stl
+        return min(
+            edge._target_layouts,
+            key=lambda stl: (
+                edge.cost(in_stl, stl),
+                stl != required_stl,
+                tuple(stl.device_size),
+                tuple(stl.stride_map),
+            ),
+        )
 
     def cost(
         self, in_layouts: "list[SpyreTensorLayout]", out_stl: "SpyreTensorLayout"
@@ -293,7 +336,7 @@ class FixedInOutNode(RestickNodeCost):
         if out_stl != self.required_out_stl:
             return INF
         return sum(
-            ec.cost(lk, rk)
+            ec.cost(lk, self.select_input_stl(ec, lk, rk))
             for ec, lk, rk in zip(self.edge_costs, in_layouts, self.required_in_stls)
         )
 
@@ -310,11 +353,17 @@ class FixedInOutNode(RestickNodeCost):
         ]
         if not matching:
             return INF
-        costs = [ec.cost(in_stl, req) for ec, req in matching]
+        costs = [
+            ec.cost(in_stl, self.select_input_stl(ec, in_stl, req))
+            for ec, req in matching
+        ]
         if any(c == INF for c in costs):
             return INF
         other_ok = all(
-            any(e.cost(other_c, req) < INF for other_c in e._in_layouts)
+            any(
+                e.cost(other_c, self.select_input_stl(e, other_c, req)) < INF
+                for other_c in e._in_layouts
+            )
             for e, req in zip(self.edge_costs, self.required_in_stls, strict=True)
             if e.dep.name != dep_name
         )
