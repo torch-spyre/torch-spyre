@@ -449,6 +449,7 @@ OP_REGISTRY: Dict[str, OpAdapter] = {
     "torch.gt": OpAdapter("torch.gt", _torch_gt),
     "torch.logical_and": OpAdapter("torch.logical_and", torch.logical_and),
     "torch.bitwise_or": OpAdapter("torch.bitwise_or", torch.bitwise_or),
+    "torch.bitwise_and": OpAdapter("torch.bitwise_and", torch.bitwise_and),
     "torch.or_": OpAdapter("torch.or_", _tensor_or_, is_inplace=True),
     # Type/device conversions
     "torch.float": OpAdapter("torch.float", _tensor_float),
@@ -600,6 +601,8 @@ OP_REGISTRY: Dict[str, OpAdapter] = {
         "torch.functional.meshgrid",
         torch.functional.meshgrid,
     ),
+    "torch.gather": OpAdapter("torch.gather", torch.gather),
+    "torch.Tensor.gather": OpAdapter("torch.Tensor.gather", torch.Tensor.gather),
     # In-place add_ listed separately
     "torch.add_": OpAdapter("torch.add_", _tensor_add_, is_inplace=True),
     "torch.and_": OpAdapter("torch.and_", _tensor_and_, is_inplace=True),

@@ -122,6 +122,10 @@ jobs:
             config: gemma-4-12B-it.yaml
           - name: Qwen 2.5
             config: Qwen2.5-7B-Instruct.yaml
+          - name: Roberta Base Squad2
+            config: roberta-base-squad2.yaml
+
+
 
     steps:
       # Sparse checkout into the GHA workspace so the local composite
