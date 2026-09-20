@@ -41,7 +41,7 @@ from unittest import mock
 import torch
 from torch._inductor.virtualized import V
 
-from tests.inductor.for_each_tile_fixtures import (
+from for_each_tile_fixtures import (
     capture_post_grad_while_loop,
     matmul_inputs,
     nested_split_m_then_k_fn,
@@ -591,7 +591,7 @@ class TestSpliceWhileLoops(unittest.TestCase):
         from torch._inductor import ir
         from torch._inductor.virtualized import V
 
-        from tests.inductor.for_each_tile_fixtures import (
+        from for_each_tile_fixtures import (
             attention_inputs,
             nested_online_softmax_fn,
         )
@@ -748,7 +748,7 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
         """
         from torch._inductor.graph import GraphLowering
 
-        from tests.inductor.for_each_tile_fixtures import capture_post_grad_while_loop
+        from for_each_tile_fixtures import capture_post_grad_while_loop
 
         _out, gm = capture_post_grad_while_loop(fn, args)
 
@@ -1070,7 +1070,7 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
             splice_while_loop,
         )
 
-        from tests.inductor.for_each_tile_fixtures import (
+        from for_each_tile_fixtures import (
             paged_gather_kv_fn,
             paged_gather_kv_inputs,
         )
@@ -1215,7 +1215,7 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
         )
 
         import torch
-        from tests.inductor.for_each_tile_fixtures import M, K, N
+        from for_each_tile_fixtures import M, K, N
 
         X, Y = torch.randn(M, K), torch.randn(K, N)
         graph = self._run_graph(split_k_fn, (X, Y))
@@ -1844,7 +1844,7 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
         from torch_spyre.constants import DEVICE_NAME
 
         import torch_spyre._inductor.passes as passes_mod
-        from tests.inductor.for_each_tile_fixtures import (
+        from for_each_tile_fixtures import (
             capture_post_grad_while_loop,
             nested_split_m_then_k_fn,
         )
@@ -1936,7 +1936,7 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
         import torch
         import torch_spyre  # noqa: F401
         from torch_spyre.constants import DEVICE_NAME
-        from tests.inductor.for_each_tile_fixtures import (
+        from for_each_tile_fixtures import (
             capture_post_grad_while_loop,
             triple_nested_stardep_outer_fn,
         )
@@ -1956,7 +1956,7 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
         import torch
         import torch_spyre  # noqa: F401
         from torch_spyre.constants import DEVICE_NAME
-        from tests.inductor.for_each_tile_fixtures import (
+        from for_each_tile_fixtures import (
             capture_post_grad_while_loop,
             triple_nested_stardep_middle_fn,
         )
@@ -1976,7 +1976,7 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
         import torch
         import torch_spyre  # noqa: F401
         from torch_spyre.constants import DEVICE_NAME
-        from tests.inductor.for_each_tile_fixtures import (
+        from for_each_tile_fixtures import (
             capture_post_grad_while_loop,
             triple_nested_stardep_inner_fn,
         )
@@ -2007,7 +2007,7 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
         import torch
         import torch_spyre  # noqa: F401
         from torch_spyre.constants import DEVICE_NAME
-        from tests.inductor.for_each_tile_fixtures import (
+        from for_each_tile_fixtures import (
             capture_post_grad_while_loop,
             triple_nested_stardep_multilevel_fn,
         )
@@ -2039,7 +2039,7 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
         import pytest
         from torch._inductor.exc import InductorError
         from torch_spyre.constants import DEVICE_NAME
-        from tests.inductor.for_each_tile_fixtures import (
+        from for_each_tile_fixtures import (
             capture_post_grad_while_loop,
             sibling_nested_fn,
             sibling_nested_reference,
@@ -2081,7 +2081,7 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
         import pytest
         from torch._inductor.exc import InductorError
         from torch_spyre.constants import DEVICE_NAME
-        from tests.inductor.for_each_tile_fixtures import (
+        from for_each_tile_fixtures import (
             capture_post_grad_while_loop,
             sibling_nested_stardep_fn,
             sibling_nested_stardep_reference,
@@ -2138,7 +2138,7 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
         from torch_spyre.constants import DEVICE_NAME
 
         import torch_spyre._inductor.passes as passes_mod
-        from tests.inductor.for_each_tile_fixtures import (
+        from for_each_tile_fixtures import (
             capture_post_grad_while_loop,
             nested_split_m_then_k_fn,
         )
@@ -2221,7 +2221,7 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
         from torch_spyre.constants import DEVICE_NAME
 
         import torch_spyre._inductor.passes as passes_mod
-        from tests.inductor.for_each_tile_fixtures import (
+        from for_each_tile_fixtures import (
             capture_post_grad_while_loop,
             nested_split_m_then_k_fn,
         )
@@ -2341,7 +2341,7 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
         import torch_spyre  # noqa: F401  registers the "spyre" device
         from torch_spyre.constants import DEVICE_NAME
 
-        from tests.inductor.for_each_tile_fixtures import (
+        from for_each_tile_fixtures import (
             nested_split_m_then_k_fn,
             nested_split_m_then_k_reference,
         )
@@ -2373,7 +2373,7 @@ class TestStampDirectLoopInfo(unittest.TestCase):
         """
         from torch._inductor.graph import GraphLowering
 
-        from tests.inductor.for_each_tile_fixtures import capture_post_grad_while_loop
+        from for_each_tile_fixtures import capture_post_grad_while_loop
 
         _out, gm = capture_post_grad_while_loop(fn, args)
 
@@ -2404,7 +2404,7 @@ class TestStampDirectLoopInfo(unittest.TestCase):
     def test_single_level_stamps_group_id_and_count(self):
         from torch._inductor import ir
 
-        from tests.inductor.for_each_tile_fixtures import matmul_inputs, split_k_fn
+        from for_each_tile_fixtures import matmul_inputs, split_k_fn
         from torch_spyre._inductor.wsr.for_each_tile_lowering import (
             _body_loop_var,
             _stamp_direct_loop_info,
@@ -2463,7 +2463,7 @@ class TestStampDirectLoopInfo(unittest.TestCase):
         """
         from torch._inductor import ir
 
-        from tests.inductor.for_each_tile_fixtures import split_m_elementwise_fn
+        from for_each_tile_fixtures import split_m_elementwise_fn
         from torch_spyre._inductor.wsr.for_each_tile_lowering import (
             _body_loop_var,
             _consume_tile_dim_markers,
@@ -2532,7 +2532,7 @@ class TestStampDirectLoopInfo(unittest.TestCase):
         from torch._inductor import ir
         from torch._inductor.dependencies import MemoryDep
 
-        from tests.inductor.for_each_tile_fixtures import split_m_elementwise_fn
+        from for_each_tile_fixtures import split_m_elementwise_fn
         from torch_spyre._inductor.wsr.for_each_tile_lowering import (
             _body_loop_var,
             _consume_tile_dim_markers,

@@ -51,13 +51,13 @@ from torch_spyre._inductor.scratchpad.permutation_layout import (
     make_permutation_packer,
 )
 
-from tests.inductor.cooptimization_capture_loader import load_captures
+from cooptimization_capture_loader import load_captures
 from torch_spyre._inductor.scratchpad.plan_solver import (
     BufferType,
     CoreDivision,
     CoreDivisionBuffer,
 )
-from tests.inductor.synthetic_cooptimization_graphs import synthetic_graphs
+from synthetic_cooptimization_graphs import synthetic_graphs
 
 
 def _seed_footprint(buffers):
@@ -850,9 +850,13 @@ class AllEligibleResidentTest(TestCase):
 # Snippet run in a subprocess to solve one graph (captured *or* synthetic, chosen
 # by CASE) and print its result; used by the cross-process determinism test below.
 _SOLVE_SNIPPET = """
-import copy, json, math
-from tests.inductor.cooptimization_capture_loader import load_captures
-from tests.inductor.synthetic_cooptimization_graphs import synthetic_graphs
+import copy, json, math, sys
+# Runs as `python -c` with cwd=<repo root>, so this file's own directory is not
+# on sys.path the way it is for the test module itself.  Add it explicitly so the
+# helpers import by the same bare name used at module level.
+sys.path.insert(0, {helper_dir!r})
+from cooptimization_capture_loader import load_captures
+from synthetic_cooptimization_graphs import synthetic_graphs
 from torch_spyre._inductor.scratchpad.sa_cooptimizer import SaCoOptimizingSolver
 case = {case!r}
 src = load_captures() if case in load_captures() else synthetic_graphs()
@@ -869,13 +873,19 @@ print("RESULT " + json.dumps({{
 """
 
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+# Where the helper modules live, for the subprocess snippet above.
+_HELPER_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
 def _solve_with_hashseed(hs, case="sdpa"):
     """Solve ``case`` in a subprocess with ``PYTHONHASHSEED=hs``."""
     env = dict(os.environ, PYTHONHASHSEED=str(hs), TORCH_DEVICE_BACKEND_AUTOLOAD="0")
     proc = subprocess.run(
-        [sys.executable, "-c", _SOLVE_SNIPPET.format(case=case)],
+        [
+            sys.executable,
+            "-c",
+            _SOLVE_SNIPPET.format(case=case, helper_dir=_HELPER_DIR),
+        ],
         capture_output=True,
         text=True,
         env=env,

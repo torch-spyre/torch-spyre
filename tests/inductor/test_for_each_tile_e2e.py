@@ -58,7 +58,7 @@ import torch
 import torch_spyre  # noqa: F401  registers the "spyre" device
 from torch_spyre.constants import DEVICE_NAME
 
-from tests.inductor.for_each_tile_fixtures import (
+from for_each_tile_fixtures import (
     batched_online_softmax_fn,
     STICK_COLS,
     STICK_ROWS,
