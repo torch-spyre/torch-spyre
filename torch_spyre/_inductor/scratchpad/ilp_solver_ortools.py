@@ -348,7 +348,7 @@ class _CoreDivisionBufferWithCpVars(_LifetimeBufferWithCpVars[CoreDivisionBuffer
             # free eff_size/cores/core_cost/split integers (domains up to a few
             # thousand) behind one-entry elements made CP-SAT's presolve scale
             # super-linearly in the copy count: 40 s at 160 copies, past the
-            # 120 s limit at 312, on the 304-op spyre_attn decode graph.
+            # solve budget at 312, on the 304-op spyre_attn decode graph.
             self.division = m.new_constant(0)
             self.eff_size = per_core[0]
             self.core_cost = core_cost[0]

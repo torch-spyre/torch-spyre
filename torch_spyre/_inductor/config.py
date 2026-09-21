@@ -109,7 +109,7 @@ lx_solver_relayout_groups_per_edge: int = int(
 # presolve passes scales super-linearly in the number of free copy residency
 # literals (measured on the spyre_attn decode
 # graph: 16 copies 5 s, 64 copies 13 s, 160 copies 40 s, 312 copies past the
-# 120 s limit) and no exposed parameter shortens it, while search on the raw
+# solve budget) and no exposed parameter shortens it, while search on the raw
 # model finds a feasible plan within seconds. 0 disables this count threshold.
 lx_solver_relayout_presolve_max_copies: int = int(
     os.getenv("SPYRE_LX_SOLVER_RELAYOUT_PRESOLVE_MAX_COPIES", "0")
@@ -276,8 +276,6 @@ layout_solver: Literal[
 # budget without an incumbent raises SolveError, and scratchpad_planning falls
 # back to greedy placement (correct, but co-optimization is lost for that
 # graph). Raise it if large graphs are falling back; 0 disables the limit.
-# The default matches the budget CpSatLayoutSolver hard-coded before this knob
-# existed, so exposing it does not change how long any solve is allowed to run.
 cpsat_time_limit_seconds: float = float(
     os.environ.get("CPSAT_TIME_LIMIT_SECONDS", "30")
 )
