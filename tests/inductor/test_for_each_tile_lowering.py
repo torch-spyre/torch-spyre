@@ -1919,28 +1919,19 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
 
     def test_triple_nested_stardep_outer_resolves_correctly(self):
         """Three-level nesting, STAR_DEP_KEPT at the outer level: marker
-        splicing/resolution (this plan's actual fix) completes correctly,
-        but the fixture still cannot compile to completion.
+        splicing/resolution completes correctly and the fixture compiles
+        cleanly to completion.
 
         Directly analogous to test_nested_for_each_tile_markers_resolve_
         correctly's finding for the (simpler, 2-level)
         nested_split_m_then_k_fn fixture: splice_while_loops fully splices
         both WhileLoop ops (0 remain) and both outer-level STAR_DEP_KEPT
-        markers survive correctly-tagged, but compilation later fails one
-        stage further in, during op_spec_validation's OS-5 symbol-
-        consistency check on a synthetic `identity` op inserted by
-        splice_while_loops's carry/tile-read redirect -- issue #4706, the
-        SAME gap documented on test_nested_for_each_tile_markers_resolve_
-        correctly and on test_nested_for_each_tile_value_correct, now
-        independently confirmed to also block depth=3 nesting (not just
-        depth=2). Per this plan's Task 2 ruling, this OS-5 gap is tracked
-        follow-on scope, not a blocker for the marker_resolution fix
-        itself. This test tolerates specifically that error (asserting
-        "OpSpecValidationError" is in the message -- narrower than a bare
-        except, so a regression to a *different* error, e.g. the original
-        pre-fix "indirect symbol" failure, still fails loudly) rather than
-        asserting full end-to-end numeric correctness, which is not
-        currently reachable for this fixture.
+        markers survive correctly-tagged. Issue #4706's OS-5 symbol-
+        consistency gap on a synthetic `identity` op inserted by
+        splice_while_loops's carry/tile-read redirect -- the same gap
+        documented on test_nested_for_each_tile_markers_resolve_correctly
+        and on test_nested_for_each_tile_value_correct -- is fixed for
+        depth=3 nesting too (not just depth=2).
         """
         import torch
         import torch_spyre  # noqa: F401
@@ -1949,30 +1940,18 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
             capture_post_grad_while_loop,
             triple_nested_stardep_outer_fn,
         )
-        from torch._inductor.exc import InductorError
 
         X = torch.randn(2, 256, 256, device=DEVICE_NAME, dtype=torch.float16)
         Y = torch.randn(2, 256, 64, device=DEVICE_NAME, dtype=torch.float16)
-        try:
-            capture_post_grad_while_loop(triple_nested_stardep_outer_fn, (X, Y))
-        except InductorError as exc:
-            self.assertIn(
-                "OpSpecValidationError",
-                str(exc),
-                "expected the known issue #4706 OS-5 symbol-consistency "
-                f"gap, got a different InductorError: {exc!r}",
-            )
+        capture_post_grad_while_loop(triple_nested_stardep_outer_fn, (X, Y))
 
     def test_triple_nested_stardep_middle_resolves_correctly(self):
         """Three-level nesting, STAR_DEP_KEPT at the middle level: marker
-        splicing/resolution completes correctly, but the fixture still
-        cannot compile to completion.
+        splicing/resolution completes correctly and the fixture compiles
+        cleanly to completion.
 
-        Same OS-5 follow-up gap as
-        test_triple_nested_stardep_outer_resolves_correctly -- see that
-        test's docstring for the full explanation. This test tolerates
-        specifically the OS-5 OpSpecValidationError rather than asserting
-        full end-to-end numeric correctness.
+        Same fix as test_triple_nested_stardep_outer_resolves_correctly --
+        see that test's docstring for the full explanation.
         """
         import torch
         import torch_spyre  # noqa: F401
@@ -1981,30 +1960,18 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
             capture_post_grad_while_loop,
             triple_nested_stardep_middle_fn,
         )
-        from torch._inductor.exc import InductorError
 
         X = torch.randn(2, 256, 256, device=DEVICE_NAME, dtype=torch.float16)
         Y = torch.randn(2, 256, 64, device=DEVICE_NAME, dtype=torch.float16)
-        try:
-            capture_post_grad_while_loop(triple_nested_stardep_middle_fn, (X, Y))
-        except InductorError as exc:
-            self.assertIn(
-                "OpSpecValidationError",
-                str(exc),
-                "expected the known issue #4706 OS-5 symbol-consistency "
-                f"gap, got a different InductorError: {exc!r}",
-            )
+        capture_post_grad_while_loop(triple_nested_stardep_middle_fn, (X, Y))
 
     def test_triple_nested_stardep_inner_resolves_correctly(self):
         """Three-level nesting, STAR_DEP_KEPT at the inner level: marker
-        splicing/resolution completes correctly, but the fixture still
-        cannot compile to completion.
+        splicing/resolution completes correctly and the fixture compiles
+        cleanly to completion.
 
-        Same OS-5 follow-up gap as
-        test_triple_nested_stardep_outer_resolves_correctly -- see that
-        test's docstring for the full explanation. This test tolerates
-        specifically the OS-5 OpSpecValidationError rather than asserting
-        full end-to-end numeric correctness.
+        Same fix as test_triple_nested_stardep_outer_resolves_correctly --
+        see that test's docstring for the full explanation.
         """
         import torch
         import torch_spyre  # noqa: F401
@@ -2013,32 +1980,20 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
             capture_post_grad_while_loop,
             triple_nested_stardep_inner_fn,
         )
-        from torch._inductor.exc import InductorError
 
         X = torch.randn(2, 256, 256, device=DEVICE_NAME, dtype=torch.float16)
         Y = torch.randn(2, 256, 64, device=DEVICE_NAME, dtype=torch.float16)
-        try:
-            capture_post_grad_while_loop(triple_nested_stardep_inner_fn, (X, Y))
-        except InductorError as exc:
-            self.assertIn(
-                "OpSpecValidationError",
-                str(exc),
-                "expected the known issue #4706 OS-5 symbol-consistency "
-                f"gap, got a different InductorError: {exc!r}",
-            )
+        capture_post_grad_while_loop(triple_nested_stardep_inner_fn, (X, Y))
 
     def test_triple_nested_stardep_multilevel_resolves_correctly(self):
         """Three-level nesting, STAR_DEP_KEPT at two levels at once: marker
-        splicing/resolution completes correctly, but the fixture still
-        cannot compile to completion.
+        splicing/resolution completes correctly and the fixture compiles
+        cleanly to completion.
 
-        Same OS-5 follow-up gap as
-        test_triple_nested_stardep_outer_resolves_correctly -- see that
-        test's docstring for the full explanation. This test tolerates
-        specifically the OS-5 OpSpecValidationError rather than asserting
-        full end-to-end numeric correctness.
+        Same fix as test_triple_nested_stardep_outer_resolves_correctly --
+        see that test's docstring for the full explanation.
 
-        NOTE: independent of the OS-5 gap, this fixture currently exercises
+        NOTE: independent of that, this fixture currently exercises
         the SAME two outer-level markers as
         test_triple_nested_stardep_outer_resolves_correctly, not independent
         two-marker interaction. Task 3 found that triple_nested_stardep_
@@ -2056,19 +2011,10 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
             capture_post_grad_while_loop,
             triple_nested_stardep_multilevel_fn,
         )
-        from torch._inductor.exc import InductorError
 
         X = torch.randn(2, 256, 256, device=DEVICE_NAME, dtype=torch.float16)
         Y = torch.randn(2, 256, 64, device=DEVICE_NAME, dtype=torch.float16)
-        try:
-            capture_post_grad_while_loop(triple_nested_stardep_multilevel_fn, (X, Y))
-        except InductorError as exc:
-            self.assertIn(
-                "OpSpecValidationError",
-                str(exc),
-                "expected the known issue #4706 OS-5 symbol-consistency "
-                f"gap, got a different InductorError: {exc!r}",
-            )
+        capture_post_grad_while_loop(triple_nested_stardep_multilevel_fn, (X, Y))
 
     def test_sibling_nested_resolves_correctly(self):
         """Two sibling (non-nested) for_each_tile loops sharing one outer
