@@ -5,7 +5,7 @@ Last updated: 2026-09-21
 ## Executive summary
 
 This branch rewrites Spyre SDPA's complete `B`/`Hkv`/`G`/`Lq`/`Lk` tile nest
-with `for_each_tile`. It is based on upstream main at `bfcaa316` and contains
+with `for_each_tile`. It is based on upstream main at `c34232b5` and contains
 no named-dimension hints.
 
 The nested-HOP correctness blockers found during the original experiment are
@@ -85,7 +85,7 @@ length changes the number of bursts, not whether one tile's live set fits LX.
 
 ## Correctness results
 
-On upstream main `bfcaa316`:
+On upstream main `c34232b5`:
 
 ```text
 tests/inductor/test_sdpa_tiling.py:             22 passed
