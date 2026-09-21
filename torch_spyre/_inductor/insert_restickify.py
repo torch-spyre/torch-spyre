@@ -342,37 +342,36 @@ def insert_restickify_on_node_inputs(
         # is inserted inside the same loop group, so it must inherit loop_info
         # to remain contiguous in build_loop_scheduler_nodes.
         #
-        # It must inherit a COPY, not the consumer's own object: when old_name
-        # is itself a tiled intra-loop-group product (a per-tile scratch from
-        # this or an enclosing loop group, identifiable by old_name's own
-        # buffer carrying loop_info), the restickify node is a per-iteration
-        # stage of old_name and TAKES OVER the consumer's per-read tile
-        # advance for that dependency (its own read of old_name strides
-        # through the source), its output is per-iteration scratch that never
-        # advances, and the consumer's read of the stage must stop advancing.
-        # Sharing one CoarseTileInfo (the old behavior) makes that transfer
-        # impossible - both ops kept the advance, so a coarse-tiled consumer
-        # of a cross-loop-group full buffer read the 1-tile stage with a
-        # striding index and ran off its end (issue #4008).
+        # It must inherit a COPY, not the consumer's own object. The transfer
+        # decision is per nesting level: old_name can be a tile-local stage in
+        # a prefix of the consumer's loop nest, yet a fixed full buffer for
+        # deeper levels. At shared levels the restickify takes over the
+        # consumer's per-read advance, its output is fixed scratch, and the
+        # consumer stops advancing. Sharing one CoarseTileInfo would apply the
+        # advance twice and can run off the restickified tile (issue #4008).
         #
-        # When old_name instead has no loop_info of its own (a graph input or
-        # any other fixed, already-full buffer materialized once outside any
-        # loop), restickify produces a full, non-tiled copy every time
-        # (lower_restickify always sizes it to old_name's full shape) and the
-        # per-trip advance genuinely belongs to the consumer, which strides
-        # through that full copy the same way it would have strided through
-        # old_name directly. Transferring the advance in that case strips it
-        # from the consumer with nothing on the restickify side to replace it
-        # (the restickify's own inner_fn has no loop_var dependence to
-        # advance), silently pinning the consumer's read to one address for
-        # every trip (see test_carry_mode_online_softmax's carried-online-
-        # softmax K case).
+        # At non-shared, deeper levels, restickify copies the source's full
+        # contents and the consumer must keep its advance to select a tile
+        # within that copy. Checking only whether old_name has loop_info loses
+        # this distinction. For example, nested SDPA first stages a full K
+        # buffer in the B/H prefix and later tiles it in the Lk loop. Moving
+        # the Lk advance to the full-K restickify pins the matmul itself to K
+        # tile zero. A graph input has no shared levels and follows this same
+        # fixed-full-buffer path at every level.
         old_name_buf = V.graph.try_get_buffer(old_name)
-        old_name_is_tiled_stage = old_name_buf is not None and hasattr(
-            old_name_buf, "loop_info"
-        )
-        if hasattr(op, "loop_info") and old_name_is_tiled_stage:
-            consumer_li = op.loop_info
+        source_li = getattr(old_name_buf, "loop_info", None)
+        consumer_li = getattr(op, "loop_info", None)
+        source_group_id = getattr(source_li, "loop_group_id", ())
+        consumer_group_id = getattr(consumer_li, "loop_group_id", ())
+        shared_loop_depth = 0
+        for source_level, consumer_level in zip(
+            source_group_id, consumer_group_id, strict=False
+        ):
+            if source_level != consumer_level:
+                break
+            shared_loop_depth += 1
+        has_shared_loop_scope = source_li is not None and shared_loop_depth > 0
+        if consumer_li is not None and has_shared_loop_scope:
             n_levels = len(getattr(consumer_li, "loop_count", []) or [])
             reads_per_dim = getattr(consumer_li, "tiled_dims_per_read", None)
             if n_levels and reads_per_dim is not None:
@@ -390,6 +389,14 @@ def insert_restickify_on_node_inputs(
                     if dep_idx is not None
                     else [[] for _ in range(n_levels)]
                 )
+                transferred_advance = [
+                    level if level_idx < shared_loop_depth else []
+                    for level_idx, level in enumerate(dep_advance)
+                ]
+                retained_advance = [
+                    [] if level_idx < shared_loop_depth else level
+                    for level_idx, level in enumerate(dep_advance)
+                ]
                 # squeezed_advance_per_read is the second, independent channel
                 # for the same per-read advance (see CoarseTileInfo), also
                 # matched to reads positionally, so it must be handed over the
@@ -405,8 +412,16 @@ def insert_restickify_on_node_inputs(
                     and dep_idx < len(adv_per_read)
                     else []
                 )
+                transferred_squeezed = [
+                    level if level_idx < shared_loop_depth else []
+                    for level_idx, level in enumerate(dep_squeezed)
+                ]
+                retained_squeezed = [
+                    [] if level_idx < shared_loop_depth else level
+                    for level_idx, level in enumerate(dep_squeezed)
+                ]
                 if restick_arg_info.get("occurrence", 0) != 0 and (
-                    any(dep_advance) or any(dep_squeezed)
+                    any(transferred_advance) or any(transferred_squeezed)
                 ):
                     raise Unsupported(
                         f"restickify edge {old_name}[{restick_arg_info['dep_index']}] "
@@ -414,24 +429,22 @@ def insert_restickify_on_node_inputs(
                         "transfer advancing read metadata independently"
                     )
                 restick_li = copy.deepcopy(consumer_li)
-                restick_li.tiled_dims_per_read = [dep_advance]
+                restick_li.tiled_dims_per_read = [transferred_advance]
                 restick_li.squeezed_advance_per_read = (
-                    [dep_squeezed] if any(dep_squeezed) else []
+                    [transferred_squeezed] if any(transferred_squeezed) else []
                 )
                 restick_li.output_tiled_dims = [[] for _ in range(n_levels)]
                 restick_buff.loop_info = restick_li
                 if dep_idx is not None:
                     consumer_li.tiled_dims_per_read = copy.deepcopy(reads_per_dim)
-                    consumer_li.tiled_dims_per_read[dep_idx] = [
-                        [] for _ in range(n_levels)
-                    ]
+                    consumer_li.tiled_dims_per_read[dep_idx] = retained_advance
                     if adv_per_read:
                         consumer_li.squeezed_advance_per_read = copy.deepcopy(
                             adv_per_read
                         )
-                        consumer_li.squeezed_advance_per_read[dep_idx] = [
-                            [] for _ in range(n_levels)
-                        ]
+                        consumer_li.squeezed_advance_per_read[dep_idx] = (
+                            retained_squeezed
+                        )
             else:
                 restick_buff.loop_info = consumer_li
         elif hasattr(op, "loop_info"):

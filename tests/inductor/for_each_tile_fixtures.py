@@ -704,6 +704,56 @@ def nested_online_softmax_fn(
     return out
 
 
+def batched_online_softmax_fn(
+    Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor
+) -> torch.Tensor:
+    """Map batches around an Lk carry, staging K/V in the outer loop."""
+
+    def batch_body(_, tiles):
+        q_batch, k_batch, v_batch = tiles
+
+        def kv_body(carry, kv_tiles):
+            running_max, denominator, accumulator = carry
+            k_tile, v_tile = kv_tiles
+            scores = q_batch @ k_tile.transpose(-1, -2)
+            new_max = torch.maximum(running_max, scores.amax(dim=-1, keepdim=True))
+            correction = torch.exp(running_max - new_max)
+            probabilities = torch.exp(scores - new_max)
+            return (
+                new_max,
+                denominator * correction + probabilities.sum(dim=-1, keepdim=True),
+                accumulator * correction + probabilities @ v_tile,
+            ), None
+
+        carry_shape = (*q_batch.shape[:-1], 1)
+        (_, denominator, accumulator), _ = for_each_tile(
+            kv_body,
+            (k_batch, v_batch),
+            dims=(-2, -2),
+            tile_size=SOFTMAX_TILE_SIZE,
+            init=(
+                torch.full(
+                    carry_shape,
+                    float("-inf"),
+                    device=Q.device,
+                    dtype=Q.dtype,
+                ),
+                torch.zeros(carry_shape, device=Q.device, dtype=Q.dtype),
+                torch.zeros_like(q_batch),
+            ),
+        )
+        return None, accumulator / denominator
+
+    _, out = for_each_tile(
+        batch_body,
+        (Q, K, V),
+        dims=(0, 0, 0),
+        tile_size=1,
+        out_dim=0,
+    )
+    return out
+
+
 def online_softmax_reference(
     Q: torch.Tensor,
     K: torch.Tensor,

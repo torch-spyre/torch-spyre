@@ -27,12 +27,12 @@ Minimum coverage per docs/superpowers/specs/2026-09-09-while-loop-lowering-desig
    page per trip from inside the body the way paged attention does.
 4. Multiple independent carries: covered by test_carry_mode_online_softmax
    (carry = (m, denom, acc), an online-softmax flash-attention inner loop).
-Case 5 (nested for_each_tile) has partial coverage: TestForEachTileNestedMapE2E
-covers the pure map/map (no carry) two-level shape, both at a small debug
-size and at a multi-stick tile size; the carry-bearing nested shapes remain
-in test_for_each_tile_lowering.py's TestConsumeTileDimMarkers (IR-level) and
-this file's test_carry_mode_split_k. Case 6 (deliberate-decline) is still
-open, tracked as a follow-on item.
+Case 5 (nested for_each_tile) covers both pure map/map nesting in
+TestForEachTileNestedMapE2E and map/carry nesting in
+test_batched_map_over_online_softmax_carry.  The latter stages full K/V
+buffers in the outer batch map, then slices those staged buffers in the inner
+Lk carry, exercising per-level ownership of input advances. Case 6
+(deliberate-decline) is still open, tracked as a follow-on item.
 
 test_map_mode_split_m (map mode: Kind.SLICE + Kind.INVARIANT operands, a
 stacking carry, no user carry) passes end to end with verified numerics and
@@ -58,6 +58,7 @@ import torch_spyre  # noqa: F401  registers the "spyre" device
 from torch_spyre.constants import DEVICE_NAME
 
 from tests.inductor.for_each_tile_fixtures import (
+    batched_online_softmax_fn,
     STICK_COLS,
     STICK_ROWS,
     abs_add_mul_tiled_fn,
@@ -231,6 +232,24 @@ class TestForEachTileE2E(_DynamoResetTestCase):
 
         compiled = torch.compile(online_softmax_fn, backend="inductor", fullgraph=True)
         out = compiled(Q_spyre, K_spyre, V_spyre)
+
+        torch.testing.assert_close(
+            out.cpu().float(), ref, atol=self.ATOL, rtol=self.RTOL
+        )
+
+    def test_batched_map_over_online_softmax_carry(self):
+        """An inner Lk advance stays on a full outer-staged K buffer."""
+        torch.manual_seed(0)
+        Q = torch.randn(2, 64, 128, dtype=torch.float16)
+        K = torch.randn(2, 256, 128, dtype=torch.float16)
+        V = torch.randn(2, 256, 128, dtype=torch.float16)
+        ref = torch.softmax(Q.float() @ K.float().transpose(-1, -2), dim=-1)
+        ref = ref @ V.float()
+
+        compiled = torch.compile(
+            batched_online_softmax_fn, backend="inductor", fullgraph=True
+        )
+        out = compiled(Q.to(DEVICE_NAME), K.to(DEVICE_NAME), V.to(DEVICE_NAME))
 
         torch.testing.assert_close(
             out.cpu().float(), ref, atol=self.ATOL, rtol=self.RTOL
