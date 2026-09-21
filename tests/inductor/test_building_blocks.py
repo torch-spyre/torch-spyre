@@ -391,10 +391,9 @@ class TestBuildingBlocks(unittest.TestCase):
         )
 
     @mock.patch(
-        "torch_spyre._inductor.decompositions._SDPA_MAX_BURST_EFFICIENT_KV_BLOCK_SIZE",
-        64,
+        "torch_spyre._inductor.decompositions._sdpa_kv_block_sizes",
+        new=lambda _: [64],
     )
-    @mock.patch("torch_spyre._inductor.decompositions._SDPA_MAX_SEQUENCE_TILE_SIZE", 64)
     def test_sdpa_lk_uses_for_each_tile(self):
         """Multiple K/V blocks lower to one counted loop instead of unrolling."""
         batch, heads, query_length, kv_length, head_dim = 1, 2, 64, 128, 128
@@ -582,7 +581,14 @@ class TestBuildingBlocks(unittest.TestCase):
             kv_padding=64,
         )
 
-    @mock.patch("torch_spyre._inductor.decompositions._SDPA_MAX_SEQUENCE_TILE_SIZE", 64)
+    @mock.patch(
+        "torch_spyre._inductor.decompositions._sdpa_query_tile_sizes",
+        new=lambda _: [64],
+    )
+    @mock.patch(
+        "torch_spyre._inductor.decompositions._sdpa_kv_block_sizes",
+        new=lambda _: [64],
+    )
     # patch the cpsat time to bypass the CI job stall timeout
     @config.patch(
         {
@@ -762,7 +768,14 @@ class TestBuildingBlocks(unittest.TestCase):
     @unittest.skip(
         "Test skipped solely because of runtime.  It passes but takes over 10 minutes."
     )
-    @mock.patch("torch_spyre._inductor.decompositions._SDPA_MAX_SEQUENCE_TILE_SIZE", 64)
+    @mock.patch(
+        "torch_spyre._inductor.decompositions._sdpa_query_tile_sizes",
+        new=lambda _: [64],
+    )
+    @mock.patch(
+        "torch_spyre._inductor.decompositions._sdpa_kv_block_sizes",
+        new=lambda _: [64],
+    )
     def test_granite_gqa_prefill_grouped_sixteen_by_sixteen_tiling(self):
         """Sixteen KV loop groups preserve Granite's online-softmax carries."""
         self._run_granite_gqa_with_finite_broadcast_mask(

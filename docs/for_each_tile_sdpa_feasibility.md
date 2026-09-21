@@ -4,59 +4,25 @@ Last updated: 2026-09-21
 
 ## Executive summary
 
-This branch contains the complete proposed rewrite of Spyre SDPA tiling as
-nested `for_each_tile` operations. It has been rebased onto the exact head of
-PR #4705, itself rebased onto the latest `upstream/main` used for this test.
+This branch rewrites Spyre SDPA's complete `B`/`Hkv`/`G`/`Lq`/`Lk` tile nest
+with `for_each_tile`. It is based on upstream main at `bfcaa316` and contains
+no named-dimension hints.
 
-PR #4705 is a substantial improvement over the previous baseline:
+The nested-HOP correctness blockers found during the original experiment are
+fixed. The focused nine-case suite and the production SDPA tests pass on
+Spyre, and Granite 3.3 8B completes chunked-prefill plus decode at 8K and 32K.
+Gemma 4 12B and 26B A4B had already passed the same 8K/32K E2Es with the
+K256 plan that the new selector still chooses.
 
-- a minimal two-level map nest now compiles and executes correctly on Spyre;
-- the standalone `Lk` online-softmax loop still passes for MHA and native GQA;
-- a stride-zero broadcast attention bias now works with that standalone loop;
-  and
-- ordinary Granite GQA decode and prefill production tests pass with the full
-  decomposition.
-
-The complete rewrite is still not safe to merge. Every remaining failure
-contains an outer map around an inner carry-bearing `Lk` loop:
-
-- a minimal `Lq -> Lk` prototype compiles and runs but returns corrupt values;
-- a complete four-level MHA prototype also runs but returns wrong values;
-- a complete five-level GQA prototype fails earlier with a cycle in Inductor's
-  scheduler/memory-planning dependency graph; and
-- the production Granite four-by-four `Lq`/`Lk` tiling test runs but returns a
-  wrong answer.
-
-The wrong-answer cases are consistent with the carry-bearing nesting class
-tracked by #4701. The five-level dependency-cycle failure is a separate symptom
-and may need its own compiler fix. PR #4705 deliberately does not claim that
-carry-bearing nested `for_each_tile` is end-to-end correct.
-
-The recommendation is to keep #4551 as a draft. PR #4705 makes nested map mode
-usable, but production SDPA needs an outer map composed with an inner reduction
-whenever both `Lq` and `Lk` require more than one tile.
-
-## Experiment baseline
-
-- Repository: `torch-spyre/torch-spyre`
-- Upstream base: `upstream/main` at
-  `fdb52a0498732b421ed43d00bdb7c617dd5ae7af`
-- PR #4705 head: `0f67e59b81746282c93853e27dc187336eee5981`
-- PR #4705 rebased onto that main:
-  `2560bb727d62053a76c1868c7a92cc99259266f9`
-- Experiment branch: `codex/sdpa-for-each-tile-experiment`
-- Prototype: `tests/inductor/test_sdpa_for_each_tile.py`
-
-The native extension was rebuilt from this checkout before testing.
+The tiling selector is cost based. It does not contain model identities,
+sequence-length cutoffs, or maximum query/K tile limits. It enumerates exact
+Lq/Lk tile pairs, estimates the nested loop body's live LX footprint and
+active-core ownership, rejects candidates that do not fit the available LX,
+and ranks the remaining candidates by K/V load bursts and loop/DSC overhead.
 
 ## SDPA structure
 
-The production decomposition chooses a tiling plan with
-`_select_sdpa_tiling`. Main represents coarse `B`, `H`, `G`, and `Lq` tiling
-with hint scopes and represents the `Lk` online-softmax reduction with
-`for_each_tile`.
-
-The full-HOP branch expresses all of those loops directly:
+The decomposition expresses these loops directly:
 
 ```text
 MHA:
@@ -73,9 +39,9 @@ for_each_tile(B, map)
         for_each_tile(Lk, carry M, l, O)
 ```
 
-For GQA, Q and bias have logical shape `[B, Hkv, G, Lq, ...]`; K and V
-retain a unit group dimension and are invariant at the `G` level. The
-innermost loop implements stable online softmax:
+For GQA, Q and bias have logical shape `[B, Hkv, G, Lq, ...]`; K and V keep a
+unit G dimension and are invariant in the G loop. The Lk reduction implements
+stable online softmax:
 
 ```text
 scores = Q @ K_tile.T * scale + bias_tile
@@ -87,168 +53,142 @@ O_next = O * correction + P @ V_tile
 result = O_final / l_final
 ```
 
-The rewrite retains the current tiling cost model, exact-divisor K/V tile
-selection, packed-key rebasing for unaligned physical rows, native GQA without
-repeating K/V, sparse accumulator construction, mask slicing, and the output
-stride contract. One-trip map and carry levels are called directly rather than
-lowered to a loop. No `named_dims` hints remain in the rewritten decomposition.
+## Selector model
 
-## Results
+For chunked prefill, the selector enumerates every exact query tile generated
+from the full Lq extent down to one row and every exact, stick-aligned K tile
+generated from power-of-two burst candidates plus the full K extent. For each
+pair it estimates:
 
-### Focused prototype suite
+- CP-SAT's usable core count over the inner physical-head and query-row axes;
+- four simultaneously live score-shaped values;
+- four query/output-shaped values;
+- the two scalar online-softmax carries;
+- the per-core restickified K footprint; and
+- two K/V load bursts per outer HOP trip and Lk block.
 
-After updating stale expected-failure annotations, the focused suite reports:
+Only plans whose estimated live set fits the actual frontend LX planning
+budget are eligible. Eligible plans are ordered by estimated load bursts,
+then outer-loop count, DSC executions, and block width. Decode retains its
+separately calibrated policy because its one-row execution is structurally
+different from chunked prefill.
+
+Representative choices with a 1,625,344-byte per-core LX budget are:
+
+| Geometry | Selected plan | Estimated live bytes/core |
+| --- | --- | ---: |
+| Granite, Hq=32, Hkv=8, Lq=512, D=128 | Lq512 / K1024 | 1,442,304 |
+| Gemma 4, Hq=16, Hkv=8, Lq=1024, D=256 | Lq1024 / K256 | 1,180,672 |
+
+The same plan is selected at 8K and 32K for each geometry because sequence
+length changes the number of bursts, not whether one tile's live set fits LX.
+
+## Correctness results
+
+On upstream main `bfcaa316`:
 
 ```text
-Ran 9 tests in 38.214s
-OK (expected failures=2)
+tests/inductor/test_sdpa_tiling.py:             22 passed
+tests/inductor/test_for_each_tile_lowering.py:  41 passed, 1 expected failure
+tests/inductor/test_sdpa_for_each_tile.py:        9 passed
+focused production SDPA tests:                   4 passed
 ```
 
-| Case | Backend | Result |
-| --- | --- | --- |
-| Full MHA `B/H/Lq/Lk` nest | CPU eager and `torch.compile` | Pass; four `while_loop`s captured |
-| Full GQA `B/Hkv/G/Lq/Lk` nest | CPU eager and `torch.compile` | Pass; five `while_loop`s captured |
-| Standalone MHA `Lk` carry loop, dense bias | Spyre | Pass; one `LoopSpec` |
-| Standalone native-GQA `Lk` carry loop, dense bias | Spyre | Pass; one `LoopSpec` |
-| Standalone MHA `Lk` carry loop, expanded broadcast bias | Spyre | Pass; one `LoopSpec` |
-| Two nested map-mode loops | Spyre | Pass; two `LoopSpec`s |
-| `Lq` map around `Lk` carry loop | Spyre | Expected failure: wrong output |
-| Full five-level GQA nest | Spyre | Expected failure: scheduler dependency cycle |
+The production group consists of the Lk-HOP structural check, Granite finite
+mask decode, Granite finite broadcast-mask prefill, and forced four-by-four
+Lq/Lk tiling.
 
-The simple nested-map test's maximum absolute difference was `0.0078125`,
-which is within the same `atol=0.1, rtol=0.1` FP16 tolerance used by PR #4705's
-Spyre end-to-end tests. Its previous default `assert_close` tolerance was too
-strict for device FP16 arithmetic.
+All requested chunked-prefill plus decode E2Es passed before the final selector
+rewrite:
 
-### Production decomposition checks
+| Model | Chunk | 8K | 32K |
+| --- | ---: | --- | --- |
+| Granite 3.3 8B Instruct | 512 | Pass | Pass |
+| Gemma 4 12B | 1024 | Pass | Pass |
+| Gemma 4 26B A4B | 1024 | Pass | Pass |
 
-| Test | Result |
+After the selector rewrite and latest-main merge, Granite was rerun because
+its selected K tile changed from K512 to K1024:
+
+| Case | Result |
 | --- | --- |
-| `test_sdpa_lk_uses_for_each_tile` | Pass |
-| Granite GQA decode, `Lq=1`, `Lk=128` | Pass |
-| Granite GQA prefill, `Lq=128`, `Lk=128` | Pass |
-| Forced four-by-four Granite GQA, `Lq=Lk=256` | Wrong output |
+| Granite 8B, 8K, chunk 512 | Pass; output suffix `of the` |
+| Granite 8B, 32K, chunk 512 | Pass; output suffix `France is` |
 
-The forced four-by-four test produced `131079 / 1048576` mismatched elements
-(`12.5%`) in two consecutive runs, with maximum absolute difference `3.890625`
-at the test's `atol=0.2, rtol=0.2` threshold. It proves that getting through
-compilation and execution is not enough when a production SDPA graph contains
-both query mapping and the K/V carry loop.
+The latest selector still chooses K256 for both Gemma models, so their
+previously passing execution path did not change.
 
-The ordinary decode and prefill cases do not contradict this result. Their
-sequence extents fit one selected query and K/V tile, so those levels take the
-one-trip direct-call path. They validate PR #4705's map-only nesting in the
-remaining GQA head/group levels, not map-plus-carry nesting.
+## Compile-time and runtime observations
 
-### Additional four-level MHA probe
+The end-to-end runner reports first-token latency, which includes compilation
+on the first invocation and chunked-prefill execution on every invocation.
 
-A Spyre probe using `B=2`, `H=2`, `Lq=32`, `Lk=256`, `D=128`, query tiles of
-16, and K/V tiles of 128 compiled and executed. It remained numerically wrong:
-`5305 / 16384` elements differed by more than `0.1`, with maximum absolute
-difference `0.4942207`. This shows the carry-composition problem is not specific
-to GQA's extra group level.
+| Case | Cold first token | Warm first token | Notes |
+| --- | ---: | ---: | --- |
+| Granite 8B, 8K | 138.94 s | 35.30 s | Approx. 103.64 s cold-only overhead |
+| Granite 8B, 32K | 1,506.36 s | >4 min | Cold run passed; the 30-minute wrapper expired during the warm run |
 
-## Remaining blocker 1: map plus carry gives wrong results (#4701)
+For comparison, the reported main compile times were approximately 20 minutes
+at 8K and one hour at 32K. The 8K cold-only overhead is therefore about an
+order of magnitude lower. The 32K cold total is 25.1 minutes including model
+execution; it is below the old compile-only baseline, but the incomplete warm
+run means compile and runtime cannot yet be separated precisely.
 
-The smallest SDPA-specific reproducer is one `Lq` map around one `Lk`
-online-softmax carry loop. It now completes tracing, splicing, scheduling,
-code generation, and device execution. In the observed run it mismatched
-`8197 / 16384` elements (`50.0%`) and produced non-finite values, including an
-infinite maximum absolute difference.
+Isolated Granite SDPA measurements explain the K1024 choice:
 
-This is the same composition class as #4701: an outer map whose body contains a
-carry-bearing inner loop. PR #4705's own report explicitly leaves that class as
-follow-up work because its nested split-M/split-K fixture can produce
-nondeterministic corruption suggestive of stale or aliased HBM storage or an
-incorrect carry read/write schedule.
+| K tile | Runtime |
+| ---: | ---: |
+| 256 | 27.39 ms |
+| 512 | 24.10 ms |
+| 1024 | 23.11 ms |
+| 2048 | 80.54 ms |
 
-The full MHA and forced production GQA results confirm that SDPA reaches this
-unresolved path. The next investigation should start with HBM-pool liveness and
-the schedule of each carry snapshot, update, and next-iteration read, using the
-minimal `Lq -> Lk` reproducer before returning to a full model.
+Generated LoopSpecs/OpSpecs show that K1024 retains the online-softmax
+intermediates in LX. K2048 exceeds the estimated live set and spills nearly
+all intermediates to `hbm_pool`, matching its large regression. A short
+Granite chunk (`Lq=64`, `Lk=8K`) likewise measured K4096 at 3.24 ms versus
+K512 at 4.22 ms, supporting selection by residency and burst count rather
+than a fixed K512 ceiling.
 
-## Remaining blocker 2: deep GQA nesting creates a dependency cycle
+For Gemma's wider D=256 geometry, K512 crosses the estimated resident live
+set. Existing measurements were 38.5 ms (K256) versus 36.2 ms (K512) at 8K,
+and 47.8 ms (K256) versus 72.7 ms (K512) at 32K. The model therefore chooses
+the resident K256 plan without checking the model name or sequence length.
 
-The five-level GQA prototype does not reach code generation. Inductor's
-`reorder_for_peak_memory` validation reports a cycle between an outer mapped
-operation and a synthetic `while_loop_carry_snapshot` dependency generated for
-the nested `Lk` carry.
+## Additional compiler fix exposed by the E2E
 
-This differs from the previous #4581 failure: no unregistered outer-loop
-indirect symbol is reported. It also differs from the numerical #4701 symptom
-because execution never starts. The full dependency path is long, but its two
-endpoints are stable and include the synthetic carry snapshot, so the first
-place to inspect is dependency construction when a carry loop is nested under
-several map levels.
+The new Granite K1024 plan exposed a generic scan-carry classification bug.
+PyTorch's scan lowering carries the tiled `xs` tensors through its generated
+while loop. A packed K-cache view needed an output stride-repair copy, so the
+IR output buffer no longer had the same name as its input placeholder. The
+bridge interpreted that copy as an accumulator update and changed its output
+to a mutation of the original rank-4 cache, even though the copy iterated over
+the rank-5 tile stack. Dependency extraction then failed on the rank/stride
+mismatch.
 
-PR #4705 also documents #4706, an OS-5 symbol-consistency gap that can affect
-other carry-bearing nested shapes. The SDPA probes above did not stop at that
-error: the shallow cases reached execution and the deepest case reached the
-memory-planning cycle.
+The bridge now consults the original body FX graph, where a pass-through carry
+is unambiguous: output position `i` is the same node as placeholder `i`. This
+keeps the stride-repair copy as a copy and avoids any geometry-specific
+safeguard. A focused unit test covers the distinction between a real updated
+carry and a stride-repaired pass-through carry.
 
-## Remaining design work
+## Remaining work
 
-### Destination-backed map outputs
-
-On CPU, both complete prototypes contain four copy/clone/stack-style
-materialization nodes after `scan` decomposes to `while_loop`. Map mode stacks
-each step's result and folds the leading scan dimension into `out_dim`; a
-non-leading fold can require a full-output copy. Destination-backed
-`scan(out=)` / `for_each_tile(output=)` is still needed to eliminate these
-writes and should be integrated independently of the carry-correctness fix.
-
-### Ragged `Lk`
-
-`for_each_tile` requires the sliced extent to be divisible by `tile_size`.
-This branch chooses an exact divisor no larger than the cost model's requested
-block, which is correct but can select a small tile for awkward or prime
-sequence lengths. Padding K/V plus a `-inf` mask for padded score columns may be
-a better production policy; native ragged tiles would require a larger frontend
-and compiler change.
-
-### Work-division parity
-
-The cost model's calibrated fast path can use `work_div` to distribute named
-`H`, `Lq`, and MHA `Lk` dimensions across cores. The full-HOP branch
-intentionally has no `named_dims`, so it needs HOP-derived work division or an
-axis-based equivalent before runtime performance can be compared fairly with
-main.
-
-## Recommended sequence
-
-1. Fix and repeatedly stress the minimal `Lq` map around the `Lk` carry,
-   including clean-cache runs to detect #4701-style nondeterminism.
-2. Fix the deep-nest scheduler dependency cycle using the five-level GQA
-   prototype as the regression test.
-3. Require both the MHA and GQA device prototypes, plus the forced four-by-four
-   production test, to pass numerically.
-4. Add destination-backed map outputs and an axis-based work-division
-   interface.
-5. Only then benchmark compile time, runtime, HBM/LX use, and generated bundle
-   size against the hints-based production implementation.
+- Complete an uninterrupted same-process Granite 32K warm run to separate
+  compile time from steady-state chunked-prefill runtime.
+- Re-run the Gemma 12B/26B E2Es if changes after this branch alter their K256
+  plan or the shared nested-HOP lowering.
+- Add destination-backed map outputs to remove scan stack/fold
+  materializations.
+- Compare the selector's estimates against generated LoopSpecs/OpSpecs for a
+  broader geometry grid and refine buffer lifetimes if the allocator changes.
 
 ## Reproduction
 
-Build the native extension and run the focused suite:
-
 ```bash
-python setup.py build_ext --inplace
-python tests/inductor/test_sdpa_for_each_tile.py -v
+python tests/inductor/test_sdpa_tiling.py -v
+python -m pytest -q tests/inductor/test_sdpa_for_each_tile.py
 ```
 
-Run the production checks:
-
-```bash
-python -m pytest -q \
-  tests/inductor/test_building_blocks.py::TestBuildingBlocks::test_sdpa_lk_uses_for_each_tile \
-  tests/inductor/test_building_blocks.py::TestBuildingBlocks::test_granite_gqa_decode_with_finite_mask \
-  tests/inductor/test_building_blocks.py::TestBuildingBlocks::test_granite_gqa_prefill_with_finite_broadcast_mask \
-  tests/inductor/test_building_blocks.py::TestBuildingBlocks::test_granite_gqa_prefill_four_by_four_sequence_tiling
-```
-
-## Decision
-
-PR #4705 resolves the map-only nested-HOP blocker and the earlier broadcast-bias
-failure. It does not yet make nested carry-bearing SDPA correct. Keep #4551 in
-draft and retain main's hints-based outer loops with the merged `Lk`-only HOP
-until the wrong-answer and dependency-cycle failures above are fixed.
+The E2E runs set `HF_HOME=/mnt/models/hf_cache` and invoke the adapter with
+`prefill_chunk_size=512` for Granite or `1024` for Gemma.

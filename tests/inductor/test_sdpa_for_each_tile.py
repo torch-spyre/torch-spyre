@@ -450,9 +450,8 @@ class TestSDPAForEachTile(unittest.TestCase):
         """The standalone Lk HOP supports a stride-zero broadcast bias."""
         self._check_kv_loop_spyre(broadcast_bias=True)
 
-    @unittest.expectedFailure
     def test_gqa_complete_tile_nest_spyre(self):
-        """The five-level nest currently creates a scheduler dependency cycle."""
+        """The five-level GQA nest compiles and executes correctly."""
         batch, heads, groups, query_length, kv_length, head_dim = 2, 2, 2, 32, 256, 128
         torch.default_generator.manual_seed(0)
         query = torch.randn(
@@ -527,9 +526,8 @@ class TestSDPAForEachTile(unittest.TestCase):
         )
         self.assertEqual(sum(source.count("LoopSpec(") for source in sources), 2)
 
-    @unittest.expectedFailure
     def test_query_kv_nested_spyre(self):
-        """An Lq map around an Lk carry loop still returns corrupt values."""
+        """An Lq map composes correctly with an Lk carry loop."""
         query = torch.randn(128, 128, dtype=torch.float16)
         key = torch.randn(256, 128, dtype=torch.float16)
         value = torch.randn(256, 128, dtype=torch.float16)
