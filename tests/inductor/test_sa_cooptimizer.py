@@ -1658,6 +1658,67 @@ _TILE_2 = TileSpec((TileAxis(host_dim=0, count=2),))
 _TILE_4 = TileSpec((TileAxis(host_dim=0, count=4),))
 
 
+class TilingBoundaryResidencyTest(TestCase):
+    """A buffer a coarse-tiled consumer reads at an advancing address cannot be
+    LX-resident: the backend has no way to advance an LX start address, and at
+    32 cores it does not even refuse -- it returns wrong data.
+
+    The rule is stated on the two configs alone. What makes that sufficient is
+    the apply: a tiled producer whose output leaves its run gets a full-extent
+    HBM ``full_buf`` and its consumers are repointed at that, so only an
+    *untiled* producer is ever read directly across the boundary.
+    """
+
+    def _pair(self, parent_tiling=TileSpec(), child_tiling=TileSpec()):
+        parent = _two_axis_buffer(name="P")
+        child = _two_axis_buffer(name="C", parents=["P"], matches={"P": [(0, 0)]})
+        for buf in (parent, child):
+            buf.division_space = _two_axis_space(tiling=_tiling_space())
+        solver = _primed_topology([parent, child])
+        solver.chosen[0] = _config(CoreDivision(tiling=parent_tiling))
+        solver.chosen[1] = _config(CoreDivision(tiling=child_tiling))
+        return solver
+
+    def test_an_untiled_producer_read_by_a_tiled_consumer_is_refused(self):
+        solver = self._pair(child_tiling=_TILE_2)
+        self.assertTrue(solver._read_across_a_tiling_boundary(0, solver.chosen[0]))
+        self.assertFalse(solver._eligible(0))
+
+    def test_an_untiled_pair_is_untouched(self):
+        # The whole corpus, and every graph with the flag off.
+        solver = self._pair()
+        self.assertFalse(solver._read_across_a_tiling_boundary(0, solver.chosen[0]))
+        self.assertTrue(solver._eligible(0))
+
+    def test_a_tiled_producer_keeps_its_residency(self):
+        """Its scratch is redrawn at one address per iteration when the consumer
+        is in its run, and replaced by an HBM full buffer when it is not -- so
+        neither case is the producer's own residency to refuse."""
+        for child_tiling in (_TILE_2, _TILE_4, TileSpec()):
+            solver = self._pair(parent_tiling=_TILE_2, child_tiling=child_tiling)
+            self.assertFalse(
+                solver._read_across_a_tiling_boundary(0, solver.chosen[0]),
+                child_tiling.label,
+            )
+
+    def test_the_consumer_side_is_not_refused(self):
+        # The gate is about being *read* across the boundary, not about reading
+        # across it: the tiled consumer's own output is per-tile scratch.
+        solver = self._pair(child_tiling=_TILE_2)
+        self.assertFalse(solver._read_across_a_tiling_boundary(1, solver.chosen[1]))
+
+    def test_a_graph_without_tilings_never_pays_for_the_test(self):
+        # `_tilings_are_possible` is false for every engine but this one and for
+        # this one with the flag off, so the gate short-circuits before it looks
+        # at a single child.
+        parent = _two_axis_buffer(name="P")
+        child = _two_axis_buffer(name="C", parents=["P"], matches={"P": [(0, 0)]})
+        solver = _primed_topology([parent, child])
+        self.assertFalse(solver._tilings_are_possible)
+        solver.chosen[1] = _config(CoreDivision(tiling=_TILE_2))
+        self.assertFalse(solver._read_across_a_tiling_boundary(0, solver.chosen[0]))
+
+
 def _menu_seed():
     """The seed config a menu source hands over -- unsplit and untiled, which
     is where every search starts."""

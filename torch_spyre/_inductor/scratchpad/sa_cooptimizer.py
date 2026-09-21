@@ -1261,9 +1261,57 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         if self._per_core_size(idx, self.chosen[idx]) > self.limit:
             return False
         parent = self.chosen[idx]
+        if self._read_across_a_tiling_boundary(idx, parent):
+            return False
         return all(
             relation.compatible(parent, self.chosen[c_idx])
             for c_idx, relation in self._children[idx]
+        )
+
+    def _read_across_a_tiling_boundary(self, idx: int, parent: DivisionConfig) -> bool:
+        """Whether buffer ``idx`` is read by a coarse-tiled consumer at an
+        address that advances with the consumer's loop -- which its residency
+        would have to express and cannot.
+
+        **The backend has no way to advance an LX address.** An LX start address
+        is never registered as a symbol in the SDSC JSON, so ``affine.apply`` has
+        nothing to target and ``compute_ops`` raises "Tiled (advancing)
+        lx-allocated tensors are not yet supported". Worse, it raises only where
+        it recognizes the advance: measured at 32 cores the same graph compiles
+        and returns wrong data (max abs error 18.9 against CPU on a two-tile
+        ``silu(a)*a + b``, where the untiled arm gives 0.05), so this is a
+        silent-wrong-answer gate and not a performance one.
+
+        **Only an untiled producer is at risk, and that is the whole rule.** Take
+        a tiled consumer ``C`` reading buffer ``P``:
+
+        * ``P`` produced inside ``C``'s own run -- loop-internal scratch, redrawn
+          at one address every iteration. Nothing advances; this is the residency
+          a tiling exists to buy and it is untouched.
+        * ``P`` produced by a tiled op in another run -- ``P`` escapes its run, so
+          the apply mints a full-extent ``full_buf`` in HBM and repoints ``C`` at
+          it (``_allocate_full_buffer``). ``C`` reads HBM; ``P``'s own scratch
+          stays resident and non-advancing.
+        * ``P`` produced by an **untiled** op, or by no op at all (a graph input's
+          clone) -- there is no copy-out and no indirection, so ``C`` reads ``P``
+          itself, once per tile, at a moving offset. Resident, that is the
+          unsupported case.
+
+        So the test needs neither run membership nor positions: it is exactly
+        "this buffer is untiled and some consumer is not". A clone carries an
+        untiled division always, so it falls under the same clause rather than
+        needing one of its own.
+
+        What this costs is the residency of every cross-boundary operand, which
+        is real -- and is what a staged tile-local read copy exists to give back
+        (``coarse_tile._plan_read_copies``): the copy does not advance, so it can
+        be resident where its source cannot. Nothing places one yet.
+        """
+        if not self._tilings_are_possible or not parent.tiling.is_untiled:
+            return False
+        return any(
+            not self.chosen[child_idx].tiling.is_untiled
+            for child_idx, _relation in self._children[idx]
         )
 
     def _all_eligible_resident(self) -> bool:
