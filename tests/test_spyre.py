@@ -102,6 +102,248 @@ class TestSpyre(TestCase):
         a_cpu = a.cpu()
         self.assertTrue(a_cpu.eq(3.5).all())
 
+    def test_cpu_auto_pins_by_default(self):
+        a = torch.empty(4096, device="spyre", dtype=torch.float16)
+        a.fill_(3.5)
+
+        a_cpu = a.cpu()
+        self.assertTrue(a_cpu.is_pinned())
+        self.assertTrue(a_cpu.eq(3.5).all())
+
+        a_cpu_unpinned = torch.empty(a.shape, dtype=a.dtype, pin_memory=False)
+        a_cpu_unpinned.copy_(a)
+        self.assertFalse(a_cpu_unpinned.is_pinned())
+        self.assertTrue(a_cpu_unpinned.eq(3.5).all())
+
+    @parametrize(
+        "factory",
+        [
+            subtest(
+                lambda: torch.empty((64, 64), dtype=torch.float16, pin_memory=True),
+                name="empty",
+            ),
+            subtest(
+                lambda: torch.empty_strided(
+                    (64, 64),
+                    (1, 64),
+                    dtype=torch.float16,
+                    pin_memory=True,
+                ),
+                name="empty_strided",
+            ),
+            subtest(
+                lambda: torch.zeros((64, 64), dtype=torch.float16, pin_memory=True),
+                name="zeros",
+            ),
+            subtest(
+                lambda: torch.ones((64, 64), dtype=torch.float16, pin_memory=True),
+                name="ones",
+            ),
+            subtest(
+                lambda: torch.full((64, 64), 3.5, dtype=torch.float16, pin_memory=True),
+                name="full",
+            ),
+            subtest(
+                lambda: torch.rand((64, 64), dtype=torch.float16, pin_memory=True),
+                name="rand",
+            ),
+            subtest(
+                lambda: torch.randn((64, 64), dtype=torch.float16, pin_memory=True),
+                name="randn",
+            ),
+            subtest(
+                lambda: torch.randint(
+                    -16,
+                    16,
+                    (64, 64),
+                    dtype=torch.int8,
+                    pin_memory=True,
+                ),
+                name="randint",
+            ),
+            subtest(
+                lambda: torch.arange(4096, dtype=torch.float16, pin_memory=True),
+                name="arange",
+            ),
+            subtest(
+                lambda: torch.linspace(
+                    -1,
+                    1,
+                    4096,
+                    dtype=torch.float16,
+                    pin_memory=True,
+                ),
+                name="linspace",
+            ),
+            subtest(
+                lambda: torch.logspace(
+                    0,
+                    1,
+                    4096,
+                    dtype=torch.float16,
+                    pin_memory=True,
+                ),
+                name="logspace",
+            ),
+            subtest(
+                lambda: torch.eye(64, dtype=torch.float16, pin_memory=True),
+                name="eye",
+            ),
+            subtest(
+                lambda: torch.tensor(
+                    [[3.5] * 64] * 64,
+                    dtype=torch.float16,
+                    pin_memory=True,
+                ),
+                name="tensor",
+            ),
+            subtest(
+                lambda: torch.normal(
+                    0.0,
+                    1.0,
+                    size=(64, 64),
+                    dtype=torch.float16,
+                    pin_memory=True,
+                ),
+                name="normal",
+            ),
+            subtest(
+                lambda: torch.empty_like(
+                    torch.empty((64, 64), dtype=torch.float16).t(),
+                    pin_memory=True,
+                ),
+                name="empty_like",
+            ),
+            subtest(
+                lambda: torch.zeros_like(
+                    torch.empty((64, 64), dtype=torch.float16).t(),
+                    pin_memory=True,
+                ),
+                name="zeros_like",
+            ),
+            subtest(
+                lambda: torch.ones_like(
+                    torch.empty((64, 64), dtype=torch.float16).t(),
+                    pin_memory=True,
+                ),
+                name="ones_like",
+            ),
+            subtest(
+                lambda: torch.full_like(
+                    torch.empty((64, 64), dtype=torch.float16).t(),
+                    3.5,
+                    pin_memory=True,
+                ),
+                name="full_like",
+            ),
+            subtest(
+                lambda: torch.rand_like(
+                    torch.empty((64, 64), dtype=torch.float16).t(),
+                    pin_memory=True,
+                ),
+                name="rand_like",
+            ),
+            subtest(
+                lambda: torch.randn_like(
+                    torch.empty((64, 64), dtype=torch.float16).t(),
+                    pin_memory=True,
+                ),
+                name="randn_like",
+            ),
+        ],
+    )
+    def test_cpu_factory_pin_memory(self, factory):
+        cpu = factory()
+
+        self.assertEqual(cpu.device.type, "cpu")
+        self.assertTrue(cpu.is_pinned())
+        self.assertEqual(cpu.numel(), 4096)
+
+        expected = (torch.arange(4096, dtype=torch.int64) % 31).to(cpu.dtype)
+        cpu.copy_(expected.reshape(cpu.shape))
+
+        actual = cpu.to("spyre").cpu()
+        torch.testing.assert_close(actual, cpu, rtol=0, atol=0)
+
+    def test_cpu_pin_memory_method_and_interior_view(self):
+        values = (torch.arange(4128, dtype=torch.int64) % 31).to(torch.float16)
+        base = values.pin_memory()
+        view = base[17:4113]
+
+        self.assertTrue(base.is_pinned())
+        self.assertTrue(view.is_pinned())
+        self.assertEqual(
+            view.data_ptr(),
+            base.data_ptr() + 17 * base.element_size(),
+        )
+
+        actual = view.to("spyre").cpu()
+        torch.testing.assert_close(actual, view, rtol=0, atol=0)
+
+    def test_cpu_auto_pin_skips_small_transfers(self):
+        a = torch.empty(50, device="spyre", dtype=torch.float16)
+        a.fill_(3.5)
+
+        a_cpu = a.cpu()
+        self.assertFalse(a_cpu.is_pinned())
+        self.assertTrue(a_cpu.eq(3.5).all())
+
+    def test_cpu_auto_pin_rollback_env_var(self):
+        a = torch.empty(4096, device="spyre", dtype=torch.float16)
+        a.fill_(3.5)
+
+        old = os.environ.get("TORCH_SPYRE_DISABLE_AUTO_PIN")
+        os.environ["TORCH_SPYRE_DISABLE_AUTO_PIN"] = "1"
+        try:
+            a_cpu = a.cpu()
+        finally:
+            if old is None:
+                os.environ.pop("TORCH_SPYRE_DISABLE_AUTO_PIN", None)
+            else:
+                os.environ["TORCH_SPYRE_DISABLE_AUTO_PIN"] = old
+
+        self.assertFalse(a_cpu.is_pinned())
+        self.assertTrue(a_cpu.eq(3.5).all())
+
+    def test_to_copy_same_device_copy_flag(self):
+        values = (torch.arange(4096, dtype=torch.int64) % 31).to(torch.float16)
+        a = values.to("spyre")
+
+        same = a.to(device=a.device, dtype=a.dtype, copy=False)
+        self.assertIs(same, a)
+
+        copied = a.to(device=a.device, dtype=a.dtype, copy=True)
+        self.assertIsNot(copied, a)
+        torch.testing.assert_close(copied.cpu(), values, rtol=0, atol=0)
+
+    def test_to_cpu_copy_true_auto_pins(self):
+        values = (torch.arange(4096, dtype=torch.int64) % 31).to(torch.float16)
+        a = values.to("spyre")
+
+        a_cpu = a.to("cpu", copy=True)
+
+        self.assertTrue(a_cpu.is_pinned())
+        torch.testing.assert_close(a_cpu, values, rtol=0, atol=0)
+
+    def test_to_cpu_preserve_format_keeps_strides(self):
+        base = torch.arange(12, dtype=torch.float16, device="spyre").reshape(3, 4)
+        view = base.t()
+
+        out = view.to("cpu", copy=True, memory_format=torch.preserve_format)
+
+        self.assertEqual(out.stride(), view.stride())
+        self.assertEqual(out, torch.arange(12, dtype=torch.float16).reshape(3, 4).t())
+
+    def test_to_cpu_channels_last_memory_format(self):
+        cpu = (torch.arange(120, dtype=torch.int64) % 31).to(torch.float16)
+        cpu = cpu.reshape(2, 3, 4, 5)
+        a = cpu.to("spyre")
+
+        out = a.to("cpu", copy=True, memory_format=torch.channels_last)
+
+        self.assertTrue(out.is_contiguous(memory_format=torch.channels_last))
+        torch.testing.assert_close(out, cpu, rtol=0, atol=0)
+
     def test_empty_factory_in_device_context(self):
         # The error only repros if at least one allocation
         # has already happened
@@ -489,6 +731,23 @@ class TestSpyre(TestCase):
                 t.to(device="spyre")
         self.assertEqual(len(rec), 0)
 
+    @parametrize("dtype", [torch.int8, torch.float16])
+    def test_auto_pinned_copy_at_stick_boundary(self, dtype):
+        from torch_spyre._C import get_elem_in_stick
+
+        elems_per_stick = get_elem_in_stick(dtype)
+        element_size = torch.empty((), dtype=dtype).element_size()
+        min_elements = (4096 + element_size - 1) // element_size
+        aligned_elements = (
+            (min_elements + elems_per_stick) // elems_per_stick
+        ) * elems_per_stick
+
+        for size in [aligned_elements - 1, aligned_elements, aligned_elements + 1]:
+            values = (torch.arange(size, dtype=torch.int64) % 31).to(dtype)
+            actual = values.to("spyre").cpu()
+            self.assertTrue(actual.is_pinned())
+            torch.testing.assert_close(actual, values, rtol=0, atol=0)
+
     def test_allocation_and_copy_dtypes(self):
         # allocation and device to host cases
         for dtype in [
@@ -683,6 +942,18 @@ class TestSpyre(TestCase):
             sliced.cpu(),
             torch.tensor([0.0, 2.0, 4.0, 6.0, 8.0], dtype=torch.float16),
         )
+
+    def test_d2h_copy_of_square_transposed_view(self):
+        expected = torch.tensor([[1, 4, 7], [2, 5, 8], [3, 6, 9]], dtype=torch.float16)
+        base = torch.tensor(
+            [[1, 2, 3], [4, 5, 6], [7, 8, 9]],
+            dtype=torch.float16,
+            device="spyre",
+        )
+        transposed = base.as_strided((3, 3), (1, 3))
+        self.assertEqual(transposed.size(), base.size())
+        self.assertEqual(transposed.stride(), (1, 3))
+        self.assertEqual(transposed.cpu(), expected)
 
     def test_d2h_copy_of_transposed_view(self):
         """Transpose / column-major D2H must NOT be intercepted by the

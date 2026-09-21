@@ -53,9 +53,13 @@ void JobPlanStepD2H::construct(LaunchContext& ctx,
   if (std::holds_alternative<flex::CompositeAddress>(device_address_)) {
     const auto& device_address =
         std::get<flex::CompositeAddress>(device_address_);
-    auto* params =
-        flex::createDmaParams(host_address_, device_address.total_size(),
-                              /*to_device=*/false, &device_address);
+    TORCH_CHECK(device_address.total_size() == size_,
+                "D2H transfer size mismatch: device extent ",
+                device_address.total_size(), " bytes, host extent ", size_,
+                " bytes");
+    auto* params = flex::createDmaParamsWithHostCapacity(
+        host_address_, device_address.total_size(), /*to_device=*/false,
+        &device_address, size_);
     params->pipeline_barrier = pipeline_barrier_;
     stream.launchD2H(params);
     flex::destroyDmaParams(params);
@@ -84,9 +88,9 @@ void JobPlanStepD2H::construct(LaunchContext& ctx,
     auto device_address =
         std::make_shared<flex::CompositeAddress>(offset_chunk);
 
-    auto* params =
-        flex::createDmaParams(host_address_, device_address->total_size(),
-                              /*to_device=*/false, device_address.get());
+    auto* params = flex::createDmaParamsWithHostCapacity(
+        host_address_, device_address->total_size(), /*to_device=*/false,
+        device_address.get(), size_);
     params->pipeline_barrier = pipeline_barrier_;
     params->callback = [device_address](void*) {};
     stream.launchD2H(params);

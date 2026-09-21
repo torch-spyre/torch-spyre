@@ -21,9 +21,30 @@ import functools
 import inspect
 import operator
 import threading
-
+import os
 
 aten = torch.ops.aten
+
+# Phase 2 auto-pin: rollback switch for auto-pinning D2H (Spyre -> CPU)
+# destination tensors. Set TORCH_SPYRE_DISABLE_AUTO_PIN=1 to restore the
+# previous behavior (unpinned CPU destinations by default).
+_DISABLE_AUTO_PIN_ENV = "TORCH_SPYRE_DISABLE_AUTO_PIN"
+
+
+def _auto_pin_d2h_enabled() -> bool:
+    """Whether `.cpu()`/`.to("cpu")` on a Spyre tensor should default to a
+    pinned CPU destination. Enabled by default; disable via
+    TORCH_SPYRE_DISABLE_AUTO_PIN=1 for rollback."""
+    return os.environ.get(_DISABLE_AUTO_PIN_ENV, "0") == "0"
+
+
+# Below this size, the fixed cost of a page-aligned pinned allocation
+# (posix_memalign + zero-fill, bypassing the CPU allocator's pooling) tends
+# to outweigh the DMA throughput benefit -- e.g. the `.cpu()` roundtrip
+# behind `.item()`/`_local_scalar_dense`. Skip auto-pinning below this
+# threshold; callers that want pinned memory for a small tensor can still
+# pass `pin_memory=True` explicitly.
+_AUTO_PIN_MIN_BYTES = 4096
 
 
 # Decorator to keep track of compiled variant
@@ -560,7 +581,7 @@ def register_inplace_kernels(ops):
 register_inplace_kernels(COMPILED_OPS)
 
 
-@torch.library.register_kernel("aten::fill_.Scalar", ["spyre"])  # type:ignore
+@torch.library.register_kernel("aten::fill_.Scalar", ["spyre"])  # type: ignore
 def spyre__fill_scalar(
     self: torch.Tensor, other: int | float | bool | complex
 ) -> torch.Tensor:
@@ -570,7 +591,7 @@ def spyre__fill_scalar(
     return self
 
 
-@torch.library.register_kernel("aten::full", ["spyre"])  # type:ignore
+@torch.library.register_kernel("aten::full", ["spyre"])  # type: ignore
 def spyre_full(
     size: list | tuple,
     fill_value: int | float | bool | complex,
@@ -589,7 +610,7 @@ def spyre_full(
     return t
 
 
-@torch.library.register_kernel("aten::ones", ["spyre"])  # type:ignore
+@torch.library.register_kernel("aten::ones", ["spyre"])  # type: ignore
 def spyre_ones(
     size: list | tuple,
     *,
@@ -605,7 +626,7 @@ def spyre_ones(
     return t
 
 
-@torch.library.register_kernel("aten::normal_", ["spyre"])  # type:ignore
+@torch.library.register_kernel("aten::normal_", ["spyre"])  # type: ignore
 def spyre__normal_(self, mean=0.0, std=1.0, *, generator=None):
     # "normal_" generates a random tensor, thus copying
     # "self" back from SPYRE to CPU is not needed.
@@ -618,14 +639,14 @@ def spyre__normal_(self, mean=0.0, std=1.0, *, generator=None):
     return self
 
 
-@torch.library.register_kernel("aten::zero_", ["spyre"])  # type:ignore
+@torch.library.register_kernel("aten::zero_", ["spyre"])  # type: ignore
 def spyre__zero_(self: torch.Tensor) -> torch.Tensor:
     """Zero out the tensor in-place using device-side FillDMA."""
     fill_tensor(self, 0.0)
     return self
 
 
-@torch.library.register_kernel("aten::uniform_", "spyre")  # type:ignore
+@torch.library.register_kernel("aten::uniform_", "spyre")  # type: ignore
 def spyre__uniform_(self, from_=0.0, to=1.0, generator=None):
     # Create a new tensor on cpu
     cpu_tmp = torch.empty_like(self, device="cpu", memory_format=torch.preserve_format)
@@ -639,7 +660,7 @@ def spyre__uniform_(self, from_=0.0, to=1.0, generator=None):
     return self
 
 
-@torch.library.register_kernel("aten::random_.from", ["spyre"])  # type:ignore
+@torch.library.register_kernel("aten::random_.from", ["spyre"])  # type: ignore
 def spyre__random_from(self, from_=0, to=1, generator=None) -> torch.Tensor:
     # Create a new tensor on CPU.
     cpu_tmp = torch.empty_like(self, device="cpu", memory_format=torch.preserve_format)
@@ -654,6 +675,94 @@ def spyre__random_from(self, from_=0, to=1, generator=None) -> torch.Tensor:
 @torch.library.register_kernel("aten::_local_scalar_dense", "spyre")
 def spyre__local_scalar_dense(self):
     return self.cpu().item()
+
+
+@torch.library.register_kernel("aten::_to_copy", ["spyre"])
+def spyre__to_copy(
+    self,
+    *,
+    dtype=None,
+    layout=None,
+    device=None,
+    pin_memory=None,
+    non_blocking=False,
+    memory_format=None,
+    copy=None,
+):
+    """Backend override for `_to_copy` on Spyre-resident tensors.
+
+    This is the op behind `.cpu()`/`.to(...)` for a tensor that already
+    lives on Spyre (H2D allocation is unaffected -- it goes through
+    `spyre_empty`/`spyre_empty_strided` directly and never reaches here,
+    since `self` would be a CPU tensor in that case).
+
+    Upstream's default composite `_to_copy` (see
+    aten/src/ATen/native/TensorConversions.cpp) already auto-pins the CPU
+    destination for CUDA, but only when non_blocking and only for CUDA
+    tensors. We extend the same idea to the Spyre PrivateUse1 backend and
+    make it the default (not gated on non_blocking) to eliminate the D2H
+    throughput asymmetry: without this, `tensor.cpu()` allocates a
+    pageable buffer and DMA falls back to a much slower path than pinned
+    H2D transfers get.
+
+    Auto-pinning only kicks in when the caller did not explicitly request
+    a pin_memory setting, and can be rolled back process-wide via
+    TORCH_SPYRE_DISABLE_AUTO_PIN=1.
+    """
+    target_device = torch.device(device) if device is not None else self.device
+    target_dtype = dtype if dtype is not None else self.dtype
+    target_layout = layout if layout is not None else self.layout
+
+    auto_pin_requested = False
+    if target_device.type == "cpu":
+        if pin_memory is None and _auto_pin_d2h_enabled():
+            nbytes = self.numel() * self.element_size()
+            pin_memory = nbytes >= _AUTO_PIN_MIN_BYTES
+            auto_pin_requested = bool(pin_memory)
+        pin_memory = bool(pin_memory)
+    else:
+        pin_memory = False
+
+    def allocate_result(pin: bool):
+        if memory_format is None or memory_format == torch.preserve_format:
+            # Expanded tensors have stride-0 dimensions and cannot be copied
+            # directly into an identically-strided destination because multiple
+            # logical elements alias one storage location. Preserve strides only
+            # for layouts without internal overlap.
+            preserve_strides = torch._debug_has_internal_overlap(self) == 0
+            if preserve_strides:
+                return torch.empty_strided(
+                    self.size(),
+                    self.stride(),
+                    dtype=target_dtype,
+                    layout=target_layout,
+                    device=target_device,
+                    pin_memory=pin,
+                )
+            return torch.empty(
+                self.size(),
+                dtype=target_dtype,
+                layout=target_layout,
+                device=target_device,
+                pin_memory=pin,
+            )
+        return torch.empty(
+            self.size(),
+            dtype=target_dtype,
+            layout=target_layout,
+            device=target_device,
+            pin_memory=pin,
+            memory_format=memory_format,
+        )
+
+    try:
+        result = allocate_result(pin_memory)
+    except RuntimeError:
+        if not auto_pin_requested:
+            raise
+        result = allocate_result(False)
+    result.copy_(self, non_blocking=non_blocking)
+    return result
 
 
 @torch.library.register_kernel("aten::_copy_from", ["spyre"])
