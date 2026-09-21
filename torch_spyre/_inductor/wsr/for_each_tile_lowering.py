@@ -1228,9 +1228,26 @@ def splice_while_loops(graph) -> None:
                 group_ops, loop_var, hint_id, result.trip_count
             )
 
+            # decompose_scan_to_while_loop introduces a CPU loop-index counter
+            # alongside the real Spyre step counter.  After the splice its
+            # increment op is dead but still lives in group_ops.  Including it
+            # in the Spyre SDSC kernel group causes its CPU inputs to be passed
+            # as kernel arguments, which SpyreStream::launch rejects at runtime
+            # ("argument N must be on Spyre device, got cpu").  Filter those CPU
+            # ops out; they remain in graph.operations for dead-code elimination.
+            spyre_group_ops = [
+                op
+                for op in group_ops
+                if not (
+                    isinstance(op, ir.ComputedBuffer)
+                    and op.get_device() is not None
+                    and op.get_device().type == "cpu"
+                )
+            ]
+
             levels = [(hint_id, result.trip_count)]
             coarse_tile_pre_stickify(
-                graph, groups=[(group_ops, levels)], group_idx_offset=group_idx
+                graph, groups=[(spyre_group_ops, levels)], group_idx_offset=group_idx
             )
 
             group_idx += 1
