@@ -303,8 +303,18 @@ class _SpyreCompileFuture(CodeCacheFuture):
         if self._cache_key is not None:
             code_dir = commit_compile_dir(self._compile_dir, self._cache_key)
         # sdsc_bundle_dir_prefix selection:
-        # cached path  — first 16 hex chars of cache_key (64 bits).
-        # no-cache path — 8-char UUID prefix.
+        # cached path  — first 16 characters of cache_key (64 bits).
+        # Two distinct kernels sharing the same 16 character prefix
+        # is possible but extremely unlikely. With 64 bits of uniform entropy
+        # the birthday-paradox threshold is ~2^32 (~4 billion) kernels before
+        # the expected number of collisions reaches one. No realistic workload
+        # approaches that count, so a collision is negligible in practice.
+        #
+        # no-cache path — 8 character UUID hex prefix.
+        # 8 character prefix is sufficient due to the small number of ephemeral
+        # SDSC bundles compiled in one process run. Can use the (activity base name,
+        # 8-char UUID hex prefix) pair to uniquely identify the SDSC bundle directory
+        # associated with a kernel event.
         self._runner = SpyreSDSCKernelRunner(
             self._kernel_name,
             code_dir,

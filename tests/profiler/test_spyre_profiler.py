@@ -472,7 +472,7 @@ def test_sdsc_bundle_dir_prefix_in_kernel_event_args_with_cache(monkeypatch, tmp
 
     # Redirect the cache root to an isolated tmp_path so parallel runs don't collide.
     monkeypatch.setattr(kc, "get_cache_root_dir", lambda: str(tmp_path))
-    monkeypatch.setattr(ac.spyre_config, "spyre_kernel_cache", True)
+    monkeypatch.setattr(ac._spyre_config, "spyre_kernel_cache", True)
 
     x = torch.randn((10, 10), dtype=torch.float16, device="spyre")
 
@@ -537,7 +537,7 @@ def test_sdsc_bundle_dir_prefix_in_kernel_event_args_without_cache(
             dir=sdsc_bundle_dir_path, prefix=f"{sdsc_bundle_dir_prefix}_{kernel_name}_"
         )
 
-    monkeypatch.setattr(ac.spyre_config, "spyre_kernel_cache", False)
+    monkeypatch.setattr(ac._spyre_config, "spyre_kernel_cache", False)
     monkeypatch.setattr(ac, "get_output_dir", patched_get_output_dir)
 
     x = torch.randn((10, 10), dtype=torch.float16, device="spyre")

@@ -168,7 +168,7 @@ def test_async_cache_commit_is_deferred_until_wait():
         compiler.wait(scope)
 
     commit.assert_called_once_with("/tmp/key.tmp", "key")
-    assert scope["kernel"] == ("sdsc_0", "/cache/key", None, fake_symbol_kinds)
+    assert scope["kernel"] == ("sdsc_0", "/cache/key", None, fake_symbol_kinds, "key")
 
 
 def test_cache_hit_reloads_symbol_kinds_from_miss(tmp_path: Path):
@@ -298,6 +298,7 @@ def test_wait_drains_remaining_spyre_futures_after_failure():
             "/cache/key1",
             None,
             fake_symbol_kinds,
+            "key1"
         )
         assert [call.args[0] for call in move_failed.call_args_list] == [
             "/tmp/key0.tmp",
@@ -400,10 +401,10 @@ def test_cache_hit_runner_gets_16char_prefix():
     runners_created = []
 
     def record_runner(
-        name, code_dir, kernel_provenance=None, sdsc_bundle_dir_prefix=""
+        name, code_dir, kernel_provenance=None, symbol_kinds=None, sdsc_bundle_dir_prefix=None
     ):
         runners_created.append(sdsc_bundle_dir_prefix)
-        return (name, code_dir, kernel_provenance, sdsc_bundle_dir_prefix)
+        return (name, code_dir, kernel_provenance, symbol_kinds, sdsc_bundle_dir_prefix)
 
     with (
         spyre_config.patch({"spyre_kernel_cache": True}),
@@ -418,12 +419,14 @@ def test_cache_hit_runner_gets_16char_prefix():
         patch.object(
             async_compile_mod, "SpyreSDSCKernelRunner", side_effect=record_runner
         ),
+        patch.object(async_compile_mod, "save_symbol_kinds"),
+        patch.object(async_compile_mod, "load_symbol_kinds"),
     ):
         scope = {"kernel": compiler.sdsc("sdsc_0", [])}
 
         # Cache hit: runner created immediately inside sdsc(), no wait() needed
         assert runners_created == [cache_key[:16]]
-        assert scope["kernel"][3] == cache_key[:16]
+        assert scope["kernel"][4] == cache_key[:16]
 
 
 def test_cache_miss_async_runner_gets_16char_prefix():
@@ -436,10 +439,10 @@ def test_cache_miss_async_runner_gets_16char_prefix():
     runners_created = []
 
     def record_runner(
-        name, code_dir, kernel_provenance=None, sdsc_bundle_dir_prefix=""
+        name, code_dir, kernel_provenance=None, symbol_kinds=None, sdsc_bundle_dir_prefix=None
     ):
         runners_created.append(sdsc_bundle_dir_prefix)
-        return (name, code_dir, kernel_provenance, sdsc_bundle_dir_prefix)
+        return (name, code_dir, kernel_provenance, symbol_kinds, sdsc_bundle_dir_prefix)
 
     with (
         torch._inductor.config.patch({"compile_threads": 2}),
@@ -456,6 +459,8 @@ def test_cache_miss_async_runner_gets_16char_prefix():
             async_compile_mod, "commit_compile_dir", return_value="/cache/key"
         ),
         patch.object(async_compile_mod, "generate_bundle"),
+        patch.object(async_compile_mod, "save_symbol_kinds"),
+        patch.object(async_compile_mod, "load_symbol_kinds"),
         patch.object(async_compile_mod, "find_unimplemented", return_value=None),
         patch.object(
             async_compile_mod, "build_kernel_provenance_descriptor", return_value=None
@@ -474,7 +479,7 @@ def test_cache_miss_async_runner_gets_16char_prefix():
 
     # After wait(): prefix must be the first 16 chars of the cache key
     assert runners_created == [cache_key[:16]]
-    assert scope["kernel"][3] == cache_key[:16]
+    assert scope["kernel"][4] == cache_key[:16]
 
 
 def test_cache_miss_sync_runner_gets_16char_prefix():
@@ -486,10 +491,10 @@ def test_cache_miss_sync_runner_gets_16char_prefix():
     runners_created = []
 
     def record_runner(
-        name, code_dir, kernel_provenance=None, sdsc_bundle_dir_prefix=""
+        name, code_dir, kernel_provenance=None, symbol_kinds=None, sdsc_bundle_dir_prefix=None
     ):
         runners_created.append(sdsc_bundle_dir_prefix)
-        return (name, code_dir, kernel_provenance, sdsc_bundle_dir_prefix)
+        return (name, code_dir, kernel_provenance, symbol_kinds, sdsc_bundle_dir_prefix)
 
     with (
         torch._inductor.config.patch({"compile_threads": 1}),
@@ -503,6 +508,8 @@ def test_cache_miss_sync_runner_gets_16char_prefix():
             async_compile_mod, "commit_compile_dir", return_value="/cache/key"
         ),
         patch.object(async_compile_mod, "generate_bundle"),
+        patch.object(async_compile_mod, "save_symbol_kinds"),
+        patch.object(async_compile_mod, "load_symbol_kinds"),
         patch.object(async_compile_mod, "find_unimplemented", return_value=None),
         patch.object(
             async_compile_mod, "build_kernel_provenance_descriptor", return_value=None
@@ -517,7 +524,7 @@ def test_cache_miss_sync_runner_gets_16char_prefix():
         # Sync path: runner is created immediately, no wait() needed
         # prefix must be the first 16 chars of the cache key
         assert runners_created == [cache_key[:16]]
-        assert scope["kernel"][3] == cache_key[:16]
+        assert scope["kernel"][4] == cache_key[:16]
 
 
 def test_cache_disabled_async_runner_gets_8char_uuid():
@@ -530,10 +537,10 @@ def test_cache_disabled_async_runner_gets_8char_uuid():
     fake_uuid.hex = FIXED_UUID_HEX
 
     def record_runner(
-        name, code_dir, kernel_provenance=None, sdsc_bundle_dir_prefix=None
+        name, code_dir, kernel_provenance=None, symbol_kinds=None, sdsc_bundle_dir_prefix=None
     ):
         runners_created.append(sdsc_bundle_dir_prefix)
-        return (name, code_dir, kernel_provenance, sdsc_bundle_dir_prefix)
+        return (name, code_dir, kernel_provenance, symbol_kinds, sdsc_bundle_dir_prefix)
 
     with (
         torch._inductor.config.patch({"compile_threads": 2}),
@@ -562,7 +569,7 @@ def test_cache_disabled_async_runner_gets_8char_uuid():
     # After wait(): prefix must be the first 8 chars of the uuid prefix
     expected_prefix = FIXED_UUID_HEX[:8]
     assert runners_created == [expected_prefix]
-    assert scope["kernel"][3] == expected_prefix
+    assert scope["kernel"][4] == expected_prefix
 
 
 def test_cache_disabled_sync_runner_gets_8char_uuid():
@@ -576,10 +583,10 @@ def test_cache_disabled_sync_runner_gets_8char_uuid():
     fake_uuid.hex = FIXED_UUID_HEX
 
     def record_runner(
-        name, code_dir, kernel_provenance=None, sdsc_bundle_dir_prefix=""
+        name, code_dir, kernel_provenance=None, symbol_kinds=None, sdsc_bundle_dir_prefix=None
     ):
         runners_created.append(sdsc_bundle_dir_prefix)
-        return (name, code_dir, kernel_provenance, sdsc_bundle_dir_prefix)
+        return (name, code_dir, kernel_provenance, symbol_kinds, sdsc_bundle_dir_prefix)
 
     with (
         torch._inductor.config.patch({"compile_threads": 1}),
@@ -601,4 +608,4 @@ def test_cache_disabled_sync_runner_gets_8char_uuid():
         # prefix must be the first 8 chars of the uuid prefix
         expected_prefix = FIXED_UUID_HEX[:8]
         assert runners_created == [expected_prefix]
-        assert scope["kernel"][3] == expected_prefix
+        assert scope["kernel"][4] == expected_prefix
