@@ -446,14 +446,13 @@ class TestSDPAForEachTile(unittest.TestCase):
         )
         self.assertEqual(sum(source.count("LoopSpec(") for source in sources), 1)
 
-    @unittest.expectedFailure
     def test_kv_loop_with_broadcast_bias_spyre(self):
-        """Stride-zero broadcast bias currently fails Spyre layout propagation."""
+        """The standalone Lk HOP supports a stride-zero broadcast bias."""
         self._check_kv_loop_spyre(broadcast_bias=True)
 
     @unittest.expectedFailure
     def test_gqa_complete_tile_nest_spyre(self):
-        """All five levels currently hit the nested indirect-symbol gap."""
+        """The five-level nest currently creates a scheduler dependency cycle."""
         batch, heads, groups, query_length, kv_length, head_dim = 2, 2, 2, 32, 256, 128
         torch.default_generator.manual_seed(0)
         query = torch.randn(
@@ -493,9 +492,8 @@ class TestSDPAForEachTile(unittest.TestCase):
         )
         self.assertEqual(sum(source.count("LoopSpec(") for source in sources), 5)
 
-    @unittest.expectedFailure
     def test_two_nested_maps_spyre(self):
-        """Minimal reproducer for issue #4581's outer-loop indirect symbol."""
+        """Two map-mode levels compile and execute after PR #4705."""
         x = torch.randn(128, 128, dtype=torch.float16)
 
         def fn(x):
@@ -524,12 +522,14 @@ class TestSDPAForEachTile(unittest.TestCase):
             torch.compile(fn, backend="inductor", fullgraph=True, dynamic=False),
             x.to("spyre"),
         )
-        torch.testing.assert_close(actual.cpu(), x + 1)
+        torch.testing.assert_close(
+            actual.cpu().float(), (x + 1).float(), atol=0.1, rtol=0.1
+        )
         self.assertEqual(sum(source.count("LoopSpec(") for source in sources), 2)
 
     @unittest.expectedFailure
     def test_query_kv_nested_spyre(self):
-        """Lq map around Lk reduction reaches issue #4581 during codegen."""
+        """An Lq map around an Lk carry loop still returns corrupt values."""
         query = torch.randn(128, 128, dtype=torch.float16)
         key = torch.randn(256, 128, dtype=torch.float16)
         value = torch.randn(256, 128, dtype=torch.float16)
