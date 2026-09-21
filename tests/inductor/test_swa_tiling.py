@@ -14,13 +14,17 @@
 
 """CPU-only tests for sliding-window attention tiling selection."""
 
+import inspect
 import unittest
 
-from torch_spyre._inductor.decompositions import _select_swa_tiling
+from torch_spyre._inductor.decompositions import _select_swa_tiling, _windowed_attention
 
 
 class TestSWATiling(unittest.TestCase):
     _LX_BUDGET = 1_625_344
+
+    def test_windowed_attention_uses_no_spyre_hints(self):
+        self.assertNotIn("spyre_hint(", inspect.getsource(_windowed_attention))
 
     def _select(
         self,

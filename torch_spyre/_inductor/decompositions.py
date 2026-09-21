@@ -1709,8 +1709,10 @@ def _windowed_attention(
     """Blocked online attention over each query block's physical KV window.
 
     Query blocks remain static because each one has a separately planned cache
-    window. Within a block, batch, head, GQA-group, and K/V traversal are
-    represented structurally with ``for_each_tile`` rather than ``spyre_hint``.
+    window. Within a block, K/V traversal is represented structurally with
+    ``for_each_tile`` rather than ``spyre_hint``. Batch, head, GQA-group, and
+    query work division are left to the compiler, which avoids staging a full
+    cache window in an outer loop before the inner K/V slice is formed.
     Functional SSA carries match ``spyre__sdpa_overrideable``; a mutation-based
     ``copy_forced`` carry is not tile-safe when the output row spans multiple
     sticks (Gemma's head_dim=256).
@@ -1771,23 +1773,6 @@ def _windowed_attention(
     )
     finite_min = torch.finfo(storage_dtype).min
     positive_min = torch.finfo(storage_dtype).tiny
-
-    def map_tiles(body, operands, dims, tile_size, out_dim):
-        sliced_operand, sliced_dim = next(
-            (operand, dim) for operand, dim in zip(operands, dims) if dim is not None
-        )
-        if sliced_operand.size(sliced_dim) == tile_size:
-            _, result = body(None, operands)
-            return result
-        _, result = for_each_tile(
-            body,
-            operands,
-            dims=dims,
-            tile_size=tile_size,
-            out_dim=out_dim,
-        )
-        return result
-
     out_blocks = []
     num_q_blocks = padded_seqlen_q // q_block
     for block_index in range(num_q_blocks):
@@ -1817,9 +1802,6 @@ def _windowed_attention(
         mask_window = mask_rows[..., read_start : read_start + buffer_width]
 
         q_rows = query[..., q_start:q_end, :]
-
-        def mask_dim(axis, extent):
-            return axis if mask_window.size(axis) == extent else None
 
         def kv_level(q_tile, k_tile, v_tile, mask_tile):
             if use_gqa:
@@ -1895,40 +1877,7 @@ def _windowed_attention(
             safe_denominator = torch.clamp_min(denominator, positive_min)
             return output_tile / safe_denominator.unsqueeze(-1)
 
-        def group_level(q_tile, k_tile, v_tile, mask_tile):
-            if not use_gqa:
-                return kv_level(q_tile, k_tile, v_tile, mask_tile)
-            operands = (q_tile, k_tile, v_tile, mask_tile)
-            dims = (2, None, None, mask_dim(2, gqa_group_size))
-
-            def body(_, tiles):
-                return None, kv_level(*tiles)
-
-            return map_tiles(body, operands, dims, 1, 2)
-
-        def head_level(q_tile, k_tile, v_tile, mask_tile):
-            head_extent = num_kvheads if use_gqa else num_heads
-            head_tile_size = (
-                1 if use_gqa else num_heads // max(1, tiling.num_head_tiles)
-            )
-            operands = (q_tile, k_tile, v_tile, mask_tile)
-            dims = (1, 1, 1, mask_dim(1, head_extent))
-
-            def body(_, tiles):
-                return None, group_level(*tiles)
-
-            return map_tiles(body, operands, dims, head_tile_size, 1)
-
-        batch_size = query.size(0)
-        batch_tile_count = _sdpa_num_batch_tiles(batch_size)
-        batch_tile_size = batch_size // batch_tile_count
-        operands = (q_rows, k_window, v_window, mask_window)
-        dims = (0, 0, 0, mask_dim(0, batch_size))
-
-        def batch_body(_, tiles):
-            return None, head_level(*tiles)
-
-        out_blocks.append(map_tiles(batch_body, operands, dims, batch_tile_size, 0))
+        out_blocks.append(kv_level(q_rows, k_window, v_window, mask_window))
 
     output = torch.cat(out_blocks, dim=-2)
     return output.flatten(1, 2) if use_gqa else output
