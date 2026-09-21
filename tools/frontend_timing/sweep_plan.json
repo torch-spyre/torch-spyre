@@ -1,0 +1,20 @@
+{
+  "note": "Default frontend-compile sweep. One entry per point; every key but 'workload' is passed to the workload builder. Each family holds all dimensions still except one, so a point series isolates a single scaling axis. Shapes only -- no measured times. transformer_block and mlp carry Llama-3.1-8B's dimensions (hidden 4096, 32 heads of 128, intermediate 14336) as captured in tests/resource/models.",
+  "points": [
+    {"workload": "transformer_block", "S": 1, "E": 4096, "heads": 32, "intermediate": 14336},
+    {"workload": "transformer_block", "S": 128, "E": 4096, "heads": 32, "intermediate": 14336},
+    {"workload": "transformer_block", "S": 512, "E": 4096, "heads": 32, "intermediate": 14336},
+    {"workload": "transformer_block", "S": 1024, "E": 4096, "heads": 32, "intermediate": 14336},
+    {"workload": "transformer_block", "S": 2048, "E": 4096, "heads": 32, "intermediate": 14336},
+    {"workload": "transformer_block", "S": 512, "E": 5120, "heads": 40, "intermediate": 16384},
+
+    {"workload": "mlp", "seq_len": 512, "emb_dim": 4096, "intermediate": 14336, "layers": 1},
+    {"workload": "mlp", "seq_len": 512, "emb_dim": 4096, "intermediate": 14336, "layers": 2},
+    {"workload": "mlp", "seq_len": 512, "emb_dim": 4096, "intermediate": 14336, "layers": 4},
+
+    {"workload": "flash", "B": 1, "H": 32, "Lq": 512, "Lk": 512, "D": 128, "block_size": 128},
+    {"workload": "flash", "B": 1, "H": 32, "Lq": 512, "Lk": 1024, "D": 128, "block_size": 128},
+
+    {"workload": "control_flow", "M": 8, "K": 12, "N": 6, "tile": 2}
+  ]
+}
