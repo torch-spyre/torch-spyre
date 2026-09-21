@@ -63,7 +63,8 @@ import collections
 import dataclasses
 import enum
 import logging
-from typing import NamedTuple
+from collections.abc import Collection
+from typing import NamedTuple, Optional
 
 import sympy
 from sympy import Expr
@@ -3001,6 +3002,7 @@ def coarse_tile_post_stickify(
     groups: list[tuple],
     group_idx_offset: int = 0,
     run_read_copies: bool = False,
+    staged_reads: Optional[Collection[tuple[str, str]]] = None,
 ) -> None:
     """Span-overflow coarse tiling.  Runs POST-stickification.
 
@@ -3031,8 +3033,9 @@ def coarse_tile_post_stickify(
         in LX is an operand the loop reads from LX instead of HBM, where the
         source it stands in for could not have been resident at all (the
         backend cannot address an LX tensor that advances per iteration). Until
-        something places it the switch stays off, because a staged HBM tile
-        replaces a source read with a write plus a read of the same size. Under joint core-division and LX
+        caller passes ``staged_reads`` naming what it placed, so a copy is
+        never built in HBM, where it would cost a write and a read to save
+        nothing. Under joint core-division and LX
         planning the copy's address is one of the things being solved for, so a
         tile-sized staging buffer the solver may put in LX is an HBM->LX copy of
         an operand the loop would otherwise re-read from HBM once per iteration
@@ -3051,7 +3054,7 @@ def coarse_tile_post_stickify(
         # A caller reaching this entry point with staging on is doing it for
         # traffic: its layouts are already committed, so nothing here is owed a
         # copy to be representable.
-        read_copies_are_optional=run_read_copies,
+        staged_reads=staged_reads,
     )
 
 
@@ -3060,7 +3063,7 @@ def _coarse_tile_common(
     groups: list[tuple],
     group_idx_offset: int,
     run_read_copies: bool,
-    read_copies_are_optional: bool = False,
+    staged_reads: Optional[Collection[tuple[str, str]]] = None,
 ) -> None:
     """Plan then transform: stamp loop_group_id / loop_count and scale ranges.
 
@@ -3070,9 +3073,8 @@ def _coarse_tile_common(
     coarse_tile_pre_stickify/coarse_tile_post_stickify for the two public
     entry points that call this.
 
-    read_copies_are_optional says the caller stages to save traffic rather
-    than to make its tiling representable, so Pass 1 may drop a read whose
-    copy would not pay -- see _plan_read_copies.
+    staged_reads restricts Pass 1 to the (source, sizing op) pairs a planner
+    decided to place; None stages every read found -- see _plan_read_copies.
     """
     operations = graph.operations
 
@@ -3125,7 +3127,7 @@ def _coarse_tile_common(
             operations,
             retiled_infos_by_group,
             predivision_unit_steps_by_op,
-            shared_reads_only=read_copies_are_optional,
+            staged_reads=staged_reads,
         )
         _insert_all_read_copy_ops(operations, read_copy_plans)
 
@@ -5866,20 +5868,21 @@ def _plan_read_copies(
         tuple[tuple[tuple[tuple[int, Expr, Expr], ...], ...], ...],
     ]
     | None = None,
-    shared_reads_only: bool = False,
+    staged_reads: Optional[Collection[tuple[str, str]]] = None,
 ) -> dict[tuple[int, ...], ReadCopyPlan]:
     """Plan Pass 1's read-copy sharing, with zero mutation.
 
-    ``shared_reads_only`` drops any read the group makes just once. A caller is
-    obliged to stage pre-stickification, where the copy reconciles a
+    ``staged_reads`` names the ``(source, sizing op)`` pairs to stage, and
+    ``None`` -- the pre-stickify caller -- stages every read it finds. A caller
+    *is* obliged to stage pre-stickification, where the copy reconciles a
     full-buffer layout with a tile-sized consumer's and dropping it would lose
-    the tiling. Post-stickification it is a choice, and a single read gains
-    nothing by it: the copy this pass builds sits inside the counted loop -- a
-    hoisted one needs a loop-invariant read, which is exactly the shape
-    :func:`_read_copy_can_be_sized` refuses here -- so the staged tile moves
-    the bytes the direct read moved, plus a write. Two or more reads sharing
-    one staged tile is where it can turn a profit, and only once the copy
-    itself can be LX-resident.
+    the tiling. Post-stickification it is a choice, and the choice is not this
+    pass's to make: a staged tile pays only by being LX-resident, since the copy
+    built here sits inside the counted loop (a hoisted one needs a
+    loop-invariant read, which is exactly the shape
+    :func:`_read_copy_can_be_sized` refuses) and so moves the bytes the direct
+    read moved, plus a write. Whether it can be resident is the planner's
+    decision, so the planner passes the pairs it placed.
 
     For each group, collects every ComputedBuffer op's
     _full_buffer_read_deps and groups equivalent reads (same buffer name,
@@ -5950,8 +5953,23 @@ def _plan_read_copies(
                 )
                 keyed.setdefault(key, []).append((op, dep))
 
-        if shared_reads_only:
-            keyed = {key: op_deps for key, op_deps in keyed.items() if len(op_deps) > 1}
+        if staged_reads is not None:
+            # op_deps is sorted into operations order below, so the pair is
+            # keyed on the first reader -- the same op the entry will name as
+            # its sizing op.
+            wanted = set(staged_reads)
+            keyed = {
+                key: op_deps
+                for key, op_deps in keyed.items()
+                if (
+                    key[0],
+                    min(
+                        op_deps,
+                        key=lambda pair: op_position[pair[0].get_operation_name()],
+                    )[0].get_name(),
+                )
+                in wanted
+            }
 
         entries: list[ReadCopyEntry] = []
         for n, (key, op_deps) in enumerate(keyed.items()):

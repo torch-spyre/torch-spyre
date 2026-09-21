@@ -78,6 +78,7 @@ from torch_spyre._inductor.scratchpad.permutation_layout import (
 from cooptimization_capture_loader import load_captures
 from torch_spyre._inductor.scratchpad.plan_solver import (
     BufferType,
+    CoarseTileReadCopyBuffer,
     CoreDivision,
     CoreDivisionBuffer,
     TileAxis,
@@ -1392,6 +1393,101 @@ class ConfigStateTest(TestCase):
                     config.division,
                     f"{case}[{gi}] {buf.name}",
                 )
+
+
+def _read_copy(source, reader, reader_index, reads=2, size=1024):
+    return CoarseTileReadCopyBuffer(
+        name=f"__spyre_coarse_tile__:read:{source}:{reader}",
+        size=size,
+        uses=[0, 1],
+        first_use_is_read=False,
+        in_place_parents=[],
+        residency_reason=None,
+        core_divisions=[CoreDivision()],
+        parents=[],
+        cd_parent_matches={},
+        boundary=BufferType.Intermediate,
+        source=source,
+        reader=reader,
+        reader_index=reader_index,
+        reads=reads,
+    )
+
+
+class StagedReadCopyTest(TestCase):
+    """A predicted staging copy is a buffer the solver places, sized and gated
+    on its READER's config rather than its own.
+
+    It exists because the source it stands in for may not be resident while a
+    tiled op reads it (:meth:`_read_across_a_tiling_boundary`) -- the address
+    moves and an LX address cannot. The copy holds one tile at a fixed address,
+    so it can be, and the residency it wins back is the whole point of it.
+    """
+
+    def _solver(self, reads=2):
+        reader = _two_axis_buffer(name="R")
+        reader.division_space = _two_axis_space(tiling=_tiling_space())
+        source = _two_axis_buffer(name="S")
+        copy = _read_copy("S", "R", reader_index=0, reads=reads)
+        return _primed_topology([reader, source, copy])
+
+    def test_it_is_sized_against_the_readers_tiling(self):
+        solver = self._solver()
+        solver.chosen[0] = _config(CoreDivision({_AXIS_0: 2}, tiling=_TILE_4))
+        # 1024 bytes over the reader's 2 cores and 4 tiles.
+        self.assertEqual(solver._per_core_size(2, solver.chosen[2]), 128)
+        solver.chosen[0] = _config(CoreDivision({_AXIS_0: 2}, tiling=_TILE_2))
+        self.assertEqual(solver._per_core_size(2, solver.chosen[2]), 256)
+
+    def test_an_untiled_reader_leaves_it_absent(self):
+        # Nothing to stage, so the slot is held at zero and ineligible -- the
+        # shape stage 5 settled on for a companion that does not exist.
+        solver = self._solver()
+        solver.chosen[0] = _config(CoreDivision({_AXIS_0: 2}))
+        self.assertEqual(solver._per_core_size(2, solver.chosen[2]), 0)
+        self.assertFalse(solver._eligible(2))
+
+    def test_a_tiled_reader_makes_it_eligible(self):
+        solver = self._solver()
+        solver.chosen[0] = _config(CoreDivision({_AXIS_0: 2}, tiling=_TILE_2))
+        self.assertTrue(solver._eligible(2))
+
+    def test_the_saving_is_over_the_reads_it_replaces_beyond_the_first(self):
+        """The copy op makes one HBM pass over the source whatever happens, so
+        ``r`` reads become one pass plus ``r`` LX reads -- a saving of
+        ``(r - 1) * size``, and only while the copy holds an address."""
+        solver = self._solver(reads=3)
+        solver.chosen[0] = _config(CoreDivision({_AXIS_0: 2}, tiling=_TILE_2))
+        self.assertEqual(solver._read_copy_savings([None, None, 0]), 2 * 1024)
+        self.assertEqual(solver._read_copy_savings([None, None, None]), 0)
+
+    def test_it_carries_no_division_decision(self):
+        # Pinned to one no-op division, so it is in neither move set -- which is
+        # also why it must not buy the anneal more steps.
+        solver = self._solver()
+        self.assertNotIn(2, solver._flippable())
+        self.assertNotIn(2, solver._anchor_candidates)
+
+    def test_the_step_budget_counts_decisions_not_slots(self):
+        solver = self._solver()
+        self.assertEqual(
+            sum(not isinstance(b, CoarseTileReadCopyBuffer) for b in solver._bufs),
+            2,
+        )
+        self.assertEqual(len(solver._bufs), 3)
+
+    def test_a_flip_resizes_and_regates_the_readers_copies(self):
+        """The copy's size and existence follow the reader's config, so a move
+        on the reader has to ripple to it -- it is in no parent/child edge, so
+        the ordinary ripple would miss it."""
+        solver = self._solver()
+        solver.chosen[0] = _config(CoreDivision({_AXIS_0: 2}, tiling=_TILE_2))
+        solver.packer.resize(2, solver._per_core_size(2, solver.chosen[2]))
+        solver.packer.set_eligible(2, True)
+        self.assertEqual(solver._read_copies_of[0], [2])
+        solver._atomic_flip(0, _config(CoreDivision({_AXIS_0: 2})))
+        self.assertEqual(solver._per_core_size(2, solver.chosen[2]), 0)
+        self.assertFalse(solver._eligible(2))
 
 
 class ConfigDeclarationTest(TestCase):

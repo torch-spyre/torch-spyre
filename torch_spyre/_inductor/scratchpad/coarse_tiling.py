@@ -30,7 +30,8 @@ ops that share a spec.
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
+from typing import Optional
 
 import sympy
 
@@ -207,10 +208,15 @@ class CoarseTilingPass(ScratchpadOptimizationPass):
     """
 
     def __init__(
-        self, choices: Mapping[str, TileSpec], read_copies: bool = False
+        self,
+        choices: Mapping[str, TileSpec],
+        staged_reads: Optional[Collection[tuple[str, str]]] = None,
     ) -> None:
         self._choices = dict(choices)
-        self._read_copies = read_copies
+        # ``(source, sizing op)`` pairs a planner placed a staging copy for.
+        # ``None`` runs no read copies at all: an unplaced copy lands in HBM,
+        # where it costs a write and a read to save nothing.
+        self._staged_reads = staged_reads
 
     def _stamped_groups(self, graph: GraphLowering) -> list[tuple]:
         """Derive the groups and stamp each member's ``dim_hints``.
@@ -284,5 +290,6 @@ class CoarseTilingPass(ScratchpadOptimizationPass):
             graph,
             groups=groups,
             group_idx_offset=group_idx_offset,
-            run_read_copies=self._read_copies,
+            run_read_copies=self._staged_reads is not None,
+            staged_reads=self._staged_reads,
         )

@@ -18,7 +18,7 @@ import math
 import time
 from abc import ABC, abstractmethod
 from collections import defaultdict
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import replace
 from typing import Any, Callable, cast, NamedTuple, Optional
 
@@ -70,6 +70,9 @@ from torch_spyre._inductor.wsr.enumerate_tilings import build_tiling_space
 from torch_spyre._inductor.scratchpad.plan_solver import (
     ceil_div,
     cost_expr_record,
+    coarse_tile_read_copy_name,
+    COARSE_TILE_READ_COPY_PREFIX,
+    CoarseTileReadCopyBuffer,
     CoreDivision,
     CoreDivisionBuffer,
     CoreDivisionLayoutSolver,
@@ -1431,7 +1434,9 @@ class ScratchpadAllocator:
         graph_editor = GraphEditor(graph)
 
         for b in buffers:
-            if b.address is None or b.name.startswith("__spyre_lx_relayout__:"):
+            if b.address is None or b.name.startswith(
+                ("__spyre_lx_relayout__:", COARSE_TILE_READ_COPY_PREFIX)
+            ):
                 continue
 
             buf = graph.get_buffer(b.name)
@@ -2024,6 +2029,12 @@ class _DivisionMap(NamedTuple):
     enumerated: set[str]
 
 
+#: Prefix ``coarse_tile`` gives a staged read copy it mints (Pass 1). Matched
+#: here rather than imported so the allocator does not depend on that module at
+#: import time; ``coarse_tile`` tests the same prefix the same way.
+_READ_COPY_PREFIX = "coarse_tile_read_copy_"
+
+
 class CoOptimizingAllocator(ScratchpadAllocator):
     def __init__(
         self,
@@ -2289,6 +2300,10 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         # pull the selected core division from the dependent buffers when the graph
         # is updated with clones in ``_push_allocation``.
         self._commit_divisions(graph, allocation)
+        # After the commit, and before the views below are derived from it: a
+        # staged read copy is not in ``allocation``, so nothing above gave it a
+        # division and it would be judged against its reader's as a mismatch.
+        self._commit_staged_read_copy_divisions(graph, allocation)
         # A solver-fired relayout source stays resident under ITS committed view
         # while the consumer it feeds will read the shuffled copy under another.
         # The judge runs on the pre-materialization graph, where that consumer
@@ -2301,10 +2316,18 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             plan.source_name: plan.source_view for plan in accepted_lx_relayouts
         }
         _, reasons, views = get_ncores_for_buffers(graph)
+        # Before the loop below, which walks the buffers the solve placed: a
+        # staged read copy is not among them (the apply created it) and needs
+        # the views this call just built.
+        self._stamp_staged_read_copies(graph, allocation, views)
         for buffer in allocation:
-            # A relayout copy is not a graph buffer: materialize_lx_relayouts
-            # creates its destination, carrying the plan's view.
-            if buffer.address is None or isinstance(buffer, RelayoutCopyBuffer):
+            # Neither synthetic buffer is a graph buffer: materialize_lx_relayouts
+            # creates a relayout copy's destination (carrying the plan's view),
+            # and a coarse-tile read copy is created by the apply, which stamps
+            # its own view (_stamp_read_copy_allocations).
+            if buffer.address is None or isinstance(
+                buffer, (RelayoutCopyBuffer, CoarseTileReadCopyBuffer)
+            ):
                 continue
             view = source_views.get(buffer.name) or views.get(buffer.name)
             if view is None:
@@ -2516,14 +2539,20 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         # from this module, so a top-level import would be circular.
         from torch_spyre._inductor.scratchpad.coarse_tiling import CoarseTilingPass
 
-        # Read copies stay off until something can place the copy. Measured:
-        # the copy this route builds is minted in ``_post_solve``, after the
-        # addresses are final, so it lands in HBM -- and a staged HBM tile
-        # replaces a source read with a write plus a read of the same size.
-        # It pays only once the copy itself can be LX-resident, which is what
-        # makes ``CoarseTilingPass``'s switch a parameter rather than a
-        # constant.
-        tiling_pass = CoarseTilingPass(choices)
+        # Stage exactly the reads whose predicted copy the solve placed. A
+        # staged tile pays only by being resident -- unplaced it would land in
+        # HBM and cost a write and a read to save nothing -- so the residency
+        # decision and the decision to stage are the same decision, made once,
+        # here. The addresses are final at this point and not yet on the
+        # layouts (``_push_allocation`` runs after), which is why they are read
+        # off the buffers.
+        placed = {
+            buffer.pair
+            for buffer in allocation
+            if isinstance(buffer, CoarseTileReadCopyBuffer)
+            and buffer.address is not None
+        }
+        tiling_pass = CoarseTilingPass(choices, staged_reads=placed)
         tiling_pass.plan_only(graph)
         tiling_pass.apply_pass(graph)
         # These ops' tilings and divisions were chosen together by one solve, so
@@ -2540,6 +2569,174 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             ", ".join(f"{name}={spec.label}" for name, spec in sorted(choices.items())),
         )
         return tiled
+
+    def _commit_staged_read_copy_divisions(
+        self,
+        graph: GraphLowering,
+        allocation: Sequence[CoreDivisionBuffer],
+    ) -> None:
+        """Give each staged read copy its reader's core division.
+
+        The copy is minted by the apply, so ``_commit_divisions`` never sees it
+        and it keeps whatever ``_distribute_work`` left -- typically all 32
+        cores, while its reader may have committed to one. ``get_ncores_for_buffers``
+        then reports a core-division mismatch and withholds the physical
+        ownership residency needs, so the copy cannot be placed however the
+        solve decided. Measured: without this the stamp below raises "no
+        accepted physical ownership" on the first copy it tries.
+
+        The reader's splits are mapped onto the copy's own iteration symbols
+        **positionally**. That is sound for exactly the reads this route stages:
+        ``_read_copy_can_be_sized`` admits a read only where the source's
+        non-unit dims and the reader's iteration extents correspond one to one,
+        which is the same correspondence being used here. A read outside that
+        class is never staged, so there is no case where the two frames differ.
+        """
+        placed = {
+            buffer.pair: buffer
+            for buffer in allocation
+            if isinstance(buffer, CoarseTileReadCopyBuffer)
+            and buffer.address is not None
+        }
+        if not placed:
+            return
+        by_name = {b.name: b for b in allocation}
+        for op, _source, readers in self._staged_read_copies(graph):
+            if not readers:
+                continue
+            reader = by_name.get(readers[0])
+            if reader is None or reader.chosen_division is None:
+                continue
+            splits = reader.core_divisions[reader.chosen_division].splits
+            symbols = list(iteration_space_from_op(op))
+            reader_op = graph.get_buffer(reader.name)
+            reader_symbols = list(iteration_space_from_op(reader_op))
+            mapped = {
+                symbols[position]: factor
+                for position, source_symbol in enumerate(reader_symbols)
+                if position < len(symbols)
+                and (factor := splits.get(source_symbol, 1)) > 1
+            }
+            commit_iteration_space_ownership(op, mapped)
+
+    @staticmethod
+    def _staged_read_copies(
+        graph: GraphLowering,
+    ) -> list[tuple[Operation, Optional[str], list[str]]]:
+        """``(copy op, the buffer it stages, the ops reading it)`` for every read
+        copy the apply minted, readers in operations order.
+
+        Identified by name prefix and then by dependency rather than by a plan
+        the pass hands back: the copy's one read names its source, and the ops
+        reading the copy are the consumers Pass 1 patched. That pair is what the
+        prediction was keyed on, so it is what joins the two.
+        """
+        minted = [
+            op
+            for op in graph.operations
+            if str(getattr(op, "name", "")).startswith(_READ_COPY_PREFIX)
+        ]
+        minted_names = {op.name for op in minted}
+        readers_of: dict[str, list[str]] = {}
+        source_of: dict[str, Optional[str]] = {}
+        for op in graph.operations:
+            name = getattr(op, "name", None)
+            if name is None:
+                continue
+            try:
+                reads = [
+                    dep
+                    for dep in op.get_read_writes().reads
+                    if isinstance(dep, MemoryDep)
+                ]
+            except Exception:  # noqa: BLE001 - best-effort match
+                continue
+            if name in minted_names:
+                sources = {dep.name for dep in reads}
+                source_of[name] = next(iter(sources)) if len(sources) == 1 else None
+            for dep in reads:
+                if dep.name in minted_names:
+                    readers_of.setdefault(dep.name, []).append(name)
+        return [
+            (op, source_of.get(op.name), readers_of.get(op.name, [])) for op in minted
+        ]
+
+    def _stamp_staged_read_copies(
+        self,
+        graph: GraphLowering,
+        allocation: Sequence[CoreDivisionBuffer],
+        views: Mapping[str, Any],
+    ) -> None:
+        """Give each staged read copy the LX address the solve reserved for it.
+
+        The copy is created by the apply, in ``_post_solve``, so it is not in
+        the ``allocation`` sequence ``_push_allocation`` walks and would
+        otherwise land in HBM however the solve decided -- which is exactly the
+        ordering that makes a companion unplaceable. What is placed is the
+        *predicted* buffer (:class:`CoarseTileReadCopyBuffer`), and this is
+        where the two are joined.
+
+        Matched by ``(source, first reader)`` rather than by name, since the
+        minted buffer is named by Inductor: the copy's one read names the
+        source, and the ops reading the copy are the consumers Pass 1 patched,
+        the first of which is the entry's own sizing op. That is the same pair
+        the placement was handed to ``CoarseTilingPass`` under, so a copy with
+        no prediction is a break between the two and raises rather than
+        silently keeping an HBM copy nothing priced.
+
+        The footprint check is :meth:`_check_priced_footprints`' argument in the
+        other direction: an applied footprint *larger* than the reserved one
+        means the LX interval spaced for this copy is too small and the bytes
+        above it belong to whatever was packed next.
+        """
+        placed = {
+            buffer.pair: buffer
+            for buffer in allocation
+            if isinstance(buffer, CoarseTileReadCopyBuffer)
+            and buffer.address is not None
+        }
+        if not placed:
+            return
+        for op, source, readers in self._staged_read_copies(graph):
+            pair = (source, readers[0]) if source and readers else None
+            buffer = placed.get(pair) if pair is not None else None
+            if buffer is None:
+                raise Unsupported(
+                    f"{op.name}: the apply staged a read of {source!r} for "
+                    f"{readers[:1]} that the solve placed no copy for, so it "
+                    "would sit in HBM unpriced"
+                )
+            layout = graph.get_buffer(op.name).get_layout()
+            device_layout = getattr(layout, "device_layout", None)
+            reader = next(b for b in allocation if b.name == buffer.reader)
+            assert reader.chosen_division is not None
+            chosen = reader.core_divisions[reader.chosen_division]
+            reserved = ceil_div(
+                buffer.size,
+                chosen.output_partition * chosen.tiling.output_tile_count,
+            )
+            if device_layout is not None:
+                applied = ceil_div(
+                    get_device_size_in_bytes(device_layout), chosen.output_partition
+                )
+                if applied > reserved:
+                    raise Unsupported(
+                        f"{op.name}: staged read copy of {source} reserved "
+                        f"{reserved} bytes per core but the applied graph needs "
+                        f"{applied}; its LX interval is too small"
+                    )
+            address = buffer.address
+            assert address is not None  # `placed` filtered on it
+            self._set_one_allocation(
+                graph.get_buffer(op.name), address, views.get(op.name)
+            )
+            logger.debug(
+                "staged read copy %s (%s -> %s) placed in LX at %d",
+                op.name,
+                source,
+                buffer.reader,
+                address,
+            )
 
     def _check_priced_footprints(
         self,
@@ -2967,7 +3164,144 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                 buffer.division_space = self._division_space(op, buffer)
             buffers.append(buffer)
         buffers.extend(self._relayout_copy_buffers(buffers, self.size))
+        buffers.extend(self._coarse_tile_read_copies(graph, buffers))
         return buffers
+
+    def _coarse_tile_read_copies(
+        self,
+        graph: GraphLowering,
+        buffers: Sequence[CoreDivisionBuffer],
+    ) -> list[CoarseTileReadCopyBuffer]:
+        """One :class:`CoarseTileReadCopyBuffer` per (source, tileable reader)
+        pair the apply could stage, minted here so the solve can place it.
+
+        The apply mints its copies in ``_post_solve``, after the addresses are
+        final, so a copy it creates can only ever be in HBM -- and an HBM staging
+        tile is strictly worse than the read it replaces. Predicting the copy
+        here is what lets its residency be one of the things the solve decides,
+        and residency is the whole point of it: the source itself may not be
+        resident while a tiled op reads it (see
+        ``SaCoOptimizingSolver._read_across_a_tiling_boundary``), and this copy
+        is the same operand at an address that does not move.
+
+        **Predicted per (source, reader), not per group.** Which ops share one
+        staged copy is a property of the tiling groups, which do not exist yet.
+        The apply stages a read only where *its own* sizing op's copy was placed,
+        so a pair the solve declined costs nothing, and a group whose sizing op
+        is not the placed reader leaves that reservation unused. Over-reserving
+        is the safe direction: a copy the search assumed and the apply does not
+        mint wastes LX, while one the apply mints and the search did not assume
+        overruns it.
+
+        **``reads`` is counted over the maximal contiguous run of tileable ops**
+        containing the reader, which is an upper bound on the group the apply
+        will form (stage 4 makes every group a contiguous run of tileable ops,
+        so a group is a sub-run of this one). It is an upper bound rather than
+        the reader's own count because that count is 1 in the case this exists
+        for -- two ops of a run each reading the same operand once -- where the
+        saving is real and a per-op count would price it at zero. The bound is
+        loose in the other direction, so a placed copy can save less than it
+        scored; that is a mispricing of the same kind as ``_companion_bytes``'s
+        own two, and it is bounded by the run length.
+
+        Three static filters, all of them the apply's own: the reader must be
+        tileable, the read must be one ``_full_buffer_read_deps`` would offer (a
+        non-indirect ``MemoryDep`` on a buffer this op does not produce), and the
+        copy must be sizable against the source's committed layout
+        (``_read_copy_can_be_sized``), which refuses every broadcast and matmul
+        operand -- the class ``TODO(span-overflow-read-copy)`` covers.
+        """
+        if not self._solver_chooses_tilings:
+            return []
+        from torch_spyre._inductor.wsr.coarse_tile import _read_copy_can_be_sized
+
+        by_name = {b.name: b for b in buffers}
+        op_by_name = {op.name: op for op in graph.operations if hasattr(op, "name")}
+
+        def tileable(buffer: CoreDivisionBuffer) -> bool:
+            space = buffer.division_space
+            return (
+                space is not None
+                and space.tiling is not None
+                and not space.tiling.is_empty
+                and buffer.op_position is not None
+            )
+
+        def staged_reads(buffer: CoreDivisionBuffer) -> dict[str, int]:
+            """``source -> read count`` for the reads of ``buffer``'s op that
+            the apply could stage."""
+            op = op_by_name.get(buffer.name)
+            if op is None:
+                return {}
+            try:
+                deps = op.get_read_writes().reads
+            except Exception:  # noqa: BLE001 - best-effort prediction
+                return {}
+            counts: dict[str, int] = {}
+            for dep in deps:
+                if not isinstance(dep, MemoryDep) or dep.is_indirect():
+                    continue
+                if dep.name == buffer.name or dep.name not in by_name:
+                    continue
+                if not _read_copy_can_be_sized(dep):
+                    continue
+                counts[dep.name] = counts.get(dep.name, 0) + 1
+            return counts
+
+        index_of = {buffer.name: index for index, buffer in enumerate(buffers)}
+        ordered = sorted(
+            (b for b in buffers if tileable(b)),
+            key=lambda b: cast(int, b.op_position),
+        )
+        copies: list[CoarseTileReadCopyBuffer] = []
+        run_start = 0
+        while run_start < len(ordered):
+            run_end = run_start
+            while (
+                run_end + 1 < len(ordered)
+                and cast(int, ordered[run_end + 1].op_position)
+                == cast(int, ordered[run_end].op_position) + 1
+            ):
+                run_end += 1
+            run = ordered[run_start : run_end + 1]
+            per_reader = {buffer.name: staged_reads(buffer) for buffer in run}
+            totals: dict[str, int] = {}
+            for counts in per_reader.values():
+                for source, count in counts.items():
+                    totals[source] = totals.get(source, 0) + count
+            for buffer in run:
+                for source in sorted(per_reader[buffer.name]):
+                    if totals[source] < 2:
+                        # A staged tile standing in for one read saves nothing:
+                        # the saving is over the reads it replaces beyond the
+                        # first, and the copy op itself makes that first one.
+                        # Predicting it anyway would give the search a slot it
+                        # can fill for free and a reason never to give back, so
+                        # it would sit in LX displacing buffers that do pay.
+                        continue
+                    copies.append(
+                        CoarseTileReadCopyBuffer(
+                            name=coarse_tile_read_copy_name(source, buffer.name),
+                            size=by_name[source].size,
+                            # Live for as long as the reader is: the copy op
+                            # writes the tile at the reader's first tick and the
+                            # reader is its only consumer.
+                            uses=list(buffer.uses),
+                            first_use_is_read=False,
+                            in_place_parents=[],
+                            core_divisions=[CoreDivision()],
+                            parents=[],
+                            cd_parent_matches={},
+                            residency_reason=None,
+                            boundary=BufferType.Intermediate,
+                            source=source,
+                            reader=buffer.name,
+                            reader_index=index_of[buffer.name],
+                            reads=totals[source],
+                        )
+                    )
+            run_start = run_end + 1
+        return copies
 
     @staticmethod
     def _loop_carry_update_edge(
