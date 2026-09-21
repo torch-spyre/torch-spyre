@@ -1578,8 +1578,6 @@ def _stamp_direct_loop_info(
         squeezed_advance_output_level: list[tuple[sympy.Expr, sympy.Expr]] = []
         writes = [dep for dep in rw.writes if isinstance(dep, MemoryDep)]
         if len(writes) > 1:
-            from torch_spyre._inductor.errors import Unsupported
-
             raise Unsupported(
                 f"op {op.get_name()!r} has {len(writes)} MemoryDep writes; "
                 "_stamp_direct_loop_info assumes at most one so it can stamp "

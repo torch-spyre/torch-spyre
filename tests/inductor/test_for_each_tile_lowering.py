@@ -2464,11 +2464,19 @@ class TestStampDirectLoopInfo(unittest.TestCase):
                 break
         assert fake_mode is not None, "could not recover a fake_mode from gm node.meta"
 
+        # Lowered on the captured graph's OWN placeholders, not on `args`:
+        # dynamo/AOT order the post-grad graph's placeholders by nothing the
+        # caller controls, so feeding `args` positionally can bind inputs to
+        # the wrong placeholders (see TestConsumeTileDimMarkers._run_graph's
+        # docstring for a fixture where this actually happens).
+        placeholders = [
+            node.meta["val"] for node in gm.graph.nodes if node.op == "placeholder"
+        ]
         graph = GraphLowering(
-            gm, example_inputs=list(args), shape_env=fake_mode.shape_env
+            gm, example_inputs=placeholders, shape_env=fake_mode.shape_env
         )
         with V.set_graph_handler(graph), V.set_fake_mode(fake_mode):
-            graph.run(*args)
+            graph.run(*placeholders)
         return graph
 
     def test_single_level_stamps_group_id_and_count(self):
