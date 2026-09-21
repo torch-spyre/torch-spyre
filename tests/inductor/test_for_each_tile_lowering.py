@@ -1806,19 +1806,13 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
         propagate_spyre_tensor_layouts, codegen) runs after it and is
         irrelevant to what this test checks. Issue #4460's stick-layout/
         read-copy gap (the same gap test_carry_mode_split_k in
-        test_for_each_tile_e2e.py now passes against) is now fixed for
-        this fixture's shape. The marker_resolution-aware guard in
-        _synthesize_dim_hints_for_group (this task's fix) makes the
-        STAR_DEP_KEPT outer marker get a synthesized dim hint it
-        previously lacked -- confirmed real progress, since the pipeline
-        now runs past the original codegen-time "indirect symbol" lookup
-        failure -- but the fixture still does not run cleanly to
-        completion: it now fails one stage further in, during
-        op_spec_validation's symbol-consistency check ("OS-5") on a
-        synthetic `identity` op inserted by splice_while_loops's carry/
-        tile-read redirect -- a distinct follow-up gap to issue #4581,
-        filed as issue #4706 (see this test's tolerant except below for
-        the exact error and origin-tag lead). This test monkeypatches
+        test_for_each_tile_e2e.py now passes against) is fixed for this
+        fixture's shape, and issue #4706's OS-5 symbol-consistency gap on
+        splice_while_loops's synthetic carry/tile-read redirect `identity`
+        op (a distinct follow-up to issue #4581) is fixed too, per
+        create_tensor_arg's device_tile_advance_expr handling
+        (torch_spyre/_inductor/wsr/for_each_tile_lowering.py). The fixture
+        now compiles cleanly all the way through. This test monkeypatches
         splice_while_loops itself (the
         name torch_spyre._inductor.passes imports and calls directly) to
         capture a *snapshot* of graph.operations right as it returns, and
@@ -1855,7 +1849,6 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
             nested_split_m_then_k_fn,
         )
         from torch._inductor import ir
-        from torch._inductor.exc import InductorError
 
         X = torch.randn(256, 256, device=DEVICE_NAME, dtype=torch.float16)
         Y = torch.randn(256, 64, device=DEVICE_NAME, dtype=torch.float16)
@@ -1880,23 +1873,6 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
         passes_mod.splice_while_loops = capturing_splice_while_loops
         try:
             capture_post_grad_while_loop(nested_split_m_then_k_fn, (X, Y))
-        except InductorError as exc:
-            # Expected: op_spec_validation (much later, unrelated to
-            # splicing) hits issue #4706 -- an OpSpecValidationError
-            # ("OS-5" symbol-consistency check) on a synthetic `identity`
-            # op tagged reason='redirect while_loop carry/tile reads to
-            # persistent scratch' (from splice_while_loops's carry/
-            # tile-read redirect) -- after splice_while_loops has already
-            # completed and this test's capture has already fired. Any
-            # OTHER exception -- including the original "indirect symbol"
-            # error, which this guard fix should have moved the pipeline
-            # past -- is a real, unexpected finding; do not swallow it.
-            self.assertIn(
-                "OpSpecValidationError",
-                str(exc),
-                "expected the known issue #4706 OS-5 symbol-consistency "
-                f"gap, got a different InductorError: {exc!r}",
-            )
         finally:
             passes_mod.splice_while_loops = original_splice_while_loops
 
