@@ -55,11 +55,19 @@ class TestSWATiling(unittest.TestCase):
         config = self._select()
 
         self.assertEqual(config.strategy, "work_divided_tiled")
-        self.assertEqual(config.kv_block_size, 272)
-        self.assertEqual(config.num_kv_blocks, 4)
+        self.assertEqual(config.kv_block_size, 256)
+        self.assertEqual(config.num_kv_blocks, 5)
         self.assertEqual(config.num_head_tiles, 1)
         self.assertEqual(config.work_div, {"q_block": 16})
-        self.assertEqual(config.kv_bytes_per_core, 1088 * 1024)
+        self.assertEqual(config.kv_bytes_per_core, 256 * 4096)
+
+    def test_repeated_bmm_tiles_are_stick_aligned(self):
+        config = self._select(head_dim=64)
+
+        self.assertEqual(config.kv_block_size, 576)
+        self.assertEqual(config.num_kv_blocks, 2)
+        self.assertEqual(config.kv_block_size % 64, 0)
+        self.assertEqual(config.kv_block_size * config.num_kv_blocks, 1152)
 
     def test_gemma4_decode_uses_fewest_dsc_executions(self):
         config = self._select(q_block=1)
@@ -128,8 +136,8 @@ class TestSWATiling(unittest.TestCase):
         config = self._select(lx_budget_bytes=32 * 1024)
 
         self.assertEqual(config.strategy, "fallback_tiled")
-        self.assertEqual(config.kv_block_size, 272)
-        self.assertEqual(config.num_kv_blocks, 4)
+        self.assertEqual(config.kv_block_size, 384)
+        self.assertEqual(config.num_kv_blocks, 3)
         self.assertEqual(config.num_head_tiles, 1)
         self.assertEqual(
             config.reason,
@@ -141,7 +149,7 @@ class TestSWATiling(unittest.TestCase):
         config = self._select(num_cores=16)
 
         self.assertEqual(config.strategy, "work_divided_tiled")
-        self.assertEqual(config.kv_block_size, 272)
+        self.assertEqual(config.kv_block_size, 256)
         self.assertEqual(config.work_div, {"q_block": 16})
         self.assertEqual(config.num_head_tiles, 1)
 
@@ -190,10 +198,12 @@ class TestSWATiling(unittest.TestCase):
                         )
 
                         self.assertGreaterEqual(config.kv_block_size, 64)
-                        self.assertEqual(buffer_width % config.kv_block_size, 0)
-                        self.assertEqual(
-                            config.num_kv_blocks,
-                            buffer_width // config.kv_block_size,
+                        self.assertEqual(config.kv_block_size % 64, 0)
+                        physical_width = config.num_kv_blocks * config.kv_block_size
+                        self.assertGreaterEqual(physical_width, buffer_width)
+                        self.assertLess(
+                            physical_width - buffer_width,
+                            config.num_kv_blocks * 64,
                         )
                         self.assertEqual(num_heads % config.num_head_tiles, 0)
                         if config.work_div is not None:

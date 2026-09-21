@@ -29,7 +29,6 @@ import contextlib
 import dataclasses
 import math
 import threading
-from contextlib import nullcontext
 from typing import Any, Callable, Optional, Sequence, Union
 
 import torch
@@ -182,6 +181,25 @@ def _num_tiles_for_max_extent(
             return num_tiles
 
     raise AssertionError("validated tiling inputs must have an exact tile")
+
+
+def _padded_tiling_for_max_extent(
+    sequence_length: int, max_extent: int, *, tile_alignment: int
+) -> tuple[int, int]:
+    """Return equal aligned tiles covering a possibly padded sequence."""
+    if sequence_length < 1 or max_extent < 1 or tile_alignment < 1:
+        raise ValueError(
+            "sequence length, maximum extent, and alignment must be positive"
+        )
+    if max_extent < tile_alignment or max_extent % tile_alignment:
+        raise ValueError("maximum extent must be a multiple of tile alignment")
+
+    num_tiles = max(1, (sequence_length + max_extent - 1) // max_extent)
+    unaligned_tile_size = (sequence_length + num_tiles - 1) // num_tiles
+    tile_size = (
+        (unaligned_tile_size + tile_alignment - 1) // tile_alignment * tile_alignment
+    )
+    return num_tiles, tile_size
 
 
 def _kv_blocks_per_loop_group(num_q_tiles: int, num_kv_blocks: int) -> int:
@@ -408,8 +426,13 @@ def _sdpa_kv_candidates(
     element_size: int,
     num_cores: int,
     work_div: dict[str, int] | None,
+    pad_extent: bool = False,
 ) -> list[_SDPAKVBlockCandidate]:
-    """Estimate LX pressure, restick traffic, and DPO execution count."""
+    """Estimate LX pressure, restick traffic, and DPO execution count.
+
+    ``pad_extent`` lets SWA cost the aligned physical blocks it will materialize
+    instead of requiring every candidate block to divide the logical extent.
+    """
     head_split = work_div.get("num_heads", 1) if work_div is not None else 1
     query_split = work_div.get("max_seqlen_q", 1) if work_div is not None else 1
     heads_per_core = num_heads // head_split
@@ -423,12 +446,19 @@ def _sdpa_kv_candidates(
     result = []
     seen_block_sizes = set()
     for max_block_size in _sdpa_kv_block_sizes(max_seqlen_kv):
-        num_blocks = _num_tiles_for_max_extent(
-            max_seqlen_kv,
-            max_block_size,
-            tile_alignment=_SDPA_SEQUENCE_TILE_ALIGNMENT,
-        )
-        effective_block_size = max_seqlen_kv // num_blocks
+        if pad_extent:
+            num_blocks, effective_block_size = _padded_tiling_for_max_extent(
+                max_seqlen_kv,
+                max_block_size,
+                tile_alignment=_SDPA_SEQUENCE_TILE_ALIGNMENT,
+            )
+        else:
+            num_blocks = _num_tiles_for_max_extent(
+                max_seqlen_kv,
+                max_block_size,
+                tile_alignment=_SDPA_SEQUENCE_TILE_ALIGNMENT,
+            )
+            effective_block_size = max_seqlen_kv // num_blocks
         if effective_block_size in seen_block_sizes:
             continue
         seen_block_sizes.add(effective_block_size)
@@ -712,15 +742,16 @@ def _select_swa_tiling(
     SDPA's ``max_seqlen_q`` and ``max_seqlen_kv`` become ``q_block`` and
     ``kv_block`` in the SWA decomposition.
 
-    Unlike full SDPA, ``for_each_tile`` does not support a ragged final tile.
-    Candidate ceilings are therefore normalized to exact divisors before
-    their costs are evaluated, and the returned block size is the physical
-    tile extent that lowering will run.
+    Unlike full SDPA, SWA pads its complete K/V scan so every repeated BMM tile
+    has a 64-row physical extent. Candidate ceilings are therefore normalized
+    to equal aligned tiles that cover the logical buffer before their physical
+    costs are evaluated.
     """
-    fallback_num_kv_blocks = _num_tiles_for_max_extent(
-        buffer_width, _SDPA_MAX_SEQUENCE_TILE_SIZE
+    fallback_num_kv_blocks, fallback_kv_block_size = _padded_tiling_for_max_extent(
+        buffer_width,
+        _SDPA_MAX_SEQUENCE_TILE_SIZE,
+        tile_alignment=_SDPA_SEQUENCE_TILE_ALIGNMENT,
     )
-    fallback_kv_block_size = buffer_width // fallback_num_kv_blocks
     fallback_num_head_tiles = (
         1 if num_heads != num_kvheads else _sdpa_num_head_tiles(num_heads)
     )
@@ -764,6 +795,7 @@ def _select_swa_tiling(
             element_size=element_size,
             num_cores=num_cores,
             work_div=sdpa_work_div,
+            pad_extent=True,
         )
         for candidate in candidates:
             logger.debug(
@@ -1743,6 +1775,8 @@ def _windowed_attention(
         num_cores=config.sencores,
         lx_budget_bytes=_sdpa_lx_budget_bytes(),
     )
+    physical_buffer_width = tiling.num_kv_blocks * tiling.kv_block_size
+    pad_columns = physical_buffer_width - buffer_width
     logger.debug(
         "SWA tiling: strategy=%s reason=%s q_block=%s "
         "buffer_width=%s kv_blocks=%s kv_block_size=%s "
@@ -1800,6 +1834,41 @@ def _windowed_attention(
             num_heads,
         )
         mask_window = mask_rows[..., read_start : read_start + buffer_width]
+        if pad_columns:
+            k_window = torch.cat(
+                [
+                    k_window,
+                    torch.zeros(
+                        (*k_window.shape[:-2], pad_columns, k_window.shape[-1]),
+                        device=k_window.device,
+                        dtype=k_window.dtype,
+                    ),
+                ],
+                dim=-2,
+            )
+            v_window = torch.cat(
+                [
+                    v_window,
+                    torch.zeros(
+                        (*v_window.shape[:-2], pad_columns, v_window.shape[-1]),
+                        device=v_window.device,
+                        dtype=v_window.dtype,
+                    ),
+                ],
+                dim=-2,
+            )
+            mask_window = torch.cat(
+                [
+                    mask_window,
+                    torch.full(
+                        (*mask_window.shape[:-1], pad_columns),
+                        float("-inf"),
+                        device=mask_window.device,
+                        dtype=mask_window.dtype,
+                    ),
+                ],
+                dim=-1,
+            )
 
         q_rows = query[..., q_start:q_end, :]
 
@@ -1847,9 +1916,7 @@ def _windowed_attention(
                 block_max = torch.amax(torch.clamp_min(scores, finite_min), dim=-1)
                 # Form the old-max correction first. The loop lowering can then
                 # update running_max without a carry snapshot.
-                correction = torch.exp(
-                    torch.clamp_max(running_max - block_max, 0.0)
-                )
+                correction = torch.exp(torch.clamp_max(running_max - block_max, 0.0))
                 new_max = torch.maximum(running_max, block_max)
                 exp_scores = torch.exp(scores - new_max.unsqueeze(-1))
                 new_denominator = denominator * correction + exp_scores.sum(dim=-1)

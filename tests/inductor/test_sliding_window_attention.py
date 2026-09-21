@@ -19,8 +19,8 @@ mask. Unsupported shapes raise rather than falling back, so numbers coming out
 at all prove the windowed path ran; which shapes are refused is settled in
 test_kv_window.py without a device.
 
-This does NOT establish that the spyre_hints produce device loops — untiled
-code returns the right answer with one large intermediate.
+Tests that require structural guarantees also inspect the generated code for
+the counted loops produced by ``for_each_tile``.
 
 Run:
     SENCORES=1 python3 -m pytest tests/inductor/test_sliding_window_attention.py -v
@@ -391,7 +391,7 @@ class TestSlidingWindowAttention(unittest.TestCase):
         _compare_attention(query, key, value, 1024)
 
     def test_nondivisible_kv_extent_uses_for_each_tile(self):
-        """A nondivisible selected block still lowers to one counted loop."""
+        """A nondivisible K/V extent is padded into one counted loop."""
         query, key, value = _inputs(1, 16, 8, 64, 1088)
         mask = _attention_mask(1, 64, 1088, 1024)
         expected = _attention(query, key, value, mask, 1024)
