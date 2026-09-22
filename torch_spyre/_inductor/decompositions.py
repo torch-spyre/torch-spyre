@@ -864,6 +864,9 @@ def _select_swa_tiling(
                     else "single-query decode; longest bursts and fewest DSC executes"
                 )
             else:
+                # Prefill starts from the generated candidates, keeps only
+                # LX-feasible tiles, then selects the one closest to the
+                # analytical K/V streaming target.
                 assert sdpa_work_div is not None
                 query_rows_per_core = q_block // sdpa_work_div["max_seqlen_q"]
                 target_kv_bytes = _sdpa_target_kv_bytes_per_core(
@@ -903,12 +906,10 @@ def _select_swa_tiling(
             # softmax reduction. Unlike full SDPA's statically unrolled
             # blocks, splitting that reduction again is neither legal nor
             # useful; preserve only the independent head/query splits.
+            swa_work_div_names = {"max_seqlen_q": "q_block"}
             swa_work_div = (
                 {
-                    {
-                        "max_seqlen_q": "q_block",
-                        "max_seqlen_kv": "kv_block",
-                    }.get(name, name): split
+                    swa_work_div_names.get(name, name): split
                     for name, split in selected_work_div.items()
                 }
                 if selected_work_div is not None

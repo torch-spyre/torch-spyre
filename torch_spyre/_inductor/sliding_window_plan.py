@@ -247,6 +247,8 @@ def query_blocking(seqlen_q: int, max_query_block: int = STICK) -> tuple[int, in
     if seqlen_q == 1:
         return 1, 1
     padded_seqlen_q = _ceil_stick(seqlen_q)
+    # Production callers pass STICK or MAX_QUERY_BLOCK; keep the helper
+    # bounded defensively if a future caller requests a larger block.
     max_query_block = min(max_query_block, MAX_QUERY_BLOCK)
     largest_candidate = min(padded_seqlen_q, max_query_block)
     for q_block in range(largest_candidate, STICK - 1, -STICK):
