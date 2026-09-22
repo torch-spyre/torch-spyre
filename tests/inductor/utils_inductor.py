@@ -82,6 +82,17 @@ def cached_xavier(
     return out
 
 
+def dl16_round(t: torch.Tensor) -> torch.Tensor:
+    """Round a CPU fp32 tensor to approximate Spyre's on-device dl16 format.
+
+    Spyre's on-device dl16 (SEN169_FP16) has one more mantissa bit than
+    bf16, so bf16 is a conservative (slightly looser, never tighter) proxy
+    for it -- fine wherever the comparison uses atol/rtol rather than an
+    exact match.
+    """
+    return t.bfloat16().float()
+
+
 @functools.lru_cache(maxsize=None)
 def unique_randn_along_dim(
     shape,

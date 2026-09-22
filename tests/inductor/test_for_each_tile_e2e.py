@@ -60,6 +60,8 @@ from torch_spyre.constants import DEVICE_NAME
 
 from for_each_tile_fixtures import (
     B,
+    COLS,
+    ROWS,
     D,
     K,
     LK,
@@ -78,6 +80,7 @@ from for_each_tile_fixtures import (
     abs_tiled_reference,
     add_tiled_fn,
     add_tiled_reference,
+    batched_online_softmax_fn,
     nested_add_outer_row_inner_col_fn,
     nested_add_outer_row_inner_col_reference,
     nested_split_m_then_k_fn,
@@ -103,25 +106,7 @@ from for_each_tile_fixtures import (
     triple_nested_stardep_outer_fn,
     triple_nested_stardep_outer_reference,
 )
-from tests.inductor.utils_inductor import cached_randn, cached_xavier
-
-
-def _dl16_round(t: torch.Tensor) -> torch.Tensor:
-    """Round a CPU fp32 tensor to approximate Spyre's on-device dl16 format.
-
-    Spyre's 16-bit tensors are stored on-device as SEN169_FP16 (dl16: 1 sign
-    / 7 exponent / 8 mantissa bits -- one more mantissa bit than bf16, one
-    fewer exponent bit), and H2D/D2H transfer converts fp16 <-> dl16
-    implicitly at the boundary -- all on-device 16-bit arithmetic, including
-    matmul accumulation, runs in dl16, not IEEE fp16. There's no native
-    torch dtype for dl16, so bf16 is used as a practical stand-in: it has
-    one fewer mantissa bit than dl16, so it's a conservative (slightly
-    looser) proxy for the actual rounding, not a bit-exact one -- fine here
-    since the comparison tolerance (atol/rtol below) is what actually
-    distinguishes expected rounding noise from a real bug, not this
-    function's exactness.
-    """
-    return t.bfloat16().float()
+from tests.inductor.utils_inductor import cached_randn, cached_xavier, dl16_round
 
 
 def _with_dynamo_reset(test_fn):
@@ -199,7 +184,7 @@ class TestForEachTileE2E(_DynamoResetTestCase):
     def _operands():
         X = cached_xavier((M, K))
         Y = cached_xavier((K, N))
-        ref = _dl16_round(X.float()) @ _dl16_round(Y.float())
+        ref = dl16_round(X.float()) @ dl16_round(Y.float())
         return X.to(DEVICE_NAME), Y.to(DEVICE_NAME), ref
 
     def test_map_mode_split_m(self):
@@ -270,7 +255,7 @@ class TestForEachTileE2E(_DynamoResetTestCase):
         K = cached_xavier((LK, D), differentiation=1)
         V = cached_xavier((LK, D), differentiation=2)
         ref = online_softmax_reference(
-            _dl16_round(Q.float()), _dl16_round(K.float()), _dl16_round(V.float())
+            dl16_round(Q.float()), dl16_round(K.float()), dl16_round(V.float())
         )
 
         Q_spyre = Q.to(DEVICE_NAME)
@@ -290,9 +275,9 @@ class TestForEachTileE2E(_DynamoResetTestCase):
         K = cached_xavier((B, 256, 128), differentiation=1)
         V = cached_xavier((B, 256, 128), differentiation=2)
         Qb, Kb, Vb = (
-            _dl16_round(Q.float()),
-            _dl16_round(K.float()),
-            _dl16_round(V.float()),
+            dl16_round(Q.float()),
+            dl16_round(K.float()),
+            dl16_round(V.float()),
         )
         ref = torch.softmax(Qb @ Kb.transpose(-1, -2), dim=-1)
         ref = ref @ Vb
@@ -329,7 +314,7 @@ class TestForEachTileE2E(_DynamoResetTestCase):
         _, table, _ = paged_gather_inputs()
         pages = cached_xavier((PAGE_POOL, PAGE_SIZE, PAGE_HS))
         q = cached_xavier((PAGE_LQ, PAGE_HS), differentiation=1)
-        ref = paged_gather_reference(_dl16_round(pages.float()), _dl16_round(q.float()))
+        ref = paged_gather_reference(dl16_round(pages.float()), dl16_round(q.float()))
 
         compiled = torch.compile(paged_gather_fn, backend="inductor", fullgraph=True)
         out = compiled(pages.to(DEVICE_NAME), table.to(DEVICE_NAME), q.to(DEVICE_NAME))
@@ -362,9 +347,9 @@ class TestForEachTileE2E(_DynamoResetTestCase):
         v_pages = cached_xavier((PAGE_POOL, PAGE_SIZE, PAGE_HS), differentiation=1)
         q = cached_xavier((PAGE_LQ, PAGE_HS), differentiation=2)
         ref = paged_gather_kv_reference(
-            _dl16_round(k_pages.float()),
-            _dl16_round(v_pages.float()),
-            _dl16_round(q.float()),
+            dl16_round(k_pages.float()),
+            dl16_round(v_pages.float()),
+            dl16_round(q.float()),
         )
 
         compiled = torch.compile(paged_gather_kv_fn, backend="inductor", fullgraph=True)
@@ -392,16 +377,19 @@ class TestForEachTilePointwiseE2E(_DynamoResetTestCase):
     test_hint_softmax_row_tiling's device_size[1] docstring in
     test_coarse_tile_e2e.py), so both sizes are kept as separate tests
     rather than only covering the large one.
+
+    References here skip dl16_round: unlike TestForEachTileE2E's matmuls,
+    these ops don't contract over a dimension, so they don't amplify
+    rounding error, and the kept ATOL/RTOL=0.1 tolerance already covers the
+    fp16-vs-dl16 gap.
     """
 
     ATOL = 0.1
     RTOL = 0.1
 
-    ROWS, COLS = 8, 16
-
     def test_add_tiled_small(self):
-        A = cached_randn((self.ROWS, self.COLS))
-        B = cached_randn((self.ROWS, self.COLS), differentiation=1)
+        A = cached_randn((ROWS, COLS))
+        B = cached_randn((ROWS, COLS), differentiation=1)
         A_spyre, B_spyre = A.to(DEVICE_NAME), B.to(DEVICE_NAME)
         ref = add_tiled_reference(A.float(), B.float())
 
@@ -427,7 +415,7 @@ class TestForEachTilePointwiseE2E(_DynamoResetTestCase):
         )
 
     def test_abs_tiled_small(self):
-        A = cached_randn((self.ROWS, self.COLS))
+        A = cached_randn((ROWS, COLS))
         A_spyre = A.to(DEVICE_NAME)
         ref = abs_tiled_reference(A.float())
 
@@ -451,9 +439,9 @@ class TestForEachTilePointwiseE2E(_DynamoResetTestCase):
         )
 
     def test_abs_add_mul_tiled_small(self):
-        A = cached_randn((self.ROWS, self.COLS))
-        B = cached_randn((self.ROWS, self.COLS), differentiation=1)
-        C = cached_randn((self.ROWS, self.COLS), differentiation=2)
+        A = cached_randn((ROWS, COLS))
+        B = cached_randn((ROWS, COLS), differentiation=1)
+        C = cached_randn((ROWS, COLS), differentiation=2)
         A_spyre = A.to(DEVICE_NAME)
         B_spyre = B.to(DEVICE_NAME)
         C_spyre = C.to(DEVICE_NAME)
@@ -489,7 +477,7 @@ class TestForEachTilePointwiseE2E(_DynamoResetTestCase):
         )
 
     def test_softmax_row_tiled_small(self):
-        X = cached_randn((self.ROWS, self.COLS))
+        X = cached_randn((ROWS, COLS))
         X_spyre = X.to(DEVICE_NAME)
         ref = softmax_row_tiled_reference(X.float())
 
@@ -502,6 +490,9 @@ class TestForEachTilePointwiseE2E(_DynamoResetTestCase):
 
     def test_softmax_row_tiled_multi_stick(self):
         """Row-tile size spans 2 sticks/row -- see test_hint_softmax_row_tiling."""
+        # abs=True: softmax is invariant to input sign, so this is purely
+        # fidelity to the old torch.rand ([0, 1)) input this test used
+        # before switching to cached_randn, not a correctness requirement.
         X = cached_randn((STICK_ROWS, STICK_COLS), abs=True)
         X_spyre = X.to(DEVICE_NAME)
         ref = softmax_row_tiled_reference(X.float())
@@ -615,7 +606,7 @@ class TestForEachTileNestedCarryE2E(_DynamoResetTestCase):
         Y = cached_xavier((256, 64), differentiation=1)
         X_spyre, Y_spyre = X.to(DEVICE_NAME), Y.to(DEVICE_NAME)
         ref = nested_split_m_then_k_reference(
-            _dl16_round(X.float()), _dl16_round(Y.float())
+            dl16_round(X.float()), dl16_round(Y.float())
         )
 
         compiled = torch.compile(
@@ -633,7 +624,7 @@ class TestForEachTileNestedCarryE2E(_DynamoResetTestCase):
         Y = cached_xavier((2, 256, 64), differentiation=1)
         X_spyre, Y_spyre = X.to(DEVICE_NAME), Y.to(DEVICE_NAME)
         ref = triple_nested_stardep_outer_reference(
-            _dl16_round(X.float()), _dl16_round(Y.float())
+            dl16_round(X.float()), dl16_round(Y.float())
         )
 
         compiled = torch.compile(
@@ -651,7 +642,7 @@ class TestForEachTileNestedCarryE2E(_DynamoResetTestCase):
         Y = cached_xavier((2, 256, 64), differentiation=1)
         X_spyre, Y_spyre = X.to(DEVICE_NAME), Y.to(DEVICE_NAME)
         ref = triple_nested_stardep_middle_reference(
-            _dl16_round(X.float()), _dl16_round(Y.float())
+            dl16_round(X.float()), dl16_round(Y.float())
         )
 
         compiled = torch.compile(
@@ -671,7 +662,7 @@ class TestForEachTileNestedCarryE2E(_DynamoResetTestCase):
         Y = cached_xavier((2, 256, 64), differentiation=1)
         X_spyre, Y_spyre = X.to(DEVICE_NAME), Y.to(DEVICE_NAME)
         ref = triple_nested_stardep_inner_reference(
-            _dl16_round(X.float()), _dl16_round(Y.float())
+            dl16_round(X.float()), dl16_round(Y.float())
         )
 
         compiled = torch.compile(
@@ -691,7 +682,7 @@ class TestForEachTileNestedCarryE2E(_DynamoResetTestCase):
         Y = cached_xavier((2, 256, 64), differentiation=1)
         X_spyre, Y_spyre = X.to(DEVICE_NAME), Y.to(DEVICE_NAME)
         ref = triple_nested_stardep_multilevel_reference(
-            _dl16_round(X.float()), _dl16_round(Y.float())
+            dl16_round(X.float()), dl16_round(Y.float())
         )
 
         compiled = torch.compile(

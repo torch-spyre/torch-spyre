@@ -2451,15 +2451,13 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
             nested_split_m_then_k_fn,
             nested_split_m_then_k_reference,
         )
-        from tests.inductor.utils_inductor import cached_xavier
+        from tests.inductor.utils_inductor import cached_xavier, dl16_round
 
         torch._dynamo.reset()
         X = cached_xavier((256, 256))
         Y = cached_xavier((256, 64), differentiation=1)
-        # bf16 has no native dl16 dtype to round through; it's a conservative
-        # (slightly looser) proxy, matching _dl16_round in test_for_each_tile_e2e.py.
         expected = nested_split_m_then_k_reference(
-            X.bfloat16().float(), Y.bfloat16().float()
+            dl16_round(X.float()), dl16_round(Y.float())
         )
 
         compiled = torch.compile(
