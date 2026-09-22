@@ -22,9 +22,9 @@ description: |
 
   Pair it with the upload side in the dispatched workflow:
 
-      - run: printf '%s' "${{ '${{' }} inputs.run_id }}" > run-id.txt
+      - run: printf '%s' "$ {{ inputs.run_id }}" > run-id.txt
       - uses: actions/upload-artifact@<pinned>
-        if: ${{ '${{' }} inputs.run_id != '' }}
+        if: $ {{ inputs.run_id != '' }}
         with: { name: run-id, path: run-id.txt, retention-days: 1 }
 
 inputs:
