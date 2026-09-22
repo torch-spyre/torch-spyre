@@ -592,6 +592,10 @@ class TestBuildingBlocks(unittest.TestCase):
     )
     def test_noncontiguous_kv_prefix_keeps_one_tile_fallback(self):
         """A declined direct read retains the contracted one-tile staging copy."""
+        # The direct-read test above compiles the same helper and shapes. Make
+        # sure this test re-enters Inductor while the proof function is mocked.
+        torch._dynamo.reset_code_caches()
+        torch._inductor.codecache.FxGraphCache.clear()
         copy_sizes = []
 
         def decline_direct_read(_consumer, copy_op, _record):
