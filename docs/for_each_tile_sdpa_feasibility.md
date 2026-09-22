@@ -1,11 +1,11 @@
-# SDPA `for_each_tile` feasibility report
+# SDPA nested `for_each_tile` implementation report
 
 Last updated: 2026-09-22
 
 ## Executive summary
 
 This branch rewrites Spyre SDPA's complete `B`/`Hkv`/`G`/`Lq`/`Lk` tile nest
-with `for_each_tile`. It is based on upstream main at `a2e41402`, including
+with `for_each_tile`. It is based on upstream main at `eaea0108`, including
 the non-contiguous input streaming support from #4750 and the shared SDPA/SWA
 cost-model helpers from #4610. The full-HOP path contains no named-dimension
 hints.
@@ -15,12 +15,12 @@ fixed. The focused nine-case suite and the production SDPA tests pass on
 Spyre. Fresh-cache Granite 3.3 8B and Gemma 4 26B A4B runs both complete
 chunked-prefill plus decode at 8K and 32K.
 
-The tiling selector is cost based. It does not contain model identities,
-sequence-length cutoffs, or maximum query/K tile limits. It enumerates exact
-`B`/`Hkv`/`G`/`Lq`/`Lk` plans and estimates live LX, active-core ownership,
-logical HBM bursts, aggregate HBM traffic, non-dense head staging, and
-loop/DSC overhead. A conservative one-carry live-set uncertainty is admitted
-only after pricing its write/read traffic.
+The prefill selector is cost based. It contains no model identities,
+sequence-length cutoffs, or fixed prefill Lq/Lk ceilings. It enumerates
+shape-derived `B`/`Hkv`/`G`/`Lq`/`Lk` plans and estimates live LX, active-core
+ownership, logical HBM bursts, aggregate HBM traffic, non-dense head staging,
+and loop/DSC overhead. A conservative one-query-buffer live-set uncertainty is
+admitted only after pricing its write/read traffic.
 
 ## SDPA structure
 
@@ -41,6 +41,11 @@ for_each_tile(B, map)
         for_each_tile(Lk, carry M, l, O)
 ```
 
+A map level is elided when its selected tile covers the complete axis. The GQA
+group map is also elided when both sequence axes fit in one tile, because a
+G-only map cannot reduce the sequence working set and would only serialize the
+query-head groups.
+
 For GQA, Q and bias have logical shape `[B, Hkv, G, Lq, ...]`; K and V keep a
 unit G dimension and are invariant in the G loop. The Lk reduction implements
 stable online softmax:
@@ -55,40 +60,96 @@ O_next = O * correction + P @ V_tile
 result = O_final / l_final
 ```
 
-## Selector model
+## Cost model
 
-For chunked prefill, the selector enumerates every exact tile count for the
-batch, physical-head, and GQA-group axes, every exact query tile generated
-from the full Lq extent down to one row, and every exact, stick-aligned K tile
-generated from power-of-two burst candidates plus the full K extent. For each
-plan it estimates:
+### Prefill candidate space
 
-- CP-SAT's usable core count over every axis visible to the inner HOP;
+For chunked prefill, the selector constructs candidates as follows:
+
+- every divisor of the batch, physical-head, and GQA-group extents is an exact
+  map-loop trip count;
+- Lq candidates start at the complete query extent and descend through
+  power-of-two extent ceilings, each normalized to an exact divisor; and
+- Lk candidates start from power-of-two block ceilings plus the complete KV
+  extent, then normalize to unique exact tiles. They retain 64-row alignment
+  whenever Lk itself is aligned, as production inputs are.
+
+This searches every outer-axis division and a bounded, shape-derived set of
+exact sequence tilings without checking a model name or context-length range.
+
+### Per-plan estimates
+
+For each plan, the selector estimates:
+
+- CP-SAT's largest exact product split over B, Hkv/H, G, and the current Lq
+  tile, capped by the available cores;
 - four simultaneously live score-shaped values;
 - seven query/output-shaped values, including map staging and carry handoff;
-- the two scalar online-softmax carries;
-- the per-core restickified K footprint;
+- the two row-shaped scalar online-softmax carries, M and l;
+- a conservative per-core restickified-K footprint divided only over B and
+  physical KV heads, because K is invariant over G and Lq;
 - mask replay on broadcast outer axes and K/V replay on G/Lq tiles;
-- staging traffic when an interleaved head slice is not dense; and
+- read/write staging traffic when head tiling slices an interleaved,
+  non-dense query, key, or value layout; and
 - two logical K/V bursts per outer HOP trip and Lk block.
 
-Aggregate bytes are converted to full-card transfer waves using the calibrated
-1 MiB/core HBM target. The analytical liveness count is conservative by one
-query/output carry at the map boundary, so the selector can admit that one
-buffer of shortfall, but charges a write and read of the larger score/query
-buffer on every inner trip. Plans requiring a larger shortfall are rejected.
-The remaining plans are ranked by DSC executions plus logical load bursts plus
-HBM transfer waves, with residency, parallelism, restick work, and tile counts
-as tie breakers. Decode retains its separately calibrated policy because its
-one-row execution is structurally different from chunked prefill.
+The live-set estimate is `4 * score + 7 * query/output + 2 * row scalar +
+restickified K`. V remains streamed and is not charged as a resident value.
+The LX limit is the frontend allocator's actual per-core planning budget, not
+the card's nominal physical capacity.
+
+Aggregate traffic includes one query read/output write, K/V replay for every G
+and Lq tile, broadcast-mask replay, any non-dense head staging, and a modeled
+spill penalty. It is converted to full-card transfer waves with the calibrated
+1 MiB/core target. Logical burst count remains separate so two equally sized
+transfers with different loop fragmentation do not look equivalent.
+
+The analytical liveness estimate is deliberately conservative around the map
+and carry handoff. A plan may exceed the budget by at most one query-sized slot;
+the model then charges a write and read of the larger score/query buffer on
+every inner trip. This is an admission and ranking penalty, not a claim that
+the final allocator will spill that value. Plans requiring two or more such
+slots are rejected.
+
+The primary score is the sum of calibrated DSC executions, logical load bursts,
+and aggregate HBM transfer waves. Ties prefer, in order: fewer modeled overflow
+slots, fewer bursts, fewer HBM bytes, fewer DSC executions, more active cores,
+less restick work, fewer B/H tiles, a larger Lq tile, fewer G tiles, and a
+larger Lk block. The DSC estimate charges eight fixed executes, roughly 17 per
+Lk block, and counted-loop group boundaries for every outer tile.
+
+### Decode and fallback
+
+Decode keeps the separately calibrated #4549 policy because its single query
+row is structurally different from prefill. It first requires its narrower
+two-score/two-query live estimate to fit LX, then separately prefers eligible K
+blocks of at least 256 rows whose restickified K is likely to remain in LX and
+whose block count stays within the calibrated multi-block window. Otherwise it
+minimizes DSC executes and prefers the larger K block.
+
+There is no legacy non-HOP SDPA path in this branch. Decode still uses the same
+`for_each_tile` decomposition; only its liveness and K-block scoring remain
+separately calibrated. SWA also reuses the narrow score/query accounting helper,
+but it is a distinct operator with its own selector.
+
+If no prefill plan fits within the one-slot allowance, or no decode candidate
+fits LX, the selector retains conservative fallback tiling inside the same HOP
+decomposition: exact Lq tiles of at most 512 rows, exact K tiles bounded by the
+smaller of 512 rows and an aligned quarter of Lk, and the established B/H/G
+split heuristics.
 
 Representative choices with a 1,625,344-byte per-core LX budget are:
 
-| Geometry | Selected plan | Estimated live bytes/core | Priced shortfall |
-| --- | --- | ---: | ---: |
-| Granite 8K, Hq=32, Hkv=8, Lq=512, D=128 | B1/H1/G1/Q2/K512 | 1,639,424 | 1 buffer |
-| Granite 32K, Hq=32, Hkv=8, Lq=512, D=128 | B1/H1/G1/Q4/K1024 | 1,540,608 | none |
-| Gemma 4 8K/32K, Hq=16, Hkv=8, Lq=1024, D=256 | B1/H1/G1/Q2/K256 | 1,573,888 | none |
+| Geometry | Selected plan | Active cores | Logical K/V bursts | Estimated live bytes/core | Admission penalty |
+| --- | --- | ---: | ---: | ---: | --- |
+| Granite 8K, Hq=32, Hkv=8, Lq=512, D=128 | B1/H1/G1/Q2/K512 | 32 | 64 | 1,639,424 | 1 query-sized slot |
+| Granite 32K, Hq=32, Hkv=8, Lq=512, D=128 | B1/H1/G1/Q4/K1024 | 32 | 256 | 1,540,608 | none |
+| Gemma 4 8K, Hq=16, Hkv=8, Lq=1024, D=256 | B1/H1/G1/Q2/K256 | 32 | 128 | 1,573,888 | none |
+| Gemma 4 32K, Hq=16, Hkv=8, Lq=1024, D=256 | B1/H1/G1/Q2/K256 | 32 | 512 | 1,573,888 | none |
+
+`B1/H1/G1/Q2` denotes the number of map tiles on each outer axis; `K512`
+denotes the Lk tile extent in tokens. Thus Granite 8K uses two 256-row query
+tiles and sixteen 512-row KV tiles, rather than a one-row head or group tile.
 
 The Granite crossover is selected from costs rather than a sequence-length
 condition. At 8K, two Q tiles avoid enough K/V replay to offset the conservatively
@@ -98,11 +159,11 @@ the resident Q2/K256 plan at both lengths.
 
 ## Correctness results
 
-On upstream main `a2e41402` plus this branch:
+On upstream main `eaea0108` plus this branch:
 
 ```text
 tests/inductor/test_sdpa_tiling.py:                 29 passed, 142 subtests
-tests/inductor/test_sdpa_for_each_tile.py (OOT):     9 passed
+tests/inductor/test_sdpa_for_each_tile.py:           9 passed
 focused production SDPA device tests:                7 passed
 pre-commit on all modified files:                    passed
 ```
@@ -123,10 +184,12 @@ selector:
 
 ## Compile-time and runtime observations
 
-A fresh-cache, same-process kernel comparison used 100 synchronized,
-device-resident iterations. K/V are transposed prefix views whose backing
-allocation is one prefill chunk longer, matching the static-cache layout used
-by the adapter.
+A fresh-cache, same-process kernel comparison used default CP-SAT,
+`CO_OPTIMIZING_LX_PLANNING=1`, and 100 synchronized, device-resident iterations.
+K/V are transposed prefix views whose backing allocation is one prefill chunk
+longer, matching the static-cache layout used by the adapter. The later
+#4753/#4759 rebases changed only CI and ClickHouse ingestion code, so these
+compiler/runtime measurements remain applicable to the current tree.
 
 | Geometry | KV length | Selected plan | Median runtime | Compile + first |
 | --- | ---: | --- | ---: | ---: |
@@ -171,7 +234,8 @@ than the earlier 91.05 s sample, but its isolated padded attention kernel is
 unchanged at 38.76 ms versus 38.90 ms; this does not indicate an attention
 codegen regression.
 
-Isolated Granite SDPA measurements explain the K1024 choice:
+An earlier forced-K sweep at Granite's 32K geometry with tightly allocated K/V
+explains the K1024 choice:
 
 | K tile | Runtime |
 | ---: | ---: |
@@ -185,7 +249,8 @@ Q4/K32 at 32K, while Gemma emits Q2/K32 and Q2/K128. The corresponding OpSpecs
 place all score-shaped and query/output-shaped inner-loop intermediates in LX.
 The remaining `hbm`/`hbm_pool` values are graph inputs, restick staging, carries
 at loop boundaries, and map-result materialization—not wholesale spills of the
-online-softmax dataflow.
+online-softmax dataflow. In particular, Granite 8K's one-slot admission penalty
+does not become an inner-loop spill in the generated OpSpecs.
 
 Earlier forced-plan studies explain the selections. Granite's Q2/K512 plan was
 faster end-to-end at 8K, while Q4/K1024 won at 32K. For Gemma's wider D=256
@@ -194,6 +259,15 @@ at 32K. The final model reproduces those choices without checking model names
 or sequence lengths.
 
 ## Non-contiguous KV-cache support inherited from #4750
+
+The decomposition still canonicalizes Q once before entering the nested maps.
+This is not needed to identify the logical HOP axes: those are explicit now,
+and the former named-dimension path is gone. It remains an explicit operation
+because `WhileLoop.create` requires exact body-input strides and otherwise
+synthesizes the same materialization for the usual logical `[B,H,S,D]` view
+backed by physical `[B,S,H,D]` storage. Q is bounded by the prefill chunk, so
+this is a predictable one-time copy. Applying the same policy to K/V would copy
+the complete context and can exhaust HBM at long sequence lengths.
 
 PR #4750 teaches `for_each_tile`/`WhileLoop` splicing to contract an exact-stride
 materialization of a non-contiguous graph input to one streamed tile. Its

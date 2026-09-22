@@ -66,8 +66,10 @@ _SDPA_PREFERRED_HEADS_PER_TILE = (4, 2, 1)
 _SDPA_MHA_MAX_HEAD_WORK_DIVISION = 4
 _SDPA_MHA_QUERY_ONLY_MAX_HEADS = 8
 _SDPA_MHA_QUERY_ONLY_MIN_KV_BLOCKS = 8
-_SDPA_LIVE_SCORE_BUFFER_ALLOWANCE = 2
-_SDPA_LIVE_QUERY_BUFFER_ALLOWANCE = 2
+# Decode and SWA use this narrower, separately calibrated live-set estimate.
+# These constants do not represent a legacy non-HOP SDPA implementation.
+_SDPA_NARROW_LIVE_SCORE_BUFFER_ALLOWANCE = 2
+_SDPA_NARROW_LIVE_QUERY_BUFFER_ALLOWANCE = 2
 _SDPA_TARGET_KV_BYTES_PER_CORE = 1024 * 1024
 _SDPA_MAX_TARGET_KV_BYTES_PER_CORE = 2 * 1024 * 1024
 _SDPA_GQA_HEADS_PER_KV_TARGET_MIB = 4
@@ -79,8 +81,8 @@ _SDPA_MAX_BURST_EFFICIENT_KV_BLOCK_SIZE = 1024
 # score-shaped values and seven query/output-shaped values once the enclosing
 # map's tile staging and carry handoff are included. These are graph-derived
 # buffer counts, rather than shape or model limits.
-_SDPA_HOP_LIVE_SCORE_BUFFER_ALLOWANCE = 4
-_SDPA_HOP_LIVE_QUERY_BUFFER_ALLOWANCE = 7
+_SDPA_PREFILL_LIVE_SCORE_BUFFER_ALLOWANCE = 4
+_SDPA_PREFILL_LIVE_QUERY_BUFFER_ALLOWANCE = 7
 
 # A counted SWA K/V loop pays its carry handoff and loop-control costs for each
 # query work partition.  Prefill sweeps show that retaining at least four query
@@ -273,7 +275,7 @@ def _sdpa_work_division(
     max_seqlen_kv: int,
     num_cores: int,
 ) -> dict[str, int] | None:
-    """Find the largest placeable head/query split for the legacy/SWA path."""
+    """Find the largest placeable head/query split for SWA."""
     if num_cores < 1 or max_seqlen_q <= 1:
         return None
 
@@ -395,15 +397,16 @@ def _sdpa_estimated_live_bytes_per_core(
     head_dim: int,
     element_size: int,
     restick_bytes_per_core: int = 0,
-    nested_hop: bool = False,
+    full_sdpa_prefill: bool = False,
 ) -> tuple[int, int]:
     """Estimate the co-live, non-streamed values for one SDPA iteration.
 
     V is streamed by the second matmul. K is restickified before the first
-    matmul and therefore participates in nested-HOP residency. The old
-    hints-based/decode path retains its smaller two-score/two-query estimate;
+    matmul and therefore participates in full-SDPA prefill residency. Full
     nested prefill accounts for every score- and query-shaped value that can
-    overlap at a loop-body operation boundary.
+    overlap at a map/carry boundary. Decode and SWA retain their separately
+    calibrated two-score/two-query estimate. This flag selects a liveness
+    accounting regime; it does not select a non-HOP SDPA implementation.
     """
     score_bytes = (
         batch_size * heads_per_core * query_rows_per_core * kv_block_size * element_size
@@ -413,14 +416,14 @@ def _sdpa_estimated_live_bytes_per_core(
     )
     accumulator_bytes = batch_size * heads_per_core * query_rows_per_core * element_size
     score_allowance = (
-        _SDPA_HOP_LIVE_SCORE_BUFFER_ALLOWANCE
-        if nested_hop
-        else _SDPA_LIVE_SCORE_BUFFER_ALLOWANCE
+        _SDPA_PREFILL_LIVE_SCORE_BUFFER_ALLOWANCE
+        if full_sdpa_prefill
+        else _SDPA_NARROW_LIVE_SCORE_BUFFER_ALLOWANCE
     )
     query_allowance = (
-        _SDPA_HOP_LIVE_QUERY_BUFFER_ALLOWANCE
-        if nested_hop
-        else _SDPA_LIVE_QUERY_BUFFER_ALLOWANCE
+        _SDPA_PREFILL_LIVE_QUERY_BUFFER_ALLOWANCE
+        if full_sdpa_prefill
+        else _SDPA_NARROW_LIVE_QUERY_BUFFER_ALLOWANCE
     )
     estimated_live_bytes = (
         score_allowance * score_bytes
@@ -530,7 +533,7 @@ def _sdpa_kv_candidates(
     query_tile_size: int | None = None,
     group_tile_size: int = 1,
     num_outer_tiles: int = 1,
-    nested_hop: bool = False,
+    full_sdpa_prefill: bool = False,
     work_div: dict[str, int] | None = None,
     pad_extent: bool = False,
 ) -> list[_SDPAKVBlockCandidate]:
@@ -539,7 +542,7 @@ def _sdpa_kv_candidates(
     ``pad_extent`` lets SWA cost the aligned physical blocks it will materialize
     instead of requiring every candidate block to divide the logical extent.
     """
-    if nested_hop:
+    if full_sdpa_prefill:
         assert query_tile_size is not None
         # Model every axis visible in the innermost HOP body. CP-SAT can divide
         # any exact combination of these axes, so the per-core score and carry
@@ -604,14 +607,14 @@ def _sdpa_kv_candidates(
             * element_size
         )
         score_bytes, live_bytes = _sdpa_estimated_live_bytes_per_core(
-            batch_size=1 if nested_hop else batch_size,
+            batch_size=1 if full_sdpa_prefill else batch_size,
             heads_per_core=heads_per_core,
             query_rows_per_core=query_rows_per_core,
             kv_block_size=effective_block_size,
             head_dim=head_dim,
             element_size=element_size,
-            restick_bytes_per_core=(restick_bytes_per_core if nested_hop else 0),
-            nested_hop=nested_hop,
+            restick_bytes_per_core=(restick_bytes_per_core if full_sdpa_prefill else 0),
+            full_sdpa_prefill=full_sdpa_prefill,
         )
         blocks_per_group = _kv_blocks_per_loop_group(1, num_blocks)
         num_loop_groups = (num_blocks + blocks_per_group - 1) // blocks_per_group
@@ -752,7 +755,7 @@ def _select_sdpa_tiling(
             query_tile_size=1,
             group_tile_size=1,
             num_outer_tiles=num_outer_tiles,
-            nested_hop=False,
+            full_sdpa_prefill=False,
         )
         feasible_decode = [
             candidate
@@ -853,7 +856,7 @@ def _select_sdpa_tiling(
                             query_tile_size=query_tile_size,
                             group_tile_size=group_tile_size,
                             num_outer_tiles=num_outer_tiles,
-                            nested_hop=True,
+                            full_sdpa_prefill=True,
                         )
                         for candidate in candidates:
                             live_overflow = max(
@@ -1748,10 +1751,13 @@ def spyre__sdpa_overrideable(
     if dropout_p > 0.0:
         raise Unsupported("Attention dropout not implemented for Spyre")
 
-    # Normalize the query to logical [B, H, S, D] order. SDPA routinely receives
-    # transpose(1, 2) views backed by [B, S, H, D] storage, while each HOP level
-    # slices a logical axis. We do not contiguify key/value wholesale because
-    # that can OOM on long KV; they are normalized one bounded tile at a time.
+    # SDPA routinely receives logical [B, H, S, D] queries backed by physical
+    # [B, S, H, D] storage. for_each_tile's explicit dims already preserve the
+    # logical axes, but WhileLoop.create still requires exact input strides and
+    # would otherwise synthesize this normalization. Keep the bounded, one-time
+    # query copy explicit before GQA unflattening. Do not contiguify K/V
+    # wholesale: those copies scale with context length, so the compiler streams
+    # their bounded tiles instead.
     original_query_strides = query.stride()
     if num_heads % num_kvheads != 0:
         raise Unsupported(

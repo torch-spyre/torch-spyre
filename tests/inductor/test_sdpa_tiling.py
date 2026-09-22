@@ -526,7 +526,7 @@ class TestSDPATiling(unittest.TestCase):
             query_tile_size=512,
             group_tile_size=4,
             num_outer_tiles=1,
-            nested_hop=True,
+            full_sdpa_prefill=True,
         )
         k256 = next(
             candidate for candidate in candidates if candidate.block_size == 256
@@ -550,7 +550,7 @@ class TestSDPATiling(unittest.TestCase):
                 query_tile_size=query_tile_size,
                 group_tile_size=group_tile_size,
                 num_outer_tiles=1,
-                nested_hop=True,
+                full_sdpa_prefill=True,
             )
             return next(item for item in candidates if item.block_size == block_size)
 
