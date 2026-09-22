@@ -679,12 +679,28 @@ def _single_arg_op_layout(
 
     in_coords = host_coordinates(in_layout, dep, None)
     out_coords = host_coordinates(output, output_dep, None)
-    if (
+    is_identity_access = (
         in_coords == out_coords
         and in_layout.size == output.size
         and dep.index == output_dep.index
         and same_device_size(in_layout.dtype, out_dtype_for_layout)
-    ):
+    )
+    if aten_op is None and not is_identity_access:
+        # An op with no origins (e.g. a synthetically-constructed
+        # ComputedBuffer like while_loop_bridge.py's carry-snapshot copy)
+        # matches no case above and falls through to here regardless of
+        # aten_op. The identity-access branch right below is sound for any
+        # aten_op (known or None), but the scanning fallback further down
+        # (_output_stl_from_stick_expr/_candidate_output_stls) was designed
+        # around known aten ops' access patterns, not an arbitrary
+        # origins-less op with a real shape/index change. Raise loudly
+        # instead of silently computing a layout for an access pattern this
+        # fallthrough was never built to handle. See issue #4458.
+        raise Unsupported(
+            f"layout propagation for a single-arg op with no origins and a "
+            f"non-identity access (in_layout={in_layout}, output={output})"
+        )
+    if is_identity_access:
         # Input and output tensors are being accessed identically and elem size is the same.
         # We can simply propagate the device_layout including ElementArrangement.
         stl = SpyreTensorLayout(
