@@ -209,7 +209,7 @@ enum class StepKind {
  * @brief Discriminator for SymbolicArg entries.
  *
  * kAddress  – the slot carries the HBM device address of a tensor.
- *             value is resolved via compositeAddressToDmva() on
+ *             value is resolved via compositeAddressToDeviceAddress() on
  *             inputs_outputs[tensor_id].
  * kDimension – the slot carries a runtime tensor dimension size,
  *             resolved by the frontend and stored in SymbolicArg::value.

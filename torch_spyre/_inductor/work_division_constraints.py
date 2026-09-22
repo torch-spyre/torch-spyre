@@ -58,7 +58,7 @@ from .constants import (
     TOPK_MAX_K_PER_CORE,
     TOPK_OPS,
 )
-from .core_mapping import aligned_split_keeps_blocks
+from .core_mapping import aligned_split_keeps_blocks, distribute_aligned_split
 from .errors import Unsupported
 from .ir import FixedTiledLayout
 from .pass_utils import (
@@ -311,6 +311,9 @@ def aligned_ownership_split_domains(
     core 0 output rows {0, 2, 4}, so an LX-resident consumer on the same
     division reads the wrong rows (1 and 4). Admit only the factors
     ``aligned_split_keeps_blocks`` accepts.
+
+    Until #4703's SDK fix is available, also exclude the observed staggered
+    matmul row-order mismatch, using these same aligned segments.
     """
     tensor_deps = [*ctx.input_tds, ctx.output_td]
     accesses = [
@@ -322,7 +325,7 @@ def aligned_ownership_split_domains(
             accesses,
             {symbol: (extent, 1) for symbol, extent in ctx.it_space.items()},
         )
-        _, _, segments = align_tensors_pure(alignment_inputs)
+        _, aligned_tensors, segments = align_tensors_pure(alignment_inputs)
     except Exception:
         # The alignment input is rebuilt ahead of codegen. Codegen reports its
         # own alignment failures; this rule only narrows splits it can prove bad.
@@ -344,8 +347,51 @@ def aligned_ownership_split_domains(
             for factor in divisors(extent)
             if aligned_split_keeps_blocks(factor, bases)
         )
+        if (
+            isinstance(ctx.op.data, Reduction)
+            and ctx.op.data.reduction_type == BATCH_MATMUL_OP
+            and has_staggered_ea_tensor(ctx.input_tds)
+            and symbol not in ctx.stick_vars
+            and symbol not in ctx.reduction_vars
+        ):
+            allowed_splits[symbol] = _matmul_row_order_factors(
+                aligned_tensors[-1], parts, allowed_splits[symbol]
+            )
 
     return ConstraintResult(allowed_splits=allowed_splits)
+
+
+def _matmul_row_order_factors(
+    output: dict[str, list],
+    parts: tuple[tuple[Symbol, int], ...],
+    factors: frozenset[int],
+) -> frozenset[int]:
+    # Temporary SDK guard: torch-spyre/torch-spyre#4703.
+    # Remove once the required SDK includes DeepTools PR #4724.
+    # A flattened row can become several aligned row segments. The backend
+    # produces rows in segment order, but currently drains them in output
+    # memory order. Exclude splits that leave both conflicting segments local.
+    index = sum(
+        coord * math.prod(output["size"][d + 1 :])
+        for d, coord in enumerate(output["coordinates"][:-1])
+    )
+    index = index.expand()
+    strides = [index.coeff(v) for v, _ in parts]
+    if not all(stride.is_Integer and stride > 0 for stride in strides):
+        return factors
+    bases = [int(basis) for _, basis in parts]
+
+    def keeps_row_order(factor: int) -> bool:
+        splits, remaining = distribute_aligned_split(factor, bases)
+        assert remaining == 1  # factor divides the product of the segment bases
+        active = [
+            stride
+            for stride, basis, split in zip(strides, bases, splits)
+            if basis // split > 1
+        ]
+        return all(a > b for a, b in zip(active, active[1:]))
+
+    return frozenset(factor for factor in factors if keeps_row_order(factor))
 
 
 def carried_reduction_pinned_row(

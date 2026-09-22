@@ -287,6 +287,17 @@ jobs:
             exit 0
           fi
 
+          # capability is the same kind of exception as perf: the model-ops suites carry no
+          # test_suite_config.labels either, so the config filter would return an empty matrix.
+          # Unlike perf it IS a matrix -- one job per model config -- so the suite list is
+          # declared in the `model_ops` job's own strategy rather than emitted here, and this
+          # only pins the tier so that job's gate fires and the label-driven `test` matrix skips.
+          if [ "${RAW_TEST_TYPE}" = "capability" ]; then
+            echo "matrix={\"suite\":[]}" >> "$GITHUB_OUTPUT"
+            echo "resolved_test_type=capability" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
           # trunk covers everything torch-spyre's push-to-main workflows
           # exercise across tests/configs/, not just torch_spyre_tests (see
           # Makefile's TEST_TYPE=trunk docs). Every other tier keeps the
@@ -820,6 +831,10 @@ jobs:
           clickhouse-user: ${{ secrets.CLICKHOUSE_USER }}
           clickhouse-pass: ${{ secrets.CLICKHOUSE_PASS }}
           clickhouse-db: ${{ secrets.CLICKHOUSE_DB }}
+          # Without these two the v2 write is a no-op, so benchmark_runs stays empty and the
+          # benchmark path is unreachable -- the perf job is its only producer.
+          clickhouse-db-v2: ${{ secrets.CLICKHOUSE_DB_V2 }}
+          schema: both
 
       # Four honesty lines. Echo only — never upload report.xml (public
       # artifacts would leak benchmark numbers).
@@ -860,6 +875,163 @@ jobs:
           echo "report validation: ${VALIDATION}"
           echo "ClickHouse ingest: ${INGEST}"
           echo "reason: ${REASON}"
+
+  # ---------------------------------------------------------------------------
+  # Job 1c: model-ops capability suites  (test_type=capability only)
+  #
+  # Which torch operations a model exercises, and whether each runs on Spyre or
+  # falls back to the CPU. Like perf, these suites carry no
+  # test_suite_config.labels, so generate_matrix emits an empty matrix and pins
+  # resolved_test_type=capability to reach this job instead. Unlike perf this IS
+  # a matrix -- one job per model config -- so the suite list lives here.
+  #
+  # Folded in from the standalone model_ops_tests_nightly.yaml, which ran its own
+  # cron at the SAME 0 2 * * * as tests-nightly and duplicated the wheel build.
+  # Running under _test_matrix means one nightly, one wheel, and a run_id that is
+  # threaded rather than minted -- which is what lets these results join
+  # artifact_results instead of orphaning.
+  #
+  # POLICY: never on a per-PR trigger. Ten model suites each holding a card
+  # runner is a nightly cost, and the guard below is the hard stop even if a
+  # pull_request path forwarded test_type=capability.
+  # ---------------------------------------------------------------------------
+  model_ops:
+    # The " Spyre" suffix is REQUIRED, not decoration: parse_model_ops_logs.py derives
+    # suite_name from the downloaded log's filename, which is the job name, and skips any
+    # file whose name lacks a \bSpyre\b token. The standalone workflow's jobs were bare
+    # ("GPT OSS 20B"), so every log was skipped and nothing has been ingested since
+    # 2026-09-10 -- 10 days of silent zero-row runs. Renaming a job here is what un-breaks
+    # it; the stored suite_names ("GPT OSS 20B Spyre") show this is the shape the parser
+    # always expected.
+    name: ${{ matrix.suite.name }} Spyre
+    needs: [generate_matrix, build_torch_spyre]
+    if: >-
+      !cancelled() &&
+      github.event_name != 'pull_request' &&
+      needs.generate_matrix.outputs.resolved_test_type == 'capability' &&
+      (needs.build_torch_spyre.result == 'success' ||
+       needs.build_torch_spyre.result == 'skipped')
+    runs-on:
+      - x86_64
+      - spyre_pf_x1
+      - ${{ inputs.runner_label }}
+      - ${{ inputs.image_label }}
+    timeout-minutes: 60
+    env:
+      # GitHub Actions sets CI=true, which makes the pytest inductor tests fail on
+      # a mix of fallbacks and decompositions. Blanked, as the other suites do.
+      CI: ''
+    strategy:
+      fail-fast: false   # one model's failure must not hide the other nine
+      # -----------------------------------------------------------------------
+      # To add a suite: append an entry here.
+      #   - name: <label shown in the GHA UI>
+      #     config: <filename inside tests/configs/model_ops_tests/>
+      # The JUnit report is named after the config (granite-4.1-8b.yaml ->
+      # granite-4.1-8b.xml).
+      # -----------------------------------------------------------------------
+      matrix:
+        suite:
+          - name: GPT OSS 20B
+            config: gpt-oss-20b.yaml
+          - name: Granite 3.3 8B Instruct FMS
+            config: granite-3.3-8b-instruct-fms.yaml
+          - name: Granite 3.3 8B Instruct
+            config: granite-3.3-8b-instruct.yaml
+          - name: Granite 4.1 8B
+            config: granite-4.1-8b.yaml
+          - name: Meta Llama 3.1 8B Instruct
+            config: Meta-Llama-3.1-8B-Instruct.yaml
+          - name: Ministral 3 14B Instruct 2512
+            config: Ministral-3-14B-Instruct-2512.yaml
+          - name: Mistral Small 3.2 24B Instruct 2506
+            config: Mistral-Small-3.2-24B-Instruct-2506.yaml
+          - name: Gemma 4 26B A4B IT
+            config: gemma-4-26B-A4B-it.yaml
+          - name: Gemma 4 12B Instruct
+            config: gemma-4-12B-it.yaml
+          # "7B" kept: suite_name is derived from the job name, and prod's 3,096 rows for this
+          # config are all under 'Qwen 2.5 7B Spyre'. Dropping it would fork the series.
+          - name: Qwen 2.5 7B
+            config: Qwen2.5-7B-Instruct.yaml
+    steps:
+      # Same reasoning as the perf job: the action DEFINITIONS must be in the
+      # workspace even in prebaked mode, so .github is always checked out fresh.
+      - name: Checkout composite actions
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ inputs.ref || github.event.pull_request.head.sha || github.sha }}
+          repository: ${{ inputs.repository || github.event.pull_request.head.repo.full_name || github.repository }}
+          sparse-checkout: .github
+          sparse-checkout-cone-mode: false
+
+      - if: ${{ !inputs.prebaked_image }}
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          path: torch-spyre
+          ref: ${{ inputs.ref || github.event.pull_request.head.sha || github.sha }}
+          repository: ${{ inputs.repository || github.event.pull_request.head.repo.full_name || github.repository }}
+
+      - if: ${{ inputs.checkout_pytorch }}
+        uses: ./.github/actions/checkout-pytorch
+
+      - uses: ./.github/actions/gather-runner-info
+        with:
+          verbose: 'true'
+          torch_spyre_dir: ${{ inputs.prebaked_image && env.PREBAKED_TORCH_SPYRE_DIR || 'torch-spyre' }}
+
+      - name: Install prebuilt torch-spyre
+        if: >-
+          ${{ !inputs.prebaked_image &&
+          (needs.build_torch_spyre.result == 'success' || inputs.torch_spyre_wheel_artifact_name != '') }}
+        uses: ./.github/actions/install-prebuilt-torch-spyre
+        with:
+          artifact_name: ${{ inputs.torch_spyre_wheel_artifact_name || 'torch-spyre-wheel' }}
+
+      - name: Derive report paths
+        run: |
+          REPORT_NAME="${{ matrix.suite.config }}"; REPORT_NAME="${REPORT_NAME%.yaml}.xml"
+          echo "REPORT_NAME=${REPORT_NAME}" >> "$GITHUB_ENV"
+          echo "REPORT_PATH=${GITHUB_WORKSPACE}/${REPORT_NAME}" >> "$GITHUB_ENV"
+
+      - name: Run ${{ matrix.suite.name }} model ops test suite
+        uses: ./.github/actions/run-test-suite
+        with:
+          suite_name: ${{ matrix.suite.name }}
+          config: tests/configs/model_ops_tests/${{ matrix.suite.config }}
+          extra_test_flags: -v
+          junit_xml_path: ${{ env.REPORT_PATH }}
+          report_name: ${{ env.REPORT_NAME }}
+          pre_run: |
+            # Clear the cached AIU setup guard and stale topo.json before every
+            # attempt, so a card left bad by a killed attempt is re-discovered
+            # rather than carrying stale state into the retry.
+            unset _IBM_AIU_SETUP
+            rm -rf /tmp/etc/ibm/spyre/topo.json
+            source /etc/profile.d/ibm-aiu-setup.sh
+
+      # Uploaded even on failure -- a failed run is when the report matters most.
+      # The artifact name is the report filename so ten matrix jobs do not
+      # overwrite one another.
+      - name: Upload JUnit XML report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ env.REPORT_NAME }}
+          path: ${{ env.REPORT_PATH }}
+          if-no-files-found: warn   # warn, not fail, if pytest itself crashed
+          retention-days: 10
+
+      - name: Annotate job with suite metadata
+        if: always()
+        run: |
+          {
+            echo "### Model-ops suite: ${{ matrix.suite.name }}"
+            echo "| Key | Value |"
+            echo "|---|---|"
+            echo "| Config | \`${{ matrix.suite.config }}\` |"
+            echo "| Report | \`${{ env.REPORT_NAME }}\` |"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
 
   # ---------------------------------------------------------------------------
   # Job 2: Multi-Spyre test matrix

@@ -521,23 +521,23 @@ class _Args:
 
 
 def test_component_defaults_to_this_repos_product(ingest):
-    assert ingest.v2_component(_Args(component="")) == "torch-spyre"
+    assert ingest.component_of(_Args(component="")) == "torch-spyre"
 
 
 def test_component_honours_an_explicit_override(ingest):
     # The borrowed-script case: hf-adapters' perf cell runs spyre-perf-suite through THIS
     # script, so its rows must name hf-adapters, not the script's owner.
-    assert ingest.v2_component(_Args(component="hf-adapters")) == "hf-adapters"
+    assert ingest.component_of(_Args(component="hf-adapters")) == "hf-adapters"
 
 
 def test_component_treats_blank_as_absent(ingest):
-    assert ingest.v2_component(_Args(component="   ")) == "torch-spyre"
+    assert ingest.component_of(_Args(component="   ")) == "torch-spyre"
 
 
 def test_component_survives_a_caller_that_passes_no_flag(ingest):
     # An older caller's Namespace has no `component` attribute at all; falling back rather
     # than raising keeps the ingest working while the callers are updated.
-    assert ingest.v2_component(_Args()) == "torch-spyre"
+    assert ingest.component_of(_Args()) == "torch-spyre"
 
 
 def test_component_changes_test_case_identity(ingest):
@@ -545,10 +545,10 @@ def test_component_changes_test_case_identity(ingest):
     # the same test reconciles to a different identity under a different component. This is
     # the defect --component exists to prevent.
     # From the library, which the ingest now uses rather than a local copy.
-    from spyre_clickhouse_ingest import v2_test_case_id
+    from spyre_clickhouse_ingest import case_id_for
 
-    a = v2_test_case_id("torch-spyre", "T", "test_x", [])
-    b = v2_test_case_id("hf-adapters", "T", "test_x", [])
+    a = case_id_for("torch-spyre", "T", "test_x", [])
+    b = case_id_for("hf-adapters", "T", "test_x", [])
     assert a and b and a != b
 
 
@@ -559,17 +559,16 @@ def test_ingest_uses_the_shared_library_not_a_local_copy(ingest):
     import spyre_clickhouse_ingest as lib
 
     for name in (
-        "v2_canonical_arch",
-        "v2_component",
-        "v2_run_id_for",
-        "v2_already_ingested",
-        "insert_v2",
+        "component_of",
+        "run_id_for",
+        "cases_already_ingested",
+        "insert_test_results",
         "extract_properties",
         "promote_xpass",
-        "v2_source_and_external_run_id",
+        "source_and_external_run_id",
         "get_client",
-        "v2_database",
-        "v2_tables_present",
+        "target_database",
+        "tables_present",
     ):
         assert getattr(ingest, name) is getattr(lib, name), name
-    assert ingest.v2_schema is lib.schema
+    assert ingest.schema_model is lib.schema

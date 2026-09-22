@@ -30,7 +30,7 @@ ingest), so there is no sys.path beyond the script's own directory and what `--w
 This module was originally COPIED per repo for that reason; it is now installed as this package
 via `--with`, so the copies and their drift check are gone. Per-repo variation is one constant,
 COMPONENT, which is why a class hierarchy would have been the wrong shape -- and why
-`v2_component` takes the default as a PARAMETER rather than reading it from here.
+`component_of` takes the default as a PARAMETER rather than reading it from here.
 
 WHY NOT THE DRIVER'S OWN SCHEMA SUPPORT. clickhouse-connect has none to use. Its `ColumnDef`
 is what DESCRIBE TABLE returns -- it reads a live table's schema, it cannot declare one or check
@@ -44,17 +44,17 @@ the `uv run --no-project` runtime above rules out. Revisit if that constraint ev
 WHAT IT DELIBERATELY DOES NOT DO. No runtime type coercion (duration_s typed Float32 accepts
 a str), no ClickHouse type mapping, and no identity computation -- run_id and test_case_id
 arrive already computed by the uuid5 helpers, which are untouched by design: changing them
-re-keys the warehouse and silently breaks v2_already_ingested dedup, producing duplicate rows
+re-keys the warehouse and silently breaks cases_already_ingested dedup, producing duplicate rows
 rather than an error.
 """
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
-from collections.abc import Sequence
 
 # The DDL's CHECK constraints, re-expressed. They cannot be read from the server at ingest
-# time, so they are duplicated here -- keep in step with functional_tests_v2.sql (status) and
-# artifacts_v2.sql (the rest).
+# time, so they are duplicated here -- keep in step with schema/10-functional-tests.sql
+# (status) and schema/20-artifacts.sql (the rest).
 STATUS_VALUES = frozenset({"passed", "failed", "error", "skipped", "xfail", "xpass"})
 KIND_VALUES = frozenset({"image", "rpm", "wheel", "generic"})
 ORIGIN_VALUES = frozenset({"built", "copied", "promoted", "upstream"})
@@ -62,9 +62,17 @@ METHOD_VALUES = frozenset({"container-pull", "dnf", "pip", "download"})
 REF_KIND_VALUES = frozenset({"pullspec", "glob", "url"})
 RESULT_KIND_VALUES = frozenset({"functional", "performance", "image"})
 TEST_TYPE_VALUES = frozenset(
-    {"smoke", "unit", "integration", "regression", "trunk", "perf"}
+    {"smoke", "unit", "integration", "regression", "trunk", "perf", "capability"}
 )
+# capability_runs.test_type: which capability analysis produced the row. A sibling vocabulary to
+# TEST_TYPE_VALUES, not a subset of it -- artifact_results calls the whole family 'capability'
+# (one tier alongside regression/perf), and these name the analyses within it.
+CAPABILITY_TYPE_VALUES = frozenset({"model_ops", "model_support"})
 STATE_VALUES = frozenset({"passed", "failed", "error", "running"})
+# capability_runs.status. NOT the test_case_runs vocabulary: a capability that is
+# not_implemented is an unsupported capability, not a skipped test, and a CPU fallback is a
+# `passed` here with backend='cpu' rather than a status of its own.
+CAPABILITY_STATUS_VALUES = frozenset({"passed", "failed", "not_implemented"})
 
 # NOT constrained, deliberately: the DDL documents tag_family as a declared, extensible set
 # ('nightly | weekly | main | pr') with no CHECK, so validating it here would reject a channel
@@ -157,7 +165,7 @@ class Table:
 
 
 # ── the v2 functional/benchmark tables, columns in DDL order ────────────────────────────
-# Source of truth: the CI pipeline's functional_tests_v2.sql.
+# Source of truth: schema/10-functional-tests.sql, alongside this file.
 # `ts` is omitted from every one: it is DEFAULT now() and letting the server set it keeps the
 # ingest clock out of the data.
 
@@ -185,6 +193,9 @@ TEST_CASE_RUNS = Table(
     enums=(("status", STATUS_VALUES),),
 )
 
+# Source of truth: schema/30-benchmarks.sql, alongside this file. `measurements` there is
+# Map(String, Array(Float64)) -- a metric's samples, not one number; this model does no type
+# coercion, so a scalar is refused by the server rather than here.
 BENCHMARKS = Table(
     name="benchmarks",
     columns=("benchmark_id", "component", "name", "tags", "props"),
@@ -209,11 +220,46 @@ BENCHMARK_RUNS = Table(
 )
 
 # ── the four v2 ARTIFACT tables, columns in DDL order ───────────────────────────────────
-# Source of truth: the CI pipeline's artifacts_v2.sql. Modelled here for the same reason as the
-# tables above -- the writer and the readers had no shared statement of a row's shape, and the
-# artifact tables are where that actually cost us.
+# Source of truth: schema/20-artifacts.sql, alongside this file. Modelled here for the same
+# reason as the tables above -- the writer and the readers had no shared statement of a row's
+# shape, and the artifact tables are where that actually cost us.
 #
 # `ts` omitted throughout, as above: DEFAULT now() on the server.
+
+# Source of truth: schema/46-capabilities.sql. The identity/observation split mirrors
+# test_cases/test_case_runs for the same reason: 246,292 v1 rows carried only 46,607 distinct
+# identities, so a flat table repeated the subject and the input signature on every row.
+CAPABILITIES = Table(
+    name="capabilities",
+    columns=(
+        "capability_id",
+        "component",
+        "test_type",
+        "subject",
+        "name",
+        "tags",
+        "props",
+    ),
+    required=("component", "test_type", "name"),
+    identity="capability_id",
+)
+
+CAPABILITY_RUNS = Table(
+    name="capability_runs",
+    columns=(
+        "run_id",
+        "capability_id",
+        "component",
+        "test_type",
+        "arch",
+        "status",
+        "backend",
+        "fail_reason",
+        "props",
+    ),
+    required=("component", "test_type"),
+    enums=(("status", CAPABILITY_STATUS_VALUES),),
+)
 
 ARTIFACTS = Table(
     name="artifacts",
@@ -302,6 +348,8 @@ TABLES = {
         ARTIFACT_REFS,
         ARTIFACT_TAGS,
         ARTIFACT_RESULTS,
+        CAPABILITIES,
+        CAPABILITY_RUNS,
     )
 }
 

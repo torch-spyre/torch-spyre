@@ -41,6 +41,84 @@ on:
         required: false
         default: prod
 
+  # Callable by another repo, so a product repo gets this ingest without a copy of it.
+  # hf-adapters and spyre-inference each forked their own ingest script and both lost
+  # capabilities this one has -- v2 writing, --component, the threaded run_id -- which is
+  # the drift a shared entry point removes. Same inputs as the dispatch path above, plus
+  # the triggering-run metadata a caller must supply because `workflow_call` carries no
+  # github.event.workflow_run context of its own.
+  workflow_call:
+    inputs:
+      gha_run_id:
+        description: GHA run id whose artifacts hold the XML to ingest.
+        required: true
+        type: string
+      workflow_name:
+        description: Name of the workflow that produced them, recorded on the rows.
+        required: true
+        type: string
+      component:
+        description: >-
+          Component to stamp on v2 rows -- the suite's real owner, not whose script runs.
+          It is a test_case_id hash input, so a wrong value re-keys the identity rather
+          than merely mislabelling it.
+        required: true
+        type: string
+      repository:
+        description: owner/repo holding the artifacts. Defaults to the calling repository.
+        required: false
+        type: string
+        default: ''
+      branch:
+        description: Branch recorded on the rows. Defaults to the caller's ref.
+        required: false
+        type: string
+        default: ''
+      sha:
+        description: Commit recorded on the rows. Defaults to the caller's sha.
+        required: false
+        type: string
+        default: ''
+      triggered_at:
+        description: ISO timestamp of the triggering run; empty lets the ingest use its own.
+        required: false
+        type: string
+        default: ''
+      display_title:
+        description: >-
+          run-name of the triggering run, which is how the suite tier is recovered
+          ("integration-tests (<tier>)") without a second API call.
+        required: false
+        type: string
+        default: ''
+      triggering_event:
+        description: push | pull_request | schedule | workflow_dispatch | merge_group.
+        required: false
+        type: string
+        default: ''
+      clickhouse_env:
+        description: prod (default) or dev.
+        required: false
+        type: string
+        default: prod
+    # Declaring this block makes it EXHAUSTIVE: a secret not named here is invisible to the
+    # workflow even when the caller has it. Both the prod and the _DEV set therefore appear,
+    # because the clickhouse_env ternary below reads whichever the caller selected.
+    secrets:
+      CLICKHOUSE_HOST: {required: true}
+      CLICKHOUSE_PORT: {required: true}
+      CLICKHOUSE_USER: {required: true}
+      CLICKHOUSE_PASS: {required: true}
+      CLICKHOUSE_DB: {required: true}
+      # Empty makes the v2 write a no-op, so a caller without it degrades to v1 only.
+      CLICKHOUSE_DB_V2: {required: false}
+      CLICKHOUSE_HOST_DEV: {required: false}
+      CLICKHOUSE_PORT_DEV: {required: false}
+      CLICKHOUSE_USER_DEV: {required: false}
+      CLICKHOUSE_PASS_DEV: {required: false}
+      CLICKHOUSE_DB_DEV: {required: false}
+      CLICKHOUSE_DB_V2_DEV: {required: false}
+
 concurrency:
   # Allow at most one ingest per triggering run (re-runs queue behind)
   group: ingest-${{ github.event.workflow_run.id || inputs.gha_run_id || github.run_id }}
@@ -61,6 +139,7 @@ jobs:
     # Skip if the triggering workflow was cancelled (but ingest failures are fine)
     if: |
       github.event_name == 'workflow_dispatch' ||
+      github.event_name == 'workflow_call' ||
       github.event.workflow_run.conclusion != 'cancelled'
 
     env:
@@ -99,15 +178,19 @@ jobs:
       # Metadata about the triggering run
       TRIGGERING_RUN_ID: ${{ github.event.workflow_run.id || inputs.gha_run_id }}
       TRIGGERING_WORKFLOW: ${{ github.event.workflow_run.name || inputs.workflow_name }}
-      TRIGGERING_BRANCH: ${{ github.event.workflow_run.head_branch || github.ref_name }}
-      TRIGGERING_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
-      TRIGGERING_AT: ${{ github.event.workflow_run.created_at || '' }}
+      TRIGGERING_BRANCH: ${{ github.event.workflow_run.head_branch || inputs.branch || github.ref_name }}
+      TRIGGERING_SHA: ${{ github.event.workflow_run.head_sha || inputs.sha || github.sha }}
+      TRIGGERING_AT: ${{ github.event.workflow_run.created_at || inputs.triggered_at || '' }}
       # display_title carries "integration-tests (<test_type>)" via that workflow's
       # run-name: — this is the only way a workflow_run-triggered job can recover the
       # original dispatch tier (integration/regression/smoke/etc) without an extra API call.
-      TRIGGERING_DISPLAY_TITLE: ${{ github.event.workflow_run.display_title || '' }}
+      TRIGGERING_DISPLAY_TITLE: ${{ github.event.workflow_run.display_title || inputs.display_title || '' }}
       # Triggering event (push/pull_request/schedule/workflow_dispatch/merge_group; empty on manual re-ingest) -- gates the PR-number lookup below.
-      TRIGGERING_EVENT: ${{ github.event.workflow_run.event || '' }}
+      TRIGGERING_EVENT: ${{ github.event.workflow_run.event || inputs.triggering_event || '' }}
+      # The repo whose artifacts and PRs are read. A workflow_call from another repo must name
+      # itself here: github.repository is the CALLER on a called workflow, but the artifacts
+      # API and the PR lookup below both need it explicitly rather than by luck.
+      TRIGGERING_REPO: ${{ inputs.repository || github.repository }}
 
 
     steps:
@@ -171,7 +254,7 @@ jobs:
           # An unconditional commit->PR lookup stamped a trunk/scheduled run with whatever PR previously merged that commit; only trust it for an actual pull_request-triggered run.
           if [[ "${TRIGGERING_EVENT}" == "pull_request" ]]; then
             PR=$(gh api \
-              "/repos/${{ github.repository }}/commits/${TRIGGERING_SHA}/pulls" \
+              "/repos/${TRIGGERING_REPO}/commits/${TRIGGERING_SHA}/pulls" \
               --jq '.[0].number // 0')
           else
             PR=0
@@ -202,7 +285,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           ARTIFACTS=$(gh api --paginate \
-            "/repos/${{ github.repository }}/actions/runs/${TRIGGERING_RUN_ID}/artifacts?per_page=100" \
+            "/repos/${TRIGGERING_REPO}/actions/runs/${TRIGGERING_RUN_ID}/artifacts?per_page=100" \
             --jq '.artifacts[] | {id: .id, name: .name}' \
             | python3 -c "import json,sys; print(json.dumps([json.loads(l) for l in sys.stdin if l.strip()]))")
           echo "artifacts=$ARTIFACTS" >> "$GITHUB_OUTPUT"
@@ -218,7 +301,9 @@ jobs:
           python3 <<'PYEOF'
           import json, os, subprocess, sys
           artifacts = json.loads(os.environ['ARTIFACTS'])
-          repo  = os.environ['GITHUB_REPOSITORY']
+          # TRIGGERING_REPO, not GITHUB_REPOSITORY: on a called workflow the latter is the
+          # CALLER, and the artifacts live in the repo whose run produced them.
+          repo  = os.environ['TRIGGERING_REPO']
           for a in artifacts:
               print(f"Downloading: {a['name']} (id={a['id']})")
               with open(f"xml_artifacts/{a['name']}.zip", "wb") as f:
@@ -259,20 +344,11 @@ jobs:
       # GHA-initiated run => empty => the ingest derives its own id from the run coordinate.
       - name: Recover threaded run_id
         id: threaded-run-id
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          RID=""
-          AID=$(gh api --paginate \
-            "/repos/${{ github.repository }}/actions/runs/${TRIGGERING_RUN_ID}/artifacts?per_page=100" \
-            --jq '.artifacts[] | select(.name == "run-id") | .id' | head -1)
-          if [[ -n "${AID}" ]]; then
-            gh api "/repos/${{ github.repository }}/actions/artifacts/${AID}/zip" > run-id.zip || true
-            unzip -o -q run-id.zip -d run-id-dir || true
-            RID=$(tr -d '[:space:]' < run-id-dir/run-id.txt 2>/dev/null || echo "")
-          fi
-          echo "Threaded run_id: ${RID:-<none, ingest will derive>}"
-          echo "run_id=${RID}" >> "${GITHUB_OUTPUT}"
+        uses: ./.github/actions/recover-threaded-run-id
+        with:
+          triggering-run-id: ${{ env.TRIGGERING_RUN_ID }}
+          repository: ${{ env.TRIGGERING_REPO }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Ingest XML files into ClickHouse
         uses: ./.github/actions/ingest-xml-to-clickhouse

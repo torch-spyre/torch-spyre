@@ -198,16 +198,16 @@ def test_several_tiers_in_one_call(ing):
 def test_executed_rows_are_stamped_with_this_run(ing):
     """`ran_in = run_id` is what makes "how much did we actually execute" answerable:
     countIf(props['ran_in'] = run_id). Without it every reuse copy inflates that count."""
-    # insert_v2 now lives in the shared library, so read it from there.
-    import spyre_clickhouse_ingest.v2_writer as writer
+    # insert_test_results now lives in the shared library, so read it from there.
+    import spyre_clickhouse_ingest.writer as writer
 
     src = pathlib.Path(writer.__file__).read_text()
-    insert_v2 = src[src.index("def insert_v2(") :]
-    # insert_v2 is the last function in the module, so there may be no following `def`.
-    nxt = insert_v2.find("\ndef ")
+    insert_test_results = src[src.index("def insert_test_results(") :]
+    # insert_test_results is the last function in the module, so there may be no following `def`.
+    nxt = insert_test_results.find("\ndef ")
     if nxt > 0:
-        insert_v2 = insert_v2[:nxt]
-    assert '"ran_in": run_id' in insert_v2
-    assert "source_file" in insert_v2, (
+        insert_test_results = insert_test_results[:nxt]
+    assert '"ran_in": run_id' in insert_test_results
+    assert "source_file" in insert_test_results, (
         "the shard discriminator must survive alongside it"
     )

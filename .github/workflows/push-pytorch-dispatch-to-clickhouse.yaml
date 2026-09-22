@@ -114,6 +114,9 @@ jobs:
         with:
           sparse-checkout: |
             .github/scripts/ingest_pytorch_dispatch.py
+            # The ingest imports it; listing only the entry point fails the import at startup.
+            extensions/clickhouse-ingest
+          sparse-checkout-cone-mode: false
 
       - name: Write dispatch payload to file
         env:
@@ -139,7 +142,15 @@ jobs:
       - name: Install Python dependencies
         run: |
           source .venv/bin/activate
-          uv pip install clickhouse-connect regex
+          # Installed from this checkout, not a git URL, so the library is always the same commit
+          # as the script importing it.
+          CHLIB="${GITHUB_WORKSPACE}/extensions/clickhouse-ingest"
+          if [ ! -f "${CHLIB}/pyproject.toml" ]; then
+            echo "::error::spyre-clickhouse-ingest not found at ${CHLIB} -- the checkout step must" \
+                 "sparse-checkout extensions/clickhouse-ingest with cone mode off."
+            exit 1
+          fi
+          uv pip install clickhouse-connect regex "${CHLIB}"
           echo "VIRTUAL_ENV $VIRTUAL_ENV"
 
       - name: Classify dispatch and ingest into ClickHouse

@@ -82,6 +82,7 @@ from .ir import (
 from .pass_utils import (
     compute_restickify_target_layout,
     concretize_expr,
+    expand_sparse,
     find_matmul_generated_var,
     find_reduction_var,
     get_matmul_m_size,
@@ -92,7 +93,6 @@ from .pass_utils import (
     try_device_coordinates,
     indirect_info_from_op,
     is_keep_by_index,
-    is_sparse_stl,
     is_stick_expr_offset_free,
     is_topk,
     iter_var_id,
@@ -224,15 +224,23 @@ def _project_pointwise_dim_order(
 ) -> list[int]:
     """Project a pointwise output order onto a trailing-aligned input."""
     rank_diff = output_rank - input_rank
+
+    if rank_diff == -1 and dim_order[-1] == -1:
+        return dim_order
+
     if rank_diff >= 0:
-        return [d - rank_diff for d in dim_order if d >= rank_diff]
+        return [
+            (d - rank_diff if d != -1 else d)
+            for d in dim_order
+            if (d >= rank_diff or d == -1)
+        ]
 
     # A loop tile can be a rank-preserving view of a higher-rank backing
     # buffer. Its extra leading axes are fixed by the loop, while the body
     # operates on the trailing axes. Keep those backing axes in the layout
     # permutation and shift the body's order onto the trailing dimensions.
     leading = list(range(-rank_diff))
-    return leading + [d - rank_diff for d in dim_order]
+    return leading + [(d - rank_diff if d != -1 else d) for d in dim_order]
 
 
 def _pick_stick_dim(stick_expr, out_coords) -> int:
@@ -254,7 +262,9 @@ def _output_stl_from_stick_expr(
         return None
     out_coords = host_coordinates(output, output_dep, None)
     out_stick_dim = _pick_stick_dim(stick_expr, out_coords)
-    return _make_output_stl(output, output_dep, c_size, c_stride, out_stick_dim, dtype)
+    return _make_output_stl(
+        out_coords, output_dep, c_size, c_stride, out_stick_dim, dtype
+    )
 
 
 def _dims_by_alignment(dims, sizes, stick_size: int) -> tuple[list[int], list[int]]:
@@ -275,17 +285,15 @@ def _dims_by_alignment(dims, sizes, stick_size: int) -> tuple[list[int], list[in
 
 
 def _make_output_stl(
-    output, output_dep, c_size, c_stride, stick_dim, dtype=None
+    out_coords, output_dep, c_size, c_stride, stick_dim, dtype
 ) -> SpyreTensorLayout | None:
     """Build a candidate output STL with stick_dim last and verify the resulting stick is offset-free.
 
     Returns None if the resulting stick expression has an offset.
     """
-    dtype = output.dtype if dtype is None else dtype
     stick_size = get_elem_in_stick(dtype)
     if stick_dim >= 0 and c_size[stick_dim] == 1:
         return None
-    out_coords = host_coordinates(output, output_dep, None)
     dim_order = _compute_dim_order(stick_dim, c_size, out_coords)
     stl = SpyreTensorLayout(c_size, c_stride, dtype, dim_order)
     coords = device_coordinates(stl, output_dep, None)
@@ -295,30 +303,28 @@ def _make_output_stl(
 
 
 def _candidate_output_stls(
-    output: FixedLayout,
+    out_coords,
     output_dep: MemoryDep,
     c_size: list,
     c_stride: list,
     skip_stick_expr: sympy.Expr,
-    dtype=None,
+    dtype,
 ) -> list[SpyreTensorLayout]:
     """Enumerate candidate output STLs by trying each dim as the stick.
 
     Skip the dim that already produces an unsupported stick.
     """
-    out_coords = host_coordinates(output, output_dep, None)
     skip_dim = _pick_stick_dim(skip_stick_expr, out_coords)
 
-    dtype = output.dtype if dtype is None else dtype
     stick_size = get_elem_in_stick(dtype)
     # Prefer stick-aligned dims; fall back to unaligned dims (padded later by
     # insert_restickify_padding) only when no aligned dim yields a candidate.
-    all_dims = [d for d in range(len(output.size)) if d != skip_dim]
-    aligned_dims, unaligned_dims = _dims_by_alignment(all_dims, output.size, stick_size)
+    all_dims = [d for d in range(len(c_size)) if d != skip_dim]
+    aligned_dims, unaligned_dims = _dims_by_alignment(all_dims, c_size, stick_size)
     stls: list[SpyreTensorLayout] = []
     for dims in (aligned_dims, unaligned_dims):
         for d in dims:
-            stl = _make_output_stl(output, output_dep, c_size, c_stride, d, dtype)
+            stl = _make_output_stl(out_coords, output_dep, c_size, c_stride, d, dtype)
             if stl is not None:
                 stls.append(stl)
         if stls:
@@ -538,7 +544,7 @@ def _single_arg_op_layout(
                     if out_stick_dim < 0:
                         continue
                 out_stl = _make_output_stl(
-                    output,
+                    out_coords,
                     output_dep,
                     c_size,
                     c_stride,
@@ -701,7 +707,7 @@ def _single_arg_op_layout(
     if out_stl is not None:
         return [out_stl]
     return _candidate_output_stls(
-        output,
+        out_coords,
         output_dep,
         c_size,
         c_stride,
@@ -768,7 +774,7 @@ def _clone_layout(
     in_host_coords = host_coordinates(in_layout, in_dep, None)
     required_in_stl = None
     for candidate in _candidate_output_stls(
-        output, output_dep, c_size, c_stride, stick_expr, dtype_for_layout
+        out_coords, output_dep, c_size, c_stride, stick_expr, dtype_for_layout
     ):
         target_stick = device_coordinates(candidate, output_dep, None)[-1]
         target_stl = compute_restickify_target_layout(
@@ -1568,6 +1574,10 @@ def _multi_arg_pointwise_layouts(
             )
             c_in_size = [concretize_expr(s) for s in arg.layout.size]
             c_in_stride = [concretize_expr(s) for s in arg.layout.stride]
+            if len(c_in_size) < len(dim_order) and dim_order[-1] == -1:
+                c_in_size.append(0)
+                c_in_stride.append(0)
+            assert len(c_in_size) == len(projected_dim_order)
             in_stl = SpyreTensorLayout(
                 c_in_size,
                 c_in_stride,
@@ -1589,6 +1599,8 @@ def _multi_arg_pointwise_layouts(
                         return False
         return True
 
+    results: list[SpyreTensorLayout] = []
+
     def _try_stick_dim(stick_dim):
         dim_order = _compute_dim_order(stick_dim, c_size, out_coords)
         if _is_supported_layout(dim_order):
@@ -1597,8 +1609,6 @@ def _multi_arg_pointwise_layouts(
                     c_size, c_stride, out_dtype_for_layout, dim_order, output_ea
                 )
             )
-
-    results: list[SpyreTensorLayout] = []
 
     if can_use_same_layout:
         template_stl = next(iter(args[0].layouts))
@@ -1762,7 +1772,9 @@ def _topk_layouts(
             out_dim_order += [out_stick_dim]
         results.append(SpyreTensorLayout(c_size, c_stride, output.dtype, out_dim_order))
 
-    op.restick_cost_fn = AllSameNode.from_args(args, results, output_dep, op)
+    op.restick_cost_fn = AllSameNode.from_args(
+        args, results, output_dep, op, forbidden_stick_sym=reduction_var
+    )
     return results
 
 
@@ -1781,28 +1793,7 @@ def _compact_layout(
     out_layouts = []
 
     for in_stl in in_arg.layouts:
-        c_size = [concretize_expr(s) for s in output.size]
-        c_stride = [concretize_expr(s) for s in output.stride]
-
-        out_stl = SpyreTensorLayout(
-            c_size, c_stride, output.dtype, list(range(len(output.size)))
-        )
-
-        in_is_sparse = is_sparse_stl(in_stl)
-        out_is_sparse = is_sparse_stl(out_stl)
-
-        if not in_is_sparse:
-            assert not out_is_sparse
-
-        restick = len(in_stl.device_size) > 1 and in_is_sparse and not out_is_sparse
-
-        if restick:
-            out_stl = SpyreTensorLayout(
-                [in_stl.elems_per_stick()] + out_stl.device_size,
-                [c_stride[0] * c_size[0]] + out_stl.stride_map,
-                out_stl.device_dtype,
-            )
-
+        _, out_stl = expand_sparse(in_stl, output)
         out_layouts.append(out_stl)
 
     op.restick_cost_fn = AnyInNode.from_args()
@@ -2320,8 +2311,9 @@ def _find_alt_target_stl(
 
     c_size = [concretize_expr(s) for s in target_layout.size]
     c_stride = [concretize_expr(s) for s in target_layout.stride]
+    target_coords = host_coordinates(target_layout, output_dep, None)
     candidates = _candidate_output_stls(
-        target_layout, output_dep, c_size, c_stride, write_stick, dtype_for_layout
+        target_coords, output_dep, c_size, c_stride, write_stick, dtype_for_layout
     )
     if not candidates:
         raise Unsupported(

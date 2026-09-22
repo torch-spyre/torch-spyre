@@ -15,7 +15,10 @@ see [Adding Operations](../compiler/adding_operations.md).
 | `torch.matmul` | Y | Y | Spyre | Decomposes to `mm`/`bmm`, both of which have eager kernels |
 | `torch.addmm` | Y | Y | Spyre | Decomposed to `mm` + `add` |
 | `torch.bmm` | Y | Y | Spyre | |
-| `torch._scaled_mm` | | Y | Spyre | Compiled only; decomposed to `spyre.scaled_mm` (decomposition in `_inductor/decompositions.py`, lowering in `_inductor/lowering.py`) |
+| `torch._scaled_mm` | Y | Y | Spyre | Decomposed to `spyre.scaled_mm` (decomposition in `_inductor/decompositions.py`, lowering in `_inductor/lowering.py`); eager dispatch compiles the op through the `COMPILED_OPS` kernel in `ops/eager.py` |
+| `torch.ops.spyre.quantize_fp8_with_scale` | Y | Y | Spyre | Custom op; scales, clamps to the E4M3 range, and converts to FP8 |
+| `torch.ops.spyre.quantize_weight_fp8_with_scale` | Y | Y | Spyre | Custom op; weight-side FP8 quantization |
+| `torch.ops.spyre.dequantize_fp8_with_scale` | Y | Y | Spyre | Custom op; converts FP8 to FP16 then multiplies by the scale |
 | `torch.nn.functional.linear` | Y | Y | Spyre | Decomposed to `matmul` + `add` |
 | `torch.nn.functional.conv2d` | Y | Y | Spyre | Custom decomposition (`conv2d_via_bmm`); CPU fallback for the im2col step |
 | `torch.nn.functional.avg_pool2d` | | Y | Spyre | Compiled only; custom lowering |
@@ -29,7 +32,7 @@ see [Adding Operations](../compiler/adding_operations.md).
 | `torch.nn.functional.sigmoid` | Y | Y | Spyre | |
 | `torch.nn.functional.softplus` | Y | Y | Spyre | Custom op + lowering |
 | `torch.nn.functional.dropout` | Y | Y | Spyre | |
-| `torch.nn.functional.scaled_dot_product_attention` | Y | Y | Spyre | Custom decomposition (flash-attention-style tiled online softmax); auto-registers a PrivateUse1 kernel for eager dispatch |
+| `torch.nn.functional.scaled_dot_product_attention` | Y | Y | Spyre | Custom decomposition (flash-attention-style tiled online softmax) with native grouped-query attention: K/V keep their head count and gain a unit broadcast axis rather than materializing `Hq` copies; auto-registers a PrivateUse1 kernel for eager dispatch |
 | `torch.ops.spyre.sliding_window_attention` | | Y | Spyre | Compiled-only custom op; runtime additive mask, causal and non-causal paths, native GQA |
 | **Pointwise Unary** | | | | |
 | `torch.abs` | Y | Y | Spyre | |
@@ -48,7 +51,7 @@ see [Adding Operations](../compiler/adding_operations.md).
 | `torch.sin` | Y | Y | Spyre | Custom decomposition (Cody-Waite range reduction + degree-9 Taylor); max abs error ~5e-5 in fp32 |
 | `torch.cos` | Y | Y | Spyre | Custom decomposition (Cody-Waite range reduction + degree-9 Taylor); max abs error ~5e-5 in fp32 |
 | `torch.clamp` | Y | Y | Spyre | Custom op + lowering |
-| `torch.pow` | Y | Y | Spyre | |
+| `torch.pow` | Y | Y | Spyre | `pow.Tensor_Scalar` custom decomposition (`exp(n·log(x))` with an integer fast path); an integer base raises |
 | `torch.nn.functional.mish` | Y | Y | Spyre | Eager via `aten.mish.out` |
 | **Pointwise Binary** | | | | |
 | `torch.add` | Y | Y | Spyre | Supports `alpha` parameter |
@@ -92,7 +95,7 @@ see [Adding Operations](../compiler/adding_operations.md).
 | `torch.unsqueeze` | | Y | Spyre | Partial; some shapes trigger internal recompile |
 | `torch.flatten` | | Y | Spyre | Compiled only (lowers via `reshape`) |
 | `torch.cat` | Y | Y | Spyre | |
-| `torch.stack` | Y | | Spyre | Eager only |
+| `torch.stack` | Y | Y | Spyre | Registered on the compiled path (`ops/eager.py` `COMPILED_OPS`); the eager kernel dispatches through `torch.compile` |
 | `torch.repeat` | | Y | Spyre | Compiled only. `repeat.out` is available as a CPU fallback |
 | `torch.unbind` | Y | Y | Spyre | |
 | `torch.Tensor.unfold` | Y | Y | Spyre | View op |

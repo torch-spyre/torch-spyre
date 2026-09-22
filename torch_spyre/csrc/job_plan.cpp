@@ -145,8 +145,9 @@ std::vector<int64_t> JobPlanStepHostCompute::resolveSymbolicArgs(
                 " out of range [0, ", tensors.size(), ")");
     switch (arg.kind) {
       case SymbolicArgKind::kAddress:
-        resolved[i] = static_cast<int64_t>(allocator.compositeAddressToDmva(
-            *get_composite_address(tensors[arg.tensor_id])));
+        resolved[i] =
+            static_cast<int64_t>(allocator.compositeAddressToDeviceAddress(
+                *get_composite_address(tensors[arg.tensor_id])));
         break;
       case SymbolicArgKind::kDimension:
         TORCH_CHECK(false,
@@ -227,9 +228,11 @@ void JobPlanStepHostCompute::construct(LaunchContext& ctx,
   int addr_idx = 0;
   auto& allocator = SpyreAllocator::instance();
   for (auto& tensor : ctx.inputs_outputs) {
-    int64_t addr = static_cast<int64_t>(allocator.compositeAddressToDmva(
-        (static_cast<SharedOwnerCtx*>(tensor.storage().data_ptr().get_context())
-             ->composite_addr)));
+    int64_t addr =
+        static_cast<int64_t>(allocator.compositeAddressToDeviceAddress(
+            (static_cast<SharedOwnerCtx*>(
+                 tensor.storage().data_ptr().get_context())
+                 ->composite_addr)));
     addresses[addr_idx++] = addr;
   }
 

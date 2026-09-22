@@ -62,6 +62,19 @@ inputs:
       the ingest script falls back to its own host-arch default.
     required: false
     default: ''
+  script-repo:
+    description: >
+      Repository holding the canonical ingest script, for the sparse-checkout
+      fallback. Consumers outside torch-spyre must keep this default -- without
+      it the fallback checks out the CALLING repo and finds no script.
+    required: false
+    default: torch-spyre/torch-spyre
+  script-ref:
+    description: >
+      Ref of script-repo to check out. Pin to a tag from another repo; the
+      default tracks that repo's default branch.
+    required: false
+    default: ''
   torch-spyre-dir:
     description: >
       Fallback directory containing .github/scripts/ingest_xml.py when the
@@ -161,10 +174,16 @@ runs:
           echo "need-checkout=true" >> "$GITHUB_OUTPUT"
         fi
 
+    # `repository` and `path` are both load-bearing for callers outside torch-spyre: without
+    # repository this checks out the CALLING repo and finds no script, and without path it
+    # overwrites the caller's workspace (its XML included).
     - name: Checkout ingest script (fallback)
       if: steps.gate.outputs.configured == 'true' && steps.locate.outputs.need-checkout == 'true'
       uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       with:
+        repository: ${{ inputs.script-repo }}
+        ref: ${{ inputs.script-ref }}
+        path: .ingest-src
         sparse-checkout: |
           .github/scripts/ingest_xml.py
           extensions/clickhouse-ingest
@@ -173,7 +192,7 @@ runs:
     - name: Set ingest script path (fallback)
       if: steps.gate.outputs.configured == 'true' && steps.locate.outputs.need-checkout == 'true'
       shell: bash
-      run: echo "INGEST_SCRIPT=${GITHUB_WORKSPACE}/.github/scripts/ingest_xml.py" >> "$GITHUB_ENV"
+      run: echo "INGEST_SCRIPT=${GITHUB_WORKSPACE}/.ingest-src/.github/scripts/ingest_xml.py" >> "$GITHUB_ENV"
 
     - name: Install uv
       if: steps.gate.outputs.configured == 'true'
@@ -239,7 +258,7 @@ runs:
         [ -n "${CH_PORT_IN}" ] && export CLICKHOUSE_PORT="${CH_PORT_IN}"
         [ -n "${CH_USER_IN}" ] && export CLICKHOUSE_USER="${CH_USER_IN}"
         [ -n "${CH_DB_IN}" ] && export CLICKHOUSE_DB="${CH_DB_IN}"
-        # Only exported when non-empty: v2_database() treats an unset value as "v2 not
+        # Only exported when non-empty: target_database() treats an unset value as "v2 not
         # configured", which is what makes the v1 default cost nothing.
         [ -n "${CH_DB_V2_IN}" ] && export CLICKHOUSE_DB_V2="${CH_DB_V2_IN}"
         [ -n "${SCHEMA_IN}" ] && export INGEST_SCHEMA="${SCHEMA_IN}"

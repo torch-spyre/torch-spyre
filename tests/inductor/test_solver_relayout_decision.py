@@ -63,6 +63,24 @@ _CORE = sympy.Symbol("core_id")
 _PER_CORE = 16  # P is 64 bytes sliced 4 ways
 
 
+@pytest.mark.parametrize(
+    "cap,costs,expected",
+    [(1, {0: 10000, 1: 1000}, [1]), (1, None, [0]), (0, {0: 10000, 1: 1000}, [0, 1])],
+)
+def test_relayout_shortlist_prices_the_consumer(monkeypatch, cap, costs, expected):
+    """Saving 500 ns on a copy must not hide a 9000 ns faster consumer."""
+    monkeypatch.setattr(config, "lx_solver_relayout_groups_per_edge", cap)
+    candidates = [
+        _candidate("C", 0, 500, group=0, j=0),
+        _candidate("C", 0, 1000, group=1, j=1),
+    ]
+    divisions = [CoreDivision(splits={sympy.Symbol("d0"): 4})] * 2
+    kept = CoOptimizingAllocator._cap_relayout_groups(
+        "P", "C", candidates, divisions, costs
+    )
+    assert [c.group for c in kept] == expected
+
+
 def _view(slot: int, num_cores: int = 4) -> PerCoreView:
     """A 4-way per-core view of device dim 1 on ``num_cores`` cores; ``slot``
     rotates the ownership so distinct slots are distinct (relayout-compatible)
@@ -151,7 +169,7 @@ def _disjoint(a_addr, b_addr, footprint=_PER_CORE) -> bool:
 
 
 @pytest.mark.parametrize("priced", [False, True])
-def test_priced_relayout_search_does_not_depend_on_copy_count(monkeypatch, priced):
+def test_relayout_solve_presolves_by_default(monkeypatch, priced):
     from ortools.sat.python import cp_model
 
     p = _producer([0, 1])
@@ -167,7 +185,7 @@ def test_priced_relayout_search_does_not_depend_on_copy_count(monkeypatch, price
 
     monkeypatch.setattr(cp_model.CpSolver, "Solve", solve)
     result = _solve(buffers, expr=_objective(buffers) if priced else None)
-    assert parameters and all(value == (not priced) for value in parameters)
+    assert parameters and all(parameters)
     assert (_copy(result).address is not None) == priced
 
 

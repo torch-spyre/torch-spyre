@@ -1486,8 +1486,8 @@ def piecewise(*args):
 
 _PT_ROWS = 8  # PT block rows per corelet
 
-# Constants for the matmul cost model (_matmul_split_cost). Each is either an
-# AIU hardware limit or a coefficient fit to measured device kernel times.
+# Constants shared by the execution estimate and standalone split ranking.
+# Additive ranking preferences below are not whole-program operation latencies.
 _TARGET_PT_PASSES = 5  # per-core M that keeps the PT pipeline full = this * _PT_ROWS
 _TARGET_M_TIE_PASSES = 4  # enough M lanes to keep the stationary weights fed
 _PT_EFFICIENCY_EXPONENT = 0.25
@@ -1514,7 +1514,28 @@ _SHARED_NARROW_OUTPUT_REF = _TARGET_N_TILE_ELEMS * _COHORT_LIMIT
 _SHARED_N_TILE_TARGET = _TARGET_N_TILE_ELEMS // 4
 
 
-def _matmul_split_cost(
+def _matmul_multicast_penalty(consumers):
+    """Existing bandwidth derate for cores sharing one operand load.
+
+    Symbolic degrees are integer products bounded by the configured core
+    budget. Tabulate that finite domain: fractional symbolic powers cannot
+    be passed directly to CP-SAT. Numeric callers use the same formula.
+    """
+    if isinstance(consumers, sympy.Basic) and consumers.free_symbols:
+        return sympy.Piecewise(
+            *(
+                (
+                    (degree / _COHORT_LIMIT) ** _COHORT_PENALTY_EXPONENT,
+                    sympy.Eq(consumers, degree),
+                )
+                for degree in range(_COHORT_LIMIT + 1, config.sencores + 1)
+            ),
+            (1.0, True),
+        )
+    return max(1.0, (consumers / _COHORT_LIMIT) ** _COHORT_PENALTY_EXPONENT)
+
+
+def _matmul_execution_cost(
     b_axis: tuple[int, int],
     m_axis: tuple[int, int],
     n_axis: tuple[int, int],
@@ -1530,16 +1551,16 @@ def _matmul_split_cost(
     ``include_hbm=False`` drops the operand/output HBM-traffic term for a caller
     that charges that traffic itself (``cost_model._matmul_ns_upstream``, whose
     bundle memory term counts the same bytes and knows about LX residency). The
-    cohort bandwidth penalty scales only that term, so it drops out with it.
+    sharing penalty drops out of this function with that term. ``predict_ops``
+    charges shared-input delivery separately, using each operand's consumers.
+
+    Array underfill remains an efficiency factor on computation. Standalone
+    split-ranking preferences belong to ``_matmul_split_cost``, not this estimate.
     """
     (B, b), (M, m), (N, n), (K, k) = b_axis, m_axis, n_axis, k_axis
     cores_used = b * m * n * k
-    # SYMBOLIC SPLITS SKIP THE BUDGET CHECK (`isinstance` is False for a sympy
-    # expression), and the fall-through cost is not merely mispriced but NEGATIVE
-    # outside the budget -- what a minimizing objective seeks. Valid only within
-    # `max_cores`, therefore, and it is the CALLER that has to hold that: the symbolic
-    # expression is built over one enumerated CoreDivision per op, which
-    # `CoOptimizingAllocator._division_map` asserts is within budget (issue #4387).
+    # Symbolic splits rely on the caller's enumerated candidate menu to enforce
+    # the core budget; a symbolic expression cannot take this Python branch.
     if cores_used == 0 or (isinstance(cores_used, int) and cores_used > max_cores):
         return math.inf
 
@@ -1557,7 +1578,13 @@ def _matmul_split_cost(
             True,
         ),
     )
+    # The peak includes both corelets. DXP's doCoreletSplitSdsc leaves an op
+    # requiring cross-core reduction on one corelet, so a K-split has half
+    # that compute throughput. This is separate from moving the partial sums.
+    # Keep the existing unsplit estimate; small/unaligned output tiles may
+    # also prevent the backend from using both corelets.
     compute_us = pt_eff_inv * (num_elems / cores_used) / _PEAK_MACS_US_CORE
+    compute_us = piecewise((2 * compute_us, k > 1), (compute_us, True))
 
     # HBM: every input operand is broadcast to the cohort of cores splitting the
     # orthogonal dim. Past _COHORT_LIMIT the broadcasts contend for the shared
@@ -1566,9 +1593,7 @@ def _matmul_split_cost(
         weight_batches = 1 if shared_weight else B
         bytes_total = (B * M * K + weight_batches * K * N + B * M * N) * _DTYPE_BYTES
         fanout_split = max(m, n) if shared_weight else n
-        cohort_penalty = max(
-            1.0, (fanout_split / _COHORT_LIMIT) ** _COHORT_PENALTY_EXPONENT
-        )
+        cohort_penalty = _matmul_multicast_penalty(fanout_split)
         hbm_us = bytes_total / (_HBM_BW_GBS * 1000) * cohort_penalty
     else:
         hbm_us = 0.0
@@ -1580,8 +1605,34 @@ def _matmul_split_cost(
     output_elems_per_core = (B * M * N) / (b * m * n)
     psum_us = max(0, k - 1) * output_elems_per_core * psum_coeff
 
+    return compute_us + hbm_us + psum_us
+
+
+def _matmul_split_cost(
+    b_axis: tuple[int, int],
+    m_axis: tuple[int, int],
+    n_axis: tuple[int, int],
+    k_axis: tuple[int, int],
+    max_cores: int,
+    shared_weight: bool = False,
+    include_hbm: bool = True,
+) -> float:
+    """Standalone split-ranking score: execution estimate plus preferences.
+
+    The additive preferences preserve this chooser's existing behavior. They
+    are not operation latencies for a whole-program optimizer to sum.
+    """
+    execution_us = _matmul_execution_cost(
+        b_axis, m_axis, n_axis, k_axis, max_cores, shared_weight, include_hbm
+    )
+    if execution_us == math.inf:
+        return execution_us
+    (_, b), (M, m), (N, n), (K, k) = b_axis, m_axis, n_axis, k_axis
+    cores_used = b * m * n * k
+    m_t = M // m if m else 1
+
     # Tie-break: among compute-equivalent splits prefer exposing enough M lanes
-    # to stream work over the stationary weight tile. PT efficiency above handles
+    # to stream work over the stationary weight tile. The execution estimate handles
     # the opposite case where an M split makes each per-core tile too short.
     target_m = max(
         _M_MIN,
@@ -1647,9 +1698,7 @@ def _matmul_split_cost(
     batch_split_us = 0.0 if shared_weight else log2(b) * _BMM_BATCH_SPLIT_PENALTY_US
 
     return (
-        compute_us
-        + hbm_us
-        + psum_us
+        execution_us
         + m_lane_underuse_us
         + m_tile_underfill_us
         + wide_n_us

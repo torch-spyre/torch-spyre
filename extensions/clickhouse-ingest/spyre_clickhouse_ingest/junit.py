@@ -73,7 +73,7 @@ def _runner_run_id(args, run_id: str) -> str:
     return run_id
 
 
-def v2_source_and_external_run_id(args, run_id: str):
+def source_and_external_run_id(args, run_id: str):
     """(source, external_run_id) for this leg, from whichever CI dispatched it.
 
     A numeric --gha-run-id means GHA dispatched it. Otherwise the leg is
@@ -83,7 +83,7 @@ def v2_source_and_external_run_id(args, run_id: str):
     `source` is required precisely because a GHA run id and a Jenkins build number
     share a number space.
 
-    Only reached when no THREADED uuid was supplied -- see v2_run_id_for(), which prefers
+    Only reached when no THREADED uuid was supplied -- see run_id_for(), which prefers
     --run-id and leaves this as the coordinate-hashing fallback.
     """
     gha = (getattr(args, "gha_run_id", "") or "").strip()

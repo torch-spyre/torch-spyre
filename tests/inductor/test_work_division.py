@@ -1005,6 +1005,62 @@ class TestWorkDivisionContextAnswers(unittest.TestCase):
                     )
 
 
+class TestMatmulRowOrderSplitDomains(unittest.TestCase):
+    def test_flattened_staggered_rows_keep_producer_order(self):
+        from torch_spyre._inductor.constants import BATCH_MATMUL_OP
+
+        rows, n, k = (_isym(name) for name in ("rows", "n", "k"))
+        op = _computed_buffer(
+            (8, 64), reduction_type=BATCH_MATMUL_OP, reduction_ranges=(64,)
+        )
+        lhs = TensorDep(
+            MemoryDep("lhs", 64 * rows + k, (rows, k), (8, 64)),
+            _fixed_tiled_layout(
+                (2, 4, 64), element_arrangement=ElementArrangement.FP32_TO_DL16
+            ),
+        )
+        rhs = _tensor_dep("rhs", (64, 64), (n, k))
+        output = _tensor_dep("out", (8, 64), (rows, n))
+        ctx = _make_context(
+            op,
+            output,
+            [lhs, rhs],
+            it_space={rows: 8, n: 64, k: 64},
+            it_space_adjusted={rows: 8, n: 1, k: 1},
+            stick_vars={n: 64, k: 64},
+            reduction_vars=[k],
+        )
+        self.assertEqual(
+            aligned_ownership_split_domains(ctx).allowed_splits[rows],
+            frozenset({2, 4, 8}),
+        )
+        # Matching physical row order must not ban a one-core matmul.
+        ctx.output_td = TensorDep(
+            MemoryDep("out", 64 * rows + n, (rows, n), (8, 64)),
+            _fixed_tiled_layout((2, 4, 64)),
+        )
+        self.assertEqual(
+            aligned_ownership_split_domains(ctx).allowed_splits[rows],
+            frozenset({1, 2, 4, 8}),
+        )
+        ctx.output_td = output
+        # A non-matmul with the same accesses is outside this guard.
+        ctx.op = _computed_buffer((8, 64))
+        self.assertEqual(
+            aligned_ownership_split_domains(ctx).allowed_splits[rows],
+            frozenset({1, 2, 4, 8}),
+        )
+        # One row segment remains unrestricted, including a one-core matmul.
+        ctx.op = op
+        ctx.input_tds[0] = _tensor_dep(
+            "lhs",
+            (8, 64),
+            (rows, k),
+            element_arrangement=ElementArrangement.FP32_TO_DL16,
+        )
+        self.assertNotIn(rows, aligned_ownership_split_domains(ctx).allowed_splits)
+
+
 class TestWorkDivisionSplitLegality(unittest.TestCase):
     def test_cpu_computed_buffer_is_not_constrained(self):
         op = _computed_buffer((8,), name="cpu_buf")
