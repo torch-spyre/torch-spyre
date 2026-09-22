@@ -68,21 +68,22 @@ runs:
       env:
         LIB_DIR_IN: ${{ inputs.library-dir }}
       run: |
-        REL=extensions/clickhouse-ingest
+        # Both must come from ONE tree, or the script and the formula could be different refs.
         FOUND=""
         for base in "${GITHUB_WORKSPACE}" "${LIB_DIR_IN}"; do
           [ -n "${base}" ] || continue
-          if [ -f "${base}/${REL}/pyproject.toml" ]; then
-            FOUND="${base}/${REL}"
+          if [ -f "${base}/extensions/clickhouse-ingest/pyproject.toml" ] \
+             && [ -f "${base}/.github/scripts/derive_artifact_id.py" ]; then
+            FOUND="${base}"
             break
           fi
         done
         if [ -n "${FOUND}" ]; then
-          echo "identity library: ${FOUND}"
-          echo "lib=${FOUND}" >> "$GITHUB_OUTPUT"
+          echo "identity library + script: ${FOUND}"
+          echo "root=${FOUND}" >> "$GITHUB_OUTPUT"
           echo "need-checkout=false" >> "$GITHUB_OUTPUT"
         else
-          echo "identity library not on disk — will sparse-checkout."
+          echo "identity library/script not on disk — will sparse-checkout."
           echo "need-checkout=true" >> "$GITHUB_OUTPUT"
         fi
 
@@ -92,83 +93,35 @@ runs:
       uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       with:
         path: .artifact-id-src
-        sparse-checkout: extensions/clickhouse-ingest
+        sparse-checkout: |
+          .github/scripts/derive_artifact_id.py
+          extensions/clickhouse-ingest
         sparse-checkout-cone-mode: false
 
     - name: Derive the artifact identity
       id: derive
       shell: bash
       env:
-        LIB: ${{ steps.locate.outputs.lib }}
+        ROOT: ${{ steps.locate.outputs.root }}
         NEED_CHECKOUT: ${{ steps.locate.outputs.need-checkout }}
-        COMPONENT: ${{ inputs.component }}
-        ARCH: ${{ inputs.arch }}
-        INSTALLED: ${{ inputs.installed }}
-        BASE_ID_FILE: ${{ inputs.base-id-file }}
-        OUT_FILE: ${{ inputs.output-file }}
       run: |
-        # No `set -e`: every path below is allowed to fail into an empty id.
+        # No `set -e`: a failure here is allowed to fall through to an empty id.
         if [ "${NEED_CHECKOUT}" = "true" ]; then
-          LIB="${GITHUB_WORKSPACE}/.artifact-id-src/extensions/clickhouse-ingest"
+          ROOT="${GITHUB_WORKSPACE}/.artifact-id-src"
         fi
-        AID=""
-        BASE=""
-        RECORD=""
-        if [ -d "${LIB}" ]; then
-          # PYTHONPATH, not an install: identity.py is stdlib-only, so the submodule is
-          # imported directly and needs no venv, no uv and no network.
-          _out=$(PYTHONPATH="${LIB}" python3 - <<'PYEOF' || true
-        import os
-        import sys
-
-        from spyre_clickhouse_ingest.identity import (
-            BASE_ARTIFACT_ID_FILE,
-            base_artifact_id,
-            gha_artifact_id,
-        )
-
-        path = os.environ.get("BASE_ID_FILE") or BASE_ARTIFACT_ID_FILE
-        base = base_artifact_id(path)
-        # Comma-joined to survive the recovery's whitespace strip; the library splits on both.
-        installed = ",".join((os.environ.get("INSTALLED") or "").replace(",", " ").split())
-        if not base:
-            # An image baked before the id was stamped. Nothing to chain onto, and inventing
-            # a coordinate here would give every such leg one shared, wrong identity.
-            aid = ""
-        elif not installed:
-            # Ran the image UNCHANGED: its own id is already correct and is used verbatim.
-            aid = base
-        else:
-            aid = gha_artifact_id(
-                os.environ.get("COMPONENT", ""), base, installed, os.environ.get("ARCH", "")
-            )
-        # Line 1 is the record the ingest parses; 2 and 3 are for this step's logging.
-        print("" if not aid else "|".join([aid, base, installed]))
-        print(aid)
-        print(base)
-        sys.exit(0)
-        PYEOF
-        )
-          RECORD=$(printf '%s\n' "${_out}" | sed -n '1p' | tr -d '[:space:]')
-          AID=$(printf '%s\n' "${_out}" | sed -n '2p' | tr -d '[:space:]')
-          BASE=$(printf '%s\n' "${_out}" | sed -n '3p' | tr -d '[:space:]')
-        else
-          echo "identity library unavailable — no artifact id will be derived."
+        # The script writes the record file and both step outputs; it exits 0 even when it
+        # derives nothing, so a non-zero here means it did not run at all.
+        if ! python3 "${ROOT}/.github/scripts/derive_artifact_id.py" \
+             --component "${{ inputs.component }}" \
+             --arch "${{ inputs.arch }}" \
+             --installed "${{ inputs.installed }}" \
+             --base-id-file "${{ inputs.base-id-file }}" \
+             --library-dir "${ROOT}/extensions/clickhouse-ingest" \
+             --output-file "${{ inputs.output-file }}"; then
+          echo "derive_artifact_id.py did not run — no artifact id will be derived."
+          echo "artifact_id=" >> "$GITHUB_OUTPUT"
+          echo "base_artifact_id=" >> "$GITHUB_OUTPUT"
         fi
-
-        if [ -n "${AID}" ]; then
-          if [ "${AID}" = "${BASE}" ]; then
-            echo "artifact_id: ${AID} (image ran unchanged — base id used verbatim)"
-          else
-            echo "artifact_id: ${AID} (derived from base ${BASE} + installed: ${INSTALLED})"
-          fi
-          printf '%s' "${RECORD}" > "${OUT_FILE}"
-        else
-          echo "artifact_id: <none — this leg's rows will carry no artifact>"
-          echo "  base id read from: ${BASE_ID_FILE:-<library default>} -> ${BASE:-<absent>}"
-        fi
-        echo "artifact_id=${AID}" >> "$GITHUB_OUTPUT"
-        echo "base_artifact_id=${BASE}" >> "$GITHUB_OUTPUT"
 
     # An artifact, not a job output: a `workflow_run` consumer sees neither. Same transport
     # the threaded run_id already uses.

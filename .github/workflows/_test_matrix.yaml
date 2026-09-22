@@ -426,15 +426,16 @@ jobs:
     # Belt and braces with the action's degrade-to-empty: telemetry never reddens a run.
     continue-on-error: true
     steps:
-      # Both, so the action finds the library in $GITHUB_WORKSPACE. At THIS ref, like every
-      # other job -- one definition of the id formula per commit.
-      - name: Checkout the identity action and library
+      # Action, script and library together, so the action finds them in $GITHUB_WORKSPACE.
+      # At THIS ref, like every other job -- one definition of the id formula per commit.
+      - name: Checkout the identity action, script and library
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           ref: ${{ inputs.ref || github.event.pull_request.head.sha || github.sha }}
           repository: ${{ inputs.repository || github.event.pull_request.head.repo.full_name || github.repository }}
           sparse-checkout: |
             .github/actions/derive-gha-artifact-id
+            .github/scripts/derive_artifact_id.py
             extensions/clickhouse-ingest
           sparse-checkout-cone-mode: false
 

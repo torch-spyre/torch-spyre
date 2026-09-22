@@ -489,7 +489,12 @@ def insert_gha_artifact_result(
         )
         return False
 
-    if not artifact_already_recorded(client, db, aid):
+    # aid == base means the leg ran the image UNCHANGED, so the artifact is the one the
+    # orchestrator produced and already recorded -- writing our own row for it would be the
+    # duplicate artifact_id the plain MergeTree exists to surface. Only the verdict is ours.
+    if aid != _norm(base_artifact_id) and not artifact_already_recorded(
+        client, db, aid
+    ):
         schema.insert(
             client,
             schema.ARTIFACTS,

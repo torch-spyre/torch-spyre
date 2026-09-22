@@ -190,3 +190,13 @@ def test_installed_digest_is_order_independent_and_empty_for_nothing():
     assert installed_digest("a a b") == installed_digest("a b")
     assert installed_digest("") == ""
     assert installed_digest("   ") == ""
+
+
+def test_an_unchanged_image_gets_a_verdict_but_no_artifact_row():
+    # The prebaked path: artifact_id == base, so the artifact is the orchestrator's and
+    # already recorded. Our own row would be the duplicate the plain MergeTree surfaces.
+    c = FakeClient()
+    assert _call(c, artifact_id=BASE, installed="") is True
+    assert _rows(c, ARTIFACTS) == []
+    assert len(_rows(c, ARTIFACT_RESULTS)) == 1
+    assert _rows(c, ARTIFACT_RESULTS)[0]["artifact_id"] == BASE
