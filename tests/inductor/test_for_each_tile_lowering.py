@@ -35,6 +35,7 @@ For end-to-end compilation + numerical correctness against a CPU
 reference, see test_for_each_tile_e2e.py.
 """
 
+import operator
 import unittest
 from unittest import mock
 
@@ -78,6 +79,23 @@ class TestNestedForEachTileFixture(unittest.TestCase):
 
 
 class TestCarryBindingsFor(unittest.TestCase):
+    def test_fx_identity_detects_stride_repaired_passthrough_carry(self):
+        from torch_spyre._inductor.wsr.while_loop_bridge import (
+            _body_fx_carry_is_passthrough,
+        )
+
+        fx_graph = torch.fx.Graph()
+        carry = fx_graph.placeholder("carry")
+        xs = fx_graph.placeholder("xs")
+        updated = fx_graph.call_function(operator.add, (carry, 1))
+        fx_graph.output((updated, xs))
+
+        while_op = mock.Mock()
+        while_op.body_subgraph.graph.module = torch.fx.GraphModule({}, fx_graph)
+
+        self.assertFalse(_body_fx_carry_is_passthrough(while_op, 0))
+        self.assertTrue(_body_fx_carry_is_passthrough(while_op, 1))
+
     def test_one_carry_positional_match(self):
         from torch_spyre._inductor.wsr.while_loop_bridge import (
             CarryBinding,
@@ -625,6 +643,107 @@ class TestSpliceWhileLoops(unittest.TestCase):
         self.assertTrue(snapshots, "expected the online-softmax carry snapshot")
         for op in snapshots:
             self.assertEqual(op.loop_info.loop_group_id, (0, 1))
+
+    def test_noncontiguous_input_materialization_streams_one_tile(self):
+        """A prefix view is staged one tile at a time after loop splicing."""
+        from torch._inductor import ir
+        from torch._inductor.dependencies import MemoryDep
+
+        from torch_spyre._inductor.wsr import for_each_tile
+        from torch_spyre._inductor.wsr.for_each_tile_lowering import (
+            _identity_load,
+            splice_while_loops,
+        )
+
+        def tile_sequence(x):
+            def body(_, operands):
+                (x_tile,) = operands
+                return None, x_tile * 2
+
+            _, out = for_each_tile(
+                body,
+                (x,),
+                dims=(2,),
+                tile_size=64,
+                out_dim=2,
+            )
+            return out
+
+        # A KV-cache prefix has a gap after every head: the physical sequence
+        # extent is 320 while the logical prefix passed to attention is 256.
+        backing = torch.randn(1, 8, 320, 128)
+        prefix = backing[:, :, :256, :]
+        self.assertEqual(prefix.stride(), (327680, 40960, 128, 1))
+
+        graph = self._run_graph(tile_sequence, (prefix,))
+        with V.set_graph_handler(graph):
+            splice_while_loops(graph)
+
+            identities = [
+                (op, identity)
+                for op in graph.operations
+                if isinstance(op, ir.ComputedBuffer)
+                and (identity := _identity_load(op)) is not None
+            ]
+            input_copies = [
+                (op, identity)
+                for op, identity in identities
+                if identity[0] in graph.graph_input_names
+            ]
+            self.assertEqual(len(input_copies), 1)
+            input_copy, (source_name, source_index, identity_indices) = input_copies[0]
+
+            # WhileLoop.create originally materializes [4, 64, 1, 8, 128].
+            # Once spliced into a four-trip counted loop, retaining that shape
+            # would copy the complete prefix on every trip.  The compiler must
+            # instead reuse one compact [Lk_tile, H, D] staging buffer.
+            self.assertEqual(list(input_copy.data.ranges), [1, 64, 1, 8, 128])
+            self.assertEqual(list(input_copy.layout.size), [1, 64, 1, 8, 128])
+            self.assertEqual(list(input_copy.layout.stride), [0, 128, 0, 8192, 1])
+            self.assertEqual(
+                input_copy.loop_info.squeezed_advance_per_read,
+                [[[(8192, 1)]]],
+            )
+            self.assertEqual(source_index.coeff(identity_indices[0]), 8192)
+            self.assertEqual(source_index.coeff(identity_indices[3]), 40960)
+
+            loop_var = input_copy.dim_hints[0].loop_var
+            self.assertIsNotNone(loop_var)
+            direct_readers = []
+            for consumer in graph.operations:
+                reads = [
+                    dep
+                    for dep in consumer.get_read_writes().reads
+                    if isinstance(dep, MemoryDep) and dep.name == input_copy.get_name()
+                ]
+                if reads:
+                    direct_readers.append(consumer)
+                for dep in reads:
+                    self.assertEqual(dep.index.coeff(loop_var), 0)
+
+            non_identity_readers = [
+                reader for reader in direct_readers if _identity_load(reader) is None
+            ]
+            self.assertEqual(
+                len(non_identity_readers),
+                1,
+                [
+                    (reader.get_name(), _identity_load(reader))
+                    for reader in direct_readers
+                ],
+            )
+            direct_record = non_identity_readers[0]._read_copy_elision_record
+            self.assertEqual(direct_record.copy_name, input_copy.get_name())
+            self.assertEqual(direct_record.source_name, source_name)
+
+            self.assertFalse(
+                any(
+                    getattr(op, "loop_info", None)
+                    and list(op.data.ranges) == [4, 64, 1, 8, 128]
+                    for op, _identity in identities
+                ),
+                "the full-cache exact-stride copy remained inside the loop",
+            )
 
 
 class TestTryProveForEachTile(unittest.TestCase):
