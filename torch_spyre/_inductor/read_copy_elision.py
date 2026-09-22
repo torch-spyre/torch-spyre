@@ -402,6 +402,18 @@ def _prove_matmul_direct_read(
         )[-1]
     except Exception as exc:
         return None, f"source layout is not directly readable: {exc}"
+    if isinstance(consumer.data, Pointwise):
+        try:
+            copy_stick = device_coordinates(copy_layout.device_layout, copy_dep, None)[
+                -1
+            ]
+        except Exception as exc:
+            return None, f"staged copy layout is not directly readable: {exc}"
+        if source_stick.free_symbols != copy_stick.free_symbols:
+            return None, (
+                "direct source changes the pointwise stick variables: "
+                f"{source_stick} != {copy_stick}"
+            )
     if is_matmul:
         try:
             generated_var = find_matmul_generated_var(
