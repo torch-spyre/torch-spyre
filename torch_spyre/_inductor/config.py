@@ -104,13 +104,14 @@ lx_solver_relayout_groups_per_edge: int = int(
     os.getenv("SPYRE_LX_SOLVER_RELAYOUT_GROUPS_PER_EDGE", "4")
 )
 
-# For unpriced CP-SAT solves, skip presolve above this many relayout copies.
-# Priced relayout solves already skip it regardless of count. One of CP-SAT's
-# presolve passes scales super-linearly in the number of free copy residency
-# literals (measured on the spyre_attn decode
-# graph: 16 copies 5 s, 64 copies 13 s, 160 copies 40 s, 312 copies past the
-# 120 s limit) and no exposed parameter shortens it, while search on the raw
-# model finds a feasible plan within seconds. 0 disables this count threshold.
+# Skip CP-SAT's presolve above this many free relayout copies in one solve;
+# 0 (the default) never skips it, priced or not. Presolve once scaled
+# super-linearly in the number of free copy residency literals (measured on the
+# spyre_attn decode graph: 16 copies 5 s, 64 copies 13 s, 160 copies 40 s, 312
+# copies past the 120 s limit). Constant-binding single-division copies and the
+# cost printer's lin_max proxy variables removed that cost, and a priced model
+# searched without presolve can exhaust memory in the LNS workers. Kept as an
+# escape hatch for a graph where presolve still outlives the time limit.
 lx_solver_relayout_presolve_max_copies: int = int(
     os.getenv("SPYRE_LX_SOLVER_RELAYOUT_PRESOLVE_MAX_COPIES", "0")
 )

@@ -819,10 +819,15 @@ class SpyreKernel(Kernel[CSEVariable]):
 
         # A WhileLoop-splice loop variable describes the address advance from
         # one counted-loop trip to the next, not an in-tile iteration axis.
-        # _general_tile_advance converts it to the backend's dedicated
-        # device_tile_advance_expr below. Pin it to trip zero in the base
-        # coordinates so the raw unbacked symbol neither leaks into the
-        # OpSpec iteration space nor applies the same advance a second time.
+        # Its advance is already explicit in loop_info (tiled_dims_per_read/
+        # output_tiled_dims or squeezed_advance_per_read/squeezed_advance_
+        # output, stamped by the WhileLoop-lowering pass -- see
+        # _general_tile_advance's docstring), which that method folds into
+        # device_tile_advance_expr below. Pin every splice loop_var to trip
+        # zero in the base coordinates so the raw unbacked symbol neither
+        # leaks into the OpSpec iteration space nor applies the same
+        # advance a second time.
+        device_tile_advance_expr = self._general_tile_advance(tensor, is_input, name)
         loop_var_ranges = loop_var_ranges_from_dim_hints(operation)
         base_index = sympy_subs(
             tensor.index,
@@ -841,7 +846,6 @@ class SpyreKernel(Kernel[CSEVariable]):
             device_coords,
             it_space,
         )
-        device_tile_advance_expr = self._general_tile_advance(tensor, is_input, name)
         tensor_arg = TensorArg(
             is_input,
             -1,

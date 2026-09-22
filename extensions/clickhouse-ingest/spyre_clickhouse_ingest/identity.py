@@ -157,9 +157,8 @@ def gha_artifact_id(
     """Artifact identity for a GHA leg that installed something on top of a prebaked image.
 
     Such a leg IS a different artifact from the image it started on, so it gets its own
-    artifacts row (origin='gha', identity_deps=[base_artifact_id]) rather than borrowing the
-    base image's id -- otherwise artifact_results.artifact_id would reference a row whose
-    contents were never what ran.
+    artifacts row (origin='built', identity_deps=['base=<base_artifact_id>']) rather than
+    borrowing the base image's id. Not a 'gha' origin: chk_origin admits no such value.
 
     `base_artifact_id` is the base image's ALREADY-MINTED v2 artifact_id, read back from the
     image (OCI label / in-image file), not a name or a digest. That is what keeps this
@@ -176,11 +175,20 @@ def gha_artifact_id(
     """
     if not (_norm(component) and canonical_arch(arch)):
         return ""
-    items = sorted({_norm(x) for x in (installed or "").replace(",", " ").split() if x})
-    digest = (
-        hashlib.sha256(ID_SEP.join(items).encode()).hexdigest()[:12] if items else ""
+    return artifact_id_for(
+        component, _norm(base_artifact_id), installed_digest(installed), arch
     )
-    return artifact_id_for(component, _norm(base_artifact_id), digest, arch)
+
+
+def installed_digest(installed: str) -> str:
+    """The id12-slot value gha_artifact_id hashes the installed set into.
+
+    Split out so the artifacts row can record it rather than recompute it -- a fifth copy of
+    the formula is the standing hazard here. Sorted and deduped, so install order cannot mint
+    a fresh identity; '' for an empty set, which is the base image itself.
+    """
+    items = sorted({_norm(x) for x in (installed or "").replace(",", " ").split() if x})
+    return hashlib.sha256(ID_SEP.join(items).encode()).hexdigest()[:12] if items else ""
 
 
 # Where the image build writes its own artifact_id, beside installed_rpms.txt. Set by

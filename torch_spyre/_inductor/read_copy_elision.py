@@ -440,7 +440,12 @@ def _prove_matmul_direct_read(
             resolved_loop_info = fallback_loop_info
             direct_op.loop_info = resolved_loop_info  # type: ignore[attr-defined]
             advance_bounds = fallback_bounds
-    source_numel = _static_int(sympy.prod(source_layout.size))
+    # A non-contiguous graph-input view can address a larger backing span than
+    # its logical numel (for example, an active KV-cache prefix whose head
+    # stride still reflects the maximum cache length).  Bound the generated
+    # element index against that physical span, including layout.offset,
+    # rather than rejecting valid addresses in its inter-head gaps.
+    source_numel = _static_int(source_layout.storage_size())
     logger.debug(
         "direct-read bounds for %s <- %s: source_dep=%s tiled=%s "
         "squeezed=%s local=%s advance=%s numel=%s",

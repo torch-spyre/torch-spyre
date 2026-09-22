@@ -26,6 +26,7 @@ from .identity import (
     benchmark_id_for,
     canonical_arch,
     capability_id_for,
+    installed_digest,
     tags_for_case,
     case_id_for,
 )
@@ -416,3 +417,147 @@ def insert_capabilities(
             file=sys.stderr,
         )
     return len(run_rows)
+
+
+# ── the GHA leg's own artifact, and its verdict ─────────────────────────────────────────
+# Written as one call: a verdict whose artifact row is missing is the unjoinable row the
+# writer's refusal exists to prevent.
+
+
+def artifact_already_recorded(client, db: str, artifact_id: str) -> bool:
+    """Does `artifacts` already hold this identity? (Plain MergeTree -- no dedup key.)"""
+    rows = client.query(
+        f"SELECT count() FROM {schema.ARTIFACTS.qualified(db)} "
+        "WHERE artifact_id = {artifact_id:UUID}",
+        parameters={"artifact_id": artifact_id},
+    ).result_rows
+    return bool(rows and rows[0][0] > 0)
+
+
+def artifact_result_already_recorded(
+    client, db: str, artifact_id: str, run_id: str, result_kind: str, test_type: str
+) -> bool:
+    """Has this verdict landed? Scoped by the full sort key -- one run may report N tiers."""
+    rows = client.query(
+        f"SELECT count() FROM {schema.ARTIFACT_RESULTS.qualified(db)} "
+        "WHERE artifact_id = {artifact_id:UUID} AND run_id = {run_id:UUID} "
+        "AND result_kind = {result_kind:String} AND test_type = {test_type:String}",
+        parameters={
+            "artifact_id": artifact_id,
+            "run_id": run_id,
+            "result_kind": result_kind,
+            "test_type": test_type,
+        },
+    ).result_rows
+    return bool(rows and rows[0][0] > 0)
+
+
+def insert_gha_artifact_result(
+    client,
+    db: str,
+    *,
+    artifact_id: str,
+    component: str,
+    arch: str,
+    run_id: str,
+    test_type: str,
+    state: str,
+    result_kind: str = "functional",
+    duration_s: float = 0.0,
+    base_artifact_id: str = "",
+    installed: str = "",
+    repo: str = "",
+    git_ref: str = "",
+    git_sha: str = "",
+    run_url: str = "",
+) -> bool:
+    """Record the artifact a GHA leg ran, and its verdict. True when rows landed.
+
+    `artifact_id` arrives already derived: the caller is the only side that knows whether the
+    leg installed on top of the image or ran it unchanged. artifact_name/props['id12'] carry
+    the HASH INPUTS, so the id stays reproducible from its own row. `sources` carries the
+    commit resolve_covered_tiers.py joins on. Refuses a partial identity rather than writing
+    one every incomplete artifact would share.
+    """
+    aid, rid = _norm(artifact_id), _norm(run_id)
+    comp, a = _norm(component), canonical_arch(arch)
+    if not (aid and rid and comp and a):
+        print(
+            f"  [warn] v2: artifact result skipped -- artifact_id={aid or '<blank>'} "
+            f"run_id={rid or '<blank>'} component={comp or '<blank>'} arch={a or '<blank>'}",
+            file=sys.stderr,
+        )
+        return False
+
+    # aid == base means the leg ran the image UNCHANGED, so the artifact is the one the
+    # orchestrator produced and already recorded -- writing our own row for it would be the
+    # duplicate artifact_id the plain MergeTree exists to surface. Only the verdict is ours.
+    if aid != _norm(base_artifact_id) and not artifact_already_recorded(
+        client, db, aid
+    ):
+        schema.insert(
+            client,
+            schema.ARTIFACTS,
+            [
+                {
+                    "artifact_id": aid,
+                    "component": comp,
+                    "arch": a,
+                    "kind": "image",
+                    # The hashed name, not a display string -- see the docstring.
+                    "artifact_name": _norm(base_artifact_id),
+                    # chk_origin admits no 'gha'; 'base=' below is what marks it derived.
+                    "origin": "built",
+                    "identity_deps": (
+                        [f"{schema.DEP_BASE_PREFIX}{_norm(base_artifact_id)}"]
+                        if _norm(base_artifact_id)
+                        else []
+                    ),
+                    "context_deps": [],
+                    # Tuple order (repo, git_ref, git_sha) -- what the covered-tier join reads.
+                    "sources": (
+                        [(repo, git_ref, git_sha)]
+                        if (repo or git_ref or git_sha)
+                        else []
+                    ),
+                    "props": {
+                        k: v
+                        for k, v in {
+                            # The digest gha_artifact_id put in the id12 slot.
+                            "id12": installed_digest(installed),
+                            "base_artifact_id": _norm(base_artifact_id),
+                            "installed": (installed or "").strip(),
+                            "run_url": run_url,
+                            "source": "gha",
+                        }.items()
+                        if v
+                    },
+                }
+            ],
+            db=db,
+        )
+
+    if artifact_result_already_recorded(client, db, aid, rid, result_kind, test_type):
+        return True
+
+    schema.insert(
+        client,
+        schema.ARTIFACT_RESULTS,
+        [
+            {
+                "artifact_id": aid,
+                "run_id": rid,
+                "result_kind": result_kind,
+                "test_type": test_type,
+                "state": state,
+                # Where it RAN; the DDL keeps this apart from artifacts.arch by design.
+                "arch": a,
+                "duration_s": float(duration_s or 0.0),
+                "props": {
+                    k: v for k, v in {"run_url": run_url, "source": "gha"}.items() if v
+                },
+            }
+        ],
+        db=db,
+    )
+    return True

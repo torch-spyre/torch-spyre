@@ -350,6 +350,19 @@ jobs:
           repository: ${{ env.TRIGGERING_REPO }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
+      # WHAT THE LEG RAN, uploaded by _test_matrix's artifact_identity job -- derived there
+      # because this job runs on image_ingest and can read neither the base id nor the delta.
+      # Empty on an unadopted workflow or a pre-#1782 image; the ingest then writes cases only.
+      - name: Recover this leg's artifact_id
+        id: leg-artifact-id
+        uses: ./.github/actions/recover-threaded-run-id
+        with:
+          triggering-run-id: ${{ env.TRIGGERING_RUN_ID }}
+          repository: ${{ env.TRIGGERING_REPO }}
+          artifact-name: artifact-id
+          label: Leg artifact_id
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Ingest XML files into ClickHouse
         uses: ./.github/actions/ingest-xml-to-clickhouse
         with:
@@ -359,6 +372,9 @@ jobs:
           sha: ${{ env.TRIGGERING_SHA }}
           gha-run-id: ${{ env.TRIGGERING_RUN_ID }}
           run-id: ${{ steps.threaded-run-id.outputs.run_id }}
+          artifact-id: ${{ steps.leg-artifact-id.outputs.value }}
+          # TRIGGERING_REPO: on a workflow_call github.repository is the CALLER.
+          repository: ${{ env.TRIGGERING_REPO }}
           component: ${{ inputs.component || 'torch-spyre' }}
           triggered-at: ${{ env.TRIGGERING_AT }}
           pr-number: ${{ steps.resolve-pr.outputs.pr_number }}
@@ -374,8 +390,12 @@ jobs:
 
       - name: Summary
         if: always()
+        env:
+          # Trimmed to its id below: a raw `|` splits the markdown table row.
+          LEG_ARTIFACT_RECORD: ${{ steps.leg-artifact-id.outputs.value }}
         run: |-
           XML_COUNT=$(find xml_artifacts -name "*.xml" 2>/dev/null | wc -l || echo 0)
+          LEG_AID="${LEG_ARTIFACT_RECORD%%|*}"
           {
             echo "### ClickHouse Ingest Summary"
             echo "| Key | Value |"
@@ -386,4 +406,5 @@ jobs:
             echo "| Branch              | ${TRIGGERING_BRANCH} |"
             echo "| Commit SHA          | ${TRIGGERING_SHA:0:12} |"
             echo "| XML files ingested  | ${XML_COUNT} |"
+            echo "| Leg artifact_id     | ${LEG_AID:-(none — no artifact row written)} |"
           } >> "$GITHUB_STEP_SUMMARY"

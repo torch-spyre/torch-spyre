@@ -522,23 +522,14 @@ def _stamps(op, graph):
     return {(a.role, a.name): a.is_boundary for a in feats.args}
 
 
-def test_extractor_reads_residency_and_store_divisions_from_buffers(monkeypatch):
+def test_extractor_reads_residency_from_is_lx(monkeypatch):
     from torch._inductor.virtualized import V
-    from torch_spyre._inductor.scratchpad.plan_solver import (
-        CoreDivision,
-        CoreDivisionBuffer,
-        division_symbol,
-    )
+    from torch_spyre._inductor.scratchpad.plan_solver import CoreDivisionBuffer
 
     row, other, cores = sympy.symbols("row other cores", integer=True)
-    output = CoreDivisionBuffer(
-        "buf1",
-        128,
-        [0],
-        core_divisions=[CoreDivision(splits={row: n, other: 2}) for n in (1, 4, 8)],
-    )
+    output = CoreDivisionBuffer("buf1", 128, [0])
     source = CoreDivisionBuffer("buf0", 128, [0])
-    buffers = {b.name: b for b in (output, source)}
+    is_lx = {output.name: output.sym_is_lx, source.name: source.sym_is_lx}
     op = _extractable_op("buf1", ["buf0", "outside"])
     rw = op.get_read_writes()
     rw.writes.append(SimpleNamespace(index=row))
@@ -549,16 +540,14 @@ def test_extractor_reads_residency_and_store_divisions_from_buffers(monkeypatch)
     # Store geometry is covered separately; this checks the buffer-data wiring.
     monkeypatch.setattr(dcm, "_indirect_write_elems", lambda *_: 32)
     with V.set_graph_handler(graph):
-        feature = dcm.extract_op_features(op, {row: cores}, buffers)
+        feature = dcm.extract_op_features(op, {row: cores}, is_lx=is_lx)
     residency = {a.name: a.is_lx for a in feature.args}
     assert residency == {
         "op_buf1": output.sym_is_lx,
         "buf0": source.sym_is_lx,
         "outside": False,
     }
-    assert feature.store_division == division_symbol(output.name)
     assert feature.cores == cores
-    assert feature.store_cores_by_division == ((0, 1), (1, 4), (2, 8))
 
 
 @pytest.mark.parametrize("placement", [None, {"buf0": True, "buf1": False}])
@@ -576,8 +565,6 @@ def test_extractor_without_buffers_keeps_committed_or_explicit_placement(placeme
         if placement is None
         else {"op_buf1": False, "buf0": True}
     )
-    assert feature.store_division is None
-    assert feature.store_cores_by_division == ()
 
 
 def test_the_extractor_stamps_reads_of_graph_inputs():
@@ -683,50 +670,14 @@ def test_store_rate_does_not_change_other_ops():
     assert cost_model._store_core_excess_ns([store], CostParams()) == 0
 
 
-def test_store_symbolic_cost_matches_concrete_and_cp_sat():
-    from ortools.sat.python import cp_model
-    from torch_spyre._inductor.scratchpad.ilp_solver_ortools import _SympyExprToCpSat
-    from torch_spyre._inductor.scratchpad.plan_solver import division_symbol
-
+def test_store_symbolic_cost_matches_concrete():
     params = CostParams()
-    division = division_symbol("store")
-    resident, cores_symbol = sympy.symbols("resident cores", integer=True)
-    menu = tuple(enumerate((1, 2, 4, 8, 16, 32)))
-    feature = _indirect_store(
-        cores_symbol, resident, store_division=division, store_cores_by_division=menu
-    )
+    cores_symbol = sympy.symbols("cores", integer=True)
+    feature = _indirect_store(cores_symbol)
     expression = cost_model._store_core_excess_ns([feature], params)
-    assert expression.has(resident, division)
-    assert expression.subs(resident, 1) == 0
-    expression = expression.subs(resident, 0)
-    for index, cores in menu:
+    for cores in (1, 2, 4, 5, 8, 16, 32):
         expected = cost_model._store_core_excess_ns([_indirect_store(cores)], params)
-        assert float(expression.subs(division, index)) == pytest.approx(expected)
-        model = cp_model.CpModel()
-        chosen = model.new_int_var(0, len(menu) - 1, division.name)
-        literals = []
-        for i, _ in menu:
-            literal = model.new_bool_var(f"chosen_{i}")
-            model.add(chosen == i).only_enforce_if(literal)
-            model.add(chosen != i).only_enforce_if(literal.Not())
-            literals.append(literal)
-        symbols = {
-            division.name: chosen,
-            f"_division_of_{division.name}": SimpleNamespace(
-                division_is=literals.__getitem__
-            ),
-        }
-        # The bundle's compute/memory overlap also wraps this cost in Min.
-        wrapped = cost_model._lazy_min(sympy.Integer(1000000), expression)
-        converted = _SympyExprToCpSat(model, symbols, {}).convert(wrapped)
-        assert converted is not None
-        model.add(chosen == index)
-        model.minimize(converted)
-        solver = cp_model.CpSolver()
-        assert solver.solve(model) == cp_model.OPTIMAL
-        assert solver.objective_value == pytest.approx(expected, abs=1)
-    feature.store_cores_by_division = ()
-    assert cost_model._store_core_excess_ns([feature], params) == 0
+        assert float(expression.subs(cores_symbol, cores)) == pytest.approx(expected)
 
 
 def test_store_cost_composes_with_bundle_and_is_reported(monkeypatch):

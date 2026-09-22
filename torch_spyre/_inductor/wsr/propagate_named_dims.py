@@ -642,15 +642,14 @@ def _assign_dim_hints_impl(operations: list[Operation]) -> None:
                     coord_for_name[name] = sym
 
         # Preserve any WhileLoop-splice-synthesized hints already stamped by
-        # for_each_tile_lowering.py's _synthesize_dim_hints_for_group
-        # (identified by loop_var_range is not None), the same as the
-        # `not op_hints` branch above -- this op may sit inside a real user
-        # spyre_hint() scope (op_hints non-empty) AND be a for_each_tile
-        # splice op at once, and the loop below must not be the only source
-        # of dim_hints in that case. The synthetic hint_id range
-        # (for_each_tile_lowering.py's _next_synthetic_hint_id_start =
-        # 1 << 30) and real user hint_ids are disjoint by construction, so no
-        # dedup is needed here.
+        # for_each_tile_lowering.py's _stamp_direct_loop_info (identified by
+        # loop_var_range is not None), the same as the `not op_hints` branch
+        # above -- this op may sit inside a real user spyre_hint() scope
+        # (op_hints non-empty) AND be a for_each_tile splice op at once, and
+        # the loop below must not be the only source of dim_hints in that
+        # case. These synthesized hints all share hint_id's dataclass
+        # default (0) and are never keyed against real user hint_ids on
+        # this path, so no dedup against op_hints is needed here.
         existing = getattr(op, "dim_hints", None) or []
         dim_hints = [h for h in existing if h.loop_var_range is not None]
         for hint_id, hint_dict in sorted(op_hints.items()):
