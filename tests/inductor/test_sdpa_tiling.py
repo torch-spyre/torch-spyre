@@ -154,19 +154,31 @@ class TestSDPATiling(unittest.TestCase):
         self.assertEqual(config.estimated_active_cores, 32)
         self.assertEqual(config.estimated_load_bursts, 2)
         self.assertEqual(config.score_bytes_per_core, 192 * 1024)
-        self.assertEqual(config.estimated_live_bytes_per_core, 1024768)
+        self.assertEqual(config.estimated_live_bytes_per_core, 336640)
 
-    def test_five_axis_search_reduces_per_core_live_footprint(self):
-        config = self._select(batch_size=4, head_dim=64)
+    def test_encoder_pooling_shape_avoids_serial_hop_tiling(self):
+        # Issue #4784: granite-embedding-278m's pooling path supplies
+        # interleaved B/L/H/D inputs and a broadcast key-padding mask.
+        tensor_bytes = 4 * 12 * 512 * 64 * 2
+        config = self._select(
+            batch_size=4,
+            head_dim=64,
+            mask_shapes=((4, 1, 1, 512),),
+            # Read+write staging for Q, K, and V when H is tiled.
+            head_tile_staging_bytes=6 * tensor_bytes,
+        )
 
-        self.assertEqual(config.strategy, "work_divided_tiled")
+        self.assertEqual(config.strategy, "work_divided")
         self.assertEqual(config.kv_block_size, 512)
         self.assertEqual(config.num_kv_blocks, 1)
         self.assertEqual(config.num_batch_tiles, 1)
-        self.assertEqual(config.num_head_tiles, 3)
+        self.assertEqual(config.num_head_tiles, 1)
+        self.assertEqual(config.num_group_tiles, 1)
+        self.assertEqual(config.num_q_tiles, 1)
         self.assertEqual(config.estimated_active_cores, 32)
-        self.assertEqual(config.score_bytes_per_core, 256 * 1024)
-        self.assertEqual(config.estimated_live_bytes_per_core, 1344512)
+        self.assertEqual(config.score_bytes_per_core, 768 * 1024)
+        self.assertEqual(config.estimated_live_bytes_per_core, 1182720)
+        self.assertEqual(config.estimated_spill_buffers, 0)
 
     def test_batch_tiles_are_exact_for_odd_extents(self):
         for batch_size, expected_tiles in ((1, 1), (2, 1), (3, 3), (4, 2), (7, 7)):
