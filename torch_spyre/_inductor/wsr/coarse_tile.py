@@ -1611,8 +1611,20 @@ def _tiled_dims_for_dep(
 
     def _dim_is_read(d: int) -> bool:
         loop_var = pos_to_loop_var.get(d)
-        if loop_var is not None and dep.index.coeff(loop_var) != 0:
-            return True
+        if loop_var is not None:
+            free = dep.index.free_symbols
+            # Same two-way OR as _loop_var_to_ranges_pos, and for the same
+            # reason: a non-linear wrapper (e.g. floor(u0)) makes
+            # .coeff(loop_var) == 0 even though loop_var is dep.index's
+            # only free symbol. This function's docstring already claims
+            # "the same coefficient test" as that function for consistency
+            # -- matching the OR, not just the coefficient half, is what
+            # actually keeps that promise. Without it, a read whose index
+            # non-linearly wraps a WhileLoop-splice loop_var would be
+            # wrongly reported as not reading dim d, silently dropping it
+            # from the tiled-dims list.
+            if loop_var in free and (len(free) == 1 or dep.index.coeff(loop_var) != 0):
+                return True
         return raw_to_squeezed.get(d, d) in dep_dims
 
     return [
