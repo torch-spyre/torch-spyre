@@ -3700,7 +3700,10 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         }
         CoarseTilingPass(choices).apply_pass(graph)
         self._remap_tiled_symbols(graph, frames)
-        # See ``JOINT_TILING_AND_DIVISION_ATTR``.
+        # See ``JOINT_TILING_AND_DIVISION_ATTR``. Looked up afresh: the apply
+        # replaces an op it redirects to a companion's full buffer
+        # (``replace_computed_buffer_body``), so a pre-apply object is stale.
+        op_by_name = {op.name: op for op in graph.operations}
         for name in tiled:
             setattr(op_by_name[name], JOINT_TILING_AND_DIVISION_ATTR, True)
         logger.info(

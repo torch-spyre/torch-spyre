@@ -3243,13 +3243,34 @@ class _SqueezingTilingPass:
                 _divide_ranges(op, sympy.Integer(level.count), [level.host_dim])
 
 
+class _ReplacingTilingPass(_SqueezingTilingPass):
+    """Also swaps each op for a new object, as the apply does for an op it
+    redirects to a companion's full buffer (``replace_computed_buffer_body``)."""
+
+    def apply_pass(self, graph):
+        from torch_spyre._inductor.pass_utils import replace_computed_buffer_body
+
+        super().apply_pass(graph)
+        for op in list(graph.operations):
+            replace_computed_buffer_body(
+                op, op.data, graph.operations, pass_name="test"
+            )
+
+
 class TestTiledSplitsAfterAUnitTile(unittest.TestCase):
     """A tile that shrinks a dim to extent 1 drops that dim's loop symbol and
     renumbers every later one. The splits the solve chose, keyed by the
     pre-apply symbols, must still commit on the axes they were chosen for."""
 
     @contextmanager
-    def _applied(self, sizes, tiling, splits_by_position, floors_by_position=None):
+    def _applied(
+        self,
+        sizes,
+        tiling,
+        splits_by_position,
+        floors_by_position=None,
+        tiling_pass=_SqueezingTilingPass,
+    ):
         from torch._inductor.sizevars import SizeVarAllocator
         from torch._inductor.virtualized import V, ops
         from torch_spyre._inductor.pass_utils import iteration_space_from_op
@@ -3259,7 +3280,9 @@ class TestTiledSplitsAfterAUnitTile(unittest.TestCase):
         def inner_fn(index):
             return ops.load("x", sum(s * i for s, i in zip(strides, index)))
 
-        with V.set_graph_handler(SimpleNamespace(sizevars=SizeVarAllocator())):
+        with V.set_graph_handler(
+            SimpleNamespace(sizevars=SizeVarAllocator(), name_to_buffer={})
+        ):
             op = ComputedBuffer(
                 name="tiled",
                 layout=FixedLayout(torch.device("cpu"), torch.float16, sizes),
@@ -3299,7 +3322,7 @@ class TestTiledSplitsAfterAUnitTile(unittest.TestCase):
                 patch.object(CoOptimizingAllocator, "_solver_chooses_tilings", True),
                 patch(
                     "torch_spyre._inductor.scratchpad.coarse_tiling.CoarseTilingPass",
-                    _SqueezingTilingPass,
+                    tiling_pass,
                 ),
                 patch.object(
                     allocator_module, "commit_iteration_space_ownership"
@@ -3351,6 +3374,17 @@ class TestTiledSplitsAfterAUnitTile(unittest.TestCase):
             [32, 1024], TileSpec((TileAxis(host_dim=0, count=32),)), {1: 4}
         ) as applied:
             self.assertEqual(self._committed(applied), {1024: 4})
+
+    def test_the_live_op_is_marked_as_jointly_tiled(self):
+        with self._applied(
+            [32, 1024],
+            TileSpec((TileAxis(host_dim=0, count=32),)),
+            {1: 4},
+            tiling_pass=_ReplacingTilingPass,
+        ) as applied:
+            (live,) = applied.graph.operations
+            self.assertIsNot(live, applied.op)
+            self.assertTrue(getattr(live, JOINT_TILING_AND_DIVISION_ATTR, False))
 
 
 class TestTopKConstraints(unittest.TestCase):
