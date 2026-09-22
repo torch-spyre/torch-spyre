@@ -562,6 +562,7 @@ def test_ingest_uses_the_shared_library_not_a_local_copy(ingest):
         "component_of",
         "run_id_for",
         "cases_already_ingested",
+        "insert_gha_artifact_result",
         "insert_test_results",
         "extract_properties",
         "promote_xpass",
@@ -572,3 +573,114 @@ def test_ingest_uses_the_shared_library_not_a_local_copy(ingest):
     ):
         assert getattr(ingest, name) is getattr(lib, name), name
     assert ingest.schema_model is lib.schema
+
+
+# The GHA leg's artifact identity: derived on the RUNNER, arriving as --artifact-id.
+# These cover what the ingest side does with it.
+
+_BASE = "2b397099-6200-52fb-98c4-b603961a0582"
+_AID = "8a4c410c-320d-5711-b987-c15b50bec3fc"
+_RUN_ID = "1a6080e8-d061-547f-ab63-1af99b18ad0c"
+
+
+def test_artifact_record_splits_into_its_three_fields(ingest):
+    assert ingest._parse_artifact_record(
+        f"{_AID}|{_BASE}|torch-spyre@07379f50,lxml"
+    ) == (
+        _AID,
+        _BASE,
+        "torch-spyre@07379f50,lxml",
+    )
+
+
+def test_a_bare_id_still_parses(ingest):
+    # Producer and parser are versioned independently; a format bump must not lose rows.
+    assert ingest._parse_artifact_record(_AID) == (_AID, "", "")
+    assert ingest._parse_artifact_record(f"{_AID}|{_BASE}") == (_AID, _BASE, "")
+    assert ingest._parse_artifact_record("") == ("", "", "")
+
+
+def test_a_leg_with_no_cases_is_an_error_not_a_failure(ingest):
+    # A suite that produced no test did not regress -- it did not run.
+    assert ingest._leg_state(0, 0) == "error"
+    assert ingest._leg_state(0, 12) == "passed"
+    assert ingest._leg_state(1, 12) == "failed"
+
+
+def test_run_url_needs_both_coordinates(ingest):
+    args = types.SimpleNamespace(repository="o/r", gha_run_id="42")
+    assert ingest._gha_run_url(args).endswith("/o/r/actions/runs/42")
+    assert (
+        ingest._gha_run_url(types.SimpleNamespace(repository="", gha_run_id="42")) == ""
+    )
+    assert (
+        ingest._gha_run_url(types.SimpleNamespace(repository="o/r", gha_run_id=""))
+        == ""
+    )
+
+
+class _ArtifactClient:
+    """Reports nothing recorded yet, and keeps what was inserted."""
+
+    def __init__(self):
+        self.inserts = []
+
+    def query(self, sql, parameters=None):
+        return _Result([[0]])
+
+    def insert(self, table, rows, column_names=None, database=None):
+        self.inserts.append((table, rows, column_names))
+
+
+def _args(**kw):
+    a = types.SimpleNamespace(
+        artifact_id=f"{_AID}|{_BASE}|torch-spyre@07379f50",
+        component="torch-spyre",
+        platform="x86_64",
+        repository="torch-spyre/torch-spyre",
+        branch="main",
+        sha="07379f50",
+        gha_run_id="42",
+    )
+    for k, v in kw.items():
+        setattr(a, k, v)
+    return a
+
+
+def test_a_sharded_leg_reports_one_verdict_for_the_whole_run(ingest):
+    # Many files under one run_id: a per-file write would report only the first shard.
+    c = _ArtifactClient()
+    legs = {(_RUN_ID, "regression"): {"failed": 3, "total": 90, "duration_s": 12.5}}
+    ingest._write_artifact_verdicts(c, "db", _args(), legs)
+    results = [i for i in c.inserts if i[0] == "artifact_results"]
+    assert len(results) == 1
+    row = dict(zip(results[0][2], results[0][1][0]))
+    assert row["state"] == "failed"
+    assert row["duration_s"] == 12.5
+    assert row["artifact_id"] == _AID
+
+
+def test_no_artifact_id_writes_nothing(ingest):
+    # Any image baked before the id was stamped: cases land, nothing claims an artifact.
+    c = _ArtifactClient()
+    legs = {(_RUN_ID, "regression"): {"failed": 0, "total": 1, "duration_s": 1.0}}
+    ingest._write_artifact_verdicts(c, "db", _args(artifact_id=""), legs)
+    assert c.inserts == []
+
+
+def test_a_tier_the_ddl_rejects_is_skipped_not_raised(ingest):
+    # An empty --trigger-type is the commonest cause; the server would reject the row.
+    c = _ArtifactClient()
+    legs = {(_RUN_ID, ""): {"failed": 0, "total": 1, "duration_s": 1.0}}
+    ingest._write_artifact_verdicts(c, "db", _args(), legs)
+    assert c.inserts == []
+
+
+def test_a_write_failure_never_propagates(ingest):
+    # The cases are already in; losing the verdict must not also lose them.
+    class Boom(_ArtifactClient):
+        def insert(self, *a, **kw):
+            raise RuntimeError("clickhouse is down")
+
+    legs = {(_RUN_ID, "regression"): {"failed": 0, "total": 1, "duration_s": 1.0}}
+    ingest._write_artifact_verdicts(Boom(), "db", _args(), legs)

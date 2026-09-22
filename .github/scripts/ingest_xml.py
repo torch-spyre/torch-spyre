@@ -38,6 +38,7 @@ from spyre_clickhouse_ingest import (
     extract_properties,
     get_client,
     insert_benchmarks,
+    insert_gha_artifact_result,
     insert_test_results,
     promote_xpass,
     cases_already_ingested,
@@ -1183,6 +1184,90 @@ def copy_reused_cases(client, db: str, run_id: str, component: str, covered) -> 
     return total
 
 
+# ---------------------------------------------------------------------------
+# The GHA leg's artifact, and its verdict. The id is derived on the RUNNER (only it can read
+# the image's stamped base id and knows the installed delta) and arrives as --artifact-id.
+# ---------------------------------------------------------------------------
+
+
+def _parse_artifact_record(raw: str):
+    """Split --artifact-id into (artifact_id, base_artifact_id, installed).
+
+    Tolerant both ways -- producer and parser are versioned independently, so a strict arity
+    check would turn a format bump into lost rows for every in-flight run.
+    """
+    parts = [f.strip() for f in (raw or "").split("|")]
+    parts += [""] * (3 - len(parts))
+    return parts[0], parts[1], parts[2]
+
+
+def _leg_state(failed: int, total: int) -> str:
+    """artifact_results.state. 'error' for no cases: that suite did not run, it did not regress."""
+    if total <= 0:
+        return "error"
+    return "failed" if failed > 0 else "passed"
+
+
+def _write_artifact_verdicts(client, v2db: str, args, legs: dict) -> None:
+    """Write one artifacts row and one artifact_results row per (run_id, tier) of this leg."""
+    if not legs or not v2db or not args.artifact_id:
+        return
+    artifact_id, base_id, installed = _parse_artifact_record(args.artifact_id)
+    if not artifact_id:
+        return
+    try:
+        for (run_id, tier), acc in sorted(legs.items()):
+            if tier not in schema_model.TEST_TYPE_VALUES:
+                # Loud: this is the last thing between a derived id and its verdict.
+                print(
+                    f"  [warn] v2: artifact verdict skipped for run_id={run_id} -- "
+                    f"test_type {tier!r} is not a tier the DDL admits "
+                    f"({sorted(schema_model.TEST_TYPE_VALUES)}); --trigger-type is the "
+                    "field usually missing",
+                    file=sys.stderr,
+                )
+                continue
+            wrote = insert_gha_artifact_result(
+                client,
+                v2db,
+                artifact_id=artifact_id,
+                component=component_of(args, COMPONENT_DEFAULT),
+                arch=args.platform or "",
+                run_id=run_id,
+                test_type=tier,
+                state=_leg_state(acc["failed"], acc["total"]),
+                duration_s=acc["duration_s"],
+                # Hash inputs, carried through the record -- unreachable from this job.
+                base_artifact_id=base_id,
+                installed=installed,
+                repo=args.repository,
+                git_ref=args.branch,
+                git_sha=args.sha,
+                run_url=_gha_run_url(args),
+            )
+            if wrote:
+                print(
+                    f"  v2: artifact_results {artifact_id} "
+                    f"[{tier}] state={_leg_state(acc['failed'], acc['total'])} "
+                    f"under run_id={run_id}"
+                )
+    except Exception as err:
+        # The cases are already in; losing the verdict must not also lose them.
+        print(
+            f"  [warn] v2: artifact verdict write failed, rows unaffected: {err!r}",
+            file=sys.stderr,
+        )
+
+
+def _gha_run_url(args) -> str:
+    """`run_url` -- the ONE url key in v2: the CI run behind the row."""
+    repo, rid = (args.repository or "").strip(), (args.gha_run_id or "").strip()
+    if not (repo and rid):
+        return ""
+    server = os.environ.get("GITHUB_SERVER_URL", "https://github.com").rstrip("/")
+    return f"{server}/{repo}/actions/runs/{rid}"
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--xml-dir", default=None)
@@ -1199,6 +1284,21 @@ def main():
         "the test_case_id they hash into) name the suite's real owner.",
     )
     parser.add_argument("--gha-run-id", default="")
+    parser.add_argument(
+        "--artifact-id",
+        default="",
+        help="Identity of what this leg ACTUALLY RAN, derived on the runner by "
+        "derive-gha-artifact-id. A bare artifact_id, or the record "
+        "'<artifact_id>|<base_artifact_id>|<installed,comma,joined>' whose extra fields are "
+        "the hash inputs. Given, the ingest also writes the artifacts row and the "
+        "artifact_results verdict; empty writes neither and the cases land as before.",
+    )
+    parser.add_argument(
+        "--repository",
+        default=os.environ.get("GITHUB_REPOSITORY", ""),
+        help="owner/repo the tested commit came from, recorded in artifacts.sources -- the "
+        "column resolve_covered_tiers.py reaches an artifact through.",
+    )
     parser.add_argument("--triggered-at", default="")
     parser.add_argument("--pr-number", default="")
     parser.add_argument(
@@ -1286,6 +1386,10 @@ def main():
     total_benchmarks = 0
     parsed_benchmarks = 0
     total_kernels = 0
+
+    # (run_id, tier) -> aggregate outcome, written AFTER the loop: a sharded run is many
+    # files under one run_id, so a per-file write would report only the first shard's verdict.
+    artifact_legs = {}
 
     # Hoisted: the gate costs round trips and v2db is fixed for the invocation.
     bench_ready = bool(v2db) and benchmark_tables_present(client, v2db)
@@ -1565,6 +1669,17 @@ def main():
                             xml_path.name,
                         )
                         print(f"  v2: {_n} test_case_runs under run_id={_v2_run_id}")
+
+                    # Accumulated even when the cases were already ingested, so a re-ingest
+                    # can still land a verdict that failed to write. The writer dedups.
+                    if _v2_run_id and args.artifact_id:
+                        _acc = artifact_legs.setdefault(
+                            (_v2_run_id, _v2_tier),
+                            {"failed": 0, "total": 0, "duration_s": 0.0},
+                        )
+                        _acc["failed"] += int(run.get("failed", 0) or 0)
+                        _acc["total"] += int(run.get("total_tests", 0) or 0)
+                        _acc["duration_s"] += float(run.get("duration_s", 0) or 0)
             except Exception as _v2_err:
                 print(
                     f"  [warn] v2 write failed, v1 unaffected: {_v2_err!r}",
@@ -1577,6 +1692,8 @@ def main():
                     f"  Inserted {len(cases)} test cases + "
                     f"{sum(len(c['properties']) for c in cases)} properties"
                 )
+
+    _write_artifact_verdicts(client, v2db, args, artifact_legs)
 
     print(f"\nDone. {len(xml_files)} file(s) processed.")
     print(f"  Test cases ingested:  {total_cases}")
