@@ -136,7 +136,7 @@ python captured/sdsc_fused__softmax_0.py --stage bundle  # artifacts only
 ```
 
 `--stage bundle` writes `sdsc_N.json` and `bundle.mlir` and stops. It needs no
-device and no `dxp_standalone`, so it is the stage to use when the question is
+device and no backend compiler, so it is the stage to use when the question is
 *"what did my OpSpec turn into?"* rather than *"what does it compute?"*.
 
 Then edit a field and re-run. That is the whole point of the file being

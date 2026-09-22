@@ -192,6 +192,7 @@ class ExhaustiveSearchSolver(CoreDivisionLayoutSolver):
         t_search = time.perf_counter() - t1
 
         n_paths = math.prod(len(b.core_divisions) for b in buffers_list)
+
         winner = {
             b.name: b.core_divisions[best_chosen[b.name]].label
             for b in variable_buffers

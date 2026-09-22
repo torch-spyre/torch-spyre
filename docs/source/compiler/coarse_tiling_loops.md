@@ -45,41 +45,31 @@ what constraints forced each choice — see the companion RFC
 
 The tiling loop structure must be created early (before work division sees
 the iteration space) and preserved intact through scheduling and codegen so
-that the hardware executes the reduced per-iteration working set — not the
-full pre-tiling range.  The design has three layers that correspond to the
-three pipeline stages above.  At each layer the same concept — *these ops
-are inside a counted loop* — takes the form demanded by that layer's type
-system:
+that the hardware executes the reduced per-iteration working set rather than
+the full pre-tiling range. The design has three layers that correspond to
+the three pipeline stages above. At each layer the
+same concept, that these ops are inside a counted loop, takes the form
+demanded by that layer's type system:
 
 | Layer | Loop identity | Form |
 |---|---|---|
-| 1 — Pre-scheduling IR pass | `loop_info: CoarseTileInfo` on `ir.Operation` | Per-op tag |
-| 2 — Scheduler | `CountedLoopSchedulerNode` | Perimeter wrapper |
-| 3 — Codegen output | `LoopSpec` | Serializable tree node |
+| 1, pre-scheduling IR pass | `loop_info: CoarseTileInfo` on `ir.Operation` | Per-op tag |
+| 2, scheduler | `CountedLoopSchedulerNode` | Perimeter wrapper |
+| 3, codegen output | `LoopSpec` | Serializable tree node |
 
-```
-Pre-scheduling IR pass  (CustomPreSchedulingPasses)
-  └─ stamps loop_info (CoarseTileInfo) on each ir.Operation
-  └─ rewrites each op's ranges (divides the tiled dimension by K)
+:::{figure} ../_static/images/coarse-tiling-layers.svg
+:alt: Three layers of coarse-tiling loop IR: the pre-scheduling pass stamps CoarseTileInfo and divides ranges, the pre-fusion pass wraps runs in CountedLoopSchedulerNode, and codegen emits a LoopSpec that serializes to scf.for
+:width: 100%
+:align: center
 
-  ↓  Inductor Scheduler wraps each ir.Operation → SchedulerNode
-  ↓  CustomPreFusionPasses fires (before Inductor's fusion pass)
-
-Pre-fusion scheduler pass  (build_loop_scheduler_nodes)
-  └─ scans list[BaseSchedulerNode] for runs sharing a loop_info.loop_group_id
-  └─ wraps each run in a CountedLoopSchedulerNode(count=K, snodes=[...])
-  └─ Inductor fusion runs after; CountedLoopSchedulerNode is opaque to it
-  └─ spyre_fuse_nodes (CustomPostFusionPasses) also cannot cross group
-     boundaries because CountedLoopSchedulerNode.can_fuse=False
-
-  ↓  Scheduler calls SuperDSCScheduling.codegen_node()
-
-codegen_node
-  └─ receives CountedLoopSchedulerNode
-  └─ drives SpyreKernel for the inner ops, collecting inner OpSpecs
-  └─ wraps them in LoopSpec(count=K, body=[OpSpec, ...])
-  └─ LoopSpec is serialized alongside OpSpec in codegen_kernel()
-```
+The three layers, from the pre-scheduling IR pass through the pre-fusion
+scheduler pass to codegen. Layer 1 stamps `loop_info` (`CoarseTileInfo`) on
+each `ir.Operation` and divides the tiled dimension by `K`. Layer 2 wraps
+each run of ops that shares a `loop_group_id` in a
+`CountedLoopSchedulerNode`, which is opaque to Inductor fusion. Layer 3
+drives `SpyreKernel` for the inner ops and wraps their `OpSpec`s in a
+`LoopSpec` that serializes to an `scf.for` with late-bound addresses.
+:::
 
 ## Small Example
 
@@ -1622,8 +1612,10 @@ making any new ones. The exact buffer allocation depends on whether tiling
 is flat (reduction dim only) or nested (outer output dim + inner reduction
 dim):
 
-**Flat (K-only) tiling** — a single `accum_full` HBM buffer is allocated.
-The fill and combine ops both target `accum_full` directly.
+**Flat (reduction-dim only) tiling** — a single `accum_full` HBM buffer is
+allocated.  The fill and combine ops both target `accum_full` directly.  The
+reduction dim here is BMM `k` or the reduced axis of a `sum`/`prod`/`max`/`min`
+reduction (the span-overflow pass now routes both).
 
 1. **Allocate `accum_full`** with the full output shape (`data.ranges`,
    which is already the full output since only `reduction_ranges` was

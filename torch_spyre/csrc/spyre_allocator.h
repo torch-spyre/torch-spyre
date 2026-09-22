@@ -81,7 +81,8 @@ struct SpyreAllocator final : public c10::DeviceAllocator {
 
   void copy_data(void* dest, const void* src, std::size_t count) const final;
 
-  uint64_t compositeAddressToDmva(const flex::CompositeAddress& addr) const;
+  uint64_t compositeAddressToDeviceAddress(
+      const flex::CompositeAddress& addr) const;
 };
 
 }  // namespace spyre

@@ -489,35 +489,57 @@ def lower_bmm(x, y):
 
     reduction_numel = x_size[-1]  # K
 
-    if x_ndim == 3 and y_ndim == 3:
-        ranges = [x_size[0], x_size[1], y_size[2]]  # B, M, N
-
-        def inner_fn(index, reduction_index):
-            i0, i1, i2 = index
-            (r0,) = reduction_index
-            tmp1 = x_loader([i0, i1, r0])
-            tmp2 = y_loader([i0, r0, i2])
-            return (tmp1, tmp2)
-    elif x_ndim == 4 and y_ndim == 4:
-        ranges = [x_size[0], x_size[1], x_size[2], y_size[-1]]
-
-        def inner_fn(index, reduction_index):
-            i0, i1, i2, i3 = index
-            (r0,) = reduction_index
-            tmp1 = x_loader([i0, i1, i2, r0])
-            tmp2 = y_loader([i0, i1, r0, i3])
-            return (tmp1, tmp2)
-    elif x_ndim == 3 and y_ndim == 2:
-        ranges = [x_size[0], x_size[1], y_size[1]]  # B, M, N
-
-        def inner_fn(index, reduction_index):
-            i0, i1, i2 = index
-            (r0,) = reduction_index
-            tmp1 = x_loader([i0, i1, r0])
-            tmp2 = y_loader([r0, i2])
-            return (tmp1, tmp2)
-    else:
+    if x_ndim < 2 or y_ndim < 2:
         raise Unsupported(f"BMM with input shapes {x.get_size()} and {y.get_size()}")
+
+    if sympy.simplify(x_size[-1] - y_size[-2]) != 0:
+        raise Unsupported(f"BMM with input shapes {x.get_size()} and {y.get_size()}")
+
+    x_batch = list(x_size[:-2])
+    y_batch = list(y_size[:-2])
+    batch_rank = max(len(x_batch), len(y_batch))
+    x_batch = [sympy.Integer(1)] * (batch_rank - len(x_batch)) + x_batch
+    y_batch = [sympy.Integer(1)] * (batch_rank - len(y_batch)) + y_batch
+    batch_ranges = []
+    x_broadcast = []
+    y_broadcast = []
+    for x_dim, y_dim in zip(x_batch, y_batch):
+        if sympy.simplify(x_dim - y_dim) == 0:
+            batch_ranges.append(x_dim)
+            x_broadcast.append(False)
+            y_broadcast.append(False)
+        elif sympy.simplify(x_dim - 1) == 0:
+            batch_ranges.append(y_dim)
+            x_broadcast.append(True)
+            y_broadcast.append(False)
+        elif sympy.simplify(y_dim - 1) == 0:
+            batch_ranges.append(x_dim)
+            x_broadcast.append(False)
+            y_broadcast.append(True)
+        else:
+            raise Unsupported(
+                f"BMM with incompatible batch shapes {x.get_size()} and {y.get_size()}"
+            )
+
+    ranges = [*batch_ranges, x_size[-2], y_size[-1]]
+    x_leading_pad = batch_rank - (x_ndim - 2)
+    y_leading_pad = batch_rank - (y_ndim - 2)
+
+    def inner_fn(index, reduction_index):
+        *batch_index, row, column = index
+        (contraction,) = reduction_index
+        x_indices = [
+            sympy.Integer(0) if is_broadcast else batch_index[dim]
+            for dim, is_broadcast in enumerate(x_broadcast)
+        ][x_leading_pad:]
+        y_indices = [
+            sympy.Integer(0) if is_broadcast else batch_index[dim]
+            for dim, is_broadcast in enumerate(y_broadcast)
+        ][y_leading_pad:]
+        return (
+            x_loader([*x_indices, row, contraction]),
+            y_loader([*y_indices, contraction, column]),
+        )
 
     if reduction_numel == 1:
         # Reduction degenerates to a pointwise mul
@@ -789,7 +811,7 @@ def lower_avg_pool2d(
     if kH == 1 or kW == 1:
         # avgpoolfwd is a windowed reduction; a 1-wide kernel has no pooling
         # window along that axis (it is an identity or a strided subsample),
-        # which the pool datapath cannot express — the DDL rejects a windowless
+        # which the pool datapath cannot express — the backend rejects a windowless
         # pool ("Unknown primary dimension kind ... for a window dimension").
         # Spyre also has no eager avg_pool2d kernel to fall back to.  So delegate
         # to the in-tree Inductor lowering, which decomposes avg_pool2d into
@@ -1400,6 +1422,93 @@ def lower_restickify(x):
     )
 
     pw.realize()
+    return pw
+
+
+@register_spyre_lowering(torch.ops.spyre.compact)
+def lower_compact(x):
+    # Just emit a pointwise op here. At this point we only know that
+    # 1) the host output layout should be the same as the host input layout
+    # 2) the device output layout should be the default for the host layout
+    # 3) we don't know the device input layout
+    #
+    # Later, during Opspec generation we have the input device layout and
+    # there we can decide to emit an identity or restickify and slice.
+
+    # Here we don't unwrap because we need to know what dimensions
+    # Pytorch is reasoning on.
+    x.realize()
+    loader = x.make_loader()
+
+    def inner_fn(index):
+        return loader(index)
+
+    pw = Pointwise.create(
+        device=x.get_device(),
+        dtype=x.get_dtype(),
+        inner_fn=inner_fn,
+        ranges=x.get_size(),
+        origin_node=V.get_current_node(),
+        traceback=x.get_traceback(),
+    )
+
+    pw.realize()
+    return pw
+
+
+@register_spyre_lowering(
+    torch.ops.spyre.tile_dim_marker,
+    type_promotion_kind=None,
+    # tile_dim_marker is called unconditionally from for_each_tile._tile(),
+    # including on device-agnostic (e.g. CPU-only) compiles that never enter
+    # enable_spyre_lowerings(). Registering it only into spyre_lowerings (the
+    # default) leaves it absent from torch._inductor.lowering.lowerings for
+    # those compiles, so Inductor's implicit_fallbacks machinery permanently
+    # installs a generic fallback_handler for it in the *global* lowerings
+    # dict. A later Spyre-context compile's enable_spyre_lowerings() then
+    # mistakes that stray fallback_handler for a legitimate pre-existing
+    # in-tree lowering, saves it, and restores it on exit -- permanently
+    # shadowing this lowering for the rest of the process. This lowering's
+    # body is device-agnostic (just realizes a ComputedBuffer), so register
+    # it directly into the real global dict at import time instead, closing
+    # the gap that lets implicit_fallbacks claim the op in the first place.
+    lowering_dict=lowering.lowerings,
+)
+def lower_tile_dim_marker(x, dim):
+    # A bare `return x` elides before any ir.Operation is ever constructed
+    # (register_lowering's dispatch never builds a new op for an identity
+    # return) -- confirmed empirically against a live nested for_each_tile
+    # compile. Force a real, distinct ComputedBuffer into existence instead,
+    # so _consume_tile_dim_markers (for_each_tile_lowering.py) has something
+    # to find, tag, and erase.
+    #
+    # Unlike lower_restickify (whose callers only ever pass whole, unsliced
+    # base tensors), _tile() calls this op on genuinely sliced/moved-dim
+    # views. Building the loader from x's own unwrapped StorageBox (as
+    # lower_restickify does) silently substitutes the base's full shape and
+    # untranslated indices for the view's -- confirmed empirically: on a
+    # narrowed tile, that reads back the whole base tensor at the wrong
+    # shape and wrong offset instead of just the tile's own values. Read
+    # through x directly instead, so the view's own indexing/shape apply.
+    x.realize()
+    loader = x.make_loader()
+
+    def inner_fn(index):
+        return loader(index)
+
+    pw = Pointwise.create(
+        device=x.get_device(),
+        dtype=x.get_dtype(),
+        inner_fn=inner_fn,
+        ranges=x.get_size(),
+        origin_node=V.get_current_node(),
+        traceback=x.get_traceback(),
+    )
+    pw.realize()
+    # Stash dim as a plain attribute on the realized ComputedBuffer so
+    # _consume_tile_dim_markers can read it back without reverse-engineering
+    # it from constant_args/op_overload plumbing.
+    pw.data.data.tile_marker_dim = dim
     return pw
 
 

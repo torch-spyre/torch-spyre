@@ -42,7 +42,8 @@ from torch_spyre._inductor.scratchpad.plan_solver import (
 )
 from torch_spyre._inductor.scratchpad.sa_cooptimizer import SaCoOptimizingSolver
 
-from tests.inductor.cooptimization_capture_loader import (
+from cooptimization_capture_loader import (
+    DEFAULT_CAPTURE_PATH,
     LARGE_CAPTURE_PATH,
     SEED_DIVISION_INDEX,
     load_captures,
@@ -161,10 +162,7 @@ class CaptureAssumptionsTest(TestCase):
         """
         import json
 
-        for path in (
-            "tests/inductor/cooptimization_captures.json",
-            "tests/inductor/cooptimization_captures_large.json",
-        ):
+        for path in (DEFAULT_CAPTURE_PATH, LARGE_CAPTURE_PATH):
             with open(path) as f:
                 raw = json.load(f)
             for case, graphs in raw.items():

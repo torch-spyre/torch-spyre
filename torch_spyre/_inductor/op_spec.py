@@ -264,6 +264,10 @@ class TensorArg:
             ops without loop_info/coarse tiling.
         work_division: Optional tensor-specific ownership used when it differs
             from the operation's work division.
+        kernel_local: True when nothing outside the kernel that produced this
+            buffer reads it. The KTIR plan-time fuser deletes a producer op only
+            for such a buffer; only the scheduler can see a buffer's users, so
+            it is filled there and defaults to False.
     """
 
     is_input: bool
@@ -278,6 +282,7 @@ class TensorArg:
         default_factory=lambda: ElementArrangement.STANDARD
     )
     work_division: TensorWorkDivision | None = None
+    kernel_local: bool = False
 
 
 def is_lx_relayout_identity(
@@ -364,6 +369,9 @@ class OpSpec:
     # node exposes no data.ranges.
     node_output_ranges: tuple[Expr, ...] | None = None
     debug_handle: DebugHandle | None = None
+    # Producer cores holding finished reduction values. Other producer cores
+    # must not be exposed as holders to the ordinary LX copy machinery.
+    completed_producer_cores: tuple[int, ...] = ()
 
 
 # --- Module-level constant tensor cache --------------------------------------

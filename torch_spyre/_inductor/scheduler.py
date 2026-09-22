@@ -628,8 +628,14 @@ class SuperDSCScheduling(BaseScheduling):
         ``kernel.failed_node`` names the operation whose description could not
         be finalized; the kernel itself is not usable afterwards.
         """
+        nodes = self._live_nodes(node)
+        # Before any spec is built, which is what this method goes on to do:
+        # create_tensor_arg reads this to decide whether a buffer is kernel-local.
+        # _codegen_into_kernel may reach further inner nodes, so the set can be a
+        # subset -- which errs towards declining.
+        kernel.fused_node_names = OrderedSet(n.get_name() for n in nodes)
         with kernel:
-            self._codegen_into_kernel(self._live_nodes(node), kernel)
+            self._codegen_into_kernel(nodes, kernel)
         if isinstance(node, CountedLoopSchedulerNode):
             kernel.wrap_op_specs_in_loop(node.loop_count)
         kernel.check_op_specs()
@@ -659,6 +665,7 @@ class SuperDSCScheduling(BaseScheduling):
         all_schedule_nodes = kernel.scheduled_nodes
 
         kernel.pool_size = getattr(V.graph, "hbm_pool_sizes", {}).get(name, 0)
+
         with V.set_kernel_handler(kernel):
             src_code = kernel.codegen_kernel()
         kernel_name = self.define_kernel(src_code, all_schedule_nodes, kernel)

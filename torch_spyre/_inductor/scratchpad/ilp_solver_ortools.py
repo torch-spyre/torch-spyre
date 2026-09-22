@@ -67,6 +67,22 @@ a merged unit to one rectangle over the union of its members' lifetimes, which i
 conservative enough that the squeeze can occasionally need more room than the
 solver's own answer; when it would not fit, the solver's offsets are kept.
 
+**LX relayouts** ride on the same machinery. The allocator hands the solver one
+``RelayoutCopyBuffer`` per relayout group (a source and one destination per-core
+view, however many consumers read it), live from the group's first consumer to
+its last; the copy's residency IS the decision to shuffle, its rectangle sits in
+the same 2D no-overlap as every other buffer, and its price is an ordinary term
+of the shared objective (``RelayoutCopyBuffer.cost_term``: the fitted shuffle
+cost of the source's chosen division, charged while the copy is resident). What
+this module adds is only the coupling the data cannot carry
+(``_constrain_relayout_copies`` and the relaxed gate in
+``constrain_residency``): a resident copy needs its source resident under a
+division it was priced for, a consumer reads the copy only under a division
+pair its candidates list, and a resident copy serves at least one consumer. The
+gate thus becomes "slicing match, or a resident copy serving this edge". Under
+the fallback objective a shuffle is unpriced and would look free, so every copy
+is pinned out there.
+
 The same model also serves plain :class:`LifetimeBoundBuffer`s via
 ``plan_layout`` (the ``MemoryPlanSolver`` contract the placement-only allocator
 calls). Those buffers carry no candidate divisions, so the division-dependent
@@ -85,10 +101,12 @@ from __future__ import annotations
 
 import logging
 import math
+import operator
 import os
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING, Generic, Optional, TypeVar, cast
+from functools import cache
+from typing import TYPE_CHECKING, Any, Generic, Optional, TypeVar, cast
 import sympy
 from sympy.printing.printer import Printer
 import torch
@@ -103,11 +121,13 @@ else:
     except ImportError:  # pragma: no cover - exercised only when ortools is absent
         cp_model = None
 
+from torch_spyre._inductor.scratchpad.lx_relayout import ChosenRelayout
 from torch_spyre._inductor.scratchpad.plan_solver import (
     CoreDivisionBuffer,
     ceil_div,
     CoreDivisionLayoutSolver,
     LifetimeBoundBuffer,
+    RelayoutCopyBuffer,
     SolveError,
     BufferType,
     _check_in_place_relationships,
@@ -130,8 +150,12 @@ _BufT = TypeVar("_BufT", bound=LifetimeBoundBuffer)
 
 # constant to scale log of core split. error ~0.5%
 _CORE_LOG_SCALE = 32.0
-# constant to scale inverse of core split. error ~1%
+# fallback scale for the inverse of a core split, used when the LCM of the
+# split's candidate values (see _SympyExprToCpSat._inv_scale) exceeds it.
+# error <= ~2.5%
 _CORE_INV_SCALE = 1024
+# constant limit on product terms to avoid int32 overflow in CP-SAT
+_MAX_PRODUCT_BOUND = 2**30
 
 
 @dataclass
@@ -213,6 +237,13 @@ class _LifetimeBufferWithCpVars(Generic[_BufT]):
             for parent in b.in_place_parents
         }
         self.core_cost = None
+        # Relayout state (populated only by the joint subclass; kept here so
+        # every solver method can iterate uniformly). Per parent this buffer
+        # could read through a relayout copy: the (served literal, copy wrapper)
+        # pairs minted in constrain_residency. A served literal means "this
+        # consumer reads the parent from that copy", which pins the division
+        # pair and requires the copy resident.
+        self.relayout_reads: dict[str, list[tuple[Any, Any]]] = {}
 
     # -- producer/consumer edges (joint model only; none when division-fixed) --
     @property
@@ -247,7 +278,7 @@ class _LifetimeBufferWithCpVars(Generic[_BufT]):
         reads_served = b.read_count - (1 if b.first_use_is_read else 0)
         return (reads_served + (1 if is_intermediate else 0)) * b.size
 
-    def constrain_residency(self, model, kids, bufs) -> None:
+    def constrain_residency(self, model, kids, bufs, copies) -> None:
         """Placement-only: any buffer may reside, so there is no slicing gate."""
 
     def constrain_merge(self, model, parent: "_LifetimeBufferWithCpVars", edge) -> None:
@@ -262,6 +293,16 @@ class _LifetimeBufferWithCpVars(Generic[_BufT]):
     def record_division(self, solver: "cp_model.CpSolver") -> None:
         """Write the chosen division back onto the buffer (nothing to record
         when the division is fixed)."""
+
+
+_operator_map = {
+    ">=": operator.ge,
+    "<": operator.lt,
+    "<=": operator.le,
+    ">": operator.gt,
+    "==": operator.eq,
+    "!=": operator.ne,
+}
 
 
 @dataclass
@@ -291,36 +332,49 @@ class _CoreDivisionBufferWithCpVars(_LifetimeBufferWithCpVars[CoreDivisionBuffer
         # optimum) this is smallest when the split is spread across more axes
         # with smaller factors, so minimizing it favours a balanced division
         # over one that hammers a single axis (e.g. 2x2 over 4x1, both four
-        # cores). The two split namespaces are coeff-keyed and iterated
-        # separately -- a union would silently drop a factor whose coeff
-        # collides across the two.
+        # cores).
         core_cost = [
-            sum(
-                split**2
-                for split in list(cd.output_splits.values())
-                + list(cd.reduction_splits.values())
-            )
-            for cd in b.core_divisions
+            sum(split**2 for split in cd.splits.values()) for cd in b.core_divisions
         ]
+        # For a relayout copy only: the served literals of the consumer edges
+        # it can carry, filled by the sources' constrain_residency and consumed
+        # by _constrain_relayout_copies ("a resident copy serves someone").
+        self.serves: list[Any] = []
+        self.cores_used = cores_used
+        if len(b.core_divisions) == 1:
+            # Nothing to choose: bind every division-derived quantity as a
+            # constant instead of an element lookup on a fixed index. Every
+            # relayout copy is such a buffer, and with hundreds of them the
+            # free eff_size/cores/core_cost/split integers (domains up to a few
+            # thousand) behind one-entry elements made CP-SAT's presolve scale
+            # super-linearly in the copy count: 40 s at 160 copies, past the
+            # 120 s limit at 312, on the 304-op spyre_attn decode graph.
+            self.division = m.new_constant(0)
+            self.eff_size = per_core[0]
+            self.core_cost = core_cost[0]
+            self.cores = cores_used[0]
+            only = b.core_divisions[0]
+            self.cp_core_divs = {
+                key: only.splits.get(key, 1) for key in b.sym_core_divs
+            }
+            self.cp_core_divs_raw = {key: [v] for key, v in self.cp_core_divs.items()}
+            true, false = m.new_constant(1), m.new_constant(0)
+            self.division_is = lambda i: true if i == 0 else false
+            return
         self.division = m.new_int_var(0, len(b.core_divisions) - 1, f"div_{b.name}")
         self.eff_size = m.new_int_var(0, max(per_core), f"eff_size_{b.name}")
         self.core_cost = m.new_int_var(0, max(core_cost), f"core_cost_{b.name}")
-        # total cores this op uses under the chosen div
-        self.cores = m.new_int_var(0, max(cores_used), f"occ_{b.name}")
+        self.cores = m.new_int_var(min(cores_used), max(cores_used), f"occ_{b.name}")
 
-        sym_core_divs = b.sym_core_divs
-
-        cp_core_divs = ({}, {})
-        cp_core_divs_raw = ({}, {})
-        for i, split_type in enumerate(["output_splits", "reduction_splits"]):
-            splits = sym_core_divs[i]
-            for key, symbol in splits.items():
-                assert isinstance(symbol, sympy.Symbol)
-                raw = [getattr(cd, split_type).get(key, 1) for cd in b.core_divisions]
-                cp_var = m.new_int_var(1, config.sencores, f"{symbol.name}")
-                m.add_element(self.division, raw, cp_var)
-                cp_core_divs[i][key] = cp_var
-                cp_core_divs_raw[i][key] = raw
+        cp_core_divs: dict = {}
+        cp_core_divs_raw: dict = {}
+        for key, symbol in b.sym_core_divs.items():
+            assert isinstance(symbol, sympy.Symbol)
+            raw = [cd.splits.get(key, 1) for cd in b.core_divisions]
+            cp_var = m.new_int_var(1, config.sencores, f"{symbol.name}")
+            m.add_element(self.division, raw, cp_var)
+            cp_core_divs[key] = cp_var
+            cp_core_divs_raw[key] = raw
 
         self.cp_core_divs = cp_core_divs
         self.cp_core_divs_raw = cp_core_divs_raw
@@ -331,6 +385,15 @@ class _CoreDivisionBufferWithCpVars(_LifetimeBufferWithCpVars[CoreDivisionBuffer
         m.add_element(self.division, cores_used, self.cores)
         m.add_element(self.division, core_cost, self.core_cost)
 
+        self.division_is = cache(self._division_is)
+
+    def _division_is(self, i: int) -> Any:
+        """The literal ``division == i`` (both directions enforced)."""
+        lit = self.model.new_bool_var(f"div_{self.name}_is_{i}")
+        self.model.add(self.division == i).only_enforce_if(lit)
+        self.model.add(self.division != i).only_enforce_if(lit.Not())
+        return lit
+
     @property
     def parents(self) -> list[str]:
         return self.buffer.parents
@@ -338,9 +401,10 @@ class _CoreDivisionBufferWithCpVars(_LifetimeBufferWithCpVars[CoreDivisionBuffer
     def match_pairs(self, parent: str) -> list[tuple[int, int]]:
         return self.buffer.cd_parent_matches.get(parent, [])
 
-    def constrain_residency(self, model, kids, bufs) -> None:
+    def constrain_residency(self, model, kids, bufs, copies) -> None:
         """Slicing-consistency gate: a resident buffer's division must match
-        *every* consumer's division under the ``cd_parent_matches`` pairs.
+        *every* consumer's division under the ``cd_parent_matches`` pairs, or
+        the consumer must read it through a resident relayout copy.
 
         This is the part of residency that genuinely depends on the solver's
         free variables, so it stays here as a constraint. The precomputable
@@ -348,11 +412,48 @@ class _CoreDivisionBufferWithCpVars(_LifetimeBufferWithCpVars[CoreDivisionBuffer
         pair -- are decided by the allocator and arrive as ``read_count`` /
         ``residency_reason``. A consumer with no compatible pair still lands
         correctly if it slips through: ``_gate_divisions`` forces ``in_buffer``
-        false when the pair list is empty."""
+        false when the pair list is empty.
+
+        ``copies`` maps a relayout group key to the wrapper of its
+        ``RelayoutCopyBuffer``. For each consumer edge with priced candidates
+        on a group that has a copy in this solve, a *served* literal says "the
+        consumer reads this buffer from that copy": it pins the division pair
+        to one the candidates list (``_gate_divisions`` over the group's
+        pairs) and requires the copy resident. The gate then relaxes to
+        "match or served". The served literals are recorded on the consumer
+        (``relayout_reads``) for extraction and on the copy's tally for the
+        "a resident copy serves someone" constraint."""
         for child, compatible in kids:
+            child_w = bufs[child]
+            served: list = []
+            by_group: dict[tuple[str, int], list] = {}
+            for candidate in child_w.buffer.cd_parent_relayouts.get(self.name, ()):
+                if candidate.group_key in copies:
+                    by_group.setdefault(candidate.group_key, []).append(candidate)
+            for key, candidates in sorted(by_group.items()):
+                copy_w = copies[key]
+                lit = model.new_bool_var(f"served_{self.name}__{child}__g{key[1]}")
+                _gate_divisions(
+                    model,
+                    [(c.source_division, c.consumer_division) for c in candidates],
+                    self.division,
+                    child_w.division,
+                    lit,
+                )
+                model.add_implication(lit, copy_w.in_buffer)
+                served.append(lit)
+                child_w.relayout_reads.setdefault(self.name, []).append((lit, copy_w))
+                copy_w.serves.append(lit)
+            if not served:
+                _gate_divisions(
+                    model, compatible, self.division, child_w.division, self.in_buffer
+                )
+                continue
+            match_lit = model.new_bool_var(f"match_{self.name}__{child}")
             _gate_divisions(
-                model, compatible, self.division, bufs[child].division, self.in_buffer
+                model, compatible, self.division, child_w.division, match_lit
             )
+            model.add_bool_or([match_lit, *served]).only_enforce_if(self.in_buffer)
 
     def constrain_merge(self, model, parent, edge) -> None:
         """An active merge means the child reuses the parent's exact per-core
@@ -377,53 +478,150 @@ class _CoreDivisionBufferWithCpVars(_LifetimeBufferWithCpVars[CoreDivisionBuffer
         self.buffer.chosen_division = solver.Value(self.division)
 
 
+_inv_rel_op = {
+    sympy.Eq: sympy.Eq,
+    sympy.Ge: sympy.Le,
+    sympy.Le: sympy.Ge,
+    sympy.Gt: sympy.Lt,
+    sympy.Lt: sympy.Gt,
+}
+
+
+@cache
+def get_cpu_count() -> int:
+    """CPUs this process may actually use, after spyre-inference's
+    ``threading_config.get_cpu_count``. Resolution order: ``SPYRE_NUM_CPUS``,
+    the cgroup v2 CPU quota, psutil's physical core count, ``os.cpu_count()``.
+
+    ``os.cpu_count()`` reports the host (128 on the dev pods) while the
+    container is limited to 16; CP-SAT with 8x more search workers than cores
+    thrashes instead of searching, and the oversubscription starves everything
+    else in the pod."""
+    env = os.environ.get("SPYRE_NUM_CPUS", "")
+    if env.strip().isdigit() and int(env) > 0:
+        return int(env)
+    try:
+        with open("/sys/fs/cgroup/cpu.max") as f:
+            quota, period = f.read().split()
+        if quota != "max":
+            return max(1, int(quota) // int(period))
+    except (OSError, ValueError):
+        pass
+    try:
+        import psutil
+
+        physical = psutil.cpu_count(logical=False)
+        if physical:
+            return int(physical)
+    except ImportError:
+        pass
+    return os.cpu_count() or 1
+
+
+class _LazyMin(sympy.Min):
+    """``Min`` built without canonicalization. An evaluated ``Min``/``Max`` runs
+    sympy's pairwise dominance check on its arguments (``_find_localzeros``),
+    which for the split-symbol expressions of the cost objective goes through
+    the assumptions system (``is_ge`` -> ``_monotonic_sign`` -> ``factor_terms``);
+    every rewrite pass below rebuilds these nodes, so on the 304-op spyre_attn
+    decode graph that check was ~60% of the planner's Python time (59.6 s of
+    the rewrite passes; 2.0 s with these classes). The printer lowers a
+    ``Min``/``Max`` structurally and never needs the canonical form."""
+
+    def __new__(cls, *args, **kwargs):
+        kwargs["evaluate"] = False
+        return super().__new__(cls, *args, **kwargs)
+
+
+class _LazyMax(sympy.Max):
+    """``Max`` counterpart of :class:`_LazyMin`."""
+
+    def __new__(cls, *args, **kwargs):
+        kwargs["evaluate"] = False
+        return super().__new__(cls, *args, **kwargs)
+
+
+_LAZY = {sympy.Min: _LazyMin, sympy.Max: _LazyMax}
+
+
+def _lazy_minmax(expr: sympy.Expr) -> sympy.Expr:
+    """Rebuild every ``Min``/``Max`` node of ``expr`` as its lazy counterpart.
+
+    A hand-rolled bottom-up rebuild rather than ``Basic.replace``: ``replace``
+    reconstructs a node whose children changed with its ORIGINAL class before
+    applying the substitution, so a ``Min`` nested inside a ``Max`` was
+    canonicalized once more on the way up (13 s on the 304-op graph's
+    objective). Here a ``Min``/``Max`` is built lazy in the first place and
+    every other node is rebuilt only when a child actually changed."""
+    if not expr.args:
+        return expr
+    args = [_lazy_minmax(a) for a in expr.args]
+    lazy = _LAZY.get(type(expr))
+    if lazy is not None:
+        return lazy(*args)
+    if all(a is b for a, b in zip(args, expr.args)):
+        return expr
+    return expr.func(*args)
+
+
 class _SympyExprToCpSat(Printer):
     """Translates a sympy cost expression into an OR-Tools CP-SAT expression
     over an existing ``sympy symbol -> CP-SAT var`` mapping.
     """
 
-    def __init__(self, model: "cp_model.CpModel", sym_map: dict) -> None:
+    def __init__(
+        self,
+        model: "cp_model.CpModel",
+        sym_map: dict,
+        buffer_map: dict,
+    ) -> None:
         self._model = model
         self._count = 0
         self._sym_map = sym_map
+        self._buffer_map = buffer_map
         super().__init__()
 
     def convert(self, cost_expr: sympy.Expr) -> "cp_model.LinearExpr":
         """Return the CP-SAT expression equivalent to ``cost_expr`` under
         ``sym_map`` (``sympy symbol -> CP-SAT var``)."""
         logger.debug("[CP-SAT layout solver] cost expr (raw): %s", cost_expr)
+        cost_expr = self._rewrite(cost_expr)
+        logger.debug("[CP-SAT layout solver] cost expr (linearized): %s", cost_expr)
+        return self._print(cost_expr)
+
+    def _rewrite(self, cost_expr: sympy.Expr) -> sympy.Expr:
+        """The symbolic rewrites that bring ``cost_expr`` into the form the
+        printer lowers: floors dropped, logs of Min/Max pushed inside, split
+        logs and inverses replaced by table symbols, scalars pushed into
+        Min/Max/Piecewise, floats truncated. Min/Max are rebuilt lazily first
+        (see :class:`_LazyMin`)."""
+        cost_expr = _lazy_minmax(cost_expr)
         cost_expr = cost_expr.replace(
             lambda e: e.func == sympy.floor,
             lambda e: e.args[0],
         )
         cost_expr = sympy.expand(cost_expr)
         cost_expr = cost_expr.replace(
-            lambda e: e.func == sympy.log,
-            lambda e: self._log_min(e),
+            lambda e: e.func in [sympy.log, sympy.Piecewise],
+            lambda e: self._piecewise_canonical(self._log_min(e)),
         )
         cost_expr = sympy.expand(cost_expr)
         cost_expr = cost_expr.replace(
-            lambda e: e.func == sympy.log,
-            lambda e: self._log_split(e),
-        )
-        cost_expr = cost_expr.replace(
-            lambda e: e.func == sympy.Pow,
-            lambda e: self._inv_sym(e),
+            lambda e: e.func in [sympy.log, sympy.Pow, sympy.Mul],
+            self._inv_log_sym,
         )
         cost_expr = cost_expr.replace(
             lambda e: e.func == sympy.Mul,
-            lambda e: self._min_expand(e),
+            lambda e: self._min_piecewise_expand(e),
         )
-        cost_expr = cost_expr.replace(
-            lambda e: e.func in [sympy.Min, sympy.Max],
-            lambda e: self._truncate_floats_min(e),
-        )
-        logger.debug("[CP-SAT layout solver] cost expr (linearized): %s", cost_expr)
-        return self._print(cost_expr)
+        cost_expr = self._integerize_minmax(cost_expr)
+        return cost_expr
 
     @classmethod
     def _log_min(cls, expr):
         # rewrite log(min(a, b)) as min(log(a), log(b))
+        if expr.func is not sympy.log:
+            return expr
         arg = expr.args[0]
         if isinstance(arg, (sympy.Min, sympy.Max)):
             # n() here is to get a numeric value instead of log(2)
@@ -440,66 +638,182 @@ class _SympyExprToCpSat(Printer):
         else:
             return expr
 
-    @classmethod
-    def _log_split(cls, expr):
+    @staticmethod
+    def _is_split_sym(expr):
+        return expr.is_Symbol and expr.name.startswith("split_")
+
+    def _inv_scale(self, name: str) -> int:
+        """Fixed-point scale of ``inv_<name>``: the LCM of ``name``'s values
+        across the candidate divisions, so every ``scale // v`` is exact and the
+        variable spans only the bits it needs. ``_CORE_INV_SCALE`` when there
+        are no values or their LCM exceeds it."""
+        _, raw = self._buffer_map.get(name, (None, ()))
+        if not raw or min(raw) < 1:
+            return _CORE_INV_SCALE
+        return min(math.lcm(*map(int, raw)), _CORE_INV_SCALE)
+
+    def _inv_log_sym(self, expr):
+        # replaces log(sym) with log2_sym and 1/sym with inv_sym
         arg = expr.args[0]
-        if isinstance(arg, sympy.Symbol) and "_split_" in arg.name:
-            return (
-                sympy.Symbol(f"log2_{arg.name}", integer=True, nonnegative=True)
-                * sympy.log(2.0)
-                / _CORE_LOG_SCALE
+        if expr.func == sympy.log:
+            if self._is_split_sym(arg):
+                return (
+                    sympy.Symbol(f"log2_{arg.name}", integer=True, nonnegative=True)
+                    * sympy.log(2.0)
+                    / _CORE_LOG_SCALE
+                )
+            elif arg.is_Number:
+                return math.log(float(arg))
+        elif expr.func == sympy.Pow:
+            if not self._is_split_sym(arg):
+                return expr
+            if expr.exp == 0.25:
+                # Discrete piecewise linear approximation of x^(1/4) over the interval [1, 32],
+                # pinned to return 1 at x=1, generated using tools/approximate-power.py.
+                # since we check that the base is a _split_ symbol, it is an integer in the
+                # range [1, 32]
+                # Max 4.5% deviation for two segments;
+                # we would get:
+                #   max 1.6% deviation with 3 segments;
+                #   max 0.074% deviation with 8 segments;
+                #   max 0.019% deviation with 12 segments;
+                #   no deviation with 16 segments.
+                # script at https://github.com/user-attachments/files/31975789/approximate-power.py
+                return sympy.Piecewise(
+                    (0.139980295504224 * arg + 0.860019704495776, arg <= 5),
+                    (0.0287191888771944 * arg + 1.45940018593522, True),
+                )
+            if expr.exp == -1:
+                return sympy.Symbol(
+                    f"inv_{arg.name}", integer=True, nonnegative=True
+                ) / self._inv_scale(arg.name)
+        elif expr.func == sympy.Mul:
+            symbols = [
+                arg
+                for arg in expr.args
+                if arg.is_Symbol and arg.name.startswith("inv_")
+            ]
+            if len(symbols) <= 2:
+                return expr
+            product = "_product_" + "_".join(
+                sorted([symbol.name[4:] for symbol in symbols])
             )
-        elif isinstance(arg, sympy.Number):
-            return math.log(float(arg))
-        else:
-            return expr
+            if product in self._sym_map:
+                # The coefficient already divides by each factor's own scale;
+                # swap those for the product's scale to keep the magnitude.
+                result = sympy.Symbol(f"inv_{product}", integer=True, nonnegative=True)
+                result *= sympy.Rational(
+                    math.prod(self._inv_scale(s.name[4:]) for s in symbols),
+                    self._inv_scale(product),
+                )
+                result *= math.prod([arg for arg in expr.args if arg not in symbols])
+                return result
+        return expr
 
     @classmethod
-    def _inv_sym(cls, expr):
-        if not isinstance(expr.base, sympy.Symbol):
+    def _piecewise_canonical(cls, expr):
+        # re-write 1/x < 1/5 as x > 5, then tighten to an equivalent integer
+        # bound (e.g. x < 4/3 as x <= 1) when x is integer-valued and the
+        # bound is numeric.
+        if not expr.is_Piecewise:
             return expr
-        if expr.exp != -1:
-            return expr
-        symbol = expr.base
-        if (
-            "_split_" in symbol.name
-            and "log2_" not in symbol.name
-            and "inv_" not in symbol.name
-        ):
-            return (
-                sympy.Symbol(f"inv_{symbol.name}", integer=True, nonnegative=True)
-                / _CORE_INV_SCALE
-            )
-        else:
-            return expr
+        args = []
+        for value, cond in expr.args:
+            if (
+                cond.is_Relational
+                and cond.lhs.is_Pow
+                and cond.lhs.exp == -1
+                and cond.lhs.base.is_Symbol
+                and cond.lhs.base.is_nonnegative
+            ):
+                args.append(
+                    (
+                        value,
+                        cls._tighten_integer_bound(
+                            _inv_rel_op[cond.func], 1 / cond.lhs, 1 / cond.rhs
+                        ),
+                    )
+                )
+            else:
+                args.append((value, cond))
+        return expr.func(*args)
 
     @staticmethod
-    def _min_expand(expr):
+    def _tighten_integer_bound(rel_op, lhs, rhs):
+        if not (lhs.is_Symbol and lhs.is_integer and rhs.is_Number):
+            return rel_op(lhs, rhs)
+        if rel_op is sympy.Lt:
+            return sympy.Le(lhs, sympy.ceiling(rhs) - 1)
+        if rel_op is sympy.Gt:
+            return sympy.Ge(lhs, sympy.floor(rhs) + 1)
+        if rel_op is sympy.Le:
+            return sympy.Le(lhs, sympy.floor(rhs))
+        if rel_op is sympy.Ge:
+            return sympy.Ge(lhs, sympy.ceiling(rhs))
+        return rel_op(lhs, rhs)
+
+    @staticmethod
+    def _min_piecewise_expand(expr):
         # re-writes 2.1*Min(x, y) as Min(2.1*x, 2.1*y)
-        if len(expr.args) != 2 or not isinstance(expr.args[0], sympy.Number):
+        # len(expr.args) may exceed 2 when extra scalar factors ride alongside
+        # the leading number and the (single) Min/Max/Piecewise factor this
+        # rewrites, e.g. 2.1*a*Min(x, y); only the first such factor is expanded
+        # per call, with the rest folded back in as a plain multiplier.
+        if len(expr.args) < 2 or not isinstance(expr.args[0], sympy.Number):
             return expr
-        arg = expr.args[1]
-        if not isinstance(arg, (sympy.Min, sympy.Max)):
-            return expr
-        m = expr.args[0]
-        new_args = [a * abs(m) for a in arg.args]
-        new_args = [
-            a.replace(
-                lambda e: e.func == sympy.Mul,
-                lambda e: _SympyExprToCpSat._min_expand(e),
+        if any(
+            isinstance(arg, (sympy.Min, sympy.Max, sympy.Piecewise))
+            for arg in expr.args[1:]
+        ):
+            idx, arg = next(
+                (
+                    (idx, a)
+                    for idx, a in enumerate(expr.args)
+                    if isinstance(a, (sympy.Min, sympy.Max, sympy.Piecewise))
+                )
             )
-            for a in new_args
-        ]
-        return arg.func(*new_args) * sympy.sign(m)
+            m = expr.args[0]
+
+            def apply(arg):
+                if isinstance(arg, (tuple, sympy.Tuple)):
+                    return (apply(arg[0]), *arg[1:])
+                else:
+                    new_arg = arg * abs(m)
+                    return new_arg.replace(
+                        lambda e: e.func == sympy.Mul,
+                        lambda e: _SympyExprToCpSat._min_piecewise_expand(e),
+                    )
+
+            new_args = [apply(a) for a in arg.args]
+            return (
+                arg.func(*new_args)
+                * sympy.sign(m)
+                * sympy.Mul(*(expr.args[1:idx] + expr.args[idx + 1 :]))
+            )
+        return expr
+
+    @classmethod
+    def _integerize_minmax(cls, expr):
+        # Only Min/Max constraints require integer operands. A conditional
+        # objective supports float values directly; rounding its coefficients
+        # can erase a large cost multiplied by scaled reciprocal variables.
+        # Keep upstream's lazy Min/Max classes when rebuilding their subtrees.
+        if isinstance(expr, (sympy.Min, sympy.Max)):
+            return expr.replace(
+                lambda e: isinstance(e, (sympy.Min, sympy.Max, sympy.Piecewise)),
+                cls._truncate_floats_min,
+            )
+        if not expr.has(sympy.Min, sympy.Max):
+            return expr
+        return expr.func(*(cls._integerize_minmax(arg) for arg in expr.args))
 
     @staticmethod
     def _truncate_floats_min(expr):
         # re-writes Min(x*0.5, y*0.5) as Min(x, y)/2
         m = 10000
-        result = []
         func = expr.func
 
-        def _process(expr):
+        def _process_inner(expr):
             if isinstance(expr, sympy.Mul) and isinstance(expr.args[0], sympy.Number):
                 a = (expr.args[0] * m).round()
                 r = sympy.Mul(a, *expr.args[1:])
@@ -509,11 +823,15 @@ class _SympyExprToCpSat(Printer):
                 r = expr * m
             return r
 
-        for arg in expr.args:
-            if isinstance(arg, sympy.Add):
-                result.append(sympy.Add(*[_process(a) for a in arg.args]))
+        def _process_outer(expr):
+            if isinstance(expr, sympy.Add):
+                return sympy.Add(*[_process_inner(a) for a in expr.args])
+            elif isinstance(expr, sympy.Tuple):
+                return (_process_outer(expr[0]), *expr[1:])
             else:
-                result.append(_process(arg))
+                return _process_inner(expr)
+
+        result = list(map(_process_outer, expr.args))
 
         return func(*result) / m
 
@@ -528,23 +846,70 @@ class _SympyExprToCpSat(Printer):
 
     def _print_Mul(self, expr):
         args = [self._print(arg) for arg in expr.args]
-        ints = [arg for arg in args if isinstance(arg, cp_model.IntVar)]
-        if len(ints) <= 1:
-            return math.prod(args)
+        return self._print_multiply(args)
 
+    def _print_multiply_two(self, a, b):
+        if isinstance(a, (int, float)) or isinstance(b, (int, float)):
+            return a * b
+        if isinstance(a, cp_model.IntVar) and isinstance(b, cp_model.IntVar):
+            return self._print_multiply([a, b])
+        if isinstance(a, (cp_model_helper.IntAffine, cp_model_helper.FloatAffine)):
+            return (
+                a.coefficient * self._print_multiply_two(a.expression, b) + a.offset * b
+            )
+        if isinstance(b, (cp_model_helper.IntAffine, cp_model_helper.FloatAffine)):
+            return self._print_multiply_two(b, a)
+        if hasattr(a, "num_exprs"):
+            try:
+                flat = cp_model.FlatIntExpr(a)
+            except TypeError:
+                flat = cp_model.FlatFloatExpr(a)
+            result = flat.offset * b
+            for var, c in zip(flat.vars, flat.coeffs):
+                result = result + c * self._print_multiply_two(var, b)
+            return result
+        if hasattr(b, "num_exprs"):
+            return self._print_multiply_two(b, a)
+        raise NotImplementedError(f"multiplying {type(a)} by {type(b)}")
+
+    def _print_multiply(self, args):
+        ints = [arg for arg in args if isinstance(arg, cp_model.IntVar)]
         nonints = [arg for arg in args if not isinstance(arg, cp_model.IntVar)]
+        if len(ints) == 1:
+            return self._print_multiply_two(math.prod(nonints), ints[0])
+        elif len(ints) == 0:
+            return math.prod(nonints)
+
         name = "_product_" + "_".join([arg.name for arg in ints])
         if name in self._sym_map:
-            return math.prod(nonints) * self._sym_map[name]
+            return self._print_multiply_two(math.prod(nonints), self._sym_map[name])
 
-        lbs, ubs = list(zip(*[self._affine_bounds(arg) for arg in ints]))
-        assert all(lb >= 0 for lb in lbs)
-        assert all(ub >= 0 for ub in ubs)
-        lb, ub = map(math.prod, [lbs, ubs])
+        # The product is multilinear (degree 1 in each factor), so its
+        # extrema over the box of bounds occur at the box's vertices. Rather
+        # than enumerating all 2**len(ints) vertices, fold the bounds
+        # pairwise: at each step the running [lb, ub] is the exact image of
+        # the partial product over its factors (a continuous function over a
+        # connected box), so it can be treated as one more independent
+        # interval factor and combined via standard interval multiplication.
+        (lb, ub), *rest = [self._affine_bounds(arg) for arg in ints]
+        for a, b in rest:
+            candidates = (lb * a, lb * b, ub * a, ub * b)
+            lb, ub = min(candidates), max(candidates)
+
+        # A product past _MAX_PRODUCT_BOUND needs more dynamic range than the
+        # model can carry. Rescaling its factors would trade the overflow for
+        # rounding that can zero a small factor such as a split count, so
+        # refuse it and let _minimize_cost_expr apply its fallback policy.
+        if max(abs(lb), abs(ub)) > _MAX_PRODUCT_BOUND:
+            raise ValueError(
+                f"product {' * '.join(arg.name for arg in ints)} spans "
+                f"[{lb}, {ub}], past the {_MAX_PRODUCT_BOUND} CP-SAT bound"
+            )
+
         product = self._model.new_int_var(int(lb), int(ub), name)
-        self._model.AddMultiplicationEquality(product, ints)
+        self._model.add_multiplication_equality(product, ints)
         self._sym_map[name] = product
-        return math.prod(nonints) * product
+        return self._print_multiply_two(math.prod(nonints), product)
 
     def _print_Symbol(self, expr):
         if expr.name in self._sym_map:
@@ -552,8 +917,7 @@ class _SympyExprToCpSat(Printer):
         if not expr.name.startswith(("log2_", "inv_")):
             raise NotImplementedError(f"not implemented. expr: {expr}")
         name = expr.name[5:] if expr.name.startswith("log2_") else expr.name[4:]
-        b = self._sym_map[f"_buffer_{name}"]
-        raw = self._sym_map[f"_raw_{name}"]
+        b, raw = self._buffer_map[name]
 
         if expr.name.startswith("log2_"):
             values = [int(round(_CORE_LOG_SCALE * math.log2(v))) for v in raw]
@@ -561,16 +925,116 @@ class _SympyExprToCpSat(Printer):
             cp_var = self._model.new_int_var_from_domain(domain, expr.name)
             self._model.add_element(b.division, values, cp_var)
         else:
-            values = [int(round(_CORE_INV_SCALE // v)) for v in raw]
+            scale = self._inv_scale(name)
+            values = [scale // v for v in raw]
             cp_var = self._model.new_int_var(min(values), max(values), expr.name)
-            self._model.AddDivisionEquality(
-                cp_var, int(_CORE_INV_SCALE), self._sym_map[name]
-            )
+            self._model.AddDivisionEquality(cp_var, scale, self._sym_map[name])
         self._sym_map[expr.name] = cp_var
         return cp_var
 
+    def _print_KroneckerDelta(self, expr):
+        """``KroneckerDelta(division_X, k)`` -> the reified literal
+        ``division == k`` of buffer X (``_CoreDivisionBufferWithCpVars.
+        division_is``), so a table term such as the relayout price lowers to a
+        product of literals. sympy canonicalises the argument order, so the
+        symbol and the constant are found by type, not position."""
+        symbols = [a for a in expr.args if isinstance(a, sympy.Symbol)]
+        constants = [a for a in expr.args if isinstance(a, sympy.Integer)]
+        if len(symbols) != 1 or len(constants) != 1:
+            raise NotImplementedError(f"not implemented. expr: {expr}")
+        wrapper = self._sym_map.get(f"_division_of_{symbols[0].name}")
+        if wrapper is None:
+            raise NotImplementedError(f"no division variable for {symbols[0]}")
+        return wrapper.division_is(int(constants[0]))
+
+    def _print_RelayoutCharge(self, expr):
+        """``RelayoutCharge(is_lx, division_X, price_0, ...)`` (a relayout
+        copy's ``cost_term``) -> one ``element`` lookup of X's division into the
+        price table plus a charge variable equal to that price while the copy
+        is resident and 0 otherwise: two constraints per copy, against one
+        boolean product per (copy, priced division) had the table been written
+        as a sum of deltas. Divisions past the table read 0; a source that is
+        not a division-choosing buffer of this solve prices at 0, as it can
+        never fire (``_constrain_relayout_copies``)."""
+        is_lx, division, *prices = expr.args
+        table = [int(p) for p in prices]
+        lit = self._print(is_lx)
+        if division.is_Integer:
+            i = int(division)
+            return lit * (table[i] if 0 <= i < len(table) else 0)
+        wrapper = self._sym_map.get(f"_division_of_{division.name}")
+        if wrapper is None or not isinstance(wrapper, _CoreDivisionBufferWithCpVars):
+            return 0
+        table += [0] * (len(wrapper.buffer.core_divisions) - len(table))
+        table = table[: len(wrapper.buffer.core_divisions)]
+        top = max(table, default=0)
+        if top <= 0:
+            return 0
+        name = is_lx.name if is_lx.is_Symbol else str(self._count)
+        self._count += 1
+        price = self._model.new_int_var(0, top, f"relayout_price_{name}")
+        self._model.add_element(wrapper.division, table, price)
+        charge = self._model.new_int_var(0, top, f"relayout_charge_{name}")
+        self._model.add(charge == price).only_enforce_if(lit)
+        self._model.add(charge == 0).only_enforce_if(lit.Not())
+        return charge
+
     def _print_Pow(self, expr):
+        if expr.exp == 2:
+            base = self._print(expr.base)
+            return self._print_multiply_two(base, base)
         return self._print(expr.base) ** self._print(expr.exp)
+
+    def _print_condition(self, cond):
+        if not isinstance(cond, sympy.core.relational.Relational):
+            return self._print(cond)
+        cond_expr = self._print(cond)
+        not_cond_expr = self._print(sympy.Not(cond))
+        var = self._model.new_bool_var(f"cond_{self._count}")
+        self._count += 1
+        self._model.Add(cond_expr).OnlyEnforceIf(var)
+        self._model.Add(not_cond_expr).OnlyEnforceIf(var.Not())
+        return var
+
+    def _print_And(self, expr):
+        lits = [self._print_condition(arg) for arg in expr.args]
+        and_var = self._model.new_bool_var(f"and_{self._count}")
+        self._count += 1
+        self._model.AddBoolAnd(lits).OnlyEnforceIf(and_var)
+        self._model.AddBoolOr([lit.Not() for lit in lits]).OnlyEnforceIf(and_var.Not())
+        return and_var
+
+    def _print_Or(self, expr):
+        lits = [self._print_condition(arg) for arg in expr.args]
+        or_var = self._model.new_bool_var(f"or_{self._count}")
+        self._count += 1
+        self._model.AddBoolOr(lits).OnlyEnforceIf(or_var)
+        self._model.AddBoolAnd([lit.Not() for lit in lits]).OnlyEnforceIf(or_var.Not())
+        return or_var
+
+    def _print_Piecewise(self, expr):
+        args = expr.args
+        assert args[-1][1] == sympy.true
+        result = 0
+        not_prev = []
+        for val, cond in args:
+            if cond == sympy.true:
+                lits = not_prev
+            else:
+                cond_var = self._print_condition(cond)
+                lits = [cond_var, *not_prev]
+                not_prev = [*not_prev, cond_var.Not()]
+            piecewise_var = self._model.new_bool_var(f"piecewise_{self._count}")
+            self._count += 1
+            self._model.AddBoolAnd(lits).OnlyEnforceIf(piecewise_var)
+            self._model.AddBoolOr([lit.Not() for lit in lits]).OnlyEnforceIf(
+                piecewise_var.Not()
+            )
+            result += self._print_multiply_two(piecewise_var, self._print(val))
+        return result
+
+    def _print_Relational(self, expr):
+        return _operator_map[expr.rel_op](*[self._print(arg) for arg in expr.args])
 
     def _print_log(self, expr):
         if isinstance(expr.args[0], sympy.Number):
@@ -608,9 +1072,45 @@ class _SympyExprToCpSat(Printer):
         assert lb <= ub
         return lb, ub
 
+    def _lin_max_operand(self, arg):
+        """``arg`` as a ``lin_max`` operand: a constant or a single (affine)
+        variable as is, a sum over several variables behind its own IntVar
+        tied to it by a linear equality.
+
+        Presolve reasons about a ``lin_max`` operand through its exact
+        reachable domain. For a weighted sum of Booleans -- the HBM read and
+        write totals behind the cost model's ``alpha * min(R, W)`` turnaround
+        term sum ``bytes * (1 - is_lx)`` over a bundle's arguments -- that is
+        the set of its subset sums, exponential in the number of distinct
+        coefficients. On a Granite 4.0 decode block it was 4 s of
+        ``PresolveToFixPoint`` (99% of the solve, on 1209 constraints) that
+        neither probing, symmetry nor presolve-iteration limits shorten, and
+        with presolve off it made the LNS
+        workers, whose neighbourhood solves presolve, run out of memory. Behind
+        an IntVar with interval bounds the same operand costs nothing and the
+        optimum is unchanged. Float-coefficient operands pass through as
+        before (``AddMaxEquality`` rejects them and ``_minimize_cost_expr``
+        falls back)."""
+        if isinstance(arg, (int, float)):
+            return arg
+        try:
+            if len(cp_model.FlatIntExpr(arg).vars) <= 1:
+                return arg
+        except TypeError:
+            return arg
+        var = self._model.new_int_var(
+            *self._affine_bounds(arg), f"minmax_arg_{self._count}"
+        )
+        self._count += 1
+        self._model.add(var == arg)
+        return var
+
     def _print_Max(self, expr):
         # max range is (max(mins), max(maxes))
         args = [self._print(arg) for arg in expr.args]
+        if all(isinstance(a, (int, float)) for a in args):
+            return max(args)  # a lazy Max of constants was never folded
+        args = [self._lin_max_operand(arg) for arg in args]
         bounds = map(max, zip(*[self._affine_bounds(arg) for arg in args]))
         max_var = self._model.new_int_var(*bounds, f"max_var_{self._count}")
         self._model.AddMaxEquality(max_var, args)
@@ -620,6 +1120,9 @@ class _SympyExprToCpSat(Printer):
     def _print_Min(self, expr):
         # min range is (min(mins), min(maxes))
         args = [self._print(arg) for arg in expr.args]
+        if all(isinstance(a, (int, float)) for a in args):
+            return min(args)  # a lazy Min of constants was never folded
+        args = [self._lin_max_operand(arg) for arg in args]
         bounds = map(min, zip(*[self._affine_bounds(arg) for arg in args]))
         min_var = self._model.new_int_var(*bounds, f"min_var_{self._count}")
         self._model.AddMinEquality(min_var, args)
@@ -635,12 +1138,14 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
     (residency, then parallelism, then division balance).
     """
 
+    decides_lx_relayouts = True
+
     def __init__(
         self,
         buffers: Sequence[LifetimeBoundBuffer],
         size: int,
         alignment: int = 128,
-        time_limit_seconds: float = 120.0,
+        time_limit_seconds: Optional[float] = None,
         bottom_justify: bool = True,
     ) -> None:
         if cp_model is None:
@@ -653,7 +1158,11 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         # The solver works in alignment-sized units so every offset it picks is
         # automatically aligned; plan_layout scales sizes/offsets in and out.
         self._capacity_units = self.limit // self.alignment
-        self._time_limit_seconds = time_limit_seconds
+        self._time_limit_seconds = (
+            config.cpsat_time_limit_seconds
+            if time_limit_seconds is None
+            else time_limit_seconds
+        )
         self._bottom_justify = bottom_justify
 
     def plan_layout(self, log_lx_usage: bool = False) -> list[LifetimeBoundBuffer]:
@@ -752,6 +1261,10 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
             b.address = None if sb.address is None else sb.address * self.alignment
             if isinstance(b, CoreDivisionBuffer) and isinstance(sb, CoreDivisionBuffer):
                 b.chosen_division = sb.chosen_division
+                b.chosen_relayouts = {
+                    parent: chosen.scaled(self.alignment)
+                    for parent, chosen in sb.chosen_relayouts.items()
+                }
         return list(buffers)
 
     # ------------------------------------------------------------------
@@ -765,32 +1278,45 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         cost_expr: sympy.Expr,
     ) -> Optional["cp_model.CpSolverStatus"]:
         sym_map = {}
+        buffer_map = {}
         for t in tensors.values():
             sym_map[t.buffer.sym_is_lx.name] = t.in_buffer
-            sym_core_divs = t.buffer.sym_core_divs
-            for splits, cp_splits, cp_splits_raw in zip(
-                sym_core_divs,
-                t.cp_core_divs,
-                t.cp_core_divs_raw,
-            ):
-                for key, symbol in splits.items():
-                    assert isinstance(symbol, sympy.Symbol)
-                    sym_map[symbol.name] = cp_splits[key]
-                    sym_map[f"_buffer_{symbol.name}"] = t
-                    sym_map[f"_raw_{symbol.name}"] = cp_splits_raw[key]
+            if not isinstance(t, _CoreDivisionBufferWithCpVars):
+                continue
+            # The division index itself, and the wrapper behind it for the
+            # KroneckerDelta lowering (a table over candidates, e.g. the
+            # relayout price, selects by identity rather than by split shape).
+            sym_map[t.buffer.sym_division.name] = t.division
+            sym_map[f"_division_of_{t.buffer.sym_division.name}"] = t
+
+            product = []
+            for key, symbol in t.buffer.sym_core_divs.items():
+                assert isinstance(symbol, sympy.Symbol)
+                sym_map[symbol.name] = t.cp_core_divs[key]
+                buffer_map[symbol.name] = (t, t.cp_core_divs_raw[key])
+                product.append(symbol.name)
+            product.sort()
+            symbol = sympy.Symbol("_product_" + "_".join(product))
+            sym_map[symbol.name] = t.cores
+            buffer_map[symbol.name] = (t, t.cores_used)
 
         try:
-            cp_cost = _SympyExprToCpSat(model, sym_map).convert(cost_expr)
+            cp_cost = _SympyExprToCpSat(model, sym_map, buffer_map).convert(cost_expr)
             if not isinstance(cp_cost, (int, float)):
                 # if the cost is non-constant, we minimize it
                 # if the cost is constant, we use any solution
                 model.minimize(cp_cost)
             status = solver.Solve(model)
             if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-                raise SolveError("CP-SAT memory planner found no feasible plan")
+                raise SolveError(
+                    f"CP-SAT returned {solver.StatusName(status)} without a plan "
+                    f"after {solver.WallTime():.2f}s"
+                )
             return status
-        except (RuntimeError, TypeError, ValueError):
-            logger.warning("[CP-SAT layout solver] cannot linearize the sympy expr")
+        except (RuntimeError, TypeError, ValueError) as exc:
+            logger.warning(
+                "[CP-SAT layout solver] cannot linearize the sympy expr: %s", exc
+            )
             if not config._cpsat_warn_on_cost_expr:
                 raise
             return None
@@ -803,14 +1329,40 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         cost_expr: sympy.Expr | None,
     ) -> dict[str, LifetimeBoundBuffer]:
         children_of = self._get_children(tensors)
+        # Relayout copies are ordinary buffers to the placement model (the
+        # in-place relaxation and its 2D no-overlap need nothing special); the
+        # residency gate and the coupling below reference them by group.
+        copies = self._relayout_copies(tensors)
         self._add_inplace_relaxation(model, tensors)
-        self._add_core_division(model, tensors, children_of, forced_reasons)
+        self._add_core_division(model, tensors, children_of, forced_reasons, copies)
+        self._constrain_relayout_copies(model, tensors, copies)
 
         solver = cp_model.CpSolver()
         if self._time_limit_seconds:
             solver.parameters.max_time_in_seconds = float(self._time_limit_seconds)
+        # Presolve runs on every model, priced or not: the lin_max proxy
+        # variables (see _SympyExprToCpSat._lin_max_operand) removed the
+        # subset-sum domain work that let it consume the budget, and without it
+        # the LNS workers on a priced model can run out of memory. The copy-count
+        # threshold remains as an opt-in escape hatch (off by default).
+        free_copies = sum(
+            isinstance(
+                tensors.get(copy_w.buffer.relayout_parent),
+                _CoreDivisionBufferWithCpVars,
+            )
+            for copy_w in copies.values()
+        )
+        max_copies = config.lx_solver_relayout_presolve_max_copies
+        if max_copies > 0 and free_copies > max_copies:
+            solver.parameters.cp_model_presolve = False
+            logger.info(
+                "[CP-SAT layout solver] %d relayout copies exceed the presolve "
+                "threshold of %d; solving without presolve",
+                free_copies,
+                max_copies,
+            )
         solver.parameters.num_search_workers = (
-            1 if torch.are_deterministic_algorithms_enabled() else (os.cpu_count() or 1)
+            1 if torch.are_deterministic_algorithms_enabled() else get_cpu_count()
         )
         # Fixed seed so a given worker configuration is reproducible run-to-run.
         solver.parameters.random_seed = 0
@@ -831,6 +1383,12 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
             # as a constraint before optimizing the next, so a later step only
             # breaks ties the earlier ones leave open.
 
+            # Fallback discipline: the traffic objective below knows no relayout
+            # price, and an unpriced shuffle looks free - the exact degeneracy
+            # the cost term exists to remove. No relayout decision may be made
+            # under this objective, so every copy is pinned out.
+            for copy_w in copies.values():
+                model.add(copy_w.in_buffer == 0)
             # Residency (the hard priority): minimize total HBM transfer traffic so
             # as much as possible stays resident in LX.
             hbm_terms = [
@@ -841,7 +1399,10 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
                 model.minimize(sum(hbm_terms))
                 status = solver.Solve(model)
                 if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-                    raise SolveError("CP-SAT memory planner found no feasible plan")
+                    raise SolveError(
+                        f"CP-SAT returned {solver.StatusName(status)} without a plan "
+                        f"after {solver.WallTime():.2f}s"
+                    )
                 # Lock in the residency optimum (the traffic value, not just the
                 # count) so the parallelism step can never trade a spill for
                 # parallelism. Rounding avoids loss of precision as the objective is
@@ -865,7 +1426,10 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
                 model.maximize(sum(core_terms))
                 status = solver.Solve(model)
                 if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-                    raise SolveError("CP-SAT memory planner found no feasible plan")
+                    raise SolveError(
+                        f"CP-SAT returned {solver.StatusName(status)} without a plan "
+                        f"after {solver.WallTime():.2f}s"
+                    )
                 occupancy = round(solver.ObjectiveValue())
 
                 # Shape balance: holding the parallelism optimum (the objective is
@@ -878,7 +1442,10 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
                 model.minimize(sum(core_cost_terms))
                 status = solver.Solve(model)
                 if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-                    raise SolveError("CP-SAT memory planner found no feasible plan")
+                    raise SolveError(
+                        f"CP-SAT returned {solver.StatusName(status)} without a plan "
+                        f"after {solver.WallTime():.2f}s"
+                    )
 
         final_tensors = self._extract(solver, tensors)
 
@@ -912,6 +1479,50 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
                 )
 
         return final_tensors
+
+    @staticmethod
+    def _relayout_copies(
+        bufs: dict[str, _LifetimeBufferWithCpVars],
+    ) -> dict[tuple[str, int], _CoreDivisionBufferWithCpVars]:
+        """group key -> wrapper of the group's ``RelayoutCopyBuffer`` (whose
+        ``serves`` tally the residency gate fills with the served literals of
+        the consumer edges it can carry)."""
+        copies: dict[tuple[str, int], _CoreDivisionBufferWithCpVars] = {}
+        for w in bufs.values():
+            if isinstance(w.buffer, RelayoutCopyBuffer):
+                assert isinstance(w, _CoreDivisionBufferWithCpVars)
+                copies[w.buffer.group_key] = w
+        return copies
+
+    @staticmethod
+    def _constrain_relayout_copies(
+        model: "cp_model.CpModel",
+        bufs: dict[str, _LifetimeBufferWithCpVars],
+        copies: dict[tuple[str, int], _CoreDivisionBufferWithCpVars],
+    ) -> None:
+        """The coupling a ``RelayoutCopyBuffer`` cannot carry as data: a resident
+        copy needs its source resident under one of the divisions it was priced
+        for (its ``cost_term`` is a table over exactly those), and must serve at
+        least one consumer (a copy nobody reads is a shuffle for nothing; the
+        price already discourages it, this makes it infeasible). The consumer
+        side -- reading the copy pins the division pair and requires the copy
+        resident -- lives in ``constrain_residency``. A copy whose source is not
+        in this solve, or has no division to choose, can never fire."""
+        for copy_w in copies.values():
+            source = bufs.get(copy_w.buffer.relayout_parent)
+            if source is None or not isinstance(source, _CoreDivisionBufferWithCpVars):
+                model.add(copy_w.in_buffer == 0)
+                continue
+            model.add_implication(copy_w.in_buffer, source.in_buffer)
+            priced = [
+                source.division_is(i)
+                for i in sorted(copy_w.buffer.cost_by_source_division)
+            ]
+            model.add_bool_or(priced).only_enforce_if(copy_w.in_buffer)
+            if copy_w.serves:
+                model.add_bool_or(copy_w.serves).only_enforce_if(copy_w.in_buffer)
+            else:
+                model.add(copy_w.in_buffer == 0)
 
     def _add_inplace_relaxation(
         self,
@@ -1053,6 +1664,7 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         bufs: dict[str, _LifetimeBufferWithCpVars],
         children_of: dict[str, list[tuple[str, list[tuple[int, int]]]]],
         forced: dict[str, str],
+        copies: dict[tuple[str, int], _CoreDivisionBufferWithCpVars],
     ) -> None:
         """Pin out every buffer ``forced`` non-resident (decided declaratively by
         :meth:`MemoryPlanSolver.partition`) and install the per-buffer residency
@@ -1062,7 +1674,7 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         for name in forced:
             model.add(bufs[name].in_buffer == 0)
         for sb in bufs.values():
-            sb.constrain_residency(model, children_of.get(sb.name, []), bufs)
+            sb.constrain_residency(model, children_of.get(sb.name, []), bufs, copies)
 
     # ------------------------------------------------------------------
     # Extract
@@ -1089,6 +1701,9 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         footprint = {name: sb.footprint(solver) for name, sb in bufs.items()}
 
         offsets: Optional[dict[str, int]] = None
+        # Relayout copies are resident buffers like any other here, so the
+        # justify pass slides them with everything else and can never move a
+        # buffer into a copy's space.
         if self._bottom_justify:
             # A placement unit is a connected component of active merge edges: its
             # members share one base (the merge equalities), so the component
@@ -1137,6 +1752,33 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
                 t.address = None
             else:
                 t.address = offsets[name]
+
+        # Read back the relayouts: a consumer whose served literal is set reads
+        # its parent from that copy, under the division pair the literal
+        # pinned. Recorded on the consumer with the copy's FINAL address (after
+        # the justify slide) for the commit path.
+        for name, sb in bufs.items():
+            for source_name, reads in sb.relayout_reads.items():
+                fired = [copy_w for lit, copy_w in reads if solver.BooleanValue(lit)]
+                if not fired:
+                    continue
+                assert len(fired) == 1, (
+                    f"{name} reads {source_name} through {len(fired)} copies at once"
+                )
+                (copy_w,) = fired
+                assert copy_w.name not in spilled, (
+                    f"{name} reads {source_name} from a spilled copy {copy_w.name}"
+                )
+                i = solver.Value(bufs[source_name].division)
+                j = solver.Value(sb.division)
+                (candidate,) = [
+                    c
+                    for c in copy_w.buffer.candidates_for(name)
+                    if c.source_division == i and c.consumer_division == j
+                ]
+                sb.buffer.chosen_relayouts[source_name] = ChosenRelayout(
+                    candidate, offsets[copy_w.name]
+                )
         return by_name
 
     @staticmethod

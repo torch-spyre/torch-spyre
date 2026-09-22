@@ -33,7 +33,6 @@ from torch._inductor.virtualized import V
 from torch.spyre import SpyreTensorLayout
 
 import torch_spyre._inductor.optimize_restickify as _optimize_restickify
-from torch._inductor.exc import InductorError
 from torch_spyre._inductor import config
 from utils_inductor import _compile_and_run, compare_with_cpu
 
@@ -57,7 +56,7 @@ def _seed_rng():
 def _compute_cost(restickify_plan):
     assert restickify_plan is not None, "restickify_plan should not be None"
     return sum(
-        math.prod(int(s) for s in entry["target_layout"].size)
+        math.prod(int(s) for s in entry.target_layout.size)
         for entries in restickify_plan.values()
         for entry in entries
     )
@@ -628,10 +627,12 @@ def test_bmm_self():
 
 @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
 def test_fallback_with_restickify():
-    # FallbackKernel (torch.sin) produces a MultiOutput node. Verify the optimizer
-    # handles it via AnyInNode and still makes a correct restickify decision downstream.
+    # FallbackKernel (torch.tril) produces a MultiOutput node. Verify the optimizer
+    # handles it via AnyInNode and still makes a correct restickify decision
+    # downstream. (torch.sin used to fill this slot; it has a Spyre decomposition
+    # now and no longer lowers to a FallbackKernel.)
     x, y = _make_tensors(2, S, S)
-    _compare(lambda x, y: torch.sin(x) + y.t(), x, y, optimal_cost=S * S)
+    _compare(lambda x, y: torch.tril(x) + y.t(), x, y, optimal_cost=S * S)
 
 
 # ------- Mutation + restickify regression test ---------
@@ -1210,18 +1211,12 @@ def test_amax_full_and_amax_live_maximum():
     _compare(f, t, optimal_cost=0)
 
 
-# ------- Unsupported stick configurations ---------
-
-
 def test_sparse_dense_pointwise():
     """a.sum(-1) + b - reduction followed by pointwise without broadcasting."""
-    a = torch.randn((S, S, S), dtype=torch.float16).to(DEVICE)
-    b = torch.randn((S, S), dtype=torch.float16).to(DEVICE)
+    a = torch.randn((S, S, S), dtype=torch.float16)
+    b = torch.randn((S, S), dtype=torch.float16)
 
-    with pytest.raises(
-        InductorError, match="No mechanism to gather elements from multiple sticks"
-    ):
-        _compare(lambda a, b: a.amin(-1) + b, a, b)
+    _compare(lambda a, b: a.min(-1)[0] + b, a, b, optimal_cost=16384)
 
 
 # ------- Restickify padding: strided input raises Unsupported ---------
@@ -1594,6 +1589,48 @@ SPLIT_T0_LAST = [(7, 67, 2), (7, 65, 2), (5, 3, 2), (7, 67, 63)]
 def test_strict_transpose_0_last_clone(shape):
     x = _arange(*shape)
     _strict(lambda x: x.transpose(0, -1).clone(), x)
+
+
+# -------- torch.cat on the target-model shapes (#1094) ----------
+#
+# ``torch.cat`` lowers to two slice writes into one freshly cloned buffer, so a
+# concat whose split point is not a stick multiple makes both writes land in the
+# SAME stick: ``[..., :32]`` and ``[..., 32:64]`` of a 64-wide stick.  Neither
+# write can be lowered natively -- the offset write cannot express its stick
+# expression, and the offset-free ``:32`` write covers only half a stick, so
+# written whole it pads to a full stick and zeroes the tail, clobbering its
+# sibling.  Both must therefore relocate to one shared alternative layout that
+# moves the offset off the stick dim.
+#
+# The two inputs occupy disjoint fp16-exact bands ([0, 512) and [512, 1024)), so
+# ``_strict`` catches any element that crosses the concat boundary in either
+# direction.  Within one input the ramp wraps every 512 elements, so a
+# displacement that is an exact multiple of 512 along the ramp is invisible; the
+# boundary itself, which is what these shapes exercise, is not.
+CAT_MODEL_SHAPES = [
+    # Aligned 64+64: both writes are whole sticks, no relocation needed.
+    ((1, 8, 1, 64), (1, 8, 1, 64), -1),
+    ((1, 14, 64), (1, 14, 64), -1),
+    ((1, 32, 41, 64), (1, 32, 41, 64), -1),
+    # KV-cache append on a non-stick dim: 67+1 -> 68 planes of a full stick.
+    ((1, 8, 67, 128), (1, 8, 1, 128), 2),
+    # Mid-stick 32+32 -> 64 (rotary embedding): the split point falls inside one
+    # stick, so both writes share it and must relocate together.
+    ((1, 8, 11, 32), (1, 8, 11, 32), -1),
+    ((1, 8, 1, 32), (1, 8, 1, 32), -1),
+]
+
+
+@pytest.mark.parametrize(
+    "shapes",
+    CAT_MODEL_SHAPES,
+    ids=lambda p: f"{'x'.join(map(str, p[0]))}+{'x'.join(map(str, p[1]))}_dim{p[2]}",
+)
+def test_strict_cat_model_shapes(shapes):
+    a_shape, b_shape, dim = shapes
+    x = _arange(*a_shape, base=0, span=512)
+    y = _arange(*b_shape, base=512, span=512)
+    _strict(lambda x, y: torch.cat([x, y], dim=dim), x, y)
 
 
 # ======================================================================
@@ -2171,26 +2208,29 @@ def test_2d_sparse_broadcast_dense_pointwise():
     """a.sum(-1) + b - reduction output broadcast into pointwise with dense b."""
     a = torch.randn((S, S), dtype=torch.float16)
     b = torch.randn((S, S), dtype=torch.float16)
-    _compare(lambda a, b: a.amin(-1) + b, a, b, optimal_cost=S * S)
+    _compare(lambda a, b: a.amin(-1) + b, a, b, optimal_cost=S)
 
 
 def test_3d_sparse_broadcast_dense_pointwise():
     """a.sum(-1) + b - reduction output broadcast into pointwise with dense b."""
     a = torch.randn((S, S, S), dtype=torch.float16)
     b = torch.randn((S, S, S), dtype=torch.float16)
-    _compare(lambda a, b: a.amin(-1) + b, a, b, optimal_cost=S * S * S)
+    _compare(lambda a, b: a.amin(-1) + b, a, b, optimal_cost=S * S)
 
 
 def test_sparse_dense_pointwise_d0_stick():
     """a.sum(-1) + b where b has a d0 stick — verifies sparse detection with alt-dim candidate."""
 
-    a = torch.randn((S, S, S), dtype=torch.float16).to(DEVICE)
+    a = torch.randn((S, S, S), dtype=torch.float16)
+    b = torch.randn((S, S), dtype=torch.float16)
     b_layout = SpyreTensorLayout([S, S], [S, 1], torch.float16, [1, 0])
-    b = torch.randn((S, S), dtype=torch.float16).to(device_layout=b_layout)
-    with pytest.raises(
-        InductorError, match="No mechanism to gather elements from multiple sticks"
-    ):
-        _compare(lambda a, b: a.amin(-1) + b, a, b)
+
+    _compare(
+        lambda a, b: a.amin(-1)[0] + b,
+        a,
+        b,
+        device_args=[a.to(DEVICE), b.to(device_layout=b_layout)],
+    )
 
 
 def test_sparse_broadcast_dense_pointwise_d0_stick():

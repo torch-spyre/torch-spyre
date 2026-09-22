@@ -35,7 +35,7 @@ Options:
     --kernel NAME     only emit kernels whose name contains NAME
     --save-inputs     also dump recorded input values to a .pt beside each
                       script, for byte-exact replay
-    --no-execute      capture without a device or dxp_standalone (see below)
+    --no-execute      capture without a device or backend compiler (see below)
     --no-explain-header
                       omit the decoded OpSpec explanation from each script
 
@@ -50,7 +50,9 @@ import argparse
 import contextlib
 import dataclasses
 import os
+from pathlib import Path
 import runpy
+import subprocess
 import sys
 import traceback
 from unittest.mock import patch
@@ -58,6 +60,7 @@ from unittest.mock import patch
 import torch
 
 import torch._inductor.config as inductor_config
+from torch._inductor.codecache import CodeCacheFuture
 from torch._inductor.utils import IndentedBuffer
 
 import torch_spyre  # noqa: F401  -- registers the "spyre" device
@@ -70,6 +73,29 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from explain import _enum_name, render_comment_block  # noqa: E402
 from runner import TEMPLATE_IMPORTS, runner_template  # noqa: E402
+
+
+def _fake_backend_compile(cmd, *args, **kwargs):
+    """Stand in for the backend compiler, writing the artifact a real one would.
+
+    The compile path treats a missing ``spyreCodeDir/spyrecode.json`` as a
+    failure even on exit 0, so a bare ``patch("subprocess.run")`` is not enough
+    -- bundle generation would raise instead of returning a captured spec.  Keeps
+    the production check unconditional.  Mirrors ``mock_backend_compiler`` in
+    tests/inductor/utils_inductor.py, duplicated because this file cannot import
+    from that directory.
+    """
+    export_dir = None
+    for arg in cmd[1:] if isinstance(cmd, (list, tuple)) else []:
+        if isinstance(arg, str) and arg.startswith("--export-dir="):
+            export_dir = arg.split("=", 1)[1]
+            break
+    if export_dir:
+        code_dir = Path(export_dir) / "spyreCodeDir"
+        code_dir.mkdir(parents=True, exist_ok=True)
+        (code_dir / "spyrecode.json").write_text("{}")
+    return subprocess.CompletedProcess(cmd, 0, "", "")
+
 
 # Mock targets for --no-execute, matching docs/tools/capture_coarse_tile_ir.py.
 _PREPARE_KERNEL = "torch_spyre.execution.kernel_runner.prepare_kernel"
@@ -189,6 +215,27 @@ class _RunRecorder:
         return self._inner.run(*args, **kwargs)
 
 
+class _RunRecorderFuture(CodeCacheFuture):
+    """Preserve async compilation and wrap its runner after resolution."""
+
+    def __init__(
+        self,
+        inner: CodeCacheFuture,
+        rec: KernelRecord,
+        save_inputs: bool,
+    ) -> None:
+        self._inner = inner
+        self._rec = rec
+        self._save_inputs = save_inputs
+        self._runner: _RunRecorder | None = None
+
+    def result(self, timeout: float | None = None):
+        if self._runner is None:
+            runner = self._inner.result(timeout=timeout)
+            self._runner = _RunRecorder(runner, self._rec, self._save_inputs)
+        return self._runner
+
+
 @contextlib.contextmanager
 def capture_kernels(save_inputs: bool = False, no_execute: bool = False):
     """Record every sdsc() call made inside the block.
@@ -211,6 +258,8 @@ def capture_kernels(save_inputs: bool = False, no_execute: bool = False):
         )
         records.append(rec)
         runner = real_sdsc(self, kernel_name, specs, pool_size=pool_size)
+        if isinstance(runner, CodeCacheFuture):
+            return _RunRecorderFuture(runner, rec, save_inputs)
         return _RunRecorder(runner, rec, save_inputs)
 
     with contextlib.ExitStack() as stack:
@@ -221,7 +270,9 @@ def capture_kernels(save_inputs: bool = False, no_execute: bool = False):
             # patching subprocess.run also stubs any subprocess the target spawns.
             stack.enter_context(patch(_PREPARE_KERNEL))
             stack.enter_context(patch(_LAUNCH_JOBPLAN))
-            stack.enter_context(patch("subprocess.run"))
+            stack.enter_context(
+                patch("subprocess.run", side_effect=_fake_backend_compile)
+            )
         yield records
 
 

@@ -70,6 +70,7 @@ _EXPECTED_OP_SPEC_SCHEMA = {
     "tiled_symbol_trip_counts": "dict[Symbol, int]",
     "symbolic_dim_bounds": "dict[str, tuple[int, int]]",
     "node_output_ranges": "tuple[Expr, ...] | None",
+    "completed_producer_cores": "tuple[int, ...]",
     "debug_handle": "DebugHandle | None",
 }
 _EXPECTED_TENSOR_ARG_SCHEMA = {
@@ -83,6 +84,7 @@ _EXPECTED_TENSOR_ARG_SCHEMA = {
     "device_tile_advance_expr": "Expr | None",
     "element_arrangement": "ElementArrangement",
     "work_division": "TensorWorkDivision | None",
+    "kernel_local": "bool",
 }
 _EXPECTED_TENSOR_WORK_DIVISION_SCHEMA = {
     "work_slices": "dict[Symbol, int]",
@@ -277,6 +279,10 @@ def _canonical_spec(spec: object) -> object:
             result["core_id_to_work_slice"] = _canonical_value(
                 spec.core_id_to_work_slice
             )
+        if spec.completed_producer_cores:
+            result["completed_producer_cores"] = _canonical_value(
+                spec.completed_producer_cores
+            )
         return result
     if isinstance(spec, LoopSpec):
         return {
@@ -324,6 +330,10 @@ def _canonical_tensor_arg(arg: TensorArg) -> object:
             ),
             "num_cores": arg.work_division.num_cores,
         }
+    # Emitted only when True, so buffers that never set it -- all of the SDSC path --
+    # keep the exact key they had before this field existed.
+    if arg.kernel_local:
+        result["kernel_local"] = True
     return result
 
 

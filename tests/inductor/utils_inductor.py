@@ -12,13 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from contextlib import contextmanager
 import copy
 import functools
 import hashlib
+import json
+from pathlib import Path
+import shutil
+import subprocess
+from unittest.mock import patch as mock_patch
 import torch
 import os
 import pytest
 from torch._inductor.utils import run_and_get_code
+
+import torch_spyre.execution.async_compile as async_compile_module
 import unittest
 
 DEVICE = torch.device("spyre")
@@ -37,13 +45,27 @@ def _make_generator(*args) -> torch.Generator:
     return gen
 
 
-# shape is a tuple of integers representing dimension of the tensor
-# to avoid using the same cached tensor of the same shape, add a unique
-# differentiation argument
 @functools.lru_cache(maxsize=None)
 def cached_randn(
     shape, differentiation=None, abs=False, dtype=torch.float16, scale=1.0
 ):
+    """Return a deterministically-seeded random tensor, cached by arguments.
+
+    Args:
+        shape: Tuple of ints giving the tensor dimensions.
+        differentiation: Optional hashable value added to the cache key so two
+            calls with the same shape but different ``differentiation`` values
+            return independent tensors rather than the same cached one.
+        abs: If True, return the absolute value of the generated tensor.
+        dtype: Output dtype (default: float16).
+        scale: Variance multiplier applied as ``randn(...) * scale``. A value of
+            1.0 gives unit-variance outputs; larger values spread the range.
+            Also seeds the RNG so the same (shape, scale) always yields the same
+            values across test runs.
+
+    Returns:
+        A cached CPU tensor of the requested shape and dtype.
+    """
     gen = _make_generator(shape, differentiation, abs, dtype, scale)
     out = torch.randn(shape, dtype=dtype, generator=gen) * scale
     return out if not abs else torch.abs(out)
@@ -59,6 +81,17 @@ def cached_xavier(
     out = torch.empty(shape, dtype=dtype)
     torch.nn.init.xavier_uniform_(out, generator=gen)
     return out
+
+
+def dl16_round(t: torch.Tensor) -> torch.Tensor:
+    """Round a CPU fp32 tensor to approximate Spyre's on-device dl16 format.
+
+    Spyre's on-device dl16 (SEN169_FP16) has one more mantissa bit than
+    bf16, so bf16 is a conservative (slightly looser, never tighter) proxy
+    for it -- fine wherever the comparison uses atol/rtol rather than an
+    exact match.
+    """
+    return t.bfloat16().float()
 
 
 @functools.lru_cache(maxsize=None)
@@ -772,3 +805,126 @@ def copy_tests(my_cls, other_cls, suffix, test_failures=None, xfail_prop=None):
     # Special case convenience routine
     if hasattr(my_cls, "is_dtype_supported"):
         other_cls.is_dtype_supported = my_cls.is_dtype_supported
+
+
+# ---------------------------------------------------------------- LX relayouts
+
+
+@contextmanager
+def mock_backend_compiler():
+    """Stub the backend compiler, writing the artifact a real one would.
+
+    Replaces ``subprocess.run`` for tests that exercise bundle emission without
+    a compiler.  A bare ``mock_patch("subprocess.run")`` is not enough: the
+    compile path treats a missing ``spyreCodeDir/spyrecode.json`` as a failure
+    even on exit 0, because the backend can return success having written
+    nothing.  So the stub creates that file, keeping the production check
+    unconditional rather than teaching it to recognise a mock.
+
+    The compile dir is read from ``--export-dir=`` in argv, so this works
+    whether or not ``--device`` is passed.
+
+    Patches ``subprocess.run`` both globally and on the module object
+    ``async_compile`` holds: call sites historically used either spelling, and a
+    stub that misses the one actually in use lets the real compiler run (or,
+    writing no artifact, trips the check above).
+    """
+
+    def fake_run(cmd, *args, **kwargs):
+        export_dir = None
+        for arg in cmd[1:] if isinstance(cmd, (list, tuple)) else []:
+            if isinstance(arg, str) and arg.startswith("--export-dir="):
+                export_dir = arg.split("=", 1)[1]
+                break
+        if export_dir:
+            code_dir = Path(export_dir) / "spyreCodeDir"
+            code_dir.mkdir(parents=True, exist_ok=True)
+            (code_dir / "spyrecode.json").write_text("{}")
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    with (
+        mock_patch("subprocess.run", side_effect=fake_run) as m,
+        mock_patch.object(async_compile_module.subprocess, "run", side_effect=fake_run),
+    ):
+        yield m
+
+
+@contextmanager
+def capture_backend_output_dirs():
+    """Record the backend output directory of every kernel compiled inside."""
+    output_dirs = []
+    get_output_dir = async_compile_module.get_output_dir
+
+    def capture(kernel_name):
+        output_dir = get_output_dir(kernel_name)
+        output_dirs.append(Path(output_dir))
+        return output_dir
+
+    with mock_patch.object(async_compile_module, "get_output_dir", side_effect=capture):
+        yield output_dirs
+
+
+def requires_dxp_standalone():
+    """Skip the calling test unless ``dxp_standalone`` is on PATH.
+
+    Bundles are compiled by dbo-opt, so dxp_standalone is no longer needed to
+    build or run a kernel.  The debug re-lowering below is the one thing that
+    still requires it: ``--use-dxp`` with ``DXP_DEBUG=1`` writes the
+    ``debug/sdsc_*/*.out.out.out.json`` payloads these assertions read, and
+    dbo-opt has no equivalent.  So the payload check is only meaningful where
+    that binary exists, and a missing one is an environment fact rather than a
+    product failure -- skip rather than fail.
+    """
+    if shutil.which("dxp_standalone") is None:
+        pytest.skip(
+            "dxp_standalone not on PATH: the --use-dxp/DXP_DEBUG debug payload "
+            "this assertion reads has no dbo-opt equivalent"
+        )
+
+
+def assert_lx_only_relayout_payload(output_dirs):
+    """The compiled bundle's SDSC payload carries exactly one LX relayout op and
+    no HBM movement: one ``STCDPOpLx``, no op named for DMA, restickify or an
+    HBM copy, and zero ``hbmSize_`` on every labeled data structure. A debug
+    re-lowering of the same bundle, not a second device execution.
+
+    Skips when dxp_standalone is unavailable -- see requires_dxp_standalone.
+    """
+    requires_dxp_standalone()
+
+    for output_dir in output_dirs:
+        subprocess.run(
+            ["dxp_standalone", "-d", output_dir, "--use-dxp"],
+            check=True,
+            env={**os.environ, "DXP_DEBUG": "1"},
+        )
+    payloads = [
+        json.loads(path.read_text())
+        for output_dir in output_dirs
+        for path in output_dir.glob("debug/sdsc_*/*.out.out.out.json")
+    ]
+    assert payloads, "DeepTools emitted no debug SDSC payloads"
+    nodes = []
+    pending = list(payloads)
+    while pending:
+        value = pending.pop()
+        if isinstance(value, dict):
+            nodes.append(value)
+            pending.extend(value.values())
+        elif isinstance(value, list):
+            pending.extend(value)
+    lx_ops = [
+        node
+        for node in nodes
+        if isinstance(node.get("op"), dict) and node["op"].get("name") == "STCDPOpLx"
+    ]
+    assert len(lx_ops) == 1
+    op_names = [node["name"] for node in nodes if isinstance(node.get("name"), str)]
+    assert not any(
+        token in name.lower()
+        for name in op_names
+        for token in ("dma", "restickify", "stcdpophbm")
+    )
+    labeled_ds = lx_ops[0]["labeledDs_"]
+    assert labeled_ds and all(ds["hbmSize_"] == 0 for ds in labeled_ds)
+    return lx_ops[0]["op"]["prodConsList"]

@@ -51,13 +51,13 @@ from torch_spyre._inductor.scratchpad.permutation_layout import (
     make_permutation_packer,
 )
 
-from tests.inductor.cooptimization_capture_loader import load_captures
+from cooptimization_capture_loader import load_captures
 from torch_spyre._inductor.scratchpad.plan_solver import (
     BufferType,
     CoreDivision,
     CoreDivisionBuffer,
 )
-from tests.inductor.synthetic_cooptimization_graphs import synthetic_graphs
+from synthetic_cooptimization_graphs import synthetic_graphs
 
 
 def _seed_footprint(buffers):
@@ -246,7 +246,7 @@ class GeometricValidityTest(TestCase):
             first_use_is_read=False,
             in_place_parents=list(in_place_parents),
             # The trivial division, so the per-core footprint is ``size``.
-            core_divisions=[CoreDivision(output_splits={}, reduction_splits={})],
+            core_divisions=[CoreDivision()],
             boundary=BufferType.Intermediate,
         )
         buf.chosen_division = 0
@@ -414,7 +414,7 @@ class UnsizedBufferTest(TestCase):
                 uses=[0, 1],
                 first_use_is_read=False,
                 residency_reason=reason,
-                core_divisions=[CoreDivision(output_splits={}, reduction_splits={})],
+                core_divisions=[CoreDivision()],
                 boundary=BufferType.Intermediate,
             )
 
@@ -490,10 +490,7 @@ class ImprovementSmokeTest(TestCase):
 
 def _div(partition):
     """A core division with the given output partition (1 == trivial/whole)."""
-    return CoreDivision(
-        output_splits=({1: partition} if partition > 1 else {}),
-        reduction_splits={},
-    )
+    return CoreDivision(splits=({1: partition} if partition > 1 else {}))
 
 
 def _cdbuf(name, parents, matches, size=1024, uses=(0, 1)):
@@ -853,9 +850,13 @@ class AllEligibleResidentTest(TestCase):
 # Snippet run in a subprocess to solve one graph (captured *or* synthetic, chosen
 # by CASE) and print its result; used by the cross-process determinism test below.
 _SOLVE_SNIPPET = """
-import copy, json, math
-from tests.inductor.cooptimization_capture_loader import load_captures
-from tests.inductor.synthetic_cooptimization_graphs import synthetic_graphs
+import copy, json, math, sys
+# Runs as `python -c` with cwd=<repo root>, so this file's own directory is not
+# on sys.path the way it is for the test module itself.  Add it explicitly so the
+# helpers import by the same bare name used at module level.
+sys.path.insert(0, {helper_dir!r})
+from cooptimization_capture_loader import load_captures
+from synthetic_cooptimization_graphs import synthetic_graphs
 from torch_spyre._inductor.scratchpad.sa_cooptimizer import SaCoOptimizingSolver
 case = {case!r}
 src = load_captures() if case in load_captures() else synthetic_graphs()
@@ -872,13 +873,19 @@ print("RESULT " + json.dumps({{
 """
 
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+# Where the helper modules live, for the subprocess snippet above.
+_HELPER_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
 def _solve_with_hashseed(hs, case="sdpa"):
     """Solve ``case`` in a subprocess with ``PYTHONHASHSEED=hs``."""
     env = dict(os.environ, PYTHONHASHSEED=str(hs), TORCH_DEVICE_BACKEND_AUTOLOAD="0")
     proc = subprocess.run(
-        [sys.executable, "-c", _SOLVE_SNIPPET.format(case=case)],
+        [
+            sys.executable,
+            "-c",
+            _SOLVE_SNIPPET.format(case=case, helper_dir=_HELPER_DIR),
+        ],
         capture_output=True,
         text=True,
         env=env,
@@ -1166,23 +1173,19 @@ class CostExprScoringTest(TestCase):
             in_place_parents=[],
             residency_reason=None,
             core_divisions=[
-                CoreDivision(output_splits={0: 1, 1: 1}, reduction_splits={}),
-                CoreDivision(output_splits={0: 2, 1: 1}, reduction_splits={0: 1}),
-                CoreDivision(output_splits={0: 4, 1: 2}, reduction_splits={0: 2}),
+                CoreDivision(splits={0: 1, 1: 1}),
+                CoreDivision(splits={0: 2, 1: 1, 2: 1}, reduction_syms=frozenset({2})),
+                CoreDivision(splits={0: 4, 1: 2, 2: 2}, reduction_syms=frozenset({2})),
             ],
             parents=[],
             cd_parent_matches={},
             boundary=BufferType.Intermediate,
         )
         solver = SaCoOptimizingSolver([buf], 1 << 30, 128)
-        out_syms, red_syms = buf.sym_core_divs
-        self.assertEqual(set(out_syms), {0, 1})
-        self.assertEqual(set(red_syms), {0})
+        syms = buf.sym_core_divs
+        self.assertEqual(set(syms), {0, 1, 2})
         cost_expr = (
-            out_syms[0] * 10
-            + out_syms[1] * 100
-            + red_syms[0] * 1000
-            + 5000 * (1 - buf.sym_is_lx)
+            syms[0] * 10 + syms[1] * 100 + syms[2] * 1000 + 5000 * (1 - buf.sym_is_lx)
         )
         solver.plan_layout_and_core_divisions(cost_expr)
         self.assertEqual(

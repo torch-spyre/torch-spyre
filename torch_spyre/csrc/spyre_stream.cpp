@@ -147,8 +147,8 @@ int SpyreStream::priority() const {
 bool SpyreStream::query() const {
   c10::DeviceGuard guard(stream_.device());
 
-  DEBUGINFO("SpyreStream::query() - stream ", id(), " on device ",
-            static_cast<int>(device().index()));
+  SPYRE_RUNTIME_DEBUG() << "stream " << id() << " on device "
+                        << static_cast<int>(device().index());
 
   flex::RuntimeStream* handle = resolveRuntimeHandle();
   return handle->query();
@@ -158,8 +158,8 @@ void SpyreStream::synchronize() const {
   RECORD_FUNCTION("host::synchronize", {});
   c10::DeviceGuard device_guard(stream_.device());
 
-  DEBUGINFO("SpyreStream::synchronize() - stream ", id(), " on device ",
-            static_cast<int>(device().index()));
+  SPYRE_RUNTIME_DEBUG() << "stream " << id() << " on device "
+                        << static_cast<int>(device().index());
 
   resolveRuntimeHandle()->synchronize();
 }
@@ -177,8 +177,10 @@ void SpyreStream::copyProgramAsync(
 
 void SpyreStream::copyAsync(const at::Tensor& src,
                             const at::Tensor& dst) const {
-  DEBUGINFO("src (", src.scalar_type(), ") is on:", src.device());
-  DEBUGINFO("dst (", dst.scalar_type(), ") on:", dst.device());
+  SPYRE_RUNTIME_DEBUG() << "src (" << src.scalar_type()
+                        << ") is on:" << src.device();
+  SPYRE_RUNTIME_DEBUG() << "dst (" << dst.scalar_type()
+                        << ") on:" << dst.device();
 
   // Determine copy direction
   bool host2device = src.is_cpu() && dst.is_privateuseone();
@@ -194,8 +196,8 @@ void SpyreStream::copyAsync(const at::Tensor& src,
     // Get SpyreTensorLayout using the public API
     SpyreTensorLayout stl = get_spyre_tensor_layout(*dev_tensor);
 
-    DataConversionInfo dci = generate_dci(
-        cpu_tensor, dev_tensor, stl, cpu_tensor->storage_offset(), host2device);
+    DataConversionInfo dci =
+        generate_dci(cpu_tensor, dev_tensor, stl, host2device);
 
     copyAsyncImpl(cpu_ptr, get_composite_address(*dev_tensor), &dci,
                   host2device);

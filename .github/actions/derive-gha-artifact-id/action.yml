@@ -1,0 +1,135 @@
+name: Derive this leg's artifact identity
+description: |
+  Derive the warehouse artifact_id for what a GHA test leg ACTUALLY RAN, and upload it so the
+  `workflow_run` ingest can stamp it on the rows.
+
+  Two inputs make it derivable: the BASE image's own artifact_id, which spyre-frameworks'
+  `_package-image` stamps into the image (as the `spyre.artifact.id` label and, because a test
+  leg runs INSIDE the container with no registry credentials, also as the file read here), and
+  `installed`, this leg's delta -- hashed as a sorted, deduped set.
+
+  Uploads a ONE-LINE RECORD, not a bare uuid, because uuid5 cannot be read back:
+
+      <artifact_id>|<base_artifact_id>|<installed,comma,joined>
+
+  `|` is the schema's reserved separator; the installed set is comma-joined so the record
+  survives the recovery's whitespace strip. A record with no `|` still parses.
+
+  MUST run on the image under test -- the base id lives in that image's filesystem.
+
+  Empty output is a normal outcome, never a failure: an image baked before spyre-frameworks
+  #1782 carries no id, and a test run must never fail over telemetry it could not compute.
+
+inputs:
+  component:
+    description: A hash input to artifact_id -- a wrong value re-keys the identity.
+    required: false
+    default: torch-spyre
+  arch:
+    description: Arch the leg ran on; folded to x86_64 by the library, so either spelling is safe.
+    required: false
+    default: x86_64
+  installed:
+    description: >-
+      What this leg installed ON TOP of the image, space- or comma-separated. EMPTY means the
+      image ran UNCHANGED and the base id is used verbatim (the prebaked path).
+    required: false
+    default: ''
+  base-id-file:
+    description: Override the in-image path; empty uses the library's constant.
+    required: false
+    default: ''
+  library-dir:
+    description: >-
+      Directory containing extensions/clickhouse-ingest. Empty searches $GITHUB_WORKSPACE then
+      sparse-checks-out, as the ingest action does.
+    required: false
+    default: ''
+  output-file:
+    description: File the id is written to, and the path the upload step takes.
+    required: false
+    default: artifact-id.txt
+
+outputs:
+  artifact_id:
+    description: The derived artifact_id, or '' when it could not be derived.
+    value: ${{ steps.derive.outputs.artifact_id }}
+  base_artifact_id:
+    description: The base image's own artifact_id, or '' when the image carries none.
+    value: ${{ steps.derive.outputs.base_artifact_id }}
+
+runs:
+  using: composite
+  steps:
+    # $GITHUB_WORKSPACE first, never a prebaked tree: a baked copy would pin the formula.
+    - name: Locate the identity library
+      id: locate
+      shell: bash
+      env:
+        LIB_DIR_IN: ${{ inputs.library-dir }}
+      run: |
+        # Both must come from ONE tree, or the script and the formula could be different refs.
+        FOUND=""
+        for base in "${GITHUB_WORKSPACE}" "${LIB_DIR_IN}"; do
+          [ -n "${base}" ] || continue
+          if [ -f "${base}/extensions/clickhouse-ingest/pyproject.toml" ] \
+             && [ -f "${base}/.github/scripts/derive_artifact_id.py" ]; then
+            FOUND="${base}"
+            break
+          fi
+        done
+        if [ -n "${FOUND}" ]; then
+          echo "identity library + script: ${FOUND}"
+          echo "root=${FOUND}" >> "$GITHUB_OUTPUT"
+          echo "need-checkout=false" >> "$GITHUB_OUTPUT"
+        else
+          echo "identity library/script not on disk — will sparse-checkout."
+          echo "need-checkout=true" >> "$GITHUB_OUTPUT"
+        fi
+
+    # `path:` is load-bearing: without it this overwrites the calling job's workspace.
+    - name: Checkout the identity library (fallback)
+      if: steps.locate.outputs.need-checkout == 'true'
+      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      with:
+        path: .artifact-id-src
+        sparse-checkout: |
+          .github/scripts/derive_artifact_id.py
+          extensions/clickhouse-ingest
+        sparse-checkout-cone-mode: false
+
+    - name: Derive the artifact identity
+      id: derive
+      shell: bash
+      env:
+        ROOT: ${{ steps.locate.outputs.root }}
+        NEED_CHECKOUT: ${{ steps.locate.outputs.need-checkout }}
+      run: |
+        # No `set -e`: a failure here is allowed to fall through to an empty id.
+        if [ "${NEED_CHECKOUT}" = "true" ]; then
+          ROOT="${GITHUB_WORKSPACE}/.artifact-id-src"
+        fi
+        # The script writes the record file and both step outputs; it exits 0 even when it
+        # derives nothing, so a non-zero here means it did not run at all.
+        if ! python3 "${ROOT}/.github/scripts/derive_artifact_id.py" \
+             --component "${{ inputs.component }}" \
+             --arch "${{ inputs.arch }}" \
+             --installed "${{ inputs.installed }}" \
+             --base-id-file "${{ inputs.base-id-file }}" \
+             --library-dir "${ROOT}/extensions/clickhouse-ingest" \
+             --output-file "${{ inputs.output-file }}"; then
+          echo "derive_artifact_id.py did not run — no artifact id will be derived."
+          echo "artifact_id=" >> "$GITHUB_OUTPUT"
+          echo "base_artifact_id=" >> "$GITHUB_OUTPUT"
+        fi
+
+    # An artifact, not a job output: a `workflow_run` consumer sees neither. Same transport
+    # the threaded run_id already uses.
+    - name: Upload the artifact identity
+      if: steps.derive.outputs.artifact_id != ''
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      with:
+        name: artifact-id
+        path: ${{ inputs.output-file }}
+        if-no-files-found: error
+        retention-days: 1

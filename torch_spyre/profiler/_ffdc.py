@@ -58,8 +58,7 @@ _FutureTimeoutError = TimeoutError
 
 
 # Failure category constants. The category also encodes where the hook
-# fired: frontend compiler, backend tool (dxp_standalone / dbo-opt), or
-# runtime.
+# fired: frontend compiler, backend tool (dbo-opt), or runtime.
 # Keep in sync with docs/source/user_guide/profiling/ffdc.md.
 CATEGORY_COMPILE_FRONTEND = "compile_frontend"
 CATEGORY_COMPILE_BACKEND = "compile_backend"
@@ -385,7 +384,7 @@ def _collect_artifacts() -> dict:
             except Exception:
                 pass
 
-    # Also search the Spyre inductor cache for dxp_standalone bundle artifacts
+    # Also search the Spyre inductor cache for backend bundle artifacts
     try:
         from torch._inductor.runtime.runtime_utils import cache_dir as _cache_dir
 

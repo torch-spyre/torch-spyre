@@ -221,14 +221,22 @@ def _xs_leaf(operand: torch.Tensor, spec: TileSpec) -> torch.Tensor:
         return spec.index
     moved = _movedim(operand, spec.dim, 0)
     # Splitting dim 0 is always expressible in strides, so this is a view.
-    return moved.unflatten(0, (moved.shape[0] // spec.extent, spec.extent))
+    #
+    # `torch.unflatten`, not `Tensor.unflatten`: the method has a Python body
+    # (`return super().unflatten(...)`, torch/_tensor.py) that dynamo normally
+    # never reaches. Under an active `torch.device` mode -- vLLM runs its model
+    # inside one -- DeviceContext.__torch_function__ re-dispatches into that body
+    # and dynamo cannot trace the `super()` call. The free function has no body.
+    return torch.unflatten(moved, 0, (moved.shape[0] // spec.extent, spec.extent))
 
 
 def _tile(operand: torch.Tensor, spec: TileSpec, sliced: torch.Tensor) -> torch.Tensor:
     """Turn scan's step slice of the xs leaf back into the operand's own layout."""
     if spec.kind is Kind.GATHER:
-        return operand.index_select(spec.dim, sliced.reshape(1))
-    return _movedim(sliced, 0, spec.dim)
+        tile = operand.index_select(spec.dim, sliced.reshape(1))
+    else:
+        tile = _movedim(sliced, 0, spec.dim)
+    return torch.ops.spyre.tile_dim_marker(tile, spec.dim)
 
 
 def _step_counter(like: torch.Tensor) -> torch.Tensor:
@@ -283,6 +291,16 @@ def for_each_tile(
         ``(final_carry, out)``, either of which is ``None`` for the unused mode.
     """
     operands = tuple(operands)
+    # A for_each_tile introduced by an AOT decomposition inherits the existing
+    # FakeTensorMode instead of passing through Dynamo's scalar-capture setup.
+    # Inductor's scan-to-while-loop pass calls item() on its scalar induction
+    # variable while tracing, so permit scalar outputs on that mode. The mode is
+    # local to the active compilation; direct user HOPs already get this setting
+    # from fullgraph capture.
+    if not torch.compiler.is_dynamo_compiling():
+        fake_mode = torch._guards.detect_fake_mode(operands)
+        if fake_mode is not None:
+            fake_mode.allow_scalar_outputs = True
     specs, num_tiles = _normalize_in_specs(operands, dims, tile_size)
 
     if isinstance(out_dim, Gather):

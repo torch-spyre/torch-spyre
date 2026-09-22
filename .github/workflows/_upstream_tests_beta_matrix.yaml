@@ -47,6 +47,11 @@ on:
         required: false
         type: string
         default: gating
+      image_label:
+        description: Runner-set IMAGE label to select. Empty = standing image_spyre_backend set.
+        required: false
+        type: string
+        default: ''
   # ---------------------------------------------------------------------------
   # Lets build_test_pytorch_source.yaml's `test` job dispatch this workflow
   # from a *step* (via actions/github-script + createWorkflowDispatch,
@@ -99,6 +104,11 @@ on:
         required: false
         type: string
         default: ''
+      image_label:
+        description: Runner-set IMAGE label to select. Empty = standing image_spyre_backend set.
+        required: false
+        type: string
+        default: ''
 
 run-name: >-
   ${{ github.workflow }}${{ inputs.correlation_id && format(' ({0})', inputs.correlation_id) || '' }}
@@ -114,7 +124,7 @@ jobs:
       - x86_64
       - spyre_pf_x1
       - linux
-      - image_spyre_backend
+      - ${{ inputs.image_label || 'image_spyre_backend' }}
     timeout-minutes: 60
     env:
       # The CI env var is very important.
@@ -213,6 +223,10 @@ jobs:
             config: inductor-test_cpu_select_algorithm_part2.yaml
           - name: Inductor test cpu select algorithm part 3
             config: inductor-test_cpu_select_algorithm_part3.yaml
+          - name: Inductor test cpu select algorithm part 4
+            config: inductor-test_cpu_select_algorithm_part4.yaml
+          - name: Inductor test cpu select algorithm part 5
+            config: inductor-test_cpu_select_algorithm_part5.yaml
           ####################
           - name: Inductor test custom op autotune
             config: inductor-test_custom_op_autotune.yaml

@@ -214,9 +214,10 @@ ops; custom ops lower to SuperDSC; everything else falls back to the CPU.
    `spyre::layer_norm`, `spyre::gelu`).
 3. **Decompositions** — FX rewrites that turn an ATen op into a
    sequence of native or custom ops (e.g. `aten.addmm` →
-   `matmul + scale + add`).
+   `matmul + scale + add`, `aten.cos`/`aten.sin` → range reduction
+   plus a Taylor polynomial).
 4. **CPU fallback** — auto-transfer for the long tail (`embedding`,
-   `arange`, `sin`, `cos`, `tril`, `triu`, ...). Transparent, but
+   `arange`, `cumsum`, `tril`, `triu`, ...). Transparent, but
    off the hot path only.
 
 When debugging slow models, the first question to ask is whether
