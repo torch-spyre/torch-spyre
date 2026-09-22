@@ -179,7 +179,7 @@ def _sdpa_num_head_tiles(num_heads: int) -> int:
 
 
 def _sdpa_num_batch_tiles(batch_size: int) -> int:
-    """Use at most two batch rows per exact ``for_each_tile`` tile."""
+    """Use two rows per exact tile, or one row when the batch size is odd."""
     return batch_size // 2 if batch_size % 2 == 0 else batch_size
 
 
