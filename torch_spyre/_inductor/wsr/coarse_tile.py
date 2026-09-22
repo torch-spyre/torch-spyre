@@ -2191,6 +2191,15 @@ def _splice_write_targets_full_buffer(op: ComputedBuffer, mut_target: Buffer) ->
     their existing path. Comparing numels rather than shapes keeps this
     robust to the squeeze/rank differences between ``op.data.ranges`` and a
     buffer's own size that this file deals with elsewhere.
+
+    ``diff.is_positive`` is tri-state (True/False/None): sympy returns None
+    rather than False when it can't determine the sign (e.g. an unresolved
+    symbolic extent), and ``bool(None)`` is False. Testing ``is_zero``
+    first and raising when neither ``is_zero`` nor ``is_positive`` resolves
+    keeps that indeterminate case from silently taking the "equal, ordinary
+    mutation" branch above -- which would double-buffer a stacking write's
+    real destination into a copy-out scratch and read a moving window of it,
+    a silent wrong answer (see issue #4458).
     """
     ranges = getattr(getattr(op, "data", None), "ranges", None)
     if not ranges:
@@ -2201,7 +2210,15 @@ def _splice_write_targets_full_buffer(op: ComputedBuffer, mut_target: Buffer) ->
         return False
     op_numel = sympy.prod([sympy.sympify(r) for r in ranges])
     diff = sympy.simplify(target_numel - op_numel)
-    return bool(diff.is_positive)
+    if diff.is_zero:
+        return False
+    if diff.is_positive:
+        return True
+    raise Unsupported(
+        f"WhileLoop-splice stacking-write size check: could not determine "
+        f"whether mutation target size ({target_numel}) exceeds op write "
+        f"size ({op_numel}); diff={diff} has indeterminate sign"
+    )
 
 
 def _hint_ranges_pos(
