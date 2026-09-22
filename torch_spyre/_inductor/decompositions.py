@@ -64,8 +64,17 @@ _SDPA_MAX_SEQUENCE_TILE_SIZE = 512
 _SDPA_SEQUENCE_TILE_ALIGNMENT = 64
 _SDPA_MAX_TILE_PAIRS_PER_LOOP_GROUP = 16
 _SDPA_PREFERRED_HEADS_PER_TILE = (4, 2, 1)
+_SDPA_MHA_MAX_HEAD_WORK_DIVISION = 4
+_SDPA_MHA_QUERY_ONLY_MAX_HEADS = 8
+_SDPA_MHA_QUERY_ONLY_MIN_KV_BLOCKS = 8
 _SDPA_LIVE_SCORE_BUFFER_ALLOWANCE = 2
 _SDPA_LIVE_QUERY_BUFFER_ALLOWANCE = 2
+_SDPA_TARGET_KV_BYTES_PER_CORE = 1024 * 1024
+_SDPA_MAX_TARGET_KV_BYTES_PER_CORE = 2 * 1024 * 1024
+_SDPA_GQA_HEADS_PER_KV_TARGET_MIB = 4
+_SDPA_QUERY_ROWS_PER_KV_TARGET_MIB = 8
+_SDPA_BASE_BURST_EFFICIENT_KV_BLOCK_SIZE = 512
+_SDPA_MAX_BURST_EFFICIENT_KV_BLOCK_SIZE = 1024
 # Nested HOP prefill keeps the scaled query and online-softmax carries live
 # across the K loop.  At the widest point, the dataflow also contains the
 # score, masked score, normalized score, contiguous probability, corrected
@@ -225,6 +234,56 @@ def _kv_blocks_per_loop_group(num_q_tiles: int, num_kv_blocks: int) -> int:
     )
 
 
+def _largest_exact_split(extent: int, limit: int) -> int:
+    """Return the largest divisor of ``extent`` no larger than ``limit``."""
+    for split in range(min(extent, limit), 0, -1):
+        if extent % split == 0:
+            return split
+    return 1
+
+
+def _sdpa_work_division(
+    num_heads: int,
+    num_kvheads: int,
+    max_seqlen_q: int,
+    max_seqlen_kv: int,
+    num_cores: int,
+) -> dict[str, int] | None:
+    """Find the largest placeable head/query split for the legacy/SWA path."""
+    if num_cores < 1 or max_seqlen_q <= 1:
+        return None
+
+    if num_heads != num_kvheads:
+        if num_heads % num_kvheads:
+            return None
+        query_split = _largest_exact_split(max_seqlen_q, num_cores)
+        return {"max_seqlen_q": query_split} if query_split > 1 else None
+
+    if (
+        num_heads <= _SDPA_MHA_QUERY_ONLY_MAX_HEADS
+        and max_seqlen_q % num_cores == 0
+        and max_seqlen_kv
+        >= _SDPA_MHA_QUERY_ONLY_MIN_KV_BLOCKS * _SDPA_MAX_SEQUENCE_TILE_SIZE
+    ):
+        return {"max_seqlen_q": num_cores}
+
+    best: tuple[int, int] | None = None
+    max_head_split = min(_SDPA_MHA_MAX_HEAD_WORK_DIVISION, num_heads, num_cores)
+    for head_split in range(1, max_head_split + 1):
+        if num_heads % head_split:
+            continue
+        query_split = _largest_exact_split(max_seqlen_q, num_cores // head_split)
+        candidate = (head_split, query_split)
+        if best is None or (math.prod(candidate), head_split) > (
+            math.prod(best),
+            best[0],
+        ):
+            best = candidate
+    if best is None or math.prod(best) <= 1:
+        return None
+    return {"num_heads": best[0], "max_seqlen_q": best[1]}
+
+
 def _sdpa_estimated_active_cores(
     head_extent: int, query_extent: int, num_cores: int
 ) -> int:
@@ -300,6 +359,7 @@ class _SDPAKVBlockCandidate:
     num_blocks: int
     score_bytes_per_core: int
     estimated_live_bytes_per_core: int
+    kv_bytes_per_core: int
     restick_bytes_per_core: int
     restick_lx_eligible: bool
     estimated_dsc_executions: int
@@ -331,6 +391,37 @@ def _sdpa_query_tile_sizes(max_seqlen_q: int) -> list[int]:
     return candidates
 
 
+def _sdpa_target_kv_bytes_per_core(
+    num_heads: int, num_kvheads: int, query_rows_per_core: int
+) -> int:
+    """Return the useful K/V streaming footprint for one core."""
+    gqa_reuse = num_heads // num_kvheads if num_heads % num_kvheads == 0 else 1
+    head_target = (
+        _SDPA_TARGET_KV_BYTES_PER_CORE
+        * max(_SDPA_GQA_HEADS_PER_KV_TARGET_MIB, gqa_reuse)
+        // _SDPA_GQA_HEADS_PER_KV_TARGET_MIB
+    )
+    query_target = (
+        _SDPA_TARGET_KV_BYTES_PER_CORE
+        * max(_SDPA_QUERY_ROWS_PER_KV_TARGET_MIB, query_rows_per_core)
+        // _SDPA_QUERY_ROWS_PER_KV_TARGET_MIB
+    )
+    return min(
+        _SDPA_MAX_TARGET_KV_BYTES_PER_CORE,
+        head_target,
+        query_target,
+    )
+
+
+def _sdpa_burst_efficient_kv_block_limit(query_rows_per_core: int) -> int:
+    """Bound K by the DPO BMM profile for the available query-row reuse."""
+    scale = max(1, query_rows_per_core // _SDPA_QUERY_ROWS_PER_KV_TARGET_MIB)
+    return min(
+        _SDPA_MAX_BURST_EFFICIENT_KV_BLOCK_SIZE,
+        _SDPA_BASE_BURST_EFFICIENT_KV_BLOCK_SIZE * scale,
+    )
+
+
 def _sdpa_restick_active_cores(
     *, num_heads: int, num_cores: int, core_split: dict[str, int] | None
 ) -> int:
@@ -354,9 +445,10 @@ def _sdpa_kv_candidates(
     head_dim: int,
     element_size: int,
     num_cores: int,
-    query_tile_size: int,
-    num_outer_tiles: int,
-    nested_hop: bool,
+    query_tile_size: int | None = None,
+    num_outer_tiles: int = 1,
+    nested_hop: bool = False,
+    work_div: dict[str, int] | None = None,
     pad_extent: bool = False,
 ) -> list[_SDPAKVBlockCandidate]:
     """Estimate LX pressure, restick traffic, and DPO execution count.
@@ -365,6 +457,7 @@ def _sdpa_kv_candidates(
     instead of requiring every candidate block to divide the logical extent.
     """
     if nested_hop:
+        assert query_tile_size is not None
         # GQA's group loop presents one logical query head per KV head to the
         # inner body. CP-SAT can divide both that Hkv axis and Lq, so model the
         # total head-row ownership rather than the removed named-dim hints.
@@ -376,16 +469,21 @@ def _sdpa_kv_candidates(
             batch_size * heads_per_tile * query_tile_size // active_cores
         )
         heads_per_core = head_rows_per_core
+        kv_heads_per_core = num_kvheads
         query_rows_per_core = 1
         restick_active_cores = min(num_cores, batch_size * num_kvheads)
     else:
         # Preserve the calibrated decode model. Its operations are too narrow
         # for the head/query partition used by chunked prefill.
-        active_cores = None
-        heads_per_core = num_heads
-        query_rows_per_core = max_seqlen_q
+        head_split = work_div.get("num_heads", 1) if work_div is not None else 1
+        query_split = (
+            work_div.get("max_seqlen_q", 1) if work_div is not None else 1
+        )
+        heads_per_core = num_heads // head_split
+        kv_heads_per_core = num_kvheads // head_split
+        query_rows_per_core = max_seqlen_q // query_split
         restick_active_cores = _sdpa_restick_active_cores(
-            num_heads=num_heads, num_cores=num_cores, core_split=None
+            num_heads=num_heads, num_cores=num_cores, core_split=work_div
         )
     gqa_reuse = num_heads // num_kvheads if num_heads % num_kvheads == 0 else 1
     restick_lx_limit = _SDPA_RESTICK_LX_BYTES_PER_REUSING_HEAD * gqa_reuse
@@ -413,6 +511,13 @@ def _sdpa_kv_candidates(
             + restick_active_cores
             - 1
         ) // restick_active_cores
+        kv_bytes_per_core = (
+            batch_size
+            * kv_heads_per_core
+            * effective_block_size
+            * head_dim
+            * element_size
+        )
         score_bytes, live_bytes = _sdpa_estimated_live_bytes_per_core(
             batch_size=1 if nested_hop else batch_size,
             heads_per_core=heads_per_core,
@@ -431,6 +536,7 @@ def _sdpa_kv_candidates(
                 num_blocks=num_blocks,
                 score_bytes_per_core=score_bytes,
                 estimated_live_bytes_per_core=live_bytes,
+                kv_bytes_per_core=kv_bytes_per_core,
                 restick_bytes_per_core=restick_bytes_per_core,
                 restick_lx_eligible=restick_bytes_per_core <= restick_lx_limit,
                 # Eight fixed executes, about seventeen for every unrolled
