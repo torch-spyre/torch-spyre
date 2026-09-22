@@ -44,7 +44,13 @@ class _RecordingPool:
         return future
 
 
-def _runner(name, code_dir, kernel_provenance=None, symbol_kinds=None, sdsc_bundle_dir_prefix=None):
+def _runner(
+    name,
+    code_dir,
+    kernel_provenance=None,
+    symbol_kinds=None,
+    sdsc_bundle_dir_prefix=None,
+):
     return name, code_dir, kernel_provenance, symbol_kinds, sdsc_bundle_dir_prefix
 
 
@@ -298,7 +304,7 @@ def test_wait_drains_remaining_spyre_futures_after_failure():
             "/cache/key1",
             None,
             fake_symbol_kinds,
-            "key1"
+            "key1",
         )
         assert [call.args[0] for call in move_failed.call_args_list] == [
             "/tmp/key0.tmp",
@@ -401,7 +407,11 @@ def test_cache_hit_runner_gets_16char_prefix():
     runners_created = []
 
     def record_runner(
-        name, code_dir, kernel_provenance=None, symbol_kinds=None, sdsc_bundle_dir_prefix=None
+        name,
+        code_dir,
+        kernel_provenance=None,
+        symbol_kinds=None,
+        sdsc_bundle_dir_prefix=None,
     ):
         runners_created.append(sdsc_bundle_dir_prefix)
         return (name, code_dir, kernel_provenance, symbol_kinds, sdsc_bundle_dir_prefix)
@@ -439,7 +449,11 @@ def test_cache_miss_async_runner_gets_16char_prefix():
     runners_created = []
 
     def record_runner(
-        name, code_dir, kernel_provenance=None, symbol_kinds=None, sdsc_bundle_dir_prefix=None
+        name,
+        code_dir,
+        kernel_provenance=None,
+        symbol_kinds=None,
+        sdsc_bundle_dir_prefix=None,
     ):
         runners_created.append(sdsc_bundle_dir_prefix)
         return (name, code_dir, kernel_provenance, symbol_kinds, sdsc_bundle_dir_prefix)
@@ -491,7 +505,11 @@ def test_cache_miss_sync_runner_gets_16char_prefix():
     runners_created = []
 
     def record_runner(
-        name, code_dir, kernel_provenance=None, symbol_kinds=None, sdsc_bundle_dir_prefix=None
+        name,
+        code_dir,
+        kernel_provenance=None,
+        symbol_kinds=None,
+        sdsc_bundle_dir_prefix=None,
     ):
         runners_created.append(sdsc_bundle_dir_prefix)
         return (name, code_dir, kernel_provenance, symbol_kinds, sdsc_bundle_dir_prefix)
@@ -537,7 +555,11 @@ def test_cache_disabled_async_runner_gets_8char_uuid():
     fake_uuid.hex = FIXED_UUID_HEX
 
     def record_runner(
-        name, code_dir, kernel_provenance=None, symbol_kinds=None, sdsc_bundle_dir_prefix=None
+        name,
+        code_dir,
+        kernel_provenance=None,
+        symbol_kinds=None,
+        sdsc_bundle_dir_prefix=None,
     ):
         runners_created.append(sdsc_bundle_dir_prefix)
         return (name, code_dir, kernel_provenance, symbol_kinds, sdsc_bundle_dir_prefix)
@@ -583,7 +605,11 @@ def test_cache_disabled_sync_runner_gets_8char_uuid():
     fake_uuid.hex = FIXED_UUID_HEX
 
     def record_runner(
-        name, code_dir, kernel_provenance=None, symbol_kinds=None, sdsc_bundle_dir_prefix=None
+        name,
+        code_dir,
+        kernel_provenance=None,
+        symbol_kinds=None,
+        sdsc_bundle_dir_prefix=None,
     ):
         runners_created.append(sdsc_bundle_dir_prefix)
         return (name, code_dir, kernel_provenance, symbol_kinds, sdsc_bundle_dir_prefix)
