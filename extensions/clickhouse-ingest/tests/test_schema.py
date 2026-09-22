@@ -17,16 +17,16 @@ built, so pair equality against the pre-refactor output is a complete correctnes
 
 import pytest
 from spyre_clickhouse_ingest.schema import (
-    ARTIFACTS,
     ARTIFACT_REFS,
     ARTIFACT_RESULTS,
     ARTIFACT_TAGS,
-    BENCHMARKS,
+    ARTIFACTS,
     BENCHMARK_RUNS,
-    TEST_CASES,
-    TEST_CASE_RUNS,
-    TABLES,
+    BENCHMARKS,
     STATUS_VALUES,
+    TABLES,
+    TEST_CASE_RUNS,
+    TEST_CASES,
     SchemaError,
     dep_component,
     dep_id12,
@@ -293,8 +293,9 @@ def test_fact_tables_declare_no_identity_and_dimensions_do():
 
 
 def test_registry_covers_exactly_the_v2_tables():
-    # The functional/benchmark four, plus the artifact four. Pinned as an exact set so adding a
-    # table to the DDL without modelling it here (or vice versa) fails rather than drifting.
+    # The functional/benchmark four, the artifact four, and the capability two. Pinned as an
+    # exact set so adding a table to the DDL without modelling it here (or vice versa) fails
+    # rather than drifting.
     assert set(TABLES) == {
         "test_cases",
         "test_case_runs",
@@ -304,6 +305,8 @@ def test_registry_covers_exactly_the_v2_tables():
         "artifact_refs",
         "artifact_tags",
         "artifact_results",
+        "capabilities",
+        "capability_runs",
     }
 
 

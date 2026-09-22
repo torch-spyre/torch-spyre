@@ -1,0 +1,95 @@
+name: Recover threaded run_id
+description: |
+  Recovers a one-file identity artifact for an ingest that runs on `workflow_run` and
+  therefore cannot receive it as a dispatch input.
+
+  Two callers, one mechanism: `run-id` carries the orchestrator's threaded uuid, `artifact-id`
+  the identity of what the leg actually ran.
+
+  Jenkins mints one uuid per test run and threads it to the dispatched workflow, so the
+  ingest stamps test_case_runs with the SAME id the Jenkins-side artifact_results writer
+  recorded and the two join on one identity. A workflow_run consumer sees none of the
+  triggering run's inputs, so the producing workflow uploads the id as a one-file artifact
+  and this reads it back.
+
+  Empty output is a normal outcome, not a failure: a GHA-initiated run has no orchestrator
+  uuid to thread, and the ingest then derives its own id from the run coordinate. Every
+  failure path here degrades to empty for the same reason -- an ingest that refused to run
+  because it could not find an optional id would lose the rows entirely.
+
+  Read the result from the `value` output. `run_id` is kept as an alias for the original
+  caller and returns the same string.
+
+  Pair it with the upload side in the dispatched workflow:
+
+      - run: printf '%s' "${{ inputs.run_id }}" > run-id.txt
+      - uses: actions/upload-artifact@<pinned>
+        if: ${{ inputs.run_id != '' }}
+        with: { name: run-id, path: run-id.txt, retention-days: 1 }
+
+inputs:
+  triggering-run-id:
+    description: >-
+      The GHA run id of the workflow that produced the artifact, i.e.
+      github.event.workflow_run.id on a workflow_run trigger.
+    required: true
+  repository:
+    description: owner/repo holding the artifact. Defaults to the current repository.
+    required: false
+    default: ${{ github.repository }}
+  artifact-name:
+    description: Name of the one-file artifact carrying the id.
+    required: false
+    default: run-id
+  label:
+    description: What to call the value in the log line (a job recovering two ids needs both).
+    required: false
+    default: Threaded run_id
+  github-token:
+    description: Token for the artifacts API. Needs actions:read on `repository`.
+    required: true
+
+outputs:
+  value:
+    description: The recovered id, or '' when the run carried none.
+    value: ${{ steps.recover.outputs.run_id }}
+  run_id:
+    description: Alias of `value`, kept so the original caller needs no edit.
+    value: ${{ steps.recover.outputs.run_id }}
+
+runs:
+  using: composite
+  steps:
+    - name: Recover ${{ inputs.artifact-name }}
+      id: recover
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        TRIGGERING_RUN_ID: ${{ inputs.triggering-run-id }}
+        REPO: ${{ inputs.repository }}
+        ART_NAME: ${{ inputs.artifact-name }}
+        LABEL: ${{ inputs.label }}
+      run: |
+        # No `set -e`: every step below is allowed to fail into an empty id.
+        RID=""
+        if [ -z "${TRIGGERING_RUN_ID}" ]; then
+          echo "No triggering run id given — nothing to recover for ${ART_NAME}."
+          echo "run_id=" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+        AID=$(gh api --paginate \
+          "/repos/${REPO}/actions/runs/${TRIGGERING_RUN_ID}/artifacts?per_page=100" \
+          --jq ".artifacts[] | select(.name == \"${ART_NAME}\") | .id" 2>/dev/null | head -1)
+        if [ -n "${AID}" ]; then
+          workdir=$(mktemp -d)
+          if gh api "/repos/${REPO}/actions/artifacts/${AID}/zip" > "${workdir}/a.zip" 2>/dev/null \
+             && unzip -o -q "${workdir}/a.zip" -d "${workdir}" 2>/dev/null; then
+            # The artifact holds one file, but its name is the producer's choice, so take
+            # whichever single file is there rather than assuming run-id.txt.
+            f=$(find "${workdir}" -type f ! -name 'a.zip' | head -1)
+            [ -n "${f}" ] && RID=$(tr -d '[:space:]' < "${f}" 2>/dev/null || echo "")
+          fi
+          rm -rf "${workdir}"
+        fi
+        echo "${LABEL}: ${RID:-<none>}"
+        echo "run_id=${RID}" >> "$GITHUB_OUTPUT"

@@ -682,7 +682,10 @@ Environment Variables
        selection and the LX budget are unchanged. Unsupported ownership or
        insufficient space still uses HBM.
    * - ``CO_OPTIMIZING_LX_PLANNING``
-     - Use the co-optimizing LX allocator strategy (default ``0``)
+     - Use the co-optimizing LX allocator strategy (default ``1``)
+   * - ``CPSAT_TIME_LIMIT_SECONDS``
+     - Wall-clock budget for one CP-SAT solve (default ``30``; ``0``
+       disables the limit)
    * - ``HBM_POOL_PLANNING``
      - Enable HBM-pool planning for intermediates not in LX
        (default ``1``)
@@ -762,6 +765,38 @@ Environment Variables
    * - ``KTIR_DEVICE_MLIR``
      - Path to a ``.mlir`` file declaring the target device for the KTIR
        execution path (default empty)
+   * - ``ENABLE_LX_CONTEXT_SWITCHING``
+     - Bracket opaque ``FallbackKernel`` calls that have no native Spyre
+       lowering with per-buffer LX dump and restore clones, so LX-resident
+       buffers survive the call (default ``1``; set ``0`` to disable)
+   * - ``SPYRE_LX_SOLVER_RELAYOUT_GROUPS_PER_EDGE``
+     - Number of destination views the CP-SAT relayout enumeration keeps per
+       (source, consumer) edge, cheapest first (default ``4``; ``0`` keeps
+       every view)
+   * - ``SPYRE_LX_SOLVER_RELAYOUT_PRESOLVE_MAX_COPIES``
+     - For unpriced CP-SAT solves, skip presolve above this many relayout
+       copies (default ``0``, which disables the threshold)
+   * - ``SPYRE_ASYNC_DXP_COMPILE``
+     - Submit independent DXP kernel compilations to Inductor's subprocess
+       pool and resolve them at the wrapper's ``async_compile.wait()``
+       barrier (default ``0``)
+   * - ``SPYRE_READ_COPY_ELISION``
+     - Remove a proven-redundant read copy after LX planning; a failed proof
+       leaves the graph unchanged (default ``1``; set ``0`` to disable)
+   * - ``SPYRE_DUMP_COST_EXPR_FILE``
+     - Append one JSON record per co-optimized graph with the symbolic cost
+       objective the solver minimizes, the chosen symbol values, and each
+       term evaluated under them (default empty)
+   * - ``SPYRE_DUMP_COST_FILE``
+     - Destination file for the ``SPYRE_DUMP_COST`` output. Empty writes to
+       stderr (default empty)
+   * - ``SPYRE_KERNEL_CACHE``
+     - Cache compiled Spyre kernels on disk and reuse them across
+       invocations (default ``0``; set ``1`` to enable)
+   * - ``SPYRE_NUM_CPUS``
+     - Override the CPU count CP-SAT uses to size its search worker pool.
+       When unset the count is derived from the cgroup v2 quota, then
+       ``psutil``, then ``os.cpu_count()``
 
 **Device enumeration** (``torch_spyre/csrc/spyre_device_enum.cpp``):
 

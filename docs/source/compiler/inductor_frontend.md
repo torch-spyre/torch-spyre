@@ -69,31 +69,55 @@ to reason about physical span. Running the hint-driven half before
 stickification also dissolves a cross-phase contract that used to exist
 between `insert_restickify` and the hint-copy machinery (issue #3135).
 
+The first pass, `splice_while_loops`, lowers each `for_each_tile`
+construct. A `for_each_tile` region reaches Inductor as a `WhileLoop`
+operation. The pass proves the loop is a bounded tile scan, splices its
+body into the enclosing graph, and coarse-tiles the spliced body
+immediately so the synthesized dimension hints survive the later
+`propagate_named_dims` and `assign_dim_hints` passes. It runs to a fixed
+point, so a nested `for_each_tile` whose inner `WhileLoop` only appears
+after the outer body is spliced is also lowered. A `WhileLoop` that does
+not prove out as a tile scan is left in place for the upstream default
+path.
+
+:::{figure} ../_static/images/wsr/for-each-tile-lowering.svg
+:alt: Flow of the splice_while_loops pass proving, splicing, and coarse-tiling a for_each_tile WhileLoop, then re-running to a fixed point for nested loops
+:width: 70%
+:align: center
+
+`splice_while_loops` proves each `for_each_tile` `WhileLoop`, splices its
+body into the enclosing graph, and coarse-tiles the spliced body. The pass
+re-runs until no `WhileLoop` remains, so a nested `for_each_tile` is lowered
+once its enclosing body has been spliced. A `WhileLoop` that does not prove
+out as a tile scan is left for the upstream default path.
+:::
+
 | # | Pass | Module | Notes |
 |---|---|---|---|
-| 1 | `deadcode_elimination` | [deadcode_elimination.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/deadcode_elimination.py) | Drops unreachable ops. |
-| 2 | `propagate_named_dims` | [propagate_named_dims.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/wsr/propagate_named_dims.py) | Propagates `name_tensor_dims` annotations from inputs through the op graph. Runs pre-stickification — only needs host-side `FixedLayout`. |
-| 3 | `validate_named_dims` | [propagate_named_dims.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/wsr/propagate_named_dims.py) | Checks the propagated named-dimension annotations for consistency before hints are lowered. |
-| 4 | `assign_dim_hints` | [propagate_named_dims.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/wsr/propagate_named_dims.py) | Lowers each `spyre_hint` scope to a per-op `DimHint` list. |
-| 5 | `_maybe_reorder_unhinted_interlopers` | [passes.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/passes.py) | Gated by `config.ignore_wsr_hints` (`SPYRE_INDUCTOR_IGNORE_HINTS`). Runs `reorder_unhinted_interlopers` to move unhinted ops that interrupt a hint-group run. |
-| 6 | `_maybe_coarse_tile_hints` | [passes.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/passes.py) | Gated by `config.ignore_wsr_hints` (`SPYRE_INDUCTOR_IGNORE_HINTS`). Hint-driven half of coarse tiling: `hints_to_coarse_tile_groups` + `validate_coarse_tile_groups` + `coarse_tile_pre_stickify`. Runs on host-side `FixedLayout` only. |
-| 7 | `insert_bmm_padding` | [padding.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/padding.py) | Pads y's K to a stick boundary for `mm`/`bmm`. Runs pre-stickification so the padded buffer is laid out (and restickified if the matmul reads it through a view such as a transposed `nn.Linear` weight) like any user-written `F.pad`. |
-| 8 | `split_multi_ops` | [split_multi_ops.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/split_multi_ops.py) | Splits multi-op loop bodies (e.g. type conversion + arithmetic) into separate single-op buffers and materializes constant args as `SpyreConstantFallback`. |
-| 9 | `propagate_spyre_tensor_layouts` | [propagate_layouts.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/propagate_layouts.py) | Stamps `FixedTiledLayout` on every `ComputedBuffer`. |
-| 10 | `validate_ops` | [split_multi_ops.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/split_multi_ops.py) | Checks that each op's inputs share the same `ElementArrangement`. Runs after layout propagation, when the `SpyreTensorLayout`s are available. |
-| 11 | `optimize_restickify_locations` | [optimize_restickify.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/optimize_restickify.py) | Moves restickify ops to better placements before the layout is finalized. |
-| 12 | `finalize_layouts` | [insert_restickify.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/insert_restickify.py) | Settles tile-structure decisions before any new restickify is inserted. |
-| 13 | `insert_restickify` | [insert_restickify.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/insert_restickify.py) | Adds explicit re-tile ops where adjacent ops disagree on layout. |
-| 14 | `validate_no_restickify_on_mutation_targets` | [insert_restickify.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/insert_restickify.py) | Checks that no restickify was inserted directly on a mutation target. |
-| 15 | `enforce_indirect_access_layout` | [enforce_indirect_access_layout.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/enforce_indirect_access_layout.py) | Constrains the layout of tensors consumed by indirect (gather-style) access so the indexed dimension is addressable. |
-| 16 | `insert_post_mutation_restickify` | [insert_restickify.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/insert_restickify.py) | Handles restickification for slice-mutation buffers. |
-| 17 | `insert_restickify_padding` | [padding.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/padding.py) | Pads restickify ops to satisfy hardware alignment. |
-| 18 | `dedup_and_promote_constants` | [dedup_constants.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/dedup_constants.py) | Deduplicates identical constants and promotes shared ones. |
-| 19 | `_maybe_coarse_tile_span_overflow` | [passes.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/passes.py) | Gated by `config.ignore_span_overflow_hints` (`SPYRE_INDUCTOR_IGNORE_SPAN_OVERFLOW_HINTS`, default on). Span-overflow half of coarse tiling: `span_overflow_groups` + `validate_coarse_tile_groups` + `coarse_tile_post_stickify`. Runs post-stickification, so it needs `FixedTiledLayout.device_layout` for physical span arithmetic. |
-| 20 | `span_reduction` | [work_division.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/work_division.py) | Reduces per-core access spans to fit the hardware memory budget. |
-| 21 | `cost_model_matmul_division` + `work_distribution` | [work_division.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/work_division.py) | The cost-model pass claims a subset of matmuls; `work_distribution` covers the rest. |
-| 22 | `scratchpad_planning` | [scratchpad/](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/scratchpad/) | Gated by `config.lx_planning`. Allocates the LX scratchpad. |
-| 23 | `elide_proven_read_copies` | [read_copy_elision.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/read_copy_elision.py) | Removes copies whose direct-read form is proven equivalent, after physical planning. |
+| 1 | `splice_while_loops` | [wsr/for_each_tile_lowering.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/wsr/for_each_tile_lowering.py) | Splices each `for_each_tile` `WhileLoop` region into its enclosing graph and coarse-tiles the spliced body. Runs to a fixed point so nested `for_each_tile` loops resolve. |
+| 2 | `deadcode_elimination` | [deadcode_elimination.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/deadcode_elimination.py) | Drops unreachable ops. |
+| 3 | `propagate_named_dims` | [propagate_named_dims.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/wsr/propagate_named_dims.py) | Propagates `name_tensor_dims` annotations from inputs through the op graph. Runs pre-stickification, so it only needs host-side `FixedLayout`. |
+| 4 | `validate_named_dims` | [propagate_named_dims.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/wsr/propagate_named_dims.py) | Checks the propagated named-dimension annotations for consistency before hints are lowered. |
+| 5 | `assign_dim_hints` | [propagate_named_dims.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/wsr/propagate_named_dims.py) | Lowers each `spyre_hint` scope to a per-op `DimHint` list. |
+| 6 | `_maybe_reorder_unhinted_interlopers` | [passes.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/passes.py) | Gated by `config.ignore_wsr_hints` (`SPYRE_INDUCTOR_IGNORE_HINTS`). Runs `reorder_unhinted_interlopers` to move unhinted ops that interrupt a hint-group run. |
+| 7 | `_maybe_coarse_tile_hints` | [passes.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/passes.py) | Gated by `config.ignore_wsr_hints` (`SPYRE_INDUCTOR_IGNORE_HINTS`). Hint-driven half of coarse tiling: `hints_to_coarse_tile_groups` + `validate_coarse_tile_groups` + `coarse_tile_pre_stickify`. Runs on host-side `FixedLayout` only. |
+| 8 | `insert_bmm_padding` | [padding.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/padding.py) | Pads y's K to a stick boundary for `mm`/`bmm`. Runs pre-stickification so the padded buffer is laid out (and restickified if the matmul reads it through a view such as a transposed `nn.Linear` weight) like any user-written `F.pad`. |
+| 9 | `split_multi_ops` | [split_multi_ops.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/split_multi_ops.py) | Splits multi-op loop bodies (e.g. type conversion + arithmetic) into separate single-op buffers and materializes constant args as `SpyreConstantFallback`. |
+| 10 | `propagate_spyre_tensor_layouts` | [propagate_layouts.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/propagate_layouts.py) | Stamps `FixedTiledLayout` on every `ComputedBuffer`. |
+| 11 | `validate_ops` | [split_multi_ops.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/split_multi_ops.py) | Checks that each op's inputs share the same `ElementArrangement`. Runs after layout propagation, when the `SpyreTensorLayout`s are available. |
+| 12 | `optimize_restickify_locations` | [optimize_restickify.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/optimize_restickify.py) | Moves restickify ops to better placements before the layout is finalized. |
+| 13 | `finalize_layouts` | [insert_restickify.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/insert_restickify.py) | Settles tile-structure decisions before any new restickify is inserted. |
+| 14 | `insert_restickify` | [insert_restickify.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/insert_restickify.py) | Adds explicit re-tile ops where adjacent ops disagree on layout. |
+| 15 | `validate_no_restickify_on_mutation_targets` | [insert_restickify.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/insert_restickify.py) | Checks that no restickify was inserted directly on a mutation target. |
+| 16 | `enforce_indirect_access_layout` | [enforce_indirect_access_layout.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/enforce_indirect_access_layout.py) | Constrains the layout of tensors consumed by indirect (gather-style) access so the indexed dimension is addressable. |
+| 17 | `insert_post_mutation_restickify` | [insert_restickify.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/insert_restickify.py) | Handles restickification for slice-mutation buffers. |
+| 18 | `insert_restickify_padding` | [padding.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/padding.py) | Pads restickify ops to satisfy hardware alignment. |
+| 19 | `dedup_and_promote_constants` | [dedup_constants.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/dedup_constants.py) | Deduplicates identical constants and promotes shared ones. |
+| 20 | `_maybe_coarse_tile_span_overflow` | [passes.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/passes.py) | Gated by `config.ignore_span_overflow_hints` (`SPYRE_INDUCTOR_IGNORE_SPAN_OVERFLOW_HINTS`, default on). Span-overflow half of coarse tiling: `span_overflow_groups` + `validate_coarse_tile_groups` + `coarse_tile_post_stickify`. Runs post-stickification, so it needs `FixedTiledLayout.device_layout` for physical span arithmetic. |
+| 21 | `span_reduction` | [work_division.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/work_division.py) | Reduces per-core access spans to fit the hardware memory budget. |
+| 22 | `cost_model_matmul_division` + `work_distribution` | [work_division.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/work_division.py) | The cost-model pass claims a subset of matmuls; `work_distribution` covers the rest. |
+| 23 | `scratchpad_planning` | [scratchpad/](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/scratchpad/) | Gated by `config.lx_planning`. Allocates the LX scratchpad. |
+| 24 | `elide_proven_read_copies` | [read_copy_elision.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/read_copy_elision.py) | Removes copies whose direct-read form is proven equivalent, after physical planning. |
 
 Once stickification has run, every `ComputedBuffer` carries a `FixedTiledLayout`, so the later passes can take device layout into account when making decisions.
 

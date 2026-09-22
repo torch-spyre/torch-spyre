@@ -12,49 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""The v2 ClickHouse schema, as data — one module, imported by every consumer.
+"""The v2 ClickHouse schema as classes: one class per table, sharing `Table`."""
 
-WHY THIS EXISTS. Every v2 insert used to be a positional list paired with a separate
-column_names list, and the same four tables were assembled independently in three repos.
-Nothing tied a row's field order to the column list except the author reading both. The
-audited state was correct (20/20 inserts column-named, 17/17 arity right), so this is not a
-bug fix -- it makes a whole class of mistake unrepresentable, and it removes the divergence
-that let one real defect live in two repos and not the third: hf-adapters and spyre-inference
-never dedup identity rows across runs, so a case seen in N runs became N rows in test_cases.
+from collections.abc import Mapping, Sequence
+from typing import Any, TypedDict
 
-WHY A TABLE MODEL AND NOT AN INGESTER CLASS. The three ingest scripts run two ways --
-directly from a checkout by GitHub Actions, and from inside a baked test image via
-`uv run --no-project --with lxml --with clickhouse-connect --with regex`. `--no-project` is
-deliberate (uv otherwise tries to sync the torch-spyre project and exits 2, dropping the
-ingest), so there is no sys.path beyond the script's own directory and what `--with` installs.
-This module was originally COPIED per repo for that reason; it is now installed as this package
-via `--with`, so the copies and their drift check are gone. Per-repo variation is one constant,
-COMPONENT, which is why a class hierarchy would have been the wrong shape -- and why
-`v2_component` takes the default as a PARAMETER rather than reading it from here.
-
-WHY NOT THE DRIVER'S OWN SCHEMA SUPPORT. clickhouse-connect has none to use. Its `ColumnDef`
-is what DESCRIBE TABLE returns -- it reads a live table's schema, it cannot declare one or check
-a row against it -- and `Client.insert` takes "a sequence of sequences" plus an ordered column-name
-list, so positional rows are the native API shape rather than a style choice here. Passing
-`column_names='*'` only moves the order to whatever the server currently reports, which couples
-every row to the live DDL instead of removing the hazard. A declarative layer does exist in
-clickhouse-sqlalchemy, and it would subsume most of this file -- but adding a dependency is what
-the `uv run --no-project` runtime above rules out. Revisit if that constraint ever lifts.
-
-WHAT IT DELIBERATELY DOES NOT DO. No runtime type coercion (duration_s typed Float32 accepts
-a str), no ClickHouse type mapping, and no identity computation -- run_id and test_case_id
-arrive already computed by the uuid5 helpers, which are untouched by design: changing them
-re-keys the warehouse and silently breaks v2_already_ingested dedup, producing duplicate rows
-rather than an error.
-"""
-
-from dataclasses import dataclass
-from typing import Any
-from collections.abc import Sequence
-
-# The DDL's CHECK constraints, re-expressed. They cannot be read from the server at ingest
-# time, so they are duplicated here -- keep in step with functional_tests_v2.sql (status) and
-# artifacts_v2.sql (the rest).
+# The DDL's CHECK constraints, re-expressed: unreadable from the server at ingest
+# time. Keep in step with schema/10-functional-tests.sql and schema/20-artifacts.sql.
 STATUS_VALUES = frozenset({"passed", "failed", "error", "skipped", "xfail", "xpass"})
 KIND_VALUES = frozenset({"image", "rpm", "wheel", "generic"})
 ORIGIN_VALUES = frozenset({"built", "copied", "promoted", "upstream"})
@@ -62,117 +26,188 @@ METHOD_VALUES = frozenset({"container-pull", "dnf", "pip", "download"})
 REF_KIND_VALUES = frozenset({"pullspec", "glob", "url"})
 RESULT_KIND_VALUES = frozenset({"functional", "performance", "image"})
 TEST_TYPE_VALUES = frozenset(
-    {"smoke", "unit", "integration", "regression", "trunk", "perf"}
+    {"smoke", "unit", "integration", "regression", "trunk", "perf", "capability"}
 )
+# Which capability analysis produced a capability_runs row -- a sibling vocabulary to
+# TEST_TYPE_VALUES, not a subset of it.
+CAPABILITY_TYPE_VALUES = frozenset({"model_ops", "model_support"})
 STATE_VALUES = frozenset({"passed", "failed", "error", "running"})
+# capability_runs.status: not_implemented is unsupported, not a skipped test.
+CAPABILITY_STATUS_VALUES = frozenset({"passed", "failed", "not_implemented"})
 
-# NOT constrained, deliberately: the DDL documents tag_family as a declared, extensible set
-# ('nightly | weekly | main | pr') with no CHECK, so validating it here would reject a channel
-# the schema permits. Same for arch, which carries two spellings by table family.
+# NOT constrained, deliberately: the DDL declares tag_family and arch without a CHECK.
 
-# A dep entry in artifacts.identity_deps / context_deps is "<component>@<id12>" -- e.g.
-# 'flex@d026bd2d255e' -- or 'base=<sha256>' for a base image named by content, or a bare
-# component name when nothing pinned it. NOT a uuid: id12 is a hash INPUT to artifact_id, so
-# artifact_id cannot be recovered from the string. A reader resolves it via props['id12'].
-# This is stated here because it is the contract a reader must not guess: a dashboard route
-# that looked these up with `artifact_id IN (...)` matched zero rows and rendered nothing,
-# with no error, until it was found by querying prod.
+# A dep entry is "<component>@<id12>", 'base=<sha256>', or a bare name -- NOT a uuid,
+# since id12 is a hash INPUT to artifact_id. A reader resolves it via props['id12'].
 DEP_ENTRY_SEP = "@"
 DEP_BASE_PREFIX = "base="
 
 
-def dep_id12(entry: str) -> str:
-    """The id12 a dep entry names, or '' when it names none (bare name, or 'base=<sha>')."""
-    s = str(entry or "")
-    if not s or s.startswith(DEP_BASE_PREFIX) or DEP_ENTRY_SEP not in s:
-        return ""
-    return s.rsplit(DEP_ENTRY_SEP, 1)[1]
-
-
-def dep_component(entry: str) -> str:
-    """The component a dep entry names, without its pin."""
-    s = str(entry or "")
-    if s.startswith(DEP_BASE_PREFIX):
-        return ""
-    return s.rsplit(DEP_ENTRY_SEP, 1)[0] if DEP_ENTRY_SEP in s else s
-
-
 class SchemaError(ValueError):
-    """A row that the DDL would reject, or that names a column the table does not have."""
+    """A row the DDL would reject, or one naming a column the table does not have."""
 
 
-@dataclass(frozen=True)
+class DepEntry:
+    """One entry of artifacts.identity_deps / context_deps."""
+
+    SEP = DEP_ENTRY_SEP
+    BASE_PREFIX = DEP_BASE_PREFIX
+
+    @classmethod
+    def id12(cls, entry: str) -> str:
+        """The id12 the entry names, or '' when it names none."""
+        s = str(entry or "")
+        if not s or s.startswith(cls.BASE_PREFIX) or cls.SEP not in s:
+            return ""
+        return s.rsplit(cls.SEP, 1)[1]
+
+    @classmethod
+    def component(cls, entry: str) -> str:
+        """The component the entry names, without its pin."""
+        s = str(entry or "")
+        if s.startswith(cls.BASE_PREFIX):
+            return ""
+        return s.rsplit(cls.SEP, 1)[0] if cls.SEP in s else s
+
+
 class Table:
-    """One v2 table: its columns in DDL order, and how a row is built.
+    """Base for one v2 table: its columns in DDL order, its CHECKs, its write path."""
 
-    `columns` is the single place the order lives. Rows are built from a dict keyed by
-    column name, so a field can never be assigned to the wrong column by position.
-    """
-
-    name: str
-    columns: tuple[str, ...]
+    # The single place column order lives; `ts` is omitted throughout (DEFAULT now()).
+    name: str = ""
+    columns: tuple[str, ...] = ()
     # Columns that must be non-empty, mirroring the DDL's CHECK constraints.
     required: tuple[str, ...] = ()
-    # column -> the DDL CHECK's allowed set. Declared per table rather than inferred from a
-    # column name, so two tables can constrain the same name differently: `state` here is the
-    # artifact_results vocabulary, which is NOT test_case_runs' `status` set.
+    # column -> allowed set, declared per table so two tables can differ on one name.
     enums: tuple[tuple[str, frozenset[str]], ...] = ()
     # id column for cross-run identity dedup; None for fact tables, which append freely.
     identity: str | None = None
+    # The TypedDict shape a caller should build for this table -- checked by mypy/the editor,
+    # never at runtime; `row()` below is still what actually validates a row.
+    Row: type = dict
 
-    def row(self, values: dict[str, Any]) -> list[Any]:
-        """Order one row by `columns`. Raises on an unknown or missing column.
-
-        The raise is the point: an inserted or renamed column shows up here, at the call
-        site, instead of shifting every later value into the wrong column.
-        """
-        unknown = set(values) - set(self.columns)
+    @classmethod
+    def row(cls, values: Mapping[str, Any]) -> list[Any]:
+        """Order one row by `columns`, raising on an unknown, missing or bad value."""
+        unknown = set(values) - set(cls.columns)
         if unknown:
             raise SchemaError(
-                f"{self.name}: no such column(s) {sorted(unknown)}; "
-                f"table has {list(self.columns)}"
+                f"{cls.name}: no such column(s) {sorted(unknown)}; "
+                f"table has {list(cls.columns)}"
             )
-        missing = set(self.columns) - set(values)
+        missing = set(cls.columns) - set(values)
         if missing:
-            raise SchemaError(f"{self.name}: missing column(s) {sorted(missing)}")
-        for col in self.required:
+            raise SchemaError(f"{cls.name}: missing column(s) {sorted(missing)}")
+        for col in cls.required:
             if values[col] in ("", None):
-                raise SchemaError(f"{self.name}: column '{col}' must be non-empty")
-        for col, allowed in self.enums:
+                raise SchemaError(f"{cls.name}: column '{col}' must be non-empty")
+        for col, allowed in cls.enums:
             if values[col] not in allowed:
                 raise SchemaError(
-                    f"{self.name}: {col} {values[col]!r} violates the DDL CHECK "
+                    f"{cls.name}: {col} {values[col]!r} violates the DDL CHECK "
                     f"(allowed: {sorted(allowed)})"
                 )
-        return [values[c] for c in self.columns]
+        return [values[c] for c in cls.columns]
 
-    def qualified(self, db: str | None) -> str:
-        """`db.table` when a database is given, bare table otherwise.
+    @classmethod
+    def qualified(cls, db: str | None) -> str:
+        """`db.table` when a database is given, bare table otherwise."""
+        return f"{db}.{cls.name}" if db else cls.name
 
-        Every v2 statement is qualified because one client now serves both generations:
-        `benchmark_runs` exists in v1 AND v2 with incompatible shapes, so an unqualified
-        name would resolve against whichever database the connection happens to hold.
-        """
-        return f"{db}.{self.name}" if db else self.name
+    @classmethod
+    def insert(
+        cls, client, rows: Sequence[Mapping[str, Any]], db: str | None = None
+    ) -> int:
+        """Insert dicts, ordering every row through the one column list."""
+        if not rows:
+            return 0
+        ordered = [cls.row(r) for r in rows]
+        client.insert(
+            cls.name, ordered, column_names=list(cls.columns), database=db or None
+        )
+        return len(ordered)
+
+    @classmethod
+    def insert_identities(
+        cls, client, rows: Mapping[Any, Mapping[str, Any]], db: str | None = None
+    ) -> int:
+        """Insert only the identity rows the dimension does not already hold."""
+        if not rows:
+            return 0
+        if not cls.identity:
+            raise SchemaError(f"{cls.name} has no identity column")
+        ids = [str(k) for k in rows]
+        known = {
+            str(r[0])
+            for r in client.query(
+                f"SELECT {cls.identity} FROM {cls.qualified(db)} "
+                f"WHERE {cls.identity} IN {{ids:Array(UUID)}}",
+                parameters={"ids": ids},
+            ).result_rows
+        }
+        fresh = [v for k, v in rows.items() if str(k) not in known]
+        return cls.insert(client, fresh, db=db)
+
+    @classmethod
+    def present(cls, client, db: str, check_columns: bool = True) -> bool:
+        """True when the table exists and holds at least the columns modelled here."""
+        if not bool(client.command(f"EXISTS TABLE {cls.qualified(db)}")):
+            return False
+        if not check_columns:
+            return True
+        rows = client.query(
+            "SELECT name FROM system.columns "
+            "WHERE database = {db:String} AND table = {t:String}",
+            parameters={"db": db, "t": cls.name},
+        ).result_rows
+        return not set(cls.columns) - {r[0] for r in rows}
+
+    @classmethod
+    def count_rows(cls, client, db: str, where: str, params: dict) -> int:
+        """count() over this table under `where`, using named-parameter placeholders."""
+        rows = client.query(
+            f"SELECT count() FROM {cls.qualified(db)} WHERE {where}",
+            parameters=params,
+        ).result_rows
+        return int(rows[0][0]) if rows else 0
 
 
-# ── the v2 functional/benchmark tables, columns in DDL order ────────────────────────────
-# Source of truth: the CI pipeline's functional_tests_v2.sql.
-# `ts` is omitted from every one: it is DEFAULT now() and letting the server set it keeps the
-# ingest clock out of the data.
+# ── functional/benchmark tables (10-functional-tests.sql, 30-benchmarks.sql) ──
 
-TEST_CASES = Table(
-    name="test_cases",
-    columns=("test_case_id", "component", "classname", "name", "tags"),
-    required=("component", "name"),
-    identity="test_case_id",
-)
 
-TEST_CASE_RUNS = Table(
-    name="test_case_runs",
-    # props carries source_file, the per-XML discriminator the dedup checks: a sharded run is
-    # many files under ONE run_id, so a run-level check would let the first shard block the rest.
-    columns=(
+class TestCaseRow(TypedDict):
+    test_case_id: str
+    component: str
+    classname: str
+    name: str
+    tags: list[str]
+
+
+class TestCases(Table):
+    """Test identity: one row per (component, classname, name, tags)."""
+
+    name = "test_cases"
+    columns = ("test_case_id", "component", "classname", "name", "tags")
+    required = ("component", "name")
+    identity = "test_case_id"
+    Row = TestCaseRow
+
+
+class TestCaseRunRow(TypedDict):
+    run_id: str
+    test_case_id: str
+    component: str
+    status: str
+    duration_s: float
+    fail_message: str
+    props: dict[str, str]
+
+
+class TestCaseRuns(Table):
+    """One test's outcome in one run; props carries the source_file discriminator."""
+
+    name = "test_case_runs"
+    columns = (
         "run_id",
         "test_case_id",
         "component",
@@ -180,23 +215,45 @@ TEST_CASE_RUNS = Table(
         "duration_s",
         "fail_message",
         "props",
-    ),
-    required=("component",),
-    enums=(("status", STATUS_VALUES),),
-)
+    )
+    required = ("component",)
+    enums = (("status", STATUS_VALUES),)
+    Row = TestCaseRunRow
 
-BENCHMARKS = Table(
-    name="benchmarks",
-    columns=("benchmark_id", "component", "name", "tags", "props"),
-    required=("component", "name"),
-    identity="benchmark_id",
-)
 
-BENCHMARK_RUNS = Table(
-    name="benchmark_runs",
-    # component leads the identity hash and the sort key, so two repos writing the same
-    # benchmark name stay distinct rows rather than colliding on one benchmark_id.
-    columns=(
+class BenchmarkRow(TypedDict):
+    benchmark_id: str
+    component: str
+    name: str
+    tags: list[str]
+    props: dict[str, str]
+
+
+class Benchmarks(Table):
+    """Benchmark identity, component-scoped so two repos cannot collide on one name."""
+
+    name = "benchmarks"
+    columns = ("benchmark_id", "component", "name", "tags", "props")
+    required = ("component", "name")
+    identity = "benchmark_id"
+    Row = BenchmarkRow
+
+
+class BenchmarkRunRow(TypedDict):
+    run_id: str
+    benchmark_id: str
+    component: str
+    backend: str
+    measurements: dict[str, list[float]]
+    iterations: int
+    props: dict[str, str]
+
+
+class BenchmarkRuns(Table):
+    """One benchmark's measurements in one run; `measurements` is a metric's SAMPLES."""
+
+    name = "benchmark_runs"
+    columns = (
         "run_id",
         "benchmark_id",
         "component",
@@ -204,22 +261,96 @@ BENCHMARK_RUNS = Table(
         "measurements",
         "iterations",
         "props",
-    ),
-    required=("component",),
-)
+    )
+    required = ("component",)
+    Row = BenchmarkRunRow
 
-# ── the four v2 ARTIFACT tables, columns in DDL order ───────────────────────────────────
-# Source of truth: the CI pipeline's artifacts_v2.sql. Modelled here for the same reason as the
-# tables above -- the writer and the readers had no shared statement of a row's shape, and the
-# artifact tables are where that actually cost us.
-#
-# `ts` omitted throughout, as above: DEFAULT now() on the server.
 
-ARTIFACTS = Table(
-    name="artifacts",
-    # sources is Array(Tuple(repo, git_ref, git_sha)) -- a 3-element sequence per source, in
-    # that order. identity_deps/context_deps are Array(String) of dep entries (see dep_id12).
-    columns=(
+# ── capability tables (schema/46-capabilities.sql) ──
+
+
+class CapabilityRow(TypedDict):
+    capability_id: str
+    component: str
+    test_type: str
+    subject: str
+    name: str
+    tags: list[str]
+    props: dict[str, str]
+
+
+class Capabilities(Table):
+    """Capability identity: one row per (subject, capability), mirroring test_cases."""
+
+    name = "capabilities"
+    columns = (
+        "capability_id",
+        "component",
+        "test_type",
+        "subject",
+        "name",
+        "tags",
+        "props",
+    )
+    required = ("component", "test_type", "name")
+    identity = "capability_id"
+    Row = CapabilityRow
+
+
+class CapabilityRunRow(TypedDict):
+    run_id: str
+    capability_id: str
+    component: str
+    test_type: str
+    arch: str
+    status: str
+    backend: str
+    fail_reason: str
+    props: dict[str, str]
+
+
+class CapabilityRuns(Table):
+    """One capability's verdict; `backend` is a column, never part of the id."""
+
+    name = "capability_runs"
+    columns = (
+        "run_id",
+        "capability_id",
+        "component",
+        "test_type",
+        "arch",
+        "status",
+        "backend",
+        "fail_reason",
+        "props",
+    )
+    required = ("component", "test_type")
+    enums = (("status", CAPABILITY_STATUS_VALUES),)
+    Row = CapabilityRunRow
+
+
+# ── artifact tables (schema/20-artifacts.sql) ──
+
+
+class ArtifactRow(TypedDict):
+    artifact_id: str
+    component: str
+    arch: str
+    kind: str
+    artifact_name: str
+    origin: str
+    identity_deps: list[str]
+    context_deps: list[str]
+    sources: list[tuple[str, str, str]]
+    props: dict[str, str]
+
+
+class Artifacts(Table):
+    """One built artifact; no `identity` -- a dup artifact_id is a producer bug."""
+
+    name = "artifacts"
+    # sources is Array(Tuple(repo, git_ref, git_sha)); dep arrays hold DepEntry strings.
+    columns = (
         "artifact_id",
         "component",
         "arch",
@@ -230,18 +361,28 @@ ARTIFACTS = Table(
         "context_deps",
         "sources",
         "props",
-    ),
-    # arch is required by the DDL's own comment: one id12 exists per arch plus a 'multi'
-    # pointer, and dropping it collided 1,043 rows.
-    required=("component", "arch"),
-    # Not `identity=`: artifacts is plain MergeTree precisely so a duplicate artifact_id stays
-    # visible as the producer bug it is. Dedup here would hide it.
-    enums=(("kind", KIND_VALUES), ("origin", ORIGIN_VALUES)),
-)
+    )
+    # arch is required: one id12 exists per arch plus 'multi'; dropping it collides.
+    required = ("component", "arch")
+    enums = (("kind", KIND_VALUES), ("origin", ORIGIN_VALUES))
+    Row = ArtifactRow
 
-ARTIFACT_REFS = Table(
-    name="artifact_refs",
-    columns=(
+
+class ArtifactRefRow(TypedDict):
+    artifact_id: str
+    method: str
+    ref_kind: str
+    index_uri: str
+    ref: str
+    content_digest: str
+    props: dict[str, str]
+
+
+class ArtifactRefs(Table):
+    """How a consumer obtains an artifact, and the address that takes."""
+
+    name = "artifact_refs"
+    columns = (
         "artifact_id",
         "method",
         "ref_kind",
@@ -249,32 +390,46 @@ ARTIFACT_REFS = Table(
         "ref",
         "content_digest",
         "props",
-    ),
-    required=("ref",),
-    enums=(("method", METHOD_VALUES), ("ref_kind", REF_KIND_VALUES)),
-)
+    )
+    required = ("ref",)
+    enums = (("method", METHOD_VALUES), ("ref_kind", REF_KIND_VALUES))
+    Row = ArtifactRefRow
 
-ARTIFACT_TAGS = Table(
-    name="artifact_tags",
-    # refs mirrors artifact_refs' shape for the tag's own published addresses; published_refs
-    # is the flat list. tag_family is NOT enum-checked -- the DDL declares it without a CHECK.
-    columns=(
-        "tag",
-        "tag_family",
-        "artifact_id",
-        "refs",
-        "published_refs",
-        "props",
-    ),
-    required=("tag",),
-)
 
-ARTIFACT_RESULTS = Table(
-    name="artifact_results",
-    # No stored counters: the v2 DDL removed total_tests/passed/failed because a stored copy is
-    # a second source of truth that drifts once a delta run copies a covering run's cases in.
-    # Readers derive them from test_case_runs.
-    columns=(
+class ArtifactTagRow(TypedDict):
+    tag: str
+    tag_family: str
+    artifact_id: str
+    refs: list[tuple[str, str, str, str]]
+    published_refs: list[str]
+    props: dict[str, str]
+
+
+class ArtifactTags(Table):
+    """What a channel tag pointed to as of ts; tag_family is NOT enum-checked."""
+
+    name = "artifact_tags"
+    columns = ("tag", "tag_family", "artifact_id", "refs", "published_refs", "props")
+    required = ("tag",)
+    Row = ArtifactTagRow
+
+
+class ArtifactResultRow(TypedDict):
+    artifact_id: str
+    run_id: str
+    result_kind: str
+    test_type: str
+    state: str
+    arch: str
+    duration_s: float
+    props: dict[str, str]
+
+
+class ArtifactResults(Table):
+    """One leg's verdict on one artifact; counters are derived, never stored."""
+
+    name = "artifact_results"
+    columns = (
         "artifact_id",
         "run_id",
         "result_kind",
@@ -283,64 +438,62 @@ ARTIFACT_RESULTS = Table(
         "arch",
         "duration_s",
         "props",
-    ),
-    enums=(
+    )
+    enums = (
         ("result_kind", RESULT_KIND_VALUES),
         ("test_type", TEST_TYPE_VALUES),
         ("state", STATE_VALUES),
-    ),
-)
+    )
+    Row = ArtifactResultRow
+
+
+# Constant API, kept so installed consumers name one table model rather than copying it.
+TEST_CASES = TestCases
+TEST_CASE_RUNS = TestCaseRuns
+BENCHMARKS = Benchmarks
+BENCHMARK_RUNS = BenchmarkRuns
+CAPABILITIES = Capabilities
+CAPABILITY_RUNS = CapabilityRuns
+ARTIFACTS = Artifacts
+ARTIFACT_REFS = ArtifactRefs
+ARTIFACT_TAGS = ArtifactTags
+ARTIFACT_RESULTS = ArtifactResults
 
 TABLES = {
     t.name: t
     for t in (
-        TEST_CASES,
-        TEST_CASE_RUNS,
-        BENCHMARKS,
-        BENCHMARK_RUNS,
-        ARTIFACTS,
-        ARTIFACT_REFS,
-        ARTIFACT_TAGS,
-        ARTIFACT_RESULTS,
+        TestCases,
+        TestCaseRuns,
+        Benchmarks,
+        BenchmarkRuns,
+        Artifacts,
+        ArtifactRefs,
+        ArtifactTags,
+        ArtifactResults,
+        Capabilities,
+        CapabilityRuns,
     )
 }
 
+dep_id12 = DepEntry.id12
+dep_component = DepEntry.component
+
 
 def insert(
-    client, table: Table, rows: Sequence[dict[str, Any]], db: str | None = None
+    client,
+    table: type[Table],
+    rows: Sequence[Mapping[str, Any]],
+    db: str | None = None,
 ) -> int:
-    """Insert dicts into `table`, ordering every row through the one column list."""
-    if not rows:
-        return 0
-    ordered = [table.row(r) for r in rows]
-    client.insert(
-        table.name, ordered, column_names=list(table.columns), database=db or None
-    )
-    return len(ordered)
+    """Insert dicts into `table` -- the free-function form of `Table.insert`."""
+    return table.insert(client, rows, db=db)
 
 
 def insert_identities(
-    client, table: Table, rows: dict[Any, dict[str, Any]], db: str | None = None
+    client,
+    table: type[Table],
+    rows: Mapping[Any, Mapping[str, Any]],
+    db: str | None = None,
 ) -> int:
-    """Insert only the identity rows the dimension does not already hold.
-
-    Both dimensions are plain MergeTree, so re-inserting a known identity APPENDS a duplicate
-    rather than collapsing it -- one case seen in 36 runs became 36 rows. Deduping within a run
-    is not enough because the collision is across runs. Centralising it here is what stops the
-    check from being present in one repo and missing in the other two.
-    """
-    if not rows:
-        return 0
-    if not table.identity:
-        raise SchemaError(f"{table.name} has no identity column")
-    ids = [str(k) for k in rows]
-    known = {
-        str(r[0])
-        for r in client.query(
-            f"SELECT {table.identity} FROM {table.qualified(db)} "
-            f"WHERE {table.identity} IN {{ids:Array(UUID)}}",
-            parameters={"ids": ids},
-        ).result_rows
-    }
-    fresh = [v for k, v in rows.items() if str(k) not in known]
-    return insert(client, table, fresh, db=db)
+    """Insert unknown identity rows -- free function form of `insert_identities`."""
+    return table.insert_identities(client, rows, db=db)

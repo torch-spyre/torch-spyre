@@ -42,6 +42,7 @@ from torch_spyre._inductor.pass_utils import (
     PerCoreView,
     commit_iteration_space_ownership,
     concretize_expr,
+    indirect_access_subs_from_op,
     indirect_info_from_op,
     iteration_space_from_op,
     op_read_writes,
@@ -53,8 +54,8 @@ from torch_spyre._inductor.pass_utils import (
 )
 from torch_spyre._C import get_device_size_in_bytes
 from torch_spyre._inductor.work_division import (
-    _has_work_div_hint,
     enumerate_work_division_candidates,
+    has_resolved_work_div_hint,
     work_division_splits_are_legal,
 )
 from torch_spyre._inductor.errors import Unsupported
@@ -90,6 +91,7 @@ from torch_spyre._inductor.scratchpad.utils import (
     calculate_liveness,
     get_buffer_users,
     ops_in_offset_mutation_component,
+    dep_has_constant_offset,
     get_op_pointwise_inputs,
     buffer_not_read_in_full,
     is_empty_tiled_layout,
@@ -103,6 +105,12 @@ from torch_spyre._inductor.scratchpad.utils import (
 )
 from torch_spyre._inductor.scratchpad.graph_editor import GraphEditor
 from torch_spyre._inductor.ir import FixedTiledLayout, SpyreEmptyFallback
+from torch_spyre._inductor.constants import (
+    BATCH_MATMUL_FP8_OP,
+    DEVICE_NAME,
+    KEEP_BY_INDEX_OP,
+    POOL_OPS,
+)
 
 from torch_spyre._inductor import config
 from torch_spyre._inductor.logging_utils import get_inductor_logger
@@ -654,6 +662,11 @@ class ScratchpadAllocator:
                 return "graph output (no clone)"
             if name in reinterpret_output_names:
                 return "graph output is a ReinterpretView"
+            if name in mutated_buffers:
+                # The output clone is inserted after the producer, so it would
+                # copy the value from before a later in-place update (e.g. a
+                # loop carry returned from the graph).
+                return "graph output mutated after production"
         if buffer_not_read_in_full(graph, name):
             return "partial/offset read"
         if division_is_fixed and ncores.get(name, -1) < 0:
@@ -1482,6 +1495,140 @@ def _core_division(op: Operation, splits: dict[sympy.Symbol, int]) -> CoreDivisi
     return CoreDivision(splits=sparse, reduction_syms=_reduction_syms(op, sparse))
 
 
+def _is_cpu_host_buffer(op: Operation) -> bool:
+    """True for a ComputedBuffer that is not on the Spyre device.
+
+    CPU/host buffers participate in the joint division map (as producers or
+    consumers in the slicing-match) but never reside in LX and are never
+    re-sliced, so they keep their committed division.
+    """
+    if not isinstance(op, ComputedBuffer):
+        return False
+    layout = op.maybe_get_layout()
+    return layout is None or layout.device.type != DEVICE_NAME
+
+
+def _is_windowed_pool(op: Operation) -> bool:
+    """True for a windowed pool (avgpoolfwd) reduction op.
+
+    Its output spatial split cannot be re-chosen by the joint solver without
+    risking a mis-addressed per-core input; see the pin in ``_division_map``.
+    """
+    return (
+        isinstance(op, ComputedBuffer)
+        and isinstance(op.data, Reduction)
+        and op.data.reduction_type in POOL_OPS
+    )
+
+
+def _is_indirect_access_op(op: Operation) -> bool:
+    """True for a gather (``index``) or scatter (``index_put``) op.
+
+    An indirect op accesses one operand through a runtime index
+    (``IndirectAccess``): a gather reads ``src[idx]``, a scatter writes
+    ``dest[idx]``. The work-division pass parallelizes these on the index-entry
+    dim and never on the shared table/destination data dim (splitting the shared
+    base is silently wrong). The joint solver does not preserve that split: a
+    scatter's entry dim reaches ``_core_division`` as a reduction split (write
+    coeff 0 through IndirectAccess) which the solver then avoids, and a gather's
+    entry split is a plain tie the memory-only objective breaks toward a single
+    core -- both drop the multicore entry-dim parallelism. Pin every indirect op
+    to its fixed (work-division) division so co-optimization keeps the entry
+    split, mirroring the keep_by_index pin. Correctness is unchanged either way
+    (the shared data dim is never split); this restores the expected parallelism.
+    """
+    return isinstance(op, ComputedBuffer) and bool(indirect_access_subs_from_op(op))
+
+
+def _reads_offset_slice(op: Operation) -> bool:
+    """True for an op that reads an input at a constant (slice) offset.
+
+    A sliced read -- ``exp(x[:, :, 32:96])`` reads its operand at index
+    ``... + 32`` -- carries a non-zero constant term in the read index.
+    Splitting the sliced dim across cores mis-addresses the per-core slice: the
+    sliced dim is a non-stick device coordinate offset into a wider operand dim
+    (``d2 + 32`` into a 128-wide dim in the restickified operand), so a per-core
+    sub-range lands at a span the DSM read address cannot express -- silent ~44%
+    error on ``exp(x[:, :, 32:96])`` over 128x192x256. The work-division pass
+    picks a safe division for these ops (it never split the offset dim); the
+    joint solver does, so pin the op to that fixed division, mirroring the
+    keep_by_index pin. Correctness is unchanged (the fixed division is what the
+    non-co-optimized path uses); only the offending split is removed. Blocking
+    the offset dim alone is not enough -- it forces the solver onto a different
+    unsafe split for a sliced reduction -- so the whole op is pinned. Indirect
+    (data-dependent) offsets are handled by ``_is_indirect_access_op``.
+
+    Shares ``dep_has_constant_offset`` with ``_writes_at_constant_offset``, the
+    write-side detector behind ``ops_in_offset_mutation_component``: both ask the
+    same question of a dep, so they must answer it the same way (in particular,
+    per-core/coarse-tile shifts are symbolic and are not offsets).
+    """
+    if not isinstance(op, ComputedBuffer):
+        return False
+    return any(dep_has_constant_offset(dep) for dep in op_read_writes(op).reads)
+
+
+def _fused_layout_group_ops(
+    graph: GraphLowering, seed_reasons: dict[str, str]
+) -> dict[str, str]:
+    """Map each op in a fused layout group to the pin reason of its seed.
+
+    ``seed_reasons`` maps a seed reduction type to the reason string reported
+    when its group is pinned; every op in that seed's group inherits it.
+
+    A group is one seed reduction plus the input producers it reads (one hop
+    back) and the consumers of its output (one hop forward): the tightly coupled
+    neighbours the work-division pass slices into a single mutually compatible
+    per-core division. The joint solver, free to divide each op independently,
+    can hand the group's members incompatible divisions and corrupt the shared
+    per-core addressing/scheduling, so the caller pins the whole group to its
+    fixed (work-division) division. Two op kinds need this identical treatment:
+
+    * ``keepbyindex`` reproduces a fragile multi-stick search layout that its
+      input restickifies and output clones carry too; an output clone splitting
+      the search axis while the reduction keeps it whole drops the second search
+      stick's kept values (silently wrong, ~2-3% of a 6x17x4x128 dim-3
+      keep_by_index). Its own unsafe splits are separately blocked by
+      ``keep_by_index_search_adjacent_blocked_vars``.
+    * ``batchmatmulfp8`` fuses the fp8 quantize of its operands and the
+      dequant/bias of its output into one SDSC bundle; leaving the matmul
+      single-core-in-LX (``{}``) while its operands split aborts DeepTools L3
+      scheduling (``distributeElemArrToTemporalLoops: Not enough elements to
+      distribute``, a 4x128 @ 128x1024 fp8 scaled_mm). Only the fused neighbours
+      need it -- the quantize chain feeding the operand producers is a separate
+      bundle -- and a plain fp16 batchmatmul (no fused quantize) is not seeded.
+
+    Both seeds are scanned in one pass, so adding a seed costs no extra graph
+    walk.
+    """
+    seeds = [
+        op
+        for op in graph.operations
+        if isinstance(op, ComputedBuffer)
+        and isinstance(op.data, Reduction)
+        and op.data.reduction_type in seed_reasons
+    ]
+    if not seeds:
+        return {}
+    # Reason per seed name, so producers and consumers inherit it below.
+    reason_of_seed = {op.name: seed_reasons[op.data.reduction_type] for op in seeds}
+    group: dict[str, str] = dict(reason_of_seed)
+    # Producers of each seed's input buffers (restickifies / fp8 quantize).
+    for seed in seeds:
+        for dep in op_read_writes(seed).reads:
+            if isinstance(dep, MemoryDep):
+                group.setdefault(dep.name, reason_of_seed[seed.name])
+    # Consumers of any seed output (output clones / dequant / bias-add).
+    for op in graph.operations:
+        if not isinstance(op, ComputedBuffer):
+            continue
+        for dep in op_read_writes(op).reads:
+            if isinstance(dep, MemoryDep) and dep.name in reason_of_seed:
+                group.setdefault(op.name, reason_of_seed[dep.name])
+                break
+    return group
+
+
 def _view_for_div(
     op: Operation,
     dep: MemoryDep,
@@ -1601,6 +1748,13 @@ def build_residency_edge(
         ),
         None,
     )
+
+    def wrapped_hasattr(obj, attr):
+        try:
+            return hasattr(obj, attr)
+        except NotImplementedError:
+            return False
+
     read_dep = next(
         (r for r in consumer_reads if r.name == buf_name and isinstance(r, MemoryDep)),
         None,
@@ -1615,13 +1769,6 @@ def build_residency_edge(
         read_dep=read_dep,
         prep_cache=prep_cache,
     )
-
-
-def _op_has_work_div_hint(op: Operation) -> bool:
-    """True when a user work_div hint governs ``op``'s division."""
-    if not isinstance(op, ComputedBuffer):
-        return False
-    return _has_work_div_hint(op)
 
 
 def _fixed_core_division(op: Operation) -> CoreDivision:
@@ -1732,11 +1879,27 @@ def _split_fits_sticks(op: Operation, splits: dict[sympy.Symbol, int]) -> bool:
         return False
     sizes = _output_stride_to_device_size(op)
     for sym, factor in splits.items():
-        stride = int(write.index.coeff(sym))
+        stride = concretize_expr(write.index.coeff(sym))
         size = sizes.get(stride, 0)
         if factor > 1 and stride and (not size or size % factor):
             return False
     return True
+
+
+def _output_axis_symbols(
+    write: sympy.Expr, iter_syms: dict[sympy.Symbol, sympy.Expr]
+) -> dict[int, sympy.Symbol]:
+    """Map each output stride in ``write`` to the iteration symbol it scales.
+
+    Only iteration symbols are axes. Under dynamic shapes the index also carries
+    size symbols (``d0*s20 + d1``), whose coefficients are loop variables rather
+    than strides, so ``write.free_symbols`` cannot be used directly.
+    """
+    return {
+        concretize_expr(write.coeff(sym)): sym
+        for sym in iter_syms
+        if sym in write.free_symbols
+    }
 
 
 def _matmul_axis_parse(op: Operation) -> dict[str, tuple[sympy.Symbol, int, int]]:
@@ -1751,8 +1914,10 @@ def _matmul_axis_parse(op: Operation) -> dict[str, tuple[sympy.Symbol, int, int]
     rw = op_read_writes(op)
     write = next(iter(rw.writes)).index
     read = next((dep.index for dep in rw.reads), write)
-    out_syms = {int(write.coeff(sym)): sym for sym in write.free_symbols}
-    k_syms = read.free_symbols - write.free_symbols
+    iter_syms = iteration_space_from_op(op)
+    out_syms = _output_axis_symbols(write, iter_syms)
+    k_syms = {sym for sym in iter_syms if sym in read.free_symbols}
+    k_syms -= write.free_symbols
     if not k_syms:
         raise ValueError(f"matmul {op.get_name()} has no reduction axis")
     sizes = _output_stride_to_device_size(op)
@@ -1764,7 +1929,7 @@ def _matmul_axis_parse(op: Operation) -> dict[str, tuple[sympy.Symbol, int, int]
     k_sym = min(k_syms, key=str)
     roles["K"] = (
         k_sym,
-        concretize_expr(iteration_space_from_op(op)[k_sym]),
+        concretize_expr(iter_syms[k_sym]),
         seed[k_sym],
     )
     return roles
@@ -1788,7 +1953,7 @@ def _reduction_bm_axes(
     M. Reductions with fewer than two output axes cannot use this factorization.
     """
     write = next(iter(op_read_writes(op).writes)).index
-    out_syms = {int(write.coeff(sym)): sym for sym in write.free_symbols}
+    out_syms = _output_axis_symbols(write, iteration_space_from_op(op))
     if len(out_syms) < 2:
         return None
     m_stride, b_stride = sorted(out_syms)[-2:]
@@ -1832,7 +1997,7 @@ def _output_profile(op: Operation, splits: dict[sympy.Symbol, int]) -> dict[int,
     """
     write = next(iter(op_read_writes(op).writes)).index
     return {
-        int(write.coeff(sym)): factor
+        concretize_expr(write.coeff(sym)): factor
         for sym, factor in splits.items()
         if factor > 1 and write.coeff(sym) != 0
     }
@@ -1844,7 +2009,9 @@ def _from_output_profile(
     """Apply a transient physical output profile as a symbol-keyed candidate."""
     write = next(iter(op_read_writes(op).writes)).index
     return {
-        sym: profile.get(int(write.coeff(sym)), 1) if write.coeff(sym) != 0 else 1
+        sym: profile.get(concretize_expr(write.coeff(sym)), 1)
+        if write.coeff(sym) != 0
+        else 1
         for sym in iteration_space_from_op(op)
     }
 
@@ -2046,7 +2213,10 @@ class CoOptimizingAllocator(ScratchpadAllocator):
     def _solve(self, solver: MemoryPlanSolver, graph: GraphLowering) -> Sequence[Any]:
         assert isinstance(solver, CoreDivisionLayoutSolver)
         bufmap = {buf.name: buf for buf in solver.buffers}
-        is_lx = {name: buf.sym_is_lx for name, buf in bufmap.items()}
+        # Built once here, not per op inside the loop below: every op's residency
+        # lookup is against this same whole-graph map, and rebuilding it per op
+        # turns an O(buffers) cost into O(ops * buffers) on the full graph.
+        default_is_lx = {name: buf.sym_is_lx for name, buf in bufmap.items()}
 
         # Keyed by buffer name, which is what ``predict_by_bundle`` needs to match
         # features to the ops in each estimated bundle. ``mem_usage_by_buf`` keys
@@ -2061,7 +2231,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             if output_name not in bufmap:
                 continue
             op_features[output_name] = self._extract_op_features(
-                graph, output_name, bufmap, is_lx
+                graph, output_name, bufmap, default_is_lx
             )
 
         from torch_spyre._inductor.cost_model import predict_bundles
@@ -2156,17 +2326,18 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         each buffer's *symbolic* core-division vars (sym_core_divs) instead of
         concrete values, so the resulting OpFeatures can be fed to
         predict_ops() to build a cost expression over the solver's own
-        decision variables. Residency is likewise symbolic: ``is_lx`` (the
-        name -> ``sym_is_lx`` map) is passed straight into the extractor so
-        every arg is stamped with its symbolic placement as it is built.
+        decision variables. The extractor reads each arg's symbolic residency
+        from ``is_lx`` (built once by the caller over all of ``buffers``, not
+        per op); ``buffers`` itself supplies this op's own candidate divisions.
         """
         from torch_spyre._inductor.dump_cost_model import extract_op_features
         from torch_spyre._inductor.scratchpad.sa_cooptimizer import _work_slices
 
         op = graph.get_buffer(output_name)
-        division = CoreDivision(splits=buffers[output_name].sym_core_divs)
+        buffer = buffers[output_name]
+        division = CoreDivision(splits=buffer.sym_core_divs)
         ws = _work_slices(op, division)
-        return extract_op_features(op, ws, is_lx)
+        return extract_op_features(op, ws, is_lx=is_lx)
 
     def _finalize_lx_relayout_allocation(
         self,
@@ -2289,24 +2460,49 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         -- asserted here because nothing downstream re-checks it (issue #4387).
         """
         max_cores = config.sencores
-        fixed_division_ops = ops_in_offset_mutation_component(graph)
         profiles, matmul_roles = _find_distinct_matmul_splits(graph.operations)
 
+        # Ops pinned to their committed (work-division) division: each guard
+        # detects a distinct wrong-code or scheduling hazard the joint solver
+        # would hit by re-slicing the op, and all share the one remedy -- keep the
+        # fixed division. A resolved user work_div hint takes the same remedy,
+        # last so a hazard guard's reason is the one logged: work division
+        # already committed the hint, and the pin is whole-op -- unhinted dims
+        # keep their committed split of 1. The graph-level group sets are
+        # loop-invariant, so build them once here rather than rescanning
+        # graph.operations for every op.
+        offset_mutation_ops = ops_in_offset_mutation_component(graph)
+        layout_group_reason = _fused_layout_group_ops(
+            graph,
+            {
+                KEEP_BY_INDEX_OP: "keep_by_index layout group",
+                BATCH_MATMUL_FP8_OP: "fp8 matmul layout group",
+            },
+        )
         result = {}
         for op in graph.operations:
-            if op.name in fixed_division_ops:
-                divs = _legal_fixed_division(
-                    op, [_fixed_core_division(op)], "offset mutation component"
-                )
-            elif not config.ignore_work_division_hints and _op_has_work_div_hint(op):
-                # User hints take ownership of the split decision - the same
-                # contract the committed work-division path honors
-                # (work_division.py). The committed division already reflects
-                # the hint, so pin the candidate list to it; re-dividing a
-                # hinted op would silently override the user.
-                divs = _legal_fixed_division(
-                    op, [_fixed_core_division(op)], "user work_div hint"
-                )
+            reason: Optional[str] = None
+            if _is_cpu_host_buffer(op):
+                reason = "cpu/host buffer"
+            elif op.name in offset_mutation_ops:
+                reason = "offset mutation component"
+            elif _is_windowed_pool(op):
+                reason = "windowed pool"
+            elif op.name in layout_group_reason:
+                reason = layout_group_reason[op.name]
+            elif _is_indirect_access_op(op):
+                reason = "indirect access entry split"
+            elif _reads_offset_slice(op):
+                reason = "offset slice read"
+            elif (
+                not config.ignore_work_division_hints
+                and isinstance(op, ComputedBuffer)
+                and has_resolved_work_div_hint(op)
+            ):
+                reason = "user work_div hint"
+
+            if reason is not None:
+                divs = _legal_fixed_division(op, [_fixed_core_division(op)], reason)
             elif self.prune and isinstance(op, ComputedBuffer):
                 divs = [
                     _core_division(op, splits)
@@ -2314,6 +2510,10 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                         op, _enum_split_options(op, profiles, matmul_roles)
                     )
                 ]
+                if not divs:
+                    divs = _legal_fixed_division(
+                        op, [_fixed_core_division(op)], "empty pruned candidate set"
+                    )
             else:
                 divs = self._enumerate_core_divisions(op, max_cores)
             if not divs:
@@ -2891,13 +3091,19 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                 if k is None:
                     cd = consumer_divs[j]
                     per_sym = cd.splits
+                    # Project onto the input: a consumer split on an axis the
+                    # input lacks (e.g. a matmul's free dim) does not slice the
+                    # input, so it must not count toward the clone's cores.
+                    # Otherwise the cores_used check below cannot reject a
+                    # broadcast read.
+                    read_syms = read_dep.index.free_symbols
                     k = len(clone_divs)
                     clone_divs.append(
                         CoreDivision(
                             splits={
                                 sym: split
                                 for sym, split in per_sym.items()
-                                if split > 1
+                                if split > 1 and sym in read_syms
                             }
                         )
                     )  # a clone op cannot have a reduction split
@@ -2962,16 +3168,19 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         consumer: str,
         candidates: list[RelayoutCandidate],
         consumer_divs: list[CoreDivision],
+        consumer_costs: dict[int, float] | None = None,
     ) -> list[RelayoutCandidate]:
         """Keep the candidates of the ``config.lx_solver_relayout_groups_per_edge``
         cheapest destination views of one (source, consumer) edge.
 
-        Every consumer division with a distinct read partition is its own
+        Each distinct consumer read partition is its own
         relayout group, and every group becomes a copy buffer the solver must
         place, though the consumer will read through at most one of them. A
-        group is ranked by its cheapest candidate (the best source division
-        that lands on it), ties toward the consumer division using more cores,
-        the solver's own preference. Dropping a group only removes an option:
+        group is ranked by copy plus consumer execution cost, not copy cost
+        alone: a cheap copy can feed an expensive matmul division. This is a
+        shortlist estimate, not the whole-graph objective. Ties favor more
+        consumer cores, the solver's existing preference. Dropping a group only
+        removes an option:
         a consumer division without a copy is treated exactly like an unpriced
         pair (match for free or spill), and every fired relayout is still
         certified at materialization.
@@ -2987,7 +3196,15 @@ class CoOptimizingAllocator(ScratchpadAllocator):
 
         def rank(item: tuple[int, list[RelayoutCandidate]]) -> tuple:
             group, members = item
-            best = min(c.cost_ns for c in members)
+            best = min(
+                c.cost_ns
+                + (
+                    consumer_costs[c.consumer_division]
+                    if consumer_costs is not None
+                    else 0.0
+                )
+                for c in members
+            )
             cores = max(consumer_divs[c.consumer_division].cores_used for c in members)
             return (best, -cores, group)
 
@@ -3000,6 +3217,37 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             len(by_group),
         )
         return [c for c in candidates if c.group in kept]
+
+    @staticmethod
+    def _relayout_consumer_costs(consumer_op, consumer_divs, parent, candidates):
+        """Reuse the execution model to shortlist copies feeding this consumer.
+
+        Price this input in LX and the remaining arguments in HBM. The solver
+        still decides their actual placement and prices complete bundles.
+        Extract once per consumer division, not once per source/destination pair.
+        """
+        from torch_spyre._inductor.cost_model import predict_ops
+        from torch_spyre._inductor.dump_cost_model import extract_op_features
+        from torch_spyre._inductor.scratchpad.sa_cooptimizer import _work_slices
+
+        is_lx = {dep.name: False for dep in op_read_writes(consumer_op).reads}
+        is_lx[consumer_op.get_name()] = False
+        is_lx[parent] = True
+        return {
+            j: float(
+                predict_ops(
+                    [
+                        extract_op_features(
+                            consumer_op,
+                            _work_slices(consumer_op, consumer_divs[j]),
+                            is_lx=is_lx,
+                        )
+                    ],
+                    params=_COST_PARAMS,
+                )
+            )
+            for j in sorted({c.consumer_division for c in candidates})
+        }
 
     def _cd_parent_relayouts(
         self,
@@ -3148,6 +3396,11 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                         continue
                     if _projected(pv, prod_coords, prod_space, "prod") is None:
                         continue
+                    # The relayout copy iterates the producer's shape, so the
+                    # destination view must also project on the producer frame
+                    # (materialize_lx_relayouts commits it there and raises).
+                    if _projected(cv, prod_coords, prod_space, "prod") is None:
+                        continue
                     src_division = _projected(pv, cons_coords, cons_space, "cons")
                     dst_division = _projected(cv, cons_coords, cons_space, "cons")
                     if src_division is None or dst_division is None:
@@ -3186,7 +3439,11 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                     if cost is None:
                         continue
                     source_span, destination_span = _span(pv), _span(cv)
-                    if source_span is None or destination_span is None:
+                    if (
+                        source_span is None
+                        or destination_span is None
+                        or destination_span > self.size
+                    ):
                         continue
                     candidates.append(
                         RelayoutCandidate(
@@ -3202,8 +3459,26 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                             destination_footprint_bytes=destination_span,
                         )
                     )
+            consumer_costs = None
+            cap = config.lx_solver_relayout_groups_per_edge
+            if cap > 0 and len({c.group for c in candidates}) > cap:
+                try:
+                    consumer_costs = self._relayout_consumer_costs(
+                        consumer_op, consumer_divs, parent, candidates
+                    )
+                except (ValueError, RuntimeError, TypeError) as exc:
+                    logger.warning(
+                        "relayout shortlist consumer cost unavailable for %s: %s; "
+                        "using copy cost only",
+                        consumer_op.get_name(),
+                        exc,
+                    )
             candidates = self._cap_relayout_groups(
-                parent, consumer_op.get_name(), candidates, consumer_divs
+                parent,
+                consumer_op.get_name(),
+                candidates,
+                consumer_divs,
+                consumer_costs,
             )
             if candidates:
                 relayouts[parent] = candidates

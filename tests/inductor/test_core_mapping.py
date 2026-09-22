@@ -33,6 +33,7 @@ from torch_spyre._inductor.constants import (
     BATCH_MATMUL_OP,
 )
 from torch_spyre._inductor.core_mapping import (
+    aligned_split_keeps_blocks,
     core_mappings_equal,
     core_to_slice_mapping,
     derive_core_mapping,
@@ -291,6 +292,28 @@ def test_late_partition_mapping_repeats_contiguous_owners():
     assert _mapping_coordinates(mapping, (head,), 32) == [
         (core // 8,) for core in range(32)
     ]
+
+
+@pytest.mark.parametrize(
+    ("split", "bases", "keeps_blocks"),
+    [
+        # d0 < 6 cut into its repeat period (2, innermost) and count (3).
+        (1, (2, 3), True),
+        (3, (2, 3), True),
+        (6, (2, 3), True),
+        # gcd(2, 3) leaves the count whole and splits the period: core 0
+        # would own rows {0, 2, 4}.
+        (2, (2, 3), False),
+        # A partial split of the outermost segment keeps blocks.
+        (2, (2, 4), True),
+        (4, (4, 3), False),
+        (6, (4, 3), True),
+        # Nothing absorbs a factor of 5.
+        (5, (2, 3), False),
+    ],
+)
+def test_aligned_split_keeps_blocks(split, bases, keeps_blocks):
+    assert aligned_split_keeps_blocks(split, bases) is keeps_blocks
 
 
 @pytest.mark.parametrize(

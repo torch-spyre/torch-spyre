@@ -20,7 +20,7 @@ from torch.utils._config_module import install_config_module
 
 lx_planning: bool = os.environ.get("LX_PLANNING", "1") == "1"
 co_optimizing_lx_planning: bool = (
-    os.environ.get("CO_OPTIMIZING_LX_PLANNING", "0") == "1"
+    os.environ.get("CO_OPTIMIZING_LX_PLANNING", "1") == "1"
 )
 hbm_pool_planning: bool = os.getenv("HBM_POOL_PLANNING", "1").lower() in (
     "1",
@@ -104,15 +104,16 @@ lx_solver_relayout_groups_per_edge: int = int(
     os.getenv("SPYRE_LX_SOLVER_RELAYOUT_GROUPS_PER_EDGE", "4")
 )
 
-# For unpriced CP-SAT solves, skip presolve above this many relayout copies.
-# Priced relayout solves already skip it regardless of count. One of CP-SAT's
-# presolve passes scales super-linearly in the number of free copy residency
-# literals (measured on the spyre_attn decode
-# graph: 16 copies 5 s, 64 copies 13 s, 160 copies 40 s, 312 copies past the
-# 120 s limit) and no exposed parameter shortens it, while search on the raw
-# model finds a feasible plan within seconds. 0 disables this count threshold.
+# Skip CP-SAT's presolve above this many free relayout copies in one solve;
+# 0 (the default) never skips it, priced or not. Presolve once scaled
+# super-linearly in the number of free copy residency literals (measured on the
+# spyre_attn decode graph: 16 copies 5 s, 64 copies 13 s, 160 copies 40 s, 312
+# copies past the 120 s limit). Constant-binding single-division copies and the
+# cost printer's lin_max proxy variables removed that cost, and a priced model
+# searched without presolve can exhaust memory in the LNS workers. Kept as an
+# escape hatch for a graph where presolve still outlives the time limit.
 lx_solver_relayout_presolve_max_copies: int = int(
-    os.getenv("SPYRE_LX_SOLVER_RELAYOUT_PRESOLVE_MAX_COPIES", "64")
+    os.getenv("SPYRE_LX_SOLVER_RELAYOUT_PRESOLVE_MAX_COPIES", "0")
 )
 
 # Submit independent DXP kernel compilations to Inductor's subprocess pool and
@@ -268,6 +269,19 @@ sdsc_cache: bool = os.environ.get("SPYRE_INDUCTOR_SDSC_CACHE", "1") == "1"
 layout_solver: Literal[
     "greedy", "bestfit", "firstfit", "cpsat", "simulated_annealing"
 ] = os.environ.get("LAYOUT_SOLVER", "cpsat")  # type: ignore[assignment]
+
+# Wall-clock budget for one CP-SAT solve, in seconds. The joint objective is
+# lexicographic and re-solves the same model up to three times (residency, then
+# parallelism, then division balance), so this bounds each phase, not the pass.
+# It is a compile-time guard, not a correctness one: a solve that runs out of
+# budget without an incumbent raises SolveError, and scratchpad_planning falls
+# back to greedy placement (correct, but co-optimization is lost for that
+# graph). Raise it if large graphs are falling back; 0 disables the limit.
+# The default matches the budget CpSatLayoutSolver hard-coded before this knob
+# existed, so exposing it does not change how long any solve is allowed to run.
+cpsat_time_limit_seconds: float = float(
+    os.environ.get("CPSAT_TIME_LIMIT_SECONDS", "30")
+)
 
 # OpSpec validation at pipeline stage boundaries. Enabled by default to catch
 # invariant violations early. Set SPYRE_VALIDATE_OP_SPECS=0 to disable.

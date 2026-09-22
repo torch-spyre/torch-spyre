@@ -32,7 +32,7 @@ from torch._inductor.utils import run_and_get_code
 from torch_spyre._inductor.wsr import for_each_tile
 
 
-M, K, N = 8, 12, 6
+M, K, N = 256, 256, 64
 
 
 def matmul_inputs() -> tuple[tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
@@ -49,7 +49,7 @@ def split_m_fn(X: torch.Tensor, Y: torch.Tensor) -> torch.Tensor:
         x_tile, y_whole = ops
         return None, x_tile @ y_whole
 
-    _, out = for_each_tile(body, (X, Y), dims=(0, None), tile_size=2, out_dim=0)
+    _, out = for_each_tile(body, (X, Y), dims=(0, None), tile_size=64, out_dim=0)
     return out
 
 
@@ -72,7 +72,7 @@ def split_m_elementwise_fn(X: torch.Tensor, Y: torch.Tensor) -> torch.Tensor:
         scaled = x_tile * 2.0
         return None, scaled @ y_whole
 
-    _, out = for_each_tile(body, (X, Y), dims=(0, None), tile_size=2, out_dim=0)
+    _, out = for_each_tile(body, (X, Y), dims=(0, None), tile_size=64, out_dim=0)
     return out
 
 
@@ -87,7 +87,7 @@ def split_k_fn(X: torch.Tensor, Y: torch.Tensor) -> torch.Tensor:
         body,
         (X, Y),
         dims=(-1, 0),
-        tile_size=3,
+        tile_size=64,
         init=torch.zeros(M, N, device=X.device, dtype=X.dtype),
     )
     return final
@@ -115,18 +115,18 @@ def nested_split_m_then_k_fn(X: torch.Tensor, Y: torch.Tensor) -> torch.Tensor:
             inner_body,
             (x_tile, y_whole),
             dims=(-1, 0),
-            tile_size=3,
+            tile_size=64,
             init=torch.zeros(m_tile, N, device=X.device, dtype=X.dtype),
         )
         return None, final
 
-    _, out = for_each_tile(outer_body, (X, Y), dims=(0, None), tile_size=2, out_dim=0)
+    _, out = for_each_tile(outer_body, (X, Y), dims=(0, None), tile_size=64, out_dim=0)
     return out
 
 
 def nested_split_m_then_k_reference(X: torch.Tensor, Y: torch.Tensor) -> torch.Tensor:
     """Eager Python nesting of the same tiling, for value assertions."""
-    m_tile_size, k_tile_size = 2, 3
+    m_tile_size, k_tile_size = 64, 64
     rows = []
     for m_start in range(0, X.shape[0], m_tile_size):
         x_m_tile = X[m_start : m_start + m_tile_size]
@@ -183,13 +183,13 @@ def triple_nested_stardep_outer_fn(X: torch.Tensor, Y: torch.Tensor) -> torch.Te
                 inner_body,
                 (x_m_tile, y_m_whole),
                 dims=(-1, 0),
-                tile_size=3,
+                tile_size=64,
                 init=torch.zeros(m_tile, N, device=X.device, dtype=X.dtype),
             )
             return None, final
 
         _, mid_out = for_each_tile(
-            middle_body, (x_b, y_b), dims=(0, None), tile_size=2, out_dim=0
+            middle_body, (x_b, y_b), dims=(0, None), tile_size=64, out_dim=0
         )
         return None, mid_out
 
@@ -201,7 +201,7 @@ def triple_nested_stardep_outer_reference(
     X: torch.Tensor, Y: torch.Tensor
 ) -> torch.Tensor:
     """Eager Python nesting of the same tiling, for value assertions."""
-    b_tile_size, m_tile_size, k_tile_size = 1, 2, 3
+    b_tile_size, m_tile_size, k_tile_size = 1, 64, 64
     batches = []
     for b_start in range(0, X.shape[0], b_tile_size):
         x_b_tile = X[b_start : b_start + b_tile_size]
@@ -259,13 +259,13 @@ def triple_nested_stardep_middle_fn(X: torch.Tensor, Y: torch.Tensor) -> torch.T
                 inner_body,
                 (x_m_tile, y_m_whole),
                 dims=(-1, 0),
-                tile_size=3,
+                tile_size=64,
                 init=torch.zeros(m_tile, N, device=X.device, dtype=X.dtype),
             )
             return None, final
 
         _, mid_out = for_each_tile(
-            middle_body, (x_b, y_b), dims=(0, None), tile_size=2, out_dim=0
+            middle_body, (x_b, y_b), dims=(0, None), tile_size=64, out_dim=0
         )
         return None, mid_out
 
@@ -277,7 +277,7 @@ def triple_nested_stardep_middle_reference(
     X: torch.Tensor, Y: torch.Tensor
 ) -> torch.Tensor:
     """Eager Python nesting of the same tiling, for value assertions."""
-    b_tile_size, m_tile_size, k_tile_size = 1, 2, 3
+    b_tile_size, m_tile_size, k_tile_size = 1, 64, 64
     batches = []
     for b_start in range(0, X.shape[0], b_tile_size):
         x_b_tile = X[b_start : b_start + b_tile_size] * 1.0
@@ -341,13 +341,13 @@ def triple_nested_stardep_inner_fn(X: torch.Tensor, Y: torch.Tensor) -> torch.Te
                 inner_body,
                 (x_m_tile, y_m_whole),
                 dims=(-1, 0),
-                tile_size=3,
+                tile_size=64,
                 init=torch.zeros(m_tile, N, device=X.device, dtype=X.dtype),
             )
             return None, final
 
         _, mid_out = for_each_tile(
-            middle_body, (x_b, y_b), dims=(0, None), tile_size=2, out_dim=0
+            middle_body, (x_b, y_b), dims=(0, None), tile_size=64, out_dim=0
         )
         return None, mid_out
 
@@ -359,7 +359,7 @@ def triple_nested_stardep_inner_reference(
     X: torch.Tensor, Y: torch.Tensor
 ) -> torch.Tensor:
     """Eager Python nesting of the same tiling, for value assertions."""
-    b_tile_size, m_tile_size, k_tile_size = 1, 2, 3
+    b_tile_size, m_tile_size, k_tile_size = 1, 64, 64
     batches = []
     for b_start in range(0, X.shape[0], b_tile_size):
         x_b_tile = X[b_start : b_start + b_tile_size] * 1.0
@@ -441,13 +441,13 @@ def triple_nested_stardep_multilevel_fn(
                 inner_body,
                 (x_m_tile, y_m_whole),
                 dims=(-1, 0),
-                tile_size=3,
+                tile_size=64,
                 init=torch.zeros(m_tile, N, device=X.device, dtype=X.dtype),
             )
             return None, final
 
         _, mid_out = for_each_tile(
-            middle_body, (x_b, y_b), dims=(0, None), tile_size=2, out_dim=0
+            middle_body, (x_b, y_b), dims=(0, None), tile_size=64, out_dim=0
         )
         return None, mid_out
 
@@ -459,7 +459,7 @@ def triple_nested_stardep_multilevel_reference(
     X: torch.Tensor, Y: torch.Tensor
 ) -> torch.Tensor:
     """Eager Python nesting of the same tiling, for value assertions."""
-    b_tile_size, m_tile_size, k_tile_size = 1, 2, 3
+    b_tile_size, m_tile_size, k_tile_size = 1, 64, 64
     batches = []
     for b_start in range(0, X.shape[0], b_tile_size):
         x_b_tile = X[b_start : b_start + b_tile_size]
@@ -520,7 +520,7 @@ def sibling_nested_fn(X: torch.Tensor, Y: torch.Tensor) -> torch.Tensor:
             sibling_a_body,
             (x_tile, y_whole),
             dims=(-1, 0),
-            tile_size=3,
+            tile_size=64,
             init=torch.zeros(m_tile, N, device=X.device, dtype=X.dtype),
         )
 
@@ -533,19 +533,19 @@ def sibling_nested_fn(X: torch.Tensor, Y: torch.Tensor) -> torch.Tensor:
             sibling_b_body,
             (x_tile,),
             dims=(-1,),
-            tile_size=3,
+            tile_size=64,
             init=torch.zeros(m_tile, 1, device=X.device, dtype=X.dtype),
         )
 
         return None, partial_a + partial_b
 
-    _, out = for_each_tile(outer_body, (X, Y), dims=(0, None), tile_size=2, out_dim=0)
+    _, out = for_each_tile(outer_body, (X, Y), dims=(0, None), tile_size=64, out_dim=0)
     return out
 
 
 def sibling_nested_reference(X: torch.Tensor, Y: torch.Tensor) -> torch.Tensor:
     """Eager Python nesting of the same tiling, for value assertions."""
-    m_tile_size, k_tile_size = 2, 3
+    m_tile_size, k_tile_size = 64, 64
     rows = []
     for m_start in range(0, X.shape[0], m_tile_size):
         x_m_tile = X[m_start : m_start + m_tile_size]
@@ -594,7 +594,7 @@ def sibling_nested_stardep_fn(X: torch.Tensor, Y: torch.Tensor) -> torch.Tensor:
             sibling_a_body,
             (x_tile, y_whole),
             dims=(-1, 0),
-            tile_size=3,
+            tile_size=64,
             init=torch.zeros(m_tile, N, device=X.device, dtype=X.dtype),
         )
 
@@ -607,19 +607,19 @@ def sibling_nested_stardep_fn(X: torch.Tensor, Y: torch.Tensor) -> torch.Tensor:
             sibling_b_body,
             (x_tile,),
             dims=(-1,),
-            tile_size=3,
+            tile_size=64,
             init=torch.zeros(m_tile, 1, device=X.device, dtype=X.dtype),
         )
 
         return None, partial_a + partial_b
 
-    _, out = for_each_tile(outer_body, (X, Y), dims=(0, None), tile_size=2, out_dim=0)
+    _, out = for_each_tile(outer_body, (X, Y), dims=(0, None), tile_size=64, out_dim=0)
     return out
 
 
 def sibling_nested_stardep_reference(X: torch.Tensor, Y: torch.Tensor) -> torch.Tensor:
     """Eager Python nesting of the same tiling, for value assertions."""
-    m_tile_size, k_tile_size = 2, 3
+    m_tile_size, k_tile_size = 64, 64
     rows = []
     for m_start in range(0, X.shape[0], m_tile_size):
         x_m_tile = X[m_start : m_start + m_tile_size]
@@ -685,6 +685,75 @@ def online_softmax_fn(
     return acc / denom
 
 
+def nested_online_softmax_fn(
+    Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor
+) -> torch.Tensor:
+    """Map query rows around the carry-based online-softmax loop."""
+
+    def body(_, tiles):
+        (q_tile,) = tiles
+        return None, online_softmax_fn(q_tile, K, V)
+
+    _, out = for_each_tile(
+        body,
+        (Q,),
+        dims=(0,),
+        tile_size=64,
+        out_dim=0,
+    )
+    return out
+
+
+def batched_online_softmax_fn(
+    Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor
+) -> torch.Tensor:
+    """Map batches around an Lk carry, staging K/V in the outer loop."""
+
+    def batch_body(_, tiles):
+        q_batch, k_batch, v_batch = tiles
+
+        def kv_body(carry, kv_tiles):
+            running_max, denominator, accumulator = carry
+            k_tile, v_tile = kv_tiles
+            scores = q_batch @ k_tile.transpose(-1, -2)
+            new_max = torch.maximum(running_max, scores.amax(dim=-1, keepdim=True))
+            correction = torch.exp(running_max - new_max)
+            probabilities = torch.exp(scores - new_max)
+            return (
+                new_max,
+                denominator * correction + probabilities.sum(dim=-1, keepdim=True),
+                accumulator * correction + probabilities @ v_tile,
+            ), None
+
+        carry_shape = (*q_batch.shape[:-1], 1)
+        (_, denominator, accumulator), _ = for_each_tile(
+            kv_body,
+            (k_batch, v_batch),
+            dims=(-2, -2),
+            tile_size=SOFTMAX_TILE_SIZE,
+            init=(
+                torch.full(
+                    carry_shape,
+                    float("-inf"),
+                    device=Q.device,
+                    dtype=Q.dtype,
+                ),
+                torch.zeros(carry_shape, device=Q.device, dtype=Q.dtype),
+                torch.zeros_like(q_batch),
+            ),
+        )
+        return None, accumulator / denominator
+
+    _, out = for_each_tile(
+        batch_body,
+        (Q, K, V),
+        dims=(0, 0, 0),
+        tile_size=1,
+        out_dim=0,
+    )
+    return out
+
+
 def online_softmax_reference(
     Q: torch.Tensor,
     K: torch.Tensor,
@@ -717,6 +786,143 @@ def online_softmax_reference(
     naive = torch.softmax(Qf @ Kf.transpose(-1, -2), dim=-1) @ Vf
     torch.testing.assert_close(acc / denom, naive, atol=1e-2, rtol=1e-2)
     return acc / denom
+
+
+ROWS, COLS = 8, 16
+STICK_ROWS, STICK_COLS = 256, 128
+
+
+def pointwise_inputs(
+    rows: int = ROWS, cols: int = COLS
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """(a, b, c) fp32 CPU tensors of shape [rows, cols] for the pointwise fixtures."""
+    torch.manual_seed(0)
+    a = torch.randn(rows, cols)
+    b = torch.randn(rows, cols)
+    c = torch.randn(rows, cols)
+    return a, b, c
+
+
+def add_tiled_fn(A: torch.Tensor, B: torch.Tensor, tile_size: int) -> torch.Tensor:
+    """Map mode: tile dim 0 of a plain elementwise add. Simplest possible body."""
+
+    def body(_, ops):
+        a_tile, b_tile = ops
+        return None, a_tile + b_tile
+
+    _, out = for_each_tile(body, (A, B), dims=(0, 0), tile_size=tile_size, out_dim=0)
+    return out
+
+
+def add_tiled_reference(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
+    return A + B
+
+
+def abs_tiled_fn(A: torch.Tensor, tile_size: int) -> torch.Tensor:
+    """Map mode: tile dim 0 of a single-operand abs. No second operand at all."""
+
+    def body(_, ops):
+        (a_tile,) = ops
+        return None, a_tile.abs()
+
+    _, out = for_each_tile(body, (A,), dims=(0,), tile_size=tile_size, out_dim=0)
+    return out
+
+
+def abs_tiled_reference(A: torch.Tensor) -> torch.Tensor:
+    return A.abs()
+
+
+def abs_add_mul_tiled_fn(
+    A: torch.Tensor, B: torch.Tensor, C: torch.Tensor, tile_size: int
+) -> torch.Tensor:
+    """Map mode: 3-operand pointwise chain abs(a + b) * c, tiled along dim 0."""
+
+    def body(_, ops):
+        a_tile, b_tile, c_tile = ops
+        return None, (a_tile + b_tile).abs() * c_tile
+
+    _, out = for_each_tile(
+        body, (A, B, C), dims=(0, 0, 0), tile_size=tile_size, out_dim=0
+    )
+    return out
+
+
+def abs_add_mul_tiled_reference(
+    A: torch.Tensor, B: torch.Tensor, C: torch.Tensor
+) -> torch.Tensor:
+    return (A + B).abs() * C
+
+
+def softmax_row_tiled_fn(X: torch.Tensor, tile_size: int) -> torch.Tensor:
+    """Map mode: row-tile dim 0, softmax the (whole, untiled) last dim per tile.
+
+    Mirrors test_hint_softmax_row_tiling's HINT-driven equivalent
+    (test_coarse_tile_e2e.py): reduction lives entirely inside the tile body
+    on the untiled column dim, so a multi-stick tile_size exercises the same
+    per-tile device_size[1] invariant that test documents -- a bug that
+    shrinks the row-stride dimension corrupts all stick groups after the
+    first in each non-first tile, and only shows up once a tile spans more
+    than one stick's worth of columns.
+    """
+
+    def body(_, ops):
+        (x_tile,) = ops
+        return None, torch.softmax(x_tile, dim=-1)
+
+    _, out = for_each_tile(body, (X,), dims=(0,), tile_size=tile_size, out_dim=0)
+    return out
+
+
+def softmax_row_tiled_reference(X: torch.Tensor) -> torch.Tensor:
+    return torch.softmax(X, dim=-1)
+
+
+def nested_add_outer_row_inner_col_fn(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    outer_tile_size: int,
+    inner_tile_size: int,
+) -> torch.Tensor:
+    """Two-level pure map/map nesting: outer tiles dim 0, inner tiles dim 1.
+
+    Both levels are plain map mode (init=None) -- no carry at either level --
+    to keep this tier simpler than the carry-based nested fixtures above
+    (nested_split_m_then_k_fn, triple_nested_stardep_*). The outer loop's
+    per-row tile is itself for_each_tile-split along the (now 1-D) column
+    axis, so this drives dimension-provenance resolution across two levels
+    where each level owns a DIFFERENT dim of the original 2-D operands,
+    rather than the same dim revisited (map-then-carry) or a third batch dim
+    layered on top (triple-nested).
+    """
+
+    def outer_body(_, outer_ops):
+        a_row, b_row = outer_ops  # each [outer_tile_size, cols]
+
+        def inner_body(_, inner_ops):
+            a_col, b_col = inner_ops  # each [outer_tile_size, inner_tile_size]
+            return None, a_col + b_col
+
+        _, row_out = for_each_tile(
+            inner_body,
+            (a_row, b_row),
+            dims=(1, 1),
+            tile_size=inner_tile_size,
+            out_dim=1,
+        )
+        return None, row_out
+
+    _, out = for_each_tile(
+        outer_body, (A, B), dims=(0, 0), tile_size=outer_tile_size, out_dim=0
+    )
+    return out
+
+
+def nested_add_outer_row_inner_col_reference(
+    A: torch.Tensor, B: torch.Tensor
+) -> torch.Tensor:
+    """Eager Python nesting of the same two-level row/col tiling."""
+    return A + B
 
 
 PAGE_POOL, PAGE_BLOCKS, PAGE_SIZE, PAGE_HS, PAGE_LQ = 8, 4, 32, 64, 32
@@ -780,6 +986,76 @@ def paged_gather_reference(pages: torch.Tensor, q: torch.Tensor) -> torch.Tensor
     for p in PAGE_ORDER:
         page = pf[p]
         acc = acc + (qf @ page.transpose(0, 1)) @ page
+    return acc
+
+
+def paged_gather_kv_inputs() -> tuple[
+    torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+]:
+    """(k pages, v pages, block table, query) -- two pools, one shared index."""
+    torch.manual_seed(0)
+    k_pages = torch.randn(PAGE_POOL, PAGE_SIZE, PAGE_HS, dtype=torch.float16)
+    v_pages = torch.randn(PAGE_POOL, PAGE_SIZE, PAGE_HS, dtype=torch.float16)
+    q = torch.randn(PAGE_LQ, PAGE_HS, dtype=torch.float16)
+    table = torch.zeros(PAGE_BLOCKS, INT32_ELEMS_PER_STICK, dtype=torch.int32)
+    for i, page in enumerate(PAGE_ORDER):
+        table[i, 0] = page
+    return k_pages, v_pages, table, q
+
+
+def paged_gather_kv_fn(
+    k_pages: torch.Tensor,
+    v_pages: torch.Tensor,
+    table: torch.Tensor,
+    q: torch.Tensor,
+) -> torch.Tensor:
+    """paged_gather_fn with separate K and V pools -- ONE marker, TWO consumers.
+
+    The only structural difference from paged_gather_fn is the one that
+    matters to _consume_tile_dim_markers: the page index sliced out of the
+    tiled block table feeds two ``index_select``s (K's page and V's page)
+    instead of one, so the block table's single dim=0 tile_dim_marker ends up
+    with two consuming reads, both ComputedBuffer/MemoryDep-shaped. That is
+    exactly what spyre-inference's page_attn_kernel does, and the same
+    multi-ComputedBuffer-consumer shape softmax_row_tiled_fn reaches through
+    torch.softmax's amax/sub siblings -- reached here through a second real
+    consumer op rather than a decomposition, and with a per-trip advance on
+    the marker that a dropped consumer turns into wrong numerics.
+
+    Keeping K and V in separate matmuls (Q@K^T, then P@V) matters too: with
+    one shared pool, or with both gathers feeding a single elementwise
+    expression, Inductor fuses the two gathers into one pointwise
+    ComputedBuffer whose two identical marker deps dedupe to a single read --
+    which silently does not exercise the multi-consumer path at all.
+    """
+
+    def body(acc, tiles):
+        table_row, k_all, v_all, q_whole = tiles
+        page_idx = table_row[0, 0:1]
+        k_page = k_all.index_select(0, page_idx).squeeze(0)
+        v_page = v_all.index_select(0, page_idx).squeeze(0)
+        scores = q_whole @ k_page.transpose(0, 1)
+        return acc + scores @ v_page, None
+
+    acc0 = torch.zeros(PAGE_LQ, PAGE_HS, device=q.device, dtype=q.dtype)
+    final, _ = for_each_tile(
+        body,
+        (table, k_pages, v_pages, q),
+        dims=(0, None, None, None),
+        tile_size=1,
+        init=acc0,
+    )
+    return final
+
+
+def paged_gather_kv_reference(
+    k_pages: torch.Tensor, v_pages: torch.Tensor, q: torch.Tensor
+) -> torch.Tensor:
+    """The same accumulation in fp32 on CPU, looped in Python over PAGE_ORDER."""
+    kf, vf, qf = k_pages.float(), v_pages.float(), q.float()
+    acc = torch.zeros(PAGE_LQ, PAGE_HS)
+    for p in PAGE_ORDER:
+        acc = acc + (qf @ kf[p].transpose(0, 1)) @ vf[p]
     return acc
 
 

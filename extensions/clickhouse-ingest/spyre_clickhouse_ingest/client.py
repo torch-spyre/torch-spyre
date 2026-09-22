@@ -12,11 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""ClickHouse connection and v2 database/table presence.
-
-The v2 database is a NAME, not a second connection: one instance holds both generations, so a
-single client serves both provided every v2 statement is qualified.
-"""
+"""ClickHouse connection factory and the v2 table-presence gate."""
 
 import os
 
@@ -25,38 +21,97 @@ import clickhouse_connect
 from . import schema
 
 
-def get_client():
-    return clickhouse_connect.get_client(
-        host=os.environ["CLICKHOUSE_HOST"],
-        port=int(os.environ.get("CLICKHOUSE_PORT", 443)),
-        user=os.environ.get("CLICKHOUSE_USER", "default"),
-        password=os.environ["CLICKHOUSE_PASS"],
-        database=os.environ.get("CLICKHOUSE_DB", "spyre"),
-        secure=True,
-    )
+class ClickHouseEnv:
+    """The connection settings, read from the environment through one resolver."""
+
+    DEFAULT_PORT = "443"
+    DEFAULT_USER = "default"
+    DEFAULT_DB = "spyre"
+
+    @staticmethod
+    def get(name: str, default: str = "") -> str:
+        """An env var, treating BLANK as absent -- GHA exports an unset secret as ''."""
+        return (os.environ.get(name) or "").strip() or default
+
+    @classmethod
+    def host(cls) -> str:
+        """CLICKHOUSE_HOST, which has no default."""
+        return cls.get("CLICKHOUSE_HOST")
+
+    @classmethod
+    def port(cls) -> str:
+        """CLICKHOUSE_PORT as a raw string, so a non-numeric value can name itself."""
+        return cls.get("CLICKHOUSE_PORT", cls.DEFAULT_PORT)
+
+    @classmethod
+    def database(cls) -> str:
+        """CLICKHOUSE_DB, the connection's own database."""
+        return cls.get("CLICKHOUSE_DB", cls.DEFAULT_DB)
+
+    @classmethod
+    def secure(cls) -> bool:
+        """CLICKHOUSE_SECURE=0 drops to plain HTTP, to reach a local box with no TLS."""
+        return cls.get("CLICKHOUSE_SECURE", "1") not in ("0", "false", "no")
+
+    @classmethod
+    def target_database(cls) -> str:
+        """CLICKHOUSE_DB_V2: the v2 database NAME, or '' when v2 is not configured."""
+        return os.environ.get("CLICKHOUSE_DB_V2", "").strip()
+
+    @classmethod
+    def summary(cls) -> str:
+        """A host:port/database string, resolved exactly as the connection is."""
+        return f"{cls.host()}:{cls.port()}/{cls.database()}"
 
 
-def v2_database() -> str:
-    """The v2 database name, or "" when v2 is not configured.
+class ClickHouse:
+    """The one connection factory for every ingest, plus the v2 write gate."""
 
-    A NAME rather than a second connection: the same instance holds both generations, so one
-    client serves both provided every v2 statement is QUALIFIED. Qualifying is not optional --
-    `benchmark_runs` exists in both with incompatible shapes (v1 has run_id UInt64 +
-    source_file, v2 has run_id UUID and no source_file), so an unqualified name resolves
-    against whichever database the connection holds and silently hits the wrong table.
-    """
-    return os.environ.get("CLICKHOUSE_DB_V2", "").strip()
+    ENV = ClickHouseEnv
+
+    @classmethod
+    def connect(cls, *, verify: bool = True):
+        """Connect with the resolved settings; `verify=False` for an unverified cert."""
+        host = cls.ENV.host()
+        if not host:
+            raise SystemExit(
+                "CLICKHOUSE_HOST is unset or empty -- check the secrets mapping"
+            )
+        secure = cls.ENV.secure()
+        password = cls.ENV.get("CLICKHOUSE_PASS")
+        if not password and secure:
+            raise SystemExit(
+                "CLICKHOUSE_PASS is unset or empty -- check the secrets mapping"
+            )
+        port_raw = cls.ENV.port()
+        try:
+            port = int(port_raw)
+        except ValueError:
+            raise SystemExit(f"CLICKHOUSE_PORT is not a number: {port_raw!r}") from None
+        return clickhouse_connect.get_client(
+            host=host,
+            port=port,
+            user=cls.ENV.get("CLICKHOUSE_USER", cls.ENV.DEFAULT_USER),
+            password=password,
+            database=cls.ENV.database(),
+            secure=secure,
+            verify=verify,
+        )
+
+    @staticmethod
+    def tables_present(
+        client, db: str, tables=None, check_columns: bool = True
+    ) -> bool:
+        """The v2 write gate: every table (default: functional pair) has its columns."""
+        return all(
+            t.present(client, db, check_columns=check_columns)
+            for t in (tables or (schema.TestCases, schema.TestCaseRuns))
+        )
 
 
-def v2_tables_present(client, db: str) -> bool:
-    """v2 write path is skipped unless BOTH tables exist, so this script can be
-    deployed before the migration without erroring on every run.
-
-    Names come from the schema model, not string literals: this file is copied across the
-    product repos and the copies are compared for MEANING, so a hardcoded name here could
-    drift from the table it is meant to check while still looking correct.
-    """
-    return all(
-        bool(client.command(f"EXISTS TABLE {t.qualified(db)}"))
-        for t in (schema.TEST_CASES, schema.TEST_CASE_RUNS)
-    )
+# Function API, kept so installed consumers import one definition, not a copy.
+_env = ClickHouseEnv.get
+get_client = ClickHouse.connect
+client_summary = ClickHouseEnv.summary
+target_database = ClickHouseEnv.target_database
+tables_present = ClickHouse.tables_present

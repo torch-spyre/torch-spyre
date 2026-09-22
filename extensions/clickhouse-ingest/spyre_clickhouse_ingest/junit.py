@@ -17,85 +17,83 @@
 import uuid
 
 
-def extract_properties(tc_el):
-    props = []
-    props_el = tc_el.find("properties")
-    if props_el is None:
+class JUnitXml:
+    """Reads the parts of a JUnit document the ingests need."""
+
+    @staticmethod
+    def extract_properties(tc_el) -> list[tuple[str, str]]:
+        """The testcase's (name, value) property pairs, blank names dropped."""
+        props: list[tuple[str, str]] = []
+        props_el = tc_el.find("properties")
+        if props_el is None:
+            return props
+        for p in props_el.findall("property"):
+            name = p.get("name", "").strip()
+            value = p.get("value", "").strip()
+            if name:
+                props.append((name, value))
         return props
-    for p in props_el.findall("property"):
-        name = p.get("name", "").strip()
-        value = p.get("value", "").strip()
-        if name:
-            props.append((name, value))
-    return props
+
+    @staticmethod
+    def promote_xpass(raw_cases, suite_attrs) -> None:
+        """Relabel bare cases as xpass for the suite's non-strict xpass failures."""
+        failures = int(suite_attrs.get("failures", 0))
+        true_fail_raw = sum(1 for c in raw_cases if c["status"] in ("failed", "error"))
+        strict_xpass_raw = sum(1 for c in raw_cases if c["status"] == "xpass")
+        non_strict = max(0, failures - true_fail_raw - strict_xpass_raw)
+
+        promoted = 0
+        for c in raw_cases:
+            if promoted >= non_strict:
+                break
+            if c["_is_bare"]:
+                c["status"] = "xpass"
+                promoted += 1
 
 
-def promote_xpass(raw_cases, suite_attrs):
-    failures = int(suite_attrs.get("failures", 0))
-    true_fail_raw = sum(1 for c in raw_cases if c["status"] in ("failed", "error"))
-    strict_xpass_raw = sum(1 for c in raw_cases if c["status"] == "xpass")
-    non_strict = max(0, failures - true_fail_raw - strict_xpass_raw)
+class RunCoordinates:
+    """The CI coordinates a leg's run_id is threaded from or derived from."""
 
-    promoted = 0
-    for c in raw_cases:
-        if promoted >= non_strict:
-            break
-        if c["_is_bare"]:
-            c["status"] = "xpass"
-            promoted += 1
+    @staticmethod
+    def threaded_run_id(args) -> str:
+        """--run-id when it is a real UUID, else '' so the caller derives one."""
+        raw = (getattr(args, "run_id", "") or "").strip()
+        try:
+            return str(uuid.UUID(raw))
+        except (ValueError, AttributeError, TypeError):
+            return ""
 
-
-def _threaded_run_id(args) -> str:
-    """--run-id when it is a real UUID, else "" so the caller mints one.
-
-    The flag has always carried a Jenkins BUILD_NUMBER historically, which is not a UUID and
-    must not land in test_runs.run_id (a UUID column). Only a well-formed uuid is honoured.
-    """
-    raw = (getattr(args, "run_id", "") or "").strip()
-    try:
-        return str(uuid.UUID(raw))
-    except (ValueError, AttributeError, TypeError):
-        return ""
-
-
-# ---------------------------------------------------------------------------
-# ── Main ───────────────────────────────────────────────────────────────────
-# ---------------------------------------------------------------------------
-def _runner_run_id(args, run_id: str) -> str:
-    """This leg's own run id: --gha-run-id when GHA-dispatched, else the same uuid as run_id."""
-    raw = (getattr(args, "gha_run_id", "") or "").strip()
-    if raw:
+    @staticmethod
+    def gha_run_id(args) -> str:
+        """--gha-run-id when numeric, else '' -- non-numeric is not a GHA run."""
+        raw = (getattr(args, "gha_run_id", "") or "").strip()
         try:
             int(raw)
             return raw
         except (ValueError, TypeError):
-            pass
-    return run_id
+            return ""
 
+    @classmethod
+    def runner_run_id(cls, args, run_id: str) -> str:
+        """This leg's own id: --gha-run-id when GHA-dispatched, else the run uuid."""
+        return cls.gha_run_id(args) or run_id
 
-def v2_source_and_external_run_id(args, run_id: str):
-    """(source, external_run_id) for this leg, from whichever CI dispatched it.
-
-    A numeric --gha-run-id means GHA dispatched it. Otherwise the leg is
-    Jenkins-dispatched and its own externalizable id ('folder/job#123') is the run
-    coordinate -- the SAME value the orchestrator hashes on its side of the join, so
-    neither side has to thread a minted uuid.
-    `source` is required precisely because a GHA run id and a Jenkins build number
-    share a number space.
-
-    Only reached when no THREADED uuid was supplied -- see v2_run_id_for(), which prefers
-    --run-id and leaves this as the coordinate-hashing fallback.
-    """
-    gha = (getattr(args, "gha_run_id", "") or "").strip()
-    if gha:
-        try:
-            int(gha)
+    @classmethod
+    def source_and_external(cls, args, run_id: str) -> tuple:
+        """(source, external_run_id) for this leg, from whichever CI dispatched it."""
+        gha = cls.gha_run_id(args)
+        if gha:
             return "gha", gha
-        except (ValueError, TypeError):
-            pass
-    jenkins_key = (getattr(args, "jenkins_run_key", "") or "").strip()
-    if jenkins_key:
-        return "jenkins", jenkins_key
-    # No CI coordinate at all: fall back to the run uuid so the rows are still
-    # self-consistent and joinable WITHIN this ingest, just not to an artifact.
-    return "local", run_id
+        jenkins_key = (getattr(args, "jenkins_run_key", "") or "").strip()
+        if jenkins_key:
+            return "jenkins", jenkins_key
+        # No CI coordinate: rows stay joinable within this ingest, not to an artifact.
+        return "local", run_id
+
+
+# Function API, kept so installed consumers import one definition, not a copy.
+extract_properties = JUnitXml.extract_properties
+promote_xpass = JUnitXml.promote_xpass
+_threaded_run_id = RunCoordinates.threaded_run_id
+_runner_run_id = RunCoordinates.runner_run_id
+source_and_external_run_id = RunCoordinates.source_and_external

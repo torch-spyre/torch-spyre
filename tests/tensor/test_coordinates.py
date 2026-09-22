@@ -515,6 +515,67 @@ class TestCoordinates(TestCase):
             )
 
 
+class TestAlignTensorsStridedTerm(TestCase):
+    """A coordinate that steps over a device dim (``2*d1``) must keep the dim's
+    footprint exact (issue #4050).
+
+    ``h.view(B, L, H, D)[..., :64]`` on a ``[B, L, H*D]`` input reads the
+    stick-tile dim as ``2*d1``: one head is two sticks and the slice keeps one.
+    """
+
+    def _tensors(self, stick_coord):
+        d0, d1, d2 = sympy.symbols("d0 d1 d2", integer=True, nonnegative=True)
+        it_space = {d0: (sympy.Integer(8), 1), d1: (sympy.Integer(4), 1), d2: (64, 1)}
+        zero = sympy.S.Zero
+        inp = {"size": [8, 8, 1, 64], "coordinates": [d0, stick_coord(d1), zero, d2]}
+        out = {"size": [4, 1, 1, 8, 64], "coordinates": [d1, zero, zero, d0, d2]}
+        return (d0, d1, d2), it_space, inp, out
+
+    def test_stride_realized_as_gap_keeps_footprint(self):
+        (d0, d1, d2), it_space, inp, out = self._tensors(lambda d1: 2 * d1)
+        _, tensors, _ = align_tensors(it_space, [inp, out])
+        aligned_in = tensors[0]
+        # 8 rows x 8 sticks x 64: a stride-2 walk over 4 heads must not inflate
+        # the stick-tile dim to 8 iterations *and* add a gap of 2 (it did, and
+        # doubled the row stride so output row l read input row 2*l).
+        self.assertEqual(sympy.prod(aligned_in["size"]), 8 * 8 * 64)
+        sizes = [int(s) for s in aligned_in["size"]]
+        gap_idx = sizes.index(2)
+        self.assertEqual(sizes[gap_idx - 1], 4, "stick-tile dim counted in iterations")
+        self.assertEqual(aligned_in["coordinates"][gap_idx - 1], d1)
+        self.assertEqual(aligned_in["coordinates"][gap_idx], 0)
+
+    def test_stride_with_residual_offset_selects_gap_position(self):
+        """``2*d1 + 1`` (e.g. ``[..., 64:]`` or ``[:, 1::2]``) keeps the +1.
+
+        The residual is below the stride, so it cannot live on the variable's
+        own coordinate; it hangs off a synthetic size-1 variable in the gap dim,
+        the same way an elided dim with an offset is restored.
+        """
+        (d0, d1, d2), it_space, inp, out = self._tensors(lambda d1: 2 * d1 + 1)
+        new_it_space, tensors, _ = align_tensors(it_space, [inp, out])
+        aligned_in = tensors[0]
+        self.assertEqual(sympy.prod(aligned_in["size"]), 8 * 8 * 64)
+        sizes = [int(s) for s in aligned_in["size"]]
+        gap_coord = aligned_in["coordinates"][sizes.index(2)]
+        synthetic = gap_coord.free_symbols
+        self.assertEqual(len(synthetic), 1)
+        z = next(iter(synthetic))
+        self.assertEqual(gap_coord, z + 1)
+        self.assertEqual(new_it_space[z][0], 1)
+        # The other tensor gains a size-1 dim for the synthetic variable.
+        self.assertIn(z, {s for c in tensors[1]["coordinates"] for s in c.free_symbols})
+
+    def test_stride_not_dividing_dim_is_rejected(self):
+        d0, d1, d2 = sympy.symbols("d0 d1 d2", integer=True, nonnegative=True)
+        it_space = {d0: (8, 1), d1: (3, 1), d2: (64, 1)}
+        zero = sympy.S.Zero
+        inp = {"size": [8, 7, 1, 64], "coordinates": [d0, 2 * d1, zero, d2]}
+        out = {"size": [3, 1, 1, 8, 64], "coordinates": [d1, zero, zero, d0, d2]}
+        with self.assertRaisesRegex(Unsupported, "does not divide"):
+            align_tensors(it_space, [inp, out])
+
+
 class TestUnrepresentableStickCandidates(TestCase):
     """Cover the skip-unrepresentable-candidate behavior added for the
     ``floor(var/N)`` cross-stick crash (transpose feeding a matmul).

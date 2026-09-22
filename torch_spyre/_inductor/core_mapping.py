@@ -692,6 +692,46 @@ def derive_partition_mapping(
     }
 
 
+def distribute_aligned_split(split: int, bases: Sequence[int]) -> tuple[list[int], int]:
+    """Factor one loop dimension's ``split`` over its aligned segments.
+
+    ``align_tensors`` cuts a loop dimension into segments, listed innermost
+    first with their extents in ``bases``. The outermost segment takes
+    ``gcd(split, basis)`` first and passes the rest inward. Returns the factor
+    each segment receives, innermost first, and what is left undistributed.
+    """
+    factors = []
+    remaining = int(split)
+    for basis in reversed(bases):
+        factor = math.gcd(remaining, int(basis))
+        factors.append(factor)
+        remaining //= factor
+    factors.reverse()
+    return factors, remaining
+
+
+def aligned_split_keeps_blocks(split: int, bases: Sequence[int]) -> bool:
+    """Whether ``split`` still gives each core one contiguous block once aligned.
+
+    The scratchpad planner, and a consumer on the same division, take an
+    ``n``-way split of a dimension to mean ``n`` contiguous blocks. The
+    distribution in :func:`distribute_aligned_split` agrees only while every
+    segment outside the innermost split one is split whole. Otherwise the
+    split lands on an inner segment and interleaves the owners: a 2-way split
+    of ``d0 < 6`` cut into segments of extent 2 and 3 (a ``repeat`` read of
+    ``Mod(d0, 2)``) gives core 0 rows {0, 2, 4}, not {0, 1, 2}.
+    """
+    factors, remaining = distribute_aligned_split(split, bases)
+    if remaining != 1:
+        return False
+    split_inside = False
+    for factor, basis in zip(reversed(factors), reversed(bases)):
+        if split_inside and factor > 1:
+            return False
+        split_inside = split_inside or factor < int(basis)
+    return True
+
+
 def remap_work_division(
     division: TensorWorkDivision,
     dimension_remap: Mapping[Symbol, Sequence[tuple[Symbol, int]]],
@@ -699,7 +739,9 @@ def remap_work_division(
     """Express tensor ownership in an aligned iteration space.
 
     ``align_tensors`` may split one loop dimension into several dimensions. The
-    physical partition does not change; only the symbols used to describe it do.
+    physical partition does not change; only the symbols used to describe it
+    do. That holds only for a split that :func:`aligned_split_keeps_blocks`
+    admits, which the work-division constraints enforce upstream.
     """
 
     num_cores = division.physical_core_count
@@ -715,11 +757,12 @@ def remap_work_division(
             split_factors = [(new_dims[0][0], remaining_split)]
             remaining_split = 1
         else:
-            for new_dim, basis in reversed(new_dims):
-                factor = math.gcd(remaining_split, int(basis))
-                split_factors.append((new_dim, factor))
-                remaining_split //= factor
-            split_factors.reverse()
+            factors, remaining_split = distribute_aligned_split(
+                remaining_split, [basis for _, basis in new_dims]
+            )
+            split_factors = [
+                (new_dim, factor) for (new_dim, _), factor in zip(new_dims, factors)
+            ]
         if remaining_split != 1:
             raise ValueError(f"cannot normalize {split}-way split on {old_dim}")
 

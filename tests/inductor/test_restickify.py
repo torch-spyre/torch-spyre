@@ -33,7 +33,6 @@ from torch._inductor.virtualized import V
 from torch.spyre import SpyreTensorLayout
 
 import torch_spyre._inductor.optimize_restickify as _optimize_restickify
-from torch._inductor.exc import InductorError
 from torch_spyre._inductor import config
 from utils_inductor import _compile_and_run, compare_with_cpu
 
@@ -1212,18 +1211,12 @@ def test_amax_full_and_amax_live_maximum():
     _compare(f, t, optimal_cost=0)
 
 
-# ------- Unsupported stick configurations ---------
-
-
 def test_sparse_dense_pointwise():
     """a.sum(-1) + b - reduction followed by pointwise without broadcasting."""
-    a = torch.randn((S, S, S), dtype=torch.float16).to(DEVICE)
-    b = torch.randn((S, S), dtype=torch.float16).to(DEVICE)
+    a = torch.randn((S, S, S), dtype=torch.float16)
+    b = torch.randn((S, S), dtype=torch.float16)
 
-    with pytest.raises(
-        InductorError, match="No mechanism to gather elements from multiple sticks"
-    ):
-        _compare(lambda a, b: a.amin(-1) + b, a, b)
+    _compare(lambda a, b: a.min(-1)[0] + b, a, b, optimal_cost=16384)
 
 
 # ------- Restickify padding: strided input raises Unsupported ---------
@@ -2215,26 +2208,29 @@ def test_2d_sparse_broadcast_dense_pointwise():
     """a.sum(-1) + b - reduction output broadcast into pointwise with dense b."""
     a = torch.randn((S, S), dtype=torch.float16)
     b = torch.randn((S, S), dtype=torch.float16)
-    _compare(lambda a, b: a.amin(-1) + b, a, b, optimal_cost=S * S)
+    _compare(lambda a, b: a.amin(-1) + b, a, b, optimal_cost=S)
 
 
 def test_3d_sparse_broadcast_dense_pointwise():
     """a.sum(-1) + b - reduction output broadcast into pointwise with dense b."""
     a = torch.randn((S, S, S), dtype=torch.float16)
     b = torch.randn((S, S, S), dtype=torch.float16)
-    _compare(lambda a, b: a.amin(-1) + b, a, b, optimal_cost=S * S * S)
+    _compare(lambda a, b: a.amin(-1) + b, a, b, optimal_cost=S * S)
 
 
 def test_sparse_dense_pointwise_d0_stick():
     """a.sum(-1) + b where b has a d0 stick — verifies sparse detection with alt-dim candidate."""
 
-    a = torch.randn((S, S, S), dtype=torch.float16).to(DEVICE)
+    a = torch.randn((S, S, S), dtype=torch.float16)
+    b = torch.randn((S, S), dtype=torch.float16)
     b_layout = SpyreTensorLayout([S, S], [S, 1], torch.float16, [1, 0])
-    b = torch.randn((S, S), dtype=torch.float16).to(device_layout=b_layout)
-    with pytest.raises(
-        InductorError, match="No mechanism to gather elements from multiple sticks"
-    ):
-        _compare(lambda a, b: a.amin(-1) + b, a, b)
+
+    _compare(
+        lambda a, b: a.amin(-1)[0] + b,
+        a,
+        b,
+        device_args=[a.to(DEVICE), b.to(device_layout=b_layout)],
+    )
 
 
 def test_sparse_broadcast_dense_pointwise_d0_stick():

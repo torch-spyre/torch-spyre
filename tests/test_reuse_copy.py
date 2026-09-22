@@ -198,16 +198,36 @@ def test_several_tiers_in_one_call(ing):
 def test_executed_rows_are_stamped_with_this_run(ing):
     """`ran_in = run_id` is what makes "how much did we actually execute" answerable:
     countIf(props['ran_in'] = run_id). Without it every reuse copy inflates that count."""
-    # insert_v2 now lives in the shared library, so read it from there.
-    import spyre_clickhouse_ingest.v2_writer as writer
+    # insert_test_results (TestResultWriter.insert) lives in the shared library -- this
+    # calls it behaviourally rather than slicing source, so the assertion survives a
+    # refactor of the writer's internal shape.
+    from spyre_clickhouse_ingest import writer
 
-    src = pathlib.Path(writer.__file__).read_text()
-    insert_v2 = src[src.index("def insert_v2(") :]
-    # insert_v2 is the last function in the module, so there may be no following `def`.
-    nxt = insert_v2.find("\ndef ")
-    if nxt > 0:
-        insert_v2 = insert_v2[:nxt]
-    assert '"ran_in": run_id' in insert_v2
-    assert "source_file" in insert_v2, (
+    class _Rows:
+        result_rows: tuple = ()
+
+    class _FakeClient:
+        def __init__(self):
+            self.inserts = []
+
+        def insert(self, name, rows, column_names=None, database=None):
+            self.inserts.append((name, rows, column_names))
+
+        def query(self, sql, parameters=None):
+            return _Rows()
+
+    c = _FakeClient()
+    writer.insert_test_results(
+        c,
+        "db",
+        "torch-spyre",
+        "run-1",
+        [{"classname": "C", "name": "n", "status": "passed"}],
+        source_file="a.xml",
+    )
+    _name, rows, cols = next(i for i in c.inserts if i[0] == "test_case_runs")
+    props = rows[0][cols.index("props")]
+    assert props["ran_in"] == "run-1"
+    assert props["source_file"] == "a.xml", (
         "the shard discriminator must survive alongside it"
     )
