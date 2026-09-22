@@ -704,7 +704,7 @@ def test_ktir_stage_names_the_missing_bindings(tmp_path):
     with pytest.raises(SystemExit) as exc:
         _ktir_stage(tmp_path, available=False)
 
-    assert "uv sync --group ktir" in str(exc.value)
+    assert "tools/install-ktir.sh" in str(exc.value)
 
 
 def test_run_stage_compiles_through_the_emitter_that_built_the_spec():

@@ -115,7 +115,7 @@ def ktir_op_specs(name: str, ops: list, out_dir: str) -> list:
     if not dialect_available():
         raise SystemExit(
             "--stage ktir needs the mlir_ktdp bindings, which are not importable"
-            " here. Install them with `uv sync --group ktir`; nothing else in"
+            " here. Install them with `tools/install-ktir.sh`; nothing else in"
             " this script needs them."
         )
     os.makedirs(out_dir, exist_ok=True)

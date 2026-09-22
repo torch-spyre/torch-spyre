@@ -605,7 +605,7 @@ def main(argv=None) -> int:
             "note: --emitter ktir, but the mlir_ktdp bindings are not importable"
             "\n      here, so each kernel's KTIR emission raises ImportError and"
             "\n      the capture ends at the first one (exit 3). The scripts are"
-            "\n      still written. `uv sync --group ktir` installs the bindings."
+            "\n      still written. `tools/install-ktir.sh` installs the bindings."
         )
 
     failure = None

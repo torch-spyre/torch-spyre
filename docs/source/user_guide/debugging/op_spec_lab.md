@@ -150,7 +150,9 @@ diff the resulting `bundle.mlir`, and you are probing the backend directly.
 `--stage ktir` is the same stage for the other emitter: it writes
 `<kernel>.ktir` — the [KTDP-dialect MLIR](../../compiler/ktir.md) that
 `generate_ktir` produces from the same OpSpec list — and stops. It needs no
-device and no `dbo-opt`, only the `mlir_ktdp` bindings (`uv sync --group ktir`).
+device and no `dbo-opt`, only the `mlir_ktdp` bindings, which are a from-source
+build rather than a declared dependency: install them with
+`tools/install-ktir.sh`.
 
 A script captured on the default path cannot use it. The buffer names
 `generate_ktir` keys its register threading on are populated by
