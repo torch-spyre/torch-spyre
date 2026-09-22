@@ -582,6 +582,40 @@ class TestBuildingBlocks(unittest.TestCase):
         )
 
     @mock.patch(
+        "torch_spyre._inductor.decompositions._sdpa_kv_block_sizes",
+        new=lambda _: [64],
+    )
+    @config.patch(
+        {
+            "cpsat_time_limit_seconds": 30,
+        }
+    )
+    def test_noncontiguous_kv_prefix_keeps_one_tile_fallback(self):
+        """A declined direct read retains the contracted one-tile staging copy."""
+        copy_sizes = []
+
+        def decline_direct_read(_consumer, copy_op, _record):
+            copy_sizes.append(tuple(int(size) for size in copy_op.get_size()))
+            return None, "forced fallback for test"
+
+        with mock.patch(
+            "torch_spyre._inductor.read_copy_elision._prove_matmul_direct_read",
+            side_effect=decline_direct_read,
+        ) as prove:
+            self._run_granite_gqa_with_finite_broadcast_mask(
+                LQ=128,
+                LK=128,
+                kv_padding=64,
+            )
+
+        self.assertTrue(prove.called, "expected a direct-read proof attempt")
+        self.assertIn(
+            (1, 64, 1, 8, 128),
+            copy_sizes,
+            "the fallback was not the contracted one-Lk-tile staging buffer",
+        )
+
+    @mock.patch(
         "torch_spyre._inductor.decompositions._sdpa_query_tile_sizes",
         new=lambda _: [64],
     )

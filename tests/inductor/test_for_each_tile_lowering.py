@@ -35,6 +35,7 @@ For end-to-end compilation + numerical correctness against a CPU
 reference, see test_for_each_tile_e2e.py.
 """
 
+import operator
 import unittest
 from unittest import mock
 
@@ -78,6 +79,23 @@ class TestNestedForEachTileFixture(unittest.TestCase):
 
 
 class TestCarryBindingsFor(unittest.TestCase):
+    def test_fx_identity_detects_stride_repaired_passthrough_carry(self):
+        from torch_spyre._inductor.wsr.while_loop_bridge import (
+            _body_fx_carry_is_passthrough,
+        )
+
+        fx_graph = torch.fx.Graph()
+        carry = fx_graph.placeholder("carry")
+        xs = fx_graph.placeholder("xs")
+        updated = fx_graph.call_function(operator.add, (carry, 1))
+        fx_graph.output((updated, xs))
+
+        while_op = mock.Mock()
+        while_op.body_subgraph.graph.module = torch.fx.GraphModule({}, fx_graph)
+
+        self.assertFalse(_body_fx_carry_is_passthrough(while_op, 0))
+        self.assertTrue(_body_fx_carry_is_passthrough(while_op, 1))
+
     def test_one_carry_positional_match(self):
         from torch_spyre._inductor.wsr.while_loop_bridge import (
             CarryBinding,

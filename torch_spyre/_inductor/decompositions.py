@@ -1568,7 +1568,15 @@ def spyre__sdpa_overrideable(
         def body(_, tiles):
             return None, query_level(*tiles)
 
-        group_tile_size = gqa_group_size // max(1, tiling.num_group_tiles)
+        # A G-only loop does not reduce the sequence working set: when both
+        # sequence axes already fit in one tile, leave G visible to the normal
+        # work-division pass and avoid paying a serial map invocation per
+        # query-head group.  Nested prefill/decode plans still use the selected
+        # G split whenever either Lq or Lk is tiled.
+        num_group_tiles = (
+            tiling.num_group_tiles if tiling.num_q_tiles > 1 or num_kv_tiles > 1 else 1
+        )
+        group_tile_size = gqa_group_size // max(1, num_group_tiles)
         return map_tiles(body, operands, dims, group_tile_size, 2)
 
     def head_level(q_tile, k_tile, v_tile, *mask_tiles):

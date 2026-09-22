@@ -2008,6 +2008,10 @@ def _contract_exact_stride_input_materializations(
                     if sympy.simplify(size - trip_count) == 0
                     and sympy.simplify(stride - coefficient) == 0
                 ]
+                # Repeated extents/strides can make more than one producer
+                # axis fit the arithmetic.  The dependency then does not prove
+                # which axis the loop selects, so do not guess: retaining the
+                # full materialization is the correctness-preserving fallback.
                 if len(axes) != 1:
                     continue
                 axis = axes[0]
@@ -2060,6 +2064,9 @@ def _contract_exact_stride_input_materializations(
                     )
                     == 0
                 ]
+                # A chain link must identify exactly one matching local axis.
+                # Choosing the first of several matches could contract a
+                # different dimension and silently change the copied values.
                 if len(axes) != 1:
                     continue
                 selected[name] = (axes[0], sympy.S.Zero, False)
