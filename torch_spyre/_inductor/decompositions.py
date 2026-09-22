@@ -144,8 +144,8 @@ def _sdpa_num_head_tiles(num_heads: int) -> int:
 
 
 def _sdpa_num_batch_tiles(batch_size: int) -> int:
-    """Return the batch split count shared by lowering and the cost model."""
-    return max(1, batch_size // 2)
+    """Use at most two batch rows per exact ``for_each_tile`` tile."""
+    return batch_size // 2 if batch_size % 2 == 0 else batch_size
 
 
 def _sdpa_head_group_tiles(num_heads: int, num_kvheads: int) -> tuple[int, int]:
@@ -1021,7 +1021,12 @@ class _OPWrapper:
             return self._fn(*args, **kwargs)
         if self._compiled_fn is None:
             self._compiled_fn = torch.compile(self._fn, dynamic=False)
-        return self._compiled_fn(*args, **kwargs)
+        # ``scan`` lowers to a ``while_loop`` whose traced body extracts its
+        # scalar induction variable with ``item()``.  Eager PrivateUse1
+        # dispatch reaches that rewrite through this lazy compilation path,
+        # outside Dynamo's usual scalar-capture setup.
+        with torch._dynamo.config.patch(capture_scalar_outputs=True):
+            return self._compiled_fn(*args, **kwargs)
 
 
 def _register_spyre_dispatchkey_kernels_permanently():

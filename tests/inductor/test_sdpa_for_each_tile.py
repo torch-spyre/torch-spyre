@@ -412,11 +412,11 @@ class TestSDPAForEachTile(unittest.TestCase):
         )
         self.assertEqual(sum(source.count("LoopSpec(") for source in sources), 1)
 
-    def test_kv_loop_with_dense_bias_spyre(self):
+    def test_kv_loop_with_dense_bias_device(self):
         """The standalone Lk HOP works with a production-like dense bias."""
         self._check_kv_loop_spyre(broadcast_bias=False)
 
-    def test_gqa_kv_loop_with_dense_bias_spyre(self):
+    def test_gqa_kv_loop_with_dense_bias_device(self):
         """The Lk HOP preserves native GQA without repeating K and V."""
         batch, heads, groups, query_length, kv_length, head_dim = 1, 2, 2, 64, 256, 128
         torch.default_generator.manual_seed(0)
@@ -446,11 +446,11 @@ class TestSDPAForEachTile(unittest.TestCase):
         )
         self.assertEqual(sum(source.count("LoopSpec(") for source in sources), 1)
 
-    def test_kv_loop_with_broadcast_bias_spyre(self):
+    def test_kv_loop_with_broadcast_bias_device(self):
         """The standalone Lk HOP supports a stride-zero broadcast bias."""
         self._check_kv_loop_spyre(broadcast_bias=True)
 
-    def test_gqa_complete_tile_nest_spyre(self):
+    def test_gqa_complete_tile_nest_device(self):
         """The five-level GQA nest compiles and executes correctly."""
         batch, heads, groups, query_length, kv_length, head_dim = 2, 2, 2, 32, 256, 128
         torch.default_generator.manual_seed(0)
@@ -491,7 +491,7 @@ class TestSDPAForEachTile(unittest.TestCase):
         )
         self.assertEqual(sum(source.count("LoopSpec(") for source in sources), 5)
 
-    def test_two_nested_maps_spyre(self):
+    def test_two_nested_maps_device(self):
         """Two map-mode levels compile and execute after PR #4705."""
         x = torch.randn(128, 128, dtype=torch.float16)
 
@@ -526,7 +526,7 @@ class TestSDPAForEachTile(unittest.TestCase):
         )
         self.assertEqual(sum(source.count("LoopSpec(") for source in sources), 2)
 
-    def test_query_kv_nested_spyre(self):
+    def test_query_kv_nested_device(self):
         """An Lq map composes correctly with an Lk carry loop."""
         query = torch.randn(128, 128, dtype=torch.float16)
         key = torch.randn(256, 128, dtype=torch.float16)

@@ -25,6 +25,9 @@ _select_sdpa_tiling = sys.modules[
 _num_tiles_for_max_extent = sys.modules[
     "torch_spyre._inductor.decompositions"
 ]._num_tiles_for_max_extent
+_sdpa_num_batch_tiles = sys.modules[
+    "torch_spyre._inductor.decompositions"
+]._sdpa_num_batch_tiles
 
 
 class TestSDPATiling(unittest.TestCase):
@@ -118,6 +121,13 @@ class TestSDPATiling(unittest.TestCase):
         self.assertEqual(config.estimated_active_cores, 32)
         self.assertEqual(config.score_bytes_per_core, 192 * 1024)
         self.assertEqual(config.estimated_live_bytes_per_core, 1017344)
+
+    def test_batch_tiles_are_exact_for_odd_extents(self):
+        for batch_size, expected_tiles in ((1, 1), (2, 1), (3, 3), (4, 2), (7, 7)):
+            with self.subTest(batch_size=batch_size):
+                num_tiles = _sdpa_num_batch_tiles(batch_size)
+                self.assertEqual(num_tiles, expected_tiles)
+                self.assertEqual(batch_size % num_tiles, 0)
 
     def test_low_head_long_mha_uses_all_available_cores(self):
         for num_heads in (2, 4, 8):
