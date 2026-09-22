@@ -12,31 +12,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""CPU-only tests for the SDPA decomposition tiling cost model."""
+"""Tests for the SDPA decomposition and its tiling cost model."""
 
+import dataclasses
 import sys
 import unittest
+from unittest import mock
 
-import torch  # noqa: F401 - loads the registered Spyre backend entry point
+import torch
+import torch.nn.functional as F
+from torch._inductor.utils import run_and_get_code
 
-_select_sdpa_tiling = sys.modules[
-    "torch_spyre._inductor.decompositions"
-]._select_sdpa_tiling
-_axis_slice_is_dense = sys.modules[
-    "torch_spyre._inductor.decompositions"
-]._axis_slice_is_dense
-_sdpa_kv_candidates = sys.modules[
-    "torch_spyre._inductor.decompositions"
-]._sdpa_kv_candidates
-_sdpa_mask_hbm_bytes = sys.modules[
-    "torch_spyre._inductor.decompositions"
-]._sdpa_mask_hbm_bytes
-_num_tiles_for_max_extent = sys.modules[
-    "torch_spyre._inductor.decompositions"
-]._num_tiles_for_max_extent
-_sdpa_num_batch_tiles = sys.modules[
-    "torch_spyre._inductor.decompositions"
-]._sdpa_num_batch_tiles
+_decompositions = sys.modules["torch_spyre._inductor.decompositions"]
+_select_sdpa_tiling = _decompositions._select_sdpa_tiling
+_axis_slice_is_dense = _decompositions._axis_slice_is_dense
+_sdpa_kv_candidates = _decompositions._sdpa_kv_candidates
+_sdpa_mask_hbm_bytes = _decompositions._sdpa_mask_hbm_bytes
+_num_tiles_for_max_extent = _decompositions._num_tiles_for_max_extent
+_sdpa_num_batch_tiles = _decompositions._sdpa_num_batch_tiles
 
 
 class TestSDPATiling(unittest.TestCase):
@@ -659,6 +652,98 @@ class TestSDPATiling(unittest.TestCase):
                                 ),
                             )
                             self.assertGreaterEqual(config.estimated_load_bursts, 2)
+
+
+class TestSDPAForEachTileIntegration(unittest.TestCase):
+    def test_complete_gqa_tile_nest(self):
+        """The actual decomposition lowers B/Hkv/G/Lq maps around an Lk scan."""
+        batch = 2
+        query_heads = 4
+        kv_heads = 2
+        query_length = 32
+        kv_length = 256
+        head_dim = 128
+        generator = torch.Generator().manual_seed(0)
+        query = torch.randn(
+            batch,
+            query_heads,
+            query_length,
+            head_dim,
+            dtype=torch.float16,
+            generator=generator,
+        )
+        key = torch.randn(
+            batch,
+            kv_heads,
+            kv_length,
+            head_dim,
+            dtype=torch.float16,
+            generator=generator,
+        )
+        value = torch.randn(
+            batch,
+            kv_heads,
+            kv_length,
+            head_dim,
+            dtype=torch.float16,
+            generator=generator,
+        )
+        bias = (
+            torch.randn(
+                batch,
+                query_heads,
+                query_length,
+                kv_length,
+                dtype=torch.float16,
+                generator=generator,
+            )
+            * 0.01
+        )
+
+        def sdpa(q, k, v, b):
+            return F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                attn_mask=b,
+                dropout_p=0.0,
+                scale=head_dim**-0.5,
+                enable_gqa=True,
+            )
+
+        def force_every_loop(**kwargs):
+            selected = _select_sdpa_tiling(**kwargs)
+            return dataclasses.replace(
+                selected,
+                strategy="work_divided_tiled",
+                kv_block_size=128,
+                num_kv_blocks=2,
+                num_q_tiles=2,
+                q_tile_size=16,
+                num_batch_tiles=2,
+                num_head_tiles=2,
+                num_group_tiles=2,
+                kv_blocks_per_loop_group=2,
+            )
+
+        expected = sdpa(query, key, value, bias)
+        with mock.patch.object(
+            _decompositions,
+            "_select_sdpa_tiling",
+            side_effect=force_every_loop,
+        ):
+            actual, sources = run_and_get_code(
+                torch.compile(sdpa, backend="inductor", fullgraph=True, dynamic=False),
+                query.to("spyre"),
+                key.to("spyre"),
+                value.to("spyre"),
+                bias.to("spyre"),
+            )
+
+        torch.testing.assert_close(
+            actual.cpu().float(), expected.float(), atol=0.1, rtol=0.1
+        )
+        self.assertEqual(sum(source.count("LoopSpec(") for source in sources), 5)
 
 
 if __name__ == "__main__":

@@ -11,7 +11,7 @@ cost-model helpers from #4610. The full-HOP path contains no named-dimension
 hints.
 
 The nested-HOP correctness blockers found during the original experiment are
-fixed. The focused nine-case suite and the production SDPA tests pass on
+fixed. The focused full-nest regression and the production SDPA tests pass on
 Spyre. Fresh-cache Granite 3.3 8B and Gemma 4 26B A4B runs both complete
 chunked-prefill plus decode at 8K and 32K.
 
@@ -162,11 +162,17 @@ the resident Q2/K256 plan at both lengths.
 On upstream main `eaea0108` plus this branch:
 
 ```text
-tests/inductor/test_sdpa_tiling.py:                 29 passed, 142 subtests
-tests/inductor/test_sdpa_for_each_tile.py:           9 passed
+tests/inductor/test_sdpa_tiling.py:                 30 passed, 142 subtests
 focused production SDPA device tests:                7 passed
 pre-commit on all modified files:                    passed
 ```
+
+The focused integration regression forces all five B/Hkv/G/Lq/Lk loops through
+the actual SDPA decomposition, checks the generated LoopSpecs, and verifies the
+result against PyTorch. Generic map nesting, map-over-carry, ragged-tile
+rejection, and standalone Lk scans remain covered by the existing
+`for_each_tile` lowering/E2E suites and the production SDPA tests instead of
+being duplicated here.
 
 The production group covers the Lk-HOP structural check, Granite finite-mask
 decode, broadcast-mask prefill, direct and fallback non-contiguous KV-prefix
@@ -299,7 +305,6 @@ PR #4551 is rebased onto current upstream main, which contains both #4750 and
 
 ```bash
 python -m pytest -q tests/inductor/test_sdpa_tiling.py
-python -m pytest -q tests/inductor/test_sdpa_for_each_tile.py
 ```
 
 The E2E runs set `HF_HOME=/mnt/models/hf_cache` and invoke the adapter with
