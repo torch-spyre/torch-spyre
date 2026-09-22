@@ -1484,6 +1484,16 @@ def piecewise(*args):
     raise ValueError("piecewise(...) requires a catch-all True branch")
 
 
+def isinf(value) -> bool:
+    """``math.isinf``, symbolic-aware: ``True`` for a float infinity
+    or a sympy expression sympy can *decide* is infinite (``oo``, ``zoo``),
+    ``False`` for a finite value or an expression whose finiteness is
+    undecidable (``is_infinite`` is ``None``, e.g. a cost over symbolic splits)."""
+    if isinstance(value, sympy.Basic):
+        return value.is_infinite is True
+    return math.isinf(value)
+
+
 _PT_ROWS = 8  # PT block rows per corelet
 
 # Constants shared by the execution estimate and standalone split ranking.
@@ -1625,7 +1635,7 @@ def _matmul_split_cost(
     execution_us = _matmul_execution_cost(
         b_axis, m_axis, n_axis, k_axis, max_cores, shared_weight, include_hbm
     )
-    if execution_us == math.inf:
+    if isinf(execution_us):
         return execution_us
     (_, b), (M, m), (N, n), (K, k) = b_axis, m_axis, n_axis, k_axis
     cores_used = b * m * n * k
