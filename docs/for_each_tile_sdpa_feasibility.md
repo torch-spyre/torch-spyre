@@ -141,6 +141,21 @@ The prior upstream-main 8K measurement was 27.59 ms, so the current full-HOP
 8K kernel is 2.61x faster on the same tightly allocated input geometry. The
 main baseline was not recompiled for this update.
 
+PR #4550's smaller benchmark geometry is not directly comparable with the
+Granite rows above: it uses MHA with `H=2` and `Lq=64`, versus Granite's
+`Hq=32`, `Hkv=8`, and `Lq=512` (128x as many query-head rows). Re-running this
+branch with #4550's exact geometry, default CP-SAT/optimizing LX planning, and
+100 synchronized samples gives:
+
+| Lk | PR #4550 published median | This PR median | This PR compile + first |
+| ---: | ---: | ---: | ---: |
+| 8,192 | 0.734 ms | 0.466 ms | 6.20 s |
+| 32,768 | 2.406 ms | 1.112 ms | 6.40 s |
+
+Thus the full-HOP version is 36.5% faster at 8K and 53.8% faster at 32K on
+the same workload. The larger absolute Granite timings reflect the larger
+production workload, not a regression relative to #4550.
+
 The end-to-end runner reports two-token generation time. The cold invocation
 includes compilation; the warm invocation reuses the same-process compiled
 graphs. Both runs use Granite 3.3 8B with 512-token chunked prefill.
