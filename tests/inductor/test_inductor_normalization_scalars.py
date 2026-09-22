@@ -569,7 +569,9 @@ class TestModelScalarOperations:
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1731
         elif execution_mode == "compiled":
             pytest.xfail(
-                reason="Spyre: dxp_standalone SIGABRT in fused_bmm_transpose compilation"
+                reason=(
+                    "Spyre: backend compiler SIGABRT in fused_bmm_transpose compilation"
+                )
             )
 
         scale = 0.125

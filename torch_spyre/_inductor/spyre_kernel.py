@@ -817,21 +817,27 @@ class SpyreKernel(Kernel[CSEVariable]):
         if "lx" in tensor.layout.allocation and tensor.layout.lx_view is None:
             raise ValueError(f"LX buffer {name} has no physical ownership")
 
-        # Merge in WhileLoop-splice loop_var trip counts (e.g. u0) stashed on
-        # the current op's dim_hints -- self.indirect_sizes only accumulates
-        # entries from indirect_indexing() calls (gather/scatter), but a
-        # tiled per-iteration symbol needs the same {symbol: valid_range}
-        # treatment even though it is not an indirect access. See
-        # loop_var_ranges_from_dim_hints's docstring.
-        indirect_sizes = {
-            **self.indirect_sizes,
-            **loop_var_ranges_from_dim_hints(self.current_node.node),
-        }
+        # A WhileLoop-splice loop variable describes the address advance from
+        # one counted-loop trip to the next, not an in-tile iteration axis.
+        # Its advance is already explicit in loop_info (tiled_dims_per_read/
+        # output_tiled_dims or squeezed_advance_per_read/squeezed_advance_
+        # output, stamped by the WhileLoop-lowering pass -- see
+        # _general_tile_advance's docstring), which that method folds into
+        # device_tile_advance_expr below. Pin every splice loop_var to trip
+        # zero in the base coordinates so the raw unbacked symbol neither
+        # leaks into the OpSpec iteration space nor applies the same
+        # advance a second time.
+        device_tile_advance_expr = self._general_tile_advance(tensor, is_input, name)
+        loop_var_ranges = loop_var_ranges_from_dim_hints(operation)
+        base_index = sympy_subs(
+            tensor.index,
+            {loop_var: sympy.Integer(0) for loop_var in loop_var_ranges},
+        )
         device_coords = alignment_coordinates(
             tensor.layout.device_layout,
-            tensor.index,
+            base_index,
             it_space,
-            indirect_sizes,
+            self.indirect_sizes,
             repeat_info_out=self._alignment_repeat_info,
         )
         work_division = work_division_from_view(
@@ -840,7 +846,6 @@ class SpyreKernel(Kernel[CSEVariable]):
             device_coords,
             it_space,
         )
-        device_tile_advance_expr = self._general_tile_advance(tensor, is_input, name)
         tensor_arg = TensorArg(
             is_input,
             -1,
@@ -1052,6 +1057,9 @@ class SpyreKernel(Kernel[CSEVariable]):
             tiled_symbol_trip_counts=tiled_symbol_trip_counts,
             symbolic_dim_bounds=symbolic_dim_bounds,
             node_output_ranges=node_output_ranges,
+            completed_producer_cores=(
+                relayout_plans[0].completed_producer_cores if relayout_plans else ()
+            ),
             debug_handle=debug_handle,
         )
         # Finish the operation here, while its inputs and its node are live.
@@ -1439,11 +1447,13 @@ class SpyreKernel(Kernel[CSEVariable]):
                 "positional address binding."
             )
         if emit_pool_tensor:
+            device = V.graph.get_current_device_or_throw()
             wrapper.writeline(
                 f"{pool_var_name} = spyre_empty_with_layout("
                 f"({self.pool_size},), (1,), torch.uint8, "
                 f"SpyreTensorLayout(device_size=[{self.pool_size}], "
-                f"stride_map=[1], device_dtype=DataFormats.SENINT8))"
+                f"stride_map=[1], device_dtype=DataFormats.SENINT8), "
+                f"device=torch.device('{device}'))"
             )
             call_args.append(pool_var_name)
 
@@ -1616,6 +1626,10 @@ def _codegen_op_spec_list(specs, buf: IndentedBuffer, sympy_str) -> None:
                             sympy_str(r) + ", " for r in op_spec.node_output_ranges
                         )
                         + "),"
+                    )
+                if op_spec.completed_producer_cores:
+                    buf.writeline(
+                        f"completed_producer_cores={op_spec.completed_producer_cores!r},"
                     )
                 if op_spec.debug_handle is not None:
                     # Source-to-kernel provenance must survive the OpSpec ->

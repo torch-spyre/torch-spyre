@@ -1,0 +1,40 @@
+[project]
+name = "spyre-clickhouse-ingest"
+version = "0.1.0"
+description = "Shared schema-v2 ClickHouse schema, identity and write path for the Spyre CI ingests"
+readme = "README.md"
+requires-python = ">=3.11"
+# Deliberately NOT depending on torch_spyre: installing it to obtain a schema module would pull
+# torch/numpy/ortools, and ortools has no ppc64le/s390x wheel -- the ingest would break on p/z.
+# The ingest runtime is three wheels, and clickhouse-connect is the only one this package needs.
+dependencies = [
+    "clickhouse-connect>=1.3.0",
+    # hw_parse imports it: the repos forbid stdlib `re` (enforce-import-regex-instead-of-re), so a
+    # module here hard-imports `regex` and must declare it or the next consumer gets ImportError.
+    # Unlike ortools it ships ppc64le/s390x wheels, so this costs the p/z ingests nothing.
+    "regex",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
+
+# Named explicitly, not auto-discovered: `schema/` sits beside the package as a sibling
+# directory, and flat-layout autodiscovery counts it as a second top-level package and refuses
+# to build ("Multiple top-level packages discovered"). That breaks `pip install` outright,
+# including the `git+https://...#subdirectory=extensions/clickhouse-ingest` form the other repos
+# install with. The .sql files are data applied against a server, never imported.
+#
+# The DDL must travel with the installed package: apply_schema is the only thing that creates
+# these tables, and an install without the .sql files made it find zero of them and report
+# success. `schema` is therefore listed as a subpackage mapped from the sibling directory --
+# it holds no .py and is never imported, it is named here purely so the data installs.
+[tool.setuptools]
+packages = ["spyre_clickhouse_ingest", "spyre_clickhouse_ingest.schema"]
+
+[tool.setuptools.package-dir]
+"spyre_clickhouse_ingest.schema" = "schema"
+
+[tool.setuptools.package-data]
+"spyre_clickhouse_ingest.schema" = ["*.sql"]

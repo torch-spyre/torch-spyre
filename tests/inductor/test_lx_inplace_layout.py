@@ -43,7 +43,7 @@ import torch._inductor.config as inductor_config
 
 import torch_spyre._inductor.propagate_layouts as propagate_layouts
 from torch_spyre._inductor import config, spyre_hint
-from utils_inductor import DEVICE
+from utils_inductor import mock_backend_compiler, DEVICE
 
 _LAUNCH_JOBPLAN = "torch_spyre.execution.kernel_runner.launch_jobplan"
 _PREPARE_KERNEL = "torch_spyre.execution.kernel_runner.prepare_kernel"
@@ -83,6 +83,17 @@ def _capture_multi_arg_layouts(original):
 class TestLXInplaceLayout:
     """In-place layout promotion in _multi_arg_pointwise_layouts."""
 
+    def test_pointwise_dim_order_projection_handles_tiled_backing_axis(self):
+        project = propagate_layouts._project_pointwise_dim_order
+
+        assert project([0, 1, 2, 3], output_rank=4, input_rank=5) == [0, 1, 2, 3, 4]
+        assert project([2, 0, 1, 3], output_rank=4, input_rank=5) == [0, 3, 1, 2, 4]
+
+    def test_pointwise_dim_order_projection_keeps_broadcast_behavior(self):
+        project = propagate_layouts._project_pointwise_dim_order
+
+        assert project([2, 0, 1, 3], output_rank=4, input_rank=3) == [1, 0, 2]
+
     def test_add_reuses_matmul_input_layout(self):
         """The add in matmul(Q*scale, K.T) + mask reuses the matmul layout.
 
@@ -116,7 +127,7 @@ class TestLXInplaceLayout:
             ),
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
-            mock_patch("subprocess.run"),
+            mock_backend_compiler(),
         ):
             torch._dynamo.reset()
             cfn = torch.compile(spyre_fn, backend="inductor")

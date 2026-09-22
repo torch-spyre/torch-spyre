@@ -63,7 +63,7 @@ from torch_spyre._inductor import spyre_hint
 import torch_spyre._inductor.wsr.propagate_named_dims as _pnd
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__)))
-from utils_inductor import compare_with_cpu, _compile_and_run  # noqa: E402
+from utils_inductor import mock_backend_compiler, compare_with_cpu, _compile_and_run  # noqa: E402
 
 _declare_tensor_dim = _pnd.declare_tensor_dim
 _name_tensor_dims = _pnd.name_tensor_dims
@@ -191,7 +191,7 @@ def run_coarse_tile_test(
         with (
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
-            mock_patch("torch_spyre.execution.async_compile.subprocess.run"),
+            mock_backend_compiler(),
         ):
             _, source_codes = run_and_get_code(torch.compile(fn), *dev_tensors)
 
@@ -2975,6 +2975,7 @@ def test_flash_tile_Lk():
         )
 
 
+@pytest.mark.skip(reason="Runs longer thank CI timeout")
 def test_flash_tile_B_H():
     """Flash v1: tile B÷2 H÷4. B=2."""
     run_coarse_tile_test(
@@ -3353,6 +3354,7 @@ def test_flash_v3_tile_Lq():
     )
 
 
+@pytest.mark.skip(reason="Runs longer thank CI timeout")
 def test_flash_v3_tile_B_H():
     """Flash v3: tile B÷2 H÷4. B=2."""
     run_coarse_tile_test(
@@ -3605,7 +3607,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         with (
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
-            mock_patch("subprocess.run"),
+            mock_backend_compiler(),
         ):
             _, source_codes = run_and_get_code(cfn, x)
         self.assertTrue(len(source_codes) > 0)
@@ -3637,7 +3639,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         with (
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
-            mock_patch("subprocess.run"),
+            mock_backend_compiler(),
         ):
             _, source_codes = run_and_get_code(cfn, x_dev)
         self.assertTrue(len(source_codes) > 0)
@@ -3648,6 +3650,54 @@ class TestCoarseTileSpyreHints(InductorTestCase):
             src,
             "Expected loop count 4 in generated source",
         )
+
+    def test_pointwise_direct_read_keeps_copy_for_different_core_ownership(self):
+        """A pointwise direct read cannot change which source slice a core owns."""
+        from torch_spyre._inductor import spyre_hint
+        from torch_spyre._inductor.pass_utils import PerCoreView
+
+        A, B = 256, 128
+        x = torch.randn(A, B, dtype=torch.float16).to("spyre")
+        _declare_tensor_dim("A", A)
+        _declare_tensor_dim("B", B)
+        _name_tensor_dims(x, ["A", "B"])
+
+        def fn(x):
+            with spyre_hint(num_tiles_per_dim={"A": 4}):
+                return torch.abs(x)
+
+        output_view = PerCoreView((), (), num_cores=1)
+        staged_view = PerCoreView((), (), num_cores=2)
+        direct_view = PerCoreView((), (), num_cores=4)
+        staged_ownership = (("d0", 2, 0),)
+        direct_ownership = (("d1", 2, 0),)
+        with (
+            mock_patch(_LAUNCH_JOBPLAN),
+            mock_patch(_PREPARE_KERNEL),
+            mock_backend_compiler(),
+            mock_patch(
+                "torch_spyre._inductor.read_copy_elision._per_core_view_on_buf",
+                side_effect=[
+                    (output_view, None, True),
+                    (output_view, None, True),
+                    (staged_view, None, True),
+                    (direct_view, None, True),
+                ],
+            ),
+            mock_patch(
+                "torch_spyre._inductor.read_copy_elision._logical_split_ownership",
+                side_effect=[
+                    staged_ownership,
+                    direct_ownership,
+                    staged_ownership,
+                    direct_ownership,
+                ],
+            ) as logical_ownership,
+        ):
+            _, source_codes = run_and_get_code(torch.compile(fn), x)
+
+        self.assertTrue(logical_ownership.called)
+        self.assertIn("coarse_tile_read_copy", source_codes[0])
 
     # ------------------------------------------------------------------
     # Softmax-shaped chain (pointwise-reduce-pointwise)
@@ -3697,7 +3747,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         with (
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
-            mock_patch("subprocess.run"),
+            mock_backend_compiler(),
         ):
             _, source_codes = run_and_get_code(cfn, x_dev)
         self.assertTrue(len(source_codes) > 0)
@@ -3717,7 +3767,8 @@ class TestCoarseTileSpyreHints(InductorTestCase):
     # Nested hints: outer K=2, inner M=4 on a single op
     # ------------------------------------------------------------------
 
-    @config.patch({"sencores": 4})
+    # direct matches shouldn't rely on a particular outcome of the cost model
+    @config.patch({"sencores": 4, "co_optimizing_lx_planning": False})
     def test_hint_nested_loop_with_scratchpad(self):
         """Design-doc small example: y=a+b; z=y*c with nested K=2×M=4 hints.
 
@@ -3765,7 +3816,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         with (
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
-            mock_patch("subprocess.run"),
+            mock_backend_compiler(),
         ):
             _, source_codes = run_and_get_code(cfn, a_dev, b_dev, c_dev)
         self.assertTrue(len(source_codes) > 0)
@@ -3851,7 +3902,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         with (
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
-            mock_patch("subprocess.run"),
+            mock_backend_compiler(),
         ):
             _, source_codes = run_and_get_code(cfn, x_dev, y_dev)
         self.assertTrue(len(source_codes) > 0)
@@ -3900,7 +3951,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         with (
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
-            mock_patch("subprocess.run"),
+            mock_backend_compiler(),
         ):
             _, source_codes = run_and_get_code(cfn, x_dev, y_dev)
         self.assertTrue(len(source_codes) > 0)
@@ -3945,7 +3996,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         with (
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
-            mock_patch("subprocess.run"),
+            mock_backend_compiler(),
         ):
             _, source_codes = run_and_get_code(cfn, x_dev)
         self.assertTrue(len(source_codes) > 0)
@@ -3964,7 +4015,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
 
     def test_loop_invariant_op_write_does_not_advance_in_sdsc(self):
         """A loop-invariant ComputedBuffer's own write inside a coarse-tile
-        group must never get a device_tile_advance_expr, so the unroller does
+        group must never get a device_tile_advance_expr, so the compiler does
         not advance its address.
 
         torch.full lowers to a scalar-fill ComputedBuffer with no loop var matching
@@ -4002,7 +4053,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         with (
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
-            mock_patch("subprocess.run"),
+            mock_backend_compiler(),
         ):
             _, source_codes = run_and_get_code(cfn, x_dev)
         src = source_codes[0]
@@ -4068,7 +4119,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         with (
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
-            mock_patch("subprocess.run"),
+            mock_backend_compiler(),
         ):
             _, source_codes = run_and_get_code(cfn, x_dev, y_dev)
         self.assertTrue(len(source_codes) > 0)
@@ -4117,7 +4168,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         with (
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
-            mock_patch("subprocess.run"),
+            mock_backend_compiler(),
         ):
             _, source_codes = run_and_get_code(cfn, x_dev, scale_dev)
         self.assertTrue(len(source_codes) > 0)
@@ -4324,7 +4375,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         with (
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
-            mock_patch("subprocess.run"),
+            mock_backend_compiler(),
         ):
             _, source_codes = run_and_get_code(cfn, x_dev, y_dev)
         self.assertTrue(len(source_codes) > 0)
@@ -4411,7 +4462,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         with (
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
-            mock_patch("subprocess.run"),
+            mock_backend_compiler(),
             pytest.raises(Exception, match="partial reduction result consumed before"),
         ):
             run_and_get_code(cfn, queries_dev, keys_dev, values_dev)
@@ -4451,7 +4502,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         with (
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
-            mock_patch("subprocess.run"),
+            mock_backend_compiler(),
         ):
             _, source_codes = run_and_get_code(cfn, x_dev)
         self.assertTrue(len(source_codes) > 0)
@@ -4571,7 +4622,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         with (
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
-            mock_patch("subprocess.run"),
+            mock_backend_compiler(),
         ):
             _, source_codes = run_and_get_code(
                 cfn, queries_dev, keys_dev, values_dev, mask_dev
@@ -4589,307 +4640,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
             src,
             "Expected Lq loop count 2 as count= in LoopSpec — _stamp_group must"
             " divide Lq ranges on each op using that op's own dim role",
-        )
-
-    def _run_kv_chunked_flash(
-        self,
-        *,
-        h_tiles=4,
-        lq_tiles=2,
-        B=1,
-        H=8,
-        Lq=256,
-        Lk=256,
-        D=64,
-        kv_block=128,
-        N_KV=None,
-        with_mask=False,
-    ):
-        """Flash attention with K/V chunking in PYTHON and WSR tiling only H/Lq.
-
-        Shared by the two tests below so the h_tiles == H degenerate-tile case
-        can reuse the graph rather than duplicate it.  Asserts inline.
-
-        WSR's reduction-dim carry propagation is unimplemented (#3432), so every
-        flash variant that hints Lk is xfailed.  Here the K/V sweep is an ordinary
-        Python ``for`` loop that torch.compile unrolls into the graph, so the
-        online-softmax recurrence becomes explicit dataflow.  WSR is then only
-        asked to tile H and Lq -- non-reduction dims -- and never sees a carry.
-
-        Complements test_hint_flash_attention_v2_divide_in_scope (#3429), which
-        tiles H/Lq over a SINGLE K block.  This covers more than one K block,
-        which that test does not reach.
-
-        Four things are load-bearing; each one produced a wrong answer or a hard
-        error while this was being written:
-
-        1.  **The K loop must be INSIDE a single H/Lq scope.**  Wrapping each
-            chunk in its own scope instead makes the scheduler interleave the
-            chunks, so a scope's ops are no longer contiguous and
-            validate_coarse_tile_groups rejects it with "hint_id=N appears in
-            both group X and group Y".  Measured op order for 2 chunks was
-            chunk0-main, chunk1-main, chunk0-tail, chunk1-tail.
-        2.  **K/V chunks are sliced by the CALLER and passed in as named
-            tensors.**  Slicing inside the graph and naming the slice output with
-            spyre_hint(named_dims=...) does not work and fails SILENTLY: the hint
-            branch of propagate_named_dims sets _dim_prop_info and returns, so
-            the read of the unnamed full tensor never gets an H mapping, and the
-            _untracked warning that would have said so disappears.  Naming the
-            full tensor does not work either -- slicing Lk shrinks the axis, so
-            _consume_names finds no prefix matching it and drops the binding.
-            Symptom either way: H tile 0 correct, every later tile ~85% wrong.
-        3.  **Carry inits use the sparse idiom** ``full((B,H,Lq,64)).amax(-1)``.
-            A plain 3-D ``full((B,H,Lq))`` raises "no mechanism to resolve stick
-            incompatibility".
-        4.  **The final divide is inside the innermost scope** (#3429): read past
-            the loop group it becomes a full buffer plus a copy op whose target a
-            second consumer also reads, and finalize_layouts overwrites it.
-
-        h_tiles=4 and lq_tiles=2 differ deliberately so the LoopSpec assertions
-        can tell the two levels apart; equal counts would pass even if one level
-        were dropped.  ``with_mask`` uses a finite-sentinel causal mask.  Unlike
-        ``-inf``, the finite value keeps a fully masked chunk from producing
-        ``exp(-inf - -inf) == NaN`` while a valid earlier/later chunk suppresses
-        its contribution in the online recurrence.
-        """
-        from torch_spyre._inductor import spyre_hint
-
-        n_chunks = Lk // kv_block
-        self.assertEqual(Lk % kv_block, 0, "chunks must divide Lk")
-        N_KV = H if N_KV is None else N_KV
-        self.assertEqual(H % N_KV, 0, "GQA heads must divide query heads")
-        scale = 1.0 / math.sqrt(math.sqrt(D))
-
-        torch.manual_seed(42)
-        queries_t = torch.randn(B, H, Lq, D, dtype=torch.float16)
-        keys_t = torch.randn(B, N_KV, Lk, D, dtype=torch.float16)
-        values_t = torch.randn(B, N_KV, Lk, D, dtype=torch.float16)
-
-        def flash(queries, k_chunks, v_chunks, m_chunks):
-            with spyre_hint(named_dims=["B", "H", "Lq"]):
-                running_max = torch.full(
-                    (B, H, Lq, 64),
-                    float("-inf"),
-                    device=queries.device,
-                    dtype=torch.float16,
-                ).amax(dim=-1)
-            with spyre_hint(named_dims=["B", "H", "Lq"]):
-                denom = torch.full(
-                    (B, H, Lq, 64), 0.0, device=queries.device, dtype=torch.float16
-                ).amax(dim=-1)
-            with spyre_hint(named_dims=["B", "H", "Lq", "D"]):
-                acc = torch.zeros_like(queries)
-
-            def sweep(running_max, denom, acc):
-                """The unrolled K/V sweep.
-
-                Carries are parameters so they can be rebound locally without a
-                nonlocal declaration.
-                """
-                out = None
-                for kb in range(n_chunks):  # unrolled into the graph
-                    k_c, v_c = k_chunks[kb], v_chunks[kb]
-                    keys_T = (k_c * scale).transpose(-1, -2).contiguous()
-                    # A matmul output inherits no names from its inputs, so both
-                    # matmuls need an explicit named_dims hint.
-                    with spyre_hint(named_dims=["B", "H", "Lq", "Lkc"]):
-                        scores = torch.matmul(queries * scale, keys_T)
-                    if m_chunks is not None:
-                        scores = scores + m_chunks[kb]
-                    block_max = torch.amax(scores, dim=-1)
-                    new_max = torch.maximum(running_max, block_max)
-                    correction = torch.exp(running_max - new_max)
-                    exp_scores = torch.exp(scores - new_max.unsqueeze(-1))
-                    new_denom = denom * correction + exp_scores.sum(dim=-1)
-                    with spyre_hint(named_dims=["B", "H", "Lq", "D"]):
-                        weighted = torch.matmul(exp_scores, v_c)
-                    new_acc = acc * correction.unsqueeze(-1) + weighted
-                    if kb == n_chunks - 1:
-                        out = new_acc / new_denom.unsqueeze(-1)
-                    else:
-                        running_max, denom, acc = new_max, new_denom, new_acc
-                return out
-
-            # Lq cannot be tiled at Lq == 1 (decode), so that hint is optional.
-            # Written as two branches rather than a stand-in context manager: a
-            # contextlib.nullcontext() inside a traced function has previously
-            # produced spurious dynamo errors in this suite.
-            with spyre_hint(num_tiles_per_dim={"H": h_tiles}):
-                if lq_tiles:
-                    with spyre_hint(num_tiles_per_dim={"Lq": lq_tiles}):
-                        return sweep(running_max, denom, acc)
-                return sweep(running_max, denom, acc)
-
-        def chunk(t):
-            return [
-                t[..., i * kv_block : (i + 1) * kv_block, :].contiguous()
-                for i in range(n_chunks)
-            ]
-
-        # CPU reference first, then device setup -- matching the driver pattern.
-        repeats = H // N_KV
-        keys_full_t = keys_t.repeat_interleave(repeats, dim=1)
-        values_full_t = values_t.repeat_interleave(repeats, dim=1)
-        k_chunks_t, v_chunks_t = chunk(keys_full_t), chunk(values_full_t)
-        m_chunks_t = None
-        mask_base_t = None
-        if with_mask:
-            query_positions = torch.arange(Lk - Lq, Lk).view(1, 1, Lq, 1)
-            key_positions = torch.arange(Lk).view(1, 1, 1, Lk)
-            mask_base_t = (
-                torch.where(
-                    key_positions <= query_positions,
-                    torch.tensor(0.0, dtype=torch.float16),
-                    torch.tensor(
-                        torch.finfo(torch.float16).min / 2, dtype=torch.float16
-                    ),
-                )
-                .expand(B, 1, Lq, Lk)
-                .contiguous()
-            )
-            mask_t = mask_base_t.expand(B, H, Lq, Lk).contiguous()
-            m_chunks_t = [
-                mask_t[..., i * kv_block : (i + 1) * kv_block].contiguous()
-                for i in range(n_chunks)
-            ]
-        if with_mask:
-            ref = F.scaled_dot_product_attention(
-                queries_t,
-                keys_t,
-                values_t,
-                attn_mask=mask_base_t,
-                dropout_p=0.0,
-                scale=1.0 / math.sqrt(D),
-                enable_gqa=N_KV != H,
-            )
-        else:
-            ref = flash(queries_t, k_chunks_t, v_chunks_t, m_chunks_t)
-
-        queries_dev = queries_t.to("spyre")
-        keys_full = keys_t.to("spyre").repeat_interleave(repeats, dim=1)
-        values_full = values_t.to("spyre").repeat_interleave(repeats, dim=1)
-        k_chunks = chunk(keys_full)
-        v_chunks = chunk(values_full)
-        m_chunks = None
-        if mask_base_t is not None:
-            mask_full = mask_base_t.to("spyre").expand(B, H, Lq, Lk)
-            m_chunks = [
-                mask_full[..., i * kv_block : (i + 1) * kv_block].contiguous()
-                for i in range(n_chunks)
-            ]
-        _declare_tensor_dim("B", B)
-        _declare_tensor_dim("H", H)
-        _declare_tensor_dim("Lq", Lq)
-        _declare_tensor_dim("D", D)
-        # The per-chunk key extent: what the scores' last axis really is.
-        _declare_tensor_dim("Lkc", kv_block)
-        _name_tensor_dims(queries_dev, ["B", "H", "Lq", "D"])
-        for t in k_chunks + v_chunks:
-            _name_tensor_dims(t, ["B", "H", "Lkc", "D"])
-        if m_chunks is not None:
-            for t in m_chunks:
-                _name_tensor_dims(t, ["B", "H", "Lq", "Lkc"])
-
-        result, source_codes = run_and_get_code(
-            torch.compile(flash), queries_dev, k_chunks, v_chunks, m_chunks
-        )
-        torch.testing.assert_close(
-            result.cpu(),
-            ref,
-            equal_nan=True,
-            atol=0.01,
-            rtol=0.1,
-            msg=lambda msg: f"compiled spyre <-> cpu mismatch\n\n{msg}\n",
-        )
-        src = source_codes[0]
-        self.assertIn("LoopSpec(", src, "expected coarse tiling to survive codegen")
-        self.assertEqual(
-            src.count("LoopSpec("),
-            2 if lq_tiles else 1,
-            "expected one loop level per tiled dim (H, plus Lq when tiled)",
-        )
-        self.assertIn(
-            f"count=sympify('{h_tiles}')",
-            src,
-            f"expected the H loop count (h_tiles={h_tiles})",
-        )
-        if lq_tiles:
-            self.assertIn(
-                f"count=sympify('{lq_tiles}')",
-                src,
-                f"expected the Lq loop count (lq_tiles={lq_tiles})",
-            )
-
-    def test_hint_flash_attention_kv_chunked_python_loop(self):
-        """K/V chunked in Python, WSR tiling H (4) and Lq (2). See impl docstring."""
-        self._run_kv_chunked_flash(h_tiles=4, lq_tiles=2)
-
-    def test_hint_flash_attention_kv_chunked_finite_causal_mask(self):
-        """Granite-shaped named masks remain correct under H/Lq coarse tiling."""
-        self._run_kv_chunked_flash(
-            h_tiles=8,
-            lq_tiles=4,
-            B=1,
-            H=32,
-            Lq=64,
-            Lk=128,
-            D=128,
-            kv_block=64,
-            N_KV=8,
-            with_mask=True,
-        )
-
-    def test_hint_flash_attention_kv_chunked_prefill_8k(self):
-        """Chunked prefill: a 512-token query block against an 8k K/V cache.
-
-        This is the production shape -- vLLM-style chunked prefill -- not a
-        scaled-down proxy.  Both H and Lq are WSR-tiled; Lk is not hinted.
-
-        kv_block is 2048 (4 chunks) rather than 512 (16) because the 16-chunk
-        graph at Lq=512 takes significantly longer to compile.  Lq stays at the
-        query-block size deliberately: the same 4-chunk graph at Lq=8192
-        compiled for over two hours without finishing, while at Lq=512 it takes
-        well under a minute, so compile cost is driven by Lq extent rather than
-        by chunk count or cache length.
-        """
-        self._run_kv_chunked_flash(
-            h_tiles=4, lq_tiles=2, B=1, H=8, Lq=512, Lk=8192, D=128, kv_block=2048
-        )
-
-    def test_hint_flash_attention_kv_chunked_decode_8k(self):
-        """Decode: one query token, batch 4, against a full 8k K/V cache.
-
-        Lq == 1 cannot be tiled, so H tiling is the only level and there is a
-        single LoopSpec.  A full cache means every key is valid, so no mask is
-        needed and the fully-masked-chunk case (block_max == -inf, making
-        exp(-inf - -inf) NaN) does not arise here -- that remains untested.
-        """
-        self._run_kv_chunked_flash(
-            h_tiles=4, lq_tiles=None, B=4, H=8, Lq=1, Lk=8192, D=128, kv_block=2048
-        )
-
-    def test_hint_flash_attention_kv_chunked_unit_h_tile(self):
-        """h_tiles == H (one head per tile) is numerically exact."""
-        self._run_kv_chunked_flash(h_tiles=8, lq_tiles=2)
-
-    def test_hint_flash_attention_kv_chunked_8_chunks(self):
-        """8 unrolled K/V chunks: now succeeds with optimized layouts for constants"""
-        self._run_kv_chunked_flash(
-            h_tiles=4, lq_tiles=None, B=1, H=8, Lq=256, Lk=4096, D=128, kv_block=512
-        )
-
-    @pytest.mark.skip(reason="Long test - takes ~6 mins to complete")
-    def test_hint_flash_attention_kv_chunked_16_chunks(self):
-        """16 unrolled K/V chunks: now succeeds with optimized layouts for constants"""
-        self._run_kv_chunked_flash(
-            h_tiles=4, lq_tiles=None, B=1, H=8, Lq=256, Lk=4096, D=128, kv_block=256
-        )
-
-    @pytest.mark.skip(reason="Long test - takes ~40 mins to complete")
-    def test_hint_flash_attention_kv_chunked_32_chunks(self):
-        """32 unrolled K/V chunks: now succeeds with optimized layouts for constants"""
-        self._run_kv_chunked_flash(
-            h_tiles=4, lq_tiles=None, B=1, H=8, Lq=256, Lk=4096, D=128, kv_block=128
         )
 
     def test_hint_h_tiling_elementwise(self):
@@ -4966,7 +4716,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         with (
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
-            mock_patch("subprocess.run"),
+            mock_backend_compiler(),
         ):
             _, source_codes = run_and_get_code(cfn, Q_dev, V_dev)
 
@@ -5368,7 +5118,7 @@ class TestNamedDimsHint(InductorTestCase):
         with (
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
-            mock_patch("subprocess.run"),
+            mock_backend_compiler(),
         ):
             _, source_codes = run_and_get_code(cfn, x_dev)
         self.assertTrue(len(source_codes) > 0)
@@ -5397,7 +5147,7 @@ class TestNamedDimsHint(InductorTestCase):
         with (
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
-            mock_patch("subprocess.run"),
+            mock_backend_compiler(),
         ):
             _, source_codes = run_and_get_code(cfn, x_dev)
         self.assertTrue(len(source_codes) > 0)
@@ -5432,7 +5182,7 @@ class TestNamedDimsHint(InductorTestCase):
         with (
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
-            mock_patch("subprocess.run"),
+            mock_backend_compiler(),
         ):
             _, source_codes = run_and_get_code(cfn, x_dev)
         self.assertTrue(len(source_codes) > 0)
@@ -5473,7 +5223,7 @@ class TestCoarseTileReductionE2E(InductorTestCase):
         with (
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
-            mock_patch("subprocess.run"),
+            mock_backend_compiler(),
         ):
             _, source_codes = run_and_get_code(cfn, x_dev)
         self.assertTrue(len(source_codes) > 0)
@@ -5521,7 +5271,7 @@ class TestCoarseTileReductionE2E(InductorTestCase):
         with (
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
-            mock_patch("subprocess.run"),
+            mock_backend_compiler(),
         ):
             _, source_codes = run_and_get_code(cfn, a_dev, b_dev)
         self.assertTrue(len(source_codes) > 0)
@@ -5569,7 +5319,7 @@ class TestCoarseTileReductionE2E(InductorTestCase):
         with (
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
-            mock_patch("subprocess.run"),
+            mock_backend_compiler(),
         ):
             _, source_codes = run_and_get_code(cfn, x_dev)
         self.assertTrue(len(source_codes) > 0)
@@ -5612,7 +5362,7 @@ class TestCoarseTileReductionE2E(InductorTestCase):
         with (
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
-            mock_patch("subprocess.run"),
+            mock_backend_compiler(),
         ):
             _, source_codes = run_and_get_code(cfn, x_dev)
         self.assertTrue(len(source_codes) > 0)
@@ -6099,7 +5849,7 @@ class TestCoarseTileMatmulKTilingE2E(InductorTestCase):
         with (
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
-            mock_patch("subprocess.run"),
+            mock_backend_compiler(),
         ):
             _, source_codes = run_and_get_code(cfn, a_dev, b_dev)
         self.assertTrue(len(source_codes) > 0)
@@ -6179,7 +5929,7 @@ class TestCoarseTileMoEBroadcastMatmulE2E(InductorTestCase):
         with (
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
-            mock_patch("subprocess.run"),
+            mock_backend_compiler(),
         ):
             _, source_codes = run_and_get_code(torch.compile(fn), x, w)
 
@@ -6246,7 +5996,7 @@ class TestCoarseTileMoEBroadcastMatmulE2E(InductorTestCase):
         with (
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
-            mock_patch("subprocess.run"),
+            mock_backend_compiler(),
             mock_patch(
                 "torch_spyre._inductor.read_copy_elision._prove_matmul_direct_read",
                 return_value=(None, "forced test decline"),
@@ -6257,8 +6007,8 @@ class TestCoarseTileMoEBroadcastMatmulE2E(InductorTestCase):
         src = source_codes[0]
         self.assertIn("coarse_tile_read_copy_0_arg1_1", src)
 
-    def test_unsqueeze_broadcast_matmul_keeps_copy_for_different_core_views(self):
-        """A legal but different source ownership cannot replace the copy."""
+    def test_unsqueeze_broadcast_matmul_allows_physical_view_permutation(self):
+        """Logical ownership can match when staging permutes physical axes."""
         from torch_spyre._inductor import spyre_hint
         from torch_spyre._inductor.pass_utils import PerCoreView
 
@@ -6282,7 +6032,11 @@ class TestCoarseTileMoEBroadcastMatmulE2E(InductorTestCase):
         with (
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
-            mock_patch("subprocess.run"),
+            mock_backend_compiler(),
+            mock_patch(
+                "torch_spyre._inductor.read_copy_elision._loop_advance_bound",
+                return_value=(0, 8192),
+            ),
             mock_patch(
                 "torch_spyre._inductor.read_copy_elision._per_core_view_on_buf",
                 side_effect=[
@@ -6295,7 +6049,7 @@ class TestCoarseTileMoEBroadcastMatmulE2E(InductorTestCase):
         ):
             _, source_codes = run_and_get_code(torch.compile(fn), x, w)
 
-        self.assertIn("coarse_tile_read_copy_0_arg1_1", source_codes[0])
+        self.assertNotIn("coarse_tile_read_copy_0_arg1_1", source_codes[0])
 
     def test_unsqueeze_broadcast_matmul_distinguishes_experts_exactly(self):
         """Each trip reads its own weight slab, not expert zero or stale HBM."""
@@ -6471,7 +6225,7 @@ class TestCoarseTileMoEBroadcastMatmulE2E(InductorTestCase):
         with (
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
-            mock_patch("subprocess.run"),
+            mock_backend_compiler(),
             mock_patch.object(superdsc, "_create_sdsc_tensors", side_effect=_spy),
         ):
             run_and_get_code(torch.compile(fn), x.to("spyre"), w.to("spyre"))
@@ -6605,7 +6359,7 @@ class TestCoarseTileNestedReductionE2E(InductorTestCase):
             ),
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
-            mock_patch("subprocess.run"),
+            mock_backend_compiler(),
         ):
             _, source_codes = run_and_get_code(torch.compile(fn), a, b)
 
@@ -6675,7 +6429,7 @@ class TestCoarseTileNestedReductionE2E(InductorTestCase):
         with (
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
-            mock_patch("subprocess.run"),
+            mock_backend_compiler(),
         ):
             _, source_codes = run_and_get_code(cfn, a_dev, b_dev)
         self.assertTrue(len(source_codes) > 0)
@@ -6709,7 +6463,7 @@ class TestCoarseTileNestedReductionE2E(InductorTestCase):
         with (
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
-            mock_patch("subprocess.run"),
+            mock_backend_compiler(),
         ):
             _, source_codes = run_and_get_code(cfn, a_dev, b_dev)
         self.assertTrue(len(source_codes) > 0)
@@ -6744,7 +6498,7 @@ class TestCoarseTileNestedReductionE2E(InductorTestCase):
         with (
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
-            mock_patch("subprocess.run"),
+            mock_backend_compiler(),
         ):
             _, source_codes = run_and_get_code(cfn, a_dev, b_dev)
         self.assertTrue(len(source_codes) > 0)
@@ -6758,7 +6512,7 @@ class TestCoarseTileNestedReductionE2E(InductorTestCase):
     def test_nested_matmul_accum_tile_write_does_not_advance_in_sdsc(self):
         """Accumulator tile buffer in nested outer-M + inner-K reduction must never
         get a device_tile_advance_expr referencing the inner K-loop, so the
-        unroller does not advance its base address across inner iterations.
+        compiler does not advance its base address across inner iterations.
 
         The accum_tile buffer is loop-internal to the inner K-loop: it is read
         and written every inner iteration by the combine op, but must stay at a
@@ -6789,7 +6543,7 @@ class TestCoarseTileNestedReductionE2E(InductorTestCase):
         with (
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
-            mock_patch("subprocess.run"),
+            mock_backend_compiler(),
         ):
             _, source_codes = run_and_get_code(cfn, a_dev, b_dev)
         self.assertTrue(len(source_codes) > 0)

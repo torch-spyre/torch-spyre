@@ -47,6 +47,7 @@ from .insert_restickify import (
     _create_restickify_node,
     _fixed_tiled,
     insert_restickify_on_node_inputs,
+    RestickifyArgInfo,
 )
 from .ir import FixedTiledLayout
 from .logging_utils import get_inductor_logger
@@ -277,7 +278,14 @@ def _insert_relayout_copy(
     consumer_name = consumer_op.get_name()
     insert_restickify_on_node_inputs(
         consumer_op,
-        [{"arg_name": arg_name, "target_layout": required_layout}],
+        [
+            RestickifyArgInfo(
+                arg_name=arg_name,
+                dep_index=None,
+                occurrence=0,
+                target_layout=required_layout,
+            )
+        ],
         operations,
     )
     logger.info(
@@ -599,7 +607,13 @@ def _insert_mutation_relayout_copy(
 
     # Step 1: copy-in: target (current layout) -> buf_tmp (required_stl).
     _, buf_tmp = _create_restickify_node(
-        {"arg_name": target_name, "target_layout": buf_tmp_layout}, mutation_op
+        RestickifyArgInfo(
+            arg_name=target_name,
+            dep_index=None,
+            occurrence=0,
+            target_layout=buf_tmp_layout,
+        ),
+        mutation_op,
     )
     buf_tmp_name = buf_tmp.get_name()
     buf_tmp._input_layout_overrides = {target_name: orig_stl_layout}
@@ -626,7 +640,12 @@ def _insert_mutation_relayout_copy(
     # For scatter, use buf_tmp as metadata source to avoid inheriting index tensor dependency
     copyback_metadata_op = buf_tmp if is_scatter_op else mutation_op
     _, buf_copyback = _create_restickify_node(
-        {"arg_name": buf_tmp_name, "target_layout": buf_copyback_layout},
+        RestickifyArgInfo(
+            arg_name=buf_tmp_name,
+            dep_index=None,
+            occurrence=0,
+            target_layout=buf_copyback_layout,
+        ),
         copyback_metadata_op,
     )
     buf_copyback.layout = MutationLayoutSHOULDREMOVE(target_buf)

@@ -93,24 +93,44 @@ def _validate_target_dtype(dtype: torch.dtype) -> None:
         )
 
 
+def _normalize_spyre_device(
+    device: torch.device | str | int | None,
+) -> torch.device | None:
+    """Initialize Spyre and normalize a DMA helper's destination device."""
+    _ensure_spyre_runtime()
+    if device is None:
+        return None
+    target = (
+        torch.device(DEVICE_NAME, device)
+        if isinstance(device, int)
+        else torch.device(device)
+    )
+    if target.type != DEVICE_NAME:
+        raise ValueError(f"Expected a Spyre destination, got {target}")
+    return target
+
+
 # --- DMA helpers -----------------------------------------------------
 
 
 def _dma_to_spyre_default(
     cpu_tensor: torch.Tensor,
     target_dtype: torch.dtype | None = None,
+    *,
+    device: torch.device | str | int | None = None,
 ) -> torch.Tensor:
     """Transfer a CPU tensor to Spyre with the default layout.
 
     Used for non-Linear-weight tensors (biases, embeddings, layer norm
     parameters, buffers). Stickifies along the last dimension.
     """
+    device = _normalize_spyre_device(device)
     if not cpu_tensor.is_contiguous():
         cpu_tensor = cpu_tensor.contiguous()
     dev_dtype = target_dtype if target_dtype is not None else cpu_tensor.dtype
     layout = SpyreTensorLayout(list(cpu_tensor.shape), dev_dtype)
     dst = spyre_empty_with_layout(
-        cpu_tensor.size(), cpu_tensor.stride(), dev_dtype, layout
+        cpu_tensor.size(), cpu_tensor.stride(), dev_dtype, layout, device=device
     )
     copy_tensor(cpu_tensor, dst, non_blocking=False)
     return dst
@@ -119,6 +139,8 @@ def _dma_to_spyre_default(
 def _dma_to_spyre_dim_order_swapped(
     weight: torch.Tensor,
     target_dtype: torch.dtype | None = None,
+    *,
+    device: torch.device | str | int | None = None,
 ) -> torch.Tensor:
     """Transfer a 2D Linear weight to Spyre with dim_order=[1, 0].
 
@@ -131,6 +153,7 @@ def _dma_to_spyre_dim_order_swapped(
     Caller must ensure ``weight.ndim == 2``.
     """
     assert weight.ndim == 2, "dim_order=[1,0] path is for 2D weights only"
+    device = _normalize_spyre_device(device)
 
     if not weight.is_contiguous():
         weight = weight.contiguous()
@@ -141,7 +164,9 @@ def _dma_to_spyre_dim_order_swapped(
         dev_dtype,
         [1, 0],  # dim_order: stick on dim-0 = out_features
     )
-    dst = spyre_empty_with_layout(weight.size(), weight.stride(), dev_dtype, layout)
+    dst = spyre_empty_with_layout(
+        weight.size(), weight.stride(), dev_dtype, layout, device=device
+    )
     copy_tensor(weight, dst, non_blocking=False)
     return dst
 
@@ -149,6 +174,8 @@ def _dma_to_spyre_dim_order_swapped(
 def _dma_to_spyre_indirect_access(
     weight: torch.Tensor,
     target_dtype: torch.dtype | None = None,
+    *,
+    device: torch.device | str | int | None = None,
 ) -> torch.Tensor | None:
     """Transfer a 2D ``nn.Embedding`` table to Spyre with a gather-optimal layout.
 
@@ -171,6 +198,7 @@ def _dma_to_spyre_indirect_access(
     Caller must ensure ``weight.ndim == 2``.
     """
     assert weight.ndim == 2, "indirect-access path is for 2D embedding tables only"
+    device = _normalize_spyre_device(device)
 
     if not weight.is_contiguous():
         weight = weight.contiguous()
@@ -194,7 +222,9 @@ def _dma_to_spyre_indirect_access(
         [d, eps, 1],  # stride_map
         get_device_dtype(dev_dtype),
     )
-    dst = spyre_empty_with_layout(weight.size(), weight.stride(), dev_dtype, layout)
+    dst = spyre_empty_with_layout(
+        weight.size(), weight.stride(), dev_dtype, layout, device=device
+    )
     copy_tensor(weight, dst, non_blocking=False)
     return dst
 
@@ -202,6 +232,8 @@ def _dma_to_spyre_indirect_access(
 def dma_moe_expert_weight_to_spyre(
     weight: torch.Tensor,
     target_dtype: torch.dtype | None = None,
+    *,
+    device: torch.device | str | int | None = None,
 ) -> torch.Tensor | None:
     """Transfer ``[E, C, F]`` weights in a gather- and matmul-friendly layout.
 
@@ -209,6 +241,7 @@ def dma_moe_expert_weight_to_spyre(
     ``F`` does not span complete sticks.
     """
     assert weight.ndim == 3, "MoE expert-weight path is for rank-3 [E,C,F] only"
+    device = _normalize_spyre_device(device)
 
     if not weight.is_contiguous():
         weight = weight.contiguous()
@@ -230,7 +263,9 @@ def dma_moe_expert_weight_to_spyre(
         [contract * free, free, eps, 1],
         get_device_dtype(dev_dtype),
     )
-    dst = spyre_empty_with_layout(weight.size(), weight.stride(), dev_dtype, layout)
+    dst = spyre_empty_with_layout(
+        weight.size(), weight.stride(), dev_dtype, layout, device=device
+    )
     copy_tensor(weight, dst, non_blocking=False)
     return dst
 
@@ -238,6 +273,8 @@ def dma_moe_expert_weight_to_spyre(
 def dma_moe_per_expert_scale_to_spyre(
     scale: torch.Tensor,
     target_dtype: torch.dtype | None = None,
+    *,
+    device: torch.device | str | int | None = None,
 ) -> torch.Tensor | None:
     """Transfer ``[E]`` scales as a gather-ready ``[E, eps]`` tensor.
 
@@ -245,6 +282,7 @@ def dma_moe_per_expert_scale_to_spyre(
     in-graph rank expansion.
     """
     assert scale.ndim == 1, "per-expert-scale path is for 1D [E] tensors only"
+    device = _normalize_spyre_device(device)
 
     if not scale.is_contiguous():
         scale = scale.contiguous()
@@ -260,7 +298,9 @@ def dma_moe_per_expert_scale_to_spyre(
         [eps, eps, 1],
         get_device_dtype(dev_dtype),
     )
-    dst = spyre_empty_with_layout(widened.size(), widened.stride(), dev_dtype, layout)
+    dst = spyre_empty_with_layout(
+        widened.size(), widened.stride(), dev_dtype, layout, device=device
+    )
     copy_tensor(widened, dst, non_blocking=False)
     return dst
 

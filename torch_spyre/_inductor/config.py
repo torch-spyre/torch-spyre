@@ -20,7 +20,7 @@ from torch.utils._config_module import install_config_module
 
 lx_planning: bool = os.environ.get("LX_PLANNING", "1") == "1"
 co_optimizing_lx_planning: bool = (
-    os.environ.get("CO_OPTIMIZING_LX_PLANNING", "0") == "1"
+    os.environ.get("CO_OPTIMIZING_LX_PLANNING", "1") == "1"
 )
 hbm_pool_planning: bool = os.getenv("HBM_POOL_PLANNING", "1").lower() in (
     "1",
@@ -92,10 +92,34 @@ lx_planner_relayout: bool = os.getenv("SPYRE_LX_PLANNER_RELAYOUT", "1").lower() 
     "yes",
 )
 
-# Submit independent DXP kernel compilations to Inductor's subprocess pool and
-# resolve them together at the generated wrapper's async_compile.wait() barrier.
-# This is opt-in while the parallel path is evaluated on full model compiles.
-async_dxp_compile: bool = os.getenv("SPYRE_ASYNC_DXP_COMPILE", "0").lower() in (
+# How many destination views the CP-SAT relayout enumeration keeps per
+# (source, consumer) edge, cheapest first: a consumer with many equal-core
+# divisions induces one distinct destination partition (one relayout copy the
+# solver must place) per division, though it will read through at most one.
+# On the spyre_attn decode graph with 16 unrolled KV blocks the unbounded
+# enumeration built 5789 copies and CP-SAT's presolve outlived the time limit.
+# 0 keeps every view.
+lx_solver_relayout_groups_per_edge: int = int(
+    os.getenv("SPYRE_LX_SOLVER_RELAYOUT_GROUPS_PER_EDGE", "4")
+)
+
+# Skip CP-SAT's presolve above this many free relayout copies in one solve;
+# 0 (the default) never skips it, priced or not. Presolve once scaled
+# super-linearly in the number of free copy residency literals (measured on the
+# spyre_attn decode graph: 16 copies 5 s, 64 copies 13 s, 160 copies 40 s, 312
+# copies past the 120 s limit). Constant-binding single-division copies and the
+# cost printer's lin_max proxy variables removed that cost, and a priced model
+# searched without presolve can exhaust memory in the LNS workers. Kept as an
+# escape hatch for a graph where presolve still outlives the time limit.
+lx_solver_relayout_presolve_max_copies: int = int(
+    os.getenv("SPYRE_LX_SOLVER_RELAYOUT_PRESOLVE_MAX_COPIES", "0")
+)
+
+# Submit independent backend-compiler kernel compilations to Inductor's
+# subprocess pool and resolve them together at the generated wrapper's
+# async_compile.wait() barrier. This is opt-in while the parallel path is
+# evaluated on full model compiles.
+async_backend_compile: bool = os.getenv("SPYRE_ASYNC_BACKEND_COMPILE", "0").lower() in (
     "1",
     "true",
     "yes",
@@ -141,6 +165,27 @@ read_copy_elision: bool = os.getenv("SPYRE_READ_COPY_ELISION", "1").lower() in (
 # after specific passes. Set via SPYRE_LOG_PASSES env var or programmatically.
 log_passes: str = os.environ.get("SPYRE_LOG_PASSES", "")
 
+# Structured per-compile timing records (timing_recorder.py).  Off by default;
+# when off, a timed region records nothing and allocates no event, but the call
+# site still builds its name and keyword arguments and this flag is still read,
+# so it is cheap rather than free: measured at ~1.4 us per region off and ~3.9 us
+# on (of which ~1.0 us is reading this flag through install_config_module, the
+# same cost log_passes already pays per pass).  A compile emitting 132 regions
+# pays ~0.2 ms off, ~0.5 ms on.  Records go to timing_out at process exit, or via
+# timing_recorder.dump_and_finalize() for callers that want them sooner.
+# Tests override with config.patch({"timing": True}) rather than the environment.
+timing: bool = os.getenv("TORCH_SPYRE_TIMING", "0").lower() in (
+    "1",
+    "true",
+    "yes",
+)
+
+# Destination for the timing record.  The pid is inserted before the suffix, so
+# one setting is safe when a run fans out into several processes.  Empty means
+# keep the events in memory and write nothing, which is what a caller reading
+# timing_recorder.RECORDER directly wants.
+timing_out: str = os.environ.get("TORCH_SPYRE_TIMING_OUT", "")
+
 # Predicted-runtime reporting from the analytical cost model (cost_model.py,
 # cost_model_pass.py).  NOT related to work_division.cost_model_matmul_division,
 # which is a separate model used to choose a matmul work division.
@@ -154,6 +199,11 @@ log_passes: str = os.environ.get("SPYRE_LOG_PASSES", "")
 # spellings, so one value drives this pass and that older per-op dump together.
 # Tests override with config.patch({"cost_model": "1"}) rather than the environment.
 cost_model: str = os.environ.get("SPYRE_DUMP_COST", "")
+# Append one JSON record per co-optimized graph to this file: the symbolic cost
+# objective the solver minimized (per-bundle terms and relayout charges as sympy
+# ``srepr`` strings), the symbol values the solve chose, and each term evaluated
+# under them. Read by the summarize-sdsc skill. Empty = off.
+dump_cost_expr_file: str = os.environ.get("SPYRE_DUMP_COST_EXPR_FILE", "")
 
 # Disable compiler-generated span-overflow coarse-tiling hints.  The global
 # SPYRE_INDUCTOR_IGNORE_HINTS flag also disables these so one switch can still
@@ -219,6 +269,19 @@ sdsc_cache: bool = os.environ.get("SPYRE_INDUCTOR_SDSC_CACHE", "1") == "1"
 layout_solver: Literal[
     "greedy", "bestfit", "firstfit", "cpsat", "simulated_annealing"
 ] = os.environ.get("LAYOUT_SOLVER", "cpsat")  # type: ignore[assignment]
+
+# Wall-clock budget for one CP-SAT solve, in seconds. The joint objective is
+# lexicographic and re-solves the same model up to three times (residency, then
+# parallelism, then division balance), so this bounds each phase, not the pass.
+# It is a compile-time guard, not a correctness one: a solve that runs out of
+# budget without an incumbent raises SolveError, and scratchpad_planning falls
+# back to greedy placement (correct, but co-optimization is lost for that
+# graph). Raise it if large graphs are falling back; 0 disables the limit.
+# The default matches the budget CpSatLayoutSolver hard-coded before this knob
+# existed, so exposing it does not change how long any solve is allowed to run.
+cpsat_time_limit_seconds: float = float(
+    os.environ.get("CPSAT_TIME_LIMIT_SECONDS", "30")
+)
 
 # OpSpec validation at pipeline stage boundaries. Enabled by default to catch
 # invariant violations early. Set SPYRE_VALIDATE_OP_SPECS=0 to disable.

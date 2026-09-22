@@ -1,0 +1,232 @@
+name: Ingest hardware-failure diagnostics into ClickHouse
+description: >
+  Download every job log from a GHA run, parse it for hardware failures
+  (.github/scripts/parse_hw_failures.py) and insert the records into ClickHouse
+  (.github/scripts/ingest_hw_diagnostics.py). The SINGLE implementation of the
+  push-hw-diagnostics-to-clickhouse.yaml job, extracted so another repo can call it directly
+  instead of copying that job's checkout+venv+install+download+parse+ingest steps. Secrets
+  cannot reach a composite action, so the caller passes the ClickHouse connection and a GH
+  token as plain inputs.
+
+inputs:
+  gha-run-id:
+    description: Numeric GitHub Actions run ID of the run whose job logs are analysed.
+    required: true
+  workflow-name:
+    description: >
+      Name of the triggering workflow, recorded as the run's test tier (a run_id hash
+      input) -- e.g. 'tests'.
+    required: false
+    default: tests
+  run-url:
+    description: URL of the analysed run. Empty computes it from repository + gha-run-id.
+    required: false
+    default: ''
+  component:
+    description: Component whose suite this is.
+    required: false
+    default: torch-spyre
+  arch:
+    description: >
+      Arch of the ANALYSED legs, not of this ingest job -- never $(uname -m), which would
+      report the ingest runner instead. arch is a run_id hash input: a wrong value derives
+      an id that joins nothing, silently.
+    required: false
+    default: x86_64
+  threaded-run-id:
+    description: Orchestrator-minted run uuid, when one exists. Empty derives one instead.
+    required: false
+    default: ''
+  jenkins-run-key:
+    description: Jenkins externalizable id ('folder/job#123'), when Jenkins dispatched this leg.
+    required: false
+    default: ''
+  artifact-id:
+    description: artifact_id of the image this leg ran, when known.
+    required: false
+    default: ''
+  table:
+    description: Target ClickHouse table. Empty uses the script's own default.
+    required: false
+    default: ''
+  gh-token:
+    description: Token `gh api` uses to list and download job logs.
+    required: true
+  repository:
+    description: owner/repo the analysed run belongs to. Empty = this job's own repository.
+    required: false
+    default: ''
+  script-repo:
+    description: Repository holding the canonical scripts, for the sparse-checkout fallback.
+    required: false
+    default: torch-spyre/torch-spyre
+  script-ref:
+    description: Ref of script-repo to check out. Pin to a tag from another repo.
+    required: false
+    default: ''
+  torch-spyre-dir:
+    description: Fallback directory holding a torch-spyre checkout. Empty = workspace, then sparse-checkout.
+    required: false
+    default: ''
+  clickhouse-host:
+    description: ClickHouse host. Empty = skip the whole ingest (clean no-op).
+    required: false
+    default: ''
+  clickhouse-port:
+    description: ClickHouse port (default 443 inside the script).
+    required: false
+    default: ''
+  clickhouse-user:
+    description: ClickHouse user (default "default" inside the script).
+    required: false
+    default: ''
+  clickhouse-pass:
+    description: ClickHouse password.
+    required: false
+    default: ''
+  clickhouse-db:
+    description: ClickHouse database (default "spyre" inside the script).
+    required: false
+    default: ''
+
+outputs:
+  json-file:
+    description: Path to the parsed JSON file, for the caller to upload as its own artifact.
+    value: ${{ steps.parse.outputs.json-file }}
+
+runs:
+  using: composite
+  steps:
+    # The no-op gate lives here, not in the library: ingest_hw_diagnostics.py's get_client()
+    # reads CLICKHOUSE_HOST as a required env (a KeyError, not a clean skip, when absent).
+    - name: Gate on ClickHouse config
+      id: gate
+      shell: bash
+      env:
+        CH_HOST: ${{ inputs.clickhouse-host }}
+      run: |
+        if [ -z "${CH_HOST}" ]; then
+          echo "::notice::ClickHouse host not configured — skipping ingest."
+          echo "configured=false" >> "$GITHUB_OUTPUT"
+        else
+          echo "configured=true" >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: Setup spyre-clickhouse-ingest
+      id: setup
+      if: steps.gate.outputs.configured == 'true'
+      uses: ./.github/actions/setup-clickhouse-ingest
+      with:
+        extra-scripts: |
+          .github/scripts/parse_hw_failures.py
+          .github/scripts/ingest_hw_diagnostics.py
+        script-repo: ${{ inputs.script-repo }}
+        script-ref: ${{ inputs.script-ref }}
+        torch-spyre-dir: ${{ inputs.torch-spyre-dir }}
+
+    - name: Setup the GitHub CLI
+      if: steps.gate.outputs.configured == 'true'
+      uses: ./.github/actions/setup-gh-cli
+
+    - name: Download job logs
+      if: steps.gate.outputs.configured == 'true'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.gh-token }}
+        REPO: ${{ inputs.repository || github.repository }}
+        RUN_ID: ${{ inputs.gha-run-id }}
+      run: |
+        set -euo pipefail
+        source .venv/bin/activate
+        mkdir -p raw_logs
+
+        retry() {
+          local max_attempts=5 attempt=1 delay=2
+          until "$@"; do
+            if [ "${attempt}" -ge "${max_attempts}" ]; then
+              echo "::error::command failed after ${attempt} attempts: $*" >&2
+              return 1
+            fi
+            echo "[retry] attempt ${attempt} failed, retrying in ${delay}s: $*" >&2
+            sleep "${delay}"
+            attempt=$((attempt + 1))
+            delay=$((delay * 2))
+          done
+        }
+
+        # filter=latest excludes a prior attempt of this run leaking in and doubling every
+        # row. --method GET is required: gh api infers POST as soon as any -f/-F field is
+        # given, and this endpoint has no POST route.
+        retry gh api \
+          --method GET \
+          "/repos/${REPO}/actions/runs/${RUN_ID}/jobs" \
+          --paginate \
+          -f filter=latest \
+          --jq '.jobs[] | {id: .id, name: .name}' \
+        > /tmp/jobs.jsonl
+
+        python3 - << 'PYEOF'
+        import os
+
+        from spyre_clickhouse_ingest.gha_logs import download_job_logs_or_die, load_jobs
+
+        download_job_logs_or_die(
+            load_jobs("/tmp/jobs.jsonl"),
+            repo=os.environ["REPO"],
+            out_dir="raw_logs",
+        )
+        PYEOF
+
+    - name: Parse logs
+      id: parse
+      if: steps.gate.outputs.configured == 'true'
+      shell: bash
+      env:
+        ROOT: ${{ steps.setup.outputs.root }}
+        RUN_ID: ${{ inputs.gha-run-id }}
+        WORKFLOW: ${{ inputs.workflow-name }}
+      run: |
+        set -euo pipefail
+        source .venv/bin/activate
+        SAFE_WF=$(echo "${WORKFLOW}" | tr ' ' '_')
+        JSON_FILE="hw_diagnostics_${SAFE_WF}_${RUN_ID}.json"
+        echo "json-file=${JSON_FILE}" >> "$GITHUB_OUTPUT"
+        echo "JSON_FILE=${JSON_FILE}" >> "$GITHUB_ENV"
+        python3 "${ROOT}/.github/scripts/parse_hw_failures.py" \
+          --log-dir raw_logs \
+          --run-id  "${RUN_ID}" \
+          --out     "${JSON_FILE}"
+
+    - name: Ingest into ClickHouse
+      if: steps.gate.outputs.configured == 'true'
+      shell: bash
+      env:
+        ROOT: ${{ steps.setup.outputs.root }}
+        CLICKHOUSE_HOST: ${{ inputs.clickhouse-host }}
+        CLICKHOUSE_PASS: ${{ inputs.clickhouse-pass }}
+        CH_PORT_IN: ${{ inputs.clickhouse-port }}
+        CH_USER_IN: ${{ inputs.clickhouse-user }}
+        CH_DB_IN: ${{ inputs.clickhouse-db }}
+        RUN_URL_IN: ${{ inputs.run-url }}
+        REPO: ${{ inputs.repository || github.repository }}
+        RUN_ID: ${{ inputs.gha-run-id }}
+      run: |
+        set -euo pipefail
+        source .venv/bin/activate
+        [ -n "${CH_PORT_IN}" ] && export CLICKHOUSE_PORT="${CH_PORT_IN}"
+        [ -n "${CH_USER_IN}" ] && export CLICKHOUSE_USER="${CH_USER_IN}"
+        [ -n "${CH_DB_IN}" ] && export CLICKHOUSE_DB="${CH_DB_IN}"
+        RUN_URL="${RUN_URL_IN:-${{ github.server_url }}/${REPO}/actions/runs/${RUN_ID}}"
+        TABLE_ARGS=()
+        [ -n "${{ inputs.table }}" ] && TABLE_ARGS=(--table "${{ inputs.table }}")
+        python3 "${ROOT}/.github/scripts/ingest_hw_diagnostics.py" \
+          --json-file      "${JSON_FILE}" \
+          --run-id         "${{ inputs.threaded-run-id }}" \
+          --component      "${{ inputs.component }}" \
+          --arch           "${{ inputs.arch }}" \
+          --gha-run-id     "${RUN_ID}" \
+          --jenkins-run-key "${{ inputs.jenkins-run-key }}" \
+          --trigger-type   "${{ inputs.workflow-name }}" \
+          --run-url        "${RUN_URL}" \
+          --artifact-id    "${{ inputs.artifact-id }}" \
+          "${TABLE_ARGS[@]}"

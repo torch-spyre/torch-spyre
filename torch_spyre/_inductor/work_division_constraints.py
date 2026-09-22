@@ -27,12 +27,23 @@ every rule.
 """
 
 import dataclasses
+import math
 import typing
+
+import sympy
 from sympy import Expr, Symbol, divisors
 
 from torch._inductor.dependencies import MemoryDep
-from torch._inductor.ir import ComputedBuffer, Pointwise, Reduction
+from torch._inductor.ir import (
+    ComputedBuffer,
+    InputBuffer,
+    Pointwise,
+    Reduction,
+    StorageBox,
+    TensorBox,
+)
 from torch._inductor.utils import sympy_index_symbol
+from torch._inductor.virtualized import V
 from torch_spyre._C import ElementArrangement
 
 from .constants import (
@@ -42,19 +53,26 @@ from .constants import (
     DEPTHWISE_CONV2D_OP,
     KEEP_BY_INDEX_OP,
     POOL_OPS,
+    STAGGERED_EAS,
     _MAX_K_PER_CORE,
     TOPK_MAX_K_PER_CORE,
     TOPK_OPS,
 )
+from .core_mapping import aligned_split_keeps_blocks, distribute_aligned_split
 from .errors import Unsupported
+from .ir import FixedTiledLayout
 from .pass_utils import (
+    AlignmentAccess,
+    build_operation_alignment_inputs,
     concretize_expr,
+    device_coordinates,
     indirect_forbidden_split_syms,
     is_restickify_coords,
     op_read_writes,
 )
 from .logging_utils import get_inductor_logger
 from .propagate_hints import get_op_hints
+from .views import align_tensors_pure
 from .wsr.coarse_tile import _raw_to_squeezed_pos
 from . import config
 
@@ -64,6 +82,15 @@ if typing.TYPE_CHECKING:
     from .work_division import TensorDep
 
 logger = get_inductor_logger("work_division_constraints")
+
+
+# A source-compatible division can use fewer cores than the staged path.  The
+# saved copy executes once per enclosing loop trip, so only steer work division
+# toward its direct form once there are enough executions to amortize that
+# tradeoff.  The two-trip boundary is deliberately conservative: naturally
+# compatible direct reads remain eligible, while this rule intervenes only to
+# change an otherwise-selected division.
+_MIN_SOURCE_AWARE_DIRECT_READ_TRIPS = 3
 
 
 @dataclasses.dataclass
@@ -111,6 +138,8 @@ def collect_work_division_constraints(
         conv_spatial_blocked_vars,
         reduction_window_blocked_vars,
         coarse_tile_local_dim_split_domains,
+        direct_read_source_stick_split_domains,
+        aligned_ownership_split_domains,
         plain_reduction_k_split_domains,
         restickify_padding_blocked_vars,
         qfp8wt_split_domains,
@@ -118,6 +147,7 @@ def collect_work_division_constraints(
         topk_split_domains,
         keep_by_index_k_split_constraint,
         keep_by_index_pinned_search_space_vars,
+        keep_by_index_search_adjacent_blocked_vars,
         indirect_access_split_domains,
     ):
         result = constraint(ctx)
@@ -157,6 +187,211 @@ def collect_work_division_constraints(
             allowed_splits[sym] = allowed
 
     return ConstraintResult(blocked=blocked, allowed_splits=allowed_splits)
+
+
+def _direct_read_source_dep(
+    op: ComputedBuffer,
+) -> tuple[MemoryDep, FixedTiledLayout] | None:
+    """Recover a saved direct-read dependency without mutating the graph."""
+    record = getattr(op, "_read_copy_elision_record", None)
+    if record is None or not isinstance(op.data, Pointwise):
+        return None
+
+    try:
+        direct_data = dataclasses.replace(op.data, inner_fn=record.direct_inner_fn)
+        direct_op = ComputedBuffer(
+            name=op.get_name(),
+            layout=op.layout,
+            data=direct_data,
+            _split_size=op._split_size,
+            _original_inner_fn=op._original_inner_fn,
+            _original_ranges=op._original_ranges,
+            _original_reduction_ranges=op._original_reduction_ranges,
+        )
+        source_deps = [
+            dep
+            for dep in op_read_writes(direct_op).reads
+            if isinstance(dep, MemoryDep) and dep.name == record.source_name
+        ]
+        if len(source_deps) != 1:
+            return None
+
+        source = V.graph.get_buffer(record.source_name)
+        if isinstance(source, TensorBox):
+            source = source.data
+        if isinstance(source, StorageBox):
+            source = source.data
+        if not isinstance(source, InputBuffer):
+            return None
+        layout = source.get_layout()
+        if not isinstance(layout, FixedTiledLayout):
+            return None
+        return source_deps[0], layout
+    except Exception:
+        # This is an optional optimization constraint.  The final read-copy
+        # elision proof remains authoritative when the saved direct form can no
+        # longer be reconstructed after another IR rewrite.
+        return None
+
+
+def direct_read_source_stick_split_domains(
+    ctx: WorkDivConstraintContext,
+) -> ConstraintResult:
+    """Keep a prospective direct HBM read on whole-stick core boundaries.
+
+    Coarse tiling deliberately retains a staged copy through layout and work-
+    division planning.  The staged layout can make an iteration dimension look
+    freely splittable even when that same dimension is the physical stick of
+    the original graph input.  Choosing such a split prevents the later,
+    correctness-checked direct-read rewrite: a core cannot own four elements
+    out of a 64-element stick.
+
+    For the canonical ``(floor(v / eps), Mod(v, eps))`` representation, limit
+    the saved direct-read candidate to factors that leave every core an
+    integral number of complete sticks.  The post-allocation proof still checks
+    full physical/logical ownership equivalence; this rule only keeps the work-
+    division search from choosing a candidate that is known to be impossible.
+    """
+    loop_info = getattr(ctx.op, "loop_info", None)
+    loop_counts = getattr(loop_info, "loop_count", ())
+    try:
+        loop_trips = 1
+        for count in loop_counts:
+            loop_trips *= concretize_expr(count)
+    except Exception:
+        return ConstraintResult()
+    if loop_trips < _MIN_SOURCE_AWARE_DIRECT_READ_TRIPS:
+        return ConstraintResult()
+
+    recovered = _direct_read_source_dep(ctx.op)
+    if recovered is None:
+        return ConstraintResult()
+    source_dep, source_layout = recovered
+
+    try:
+        coordinates = device_coordinates(source_layout.device_layout, source_dep, None)
+        eps = int(source_layout.device_layout.elems_per_stick())
+    except Exception:
+        return ConstraintResult()
+    if not coordinates or eps <= 0:
+        return ConstraintResult()
+
+    stick_coord = sympy.expand(coordinates[-1])
+    allowed_splits: dict[Symbol, frozenset[int]] = {}
+    for symbol, extent_expr in ctx.it_space.items():
+        if sympy.simplify(stick_coord - sympy.Mod(symbol, eps)) != 0:
+            continue
+        try:
+            extent = concretize_expr(extent_expr)
+        except Exception:
+            continue
+        if extent < 1:
+            continue
+        allowed_splits[symbol] = frozenset(
+            factor
+            for factor in divisors(extent)
+            if factor == 1 or (extent // factor) % eps == 0
+        )
+
+    return ConstraintResult(allowed_splits=allowed_splits)
+
+
+def aligned_ownership_split_domains(
+    ctx: WorkDivConstraintContext,
+) -> ConstraintResult:
+    """Keep every core's share of a dimension one contiguous block in codegen.
+
+    Tensor alignment cuts a loop dimension at each boundary an operand's
+    coordinates put on it, and codegen distributes the dimension's split over
+    the resulting segments outermost first (``distribute_aligned_split``). A
+    split that does not line up with those segments lands on an inner one and
+    interleaves the owners, while the scratchpad planner still assumes
+    contiguous blocks. ``x.repeat(3, 2)`` with ``x`` of shape (2, 64) reads
+    ``x`` at ``Mod(d0, 2)`` over ``d0 < 6``; a 2-way split of ``d0`` gives
+    core 0 output rows {0, 2, 4}, so an LX-resident consumer on the same
+    division reads the wrong rows (1 and 4). Admit only the factors
+    ``aligned_split_keeps_blocks`` accepts.
+
+    Until #4703's SDK fix is available, also exclude the observed staggered
+    matmul row-order mismatch, using these same aligned segments.
+    """
+    tensor_deps = [*ctx.input_tds, ctx.output_td]
+    accesses = [
+        AlignmentAccess(td.layout.device_layout, td.dep.index) for td in tensor_deps
+    ]
+    try:
+        alignment_inputs = build_operation_alignment_inputs(
+            ctx.it_space,
+            accesses,
+            {symbol: (extent, 1) for symbol, extent in ctx.it_space.items()},
+        )
+        _, aligned_tensors, segments = align_tensors_pure(alignment_inputs)
+    except Exception:
+        # The alignment input is rebuilt ahead of codegen. Codegen reports its
+        # own alignment failures; this rule only narrows splits it can prove bad.
+        return ConstraintResult()
+
+    allowed_splits: dict[Symbol, frozenset[int]] = {}
+    for symbol, parts in segments.items():
+        if len(parts) < 2 or symbol not in ctx.it_space_adjusted:
+            continue
+        try:
+            extent = concretize_expr(ctx.it_space_adjusted[symbol])
+        except Exception:
+            continue
+        bases = [int(basis) for _, basis in parts]
+        if math.prod(bases) != extent:
+            continue
+        allowed_splits[symbol] = frozenset(
+            factor
+            for factor in divisors(extent)
+            if aligned_split_keeps_blocks(factor, bases)
+        )
+        if (
+            isinstance(ctx.op.data, Reduction)
+            and ctx.op.data.reduction_type == BATCH_MATMUL_OP
+            and has_staggered_ea_tensor(ctx.input_tds)
+            and symbol not in ctx.stick_vars
+            and symbol not in ctx.reduction_vars
+        ):
+            allowed_splits[symbol] = _matmul_row_order_factors(
+                aligned_tensors[-1], parts, allowed_splits[symbol]
+            )
+
+    return ConstraintResult(allowed_splits=allowed_splits)
+
+
+def _matmul_row_order_factors(
+    output: dict[str, list],
+    parts: tuple[tuple[Symbol, int], ...],
+    factors: frozenset[int],
+) -> frozenset[int]:
+    # Temporary SDK guard: torch-spyre/torch-spyre#4703.
+    # Remove once the required SDK includes DeepTools PR #4724.
+    # A flattened row can become several aligned row segments. The backend
+    # produces rows in segment order, but currently drains them in output
+    # memory order. Exclude splits that leave both conflicting segments local.
+    index = sum(
+        coord * math.prod(output["size"][d + 1 :])
+        for d, coord in enumerate(output["coordinates"][:-1])
+    )
+    index = index.expand()
+    strides = [index.coeff(v) for v, _ in parts]
+    if not all(stride.is_Integer and stride > 0 for stride in strides):
+        return factors
+    bases = [int(basis) for _, basis in parts]
+
+    def keeps_row_order(factor: int) -> bool:
+        splits, remaining = distribute_aligned_split(factor, bases)
+        assert remaining == 1  # factor divides the product of the segment bases
+        active = [
+            stride
+            for stride, basis, split in zip(strides, bases, splits)
+            if basis // split > 1
+        ]
+        return all(a > b for a, b in zip(active, active[1:]))
+
+    return frozenset(factor for factor in factors if keeps_row_order(factor))
 
 
 def carried_reduction_pinned_row(
@@ -218,9 +453,7 @@ def conv_spatial_blocked_vars(ctx: WorkDivConstraintContext) -> ConstraintResult
     conv_params = op_info.get("conv_params")
     if not isinstance(conv_params, dict):
         return ConstraintResult()
-    # Depthwise conv2d (#3510) records stride as stride_i/stride_j; forward
-    # conv2d (#3284) records it as stride_h/stride_w. Accept either spelling so
-    # the strided-spatial-split block covers both direct-conv paths.
+
     stride_i = conv_params.get("stride_i", conv_params.get("stride_h", 1))
     stride_j = conv_params.get("stride_j", conv_params.get("stride_w", 1))
     if (stride_i or 1) <= 1 and (stride_j or 1) <= 1:
@@ -566,12 +799,29 @@ def restickify_padding_blocked_vars(
     return ConstraintResult(blocked=padded)
 
 
-def has_qfp8wt_tensor(tds: "list[TensorDep]") -> bool:
+def _has_ea_tensor(
+    tds: "list[TensorDep]", eas: "frozenset[ElementArrangement]"
+) -> bool:
+    """True if any tensor's device layout carries one of ``eas``.
+
+    Layouts without an ``element_arrangement`` (the plain, non-EA case) simply
+    do not match.
+    """
     return any(
         hasattr(td.layout.device_layout, "element_arrangement")
-        and td.layout.device_layout.element_arrangement == ElementArrangement.QFP8WT
+        and td.layout.device_layout.element_arrangement in eas
         for td in tds
     )
+
+
+def has_qfp8wt_tensor(tds: "list[TensorDep]") -> bool:
+    """True if any tensor carries the QFP8WT (2D stick) element arrangement."""
+    return _has_ea_tensor(tds, frozenset({ElementArrangement.QFP8WT}))
+
+
+def has_staggered_ea_tensor(tds: "list[TensorDep]") -> bool:
+    """True if any tensor carries a staggered EA (``FP32_TO_DL16`` / ``DL16_TO_FP32``)."""
+    return _has_ea_tensor(tds, STAGGERED_EAS)
 
 
 def qfp8wt_split_domains(ctx: WorkDivConstraintContext) -> ConstraintResult:
@@ -604,10 +854,20 @@ def qfp8wt_split_domains(ctx: WorkDivConstraintContext) -> ConstraintResult:
 
 
 def qfp8wt_matmul_k_split_domains(ctx: WorkDivConstraintContext) -> ConstraintResult:
-    """Restrict reduction K to split=1 for QFP8WT batchmatmul.
+    """Restrict reduction K to split=1 for QFP8WT / staggered-EA batchmatmul.
 
     Splitting K would require partial-sum accumulation across cores, which the
     QFP8WT matmul kernel does not support.
+
+    The same restriction applies when an operand carries a staggered EA
+    (``FP32_TO_DL16`` / ``DL16_TO_FP32``): those layouts reorder elements
+    *within a stick* along the contraction (K) axis, so a K-split hands each
+    core a strided slice of the staggered operand that the matmul's K-fast
+    cohort accumulation mis-addresses -- silent wrong results. This is the
+    root cause of the co-optimization ``test_stagger_to_standard_ea`` width-128
+    failures, where the balance tie-break splits K of the ``mm(x_staggered, P)``
+    that ``spyre.stagger_to_standard_ea`` lowers to (the non-co-opt matmul cost
+    model never picks that K-split, so the greedy path is unaffected).
     """
     if not isinstance(ctx.op.data, Reduction):
         return ConstraintResult()
@@ -615,7 +875,7 @@ def qfp8wt_matmul_k_split_domains(ctx: WorkDivConstraintContext) -> ConstraintRe
         return ConstraintResult()
 
     all_tds = ctx.input_tds + [ctx.output_td]
-    if not has_qfp8wt_tensor(all_tds):
+    if not (has_qfp8wt_tensor(all_tds) or has_staggered_ea_tensor(all_tds)):
         return ConstraintResult()
 
     return ConstraintResult(
@@ -730,14 +990,14 @@ def keep_by_index_k_split_constraint(ctx: WorkDivConstraintContext) -> Constrain
     return ConstraintResult(allowed_splits=allowed_splits)
 
 
-def keep_by_index_pinned_search_space_vars(
-    ctx: WorkDivConstraintContext,
-) -> ConstraintResult:
-    """Keep one keep_by_index full-search output axis on each core.
+def _keep_by_index_search_axis(ctx: WorkDivConstraintContext) -> Symbol | None:
+    """The iteration symbol of the keep_by_index full-search output axis.
 
-    A broadcast indices input can omit unrelated output/batch axes. Preserve the
-    prior coordinate-based policy: select one simplest output coordinate absent
-    from the semantic indices operand rather than pinning every absent symbol.
+    The search axis is the simplest output device coordinate absent from the
+    semantic indices operand. A broadcast indices input can omit unrelated
+    output/batch axes, so select one simplest such coordinate rather than every
+    absent symbol. Returns ``None`` for a non-keep_by_index op or when no such
+    axis exists.
     """
     if (
         not (
@@ -746,8 +1006,7 @@ def keep_by_index_pinned_search_space_vars(
         )
         or len(ctx.input_tds) < 2
     ):
-        return ConstraintResult()
-
+        return None
     index_coords = ctx.input_tds[1].device_coords
     candidates = [
         coord
@@ -755,19 +1014,82 @@ def keep_by_index_pinned_search_space_vars(
         if coord.free_symbols and not any(coord.equals(index) for index in index_coords)
     ]
     if not candidates:
-        return ConstraintResult()
-
+        return None
     search_coord = min(
         candidates, key=lambda coord: (len(coord.free_symbols), str(coord))
     )
-    search_axis = next(
+    return next(
         (axis for axis in ctx.it_space if axis in search_coord.free_symbols), None
     )
+
+
+def keep_by_index_pinned_search_space_vars(
+    ctx: WorkDivConstraintContext,
+) -> ConstraintResult:
+    """Keep the keep_by_index full-search output axis whole on each core."""
+    search_axis = _keep_by_index_search_axis(ctx)
     return (
         ConstraintResult(allowed_splits={search_axis: frozenset({1})})
         if search_axis is not None
         else ConstraintResult()
     )
+
+
+def keep_by_index_search_adjacent_blocked_vars(
+    ctx: WorkDivConstraintContext,
+) -> ConstraintResult:
+    """Block the output dim that encloses a multi-stick keep_by_index search axis.
+
+    keep_by_index masks each output search position by comparing its search
+    coordinate against the K selected indices, and the datapath sweeps the whole
+    search axis on each core as one unit. When the search axis is wider than one
+    stick, splitting the output dim laid out immediately outside it -- the dim
+    whose sweep the search axis is nested inside -- across cores corrupts that
+    sweep: each core then compares only the first stick's worth of search
+    positions, so kept values beyond the first stick come back as the fill value
+    -- silently wrong (~1.5-2.4% of a 6x17x4x128 dim-3 keep_by_index) and a
+    backend-compiler abort at some core counts. This is independent of
+    co-optimization: the plain work-division pass hits it too whenever it happens
+    to split that dim. The leading and other batch dims split correctly, so only
+    the enclosing dim is blocked, and only when the search axis spans more than
+    one stick (a single-stick search has no second stick to drop). Both split
+    enumerators consume this.
+
+    The enclosing dim is identified by stride rather than device-coordinate
+    adjacency: it is the output-index symbol whose coefficient equals the search
+    axis's coefficient times its extent (the dim one memory level out from
+    search). This is stable across the stickified layout, where a multi-stick
+    search axis itself decomposes into two device coordinates.
+    """
+    search_axis = _keep_by_index_search_axis(ctx)
+    if search_axis is None:
+        return ConstraintResult()
+
+    # A search axis no wider than one stick has no second stick to drop, so the
+    # datapath sweep is split-safe -- leave those parallel. stick_vars maps each
+    # stick dim to its elements-per-stick, so the entry must be looked up by the
+    # search axis: an op can have several stick vars (one per operand stick dim,
+    # two for a QFP8WT 2D stick) inserted in tensor-dep order, and reading an
+    # arbitrary one compares this axis's extent against an unrelated operand's
+    # stick width -- which fails *open* into the wrong-code path above whenever
+    # that operand's stick is wider. When the search axis is not a stick dim at
+    # all, "spans more than one stick" does not apply and we block conservatively.
+    search_extent = concretize_expr(ctx.it_space[search_axis])
+    elems_per_stick = ctx.stick_vars.get(search_axis)
+    if elems_per_stick is not None and search_extent <= elems_per_stick:
+        return ConstraintResult()
+
+    write_index = ctx.output_td.dep.index
+    search_coeff = write_index.coeff(search_axis)
+    if search_coeff == 0:
+        return ConstraintResult()
+    enclosing_coeff = search_coeff * search_extent
+    blocked = {
+        v
+        for v in ctx.it_space
+        if v != search_axis and write_index.coeff(v) == enclosing_coeff
+    }
+    return ConstraintResult(blocked=blocked)
 
 
 def indirect_access_split_domains(ctx: WorkDivConstraintContext) -> ConstraintResult:

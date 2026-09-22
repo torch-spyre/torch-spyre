@@ -39,7 +39,14 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-import clickhouse_connect
+from spyre_clickhouse_ingest.client import get_client as _get_client
+from spyre_clickhouse_ingest.client import target_database, tables_present
+from spyre_clickhouse_ingest.identity import canonical_arch, component_of, run_id_for
+from spyre_clickhouse_ingest.schema import CAPABILITIES, CAPABILITY_RUNS
+from spyre_clickhouse_ingest.writer import (
+    capabilities_already_ingested,
+    insert_capabilities,
+)
 
 # ---------------------------------------------------------------------------
 # ClickHouse DDL
@@ -146,15 +153,9 @@ SETTINGS index_granularity = 8192
 
 
 def get_client():
-    return clickhouse_connect.get_client(
-        host=os.environ["CLICKHOUSE_HOST"],
-        port=int(os.environ.get("CLICKHOUSE_PORT", 443)),
-        user=os.environ.get("CLICKHOUSE_USER", "default"),
-        password=os.environ["CLICKHOUSE_PASS"],
-        database=os.environ.get("CLICKHOUSE_DB", "spyre"),
-        secure=True,
-        verify=False,
-    )
+    """This endpoint's certificate does not validate, hence verify=False -- the only reason this
+    wrapper exists rather than importing the shared factory directly."""
+    return _get_client(verify=False)
 
 
 def _parse_ts(ts_str: str) -> datetime:
@@ -334,6 +335,86 @@ def build_suite_row(rec: dict, args, gha_run_id: int, now: datetime) -> list:
     ]
 
 
+# ── schema-v2: capability results ──────────────────────────────────────────────
+# The v1 (classification, status) pair collapses to (status, backend). v1's three values
+# conflated two independent facts: FALLBACK is a PASS that ran on the CPU, so
+# countIf(status='XPASS') silently undercounted the operations that actually work.
+_V2_VERDICT = {
+    "spyre_enabled": ("passed", "spyre"),
+    "not_implemented": ("not_implemented", "spyre"),
+    "cpu_fallback": ("passed", "cpu"),
+}
+
+# Hashed into capability_id, so two runs of one operation at one shape reconcile. Positional:
+# reordering mints new ids.
+V2_DISC_KEYS = ("input_shapes", "input_dtypes")
+
+
+def _v2_capability_results(records: list) -> list:
+    """Every variant in every suite, as capability-writer entries.
+
+    Reads the same parsed JSON the v1 rows are built from rather than re-deriving from them: the
+    v1 shape has already folded `spyre_failed` into two classifications and dropped the group
+    nesting, so going through it would lose which backend each verdict came from.
+    """
+    out = []
+    for rec in records:
+        model = _str(rec.get("model_name")) or _str(rec.get("suite_name"))
+        yaml_file = _str(rec.get("yaml_file"))
+        ops = rec.get("operations", {}) or {}
+
+        def _emit(v: dict, classification: str):
+            operation = _str(v.get("operation"))
+            if not operation:
+                return
+            status, backend = _V2_VERDICT[classification]
+            out.append(
+                {
+                    "subject": model,
+                    "name": operation,
+                    "status": status,
+                    "backend": backend,
+                    # test_name is NOT hashed: one operation is one capability however many
+                    # tests exercise it, and hashing it would mint an identity per test.
+                    "disc": {
+                        "input_shapes": _jstr(v.get("input_shapes", [])),
+                        "input_dtypes": _jstr(v.get("input_dtypes", [])),
+                    },
+                    "tags": [t for t in _str(v.get("tags", "")).split() if t],
+                    "props": {
+                        k: val
+                        for k, val in (
+                            ("test_name", _str(v.get("test_name"))),
+                            ("input_strides", _jstr(v.get("input_strides", []))),
+                            ("yaml_file", yaml_file),
+                        )
+                        if val and val != "[]"
+                    },
+                }
+            )
+
+        for group in ops.get("spyre_enabled", []):
+            for v in group.get("variants", []):
+                _emit(v, "spyre_enabled")
+        for group in ops.get("not_implemented", []):
+            for v in group.get("variants", []):
+                _emit(v, "not_implemented")
+        # spyre_failed is a MIXED group: its xpass/xfail variants are the same two verdicts as
+        # above, split by which way each went.
+        for group in ops.get("spyre_failed", []):
+            for v in group.get("xpass_variants", []):
+                _emit(v, "spyre_enabled")
+            for v in group.get("xfail_variants", []):
+                _emit(v, "not_implemented")
+        for entry in ops.get("cpu_fallback", []):
+            variants = entry.get("variants", []) or [
+                {"operation": _str(entry.get("operation")), "test_name": ""}
+            ]
+            for v in variants:
+                _emit(v, "cpu_fallback")
+    return out
+
+
 def _build_variant_rows(
     rec: dict,
     args,
@@ -473,7 +554,35 @@ def main() -> None:
     parser.add_argument("--branch", default="", help="Git branch name")
     parser.add_argument("--sha", default="", help="Git commit SHA")
     parser.add_argument("--run-id", default="", help="GHA run ID (numeric string)")
+    parser.add_argument(
+        "--schema",
+        default="v1",
+        choices=("v1", "v2", "both"),
+        help="Which generation to write (default: v1)",
+    )
+    parser.add_argument(
+        "--component", default="", help="Component these rows belong to"
+    )
+    parser.add_argument(
+        "--arch", default="", help="Arch of the analysed leg; amd64 folds to x86_64"
+    )
+    parser.add_argument(
+        "--gha-run-id", default="", help="GHA run id, when GHA dispatched this leg"
+    )
+    parser.add_argument(
+        "--jenkins-run-key",
+        default="",
+        help="Jenkins externalizable id, when Jenkins dispatched this leg",
+    )
+    parser.add_argument(
+        "--trigger-type",
+        default="capability",
+        help="test_type of the RUN, a run_id hash input (not the capability test_type)",
+    )
     args = parser.parse_args()
+    args.write_v1 = args.schema in ("v1", "both")
+    args.write_v2 = args.schema in ("v2", "both")
+    print(f"  schema={args.schema} (v1={args.write_v1} v2={args.write_v2})")
 
     # ── Load JSON ────────────────────────────────────────────────────────────
     json_path = Path(args.json_file)
@@ -509,7 +618,8 @@ def main() -> None:
     print("[info] Connected.\n")
 
     # ── Ensure tables exist (keeps historical data for regression views) ──────
-    ensure_tables(client)
+    if args.write_v1:
+        ensure_tables(client)
 
     gha_run_id = _int(args.run_id)
     now = datetime.now(timezone.utc).replace(tzinfo=None)
@@ -542,27 +652,76 @@ def main() -> None:
             print(f"  [variants err] {suite_name!r}: {exc}", file=sys.stderr)
 
     # ── Batch insert ──────────────────────────────────────────────────────────
-    print(f"\n[info] Inserting {len(all_suite_rows)} suite rows ...")
-    if all_suite_rows:
-        client.insert("model_ops_suites", all_suite_rows, column_names=SUITE_COLS)
-        print(f"[info]   model_ops_suites    — {len(all_suite_rows)} rows inserted")
+    if args.write_v1:
+        print(f"\n[info] Inserting {len(all_suite_rows)} suite rows ...")
+        if all_suite_rows:
+            client.insert("model_ops_suites", all_suite_rows, column_names=SUITE_COLS)
+            print(f"[info]   model_ops_suites    — {len(all_suite_rows)} rows inserted")
 
-    print(f"[info] Inserting {len(all_variant_rows)} variant rows ...")
-    if all_variant_rows:
-        client.insert("model_ops_variants", all_variant_rows, column_names=VARIANT_COLS)
-        print(f"[info]   model_ops_variants  — {len(all_variant_rows)} rows inserted")
+        print(f"[info] Inserting {len(all_variant_rows)} variant rows ...")
+        if all_variant_rows:
+            client.insert(
+                "model_ops_variants", all_variant_rows, column_names=VARIANT_COLS
+            )
+            print(
+                f"[info]   model_ops_variants  — {len(all_variant_rows)} rows inserted"
+            )
 
-    # ── Verify counts ─────────────────────────────────────────────────────────
-    n_s = client.query("SELECT count() FROM model_ops_suites").result_rows[0][0]
-    n_v = client.query("SELECT count() FROM model_ops_variants").result_rows[0][0]
+        n_s = client.query("SELECT count() FROM model_ops_suites").result_rows[0][0]
+        n_v = client.query("SELECT count() FROM model_ops_variants").result_rows[0][0]
+        print("\n[info] ── v1 ingest complete ───────────────────────────────────")
+        print(f"[info]   model_ops_suites   : {n_s} rows")
+        print(f"[info]   model_ops_variants : {n_v} rows")
+        print(f"[info]   gha_run_id         : {gha_run_id}")
 
-    print("\n[info] ── Ingest complete ──────────────────────────────────────────")
-    print(f"[info]   model_ops_suites   : {n_s} rows")
-    print(f"[info]   model_ops_variants : {n_v} rows")
-    print(f"[info]   gha_run_id         : {gha_run_id}")
-    print(f"[info]   workflow           : {args.workflow}")
-    print(f"[info]   branch             : {args.branch}")
-    print(f"[info]   sha                : {args.sha[:12]}")
+    # ── schema-v2: capabilities + capability_runs ─────────────────────────────
+    # Wrapped so a v2 failure never costs the v1 rows already inserted above. The v1 suites
+    # table has no v2 counterpart: its counters are derivable from the verdicts (and already
+    # disagreed with them), so a view aggregates instead of a second writer.
+    if args.write_v2:
+        v2db = target_database()
+        if not v2db:
+            print(
+                "[warn] --schema asks for v2 but CLICKHOUSE_DB_V2 is unset — skipping"
+            )
+        else:
+            try:
+                if not tables_present(
+                    client, v2db, tables=(CAPABILITIES, CAPABILITY_RUNS)
+                ):
+                    print(f"[warn] v2 tables missing in {v2db} — skipping v2 write")
+                else:
+                    component = component_of(args, default="torch-spyre")
+                    arch = canonical_arch(args.arch)
+                    external = _str(args.gha_run_id or args.run_id)
+                    run_id = run_id_for(args, external, arch, args.trigger_type)
+                    if not run_id:
+                        print("[warn] v2: no run_id derivable — skipping v2 write")
+                    elif capabilities_already_ingested(
+                        client, v2db, run_id, component, "model_ops"
+                    ):
+                        print(f"[info] v2: run_id={run_id} model_ops already ingested")
+                    else:
+                        results = _v2_capability_results(records)
+                        n = insert_capabilities(
+                            client,
+                            v2db,
+                            component,
+                            run_id,
+                            "model_ops",
+                            results,
+                            arch=arch,
+                            disc_keys=V2_DISC_KEYS,
+                        )
+                        print("\n[info] ── v2 ingest complete ────────────────────")
+                        print(f"[info]   capability_runs    : {n} verdicts")
+                        print(f"[info]   run_id             : {run_id}")
+                        print(f"[info]   component/arch     : {component} / {arch}")
+            except Exception as exc:
+                print(
+                    f"[warn] v2 write failed (v1 rows unaffected): {exc}",
+                    file=sys.stderr,
+                )
 
 
 if __name__ == "__main__":

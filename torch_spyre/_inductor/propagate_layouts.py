@@ -82,6 +82,7 @@ from .ir import (
 from .pass_utils import (
     compute_restickify_target_layout,
     concretize_expr,
+    expand_sparse,
     find_matmul_generated_var,
     find_reduction_var,
     get_matmul_m_size,
@@ -92,7 +93,6 @@ from .pass_utils import (
     try_device_coordinates,
     indirect_info_from_op,
     is_keep_by_index,
-    is_sparse_stl,
     is_stick_expr_offset_free,
     is_topk,
     iter_var_id,
@@ -219,6 +219,30 @@ def _compute_dim_order(stick_dim, size, coords):
     return dim_order
 
 
+def _project_pointwise_dim_order(
+    dim_order: list[int], output_rank: int, input_rank: int
+) -> list[int]:
+    """Project a pointwise output order onto a trailing-aligned input."""
+    rank_diff = output_rank - input_rank
+
+    if rank_diff == -1 and dim_order[-1] == -1:
+        return dim_order
+
+    if rank_diff >= 0:
+        return [
+            (d - rank_diff if d != -1 else d)
+            for d in dim_order
+            if (d >= rank_diff or d == -1)
+        ]
+
+    # A loop tile can be a rank-preserving view of a higher-rank backing
+    # buffer. Its extra leading axes are fixed by the loop, while the body
+    # operates on the trailing axes. Keep those backing axes in the layout
+    # permutation and shift the body's order onto the trailing dimensions.
+    leading = list(range(-rank_diff))
+    return leading + [(d - rank_diff if d != -1 else d) for d in dim_order]
+
+
 def _pick_stick_dim(stick_expr, out_coords) -> int:
     """Map a stick expression to an output dimension index, or -1 if it doesn't survive."""
     maybe = matching_dim(out_coords, stick_expr)
@@ -238,7 +262,9 @@ def _output_stl_from_stick_expr(
         return None
     out_coords = host_coordinates(output, output_dep, None)
     out_stick_dim = _pick_stick_dim(stick_expr, out_coords)
-    return _make_output_stl(output, output_dep, c_size, c_stride, out_stick_dim, dtype)
+    return _make_output_stl(
+        out_coords, output_dep, c_size, c_stride, out_stick_dim, dtype
+    )
 
 
 def _dims_by_alignment(dims, sizes, stick_size: int) -> tuple[list[int], list[int]]:
@@ -259,17 +285,15 @@ def _dims_by_alignment(dims, sizes, stick_size: int) -> tuple[list[int], list[in
 
 
 def _make_output_stl(
-    output, output_dep, c_size, c_stride, stick_dim, dtype=None
+    out_coords, output_dep, c_size, c_stride, stick_dim, dtype
 ) -> SpyreTensorLayout | None:
     """Build a candidate output STL with stick_dim last and verify the resulting stick is offset-free.
 
     Returns None if the resulting stick expression has an offset.
     """
-    dtype = output.dtype if dtype is None else dtype
     stick_size = get_elem_in_stick(dtype)
     if stick_dim >= 0 and c_size[stick_dim] == 1:
         return None
-    out_coords = host_coordinates(output, output_dep, None)
     dim_order = _compute_dim_order(stick_dim, c_size, out_coords)
     stl = SpyreTensorLayout(c_size, c_stride, dtype, dim_order)
     coords = device_coordinates(stl, output_dep, None)
@@ -279,30 +303,28 @@ def _make_output_stl(
 
 
 def _candidate_output_stls(
-    output: FixedLayout,
+    out_coords,
     output_dep: MemoryDep,
     c_size: list,
     c_stride: list,
     skip_stick_expr: sympy.Expr,
-    dtype=None,
+    dtype,
 ) -> list[SpyreTensorLayout]:
     """Enumerate candidate output STLs by trying each dim as the stick.
 
     Skip the dim that already produces an unsupported stick.
     """
-    out_coords = host_coordinates(output, output_dep, None)
     skip_dim = _pick_stick_dim(skip_stick_expr, out_coords)
 
-    dtype = output.dtype if dtype is None else dtype
     stick_size = get_elem_in_stick(dtype)
     # Prefer stick-aligned dims; fall back to unaligned dims (padded later by
     # insert_restickify_padding) only when no aligned dim yields a candidate.
-    all_dims = [d for d in range(len(output.size)) if d != skip_dim]
-    aligned_dims, unaligned_dims = _dims_by_alignment(all_dims, output.size, stick_size)
+    all_dims = [d for d in range(len(c_size)) if d != skip_dim]
+    aligned_dims, unaligned_dims = _dims_by_alignment(all_dims, c_size, stick_size)
     stls: list[SpyreTensorLayout] = []
     for dims in (aligned_dims, unaligned_dims):
         for d in dims:
-            stl = _make_output_stl(output, output_dep, c_size, c_stride, d, dtype)
+            stl = _make_output_stl(out_coords, output_dep, c_size, c_stride, d, dtype)
             if stl is not None:
                 stls.append(stl)
         if stls:
@@ -430,7 +452,7 @@ def _qfp8wt_stl(
         in_layout: Inductor ``FixedLayout`` for the op's input tensor.
     """
     in_eps = get_elem_in_stick(in_layout.dtype)
-    stick_dim_size = in_layout.size[-1]
+    stick_dim_size = concretize_expr(in_layout.size[-1])
     unaligned = stick_dim_size % in_eps
     outer_sizes = [concretize_expr(s) for s in output.size[:-1]]
     outer_strides = [concretize_expr(s) for s in output.stride[:-1]]
@@ -522,7 +544,7 @@ def _single_arg_op_layout(
                     if out_stick_dim < 0:
                         continue
                 out_stl = _make_output_stl(
-                    output,
+                    out_coords,
                     output_dep,
                     c_size,
                     c_stride,
@@ -685,7 +707,7 @@ def _single_arg_op_layout(
     if out_stl is not None:
         return [out_stl]
     return _candidate_output_stls(
-        output,
+        out_coords,
         output_dep,
         c_size,
         c_stride,
@@ -715,9 +737,7 @@ def _clone_layout(
     data = op.data
 
     assert isinstance(data, Pointwise)
-    origin_node = next(iter(data.origins))
-    aten_op = origin_node.target
-    assert aten_op == aten.clone.default
+    assert any(origin.target == aten.clone.default for origin in data.origins)
 
     in_dep = args[0].dep
     in_stl = next(iter(args[0].layouts))
@@ -754,7 +774,7 @@ def _clone_layout(
     in_host_coords = host_coordinates(in_layout, in_dep, None)
     required_in_stl = None
     for candidate in _candidate_output_stls(
-        output, output_dep, c_size, c_stride, stick_expr, dtype_for_layout
+        out_coords, output_dep, c_size, c_stride, stick_expr, dtype_for_layout
     ):
         target_stick = device_coordinates(candidate, output_dep, None)[-1]
         target_stl = compute_restickify_target_layout(
@@ -1549,11 +1569,15 @@ def _multi_arg_pointwise_layouts(
 
     def _is_supported_layout(dim_order):
         for arg in args:
-            # Project output dim_order to input, dropping leading dims missing due to broadcast.
-            rank_diff = len(output.size) - len(arg.layout.size)
-            projected_dim_order = [d - rank_diff for d in dim_order if d >= rank_diff]
+            projected_dim_order = _project_pointwise_dim_order(
+                dim_order, len(output.size), len(arg.layout.size)
+            )
             c_in_size = [concretize_expr(s) for s in arg.layout.size]
             c_in_stride = [concretize_expr(s) for s in arg.layout.stride]
+            if len(c_in_size) < len(dim_order) and dim_order[-1] == -1:
+                c_in_size.append(0)
+                c_in_stride.append(0)
+            assert len(c_in_size) == len(projected_dim_order)
             in_stl = SpyreTensorLayout(
                 c_in_size,
                 c_in_stride,
@@ -1575,6 +1599,8 @@ def _multi_arg_pointwise_layouts(
                         return False
         return True
 
+    results: list[SpyreTensorLayout] = []
+
     def _try_stick_dim(stick_dim):
         dim_order = _compute_dim_order(stick_dim, c_size, out_coords)
         if _is_supported_layout(dim_order):
@@ -1583,8 +1609,6 @@ def _multi_arg_pointwise_layouts(
                     c_size, c_stride, out_dtype_for_layout, dim_order, output_ea
                 )
             )
-
-    results: list[SpyreTensorLayout] = []
 
     if can_use_same_layout:
         template_stl = next(iter(args[0].layouts))
@@ -1748,7 +1772,9 @@ def _topk_layouts(
             out_dim_order += [out_stick_dim]
         results.append(SpyreTensorLayout(c_size, c_stride, output.dtype, out_dim_order))
 
-    op.restick_cost_fn = AllSameNode.from_args(args, results, output_dep, op)
+    op.restick_cost_fn = AllSameNode.from_args(
+        args, results, output_dep, op, forbidden_stick_sym=reduction_var
+    )
     return results
 
 
@@ -1767,28 +1793,7 @@ def _compact_layout(
     out_layouts = []
 
     for in_stl in in_arg.layouts:
-        c_size = [concretize_expr(s) for s in output.size]
-        c_stride = [concretize_expr(s) for s in output.stride]
-
-        out_stl = SpyreTensorLayout(
-            c_size, c_stride, output.dtype, list(range(len(output.size)))
-        )
-
-        in_is_sparse = is_sparse_stl(in_stl)
-        out_is_sparse = is_sparse_stl(out_stl)
-
-        if not in_is_sparse:
-            assert not out_is_sparse
-
-        restick = len(in_stl.device_size) > 1 and in_is_sparse and not out_is_sparse
-
-        if restick:
-            out_stl = SpyreTensorLayout(
-                [in_stl.elems_per_stick()] + out_stl.device_size,
-                [c_stride[0] * c_size[0]] + out_stl.stride_map,
-                out_stl.device_dtype,
-            )
-
+        _, out_stl = expand_sparse(in_stl, output)
         out_layouts.append(out_stl)
 
     op.restick_cost_fn = AnyInNode.from_args()
@@ -1944,7 +1949,7 @@ def compute_layouts(
     if aten_op == spyreop.compact.default:
         return _compact_layout(op, output, output_dep, args)
 
-    if aten_op == aten.clone.default:
+    if any(origin.target == aten.clone.default for origin in data.origins):
         # clone materializes a new buffer in a fixed row-major layout regardless of
         # input stick — equivalent to a restickify. No restickify before it is needed,
         # unless there is an offset in the stick dimension.
@@ -2012,8 +2017,9 @@ def generic_layout(op: Operation) -> SpyreTensorLayout:
 
 def _generic_layout_for(output: FixedLayout) -> SpyreTensorLayout:
     # tl;dr: usually pick the blind identity stick-dim order; only override
-    # it for a FixedLayout whose most-contiguous dim isn't already last,
-    # since that's the one shape where the blind order is provably wrong.
+    # it for a FixedLayout whose most-contiguous REAL dim isn't already
+    # last, since that's the one shape where the blind order is provably
+    # wrong.
     #
     # Concretize for C++ SpyreTensorLayout constructor.
     c_size = [concretize_expr(s) for s in output.size]
@@ -2021,29 +2027,48 @@ def _generic_layout_for(output: FixedLayout) -> SpyreTensorLayout:
     # SpyreTensorLayout's bare (size, dtype) constructor synthesizes its own
     # row-major host strides from size alone (identity dim order, last dim =
     # stick dim) -- blind to output.stride. That's correct for the
-    # overwhelming majority of ops, including a BROADCAST layout (zero
-    # stride) like test_building_blocks' causal-SDPA buf29 -- so it's left
-    # in place except in the one case below.
+    # overwhelming majority of ops, including a purely-broadcast layout
+    # (every dim zero stride) like test_building_blocks' causal-SDPA buf29
+    # -- so it's left in place except in the one case below.
     #
     # A FixedLayout can carry a non-monotonic stride whose last dim is NOT
-    # its most-contiguous one (e.g. it's shared with a later mutation write
-    # into the same buffer, as in test_map_mode_split_m's transposed pad
-    # target, size=[6, 64] stride=[1, 6]). There the blind order picks the
-    # wrong stick dim, producing an unrepresentable stick expression
-    # downstream ("Unexpected stick expression d0 + 2*(Mod(3*d1, 32))" out of
-    # _find_alt_target_stl's device_coordinates call). The two conditions
-    # below isolate exactly that case (no zero strides, so broadcast layouts
-    # like buf29 are excluded; min stride not already last, so a natural
-    # row-major layout is untouched) and sort dims by decreasing stride
-    # (ties by original position) so the most-contiguous dim lands last,
-    # matching every other SpyreTensorLayout call site in this module (e.g.
-    # _all_constant_layouts, _make_output_stl).
+    # its most-contiguous REAL (non-broadcast) dim (e.g. it's shared with a
+    # later mutation write into the same buffer, as in
+    # test_map_mode_split_m's transposed pad target, size=[6, 64]
+    # stride=[1, 6], or issue #4460's constant_pad_nd target buf60, size=
+    # [2, 6, 64] stride=[0, 1, 6] -- a legitimate broadcast dim (stride 0,
+    # size 2) alongside two real dims that are themselves non-monotonic).
+    # There the blind order picks the wrong stick dim, producing an
+    # unrepresentable stick expression downstream ("Unexpected stick
+    # expression d0 + 2*(Mod(3*d1, 32))" out of _find_alt_target_stl's
+    # device_coordinates call).
+    #
+    # A broadcast dim (stride 0, size > 1) has no real address contribution
+    # and must never be picked as the stick dim, nor influence which real
+    # dim is most-contiguous -- ranking it by its raw stride value would
+    # place it first (0 sorts as smallest), corrupting the choice. Exclude
+    # broadcast dims from the ranking (mirroring lower_pad_sequence's own
+    # broadcast-dim exclusion in pass_utils.py) and place them ahead of the
+    # ranked real dims in dim_order; a size-1 dim's stride is irrelevant
+    # regardless.
+    #
+    # The two conditions below isolate exactly the "non-monotonic among
+    # real dims" case (at least one nonzero stride to rank; most-contiguous
+    # real dim not already last) and sort the real dims by decreasing
+    # stride (ties by original position) so the most-contiguous one lands
+    # last, matching every other SpyreTensorLayout call site in this module
+    # (e.g. _all_constant_layouts, _make_output_stl).
+    real_dims = [
+        d for d in range(len(c_size)) if not (c_stride[d] == 0 and c_size[d] > 1)
+    ]
     if (
         len(c_size) > 1
-        and all(s != 0 for s in c_stride)
-        and min(c_stride) != c_stride[-1]
+        and real_dims
+        and min(c_stride[d] for d in real_dims) != c_stride[-1]
     ):
-        dim_order = sorted(range(len(c_size)), key=lambda d: (-c_stride[d], d))
+        broadcast_dims = [d for d in range(len(c_size)) if d not in real_dims]
+        ordered_real = sorted(real_dims, key=lambda d: (-c_stride[d], d))
+        dim_order = broadcast_dims + ordered_real
         return SpyreTensorLayout(c_size, c_stride, output.dtype, dim_order)
     return SpyreTensorLayout(c_size, output.dtype)
 
@@ -2286,8 +2311,9 @@ def _find_alt_target_stl(
 
     c_size = [concretize_expr(s) for s in target_layout.size]
     c_stride = [concretize_expr(s) for s in target_layout.stride]
+    target_coords = host_coordinates(target_layout, output_dep, None)
     candidates = _candidate_output_stls(
-        target_layout, output_dep, c_size, c_stride, write_stick, dtype_for_layout
+        target_coords, output_dep, c_size, c_stride, write_stick, dtype_for_layout
     )
     if not candidates:
         raise Unsupported(
@@ -2649,7 +2675,7 @@ def propagate_spyre_tensor_layouts(
                     # Treat the mutation op like a normal pointwise op: run
                     # _multi_arg_pointwise_layouts with the non-target inputs.
                     # This enforces input-compatibility and slice constraints,
-                    # so the backend DDL slice check passes.
+                    # so the backend slice check passes.
                     rw = op.get_read_writes()
                     output_dep = next(iter(rw.writes))
                     all_args = _get_prop_args(rw.reads)
@@ -2923,16 +2949,20 @@ def _real_layout_matches_op_size(
     body's own mutation op writes only a `[2, 6]` tile of a `[4, 2, 6]`
     invariant buffer at an offset like `12*u0`).
 
-    A *static* ReinterpretView slice (concrete, symbol-free offset) of a
-    buffer that already has its own committed FixedTiledLayout is not that
-    case: the op writes a fixed sub-region of a real, already-laid-out
-    buffer once (e.g. constant_pad_nd's fill/copy ops writing the pad strip
-    vs. the copied interior of the same padded output buffer), so
-    real_layout() -- the target buffer's own layout -- is exactly right to
-    reuse, size mismatch notwithstanding: this op's write is smaller than
-    the buffer only because it is one piece of it, not because real_layout()
-    picked the wrong tiling scheme.
+    A *static*, rank-preserving ReinterpretView slice (concrete, symbol-free
+    offset) of a buffer that already has its own committed FixedTiledLayout
+    is not that case: the op writes a fixed sub-region of a real,
+    already-laid-out buffer once (e.g. constant_pad_nd's fill/copy ops writing
+    the pad strip vs. the copied interior of the same padded output buffer),
+    so real_layout() -- the target buffer's own layout -- is exactly right to
+    reuse, size mismatch notwithstanding.  A rank-changing view is different:
+    its logical coordinates cannot be indexed with the backing layout's
+    strides, even when the offset is static, so it must use the clean logical
+    layout built below.
     """
+    logical_size = list(node.data.get_size())
+    if len(logical_size) != len(real.size):
+        return False
     if list(node.get_layout().size) == list(real.size):
         return True
     target = node.get_layout().target
@@ -3061,17 +3091,6 @@ def propagate_mutation_layouts(
                     output.stride,
                     layouts[0],
                     offset=output.offset,
-                )
-        elif isinstance(n.node.data, Reduction):
-            real = n.node.layout.real_layout()
-            if isinstance(real, FixedTiledLayout) and _real_layout_matches_op_size(
-                n.node, real
-            ):
-                n.node.layout = real
-            else:
-                logger.warning(
-                    "propagate_mutation_layouts: unhandled mutation Reduction"
-                    f" op {n.node.get_name()}: real_layout is {type(real)}"
                 )
         else:
             logger.warning(

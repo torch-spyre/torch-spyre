@@ -49,11 +49,15 @@ Model (per fused bundle / single-op kernel):
   its allocation. LX-placed tensors don't touch HBM, and their LX traffic is treated
   as ~free (the measured per-pass LX cost is below run-to-run noise). The exception is
   a GRAPH BOUNDARY transfer (a graph input's read, a graph output's write): the planner
-  pins such a buffer by CLONING it, and the clone still moves those bytes through HBM,
-  so they stay charged when the buffer is LX-resident (``ArgTraffic.is_boundary``; issue
-  #4271). The clone-in load is charged to the first bundle that reads the input, since
-  one clone serves the whole graph (``charge_boundary_reads_once`` clears
-  ``owns_boundary_charge`` on the rest, keeping them de-duplicable). Broadcast inputs
+  pins such a buffer by CLONING it, and the clone still moves those bytes through HBM
+  (``ArgTraffic.is_boundary``; issue #4271). A graph output's write stays charged in its
+  producer's bundle when LX-resident. A resident graph input's READERS are served from
+  LX like any other resident arg; the clone's own load is a separate CLONE-IN term
+  (``ArgTraffic.clone_in_elems``), charged to the first bundle that reads the input,
+  since one clone serves the whole graph (``charge_boundary_reads_once`` clears
+  ``owns_boundary_charge`` on the rest, keeping them de-duplicable). The clone is its
+  own read-only DSC, so the term is priced at BW_PEAK OUTSIDE the bundle's turnaround and
+  compute overlap, like an LX relayout copy (measurement in ``predict_ops``). Broadcast inputs
   are loaded ONCE and reused across the broadcast dim, so they are counted at their own
   (one-row/-col) DEVICE size -- NOT scaled up to the output size (the rung-6 runs proved
   a core does not re-read the operand per output element), but NOT dropped to zero
@@ -64,6 +68,20 @@ Model (per fused bundle / single-op kernel):
   30-33us, both far below the full 3-pass add (52us). A per-core reload would have added
   ~cores*C and pushed bcast up toward add; it did not -- so the operand costs a single
   load regardless of how the work splits across cores.
+- NON-SHARED MATMUL operands are the exception (``ArgTraffic.replication``): a bmm whose core split
+  lies on a dim an operand does not index (M-split -> B, N-split -> A) makes every core
+  in that split load its own full copy of the operand's slice from HBM. The grouped
+  LX-relayout sweep (2026-09-09, 43 gather/broadcast rows, replication 2-16) measured
+  the consumer-from-HBM time as ~2.5us + f*B at 60-67 GB/s -- f times the one-load
+  bytes -- and the once-per-input count under-predicted the demote penalty 10-40x.
+  Those loads also run at a PER-CORE ceiling (~2.3 GB/s per core; flat in rows per
+  core and in core count, rows-per-core ladder 2026-09-10), so they are priced as
+  per-core bytes over ``mm_replicated_read_gbps_per_core`` rather than at BW_PEAK.
+  Residency removes all f loads; a resident graph input adds only its one clone-in load.
+  Shared matmul inputs (``broadcast``) instead count one physical HBM load plus
+  delivery time based on how many cores consume it. This accounting applies to
+  both matmul models; the bundled model's large-output-tile reread term remains
+  separate and is not refitted here.
 
 Byte counts use each arg's DEVICE layout (stick-padded ``device_size``), not the torch
 logical shape -- so a reduction's reduced input is naturally full-sized and stick
@@ -77,11 +95,13 @@ for a split reduced axis was dropped as sub-noise -- provably <=~5ns on us kerne
 MATMUL (reduction_type batchmatmul) is priced by one of two independent
 implementations, switched on ``CostParams.use_bundled_cost_model``:
 
-- UPSTREAM (``use_bundled_cost_model=False``): the compute/split-shape part of
-  ``work_division._matmul_split_cost`` -- the same heuristic the work-division planner
-  uses to choose a matmul's core split, called with ``include_hbm=False``. Its own
+- UPSTREAM (``use_bundled_cost_model=False``): the computation and partial-sum part of
+  ``work_division._matmul_execution_cost``, shared with the work-division planner.
+  Standalone split-ranking preferences are excluded: they are not operation times.
+  It is called with ``include_hbm=False``. Its own
   HBM-traffic term is dropped because the bundle memory term below already charges the
   operand/output bytes, and does so LX-aware; charging both double-counts memory.
+  ``predict_ops`` also charges shared-input delivery. CP-SAT uses this model.
 
 - BUNDLED (``use_bundled_cost_model=True``): the original device-calibrated model,
   kept alongside the above rather than deleted. Adds a compute term that OVERLAPS the
@@ -156,7 +176,13 @@ from typing import Optional
 
 import sympy
 
-from .work_division import _matmul_split_cost, min, max, log2
+from .work_division import (
+    _matmul_execution_cost,
+    _matmul_multicast_penalty,
+    min,
+    max,
+    log2,
+)
 from . import config
 
 
@@ -168,7 +194,8 @@ class ArgTraffic:
     role: str  # "input" | "output"
     is_lx: bool
     elems: int  # device element count = prod(dims) (its own one-load size)
-    broadcast: bool = False  # loaded once & reused across the broadcast dim
+    # One physical load shared by `replication` consumers, or reused locally.
+    broadcast: bool = False
     # DEVICE (stick) shape, e.g. [4, 512, 64]
     dims: list = dataclasses.field(default_factory=list)
     # LOGICAL torch shape, e.g. [512, 1024] -- shown next to dims so the stickification
@@ -184,21 +211,37 @@ class ArgTraffic:
     # This arg's traffic crosses the GRAPH boundary, so LX residency cannot remove it:
     # a read of a graph input, or the externally-visible write of a graph output. The
     # scratchpad planner pins such a buffer by CLONING it (allocator._push_allocation),
-    # and the clone still performs this transfer -- so it stays charged even when
-    # ``is_lx``. A property of the (tensor, op, role) triple, not of the tensor: a
-    # buffer that is both a graph input and a graph output (a returned view of an
-    # input; a mutated input that is returned) is stamped per arg, and its
-    # graph-input reads and graph-output write never collide. ``None`` = a record
-    # captured before this field existed; the name heuristic below stands in.
+    # and the clone still performs this transfer. For a graph output it stays in the
+    # producer's write even when ``is_lx``; for a graph input the reader is served
+    # from LX and the clone's load is ``clone_in_elems``. A property of the (tensor,
+    # op, role) triple, not of the tensor: a buffer that is both a graph input and a
+    # graph output (a returned view of an input; a mutated input that is returned) is
+    # stamped per arg, and its graph-input reads and graph-output write never collide.
+    # ``None`` = a record captured before this field existed; the name heuristic below
+    # stands in.
     is_boundary: bool | None = None
-    # Whether THIS bundle pays the boundary transfer, as opposed to an earlier one
-    # that already did. Orthogonal to ``is_boundary``, which stays exactly as
+    # Whether THIS bundle pays a graph input's clone-in load, as opposed to an earlier
+    # one that already did. Orthogonal to ``is_boundary``, which stays exactly as
     # extraction stamped it: one clone serves the whole graph, so
     # ``charge_boundary_reads_once`` clears this on every reader after the first
     # while leaving the arg recognisable as a graph input -- which is also the key
-    # ``_fused_hbm_bytes`` de-duplicates on. Meaningless, and left True, on an arg
-    # that is not a boundary arg.
+    # ``_fused_hbm_bytes`` and ``_clone_in_bytes`` de-duplicate on. Meaningless, and
+    # left True, on an arg that is not a graph-input read.
     owns_boundary_charge: bool = True
+    # Number of consumer copies: the product of the
+    # consumer's core splits on iteration dims this arg's read index does NOT
+    # contain. Every such split places a full copy of the arg's slice on another
+    # core. Unless broadcast marks a shared load, each core performs its own
+    # load, so HBM bytes scale by this factor when non-resident. A shared load
+    # pays physical bytes once but retains this degree for delivery cost.
+    # 1 for an arg indexed by every split
+    # dim (a permutation; each core reads exactly its own slice). Stamped for
+    # MATMUL consumers only: the grouped-relayout sweep (2026-09-09) measured a
+    # bmm reading a replicated operand at f x bytes (2.5 us + f*B at 60-67 GB/s),
+    # while the rung-G probe verified that a POINTWISE broadcast operand is loaded
+    # once, not per core (see ``broadcast``). May be a sympy expression of the
+    # solver's split symbols in the co-optimizing path.
+    replication: int = 1
 
     @property
     def is_graph_boundary(self) -> bool:
@@ -212,16 +255,56 @@ class ArgTraffic:
         return self.role == "input" and self.name.startswith("arg")
 
     def hbm_elems(self):
-        """Device elements this arg moves through HBM, loop-scaled. Zero when the arg
-        is LX-resident -- unless this bundle pays a graph-boundary transfer, which
-        residency cannot remove. A boundary arg whose charge belongs to an earlier
-        bundle is priced like any other arg: the clone loaded it, so residency does
-        free this read, and without residency every bundle re-reads it from HBM.
-        ``is_lx`` may be a solver decision variable, so the residency factor stays
-        arithmetic (``1 - is_lx``) rather than a branch."""
-        if self.is_graph_boundary and self.owns_boundary_charge:
-            return self.elems * self.loop_factor
-        return self.elems * self.loop_factor * (1 - self.is_lx)
+        """Device elements this op's own pass moves through HBM for this arg,
+        loop-scaled. Zero when the arg is LX-resident -- including a resident graph
+        input, whose readers the clone serves from LX (its one load is
+        :meth:`clone_in_elems`, priced separately). The exception is a graph output's
+        write, which the clone-out still performs, so it stays charged. ``is_lx`` may
+        be a solver decision variable, so the residency factor stays arithmetic
+        (``1 - is_lx``) rather than a branch.
+
+        Non-broadcast replicas each load from HBM. Broadcast replicas share one
+        physical load; residency removes either kind of direct HBM read."""
+        # A bool residency next to a symbolic replication (a fixed-residency buffer
+        # read under a solver-chosen split) must add as 0/1, not as a sympy Boolean.
+        is_lx = int(self.is_lx) if isinstance(self.is_lx, bool) else self.is_lx
+        replication = 1 if self.role == "input" and self.broadcast else self.replication
+        if self.role == "output" and self.is_graph_boundary:
+            return (
+                self.elems * self.loop_factor * (is_lx + self.replication * (1 - is_lx))
+            )
+        return self.elems * self.loop_factor * replication * (1 - is_lx)
+
+    def clone_in_elems(self):
+        """Device elements the clone of a resident graph input loads from HBM: one
+        aggregate load of ``elems``, charged only to the bundle that owns the input's
+        boundary charge (``owns_boundary_charge``), and zero for every other arg.
+
+        The clone is one untiled pass, so neither ``replication`` nor ``loop_factor``
+        scales it: the replicas and the loop iterations are what its readers would
+        otherwise load, and they read from LX instead. Linear in ``is_lx``."""
+        if not (
+            self.role == "input"
+            and self.is_graph_boundary
+            and self.owns_boundary_charge
+        ):
+            return 0
+        return self.elems * self.is_lx
+
+    def replicated_hbm_elems(self):
+        """The share of :meth:`hbm_elems` that is a per-core replica load: all of a
+        non-resident replicated operand's loads, none once it is resident. Zero when
+        ``replication`` is 1 (nothing to price differently), so callers can subtract it
+        from ``hbm_elems`` unconditionally."""
+        if self.broadcast or self.replication == 1:
+            return 0
+        loads = self.elems * self.loop_factor * self.replication * (1 - self.is_lx)
+        if isinstance(self.replication, sympy.Basic):
+            # A candidate can choose no replication. Keep that same case in the
+            # symbolic price; otherwise ordinary partitioned reads pay the much
+            # lower per-core replica rate merely because the split was undecided.
+            loads *= sympy.Piecewise((0, sympy.Eq(self.replication, 1)), (1, True))
+        return loads
 
     @property
     def mem(self) -> str:
@@ -292,6 +375,8 @@ class OpFeatures:
     # ``cores / owners`` via a future ``relayout_owners`` feature, not by a bytes
     # field).
     is_lx_relayout: bool = False
+    # Stores with a known contiguous, indirect row write.
+    is_indirect_store: bool = False
     # Per-core contiguous run, in ELEMENTS, of the finer (governing) of the two
     # PerCoreViews: (device_size[d] // split[d]) * prod(device_size[d+1:]) for the
     # innermost split dim d. The 10x-at-fixed-bytes variable.
@@ -306,8 +391,8 @@ class OpFeatures:
         scaled by ``loop_factor`` (L for a per-tile accumulator re-read every iteration,
         1 for an advancing tiled arg or a normal arg). A broadcast operand carries its
         real (one-row/-col) ``elems`` -- loaded once, NOT scaled to the output. A read
-        of a GRAPH INPUT stays charged when LX-resident: pinning it inserts a clone that
-        performs exactly this load (``ArgTraffic.is_boundary``).
+        of a resident GRAPH INPUT is served from LX by its clone, whose own load is
+        :meth:`clone_in_bytes`, not part of this op's read.
         """
         return (
             sum(a.hbm_elems() for a in self.args if a.role == "input")
@@ -316,16 +401,21 @@ class OpFeatures:
 
     def write_bytes(self) -> int:
         """HBM bytes WRITTEN (output args), scaled by ``loop_factor``. A GRAPH OUTPUT's
-        write stays charged when LX-resident, for the mirror-image reason
-        ``read_bytes`` gives: the clone-out still writes it to HBM."""
+        write stays charged when LX-resident: the clone-out still writes it to HBM."""
         return (
             sum(a.hbm_elems() for a in self.args if a.role == "output")
             * self.dtype_bytes
         )
 
+    def clone_in_bytes(self) -> int:
+        """HBM bytes the clones of this op's resident graph inputs load, for the inputs
+        whose clone-in this op's bundle owns (``ArgTraffic.clone_in_elems``)."""
+        return sum(a.clone_in_elems() for a in self.args) * self.dtype_bytes
+
     def hbm_bytes(self) -> int:
-        """Total HBM traffic = read + write (kept for the dump / LAST_IO totals)."""
-        return self.read_bytes() + self.write_bytes()
+        """Total HBM traffic = read + write + clone-in (kept for the dump / LAST_IO
+        totals)."""
+        return self.read_bytes() + self.write_bytes() + self.clone_in_bytes()
 
     def lx_bytes(self) -> int:
         return sum(a.elems * a.is_lx for a in self.args) * self.dtype_bytes
@@ -525,7 +615,7 @@ class CostParams:
     # Switch between the two matmul cost implementations (see the module docstring).
     # True (default) -- matmul uses the original device-calibrated
     # compute/HBM/spill/split-shape model below (``_matmul_ns_bundled``).
-    # False -- delegates matmul entirely to ``work_division._matmul_split_cost``.
+    # False -- delegates matmul entirely to ``work_division._matmul_execution_cost``.
     use_bundled_cost_model: bool = True
     # MATMUL compute term. T_matmul = max(compute, HBM), where
     # compute = MACs/cores/(mac_peak*pt_eff). mac_peak=1140 (sustained) fit on the
@@ -564,6 +654,9 @@ class CostParams:
     # geometry, no trend). NO loop_trip factor: a relayout inside a coarse-tiling loop
     # is structurally impossible today (the planner rejects coarse_tile_copy
     # consumers).
+    # The negative intercept is the fitted value, not a typo: a small-run
+    # extrapolation artifact of the linear-in-log2(split) per-run form. The
+    # split clamp to [2, 8] keeps the per-run term positive over its domain.
     relayout_run_a_ns: float = -1.14  # per-run cost intercept
     relayout_run_b_ns: float = 3.92  # per-run cost log2(split) slope
     relayout_span_gbps: float = 547.0  # per-core stride-limited walk rate
@@ -613,6 +706,18 @@ class CostParams:
     # these data.
     mm_bw_read_gbps: float = 150.0
     mm_bw_write_gbps: float = 150.0
+    # SEPARATE matmul reads (replication > 1, broadcast=False): every consumer
+    # loads its own copy of the operand's slice, and it does so at a
+    # PER-CORE ceiling, not at the shared HBM peak. Rows-per-core ladder (2026-09-10,
+    # 13 rungs) plus the grouped-relayout sweep (2026-09-09, 43 rows): the consumer's
+    # read time is FLAT in query rows per core (1..16) and in the core count (4..32),
+    # and scales only with the bytes each core reads -- 56 points fit
+    # ``t = per_core_bytes / 2.27 GB/s`` with a ~0 intercept, 46 of them within 10%.
+    # So the term is per-core bytes over this rate; the shared peak never binds below
+    # 64 cores (32 x 2.3 = 74 GB/s < 150). Applied to replicated operand bytes ONLY:
+    # whether a matmul's non-replicated operand reads share the ceiling was not
+    # measured (every row here read a replicated operand), so those keep mm_bw_read.
+    mm_replicated_read_gbps_per_core: float = 2.3
     # DEFAULT-LAYOUT BMM slow compute rate (cat 4). A batched matmul whose BOTH rank-3
     # operands carry the COMPILER-DEFAULT [0,1,2] device tile order -- the batch dim B
     # sits just inside the stick (device pos -2) -- runs the systolic array at a much
@@ -760,6 +865,11 @@ class CostParams:
     red_bw_cores_g: dict = dataclasses.field(
         default_factory=lambda: {1: 0.11, 2: 0.22, 4: 0.43, 8: 0.54, 16: 0.54, 32: 1.0}
     )
+    # Initial rate for contiguous indirect row stores, in GB/s per writing core.
+    # Fitted to FP16 cache writes (256/512 rows, 128 values per row). This captures
+    # the large 1-to-many-core gain, not the smaller measured 4-vs-16 ranking.
+    # The shared bus remains capped at bw_peak_gbps; 0 disables this correction.
+    store_gbps_per_core: float = 30.0
     # Ops that stream a FULL input plus a small BROADCAST operand (loaded once) -- copy
     # (x+const), bcast, bcastcol, mulbcast -- run FASTER than a plain 1R:1W op (~118 vs
     # ~105 GB/s; mechanism open). NOT `write` (both operands broadcast, no full input).
@@ -1139,6 +1249,17 @@ def relayout_ns(o: "OpFeatures", params: "CostParams | None" = None) -> float:
     )
 
 
+def _max_traffic(a, b):
+    """``max`` for byte counts that may be sympy expressions of the solver's
+    residency / split symbols (the co-optimizing path): Python's ``max`` compares
+    with ``>`` and raises on a symbolic relational, so fall back to ``sympy.Max``
+    when either side is symbolic. Two structurally equal expressions still collapse
+    to one, and numeric inputs take the plain ``max``."""
+    if isinstance(a, sympy.Basic) or isinstance(b, sympy.Basic):
+        return sympy.Max(a, b)
+    return max(a, b)
+
+
 def _fused_hbm_bytes(ops: list) -> tuple:
     """(read, write) HBM bytes for a FUSED bundle, counting each distinct EXTERNAL graph
     input (``ArgTraffic.is_graph_boundary`` on a read) ONCE even if several fused ops
@@ -1155,7 +1276,7 @@ def _fused_hbm_bytes(ops: list) -> tuple:
             b = a.hbm_elems() * o.dtype_bytes
             if a.role == "input" and a.is_graph_boundary:
                 if a.name in ext_in:
-                    ext_in[a.name] = max(ext_in[a.name], b)
+                    ext_in[a.name] = _max_traffic(ext_in[a.name], b)
                 else:
                     ext_in[a.name] = b
             elif a.role == "input":
@@ -1164,6 +1285,90 @@ def _fused_hbm_bytes(ops: list) -> tuple:
                 w += b
     r += sum(ext_in.values())
     return r, w
+
+
+def _clone_in_bytes(ops: list):
+    """HBM bytes a bundle's input clones load: each resident graph input whose clone-in
+    this bundle owns, counted ONCE however many of the bundle's ops read it (the same
+    by-name ``max`` de-duplication as ``_fused_hbm_bytes``). Kept out of the bundle's
+    read total, because the clone is its own read-only pass: ``predict_ops`` prices it
+    alone rather than inside the bundle's read/write turnaround."""
+    ext_in: dict = {}
+    for o in ops:
+        for a in o.args:
+            b = a.clone_in_elems() * o.dtype_bytes
+            if isinstance(b, int) and b == 0:
+                continue
+            ext_in[a.name] = _max_traffic(ext_in[a.name], b) if a.name in ext_in else b
+    return sum(ext_in.values())
+
+
+def _replicated_operand_reads(ops: list, p: "CostParams") -> tuple:
+    """(bytes, ns) of the REPLICATED matmul operand loads in a bundle.
+
+    These bytes are already inside ``_fused_hbm_bytes``'s read total (that is the
+    replication count of #4454); this prices them at the per-core ceiling instead of
+    the shared peak, so the caller subtracts ``bytes`` from R and adds ``ns``. Each
+    core reads ``bytes / cores`` of the operand, at
+    ``mm_replicated_read_gbps_per_core``. Boundary (graph-input) args are
+    de-duplicated by name with the same ``max`` rule as ``_fused_hbm_bytes`` so the
+    subtraction can never exceed what was counted. With symbolic splits this is
+    ``B * (1 - is_lx) / prod(indexed splits)``: sympy cancels ``replication / cores``
+    to the inverse of the splits the operand indexes, which the CP-SAT printer lowers
+    as ``inv_`` symbols and ``lambdify`` evaluates directly."""
+    total_bytes = 0
+    ns = 0
+    ext: dict = {}
+    for o in ops:
+        for a in o.args:
+            if a.role != "input":
+                continue
+            b = a.replicated_hbm_elems() * o.dtype_bytes
+            if isinstance(b, int) and b == 0:
+                continue
+            if a.is_graph_boundary:
+                if a.name in ext:
+                    ext[a.name] = (_max_traffic(ext[a.name][0], b), o.cores)
+                else:
+                    ext[a.name] = (b, o.cores)
+            else:
+                total_bytes += b
+                ns += b / o.cores / p.mm_replicated_read_gbps_per_core
+    for b, cores in ext.values():
+        total_bytes += b
+        ns += b / cores / p.mm_replicated_read_gbps_per_core
+    return total_bytes, ns
+
+
+def _shared_operand_read_excess(ops: list, p: "CostParams"):
+    """Extra delivery time for a shared HBM load, beyond its one base read.
+
+    Keep physical bytes unchanged and price each operand's own consumer degree.
+    Resident operands vanish through hbm_elems; boundary clone loads stay separate.
+    """
+    total = 0
+    external: dict[str, float | sympy.Expr] = {}
+    for op in ops:
+        if not op.is_matmul:
+            continue
+        for arg in op.args:
+            if arg.role != "input" or not arg.broadcast or arg.replication == 1:
+                continue
+            excess = (
+                arg.hbm_elems()
+                * op.dtype_bytes
+                * (_matmul_multicast_penalty(arg.replication) - 1)
+                / p.bw_peak_gbps
+            )
+            if arg.is_graph_boundary:
+                external[arg.name] = (
+                    _max_traffic(external[arg.name], excess)
+                    if arg.name in external
+                    else excess
+                )
+            else:
+                total += excess
+    return total + sum(external.values())
 
 
 def _loop_reread_bytes(ops: list) -> float:
@@ -1455,7 +1660,7 @@ def _reduction_bw_cores_factor(cores, p):
 
 def _matmul_axes_for_split_cost(o) -> tuple | None:
     """Recover the ``(B,b),(M,m),(N,n),(K,k)`` axis pairs, the ``shared_weight`` flag,
-    and the cores actually used -- everything ``work_division._matmul_split_cost``
+    and the cores actually used -- everything ``work_division._matmul_execution_cost``
     needs -- from one matmul :class:`OpFeatures` record.
 
     Returns ``None`` when matmul_a_bytes and matmul_b_bytes are not given
@@ -1473,7 +1678,12 @@ def _matmul_axes_for_split_cost(o) -> tuple | None:
         return None
     B_total = max(1.0, o.out_elems / (M * N))
     b_split = o.cores // (m_split * n_split * k_split)
-    shared_weight = any(a.role == "input" and a.broadcast for a in o.args)
+    # Treat one batch as shared-weight, including 2D projections without a
+    # broadcast tag. For multiple batches, use the existing input tag. This
+    # feature-level rule is not the standalone chooser's dependency-based test.
+    shared_weight = round(B_total) == 1 or any(
+        a.role == "input" and a.broadcast for a in o.args
+    )
     return (
         (round(B_total), b_split),
         (round(M), m_split),
@@ -1491,6 +1701,8 @@ def _matmul_ns_upstream(ops: list, p: CostParams) -> float:
     memory term, exactly as for ``_matmul_ns_bundled`` -- the two terms count the same
     operand/output bytes, so charging both double-counts memory (and the split-cost
     version is blind to LX residency, which is what the co-optimizing planner steers).
+    Standalone chooser preferences are also excluded: a preference for using more
+    cores must not become an additive latency on every matmul in the graph.
     """
     total_us = 0.0
     for o in ops:
@@ -1504,7 +1716,7 @@ def _matmul_ns_upstream(ops: list, p: CostParams) -> float:
                 "cannot price it"
             )
         b_axis, m_axis, n_axis, k_axis, shared_weight = axes
-        us = _matmul_split_cost(
+        us = _matmul_execution_cost(
             b_axis,
             m_axis,
             n_axis,
@@ -1574,11 +1786,50 @@ def _matmul_ns_bundled(ops: list, p: CostParams) -> float:
     return compute + split_ns
 
 
+def _lazy_min(r, w):
+    """``min`` of two bundle-level terms, built unevaluated when symbolic.
+
+    Under co-optimization the turnaround overlap ``min(R, W)`` and the
+    compute/memory overlap ``min(compute, mem)`` combine large sums over the
+    residency and split symbols, and an evaluated ``sympy.Min`` first asks the
+    assumptions system whether one side dominates the other
+    (``_find_localzeros``): 13.9 s per site on a 304-op graph. Every consumer
+    of the objective (the CP-SAT printer, ``lambdify``, ``evalf``) handles the
+    unevaluated node; numeric inputs take the plain ``min``.
+    """
+    if isinstance(r, sympy.Basic) or isinstance(w, sympy.Basic):
+        if getattr(r, "free_symbols", None) or getattr(w, "free_symbols", None):
+            return sympy.Min(r, w, evaluate=False)
+        return sympy.Min(r, w)
+    return min(r, w)
+
+
+def _store_core_excess_ns(ops: list, p: "CostParams"):
+    """Extra write time when the writing cores cannot saturate the shared bus.
+
+    The base model already charges W/peak. Add only W/min(peak, cores*rate)
+    minus that charge.
+    """
+    rate, peak = p.store_gbps_per_core, p.bw_peak_gbps
+    if rate <= 0:
+        return 0.0
+
+    def per_byte(cores):
+        return max(0.0, 1.0 / (cores * rate) - 1.0 / peak)
+
+    total = 0.0
+    for op in ops:
+        if not op.is_indirect_store or op.is_matmul:
+            continue
+        total += op.write_bytes() * per_byte(op.cores)
+    return total
+
+
 def predict_ops(ops: list, params: CostParams | None = None) -> float:
     """Predicted device latency (ns) for a bundle of ops (one fused kernel).
 
     A matmul in the bundle adds a compute term from ``_matmul_ns_upstream`` (defers to
-    ``work_division._matmul_split_cost``) or, when ``CostParams.use_bundled_cost_model``
+    ``work_division._matmul_execution_cost``) or, when ``CostParams.use_bundled_cost_model``
     is set, ``_matmul_ns_bundled`` (the original device-calibrated compute/spill/
     split-shape model); see the module docstring. Either way the operand/output HBM
     bytes are charged ONCE, by the memory term below -- neither matmul model carries an
@@ -1596,6 +1847,10 @@ def predict_ops(ops: list, params: CostParams | None = None) -> float:
     """
     p = params or CostParams()
     r, w = _fused_hbm_bytes(ops)
+    # Replicated matmul operand loads leave the shared-bandwidth pool and are priced
+    # at the per-core ceiling (CostParams.mm_replicated_read_gbps_per_core).
+    rep_bytes, rep_ns = _replicated_operand_reads(ops, p)
+    r = r - rep_bytes
     # HBM. Pointwise/reduction/transport keep the single-BW turnaround model.
     _pat_bw = {
         "restickify": p.bw_restickify_gbps,
@@ -1629,13 +1884,18 @@ def predict_ops(ops: list, params: CostParams | None = None) -> float:
         mem = 0.0
         for o in ops:
             ro, wo = o.read_bytes(), o.write_bytes()
+            ro = (
+                ro
+                - sum(a.replicated_hbm_elems() for a in o.args if a.role == "input")
+                * o.dtype_bytes
+            )
             bw = _eff_bw(o)
             if bw:
                 mem += (ro + wo) / bw
             else:
-                mem += (ro + wo) / p.bw_peak_gbps + p.rw_turnaround_ns_per_byte * min(
-                    ro, wo
-                )
+                mem += (
+                    ro + wo
+                ) / p.bw_peak_gbps + p.rw_turnaround_ns_per_byte * _lazy_min(ro, wo)
     elif (
         len(ops) == 1
         and ops[0].is_reduction
@@ -1678,25 +1938,32 @@ def predict_ops(ops: list, params: CostParams | None = None) -> float:
         # config. NOTE the floor is applied to the FINAL memory time below, not here:
         # `mem` is still divided by the underfill/spill derates further down, which
         # would inflate a floor imposed at this point by 1/(eff*spill_derate).
-        mem = (r + w) / p.bw_peak_gbps + p.rw_turnaround_ns_per_byte * min(r, w)
+        mem = (r + w) / p.bw_peak_gbps + p.rw_turnaround_ns_per_byte * _lazy_min(r, w)
     else:
-        mem = (r + w) / p.bw_peak_gbps + p.rw_turnaround_ns_per_byte * min(r, w)
-        # NOTE: a multi-op dependent chain (e.g. add3/add4 = chained binary adds) runs
-        # slower than its byte count because the intermediate is written then read back
-        # through HBM -- a READ-AFTER-WRITE dependency ACROSS op boundaries. That
-        # is a program-level / coarse-tiling effect, NOT a single-op cost, so it is
-        # deliberately NOT modeled here. `add_n` is not a native op; the single-op model
-        # stays pure.
-        #
-        # SIZE OF THE GAP, measured on one build (2026-08-07, 78 pointwise rows): the
-        # fused chains under-predict by -9.3 % on average, rising with chain depth --
-        # add -5 %, add3 -10 %, add4 -15 %, add6 -16 %. `add_indep2` is the control that
-        # identifies it: two INDEPENDENT adds, more bytes than add3 and the same op
-        # count, predicted to -0.9 %. Two alternative readings are ruled out by the same
-        # data -- op count (add_indep2 has two ops) and the read/write ratio (add, add5
-        # and add6 all run at R:W = 2:1 and err -2 %, -15 %, -15 %). What remains is the
-        # dependency itself. A byte-keyed read-after-write term, unified with the coarse
-        # LX-spill derate below, is the natural next step.
+        mem = (r + w) / p.bw_peak_gbps + p.rw_turnaround_ns_per_byte * _lazy_min(r, w)
+    # Replace the stores' peak-rate charge with the writing cores' limited rate.
+    mem = mem + _store_core_excess_ns(ops, p)
+    # Sharing slows delivery of these same reads; it does not add HBM bytes.
+    # Apply the same subsequent bandwidth derates as the base and replica reads.
+    # Both matmul models use this input-delivery cost. The bundled model's
+    # separate output-tile reread estimate is unchanged, not recalibrated here.
+    mem = mem + rep_ns + _shared_operand_read_excess(ops, p)
+    # NOTE: a multi-op dependent chain (e.g. add3/add4 = chained binary adds) runs
+    # slower than its byte count because the intermediate is written then read back
+    # through HBM -- a READ-AFTER-WRITE dependency ACROSS op boundaries. That
+    # is a program-level / coarse-tiling effect, NOT a single-op cost, so it is
+    # deliberately NOT modeled here. `add_n` is not a native op; the single-op model
+    # stays pure.
+    #
+    # SIZE OF THE GAP, measured on one build (2026-08-07, 78 pointwise rows): the
+    # fused chains under-predict by -9.3 % on average, rising with chain depth --
+    # add -5 %, add3 -10 %, add4 -15 %, add6 -16 %. `add_indep2` is the control that
+    # identifies it: two INDEPENDENT adds, more bytes than add3 and the same op
+    # count, predicted to -0.9 %. Two alternative readings are ruled out by the same
+    # data -- op count (add_indep2 has two ops) and the read/write ratio (add, add5
+    # and add6 all run at R:W = 2:1 and err -2 %, -15 %, -15 %). What remains is the
+    # dependency itself. A byte-keyed read-after-write term, unified with the coarse
+    # LX-spill derate below, is the natural next step.
     # OUTPUT-dim (pointwise) coarse-tiling underfill: a short per-core tile underfills
     # the streaming pipeline, derating the bandwidth term. The smallest tile in the
     # bundle governs (worst underfill). 1.0 (no derate) when nothing is output-tiled.
@@ -1756,7 +2023,19 @@ def predict_ops(ops: list, params: CostParams | None = None) -> float:
     # as beside a 25 us relu, so it does not hide behind PT-array work either. See
     # relayout_ns() and the CostParams note for the fitted law and its validity range.
     rel_ns = sum(relayout_ns(o, p) for o in ops)
-    t = compute + mem_t - p.overlap_gamma * min(compute, mem_t) + rel_ns
+    # INPUT CLONE-IN: the clone of a resident graph input is likewise its own DSC, a
+    # read-only pass from HBM into LX, so it adds at BW_PEAK outside the overlap and
+    # outside the bundle's read/write turnaround, whose readers it serves from LX.
+    # Measured on x*2 + x*3 (cores=32): with the clone the fused kernel is exactly one
+    # read plus one write at 150 GB/s (113 us at x = 8 MiB, 222 us at 16 MiB).
+    clone_ns = _clone_in_bytes(ops) / p.bw_peak_gbps
+    t = (
+        compute
+        + mem_t
+        - p.overlap_gamma * _lazy_min(compute, mem_t)
+        + rel_ns
+        + clone_ns
+    )
     # (A genuine-reduction cross-core ring-combine term once lived here; it is provably
     # bounded by ~cores * a tiny per-elem cost <= ~5 ns -- below run-to-run noise --
     # so it is dropped as inert. K is never split for matmul, so there is no matmul
@@ -1778,6 +2057,8 @@ def _explain_matmul_bundled(lines: list, ops: list, p: CostParams) -> str:
     underfill/compute/split-shape breakdown and returns the joined string.
     """
     R, W = _fused_hbm_bytes(ops)  # external input counted once (fused kernel)
+    rep_bytes, rep_ns = _replicated_operand_reads(ops, p)
+    R = R - rep_bytes
     base = R / p.mm_bw_read_gbps + W / p.mm_bw_write_gbps
     turn = p.rw_turnaround_ns_per_byte * min(R, W)
     # Underfill derate (output-dim tiling): smallest per-core tile governs.
@@ -1818,11 +2099,21 @@ def _explain_matmul_bundled(lines: list, ops: list, p: CostParams) -> str:
         parts = f"[{parts}] / eff_underfill"
     if mm_us > 0:
         parts = f"compute + {parts}"
+    if rep_bytes:
+        parts = (
+            f"{parts} + replicated_bytes/cores/{p.mm_replicated_read_gbps_per_core:g}"
+        )
     lines.append(f"  -- prediction (turnaround, bundled matmul model): T = {parts} --")
     lines.append(f"     R={R}B (read)   W={W}B (write)")
     lines.extend(mm_lines)
     blab = f"R/{p.mm_bw_read_gbps:.0f} + W/{p.mm_bw_write_gbps:.0f}"
     lines.append(f"     base = {blab} = {base / 1000:.2f} us")
+    if rep_bytes:
+        lines.append(
+            f"     replicated operand reads = {rep_bytes} B / cores / "
+            f"{p.mm_replicated_read_gbps_per_core:g} GB/s per core = "
+            f"{rep_ns / 1000:.2f} us"
+        )
     lines.append(
         f"     turn = a*min(R,W) = {p.rw_turnaround_ns_per_byte}*{min(R, W)} "
         f"= {turn / 1000:.2f} us"
@@ -1891,8 +2182,8 @@ def charge_boundary_reads_once(bundles: list) -> list:
     """Charge each graph input's clone-in load to the FIRST bundle that reads it.
 
     Pinning a graph input inserts ONE clone (``allocator._push_allocation``) that loads it
-    from HBM once for the whole graph; every other reader is then served from LX. Within a
-    bundle ``_fused_hbm_bytes`` already de-duplicates, so keeping the boundary charge in
+    from HBM once for the whole graph; every reader is then served from LX. Within a
+    bundle ``_clone_in_bytes`` already de-duplicates, so keeping the clone-in charge in
     the first reading bundle and clearing it in the rest prices exactly that one load, for
     any number of readers.
 
@@ -1903,10 +2194,11 @@ def charge_boundary_reads_once(bundles: list) -> list:
     ``amax`` and ``sub``). Leaving the stamp intact also makes the rewrite idempotent and
     independent of which bundle is first.
 
-    A later bundle's read is then priced like any other arg: freed by residency, because
-    the clone is what served it, and charged in full without residency, because every
-    bundle re-reads an HBM input. Which bundle is first does not depend on residency, so
-    the rewrite is static and the objective stays linear in the solver's ``sym_is_lx``.
+    Every bundle's read, the first included, is priced like any other arg: freed by
+    residency, because the clone is what served it, and charged in full without
+    residency, because every bundle re-reads an HBM input. Which bundle is first does not
+    depend on residency, so the rewrite is static and the objective stays linear in the
+    solver's ``sym_is_lx``.
     """
     seen: set = set()
     out = []
@@ -1934,16 +2226,47 @@ def charge_boundary_reads_once(bundles: list) -> list:
     return out
 
 
+def predict_bundles(
+    operations: Sequence,
+    features_by_buffer: Mapping[str, OpFeatures],
+    params: CostParams | None = None,
+) -> list[tuple[list[str], float]]:
+    """The terms :func:`predict_by_bundle` sums: one ``(buffer names, latency)``
+    per estimated bundle, in schedule order; the names are the buffers the
+    bundle's ops store (the ``features_by_buffer`` keys). The latency is a number for
+    concrete features and a sympy expression over the solver's residency and
+    split symbols for the co-optimizing allocator's symbolic features; the
+    cost-expression dump (``SPYRE_DUMP_COST_EXPR_FILE``) records these terms."""
+    grouped = group_features_by_bundle(operations, features_by_buffer)
+    priced = charge_boundary_reads_once(grouped)
+    # Name each op by the buffer it was looked up under (``features_by_buffer``
+    # key), falling back to its own display name.
+    #
+    # Names come from GROUPED and prices from PRICED, because
+    # ``charge_boundary_reads_once`` rebuilds any op whose boundary read an
+    # earlier bundle already paid for (``dataclasses.replace``). That gives the
+    # copy a new ``id()``, so an identity lookup against it misses and falls back
+    # to ``OpFeatures.name`` -- the op KIND ("sub"), not the buffer. The dump's
+    # whole join key is the buffer name, and the rewrite fires on exactly the
+    # shape the dump is most wanted for: several bundles reading one graph input
+    # (softmax reads its input in both ``amax`` and ``sub``). The rewrite
+    # preserves bundle and op order, so the two lists zip positionally.
+    buffer_of = {id(feat): name for name, feat in features_by_buffer.items()}
+    return [
+        ([buffer_of.get(id(o), o.name) for o in names], predict_ops(bundle, params))
+        for names, bundle in zip(grouped, priced)
+    ]
+
+
 def predict_by_bundle(
     operations: Sequence,
     features_by_buffer: Mapping[str, OpFeatures],
     params: CostParams | None = None,
 ) -> float:
     """Predicted latency (ns) for ``operations``, scored one bundle at a time."""
-    bundles = charge_boundary_reads_once(
-        group_features_by_bundle(operations, features_by_buffer)
+    return sum(
+        term for _, term in predict_bundles(operations, features_by_buffer, params)
     )
-    return sum(predict_ops(bundle, params) for bundle in bundles)
 
 
 def explain(ops: list, params: CostParams | None = None) -> str:
@@ -1959,13 +2282,16 @@ def explain(ops: list, params: CostParams | None = None) -> str:
             bc = " broadcast (loaded once)" if a.broadcast else ""
             lf = f" xL={a.loop_factor}" if a.loop_factor > 1 else ""
             bd = ""
-            if a.is_graph_boundary:
+            if a.is_graph_boundary and a.role == "output":
+                bd = " graph boundary (charged despite LX)"
+            elif a.is_graph_boundary:
                 bd = (
-                    " graph boundary (charged despite LX)"
+                    " graph boundary (clone-in charged here if LX)"
                     if a.owns_boundary_charge
-                    else " graph boundary (charged to an earlier bundle)"
+                    else " graph boundary (clone-in charged to an earlier bundle)"
                 )
-            counted = a.hbm_elems() * o.dtype_bytes
+            rp = f" x{a.replication} consumers" if a.replication != 1 else ""
+            counted = (a.hbm_elems() + a.clone_in_elems()) * o.dtype_bytes
             dev = a.dims if a.dims else [a.elems]
             log = f"torch {a.logical} -> " if a.logical else ""
             try:
@@ -1977,16 +2303,22 @@ def explain(ops: list, params: CostParams | None = None) -> str:
             lines.append(
                 f"      {a.role:<6} {a.name:<22} {log}device {dev} in {mem_repr}"
                 f"  | {a.elems} elems x {o.dtype_bytes}B = {a.elems * o.dtype_bytes} B"
-                f" (hbm counted: {counted} B){lf}{bc}{bd}"
+                f" (hbm counted: {counted} B){lf}{rp}{bc}{bd}"
             )
+    store_extra = _store_core_excess_ns(ops, p)
+    if store_extra:
+        lines.append(
+            f"     indirect-store core limit: +{store_extra / 1000:.2f} us "
+            "(before bandwidth adjustments and compute overlap)"
+        )
     if any(getattr(o, "is_matmul", False) for o in ops) and p.use_bundled_cost_model:
         return _explain_matmul_bundled(lines, ops, p)
     if any(getattr(o, "is_matmul", False) for o in ops):
-        # Matmul compute comes from work_division._matmul_split_cost (HBM excluded --
+        # Matmul compute comes from work_division._matmul_execution_cost (HBM excluded --
         # see the module docstring), and the bundle memory term supplies the traffic.
         # Report the reconstructed axes each matmul op was priced with, then R/W.
         lines.append(
-            "  -- prediction (matmul, via work_division._matmul_split_cost) --"
+            "  -- prediction (matmul, via work_division._matmul_execution_cost) --"
         )
         compute_ns = 0.0
         for o in ops:
@@ -2000,7 +2332,7 @@ def explain(ops: list, params: CostParams | None = None) -> str:
                     "cannot price it"
                 )
             (B, b), (M, m), (N, n), (K, k), shared_weight = axes
-            us = _matmul_split_cost(
+            us = _matmul_execution_cost(
                 (B, b),
                 (M, m),
                 (N, n),
@@ -2044,10 +2376,20 @@ def explain(ops: list, params: CostParams | None = None) -> str:
                 eff, eff_rows, eff_cols = e, rpc, _op_cols(o)
     t = predict_ops(ops, p)
     parts = "(R+W)/BW_PEAK + a*min(R,W)"
+    if store_extra:
+        parts += " + store_core_excess"
     if eff < 1.0:
         parts = f"[{parts}] / eff_underfill"
+    clone = _clone_in_bytes(ops)
+    if not (isinstance(clone, int) and clone == 0):
+        parts = f"{parts} + CLONE_IN/BW_PEAK"
     lines.append(f"  -- prediction (turnaround): T = {parts} --")
     lines.append(f"     R={R}B (read)   W={W}B (write)")
+    if not (isinstance(clone, int) and clone == 0):
+        lines.append(
+            f"     clone_in = {clone}/{p.bw_peak_gbps:.0f} = "
+            f"{clone / p.bw_peak_gbps / 1000:.2f} us (own read-only pass)"
+        )
     lines.append(f"     base = (R+W)/{p.bw_peak_gbps:.0f} = {base / 1000:.2f} us")
     lines.append(
         f"     turn = a*min(R,W) = {p.rw_turnaround_ns_per_byte}*{min(R, W)} "
@@ -2062,7 +2404,8 @@ def explain(ops: list, params: CostParams | None = None) -> str:
         )
         lines.append(
             f"     eff_underfill = min({p.coarse_underfill_cap}, {shape}) = {eff:.3f}"
-            f"  -> (base+turn)/eff = {(base + turn) / eff / 1000:.2f} us"
+            f"  -> (base+turn+store_core_excess)/eff = "
+            f"{(base + turn + store_extra) / eff / 1000:.2f} us"
         )
     lines.append(f"     => T_model = {t / 1000:.2f} us")
     return "\n".join(lines)

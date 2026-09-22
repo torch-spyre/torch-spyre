@@ -20,6 +20,7 @@ import math
 import os
 import subprocess
 import sys
+import types
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 
@@ -42,6 +43,8 @@ try:
     from ortools.sat.python import cp_model  # noqa: F401
 
     from torch_spyre._inductor.scratchpad.ilp_solver_ortools import (
+        _CORE_INV_SCALE,
+        _MAX_PRODUCT_BOUND,
         CpSatLayoutSolver,
         _SympyExprToCpSat,
     )
@@ -70,20 +73,31 @@ SMALL_SIZE = 10
 ALIGNMENT = 128
 
 
+def _signature_key(cd: CoreDivision):
+    """Per-core slicing signature, or ``None`` for a reduction-split division
+    (a ``None`` never compares equal, so partial-reduction divisions never
+    match). Only used within one operation's symbol namespace."""
+    return (
+        tuple(sorted(cd.output_splits.items(), key=lambda item: str(item[0])))
+        if not cd.reduction_splits
+        else None
+    )
+
+
 class TestCoreDivision(TestCase):
     def test_symbol_keys_are_sortable_for_signature_and_label(self):
-        x, y = sympy.symbols("x y")
+        x, y, rx, ry = sympy.symbols("x y rx ry")
         division = CoreDivision(
-            output_splits={y: 2, x: 4}, reduction_splits={y: 8, x: 16}
+            splits={y: 2, x: 4, ry: 8, rx: 16}, reduction_syms=frozenset({rx, ry})
         )
 
         self.assertEqual(
             division.label,
-            "sx/4,sy/2 ~sx/16,~sy/8",
+            "sx/4,sy/2 ~srx/16,~sry/8",
         )
-        self.assertIsNone(division.signature_key())
+        self.assertIsNone(_signature_key(division))
         self.assertEqual(
-            CoreDivision(output_splits={y: 2, x: 4}).signature_key(),
+            _signature_key(CoreDivision(splits={y: 2, x: 4})),
             ((x, 4), (y, 2)),
         )
 
@@ -175,7 +189,7 @@ def _divs():
     # Two valid loop divisions: split output stride-256 axis four ways
     # (per-core footprint = total / 4), or keep the buffer whole.
     return [
-        CoreDivision(output_splits={256: 4}),
+        CoreDivision(splits={256: 4}),
         CoreDivision(),
     ]
 
@@ -1126,7 +1140,7 @@ class JointDivisionSolverTests(BaseLayoutSolverTests):
         # clean split, so their signatures agree.
         p_cd = result["P"].core_divisions[result["P"].chosen_division]
         c_cd = result["C"].core_divisions[result["C"].chosen_division]
-        self.assertEqual(p_cd.signature_key(), c_cd.signature_key())
+        self.assertEqual(_signature_key(p_cd), _signature_key(c_cd))
         self.assertEqual(p_cd.output_partition, 4)
 
     def test_no_consumer_division_buffer_is_spilled(self):
@@ -1274,13 +1288,13 @@ class TestCpSatJointDivision(JointDivisionSolverTests, TestCase):
             residency_reason="no consumer reads it from LX",
         )
         big = CoreDivisionBuffer(
-            "big", 1000, [0, 1], core_divisions=[CoreDivision(output_splits={256: 4})]
+            "big", 1000, [0, 1], core_divisions=[CoreDivision(splits={256: 4})]
         )
         C = CoreDivisionBuffer(
             "C",
             100,
             [1, 2],
-            core_divisions=[CoreDivision(output_splits={256: 4})],
+            core_divisions=[CoreDivision(splits={256: 4})],
             parents=["big"],
             residency_reason="no consumer reads it from LX",
         )
@@ -1299,8 +1313,8 @@ class TestCpSatJointDivision(JointDivisionSolverTests, TestCase):
 
     def test_balance_prefers_balanced_division(self):
         # verify the solver prefers the balanced core split
-        unbalanced = CoreDivision(output_splits={256: 4})  # 4 cores, cost 16
-        balanced = CoreDivision(output_splits={256: 2, 128: 2})  # 4 cores, cost 8
+        unbalanced = CoreDivision(splits={256: 4})  # 4 cores, cost 16
+        balanced = CoreDivision(splits={256: 2, 128: 2})  # 4 cores, cost 8
         self.assertEqual(unbalanced.cores_used, balanced.cores_used)
         a = CoreDivisionBuffer(
             "a",
@@ -1348,8 +1362,10 @@ class TestCpSatJointDivision(JointDivisionSolverTests, TestCase):
             128,
             [0, 1],
             core_divisions=[
-                CoreDivision(output_splits={"b": 4, "m": 8}, reduction_splits={}),
-                CoreDivision(output_splits={"b": 4, "m": 4}, reduction_splits={"k": 2}),
+                CoreDivision(splits={"b": 4, "m": 8}),
+                CoreDivision(
+                    splits={"b": 4, "m": 4, "k": 2}, reduction_syms=frozenset({"k"})
+                ),
             ],
         )
         self.assertEqual(buf.core_divisions[0].cores_used, 32)
@@ -1403,6 +1419,20 @@ class TestSympyExprToCpSatPrinter(TestCase):
         self.assertEqual(solver.ObjectiveValue(), 20)
         self.assertEqual(solver.Value(sym_map["x"]), 10)
 
+    def test_shared_load_penalty_lowers_for_product_degrees(self):
+        from torch_spyre._inductor.work_division import _matmul_multicast_penalty
+
+        x, y, resident = sympy.symbols("x y resident", integer=True)
+        expression = (
+            8192 / 150 * (_matmul_multicast_penalty(x * y) - 1) * (1 - resident)
+        )
+        for a, b, lx in ((2, 4, 0), (3, 4, 0), (4, 8, 0), (4, 8, 1)):
+            solver, _ = self._optimize(
+                expression, {"x": (a, a), "y": (b, b), "resident": (lx, lx)}, False
+            )
+            expected = 8192 / 150 * (_matmul_multicast_penalty(a * b) - 1) * (1 - lx)
+            self.assertAlmostEqual(solver.ObjectiveValue(), expected, places=5)
+
     def test_piecewise_and_or_condition_lowering(self):
         # Exercises _print_And and _print_Or as Piecewise conditions.
         x, y = sympy.symbols("x y", integer=True)
@@ -1425,6 +1455,78 @@ class TestSympyExprToCpSatPrinter(TestCase):
         solver, sym_map = self._optimize(expr, {"x": (0, 5)}, maximize=True)
         self.assertEqual(solver.ObjectiveValue(), 10)
         self.assertEqual(solver.Value(sym_map["x"]), 2)
+
+    def test_conditional_cost_keeps_small_coefficients(self):
+        x, enabled = sympy.symbols("x enabled", integer=True, nonnegative=True)
+        # Rounding a small coefficient to zero erases a large total cost.
+        expression = sympy.Piecewise((1e-6 * x**2, sympy.Eq(enabled, 1)), (0, True))
+        for flag in (0, 1):
+            solver, _ = self._optimize(
+                expression, {"x": (10000, 10000), "enabled": (flag, flag)}, False
+            )
+            self.assertAlmostEqual(solver.ObjectiveValue(), 100.0 * flag, places=6)
+        solver, _ = self._optimize(
+            expression + sympy.Min(0.5 * x, 3.25),
+            {"x": (10000, 10000), "enabled": (1, 1)},
+            False,
+        )
+        self.assertAlmostEqual(solver.ObjectiveValue(), 103.25, places=6)
+        solver, variables = self._optimize(
+            expression + 50 * (1 - enabled),
+            {"x": (10000, 10000), "enabled": (0, 1)},
+            False,
+        )
+        self.assertEqual(solver.Value(variables["enabled"]), 0)
+        self.assertAlmostEqual(solver.ObjectiveValue(), 50.0, places=6)
+
+    def test_unreplicated_choice_in_a_product_of_splits(self):
+        from torch_spyre._inductor.cost_model import ArgTraffic, OpFeatures, predict_ops
+
+        b, m = sympy.symbols("b m", integer=True, positive=True)
+
+        def price(replication):
+            return predict_ops(
+                [
+                    OpFeatures(
+                        "bmm",
+                        True,
+                        64,
+                        8,
+                        2,
+                        [
+                            ArgTraffic(
+                                "buf0", "input", False, 4096, replication=replication
+                            ),
+                            ArgTraffic("buf1", "output", False, 64),
+                        ],
+                        is_matmul=True,
+                    )
+                ]
+            )
+
+        expression = price(b * m)
+        for batch, rows in ((1, 1), (1, 2), (2, 1)):
+            solver, _ = self._optimize(
+                expression, {"b": (batch, batch), "m": (rows, rows)}, False
+            )
+            self.assertAlmostEqual(
+                solver.ObjectiveValue(), price(batch * rows), delta=1
+            )
+
+    def test_conditional_minmax_operands_still_lower(self):
+        x, enabled = sympy.symbols("x enabled", integer=True, nonnegative=True)
+        conditional = sympy.Piecewise((0.5 * x, sympy.Eq(enabled, 1)), (1.5 * x, True))
+        for operation in (sympy.Min, sympy.Max):
+            expression = operation(1 + sympy.Min(conditional, 3.25), 7)
+            for flag in (0, 1):
+                solver, _ = self._optimize(
+                    expression, {"x": (4, 4), "enabled": (flag, flag)}, False
+                )
+                self.assertAlmostEqual(
+                    solver.ObjectiveValue(),
+                    float(expression.subs({x: 4, enabled: flag})),
+                    places=6,
+                )
 
     @staticmethod
     def _brute_force_product_bounds(domains):
@@ -1455,6 +1557,164 @@ class TestSympyExprToCpSatPrinter(TestCase):
 
     def test_multiply_four_int_vars_mixed_sign(self):
         self._check_multiply([(-2, 3), (1, 4), (-1, 2), (2, 3)], ["x", "y", "z", "w"])
+
+    def test_multiply_refuses_product_past_bound(self):
+        # A product whose interval bound passes _MAX_PRODUCT_BOUND needs more
+        # dynamic range than the model carries. Lowering raises instead of
+        # rescaling factors, which could round a small one such as d to 0.
+        # _minimize_cost_expr turns the ValueError into its fallback policy.
+        for domains in (
+            {"a": (1, 2**20), "b": (1, 2**20), "d": (1, 32)},
+            {"a": (1, 2**30), "d": (1, 32)},
+            {"a": (-(2**20), 2**20), "b": (1, 2**20), "d": (1, 32)},
+        ):
+            with self.subTest(domains=domains):
+                expr = sympy.Mul(*[sympy.Symbol(n, integer=True) for n in domains])
+                with self.assertRaisesRegex(ValueError, "CP-SAT bound"):
+                    self._optimize(expr, domains, maximize=True)
+
+    def test_multiply_at_bound_lowers_exactly(self):
+        # The bound itself is inclusive: 2**15 * 2**15 lowers unscaled.
+        a, b = sympy.symbols("a b", integer=True)
+        solver, _ = self._optimize(
+            a * b, {"a": (1, 2**15), "b": (1, 2**15)}, maximize=True
+        )
+        self.assertEqual(solver.ObjectiveValue(), _MAX_PRODUCT_BOUND)
+
+    def _pinned_split_cost(self, expr, menus, candidate, full_product=False):
+        # One buffer whose split symbols take ``menus[name][i]`` under candidate
+        # division i, wired the way ``_minimize_cost_expr`` wires a real buffer,
+        # with the division pinned. Returns the objective and the model.
+        model = cp_model.CpModel()
+        n = len(next(iter(menus.values())))
+        division = model.new_int_var(0, n - 1, "div")
+        model.add(division == candidate)
+        buf = types.SimpleNamespace(division=division)
+        columns = dict(menus)
+        if full_product:
+            # The product over ALL of a buffer's splits is its core count.
+            columns["_product_" + "_".join(sorted(menus))] = [
+                math.prod(splits) for splits in zip(*menus.values())
+            ]
+        sym_map, buffer_map = {}, {}
+        for name, raw in columns.items():
+            sym_map[name] = model.new_int_var(min(raw), max(raw), name)
+            model.add_element(division, raw, sym_map[name])
+            buffer_map[name] = (buf, raw)
+        model.minimize(_SympyExprToCpSat(model, sym_map, buffer_map).convert(expr))
+        solver = cp_model.CpSolver()
+        status = solver.Solve(model)
+        self.assertEqual(status, cp_model.OPTIMAL, solver.StatusName(status))
+        return solver.ObjectiveValue(), model
+
+    @staticmethod
+    def _domain_of(model, name):
+        (var,) = [v for v in model.proto.variables if v.name == name]
+        return min(var.domain), max(var.domain)
+
+    def test_inverse_scale_is_lcm_of_candidate_splits(self):
+        # Each inv_ variable is scaled by the LCM of its own candidates -- 8
+        # for a power-of-two menu, 6 for one with a 3 in it -- so its domain
+        # needs only log2(LCM) bits and every candidate's value is exact, even
+        # though the two factors of the product carry different scales.
+        a, b, k = sympy.symbols("split_a split_b split_k", integer=True, positive=True)
+        menus = {
+            "split_a": [1, 2, 4, 8],
+            "split_b": [1, 3, 6, 2],
+            "split_k": [2, 1, 1, 4],
+        }
+        for i in range(4):
+            got, model = self._pinned_split_cost(1000 * k / (a * b), menus, i)
+            k_i, a_i, b_i = (menus[n][i] for n in ("split_k", "split_a", "split_b"))
+            exact = 1000 * k_i / (a_i * b_i)
+            self.assertAlmostEqual(got, exact, delta=1e-6 * exact)
+        self.assertEqual(self._domain_of(model, "inv_split_a"), (1, 8))
+        self.assertEqual(self._domain_of(model, "inv_split_b"), (1, 6))
+
+    def test_inverse_scale_keeps_magnitude_through_full_product(self):
+        # Three or more inverses covering every split of a buffer collapse into
+        # one inverse of its core count, scaled by the LCM of the core counts;
+        # the coefficient must trade the factors' scales for that one.
+        a, b, c = sympy.symbols("split_a split_b split_c", integer=True, positive=True)
+        menus = {
+            "split_a": [1, 2, 4, 1],
+            "split_b": [1, 3, 1, 2],
+            "split_c": [1, 1, 2, 3],
+        }
+        for i in range(4):
+            got, model = self._pinned_split_cost(
+                1000 / (a * b * c), menus, i, full_product=True
+            )
+            cores = menus["split_a"][i] * menus["split_b"][i] * menus["split_c"][i]
+            self.assertAlmostEqual(got, 1000 / cores, delta=1e-6 * 1000 / cores)
+        # Core counts [1, 6, 8, 6] -> LCM 24, values 24 // cores.
+        name = "inv__product_split_a_split_b_split_c"
+        self.assertEqual(self._domain_of(model, name), (3, 24))
+
+    def test_inverse_scale_falls_back_past_cap(self):
+        # 7 * 11 * 13 = 1001 fits under the cap and stays exact; 7 * 11 * 17 =
+        # 1309 does not, so the default scale and its rounding return.
+        a = sympy.Symbol("split_a", integer=True, positive=True)
+        _, model = self._pinned_split_cost(1 / a, {"split_a": [1, 7, 11, 13]}, 0)
+        self.assertEqual(self._domain_of(model, "inv_split_a"), (77, 1001))
+        got, model = self._pinned_split_cost(1000 / a, {"split_a": [1, 7, 11, 17]}, 1)
+        self.assertEqual(
+            self._domain_of(model, "inv_split_a"),
+            (_CORE_INV_SCALE // 17, _CORE_INV_SCALE),
+        )
+        self.assertAlmostEqual(got, 1000 * (_CORE_INV_SCALE // 7) / _CORE_INV_SCALE)
+
+    @staticmethod
+    def _lin_max_operand_sizes(model):
+        return [
+            len(e.vars)
+            for c in model.proto.constraints
+            if c.has_lin_max()
+            for e in c.lin_max.exprs
+        ]
+
+    def test_minmax_multi_term_operands_get_their_own_var(self):
+        # The cost model's alpha * min(R, W) turnaround term compares two
+        # weighted sums of residency literals. Presolve reasons about a lin_max
+        # operand through its exact domain -- for such a sum the set of its
+        # subset sums, exponential in its distinct coefficients (4 s of
+        # PresolveToFixPoint on a Granite 4.0 decode block). Every
+        # multi-variable operand must reach lin_max as a single variable, and
+        # the optimum must not move.
+        lits = sympy.symbols("b0:6", integer=True, nonnegative=True)
+        reads = 3 * (1 - lits[0]) + 5 * (1 - lits[1]) + 7 * lits[2] + 2 * lits[3]
+        writes = 4 * lits[0] + 6 * (1 - lits[3]) + 11 * lits[4] + 9 * (1 - lits[5])
+        for minmax, maximize in ((sympy.Min, True), (sympy.Max, False)):
+            expr = minmax(reads, writes)
+            model = cp_model.CpModel()
+            sym_map = {x.name: model.new_int_var(0, 1, x.name) for x in lits}
+            cp_expr = _SympyExprToCpSat(model, dict(sym_map), {}).convert(expr)
+            sizes = self._lin_max_operand_sizes(model)
+            self.assertTrue(sizes)
+            self.assertLessEqual(max(sizes), 1, sizes)
+            if maximize:
+                model.maximize(cp_expr)
+            else:
+                model.minimize(cp_expr)
+            solver = cp_model.CpSolver()
+            self.assertEqual(solver.Solve(model), cp_model.OPTIMAL)
+            values = [
+                int(expr.subs(dict(zip(lits, bits))))
+                for bits in itertools.product((0, 1), repeat=len(lits))
+            ]
+            best = max(values) if maximize else min(values)
+            self.assertEqual(solver.ObjectiveValue(), best)
+
+    def test_minmax_single_variable_operands_are_not_wrapped(self):
+        # A constant or a single affine variable is already cheap for lin_max;
+        # only multi-variable sums get a variable of their own.
+        x, y = sympy.symbols("x y", integer=True)
+        model = cp_model.CpModel()
+        sym_map = {n: model.new_int_var(0, 9, n) for n in ("x", "y")}
+        _SympyExprToCpSat(model, dict(sym_map), {}).convert(sympy.Min(x, 2 * y + 1))
+        self.assertFalse(
+            any(v.name.startswith("minmax_arg_") for v in model.proto.variables)
+        )
 
 
 @unittest.skipUnless(_HAS_ORTOOLS, "cpsat placement unit tests need ortools")

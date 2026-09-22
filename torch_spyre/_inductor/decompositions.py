@@ -25,7 +25,6 @@ independent from PyTorch's global ``torch._inductor.decomposition.decompositions
 registry; Spyre never mutates the global table.
 """
 
-import contextlib
 import dataclasses
 import math
 import threading
@@ -33,13 +32,14 @@ from typing import Any, Callable, Optional, Sequence, Union
 
 import torch
 import torch._decomp as decomp
+from torch._prims_common import ELEMENTWISE_TYPE_PROMOTION_KIND, elementwise_dtypes
 
 from .constants import DEVICE_NAME, FP8_E4M3FN_MAX, FP8_E4M3FN_MIN
 from .errors import Unsupported
 from .sliding_window_plan import (
+    MAX_QUERY_BLOCK,
+    STICK,
     SlidingWindowPlan,
-    band_valid_start,
-    check_valid_start,
     check_window_read,
     plan_sliding_window,
     query_blocking,
@@ -49,7 +49,7 @@ from . import config
 from .logging_utils import get_inductor_logger
 
 from . import customops  # noqa: F401
-from . import spyre_hint
+from .wsr import for_each_tile
 from torch_spyre._C import DataFormats, get_device_dtype, get_elem_in_stick
 import torch_spyre._inductor.customops  # noqa: F401
 
@@ -57,32 +57,53 @@ logger = get_inductor_logger("decompositions")
 
 
 _SDPA_MAX_SEQUENCE_TILE_SIZE = 512
-_SDPA_GQA_MAX_KV_TILE_SIZE = 1024
+# for_each_tile feeds V directly to the second matmul. A partial-width V tile
+# retains its transposed producer layout when padded to a full fp16/bf16 stick;
+# the resulting stride amplification can exceed the 256 MiB per-core span.
+_SDPA_SEQUENCE_TILE_ALIGNMENT = 64
 _SDPA_MAX_TILE_PAIRS_PER_LOOP_GROUP = 16
 _SDPA_PREFERRED_HEADS_PER_TILE = (4, 2, 1)
 _SDPA_MHA_MAX_HEAD_WORK_DIVISION = 4
-_SDPA_LIVE_SCORE_BUFFER_ALLOWANCE = 2
-_SDPA_LIVE_QUERY_BUFFER_ALLOWANCE = 2
+_SDPA_MHA_QUERY_ONLY_MAX_HEADS = 8
+_SDPA_MHA_QUERY_ONLY_MIN_KV_BLOCKS = 8
+# Decode and SWA use this narrower, separately calibrated live-set estimate.
+# These constants do not represent a legacy non-HOP SDPA implementation.
+_SDPA_NARROW_LIVE_SCORE_BUFFER_ALLOWANCE = 2
+_SDPA_NARROW_LIVE_QUERY_BUFFER_ALLOWANCE = 2
 _SDPA_TARGET_KV_BYTES_PER_CORE = 1024 * 1024
-_SDPA_LOW_KV_HEAD_TARGET_BYTES_PER_CORE = 2 * 1024 * 1024
+_SDPA_MAX_TARGET_KV_BYTES_PER_CORE = 2 * 1024 * 1024
+_SDPA_GQA_HEADS_PER_KV_TARGET_MIB = 4
+_SDPA_QUERY_ROWS_PER_KV_TARGET_MIB = 8
+_SDPA_BASE_BURST_EFFICIENT_KV_BLOCK_SIZE = 512
+_SDPA_MAX_BURST_EFFICIENT_KV_BLOCK_SIZE = 1024
+# Nested HOP prefill keeps the scaled query and online-softmax carries live
+# across the K loop. At the widest point, the dataflow contains four
+# score-shaped values and seven query/output-shaped values once the enclosing
+# map's tile staging and carry handoff are included. These are graph-derived
+# buffer counts, rather than shape or model limits.
+_SDPA_PREFILL_LIVE_SCORE_BUFFER_ALLOWANCE = 4
+_SDPA_PREFILL_LIVE_QUERY_BUFFER_ALLOWANCE = 7
 
-# Decode has a very different working set from prefill: Lq == 1 leaves enough
-# LX for substantially longer K/V blocks, but backend scheduling has sharp
-# geometry-dependent cliffs before capacity is exhausted.  These policies are
-# the stable minima from sweeps between Lkv=512 and 8192. Unknown geometries
-# retain the conservative 512-token block and no explicit work division.
-#
-# Values are maximum K/V block sizes. Native GQA sweeps found that head/group
-# work division loses to ordinary scheduling for decode.
-_SDPA_DECODE_POLICIES: dict[tuple[int, int, int], int] = {
-    # Granite 3.3 8B
-    (32, 8, 128): 8192,
-    # Gemma 4 12B/26B local attention
-    (16, 8, 256): 8192,
-    # Gemma 4 12B and 26B global attention
-    (16, 1, 512): 8192,
-    (16, 2, 512): 8192,
-}
+# A counted SWA K/V loop pays its carry handoff and loop-control costs for each
+# query work partition.  Prefill sweeps show that retaining at least four query
+# rows per core amortizes those costs while still exposing enough parallelism.
+# This caps only GQA's query-only work division; MHA retains SDPA's joint
+# head/query search.
+_SWA_MIN_QUERY_ROWS_PER_CORE = 4
+
+# DPO emits about seventeen additional sdsc_execute operations for every
+# unrolled online-softmax block. Four K256 blocks can still win by retaining
+# restickified K in LX, while four K1024 blocks lose badly to one long block.
+# Permit two resident blocks at any measured size, and more only while their
+# combined extent stays within the measured 1024-token efficient window.
+_SDPA_DECODE_MIN_LX_RESIDENT_BLOCKS = 2
+_SDPA_DECODE_MAX_MULTI_BLOCK_EXTENT = 1024
+
+# Scratchpad allocation sweeps show that the restickified K is retained in LX
+# while its per-core footprint is below roughly 2 KiB per reusing query head.
+# This is deliberately a performance hint rather than an allocation guarantee;
+# the allocator remains the authority on whether the value is actually kept.
+_SDPA_RESTICK_LX_BYTES_PER_REUSING_HEAD = 2 * 1024
 
 
 @dataclasses.dataclass(frozen=True)
@@ -95,11 +116,57 @@ class _SDPATilingConfig:
     num_kv_blocks: int
     num_q_tiles: int
     q_tile_size: int
+    num_batch_tiles: int
     num_head_tiles: int
+    num_group_tiles: int
     kv_blocks_per_loop_group: int
+    estimated_active_cores: int | None
+    estimated_load_bursts: int
+    estimated_hbm_bytes: int
+    estimated_spill_buffers: int | None
+    estimated_spill_bytes: int | None
+    score_bytes_per_core: int | None
+    estimated_live_bytes_per_core: int | None
+    lx_budget_bytes: int
+
+
+@dataclasses.dataclass(frozen=True)
+class _SDPAPrefillPlan:
+    """One exact nested-HOP tiling and its compiler-visible costs."""
+
+    num_batch_tiles: int
+    num_head_tiles: int
+    num_group_tiles: int
+    num_q_tiles: int
+    q_tile_size: int
+    kv: "_SDPAKVBlockCandidate"
+    estimated_active_cores: int
+    estimated_restick_active_cores: int
+    estimated_restick_work_bytes: int
+    estimated_load_bursts: int
+    estimated_hbm_bytes: int
+    estimated_hbm_transfer_waves: int
+    estimated_spill_buffers: int
+    estimated_spill_bytes: int
+    estimated_work: int
+
+
+@dataclasses.dataclass(frozen=True)
+class _SWATilingConfig:
+    """Static SWA decomposition choices produced by the cost model."""
+
+    strategy: str
+    reason: str
+    kv_block_size: int
+    num_kv_blocks: int
+    num_head_tiles: int
     work_div: dict[str, int] | None
     score_bytes_per_core: int | None
     estimated_live_bytes_per_core: int | None
+    kv_bytes_per_core: int | None
+    restick_bytes_per_core: int | None
+    restick_lx_eligible: bool | None
+    estimated_dsc_executions: int | None
     lx_budget_bytes: int
 
 
@@ -111,27 +178,79 @@ def _sdpa_num_head_tiles(num_heads: int) -> int:
     return 1
 
 
-def _num_tiles_for_max_extent(sequence_length: int, max_extent: int) -> int:
+def _sdpa_num_batch_tiles(batch_size: int) -> int:
+    """Use two rows per exact tile, or one row when the batch size is odd."""
+    return batch_size // 2 if batch_size % 2 == 0 else batch_size
+
+
+def _sdpa_head_group_tiles(num_heads: int, num_kvheads: int) -> tuple[int, int]:
+    """Keep at most four query heads in each fallback H/G tile."""
+    if num_heads == num_kvheads:
+        return _sdpa_num_head_tiles(num_heads), 1
+
+    group_size = num_heads // num_kvheads
+    return _sdpa_num_head_tiles(num_kvheads), group_size
+
+
+def _num_tiles_for_max_extent(
+    sequence_length: int, max_extent: int, *, tile_alignment: int = 1
+) -> int:
     """Return an exact split count whose tile extent is at most ``max_extent``.
 
     Coarse tiling currently requires equal-sized tiles, so a simple ceiling is
     insufficient when it does not divide ``sequence_length``. Start with the
     minimum count that satisfies the extent cap and advance to the next exact
-    divisor. Sequence lengths used by the adapters are stick-padded, so this
-    normally resolves after only a few candidates.
+    divisor whose tile extent has the requested alignment. If the full extent
+    is not aligned, or the extent cap is smaller than the alignment, no exact
+    aligned split exists and only divisibility is enforced. Sequence lengths
+    used by the adapters are normally stick-padded, so this resolves after only
+    a few candidates.
     """
+    if sequence_length < 1 or max_extent < 1 or tile_alignment < 1:
+        raise ValueError(
+            "sequence length, maximum extent, and alignment must be positive"
+        )
+
+    alignment_is_possible = (
+        sequence_length % tile_alignment == 0 and max_extent >= tile_alignment
+    )
+    effective_alignment = tile_alignment if alignment_is_possible else 1
+    minimum_tiles = max(1, (sequence_length + max_extent - 1) // max_extent)
+    for num_tiles in range(minimum_tiles, sequence_length + 1):
+        if (
+            sequence_length % num_tiles == 0
+            and (sequence_length // num_tiles) % effective_alignment == 0
+        ):
+            return num_tiles
+
+    raise AssertionError("validated tiling inputs must have an exact tile")
+
+
+def _padded_tiling_for_max_extent(
+    sequence_length: int, max_extent: int, *, tile_alignment: int
+) -> tuple[int, int]:
+    """Return equal aligned tiles covering a possibly padded sequence."""
+    if sequence_length < 1 or max_extent < 1 or tile_alignment < 1:
+        raise ValueError(
+            "sequence length, maximum extent, and alignment must be positive"
+        )
+    if max_extent < tile_alignment or max_extent % tile_alignment:
+        raise ValueError("maximum extent must be a multiple of tile alignment")
+
     num_tiles = max(1, (sequence_length + max_extent - 1) // max_extent)
-    while sequence_length % num_tiles != 0:
-        num_tiles += 1
-    return num_tiles
+    unaligned_tile_size = (sequence_length + num_tiles - 1) // num_tiles
+    tile_size = (
+        (unaligned_tile_size + tile_alignment - 1) // tile_alignment * tile_alignment
+    )
+    return num_tiles, tile_size
 
 
 def _kv_blocks_per_loop_group(num_q_tiles: int, num_kv_blocks: int) -> int:
     """Keep each SDPA backend bundle near the proven 4-by-4 size.
 
-    DXP specializes a counted Lq loop across every unrolled Lk block.  Bundle
-    code size therefore scales with their product, not with the number of Lk
-    blocks alone. Cap that product at sixteen when possible, while retaining at
+    The backend specializes a counted Lq loop across every unrolled Lk block.
+    Bundle code size therefore scales with their product, not with the number of
+    Lk blocks alone. Cap that product at sixteen when possible, while retaining at
     least one Lk block per group. Once Lq alone needs sixteen or more tiles,
     each explicit Lk block gets its own loop group.
     """
@@ -141,37 +260,124 @@ def _kv_blocks_per_loop_group(num_q_tiles: int, num_kv_blocks: int) -> int:
     )
 
 
-def _sdpa_full_core_work_division(
+def _largest_exact_split(extent: int, limit: int) -> int:
+    """Return the largest divisor of ``extent`` no larger than ``limit``."""
+    for split in range(min(extent, limit), 0, -1):
+        if extent % split == 0:
+            return split
+    return 1
+
+
+def _sdpa_work_division(
     num_heads: int,
     num_kvheads: int,
     max_seqlen_q: int,
+    max_seqlen_kv: int,
     num_cores: int,
 ) -> dict[str, int] | None:
-    """Find placeable head/query splits that keep every core occupied.
-
-    MHA can split its physical head dimension up to the previously proven
-    four-way partition. Native GQA represents logical heads as
-    ``[num_kvheads, expansion]``. Measurements show that preserving both axes
-    and distributing query rows alone is faster than splitting either head
-    axis, so only use this path when query rows can occupy every core exactly.
-    """
-    if num_cores < 1:
+    """Find the largest placeable head/query split for SWA."""
+    if num_cores < 1 or max_seqlen_q <= 1:
         return None
 
     if num_heads != num_kvheads:
-        if num_heads % num_kvheads or max_seqlen_q % num_cores:
+        if num_heads % num_kvheads:
             return None
+        query_split = _largest_exact_split(max_seqlen_q, num_cores)
+        return {"max_seqlen_q": query_split} if query_split > 1 else None
+
+    if (
+        num_heads <= _SDPA_MHA_QUERY_ONLY_MAX_HEADS
+        and max_seqlen_q % num_cores == 0
+        and max_seqlen_kv
+        >= _SDPA_MHA_QUERY_ONLY_MIN_KV_BLOCKS * _SDPA_MAX_SEQUENCE_TILE_SIZE
+    ):
         return {"max_seqlen_q": num_cores}
 
-    max_head_split = _SDPA_MHA_MAX_HEAD_WORK_DIVISION
-    max_head_split = min(max_head_split, num_heads, num_cores)
-    for head_split in range(max_head_split, 0, -1):
-        if num_cores % head_split != 0 or num_heads % head_split != 0:
+    best: tuple[int, int] | None = None
+    max_head_split = min(_SDPA_MHA_MAX_HEAD_WORK_DIVISION, num_heads, num_cores)
+    for head_split in range(1, max_head_split + 1):
+        if num_heads % head_split:
             continue
-        query_split = num_cores // head_split
-        if max_seqlen_q % query_split == 0:
-            return {"num_heads": head_split, "max_seqlen_q": query_split}
-    return None
+        query_split = _largest_exact_split(max_seqlen_q, num_cores // head_split)
+        candidate = (head_split, query_split)
+        if best is None or (math.prod(candidate), head_split) > (
+            math.prod(best),
+            best[0],
+        ):
+            best = candidate
+    if best is None or math.prod(best) <= 1:
+        return None
+    return {"num_heads": best[0], "max_seqlen_q": best[1]}
+
+
+def _sdpa_estimated_active_cores(tile_extents: tuple[int, ...], num_cores: int) -> int:
+    """Estimate CP-SAT's largest exact split over visible inner axes."""
+    products = {1}
+    for extent in tile_extents:
+        divisors = [
+            split
+            for split in range(1, min(extent, num_cores) + 1)
+            if extent % split == 0
+        ]
+        products = {
+            product * divisor
+            for product in products
+            for divisor in divisors
+            if product * divisor <= num_cores
+        }
+    return max(products)
+
+
+def _exact_tile_counts(extent: int) -> list[int]:
+    """Return every exact map-loop trip count for a static axis."""
+    return [count for count in range(1, extent + 1) if extent % count == 0]
+
+
+def _axis_slice_is_dense(
+    shape: tuple[int, ...], strides: tuple[int, ...], axis: int
+) -> bool:
+    """Whether one tile of ``axis`` is a contiguous region of the tensor."""
+    expected_stride = 1
+    for dim in range(len(shape) - 1, axis, -1):
+        if shape[dim] > 1:
+            if strides[dim] != expected_stride:
+                return False
+            expected_stride *= shape[dim]
+    return strides[axis] == expected_stride
+
+
+def _sdpa_mask_hbm_bytes(
+    *,
+    mask_shapes: tuple[tuple[int, ...], ...],
+    axis_extents: tuple[int, ...],
+    axis_tile_counts: tuple[int, ...],
+    element_size: int,
+) -> int:
+    """Estimate mask loads, including replay along broadcast loop axes."""
+    total = 0
+    for shape in mask_shapes:
+        if len(shape) != len(axis_extents):
+            raise ValueError(
+                f"SDPA mask rank {len(shape)} does not match rank {len(axis_extents)}"
+            )
+        replay = 1
+        for size, extent, tile_count in zip(
+            shape, axis_extents, axis_tile_counts, strict=True
+        ):
+            if size == 1 and extent != 1:
+                replay *= tile_count
+            elif size != extent:
+                raise ValueError(
+                    f"SDPA mask extent {size} is neither broadcast nor {extent}"
+                )
+        total += math.prod(shape) * element_size * replay
+    return total
+
+
+def _sdpa_hbm_transfer_waves(num_bytes: int, num_cores: int) -> int:
+    """Convert aggregate traffic into calibrated full-card HBM load waves."""
+    bytes_per_wave = num_cores * _SDPA_TARGET_KV_BYTES_PER_CORE
+    return (num_bytes + bytes_per_wave - 1) // bytes_per_wave
 
 
 def _sdpa_lx_budget_bytes() -> int:
@@ -182,15 +388,6 @@ def _sdpa_lx_budget_bytes() -> int:
     return _lx_planning_size()
 
 
-def _sdpa_kv_work_division(*, query_split: int, kv_block_size: int) -> int:
-    """Choose a useful, exact KV split without forcing maximum occupancy."""
-    preferred = min(query_split, kv_block_size)
-    for kv_split in range(preferred, 0, -1):
-        if kv_block_size % kv_split == 0:
-            return kv_split
-    return 1
-
-
 def _sdpa_estimated_live_bytes_per_core(
     *,
     batch_size: int,
@@ -199,14 +396,17 @@ def _sdpa_estimated_live_bytes_per_core(
     kv_block_size: int,
     head_dim: int,
     element_size: int,
+    restick_bytes_per_core: int = 0,
+    full_sdpa_prefill: bool = False,
 ) -> tuple[int, int]:
     """Estimate the co-live, non-streamed values for one SDPA iteration.
 
-    K/V operands are streamed by the matmul implementation, so the hard LX
-    check covers the two score-sized values plus query/output-sized values and
-    the two scalar online-softmax accumulators. K/V bytes are handled
-    separately as a performance target, not incorrectly added as permanently
-    resident buffers.
+    V is streamed by the second matmul. K is restickified before the first
+    matmul and therefore participates in full-SDPA prefill residency. Full
+    nested prefill accounts for every score- and query-shaped value that can
+    overlap at a map/carry boundary. Decode and SWA retain their separately
+    calibrated two-score/two-query estimate. This flag selects a liveness
+    accounting regime; it does not select a non-HOP SDPA implementation.
     """
     score_bytes = (
         batch_size * heads_per_core * query_rows_per_core * kv_block_size * element_size
@@ -215,12 +415,232 @@ def _sdpa_estimated_live_bytes_per_core(
         batch_size * heads_per_core * query_rows_per_core * head_dim * element_size
     )
     accumulator_bytes = batch_size * heads_per_core * query_rows_per_core * element_size
+    score_allowance = (
+        _SDPA_PREFILL_LIVE_SCORE_BUFFER_ALLOWANCE
+        if full_sdpa_prefill
+        else _SDPA_NARROW_LIVE_SCORE_BUFFER_ALLOWANCE
+    )
+    query_allowance = (
+        _SDPA_PREFILL_LIVE_QUERY_BUFFER_ALLOWANCE
+        if full_sdpa_prefill
+        else _SDPA_NARROW_LIVE_QUERY_BUFFER_ALLOWANCE
+    )
     estimated_live_bytes = (
-        _SDPA_LIVE_SCORE_BUFFER_ALLOWANCE * score_bytes
-        + _SDPA_LIVE_QUERY_BUFFER_ALLOWANCE * query_bytes
+        score_allowance * score_bytes
+        + query_allowance * query_bytes
         + 2 * accumulator_bytes
+        + restick_bytes_per_core
     )
     return score_bytes, estimated_live_bytes
+
+
+@dataclasses.dataclass(frozen=True)
+class _SDPAKVBlockCandidate:
+    """Compiler-derived costs for one aligned K/V block size."""
+
+    block_size: int
+    num_blocks: int
+    score_bytes_per_core: int
+    query_bytes_per_core: int
+    estimated_live_bytes_per_core: int
+    kv_bytes_per_core: int
+    estimated_restick_active_cores: int
+    restick_bytes_per_core: int
+    restick_lx_eligible: bool
+    estimated_dsc_executions: int
+    estimated_load_bursts: int
+
+
+def _sdpa_kv_block_sizes(max_seqlen_kv: int) -> list[int]:
+    """Enumerate power-of-two burst sizes plus the aligned full extent."""
+    aligned_extent = max(64, ((max_seqlen_kv + 63) // 64) * 64)
+    candidates = []
+    block_size = 64
+    while block_size < aligned_extent:
+        candidates.append(block_size)
+        block_size *= 2
+    candidates.append(aligned_extent)
+    return candidates
+
+
+def _sdpa_query_tile_sizes(max_seqlen_q: int) -> list[int]:
+    """Enumerate exact query tiles from the full chunk down to one row."""
+    candidates = [max_seqlen_q]
+    target = 1 << (max_seqlen_q.bit_length() - 1)
+    while target >= 1:
+        num_tiles = _num_tiles_for_max_extent(max_seqlen_q, target)
+        tile_size = max_seqlen_q // num_tiles
+        if tile_size not in candidates:
+            candidates.append(tile_size)
+        target //= 2
+    return candidates
+
+
+def _sdpa_target_kv_bytes_per_core(
+    num_heads: int, num_kvheads: int, query_rows_per_core: int
+) -> int:
+    """Return the useful K/V streaming footprint for one core."""
+    gqa_reuse = num_heads // num_kvheads if num_heads % num_kvheads == 0 else 1
+    head_target = (
+        _SDPA_TARGET_KV_BYTES_PER_CORE
+        * max(_SDPA_GQA_HEADS_PER_KV_TARGET_MIB, gqa_reuse)
+        // _SDPA_GQA_HEADS_PER_KV_TARGET_MIB
+    )
+    query_target = (
+        _SDPA_TARGET_KV_BYTES_PER_CORE
+        * max(_SDPA_QUERY_ROWS_PER_KV_TARGET_MIB, query_rows_per_core)
+        // _SDPA_QUERY_ROWS_PER_KV_TARGET_MIB
+    )
+    return min(
+        _SDPA_MAX_TARGET_KV_BYTES_PER_CORE,
+        head_target,
+        query_target,
+    )
+
+
+def _sdpa_burst_efficient_kv_block_limit(query_rows_per_core: int) -> int:
+    """Bound K by the DPO BMM profile for the available query-row reuse."""
+    scale = max(1, query_rows_per_core // _SDPA_QUERY_ROWS_PER_KV_TARGET_MIB)
+    return min(
+        _SDPA_MAX_BURST_EFFICIENT_KV_BLOCK_SIZE,
+        _SDPA_BASE_BURST_EFFICIENT_KV_BLOCK_SIZE * scale,
+    )
+
+
+def _sdpa_restick_active_cores(
+    *, num_heads: int, num_cores: int, core_split: dict[str, int] | None
+) -> int:
+    """Estimate the cores sharing a restickified K block.
+
+    Explicit query work division determines this directly. Without one, the
+    DPO schedules observed for decode use at most two lanes per query head.
+    """
+    if core_split is not None:
+        return min(num_cores, math.prod(core_split.values()))
+    return min(num_cores, max(1, 2 * num_heads))
+
+
+def _sdpa_kv_candidates(
+    *,
+    batch_size: int,
+    num_heads: int,
+    num_kvheads: int,
+    max_seqlen_q: int,
+    max_seqlen_kv: int,
+    head_dim: int,
+    element_size: int,
+    num_cores: int,
+    query_tile_size: int | None = None,
+    group_tile_size: int = 1,
+    num_outer_tiles: int = 1,
+    full_sdpa_prefill: bool = False,
+    work_div: dict[str, int] | None = None,
+    pad_extent: bool = False,
+) -> list[_SDPAKVBlockCandidate]:
+    """Estimate LX pressure, restick traffic, and DPO execution count.
+
+    ``pad_extent`` lets SWA cost the aligned physical blocks it will materialize
+    instead of requiring every candidate block to divide the logical extent.
+    """
+    if full_sdpa_prefill:
+        assert query_tile_size is not None
+        # Model every axis visible in the innermost HOP body. CP-SAT can divide
+        # any exact combination of these axes, so the per-core score and carry
+        # footprint is the complete logical row count divided by that split.
+        active_cores = _sdpa_estimated_active_cores(
+            (batch_size, num_kvheads, group_tile_size, query_tile_size), num_cores
+        )
+        head_rows_per_core = (
+            batch_size * num_kvheads * group_tile_size * query_tile_size // active_cores
+        )
+        heads_per_core = head_rows_per_core
+        kv_heads_per_core = num_kvheads
+        query_rows_per_core = 1
+        # K has no G or Q axis.  Be deliberately conservative here: generated
+        # plans can use more lanes when a downstream Q split is compatible,
+        # but the only parallel axes guaranteed before layout planning are B
+        # and Hkv.  Overestimating this split makes a near-capacity plan look
+        # resident and is much costlier than rejecting one marginal K tile.
+        restick_active_cores = min(num_cores, batch_size * num_kvheads)
+    else:
+        # Preserve the calibrated decode model. Its operations are too narrow
+        # for the head/query partition used by chunked prefill.
+        head_split = work_div.get("num_heads", 1) if work_div is not None else 1
+        query_split = work_div.get("max_seqlen_q", 1) if work_div is not None else 1
+        heads_per_core = num_heads // head_split
+        kv_heads_per_core = num_kvheads // head_split
+        query_rows_per_core = max_seqlen_q // query_split
+        restick_active_cores = _sdpa_restick_active_cores(
+            num_heads=num_heads, num_cores=num_cores, core_split=work_div
+        )
+    gqa_reuse = num_heads // num_kvheads if num_heads % num_kvheads == 0 else 1
+    restick_lx_limit = _SDPA_RESTICK_LX_BYTES_PER_REUSING_HEAD * gqa_reuse
+    result = []
+    seen_block_sizes = set()
+    for max_block_size in _sdpa_kv_block_sizes(max_seqlen_kv):
+        if pad_extent:
+            num_blocks, effective_block_size = _padded_tiling_for_max_extent(
+                max_seqlen_kv,
+                max_block_size,
+                tile_alignment=_SDPA_SEQUENCE_TILE_ALIGNMENT,
+            )
+        else:
+            num_blocks = _num_tiles_for_max_extent(
+                max_seqlen_kv,
+                max_block_size,
+                tile_alignment=_SDPA_SEQUENCE_TILE_ALIGNMENT,
+            )
+            effective_block_size = max_seqlen_kv // num_blocks
+        if effective_block_size in seen_block_sizes:
+            continue
+        seen_block_sizes.add(effective_block_size)
+        restick_bytes_per_core = (
+            batch_size * num_kvheads * effective_block_size * head_dim * element_size
+            + restick_active_cores
+            - 1
+        ) // restick_active_cores
+        kv_bytes_per_core = (
+            batch_size
+            * kv_heads_per_core
+            * effective_block_size
+            * head_dim
+            * element_size
+        )
+        score_bytes, live_bytes = _sdpa_estimated_live_bytes_per_core(
+            batch_size=1 if full_sdpa_prefill else batch_size,
+            heads_per_core=heads_per_core,
+            query_rows_per_core=query_rows_per_core,
+            kv_block_size=effective_block_size,
+            head_dim=head_dim,
+            element_size=element_size,
+            restick_bytes_per_core=(restick_bytes_per_core if full_sdpa_prefill else 0),
+            full_sdpa_prefill=full_sdpa_prefill,
+        )
+        blocks_per_group = _kv_blocks_per_loop_group(1, num_blocks)
+        num_loop_groups = (num_blocks + blocks_per_group - 1) // blocks_per_group
+        result.append(
+            _SDPAKVBlockCandidate(
+                block_size=effective_block_size,
+                num_blocks=num_blocks,
+                score_bytes_per_core=score_bytes,
+                query_bytes_per_core=(score_bytes * head_dim // effective_block_size),
+                estimated_live_bytes_per_core=live_bytes,
+                kv_bytes_per_core=kv_bytes_per_core,
+                estimated_restick_active_cores=restick_active_cores,
+                restick_bytes_per_core=restick_bytes_per_core,
+                restick_lx_eligible=restick_bytes_per_core <= restick_lx_limit,
+                # Eight fixed executes, about seventeen for every unrolled
+                # block, and one carry boundary per loop group in the DBO
+                # bundles inspected during calibration.
+                estimated_dsc_executions=num_outer_tiles
+                * (8 + 17 * num_blocks + num_loop_groups),
+                # One K and one V stream per online-softmax trip. Outer HOP
+                # tiles replay both streams; wider resident blocks reduce the
+                # number of independent load bursts without a token cutoff.
+                estimated_load_bursts=2 * num_outer_tiles * num_blocks,
+            )
+        )
+    return result
 
 
 def _select_sdpa_tiling(
@@ -234,171 +654,393 @@ def _select_sdpa_tiling(
     element_size: int,
     num_cores: int,
     lx_budget_bytes: int,
+    mask_shapes: tuple[tuple[int, ...], ...] = (),
+    head_tile_staging_bytes: int = 0,
 ) -> _SDPATilingConfig:
-    """Choose a work-divided tile when it is safe, otherwise use the fallback.
+    """Choose SDPA tiling from compiler-visible costs.
 
-    Capacity is a rejection constraint, not the objective. Among feasible
-    choices, target 1-2 MiB of physical K/V data per core; native-GQA sweeps
-    show that both smaller blocks (extra online-softmax iterations) and larger
-    blocks (more local pressure) lose. Keep Lq and heads in one coarse tile
-    whenever a placeable work division can use every core. Shapes outside the
-    calibrated Lq<=512 regime retain the post-#4259 decomposition.
+    Prefill enumerates exact B/Hkv/G/Lq/Lk plans. It estimates the complete
+    nested-HOP live set, permits at most one whole intermediate to spill, and
+    balances loop/DSC executions, HBM load bursts, and aggregate transfer waves.
+    Decode retains its separately calibrated policy. No model identity or
+    sequence-length cutoff participates in the decision.
     """
     quarter_kv_stick_aligned = max(64, ((max_seqlen_kv + 3) // 4 + 63) // 64 * 64)
-    fallback_kv_block_size = min(_SDPA_MAX_SEQUENCE_TILE_SIZE, quarter_kv_stick_aligned)
-    fallback_num_kv_blocks = (
-        max_seqlen_kv + fallback_kv_block_size - 1
-    ) // fallback_kv_block_size
+    fallback_kv_block_limit = min(
+        _SDPA_MAX_SEQUENCE_TILE_SIZE, quarter_kv_stick_aligned
+    )
+    fallback_num_kv_blocks = _num_tiles_for_max_extent(
+        max_seqlen_kv,
+        fallback_kv_block_limit,
+        tile_alignment=_SDPA_SEQUENCE_TILE_ALIGNMENT,
+    )
+    fallback_kv_block_size = max_seqlen_kv // fallback_num_kv_blocks
     fallback_num_q_tiles = _num_tiles_for_max_extent(
         max_seqlen_q, _SDPA_MAX_SEQUENCE_TILE_SIZE
     )
     fallback_q_tile_size = max_seqlen_q // fallback_num_q_tiles
-    fallback_num_head_tiles = _sdpa_num_head_tiles(num_heads)
+    fallback_num_head_tiles, fallback_num_group_tiles = _sdpa_head_group_tiles(
+        num_heads, num_kvheads
+    )
+    fallback_num_batch_tiles = _sdpa_num_batch_tiles(batch_size)
     fallback_kv_blocks_per_loop_group = _kv_blocks_per_loop_group(
         fallback_num_q_tiles, fallback_num_kv_blocks
     )
     score_bytes_per_core: int | None = None
     estimated_live_bytes_per_core: int | None = None
-    selected_kv_block_size: int | None = None
+    is_decode = max_seqlen_q == 1
+    group_extent = num_heads // num_kvheads if num_heads != num_kvheads else 1
+    head_extent = num_kvheads if group_extent > 1 else num_heads
+    query_output_bytes = (
+        2 * batch_size * num_heads * max_seqlen_q * head_dim * element_size
+    )
+    kv_bytes = 2 * batch_size * num_kvheads * max_seqlen_kv * head_dim * element_size
+    mask_axis_extents = (
+        (batch_size, head_extent, group_extent, max_seqlen_q, max_seqlen_kv)
+        if group_extent > 1
+        else (batch_size, head_extent, max_seqlen_q, max_seqlen_kv)
+    )
 
-    # Decode has no useful query-axis parallelism, and coarse head tiling
-    # repeats the online-softmax body.  Keep all heads in one coarse tile.
-    # Native GQA geometries are fastest with ordinary scheduling. The K/V block
-    # cap is performance-driven and deliberately independent of the LX limit:
-    # sweeps show discontinuities well before capacity is full.
-    if max_seqlen_q == 1:
-        block_limit = _SDPA_DECODE_POLICIES.get(
-            (num_heads, num_kvheads, head_dim),
-            _SDPA_MAX_SEQUENCE_TILE_SIZE,
+    def estimated_hbm_bytes(
+        *,
+        num_batch_tiles: int,
+        num_head_tiles: int,
+        num_group_tiles: int,
+        num_q_tiles: int,
+        num_kv_blocks: int,
+    ) -> int:
+        axis_tile_counts = (
+            (
+                num_batch_tiles,
+                num_head_tiles,
+                num_group_tiles,
+                num_q_tiles,
+                num_kv_blocks,
+            )
+            if group_extent > 1
+            else (
+                num_batch_tiles,
+                num_head_tiles,
+                num_q_tiles,
+                num_kv_blocks,
+            )
         )
-        # Gemma 4 26B global has a short-context scheduling cliff: K256 wins at
-        # 512/1024/2048, while one full block wins at 4K and the measured 8K.
-        if (num_heads, num_kvheads, head_dim) == (16, 2, 512):
-            block_limit = 256 if max_seqlen_kv <= 2048 else 8192
-        selected_kv_block_size = min(max_seqlen_kv, block_limit)
-        selected_kv_block_size = max(64, selected_kv_block_size // 64 * 64)
-        decode_work_div = None
-        heads_per_core = num_heads
-        score_bytes_per_core, estimated_live_bytes_per_core = (
-            _sdpa_estimated_live_bytes_per_core(
-                batch_size=batch_size,
-                heads_per_core=heads_per_core,
-                query_rows_per_core=1,
-                kv_block_size=min(selected_kv_block_size, max_seqlen_kv),
-                head_dim=head_dim,
+        return (
+            query_output_bytes
+            + kv_bytes * num_group_tiles * num_q_tiles
+            + _sdpa_mask_hbm_bytes(
+                mask_shapes=mask_shapes,
+                axis_extents=mask_axis_extents,
+                axis_tile_counts=axis_tile_counts,
                 element_size=element_size,
             )
+            + (head_tile_staging_bytes if num_head_tiles > 1 else 0)
         )
-        if estimated_live_bytes_per_core <= lx_budget_bytes:
-            num_kv_blocks = (
-                max_seqlen_kv + selected_kv_block_size - 1
-            ) // selected_kv_block_size
-            if decode_work_div is None:
-                strategy = "decode" if num_kv_blocks == 1 else "decode_tiled"
-            else:
-                strategy = (
-                    "decode_work_divided"
-                    if num_kv_blocks == 1
-                    else "decode_work_divided_tiled"
+
+    if is_decode:
+        num_batch_tiles = _sdpa_num_batch_tiles(batch_size)
+        batch_tile_size = batch_size // num_batch_tiles
+        num_head_tiles = 1
+        num_group_tiles = group_extent
+        num_outer_tiles = num_batch_tiles * num_group_tiles
+        candidates = _sdpa_kv_candidates(
+            batch_size=batch_tile_size,
+            num_heads=num_heads,
+            num_kvheads=num_kvheads,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_kv=max_seqlen_kv,
+            head_dim=head_dim,
+            element_size=element_size,
+            num_cores=num_cores,
+            query_tile_size=1,
+            group_tile_size=1,
+            num_outer_tiles=num_outer_tiles,
+            full_sdpa_prefill=False,
+        )
+        feasible_decode = [
+            candidate
+            for candidate in candidates
+            if candidate.estimated_live_bytes_per_core <= lx_budget_bytes
+        ]
+        if feasible_decode:
+            fewest_executions = min(
+                feasible_decode,
+                key=lambda candidate: (
+                    candidate.estimated_dsc_executions,
+                    -candidate.block_size,
+                ),
+            )
+            lx_resident = [
+                candidate
+                for candidate in feasible_decode
+                if candidate.restick_lx_eligible
+                and candidate.block_size >= 256
+                and candidate.num_blocks
+                <= max(
+                    _SDPA_DECODE_MIN_LX_RESIDENT_BLOCKS,
+                    _SDPA_DECODE_MAX_MULTI_BLOCK_EXTENT // candidate.block_size,
                 )
+            ]
+            selected = (
+                min(
+                    lx_resident,
+                    key=lambda candidate: (
+                        candidate.estimated_dsc_executions,
+                        -candidate.block_size,
+                    ),
+                )
+                if lx_resident
+                else fewest_executions
+            )
+            reason = (
+                "single-query decode; LX-resident restickified K"
+                if selected.restick_lx_eligible
+                else "single-query decode; longest bursts and fewest DSC executes"
+            )
             return _SDPATilingConfig(
-                strategy=strategy,
-                reason="single-query decode; geometry-calibrated",
-                kv_block_size=selected_kv_block_size,
-                num_kv_blocks=num_kv_blocks,
+                strategy="decode" if selected.num_blocks == 1 else "decode_tiled",
+                reason=reason,
+                kv_block_size=selected.block_size,
+                num_kv_blocks=selected.num_blocks,
                 num_q_tiles=1,
                 q_tile_size=1,
-                num_head_tiles=1,
-                kv_blocks_per_loop_group=_kv_blocks_per_loop_group(1, num_kv_blocks),
-                work_div=decode_work_div,
-                score_bytes_per_core=score_bytes_per_core,
-                estimated_live_bytes_per_core=estimated_live_bytes_per_core,
+                num_batch_tiles=num_batch_tiles,
+                num_head_tiles=num_head_tiles,
+                num_group_tiles=num_group_tiles,
+                kv_blocks_per_loop_group=_kv_blocks_per_loop_group(
+                    1, selected.num_blocks
+                ),
+                estimated_active_cores=None,
+                estimated_load_bursts=selected.estimated_load_bursts,
+                estimated_hbm_bytes=estimated_hbm_bytes(
+                    num_batch_tiles=num_batch_tiles,
+                    num_head_tiles=num_head_tiles,
+                    num_group_tiles=num_group_tiles,
+                    num_q_tiles=1,
+                    num_kv_blocks=selected.num_blocks,
+                ),
+                estimated_spill_buffers=0,
+                estimated_spill_bytes=0,
+                score_bytes_per_core=selected.score_bytes_per_core,
+                estimated_live_bytes_per_core=selected.estimated_live_bytes_per_core,
                 lx_budget_bytes=lx_budget_bytes,
             )
+        smallest_candidate = min(
+            candidates, key=lambda candidate: candidate.estimated_live_bytes_per_core
+        )
+    else:
+        plans: list[_SDPAPrefillPlan] = []
+        for num_batch_tiles in _exact_tile_counts(batch_size):
+            batch_tile_size = batch_size // num_batch_tiles
+            for num_head_tiles in _exact_tile_counts(head_extent):
+                head_tile_size = head_extent // num_head_tiles
+                for num_group_tiles in _exact_tile_counts(group_extent):
+                    group_tile_size = group_extent // num_group_tiles
+                    for query_tile_size in _sdpa_query_tile_sizes(max_seqlen_q):
+                        num_q_tiles = max_seqlen_q // query_tile_size
+                        num_outer_tiles = (
+                            num_batch_tiles
+                            * num_head_tiles
+                            * num_group_tiles
+                            * num_q_tiles
+                        )
+                        candidates = _sdpa_kv_candidates(
+                            batch_size=batch_tile_size,
+                            num_heads=head_tile_size * group_tile_size,
+                            num_kvheads=head_tile_size,
+                            max_seqlen_q=query_tile_size,
+                            max_seqlen_kv=max_seqlen_kv,
+                            head_dim=head_dim,
+                            element_size=element_size,
+                            num_cores=num_cores,
+                            query_tile_size=query_tile_size,
+                            group_tile_size=group_tile_size,
+                            num_outer_tiles=num_outer_tiles,
+                            full_sdpa_prefill=True,
+                        )
+                        for candidate in candidates:
+                            live_overflow = max(
+                                0,
+                                candidate.estimated_live_bytes_per_core
+                                - lx_budget_bytes,
+                            )
+                            # The analytical live count is conservative around
+                            # the map/carry handoff by one query-shaped slot.
+                            # Use that slot for admission, but charge the larger
+                            # score/query buffer that allocation may evict.
+                            spill_allowance = candidate.query_bytes_per_core
+                            spill_buffer_size = max(
+                                candidate.score_bytes_per_core,
+                                candidate.query_bytes_per_core,
+                            )
+                            estimated_spill_buffers = (
+                                (live_overflow + spill_allowance - 1) // spill_allowance
+                                if live_overflow
+                                else 0
+                            )
+                            # A spilled intermediate is written to HBM and read
+                            # back on every innermost loop trip.
+                            estimated_spill_bytes = (
+                                2
+                                * estimated_spill_buffers
+                                * spill_buffer_size
+                                * num_cores
+                                * num_outer_tiles
+                                * candidate.num_blocks
+                            )
+                            plan_hbm_bytes = (
+                                estimated_hbm_bytes(
+                                    num_batch_tiles=num_batch_tiles,
+                                    num_head_tiles=num_head_tiles,
+                                    num_group_tiles=num_group_tiles,
+                                    num_q_tiles=num_q_tiles,
+                                    num_kv_blocks=candidate.num_blocks,
+                                )
+                                + estimated_spill_bytes
+                            )
+                            plan_load_bursts = candidate.estimated_load_bursts + (
+                                _sdpa_hbm_transfer_waves(
+                                    head_tile_staging_bytes, num_cores
+                                )
+                                if num_head_tiles > 1
+                                else 0
+                            )
+                            plan_hbm_transfer_waves = _sdpa_hbm_transfer_waves(
+                                plan_hbm_bytes, num_cores
+                            )
+                            plans.append(
+                                _SDPAPrefillPlan(
+                                    num_batch_tiles=num_batch_tiles,
+                                    num_head_tiles=num_head_tiles,
+                                    num_group_tiles=num_group_tiles,
+                                    num_q_tiles=num_q_tiles,
+                                    q_tile_size=query_tile_size,
+                                    kv=candidate,
+                                    estimated_active_cores=(
+                                        _sdpa_estimated_active_cores(
+                                            (
+                                                batch_tile_size,
+                                                head_tile_size,
+                                                group_tile_size,
+                                                query_tile_size,
+                                            ),
+                                            num_cores,
+                                        )
+                                    ),
+                                    estimated_restick_active_cores=(
+                                        candidate.estimated_restick_active_cores
+                                    ),
+                                    estimated_restick_work_bytes=(
+                                        candidate.restick_bytes_per_core
+                                        * num_outer_tiles
+                                        * candidate.num_blocks
+                                    ),
+                                    estimated_load_bursts=plan_load_bursts,
+                                    estimated_hbm_bytes=plan_hbm_bytes,
+                                    estimated_hbm_transfer_waves=(
+                                        plan_hbm_transfer_waves
+                                    ),
+                                    estimated_spill_buffers=(estimated_spill_buffers),
+                                    estimated_spill_bytes=estimated_spill_bytes,
+                                    estimated_work=(
+                                        candidate.estimated_dsc_executions
+                                        + plan_load_bursts
+                                        + plan_hbm_transfer_waves
+                                    ),
+                                )
+                            )
 
-    work_div = _sdpa_full_core_work_division(
-        num_heads, num_kvheads, max_seqlen_q, num_cores
-    )
-    if work_div is not None and max_seqlen_q <= _SDPA_MAX_SEQUENCE_TILE_SIZE:
-        head_split = work_div.get("num_heads", 1)
-        heads_per_core = num_heads // head_split
-        kv_heads_per_core = num_kvheads // head_split
-        query_rows_per_core = max_seqlen_q // work_div["max_seqlen_q"]
-        kv_bytes_per_token_per_core = (
-            batch_size * kv_heads_per_core * head_dim * element_size
-        )
-        target_kv_bytes_per_core = (
-            _SDPA_LOW_KV_HEAD_TARGET_BYTES_PER_CORE
-            if num_heads != num_kvheads and num_kvheads <= 2
-            else _SDPA_TARGET_KV_BYTES_PER_CORE
-        )
-        target_kv_block_size = max(
-            64,
-            (target_kv_bytes_per_core // kv_bytes_per_token_per_core // 64) * 64,
-        )
-        selected_kv_block_size = min(
-            max_seqlen_kv,
-            (
-                _SDPA_MAX_SEQUENCE_TILE_SIZE
-                if num_heads == num_kvheads
-                else _SDPA_GQA_MAX_KV_TILE_SIZE
-            ),
-            target_kv_block_size,
-        )
-        selected_kv_block_size = max(64, selected_kv_block_size // 64 * 64)
-        while selected_kv_block_size >= 64:
-            score_bytes_per_core, estimated_live_bytes_per_core = (
-                _sdpa_estimated_live_bytes_per_core(
-                    batch_size=batch_size,
-                    heads_per_core=heads_per_core,
-                    query_rows_per_core=query_rows_per_core,
-                    kv_block_size=min(selected_kv_block_size, max_seqlen_kv),
-                    head_dim=head_dim,
-                    element_size=element_size,
-                )
+        bounded_prefill = [
+            plan
+            for plan in plans
+            # Tolerate and price one query/output carry-sized uncertainty at
+            # the map boundary. Requiring more means DWSRS did not right-size
+            # the working set.
+            if plan.estimated_spill_buffers <= 1
+        ]
+        for plan in plans:
+            logger.debug(
+                "SDPA tile candidate: B=%s H=%s G=%s Lq=%s K=%s "
+                "active_cores=%s restick_cores=%s load_bursts=%s "
+                "hbm_bytes=%s hbm_waves=%s spill_buffers=%s spill_bytes=%s "
+                "restick_work_bytes=%s dsc_executes=%s estimated_work=%s "
+                "score_bytes_per_core=%s live_bytes_per_core=%s feasible=%s",
+                plan.num_batch_tiles,
+                plan.num_head_tiles,
+                plan.num_group_tiles,
+                plan.q_tile_size,
+                plan.kv.block_size,
+                plan.estimated_active_cores,
+                plan.estimated_restick_active_cores,
+                plan.estimated_load_bursts,
+                plan.estimated_hbm_bytes,
+                plan.estimated_hbm_transfer_waves,
+                plan.estimated_spill_buffers,
+                plan.estimated_spill_bytes,
+                plan.estimated_restick_work_bytes,
+                plan.kv.estimated_dsc_executions,
+                plan.estimated_work,
+                plan.kv.score_bytes_per_core,
+                plan.kv.estimated_live_bytes_per_core,
+                plan.estimated_spill_buffers <= 1,
             )
-            if estimated_live_bytes_per_core <= lx_budget_bytes:
-                break
-            selected_kv_block_size = selected_kv_block_size // 2 // 64 * 64
-
-    reason = "eligible"
-    if max_seqlen_q > _SDPA_MAX_SEQUENCE_TILE_SIZE:
-        reason = "query extent exceeds the calibrated work-divided limit"
-    elif work_div is None:
-        reason = "no exact full-core head/sequence work division"
-    elif (
-        selected_kv_block_size is None
-        or selected_kv_block_size < 64
-        or estimated_live_bytes_per_core is None
-        or estimated_live_bytes_per_core > lx_budget_bytes
-    ):
-        reason = "estimated per-core live footprint exceeds the LX budget"
-
-    if reason == "eligible":
-        assert work_div is not None
-        assert selected_kv_block_size is not None
-        num_kv_blocks = (
-            max_seqlen_kv + selected_kv_block_size - 1
-        ) // selected_kv_block_size
-        if num_heads == num_kvheads:
-            work_div["max_seqlen_kv"] = _sdpa_kv_work_division(
-                query_split=work_div["max_seqlen_q"],
-                kv_block_size=selected_kv_block_size,
+        if bounded_prefill:
+            selected_plan = min(
+                bounded_prefill,
+                key=lambda plan: (
+                    plan.estimated_work,
+                    plan.estimated_spill_buffers,
+                    plan.estimated_load_bursts,
+                    plan.estimated_hbm_bytes,
+                    plan.kv.estimated_dsc_executions,
+                    -plan.estimated_active_cores,
+                    plan.estimated_restick_work_bytes,
+                    plan.num_batch_tiles,
+                    plan.num_head_tiles,
+                    -plan.q_tile_size,
+                    plan.num_group_tiles,
+                    -plan.kv.block_size,
+                ),
             )
-        return _SDPATilingConfig(
-            strategy=("work_divided" if num_kv_blocks == 1 else "work_divided_tiled"),
-            reason=reason,
-            kv_block_size=selected_kv_block_size,
-            num_kv_blocks=num_kv_blocks,
-            num_q_tiles=1,
-            q_tile_size=max_seqlen_q,
-            num_head_tiles=1,
-            kv_blocks_per_loop_group=_kv_blocks_per_loop_group(1, num_kv_blocks),
-            work_div=work_div,
-            score_bytes_per_core=score_bytes_per_core,
-            estimated_live_bytes_per_core=estimated_live_bytes_per_core,
-            lx_budget_bytes=lx_budget_bytes,
+            selected = selected_plan.kv
+            return _SDPATilingConfig(
+                strategy=(
+                    "work_divided"
+                    if selected_plan.num_batch_tiles == 1
+                    and selected_plan.num_head_tiles == 1
+                    and selected_plan.num_group_tiles == 1
+                    and selected_plan.num_q_tiles == 1
+                    and selected.num_blocks == 1
+                    else "work_divided_tiled"
+                ),
+                reason=("lowest loop, HBM burst, and bounded-spill transfer cost"),
+                kv_block_size=selected.block_size,
+                num_kv_blocks=selected.num_blocks,
+                num_q_tiles=selected_plan.num_q_tiles,
+                q_tile_size=selected_plan.q_tile_size,
+                num_batch_tiles=selected_plan.num_batch_tiles,
+                num_head_tiles=selected_plan.num_head_tiles,
+                num_group_tiles=selected_plan.num_group_tiles,
+                kv_blocks_per_loop_group=_kv_blocks_per_loop_group(
+                    selected_plan.num_q_tiles, selected.num_blocks
+                ),
+                estimated_active_cores=selected_plan.estimated_active_cores,
+                estimated_load_bursts=selected_plan.estimated_load_bursts,
+                estimated_hbm_bytes=selected_plan.estimated_hbm_bytes,
+                estimated_spill_buffers=selected_plan.estimated_spill_buffers,
+                estimated_spill_bytes=selected_plan.estimated_spill_bytes,
+                score_bytes_per_core=selected.score_bytes_per_core,
+                estimated_live_bytes_per_core=selected.estimated_live_bytes_per_core,
+                lx_budget_bytes=lx_budget_bytes,
+            )
+        smallest_plan = min(
+            plans, key=lambda plan: plan.kv.estimated_live_bytes_per_core
         )
+        smallest_candidate = smallest_plan.kv
+
+    score_bytes_per_core = smallest_candidate.score_bytes_per_core
+    estimated_live_bytes_per_core = smallest_candidate.estimated_live_bytes_per_core
+    reason = "estimated per-core live footprint exceeds the LX budget"
 
     return _SDPATilingConfig(
         strategy="coarse_tiled",
@@ -407,11 +1049,267 @@ def _select_sdpa_tiling(
         num_kv_blocks=fallback_num_kv_blocks,
         num_q_tiles=fallback_num_q_tiles,
         q_tile_size=fallback_q_tile_size,
+        num_batch_tiles=fallback_num_batch_tiles,
         num_head_tiles=fallback_num_head_tiles,
+        num_group_tiles=fallback_num_group_tiles,
         kv_blocks_per_loop_group=fallback_kv_blocks_per_loop_group,
+        estimated_active_cores=None,
+        estimated_load_bursts=(
+            2
+            * fallback_num_batch_tiles
+            * fallback_num_head_tiles
+            * fallback_num_group_tiles
+            * fallback_num_q_tiles
+            * fallback_num_kv_blocks
+            + (
+                _sdpa_hbm_transfer_waves(head_tile_staging_bytes, num_cores)
+                if fallback_num_head_tiles > 1
+                else 0
+            )
+        ),
+        estimated_hbm_bytes=estimated_hbm_bytes(
+            num_batch_tiles=fallback_num_batch_tiles,
+            num_head_tiles=fallback_num_head_tiles,
+            num_group_tiles=fallback_num_group_tiles,
+            num_q_tiles=fallback_num_q_tiles,
+            num_kv_blocks=fallback_num_kv_blocks,
+        ),
+        estimated_spill_buffers=None,
+        estimated_spill_bytes=None,
+        score_bytes_per_core=score_bytes_per_core,
+        estimated_live_bytes_per_core=estimated_live_bytes_per_core,
+        lx_budget_bytes=lx_budget_bytes,
+    )
+
+
+def _select_swa_tiling(
+    *,
+    batch_size: int,
+    num_heads: int,
+    num_kvheads: int,
+    q_block: int,
+    buffer_width: int,
+    head_dim: int,
+    element_size: int,
+    num_cores: int,
+    lx_budget_bytes: int,
+) -> _SWATilingConfig:
+    """Choose SWA tiling from the same compiler-visible costs as full SDPA.
+
+    SWA presents one static physical K/V window to each query block, so its
+    block selection has the same score-buffer, streaming, restickification,
+    and DPO execution tradeoffs as SDPA.  Only the dimension names differ:
+    SDPA's ``max_seqlen_q`` and ``max_seqlen_kv`` become ``q_block`` and
+    ``kv_block`` in the SWA decomposition.
+
+    Unlike full SDPA, SWA pads its complete K/V scan so every repeated BMM tile
+    has a 64-row physical extent. Candidate ceilings are therefore normalized
+    to equal aligned tiles that cover the logical buffer before their physical
+    costs are evaluated.
+    """
+    fallback_num_kv_blocks, fallback_kv_block_size = _padded_tiling_for_max_extent(
+        buffer_width,
+        _SDPA_MAX_SEQUENCE_TILE_SIZE,
+        tile_alignment=_SDPA_SEQUENCE_TILE_ALIGNMENT,
+    )
+    fallback_num_head_tiles = (
+        1 if num_heads != num_kvheads else _sdpa_num_head_tiles(num_heads)
+    )
+    score_bytes_per_core: int | None = None
+    estimated_live_bytes_per_core: int | None = None
+    kv_bytes_per_core: int | None = None
+    restick_bytes_per_core: int | None = None
+    restick_lx_eligible: bool | None = None
+    estimated_dsc_executions: int | None = None
+    is_decode = q_block == 1
+    work_div_num_cores = num_cores
+    if num_heads != num_kvheads:
+        work_div_num_cores = min(
+            num_cores, max(1, q_block // _SWA_MIN_QUERY_ROWS_PER_CORE)
+        )
+    sdpa_work_div = (
+        None
+        if is_decode
+        else _sdpa_work_division(
+            num_heads,
+            num_kvheads,
+            q_block,
+            buffer_width,
+            work_div_num_cores,
+        )
+    )
+
+    reason = "compiler-cost candidate available"
+    if q_block > _SDPA_MAX_SEQUENCE_TILE_SIZE:
+        reason = "query block exceeds the calibrated work-divided limit"
+    elif not is_decode and sdpa_work_div is None:
+        reason = "no exact head/query-block work division"
+    else:
+        candidates = _sdpa_kv_candidates(
+            batch_size=batch_size,
+            num_heads=num_heads,
+            num_kvheads=num_kvheads,
+            max_seqlen_q=q_block,
+            max_seqlen_kv=buffer_width,
+            head_dim=head_dim,
+            element_size=element_size,
+            num_cores=num_cores,
+            work_div=sdpa_work_div,
+            pad_extent=True,
+        )
+        for candidate in candidates:
+            logger.debug(
+                "SWA KV candidate: K=%s blocks=%s estimated_dsc_executes=%s "
+                "score_bytes_per_core=%s live_bytes_per_core=%s "
+                "kv_bytes_per_core=%s restick_bytes_per_core=%s "
+                "restick_lx_eligible=%s feasible=%s",
+                candidate.block_size,
+                candidate.num_blocks,
+                candidate.estimated_dsc_executions,
+                candidate.score_bytes_per_core,
+                candidate.estimated_live_bytes_per_core,
+                candidate.kv_bytes_per_core,
+                candidate.restick_bytes_per_core,
+                candidate.restick_lx_eligible,
+                candidate.estimated_live_bytes_per_core <= lx_budget_bytes,
+            )
+        feasible = [
+            candidate
+            for candidate in candidates
+            if candidate.estimated_live_bytes_per_core <= lx_budget_bytes
+        ]
+        if not feasible:
+            smallest = candidates[0]
+            score_bytes_per_core = smallest.score_bytes_per_core
+            estimated_live_bytes_per_core = smallest.estimated_live_bytes_per_core
+            kv_bytes_per_core = smallest.kv_bytes_per_core
+            restick_bytes_per_core = smallest.restick_bytes_per_core
+            restick_lx_eligible = smallest.restick_lx_eligible
+            estimated_dsc_executions = smallest.estimated_dsc_executions
+            reason = "estimated per-core live footprint exceeds the LX budget"
+        else:
+            fewest_executions = min(
+                feasible,
+                key=lambda candidate: (
+                    candidate.estimated_dsc_executions,
+                    -candidate.block_size,
+                ),
+            )
+            if is_decode:
+                lx_resident = [
+                    candidate
+                    for candidate in feasible
+                    if candidate.restick_lx_eligible
+                    and candidate.block_size >= 256
+                    and candidate.num_blocks
+                    <= max(
+                        _SDPA_DECODE_MIN_LX_RESIDENT_BLOCKS,
+                        _SDPA_DECODE_MAX_MULTI_BLOCK_EXTENT // candidate.block_size,
+                    )
+                ]
+                selected = (
+                    min(
+                        lx_resident,
+                        key=lambda candidate: (
+                            candidate.estimated_dsc_executions,
+                            -candidate.block_size,
+                        ),
+                    )
+                    if lx_resident
+                    else fewest_executions
+                )
+                reason = (
+                    "single-query decode; LX-resident restickified K"
+                    if selected.restick_lx_eligible
+                    else "single-query decode; longest bursts and fewest DSC executes"
+                )
+            else:
+                # Prefill starts from the generated candidates, keeps only
+                # LX-feasible tiles, then selects the one closest to the
+                # analytical K/V streaming target.
+                assert sdpa_work_div is not None
+                query_rows_per_core = q_block // sdpa_work_div["max_seqlen_q"]
+                target_kv_bytes = _sdpa_target_kv_bytes_per_core(
+                    num_heads,
+                    num_kvheads,
+                    query_rows_per_core,
+                )
+                target_kv_block_size = _sdpa_burst_efficient_kv_block_limit(
+                    query_rows_per_core
+                )
+                kv_bytes_per_row = (
+                    candidates[0].kv_bytes_per_core // candidates[0].block_size
+                )
+                target_kv_extent = min(
+                    target_kv_block_size,
+                    max(1, target_kv_bytes // kv_bytes_per_row),
+                )
+                # Equal HOP tiles can leave large gaps around the analytical
+                # target.  Choose the closest physically runnable divisor,
+                # rather than always rounding down and accidentally halving
+                # the useful burst.  LX remains a hard feasibility bound;
+                # execution count and burst length break equidistant ties.
+                selected = min(
+                    feasible,
+                    key=lambda candidate: (
+                        abs(candidate.block_size - target_kv_extent),
+                        candidate.estimated_dsc_executions,
+                        -candidate.block_size,
+                    ),
+                )
+                reason = "closest exact tile to K/V streaming and burst targets"
+
+            selected_work_div = (
+                dict(sdpa_work_div) if sdpa_work_div is not None else None
+            )
+            # The HOP loop already owns the K/V traversal and its online
+            # softmax reduction. Unlike full SDPA's statically unrolled
+            # blocks, splitting that reduction again is neither legal nor
+            # useful; preserve only the independent head/query splits.
+            swa_work_div_names = {"max_seqlen_q": "q_block"}
+            swa_work_div = (
+                {
+                    swa_work_div_names.get(name, name): split
+                    for name, split in selected_work_div.items()
+                }
+                if selected_work_div is not None
+                else None
+            )
+            strategy = "decode" if is_decode else "work_divided"
+            if selected.num_blocks > 1:
+                strategy += "_tiled"
+            return _SWATilingConfig(
+                strategy=strategy,
+                reason=reason,
+                kv_block_size=selected.block_size,
+                num_kv_blocks=selected.num_blocks,
+                num_head_tiles=1,
+                work_div=swa_work_div,
+                score_bytes_per_core=selected.score_bytes_per_core,
+                estimated_live_bytes_per_core=selected.estimated_live_bytes_per_core,
+                kv_bytes_per_core=selected.kv_bytes_per_core,
+                restick_bytes_per_core=selected.restick_bytes_per_core,
+                restick_lx_eligible=selected.restick_lx_eligible,
+                estimated_dsc_executions=selected.estimated_dsc_executions,
+                lx_budget_bytes=lx_budget_bytes,
+            )
+
+    if reason == "compiler-cost candidate available":
+        raise AssertionError("SWA candidate selection did not produce a result")
+
+    return _SWATilingConfig(
+        strategy=("fallback" if fallback_num_kv_blocks == 1 else "fallback_tiled"),
+        reason=reason,
+        kv_block_size=fallback_kv_block_size,
+        num_kv_blocks=fallback_num_kv_blocks,
+        num_head_tiles=fallback_num_head_tiles,
         work_div=None,
         score_bytes_per_core=score_bytes_per_core,
         estimated_live_bytes_per_core=estimated_live_bytes_per_core,
+        kv_bytes_per_core=kv_bytes_per_core,
+        restick_bytes_per_core=restick_bytes_per_core,
+        restick_lx_eligible=restick_lx_eligible,
+        estimated_dsc_executions=estimated_dsc_executions,
         lx_budget_bytes=lx_budget_bytes,
     )
 
@@ -548,7 +1446,12 @@ class _OPWrapper:
             return self._fn(*args, **kwargs)
         if self._compiled_fn is None:
             self._compiled_fn = torch.compile(self._fn, dynamic=False)
-        return self._compiled_fn(*args, **kwargs)
+        # ``scan`` lowers to a ``while_loop`` whose traced body extracts its
+        # scalar induction variable with ``item()``.  Eager PrivateUse1
+        # dispatch reaches that rewrite through this lazy compilation path,
+        # outside Dynamo's usual scalar-capture setup.
+        with torch._dynamo.config.patch(capture_scalar_outputs=True):
+            return self._compiled_fn(*args, **kwargs)
 
 
 def _register_spyre_dispatchkey_kernels_permanently():
@@ -741,6 +1644,63 @@ def spyre_softplus(
     return torch.ops.spyre.softplus(input * beta, 1.0, threshold) * inv_beta
 
 
+def _pow_by_squaring(input: torch.Tensor, exponent: int) -> torch.Tensor:
+    """``input ** exponent`` for ``exponent >= 1`` as a chain of ``mul`` ops.
+
+    Binary square-and-multiply, so ~2*log2(n) multiplies. That is optimal for
+    every exponent below 15 and never more than one multiply above optimal
+    through at least n=40, so the addition-chain search that would close the
+    gap is not worth the table it needs.
+    """
+    result = None
+    square = input
+    while exponent:
+        if exponent & 1:
+            result = square if result is None else torch.mul(result, square)
+        exponent >>= 1
+        if exponent:
+            square = torch.mul(square, square)
+    return result
+
+
+@register_spyre_decompositions([torch.ops.aten.pow.Tensor_Scalar])
+def spyre_pow_tensor_scalar(
+    input: torch.Tensor, exponent: Union[int, float]
+) -> torch.Tensor:
+    """``pow`` with a scalar exponent: an exact primitive where one exists, a
+    multiply chain for any other integer, and ``exp(n * log(x))`` otherwise.
+
+    Limitation: a negative base with a non-integer exponent returns a finite
+    garbage value where CPU returns NaN.
+    """
+    if isinstance(exponent, bool):
+        exponent = int(exponent)
+    if not input.dtype.is_floating_point:
+        # TODO: support integer bases; needs aten's promotion rules plus device
+        # support for integer multiply chains.
+        raise Unsupported(f"pow with a non-floating-point base: {input.dtype}")
+
+    # int, float, or SymFloat depending on the trace, and not stable across runs.
+    e = float(exponent)
+    if e == 1.0:
+        # Returning the input rather than a copy is legal because a
+        # decomposition runs on a functionalized graph; callers must not rely on
+        # either identity, since aten's contract is only that the value matches.
+        return input
+    if e == -1.0:
+        return torch.reciprocal(input)
+    if e == 0.5:
+        return torch.sqrt(input)
+    if e == -0.5:
+        return torch.rsqrt(input)
+    if e == 0.0:
+        return torch.ones_like(input)
+    if e.is_integer():
+        magnitude = _pow_by_squaring(input, abs(int(e)))
+        return torch.reciprocal(magnitude) if e < 0 else magnitude
+    return torch.exp(e * torch.log(input))
+
+
 @register_spyre_decompositions([torch.ops.aten.linear.default])
 def spyre_linear(
     input: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None
@@ -784,34 +1744,20 @@ def spyre__sdpa_overrideable(
     max_seqlen_kv = key.size(2)
     head_dim = query.size(3)
 
-    scaling_factor = scale
-    if scaling_factor is None:
-        scaling_factor = 1.0 / math.sqrt(math.sqrt(head_dim))
-    else:
-        scaling_factor = math.sqrt(scaling_factor)
+    query_scale = scale
+    if query_scale is None:
+        query_scale = 1.0 / math.sqrt(head_dim)
 
     if dropout_p > 0.0:
         raise Unsupported("Attention dropout not implemented for Spyre")
 
-    # The named_dims seeds below zip names positionally to each seeded op's
-    # PHYSICAL output layout. host_coordinates derives the coord expressions
-    # from the op's physical STRIDES, so the tiler's loop-var -> logical-dim
-    # mapping follows physical stride order, not logical dim order. SDPA is
-    # routinely called with q/k/v as transpose(1, 2) views of a [B, S, H, D]
-    # tensor, so query's physical layout is [B, S, H, D] while its logical shape
-    # is [B, H, S, D]. Seeding ["_b","num_heads","max_seqlen_q",...] on such
-    # a buffer then maps the tile onto the head axis instead of the query
-    # axis and the result is wrong.
-    #
-    # Normalize the QUERY wholesale: query.contiguous() is bounded (same
-    # footprint as the `output` buffer we allocate below) and makes every
-    # query-derived seed (q_scaled, zeros_like(query), the final permute) land
-    # on logical [B, H, S, D] order. We do NOT contiguify key/value wholesale --
-    # that materializes a full [B, H, S_kv, D] copy that OOMs on long KV. K/V are
-    # instead normalized PER BLOCK inside the loop (keys_T's .contiguous() and
-    # the per-block v_blk.contiguous()), each a bounded [B, H, kv_block_size, D]
-    # copy chosen by the cost model, never an implicit full [B, H, S_kv, D]
-    # copy. Decode can intentionally choose a full block for short sequences.
+    # SDPA routinely receives logical [B, H, S, D] queries backed by physical
+    # [B, S, H, D] storage. for_each_tile's explicit dims already preserve the
+    # logical axes, but WhileLoop.create still requires exact input strides and
+    # would otherwise synthesize this normalization. Keep the bounded, one-time
+    # query copy explicit before GQA unflattening. Do not contiguify K/V
+    # wholesale: those copies scale with context length, so the compiler streams
+    # their bounded tiles instead.
     original_query_strides = query.stride()
     if num_heads % num_kvheads != 0:
         raise Unsupported(
@@ -828,79 +1774,6 @@ def spyre__sdpa_overrideable(
     query = query.contiguous()
     if use_gqa:
         query = query.unflatten(1, (num_kvheads, gqa_group_size))
-
-    query_dim_names = (
-        [
-            "_b",
-            "num_kvheads",
-            "gqa_group_size",
-            "max_seqlen_q",
-            "head_dim",
-        ]
-        if use_gqa
-        else ["_b", "num_heads", "max_seqlen_q", "head_dim"]
-    )
-    accumulator_dim_names = query_dim_names[:-1]
-    accumulator_shape = (
-        (batch_size, num_kvheads, gqa_group_size, max_seqlen_q, 64)
-        if use_gqa
-        else (batch_size, num_heads, max_seqlen_q, 64)
-    )
-
-    tiling = _select_sdpa_tiling(
-        batch_size=batch_size,
-        num_heads=num_heads,
-        num_kvheads=num_kvheads,
-        max_seqlen_q=max_seqlen_q,
-        max_seqlen_kv=max_seqlen_kv,
-        head_dim=head_dim,
-        element_size=query.dtype.itemsize,
-        num_cores=config.sencores,
-        lx_budget_bytes=_sdpa_lx_budget_bytes(),
-    )
-    logger.debug(
-        "SDPA tiling: strategy=%s reason=%s Lq=%s q_tiles=%s "
-        "q_tile_size=%s Lk=%s kv_blocks=%s kv_block_size=%s "
-        "head_tiles=%s kv_blocks_per_loop_group=%s work_div=%s "
-        "score_bytes_per_core=%s estimated_live_bytes_per_core=%s "
-        "lx_budget_bytes=%s",
-        tiling.strategy,
-        tiling.reason,
-        max_seqlen_q,
-        tiling.num_q_tiles,
-        tiling.q_tile_size,
-        max_seqlen_kv,
-        tiling.num_kv_blocks,
-        tiling.kv_block_size,
-        tiling.num_head_tiles,
-        tiling.kv_blocks_per_loop_group,
-        tiling.work_div,
-        tiling.score_bytes_per_core,
-        tiling.estimated_live_bytes_per_core,
-        tiling.lx_budget_bytes,
-    )
-
-    with spyre_hint(named_dims=query_dim_names):
-        output = torch.zeros_like(query)
-
-    # FIXME: create a sparse M tensor via reduction
-    M_reduced = torch.full(
-        accumulator_shape,
-        float("-inf"),
-        device=query.device,
-        dtype=query.dtype,
-    )
-    with spyre_hint(named_dims=accumulator_dim_names):
-        M = M_reduced.amax(dim=-1)
-
-    # FIXME: create a sparse denominator tensor via reduction
-    denominator_reduced = torch.zeros(
-        accumulator_shape,
-        device=query.device,
-        dtype=query.dtype,
-    )
-    with spyre_hint(named_dims=accumulator_dim_names):
-        denominator = denominator_reduced.amax(dim=-1)
 
     # Precompute the causal additive mask once before entering the tiled loops.
     # Shape [1, 1, max_seqlen_q, max_seqlen_kv]: 0.0 = keep, -inf = masked.
@@ -936,169 +1809,243 @@ def spyre__sdpa_overrideable(
             raise Unsupported(
                 f"GQA attention bias must have rank 2-5, got rank {attn_bias.dim()}"
             )
+    elif attn_bias is not None:
+        while attn_bias.dim() < 4:
+            attn_bias = attn_bias.unsqueeze(0)
+        if attn_bias.dim() != 4:
+            raise Unsupported(
+                f"MHA attention bias must have rank 2-4, got rank {attn_bias.dim()}"
+            )
 
-    # Bound each loop group's Lq-tile x unrolled-Lk-block product. Keeping many
-    # Lk blocks together with a long Lq loop produces oversized bundles that can
-    # crash DXP or the runtime H2D launch. A sixteen-pair budget groups blocks
-    # while that is possible; once the Lq loop itself reaches that size, each Lk
-    # block gets a separate group. The functional M/denominator/output SSA
-    # carries are materialized between groups and then resume the exact same
-    # online-softmax recurrence.
-    for block_group_start in range(
-        0, tiling.num_kv_blocks, tiling.kv_blocks_per_loop_group
-    ):
-        block_group_end = min(
-            block_group_start + tiling.kv_blocks_per_loop_group,
-            tiling.num_kv_blocks,
+    masks = tuple(
+        mask
+        for mask in (
+            causal_mask if is_causal else None,
+            attn_bias,
         )
-        with spyre_hint(tiles={"batch_size": max(1, batch_size // 2)}):
-            head_tiles = {} if use_gqa else {"num_heads": tiling.num_head_tiles}
-            with spyre_hint(tiles=head_tiles):
-                with (
-                    spyre_hint(num_tiles_per_dim={"max_seqlen_q": tiling.num_q_tiles}),
-                    (
-                        spyre_hint(work_div=tiling.work_div)
-                        if tiling.work_div is not None
-                        else contextlib.nullcontext()
-                    ),
-                ):
-                    # Materialize scaled Q inside the sequence-tile scope. It is
-                    # loop-invariant across the unrolled KV blocks below.
-                    with spyre_hint(named_dims=query_dim_names):
-                        q_scaled = query * scaling_factor
-                    for blk in range(block_group_start, block_group_end):
-                        start = blk * tiling.kv_block_size
-                        end = min(start + tiling.kv_block_size, max_seqlen_kv)
+        if mask is not None
+    )
 
-                        k_blk = key[..., start:end, :]
-                        v_blk = value[..., start:end, :]
-                        if use_gqa:
-                            k_blk = k_blk.unsqueeze(2)
-                            v_blk = v_blk.unsqueeze(2)
+    # Tiling an interleaved H axis requires map inputs/outputs to be staged in
+    # HBM. Price both sides of each staging copy. Query itself is normalized
+    # before the loops, but the result must return in its original layout.
+    head_tile_staging_bytes = 0
+    for tensor in (key, value):
+        if not _axis_slice_is_dense(tuple(tensor.shape), tuple(tensor.stride()), 1):
+            head_tile_staging_bytes += 2 * tensor.numel() * tensor.element_size()
+    if not _axis_slice_is_dense(
+        (batch_size, num_heads, max_seqlen_q, head_dim), original_query_strides, 1
+    ):
+        head_tile_staging_bytes += 2 * query.numel() * query.element_size()
 
-                        kv_dim_names = (
-                            [
-                                "_b",
-                                "num_kvheads",
-                                "_gqa_broadcast",
-                                "blk_len",
-                                "head_dim",
-                            ]
-                            if use_gqa
-                            else ["_b", "num_heads", "blk_len", "head_dim"]
-                        )
+    tiling = _select_sdpa_tiling(
+        batch_size=batch_size,
+        num_heads=num_heads,
+        num_kvheads=num_kvheads,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_kv=max_seqlen_kv,
+        head_dim=head_dim,
+        element_size=query.dtype.itemsize,
+        num_cores=config.sencores,
+        lx_budget_bytes=_sdpa_lx_budget_bytes(),
+        mask_shapes=tuple(tuple(mask.shape) for mask in masks),
+        head_tile_staging_bytes=head_tile_staging_bytes,
+    )
+    logger.debug(
+        "SDPA tiling: strategy=%s reason=%s Lq=%s q_tiles=%s "
+        "q_tile_size=%s Lk=%s kv_blocks=%s kv_block_size=%s "
+        "batch_tiles=%s head_tiles=%s group_tiles=%s kv_blocks_per_loop_group=%s "
+        "estimated_active_cores=%s estimated_load_bursts=%s "
+        "estimated_hbm_bytes=%s estimated_spill_buffers=%s "
+        "estimated_spill_bytes=%s score_bytes_per_core=%s "
+        "estimated_live_bytes_per_core=%s lx_budget_bytes=%s",
+        tiling.strategy,
+        tiling.reason,
+        max_seqlen_q,
+        tiling.num_q_tiles,
+        tiling.q_tile_size,
+        max_seqlen_kv,
+        tiling.num_kv_blocks,
+        tiling.kv_block_size,
+        tiling.num_batch_tiles,
+        tiling.num_head_tiles,
+        tiling.num_group_tiles,
+        tiling.kv_blocks_per_loop_group,
+        tiling.estimated_active_cores,
+        tiling.estimated_load_bursts,
+        tiling.estimated_hbm_bytes,
+        tiling.estimated_spill_buffers,
+        tiling.estimated_spill_bytes,
+        tiling.score_bytes_per_core,
+        tiling.estimated_live_bytes_per_core,
+        tiling.lx_budget_bytes,
+    )
 
-                        # The K/V slices are produced in-graph, so they carry no
-                        # named dims and stay untiled -- forming a restickify
-                        # boundary against the tiled matmuls that consume them.
-                        # Name each slice's first consuming op so the per-chunk
-                        # key extent ("blk_len") propagates and the producers tile
-                        # with their consumers.
-                        with spyre_hint(named_dims=kv_dim_names):
-                            scaled_keys = k_blk * scaling_factor
-                        # v_blk feeds the second matmul directly (line below), so
-                        # unlike scaled_keys (re-normalized by keys_T.contiguous())
-                        # it has no downstream .contiguous() to fix its layout. For
-                        # a transposed value view the slice's physical strides stay
-                        # transposed (a pointwise op preserves its input's stride
-                        # order via pick_loop_order), which scrambles the tiled
-                        # matmul. .contiguous() lowers to aten.clone(contiguous),
-                        # which the Spyre clone override freezes to contiguous
-                        # strides -- normalizing this [B, H, blk_len, D] slice per
-                        # block without a full-tensor value.contiguous() (an OOM on
-                        # long KV). The named_dims seed lands on the resulting clone, so
-                        # blk_len still propagates.
-                        with spyre_hint(named_dims=kv_dim_names):
-                            v_blk = v_blk.contiguous()
-                        # .contiguous() materializes the transposed keys so the
-                        # scores matmul sees a clean single-contraction-dim input.
-                        # Without it the backend scheduler aborts with
-                        # out_reuse_dim.size() == 1 (L3DlOpsScheduler): the
-                        # transposed view's loop-dim-order leaves the matmul with
-                        # an ambiguous contraction dim under Lq tiling.
-                        keys_T = scaled_keys.transpose(
-                            -1, -2
-                        ).contiguous()  # batch_size, num_heads, head_dim, blk_len
-                        # A matmul output inherits no named dims from its inputs,
-                        # so naming it explicitly is what keeps the op inside the
-                        # max_seqlen_q tile region (otherwise it becomes an
-                        # untiled restickify boundary). "blk_len" is the per-chunk
-                        # key extent -- the scores' last axis.
-                        score_dim_names = (
-                            [
-                                "_b",
-                                "num_kvheads",
-                                "gqa_group_size",
-                                "max_seqlen_q",
-                                "blk_len",
-                            ]
-                            if use_gqa
-                            else ["_b", "num_heads", "max_seqlen_q", "blk_len"]
-                        )
-                        with spyre_hint(named_dims=score_dim_names):
-                            scores = (
-                                torch.ops.spyre.batched_matmul(q_scaled, keys_T)
-                                if use_gqa
-                                else torch.matmul(q_scaled, keys_T)
-                            )
+    # for_each_tile requires equal-sized tiles. The cost model already returns
+    # an exact, stick-aligned block; retain the calculation here as a safety net
+    # for configurations supplied by fallback or test overrides.
+    num_kv_tiles = _num_tiles_for_max_extent(
+        max_seqlen_kv,
+        tiling.kv_block_size,
+        tile_alignment=_SDPA_SEQUENCE_TILE_ALIGNMENT,
+    )
+    kv_tile_size = max_seqlen_kv // num_kv_tiles
+    packed_key_strides = (
+        max_seqlen_kv * num_kvheads * head_dim,
+        head_dim,
+        num_kvheads * head_dim,
+        1,
+    )
+    rebase_unaligned_packed_key = (
+        batch_size > 1
+        and key.stride() == packed_key_strides
+        and kv_tile_size % get_elem_in_stick(key.dtype) != 0
+    )
 
-                        if is_causal:
-                            scores = scores + causal_mask[..., :, start:end]
+    def mask_dims(axis, extent):
+        return tuple(axis if mask.size(axis) == extent else None for mask in masks)
 
-                        if attn_bias is not None:
-                            scores = scores + attn_bias[..., :, start:end]
+    def map_tiles(body, operands, dims, tile_size, out_dim):
+        sliced_operand, sliced_dim = next(
+            (operand, dim) for operand, dim in zip(operands, dims) if dim is not None
+        )
+        if sliced_operand.size(sliced_dim) == tile_size:
+            _, result = body(None, operands)
+            return result
+        _, result = for_each_tile(
+            body,
+            operands,
+            dims=dims,
+            tile_size=tile_size,
+            out_dim=out_dim,
+        )
+        return result
 
-                        block_max = torch.amax(
-                            scores, dim=-1
-                        )  # batch_size, num_heads, max_seqlen_q sparse
-                        new_max = torch.maximum(
-                            M, block_max
-                        )  # batch_size, num_heads, max_seqlen_q sparse
+    def kv_level(q_tile, k_tile, v_tile, *mask_tiles):
+        # Q is invariant across the counted Lk loop.
+        q_scaled = q_tile * query_scale
 
-                        exp_scores = torch.exp(
-                            scores - new_max.unsqueeze(-1)
-                        )  # batch_size, num_heads, max_seqlen_q, blk_len
-                        correction = torch.exp(
-                            M - new_max
-                        )  # batch_size, num_heads, max_seqlen_q sparse
+        # Keep the sparse accumulator representation used by production SDPA,
+        # but size it to the current outer-loop tile.
+        tile_accumulator_shape = (*q_tile.shape[:-1], 64)
+        running_max_reduced = torch.full(
+            tile_accumulator_shape,
+            float("-inf"),
+            device=q_tile.device,
+            dtype=q_tile.dtype,
+        )
+        running_max = running_max_reduced.amax(dim=-1)
+        denominator_reduced = torch.zeros(
+            tile_accumulator_shape,
+            device=q_tile.device,
+            dtype=q_tile.dtype,
+        )
+        denominator = denominator_reduced.amax(dim=-1)
+        output_tile = torch.zeros_like(q_tile)
 
-                        # Online-softmax recurrence as FUNCTIONAL SSA -- no
-                        # in-place copy_f writeback. copy_f mutates the whole
-                        # accumulator buffer and is NOT tile-aware: under the
-                        # max_seqlen_q tile it left the second query-tile's
-                        # accumulators un-updated (0/0 -> nan, exp(-inf) -> inf).
-                        # Threading new values forward (as in the coarse-tile
-                        # flash e2e test, PR #3674) keeps each Lq tile's carry
-                        # correct. The names flow from q_scaled/the matmuls.
-                        new_denom = denominator * correction + exp_scores.sum(
-                            dim=-1
-                        )  # batch_size, num_heads, max_seqlen_q sparse
-                        # Materialize exp_scores before the second matmul for the
-                        # same reason as keys_T above -- a clean contiguous input
-                        # keeps the matmul's contraction dim unambiguous.
-                        exp_scores_c = exp_scores.contiguous()
-                        with spyre_hint(named_dims=query_dim_names):
-                            weighted = (
-                                torch.ops.spyre.batched_matmul(exp_scores_c, v_blk)
-                                if use_gqa
-                                else torch.matmul(exp_scores_c, v_blk)
-                            )
-                        new_output = (
-                            output * correction.unsqueeze(-1) + weighted
-                        )  # batch_size, num_heads, max_seqlen_q, head_dim
+        def sdpa_lk_body(carry, tiles):
+            block_maximum, block_denominator, block_output = carry
+            _, k_blk, v_blk, *block_masks = tiles
+            if use_gqa:
+                k_blk = k_blk.unsqueeze(2)
+                v_blk = v_blk.unsqueeze(2)
 
-                        if blk == tiling.num_kv_blocks - 1:
-                            # The final divide must live INSIDE the innermost tile
-                            # scope (#3674 point #4): read past the loop group it
-                            # becomes a full untiled buffer whose input
-                            # (new_output, written in the tiled region) is
-                            # split-layout, so finalize_layouts hits
-                            # restickify-infeasible. Fold it into the last KV
-                            # block so it inherits the max_seqlen_q tile.
-                            with spyre_hint(named_dims=query_dim_names):
-                                output = new_output / new_denom.unsqueeze(-1)
-                        else:
-                            M, denominator, output = new_max, new_denom, new_output
+            # A packed [B*S, H, D] input viewed as [B, H, S, D] shares one
+            # physical row dimension between B and S. Rebase an unaligned S
+            # tile before the transpose restickify so one batch's padded tail
+            # cannot read the next batch's first row.
+            if rebase_unaligned_packed_key:
+                k_blk = k_blk.contiguous()
+            keys_T = k_blk.transpose(-1, -2).contiguous()
+            scores = (
+                torch.ops.spyre.batched_matmul(q_scaled, keys_T)
+                if use_gqa
+                else torch.matmul(q_scaled, keys_T)
+            )
+            for block_mask in block_masks:
+                scores = scores + block_mask
+
+            block_max = torch.amax(scores, dim=-1)
+            # Compute the old-max correction before producing new_max. The loop
+            # lowering can then update running_max in place without snapshotting
+            # its old value for a later reader.
+            correction = torch.exp(torch.clamp_max(block_maximum - block_max, 0.0))
+            new_max = torch.maximum(block_maximum, block_max)
+            exp_scores = torch.exp(scores - new_max.unsqueeze(-1))
+            new_denominator = block_denominator * correction + exp_scores.sum(dim=-1)
+            exp_scores_c = exp_scores.contiguous()
+            weighted = (
+                torch.ops.spyre.batched_matmul(exp_scores_c, v_blk)
+                if use_gqa
+                else torch.matmul(exp_scores_c, v_blk)
+            )
+            new_output = block_output * correction.unsqueeze(-1) + weighted
+            return (new_max, new_denominator, new_output), None
+
+        kv_operands = (q_tile, k_tile, v_tile, *mask_tiles)
+        kv_dims = (None, -2, -2, *mask_dims(-1, max_seqlen_kv))
+        initial = (running_max, denominator, output_tile)
+        if num_kv_tiles == 1:
+            (_, denominator, output_tile), _ = sdpa_lk_body(initial, kv_operands)
+        else:
+            (_, denominator, output_tile), _ = for_each_tile(
+                sdpa_lk_body,
+                kv_operands,
+                dims=kv_dims,
+                tile_size=kv_tile_size,
+                init=initial,
+            )
+        return output_tile / denominator.unsqueeze(-1)
+
+    def query_level(q_tile, k_tile, v_tile, *mask_tiles):
+        operands = (q_tile, k_tile, v_tile, *mask_tiles)
+        dims = (-2, None, None, *mask_dims(-2, max_seqlen_q))
+
+        def body(_, tiles):
+            return None, kv_level(*tiles)
+
+        return map_tiles(body, operands, dims, tiling.q_tile_size, -2)
+
+    def group_level(q_tile, k_tile, v_tile, *mask_tiles):
+        if not use_gqa:
+            return query_level(q_tile, k_tile, v_tile, *mask_tiles)
+        operands = (q_tile, k_tile, v_tile, *mask_tiles)
+        dims = (2, None, None, *mask_dims(2, gqa_group_size))
+
+        def body(_, tiles):
+            return None, query_level(*tiles)
+
+        # A G-only loop does not reduce the sequence working set: when both
+        # sequence axes already fit in one tile, leave G visible to the normal
+        # work-division pass and avoid paying a serial map invocation per
+        # query-head group.  Nested prefill/decode plans still use the selected
+        # G split whenever either Lq or Lk is tiled.
+        num_group_tiles = (
+            tiling.num_group_tiles if tiling.num_q_tiles > 1 or num_kv_tiles > 1 else 1
+        )
+        group_tile_size = gqa_group_size // max(1, num_group_tiles)
+        return map_tiles(body, operands, dims, group_tile_size, 2)
+
+    def head_level(q_tile, k_tile, v_tile, *mask_tiles):
+        head_extent = num_kvheads if use_gqa else num_heads
+        head_tile_size = head_extent // max(1, tiling.num_head_tiles)
+        operands = (q_tile, k_tile, v_tile, *mask_tiles)
+        dims = (1, 1, 1, *mask_dims(1, head_extent))
+
+        def body(_, tiles):
+            return None, group_level(*tiles)
+
+        return map_tiles(body, operands, dims, head_tile_size, 1)
+
+    batch_tile_count = tiling.num_batch_tiles
+    batch_tile_size = batch_size // batch_tile_count
+    operands = (query, key, value, *masks)
+    dims = (0, 0, 0, *mask_dims(0, batch_size))
+
+    def batch_body(_, tiles):
+        return None, head_level(*tiles)
+
+    output = map_tiles(batch_body, operands, dims, batch_tile_size, 0)
     if use_gqa:
         output = output.flatten(1, 2)
     # The reference meta kernel for this op
@@ -1143,7 +2090,7 @@ def spyre_kv_window(
     buffer_width: int,
     num_heads: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """One Q block's KV window: k_win [B, Hq, E, W] transposed, v_win [B, Hq, W, E]."""
+    """One Q block's native-head K/V window."""
     reason = check_window_read(
         read_start=read_start,
         buffer_width=buffer_width,
@@ -1156,15 +2103,10 @@ def spyre_kv_window(
     if reason is not None:
         raise Unsupported(f"kv_window: {reason}")
 
-    # Slice before expanding: expanding first and slicing after breaks the
-    # stick-padding pass ("lower_pad_sequence: pad_extent=-129").
-    k_win = key[:, :, read_start : read_start + buffer_width, :].transpose(-1, -2)
+    # Preserve Hkv. Native GQA adds a unit broadcast axis at the matmul rather
+    # than materializing Hq copies of each K/V window.
+    k_win = key[:, :, read_start : read_start + buffer_width, :]
     v_win = value[:, :, read_start : read_start + buffer_width, :]
-
-    expansion = num_heads // key.size(1)
-    if expansion != 1:
-        k_win = k_win.unsqueeze(2).expand(-1, -1, expansion, -1, -1).flatten(1, 2)
-        v_win = v_win.unsqueeze(2).expand(-1, -1, expansion, -1, -1).flatten(1, 2)
     return k_win, v_win
 
 
@@ -1172,123 +2114,223 @@ def _windowed_attention(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
-    plan: SlidingWindowPlan,
-    scaling_factor: float,
+    attention_mask: torch.Tensor,
+    causal_plan: SlidingWindowPlan | None,
+    q_block: int,
+    padded_seqlen_q: int,
+    query_scale: float,
     num_heads: int,
-    valid_start: list[int] | None = None,
 ) -> torch.Tensor:
-    """spyre__sdpa_overrideable's body, tiled over buffer_width not max_seqlen_kv.
+    """Blocked online attention over each query block's physical KV window.
 
-    The Python loop is unrolled at trace time, so every read offset is a
-    constant. Blocks share no softmax state; the accumulators are per
-    iteration and exist because the window_size hint may tile buffer_width
-    into partial softmaxes.
+    Query blocks remain static because each one has a separately planned cache
+    window. Within a block, K/V traversal is represented structurally with
+    ``for_each_tile`` rather than ``spyre_hint``. Batch, head, GQA-group, and
+    query work division are left to the compiler, which avoids staging a full
+    cache window in an outer loop before the inner K/V slice is formed.
+    Functional SSA carries match ``spyre__sdpa_overrideable``; a mutation-based
+    ``copy_forced`` carry is not tile-safe when the output row spans multiple
+    sticks (Gemma's head_dim=256).
     """
-    batch_size = query.size(0)
-    head_dim = query.size(3)
-    q_block = plan.q_block
-    buffer_width = plan.buffer_width
+    num_kvheads = key.size(1)
+    gqa_group_size = num_heads // num_kvheads
+    use_gqa = gqa_group_size != 1
 
+    # Keep GQA explicit as [Hkv, group], exactly as full SDPA does. K/V retain
+    # Hkv and gain only a unit view axis for the broadcast-aware matmuls.
+    if use_gqa:
+        query = query.contiguous().unflatten(1, (num_kvheads, gqa_group_size))
+        attention_mask = attention_mask.unsqueeze(2)
+
+    # A causal square prefill has a static narrow read plan. Generic masks and
+    # runtime-positioned calls scan the complete compact allocation; their
+    # tensor mask is the only source of geometry.
+    buffer_width = key.size(2) if causal_plan is None else causal_plan.buffer_width
+
+    tiling = _select_swa_tiling(
+        batch_size=query.size(0),
+        num_heads=num_heads,
+        num_kvheads=key.size(1),
+        q_block=q_block,
+        buffer_width=buffer_width,
+        head_dim=query.size(-1),
+        element_size=query.dtype.itemsize,
+        num_cores=config.sencores,
+        lx_budget_bytes=_sdpa_lx_budget_bytes(),
+    )
+    physical_buffer_width = tiling.num_kv_blocks * tiling.kv_block_size
+    pad_columns = physical_buffer_width - buffer_width
+    logger.debug(
+        "SWA tiling: strategy=%s reason=%s q_block=%s "
+        "buffer_width=%s kv_blocks=%s kv_block_size=%s "
+        "head_tiles=%s work_div=%s score_bytes_per_core=%s "
+        "estimated_live_bytes_per_core=%s kv_bytes_per_core=%s "
+        "restick_bytes_per_core=%s restick_lx_eligible=%s "
+        "estimated_dsc_executions=%s lx_budget_bytes=%s",
+        tiling.strategy,
+        tiling.reason,
+        q_block,
+        buffer_width,
+        tiling.num_kv_blocks,
+        tiling.kv_block_size,
+        tiling.num_head_tiles,
+        tiling.work_div,
+        tiling.score_bytes_per_core,
+        tiling.estimated_live_bytes_per_core,
+        tiling.kv_bytes_per_core,
+        tiling.restick_bytes_per_core,
+        tiling.restick_lx_eligible,
+        tiling.estimated_dsc_executions,
+        tiling.lx_budget_bytes,
+    )
+    # Spyre stores fp16 and bf16 tensors in its 16-bit floating-point format.
+    # Use values representable in that storage rather than bf16's wider range.
+    storage_dtype = (
+        torch.float16 if query.dtype in (torch.float16, torch.bfloat16) else query.dtype
+    )
+    finite_min = torch.finfo(storage_dtype).min
+    positive_min = torch.finfo(storage_dtype).tiny
     out_blocks = []
-    for block_index in range(plan.num_q_blocks):
-        q_start, q_end = plan.block_q_range(block_index)
+    num_q_blocks = padded_seqlen_q // q_block
+    for block_index in range(num_q_blocks):
+        q_start = block_index * q_block
+        q_end = q_start + q_block
         assert q_end - q_start == q_block, (
             f"sliding_window_attention: Q block {block_index} is "
-            f"{q_end - q_start} rows, expected {q_block} -- plan_sliding_window "
-            "should have rejected a query length that does not divide"
+            f"{q_end - q_start} rows, expected {q_block} -- query padding "
+            "should have produced a whole number of blocks"
         )
 
-        read_start = plan.read_start(block_index)
-        k_win, v_win = torch.ops.spyre.kv_window(
-            key, value, read_start, buffer_width, num_heads
+        read_start = 0 if causal_plan is None else causal_plan.read_start(block_index)
+        mask_rows = attention_mask[..., q_start:q_end, :]
+
+        # Keep the multi-output custom reads outside the coarse-tile scope.
+        # FallbackKernel/MultiOutput nodes do not carry named dimensions; putting
+        # them inside the scope can pull GQA expansion and batch dependencies into
+        # the wrong loop group (and, for batch > 1, leave a dangling scheduler
+        # dependency after grouping).
+        k_window, v_window = torch.ops.spyre.kv_window(
+            key,
+            value,
+            read_start,
+            buffer_width,
+            num_heads,
         )
-        # A valid_start that masks anything makes the band load-bearing even for a
-        # block the window alone fully covers.
-        fully_attended = (
-            plan.block_is_fully_attended(block_index)
-            and band_valid_start(valid_start) is None
-        )
-        band = (
-            None
-            if fully_attended
-            else torch.ops.spyre.window_band_mask(
-                # Logical, not read_start: the row side of this op
-                # (q_row_origin) is a logical coordinate, and delta = row -
-                # column only means anything if both sides agree. Identical
-                # to read_start while buffer_origin is 0 -- a still-filling
-                # or exactly-full cache -- and diverges for a rolled buffer.
-                plan.read_start_logical(block_index),
-                q_block,
-                buffer_width,
-                plan.q_kv_offset + q_start,
-                plan.window_size,
-                plan.is_causal,
-                query.dtype,
-                query.device,
-                valid_start,
+        mask_window = mask_rows[..., read_start : read_start + buffer_width]
+        if pad_columns:
+            k_window = torch.cat(
+                [
+                    k_window,
+                    torch.zeros(
+                        (*k_window.shape[:-2], pad_columns, k_window.shape[-1]),
+                        device=k_window.device,
+                        dtype=k_window.dtype,
+                    ),
+                ],
+                dim=-2,
             )
-        )
-        q_rows = query[:, :, q_start:q_end, :]
+            v_window = torch.cat(
+                [
+                    v_window,
+                    torch.zeros(
+                        (*v_window.shape[:-2], pad_columns, v_window.shape[-1]),
+                        device=v_window.device,
+                        dtype=v_window.dtype,
+                    ),
+                ],
+                dim=-2,
+            )
+            mask_window = torch.cat(
+                [
+                    mask_window,
+                    torch.full(
+                        (*mask_window.shape[:-1], pad_columns),
+                        float("-inf"),
+                        device=mask_window.device,
+                        dtype=mask_window.dtype,
+                    ),
+                ],
+                dim=-1,
+            )
 
-        # SDPA's "sparse via reduction" construction. On a single pass M is
-        # -inf, so correction is exp(-inf) == 0 and the running terms drop out.
-        m_reduced = torch.full(
-            (batch_size, num_heads, q_block, 64),
-            float("-inf"),
-            device=query.device,
-            dtype=query.dtype,
-        )
-        running_max = m_reduced.amax(dim=-1)
+        q_rows = query[..., q_start:q_end, :]
 
-        denominator_reduced = torch.zeros(
-            (batch_size, num_heads, q_block, 64),
-            device=query.device,
-            dtype=query.dtype,
-        )
-        denominator = denominator_reduced.amax(dim=-1)
+        def kv_level(q_tile, k_tile, v_tile, mask_tile):
+            if use_gqa:
+                k_tile = k_tile.unsqueeze(2)
+                v_tile = v_tile.unsqueeze(2)
 
-        output = torch.zeros(
-            (batch_size, num_heads, q_block, head_dim),
-            device=query.device,
-            dtype=query.dtype,
-        )
+            # Q and the carry seeds are invariant across the counted K/V loop.
+            # A finite maximum keeps fully masked chunks defined: their
+            # exponentials and weighted contribution are exactly zero.
+            q_scaled = q_tile * query_scale
+            output_tile = torch.zeros_like(q_tile)
+            accumulator_shape = (*q_tile.shape[:-1], STICK)
+            running_max_reduced = torch.full(
+                accumulator_shape,
+                finite_min,
+                device=query.device,
+                dtype=query.dtype,
+            )
+            running_max = running_max_reduced.amax(dim=-1)
+            denominator_reduced = torch.zeros(
+                accumulator_shape,
+                device=query.device,
+                dtype=query.dtype,
+            )
+            denominator = denominator_reduced.amax(dim=-1)
 
-        with spyre_hint(tiles={"batch_size": max(1, batch_size // 2)}):
-            with spyre_hint(tiles={"num_heads": max(1, num_heads // 4)}):
-                with spyre_hint(tiles={"window_size": max(1, buffer_width // 64)}):
-                    with spyre_hint(work_div={"num_heads": 4, "window_size": 8}):
-                        # k_win arrives transposed.
-                        scores = torch.matmul(
-                            q_rows * scaling_factor, k_win * scaling_factor
-                        )  # batch, num_heads, q_block, buffer_width
+            def swa_kv_body(carry, tiles):
+                running_max, denominator, output = carry
+                _, k_blk, v_blk, mask_blk = tiles
+                # Match full SDPA: the scan walks K in cache order and
+                # materializes only the bounded, transposed tile required by
+                # the score matmul.
+                keys_t = k_blk.transpose(-1, -2).contiguous()
+                scores = (
+                    torch.ops.spyre.batched_matmul(q_scaled, keys_t)
+                    if use_gqa
+                    else torch.matmul(q_scaled, keys_t)
+                )
+                scores = scores + mask_blk
 
-                        if band is not None:
-                            scores = scores + band
+                # Clamp before reducing so fully masked chunks do not form
+                # ``-inf - -inf`` in the online-softmax recurrence.
+                block_max = torch.amax(torch.clamp_min(scores, finite_min), dim=-1)
+                # Form the old-max correction first. The loop lowering can then
+                # update running_max without a carry snapshot.
+                correction = torch.exp(torch.clamp_max(running_max - block_max, 0.0))
+                new_max = torch.maximum(running_max, block_max)
+                exp_scores = torch.exp(scores - new_max.unsqueeze(-1))
+                new_denominator = denominator * correction + exp_scores.sum(dim=-1)
+                exp_scores = exp_scores.contiguous()
+                weighted = (
+                    torch.ops.spyre.batched_matmul(exp_scores, v_blk)
+                    if use_gqa
+                    else torch.matmul(exp_scores, v_blk)
+                )
+                new_output = output * correction.unsqueeze(-1) + weighted
+                return (new_max, new_denominator, new_output), None
 
-                        block_max = torch.amax(scores, dim=-1)
-                        max_running = torch.maximum(running_max, block_max)
+            kv_operands = (q_tile, k_tile, v_tile, mask_tile)
+            initial = (running_max, denominator, output_tile)
+            if tiling.num_kv_blocks == 1:
+                (_, denominator, output_tile), _ = swa_kv_body(initial, kv_operands)
+            else:
+                (_, denominator, output_tile), _ = for_each_tile(
+                    swa_kv_body,
+                    kv_operands,
+                    dims=(None, -2, -2, -1),
+                    tile_size=tiling.kv_block_size,
+                    init=initial,
+                )
+            safe_denominator = torch.clamp_min(denominator, positive_min)
+            return output_tile / safe_denominator.unsqueeze(-1)
 
-                        exp_scores = torch.exp(scores - max_running.unsqueeze(-1))
-                        correction = torch.exp(running_max - max_running)
+        out_blocks.append(kv_level(q_rows, k_window, v_window, mask_window))
 
-                        denominator = torch.ops.spyre.copy_forced(
-                            denominator * correction + exp_scores.sum(dim=-1),
-                            denominator,
-                        )
-                        output = torch.ops.spyre.copy_forced(
-                            output * correction.unsqueeze(-1)
-                            + torch.matmul(exp_scores, v_win),
-                            output,
-                        )
-                        running_max = torch.ops.spyre.copy_forced(
-                            max_running, running_max
-                        )
-
-        out_blocks.append(
-            torch.ops.spyre.copy_forced(output / denominator.unsqueeze(-1), output)
-        )
-
-    return torch.cat(out_blocks, dim=2)
+    output = torch.cat(out_blocks, dim=-2)
+    return output.flatten(1, 2) if use_gqa else output
 
 
 @register_spyre_decompositions([torch.ops.spyre.sliding_window_attention.default])
@@ -1296,86 +2338,121 @@ def spyre_sliding_window_attention(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
+    attention_mask: torch.Tensor,
     window_size: int,
-    is_causal: bool = True,
+    is_causal: bool,
     scale: float | None = None,
-    cache_seqlen: int | None = None,
-    buffer_origin: int | None = None,
-    valid_start: list[int] | None = None,
 ) -> torch.Tensor:
-    """Sliding-window attention: each Q block attends only its own KV slice.
+    """Sliding-window attention with all runtime geometry in a tensor mask.
 
-    Rather than scoring the full cache behind a band mask, each block of
-    q_block query rows reads buffer_width rows -- a constant that does not
-    grow with the cache -- and attends against those. See
-    ``plan_sliding_window`` for the placement.
-
-    A ragged query length is padded up rather than refused. Shapes the
-    placement cannot express raise: there is no slower-but-correct fallback,
-    since a band mask over full attention is itself wrong for an unaligned KV
-    length.
+    Strictly causal square prefill uses static per-block KV windows. Generic
+    masks and every other shape read the complete cache allocation in bounded
+    chunks, so changing mask contents never changes the graph. A ragged query
+    length is padded up rather than refused. In particular, decode with a
+    runtime mask scales with the physical cache width, not only
+    ``window_size``. Callers should therefore keep decode caches compact (about
+    one window plus query-block staggering); a full-length cache remains
+    correct but intentionally receives no hidden position-dependent fast path.
     """
     num_heads = query.size(1)
     head_dim = query.size(3)
     batch_size = query.size(0)
     seqlen_q = query.size(2)
     cache_capacity = key.size(2)
-
-    # The cache's position, not its allocation. None means "exactly full",
-    # which is what reading key.size(2) as a position silently assumed.
-    # Degenerate values (<= 0, either of them) need no check here:
-    # rejection_reason below rejects them, and it is the single source of
-    # truth for which geometries can be planned.
-    if cache_seqlen is None:
-        cache_seqlen = cache_capacity
-
-    reason = check_valid_start(valid_start, batch_size, cache_seqlen)
-    if reason is not None:
-        raise Unsupported(f"sliding_window_attention: {reason}")
+    num_kvheads = key.size(1)
 
     if scale is not None and scale < 0:
         # math.sqrt would otherwise raise a bare ValueError.
         raise Unsupported(
             f"sliding_window_attention: scale={scale} must be non-negative"
         )
-
-    # Split across query and key, not applied once to their product: keeps the
-    # intermediate in float16 range.
-    if scale is None:
-        scaling_factor = 1.0 / math.sqrt(math.sqrt(head_dim))
-    else:
-        scaling_factor = math.sqrt(scale)
-
-    # Pad at the FRONT: row i sits at coordinate seqlen_kv - seqlen_q + i, so
-    # once seqlen_q is the padded length the two shifts cancel and every real
-    # row keeps its coordinate. Back-padding would move all of them.
-    q_block, padded_seqlen_q = query_blocking(seqlen_q)
-    pad_rows = padded_seqlen_q - seqlen_q
-    plan = plan_sliding_window(
-        padded_seqlen_q,
-        cache_seqlen,
-        window_size,
-        is_causal=is_causal,
-        q_block=q_block,
-        cache_capacity=cache_capacity,
-        buffer_origin=buffer_origin,
-    )
-    if plan is None:
-        # Never None when the plan is, but the type says otherwise.
-        reason = (
-            rejection_reason(
-                padded_seqlen_q,
-                cache_seqlen,
-                window_size,
-                is_causal,
-                q_block,
-                cache_capacity,
-                buffer_origin,
-            )
-            or "the window placement cannot express this shape"
+    if window_size <= 0:
+        raise Unsupported(
+            f"sliding_window_attention: window_size={window_size} must be positive"
         )
-        raise Unsupported(f"sliding_window_attention: {reason}")
+    if seqlen_q <= 0 or cache_capacity <= 0:
+        raise Unsupported(
+            "sliding_window_attention: query and cache lengths must be positive, "
+            f"got seqlen_q={seqlen_q}, cache_capacity={cache_capacity}"
+        )
+    if seqlen_q > cache_capacity:
+        raise Unsupported(
+            f"sliding_window_attention: seqlen_q={seqlen_q} exceeds "
+            f"cache_capacity={cache_capacity}"
+        )
+    if cache_capacity % STICK != 0:
+        raise Unsupported(
+            f"sliding_window_attention: cache_capacity={cache_capacity} must be a "
+            f"multiple of {STICK}"
+        )
+    if num_kvheads <= 0 or num_heads % num_kvheads != 0:
+        raise Unsupported(
+            "sliding_window_attention: query heads must be a whole multiple "
+            f"of KV heads, got Hq={num_heads}, Hkv={num_kvheads}"
+        )
 
+    expected_mask_shape = (batch_size, 1, seqlen_q, cache_capacity)
+    if tuple(attention_mask.shape) != expected_mask_shape:
+        raise Unsupported(
+            "sliding_window_attention: attention_mask shape "
+            f"{tuple(attention_mask.shape)} must be {expected_mask_shape}"
+        )
+    if attention_mask.dtype != query.dtype:
+        raise Unsupported(
+            "sliding_window_attention: attention_mask dtype "
+            f"{attention_mask.dtype} must match query dtype {query.dtype}"
+        )
+    if attention_mask.device != query.device:
+        raise Unsupported(
+            "sliding_window_attention: attention_mask device "
+            f"{attention_mask.device} must match query device {query.device}"
+        )
+
+    query_scale = scale
+    if query_scale is None:
+        query_scale = 1.0 / math.sqrt(head_dim)
+
+    # Pad at the front so real rows keep their relative order. Synthetic rows
+    # receive an all-zero mask and are sliced from the result; this guarantees a
+    # finite softmax without imposing semantics on discarded outputs.
+    has_narrow_static_plan = (
+        is_causal and seqlen_q == cache_capacity and window_size < cache_capacity
+    )
+    q_block, padded_seqlen_q = query_blocking(
+        seqlen_q,
+        max_query_block=(STICK if has_narrow_static_plan else MAX_QUERY_BLOCK),
+    )
+    pad_rows = padded_seqlen_q - seqlen_q
+
+    # Only a strictly causal square prefill has position and its upper bound
+    # fully determined by tensor shapes. A generic mask can allow future keys,
+    # while non-square calls can carry a changing query origin in mask values;
+    # both must scan the complete allocation. A compact decode cache keeps that
+    # bounded by the configured window.
+    causal_plan = None
+    if is_causal and seqlen_q == cache_capacity:
+        causal_plan = plan_sliding_window(
+            padded_seqlen_q,
+            cache_capacity,
+            window_size,
+            is_causal=True,
+            q_block=q_block,
+            cache_capacity=cache_capacity,
+        )
+        if causal_plan is None:
+            # Never None when the plan is valid, but the type says otherwise.
+            reason = (
+                rejection_reason(
+                    padded_seqlen_q,
+                    cache_capacity,
+                    window_size,
+                    True,
+                    q_block,
+                    cache_capacity,
+                )
+                or "the window placement cannot express this shape"
+            )
+            raise Unsupported(f"sliding_window_attention: {reason}")
     if pad_rows:
         query = torch.cat(
             [
@@ -1388,9 +2465,28 @@ def spyre_sliding_window_attention(
             ],
             dim=2,
         )
+        attention_mask = torch.cat(
+            [
+                torch.zeros(
+                    (batch_size, 1, pad_rows, cache_capacity),
+                    device=attention_mask.device,
+                    dtype=attention_mask.dtype,
+                ),
+                attention_mask,
+            ],
+            dim=2,
+        )
 
     output = _windowed_attention(
-        query, key, value, plan, scaling_factor, num_heads, valid_start
+        query,
+        key,
+        value,
+        attention_mask,
+        causal_plan,
+        q_block,
+        padded_seqlen_q,
+        query_scale,
+        num_heads,
     )
     return output[:, :, pad_rows:, :] if pad_rows else output
 
@@ -1517,6 +2613,190 @@ def spyre_ceil(input: torch.Tensor) -> torch.Tensor:
     return torch.ops.aten.neg.default(
         torch.ops.aten.floor.default(torch.ops.aten.neg.default(input))
     )
+
+
+# ---------------------------------------------------------------------------
+# cos / sin via Cody-Waite range reduction + degree-9 Taylor series
+#
+# All RoPE call sites use fp32 inputs (confirmed from tests/resource/models/).
+# Ops used: floor, mul, add, sub — all natively lowered on Spyre.
+# torch.round is NOT used: it is not implemented in the Spyre codegen;
+# round-to-nearest is expressed as floor(x + 0.5).
+#
+# Accuracy (fp32 input, measured against an fp64 reference): worst-case absolute
+# error ~5.3e-5 for both cos and sin on RoPE-realistic inputs (|x| ≤ 1063, i.e.
+# seq_len=1064 with inv_freq[0]=1.0).  On a dense linspace sweep the two differ:
+# cos is the limiting op at ~2.5e-5 even for |x| ≤ π, because the polynomial
+# partially cancels near |x_r| = π/2; sin stays at ~3.7e-6 there.  Safe
+# tolerance for both: 1e-4.  The downstream fp16 cast in model inference absorbs
+# this entirely (fp16 ULP at 1.0 is ~1e-3).
+#
+# Narrower dtypes are computed in fp32 and cast back.  The range reduction needs
+# k = floor(x/π + 0.5) to resolve x against π, and a 10- or 7-bit mantissa runs
+# out of bits as |x| grows: evaluated at fp16 width the error reaches ~0.75 at
+# |x| ≤ 1000, i.e. unusable rather than merely coarse.  Computing the whole body
+# in fp32 fixes it — measured on device, against cos of the value the device
+# actually holds, the error is 4.9e-4 (one fp16 ULP, i.e. optimal) at every range
+# from π to 1000, versus 0.75 without the upcast.  A reduction-only fp32 window
+# is also honored but is weaker (2.4e-3), so the whole body is upcast.
+#
+# Note when validating fp16 against a CPU reference: Spyre's fp16 is a 1-6-9
+# format (9 mantissa bits, not IEEE's 10), so H2D re-rounds an IEEE fp16 input by
+# up to 1 ULP.  That shifts cos/sin by up to 0.5 at |x| ~ 1000 no matter how the
+# op is implemented — it hits a CPU fallback identically (measured 0.495 for
+# both) — so a *device* result must be compared against cos of the round-tripped
+# input, not of the original.  Tolerances below are stated on that basis.
+#
+# KNOWN LIMITATION for fp16/bf16, issue #2818, not introduced here: the fp32
+# window this decomposition opens closes with an fp32 -> fp16/bf16 cast, and that
+# cast is wrong on device unless the innermost dim spans an EVEN number of fp32
+# sticks, i.e. ceil(size[-1] / 32) % 2 == 0.  Two 32-element fp32 sticks pair
+# into one 64-element fp16 stick, and an odd count leaves a dangling half stick
+# where "the fp32 tensor is allocated with a stick of 32 elements but the SDSC
+# shapes are asking for 64" (#2818).  Measured on a sweep of (4, N): correct at
+# N = 48, 64, 112, 128, 192, 240, 256, 320 (even stick counts); wrong or a hard
+# "Invalid device sizes and stride map" at N = 16, 32, 65, 80, 96, 129, 160, 224
+# (odd), with over half the elements taking values that are not in the correct
+# result at all.  Note the rule is the stick pairing, not "multiple of 64":
+# N = 48 is correct and N = 96 is not.
+#
+# This is a backend cast defect, not a cos/sin one, and it is not this
+# decomposition's to fix: a bare ``(x.float() * 2.0).to(torch.float16)`` on the
+# same shapes is wrong by the same amount with no cos/sin in the graph, while a
+# pure fp16 pointwise op (abs, mul) is bit-exact there.  It is also not #4392
+# (no zero-sized device dim appears on these graphs, and a ceil in
+# ``rescale_stl_for_dtype`` changes nothing) and not #4393 (the output carries a
+# STANDARD element arrangement, and a following compiled graph reads back the
+# same wrong values, so the device data itself is wrong rather than merely
+# permuted on copy-out).  RoPE head dims (64, 128) are even-stick and unaffected.
+#
+# PI_HI: nearest fp32 to π (stored as a Python float / fp64 constant so the
+#         compiler sees the exact value rather than a rounded literal).
+# PI_LO: fp64 residual (π − PI_HI), used in the two-term subtraction to
+#         suppress range-reduction error accumulated across large k values.
+# ---------------------------------------------------------------------------
+
+_PI_HI = 3.1415927410125732  # float32(π) as fp64
+_PI_LO = -8.742278012618954e-8  # π − PI_HI in fp64
+
+
+def _taylor_range_reduce(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Cody-Waite two-term range reduction.
+
+    Returns (x_r, sign) where x_r ∈ [−π/2, π/2] and sign = (−1)^k.
+    k is computed as round(x / π) using floor(x/π + 0.5) to avoid
+    torch.round (not supported in the Spyre codegen).
+    """
+    k = torch.ops.aten.floor.default(x * (1.0 / math.pi) + 0.5)
+    x_r = (x - k * _PI_HI) - k * _PI_LO
+    k_mod2 = k - 2.0 * torch.ops.aten.floor.default(k * 0.5)
+    sign = 1.0 - 2.0 * k_mod2
+    return x_r, sign
+
+
+def _taylor_cos(x: torch.Tensor) -> torch.Tensor:
+    """Degree-9 Horner cos. Caller must widen to fp32 (see the accuracy note)."""
+    x_r, sign = _taylor_range_reduce(x)
+    x2 = x_r * x_r
+    poly = 1.0 + x2 * (
+        -0.5 + x2 * (1.0 / 24.0 + x2 * (-1.0 / 720.0 + x2 * (1.0 / 40320.0)))
+    )
+    return sign * poly
+
+
+def _taylor_sin(x: torch.Tensor) -> torch.Tensor:
+    """Degree-9 Horner sin. Caller must widen to fp32 (see the accuracy note)."""
+    x_r, sign = _taylor_range_reduce(x)
+    x2 = x_r * x_r
+    poly = x_r * (
+        1.0
+        + x2
+        * (
+            -1.0 / 6.0
+            + x2 * (1.0 / 120.0 + x2 * (-1.0 / 5040.0 + x2 * (1.0 / 362880.0)))
+        )
+    )
+    return sign * poly
+
+
+def _taylor_dtypes(input: torch.Tensor) -> tuple[torch.dtype, torch.dtype]:
+    """Compute and result dtypes for a cos/sin body, as aten defines them.
+
+    The result dtype is aten's, asked of aten rather than reimplemented:
+    ``ELEMENTWISE_TYPE_PROMOTION_KIND.INT_TO_FLOAT`` is the kind
+    ``torch._refs.cos`` is built with, so integral and boolean input yield the
+    default floating dtype (nothing is truncated back to an integral dtype) and
+    floating input is returned at its own width.
+
+    The compute dtype is *not* taken from the same call, and this is deliberate.
+    ``elementwise_dtypes`` derives it through ``get_computation_dtype``, which
+    reads ``torch._prims_common._computation_dtype_map`` -- and
+    ``torch_spyre._inductor.patches.spyre_data_types`` deliberately replaces that
+    map with identity entries for the whole Inductor compile, so refs do not widen
+    fp16 to fp32 on a device whose native dtype is fp16.  Inside a Spyre compile
+    it therefore reports ``compute=float16`` for fp16 input where an eager call
+    reports ``compute=float32``; wearing ``elementwise_type_promotion_wrapper``
+    here looks idiomatic but widens nothing on the path that matters (measured:
+    0.7501 max error at fp16, identical to no upcast at all, against 5.0e-4 for
+    the explicit ``.to`` below).  cos/sin need the wider window for the range
+    reduction regardless of that policy, so they ask for it in the graph with an
+    explicit cast, which lowers to ``aten._to_copy`` and survives.
+
+    fp64 falls out of ``promote_types``: computation and result are both fp64,
+    which is not a claim that Spyre executes fp64 -- H2D rejects a Double tensor
+    outright.  It matters only because the bodies above are plain torch
+    functions the CPU-side accuracy tests call directly, and this never narrows
+    one of those.  Eager dispatch cannot arrive here with fp64 either, even
+    though ``_register_spyre_dispatchkey_kernels_permanently`` installs a
+    PrivateUse1 kernel for ``aten.cos`` / ``aten.sin``: that key selects on
+    device, not dtype, so a CPU fp64 tensor takes the CPU kernel, and no fp64
+    tensor can sit on a Spyre device to route here -- placement raises
+    ``Spyre backend does not support dtype Double``, and widening an
+    already-placed tensor via ``.to(torch.float64)`` dies with SIGFPE inside the
+    cast (measured; issue #1201's territory, nothing to do with this body).
+
+    Complex is the one dtype aten accepts that these bodies do not serve, and it
+    needs no guard because it cannot arrive: ``.to("spyre")`` rejects a complex
+    tensor outright (``Spyre backend does not support dtype ComplexFloat``), so
+    no Spyre compile ever sees one.  Called directly on CPU it raises
+    ``NotImplementedError`` from ``torch.floor``, which is the right answer --
+    range-reducing a complex argument against pi is meaningless, ``cos(a+bi)``
+    needing ``cosh``/``sinh`` instead.  Should complex placement ever land,
+    cos/sin would need a complex guard or a fallback registration, since they no
+    longer appear in ``register_fallback_default``.
+    """
+    _, result_dtype = elementwise_dtypes(
+        input, type_promotion_kind=ELEMENTWISE_TYPE_PROMOTION_KIND.INT_TO_FLOAT
+    )
+    return torch.promote_types(result_dtype, torch.float32), result_dtype
+
+
+@register_spyre_decompositions([torch.ops.aten.cos.default])
+def spyre_cos(input: torch.Tensor) -> torch.Tensor:
+    """cos(x) via Cody-Waite range reduction and degree-9 Horner polynomial.
+
+    Serves every real dtype aten accepts, so no CPU fallback is needed: the body
+    runs at fp32 or wider and the result carries aten's own dtype.  Complex is
+    aten's one dtype this does not serve, and is unreachable on this backend
+    rather than guarded against -- see ``_taylor_dtypes``.
+    """
+    compute_dtype, result_dtype = _taylor_dtypes(input)
+    out = _taylor_cos(input.to(compute_dtype))
+    return out if out.dtype == result_dtype else out.to(result_dtype)
+
+
+@register_spyre_decompositions([torch.ops.aten.sin.default])
+def spyre_sin(input: torch.Tensor) -> torch.Tensor:
+    """sin(x) via Cody-Waite range reduction and degree-9 Horner polynomial.
+
+    Serves every real dtype aten accepts, so no CPU fallback is needed: the body
+    runs at fp32 or wider and the result carries aten's own dtype.  Complex is
+    aten's one dtype this does not serve, and is unreachable on this backend
+    rather than guarded against -- see ``_taylor_dtypes``.
+    """
+    compute_dtype, result_dtype = _taylor_dtypes(input)
+    out = _taylor_sin(input.to(compute_dtype))
+    return out if out.dtype == result_dtype else out.to(result_dtype)
 
 
 @register_spyre_decompositions([torch.ops.aten.bitwise_not])

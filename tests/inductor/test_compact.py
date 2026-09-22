@@ -265,9 +265,12 @@ def run_binary_op(
             print("device='spyre'")
             print(f"a = torch.ones({tuple(a.shape)}, device=device, {dtype=})")
             print(f"b = torch.ones({tuple(b.shape)}, device=device, {dtype=})")
-            print(
-                f"{filename}_maybe_compact =  lambda x, _: torch.ops.spyre.compact(x)"
-            )
+            if compact:
+                print(
+                    f"{filename}_maybe_compact =  lambda x, _: torch.ops.spyre.compact(x)"
+                )
+            else:
+                print(f"{filename}_maybe_compact =  lambda x, _: x")
             print(gm.code)
             print("compiled = torch.compile(forward)")
             print("print(compiled(None, a,b))")
@@ -275,14 +278,9 @@ def run_binary_op(
     return func(dim, compact, reduce_keep_dim, pre_op_keep_dim, a, b).cpu()
 
 
-def run_test(do_run, compact):
+def run_test(do_run):
     # run on CPU first to be sure that we didn't mess up the pytorch logic
     cpu_result = do_run("cpu")
-
-    # Now that CPU hasn't failed, set xfail if we're not compacting
-    if not compact:
-        pytest.xfail("Operation may fail without compacting")
-
     spyre_result = do_run("spyre")
 
     torch.testing.assert_close(
@@ -341,7 +339,7 @@ def test_pointwise_binary_op(
             b,
         )
 
-    run_test(do_run, compact)
+    run_test(do_run)
 
 
 @torch.compile
@@ -378,4 +376,4 @@ def test_matmul_op(
             matmul_on_reduced, device, dtype, dim, compact, False, False, a, b
         )
 
-    run_test(do_run, compact)
+    run_test(do_run)

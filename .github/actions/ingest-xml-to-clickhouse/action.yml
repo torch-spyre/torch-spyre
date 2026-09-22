@@ -36,6 +36,19 @@ inputs:
     description: Numeric GitHub Actions run id, used as the dedup key.
     required: false
     default: ''
+  artifact-id:
+    description: >
+      artifact_id of what the leg ACTUALLY RAN, derived by derive-gha-artifact-id on the
+      runner. Set, the ingest also writes the artifacts row and the artifact_results verdict;
+      empty (default) writes neither, leaving every existing caller unchanged.
+    required: false
+    default: ''
+  repository:
+    description: >
+      owner/repo the tested commit came from, recorded in artifacts.sources -- the column
+      resolve_covered_tiers.py reaches an artifact through. Empty = GITHUB_REPOSITORY.
+    required: false
+    default: ''
   triggered-at:
     description: Trigger timestamp recorded against the rows (may be empty).
     required: false
@@ -48,19 +61,39 @@ inputs:
     description: Suite tier (e.g. perf | regression | integration | smoke).
     required: false
     default: ''
+  component:
+    description: >
+      Component to stamp on v2 rows. Empty = the ingest script's own product. Set it when a
+      cell runs ANOTHER component's suite through this script: component is a test_case_id
+      hash input, so the wrong value gives the same test a different identity rather than
+      merely mislabelling it.
+    required: false
+    default: ''
   platform:
     description: >
       Platform arch recorded on benchmark_runs rows (e.g. x86_64). Empty =
       the ingest script falls back to its own host-arch default.
     required: false
     default: ''
+  script-repo:
+    description: >
+      Repository holding the canonical ingest script, for the sparse-checkout
+      fallback. Consumers outside torch-spyre must keep this default -- without
+      it the fallback checks out the CALLING repo and finds no script.
+    required: false
+    default: torch-spyre/torch-spyre
+  script-ref:
+    description: >
+      Ref of script-repo to check out. Pin to a tag from another repo; the
+      default tracks that repo's default branch.
+    required: false
+    default: ''
   torch-spyre-dir:
     description: >
-      Directory that already holds a checkout containing
-      .github/scripts/ingest_xml.py (e.g. the prebaked dev image source dir or
-      a per-job checkout). When set and the script is found there, the action
-      reuses it instead of a redundant sparse-checkout. Empty = always
-      sparse-checkout the script into the workspace.
+      Fallback directory containing .github/scripts/ingest_xml.py when the
+      workspace does not already have this ref's copy. The action searches
+      $GITHUB_WORKSPACE first so a prebaked product tree cannot hide a
+      newer sparse-checkout. Empty = workspace, then sparse-checkout.
     required: false
     default: ''
   clickhouse-host:
@@ -81,6 +114,19 @@ inputs:
     default: ''
   clickhouse-db:
     description: ClickHouse database (default "spyre" inside the script).
+    required: false
+    default: ''
+  clickhouse-db-v2:
+    description: >
+      Schema-v2 database. Every v2 statement is qualified with it, because test_cases and
+      benchmark_runs exist in both generations with incompatible shapes. Empty makes the v2
+      write a no-op, so an un-updated caller is unaffected.
+    required: false
+    default: ''
+  schema:
+    description: >
+      Which schema generation to write: v1 (default) | v2 | both. `both` is the migration
+      window -- v1 stays authoritative while v2 accumulates the same runs.
     required: false
     default: ''
 
@@ -111,11 +157,11 @@ runs:
         fi
 
     # The ingest script lives under .github/scripts (a different path than the
-    # .github/actions the perf job already checks out). Reuse an on-disk copy
-    # when the caller has one (perf card runner: prebaked image or a per-job
-    # checkout); otherwise fall back to a sparse-checkout, which reproduces the
-    # push-to-clickhouse.yaml caller's original behavior (it has no product
-    # checkout).
+    # .github/actions the perf job already checks out). Prefer $GITHUB_WORKSPACE
+    # (the job's sparse-checkout of this ref) over torch-spyre-dir. Searching
+    # a prebaked tree first would keep ingest=ok until the next image bake.
+    # Fall back to torch-spyre-dir, then a sparse-checkout (push-to-clickhouse
+    # has no product checkout).
     - name: Locate ingest script (on disk)
       id: locate
       if: steps.gate.outputs.configured == 'true'
@@ -125,7 +171,7 @@ runs:
       run: |
         REL=.github/scripts/ingest_xml.py
         FOUND=""
-        for base in "${TS_DIR}" "${GITHUB_WORKSPACE}"; do
+        for base in "${GITHUB_WORKSPACE}" "${TS_DIR}"; do
           [ -n "${base}" ] || continue
           if [ -f "${base}/${REL}" ]; then
             FOUND="${base}/${REL}"
@@ -141,18 +187,25 @@ runs:
           echo "need-checkout=true" >> "$GITHUB_OUTPUT"
         fi
 
+    # `repository` and `path` are both load-bearing for callers outside torch-spyre: without
+    # repository this checks out the CALLING repo and finds no script, and without path it
+    # overwrites the caller's workspace (its XML included).
     - name: Checkout ingest script (fallback)
       if: steps.gate.outputs.configured == 'true' && steps.locate.outputs.need-checkout == 'true'
       uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       with:
+        repository: ${{ inputs.script-repo }}
+        ref: ${{ inputs.script-ref }}
+        path: .ingest-src
         sparse-checkout: |
           .github/scripts/ingest_xml.py
+          extensions/clickhouse-ingest
         sparse-checkout-cone-mode: false
 
     - name: Set ingest script path (fallback)
       if: steps.gate.outputs.configured == 'true' && steps.locate.outputs.need-checkout == 'true'
       shell: bash
-      run: echo "INGEST_SCRIPT=${GITHUB_WORKSPACE}/.github/scripts/ingest_xml.py" >> "$GITHUB_ENV"
+      run: echo "INGEST_SCRIPT=${GITHUB_WORKSPACE}/.ingest-src/.github/scripts/ingest_xml.py" >> "$GITHUB_ENV"
 
     - name: Install uv
       if: steps.gate.outputs.configured == 'true'
@@ -168,12 +221,33 @@ runs:
     - name: Setup venv and dependencies
       if: steps.gate.outputs.configured == 'true'
       shell: bash
+      env:
+        TS_DIR: ${{ inputs.torch-spyre-dir }}
       run: |
         # Create the ingest venv in the workspace, NOT the baked shared venv, so
         # the ingest deps never perturb the dev image's torch-spyre environment.
         uv venv
         source .venv/bin/activate
-        uv pip install requests clickhouse-driver clickhouse-connect lxml regex
+        # Installed from the checkout, not a git URL, so the library is always the same
+        # commit as the script importing it. Resolved relative to THAT script: `locate`
+        # accepts it from the workspace or from torch-spyre-dir, and those can differ.
+        CHLIB=""
+        for base in "$(cd "$(dirname "${INGEST_SCRIPT}")/../.." && pwd)" \
+                    "${GITHUB_WORKSPACE}" "${TS_DIR}"; do
+          [ -n "${base}" ] || continue
+          if [ -f "${base}/extensions/clickhouse-ingest/pyproject.toml" ]; then
+            CHLIB="${base}/extensions/clickhouse-ingest"
+            break
+          fi
+        done
+        if [ -z "${CHLIB}" ]; then
+          echo "::error::spyre-clickhouse-ingest not found next to ${INGEST_SCRIPT}, in" \
+               "${GITHUB_WORKSPACE} or ${TS_DIR}. The caller must sparse-checkout" \
+               "extensions/clickhouse-ingest alongside .github/scripts/ingest_xml.py."
+          exit 1
+        fi
+        echo "clickhouse-ingest library: ${CHLIB}"
+        uv pip install requests clickhouse-driver clickhouse-connect lxml regex "${CHLIB}"
 
     - name: Ingest XML files into ClickHouse
       if: steps.gate.outputs.configured == 'true'
@@ -188,16 +262,45 @@ runs:
         CH_PORT_IN: ${{ inputs.clickhouse-port }}
         CH_USER_IN: ${{ inputs.clickhouse-user }}
         CH_DB_IN: ${{ inputs.clickhouse-db }}
+        CH_DB_V2_IN: ${{ inputs.clickhouse-db-v2 }}
+        SCHEMA_IN: ${{ inputs.schema }}
         PLATFORM_IN: ${{ inputs.platform }}
+        COMPONENT_IN: ${{ inputs.component }}
+        ARTIFACT_ID_IN: ${{ inputs.artifact-id }}
+        REPOSITORY_IN: ${{ inputs.repository }}
       run: |
         source .venv/bin/activate
         [ -n "${CH_PORT_IN}" ] && export CLICKHOUSE_PORT="${CH_PORT_IN}"
         [ -n "${CH_USER_IN}" ] && export CLICKHOUSE_USER="${CH_USER_IN}"
         [ -n "${CH_DB_IN}" ] && export CLICKHOUSE_DB="${CH_DB_IN}"
+        # Only exported when non-empty: target_database() treats an unset value as "v2 not
+        # configured", which is what makes the v1 default cost nothing.
+        [ -n "${CH_DB_V2_IN}" ] && export CLICKHOUSE_DB_V2="${CH_DB_V2_IN}"
+        [ -n "${SCHEMA_IN}" ] && export INGEST_SCHEMA="${SCHEMA_IN}"
         # Only pass --platform when non-empty; an empty value would override the
         # ingest script's own host-arch default with a blank string.
         PLATFORM_ARGS=()
         [ -n "${PLATFORM_IN}" ] && PLATFORM_ARGS=(--platform "${PLATFORM_IN}")
+        # Same --help probe as --platform above: a prebaked image may carry an ingest script
+        # predating --component, and passing an unknown flag makes argparse exit 2.
+        COMPONENT_ARGS=()
+        if [ -n "${COMPONENT_IN}" ] \
+           && python3 "${INGEST_SCRIPT}" --help 2>/dev/null | grep -q -- "--component"; then
+          COMPONENT_ARGS=(--component "${COMPONENT_IN}")
+        fi
+        # Same --help probe: a prebaked image can carry a script older than these flags, and
+        # argparse exits 2 on an unknown one. Probed once for both -- they landed together.
+        ARTIFACT_ARGS=()
+        if [ -n "${ARTIFACT_ID_IN}" ] \
+           && python3 "${INGEST_SCRIPT}" --help 2>/dev/null | grep -q -- "--artifact-id"; then
+          ARTIFACT_ARGS=(--artifact-id "${ARTIFACT_ID_IN}")
+          if [ -n "${REPOSITORY_IN}" ]; then
+            ARTIFACT_ARGS+=(--repository "${REPOSITORY_IN}")
+          fi
+        elif [ -n "${ARTIFACT_ID_IN}" ]; then
+          echo "::warning::ingest script predates --artifact-id; no artifact row will be" \
+               "written for this run (id was ${ARTIFACT_ID_IN})."
+        fi
         python3 "${INGEST_SCRIPT}" \
           --xml-dir "${{ inputs.xml-dir }}" \
           --workflow "${{ inputs.workflow }}" \
@@ -208,4 +311,4 @@ runs:
           --triggered-at "${{ inputs.triggered-at }}" \
           --pr-number "${{ inputs.pr-number }}" \
           --trigger-type "${{ inputs.trigger-type }}" \
-          "${PLATFORM_ARGS[@]}"
+          "${PLATFORM_ARGS[@]}" "${COMPONENT_ARGS[@]}" "${ARTIFACT_ARGS[@]}"

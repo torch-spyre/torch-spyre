@@ -22,7 +22,7 @@ from unittest.mock import MagicMock, patch
 import sympy
 import torch
 from sympy import Symbol
-from torch._inductor.dependencies import MemoryDep
+from torch._inductor.dependencies import MemoryDep, StarDep, WeakDep
 from torch._inductor.ir import (
     ComputedBuffer,
     FixedLayout,
@@ -30,10 +30,12 @@ from torch._inductor.ir import (
     Pointwise,
     Reduction,
 )
+from torch.utils._sympy.functions import ModularIndexing
 
 from torch_spyre._C import DataFormats, ElementArrangement, SpyreTensorLayout
 from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.ir import FixedTiledLayout
+from torch_spyre._inductor.loop_info import CoarseTileInfo, LoopCarryRecord
 from torch_spyre._inductor.constants import (
     AVGPOOL2D_OP,
     CONV2D_FWD_OP,
@@ -66,9 +68,11 @@ from torch_spyre._inductor.work_division import (
 from torch_spyre._inductor.work_division_constraints import (
     ConstraintResult,
     WorkDivConstraintContext,
+    aligned_ownership_split_domains,
     collect_work_division_constraints,
     conv_spatial_blocked_vars,
     coordinate_mask_blocked_vars,
+    direct_read_source_stick_split_domains,
     indirect_access_split_domains,
     keep_by_index_k_split_constraint,
     keep_by_index_pinned_search_space_vars,
@@ -97,7 +101,7 @@ def _fixed_tiled_layout(shape, dtype=torch.float16, element_arrangement=None):
     device_layout = SpyreTensorLayout(size, stride, dtype, dim_order)
     if element_arrangement is not None:
         device_layout = device_layout.with_element_arrangement(element_arrangement)
-    return FixedTiledLayout("spyre:0", dtype, size, stride, device_layout)
+    return FixedTiledLayout(torch.device("spyre:0"), dtype, size, stride, device_layout)
 
 
 def _tensor_dep(name, shape, symbols, element_arrangement=None):
@@ -122,6 +126,157 @@ def _computed_buffer(shape, name="buf0", reduction_type=None, reduction_ranges=(
     op = ComputedBuffer(name=name, layout=layout, data=data)
     op.operation_name = name
     return op
+
+
+class TestLoopCarryLxEligibility(unittest.TestCase):
+    def setUp(self):
+        self.allocator = ScratchpadAllocator(GreedyLayoutSolver, 2**20)
+
+    @staticmethod
+    def _tagged_carry(name="carry"):
+        op = _computed_buffer((64, 64), name=name)
+        op._loop_carry_record = LoopCarryRecord(
+            storage_name=name,
+            update_name="carry_update",
+        )
+        return op
+
+    def test_loop_carry_bypasses_output_profitability_denylist(self):
+        op = self._tagged_carry()
+        with patch.object(self.allocator, "_get_op_name", return_value="convolution"):
+            self.assertTrue(self.allocator._op_output_good_for_lx_reuse(op))
+
+            op._loop_carry_record = LoopCarryRecord(
+                storage_name="some_other_buffer",
+                update_name="carry_update",
+            )
+            self.assertFalse(self.allocator._op_output_good_for_lx_reuse(op))
+
+    def test_only_joint_solver_accepts_tagged_loop_carry_mutation_target(self):
+        graph = SimpleNamespace(operations=[])
+        common = dict(
+            graph=graph,
+            name="carry",
+            uses=[0, 1],
+            mutated_buffers={"carry"},
+            graph_output_names=set(),
+            reinterpret_output_names=set(),
+            ncores={},
+            ncores_reasons={},
+            division_is_fixed=False,
+            buf_user_deps={},
+        )
+        ordinary = _computed_buffer((64, 64), name="carry")
+        self.assertEqual(
+            self.allocator._buffer_residency_reason(op=ordinary, **common),
+            "mutation target",
+        )
+
+        carry = self._tagged_carry()
+        with (
+            patch.object(allocator_module, "_is_tiled_advancing", return_value=False),
+            patch.object(
+                allocator_module, "_is_read_advancing_anywhere", return_value=False
+            ),
+            patch.object(
+                allocator_module,
+                "_multi_output_extern_kernel_in_live_range",
+                return_value=False,
+            ),
+            patch.object(
+                allocator_module, "buffer_not_read_in_full", return_value=False
+            ),
+            patch.object(
+                allocator_module, "_would_produce_lx_back_gap", return_value=False
+            ),
+            patch.object(self.allocator, "_restickify_barrier", return_value=None),
+            patch.object(
+                self.allocator, "_is_index_or_indirectly_accessed", return_value=False
+            ),
+        ):
+            self.assertIsNone(
+                self.allocator._buffer_residency_reason(op=carry, **common)
+            )
+            common["division_is_fixed"] = True
+            self.assertEqual(
+                self.allocator._buffer_residency_reason(op=carry, **common),
+                "mutation target",
+            )
+
+
+class TestRestickifyBarrierDeferredOnJointPath(unittest.TestCase):
+    """Issue #4655: the restickify barrier tests one committed division
+
+    (``op.iteration_space_ownership``) that reflects whatever a prior pass
+    happened to leave on the op, not any division the joint solver could
+    actually pick. On the joint path (``division_is_fixed=False``) that
+    committed division may disagree with a perfectly compatible candidate the
+    solver's own ``cd_parent_matches``/``constrain_residency`` gate would
+    later select, permanently barring a buffer the solver would otherwise
+    place. The fixed-division (placement) path has no such downstream gate,
+    so it must still apply the barrier up front.
+    """
+
+    def setUp(self):
+        self.allocator = CoOptimizingAllocator(lambda buffers, size: None, 2**20)
+        self.op = _computed_buffer((64, 64), name="buf")
+        self.common = dict(
+            graph=SimpleNamespace(operations=[]),
+            name="buf",
+            uses=[0, 1],
+            op=self.op,
+            mutated_buffers=set(),
+            graph_output_names=set(),
+            reinterpret_output_names=set(),
+            ncores={},
+            ncores_reasons={},
+            buf_user_deps={},
+        )
+
+    def test_joint_path_does_not_consult_the_barrier(self):
+        with (
+            patch.object(
+                self.allocator, "_op_output_good_for_lx_reuse", return_value=True
+            ),
+            patch.object(allocator_module, "is_empty_tiled_layout", return_value=False),
+            patch.object(allocator_module, "_is_tiled_advancing", return_value=False),
+            patch.object(
+                allocator_module, "_is_read_advancing_anywhere", return_value=False
+            ),
+            patch.object(
+                allocator_module,
+                "_multi_output_extern_kernel_in_live_range",
+                return_value=False,
+            ),
+            patch.object(
+                self.allocator, "_is_index_or_indirectly_accessed", return_value=False
+            ),
+            patch.object(
+                allocator_module, "buffer_not_read_in_full", return_value=False
+            ),
+            patch.object(
+                allocator_module, "_would_produce_lx_back_gap", return_value=False
+            ),
+            patch.object(
+                self.allocator,
+                "_restickify_barrier",
+                return_value="read by restickify (local-read proof failed)",
+            ) as barrier,
+        ):
+            self.assertIsNone(
+                self.allocator._buffer_residency_reason(
+                    division_is_fixed=False, **self.common
+                )
+            )
+            barrier.assert_not_called()
+
+            self.assertEqual(
+                self.allocator._buffer_residency_reason(
+                    division_is_fixed=True, **self.common
+                ),
+                "read by restickify (local-read proof failed)",
+            )
+            barrier.assert_called_once()
 
 
 class TestEmptyLxEligibility(unittest.TestCase):
@@ -201,6 +356,110 @@ def _make_context(
         reduction_vars=list(reduction_vars),
         committed_splits=committed_splits or {},
     )
+
+
+class TestAlignedOwnershipSplitDomains(unittest.TestCase):
+    def _context(self, source_shape, source_index):
+        rows, cols = _isym("d0"), _isym("d1")
+        op = _computed_buffer((6, 128), name="repeat")
+        output_td = _tensor_dep("repeat", (6, 128), (rows, cols))
+        source = TensorDep(
+            dep=MemoryDep("x", source_index(rows, cols), (rows, cols), (6, 128)),
+            layout=_fixed_tiled_layout(source_shape),
+        )
+        ctx = _make_context(
+            op,
+            output_td,
+            [source],
+            it_space={rows: 6, cols: 128},
+            it_space_adjusted={rows: 6, cols: 2},
+            stick_vars={cols: 64},
+        )
+        return ctx, rows
+
+    def test_repeat_rows_split_only_into_whole_blocks(self):
+        # x.repeat(3, 2) over x of shape (2, 64): a 2-way row split would give
+        # core 0 output rows {0, 2, 4} after alignment.
+        ctx, rows = self._context(
+            (2, 64),
+            lambda d0, d1: 64 * ModularIndexing(d0, 1, 2) + ModularIndexing(d1, 1, 64),
+        )
+        result = aligned_ownership_split_domains(ctx)
+        self.assertEqual(result.allowed_splits[rows], frozenset({1, 3, 6}))
+        self.assertFalse(result.blocked)
+
+    def test_affine_read_leaves_rows_unconstrained(self):
+        ctx, rows = self._context((6, 128), lambda d0, d1: 128 * d0 + d1)
+        result = aligned_ownership_split_domains(ctx)
+        self.assertNotIn(rows, result.allowed_splits)
+
+
+class TestDirectReadSourceStickSplitDomains(unittest.TestCase):
+    def test_only_whole_stick_partitions_are_legal(self):
+        head, feature, key = (_isym(name) for name in ("head", "feature", "key"))
+        op = _computed_buffer((2, 128, 64), name="direct_read_candidate")
+        op.loop_info = CoarseTileInfo(
+            loop_group_id=(0,),
+            loop_count=[sympy.Integer(3)],
+            loop_tiled_dims=[[]],
+        )
+        output_td = _tensor_dep("output", (2, 128, 64), (head, feature, key))
+
+        for feature_extent, expected in (
+            (128, frozenset({1, 2})),
+            (192, frozenset({1, 3})),
+            (96, frozenset({1})),
+        ):
+            with self.subTest(feature_extent=feature_extent):
+                source_layout = _fixed_tiled_layout((2, 8192, feature_extent))
+                source_dep = MemoryDep(
+                    "source",
+                    8192 * feature_extent * head + feature + feature_extent * key,
+                    (head, feature, key),
+                    (2, feature_extent, 64),
+                )
+                ctx = _make_context(
+                    op,
+                    output_td,
+                    it_space={head: 2, feature: feature_extent, key: 64},
+                )
+                with patch(
+                    "torch_spyre._inductor.work_division_constraints."
+                    "_direct_read_source_dep",
+                    return_value=(source_dep, source_layout),
+                ):
+                    result = direct_read_source_stick_split_domains(ctx)
+
+                self.assertEqual(result.allowed_splits, {feature: expected})
+
+    def test_short_loop_does_not_force_source_compatible_division(self):
+        head, feature, key = (_isym(name) for name in ("head", "feature", "key"))
+        op = _computed_buffer((2, 128, 64), name="short_direct_read_candidate")
+        op.loop_info = CoarseTileInfo(
+            loop_group_id=(0,),
+            loop_count=[sympy.Integer(2)],
+            loop_tiled_dims=[[]],
+        )
+        output_td = _tensor_dep("output", (2, 128, 64), (head, feature, key))
+        source_layout = _fixed_tiled_layout((2, 128, 128))
+        source_dep = MemoryDep(
+            "source",
+            128 * 128 * head + feature + 128 * key,
+            (head, feature, key),
+            (2, 128, 64),
+        )
+        ctx = _make_context(
+            op,
+            output_td,
+            it_space={head: 2, feature: 128, key: 64},
+        )
+        with patch(
+            "torch_spyre._inductor.work_division_constraints._direct_read_source_dep",
+            return_value=(source_dep, source_layout),
+        ):
+            result = direct_read_source_stick_split_domains(ctx)
+
+        self.assertEqual(result, ConstraintResult())
 
 
 class TestMultiDimIterationSpaceSplit(unittest.TestCase):
@@ -746,6 +1005,62 @@ class TestWorkDivisionContextAnswers(unittest.TestCase):
                     )
 
 
+class TestMatmulRowOrderSplitDomains(unittest.TestCase):
+    def test_flattened_staggered_rows_keep_producer_order(self):
+        from torch_spyre._inductor.constants import BATCH_MATMUL_OP
+
+        rows, n, k = (_isym(name) for name in ("rows", "n", "k"))
+        op = _computed_buffer(
+            (8, 64), reduction_type=BATCH_MATMUL_OP, reduction_ranges=(64,)
+        )
+        lhs = TensorDep(
+            MemoryDep("lhs", 64 * rows + k, (rows, k), (8, 64)),
+            _fixed_tiled_layout(
+                (2, 4, 64), element_arrangement=ElementArrangement.FP32_TO_DL16
+            ),
+        )
+        rhs = _tensor_dep("rhs", (64, 64), (n, k))
+        output = _tensor_dep("out", (8, 64), (rows, n))
+        ctx = _make_context(
+            op,
+            output,
+            [lhs, rhs],
+            it_space={rows: 8, n: 64, k: 64},
+            it_space_adjusted={rows: 8, n: 1, k: 1},
+            stick_vars={n: 64, k: 64},
+            reduction_vars=[k],
+        )
+        self.assertEqual(
+            aligned_ownership_split_domains(ctx).allowed_splits[rows],
+            frozenset({2, 4, 8}),
+        )
+        # Matching physical row order must not ban a one-core matmul.
+        ctx.output_td = TensorDep(
+            MemoryDep("out", 64 * rows + n, (rows, n), (8, 64)),
+            _fixed_tiled_layout((2, 4, 64)),
+        )
+        self.assertEqual(
+            aligned_ownership_split_domains(ctx).allowed_splits[rows],
+            frozenset({1, 2, 4, 8}),
+        )
+        ctx.output_td = output
+        # A non-matmul with the same accesses is outside this guard.
+        ctx.op = _computed_buffer((8, 64))
+        self.assertEqual(
+            aligned_ownership_split_domains(ctx).allowed_splits[rows],
+            frozenset({1, 2, 4, 8}),
+        )
+        # One row segment remains unrestricted, including a one-core matmul.
+        ctx.op = op
+        ctx.input_tds[0] = _tensor_dep(
+            "lhs",
+            (8, 64),
+            (rows, k),
+            element_arrangement=ElementArrangement.FP32_TO_DL16,
+        )
+        self.assertNotIn(rows, aligned_ownership_split_domains(ctx).allowed_splits)
+
+
 class TestWorkDivisionSplitLegality(unittest.TestCase):
     def test_cpu_computed_buffer_is_not_constrained(self):
         op = _computed_buffer((8,), name="cpu_buf")
@@ -1038,17 +1353,24 @@ class TestConvSpatialBlockedVars(unittest.TestCase):
             j,
         )
 
-    def test_blocks_spatial_dims_for_strided_conv(self):
-        ctx, i, j = self._context((2, 1))
+    def _blocked(self, ctx, i, j):
+        """Run the constraint against the (mb, out, i, j) output write ranges."""
         rw = MagicMock()
         # Inductor stores ranges in OrderedSet, which does not support slices.
         rw.writes = [MagicMock(ranges=(_isym("mb"), _isym("out"), i, j))]
         with patch(self._PATCH_TARGET, return_value=rw):
-            self.assertEqual(conv_spatial_blocked_vars(ctx).blocked, {i, j})
+            return conv_spatial_blocked_vars(ctx).blocked
+
+    def test_blocks_spatial_dims_for_strided_conv(self):
+        ctx, i, j = self._context((2, 1))
+        self.assertEqual(self._blocked(ctx, i, j), {i, j})
 
     def test_allows_spatial_dims_for_unstrided_conv(self):
-        ctx, _, _ = self._context((1, 1))
-        self.assertEqual(conv_spatial_blocked_vars(ctx).blocked, set())
+        # An unstrided conv splits spatially per-core, so nothing is blocked --
+        # including a collapsed (kernel-extent-1) axis, whose split is correct
+        # (see conv_spatial_blocked_vars).
+        ctx, i, j = self._context((1, 1))
+        self.assertEqual(self._blocked(ctx, i, j), set())
 
     def test_span_commit_conflicting_with_spatial_block_raises_unsupported(self):
         ctx, i, j = self._context((2, 1))
@@ -1466,15 +1788,16 @@ class TestResidencyEdgeMatching(unittest.TestCase):
         self.view_wide = _physical_view((0, 2), (1, 2))
 
         def _div(splits, reduction=None):
+            output = dict(splits)
+            reduction = dict(reduction or {})
             return CoreDivision(
-                output_splits=dict(splits), reduction_splits=dict(reduction or {})
+                splits={**output, **reduction}, reduction_syms=frozenset(reduction)
             )
 
         # Consumer: a 4-core slicing, a 2-core one, an 8-core one that slices
         # the buffer the same way as the first (the stale-LX case), and a
         # 4-core one slicing two device dims -- the only consumer the wide
-        # parent candidate could pair with, so the matmul guard is what
-        # rejects it rather than a view mismatch.
+        # parent candidate can pair with.
         self.consumer_divs = [
             _div({x: 4}),
             _div({x: 2}),
@@ -1503,8 +1826,8 @@ class TestResidencyEdgeMatching(unittest.TestCase):
                 [False, True],
                 False,
             ),
-            # A matmul split across >1 device dim: only the primary split is
-            # carried, so the wide candidate drops out and the narrow stays.
+            # A matmul split across two device dims uses the same complete
+            # ownership comparison as every other producer.
             "matmul": (
                 [self.view_wide, self.view_b],
                 [False, False],
@@ -1519,6 +1842,7 @@ class TestResidencyEdgeMatching(unittest.TestCase):
         self.divisions = {
             name: self.parent_divs for name in list(self.parents) + ["spilled", "clone"]
         }
+        self.divisions["matmul"] = [self.consumer_divs[3], self.parent_divs[1]]
         self.residency = dict.fromkeys(self.op_by_name, None)
         self.residency["spilled"] = "no room"
         self.parent_names = list(self.parents) + ["spilled", "clone", "not_a_buffer"]
@@ -1538,8 +1862,8 @@ class TestResidencyEdgeMatching(unittest.TestCase):
                 for name, op in self.op_by_name.items()
             },
         }
-        # A clone whose write carries a dim its reads do not: it broadcasts,
-        # so no per-core slice of it is produced core-locally.
+        # Expanding a clone's input does not make its finished output partial.
+        # Check input ownership separately from this output-consumer edge.
         self.rw[self.op_by_name["clone"]] = MagicMock(
             writes=[MemoryDep("clone", 16 * x + y, (x, y), (8, 16))],
             reads=[MemoryDep("src", x, (x,), (8,))],
@@ -1551,15 +1875,15 @@ class TestResidencyEdgeMatching(unittest.TestCase):
         op.get_name.return_value = name
         return op
 
-    def _view_for_div(self, op, dep, buf_name, division, prep_cache):
+    def _view_for_div(self, op, dep, buf_name, splits, prep_cache):
         name = op.get_name()
         if name == "consumer":
-            index = self.consumer_divs.index(division)
+            index = [cd.splits for cd in self.consumer_divs].index(splits)
             return (self.consumer_views[index], False, True)
         views, partial, repr_ok, _matmul = self.parents.get(
             name, ([self.view_a, self.view_b], [False, False], [True, True], False)
         )
-        index = self.parent_divs.index(division)
+        index = [cd.splits for cd in self.divisions[name]].index(splits)
         return (views[index], partial[index], repr_ok[index])
 
     def _patches(self):
@@ -1603,8 +1927,8 @@ class TestResidencyEdgeMatching(unittest.TestCase):
         allocator = CoOptimizingAllocator(MagicMock(), size=1)
         with self._patches():
             actual = self._table(allocator)
-        # Producers excluded outright ("spilled", "clone") get no entry at all;
-        # "plain" is the only one keeping the wide parent candidate. Consumer
+        # A rejected producer ("spilled") gets no entry. The wide matmul
+        # matches only the same two-axis consumer. Consumer
         # index 2 slices the buffer like index 0 but on 8 cores, so the
         # cores_used guard drops it everywhere.
         self.assertEqual(
@@ -1613,9 +1937,62 @@ class TestResidencyEdgeMatching(unittest.TestCase):
                 "plain": [(0, 0), (1, 1)],
                 "partial": [(1, 1)],
                 "unrepr": [(1, 1)],
-                "matmul": [(1, 1)],
+                "matmul": [(0, 3), (1, 1)],
+                "clone": [(0, 0), (1, 1)],
             },
         )
+
+    def test_multi_axis_matmul_requires_a_representable_finished_write(self):
+        allocator = CoOptimizingAllocator(MagicMock(), size=1)
+        for partial, representable in ((True, True), (False, False)):
+            with self.subTest(partial=partial, representable=representable):
+                self.parents["matmul"] = (
+                    [self.view_wide, self.view_b],
+                    [partial, False],
+                    [representable, True],
+                    True,
+                )
+                with self._patches():
+                    self.assertEqual(self._table(allocator)["matmul"], [(1, 1)])
+
+    def test_loop_carry_update_is_a_storage_ownership_edge(self):
+        allocator = CoOptimizingAllocator(MagicMock(), size=1)
+        storage_op = self.op_by_name["plain"]
+        record = LoopCarryRecord(
+            storage_name=storage_op.get_name(),
+            update_name=self.consumer_op.get_name(),
+        )
+        storage_op._loop_carry_record = record
+        self.consumer_op._loop_carry_record = record
+
+        with self._patches():
+            edge = allocator._loop_carry_update_edge(
+                self.consumer_op,
+                self.op_by_name,
+                {},
+            )
+            self.assertIsNotNone(edge)
+            self.assertEqual(edge.buf_name, storage_op.get_name())
+            self.assertEqual(edge.read_dep.name, storage_op.get_name())
+            self.assertEqual(
+                edge.match_pairs(
+                    [cd.splits for cd in self.parent_divs],
+                    [cd.splits for cd in self.consumer_divs],
+                ),
+                [(0, 0), (1, 1)],
+            )
+
+    @staticmethod
+    def _compatible(edge, parent_div, consumer_div):
+        """Per-pair reimplementation of what ``match_pairs`` computes in
+        batch, exercised against the same splits-dict API."""
+        if edge._cores_used(parent_div.splits) != edge._cores_used(consumer_div.splits):
+            return False
+        parent_view = edge.parent_view(parent_div.splits)
+        if parent_view is None:
+            return False
+        consumer_view = edge.consumer_view(consumer_div.splits)
+        return consumer_view is not None and parent_view.same_partition(consumer_view)
 
     def test_compatible_agrees_with_the_table(self):
         allocator = CoOptimizingAllocator(MagicMock(), size=1)
@@ -1630,19 +2007,36 @@ class TestResidencyEdgeMatching(unittest.TestCase):
                     self.residency[parent],
                     {},
                 )
-                for i, parent_div in enumerate(self.parent_divs):
+                for i, parent_div in enumerate(self.divisions[parent]):
                     for j, consumer_div in enumerate(self.consumer_divs):
                         self.assertEqual(
-                            edge.compatible(parent_div, consumer_div),
+                            self._compatible(edge, parent_div, consumer_div),
                             (i, j) in pairs,
                             f"{parent} ({i}, {j})",
                         )
+
+    def test_expanding_clone_cannot_read_an_unreplicated_lx_input(self):
+        producer = self.op_by_name["plain"]
+        clone = self.op_by_name["clone"]
+        self.divisions["clone"] = [self.consumer_divs[2]]
+        read = self.rw[clone].reads[0].rename({"src": "plain"})
+        with self._patches():
+            edge = allocator_module.build_residency_edge(
+                "plain", producer, clone, [read], None, {}
+            )
+            self.assertIsNotNone(edge)
+            # Four owners cannot directly serve eight consumer cores.
+            self.assertEqual(
+                edge.match_pairs(
+                    [self.parent_divs[0].splits], [self.consumer_divs[2].splits]
+                ),
+                [],
+            )
 
     def test_excluded_edges_have_no_edge_object(self):
         with self._patches():
             for parent, reason in [
                 ("spilled", "residency"),
-                ("clone", "frame-changing clone"),
             ]:
                 self.assertIsNone(
                     allocator_module.build_residency_edge(
@@ -1656,6 +2050,26 @@ class TestResidencyEdgeMatching(unittest.TestCase):
                     reason,
                 )
 
+    def test_residency_edge_requires_coordinate_dependencies(self):
+        producer = self.op_by_name["plain"]
+        memory = self.rw[producer].writes[0]
+        for dependency in (StarDep("plain"), WeakDep("plain", "consumer")):
+            for reads in ([dependency], [dependency, memory]):
+                for writes in ([dependency], [dependency, memory]):
+                    with self.subTest(reads=reads, writes=writes):
+                        with (
+                            self._patches(),
+                            patch.object(self.rw[producer], "writes", writes),
+                        ):
+                            edge = allocator_module.build_residency_edge(
+                                "plain", producer, self.consumer_op, reads, None, {}
+                            )
+                        if memory in reads and memory in writes:
+                            self.assertIs(edge.read_dep, memory)
+                            self.assertIs(edge.write_dep, memory)
+                        else:
+                            self.assertIsNone(edge)
+
     def test_no_consumer_op_matches_nothing(self):
         allocator = CoOptimizingAllocator(MagicMock(), size=1)
         with self._patches():
@@ -1663,6 +2077,67 @@ class TestResidencyEdgeMatching(unittest.TestCase):
                 allocator._cd_parent_matches(None, [], [], {}, {}, {}, self.residency),
                 {},
             )
+
+
+class TestCloneDivisionMatching(unittest.TestCase):
+    """The clone-in seam: the pairs a graph input's synthesized menu admits.
+
+    The sibling of :class:`TestResidencyEdgeMatching` for the one edge with no
+    producer: a clone's view *is* its consumer's, so nothing compares two views
+    here and the broadcast check in ``_clone_divisions_and_matches`` is the
+    only thing standing between a broadcast read and a plan ``_post_solve`` can
+    only reject.
+    """
+
+    def setUp(self):
+        x, y = _isym("x"), _isym("y")
+        # One consumer, three candidates. The middle one splits ``y``, an axis
+        # the input does not carry, so the split contracts out of the view and
+        # all four cores read the whole buffer.
+        self.consumer_divs = [
+            CoreDivision(splits={x: 4}),
+            CoreDivision(splits={y: 4}),
+            CoreDivision(splits={x: 2}),
+        ]
+        self.views = [
+            _physical_view((0, 4)),
+            PerCoreView(work_slice_dims=(), core_to_slot=(), num_cores=4),
+            _physical_view((0, 2)),
+        ]
+        self.consumer = MagicMock(spec=ComputedBuffer)
+        self.consumer.get_name.return_value = "consumer"
+        self.rw = MagicMock(
+            reads=[MemoryDep("inp", x, (x,), (8,))],
+            writes=[MemoryDep("consumer", x, (x,), (8,))],
+        )
+
+    def _view_for_div(self, op, dep, buf_name, splits, prep_cache):
+        index = [cd.splits for cd in self.consumer_divs].index(splits)
+        return (self.views[index], False, True)
+
+    def _menu(self):
+        allocator = CoOptimizingAllocator(MagicMock(), size=1)
+        with ExitStack() as stack:
+            for target, kwargs in [
+                ("_view_for_div", {"side_effect": self._view_for_div}),
+                ("op_read_writes", {"return_value": self.rw}),
+            ]:
+                stack.enter_context(
+                    patch(
+                        f"torch_spyre._inductor.scratchpad.allocator.{target}",
+                        **kwargs,
+                    )
+                )
+            return allocator._clone_divisions_and_matches(
+                "inp", [self.consumer], {"consumer": self.consumer_divs}, {}
+            )
+
+    def test_broadcast_read_reaches_neither_the_menu_nor_the_table(self):
+        divs, matches = self._menu()
+        self.assertEqual(
+            [cd.splits for cd in divs], [{_isym("x"): split} for split in (4, 2)]
+        )
+        self.assertEqual(matches, {"consumer": [(0, 0), (1, 2)]})
 
 
 class TestCoOptimizingAllocator(unittest.TestCase):
@@ -1688,10 +2163,6 @@ class TestCoOptimizingAllocator(unittest.TestCase):
             patch(
                 "torch_spyre._inductor.scratchpad.allocator._fixed_core_division",
                 return_value=fixed,
-            ),
-            patch(
-                "torch_spyre._inductor.scratchpad.allocator._division_splits",
-                return_value={},
             ),
             patch(
                 "torch_spyre._inductor.scratchpad.allocator._split_option_is_legal",
@@ -1745,9 +2216,7 @@ class TestCoOptimizingAllocator(unittest.TestCase):
         ):
             divisions = allocator._division_map(graph)[op.name]
 
-        self.assertEqual(
-            divisions, [CoreDivision(output_splits={m: 8}, reduction_splits={})]
-        )
+        self.assertEqual(divisions, [CoreDivision(splits={m: 8})])
         self.assertEqual(is_legal.call_args_list[0].args[1], safe)
         self.assertEqual(is_legal.call_args_list[1].args[1], unsafe)
 
@@ -1757,17 +2226,11 @@ class TestCoOptimizingAllocator(unittest.TestCase):
                 name=op.name,
                 size=128,
                 uses=[0],
-                core_divisions=[
-                    CoreDivision(output_splits={batch: 4}, reduction_splits={})
-                ],
+                core_divisions=[CoreDivision(splits={batch: 4})],
                 chosen_division=0,
             )
         ]
         with (
-            patch(
-                "torch_spyre._inductor.scratchpad.allocator._division_splits",
-                return_value={batch: 4},
-            ),
             patch(
                 "torch_spyre._inductor.scratchpad.allocator._split_option_is_legal",
                 return_value=False,
@@ -1785,7 +2248,7 @@ class TestCoOptimizingAllocator(unittest.TestCase):
         rw.reads = []
         allocator = CoOptimizingAllocator(MagicMock(), size=1)
 
-        fixed = CoreDivision(output_splits={1: 2}, reduction_splits={})
+        fixed = CoreDivision(splits={1: 2})
         with (
             patch(
                 "torch_spyre._inductor.scratchpad.allocator.op_read_writes",
@@ -1794,10 +2257,6 @@ class TestCoOptimizingAllocator(unittest.TestCase):
             patch(
                 "torch_spyre._inductor.scratchpad.allocator._fixed_core_division",
                 return_value=fixed,
-            ),
-            patch(
-                "torch_spyre._inductor.scratchpad.allocator._division_splits",
-                return_value={},
             ),
             patch(
                 "torch_spyre._inductor.scratchpad.allocator."

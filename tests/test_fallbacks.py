@@ -63,9 +63,13 @@ _factory_ops = [
     FactoryOp("arange", torch.arange, [(64.0,), (1.0, 65.0), (0.0, 128.0, 2.0)]),
 ]
 
+# aten.tril / aten.triu stand in for the unary-fallback shape here. They are
+# 2-D-only, hence the explicit inputs. (aten.sin / aten.cos used to fill this
+# slot, but they now carry Spyre decompositions and no longer fall back --
+# see torch_spyre/_inductor/decompositions.py spyre_sin / spyre_cos.)
 _unary_ops = [
-    UnaryOp("sin", torch.sin),
-    UnaryOp("cos", torch.cos),
+    UnaryOp("tril", torch.tril, [torch.rand(64, 64, dtype=torch.float16)]),
+    UnaryOp("triu", torch.triu, [torch.rand(64, 64, dtype=torch.float16)]),
 ]
 
 
