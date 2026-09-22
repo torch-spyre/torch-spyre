@@ -1,0 +1,40 @@
+name: Setup the GitHub CLI
+description: >
+  Install `gh` directly on PATH. actions4gh/setup-gh@v1.0.2 extracts the tarball but never
+  lands the binary on PATH before it calls `gh auth login`, so every job using it fails with
+  "spawn gh ENOENT" (upstream actions4gh/setup-gh#7, #11, unresolved). Downstream steps
+  already set GH_TOKEN, which `gh` picks up implicitly, so no `gh auth login` call is needed
+  here. Shared by every ingest that downloads GHA job logs (hw-diagnostics, model-ops).
+
+inputs:
+  version-floor:
+    description: >
+      Offline floor, used when api.github.com can't be reached to resolve the latest release,
+      so a transient API failure degrades to a known-good gh instead of failing the job.
+    required: false
+    default: 2.98.0
+
+runs:
+  using: composite
+  steps:
+    - name: Install gh
+      shell: bash
+      env:
+        GH_CLI_VERSION_FLOOR: ${{ inputs.version-floor }}
+      run: |
+        set -euo pipefail
+        # Track the latest gh release rather than a pin: nothing here depends on a
+        # specific gh version, and a pin silently rots (this fleet had 2.92.0 and 2.97.0
+        # drifting apart across workflows).
+        GH_CLI_VERSION="$(curl -fsSL https://api.github.com/repos/cli/cli/releases/latest \
+                            | jq -r '.tag_name // empty' | sed 's/^v//')" || GH_CLI_VERSION=""
+        if [ -z "$GH_CLI_VERSION" ]; then
+          echo "api.github.com unreachable; flooring to ${GH_CLI_VERSION_FLOOR}"
+          GH_CLI_VERSION="${GH_CLI_VERSION_FLOOR}"
+        fi
+        curl -fsSL \
+          "https://github.com/cli/cli/releases/download/v${GH_CLI_VERSION}/gh_${GH_CLI_VERSION}_linux_amd64.tar.gz" \
+          -o "${RUNNER_TEMP}/gh-cli.tar.gz"
+        mkdir -p "${RUNNER_TEMP}/gh-cli"
+        tar -xzf "${RUNNER_TEMP}/gh-cli.tar.gz" -C "${RUNNER_TEMP}/gh-cli" --strip-components=1
+        echo "${RUNNER_TEMP}/gh-cli/bin" >> "${GITHUB_PATH}"
