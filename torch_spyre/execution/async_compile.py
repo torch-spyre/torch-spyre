@@ -64,9 +64,6 @@ _COMPILE_TIMEOUT_S = 60.0
 def _check_ktir_device_prerequisites() -> None:
     """Raise unless the environment can compile emitted KTIR for the device.
 
-    Names everything missing at once, so a first run does not turn one
-    misconfiguration into a sequence of unrelated-looking failures.
-
     ``ktir_device_mlir`` is deliberately not a prerequisite: dbo-opt defaults
     ``--device`` on its own, so leaving it unset is a valid configuration.
     """

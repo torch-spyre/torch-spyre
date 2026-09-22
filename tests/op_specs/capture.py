@@ -48,6 +48,7 @@ Exit status:
 """
 
 import argparse
+from collections.abc import Callable
 import contextlib
 import dataclasses
 import os
@@ -269,9 +270,13 @@ def capture_kernels(
     flag, and one missed method is a silent empty capture.
     """
     records: list = []
-    # Annotated loosely on purpose: the two methods have different signatures, so
-    # an inferred union makes the pool_size call below unresolvable statically.
-    originals: dict = {"sdsc": SpyreAsyncCompile.sdsc, "ktir": SpyreAsyncCompile.ktir}
+    # ``Callable`` without a signature on purpose: the two methods differ in
+    # arity, and an inferred union makes the pool_size call below unresolvable
+    # statically.
+    originals: dict[str, Callable] = {
+        "sdsc": SpyreAsyncCompile.sdsc,
+        "ktir": SpyreAsyncCompile.ktir,
+    }
 
     def spy(method: str):
         real = originals[method]
