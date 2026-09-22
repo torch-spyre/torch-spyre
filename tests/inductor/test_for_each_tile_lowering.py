@@ -2427,35 +2427,22 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
         finally:
             del victim.tile_marker_dim
 
-    @unittest.expectedFailure
     def test_nested_for_each_tile_value_correct(self):
-        # Issue #4460 (stick-layout/read-copy reconciliation gap in
-        # propagate_layouts.py, inherited from nested_split_m_then_k_fn's
-        # split_k-shaped inner loop) is fixed for this fixture's shape.
-        # The marker_resolution-aware guard in
-        # _synthesize_dim_hints_for_group (issue #4581's fix) makes real
-        # progress -- the pipeline now runs past the original codegen-time
-        # "indirect symbol" lookup failure. Issue #4706's OS-5
-        # symbol-consistency gap on splice_while_loops's synthetic
-        # `identity` op (create_tensor_arg now strips WhileLoop-splice
-        # loop_var symbols like u5 out of the static device_coordinates
-        # and folds their contribution into device_tile_advance_expr
-        # instead) is fixed too, for this fixture's shape. Compilation,
-        # scheduling, and codegen now all complete -- but the test still
-        # fails at the final numeric assertion, and the failure is
-        # nondeterministic run-to-run on this same fixed-seed-free fixture
-        # (confirmed via repeated clean-cache runs). This points to a
-        # memory-safety-class bug (a stale or aliased HBM read, likely in
-        # hbm_pool allocation lifetime or carry read/write scheduling
-        # order) rather than a deterministic addressing/indexing bug in
-        # the tiled_symbols/splice-var binding layer -- see issue #4701
-        # for the full investigation writeup and next steps.
-        # test_carry_mode_split_k (test_for_each_tile_e2e.py) now passes:
-        # its StarDep-shaped matmul consumer turned out to hit the same
-        # issue #4706 OS-5 symbol-consistency layer as this fixture, and
-        # does not hit the #4701 nondeterministic memory-safety gap this
-        # test remains xfailed on (confirmed via isolated stash/pop
-        # bisection -- see that test's own docstring).
+        """Depth=2 nested for_each_tile (outer M-tile, inner split-K carry)
+        compiles and produces numerically correct output end to end.
+
+        Issue #4460 (stick-layout/read-copy reconciliation gap in
+        propagate_layouts.py) and issue #4706 (OS-5 symbol-consistency gap
+        on splice_while_loops's synthetic `identity` op) are both fixed for
+        this fixture's shape. Issue #4701 investigated an apparent
+        nondeterministic numeric mismatch here; that turned out to be this
+        test's reference not matching Spyre's actual dl16 compute precision
+        (unit-variance randn inputs at K=256 blow up output magnitude, and
+        the reference wasn't rounded to approximate dl16) rather than a
+        memory-safety bug -- with methodology matching
+        test_nested_split_m_then_k (test_for_each_tile_e2e.py), the result
+        is deterministic and correct.
+        """
         import torch
         import torch_spyre  # noqa: F401  registers the "spyre" device
         from torch_spyre.constants import DEVICE_NAME
@@ -2464,17 +2451,22 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
             nested_split_m_then_k_fn,
             nested_split_m_then_k_reference,
         )
+        from tests.inductor.utils_inductor import cached_xavier
 
         torch._dynamo.reset()
-        X = torch.randn(256, 256, device=DEVICE_NAME, dtype=torch.float16)
-        Y = torch.randn(256, 64, device=DEVICE_NAME, dtype=torch.float16)
-        expected = nested_split_m_then_k_reference(X.cpu(), Y.cpu()).to(DEVICE_NAME)
+        X = cached_xavier((256, 256))
+        Y = cached_xavier((256, 64), differentiation=1)
+        # bf16 has no native dl16 dtype to round through; it's a conservative
+        # (slightly looser) proxy, matching _dl16_round in test_for_each_tile_e2e.py.
+        expected = nested_split_m_then_k_reference(
+            X.bfloat16().float(), Y.bfloat16().float()
+        )
 
         compiled = torch.compile(
             nested_split_m_then_k_fn, backend="inductor", fullgraph=True
         )
-        actual = compiled(X, Y)
-        torch.testing.assert_close(actual.cpu(), expected.cpu(), atol=1e-2, rtol=1e-2)
+        actual = compiled(X.to(DEVICE_NAME), Y.to(DEVICE_NAME))
+        torch.testing.assert_close(actual.cpu().float(), expected, atol=1e-2, rtol=1e-2)
 
 
 class TestStampDirectLoopInfo(unittest.TestCase):
