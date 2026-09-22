@@ -46,7 +46,7 @@ outputs:
     description: >
       Directory containing .github/scripts/... and extensions/clickhouse-ingest for this
       call -- $GITHUB_WORKSPACE, torch-spyre-dir, or the fallback sparse-checkout. A caller
-      builds its own script paths as `${{ steps.X.outputs.root }}/.github/scripts/<name>.py`.
+      builds its own script paths as `$ {{ steps.X.outputs.root }}/.github/scripts/<name>.py`.
     value: ${{ steps.locate.outputs.root || steps.fallback-root.outputs.root }}
 
 runs:
