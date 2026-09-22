@@ -1,18 +1,19 @@
 # SDPA `for_each_tile` feasibility report
 
-Last updated: 2026-09-21
+Last updated: 2026-09-22
 
 ## Executive summary
 
 This branch rewrites Spyre SDPA's complete `B`/`Hkv`/`G`/`Lq`/`Lk` tile nest
-with `for_each_tile`. It is based on upstream main at `c34232b5` and contains
-no named-dimension hints.
+with `for_each_tile`. It is based on upstream main at `ef4032e9`, including
+the non-contiguous input streaming support merged in #4750, and contains no
+named-dimension hints.
 
 The nested-HOP correctness blockers found during the original experiment are
 fixed. The focused nine-case suite and the production SDPA tests pass on
 Spyre, and Granite 3.3 8B completes chunked-prefill plus decode at 8K and 32K.
-Gemma 4 12B and 26B A4B had already passed the same 8K/32K E2Es with the
-K256 plan that the new selector still chooses.
+Gemma 4 12B and 26B A4B had already passed the same 8K/32K E2Es with the K256
+plan that the selector still chooses.
 
 The tiling selector is cost based. It does not contain model identities,
 sequence-length cutoffs, or maximum query/K tile limits. It enumerates exact
@@ -82,16 +83,20 @@ Representative choices with a 1,625,344-byte per-core LX budget are:
 
 The same plan is selected at 8K and 32K for each geometry because sequence
 length changes the number of bursts, not whether one tile's live set fits LX.
+When both Lq and Lk already fit in one tile, the lowering leaves G visible to
+normal work division instead of adding a G-only map that cannot reduce the
+sequence working set.
 
 ## Correctness results
 
-On upstream main `c34232b5`:
+On upstream main `ef4032e9` plus this branch:
 
 ```text
-tests/inductor/test_sdpa_tiling.py:             22 passed
-tests/inductor/test_for_each_tile_lowering.py:  41 passed, 1 expected failure
-tests/inductor/test_sdpa_for_each_tile.py:        9 passed
-focused production SDPA tests:                   4 passed
+tests/inductor/test_sdpa_tiling.py:                 23 passed
+tests/inductor/test_sdpa_for_each_tile.py (OOT):     9 passed
+selected SDPA/Granite/SigLIP device suite:          23 passed, 2 skipped
+Misc Compute C OOT shard:                           21 passed, 2 expected failures
+LX Misc Compute C OOT shard:                        42 passed, 4 expected failures
 ```
 
 The production group consists of the Lk-HOP structural check, Granite finite
@@ -120,19 +125,38 @@ previously passing execution path did not change.
 
 ## Compile-time and runtime observations
 
-The end-to-end runner reports first-token latency, which includes compilation
-on the first invocation and chunked-prefill execution on every invocation.
+A fresh-cache, same-process kernel comparison used 20 synchronized,
+device-resident iterations of Granite geometry (`Hq=32`, `Hkv=8`, `Lq=512`,
+`D=128`). The padded measurements use K/V prefix views whose backing allocation
+is 512 tokens longer, matching the static-cache layout used by the adapter.
 
-| Case | Cold first token | Warm first token | Notes |
+| KV length | K/V layout | Median runtime | Cold compile + first execution |
+| ---: | --- | ---: | ---: |
+| 8K | tightly allocated | 10.56 ms | 8.72 s |
+| 8K | padded prefix view | 14.07 ms | 8.85 s |
+| 32K | tightly allocated | 23.06 ms | 9.59 s |
+| 32K | padded prefix view | 38.90 ms | 9.55 s |
+
+The prior upstream-main 8K measurement was 27.59 ms, so the current full-HOP
+8K kernel is 2.61x faster on the same tightly allocated input geometry. The
+main baseline was not recompiled for this update.
+
+The end-to-end runner reports two-token generation time. The cold invocation
+includes compilation; the warm invocation reuses the same-process compiled
+graphs. Both runs use Granite 3.3 8B with 512-token chunked prefill.
+
+| Case | Cold total | Warm total | Approx. cold-only overhead |
 | --- | ---: | ---: | --- |
-| Granite 8B, 8K | 138.94 s | 35.30 s | Approx. 103.64 s cold-only overhead |
-| Granite 8B, 32K | 1,506.36 s | >4 min | Cold run passed; the 30-minute wrapper expired during the warm run |
+| Granite 8B, 8K | 70.26 s | 10.37 s | 59.89 s |
+| Granite 8B, 32K | 149.63 s | 91.05 s | 58.58 s |
 
 For comparison, the reported main compile times were approximately 20 minutes
-at 8K and one hour at 32K. The 8K cold-only overhead is therefore about an
-order of magnitude lower. The 32K cold total is 25.1 minutes including model
-execution; it is below the old compile-only baseline, but the incomplete warm
-run means compile and runtime cannot yet be separated precisely.
+at 8K and one hour at 32K. The fixed 512-token chunk shape now compiles once,
+so the observed cold-only overhead is about one minute at both lengths instead
+of scaling with the total context length. Compared with the previous 4551
+measurements, 8K improves from 138.94/35.30 seconds cold/warm and 32K improves
+from 1,506.36 seconds cold with a warm run that had not completed after four
+minutes.
 
 Isolated Granite SDPA measurements explain the K1024 choice:
 
@@ -155,27 +179,29 @@ set. Existing measurements were 38.5 ms (K256) versus 36.2 ms (K512) at 8K,
 and 47.8 ms (K256) versus 72.7 ms (K512) at 32K. The model therefore chooses
 the resident K256 plan without checking the model name or sequence length.
 
-## Additional compiler fix exposed by the E2E
+## Non-contiguous KV-cache support inherited from #4750
 
-The new Granite K1024 plan exposed a generic scan-carry classification bug.
-PyTorch's scan lowering carries the tiled `xs` tensors through its generated
-while loop. A packed K-cache view needed an output stride-repair copy, so the
-IR output buffer no longer had the same name as its input placeholder. The
-bridge interpreted that copy as an accumulator update and changed its output
-to a mutation of the original rank-4 cache, even though the copy iterated over
-the rank-5 tile stack. Dependency extraction then failed on the rank/stride
-mismatch.
+PR #4750 teaches `for_each_tile`/`WhileLoop` splicing to contract an exact-stride
+materialization of a non-contiguous graph input to one streamed tile. Its
+direct-read proof now compares affine bounds with `storage_size()` rather than
+logical `numel`. This deliberately broadens a general-purpose direct-read proof,
+not only the KV-prefix case; both quantities include the storage offset, so the
+bounds comparison remains like-for-like.
 
-The bridge now consults the original body FX graph, where a pass-through carry
-is unambiguous: output position `i` is the same node as placeholder `i`. This
-keeps the stride-repair copy as a copy and avoids any geometry-specific
-safeguard. A focused unit test covers the distinction between a real updated
-carry and a stride-repaired pass-through carry.
+If encoding, layout, ownership, or bounds do not prove a direct read safe, the
+compiler retains the contracted one-tile staging copy. This branch adds a
+device test that forces that proof to decline, checks the fallback shape is
+exactly `(1, 64, 1, 8, 128)`, and verifies the numerical result. The test takes
+about 13 seconds locally under its 30-second CP-SAT limit. It also carries the
+review-requested diagnostics: comments explain why ambiguous axis matches bail
+out instead of guessing, and a debug message records when the FX graph needed
+for pass-through carry detection is unavailable.
+
+PR #4551 is rebased directly on the merged #4750 commit; its former duplicate
+of that compiler patch has been removed.
 
 ## Remaining work
 
-- Complete an uninterrupted same-process Granite 32K warm run to separate
-  compile time from steady-state chunked-prefill runtime.
 - Re-run the Gemma 12B/26B E2Es if changes after this branch alter their K256
   plan or the shared nested-HOP lowering.
 - Add destination-backed map outputs to remove scan stack/fold
