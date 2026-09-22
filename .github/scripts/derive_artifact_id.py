@@ -17,23 +17,27 @@ cases with no artifact row, exactly as it did before this existed.
 """
 
 import argparse
+import importlib
 import os
 import sys
+import types
 
 RECORD_SEP = "|"
+
+_PKG = "_spyre_identity_only"  # real package's __init__ pulls clickhouse_connect
 
 
 def _identity(library_dir: str):
     """Import the SHARED identity module -- a local copy would be a second definition."""
-    if library_dir and library_dir not in sys.path:
-        sys.path.insert(0, library_dir)
-    from spyre_clickhouse_ingest.identity import (
-        BASE_ARTIFACT_ID_FILE,
-        base_artifact_id,
-        gha_artifact_id,
-    )
-
-    return BASE_ARTIFACT_ID_FILE, base_artifact_id, gha_artifact_id
+    pkg = types.ModuleType(_PKG)
+    pkg.__path__ = [os.path.join(library_dir, "spyre_clickhouse_ingest")]
+    sys.modules[_PKG] = pkg
+    # Rebound every call, and submodules from an earlier one dropped, so a second call with a
+    # different library_dir is honoured rather than silently served the first one's.
+    for name in [n for n in sys.modules if n.startswith(f"{_PKG}.")]:
+        del sys.modules[name]
+    mod = importlib.import_module(f"{_PKG}.identity")
+    return mod.BASE_ARTIFACT_ID_FILE, mod.base_artifact_id, mod.gha_artifact_id
 
 
 def derive(

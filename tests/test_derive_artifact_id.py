@@ -19,6 +19,7 @@ identity functions it calls are stdlib-only, which is why the action needs no ve
 """
 
 import importlib.util
+import subprocess
 import sys
 from pathlib import Path
 
@@ -159,7 +160,6 @@ def test_a_broken_library_never_fails_the_build(
     # Telemetry must not redden a test run, so an unimportable library exits 0 with no id.
     gho = tmp_path / "gho.txt"
     monkeypatch.setenv("GITHUB_OUTPUT", str(gho))
-    monkeypatch.setitem(sys.modules, "spyre_clickhouse_ingest.identity", None)
     rc = derive_mod.main(
         [
             "--component",
@@ -178,9 +178,53 @@ def test_a_broken_library_never_fails_the_build(
 
 def test_the_script_uses_the_shared_library_not_a_local_copy(derive_mod):
     # The point of extensions/clickhouse-ingest is that ONE definition runs everywhere.
-    if str(LIB) not in sys.path:
-        sys.path.insert(0, str(LIB))
-    from spyre_clickhouse_ingest.identity import gha_artifact_id
+    # Asserted on the FILE, not object identity: the script binds the module under a private
+    # package name (see below), so it is the same source loaded twice, not a copy.
+    _, _, derive_id = derive_mod._identity(str(LIB))
+    assert derive_id.__module__.endswith(".identity")
+    assert sys.modules[derive_id.__module__].__file__ == str(
+        LIB / "spyre_clickhouse_ingest" / "identity.py"
+    )
 
-    _, read_base, derive_id = derive_mod._identity(str(LIB))
-    assert derive_id is gha_artifact_id
+
+def test_the_package_init_is_never_run(derive_mod):
+    # It imports .client -> clickhouse_connect, a driver this script neither has nor needs.
+    # Importing under a PRIVATE name also leaves the real package free for a caller in the
+    # same process -- tests/test_ingest_xml.py imports it in this very pytest session.
+    derive_mod._identity(str(LIB))
+    assert derive_mod._PKG in sys.modules
+    assert sys.modules[derive_mod._PKG].__name__ != "spyre_clickhouse_ingest"
+
+
+def test_it_derives_with_no_clickhouse_driver_installed(tmp_path):
+    # The regression this guards: importing the package __init__ pulled in clickhouse_connect,
+    # so on a runner without it the script exited 0 having derived NOTHING -- silently, which
+    # is the exact failure mode this whole chain exists to remove.
+    base = tmp_path / "spyre_artifact_id.txt"
+    base.write_text(BASE)
+    blocker = (
+        "import sys\n"
+        "class B:\n"
+        "    def find_spec(self, name, path=None, target=None):\n"
+        "        if name.split('.')[0] == 'clickhouse_connect':\n"
+        "            raise ModuleNotFoundError(name)\n"
+        "sys.meta_path.insert(0, B())\n"
+        f"sys.argv = ['x', '--component', 'torch-spyre', '--arch', 'x86_64',\n"
+        f"            '--installed', 'lxml', '--base-id-file', {str(base)!r},\n"
+        f"            '--library-dir', {str(LIB)!r}]\n"
+        f"exec(open({str(SCRIPT)!r}).read())\n"
+    )
+    out = subprocess.run(
+        [sys.executable, "-c", blocker], capture_output=True, text=True, check=True
+    )
+    assert "artifact_id: " in out.stdout
+    assert "<none" not in out.stdout, out.stderr
+
+
+def test_a_second_call_honours_a_different_library_dir(derive_mod, tmp_path):
+    # The private package name is rebound per call; caching it would serve the first dir
+    # forever, which is how a bogus --library-dir came back as a working import.
+    assert derive_mod._identity(str(LIB))[0].endswith("spyre_artifact_id.txt")
+    with pytest.raises(ModuleNotFoundError):
+        derive_mod._identity(str(tmp_path / "nowhere"))
+    assert derive_mod._identity(str(LIB))[0].endswith("spyre_artifact_id.txt")
