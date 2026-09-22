@@ -47,7 +47,6 @@ from .pass_utils import (
     apply_splits_from_index_coeff,
     iteration_space_from_op,
 )
-from .scratchpad.plan_solver import CoreDivisionBuffer, division_symbol
 
 logger = get_logger("cost_model")
 
@@ -76,14 +75,16 @@ def _prod_ints(seq) -> int:
 
 
 def _op_name(op) -> str:
-    data = getattr(op, "data", None)
-    node = getattr(data, "origin_node", None)
-    if node is not None:
-        return getattr(node, "name", None) or str(getattr(node, "target", node))
-    rtype = getattr(data, "reduction_type", None)
-    if rtype:
-        return str(rtype)
-    return type(data).__name__ if data is not None else op.get_operation_name()
+    """The op's origin-node name.
+
+    ``dump_common`` owns the definition so this dump and the cost-expression
+    dump name ops identically -- the two are joined on it. Imported inside the
+    function because ``dump_common`` is the shared sink and importing it at
+    module scope would close a cycle.
+    """
+    from .dump_common import origin_op_name
+
+    return origin_op_name(op)
 
 
 def _work_slices(op, write_index, read_index, iteration_space, work_slices=None):
@@ -766,7 +767,6 @@ def _relayout_logger():
 def extract_op_features(
     op,
     work_slices=None,
-    buffers: Optional[Mapping[str, CoreDivisionBuffer]] = None,
     *,
     is_lx: Optional[Mapping[str, bool]] = None,
 ) -> OpFeatures:
@@ -776,16 +776,15 @@ def extract_op_features(
     planning. Otherwise committed pre-scheduler ownership is used, falling back
     to legacy coefficient-keyed Scheduler transport after finalization.
 
-    ``buffers`` supplies each arg's symbolic residency and the output's candidate
-    divisions. Missing buffers use their committed layouts. ``is_lx`` overrides
-    residency when pricing a specific placement, such as a relayout candidate.
+    ``is_lx`` supplies each arg's residency (symbolic or concrete) by buffer
+    name, such as a relayout candidate's forced placement. A name missing from
+    it falls back to the buffer's committed layout.
 
     Each arg is also stamped with ``is_boundary``: whether ITS traffic crosses the
     graph boundary, resolved against the arg's own role, so a buffer that is both a
     graph input and a graph output (a returned view of an input; a mutated input that
     is returned) needs no special case.
     """
-    buffers = buffers or {}
     is_lx = is_lx or {}
     boundary = _graph_boundary_names()
     graph_inputs, graph_outputs = boundary if boundary is not None else (None, None)
@@ -817,12 +816,9 @@ def extract_op_features(
     if is_reduction:
         reduction_cores = max(1, cores // max(1, out_elems))
 
-    output_buffer = buffers.get(op.name)
     out_is_lx = is_lx.get(
         op.name,
-        output_buffer.sym_is_lx
-        if output_buffer is not None
-        else _mem_of_layout(op.get_layout()) == "lx",
+        _mem_of_layout(op.get_layout()) == "lx",
     )
 
     # Matmul (batchmatmul reduction): compute-bound -> extra additive compute term. Pull
@@ -915,16 +911,6 @@ def extract_op_features(
     if not is_reduction and loop_trip == 1 and out_is_lx is not True:
         out_write_elems = _indirect_write_elems(op, out_elems)
 
-    # Use the same resolved axes as `cores`, not a candidate's raw split product.
-    store_division = None
-    store_cores_by_division: tuple[tuple[int, int], ...] = ()
-    if out_write_elems is not None and output_buffer is not None:
-        store_division = division_symbol(output_buffer.name)
-        store_cores_by_division = tuple(
-            (index, math.prod(cd.splits.get(key, 1) for key in slices))
-            for index, cd in enumerate(output_buffer.core_divisions)
-        )
-
     args: list = []
     # Output arg (device-sized).
     args.append(
@@ -984,10 +970,9 @@ def extract_op_features(
                 dims, in_elems, in_logical = list(out_dims), out_elems, []
             inp_is_lx = False
         else:
-            input_buffer = buffers.get(name)
             inp_is_lx = is_lx.get(
                 name,
-                input_buffer.sym_is_lx if input_buffer is not None else mem == "lx",
+                mem == "lx",
             )
         args.append(
             ArgTraffic(
@@ -1038,8 +1023,6 @@ def extract_op_features(
         is_lx_relayout=_rl[0],
         relayout_run_elems=_rl[1],
         relayout_split=_rl[2],
-        store_division=store_division,
-        store_cores_by_division=store_cores_by_division,
         # The byte-count check defines which store geometry gets the rate estimate.
         is_indirect_store=out_write_elems is not None,
     )

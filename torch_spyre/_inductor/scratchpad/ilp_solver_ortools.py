@@ -1155,6 +1155,12 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
                 "or select a different layout_solver (e.g. 'greedy')."
             )
         super().__init__(buffers, size, alignment)
+        # What the last solve cost and returned, for the cost-expression dump.
+        # Here rather than on the base class: this is the only solver that
+        # reports it, and the allocator reads it with a default, so the base
+        # contract does not change. Empty until a solve, so a reader can tell
+        # "not recorded" from "no solve".
+        self.last_solve_stats: dict = {}
         # The solver works in alignment-sized units so every offset it picks is
         # automatically aligned; plan_layout scales sizes/offsets in and out.
         self._capacity_units = self.limit // self.alignment
@@ -1306,7 +1312,7 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
                 # if the cost is non-constant, we minimize it
                 # if the cost is constant, we use any solution
                 model.minimize(cp_cost)
-            status = solver.Solve(model)
+            status = self._solve_and_record(solver, model, objective=True)
             if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
                 raise SolveError(
                     f"CP-SAT returned {solver.StatusName(status)} without a plan "
@@ -1319,7 +1325,47 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
             )
             if not config._cpsat_warn_on_cost_expr:
                 raise
+            # The objective could not be lowered. A fallback solve follows and
+            # records over this with ``objective_used`` False; this entry stands
+            # only if no fallback runs, and says why.
+            self.last_solve_stats = {
+                "status": "NOT_LINEARIZABLE",
+                "error": str(exc),
+                "objective_used": False,
+            }
             return None
+
+    def _solve_and_record(
+        self,
+        solver: "cp_model.CpSolver",
+        model: "cp_model.CpModel",
+        *,
+        objective: bool = False,
+    ) -> int:
+        """Solve, and stash what it cost and returned for the cost-expression
+        dump. The one way this class solves.
+
+        Recording is bound to solving rather than left to each call site:
+        ``_run`` solves in its own occupancy passes when
+        ``_minimize_cost_expr`` returns no status, and a site that solved
+        without recording would leave its plan described by an earlier call's
+        numbers -- silently wrong data rather than an error. The two paths are
+        exclusive (the fallbacks sit under ``if status is None``), so the last
+        record always describes the solve that produced this plan.
+
+        Nothing else in the pipeline records this, so "why was that compile
+        slow" currently has no artifact behind it.
+        """
+        status = solver.Solve(model)
+        self.last_solve_stats = {
+            "status": solver.StatusName(status),
+            "solve_s": round(solver.WallTime(), 3),
+            "variables": len(model.proto.variables),
+            "constraints": len(model.proto.constraints),
+            "limit_s": solver.parameters.max_time_in_seconds or None,
+            "objective_used": objective,
+        }
+        return status
 
     def _run(
         self,
@@ -1340,11 +1386,11 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         solver = cp_model.CpSolver()
         if self._time_limit_seconds:
             solver.parameters.max_time_in_seconds = float(self._time_limit_seconds)
-        # Priced relayout models couple division tables, optional copies and
-        # variable-sized placements. Their first presolve pass can consume the
-        # budget before search starts, even below the copy-count threshold.
-        # Search the same model directly; do not change its objective or budget.
-        # Keep the existing threshold for models without a cost objective.
+        # Presolve runs on every model, priced or not: the lin_max proxy
+        # variables (see _SympyExprToCpSat._lin_max_operand) removed the
+        # subset-sum domain work that let it consume the budget, and without it
+        # the LNS workers on a priced model can run out of memory. The copy-count
+        # threshold remains as an opt-in escape hatch (off by default).
         free_copies = sum(
             isinstance(
                 tensors.get(copy_w.buffer.relayout_parent),
@@ -1353,15 +1399,13 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
             for copy_w in copies.values()
         )
         max_copies = config.lx_solver_relayout_presolve_max_copies
-        if (cost_expr is not None and free_copies) or (
-            max_copies > 0 and free_copies > max_copies
-        ):
+        if max_copies > 0 and free_copies > max_copies:
             solver.parameters.cp_model_presolve = False
             logger.info(
-                "[CP-SAT layout solver] %d free relayout copies, priced=%s; "
-                "solving without presolve",
+                "[CP-SAT layout solver] %d relayout copies exceed the presolve "
+                "threshold of %d; solving without presolve",
                 free_copies,
-                cost_expr is not None,
+                max_copies,
             )
         solver.parameters.num_search_workers = (
             1 if torch.are_deterministic_algorithms_enabled() else get_cpu_count()
@@ -1399,7 +1443,7 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
             status = cp_model.INFEASIBLE
             if hbm_terms:
                 model.minimize(sum(hbm_terms))
-                status = solver.Solve(model)
+                status = self._solve_and_record(solver, model)
                 if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
                     raise SolveError(
                         f"CP-SAT returned {solver.StatusName(status)} without a plan "
@@ -1426,7 +1470,7 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
             ]
             if core_terms:
                 model.maximize(sum(core_terms))
-                status = solver.Solve(model)
+                status = self._solve_and_record(solver, model)
                 if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
                     raise SolveError(
                         f"CP-SAT returned {solver.StatusName(status)} without a plan "
@@ -1442,7 +1486,7 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
                 # spill a buffer or lower its core count.
                 model.add(sum(core_terms) >= occupancy)
                 model.minimize(sum(core_cost_terms))
-                status = solver.Solve(model)
+                status = self._solve_and_record(solver, model)
                 if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
                     raise SolveError(
                         f"CP-SAT returned {solver.StatusName(status)} without a plan "

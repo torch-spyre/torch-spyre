@@ -493,8 +493,6 @@ def plan_coarse_tile_groups(
 
     Untiled/skipped ops (non-ComputedBuffer) have no entry.
     """
-    from torch_spyre._inductor.wsr.for_each_tile_lowering import _marker_dim
-
     plan: dict[int, CoarseTileInfo] = {}
     for group_idx, (group_ops, levels) in enumerate(groups):
         group_id: tuple[int, ...] = (group_idx,)
@@ -512,16 +510,22 @@ def plan_coarse_tile_groups(
         for op in group_ops:
             if not isinstance(op, ComputedBuffer):
                 continue
-            if _marker_dim(op) is not None:
-                # A tile_dim_marker op that _consume_tile_dim_markers left
-                # materialized (StarDep-shaped consumer branch -- see its
-                # own comment) is not a tile computation to plan: it never
-                # gets synthesized dim_hints (see
-                # _synthesize_dim_hints_for_group's own marker-exclusion
-                # guard), so giving it a CoarseTileInfo entry here would
-                # only make _apply_plan stamp a spurious loop_info onto it
-                # later, with no corresponding dim_hints to justify it.
-                continue
+            # A tile_dim_marker op that _consume_tile_dim_markers left
+            # materialized (StarDep-shaped consumer branch -- see its own
+            # comment) DOES get planned here like any other ComputedBuffer.
+            # _synthesize_dim_hints_for_group only excludes INLINE_ERASED
+            # markers from dim_hints (issue #4581) -- a STAR_DEP_KEPT marker
+            # gets a real dim_hints entry, and _hint_ranges_pos's
+            # lookup_marker_dim branch exists specifically to resolve a
+            # WhileLoop-splice loop_var against the marker's own read. So
+            # giving it a normal CoarseTileInfo/output_tiled_dims here lets
+            # the marker's per-trip address advance (e.g. an outer while
+            # loop's induction symbol) flow through the same
+            # device_tile_advance_expr machinery every other tiled op uses,
+            # instead of being baked into a fixed index with no
+            # representation (see issue history: substituting that symbol
+            # to 0 avoided the OS-5 crash but silently zeroed a real
+            # per-trip advance).
 
             op_out = op_out_coords(op)
             rw = op_read_writes(op)
@@ -1560,6 +1564,19 @@ def _tiled_dims_for_dep(
     first place -- see _loop_var_to_ranges_pos/
     _loop_var_to_reduction_ranges_pos) and test dep.index's coefficient on
     that symbol directly, instead of name-matching.
+
+    A dim's loop_var symbol only appears in the ONE dependency the splice
+    machinery rewrote in place (the in-place carry target's own
+    ReinterpretView offset, e.g. `_rebase_splice_write_offset`'s
+    `12*u5`-style term) -- an op's other reads of that same tiled dim keep
+    the ordinary squeezed d<N> convention and never contain the loop_var
+    at all. So a zero coefficient on the loop_var does not mean this dep
+    doesn't read dim d; it means this dep uses the other convention. Fall
+    through to the d-prefix membership test rather than returning False --
+    otherwise a real, ordinary-indexed read of a splice-tiled dim (e.g.
+    the mutation_write_back write-back's OWN read of its non-carry input)
+    is wrongly reported as not reading that dim at all, leaving it with no
+    tracked advance mechanism whatsoever.
     """
     pos_to_loop_var: dict[int, sympy.Symbol] = {}
     hints = getattr(ir_node, "dim_hints", None) or ()
@@ -1595,7 +1612,19 @@ def _tiled_dims_for_dep(
     def _dim_is_read(d: int) -> bool:
         loop_var = pos_to_loop_var.get(d)
         if loop_var is not None:
-            return dep.index.coeff(loop_var) != 0
+            free = dep.index.free_symbols
+            # Same two-way OR as _loop_var_to_ranges_pos, and for the same
+            # reason: a non-linear wrapper (e.g. floor(u0)) makes
+            # .coeff(loop_var) == 0 even though loop_var is dep.index's
+            # only free symbol. This function's docstring already claims
+            # "the same coefficient test" as that function for consistency
+            # -- matching the OR, not just the coefficient half, is what
+            # actually keeps that promise. Without it, a read whose index
+            # non-linearly wraps a WhileLoop-splice loop_var would be
+            # wrongly reported as not reading dim d, silently dropping it
+            # from the tiled-dims list.
+            if loop_var in free and (len(free) == 1 or dep.index.coeff(loop_var) != 0):
+                return True
         return raw_to_squeezed.get(d, d) in dep_dims
 
     return [
@@ -2174,6 +2203,15 @@ def _splice_write_targets_full_buffer(op: ComputedBuffer, mut_target: Buffer) ->
     their existing path. Comparing numels rather than shapes keeps this
     robust to the squeeze/rank differences between ``op.data.ranges`` and a
     buffer's own size that this file deals with elsewhere.
+
+    ``diff.is_positive`` is tri-state (True/False/None): sympy returns None
+    rather than False when it can't determine the sign (e.g. an unresolved
+    symbolic extent), and ``bool(None)`` is False. Testing ``is_zero``
+    first and raising when neither ``is_zero`` nor ``is_positive`` resolves
+    keeps that indeterminate case from silently taking the "equal, ordinary
+    mutation" branch above -- which would double-buffer a stacking write's
+    real destination into a copy-out scratch and read a moving window of it,
+    a silent wrong answer (see issue #4458).
     """
     ranges = getattr(getattr(op, "data", None), "ranges", None)
     if not ranges:
@@ -2184,7 +2222,15 @@ def _splice_write_targets_full_buffer(op: ComputedBuffer, mut_target: Buffer) ->
         return False
     op_numel = sympy.prod([sympy.sympify(r) for r in ranges])
     diff = sympy.simplify(target_numel - op_numel)
-    return bool(diff.is_positive)
+    if diff.is_zero:
+        return False
+    if diff.is_positive:
+        return True
+    raise Unsupported(
+        f"WhileLoop-splice stacking-write size check: could not determine "
+        f"whether mutation target size ({target_numel}) exceeds op write "
+        f"size ({op_numel}); diff={diff} has indeterminate sign"
+    )
 
 
 def _hint_ranges_pos(
@@ -2233,9 +2279,27 @@ def _hint_ranges_pos(
         rpos = _loop_var_to_reduction_ranges_pos(op, hint.loop_var)
         if rpos is not None:
             return rpos, True
+
     from torch_spyre._inductor.wsr.for_each_tile_lowering import (
+        _marker_dim,
         lookup_marker_dim,
     )
+
+    # op itself may BE a surviving (STAR_DEP_KEPT) tile_dim_marker, not a
+    # consumer reading one. lookup_marker_dim's _MARKER_MAPS lookup is keyed
+    # by (consumer_name, dep) -- see _consume_tile_dim_markers, which never
+    # records an entry keyed by the marker's own name -- so it cannot
+    # resolve loop_var here even though the marker's read genuinely mentions
+    # it (e.g. the outer WhileLoop's induction symbol baked into the
+    # marker's own read index by lower_tile_dim_marker). tile_marker_dim is
+    # stamped directly on the marker by lower_tile_dim_marker as the
+    # marker's own output-coordinate position (dim indexes x.get_size(),
+    # the same Pointwise ranges op_out_coords resolves against here) -- a
+    # marker is always Pointwise, never Reduction, so this position is
+    # always a non-reduction output dim, never a reduction dim.
+    marker_dim = _marker_dim(op)
+    if marker_dim is not None:
+        return marker_dim, False
 
     resolved = lookup_marker_dim(op, hint.loop_var)
     if resolved is not None:

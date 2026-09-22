@@ -377,10 +377,6 @@ class OpFeatures:
     is_lx_relayout: bool = False
     # Stores with a known contiguous, indirect row write.
     is_indirect_store: bool = False
-    # Existing candidate identities let the solver price each core count without
-    # dividing by a decision variable.
-    store_division: sympy.Symbol | None = None
-    store_cores_by_division: tuple[tuple[int, int], ...] = ()
     # Per-core contiguous run, in ELEMENTS, of the finer (governing) of the two
     # PerCoreViews: (device_size[d] // split[d]) * prod(device_size[d+1:]) for the
     # innermost split dim d. The 10x-at-fixed-bytes variable.
@@ -1812,30 +1808,20 @@ def _store_core_excess_ns(ops: list, p: "CostParams"):
     """Extra write time when the writing cores cannot saturate the shared bus.
 
     The base model already charges W/peak. Add only W/min(peak, cores*rate)
-    minus that charge. Tabulate undecided core counts using the existing
-    division identities; keep HBM bytes symbolic until placement is chosen.
+    minus that charge.
     """
     rate, peak = p.store_gbps_per_core, p.bw_peak_gbps
     if rate <= 0:
         return 0.0
 
     def per_byte(cores):
-        return max(0.0, 1.0 / min(peak, cores * rate) - 1.0 / peak)
+        return max(0.0, 1.0 / (cores * rate) - 1.0 / peak)
 
     total = 0.0
     for op in ops:
         if not op.is_indirect_store or op.is_matmul:
             continue
-        if _is_sym(op.cores):
-            if op.store_division is None or not op.store_cores_by_division:
-                continue  # Retain the old estimate if candidates are unavailable.
-            factor = sum(
-                sympy.KroneckerDelta(op.store_division, index) * per_byte(cores)
-                for index, cores in op.store_cores_by_division
-            )
-        else:
-            factor = per_byte(op.cores)
-        total += op.write_bytes() * factor
+        total += op.write_bytes() * per_byte(op.cores)
     return total
 
 

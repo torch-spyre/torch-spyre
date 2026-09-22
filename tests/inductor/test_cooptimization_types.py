@@ -42,7 +42,7 @@ from torch_spyre._inductor.scratchpad.plan_solver import (
 )
 from torch_spyre._inductor.scratchpad.sa_cooptimizer import SaCoOptimizingSolver
 
-from tests.inductor.cooptimization_capture_loader import (
+from cooptimization_capture_loader import (
     DEFAULT_CAPTURE_PATH,
     LARGE_CAPTURE_PATH,
     SEED_DIVISION_INDEX,

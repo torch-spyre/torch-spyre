@@ -1376,6 +1376,16 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
             },
         },
+        ("test_topk_fused_softmax", "test_topk_fused_softmax_router"): {
+            "param_sets": {
+                # Stick-aligned (64 fp16 per 128-byte stick) and unaligned.
+                "w64": (64,),
+                "w96": (96,),
+                "w128": (128,),
+                "w160": (160,),
+                "w192": (192,),
+            },
+        },
         ("test_topk", "test_topk_cpu"): {
             "param_sets": {
                 "2d_k1_dim0": (unique_randn_along_dim((64, 256), dim=0), 1, 0),
@@ -6911,6 +6921,31 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 [x],
                 "spyre",
             )
+
+    @unittest.skip("topk.ddl does not support sparse input tensors; see #4732")
+    def test_topk_sparse_input(self):
+        # amax over the stick dim produces a sparse output (constant 0 in the
+        # rightmost device coord). topk over a surviving dim of that sparse
+        # tensor must accept the zero-stick layout without forcing a restickify.
+        # Skipped: backend (dxp_standalone / topk.ddl) does not yet support sparse
+        # input tensors to topk ("None of the dimensions is mapped"); see #4732.
+        x = unique_randn_along_dim((32, 32, 64), dim=-1)
+        self.compare_with_cpu(
+            lambda x: torch.topk(torch.amax(x, dim=-1), 4, dim=-1)[0],
+            x,
+            run_eager=False,
+        )
+
+    def test_topk_fused_softmax_router(self, width: int):
+        # Fused softmax->topk: the producer's layout reaches topk through the
+        # restickify graph, so the reduction dim must be pushed off the stick
+        # instead of inherited. Stick-aligned and unaligned widths both covered.
+        x = unique_randn_along_dim((64, width), dim=-1)
+        self.compare_with_cpu(
+            lambda x: torch.topk(torch.softmax(x, dim=-1), 4, dim=-1)[0],
+            x,
+            run_eager=False,
+        )
 
     def test_keep_by_index_cpu(self, x, k: int, dim: int, fill_value: float):
         _, indices = torch.topk(x, k, dim=dim, largest=True)

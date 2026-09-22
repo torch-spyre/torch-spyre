@@ -37,6 +37,7 @@ from ..pass_utils import (
     host_coordinates,
     device_coordinates,
     indirect_sizes_from_op,
+    loop_var_ranges_from_dim_hints,
     op_out_coords,
 )
 from ..ir import SpyreConstantFallback
@@ -276,6 +277,20 @@ def _compute_named_dims(op, inputs):
         if sym not in loop_var_dims:
             size = int(output_dep.ranges[sym])
             loop_var_dims[sym] = [_untracked_name(op.get_name(), sym, size)]
+    # A WhileLoop-splice loop_var (e.g. u0, see for_each_tile_lowering.py's
+    # _synthesize_dim_hints_for_group) is deliberately never an
+    # output_dep.ranges key -- see loop_var_ranges_from_dim_hints's
+    # docstring -- so the seed loop above never assigns it a placeholder.
+    # If such a loop_var is also absent from every input's named dims (no
+    # real name), the out_coords loop below would then do
+    # loop_var_dims.get(sym, []) -> [] and silently contribute nothing,
+    # leaving named_dims one entry short and causing a positional
+    # off-by-one for every downstream named-dim consumer. Seed a
+    # placeholder for it here too, sized from its own dim_hints range
+    # rather than output_dep.ranges.
+    for sym, size in loop_var_ranges_from_dim_hints(op).items():
+        if sym not in loop_var_dims:
+            loop_var_dims[sym] = [_untracked_name(op.get_name(), sym, int(size))]
     out_coords = op_out_coords(op)
 
     named_dims = []
@@ -642,15 +657,14 @@ def _assign_dim_hints_impl(operations: list[Operation]) -> None:
                     coord_for_name[name] = sym
 
         # Preserve any WhileLoop-splice-synthesized hints already stamped by
-        # for_each_tile_lowering.py's _synthesize_dim_hints_for_group
-        # (identified by loop_var_range is not None), the same as the
-        # `not op_hints` branch above -- this op may sit inside a real user
-        # spyre_hint() scope (op_hints non-empty) AND be a for_each_tile
-        # splice op at once, and the loop below must not be the only source
-        # of dim_hints in that case. The synthetic hint_id range
-        # (for_each_tile_lowering.py's _next_synthetic_hint_id_start =
-        # 1 << 30) and real user hint_ids are disjoint by construction, so no
-        # dedup is needed here.
+        # for_each_tile_lowering.py's _stamp_direct_loop_info (identified by
+        # loop_var_range is not None), the same as the `not op_hints` branch
+        # above -- this op may sit inside a real user spyre_hint() scope
+        # (op_hints non-empty) AND be a for_each_tile splice op at once, and
+        # the loop below must not be the only source of dim_hints in that
+        # case. These synthesized hints all share hint_id's dataclass
+        # default (0) and are never keyed against real user hint_ids on
+        # this path, so no dedup against op_hints is needed here.
         existing = getattr(op, "dim_hints", None) or []
         dim_hints = [h for h in existing if h.loop_var_range is not None]
         for hint_id, hint_dict in sorted(op_hints.items()):

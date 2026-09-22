@@ -29,11 +29,11 @@ import pytest
 from unittest.mock import patch
 
 import torch
+import torch.nn.functional as F
 from torch._inductor.virtualized import V
 from torch.spyre import SpyreTensorLayout
 
 import torch_spyre._inductor.optimize_restickify as _optimize_restickify
-from torch._inductor.exc import InductorError
 from torch_spyre._inductor import config
 from utils_inductor import _compile_and_run, compare_with_cpu
 
@@ -57,7 +57,7 @@ def _seed_rng():
 def _compute_cost(restickify_plan):
     assert restickify_plan is not None, "restickify_plan should not be None"
     return sum(
-        math.prod(int(s) for s in entry["target_layout"].size)
+        math.prod(int(s) for s in entry.target_layout.size)
         for entries in restickify_plan.values()
         for entry in entries
     )
@@ -899,6 +899,45 @@ def test_opt_chained_matmuls():
     _compare(lambda a, b, c: (a @ b) @ c, a, b, c, optimal_cost=0)
 
 
+def test_fused_attention_projection_uses_exact_flat_m_layout():
+    """Issue #4746: a fused shared-weight o_proj must not retain B,L BMM axes."""
+    B, H, L, D = 2, 2, 64, 64
+    M, K = B * L, H * D
+    q, k, v = _make_tensors(3, B, H, L, D)
+    weight = torch.randn((K, K), dtype=torch.float16) * 0.1
+
+    def fn(q, k, v, weight):
+        attention = F.scaled_dot_product_attention(
+            q, k, v, dropout_p=0.0, scale=D**-0.5
+        )
+        flat = attention.transpose(1, 2).reshape(M, K)
+        return F.linear(flat, weight)
+
+    result, plan = _compile_and_run_plan_capture(fn, q, k, v, weight)
+    target_stls = [
+        entry.target_layout.device_layout
+        for entries in plan.values()
+        for entry in entries
+    ]
+
+    assert any(
+        list(layout.device_size) == [K // 64, M, 64]
+        and list(layout.stride_map) == [64, K, 1]
+        for layout in target_stls
+    ), f"expected an exact flat-M restickify target, got {target_stls}"
+    compare_with_cpu(
+        fn,
+        q,
+        k,
+        v,
+        weight,
+        target=result,
+        run_eager=False,
+        atol=0.2,
+        rtol=0.2,
+    )
+
+
 def test_opt_two_independent_conflicts():
     """(a+b.t()) + (e.t()+f.t()+g) — two separate conflicts."""
     a, b, e, f, g = _make_tensors(5, S, S)
@@ -1212,18 +1251,12 @@ def test_amax_full_and_amax_live_maximum():
     _compare(f, t, optimal_cost=0)
 
 
-# ------- Unsupported stick configurations ---------
-
-
 def test_sparse_dense_pointwise():
     """a.sum(-1) + b - reduction followed by pointwise without broadcasting."""
-    a = torch.randn((S, S, S), dtype=torch.float16).to(DEVICE)
-    b = torch.randn((S, S), dtype=torch.float16).to(DEVICE)
+    a = torch.randn((S, S, S), dtype=torch.float16)
+    b = torch.randn((S, S), dtype=torch.float16)
 
-    with pytest.raises(
-        InductorError, match="No mechanism to gather elements from multiple sticks"
-    ):
-        _compare(lambda a, b: a.amin(-1) + b, a, b)
+    _compare(lambda a, b: a.min(-1)[0] + b, a, b, optimal_cost=16384)
 
 
 # ------- Restickify padding: strided input raises Unsupported ---------
@@ -2215,26 +2248,29 @@ def test_2d_sparse_broadcast_dense_pointwise():
     """a.sum(-1) + b - reduction output broadcast into pointwise with dense b."""
     a = torch.randn((S, S), dtype=torch.float16)
     b = torch.randn((S, S), dtype=torch.float16)
-    _compare(lambda a, b: a.amin(-1) + b, a, b, optimal_cost=S * S)
+    _compare(lambda a, b: a.amin(-1) + b, a, b, optimal_cost=S)
 
 
 def test_3d_sparse_broadcast_dense_pointwise():
     """a.sum(-1) + b - reduction output broadcast into pointwise with dense b."""
     a = torch.randn((S, S, S), dtype=torch.float16)
     b = torch.randn((S, S, S), dtype=torch.float16)
-    _compare(lambda a, b: a.amin(-1) + b, a, b, optimal_cost=S * S * S)
+    _compare(lambda a, b: a.amin(-1) + b, a, b, optimal_cost=S * S)
 
 
 def test_sparse_dense_pointwise_d0_stick():
     """a.sum(-1) + b where b has a d0 stick — verifies sparse detection with alt-dim candidate."""
 
-    a = torch.randn((S, S, S), dtype=torch.float16).to(DEVICE)
+    a = torch.randn((S, S, S), dtype=torch.float16)
+    b = torch.randn((S, S), dtype=torch.float16)
     b_layout = SpyreTensorLayout([S, S], [S, 1], torch.float16, [1, 0])
-    b = torch.randn((S, S), dtype=torch.float16).to(device_layout=b_layout)
-    with pytest.raises(
-        InductorError, match="No mechanism to gather elements from multiple sticks"
-    ):
-        _compare(lambda a, b: a.amin(-1) + b, a, b)
+
+    _compare(
+        lambda a, b: a.amin(-1)[0] + b,
+        a,
+        b,
+        device_args=[a.to(DEVICE), b.to(device_layout=b_layout)],
+    )
 
 
 def test_sparse_broadcast_dense_pointwise_d0_stick():

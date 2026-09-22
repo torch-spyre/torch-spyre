@@ -12,14 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Fetching GitHub Actions job logs and run artifacts through `gh`.
-
-Lived as an inline heredoc in each repo's ingest workflow, where it could not be tested and where
-the pre-commit hooks could not see it -- so the retry hardening added to one copy never reached
-the checked-in downloader script. One definition, on disk, testable.
-
-stdlib + the `gh` CLI only: this also runs in matrix jobs that install no Python packages.
-"""
+"""Fetching GitHub Actions job logs through `gh` -- stdlib + `gh` CLI only."""
 
 import json
 import os
@@ -33,101 +26,107 @@ import regex as re
 TRANSIENT_HTTP_CODES = ("502", "503", "504")
 
 
-def escape_sequence_flag() -> list:
-    """`--allow-escape-sequences` when this `gh` understands it, else [].
+class GhCli:
+    """Probing and invoking the `gh` binary."""
 
-    gh 2.97.0 began refusing to emit a response body containing terminal escape sequences without
-    the flag, and Actions job logs are full of them: without it every download exits 1 with an
-    empty body and the ingest is silently skipped. Probed rather than version-pinned because the
-    flag does not exist on older gh.
-    """
-    help_text = subprocess.run(
-        ["gh", "api", "--help"], capture_output=True, text=True
-    ).stdout
-    return (
-        ["--allow-escape-sequences"] if "--allow-escape-sequences" in help_text else []
-    )
-
-
-def run_with_retry(args: list, max_attempts: int = 5, base_delay: int = 2):
-    """Run `gh`, retrying only transient 5xx with exponential backoff.
-
-    A 404 (a job with no logs) is returned immediately: retrying a permanent answer just burns
-    the budget that a real 502 needs.
-    """
-    result = subprocess.run(args, capture_output=True, env={**os.environ})
-    for attempt in range(1, max_attempts + 1):
-        if result.returncode == 0:
-            return result
-        err = result.stderr.decode("utf-8", "replace")
-        if (
-            not any(code in err for code in TRANSIENT_HTTP_CODES)
-            or attempt == max_attempts
-        ):
-            return result
-        delay = base_delay * (2 ** (attempt - 1))
-        print(
-            f"  [retry] attempt {attempt}/{max_attempts} failed "
-            f"(rc={result.returncode}), retrying in {delay}s: {err.strip()}"
+    @staticmethod
+    def escape_sequence_flag() -> list:
+        """`--allow-escape-sequences` when this `gh` supports it (probed), else []."""
+        help_text = subprocess.run(
+            ["gh", "api", "--help"], capture_output=True, text=True
+        ).stdout
+        return (
+            ["--allow-escape-sequences"]
+            if "--allow-escape-sequences" in help_text
+            else []
         )
-        time.sleep(delay)
+
+    @staticmethod
+    def run_with_retry(args: list, max_attempts: int = 5, base_delay: int = 2):
+        """Run `gh`, retrying transient 5xx with backoff; a 404 returns immediately."""
         result = subprocess.run(args, capture_output=True, env={**os.environ})
-    return result
+        for attempt in range(1, max_attempts + 1):
+            if result.returncode == 0:
+                return result
+            err = result.stderr.decode("utf-8", "replace")
+            if (
+                not any(code in err for code in TRANSIENT_HTTP_CODES)
+                or attempt == max_attempts
+            ):
+                return result
+            delay = base_delay * (2 ** (attempt - 1))
+            print(
+                f"  [retry] attempt {attempt}/{max_attempts} failed "
+                f"(rc={result.returncode}), retrying in {delay}s: {err.strip()}"
+            )
+            time.sleep(delay)
+            result = subprocess.run(args, capture_output=True, env={**os.environ})
+        return result
 
 
-def dedupe_jobs(jobs: list) -> list:
-    """Drop repeated job ids, so each job's log is downloaded and parsed once even if the API
-    lists it twice."""
-    seen: set = set()
-    out = []
-    for job in jobs:
-        if job["id"] not in seen:
-            seen.add(job["id"])
-            out.append(job)
-    if len(out) != len(jobs):
-        print(f"[warn] jobs list had {len(jobs) - len(out)} duplicate id(s), deduped")
-    return out
+class JobLogs:
+    """Listing, deduping and downloading GHA job logs."""
+
+    @staticmethod
+    def dedupe(jobs: list) -> list:
+        """Drop repeated job ids, so each job's log is downloaded and parsed once."""
+        seen: set = set()
+        out = []
+        for job in jobs:
+            if job["id"] not in seen:
+                seen.add(job["id"])
+                out.append(job)
+        if len(out) != len(jobs):
+            print(
+                f"[warn] jobs list had {len(jobs) - len(out)} duplicate id(s), deduped"
+            )
+        return out
+
+    @classmethod
+    def load(cls, path) -> list:
+        """Jobs from a JSONL listing, as written by `gh api ... --jq`."""
+        with open(path) as fh:
+            return cls.dedupe([json.loads(line) for line in fh if line.strip()])
+
+    @staticmethod
+    def download(jobs: list, repo: str, out_dir) -> int:
+        """Write each job's log to out_dir; returns how many were fetched."""
+        out_path = Path(out_dir)
+        out_path.mkdir(parents=True, exist_ok=True)
+        # Resolved via the module global, not GhCli directly, so a caller patching the
+        # module-level `escape_sequence_flag` alias (no live `gh`) is honoured.
+        esc_flag = escape_sequence_flag()
+        downloaded = 0
+        for idx, job in enumerate(jobs):
+            safe = re.sub(r"[^\w\s\-]", "", job["name"]).strip()
+            target = out_path / f"{idx}_{safe}.txt"
+            result = run_with_retry(
+                ["gh", "api", *esc_flag, f"/repos/{repo}/actions/jobs/{job['id']}/logs"]
+            )
+            if result.returncode == 0 and result.stdout:
+                target.write_bytes(result.stdout)
+                downloaded += 1
+                print(f"  OK  {target}")
+            else:
+                err = result.stderr.decode("utf-8", "replace").strip()
+                print(f"  SKIP  {job['name']} (rc={result.returncode}): {err}")
+        print(f"[info] downloaded {downloaded}/{len(jobs)} job logs")
+        return downloaded
+
+    @classmethod
+    def download_or_die(cls, jobs: list, repo: str, out_dir) -> int:
+        """As `download`, but zero downloads for a non-empty job list is fatal."""
+        downloaded = cls.download(jobs, repo, out_dir)
+        if jobs and downloaded == 0:
+            print(f"::error::downloaded 0 of {len(jobs)} job logs -- aborting")
+            sys.exit(1)
+        return downloaded
 
 
-def load_jobs(path) -> list:
-    """Jobs from a JSONL listing, as written by `gh api ... --jq`."""
-    with open(path) as fh:
-        return dedupe_jobs([json.loads(line) for line in fh if line.strip()])
-
-
-def download_job_logs(jobs: list, repo: str, out_dir) -> int:
-    """Write each job's log to out_dir; returns how many were fetched."""
-    out_path = Path(out_dir)
-    out_path.mkdir(parents=True, exist_ok=True)
-    esc_flag = escape_sequence_flag()
-    downloaded = 0
-    for idx, job in enumerate(jobs):
-        safe = re.sub(r"[^\w\s\-]", "", job["name"]).strip()
-        target = out_path / f"{idx}_{safe}.txt"
-        result = run_with_retry(
-            ["gh", "api", *esc_flag, f"/repos/{repo}/actions/jobs/{job['id']}/logs"]
-        )
-        if result.returncode == 0 and result.stdout:
-            target.write_bytes(result.stdout)
-            downloaded += 1
-            print(f"  OK  {target}")
-        else:
-            err = result.stderr.decode("utf-8", "replace").strip()
-            print(f"  SKIP  {job['name']} (rc={result.returncode}): {err}")
-    print(f"[info] downloaded {downloaded}/{len(jobs)} job logs")
-    return downloaded
-
-
-def download_job_logs_or_die(jobs: list, repo: str, out_dir) -> int:
-    """As download_job_logs, but a total failure is fatal.
-
-    Every completed run has at least one job with a log, so zero downloads means the download
-    mechanism broke -- not that the run produced nothing. Failing here is deliberate: the
-    empty-data guard downstream would skip the ingest and still report success, which is how one
-    such outage stayed green for days.
-    """
-    downloaded = download_job_logs(jobs, repo, out_dir)
-    if jobs and downloaded == 0:
-        print(f"::error::downloaded 0 of {len(jobs)} job logs -- aborting")
-        sys.exit(1)
-    return downloaded
+# Function API, kept so installed consumers import one definition, not a copy.
+escape_sequence_flag = GhCli.escape_sequence_flag
+run_with_retry = GhCli.run_with_retry
+dedupe_jobs = JobLogs.dedupe
+load_jobs = JobLogs.load
+download_job_logs = JobLogs.download
+download_job_logs_or_die = JobLogs.download_or_die

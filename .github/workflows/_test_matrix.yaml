@@ -94,7 +94,7 @@ on:
           (for suite_<group>) whose path sits under that directory -- there
           is no catch-all value that ignores a config's labels.
           integration covers the device-layer surfaces flex and
-          deeptools/dxp_standalone exercise most (streams, job launch
+          deeptools exercise most (streams, job launch
           plans, codegen, LX/scratchpad planning, tensor layout,
           allocator/GC, D2D copies). Default: regression (every config
           labeled for full functional coverage) -- callers that want the
@@ -402,6 +402,82 @@ jobs:
           name: run-id
           path: run-id.txt
           retention-days: 1
+
+  # ---------------------------------------------------------------------------
+  # Job 0a: derive THIS LEG'S artifact identity
+  #
+  # A GHA leg installs this PR's build on top of a prebaked image, so what it runs is a
+  # DIFFERENT artifact from the image Jenkins published -- and had no identity, which is the
+  # whole of the artifact_results coverage gap. spyre-frameworks #1782 stamps the image with
+  # its own artifact_id; gha_artifact_id() chains this leg's delta onto it.
+  #
+  # Its OWN job: the identity is per RUN, not per suite, so deriving it in the ~90-cell matrix
+  # would mint 90 copies of one fact. Cardless spyre_pf_x0, and it cannot run on ubuntu-latest
+  # -- the base id lives in the image's filesystem. No `needs`, so it never gates the run.
+  # ---------------------------------------------------------------------------
+  artifact_identity:
+    name: Derive artifact identity
+    runs-on:
+      - x86_64
+      - spyre_pf_x0
+      - ${{ inputs.runner_label }}
+      - ${{ inputs.image_label }}
+    timeout-minutes: 10
+    # Belt and braces with the action's degrade-to-empty: telemetry never reddens a run.
+    continue-on-error: true
+    steps:
+      # Action, script and library together, so the action finds them in $GITHUB_WORKSPACE.
+      # At THIS ref, like every other job -- one definition of the id formula per commit.
+      - name: Checkout the identity action, script and library
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ inputs.ref || github.event.pull_request.head.sha || github.sha }}
+          repository: ${{ inputs.repository || github.event.pull_request.head.repo.full_name || github.repository }}
+          sparse-checkout: |
+            .github/actions/derive-gha-artifact-id
+            .github/scripts/derive_artifact_id.py
+            extensions/clickhouse-ingest
+          sparse-checkout-cone-mode: false
+
+      # Run-level facts only: a per-job `uv pip freeze` describes one cell, not the run.
+      # EMPTY on the prebaked path, deliberately -- that path tests the image UNCHANGED, so
+      # its artifact IS the image and a derived id would invent one that never existed.
+      - name: Describe what this leg installs on top of the image
+        id: delta
+        env:
+          PREBAKED: ${{ inputs.prebaked_image }}
+          HEAD_SHA: ${{ inputs.ref || github.event.pull_request.head.sha || github.sha }}
+          RPM_NAMES: ${{ inputs.rpm_names }}
+          TS_WHEEL: ${{ inputs.torch_spyre_wheel_artifact_name }}
+          PT_WHEEL: ${{ inputs.pytorch_wheel_artifact_name }}
+        run: |
+          set -euo pipefail
+          TOKENS=""
+          if [ "${PREBAKED}" = "true" ]; then
+            echo "prebaked image: tested unchanged, so its own id is this leg's id."
+          else
+            # The sha, not the wheel filename -- that version does not move per commit.
+            TOKENS="torch-spyre@${HEAD_SHA:0:12}"
+            if [ -n "${RPM_NAMES}" ]; then
+              TOKENS="${TOKENS} ${RPM_NAMES}"
+            fi
+            if [ -n "${TS_WHEEL}" ]; then
+              TOKENS="${TOKENS} torch-spyre-wheel@${TS_WHEEL}"
+            fi
+            if [ -n "${PT_WHEEL}" ]; then
+              TOKENS="${TOKENS} pytorch-wheel@${PT_WHEEL}"
+            fi
+            echo "installed on top: ${TOKENS}"
+          fi
+          echo "installed=${TOKENS}" >> "$GITHUB_OUTPUT"
+
+      - name: Derive and upload the artifact identity
+        id: derive
+        uses: ./.github/actions/derive-gha-artifact-id
+        with:
+          component: ${{ inputs.component }}
+          arch: x86_64
+          installed: ${{ steps.delta.outputs.installed }}
 
   # ---------------------------------------------------------------------------
   # Job 0b: build torch-spyre ONCE

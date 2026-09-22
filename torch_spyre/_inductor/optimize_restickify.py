@@ -49,7 +49,9 @@ class EdgeCostMap:
 
     Entries are computed on demand by compute_restickify_needed. `dep` is the
     MemoryDep for this input; it is not used locally but is forwarded to
-    compute_restickify_needed in pass_utils.
+    compute_restickify_needed in pass_utils. ``require_exact`` makes physical
+    layout equality, rather than ordinary stick compatibility, the zero-cost
+    condition for this edge.
     """
 
     def __init__(
@@ -59,14 +61,18 @@ class EdgeCostMap:
         target_layouts: list,
         target_dep: "MemoryDep",
         op,
+        forbidden_stick_sym: "sympy.Symbol | None" = None,
+        require_exact: bool = False,
     ):
         self.dep = dep
         self._op = op
         self._in_layouts = in_layouts
         self._target_layouts = target_layouts
         self._target_dep = target_dep
+        self._require_exact = require_exact
         self._dep_layout = V.graph.get_buffer(dep.name).get_layout()
         self._target_dep_layout = V.graph.get_buffer(target_dep.name).get_layout()
+        self._forbidden_stick_sym = forbidden_stick_sym
 
         # _cost and _layout are parallel maps.
         # _cost stores the cost for a given in/target layout pair
@@ -88,15 +94,29 @@ class EdgeCostMap:
     ) -> None:
         """Populate _cost and _layout for (in_stl, target_stl).
 
-        Cost is 0 if stick-compatible, the input element count if restickifiable, or INF if infeasible.
+        Cost is 0 if compatible, the input element count if restickifiable, or INF if infeasible.
         _layout stores:
           None               — compatible, no restickify needed
           INFEASIBLE         — restickify needed but compute_restickify_target_layout returned None
           SpyreTensorLayout  — feasible restickify target layout
         """
         needed, tgt = compute_restickify_needed(
-            in_stl, self._dep_layout, self.dep, target_stl, self._target_dep, self._op
+            in_stl,
+            self._dep_layout,
+            self.dep,
+            target_stl,
+            self._target_dep,
+            self._op,
+            require_exact=self._require_exact,
         )
+        if not needed and self._forbidden_stick_sym is not None:
+            stick_expr = device_coordinates(in_stl, self.dep, None)[-1]
+            if self._forbidden_stick_sym in stick_expr.free_symbols:
+                # Input stick contains a forbidden symbol (e.g. topk reduction
+                # var): this pairing is invalid even though stick_compatible
+                # accepted it. Mark as infeasible so the optimizer is forced to
+                # pick a different input candidate or output STL.
+                needed, tgt = True, None
         if not needed:
             cost = 0.0
             self._layout[in_stl][target_stl] = None
@@ -187,13 +207,24 @@ class AllSameNode(RestickNodeCost):
     """
 
     @classmethod
-    def from_args(cls, args, out_layouts, out_deps, op):
+    def from_args(
+        cls,
+        args,
+        out_layouts,
+        out_deps,
+        op,
+        forbidden_stick_sym: "sympy.Symbol | None" = None,
+    ):
         """Build an AllSameNode from input PropArgs and output dep(s).
 
         out_deps is either a single MemoryDep (normal ops) or a list whose first
         entry is the primary output dep and whose remaining entries are co-output
         MemoryDeps (e.g. the shared mutation buffer in copy_forced). Co-output deps
         must agree on the same layout but are not eligible for restickify insertion.
+
+        forbidden_stick_sym: if set, any input whose stick expression contains this
+        symbol is treated as incompatible regardless of stick_compatible() — the
+        optimizer is forced to restickify or pick a different layout.
         """
         assert out_layouts, "AllSameNode.from_args: out_layouts is empty"
         if not isinstance(out_deps, list):
@@ -201,7 +232,10 @@ class AllSameNode(RestickNodeCost):
         out_dep = out_deps[0]  # reference output dep for stick-compatibility checks
         co_output_deps = out_deps[1:]
         input_edge_costs = [
-            EdgeCostMap(arg.dep, arg.layouts, out_layouts, out_dep, op) for arg in args
+            EdgeCostMap(
+                arg.dep, arg.layouts, out_layouts, out_dep, op, forbidden_stick_sym
+            )
+            for arg in args
         ]
         output_edge_costs = [
             EdgeCostMap(
@@ -279,11 +313,19 @@ class FixedInOutNode(RestickNodeCost):
         self.required_in_stls = required_in_stls
 
     @classmethod
-    def from_args(cls, args, out_stl, req_stls, op):
+    def from_args(cls, args, out_stl, req_stls, op, exact_input_indices=None):
         assert req_stls, "FixedInOutNode.from_args: req_stls is empty"
+        exact_input_indices = exact_input_indices or set()
         edge_costs = [
-            EdgeCostMap(arg.dep, arg.layouts, [req], arg.dep, op)
-            for arg, req in zip(args, req_stls)
+            EdgeCostMap(
+                arg.dep,
+                arg.layouts,
+                [req],
+                arg.dep,
+                op,
+                require_exact=i in exact_input_indices,
+            )
+            for i, (arg, req) in enumerate(zip(args, req_stls))
         ]
         return cls(edge_costs, required_out_stl=out_stl, required_in_stls=req_stls)
 

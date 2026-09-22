@@ -339,7 +339,7 @@ def _collect_artifacts() -> dict:
             except Exception:
                 pass
 
-    # Also search the Spyre inductor cache for dxp_standalone bundle artifacts
+    # Also search the Spyre inductor cache for backend bundle artifacts
     try:
         from torch._inductor.runtime.runtime_utils import cache_dir as _cache_dir
 

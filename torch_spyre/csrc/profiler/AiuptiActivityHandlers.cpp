@@ -174,6 +174,84 @@ inline std::string runtimeCbidName(AIUpti_runtime_api_trace_cbid cbid) {
       return "aiuIssueCallback";
     case AIUPTI_RUNTIME_TRACE_CBID_VERIFY_ASYC_MSGS:
       return "aiuVerifyAsyncMsgs";
+    // Host-side spans emitted by spyre-comms (RFC 2973), cbids 41-77. These are
+    // what make collectives visible in a PyTorch trace: AIUPTI records carry no
+    // name, so the label shown to the user comes from here. A cbid missing from
+    // this switch renders as "Unknown CBID <n>" rather than failing.
+    case AIUPTI_RUNTIME_TRACE_CBID_COLL_ALLREDUCE:
+      return "aiuCommsCollAllreduce";
+    case AIUPTI_RUNTIME_TRACE_CBID_COLL_ALLGATHER:
+      return "aiuCommsCollAllgather";
+    case AIUPTI_RUNTIME_TRACE_CBID_COLL_GATHER:
+      return "aiuCommsCollGather";
+    case AIUPTI_RUNTIME_TRACE_CBID_COLL_GATHERV:
+      return "aiuCommsCollGatherv";
+    case AIUPTI_RUNTIME_TRACE_CBID_COLL_REDUCE:
+      return "aiuCommsCollReduce";
+    case AIUPTI_RUNTIME_TRACE_CBID_COLL_BROADCAST:
+      return "aiuCommsCollBroadcast";
+    case AIUPTI_RUNTIME_TRACE_CBID_COLL_BARRIER:
+      return "aiuCommsCollBarrier";
+    case AIUPTI_RUNTIME_TRACE_CBID_WORK_SCHED_START:
+      return "aiuCommsWorkSchedStart";
+    case AIUPTI_RUNTIME_TRACE_CBID_WORK_SCHED_WAIT:
+      return "aiuCommsWorkSchedWait";
+    case AIUPTI_RUNTIME_TRACE_CBID_COLL_ALLREDUCE_SETUP:
+      return "aiuCommsCollAllreduceSetup";
+    case AIUPTI_RUNTIME_TRACE_CBID_COLL_ALLGATHER_SETUP:
+      return "aiuCommsCollAllgatherSetup";
+    case AIUPTI_RUNTIME_TRACE_CBID_COLL_GATHER_SETUP:
+      return "aiuCommsCollGatherSetup";
+    case AIUPTI_RUNTIME_TRACE_CBID_COLL_GATHERV_SETUP:
+      return "aiuCommsCollGathervSetup";
+    case AIUPTI_RUNTIME_TRACE_CBID_COLL_REDUCE_SETUP:
+      return "aiuCommsCollReduceSetup";
+    case AIUPTI_RUNTIME_TRACE_CBID_COLL_BROADCAST_SETUP:
+      return "aiuCommsCollBroadcastSetup";
+    case AIUPTI_RUNTIME_TRACE_CBID_WORK_SCHED_PHASE_RECORDING:
+      return "aiuCommsWorkSchedPhaseRecord";
+    case AIUPTI_RUNTIME_TRACE_CBID_WORK_SCHED_PHASE_WIREUP:
+      return "aiuCommsWorkSchedPhaseWireup";
+    case AIUPTI_RUNTIME_TRACE_CBID_WORK_SCHED_MSG_INFO_MGR:
+      return "aiuCommsWorkSchedMsgInfoMgr";
+    case AIUPTI_RUNTIME_TRACE_CBID_WORK_SCHED_HDMA_RT_MGR:
+      return "aiuCommsWorkSchedHdmaRtMgr";
+    case AIUPTI_RUNTIME_TRACE_CBID_WORK_SCHED_PHASE_LAUNCH:
+      return "aiuCommsWorkSchedPhaseLaunch";
+    case AIUPTI_RUNTIME_TRACE_CBID_OP_SYNCHRONIZE:
+      return "aiuCommsOpSync";
+    case AIUPTI_RUNTIME_TRACE_CBID_OP_D2H_TRANSFER:
+      return "aiuCommsOpD2HXfer";
+    case AIUPTI_RUNTIME_TRACE_CBID_OP_H2D_TRANSFER:
+      return "aiuCommsOpH2DXfer";
+    case AIUPTI_RUNTIME_TRACE_CBID_OP_SEND_DATA:
+      return "aiuCommsOpSendData";
+    case AIUPTI_RUNTIME_TRACE_CBID_OP_MULTICAST_SEND_DATA:
+      return "aiuCommsOpMcastSendData";
+    case AIUPTI_RUNTIME_TRACE_CBID_OP_RECV_DATA:
+      return "aiuCommsOpRecvData";
+    case AIUPTI_RUNTIME_TRACE_CBID_OP_BROADCAST_DATA:
+      return "aiuCommsOpBcastData";
+    case AIUPTI_RUNTIME_TRACE_CBID_OP_GATHER_DATA:
+      return "aiuCommsOpGatherData";
+    case AIUPTI_RUNTIME_TRACE_CBID_OP_ALLGATHER_DATA:
+      return "aiuCommsOpAllgatherData";
+    case AIUPTI_RUNTIME_TRACE_CBID_OP_BINARY_COMPUTE:
+      return "aiuCommsOpBinaryComp";
+    case AIUPTI_RUNTIME_TRACE_CBID_OP_COPY:
+      return "aiuCommsOpCopy";
+    case AIUPTI_RUNTIME_TRACE_CBID_BUNDLE_GENERATE:
+      return "aiuCommsBundleGen";
+    case AIUPTI_RUNTIME_TRACE_CBID_ARTIFACT_LOAD_TO_DEVICE:
+      return "aiuCommsArtifactLoad";
+    case AIUPTI_RUNTIME_TRACE_CBID_ARTIFACT_LAUNCH_COMPUTE_OP:
+      return "aiuCommsArtifactLaunchOp";
+    case AIUPTI_RUNTIME_TRACE_CBID_COST_ESTIMATE:
+      return "aiuCommsCostEst";
+    case AIUPTI_RUNTIME_TRACE_CBID_BENCH_PAIRWISE:
+      return "aiuCommsBenchPairwise";
+    case AIUPTI_RUNTIME_TRACE_CBID_BENCH_ALLREDUCE:
+      return "aiuCommsBenchAllreduce";
     default:
       break;
   }

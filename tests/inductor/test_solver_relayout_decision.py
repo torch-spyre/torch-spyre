@@ -169,7 +169,7 @@ def _disjoint(a_addr, b_addr, footprint=_PER_CORE) -> bool:
 
 
 @pytest.mark.parametrize("priced", [False, True])
-def test_priced_relayout_search_does_not_depend_on_copy_count(monkeypatch, priced):
+def test_relayout_solve_presolves_by_default(monkeypatch, priced):
     from ortools.sat.python import cp_model
 
     p = _producer([0, 1])
@@ -185,7 +185,7 @@ def test_priced_relayout_search_does_not_depend_on_copy_count(monkeypatch, price
 
     monkeypatch.setattr(cp_model.CpSolver, "Solve", solve)
     result = _solve(buffers, expr=_objective(buffers) if priced else None)
-    assert parameters and all(value == (not priced) for value in parameters)
+    assert parameters and all(parameters)
     assert (_copy(result).address is not None) == priced
 
 

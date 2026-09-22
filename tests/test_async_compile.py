@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Device-free tests for parallel DXP compilation."""
+"""Device-free tests for parallel backend compilation."""
 
 from concurrent.futures import Future
 import os
@@ -46,7 +46,7 @@ def _runner(name, code_dir, kernel_provenance=None, symbol_kinds=None):
     return name, code_dir, kernel_provenance, symbol_kinds
 
 
-def test_sdsc_submits_all_dxp_jobs_before_wait():
+def test_sdsc_submits_all_backend_jobs_before_wait():
     pool = _RecordingPool()
     compiler = async_compile_mod.SpyreAsyncCompile()
     events = []
@@ -63,7 +63,9 @@ def test_sdsc_submits_all_dxp_jobs_before_wait():
 
     with (
         torch._inductor.config.patch({"compile_threads": 2}),
-        spyre_config.patch({"async_dxp_compile": True, "spyre_kernel_cache": False}),
+        spyre_config.patch(
+            {"async_backend_compile": True, "spyre_kernel_cache": False}
+        ),
         patch.object(compiler, "wait_pool_ready"),
         patch.object(compiler, "use_process_pool", return_value=True),
         patch.object(compiler, "process_pool", return_value=pool),
@@ -113,7 +115,7 @@ def test_async_cache_commit_is_deferred_until_wait():
 
     with (
         torch._inductor.config.patch({"compile_threads": 2}),
-        spyre_config.patch({"async_dxp_compile": True, "spyre_kernel_cache": True}),
+        spyre_config.patch({"async_backend_compile": True, "spyre_kernel_cache": True}),
         patch.object(compiler, "wait_pool_ready"),
         patch.object(compiler, "use_process_pool", return_value=True),
         patch.object(compiler, "process_pool", return_value=pool),
@@ -153,7 +155,7 @@ def test_cache_hit_reloads_symbol_kinds_from_miss(tmp_path: Path):
 
     with (
         spyre_config.patch(  # type: ignore[attr-defined]
-            {"async_dxp_compile": False, "spyre_kernel_cache": True}
+            {"async_backend_compile": False, "spyre_kernel_cache": True}
         ),
         patch.object(async_compile_mod, "compute_specs_hash", return_value="key"),
         patch.object(
@@ -174,7 +176,7 @@ def test_cache_hit_reloads_symbol_kinds_from_miss(tmp_path: Path):
             "load_symbol_kinds",
             return_value=fake_symbol_kinds,
         ),
-        patch.object(async_compile_mod, "_run_dxp"),
+        patch.object(async_compile_mod, "_run_backend_compiler"),
         patch.object(async_compile_mod, "find_unimplemented", return_value=None),
         patch.object(
             async_compile_mod, "build_kernel_provenance_descriptor", return_value=None
@@ -195,7 +197,7 @@ def test_async_compile_failure_moves_cache_entry_at_wait():
 
     with (
         torch._inductor.config.patch({"compile_threads": 2}),
-        spyre_config.patch({"async_dxp_compile": True, "spyre_kernel_cache": True}),
+        spyre_config.patch({"async_backend_compile": True, "spyre_kernel_cache": True}),
         patch.object(compiler, "wait_pool_ready"),
         patch.object(compiler, "use_process_pool", return_value=True),
         patch.object(compiler, "process_pool", return_value=pool),
@@ -213,9 +215,9 @@ def test_async_compile_failure_moves_cache_entry_at_wait():
         patch.object(async_compile_mod, "_move_to_failed_dir") as move_failed,
     ):
         scope = {"kernel": compiler.sdsc("sdsc_0", [])}
-        pool.futures[0].set_exception(RuntimeError("DXP failed"))
+        pool.futures[0].set_exception(RuntimeError("backend compile failed"))
 
-        with pytest.raises(RuntimeError, match="DXP failed"):
+        with pytest.raises(RuntimeError, match="backend compile failed"):
             compiler.wait(scope)
 
     move_failed.assert_called_once_with("/tmp/key.tmp")
@@ -228,7 +230,7 @@ def test_wait_drains_remaining_spyre_futures_after_failure():
 
     with (
         torch._inductor.config.patch({"compile_threads": 2}),
-        spyre_config.patch({"async_dxp_compile": True, "spyre_kernel_cache": True}),
+        spyre_config.patch({"async_backend_compile": True, "spyre_kernel_cache": True}),
         patch.object(compiler, "wait_pool_ready"),
         patch.object(compiler, "use_process_pool", return_value=True),
         patch.object(compiler, "process_pool", return_value=pool),
@@ -260,11 +262,11 @@ def test_wait_drains_remaining_spyre_futures_after_failure():
         scope = {
             f"kernel{index}": compiler.sdsc(f"sdsc_{index}", []) for index in range(3)
         }
-        pool.futures[0].set_exception(RuntimeError("first DXP failure"))
+        pool.futures[0].set_exception(RuntimeError("first backend failure"))
         pool.futures[1].set_result("compiled")
-        pool.futures[2].set_exception(RuntimeError("later DXP failure"))
+        pool.futures[2].set_exception(RuntimeError("later backend failure"))
 
-        with pytest.raises(RuntimeError, match="first DXP failure"):
+        with pytest.raises(RuntimeError, match="first backend failure"):
             compiler.wait(scope)
 
         commit.assert_called_once_with("/tmp/key1.tmp", "key1")
@@ -282,7 +284,7 @@ def test_wait_drains_remaining_spyre_futures_after_failure():
 
 def test_compile_to_dir_rejects_dimension_symbols(tmp_path: Path):
     """_compile_to_dir must raise NotImplementedError when generate_bundle returns
-    dimension symbols, before any dxp_standalone artifact is produced."""
+    dimension symbols, before any backend-compiler artifact is produced."""
     fake_symbol_kinds = [SymbolKind.dimension(16, 128, "s0"), SymbolKind.kernel(0)]
 
     with (
@@ -294,8 +296,14 @@ def test_compile_to_dir_rejects_dimension_symbols(tmp_path: Path):
         async_compile_mod._compile_to_dir("test_kernel", str(tmp_path), [], 0)
 
 
-def test_real_subprocess_pool_runs_dxp_jobs_concurrently(tmp_path: Path):
-    """Two DXP jobs must overlap rather than running serially in the parent."""
+def test_real_subprocess_pool_runs_backend_jobs_concurrently(tmp_path: Path):
+    """Two backend compiles must overlap, not run serially in the parent.
+
+    Each fake compiler touches a marker named for its own compile dir, then
+    blocks until it can see two markers.  That is a mutual deadlock unless both
+    processes are running at once: a serialized pool leaves the first job waiting
+    for a marker the second cannot yet write, and it exits non-zero at the
+    deadline.  Both finish only if the pool really ran them concurrently."""
     bin_dir = tmp_path / "bin"
     marker_dir = tmp_path / "markers"
     compile_dirs = [tmp_path / "kernel0", tmp_path / "kernel1"]
@@ -304,22 +312,32 @@ def test_real_subprocess_pool_runs_dxp_jobs_concurrently(tmp_path: Path):
     for compile_dir in compile_dirs:
         compile_dir.mkdir()
 
-    fake_dxp = bin_dir / "dxp_standalone"
-    fake_dxp.write_text(
+    fake_compiler = bin_dir / "dbo-opt"
+    fake_compiler.write_text(
         "#!/usr/bin/env python3\n"
         "import os\n"
         "from pathlib import Path\n"
         "import sys\n"
         "import time\n"
-        "marker_dir = Path(os.environ['FAKE_DXP_MARKER_DIR'])\n"
-        "(marker_dir / Path(sys.argv[2]).name).touch()\n"
+        "marker_dir = Path(os.environ['FAKE_BACKEND_COMPILER_MARKER_DIR'])\n"
+        # Read the compile dir off --export-dir rather than a positional index:
+        # the argv layout depends on whether --device is passed.
+        "export_dir = next(\n"
+        "    a.split('=', 1)[1] for a in sys.argv[1:]\n"
+        "    if a.startswith('--export-dir=')\n"
+        ")\n"
+        "(marker_dir / Path(export_dir).name).touch()\n"
+        # The caller treats a missing spyrecode.json as a failure even on exit 0.
+        "code_dir = Path(export_dir) / 'spyreCodeDir'\n"
+        "code_dir.mkdir(parents=True, exist_ok=True)\n"
+        "(code_dir / 'spyrecode.json').write_text('{}')\n"
         "deadline = time.monotonic() + 10\n"
         "while len(list(marker_dir.iterdir())) < 2:\n"
         "    if time.monotonic() >= deadline:\n"
-        "        raise SystemExit('DXP jobs did not overlap')\n"
+        "        raise SystemExit('backend compile jobs did not overlap')\n"
         "    time.sleep(0.05)\n"
     )
-    fake_dxp.chmod(0o755)
+    fake_compiler.chmod(0o755)
 
     shutdown_compile_workers()
     try:
@@ -328,19 +346,19 @@ def test_real_subprocess_pool_runs_dxp_jobs_concurrently(tmp_path: Path):
                 {"compile_threads": 2, "worker_start_method": "subprocess"}
             ),
             spyre_config.patch(  # type: ignore[attr-defined]
-                {"async_dxp_compile": True}
+                {"async_backend_compile": True}
             ),
             patch.dict(
                 os.environ,
                 {
                     "PATH": f"{bin_dir}:{os.environ['PATH']}",
-                    "FAKE_DXP_MARKER_DIR": str(marker_dir),
+                    "FAKE_BACKEND_COMPILER_MARKER_DIR": str(marker_dir),
                 },
             ),
         ):
             compiler = async_compile_mod.SpyreAsyncCompile()
             tasks = [
-                compiler._submit_dxp(f"sdsc_{index}", str(compile_dir))
+                compiler._submit_backend_compile(f"sdsc_{index}", str(compile_dir))
                 for index, compile_dir in enumerate(compile_dirs)
             ]
             assert all(task is not None for task in tasks)

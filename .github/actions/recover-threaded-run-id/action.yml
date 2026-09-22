@@ -1,7 +1,10 @@
 name: Recover threaded run_id
 description: |
-  Recovers the orchestrator's threaded run_id for an ingest that runs on
-  `workflow_run` and therefore cannot receive it as a dispatch input.
+  Recovers a one-file identity artifact for an ingest that runs on `workflow_run` and
+  therefore cannot receive it as a dispatch input.
+
+  Two callers, one mechanism: `run-id` carries the orchestrator's threaded uuid, `artifact-id`
+  the identity of what the leg actually ran.
 
   Jenkins mints one uuid per test run and threads it to the dispatched workflow, so the
   ingest stamps test_case_runs with the SAME id the Jenkins-side artifact_results writer
@@ -14,11 +17,14 @@ description: |
   failure path here degrades to empty for the same reason -- an ingest that refused to run
   because it could not find an optional id would lose the rows entirely.
 
+  Read the result from the `value` output. `run_id` is kept as an alias for the original
+  caller and returns the same string.
+
   Pair it with the upload side in the dispatched workflow:
 
-      - run: printf '%s' "${{ inputs.run_id }}" > run-id.txt
+      - run: printf '%s' "$ {{ inputs.run_id }}" > run-id.txt
       - uses: actions/upload-artifact@<pinned>
-        if: ${{ inputs.run_id != '' }}
+        if: $ {{ inputs.run_id != '' }}
         with: { name: run-id, path: run-id.txt, retention-days: 1 }
 
 inputs:
@@ -35,19 +41,26 @@ inputs:
     description: Name of the one-file artifact carrying the id.
     required: false
     default: run-id
+  label:
+    description: What to call the value in the log line (a job recovering two ids needs both).
+    required: false
+    default: Threaded run_id
   github-token:
     description: Token for the artifacts API. Needs actions:read on `repository`.
     required: true
 
 outputs:
+  value:
+    description: The recovered id, or '' when the run carried none.
+    value: ${{ steps.recover.outputs.run_id }}
   run_id:
-    description: The threaded uuid, or '' when the run carried none.
+    description: Alias of `value`, kept so the original caller needs no edit.
     value: ${{ steps.recover.outputs.run_id }}
 
 runs:
   using: composite
   steps:
-    - name: Recover threaded run_id
+    - name: Recover ${{ inputs.artifact-name }}
       id: recover
       shell: bash
       env:
@@ -55,11 +68,12 @@ runs:
         TRIGGERING_RUN_ID: ${{ inputs.triggering-run-id }}
         REPO: ${{ inputs.repository }}
         ART_NAME: ${{ inputs.artifact-name }}
+        LABEL: ${{ inputs.label }}
       run: |
         # No `set -e`: every step below is allowed to fail into an empty id.
         RID=""
         if [ -z "${TRIGGERING_RUN_ID}" ]; then
-          echo "No triggering run id given — nothing to recover."
+          echo "No triggering run id given — nothing to recover for ${ART_NAME}."
           echo "run_id=" >> "$GITHUB_OUTPUT"
           exit 0
         fi
@@ -77,5 +91,5 @@ runs:
           fi
           rm -rf "${workdir}"
         fi
-        echo "Threaded run_id: ${RID:-<none, ingest will derive>}"
+        echo "${LABEL}: ${RID:-<none>}"
         echo "run_id=${RID}" >> "$GITHUB_OUTPUT"

@@ -130,21 +130,30 @@ vs `[floor(c1/64), z0, c0, Mod(c1, 64)]`), and that is fine: per-argument
 
 SuperDSC artifacts have to be diffable and inspectable during development, which is why JSON is the wire format. When an op gives wrong results on a particular core layout, opening the artifact in a text editor and reading that core's address mapping is usually the fastest path to a diagnosis. JSON also slots cleanly into `torch.compile`'s artifact cache.
 
-### From SuperDSC to KTIR
+### SuperDSC and KTIR
 
-SuperDSC was designed to get Torch-Spyre running quickly with an IR that closely matches the hardware model. The team is now transitioning to KernelTile IR (KTIR), an MLIR-based representation that generalizes the concepts SuperDSC introduced (compute tiles, scratchpad staging, compile-time core partitioning) into a community specification aimed at any dataflow accelerator. See [RFC 0682 - KTIR Spec](https://github.com/torch-spyre/rfcs/blob/main/0682-KtirSpec/0682-KtirSpecRFC.md).
+SuperDSC is an IR that closely matches the hardware model. KernelTile IR (KTIR) is an MLIR-based representation that generalizes the concepts in SuperDSC (compute tiles, scratchpad staging, compile-time core partitioning) into a community specification for any dataflow accelerator. See [KTIR](ktir.md) for the KTIR path through the backend and [RFC 0682 - KTIR Spec](https://github.com/torch-spyre/rfcs/blob/main/0682-KtirSpec/0682-KtirSpecRFC.md) for the specification.
 
 ## Invocation
 
 DeepTools runs as an out-of-process subprocess. During scheduling, the
 generated host code calls `async_compile.sdsc(...)`
 ([`execution/async_compile.py`](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/execution/async_compile.py)),
-which runs `dxp_standalone -d <output_dir>` to turn the
-SuperDSC JSON into a device binary. (The bundle itself is produced
+which runs `dbo-opt --export-dir=<output_dir> -kEmitSpyreCode <output_dir>/bundle.mlir`
+to turn the SuperDSC JSON into a device binary. An SDSC bundle is dbo-opt's
+default input, so no `--from-ktir` is passed; that flag selects the KTIR
+frontend instead. (The bundle itself is produced
 earlier, in Python, by `generate_bundle(...)`.) Each kernel gets its own output
 directory created with `tempfile.mkdtemp` under `<cache_dir>/inductor-spyre`,
 so the bundles are stored separately from Inductor's content-addressed
 Python/Triton cache.
+
+Setting `SPYRE_ASYNC_DXP_COMPILE=1` submits each `dxp_standalone` run to
+Inductor's compile-worker process pool instead of running it inline, so the
+`dxp_standalone` invocations for separate kernels compile in parallel. The
+flag takes effect only when more than one compile thread is configured.
+With a single thread, or when it is left at its default of `0`, each kernel
+compiles synchronously.
 
 ## Further Reading
 

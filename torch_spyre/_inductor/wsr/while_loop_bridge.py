@@ -20,6 +20,46 @@ Deliberately knows nothing about for_each_tile's own frontend contract
 wsr/for_each_tile_lowering.py, which is this module's only caller. Anything
 here should stay reusable by a future, differently-shaped while_loop
 producer.
+
+Overall algorithm: ``splice_while_loop`` replaces a WhileLoop op with its
+body subgraph's own ops spliced directly into the outer graph -- the loop
+structure itself is discarded, with iteration folded into DimHints/levels by
+the caller (wsr/for_each_tile_lowering.py). Splicing this single body copy
+in once means every carry (one per position in ``while_op.carried_inputs``,
+see ``CarryBinding``) needs its reads and writes rewired so this one copy
+behaves like every trip at once. Three carry shapes exist, each rewired
+differently:
+
+  pass-through  the body never rewrites this carry (body_output IS the
+                placeholder object). Its read is aliased straight to the
+                real ``while_op.carried_inputs[i]`` object; nothing else is
+                needed.
+  accumulator   the body computes a new value each iteration, in place,
+                read once at the end. Rewired via fill/rewrite/drain:
+
+                  fill    the carry's own real initial buffer's pre-loop
+                          producer seeds it
+                  rewrite the single spliced copy of the body op that wrote
+                          this carry is redirected (via
+                          ``_rewire_accumulator_output``) to read and write
+                          that same real initial buffer in place, standing
+                          in for every trip
+                  drain   the buffer itself IS the final value after the
+                          last trip, so outside consumers read it directly
+
+  stacking      each iteration writes a DIFFERENT SLICE of one larger
+                result (e.g. ``scan``'s ``ys``). There is no intermediate
+                per-iteration state to thread, so no scratch buffer is
+                needed at all -- instead the destination buffer's own
+                layout is folded from ``[trip_count, *tile]`` to the flat
+                result shape via ``fold_stacked_carry_layout``, and the
+                per-iteration write becomes an ordinary tile-advancing
+                write into it.
+
+See ``CarryBinding``'s own docstring for the accumulator/stacking split in
+more detail, and ``splice_while_loop``'s docstring for how reads (two
+distinct shapes: name-based ``ops.load`` calls vs. direct object references
+held in ``.inputs``) and writes are actually redirected.
 """
 
 from __future__ import annotations
@@ -114,6 +154,43 @@ def carry_bindings_for(
         )
         for i, initial in enumerate(carried_inputs)
     ]
+
+
+def _body_fx_carry_is_passthrough(while_op: "ir.WhileLoop", carry_index: int) -> bool:
+    """Return whether the original body returns this carry placeholder unchanged.
+
+    ``WhileLoop.create`` applies ``require_exact_strides`` to every lowered IR
+    body output after tracing the body FX graph.  For a scan ``xs`` carry that
+    is semantically pass-through, that stride repair can introduce a copy and
+    make the IR output's buffer name differ from the placeholder name.  The FX
+    graph still retains the semantic identity: output ``i`` is placeholder
+    ``i``.  Consult it so the copy is not mistaken for an accumulator update
+    and rewritten in place onto a differently-ranked input view.
+    """
+    from torch.utils._pytree import tree_leaves
+
+    body_graph = getattr(getattr(while_op, "body_subgraph", None), "graph", None)
+    module = getattr(body_graph, "module", None)
+    fx_graph = getattr(module, "graph", None)
+    if fx_graph is None:
+        logger.debug(
+            "cannot inspect FX pass-through identity for carry %d: "
+            "body_subgraph.graph.module.graph is unavailable",
+            carry_index,
+        )
+        return False
+
+    placeholders = [node for node in fx_graph.nodes if node.op == "placeholder"]
+    output = next((node for node in fx_graph.nodes if node.op == "output"), None)
+    if output is None or not output.args:
+        return False
+
+    outputs = tree_leaves(output.args[0])
+    return (
+        carry_index < len(placeholders)
+        and carry_index < len(outputs)
+        and outputs[carry_index] is placeholders[carry_index]
+    )
 
 
 def fold_stacked_carry_layout(node: Any, trip_count: Any) -> bool:
@@ -232,10 +309,7 @@ def _transplant_buffer_registrations(
     does not delegate lookups to its .parent, so leaving this unpatched
     means every downstream V.graph.get_buffer(name)/get_operation(name) call
     against the spliced ops (e.g. coarse_tile.py's read-copy planning) fails
-    with "Failed to find buffer/operation matching name ...", confirmed
-    empirically: splicing alone (without this) raises exactly that
-    RuntimeError from _full_buffer_read_deps the first time
-    coarse_tile_pre_stickify inspects a spliced op's reads.
+    with "Failed to find buffer/operation matching name ...".
 
     Only copies the dict/list entries this bridge and its callers are known
     to read (name_to_buffer/buffers/name_to_op) -- not a general graph
@@ -261,8 +335,7 @@ def _substitute_direct_input_refs(
 
     Ops without an `inner_fn` (DynamicScalar, ExternKernelOut, ...) hold
     their reads as direct Python object references in `.inputs`, not as
-    named index-expression loads -- confirmed empirically for both
-    split_m_fn and split_k_fn: DynamicScalar.inputs[0] is always the
+    named index-expression loads: DynamicScalar.inputs[0] is always the
     body's own iteration-carry placeholder object, and ExternKernelOut's
     per-tile operand input is either the placeholder object itself or a
     frozen ReinterpretView/mutable StorageBox wrapping it. Renaming a dict
@@ -273,17 +346,15 @@ def _substitute_direct_input_refs(
     ComputedBuffer with a MutationLayoutSHOULDREMOVE layout holds its
     mutation target as a direct object reference on `op.layout.target`
     (set once in Layout.__init__ and never renamed) -- not in `.inputs`,
-    not a named ops.load. Confirmed via test_map_mode_split_m
-    (issue #3965): a body-internal constant_pad_nd/copy pair targets the
-    body's own per-tile-invariant operand placeholder
-    (while_loop_body_graph_0_0_arg1_1, Y's map-mode carry), which after
-    splicing is never registered in the outer graph's buffer namespace --
-    V.graph.get_buffer(target_name) in propagate_layouts.py's mutation-op
-    handling then raises "Failed to find buffer matching name ...". Patch
-    op.layout.target in place the same way as an `.inputs` entry (one level
-    of StorageBox unwrapping included) so it resolves to the real
-    outer-graph object splice_while_loop already computed, exactly as
-    `.inputs` entries do.
+    not a named ops.load. E.g. a body-internal constant_pad_nd/copy pair
+    can target the body's own per-tile-invariant operand placeholder (a
+    map-mode carry), which after splicing is never registered in the outer
+    graph's buffer namespace -- V.graph.get_buffer(target_name) in
+    propagate_layouts.py's mutation-op handling then raises "Failed to find
+    buffer matching name ...". Patch op.layout.target in place the same way
+    as an `.inputs` entry (one level of StorageBox unwrapping included) so
+    it resolves to the real outer-graph object splice_while_loop already
+    computed, exactly as `.inputs` entries do.
 
     ref_map maps a placeholder buffer's own name to the real object it
     should resolve to (a carry's scratch buffer, or the real outer-graph
@@ -308,8 +379,8 @@ def _substitute_direct_input_refs(
     the outer graph's buffer namespace once this splice completes -- so
     `carry_bindings_for`/`splice_while_loop`, run against the inner loop on
     the next fixed-point pass, would resolve a stale placeholder name and
-    crash downstream (`Failed to find buffer matching name ...`) the same
-    way Bug A/Bug B did for the shapes above. Patch both lists in place,
+    crash downstream (`Failed to find buffer matching name ...`), same as
+    the `.inputs`/`.layout.target` shapes above. Patch both lists in place,
     same substitution rule as `.inputs`.
 
     Whole-object substitution (rebinding a list slot or `.layout.target`
@@ -325,18 +396,15 @@ def _substitute_direct_input_refs(
     Substituting the whole `ReinterpretView` object away, as a naive
     `resolve(node) is not None` check would do, silently discards that
     slice/offset and hands consumers the placeholder's raw, untiled layout
-    instead -- confirmed empirically via test_map_mode_split_m: doing so
-    produces a MutationLayoutSHOULDREMOVE target whose real_layout() delivers
-    the untiled buffer's layout while the mutation op's own store still
-    computes indices against the tile's small `[2, 6]` iteration domain,
-    which resolves handles fine (real_layout()/stride still work -- the
-    layout is well-formed) but is simply the wrong slice; the *actual*
-    crash this produces downstream is even more direct: some other
-    call reads `layout.target`'s stride expecting the tile's own FixedLayout
-    and instead unwraps all the way down to the InputBuffer, whose
-    FixedLayout's stride/size mismatches what `_fixed_indexer` was closed
-    over. So: only replace whole-node when the node has no distinguishing
-    layout of its own (a bare StorageBox/InputBuffer/TensorBox pass-through);
+    instead: a MutationLayoutSHOULDREMOVE target's real_layout() would then
+    deliver the untiled buffer's layout while the mutation op's own store
+    still computes indices against the tile's own small iteration domain --
+    a well-formed but wrong-slice layout, which surfaces downstream as a
+    stride/size mismatch wherever a consumer's `_fixed_indexer` was closed
+    over the tile's own FixedLayout but the unwrap chain now bottoms out at
+    the InputBuffer's untiled one instead. So: only replace whole-node when
+    the node has no distinguishing layout of its own (a bare
+    StorageBox/InputBuffer/TensorBox pass-through);
     for a ReinterpretView (or any node whose own `.data` is a StorageBox
     still pointing at the placeholder), unwrap one level and patch the
     inner StorageBox's `.data` in place instead, leaving the ReinterpretView
@@ -364,11 +432,11 @@ def _substitute_direct_input_refs(
             if inner_replacement is not None:
                 # inner_replacement resolves from ref_map, whose values are
                 # whatever object shape while_op.carried_inputs/inputs held
-                # (confirmed empirically: a TensorBox(StorageBox(...))
-                # MutableBox, same as any other real graph value) -- but
-                # StorageBox.data must hold the innermost real node (a
-                # Buffer/View/Loops), never another MutableBox, or
-                # consumers that expect exactly one level of box
+                # -- typically a TensorBox(StorageBox(...)) MutableBox, same
+                # as any other real graph value -- but StorageBox.data must
+                # hold the innermost real node (a Buffer/View/Loops), never
+                # another MutableBox, or consumers that expect exactly one
+                # level of box
                 # (unwrap_views's own MutableBox arm recurses fine, but
                 # make_indexer()/get_layout() chains built before this
                 # point were not written expecting a double-boxed shape).
@@ -446,10 +514,10 @@ def _extra_readers_of_placeholder(
     in body_ops's topological order and still read placeholder_name are
     real hazards.
 
-    Uses op.get_read_writes() rather than hand-parsing inner_fn/.inputs --
-    confirmed to correctly surface both read shapes (named ops.load calls
-    and DynamicScalar/ExternKernelOut's direct object-reference inputs)
-    uniformly for every op kind seen in every fixture so far.
+    Uses op.get_read_writes() rather than hand-parsing inner_fn/.inputs, so
+    both read shapes (named ops.load calls and DynamicScalar/
+    ExternKernelOut's direct object-reference inputs) surface uniformly
+    regardless of op kind.
 
     get_read_writes() is not guaranteed to succeed for every Operation
     subclass that can appear in a spliced while-loop body -- e.g.
@@ -630,10 +698,9 @@ def _rewire_accumulator_output(
     ``graph.graph_outputs`` (or any downstream op) actually holds, since the
     ``WhileLoop`` itself has a ``MultiOutputLayout`` and is never read
     directly. ``splice_while_loop`` drops those children right after this
-    runs, so anything still pointing at one would dangle: for
-    ``split_k_fn``, that is precisely how ``graph_outputs`` ended up naming
-    a removed ``buf9``, producing a wrapper with an empty body and a
-    ``NameError`` at runtime.
+    runs, so anything still pointing at one would dangle: a
+    ``graph_outputs`` entry naming a removed buffer produces a wrapper with
+    an empty body and a ``NameError`` at runtime.
 
     Returns ``body_ops`` (possibly with the rewritten op substituted in
     place, preserving order).
@@ -695,7 +762,9 @@ def _rewire_accumulator_output(
 
 
 def _repoint_refs_to_buffer(
-    graph: "GraphLowering", old_name: str, new_buf: Any
+    graph: "GraphLowering",
+    old_name: str,
+    new_buf: Any,
 ) -> None:
     """Point graph outputs (and any op input) naming old_name at new_buf.
 
@@ -799,7 +868,7 @@ def splice_while_loop(
     redirect that no buffer was ever materialized under).
 
     So the read side is handled per carry shape, distinguishing two cases by
-    identity (confirmed against both split_m_fn and split_k_fn):
+    identity:
 
     - Pass-through carry: body_output IS the placeholder object itself
       (the body never rewrites this carry -- e.g. a per-tile xs leaf
@@ -826,12 +895,13 @@ def splice_while_loop(
     ExternKernelOut hold direct Python object references to the
     placeholder buffer in `.inputs` (object-based -- handled by
     _substitute_direct_input_refs, since no name_map rename can reach a
-    held object reference). Confirmed empirically (both fixtures): every
-    mutated-carry placeholder is read exclusively via inner_fn/ops.load;
-    direct .inputs references only ever target pass-through carries (and,
-    for split_k_fn's counter carry, both shapes read the same placeholder
-    simultaneously) -- so both maps are populated for every carry
-    regardless of shape, rather than assuming shape predicts read kind.
+    held object reference). A mutated-carry placeholder is read exclusively
+    via inner_fn/ops.load; direct .inputs references only ever target
+    pass-through carries, and a single carry can be read by both shapes at
+    once (e.g. a counter carry read both by an inner_fn load and by a
+    DynamicScalar's direct input) -- so both maps are populated for every
+    carry regardless of shape, rather than assuming shape predicts read
+    kind.
 
     Returns the spliced body ops (graph.operations, still in topological
     order) so the caller can build a coarse-tile (ops, levels) group from
@@ -856,9 +926,20 @@ def splice_while_loop(
             # this function's docstring. The read side still resolves to the
             # real buffer below, exactly as for a pass-through carry, since
             # the spliced body reads the same object it writes.
-            if trip_count is not None and not fold_stacked_carry_layout(
-                real_input, trip_count
-            ):
+            #
+            # A caller can mark a carry stacking (carry_bindings_for's
+            # stacking_indices) independently of what trip_count it passes
+            # here -- the two APIs don't couple them. Without trip_count the
+            # fold can't even be attempted, so the destination is left in its
+            # unfolded [trip, *tile] shape with no fold and no diagnostic:
+            # any outside consumer expecting the flat shape silently reads
+            # a wrong-shaped buffer. Raise instead of letting that happen.
+            if trip_count is None:
+                raise Unsupported(
+                    f"stacking carry {binding.carry_index} ({real_name}) "
+                    f"requires a trip_count to fold its layout; got None"
+                )
+            if not fold_stacked_carry_layout(real_input, trip_count):
                 logger.debug(
                     "splice_while_loop: carry %d (%s) marked stacking but its "
                     "layout is not a foldable [trip, *tile] shape; leaving it "
@@ -871,7 +952,9 @@ def splice_while_loop(
             continue
 
         body_output_name = getattr(binding.body_output, "get_name", lambda: None)()
-        is_passthrough = body_output_name == placeholder_name
+        is_passthrough = body_output_name == placeholder_name or (
+            _body_fx_carry_is_passthrough(while_op, binding.carry_index)
+        )
         if body_output_name is not None and not is_passthrough:
             # Real per-iteration rewrite of an ACCUMULATOR carry. Redirect
             # its write in place into the carry's own initial buffer, so the
@@ -886,13 +969,10 @@ def splice_while_loop(
             #           trip, so outside consumers read it directly (see
             #           _rewire_accumulator_output's graph-output patching)
             #
-            # This replaces an earlier redirect to `scratch_name`, a name no
-            # buffer was ever materialized under: the write kept its own
-            # (now unread) name, nothing consumed it, and the whole group
-            # DCE'd away leaving a wrapper whose `return (buf9,)` named a
-            # buffer that no longer existed. scratch_name is retained on
-            # CarryBinding as the identity a future multi-buffer carry
-            # scheme can build on, but is no longer what the rewrite targets.
+            # scratch_name is retained on CarryBinding as the identity a
+            # future multi-buffer carry scheme can build on, but is not
+            # what the rewrite below targets -- the write goes straight
+            # into the carry's own initial buffer instead.
             #
             # The in-place write below aliases this carry's new value onto
             # its own initial buffer -- correct for PyTorch's while_loop
@@ -919,7 +999,11 @@ def splice_while_loop(
                     body_ops,
                 )
             body_ops = _rewire_accumulator_output(
-                graph, while_op, binding, body_ops, real_input
+                graph,
+                while_op,
+                binding,
+                body_ops,
+                real_input,
             )
 
         # Read side always resolves to the real, already-registered initial
@@ -967,14 +1051,11 @@ def splice_while_loop(
     # place -- its ReinterpretView is already correct with no patching
     # needed (see this docstring's opening paragraph).
     #
-    # Verified against a live compiled graph (split_k_fn, which has a real
-    # carry): each such child is an ir.MultiOutput ExternKernel whose own
-    # `.inputs[0] is while_op` -- that is the real linkage, confirmed by
-    # object identity, not by any `_while_loop_parent` attribute (no such
-    # attribute exists anywhere on the real IR; the placeholder predicate
-    # this replaced was therefore a no-op that removed nothing). MutationOutput
-    # is a Buffer, not an Operation, and so can never appear in
-    # graph.operations at all -- only MultiOutput needs handling here.
+    # Each such child is an ir.MultiOutput ExternKernel whose own
+    # `.inputs[0] is while_op` -- that object identity is the real linkage;
+    # no `_while_loop_parent` attribute exists anywhere on the real IR.
+    # MutationOutput is a Buffer, not an Operation, and so can never appear
+    # in graph.operations at all -- only MultiOutput needs handling here.
     graph.operations = [
         op
         for op in graph.operations

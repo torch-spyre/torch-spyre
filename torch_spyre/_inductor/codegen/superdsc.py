@@ -841,8 +841,9 @@ def _avgpool_sdsc_fields(iteration_space: dict, pool_params: dict) -> dict:
     # which the pipeline squeezes out (so its label was already dropped by
     # _align_pool_dim_labels).  Such an axis is a plain pass-through: emitting a
     # paddingSizes_/windowDim_ entry for it would reference a dim the SDSC no
-    # longer has, and dxp_standalone aborts with "Missing window size for padded
-    # size calculation".  So skip any axis whose window dim is absent.
+    # longer has, which the backend rejects -- dxp_standalone aborted with
+    # "Missing window size for padded size calculation".  So skip any axis whose
+    # window dim is absent.
     axes = [
         ("i", "ki", kH, sH, pH),
         ("j", "kj", kW, sW, pW),
@@ -1328,11 +1329,12 @@ def _create_sdsc_tensors(
             # appear in x's layout with scale=-1 (reduced_dim).
             #
             # M=1 (coarse-tiling GEMV): N leaks into x's physical dep index,
-            # so x_dim_order already contains y_stick (N).  DXP computes x's
-            # reuse dim by set-subtraction (KERNEL - INPUT); if N is in both,
-            # the result is empty and DXP asserts inp0_reuse_dim.size() == 1.
-            # Strip N from x's layout so INPUT stays K-only and DXP correctly
-            # identifies N as x's broadcast dim.
+            # so x_dim_order already contains y_stick (N).  The backend
+            # computes x's reuse dim by set-subtraction (KERNEL - INPUT); if N is
+            # in both, the result is empty and the backend asserts
+            # inp0_reuse_dim.size() == 1.  Strip N from x's layout so INPUT stays
+            # K-only and the backend correctly identifies N as x's broadcast
+            # dim.
             # Partition matmul_x_reuse_dims into two mutually exclusive,
             # exhaustive subsets based on membership in x's current dim_order.
             x_dim_order_set = set(dim_order)

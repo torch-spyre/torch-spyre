@@ -1,49 +1,38 @@
--- vLLM benchmark results in upstream pytorch/test-infra's `oss_ci_benchmark_v3` shape, plus
--- the dropdown table upstream derives from it.
+-- vLLM benchmark results in upstream pytorch/test-infra's `oss_ci_benchmark_v3` shape, plus the
+-- dropdown table upstream derives from it.
 --
--- WHY THIS SHAPE. vLLM perf reaches us through vLLM's own bench harness, so the record shape
--- is an upstream contract we do not control. Matching it is what lets the PyTorch HUD read
--- our numbers with no query changes, with only the DATABASE redirected.
+-- WHY THIS SHAPE. Matching upstream's record shape (an upstream contract we don't control) is
+-- what lets the PyTorch HUD read our numbers with no query changes, only the DATABASE redirected.
 --
--- THE TABLE NAMES ARE LOAD-BEARING. The HUD resolves these tables in TypeScript, not only in
--- its .sql files, and its CLICKHOUSE_BENCHMARK_DATABASE setting redirects the database while
--- keeping the names. They must be spelled `oss_ci_benchmark_v3` and
--- `oss_ci_benchmark_metadata`, and must be real MergeTree tables: exposing the names as plain
--- VIEWs fails with "Code 182: Storage View does not support PREWHERE", because upstream's
--- metadata query builder emits one. That failure is partial and so easy to misread -- the
--- saved .sql queries carry no PREWHERE and keep working, so only the dropdowns break.
+-- THE TABLE NAMES ARE LOAD-BEARING. The HUD resolves `oss_ci_benchmark_v3` and
+-- `oss_ci_benchmark_metadata` in TypeScript, and they must be real MergeTree tables: exposing
+-- them as plain VIEWs fails with "Code 182: Storage View does not support PREWHERE" on
+-- upstream's metadata query builder -- a partial failure where only the dropdowns break.
 --
--- FED BY MATERIALIZED VIEW, NOT A SECOND INSERT. benchmark_runs is the one written perf fact
--- and both tables here are projections of it. An MV's target is a real table, satisfying the
--- PREWHERE constraint above while keeping a single source of truth and a single insert.
+-- FED BY MATERIALIZED VIEW, NOT A SECOND INSERT: benchmark_runs is the one written perf fact,
+-- and an MV's target being a real table satisfies the PREWHERE constraint above while keeping
+-- one source of truth.
 --
--- WHAT WE ADD. `run_id` is ours, not upstream's. Upstream has no artifact concept -- its
--- `dependencies` Map is a provenance hint, not a content identity -- so an upstream-shaped
--- table alone cannot join artifact_results. This one column is the difference between
--- HUD-compatible and HUD-compatible-and-joinable.
+-- WHAT WE ADD. `run_id` is ours, not upstream's -- upstream has no artifact concept, so an
+-- upstream-shaped table alone cannot join artifact_results.
 --
--- MVs FIRE ON INSERT ONLY, so these tables cannot be rebuilt from rows already in
--- benchmark_runs; a definition change means re-inserting. Upstream ships a backfill INSERT
--- beside its own MV for this reason, and the same recipe applies here.
+-- MVs FIRE ON INSERT ONLY, so a definition change means re-inserting (upstream's own recipe: a
+-- backfill INSERT beside the MV).
 
 -- ── upstream's record table ─────────────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS oss_ci_benchmark_v3
 (
     -- Our join key: uuid5(NS, "{source}|{external_run_id}|{arch}|{test_type}"), the same value
-    -- artifact_results.run_id carries. On the Jenkins path params.RUN_ID is already this uuid
-    -- -- pass it verbatim; re-hashing it mints a third identity that joins to nothing.
+    -- artifact_results.run_id carries; on Jenkins, params.RUN_ID is already this uuid.
     run_id         UUID,
 
-    -- SECONDS, not milliseconds. Every upstream query reads this with toUnixTimestamp() /
-    -- fromUnixTimestamp() and no intDiv, so milliseconds put every row centuries in the future
-    -- and each query silently returns nothing.
+    -- SECONDS, not milliseconds: every upstream query reads this with toUnixTimestamp(), no intDiv.
     timestamp      Int64,
     schema_version LowCardinality(String) DEFAULT 'v3',
 
-    -- A REGISTERED benchmark id, not the benchmark's own name: the HUD routes
-    -- /benchmark/v3/dashboard/<id> against this and refuses an unregistered one, so a
-    -- per-benchmark name makes the dashboard unreachable. The real name travels in
-    -- benchmark.extra_info['benchmark_name'].
+    -- A REGISTERED benchmark id, not the benchmark's own name -- the HUD routes
+    -- /benchmark/v3/dashboard/<id> against this and refuses an unregistered one; the real name
+    -- travels in benchmark.extra_info['benchmark_name'].
     name           String,
 
     repo           LowCardinality(String),
@@ -53,12 +42,9 @@ CREATE TABLE IF NOT EXISTS oss_ci_benchmark_v3
     run_attempt    UInt32 DEFAULT 0,
     job_id         Int64 DEFAULT 0,
 
-    -- Upstream's full 11-field tuple. The GPU fields are empty for a Spyre run, but trimming
-    -- them breaks upstream's own metadata MV, which reads runners[1].'cpu_info' as an arch
-    -- fallback. Carrying unused fields is the cost of reading upstream's queries unmodified.
-    -- runners[1] is (name = DEVICE, type = ARCH): upstream's MV and its _llms query both read
-    -- it that way and the dashboard filters on device=/arch=, so swapping the two empties the
-    -- page with no error.
+    -- Upstream's full 11-field tuple; GPU fields are empty for a Spyre run, but trimming them
+    -- breaks upstream's metadata MV, which reads runners[1] as (name=DEVICE, type=ARCH) for its
+    -- arch fallback -- carrying unused fields is the cost of reading upstream's queries unmodified.
     runners        Array(Tuple(
                        name String, type String, cpu_info String, cpu_count UInt32,
                        mem_info String, avail_mem_in_gb UInt32, gpu_info String,
@@ -67,8 +53,7 @@ CREATE TABLE IF NOT EXISTS oss_ci_benchmark_v3
                    )),
 
     -- extra_info carries the keys the HUD reads by name: device, arch, hardware_type,
-    -- use_compile, and `args` as a JSON STRING it JSONExtracts tensor_parallel_size /
-    -- input_len / output_len out of.
+    -- use_compile, and `args` as a JSON STRING it JSONExtracts tensor_parallel_size/input_len/output_len from.
     benchmark      Tuple(name String, mode String, dtype String,
                          extra_info Map(String, String)),
     model          Tuple(name String, type String, backend String, origins Array(String),
@@ -78,22 +63,20 @@ CREATE TABLE IF NOT EXISTS oss_ci_benchmark_v3
                                      extra_info Map(String, String))),
 
     -- An array because a metric measured n times is n values: the HUD computes both an
-    -- arithmetic and a geometric mean, which can only differ if the samples survive.
+    -- arithmetic and a geometric mean.
     metric         Tuple(name String, benchmark_values Array(Float32), target_value Float32,
                          extra_info Map(String, String))
 )
 ENGINE = MergeTree()
 PARTITION BY toYYYYMM(toDateTime(timestamp))
--- Upstream's sort key, kept: this table exists to serve upstream's time-series scan, and its
--- queries filter on the time window first. Reads by run go to benchmark_runs instead.
+-- Upstream's sort key, kept: this table serves upstream's time-window scan; reads by run go to benchmark_runs.
 ORDER BY (timestamp, head_branch, head_sha, workflow_id, job_id);
 
--- One row per (benchmark run, metric): benchmark_runs holds a metric->samples Map, and the HUD
--- wants one row per metric, so the Map is fanned out here.
+-- One row per (benchmark run, metric): benchmark_runs holds a metric->samples Map, fanned out
+-- here since the HUD wants one row per metric.
 --
 -- The props this reads (repo, head_branch, head_sha, workflow_id, arch, hardware_type) must be
--- written onto benchmark_runs by the ingest, not re-derived here: this view cannot see the CI
--- coordinates, and guessing them would put a wrong commit on a chart.
+-- written onto benchmark_runs by the ingest: this view cannot see the CI coordinates itself.
 CREATE MATERIALIZED VIEW IF NOT EXISTS oss_ci_benchmark_v3_mv TO oss_ci_benchmark_v3 AS
 SELECT
     r.run_id                               AS run_id,
@@ -143,9 +126,9 @@ ARRAY JOIN arrayZip(mapKeys(r.measurements), mapValues(r.measurements)) AS m
 WHERE r.component = 'spyre-inference';
 
 -- ── upstream's dropdown table, its own definition ───────────────────────────────────────────
--- Exists to keep oss_ci_benchmark_names / _branches fast, and it is where the PREWHERE lands.
--- Copied from upstream's oss_ci_benchmark_v3_materialized_views/schema.sql; the only change is
--- dropping the replicated-engine arguments, which a single-node server does not take.
+-- Keeps oss_ci_benchmark_names/_branches fast, and is where the PREWHERE lands. Copied from
+-- upstream's oss_ci_benchmark_v3_materialized_views/schema.sql, minus the replicated-engine args
+-- a single-node server does not take.
 CREATE TABLE IF NOT EXISTS oss_ci_benchmark_metadata
 (
     repo            String,

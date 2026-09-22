@@ -53,6 +53,26 @@ frontend_pool_allocation: bool = os.getenv("FRONTEND_POOL_ALLOCATION", "0").lowe
     "yes",
 )
 
+
+def pool_allocated_by_frontend() -> bool:
+    """Whether the front end, rather than the backend, allocates a kernel's pool.
+
+    A choice on the SDSC path, where both mechanisms exist, and not one on the
+    KTIR path: a KTIR kernel is a bare ``module { func.func }`` with no
+    ``sdscbundle`` wrapper for ``device_mem_allocate`` to live in, so the pool can
+    only arrive as a parameter the wrapper fills. Implied there rather than asked
+    for, so that a pooled intermediate needs no flag to be emittable.
+
+    Read through this function, not off ``frontend_pool_allocation``, by whoever
+    decides to pass a pool or to give the signature a slot for one -- the two must
+    agree, and they agree by both asking here.
+    """
+    # ``install_config_module`` below moves these names onto a wrapper object, so
+    # they are attributes of this module and not globals of this function.
+    cfg = sys.modules[__name__]
+    return bool(cfg.frontend_pool_allocation or cfg.ktir_emitter)
+
+
 # Emit a native conv2d SDSC (opFuncName="conv2d" on the "pt" unit) instead of
 # the im2col+matmul decomposition (conv2d_via_bmm_decomp). Off by default: the
 # decomposition remains the default path and the fallback for cases the direct
@@ -104,21 +124,23 @@ lx_solver_relayout_groups_per_edge: int = int(
     os.getenv("SPYRE_LX_SOLVER_RELAYOUT_GROUPS_PER_EDGE", "4")
 )
 
-# For unpriced CP-SAT solves, skip presolve above this many relayout copies.
-# Priced relayout solves already skip it regardless of count. One of CP-SAT's
-# presolve passes scales super-linearly in the number of free copy residency
-# literals (measured on the spyre_attn decode
-# graph: 16 copies 5 s, 64 copies 13 s, 160 copies 40 s, 312 copies past the
-# solve budget) and no exposed parameter shortens it, while search on the raw
-# model finds a feasible plan within seconds. 0 disables this count threshold.
+# Skip CP-SAT's presolve above this many free relayout copies in one solve;
+# 0 (the default) never skips it, priced or not. Presolve once scaled
+# super-linearly in the number of free copy residency literals (measured on the
+# spyre_attn decode graph: 16 copies 5 s, 64 copies 13 s, 160 copies 40 s, 312
+# copies past the solve budget). Constant-binding single-division copies and
+# the cost printer's lin_max proxy variables removed that cost, and a priced
+# model searched without presolve can exhaust memory in the LNS workers. Kept
+# as an escape hatch for a graph where presolve still outlives the time limit.
 lx_solver_relayout_presolve_max_copies: int = int(
     os.getenv("SPYRE_LX_SOLVER_RELAYOUT_PRESOLVE_MAX_COPIES", "0")
 )
 
-# Submit independent DXP kernel compilations to Inductor's subprocess pool and
-# resolve them together at the generated wrapper's async_compile.wait() barrier.
-# This is opt-in while the parallel path is evaluated on full model compiles.
-async_dxp_compile: bool = os.getenv("SPYRE_ASYNC_DXP_COMPILE", "0").lower() in (
+# Submit independent backend-compiler kernel compilations to Inductor's
+# subprocess pool and resolve them together at the generated wrapper's
+# async_compile.wait() barrier. This is opt-in while the parallel path is
+# evaluated on full model compiles.
+async_backend_compile: bool = os.getenv("SPYRE_ASYNC_BACKEND_COMPILE", "0").lower() in (
     "1",
     "true",
     "yes",

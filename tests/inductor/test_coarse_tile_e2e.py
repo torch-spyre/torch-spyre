@@ -63,7 +63,7 @@ from torch_spyre._inductor import spyre_hint
 import torch_spyre._inductor.wsr.propagate_named_dims as _pnd
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__)))
-from utils_inductor import compare_with_cpu, _compile_and_run  # noqa: E402
+from utils_inductor import mock_backend_compiler, compare_with_cpu, _compile_and_run  # noqa: E402
 
 _declare_tensor_dim = _pnd.declare_tensor_dim
 _name_tensor_dims = _pnd.name_tensor_dims
@@ -191,7 +191,7 @@ def run_coarse_tile_test(
         with (
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
-            mock_patch("torch_spyre.execution.async_compile.subprocess.run"),
+            mock_backend_compiler(),
         ):
             _, source_codes = run_and_get_code(torch.compile(fn), *dev_tensors)
 
@@ -3607,7 +3607,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         with (
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
-            mock_patch("subprocess.run"),
+            mock_backend_compiler(),
         ):
             _, source_codes = run_and_get_code(cfn, x)
         self.assertTrue(len(source_codes) > 0)
@@ -3639,7 +3639,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         with (
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
-            mock_patch("subprocess.run"),
+            mock_backend_compiler(),
         ):
             _, source_codes = run_and_get_code(cfn, x_dev)
         self.assertTrue(len(source_codes) > 0)
@@ -3674,7 +3674,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         with (
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
-            mock_patch("subprocess.run"),
+            mock_backend_compiler(),
             mock_patch(
                 "torch_spyre._inductor.read_copy_elision._per_core_view_on_buf",
                 side_effect=[
@@ -3747,7 +3747,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         with (
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
-            mock_patch("subprocess.run"),
+            mock_backend_compiler(),
         ):
             _, source_codes = run_and_get_code(cfn, x_dev)
         self.assertTrue(len(source_codes) > 0)
@@ -3816,7 +3816,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         with (
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
-            mock_patch("subprocess.run"),
+            mock_backend_compiler(),
         ):
             _, source_codes = run_and_get_code(cfn, a_dev, b_dev, c_dev)
         self.assertTrue(len(source_codes) > 0)
@@ -3902,7 +3902,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         with (
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
-            mock_patch("subprocess.run"),
+            mock_backend_compiler(),
         ):
             _, source_codes = run_and_get_code(cfn, x_dev, y_dev)
         self.assertTrue(len(source_codes) > 0)
@@ -3951,7 +3951,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         with (
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
-            mock_patch("subprocess.run"),
+            mock_backend_compiler(),
         ):
             _, source_codes = run_and_get_code(cfn, x_dev, y_dev)
         self.assertTrue(len(source_codes) > 0)
@@ -3996,7 +3996,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         with (
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
-            mock_patch("subprocess.run"),
+            mock_backend_compiler(),
         ):
             _, source_codes = run_and_get_code(cfn, x_dev)
         self.assertTrue(len(source_codes) > 0)
@@ -4053,7 +4053,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         with (
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
-            mock_patch("subprocess.run"),
+            mock_backend_compiler(),
         ):
             _, source_codes = run_and_get_code(cfn, x_dev)
         src = source_codes[0]
@@ -4119,7 +4119,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         with (
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
-            mock_patch("subprocess.run"),
+            mock_backend_compiler(),
         ):
             _, source_codes = run_and_get_code(cfn, x_dev, y_dev)
         self.assertTrue(len(source_codes) > 0)
@@ -4168,7 +4168,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         with (
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
-            mock_patch("subprocess.run"),
+            mock_backend_compiler(),
         ):
             _, source_codes = run_and_get_code(cfn, x_dev, scale_dev)
         self.assertTrue(len(source_codes) > 0)
@@ -4375,7 +4375,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         with (
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
-            mock_patch("subprocess.run"),
+            mock_backend_compiler(),
         ):
             _, source_codes = run_and_get_code(cfn, x_dev, y_dev)
         self.assertTrue(len(source_codes) > 0)
@@ -4462,7 +4462,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         with (
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
-            mock_patch("subprocess.run"),
+            mock_backend_compiler(),
             pytest.raises(Exception, match="partial reduction result consumed before"),
         ):
             run_and_get_code(cfn, queries_dev, keys_dev, values_dev)
@@ -4502,7 +4502,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         with (
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
-            mock_patch("subprocess.run"),
+            mock_backend_compiler(),
         ):
             _, source_codes = run_and_get_code(cfn, x_dev)
         self.assertTrue(len(source_codes) > 0)
@@ -4622,7 +4622,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         with (
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
-            mock_patch("subprocess.run"),
+            mock_backend_compiler(),
         ):
             _, source_codes = run_and_get_code(
                 cfn, queries_dev, keys_dev, values_dev, mask_dev
@@ -4716,7 +4716,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         with (
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
-            mock_patch("subprocess.run"),
+            mock_backend_compiler(),
         ):
             _, source_codes = run_and_get_code(cfn, Q_dev, V_dev)
 
@@ -5118,7 +5118,7 @@ class TestNamedDimsHint(InductorTestCase):
         with (
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
-            mock_patch("subprocess.run"),
+            mock_backend_compiler(),
         ):
             _, source_codes = run_and_get_code(cfn, x_dev)
         self.assertTrue(len(source_codes) > 0)
@@ -5147,7 +5147,7 @@ class TestNamedDimsHint(InductorTestCase):
         with (
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
-            mock_patch("subprocess.run"),
+            mock_backend_compiler(),
         ):
             _, source_codes = run_and_get_code(cfn, x_dev)
         self.assertTrue(len(source_codes) > 0)
@@ -5182,7 +5182,7 @@ class TestNamedDimsHint(InductorTestCase):
         with (
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
-            mock_patch("subprocess.run"),
+            mock_backend_compiler(),
         ):
             _, source_codes = run_and_get_code(cfn, x_dev)
         self.assertTrue(len(source_codes) > 0)
@@ -5223,7 +5223,7 @@ class TestCoarseTileReductionE2E(InductorTestCase):
         with (
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
-            mock_patch("subprocess.run"),
+            mock_backend_compiler(),
         ):
             _, source_codes = run_and_get_code(cfn, x_dev)
         self.assertTrue(len(source_codes) > 0)
@@ -5271,7 +5271,7 @@ class TestCoarseTileReductionE2E(InductorTestCase):
         with (
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
-            mock_patch("subprocess.run"),
+            mock_backend_compiler(),
         ):
             _, source_codes = run_and_get_code(cfn, a_dev, b_dev)
         self.assertTrue(len(source_codes) > 0)
@@ -5319,7 +5319,7 @@ class TestCoarseTileReductionE2E(InductorTestCase):
         with (
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
-            mock_patch("subprocess.run"),
+            mock_backend_compiler(),
         ):
             _, source_codes = run_and_get_code(cfn, x_dev)
         self.assertTrue(len(source_codes) > 0)
@@ -5362,7 +5362,7 @@ class TestCoarseTileReductionE2E(InductorTestCase):
         with (
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
-            mock_patch("subprocess.run"),
+            mock_backend_compiler(),
         ):
             _, source_codes = run_and_get_code(cfn, x_dev)
         self.assertTrue(len(source_codes) > 0)
@@ -5849,7 +5849,7 @@ class TestCoarseTileMatmulKTilingE2E(InductorTestCase):
         with (
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
-            mock_patch("subprocess.run"),
+            mock_backend_compiler(),
         ):
             _, source_codes = run_and_get_code(cfn, a_dev, b_dev)
         self.assertTrue(len(source_codes) > 0)
@@ -5929,7 +5929,7 @@ class TestCoarseTileMoEBroadcastMatmulE2E(InductorTestCase):
         with (
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
-            mock_patch("subprocess.run"),
+            mock_backend_compiler(),
         ):
             _, source_codes = run_and_get_code(torch.compile(fn), x, w)
 
@@ -5996,7 +5996,7 @@ class TestCoarseTileMoEBroadcastMatmulE2E(InductorTestCase):
         with (
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
-            mock_patch("subprocess.run"),
+            mock_backend_compiler(),
             mock_patch(
                 "torch_spyre._inductor.read_copy_elision._prove_matmul_direct_read",
                 return_value=(None, "forced test decline"),
@@ -6032,7 +6032,7 @@ class TestCoarseTileMoEBroadcastMatmulE2E(InductorTestCase):
         with (
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
-            mock_patch("subprocess.run"),
+            mock_backend_compiler(),
             mock_patch(
                 "torch_spyre._inductor.read_copy_elision._loop_advance_bound",
                 return_value=(0, 8192),
@@ -6225,7 +6225,7 @@ class TestCoarseTileMoEBroadcastMatmulE2E(InductorTestCase):
         with (
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
-            mock_patch("subprocess.run"),
+            mock_backend_compiler(),
             mock_patch.object(superdsc, "_create_sdsc_tensors", side_effect=_spy),
         ):
             run_and_get_code(torch.compile(fn), x.to("spyre"), w.to("spyre"))
@@ -6359,7 +6359,7 @@ class TestCoarseTileNestedReductionE2E(InductorTestCase):
             ),
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
-            mock_patch("subprocess.run"),
+            mock_backend_compiler(),
         ):
             _, source_codes = run_and_get_code(torch.compile(fn), a, b)
 
@@ -6429,7 +6429,7 @@ class TestCoarseTileNestedReductionE2E(InductorTestCase):
         with (
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
-            mock_patch("subprocess.run"),
+            mock_backend_compiler(),
         ):
             _, source_codes = run_and_get_code(cfn, a_dev, b_dev)
         self.assertTrue(len(source_codes) > 0)
@@ -6463,7 +6463,7 @@ class TestCoarseTileNestedReductionE2E(InductorTestCase):
         with (
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
-            mock_patch("subprocess.run"),
+            mock_backend_compiler(),
         ):
             _, source_codes = run_and_get_code(cfn, a_dev, b_dev)
         self.assertTrue(len(source_codes) > 0)
@@ -6498,7 +6498,7 @@ class TestCoarseTileNestedReductionE2E(InductorTestCase):
         with (
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
-            mock_patch("subprocess.run"),
+            mock_backend_compiler(),
         ):
             _, source_codes = run_and_get_code(cfn, a_dev, b_dev)
         self.assertTrue(len(source_codes) > 0)
@@ -6543,7 +6543,7 @@ class TestCoarseTileNestedReductionE2E(InductorTestCase):
         with (
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
-            mock_patch("subprocess.run"),
+            mock_backend_compiler(),
         ):
             _, source_codes = run_and_get_code(cfn, a_dev, b_dev)
         self.assertTrue(len(source_codes) > 0)
