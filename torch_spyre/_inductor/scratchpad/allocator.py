@@ -2499,6 +2499,15 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                 reason = "indirect access entry split"
             elif _reads_offset_slice(op):
                 reason = "offset slice read"
+            elif is_restickify_op(op, graph) and hasattr(
+                op, "_read_copy_elision_record"
+            ):
+                # This restickify is a temporary fallback for a deferred
+                # direct graph-input read and is removed after LX planning.
+                # Its split therefore has no cost-model term for CP-SAT to
+                # optimize. Preserve the legal work-division choice instead
+                # of letting an unpriced menu choose an arbitrary split.
+                reason = "deferred direct graph-input read"
             elif (
                 not config.ignore_work_division_hints
                 and isinstance(op, ComputedBuffer)

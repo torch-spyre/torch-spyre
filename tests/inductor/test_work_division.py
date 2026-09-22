@@ -2141,6 +2141,48 @@ class TestCloneDivisionMatching(unittest.TestCase):
 
 
 class TestCoOptimizingAllocator(unittest.TestCase):
+    def test_deferred_direct_read_restickify_keeps_committed_division(self):
+        head, sequence = _isym("head"), _isym("sequence")
+        op = _computed_buffer((2, 128, 1024), name="direct_read_restickify")
+        op._read_copy_elision_record = MagicMock()
+        graph = MagicMock(operations=[op])
+        allocator = CoOptimizingAllocator(MagicMock(), size=1)
+        fixed = CoreDivision(splits={head: 2, sequence: 16})
+
+        with (
+            patch(
+                "torch_spyre._inductor.scratchpad.allocator."
+                "ops_in_offset_mutation_component",
+                return_value=set(),
+            ),
+            patch(
+                "torch_spyre._inductor.scratchpad.allocator._fused_layout_group_ops",
+                return_value={},
+            ),
+            patch(
+                "torch_spyre._inductor.scratchpad.allocator."
+                "_find_distinct_matmul_splits",
+                return_value=((), ()),
+            ),
+            patch(
+                "torch_spyre._inductor.scratchpad.allocator.is_restickify_op",
+                return_value=True,
+            ),
+            patch(
+                "torch_spyre._inductor.scratchpad.allocator._fixed_core_division",
+                return_value=fixed,
+            ),
+            patch(
+                "torch_spyre._inductor.scratchpad.allocator._split_option_is_legal",
+                return_value=True,
+            ),
+            patch.object(allocator, "_enumerate_core_divisions") as enumerate_divs,
+        ):
+            divisions = allocator._division_map(graph)
+
+        self.assertEqual(divisions[op.name], [fixed])
+        enumerate_divs.assert_not_called()
+
     def test_fixed_illegal_split_raises_unsupported(self):
         op = MagicMock(spec=ComputedBuffer, name="fixed_op")
         op.data = MagicMock(spec=Pointwise)

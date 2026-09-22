@@ -281,6 +281,7 @@ class ReadCopyElisionRecord:
     direct_squeezed_advance_per_level: (
         tuple[tuple[tuple[sympy.Expr, sympy.Expr], ...], ...] | None
     ) = None
+    orphaned_copy_names: tuple[str, ...] = ()
 
 
 @dataclass

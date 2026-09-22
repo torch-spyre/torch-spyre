@@ -745,6 +745,267 @@ class TestSpliceWhileLoops(unittest.TestCase):
                 "the full-cache exact-stride copy remained inside the loop",
             )
 
+    def test_nested_noncontiguous_input_materialization_streams_one_tile(self):
+        """Nested head/Lk maps compose into one direct graph-input read."""
+        from torch._inductor import ir
+        from torch._inductor.dependencies import MemoryDep
+        from torch._inductor.virtualized import V
+
+        from torch_spyre._inductor.wsr import for_each_tile
+        from torch_spyre._inductor.wsr.for_each_tile_lowering import (
+            _identity_load,
+            splice_while_loops,
+        )
+
+        def nested_tile_sequence(x):
+            x = x.contiguous()
+
+            def head_body(_, head_operands):
+                (x_head,) = head_operands
+
+                def sequence_body(_, sequence_operands):
+                    (x_tile,) = sequence_operands
+                    return None, x_tile * 2
+
+                _, head_out = for_each_tile(
+                    sequence_body,
+                    (x_head,),
+                    dims=(3,),
+                    tile_size=64,
+                    out_dim=3,
+                )
+                return None, head_out
+
+            _, out = for_each_tile(
+                head_body,
+                (x,),
+                dims=(0,),
+                tile_size=1,
+                out_dim=0,
+            )
+            return out
+
+        backing = torch.randn(4, 2, 1, 320, 128)
+        prefix = backing[:, :, :, :256, :]
+        graph = self._run_graph(nested_tile_sequence, (prefix,))
+        with V.set_graph_handler(graph):
+            splice_while_loops(graph)
+
+            identities = [
+                (op, identity)
+                for op in graph.operations
+                if isinstance(op, ir.ComputedBuffer)
+                and (identity := _identity_load(op)) is not None
+            ]
+            input_copies = [
+                (op, identity)
+                for op, identity in identities
+                if identity[0] in graph.graph_input_names
+            ]
+            self.assertEqual(len(input_copies), 1)
+            input_copy, (source_name, _source_index, _identity_indices) = input_copies[
+                0
+            ]
+
+            direct_readers = [
+                op
+                for op in graph.operations
+                if isinstance(op, ir.ComputedBuffer)
+                and hasattr(op, "_read_copy_elision_record")
+                and op._read_copy_elision_record.copy_name == input_copy.get_name()
+            ]
+            self.assertEqual(len(direct_readers), 1)
+            direct_reader = direct_readers[0]
+            direct_record = direct_reader._read_copy_elision_record
+            self.assertEqual(direct_record.copy_name, input_copy.get_name())
+            self.assertEqual(direct_record.source_name, source_name)
+
+            self.assertEqual(direct_reader.loop_info.loop_group_id, (0, 1))
+            self.assertEqual(
+                direct_record.direct_tiled_dims_per_level,
+                ((), ((3, 64),)),
+            )
+            self.assertEqual(
+                direct_record.direct_squeezed_advance_per_level,
+                (((81920, 1),), ()),
+            )
+            self.assertEqual(
+                direct_reader.loop_info.squeezed_advance_per_read,
+                [[[(65536, 1)], []]],
+            )
+
+            self.assertFalse(
+                any(
+                    op is not input_copy and identity[0] == input_copy.get_name()
+                    for op, identity in identities
+                ),
+                "an intermediate head-tile identity survived chain contraction",
+            )
+
+            direct_reads = [
+                dep
+                for dep in direct_reader.get_read_writes().reads
+                if isinstance(dep, MemoryDep) and dep.name == input_copy.get_name()
+            ]
+            self.assertEqual(len(direct_reads), 1)
+
+    def test_nested_invariant_input_materialization_streams_one_tile(self):
+        """An outer-invariant input can still advance in the inner loop."""
+        from torch._inductor import ir
+
+        from torch_spyre._inductor.wsr import for_each_tile
+        from torch_spyre._inductor.wsr.for_each_tile_lowering import (
+            _identity_load,
+            splice_while_loops,
+        )
+
+        def nested_tile_sequence(q, x):
+            x = x.contiguous()
+
+            def query_body(_, query_operands):
+                _q_tile, x_whole = query_operands
+
+                def sequence_body(_, sequence_operands):
+                    (x_tile,) = sequence_operands
+                    return None, x_tile * 2
+
+                _, sequence_out = for_each_tile(
+                    sequence_body,
+                    (x_whole,),
+                    dims=(3,),
+                    tile_size=64,
+                    out_dim=3,
+                )
+                return None, sequence_out + _q_tile
+
+            _, out = for_each_tile(
+                query_body,
+                (q, x),
+                dims=(0, None),
+                tile_size=1,
+                out_dim=0,
+            )
+            return out
+
+        backing = torch.randn(2, 1, 1, 320, 128)
+        prefix = backing[:, :, :, :256, :]
+        query = torch.randn(prefix.shape)
+        graph = self._run_graph(nested_tile_sequence, (query, prefix))
+        with V.set_graph_handler(graph):
+            splice_while_loops(graph)
+
+            identities = [
+                (op, identity)
+                for op in graph.operations
+                if isinstance(op, ir.ComputedBuffer)
+                and (identity := _identity_load(op)) is not None
+            ]
+            input_copies = [
+                (op, identity)
+                for op, identity in identities
+                if identity[0] in graph.graph_input_names
+                and list(op.layout.size) == [2, 1, 1, 256, 128]
+            ]
+            self.assertEqual(len(input_copies), 1)
+            input_copy, (source_name, _source_index, _identity_indices) = input_copies[
+                0
+            ]
+
+            direct_readers = [
+                op
+                for op in graph.operations
+                if isinstance(op, ir.ComputedBuffer)
+                and hasattr(op, "_read_copy_elision_record")
+                and op._read_copy_elision_record.copy_name == input_copy.get_name()
+            ]
+            self.assertEqual(len(direct_readers), 1)
+            direct_reader = direct_readers[0]
+            direct_record = direct_reader._read_copy_elision_record
+            self.assertEqual(direct_record.copy_name, input_copy.get_name())
+            self.assertEqual(direct_record.source_name, source_name)
+            self.assertEqual(direct_reader.loop_info.loop_group_id, (0, 1))
+            self.assertEqual(
+                direct_record.direct_tiled_dims_per_level,
+                ((), ((3, 64),)),
+            )
+            self.assertEqual(
+                direct_record.direct_squeezed_advance_per_level,
+                ((), ()),
+            )
+
+            self.assertFalse(
+                any(
+                    op is not input_copy and identity[0] == input_copy.get_name()
+                    for op, identity in identities
+                ),
+                "an intermediate sequence-tile identity survived chain contraction",
+            )
+
+    def test_identity_chain_loop_advance_proof_handles_outer_invariant(self):
+        import sympy
+        from torch._inductor import ir
+        from torch._inductor.dependencies import MemoryDep
+
+        from torch_spyre._inductor.loop_info import CoarseTileInfo
+        from torch_spyre._inductor.wsr.for_each_tile_lowering import (
+            _identity_chain_has_valid_loop_advances,
+        )
+
+        outer, inner, element = sympy.symbols(
+            "outer inner element", integer=True, nonnegative=True
+        )
+        producer = mock.Mock(
+            layout=ir.FixedLayout(
+                torch.device("cpu"),
+                torch.float32,
+                size=[2, 256],
+                stride=[256, 1],
+            )
+        )
+        reader = mock.Mock()
+        reader.get_name.return_value = "reader"
+        reader.loop_info = CoarseTileInfo(
+            loop_group_id=(0, 1),
+            loop_count=[2, 4],
+            loop_tiled_dims=[[], [0]],
+            tiled_dims_per_read=[[[], [(0, 64)]]],
+        )
+        graph = mock.Mock()
+        graph.try_get_buffer.side_effect = {"root": producer}.get
+        loop_by_group = {0: (outer, sympy.Integer(2)), 1: (inner, sympy.Integer(4))}
+
+        reader.get_read_writes.return_value = mock.Mock(
+            reads=[
+                MemoryDep(
+                    "root",
+                    64 * inner + element,
+                    (element,),
+                    (256,),
+                )
+            ]
+        )
+        self.assertTrue(
+            _identity_chain_has_valid_loop_advances(
+                graph, ["root"], reader, loop_by_group
+            )
+        )
+
+        reader.get_read_writes.return_value = mock.Mock(
+            reads=[
+                MemoryDep(
+                    "root",
+                    256 * outer + 64 * inner + element,
+                    (element,),
+                    (256,),
+                )
+            ]
+        )
+        self.assertFalse(
+            _identity_chain_has_valid_loop_advances(
+                graph, ["root"], reader, loop_by_group
+            )
+        )
+
 
 class TestTryProveForEachTile(unittest.TestCase):
     def test_map_mode_accepted_with_trip_count(self):
