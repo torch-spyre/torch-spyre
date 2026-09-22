@@ -307,8 +307,8 @@ FFDC (First Failure Data Capture)
    Reports are written automatically when a failure is captured and
    ``TORCH_SPYRE_FFDC=1`` is set. Retrieval via this function does not
    require that environment variable. ``TORCH_SPYRE_FFDC`` is intentionally
-   separate from ``USE_SPYRE_PROFILER`` (the CMake / Kineto profiler build
-   flag).
+   separate from ``USE_SPYRE_PROFILER`` (the ``setup.py`` Kineto profiler
+   build flag).
 
    Each successful capture writes a new file named
    ``ffdc_<category>_<YYYYMMDDTHHMMSS>_<microseconds>_<pid>.json``; earlier
@@ -357,8 +357,9 @@ FFDC (First Failure Data Capture)
           print(report["_report_path"])
 
    The same function is also available as
-   ``torch_spyre.profiler.get_diagnostic_report``. For usage workflow,
-   report locations, and JSON triage, see
+   ``torch_spyre.profiler.get_diagnostic_report``. For the enable →
+   fail → retrieve → triage workflow, report schema, and
+   interpretation notes, see
    :doc:`../user_guide/profiling/ffdc`.
 
 Tensor Operations
