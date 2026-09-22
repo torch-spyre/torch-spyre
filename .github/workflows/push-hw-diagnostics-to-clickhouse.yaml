@@ -33,17 +33,8 @@ jobs:
       github.event.workflow_run.conclusion != 'cancelled'
 
     env:
-      CLICKHOUSE_HOST: ${{ secrets.CLICKHOUSE_HOST }}
-      CLICKHOUSE_PORT: ${{ secrets.CLICKHOUSE_PORT }}
-      CLICKHOUSE_USER: ${{ secrets.CLICKHOUSE_USER }}
-      CLICKHOUSE_PASS: ${{ secrets.CLICKHOUSE_PASS }}
-      CLICKHOUSE_DB: ${{ secrets.CLICKHOUSE_DB }}
-
       TRIGGERING_RUN_ID: ${{ github.event.workflow_run.id        || inputs.gha_run_id }}
       TRIGGERING_WORKFLOW: ${{ github.event.workflow_run.name       || 'tests' }}
-      TRIGGERING_BRANCH: ${{ github.event.workflow_run.head_branch || github.ref_name }}
-      TRIGGERING_SHA: ${{ github.event.workflow_run.head_sha   || github.sha }}
-      TRIGGERING_RUN_LINK: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.event.workflow_run.id || inputs.gha_run_id }}
 
       INGEST_COMPONENT: torch-spyre
       # The arch of the ANALYSED legs, not of this ingest job -- so never $(uname -m), which
@@ -55,163 +46,34 @@ jobs:
       LEG_ARCH: x86_64
 
     steps:
-      - name: Checkout scripts
+      # Checkout so ./.github/actions/... resolves; the action itself locates or
+      # sparse-checks-out the scripts and library it actually needs.
+      - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
           sparse-checkout: |
-            .github/scripts/parse_hw_failures.py
-            .github/scripts/ingest_hw_diagnostics.py
-            # Both scripts import it. Listing only the entry points makes the first import fail
-            # at startup, so the job exits 1 having written nothing.
-            extensions/clickhouse-ingest
+            .github/actions
           sparse-checkout-cone-mode: false
 
-      - name: Install uv
-        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+      - name: Ingest hardware-failure diagnostics into ClickHouse
+        id: ingest
+        uses: ./.github/actions/ingest-hw-diagnostics-to-clickhouse
         with:
-          # latest-known, not "latest": it resolves to the newest uv whose checksum is
-          # bundled INTO this setup-uv pin, resolved locally with no release lookup. A
-          # just-published release is not yet mirrored on releases.astral.sh, so "latest"
-          # 404s there and falls back to GitHub Releases, which rate-limits (429) once the
-          # fleet requests it concurrently. Bumping setup-uv moves this version forward.
-          version: latest-known
-
-      - name: setup venv
-        run: |
-          pwd
-          ls -la
-          uv venv
-          source .venv/bin/activate
-          echo "VIRTUAL_ENV $VIRTUAL_ENV"
-
-      - name: Install Python dependencies
-        run: |
-          source .venv/bin/activate
-          # Installed from this checkout, not a git URL, so the library is always the same commit
-          # as the scripts importing it.
-          CHLIB="${GITHUB_WORKSPACE}/extensions/clickhouse-ingest"
-          if [ ! -f "${CHLIB}/pyproject.toml" ]; then
-            echo "::error::spyre-clickhouse-ingest not found at ${CHLIB} -- the checkout step must" \
-                 "sparse-checkout extensions/clickhouse-ingest with cone mode off."
-            exit 1
-          fi
-          uv pip install clickhouse-connect regex "${CHLIB}"
-
-      # actions4gh/setup-gh@v1.0.2 extracts the gh tarball but never lands
-      # the binary on PATH before it calls `gh auth login`, so every job
-      # fails with "spawn gh ENOENT" (upstream actions4gh/setup-gh#7, #11,
-      # unresolved). Install gh directly instead; downstream steps already
-      # set GH_TOKEN, which `gh` picks up implicitly, so no `gh auth login`
-      # call is needed here.
-      - name: Setup the GitHub CLI
-        env:
-          # Offline floor only: used when api.github.com can't be reached to resolve the
-          # latest release, so a transient API failure degrades to a known-good gh instead
-          # of failing the job.
-          GH_CLI_VERSION_FLOOR: 2.98.0
-        run: |
-          set -euo pipefail
-          # Track the latest gh release rather than a pin: nothing here depends on a
-          # specific gh version, and a pin silently rots (this fleet had 2.92.0 and 2.97.0
-          # drifting apart across workflows).
-          GH_CLI_VERSION="$(curl -fsSL https://api.github.com/repos/cli/cli/releases/latest \
-                              | jq -r '.tag_name // empty' | sed 's/^v//')" || GH_CLI_VERSION=""
-          if [ -z "$GH_CLI_VERSION" ]; then
-            echo "api.github.com unreachable; flooring to ${GH_CLI_VERSION_FLOOR}"
-            GH_CLI_VERSION="${GH_CLI_VERSION_FLOOR}"
-          fi
-          curl -fsSL \
-            "https://github.com/cli/cli/releases/download/v${GH_CLI_VERSION}/gh_${GH_CLI_VERSION}_linux_amd64.tar.gz" \
-            -o "${RUNNER_TEMP}/gh-cli.tar.gz"
-          mkdir -p "${RUNNER_TEMP}/gh-cli"
-          tar -xzf "${RUNNER_TEMP}/gh-cli.tar.gz" -C "${RUNNER_TEMP}/gh-cli" --strip-components=1
-          echo "${RUNNER_TEMP}/gh-cli/bin" >> "${GITHUB_PATH}"
-
-      - name: Download Job Logs
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          # The download helper is imported from the installed library, so the venv is needed here
-          # too -- this step used to be stdlib-only.
-          source .venv/bin/activate
-          mkdir -p raw_logs
-
-          # Retries the job-listing call below on a transient 502 from the GitHub API.
-          retry() {
-            local max_attempts=5 attempt=1 delay=2
-            until "$@"; do
-              if [ "${attempt}" -ge "${max_attempts}" ]; then
-                echo "::error::command failed after ${attempt} attempts: $*" >&2
-                return 1
-              fi
-              echo "[retry] attempt ${attempt} failed, retrying in ${delay}s: $*" >&2
-              sleep "${delay}"
-              attempt=$((attempt + 1))
-              delay=$((delay * 2))
-            done
-          }
-
-          # filter=latest is the API's own default, but pin it explicitly: jobs from a
-          # prior attempt of this run (a runner-infra retry, not just a user re-run
-          # click) leaking into the list would download and parse every one of them
-          # twice, doubling every row this run produces in hw_failure_diagnostics.
-          # --method GET is required: gh api infers POST as soon as any -f/-F field is
-          # given, and this endpoint has no POST route, so filter=latest alone 404s.
-          retry gh api \
-            --method GET \
-            "/repos/${{ github.repository }}/actions/runs/${TRIGGERING_RUN_ID}/jobs" \
-            --paginate \
-            -f filter=latest \
-            --jq '.jobs[] | {id: .id, name: .name}' \
-          > /tmp/jobs.jsonl
-
-          python3 - << 'PYEOF'
-          import os
-
-          from spyre_clickhouse_ingest.gha_logs import (
-              download_job_logs_or_die,
-              load_jobs,
-          )
-
-          # Logic lives in the library so it is testable and linted; this stays a 4-line call.
-          download_job_logs_or_die(
-              load_jobs("/tmp/jobs.jsonl"),
-              repo=os.environ["GITHUB_REPOSITORY"],
-              out_dir="raw_logs",
-          )
-          PYEOF
-
-      - name: Parse Logs
-        run: |
-          source .venv/bin/activate
-
-          SAFE_WF=$(echo "${TRIGGERING_WORKFLOW}" | tr ' ' '_')
-          JSON_FILE="hw_diagnostics_${SAFE_WF}_${TRIGGERING_RUN_ID}.json"
-          echo "JSON_FILE=${JSON_FILE}" >> "$GITHUB_ENV"
-
-          python3 .github/scripts/parse_hw_failures.py \
-            --log-dir raw_logs \
-            --run-id  "${TRIGGERING_RUN_ID}" \
-            --out     "${JSON_FILE}"
-
-      - name: Ingest Logs Report into ClickHouse
-        run: |
-          source .venv/bin/activate
-          # --trigger-type carries what --workflow used to: the triggering workflow's name IS
-          # the tier, and the tier is a run_id hash input. --gha-run-id is the coordinate that
-          # run_id is derived FROM, not run_id itself.
-          python3 .github/scripts/ingest_hw_diagnostics.py \
-            --json-file    "${JSON_FILE}" \
-            --component    "${INGEST_COMPONENT}" \
-            --arch         "${LEG_ARCH}" \
-            --trigger-type "${TRIGGERING_WORKFLOW}" \
-            --gha-run-id   "${TRIGGERING_RUN_ID}" \
-            --run-url      "${TRIGGERING_RUN_LINK}"
+          gha-run-id: ${{ env.TRIGGERING_RUN_ID }}
+          workflow-name: ${{ env.TRIGGERING_WORKFLOW }}
+          component: ${{ env.INGEST_COMPONENT }}
+          arch: ${{ env.LEG_ARCH }}
+          gh-token: ${{ secrets.GITHUB_TOKEN }}
+          clickhouse-host: ${{ secrets.CLICKHOUSE_HOST }}
+          clickhouse-port: ${{ secrets.CLICKHOUSE_PORT }}
+          clickhouse-user: ${{ secrets.CLICKHOUSE_USER }}
+          clickhouse-pass: ${{ secrets.CLICKHOUSE_PASS }}
+          clickhouse-db: ${{ secrets.CLICKHOUSE_DB }}
 
       - name: Upload JSON artifact
-        if: always()
+        if: always() && steps.ingest.outputs.json-file != ''
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: ${{ env.JSON_FILE }}
-          path: ${{ env.JSON_FILE }}
+          name: ${{ steps.ingest.outputs.json-file }}
+          path: ${{ steps.ingest.outputs.json-file }}
           retention-days: 10
