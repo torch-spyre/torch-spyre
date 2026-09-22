@@ -470,7 +470,6 @@ class TestBuildingBlocks(unittest.TestCase):
         LQ,
         *,
         dtype=torch.float16,
-        name_inputs=False,
         LK=128,
         kv_padding=0,
         transposed_inputs=False,
@@ -523,31 +522,6 @@ class TestBuildingBlocks(unittest.TestCase):
             k_dev = k.to("spyre")
             v_dev = v.to("spyre")
         mask_dev = mask.to("spyre")
-        if name_inputs:
-            for name, size in (
-                ("_b", B),
-                ("num_heads", H),
-                ("num_kvheads", N_KV),
-                ("max_seqlen_q", LQ),
-                ("max_seqlen_kv", LK),
-                ("head_dim", D),
-            ):
-                _pnd.declare_tensor_dim(name, size)
-            # The eager naming API omits static unit axes, matching the adapter.
-            logical_names = (
-                ("_b", "num_heads", "max_seqlen_q", "head_dim"),
-                ("_b", "num_kvheads", "max_seqlen_kv", "head_dim"),
-                ("_b", "num_kvheads", "max_seqlen_kv", "head_dim"),
-            )
-            for tensor, names in zip((q_dev, k_dev, v_dev), logical_names, strict=True):
-                _pnd.name_tensor_dims(
-                    tensor,
-                    [
-                        name
-                        for size, name in zip(tensor.shape, names, strict=True)
-                        if size != 1
-                    ],
-                )
         actual = torch.compile(sdpa, dynamic=False)(q_dev, k_dev, v_dev, mask_dev).cpu()
         tolerance = 0.2 if dtype is torch.bfloat16 else 0.1
         torch.testing.assert_close(actual, expected, atol=tolerance, rtol=tolerance)
@@ -638,7 +612,6 @@ class TestBuildingBlocks(unittest.TestCase):
         self._run_granite_gqa_with_finite_broadcast_mask(
             LQ=256,
             dtype=torch.bfloat16,
-            name_inputs=True,
             LK=256,
             transposed_inputs=True,
             reshape_output=True,
@@ -797,7 +770,6 @@ class TestBuildingBlocks(unittest.TestCase):
         self._run_granite_gqa_with_finite_broadcast_mask(
             LQ=1024,
             dtype=torch.bfloat16,
-            name_inputs=True,
             LK=1024,
             transposed_inputs=True,
             reshape_output=True,
@@ -819,7 +791,6 @@ class TestBuildingBlocks(unittest.TestCase):
         self._run_granite_gqa_with_finite_broadcast_mask(
             LQ=1024,
             dtype=torch.bfloat16,
-            name_inputs=True,
             LK=1024,
             transposed_inputs=True,
             reshape_output=True,

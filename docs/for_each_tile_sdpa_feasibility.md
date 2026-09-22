@@ -5,21 +5,22 @@ Last updated: 2026-09-22
 ## Executive summary
 
 This branch rewrites Spyre SDPA's complete `B`/`Hkv`/`G`/`Lq`/`Lk` tile nest
-with `for_each_tile`. It is based on upstream main at `ef4032e9`, including
-the non-contiguous input streaming support merged in #4750, and contains no
-named-dimension hints.
+with `for_each_tile`. It is based on upstream main at `a2e41402`, including
+the non-contiguous input streaming support from #4750 and the shared SDPA/SWA
+cost-model helpers from #4610. The full-HOP path contains no named-dimension
+hints.
 
 The nested-HOP correctness blockers found during the original experiment are
 fixed. The focused nine-case suite and the production SDPA tests pass on
-Spyre, and Granite 3.3 8B completes chunked-prefill plus decode at 8K and 32K.
-Gemma 4 12B and 26B A4B had already passed the same 8K/32K E2Es with the K256
-plan that the selector still chooses.
+Spyre. Fresh-cache Granite 3.3 8B and Gemma 4 26B A4B runs both complete
+chunked-prefill plus decode at 8K and 32K.
 
 The tiling selector is cost based. It does not contain model identities,
 sequence-length cutoffs, or maximum query/K tile limits. It enumerates exact
-Lq/Lk tile pairs, estimates the nested loop body's live LX footprint and
-active-core ownership, rejects candidates that do not fit the available LX,
-and ranks the remaining candidates by K/V load bursts and loop/DSC overhead.
+`B`/`Hkv`/`G`/`Lq`/`Lk` plans and estimates live LX, active-core ownership,
+logical HBM bursts, aggregate HBM traffic, non-dense head staging, and
+loop/DSC overhead. A conservative one-carry live-set uncertainty is admitted
+only after pricing its write/read traffic.
 
 ## SDPA structure
 
@@ -56,90 +57,86 @@ result = O_final / l_final
 
 ## Selector model
 
-For chunked prefill, the selector enumerates every exact query tile generated
-from the full Lq extent down to one row and every exact, stick-aligned K tile
+For chunked prefill, the selector enumerates every exact tile count for the
+batch, physical-head, and GQA-group axes, every exact query tile generated
+from the full Lq extent down to one row, and every exact, stick-aligned K tile
 generated from power-of-two burst candidates plus the full K extent. For each
-pair it estimates:
+plan it estimates:
 
-- CP-SAT's usable core count over the inner physical-head and query-row axes;
+- CP-SAT's usable core count over every axis visible to the inner HOP;
 - four simultaneously live score-shaped values;
-- four query/output-shaped values;
+- seven query/output-shaped values, including map staging and carry handoff;
 - the two scalar online-softmax carries;
-- the per-core restickified K footprint; and
-- two K/V load bursts per outer HOP trip and Lk block.
+- the per-core restickified K footprint;
+- mask replay on broadcast outer axes and K/V replay on G/Lq tiles;
+- staging traffic when an interleaved head slice is not dense; and
+- two logical K/V bursts per outer HOP trip and Lk block.
 
-Only plans whose estimated live set fits the actual frontend LX planning
-budget are eligible. Eligible plans are ordered by estimated load bursts,
-then outer-loop count, DSC executions, and block width. Decode retains its
-separately calibrated policy because its one-row execution is structurally
-different from chunked prefill.
+Aggregate bytes are converted to full-card transfer waves using the calibrated
+1 MiB/core HBM target. The analytical liveness count is conservative by one
+query/output carry at the map boundary, so the selector can admit that one
+buffer of shortfall, but charges a write and read of the larger score/query
+buffer on every inner trip. Plans requiring a larger shortfall are rejected.
+The remaining plans are ranked by DSC executions plus logical load bursts plus
+HBM transfer waves, with residency, parallelism, restick work, and tile counts
+as tie breakers. Decode retains its separately calibrated policy because its
+one-row execution is structurally different from chunked prefill.
 
 Representative choices with a 1,625,344-byte per-core LX budget are:
 
-| Geometry | Selected plan | Estimated live bytes/core |
-| --- | --- | ---: |
-| Granite, Hq=32, Hkv=8, Lq=512, D=128 | Lq512 / K1024 | 1,442,304 |
-| Gemma 4, Hq=16, Hkv=8, Lq=1024, D=256 | Lq1024 / K256 | 1,180,672 |
+| Geometry | Selected plan | Estimated live bytes/core | Priced shortfall |
+| --- | --- | ---: | ---: |
+| Granite 8K, Hq=32, Hkv=8, Lq=512, D=128 | B1/H1/G1/Q2/K512 | 1,639,424 | 1 buffer |
+| Granite 32K, Hq=32, Hkv=8, Lq=512, D=128 | B1/H1/G1/Q4/K1024 | 1,540,608 | none |
+| Gemma 4 8K/32K, Hq=16, Hkv=8, Lq=1024, D=256 | B1/H1/G1/Q2/K256 | 1,573,888 | none |
 
-The same plan is selected at 8K and 32K for each geometry because sequence
-length changes the number of bursts, not whether one tile's live set fits LX.
-When both Lq and Lk already fit in one tile, the lowering leaves G visible to
-normal work division instead of adding a G-only map that cannot reduce the
-sequence working set.
+The Granite crossover is selected from costs rather than a sequence-length
+condition. At 8K, two Q tiles avoid enough K/V replay to offset the conservatively
+priced carry shortfall. At 32K, four Q tiles with K1024 eliminate that shortfall
+and win as its repeated transfer cost grows. Gemma's wider D=256 geometry keeps
+the resident Q2/K256 plan at both lengths.
 
 ## Correctness results
 
-On upstream main `ef4032e9` plus this branch:
+On upstream main `a2e41402` plus this branch:
 
 ```text
-tests/inductor/test_sdpa_tiling.py:                 23 passed
+tests/inductor/test_sdpa_tiling.py:                 29 passed, 142 subtests
 tests/inductor/test_sdpa_for_each_tile.py (OOT):     9 passed
-selected SDPA/Granite/SigLIP device suite:          23 passed, 2 skipped
-Misc Compute C OOT shard:                           21 passed, 2 expected failures
-LX Misc Compute C OOT shard:                        42 passed, 4 expected failures
+focused production SDPA device tests:                7 passed
+pre-commit on all modified files:                    passed
 ```
 
-The production group consists of the Lk-HOP structural check, Granite finite
-mask decode, Granite finite broadcast-mask prefill, and forced four-by-four
-Lq/Lk tiling.
+The production group covers the Lk-HOP structural check, Granite finite-mask
+decode, broadcast-mask prefill, direct and fallback non-contiguous KV-prefix
+paths, forced four-by-four Lq/Lk tiling, and the larger production layout. The
+two transposed-input tests no longer attach named dimensions: the nested HOP
+must carry all tiling structure itself.
 
-All requested chunked-prefill plus decode E2Es passed before the final selector
-rewrite:
+All requested chunked-prefill plus two-token decode E2Es pass with the final
+selector:
 
 | Model | Chunk | 8K | 32K |
 | --- | ---: | --- | --- |
-| Granite 3.3 8B Instruct | 512 | Pass | Pass |
-| Gemma 4 12B | 1024 | Pass | Pass |
-| Gemma 4 26B A4B | 1024 | Pass | Pass |
-
-After the selector rewrite and latest-main merge, Granite was rerun because
-its selected K tile changed from K512 to K1024:
-
-| Case | Result |
-| --- | --- |
-| Granite 8B, 8K, chunk 512 | Pass; output suffix `of the` |
-| Granite 8B, 32K, chunk 512 | Pass; output suffix `France is` |
-
-The latest selector still chooses K256 for both Gemma models, so their
-previously passing execution path did not change.
+| Granite 3.3 8B Instruct | 512 | Pass; `of France` | Pass; `France is` |
+| Gemma 4 26B A4B | 1024 | Pass; `of France` | Pass; `France-` |
 
 ## Compile-time and runtime observations
 
-A fresh-cache, same-process kernel comparison used 20 synchronized,
-device-resident iterations of Granite geometry (`Hq=32`, `Hkv=8`, `Lq=512`,
-`D=128`). The padded measurements use K/V prefix views whose backing allocation
-is 512 tokens longer, matching the static-cache layout used by the adapter.
+A fresh-cache, same-process kernel comparison used 100 synchronized,
+device-resident iterations. K/V are transposed prefix views whose backing
+allocation is one prefill chunk longer, matching the static-cache layout used
+by the adapter.
 
-| KV length | K/V layout | Median runtime | Cold compile + first execution |
-| ---: | --- | ---: | ---: |
-| 8K | tightly allocated | 10.56 ms | 8.72 s |
-| 8K | padded prefix view | 14.07 ms | 8.85 s |
-| 32K | tightly allocated | 23.06 ms | 9.59 s |
-| 32K | padded prefix view | 38.90 ms | 9.55 s |
+| Geometry | KV length | Selected plan | Median runtime | Compile + first |
+| --- | ---: | --- | ---: | ---: |
+| Granite | 8K | Q2/K512 | 11.273 ms | 11.247 s |
+| Granite | 32K | Q4/K1024 | 38.757 ms | 11.978 s |
+| Gemma 4 | 8K | Q2/K256 | 17.934 ms | 10.820 s |
+| Gemma 4 | 32K | Q2/K256 | 42.081 ms | 14.665 s |
 
-The prior upstream-main 8K measurement was 27.59 ms, so the current full-HOP
-8K kernel is 2.61x faster on the same tightly allocated input geometry. The
-main baseline was not recompiled for this update.
+These production-shaped figures should not be compared directly with the much
+smaller PR #4550 benchmark below.
 
 PR #4550's smaller benchmark geometry is not directly comparable with the
 Granite rows above: it uses MHA with `H=2` and `Lq=64`, versus Granite's
@@ -157,21 +154,22 @@ the same workload. The larger absolute Granite timings reflect the larger
 production workload, not a regression relative to #4550.
 
 The end-to-end runner reports two-token generation time. The cold invocation
-includes compilation; the warm invocation reuses the same-process compiled
-graphs. Both runs use Granite 3.3 8B with 512-token chunked prefill.
+includes compilation of both prefill and decode graphs; two warm invocations
+reuse the same-process compiled graphs.
 
-| Case | Cold total | Warm total | Approx. cold-only overhead |
-| --- | ---: | ---: | --- |
-| Granite 8B, 8K | 70.26 s | 10.37 s | 59.89 s |
-| Granite 8B, 32K | 149.63 s | 91.05 s | 58.58 s |
+| Case | Chunk | Cold total | Warm totals | Warm first-token median |
+| --- | ---: | ---: | --- | ---: |
+| Granite 8B, 8K | 512 | 75.309 s | 10.532 / 10.527 s | 10.348 s |
+| Granite 8B, 32K | 512 | 177.746 s | 113.810 / 113.907 s | 112.305 s |
+| Gemma 4 26B, 8K | 1024 | 165.263 s | 21.176 / 21.016 s | 20.832 s |
+| Gemma 4 26B, 32K | 1024 | 271.112 s | 138.327 / 136.217 s | 136.183 s |
 
 For comparison, the reported main compile times were approximately 20 minutes
-at 8K and one hour at 32K. The fixed 512-token chunk shape now compiles once,
-so the observed cold-only overhead is about one minute at both lengths instead
-of scaling with the total context length. Compared with the previous 4551
-measurements, 8K improves from 138.94/35.30 seconds cold/warm and 32K improves
-from 1,506.36 seconds cold with a warm run that had not completed after four
-minutes.
+at 8K and one hour at 32K. Fixed chunk shapes now compile once instead of
+specializing on total context length. The latest Granite 32K warm run is slower
+than the earlier 91.05 s sample, but its isolated padded attention kernel is
+unchanged at 38.76 ms versus 38.90 ms; this does not indicate an attention
+codegen regression.
 
 Isolated Granite SDPA measurements explain the K1024 choice:
 
@@ -182,17 +180,18 @@ Isolated Granite SDPA measurements explain the K1024 choice:
 | 1024 | 23.11 ms |
 | 2048 | 80.54 ms |
 
-Generated LoopSpecs/OpSpecs show that K1024 retains the online-softmax
-intermediates in LX. K2048 exceeds the estimated live set and spills nearly
-all intermediates to `hbm_pool`, matching its large regression. A short
-Granite chunk (`Lq=64`, `Lk=8K`) likewise measured K4096 at 3.24 ms versus
-K512 at 4.22 ms, supporting selection by residency and burst count rather
-than a fixed K512 ceiling.
+Generated LoopSpecs match the selected plans: Granite emits Q2/K16 at 8K and
+Q4/K32 at 32K, while Gemma emits Q2/K32 and Q2/K128. The corresponding OpSpecs
+place all score-shaped and query/output-shaped inner-loop intermediates in LX.
+The remaining `hbm`/`hbm_pool` values are graph inputs, restick staging, carries
+at loop boundaries, and map-result materialization—not wholesale spills of the
+online-softmax dataflow.
 
-For Gemma's wider D=256 geometry, K512 crosses the estimated resident live
-set. Existing measurements were 38.5 ms (K256) versus 36.2 ms (K512) at 8K,
-and 47.8 ms (K256) versus 72.7 ms (K512) at 32K. The model therefore chooses
-the resident K256 plan without checking the model name or sequence length.
+Earlier forced-plan studies explain the selections. Granite's Q2/K512 plan was
+faster end-to-end at 8K, while Q4/K1024 won at 32K. For Gemma's wider D=256
+geometry, K512 crossed the estimated resident live set and regressed sharply
+at 32K. The final model reproduces those choices without checking model names
+or sequence lengths.
 
 ## Non-contiguous KV-cache support inherited from #4750
 
@@ -212,22 +211,20 @@ review-requested diagnostics: comments explain why ambiguous axis matches bail
 out instead of guessing, and a debug message records when the FX graph needed
 for pass-through carry detection is unavailable.
 
-PR #4551 is rebased directly on the merged #4750 commit; its former duplicate
-of that compiler patch has been removed.
+PR #4551 is rebased onto current upstream main, which contains both #4750 and
+#4610; its former duplicate compiler patch has been removed.
 
 ## Remaining work
 
-- Re-run the Gemma 12B/26B E2Es if changes after this branch alter their K256
-  plan or the shared nested-HOP lowering.
 - Add destination-backed map outputs to remove scan stack/fold
   materializations.
-- Compare the selector's estimates against generated LoopSpecs/OpSpecs for a
-  broader geometry grid and refine buffer lifetimes if the allocator changes.
+- Continue calibrating the analytical live-set and HBM-wave estimates against
+  generated OpSpecs when allocator behavior changes.
 
 ## Reproduction
 
 ```bash
-python tests/inductor/test_sdpa_tiling.py -v
+python -m pytest -q tests/inductor/test_sdpa_tiling.py
 python -m pytest -q tests/inductor/test_sdpa_for_each_tile.py
 ```
 

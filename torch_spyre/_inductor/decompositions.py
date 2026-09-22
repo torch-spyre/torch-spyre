@@ -49,7 +49,6 @@ from . import config
 from .logging_utils import get_inductor_logger
 
 from . import customops  # noqa: F401
-from . import spyre_hint
 from .wsr import for_each_tile
 from torch_spyre._C import DataFormats, get_device_dtype, get_elem_in_stick
 import torch_spyre._inductor.customops  # noqa: F401
@@ -76,12 +75,12 @@ _SDPA_QUERY_ROWS_PER_KV_TARGET_MIB = 8
 _SDPA_BASE_BURST_EFFICIENT_KV_BLOCK_SIZE = 512
 _SDPA_MAX_BURST_EFFICIENT_KV_BLOCK_SIZE = 1024
 # Nested HOP prefill keeps the scaled query and online-softmax carries live
-# across the K loop.  At the widest point, the dataflow also contains the
-# score, masked score, normalized score, contiguous probability, corrected
-# output, weighted value, and updated output.  These are graph-derived buffer
-# counts, rather than shape or model limits.
+# across the K loop. At the widest point, the dataflow contains four
+# score-shaped values and seven query/output-shaped values once the enclosing
+# map's tile staging and carry handoff are included. These are graph-derived
+# buffer counts, rather than shape or model limits.
 _SDPA_HOP_LIVE_SCORE_BUFFER_ALLOWANCE = 4
-_SDPA_HOP_LIVE_QUERY_BUFFER_ALLOWANCE = 4
+_SDPA_HOP_LIVE_QUERY_BUFFER_ALLOWANCE = 7
 
 # A counted SWA K/V loop pays its carry handoff and loop-control costs for each
 # query work partition.  Prefill sweeps show that retaining at least four query
@@ -115,14 +114,39 @@ class _SDPATilingConfig:
     num_kv_blocks: int
     num_q_tiles: int
     q_tile_size: int
+    num_batch_tiles: int
     num_head_tiles: int
     num_group_tiles: int
     kv_blocks_per_loop_group: int
     estimated_active_cores: int | None
     estimated_load_bursts: int
+    estimated_hbm_bytes: int
+    estimated_spill_buffers: int | None
+    estimated_spill_bytes: int | None
     score_bytes_per_core: int | None
     estimated_live_bytes_per_core: int | None
     lx_budget_bytes: int
+
+
+@dataclasses.dataclass(frozen=True)
+class _SDPAPrefillPlan:
+    """One exact nested-HOP tiling and its compiler-visible costs."""
+
+    num_batch_tiles: int
+    num_head_tiles: int
+    num_group_tiles: int
+    num_q_tiles: int
+    q_tile_size: int
+    kv: "_SDPAKVBlockCandidate"
+    estimated_active_cores: int
+    estimated_restick_active_cores: int
+    estimated_restick_work_bytes: int
+    estimated_load_bursts: int
+    estimated_hbm_bytes: int
+    estimated_hbm_transfer_waves: int
+    estimated_spill_buffers: int
+    estimated_spill_bytes: int
+    estimated_work: int
 
 
 @dataclasses.dataclass(frozen=True)
@@ -284,18 +308,74 @@ def _sdpa_work_division(
     return {"num_heads": best[0], "max_seqlen_q": best[1]}
 
 
-def _sdpa_estimated_active_cores(
-    head_extent: int, query_extent: int, num_cores: int
+def _sdpa_estimated_active_cores(tile_extents: tuple[int, ...], num_cores: int) -> int:
+    """Estimate CP-SAT's largest exact split over visible inner axes."""
+    products = {1}
+    for extent in tile_extents:
+        divisors = [
+            split
+            for split in range(1, min(extent, num_cores) + 1)
+            if extent % split == 0
+        ]
+        products = {
+            product * divisor
+            for product in products
+            for divisor in divisors
+            if product * divisor <= num_cores
+        }
+    return max(products)
+
+
+def _exact_tile_counts(extent: int) -> list[int]:
+    """Return every exact map-loop trip count for a static axis."""
+    return [count for count in range(1, extent + 1) if extent % count == 0]
+
+
+def _axis_slice_is_dense(
+    shape: tuple[int, ...], strides: tuple[int, ...], axis: int
+) -> bool:
+    """Whether one tile of ``axis`` is a contiguous region of the tensor."""
+    expected_stride = 1
+    for dim in range(len(shape) - 1, axis, -1):
+        if shape[dim] > 1:
+            if strides[dim] != expected_stride:
+                return False
+            expected_stride *= shape[dim]
+    return strides[axis] == expected_stride
+
+
+def _sdpa_mask_hbm_bytes(
+    *,
+    mask_shapes: tuple[tuple[int, ...], ...],
+    axis_extents: tuple[int, ...],
+    axis_tile_counts: tuple[int, ...],
+    element_size: int,
 ) -> int:
-    """Estimate CP-SAT's exact head/query partition for one inner HOP tile."""
-    best = 1
-    for head_split in range(1, min(head_extent, num_cores) + 1):
-        if head_extent % head_split:
-            continue
-        for query_split in range(1, min(query_extent, num_cores // head_split) + 1):
-            if query_extent % query_split == 0:
-                best = max(best, head_split * query_split)
-    return best
+    """Estimate mask loads, including replay along broadcast loop axes."""
+    total = 0
+    for shape in mask_shapes:
+        if len(shape) != len(axis_extents):
+            raise ValueError(
+                f"SDPA mask rank {len(shape)} does not match rank {len(axis_extents)}"
+            )
+        replay = 1
+        for size, extent, tile_count in zip(
+            shape, axis_extents, axis_tile_counts, strict=True
+        ):
+            if size == 1 and extent != 1:
+                replay *= tile_count
+            elif size != extent:
+                raise ValueError(
+                    f"SDPA mask extent {size} is neither broadcast nor {extent}"
+                )
+        total += math.prod(shape) * element_size * replay
+    return total
+
+
+def _sdpa_hbm_transfer_waves(num_bytes: int, num_cores: int) -> int:
+    """Convert aggregate traffic into calibrated full-card HBM load waves."""
+    bytes_per_wave = num_cores * _SDPA_TARGET_KV_BYTES_PER_CORE
+    return (num_bytes + bytes_per_wave - 1) // bytes_per_wave
 
 
 def _sdpa_lx_budget_bytes() -> int:
@@ -358,8 +438,10 @@ class _SDPAKVBlockCandidate:
     block_size: int
     num_blocks: int
     score_bytes_per_core: int
+    query_bytes_per_core: int
     estimated_live_bytes_per_core: int
     kv_bytes_per_core: int
+    estimated_restick_active_cores: int
     restick_bytes_per_core: int
     restick_lx_eligible: bool
     estimated_dsc_executions: int
@@ -446,6 +528,7 @@ def _sdpa_kv_candidates(
     element_size: int,
     num_cores: int,
     query_tile_size: int | None = None,
+    group_tile_size: int = 1,
     num_outer_tiles: int = 1,
     nested_hop: bool = False,
     work_div: dict[str, int] | None = None,
@@ -458,27 +541,29 @@ def _sdpa_kv_candidates(
     """
     if nested_hop:
         assert query_tile_size is not None
-        # GQA's group loop presents one logical query head per KV head to the
-        # inner body. CP-SAT can divide both that Hkv axis and Lq, so model the
-        # total head-row ownership rather than the removed named-dim hints.
-        heads_per_tile = num_kvheads if num_heads != num_kvheads else num_heads
+        # Model every axis visible in the innermost HOP body. CP-SAT can divide
+        # any exact combination of these axes, so the per-core score and carry
+        # footprint is the complete logical row count divided by that split.
         active_cores = _sdpa_estimated_active_cores(
-            heads_per_tile, query_tile_size, num_cores
+            (batch_size, num_kvheads, group_tile_size, query_tile_size), num_cores
         )
         head_rows_per_core = (
-            batch_size * heads_per_tile * query_tile_size // active_cores
+            batch_size * num_kvheads * group_tile_size * query_tile_size // active_cores
         )
         heads_per_core = head_rows_per_core
         kv_heads_per_core = num_kvheads
         query_rows_per_core = 1
+        # K has no G or Q axis.  Be deliberately conservative here: generated
+        # plans can use more lanes when a downstream Q split is compatible,
+        # but the only parallel axes guaranteed before layout planning are B
+        # and Hkv.  Overestimating this split makes a near-capacity plan look
+        # resident and is much costlier than rejecting one marginal K tile.
         restick_active_cores = min(num_cores, batch_size * num_kvheads)
     else:
         # Preserve the calibrated decode model. Its operations are too narrow
         # for the head/query partition used by chunked prefill.
         head_split = work_div.get("num_heads", 1) if work_div is not None else 1
-        query_split = (
-            work_div.get("max_seqlen_q", 1) if work_div is not None else 1
-        )
+        query_split = work_div.get("max_seqlen_q", 1) if work_div is not None else 1
         heads_per_core = num_heads // head_split
         kv_heads_per_core = num_kvheads // head_split
         query_rows_per_core = max_seqlen_q // query_split
@@ -535,8 +620,10 @@ def _sdpa_kv_candidates(
                 block_size=effective_block_size,
                 num_blocks=num_blocks,
                 score_bytes_per_core=score_bytes,
+                query_bytes_per_core=(score_bytes * head_dim // effective_block_size),
                 estimated_live_bytes_per_core=live_bytes,
                 kv_bytes_per_core=kv_bytes_per_core,
+                estimated_restick_active_cores=restick_active_cores,
                 restick_bytes_per_core=restick_bytes_per_core,
                 restick_lx_eligible=restick_bytes_per_core <= restick_lx_limit,
                 # Eight fixed executes, about seventeen for every unrolled
@@ -564,15 +651,16 @@ def _select_sdpa_tiling(
     element_size: int,
     num_cores: int,
     lx_budget_bytes: int,
+    mask_shapes: tuple[tuple[int, ...], ...] = (),
+    head_tile_staging_bytes: int = 0,
 ) -> _SDPATilingConfig:
     """Choose SDPA tiling from compiler-visible costs.
 
-    Prefill enumerates exact Lq/Lk tile pairs. Candidates whose complete nested
-    HOP live set does not fit in LX are rejected; the rest are ranked by the
-    number of K/V load bursts, then by outer-loop and DSC execution overhead.
-    Decode retains its separately calibrated restick-residency tradeoff. No
-    model identity, sequence-length cutoff, or fixed K tile participates in the
-    decision.
+    Prefill enumerates exact B/Hkv/G/Lq/Lk plans. It estimates the complete
+    nested-HOP live set, permits at most one whole intermediate to spill, and
+    balances loop/DSC executions, HBM load bursts, and aggregate transfer waves.
+    Decode retains its separately calibrated policy. No model identity or
+    sequence-length cutoff participates in the decision.
     """
     quarter_kv_stick_aligned = max(64, ((max_seqlen_kv + 3) // 4 + 63) // 64 * 64)
     fallback_kv_block_limit = min(
@@ -591,23 +679,69 @@ def _select_sdpa_tiling(
     fallback_num_head_tiles, fallback_num_group_tiles = _sdpa_head_group_tiles(
         num_heads, num_kvheads
     )
+    fallback_num_batch_tiles = _sdpa_num_batch_tiles(batch_size)
     fallback_kv_blocks_per_loop_group = _kv_blocks_per_loop_group(
         fallback_num_q_tiles, fallback_num_kv_blocks
     )
     score_bytes_per_core: int | None = None
     estimated_live_bytes_per_core: int | None = None
     is_decode = max_seqlen_q == 1
-    num_batch_tiles = _sdpa_num_batch_tiles(batch_size)
-    batch_rows_per_tile = (batch_size + num_batch_tiles - 1) // num_batch_tiles
-    num_group_tiles = num_heads // num_kvheads if num_heads != num_kvheads else 1
-    query_tile_sizes = [1] if is_decode else _sdpa_query_tile_sizes(max_seqlen_q)
-    plans: list[tuple[int, _SDPAKVBlockCandidate]] = []
-    for query_tile_size in query_tile_sizes:
-        num_q_tiles = max_seqlen_q // query_tile_size
-        num_outer_tiles = num_batch_tiles * num_group_tiles * num_q_tiles
+    group_extent = num_heads // num_kvheads if num_heads != num_kvheads else 1
+    head_extent = num_kvheads if group_extent > 1 else num_heads
+    query_output_bytes = (
+        2 * batch_size * num_heads * max_seqlen_q * head_dim * element_size
+    )
+    kv_bytes = 2 * batch_size * num_kvheads * max_seqlen_kv * head_dim * element_size
+    mask_axis_extents = (
+        (batch_size, head_extent, group_extent, max_seqlen_q, max_seqlen_kv)
+        if group_extent > 1
+        else (batch_size, head_extent, max_seqlen_q, max_seqlen_kv)
+    )
+
+    def estimated_hbm_bytes(
+        *,
+        num_batch_tiles: int,
+        num_head_tiles: int,
+        num_group_tiles: int,
+        num_q_tiles: int,
+        num_kv_blocks: int,
+    ) -> int:
+        axis_tile_counts = (
+            (
+                num_batch_tiles,
+                num_head_tiles,
+                num_group_tiles,
+                num_q_tiles,
+                num_kv_blocks,
+            )
+            if group_extent > 1
+            else (
+                num_batch_tiles,
+                num_head_tiles,
+                num_q_tiles,
+                num_kv_blocks,
+            )
+        )
+        return (
+            query_output_bytes
+            + kv_bytes * num_group_tiles * num_q_tiles
+            + _sdpa_mask_hbm_bytes(
+                mask_shapes=mask_shapes,
+                axis_extents=mask_axis_extents,
+                axis_tile_counts=axis_tile_counts,
+                element_size=element_size,
+            )
+            + (head_tile_staging_bytes if num_head_tiles > 1 else 0)
+        )
+
+    if is_decode:
+        num_batch_tiles = _sdpa_num_batch_tiles(batch_size)
+        batch_tile_size = batch_size // num_batch_tiles
+        num_head_tiles = 1
+        num_group_tiles = group_extent
+        num_outer_tiles = num_batch_tiles * num_group_tiles
         candidates = _sdpa_kv_candidates(
-            # The outer batch HOP limits every kernel to one batch tile.
-            batch_size=batch_rows_per_tile,
+            batch_size=batch_tile_size,
             num_heads=num_heads,
             num_kvheads=num_kvheads,
             max_seqlen_q=max_seqlen_q,
@@ -615,40 +749,19 @@ def _select_sdpa_tiling(
             head_dim=head_dim,
             element_size=element_size,
             num_cores=num_cores,
-            query_tile_size=query_tile_size,
+            query_tile_size=1,
+            group_tile_size=1,
             num_outer_tiles=num_outer_tiles,
-            nested_hop=not is_decode,
+            nested_hop=False,
         )
-        for candidate in candidates:
-            logger.debug(
-                "SDPA tile candidate: Lq=%s q_tiles=%s K=%s blocks=%s "
-                "estimated_load_bursts=%s estimated_dsc_executes=%s "
-                "score_bytes_per_core=%s live_bytes_per_core=%s "
-                "restick_bytes_per_core=%s restick_lx_eligible=%s feasible=%s",
-                query_tile_size,
-                num_q_tiles,
-                candidate.block_size,
-                candidate.num_blocks,
-                candidate.estimated_load_bursts,
-                candidate.estimated_dsc_executions,
-                candidate.score_bytes_per_core,
-                candidate.estimated_live_bytes_per_core,
-                candidate.restick_bytes_per_core,
-                candidate.restick_lx_eligible,
-                candidate.estimated_live_bytes_per_core <= lx_budget_bytes,
-            )
-            plans.append((query_tile_size, candidate))
-
-    feasible = [
-        plan
-        for plan in plans
-        if plan[1].estimated_live_bytes_per_core <= lx_budget_bytes
-    ]
-    if feasible:
-        if is_decode:
-            candidates = [candidate for _, candidate in feasible]
+        feasible_decode = [
+            candidate
+            for candidate in candidates
+            if candidate.estimated_live_bytes_per_core <= lx_budget_bytes
+        ]
+        if feasible_decode:
             fewest_executions = min(
-                candidates,
+                feasible_decode,
                 key=lambda candidate: (
                     candidate.estimated_dsc_executions,
                     -candidate.block_size,
@@ -656,7 +769,7 @@ def _select_sdpa_tiling(
             )
             lx_resident = [
                 candidate
-                for candidate in candidates
+                for candidate in feasible_decode
                 if candidate.restick_lx_eligible
                 and candidate.block_size >= 256
                 and candidate.num_blocks
@@ -676,66 +789,254 @@ def _select_sdpa_tiling(
                 if lx_resident
                 else fewest_executions
             )
-            selected_query_tile_size = 1
             reason = (
                 "single-query decode; LX-resident restickified K"
                 if selected.restick_lx_eligible
                 else "single-query decode; longest bursts and fewest DSC executes"
             )
-        else:
-            selected_query_tile_size, selected = min(
-                feasible,
+            return _SDPATilingConfig(
+                strategy="decode" if selected.num_blocks == 1 else "decode_tiled",
+                reason=reason,
+                kv_block_size=selected.block_size,
+                num_kv_blocks=selected.num_blocks,
+                num_q_tiles=1,
+                q_tile_size=1,
+                num_batch_tiles=num_batch_tiles,
+                num_head_tiles=num_head_tiles,
+                num_group_tiles=num_group_tiles,
+                kv_blocks_per_loop_group=_kv_blocks_per_loop_group(
+                    1, selected.num_blocks
+                ),
+                estimated_active_cores=None,
+                estimated_load_bursts=selected.estimated_load_bursts,
+                estimated_hbm_bytes=estimated_hbm_bytes(
+                    num_batch_tiles=num_batch_tiles,
+                    num_head_tiles=num_head_tiles,
+                    num_group_tiles=num_group_tiles,
+                    num_q_tiles=1,
+                    num_kv_blocks=selected.num_blocks,
+                ),
+                estimated_spill_buffers=0,
+                estimated_spill_bytes=0,
+                score_bytes_per_core=selected.score_bytes_per_core,
+                estimated_live_bytes_per_core=selected.estimated_live_bytes_per_core,
+                lx_budget_bytes=lx_budget_bytes,
+            )
+        smallest_candidate = min(
+            candidates, key=lambda candidate: candidate.estimated_live_bytes_per_core
+        )
+    else:
+        plans: list[_SDPAPrefillPlan] = []
+        for num_batch_tiles in _exact_tile_counts(batch_size):
+            batch_tile_size = batch_size // num_batch_tiles
+            for num_head_tiles in _exact_tile_counts(head_extent):
+                head_tile_size = head_extent // num_head_tiles
+                for num_group_tiles in _exact_tile_counts(group_extent):
+                    group_tile_size = group_extent // num_group_tiles
+                    for query_tile_size in _sdpa_query_tile_sizes(max_seqlen_q):
+                        num_q_tiles = max_seqlen_q // query_tile_size
+                        num_outer_tiles = (
+                            num_batch_tiles
+                            * num_head_tiles
+                            * num_group_tiles
+                            * num_q_tiles
+                        )
+                        candidates = _sdpa_kv_candidates(
+                            batch_size=batch_tile_size,
+                            num_heads=head_tile_size * group_tile_size,
+                            num_kvheads=head_tile_size,
+                            max_seqlen_q=query_tile_size,
+                            max_seqlen_kv=max_seqlen_kv,
+                            head_dim=head_dim,
+                            element_size=element_size,
+                            num_cores=num_cores,
+                            query_tile_size=query_tile_size,
+                            group_tile_size=group_tile_size,
+                            num_outer_tiles=num_outer_tiles,
+                            nested_hop=True,
+                        )
+                        for candidate in candidates:
+                            live_overflow = max(
+                                0,
+                                candidate.estimated_live_bytes_per_core
+                                - lx_budget_bytes,
+                            )
+                            # The analytical live count is conservative around
+                            # the map/carry handoff by one query-shaped slot.
+                            # Use that slot for admission, but charge the larger
+                            # score/query buffer that allocation may evict.
+                            spill_allowance = candidate.query_bytes_per_core
+                            spill_buffer_size = max(
+                                candidate.score_bytes_per_core,
+                                candidate.query_bytes_per_core,
+                            )
+                            estimated_spill_buffers = (
+                                (live_overflow + spill_allowance - 1) // spill_allowance
+                                if live_overflow
+                                else 0
+                            )
+                            # A spilled intermediate is written to HBM and read
+                            # back on every innermost loop trip.
+                            estimated_spill_bytes = (
+                                2
+                                * estimated_spill_buffers
+                                * spill_buffer_size
+                                * num_cores
+                                * num_outer_tiles
+                                * candidate.num_blocks
+                            )
+                            plan_hbm_bytes = (
+                                estimated_hbm_bytes(
+                                    num_batch_tiles=num_batch_tiles,
+                                    num_head_tiles=num_head_tiles,
+                                    num_group_tiles=num_group_tiles,
+                                    num_q_tiles=num_q_tiles,
+                                    num_kv_blocks=candidate.num_blocks,
+                                )
+                                + estimated_spill_bytes
+                            )
+                            plan_load_bursts = candidate.estimated_load_bursts + (
+                                _sdpa_hbm_transfer_waves(
+                                    head_tile_staging_bytes, num_cores
+                                )
+                                if num_head_tiles > 1
+                                else 0
+                            )
+                            plan_hbm_transfer_waves = _sdpa_hbm_transfer_waves(
+                                plan_hbm_bytes, num_cores
+                            )
+                            plans.append(
+                                _SDPAPrefillPlan(
+                                    num_batch_tiles=num_batch_tiles,
+                                    num_head_tiles=num_head_tiles,
+                                    num_group_tiles=num_group_tiles,
+                                    num_q_tiles=num_q_tiles,
+                                    q_tile_size=query_tile_size,
+                                    kv=candidate,
+                                    estimated_active_cores=(
+                                        _sdpa_estimated_active_cores(
+                                            (
+                                                batch_tile_size,
+                                                head_tile_size,
+                                                group_tile_size,
+                                                query_tile_size,
+                                            ),
+                                            num_cores,
+                                        )
+                                    ),
+                                    estimated_restick_active_cores=(
+                                        candidate.estimated_restick_active_cores
+                                    ),
+                                    estimated_restick_work_bytes=(
+                                        candidate.restick_bytes_per_core
+                                        * num_outer_tiles
+                                        * candidate.num_blocks
+                                    ),
+                                    estimated_load_bursts=plan_load_bursts,
+                                    estimated_hbm_bytes=plan_hbm_bytes,
+                                    estimated_hbm_transfer_waves=(
+                                        plan_hbm_transfer_waves
+                                    ),
+                                    estimated_spill_buffers=(estimated_spill_buffers),
+                                    estimated_spill_bytes=estimated_spill_bytes,
+                                    estimated_work=(
+                                        candidate.estimated_dsc_executions
+                                        + plan_load_bursts
+                                        + plan_hbm_transfer_waves
+                                    ),
+                                )
+                            )
+
+        bounded_prefill = [
+            plan
+            for plan in plans
+            # Tolerate and price one query/output carry-sized uncertainty at
+            # the map boundary. Requiring more means DWSRS did not right-size
+            # the working set.
+            if plan.estimated_spill_buffers <= 1
+        ]
+        for plan in plans:
+            logger.debug(
+                "SDPA tile candidate: B=%s H=%s G=%s Lq=%s K=%s "
+                "active_cores=%s restick_cores=%s load_bursts=%s "
+                "hbm_bytes=%s hbm_waves=%s spill_buffers=%s spill_bytes=%s "
+                "restick_work_bytes=%s dsc_executes=%s estimated_work=%s "
+                "score_bytes_per_core=%s live_bytes_per_core=%s feasible=%s",
+                plan.num_batch_tiles,
+                plan.num_head_tiles,
+                plan.num_group_tiles,
+                plan.q_tile_size,
+                plan.kv.block_size,
+                plan.estimated_active_cores,
+                plan.estimated_restick_active_cores,
+                plan.estimated_load_bursts,
+                plan.estimated_hbm_bytes,
+                plan.estimated_hbm_transfer_waves,
+                plan.estimated_spill_buffers,
+                plan.estimated_spill_bytes,
+                plan.estimated_restick_work_bytes,
+                plan.kv.estimated_dsc_executions,
+                plan.estimated_work,
+                plan.kv.score_bytes_per_core,
+                plan.kv.estimated_live_bytes_per_core,
+                plan.estimated_spill_buffers <= 1,
+            )
+        if bounded_prefill:
+            selected_plan = min(
+                bounded_prefill,
                 key=lambda plan: (
-                    plan[1].estimated_load_bursts,
-                    max_seqlen_q // plan[0],
-                    plan[1].estimated_dsc_executions,
-                    -plan[1].block_size,
+                    plan.estimated_work,
+                    plan.estimated_spill_buffers,
+                    plan.estimated_load_bursts,
+                    plan.estimated_hbm_bytes,
+                    plan.kv.estimated_dsc_executions,
+                    -plan.estimated_active_cores,
+                    plan.estimated_restick_work_bytes,
+                    plan.num_batch_tiles,
+                    plan.num_head_tiles,
+                    -plan.q_tile_size,
+                    plan.num_group_tiles,
+                    -plan.kv.block_size,
                 ),
             )
-            reason = "fewest K/V load bursts with an LX-resident HOP live set"
-
-        num_q_tiles = max_seqlen_q // selected_query_tile_size
-        num_kv_blocks = selected.num_blocks
-        estimated_active_cores = (
-            None
-            if is_decode
-            else _sdpa_estimated_active_cores(
-                num_kvheads if num_heads != num_kvheads else num_heads,
-                selected_query_tile_size,
-                num_cores,
+            selected = selected_plan.kv
+            return _SDPATilingConfig(
+                strategy=(
+                    "work_divided"
+                    if selected_plan.num_batch_tiles == 1
+                    and selected_plan.num_head_tiles == 1
+                    and selected_plan.num_group_tiles == 1
+                    and selected_plan.num_q_tiles == 1
+                    and selected.num_blocks == 1
+                    else "work_divided_tiled"
+                ),
+                reason=("lowest loop, HBM burst, and bounded-spill transfer cost"),
+                kv_block_size=selected.block_size,
+                num_kv_blocks=selected.num_blocks,
+                num_q_tiles=selected_plan.num_q_tiles,
+                q_tile_size=selected_plan.q_tile_size,
+                num_batch_tiles=selected_plan.num_batch_tiles,
+                num_head_tiles=selected_plan.num_head_tiles,
+                num_group_tiles=selected_plan.num_group_tiles,
+                kv_blocks_per_loop_group=_kv_blocks_per_loop_group(
+                    selected_plan.num_q_tiles, selected.num_blocks
+                ),
+                estimated_active_cores=selected_plan.estimated_active_cores,
+                estimated_load_bursts=selected_plan.estimated_load_bursts,
+                estimated_hbm_bytes=selected_plan.estimated_hbm_bytes,
+                estimated_spill_buffers=selected_plan.estimated_spill_buffers,
+                estimated_spill_bytes=selected_plan.estimated_spill_bytes,
+                score_bytes_per_core=selected.score_bytes_per_core,
+                estimated_live_bytes_per_core=selected.estimated_live_bytes_per_core,
+                lx_budget_bytes=lx_budget_bytes,
             )
+        smallest_plan = min(
+            plans, key=lambda plan: plan.kv.estimated_live_bytes_per_core
         )
-        strategy = (
-            "decode"
-            if is_decode and num_kv_blocks == 1
-            else "decode_tiled"
-            if is_decode
-            else "work_divided"
-            if num_q_tiles == 1 and num_kv_blocks == 1
-            else "work_divided_tiled"
-        )
-        return _SDPATilingConfig(
-            strategy=strategy,
-            reason=reason,
-            kv_block_size=selected.block_size,
-            num_kv_blocks=num_kv_blocks,
-            num_q_tiles=num_q_tiles,
-            q_tile_size=selected_query_tile_size,
-            num_head_tiles=1,
-            num_group_tiles=num_group_tiles,
-            kv_blocks_per_loop_group=_kv_blocks_per_loop_group(
-                num_q_tiles, num_kv_blocks
-            ),
-            estimated_active_cores=estimated_active_cores,
-            estimated_load_bursts=selected.estimated_load_bursts,
-            score_bytes_per_core=selected.score_bytes_per_core,
-            estimated_live_bytes_per_core=selected.estimated_live_bytes_per_core,
-            lx_budget_bytes=lx_budget_bytes,
-        )
+        smallest_candidate = smallest_plan.kv
 
-    smallest = min(plans, key=lambda plan: plan[1].estimated_live_bytes_per_core)[1]
-    score_bytes_per_core = smallest.score_bytes_per_core
-    estimated_live_bytes_per_core = smallest.estimated_live_bytes_per_core
+    score_bytes_per_core = smallest_candidate.score_bytes_per_core
+    estimated_live_bytes_per_core = smallest_candidate.estimated_live_bytes_per_core
     reason = "estimated per-core live footprint exceeds the LX budget"
 
     return _SDPATilingConfig(
@@ -745,18 +1046,33 @@ def _select_sdpa_tiling(
         num_kv_blocks=fallback_num_kv_blocks,
         num_q_tiles=fallback_num_q_tiles,
         q_tile_size=fallback_q_tile_size,
+        num_batch_tiles=fallback_num_batch_tiles,
         num_head_tiles=fallback_num_head_tiles,
         num_group_tiles=fallback_num_group_tiles,
         kv_blocks_per_loop_group=fallback_kv_blocks_per_loop_group,
         estimated_active_cores=None,
         estimated_load_bursts=(
             2
-            * num_batch_tiles
+            * fallback_num_batch_tiles
             * fallback_num_head_tiles
             * fallback_num_group_tiles
             * fallback_num_q_tiles
             * fallback_num_kv_blocks
+            + (
+                _sdpa_hbm_transfer_waves(head_tile_staging_bytes, num_cores)
+                if fallback_num_head_tiles > 1
+                else 0
+            )
         ),
+        estimated_hbm_bytes=estimated_hbm_bytes(
+            num_batch_tiles=fallback_num_batch_tiles,
+            num_head_tiles=fallback_num_head_tiles,
+            num_group_tiles=fallback_num_group_tiles,
+            num_q_tiles=fallback_num_q_tiles,
+            num_kv_blocks=fallback_num_kv_blocks,
+        ),
+        estimated_spill_buffers=None,
+        estimated_spill_bytes=None,
         score_bytes_per_core=score_bytes_per_core,
         estimated_live_bytes_per_core=estimated_live_bytes_per_core,
         lx_budget_bytes=lx_budget_bytes,
@@ -1453,42 +1769,6 @@ def spyre__sdpa_overrideable(
     if use_gqa:
         query = query.unflatten(1, (num_kvheads, gqa_group_size))
 
-    tiling = _select_sdpa_tiling(
-        batch_size=batch_size,
-        num_heads=num_heads,
-        num_kvheads=num_kvheads,
-        max_seqlen_q=max_seqlen_q,
-        max_seqlen_kv=max_seqlen_kv,
-        head_dim=head_dim,
-        element_size=query.dtype.itemsize,
-        num_cores=config.sencores,
-        lx_budget_bytes=_sdpa_lx_budget_bytes(),
-    )
-    logger.debug(
-        "SDPA tiling: strategy=%s reason=%s Lq=%s q_tiles=%s "
-        "q_tile_size=%s Lk=%s kv_blocks=%s kv_block_size=%s "
-        "head_tiles=%s group_tiles=%s kv_blocks_per_loop_group=%s "
-        "estimated_active_cores=%s estimated_load_bursts=%s "
-        "score_bytes_per_core=%s estimated_live_bytes_per_core=%s "
-        "lx_budget_bytes=%s",
-        tiling.strategy,
-        tiling.reason,
-        max_seqlen_q,
-        tiling.num_q_tiles,
-        tiling.q_tile_size,
-        max_seqlen_kv,
-        tiling.num_kv_blocks,
-        tiling.kv_block_size,
-        tiling.num_head_tiles,
-        tiling.num_group_tiles,
-        tiling.kv_blocks_per_loop_group,
-        tiling.estimated_active_cores,
-        tiling.estimated_load_bursts,
-        tiling.score_bytes_per_core,
-        tiling.estimated_live_bytes_per_core,
-        tiling.lx_budget_bytes,
-    )
-
     # Precompute the causal additive mask once before entering the tiled loops.
     # Shape [1, 1, max_seqlen_q, max_seqlen_kv]: 0.0 = keep, -inf = masked.
     #
@@ -1531,6 +1811,70 @@ def spyre__sdpa_overrideable(
                 f"MHA attention bias must have rank 2-4, got rank {attn_bias.dim()}"
             )
 
+    masks = tuple(
+        mask
+        for mask in (
+            causal_mask if is_causal else None,
+            attn_bias,
+        )
+        if mask is not None
+    )
+
+    # Tiling an interleaved H axis requires map inputs/outputs to be staged in
+    # HBM. Price both sides of each staging copy. Query itself is normalized
+    # before the loops, but the result must return in its original layout.
+    head_tile_staging_bytes = 0
+    for tensor in (key, value):
+        if not _axis_slice_is_dense(tuple(tensor.shape), tuple(tensor.stride()), 1):
+            head_tile_staging_bytes += 2 * tensor.numel() * tensor.element_size()
+    if not _axis_slice_is_dense(
+        (batch_size, num_heads, max_seqlen_q, head_dim), original_query_strides, 1
+    ):
+        head_tile_staging_bytes += 2 * query.numel() * query.element_size()
+
+    tiling = _select_sdpa_tiling(
+        batch_size=batch_size,
+        num_heads=num_heads,
+        num_kvheads=num_kvheads,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_kv=max_seqlen_kv,
+        head_dim=head_dim,
+        element_size=query.dtype.itemsize,
+        num_cores=config.sencores,
+        lx_budget_bytes=_sdpa_lx_budget_bytes(),
+        mask_shapes=tuple(tuple(mask.shape) for mask in masks),
+        head_tile_staging_bytes=head_tile_staging_bytes,
+    )
+    logger.debug(
+        "SDPA tiling: strategy=%s reason=%s Lq=%s q_tiles=%s "
+        "q_tile_size=%s Lk=%s kv_blocks=%s kv_block_size=%s "
+        "batch_tiles=%s head_tiles=%s group_tiles=%s kv_blocks_per_loop_group=%s "
+        "estimated_active_cores=%s estimated_load_bursts=%s "
+        "estimated_hbm_bytes=%s estimated_spill_buffers=%s "
+        "estimated_spill_bytes=%s score_bytes_per_core=%s "
+        "estimated_live_bytes_per_core=%s lx_budget_bytes=%s",
+        tiling.strategy,
+        tiling.reason,
+        max_seqlen_q,
+        tiling.num_q_tiles,
+        tiling.q_tile_size,
+        max_seqlen_kv,
+        tiling.num_kv_blocks,
+        tiling.kv_block_size,
+        tiling.num_batch_tiles,
+        tiling.num_head_tiles,
+        tiling.num_group_tiles,
+        tiling.kv_blocks_per_loop_group,
+        tiling.estimated_active_cores,
+        tiling.estimated_load_bursts,
+        tiling.estimated_hbm_bytes,
+        tiling.estimated_spill_buffers,
+        tiling.estimated_spill_bytes,
+        tiling.score_bytes_per_core,
+        tiling.estimated_live_bytes_per_core,
+        tiling.lx_budget_bytes,
+    )
+
     # for_each_tile requires equal-sized tiles. The cost model already returns
     # an exact, stick-aligned block; retain the calculation here as a safety net
     # for configurations supplied by fallback or test overrides.
@@ -1550,15 +1894,6 @@ def spyre__sdpa_overrideable(
         batch_size > 1
         and key.stride() == packed_key_strides
         and kv_tile_size % get_elem_in_stick(key.dtype) != 0
-    )
-
-    masks = tuple(
-        mask
-        for mask in (
-            causal_mask if is_causal else None,
-            attn_bias,
-        )
-        if mask is not None
     )
 
     def mask_dims(axis, extent):
@@ -1696,7 +2031,7 @@ def spyre__sdpa_overrideable(
 
         return map_tiles(body, operands, dims, head_tile_size, 1)
 
-    batch_tile_count = _sdpa_num_batch_tiles(batch_size)
+    batch_tile_count = tiling.num_batch_tiles
     batch_tile_size = batch_size // batch_tile_count
     operands = (query, key, value, *masks)
     dims = (0, 0, 0, *mask_dims(0, batch_size))

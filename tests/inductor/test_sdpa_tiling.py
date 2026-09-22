@@ -22,6 +22,15 @@ import torch  # noqa: F401 - loads the registered Spyre backend entry point
 _select_sdpa_tiling = sys.modules[
     "torch_spyre._inductor.decompositions"
 ]._select_sdpa_tiling
+_axis_slice_is_dense = sys.modules[
+    "torch_spyre._inductor.decompositions"
+]._axis_slice_is_dense
+_sdpa_kv_candidates = sys.modules[
+    "torch_spyre._inductor.decompositions"
+]._sdpa_kv_candidates
+_sdpa_mask_hbm_bytes = sys.modules[
+    "torch_spyre._inductor.decompositions"
+]._sdpa_mask_hbm_bytes
 _num_tiles_for_max_extent = sys.modules[
     "torch_spyre._inductor.decompositions"
 ]._num_tiles_for_max_extent
@@ -45,6 +54,8 @@ class TestSDPATiling(unittest.TestCase):
         element_size=2,
         num_cores=32,
         lx_budget_bytes=_LX_BUDGET,
+        mask_shapes=(),
+        head_tile_staging_bytes=0,
     ):
         return _select_sdpa_tiling(
             batch_size=batch_size,
@@ -56,6 +67,46 @@ class TestSDPATiling(unittest.TestCase):
             element_size=element_size,
             num_cores=num_cores,
             lx_budget_bytes=lx_budget_bytes,
+            mask_shapes=mask_shapes,
+            head_tile_staging_bytes=head_tile_staging_bytes,
+        )
+
+    def _select_production_gqa(
+        self,
+        *,
+        num_heads,
+        num_kvheads,
+        max_seqlen_q,
+        max_seqlen_kv,
+        head_dim,
+        batch_size=1,
+        element_size=2,
+    ):
+        """Model the adapter's broadcast mask and interleaved B/S/H/D inputs."""
+        mask_shape = (
+            batch_size,
+            1,
+            1,
+            max_seqlen_q,
+            max_seqlen_kv,
+        )
+        query_bytes = batch_size * num_heads * max_seqlen_q * head_dim * element_size
+        one_kv_bytes = (
+            batch_size * num_kvheads * max_seqlen_kv * head_dim * element_size
+        )
+        # A head tile of an interleaved input needs a read and a staging write
+        # for K and V; restoring the output query layout has the same two sides.
+        head_tile_staging_bytes = 2 * (2 * one_kv_bytes + query_bytes)
+        return self._select(
+            batch_size=batch_size,
+            num_heads=num_heads,
+            num_kvheads=num_kvheads,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_kv=max_seqlen_kv,
+            head_dim=head_dim,
+            element_size=element_size,
+            mask_shapes=(mask_shape,),
+            head_tile_staging_bytes=head_tile_staging_bytes,
         )
 
     def test_exact_tile_search_is_bounded_and_returns_a_valid_split(self):
@@ -110,17 +161,19 @@ class TestSDPATiling(unittest.TestCase):
         self.assertEqual(config.estimated_active_cores, 32)
         self.assertEqual(config.estimated_load_bursts, 2)
         self.assertEqual(config.score_bytes_per_core, 192 * 1024)
-        self.assertEqual(config.estimated_live_bytes_per_core, 951040)
+        self.assertEqual(config.estimated_live_bytes_per_core, 1024768)
 
-    def test_batch_coarse_tiling_reduces_per_core_live_footprint(self):
+    def test_five_axis_search_reduces_per_core_live_footprint(self):
         config = self._select(batch_size=4, head_dim=64)
 
         self.assertEqual(config.strategy, "work_divided_tiled")
-        self.assertEqual(config.kv_block_size, 256)
-        self.assertEqual(config.num_kv_blocks, 2)
+        self.assertEqual(config.kv_block_size, 512)
+        self.assertEqual(config.num_kv_blocks, 1)
+        self.assertEqual(config.num_batch_tiles, 1)
+        self.assertEqual(config.num_head_tiles, 3)
         self.assertEqual(config.estimated_active_cores, 32)
-        self.assertEqual(config.score_bytes_per_core, 192 * 1024)
-        self.assertEqual(config.estimated_live_bytes_per_core, 1017344)
+        self.assertEqual(config.score_bytes_per_core, 256 * 1024)
+        self.assertEqual(config.estimated_live_bytes_per_core, 1344512)
 
     def test_batch_tiles_are_exact_for_odd_extents(self):
         for batch_size, expected_tiles in ((1, 1), (2, 1), (3, 3), (4, 2), (7, 7)):
@@ -161,15 +214,22 @@ class TestSDPATiling(unittest.TestCase):
 
         self.assertEqual(config.estimated_active_cores, 32)
 
-    def test_prefill_block_tracks_physical_kv_footprint_and_gqa_reuse(self):
+    def test_prefill_search_can_tile_every_outer_axis(self):
         cases = (
-            # Hq, Hkv, D, expected K block
-            (32, 8, 128, 1024),
-            (16, 8, 256, 512),
-            (16, 2, 512, 1024),
-            (16, 1, 512, 1024),
+            # Hq, Hkv, D, K block, H tiles, G tiles
+            (32, 8, 128, 512, 2, 1),
+            (16, 8, 256, 256, 1, 1),
+            (16, 2, 512, 256, 2, 1),
+            (16, 1, 512, 256, 1, 2),
         )
-        for num_heads, num_kvheads, head_dim, expected_block in cases:
+        for (
+            num_heads,
+            num_kvheads,
+            head_dim,
+            expected_block,
+            expected_head_tiles,
+            expected_group_tiles,
+        ) in cases:
             with self.subTest(
                 num_heads=num_heads, num_kvheads=num_kvheads, head_dim=head_dim
             ):
@@ -183,10 +243,12 @@ class TestSDPATiling(unittest.TestCase):
                 self.assertEqual(config.strategy, "work_divided_tiled")
                 self.assertEqual(config.kv_block_size, expected_block)
                 self.assertEqual(config.num_kv_blocks, 8192 // expected_block)
+                self.assertEqual(config.num_head_tiles, expected_head_tiles)
+                self.assertEqual(config.num_group_tiles, expected_group_tiles)
                 self.assertEqual(config.estimated_active_cores, 32)
 
     def test_short_gqa_chunks_use_available_head_query_parallelism(self):
-        for query_length, expected_cores in ((2, 16), (8, 32), (16, 32), (64, 32)):
+        for query_length in (2, 8, 16, 64):
             with self.subTest(query_length=query_length):
                 config = self._select(
                     num_heads=32,
@@ -196,10 +258,13 @@ class TestSDPATiling(unittest.TestCase):
                 )
 
                 self.assertEqual(config.strategy, "work_divided_tiled")
-                self.assertEqual(config.kv_block_size, 4096)
+                self.assertEqual(
+                    config.kv_block_size,
+                    4096 if query_length <= 16 else 1024,
+                )
                 self.assertEqual(config.num_head_tiles, 1)
-                self.assertEqual(config.num_group_tiles, 4)
-                self.assertEqual(config.estimated_active_cores, expected_cores)
+                self.assertEqual(config.num_group_tiles, 1)
+                self.assertEqual(config.estimated_active_cores, 32)
 
     def test_gqa_core_estimate_uses_the_inner_hkv_and_query_axes(self):
         config = self._select(
@@ -224,10 +289,7 @@ class TestSDPATiling(unittest.TestCase):
                 )
 
                 self.assertEqual(config.kv_block_size, 1024)
-                self.assertEqual(
-                    config.estimated_active_cores,
-                    min(32, num_kvheads * 16),
-                )
+                self.assertEqual(config.estimated_active_cores, 32)
 
     def test_decode_selects_lx_resident_k_when_block_count_is_small(self):
         cases = (
@@ -319,36 +381,57 @@ class TestSDPATiling(unittest.TestCase):
                 self.assertEqual(config.strategy, "work_divided_tiled")
                 self.assertEqual(
                     config.reason,
-                    "fewest K/V load bursts with an LX-resident HOP live set",
+                    "lowest loop, HBM burst, and bounded-spill transfer cost",
                 )
                 self.assertGreater(config.num_kv_blocks, 1)
-                self.assertGreater(config.num_q_tiles, 1)
-                self.assertLessEqual(
-                    config.estimated_live_bytes_per_core,
-                    config.lx_budget_bytes,
-                )
+                self.assertGreater(config.num_head_tiles * config.num_q_tiles, 1)
+                self.assertLessEqual(config.estimated_spill_buffers, 1)
                 self.assertEqual(
                     config.kv_blocks_per_loop_group,
                     min(config.num_kv_blocks, max(1, 16 // config.num_q_tiles)),
                 )
 
-    def test_production_chunk_size_uses_compiler_cost_selection(self):
-        config = self._select(
-            num_heads=16,
-            num_kvheads=8,
-            max_seqlen_q=1024,
-            max_seqlen_kv=8192,
-            head_dim=256,
+    def test_production_chunks_account_for_mask_and_interleaved_layout(self):
+        cases = (
+            # Hq, Hkv, Lq, Lk, D, Q tiles, expected K block, spills
+            (32, 8, 512, 8192, 128, 2, 512, 1),
+            (32, 8, 512, 32768, 128, 4, 1024, 0),
+            (16, 8, 1024, 8192, 256, 2, 256, 0),
+            (16, 8, 1024, 32768, 256, 2, 256, 0),
         )
+        for (
+            num_heads,
+            num_kvheads,
+            query_length,
+            kv_length,
+            head_dim,
+            query_tiles,
+            kv_block,
+            spill_buffers,
+        ) in cases:
+            with self.subTest(
+                num_heads=num_heads,
+                num_kvheads=num_kvheads,
+                query_length=query_length,
+                head_dim=head_dim,
+            ):
+                config = self._select_production_gqa(
+                    num_heads=num_heads,
+                    num_kvheads=num_kvheads,
+                    max_seqlen_q=query_length,
+                    max_seqlen_kv=kv_length,
+                    head_dim=head_dim,
+                )
 
-        self.assertEqual(config.strategy, "work_divided_tiled")
-        self.assertEqual(config.num_q_tiles, 1)
-        self.assertEqual(config.q_tile_size, 1024)
-        self.assertEqual(config.num_head_tiles, 1)
-        self.assertEqual(config.num_group_tiles, 2)
-        self.assertEqual(config.kv_block_size, 256)
-        self.assertEqual(config.estimated_active_cores, 32)
-        self.assertEqual(config.estimated_load_bursts, 128)
+                self.assertEqual(config.strategy, "work_divided_tiled")
+                self.assertEqual(config.num_q_tiles, query_tiles)
+                self.assertEqual(config.q_tile_size, query_length // query_tiles)
+                self.assertEqual(config.num_batch_tiles, 1)
+                self.assertEqual(config.num_head_tiles, 1)
+                self.assertEqual(config.num_group_tiles, 1)
+                self.assertEqual(config.kv_block_size, kv_block)
+                self.assertEqual(config.estimated_spill_buffers, spill_buffers)
+                self.assertEqual(config.estimated_active_cores, 32)
 
     def test_selected_kv_tiles_are_exact_and_stick_aligned(self):
         config = self._select(
@@ -367,15 +450,141 @@ class TestSDPATiling(unittest.TestCase):
             3520,
         )
 
-    def test_lx_budget_reduces_kv_block_until_live_values_fit(self):
+    def test_lx_budget_allows_one_priced_carry_spill(self):
         config = self._select(batch_size=2, lx_budget_bytes=300 * 1024)
 
         self.assertEqual(config.strategy, "work_divided_tiled")
-        self.assertEqual(config.kv_block_size, 128)
-        self.assertEqual(config.num_kv_blocks, 4)
-        self.assertEqual(config.num_q_tiles, 4)
-        self.assertEqual(config.score_bytes_per_core, 24 * 1024)
-        self.assertEqual(config.estimated_live_bytes_per_core, 229760)
+        self.assertEqual(config.kv_block_size, 256)
+        self.assertEqual(config.num_kv_blocks, 2)
+        self.assertEqual(config.num_q_tiles, 1)
+        self.assertEqual(config.num_head_tiles, 6)
+        self.assertEqual(config.score_bytes_per_core, 32 * 1024)
+        self.assertEqual(config.estimated_live_bytes_per_core, 311552)
+        self.assertEqual(config.estimated_spill_buffers, 1)
+        self.assertGreater(config.estimated_spill_bytes, 0)
+
+    def test_batch_axis_is_enumerated_and_exact(self):
+        config = self._select(batch_size=6, lx_budget_bytes=600 * 1024)
+
+        self.assertEqual(config.num_batch_tiles, 2)
+        self.assertEqual(6 % config.num_batch_tiles, 0)
+        self.assertEqual(config.num_head_tiles, 4)
+        self.assertGreater(config.estimated_live_bytes_per_core, config.lx_budget_bytes)
+        self.assertEqual(config.estimated_spill_buffers, 1)
+
+    def test_broadcast_mask_replay_is_charged_on_outer_map_axes(self):
+        one_mask_pass = 512 * 8192 * 2
+        estimated = _sdpa_mask_hbm_bytes(
+            mask_shapes=((1, 1, 1, 512, 8192),),
+            axis_extents=(1, 8, 4, 512, 8192),
+            axis_tile_counts=(1, 2, 4, 2, 16),
+            element_size=2,
+        )
+
+        # Q and K slice the mask, while its broadcast H/G axes replay it.
+        self.assertEqual(estimated, one_mask_pass * 2 * 4)
+
+    def test_interleaved_head_staging_favors_query_tiling(self):
+        kwargs = dict(
+            num_heads=32,
+            num_kvheads=8,
+            max_seqlen_q=512,
+            max_seqlen_kv=8192,
+            head_dim=128,
+            mask_shapes=((1, 1, 1, 512, 8192),),
+        )
+        without_staging = self._select(**kwargs)
+        with_staging = self._select(
+            **kwargs,
+            head_tile_staging_bytes=75_497_472,
+        )
+
+        self.assertEqual(without_staging.num_head_tiles, 2)
+        self.assertEqual(without_staging.num_q_tiles, 1)
+        self.assertEqual(with_staging.num_head_tiles, 1)
+        self.assertEqual(with_staging.num_q_tiles, 2)
+
+    def test_interleaved_head_axis_is_not_dense(self):
+        shape = (1, 8, 8192, 128)
+        self.assertTrue(
+            _axis_slice_is_dense(shape, (8 * 8192 * 128, 8192 * 128, 128, 1), 1)
+        )
+        self.assertFalse(
+            _axis_slice_is_dense(shape, (8192 * 8 * 128, 128, 8 * 128, 1), 1)
+        )
+
+    def test_conservative_restick_estimate_rejects_near_budget_plan(self):
+        candidates = _sdpa_kv_candidates(
+            batch_size=1,
+            num_heads=32,
+            num_kvheads=8,
+            max_seqlen_q=512,
+            max_seqlen_kv=8192,
+            head_dim=128,
+            element_size=2,
+            num_cores=32,
+            query_tile_size=512,
+            group_tile_size=4,
+            num_outer_tiles=1,
+            nested_hop=True,
+        )
+        k256 = next(
+            candidate for candidate in candidates if candidate.block_size == 256
+        )
+
+        self.assertEqual(k256.estimated_restick_active_cores, 8)
+        self.assertEqual(k256.estimated_live_bytes_per_core, 2_033_664)
+        self.assertGreater(k256.estimated_live_bytes_per_core, self._LX_BUDGET)
+
+    def test_map_carry_residency_preserves_the_right_production_split(self):
+        def candidate(*, query_tile_size, group_tile_size, block_size, head_dim):
+            candidates = _sdpa_kv_candidates(
+                batch_size=1,
+                num_heads=8 * group_tile_size,
+                num_kvheads=8,
+                max_seqlen_q=query_tile_size,
+                max_seqlen_kv=8192,
+                head_dim=head_dim,
+                element_size=2,
+                num_cores=32,
+                query_tile_size=query_tile_size,
+                group_tile_size=group_tile_size,
+                num_outer_tiles=1,
+                nested_hop=True,
+            )
+            return next(item for item in candidates if item.block_size == block_size)
+
+        granite_q2_k512 = candidate(
+            query_tile_size=256,
+            group_tile_size=4,
+            block_size=512,
+            head_dim=128,
+        )
+        granite_q4_k1024 = candidate(
+            query_tile_size=128,
+            group_tile_size=4,
+            block_size=1024,
+            head_dim=128,
+        )
+        gemma_q2_k256 = candidate(
+            query_tile_size=512,
+            group_tile_size=2,
+            block_size=256,
+            head_dim=256,
+        )
+
+        self.assertGreater(
+            granite_q2_k512.estimated_live_bytes_per_core,
+            self._LX_BUDGET,
+        )
+        self.assertLessEqual(
+            granite_q4_k1024.estimated_live_bytes_per_core,
+            self._LX_BUDGET,
+        )
+        self.assertLessEqual(
+            gemma_q2_k256.estimated_live_bytes_per_core,
+            self._LX_BUDGET,
+        )
 
     def test_live_footprint_over_budget_keeps_coarse_tiling(self):
         config = self._select(batch_size=2, lx_budget_bytes=16 * 1024)
@@ -431,6 +640,7 @@ class TestSDPATiling(unittest.TestCase):
                             query_length,
                         )
                         self.assertEqual(num_heads % config.num_head_tiles, 0)
+                        self.assertEqual(1 % config.num_batch_tiles, 0)
                         group_size = num_heads // num_kvheads
                         self.assertEqual(group_size % config.num_group_tiles, 0)
                         if config.estimated_active_cores is not None:
@@ -439,9 +649,14 @@ class TestSDPATiling(unittest.TestCase):
                         if config.strategy != "coarse_tiled":
                             self.assertIsNotNone(config.estimated_live_bytes_per_core)
                             assert config.estimated_live_bytes_per_core is not None
-                            self.assertLessEqual(
-                                config.estimated_live_bytes_per_core,
-                                config.lx_budget_bytes,
+                            self.assertIsNotNone(config.estimated_spill_buffers)
+                            self.assertLessEqual(config.estimated_spill_buffers, 1)
+                            self.assertEqual(
+                                config.estimated_spill_buffers,
+                                int(
+                                    config.estimated_live_bytes_per_core
+                                    > config.lx_budget_bytes
+                                ),
                             )
                             self.assertGreaterEqual(config.estimated_load_bursts, 2)
 
