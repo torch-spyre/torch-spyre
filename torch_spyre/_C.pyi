@@ -444,6 +444,11 @@ def prepare_kernel(
             If None, uses the current stream. Defaults to None.
         profiler_event_name: Bounded base name for profiler-visible compute events.
             If None, uses the existing SpyreCode or directory-derived name.
+        sdsc_bundle_dir_prefix: Prefix of the SDSC bundle directory.
+            16 characters on the cached path (first 16 of the base32-encoded
+            SHA-256 cache key), 8 hex characters on the no-cache/KTIR path
+            (first 8 of the UUID prefix). Emitted as ``args.sdsc_bundle_dir_prefix`` in
+            profiler traces. Empty string disables registration. Defaults to "".
 
     Returns:
         Prepared JobPlan ready for execution

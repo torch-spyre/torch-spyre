@@ -303,18 +303,15 @@ class _SpyreCompileFuture(CodeCacheFuture):
         if self._cache_key is not None:
             code_dir = commit_compile_dir(self._compile_dir, self._cache_key)
         # sdsc_bundle_dir_prefix selection:
-        # cached path  — first 16 characters of cache_key (64 bits).
-        # Two distinct kernels sharing the same 16 character prefix
-        # is possible but extremely unlikely. With 64 bits of uniform entropy
-        # the birthday-paradox threshold is ~2^32 (~4 billion) kernels before
-        # the expected number of collisions reaches one. No realistic workload
-        # approaches that count, so a collision is negligible in practice.
-        #
-        # no-cache path — 8 character UUID hex prefix.
-        # 8 character prefix is sufficient due to the small number of ephemeral
-        # SDSC bundles compiled in one process run. Can use the (activity base name,
-        # 8-char UUID hex prefix) pair to uniquely identify the SDSC bundle directory
-        # associated with a kernel event.
+        # cached path  — first 16 characterss of cache_key, a base32-encoded
+        #                SHA-256 digest (80 bits of entropy); prefix
+        #                collision across distinct kernels is possible but
+        #                negligible in practice (birthday bound ~2^40 kernels).
+        # no-cache path — first 8 hex characters of a UUID (32 bits of randomness);
+        #                 sufficient for the small number of ephemeral bundles
+        #                 in one process run. Can use the (activity base name,
+        #                 8 hex character UUID hex prefix) pair to uniquely identify the
+        #                 SDSC bundle directory associated with a kernel event.
         self._runner = SpyreSDSCKernelRunner(
             self._kernel_name,
             code_dir,
@@ -449,6 +446,7 @@ class SpyreAsyncCompile(AsyncCompile):
             # neither generate_bundle nor the backend compiler runs at all
             # (only the kernel_name.txt marker is touched).
             # sdsc_bundle_dir_prefix on the cached path is cache_key[:16].
+            # (first 16 characters of a base32-encoded SHA-256 digest).
             try:
                 cache_key = compute_specs_hash(
                     specs, kernel_name=kernel_name, pool_size=pool_size
@@ -516,7 +514,7 @@ class SpyreAsyncCompile(AsyncCompile):
 
         # Caching disabled (SPYRE_KERNEL_CACHE=0 or force_disable_caches).
         # Compile into a throw-away temp dir that lives for this process only.
-        # sdsc_bundle_dir_prefix on the no-cache path is a 8-char UUID hex prefix.
+        # sdsc_bundle_dir_prefix on the no-cache path is a 8 character UUID hex prefix.
         sdsc_bundle_dir_prefix = uuid.uuid4().hex[:8]
         output_dir = get_output_dir(kernel_name, sdsc_bundle_dir_prefix)
         symbol_kinds = _compile_to_dir(kernel_name, output_dir, specs, pool_size)
@@ -582,7 +580,7 @@ class SpyreAsyncCompile(AsyncCompile):
 
         # Persist the emitted KTIR as a text file in the same per-kernel output
         # dir as sdsc's bundle.
-        # sdsc_bundle_dir_prefix on the KTIR path is a 8-char UUID hex prefix.
+        # sdsc_bundle_dir_prefix on the KTIR path is a 8 character UUID hex prefix.
         sdsc_bundle_dir_prefix = uuid.uuid4().hex[:8]
         output_dir = get_output_dir(kernel_name, sdsc_bundle_dir_prefix)
         ktir_path = os.path.join(output_dir, f"{_safe_kernel_name(kernel_name)}.ktir")

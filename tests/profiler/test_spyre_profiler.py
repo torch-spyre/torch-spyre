@@ -497,8 +497,8 @@ def test_sdsc_bundle_dir_prefix_in_kernel_event_args_with_cache(monkeypatch, tmp
         "No trace events captured; profiler produced an empty traceEvents list"
     )
 
-    # Collect the first 16 chars of every committed cache-key dir name.
-    # Committed dirs are named <cache_key> (64 hex chars); .tmp. dirs are in-progress
+    # Collect the first 16 characters of every committed cache-key directory name.
+    # Committed directories are named <cache_key> (a base32-encoded SHA-256 digest); .tmp. dirs are in-progress
     # and are excluded. The runner receives cache_key[:16] as sdsc_bundle_dir_prefix.
     sdsc_bundle_dir_prefixes = [
         entry.name[:16]

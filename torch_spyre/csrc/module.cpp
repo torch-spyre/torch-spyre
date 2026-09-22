@@ -646,8 +646,9 @@ PYBIND11_MODULE(_C, m) {
         "profiler-visible compute events. Defaults to None.\n"
         "    sdsc_bundle_dir_prefix (str, optional): Hex prefix of the SDSC "
         "bundle directory; emitted as args.sdsc_bundle_dir_prefix in profiler "
-        "traces.  Use 16 chars (first 16 of the SHA-256 cache key) on the "
-        "cached path, or 8 chars (UUID prefix) on the no-cache path. "
+        "traces.  Use 16 characters (first 16 of the SHA-256 cache key) on the "
+        "cached path, or 8 hex characters (first 8 of the UUID prefix) on the "
+        "no-cache/KTIR path. "
         "Empty string disables registration.\n\n "
         "Returns:\n"
         "    Prepared JobPlan ready for execution");
