@@ -83,6 +83,8 @@ from for_each_tile_fixtures import (
     batched_online_softmax_fn,
     nested_add_outer_row_inner_col_fn,
     nested_add_outer_row_inner_col_reference,
+    nested_online_softmax_fn,
+    nested_online_softmax_reference,
     nested_split_m_then_k_fn,
     nested_split_m_then_k_reference,
     online_softmax_fn,
@@ -92,6 +94,8 @@ from for_each_tile_fixtures import (
     paged_gather_kv_fn,
     paged_gather_kv_inputs,
     paged_gather_kv_reference,
+    paged_gather_nested_fn,
+    paged_gather_nested_reference,
     paged_gather_reference,
     softmax_row_tiled_fn,
     softmax_row_tiled_reference,
@@ -689,6 +693,65 @@ class TestForEachTileNestedCarryE2E(_DynamoResetTestCase):
             triple_nested_stardep_multilevel_fn, backend="inductor", fullgraph=True
         )
         out = compiled(X_spyre, Y_spyre)
+
+        torch.testing.assert_close(
+            out.cpu().float(), ref, atol=self.ATOL, rtol=self.RTOL
+        )
+
+    def test_nested_online_softmax(self):
+        """Map-outer/carry-inner nesting with a multi-leaf carry.
+
+        nested_online_softmax_fn maps Q-row-tiles around online_softmax_fn's
+        own 3-leaf (m, denom, acc) carry over K/V tiles -- unlike
+        test_batched_map_over_online_softmax_carry (which stages full K/V
+        buffers in the outer loop and tiles Lk in the inner one), this
+        fixture re-runs the ENTIRE online-softmax recurrence, including its
+        own K/V tiling, once per outer Q-tile: the nesting wraps a full
+        inner for_each_tile call rather than sharing one carry-tiling level
+        across both loops.
+        """
+        Q = cached_xavier((LQ, D))
+        K = cached_xavier((LK, D), differentiation=1)
+        V = cached_xavier((LK, D), differentiation=2)
+        ref = nested_online_softmax_reference(
+            dl16_round(Q.float()), dl16_round(K.float()), dl16_round(V.float())
+        )
+
+        compiled = torch.compile(
+            nested_online_softmax_fn, backend="inductor", fullgraph=True
+        )
+        out = compiled(Q.to(DEVICE_NAME), K.to(DEVICE_NAME), V.to(DEVICE_NAME))
+
+        torch.testing.assert_close(
+            out.cpu().float(), ref, atol=self.ATOL, rtol=self.RTOL
+        )
+
+
+class TestForEachTileNestedGatherE2E(_DynamoResetTestCase):
+    """Kind.GATHER nested inside another for_each_tile level.
+
+    paged_gather_fn/paged_gather_kv_fn (TestForEachTileE2E) exercise
+    Kind.GATHER but only as a single loop level. paged_gather_nested_fn
+    wraps an outer map over Q-row-tiles around that same gather-mode body
+    (tiled block table, invariant page pool, one page gathered per trip),
+    the shape paged attention would want with an outer query tile.
+    """
+
+    ATOL = 1e-2
+    RTOL = 1e-2
+
+    def test_gather_mode_nested_paged_pages(self):
+        _, table, _ = paged_gather_inputs()
+        pages = cached_xavier((PAGE_POOL, PAGE_SIZE, PAGE_HS))
+        q = cached_xavier((PAGE_LQ, PAGE_HS), differentiation=1)
+        ref = paged_gather_nested_reference(
+            dl16_round(pages.float()), dl16_round(q.float())
+        )
+
+        compiled = torch.compile(
+            paged_gather_nested_fn, backend="inductor", fullgraph=True
+        )
+        out = compiled(pages.to(DEVICE_NAME), table.to(DEVICE_NAME), q.to(DEVICE_NAME))
 
         torch.testing.assert_close(
             out.cpu().float(), ref, atol=self.ATOL, rtol=self.RTOL

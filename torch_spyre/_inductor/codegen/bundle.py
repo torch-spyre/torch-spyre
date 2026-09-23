@@ -473,10 +473,10 @@ def generate_bundle(
         f.write("\t}\n")
         f.write("}\n")
 
-    if sdsc_log.isEnabledFor(logging.INFO):
+    if sdsc_log.isEnabledFor(logging.DEBUG):
         bundle_path = os.path.join(output_dir, "bundle.mlir")
         with open(bundle_path, "r") as bf:
-            sdsc_log.info("BUNDLE MLIR [bundle.mlir]\n%s", bf.read())
+            sdsc_log.debug("BUNDLE MLIR [bundle.mlir]\n%s", bf.read())
 
     return param_symbol_kinds
 
@@ -567,8 +567,8 @@ def _compile_specs(
                     cached_json,
                 )
             )
-            if sdsc_log.isEnabledFor(logging.INFO):
-                sdsc_log.info(
+            if sdsc_log.isEnabledFor(logging.DEBUG):
+                sdsc_log.debug(
                     "SDSC JSON [%s]\n%s",
                     file_name,
                     json.dumps(sdsc_json, indent=2),
