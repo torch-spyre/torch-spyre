@@ -37,7 +37,11 @@ from spyre_clickhouse_ingest.identity import (
     component_of,
     run_id_for,
 )
-from spyre_clickhouse_ingest.hw_schema import DEFAULT_TABLE, already_ingested
+from spyre_clickhouse_ingest.hw_schema import (
+    DEFAULT_TABLE,
+    already_ingested,
+    ensure_extra_columns,
+)
 
 
 def main() -> None:
@@ -123,6 +127,8 @@ def main() -> None:
     client = get_client()
     client.command("SELECT 1")
     print("[info] Connected.\n")
+
+    ensure_extra_columns(client, table=args.table)
 
     # One JSON file is one run, so the first record's coordinate represents the batch. It is a
     # hash INPUT, not the run_id: --gha-run-id is the flag form of the same value.

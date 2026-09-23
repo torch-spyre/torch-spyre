@@ -14,9 +14,11 @@
 
 """hw_failure_diagnostics: v1-generation, self-migrating -- NOT a schema.Table."""
 
+import sys
+
 
 class HwFailureDiagnostics:
-    """Column order and dedup check for the self-migrating table."""
+    """Column order, self-migration and dedup check for the self-migrating table."""
 
     DEFAULT_TABLE = "hw_failure_diagnostics"
     NIL_UUID = "00000000-0000-0000-0000-000000000000"
@@ -68,6 +70,35 @@ class HwFailureDiagnostics:
         "props",  # external_run_id (the raw run_id hash input) and run_url
     )
 
+    # Columns absent from older deployments of this table (types match schema/45-hw-diagnostics
+    # .sql, whose CREATE TABLE IF NOT EXISTS is a no-op against an already-existing table).
+    # ADD COLUMN IF NOT EXISTS is idempotent, so this runs on every ingest and is the only
+    # migration path this table has.
+    EXTRA_COLUMNS = (
+        (
+            "artifact_id",
+            "UUID DEFAULT toUUID('00000000-0000-0000-0000-000000000000')",
+        ),
+        ("component", "LowCardinality(String) DEFAULT ''"),
+        ("arch", "LowCardinality(String) DEFAULT ''"),
+        ("props", "Map(LowCardinality(String), String)"),
+    )
+
+    @classmethod
+    def ensure_extra_columns(cls, client, table: str = "") -> None:
+        """Add any missing EXTRA_COLUMNS. Non-fatal per column: the usual cause is that it
+        already exists, and a failure here must not cost the run its rows."""
+        table = table or cls.DEFAULT_TABLE
+        for col_name, col_type in cls.EXTRA_COLUMNS:
+            try:
+                client.command(
+                    f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {col_name} {col_type}"
+                )
+            except Exception as exc:
+                print(
+                    f"  [warn] Could not add column {col_name}: {exc}", file=sys.stderr
+                )
+
     @classmethod
     def already_ingested(
         cls, client, run_id: str, component: str, table: str = ""
@@ -85,4 +116,6 @@ class HwFailureDiagnostics:
 HW_COLUMN_NAMES = HwFailureDiagnostics.COLUMN_NAMES
 NIL_UUID = HwFailureDiagnostics.NIL_UUID
 DEFAULT_TABLE = HwFailureDiagnostics.DEFAULT_TABLE
+EXTRA_COLUMNS = HwFailureDiagnostics.EXTRA_COLUMNS
+ensure_extra_columns = HwFailureDiagnostics.ensure_extra_columns
 already_ingested = HwFailureDiagnostics.already_ingested
