@@ -176,13 +176,12 @@ def _loop_advance_bound(
     return lo, hi
 
 
-def _copy_readers(operations: list[Operation], copy_name: str) -> list[ComputedBuffer]:
+def _copy_readers(operations: list[Operation], copy_name: str) -> list[Operation]:
     readers = []
     for op in operations:
-        if not isinstance(op, ComputedBuffer):
-            continue
         if any(
-            dep.name == copy_name for dep in _memory_deps(op.get_read_writes().reads)
+            getattr(dep, "name", None) == copy_name
+            for dep in op.get_read_writes().reads
         ):
             readers.append(op)
     return readers
@@ -550,6 +549,7 @@ def elide_proven_read_copies(graph: GraphLowering) -> None:
         return
 
     operations = graph.operations
+    graph_output_names = set(graph.get_output_names())
     for consumer in list(operations):
         record = getattr(consumer, "_read_copy_elision_record", None)
         if not isinstance(consumer, ComputedBuffer) or not isinstance(
@@ -567,6 +567,12 @@ def elide_proven_read_copies(graph: GraphLowering) -> None:
         if copy_op is None:
             logger.debug(
                 "read-copy elision declined for %s: copy is absent",
+                record.consumer_name,
+            )
+            continue
+        if record.copy_name in graph_output_names:
+            logger.debug(
+                "read-copy elision declined for %s: copy is a graph output",
                 record.consumer_name,
             )
             continue
@@ -619,7 +625,11 @@ def elide_proven_read_copies(graph: GraphLowering) -> None:
                 ),
                 None,
             )
-            if orphan is not None and not _copy_readers(operations, orphan_name):
+            if (
+                orphan is not None
+                and orphan_name not in graph_output_names
+                and not _copy_readers(operations, orphan_name)
+            ):
                 graph.removed_buffers.add(orphan_name)
                 operations.remove(orphan)
         logger.info(

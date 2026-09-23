@@ -817,6 +817,10 @@ class TestSpliceWhileLoops(unittest.TestCase):
             self.assertEqual(len(direct_readers), 1)
             direct_reader = direct_readers[0]
             direct_record = direct_reader._read_copy_elision_record
+            self.assertTrue(
+                direct_reader.data.origins,
+                "rewriting the nested identity erased its FX provenance",
+            )
             self.assertEqual(direct_record.copy_name, input_copy.get_name())
             self.assertEqual(direct_record.source_name, source_name)
 
@@ -1006,60 +1010,171 @@ class TestSpliceWhileLoops(unittest.TestCase):
             )
         )
 
-    def test_head_slice_is_not_a_host_identity_access(self):
-        """Do not feed an origins-less synthetic head slice to stickification."""
-        import sympy
+    def test_identity_recognition_declines_an_untraceable_pointwise(self):
         from torch._inductor import ir
-        from torch._inductor.dependencies import MemoryDep
+
+        from torch_spyre._inductor.wsr.for_each_tile_lowering import _identity_load
+
+        def unsupported_inner(_index):
+            raise RuntimeError("not executable by the identity recorder")
+
+        op = ir.ComputedBuffer(
+            name="not_an_identity",
+            layout=ir.FixedLayout(
+                torch.device("cpu"), torch.float32, size=[4], stride=[1]
+            ),
+            data=ir.Pointwise(
+                device=torch.device("cpu"),
+                dtype=torch.float32,
+                inner_fn=unsupported_inner,
+                ranges=[4],
+            ),
+        )
+
+        self.assertIsNone(_identity_load(op))
+
+    def test_identity_chain_declines_a_flat_slice_offset(self):
+        import sympy
+
+        from torch_spyre._inductor.wsr.coarse_tile import _rescale_index
+        from torch_spyre._inductor.wsr.for_each_tile_lowering import (
+            _IdentityChainLoadHandler,
+        )
+
+        class LoadRecorder:
+            def load(self, name, index):
+                return name, index
+
+        i, j = sympy.symbols("i j", integer=True, nonnegative=True)
+        handler = _IdentityChainLoadHandler(
+            LoadRecorder(),
+            {
+                "staged": (
+                    "source",
+                    [4, 4],
+                    [4, 1],
+                    [8, 1],
+                    sympy.S.Zero,
+                )
+            },
+            (),
+            _rescale_index,
+            {i, j},
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "constant offset"):
+            handler.load("staged", 4 * i + j + 1)
+
+    def test_identity_chain_declines_a_symbolic_flat_slice_offset(self):
+        import sympy
+
+        from torch_spyre._inductor.wsr.coarse_tile import _rescale_index
+        from torch_spyre._inductor.wsr.for_each_tile_lowering import (
+            _IdentityChainLoadHandler,
+        )
+
+        class LoadRecorder:
+            def load(self, name, index):
+                return name, index
+
+        i, j, width = sympy.symbols("i j width", integer=True, nonnegative=True)
+        handler = _IdentityChainLoadHandler(
+            LoadRecorder(),
+            {
+                "staged": (
+                    "source",
+                    [4, width],
+                    [width, 1],
+                    [2 * width, 1],
+                    sympy.S.Zero,
+                )
+            },
+            (),
+            _rescale_index,
+            {i, j},
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "constant offset"):
+            handler.load("staged", width * i + j + width)
+
+    def test_identity_chain_declines_ambiguous_stride_mapping(self):
+        import sympy
+
+        from torch_spyre._inductor.wsr.coarse_tile import _rescale_index
+        from torch_spyre._inductor.wsr.for_each_tile_lowering import (
+            _IdentityChainLoadHandler,
+        )
+
+        class LoadRecorder:
+            def load(self, name, index):
+                return name, index
+
+        i, j = sympy.symbols("i j", integer=True, nonnegative=True)
+        handler = _IdentityChainLoadHandler(
+            LoadRecorder(),
+            {
+                "staged": (
+                    "source",
+                    [4, 4],
+                    [4, 4],
+                    [8, 4],
+                    sympy.S.Zero,
+                )
+            },
+            (),
+            _rescale_index,
+            {i, j},
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "ambiguous full_stride"):
+            handler.load("staged", 4 * i)
+
+    def test_identity_contraction_requires_every_reader_to_be_covered(self):
+        import sympy
 
         from torch_spyre._inductor.wsr.for_each_tile_lowering import (
-            _is_host_identity_access,
+            _prune_unsafe_identity_selections,
         )
 
-        batch, head, sequence, feature = sympy.symbols(
-            "batch head sequence feature", integer=True, nonnegative=True
-        )
-        full_layout = ir.FixedLayout(
-            torch.device("cpu"),
-            torch.float16,
-            size=[4, 12, 512, 64],
-            stride=[393216, 32768, 64, 1],
-        )
-        tile_layout = ir.FixedLayout(
-            torch.device("cpu"),
-            torch.float16,
-            size=[4, 4, 512, 64],
-            stride=[131072, 32768, 64, 1],
-        )
-        full_read = MemoryDep(
-            "full",
-            393216 * batch + 32768 * head + 64 * sequence + feature,
-            (batch, head, sequence, feature),
-            (4, 4, 512, 64),
-        )
-        tile_write = MemoryDep(
-            "tile",
-            131072 * batch + 32768 * head + 64 * sequence + feature,
-            (batch, head, sequence, feature),
-            (4, 4, 512, 64),
-        )
-        identity_read = MemoryDep(
-            "tile",
-            tile_write.index,
-            (batch, head, sequence, feature),
-            (4, 4, 512, 64),
+        selection = (0, sympy.Integer(64), True)
+        descendant = (0, sympy.S.Zero, False)
+        identity_sources = {"root": "input", "pass_through": "root"}
+        advancing_reads = {
+            "root": {("advancing_consumer", "advancing_read")},
+            "pass_through": {("terminal_consumer", "terminal_read")},
+        }
+        covered_readers = {
+            "root": {
+                ("advancing_consumer", "advancing_read"),
+                ("pass_through", "identity_read"),
+            },
+            "pass_through": {("terminal_consumer", "terminal_read")},
+        }
+
+        self.assertEqual(
+            _prune_unsafe_identity_selections(
+                {"root": selection, "pass_through": descendant},
+                identity_sources,
+                covered_readers,
+                advancing_reads,
+            ),
+            {"root": selection, "pass_through": descendant},
         )
 
-        self.assertFalse(
-            _is_host_identity_access(full_layout, tile_layout, full_read, tile_write)
+        readers_with_uncovered_use = {
+            name: set(readers) for name, readers in covered_readers.items()
+        }
+        readers_with_uncovered_use["root"].add(
+            ("advancing_consumer", "second_uncovered_read")
         )
-        self.assertTrue(
-            _is_host_identity_access(
-                tile_layout,
-                tile_layout,
-                identity_read,
-                tile_write,
-            )
+        self.assertEqual(
+            _prune_unsafe_identity_selections(
+                {"root": selection, "pass_through": descendant},
+                identity_sources,
+                readers_with_uncovered_use,
+                advancing_reads,
+            ),
+            {},
         )
 
 

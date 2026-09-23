@@ -1883,7 +1883,10 @@ def _identity_load(
     try:
         with V.set_ops_handler(recorder):
             result = op.data.inner_fn(indices)
-    except (AssertionError, TypeError, ValueError):
+    except Exception:  # noqa: BLE001
+        # This is a speculative recognizer over arbitrary pointwise bodies.
+        # Any body that cannot execute under the recording handler is simply
+        # not the generated single-load identity this optimization needs.
         return None
     # V.ops is an OpsWrapper, so scalar handler results normally come back as
     # OpsValue(value).  Accept the unwrapped form too for direct unit tests.
@@ -1896,46 +1899,22 @@ def _identity_load(
     return name, sympy.sympify(index), indices
 
 
-def _is_host_identity_access(
-    input_layout: ir.FixedLayout,
-    output_layout: ir.FixedLayout,
-    input_dep: Dep,
-    output_dep: Dep,
-) -> bool:
-    """Whether a pointwise fallback remains an identity for layout propagation."""
-    from torch._inductor.dependencies import MemoryDep
-    from torch._inductor.ir import FixedLayout
-
-    from torch_spyre._inductor.pass_utils import host_coordinates
-
-    if not (
-        isinstance(input_layout, FixedLayout)
-        and isinstance(output_layout, FixedLayout)
-        and isinstance(input_dep, MemoryDep)
-        and isinstance(output_dep, MemoryDep)
-        and input_layout.dtype == output_layout.dtype
-        and list(input_layout.size) == list(output_layout.size)
-        and input_dep.index == output_dep.index
-    ):
-        return False
-    try:
-        return host_coordinates(input_layout, input_dep, None) == host_coordinates(
-            output_layout, output_dep, None
-        )
-    except (AssertionError, KeyError, TypeError, ValueError):
-        # The contraction is speculative.  If the host access cannot be
-        # represented, retain the original materialization path.
-        return False
-
-
 class _IdentityChainLoadHandler(WrapperHandler):
     """Inline a chain of affine identity loads into one consumer load."""
 
-    def __init__(self, inner, transforms, loop_specs, rescale_index):
+    def __init__(
+        self,
+        inner,
+        transforms,
+        loop_specs,
+        rescale_index,
+        iteration_symbols: set[sympy.Symbol] | None = None,
+    ):
         super().__init__(inner)
         self._transforms = transforms
         self._loop_specs = loop_specs
         self._rescale_index = rescale_index
+        self._iteration_symbols = iteration_symbols
 
     def load(self, name, index):
         visited = set()
@@ -1978,14 +1957,57 @@ class _IdentityChainLoadHandler(WrapperHandler):
                 mapped_loop_terms += source_strides[axis] * extent * loop_var
 
             local_index = sympy.simplify(index - loop_terms)
+            iteration_symbols = self._iteration_symbols
+            if iteration_symbols is None:
+                parameter_symbols: set[sympy.Symbol] = set()
+                for expr in (
+                    *full_sizes,
+                    *full_strides,
+                    *source_strides,
+                    *(trip_count for _loop_var, trip_count in self._loop_specs),
+                ):
+                    parameter_symbols.update(sympy.sympify(expr).free_symbols)
+                iteration_symbols = local_index.free_symbols - parameter_symbols
+            local_constant = sympy.simplify(
+                local_index.subs({symbol: sympy.S.Zero for symbol in iteration_symbols})
+            )
+            if local_constant != 0:
+                # A flat offset in the identity's output layout cannot in
+                # general be reused in its source layout.  Decomposing that
+                # offset into source coordinates would need a separate proof;
+                # this speculative optimization instead retains the staged
+                # path.
+                raise RuntimeError(
+                    f"cannot compose constant offset {local_constant} "
+                    f"through identity {name!r}"
+                )
+            rescaled_source_strides = list(source_strides)
+            for axis, full_stride in enumerate(full_strides):
+                equal_axes = [
+                    other_axis
+                    for other_axis, other_stride in enumerate(full_strides)
+                    if sympy.simplify(full_stride - other_stride) == 0
+                ]
+                non_unit_axes = [
+                    other_axis
+                    for other_axis in equal_axes
+                    if sympy.simplify(full_sizes[other_axis] - 1) != 0
+                ]
+                if len(non_unit_axes) == 1:
+                    # A size-one coordinate cannot contribute to the flat
+                    # index.  Treat duplicate strides belonging to such dims
+                    # as the one non-degenerate dimension rather than as an
+                    # ambiguity in the inverse layout map.
+                    rescaled_source_strides[axis] = source_strides[non_unit_axes[0]]
             index = sympy.simplify(
                 source_base
                 + mapped_loop_terms
                 + self._rescale_index(
                     local_index,
                     full_strides,
-                    source_strides,
+                    rescaled_source_strides,
                     strip_constant=True,
+                    reject_ambiguous=True,
                 )
             )
             name = source_name
@@ -2084,6 +2106,45 @@ def _identity_chain_has_valid_loop_advances(
     return True
 
 
+def _prune_unsafe_identity_selections(
+    selected: dict[str, tuple[int, sympy.Expr, bool]],
+    identity_sources: dict[str, str],
+    readers_by_source: dict[str, set[tuple[str, object]]],
+    advancing_reads: dict[str, set[tuple[str, object]]],
+) -> dict[str, tuple[int, sympy.Expr, bool]]:
+    """Keep only identity contractions whose complete use graph is covered.
+
+    Shrinking an identity is safe when every reader either selects the same
+    advancing tile or is another identity that will be shrunk with it.  Apply
+    this to a fixed point because removing one unsafe parent also invalidates
+    every descendant selected solely by propagation from that parent.
+    """
+    selected = dict(selected)
+    while True:
+        unsafe = set()
+        selected_names = set(selected)
+        for name, (_axis, _source_step, owns_advance) in selected.items():
+            source_name = identity_sources.get(name)
+            if not owns_advance and source_name not in selected_names:
+                unsafe.add(name)
+                continue
+
+            safe_reads = set(advancing_reads.get(name, ()))
+            safe_reads.update(
+                (reader_name, dep)
+                for reader_name, dep in readers_by_source.get(name, ())
+                if reader_name in selected_names
+                and identity_sources.get(reader_name) == name
+            )
+            if readers_by_source.get(name, set()) - safe_reads:
+                unsafe.add(name)
+
+        if not unsafe:
+            return selected
+        for name in unsafe:
+            selected.pop(name, None)
+
+
 def _contract_cross_scope_input_materializations(
     graph: Any,
     pending_levels: list[tuple[sympy.Symbol, sympy.Expr, int, list[str]]],
@@ -2119,6 +2180,7 @@ def _contract_cross_scope_input_materializations(
         for loop_var, trip_count, group_idx, _op_names in pending_levels
     }
     loop_specs = tuple(loop_by_group.values())
+    graph_output_names = set(graph.get_output_names())
 
     def memory_reads(op):
         return [dep for dep in op.get_read_writes().reads if isinstance(dep, MemoryDep)]
@@ -2142,10 +2204,10 @@ def _contract_cross_scope_input_materializations(
         candidate = clone_with_inner(op, inner_fn)
         try:
             deps = [dep for dep in memory_reads(candidate) if dep.name == target_name]
-        except RuntimeError:
+        except Exception:  # noqa: BLE001
             # Affine-chain composition is speculative.  If an identity's
-            # physical strides cannot represent the composed index, leave the
-            # original materialization path intact.
+            # body or physical strides cannot represent the composed index,
+            # leave the original materialization path intact.
             return None
         return deps[0] if len(deps) == 1 else None
 
@@ -2181,6 +2243,8 @@ def _contract_cross_scope_input_materializations(
                 # The dim/extent description remains valid after an affine
                 # identity composition; codegen derives the new source stride
                 # from the transformed dependency itself.
+                if coefficient == 0:
+                    return None
                 continue
             if squeezed[level_idx]:
                 if coefficient == 0:
@@ -2217,17 +2281,27 @@ def _contract_cross_scope_input_materializations(
             valid_chain = True
 
             while True:
+                if cursor in graph_output_names:
+                    valid_chain = False
+                    break
                 users = []
                 for op in operations:
-                    if not isinstance(op, ir.ComputedBuffer):
-                        continue
-                    deps = [dep for dep in memory_reads(op) if dep.name == cursor]
+                    deps = [
+                        dep
+                        for dep in op.get_read_writes().reads
+                        if getattr(dep, "name", None) == cursor
+                    ]
                     if deps:
                         users.append((op, deps))
                 if len(users) != 1 or len(users[0][1]) != 1:
                     valid_chain = False
                     break
                 reader, (dep,) = users[0]
+                if not isinstance(reader, ir.ComputedBuffer) or not isinstance(
+                    dep, MemoryDep
+                ):
+                    valid_chain = False
+                    break
                 if reader.get_name() in identities:
                     if reader.get_name() in chain_names:
                         valid_chain = False
@@ -2283,6 +2357,16 @@ def _contract_cross_scope_input_materializations(
 
             final_info = getattr(final_consumer, "loop_info", None)
             if not isinstance(final_info, CoarseTileInfo):
+                continue
+            if isinstance(
+                getattr(final_consumer, "_read_copy_elision_record", None),
+                ReadCopyElisionRecord,
+            ):
+                # This fixed-point loop revisits every still-live root after
+                # each successful rewrite.  A consumer already carrying a
+                # proposal has reached its canonical fallback form; wrapping
+                # it again would overwrite the proof and can otherwise loop
+                # forever for an input invariant at every nesting level.
                 continue
             if not (
                 isinstance(final_consumer.data, ir.Pointwise)
@@ -2355,9 +2439,19 @@ def _contract_cross_scope_input_materializations(
                 _inner=original_inner,
                 _transforms=fallback_transforms,
             ):
+                iteration_symbols = {
+                    symbol
+                    for arg_group in args
+                    for arg in arg_group
+                    for symbol in sympy.sympify(arg).free_symbols
+                }
                 with V.set_ops_handler(
                     _IdentityChainLoadHandler(
-                        V.ops, _transforms, loop_specs, _rescale_index
+                        V.ops,
+                        _transforms,
+                        loop_specs,
+                        _rescale_index,
+                        iteration_symbols,
                     )
                 ):
                     return _inner(*args)
@@ -2367,9 +2461,19 @@ def _contract_cross_scope_input_materializations(
                 _inner=original_inner,
                 _transforms=transforms,
             ):
+                iteration_symbols = {
+                    symbol
+                    for arg_group in args
+                    for arg in arg_group
+                    for symbol in sympy.sympify(arg).free_symbols
+                }
                 with V.set_ops_handler(
                     _IdentityChainLoadHandler(
-                        V.ops, _transforms, loop_specs, _rescale_index
+                        V.ops,
+                        _transforms,
+                        loop_specs,
+                        _rescale_index,
+                        iteration_symbols,
                     )
                 ):
                     return _inner(*args)
@@ -2391,6 +2495,12 @@ def _contract_cross_scope_input_materializations(
                 else None
             )
             if fallback_metadata is None or direct_metadata is None:
+                continue
+            direct_tiled, direct_squeezed = direct_metadata
+            if not any(direct_tiled) and not any(direct_squeezed):
+                # There is no loop-varying read to stream.  Rewriting a wholly
+                # invariant input cannot remove a per-iteration materialization,
+                # and the post-layout proof requires a nonzero loop advance.
                 continue
 
             loop_var_zeros = {
@@ -2415,43 +2525,6 @@ def _contract_cross_scope_input_materializations(
                 with V.set_ops_handler(_LoopVarRebaseHandler(V.ops, _target, _zeros)):
                     return _inner(*args)
 
-            # ``target_idx`` selects a synthetic tile-staging identity rather
-            # than the terminal aten op.  Some WhileLoop snapshots have no
-            # origins, and layout propagation only supports such a pointwise
-            # buffer while its access remains an identity.  Composing away an
-            # enclosing head slice can turn it into a real shape/index change
-            # (for example [B, H, L, D] -> [B, 4, L, D]); that would fail in
-            # propagate_spyre_tensor_layouts before the deferred direct-read
-            # proof gets a chance to decline.  Keep the old chain in that case.
-            if (
-                target_idx is not None
-                and isinstance(final_consumer.data, ir.Pointwise)
-                and not final_consumer.data.origins
-            ):
-                fallback_layout_dep = one_target_dep(
-                    final_consumer, fallback_inner, root_name
-                )
-                fallback_source = graph.try_get_buffer(root_name)
-                fallback_writes = [
-                    dep
-                    for dep in final_consumer.get_read_writes().writes
-                    if isinstance(dep, MemoryDep)
-                ]
-                if (
-                    fallback_layout_dep is None
-                    or not isinstance(fallback_source, ir.ComputedBuffer)
-                    or not isinstance(fallback_source.layout, ir.FixedLayout)
-                    or not isinstance(final_consumer.layout, ir.FixedLayout)
-                    or len(fallback_writes) != 1
-                    or not _is_host_identity_access(
-                        fallback_source.layout,
-                        final_consumer.layout,
-                        fallback_layout_dep,
-                        fallback_writes[0],
-                    )
-                ):
-                    continue
-
             fallback_tiled, fallback_squeezed = fallback_metadata
             tiled_per_read = copy.deepcopy(final_info.tiled_dims_per_read)
             tiled_per_read[original_dep_idx] = fallback_tiled
@@ -2473,7 +2546,6 @@ def _contract_cross_scope_input_materializations(
                 tiled_dims_per_read=tiled_per_read,
                 squeezed_advance_per_read=squeezed_per_read,
             )
-            direct_tiled, direct_squeezed = direct_metadata
             replacement._read_copy_elision_record = ReadCopyElisionRecord(  # type: ignore[attr-defined]
                 consumer_name=replacement.get_name(),
                 copy_name=root_name,
@@ -2536,6 +2608,7 @@ def _contract_exact_stride_input_materializations(
         _LoopVarRebaseHandler,
         _NameSwapHandler,
         _divide_ranges,
+        _loop_var_hinted_ranges,
         _patch_retiled_load_indexes,
         _splice_loop_vars,
     )
@@ -2543,18 +2616,21 @@ def _contract_exact_stride_input_materializations(
     _contract_cross_scope_input_materializations(graph, pending_levels)
 
     operations = graph.operations
-    identities = {
-        op.get_name(): identity
-        for op in operations
-        if (identity := _identity_load(op)) is not None
-    }
-    if not identities:
-        return
-
-    direct_read_roots: set[str] = set()
+    direct_read_roots: list[str] = []
     contracted_names: set[str] = set()
 
     for loop_var, trip_count, group_idx, _op_names in reversed(pending_levels):
+        # Earlier (deeper) levels can rewrite identity bodies and layouts.
+        # Recompute the behavioral description so every level reasons from
+        # the current IR rather than stale pre-rewrite strides/indexes.
+        identities = {
+            op.get_name(): identity
+            for op in operations
+            if (identity := _identity_load(op)) is not None
+        }
+        if not identities:
+            continue
+
         # Every op carrying this level records its absolute group index in the
         # corresponding loop_group_id slot.  Different top-level HOPs can have
         # different tuple lengths, so resolve the slot per op instead of using
@@ -2568,11 +2644,15 @@ def _contract_exact_stride_input_materializations(
                 return None
 
         selected: dict[str, tuple[int, sympy.Expr, bool]] = {}
+        conflicting_selections: set[str] = set()
+        advancing_reads: dict[str, set[tuple[str, object]]] = {}
 
         # Roots are identities whose consumer explicitly selects one slice
         # with this loop's variable.  The coefficient has to equal exactly one
         # producer-axis stride, and that axis has to have trip_count elements.
         for consumer in operations:
+            if not isinstance(consumer, ir.ComputedBuffer):
+                continue
             consumer_level = level_index(consumer)
             consumer_info = getattr(consumer, "loop_info", None)
             if consumer_level is None or consumer_info is None:
@@ -2631,9 +2711,22 @@ def _contract_exact_stride_input_materializations(
                 source_step = sympy.simplify(source_index.coeff(identity_indices[axis]))
                 if source_step == 0:
                     continue
-                selected[dep.name] = (axis, source_step, True)
-                if source_name in graph.graph_input_names:
-                    direct_read_roots.add(dep.name)
+                selection = (axis, source_step, True)
+                previous = selected.get(dep.name)
+                if previous is not None and previous != selection:
+                    # One staging identity cannot be shrunk along two
+                    # different axes (or advanced by two different source
+                    # steps) for different consumers.  The old last-writer-
+                    # wins behavior made the result depend on operation order.
+                    conflicting_selections.add(dep.name)
+                    continue
+                selected[dep.name] = selection
+                advancing_reads.setdefault(dep.name, set()).add(
+                    (consumer.get_name(), dep)
+                )
+
+        for name in conflicting_selections:
+            selected.pop(name, None)
 
         # Exact-stride normalization can also add a second whole-size identity
         # on the pass-through body output.  Contract a pure identity chain as
@@ -2684,6 +2777,43 @@ def _contract_exact_stride_input_materializations(
                 selected[name] = (axes[0], sympy.S.Zero, False)
                 changed = True
 
+        # Prove every selected link can actually be shrunk before mutating any
+        # of them.  A loop-var-hinted range is already per-iteration, and a
+        # coincidental size match must not make it look like a whole-loop
+        # materialization.  Removing such a link here also removes descendants
+        # that depended solely on its contraction in the fixed-point pruning
+        # below, preventing a partially contracted identity chain.
+        for name, (axis, _source_step, _owns_advance) in list(selected.items()):
+            producer = graph.try_get_buffer(name)
+            if (
+                not isinstance(producer, ir.ComputedBuffer)
+                or not isinstance(producer.data, (ir.Pointwise, ir.Reduction))
+                or axis >= len(producer.data.ranges)
+                or axis in _loop_var_hinted_ranges(producer)
+                or sympy.simplify(producer.data.ranges[axis] - trip_count) != 0
+                or sympy.simplify(producer.layout.size[axis] - 1) == 0
+            ):
+                selected.pop(name)
+
+        readers_by_source: dict[str, set[tuple[str, object]]] = {}
+        for reader in operations:
+            for dep in reader.get_read_writes().reads:
+                dependency_name = getattr(dep, "name", None)
+                if dependency_name in selected:
+                    readers_by_source.setdefault(dependency_name, set()).add(
+                        (reader.get_name(), dep)
+                    )
+        for name in set(selected).intersection(graph.get_output_names()):
+            # A graph output has no reader operation, but it is still an
+            # externally observable use of the full buffer.
+            readers_by_source.setdefault(name, set()).add(("<graph output>", None))
+        selected = _prune_unsafe_identity_selections(
+            selected,
+            {name: identity[0] for name, identity in identities.items()},
+            readers_by_source,
+            advancing_reads,
+        )
+
         if not selected:
             continue
 
@@ -2701,17 +2831,27 @@ def _contract_exact_stride_input_materializations(
             == group_id
         ]
 
+        contracted_level_names: set[str] = set()
         retiled_infos = {}
         for name, (axis, source_step, owns_advance) in selected.items():
             producer = graph.try_get_buffer(name)
             assert isinstance(producer, ir.ComputedBuffer)
+            old_size = tuple(producer.layout.size)
             divide_result = _divide_ranges(producer, trip_count, [axis])
-            if divide_result.retiled_info is None:
+            if tuple(producer.layout.size) == old_size:
                 continue
-            retiled_infos[name] = divide_result.retiled_info
+            contracted_level_names.add(name)
             contracted_names.add(name)
+            if divide_result.retiled_info is not None:
+                retiled_infos[name] = divide_result.retiled_info
 
             if owns_advance:
+                source_name = identities[name][0]
+                if (
+                    source_name in graph.graph_input_names
+                    and name not in direct_read_roots
+                ):
+                    direct_read_roots.append(name)
                 producer_info = producer.loop_info
                 producer_level = level_index(producer)
                 assert producer_level is not None
@@ -2731,12 +2871,12 @@ def _contract_exact_stride_input_materializations(
                     squeezed_advance_per_read=squeezed,
                 )
 
-        if not retiled_infos:
+        if not contracted_level_names:
             continue
 
         # The advancing consumer now reads iteration zero of a scratch tile;
         # its old per-level advance belongs to the identity's source instead.
-        selected_names = set(retiled_infos)
+        selected_names = contracted_level_names
         for consumer in group_ops:
             consumer_level = level_index(consumer)
             consumer_info = getattr(consumer, "loop_info", None)
@@ -2765,12 +2905,13 @@ def _contract_exact_stride_input_materializations(
                     squeezed_advance_per_read=squeezed,
                 )
 
-        _patch_retiled_load_indexes(
-            group_id,
-            group_ops,
-            retiled_infos,
-            operations,
-        )
+        if retiled_infos:
+            _patch_retiled_load_indexes(
+                group_id,
+                group_ops,
+                retiled_infos,
+                operations,
+            )
 
     # Preserve the direct source form for the existing post-layout proof.
     # Until layout selection has proved that the source's device encoding and
@@ -2778,6 +2919,11 @@ def _contract_exact_stride_input_materializations(
     # authoritative fallback.  Attaching these records only after every
     # retile rewrite is important: replace_computed_buffer_body deliberately
     # drops a saved record whenever it changes a consumer body.
+    identities = {
+        op.get_name(): identity
+        for op in operations
+        if (identity := _identity_load(op)) is not None
+    }
     for copy_name in direct_read_roots:
         copy_op = graph.try_get_buffer(copy_name)
         identity = identities.get(copy_name)
@@ -2821,6 +2967,15 @@ def _contract_exact_stride_input_materializations(
         if len(candidate_readers) != 1 or len(candidate_readers[0][1]) != 1:
             continue
         consumer, (copy_dep,) = candidate_readers[0]
+        if isinstance(
+            getattr(consumer, "_read_copy_elision_record", None),
+            ReadCopyElisionRecord,
+        ):
+            # A consumer can have multiple eligible staged inputs, but the IR
+            # stores one deferred rewrite.  Keep the first stable proposal
+            # rather than overwriting it according to incidental traversal
+            # order; the remaining copy is still the safe fallback.
+            continue
         # _NameSwapHandler intentionally discards the compact copy's constant
         # offset.  A nonzero one would need coordinate decomposition rather
         # than stride substitution, so retain the staging fallback for it.
