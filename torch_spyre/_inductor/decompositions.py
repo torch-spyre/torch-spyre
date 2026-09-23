@@ -45,7 +45,7 @@ from .sliding_window_plan import (
     query_blocking,
     rejection_reason,
 )
-from . import config, spyre_hint
+from . import config
 from .logging_utils import get_inductor_logger
 
 from . import customops  # noqa: F401
@@ -1872,24 +1872,11 @@ def spyre__sdpa_overrideable(
         and tiling.num_q_tiles == 1
         and tiling.num_kv_blocks == 1
     )
-    direct_work_div = None
-    if direct_prefill_plan:
-        # Nested plans communicate their partition through HOP tile extents.
-        # The direct body has no such boundary, so seed its equivalent exact
-        # H/Q division explicitly; otherwise CP-SAT spends most of compilation
-        # rediscovering the same full-core placement.
-        direct_work_div = _sdpa_work_division(
-            num_heads,
-            num_kvheads,
-            max_seqlen_q,
-            max_seqlen_kv,
-            config.sencores,
-        )
     logger.debug(
         "SDPA tiling: strategy=%s reason=%s Lq=%s q_tiles=%s "
         "q_tile_size=%s Lk=%s kv_blocks=%s kv_block_size=%s "
         "batch_tiles=%s head_tiles=%s group_tiles=%s kv_blocks_per_loop_group=%s "
-        "direct_work_div=%s estimated_active_cores=%s estimated_load_bursts=%s "
+        "estimated_active_cores=%s estimated_load_bursts=%s "
         "estimated_hbm_bytes=%s estimated_spill_buffers=%s "
         "estimated_spill_bytes=%s score_bytes_per_core=%s "
         "estimated_live_bytes_per_core=%s lx_budget_bytes=%s",
@@ -1905,7 +1892,6 @@ def spyre__sdpa_overrideable(
         tiling.num_head_tiles,
         tiling.num_group_tiles,
         tiling.kv_blocks_per_loop_group,
-        direct_work_div,
         tiling.estimated_active_cores,
         tiling.estimated_load_bursts,
         tiling.estimated_hbm_bytes,
@@ -1958,22 +1944,7 @@ def spyre__sdpa_overrideable(
 
     def kv_level(q_tile, k_tile, v_tile, *mask_tiles):
         # Q is invariant across the counted Lk loop.
-        if direct_work_div is not None:
-            query_dim_names = (
-                [
-                    "_b",
-                    "num_kvheads",
-                    "gqa_group_size",
-                    "max_seqlen_q",
-                    "head_dim",
-                ]
-                if use_gqa
-                else ["_b", "num_heads", "max_seqlen_q", "head_dim"]
-            )
-            with spyre_hint(named_dims=query_dim_names):
-                q_scaled = q_tile * query_scale
-        else:
-            q_scaled = q_tile * query_scale
+        q_scaled = q_tile * query_scale
 
         # A fully direct prefill plan has no online-softmax state to carry. Keep
         # its graph as the stable-softmax formula so the compiler sees the same
@@ -1986,20 +1957,11 @@ def spyre__sdpa_overrideable(
             if rebase_unaligned_packed_key:
                 k_tile = k_tile.contiguous()
             keys_t = k_tile.transpose(-1, -2).contiguous()
-            if direct_work_div is not None:
-                score_dim_names = [*query_dim_names[:-1], "max_seqlen_kv"]
-                with spyre_hint(named_dims=score_dim_names):
-                    scores = (
-                        torch.ops.spyre.batched_matmul(q_scaled, keys_t)
-                        if use_gqa
-                        else torch.matmul(q_scaled, keys_t)
-                    )
-            else:
-                scores = (
-                    torch.ops.spyre.batched_matmul(q_scaled, keys_t)
-                    if use_gqa
-                    else torch.matmul(q_scaled, keys_t)
-                )
+            scores = (
+                torch.ops.spyre.batched_matmul(q_scaled, keys_t)
+                if use_gqa
+                else torch.matmul(q_scaled, keys_t)
+            )
             for mask_tile in mask_tiles:
                 scores = scores + mask_tile
             block_max = torch.amax(scores, dim=-1)
@@ -2010,9 +1972,6 @@ def spyre__sdpa_overrideable(
                 if use_gqa
                 else torch.matmul(exp_scores, v_tile)
             )
-            if direct_work_div is not None:
-                with spyre_hint(named_dims=query_dim_names):
-                    return output_tile / denominator.unsqueeze(-1)
             return output_tile / denominator.unsqueeze(-1)
 
         # Keep the sparse accumulator representation used by production SDPA,
@@ -2135,11 +2094,7 @@ def spyre__sdpa_overrideable(
     def batch_body(_, tiles):
         return None, head_level(*tiles)
 
-    if direct_work_div is not None:
-        with spyre_hint(work_div=direct_work_div):
-            output = map_tiles(batch_body, operands, dims, batch_tile_size, 0)
-    else:
-        output = map_tiles(batch_body, operands, dims, batch_tile_size, 0)
+    output = map_tiles(batch_body, operands, dims, batch_tile_size, 0)
     if use_gqa:
         output = output.flatten(1, 2)
     # The reference meta kernel for this op
