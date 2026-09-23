@@ -17,6 +17,7 @@ from torch_spyre._C import fill_tensor, copy_tensor, SpyreTensorLayout
 import torch_spyre.ops.fallbacks  # noqa: F401
 from .fallbacks import _get_op_overloads
 import warnings
+import contextlib
 import functools
 import inspect
 import operator
@@ -24,6 +25,71 @@ import threading
 
 
 aten = torch.ops.aten
+
+
+# Ops whose compiled kernel is running on this thread; see ``_guard_reentry``.
+_in_flight = threading.local()
+
+
+def _op_frame(op):
+    """Wrap ``op`` in a plain function that owns its dynamo cache line.
+
+    ``torch.compile`` on an ``OpOverload`` routes it through
+    ``torch._dynamo.external_utils.wrap_inline``, whose ``inner`` is one
+    module-level code object -- and dynamo caches per code object, so every
+    compiled op would otherwise share a single cache and recompile budget.
+    ``code.replace`` mints a distinct code object per op; the unchanged fields
+    are deliberate (upstream does the same for
+    ``config.debug_force_nested_calls``). CPython never interns code objects
+    by content the way it does small ints/strings, so this doesn't rely on an
+    accident of the current implementation -- and if that ever changed,
+    upstream's own ``debug_force_nested_calls`` use of the identical trick
+    would break the same way, not just this one.
+    """
+
+    def call_op(*args, **kwargs):
+        return op(*args, **kwargs)
+
+    call_op.__code__ = call_op.__code__.replace(
+        co_varnames=call_op.__code__.co_varnames
+    )
+    # Distinct __qualname__ per op so dynamo's recompile-limit log messages
+    # ("function: '<name>' ...") name the op that hit its budget, instead of
+    # every op showing up as the same generic 'call_op'. str(), not .name():
+    # a single-overload custom op (e.g. spyre.quantize_weight_fp8_with_scale)
+    # resolves to an OpOverloadPacket, not an OpOverload, and
+    # OpOverloadPacket has no .name() -- attribute access falls through to
+    # __getattr__, which tries to resolve "name" as an overload and raises
+    # AttributeError. __str__ is defined on both and needs no such dispatch.
+    call_op.__qualname__ = f"_op_frame.<locals>.{op}"
+    return call_op
+
+
+@contextlib.contextmanager
+def _guard_reentry(op):
+    """Raise if ``op``'s compiled kernel re-dispatches to itself.
+
+    Only reachable when dynamo runs the frame eagerly instead of tracing it, so
+    the call loops back through this kernel. Unguarded it surfaces as an opaque
+    ``RecursionError`` in whatever ran out of stack first.
+    """
+    active = getattr(_in_flight, "ops", None)
+    if active is None:
+        active = set()
+        _in_flight.ops = active
+    if op in active:
+        raise RuntimeError(
+            f"the compiled Spyre kernel for {op} re-entered itself: dynamo "
+            "ran the op eagerly instead of tracing it, so it dispatched back "
+            "into this kernel. Check the log for 'torch._dynamo hit "
+            "config.accumulated_recompile_limit' and whether dynamo is "
+            "disabled (TORCHDYNAMO_DISABLE)."
+        )
+    active.add(op)
+    try:
+        yield
+    finally:
+        active.discard(op)
 
 
 # Decorator to keep track of compiled variant
@@ -38,8 +104,9 @@ def compile_once(op, **compile_kwargs):
             if compiled is None:
                 if isinstance(op, str):
                     op = operator.attrgetter(op)(torch.ops)
-                compiled = torch.compile(op, **compile_kwargs)
-            return fn(*args, compiled=compiled, **kwargs)
+                compiled = torch.compile(_op_frame(op), **compile_kwargs)
+            with _guard_reentry(op):
+                return fn(*args, compiled=compiled, **kwargs)
 
         # We remove the `compiled` arg from the signature to have
         # a clean signature.
