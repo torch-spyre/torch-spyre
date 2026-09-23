@@ -135,8 +135,6 @@ def _backward_pass(graph: GraphLowering) -> set[str]:
         if op.data.reduction_type not in MATMUL_REDUCTION_OPS:
             continue
         out_name = op.get_name()
-        # if out_name not in graph_inputs:
-        #     targets.add(out_name)
         for dep in op.get_read_writes().reads:
             if not isinstance(dep, MemoryDep):
                 continue
@@ -210,6 +208,7 @@ def _forward_pass(targets: set[str]) -> None:
 
 def reorder_nonstick_dims(graph: GraphLowering) -> None:
     """Reorder non-stick dims on matmul inputs for better work division."""
+    V.graph.nonstick_reorder_log = {}
     targets = _backward_pass(graph)
     if targets:
         _forward_pass(targets)

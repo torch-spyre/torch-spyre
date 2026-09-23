@@ -2773,9 +2773,10 @@ def test_nonstick_reorder_pointwise_into_matmul():
             if len(device_size) < 3:
                 continue
             nonstick = device_size[:-1]
-            # device_size[-2] is the sandwich slot. Only check buffers where
-            # the slot dim is actually the largest — buffers whose idc couldn't
-            # be resolved are left unchanged and don't satisfy this property.
+            # For the 2D-stick shape used here (4 device dims, outer_stick=1,
+            # slot=2), the sandwich slot is device_size[-2].  Only check
+            # buffers where the slot dim is actually the largest — buffers
+            # whose idc couldn't be resolved are left unchanged.
             if device_size[-2] != max(nonstick):
                 continue
             reordered_any = True

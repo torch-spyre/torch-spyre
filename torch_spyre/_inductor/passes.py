@@ -65,6 +65,7 @@ from .propagate_layouts import (
     propagate_mutation_layouts,
     propagate_spyre_tensor_layouts,
 )
+from .nonstick_dim_order import reorder_nonstick_dims
 from .optimize_restickify import optimize_restickify_locations
 from .insert_restickify import (
     finalize_layouts,
@@ -73,7 +74,6 @@ from .insert_restickify import (
     validate_no_restickify_on_mutation_targets,
 )
 from .enforce_indirect_access_layout import enforce_indirect_access_layout
-from .nonstick_dim_order import reorder_nonstick_dims
 from .hbm_pool_planning import hbm_pool_planning
 from .work_division import (
     span_reduction,
