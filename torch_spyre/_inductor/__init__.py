@@ -180,9 +180,9 @@ def enable_spyre_compile_fx_wrapper():
                     _prev_in_spyre = getattr(_compile_state, "in_spyre_compile", False)
                     _compile_state.in_spyre_compile = True
                     try:
-                        # The outermost region of one Spyre compile: every other
-                        # timed region nests inside it, so a frontend total is
-                        # this minus the per-kernel backend calls.
+                        # The outermost torch-spyre region of one compile; it
+                        # runs inside Dynamo's mirrored entire_frame_compile. A
+                        # frontend total is this minus the per-kernel backend calls.
                         with timing_recorder.stage("stage:compile_fx:spyre_compile"):
                             with enable_spyre_context(example_inputs):
                                 return _orig(gm, example_inputs, *args, **kwargs)
@@ -206,8 +206,12 @@ def enable_spyre_compile_fx_wrapper():
 def _light_autoload():
     from . import decompositions  # noqa: F401
     from . import distributed as _distributed_init  # noqa: F401  registers spyre::broadcast_async/wait_work
+    from . import torch_phases
 
     enable_spyre_compile_fx_wrapper()
+    # Before any compile rather than inside enable_spyre_context, which opens too
+    # late to see Dynamo tracing.
+    torch_phases.install()
 
 
 # Name of the ``scan`` higher-order op as PyTorch's cache checks see it.

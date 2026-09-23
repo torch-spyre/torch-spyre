@@ -559,6 +559,14 @@ After upgrading, watch for:
    Fix: pass `guard.user_stack` (or `None`) as the third argument. Check
    signatures in `torch/_C/_dynamo/guards.pyi` after the upgrade and
    cross-reference against torch-spyre's patches.
+5b. **Compile phase timing** — `torch_spyre/_inductor/torch_phases.py`
+   wraps `ChromiumEventLogger.log_event_start` and `log_event_end` in
+   `torch/_dynamo/utils.py` with `*args`, so a change in their positional
+   order raises no error. Check that `event_name` is still the first
+   argument of both and `metadata` the third of `log_event_start` (the
+   wrapper reads `args[2]`). `tests/inductor/test_torch_phases.py` fails on
+   a renamed phase or on metadata that is no longer read, but only on a
+   runner that has the new torch.
 6. **Skipped-version accumulation** — If skipping versions, multiple breaking
    changes may compound. Consider reading PyTorch release notes for each
    skipped version to anticipate issues.
