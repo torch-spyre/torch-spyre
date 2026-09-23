@@ -1896,6 +1896,38 @@ def _identity_load(
     return name, sympy.sympify(index), indices
 
 
+def _is_host_identity_access(
+    input_layout: ir.FixedLayout,
+    output_layout: ir.FixedLayout,
+    input_dep: Dep,
+    output_dep: Dep,
+) -> bool:
+    """Whether a pointwise fallback remains an identity for layout propagation."""
+    from torch._inductor.dependencies import MemoryDep
+    from torch._inductor.ir import FixedLayout
+
+    from torch_spyre._inductor.pass_utils import host_coordinates
+
+    if not (
+        isinstance(input_layout, FixedLayout)
+        and isinstance(output_layout, FixedLayout)
+        and isinstance(input_dep, MemoryDep)
+        and isinstance(output_dep, MemoryDep)
+        and input_layout.dtype == output_layout.dtype
+        and list(input_layout.size) == list(output_layout.size)
+        and input_dep.index == output_dep.index
+    ):
+        return False
+    try:
+        return host_coordinates(input_layout, input_dep, None) == host_coordinates(
+            output_layout, output_dep, None
+        )
+    except (AssertionError, KeyError, TypeError, ValueError):
+        # The contraction is speculative.  If the host access cannot be
+        # represented, retain the original materialization path.
+        return False
+
+
 class _IdentityChainLoadHandler(WrapperHandler):
     """Inline a chain of affine identity loads into one consumer load."""
 
@@ -2382,6 +2414,43 @@ def _contract_cross_scope_input_materializations(
             ):
                 with V.set_ops_handler(_LoopVarRebaseHandler(V.ops, _target, _zeros)):
                     return _inner(*args)
+
+            # ``target_idx`` selects a synthetic tile-staging identity rather
+            # than the terminal aten op.  Some WhileLoop snapshots have no
+            # origins, and layout propagation only supports such a pointwise
+            # buffer while its access remains an identity.  Composing away an
+            # enclosing head slice can turn it into a real shape/index change
+            # (for example [B, H, L, D] -> [B, 4, L, D]); that would fail in
+            # propagate_spyre_tensor_layouts before the deferred direct-read
+            # proof gets a chance to decline.  Keep the old chain in that case.
+            if (
+                target_idx is not None
+                and isinstance(final_consumer.data, ir.Pointwise)
+                and not final_consumer.data.origins
+            ):
+                fallback_layout_dep = one_target_dep(
+                    final_consumer, fallback_inner, root_name
+                )
+                fallback_source = graph.try_get_buffer(root_name)
+                fallback_writes = [
+                    dep
+                    for dep in final_consumer.get_read_writes().writes
+                    if isinstance(dep, MemoryDep)
+                ]
+                if (
+                    fallback_layout_dep is None
+                    or not isinstance(fallback_source, ir.ComputedBuffer)
+                    or not isinstance(fallback_source.layout, ir.FixedLayout)
+                    or not isinstance(final_consumer.layout, ir.FixedLayout)
+                    or len(fallback_writes) != 1
+                    or not _is_host_identity_access(
+                        fallback_source.layout,
+                        final_consumer.layout,
+                        fallback_layout_dep,
+                        fallback_writes[0],
+                    )
+                ):
+                    continue
 
             fallback_tiled, fallback_squeezed = fallback_metadata
             tiled_per_read = copy.deepcopy(final_info.tiled_dims_per_read)

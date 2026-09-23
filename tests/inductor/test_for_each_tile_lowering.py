@@ -1006,6 +1006,62 @@ class TestSpliceWhileLoops(unittest.TestCase):
             )
         )
 
+    def test_head_slice_is_not_a_host_identity_access(self):
+        """Do not feed an origins-less synthetic head slice to stickification."""
+        import sympy
+        from torch._inductor import ir
+        from torch._inductor.dependencies import MemoryDep
+
+        from torch_spyre._inductor.wsr.for_each_tile_lowering import (
+            _is_host_identity_access,
+        )
+
+        batch, head, sequence, feature = sympy.symbols(
+            "batch head sequence feature", integer=True, nonnegative=True
+        )
+        full_layout = ir.FixedLayout(
+            torch.device("cpu"),
+            torch.float16,
+            size=[4, 12, 512, 64],
+            stride=[393216, 32768, 64, 1],
+        )
+        tile_layout = ir.FixedLayout(
+            torch.device("cpu"),
+            torch.float16,
+            size=[4, 4, 512, 64],
+            stride=[131072, 32768, 64, 1],
+        )
+        full_read = MemoryDep(
+            "full",
+            393216 * batch + 32768 * head + 64 * sequence + feature,
+            (batch, head, sequence, feature),
+            (4, 4, 512, 64),
+        )
+        tile_write = MemoryDep(
+            "tile",
+            131072 * batch + 32768 * head + 64 * sequence + feature,
+            (batch, head, sequence, feature),
+            (4, 4, 512, 64),
+        )
+        identity_read = MemoryDep(
+            "tile",
+            tile_write.index,
+            (batch, head, sequence, feature),
+            (4, 4, 512, 64),
+        )
+
+        self.assertFalse(
+            _is_host_identity_access(full_layout, tile_layout, full_read, tile_write)
+        )
+        self.assertTrue(
+            _is_host_identity_access(
+                tile_layout,
+                tile_layout,
+                identity_read,
+                tile_write,
+            )
+        )
+
 
 class TestTryProveForEachTile(unittest.TestCase):
     def test_map_mode_accepted_with_trip_count(self):
