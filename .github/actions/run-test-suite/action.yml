@@ -314,7 +314,12 @@ runs:
         done
         _holders="$(_vfio_holder_pids)"
         if [[ -n "$_holders" ]]; then
-          echo "::warning::AIU card still held by PID(s) ${_holders} after ${CARD_RELEASE_TIMEOUT_SECS}s — stall retry may fail to open the device"
+          # A survivor escaped the process-group kill above; kill it by PID directly instead of warning and retrying into a guaranteed failure.
+          echo "::warning::AIU card still held by PID(s) ${_holders} after ${CARD_RELEASE_TIMEOUT_SECS}s — force-killing before retry"
+          for _holder in $_holders; do
+            kill -KILL "${_holder%%(*}" 2>/dev/null || true
+          done
+          sleep 2
         elif [[ $_waited -gt 0 ]]; then
           echo "AIU card released after ${_waited}s"
         fi
