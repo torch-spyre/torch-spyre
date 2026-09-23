@@ -1,20 +1,11 @@
--- CI audit trails: Jenkins fleet health.
+-- CI audit trails: Jenkins fleet health -- infrastructure telemetry, not an artifact fact
+-- (carries no artifact_id), living here only because vars/pushToClickhouse.groovy writes it.
 --
--- Infrastructure telemetry, not an artifact fact: it carries no artifact_id, and inventing
--- one would be the synthetic-identity mistake this schema exists to avoid. It lives here
--- because the same writer (vars/pushToClickhouse.groovy) produces it and it must land in
--- that writer's database.
---
--- A v2 pr_check_events table was deliberately not carried forward: every field it held is
--- already answerable from the artifact layer, it added a second status vocabulary every
--- reader had to normalise, and having no artifact_id it could not answer the one question a
--- per-PR page asks. It had no writer and no rows. The v1 table is untouched and still backs
--- the v1 /pr-builds route.
+-- A v2 pr_check_events table was deliberately not carried forward: it duplicated the artifact
+-- layer, added a second status vocabulary, and had no writer; the v1 table still backs /pr-builds.
 
--- Sampled from the controller API by Spyre/monitoring/collect-agents. That collector runs on
--- the controller, which has no python3, so it cannot generate this DDL at run time -- it ships
--- a JSONEachRow file and this file is the schema. A test asserts these columns match the
--- emitted row keys so the two cannot drift.
+-- Sampled from the controller API by Spyre/monitoring/collect-agents, which ships a JSONEachRow
+-- file (no python3 on the controller to generate this DDL); a test pins these columns to it.
 CREATE TABLE IF NOT EXISTS jenkins_agents
 (
     ts                  DateTime('UTC') DEFAULT now(),
@@ -51,8 +42,7 @@ CREATE TABLE IF NOT EXISTS jenkins_agents
 
     labels              Array(LowCardinality(String)),
 
-    -- Non-empty when the per-agent request failed. The row still lands: "could not sample
-    -- this node" is itself the health signal, and dropping it reads as a healthy gap.
+    -- Non-empty when the per-agent request failed; the row still lands as the health signal.
     sample_error        String DEFAULT '',
 
     props               Map(LowCardinality(String), String)
@@ -60,5 +50,5 @@ CREATE TABLE IF NOT EXISTS jenkins_agents
 ENGINE = MergeTree()
 PARTITION BY toYYYYMM(ts)
 ORDER BY (node, ts)
--- A sample every few minutes per node, for data whose value is recent. 180d matches v1.
+-- A sample every few minutes per node; 180d matches v1.
 TTL ts + INTERVAL 180 DAY;

@@ -12,235 +12,178 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""The schema-v2 write path: dedup guard plus the test_cases/test_case_runs insert.
-
-Rows are built as dicts and ordered by the schema model, so a field cannot be assigned
-to the wrong column and the column order lives in exactly one place.
-"""
+"""The v2 write path: one writer class per table pair, all sharing `RunWriter`."""
 
 import sys
 
 from . import schema
-from .identity import (
-    _norm,
-    benchmark_id_for,
-    canonical_arch,
-    capability_id_for,
-    installed_digest,
-    tags_for_case,
-    case_id_for,
-)
+from .identity import BenchmarkId, CapabilityId, CaseId, DerivedId, GhaArtifactId
 
 
-def cases_already_ingested(
-    client, db: str, run_id: str, component: str, source_file: str = ""
-) -> bool:
-    """Has THIS source file's rows for this run already landed?
+class RunWriter:
+    """Base for a writer over an (identity, fact) table pair."""
 
-    test_case_runs is a plain MergeTree with no dedup key, so a double ingest of one leg
-    DOUBLES its counts -- and v2 dropped the stored counters precisely because they are
-    derived from these rows. This check is what keeps that correct.
+    # No default: every concrete writer sets both, and a base-class None default made
+    # mypy treat every use below as possibly-None instead of catching a real omission.
+    identity_table: type[schema.Table]
+    fact_table: type[schema.Table]
 
-    Scoped by source file, not just run_id: a sharded run is MANY xml files under ONE
-    run_id (the pipeline passes --xml-dir with every shard in a single invocation), so a
-    run-level check lets the first shard block all the others. Measured on a real
-    Spyre-Next run: 9 of 10 cases silently dropped across 7 shards.
+    @classmethod
+    def _seen(cls, client, db: str, run_id: str, component: str, scopes=()) -> bool:
+        """True when the fact table holds rows for this run within `scopes`."""
+        where = "component = {component:String} AND run_id = {run_id:UUID}"
+        params = {"component": component, "run_id": run_id}
+        for column, key, value in scopes:
+            if value:
+                where += f" AND {column} = {{{key}:String}}"
+                params[key] = value
+        return cls.fact_table.count_rows(client, db, where, params) > 0
 
-    `props['source_file']` carries the discriminator. props is a Map outside every key, so
-    recording it costs no sort-order change.
-    """
-    table = schema.TEST_CASE_RUNS.qualified(db)
-    if source_file:
-        rows = client.query(
-            f"SELECT count() FROM {table} "
-            "WHERE component = {component:String} AND run_id = {run_id:UUID} "
-            "AND props['source_file'] = {sf:String}",
-            parameters={"component": component, "run_id": run_id, "sf": source_file},
-        ).result_rows
-    else:
-        # No discriminator given: fall back to the run-level check rather than skip
-        # dedup entirely, so a caller that cannot name the file is still protected.
-        rows = client.query(
-            f"SELECT count() FROM {table} "
-            "WHERE component = {component:String} AND run_id = {run_id:UUID}",
-            parameters={"component": component, "run_id": run_id},
-        ).result_rows
-    return bool(rows and rows[0][0] > 0)
+    @classmethod
+    def _flush(cls, client, db: str, ident_rows: dict, fact_rows: list) -> int:
+        """Write the unknown identities and every fact row; returns the row count."""
+        cls.identity_table.insert_identities(client, ident_rows, db=db)
+        cls.fact_table.insert(client, fact_rows, db=db)
+        return len(fact_rows)
+
+    @staticmethod
+    def _warn(count: int, message: str) -> None:
+        """Report skipped rows on stderr, so a parse gap is visible, not fatal."""
+        if count:
+            print(f"  [warn] v2: {count} {message}", file=sys.stderr)
 
 
-def insert_test_results(
-    client, db: str, component: str, run_id: str, cases: list, source_file: str = ""
-) -> int:
-    """Write test_cases (identity) + test_case_runs (outcome) for one leg.
+class TestResultWriter(RunWriter):
+    """test_cases (identity) + test_case_runs (outcome) for one JUnit leg."""
 
-    Rows are built as dicts and ordered by schema_model, so a field cannot be assigned to
-    the wrong column and the column order lives in exactly one place.
+    identity_table = schema.TestCases
+    fact_table = schema.TestCaseRuns
 
-    Dropped from v2 deliberately: filename, suite_name, runner_run_id, and every stored
-    counter -- all derivable, and a stored counter invites drift.
-    """
-    if not cases:
-        return 0
-    ident_rows, run_rows = {}, []
+    @classmethod
+    def already_ingested(
+        cls, client, db: str, run_id: str, component: str, source_file: str = ""
+    ) -> bool:
+        """Have this source file's rows for this run already landed?"""
+        return cls._seen(
+            client,
+            db,
+            run_id,
+            component,
+            (("props['source_file']", "sf", source_file),),
+        )
 
-    skipped_unidentifiable = 0
-    for c in cases:
-        tags = tags_for_case(c)
-        classname, name = c.get("classname", ""), c.get("name", "")
-        tcid = case_id_for(component, classname, name, tags)
-        if not tcid:
-            # Refused identity: writing the row anyway would collide it with every
-            # other unidentifiable case rather than merely orphaning it.
-            skipped_unidentifiable += 1
-            continue
-        # Keyed by id: identical identity rows within a leg are one fact.
-        ident_rows[tcid] = {
-            "test_case_id": tcid,
-            "component": component,
-            "classname": classname,
-            "name": name,
-            "tags": tags,
-        }
-        run_rows.append(
-            {
+    @classmethod
+    def insert(
+        cls,
+        client,
+        db: str,
+        component: str,
+        run_id: str,
+        cases: list,
+        source_file: str = "",
+    ) -> int:
+        """Write one leg's cases; returns the number of outcome rows written."""
+        if not cases:
+            return 0
+        ident_rows, run_rows = {}, []
+        skipped = 0
+        for c in cases:
+            tags = CaseId.tags_for(c)
+            classname, name = c.get("classname", ""), c.get("name", "")
+            tcid = CaseId.derive(component, classname, name, tags)
+            if not tcid:
+                # Refused identity: writing it anyway collides this case with every
+                # other unidentifiable one, rather than merely orphaning it.
+                skipped += 1
+                continue
+            # Keyed by id: identical identity rows within a leg are one fact.
+            ident_row: schema.TestCaseRow = {
+                "test_case_id": tcid,
+                "component": component,
+                "classname": classname,
+                "name": name,
+                "tags": tags,
+            }
+            ident_rows[tcid] = ident_row
+            run_row: schema.TestCaseRunRow = {
                 "run_id": run_id,
                 "test_case_id": tcid,
                 "component": component,
                 "status": c.get("status", ""),
                 "duration_s": float(c.get("duration_s", 0) or 0),
                 "fail_message": (c.get("fail_message") or "")[:8192],
-                # source_file names the xml this row came from, so a sharded run dedups
-                # per file instead of the first shard blocking the rest.
-                # ran_in names the run that ACTUALLY EXECUTED this case. For a case this
-                # run ran it is this run_id; a reuse copy carries the original
-                # executor's (see copy_reused_cases). Every "how much did we execute"
-                # query must filter props['ran_in'] = run_id -- without it, reuse copies
-                # inflate the count. Queries asking "what does this run report for the
-                # tier" want the unfiltered total, which is the point of writing the
-                # copies at all.
-                "props": (
-                    {
-                        "ran_in": run_id,
-                        **({"source_file": source_file} if source_file else {}),
-                    }
-                ),
+                # ran_in names the run that ACTUALLY EXECUTED this case (a reuse
+                # carries the original executor's), the filter for "how much did we
+                # execute"; source_file is the shard discriminator the dedup reads.
+                "props": {
+                    "ran_in": run_id,
+                    **({"source_file": source_file} if source_file else {}),
+                },
             }
+            run_rows.append(run_row)
+        written = cls._flush(client, db, ident_rows, run_rows)
+        cls._warn(skipped, "case(s) skipped -- identity not derivable")
+        return written
+
+
+class BenchmarkWriter(RunWriter):
+    """benchmarks (identity) + benchmark_runs (measurements) for one leg."""
+
+    identity_table = schema.Benchmarks
+    fact_table = schema.BenchmarkRuns
+
+    @classmethod
+    def already_ingested(
+        cls,
+        client,
+        db: str,
+        run_id: str,
+        component: str,
+        report_kind: str = "",
+        source_file: str = "",
+    ) -> bool:
+        """Have this run's rows for this report kind and source file already landed?"""
+        return cls._seen(
+            client,
+            db,
+            run_id,
+            component,
+            (
+                ("props['report_kind']", "kind", report_kind),
+                ("props['source_file']", "sf", source_file),
+            ),
         )
-    # Cross-run dedup, not just in-leg: test_cases is a plain MergeTree, so re-inserting
-    # a known identity appends a duplicate instead of collapsing it.
-    schema.insert_identities(client, schema.TEST_CASES, ident_rows, db=db)
-    schema.insert(client, schema.TEST_CASE_RUNS, run_rows, db=db)
-    if skipped_unidentifiable:
-        print(
-            f"  [warn] v2: {skipped_unidentifiable} case(s) skipped -- identity "
-            "not derivable",
-            file=sys.stderr,
-        )
-    return len(run_rows)
 
-
-def benchmarks_already_ingested(
-    client,
-    db: str,
-    run_id: str,
-    component: str,
-    report_kind: str = "",
-    source_file: str = "",
-) -> bool:
-    """benchmark_runs has no dedup key, so a double ingest doubles the samples behind a
-    mean -- which still looks plausible.
-
-    report_kind is part of the scope because one invocation ingests SEVERAL files under one
-    run_id: run_id_for honours a threaded --run-id verbatim, so a kernel-report and a
-    benchmark-report XML from the same leg share it. Keyed on (component, run_id) alone,
-    the first file written makes every later kind look already-ingested and its disjoint
-    benchmarks are dropped silently. Empty matches rows written before this key existed.
-
-    source_file narrows further, as cases_already_ingested's sibling check does: a sharded
-    run can pass several same-kind XMLs (e.g. two kernel-report shards) under one run_id,
-    and report_kind alone would let the first shard block the rest.
-    """
-    q = (
-        f"SELECT count() FROM {schema.BENCHMARK_RUNS.qualified(db)} "
-        "WHERE component = {component:String} AND run_id = {run_id:UUID}"
-    )
-    params = {"component": component, "run_id": run_id}
-    if report_kind:
-        q += " AND props['report_kind'] = {kind:String}"
-        params["kind"] = report_kind
-    if source_file:
-        q += " AND props['source_file'] = {sf:String}"
-        params["sf"] = source_file
-    rows = client.query(q, parameters=params).result_rows
-    return bool(rows and rows[0][0] > 0)
-
-
-def insert_benchmarks(
-    client,
-    db: str,
-    component: str,
-    run_id: str,
-    benchmarks: list,
-    report_kind: str = "",
-    source_file: str = "",
-) -> int:
-    """Write benchmarks (identity) + benchmark_runs (measurements) for one leg.
-
-    Each entry is a dict: name, tags, props, backend, measurements, iterations, and
-    `disc` plus `disc_keys` for the identity discriminators (see benchmark_id_for). One row
-    per (benchmark, backend): a row per metric would multiply every trend point by the
-    metric count.
-
-    report_kind and source_file are stamped into each row's props so
-    benchmarks_already_ingested can scope its dedup per source kind and per file --
-    several files, some sharing a kind, share one run_id in an invocation.
-    """
-    if not benchmarks:
-        return 0
-    ident_rows, facts = {}, {}
-    skipped_unidentifiable = 0
-    for b in benchmarks:
-        name, tags = b.get("name", ""), b.get("tags") or []
-        disc = b.get("disc") or {}
-        bid = benchmark_id_for(component, name, tags, disc, b.get("disc_keys") or ())
-        if not bid:
-            # Writing a refused identity would collide it with every other
-            # unidentifiable one.
-            skipped_unidentifiable += 1
-            continue
-        backend = b.get("backend", "")
-        # Keyed by id: two files reporting one benchmark merge, richer props winning, so
-        # the merge cannot drop a field the other side set.
-        prev = ident_rows.get(bid)
-        props = {k: str(v) for k, v in (b.get("props") or {}).items() if v != ""}
-        # Union, for the same reason props merge: the id hashes NORMALIZED tags, so two
-        # entries differing only in case or order share a bid, and taking the last
-        # entry's list wholesale would drop tags the other side carried.
-        # Normalized through the SAME helper the hash uses: unioning raw spellings put both
-        # 'GPU' and 'gpu' on one identity, so has(tags,'gpu') and has(tags,'GPU') disagreed
-        # about a single canonical row.
-        tag_set = {n for n in (_norm(t) for t in tags) if n}
-        if prev:
-            merged = dict(prev["props"])
-            merged.update(props)
-            props = merged
-            tag_set |= set(prev["tags"])
-        # First-write-wins, like tags/props merge from a fixed side rather than the last
-        # entry seen: bid is a content hash of (component, name, tags, disc), so every
-        # entry sharing a bid already agrees on name in substance -- this only picks
-        # which literal spelling (case, whitespace) survives, deterministically.
-        if prev:
-            name = prev["name"]
-        ident_rows[bid] = {
-            "benchmark_id": bid,
-            "component": component,
-            "name": name,
-            "tags": sorted(tag_set),
-            "props": props,
-        }
-        fact = facts.setdefault(
-            (bid, backend),
-            {
+    @classmethod
+    def insert(
+        cls,
+        client,
+        db: str,
+        component: str,
+        run_id: str,
+        benchmarks: list,
+        report_kind: str = "",
+        source_file: str = "",
+    ) -> int:
+        """Write one leg's benchmarks, one row per (benchmark, backend)."""
+        if not benchmarks:
+            return 0
+        ident_rows: dict[str, schema.BenchmarkRow] = {}
+        facts: dict[tuple[str, str], schema.BenchmarkRunRow] = {}
+        skipped = 0
+        for b in benchmarks:
+            name, tags = b.get("name", ""), b.get("tags") or []
+            disc = b.get("disc") or {}
+            bid = BenchmarkId.derive(
+                component, name, tags, disc, b.get("disc_keys") or ()
+            )
+            if not bid:
+                skipped += 1
+                continue
+            backend = b.get("backend", "")
+            name, ident = cls._merge_identity(ident_rows, bid, component, name, tags, b)
+            ident_rows[bid] = ident
+            default_fact: schema.BenchmarkRunRow = {
                 "run_id": run_id,
                 "benchmark_id": bid,
                 "component": component,
@@ -251,313 +194,316 @@ def insert_benchmarks(
                     **({"report_kind": report_kind} if report_kind else {}),
                     **({"source_file": source_file} if source_file else {}),
                 },
-            },
+            }
+            fact = facts.setdefault((bid, backend), default_fact)
+            cls._merge_fact(fact, b, report_kind, source_file)
+        # The DDL's CHECK refuses an empty map, so one unmeasured benchmark would fail
+        # the whole insert; dropped with a warning rather than losing a long perf leg.
+        run_rows = [f for f in facts.values() if f["measurements"]]
+        dropped = len(facts) - len(run_rows)
+        kept = {f["benchmark_id"] for f in run_rows}
+        written = cls._flush(
+            client,
+            db,
+            {k: v for k, v in ident_rows.items() if k in kept},
+            run_rows,
         )
-        # Extended, not overwritten: two entries sharing (benchmark, backend) and a
-        # metric key are two samples of that metric, and the column exists to keep both.
-        for k, v in (b.get("measurements") or {}).items():
+        cls._warn(skipped, "benchmark(s) skipped -- identity not derivable")
+        cls._warn(dropped, "benchmark(s) skipped -- no measurements parsed")
+        return written
+
+    @staticmethod
+    def _merge_identity(ident_rows, bid, component, name, tags, entry) -> tuple:
+        """Fold this entry's tags/props into the identity row for `bid`."""
+        prev = ident_rows.get(bid)
+        props = {k: str(v) for k, v in (entry.get("props") or {}).items() if v != ""}
+        # Normalised through the SAME helper the hash uses: one spelling per tag.
+        tag_set = {n for n in (DerivedId.norm(t) for t in tags) if n}
+        if prev:
+            merged = dict(prev["props"])
+            merged.update(props)
+            props = merged
+            tag_set |= set(prev["tags"])
+            name = prev["name"]
+        row: schema.BenchmarkRow = {
+            "benchmark_id": bid,
+            "component": component,
+            "name": name,
+            "tags": sorted(tag_set),
+            "props": props,
+        }
+        return name, row
+
+    @staticmethod
+    def _merge_fact(
+        fact: schema.BenchmarkRunRow, entry, report_kind: str, source_file: str
+    ) -> None:
+        """Extend samples, sum iterations, merge props into one fact row."""
+        for k, v in (entry.get("measurements") or {}).items():
             fact["measurements"].setdefault(k, []).extend(v)
-        # Summed, not maxed: measurements are extended across entries sharing this fact
-        # key, so each entry's iterations is its own distinct contribution, not a
-        # restatement of the same count. A single scalar still can't reflect per-metric
-        # sample counts that diverge (recoverable as length(measurements[k]) whenever the
-        # producer sends samples rather than a mean) -- this only fixes the multi-entry
-        # undercount, not that ceiling.
-        fact["iterations"] += int(b.get("iterations") or 0)
-        # Merged on every entry, as the identity props are: a sparser first entry must
-        # not drop a field a later one set for the same (benchmark, backend).
-        fact["props"].update({k: str(v) for k, v in (b.get("run_props") or {}).items()})
-        # Re-applied last: report_kind/source_file are the dedup scope, so a producer
-        # prop of the same name must not be able to redefine either and let a re-ingest
-        # through.
+        fact["iterations"] += int(entry.get("iterations") or 0)
+        fact["props"].update(
+            {k: str(v) for k, v in (entry.get("run_props") or {}).items()}
+        )
         if report_kind:
             fact["props"]["report_kind"] = report_kind
         if source_file:
             fact["props"]["source_file"] = source_file
-    # The DDL's CHECK refuses an empty map, so one unmeasured benchmark would fail the
-    # whole insert; dropped with a warning instead of losing a long perf leg to a parse
-    # gap.
-    run_rows = [f for f in facts.values() if f["measurements"]]
-    dropped = len(facts) - len(run_rows)
-    kept = {f["benchmark_id"] for f in run_rows}
-    schema.insert_identities(
+
+
+class CapabilityWriter(RunWriter):
+    """capabilities (identity) + capability_runs (verdict) for one analysis."""
+
+    identity_table = schema.Capabilities
+    fact_table = schema.CapabilityRuns
+
+    @classmethod
+    def already_ingested(
+        cls,
         client,
-        schema.BENCHMARKS,
-        {k: v for k, v in ident_rows.items() if k in kept},
-        db=db,
-    )
-    schema.insert(client, schema.BENCHMARK_RUNS, run_rows, db=db)
-    if skipped_unidentifiable:
-        print(
-            f"  [warn] v2: {skipped_unidentifiable} benchmark(s) skipped -- identity "
-            "not derivable",
-            file=sys.stderr,
+        db: str,
+        run_id: str,
+        component: str,
+        test_type: str = "",
+        shard: str = "",
+    ) -> bool:
+        """Have this run's verdicts for this analysis and shard already landed?"""
+        return cls._seen(
+            client,
+            db,
+            run_id,
+            component,
+            (("test_type", "tt", test_type), ("props['shard']", "shard", shard)),
         )
-    if dropped:
-        print(
-            f"  [warn] v2: {dropped} benchmark(s) skipped -- no measurements parsed",
-            file=sys.stderr,
-        )
-    return len(run_rows)
 
-
-def capabilities_already_ingested(
-    client,
-    db: str,
-    run_id: str,
-    component: str,
-    test_type: str = "",
-    shard: str = "",
-) -> bool:
-    """capability_runs has no dedup key, so a double ingest doubles every verdict behind a
-    coverage percentage -- which still looks plausible.
-
-    Scoped by test_type as well as run: one run can carry several analyses (model_ops and
-    model_support are separate scans), and keyed on (component, run_id) alone the first one
-    written makes every later one look already-ingested and its rows are dropped silently.
-    The same failure benchmark report_kind exists to prevent.
-
-    `shard` narrows it once more, as cases_already_ingested's source_file does. An analysis can
-    be SHARDED across parallel processes that share one run_id: hf-adapters' weekly scan fans
-    out over up to 25 shards per tier, each with its own sink and its own client. Scoped by run
-    alone, the first shard to flush makes every other shard look already-ingested and their
-    verdicts are dropped with no error. Empty matches rows written before this key existed.
-    """
-    q = (
-        f"SELECT count() FROM {schema.CAPABILITY_RUNS.qualified(db)} "
-        "WHERE component = {component:String} AND run_id = {run_id:UUID}"
-    )
-    params = {"component": component, "run_id": run_id}
-    if test_type:
-        q += " AND test_type = {tt:String}"
-        params["tt"] = test_type
-    if shard:
-        q += " AND props['shard'] = {shard:String}"
-        params["shard"] = shard
-    rows = client.query(q, parameters=params).result_rows
-    return bool(rows and rows[0][0] > 0)
-
-
-def insert_capabilities(
-    client,
-    db: str,
-    component: str,
-    run_id: str,
-    test_type: str,
-    results: list,
-    arch: str = "",
-    disc_keys=(),
-    shard: str = "",
-) -> int:
-    """Write capabilities (identity) + capability_runs (verdict) for one analysis.
-
-    Each entry is a dict: subject, name, status, backend, optional fail_reason, tags, and
-    `disc` (the per-producer discriminator hashed into the identity -- input shapes/dtypes for
-    model_ops, nothing for model_support).
-
-    `backend` is NOT part of the identity: one capability measured on cpu and on spyre is one
-    capability with two verdicts, so the same capability_id carries both rows. That is what
-    makes "supported on spyre but only via cpu fallback" a self-join rather than a stored flag.
-
-    `shard` names this writer's slice of a sharded analysis and is stamped into every row's
-    props, so capabilities_already_ingested can scope its dedup per shard rather than letting
-    the first of N parallel writers block the rest.
-    """
-    if not results:
-        return 0
-    ident_rows, run_rows = {}, []
-    skipped_unidentifiable = 0
-    for r in results:
-        subject, name = r.get("subject", ""), r.get("name", "")
-        disc = r.get("disc") or {}
-        cid = capability_id_for(component, test_type, subject, name, disc, disc_keys)
-        if not cid:
-            # Refused identity: writing it anyway collides this row with every other
-            # unidentifiable one rather than merely orphaning it.
-            skipped_unidentifiable += 1
-            continue
-        tags = sorted({t for t in (r.get("tags") or []) if t})
-        # Keyed by id: identical identity rows within one analysis are one fact. The
-        # discriminator is hashed INTO cid, so it is recorded here rather than re-derived.
-        ident_rows[cid] = {
-            "capability_id": cid,
-            "component": component,
-            "test_type": test_type,
-            "subject": subject,
-            "name": name,
-            "tags": tags,
-            "props": {k: str(v) for k, v in disc.items() if v not in (None, "")},
-        }
-        run_rows.append(
-            {
+    @classmethod
+    def insert(
+        cls,
+        client,
+        db: str,
+        component: str,
+        run_id: str,
+        test_type: str,
+        results: list,
+        arch: str = "",
+        disc_keys=(),
+        shard: str = "",
+    ) -> int:
+        """Write one analysis's verdicts; `backend` is a column, not part of the id."""
+        if not results:
+            return 0
+        ident_rows, run_rows = {}, []
+        skipped = 0
+        for r in results:
+            subject, name = r.get("subject", ""), r.get("name", "")
+            disc = r.get("disc") or {}
+            cid = CapabilityId.derive(
+                component, test_type, subject, name, disc, disc_keys
+            )
+            if not cid:
+                skipped += 1
+                continue
+            tags = sorted({t for t in (r.get("tags") or []) if t})
+            # The discriminator is hashed INTO cid, so it is recorded, not re-derived.
+            ident_row: schema.CapabilityRow = {
+                "capability_id": cid,
+                "component": component,
+                "test_type": test_type,
+                "subject": subject,
+                "name": name,
+                "tags": tags,
+                "props": {k: str(v) for k, v in disc.items() if v not in (None, "")},
+            }
+            ident_rows[cid] = ident_row
+            run_row: schema.CapabilityRunRow = {
                 "run_id": run_id,
                 "capability_id": cid,
                 "component": component,
                 "test_type": test_type,
-                "arch": canonical_arch(arch),
+                "arch": DerivedId.arch(arch),
                 "status": r.get("status", ""),
-                "backend": _norm(r.get("backend")),
-                "fail_reason": _norm(r.get("fail_reason")),
-                # shard is applied LAST: it is the dedup scope, so a producer prop of the
-                # same name must not be able to redefine it and let a re-ingest through.
+                "backend": DerivedId.norm(r.get("backend")),
+                "fail_reason": DerivedId.norm(r.get("fail_reason")),
+                # shard is applied LAST: it is the dedup scope, so a producer prop
+                # of the same name must not redefine it and let a re-ingest through.
                 "props": {
                     **{k: str(v) for k, v in (r.get("props") or {}).items()},
                     **({"shard": shard} if shard else {}),
                 },
             }
+            run_rows.append(run_row)
+        written = cls._flush(client, db, ident_rows, run_rows)
+        cls._warn(skipped, "capability result(s) skipped -- identity not derivable")
+        return written
+
+
+class ArtifactWriter:
+    """The GHA leg's own artifact row and its verdict, written as one call."""
+
+    artifact_table = schema.Artifacts
+    result_table = schema.ArtifactResults
+
+    @classmethod
+    def artifact_recorded(cls, client, db: str, artifact_id: str) -> bool:
+        """Does `artifacts` hold this identity? (Plain MergeTree -- no dedup key.)"""
+        return (
+            cls.artifact_table.count_rows(
+                client,
+                db,
+                "artifact_id = {artifact_id:UUID}",
+                {"artifact_id": artifact_id},
+            )
+            > 0
         )
-    # Cross-run dedup: capabilities is a plain MergeTree, so re-inserting a known identity
-    # appends a duplicate instead of collapsing it.
-    schema.insert_identities(client, schema.CAPABILITIES, ident_rows, db=db)
-    schema.insert(client, schema.CAPABILITY_RUNS, run_rows, db=db)
-    if skipped_unidentifiable:
-        print(
-            f"  [warn] v2: {skipped_unidentifiable} capability result(s) skipped -- "
-            "identity not derivable",
-            file=sys.stderr,
+
+    @classmethod
+    def result_recorded(
+        cls,
+        client,
+        db: str,
+        artifact_id: str,
+        run_id: str,
+        result_kind: str,
+        test_type: str,
+    ) -> bool:
+        """Has this verdict landed? Scoped by the sort key: one run reports N tiers."""
+        return (
+            cls.result_table.count_rows(
+                client,
+                db,
+                "artifact_id = {artifact_id:UUID} AND run_id = {run_id:UUID} "
+                "AND result_kind = {result_kind:String} "
+                "AND test_type = {test_type:String}",
+                {
+                    "artifact_id": artifact_id,
+                    "run_id": run_id,
+                    "result_kind": result_kind,
+                    "test_type": test_type,
+                },
+            )
+            > 0
         )
-    return len(run_rows)
 
+    @classmethod
+    def insert_gha_result(
+        cls,
+        client,
+        db: str,
+        *,
+        artifact_id: str,
+        component: str,
+        arch: str,
+        run_id: str,
+        test_type: str,
+        state: str,
+        result_kind: str = "functional",
+        duration_s: float = 0.0,
+        base_artifact_id: str = "",
+        installed: str = "",
+        repo: str = "",
+        git_ref: str = "",
+        git_sha: str = "",
+        run_url: str = "",
+    ) -> bool:
+        """Record the artifact a GHA leg ran and its verdict; refuses a partial id."""
+        aid, rid = DerivedId.norm(artifact_id), DerivedId.norm(run_id)
+        comp, a = DerivedId.norm(component), DerivedId.arch(arch)
+        if not (aid and rid and comp and a):
+            print(
+                f"  [warn] v2: artifact result skipped -- "
+                f"artifact_id={aid or '<blank>'} "
+                f"run_id={rid or '<blank>'} "
+                f"component={comp or '<blank>'} arch={a or '<blank>'}",
+                file=sys.stderr,
+            )
+            return False
 
-# ── the GHA leg's own artifact, and its verdict ─────────────────────────────────────────
-# Written as one call: a verdict whose artifact row is missing is the unjoinable row the
-# writer's refusal exists to prevent.
+        # aid == base means the leg ran the image UNCHANGED, so the artifact is the
+        # one the orchestrator already recorded, and our own row would be a duplicate.
+        if aid != DerivedId.norm(base_artifact_id) and not cls.artifact_recorded(
+            client, db, aid
+        ):
+            cls.artifact_table.insert(
+                client,
+                [
+                    cls._artifact_row(
+                        aid,
+                        comp,
+                        a,
+                        base_artifact_id,
+                        installed,
+                        repo,
+                        git_ref,
+                        git_sha,
+                        run_url,
+                    )
+                ],
+                db=db,
+            )
 
+        if cls.result_recorded(client, db, aid, rid, result_kind, test_type):
+            return True
 
-def artifact_already_recorded(client, db: str, artifact_id: str) -> bool:
-    """Does `artifacts` already hold this identity? (Plain MergeTree -- no dedup key.)"""
-    rows = client.query(
-        f"SELECT count() FROM {schema.ARTIFACTS.qualified(db)} "
-        "WHERE artifact_id = {artifact_id:UUID}",
-        parameters={"artifact_id": artifact_id},
-    ).result_rows
-    return bool(rows and rows[0][0] > 0)
-
-
-def artifact_result_already_recorded(
-    client, db: str, artifact_id: str, run_id: str, result_kind: str, test_type: str
-) -> bool:
-    """Has this verdict landed? Scoped by the full sort key -- one run may report N tiers."""
-    rows = client.query(
-        f"SELECT count() FROM {schema.ARTIFACT_RESULTS.qualified(db)} "
-        "WHERE artifact_id = {artifact_id:UUID} AND run_id = {run_id:UUID} "
-        "AND result_kind = {result_kind:String} AND test_type = {test_type:String}",
-        parameters={
-            "artifact_id": artifact_id,
-            "run_id": run_id,
+        result_row: schema.ArtifactResultRow = {
+            "artifact_id": aid,
+            "run_id": rid,
             "result_kind": result_kind,
             "test_type": test_type,
-        },
-    ).result_rows
-    return bool(rows and rows[0][0] > 0)
-
-
-def insert_gha_artifact_result(
-    client,
-    db: str,
-    *,
-    artifact_id: str,
-    component: str,
-    arch: str,
-    run_id: str,
-    test_type: str,
-    state: str,
-    result_kind: str = "functional",
-    duration_s: float = 0.0,
-    base_artifact_id: str = "",
-    installed: str = "",
-    repo: str = "",
-    git_ref: str = "",
-    git_sha: str = "",
-    run_url: str = "",
-) -> bool:
-    """Record the artifact a GHA leg ran, and its verdict. True when rows landed.
-
-    `artifact_id` arrives already derived: the caller is the only side that knows whether the
-    leg installed on top of the image or ran it unchanged. artifact_name/props['id12'] carry
-    the HASH INPUTS, so the id stays reproducible from its own row. `sources` carries the
-    commit resolve_covered_tiers.py joins on. Refuses a partial identity rather than writing
-    one every incomplete artifact would share.
-    """
-    aid, rid = _norm(artifact_id), _norm(run_id)
-    comp, a = _norm(component), canonical_arch(arch)
-    if not (aid and rid and comp and a):
-        print(
-            f"  [warn] v2: artifact result skipped -- artifact_id={aid or '<blank>'} "
-            f"run_id={rid or '<blank>'} component={comp or '<blank>'} arch={a or '<blank>'}",
-            file=sys.stderr,
-        )
-        return False
-
-    # aid == base means the leg ran the image UNCHANGED, so the artifact is the one the
-    # orchestrator produced and already recorded -- writing our own row for it would be the
-    # duplicate artifact_id the plain MergeTree exists to surface. Only the verdict is ours.
-    if aid != _norm(base_artifact_id) and not artifact_already_recorded(
-        client, db, aid
-    ):
-        schema.insert(
-            client,
-            schema.ARTIFACTS,
-            [
-                {
-                    "artifact_id": aid,
-                    "component": comp,
-                    "arch": a,
-                    "kind": "image",
-                    # The hashed name, not a display string -- see the docstring.
-                    "artifact_name": _norm(base_artifact_id),
-                    # chk_origin admits no 'gha'; 'base=' below is what marks it derived.
-                    "origin": "built",
-                    "identity_deps": (
-                        [f"{schema.DEP_BASE_PREFIX}{_norm(base_artifact_id)}"]
-                        if _norm(base_artifact_id)
-                        else []
-                    ),
-                    "context_deps": [],
-                    # Tuple order (repo, git_ref, git_sha) -- what the covered-tier join reads.
-                    "sources": (
-                        [(repo, git_ref, git_sha)]
-                        if (repo or git_ref or git_sha)
-                        else []
-                    ),
-                    "props": {
-                        k: v
-                        for k, v in {
-                            # The digest gha_artifact_id put in the id12 slot.
-                            "id12": installed_digest(installed),
-                            "base_artifact_id": _norm(base_artifact_id),
-                            "installed": (installed or "").strip(),
-                            "run_url": run_url,
-                            "source": "gha",
-                        }.items()
-                        if v
-                    },
-                }
-            ],
-            db=db,
-        )
-
-    if artifact_result_already_recorded(client, db, aid, rid, result_kind, test_type):
+            "state": state,
+            # Where it RAN; kept apart from artifacts.arch by design.
+            "arch": a,
+            "duration_s": float(duration_s or 0.0),
+            "props": {
+                k: v for k, v in {"run_url": run_url, "source": "gha"}.items() if v
+            },
+        }
+        cls.result_table.insert(client, [result_row], db=db)
         return True
 
-    schema.insert(
-        client,
-        schema.ARTIFACT_RESULTS,
-        [
-            {
-                "artifact_id": aid,
-                "run_id": rid,
-                "result_kind": result_kind,
-                "test_type": test_type,
-                "state": state,
-                # Where it RAN; the DDL keeps this apart from artifacts.arch by design.
-                "arch": a,
-                "duration_s": float(duration_s or 0.0),
-                "props": {
-                    k: v for k, v in {"run_url": run_url, "source": "gha"}.items() if v
-                },
-            }
-        ],
-        db=db,
-    )
-    return True
+    @staticmethod
+    def _artifact_row(
+        aid, comp, arch, base_artifact_id, installed, repo, git_ref, git_sha, run_url
+    ) -> "schema.ArtifactRow":
+        """The artifacts row for a GHA leg; hash inputs stay readable beside the id."""
+        base = DerivedId.norm(base_artifact_id)
+        row: schema.ArtifactRow = {
+            "artifact_id": aid,
+            "component": comp,
+            "arch": arch,
+            "kind": "image",
+            # The hashed name, not a display string.
+            "artifact_name": base,
+            # chk_origin admits no 'gha'; the 'base=' dep is what marks it derived.
+            "origin": "built",
+            "identity_deps": [f"{schema.DEP_BASE_PREFIX}{base}"] if base else [],
+            "context_deps": [],
+            # Tuple order (repo, git_ref, git_sha) -- what the covered-tier join reads.
+            "sources": [(repo, git_ref, git_sha)]
+            if (repo or git_ref or git_sha)
+            else [],
+            "props": {
+                k: v
+                for k, v in {
+                    # The digest GhaArtifactId put in the id12 slot.
+                    "id12": GhaArtifactId.installed_digest(installed),
+                    "base_artifact_id": base,
+                    "installed": (installed or "").strip(),
+                    "run_url": run_url,
+                    "source": "gha",
+                }.items()
+                if v
+            },
+        }
+        return row
+
+
+# Function API, kept so installed consumers import one definition, not a copy.
+cases_already_ingested = TestResultWriter.already_ingested
+insert_test_results = TestResultWriter.insert
+benchmarks_already_ingested = BenchmarkWriter.already_ingested
+insert_benchmarks = BenchmarkWriter.insert
+capabilities_already_ingested = CapabilityWriter.already_ingested
+insert_capabilities = CapabilityWriter.insert
+artifact_already_recorded = ArtifactWriter.artifact_recorded
+artifact_result_already_recorded = ArtifactWriter.result_recorded
+insert_gha_artifact_result = ArtifactWriter.insert_gha_result

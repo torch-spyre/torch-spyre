@@ -23,6 +23,7 @@
 #include <flex/flex.hpp>
 #include <iostream>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <variant>
@@ -507,44 +508,40 @@ class JobPlanStepCompute final : public JobPlanStep {
 /**
  * @brief Host-side computation step (e.g., program correction)
  *
- * Stores compiler metadata (Hcm) and a shared output buffer during
- * PrepareKernel. The host computation uses
- * deeptools::processComputeOnHostCommand which takes Hcm metadata and performs
- * program correction or other host-side operations.
+ * Stores compiler metadata (Hcm) and the destination device address for the
+ * correction blob.  construct() builds a producer lambda (one of four cases
+ * depending on input source), calls it to allocate + fill a RaiiBuffer, then
+ * launches the correction H2D — both produce and transfer happen in one step,
+ * retiring the shared output_buffer_ pin.
  *
- * The output buffer is a pointer to pinned host memory, shared
- * with the subsequent JobPlanStepH2D that transfers it to device. construct()
- * builds a closure capturing the metadata, composite addresses, and
- * the buffer, and produces a RuntimeOperationHostCallback.
- *
- * The shared buffer is allocated once during PrepareKernel and reused across
- * launches. For tiled execution, the same buffer is reused across iterations —
- * FIFO ordering guarantees each iteration's H2D consumes the buffer before the
- * next iteration's HostCompute overwrites it.
+ * The RaiiBuffer produced at launch time carries the correction bytes; the
+ * adjacent DataTransfer H2D is collapsed into this step by the builder.
  */
 class JobPlanStepHostCompute final : public JobPlanStep {
  public:
   /**
-   * @brief Construct host compute step
+   * @brief Construct host compute step (merged HC + H2D form).
    *
    * @param hcm Compiler-provided metadata from deeptools (contains vdci and
    *            senConstants describing how symbolic values must be interpreted)
-   * @param output_buffer Pinned host buffer (lifetime managed by JobPlan)
-   * @param input_buffer Pinned host buffer (lifetime managed by JobPlan)
-   * @param ishape used for constructing input buffer
+   * @param correction_size Size of the correction blob in bytes (must equal
+   *            device_address.total_size())
+   * @param device_address Device CompositeAddress that receives the correction
+   *            blob via H2D after produce().
+   * @param input_buffer Pinned host buffer used as input (Case 1); nullptr for
+   *            Cases 2 and 3.
+   * @param ishape used to discriminate case 2 (fake symbols)
    */
-  JobPlanStepHostCompute(std::unique_ptr<Hcm> hcm, void* output_buffer,
+  JobPlanStepHostCompute(std::unique_ptr<Hcm> hcm, size_t correction_size,
+                         flex::CompositeAddress device_address,
                          const void* input_buffer, std::vector<int64_t> ishape)
       : hcm_(std::move(hcm)),
-        output_buffer_(output_buffer),
+        correction_size_(correction_size),
+        device_address_(std::move(device_address)),
         input_buffer_(input_buffer),
         ishape_(std::move(ishape)) {
-    // Inherits pipeline_barrier_ = true from the base. HostCompute keeps strict
-    // per-stream FIFO like every other op; overlap with device compute comes
-    // from placing HostCompute on the prep stream (S_prep), NOT from relaxing
-    // its barrier. The inline synchronize() it triggers only drains S_prep, so
-    // it never blocks device compute on S_dev.
-    role_ = StreamRole::Prep;
+    pipeline_barrier_ = false;  // host-produce is overlap-eligible
+
     // Try to build fast plan at construction time (prepare time)
     if (hcm_) {
       fast_plan_.valid = deeptools::buildFastHcmPatchPlan(fast_plan_, *hcm_);
@@ -583,7 +580,8 @@ class JobPlanStepHostCompute final : public JobPlanStep {
 
  private:
   std::unique_ptr<Hcm> hcm_;
-  void* output_buffer_;       // Non-owning pointer (JobPlan owns the buffer)
+  size_t correction_size_;  ///< byte count of the correction blob
+  flex::CompositeAddress device_address_;  ///< device destination for H2D
   const void* input_buffer_;  // Non-owning pointer (JobPlan owns the buffer)
   std::vector<int64_t> ishape_;
 

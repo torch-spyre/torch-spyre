@@ -1427,6 +1427,10 @@ class SpyreKernel(Kernel[CSEVariable]):
         real pool tensor is allocated immediately before and freed
         immediately after this kernel's .run() call, scoping its lifetime
         tightly to this one bundle's execution.
+
+        The pool tensor, when there is one, is call argument 0, ahead of the
+        tensor arguments. The KTIR emitter opens the kernel's signature with a
+        matching leading slot (``KernelPlan.parameters``).
         """
         wrapper = V.graph.wrapper_code
         call_args = []
@@ -1437,15 +1441,7 @@ class SpyreKernel(Kernel[CSEVariable]):
         # its own unique name -- so deriving the pool variable name from it
         # is collision-free without any extra bookkeeping here.
         pool_var_name = f"_pool_{name}"
-        emit_pool_tensor = uses_pool and _spyre_config.frontend_pool_allocation
-        if emit_pool_tensor and _spyre_config.ktir_emitter:
-            raise AssertionError(
-                "config.frontend_pool_allocation is not supported on the KTIR "
-                "emitter path: async_compile.ktir() takes no pool_size and the "
-                "KTIR emitter threads hbm_pool buffers as internal SSA values, "
-                "so a front-end pool argument would shift every tensor's "
-                "positional address binding."
-            )
+        emit_pool_tensor = uses_pool and _spyre_config.pool_allocated_by_frontend()
         if emit_pool_tensor:
             device = V.graph.get_current_device_or_throw()
             wrapper.writeline(

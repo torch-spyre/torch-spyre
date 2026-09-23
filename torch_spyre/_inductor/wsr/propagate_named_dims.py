@@ -37,6 +37,7 @@ from ..pass_utils import (
     host_coordinates,
     device_coordinates,
     indirect_sizes_from_op,
+    loop_var_ranges_from_dim_hints,
     op_out_coords,
 )
 from ..ir import SpyreConstantFallback
@@ -276,6 +277,20 @@ def _compute_named_dims(op, inputs):
         if sym not in loop_var_dims:
             size = int(output_dep.ranges[sym])
             loop_var_dims[sym] = [_untracked_name(op.get_name(), sym, size)]
+    # A WhileLoop-splice loop_var (e.g. u0, see for_each_tile_lowering.py's
+    # _synthesize_dim_hints_for_group) is deliberately never an
+    # output_dep.ranges key -- see loop_var_ranges_from_dim_hints's
+    # docstring -- so the seed loop above never assigns it a placeholder.
+    # If such a loop_var is also absent from every input's named dims (no
+    # real name), the out_coords loop below would then do
+    # loop_var_dims.get(sym, []) -> [] and silently contribute nothing,
+    # leaving named_dims one entry short and causing a positional
+    # off-by-one for every downstream named-dim consumer. Seed a
+    # placeholder for it here too, sized from its own dim_hints range
+    # rather than output_dep.ranges.
+    for sym, size in loop_var_ranges_from_dim_hints(op).items():
+        if sym not in loop_var_dims:
+            loop_var_dims[sym] = [_untracked_name(op.get_name(), sym, int(size))]
     out_coords = op_out_coords(op)
 
     named_dims = []

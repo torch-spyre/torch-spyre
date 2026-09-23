@@ -1,37 +1,25 @@
 -- Hardware-failure diagnostics: one row per (run, suite, attempt).
 --
--- The parse/ingest logic lives in spyre_clickhouse_ingest.hw_parse / .hw_diagnostics and is
--- shared by torch-spyre, hf-adapters and spyre-inference. This file is the definition those
--- writers assume -- the live v1 table grew by ALTER ... ADD COLUMN from each ingest instead,
--- which is how it reached 45 columns with an empty sorting key and no checked-in shape.
+-- Parse/ingest logic lives in spyre_clickhouse_ingest.hw_parse / .hw_diagnostics, shared by
+-- torch-spyre, hf-adapters and spyre-inference; this file is the definition those writers
+-- assume, replacing the live v1 table's ALTER-per-ingest growth to 45 undeclared columns.
 --
--- ONE run id. run_id is the uuid5 over (source, external_run_id, arch, test_type), derived by
--- the same two-case rule as every other writer: the THREADED uuid when the orchestrator
--- supplied one, else the coordinate hash. v1 also stored the raw producer coordinate (a GHA run
--- id, a Jenkins build key) in a String column of the same name; that is a hash INPUT, recoverable
--- from nothing else only because nothing else recorded it -- so it lives in props now, and the
--- column name means one thing.
+-- ONE run id: run_id is the uuid5 over (source, external_run_id, arch, test_type) -- the
+-- threaded uuid when supplied, else the coordinate hash, same as every other writer. The raw
+-- producer coordinate (a hash input) now lives in props, not in a same-named String column.
 --
--- DROPPED as run-level duplication, measured over 841,583 prod rows / 6,090 run_ids -- 0 run_ids
--- carried two values of any of them:
---   workflow    -- it IS the test_type (its 7 values are the tiers: regression, trunk, perf,
---                  integration...), already a run_id hash input under another name
---   run_link    -- {server}/{repo}/actions/runs/{run_id}, pure derivation; blank on 209,519 rows
---   branch      -- the triggering run's head
---   commit_sha  -- likewise
--- The last two are real facts with no per-row variation, so they belong on the run, not here.
+-- workflow/run_link/branch/commit_sha DROPPED as run-level duplication (0 of 6,090 run_ids in
+-- 841,583 prod rows carried two values of any): workflow IS test_type; run_link is pure
+-- derivation; branch/commit_sha are real facts but belong on the run, not here.
 --
--- attempt stays in the key because retries are the point: a flaky card shows up as attempt 2+ of
--- the same (run, suite), and retry_trigger/pod_level_retry only make sense read alongside the
--- attempt they belong to.
+-- attempt stays in the key: retries are the point, and retry_trigger/pod_level_retry only make
+-- sense read alongside the attempt they belong to.
 --
--- No audit_uuid/audit_timestamp: the live v1 table carries both, but no writer sets them, so they
--- are unwritten defaults rather than data. Same call as jenkins_agents.
+-- No audit_uuid/audit_timestamp: the v1 table carries both but no writer sets them (same call
+-- as jenkins_agents).
 --
--- component leads, as in every other table here, and the join to the artifact side is the same:
---   run_id -> artifact_results.run_id -> .artifact_id -> artifacts -> artifact_tags
--- artifact_id is nil-UUID on an un-updated writer, which reads as "not linked" rather than
--- mis-linked -- a nil UUID joins nothing, whereas a defaulted hash would join everything.
+-- component leads, as elsewhere; artifact_id is nil-UUID on an un-updated writer, which reads
+-- as "not linked" (a nil UUID joins nothing) rather than mis-linked.
 CREATE TABLE IF NOT EXISTS hw_failure_diagnostics
 (
     `run_id` UUID,
@@ -75,9 +63,8 @@ CREATE TABLE IF NOT EXISTS hw_failure_diagnostics
     `tests_failed` UInt32,
     `tests_error` UInt32,
     `stall_max_secs` UInt32,
-    -- external_run_id (the raw producer coordinate run_id is hashed from) and run_url. Both are
-    -- run-level, but unlike branch/commit_sha they are the INPUTS to this row's own identity, so
-    -- they stay recoverable here rather than needing the run to be resolvable first.
+    -- external_run_id (this row's identity hash input) and run_url; kept here rather than
+    -- requiring the run to be resolved first.
     `props` Map(LowCardinality(String), String)
 )
 ENGINE = MergeTree

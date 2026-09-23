@@ -83,8 +83,8 @@ on:
           trunk | suite_<group> | <label>. These tier names ARE the
           test_suite_config.labels vocabulary directly (no alias layer).
           Default: integration (configs whose test_suite_config.labels cover
-          the device-layer surfaces flex and deeptools/dxp_standalone
-          exercise most -- streams, job launch plans, codegen,
+          the device-layer surfaces flex and deeptools exercise most
+          -- streams, job launch plans, codegen,
           LX/scratchpad planning, tensor layout, allocator/GC, D2D copies).
           Pass "regression" to run every config.
         required: false

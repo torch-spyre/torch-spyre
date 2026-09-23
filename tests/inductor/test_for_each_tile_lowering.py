@@ -16,9 +16,11 @@
 
 No Spyre device or backend compiler is required. Covers four areas, each
 in its own class group:
-  1. An eager-mode sanity check that the nested for_each_tile fixture's
-     reference implementation matches plain matmul (TestNestedForEach
-     TileFixture).
+  1. Eager-mode sanity checks for fixture reference implementations: the
+     nested for_each_tile fixture against plain matmul
+     (TestNestedForEachTileFixture), and paged_gather_reference's row-count
+     handling for Q-tiles shorter than the full sequence
+     (TestPagedGatherReference).
   2. while_loop_bridge's generic while_loop -> coarse-tile-group bridge:
      CarryBinding/carry_bindings_for and splice_while_loop's buffer
      transplant, carry/xs-leaf read redirection, and mutated-carry
@@ -42,11 +44,15 @@ from unittest import mock
 import torch
 from torch._inductor.virtualized import V
 
-from tests.inductor.for_each_tile_fixtures import (
+from for_each_tile_fixtures import (
+    PAGE_HS,
+    PAGE_LQ,
     capture_post_grad_while_loop,
     matmul_inputs,
     nested_split_m_then_k_fn,
     nested_split_m_then_k_reference,
+    paged_gather_inputs,
+    paged_gather_reference,
     split_k_fn,
     split_m_elementwise_fn,
     split_m_fn,
@@ -76,6 +82,23 @@ class TestNestedForEachTileFixture(unittest.TestCase):
         (X, Y), expected = matmul_inputs()
         actual = nested_split_m_then_k_fn(X, Y)
         torch.testing.assert_close(actual, expected, atol=self.ATOL, rtol=self.RTOL)
+
+
+class TestPagedGatherReference(unittest.TestCase):
+    """Regression test for paged_gather_reference's row-count fix.
+
+    paged_gather_reference used to hardcode PAGE_LQ as the accumulator's row
+    count instead of deriving it from q.shape[0], so it crashed (rather than
+    silently mismatching) as soon as a caller -- e.g. paged_gather_nested_
+    reference, tiling Q into narrower row-tiles -- passed a Q shorter than
+    the full sequence.
+    """
+
+    def test_accepts_q_tile_shorter_than_page_lq(self):
+        pages, _, q = paged_gather_inputs()
+        q_tile = q[: PAGE_LQ // 2]
+        out = paged_gather_reference(pages, q_tile)
+        self.assertEqual(out.shape, (PAGE_LQ // 2, PAGE_HS))
 
 
 class TestCarryBindingsFor(unittest.TestCase):
@@ -609,7 +632,7 @@ class TestSpliceWhileLoops(unittest.TestCase):
         from torch._inductor import ir
         from torch._inductor.virtualized import V
 
-        from tests.inductor.for_each_tile_fixtures import (
+        from for_each_tile_fixtures import (
             attention_inputs,
             nested_online_softmax_fn,
         )
@@ -867,7 +890,7 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
         """
         from torch._inductor.graph import GraphLowering
 
-        from tests.inductor.for_each_tile_fixtures import capture_post_grad_while_loop
+        from for_each_tile_fixtures import capture_post_grad_while_loop
 
         _out, gm = capture_post_grad_while_loop(fn, args)
 
@@ -1189,7 +1212,7 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
             splice_while_loop,
         )
 
-        from tests.inductor.for_each_tile_fixtures import (
+        from for_each_tile_fixtures import (
             paged_gather_kv_fn,
             paged_gather_kv_inputs,
         )
@@ -1334,7 +1357,7 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
         )
 
         import torch
-        from tests.inductor.for_each_tile_fixtures import M, K, N
+        from for_each_tile_fixtures import M, K, N
 
         X, Y = torch.randn(M, K), torch.randn(K, N)
         graph = self._run_graph(split_k_fn, (X, Y))
@@ -1963,7 +1986,7 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
         from torch_spyre.constants import DEVICE_NAME
 
         import torch_spyre._inductor.passes as passes_mod
-        from tests.inductor.for_each_tile_fixtures import (
+        from for_each_tile_fixtures import (
             capture_post_grad_while_loop,
             nested_split_m_then_k_fn,
         )
@@ -2036,6 +2059,71 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
             "keeps its marker materialized rather than erasing it)",
         )
 
+    def test_gather_mode_nested_resolves_correctly(self):
+        """Kind.GATHER nested inside another for_each_tile splices cleanly.
+
+        paged_gather_nested_fn wraps an outer map over Q-row-tiles around
+        paged_gather_fn's own gather-mode body (tiled block table, invariant
+        page pool, one page gathered per trip via a POINT read of the page
+        index -- see paged_gather_fn's docstring). Every prior nested
+        fixture in this file nests Kind.SLICE loops inside each other; this
+        is the first to nest a Kind.GATHER loop, which resolves its own
+        tile_dim_marker via a point read rather than a sliced-tensor read.
+        Asserts both WhileLoop ops (outer map, inner gather) are fully
+        spliced -- same shape, and same snapshot-before-DCE requirement, as
+        test_nested_for_each_tile_markers_resolve_correctly's check for the
+        Kind.SLICE-in-Kind.SLICE case (see that test's docstring for why a
+        live post-compile read of graph.operations cannot distinguish
+        "spliced correctly" from "splicing was a no-op and DCE pruned the
+        orphaned WhileLoop as unrelated dead code").
+        """
+        import torch_spyre  # noqa: F401  registers the "spyre" device
+        from torch_spyre.constants import DEVICE_NAME
+        from torch._inductor import ir
+
+        import torch_spyre._inductor.passes as passes_mod
+        from for_each_tile_fixtures import (
+            capture_post_grad_while_loop,
+            paged_gather_inputs,
+            paged_gather_nested_fn,
+        )
+
+        pages, table, q = paged_gather_inputs()
+        pages = pages.to(DEVICE_NAME)
+        table = table.to(DEVICE_NAME)
+        q = q.to(DEVICE_NAME)
+
+        captured = {}
+        original_splice_while_loops = passes_mod.splice_while_loops
+
+        def capturing_splice_while_loops(graph):
+            result = original_splice_while_loops(graph)
+            # No captured["graph"] here (unlike the sibling
+            # test_nested_for_each_tile_markers_resolve_correctly): this test
+            # only checks that both WhileLoops were spliced, not marker
+            # survival, so it has no later use for the graph reference.
+            captured["operations"] = list(graph.operations)
+            return result
+
+        passes_mod.splice_while_loops = capturing_splice_while_loops
+        try:
+            capture_post_grad_while_loop(paged_gather_nested_fn, (pages, table, q))
+        finally:
+            passes_mod.splice_while_loops = original_splice_while_loops
+
+        self.assertIn(
+            "operations", captured, "splice_while_loops was never called/captured"
+        )
+        remaining_while_ops = [
+            op for op in captured["operations"] if isinstance(op, ir.WhileLoop)
+        ]
+        self.assertEqual(
+            remaining_while_ops,
+            [],
+            "expected both nesting levels (outer map, inner gather) to be "
+            "fully spliced",
+        )
+
     def test_triple_nested_stardep_outer_resolves_correctly(self):
         """Three-level nesting, STAR_DEP_KEPT at the outer level: marker
         splicing/resolution completes correctly and the fixture compiles
@@ -2055,7 +2143,7 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
         import torch
         import torch_spyre  # noqa: F401
         from torch_spyre.constants import DEVICE_NAME
-        from tests.inductor.for_each_tile_fixtures import (
+        from for_each_tile_fixtures import (
             capture_post_grad_while_loop,
             triple_nested_stardep_outer_fn,
         )
@@ -2075,7 +2163,7 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
         import torch
         import torch_spyre  # noqa: F401
         from torch_spyre.constants import DEVICE_NAME
-        from tests.inductor.for_each_tile_fixtures import (
+        from for_each_tile_fixtures import (
             capture_post_grad_while_loop,
             triple_nested_stardep_middle_fn,
         )
@@ -2095,7 +2183,7 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
         import torch
         import torch_spyre  # noqa: F401
         from torch_spyre.constants import DEVICE_NAME
-        from tests.inductor.for_each_tile_fixtures import (
+        from for_each_tile_fixtures import (
             capture_post_grad_while_loop,
             triple_nested_stardep_inner_fn,
         )
@@ -2126,7 +2214,7 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
         import torch
         import torch_spyre  # noqa: F401
         from torch_spyre.constants import DEVICE_NAME
-        from tests.inductor.for_each_tile_fixtures import (
+        from for_each_tile_fixtures import (
             capture_post_grad_while_loop,
             triple_nested_stardep_multilevel_fn,
         )
@@ -2158,7 +2246,7 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
         import pytest
         from torch._inductor.exc import InductorError
         from torch_spyre.constants import DEVICE_NAME
-        from tests.inductor.for_each_tile_fixtures import (
+        from for_each_tile_fixtures import (
             capture_post_grad_while_loop,
             sibling_nested_fn,
             sibling_nested_reference,
@@ -2200,7 +2288,7 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
         import pytest
         from torch._inductor.exc import InductorError
         from torch_spyre.constants import DEVICE_NAME
-        from tests.inductor.for_each_tile_fixtures import (
+        from for_each_tile_fixtures import (
             capture_post_grad_while_loop,
             sibling_nested_stardep_fn,
             sibling_nested_stardep_reference,
@@ -2257,7 +2345,7 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
         from torch_spyre.constants import DEVICE_NAME
 
         import torch_spyre._inductor.passes as passes_mod
-        from tests.inductor.for_each_tile_fixtures import (
+        from for_each_tile_fixtures import (
             capture_post_grad_while_loop,
             nested_split_m_then_k_fn,
         )
@@ -2340,7 +2428,7 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
         from torch_spyre.constants import DEVICE_NAME
 
         import torch_spyre._inductor.passes as passes_mod
-        from tests.inductor.for_each_tile_fixtures import (
+        from for_each_tile_fixtures import (
             capture_post_grad_while_loop,
             nested_split_m_then_k_fn,
         )
@@ -2427,54 +2515,84 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
         finally:
             del victim.tile_marker_dim
 
-    @unittest.expectedFailure
     def test_nested_for_each_tile_value_correct(self):
-        # Issue #4460 (stick-layout/read-copy reconciliation gap in
-        # propagate_layouts.py, inherited from nested_split_m_then_k_fn's
-        # split_k-shaped inner loop) is fixed for this fixture's shape.
-        # The marker_resolution-aware guard in
-        # _synthesize_dim_hints_for_group (issue #4581's fix) makes real
-        # progress -- the pipeline now runs past the original codegen-time
-        # "indirect symbol" lookup failure. Issue #4706's OS-5
-        # symbol-consistency gap on splice_while_loops's synthetic
-        # `identity` op (create_tensor_arg now strips WhileLoop-splice
-        # loop_var symbols like u5 out of the static device_coordinates
-        # and folds their contribution into device_tile_advance_expr
-        # instead) is fixed too, for this fixture's shape. Compilation,
-        # scheduling, and codegen now all complete -- but the test still
-        # fails at the final numeric assertion, and the failure is
-        # nondeterministic run-to-run on this same fixed-seed-free fixture
-        # (confirmed via repeated clean-cache runs). This points to a
-        # memory-safety-class bug (a stale or aliased HBM read, likely in
-        # hbm_pool allocation lifetime or carry read/write scheduling
-        # order) rather than a deterministic addressing/indexing bug in
-        # the tiled_symbols/splice-var binding layer -- see issue #4701
-        # for the full investigation writeup and next steps.
-        # test_carry_mode_split_k (test_for_each_tile_e2e.py) now passes:
-        # its StarDep-shaped matmul consumer turned out to hit the same
-        # issue #4706 OS-5 symbol-consistency layer as this fixture, and
-        # does not hit the #4701 nondeterministic memory-safety gap this
-        # test remains xfailed on (confirmed via isolated stash/pop
-        # bisection -- see that test's own docstring).
+        """Depth=2 nested for_each_tile (outer M-tile, inner split-K carry)
+        compiles and produces numerically correct output end to end.
+
+        Issue #4460 (stick-layout/read-copy reconciliation gap in
+        propagate_layouts.py) and issue #4706 (OS-5 symbol-consistency gap
+        on splice_while_loops's synthetic `identity` op) are both fixed for
+        this fixture's shape. Issue #4701 investigated an apparent
+        nondeterministic numeric mismatch here; that turned out to be this
+        test's reference not matching Spyre's actual dl16 compute precision
+        (unit-variance randn inputs at K=256 blow up output magnitude, and
+        the reference wasn't rounded to approximate dl16) rather than a
+        memory-safety bug -- with methodology matching
+        test_nested_split_m_then_k (test_for_each_tile_e2e.py), the result
+        is deterministic and correct.
+        """
         import torch
         import torch_spyre  # noqa: F401  registers the "spyre" device
         from torch_spyre.constants import DEVICE_NAME
 
-        from tests.inductor.for_each_tile_fixtures import (
+        from for_each_tile_fixtures import (
             nested_split_m_then_k_fn,
             nested_split_m_then_k_reference,
         )
+        from tests.inductor.utils_inductor import cached_xavier, dl16_round
 
         torch._dynamo.reset()
-        X = torch.randn(256, 256, device=DEVICE_NAME, dtype=torch.float16)
-        Y = torch.randn(256, 64, device=DEVICE_NAME, dtype=torch.float16)
-        expected = nested_split_m_then_k_reference(X.cpu(), Y.cpu()).to(DEVICE_NAME)
+        X = cached_xavier((256, 256))
+        Y = cached_xavier((256, 64), differentiation=1)
+        expected = nested_split_m_then_k_reference(
+            dl16_round(X.float()), dl16_round(Y.float())
+        )
 
         compiled = torch.compile(
             nested_split_m_then_k_fn, backend="inductor", fullgraph=True
         )
-        actual = compiled(X, Y)
-        torch.testing.assert_close(actual.cpu(), expected.cpu(), atol=1e-2, rtol=1e-2)
+        actual = compiled(X.to(DEVICE_NAME), Y.to(DEVICE_NAME))
+        torch.testing.assert_close(actual.cpu().float(), expected, atol=1e-2, rtol=1e-2)
+
+    def test_nested_online_softmax_value_correct(self):
+        """Map-outer/carry-inner nesting with a multi-leaf carry compiles and
+        produces numerically correct output end to end.
+
+        nested_online_softmax_fn maps Q-row-tiles around online_softmax_fn's
+        own 3-leaf (m, denom, acc) carry over K/V tiles -- previously only
+        exercised by test_nested_late_created_ops_inherit_ancestor_loop_info
+        (loop_info/marker propagation on mocked IR, no device compile, no
+        numerics). This closes that gap: same dl16-rounded-reference,
+        xavier-input methodology as test_carry_mode_online_softmax
+        (test_for_each_tile_e2e.py), since the inner loop is exactly that
+        fixture's carry recurrence, just re-run once per outer Q-tile.
+        """
+        import torch
+        import torch_spyre  # noqa: F401  registers the "spyre" device
+        from torch_spyre.constants import DEVICE_NAME
+
+        from for_each_tile_fixtures import (
+            D,
+            LK,
+            LQ,
+            nested_online_softmax_fn,
+            nested_online_softmax_reference,
+        )
+        from tests.inductor.utils_inductor import cached_xavier, dl16_round
+
+        torch._dynamo.reset()
+        Q = cached_xavier((LQ, D))
+        K = cached_xavier((LK, D), differentiation=1)
+        V = cached_xavier((LK, D), differentiation=2)
+        expected = nested_online_softmax_reference(
+            dl16_round(Q.float()), dl16_round(K.float()), dl16_round(V.float())
+        )
+
+        compiled = torch.compile(
+            nested_online_softmax_fn, backend="inductor", fullgraph=True
+        )
+        actual = compiled(Q.to(DEVICE_NAME), K.to(DEVICE_NAME), V.to(DEVICE_NAME))
+        torch.testing.assert_close(actual.cpu().float(), expected, atol=1e-2, rtol=1e-2)
 
 
 class TestStampDirectLoopInfo(unittest.TestCase):
@@ -2492,7 +2610,7 @@ class TestStampDirectLoopInfo(unittest.TestCase):
         """
         from torch._inductor.graph import GraphLowering
 
-        from tests.inductor.for_each_tile_fixtures import capture_post_grad_while_loop
+        from for_each_tile_fixtures import capture_post_grad_while_loop
 
         _out, gm = capture_post_grad_while_loop(fn, args)
 
@@ -2523,7 +2641,7 @@ class TestStampDirectLoopInfo(unittest.TestCase):
     def test_single_level_stamps_group_id_and_count(self):
         from torch._inductor import ir
 
-        from tests.inductor.for_each_tile_fixtures import matmul_inputs, split_k_fn
+        from for_each_tile_fixtures import matmul_inputs, split_k_fn
         from torch_spyre._inductor.wsr.for_each_tile_lowering import (
             _body_loop_var,
             _stamp_direct_loop_info,
@@ -2582,7 +2700,7 @@ class TestStampDirectLoopInfo(unittest.TestCase):
         """
         from torch._inductor import ir
 
-        from tests.inductor.for_each_tile_fixtures import split_m_elementwise_fn
+        from for_each_tile_fixtures import split_m_elementwise_fn
         from torch_spyre._inductor.wsr.for_each_tile_lowering import (
             _body_loop_var,
             _consume_tile_dim_markers,
@@ -2651,7 +2769,7 @@ class TestStampDirectLoopInfo(unittest.TestCase):
         from torch._inductor import ir
         from torch._inductor.dependencies import MemoryDep
 
-        from tests.inductor.for_each_tile_fixtures import split_m_elementwise_fn
+        from for_each_tile_fixtures import split_m_elementwise_fn
         from torch_spyre._inductor.wsr.for_each_tile_lowering import (
             _body_loop_var,
             _consume_tile_dim_markers,

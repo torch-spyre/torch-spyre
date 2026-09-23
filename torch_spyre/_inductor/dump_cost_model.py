@@ -75,14 +75,16 @@ def _prod_ints(seq) -> int:
 
 
 def _op_name(op) -> str:
-    data = getattr(op, "data", None)
-    node = getattr(data, "origin_node", None)
-    if node is not None:
-        return getattr(node, "name", None) or str(getattr(node, "target", node))
-    rtype = getattr(data, "reduction_type", None)
-    if rtype:
-        return str(rtype)
-    return type(data).__name__ if data is not None else op.get_operation_name()
+    """The op's origin-node name.
+
+    ``dump_common`` owns the definition so this dump and the cost-expression
+    dump name ops identically -- the two are joined on it. Imported inside the
+    function because ``dump_common`` is the shared sink and importing it at
+    module scope would close a cycle.
+    """
+    from .dump_common import origin_op_name
+
+    return origin_op_name(op)
 
 
 def _work_slices(op, write_index, read_index, iteration_space, work_slices=None):
