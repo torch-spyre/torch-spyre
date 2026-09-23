@@ -1754,10 +1754,12 @@ def spyre__sdpa_overrideable(
     # SDPA routinely receives logical [B, H, S, D] queries backed by physical
     # [B, S, H, D] storage. for_each_tile's explicit dims already preserve the
     # logical axes, but WhileLoop.create still requires exact input strides and
-    # would otherwise synthesize this normalization. Keep the bounded, one-time
-    # query copy explicit before GQA unflattening. Do not contiguify K/V
-    # wholesale: those copies scale with context length, so the compiler streams
-    # their bounded tiles instead.
+    # would otherwise synthesize this normalization. A projection result can be
+    # logically contiguous while retaining a noncanonical Spyre device layout,
+    # so ``contiguous()`` is not sufficient to materialize the normalization.
+    # Keep the bounded, one-time query clone explicit before GQA unflattening.
+    # Do not clone K/V wholesale: those copies scale with context length, so the
+    # compiler streams their bounded tiles instead.
     original_query_strides = query.stride()
     if num_heads % num_kvheads != 0:
         raise Unsupported(
@@ -1771,7 +1773,11 @@ def spyre__sdpa_overrideable(
     # K/V receive only a unit view axis and broadcast over the within-group
     # query-head dimension in the native batched-matmul lowering. Preserve the
     # established rank-4 MHA path when there is no grouped-query expansion.
-    query = query.contiguous()
+    query = (
+        query.clone(memory_format=torch.contiguous_format)
+        if use_gqa
+        else query.contiguous()
+    )
     if use_gqa:
         query = query.unflatten(1, (num_kvheads, gqa_group_size))
 
