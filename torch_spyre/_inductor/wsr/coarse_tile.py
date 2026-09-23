@@ -1611,8 +1611,20 @@ def _tiled_dims_for_dep(
 
     def _dim_is_read(d: int) -> bool:
         loop_var = pos_to_loop_var.get(d)
-        if loop_var is not None and dep.index.coeff(loop_var) != 0:
-            return True
+        if loop_var is not None:
+            free = dep.index.free_symbols
+            # Same two-way OR as _loop_var_to_ranges_pos, and for the same
+            # reason: a non-linear wrapper (e.g. floor(u0)) makes
+            # .coeff(loop_var) == 0 even though loop_var is dep.index's
+            # only free symbol. This function's docstring already claims
+            # "the same coefficient test" as that function for consistency
+            # -- matching the OR, not just the coefficient half, is what
+            # actually keeps that promise. Without it, a read whose index
+            # non-linearly wraps a WhileLoop-splice loop_var would be
+            # wrongly reported as not reading dim d, silently dropping it
+            # from the tiled-dims list.
+            if loop_var in free and (len(free) == 1 or dep.index.coeff(loop_var) != 0):
+                return True
         return raw_to_squeezed.get(d, d) in dep_dims
 
     return [
@@ -2191,6 +2203,15 @@ def _splice_write_targets_full_buffer(op: ComputedBuffer, mut_target: Buffer) ->
     their existing path. Comparing numels rather than shapes keeps this
     robust to the squeeze/rank differences between ``op.data.ranges`` and a
     buffer's own size that this file deals with elsewhere.
+
+    ``diff.is_positive`` is tri-state (True/False/None): sympy returns None
+    rather than False when it can't determine the sign (e.g. an unresolved
+    symbolic extent), and ``bool(None)`` is False. Testing ``is_zero``
+    first and raising when neither ``is_zero`` nor ``is_positive`` resolves
+    keeps that indeterminate case from silently taking the "equal, ordinary
+    mutation" branch above -- which would double-buffer a stacking write's
+    real destination into a copy-out scratch and read a moving window of it,
+    a silent wrong answer (see issue #4458).
     """
     ranges = getattr(getattr(op, "data", None), "ranges", None)
     if not ranges:
@@ -2201,7 +2222,15 @@ def _splice_write_targets_full_buffer(op: ComputedBuffer, mut_target: Buffer) ->
         return False
     op_numel = sympy.prod([sympy.sympify(r) for r in ranges])
     diff = sympy.simplify(target_numel - op_numel)
-    return bool(diff.is_positive)
+    if diff.is_zero:
+        return False
+    if diff.is_positive:
+        return True
+    raise Unsupported(
+        f"WhileLoop-splice stacking-write size check: could not determine "
+        f"whether mutation target size ({target_numel}) exceeds op write "
+        f"size ({op_numel}); diff={diff} has indeterminate sign"
+    )
 
 
 def _hint_ranges_pos(

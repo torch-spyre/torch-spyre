@@ -148,9 +148,10 @@ def _geometry_violations(buffers, capacity, alignment):
     """Every way a solved layout can be geometrically wrong, as a list of
     human-readable strings (empty == the layout is realizable).
 
-    Derived from the returned buffers alone -- lifetimes off ``uses``, per-core
-    footprints off ``size`` and the chosen division's ``output_partition`` -- so
-    it shares no code with the packer whose output it judges. That is the point:
+    Derived from the returned buffers alone -- lifetimes off ``uses`` and
+    ``lifetime_end_override``, per-core footprints off ``size`` and the chosen
+    division's ``output_partition`` -- so it shares no code with the packer
+    whose output it judges. That is the point:
     ``test_probe_walk_leaves_the_packer_consistent`` compares the incremental
     packer against a from-scratch rebuild, which catches bookkeeping drift but
     puts the same geometry rules on both sides, so a systematic placement bug
@@ -181,11 +182,16 @@ def _geometry_violations(buffers, capacity, alignment):
     # A buffer with no uses is alive at no tick, so it can overlap nothing; the
     # alignment and capacity checks above still covered it.
     live = [b for b in resident if b.uses]
+
+    def end(b):
+        return max(b.uses[-1] + 1, b.lifetime_end_override or 0)
+
     for i, bi in enumerate(live):
         for bj in live[i + 1 :]:
-            # Lifetimes are the half-open [uses[0], uses[-1] + 1), re-derived
-            # here rather than taken from the buffer's own properties.
-            if not (bi.uses[0] < bj.uses[-1] + 1 and bj.uses[0] < bi.uses[-1] + 1):
+            # Lifetimes are the half-open [uses[0], end), re-derived here rather
+            # than taken from the buffer's own properties; ``end`` extends to a
+            # counted loop's end when the buffer carries that override.
+            if not (bi.uses[0] < end(bj) and bj.uses[0] < end(bi)):
                 continue
             lo_i, hi_i = bi.address, bi.address + footprint[bi.name]
             lo_j, hi_j = bj.address, bj.address + footprint[bj.name]
@@ -290,6 +296,16 @@ class GeometricValidityTest(TestCase):
 
         b.address = 896  # aligned and clear of a, but [896, 1152) exceeds 1024
         self.assertEqual(len(_geometry_violations([a, b], cap, 128)), 1)
+
+    def test_lifetime_end_override_keeps_buffers_apart(self):
+        """A buffer a counted loop keeps alive past its last use (the loop body
+        re-runs) must not donate its bytes to one that starts after that use."""
+        a = self._placed("a", 512, (0, 1), None)
+        a.lifetime_end_override = 4
+        b = self._placed("b", 512, (2, 3), None)
+        out = SaCoOptimizingSolver([a, b], 1024, 128).plan_layout_and_core_divisions()
+        self.assertTrue(all(buf.address is not None for buf in out))
+        self.assertEqual(_geometry_violations(out, 1024, 128), [])
 
     def test_in_place_child_may_share_the_parent_address(self):
         """The one legitimate way two co-live buffers share bytes: the child

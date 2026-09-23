@@ -3260,11 +3260,9 @@ def spyre_flip(input: torch.Tensor, dims: Sequence[int]) -> torch.Tensor:
 def spyre_prod_dim_int(
     input: torch.Tensor, dim: int, keepdim: bool = False
 ) -> torch.Tensor:
-    # Currently, restickify does not support fp32 (int64 is also converted to fp32
-    # for now, so it is unsupported as well).
-    # Use decomposition in these cases as a safe fallback, even if restickify
-    # might not be needed in the end.
-    if input.dtype != torch.float32 and input.dtype != torch.int64:
+    # int64 is converted to fp32 for now, so it stays on the decomposition
+    # path below.
+    if input.dtype != torch.int64:
         return torch.ops.spyre.prod_dim_int(input, dim, keepdim)
 
     if dim < 0:
