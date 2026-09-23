@@ -24,7 +24,7 @@ import torch.nn.functional as F
 
 import torch_spyre._inductor.wsr.propagate_named_dims as _pnd
 from torch._inductor.utils import run_and_get_code
-from torch_spyre._C import SpyreTensorLayout
+from torch_spyre._C import SpyreTensorLayout, get_device_dtype
 from torch_spyre._inductor import spyre_hint  # noqa: F401
 from torch_spyre._inductor import config
 
@@ -304,36 +304,16 @@ class TestBuildingBlocks(unittest.TestCase):
 
     def test_mixed_ea_staggered_broadcaster_fp32(self):
         # Case 3.2 with an fp32-physical staggered broadcaster (DL16_TO_FP32).
-        # The mixed-EA gate ALLOWS it (physically the equivalent all-STANDARD fp32
-        # broadcast), but the codegen doesn't yet emit an fp32 broadcast along
-        # the stick axis. The same crash hits a pure-STANDARD fp32
-        # [4,1]+[4,64] broadcast, so it is a separate, pre-existing codegen gap
-        # tracked in https://github.com/torch-spyre/torch-spyre/issues/4132.
-        #
-        # We assert the failure originates in *codegen*, not the mixed-EA layout
-        # gate: a plain @unittest.expectedFailure would also stay green if a future
-        # change re-tightened the gate and raised `Unsupported` before codegen,
-        # masking a regression of the path this test guards. So we require the
-        # error to be a codegen failure and NOT the gate's "mixed EA"
-        # Unsupported. Flip this to a compare_with_cpu once codegen lands.
+        # The mixed-EA gate allows it, being physically the equivalent
+        # all-STANDARD fp32 broadcast, and the backend now emits an fp32
+        # broadcast along the stick axis.
         x = torch.randn(4, 1, dtype=torch.float16)  # -> .to(f32): staggered bcast
         w = torch.randn(4, 64, dtype=torch.float32)  # STANDARD full
 
         def fn(x, w):
             return torch.add(x.to(torch.float32), w)
 
-        with self.assertRaises(Exception) as ctx:
-            compare_with_cpu(fn, x, w, cpu_compile=False, run_eager=False)
-        msg = str(ctx.exception)
-        self.assertNotIn(
-            "Multi-arg pointwise with mixed EA",
-            msg,
-            f"expected a codegen failure, but the mixed-EA gate rejected it: {msg}",
-        )
-        self.assertTrue(
-            any(k in msg for k in ("ddc", "sbf-")),
-            f"expected a ddc/sbf codegen-stage failure, got: {msg[:300]}",
-        )
+        compare_with_cpu(fn, x, w, cpu_compile=False, run_eager=False)
 
     def test_flash_attention(self):
         B, H, L, D = 1, 8, 256, 64
@@ -529,6 +509,79 @@ class TestBuildingBlocks(unittest.TestCase):
     def test_granite_gqa_decode_with_finite_mask(self):
         """Decode SDPA uses all KV chunks through an unnamed broadcast mask."""
         self._run_granite_gqa_with_finite_broadcast_mask(LQ=1)
+
+    def test_gqa_decode_group_tiling_with_projected_query_layout(self):
+        """GQA tiling must rebase the noncanonical Q layout from projection."""
+        batch, query_heads, kv_heads, query_length, kv_length, head_dim = (
+            1,
+            16,
+            4,
+            1,
+            512,
+            128,
+        )
+        dtype = torch.bfloat16
+
+        def sdpa(query, key, value, mask):
+            return F.scaled_dot_product_attention(
+                query,
+                key,
+                value,
+                attn_mask=mask,
+                dropout_p=0.0,
+                scale=0.0078125,
+                enable_gqa=True,
+            )
+
+        query = torch.randn(
+            batch, query_length, query_heads, head_dim, dtype=dtype
+        ).transpose(1, 2)
+        key = torch.zeros(batch, kv_heads, kv_length, head_dim, dtype=dtype)
+        value = torch.zeros(batch, kv_heads, kv_length, head_dim, dtype=dtype)
+        key[:, :, 59:65, :] = torch.randn(batch, kv_heads, 6, head_dim, dtype=dtype)
+        value[:, :, 59:65, :] = torch.randn(batch, kv_heads, 6, head_dim, dtype=dtype)
+        mask = torch.full(
+            (batch, query_heads, query_length, kv_length),
+            torch.finfo(dtype).min / 2,
+            dtype=dtype,
+        )
+        mask[..., 59:65] = 0
+
+        # Match the factorized physical layout emitted by Granite's compiled
+        # Q projection and RoPE path while retaining logical BHLD strides.
+        elems_per_stick = SpyreTensorLayout(query.shape, dtype).elems_per_stick()
+        query_layout = SpyreTensorLayout(
+            device_size=[
+                head_dim // elems_per_stick,
+                1,
+                1,
+                1,
+                1,
+                query_heads,
+                elems_per_stick,
+            ],
+            stride_map=[
+                elems_per_stick,
+                -1,
+                -1,
+                -1,
+                elems_per_stick,
+                head_dim,
+                1,
+            ],
+            device_dtype=get_device_dtype(dtype),
+        )
+
+        expected = sdpa(query, key, value, mask)
+        actual, sources = run_and_get_code(
+            torch.compile(sdpa, dynamic=False),
+            query.to("spyre", device_layout=query_layout),
+            key.to("spyre"),
+            value.to("spyre"),
+            mask.to("spyre"),
+        )
+        torch.testing.assert_close(actual.cpu(), expected, atol=0.01, rtol=0.01)
+        self.assertEqual(sum(source.count("LoopSpec(") for source in sources), 2)
 
     def test_granite_gqa_prefill_with_finite_broadcast_mask(self):
         """Prefill SDPA accepts the model's ``[B,1,Lq,Lk]`` causal mask.

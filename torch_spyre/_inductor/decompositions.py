@@ -70,6 +70,12 @@ _SDPA_MHA_QUERY_ONLY_MIN_KV_BLOCKS = 8
 # These constants do not represent a legacy non-HOP SDPA implementation.
 _SDPA_NARROW_LIVE_SCORE_BUFFER_ALLOWANCE = 2
 _SDPA_NARROW_LIVE_QUERY_BUFFER_ALLOWANCE = 2
+# When every selected MHA tile count is one, ``map_tiles`` and the K/V scan
+# invoke their bodies directly. There is no HOP staging or carry handoff in
+# that graph: the score allocation can be reused after its reduction and only
+# the scaled query, weighted result, and normalized output overlap at peak.
+_SDPA_DIRECT_LIVE_SCORE_BUFFER_ALLOWANCE = 1
+_SDPA_DIRECT_LIVE_QUERY_BUFFER_ALLOWANCE = 3
 _SDPA_TARGET_KV_BYTES_PER_CORE = 1024 * 1024
 _SDPA_MAX_TARGET_KV_BYTES_PER_CORE = 2 * 1024 * 1024
 _SDPA_GQA_HEADS_PER_KV_TARGET_MIB = 4
@@ -275,7 +281,7 @@ def _sdpa_work_division(
     max_seqlen_kv: int,
     num_cores: int,
 ) -> dict[str, int] | None:
-    """Find the largest placeable head/query split for SWA."""
+    """Find the largest placeable head/query split for direct SDPA and SWA."""
     if num_cores < 1 or max_seqlen_q <= 1:
         return None
 
@@ -398,15 +404,18 @@ def _sdpa_estimated_live_bytes_per_core(
     element_size: int,
     restick_bytes_per_core: int = 0,
     full_sdpa_prefill: bool = False,
+    has_loop_boundary: bool = True,
 ) -> tuple[int, int]:
     """Estimate the co-live, non-streamed values for one SDPA iteration.
 
     V is streamed by the second matmul. K is restickified before the first
     matmul and therefore participates in full-SDPA prefill residency. Full
     nested prefill accounts for every score- and query-shaped value that can
-    overlap at a map/carry boundary. Decode and SWA retain their separately
-    calibrated two-score/two-query estimate. This flag selects a liveness
-    accounting regime; it does not select a non-HOP SDPA implementation.
+    overlap at a map/carry boundary. A prefill plan with no effective loop uses
+    the direct-body live set because ``map_tiles`` and the one-block scan bypass
+    ``for_each_tile``. Decode and SWA retain their separately calibrated
+    two-score/two-query estimate. These flags select a liveness accounting
+    regime; they do not select a different SDPA implementation.
     """
     score_bytes = (
         batch_size * heads_per_core * query_rows_per_core * kv_block_size * element_size
@@ -415,16 +424,15 @@ def _sdpa_estimated_live_bytes_per_core(
         batch_size * heads_per_core * query_rows_per_core * head_dim * element_size
     )
     accumulator_bytes = batch_size * heads_per_core * query_rows_per_core * element_size
-    score_allowance = (
-        _SDPA_PREFILL_LIVE_SCORE_BUFFER_ALLOWANCE
-        if full_sdpa_prefill
-        else _SDPA_NARROW_LIVE_SCORE_BUFFER_ALLOWANCE
-    )
-    query_allowance = (
-        _SDPA_PREFILL_LIVE_QUERY_BUFFER_ALLOWANCE
-        if full_sdpa_prefill
-        else _SDPA_NARROW_LIVE_QUERY_BUFFER_ALLOWANCE
-    )
+    if full_sdpa_prefill and not has_loop_boundary:
+        score_allowance = _SDPA_DIRECT_LIVE_SCORE_BUFFER_ALLOWANCE
+        query_allowance = _SDPA_DIRECT_LIVE_QUERY_BUFFER_ALLOWANCE
+    elif full_sdpa_prefill:
+        score_allowance = _SDPA_PREFILL_LIVE_SCORE_BUFFER_ALLOWANCE
+        query_allowance = _SDPA_PREFILL_LIVE_QUERY_BUFFER_ALLOWANCE
+    else:
+        score_allowance = _SDPA_NARROW_LIVE_SCORE_BUFFER_ALLOWANCE
+        query_allowance = _SDPA_NARROW_LIVE_QUERY_BUFFER_ALLOWANCE
     estimated_live_bytes = (
         score_allowance * score_bytes
         + query_allowance * query_bytes
@@ -615,6 +623,9 @@ def _sdpa_kv_candidates(
             element_size=element_size,
             restick_bytes_per_core=(restick_bytes_per_core if full_sdpa_prefill else 0),
             full_sdpa_prefill=full_sdpa_prefill,
+            has_loop_boundary=(
+                num_heads != num_kvheads or num_outer_tiles > 1 or num_blocks > 1
+            ),
         )
         blocks_per_group = _kv_blocks_per_loop_group(1, num_blocks)
         num_loop_groups = (num_blocks + blocks_per_group - 1) // blocks_per_group
@@ -659,11 +670,12 @@ def _select_sdpa_tiling(
 ) -> _SDPATilingConfig:
     """Choose SDPA tiling from compiler-visible costs.
 
-    Prefill enumerates exact B/Hkv/G/Lq/Lk plans. It estimates the complete
-    nested-HOP live set, permits at most one whole intermediate to spill, and
-    balances loop/DSC executions, HBM load bursts, and aggregate transfer waves.
-    Decode retains its separately calibrated policy. No model identity or
-    sequence-length cutoff participates in the decision.
+    Prefill enumerates exact B/Hkv/G/Lq/Lk plans. It distinguishes the direct
+    body from nested-HOP staging in its live-set estimate, permits at most one
+    whole intermediate to spill, and balances loop/DSC executions, HBM load
+    bursts, and aggregate transfer waves. Decode retains its separately
+    calibrated policy. No model identity or sequence-length cutoff participates
+    in the decision.
     """
     quarter_kv_stick_aligned = max(64, ((max_seqlen_kv + 3) // 4 + 63) // 64 * 64)
     fallback_kv_block_limit = min(
@@ -1754,10 +1766,12 @@ def spyre__sdpa_overrideable(
     # SDPA routinely receives logical [B, H, S, D] queries backed by physical
     # [B, S, H, D] storage. for_each_tile's explicit dims already preserve the
     # logical axes, but WhileLoop.create still requires exact input strides and
-    # would otherwise synthesize this normalization. Keep the bounded, one-time
-    # query copy explicit before GQA unflattening. Do not contiguify K/V
-    # wholesale: those copies scale with context length, so the compiler streams
-    # their bounded tiles instead.
+    # would otherwise synthesize this normalization. A projection result can be
+    # logically contiguous while retaining a noncanonical Spyre device layout,
+    # so ``contiguous()`` is not sufficient to materialize the normalization.
+    # Keep the bounded, one-time query clone explicit before GQA unflattening.
+    # Do not clone K/V wholesale: those copies scale with context length, so the
+    # compiler streams their bounded tiles instead.
     original_query_strides = query.stride()
     if num_heads % num_kvheads != 0:
         raise Unsupported(
@@ -1771,7 +1785,11 @@ def spyre__sdpa_overrideable(
     # K/V receive only a unit view axis and broadcast over the within-group
     # query-head dimension in the native batched-matmul lowering. Preserve the
     # established rank-4 MHA path when there is no grouped-query expansion.
-    query = query.contiguous()
+    query = (
+        query.clone(memory_format=torch.contiguous_format)
+        if use_gqa
+        else query.contiguous()
+    )
     if use_gqa:
         query = query.unflatten(1, (num_kvheads, gqa_group_size))
 
@@ -1851,6 +1869,15 @@ def spyre__sdpa_overrideable(
         mask_shapes=tuple(tuple(mask.shape) for mask in masks),
         head_tile_staging_bytes=head_tile_staging_bytes,
     )
+    direct_prefill_plan = (
+        max_seqlen_q > 1
+        and num_heads == num_kvheads
+        and tiling.num_batch_tiles == 1
+        and tiling.num_head_tiles == 1
+        and tiling.num_group_tiles == 1
+        and tiling.num_q_tiles == 1
+        and tiling.num_kv_blocks == 1
+    )
     logger.debug(
         "SDPA tiling: strategy=%s reason=%s Lq=%s q_tiles=%s "
         "q_tile_size=%s Lk=%s kv_blocks=%s kv_block_size=%s "
@@ -1924,6 +1951,34 @@ def spyre__sdpa_overrideable(
     def kv_level(q_tile, k_tile, v_tile, *mask_tiles):
         # Q is invariant across the counted Lk loop.
         q_scaled = q_tile * query_scale
+
+        # A fully direct prefill plan has no online-softmax state to carry. Keep
+        # its graph as the stable-softmax formula so the compiler sees the same
+        # short live ranges that the cost model charges above. Decode and
+        # outer-tiled plans retain the common carry path below.
+        if direct_prefill_plan:
+            if use_gqa:
+                k_tile = k_tile.unsqueeze(2)
+                v_tile = v_tile.unsqueeze(2)
+            if rebase_unaligned_packed_key:
+                k_tile = k_tile.contiguous()
+            keys_t = k_tile.transpose(-1, -2).contiguous()
+            scores = (
+                torch.ops.spyre.batched_matmul(q_scaled, keys_t)
+                if use_gqa
+                else torch.matmul(q_scaled, keys_t)
+            )
+            for mask_tile in mask_tiles:
+                scores = scores + mask_tile
+            block_max = torch.amax(scores, dim=-1)
+            exp_scores = torch.exp(scores - block_max.unsqueeze(-1)).contiguous()
+            denominator = exp_scores.sum(dim=-1)
+            output_tile = (
+                torch.ops.spyre.batched_matmul(exp_scores, v_tile)
+                if use_gqa
+                else torch.matmul(exp_scores, v_tile)
+            )
+            return output_tile / denominator.unsqueeze(-1)
 
         # Keep the sparse accumulator representation used by production SDPA,
         # but size it to the current outer-loop tile.
@@ -3260,11 +3315,9 @@ def spyre_flip(input: torch.Tensor, dims: Sequence[int]) -> torch.Tensor:
 def spyre_prod_dim_int(
     input: torch.Tensor, dim: int, keepdim: bool = False
 ) -> torch.Tensor:
-    # Currently, restickify does not support fp32 (int64 is also converted to fp32
-    # for now, so it is unsupported as well).
-    # Use decomposition in these cases as a safe fallback, even if restickify
-    # might not be needed in the end.
-    if input.dtype != torch.float32 and input.dtype != torch.int64:
+    # int64 is converted to fp32 for now, so it stays on the decomposition
+    # path below.
+    if input.dtype != torch.int64:
         return torch.ops.spyre.prod_dim_int(input, dim, keepdim)
 
     if dim < 0:

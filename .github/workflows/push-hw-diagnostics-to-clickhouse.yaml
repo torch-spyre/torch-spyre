@@ -44,6 +44,11 @@ jobs:
       # value MUST come from the parsed record instead: a wrong arch derives a run_id that joins
       # nothing, silently. parse_hw_failures.py does not capture arch yet.
       LEG_ARCH: x86_64
+      # Dual-write during the migration window: v1 (spyre.hw_failure_diagnostics) stays
+      # authoritative, v2 (CLICKHOUSE_DB_V2.hw_failure_diagnostics) accumulates the same runs
+      # so it can be validated against real traffic. Empty CLICKHOUSE_DB_V2 makes the v2 half
+      # a no-op, same as push-to-clickhouse.yaml.
+      INGEST_SCHEMA: both
 
     steps:
       # Checkout so ./.github/actions/... resolves; the action itself locates or
@@ -69,6 +74,8 @@ jobs:
           clickhouse-user: ${{ secrets.CLICKHOUSE_USER }}
           clickhouse-pass: ${{ secrets.CLICKHOUSE_PASS }}
           clickhouse-db: ${{ secrets.CLICKHOUSE_DB }}
+          clickhouse-db-v2: ${{ secrets.CLICKHOUSE_DB_V2 }}
+          schema: ${{ env.INGEST_SCHEMA }}
 
       - name: Upload JSON artifact
         if: always() && steps.ingest.outputs.json-file != ''

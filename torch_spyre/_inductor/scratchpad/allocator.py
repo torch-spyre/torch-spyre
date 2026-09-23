@@ -2316,11 +2316,47 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         if config.dump_cost_expr_file and cost_expr is not None:
             # The objective as solved: its terms, the chosen symbol values and
             # the evaluated prices, for the summarize-sdsc skill.
-            from torch_spyre._inductor.dump_common import emit_json_line
+            from torch_spyre._inductor.dump_common import (
+                emit_json_line,
+                origin_op_name,
+            )
 
+            # No graph identity: the kernel name and directory hash are
+            # assigned at codegen, and `get_output_names()` is empty here. A
+            # reader pairs records to kernels by position -- they are appended
+            # in solve order -- so a counter would add only process-global state.
+            #
+            # Ops are named twice because the numeric cost dump names them
+            # twice: `op_names` matches its block heading and is what a human
+            # reads, `op_ids` matches its `output opN` line and is unique, so it
+            # is the key that joins the two dumps.
+            op_names, op_ids = {}, {}
+            for op in graph.operations or ():
+                # All three names or none: a half-written pair would leave the
+                # two maps disagreeing about which ops exist.
+                try:
+                    named = (op.get_name(), origin_op_name(op), op.get_operation_name())
+                except Exception:  # pragma: no cover - naming is best-effort
+                    continue
+                op_names[named[0]], op_ids[named[0]] = named[1], named[2]
+            context = {
+                "op_names": op_names,
+                "op_ids": op_ids,
+                "env": {
+                    # Per SOLVE, not per run: the head-major attention path
+                    # caps it for its own compile and leaves the rest at 32.
+                    "sencores": config.sencores,
+                    "lx_capacity": self.size,
+                    "solver": type(solver).__name__,
+                    "allocator": type(self).__name__,
+                },
+                "solve": dict(getattr(solver, "last_solve_stats", {}) or {}),
+            }
             emit_json_line(
                 config.dump_cost_expr_file,
-                cost_expr_record(cost_expr, bundle_terms, result, _COST_PARAMS),
+                cost_expr_record(
+                    cost_expr, bundle_terms, result, _COST_PARAMS, context=context
+                ),
             )
         return result
 

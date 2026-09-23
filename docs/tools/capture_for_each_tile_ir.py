@@ -12,16 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Capture real IR/OpSpec/bundle.mlir for the coarse-tiling loops doc's
-small example (test_hint_nested_loop_with_scratchpad).
+`for_each_tile` small example: `y = a + b; z = y * c`, tiled along dim 0
+with `for_each_tile`, the direct-loop-info analog of
+`capture_coarse_tile_ir.py`'s `spyre_hint`-driven example.
 
 See docs/tools/README.md for usage. In short:
 
     rm -rf /tmp/torchinductor_$USER
-    python3 docs/tools/capture_coarse_tile_ir.py > /tmp/coarse_tile_capture.txt 2>&1
+    python3 docs/tools/capture_for_each_tile_ir.py > /tmp/for_each_tile_capture.txt 2>&1
 
-Set SPYRE_LOG_PASSES=_maybe_coarse_tile_hints (or another pass name, or
-"all") together with --debug to additionally dump per-pass IR snapshots,
-e.g. immediately after coarse_tile() stamps loop_info and before later
+Set SPYRE_LOG_PASSES=splice_while_loops (or another pass name, or "all")
+together with --debug to additionally dump per-pass IR snapshots, e.g.
+immediately after splice_while_loops stamps loop_info and before later
 passes (split_multi_ops, stickification, work division, scratchpad
 planning) touch anything.
 """
@@ -45,11 +47,7 @@ from torch._inductor.utils import run_and_get_code  # noqa: E402
 
 import torch_spyre  # noqa: E402,F401
 from torch_spyre._inductor import config  # noqa: E402
-from torch_spyre._inductor.wsr import propagate_named_dims as _pnd  # noqa: E402
-
-_declare_tensor_dim = _pnd.declare_tensor_dim
-_name_tensor_dims = _pnd.name_tensor_dims
-from torch_spyre._inductor import spyre_hint  # noqa: E402
+from torch_spyre._inductor.wsr.for_each_tile import for_each_tile  # noqa: E402
 
 _LAUNCH_JOBPLAN = "torch_spyre.execution.kernel_runner.launch_jobplan"
 _PREPARE_KERNEL = "torch_spyre.execution.kernel_runner.prepare_kernel"
@@ -58,10 +56,9 @@ DEVICE = torch.device("spyre")
 
 
 def _fake_backend_compiler(cmd, *args, **kwargs):
-    """Stand in for the real ``dbo-opt``/``dxp_standalone`` binary: this
-    capture only needs ``bundle.mlir`` (already on disk by the time the
-    backend compiler would run), not a working device binary.
-    ``_run_backend_compiler`` treats the presence of
+    """Stand in for the real ``dbo-opt`` binary: this capture only needs
+    ``bundle.mlir`` (already on disk by the time dbo-opt would run), not a
+    working device binary. ``_run_backend_compiler`` treats the presence of
     ``spyreCodeDir/spyrecode.json`` -- not the mocked return code -- as its
     success signal (a real backend compiler can exit 0 without writing it,
     per issue #3651), so the mock must create that file itself. A bare
@@ -94,28 +91,22 @@ def main() -> None:
         "--debug",
         action="store_true",
         help=(
-            "Log at DEBUG instead of INFO. Combine with SPYRE_LOG_PASSES=<pass"
-            " name|all> to also dump per-pass IR snapshots, not just the final"
-            " AFTER PRE-SCHEDULING dump."
+            "Log at DEBUG instead of INFO. Combine with"
+            " SPYRE_LOG_PASSES=<pass name|all> to also dump per-pass IR"
+            " snapshots, not just the final AFTER PRE-SCHEDULING dump."
         ),
     )
     parser.add_argument(
-        "--outer-tiles",
+        "--tile-size",
         type=int,
-        default=2,
-        help="num_tiles_per_dim for the outer spyre_hint (dim A). Default: 2.",
+        default=128,
+        help="for_each_tile tile_size. Default: 128.",
     )
     parser.add_argument(
-        "--inner-tiles",
-        type=int,
-        default=4,
-        help="num_tiles_per_dim for the inner spyre_hint (dim B). Default: 4.",
+        "--size-a", type=int, default=1024, help="Size of dim 0. Default: 1024."
     )
     parser.add_argument(
-        "--size-a", type=int, default=1024, help="Size of dim A. Default: 1024."
-    )
-    parser.add_argument(
-        "--size-b", type=int, default=4096, help="Size of dim B. Default: 4096."
+        "--size-b", type=int, default=4096, help="Size of dim 1. Default: 4096."
     )
     parser.add_argument(
         "--sencores", type=int, default=4, help="SENCORES value. Default: 4."
@@ -131,26 +122,28 @@ def main() -> None:
     b_dev = b.to(DEVICE)
     c_dev = c.to(DEVICE)
 
-    _declare_tensor_dim("A", args.size_a)
-    _declare_tensor_dim("B", args.size_b)
-    for t in (a_dev, b_dev, c_dev):
-        _name_tensor_dims(t, ["A", "B"])
-
-    outer_tiles, inner_tiles = args.outer_tiles, args.inner_tiles
+    tile_size = args.tile_size
 
     def fn(a, b, c):
-        with spyre_hint(num_tiles_per_dim={"A": outer_tiles}):
-            with spyre_hint(num_tiles_per_dim={"B": inner_tiles}):
-                y = a + b
-                z = y * c
-                return z
+        def body(_, ops):
+            a_tile, b_tile, c_tile = ops
+            y_tile = a_tile + b_tile
+            return None, y_tile * c_tile
 
-    with config.patch(
-        {
-            "lx_planning": True,
-            "allow_all_ops_in_lx_planning": True,
-            "sencores": args.sencores,
-        }
+        _, z = for_each_tile(
+            body, (a, b, c), dims=(0, 0, 0), tile_size=tile_size, out_dim=0
+        )
+        return z
+
+    with (
+        config.patch(
+            {
+                "lx_planning": True,
+                "allow_all_ops_in_lx_planning": True,
+                "sencores": args.sencores,
+            }
+        ),
+        torch._dynamo.config.patch(capture_scalar_outputs=True),
     ):
         cfn = torch.compile(fn)
 

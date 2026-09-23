@@ -62,6 +62,7 @@ from .pass_utils import (
     indirect_info_from_op,
     iteration_space_from_op,
     iteration_space_with_splits,
+    loop_var_ranges_from_dim_hints,
     padded_entry_output_stl,
 )
 from .views import AlignmentInputs, UnalignedStickSplit, align_tensors_pure
@@ -750,8 +751,21 @@ def _enforce_scatter_destination_layout(
 
     # Check scatter destination compliance: scatter index dimensions must be outermost.
     # Detect scatter index symbols (non-loop symbols in write_dep.index).
+    #
+    # A WhileLoop-splice per-iteration loop_var (e.g. u0, see
+    # wsr/for_each_tile_lowering.py's _synthesize_dim_hints_for_group) is
+    # deliberately folded into write_dep.index without ever being a
+    # write_dep.ranges key -- see pass_utils.py's
+    # loop_var_ranges_from_dim_hints -- so it looks exactly like a scatter
+    # index symbol by this "not a loop range key" test alone. Excluding it
+    # explicitly matches _build_indirect_store_subs's identical exclusion
+    # for the read-side version of this same inference; without it, a
+    # scatter nested inside a spliced WhileLoop body would misclassify its
+    # own tile-advancing loop_var as a scatter index and corrupt the
+    # dim-order compliance check below.
     all_write_syms = write_dep.index.free_symbols
     loop_syms = set(write_dep.ranges.keys())
+    loop_syms |= set(loop_var_ranges_from_dim_hints(scatter_op))
     scatter_syms = all_write_syms - loop_syms
 
     if not scatter_syms:
