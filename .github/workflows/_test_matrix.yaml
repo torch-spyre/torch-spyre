@@ -94,7 +94,7 @@ on:
           (for suite_<group>) whose path sits under that directory -- there
           is no catch-all value that ignores a config's labels.
           integration covers the device-layer surfaces flex and
-          deeptools/dxp_standalone exercise most (streams, job launch
+          deeptools exercise most (streams, job launch
           plans, codegen, LX/scratchpad planning, tensor layout,
           allocator/GC, D2D copies). Default: regression (every config
           labeled for full functional coverage) -- callers that want the

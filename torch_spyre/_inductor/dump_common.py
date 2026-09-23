@@ -57,6 +57,27 @@ def emit_json_line(path: str, record: dict) -> None:
         logger.debug("cost dump to %s skipped", path, exc_info=True)
 
 
+def origin_op_name(op) -> str:
+    """The Inductor ORIGIN node name for an operation (``index_put_3``,
+    ``amax_1``), falling back to the reduction type and then to the positional
+    operation name (``op7``).
+
+    Shared so the two dumps key ops the same way: the numeric cost dump and the
+    cost-expression dump are joined on this name, and ``get_operation_name``
+    alone would give the positional id, which the numeric dump never uses.
+    """
+    data = getattr(op, "data", None)
+    node = getattr(data, "origin_node", None)
+    if node is not None:
+        return getattr(node, "name", None) or str(getattr(node, "target", node))
+    rtype = getattr(data, "reduction_type", None)
+    if rtype:
+        return str(rtype)
+    if data is not None:
+        return type(data).__name__
+    return op.get_operation_name()
+
+
 def banner(title: str) -> str:
     """Return a boxed section header for a dump record."""
     bar = "=" * 78

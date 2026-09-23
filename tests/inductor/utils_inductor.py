@@ -18,6 +18,7 @@ import functools
 import hashlib
 import json
 from pathlib import Path
+import shutil
 import subprocess
 from unittest.mock import patch as mock_patch
 import torch
@@ -80,6 +81,17 @@ def cached_xavier(
     out = torch.empty(shape, dtype=dtype)
     torch.nn.init.xavier_uniform_(out, generator=gen)
     return out
+
+
+def dl16_round(t: torch.Tensor) -> torch.Tensor:
+    """Round a CPU fp32 tensor to approximate Spyre's on-device dl16 format.
+
+    Spyre's on-device dl16 (SEN169_FP16) has one more mantissa bit than
+    bf16, so bf16 is a conservative (slightly looser, never tighter) proxy
+    for it -- fine wherever the comparison uses atol/rtol rather than an
+    exact match.
+    """
+    return t.bfloat16().float()
 
 
 @functools.lru_cache(maxsize=None)
@@ -799,6 +811,45 @@ def copy_tests(my_cls, other_cls, suffix, test_failures=None, xfail_prop=None):
 
 
 @contextmanager
+def mock_backend_compiler():
+    """Stub the backend compiler, writing the artifact a real one would.
+
+    Replaces ``subprocess.run`` for tests that exercise bundle emission without
+    a compiler.  A bare ``mock_patch("subprocess.run")`` is not enough: the
+    compile path treats a missing ``spyreCodeDir/spyrecode.json`` as a failure
+    even on exit 0, because the backend can return success having written
+    nothing.  So the stub creates that file, keeping the production check
+    unconditional rather than teaching it to recognise a mock.
+
+    The compile dir is read from ``--export-dir=`` in argv, so this works
+    whether or not ``--device`` is passed.
+
+    Patches ``subprocess.run`` both globally and on the module object
+    ``async_compile`` holds: call sites historically used either spelling, and a
+    stub that misses the one actually in use lets the real compiler run (or,
+    writing no artifact, trips the check above).
+    """
+
+    def fake_run(cmd, *args, **kwargs):
+        export_dir = None
+        for arg in cmd[1:] if isinstance(cmd, (list, tuple)) else []:
+            if isinstance(arg, str) and arg.startswith("--export-dir="):
+                export_dir = arg.split("=", 1)[1]
+                break
+        if export_dir:
+            code_dir = Path(export_dir) / "spyreCodeDir"
+            code_dir.mkdir(parents=True, exist_ok=True)
+            (code_dir / "spyrecode.json").write_text("{}")
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    with (
+        mock_patch("subprocess.run", side_effect=fake_run) as m,
+        mock_patch.object(async_compile_module.subprocess, "run", side_effect=fake_run),
+    ):
+        yield m
+
+
+@contextmanager
 def capture_backend_output_dirs():
     """Record the backend output directory of every kernel compiled inside."""
     output_dirs = []
@@ -813,11 +864,34 @@ def capture_backend_output_dirs():
         yield output_dirs
 
 
+def requires_dxp_standalone():
+    """Skip the calling test unless ``dxp_standalone`` is on PATH.
+
+    Bundles are compiled by dbo-opt, so dxp_standalone is no longer needed to
+    build or run a kernel.  The debug re-lowering below is the one thing that
+    still requires it: ``--use-dxp`` with ``DXP_DEBUG=1`` writes the
+    ``debug/sdsc_*/*.out.out.out.json`` payloads these assertions read, and
+    dbo-opt has no equivalent.  So the payload check is only meaningful where
+    that binary exists, and a missing one is an environment fact rather than a
+    product failure -- skip rather than fail.
+    """
+    if shutil.which("dxp_standalone") is None:
+        pytest.skip(
+            "dxp_standalone not on PATH: the --use-dxp/DXP_DEBUG debug payload "
+            "this assertion reads has no dbo-opt equivalent"
+        )
+
+
 def assert_lx_only_relayout_payload(output_dirs):
     """The compiled bundle's SDSC payload carries exactly one LX relayout op and
     no HBM movement: one ``STCDPOpLx``, no op named for DMA, restickify or an
     HBM copy, and zero ``hbmSize_`` on every labeled data structure. A debug
-    re-lowering of the same bundle, not a second device execution."""
+    re-lowering of the same bundle, not a second device execution.
+
+    Skips when dxp_standalone is unavailable -- see requires_dxp_standalone.
+    """
+    requires_dxp_standalone()
+
     for output_dir in output_dirs:
         subprocess.run(
             ["dxp_standalone", "-d", output_dir, "--use-dxp"],

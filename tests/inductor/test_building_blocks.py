@@ -304,36 +304,16 @@ class TestBuildingBlocks(unittest.TestCase):
 
     def test_mixed_ea_staggered_broadcaster_fp32(self):
         # Case 3.2 with an fp32-physical staggered broadcaster (DL16_TO_FP32).
-        # The mixed-EA gate ALLOWS it (physically the equivalent all-STANDARD fp32
-        # broadcast), but the codegen doesn't yet emit an fp32 broadcast along
-        # the stick axis. The same crash hits a pure-STANDARD fp32
-        # [4,1]+[4,64] broadcast, so it is a separate, pre-existing codegen gap
-        # tracked in https://github.com/torch-spyre/torch-spyre/issues/4132.
-        #
-        # We assert the failure originates in *codegen*, not the mixed-EA layout
-        # gate: a plain @unittest.expectedFailure would also stay green if a future
-        # change re-tightened the gate and raised `Unsupported` before codegen,
-        # masking a regression of the path this test guards. So we require the
-        # error to be a codegen failure and NOT the gate's "mixed EA"
-        # Unsupported. Flip this to a compare_with_cpu once codegen lands.
+        # The mixed-EA gate allows it, being physically the equivalent
+        # all-STANDARD fp32 broadcast, and the backend now emits an fp32
+        # broadcast along the stick axis.
         x = torch.randn(4, 1, dtype=torch.float16)  # -> .to(f32): staggered bcast
         w = torch.randn(4, 64, dtype=torch.float32)  # STANDARD full
 
         def fn(x, w):
             return torch.add(x.to(torch.float32), w)
 
-        with self.assertRaises(Exception) as ctx:
-            compare_with_cpu(fn, x, w, cpu_compile=False, run_eager=False)
-        msg = str(ctx.exception)
-        self.assertNotIn(
-            "Multi-arg pointwise with mixed EA",
-            msg,
-            f"expected a codegen failure, but the mixed-EA gate rejected it: {msg}",
-        )
-        self.assertTrue(
-            any(k in msg for k in ("dxp_standalone", "ddc", "sbf-")),
-            f"expected a ddc/dxp codegen-stage failure, got: {msg[:300]}",
-        )
+        compare_with_cpu(fn, x, w, cpu_compile=False, run_eager=False)
 
     def test_flash_attention(self):
         B, H, L, D = 1, 8, 256, 64
@@ -391,10 +371,9 @@ class TestBuildingBlocks(unittest.TestCase):
         )
 
     @mock.patch(
-        "torch_spyre._inductor.decompositions._SDPA_MAX_BURST_EFFICIENT_KV_BLOCK_SIZE",
-        64,
+        "torch_spyre._inductor.decompositions._sdpa_kv_block_sizes",
+        new=lambda _: [64],
     )
-    @mock.patch("torch_spyre._inductor.decompositions._SDPA_MAX_SEQUENCE_TILE_SIZE", 64)
     def test_sdpa_lk_uses_for_each_tile(self):
         """Multiple K/V blocks lower to one counted loop instead of unrolling."""
         batch, heads, query_length, kv_length, head_dim = 1, 2, 64, 128, 128
@@ -471,7 +450,6 @@ class TestBuildingBlocks(unittest.TestCase):
         LQ,
         *,
         dtype=torch.float16,
-        name_inputs=False,
         LK=128,
         kv_padding=0,
         transposed_inputs=False,
@@ -524,31 +502,6 @@ class TestBuildingBlocks(unittest.TestCase):
             k_dev = k.to("spyre")
             v_dev = v.to("spyre")
         mask_dev = mask.to("spyre")
-        if name_inputs:
-            for name, size in (
-                ("_b", B),
-                ("num_heads", H),
-                ("num_kvheads", N_KV),
-                ("max_seqlen_q", LQ),
-                ("max_seqlen_kv", LK),
-                ("head_dim", D),
-            ):
-                _pnd.declare_tensor_dim(name, size)
-            # The eager naming API omits static unit axes, matching the adapter.
-            logical_names = (
-                ("_b", "num_heads", "max_seqlen_q", "head_dim"),
-                ("_b", "num_kvheads", "max_seqlen_kv", "head_dim"),
-                ("_b", "num_kvheads", "max_seqlen_kv", "head_dim"),
-            )
-            for tensor, names in zip((q_dev, k_dev, v_dev), logical_names, strict=True):
-                _pnd.name_tensor_dims(
-                    tensor,
-                    [
-                        name
-                        for size, name in zip(tensor.shape, names, strict=True)
-                        if size != 1
-                    ],
-                )
         actual = torch.compile(sdpa, dynamic=False)(q_dev, k_dev, v_dev, mask_dev).cpu()
         tolerance = 0.2 if dtype is torch.bfloat16 else 0.1
         torch.testing.assert_close(actual, expected, atol=tolerance, rtol=tolerance)
@@ -582,7 +535,52 @@ class TestBuildingBlocks(unittest.TestCase):
             kv_padding=64,
         )
 
-    @mock.patch("torch_spyre._inductor.decompositions._SDPA_MAX_SEQUENCE_TILE_SIZE", 64)
+    @mock.patch(
+        "torch_spyre._inductor.decompositions._sdpa_kv_block_sizes",
+        new=lambda _: [64],
+    )
+    @config.patch(
+        {
+            "cpsat_time_limit_seconds": 30,
+        }
+    )
+    def test_noncontiguous_kv_prefix_keeps_one_tile_fallback(self):
+        """A declined direct read retains the contracted one-tile staging copy."""
+        # The direct-read test above compiles the same helper and shapes. Make
+        # sure this test re-enters Inductor while the proof function is mocked.
+        torch._dynamo.reset_code_caches()
+        torch._inductor.codecache.FxGraphCache.clear()
+        copy_sizes = []
+
+        def decline_direct_read(_consumer, copy_op, _record):
+            copy_sizes.append(tuple(int(size) for size in copy_op.get_size()))
+            return None, "forced fallback for test"
+
+        with mock.patch(
+            "torch_spyre._inductor.read_copy_elision._prove_matmul_direct_read",
+            side_effect=decline_direct_read,
+        ) as prove:
+            self._run_granite_gqa_with_finite_broadcast_mask(
+                LQ=128,
+                LK=128,
+                kv_padding=64,
+            )
+
+        self.assertTrue(prove.called, "expected a direct-read proof attempt")
+        self.assertIn(
+            (1, 64, 1, 8, 128),
+            copy_sizes,
+            "the fallback was not the contracted one-Lk-tile staging buffer",
+        )
+
+    @mock.patch(
+        "torch_spyre._inductor.decompositions._sdpa_query_tile_sizes",
+        new=lambda _: [64],
+    )
+    @mock.patch(
+        "torch_spyre._inductor.decompositions._sdpa_kv_block_sizes",
+        new=lambda _: [64],
+    )
     # patch the cpsat time to bypass the CI job stall timeout
     @config.patch(
         {
@@ -594,7 +592,6 @@ class TestBuildingBlocks(unittest.TestCase):
         self._run_granite_gqa_with_finite_broadcast_mask(
             LQ=256,
             dtype=torch.bfloat16,
-            name_inputs=True,
             LK=256,
             transposed_inputs=True,
             reshape_output=True,
@@ -753,7 +750,6 @@ class TestBuildingBlocks(unittest.TestCase):
         self._run_granite_gqa_with_finite_broadcast_mask(
             LQ=1024,
             dtype=torch.bfloat16,
-            name_inputs=True,
             LK=1024,
             transposed_inputs=True,
             reshape_output=True,
@@ -762,13 +758,19 @@ class TestBuildingBlocks(unittest.TestCase):
     @unittest.skip(
         "Test skipped solely because of runtime.  It passes but takes over 10 minutes."
     )
-    @mock.patch("torch_spyre._inductor.decompositions._SDPA_MAX_SEQUENCE_TILE_SIZE", 64)
+    @mock.patch(
+        "torch_spyre._inductor.decompositions._sdpa_query_tile_sizes",
+        new=lambda _: [64],
+    )
+    @mock.patch(
+        "torch_spyre._inductor.decompositions._sdpa_kv_block_sizes",
+        new=lambda _: [64],
+    )
     def test_granite_gqa_prefill_grouped_sixteen_by_sixteen_tiling(self):
         """Sixteen KV loop groups preserve Granite's online-softmax carries."""
         self._run_granite_gqa_with_finite_broadcast_mask(
             LQ=1024,
             dtype=torch.bfloat16,
-            name_inputs=True,
             LK=1024,
             transposed_inputs=True,
             reshape_output=True,

@@ -1048,7 +1048,7 @@ def keep_by_index_search_adjacent_blocked_vars(
     sweep: each core then compares only the first stick's worth of search
     positions, so kept values beyond the first stick come back as the fill value
     -- silently wrong (~1.5-2.4% of a 6x17x4x128 dim-3 keep_by_index) and a
-    dxp_standalone abort at some core counts. This is independent of
+    backend-compiler abort at some core counts. This is independent of
     co-optimization: the plain work-division pass hits it too whenever it happens
     to split that dim. The leading and other batch dims split correctly, so only
     the enclosing dim is blocked, and only when the search axis spans more than

@@ -63,7 +63,7 @@ paths to link into the report.
 | `failure.category` | Layer | When it fires | Hook location |
 |---|---|---|---|
 | `compile_frontend` | Frontend | `torch.compile()` / Spyre Inductor frontend fails (including decomposition and lowering paths that surface through `compile_fx`) | `torch_spyre/_inductor/__init__.py` |
-| `compile_backend` | Backend | `dxp_standalone` / bundle compilation fails while generating op-spec / MLIR artifacts | `torch_spyre/execution/async_compile.py` |
+| `compile_backend` | Backend | `dbo-opt` / bundle compilation fails while generating op-spec / MLIR artifacts | `torch_spyre/execution/async_compile.py` |
 | `runtime_launch` | Runtime | Kernel launch or `launch_jobplan` fails on device | `torch_spyre/execution/kernel_runner.py` (`SpyreSDSCKernelRunner`) |
 | `unimplemented` | Runtime | An op reaches the runtime without a Spyre lowering | `torch_spyre/execution/kernel_runner.py` (`SpyreUnimplementedRunner`) |
 | `unknown` | — | Manual collection or empty category input normalized at capture time | `torch_spyre/profiler/_ffdc.py` |

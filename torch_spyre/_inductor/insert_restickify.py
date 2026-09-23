@@ -15,6 +15,7 @@
 import copy
 import logging
 from collections import defaultdict
+from dataclasses import dataclass
 from typing import cast
 
 import sympy
@@ -26,7 +27,6 @@ from .errors import Unsupported
 from .ir import FixedTiledLayout, SpyreEmptyFallback
 from .optimize_restickify import AnyInNode, EdgeCostMap
 from .logging_utils import get_inductor_logger
-from .pass_utils import redirect_computed_buffer_reads
 from torch._inductor.dependencies import MemoryDep, index_vars_squeeze
 from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import (
@@ -53,12 +53,20 @@ from torch.utils._ordered_set import OrderedSet
 logger = get_inductor_logger("insert_restickify")
 
 
+@dataclass
+class RestickifyArgInfo:
+    arg_name: str
+    dep_index: sympy.Expr | None
+    occurrence: int
+    target_layout: FixedTiledLayout
+
+
 def _restickify_dep_index(
-    memory_deps: list[MemoryDep], restick_arg_info: dict
+    memory_deps: list[MemoryDep], restick_arg_info: RestickifyArgInfo
 ) -> int | None:
     """Resolve a restickify plan entry to its exact read-metadata slot."""
-    old_name = restick_arg_info["arg_name"]
-    if "dep_index" not in restick_arg_info:
+    old_name = restick_arg_info.arg_name
+    if restick_arg_info.dep_index is None:
         matches = [i for i, dep in enumerate(memory_deps) if dep.name == old_name]
         if len(matches) > 1:
             raise AssertionError(
@@ -66,7 +74,7 @@ def _restickify_dep_index(
             )
         return matches[0] if matches else None
 
-    expected_index = sympy.sympify(restick_arg_info["dep_index"])
+    expected_index = sympy.sympify(restick_arg_info.dep_index)
     matches = [
         i
         for i, dep in enumerate(memory_deps)
@@ -171,10 +179,10 @@ def _fixed_tiled(layout: FixedLayout, stl: SpyreTensorLayout) -> FixedTiledLayou
 def _record_restickify(
     op: Operation,
     dep_name: str,
-    dep_index,
+    dep_index: sympy.Expr,
     occurrence: int,
     target_layout: FixedTiledLayout,
-    restickify_plan: dict,
+    restickify_plan: dict[str, list[RestickifyArgInfo]],
 ) -> None:
     """Record that op's input dep_name must be restickified to target_layout.
 
@@ -187,17 +195,17 @@ def _record_restickify(
     finalize_layouts and executed later by insert_restickify.
     """
     restickify_plan[op.get_name()].append(
-        {
-            "arg_name": dep_name,
-            "dep_index": dep_index,
-            "occurrence": occurrence,
-            "target_layout": target_layout,
-        }
+        RestickifyArgInfo(
+            arg_name=dep_name,
+            dep_index=dep_index,
+            occurrence=occurrence,
+            target_layout=target_layout,
+        )
     )
 
 
 def _create_restickify_node(
-    restick_arg_info: dict, op: ComputedBuffer
+    restick_arg_info: RestickifyArgInfo, op: ComputedBuffer
 ) -> tuple[str, ComputedBuffer]:
     """
     Lower a restickify FX node for the given incompatible input arg.
@@ -215,7 +223,7 @@ def _create_restickify_node(
         lower_restickify,
     )  # deferred: lowering.py imports insert_restickify at module level
 
-    arg_name = restick_arg_info["arg_name"]
+    arg_name = restick_arg_info.arg_name
 
     graph_lowering = V.graph
     fx_graph = graph_lowering.graph
@@ -243,6 +251,7 @@ def _create_restickify_node(
         ),
         None,
     )
+    first_compute_node = next(n for n in fx_graph.nodes if n.op != "placeholder")
 
     if fx_arg_node is None:
         # Synthetically-created buffers (e.g. coarse_tile_read_copy_*) have no
@@ -257,7 +266,6 @@ def _create_restickify_node(
         arg_tb = TensorBox(StorageBox(arg_buf))
         # Insert a synthetic FX node for origins — downstream code (e.g.
         # _single_arg_op_layout in propagate_layouts.py) requires non-empty origins.
-        first_compute_node = next(n for n in fx_graph.nodes if n.op != "placeholder")
         with fx_graph.inserting_before(first_compute_node):
             restick_fx_node = fx_graph.create_node(
                 "call_function", torch.ops.spyre.restickify.default, ()
@@ -267,24 +275,14 @@ def _create_restickify_node(
             V.set_current_node(restick_fx_node),
         ):
             restick_tb = lower_restickify(arg_tb)
-        restick_buff = restick_tb.data.data  # TensorBox -> StorageBox -> ComputedBuffer
-        assert isinstance(restick_buff, ComputedBuffer), (
-            f"Expected ComputedBuffer, got {type(restick_buff).__name__}"
-        )
-        restick_buff.origins = OrderedSet([restick_fx_node])
-        graph_lowering.env[restick_fx_node] = restick_tb
-        restick_buff.layout = restick_arg_info["target_layout"]
-        return arg_name, restick_buff
+    else:
+        with fx_graph.inserting_before(first_compute_node):
+            restick_fx_node = fx_graph.create_node(
+                "call_function", torch.ops.spyre.restickify.default, (fx_arg_node,)
+            )
+        # Lower the FX node; run_node registers the output in graph.buffers and graph.operations.
+        restick_tb = graph_lowering.run_node(restick_fx_node)
 
-    # Insert at a valid position in the FX graph; the operations list order is
-    # authoritative pre-scheduler, not position in the FX graph.
-    first_compute_node = next(n for n in fx_graph.nodes if n.op != "placeholder")
-    with fx_graph.inserting_before(first_compute_node):
-        restick_fx_node = fx_graph.create_node(
-            "call_function", torch.ops.spyre.restickify.default, (fx_arg_node,)
-        )
-    # Lower the FX node; run_node registers the output in graph.buffers and graph.operations.
-    restick_tb = graph_lowering.run_node(restick_fx_node)
     restick_buff = restick_tb.data.data  # TensorBox -> StorageBox -> ComputedBuffer
     assert isinstance(restick_buff, ComputedBuffer), (
         f"Expected ComputedBuffer, got {type(restick_buff).__name__}"
@@ -293,14 +291,13 @@ def _create_restickify_node(
     # set it to the synthetic FX node so code that expects non-empty origins doesn't crash.
     restick_buff.origins = OrderedSet([restick_fx_node])
     graph_lowering.env[restick_fx_node] = restick_tb
-
-    restick_buff.layout = restick_arg_info["target_layout"]
+    restick_buff.layout = restick_arg_info.target_layout
     return arg_name, restick_buff
 
 
 def insert_restickify_on_node_inputs(
     op: ComputedBuffer,
-    resticks_needed: list[dict],
+    resticks_needed: list[RestickifyArgInfo],
     operations: list[Operation],
 ) -> None:
     """Insert restickify nodes before op for each incompatible input, patch op's inner_fn
@@ -319,12 +316,12 @@ def insert_restickify_on_node_inputs(
     for restick_arg_info in resticks_needed:
         old_name, restick_buff = _create_restickify_node(restick_arg_info, op)
         new_name = restick_buff.get_name()
-        if "dep_index" in restick_arg_info:
+        if restick_arg_info.dep_index is not None:
             edge_swaps.append(
                 (
                     old_name,
-                    restick_arg_info["dep_index"],
-                    restick_arg_info["occurrence"],
+                    restick_arg_info.dep_index,
+                    restick_arg_info.occurrence,
                     new_name,
                 )
             )
@@ -420,12 +417,12 @@ def insert_restickify_on_node_inputs(
                     [] if level_idx < shared_loop_depth else level
                     for level_idx, level in enumerate(dep_squeezed)
                 ]
-                if restick_arg_info.get("occurrence", 0) != 0 and (
+                if restick_arg_info.occurrence != 0 and (
                     any(transferred_advance) or any(transferred_squeezed)
                 ):
                     raise Unsupported(
-                        f"restickify edge {old_name}[{restick_arg_info['dep_index']}] "
-                        f"occurrence {restick_arg_info['occurrence']} cannot "
+                        f"restickify edge {old_name}[{restick_arg_info.dep_index}] "
+                        f"occurrence {restick_arg_info.occurrence} cannot "
                         "transfer advancing read metadata independently"
                     )
                 restick_li = copy.deepcopy(consumer_li)
@@ -512,14 +509,6 @@ def insert_restickify_on_node_inputs(
 
     object.__setattr__(op.data, "inner_fn", new_inner_fn)
 
-    redirect_computed_buffer_reads(
-        op,
-        {},
-        operations,
-        pass_name="insert_restickify",
-        reason="redirect consumer to restickified input",
-    )
-
 
 def insert_restickify(graph: GraphLowering) -> None:
     """Insert restickify operations before all nodes in restickify_plan.
@@ -528,10 +517,10 @@ def insert_restickify(graph: GraphLowering) -> None:
     necessary ComputedBuffer nodes into the operations list in-place.
     No scheduler state is touched.
     """
-    operations = graph.operations
-    restickify_plan = graph.restickify_plan
-    if not restickify_plan:
+    if not hasattr(graph, "restickify_plan"):
         return
+    restickify_plan: dict[str, list[RestickifyArgInfo]] = graph.restickify_plan
+    operations = graph.operations
 
     for op in list(
         operations
@@ -570,7 +559,7 @@ def finalize_layouts(graph: GraphLowering) -> None:
             input_buf.layout = _fixed_tiled(input_buf.layout, stl)
             del tensor_box.layouts
 
-    plan: dict = defaultdict(list)
+    plan: defaultdict[str, list[RestickifyArgInfo]] = defaultdict(list)
 
     for op in operations:
         cost_fn = getattr(op, "restick_cost_fn", None)
@@ -736,8 +725,8 @@ def finalize_layouts(graph: GraphLowering) -> None:
                 else:
                     op_kind = type(consumer).__name__
                 for r in resticks:
-                    tgt = r["target_layout"]
-                    arg_name = r["arg_name"]
+                    tgt = r.target_layout
+                    arg_name = r.arg_name
                     arg_buf = graph.get_buffer(arg_name)
                     if (
                         isinstance(arg_buf, TensorBox)
@@ -882,7 +871,12 @@ def insert_post_mutation_restickify(graph: GraphLowering) -> None:
         # This op must read arg0_1 as orig_stl, so record that override on buf_tmp.
         orig_stl_layout = _fixed_tiled(base_layout, orig_stl)
         _, buf_tmp = _create_restickify_node(
-            {"arg_name": target_name, "target_layout": buf_tmp_layout},
+            RestickifyArgInfo(
+                arg_name=target_name,
+                dep_index=None,
+                occurrence=0,
+                target_layout=buf_tmp_layout,
+            ),
             mutation_op,
         )
         buf_tmp_name = buf_tmp.get_name()
@@ -917,7 +911,12 @@ def insert_post_mutation_restickify(graph: GraphLowering) -> None:
         # in the later codegen pass. MutationLayoutSHOULDREMOVE(arg0_1) makes this write
         # back to arg0_1's original storage and keeps the copy-back path live.
         _, buf_copyback = _create_restickify_node(
-            {"arg_name": buf_tmp_name, "target_layout": buf_copyback_layout},
+            RestickifyArgInfo(
+                arg_name=buf_tmp_name,
+                dep_index=None,
+                occurrence=0,
+                target_layout=buf_copyback_layout,
+            ),
             mutation_op,
         )
         buf_copyback.layout = MutationLayoutSHOULDREMOVE(graph_input)
@@ -962,7 +961,7 @@ def validate_no_restickify_on_mutation_targets(graph: GraphLowering) -> None:
     assert hasattr(graph, "restickify_plan"), (
         "validate_no_restickify_on_mutation_targets must run after insert_restickify"
     )
-    restickify_plan = graph.restickify_plan
+    restickify_plan: dict[str, list[RestickifyArgInfo]] = graph.restickify_plan
     for op in graph.operations:
         if not isinstance(op, ComputedBuffer):
             continue
@@ -976,7 +975,7 @@ def validate_no_restickify_on_mutation_targets(graph: GraphLowering) -> None:
             continue
         target_name = target.get_name()
         for entry in restickify_plan.get(op.get_name(), []):
-            if entry["arg_name"] == target_name:
+            if entry.arg_name == target_name:
                 raise AssertionError(
                     f"restickify inserted on mutation target buffer {target_name!r} "
                     f"as input to its own mutation op {op.get_name()!r}"

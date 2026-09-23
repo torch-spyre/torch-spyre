@@ -1861,7 +1861,8 @@ _run_pytest_isolated() {
             # SIGKILL if the agent ignores SIGTERM).
             _DIST_RUN_TIMEOUT="${TORCH_SPYRE_DIST_RUN_TIMEOUT:-30m}"
             _DIST_KILL_AFTER="${TORCH_SPYRE_DIST_KILL_AFTER:-30s}"
-            _run_cmd "${_tmo[@]+"${_tmo[@]}"}" timeout --kill-after="${_DIST_KILL_AFTER}" "${_DIST_RUN_TIMEOUT}" \
+            # --foreground: without it, torchrun ends up outside the stall-watcher's killable process group (see serial `timeout` call below).
+            _run_cmd "${_tmo[@]+"${_tmo[@]}"}" timeout --foreground --kill-after="${_DIST_KILL_AFTER}" "${_DIST_RUN_TIMEOUT}" \
                 torchrun --nproc-per-node "$_NPROC" --no-python bash "${_dir}/split_output.sh" python3 -u -m pytest "$_base" "${_args[@]}"
 
             # split_output.sh tees only rank 0 to stdout, so on failure the
@@ -1902,7 +1903,8 @@ _run_pytest_isolated() {
             _SERIAL_KILL_AFTER="${TORCH_SPYRE_SERIAL_KILL_AFTER:-30s}"
             _serial_tmo=()
             if [[ -n "$_SERIAL_RUN_TIMEOUT" ]] && command -v timeout >/dev/null 2>&1; then
-                _serial_tmo=(timeout --kill-after="$_SERIAL_KILL_AFTER" "$_SERIAL_RUN_TIMEOUT")
+                # --foreground: without it, `timeout` reparents pytest into a new pgid the stall-watcher's -pgid kill can't reach, leaking the VFIO fd.
+                _serial_tmo=(timeout --foreground --kill-after="$_SERIAL_KILL_AFTER" "$_SERIAL_RUN_TIMEOUT")
             fi
             _run_cmd "${_tmo[@]+"${_tmo[@]}"}" "${_serial_tmo[@]+"${_serial_tmo[@]}"}" python3 -m pytest "$_base" "${_args[@]}"
         fi
@@ -1980,7 +1982,8 @@ _run_xdist_fallback() {
     local _xdist_out_tmp="/tmp/_spyre_xdist_out_${$}_$$.tmp"
     if [[ -n "$_fb_timeout" && "$_fb_timeout" != "0" ]] && command -v timeout >/dev/null 2>&1; then
         echo "[torch_oot_device_tests_run]     Retry bounded to ${_fb_timeout} (wedged-device guard)."
-        _OOT_TIMEOUT_PREFIX=("timeout" "--signal=KILL" "$_fb_timeout")
+        # --foreground: this prefix wraps the calls above, so it needs the same fix or it reintroduces the escape one level up.
+        _OOT_TIMEOUT_PREFIX=("timeout" "--foreground" "--signal=KILL" "$_fb_timeout")
     else
         _OOT_TIMEOUT_PREFIX=()
     fi

@@ -173,6 +173,11 @@ def _body_fx_carry_is_passthrough(while_op: "ir.WhileLoop", carry_index: int) ->
     module = getattr(body_graph, "module", None)
     fx_graph = getattr(module, "graph", None)
     if fx_graph is None:
+        logger.debug(
+            "cannot inspect FX pass-through identity for carry %d: "
+            "body_subgraph.graph.module.graph is unavailable",
+            carry_index,
+        )
         return False
 
     placeholders = [node for node in fx_graph.nodes if node.op == "placeholder"]
@@ -921,9 +926,20 @@ def splice_while_loop(
             # this function's docstring. The read side still resolves to the
             # real buffer below, exactly as for a pass-through carry, since
             # the spliced body reads the same object it writes.
-            if trip_count is not None and not fold_stacked_carry_layout(
-                real_input, trip_count
-            ):
+            #
+            # A caller can mark a carry stacking (carry_bindings_for's
+            # stacking_indices) independently of what trip_count it passes
+            # here -- the two APIs don't couple them. Without trip_count the
+            # fold can't even be attempted, so the destination is left in its
+            # unfolded [trip, *tile] shape with no fold and no diagnostic:
+            # any outside consumer expecting the flat shape silently reads
+            # a wrong-shaped buffer. Raise instead of letting that happen.
+            if trip_count is None:
+                raise Unsupported(
+                    f"stacking carry {binding.carry_index} ({real_name}) "
+                    f"requires a trip_count to fold its layout; got None"
+                )
+            if not fold_stacked_carry_layout(real_input, trip_count):
                 logger.debug(
                     "splice_while_loop: carry %d (%s) marked stacking but its "
                     "layout is not a foldable [trip, *tile] shape; leaving it "

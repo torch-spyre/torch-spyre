@@ -408,7 +408,7 @@ def run_e2e(
     backend and validate the device result against the CPU reference.
 
     Unlike the capture-based helpers, this mocks nothing: it drives the full
-    `bundle -> dxp_standalone -> launch_jobplan` path, exactly like the
+    `bundle -> backend compiler -> launch_jobplan` path, exactly like the
     standalone `tests/indirect_access/gather.py` script.  `dev_args` are the
     device tensors the kernel is invoked with; the CPU reference is computed
     from their host copies.
@@ -421,7 +421,7 @@ def run_e2e(
     the test itself (e.g. an out-of-bounds index) and is allowed to propagate.
 
     The device compile/run is best-effort: the backend does not yet support
-    every indirect-access pattern and aborts (SIGABRT in dxp_standalone) on some
+    every indirect-access pattern and aborts (SIGABRT in the backend) on some
     of them. A backend failure -- and likewise a value divergence -- is reported
     as an *expected failure* (pytest.xfail) rather than warned or hard-failed, so
     "always run e2e" surfaces known backend gaps as xfail (and flips to xpass the
@@ -800,7 +800,7 @@ class IndirectAccessTestCase(InductorTestCase):
         """Validate every capture-path stage with check(), then run end-to-end.
 
         Shared by the gather and scatter op-family tests. Currently only the
-        capture-path stages run; the e2e leg (real backend: dxp_standalone +
+        capture-path stages run; the e2e leg (real backend compiler +
         on-device launch via run_e2e) is wired up but disabled until e2e
         support lands. Pass expect_close=True for ops whose result must match
         the CPU reference (e.g. a supported direct op) once e2e is enabled.

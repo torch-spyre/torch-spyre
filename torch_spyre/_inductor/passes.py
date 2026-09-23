@@ -65,6 +65,7 @@ from .propagate_layouts import (
     propagate_mutation_layouts,
     propagate_spyre_tensor_layouts,
 )
+from .nonstick_dim_order import reorder_nonstick_dims
 from .optimize_restickify import optimize_restickify_locations
 from .insert_restickify import (
     finalize_layouts,
@@ -543,6 +544,7 @@ class CustomPreSchedulingPasses:
             # Tensor Layout (Stickification)
             split_multi_ops,
             propagate_spyre_tensor_layouts,
+            reorder_nonstick_dims,
             validate_ops,
             optimize_restickify_locations,
             finalize_layouts,

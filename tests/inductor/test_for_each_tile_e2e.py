@@ -58,8 +58,20 @@ import torch
 import torch_spyre  # noqa: F401  registers the "spyre" device
 from torch_spyre.constants import DEVICE_NAME
 
-from tests.inductor.for_each_tile_fixtures import (
-    batched_online_softmax_fn,
+from for_each_tile_fixtures import (
+    B,
+    COLS,
+    ROWS,
+    D,
+    K,
+    LK,
+    LQ,
+    M,
+    N,
+    PAGE_HS,
+    PAGE_LQ,
+    PAGE_POOL,
+    PAGE_SIZE,
     STICK_COLS,
     STICK_ROWS,
     abs_add_mul_tiled_fn,
@@ -68,8 +80,7 @@ from tests.inductor.for_each_tile_fixtures import (
     abs_tiled_reference,
     add_tiled_fn,
     add_tiled_reference,
-    attention_inputs,
-    matmul_inputs,
+    batched_online_softmax_fn,
     nested_add_outer_row_inner_col_fn,
     nested_add_outer_row_inner_col_reference,
     nested_split_m_then_k_fn,
@@ -82,7 +93,6 @@ from tests.inductor.for_each_tile_fixtures import (
     paged_gather_kv_inputs,
     paged_gather_kv_reference,
     paged_gather_reference,
-    pointwise_inputs,
     softmax_row_tiled_fn,
     softmax_row_tiled_reference,
     split_k_fn,
@@ -96,6 +106,7 @@ from tests.inductor.for_each_tile_fixtures import (
     triple_nested_stardep_outer_fn,
     triple_nested_stardep_outer_reference,
 )
+from tests.inductor.utils_inductor import cached_randn, cached_xavier, dl16_round
 
 
 def _with_dynamo_reset(test_fn):
@@ -144,31 +155,37 @@ class _DynamoResetTestCase(unittest.TestCase):
 
 
 class TestForEachTileE2E(_DynamoResetTestCase):
-    # Spyre's matmul runs in fp16, so the reference has to be an fp16-faithful
-    # one: cast the operands first, then accumulate in fp32 on CPU. Comparing
-    # against the fp32 product of fp32 operands would fail on rounding alone,
-    # independently of anything this test is meant to check.
+    # Spyre's matmul actually runs in dl16 on-device (SEN169_FP16; fp16 <->
+    # dl16 conversion happens implicitly at the H2D/D2H transfer boundary),
+    # so the reference has to be dl16-faithful: round through (an
+    # approximation of) dl16, then accumulate in fp32 on CPU. Comparing
+    # against the fp32 product of fp32-precision operands would fail on
+    # rounding alone, independently of anything this test is meant to check.
     #
-    # Operands must also be cast to fp16 BEFORE the host->device transfer, not
-    # after: `t.to(DEVICE_NAME).half()` (transfer fp32, cast on device)
-    # currently produces garbage on this backend for reasons unrelated to
-    # while_loop lowering -- a plain `torch.compile`d `a @ b` reproduces it
-    # without any for_each_tile involved. `t.half().to(DEVICE_NAME)` is the
-    # idiom the rest of the compiled-op suite uses (see
-    # tests/inductor/test_inductor_matmul.py, whose inputs are constructed
-    # `dtype=torch.float16` up front).
+    # Operands are generated directly at fp16 via cached_xavier rather than
+    # `torch.randn(fp32).half()`, for two reasons: (1) it avoids a second,
+    # independent double-rounding step (fp32 -> fp16) on top of the
+    # fp16 -> dl16 conversion already happening at the device boundary, and
+    # (2) xavier_uniform_ keeps output magnitude bounded regardless of the
+    # contraction (K) dimension, whereas plain unit-variance randn summed
+    # over K=256 produces outputs with magnitude ~sqrt(K) (~15-40 here) --
+    # exactly where a loose rtol grants the most absolute slack and can mask
+    # a real bug (see issue #4701's investigation). This is the same
+    # rand_type="xavier" idiom test_inductor_ops.py already uses for its
+    # large matmul cases.
     #
-    # rtol is the binding constraint here: operand/output magnitudes are
-    # O(1)-O(10), so rtol * |expected| dominates atol (which only matters
-    # near zero).
-    ATOL = 0.1
-    RTOL = 0.1
+    # Tightened from the previous atol=0.1/rtol=0.1 now that both the
+    # reference (dl16-rounded) and the operands (bounded-magnitude xavier)
+    # remove the two effects that tolerance was compensating for.
+    ATOL = 1e-2
+    RTOL = 1e-2
 
     @staticmethod
     def _operands():
-        (X, Y), _ = matmul_inputs()
-        ref = (X.half().float()) @ (Y.half().float())
-        return X.half().to(DEVICE_NAME), Y.half().to(DEVICE_NAME), ref
+        X = cached_xavier((M, K))
+        Y = cached_xavier((K, N))
+        ref = dl16_round(X.float()) @ dl16_round(Y.float())
+        return X.to(DEVICE_NAME), Y.to(DEVICE_NAME), ref
 
     def test_map_mode_split_m(self):
         X_spyre, Y_spyre, ref = self._operands()
@@ -234,8 +251,12 @@ class TestForEachTileE2E(_DynamoResetTestCase):
         after m_new (m's per-iteration output) has already been computed --
         the exact case an in-place-only rewrite would silently corrupt.
         """
-        Q, K, V = attention_inputs()
-        ref = online_softmax_reference(Q, K, V)
+        Q = cached_xavier((LQ, D))
+        K = cached_xavier((LK, D), differentiation=1)
+        V = cached_xavier((LK, D), differentiation=2)
+        ref = online_softmax_reference(
+            dl16_round(Q.float()), dl16_round(K.float()), dl16_round(V.float())
+        )
 
         Q_spyre = Q.to(DEVICE_NAME)
         K_spyre = K.to(DEVICE_NAME)
@@ -250,12 +271,16 @@ class TestForEachTileE2E(_DynamoResetTestCase):
 
     def test_batched_map_over_online_softmax_carry(self):
         """An inner Lk advance stays on a full outer-staged K buffer."""
-        torch.manual_seed(0)
-        Q = torch.randn(2, 64, 128, dtype=torch.float16)
-        K = torch.randn(2, 256, 128, dtype=torch.float16)
-        V = torch.randn(2, 256, 128, dtype=torch.float16)
-        ref = torch.softmax(Q.float() @ K.float().transpose(-1, -2), dim=-1)
-        ref = ref @ V.float()
+        Q = cached_xavier((B, 64, 128))
+        K = cached_xavier((B, 256, 128), differentiation=1)
+        V = cached_xavier((B, 256, 128), differentiation=2)
+        Qb, Kb, Vb = (
+            dl16_round(Q.float()),
+            dl16_round(K.float()),
+            dl16_round(V.float()),
+        )
+        ref = torch.softmax(Qb @ Kb.transpose(-1, -2), dim=-1)
+        ref = ref @ Vb
 
         compiled = torch.compile(
             batched_online_softmax_fn, backend="inductor", fullgraph=True
@@ -286,16 +311,17 @@ class TestForEachTileE2E(_DynamoResetTestCase):
         applied to the wrong operand or dropped entirely shows up as a large
         mismatch rather than rounding.
         """
-        pages, table, q = paged_gather_inputs()
-        ref = paged_gather_reference(pages, q)
+        _, table, _ = paged_gather_inputs()
+        pages = cached_xavier((PAGE_POOL, PAGE_SIZE, PAGE_HS))
+        q = cached_xavier((PAGE_LQ, PAGE_HS), differentiation=1)
+        ref = paged_gather_reference(dl16_round(pages.float()), dl16_round(q.float()))
 
         compiled = torch.compile(paged_gather_fn, backend="inductor", fullgraph=True)
         out = compiled(pages.to(DEVICE_NAME), table.to(DEVICE_NAME), q.to(DEVICE_NAME))
 
-        # Looser than the class defaults: the accumulator sums four
-        # score-weighted pages of magnitude ~sqrt(head_size), so fp16 matmul
-        # rounding alone reaches a couple of absolute units here.
-        torch.testing.assert_close(out.cpu().float(), ref, atol=2.0, rtol=0.05)
+        torch.testing.assert_close(
+            out.cpu().float(), ref, atol=self.ATOL, rtol=self.RTOL
+        )
 
     def test_gather_mode_paged_pages_kv(self):
         """Kind.GATHER with separate K and V pools: one marker, two consumers.
@@ -316,8 +342,15 @@ class TestForEachTileE2E(_DynamoResetTestCase):
         genuine per-trip advance, so a consumer resolved by renaming rather
         than by composition is silent there and loud here.
         """
-        k_pages, v_pages, table, q = paged_gather_kv_inputs()
-        ref = paged_gather_kv_reference(k_pages, v_pages, q)
+        _, _, table, _ = paged_gather_kv_inputs()
+        k_pages = cached_xavier((PAGE_POOL, PAGE_SIZE, PAGE_HS))
+        v_pages = cached_xavier((PAGE_POOL, PAGE_SIZE, PAGE_HS), differentiation=1)
+        q = cached_xavier((PAGE_LQ, PAGE_HS), differentiation=2)
+        ref = paged_gather_kv_reference(
+            dl16_round(k_pages.float()),
+            dl16_round(v_pages.float()),
+            dl16_round(q.float()),
+        )
 
         compiled = torch.compile(paged_gather_kv_fn, backend="inductor", fullgraph=True)
         out = compiled(
@@ -327,8 +360,9 @@ class TestForEachTileE2E(_DynamoResetTestCase):
             q.to(DEVICE_NAME),
         )
 
-        # Same tolerance rationale as test_gather_mode_paged_pages above.
-        torch.testing.assert_close(out.cpu().float(), ref, atol=2.0, rtol=0.05)
+        torch.testing.assert_close(
+            out.cpu().float(), ref, atol=self.ATOL, rtol=self.RTOL
+        )
 
 
 class TestForEachTilePointwiseE2E(_DynamoResetTestCase):
@@ -343,15 +377,21 @@ class TestForEachTilePointwiseE2E(_DynamoResetTestCase):
     test_hint_softmax_row_tiling's device_size[1] docstring in
     test_coarse_tile_e2e.py), so both sizes are kept as separate tests
     rather than only covering the large one.
+
+    References here skip dl16_round: unlike TestForEachTileE2E's matmuls,
+    these ops don't contract over a dimension, so they don't amplify
+    rounding error, and the kept ATOL/RTOL=0.1 tolerance already covers the
+    fp16-vs-dl16 gap.
     """
 
     ATOL = 0.1
     RTOL = 0.1
 
     def test_add_tiled_small(self):
-        A, B, _ = pointwise_inputs()
-        A_spyre, B_spyre = A.half().to(DEVICE_NAME), B.half().to(DEVICE_NAME)
-        ref = add_tiled_reference(A.half().float(), B.half().float())
+        A = cached_randn((ROWS, COLS))
+        B = cached_randn((ROWS, COLS), differentiation=1)
+        A_spyre, B_spyre = A.to(DEVICE_NAME), B.to(DEVICE_NAME)
+        ref = add_tiled_reference(A.float(), B.float())
 
         compiled = torch.compile(add_tiled_fn, backend="inductor", fullgraph=True)
         out = compiled(A_spyre, B_spyre, 2)
@@ -361,10 +401,10 @@ class TestForEachTilePointwiseE2E(_DynamoResetTestCase):
         )
 
     def test_add_tiled_multi_stick(self):
-        A = torch.randn(STICK_ROWS, STICK_COLS)
-        B = torch.randn(STICK_ROWS, STICK_COLS)
-        A_spyre, B_spyre = A.half().to(DEVICE_NAME), B.half().to(DEVICE_NAME)
-        ref = add_tiled_reference(A.half().float(), B.half().float())
+        A = cached_randn((STICK_ROWS, STICK_COLS))
+        B = cached_randn((STICK_ROWS, STICK_COLS), differentiation=1)
+        A_spyre, B_spyre = A.to(DEVICE_NAME), B.to(DEVICE_NAME)
+        ref = add_tiled_reference(A.float(), B.float())
 
         compiled = torch.compile(add_tiled_fn, backend="inductor", fullgraph=True)
         # tile_size=128 rows, full 128-col width -> 2 sticks/row per tile.
@@ -375,9 +415,9 @@ class TestForEachTilePointwiseE2E(_DynamoResetTestCase):
         )
 
     def test_abs_tiled_small(self):
-        A, _, _ = pointwise_inputs()
-        A_spyre = A.half().to(DEVICE_NAME)
-        ref = abs_tiled_reference(A.half().float())
+        A = cached_randn((ROWS, COLS))
+        A_spyre = A.to(DEVICE_NAME)
+        ref = abs_tiled_reference(A.float())
 
         compiled = torch.compile(abs_tiled_fn, backend="inductor", fullgraph=True)
         out = compiled(A_spyre, 2)
@@ -387,9 +427,9 @@ class TestForEachTilePointwiseE2E(_DynamoResetTestCase):
         )
 
     def test_abs_tiled_multi_stick(self):
-        A = torch.randn(STICK_ROWS, STICK_COLS)
-        A_spyre = A.half().to(DEVICE_NAME)
-        ref = abs_tiled_reference(A.half().float())
+        A = cached_randn((STICK_ROWS, STICK_COLS))
+        A_spyre = A.to(DEVICE_NAME)
+        ref = abs_tiled_reference(A.float())
 
         compiled = torch.compile(abs_tiled_fn, backend="inductor", fullgraph=True)
         out = compiled(A_spyre, 128)
@@ -399,13 +439,13 @@ class TestForEachTilePointwiseE2E(_DynamoResetTestCase):
         )
 
     def test_abs_add_mul_tiled_small(self):
-        A, B, C = pointwise_inputs()
-        A_spyre = A.half().to(DEVICE_NAME)
-        B_spyre = B.half().to(DEVICE_NAME)
-        C_spyre = C.half().to(DEVICE_NAME)
-        ref = abs_add_mul_tiled_reference(
-            A.half().float(), B.half().float(), C.half().float()
-        )
+        A = cached_randn((ROWS, COLS))
+        B = cached_randn((ROWS, COLS), differentiation=1)
+        C = cached_randn((ROWS, COLS), differentiation=2)
+        A_spyre = A.to(DEVICE_NAME)
+        B_spyre = B.to(DEVICE_NAME)
+        C_spyre = C.to(DEVICE_NAME)
+        ref = abs_add_mul_tiled_reference(A.float(), B.float(), C.float())
 
         compiled = torch.compile(
             abs_add_mul_tiled_fn, backend="inductor", fullgraph=True
@@ -417,17 +457,15 @@ class TestForEachTilePointwiseE2E(_DynamoResetTestCase):
         )
 
     def test_abs_add_mul_tiled_multi_stick(self):
-        A = torch.randn(STICK_ROWS, STICK_COLS)
-        B = torch.randn(STICK_ROWS, STICK_COLS)
-        C = torch.randn(STICK_ROWS, STICK_COLS)
+        A = cached_randn((STICK_ROWS, STICK_COLS))
+        B = cached_randn((STICK_ROWS, STICK_COLS), differentiation=1)
+        C = cached_randn((STICK_ROWS, STICK_COLS), differentiation=2)
         A_spyre, B_spyre, C_spyre = (
-            A.half().to(DEVICE_NAME),
-            B.half().to(DEVICE_NAME),
-            C.half().to(DEVICE_NAME),
+            A.to(DEVICE_NAME),
+            B.to(DEVICE_NAME),
+            C.to(DEVICE_NAME),
         )
-        ref = abs_add_mul_tiled_reference(
-            A.half().float(), B.half().float(), C.half().float()
-        )
+        ref = abs_add_mul_tiled_reference(A.float(), B.float(), C.float())
 
         compiled = torch.compile(
             abs_add_mul_tiled_fn, backend="inductor", fullgraph=True
@@ -439,9 +477,9 @@ class TestForEachTilePointwiseE2E(_DynamoResetTestCase):
         )
 
     def test_softmax_row_tiled_small(self):
-        X, _, _ = pointwise_inputs()
-        X_spyre = X.half().to(DEVICE_NAME)
-        ref = softmax_row_tiled_reference(X.half().float())
+        X = cached_randn((ROWS, COLS))
+        X_spyre = X.to(DEVICE_NAME)
+        ref = softmax_row_tiled_reference(X.float())
 
         compiled = torch.compile(
             softmax_row_tiled_fn, backend="inductor", fullgraph=True
@@ -452,9 +490,12 @@ class TestForEachTilePointwiseE2E(_DynamoResetTestCase):
 
     def test_softmax_row_tiled_multi_stick(self):
         """Row-tile size spans 2 sticks/row -- see test_hint_softmax_row_tiling."""
-        X = torch.rand(STICK_ROWS, STICK_COLS)
-        X_spyre = X.half().to(DEVICE_NAME)
-        ref = softmax_row_tiled_reference(X.half().float())
+        # abs=True: softmax is invariant to input sign, so this is purely
+        # fidelity to the old torch.rand ([0, 1)) input this test used
+        # before switching to cached_randn, not a correctness requirement.
+        X = cached_randn((STICK_ROWS, STICK_COLS), abs=True)
+        X_spyre = X.to(DEVICE_NAME)
+        ref = softmax_row_tiled_reference(X.float())
 
         compiled = torch.compile(
             softmax_row_tiled_fn, backend="inductor", fullgraph=True
@@ -508,11 +549,10 @@ class TestForEachTileNestedMapE2E(_DynamoResetTestCase):
         it needs ``_clone_layout`` to offer (or inherit) a layout that keeps
         the flattened axis whole, deferred as a separate task.
         """
-        A, B, _ = pointwise_inputs(rows=4, cols=8)
-        A_spyre, B_spyre = A.half().to(DEVICE_NAME), B.half().to(DEVICE_NAME)
-        ref = nested_add_outer_row_inner_col_reference(
-            A.half().float(), B.half().float()
-        )
+        A = cached_randn((4, 8))
+        B = cached_randn((4, 8), differentiation=1)
+        A_spyre, B_spyre = A.to(DEVICE_NAME), B.to(DEVICE_NAME)
+        ref = nested_add_outer_row_inner_col_reference(A.float(), B.float())
 
         compiled = torch.compile(
             nested_add_outer_row_inner_col_fn, backend="inductor", fullgraph=True
@@ -524,12 +564,10 @@ class TestForEachTileNestedMapE2E(_DynamoResetTestCase):
         )
 
     def test_nested_add_outer_row_inner_col_multi_stick(self):
-        A = torch.randn(STICK_ROWS, STICK_COLS)
-        B = torch.randn(STICK_ROWS, STICK_COLS)
-        A_spyre, B_spyre = A.half().to(DEVICE_NAME), B.half().to(DEVICE_NAME)
-        ref = nested_add_outer_row_inner_col_reference(
-            A.half().float(), B.half().float()
-        )
+        A = cached_randn((STICK_ROWS, STICK_COLS))
+        B = cached_randn((STICK_ROWS, STICK_COLS), differentiation=1)
+        A_spyre, B_spyre = A.to(DEVICE_NAME), B.to(DEVICE_NAME)
+        ref = nested_add_outer_row_inner_col_reference(A.float(), B.float())
 
         compiled = torch.compile(
             nested_add_outer_row_inner_col_fn, backend="inductor", fullgraph=True
@@ -554,18 +592,22 @@ class TestForEachTileNestedCarryE2E(_DynamoResetTestCase):
     docstrings), so a wrong per-level advance shows up as a large numeric
     mismatch rather than a compile-time error.
 
-    Same fp16-matmul tolerance rationale as TestForEachTileE2E.
+    Same dl16-rounded-reference, xavier-input tolerance rationale as
+    TestForEachTileE2E: every level here carries a matmul accumulation, so
+    the K-dimension magnitude blowup and fp16-vs-dl16 mismatch both apply.
     """
 
-    ATOL = 0.1
-    RTOL = 0.1
+    ATOL = 1e-2
+    RTOL = 1e-2
 
     def test_nested_split_m_then_k(self):
         """Depth=2: outer maps M, inner carries K (matmul accumulation)."""
-        X = torch.randn(256, 256)
-        Y = torch.randn(256, 64)
-        X_spyre, Y_spyre = X.half().to(DEVICE_NAME), Y.half().to(DEVICE_NAME)
-        ref = nested_split_m_then_k_reference(X.half().float(), Y.half().float())
+        X = cached_xavier((256, 256))
+        Y = cached_xavier((256, 64), differentiation=1)
+        X_spyre, Y_spyre = X.to(DEVICE_NAME), Y.to(DEVICE_NAME)
+        ref = nested_split_m_then_k_reference(
+            dl16_round(X.float()), dl16_round(Y.float())
+        )
 
         compiled = torch.compile(
             nested_split_m_then_k_fn, backend="inductor", fullgraph=True
@@ -578,10 +620,12 @@ class TestForEachTileNestedCarryE2E(_DynamoResetTestCase):
 
     def test_triple_nested_stardep_outer(self):
         """Depth=3: surviving STAR_DEP_KEPT marker at the outer level."""
-        X = torch.randn(2, 256, 256)
-        Y = torch.randn(2, 256, 64)
-        X_spyre, Y_spyre = X.half().to(DEVICE_NAME), Y.half().to(DEVICE_NAME)
-        ref = triple_nested_stardep_outer_reference(X.half().float(), Y.half().float())
+        X = cached_xavier((2, 256, 256))
+        Y = cached_xavier((2, 256, 64), differentiation=1)
+        X_spyre, Y_spyre = X.to(DEVICE_NAME), Y.to(DEVICE_NAME)
+        ref = triple_nested_stardep_outer_reference(
+            dl16_round(X.float()), dl16_round(Y.float())
+        )
 
         compiled = torch.compile(
             triple_nested_stardep_outer_fn, backend="inductor", fullgraph=True
@@ -594,10 +638,12 @@ class TestForEachTileNestedCarryE2E(_DynamoResetTestCase):
 
     def test_triple_nested_stardep_middle(self):
         """Depth=3: surviving STAR_DEP_KEPT markers at outer and middle."""
-        X = torch.randn(2, 256, 256)
-        Y = torch.randn(2, 256, 64)
-        X_spyre, Y_spyre = X.half().to(DEVICE_NAME), Y.half().to(DEVICE_NAME)
-        ref = triple_nested_stardep_middle_reference(X.half().float(), Y.half().float())
+        X = cached_xavier((2, 256, 256))
+        Y = cached_xavier((2, 256, 64), differentiation=1)
+        X_spyre, Y_spyre = X.to(DEVICE_NAME), Y.to(DEVICE_NAME)
+        ref = triple_nested_stardep_middle_reference(
+            dl16_round(X.float()), dl16_round(Y.float())
+        )
 
         compiled = torch.compile(
             triple_nested_stardep_middle_fn, backend="inductor", fullgraph=True
@@ -612,10 +658,12 @@ class TestForEachTileNestedCarryE2E(_DynamoResetTestCase):
         """Depth=3: same outer STAR_DEP_KEPT marker as outer_fn; inner
         marker is INLINE_ERASED despite the fixture's name (see
         for_each_tile_fixtures.py's docstring)."""
-        X = torch.randn(2, 256, 256)
-        Y = torch.randn(2, 256, 64)
-        X_spyre, Y_spyre = X.half().to(DEVICE_NAME), Y.half().to(DEVICE_NAME)
-        ref = triple_nested_stardep_inner_reference(X.half().float(), Y.half().float())
+        X = cached_xavier((2, 256, 256))
+        Y = cached_xavier((2, 256, 64), differentiation=1)
+        X_spyre, Y_spyre = X.to(DEVICE_NAME), Y.to(DEVICE_NAME)
+        ref = triple_nested_stardep_inner_reference(
+            dl16_round(X.float()), dl16_round(Y.float())
+        )
 
         compiled = torch.compile(
             triple_nested_stardep_inner_fn, backend="inductor", fullgraph=True
@@ -630,11 +678,11 @@ class TestForEachTileNestedCarryE2E(_DynamoResetTestCase):
         """Depth=3: same outer STAR_DEP_KEPT markers as outer_fn plus a
         middle-level `* 1.0`; the inner marker is lost regardless (see
         for_each_tile_fixtures.py's docstring)."""
-        X = torch.randn(2, 256, 256)
-        Y = torch.randn(2, 256, 64)
-        X_spyre, Y_spyre = X.half().to(DEVICE_NAME), Y.half().to(DEVICE_NAME)
+        X = cached_xavier((2, 256, 256))
+        Y = cached_xavier((2, 256, 64), differentiation=1)
+        X_spyre, Y_spyre = X.to(DEVICE_NAME), Y.to(DEVICE_NAME)
         ref = triple_nested_stardep_multilevel_reference(
-            X.half().float(), Y.half().float()
+            dl16_round(X.float()), dl16_round(Y.float())
         )
 
         compiled = torch.compile(

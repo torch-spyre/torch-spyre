@@ -894,7 +894,7 @@ class TestDataTransfer(unittest.TestCase):
         self.compare_with_cpu(fn, src, run_eager=False)
 
     def test_compiled_copy_fp16_workaround(self):
-        """.to(t.dtype) identity cast avoids the sdsc_fused_copy dxp_standalone crash."""
+        """.to(t.dtype) identity cast avoids the sdsc_fused_copy backend crash."""
         src = cached_randn((4, 64), differentiation="cop01wa_src")
 
         def fn(t):

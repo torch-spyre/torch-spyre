@@ -18,6 +18,7 @@ built from handcrafted buffers and terms."""
 
 import json
 
+import pytest
 import sympy
 
 from torch_spyre._inductor.cost_model import CostParams
@@ -152,6 +153,71 @@ def test_a_bundle_names_its_buffers_after_the_boundary_rewrite(monkeypatch):
     assert named == [["buf0"], ["buf1"]], (
         "the second bundle's op was renamed to its op kind by the rewrite"
     )
+
+
+def test_the_record_carries_the_context_the_buffers_cannot_show():
+    """Graph identity, environment and solve stats ride along with the plan.
+
+    Occupancy means nothing without the LX budget it is measured against, and
+    the kernel's name and directory hash do not exist yet at solve time, so the
+    graph's output names are the identity a reader joins on.
+    """
+    p, c = _buffers()
+    p.address, p.chosen_division = 0, 1
+    c.address, c.chosen_division = 16, 0
+    context = {
+        "op_names": {"C": "amax_1"},
+        "op_ids": {"C": "op1"},
+        "env": {"sencores": 8, "lx_capacity": 1234, "solver": "CpSatLayoutSolver"},
+        "solve": {"status": "OPTIMAL", "solve_s": 0.4},
+    }
+    rec = cost_expr_record(sympy.Integer(0), [], [p, c], CostParams(), context=context)
+    assert rec["env"]["lx_capacity"] == 1234 and rec["env"]["sencores"] == 8
+    assert rec["solve"]["status"] == "OPTIMAL"
+    assert rec["op_names"]["C"] == "amax_1", "the readable name"
+    assert rec["op_ids"]["C"] == "op1", "the key the numeric dump joins on"
+    # And a record built without context is unchanged, so old readers still work.
+    plain = cost_expr_record(sympy.Integer(0), [], [p, c], CostParams())
+    assert "env" not in plain and "solve" not in plain
+
+
+def test_context_may_not_redefine_the_record():
+    """Context describes the record; it does not get to replace it. Without the
+    guard a caller key named ``bundles`` would silently drop the terms."""
+    p, c = _buffers()
+    p.address, p.chosen_division = 0, 1
+    c.address, c.chosen_division = 16, 0
+    with pytest.raises(AssertionError, match="bundles"):
+        cost_expr_record(
+            sympy.Integer(0), [], [p, c], CostParams(), context={"bundles": "oops"}
+        )
+
+
+def test_a_buffer_carries_the_reason_it_never_reached_the_solver():
+    """Three outcomes a reader must not conflate: excluded before the solve,
+    weighed and declined, resident. ``reason`` separates the first."""
+    p, c = _buffers()
+    p.residency_reason = "op not allowed"
+    p.address, p.chosen_division = None, 1
+    c.address, c.chosen_division = 16, 0
+    divs = cost_expr_record(sympy.Integer(0), [], [p, c], CostParams())["divisions"]
+    assert divs["P"]["reason"] == "op not allowed"
+    assert divs["C"]["reason"] is None, "C reached the solver; bindings say the rest"
+
+
+def test_priced_relayouts_record_the_copies_that_were_not_taken():
+    """``relayout_terms`` holds what fired. Without the priced candidates a
+    reader cannot tell "relayout was never on the table" from "it was available
+    and lost"."""
+    p, c = _buffers()
+    p.address, p.chosen_division = 0, 1
+    c.address, c.chosen_division = 16, 0
+    rec = cost_expr_record(sympy.Integer(0), [], [p, c], CostParams())
+    priced = rec["priced_relayouts"]
+    assert list(priced) == ["C"], "keyed by the consumer, as divisions are"
+    (cand,) = priced["C"]["P"]
+    assert cand["cost_ns"] == 3000.0
+    assert (cand["source_division"], cand["consumer_division"]) == (1, 0)
 
 
 def test_emit_json_line_appends_one_record_per_call(tmp_path):
