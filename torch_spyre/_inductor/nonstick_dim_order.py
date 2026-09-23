@@ -102,7 +102,9 @@ def _reorder_stl(
 
     # Only move dims from outside (before outer_stick) into the slot,
     # and only if the largest outside dim is bigger than what's already there.
-    candidates = list(range(outer_stick))
+    # Exclude dims with constant (zero free-symbol) coordinates — these are
+    # padding/gap dims prepended by restickify/compact and must not be moved.
+    candidates = [d for d in range(outer_stick) if idc[d].free_symbols]
     if not candidates:
         return stl
     largest = max(candidates, key=lambda d: device_size[d])
