@@ -128,9 +128,24 @@ def derive_tiling_groups(
     untiled (absent from ``choices`` or mapped to the empty spec) or its spec
     differs from the run's. Contiguity is a hard requirement, not an
     optimization -- ``validate_coarse_tile_groups`` and ``_apply_plan`` both rely
-    on each group occupying one contiguous stretch of the operation list, so a
-    connected component that skipped an intervening untiled op would be rejected
-    at apply time.
+    on each group occupying one contiguous stretch of the operation list.
+
+    Two non-adjacent runs carrying the same spec are therefore **two groups**,
+    each minting its own hint ids and group id. They are not the same group and
+    not an error: ``TileSpec`` equality is structural, so unrelated regions
+    anywhere in the graph collide on a small alphabet (~6 counts per axis over
+    at most two dims), and refusing them would refuse ordinary graphs.
+
+    **Precondition on the caller, which this signature cannot check.** Ops meant
+    to tile together have to be contiguous in ``graph.operations``. A chooser
+    walking producer/consumer reachability is not walking contiguity: an op it
+    could not tile -- a menu-backed one, or one already carrying ``dim_hints``
+    -- sitting in the middle of a region leaves the second half reading the
+    first half's *full* extent while the chooser priced both at the per-tile
+    footprint. That is a mispricing rather than an illegal graph, and a
+    name->spec map carries no region identity to detect it with, so it belongs
+    to whoever builds ``choices``. ``_validate_contiguous`` remains the backstop
+    for the illegal case.
 
     ``choices`` is keyed by operation name (``op.get_operation_name()``).
     """
@@ -186,8 +201,8 @@ class CoarseTilingPass(ScratchpadOptimizationPass):
     the pass mints hint ids and a group-id offset from bases derived off the
     graph, stamps each op's ``dim_hints``, validates group contiguity, then calls
     ``coarse_tile``. With empty (or all-untiled) ``choices`` it is a no-op and
-    the op count is unchanged -- which is what keeps it inert while
-    ``auto_coarse_tiling`` is off.
+    the op count is unchanged -- which is what keeps it inert until a solver
+    hands it real choices.
     """
 
     def __init__(self, choices: Mapping[str, TileSpec]):
