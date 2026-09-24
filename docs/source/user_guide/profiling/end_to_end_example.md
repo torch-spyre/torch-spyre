@@ -8,12 +8,12 @@ telemetry. It uses today's tooling: `torch.profiler` + [`aiu-smi`](device_monito
 
 The Granite end-to-end path on Spyre today goes through the
 [Foundation Model Stack][fms] and
-[`aiu-fms-testing-utils`][aiu-fms] — **not** HuggingFace
+[`aiu-fms-testing-utils`][aiu-fms], **not** HuggingFace
 `AutoModelForCausalLM` directly. Spyre support for both currently
 exists on the `eager_spyre` branch of each repo, so install them from
 source off that branch rather than from PyPI.
 
-This example profiles Granite 3.3-8B-Instruct on Spyre in eager mode so `torch.compile` is not required.
+This example profiles the FMS Granite 3.3-8B-Instruct decoder on Spyre in eager mode, so `torch.compile` is not required for this path. Eager execution here is a property of the FMS Granite decoder as it runs through `aiu-fms-testing-utils`, not a general statement that any model runs eager on Spyre.
 
 ## What you need
 
@@ -59,7 +59,7 @@ for the full list):
 
 ```bash
 export PYTHONUNBUFFERED=1
-export SENCORES=32                 # full accelerator (1–32; default 32)
+export SENCORES=32                 # full accelerator (1-32; default 32)
 ```
 
 ## The script
@@ -117,7 +117,7 @@ alpha = model.base_model.rot_emb.compute_freqs_cis(DEVICE, ids.shape[1])
 selected_freqs = model.base_model.rot_emb.cached_freqs[0][alpha][position_ids].to(DEVICE)
 mask = kwargs["mask"].to(dtype=torch.float16).to(DEVICE)
 
-# 3. Warmup — first run is always slower due to runtime and device initialization
+# 3. Warmup: first run is always slower due to runtime and device initialization
 print("=" * 42)
 print("Warming up.".center(42))
 print("=" * 42)
@@ -178,9 +178,9 @@ See [PyTorch Profiler](pytorch_profiler.md).
 The `logs/granite/` directory will contain one JSON per profiler step.
 Open in any of:
 
-- `chrome://tracing` — built into Chromium / Chrome.
-- [Perfetto UI](https://ui.perfetto.dev/) — drag-and-drop the file.
-- TensorBoard — `tensorboard --logdir=logs/granite`.
+- `chrome://tracing`: built into Chromium / Chrome.
+- [Perfetto UI](https://ui.perfetto.dev/): drag-and-drop the file.
+- TensorBoard: `tensorboard --logdir=logs/granite`.
 
 Then post-process with `aiu-trace-analyzer` to extract derived metrics
 (kernel durations, gap analysis, idle bubbles). See
@@ -220,21 +220,21 @@ For a Granite-class transformer the typical signals are:
 |---|---|---|
 | First iteration much slower than the rest | Runtime and device initialization or general warmup | Expected. Discard the early iterations. |
 | Wall-clock ≫ profiler CPU | Device-side work dominates (good for compute-bound layers like MLP / large matmul) | Cross-check with `aiu-smi` PT-array util. |
-| Wall-clock ≈ profiler CPU | Host-side bottleneck — Python or Dynamo overhead | `TORCH_LOGS="+inductor"` |
+| Wall-clock ≈ profiler CPU | Host-side bottleneck: Python or Dynamo overhead | `TORCH_LOGS="+inductor"` |
 | Per-layer kernel gaps | Tile staging between LPDDR5 and LX scratchpad | [Performance analysis methodology](performance_analysis_methodology.md) |
 | Low PT-array utilization in `aiu-smi` | Work-division inefficiency, stick-alignment padding | [Compiler work division](../../compiler/work_division_planning.md) |
 | Idle bubbles between consecutive kernels | Reconfiguration latency or DMA stalls | `aiu-trace-analyzer` gap analysis |
 
 ## See also
 
-- [PyTorch Profiler](pytorch_profiler.md) — `torch.profiler` reference
-- [Device monitoring](device_monitoring.md) — `aiu-smi` setup
-- [Trace analysis](trace_analysis.md) — viewers and `aiu-trace-analyzer`
-- [Performance analysis methodology](performance_analysis_methodology.md) —
+- [PyTorch Profiler](pytorch_profiler.md): `torch.profiler` reference
+- [Device monitoring](device_monitoring.md): `aiu-smi` setup
+- [Trace analysis](trace_analysis.md): viewers and `aiu-trace-analyzer`
+- [Performance analysis methodology](performance_analysis_methodology.md):
   bounding a region and pairing traces with telemetry
-- [Environment variables](environment_variables.md) — full list of
+- [Environment variables](environment_variables.md): full list of
   logging and runtime flags
-- [RFC 0601][rfc-0601] — full profiling toolkit design
+- [RFC 0601][rfc-0601]: full profiling toolkit design
 
 [fms]: https://github.com/foundation-model-stack/foundation-model-stack
 [aiu-fms]: https://github.com/foundation-model-stack/aiu-fms-testing-utils

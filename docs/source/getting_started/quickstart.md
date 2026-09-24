@@ -64,5 +64,14 @@ output = c_matmul(x, y)
 print(f"Output of matmul with torch.compile\n: {output}")
 ```
 
+# Running HuggingFace models
+
+To run a stock HuggingFace Transformers checkpoint on Spyre, use the
+[hf-adapters](https://github.com/torch-spyre/hf-adapters) project rather than
+`AutoModelForCausalLM` directly. It loads the checkpoint through
+`AutoSpyreModelForCausalLM` and patches only the operations Spyre cannot run
+natively. See [Running HuggingFace models on Spyre](../user_guide/running_hf_models.md)
+for the supported model families and the load-and-generate walkthrough.
+
 # More Examples
 Refer to the [examples](https://github.com/torch-spyre/torch-spyre/tree/main/docs/source/user_guide/examples) directory in this repository, which provides more examples of using PyTorch on `spyre` device.

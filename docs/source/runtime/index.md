@@ -7,12 +7,12 @@ machinery, eager-mode dispatch, streams, and multi-card support.
 
 ## Responsibilities
 
-- **Device registration** — registering `spyre` as a PyTorch device type
-- **Tensor memory management** — allocating and freeing device DRAM (DDR)
+- **Device registration**: registering `spyre` as a PyTorch device type
+- **Tensor memory management**: allocating and freeing device DRAM (DDR)
   for `SpyreTensorImpl` objects
-- **DMA transfers** — moving tensor data between host (CPU) memory and
+- **DMA transfers**: moving tensor data between host (CPU) memory and
   device (DDR) memory via the `to()` / `from_device()` APIs
-- **Kernel dispatch** — loading compiled program binaries and
+- **Kernel dispatch**: loading compiled program binaries and
   orchestrating their execution across Spyre cores
 
 :::{figure} ../_static/images/pytorch-dispatcher.png
@@ -26,7 +26,7 @@ The PyTorch Dispatcher routes each operation to the correct device implementatio
 ## Device Registration
 
 Torch-Spyre registers `spyre` as a PyTorch device using the
-`PrivateUse1` mechanism — the standard PyTorch pathway for out-of-tree
+`PrivateUse1` mechanism, the standard PyTorch pathway for out-of-tree
 accelerators. Registration happens in `torch_spyre/__init__.py`'s
 `_autoload_impl()`, invoked by the run-once `_autoload()` entry point:
 
@@ -103,12 +103,12 @@ A standard PyTorch `(size, stride)` pair cannot describe a tiled device tensor, 
 
 The `SpyreTensorLayout` holds:
 
-- `device_size` — the tensor's shape on device, including the extra tiling and padding dims.
-- `stride_map` — the host stride for each device dim. A `-1` here means the dim is synthetic or fully padded.
-- `device_dtype` — the on-device data format, for example `SEN169_FP16`.
-- `element_arrangement` — how elements are packed within a stick (defaults to `STANDARD`).
+- `device_size`: the tensor's shape on device, including the extra tiling and padding dims.
+- `stride_map`: the host stride for each device dim. A `-1` here means the dim is synthetic or fully padded.
+- `device_dtype`: the on-device data format, for example `SEN169_FP16`.
+- `element_arrangement`: how elements are packed within a stick (defaults to `STANDARD`).
 
-Alongside the layout, `SpyreTensorImpl` carries `dma_sizes` and `dma_strides` directly — a host-shape DMA descriptor used when copying views back to the host. They drive `copyAsync()` in `spyre_stream.cpp`.
+Alongside the layout, `SpyreTensorImpl` carries `dma_sizes` and `dma_strides` directly, a host-shape DMA descriptor used when copying views back to the host. They drive `copyAsync()` in `spyre_stream.cpp`.
 
 Note that the handles returned to Python never carry a raw device pointer. That is a hard requirement on IBM Z.
 
@@ -137,7 +137,7 @@ What happens between a Python tensor going out of scope and the device allocatio
 When the allocator runs out of memory regions it invokes a registered
 memory-pressure callback. The torch-spyre callback releases the allocator mutex,
 calls `PyGC_Collect()` to free Python cyclic garbage, and re-acquires the mutex
-before returning — allowing the allocation to be retried. See
+before returning, allowing the allocation to be retried. See
 [Memory Pressure and Python GC](memory_pressure_gc.md) for the full GIL
 interaction and lock-ordering details.
 
@@ -155,7 +155,7 @@ Eager kernels reach the Spyre dispatch key from two Python sources.
 
 The first is manual registrations in [`torch_spyre/ops/eager.py`](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/ops/eager.py), which use `register_torch_compile_kernel` to register the 45+ ops in `COMPILED_OPS` (arithmetic, comparison, reduction, activation, and view ops) for the PrivateUse1 dispatch key.
 
-In-place variants are *derived* from that same list by `register_inplace_kernels`, not listed separately: each `foo_` overload whose signature matches its functional `foo` sibling gets a kernel that computes functionally and writes back with `self.copy_()`. In-place ops must never be added to `COMPILED_OPS` directly — a standalone-compiled in-place kernel bakes its write-destination address at trace time and can clobber an unrelated live buffer, whereas `copy_` is addressed at runtime.
+In-place variants are *derived* from that same list by `register_inplace_kernels`, not listed separately: each `foo_` overload whose signature matches its functional `foo` sibling gets a kernel that computes functionally and writes back with `self.copy_()`. In-place ops must never be added to `COMPILED_OPS` directly: a standalone-compiled in-place kernel bakes its write-destination address at trace time and can clobber an unrelated live buffer, whereas `copy_` is addressed at runtime.
 
 The match requires the same overload name *and* an identical argument signature modulo the `(a!)` write-alias, so a same-named pair with different operand order is rejected rather than mis-paired: `pow_.Scalar(Tensor self, Scalar exponent)` versus `pow.Scalar(Scalar self, Tensor exponent)` would otherwise yield a kernel computing `other ** self`. The kernel also enforces PyTorch's in-place dtype contract, raising if the promoted result cannot be cast back to `self`.
 
@@ -248,14 +248,18 @@ Three ordered `RuntimeOperation`s on a stream: a CPU callback computes the corre
    `processComputeOnHostCommand` with compiler-supplied metadata (`Hcm`) and
    writes a small correction blob into a pinned host buffer. The closure
    captures the metadata, the destination CompositeAddresses, and the buffer
-   pointer.
+   pointer. Each tensor's `kAddress` symbolic argument is resolved by
+   translating its `flex::CompositeAddress` to a concrete device address
+   through `SpyreAllocator::compositeAddressToDeviceAddress()`, so the
+   correction blob holds the final device addresses regardless of where the
+   allocator placed each tensor.
 2. **`JobPlanStepH2D`** copies that buffer into the program region on the device.
 3. **`JobPlanStepCompute`** then runs the kernel. The device-side prologue
    reads the corrections, patches the symbolic operands, and starts execution.
 
 The pinned host buffer is allocated once during `prepareKernel` and reused
 across launches. For tiled execution the same buffer cycles through every
-iteration — FIFO ordering guarantees each iteration's H2D consumes the buffer
+iteration. FIFO ordering guarantees each iteration's H2D consumes the buffer
 before the next iteration's HostCompute overwrites it.
 
 ## Multi-card and distributed execution
@@ -316,7 +320,7 @@ mode:
 process-group entries (`scatter`, `reduce_scatter`, `alltoall`,
 `alltoall_base`, `_allgather_base`, `allreduce_coalesced`) raise
 `SpyreCCLNotSupportedException`. `recvAnysource` is intentionally
-unsupported — the protocol overhead is high and call sites are rare.
+unsupported: the protocol overhead is high and call sites are rare.
 
 ### One device per process
 

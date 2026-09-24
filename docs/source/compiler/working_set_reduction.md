@@ -210,7 +210,7 @@ into a `loop_info`-carrying representation. The mechanics of that
 recognition and rewrite (`try_prove_for_each_tile`, `splice_while_loops`,
 `_stamp_direct_loop_info`, and the surrounding carry machinery in
 `while_loop_bridge.py`) are described in detail in
-[`coarse_tiling_loops.md`](coarse_tiling_loops.md#layer-1--pre-scheduling-ir-pass),
+[`coarse_tiling_loops.md`](coarse_tiling_loops.md#layer-1-pre-scheduling-ir-pass),
 which covers everything past "a run of ops carries a `loop_info:
 CoarseTileInfo`" — the `CountedLoopSchedulerNode` scheduler wrapper (Layer 2)
 and the `LoopSpec` codegen tree (Layer 3).

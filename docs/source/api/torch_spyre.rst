@@ -2,7 +2,7 @@ torch\_spyre
 ============
 
 When the ``torch_spyre`` package is installed, PyTorch picks it up
-through the ``torch.backends`` autoload entry point — no explicit
+through the ``torch.backends`` autoload entry point; no explicit
 ``import torch_spyre`` is needed. The Spyre backend registers itself
 on first use of ``torch`` and the public API is available under
 ``torch.spyre``, mirroring the ``torch.cuda`` surface.
@@ -339,7 +339,7 @@ FFDC (First Failure Data Capture)
        root is ``$TORCHINDUCTOR_CACHE_DIR`` or else
        ``<tempdir>/torchinductor_<user>`` from Inductor ``cache_dir()``
        (not ``~/.cache/torch/inductor``). ``<tempdir>`` is
-       ``tempfile.gettempdir()`` — typically ``/tmp`` on Linux, or
+       ``tempfile.gettempdir()``, typically ``/tmp`` on Linux, or
        ``$TMPDIR`` when that is set. Falls back to
        ``<tempdir>/torch-spyre-ffdc`` if that root cannot be resolved.
    :type output_dir: str, optional
@@ -776,8 +776,8 @@ Environment Variables
    * - ``SPYRE_LX_SOLVER_RELAYOUT_PRESOLVE_MAX_COPIES``
      - For unpriced CP-SAT solves, skip presolve above this many relayout
        copies (default ``0``, which disables the threshold)
-   * - ``SPYRE_ASYNC_DXP_COMPILE``
-     - Submit independent DXP kernel compilations to Inductor's subprocess
+   * - ``SPYRE_ASYNC_BACKEND_COMPILE``
+     - Submit independent backend kernel compilations to Inductor's subprocess
        pool and resolve them at the wrapper's ``async_compile.wait()``
        barrier (default ``0``)
    * - ``SPYRE_READ_COPY_ELISION``
@@ -792,7 +792,14 @@ Environment Variables
        stderr (default empty)
    * - ``SPYRE_KERNEL_CACHE``
      - Cache compiled Spyre kernels on disk and reuse them across
-       invocations (default ``0``; set ``1`` to enable)
+       invocations (default ``0``; set ``1`` to enable). When enabled,
+       ``LIB_VERSION_FILE`` must point at the compiler version file, which
+       supplies the compiler version for the cache key; if it is unset the
+       cache raises ``RuntimeError``. Set ``SPYRE_KERNEL_CACHE=0`` to run
+       without caching when no version file is available
+   * - ``LIB_VERSION_FILE``
+     - Path to the compiler version file read to form the kernel-cache key.
+       Required when ``SPYRE_KERNEL_CACHE=1``
    * - ``SPYRE_NUM_CPUS``
      - Override the CPU count CP-SAT uses to size its search worker pool.
        When unset the count is derived from the cgroup v2 quota, then
