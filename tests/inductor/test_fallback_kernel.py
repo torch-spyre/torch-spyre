@@ -428,9 +428,10 @@ class TestInGraphCpuComputedBuffers(unittest.TestCase):
 
     # Pin greedy: this covers the co-opt allocator over the greedy inner solver
     # (ExhaustiveSearchSolver-wrapped), the path this CPU-buffer guard was written
-    # for. The cpsat *joint* co-opt path does not yet apply the same guard, but
-    # co_optimizing_lx_planning is off by default so it is never on the default
-    # compile path; enabling cpsat co-opt is deferred to the co-opt follow-up.
+    # for. The cpsat *joint* co-opt path does not yet apply the same guard;
+    # enabling cpsat co-opt is deferred to the co-opt follow-up. greedy has no
+    # core-division-capable solver, so this must opt into the
+    # ExhaustiveSearchSolver fallback via allow_exhaustive_search=True.
     @config.patch(
         {
             "co_optimizing_lx_planning": True,

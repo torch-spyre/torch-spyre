@@ -482,6 +482,11 @@ class ParameterizedScratchpadUsage(
             layout_solver=params["solver_method"],
             sencores=params["sencores"],
             co_optimizing_lx_planning=params["co_optimization"],
+            # greedy/bestfit/firstfit have no core-division-capable solver, so
+            # co_optimization=True can only proceed via the ExhaustiveSearchSolver
+            # DFS fallback, which this sweep deliberately exercises. (No-op for
+            # cpsat/simulated_annealing, and for co_optimization=False.)
+            allow_exhaustive_search=True,
             _cpsat_warn_on_cost_expr=False,
         ):
             model, args, kwargs = factory(self)
@@ -830,6 +835,11 @@ class TestCloneAtGraphBoundaries(
             layout_solver=params["solver_method"],
             sencores=params["sencores"],
             co_optimizing_lx_planning=params["co_optimization"],
+            # greedy/bestfit/firstfit have no core-division-capable solver, so
+            # co_optimization=True can only proceed via the ExhaustiveSearchSolver
+            # DFS fallback, which this sweep deliberately exercises. (No-op for
+            # cpsat, and for co_optimization=False.)
+            allow_exhaustive_search=True,
             _cpsat_warn_on_cost_expr=False,
         ):
             model, args, kwargs = factory(self)
@@ -1262,6 +1272,12 @@ class TestCpSatAllocatorFallback(
     still reduce HBM traffic (the greedy fallback is correct, just not
     CP-SAT-optimal). The metaclass injects one ``test_<model>__<combo>`` method
     per ``(model, config-combo)``.
+
+    Without ortools, ``cpsat`` degrades to greedy placement, which is not
+    core-division-capable; the ``co_optimization=True`` cases must therefore opt
+    into the ``ExhaustiveSearchSolver`` DFS fallback via
+    ``allow_exhaustive_search=True`` (see ``run_case`` below), which is exactly
+    the degraded routing this class exists to cover.
     """
 
     # Models swept by the parameterized suites, as ``(label, factory)`` where
@@ -1308,6 +1324,12 @@ class TestCpSatAllocatorFallback(
                 layout_solver=params["solver_method"],
                 sencores=params["sencores"],
                 co_optimizing_lx_planning=params["co_optimization"],
+                # Without ortools, cpsat degrades to greedy placement, which is
+                # not core-division-capable, so co_optimization=True can only
+                # proceed via the ExhaustiveSearchSolver DFS fallback -- the
+                # degraded routing this class exists to cover. (No-op for
+                # co_optimization=False.)
+                allow_exhaustive_search=True,
                 _cpsat_warn_on_cost_expr=False,
             ):
                 model, args, kwargs = factory(self)
@@ -1626,6 +1648,51 @@ class TestSelectAllocator(unittest.TestCase):
             with self.assertRaises(ValueError):
                 select_allocator()
 
+    def test_exhaustive_search_guard_error_text(self):
+        """The ValueError raised for a non-core-division-capable solver names the
+        offending solver and every documented way out, regardless of host ortools
+        availability."""
+        from torch_spyre._inductor.scratchpad.allocator import select_allocator
+
+        for solver_method in ("greedy", "bestfit", "firstfit"):
+            with self.subTest(solver_method=solver_method):
+                with ts_inductor_config.patch(
+                    layout_solver=solver_method,
+                    co_optimizing_lx_planning=True,
+                    allow_exhaustive_search=False,
+                ):
+                    with self.assertRaises(ValueError) as ctx:
+                        select_allocator()
+                message = str(ctx.exception)
+                self.assertIn(solver_method, message)
+                self.assertIn("allow_exhaustive_search", message)
+                self.assertIn("co_optimizing_lx_planning", message)
+
+    def test_cpsat_co_optimization_guard_with_ortools_forced_absent(self):
+        """Forces the missing-ortools condition explicitly (rather than branching
+        on the host's actual ortools install) so this assertion runs the same way
+        on every machine: ``cpsat`` degrades to a greedy factory, which is not
+        core-division-capable, so co-optimization must raise unless
+        ``allow_exhaustive_search`` is set."""
+        from torch_spyre._inductor.scratchpad import ilp_solver_ortools
+        from torch_spyre._inductor.scratchpad.allocator import select_allocator
+
+        saved = ilp_solver_ortools.cp_model
+        ilp_solver_ortools.cp_model = None
+        try:
+            with ts_inductor_config.patch(
+                layout_solver="cpsat",
+                co_optimizing_lx_planning=True,
+                allow_exhaustive_search=False,
+                _cpsat_warn_on_cost_expr=False,
+            ):
+                with self.assertRaises(ValueError) as ctx:
+                    select_allocator()
+            self.assertIn("cpsat", str(ctx.exception))
+            self.assertIn("allow_exhaustive_search", str(ctx.exception))
+        finally:
+            ilp_solver_ortools.cp_model = saved
+
 
 class TestInplaceEdgeGate(unittest.TestCase):
     """Unit tests for ``ScratchpadAllocator._inplace_edge_ok``, the sole predicate
@@ -1725,6 +1792,7 @@ class TestInPlaceMutationCoOptimizing(BaseTestScratchpadUsage):
             lx_planning=True,
             layout_solver="greedy",
             co_optimizing_lx_planning=True,
+            allow_exhaustive_search=True,
         ):
             device_result = torch.compile(fn, fullgraph=True)(*args).to("cpu")
         torch.testing.assert_close(device_result, cpu_result, atol=1e-2, rtol=1e-3)

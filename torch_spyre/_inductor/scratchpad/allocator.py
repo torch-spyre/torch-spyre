@@ -3680,7 +3680,9 @@ def select_allocator() -> ScratchpadAllocator:
                     "proceed is to fall back to ExhaustiveSearchSolver, an "
                     "expensive DFS over core-division candidates. Set "
                     "allow_exhaustive_search=True (or "
-                    "ALLOW_EXHAUSTIVE_SEARCH=1) to allow that fallback."
+                    "ALLOW_EXHAUSTIVE_SEARCH=1) to allow that fallback, or "
+                    "set co_optimizing_lx_planning=False (or "
+                    "CO_OPTIMIZING_LX_PLANNING=0) to avoid it."
                 )
             return CoOptimizingAllocator(
                 layout_planning=functools.partial(
