@@ -42,6 +42,7 @@ test_suite_config:
             - TestOps::test_implicit_loading.*
             - TestOps::test_is_nonzero.*
             - TestOps::test_item.*
+            - TestOps::test_div_rounding_mode.*
             # exact matches — no .* to avoid leaking into other shards
             - TestOps::test_log
             # test_mean has 3 params: 3d_dim0, 3d_dim1, 3d_dim0_keepdim.
