@@ -99,6 +99,7 @@ from torch_spyre._inductor.wsr.tile_prediction import (
     _rejection_reason,
     predict_frame,
 )
+from torch_spyre._inductor.scratchpad import coarse_tiling as coarse_tiling_module
 from torch_spyre._inductor.scratchpad.coarse_tiling import (
     CoarseTilingPass,
     _derive_group_idx_offset,
@@ -10980,6 +10981,75 @@ class TestDeriveTilingGroups(unittest.TestCase):
         g = self._graph_of(["op0", "op1"])
         self.assertEqual(derive_tiling_groups(g, {}), [])
         self.assertEqual(derive_tiling_groups(g, {"op0": TileSpec()}), [])
+
+
+class TestDeriveTilingGroupsMisreads(unittest.TestCase):
+    """A run of one nest breaks at a consumer that does not read a producer of
+    its stretch tile by tile; the stretch outlives the break and ends where the
+    nest changes. ``tile_misread`` is the per-edge test (covered on the card
+    in ``test_solver_auto_coarse_tiling``); here it is a table."""
+
+    def _groups(self, nests, reads, misreads):
+        """``nests``: op name -> nest; ``reads``: op name -> producers it
+        reads; ``misreads``: the ``(producer, consumer)`` pairs that misread."""
+        ops = []
+        for name in nests:
+            op = MagicMock()
+            op.get_name.return_value = name
+            op.get_operation_name.return_value = name
+            ops.append(op)
+        choices = {
+            name: TileSpec(tuple(TileAxis(i, c) for i, c in enumerate(nest)))
+            for name, nest in nests.items()
+            if nest
+        }
+
+        def read_writes(op):
+            names = reads.get(op.get_name(), ())
+            return SimpleNamespace(reads=[SimpleNamespace(name=n) for n in names])
+
+        def misread(graph, producer, _ps, consumer, _cs, _read):
+            pair = (producer.get_name(), consumer.get_name())
+            return "misread" if pair in misreads else None
+
+        with (
+            patch.object(coarse_tiling_module, "op_read_writes", read_writes),
+            patch.object(coarse_tiling_module, "tile_misread", misread),
+        ):
+            groups = derive_tiling_groups(_graph(ops), choices)
+        return [[o.get_name() for o in group] for group, _ in groups]
+
+    def test_a_misread_starts_a_new_group(self):
+        self.assertEqual(
+            self._groups({"p": (2,), "c": (2,)}, {"c": ["p"]}, {("p", "c")}),
+            [["p"], ["c"]],
+        )
+
+    def test_a_reader_in_step_shares_the_group(self):
+        self.assertEqual(
+            self._groups({"p": (2,), "c": (2,)}, {"c": ["p"]}, set()), [["p", "c"]]
+        )
+
+    def test_the_stretch_outlives_a_split(self):
+        # c misreads a, which is already in an earlier group; c still breaks.
+        self.assertEqual(
+            self._groups(
+                {"a": (2,), "b": (2,), "c": (2,)},
+                {"b": ["a"], "c": ["a", "b"]},
+                {("a", "b"), ("a", "c")},
+            ),
+            [["a"], ["b"], ["c"]],
+        )
+
+    def test_a_nest_change_ends_the_stretch(self):
+        self.assertEqual(
+            self._groups(
+                {"a": (2,), "b": (4,), "c": (2,), "d": (2,)},
+                {"d": ["a", "c"]},
+                {("a", "d")},
+            ),
+            [["a"], ["b"], ["c", "d"]],
+        )
 
 
 class TestDerivedBases(unittest.TestCase):
