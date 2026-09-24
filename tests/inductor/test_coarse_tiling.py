@@ -6026,6 +6026,117 @@ class TestPlanReadCopies(unittest.TestCase):
         self.assertEqual(entries_by_name["only_b_buf"].consumer_op_names, ("op_b",))
 
 
+def _committed_layout(host_size, dtype=torch.float32):
+    """A ``FixedTiledLayout`` over ``host_size`` -- what every buffer carries by
+    the time the scratchpad's coarse-tiling pass runs."""
+    from torch._inductor.ir import FlexibleLayout
+
+    from torch_spyre._C import ElementArrangement, SpyreTensorLayout
+    from torch_spyre._inductor.ir import FixedTiledLayout
+
+    strides = [int(x) for x in FlexibleLayout.contiguous_strides(host_size)]
+    return FixedTiledLayout(
+        torch.device("cpu"),
+        dtype,
+        [Integer(x) for x in host_size],
+        [Integer(x) for x in strides],
+        SpyreTensorLayout(
+            host_size,
+            strides,
+            dtype,
+            list(range(len(host_size))),
+            ElementArrangement.STANDARD,
+        ),
+    )
+
+
+class TestPostStickifyReadCopySizing(unittest.TestCase):
+    """Pass 1 runs on the post-stickify route for a caller that can place the
+    copy, and drops the reads it cannot size instead of refusing the tiling.
+
+    ``_insert_one_read_copy``'s committed-layout branch pairs the source's
+    non-unit dims with the reader's iteration extents positionally, so it needs
+    the two to be the same length and raises otherwise
+    (``TODO(span-overflow-read-copy)``). That raise is right for the
+    span-overflow caller, whose tiling is forced; for a caller that *chose* to
+    tile, staging the read is an optimization and skipping it leaves the op
+    reading the full buffer, exactly as it does with Pass 1 off.
+    """
+
+    def setUp(self):
+        gm = fx.symbolic_trace(lambda: None)
+        self._graph_ctx = V.set_graph_handler(GraphLowering(gm))
+        self._graph_ctx.__enter__()
+
+    def tearDown(self):
+        self._graph_ctx.__exit__(None, None, None)
+
+    def _fixture(self, layout=None):
+        """The shared-read fixture with the source's committed layout swapped
+        in. Rank stays 2 throughout: the readers load through the source's own
+        indexer, which asserts on a rank it was not built against, so a
+        rank-changing swap would fail there rather than at the predicate under
+        test. Unit dims give the same mismatch at equal rank, and are one of
+        the three shapes the sizing walk names."""
+        op_a, op_b, full_buf, operations = _make_two_op_shared_read_fixture()
+        if layout is not None:
+            full_buf.layout = layout
+        return op_a, op_b, full_buf, operations
+
+    def _only_dep(self, op):
+        from torch_spyre._inductor.wsr.coarse_tile import _full_buffer_read_deps
+
+        deps = list(_full_buffer_read_deps(op))
+        self.assertEqual(len(deps), 1)
+        return deps[0]
+
+    def test_an_uncommitted_layout_is_always_sizable(self):
+        # The pre-stickify caller, whose source carries a plain FixedLayout:
+        # the branch that needs the ranks to agree is not the one it takes.
+        from torch_spyre._inductor.wsr.coarse_tile import _read_copy_can_be_sized
+
+        op_a, _, _, _ = self._fixture()
+        self.assertTrue(_read_copy_can_be_sized(self._only_dep(op_a)))
+
+    def test_a_committed_layout_of_matching_rank_is_sizable(self):
+        from torch_spyre._inductor.wsr.coarse_tile import _read_copy_can_be_sized
+
+        op_a, _, _, _ = self._fixture(_committed_layout([64, 128]))
+        dep = self._only_dep(op_a)
+        self.assertEqual(len(dep.size), 2)
+        self.assertTrue(_read_copy_can_be_sized(dep))
+
+    def test_a_committed_layout_of_fewer_non_unit_dims_than_extents_is_not(self):
+        # A read whose loop carries more variables than the buffer has real
+        # dimensions -- the broadcast-operand shape, and the same count a
+        # matmul operand fails on. Unit dims do not count: they are squeezed
+        # out of the dep and reinserted by the sizing walk.
+        from torch_spyre._inductor.wsr.coarse_tile import _read_copy_can_be_sized
+
+        op_a, _, _, _ = self._fixture(_committed_layout([1, 128]))
+        self.assertFalse(_read_copy_can_be_sized(self._only_dep(op_a)))
+
+    def test_the_planner_drops_an_unsizable_read_rather_than_raising(self):
+        from torch_spyre._inductor.wsr.coarse_tile import _plan_read_copies
+
+        op_a, op_b, _, operations = self._fixture(_committed_layout([1, 128]))
+        plans = _plan_read_copies(operations, [((0,), [op_a, op_b], {})])
+        self.assertEqual(
+            [entry for plan in plans.values() for entry in plan.entries], []
+        )
+
+    def test_the_planner_keeps_a_sizable_read(self):
+        # Non-vacuity for the test above: the same fixture, same call, one
+        # entry -- so an empty plan there is the predicate and not the fixture.
+        from torch_spyre._inductor.wsr.coarse_tile import _plan_read_copies
+
+        op_a, op_b, _, operations = self._fixture(_committed_layout([64, 128]))
+        plans = _plan_read_copies(operations, [((0,), [op_a, op_b], {})])
+        self.assertEqual(
+            len([entry for plan in plans.values() for entry in plan.entries]), 1
+        )
+
+
 class TestReadCopyPlanDataclasses(unittest.TestCase):
     """ReadCopyEntry/ReadCopyPlan are plain frozen dataclasses (Task 1)."""
 
@@ -9422,11 +9533,21 @@ class TestDeriveTilingGroups(unittest.TestCase):
     def test_consecutive_run_grouped_untiled_breaks(self):
         g = self._graph_of(["op0", "op1", "op2", "op3", "op4"])
         spec = TileSpec((TileAxis(0, 4),))
+        other = TileSpec((TileAxis(0, 2),))
         # op1,op2 tiled and consecutive -> one group; op4 tiled alone; op0/op3
         # untiled -> break the runs.
-        choices = {"op1": spec, "op2": spec, "op4": spec}
+        choices = {"op1": spec, "op2": spec, "op4": other}
         groups = derive_tiling_groups(g, choices)
         self.assertEqual(self._names(groups), [["op1", "op2"], ["op4"]])
+
+    def test_one_spec_in_two_non_adjacent_runs_is_two_groups(self):
+        # TileSpec equality is structural, so unrelated regions collide on a
+        # small alphabet. Two runs, two groups -- each mints its own hint ids.
+        g = self._graph_of(["op0", "op1", "op2", "op3", "op4"])
+        spec = TileSpec((TileAxis(0, 4),))
+        groups = derive_tiling_groups(g, {"op1": spec, "op2": spec, "op4": spec})
+        self.assertEqual(self._names(groups), [["op1", "op2"], ["op4"]])
+        self.assertEqual([s for _, s in groups], [spec, spec])
 
     def test_spec_change_breaks_the_run(self):
         g = self._graph_of(["op0", "op1"])
@@ -9539,6 +9660,57 @@ class TestCoarseTilingPassEquivalence(unittest.TestCase):
         self.assertEqual(self._loop_fields(got), ref_fields)
         self.assertEqual(list(got.data.ranges), ref_ranges)
         self.assertEqual(list(got.data.ranges), [Integer(64), Integer(64)])
+
+    def test_plan_only_raises_what_apply_would_but_leaves_the_graph_alone(self):
+        # For a caller that treats a refusal as fatal: it must be able to fail
+        # on an untouched graph, because the decisions are all made before any
+        # IR is rewritten but ``dim_hints`` are stamped on the way there.
+        spec = TileSpec((TileAxis(0, 4),))
+        ops = [self._bare([256], n) for n in ("op0", "op1")]
+        g = _graph(ops)
+        before = [list(op.data.ranges) for op in ops]
+        CoarseTilingPass({"op0": spec, "op1": spec}).plan_only(g)
+        self.assertEqual([list(op.data.ranges) for op in ops], before)
+        for op in ops:
+            self.assertEqual(getattr(op, "dim_hints", []), [])
+        # And it is a dry run of the real thing: applying now still works.
+        CoarseTilingPass({"op0": spec, "op1": spec}).apply_pass(g)
+        self.assertEqual([op.data.ranges[0] for op in ops], [Integer(64)] * 2)
+
+    def test_plan_only_restores_hints_when_it_raises(self):
+        # host_dim 3 does not exist on a 1-D op, so tile_spec_to_dim_hints
+        # refuses -- after the first op in the group was already stamped.
+        ops = [self._bare([256], n) for n in ("op0", "op1")]
+        g = _graph(ops)
+        spec = TileSpec((TileAxis(3, 4),))
+        with self.assertRaises(Unsupported):
+            CoarseTilingPass({"op0": spec, "op1": spec}).plan_only(g)
+        for op in ops:
+            self.assertEqual(getattr(op, "dim_hints", []), [])
+
+    def test_two_equal_spec_runs_become_two_groups_with_distinct_hint_ids(self):
+        # The fix for the structural-equality collision: op0 and op2 share a
+        # spec but op1 breaks the run, so they are two groups. Each mints its
+        # own hint id, which is what validate_coarse_tile_groups demands and
+        # what keeps their loop nests separate.
+        spec = TileSpec((TileAxis(0, 4),))
+        ops = [self._bare([256], n) for n in ("op0", "op1", "op2")]
+        g = _graph(ops)
+        groups = derive_tiling_groups(g, {"op0": spec, "op2": spec})
+        self.assertEqual(
+            [[o.get_operation_name() for o in ops_] for ops_, _ in groups],
+            [["op0"], ["op2"]],
+        )
+        CoarseTilingPass({"op0": spec, "op2": spec}).apply_pass(g)
+        hint_ids = [[h.hint_id for h in op.dim_hints] for op in (ops[0], ops[2])]
+        self.assertEqual(hint_ids, [[0], [1]])
+        self.assertNotEqual(
+            tuple(ops[0].loop_info.loop_group_id),
+            tuple(ops[2].loop_info.loop_group_id),
+        )
+        # op1 was never in a group, so it is untiled and unhinted.
+        self.assertEqual(getattr(ops[1], "dim_hints", []), [])
+        self.assertEqual(ops[1].data.ranges[0], Integer(256))
 
     def test_pass_inputs_match_hint_path_structurally(self):
         # Two independent ops in one group: prove the group derivation and

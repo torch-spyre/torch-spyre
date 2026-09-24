@@ -18,9 +18,9 @@ import math
 import time
 from abc import ABC, abstractmethod
 from collections import defaultdict
-from collections.abc import Iterable, Sequence
-from dataclasses import dataclass, replace
-from typing import Any, Callable, cast, Optional
+from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import replace
+from typing import Any, Callable, cast, NamedTuple, Optional
 
 import sympy
 import torch
@@ -35,7 +35,7 @@ from torch._inductor.ir import (
     Reduction,
     ReinterpretView,
 )
-from torch._inductor.dependencies import Dep, MemoryDep
+from torch._inductor.dependencies import MemoryDep
 from torch._inductor.graph import GraphLowering
 
 from torch_spyre._inductor.pass_utils import (
@@ -46,27 +46,40 @@ from torch_spyre._inductor.pass_utils import (
     indirect_info_from_op,
     iteration_space_from_op,
     op_read_writes,
-    _prepare_per_core_view,
-    _per_core_view_from_prep,
     _per_core_view_on_buf,
     _is_matmul_op,
     op_short_name,
 )
 from torch_spyre._C import get_device_size_in_bytes
 from torch_spyre._inductor.work_division import (
+    OpSplitSpace,
+    ResidencyEdge,
+    build_op_split_space,
+    build_residency_edge,
     enumerate_work_division_candidates,
     has_resolved_work_div_hint,
     work_division_splits_are_legal,
+    _core_division,
+    _view_for_div,
 )
 from torch_spyre._inductor.errors import Unsupported
+from torch_spyre._inductor.work_division_constraints import (
+    JOINT_TILING_AND_DIVISION_ATTR,
+)
+from torch_spyre._inductor.wsr.enumerate_tilings import build_tiling_space
 from torch_spyre._inductor.scratchpad.plan_solver import (
+    ceil_div,
     cost_expr_record,
+    coarse_tile_read_copy_name,
+    COARSE_TILE_READ_COPY_PREFIX,
+    CoarseTileReadCopyBuffer,
     CoreDivision,
     CoreDivisionBuffer,
     CoreDivisionLayoutSolver,
     LifetimeBoundBuffer,
     MemoryPlanSolver,
     SolveError,
+    TileSpec,
     BufferType,
     RelayoutCopyBuffer,
     build_relayout_copy,
@@ -1421,7 +1434,9 @@ class ScratchpadAllocator:
         graph_editor = GraphEditor(graph)
 
         for b in buffers:
-            if b.address is None or b.name.startswith("__spyre_lx_relayout__:"):
+            if b.address is None or b.name.startswith(
+                ("__spyre_lx_relayout__:", COARSE_TILE_READ_COPY_PREFIX)
+            ):
                 continue
 
             buf = graph.get_buffer(b.name)
@@ -1481,23 +1496,6 @@ def _lx_planning_size() -> int:
 
     frontend_reservation = int(_LX_TRACKER_CAPACITY_BYTES * (1.0 - backend_fraction))
     return round_up_to_alignment(frontend_reservation, _LX_ALLOCATION_GRANULARITY_BYTES)
-
-
-def _reduction_syms(
-    op: Operation, splits: dict[sympy.Symbol, int]
-) -> frozenset[sympy.Symbol]:
-    """Get reduction symbols for an operation."""
-    rw = op_read_writes(op)
-    write = next((d for d in rw.writes if isinstance(d, MemoryDep)), None)
-    if write is None:
-        return frozenset()
-    return frozenset(s for s in splits if write.index.coeff(s) == 0)
-
-
-def _core_division(op: Operation, splits: dict[sympy.Symbol, int]) -> CoreDivision:
-    """Classify one symbol-keyed candidate for its producing operation."""
-    sparse = {s: v for s, v in splits.items() if v > 1}
-    return CoreDivision(splits=sparse, reduction_syms=_reduction_syms(op, sparse))
 
 
 def _is_cpu_host_buffer(op: Operation) -> bool:
@@ -1632,148 +1630,6 @@ def _fused_layout_group_ops(
                 group.setdefault(op.name, reason_of_seed[dep.name])
                 break
     return group
-
-
-def _view_for_div(
-    op: Operation,
-    dep: MemoryDep,
-    buf_name: str,
-    splits: dict[sympy.Symbol, int],
-    prep_cache: dict,
-):
-    """One candidate division's per-core view of ``buf_name``.
-
-    ``prep_cache`` holds the candidate-invariant (sympy-heavy) context, keyed by
-    ``(op name, dep, buf_name)``: a producer's write-dep and a consumer's
-    read-dep on the same buffer can be equal ``MemoryDep``s, so the op name
-    keeps their preps distinct while a parent read by several consumers reuses
-    its write-view prep.
-    """
-    key = (op.get_name(), dep, buf_name)
-    if key not in prep_cache:
-        prep_cache[key] = _prepare_per_core_view(op, dep, buf_name)
-    syms = _reduction_syms(op, splits)
-    return _per_core_view_from_prep(
-        prep_cache[key],
-        splits,
-        {k: v for k, v in splits.items() if k in syms},
-    )
-
-
-@dataclass
-class ResidencyEdge:
-    """One producer-buffer -> consumer edge, with its residency policy applied.
-
-    Owns both halves of "can these two candidates share a residency": the
-    *geometry* -- the same per-core slicing of the buffer, compared in the
-    buffer's own device-dim frame, on the same total core count -- and the
-    *policy* filters that decide a candidate can host a readable residency at
-    all. Built once per edge by :func:`build_residency_edge`, which returns
-    ``None`` for an edge excluded outright, so a caller that generates
-    candidates instead of enumerating them cannot apply the geometry and forget
-    the filters.
-
-    A producer rejected for LX is excluded outright. Otherwise, check each
-    producer-consumer edge independently. A broadcasting clone may read its
-    input from HBM and still keep its completed output in LX for a matching
-    consumer. Candidate-specific checks are in :meth:`parent_view` and
-    :meth:`consumer_view`.
-    """
-
-    buf_name: str
-    parent_op: Operation
-    consumer_op: Operation
-    write_dep: MemoryDep
-    read_dep: MemoryDep
-    prep_cache: dict
-
-    def parent_view(self, splits: dict[sympy.Symbol, int]) -> Optional[PerCoreView]:
-        """The producer's write-view under ``division``, or ``None`` when that
-        candidate cannot host a readable residency: a partial-reduction write
-        (output not final) or an unrepresentable slicing. Matching compares
-        the complete per-core views, including all split dimensions."""
-        view, partial, repr_ok = _view_for_div(
-            self.parent_op, self.write_dep, self.buf_name, splits, self.prep_cache
-        )
-        if not repr_ok or partial:
-            return None
-        return view
-
-    def consumer_view(self, splits: dict[sympy.Symbol, int]) -> Optional[PerCoreView]:
-        """The consumer's read-view under ``division``, or ``None`` when its
-        slicing of the buffer is unrepresentable -- we never pin on a slicing
-        we cannot verify."""
-        view, _partial, repr_ok = _view_for_div(
-            self.consumer_op, self.read_dep, self.buf_name, splits, self.prep_cache
-        )
-        return view if repr_ok else None
-
-    @staticmethod
-    def _cores_used(splits: dict[sympy.Symbol, int]):
-        return math.prod(splits.values())
-
-    def match_pairs(
-        self,
-        parent_divisions: Sequence[dict[sympy.Symbol, int]],
-        consumer_divisions: Sequence[dict[sympy.Symbol, int]],
-    ) -> list[tuple[int, int]]:
-        """Compatible ``(parent index, consumer index)`` pairs, with each side's
-        view computed once per candidate rather than once per pair."""
-        parent_views = [self.parent_view(cd) for cd in parent_divisions]
-        consumer_views = [self.consumer_view(cd) for cd in consumer_divisions]
-        return [
-            (i, j)
-            for i, parent_view in enumerate(parent_views)
-            if parent_view is not None
-            for j, consumer_view in enumerate(consumer_views)
-            if consumer_view is not None
-            and parent_view.same_partition(consumer_view)
-            and self._cores_used(parent_divisions[i])
-            == self._cores_used(consumer_divisions[j])
-        ]
-
-
-def build_residency_edge(
-    buf_name: str,
-    parent_op: Operation,
-    consumer_op: Operation,
-    consumer_reads: Iterable[Dep],
-    residency_reason: Optional[str],
-    prep_cache: dict,
-) -> Optional[ResidencyEdge]:
-    """The :class:`ResidencyEdge` for this producer-consumer pair, or ``None``
-    when the edge can never host a residency."""
-    if residency_reason is not None:
-        return None
-    write_dep = next(
-        (
-            w
-            for w in op_read_writes(parent_op).writes
-            if w.name == buf_name and isinstance(w, MemoryDep)
-        ),
-        None,
-    )
-
-    def wrapped_hasattr(obj, attr):
-        try:
-            return hasattr(obj, attr)
-        except NotImplementedError:
-            return False
-
-    read_dep = next(
-        (r for r in consumer_reads if r.name == buf_name and isinstance(r, MemoryDep)),
-        None,
-    )
-    if write_dep is None or read_dep is None:
-        return None
-    return ResidencyEdge(
-        buf_name=buf_name,
-        parent_op=parent_op,
-        consumer_op=consumer_op,
-        write_dep=write_dep,
-        read_dep=read_dep,
-        prep_cache=prep_cache,
-    )
 
 
 def _fixed_core_division(op: Operation) -> CoreDivision:
@@ -2158,6 +2014,27 @@ def _intern_view_group(groups: dict[PerCoreView, int], view: PerCoreView) -> int
     return index
 
 
+class _DivisionMap(NamedTuple):
+    """Every op's core-division candidates, and which of those lists are the
+    whole legal space.
+
+    A generated division has to be one the enumeration would have carried, so a
+    solver may only generate for an op in ``enumerated``. An op pinned to its
+    committed division (an offset-mutation component) or one whose candidates
+    came from the pruning heuristic is deliberately narrower than its legal
+    space, and is absent.
+    """
+
+    divisions: dict[str, list[CoreDivision]]
+    enumerated: set[str]
+
+
+#: Prefix ``coarse_tile`` gives a staged read copy it mints (Pass 1). Matched
+#: here rather than imported so the allocator does not depend on that module at
+#: import time; ``coarse_tile`` tests the same prefix the same way.
+_READ_COPY_PREFIX = "coarse_tile_read_copy_"
+
+
 class CoOptimizingAllocator(ScratchpadAllocator):
     def __init__(
         self,
@@ -2210,10 +2087,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
     ) -> Sequence[Any]:
         # Joint selection derives its own divisions; fixed-division plans do not apply.
         in_place = self._determine_in_place_division_invariant(graph)
-        buffers = self._build_cd_bound_buffers(
-            graph, in_place, self._division_map(graph)
-        )
-        return buffers
+        return self._build_cd_bound_buffers(graph, in_place, self._division_map(graph))
 
     def _solve(self, solver: MemoryPlanSolver, graph: GraphLowering) -> Sequence[Any]:
         assert isinstance(solver, CoreDivisionLayoutSolver)
@@ -2370,7 +2244,17 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         decision variables. The extractor reads each arg's symbolic residency
         from ``is_lx`` (built once by the caller over all of ``buffers``, not
         per op); ``buffers`` itself supplies this op's own candidate divisions.
+
+        The coarse tiling is the third undecided thing, and the one this
+        allocator used to hide from the model entirely: ``_post_solve`` applies
+        the solver's chosen tilings *after* this runs, so every op was extracted
+        at ``loop_trip=1`` and the expression carried no tiling at all. The
+        buffer's ``sym_tile_counts`` is that decision as symbols, one per axis
+        its tiling space offers a level on, and is empty for every engine and
+        every configuration that cannot choose one -- which is what leaves the
+        expression exactly as it was.
         """
+        from torch_spyre._inductor.cost_model import ProspectiveTiling
         from torch_spyre._inductor.dump_cost_model import extract_op_features
         from torch_spyre._inductor.scratchpad.sa_cooptimizer import _work_slices
 
@@ -2378,7 +2262,9 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         buffer = buffers[output_name]
         division = CoreDivision(splits=buffer.sym_core_divs)
         ws = _work_slices(op, division)
-        return extract_op_features(op, ws, is_lx=is_lx)
+        tile_counts = buffer.sym_tile_counts
+        tiling = ProspectiveTiling(tile_counts) if tile_counts else None
+        return extract_op_features(op, ws, is_lx=is_lx, tiling=tiling)
 
     def _finalize_lx_relayout_allocation(
         self,
@@ -2437,10 +2323,23 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         allocation: Sequence[Any],
         accepted_lx_relayouts: Sequence[LXRelayoutPlan],
     ) -> None:
+        # Apply before commit. ``commit_iteration_space_ownership`` builds the
+        # ownership off ``iteration_space_from_op``, whose symbols come from the
+        # write dep's ranges -- which ``_divide_ranges`` invalidates. Committing
+        # afterwards derives both the split map and the core mapping against the
+        # already-divided op instead of migrating a stale object, and
+        # ``coarse_tile`` reads no ownership of its own, so the one
+        # ``_distribute_work`` left is simply overwritten.
+        tiled = self._apply_chosen_tilings(graph, allocation)
+        self._check_priced_footprints(graph, allocation, tiled)
         # The divisions must be committed such that any buffer clones can correctly
         # pull the selected core division from the dependent buffers when the graph
         # is updated with clones in ``_push_allocation``.
         self._commit_divisions(graph, allocation)
+        # After the commit, and before the views below are derived from it: a
+        # staged read copy is not in ``allocation``, so nothing above gave it a
+        # division and it would be judged against its reader's as a mismatch.
+        self._commit_staged_read_copy_divisions(graph, allocation)
         # A solver-fired relayout source stays resident under ITS committed view
         # while the consumer it feeds will read the shuffled copy under another.
         # The judge runs on the pre-materialization graph, where that consumer
@@ -2453,10 +2352,18 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             plan.source_name: plan.source_view for plan in accepted_lx_relayouts
         }
         _, reasons, views = get_ncores_for_buffers(graph)
+        # Before the loop below, which walks the buffers the solve placed: a
+        # staged read copy is not among them (the apply created it) and needs
+        # the views this call just built.
+        self._stamp_staged_read_copies(graph, allocation, views)
         for buffer in allocation:
-            # A relayout copy is not a graph buffer: materialize_lx_relayouts
-            # creates its destination, carrying the plan's view.
-            if buffer.address is None or isinstance(buffer, RelayoutCopyBuffer):
+            # Neither synthetic buffer is a graph buffer: materialize_lx_relayouts
+            # creates a relayout copy's destination (carrying the plan's view),
+            # and a coarse-tile read copy is created by the apply, which stamps
+            # its own view (_stamp_read_copy_allocations).
+            if buffer.address is None or isinstance(
+                buffer, (RelayoutCopyBuffer, CoarseTileReadCopyBuffer)
+            ):
                 continue
             view = source_views.get(buffer.name) or views.get(buffer.name)
             if view is None:
@@ -2475,7 +2382,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         assert isinstance(solver, CoreDivisionLayoutSolver)
         return solver.spill_reasons
 
-    def _division_map(self, graph: GraphLowering) -> dict[str, list[CoreDivision]]:
+    def _division_map(self, graph: GraphLowering) -> "_DivisionMap":
         """Per-op core-division candidates for the joint-division solve.
 
         Every op gets at least one ``CoreDivision`` so the slicing-match gate can
@@ -2521,6 +2428,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             },
         )
         result = {}
+        enumerated = set()
         for op in graph.operations:
             reason: Optional[str] = None
             if _is_cpu_host_buffer(op):
@@ -2556,7 +2464,9 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                         op, [_fixed_core_division(op)], "empty pruned candidate set"
                     )
             else:
-                divs = self._enumerate_core_divisions(op, max_cores)
+                divs, is_enumeration = self._enumerate_core_divisions(op, max_cores)
+                if is_enumeration:
+                    enumerated.add(op.name)
             if not divs:
                 raise Unsupported(f"{op.name}: no legal core-division candidates.")
             # The core budget is an invariant of the MENU, not of its consumers: both
@@ -2575,27 +2485,29 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             )
             result[op.name] = divs
 
-        return result
+        return _DivisionMap(result, enumerated)
 
     def _enumerate_core_divisions(
         self, op: Operation, max_cores: int
-    ) -> list[CoreDivision]:
-        """Enumerate and deduplicate symbol-keyed candidates for one operation.
+    ) -> tuple[list[CoreDivision], bool]:
+        """Enumerate and deduplicate symbol-keyed candidates for one operation,
+        with whether they are the *whole* legal cross product.
 
         Operations without an enumerable concrete iteration space retain their
-        committed division. Deduplication uses local symbol names only within
-        this operation; cross-operation compatibility is derived from
-        ``PerCoreView`` instead.
+        committed division, and say so: a solver may only generate divisions of
+        its own where the candidates it was handed are the entire legal space.
+        Deduplication uses local symbol names only within this operation;
+        cross-operation compatibility is derived from ``PerCoreView`` instead.
         """
         fixed = [_fixed_core_division(op)]
         if not isinstance(op, ComputedBuffer) or not isinstance(
             op.data, (Pointwise, Reduction)
         ):
-            return fixed
+            return fixed, False
         try:
             candidates = enumerate_work_division_candidates(op, max_cores)
         except Unsupported as exc:
-            return _legal_fixed_division(op, fixed, str(exc))
+            return _legal_fixed_division(op, fixed, str(exc)), False
         cds: list[CoreDivision] = []
         seen: set[tuple] = set()
         for candidate in candidates:
@@ -2604,7 +2516,315 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             if key not in seen:
                 seen.add(key)
                 cds.append(division)
-        return cds or _legal_fixed_division(op, fixed, "no enumerable candidate")
+        if cds:
+            return cds, True
+        return _legal_fixed_division(op, fixed, "no enumerable candidate"), False
+
+    def _apply_chosen_tilings(
+        self,
+        graph: GraphLowering,
+        allocation: Sequence[CoreDivisionBuffer],
+    ) -> dict[str, TileSpec]:
+        """Apply the solver's chosen coarse tilings, returning them by buffer name.
+
+        The only consumer a chosen ``TileSpec`` has. Without it the search prices
+        the *per-tile* footprint and the packer lays LX out by it while the graph
+        writes the full extent, so the reserved interval is a fraction of the
+        real one -- which is why offering tilings is gated on this running, not
+        merely on it being useful.
+
+        **The anneal's placement stands.** Applying the tiling is what makes its
+        addresses true rather than stale, so there is no second placement round:
+        re-running a placement engine here would decouple the layout from the
+        divisions and tilings it was jointly chosen with, which is the coupling
+        this allocator exists for. The companion buffers the apply mints (a
+        full-extent ``full_buf`` per op whose output escapes its tiling group)
+        were not in the joint state, so they get no LX address and stay in HBM
+        -- which is what the solver's ``_companion_bytes`` prices them as.
+
+        **A refusal raises**, after a zero-mutation dry run so it raises on an
+        untouched graph. The search is supposed to propose only tilings
+        ``coarse_tile`` accepts -- ``OpSplitSpace.admits`` is meant to be
+        complete with respect to it -- so a refusal is a defect in that model
+        rather than a graph to route around, and dropping the tiling here would
+        also invalidate the addresses already spaced for it.
+        """
+        if not self._solver_chooses_tilings:
+            return {}
+        op_by_name = {op.name: op for op in graph.operations}
+        tiled: dict[str, TileSpec] = {}
+        choices: dict[str, TileSpec] = {}
+        for buffer in allocation:
+            if buffer.chosen_division is None:
+                continue
+            tiling = buffer.core_divisions[buffer.chosen_division].tiling
+            if tiling.is_untiled:
+                continue
+            op = op_by_name.get(buffer.name)
+            if op is None:
+                raise Unsupported(
+                    f"{buffer.name}: a coarse tiling ({tiling.label}) was chosen "
+                    "for a buffer with no producing operation, which nothing can "
+                    "apply it to"
+                )
+            tiled[buffer.name] = tiling
+            choices[op.get_operation_name()] = tiling
+        if not choices:
+            return {}
+        # Local import: ``coarse_tiling`` imports ``ScratchpadOptimizationPass``
+        # from this module, so a top-level import would be circular.
+        from torch_spyre._inductor.scratchpad.coarse_tiling import CoarseTilingPass
+
+        # Stage exactly the reads whose predicted copy the solve placed. A
+        # staged tile pays only by being resident -- unplaced it would land in
+        # HBM and cost a write and a read to save nothing -- so the residency
+        # decision and the decision to stage are the same decision, made once,
+        # here. The addresses are final at this point and not yet on the
+        # layouts (``_push_allocation`` runs after), which is why they are read
+        # off the buffers.
+        placed = {
+            buffer.pair
+            for buffer in allocation
+            if isinstance(buffer, CoarseTileReadCopyBuffer)
+            and buffer.address is not None
+        }
+        tiling_pass = CoarseTilingPass(choices, staged_reads=placed)
+        tiling_pass.plan_only(graph)
+        tiling_pass.apply_pass(graph)
+        # These ops' tilings and divisions were chosen together by one solve, so
+        # they are exempt from the pin that keeps *independent* choosers off a
+        # coarse-tile-local dim -- see ``coarse_tile_local_dim_split_domains``.
+        # Marked here and nowhere broader: an op the hint pass tiled carries
+        # ``loop_info`` before the menu is enumerated, so its candidates already
+        # respect the pin and must keep doing so.
+        for name in tiled:
+            setattr(op_by_name[name], JOINT_TILING_AND_DIVISION_ATTR, True)
+        logger.info(
+            "applied a coarse tiling to %d op(s): %s",
+            len(choices),
+            ", ".join(f"{name}={spec.label}" for name, spec in sorted(choices.items())),
+        )
+        return tiled
+
+    def _commit_staged_read_copy_divisions(
+        self,
+        graph: GraphLowering,
+        allocation: Sequence[CoreDivisionBuffer],
+    ) -> None:
+        """Give each staged read copy its reader's core division.
+
+        The copy is minted by the apply, so ``_commit_divisions`` never sees it
+        and it keeps whatever ``_distribute_work`` left -- typically all 32
+        cores, while its reader may have committed to one. ``get_ncores_for_buffers``
+        then reports a core-division mismatch and withholds the physical
+        ownership residency needs, so the copy cannot be placed however the
+        solve decided. Measured: without this the stamp below raises "no
+        accepted physical ownership" on the first copy it tries.
+
+        The reader's splits are mapped onto the copy's own iteration symbols
+        **positionally**. That is sound for exactly the reads this route stages:
+        ``_read_copy_can_be_sized`` admits a read only where the source's
+        non-unit dims and the reader's iteration extents correspond one to one,
+        which is the same correspondence being used here. A read outside that
+        class is never staged, so there is no case where the two frames differ.
+        """
+        placed = {
+            buffer.pair: buffer
+            for buffer in allocation
+            if isinstance(buffer, CoarseTileReadCopyBuffer)
+            and buffer.address is not None
+        }
+        if not placed:
+            return
+        by_name = {b.name: b for b in allocation}
+        for op, _source, readers in self._staged_read_copies(graph):
+            if not readers:
+                continue
+            reader = by_name.get(readers[0])
+            if reader is None or reader.chosen_division is None:
+                continue
+            splits = reader.core_divisions[reader.chosen_division].splits
+            symbols = list(iteration_space_from_op(op))
+            reader_op = graph.get_buffer(reader.name)
+            reader_symbols = list(iteration_space_from_op(reader_op))
+            mapped = {
+                symbols[position]: factor
+                for position, source_symbol in enumerate(reader_symbols)
+                if position < len(symbols)
+                and (factor := splits.get(source_symbol, 1)) > 1
+            }
+            commit_iteration_space_ownership(op, mapped)
+
+    @staticmethod
+    def _staged_read_copies(
+        graph: GraphLowering,
+    ) -> list[tuple[Operation, Optional[str], list[str]]]:
+        """``(copy op, the buffer it stages, the ops reading it)`` for every read
+        copy the apply minted, readers in operations order.
+
+        Identified by name prefix and then by dependency rather than by a plan
+        the pass hands back: the copy's one read names its source, and the ops
+        reading the copy are the consumers Pass 1 patched. That pair is what the
+        prediction was keyed on, so it is what joins the two.
+        """
+        minted = [
+            op
+            for op in graph.operations
+            if str(getattr(op, "name", "")).startswith(_READ_COPY_PREFIX)
+        ]
+        minted_names = {op.name for op in minted}
+        readers_of: dict[str, list[str]] = {}
+        source_of: dict[str, Optional[str]] = {}
+        for op in graph.operations:
+            name = getattr(op, "name", None)
+            if name is None:
+                continue
+            try:
+                reads = [
+                    dep
+                    for dep in op.get_read_writes().reads
+                    if isinstance(dep, MemoryDep)
+                ]
+            except Exception:  # noqa: BLE001 - best-effort match
+                continue
+            if name in minted_names:
+                sources = {dep.name for dep in reads}
+                source_of[name] = next(iter(sources)) if len(sources) == 1 else None
+            for dep in reads:
+                if dep.name in minted_names:
+                    readers_of.setdefault(dep.name, []).append(name)
+        return [
+            (op, source_of.get(op.name), readers_of.get(op.name, [])) for op in minted
+        ]
+
+    def _stamp_staged_read_copies(
+        self,
+        graph: GraphLowering,
+        allocation: Sequence[CoreDivisionBuffer],
+        views: Mapping[str, Any],
+    ) -> None:
+        """Give each staged read copy the LX address the solve reserved for it.
+
+        The copy is created by the apply, in ``_post_solve``, so it is not in
+        the ``allocation`` sequence ``_push_allocation`` walks and would
+        otherwise land in HBM however the solve decided -- which is exactly the
+        ordering that makes a companion unplaceable. What is placed is the
+        *predicted* buffer (:class:`CoarseTileReadCopyBuffer`), and this is
+        where the two are joined.
+
+        Matched by ``(source, first reader)`` rather than by name, since the
+        minted buffer is named by Inductor: the copy's one read names the
+        source, and the ops reading the copy are the consumers Pass 1 patched,
+        the first of which is the entry's own sizing op. That is the same pair
+        the placement was handed to ``CoarseTilingPass`` under, so a copy with
+        no prediction is a break between the two and raises rather than
+        silently keeping an HBM copy nothing priced.
+
+        The footprint check is :meth:`_check_priced_footprints`' argument in the
+        other direction: an applied footprint *larger* than the reserved one
+        means the LX interval spaced for this copy is too small and the bytes
+        above it belong to whatever was packed next.
+        """
+        placed = {
+            buffer.pair: buffer
+            for buffer in allocation
+            if isinstance(buffer, CoarseTileReadCopyBuffer)
+            and buffer.address is not None
+        }
+        if not placed:
+            return
+        for op, source, readers in self._staged_read_copies(graph):
+            pair = (source, readers[0]) if source and readers else None
+            buffer = placed.get(pair) if pair is not None else None
+            if buffer is None:
+                raise Unsupported(
+                    f"{op.name}: the apply staged a read of {source!r} for "
+                    f"{readers[:1]} that the solve placed no copy for, so it "
+                    "would sit in HBM unpriced"
+                )
+            layout = graph.get_buffer(op.name).get_layout()
+            device_layout = getattr(layout, "device_layout", None)
+            reader = next(b for b in allocation if b.name == buffer.reader)
+            assert reader.chosen_division is not None
+            chosen = reader.core_divisions[reader.chosen_division]
+            reserved = ceil_div(
+                buffer.size,
+                chosen.output_partition * chosen.tiling.output_tile_count,
+            )
+            if device_layout is not None:
+                applied = ceil_div(
+                    get_device_size_in_bytes(device_layout), chosen.output_partition
+                )
+                if applied > reserved:
+                    raise Unsupported(
+                        f"{op.name}: staged read copy of {source} reserved "
+                        f"{reserved} bytes per core but the applied graph needs "
+                        f"{applied}; its LX interval is too small"
+                    )
+            address = buffer.address
+            assert address is not None  # `placed` filtered on it
+            self._set_one_allocation(
+                graph.get_buffer(op.name), address, views.get(op.name)
+            )
+            logger.debug(
+                "staged read copy %s (%s -> %s) placed in LX at %d",
+                op.name,
+                source,
+                buffer.reader,
+                address,
+            )
+
+    def _check_priced_footprints(
+        self,
+        graph: GraphLowering,
+        allocation: Sequence[CoreDivisionBuffer],
+        tiled: dict[str, TileSpec],
+    ) -> None:
+        """Every tiled buffer's applied per-core footprint is the one it was
+        placed at, or this raises.
+
+        The search divides the buffer's *total* size by
+        ``output_partition * output_tile_count``; the apply divides the op's
+        ranges per dim and rebuilds the device layout through
+        ``_resize_device_layout``. Those agree only if resizing divides the
+        device byte size exactly -- plausible, since ``build_tiling_space`` never
+        tiles the stick dim, but per-dim device padding could re-round. An
+        applied footprint *larger* than the priced one is stage 3's overlap
+        hazard again: the LX interval reserved for this buffer is too small and
+        the bytes above it belong to whatever was packed next.
+
+        This is the guard that replaces refusing a tiled resident buffer
+        outright. That predicate asked whether a tiling had been chosen for a
+        buffer in LX -- which is the outcome the search exists to produce, so it
+        would now refuse the feature working. The question worth asking is the
+        narrower one: is the tiling this buffer was priced at the one the graph
+        ended up with.
+        """
+        for buffer in allocation:
+            tiling = tiled.get(buffer.name)
+            if tiling is None:
+                continue
+            layout = graph.get_buffer(buffer.name).layout
+            device_layout = getattr(layout, "device_layout", None)
+            if device_layout is None:
+                raise Unsupported(
+                    f"{buffer.name}: tiled as {tiling.label} but carries no device "
+                    "layout to check the applied footprint against"
+                )
+            # ``_apply_chosen_tilings`` skips a buffer with no chosen division,
+            # so anything in ``tiled`` has one.
+            assert buffer.chosen_division is not None
+            partition = buffer.core_divisions[buffer.chosen_division].output_partition
+            applied = ceil_div(get_device_size_in_bytes(device_layout), partition)
+            priced = ceil_div(buffer.size, partition * tiling.output_tile_count)
+            if applied != priced:
+                raise Unsupported(
+                    f"{buffer.name}: placed at a per-core footprint of {priced} "
+                    f"bytes under tiling {tiling.label} ({buffer.size} bytes over "
+                    f"{partition} cores x {tiling.output_tile_count} tiles), but "
+                    f"the applied graph gives {applied}; its LX address is spaced "
+                    "for a footprint the graph does not have"
+                )
 
     def _commit_divisions(
         self,
@@ -2631,8 +2851,27 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             if not hasattr(op, "iteration_space_ownership"):
                 continue
             cd = buf.core_divisions[buf.chosen_division]
+            if not cd.tiling.is_untiled:
+                # The apply ran first, so this op's iteration space has been
+                # re-derived since the division was chosen. A split naming a
+                # symbol that no longer exists would not be rejected by
+                # ``make_iteration_space_ownership`` -- it reads
+                # ``splits.get(sym, 1)`` over the *live* space, so a stale key is
+                # dropped and the axis silently commits as unsplit.
+                live = set(iteration_space_from_op(op))
+                stale = sorted(str(sym) for sym in cd.splits if sym not in live)
+                if stale:
+                    raise Unsupported(
+                        f"{op.name}: applying {cd.tiling.label} left the chosen "
+                        f"division naming iteration symbols the op no longer has "
+                        f"({', '.join(stale)}); those splits would commit as 1"
+                    )
             if not _split_option_is_legal(op, cd.splits):
-                raise Unsupported(f"{op.name}: chosen split violates hard domain.")
+                raise Unsupported(
+                    f"{op.name}: chosen split violates hard domain "
+                    f"(division {cd.label}, tiling {cd.tiling.label}, ranges "
+                    f"{[str(r) for r in getattr(op.data, 'ranges', [])]})"
+                )
             commit_iteration_space_ownership(op, cd.splits)
 
     def _determine_in_place_division_invariant(
@@ -2726,16 +2965,24 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         self,
         graph: GraphLowering,
         in_place: Optional[dict[str, list[str]]],
-        divisions: dict[str, list[CoreDivision]],
+        division_map: "_DivisionMap",
     ) -> list[CoreDivisionBuffer]:
         """Build the ``CoreDivisionBuffer``s handed to the solver.
 
-        Every buffer carries its candidate ``divisions`` and is sized by its
+        Every buffer carries its candidate divisions and is sized by its
         *total* device footprint plus its producer edges (``parent_proj``); the
         solver picks a division and divides by its ``output_partition``.
         Counted-loop lifetimes still filter unsafe in-place handoffs before the
         solver compares those total footprints.
+
+        Each buffer also carries the same two relations *per candidate*, for a
+        solver that generates divisions rather than indexing the list: the
+        residency edge to each divided producer, and -- where the candidates are
+        the whole legal space and the solver is one that generates (see
+        :attr:`_solver_generates_divisions`) -- its op's split space, built with
+        this buffer's own cost symbols so a generated division stays priceable.
         """
+        divisions = division_map.divisions
         # Per-plan interning of relayout destination views (see
         # _cd_parent_relayouts): group ids are only meaningful within one plan.
         self._relayout_view_groups: dict[str, dict[PerCoreView, int]] = {}
@@ -2744,6 +2991,10 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         mem_usage = mem_usage_by_buf(graph)
         in_place = {} if in_place is None else in_place
         op_by_name = {op.name: op for op in graph.operations}
+        # Operation *order*, which the coarse-tiling run structure is measured
+        # over. Derived here rather than inferred in the solver from ``uses[0]``:
+        # the two agree for a computed buffer, but only this side actually knows.
+        position_by_name = {op.name: index for index, op in enumerate(graph.operations)}
         graph_output_names = set(graph.get_output_names())
 
         prep_cache: dict = {}
@@ -2830,6 +3081,9 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             )
             size = info["size"]  # total footprint; solver divides per chosen cd
             parent_proj = info["op_inputs"].copy()
+            residency_edges = self._parent_residency_edges(
+                op, parent_proj, op_by_name, prep_cache, residency_by_buf
+            )
             cd_parent_matches = self._cd_parent_matches(
                 op,
                 buf_divisions,
@@ -2838,6 +3092,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                 op_by_name,
                 prep_cache,
                 residency_by_buf,
+                edges=residency_edges,
             )
             cd_parent_relayouts = self._cd_parent_relayouts(
                 graph,
@@ -2916,29 +3171,173 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                 ):
                     parents.append(clone_name)
 
-            buffers.append(
-                CoreDivisionBuffer(
-                    output_name,
-                    size,
-                    uses,
-                    # An op output is a computed buffer: ``uses[0]`` is the
-                    # producing write, as on the placement path above. (Only the
-                    # input-clone loop above sets this True.)
-                    first_use_is_read=False,
-                    in_place_parents=parents,
-                    core_divisions=buf_divisions,
-                    parents=parent_proj,
-                    cd_parent_matches=cd_parent_matches,
-                    cd_parent_relayouts=cd_parent_relayouts,
-                    residency_reason=residency_reason,
-                    lifetime_end_override=lifetime_end_overrides.get(output_name),
-                    boundary=BufferType.Output
-                    if output_name in graph_output_names
-                    else BufferType.Intermediate,
-                )
+            buffer = CoreDivisionBuffer(
+                output_name,
+                size,
+                uses,
+                # An op output is a computed buffer: ``uses[0]`` is the
+                # producing write, as on the placement path above. (Only the
+                # input-clone loop above sets this True.)
+                first_use_is_read=False,
+                in_place_parents=parents,
+                core_divisions=buf_divisions,
+                parents=parent_proj,
+                cd_parent_matches=cd_parent_matches,
+                cd_parent_relayouts=cd_parent_relayouts,
+                residency_edges=residency_edges,
+                residency_reason=residency_reason,
+                lifetime_end_override=lifetime_end_overrides.get(output_name),
+                op_position=position_by_name.get(output_name),
+                boundary=BufferType.Output
+                if output_name in graph_output_names
+                else BufferType.Intermediate,
             )
+            if (
+                op is not None
+                and output_name in division_map.enumerated
+                and self._solver_generates_divisions
+            ):
+                buffer.division_space = self._division_space(op, buffer)
+            buffers.append(buffer)
         buffers.extend(self._relayout_copy_buffers(buffers, self.size))
+        buffers.extend(self._coarse_tile_read_copies(graph, buffers))
         return buffers
+
+    def _coarse_tile_read_copies(
+        self,
+        graph: GraphLowering,
+        buffers: Sequence[CoreDivisionBuffer],
+    ) -> list[CoarseTileReadCopyBuffer]:
+        """One :class:`CoarseTileReadCopyBuffer` per (source, tileable reader)
+        pair the apply could stage, minted here so the solve can place it.
+
+        The apply mints its copies in ``_post_solve``, after the addresses are
+        final, so a copy it creates can only ever be in HBM -- and an HBM staging
+        tile is strictly worse than the read it replaces. Predicting the copy
+        here is what lets its residency be one of the things the solve decides,
+        and residency is the whole point of it: the source itself may not be
+        resident while a tiled op reads it (see
+        ``SaCoOptimizingSolver._read_across_a_tiling_boundary``), and this copy
+        is the same operand at an address that does not move.
+
+        **Predicted per (source, reader), not per group.** Which ops share one
+        staged copy is a property of the tiling groups, which do not exist yet.
+        The apply stages a read only where *its own* sizing op's copy was placed,
+        so a pair the solve declined costs nothing, and a group whose sizing op
+        is not the placed reader leaves that reservation unused. Over-reserving
+        is the safe direction: a copy the search assumed and the apply does not
+        mint wastes LX, while one the apply mints and the search did not assume
+        overruns it.
+
+        **``reads`` is counted over the maximal contiguous run of tileable ops**
+        containing the reader, which is an upper bound on the group the apply
+        will form (stage 4 makes every group a contiguous run of tileable ops,
+        so a group is a sub-run of this one). It is an upper bound rather than
+        the reader's own count because that count is 1 in the case this exists
+        for -- two ops of a run each reading the same operand once -- where the
+        saving is real and a per-op count would price it at zero. The bound is
+        loose in the other direction, so a placed copy can save less than it
+        scored; that is a mispricing of the same kind as ``_companion_bytes``'s
+        own two, and it is bounded by the run length.
+
+        Three static filters, all of them the apply's own: the reader must be
+        tileable, the read must be one ``_full_buffer_read_deps`` would offer (a
+        non-indirect ``MemoryDep`` on a buffer this op does not produce), and the
+        copy must be sizable against the source's committed layout
+        (``_read_copy_can_be_sized``), which refuses every broadcast and matmul
+        operand -- the class ``TODO(span-overflow-read-copy)`` covers.
+        """
+        if not self._solver_chooses_tilings:
+            return []
+        from torch_spyre._inductor.wsr.coarse_tile import _read_copy_can_be_sized
+
+        by_name = {b.name: b for b in buffers}
+        op_by_name = {op.name: op for op in graph.operations if hasattr(op, "name")}
+
+        def tileable(buffer: CoreDivisionBuffer) -> bool:
+            space = buffer.division_space
+            return (
+                space is not None
+                and space.tiling is not None
+                and not space.tiling.is_empty
+                and buffer.op_position is not None
+            )
+
+        def staged_reads(buffer: CoreDivisionBuffer) -> dict[str, int]:
+            """``source -> read count`` for the reads of ``buffer``'s op that
+            the apply could stage."""
+            op = op_by_name.get(buffer.name)
+            if op is None:
+                return {}
+            try:
+                deps = op.get_read_writes().reads
+            except Exception:  # noqa: BLE001 - best-effort prediction
+                return {}
+            counts: dict[str, int] = {}
+            for dep in deps:
+                if not isinstance(dep, MemoryDep) or dep.is_indirect():
+                    continue
+                if dep.name == buffer.name or dep.name not in by_name:
+                    continue
+                if not _read_copy_can_be_sized(dep):
+                    continue
+                counts[dep.name] = counts.get(dep.name, 0) + 1
+            return counts
+
+        index_of = {buffer.name: index for index, buffer in enumerate(buffers)}
+        ordered = sorted(
+            (b for b in buffers if tileable(b)),
+            key=lambda b: cast(int, b.op_position),
+        )
+        copies: list[CoarseTileReadCopyBuffer] = []
+        run_start = 0
+        while run_start < len(ordered):
+            run_end = run_start
+            while (
+                run_end + 1 < len(ordered)
+                and cast(int, ordered[run_end + 1].op_position)
+                == cast(int, ordered[run_end].op_position) + 1
+            ):
+                run_end += 1
+            run = ordered[run_start : run_end + 1]
+            per_reader = {buffer.name: staged_reads(buffer) for buffer in run}
+            totals: dict[str, int] = {}
+            for counts in per_reader.values():
+                for source, count in counts.items():
+                    totals[source] = totals.get(source, 0) + count
+            for buffer in run:
+                for source in sorted(per_reader[buffer.name]):
+                    if totals[source] < 2:
+                        # A staged tile standing in for one read saves nothing:
+                        # the saving is over the reads it replaces beyond the
+                        # first, and the copy op itself makes that first one.
+                        # Predicting it anyway would give the search a slot it
+                        # can fill for free and a reason never to give back, so
+                        # it would sit in LX displacing buffers that do pay.
+                        continue
+                    copies.append(
+                        CoarseTileReadCopyBuffer(
+                            name=coarse_tile_read_copy_name(source, buffer.name),
+                            size=by_name[source].size,
+                            # Live for as long as the reader is: the copy op
+                            # writes the tile at the reader's first tick and the
+                            # reader is its only consumer.
+                            uses=list(buffer.uses),
+                            first_use_is_read=False,
+                            in_place_parents=[],
+                            core_divisions=[CoreDivision()],
+                            parents=[],
+                            cd_parent_matches={},
+                            residency_reason=None,
+                            boundary=BufferType.Intermediate,
+                            source=source,
+                            reader=buffer.name,
+                            reader_index=index_of[buffer.name],
+                            reads=totals[source],
+                        )
+                    )
+            run_start = run_end + 1
+        return copies
 
     @staticmethod
     def _loop_carry_update_edge(
@@ -3040,6 +3439,66 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                 capacity,
             )
         return copies
+
+    @property
+    def _solver_generates_divisions(self) -> bool:
+        """Whether the solver this allocator feeds generates divisions at all.
+
+        Only :class:`SaCoOptimizingSolver` does; the CP-SAT and DFS engines read
+        ``core_divisions`` and ``cd_parent_matches`` exactly as before and would
+        never look at a space. Building one is not free -- a
+        ``WorkDivisionContext`` and a factor domain per axis, per buffer -- so an
+        engine that would ignore the answer does not pay for it.
+
+        Which engine it is *is* the switch, as far as a user is concerned:
+        ``select_allocator`` reaches this solver from exactly two settings
+        (``co_optimizing_lx_planning`` plus
+        ``layout_solver = "simulated_annealing"``), and a separate flag on top
+        could only ever disagree with them.
+        """
+        return self.layout_planning is SaCoOptimizingSolver
+
+    @property
+    def _solver_chooses_tilings(self) -> bool:
+        """Whether the solver this allocator feeds picks coarse tilings too.
+
+        Only a generated division can carry a ``TileSpec`` -- the enumeration
+        has none to offer, so an engine that indexes it could not choose one if
+        it wanted to. Hence :attr:`_solver_generates_divisions`.
+
+        The other conjunct is ``config.auto_coarse_tiling``, off by default.
+        Unlike the rest of this allocator's behaviour, that *is* a user setting
+        rather than a consequence of which engine runs: a refusal from the apply
+        raises rather than falling back, and nothing yet prices the loop cost
+        above the split cap, so the two together make turning this on a
+        deliberate act. See the flag's own comment.
+        """
+        return config.auto_coarse_tiling and self._solver_generates_divisions
+
+    def _division_space(
+        self, op: Operation, buffer: CoreDivisionBuffer
+    ) -> Optional[OpSplitSpace]:
+        """The op's split space, priced through ``buffer``'s own cost symbols.
+
+        The declaration is this buffer's ``sym_core_divs``, which is derived from
+        the candidate list -- so it is available only once the buffer exists,
+        which is why the space is attached here rather than where the candidates
+        are enumerated. A split on an axis outside it would be priced as
+        unsplit, so the space is what holds a generated division to it.
+
+        The tiling half is attached only for the solver that can use it (see
+        :attr:`_solver_chooses_tilings`): deriving it costs a stick-alignment
+        analysis per output dim, so an engine that would ignore the answer does
+        not pay for it.
+        """
+        tiling = (
+            build_tiling_space(op, include_reductions=False)
+            if self._solver_chooses_tilings
+            else None
+        )
+        return build_op_split_space(
+            op, config.sencores, buffer.sym_core_divs, tiling=tiling
+        )
 
     def _eligible_clone_inputs(
         self, graph: GraphLowering, lifetimes: dict[str, list[int]]
@@ -3161,29 +3620,22 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         # >=1-division invariant.
         return clone_divs, matches
 
-    def _cd_parent_matches(
-        self,
+    @staticmethod
+    def _parent_residency_edges(
         consumer_op: Optional[Operation],
-        consumer_divs: list[CoreDivision],
         parent_names: list[str],
-        divisions: dict[str, list[CoreDivision]],
         op_by_name: dict[str, Operation],
         prep_cache: dict,
         residency_by_buf: dict[str, Optional[str]],
-    ) -> dict[str, list[tuple[int, int]]]:
-        """Physical slicing-match pairs for each divided producer this op reads.
-
-        One :class:`ResidencyEdge` per producer decides both which candidate
-        pairs are compatible and which producers are excluded from matching
-        altogether; this is the pair-table materialization of it. The pairing is
-        the per-core-view comparison ``get_ncores_for_buffers`` uses -- correct
-        across reductions/reshapes, where a coeff-keyed signature would conflate
-        axes.
-        """
+    ) -> dict[str, ResidencyEdge]:
+        """One :class:`ResidencyEdge` per divided producer this op reads, which
+        decides both which candidate pairs are compatible and which producers
+        are excluded from matching altogether. A producer with no entry can host
+        no residency for this consumer at all."""
         if consumer_op is None:
             return {}
-        matches: dict[str, list[tuple[int, int]]] = {}
         consumer_reads = op_read_writes(consumer_op).reads
+        edges: dict[str, ResidencyEdge] = {}
         for parent in parent_names:
             if parent not in op_by_name:
                 continue
@@ -3195,13 +3647,41 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                 residency_by_buf.get(parent, "not in graph"),
                 prep_cache,
             )
-            if edge is None:
-                continue
-            matches[parent] = edge.match_pairs(
+            if edge is not None:
+                edges[parent] = edge
+        return edges
+
+    def _cd_parent_matches(
+        self,
+        consumer_op: Optional[Operation],
+        consumer_divs: list[CoreDivision],
+        parent_names: list[str],
+        divisions: dict[str, list[CoreDivision]],
+        op_by_name: dict[str, Operation],
+        prep_cache: dict,
+        residency_by_buf: dict[str, Optional[str]],
+        edges: Optional[dict[str, ResidencyEdge]] = None,
+    ) -> dict[str, list[tuple[int, int]]]:
+        """Physical slicing-match pairs for each divided producer this op reads:
+        the pair-table materialization of :meth:`_parent_residency_edges`.
+
+        The pairing is the per-core-view comparison ``get_ncores_for_buffers``
+        uses -- correct across reductions/reshapes, where a coeff-keyed
+        signature would conflate axes. ``edges`` passes in an already-built
+        edge set; a caller that keeps the edges themselves still goes through
+        here, so this stays the one place the table is produced.
+        """
+        if edges is None:
+            edges = self._parent_residency_edges(
+                consumer_op, parent_names, op_by_name, prep_cache, residency_by_buf
+            )
+        return {
+            parent: edge.match_pairs(
                 [cd.splits for cd in divisions[parent]],
                 [cd.splits for cd in consumer_divs],
             )
-        return matches
+            for parent, edge in edges.items()
+        }
 
     @staticmethod
     def _cap_relayout_groups(

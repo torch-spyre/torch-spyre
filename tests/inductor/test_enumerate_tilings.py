@@ -12,11 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Device-free tests for the tiling-option enumerator.
+"""Device-free tests for the tiling-option space and its enumeration.
 
-The enumerator is pure and unconsumed, so these tests need no solver and no
-device: they build the same lightweight ``FixedTiledLayout`` ops the
-span-overflow tests use and assert the returned ``TileSpec`` set directly.
+The predicates are pure, so these tests need no solver and no device: they
+build the same lightweight ``FixedTiledLayout`` ops the span-overflow tests use
+and assert the returned ``TileSpec`` set directly. ``TestTilingSpace`` pins the
+seam a generating search asks instead of the list -- that the space and the
+enumeration answer alike, and what one move-alphabet step reaches.
 """
 
 import itertools
@@ -37,6 +39,7 @@ from torch_spyre._inductor.scratchpad.plan_solver import TileAxis, TileSpec
 from torch_spyre._inductor.wsr.enumerate_tilings import (
     _MAX_AUTO_TILE_SPLIT_COUNT,
     _reduction_split_counts,
+    build_tiling_space,
     enumerate_tile_options,
 )
 
@@ -243,6 +246,169 @@ class TestNoBadReductionOptions(unittest.TestCase):
                     self.assertLessEqual(len(red_axes), 1, spec.label)
                     # Never an output axis and a reduction axis together.
                     self.assertFalse(red_axes and out_axes, spec.label)
+
+
+class TestTilingSpace(unittest.TestCase):
+    """The space a generating search asks, and its agreement with the list.
+
+    Not a copy of the enumerator's own expectations: the declaration below is
+    over the *relation* between the two, so a change to either that does not
+    change the other shows up here.
+    """
+
+    def _space(self, op, **kwargs):
+        return build_tiling_space(op, **kwargs)
+
+    def test_the_space_admits_exactly_what_the_enumeration_carries(self):
+        # Untruncated, so the two sets are comparable in both directions: every
+        # emitted option is admitted, and every admitted option is emitted.
+        op = _pointwise_op((512, 256, 128))
+        space = self._space(op)
+        options = enumerate_tile_options(op, max_options=1000)
+        for spec in options:
+            self.assertTrue(space.admits(spec), spec.label)
+        self.assertEqual(set(space.enumerate()), set(options))
+        # Non-vacuity: there is something to disagree about.
+        self.assertGreater(len(options), 10)
+
+    def test_truncation_bounds_the_list_and_not_the_space(self):
+        # The reason a search generates: the cap is on what gets materialized.
+        op = _pointwise_op((512, 256, 128))
+        space = self._space(op)
+        capped = enumerate_tile_options(op, max_options=5)
+        beyond = [spec for spec in space.enumerate() if spec not in capped]
+        self.assertTrue(beyond)
+        for spec in beyond:
+            self.assertTrue(space.admits(spec), spec.label)
+
+    def test_admits_rejects_what_the_enumeration_never_emits(self):
+        space = self._space(_pointwise_op((512, 256, 128)))
+        self.assertFalse(space.admits(TileSpec((TileAxis(2, 2),))))  # stick dim
+        self.assertFalse(space.admits(TileSpec((TileAxis(0, 3),))))  # not a divisor
+        self.assertFalse(  # the same dim twice
+            space.admits(TileSpec((TileAxis(0, 2), TileAxis(0, 4))))
+        )
+        self.assertFalse(  # deeper than max_dims
+            space.admits(TileSpec((TileAxis(0, 2), TileAxis(1, 2), TileAxis(0, 2))))
+        )
+
+    def test_a_reduction_level_is_admitted_only_alone(self):
+        with patch.object(config, "enable_reduction_tiling", True):
+            space = self._space(_reduction_op((512, 256), (128,)))
+        red = TileAxis(host_dim=0, count=2, is_reduction=True)
+        self.assertTrue(space.admits(TileSpec((red,))))
+        self.assertFalse(space.admits(TileSpec((red, TileAxis(0, 2)))))
+
+    def test_admits_is_exactly_membership_in_the_enumeration(self):
+        # The safety argument for consuming the space's predicates instead of
+        # the enumerator's list, asserted in the direction that can break it:
+        # over *permutations*, not combinations, so a level order the
+        # enumeration cannot emit has to be refused.
+        space = self._space(_pointwise_op((512, 256, 128)))
+        emitted = set(space.enumerate())
+        for depth in range(1, space.max_dims + 2):
+            for dims in itertools.permutations(space.output_dims, depth):
+                for counts in itertools.product(*(space.counts(d) for d in dims)):
+                    spec = TileSpec(tuple(TileAxis(d, c) for d, c in zip(dims, counts)))
+                    self.assertEqual(space.admits(spec), spec in emitted, spec.label)
+
+    def test_every_neighbour_is_admitted_and_one_edit_away(self):
+        space = self._space(_pointwise_op((512, 256, 128)))
+        emitted = set(space.enumerate())
+        for spec in space.enumerate():
+            for candidate in space.neighbours(spec):
+                self.assertTrue(space.admits(candidate), candidate.label)
+                self.assertIn(candidate, emitted, candidate.label)
+                self.assertNotEqual(candidate, spec)
+                self.assertLessEqual(abs(candidate.depth - spec.depth), 1)
+
+    def test_the_alphabet_offers_every_move_type(self):
+        space = self._space(_pointwise_op((512, 256, 128)))
+        start = TileSpec((TileAxis(0, 2), TileAxis(1, 2)))
+        self.assertTrue(space.admits(start))
+        moves = space.neighbours(start)
+        self.assertIn(TileSpec((TileAxis(0, 4), TileAxis(1, 2))), moves)  # recount
+        self.assertIn(TileSpec((TileAxis(1, 2),)), moves)  # remove
+        # Add: reachable from a shallower spec, since ``max_dims`` is 2 here.
+        self.assertIn(
+            TileSpec((TileAxis(0, 2), TileAxis(1, 2))),
+            space.neighbours(TileSpec((TileAxis(0, 2),))),
+        )
+
+    def test_no_move_reorders_and_an_added_level_lands_canonically(self):
+        # Nest order is not a decision variable: a swap would be a free,
+        # always-accepted step, so the alphabet does not carry one and an added
+        # level sorts into place instead of nesting innermost.
+        space = self._space(_pointwise_op((512, 256, 128)))
+        start = TileSpec((TileAxis(0, 2), TileAxis(1, 2)))
+        self.assertNotIn(
+            TileSpec((TileAxis(1, 2), TileAxis(0, 2))), space.neighbours(start)
+        )
+        self.assertFalse(space.admits(TileSpec((TileAxis(1, 2), TileAxis(0, 2)))))
+        self.assertIn(
+            TileSpec((TileAxis(0, 2), TileAxis(1, 4))),
+            space.neighbours(TileSpec((TileAxis(1, 4),))),
+        )
+
+    def test_untiled_is_reachable_and_reaches_back(self):
+        # Undividing has to stay a single move, or the walk cannot leave a
+        # region it tiled.
+        space = self._space(_pointwise_op((512, 256, 128)))
+        self.assertIn(TileSpec(), space.neighbours(TileSpec((TileAxis(0, 2),))))
+        self.assertIn(TileSpec((TileAxis(0, 2),)), space.neighbours(TileSpec()))
+
+    def test_no_move_ever_proposes_a_reduction_level(self):
+        # v1 scope: output-axis tiling only, so a search seeded untiled never
+        # reaches a reduction spec even where the enumeration offers one.
+        with patch.object(config, "enable_reduction_tiling", True):
+            space = self._space(_reduction_op((512, 256), (128,)))
+        self.assertTrue(  # non-vacuity: the enumeration does offer them
+            any(not spec.is_clean for spec in space.enumerate())
+        )
+        seen = {TileSpec()}
+        frontier = [TileSpec()]
+        while frontier:
+            for candidate in space.neighbours(frontier.pop()):
+                if candidate not in seen:
+                    seen.add(candidate)
+                    frontier.append(candidate)
+        self.assertTrue(all(spec.is_clean for spec in seen))
+
+    def test_an_untileable_op_has_an_empty_space(self):
+        space = self._space(MagicMock())
+        self.assertTrue(space.is_empty)
+        self.assertEqual(space.enumerate(), [TileSpec()])
+        self.assertEqual(space.neighbours(TileSpec()), [])
+
+    def test_reduction_only_counts_still_report_an_empty_space(self):
+        # ``is_empty`` answers for the moves, not the enumeration: no move adds
+        # a reduction level, so an op whose only tileable axis is a reduction
+        # one is one a generating search can do nothing with.
+        with patch.object(config, "enable_reduction_tiling", True):
+            space = self._space(_reduction_op((7,), (128,)))
+        self.assertEqual(space.output_counts, {})
+        self.assertTrue(space.reduction_counts)  # non-vacuity
+        self.assertTrue(space.is_empty)
+        self.assertEqual(space.neighbours(TileSpec()), [])
+
+    def test_the_reduction_half_is_derived_only_when_asked(self):
+        with patch.object(config, "enable_reduction_tiling", True):
+            op = _reduction_op((512, 256), (128,))
+            self.assertTrue(build_tiling_space(op).reduction_counts)
+            self.assertEqual(
+                build_tiling_space(op, include_reductions=False).reduction_counts, {}
+            )
+
+    def test_an_op_the_hint_passes_already_tiled_is_offered_nothing(self):
+        # ``CoarseTilingPass`` stamps ``op.dim_hints`` wholesale, so a tiling
+        # chosen here for an already-hinted op would clobber the group it is
+        # part of. The marker both earlier passes leave set is the guard.
+        op = _pointwise_op((512, 256, 128))
+        self.assertFalse(self._space(op).is_empty)  # non-vacuity
+        op.dim_hints = [object()]
+        space = self._space(op)
+        self.assertTrue(space.is_empty)
+        self.assertEqual(space.enumerate(), [TileSpec()])
 
 
 if __name__ == "__main__":

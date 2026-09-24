@@ -38,10 +38,16 @@ import sympy
 from torch_spyre._inductor.cost_model import (
     ArgTraffic,
     OpFeatures,
+    ProspectiveTiling,
     _loop_reread_bytes,
     op_from_dict,
     predict_by_bundle,
     predict_ops,
+)
+from torch_spyre._inductor.dump_cost_model import (
+    _loop_factor_for_index,
+    _loop_features,
+    _tiled_symbols_per_level,
 )
 from torch_spyre._inductor.scratchpad.plan_solver import CoreDivision
 from torch_spyre._inductor.scratchpad.sa_cooptimizer import _work_slices
@@ -411,6 +417,147 @@ class SymbolicTiledFeatureTest(TestCase):
             self._leaked_symbols(expr),
             "a non-residency symbol leaked into the bundle-level cost",
         )
+
+
+class ProspectiveTilingTest(TestCase):
+    """Features extracted against a tiling nobody has applied yet.
+
+    ``CoOptimizingAllocator`` applies the solver's chosen tilings in
+    ``_post_solve``, after the features are built, so every op used to reach
+    ``predict_ops`` at ``loop_trip=1`` and the search optimized an expression
+    with no tiling in it. A :class:`ProspectiveTiling` states the axes an op
+    *may* tile and the symbol standing for each count, and the extractor stamps
+    the two features that are linear in it.
+    """
+
+    TILES = sympy.Symbol("tiles_buf0_d0", integer=True, positive=True)
+    OTHER = sympy.Symbol("tiles_buf0_d1", integer=True, positive=True)
+
+    def test_the_trip_count_is_the_product_over_levels(self):
+        d0, d1 = sympy.symbols("d0 d1")
+        self.assertEqual(ProspectiveTiling({}).trip, 1)
+        self.assertEqual(ProspectiveTiling({d0: self.TILES}).trip, self.TILES)
+        self.assertEqual(
+            ProspectiveTiling({d0: self.TILES, d1: self.OTHER}).trip,
+            self.TILES * self.OTHER,
+        )
+
+    def test_the_prospective_trip_replaces_the_ir_reading(self):
+        """``_loop_features`` never touches ``op.loop_info`` when a prospective
+        tiling is given -- it is the whole point that the graph is not tiled
+        yet. Both flags stay false: they gate branches, not values."""
+        d0 = sympy.Symbol("d0")
+        trip, tiles_red, tiles_out = _loop_features(
+            None, ProspectiveTiling({d0: self.TILES})
+        )
+        self.assertEqual(trip, self.TILES)
+        self.assertFalse(tiles_red)
+        self.assertFalse(tiles_out)
+
+    def test_an_empty_prospective_tiling_falls_through_to_the_ir(self):
+        # Which is what every caller but the co-optimizer passes, and what the
+        # co-optimizer passes for a buffer whose space offers no level.
+        self.assertEqual(_loop_features(None, ProspectiveTiling({})), (1, False, False))
+        self.assertEqual(_loop_features(None, None), (1, False, False))
+
+    def test_an_arg_repeats_at_a_level_its_index_does_not_carry(self):
+        """The asymmetry the whole per-arg factor exists for: an operand whose
+        address does not depend on the tiled axis is re-entered every iteration,
+        so it is transferred ``trip`` times; one that walks the axis is
+        transferred once. Static in the index, symbolic in the count."""
+        d0, d1 = sympy.symbols("d0 d1")
+        levels = _tiled_symbols_per_level(None, ProspectiveTiling({d0: self.TILES}))
+        self.assertEqual(levels, [(self.TILES, {d0}, 1)])
+        self.assertEqual(_loop_factor_for_index(d0 + 2048 * d1, levels), 1)
+        self.assertEqual(_loop_factor_for_index(d1, levels), self.TILES)
+
+    def test_two_levels_multiply_per_arg(self):
+        d0, d1 = sympy.symbols("d0 d1")
+        levels = _tiled_symbols_per_level(
+            None, ProspectiveTiling({d0: self.TILES, d1: self.OTHER})
+        )
+        self.assertEqual(_loop_factor_for_index(d0, levels), self.OTHER)
+        self.assertEqual(_loop_factor_for_index(d1, levels), self.TILES)
+        self.assertEqual(
+            _loop_factor_for_index(sympy.Symbol("r0"), levels),
+            self.TILES * self.OTHER,
+        )
+        self.assertEqual(_loop_factor_for_index(d0 + d1, levels), 1)
+
+    def _prospectively_tiled(self, op: OpFeatures) -> OpFeatures:
+        """``op`` as the co-optimizing path now presents it: an undecided trip
+        count, the output advancing (an output-axis level cuts a dim its write
+        index covers), and every input re-read once per iteration.
+
+        The per-arg factors are stated here rather than derived, because a
+        captured feature record carries no index expressions -- which index
+        carries the tiled symbol is :meth:`test_an_arg_repeats_at_a_level_its_
+        index_does_not_carry`'s subject. All-inputs-invariant is the worst case
+        and so the sharpest test of the substitution below.
+        """
+        args = [
+            dataclasses.replace(a, loop_factor=1 if a.role == "output" else self.TILES)
+            for a in op.args
+        ]
+        return dataclasses.replace(op, args=args, loop_trip=self.TILES)
+
+    def test_substituting_one_tile_reproduces_the_untiled_prediction(self):
+        """The parity this stage is gated on, at the level of one op: a tiling
+        symbol bound to 1 is *untiled*, so the model has to give back exactly
+        the number it gave before the symbol existed. It does because nothing
+        structural moved -- no flag, no derate, no branch."""
+        checked = 0
+        for gname, bname, b in _entries():
+            raw = next((f for f in b["features"] if f is not None), None)
+            if raw is None:
+                continue
+            untiled = op_from_dict(raw)
+            tiled = sympy.sympify(predict_ops([self._prospectively_tiled(untiled)]))
+            # Subset, not equality: an op with no input args (flash_attention's
+            # buf0) re-reads nothing, so the symbol cancels out of its price
+            # entirely. That it does NOT cancel where there is something to
+            # re-read is the next test.
+            self.assertLessEqual(tiled.free_symbols, {self.TILES}, f"{gname}/{bname}")
+            self.assertAlmostEqual(
+                float(tiled.subs(self.TILES, 1)),
+                float(predict_ops([untiled])),
+                places=6,
+                msg=f"{gname}/{bname}",
+            )
+            checked += 1
+        self.assertGreater(checked, 10)
+
+    def test_the_tile_count_raises_the_prediction_it_is_read_into(self):
+        """Non-vacuity for the test above: the substitution is not trivially
+        equal because the expression ignores the symbol. A re-read operand costs
+        more as the loop runs more times, which is the one channel a tiling
+        reaches this path through."""
+        raised = 0
+        for _, _, b in _entries():
+            raw = next((f for f in b["features"] if f is not None), None)
+            if raw is None:
+                continue
+            expr = sympy.sympify(
+                predict_ops([self._prospectively_tiled(op_from_dict(raw))])
+            )
+            raised += float(expr.subs(self.TILES, 8)) > float(expr.subs(self.TILES, 1))
+        self.assertGreater(raised, 0, "no captured op prices its re-read at all")
+
+    def test_the_prospective_expression_stays_linearizable(self):
+        # Same proxy as the sibling tiled test: no Piecewise, and every Pow
+        # invertible. A tile count entering as a plain multiplier keeps both.
+        for _, _, b in _entries():
+            raw = next((f for f in b["features"] if f is not None), None)
+            if raw is None:
+                continue
+            expr = sympy.sympify(
+                predict_ops([self._prospectively_tiled(op_from_dict(raw))])
+            )
+            self.assertFalse(expr.atoms(sympy.Piecewise))
+            for pow_ in expr.atoms(sympy.Pow):
+                self.assertIn(
+                    pow_.exp, (-1, self.TILES), f"non-invertible power {pow_}"
+                )
 
 
 class SymbolicMatmulSplitCostTest(TestCase):

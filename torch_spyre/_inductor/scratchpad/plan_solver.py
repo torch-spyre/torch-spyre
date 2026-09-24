@@ -26,6 +26,10 @@ from enum import Enum
 
 if TYPE_CHECKING:
     from torch_spyre._inductor.pass_utils import PerCoreView
+    from torch_spyre._inductor.work_division import (
+        OpSplitSpace,
+        ResidencyEdge,
+    )
     from torch_spyre._inductor.scratchpad.lx_relayout import (
         ChosenRelayout,
         LXRelayoutPlan,
@@ -188,7 +192,8 @@ class TileSpec:
     because tile levels *nest*: swapping two levels is a different plan. Frozen
     and hashable so ``==`` is exactly the "same tiling shape" test the group
     derivation keys on. The empty spec is *untiled*, and is the inert default
-    every :class:`CoreDivision` carries while ``auto_coarse_tiling`` is off.
+    every :class:`CoreDivision` carries unless a solver chose otherwise -- only
+    the SA co-optimizer does.
     """
 
     axes: tuple[TileAxis, ...] = ()
@@ -219,6 +224,12 @@ class TileSpec:
         :attr:`tile_count`.
         """
         return math.prod(a.count for a in self.axes if not a.is_reduction)
+
+    @property
+    def is_clean(self) -> bool:
+        """True when no reduction axis is tiled, so every tile of the output is
+        final rather than a partial sum."""
+        return not any(a.is_reduction for a in self.axes)
 
     @property
     def label(self) -> str:
@@ -307,6 +318,26 @@ class CoreDivisionBuffer(LifetimeBoundBuffer):
     cd_parent_relayouts: dict[str, list["RelayoutCandidate"]] = field(
         default_factory=dict
     )
+    # The same relation per candidate rather than per pair: one edge per divided
+    # producer this buffer reads, keyed as ``cd_parent_matches`` is. A solver
+    # that generates divisions asks these instead of indexing the table, and
+    # constructs the division on the other end of an edge by inverting the view.
+    # Empty where the allocator has not built them (they need the live ops).
+    residency_edges: dict[str, "ResidencyEdge"] = field(default_factory=dict)
+    # This buffer's producing op's legal divisions as a space to move in --
+    # ``core_divisions`` without materializing it. ``None`` for a buffer whose
+    # menu is not an enumeration to begin with: an input clone, a non-pointwise
+    # op, an op pinned to its committed division.
+    division_space: Optional["OpSplitSpace"] = None
+    # Index of this buffer's producing operation in ``graph.operations``, which
+    # is what a coarse-tiling *run* is measured over: a group has to occupy one
+    # contiguous stretch of that list, and buffer order is not operation order
+    # (input clones are prepended, and an operation producing no solver buffer
+    # has no index at all). ``None`` where there is no producing operation -- an
+    # input clone -- or where the caller does not supply one, which is what a
+    # solver reads as "operation order is unknown here, so no tiling may span
+    # more than nothing".
+    op_position: Optional[int] = None
     chosen_division: Optional[int] = None
     # Solver-chosen relayouts feeding this consumer: parent_buf_name -> the
     # fired candidate with the destination address (bytes) of the group's copy
@@ -326,9 +357,9 @@ class CoreDivisionBuffer(LifetimeBoundBuffer):
         A tiled candidate's own buffer is per-tile scratch, so its footprint
         shrinks by the output tile count as well as the core count -- this is
         the LX-residency win entering the footprint math. Reduction tile levels
-        are excluded (see :attr:`TileSpec.output_tile_count`); with
-        ``auto_coarse_tiling`` off every ``cd.tiling`` is empty and this reduces
-        to the previous ``ceil_div(size, output_partition)`` exactly."""
+        are excluded (see :attr:`TileSpec.output_tile_count`); where no
+        solver chose a tiling every ``cd.tiling`` is empty and this reduces to
+        ``ceil_div(size, output_partition)`` exactly."""
         if not self.core_divisions:
             return self.size
         return min(
@@ -353,6 +384,36 @@ class CoreDivisionBuffer(LifetimeBoundBuffer):
         return division_symbol(self.name)
 
     @property
+    def sym_tile_counts(self) -> dict[sympy.Symbol, sympy.Symbol]:
+        """Symbolic stand-in for a chosen coarse tiling: one symbol per
+        iteration axis this buffer's :attr:`division_space` offers a tile level
+        on, so the cost model can carry an undecided tile count as an unknown.
+
+        Keyed by axis rather than by buffer because a tile count divides an
+        axis's extent exactly as a core split does -- the two enter the same
+        per-core geometry, and which of an op's args a level makes
+        loop-invariant is decided by whether that axis's symbol appears in the
+        arg's index, which is static. So only the count is unknown, and a
+        candidate that leaves an axis untiled binds its symbol to 1.
+
+        Empty where tilings are not this caller's to choose: no space at all
+        (the placement-only wrap), or a space built without one, which is what
+        every engine but the SA co-optimizer gets and what
+        ``config.auto_coarse_tiling`` off leaves behind. The expression then
+        carries no tiling symbol and is the one it was before this existed.
+        """
+        space = self.division_space
+        tiling = getattr(space, "tiling", None)
+        if space is None or tiling is None:
+            return {}
+        counts = {}
+        for host_dim in tiling.output_dims:
+            axis = space.axis_by_host_dim.get(host_dim)
+            if axis is not None:
+                counts[axis] = tile_count_symbol(self.name, axis)
+        return counts
+
+    @property
     def sym_core_divs(self) -> dict[sympy.Symbol, sympy.Symbol]:
         """Symbolic stand-in for a chosen ``op_it_space_splits``: one symbol per
         stride coefficient seen across this buffer's candidate divisions, so the
@@ -370,6 +431,19 @@ class CoreDivisionBuffer(LifetimeBoundBuffer):
             key: sympy.Symbol(f"split_{self.name}_{key}", integer=True, positive=True)
             for key in keys
         }
+
+
+def tile_count_symbol(buffer_name: str, axis: sympy.Symbol) -> sympy.Symbol:
+    """The objective symbol for the coarse-tile count ``buffer_name`` takes on
+    ``axis`` (see :attr:`CoreDivisionBuffer.sym_tile_counts`). One constructor
+    so the declaration and the engine's binding agree on name and assumptions,
+    as :func:`division_symbol` does for the division index.
+
+    ``positive`` rather than ``nonnegative``: a tile count is at least 1 (the
+    untiled binding), and sympy needs that to keep an expression dividing by it
+    from being rewritten around a possible zero.
+    """
+    return sympy.Symbol(f"tiles_{buffer_name}_{axis}", integer=True, positive=True)
 
 
 def division_symbol(buffer_name: str) -> sympy.Symbol:
@@ -598,6 +672,65 @@ def cost_expr_record(
             "" if objective_ns is not None else " (whole objective too)",
         )
     return record
+
+
+COARSE_TILE_READ_COPY_PREFIX = "__spyre_coarse_tile__:read:"
+
+
+def coarse_tile_read_copy_name(source: str, reader: str) -> str:
+    """Name of the predicted staging copy of ``reader``'s read of ``source``.
+
+    Synthetic, and prefixed so every "not a graph buffer" gate in the allocator
+    (nothing to push, nothing to commit, no operation to tile) applies to it the
+    way it applies to a relayout copy. The real buffer the apply mints is named
+    by Inductor and is matched back to this one by the (source, reader) pair
+    rather than by name -- see ``CoOptimizingAllocator._apply_chosen_tilings``.
+    """
+    return f"{COARSE_TILE_READ_COPY_PREFIX}{source}:{reader}"
+
+
+@dataclass
+class CoarseTileReadCopyBuffer(CoreDivisionBuffer):
+    """One tile-local staging copy of a cross-boundary read, as a buffer the
+    solver places -- the same trick :class:`RelayoutCopyBuffer` plays for a
+    shuffle, and for a related reason.
+
+    **What it exists for is residency, not traffic.** A coarse-tiled op reading
+    a buffer produced outside its run reads it at an address that moves once per
+    tile, and the backend cannot advance an LX start address at all, so that
+    source may not be resident (``_read_across_a_tiling_boundary``). Staging the
+    read into a copy sized to one tile gives the same operand a *fixed* address,
+    which can be. So this buffer is how a tiled region gets its cross-boundary
+    operands back into LX, and its residency IS the decision -- exactly as a
+    relayout copy's is.
+
+    Its price follows from that and is charged where the expression cannot reach
+    (``SaCoOptimizingSolver._read_copy_savings``): resident, the ``r`` readers
+    pay one HBM pass over the source between them instead of ``r``; not
+    resident, the apply does not mint it at all, so it costs nothing and the
+    readers keep paying ``r``. Which is why the solver's residency decision is
+    handed back to the apply rather than the apply staging what it likes.
+
+    ``size`` is the SOURCE's total size, so the per-core footprint the engine
+    derives divides by the *reader's* partition and tile count -- the copy holds
+    one core's share of one tile. ``parents`` is deliberately empty: nothing
+    reads this buffer in the pre-apply graph, and listing the source would make
+    the residency gates treat it as a slicing edge it is not.
+    """
+
+    source: str = ""
+    reader: str = ""
+    # Index of the reading buffer in the solver's own buffer list, so the
+    # engine can size and gate this copy against the reader's chosen config.
+    # Filled in once the list is complete; -1 until then.
+    reader_index: int = -1
+    # How many reads of ``source`` the staged tile stands in for. One HBM pass
+    # is paid whatever happens, so the saving is over the other ``r - 1``.
+    reads: int = 1
+
+    @property
+    def pair(self) -> tuple[str, str]:
+        return (self.source, self.reader)
 
 
 RELAYOUT_COPY_PREFIX = "__spyre_lx_relayout__:copy:"

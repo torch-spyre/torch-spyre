@@ -318,6 +318,45 @@ class ArgTraffic:
 
 
 @dataclasses.dataclass
+class ProspectiveTiling:
+    """A coarse tiling an op *may* take, as the extractor has to see it: which
+    iteration axes carry a tile level, and the undecided count on each.
+
+    The co-optimizing allocator extracts features before it applies anything,
+    so what it can offer is not a chosen :class:`TileSpec` but the shape of the
+    choice -- the axes are static (they are what the op's tiling space offers),
+    the counts are the solver's own symbols, and an axis the chosen spec leaves
+    alone binds its symbol to 1. That split is what keeps the tiling out of
+    every branch: which args a level makes loop-invariant is decided by whether
+    its axis's symbol appears in their index, which is a static fact, and only
+    the multiplier is unknown.
+
+    ``counts`` is keyed by the op's own iteration symbols -- the same ones the
+    index expressions are written in -- so a level's effect on an arg is read
+    straight off that arg's index. Empty (or ``None`` at the call site) means
+    "no tiling to price", which is every caller but the co-optimizer.
+    """
+
+    counts: dict  # iteration symbol -> tile count (usually a sympy symbol)
+
+    @property
+    def trip(self):
+        """The whole nest's trip count: the product over levels. ``1`` when
+        there is nothing to tile, which is the untiled value and not a
+        sentinel."""
+        trip = 1
+        for count in self.counts.values():
+            trip = trip * count
+        return trip
+
+    def levels(self) -> list:
+        """``[(trip, {axis}, declared)]`` in the shape ``_loop_factor_for_index``
+        consumes: one level per axis, each declaring exactly the axis it cuts.
+        Order is irrelevant there -- the factor is a product over levels."""
+        return [(count, {axis}, 1) for axis, count in self.counts.items()]
+
+
+@dataclasses.dataclass
 class OpFeatures:
     """Cost-relevant features of one LoopLevel-IR op."""
 
@@ -970,6 +1009,20 @@ def _op_cols(o) -> float:
 def _is_sym(*vals) -> bool:
     """True if any value is a sympy expression rather than a number."""
     return any(isinstance(v, sympy.Basic) and not v.is_number for v in vals)
+
+
+def _tiles_output(o) -> bool:
+    """Whether ``o`` really runs an output-dim coarse loop.
+
+    ``o.loop_trip > 1`` cannot be asked directly any more: the co-optimizing
+    path stamps the solver's undecided tile count there, and a ``Relational``
+    in an ``if`` raises ``TypeError`` -- which ``CoOptimizingAllocator._solve``
+    catches by discarding the whole cost objective, the failure mode #4386 was
+    about. An undecided count is *some* tiling, so it passes the gate and the
+    surfaces behind it then withhold themselves on the symbolic tile height
+    (see :func:`_tiled_rows`), rather than the gate deciding for them.
+    """
+    return bool(o.tiles_output_dim) and (_is_sym(o.loop_trip) or o.loop_trip > 1)
 
 
 def _tiled_rows(o) -> Optional[float]:
@@ -2018,7 +2071,7 @@ def predict_ops(ops: list, params: CostParams | None = None) -> float:
     eff = 1.0
     for o in ops:
         rpc = _tiled_rows(o)
-        if o.loop_trip > 1 and o.tiles_output_dim and rpc:
+        if _tiles_output(o) and rpc:
             eff = min(eff, coarse_underfill_eff(rpc, _op_cols(o), p))
     # LX-SPILL bandwidth derate: a coarse-tiled kernel whose per-core working set (~2
     # live intermediate tiles) overflows LX spills to HBM, and that spilled traffic runs
@@ -2115,7 +2168,7 @@ def _explain_matmul_bundled(lines: list, ops: list, p: CostParams) -> str:
     eff, eff_rows = 1.0, None
     for o in ops:
         rpc = _tiled_rows(o)
-        if o.loop_trip > 1 and o.tiles_output_dim and rpc:
+        if _tiles_output(o) and rpc:
             e = coarse_underfill_eff_matmul(rpc, p)
             if e < eff:
                 eff, eff_rows = e, rpc
@@ -2325,7 +2378,10 @@ def explain(ops: list, params: CostParams | None = None) -> str:
     lines = []
     for o in ops:
         r, w, lx = o.read_bytes(), o.write_bytes(), o.lx_bytes()
-        loop = f" loop_trip={o.loop_trip}" if o.loop_trip > 1 else ""
+        # `_is_sym` first: an undecided trip count is printed as itself, and
+        # comparing it to 1 would raise inside instrumentation.
+        tiled = _is_sym(o.loop_trip) or o.loop_trip > 1
+        loop = f" loop_trip={o.loop_trip}" if tiled else ""
         pat = f" [{o.hbm_pattern}]" if getattr(o, "hbm_pattern", "") else ""
         lines.append(f"  {o.name:<12} read={r}B write={w}B lx={lx}B{loop}{pat}")
         for a in o.args:
@@ -2420,7 +2476,7 @@ def explain(ops: list, params: CostParams | None = None) -> str:
     eff, eff_rows, eff_cols = 1.0, None, 0.0
     for o in ops:
         rpc = _tiled_rows(o)
-        if o.loop_trip > 1 and o.tiles_output_dim and rpc:
+        if _tiles_output(o) and rpc:
             e = coarse_underfill_eff(rpc, _op_cols(o), p)
             if e < eff:
                 eff, eff_rows, eff_cols = e, rpc, _op_cols(o)
