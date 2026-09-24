@@ -94,6 +94,25 @@ one record. Event names have three shapes:
 | `pass:<PipelineClass>:<pass_name>` | One pass within it |
 | `stage:<PipelineClass>:<what>` | Work a pipeline does around its passes (`pass_loop`, `cost_model`, `cost_dump`, `finalize_work_division`, and the `log_before` / `log_after` IR dumps when INFO logging is on) |
 
+Each pipeline and pass event also carries `meta` with the graph size it saw
+(`input_nodes` / `output_nodes`, or `input_operations` / `output_operations`
+for the pre-scheduling pipeline) and counts of the analysis calls it made.
+Timing says a pass is slow; the counts say how many times it asked the same
+question, and unlike a duration they are exact and repeatable. A counter that
+did not move is omitted rather than recorded as zero.
+
+| Counter | Meaning |
+|---|---|
+| `read_writes.requests` | Calls to the memoized `op_read_writes` helper: how many times the pass asked |
+| `read_writes.misses` | Of those, the ones the per-op memo could not serve |
+| `read_writes.extractions` | `ComputedBuffer.get_read_writes` invocations -- the sympy dependency extraction that actually costs something, including callers that bypass the memo |
+| `device_coordinates` | Device-space coordinate constructions |
+| `host_coordinates` | Host-space coordinate constructions |
+
+Requests far above extractions is a rescan the memo is absorbing; misses far
+below extractions is a pass going around the memo. Pipeline events carry the
+inclusive total, the same way `inclusive_ns` does.
+
 ## FFDC (First Failure Data Capture)
 
 | Variable | Effect |

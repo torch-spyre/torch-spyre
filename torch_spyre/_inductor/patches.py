@@ -27,6 +27,7 @@ from torch._inductor.scheduler import SchedulerNode
 from torch._inductor.utils import InputType
 from torch._inductor.virtualized import V
 
+from . import pass_counters, timing_recorder
 from .constants import DEVICE_NAME
 
 
@@ -228,6 +229,9 @@ def enable_spyre_context(example_inputs: list[InputType]):
         spyre_data_types(),
         _preserve_spyre_input_storage_offsets(),
         enable_spyre_lowerings(),
+        # Analysis-call counters ride the timing gate: they exist to annotate
+        # timing records, and a second knob would let the two disagree.
+        pass_counters.counting(install=timing_recorder.is_enabled()),
         V.set_real_inputs(example_inputs),
         V.set_choices_handler(SpyreHeuristics()),
         torch._inductor.config.patch(new_config),

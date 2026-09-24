@@ -43,9 +43,11 @@ from torch._inductor.virtualized import V
 
 from torch_spyre._C import get_elem_in_stick
 from torch_spyre._inductor import config as ts_inductor_config
+from torch_spyre._inductor import pass_counters
 from torch_spyre._inductor import passes
 from torch_spyre._inductor.dedup_constants import dedup_and_promote_constants
 from torch_spyre._inductor.ir import SpyreConstantFallback
+from torch_spyre._inductor.pass_counters import READ_WRITES_EXTRACTIONS
 from torch_spyre._inductor.pass_utils import NameSwapHandler
 from torch_spyre._inductor.passes import CustomPreSchedulingPasses
 
@@ -916,13 +918,6 @@ class TestDedupConstantsPassLevel(_DedupTestBase):
         x = torch.randn(2, 8, k_aligned, dtype=dtype, device="spyre")
         w1 = torch.randn(2, k_aligned, 32, dtype=dtype, device="spyre")
 
-        counter = {"n": 0}
-        orig_grw = ComputedBuffer.get_read_writes
-
-        def counted_grw(self):
-            counter["n"] += 1
-            return orig_grw(self)
-
         def cb(graph: GraphLowering) -> None:
             from torch_spyre._inductor.dedup_constants import _constant_key
 
@@ -938,10 +933,9 @@ class TestDedupConstantsPassLevel(_DedupTestBase):
                 "fixture shape changed.",
             )
 
-            with patch.object(ComputedBuffer, "get_read_writes", counted_grw):
-                counter["n"] = 0
+            with pass_counters.counted_region() as counts:
                 dedup_and_promote_constants(graph)
-                calls = counter["n"]
+            calls = counts.get(READ_WRITES_EXTRACTIONS, 0)
 
             self.assertEqual(
                 calls,
@@ -982,13 +976,6 @@ class TestDedupConstantsPassLevel(_DedupTestBase):
         w2 = torch.randn(2, k, 32, dtype=dtype, device="spyre")
         w3 = torch.randn(2, k, 32, dtype=dtype, device="spyre")
 
-        counter = {"n": 0}
-        orig_grw = ComputedBuffer.get_read_writes
-
-        def counted_grw(self):
-            counter["n"] += 1
-            return orig_grw(self)
-
         def cb(graph: GraphLowering) -> None:
             from torch_spyre._inductor.dedup_constants import _constant_key
 
@@ -1011,10 +998,9 @@ class TestDedupConstantsPassLevel(_DedupTestBase):
             )
             n_ops_at_entry = len(graph.operations)
 
-            with patch.object(ComputedBuffer, "get_read_writes", counted_grw):
-                counter["n"] = 0
+            with pass_counters.counted_region() as counts:
                 dedup_and_promote_constants(graph)
-                calls = counter["n"]
+            calls = counts.get(READ_WRITES_EXTRACTIONS, 0)
 
             # In the single-sweep implementation, each ComputedBuffer in
             # graph.operations at pass entry is visited exactly once,
@@ -1058,6 +1044,93 @@ class TestDedupConstantsPassLevel(_DedupTestBase):
             return torch.bmm(x, w1) + torch.bmm(x, w2) + torch.bmm(x, w3)
 
         self._drive(cb, fn, (x, w1, w2, w3))
+
+    # ------------------------------------------------------------------
+    # test_reverse_index_bound_holds_as_D_grows
+    # ------------------------------------------------------------------
+
+    def test_reverse_index_bound_holds_as_D_grows(self) -> None:
+        """The same bound at two duplicate-group sizes, D=2 and D=4.
+
+        One data point leaves open that the fixture, not the implementation, is
+        what keeps the count under N. Raising D makes a per-duplicate rebuild
+        proportionally worse -- roughly D*N calls -- so re-checking
+        ``calls <= N`` at D=4 fails harder than at D=2 while staying an exact
+        bound. A fitted slope was the alternative and is worse here: the
+        invariant is exact, so fitting would trade a hard bound for a threshold
+        that can drift into flakiness in a shared suite.
+
+        Growing the group grows N as well as D in this fixture (each bmm adds
+        ops), which is why the assertion is the per-graph bound at each size
+        rather than a comparison of raw counts across the two.
+        """
+        dtype = torch.float16
+        stick_size = get_elem_in_stick(dtype)
+        k = stick_size + 1
+        # (n_bmms, calls, n_ops_at_entry) for each graph driven below.
+        measured: list[tuple[int, int, int]] = []
+
+        def make_cb(n_bmms: int) -> Callable[[GraphLowering], None]:
+            def cb(graph: GraphLowering) -> None:
+                from torch_spyre._inductor.dedup_constants import _constant_key
+
+                constants = self._constants(graph.operations)
+                groups: dict[tuple, list[SpyreConstantFallback]] = {}
+                for c in constants:
+                    groups.setdefault(_constant_key(c), []).append(c)
+                largest = max((len(g) for g in groups.values()), default=0)
+                self.assertGreaterEqual(
+                    largest,
+                    n_bmms,
+                    f"PRECONDITION: {n_bmms} unaligned bmms sharing one "
+                    f"unaligned K should have produced a duplicate group of "
+                    f"{n_bmms} padding constants; largest group is {largest}. "
+                    "Not a dedup failure -- fixture shape changed.",
+                )
+                n_ops = len(graph.operations)
+                with pass_counters.counted_region() as counts:
+                    dedup_and_promote_constants(graph)
+                measured.append((n_bmms, counts.get(READ_WRITES_EXTRACTIONS, 0), n_ops))
+                raise _TestStopSignal()
+
+            return cb
+
+        def fn(x, *ws):
+            out = torch.bmm(x, ws[0])
+            for w in ws[1:]:
+                out = out + torch.bmm(x, w)
+            return out
+
+        for n_bmms in (3, 5):
+            x = torch.randn(2, 8, k, dtype=dtype, device="spyre")
+            ws = tuple(
+                torch.randn(2, k, 32, dtype=dtype, device="spyre")
+                for _ in range(n_bmms)
+            )
+            self._drive(make_cb(n_bmms), fn, (x, *ws))
+
+        self.assertEqual(
+            [m[0] for m in measured],
+            [3, 5],
+            f"both graphs must have reached dedup; measured {measured}",
+        )
+        for n_bmms, calls, n_ops in measured:
+            self.assertGreater(
+                calls,
+                0,
+                f"regression guard: duplicates exist at {n_bmms} bmms but dedup "
+                "made zero get_read_writes calls -- the reverse index was "
+                "never built.",
+            )
+            self.assertLessEqual(
+                calls,
+                n_ops,
+                f"regression guard: at {n_bmms} bmms (D={n_bmms - 1}) dedup made "
+                f"{calls} ComputedBuffer.get_read_writes calls on a graph with "
+                f"{n_ops} ops at pass entry. A single sweep makes at most one "
+                f"call per op; a per-duplicate rebuild would make about "
+                f"{(n_bmms - 1) * n_ops}. All measurements: {measured}",
+            )
 
     # ------------------------------------------------------------------
     # test_all_output_name_duplicates_still_dropped
@@ -1106,13 +1179,6 @@ class TestDedupConstantsPassLevel(_DedupTestBase):
         w1 = torch.randn(2, k, 32, dtype=dtype, device="spyre")
         w2 = torch.randn(2, k, 32, dtype=dtype, device="spyre")
 
-        counter = {"n": 0}
-        orig_grw = ComputedBuffer.get_read_writes
-
-        def counted_grw(self):
-            counter["n"] += 1
-            return orig_grw(self)
-
         def cb(graph: GraphLowering) -> None:
             from torch_spyre._inductor.dedup_constants import _constant_key
 
@@ -1155,10 +1221,9 @@ class TestDedupConstantsPassLevel(_DedupTestBase):
             object.__setattr__(graph, "get_output_names", patched_get_output_names)
 
             try:
-                with patch.object(ComputedBuffer, "get_read_writes", counted_grw):
-                    counter["n"] = 0
+                with pass_counters.counted_region() as counts:
                     dedup_and_promote_constants(graph)
-                    calls = counter["n"]
+                calls = counts.get(READ_WRITES_EXTRACTIONS, 0)
             finally:
                 # Restore -- best-effort; the test raises _TestStopSignal
                 # right after this so the graph will not be used.

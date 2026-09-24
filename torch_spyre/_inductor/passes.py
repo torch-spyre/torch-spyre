@@ -37,6 +37,7 @@ from torch._inductor.scheduler import BaseSchedulerNode
 
 from . import timing_recorder
 from .logging_utils import get_inductor_logger
+from .pass_counters import COUNTERS
 from .provenance import SpyreGraphTransformObserver, reset_provenance_warnings
 
 from .padding import insert_bmm_padding, insert_restickify_padding
@@ -187,6 +188,10 @@ class _SpyreGraphPassPipeline(CustomGraphPass):
         # FX-graph passes are already observed by upstream Inductor's
         # GraphTransformObserver (populates node.meta["from_node"]); no Spyre
         # observer is wrapped here.
+        #
+        # Counter deltas are attached like the node counts are, and nest the way
+        # inclusive_ns does: a pipeline's counts include its passes'.
+        pipeline_counts = COUNTERS.snapshot()
         with timing_recorder.stage(
             f"pipeline:{pipeline}",
             passes=len(self.passes),
@@ -194,6 +199,7 @@ class _SpyreGraphPassPipeline(CustomGraphPass):
         ) as pipeline_event:
             for p in self.passes:
                 name = _get_pass_name(p) if counting else ""
+                pass_counts = COUNTERS.snapshot()
                 with timing_recorder.stage(
                     f"pass:{pipeline}:{name}",
                     input_nodes=len(graph.nodes) if counting else 0,
@@ -201,8 +207,10 @@ class _SpyreGraphPassPipeline(CustomGraphPass):
                     p(graph)
                 if counting:
                     event.meta["output_nodes"] = len(graph.nodes)
+                    event.meta.update(COUNTERS.since(pass_counts))
         if counting:
             pipeline_event.meta["output_nodes"] = len(graph.nodes)
+            pipeline_event.meta.update(COUNTERS.since(pipeline_counts))
 
     def uuid(self) -> Any | None:
         return _uuid(self.passes)
@@ -224,6 +232,7 @@ class _SpyreNodePassPipeline(CustomSchedulerPass):
         # so clear the dedup here so each compile warns afresh.
         reset_provenance_warnings()
         pipeline = type(self).__name__
+        pipeline_counts = COUNTERS.snapshot()
         with timing_recorder.stage(
             f"pipeline:{pipeline}", passes=len(self.passes), input_nodes=len(target)
         ) as pipeline_event:
@@ -231,15 +240,18 @@ class _SpyreNodePassPipeline(CustomSchedulerPass):
                 name = _get_pass_name(pass_fn)
                 observer = SpyreGraphTransformObserver(target, name, kind="node")
                 with observer:
+                    pass_counts = COUNTERS.snapshot()
                     with timing_recorder.stage(
                         f"pass:{pipeline}:{name}", input_nodes=len(target)
                     ) as event:
                         target = pass_fn(target)
                     event.meta["output_nodes"] = len(target)
+                    event.meta.update(COUNTERS.since(pass_counts))
                     # Reconcile the returned list while recursively inspecting
                     # the underlying buffers through scheduler get_nodes().
                     observer.target = target
         pipeline_event.meta["output_nodes"] = len(target)
+        pipeline_event.meta.update(COUNTERS.since(pipeline_counts))
         return target
 
     def uuid(self) -> Any | None:
@@ -603,6 +615,7 @@ class CustomPreSchedulingPasses:
         clear_marker_maps()
 
         pipeline = type(self).__name__
+        pipeline_counts = COUNTERS.snapshot()
         with timing_recorder.stage(
             f"pipeline:{pipeline}",
             passes=len(self.passes),
@@ -646,6 +659,7 @@ class CustomPreSchedulingPasses:
                 finalize_work_division_for_scheduler(graph)
 
         pipeline_event.meta["output_operations"] = len(graph.operations)
+        pipeline_event.meta.update(COUNTERS.since(pipeline_counts))
 
     def _run_pass_loop(self, graph: GraphLowering) -> None:
         """Run the pass list. Split out so it gets its own timed region."""
@@ -656,6 +670,7 @@ class CustomPreSchedulingPasses:
             # `graph.operations` in place -- so before/after reconciliation
             # is exact here.
             with SpyreGraphTransformObserver(graph, pass_name, kind="graphlowering"):
+                pass_counts = COUNTERS.snapshot()
                 with timing_recorder.stage(
                     f"pass:{pipeline}:{pass_name}",
                     input_operations=len(graph.operations),
@@ -666,6 +681,7 @@ class CustomPreSchedulingPasses:
                 # Counted after the region closes, so counting is never charged
                 # to the work it describes.
                 event.meta["output_operations"] = len(graph.operations)
+                event.meta.update(COUNTERS.since(pass_counts))
 
             if logger.isEnabledFor(logging.INFO):
                 logger.info(

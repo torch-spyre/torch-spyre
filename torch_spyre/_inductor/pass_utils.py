@@ -69,6 +69,13 @@ from .constants import (
 from .ir import FixedTiledLayout, SpyreConstantFallback
 from .logging_utils import get_inductor_logger
 from .loop_info import copy_op_metadata
+from .pass_counters import (
+    COUNTERS,
+    DEVICE_COORDINATES,
+    HOST_COORDINATES,
+    READ_WRITES_MISSES,
+    READ_WRITES_REQUESTS,
+)
 from .provenance import preserve_provenance
 from .views import (
     AlignmentInputs,
@@ -250,8 +257,12 @@ def op_read_writes(op: Operation) -> ReadWrites:
     we cache it under a private key only this helper reads -- a non-planner
     caller (e.g. later-pass codegen) still goes through the real method.
     """
+    if COUNTERS.enabled:
+        COUNTERS.bump(READ_WRITES_REQUESTS)
     rw = op.__dict__.get("_ts_cached_read_writes")
     if rw is None:
+        if COUNTERS.enabled:
+            COUNTERS.bump(READ_WRITES_MISSES)
         rw = op.get_read_writes()
         op.__dict__["_ts_cached_read_writes"] = rw
     return rw
@@ -1211,6 +1222,8 @@ def host_coordinates(
     Returns:
         One coordinate expression per host dimension.
     """
+    if COUNTERS.enabled:
+        COUNTERS.bump(HOST_COORDINATES)
     # Concretize size/stride so compute_coordinates can use plain ``<``/``>``
     # comparisons.  var_ranges and index stay symbolic so the *output*
     # coordinate expressions remain symbolic.
@@ -1477,6 +1490,8 @@ def device_coordinates(
         One coordinate expression per device dimension; the last element is
         the stick expression.
     """
+    if COUNTERS.enabled:
+        COUNTERS.bump(DEVICE_COORDINATES)
     index = per_trip_index(op, dep.index) if op is not None else dep.index
     coords = alignment_coordinates(stl, index, dep.ranges, indirect_sizes)
     if check_stick_expr:
