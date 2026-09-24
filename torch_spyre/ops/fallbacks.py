@@ -289,3 +289,18 @@ def spyre__max_default_int64_fallback(input, **kwargs):
     This avoids recursive decomposition by directly calling torch.max on CPU.
     """
     return torch.max(input, **kwargs)
+
+
+@register_fallback([aten.histc.default, aten.histc.out])
+def spyre__histc_fallback(input, bins=100, min=0, max=0, **kwargs):
+    """
+    CPU fallback for torch.histc (eager and compiled).
+
+    CPU histc has no float16 or int32 kernel (transformers' MoE
+    routing calls ``histc(expert_ids.int(), ...)``), so compute in float32 and
+    cast the counts back to the input dtype. ``out=`` is handled by
+    ``register_fallback``.
+    """
+    kwargs.pop("out", None)
+    x = input if input.dtype == torch.float32 else input.to(torch.float32)
+    return torch.histc(x, bins, min, max).to(input.dtype)

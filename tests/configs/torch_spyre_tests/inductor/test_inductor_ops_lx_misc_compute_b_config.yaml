@@ -48,6 +48,7 @@ test_suite_config:
             - LxPlanning.*::test_compiled_randn_fallback_cpu.*_lx_planning_(pointwise|reduction)
             - LxPlanning.*::test_overwrite.*_lx_planning_(pointwise|reduction)
             - LxPlanning.*::test_tril.*_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_histc.*_lx_planning_(pointwise|reduction)
             - LxPlanning.*::test_triu.*_lx_planning_(pointwise|reduction)
             - LxPlanning.*::test_uniform_cpu.*_lx_planning_(pointwise|reduction)
             - LxPlanning.*::test_uniform_custom_range_cpu.*_lx_planning_(pointwise|reduction)

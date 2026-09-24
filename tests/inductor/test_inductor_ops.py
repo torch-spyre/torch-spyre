@@ -3393,6 +3393,17 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "3d": (cached_randn((32, 64, 64)),),
             }
         },
+        # histc is a CPU fallback. float32 inputs here because the CPU reference
+        # has no float16 kernel; float16 and int32 (MoE routing) are covered in
+        # tests/test_fallbacks.py.
+        ("test_histc", "test_histc_cpu"): {
+            "param_sets": {
+                "1d": (cached_randn((64,), dtype=torch.float32), 4, -3.0, 3.0),
+                # issue #3982 (gpt-oss): torch.histc(torch.rand(1, 5), bins=10, min=0.0, max=1.0)
+                "2d": (torch.rand((1, 5), dtype=torch.float32), 10, 0.0, 1.0),
+                "auto_range": (cached_randn((64,), dtype=torch.float32), 8, 0.0, 0.0),
+            }
+        },
         ("test_triu", "test_triu_cpu"): {
             "param_sets": {
                 "2d": (
@@ -7981,6 +7992,13 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             return torch.tril(input)
 
         self.compare_with_cpu(fn, x)
+
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+    def test_histc_cpu(self, x, bins, min, max):
+        def fn(input):
+            return torch.histc(input, bins=bins, min=min, max=max)
+
+        self.compare_with_cpu(fn, x, atol=0, rtol=0)
 
     @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_triu_cpu(self, x, diagonal):
