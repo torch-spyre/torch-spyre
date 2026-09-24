@@ -109,6 +109,14 @@ std::shared_ptr<spyre_comms::Context> ensure_context() {
   auto context = spyre_comms::get_world_context();
   if (context == nullptr) {
     SPYRE_RUNTIME_DEBUG() << "Initializing spyre-comms library";
+    // Spyre Comms is initialised with the default Flex stream handle.  Because
+    // all collective operations are injected into that same stream, Flex
+    // enforces ordering between comms operations and any surrounding compute
+    // kernels.  This data-dependency ordering is what makes skipping
+    // work->wait() in spyre_wait_work_impl valid: the device itself serialises
+    // the collective result before any subsequent operation on the stream can
+    // consume it.  Torch Spyre calls synchronize() when exposing results to the
+    // user, so there is no gap at the end of the graph either.
     spyre_comms::initialize_library(spyre::GlobalRuntime::get(),
                                     spyre::getDefaultStreamRuntimeHandle());
     context = spyre_comms::get_world_context();
@@ -486,11 +494,12 @@ at::Tensor spyre_wait_work_impl(const at::Tensor& tensor) {
                           << pending_work_map_.size();
   }
 
-  // Lock released — concurrent wait_work and run ops can now proceed
-  if (pending.work) {
-    pending.work->wait();
-    SPYRE_RUNTIME_DEBUG() << "WorkSchedule wait completed";
-  }
+  // Lock released — concurrent wait_work and run ops can now proceed.
+  // No explicit work->wait() is needed here: Spyre Comms uses the default Flex
+  // stream, so Flex enforces ordering between the collective and any subsequent
+  // compute.  The result is visible to later operations on the stream without a
+  // host-side synchronization point.  See the comment in ensure_context() for
+  // the full rationale.
 
   if (pending.kind == CollectiveKind::AllGather) {
     // _c10d_functional.all_gather_into_tensor concatenates along dim 0 by
