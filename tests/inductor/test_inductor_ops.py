@@ -3395,14 +3395,24 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         },
         ("test_triu", "test_triu_cpu"): {
             "param_sets": {
-                "2d": (
-                    cached_randn((64, 64)),
+                "2d_diag0": (cached_randn((64, 64)), 0),
+                "2d_diag1": (cached_randn((64, 64)), 1),
+                "2d_diag_neg1": (cached_randn((64, 64)), -1),
+                "2d_unaligned": (cached_randn((65, 70)), 0),
+                "3d_diag0": (cached_randn((32, 64, 64)), 0),
+                "3d_diag1": (cached_randn((32, 64, 64)), 1),
+                "4d_diag0": (cached_randn((2, 4, 64, 64)), 0),
+                "4d_diag1": (cached_randn((2, 4, 64, 64)), 1),
+                "4d_unaligned": (cached_randn((2, 4, 65, 70)), 1),
+                "nonfinite": (
+                    torch.full((64, 64), float("-inf"), dtype=torch.float16),
                     1,
                 ),
-                "3d": (
-                    cached_randn((32, 64, 64)),
-                    1,
-                ),
+            }
+        },
+        ("test_triu_int", "test_triu_int_cpu"): {
+            "param_sets": {
+                "int32_2d": (torch.randint(0, 100, (64, 64), dtype=torch.int32), 1),
             }
         },
         ("test_item", "test_item_cpu"): {
@@ -7982,8 +7992,15 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
         self.compare_with_cpu(fn, x)
 
-    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+    @pytest.mark.filterwarnings("error::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_triu_cpu(self, x, diagonal):
+        def fn(input, diagonal):
+            return torch.triu(input, diagonal)
+
+        self.compare_with_cpu(fn, x, diagonal)
+
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+    def test_triu_int_cpu(self, x, diagonal):
         def fn(input, diagonal):
             return torch.triu(input, diagonal)
 

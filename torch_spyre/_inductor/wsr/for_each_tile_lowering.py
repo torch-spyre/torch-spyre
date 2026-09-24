@@ -3150,7 +3150,9 @@ def splice_while_loops(graph) -> None:
     that loop is later spliced, its final recordable names are appended to
     every ancestor's pending name list. This makes those late-created ops
     members of the complete loop nest instead of a sibling group containing
-    only their immediate level.
+    only their immediate level. A pre-loop carry copy that the splice
+    inserts before the loop (carry ownership, #4838) is appended to the
+    ancestors only: it runs once per enclosing trip, outside its own loop.
 
     Stamping itself still proceeds level-0-first (outermost first) within
     the single final phase: level 0's call stamps first (existing=None,
@@ -3200,12 +3202,24 @@ def splice_while_loops(graph) -> None:
                 while_op,
                 _stacking_carry_indices(while_op, loop_var, result.trip_count),
             )
+            names_before_splice = {op.get_name() for op in graph.operations}
             group_ops = splice_while_loop(
                 graph,
                 while_op,
                 carries,
                 trip_count=result.trip_count,
             )
+            # The splice can also add an op OUTSIDE this loop's body: a
+            # carry's pre-loop ownership copy. It runs once per trip of every
+            # enclosing level, never per trip of this one, so it joins the
+            # ancestors' names below but not this level's.
+            group_names = {op.get_name() for op in group_ops}
+            pre_loop_names = [
+                op.get_name()
+                for op in graph.operations
+                if op.get_name() not in names_before_splice
+                and op.get_name() not in group_names
+            ]
 
             _consume_tile_dim_markers(group_ops, graph.operations)
 
@@ -3213,7 +3227,7 @@ def splice_while_loops(graph) -> None:
             for ancestor_idx in ancestor_level_indices:
                 ancestor_names = pending_levels[ancestor_idx][3]
                 ancestor_name_set = set(ancestor_names)
-                for name in recordable_names:
+                for name in (*pre_loop_names, *recordable_names):
                     if name not in ancestor_name_set:
                         ancestor_names.append(name)
                         ancestor_name_set.add(name)

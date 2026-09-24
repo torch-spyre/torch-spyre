@@ -87,6 +87,8 @@ from for_each_tile_fixtures import (
     nested_online_softmax_reference,
     nested_split_m_then_k_fn,
     nested_split_m_then_k_reference,
+    nested_two_inner_loops_shared_init_fn,
+    nested_two_inner_loops_shared_init_reference,
     online_softmax_fn,
     online_softmax_reference,
     paged_gather_fn,
@@ -99,7 +101,11 @@ from for_each_tile_fixtures import (
     paged_gather_reference,
     softmax_row_tiled_fn,
     softmax_row_tiled_reference,
+    split_k_caller_init_fn,
     split_k_fn,
+    split_k_transposed_caller_init_fn,
+    split_k_transposed_caller_init_two_carries_fn,
+    split_k_transposed_caller_init_two_carries_reference,
     split_m_fn,
     triple_nested_stardep_inner_fn,
     triple_nested_stardep_inner_reference,
@@ -238,6 +244,90 @@ class TestForEachTileE2E(_DynamoResetTestCase):
 
         torch.testing.assert_close(
             out.cpu().float(), ref, atol=self.ATOL, rtol=self.RTOL
+        )
+
+    @staticmethod
+    def _exact_split_k_operands(acc0_shape):
+        """Small-integer operands whose split-K sums stay exact.
+
+        X and Y are 0/1 and acc0 is 0..3, so every partial sum is an integer
+        of at most K + 3 = 259: exact in the device's fp16 (SEN169, 10
+        significant bits) and across the H2D/D2H round trip. The reference is
+        therefore exact, and a wrong or reused accumulator shows up as a
+        mismatch rather than as rounding.
+        """
+        g = torch.Generator().manual_seed(0)
+        X = torch.randint(0, 2, (M, K), generator=g).half()
+        Y = torch.randint(0, 2, (K, N), generator=g).half()
+        acc0 = torch.randint(0, 4, acc0_shape, generator=g).half()
+        return X, Y, acc0
+
+    def _assert_exact_twice_inputs_unchanged(self, fn, inputs, refs):
+        """Two calls with the same inputs: both exact, every input unchanged.
+
+        If an accumulator wrote into a caller's init (#4838), that input
+        changes and the second call starts from the first call's result.
+        ``refs`` holds one exact reference per output. Each result is brought
+        to the host before the next call, so the second call cannot overwrite
+        the first result's memory.
+        """
+        on_device = [t.to(DEVICE_NAME) for t in inputs]
+        compiled = torch.compile(fn, backend="inductor", fullgraph=True)
+        for _ in range(2):
+            outs = compiled(*on_device)
+            outs = outs if isinstance(outs, tuple) else (outs,)
+            self.assertEqual(len(outs), len(refs))
+            for out, ref in zip(outs, refs):
+                torch.testing.assert_close(out.cpu().float(), ref, atol=0.0, rtol=0.0)
+        for before, after in zip(inputs, on_device):
+            self.assertTrue(torch.equal(after.cpu(), before), "a caller input changed")
+
+    def test_carry_mode_split_k_caller_init(self):
+        """#4838: a caller-owned init is copied, never accumulated into."""
+        X, Y, acc0 = self._exact_split_k_operands((M, N))
+        ref = acc0.float() + X.float() @ Y.float()
+        self._assert_exact_twice_inputs_unchanged(
+            split_k_caller_init_fn, (X, Y, acc0), (ref,)
+        )
+
+    def test_carry_mode_split_k_transposed_caller_init(self):
+        """#4838: a transposed view of a caller init is copied as its storage.
+
+        acc0 is [N, M] and the carry starts from acc0.t() ([M, N], not
+        square), so a copy that dropped the transpose, or wrote through to
+        the caller's buffer, fails the exact comparison.
+        """
+        X, Y, acc0 = self._exact_split_k_operands((N, M))
+        ref = acc0.t().float() + X.float() @ Y.float()
+        self._assert_exact_twice_inputs_unchanged(
+            split_k_transposed_caller_init_fn, (X, Y, acc0), (ref,)
+        )
+
+    def test_carry_mode_split_k_transposed_caller_init_old_value_reader(self):
+        """#4838: the transposed caller init's old value has another reader.
+
+        ``b`` adds ``a``'s pre-trip value, so ``a`` needs an in-loop snapshot
+        on top of its pre-loop copy; both must copy the caller's storage and
+        keep the transpose. Every sum is an integer of at most 396 (``b``
+        adds four values of at most 3 + 64 * trip), so the check is exact.
+        """
+        X, Y, acc0 = self._exact_split_k_operands((N, M))
+        refs = split_k_transposed_caller_init_two_carries_reference(X, Y, acc0)
+        self._assert_exact_twice_inputs_unchanged(
+            split_k_transposed_caller_init_two_carries_fn, (X, Y, acc0), refs
+        )
+
+    def test_nested_inner_loops_share_one_init(self):
+        """#4838: an inner loop's pre-loop copy re-runs on every outer trip.
+
+        Both inner loops start from one fill made in the outer loop's body, so
+        the first one gets a pre-loop copy. If that copy ran once instead of on
+        every outer trip, later outer trips would start from a stale sum.
+        """
+        X, Y, _ = self._exact_split_k_operands((M, N))
+        ref = nested_two_inner_loops_shared_init_reference(X, Y)
+        self._assert_exact_twice_inputs_unchanged(
+            nested_two_inner_loops_shared_init_fn, (X, Y), (ref,)
         )
 
     def test_carry_mode_online_softmax(self):
