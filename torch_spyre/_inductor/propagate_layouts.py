@@ -403,70 +403,23 @@ def _convert_reads_whole_input(
     )
 
 
-def _find_num_sticks_dim(stl: SpyreTensorLayout) -> int | None:
-    stick_stride = stl.stride_map[-1]
-    if stick_stride <= 0:
-        return None
-    target = stick_stride * stl.device_size[-1]  # stride_map[-1] * eps
-    last = len(stl.device_size) - 1
-    return next(
-        (i for i in range(last) if stl.stride_map[i] == target),
-        None,
-    )
-
-
 def _fp32_to_dl16_stl(
     stl: SpyreTensorLayout, out_dtype: torch.dtype
 ) -> SpyreTensorLayout:
     """Return the output layout for FP32_TO_DL16 conversion."""
-    in_eps = stl.device_size[-1]
-    out_eps = get_elem_in_stick(out_dtype)
-    out_device_size = list(stl.device_size)
-    out_stride_map = list(stl.stride_map)
-    # change stick size: 32 -> 64
-    out_device_size[-1] = out_eps
-    ns = _find_num_sticks_dim(stl)
-    if ns is not None:
-        # rescale num-sticks dim with ceil division
-        out_device_size[ns] = -(-(stl.device_size[ns] * in_eps) // out_eps)
-        # update its stride consistently
-        out_stride_map[ns] = out_eps * stl.stride_map[-1]
-    return SpyreTensorLayout(
-        out_device_size,
-        out_stride_map,
-        get_device_dtype(out_dtype),
-        ElementArrangement.FP32_TO_DL16,
-    )
+    return rescale_stl_for_dtype(stl, out_dtype, ElementArrangement.FP32_TO_DL16)
 
 
 def _qfp8ch_stl(stl: SpyreTensorLayout, out_dtype: torch.dtype) -> SpyreTensorLayout:
     """Output layout of ``qfp8ch``: fp16 (64/stick) -> fp8 (128/stick) quantization.
 
-    Propagates the input device layout, preserving any padding, and rescales
-    the stick depth the way ``rescale_stl_for_dtype`` does, except that the
-    num-sticks dim rounds UP: an fp16 tensor whose stick-indexing dim holds an
-    odd number of 64-element sticks ends in one partially filled 128-element
-    fp8 stick. That is a legitimate layout for this op -- the fp8->fp16
-    conversion that consumes it rebuilds a dense layout from the host size,
-    treating the partial stick exactly like any other unaligned stick dim --
-    so it must never floor to a size-0 dim (issue #3604).
+    An fp16 tensor whose num-sticks dim holds an odd number of 64-element sticks
+    ends in one partially filled 128-element fp8 stick. That is a legitimate
+    layout for this op: the fp8->fp16 conversion that consumes it rebuilds a
+    dense layout from the host size, treating the partial stick exactly like any
+    other unaligned stick dim.
     """
-    in_eps = stl.device_size[-1]
-    out_eps = get_elem_in_stick(out_dtype)
-    out_device_size = list(stl.device_size)
-    out_stride_map = list(stl.stride_map)
-    out_device_size[-1] = out_eps
-    for i, s in enumerate(stl.stride_map):
-        if s == in_eps:
-            out_device_size[i] = -(-(stl.device_size[i] * in_eps) // out_eps)
-            out_stride_map[i] = out_eps
-            break
-    return SpyreTensorLayout(
-        out_device_size,
-        out_stride_map,
-        get_device_dtype(out_dtype),
-        ElementArrangement.QFP8CH,
-    )
+    return rescale_stl_for_dtype(stl, out_dtype, ElementArrangement.QFP8CH)
 
 
 def _qfp8wt_stl(

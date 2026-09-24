@@ -82,10 +82,10 @@ from .pass_utils import (
     is_restickify_coords,
     _is_compact_node,
     lower_pad_sequence,
+    num_sticks_dim,
     redirect_computed_buffer_reads,
     replace_computed_buffer_body,
 )
-from .propagate_layouts import _find_num_sticks_dim
 from .views import compute_coordinates
 from torch_spyre._C import ElementArrangement, SpyreTensorLayout, get_elem_in_stick
 
@@ -1122,22 +1122,27 @@ def _pad_fp32_to_dl16_input(op: Operation, graph: GraphLowering) -> None:
         return
 
     in_stl = in_layout.device_layout
-    num_sticks_dim = _find_num_sticks_dim(in_stl)
-    if num_sticks_dim is None:
+    sticks_dim = num_sticks_dim(in_stl)
+    if sticks_dim is None:
         return
 
     in_eps = in_stl.device_size[-1]  # 32 for fp32
+    # The output stick depth is the coarser of the two grids for this conversion,
+    # which is what the round-up must be taken against (issue #3999). A
+    # conversion whose output is the finer grid would have to read the input's
+    # depth instead; this pass is gated on FP32_TO_DL16, so it never is.
     out_eps = out_stl.device_size[-1]  # 64 for fp16
-    out_num_sticks = out_stl.device_size[num_sticks_dim]
+    out_num_sticks = out_stl.device_size[sticks_dim]
 
-    # Required input num-sticks = out_num_sticks * out_eps / in_eps
-    required_in_num_sticks = out_num_sticks * out_eps // in_eps
-    current_in_num_sticks = in_stl.device_size[num_sticks_dim]
+    # Input capacity that the output's sticks span. The output num-sticks count
+    # is already rounded up, so this covers the padding stick.
+    required_in_num_sticks = -(-out_num_sticks * out_eps // in_eps)
+    current_in_num_sticks = in_stl.device_size[sticks_dim]
 
     if current_in_num_sticks >= required_in_num_sticks:
         return
 
-    in_buf.layout = _pad_device_dim(in_layout, num_sticks_dim, required_in_num_sticks)
+    in_buf.layout = _pad_device_dim(in_layout, sticks_dim, required_in_num_sticks)
 
 
 def insert_restickify_padding(graph: GraphLowering) -> None:

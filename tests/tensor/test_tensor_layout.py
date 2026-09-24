@@ -717,45 +717,73 @@ class TestSpyreTensorLayout(TestCase):
         ).cpu()
         torch.testing.assert_close(actual, expected, atol=0.1, rtol=0.1)
 
-    def test_rescale_for_dtype_rejects_inexact_stick_rescale(self):
-        """A stick-indexing dim that does not hold a whole number of output
-        sticks must raise, not floor.
+    def test_rescale_for_dtype_rounds_the_num_sticks_dim_up(self):
+        """A num-sticks dim that does not hold a whole number of output sticks
+        rounds up, so that padded and unpadded inputs describing the same live
+        elements yield the same layout: three fp32 sticks and four both hold 96
+        live elements and both describe two fp16 sticks.
+        ``insert_staggered_ea_padding`` sizes the wide side's padding from this
+        layout (issue #3999).
 
-        Widening the stick depth shrinks the num-sticks dim by the depth ratio.
-        Flooring an inexact ratio drops data, and a single input stick floors to
-        zero; such a layout describes no tensor, and it used to reach
-        ``get_device_stride_infos``, which divided by it and killed the process
-        with SIGFPE rather than raising (issue #3604). Needs no device.
+        Rounding up also keeps a single input stick from flooring to a size-0
+        dim, which described no tensor and reached ``get_device_stride_infos`` to
+        divide by it and kill the process with SIGFPE (issue #3604). Needs no
+        device.
         """
         from torch_spyre._C import ElementArrangement
-        from torch_spyre._inductor.errors import Unsupported
         from torch_spyre._inductor.pass_utils import rescale_stl_for_dtype
 
         fp32 = get_device_dtype(torch.float32)
-        # One fp32 stick (32 elements): 1 * 32 // 64 == 0 going to fp16.
-        one_stick = SpyreTensorLayout(
-            [1, 4, 32], [32, 32, 1], fp32, ElementArrangement.STANDARD
-        )
-        with self.assertRaisesRegex(Unsupported, "not a whole number of 64-element"):
-            rescale_stl_for_dtype(one_stick, torch.float16, ElementArrangement.STANDARD)
-        # Three fp32 sticks (96 elements): flooring to one fp16 stick would
-        # silently drop 32 elements.
-        three_sticks = SpyreTensorLayout(
-            [3, 4, 32], [32, 32, 1], fp32, ElementArrangement.STANDARD
-        )
-        with self.assertRaisesRegex(Unsupported, "3 stick\\(s\\) of 32 elements"):
-            rescale_stl_for_dtype(
-                three_sticks, torch.float16, ElementArrangement.STANDARD
+
+        def rescaled(num_sticks):
+            stl = SpyreTensorLayout(
+                [num_sticks, 4, 32], [32, 32, 1], fp32, ElementArrangement.STANDARD
             )
-        # An exact ratio rescales as before.
-        two_sticks = SpyreTensorLayout(
-            [2, 4, 32], [32, 32, 1], fp32, ElementArrangement.STANDARD
+            return rescale_stl_for_dtype(
+                stl, torch.float16, ElementArrangement.STANDARD
+            )
+
+        # One fp32 stick: a whole fp16 stick, never a size-0 dim.
+        self.assertEqual(list(rescaled(1).device_size), [1, 4, 64])
+        # Three fp32 sticks (96 elements) span two fp16 sticks; flooring to one
+        # would drop 32 elements.
+        self.assertEqual(list(rescaled(3).device_size), [2, 4, 64])
+        # Four, the padded form of the same 96 live elements, agrees.
+        self.assertEqual(list(rescaled(4).device_size), [2, 4, 64])
+        # An exact ratio rescales the dim and its stride.
+        self.assertEqual(list(rescaled(2).device_size), [1, 4, 64])
+        self.assertEqual(list(rescaled(2).stride_map), [64, 32, 1])
+
+    def test_rescale_for_dtype_leaves_a_sub_stick_dim_alone(self):
+        """A num-sticks stride below the input stick depth marks a stick dim
+        shorter than one stick: the entry is the host extent, not a stick step,
+        and the dim already counts the single stick that extent occupies.
+        Rescaling it would claim stepping the host tensor does not have, which
+        the layout validator rejects, so only the stick depth changes.
+
+        A sentinel num-sticks slot (-1, a dim that is extent 1 by construction
+        and never stepped) is left alone for the same reason. Needs no device.
+        """
+        from torch_spyre._C import ElementArrangement
+        from torch_spyre._inductor.pass_utils import rescale_stl_for_dtype
+
+        fp16 = get_device_dtype(torch.float16)
+        # Host extent 5 at fp16: the num-sticks stride is the extent, not 64.
+        sub_stick = SpyreTensorLayout(
+            [3, 1, 2, 64], [5, 5, 15, 1], fp16, ElementArrangement.STANDARD
         )
-        rescaled = rescale_stl_for_dtype(
-            two_sticks, torch.float16, ElementArrangement.STANDARD
+        out = rescale_stl_for_dtype(
+            sub_stick, torch.float32, ElementArrangement.STANDARD
         )
-        self.assertEqual(list(rescaled.device_size), [1, 4, 64])
-        self.assertEqual(list(rescaled.stride_map), [64, 32, 1])
+        self.assertEqual(list(out.device_size), [3, 1, 2, 32])
+        self.assertEqual(list(out.stride_map), [5, 5, 15, 1])
+
+        scalar = SpyreTensorLayout([1, 64], [-1, -1], fp16, ElementArrangement.STANDARD)
+        scalar_out = rescale_stl_for_dtype(
+            scalar, torch.float32, ElementArrangement.STANDARD
+        )
+        self.assertEqual(list(scalar_out.device_size), [1, 32])
+        self.assertEqual(list(scalar_out.stride_map), [-1, -1])
 
     def test_qfp8ch_layout_rounds_a_partial_stick_up(self):
         """qfp8ch's fp16 -> fp8 output may end in a partially filled fp8 stick:
@@ -794,7 +822,8 @@ class TestSpyreTensorLayout(TestCase):
         stride_map entry each. A negative dim is rejected at construction
         instead of crashing the process later. A size-0 dim is how an empty
         tensor is laid out and stays legal; the degenerate size-0 dim behind
-        issue #3604 is refused by rescale_stl_for_dtype instead."""
+        issue #3604 cannot arise, because rescale_stl_for_dtype rounds its
+        num-sticks dim up."""
         from torch_spyre._C import ElementArrangement
 
         fp16 = get_device_dtype(torch.float16)

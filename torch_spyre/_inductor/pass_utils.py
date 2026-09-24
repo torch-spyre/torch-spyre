@@ -174,6 +174,34 @@ def get_mem_deps(n: SchedulerNode) -> list[SchedNodeArg]:
     return res
 
 
+def num_sticks_dim(stl: SpyreTensorLayout) -> int | None:
+    """Return the device dim that counts sticks, or None if there is no such dim.
+
+    The last device dim is the stick depth; exactly one other dim counts how many
+    sticks the tensor holds. Its position is fixed by the device layout
+    convention, matching ``stick_dim_index`` in ``csrc/spyre_mem.cpp``: the third
+    dim from the end for a rank 3 or higher layout, the first dim for rank 2.
+
+    Identifying it by position rather than by matching ``stride_map`` against the
+    stick depth is what makes sub-stick tensors work. A ``stride_map`` entry is a
+    host-element step, and ``dim_map_to_stride_map`` writes
+    ``min(elems_per_stick, host_extent)``, so a tensor whose stick dim is shorter
+    than one stick carries its own extent there (5, 7, 32) and never the stick
+    depth. Matching on the depth misses those layouts entirely, and on an aligned
+    layout whose batch stride happens to equal the depth it matches the batch dim
+    instead.
+
+    Returns None for a layout whose num-sticks slot holds the sentinel -1, which
+    marks a dim that is extent 1 by construction and never stepped (a scalar is
+    ``[1, 64]`` / ``[-1, -1]``). Such a dim counts no sticks, so a caller
+    rescaling stick depth leaves it alone.
+    """
+    if len(stl.device_size) < 2:
+        return None
+    dim = len(stl.device_size) - 3 if len(stl.device_size) > 2 else 0
+    return None if stl.stride_map[dim] <= 0 else dim
+
+
 def rescale_stl_for_dtype(
     stl: SpyreTensorLayout,
     out_dtype: torch.dtype,
@@ -182,57 +210,47 @@ def rescale_stl_for_dtype(
     """Propagate a device layout across a same-shape, differing-stick-depth dtype conversion.
 
     Copies the input STL's ``device_size``/``stride_map`` and rescales the stick
-    depth (the last device dim) plus, when present, the one non-stick dim whose
-    stride equals the input stick depth. This preserves any non-canonical layout
-    or padding present in the input STL instead of reconstructing a dense layout
-    from the logical size/stride.
+    depth (the last device dim) plus the num-sticks dim. This preserves any
+    non-canonical layout or padding present in the input STL instead of
+    reconstructing a dense layout from the logical size/stride.
 
     The input elements-per-stick is read from ``stl.device_size[-1]`` (the stick
     dimension is always full, so it equals ``get_elem_in_stick(in_dtype)``); the
     output count comes from ``out_dtype``.
 
-    The rescale must be exact: the dim's sticks must hold a whole number of
-    output sticks. Flooring an inexact ratio either drops data (three fp32
-    sticks of 32 elements floor to one fp16 stick, losing 32 elements) or
-    floors to zero (one fp32 stick, ``1 * 32 // 64``), and a zero-sized device
-    dim used to reach ``get_device_stride_infos`` and kill the process with
-    SIGFPE (issue #3604). A conversion whose output can legitimately end in a
-    partially filled stick builds its own layout instead (see
-    ``_qfp8ch_stl`` in propagate_layouts.py).
+    The num-sticks count rounds UP, so that the same live elements yield the same
+    layout whether or not the input has already been padded: three fp32 sticks
+    and four both hold 96 live elements and both describe two fp16 sticks.
+    Rounding up is also what keeps a single input stick from flooring to a
+    size-0 dim, which described no tensor and reached
+    ``get_device_stride_infos`` to divide by it and kill the process with SIGFPE
+    (issue #3604).
+
+    A narrowing output may therefore end in a partially filled stick, carrying
+    capacity the input does not yet cover. Giving that stick real storage on the
+    wide-dtype side is ``insert_staggered_ea_padding``'s job, and it sizes the
+    padding from the layout returned here (issue #3999).
 
     Args:
         stl: Input device layout to rescale.
         out_dtype: Torch dtype of the conversion output.
         ea: ElementArrangement to stamp on the returned layout.
-
-    Raises:
-        Unsupported: If the stick-indexing dim does not rescale to a whole
-            number of output sticks.
     """
     in_eps = stl.device_size[-1]
     out_eps = get_elem_in_stick(out_dtype)
     out_device_size = list(stl.device_size)
     out_stride_map = list(stl.stride_map)
     out_device_size[-1] = out_eps
-    # Rescale the first non-stick dim that indexes whole sticks (stride == the
-    # input stick depth) by the stick-depth ratio. A staggered/sparse layout
-    # (e.g. the DL16_TO_FP32 restoration operand, whose stride_map carries
-    # sentinel -1 entries rather than a linear num-sticks stride) has no such
-    # dim; there only the stick depth changes, so a no-match is expected and
-    # left as-is.
-    for i, s in enumerate(stl.stride_map):
-        if s == in_eps:
-            total_elems = stl.device_size[i] * in_eps
-            if total_elems % out_eps != 0:
-                raise Unsupported(
-                    f"cannot rescale device layout {list(stl.device_size)} for "
-                    f"conversion to {out_dtype}: device dim {i} holds "
-                    f"{stl.device_size[i]} stick(s) of {in_eps} elements, which is "
-                    f"not a whole number of {out_eps}-element output sticks"
-                )
-            out_device_size[i] = total_elems // out_eps
-            out_stride_map[i] = out_eps
-            break
+    dim = num_sticks_dim(stl)
+    # A num-sticks stride below the input stick depth means the stick dim is
+    # shorter than one stick: the entry is the host extent, not a stick step, and
+    # the dim already counts the single stick that extent occupies. Rescaling it
+    # would claim stepping the host tensor does not have, so only the depth
+    # changes there.
+    if dim is not None and stl.stride_map[dim] >= in_eps:
+        total_elems = stl.device_size[dim] * in_eps
+        out_device_size[dim] = -(-total_elems // out_eps)
+        out_stride_map[dim] = out_eps * stl.stride_map[-1]
     return SpyreTensorLayout(
         out_device_size,
         out_stride_map,
