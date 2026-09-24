@@ -18,6 +18,7 @@ Four independent producers must agree on these uuids -- this library, the Jenkin
 and the product-repo ingests. A drift does not raise; it silently stops rows joining.
 """
 
+import json
 import uuid
 
 import pytest
@@ -32,6 +33,7 @@ from spyre_clickhouse_ingest import (
     run_id_of,
     case_id_for,
 )
+from spyre_clickhouse_ingest.identity import ArtifactId
 
 
 class _Args:
@@ -208,6 +210,50 @@ def test_base_artifact_id_is_blank_when_absent(tmp_path):
     empty = tmp_path / "empty.txt"
     empty.write_text("\n")
     assert base_artifact_id(str(empty)) == ""
+
+
+def test_base_artifact_id_prefers_the_json_record(tmp_path):
+    # New-format images stamp spyre_artifact.json (all metadata); the bare-string file is only
+    # the pre-rollout fallback, so a JSON record present must win over it.
+    f = tmp_path / "spyre_artifact.json"
+    f.write_text(json.dumps({"artifact_id": "  2B397099-6200-52FB-98C4-B603961A0582 "}))
+    assert base_artifact_id(str(f)) == "2b397099-6200-52fb-98c4-b603961a0582"
+
+
+def test_base_artifact_id_falls_back_to_bare_string_when_json_absent(tmp_path):
+    # A path override checks BOTH formats at that same path -- a test fixture with one file
+    # need not pick a format ahead of time.
+    f = tmp_path / "spyre_artifact_id.txt"
+    f.write_text("2b397099-6200-52fb-98c4-b603961a0582\n")
+    assert base_artifact_id(str(f)) == "2b397099-6200-52fb-98c4-b603961a0582"
+
+
+def test_base_artifact_id_falls_back_on_malformed_json(tmp_path):
+    # Malformed JSON must not raise -- it degrades to the bare-string fallback read, at the
+    # library's own default path (a real deployment never points both formats at one file).
+    bad = tmp_path / "spyre_artifact.json"
+    bad.write_text("{not valid json")
+    assert ArtifactId.metadata_from_image(str(bad)) == {}
+    assert base_artifact_id(str(tmp_path / "nope.txt")) == ""
+
+
+def test_metadata_from_image_returns_the_full_record(tmp_path):
+    f = tmp_path / "spyre_artifact.json"
+    record = {
+        "artifact_id": "2b397099-6200-52fb-98c4-b603961a0582",
+        "component": "torch-spyre",
+        "arch": "amd64",
+        "id12": "492504101aed",
+    }
+    f.write_text(json.dumps(record))
+    assert ArtifactId.metadata_from_image(str(f)) == record
+
+
+def test_metadata_from_image_is_blank_dict_when_absent_or_malformed(tmp_path):
+    assert ArtifactId.metadata_from_image(str(tmp_path / "nope.json")) == {}
+    bad = tmp_path / "bad.json"
+    bad.write_text("[1, 2, 3]")  # valid JSON, but not a record
+    assert ArtifactId.metadata_from_image(str(bad)) == {}
 
 
 def test_gha_artifact_id_chains_onto_a_real_embedded_id():

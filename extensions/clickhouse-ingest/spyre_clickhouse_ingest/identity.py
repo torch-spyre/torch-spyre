@@ -15,6 +15,7 @@
 """Derived, never-minted uuid5 identities: one class per kind, sharing `DerivedId`."""
 
 import hashlib
+import json
 import uuid
 
 from .junit import RunCoordinates
@@ -27,7 +28,12 @@ ID_SEP = "|"
 # test cell may run another component's suite, and component is a hash input.
 COMPONENT_DEFAULT = "torch-spyre"
 
-# Where the image build writes its own artifact_id, beside installed_rpms.txt.
+# Full-metadata identity record, one per component layer (each Containerfile overwrites its
+# own). Preferred read path.
+SPYRE_ARTIFACT_JSON_FILE = "/home/senuser/spyre_artifact.json"
+
+# Pre-JSON-rollout format: a bare id, beside installed_rpms.txt. Kept as a fallback so images
+# built before the rollout (or an unstamped standalone build) still derive something.
 BASE_ARTIFACT_ID_FILE = "/home/senuser/spyre_artifact_id.txt"
 
 
@@ -130,6 +136,7 @@ class ArtifactId(DerivedId):
     """Content identity of an artifact: (component, artifact_name, id12, arch)."""
 
     FILE = BASE_ARTIFACT_ID_FILE
+    JSON_FILE = SPYRE_ARTIFACT_JSON_FILE
 
     @classmethod
     def derive(cls, component: str, artifact_name: str, id12: str, arch: str) -> str:
@@ -144,8 +151,28 @@ class ArtifactId(DerivedId):
         )
 
     @classmethod
+    def metadata_from_image(cls, path: str = "") -> dict:
+        """The full stamped identity record (component, deps, sources, ...); {} when absent
+        or pre-rollout (a bare-id image has no JSON to parse)."""
+        try:
+            with open(path or cls.JSON_FILE) as fh:
+                data = json.loads(fh.read())
+        except (OSError, ValueError):
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    @classmethod
     def from_image(cls, path: str = "") -> str:
-        """The prebaked image's own artifact_id, read from inside it; '' when absent."""
+        """The prebaked image's own artifact_id, read from inside it; '' when absent.
+
+        Tries the JSON record first, falling back to the pre-rollout bare-id file so an
+        image built before every component stamped its own JSON still derives something.
+        `path`, when given, overrides both attempts (it names the caller's single test file).
+        """
+        meta = cls.metadata_from_image(path or cls.JSON_FILE)
+        aid = cls.norm(meta.get("artifact_id")) if meta else ""
+        if aid:
+            return aid
         try:
             with open(path or cls.FILE) as fh:
                 return cls.norm(fh.read())

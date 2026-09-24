@@ -28,6 +28,7 @@ from spyre_clickhouse_ingest.schema import (
     STATE_VALUES,
     TEST_TYPE_VALUES,
 )
+from spyre_clickhouse_ingest.writer import ArtifactWriter
 
 # The id _package-image stamps into spyre-backend-dev/amd64, verified against prod.
 BASE = "2b397099-6200-52fb-98c4-b603961a0582"
@@ -190,6 +191,35 @@ def test_installed_digest_is_order_independent_and_empty_for_nothing():
     assert installed_digest("a a b") == installed_digest("a b")
     assert installed_digest("") == ""
     assert installed_digest("   ") == ""
+
+
+def test_result_recorded_query_excludes_seeded_running_rows():
+    # Jenkins seeds a 'running' row before dispatch (Part C); it must not count as "already
+    # recorded" or the leg's own terminal insert_gha_result call would be silently skipped.
+    c = FakeClient(counts=[1])
+    assert (
+        ArtifactWriter.result_recorded(c, "db", BASE, RUN, "functional", "regression")
+        is True
+    )
+    sql, params = c.queries[0]
+    assert "state != 'running'" in sql
+    assert params == {
+        "artifact_id": BASE,
+        "run_id": RUN,
+        "result_kind": "functional",
+        "test_type": "regression",
+    }
+
+
+def test_a_seeded_running_row_does_not_block_the_terminal_insert():
+    # End-to-end through insert_gha_artifact_result: artifact already known (count=1), and
+    # the ONLY existing result row is the seed -- FakeClient can't filter by state itself, so
+    # this only proves the call path still inserts when result_recorded's own guard (tested
+    # above) says "not yet recorded".
+    c = FakeClient(counts=[1, 0])  # artifact known; no non-running verdict yet
+    assert _call(c, state="passed") is True
+    assert len(_rows(c, ARTIFACT_RESULTS)) == 1
+    assert _rows(c, ARTIFACT_RESULTS)[0]["state"] == "passed"
 
 
 def test_an_unchanged_image_gets_a_verdict_but_no_artifact_row():

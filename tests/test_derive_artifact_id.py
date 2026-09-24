@@ -19,6 +19,7 @@ identity functions it calls are stdlib-only, which is why the action needs no ve
 """
 
 import importlib.util
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -43,10 +44,31 @@ def derive_mod():
 
 @pytest.fixture
 def base_file(tmp_path):
-    # Upper-case and padded: the builder's spelling must not change the identity.
+    # New format: the full JSON record every component now stamps. Upper-case id, so the
+    # builder's spelling must not change the identity.
+    f = tmp_path / "spyre_artifact.json"
+    f.write_text(json.dumps({"artifact_id": BASE.upper()}))
+    return str(f)
+
+
+@pytest.fixture
+def bare_base_file(tmp_path):
+    # Pre-rollout format: a bare id beside installed_rpms.txt. Kept so an image built before
+    # every component stamped its own JSON still derives something.
     f = tmp_path / "spyre_artifact_id.txt"
     f.write_text(f"  {BASE.upper()} \n")
     return str(f)
+
+
+def test_a_leg_still_chains_onto_a_pre_rollout_bare_string_base(
+    derive_mod, bare_base_file
+):
+    record, aid, base = derive_mod.derive(
+        "torch-spyre", "amd64", "lxml", bare_base_file, str(LIB)
+    )
+    assert base == BASE
+    assert aid != BASE
+    assert record == f"{aid}|{BASE}|lxml"
 
 
 def test_a_leg_that_installed_something_chains_onto_the_base(derive_mod, base_file):
