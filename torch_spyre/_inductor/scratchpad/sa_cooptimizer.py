@@ -49,8 +49,8 @@ import math
 import random as rnd
 import statistics
 from collections.abc import Iterable, Sequence
-from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Optional, cast
+from dataclasses import dataclass, field, replace
+from typing import TYPE_CHECKING, Any, Callable, Optional, cast
 
 import sympy
 
@@ -78,6 +78,7 @@ from torch_spyre._inductor.logging_utils import get_inductor_logger
 from torch_spyre._inductor.pass_utils import iteration_space_from_op
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
+    from torch_spyre._inductor.scratchpad.coarse_tiling import TileReads
     from torch_spyre._inductor.scratchpad.plan_solver import CoreDivision
 
 logger = get_inductor_logger("scratchpad.sa_cooptimizer")
@@ -608,12 +609,17 @@ class _ViewRelation(_EdgeRelation):
     Propagation is memoized on the *whole* key where compatibility is memoized
     on the split half: the division constructed on the far side carries the
     near side's tiling where it can, so which tiling was asked for changes the
-    answer even though the verdict does not.
+    answer even though the verdict does not. It carries none that ``carries``
+    refuses: a spec the reader does not read as written would put the two ends
+    in different groups (``derive_tiling_groups``) and the trim would strip it.
     """
 
     edge: "ResidencyEdge"
     parent_source: _GeneratedDivisions
     child_source: _GeneratedDivisions
+    carries: Callable[["TileSpec"], bool] = field(
+        default=lambda _spec: True, repr=False
+    )
     _compatible: dict = field(default_factory=dict, repr=False)
     _down: dict = field(default_factory=dict, repr=False)
     _up: dict = field(default_factory=dict, repr=False)
@@ -628,10 +634,15 @@ class _ViewRelation(_EdgeRelation):
             )
         return self._compatible[pair]
 
+    def _carried(self, division: "CoreDivision") -> "CoreDivision":
+        if self.carries(division.tiling):
+            return division
+        return replace(division, tiling=_UNTILED)
+
     def child_for(self, parent: DivisionConfig) -> Optional[DivisionConfig]:
         if parent.key not in self._down:
             division = self.edge.consumer_division_for(
-                parent.division, self.child_source.space
+                self._carried(parent.division), self.child_source.space
             )
             self._down[parent.key] = (
                 None if division is None else self.child_source.config_for(division)
@@ -641,7 +652,7 @@ class _ViewRelation(_EdgeRelation):
     def parent_for(self, child: DivisionConfig) -> Optional[DivisionConfig]:
         if child.key not in self._up:
             division = self.edge.parent_division_for(
-                child.division, self.parent_source.space
+                self._carried(child.division), self.parent_source.space
             )
             self._up[child.key] = (
                 None if division is None else self.parent_source.config_for(division)
@@ -911,6 +922,22 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
             self._buffer_at[position] = idx
             self._position_of.append(position)
         self._n_positions = max(self._buffer_at, default=-1) + 1
+        # Reader position -> (earlier producer position, whether it reads that
+        # producer tile by tile under a pair of specs), and the same by
+        # producer: where a run breaks (see :meth:`_breaks_at`).
+        self._tile_reads: dict[int, list[tuple[int, TileReads]]] = {}
+        self._tile_readers: dict[int, list[tuple[int, TileReads]]] = {}
+        for idx, buf in enumerate(self._bufs):
+            reader = self._position_of[idx]
+            if reader is None:
+                continue
+            for name, reads in sorted(buf.tile_reads.items()):
+                p_idx = self._name_to_idx.get(name)
+                producer = None if p_idx is None else self._position_of[p_idx]
+                if producer is None or producer >= reader:
+                    continue
+                self._tile_reads.setdefault(reader, []).append((producer, reads))
+                self._tile_readers.setdefault(producer, []).append((reader, reads))
 
     def _tiling_at(
         self,
@@ -929,24 +956,53 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         )
         return config.tiling
 
+    def _breaks_at(
+        self,
+        position: int,
+        stretch: int,
+        override: Optional[dict[int, DivisionConfig]] = None,
+    ) -> bool:
+        """Whether ``derive_tiling_groups`` starts a group at ``position``
+        inside a stretch of one nest starting at ``stretch``: it does not read
+        some op of the stretch tile by tile, each under its own spec."""
+        spec = self._tiling_at(position, override)
+        if spec.is_untiled:
+            return False
+        return any(
+            stretch <= producer
+            and not reads.aligned(self._tiling_at(producer, override), spec)
+            for producer, reads in self._tile_reads.get(position, ())
+        )
+
     def _run_bounds(
         self,
         position: int,
         override: Optional[dict[int, DivisionConfig]] = None,
     ) -> tuple[int, int]:
-        """The maximal contiguous stretch of operation positions agreeing with
-        ``position`` on the tiling -- inclusive on both ends.
+        """The run holding ``position`` -- inclusive on both ends: the group
+        ``derive_tiling_groups`` forms there, i.e. the maximal stretch of
+        positions agreeing on the loop nest, cut where :meth:`_breaks_at`.
 
         Untiled is a spec value like any other, so these runs partition the whole
         operation list. That is what lets a boundary move *create* a tiled region
         rather than only shrink one.
         """
-        spec = self._tiling_at(position, override)
-        lo = position
-        while lo > 0 and self._tiling_at(lo - 1, override) == spec:
-            lo -= 1
+        nest = self._tiling_at(position, override).level_counts
+        stretch = position
+        while (
+            stretch > 0 and self._tiling_at(stretch - 1, override).level_counts == nest
+        ):
+            stretch -= 1
+        lo = stretch
+        for at in range(stretch + 1, position + 1):
+            if self._breaks_at(at, stretch, override):
+                lo = at
         hi = position
-        while hi + 1 < self._n_positions and self._tiling_at(hi + 1, override) == spec:
+        while (
+            hi + 1 < self._n_positions
+            and self._tiling_at(hi + 1, override).level_counts == nest
+            and not self._breaks_at(hi + 1, stretch, override)
+        ):
             hi += 1
         return lo, hi
 
@@ -966,7 +1022,14 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
             and isinstance(parent_source, _GeneratedDivisions)
             and isinstance(child_source, _GeneratedDivisions)
         ):
-            return _ViewRelation(edge, parent_source, child_source)
+            reads = self._bufs[c_idx].tile_reads.get(p_name)
+            if reads is None:
+                return _ViewRelation(edge, parent_source, child_source)
+
+            def carries(spec: TileSpec) -> bool:
+                return reads.aligned(spec, spec)
+
+            return _ViewRelation(edge, parent_source, child_source, carries)
         return _table_relation(
             (
                 (int(a), int(b))
@@ -1227,7 +1290,9 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         as it forms any two runs.
 
         An operation that produces no solver buffer stops the walk for the same
-        reason it breaks a run: nothing can carry a tiling to it.
+        reason it breaks a run: nothing can carry a tiling to it. So does an op
+        the new spec would cut from the stretch written so far
+        (:meth:`_misread_across`).
 
         The single-op flip survives as the degenerate case -- ``H`` at a run end
         -- and a mid-run split is two steps rather than one.
@@ -1247,6 +1312,10 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
             target = self._buffer_at.get(at)
             if target is None:
                 break
+            if at != position and self._misread_across(
+                at, position, config.tiling, forward
+            ):
+                break
             retiled = self._sources[target].retiled(self.chosen[target], config.tiling)
             if retiled is None:
                 break
@@ -1256,6 +1325,21 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
             at += step
         if assignment:
             self._apply_assignment(assignment)
+
+    def _misread_across(
+        self, at: int, start: int, spec: "TileSpec", forward: bool
+    ) -> bool:
+        """Whether ``spec`` would cut ``at`` from the stretch it extends,
+        ``start..at - 1`` walking forward or ``at + 1..start`` walking back,
+        every op of which the walk gives ``spec``: :meth:`_breaks_at` over the
+        reads ``at`` adds."""
+        if spec.is_untiled:
+            return False
+        if forward:
+            edges = [r for p, r in self._tile_reads.get(at, ()) if start <= p]
+        else:
+            edges = [r for p, r in self._tile_readers.get(at, ()) if p <= start]
+        return any(not reads.aligned(spec, spec) for reads in edges)
 
     def _flood_region(
         self, anchor: int, config: DivisionConfig

@@ -458,8 +458,9 @@ def derive_tiling_groups(
     the group boundary. The stretch is every op since the nest last changed,
     not only the current group: that over-splits only where the producer is
     already in an earlier group, and it keeps where a group starts a function of
-    the ops between a consumer and what it reads, which a search re-tiling one
-    op at a time relies on. Returns ``(ops, level counts)`` per group.
+    the ops between a consumer and what it reads, which the SA co-optimizer
+    re-derives per move (``SaCoOptimizingSolver._run_bounds``). Returns
+    ``(ops, level counts)`` per group.
 
     ``choices`` is keyed by operation name (``op.get_operation_name()``).
     """
@@ -575,6 +576,40 @@ def tile_misread(
             f"({producer_spec.label}) writes it"
         )
     return None
+
+
+@dataclasses.dataclass
+class TileReads:
+    """Whether ``consumer`` reads ``producer`` tile by tile under a pair of
+    specs -- :func:`tile_misread` over every read of it, the question
+    :func:`derive_tiling_groups` asks of an edge in a stretch -- memoized per
+    pair, for a search that asks it per move."""
+
+    graph: GraphLowering
+    producer: Operation
+    consumer: Operation
+    _memo: dict[tuple[TileSpec, TileSpec], bool] = dataclasses.field(
+        default_factory=dict, repr=False
+    )
+
+    def aligned(self, producer_spec: TileSpec, consumer_spec: TileSpec) -> bool:
+        key = (producer_spec, consumer_spec)
+        if key not in self._memo:
+            name = self.producer.get_name()
+            self._memo[key] = all(
+                tile_misread(
+                    self.graph,
+                    self.producer,
+                    producer_spec,
+                    self.consumer,
+                    consumer_spec,
+                    read,
+                )
+                is None
+                for read in op_read_writes(self.consumer).reads
+                if read.name == name
+            )
+        return self._memo[key]
 
 
 def _derive_hint_id_base(graph: GraphLowering) -> int:

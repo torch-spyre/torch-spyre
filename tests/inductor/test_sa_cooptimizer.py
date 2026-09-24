@@ -36,6 +36,7 @@ import random as rnd
 import subprocess
 import sys
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 from unittest import TestCase
 
@@ -70,7 +71,12 @@ from torch_spyre._inductor.scratchpad.plan_solver import (
     TileSpec,
 )
 from synthetic_cooptimization_graphs import synthetic_graphs
-from utils_inductor import mock_op_split_space
+from utils_inductor import (
+    ir_computed_buffer,
+    ir_input_loader,
+    mock_op_split_space,
+    patch_row_major_out_coords,
+)
 
 
 def _seed_footprint(buffers):
@@ -1947,3 +1953,174 @@ class ContiguousTilingRunTest(TestCase):
             for _ in range(200):
                 solver._execute_move("flip")
         boundary.assert_not_called()
+
+
+def _attention_ops():
+    """``KT = K^T``, ``S = Q @ KT``, ``V``, ``O = S @ V`` as IR, in that order,
+    under the caller's graph handler: tiling host dim 0 of all four, ``S``
+    reduces over ``KT``'s tiled dim and ``O`` over ``V``'s."""
+    from torch._inductor.virtualized import ops
+
+    buf, load_input = ir_computed_buffer, ir_input_loader
+    load_q, load_k = load_input("q", [8, 16]), load_input("k", [8, 16])
+    load_kt, kt = buf("KT", [16, 8], lambda i: load_k([i[1], i[0]]))
+    load_s, s = buf(
+        "S",
+        [8, 8],
+        lambda i, r: ops.mul(load_q([i[0], r[0]]), load_kt([r[0], i[1]])),
+        reduction_ranges=[16],
+    )
+    load_v, v = buf("V", [8, 16], load_input("v_in", [8, 16]))
+    _, o = buf(
+        "O",
+        [8, 16],
+        lambda i, r: ops.mul(load_s([i[0], r[0]]), load_v([r[0], i[1]])),
+        reduction_ranges=[8],
+    )
+    return [kt, s, v, o]
+
+
+def _permuted_stretch_ops():
+    """``P``, ``C = P`` permuted, ``D = C + P`` permuted, as IR under the
+    caller's graph handler: tiling host dim 0, ``C`` misreads ``P`` and ``D``
+    reads ``C`` as written but misreads ``P``."""
+    from torch._inductor.virtualized import ops
+
+    buf = ir_computed_buffer
+    load_p, p = buf("P", [4, 8, 128], ir_input_loader("in0", [4, 8, 128]))
+    load_c, c = buf("C", [8, 4, 128], lambda i: load_p([i[1], i[0], i[2]]))
+    _, d = buf(
+        "D",
+        [8, 4, 128],
+        lambda i: ops.add(load_c(i), load_p([i[1], i[0], i[2]])),
+    )
+    return [p, c, d]
+
+
+class ApplyGroupAgreementTest(TestCase):
+    """The SA's runs are the groups ``derive_tiling_groups`` forms, including
+    where a reader walks a run member's tiled host dim differently than that
+    member writes it -- the attention chain's ``S = Q @ K^T`` and ``O = S @ V``
+    both reduce over what the positional spec tiles upstream."""
+
+    def setUp(self):
+        from torch import fx
+        from torch._inductor.graph import GraphLowering
+        from torch._inductor.virtualized import V
+
+        self.enterContext(
+            V.set_graph_handler(GraphLowering(fx.symbolic_trace(lambda: None)))
+        )
+        self.enterContext(patch_row_major_out_coords())
+
+    def _solver(self, operations):
+        from torch_spyre._inductor.scratchpad.allocator import CoOptimizingAllocator
+
+        from torch._inductor.virtualized import V
+
+        op_by_name = {op.get_name(): op for op in operations}
+        bufs = []
+        for at, op in enumerate(operations):
+            buf = _run_buffer(
+                op.get_name(), at, _two_axis_space(tiling=_tiling_space())
+            )
+            buf.tile_reads = CoOptimizingAllocator._tile_reads(V.graph, op, op_by_name)
+            buf.parents = sorted(buf.tile_reads)
+            bufs.append(buf)
+        solver = _primed(bufs, 1 << 30)
+        for idx in range(len(bufs)):
+            solver.chosen[idx] = _config(CoreDivision({_AXIS_0: 2}, tiling=_TILE_2))
+        return solver
+
+    def _assert_runs_are_the_applied_groups(self, operations, expected):
+        from torch_spyre._inductor.scratchpad.coarse_tiling import (
+            derive_tiling_groups,
+        )
+
+        solver = self._solver(operations)
+        from torch._inductor.virtualized import V
+
+        groups = derive_tiling_groups(
+            SimpleNamespace(operations=operations, get_buffer=V.graph.get_buffer),
+            {op.get_name(): _TILE_2 for op in operations},
+        )
+        position = {op.get_name(): at for at, op in enumerate(operations)}
+        applied = {
+            position[op.get_name()]: (
+                position[ops[0].get_name()],
+                position[ops[-1].get_name()],
+            )
+            for ops, _spec in groups
+            for op in ops
+        }
+        self.assertEqual(sorted(set(applied.values())), expected)
+        self.assertEqual(
+            {p: solver._run_bounds(p) for p in range(len(operations))}, applied
+        )
+
+    def test_the_runs_are_the_applied_groups(self):
+        self._assert_runs_are_the_applied_groups(
+            _attention_ops(), [(0, 0), (1, 2), (3, 3)]
+        )
+
+    def test_a_misread_of_an_earlier_group_of_the_stretch_breaks_the_run(self):
+        # D reads C as written but P, in C's stretch, permuted.
+        self._assert_runs_are_the_applied_groups(
+            _permuted_stretch_ops(), [(0, 0), (1, 1), (2, 2)]
+        )
+
+    def test_the_trim_strips_a_tiling_carried_across_a_misaligned_read(self):
+        solver = self._solver(_attention_ops())
+        assignment = {i: solver.chosen[i] for i in range(4)}
+        trimmed = solver._trim_tilings_to_anchor_run(1, assignment)
+        self.assertEqual(
+            [trimmed[i].tiling.is_untiled for i in range(4)],
+            [True, False, False, True],
+        )
+
+    def test_a_boundary_flip_stops_at_a_misaligned_read(self):
+        tiled = _config(CoreDivision({_AXIS_0: 2}, tiling=_TILE_2))
+        for position, draw, expected in (
+            (1, 0.0, [False, True, True, False]),  # forward: O misreads V
+            (3, 0.9, [False, False, False, True]),  # back: likewise
+        ):
+            solver = self._solver(_attention_ops())
+            for idx in range(4):
+                solver.chosen[idx] = _config(CoreDivision({_AXIS_0: 2}))
+            with mock.patch.object(solver._rng, "random", return_value=draw):
+                solver._retile_boundary(position, tiled)
+            self.assertEqual(
+                [not solver.chosen[i].tiling.is_untiled for i in range(4)], expected
+            )
+
+    def test_the_view_relation_carries_no_tiling_across_a_misaligned_read(self):
+        space = _two_axis_space(tiling=_tiling_space())
+        parent_source = _GeneratedDivisions(space, _config(_axis_div(), menu_index=0))
+        child_source = _GeneratedDivisions(space, _config(_axis_div(), menu_index=0))
+        edge = mock.MagicMock()
+        edge.consumer_division_for.side_effect = lambda division, _space: division
+        edge.parent_division_for.side_effect = lambda division, _space: division
+        relation = _ViewRelation(
+            edge,
+            parent_source,
+            child_source,
+            lambda spec: all(axis.host_dim == 1 for axis in spec.axes),
+        )
+        tiled = parent_source.config_for(space.division({_AXIS_0: 2}, _TILE_4))
+        self.assertTrue(relation.child_for(tiled).tiling.is_untiled)
+        self.assertTrue(relation.parent_for(tiled).tiling.is_untiled)
+        self.assertEqual(relation.child_for(tiled).division.output_splits, {_AXIS_0: 2})
+
+    def test_the_edge_relation_takes_the_readers_alignment(self):
+        parent = _run_buffer("P", 0, _two_axis_space(tiling=_tiling_space()))
+        child = _run_buffer("C", 1, _two_axis_space(tiling=_tiling_space()))
+        child.parents = ["P"]
+        child.residency_edges = {"P": mock.MagicMock()}
+        reads = mock.MagicMock()
+        reads.aligned.side_effect = lambda parent_spec, child_spec: all(
+            axis.host_dim == 1 for axis in child_spec.axes
+        )
+        child.tile_reads = {"P": reads}
+        relation = _primed([parent, child], 1 << 30)._relations[(0, 1)]
+        self.assertFalse(relation.carries(_TILE_2))
+        self.assertTrue(relation.carries(TileSpec((TileAxis(host_dim=1, count=2),))))

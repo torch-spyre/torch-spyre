@@ -20,7 +20,7 @@ from abc import ABC, abstractmethod
 from collections import defaultdict
 from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
-from typing import Any, Callable, cast, NamedTuple, Optional
+from typing import TYPE_CHECKING, Any, Callable, cast, NamedTuple, Optional
 
 import sympy
 from torch._inductor.ir import (
@@ -166,6 +166,9 @@ _COST_PARAMS = CostParams(
     overlap_gamma=0.46,
     use_bundled_cost_model=False,
 )
+
+if TYPE_CHECKING:
+    from torch_spyre._inductor.scratchpad.coarse_tiling import TileReads
 
 logger = get_inductor_logger("scratchpad.allocator")
 
@@ -4170,9 +4173,26 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                 and self._solver_generates_divisions
             ):
                 buffer.division_space = self._division_space(op)
+            if self._solver_chooses_tilings and isinstance(op, ComputedBuffer):
+                buffer.tile_reads = self._tile_reads(graph, op, op_by_name)
             buffers.append(buffer)
         buffers.extend(self._relayout_copy_buffers(buffers, self.size))
         return buffers
+
+    @staticmethod
+    def _tile_reads(
+        graph: GraphLowering, op: ComputedBuffer, op_by_name: dict[str, Operation]
+    ) -> dict[str, "TileReads"]:
+        """``CoreDivisionBuffer.tile_reads`` for ``op``: one per computed
+        buffer it reads."""
+        # Local import: ``coarse_tiling`` imports this module.
+        from torch_spyre._inductor.scratchpad.coarse_tiling import TileReads
+
+        return {
+            name: TileReads(graph, producer, op)
+            for name in sorted({read.name for read in op.get_read_writes().reads})
+            if isinstance(producer := op_by_name.get(name), ComputedBuffer)
+        }
 
     @staticmethod
     def _loop_carry_update_edge(
