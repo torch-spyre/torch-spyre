@@ -3616,9 +3616,10 @@ def select_allocator() -> ScratchpadAllocator:
       instance. ``"simulated_annealing"`` is served by
       :class:`SaCoOptimizingSolver`, the joint work-division + LX engine.
       Otherwise a core-division-capable factory (currently only ``"cpsat"``, and
-      only when ortools is available) is used directly; every other factory is
-      wrapped in an :class:`ExhaustiveSearchSolver` that does an exhaustive
-      search of all the core division options.
+      only when ortools is available) is used directly; every other factory
+      would need to be wrapped in an :class:`ExhaustiveSearchSolver` that does
+      an exhaustive search of all the core division options -- allowed only
+      when ``allow_exhaustive_search`` is set, else this raises ``ValueError``.
 
     The annealer is deliberately not wrapped in :class:`ExhaustiveSearchSolver`:
     that wrapper solves the layout once per enumerated division candidate, so
@@ -3669,6 +3670,18 @@ def select_allocator() -> ScratchpadAllocator:
         # core-division-capable when the factory may be a plain function (the
         # ortools-availability-aware cpsat factory) rather than a solver class.
         if not isinstance(solver_cls([], size), CoreDivisionLayoutSolver):
+            if not config.allow_exhaustive_search:
+                raise ValueError(
+                    f"co_optimizing_lx_planning=True with layout_solver="
+                    f"'{config.layout_solver}' has no core-division-capable "
+                    "solver to co-optimize with (this requires layout_solver="
+                    "'cpsat' with ortools installed, or "
+                    "layout_solver='simulated_annealing'); the only way to "
+                    "proceed is to fall back to ExhaustiveSearchSolver, an "
+                    "expensive DFS over core-division candidates. Set "
+                    "allow_exhaustive_search=True (or "
+                    "ALLOW_EXHAUSTIVE_SEARCH=1) to allow that fallback."
+                )
             return CoOptimizingAllocator(
                 layout_planning=functools.partial(
                     ExhaustiveSearchSolver, inner_factory=solver_cls

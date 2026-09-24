@@ -1520,8 +1520,22 @@ class TestSelectAllocator(unittest.TestCase):
             self.assertIs(type(a), ScratchpadAllocator)
             self.assertEqual(a.layout_planning, BestFitLayoutSolver)
 
+        # greedy + co-optimization has no core-division-capable solver to
+        # co-optimize with, so it can only proceed by falling back to
+        # ExhaustiveSearchSolver -- disallowed unless allow_exhaustive_search
+        # is set.
         with ts_inductor_config.patch(
-            layout_solver="greedy", co_optimizing_lx_planning=True
+            layout_solver="greedy",
+            co_optimizing_lx_planning=True,
+            allow_exhaustive_search=False,
+        ):
+            with self.assertRaises(ValueError):
+                select_allocator()
+
+        with ts_inductor_config.patch(
+            layout_solver="greedy",
+            co_optimizing_lx_planning=True,
+            allow_exhaustive_search=True,
         ):
             a = select_allocator()
             self.assertIsInstance(a, CoOptimizingAllocator)
@@ -1529,13 +1543,32 @@ class TestSelectAllocator(unittest.TestCase):
             self.assertIsInstance(solver, ExhaustiveSearchSolver)
             self.assertIs(solver._inner_factory, GreedyLayoutSolver)
 
-        # cpsat + co-optimization always routes to the joint allocator: when
-        # ortools is present the cpsat factory is core-division-capable and is
-        # used directly, else it degrades to an ExhaustiveSearchSolver wrapping
-        # the cpsat factory's own greedy fallback.
+        # cpsat + co-optimization routes to the joint allocator when ortools
+        # is present (the cpsat factory is core-division-capable and is used
+        # directly); without ortools it would need to degrade to an
+        # ExhaustiveSearchSolver wrapping the cpsat factory's own greedy
+        # fallback, which is likewise disallowed unless
+        # allow_exhaustive_search is set.
         with ts_inductor_config.patch(
             layout_solver="cpsat",
             co_optimizing_lx_planning=True,
+            allow_exhaustive_search=False,
+            _cpsat_warn_on_cost_expr=False,
+        ):
+            if _HAS_ORTOOLS:
+                a = select_allocator()
+                self.assertIsInstance(a, CoOptimizingAllocator)
+                solver = a.layout_planning([], a.size)
+                self.assertIs(a.layout_planning, _make_cpsat_solver)
+                self.assertIsInstance(solver, CpSatLayoutSolver)
+            else:
+                with self.assertRaises(ValueError):
+                    select_allocator()
+
+        with ts_inductor_config.patch(
+            layout_solver="cpsat",
+            co_optimizing_lx_planning=True,
+            allow_exhaustive_search=True,
             _cpsat_warn_on_cost_expr=False,
         ):
             a = select_allocator()

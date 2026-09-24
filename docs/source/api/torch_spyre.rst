@@ -705,6 +705,14 @@ Environment Variables
      - LX scratchpad layout solver strategy: ``cpsat`` (default),
        ``greedy``, ``bestfit``, ``firstfit``, ``simulated_annealing``.
        See :doc:`/compiler/scratchpad_planning`
+   * - ``ALLOW_EXHAUSTIVE_SEARCH``
+     - Allow ``CO_OPTIMIZING_LX_PLANNING`` to fall back to
+       ``ExhaustiveSearchSolver`` (an expensive DFS over core-division
+       candidates) when ``LAYOUT_SOLVER`` names a solver that is not
+       natively core-division-capable -- ``greedy``, ``bestfit``,
+       ``firstfit``, or ``cpsat`` without ``ortools`` installed (default
+       ``0``; without this set, that combination raises ``ValueError``
+       instead). See :doc:`/compiler/scratchpad_planning`
    * - ``SPYRE_INDUCTOR_ENABLE_REDUCTION_TILING``
      - Enable reduction tiling in the pre-scheduling pipeline (default
        ``1``)
