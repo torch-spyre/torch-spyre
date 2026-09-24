@@ -792,13 +792,15 @@ class TestSpyreTensorLayout(TestCase):
         rebuilds a dense layout from the host size, so the partial stick is the
         padded case it already handles."""
         from torch_spyre._C import ElementArrangement
-        from torch_spyre._inductor.propagate_layouts import _qfp8ch_stl
+        from torch_spyre._inductor.pass_utils import rescale_stl_for_dtype
 
         fp16 = get_device_dtype(torch.float16)
         one_stick = SpyreTensorLayout(
             [1, 4, 64], [64, 64, 1], fp16, ElementArrangement.STANDARD
         )
-        out = _qfp8ch_stl(one_stick, torch.float8_e4m3fn)
+        out = rescale_stl_for_dtype(
+            one_stick, torch.float8_e4m3fn, ElementArrangement.QFP8CH
+        )
         self.assertEqual(list(out.device_size), [1, 4, 128])
         self.assertEqual(list(out.stride_map), [128, 64, 1])
         self.assertEqual(out.element_arrangement, ElementArrangement.QFP8CH)
@@ -806,14 +808,23 @@ class TestSpyreTensorLayout(TestCase):
             [3, 4, 64], [64, 64, 1], fp16, ElementArrangement.STANDARD
         )
         self.assertEqual(
-            list(_qfp8ch_stl(three_sticks, torch.float8_e4m3fn).device_size),
+            list(
+                rescale_stl_for_dtype(
+                    three_sticks, torch.float8_e4m3fn, ElementArrangement.QFP8CH
+                ).device_size
+            ),
             [2, 4, 128],
         )
         two_sticks = SpyreTensorLayout(
             [2, 4, 64], [64, 64, 1], fp16, ElementArrangement.STANDARD
         )
         self.assertEqual(
-            list(_qfp8ch_stl(two_sticks, torch.float8_e4m3fn).device_size), [1, 4, 128]
+            list(
+                rescale_stl_for_dtype(
+                    two_sticks, torch.float8_e4m3fn, ElementArrangement.QFP8CH
+                ).device_size
+            ),
+            [1, 4, 128],
         )
 
     def test_explicit_layout_rejects_malformed_device_size(self):
@@ -846,20 +857,22 @@ class TestSpyreTensorLayout(TestCase):
         )
         self.assertEqual(list(ok.device_size), [1, 4, 64])
 
-    def test_fp32_to_dl16_stl_output_partial_stick(self):
-        """_fp32_to_dl16_stl: 3 fp32 sticks -> 2 fp16 sticks (issue #3999).
+    def test_fp32_to_dl16_output_partial_stick(self):
+        """FP32_TO_DL16: 3 fp32 sticks -> 2 fp16 sticks (issue #3999).
 
         The output-side ceil division is the existing correct behavior.
         Verify it is preserved: 3*32=96 elements -> ceil(96/64)=2 fp16 sticks.
         """
         from torch_spyre._C import ElementArrangement
-        from torch_spyre._inductor.propagate_layouts import _fp32_to_dl16_stl
+        from torch_spyre._inductor.pass_utils import rescale_stl_for_dtype
 
         fp32 = get_device_dtype(torch.float32)
         three_sticks = SpyreTensorLayout(
             [3, 2, 32], [32, 32, 1], fp32, ElementArrangement.STANDARD
         )
-        out = _fp32_to_dl16_stl(three_sticks, torch.float16)
+        out = rescale_stl_for_dtype(
+            three_sticks, torch.float16, ElementArrangement.FP32_TO_DL16
+        )
 
         # Output: 2 DL16 sticks of 64 elements.
         self.assertEqual(list(out.device_size), [2, 2, 64])
