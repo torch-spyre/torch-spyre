@@ -458,6 +458,22 @@ def _marker_resolution(op: "ir.Operation") -> "MarkerResolution | None":
     return getattr(op, "tile_marker_resolution", None)
 
 
+def _marker_axis_is_consumed(axis_coords: "list[sympy.Expr] | None") -> bool:
+    """True iff the marker's tiled-axis load-site coordinate is consumed at the consumer.
+
+    True iff the captured coordinate(s) are non-empty and carry no free symbols at
+    all (all pure constants) -- stricter than "no iteration variable", so a
+    dynamic-size symbol conservatively keeps the existing resolution path. A
+    surviving tiled coordinate always carries a free symbol (d0/i0/q0/...), so it is
+    never misclassified. A kept size-1 tiled axis is classified consumed: harmless,
+    it cannot be split and the per-trip advance still comes from
+    _structural_resolve / squeezed_advance_per_read.
+    """
+    if not axis_coords:
+        return False
+    return all(not c.free_symbols for c in axis_coords)
+
+
 def _delinearize_index(index: sympy.Expr, size, stride, offset) -> list[sympy.Expr]:
     """Invert a FixedLayout-style flat index back into per-dim coordinates.
 
@@ -599,9 +615,15 @@ class _InlineMarkerHandler(WrapperHandler):
     in this codebase already does.
     """
 
-    def __init__(self, inner, marker_name: str, marker_op: "ir.Operation"):
+    def __init__(
+        self, inner, marker_name: str, marker_op: "ir.Operation", capture=None
+    ):
         super().__init__(inner)
         self._marker_name = marker_name
+        # Marker operand's tiled axis + a one-shot collector for the load-site
+        # coordinate along it (feeds the consumed-axis classification).
+        self._marker_dim = _marker_dim(marker_op)
+        self._capture = capture
         layout = marker_op.layout
         self._size = layout.size
         self._stride = layout.stride
@@ -616,6 +638,17 @@ class _InlineMarkerHandler(WrapperHandler):
     def load(self, name, index):
         if name == self._marker_name:
             coords = _delinearize_index(index, self._size, self._stride, self._offset)
+            if (
+                self._capture is not None
+                and self._marker_dim is not None
+                and 0 <= self._marker_dim < len(coords)
+            ):
+                # Key by the consumer load-site index and REPLACE, so a
+                # re-evaluated inner_fn yields one record per distinct read rather
+                # than accumulating. The coordinate is in the marker's own
+                # unsqueezed axes: a pure constant means the axis was consumed
+                # (sliced base); a free symbol means genuine tiling.
+                self._capture[index] = coords[self._marker_dim]
             # self._size (this handler's own layout.size) has NOT had size-1
             # dims squeezed out, but self._marker_var_names/
             # self._marker_write_size (from the marker's own WRITE dep) HAVE
@@ -657,7 +690,7 @@ def _inline_marker_into_consumer(
     consumer_op: "ir.Operation",
     marker_op: "ir.Operation",
     operations: list["ir.Operation"],
-) -> "ir.Operation":
+) -> "tuple[ir.Operation, bool]":
     """Erase marker_op by inlining its body into consumer_op's load of it.
 
     See _InlineMarkerHandler for why a plain name-swap
@@ -669,6 +702,12 @@ def _inline_marker_into_consumer(
     exactly that (metadata copy, provenance, cache invalidation, mutation-
     target/nested-WhileLoop repointing) for a caller supplying a full new
     body object rather than a bare name map.
+
+    Returns ``(new_consumer, consumed)``: the replacement buffer and whether the
+    marker's tiled axis was consumed at the consumer. The new read/write info is
+    materialized once here to fill the one-shot collector, which is then closed
+    (the closed-over ``capture`` is rebound to None) so later re-evaluations of
+    this long-lived inner_fn stop recording.
     """
     from torch._inductor.virtualized import V
 
@@ -680,21 +719,33 @@ def _inline_marker_into_consumer(
     marker_name = marker_op.get_name()
 
     orig_inner = consumer_op.data.inner_fn
+    capture: "dict | None" = {}
 
     def new_inner_fn(*args, _orig_inner=orig_inner):
-        with V.set_ops_handler(_InlineMarkerHandler(V.ops, marker_name, marker_op)):
+        with V.set_ops_handler(
+            _InlineMarkerHandler(V.ops, marker_name, marker_op, capture)
+        ):
             return _orig_inner(*args)
 
     object.__setattr__(consumer_op.data, "inner_fn", new_inner_fn)
     _invalidate_body_caches(consumer_op.data)
 
-    return replace_computed_buffer_body(
+    result = replace_computed_buffer_body(
         consumer_op,
         consumer_op.data,
         operations,
         pass_name="_consume_tile_dim_markers",
         reason=f"inline erased tile_dim_marker {marker_name!r} body",
     )
+    # Fill the one-shot collector once (this evaluates the replacement body),
+    # classify, then close it by rebinding the closed-over `capture` to None:
+    # later re-evaluations of this long-lived inner_fn pass None to the handler.
+    result.get_read_writes()
+    consumed = _marker_axis_is_consumed(
+        list(capture.values()) if capture is not None else []
+    )
+    capture = None
+    return result, consumed
 
 
 def _consume_tile_dim_markers(
@@ -912,6 +963,9 @@ def _consume_tile_dim_markers(
         # resolved.
         any_star_dep_consumer = False
         for consumer_op, consumer_dep in consumers:
+            # Set by the ComputedBuffer branch; stays False (unchanged behavior)
+            # for a StarDep consumer, which has no captured load-site coordinate.
+            _marker_axis_consumed = False
             if hasattr(consumer_op, "data"):
                 # A consumer can independently read marker_input_name BEFORE
                 # inlining too -- e.g. a body op shaped like
@@ -926,7 +980,7 @@ def _consume_tile_dim_markers(
                     for d in consumer_op.get_read_writes().reads
                     if isinstance(d, MemoryDep) and d.name == marker_input_name
                 ]
-                new_consumer = _inline_marker_into_consumer(
+                new_consumer, _marker_axis_consumed = _inline_marker_into_consumer(
                     consumer_op, marker_op, operations
                 )
                 # _inline_marker_into_consumer swaps `operations[op_idx]` in
@@ -1012,7 +1066,12 @@ def _consume_tile_dim_markers(
                 new_dep = consumer_dep
                 any_star_dep_consumer = True
 
-            marker_map[(new_consumer.get_name(), new_dep)] = dim
+            # Skip a consumed read: its `dim` names a marker axis that no longer
+            # exists in the read, and recording it is what would let
+            # lookup_marker_dim's coefficient coincidence mis-resolve it. A
+            # retained read of a mixed op is still entered and still resolves.
+            if not _marker_axis_consumed:
+                marker_map[(new_consumer.get_name(), new_dep)] = dim
             if id(consumer_op) in group_op_ids:
                 group_op_ids.discard(id(consumer_op))
                 group_op_ids.add(id(new_consumer))

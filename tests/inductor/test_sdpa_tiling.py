@@ -28,6 +28,10 @@ _select_sdpa_tiling = _decompositions._select_sdpa_tiling
 _axis_slice_is_dense = _decompositions._axis_slice_is_dense
 _sdpa_kv_candidates = _decompositions._sdpa_kv_candidates
 _sdpa_mask_hbm_bytes = _decompositions._sdpa_mask_hbm_bytes
+_sdpa_estimated_live_bytes_per_core = (
+    _decompositions._sdpa_estimated_live_bytes_per_core
+)
+_sdpa_has_loop_boundary = _decompositions._sdpa_has_loop_boundary
 _num_tiles_for_max_extent = _decompositions._num_tiles_for_max_extent
 _sdpa_num_batch_tiles = _decompositions._sdpa_num_batch_tiles
 
@@ -179,6 +183,98 @@ class TestSDPATiling(unittest.TestCase):
         self.assertEqual(config.score_bytes_per_core, 768 * 1024)
         self.assertEqual(config.estimated_live_bytes_per_core, 1182720)
         self.assertEqual(config.estimated_spill_buffers, 0)
+
+    def test_loop_free_live_set_is_independent_of_attention_geometry(self):
+        kwargs = dict(
+            batch_size=1,
+            heads_per_core=2,
+            query_rows_per_core=1,
+            kv_block_size=512,
+            head_dim=256,
+            element_size=2,
+            has_loop_boundary=False,
+        )
+        score_bytes, direct_live_bytes = _sdpa_estimated_live_bytes_per_core(
+            **kwargs,
+            full_sdpa_prefill=False,
+        )
+        _, prefill_live_bytes = _sdpa_estimated_live_bytes_per_core(
+            **kwargs,
+            full_sdpa_prefill=True,
+        )
+        query_bytes = 2 * 1 * 256 * 2
+        accumulator_bytes = 2 * 1 * 2
+
+        self.assertEqual(
+            direct_live_bytes,
+            score_bytes + 3 * query_bytes + 2 * accumulator_bytes,
+        )
+        self.assertEqual(direct_live_bytes, prefill_live_bytes)
+
+    def test_grouped_decode_uses_effective_loop_counts(self):
+        for num_heads, num_kvheads, kv_length, head_dim in (
+            (32, 8, 128, 128),
+            (16, 8, 512, 256),
+        ):
+            with self.subTest(
+                num_heads=num_heads,
+                num_kvheads=num_kvheads,
+                kv_length=kv_length,
+            ):
+                config = self._select(
+                    num_heads=num_heads,
+                    num_kvheads=num_kvheads,
+                    max_seqlen_q=1,
+                    max_seqlen_kv=kv_length,
+                    head_dim=head_dim,
+                )
+
+                self.assertGreater(config.num_group_tiles, 1)
+                self.assertEqual(config.num_kv_blocks, 1)
+                self.assertFalse(
+                    _sdpa_has_loop_boundary(
+                        num_non_group_outer_tiles=(
+                            config.num_batch_tiles
+                            * config.num_head_tiles
+                            * config.num_q_tiles
+                        ),
+                        num_group_tiles=config.num_group_tiles,
+                        num_q_tiles=config.num_q_tiles,
+                        num_kv_blocks=config.num_kv_blocks,
+                    )
+                )
+                _, direct_live_bytes = _sdpa_estimated_live_bytes_per_core(
+                    batch_size=1,
+                    heads_per_core=num_heads,
+                    query_rows_per_core=1,
+                    kv_block_size=config.kv_block_size,
+                    head_dim=head_dim,
+                    element_size=2,
+                    has_loop_boundary=False,
+                )
+                self.assertEqual(
+                    config.estimated_live_bytes_per_core, direct_live_bytes
+                )
+                self.assertEqual(config.estimated_load_bursts, 2)
+
+        tiled = self._select(
+            num_heads=4,
+            num_kvheads=1,
+            max_seqlen_q=1,
+            max_seqlen_kv=512,
+            head_dim=128,
+        )
+        self.assertEqual(tiled.num_kv_blocks, 2)
+        self.assertTrue(
+            _sdpa_has_loop_boundary(
+                num_non_group_outer_tiles=(
+                    tiled.num_batch_tiles * tiled.num_head_tiles * tiled.num_q_tiles
+                ),
+                num_group_tiles=tiled.num_group_tiles,
+                num_q_tiles=tiled.num_q_tiles,
+                num_kv_blocks=tiled.num_kv_blocks,
+            )
+        )
 
     def test_batch_tiles_are_exact_for_odd_extents(self):
         for batch_size, expected_tiles in ((1, 1), (2, 1), (3, 3), (4, 2), (7, 7)):
@@ -530,7 +626,7 @@ class TestSDPATiling(unittest.TestCase):
             num_cores=32,
             query_tile_size=512,
             group_tile_size=4,
-            num_outer_tiles=1,
+            num_non_group_outer_tiles=1,
             full_sdpa_prefill=True,
         )
         k256 = next(
@@ -554,7 +650,7 @@ class TestSDPATiling(unittest.TestCase):
                 num_cores=32,
                 query_tile_size=query_tile_size,
                 group_tile_size=group_tile_size,
-                num_outer_tiles=1,
+                num_non_group_outer_tiles=1,
                 full_sdpa_prefill=True,
             )
             return next(item for item in candidates if item.block_size == block_size)
@@ -667,6 +763,48 @@ class TestSDPATiling(unittest.TestCase):
 
 
 class TestSDPAForEachTileIntegration(unittest.TestCase):
+    def test_gqa_decode_direct_body_tracks_effective_group_loop(self):
+        """A nominal G split is a real loop only when a sequence axis is tiled."""
+
+        def sdpa(q, k, v):
+            return F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                dropout_p=0.0,
+                scale=128**-0.5,
+                enable_gqa=True,
+            )
+
+        generator = torch.Generator().manual_seed(0)
+        for kv_length, expect_loop in ((128, False), (512, True)):
+            with self.subTest(kv_length=kv_length):
+                query = torch.randn(
+                    1, 4, 1, 128, dtype=torch.float16, generator=generator
+                )
+                key = torch.randn(
+                    1, 1, kv_length, 128, dtype=torch.float16, generator=generator
+                )
+                value = torch.randn(
+                    1, 1, kv_length, 128, dtype=torch.float16, generator=generator
+                )
+                expected = sdpa(query, key, value)
+                actual, sources = run_and_get_code(
+                    torch.compile(
+                        sdpa, backend="inductor", fullgraph=True, dynamic=False
+                    ),
+                    query.to("spyre"),
+                    key.to("spyre"),
+                    value.to("spyre"),
+                )
+                source = "\n".join(sources)
+
+                torch.testing.assert_close(
+                    actual.cpu().float(), expected.float(), atol=0.1, rtol=0.1
+                )
+                self.assertEqual("LoopSpec(" in source, expect_loop)
+                self.assertEqual("op='maximum'" in source, expect_loop)
+
     def test_complete_gqa_tile_nest(self):
         """The actual decomposition lowers B/Hkv/G/Lq maps around an Lk scan."""
         batch = 2

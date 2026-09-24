@@ -125,6 +125,84 @@ def test_joint_matmul_price_is_independent_of_standalone_preferences(monkeypatch
     assert wd._matmul_split_cost(*axes, 32) > standalone
 
 
+def test_fused_reduction_compute_uses_work_per_active_core():
+    small = ArgTraffic("small", "input", True, 1024)
+    large = ArgTraffic("large", "input", True, 6144, loop_factor=2)
+    output = ArgTraffic("out", "output", True, 64)
+    reductions = [
+        OpFeatures("amax", True, 64, 8, 2, [small, output]),
+        OpFeatures("sum", True, 64, 8, 2, [large, output]),
+        # Matmul has a different compute model and must not set this floor.
+        OpFeatures("bmm", True, 1 << 20, 1, 2, [], is_matmul=True),
+    ]
+
+    expected = (6144 * 2) / 8 / CostParams().fused_reduction_elems_per_core_ns
+    assert cost_model._fused_reduction_compute_ns(
+        reductions, CostParams()
+    ) == pytest.approx(expected)
+
+
+def test_fused_reduction_compute_keeps_core_count_symbolic():
+    heads, rows = sympy.symbols("split_heads split_rows", integer=True, positive=True)
+    op = OpFeatures(
+        "sum",
+        True,
+        64,
+        heads * rows,
+        2,
+        [ArgTraffic("input", "input", True, 12_288)],
+    )
+
+    compute = cost_model._fused_reduction_compute_ns([op], CostParams())
+
+    assert compute.free_symbols == {heads, rows}
+    assert float(compute.subs({heads: 4, rows: 8})) == pytest.approx(256)
+
+
+def test_fused_reduction_compute_skips_independent_boundary_reductions():
+    boundary = ArgTraffic("arg0_1", "input", False, 6144, is_boundary=True)
+    output = ArgTraffic("out", "output", False, 64, is_boundary=True)
+    reductions = [
+        OpFeatures("amax", True, 64, 8, 2, [boundary, output]),
+        OpFeatures("amin", True, 64, 8, 2, [boundary, output]),
+    ]
+
+    assert cost_model._fused_reduction_compute_ns(reductions, CostParams()) == 0.0
+
+
+def test_fused_reduction_compute_keeps_spill_cost_visible():
+    params = CostParams(overlap_gamma=0.46)
+
+    def prediction(is_lx):
+        intermediate = ArgTraffic("buf0", "input", is_lx, 12_288, is_boundary=False)
+        output = ArgTraffic("buf1", "output", False, 64, is_boundary=True)
+        reduction = OpFeatures("sum", True, 64, 8, 2, [intermediate, output])
+        pointwise = OpFeatures("exp", False, 12_288, 8, 2, [intermediate])
+        return cost_model.predict_ops([pointwise, reduction], params)
+
+    assert prediction(False) > prediction(True)
+
+
+def test_standalone_reduction_keeps_its_calibrated_bandwidth_model():
+    op = OpFeatures(
+        "amax",
+        True,
+        64,
+        1,
+        2,
+        [
+            ArgTraffic("input", "input", False, 6144),
+            ArgTraffic("out", "output", False, 64),
+        ],
+    )
+
+    assert cost_model.predict_ops(
+        [op], CostParams(fused_reduction_elems_per_core_ns=1e-6)
+    ) == pytest.approx(
+        cost_model.predict_ops([op], CostParams(fused_reduction_elems_per_core_ns=1e6))
+    )
+
+
 def test_isinf_is_symbolic_aware():
     from torch_spyre._inductor.work_division import isinf
 

@@ -35,6 +35,7 @@ from torch_spyre._inductor.scratchpad.plan_solver import (
     CoreDivision,
     CoreDivisionBuffer,
     LifetimeBoundBuffer,
+    solved_bindings,
 )
 from torch_spyre._inductor.scratchpad.greedy_solver import GreedyLayoutSolver
 from torch_spyre._inductor.scratchpad.exhaustive_search import ExhaustiveSearchSolver
@@ -1192,6 +1193,25 @@ class TestCpSatJointDivision(JointDivisionSolverTests, TestCase):
     single-use (zero-width) parent."""
 
     solver_class = CpSatLayoutSolver
+
+    def test_symbolic_reciprocal_core_count_selects_the_faster_candidate(self):
+        buf = CoreDivisionBuffer(
+            "reduction_out",
+            128,
+            [0, 1],
+            core_divisions=[
+                CoreDivision(splits={"b": 1, "h": 4, "q": 2}),
+                CoreDivision(splits={"b": 2, "h": 4, "q": 4}),
+            ],
+            residency_reason="no consumer reads it from LX",
+        )
+        cost = sympy.Integer(32_000) / buf.sym_cores
+        (result,) = self.solver_class(
+            [buf], size=1 << 20, alignment=1
+        ).plan_layout_and_core_divisions(cost)
+
+        self.assertEqual(result.chosen_division, 1)
+        self.assertEqual(float(cost.subs(solved_bindings([result]))), 1000.0)
 
     def test_inplace_chain_shares_single_slot(self):
         # A 3-level in-place chain gp -> p -> c (each parent.end_time ==

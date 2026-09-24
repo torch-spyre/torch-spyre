@@ -1183,3 +1183,30 @@ def capture_post_grad_while_loop(
     )
     assert found, "expected a while_loop node in the post-grad graph"
     return out, gm
+
+
+def consumed_row_inputs() -> tuple[torch.Tensor]:
+    """A tiny int/float block table whose tiled dim is CONSUMED by the body.
+
+    table[2, 32] tiled along dim 0 (tile_size 1); the body reads the whole
+    consumed row (``tiles[0][0, :]``), so the marker's tiled axis is sliced to
+    a constant. The marker's own read index over the flat table is
+    ``e + 32 * u0`` with ``range(e) == 32`` -- the exact coefficient
+    coincidence (coeff(u0)=32 == coeff(e)*range(e)=1*32) that makes
+    lookup_marker_dim falsely resolve a surviving tiled position for a
+    consumed axis.
+    """
+    table = torch.arange(2 * 32, dtype=torch.float16).reshape(2, 32)
+    return (table,)
+
+
+def consumed_row_fn(table: torch.Tensor) -> torch.Tensor:
+    """for_each_tile over table's dim 0; the tile axis is consumed in-body."""
+    from torch_spyre._inductor.wsr import for_each_tile
+
+    def body(acc, tiles):
+        return acc + tiles[0][0, :], None
+
+    acc0 = torch.zeros_like(table[0])
+    final, _ = for_each_tile(body, (table,), dims=(0,), tile_size=1, init=acc0)
+    return final

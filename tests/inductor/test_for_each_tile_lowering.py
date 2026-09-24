@@ -166,6 +166,47 @@ class TestCarryBindingsFor(unittest.TestCase):
         self.assertEqual(bindings, [])
 
 
+class TestIndirectIndexStepGuard(unittest.TestCase):
+    """_check_indirect_index_step refuses a sub-stick per-trip index advance."""
+
+    def _arg(self, expr):
+        from torch_spyre._C import DataFormats
+        from torch_spyre._inductor.op_spec import TensorArg
+
+        return TensorArg(
+            is_input=True,
+            arg_index=1,
+            device_dtype=DataFormats.SENUINT32,
+            device_size=[4],
+            device_coordinates=[],
+            allocation={},
+            device_tile_advance_expr=expr,
+        )
+
+    def test_sub_stick_step_is_refused(self):
+        import sympy
+        from torch_spyre._inductor.spyre_kernel import SpyreKernel
+        from torch_spyre._inductor.views import UnalignedStickSplit
+
+        level = sympy.Symbol("L0")
+        with self.assertRaises(UnalignedStickSplit):
+            SpyreKernel._check_indirect_index_step(None, self._arg(2 * level))
+
+    def test_whole_stick_step_is_allowed(self):
+        import sympy
+        from torch_spyre._inductor.spyre_kernel import SpyreKernel
+
+        level = sympy.Symbol("L0")
+        # B's [trips, 32] rows: one int32 stick; C's one-stick-per-entry: 32*E.
+        SpyreKernel._check_indirect_index_step(None, self._arg(32 * level))
+        SpyreKernel._check_indirect_index_step(None, self._arg(96 * level))
+
+    def test_no_advance_is_allowed(self):
+        from torch_spyre._inductor.spyre_kernel import SpyreKernel
+
+        SpyreKernel._check_indirect_index_step(None, self._arg(None))
+
+
 class TestSpliceWhileLoop(unittest.TestCase):
     def test_accumulator_view_tags_backing_storage(self):
         """A view-backed carry records ownership on its mutable Buffer."""
@@ -1491,6 +1532,7 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
             _body_loop_var,
             _consume_tile_dim_markers,
             _stacking_carry_indices,
+            lookup_marker_dim,
             try_prove_for_each_tile,
         )
         from torch_spyre._inductor.wsr.while_loop_bridge import (
@@ -1558,7 +1600,7 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
             )
             consumer_name = consumer_before.get_name()
 
-            _consume_tile_dim_markers(group_ops, graph.operations)
+            marker_map = _consume_tile_dim_markers(group_ops, graph.operations)
 
             new_consumer = next(
                 op for op in graph.operations if op.get_name() == consumer_name
@@ -1606,27 +1648,40 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
                 "other (e.g. renamed-and-unchanged, or miscomposed) value.",
             )
 
-    def test_marker_with_two_computed_buffer_consumers_maps_both(self):
-        """Paged attention's shape: one marker, two ComputedBuffer consumers.
+            # This is a RETAINED-axis consumer, so its post-inline read must
+            # still be registered in marker_map -- the simplified classifier
+            # must not pass by dropping every inlined read. Its mapped dep is
+            # the post-inline read of the marker's own input, and lookup
+            # resolves a real retained position (not None).
+            mapped_names = {name for name, _dep in marker_map}
+            self.assertIn(
+                consumer_name,
+                mapped_names,
+                "a retained-axis consumer's post-inline read must still be "
+                "registered in marker_map",
+            )
+            mapped_dep = next(dep for name, dep in marker_map if name == consumer_name)
+            self.assertEqual(mapped_dep.name, marker_input_name)
+            self.assertIsNotNone(
+                lookup_marker_dim(new_consumer, loop_var),
+                "the retained axis must still resolve to a tiled position",
+            )
+
+    def test_marker_with_two_computed_buffer_consumers_retain_advances(self):
+        """Paged attention's shape: one marker, two ComputedBuffer consumers,
+        BOTH slicing (consuming) the marker's tiled axis.
 
         paged_gather_kv_fn slices one page index out of the tiled block table
         and hands it to two ``index_select``s (K's page and V's), so the
         table's single dim=0 marker has two consuming reads, both
-        inline-branch shaped. This is the same supported multi-consumer shape
-        softmax_row_tiled_fn reaches through torch.softmax's amax/sub
-        siblings, pinned here at the IR level rather than only end to end,
-        and on a marker that carries a real per-trip advance.
-
-        Asserts more than "it no longer raises". Each consumer must get its
-        OWN map entry (dropping either silently loses that op's tiled-dim
-        provenance), each post-inline read must still carry the marker's own
-        per-trip advance term with the marker's own coefficient (the
-        silent-wrong-numerics regression
-        test_marker_inlined_preserves_advance_term_on_computed_buffer_
-        consumer pins for one consumer -- composing the transform into the
-        first consumer and merely renaming past the second would satisfy a
-        weaker check), and the marker must end up erased, since every one of
-        its consumers took the inline branch.
+        inline-branch shaped. A consumed axis is not entered into marker_map,
+        so the map holds neither consumer -- the two consumers are found
+        directly in the replaced group_ops instead. The contract this pins is
+        that BOTH replaced consumers keep the marker's own per-trip advance
+        term composed into their post-inline read (the silent-wrong-numerics
+        regression test_marker_inlined_preserves_advance_term_on_computed_
+        buffer_consumer pins for one consumer), and that the marker ends up
+        erased, since every consumer took the inline branch.
         """
         from torch._inductor import ir
         from torch._inductor.dependencies import MemoryDep
@@ -1717,29 +1772,50 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
 
             marker_map = _consume_tile_dim_markers(group_ops, graph.operations)
 
-        mapped_names = {name for name, _dep in marker_map}
-        self.assertEqual(
-            mapped_names,
-            consumer_names,
-            "every consumer of the marker must get its own map entry",
-        )
-        self.assertEqual(set(marker_map.values()), {0})
+            # Each replaced consumer's post-inline read, read while the graph
+            # handler is live (get_read_writes needs it).
+            consumer_reads = {}
+            for name in consumer_names:
+                op = next(o for o in group_ops if o.get_name() == name)
+                consumer_reads[name] = [
+                    d
+                    for d in op.get_read_writes().reads
+                    if isinstance(d, MemoryDep) and d.name == marker_input_name
+                ]
 
-        for (name, dep), _dim in marker_map.items():
+        # Both replaced consumers remain in the group.
+        self.assertTrue(
+            consumer_names <= {o.get_name() for o in group_ops},
+            "both replaced consumers must remain in group_ops",
+        )
+
+        # A consumed (sliced) marker axis leaves a pure-constant coordinate, so
+        # neither consumer is entered into marker_map.
+        mapped_names = {name for name, _dep in marker_map}
+        self.assertFalse(
+            mapped_names & consumer_names,
+            "a consumed (sliced) marker axis must not be entered into "
+            f"marker_map; got entries for {sorted(mapped_names & consumer_names)}",
+        )
+
+        # Both consumers still exist in the replaced group and each keeps
+        # exactly one post-inline read of the marker's input carrying the
+        # marker's own per-trip advance coefficient -- composing the transform
+        # into the first consumer and merely renaming past the second would
+        # satisfy a weaker check.
+        for name, reads in consumer_reads.items():
             self.assertEqual(
-                dep.name,
-                marker_input_name,
-                f"{name}'s mapped dep must name the marker's own upstream "
-                "input, i.e. be the post-inline read",
+                len(reads),
+                1,
+                f"{name} must have exactly one post-inline read of the "
+                f"marker's input; got {reads!r}",
             )
             self.assertEqual(
-                dep.index.coeff(loop_var),
+                reads[0].index.coeff(loop_var),
                 marker_own_index.coeff(loop_var),
-                f"{name}'s post-inline read lost or altered the marker's "
-                f"own per-trip advance term ({loop_var}) -- got "
-                f"{dep.index!r}, marker's own index is {marker_own_index!r}. "
-                "Every consumer must have the marker's real coordinate "
-                "transform composed in, not just the first one.",
+                f"{name}'s post-inline read lost or altered the marker's own "
+                f"per-trip advance term ({loop_var}) -- got {reads[0].index!r}, "
+                f"marker's own index is {marker_own_index!r}.",
             )
 
         self.assertEqual(
@@ -3025,6 +3101,167 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
         )
         actual = compiled(Q.to(DEVICE_NAME), K.to(DEVICE_NAME), V.to(DEVICE_NAME))
         torch.testing.assert_close(actual.cpu().float(), expected, atol=1e-2, rtol=1e-2)
+
+    def test_consumed_marker_axis_does_not_resolve_tiled_position(self):
+        """A tile axis consumed at its consumer must not be stamped loop_tiled.
+
+        consumed_row_fn slices the tiled block table's dim 0 to a constant, so the
+        inlined flat-table read is ``e + 32*u0`` -- the coefficient coincidence that
+        used to make lookup_marker_dim call the entries axis tiled. Real lowering,
+        CPU-only: consume the marker, stamp the real group, then assert the entries
+        axis is not loop_tiled and the read's own per-trip advance is exactly one
+        ``(32, 1)`` pair.
+        """
+        import sympy
+        from torch._inductor import ir
+        from torch._inductor.dependencies import MemoryDep
+
+        from torch_spyre._inductor.wsr.for_each_tile_lowering import (
+            _body_loop_var,
+            _consume_tile_dim_markers,
+            _stacking_carry_indices,
+            _stamp_direct_loop_info,
+            try_prove_for_each_tile,
+        )
+        from torch_spyre._inductor.wsr.while_loop_bridge import (
+            carry_bindings_for,
+            splice_while_loop,
+        )
+
+        from for_each_tile_fixtures import consumed_row_fn, consumed_row_inputs
+
+        graph = self._run_graph(consumed_row_fn, consumed_row_inputs())
+        while_op = next(op for op in graph.operations if isinstance(op, ir.WhileLoop))
+        res = try_prove_for_each_tile(while_op)
+        self.assertTrue(res.accepted)
+        loop_var = _body_loop_var(while_op)
+        self.assertIsNotNone(loop_var)
+
+        with V.set_graph_handler(graph):
+            carries = carry_bindings_for(
+                while_op, _stacking_carry_indices(while_op, loop_var)
+            )
+            group_ops = splice_while_loop(
+                graph, while_op, carries, trip_count=res.trip_count
+            )
+            _consume_tile_dim_markers(group_ops, graph.operations)
+            _stamp_direct_loop_info(group_ops, loop_var, res.trip_count, group_idx=0)
+
+            # The real inlined flat-table read carries the 32*u0 per-trip advance.
+            consumers = []
+            for op in group_ops:
+                reads = [
+                    dep
+                    for dep in op.get_read_writes().reads
+                    if isinstance(dep, MemoryDep)
+                ]
+                for read_idx, dep in enumerate(reads):
+                    if dep.index.coeff(loop_var) == 32:
+                        consumers.append((op, read_idx))
+
+        self.assertTrue(consumers, "no read carries the 32*u0 per-trip advance")
+        for op, read_idx in consumers:
+            info = getattr(op, "loop_info", None)
+            self.assertIsNotNone(info, "the consumer was not stamped")
+            loop_tiled = [pos for level in info.loop_tiled_dims for pos in level]
+            self.assertNotIn(
+                0,
+                loop_tiled,
+                "the consumed marker's entries axis must not be stamped loop_tiled",
+            )
+            tiled_entries = [
+                entry for level in info.tiled_dims_per_read[read_idx] for entry in level
+            ]
+            self.assertEqual(
+                tiled_entries,
+                [],
+                "the consumed read must carry no tiled_dims_per_read entry",
+            )
+            advances = [
+                pair
+                for level in info.squeezed_advance_per_read[read_idx]
+                for pair in level
+            ]
+            self.assertEqual(
+                advances,
+                [(sympy.Integer(32), sympy.Integer(1))],
+                "the read's own per-trip advance must be exactly one (32, 1) pair",
+            )
+
+    def test_consumed_read_does_not_hide_a_retained_read(self):
+        """A consumed mapped read must not hide a SECOND retained mapped read on the
+        same op.
+
+        Minimal IR (this class's established mock-IR convention): one op reads two
+        markers -- X consumed (its marker axis was sliced to a constant, so the
+        production lowering omits it from marker_map) and Y retained. marker_map
+        therefore holds only Y, and lookup_marker_dim must resolve Y (position 1),
+        not X's coincidental position. This pins the lookup contract; it is not
+        required to fail on pristine main.
+        """
+        import sympy
+
+        import torch_spyre._inductor.wsr.coarse_tile as coarse_tile_mod
+        from torch._inductor.dependencies import MemoryDep
+        from torch_spyre._inductor.wsr.for_each_tile_lowering import (
+            _MARKER_MAPS,
+            clear_marker_maps,
+            lookup_marker_dim,
+        )
+
+        u0 = sympy.Symbol("u0")
+        v0 = sympy.Symbol("v0")
+        w0 = sympy.Symbol("w0")
+
+        # X: consumed-first read; coefficient coincidence 3*u0 on v0's axis.
+        x_dep = MemoryDep(
+            name="x_buf",
+            index=v0 + 3 * u0,
+            var_names=(v0,),
+            size=(sympy.Integer(3),),
+        )
+        # Y: retained read; advances on w0's own axis.
+        y_dep = MemoryDep(
+            name="y_buf",
+            index=w0 + u0,
+            var_names=(w0,),
+            size=(sympy.Integer(1),),
+        )
+        out_dep = MemoryDep(
+            name="out_buf",
+            index=sympy.Symbol("d0"),
+            var_names=(sympy.Symbol("d0"),),
+            size=(sympy.Integer(1),),
+        )
+
+        op = mock.Mock(spec=["get_read_writes", "get_name", "data"])
+        op.get_name.return_value = "mixed_op"
+        op.data = mock.Mock(spec=[])  # not a Reduction
+        rw = mock.Mock()
+        rw.reads = [x_dep, y_dep]
+        rw.writes = {out_dep}
+        op.get_read_writes.return_value = rw
+
+        operations = ["sentinel_operations_list"]
+        clear_marker_maps()
+        self.addCleanup(clear_marker_maps)
+        # Production omits the consumed X read from marker_map; only Y is present.
+        _MARKER_MAPS[id(operations)] = {("mixed_op", y_dep): 0}
+
+        graph = mock.Mock(spec=["operations"])
+        graph.operations = operations
+
+        with mock.patch.object(coarse_tile_mod, "op_out_coords", return_value=[v0, w0]):
+            with V.set_graph_handler(graph):
+                result = lookup_marker_dim(op, u0)
+
+        self.assertEqual(
+            result,
+            (1, False),
+            "expected lookup_marker_dim to skip the consumed X read and "
+            "resolve the retained Y read (position 1); got the consumed X "
+            "position or None instead",
+        )
 
 
 class TestStampDirectLoopInfo(unittest.TestCase):

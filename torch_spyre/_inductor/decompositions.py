@@ -70,7 +70,7 @@ _SDPA_MHA_QUERY_ONLY_MIN_KV_BLOCKS = 8
 # These constants do not represent a legacy non-HOP SDPA implementation.
 _SDPA_NARROW_LIVE_SCORE_BUFFER_ALLOWANCE = 2
 _SDPA_NARROW_LIVE_QUERY_BUFFER_ALLOWANCE = 2
-# When every selected MHA tile count is one, ``map_tiles`` and the K/V scan
+# When every selected tile count is one, ``map_tiles`` and the K/V scan
 # invoke their bodies directly. There is no HOP staging or carry handoff in
 # that graph: the score allocation can be reused after its reduction and only
 # the scaled query, weighted result, and normalized output overlap at peak.
@@ -196,6 +196,34 @@ def _sdpa_head_group_tiles(num_heads: int, num_kvheads: int) -> tuple[int, int]:
 
     group_size = num_heads // num_kvheads
     return _sdpa_num_head_tiles(num_kvheads), group_size
+
+
+def _sdpa_effective_group_tiles(
+    num_group_tiles: int, num_q_tiles: int, num_kv_blocks: int
+) -> int:
+    """Return the number of group tiles that become an executed map loop.
+
+    A group-only split does not reduce the sequence working set, so the lowering
+    deliberately leaves the full G axis visible to work division when both
+    sequence axes fit in one tile. Keep cost accounting and graph selection tied
+    to that same effective count.
+    """
+    return num_group_tiles if num_q_tiles > 1 or num_kv_blocks > 1 else 1
+
+
+def _sdpa_has_loop_boundary(
+    *,
+    num_non_group_outer_tiles: int,
+    num_group_tiles: int,
+    num_q_tiles: int,
+    num_kv_blocks: int,
+) -> bool:
+    """Whether the selected counts emit any map or carry loop."""
+    return (
+        num_non_group_outer_tiles > 1
+        or _sdpa_effective_group_tiles(num_group_tiles, num_q_tiles, num_kv_blocks) > 1
+        or num_kv_blocks > 1
+    )
 
 
 def _num_tiles_for_max_extent(
@@ -411,9 +439,9 @@ def _sdpa_estimated_live_bytes_per_core(
     V is streamed by the second matmul. K is restickified before the first
     matmul and therefore participates in full-SDPA prefill residency. Full
     nested prefill accounts for every score- and query-shaped value that can
-    overlap at a map/carry boundary. A prefill plan with no effective loop uses
-    the direct-body live set because ``map_tiles`` and the one-block scan bypass
-    ``for_each_tile``. Decode and SWA retain their separately calibrated
+    overlap at a map/carry boundary. Any plan with no effective loop uses the
+    direct-body live set because ``map_tiles`` and the one-block scan bypass
+    ``for_each_tile``. Looped decode and SWA retain their separately calibrated
     two-score/two-query estimate. These flags select a liveness accounting
     regime; they do not select a different SDPA implementation.
     """
@@ -424,7 +452,7 @@ def _sdpa_estimated_live_bytes_per_core(
         batch_size * heads_per_core * query_rows_per_core * head_dim * element_size
     )
     accumulator_bytes = batch_size * heads_per_core * query_rows_per_core * element_size
-    if full_sdpa_prefill and not has_loop_boundary:
+    if not has_loop_boundary:
         score_allowance = _SDPA_DIRECT_LIVE_SCORE_BUFFER_ALLOWANCE
         query_allowance = _SDPA_DIRECT_LIVE_QUERY_BUFFER_ALLOWANCE
     elif full_sdpa_prefill:
@@ -540,7 +568,9 @@ def _sdpa_kv_candidates(
     num_cores: int,
     query_tile_size: int | None = None,
     group_tile_size: int = 1,
-    num_outer_tiles: int = 1,
+    num_non_group_outer_tiles: int = 1,
+    num_group_tiles: int = 1,
+    num_q_tiles: int = 1,
     full_sdpa_prefill: bool = False,
     work_div: dict[str, int] | None = None,
     pad_extent: bool = False,
@@ -552,18 +582,7 @@ def _sdpa_kv_candidates(
     """
     if full_sdpa_prefill:
         assert query_tile_size is not None
-        # Model every axis visible in the innermost HOP body. CP-SAT can divide
-        # any exact combination of these axes, so the per-core score and carry
-        # footprint is the complete logical row count divided by that split.
-        active_cores = _sdpa_estimated_active_cores(
-            (batch_size, num_kvheads, group_tile_size, query_tile_size), num_cores
-        )
-        head_rows_per_core = (
-            batch_size * num_kvheads * group_tile_size * query_tile_size // active_cores
-        )
-        heads_per_core = head_rows_per_core
         kv_heads_per_core = num_kvheads
-        query_rows_per_core = 1
         # K has no G or Q axis.  Be deliberately conservative here: generated
         # plans can use more lanes when a downstream Q split is compatible,
         # but the only parallel axes guaranteed before layout planning are B
@@ -602,6 +621,35 @@ def _sdpa_kv_candidates(
         if effective_block_size in seen_block_sizes:
             continue
         seen_block_sizes.add(effective_block_size)
+        effective_group_tiles = _sdpa_effective_group_tiles(
+            num_group_tiles, num_q_tiles, num_blocks
+        )
+        num_outer_tiles = num_non_group_outer_tiles * effective_group_tiles
+        if full_sdpa_prefill:
+            assert query_tile_size is not None
+            # Model every axis visible in the innermost HOP body. When a G-only
+            # map is elided, the complete G extent remains visible to CP-SAT.
+            effective_group_tile_size = (
+                group_tile_size * num_group_tiles // effective_group_tiles
+            )
+            active_cores = _sdpa_estimated_active_cores(
+                (
+                    batch_size,
+                    num_kvheads,
+                    effective_group_tile_size,
+                    query_tile_size,
+                ),
+                num_cores,
+            )
+            head_rows_per_core = (
+                batch_size
+                * num_kvheads
+                * effective_group_tile_size
+                * query_tile_size
+                // active_cores
+            )
+            heads_per_core = head_rows_per_core
+            query_rows_per_core = 1
         restick_bytes_per_core = (
             batch_size * num_kvheads * effective_block_size * head_dim * element_size
             + restick_active_cores
@@ -623,8 +671,11 @@ def _sdpa_kv_candidates(
             element_size=element_size,
             restick_bytes_per_core=(restick_bytes_per_core if full_sdpa_prefill else 0),
             full_sdpa_prefill=full_sdpa_prefill,
-            has_loop_boundary=(
-                num_heads != num_kvheads or num_outer_tiles > 1 or num_blocks > 1
+            has_loop_boundary=_sdpa_has_loop_boundary(
+                num_non_group_outer_tiles=num_non_group_outer_tiles,
+                num_group_tiles=num_group_tiles,
+                num_q_tiles=num_q_tiles,
+                num_kv_blocks=num_blocks,
             ),
         )
         blocks_per_group = _kv_blocks_per_loop_group(1, num_blocks)
@@ -721,11 +772,14 @@ def _select_sdpa_tiling(
         num_q_tiles: int,
         num_kv_blocks: int,
     ) -> int:
+        effective_group_tiles = _sdpa_effective_group_tiles(
+            num_group_tiles, num_q_tiles, num_kv_blocks
+        )
         axis_tile_counts = (
             (
                 num_batch_tiles,
                 num_head_tiles,
-                num_group_tiles,
+                effective_group_tiles,
                 num_q_tiles,
                 num_kv_blocks,
             )
@@ -739,7 +793,7 @@ def _select_sdpa_tiling(
         )
         return (
             query_output_bytes
-            + kv_bytes * num_group_tiles * num_q_tiles
+            + kv_bytes * effective_group_tiles * num_q_tiles
             + _sdpa_mask_hbm_bytes(
                 mask_shapes=mask_shapes,
                 axis_extents=mask_axis_extents,
@@ -754,7 +808,6 @@ def _select_sdpa_tiling(
         batch_tile_size = batch_size // num_batch_tiles
         num_head_tiles = 1
         num_group_tiles = group_extent
-        num_outer_tiles = num_batch_tiles * num_group_tiles
         candidates = _sdpa_kv_candidates(
             batch_size=batch_tile_size,
             num_heads=num_heads,
@@ -766,7 +819,9 @@ def _select_sdpa_tiling(
             num_cores=num_cores,
             query_tile_size=1,
             group_tile_size=1,
-            num_outer_tiles=num_outer_tiles,
+            num_non_group_outer_tiles=num_batch_tiles,
+            num_group_tiles=num_group_tiles,
+            num_q_tiles=1,
             full_sdpa_prefill=False,
         )
         feasible_decode = [
@@ -850,11 +905,8 @@ def _select_sdpa_tiling(
                     group_tile_size = group_extent // num_group_tiles
                     for query_tile_size in _sdpa_query_tile_sizes(max_seqlen_q):
                         num_q_tiles = max_seqlen_q // query_tile_size
-                        num_outer_tiles = (
-                            num_batch_tiles
-                            * num_head_tiles
-                            * num_group_tiles
-                            * num_q_tiles
+                        num_non_group_outer_tiles = (
+                            num_batch_tiles * num_head_tiles * num_q_tiles
                         )
                         candidates = _sdpa_kv_candidates(
                             batch_size=batch_tile_size,
@@ -867,10 +919,25 @@ def _select_sdpa_tiling(
                             num_cores=num_cores,
                             query_tile_size=query_tile_size,
                             group_tile_size=group_tile_size,
-                            num_outer_tiles=num_outer_tiles,
+                            num_non_group_outer_tiles=num_non_group_outer_tiles,
+                            num_group_tiles=num_group_tiles,
+                            num_q_tiles=num_q_tiles,
                             full_sdpa_prefill=True,
                         )
                         for candidate in candidates:
+                            effective_group_tiles = _sdpa_effective_group_tiles(
+                                num_group_tiles,
+                                num_q_tiles,
+                                candidate.num_blocks,
+                            )
+                            num_outer_tiles = (
+                                num_non_group_outer_tiles * effective_group_tiles
+                            )
+                            effective_group_tile_size = (
+                                group_tile_size
+                                * num_group_tiles
+                                // effective_group_tiles
+                            )
                             live_overflow = max(
                                 0,
                                 candidate.estimated_live_bytes_per_core
@@ -933,7 +1000,7 @@ def _select_sdpa_tiling(
                                             (
                                                 batch_tile_size,
                                                 head_tile_size,
-                                                group_tile_size,
+                                                effective_group_tile_size,
                                                 query_tile_size,
                                             ),
                                             num_cores,
@@ -1018,11 +1085,16 @@ def _select_sdpa_tiling(
             return _SDPATilingConfig(
                 strategy=(
                     "work_divided"
-                    if selected_plan.num_batch_tiles == 1
-                    and selected_plan.num_head_tiles == 1
-                    and selected_plan.num_group_tiles == 1
-                    and selected_plan.num_q_tiles == 1
-                    and selected.num_blocks == 1
+                    if not _sdpa_has_loop_boundary(
+                        num_non_group_outer_tiles=(
+                            selected_plan.num_batch_tiles
+                            * selected_plan.num_head_tiles
+                            * selected_plan.num_q_tiles
+                        ),
+                        num_group_tiles=selected_plan.num_group_tiles,
+                        num_q_tiles=selected_plan.num_q_tiles,
+                        num_kv_blocks=selected.num_blocks,
+                    )
                     else "work_divided_tiled"
                 ),
                 reason=("lowest loop, HBM burst, and bounded-spill transfer cost"),
@@ -1054,6 +1126,11 @@ def _select_sdpa_tiling(
     estimated_live_bytes_per_core = smallest_candidate.estimated_live_bytes_per_core
     reason = "estimated per-core live footprint exceeds the LX budget"
 
+    fallback_effective_group_tiles = _sdpa_effective_group_tiles(
+        fallback_num_group_tiles,
+        fallback_num_q_tiles,
+        fallback_num_kv_blocks,
+    )
     return _SDPATilingConfig(
         strategy="coarse_tiled",
         reason=reason,
@@ -1070,7 +1147,7 @@ def _select_sdpa_tiling(
             2
             * fallback_num_batch_tiles
             * fallback_num_head_tiles
-            * fallback_num_group_tiles
+            * fallback_effective_group_tiles
             * fallback_num_q_tiles
             * fallback_num_kv_blocks
             + (
@@ -1869,14 +1946,25 @@ def spyre__sdpa_overrideable(
         mask_shapes=tuple(tuple(mask.shape) for mask in masks),
         head_tile_staging_bytes=head_tile_staging_bytes,
     )
-    direct_prefill_plan = (
-        max_seqlen_q > 1
-        and num_heads == num_kvheads
-        and tiling.num_batch_tiles == 1
-        and tiling.num_head_tiles == 1
-        and tiling.num_group_tiles == 1
-        and tiling.num_q_tiles == 1
-        and tiling.num_kv_blocks == 1
+    # for_each_tile requires equal-sized tiles. The cost model already returns
+    # an exact, stick-aligned block; retain the calculation here as a safety net
+    # for configurations supplied by fallback or test overrides.
+    num_kv_tiles = _num_tiles_for_max_extent(
+        max_seqlen_kv,
+        tiling.kv_block_size,
+        tile_alignment=_SDPA_SEQUENCE_TILE_ALIGNMENT,
+    )
+    kv_tile_size = max_seqlen_kv // num_kv_tiles
+    num_group_tiles = _sdpa_effective_group_tiles(
+        tiling.num_group_tiles, tiling.num_q_tiles, num_kv_tiles
+    )
+    direct_plan = not _sdpa_has_loop_boundary(
+        num_non_group_outer_tiles=(
+            tiling.num_batch_tiles * tiling.num_head_tiles * tiling.num_q_tiles
+        ),
+        num_group_tiles=tiling.num_group_tiles,
+        num_q_tiles=tiling.num_q_tiles,
+        num_kv_blocks=num_kv_tiles,
     )
     logger.debug(
         "SDPA tiling: strategy=%s reason=%s Lq=%s q_tiles=%s "
@@ -1908,15 +1996,6 @@ def spyre__sdpa_overrideable(
         tiling.lx_budget_bytes,
     )
 
-    # for_each_tile requires equal-sized tiles. The cost model already returns
-    # an exact, stick-aligned block; retain the calculation here as a safety net
-    # for configurations supplied by fallback or test overrides.
-    num_kv_tiles = _num_tiles_for_max_extent(
-        max_seqlen_kv,
-        tiling.kv_block_size,
-        tile_alignment=_SDPA_SEQUENCE_TILE_ALIGNMENT,
-    )
-    kv_tile_size = max_seqlen_kv // num_kv_tiles
     packed_key_strides = (
         max_seqlen_kv * num_kvheads * head_dim,
         head_dim,
@@ -1952,11 +2031,11 @@ def spyre__sdpa_overrideable(
         # Q is invariant across the counted Lk loop.
         q_scaled = q_tile * query_scale
 
-        # A fully direct prefill plan has no online-softmax state to carry. Keep
+        # A loop-free plan has no online-softmax state to carry. Keep
         # its graph as the stable-softmax formula so the compiler sees the same
-        # short live ranges that the cost model charges above. Decode and
-        # outer-tiled plans retain the common carry path below.
-        if direct_prefill_plan:
+        # short live ranges that the cost model charges above. Tiled plans retain
+        # the common carry path below.
+        if direct_plan:
             if use_gqa:
                 k_tile = k_tile.unsqueeze(2)
                 v_tile = v_tile.unsqueeze(2)
@@ -2075,9 +2154,6 @@ def spyre__sdpa_overrideable(
         # work-division pass and avoid paying a serial map invocation per
         # query-head group.  Nested prefill/decode plans still use the selected
         # G split whenever either Lq or Lk is tiled.
-        num_group_tiles = (
-            tiling.num_group_tiles if tiling.num_q_tiles > 1 or num_kv_tiles > 1 else 1
-        )
         group_tile_size = gqa_group_size // max(1, num_group_tiles)
         return map_tiles(body, operands, dims, group_tile_size, 2)
 

@@ -1410,6 +1410,12 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         solver.parameters.num_search_workers = (
             1 if torch.are_deterministic_algorithms_enabled() else get_cpu_count()
         )
+        # Root-level bounds shared by OR-Tools' parallel subsolvers can race on
+        # this mixed nonlinear/NoOverlap2D model: with a large portfolio, 9.15
+        # has returned different plans as OPTIMAL and has even reported a lower
+        # bound above its incumbent. Keep the full worker portfolio, but let each
+        # subsolver prove its own level-zero bounds.
+        solver.parameters.share_level_zero_bounds = False
         # Fixed seed so a given worker configuration is reproducible run-to-run.
         solver.parameters.random_seed = 0
 

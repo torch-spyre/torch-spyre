@@ -1661,7 +1661,7 @@ def _multi_arg_pointwise_layouts(
         for arg in args
         for stl in arg.layouts
         if arg.dep.name not in ind_names
-        for dc in [try_device_coordinates(stl, arg.dep, ind_sizes)]
+        for dc in [try_device_coordinates(stl, arg.dep, ind_sizes, op=op)]
         if dc is not None
     }
 
@@ -1675,8 +1675,10 @@ def _multi_arg_pointwise_layouts(
 
     # If the indexing and device element size are identical
     # across all inputs and the output we can just propagate the device layout.
-    in_coords = [host_coordinates(arg.layout, arg.dep, ind_sizes) for arg in args]
-    out_coords = host_coordinates(output, output_dep, ind_sizes)
+    in_coords = [
+        host_coordinates(arg.layout, arg.dep, ind_sizes, op=op) for arg in args
+    ]
+    out_coords = host_coordinates(output, output_dep, ind_sizes, op=op)
     can_use_same_layout = True
 
     if len(stick_exprs) > 1 or any(len(arg.layouts) > 1 for arg in args):
@@ -1714,7 +1716,7 @@ def _multi_arg_pointwise_layouts(
                 projected_dim_order,
                 output_ea,
             )
-            coord = try_device_coordinates(in_stl, arg.dep, ind_sizes)
+            coord = try_device_coordinates(in_stl, arg.dep, ind_sizes, op=op)
             if coord is None or not is_stick_expr_offset_free(coord[-1], stick_size):
                 return False
             # For indirect-access value tensors, the stick dimension cannot
@@ -1822,7 +1824,7 @@ def _multi_arg_pointwise_layouts(
             continue
         # Stick must be offset-free; per-input feasibility is left to
         # AllSameNode (INF-costs incompatible).
-        out_coord = device_coordinates(candidate, output_dep, ind_sizes)
+        out_coord = device_coordinates(candidate, output_dep, ind_sizes, op=op)
         if not is_stick_expr_offset_free(out_coord[-1], stick_size):
             continue
         # Move to front (or insert if new): the in-place layout must win on

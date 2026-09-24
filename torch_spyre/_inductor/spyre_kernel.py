@@ -71,7 +71,7 @@ from .pass_utils import (
     input_layout_for_operation,
     is_restickify_coords,
     alignment_coordinates,
-    loop_var_ranges_from_dim_hints,
+    per_trip_index,
 )
 from .views import align_tensors, tiling_expr_to_device_expr
 from .logging_utils import get_inductor_logger
@@ -828,11 +828,7 @@ class SpyreKernel(Kernel[CSEVariable]):
         # leaks into the OpSpec iteration space nor applies the same
         # advance a second time.
         device_tile_advance_expr = self._general_tile_advance(tensor, is_input, name)
-        loop_var_ranges = loop_var_ranges_from_dim_hints(operation)
-        base_index = sympy_subs(
-            tensor.index,
-            {loop_var: sympy.Integer(0) for loop_var in loop_var_ranges},
-        )
+        base_index = per_trip_index(operation, tensor.index)
         device_coords = alignment_coordinates(
             tensor.layout.device_layout,
             base_index,
@@ -865,6 +861,35 @@ class SpyreKernel(Kernel[CSEVariable]):
         ):
             self.spyre_kernel_args.append((name, tensor_arg))
         return tensor_arg
+
+    def _check_indirect_index_step(self, idx_arg: TensorArg) -> None:
+        """Refuse an indirect index whose per-trip advance is sub-stick.
+
+        Scoped to indirect index operands: their per-trip start must remain
+        stick-aligned. Reuses ``coeff_through_floor`` on
+        ``device_tile_advance_expr`` -- the same device-element per-trip step the
+        emitted byte stride is built from -- so there is no second address
+        calculation. ``coeff_through_floor`` already raises ``Unsupported`` for a
+        non-integer (sub-stick) coefficient, so an unknown advance is never
+        silently accepted. Whole-stick advances pass untouched.
+        """
+        from torch_spyre._inductor.pass_utils import coeff_through_floor
+        from torch_spyre._inductor.views import UnalignedStickSplit
+
+        expr = idx_arg.device_tile_advance_expr
+        if expr is None:
+            return
+        # Read the index's committed device format rather than assuming int32
+        # (same query as pass_utils' dev_layout.device_dtype.elems_per_stick()).
+        elems_per_stick = idx_arg.device_dtype.elems_per_stick()
+        for sym in sorted(expr.free_symbols, key=str):
+            step = coeff_through_floor(expr, sym)
+            if step == 0:
+                continue
+            if int(step) % elems_per_stick != 0:
+                raise UnalignedStickSplit(
+                    idx_arg.arg_index, sym, int(step), elems_per_stick
+                )
 
     def create_op_spec(
         self,
@@ -1178,16 +1203,16 @@ class SpyreKernel(Kernel[CSEVariable]):
             args: list[TensorArg] = []
             indirect_syms = _indirect_syms_used(value, self.indirect_vars)
             if indirect_syms:
-                args += [
-                    self.create_tensor_arg(
+                for sym in sorted(indirect_syms, key=str):
+                    idx_tensor = self.indirect_vars[sym]
+                    idx_arg = self.create_tensor_arg(
                         True,
                         idx_tensor.name,
                         idx_tensor,
                         opspec_name=idx_tensor.name,
                     )
-                    for sym in sorted(indirect_syms, key=str)
-                    for idx_tensor in [self.indirect_vars[sym]]
-                ]
+                    self._check_indirect_index_step(idx_arg)
+                    args.append(idx_arg)
             for input in value.arguments:
                 if isinstance(input, TensorAccess):
                     args.append(self.create_tensor_arg(True, input.name, input))
@@ -1221,16 +1246,17 @@ class SpyreKernel(Kernel[CSEVariable]):
                 # Gather/scatter: coordinates are built with raw indirect symbols here;
                 # create_op_spec applies indirect_access_subs during simplification.
                 # Only add the indirect tensors that this specific operation uses.
-                args = [
-                    self.create_tensor_arg(
+                args = []
+                for sym in sorted(indirect_syms_used, key=str):
+                    idx_tensor = self.indirect_vars[sym]
+                    idx_arg = self.create_tensor_arg(
                         True,
                         idx_tensor.name,
                         idx_tensor,
                         opspec_name=idx_tensor.name,
                     )
-                    for sym in sorted(indirect_syms_used, key=str)
-                    for idx_tensor in [self.indirect_vars[sym]]
-                ]
+                    self._check_indirect_index_step(idx_arg)
+                    args.append(idx_arg)
                 args += [
                     self.create_tensor_arg(True, value.name, value),
                     self.create_tensor_arg(False, real_dst_name, dst),

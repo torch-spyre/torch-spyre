@@ -19,7 +19,9 @@ LoopLevel IR to guide higher-level optimization. Deliberately NOT a simulator.
 
 Model (per fused bundle / single-op kernel):
 
-    T   = max(compute, mem) + split                        mem = HBM / (eff * s_lx)
+    T       = compute + mem - overlap_gamma * min(compute, mem) + split
+    compute = matmul_compute + reduction_elems / (cores * reduction_rate)
+    mem     = HBM / (eff * s_lx)
 
     HBM = [ (R+W)/BW + alpha*min(R,W) ] + spill + write_extra
     s_lx = min(1, (512KB/ws)**0.15)   for a coarse-tiled kernel with ws > 512KB   (else 1)
@@ -28,7 +30,8 @@ Model (per fused bundle / single-op kernel):
   traffic is treated as ~free. ``eff`` (<=1) derates the MEMORY term for OUTPUT-dim
   (pointwise) coarse-tiling that shrinks each core's per-tile height; ``s_lx`` (<=1) further
   derates it when the per-core working set overflows LX (spilled traffic runs slower).
-  ``compute`` is nonzero only for matmul (see below). A genuine-reduction cross-core ring term,
+  ``compute`` includes matmul work (see below) and the element-throughput bound of a
+  dependent fused reduction pipeline. A genuine-reduction cross-core ring term,
   and a per-iteration coarse-tiling loop overhead (c_loop*L), once lived here but are dropped
   (the ring is <=~5ns sub-noise; c_loop had no current op to validate it). For a normal untiled
   non-matmul kernel eff = 1, s_lx = 1 and compute = 0, so this reduces to the bandwidth model.
@@ -633,6 +636,14 @@ class CostParams:
     # over-charged rather than the overlap under-modelled.
     loop_reread_scale: float = 0.85
     overlap_gamma: float = 1.0  # compute/HBM overlap: min(compute,HBM) partly hidden
+    # A dependent fused row-reduction pipeline is bounded by the number of
+    # device-layout input elements each active core processes even when all
+    # intermediates stay in LX.
+    # The low-core softmax ladder (1--8 cores) sustains about 1.5 device-layout input
+    # elements/ns/core; at 16/32 cores the HBM side of the roofline takes over. This
+    # This is compute-side execution throughput, not another byte stream: applying
+    # the LX spill/underfill derates to it would count the same bottleneck twice.
+    fused_reduction_elems_per_core_ns: float = 1.5
     # LX RELAYOUT (shuffle) term: per-core serial descriptor cost plus a stride-limited
     # walk. Fitted 2026-08-17 on 21 direct per-kernel rows (main @ 65508a02, fp16,
     # BUNDLE_SYMBOLIC_ARGS=0 -- a method #3741 has since removed; re-measuring needs
@@ -1659,6 +1670,38 @@ def _reduction_bw_cores_factor(cores, p):
     return 1.0
 
 
+def _fused_reduction_compute_ns(ops: list, p: CostParams) -> float | sympy.Expr:
+    """Per-core element-throughput cost for a dependent fused reduction.
+
+    A softmax-like bundle may keep every score-sized intermediate in LX, but its
+    reduction pipeline still processes the full padded device-layout input on each
+    owning core.  Only reductions of values produced inside the bundle participate:
+    independent reductions of a graph input are already covered by the calibrated
+    HBM path and are not the dependent pipeline this term was measured on.
+    The largest such reduction governs the fused pipeline. ``cores`` may be the
+    product of symbolic work-division factors; the solver lowers their reciprocal
+    directly, keeping this hardware model independent of candidate enumeration.
+    """
+    costs = []
+    for op in ops:
+        if not op.is_reduction or op.is_matmul:
+            continue
+        internal_inputs = [
+            arg for arg in op.args if arg.role == "input" and not arg.is_graph_boundary
+        ]
+        if not internal_inputs:
+            continue
+        input_elems = max(
+            [arg.elems * arg.loop_factor for arg in internal_inputs],
+            default=op.out_elems,
+        )
+        costs.append(input_elems / op.cores / p.fused_reduction_elems_per_core_ns)
+    if not costs:
+        return 0.0
+    # work_division.max does not yet accept a single numeric scalar.
+    return costs[0] if len(costs) == 1 else max(*costs)
+
+
 def _matmul_axes_for_split_cost(o) -> tuple | None:
     """Recover the ``(B,b),(M,m),(N,n),(K,k)`` axis pairs, the ``shared_weight`` flag,
     and the cores actually used -- everything ``work_division._matmul_execution_cost``
@@ -1925,8 +1968,10 @@ def predict_ops(ops: list, params: CostParams | None = None) -> float:
         # path had no core-count term at all, which made low-core softmax the model's
         # worst category (median -82 % at cores<32; `softmax_unrolled` runs at cores=1
         # BY DESIGN, so every one of its points sat near -92 %). The binding constraint
-        # there is PER-CORE ELEMENT that separate the two. Charged as a floor, so it
-        # only ever raises a prediction and never binds at cores=32 (0/89 records) ->
+        # there is PER-CORE ELEMENT THROUGHPUT: the 1--8 core ladder sustains about
+        # 1.5 device-layout elements/ns/core. Charged on the compute side of the
+        # roofline, it only ever raises a prediction and never binds at cores=32
+        # (0/89 records) ->
         # the cores=32 path is byte-identical. FLAGGED, deliberately NOT modelled: the
         # floor alone leaves a systematic residual at cores=8/16 (median -17 % / -41 %),
         # where the throughput bound hands back to the memory term and that term is
@@ -1936,9 +1981,8 @@ def predict_ops(ops: list, params: CostParams | None = None) -> float:
         # at cores=32 (median error -50.9 / -38.7 / -17.5 / +0.4 % at cols 128/256/512/
         # 2048), which no core-count term can reach. Deciding experiment: a COLS x ROWS
         # cores ladder with repeats -- the present cells are one shape, one log, n=1 per
-        # config. NOTE the floor is applied to the FINAL memory time below, not here:
-        # `mem` is still divided by the underfill/spill derates further down, which
-        # would inflate a floor imposed at this point by 1/(eff*spill_derate).
+        # config. The throughput term is added to `compute` below, after `mem` receives
+        # the underfill/spill derates, so those memory effects do not inflate it.
         mem = (r + w) / p.bw_peak_gbps + p.rw_turnaround_ns_per_byte * _lazy_min(r, w)
     else:
         mem = (r + w) / p.bw_peak_gbps + p.rw_turnaround_ns_per_byte * _lazy_min(r, w)
@@ -1981,7 +2025,6 @@ def predict_ops(ops: list, params: CostParams | None = None) -> float:
     # slower than the modeled rate. Bytes are already counted as HBM; here we derate the
     # BW.
     spill_derate = _lx_spill_bw_derate(ops, p)
-    # A fused reduction bundle is floored by per-core element throughput (see
     mem_t = p.fill_ns + mem / eff / spill_derate
     # LOOP-INVARIANT OPERAND RE-READ, charged AFTER the derates and at the plain peak
     # rate. Placement is the mechanism, not a convenience: `eff` models a SHORT PER-TILE
@@ -1998,6 +2041,12 @@ def predict_ops(ops: list, params: CostParams | None = None) -> float:
         compute = _matmul_ns_bundled(ops, p)
     else:
         compute = _matmul_ns_upstream(ops, p)
+    if len(ops) > 1:
+        # This is execution throughput, not another byte stream.  Keeping it on
+        # the compute side preserves the ordinary roofline when overlap_gamma=1,
+        # while the co-optimizer's calibrated partial-overlap objective can still
+        # see the cost of spilling otherwise-LX-resident intermediates to HBM.
+        compute += _fused_reduction_compute_ns(ops, p)
     # compute/HBM OVERLAP: the engine streams operands while the systolic array works,
     # so a kernel takes the LONGER of the two rather than their sum. For a non-matmul
     # bundle compute=0 -> t = mem_t (unchanged). The split re-read is charged AFTER the

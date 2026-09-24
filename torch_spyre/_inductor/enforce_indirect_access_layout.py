@@ -510,7 +510,7 @@ def _value_bufs_for_op(
             continue
         coords = [
             c.xreplace(access_subs)
-            for c in device_coordinates(layout.device_layout, dep, sizes)
+            for c in device_coordinates(layout.device_layout, dep, sizes, op=op)
         ]
         if any(hasattr(c, "has") and c.has(IndirectAccess) for c in coords):
             value_bufs.append(buf)
