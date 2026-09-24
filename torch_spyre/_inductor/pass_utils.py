@@ -227,9 +227,12 @@ def rescale_stl_for_dtype(
     (issue #3604).
 
     A narrowing output may therefore end in a partially filled stick, carrying
-    capacity the input does not yet cover. Giving that stick real storage on the
-    wide-dtype side is ``insert_staggered_ea_padding``'s job, and it sizes the
-    padding from the layout returned here (issue #3999).
+    capacity the input does not yet cover. That is a legitimate layout: the
+    widening conversion that consumes it rebuilds a dense layout from the host
+    size, treating the partial stick like any other unaligned stick dim. Giving
+    that stick real storage on the wide-dtype side is
+    ``insert_staggered_ea_padding``'s job, and it sizes the padding from the
+    layout returned here (issue #3999).
 
     Args:
         stl: Input device layout to rescale.

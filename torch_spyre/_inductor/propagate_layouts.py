@@ -403,25 +403,6 @@ def _convert_reads_whole_input(
     )
 
 
-def _fp32_to_dl16_stl(
-    stl: SpyreTensorLayout, out_dtype: torch.dtype
-) -> SpyreTensorLayout:
-    """Return the output layout for FP32_TO_DL16 conversion."""
-    return rescale_stl_for_dtype(stl, out_dtype, ElementArrangement.FP32_TO_DL16)
-
-
-def _qfp8ch_stl(stl: SpyreTensorLayout, out_dtype: torch.dtype) -> SpyreTensorLayout:
-    """Output layout of ``qfp8ch``: fp16 (64/stick) -> fp8 (128/stick) quantization.
-
-    An fp16 tensor whose num-sticks dim holds an odd number of 64-element sticks
-    ends in one partially filled 128-element fp8 stick. That is a legitimate
-    layout for this op: the fp8->fp16 conversion that consumes it rebuilds a
-    dense layout from the host size, treating the partial stick exactly like any
-    other unaligned stick dim.
-    """
-    return rescale_stl_for_dtype(stl, out_dtype, ElementArrangement.QFP8CH)
-
-
 def _qfp8wt_stl(
     output: FixedLayout,
     in_layout: FixedLayout,
@@ -598,10 +579,7 @@ def _single_arg_op_layout(
             if staggered and _convert_reads_whole_input(
                 in_layout, output, dep, output_dep
             ):
-                if fmt == ElementArrangement.FP32_TO_DL16:
-                    layouts = [_fp32_to_dl16_stl(stl, output.dtype)]
-                else:
-                    layouts = [rescale_stl_for_dtype(stl, output.dtype, fmt)]
+                layouts = [rescale_stl_for_dtype(stl, output.dtype, fmt)]
 
                 # A conversion that creates a staggered EA must also expose
                 # outputs reachable by restickifying its STANDARD input first.
@@ -625,12 +603,7 @@ def _single_arg_op_layout(
                         )
                         if target_stl is None:
                             continue
-                        if fmt == ElementArrangement.FP32_TO_DL16:
-                            candidate = _fp32_to_dl16_stl(target_stl, output.dtype)
-                        else:
-                            candidate = rescale_stl_for_dtype(
-                                target_stl, output.dtype, fmt
-                            )
+                        candidate = rescale_stl_for_dtype(target_stl, output.dtype, fmt)
                         if candidate not in layouts:
                             layouts.append(candidate)
 
@@ -656,12 +629,10 @@ def _single_arg_op_layout(
             ]
 
         case spyreop.qfp8ch.default:
-            # fp16 (64 elems/stick) -> fp8 (128 elems/stick) quantization.
-            # Propagate the input device layout and rescale for the dtype change,
-            # preserving any padding present in the input STL. Not
-            # rescale_stl_for_dtype: an fp16 tensor with an odd stick count
-            # ends in a partially filled fp8 stick, which that helper rejects.
-            return [_qfp8ch_stl(stl, output.dtype)]
+            # fp16 (64 elems/stick) -> fp8 (128 elems/stick) quantization: an
+            # fp16 tensor with an odd stick count ends in a partially filled
+            # fp8 stick.
+            return [rescale_stl_for_dtype(stl, output.dtype, ElementArrangement.QFP8CH)]
 
         case spyreop.qfp8wt.default:
             # fp16 -> fp8 weight quantization with 2D-stick layout [2, 64].
