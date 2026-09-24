@@ -1523,6 +1523,7 @@ class TestSelectAllocator(unittest.TestCase):
         from torch_spyre._inductor.scratchpad.greedy_solver import GreedyLayoutSolver
         from torch_spyre._inductor.scratchpad.firstfit_bestfit_solver import (
             BestFitLayoutSolver,
+            FirstFitLayoutSolver,
         )
         from torch_spyre._inductor.scratchpad.ilp_solver_ortools import (
             CpSatLayoutSolver,
@@ -1542,28 +1543,42 @@ class TestSelectAllocator(unittest.TestCase):
             self.assertIs(type(a), ScratchpadAllocator)
             self.assertEqual(a.layout_planning, BestFitLayoutSolver)
 
-        # greedy + co-optimization has no core-division-capable solver to
-        # co-optimize with, so it can only proceed by falling back to
-        # ExhaustiveSearchSolver -- disallowed unless allow_exhaustive_search
-        # is set.
         with ts_inductor_config.patch(
-            layout_solver="greedy",
-            co_optimizing_lx_planning=True,
-            allow_exhaustive_search=False,
-        ):
-            with self.assertRaises(ValueError):
-                select_allocator()
-
-        with ts_inductor_config.patch(
-            layout_solver="greedy",
-            co_optimizing_lx_planning=True,
-            allow_exhaustive_search=True,
+            layout_solver="firstfit", co_optimizing_lx_planning=False
         ):
             a = select_allocator()
-            self.assertIsInstance(a, CoOptimizingAllocator)
-            solver = a.layout_planning([], a.size)
-            self.assertIsInstance(solver, ExhaustiveSearchSolver)
-            self.assertIs(solver._inner_factory, GreedyLayoutSolver)
+            self.assertIs(type(a), ScratchpadAllocator)
+            self.assertEqual(a.layout_planning, FirstFitLayoutSolver)
+
+        # greedy/bestfit/firstfit + co-optimization have no core-division-capable
+        # solver to co-optimize with, so they can only proceed by falling back to
+        # ExhaustiveSearchSolver -- disallowed unless allow_exhaustive_search is
+        # set. All three go through the same generic dict-driven dispatch in
+        # select_allocator(), so this exercises that shared path for each.
+        for solver_method, solver_cls in (
+            ("greedy", GreedyLayoutSolver),
+            ("bestfit", BestFitLayoutSolver),
+            ("firstfit", FirstFitLayoutSolver),
+        ):
+            with self.subTest(solver_method=solver_method):
+                with ts_inductor_config.patch(
+                    layout_solver=solver_method,
+                    co_optimizing_lx_planning=True,
+                    allow_exhaustive_search=False,
+                ):
+                    with self.assertRaises(ValueError):
+                        select_allocator()
+
+                with ts_inductor_config.patch(
+                    layout_solver=solver_method,
+                    co_optimizing_lx_planning=True,
+                    allow_exhaustive_search=True,
+                ):
+                    a = select_allocator()
+                    self.assertIsInstance(a, CoOptimizingAllocator)
+                    solver = a.layout_planning([], a.size)
+                    self.assertIsInstance(solver, ExhaustiveSearchSolver)
+                    self.assertIs(solver._inner_factory, solver_cls)
 
         # cpsat + co-optimization routes to the joint allocator when ortools
         # is present (the cpsat factory is core-division-capable and is used
