@@ -114,7 +114,11 @@ from torch_spyre._inductor.constants import (
 
 from torch_spyre._inductor import config
 from torch_spyre._inductor.logging_utils import get_inductor_logger
-from torch_spyre._inductor.loop_info import CarriedReductionRecord, LoopCarryRecord
+from torch_spyre._inductor.loop_info import (
+    CarriedReductionRecord,
+    LoopCarryRecord,
+    ReadCopyElisionRecord,
+)
 from torch_spyre._inductor.padding import is_restickify_op
 from torch_spyre._inductor.scratchpad.lx_relayout import (
     _unsupported_relayout_transition_reason,
@@ -2475,7 +2479,9 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         assert isinstance(solver, CoreDivisionLayoutSolver)
         return solver.spill_reasons
 
-    def _division_map(self, graph: GraphLowering) -> dict[str, list[CoreDivision]]:
+    def _division_map(
+        self, graph: GraphLowering, *, allow_deferred_read_candidates: bool = False
+    ) -> dict[str, list[CoreDivision]]:
         """Per-op core-division candidates for the joint-division solve.
 
         Every op gets at least one ``CoreDivision`` so the slicing-match gate can
@@ -2535,14 +2541,19 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                 reason = "indirect access entry split"
             elif _reads_offset_slice(op):
                 reason = "offset slice read"
-            elif is_restickify_op(op, graph) and hasattr(
-                op, "_read_copy_elision_record"
+            elif (
+                is_restickify_op(op, graph)
+                and hasattr(op, "_read_copy_elision_record")
+                and not (
+                    allow_deferred_read_candidates
+                    and config.read_copy_elision
+                    and isinstance(op._read_copy_elision_record, ReadCopyElisionRecord)
+                )
             ):
-                # This restickify is a temporary fallback for a deferred
-                # direct graph-input read and is removed after LX planning.
-                # Its split therefore has no cost-model term for CP-SAT to
-                # optimize. Preserve the legal work-division choice instead
-                # of letting an unpriced menu choose an arbitrary split.
+                # The preparation path may provisionally enumerate ordinary
+                # legal candidates, but retains them only after proving and
+                # pricing the direct read in the actual allocation context.
+                # Other callers and unrecognized records keep the fixed pin.
                 reason = "deferred direct graph-input read"
             elif (
                 not config.ignore_work_division_hints
