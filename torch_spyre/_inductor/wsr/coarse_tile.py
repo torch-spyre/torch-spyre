@@ -132,7 +132,7 @@ from ..pass_utils import (
 from ..ir import FixedTiledLayout, SpyreConstantFallback, _resize_device_layout
 from .tile import compute_tile_index, compute_tile_stride, decompose_index_for_tiling
 
-logger = get_inductor_logger("coarse_tile")
+logger = get_inductor_logger("wsr.coarse_tile")
 
 
 class _RetiledBufferInfo(NamedTuple):

@@ -514,6 +514,8 @@ class CustomPreSchedulingPasses:
 
     def __init__(self):
         self.passes = [
+            #
+            # Convert for_each_tile WhileLoops bodies into inlined IR with loop_infos
             splice_while_loops,
             deadcode_elimination,
             #

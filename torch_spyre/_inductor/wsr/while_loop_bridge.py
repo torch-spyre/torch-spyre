@@ -65,17 +65,17 @@ held in ``.inputs``) and writes are actually redirected.
 from __future__ import annotations
 
 import dataclasses
-import logging
 from typing import TYPE_CHECKING, Any
 
 from ..errors import Unsupported
+from ..logging_utils import get_inductor_logger
 from ..loop_info import LoopCarryRecord
 
 if TYPE_CHECKING:
     from torch._inductor import ir
     from torch._inductor.graph import GraphLowering
 
-logger = logging.getLogger(__name__)
+logger = get_inductor_logger("wsr.while_loop_bridge")
 
 
 @dataclasses.dataclass(frozen=True)

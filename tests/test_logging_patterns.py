@@ -491,6 +491,59 @@ class TestTorchSpyreNamespaceNormalization(LoggingIsolationMixin):
         )
 
 
+class TestWsrNamespace(LoggingIsolationMixin):
+    """Tests for the spyre.inductor.wsr namespace covering torch_spyre._inductor.wsr."""
+
+    def test_plus_torch_spyre_inductor_wsr_enables_wsr_and_children(self) -> None:
+        """+torch_spyre.inductor.wsr must raise spyre.inductor.wsr (and its
+        dynamic children) to DEBUG, without touching sibling components."""
+        os.environ["TORCH_LOGS"] = "+torch_spyre.inductor.wsr"
+        logging_config, logging_utils = self._reload_logging_modules()
+
+        assert (
+            logging_config.get_log_level("spyre.inductor.wsr")
+            == logging_config.LogLevel.DEBUG
+        )
+        assert logging_config.get_config_source("spyre.inductor.wsr") == "TORCH_LOGS"
+
+        coarse_tile_logger = logging_utils.get_logger("wsr.coarse_tile")
+        assert coarse_tile_logger.name == "spyre.inductor.wsr.coarse_tile"
+        assert coarse_tile_logger.level == int(logging_config.LogLevel.DEBUG)
+
+        # A sibling component outside wsr must stay at its default.
+        assert (
+            logging_config.get_log_level("spyre.inductor.lowering")
+            == logging_config.LogLevel.WARNING
+        )
+
+        with capture_logs("spyre.inductor.wsr.coarse_tile", level="DEBUG") as captured:
+            coarse_tile_logger.debug("coarse tile decision")
+        assert any("coarse tile decision" in line for line in captured.output)
+
+    def test_minus_torch_spyre_inductor_wsr_overrides_enabled_parent(self) -> None:
+        """-torch_spyre.inductor.wsr silences wsr even when inductor is enabled."""
+        os.environ["TORCH_LOGS"] = "+torch_spyre.inductor,-torch_spyre.inductor.wsr"
+        logging_config, _ = self._reload_logging_modules()
+
+        assert (
+            logging_config.get_log_level("spyre.inductor")
+            == logging_config.LogLevel.DEBUG
+        )
+        assert (
+            logging_config.get_log_level("spyre.inductor.wsr")
+            == logging_config.LogLevel.ERROR
+        )
+        assert (
+            logging_config.get_log_level("spyre.inductor.wsr.coarse_tile")
+            == logging_config.LogLevel.ERROR
+        )
+        # Siblings still inherit the enabled parent.
+        assert (
+            logging_config.get_log_level("spyre.inductor.lowering")
+            == logging_config.LogLevel.DEBUG
+        )
+
+
 class TestCompleteIntegration(LoggingIsolationMixin):
     """End-to-end tests for integrated logging configuration behavior."""
 

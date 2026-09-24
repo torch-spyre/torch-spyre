@@ -86,6 +86,7 @@ from __future__ import annotations
 import copy
 import dataclasses
 import enum
+import logging
 from typing import TYPE_CHECKING, Any
 
 import sympy
@@ -94,9 +95,16 @@ import torch
 from torch._inductor.ops_handler import DefaultHandler, WrapperHandler
 from torch._inductor.virtualized import V
 
+from .. import timing_recorder
+from ..deadcode_elimination import deadcode_elimination
+from ..logging_utils import get_inductor_logger
+from ..pass_utils import format_operations
+
 if TYPE_CHECKING:
     from torch._inductor import ir
     from torch._inductor.dependencies import Dep
+
+logger = get_inductor_logger("wsr.for_each_tile_lowering")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -3170,6 +3178,12 @@ def splice_while_loops(graph) -> None:
         splice_while_loop,
     )
 
+    if logger.isEnabledFor(logging.INFO):
+        with timing_recorder.stage("stage:splice_while_loops:log_before"):
+            logger.info(
+                "BEFORE SPLICE_WHILE_LOOPS\n%s", format_operations(graph.operations)
+            )
+
     group_idx = 0
     pending_levels: list[tuple[sympy.Symbol, sympy.Expr, int, list[str]]] = []
 
@@ -3298,3 +3312,21 @@ def splice_while_loops(graph) -> None:
     # merged in above, so squeezed_advance_per_read reflects each op's final,
     # fully-merged state rather than a partially-stamped intermediate.
     _rebase_point_splice_reads(graph.operations)
+
+    if pending_levels:
+        # Splicing/unrolling leaves dead carry-snapshot and marker scaffolding
+        # behind. The pipeline's deadcode_elimination pass runs before this one,
+        # so nothing downstream would otherwise clean this up until scheduling --
+        # run it here too so the AFTER dump below reflects the IR later passes
+        # actually see, not transient splice debris. Idempotent: a later
+        # deadcode_elimination call finds nothing new to remove.
+        deadcode_elimination(graph)
+
+    if logger.isEnabledFor(logging.INFO):
+        if pending_levels:
+            with timing_recorder.stage("stage:splice_while_loops:log_after"):
+                logger.info(
+                    "AFTER SPLICE_WHILE_LOOPS\n%s", format_operations(graph.operations)
+                )
+        else:
+            logger.info("SPLICE_WHILE_LOOPS: no while_loops spliced")

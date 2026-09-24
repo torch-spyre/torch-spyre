@@ -298,6 +298,7 @@ These components are defined in `DEFAULT_LOG_LEVELS` in
 | `spyre.inductor.sdsc` | SuperDSC bundle generation | `_inductor/codegen/bundle.py` |
 | `spyre.inductor.stickify` | Tensor stickification passes | `_inductor/insert_restickify.py` |
 | `spyre.inductor.passes` | General compiler passes | `_inductor/passes.py` |
+| `spyre.inductor.wsr` | Working-set-reduction / coarse-tiling package (parent) | `_inductor/wsr/` |
 | `spyre.runtime` | C++ runtime (allocator, streams, distributed) | `torch_spyre/csrc/` |
 | `spyre.execution` | (reserved) | — |
 | `spyre.device` | (reserved) | — |
@@ -357,15 +358,31 @@ The full list of dynamic loggers in the codebase:
 | `"scratchpad.allocator"` | `spyre.inductor.scratchpad.allocator` | `_inductor/scratchpad/allocator.py` |
 | `"scratchpad.plan_solver"` | `spyre.inductor.scratchpad.plan_solver` | `_inductor/scratchpad/plan_solver.py` |
 | `"scratchpad.greedy_solver"` | `spyre.inductor.scratchpad.greedy_solver` | `_inductor/scratchpad/greedy_solver.py` |
-| `"assign_dim_hints"` | `spyre.inductor.assign_dim_hints` | `_inductor/wsr/coarse_tile_hints.py` |
-| `"coarse_tile"` | `spyre.inductor.coarse_tile` | `_inductor/wsr/coarse_tile.py` |
-| `"propagate_named_dims"` | `spyre.inductor.propagate_named_dims` | `_inductor/wsr/propagate_named_dims.py` |
-| `"span_overflow_hint_analysis"` | `spyre.inductor.span_overflow_hint_analysis` | `_inductor/wsr/span_overflow_hint_analysis.py` |
+| `"wsr.assign_dim_hints"` | `spyre.inductor.wsr.assign_dim_hints` | `_inductor/wsr/coarse_tile_hints.py` |
+| `"wsr.coarse_tile"` | `spyre.inductor.wsr.coarse_tile` | `_inductor/wsr/coarse_tile.py`, `_inductor/wsr/coarse_tile_span_overflow.py` |
+| `"wsr.propagate_named_dims"` | `spyre.inductor.wsr.propagate_named_dims` | `_inductor/wsr/propagate_named_dims.py` |
+| `"wsr.span_overflow_hint_analysis"` | `spyre.inductor.wsr.span_overflow_hint_analysis` | `_inductor/wsr/span_overflow_hint_analysis.py` |
+| `"wsr.while_loop_bridge"` | `spyre.inductor.wsr.while_loop_bridge` | `_inductor/wsr/while_loop_bridge.py` |
+| `"wsr.enumerate_tilings"` | `spyre.inductor.wsr.enumerate_tilings` | `_inductor/wsr/enumerate_tilings.py` |
+| `"wsr.for_each_tile_lowering"` | `spyre.inductor.wsr.for_each_tile_lowering` | `_inductor/wsr/for_each_tile_lowering.py` |
 | `"propagate_layouts"` | `spyre.inductor.propagate_layouts` | `_inductor/propagate_layouts.py` |
 | `"spyre_kernel"` | `spyre.inductor.spyre_kernel` | `_inductor/spyre_kernel.py` |
 | `"work_division"` | `spyre.inductor.work_division` | `_inductor/work_division.py` |
 
 All of these respond to `TORCH_LOGS="+torch_spyre.inductor"` (parent inheritance).
+
+All `wsr.*` loggers additionally nest under the real `spyre.inductor.wsr`
+namespace (registered in `DEFAULT_LOG_LEVELS`, unlike the other dynamic
+loggers above), so the whole `torch_spyre._inductor.wsr` package can be
+controlled as one group without touching sibling components:
+
+```bash
+# Everything in the wsr package (coarse-tiling / working-set reduction) at DEBUG
+export TORCH_LOGS="+torch_spyre.inductor.wsr"
+
+# Everything else in inductor at DEBUG, but silence wsr specifically
+export TORCH_LOGS="+torch_spyre.inductor,-torch_spyre.inductor.wsr"
+```
 
 ---
 
