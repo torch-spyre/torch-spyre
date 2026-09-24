@@ -487,10 +487,11 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
   TORCH_CHECK(dev_offset == 0, "Invalid device tensor storage offset");
   TORCH_CHECK(device_offset < device_elements, "Invalid device storage offset");
 
-  if (c10::multiply_integers(dma_sizes) > dev_tensor->numel()) {
-    // If the dma_sizes contains more elements than dev_tensor contains then
-    // the dev_tensor is a slice.
-    //
+  // If the dma_sizes contains more elements than dev_tensor contains then the
+  // dev_tensor is a slice.
+  const bool dev_sliced =
+      c10::multiply_integers(dma_sizes) > dev_tensor->numel();
+  if (dev_sliced) {
     // In these cases we first update the dma_sizes and dma_strides to reflect
     // the cpu_tensor sizes and strides.
     //
@@ -662,10 +663,9 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
   }
 
   if (host2device) {
+    // If the dev_strides do not match the cpu_strides then the cpu_tensor is
+    // sliced and/or expanded.
     if (cpu_strides != dev_strides) {
-      // If the dev_strides do not match the cpu_strides then the cpu_tensor is
-      // sliced and/or expanded.
-      //
       // In these cases we update the stride_map of the SpyreTensorLayout to
       // reflect the cpu_strides instead of the dma_strides.
       //
@@ -754,6 +754,13 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
       }
 
       stl.stride_map = dst_stride_map;
+    }
+  } else {
+    // If the device tensors is not sliced we use the original dma_sizes and
+    // dma_strides.
+    if (!dev_sliced) {
+      cpu_sizes = dma_sizes;
+      cpu_strides = dma_strides;
     }
   }
 

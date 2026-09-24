@@ -940,7 +940,7 @@ class TestSpyre(TestCase):
         )
 
         slice_sizes = [2, sizes[1], sizes[2], sizes[3]]
-        y = torch.tensor(
+        y = torch.rand(
             slice_sizes,
             dtype=torch.float16,
             device="cpu",
@@ -949,7 +949,7 @@ class TestSpyre(TestCase):
         self.assertEqual(x.cpu()[:2], y, atol=1e-3, rtol=1e-3)
 
         slice_sizes = [1, sizes[1], sizes[2], sizes[3]]
-        y = torch.tensor(
+        y = torch.rand(
             slice_sizes,
             dtype=torch.float16,
             device="cpu",
@@ -958,7 +958,7 @@ class TestSpyre(TestCase):
         self.assertEqual(x.cpu()[2:3], y, atol=1e-3, rtol=1e-3)
 
         slice_sizes = [sizes[1], sizes[2], sizes[3]]
-        y = torch.tensor(
+        y = torch.rand(
             slice_sizes,
             dtype=torch.float16,
             device="cpu",
@@ -967,7 +967,7 @@ class TestSpyre(TestCase):
         self.assertEqual(x.cpu()[3], y, atol=1e-3, rtol=1e-3)
 
         slice_sizes = [2, sizes[2], sizes[3]]
-        y = torch.tensor(
+        y = torch.rand(
             slice_sizes,
             dtype=torch.float16,
             device="cpu",
@@ -976,7 +976,7 @@ class TestSpyre(TestCase):
         self.assertEqual(x.cpu()[3, :2], y, atol=1e-3, rtol=1e-3)
 
         slice_sizes = [1, sizes[2], sizes[3]]
-        y = torch.tensor(
+        y = torch.rand(
             slice_sizes,
             dtype=torch.float16,
             device="cpu",
@@ -985,7 +985,7 @@ class TestSpyre(TestCase):
         self.assertEqual(x.cpu()[3, 2:3], y, atol=1e-3, rtol=1e-3)
 
         slice_sizes = [sizes[2], sizes[3]]
-        y = torch.tensor(
+        y = torch.rand(
             slice_sizes,
             dtype=torch.float16,
             device="cpu",
@@ -994,7 +994,7 @@ class TestSpyre(TestCase):
         self.assertEqual(x.cpu()[3, 3], y, atol=1e-3, rtol=1e-3)
 
         slice_sizes = [2, sizes[3]]
-        y = torch.tensor(
+        y = torch.rand(
             slice_sizes,
             dtype=torch.float16,
             device="cpu",
@@ -1003,7 +1003,7 @@ class TestSpyre(TestCase):
         self.assertEqual(x.cpu()[3, 3, :2], y, atol=1e-3, rtol=1e-3)
 
         slice_sizes = [1, sizes[3]]
-        y = torch.tensor(
+        y = torch.rand(
             slice_sizes,
             dtype=torch.float16,
             device="cpu",
@@ -1012,7 +1012,7 @@ class TestSpyre(TestCase):
         self.assertEqual(x.cpu()[3, 3, 2:3], y, atol=1e-3, rtol=1e-3)
 
         slice_sizes = [sizes[3]]
-        y = torch.tensor(
+        y = torch.rand(
             slice_sizes,
             dtype=torch.float16,
             device="cpu",
@@ -1021,7 +1021,7 @@ class TestSpyre(TestCase):
         self.assertEqual(x.cpu()[3, 3, 3], y, atol=1e-3, rtol=1e-3)
 
         slice_sizes = [2]
-        y = torch.tensor(
+        y = torch.rand(
             slice_sizes,
             dtype=torch.float16,
             device="cpu",
@@ -1030,7 +1030,7 @@ class TestSpyre(TestCase):
         self.assertEqual(x.cpu()[3, 3, 3, :2], y, atol=1e-3, rtol=1e-3)
 
         slice_sizes = [1]
-        y = torch.tensor(
+        y = torch.rand(
             slice_sizes,
             dtype=torch.float16,
             device="cpu",
@@ -1039,7 +1039,7 @@ class TestSpyre(TestCase):
         self.assertEqual(x.cpu()[3, 3, 3, 2:3], y, atol=1e-3, rtol=1e-3)
 
         slice_sizes = []
-        y = torch.tensor(
+        y = torch.rand(
             slice_sizes,
             dtype=torch.float16,
             device="cpu",
