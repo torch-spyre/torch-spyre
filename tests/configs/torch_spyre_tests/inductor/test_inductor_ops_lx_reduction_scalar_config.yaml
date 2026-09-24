@@ -28,6 +28,20 @@ test_suite_config:
             - LxPlanning.*::test_dwise_conv2d_1x64_ksize3_depthwise_lx_planning_(pointwise|reduction)
             - LxPlanning.*::test_conv2d_2x32_ksize1_stride2_lx_planning_(pointwise|reduction)
             - LxPlanning.*::test_conv2d_2x3x32_ksize1_lx_planning_(pointwise|reduction)
+            # mistral_model (392x532 spatial, 14x14 kernel): the largest conv2d
+            # output in this suite (~1024x379x519 fp16). allow_all_ops_in_lx_planning
+            # force-pins it for LX reuse (production excludes conv2d via
+            # OP_OUTPUT_NOT_GOOD_FOR_LX_REUSE), and its per-core span is ~426 MB,
+            # over work_division.MAX_SPAN_BYTES' 256 MB hard limit -- Unsupported:
+            # "buf5: per-core tensor span ... exceeds hardware limit" (confirmed on
+            # real hardware). A capacity limit, not a correctness bug like the
+            # other conv2d entries here; fixing it means teaching the scratchpad
+            # planner to fall back to hbm_pool instead of hard-erroring, out of
+            # scope for a test-only config production never exercises for conv2d.
+            #
+            # Was also ~8 minutes/wrap to reach that failure from a slow live
+            # fp16 CPU reference; now proxied via fp32 like test_mm_relaxed (see
+            # _is_test_conv2d_fp32_proxy_shape) -- confirmed ~94s combined.
             - LxPlanning.*::test_conv2d_mistral_model_lx_planning_(pointwise|reduction)
             # Native direct-lowered conv2d, STRIDED cases only. A stride-2 conv
             # miscomputes when its output is pinned in LX via the test-only
@@ -45,3 +59,4 @@ test_suite_config:
           mode: mandatory_success
           tags:
             - ops__inductor-reduction
+            

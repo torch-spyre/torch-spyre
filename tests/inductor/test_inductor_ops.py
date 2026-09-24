@@ -715,6 +715,31 @@ def _derive_test_large_matmul_fp32_proxy_shapes(param_sets) -> set:
     }
 
 
+# Same fp32-proxy CPU-ref mechanism as test_large_matmul, scoped to the
+# test_conv2d cases whose CPU-side reference (a large im2col-equivalent
+# GEMM in fp16) is comparably expensive on s390x/ppc64: mistral_model is
+# (1,3,392,532) x (1024,3,14,14), ~2.4e11 FLOPs, the same order of
+# magnitude as test_large_matmul's 2d_M2048_K2048_N65536 case (~5.5e11).
+_TEST_CONV2D_FP32_PROXY_PARAM_KEYS = frozenset({"mistral_model"})
+
+# Populated from TestOps.PARAMS after the class body runs (see bottom of module).
+_TEST_CONV2D_FP32_PROXY_SHAPES = set()
+
+
+def _derive_test_conv2d_fp32_proxy_shapes(param_sets) -> set:
+    missing = _TEST_CONV2D_FP32_PROXY_PARAM_KEYS - param_sets.keys()
+    if missing:
+        raise RuntimeError(
+            "test_conv2d fp32-proxy param keys missing from "
+            'TestOps.PARAMS[("test_conv2d", "test_conv2d_cpu")]: '
+            f"{sorted(missing)}"
+        )
+    return {
+        (tuple(param_sets[key][0].shape), tuple(param_sets[key][1].shape))
+        for key in _TEST_CONV2D_FP32_PROXY_PARAM_KEYS
+    }
+
+
 # Cached once: platform.machine() is stable for the process.
 _ARCH_NEEDS_FP32_PROXY_CPU_REF = (
     platform.machine().lower().startswith(("s390x", "ppc64"))
@@ -732,10 +757,17 @@ def _is_test_large_matmul_fp32_proxy_shape(a: torch.Tensor, b: torch.Tensor) -> 
     return (tuple(a.shape), tuple(b.shape)) in _TEST_LARGE_MATMUL_FP32_PROXY_SHAPES
 
 
+def _is_test_conv2d_fp32_proxy_shape(a: torch.Tensor, b: torch.Tensor) -> bool:
+    # Same scoping convention as _is_test_large_matmul_fp32_proxy_shape, keyed by
+    # (input, weight) shape. Intended coverage is _TEST_CONV2D_FP32_PROXY_PARAM_KEYS.
+    return (tuple(a.shape), tuple(b.shape)) in _TEST_CONV2D_FP32_PROXY_SHAPES
+
+
 def _build_fp32_proxy_cpu_refs(
     op,
     a: torch.Tensor,
     b: torch.Tensor,
+    *extra_args,
     wrap=None,
 ) -> dict:
     """Build compare_with_cpu kwargs using fp32 execution + cast to input dtype.
@@ -746,7 +778,11 @@ def _build_fp32_proxy_cpu_refs(
 
     When ``wrap`` is None (TestOps), ``cpu_eager_result`` is ``op(a32, b32)``.
     When ``wrap`` is set (LX planning), ``cpu_eager_result`` is
-    ``wrap(op_fp32_proxy)(a, b)`` to match ``compare_with_cpu(wrap(op), ...)``.
+    ``wrap(op_fp32_proxy)(a, b, *extra_args)`` to match
+    ``compare_with_cpu(wrap(op), ...)``. ``extra_args`` are additional
+    positional args beyond ``a``/``b`` (e.g. conv2d's bias, padding, stride,
+    groups); tensor entries are upcast to fp32 too, non-tensor entries pass
+    through as-is.
 
     Gate on arch + ``_is_test_large_matmul_fp32_proxy_shape`` before calling.
 
@@ -754,8 +790,9 @@ def _build_fp32_proxy_cpu_refs(
     parity vs x86.
     """
 
-    def op_fp32_proxy(a, b):
-        return op(a.float(), b.float()).to(dtype=a.dtype)
+    def op_fp32_proxy(a, b, *extra_args):
+        extra32 = (t.float() if isinstance(t, torch.Tensor) else t for t in extra_args)
+        return op(a.float(), b.float(), *extra32).to(dtype=a.dtype)
 
     kwargs = {}
     with torch.no_grad():
@@ -766,7 +803,7 @@ def _build_fp32_proxy_cpu_refs(
                 out32 = _compile_and_run(op, (a32, b32), "cpu", compile=True)
                 kwargs["cpu_compile_result"] = out32.to(dtype=a.dtype)
         else:
-            kwargs["cpu_eager_result"] = wrap(op_fp32_proxy)(a, b)
+            kwargs["cpu_eager_result"] = wrap(op_fp32_proxy)(a, b, *extra_args)
     return kwargs
 
 
@@ -9194,5 +9231,10 @@ _TEST_LARGE_MATMUL_FP32_PROXY_SHAPES = _derive_test_large_matmul_fp32_proxy_shap
     TestOps.PARAMS[("test_large_matmul", "test_mm_relaxed")]["param_sets"]
 )
 
+_TEST_CONV2D_FP32_PROXY_SHAPES = _derive_test_conv2d_fp32_proxy_shapes(
+    TestOps.PARAMS[("test_conv2d", "test_conv2d_cpu")]["param_sets"]
+)
+
 if __name__ == "__main__":
     unittest.main()
+    

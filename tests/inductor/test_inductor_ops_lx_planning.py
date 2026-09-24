@@ -33,6 +33,7 @@ import inductor.test_inductor_ops  # noqa: E402
 from inductor.test_inductor_ops import (  # noqa: E402
     _arch_needs_fp32_proxy_cpu_ref,
     _build_fp32_proxy_cpu_refs,
+    _is_test_conv2d_fp32_proxy_shape,
     _is_test_large_matmul_fp32_proxy_shape,
 )
 
@@ -191,17 +192,25 @@ class _LxPlanningTwoOpTestBase(unittest.TestCase):
 
         # Large matmul on s390x/ppc64: live fp16 CPU GEMM inside wrap(fn) is slow.
         # Build fp32→fp16 proxy gold through the same wrap as Spyre (matmul-only
-        # refs for TestOps are built in test_mm_relaxed behind compare_with_cpu guard).
+        # refs for TestOps are built in test_mm_relaxed behind compare_with_cpu
+        # guard). Also covers large conv2d shapes (e.g. mistral_model), whose
+        # CPU-side im2col matmul is comparably slow; extra positional args
+        # beyond a/b (conv2d's bias, padding, stride, groups) pass through.
         if (
             kwargs.get("cpu_eager_result") is None
             and len(args) >= 2
             and isinstance(args[0], torch.Tensor)
             and isinstance(args[1], torch.Tensor)
             and _arch_needs_fp32_proxy_cpu_ref()
-            and _is_test_large_matmul_fp32_proxy_shape(args[0], args[1])
+            and (
+                _is_test_large_matmul_fp32_proxy_shape(args[0], args[1])
+                or _is_test_conv2d_fp32_proxy_shape(args[0], args[1])
+            )
         ):
             kwargs.update(
-                _build_fp32_proxy_cpu_refs(fn, args[0], args[1], wrap=self.wrap)
+                _build_fp32_proxy_cpu_refs(
+                    fn, args[0], args[1], *args[2:], wrap=self.wrap
+                )
             )
 
         return compare_with_cpu(
