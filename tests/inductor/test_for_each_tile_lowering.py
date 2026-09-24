@@ -14,7 +14,7 @@
 
 """IR-level / mocked-IR unit tests for WhileLoop -> for_each_tile lowering.
 
-No Spyre device or backend compiler is required. Covers four areas, each
+No Spyre device or backend compiler is required. Covers five areas, each
 in its own class group:
   1. Eager-mode sanity checks for fixture reference implementations: the
      nested for_each_tile fixture against plain matmul
@@ -26,11 +26,15 @@ in its own class group:
      transplant, carry/xs-leaf read redirection, and mutated-carry
      re-read guard, exercised against hand-built mocks
      (TestCarryBindingsFor, TestSpliceWhileLoop).
-  3. for_each_tile_lowering's splice_while_loops pass and try_prove_
+  3. Per-trip indirect-index safety: SpyreKernel's sub-stick advance
+     refusal (TestIndirectIndexStepGuard) and pass_utils.per_trip_index's
+     splice trip-counter pin (TestPerTripIndex), both against hand-built
+     synthetic inputs.
+  4. for_each_tile_lowering's splice_while_loops pass and try_prove_
      for_each_tile shape prover, exercised against real ir.WhileLoop
      nodes built by lowering the vendored fixtures through GraphLowering
      (TestSpliceWhileLoops, TestTryProveForEachTile).
-  4. Pass-pipeline registration: splice_while_loops runs first, ahead of
+  5. Pass-pipeline registration: splice_while_loops runs first, ahead of
      every other pre-scheduling pass (TestPassPipelineRegistration).
 
 For end-to-end compilation + numerical correctness against a CPU
@@ -205,6 +209,71 @@ class TestIndirectIndexStepGuard(unittest.TestCase):
         from torch_spyre._inductor.spyre_kernel import SpyreKernel
 
         SpyreKernel._check_indirect_index_step(None, self._arg(None))
+
+
+class TestPerTripIndex(unittest.TestCase):
+    """``per_trip_index`` pins a spliced loop's trip counter to zero.
+
+    A spliced ``for_each_tile`` loop writes its trip counter ``u0`` into
+    addresses (e.g. ``d0 + 32*u0``). It describes the address advance from
+    one trip to the next, not an in-tile iteration axis; codegen already
+    applies the advance once and pins ``u0`` to zero in the base
+    coordinates. ``per_trip_index`` is that pin, shared with the layout
+    passes. The device-level regression (a real multi-trip vector page
+    gather) lives in ``test_for_each_tile_e2e.py::TestForEachTileTripRangesE2E``.
+    """
+
+    class _Hint:
+        def __init__(self, loop_var, loop_var_range):
+            self.loop_var = loop_var
+            self.loop_var_range = loop_var_range
+
+    class _FakeOp:
+        def __init__(self, hints):
+            self.dim_hints = hints
+
+    def _u0(self):
+        import sympy
+
+        return sympy.Symbol("u0", integer=True)
+
+    def test_no_hints_returns_index_unchanged(self):
+        import sympy
+
+        from torch_spyre._inductor.pass_utils import per_trip_index
+
+        d0 = sympy.Symbol("d0")
+        self.assertEqual(per_trip_index(self._FakeOp([]), d0), d0)
+        self.assertEqual(per_trip_index(None, d0), d0)
+
+    def test_pins_splice_var_to_zero(self):
+        import sympy
+
+        from torch_spyre._inductor.pass_utils import per_trip_index
+
+        u0, d0 = self._u0(), sympy.Symbol("d0")
+        out = per_trip_index(self._FakeOp([self._Hint(u0, 4)]), d0 + 32 * u0)
+        self.assertEqual(out, d0)
+        self.assertEqual(out.free_symbols, {d0})
+
+    def test_input_expression_not_mutated(self):
+        import sympy
+
+        from torch_spyre._inductor.pass_utils import per_trip_index
+
+        u0, d0 = self._u0(), sympy.Symbol("d0")
+        idx = d0 + 32 * u0
+        per_trip_index(self._FakeOp([self._Hint(u0, 4)]), idx)
+        self.assertEqual(idx, d0 + 32 * u0)
+
+    def test_hint_without_range_is_ignored(self):
+        import sympy
+
+        from torch_spyre._inductor.pass_utils import per_trip_index
+
+        u0, d0 = self._u0(), sympy.Symbol("d0")
+        idx = d0 + 32 * u0
+        self.assertEqual(per_trip_index(self._FakeOp([self._Hint(u0, None)]), idx), idx)
 
 
 class TestSpliceWhileLoop(unittest.TestCase):

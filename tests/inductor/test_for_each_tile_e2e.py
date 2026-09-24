@@ -862,5 +862,65 @@ class TestForEachTileTripRangesE2E(_DynamoResetTestCase):
                     assert (out - adv_twice).abs().max().item() > 1e-2
 
 
+# --- sub-stick for_each_tile indirect-index advance (issue #4835) -----------
+
+
+def substick_gather_fn(pool, ids, init):
+    from torch_spyre._inductor.wsr import for_each_tile
+
+    def fn(pool, ids, init):
+        def body(carry, tiles):
+            tile_ids, whole_pool = tiles
+            return (carry[0] + whole_pool[tile_ids],), None
+
+        (acc,), _ = for_each_tile(
+            body, (ids, pool), dims=(0, None), tile_size=SUBSTICK_TILE, init=(init,)
+        )
+        return acc
+
+    return fn(pool, ids, init)
+
+
+SUBSTICK_POOL, SUBSTICK_WIDTH, SUBSTICK_TRIPS, SUBSTICK_TILE = 256, 128, 4, 2
+
+
+class TestForEachTileSubStickAdvanceE2E(_DynamoResetTestCase):
+    """A ``for_each_tile`` whose per-trip indirect-index advance is narrower
+    than one physical stick must be refused at compile time, not silently
+    compiled to a wrong answer.
+
+    ``ids`` is an int32 tile-advancing (``Kind.SLICE``) operand tiled with
+    ``tile_size=SUBSTICK_TILE=2``; each trip therefore advances the index
+    tensor's device stick coordinate by 2 int32 elements, well inside a
+    single 32-element stick. Before the ``UnalignedStickSplit`` guard added
+    by PR #4829, ``SpyreKernel`` computed this sub-stick advance as if it
+    were whole-stick, repeating the first tile's gather on every subsequent
+    trip. #4829's own regression coverage of that guard
+    (``TestIndirectIndexStepGuard`` in test_for_each_tile_lowering.py) only
+    exercises it via a synthetic CPU ``sympy`` expression; no test compiles
+    an actual sub-stick advance on device. This test closes that gap: it
+    asserts that compiling ``substick_gather_fn`` raises the documented
+    ``UnalignedStickSplit`` failure (surfaced through the wrapping
+    ``InductorError``) instead of returning a plausible-looking wrong
+    answer. See issue #4835 and the parent issue #4828.
+    """
+
+    def test_substick_indirect_advance_is_refused(self):
+        import pytest
+        from torch._inductor.exc import InductorError
+
+        ids = torch.arange(SUBSTICK_TRIPS, dtype=torch.int32).to(DEVICE_NAME)
+        pool = torch.randn(SUBSTICK_POOL, SUBSTICK_WIDTH, dtype=torch.float16).to(
+            DEVICE_NAME
+        )
+        init = torch.zeros(SUBSTICK_TILE, SUBSTICK_WIDTH, dtype=torch.float16).to(
+            DEVICE_NAME
+        )
+
+        compiled = torch.compile(substick_gather_fn, backend="inductor", fullgraph=True)
+        with pytest.raises(InductorError, match="cuts tensor.*physical stick"):
+            compiled(pool, ids, init)
+
+
 if __name__ == "__main__":
     unittest.main()
