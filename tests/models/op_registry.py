@@ -496,7 +496,7 @@ OP_REGISTRY: Dict[str, OpAdapter] = {
     "torch.logical_and": OpAdapter("torch.logical_and", torch.logical_and),
     "torch.bitwise_and": OpAdapter("torch.bitwise_and", torch.bitwise_and),
     "torch.bitwise_or": OpAdapter("torch.bitwise_or", torch.bitwise_or),
-    "torch.or_": OpAdapter("torch.or_", _tensor_or_, is_inplace=True),
+    "torch.or_": OpAdapter("torch.or_", _tensor_or_),
     # Type/device conversions
     "torch.float": OpAdapter("torch.float", _tensor_float),
     "float": OpAdapter("torch.float", _tensor_float),
