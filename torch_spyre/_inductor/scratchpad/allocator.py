@@ -2214,10 +2214,78 @@ class CoOptimizingAllocator(ScratchpadAllocator):
     ) -> Sequence[Any]:
         # Joint selection derives its own divisions; fixed-division plans do not apply.
         in_place = self._determine_in_place_division_invariant(graph)
-        buffers = self._build_cd_bound_buffers(
-            graph, in_place, self._division_map(graph)
+        divisions = self._division_map(graph, allow_deferred_read_candidates=True)
+        pending = {
+            op.name: op
+            for op in graph.operations
+            if hasattr(op, "_read_copy_elision_record")
+            and is_restickify_op(op, graph)
+            and divisions[op.name] != [_fixed_core_division(op)]
+        }
+        while True:
+            buffers = self._build_cd_bound_buffers(graph, in_place, divisions)
+            if not pending:
+                return buffers
+            pricing = {
+                op.get_name(): op for op in self._pricing_operations(graph, buffers)
+            }
+            rejected = [
+                name
+                for name, op in pending.items()
+                if pricing.get(name) is op
+                or not self._direct_read_candidates_priced(
+                    pricing.get(name), divisions[name], buffers
+                )
+            ]
+            if not rejected:
+                return buffers
+            for name in rejected:
+                op = pending.pop(name)
+                fixed = _fixed_core_division(op)
+                assert fixed.cores_used <= config.sencores, (
+                    f"{name}: fixed direct-read division over the "
+                    f"{config.sencores}-core budget"
+                )
+                divisions[name] = _legal_fixed_division(
+                    op, [fixed], "unproved or unpriced direct read"
+                )
+            # Menus affect input clones and relayouts. Rebuild their actual
+            # allocation context and recheck the remaining expanded reads.
+            # Rejection is monotonic, so this terminates after at most one pin
+            # per deferred read, without changing the graph or the late proof.
+
+    @staticmethod
+    def _direct_read_candidates_priced(op, divisions, buffers) -> bool:
+        from torch_spyre._inductor.cost_model import transport_dma_cost_available
+        from torch_spyre._inductor.dump_cost_model import extract_op_features
+        from torch_spyre._inductor.scratchpad.sa_cooptimizer import _work_slices
+
+        if op is None or not any(buf.name == op.get_name() for buf in buffers):
+            return False
+        is_lx = {buf.name: buf.sym_is_lx for buf in buffers}
+        return all(
+            transport_dma_cost_available(
+                extract_op_features(op, _work_slices(op, division), is_lx=is_lx),
+                _COST_PARAMS,
+            )
+            for division in divisions
         )
-        return buffers
+
+    @staticmethod
+    def _pricing_operations(graph, buffers):
+        from torch_spyre._inductor.read_copy_elision import (
+            project_transport_read_copies,
+        )
+
+        return project_transport_read_copies(
+            graph,
+            {buf.name: [cd.splits for cd in buf.core_divisions] for buf in buffers},
+            relayout_sources={
+                buf.relayout_parent
+                for buf in buffers
+                if isinstance(buf, RelayoutCopyBuffer)
+            },
+        )
 
     def _solve(self, solver: MemoryPlanSolver, graph: GraphLowering) -> Sequence[Any]:
         assert isinstance(solver, CoreDivisionLayoutSolver)
@@ -2226,6 +2294,8 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         # lookup is against this same whole-graph map, and rebuilding it per op
         # turns an O(buffers) cost into O(ops * buffers) on the full graph.
         default_is_lx = {name: buf.sym_is_lx for name, buf in bufmap.items()}
+        pricing_ops = self._pricing_operations(graph, solver.buffers)
+        pricing_by_name = {op.get_name(): op for op in pricing_ops}
 
         # Keyed by buffer name, which is what ``predict_by_bundle`` needs to match
         # features to the ops in each estimated bundle. ``mem_usage_by_buf`` keys
@@ -2239,8 +2309,14 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                 continue
             if output_name not in bufmap:
                 continue
+            if output_name not in pricing_by_name:
+                continue
             op_features[output_name] = self._extract_op_features(
-                graph, output_name, bufmap, default_is_lx
+                graph,
+                output_name,
+                bufmap,
+                default_is_lx,
+                op=pricing_by_name[output_name],
             )
 
         from torch_spyre._inductor.cost_model import predict_bundles
@@ -2279,7 +2355,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         bundle_terms: list = []
         try:
             bundle_terms = predict_bundles(
-                graph.operations, op_features, params=_COST_PARAMS
+                pricing_ops, op_features, params=_COST_PARAMS
             )
             cost_expr = sympy.sympify(sum(term for _, term in bundle_terms))
         except (ValueError, RuntimeError, TypeError) as e:
@@ -2364,7 +2440,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             )
         return result
 
-    def _extract_op_features(self, graph, output_name, buffers, is_lx):
+    def _extract_op_features(self, graph, output_name, buffers, is_lx, *, op=None):
         """Build symbolic OpFeatures for one ComputedBuffer op (best-effort).
 
         Same extraction as dump_cost_model.extract_op_features, but keyed off
@@ -2378,7 +2454,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         from torch_spyre._inductor.dump_cost_model import extract_op_features
         from torch_spyre._inductor.scratchpad.sa_cooptimizer import _work_slices
 
-        op = graph.get_buffer(output_name)
+        op = graph.get_buffer(output_name) if op is None else op
         buffer = buffers[output_name]
         division = CoreDivision(splits=buffer.sym_core_divs)
         ws = _work_slices(op, division)

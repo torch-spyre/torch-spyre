@@ -59,6 +59,7 @@ test coverage, bug classification), see :doc:`/contributing/op_enablement`.
    coarse_tiling_loops
    marker_resolution
    cost_model
+   restickify_cost_model
    span_overflow_hint_analysis
    work_division_planning
    scratchpad_planning
