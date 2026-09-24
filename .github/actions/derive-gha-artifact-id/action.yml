@@ -32,7 +32,8 @@ inputs:
   installed:
     description: >-
       What this leg installed ON TOP of the image, space- or comma-separated. EMPTY means the
-      image ran UNCHANGED and the base id is used verbatim (the prebaked path).
+      image ran UNCHANGED (the prebaked path) -- the id is still minted through `component`,
+      since the base image's id on disk belongs to whichever component built that image.
     required: false
     default: ''
   base-id-file:

@@ -66,13 +66,25 @@ def test_install_order_does_not_change_the_identity(derive_mod, base_file):
     assert a == b
 
 
-def test_an_unchanged_image_uses_its_own_id_verbatim(derive_mod, base_file):
-    # The prebaked path: a derived id there would invent an artifact that never existed.
+def test_the_prebaked_path_still_mints_its_own_component_scoped_id(
+    derive_mod, base_file
+):
+    # The image ran unchanged, but its base id was minted under whichever component built
+    # it (e.g. spyre-backend) -- reusing it verbatim for a torch-spyre leg misattributed the
+    # result. component is always folded in, delta or not, so this leg gets its own id.
     record, aid, base = derive_mod.derive(
         "torch-spyre", "amd64", "", base_file, str(LIB)
     )
-    assert aid == base == BASE
-    assert record == f"{BASE}|{BASE}|"
+    assert base == BASE
+    assert aid != BASE
+    assert record == f"{aid}|{BASE}|"
+
+
+def test_the_prebaked_id_differs_by_component(derive_mod, base_file):
+    # Same base image, same empty delta, different component -- must not collide.
+    ts = derive_mod.derive("torch-spyre", "amd64", "", base_file, str(LIB))[1]
+    sb = derive_mod.derive("spyre-backend", "amd64", "", base_file, str(LIB))[1]
+    assert ts != sb
 
 
 def test_an_unstamped_image_derives_nothing(derive_mod, tmp_path):

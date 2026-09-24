@@ -56,8 +56,13 @@ def derive(
         # An image baked before the id was stamped: nothing to chain onto, and inventing a
         # coordinate would give every such leg one shared, wrong identity.
         return "", "", ""
-    # No delta means the image ran UNCHANGED, so its own id is already correct.
-    aid = base if not installed else derive_id(component, base, installed, arch)
+    # Always mint through `component`, delta or not: the base id on disk belongs to
+    # whichever component built that image (e.g. spyre-backend owns every
+    # spyre-backend-dev image row), so reusing it verbatim for an empty delta silently
+    # attributed a torch-spyre leg's result to spyre-backend's own artifact row. Folding
+    # component into the hash even with installed="" always mints this leg's own id,
+    # chained onto base via insert_gha_result's base_artifact_id handling.
+    aid = derive_id(component, base, installed, arch)
     if not aid:
         return "", "", base
     return RECORD_SEP.join([aid, base, installed]), aid, base
@@ -83,7 +88,8 @@ def main(argv=None) -> int:
         "--installed",
         default="",
         help="what this leg installed ON TOP of the image, space- or comma-separated. "
-        "Empty means the image ran unchanged and its own id is used verbatim.",
+        "Empty means the image ran unchanged; the id is still minted through --component, "
+        "since the base image's id on disk belongs to whichever component built that image.",
     )
     ap.add_argument("--base-id-file", default="", help="override the in-image path")
     ap.add_argument(
@@ -111,10 +117,10 @@ def main(argv=None) -> int:
         _emit(artifact_id="", base_artifact_id="")
         return 0
 
-    if aid and aid == base:
-        print(f"artifact_id: {aid} (image ran unchanged — base id used verbatim)")
-    elif aid:
-        print(f"artifact_id: {aid} (base {base} + installed: {args.installed})")
+    if aid:
+        print(
+            f"artifact_id: {aid} (component {args.component}, base {base}, installed: {args.installed or '<none>'})"
+        )
     else:
         print("artifact_id: <none — this leg's rows will carry no artifact>")
         print(
