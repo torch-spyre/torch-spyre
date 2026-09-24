@@ -2390,9 +2390,8 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             ):
                 cost_expr = cost_expr + copy.cost_term()
         result = solver.plan_layout_and_core_divisions(cost_expr)
-        assert not any(buffer.lx_relayout_plans for buffer in result), (
-            "CoOptimizingAllocator does not support LX relayout"
-        )
+        if any(buffer.lx_relayout_plans for buffer in result):
+            raise AssertionError("CoOptimizingAllocator does not support LX relayout")
         if config.dump_cost_expr_file and cost_expr is not None:
             # The objective as solved: its terms, the chosen symbol values and
             # the evaluated prices, for the summarize-sdsc skill.

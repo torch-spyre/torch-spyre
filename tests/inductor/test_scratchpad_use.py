@@ -21,7 +21,7 @@ from types import SimpleNamespace
 from typing import Callable, TypeVarTuple, Unpack, Optional, override
 
 import unittest
-from unittest.mock import patch
+from unittest.mock import create_autospec, patch
 import torch
 
 from torch._inductor import config as t_inductor_config
@@ -125,25 +125,27 @@ def test_nested_spyre_context_runs_pre_scheduling_once():
 def test_cooptimizing_allocator_rejects_relayout_results_without_asserts():
     """Unsupported paired plans remain fail-closed under ``python -O``."""
 
-    import torch_spyre._inductor.cost_model as cost_model_module
     import torch_spyre._inductor.scratchpad.allocator as allocator_module
 
-    solver = SimpleNamespace(
-        buffers=[],
-        plan_layout_and_core_divisions=lambda _cost: [
-            SimpleNamespace(lx_relayout_plans=[object()])
-        ],
+    solver = create_autospec(allocator_module.CoreDivisionLayoutSolver, instance=True)
+    solver.buffers = []
+    solver.decides_lx_relayouts = False
+    solver.plan_layout_and_core_divisions.return_value = [
+        SimpleNamespace(lx_relayout_plans=[object()])
+    ]
+    allocator = allocator_module.CoOptimizingAllocator(
+        layout_planning=lambda _buffers, _size: solver,
+        size=0,
     )
-    graph = SimpleNamespace(operations=[])
+    graph = SimpleNamespace(operations=[], get_output_names=lambda: [])
     with (
-        patch.object(allocator_module, "CoreDivisionLayoutSolver", object),
         patch.object(allocator_module, "mem_usage_by_buf", return_value={}),
-        patch.object(cost_model_module, "predict_by_bundle", return_value=0),
         unittest.TestCase().assertRaisesRegex(
             AssertionError, "CoOptimizingAllocator does not support LX relayout"
         ),
     ):
-        allocator_module.CoOptimizingAllocator._solve(SimpleNamespace(), solver, graph)
+        allocator._solve(solver, graph)
+    solver.plan_layout_and_core_divisions.assert_called_once()
 
 
 class CustomPreSchedulingPassesWithOurPasses(CustomPreSchedulingPasses):
