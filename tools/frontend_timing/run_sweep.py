@@ -32,6 +32,14 @@ no repository path.
 Backend compilation is skipped by default (``TORCH_SPYRE_FRONTEND_ONLY=1``) because it
 dominates wall time and is not what this measures. Pass ``--with-backend`` for a point
 where the backend share itself is the question.
+
+A plan point may carry ``tiers`` and ``env``. ``--tier NAME`` runs only the points that
+declare it, which is how one plan serves a per-PR lane, a nightly lane and a weekly lane
+without three files drifting apart; a point with no ``tiers`` runs in every tier.
+``env`` sets environment for that point's children only, which is the A/B facility: the
+only way to measure two configurations against one tree. The CP-SAT evidence behind the
+complexity audit was taken before that optimization became the default, so re-running
+both arms matters.
 """
 
 from __future__ import annotations
@@ -39,11 +47,13 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import resource
 import shutil
 import subprocess
 import sys
 import tempfile
 import time
+from dataclasses import dataclass, field
 from typing import Any
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -62,6 +72,31 @@ def resolve_out_dir(explicit: str | None) -> str:
     return os.path.join(_HERE, "records")
 
 
+#: Plan keys that configure the sweep rather than the workload. Everything else in a
+#: point is a builder keyword, so a new key here must also be added to this set or the
+#: child will reject it as an unexpected argument.
+RESERVED_PLAN_KEYS = frozenset({"workload", "tiers", "env", "comment"})
+
+#: Carries the resolved A/B arm to the child, which records it so a summary can tell two
+#: arms of one point apart instead of averaging them together.
+ARM_ENV_VAR = "SPYRE_FTS_ENV_ARM"
+
+
+@dataclass
+class Point:
+    """One sweep point: what to build, with what, under what environment."""
+
+    workload: str
+    params: dict[str, Any] = field(default_factory=dict)
+    env: dict[str, str] = field(default_factory=dict)
+    tiers: tuple[str, ...] = ()
+
+    @property
+    def arm(self) -> str:
+        """A short stable label for the environment arm; empty when there is none."""
+        return ",".join(f"{k}={self.env[k]}" for k in sorted(self.env))
+
+
 def parse_params(pairs: list[str]) -> dict[str, Any]:
     """Turn ``key=value`` strings into typed parameters."""
     params: dict[str, Any] = {}
@@ -76,12 +111,19 @@ def parse_params(pairs: list[str]) -> dict[str, Any]:
     return params
 
 
-def point_id(workload: str, params: dict[str, Any]) -> str:
-    """A filesystem-safe, order-independent name for one sweep point."""
-    if not params:
-        return workload
-    joined = "_".join(f"{k}{params[k]}" for k in sorted(params))
-    return f"{workload}-{joined}"
+def point_id(workload: str, params: dict[str, Any], arm: str = "") -> str:
+    """A filesystem-safe, order-independent name for one sweep point.
+
+    The arm is part of the name: without it two arms of the same point write to the same
+    record filename and the second silently overwrites the first.
+    """
+    name = workload
+    if params:
+        name += "-" + "_".join(f"{k}{params[k]}" for k in sorted(params))
+    if arm:
+        safe = arm.replace("=", "").replace(",", "-").replace("/", "_")
+        name += f"+{safe}"
+    return name
 
 
 # ---------------------------------------------------------------------------
@@ -102,6 +144,7 @@ def run_sample(workload: str, params: dict[str, Any], sample: int) -> int:
         cold=True,
         cache_dir=os.environ.get("TORCHINDUCTOR_CACHE_DIR", ""),
         spyre_config=_config_snapshot(config),
+        env_arm=os.environ.get(ARM_ENV_VAR, ""),
         **built.params,
     )
 
@@ -109,6 +152,7 @@ def run_sample(workload: str, params: dict[str, Any], sample: int) -> int:
     # quietly change what is being timed. The control-flow workload needs it outright --
     # without it Dynamo leaves the scan HOP and hits a data-dependent scalar.
     compiled = torch.compile(built.fn, fullgraph=True)
+    started = time.perf_counter()
     try:
         compiled(*built.args)
     except RuntimeError as exc:
@@ -116,6 +160,18 @@ def run_sample(workload: str, params: dict[str, Any], sample: int) -> int:
         # being reached, not a failure. Anything else is real.
         if not config.frontend_only or "TORCH_SPYRE_FRONTEND_ONLY" not in str(exc):
             raise
+    wall_ms = (time.perf_counter() - started) * 1000
+
+    # Recorded after the compile, so they describe it. compile_wall_ms is deliberately
+    # redundant with the recorder's own total: when the two disagree, the recorder is
+    # missing a region, and that is worth knowing from the record itself.
+    timing_recorder.set_run_meta(
+        compile_wall_ms=wall_ms,
+        peak_rss_kb=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
+        kernels_skipped=len(
+            timing_recorder.RECORDER.run_meta.get("backend_skipped_kernels", []) or []
+        ),
+    )
     return 0
 
 
@@ -138,7 +194,13 @@ def _config_snapshot(config: Any) -> dict[str, Any]:
 # Driver.
 
 
-def _child_env(out_dir: str, record_name: str, cache_dir: str, frontend_only: bool):
+def _child_env(
+    out_dir: str,
+    record_name: str,
+    cache_dir: str,
+    frontend_only: bool,
+    point: Point,
+):
     env = dict(os.environ)
     env["TORCHINDUCTOR_CACHE_DIR"] = cache_dir
     env["TORCHINDUCTOR_FORCE_DISABLE_CACHES"] = "1"
@@ -148,19 +210,23 @@ def _child_env(out_dir: str, record_name: str, cache_dir: str, frontend_only: bo
         env["TORCH_SPYRE_FRONTEND_ONLY"] = "1"
     else:
         env.pop("TORCH_SPYRE_FRONTEND_ONLY", None)
+    # The arm goes last so a point can deliberately override anything above it, and its
+    # label travels separately so the child can record which arm produced the record.
+    env.update(point.env)
+    env[ARM_ENV_VAR] = point.arm
     return env
 
 
 def run_point(
-    workload: str,
-    params: dict[str, Any],
+    point: Point,
     out_dir: str,
     samples: int,
     frontend_only: bool,
     timeout_s: int,
 ) -> list[str]:
     """Run one point's warmup plus samples. Returns a list of failure descriptions."""
-    name = point_id(workload, params)
+    workload, params = point.workload, point.params
+    name = point_id(workload, params, point.arm)
     warmup_dir = os.path.join(out_dir, "warmup")
     os.makedirs(warmup_dir, exist_ok=True)
     failures: list[str] = []
@@ -188,7 +254,7 @@ def run_point(
         try:
             proc = subprocess.run(
                 argv,
-                env=_child_env(target, record_name, cache_dir, frontend_only),
+                env=_child_env(target, record_name, cache_dir, frontend_only, point),
                 capture_output=True,
                 text=True,
                 timeout=timeout_s,
@@ -212,13 +278,32 @@ def run_point(
     return failures
 
 
-def load_plan(path: str) -> list[dict[str, Any]]:
+def load_plan(path: str, tier: str | None = None) -> list[Point]:
+    """Load a plan, keeping the points that belong to ``tier``.
+
+    A bare list is still accepted, and a point with no ``tiers`` runs in every tier, so
+    a plan written before tiers existed behaves exactly as it did.
+    """
     with open(path) as handle:
         plan = json.load(handle)
-    points = plan["points"] if isinstance(plan, dict) else plan
-    for point in points:
-        if "workload" not in point:
-            raise SystemExit(f"plan entry missing 'workload': {point}")
+    entries = plan["points"] if isinstance(plan, dict) else plan
+
+    points: list[Point] = []
+    for entry in entries:
+        if "workload" not in entry:
+            raise SystemExit(f"plan entry missing 'workload': {entry}")
+        tiers = tuple(entry.get("tiers", ()))
+        if tier is not None and tiers and tier not in tiers:
+            continue
+        env = {str(k): str(v) for k, v in (entry.get("env") or {}).items()}
+        points.append(
+            Point(
+                workload=entry["workload"],
+                params={k: v for k, v in entry.items() if k not in RESERVED_PLAN_KEYS},
+                env=env,
+                tiers=tiers,
+            )
+        )
     return points
 
 
@@ -233,6 +318,17 @@ def main(argv: list[str] | None = None) -> int:
         default=[],
         metavar="KEY=VALUE",
         help="workload parameter; repeatable",
+    )
+    parser.add_argument(
+        "--tier",
+        help="run only plan points declaring this tier (e.g. pr, nightly, weekly)",
+    )
+    parser.add_argument(
+        "--env",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help="environment for this point's children; repeatable (A/B arm)",
     )
     parser.add_argument("--out", help="directory for records")
     parser.add_argument("--samples", type=int, default=3, help="measured samples (3)")
@@ -262,26 +358,39 @@ def main(argv: list[str] | None = None) -> int:
     if bool(args.plan) == bool(args.workload):
         raise SystemExit("pass exactly one of --plan or --workload")
 
-    points = (
-        load_plan(args.plan)
-        if args.plan
-        else [{"workload": args.workload, **parse_params(args.param)}]
-    )
+    cli_env = {k: str(v) for k, v in parse_params(args.env).items()}
+    if args.plan:
+        points = load_plan(args.plan, args.tier)
+        if cli_env:
+            raise SystemExit("--env applies to a single point; a plan carries its own")
+    else:
+        points = [
+            Point(
+                workload=args.workload,
+                params=parse_params(args.param),
+                env=cli_env,
+            )
+        ]
+    if not points:
+        raise SystemExit(f"no plan points declare tier {args.tier!r}")
+
     out_dir = resolve_out_dir(args.out)
     os.makedirs(out_dir, exist_ok=True)
 
     print(f"records -> {out_dir}")
-    print(f"{len(points)} point(s), {args.samples} sample(s) each, plus a warmup")
+    tier_note = f", tier {args.tier}" if args.tier else ""
+    print(
+        f"{len(points)} point(s){tier_note}, {args.samples} sample(s) each, "
+        "plus a warmup"
+    )
     if not args.with_backend:
         print("backend compilation skipped (TORCH_SPYRE_FRONTEND_ONLY=1)")
 
     failures: list[str] = []
     for point in points:
-        params = {k: v for k, v in point.items() if k != "workload"}
-        print(f"{point_id(point['workload'], params)}:")
+        print(f"{point_id(point.workload, point.params, point.arm)}:")
         failures += run_point(
-            point["workload"],
-            params,
+            point,
             out_dir,
             args.samples,
             not args.with_backend,
