@@ -1,20 +1,465 @@
 {
-  "note": "Default frontend-compile sweep. One entry per point; every key but 'workload' is passed to the workload builder. Each family holds all dimensions still except one, so a point series isolates a single scaling axis. Shapes only -- no measured times. transformer_block and mlp carry Llama-3.1-8B's dimensions (hidden 4096, 32 heads of 128, intermediate 14336) as captured in tests/resource/models.",
+  "note": "Frontend-compile sweep. One entry per point; every key but 'workload', 'tiers', 'env' and 'comment' is passed to the workload builder. Each family holds all dimensions still except one, so a point series isolates a single scaling axis -- scaling.py finds those series by that rule, and a point that moves two axes at once yields no fit. Shapes only, no measured times. 'tiers' selects cadence (pr | nightly | weekly); a point with no 'tiers' runs in every tier. TIER MEMBERSHIP IS PROVISIONAL until calibrated on real hardware -- see the README. granite_* points carry Granite 3.3 8B's dimensions (hidden 4096, 32 query heads over 8 key/value heads of 128, intermediate 12800, stick-padded vocab 49159); transformer_block and mlp keep Llama-3.1-8B's (intermediate 14336) as the continuity point for baselines already taken.",
   "points": [
-    {"workload": "transformer_block", "S": 1, "E": 4096, "heads": 32, "intermediate": 14336},
-    {"workload": "transformer_block", "S": 128, "E": 4096, "heads": 32, "intermediate": 14336},
-    {"workload": "transformer_block", "S": 512, "E": 4096, "heads": 32, "intermediate": 14336},
-    {"workload": "transformer_block", "S": 1024, "E": 4096, "heads": 32, "intermediate": 14336},
-    {"workload": "transformer_block", "S": 2048, "E": 4096, "heads": 32, "intermediate": 14336},
-    {"workload": "transformer_block", "S": 512, "E": 5120, "heads": 40, "intermediate": 16384},
-
-    {"workload": "mlp", "seq_len": 512, "emb_dim": 4096, "intermediate": 14336, "layers": 1},
-    {"workload": "mlp", "seq_len": 512, "emb_dim": 4096, "intermediate": 14336, "layers": 2},
-    {"workload": "mlp", "seq_len": 512, "emb_dim": 4096, "intermediate": 14336, "layers": 4},
-
-    {"workload": "flash", "B": 1, "H": 32, "Lq": 512, "Lk": 512, "D": 128, "block_size": 128},
-    {"workload": "flash", "B": 1, "H": 32, "Lq": 512, "Lk": 1024, "D": 128, "block_size": 128},
-
-    {"workload": "control_flow", "M": 8, "K": 12, "N": 6, "tile": 2}
+    {
+      "workload": "granite_layer",
+      "tiers": [
+        "pr",
+        "nightly",
+        "weekly"
+      ],
+      "S": 128
+    },
+    {
+      "workload": "granite_layer",
+      "tiers": [
+        "nightly",
+        "weekly"
+      ],
+      "S": 1
+    },
+    {
+      "workload": "granite_layer",
+      "tiers": [
+        "nightly",
+        "weekly"
+      ],
+      "S": 512
+    },
+    {
+      "workload": "granite_layer",
+      "tiers": [
+        "nightly",
+        "weekly"
+      ],
+      "S": 1024
+    },
+    {
+      "workload": "granite_layer",
+      "tiers": [
+        "weekly"
+      ],
+      "S": 2048
+    },
+    {
+      "workload": "granite_layer",
+      "tiers": [
+        "nightly",
+        "weekly"
+      ],
+      "S": 512,
+      "layers": 2
+    },
+    {
+      "workload": "granite_layer",
+      "tiers": [
+        "nightly",
+        "weekly"
+      ],
+      "S": 512,
+      "layers": 4
+    },
+    {
+      "workload": "granite_layer",
+      "tiers": [
+        "weekly"
+      ],
+      "S": 512,
+      "layers": 8,
+      "comment": "fourth point of the depth series; scaling.py needs four to fit at all"
+    },
+    {
+      "workload": "granite_lm_head",
+      "tiers": [
+        "nightly",
+        "weekly"
+      ],
+      "S": 128,
+      "chunks": 4
+    },
+    {
+      "workload": "granite_lm_head",
+      "tiers": [
+        "nightly",
+        "weekly"
+      ],
+      "S": 512,
+      "chunks": 4
+    },
+    {
+      "workload": "granite_lm_head",
+      "tiers": [
+        "weekly"
+      ],
+      "S": 1024,
+      "chunks": 4
+    },
+    {
+      "workload": "granite_lm_head",
+      "tiers": [
+        "weekly"
+      ],
+      "S": 2048,
+      "chunks": 4
+    },
+    {
+      "workload": "granite_lm_head",
+      "tiers": [
+        "weekly"
+      ],
+      "S": 512,
+      "chunks": 2,
+      "comment": "chunks series: 2 is the coarsest split that fits the 256 MB per-core span limit"
+    },
+    {
+      "workload": "granite_lm_head",
+      "tiers": [
+        "weekly"
+      ],
+      "S": 512,
+      "chunks": 8
+    },
+    {
+      "workload": "granite_lm_head",
+      "tiers": [
+        "weekly"
+      ],
+      "S": 512,
+      "chunks": 16
+    },
+    {
+      "workload": "granite_embedding",
+      "tiers": [
+        "nightly",
+        "weekly"
+      ],
+      "S": 512
+    },
+    {
+      "workload": "granite_embedding",
+      "tiers": [
+        "weekly"
+      ],
+      "S": 2048
+    },
+    {
+      "workload": "mlp",
+      "tiers": [
+        "pr",
+        "nightly",
+        "weekly"
+      ],
+      "seq_len": 512,
+      "emb_dim": 4096,
+      "intermediate": 14336,
+      "layers": 1
+    },
+    {
+      "workload": "mlp",
+      "tiers": [
+        "nightly",
+        "weekly"
+      ],
+      "seq_len": 512,
+      "emb_dim": 4096,
+      "intermediate": 14336,
+      "layers": 2
+    },
+    {
+      "workload": "mlp",
+      "tiers": [
+        "nightly",
+        "weekly"
+      ],
+      "seq_len": 512,
+      "emb_dim": 4096,
+      "intermediate": 14336,
+      "layers": 4
+    },
+    {
+      "workload": "mlp",
+      "tiers": [
+        "weekly"
+      ],
+      "seq_len": 512,
+      "emb_dim": 4096,
+      "intermediate": 14336,
+      "layers": 8
+    },
+    {
+      "workload": "flash",
+      "tiers": [
+        "pr",
+        "nightly",
+        "weekly"
+      ],
+      "B": 1,
+      "H": 32,
+      "Lq": 512,
+      "Lk": 512,
+      "D": 128,
+      "block_size": 128
+    },
+    {
+      "workload": "flash",
+      "tiers": [
+        "nightly",
+        "weekly"
+      ],
+      "B": 1,
+      "H": 32,
+      "Lq": 512,
+      "Lk": 256,
+      "D": 128,
+      "block_size": 128
+    },
+    {
+      "workload": "flash",
+      "tiers": [
+        "nightly",
+        "weekly"
+      ],
+      "B": 1,
+      "H": 32,
+      "Lq": 512,
+      "Lk": 1024,
+      "D": 128,
+      "block_size": 128
+    },
+    {
+      "workload": "flash",
+      "tiers": [
+        "weekly"
+      ],
+      "B": 1,
+      "H": 32,
+      "Lq": 512,
+      "Lk": 2048,
+      "D": 128,
+      "block_size": 128
+    },
+    {
+      "workload": "elementwise_chain",
+      "tiers": [
+        "pr",
+        "nightly",
+        "weekly"
+      ],
+      "ops": 64
+    },
+    {
+      "workload": "elementwise_chain",
+      "tiers": [
+        "nightly",
+        "weekly"
+      ],
+      "ops": 128
+    },
+    {
+      "workload": "elementwise_chain",
+      "tiers": [
+        "nightly",
+        "weekly"
+      ],
+      "ops": 256
+    },
+    {
+      "workload": "elementwise_chain",
+      "tiers": [
+        "weekly"
+      ],
+      "ops": 512
+    },
+    {
+      "workload": "elementwise_chain",
+      "tiers": [
+        "weekly"
+      ],
+      "ops": 1024
+    },
+    {
+      "workload": "fanout",
+      "tiers": [
+        "pr",
+        "nightly",
+        "weekly"
+      ],
+      "consumers": 8
+    },
+    {
+      "workload": "fanout",
+      "tiers": [
+        "nightly",
+        "weekly"
+      ],
+      "consumers": 16
+    },
+    {
+      "workload": "fanout",
+      "tiers": [
+        "nightly",
+        "weekly"
+      ],
+      "consumers": 32
+    },
+    {
+      "workload": "fanout",
+      "tiers": [
+        "weekly"
+      ],
+      "consumers": 64
+    },
+    {
+      "workload": "fanout",
+      "tiers": [
+        "weekly"
+      ],
+      "consumers": 128
+    },
+    {
+      "workload": "dup_constants",
+      "tiers": [
+        "pr",
+        "nightly",
+        "weekly"
+      ],
+      "dups": 4
+    },
+    {
+      "workload": "dup_constants",
+      "tiers": [
+        "nightly",
+        "weekly"
+      ],
+      "dups": 8
+    },
+    {
+      "workload": "dup_constants",
+      "tiers": [
+        "nightly",
+        "weekly"
+      ],
+      "dups": 16
+    },
+    {
+      "workload": "dup_constants",
+      "tiers": [
+        "weekly"
+      ],
+      "dups": 32
+    },
+    {
+      "workload": "dup_constants",
+      "tiers": [
+        "weekly"
+      ],
+      "dups": 64
+    },
+    {
+      "workload": "transformer_block",
+      "tiers": [
+        "nightly",
+        "weekly"
+      ],
+      "S": 512,
+      "E": 4096,
+      "heads": 32,
+      "intermediate": 14336
+    },
+    {
+      "workload": "transformer_block",
+      "tiers": [
+        "weekly"
+      ],
+      "S": 1,
+      "E": 4096,
+      "heads": 32,
+      "intermediate": 14336
+    },
+    {
+      "workload": "transformer_block",
+      "tiers": [
+        "weekly"
+      ],
+      "S": 128,
+      "E": 4096,
+      "heads": 32,
+      "intermediate": 14336
+    },
+    {
+      "workload": "transformer_block",
+      "tiers": [
+        "weekly"
+      ],
+      "S": 1024,
+      "E": 4096,
+      "heads": 32,
+      "intermediate": 14336
+    },
+    {
+      "workload": "transformer_block",
+      "tiers": [
+        "weekly"
+      ],
+      "S": 2048,
+      "E": 4096,
+      "heads": 32,
+      "intermediate": 14336
+    },
+    {
+      "workload": "transformer_block",
+      "tiers": [
+        "weekly"
+      ],
+      "S": 512,
+      "E": 5120,
+      "heads": 40,
+      "intermediate": 16384
+    },
+    {
+      "workload": "control_flow",
+      "tiers": [
+        "pr",
+        "nightly",
+        "weekly"
+      ],
+      "M": 8,
+      "K": 12,
+      "N": 6,
+      "tile": 2
+    },
+    {
+      "workload": "granite_layer",
+      "tiers": [
+        "weekly"
+      ],
+      "S": 512,
+      "env": {
+        "SPYRE_LX_PLANNER_RELAYOUT": "0"
+      },
+      "comment": "control arm: the CP-SAT relayout optimizations off. The 2.13 solve exponent in the complexity audit was measured before the default flipped, and this is the only way to re-take both arms on one tree."
+    },
+    {
+      "workload": "granite_layer",
+      "tiers": [
+        "weekly"
+      ],
+      "S": 512,
+      "env": {
+        "SENCORES": "1"
+      },
+      "comment": "work-division arm: one core instead of 32 changes what span reduction and work division have to solve."
+    },
+    {
+      "workload": "granite_layer",
+      "tiers": [
+        "weekly"
+      ],
+      "S": 512,
+      "env": {
+        "SPYRE_LX_SOLVER_RELAYOUT_GROUPS_PER_EDGE": "0"
+      },
+      "comment": "unbounded relayout enumeration. config.py records 5789 copies and a presolve that outlived the time limit on a 16-block decode graph, so this arm is the documented pathological case."
+    }
   ]
 }

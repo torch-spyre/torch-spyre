@@ -28,6 +28,13 @@ Sizes are parameters rather than constants because #4117 is about how compile ti
 scales with graph size, and graph size is what these parameters drive: flash unrolls
 its block loop at trace time, so ``Lk / block_size`` inner bodies reach the compiler,
 and the MLP's ``layers`` multiplies its body directly.
+
+Two kinds of family live here. The model-shaped ones -- ``granite_layer``,
+``granite_lm_head``, ``granite_embedding``, ``transformer_block``, ``mlp``, ``flash`` --
+answer "how long does a real shape take". The mechanism probes --
+``elementwise_chain``, ``fanout``, ``dup_constants`` -- move a single axis a specific
+pass scales on, so a superlinear pass can be attributed rather than merely observed.
+A probe is not a workload anyone runs; it is an instrument.
 """
 
 from __future__ import annotations
@@ -267,12 +274,331 @@ def build_control_flow(
     )
 
 
+# ---------------------------------------------------------------------------
+# Granite 3.3 8B.
+
+# From Granite 3.3 8B's published config, cross-checked against the shapes captured in
+# ``tests/resource/models/granite-3.3-8b-instruct.yaml``. Kept together because a point
+# that mixes these with Llama's dimensions measures neither model: Granite's
+# intermediate is 12800 where Llama-3.1-8B's is 14336, and Granite is grouped-query
+# (32 query heads over 8 key/value heads) where Llama-3.1-8B here is not.
+GRANITE_E = 4096
+GRANITE_HEADS = 32
+GRANITE_KV_HEADS = 8
+GRANITE_INTERMEDIATE = 12800
+GRANITE_VOCAB = 49159
+#: Granite's full depth. Nothing here compiles 40 layers in one graph -- see the README
+#: on extrapolation -- but the depth axis is fitted towards this number.
+GRANITE_LAYERS = 40
+# Granite scales four things a plain Llama-shaped block does not. They are only scalar
+# multiplies, but they are operations, so a faithful graph carries them.
+GRANITE_ATTENTION_MULTIPLIER = 0.0078125
+GRANITE_EMBEDDING_MULTIPLIER = 12.0
+GRANITE_LOGITS_SCALING = 16.0
+GRANITE_RESIDUAL_MULTIPLIER = 0.22
+GRANITE_RMS_EPS = 1e-5
+
+
+def _rms_norm(t: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    return t * torch.rsqrt((t * t).mean(-1, keepdim=True) + GRANITE_RMS_EPS) * weight
+
+
+def build_granite_layer(
+    *,
+    B: int = 1,
+    S: int = 512,
+    layers: int = 1,
+    E: int = GRANITE_E,
+    heads: int = GRANITE_HEADS,
+    kv_heads: int = GRANITE_KV_HEADS,
+    intermediate: int = GRANITE_INTERMEDIATE,
+) -> Workload:
+    """Granite 3.3 8B decoder layers, stacked ``layers`` deep.
+
+    Grouped-query attention is what separates this from ``transformer_block``: 32 query
+    heads share 8 key/value heads, so the projections are asymmetric and SDPA runs with
+    ``enable_gqa=True``. That path is exercised by
+    ``test_building_blocks.py::_run_granite_gqa_with_finite_broadcast_mask``
+    (``B, H, N_KV, D = 1, 32, 8, 128``) and was only fixed in #4793, so it is thinly
+    covered and worth sweeping.
+
+    Named dims come from ``spyre_hint`` on the reshapes rather than from the eager
+    ``name_tensor_dims`` API, even though the >512 GQA test uses the latter: here q, k
+    and v are *computed* from projections inside the graph, so naming the input tensors
+    would never reach the reshape that splits the head dimension. Above
+    ``S=512`` -- ``_SDPA_MAX_SEQUENCE_TILE_SIZE`` in ``decompositions.py`` -- the
+    decomposition must tile the query dimension, which needs those names to exist.
+
+    The query and key/value head dimensions carry *different* names because they are
+    different sizes; one name at two sizes is a conflict, not a shortcut.
+    """
+    if E % heads:
+        raise ValueError(f"E {E} not divisible by heads {heads}")
+    head_dim = E // heads
+    if head_dim % 64:
+        # 64 fp16 elements is one stick; a fractional head lands as an
+        # "Unsupported coordinate expression 5*c0/2" assertion deep in lowering.
+        raise ValueError(
+            f"head_dim {head_dim} (E {E} / heads {heads}) is not a multiple of 64"
+        )
+    if heads % kv_heads:
+        raise ValueError(f"heads {heads} not divisible by kv_heads {kv_heads}")
+
+    torch.manual_seed(0)
+    x = _randn(B, S, E)
+    kv_width = kv_heads * head_dim
+    weights = []
+    for _ in range(layers):
+        weights.append(
+            (
+                _randn(E),
+                _randn(E),
+                _randn(E, E),
+                _randn(E, kv_width),
+                _randn(E, kv_width),
+                _randn(E, E),
+                _randn(E, intermediate),
+                _randn(E, intermediate),
+                _randn(intermediate, E),
+            )
+        )
+
+    def per_head(t, n_heads, head_name):
+        with spyre_hint(named_dims=["B", "S", head_name, "D"]):
+            split = t.reshape(B, S, n_heads, head_dim)
+        with spyre_hint(named_dims=["B", head_name, "S", "D"]):
+            return split.transpose(1, 2)
+
+    def stack(x, weights):
+        for norm1, norm2, wq, wk, wv, wo, gate, up, down in weights:
+            h = _rms_norm(x, norm1)
+            q = per_head(h @ wq, heads, "H")
+            k = per_head(h @ wk, kv_heads, "Hkv")
+            v = per_head(h @ wv, kv_heads, "Hkv")
+            with spyre_hint(named_dims=["B", "H", "S", "D"]):
+                attn = F.scaled_dot_product_attention(
+                    q, k, v, scale=GRANITE_ATTENTION_MULTIPLIER, enable_gqa=True
+                )
+            with spyre_hint(named_dims=["B", "S", "H", "D"]):
+                back = attn.transpose(1, 2)
+            with spyre_hint(named_dims=["B", "S", "E"]):
+                merged = back.reshape(B, S, E)
+            x = x + GRANITE_RESIDUAL_MULTIPLIER * (merged @ wo)
+            h = _rms_norm(x, norm2)
+            mlp_out = (h @ up * F.silu(h @ gate)) @ down
+            x = x + GRANITE_RESIDUAL_MULTIPLIER * mlp_out
+        return x
+
+    return Workload(
+        name="granite_layer",
+        fn=stack,
+        args=(x, weights),
+        params={
+            "B": B,
+            "S": S,
+            "layers": layers,
+            "E": E,
+            "heads": heads,
+            "kv_heads": kv_heads,
+            "intermediate": intermediate,
+        },
+    )
+
+
+def build_granite_lm_head(
+    *,
+    B: int = 1,
+    S: int = 512,
+    E: int = GRANITE_E,
+    vocab: int = GRANITE_VOCAB,
+    chunks: int = 4,
+) -> Workload:
+    """Granite's final norm and language-model head, split over the vocabulary.
+
+    A 4096 -> 49159 projection is 201M parameters in one matmul, and no amount of
+    decoder-layer sweeping ever reaches it.
+
+    It does not fit unsplit. Measured: work division rejects the whole weight with
+    "per-core tensor span 384.500 MB (shape=[4096, 49159]) exceeds hardware limit of
+    256.00 MB". ``SENCORES`` cannot rescue that -- 32 cores is already the maximum and
+    fewer cores means more per core -- so the projection is split into ``chunks``
+    matmuls, which is what a real implementation does for a vocabulary this size. That
+    makes ``chunks`` a working-set axis worth sweeping in its own right.
+
+    The chunks are returned rather than concatenated: the concatenation is not the work
+    being measured, and keeping it out avoids making this family's cost depend on
+    whether cat lowers well.
+    """
+    torch.manual_seed(0)
+    if chunks < 1:
+        raise ValueError(f"chunks {chunks} must be at least 1")
+    x = _randn(B, S, E)
+    norm = _randn(E)
+    # The remainder rides on the last chunk, so the widths still sum to vocab.
+    width = vocab // chunks
+    widths = [width] * chunks
+    widths[-1] += vocab - width * chunks
+    heads = [_randn(E, w) for w in widths]
+
+    def lm_head(x, norm, heads):
+        h = _rms_norm(x, norm)
+        return tuple((h @ head) / GRANITE_LOGITS_SCALING for head in heads)
+
+    return Workload(
+        name="granite_lm_head",
+        fn=lm_head,
+        args=(x, norm, heads),
+        params={"B": B, "S": S, "E": E, "vocab": vocab, "chunks": chunks},
+    )
+
+
+def build_granite_embedding(
+    *, S: int = 512, E: int = GRANITE_E, vocab: int = GRANITE_VOCAB
+) -> Workload:
+    """Granite's token embedding, as the gather it lowers to.
+
+    There is no ``embedding`` lowering in the backend, so this is written as
+    ``index_select`` over the table -- which is the same memory access and is a
+    supported frontend path, from
+    ``tests/inductor/test_indirect_access_gather.py::test_index_select``. The index is
+    int32, as every scenario in that file uses.
+
+    Worth its own family because it is the only indirect access in the sweep: it is the
+    one point that reaches ``enforce_indirect_access_layout`` at all. The backend's
+    indirect-access numerics are an expected failure today, which does not matter
+    here -- a frontend-only compile never runs the kernel.
+    """
+    torch.manual_seed(0)
+    table = _randn(vocab, E)
+    ids = torch.randint(0, vocab, (S,), dtype=torch.int32).to(DEVICE_NAME)
+
+    def embed(table, ids):
+        return torch.index_select(table, 0, ids) * GRANITE_EMBEDDING_MULTIPLIER
+
+    return Workload(
+        name="granite_embedding",
+        fn=embed,
+        args=(table, ids),
+        params={"S": S, "E": E, "vocab": vocab},
+    )
+
+
+# ---------------------------------------------------------------------------
+# Mechanism probes: small graphs whose only purpose is to move one axis.
+
+
+def build_elementwise_chain(
+    *, ops: int = 64, rows: int = 256, cols: int = 1024
+) -> Workload:
+    """A chain of ``ops`` pointwise operations.
+
+    The cheapest possible graph-size axis, and the only one that grows the operation
+    count without paying for a single matmul -- so a pass whose cost is per-operation
+    shows up here uncontaminated by BMM planning.
+
+    This works because ``enable_spyre_context`` forces ``Loops.has_large_inner_fn`` to
+    return True (``patches.py``), realizing every operation as its own buffer instead of
+    fusing the chain into one inner function. On a backend without that, the whole chain
+    would collapse to a single operation and this family would measure nothing.
+    """
+    torch.manual_seed(0)
+    x = _randn(rows, cols)
+
+    def chain(x):
+        for i in range(ops):
+            # Cycled so the graph is a mix of unary and scalar-binary operations rather
+            # than the same node repeated, which planning could treat as one shape.
+            step = i % 4
+            if step == 0:
+                x = torch.relu(x)
+            elif step == 1:
+                x = x * 1.0009765625
+            elif step == 2:
+                x = x + 0.5
+            else:
+                x = F.silu(x)
+        return x
+
+    return Workload(
+        name="elementwise_chain",
+        fn=chain,
+        args=(x,),
+        params={"ops": ops, "rows": rows, "cols": cols},
+    )
+
+
+def build_fanout(*, consumers: int = 8, rows: int = 256, cols: int = 1024) -> Workload:
+    """One produced buffer read by ``consumers`` operations.
+
+    Grows the consumer count while holding the producer and the operation shapes still,
+    which is the axis a consumer-index or users-lookup cost scales on. That is the
+    mechanism class behind #4113 -- a reverse index rebuilt per consumer -- and the repo
+    has no users abstraction, so nothing else in the sweep moves this axis on its own.
+    """
+    torch.manual_seed(0)
+    x = _randn(rows, cols)
+
+    def fanout(x):
+        producer = torch.relu(x)
+        total = producer * 1.0
+        for i in range(2, consumers + 1):
+            total = total + producer * float(i)
+        return total
+
+    return Workload(
+        name="fanout",
+        fn=fanout,
+        args=(x,),
+        params={"consumers": consumers, "rows": rows, "cols": cols},
+    )
+
+
+def build_dup_constants(
+    *, dups: int = 4, B: int = 2, M: int = 8, N: int = 32
+) -> Workload:
+    """``dups`` unaligned bmms over one shared activation.
+
+    Each unaligned K emits a padding constant, and they are identical, so dedup sees one
+    duplicate group of size ``dups``. That is the natural axis of
+    ``dedup_and_promote_constants`` -- the pass whose complexity row is already measured
+    as ``operations x duplicates`` -- and this is the only family that moves it.
+
+    The fixture is ``tests/inductor/test_dedup_constants.py``'s: fp16, K one element
+    past a stick boundary, several weights sharing one activation.
+    """
+    from torch_spyre._C import get_elem_in_stick
+
+    torch.manual_seed(0)
+    K = get_elem_in_stick(torch.float16) + 1
+    x = _randn(B, M, K)
+    weights = [_randn(B, K, N) for _ in range(dups)]
+
+    def dup(x, weights):
+        out = torch.bmm(x, weights[0])
+        for w in weights[1:]:
+            out = out + torch.bmm(x, w)
+        return out
+
+    return Workload(
+        name="dup_constants",
+        fn=dup,
+        args=(x, weights),
+        params={"dups": dups, "B": B, "M": M, "N": N},
+    )
+
+
 #: Workload name -> builder. Add an entry here and a point in sweep_plan.json.
 BUILDERS: dict[str, Callable[..., Workload]] = {
+    "control_flow": build_control_flow,
+    "dup_constants": build_dup_constants,
+    "elementwise_chain": build_elementwise_chain,
+    "fanout": build_fanout,
     "flash": build_flash,
+    "granite_embedding": build_granite_embedding,
+    "granite_layer": build_granite_layer,
+    "granite_lm_head": build_granite_lm_head,
     "mlp": build_mlp,
     "transformer_block": build_transformer_block,
-    "control_flow": build_control_flow,
 }
 
 
