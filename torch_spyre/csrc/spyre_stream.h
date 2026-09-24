@@ -76,9 +76,10 @@ class SpyreStream {
 
  private:
   flex::RuntimeStream* resolveRuntimeHandle() const;
-  void copyAsyncImpl(void* cpu_ptr,
+  void copyAsyncImpl(void* cpu_ptr, size_t host_capacity,
                      const flex::CompositeAddress* device_address,
-                     const DataConversionInfo* dci, bool host2device) const;
+                     const DataConversionInfo* dci, bool host2device,
+                     std::shared_ptr<void> host_lifetime = nullptr) const;
 };
 
 /**

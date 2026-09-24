@@ -102,6 +102,74 @@ class TestSpyre(TestCase):
         a_cpu = a.cpu()
         self.assertTrue(a_cpu.eq(3.5).all())
 
+    @parametrize(
+        "factory",
+        [
+            subtest(
+                lambda: torch.empty((64, 64), dtype=torch.float16, pin_memory=True),
+                name="empty",
+            ),
+            subtest(
+                lambda: torch.empty_strided(
+                    (64, 64),
+                    (1, 64),
+                    dtype=torch.float16,
+                    pin_memory=True,
+                ),
+                name="empty_strided",
+            ),
+        ],
+    )
+    def test_cpu_factory_pin_memory(self, factory):
+        cpu = factory()
+
+        self.assertEqual(cpu.device.type, "cpu")
+        self.assertTrue(cpu.is_pinned())
+
+        expected = (torch.arange(cpu.numel(), dtype=torch.int64) % 31).to(cpu.dtype)
+        cpu.copy_(expected.reshape(cpu.shape))
+        actual = cpu.to("spyre").cpu()
+        torch.testing.assert_close(actual, cpu, rtol=0, atol=0)
+
+    def test_cpu_pin_memory_method_and_interior_view(self):
+        values = (torch.arange(4128, dtype=torch.int64) % 31).to(torch.float16)
+        base = values.pin_memory()
+        view = base[17:4113]
+
+        self.assertTrue(base.is_pinned())
+        self.assertTrue(view.is_pinned())
+        self.assertEqual(
+            view.data_ptr(),
+            base.data_ptr() + 17 * base.element_size(),
+        )
+
+    def test_explicit_pinned_d2h(self):
+        expected = (torch.arange(4096, dtype=torch.int64) % 31).to(torch.float16)
+        source = expected.to("spyre")
+        destination = torch.empty_like(expected, pin_memory=True)
+
+        destination.copy_(source, non_blocking=True)
+        torch.accelerator.synchronize()
+
+        self.assertTrue(destination.is_pinned())
+        torch.testing.assert_close(destination, expected, rtol=0, atol=0)
+
+    def test_pageable_d2h_remains_supported(self):
+        expected = (torch.arange(4096, dtype=torch.int64) % 31).to(torch.float16)
+        source = expected.to("spyre")
+        destination = torch.empty_like(expected, pin_memory=False)
+
+        destination.copy_(source, non_blocking=True)
+        torch.accelerator.synchronize()
+
+        self.assertFalse(destination.is_pinned())
+        torch.testing.assert_close(destination, expected, rtol=0, atol=0)
+
+    def test_zero_size_pinned_allocation(self):
+        cpu = torch.empty(0, dtype=torch.float16, pin_memory=True)
+        self.assertEqual(cpu.numel(), 0)
+        self.assertEqual(cpu.device.type, "cpu")
+
     def test_empty_factory_in_device_context(self):
         # The error only repros if at least one allocation
         # has already happened
