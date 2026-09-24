@@ -212,7 +212,7 @@ def test_relayout_solve_uses_available_parallel_search_workers(
 
     def solve(solver, model, *args, **kwargs):
         workers.append(solver.parameters.num_search_workers)
-        assert not solver.parameters.share_level_zero_bounds
+        assert solver.parameters.share_level_zero_bounds
         return original(solver, model, *args, **kwargs)
 
     monkeypatch.setattr(cp_model.CpSolver, "Solve", solve)

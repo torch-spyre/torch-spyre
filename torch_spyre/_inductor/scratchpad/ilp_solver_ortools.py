@@ -1410,12 +1410,6 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         solver.parameters.num_search_workers = (
             1 if torch.are_deterministic_algorithms_enabled() else get_cpu_count()
         )
-        # Root-level bounds shared by OR-Tools' parallel subsolvers can race on
-        # this mixed nonlinear/NoOverlap2D model: with a large portfolio, 9.15
-        # has returned different plans as OPTIMAL and has even reported a lower
-        # bound above its incumbent. Keep the full worker portfolio, but let each
-        # subsolver prove its own level-zero bounds.
-        solver.parameters.share_level_zero_bounds = False
         # Fixed seed so a given worker configuration is reproducible run-to-run.
         solver.parameters.random_seed = 0
 
@@ -1680,10 +1674,19 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
                     x_start, x_size, sb.end_time, sb.in_buffer, f"x_{sb.name}"
                 )
             )
-            # An interval's ``end`` must be affine (a single var), so the address
-            # top ``offset + eff_size`` (a sum of two vars) needs its own var; the
-            # interval ties it to start+size whenever the buffer is resident.
-            y_end = model.new_int_var(0, self._capacity_units, f"top_{sb.name}")
+            # An interval's ``end`` must be affine (a single var), so the top
+            # of a division-dependent footprint needs its own var, tied to
+            # ``offset + eff_size`` unconditionally. Its range covers every
+            # offset/footprint pair, so a spilled buffer loses no assignment.
+
+            # the top bound must be larger than capacity to account for buffers
+            # which are larger than LX itself
+            y_end = model.new_int_var(
+                0,
+                max(0, self._capacity_units - 1) + sb.buffer.size,
+                f"top_{sb.name}",
+            )
+            model.add(y_end == sb.offset + sb.eff_size)
             y_intervals.append(
                 model.new_optional_interval_var(
                     sb.offset,
