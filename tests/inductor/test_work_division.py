@@ -3228,6 +3228,131 @@ class TestCoOptimizingAllocator(unittest.TestCase):
         self.assertIn("buf0", str(caught.exception))
 
 
+class _SqueezingTilingPass:
+    """Stands in for ``CoarseTilingPass``: divides each chosen op's ranges, which
+    is the part of the apply that renumbers its iteration symbols."""
+
+    def __init__(self, choices):
+        self.choices = choices
+
+    def apply_pass(self, graph):
+        from torch_spyre._inductor.wsr.coarse_tile import _divide_ranges
+
+        for op in graph.operations:
+            for level in self.choices[op.get_operation_name()].axes:
+                _divide_ranges(op, sympy.Integer(level.count), [level.host_dim])
+
+
+class TestTiledSplitsAfterAUnitTile(unittest.TestCase):
+    """A tile that shrinks a dim to extent 1 drops that dim's loop symbol and
+    renumbers every later one. The splits the solve chose, keyed by the
+    pre-apply symbols, must still commit on the axes they were chosen for."""
+
+    @contextmanager
+    def _applied(self, sizes, tiling, splits_by_position, floors_by_position=None):
+        from torch._inductor.sizevars import SizeVarAllocator
+        from torch._inductor.virtualized import V, ops
+        from torch_spyre._inductor.pass_utils import iteration_space_from_op
+
+        strides = [math.prod(sizes[i + 1 :]) for i in range(len(sizes))]
+
+        def inner_fn(index):
+            return ops.load("x", sum(s * i for s, i in zip(strides, index)))
+
+        with V.set_graph_handler(SimpleNamespace(sizevars=SizeVarAllocator())):
+            op = ComputedBuffer(
+                name="tiled",
+                layout=FixedLayout(torch.device("cpu"), torch.float16, sizes),
+                data=Pointwise(
+                    device=torch.device("cpu"),
+                    dtype=torch.float16,
+                    inner_fn=inner_fn,
+                    ranges=[sympy.Integer(s) for s in sizes],
+                ),
+            )
+            op.operation_name = op.name
+            op.iteration_space_ownership = None
+            before = list(iteration_space_from_op(op))
+            if floors_by_position:
+                op._work_division_span_min_splits = {
+                    before[p]: f for p, f in floors_by_position.items()
+                }
+            graph = MagicMock(operations=[op])
+            allocation = [
+                CoreDivisionBuffer(
+                    name=op.name,
+                    size=2 * math.prod(sizes),
+                    uses=[0],
+                    core_divisions=[
+                        CoreDivision(
+                            splits={
+                                before[p]: f for p, f in splits_by_position.items()
+                            },
+                            tiling=tiling,
+                        )
+                    ],
+                    chosen_division=0,
+                )
+            ]
+            allocator = CoOptimizingAllocator(MagicMock(), size=1)
+            with (
+                patch.object(CoOptimizingAllocator, "_solver_chooses_tilings", True),
+                patch(
+                    "torch_spyre._inductor.scratchpad.coarse_tiling.CoarseTilingPass",
+                    _SqueezingTilingPass,
+                ),
+                patch.object(
+                    allocator_module, "commit_iteration_space_ownership"
+                ) as commit,
+            ):
+                allocator._apply_chosen_tilings(graph, allocation)
+                yield SimpleNamespace(
+                    allocator=allocator,
+                    graph=graph,
+                    allocation=allocation,
+                    op=op,
+                    commit=commit,
+                )
+
+    @staticmethod
+    def _by_extent(op, splits):
+        from torch_spyre._inductor.pass_utils import iteration_space_from_op
+
+        extents = iteration_space_from_op(op)
+        return {int(extents[sym]): factor for sym, factor in splits.items()}
+
+    def _committed(self, applied):
+        allocator_module.commit_divisions(
+            applied.graph, applied.allocation, applied.allocator._live_splits
+        )
+        (committed,) = [c.args[1] for c in applied.commit.call_args_list]
+        return self._by_extent(applied.op, committed)
+
+    def test_splits_follow_their_axes_past_a_squeezed_dim(self):
+        with self._applied(
+            [4, 64, 256, 128],
+            TileSpec((TileAxis(host_dim=0, count=4),)),
+            {1: 16, 2: 2},
+            floors_by_position={1: 16},
+        ) as applied:
+            # Positionally re-read, these would land 16 on the 256 axis and 2
+            # on the 128 stick axis.
+            self.assertEqual(self._committed(applied), {64: 16, 256: 2})
+            self.assertEqual(
+                self._by_extent(
+                    applied.op,
+                    applied.op._work_division_span_min_splits,
+                ),
+                {64: 16},
+            )
+
+    def test_a_split_on_the_only_other_axis_survives(self):
+        with self._applied(
+            [32, 1024], TileSpec((TileAxis(host_dim=0, count=32),)), {1: 4}
+        ) as applied:
+            self.assertEqual(self._committed(applied), {1024: 4})
+
+
 class TestTopKConstraints(unittest.TestCase):
     def test_topk_uses_minimum_supported_split_domains(self):
         k, search = _isym("k"), _isym("search")
