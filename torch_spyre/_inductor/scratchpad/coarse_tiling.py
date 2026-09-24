@@ -42,6 +42,7 @@ from ..pass_utils import op_out_coords
 from ..propagate_hints import DimHint
 from ..wsr.coarse_tile import (
     coarse_tile_post_stickify,
+    plan_coarse_tile_groups,
     reduction_loop_vars,
     validate_coarse_tile_groups,
 )
@@ -128,9 +129,24 @@ def derive_tiling_groups(
     untiled (absent from ``choices`` or mapped to the empty spec) or its spec
     differs from the run's. Contiguity is a hard requirement, not an
     optimization -- ``validate_coarse_tile_groups`` and ``_apply_plan`` both rely
-    on each group occupying one contiguous stretch of the operation list, so a
-    connected component that skipped an intervening untiled op would be rejected
-    at apply time.
+    on each group occupying one contiguous stretch of the operation list.
+
+    Two non-adjacent runs carrying the same spec are therefore **two groups**,
+    each minting its own hint ids and group id. They are not the same group and
+    not an error: ``TileSpec`` equality is structural, so unrelated regions
+    anywhere in the graph collide on a small alphabet (~6 counts per axis over
+    at most two dims), and refusing them would refuse ordinary graphs.
+
+    **Precondition on the caller, which this signature cannot check.** Ops meant
+    to tile together have to be contiguous in ``graph.operations``. A chooser
+    walking producer/consumer reachability is not walking contiguity: an op it
+    could not tile -- a menu-backed one, or one already carrying ``dim_hints``
+    -- sitting in the middle of a region leaves the second half reading the
+    first half's *full* extent while the chooser priced both at the per-tile
+    footprint. That is a mispricing rather than an illegal graph, and a
+    name->spec map carries no region identity to detect it with, so it belongs
+    to whoever builds ``choices``. ``_validate_contiguous`` remains the backstop
+    for the illegal case.
 
     ``choices`` is keyed by operation name (``op.get_operation_name()``).
     """
@@ -186,22 +202,26 @@ class CoarseTilingPass(ScratchpadOptimizationPass):
     the pass mints hint ids and a group-id offset from bases derived off the
     graph, stamps each op's ``dim_hints``, validates group contiguity, then calls
     ``coarse_tile``. With empty (or all-untiled) ``choices`` it is a no-op and
-    the op count is unchanged -- which is what keeps it inert while
-    ``auto_coarse_tiling`` is off.
+    the op count is unchanged -- which is what keeps it inert until a solver
+    hands it real choices.
     """
 
     def __init__(self, choices: Mapping[str, TileSpec]):
         self._choices = dict(choices)
 
-    def apply_pass(self, graph: GraphLowering) -> None:
+    def _stamped_groups(self, graph: GraphLowering) -> list[tuple]:
+        """Derive the groups and stamp each member's ``dim_hints``.
+
+        Shared by :meth:`apply_pass` and :meth:`plan_only`, which differ only in
+        whether they go on to mutate the IR.
+        """
         groups_specs = derive_tiling_groups(graph, self._choices)
         if not groups_specs:
-            return
+            return []
         # Both bases are derived off the graph *before* this pass stamps any of
         # its own hints/groups, so pre-existing (hint-driven) ids are avoided
         # and the ids this pass mints increase monotonically.
         next_hint_id = _derive_hint_id_base(graph)
-        group_idx_offset = _derive_group_idx_offset(graph)
         groups: list[tuple] = []
         for group_ops, spec in groups_specs:
             hint_ids = list(range(next_hint_id, next_hint_id + len(spec.axes)))
@@ -214,6 +234,38 @@ class CoarseTilingPass(ScratchpadOptimizationPass):
                 op.dim_hints = tile_spec_to_dim_hints(op, spec, hint_ids)
             groups.append((group_ops, levels))
         validate_coarse_tile_groups(groups)
+        return groups
+
+    def plan_only(self, graph: GraphLowering) -> None:
+        """Raise whatever :meth:`apply_pass` would raise, leaving ``graph`` as
+        it was found.
+
+        For a caller that must not be left holding a half-transformed graph: the
+        decisions are all made before any IR is rewritten
+        (``plan_coarse_tile_groups`` is explicitly zero-mutation), but
+        ``dim_hints`` are stamped along the way, so those are restored here. A
+        caller that treats a refusal as fatal can then fail on an untouched
+        graph -- which matters where something downstream (a fallback solver,
+        say) is entitled to assume the graph was never touched.
+        """
+        saved = [(op, getattr(op, "dim_hints", None)) for op in graph.operations]
+        try:
+            groups = self._stamped_groups(graph)
+            if groups:
+                plan_coarse_tile_groups(graph.operations, groups)
+        finally:
+            for op, hints in saved:
+                if hints is None:
+                    if hasattr(op, "dim_hints"):
+                        del op.dim_hints
+                else:
+                    op.dim_hints = hints
+
+    def apply_pass(self, graph: GraphLowering) -> None:
+        group_idx_offset = _derive_group_idx_offset(graph)
+        groups = self._stamped_groups(graph)
+        if not groups:
+            return
         # This pass runs inside scratchpad/LX planning -- after stickification
         # (insert_restickify) and the post-stickify span-overflow WSR pass -- so
         # every op already carries a committed FixedTiledLayout. Use the
