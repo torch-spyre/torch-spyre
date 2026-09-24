@@ -1983,6 +1983,11 @@ def test_carried_reduction_verifier_requires_physical_ownership():
         "lx_planning": True,
         "allow_all_ops_in_lx_planning": True,
         "layout_solver": "greedy",
+        # co_optimizing_lx_planning defaults on; greedy has no core-division-
+        # capable solver, so co-optimization would otherwise raise unless we
+        # opt into the (here harmless, small-graph) ExhaustiveSearchSolver
+        # fallback.
+        "allow_exhaustive_search": True,
     }
 )
 def test_carried_reduction_stages_compile_to_a_drain():
@@ -2067,6 +2072,11 @@ def test_relayout_splits_rows_and_collects_columns():
         "lx_planning": True,
         "allow_all_ops_in_lx_planning": True,
         "layout_solver": "greedy",
+        # co_optimizing_lx_planning defaults on; greedy has no core-division-
+        # capable solver, so co-optimization would otherwise raise unless we
+        # opt into the (here harmless, small-graph) ExhaustiveSearchSolver
+        # fallback.
+        "allow_exhaustive_search": True,
     }
 )
 def test_carried_reduction_after_tiled_pointwise_producer():
