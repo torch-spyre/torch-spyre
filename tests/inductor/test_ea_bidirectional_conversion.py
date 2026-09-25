@@ -262,6 +262,43 @@ def test_bidirectional_roundtrip_fp32_start(device, shape, fp16):
     print("✓ FP32→FP16→FP32 roundtrip works")
 
 
+# A staggered FP32 value spans two sticks per FP16 stick, so an extent that is
+# not a whole FP16 stick leaves the second one partly live.  Cover the sub-stick
+# extents (below one FP16 stick) and the half-stick multiples, where the wide
+# side needs an odd number of FP32 sticks rounded up to the pair.
+_CONSUMED_WIDE_EXTENTS = [1, 5, 31, 32, 33, 63, 96]
+
+
+@pytest.mark.parametrize("device", ["spyre"])
+@pytest.mark.parametrize("extent", _CONSUMED_WIDE_EXTENTS, ids=lambda n: f"n{n}")
+@pytest.mark.parametrize(
+    "fp16",
+    DtypeOpTable.fp16_types(),
+    ids=lambda dt: str(dt).replace("torch.", ""),
+)
+def test_consumed_wide_value_keeps_both_staggered_sticks(device, extent, fp16):
+    """A consumer between two conversions covers both sticks of a staggered pair.
+
+    Unlike the roundtrips above, the wide value is read by an op rather than
+    converted straight back, so the pair of FP32 sticks holding one FP16 stick
+    has to survive into that op's own iteration.  An op reaching only the first
+    stick drops half the elements, interleaved through the extent rather than
+    left in a tail, which a bare roundtrip cannot show: with nothing consuming
+    the wide value the pair of casts folds to an identity and no conversion
+    reaches the device at all.
+    """
+    torch._dynamo.reset()
+
+    def fn(x):
+        return (x.to(torch.float32) * 2.0).to(dtype=fp16)
+
+    x = torch.randn(2, 3, extent, device=device, dtype=fp16)
+    result = torch.compile(fn)(x)
+
+    assert_ea(result, ElementArrangement.STANDARD)
+    assert_val(fn, x, result)
+
+
 def _stagger_fn(x, fp16):
     """fp32 → fp16(staggered) → stagger_to_standard_ea → standard EA fp16."""
     return torch.ops.spyre.stagger_to_standard_ea(x.to(dtype=fp16))
