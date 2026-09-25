@@ -6,31 +6,13 @@ the op graph.
 
 ---
 
-## Background: Sticks, Stick Constraints, and Restickify
+## Terminology
 
-The Spyre hardware memory model requires all tensor operands within a single
-kernel to share the same *stick variable*. A stick is a 128-byte aligned
-chunk of contiguous elements in device memory — 64 elements at `fp16`, 32 at
-`fp32`. The *stick dimension* is the innermost device dimension; the *stick
-variable* is the loop variable whose expression modulo the stick depth appears
-in the innermost device coordinate.
-
-A `SpyreTensorLayout` (STL) fully describes how a tensor is stored in device
-memory:
-
-- `device_size` — shape of the device buffer (may differ from the host logical
-  shape after stick-dimension transposition or padding)
-- `stride_map` — how each device dimension corresponds to host strides (set to
-  `-1` for size-1 or sparse axes)
-- `device_dtype` — the on-device data format (e.g. `SEN169_FP16`)
-- `element_arrangement` (`ElementArrangement`) — standard, staggered
-  (`DL16_TO_FP32` / `FP32_TO_DL16` for RMSNorm upcasts), `QFP8CH`, `QFP8WT`
-- The stick is always the last device dimension.
-
-Each operation imposes specific stick constraints on its inputs and outputs.
-If those constraints are not met, the operation will not execute correctly or
-will produce incorrect output. A *restickify* op must be inserted to produce a
-new buffer whose stick satisfies the operation's requirements.
+- **Stick** — a 128-byte aligned chunk of contiguous elements; the stick dimension is always the innermost device dimension.
+- **SpyreTensorLayout** (STL) — fully describes a tensor's on-device storage, including its stick.
+- **Restickify** — a data-movement op that copies a tensor into a new buffer with a different stick arrangement.
+- **Stick compatibility** — each op imposes stick constraints on its inputs and output. When a constraint is not met, a restickify is required to resolve it.
+- **Layout optimization** — selecting an output STL for each op that satisfies its stick constraints while minimizing total restickify cost.
 
 ---
 
@@ -66,8 +48,8 @@ improves to the point where the larger state space is manageable.
 
 ### Stick Compatibility and Restickify Cost
 
-Stick constraints across all ops reduce to three classes, each specifying how
-inputs and output must relate and the cost of a mismatch.
+Three node types encode the different classes stick-compatibility constraints and the cost
+to bring incompatibilities into compliance vi restickify.
 
 **`AllSameNode`** — used for pointwise ops and most reductions. All inputs
 and the output must share a stick. The cost is the sum of per-input
@@ -145,7 +127,6 @@ optimizer to choose:
   contraction variable, weight and output stick on the out-channel variable.
 - **`exx2` / `layernormnorm`**: input must stick on the last (reduction) dimension.
 
-
 ---
 
 ## Pass 2 — Restickify Optimization (`optimize_restickify_locations`)
@@ -190,7 +171,7 @@ recomputation.
 
 The optimizer operates over the same three cost node types (`AllSameNode`,
 `FixedInOutNode`, `AnyInNode`) defined above. See
-[Cost node types](#cost-node-types) above.
+[Stick Compatibility and Restickify Cost](#stick-compatibility-and-restickify-cost) above.
 
 ---
 
@@ -214,16 +195,15 @@ the frontier is sorted by lower bound and trimmed to at most `BEAM_WIDTH`
 states. A wider beam is more likely to find the global optimum; a narrower
 beam finishes faster but may discard the optimal path if it gets trimmed because it looked poor initially.
 
-
 ### Pruning optimizations
 
-The optimizer performs two additional optimizations to reduce the state space (improving both runtime and memory usage) by pruning provably non-optimal 
+The optimizer performs two additional optimizations to reduce the state space (improving both runtime and memory usage) by pruning provably non-optimal
 states.  Note this differs from the previously discussed `BEAM_WIDTH` and `propagate_layouts` heuristics, which may prevent the optimal solution from being found.  The optimizations below should never drop an optimal solution.
 
 **Liveness merge.** If two states
 differ only in the STLs of dead buffers — buffers no future op will read —
 the state with the higher cost can never win, thus can be discarded.  In graphs with many short-lived
-intermediates, liveness merge can eliminate a large fraction of states, helping prevent an optimal state from exceeding `BEAM_WIDTH` and being trimmed. 
+intermediates, liveness merge can eliminate a large fraction of states, helping prevent an optimal state from exceeding `BEAM_WIDTH` and being trimmed.
 
 **Backward DP lower bound.** Before the forward pass runs, a backward pass
 walks the graph in reverse topological order and computes, for every
