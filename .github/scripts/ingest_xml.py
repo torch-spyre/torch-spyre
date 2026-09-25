@@ -100,6 +100,12 @@ PERF_SUITE_NAME = "spyre-perf-suite"
 # version_info must name these four with a real commit. spyre-perf-suite is
 # not required until that SHA is emitted (#150).
 _REQUIRED_PROVENANCE_KEYS = ("torch-spyre", "flex", "deeptools", "spyre-comms")
+# Prod report.xml often uses RPM-style keys; bare keys remain valid (#4896).
+_PROVENANCE_KEY_ALIASES = {
+    "flex": ("flex/ibm-flex",),
+    "deeptools": ("deeptools/ibm-deeptools",),
+    "spyre-comms": ("spyre-comms/ibm-spyre-comms",),
+}
 _MISSING_COMMIT = {"", "null", "N/A", "None"}
 
 
@@ -414,12 +420,26 @@ def _null_tag(value):
     return None if value in (None, "", "null", "N/A") else value
 
 
+def _has_provenance_commit(info: dict, key: str) -> bool:
+    """True if bare key or a known RPM alias has a non-empty commit str."""
+    for candidate in (key,) + _PROVENANCE_KEY_ALIASES.get(key, ()):
+        comp = info.get(candidate)
+        if not isinstance(comp, dict):
+            continue
+        commit = comp.get("commit")
+        if isinstance(commit, str) and commit.strip() not in _MISSING_COMMIT:
+            return True
+    return False
+
+
 def classify_run_quality(version_info: str | None) -> tuple[str, int]:
     """Return (quality, regression_eligible) from testsuite version_info JSON.
 
     Incomplete provenance is still ingested (visible on Benchmark Runs) but
     must not feed regression views. version may be JSON null; commit must be
     a non-empty Python str. Unparseable / missing version_info is incomplete.
+    For flex / deeptools / spyre-comms, bare keys or RPM-style aliases
+    (flex/ibm-flex, …) both count (#4896).
     """
     if not version_info:
         return "incomplete", 0
@@ -430,11 +450,7 @@ def classify_run_quality(version_info: str | None) -> tuple[str, int]:
     if not isinstance(info, dict):
         return "incomplete", 0
     for key in _REQUIRED_PROVENANCE_KEYS:
-        comp = info.get(key)
-        if not isinstance(comp, dict):
-            return "incomplete", 0
-        commit = comp.get("commit")
-        if not isinstance(commit, str) or commit.strip() in _MISSING_COMMIT:
+        if not _has_provenance_commit(info, key):
             return "incomplete", 0
     return "valid", 1
 
