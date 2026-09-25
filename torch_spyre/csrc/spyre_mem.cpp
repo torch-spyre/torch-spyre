@@ -430,15 +430,11 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
 
   std::vector<int64_t> cpu_sizes = cpu_tensor->sizes().vec();
   std::vector<int64_t> cpu_strides = cpu_tensor->strides().vec();
-  const std::vector<int64_t> dev_sizes = dev_tensor->sizes().vec();
-  const std::vector<int64_t> dev_strides = dev_tensor->strides().vec();
+  std::vector<int64_t> dev_sizes = dev_tensor->sizes().vec();
+  std::vector<int64_t> dev_strides = dev_tensor->strides().vec();
   const std::vector<int64_t> dma_sizes = spyre_tensor_impl->dma_sizes;
   const std::vector<int64_t> dma_strides = spyre_tensor_impl->dma_strides;
   std::vector<int64_t> device_sizes = stl.device_size;
-
-  const int64_t cpu_offset = cpu_tensor->storage_offset();
-  int64_t dev_offset = dev_tensor->storage_offset();
-  int64_t device_offset = 0;
 
   // While the source strides may differ from the destination strides when the
   // source is non-dense or overlapping, the source sizes should always match
@@ -450,28 +446,233 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
               "Invalid device sizes for host sizes. Expected: ", cpu_sizes,
               ", got: ", dev_sizes);
 
-  if (host2device) {
-    TORCH_CHECK(dev_sizes == dma_sizes,
-                "Invalid dma sizes for device sizes. Expected: ", dev_sizes,
-                ", got: ", dma_sizes);
-    TORCH_CHECK(dev_strides == dma_strides,
-                "Invalid dma strides for device strides. Expected: ",
-                dev_strides, ", got: ", dma_strides);
+  const int64_t cpu_offset = cpu_tensor->storage_offset();
+  int64_t dev_offset = dev_tensor->storage_offset();
+  int64_t device_offset = 0;
+
+  const int device_rank = stl.stride_map.size();
+
+  // Compute the device_offset, which is the offset into stl.device_size, based
+  // on the dev_offset, which is the offset into dma_sizes.
+  std::vector<int64_t> device_strides(device_rank, 1);
+  int64_t device_elements = 1;
+  for (int i = device_rank - 1; i >= 0; i--) {
+    device_strides[i] = device_elements;
+    device_elements *= stl.device_size[i];
+  }
+
+  std::map<int64_t, int, std::greater<int64_t>> stride_map_to_j;
+  for (int i = 0; i < device_rank; i++) {
+    if (stl.stride_map[i] <= 0) continue;
+    if (stl.device_size[i] <= 1) continue;
+    if (stride_map_to_j.contains(stl.stride_map[i])) {
+      TORCH_CHECK(i == (device_rank - 1),
+                  "Invalid device sizes and stride map. Expected only 1 non-1 ",
+                  "device_size value for stride_map value ", stl.stride_map[i],
+                  "got: ", stl.device_size[i], " and ",
+                  stl.device_size[stride_map_to_j[stl.stride_map[i]]]);
+      continue;
+    }
+    stride_map_to_j.insert({stl.stride_map[i], i});
+  }
+
+  for (const auto& [stride, index] : stride_map_to_j) {
+    if (stride > dev_offset) continue;
+    const int64_t slice = dev_offset / stride;
+    device_offset += slice * device_strides[index];
+    dev_offset -= slice * stride;
+    if (dev_offset <= 0) break;
+  }
+
+  TORCH_CHECK(dev_offset == 0, "Invalid device tensor storage offset");
+  TORCH_CHECK(device_offset < device_elements, "Invalid device storage offset");
+
+  // If the dma_sizes contains more elements than dev_tensor contains then the
+  // dev_tensor is a slice.
+  const bool dev_sliced =
+      c10::multiply_integers(dma_sizes) > dev_tensor->numel();
+  if (dev_sliced) {
+    // In these cases we first update the dma_sizes and dma_strides to reflect
+    // the cpu_tensor sizes and strides.
+    //
+    // We then update the stride_map of the SpyreTensorLayout to reflect the
+    // updated dma_sizes and dma_strides.
+    //
+    // Note that these updates are only applied to the local copy of the
+    // dma_sizes, dma_strides, and SpyreTensorLayout. The SpyreTensorImpl for
+    // the dev_tensor is not modified.
+    const int host_rank = dev_tensor->dim();
+    const int dma_rank = dma_strides.size();
+
+    // Inflate or deflate cpu_sizes, cpu_strides, dev_sizes, and dev_strides
+    // to the same rank as dma_sizes and dma_strides.
+    std::vector<int64_t> adjusted_cpu_sizes;
+    std::vector<int64_t> adjusted_cpu_strides;
+    std::vector<int64_t> adjusted_dev_sizes;
+    std::vector<int64_t> adjusted_dev_strides;
+    for (int i = 0; i < dma_rank; i++) {
+      const int64_t dma_size = dma_sizes[i];
+      const int64_t dma_stride = dma_strides[i];
+      const int64_t next_stride = dma_size * dma_stride;
+      int64_t cpu_product = 1;
+      int64_t dev_product = 1;
+      int64_t cpu_min_stride = dma_stride;
+      int64_t dev_min_stride = dma_stride;
+      for (int j = 0; j < host_rank; j++) {
+        if (dev_strides[j] >= dma_stride && dev_strides[j] < next_stride) {
+          cpu_product *= cpu_sizes[j];
+          cpu_min_stride = std::min(cpu_min_stride, cpu_strides[j]);
+          dev_product *= dev_sizes[j];
+          dev_min_stride = std::min(dev_min_stride, dev_strides[j]);
+        }
+      }
+      cpu_product = std::min(cpu_product, dma_size);
+      adjusted_cpu_sizes.push_back(cpu_product);
+      adjusted_cpu_strides.push_back(cpu_min_stride);
+      dev_product = std::min(dev_product, dma_size);
+      adjusted_dev_sizes.push_back(dev_product);
+      adjusted_dev_strides.push_back(dev_min_stride);
+    }
+    cpu_sizes = std::move(adjusted_cpu_sizes);
+    cpu_strides = std::move(adjusted_cpu_strides);
+
+    // Reorder cpu_sizes, cpu_strides, dev_sizes, and dev_strides to the same
+    // ordering as dma_sizes and dma_strides.
+    std::vector<int64_t> dma_order(dma_rank);
+    std::iota(dma_order.begin(), dma_order.end(), 0);
+    std::sort(dma_order.begin(), dma_order.end(),
+              [&dma_strides, &dma_sizes](int64_t i1, int64_t i2) {
+                if (dma_strides[i1] == dma_strides[i2]) {
+                  if (dma_strides[i1] != 1 && dma_strides[i2] != 1) {
+                    return i1 > i2;
+                  }
+                  return dma_sizes[i1] != 1;
+                }
+                return dma_strides[i1] > dma_strides[i2];
+              });
+
+    std::vector<int64_t> dev_order(dma_rank);
+    std::iota(dev_order.begin(), dev_order.end(), 0);
+    std::sort(
+        dev_order.begin(), dev_order.end(),
+        [&adjusted_dev_strides, &adjusted_dev_sizes](int64_t i1, int64_t i2) {
+          if (adjusted_dev_strides[i1] == adjusted_dev_strides[i2]) {
+            if (adjusted_dev_strides[i1] != 1 &&
+                adjusted_dev_strides[i2] != 1) {
+              return i1 > i2;
+            }
+            return adjusted_dev_sizes[i1] != 1;
+          }
+          return adjusted_dev_strides[i1] > adjusted_dev_strides[i2];
+        });
+
+    std::vector<int64_t> ordered_sizes(dma_rank);
+    std::vector<int64_t> ordered_strides(dma_rank);
+    std::vector<int64_t> ordered_dev_sizes(dma_rank);
+    std::vector<int64_t> ordered_dev_strides(dma_rank);
+    for (int i = 0; i < dma_rank; i++) {
+      for (int j = 0; j < dma_rank; j++) {
+        if (dev_order[i] == dma_order[j]) {
+          ordered_sizes[i] = cpu_sizes[j];
+          ordered_strides[i] = cpu_strides[j];
+          ordered_dev_sizes[i] = adjusted_dev_sizes[j];
+          ordered_dev_strides[i] = adjusted_dev_strides[j];
+          break;
+        }
+      }
+    }
+    cpu_sizes = std::move(ordered_sizes);
+    cpu_strides = std::move(ordered_strides);
+    dev_sizes = std::move(ordered_dev_sizes);
+    dev_strides = std::move(ordered_dev_strides);
+
+    // Create a dst_stride_map that reflects cpu_sizes and cpu_strides.
+    // This is done in 3 passes.
+
+    // Pass 1: Fill dst_stride_map with the min of stride_map and cpu_strides.
+    std::map<int64_t, int> dma_stride_to_j;
+    for (int i = 0; i < dma_rank; i++) {
+      if (dma_sizes[i] == 1) continue;
+      dma_stride_to_j.insert({dma_strides[i], i});
+    }
+
+    std::vector<int64_t> dst_stride_map(device_rank, -2);
+    for (int i = 0; i < device_rank; i++) {
+      const int64_t device_size = stl.device_size[i];
+      if (device_size == 1) {
+        dst_stride_map[i] = -1;
+        continue;
+      }
+      const int64_t device_stride = stl.stride_map[i];
+      if (device_stride < 1) {
+        dst_stride_map[i] = device_stride;
+        continue;
+      }
+      if (dma_stride_to_j.find(device_stride) != dma_stride_to_j.end()) {
+        const int j = dma_stride_to_j[device_stride];
+        dst_stride_map[i] = std::min(device_stride, cpu_strides[j]);
+      }
+    }
+
+    // Pass 2: Compute missing values (tiles) using dst_stride_map values.
+    const std::vector<std::vector<int>> tile_map =
+        get_tile_map(dma_sizes, dma_strides, stl.device_size, stl.stride_map);
+
+    for (int i = 0; i < dma_rank; i++) {
+      for (const int& j : tile_map[i]) {
+        if (dst_stride_map[j] == -2) {
+          int64_t prev_stride = 1;
+          int prev_index = -1;
+          for (int k = 0; k < device_rank; k++) {
+            if (stl.device_size[k] == 1) continue;
+            if (stl.stride_map[k] < 1) continue;
+            if (stl.stride_map[k] >= stl.stride_map[j]) continue;
+            if (stl.stride_map[k] >= prev_stride) {
+              prev_stride = stl.stride_map[k];
+              prev_index = k;
+            }
+          }
+          if (prev_index != -1) {
+            const int64_t tile_size = stl.stride_map[j] / prev_stride;
+            prev_stride = dst_stride_map[prev_index];
+            dst_stride_map[j] = tile_size * prev_stride;
+          } else {
+            dst_stride_map[j] = stl.stride_map[j];
+          }
+        }
+      }
+    }
+
     TORCH_CHECK(
-        dev_offset == 0,
-        "Invalid destination storage offset. Expected: 0, got: ", dev_offset);
+        std::all_of(dst_stride_map.begin(), dst_stride_map.end(),
+                    [](int64_t val) { return val != -2; }),
+        "Invalid device sizes and stride map for host sizes and strides");
+
+    // Pass 3: Update dst_stride_map values to reflect sliced sizes.
+    for (int i = 0; i < dma_rank; i++) {
+      for (const int& j : tile_map[i]) {
+        if (cpu_sizes[i] == 1) {
+          dst_stride_map[j] = -1;
+        } else if (dst_stride_map[j] > cpu_sizes[i] * cpu_strides[i]) {
+          dst_stride_map[j] = cpu_sizes[i] * cpu_strides[i];
+        }
+      }
+    }
+
+    stl.stride_map = dst_stride_map;
+  }
+
+  if (host2device) {
+    // If the dev_strides do not match the cpu_strides then the cpu_tensor is
+    // sliced and/or expanded.
     if (cpu_strides != dev_strides) {
-      // If the dev_strides do not match the cpu_strides then the cpu_tensor is
-      // sliced and/or expanded.
-      //
       // In these cases we update the stride_map of the SpyreTensorLayout to
       // reflect the cpu_strides instead of the dma_strides.
       //
       // Note that these updates are only applied to the local copy of the
       // SpyreTensorLayout. The SpyreTensorImpl for the dev_tensor is not
       // modified.
-      const int host_rank = dev_tensor->dim();
-      const int device_rank = stl.stride_map.size();
+      const int host_rank = cpu_sizes.size();
 
       std::vector<int64_t> dst_stride_map = stl.stride_map;
       std::vector<int64_t> dst_strides = dev_strides;
@@ -480,7 +681,7 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
       // dividing all other stride values greater than expanded stride value by
       // the amount expanded.
       const std::vector<std::vector<int>> tile_map =
-          get_tile_map(dma_sizes, dma_strides, stl.device_size, stl.stride_map);
+          get_tile_map(dev_sizes, dev_strides, stl.device_size, stl.stride_map);
 
       std::map<int64_t, int64_t> expands;
       for (int i = 0; i < host_rank; i++) {
@@ -555,206 +756,11 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
       stl.stride_map = dst_stride_map;
     }
   } else {
-    TORCH_CHECK(
-        cpu_offset == 0,
-        "Invalid destination storage offset. Expected: 0, got: ", cpu_offset);
-    cpu_sizes = dma_sizes;
-    cpu_strides = dma_strides;
-    if (c10::multiply_integers(dma_sizes) > dev_tensor->numel()) {
-      // If the dma_sizes contains more elements than dev_tensor contains then
-      // the dev_tensor is a slice.
-      //
-      // In these cases we first update the dma_sizes and dma_strides to reflect
-      // the cpu_tensor sizes and strides.
-      //
-      // We then update the stride_map of the SpyreTensorLayout to reflect the
-      // updated dma_sizes and dma_strides.
-      //
-      // Finally we compute the device_offset based on the dev_tensor
-      // storage_offset and updated values.
-      //
-      // Note that these updates are only applied to the local copy of the
-      // dma_sizes, dma_strides, and SpyreTensorLayout. The SpyreTensorImpl for
-      // the dev_tensor is not modified.
-      const int host_rank = dev_tensor->dim();
-      const int dma_rank = dma_strides.size();
-      const int device_rank = stl.stride_map.size();
-
-      cpu_sizes = cpu_tensor->sizes().vec();
-      cpu_strides = cpu_tensor->strides().vec();
-
-      // Inflate or deflate cpu_sizes, cpu_strides, dev_sizes, and dev_strides
-      // to the same rank as dma_sizes and dma_strides.
-      std::vector<int64_t> adjusted_cpu_sizes;
-      std::vector<int64_t> adjusted_cpu_strides;
-      std::vector<int64_t> adjusted_dev_sizes;
-      std::vector<int64_t> adjusted_dev_strides;
-      for (int i = 0; i < dma_rank; i++) {
-        const int64_t dma_size = dma_sizes[i];
-        const int64_t dma_stride = dma_strides[i];
-        const int64_t next_stride = dma_size * dma_stride;
-        int64_t product = 1;
-        int64_t min_stride = dma_stride;
-        for (int j = 0; j < host_rank; j++) {
-          if (dev_strides[j] >= dma_stride && dev_strides[j] < next_stride) {
-            product *= cpu_sizes[j];
-            min_stride = std::min(min_stride, cpu_strides[j]);
-          }
-        }
-        product = std::min(product, dma_size);
-        adjusted_cpu_sizes.push_back(product);
-        adjusted_cpu_strides.push_back(min_stride);
-        adjusted_dev_sizes.push_back(product);
-        adjusted_dev_strides.push_back(dma_stride);
-      }
-      cpu_sizes = std::move(adjusted_cpu_sizes);
-      cpu_strides = std::move(adjusted_cpu_strides);
-
-      // Reorder cpu_sizes and cpu_strides to the same ordering as dma_sizes and
-      // dma_strides.
-      std::vector<int64_t> dma_order(dma_rank);
-      std::iota(dma_order.begin(), dma_order.end(), 0);
-      std::sort(dma_order.begin(), dma_order.end(),
-                [&dma_strides, &dma_sizes](int64_t i1, int64_t i2) {
-                  if (dma_strides[i1] == dma_strides[i2]) {
-                    if (dma_strides[i1] != 1 && dma_strides[i2] != 1) {
-                      return i1 > i2;
-                    }
-                    return dma_sizes[i1] != 1;
-                  }
-                  return dma_strides[i1] > dma_strides[i2];
-                });
-
-      std::vector<int64_t> dev_order(dma_rank);
-      std::iota(dev_order.begin(), dev_order.end(), 0);
-      std::sort(
-          dev_order.begin(), dev_order.end(),
-          [&adjusted_dev_strides, &adjusted_dev_sizes](int64_t i1, int64_t i2) {
-            if (adjusted_dev_strides[i1] == adjusted_dev_strides[i2]) {
-              if (adjusted_dev_strides[i1] != 1 &&
-                  adjusted_dev_strides[i2] != 1) {
-                return i1 > i2;
-              }
-              return adjusted_dev_sizes[i1] != 1;
-            }
-            return adjusted_dev_strides[i1] > adjusted_dev_strides[i2];
-          });
-
-      std::vector<int64_t> ordered_sizes(dma_rank);
-      std::vector<int64_t> ordered_strides(dma_rank);
-      for (int i = 0; i < dma_rank; i++) {
-        for (int j = 0; j < dma_rank; j++) {
-          if (dev_order[i] == dma_order[j]) {
-            ordered_sizes[i] = cpu_sizes[j];
-            ordered_strides[i] = cpu_strides[j];
-            break;
-          }
-        }
-      }
-      cpu_sizes = std::move(ordered_sizes);
-      cpu_strides = std::move(ordered_strides);
-
-      // Create a dst_stride_map that reflects cpu_sizes and cpu_strides.
-      // This is done in 3 passes.
-
-      // Pass 1: Fill dst_stride_map with the min of stride_map and cpu_strides.
-      std::map<int64_t, int> dma_stride_to_j;
-      for (int i = 0; i < dma_rank; i++) {
-        if (dma_sizes[i] == 1) continue;
-        dma_stride_to_j.insert({dma_strides[i], i});
-      }
-
-      std::vector<int64_t> dst_stride_map(device_rank, -2);
-      for (int i = 0; i < device_rank; i++) {
-        const int64_t device_size = stl.device_size[i];
-        if (device_size == 1) {
-          dst_stride_map[i] = -1;
-          continue;
-        }
-        const int64_t device_stride = stl.stride_map[i];
-        if (device_stride < 1) {
-          dst_stride_map[i] = device_stride;
-          continue;
-        }
-        if (dma_stride_to_j.find(device_stride) != dma_stride_to_j.end()) {
-          const int j = dma_stride_to_j[device_stride];
-          dst_stride_map[i] = std::min(device_stride, cpu_strides[j]);
-        }
-      }
-
-      // Pass 2: Compute missing values (tiles) using dst_stride_map values.
-      const std::vector<std::vector<int>> tile_map =
-          get_tile_map(dma_sizes, dma_strides, stl.device_size, stl.stride_map);
-
-      for (int i = 0; i < dma_rank; i++) {
-        for (const int& j : tile_map[i]) {
-          if (dst_stride_map[j] == -2) {
-            int64_t prev_stride = 1;
-            int prev_index = -1;
-            for (int k = 0; k < device_rank; k++) {
-              if (stl.device_size[k] == 1) continue;
-              if (stl.stride_map[k] < 1) continue;
-              if (stl.stride_map[k] >= stl.stride_map[j]) continue;
-              if (stl.stride_map[k] >= prev_stride) {
-                prev_stride = stl.stride_map[k];
-                prev_index = k;
-              }
-            }
-            if (prev_index != -1) {
-              const int64_t tile_size = stl.stride_map[j] / prev_stride;
-              prev_stride = dst_stride_map[prev_index];
-              dst_stride_map[j] = tile_size * prev_stride;
-            } else {
-              dst_stride_map[j] = stl.stride_map[j];
-            }
-          }
-        }
-      }
-
-      TORCH_CHECK(
-          std::all_of(dst_stride_map.begin(), dst_stride_map.end(),
-                      [](int64_t val) { return val != -2; }),
-          "Invalid device sizes and stride map for host sizes and strides");
-
-      // Pass 3: Update dst_stride_map values to reflect sliced sizes.
-      for (int i = 0; i < dma_rank; i++) {
-        for (const int& j : tile_map[i]) {
-          if (cpu_sizes[i] == 1) {
-            dst_stride_map[j] = -1;
-          } else if (dst_stride_map[j] > cpu_sizes[i] * cpu_strides[i]) {
-            dst_stride_map[j] = cpu_sizes[i] * cpu_strides[i];
-          }
-        }
-      }
-
-      // Compute the device_offset, which is the offset into stl.device_size,
-      // based on the dev_tensor->storage_offset(), which is the offset into
-      // dma_sizes.
-      std::vector<int64_t> device_strides(device_rank, 1);
-      int64_t device_stride = 1;
-      for (int i = device_rank - 1; i >= 0; i--) {
-        device_strides[i] = device_stride;
-        device_stride *= stl.device_size[i];
-      }
-
-      std::map<int64_t, int, std::greater<int64_t>> stride_map_to_j;
-      for (int i = 0; i < device_rank; i++) {
-        if (stl.stride_map[i] <= 0) continue;
-        if (stl.device_size[i] <= 1) continue;
-        stride_map_to_j.insert({stl.stride_map[i], i});
-      }
-
-      for (const auto& [stride, index] : stride_map_to_j) {
-        if (stride > dev_offset) continue;
-        const int64_t slice = dev_offset / stride;
-        device_offset += slice * device_strides[index];
-        dev_offset -= slice * stride;
-        if (dev_offset <= 0) break;
-      }
-
-      TORCH_CHECK(dev_offset == 0, "Invalid source storage offset");
-
-      stl.stride_map = dst_stride_map;
+    // If the device tensors is not sliced we use the original dma_sizes and
+    // dma_strides.
+    if (!dev_sliced) {
+      cpu_sizes = dma_sizes;
+      cpu_strides = dma_strides;
     }
   }
 

@@ -253,8 +253,12 @@ def test_synchronize_callable():
 
 
 @pytest.mark.requires_spyre_profiler
-def test_compiled_kernel_event_keys_match_captured_debug_handles(monkeypatch):
+@pytest.mark.parametrize("compile_threads", [1, 2])
+def test_compiled_kernel_event_keys_match_captured_debug_handles(
+    monkeypatch, compile_threads
+):
     """Real events carry compiler keys and direct handles from the same process."""
+    from torch._inductor.codecache import CodeCacheFuture
     from torch_spyre._inductor.op_spec import LoopSpec, OpSpec
     from torch_spyre._inductor.profiler_event import (
         AIUPTI_ACTIVITY_NAME_MAX_BYTES,
@@ -262,11 +266,11 @@ def test_compiled_kernel_event_keys_match_captured_debug_handles(monkeypatch):
     )
     from torch_spyre.execution.async_compile import SpyreAsyncCompile
 
-    captures = []
+    pending_captures = []
     original_sdsc = SpyreAsyncCompile.sdsc
 
     def capture_sdsc(self, kernel_name, specs, pool_size=0):
-        runner = original_sdsc(self, kernel_name, specs, pool_size=pool_size)
+        result = original_sdsc(self, kernel_name, specs, pool_size=pool_size)
         handles = []
 
         def collect(spec_list):
@@ -277,14 +281,12 @@ def test_compiled_kernel_event_keys_match_captured_debug_handles(monkeypatch):
                     collect(spec.body)
 
         collect(specs)
-        if runner.kernel_provenance is not None:
-            captures.append(
-                (runner.kernel_provenance, runner.profiler_event_name, tuple(handles))
-            )
-        return runner
+        pending_captures.append((result, tuple(handles)))
+        return result
 
     monkeypatch.setattr(SpyreAsyncCompile, "sdsc", capture_sdsc)
     monkeypatch.setattr(torch._inductor.config, "force_disable_caches", True)
+    monkeypatch.setattr(torch._inductor.config, "compile_threads", compile_threads)
     torch._dynamo.reset()
 
     model = _ProfilerMLP().half().to("spyre").eval()
@@ -294,6 +296,17 @@ def test_compiled_kernel_event_keys_match_captured_debug_handles(monkeypatch):
     with torch.no_grad():
         compiled(x)
         torch.spyre.synchronize()
+
+        # The generated wrapper has now waited for all compile jobs. Inspect
+        # resolved runners here so capturing does not serialize compilation.
+        captures = []
+        for result, handles in pending_captures:
+            assert isinstance(result, CodeCacheFuture) == (compile_threads > 1)
+            runner = result.result() if isinstance(result, CodeCacheFuture) else result
+            if runner.kernel_provenance is not None:
+                captures.append(
+                    (runner.kernel_provenance, runner.profiler_event_name, handles)
+                )
 
         assert captures, "compilation produced no provenance-aware Spyre runners"
 

@@ -65,6 +65,12 @@ from .utils import _op_num_cores
 logger = get_inductor_logger("lx_relayout")
 _DESTINATION_PREFIX = "__spyre_lx_relayout__"
 _REGISTRY = "_spyre_lx_relayout_copies"
+# The current shuffle lowering can need one mandatory L3LU address-bound
+# register per incoming fragment. There are eight LBRs on Spyre. Deeptools
+# does not common these values per core for fully global programs, so a
+# larger gather can fail register initialization even when individual cores
+# need fewer distinct values. Apply this conservative bound before placement.
+_MAX_SHUFFLE_FANIN = 8
 
 
 @dataclasses.dataclass(frozen=True)
@@ -536,6 +542,8 @@ def movement_supported(
     A complete source may feed uniformly repeated destination slices. Across
     unequal core counts, only even broadcasts (one source per destination) are
     supported. Equal destination slices have identical sources by construction.
+    Incoming fragments must also fit the current shuffle lowering's address
+    register budget; broadcast fan-out does not consume this budget.
     """
 
     num_cores = source_num_cores
@@ -572,6 +580,7 @@ def movement_supported(
             len(set(fanout)) == 1,
             # Every destination receives from the same number of source cores.
             len(set(fanin)) == 1,
+            max(fanin) <= _MAX_SHUFFLE_FANIN,
             # Every source slice is present exactly once.
             len({tuple(sorted(row.items())) for row in source_map.values()})
             == num_cores,

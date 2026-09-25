@@ -571,6 +571,61 @@ class TestSdscJsonSymbolicDimSmoke(InductorTestCase):
 
 
 class TestTiledAwayPhysicalAxis(InductorTestCase):
+    def test_tiled_group_gap_before_stick_axis(self):
+        """Decode must skip the other GQA groups when one core reads many heads."""
+        head, feature, group = sympy.symbols("head feature tile_group")
+        for head_splits in (1, 2, 4):
+            with self.subTest(head_splits=head_splits):
+                iteration_space = {
+                    head: (sympy.Integer(4), head_splits),
+                    feature: (sympy.Integer(128), 1),
+                }
+                spec = OpSpec(
+                    op="identity",
+                    is_reduction=False,
+                    iteration_space=iteration_space,
+                    core_id_to_work_slice=derive_operation_mapping(iteration_space),
+                    args=[
+                        TensorArg(
+                            is_input=True,
+                            arg_index=0,
+                            device_dtype=DataFormats.SEN169_FP16,
+                            # [Hkv, tiled-away G, D/64, D%64]
+                            device_size=[4, 4, 2, 64],
+                            device_coordinates=[
+                                head,
+                                sympy.S.Zero,
+                                sympy.floor(feature / 64),
+                                sympy.Mod(feature, 64),
+                            ],
+                            allocation={"hbm": 0},
+                            device_tile_advance_expr=128 * group,
+                        ),
+                        TensorArg(
+                            is_input=False,
+                            arg_index=1,
+                            device_dtype=DataFormats.SEN169_FP16,
+                            device_size=[4, 2, 64],
+                            device_coordinates=[
+                                head,
+                                sympy.floor(feature / 64),
+                                sympy.Mod(feature, 64),
+                            ],
+                            allocation={"lx": 0},
+                        ),
+                    ],
+                    op_info={},
+                    tiled_symbols=[[group]],
+                    tiled_symbol_trip_counts={group: 4},
+                )
+
+                sdsc_spec, mapping = parse_op_spec(spec)
+                source, destination = sdsc_spec.args
+                self.assertEqual(source.backGap, {mapping[feature]: 384})
+                self.assertEqual(source.strides[mapping[feature]], 128)
+                self.assertEqual(source.strides[mapping[head]], 2048)
+                self.assertEqual(destination.backGap, {})
+
     def test_native_bmm_fake_broadcasts_gqa_axis(self):
         query = torch.empty((1, 8, 4, 256, 128), device="meta")
         key = torch.empty((1, 8, 1, 128, 256), device="meta")

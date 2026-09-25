@@ -9,7 +9,7 @@ the op graph.
 
 - **Stick** — a 128-byte aligned chunk of contiguous elements; the stick dimension is always the innermost device dimension.
 - **SpyreTensorLayout** (STL) — fully describes a tensor's on-device storage, including its stick.
-- **Restickify** — a data-movement op that copies a tensor into a new buffer with a different stick arrangement.
+- **Restickify** — a data-movement op that copies a tensor to achieve a  different stick arrangement.
 - **Stick compatibility** — each op imposes stick constraints on its inputs and output. When a constraint is not met, a restickify is required to resolve it.
 - **Layout optimization** — selecting an output STL for each op that satisfies its stick constraints while minimizing total restickify cost.
 

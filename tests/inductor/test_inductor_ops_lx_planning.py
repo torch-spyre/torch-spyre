@@ -33,6 +33,7 @@ import inductor.test_inductor_ops  # noqa: E402
 from inductor.test_inductor_ops import (  # noqa: E402
     _arch_needs_fp32_proxy_cpu_ref,
     _build_fp32_proxy_cpu_refs,
+    _dlfloat16_saturating_ref,
     _is_test_large_matmul_fp32_proxy_shape,
 )
 
@@ -181,11 +182,18 @@ class _LxPlanningTwoOpTestBase(unittest.TestCase):
     def wrap(self, fn):
         raise NotImplementedError
 
-    def compare_with_cpu(self, fn, *args, **kwargs):
+    def wrap_dlfloat16_reference(self, result):
+        raise NotImplementedError
+
+    def compare_with_cpu(self, fn, *args, dlfloat16_reference=None, **kwargs):
         def source_check(source):
             FileCheck().check("{lx: 0}").run(source)
 
         kwargs["cpu_compile"] = False
+        if dlfloat16_reference is not None:
+            kwargs["cpu_eager_result"] = self.wrap_dlfloat16_reference(
+                _dlfloat16_saturating_ref(dlfloat16_reference)
+            ).to(torch.float16)
         if self._wrap_atol_floor:
             kwargs["atol"] = max(kwargs.get("atol") or 0.0, self._wrap_atol_floor)
 
@@ -229,6 +237,11 @@ class _LxPlanningTwoOpTestBase(unittest.TestCase):
 
 
 class LxPlanningTwoOpPointwiseAdditionTest(_LxPlanningTwoOpTestBase):
+    def wrap_dlfloat16_reference(self, result):
+        # Check the addition before dividing: the final mathematical result
+        # can fit even though the intermediate addition overflows to NINF.
+        return _dlfloat16_saturating_ref(result + result) / 2
+
     def wrap(self, fn):
         @functools.wraps(fn)
         def make_seq_of_ops(*fn_args, **fn_kwargs):
@@ -261,6 +274,11 @@ class LxPlanningTwoOpReductionTest(_LxPlanningTwoOpTestBase):
     # The sum-reduction wrap accumulates in fp16 across cores; allow for the
     # resulting order/cancellation noise (see _wrap_atol_floor).
     _wrap_atol_floor = 1.0
+
+    def wrap_dlfloat16_reference(self, result):
+        # These references contain same-sign values, so a sum cannot overflow
+        # transiently and then return to range through cancellation.
+        return _dlfloat16_saturating_ref(torch.sum(result, dim=0))
 
     def wrap(self, fn):
         @functools.wraps(fn)

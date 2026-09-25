@@ -270,8 +270,9 @@ LOCK
 CURRENT
 MANIFEST-*
 
-# generated version file
+# generated version files
 caffe2/version.py
+torch_spyre/_version.py
 
 # setup.py intermediates
 .eggs

@@ -1896,6 +1896,36 @@ def _store_core_excess_ns(ops: list, p: "CostParams"):
     return total
 
 
+def transport_dma_cost_available(op: OpFeatures, p: "CostParams") -> bool:
+    """Whether transport geometry and calibration support this cost term.
+
+    A supported long-burst read can have zero excess over the byte charge;
+    zero cost must not be confused with unavailable pricing. Symbolic core
+    counts are priced piecewise; callers expanding a candidate menu must also
+    check each concrete candidate against the calibrated core counts.
+    """
+    rates = p.transport_dma_ns_per_request
+    if (
+        not rates
+        or p.restickify_core_gbps <= 0
+        or p.transport_dma_word_bytes <= 0
+        or p.transport_dma_max_burst_words <= 0
+        or op.dtype_bytes != 2
+        or op.transport_read_run_bytes is None
+        or op.transport_tile_elems is None
+        or op.transport_tile_elems <= 0
+        or sympy.sympify(op.transport_read_run_bytes).is_positive is False
+    ):
+        return False
+    cores = sympy.sympify(op.cores)
+    if not cores.free_symbols and rates.get(cores, 0) <= 0:
+        return False
+    return (
+        sum(a.role == "input" for a in op.args) == 1
+        and sum(a.role == "output" for a in op.args) == 1
+    )
+
+
 def _transport_dma_excess_ns(ops: list, p: "CostParams"):
     """Transport request/transpose time exceeding the existing byte charge.
 
@@ -1909,27 +1939,12 @@ def _transport_dma_excess_ns(ops: list, p: "CostParams"):
     the transpose ceiling. Fully local inputs never issue off-chip requests.
     """
     rates = p.transport_dma_ns_per_request
-    if (
-        not rates
-        or p.restickify_core_gbps <= 0
-        or p.transport_dma_word_bytes <= 0
-        or p.transport_dma_max_burst_words <= 0
-    ):
-        return 0.0
     total = 0.0
     for op in ops:
-        if (
-            op.dtype_bytes != 2
-            or op.transport_read_run_bytes is None
-            or op.transport_tile_elems is None
-            or op.transport_tile_elems <= 0
-            or sympy.sympify(op.transport_read_run_bytes).is_positive is False
-        ):
+        if not transport_dma_cost_available(op, p):
             continue
         inputs = [a for a in op.args if a.role == "input"]
         outputs = [a for a in op.args if a.role == "output"]
-        if len(inputs) != 1 or len(outputs) != 1:
-            continue
         payload = op.transport_tile_elems * op.dtype_bytes
         # Fold the payload INTO each branch before Min/Max integerization. A
         # requests/byte intermediate would round sub-unit densities to zero in
@@ -1956,6 +1971,8 @@ def _transport_dma_excess_ns(ops: list, p: "CostParams"):
         def for_run(requests, with_transpose):
             branches = []
             for cores, ns in rates.items():
+                if ns <= 0:
+                    continue
                 floor = max(
                     0,
                     payload / (cores * p.restickify_core_gbps) - 2 * byte_time

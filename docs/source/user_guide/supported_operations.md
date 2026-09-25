@@ -22,6 +22,7 @@ see [Adding Operations](../compiler/adding_operations.md).
 | `torch.nn.functional.linear` | Y | Y | Spyre | Decomposed to `matmul` + `add` |
 | `torch.nn.functional.conv2d` | Y | Y | Spyre | Custom decomposition (`conv2d_via_bmm`); CPU fallback for the im2col step |
 | `torch.nn.functional.avg_pool2d` | | Y | Spyre | Compiled only; custom lowering |
+| `torch.triu` | Y | Y | Spyre | Compiled via mask-multiply decomposition; integer dtypes and `out=` variant fall back to CPU |
 | **Activation Functions** | | | | |
 | `torch.nn.functional.softmax` | Y | Y | Spyre | |
 | `torch.nn.functional.layer_norm` | Y | Y | Spyre | Custom decomposition |
@@ -128,7 +129,6 @@ see [Adding Operations](../compiler/adding_operations.md).
 | **CPU Fallback** | | | | |
 | `torch.arange` | Y | Y | CPU fallback | Runs on CPU, result transferred back |
 | `torch.tril` | Y | Y | CPU fallback | Runs on CPU, result transferred back |
-| `torch.triu` | Y | Y | CPU fallback | Runs on CPU, result transferred back |
 | `torch.isin` | Y | Y | CPU fallback | Runs on CPU, result transferred back |
 | `torch.bitwise_xor` | Y | Y | CPU fallback | Runs on CPU, result transferred back |
 | `torch.bitwise_or` | Y | Y | CPU fallback | Runs on CPU, result transferred back |

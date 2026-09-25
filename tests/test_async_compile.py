@@ -46,10 +46,28 @@ def _runner(name, code_dir, kernel_provenance=None, symbol_kinds=None):
     return name, code_dir, kernel_provenance, symbol_kinds
 
 
+def test_single_worker_compiles_inline_without_starting_pool():
+    compiler = async_compile_mod.SpyreAsyncCompile()
+
+    with (
+        torch._inductor.config.patch({"compile_threads": 1}),
+        patch.object(compiler, "wait_pool_ready") as wait_ready,
+        patch.object(compiler, "process_pool") as pool,
+        patch.object(async_compile_mod, "_run_backend_compiler") as compile_backend,
+    ):
+        task = compiler._submit_backend_compile("sdsc_0", "/tmp/kernel")
+
+    assert task is None
+    wait_ready.assert_not_called()
+    pool.assert_not_called()
+    compile_backend.assert_called_once_with("sdsc_0", "/tmp/kernel", dict(os.environ))
+
+
 def test_sdsc_submits_all_backend_jobs_before_wait():
     pool = _RecordingPool()
     compiler = async_compile_mod.SpyreAsyncCompile()
     events = []
+    provenance = object()
 
     def generate_bundle(name, output_dir, specs, pool_size=0):
         events.append(("bundle", name))
@@ -63,9 +81,7 @@ def test_sdsc_submits_all_backend_jobs_before_wait():
 
     with (
         torch._inductor.config.patch({"compile_threads": 2}),
-        spyre_config.patch(
-            {"async_backend_compile": True, "spyre_kernel_cache": False}
-        ),
+        spyre_config.patch({"spyre_kernel_cache": False}),
         patch.object(compiler, "wait_pool_ready"),
         patch.object(compiler, "use_process_pool", return_value=True),
         patch.object(compiler, "process_pool", return_value=pool),
@@ -78,7 +94,9 @@ def test_sdsc_submits_all_backend_jobs_before_wait():
         patch.object(async_compile_mod, "generate_bundle", side_effect=generate_bundle),
         patch.object(async_compile_mod, "find_unimplemented", return_value=None),
         patch.object(
-            async_compile_mod, "build_kernel_provenance_descriptor", return_value=None
+            async_compile_mod,
+            "build_kernel_provenance_descriptor",
+            return_value=provenance,
         ),
         patch.object(
             async_compile_mod, "SpyreSDSCKernelRunner", side_effect=_runner
@@ -103,8 +121,8 @@ def test_sdsc_submits_all_backend_jobs_before_wait():
         compiler.wait(scope)
 
     assert scope == {
-        "kernel0": ("sdsc_0", "/tmp/k0", None, []),
-        "kernel1": ("sdsc_1", "/tmp/k1", None, []),
+        "kernel0": ("sdsc_0", "/tmp/k0", provenance, []),
+        "kernel1": ("sdsc_1", "/tmp/k1", provenance, []),
     }
 
 
@@ -115,7 +133,7 @@ def test_async_cache_commit_is_deferred_until_wait():
 
     with (
         torch._inductor.config.patch({"compile_threads": 2}),
-        spyre_config.patch({"async_backend_compile": True, "spyre_kernel_cache": True}),
+        spyre_config.patch({"spyre_kernel_cache": True}),
         patch.object(compiler, "wait_pool_ready"),
         patch.object(compiler, "use_process_pool", return_value=True),
         patch.object(compiler, "process_pool", return_value=pool),
@@ -154,9 +172,8 @@ def test_cache_hit_reloads_symbol_kinds_from_miss(tmp_path: Path):
     fake_symbol_kinds = [SymbolKind.kernel(0), SymbolKind.kernel(2)]
 
     with (
-        spyre_config.patch(  # type: ignore[attr-defined]
-            {"async_backend_compile": False, "spyre_kernel_cache": True}
-        ),
+        torch._inductor.config.patch({"compile_threads": 1}),
+        spyre_config.patch({"spyre_kernel_cache": True}),  # type: ignore[attr-defined]
         patch.object(async_compile_mod, "compute_specs_hash", return_value="key"),
         patch.object(
             async_compile_mod,
@@ -197,7 +214,7 @@ def test_async_compile_failure_moves_cache_entry_at_wait():
 
     with (
         torch._inductor.config.patch({"compile_threads": 2}),
-        spyre_config.patch({"async_backend_compile": True, "spyre_kernel_cache": True}),
+        spyre_config.patch({"spyre_kernel_cache": True}),
         patch.object(compiler, "wait_pool_ready"),
         patch.object(compiler, "use_process_pool", return_value=True),
         patch.object(compiler, "process_pool", return_value=pool),
@@ -230,7 +247,7 @@ def test_wait_drains_remaining_spyre_futures_after_failure():
 
     with (
         torch._inductor.config.patch({"compile_threads": 2}),
-        spyre_config.patch({"async_backend_compile": True, "spyre_kernel_cache": True}),
+        spyre_config.patch({"spyre_kernel_cache": True}),
         patch.object(compiler, "wait_pool_ready"),
         patch.object(compiler, "use_process_pool", return_value=True),
         patch.object(compiler, "process_pool", return_value=pool),
@@ -344,9 +361,6 @@ def test_real_subprocess_pool_runs_backend_jobs_concurrently(tmp_path: Path):
         with (
             torch._inductor.config.patch(
                 {"compile_threads": 2, "worker_start_method": "subprocess"}
-            ),
-            spyre_config.patch(  # type: ignore[attr-defined]
-                {"async_backend_compile": True}
             ),
             patch.dict(
                 os.environ,

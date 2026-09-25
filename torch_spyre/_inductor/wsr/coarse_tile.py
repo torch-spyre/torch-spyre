@@ -132,7 +132,7 @@ from ..pass_utils import (
 from ..ir import FixedTiledLayout, SpyreConstantFallback, _resize_device_layout
 from .tile import compute_tile_index, compute_tile_stride, decompose_index_for_tiling
 
-logger = get_inductor_logger("coarse_tile")
+logger = get_inductor_logger("wsr.coarse_tile")
 
 
 class _RetiledBufferInfo(NamedTuple):
@@ -4549,6 +4549,7 @@ def _rescale_index(
     full_strides: list[Expr],
     tile_strides: list[Expr],
     strip_constant: bool = False,
+    reject_ambiguous: bool = False,
 ) -> Expr:
     """Rescale an affine index's per-dimension coefficients.
 
@@ -4559,7 +4560,9 @@ def _rescale_index(
     coefficient replaced by the matching entry in `tile_strides`. Matching
     is by coefficient value rather than by variable identity because the
     variables `index` is expressed in are not known in advance -- see
-    _NameSwapHandler.
+    _NameSwapHandler.  When ``reject_ambiguous`` is true, a term that could
+    name multiple equal-stride dimensions is accepted only if every match
+    maps to the same target stride.
 
     Each additive term is matched against a candidate `full_stride` by
     dividing the term by it and checking the quotient is free of the
@@ -4661,17 +4664,42 @@ def _rescale_index(
             if not strip_constant:
                 new_index += term
             continue
-        for i, (full_stride, tile_stride) in enumerate(remaining):
-            matched, loop_var_part = _divides_evenly(term, full_stride)
-            if matched:
-                new_index += tile_stride * loop_var_part
-                del remaining[i]
-                break
-        else:
+        if not reject_ambiguous:
+            for i, (full_stride, tile_stride) in enumerate(remaining):
+                matched, loop_var_part = _divides_evenly(term, full_stride)
+                if matched:
+                    new_index += tile_stride * loop_var_part
+                    del remaining[i]
+                    break
+            else:
+                raise RuntimeError(
+                    f"_rescale_index: no matching full_stride for term {term} "
+                    f"in index {index}; full_strides={full_strides}"
+                )
+            continue
+
+        matches = [
+            (i, tile_stride, loop_var_part)
+            for i, (full_stride, tile_stride) in enumerate(remaining)
+            if (match := _divides_evenly(term, full_stride))[0]
+            for loop_var_part in (match[1],)
+        ]
+        if not matches:
             raise RuntimeError(
                 f"_rescale_index: no matching full_stride for term {term} "
                 f"in index {index}; full_strides={full_strides}"
             )
+        if reject_ambiguous and any(
+            sympy.simplify(tile_stride - matches[0][1]) != 0
+            for _i, tile_stride, _loop_var_part in matches[1:]
+        ):
+            raise RuntimeError(
+                f"_rescale_index: ambiguous full_stride for term {term} "
+                f"in index {index}; full_strides={full_strides}"
+            )
+        i, tile_stride, loop_var_part = matches[0]
+        new_index += tile_stride * loop_var_part
+        del remaining[i]
     return new_index
 
 

@@ -2288,8 +2288,10 @@ class TestCoarseTile(unittest.TestCase):
         from collections import namedtuple
 
         from torch_spyre._inductor.scratchpad.utils import (
+            counted_loop_lifetime_overrides,
             counted_loop_lifetime_end_overrides,
         )
+        from torch_spyre._inductor.loop_info import LoopCarryRecord
 
         _dep = namedtuple("_dep", ["name"])
 
@@ -2308,31 +2310,126 @@ class TestCoarseTile(unittest.TestCase):
         _stub_read_writes(body_writer, reads=["arg1"], writes=["internal"])
         reader_x = _make_hinted_op(_make_pointwise([Integer(16)]), "reader_x")
         _stub_read_writes(reader_x, reads=["crossing"], writes=["reader_x_out"])
+        carry_update = _make_hinted_op(_make_pointwise([Integer(16)]), "carry_update")
+        _stub_read_writes(carry_update, reads=["carry"], writes=["carry_update"])
+        carry_update._loop_carry_record = LoopCarryRecord("carry", "carry_update")
         reader_i = _make_hinted_op(_make_pointwise([Integer(16)]), "reader_i")
         _stub_read_writes(reader_i, reads=["internal"], writes=["reader_i_out"])
 
-        operations = [crossing, body_writer, reader_x, reader_i]
+        operations = [crossing, body_writer, reader_x, carry_update, reader_i]
         coarse_tile_post_stickify(
             _graph(operations),
-            [([body_writer, reader_x, reader_i], [(0, Integer(4))])],
+            [([body_writer, reader_x, carry_update, reader_i], [(0, Integer(4))])],
         )
 
-        # The loop body stays ops 1..3: nothing was inserted, the op outside
+        # The loop body stays ops 1..4: nothing was inserted, the op outside
         # the group was not stamped, and the group ops carry the loop id.
-        self.assertEqual(len(operations), 4)
+        self.assertEqual(len(operations), 5)
         self.assertFalse(hasattr(crossing, "loop_info"))
         self.assertEqual(reader_i.loop_info.loop_group_id, (0,))
 
         overrides = counted_loop_lifetime_end_overrides(
-            SimpleNamespace(operations=operations, graph_input_names=["arg0", "arg1"])
+            SimpleNamespace(
+                operations=operations,
+                graph_input_names=["arg0", "arg1", "carry"],
+            )
         )
 
         # Values born before the loop and read inside it -- the computed
         # buffer ``crossing`` and the graph input ``arg1`` -- live through
-        # the loop's textual end (exclusive index 4).  ``internal`` is born
+        # the loop's textual end (exclusive index 5).  ``internal`` is born
         # and consumed inside the loop: no extension.  ``arg0`` is only read
-        # outside the loop: no extension.
-        self.assertEqual(overrides, {"crossing": 4, "arg1": 4})
+        # outside the loop: no extension. Only the compiler-tagged carry starts
+        # at the loop boundary; ordinary crossing values keep their first read.
+        self.assertEqual(overrides, {"crossing": 5, "arg1": 5, "carry": 5})
+        starts, ends = counted_loop_lifetime_overrides(
+            SimpleNamespace(
+                operations=operations,
+                graph_input_names=["arg0", "arg1", "carry"],
+            )
+        )
+        self.assertEqual(starts, {"carry": 1})
+        self.assertEqual(ends, {"crossing": 5, "arg1": 5, "carry": 5})
+
+    def test_counted_loop_protects_start_of_value_read_after_the_loop(self):
+        """A crossing value read after the loop still needs its start widened.
+
+        Its nominal end already covers the loop, so the end override is not
+        required -- but its first in-loop read can fall after the loop's start,
+        leaving a loop-local born earlier disjoint from it under plain liveness.
+        Sharing one LX address then lets the next iteration's write of that local
+        clobber the value before the next iteration reads it. This is why the
+        start bound is decided independently of the end bound, and for every
+        crossing value rather than only a tagged carry.
+        """
+        from types import SimpleNamespace
+
+        from torch_spyre._inductor.scratchpad.plan_solver import LifetimeBoundBuffer
+        from torch_spyre._inductor.scratchpad.utils import (
+            counted_loop_lifetime_overrides,
+        )
+
+        class _Dep:
+            def __init__(self, name):
+                self.name = name
+
+            def __hash__(self):
+                return hash(self.name)
+
+            def __eq__(self, other):
+                return self.name == other.name
+
+        def _op(name, reads, writes, loop=None):
+            rw = SimpleNamespace(
+                reads={_Dep(n) for n in reads}, writes={_Dep(n) for n in writes}
+            )
+            op = SimpleNamespace(name=name)
+            op.get_read_writes = lambda rw=rw: rw
+            op.get_operation_name = lambda n=name: n
+            op.get_name = lambda n=name: n
+            if loop is not None:
+                op.loop_info = SimpleNamespace(loop_group_id=loop)
+            return op
+
+        # Loop is indices 1..4. ``local`` lives [1, 3); ``v`` is first read at 3,
+        # inside the loop, and again at 5, after it -- so its nominal end already
+        # clears the loop end and only the start needs widening.
+        operations = [
+            _op("pre", ["arg0"], ["pre"]),
+            _op("local_w", ["arg1"], ["local"], loop=(0,)),
+            _op("local_r", ["local"], ["r1"], loop=(0,)),
+            _op("v_r", ["v"], ["r2"], loop=(0,)),
+            _op("filler", ["sink"], ["r3"], loop=(0,)),
+            _op("post", ["v"], ["r4"]),
+        ]
+        starts, ends = counted_loop_lifetime_overrides(
+            SimpleNamespace(
+                operations=operations,
+                graph_input_names=["arg0", "arg1", "v", "sink"],
+            )
+        )
+        self.assertEqual(starts.get("v"), 1)
+        self.assertNotIn("v", ends)
+
+        def interval(name, uses):
+            buffer = LifetimeBoundBuffer(
+                name=name,
+                size=64,
+                uses=uses,
+                first_use_is_read=True,
+                in_place_parents=[],
+                lifetime_start_override=starts.get(name),
+                lifetime_end_override=ends.get(name),
+            )
+            return buffer.start_time, buffer.end_time
+
+        v_start, v_end = interval("v", [3, 5])
+        local_start, local_end = interval("local", [1, 2])
+        self.assertEqual((v_start, v_end), (1, 6))
+        self.assertTrue(
+            v_start < local_end and local_start < v_end,
+            "the crossing value must overlap the loop-local it could be aliased with",
+        )
 
     def test_end_to_end_shares_one_copy_across_group(self):
         """Full coarse_tile() entry point: two hint-driven ops in one group
@@ -6074,6 +6171,70 @@ class TestReadCopyElisionProof(unittest.TestCase):
 
         with self.assertRaises(Exception):
             record.copy_name = "other"
+
+    def test_graph_output_copy_is_not_elided(self):
+        from torch._inductor.ir import ComputedBuffer
+
+        from torch_spyre._inductor.loop_info import ReadCopyElisionRecord
+        from torch_spyre._inductor.read_copy_elision import elide_proven_read_copies
+
+        copy_op = MagicMock(spec=ComputedBuffer)
+        copy_op.get_name.return_value = "copy0"
+        consumer = MagicMock(spec=ComputedBuffer)
+        consumer.get_name.return_value = "consumer0"
+        consumer._read_copy_elision_record = ReadCopyElisionRecord(
+            consumer_name="consumer0",
+            copy_name="copy0",
+            source_name="input0",
+            direct_inner_fn=lambda: None,
+        )
+        graph = SimpleNamespace(
+            operations=[copy_op, consumer],
+            get_output_names=lambda: ["copy0"],
+            removed_buffers=set(),
+        )
+
+        with patch(
+            "torch_spyre._inductor.read_copy_elision._prove_matmul_direct_read"
+        ) as prove:
+            elide_proven_read_copies(graph)
+
+        prove.assert_not_called()
+        self.assertEqual(graph.operations, [copy_op, consumer])
+
+    def test_non_memory_dependency_prevents_copy_elision(self):
+        from torch._inductor.dependencies import StarDep
+        from torch._inductor.ir import ComputedBuffer
+
+        from torch_spyre._inductor.loop_info import ReadCopyElisionRecord
+        from torch_spyre._inductor.read_copy_elision import elide_proven_read_copies
+
+        copy_op = MagicMock(spec=ComputedBuffer)
+        copy_op.get_name.return_value = "copy0"
+        consumer = MagicMock(spec=ComputedBuffer)
+        consumer.get_name.return_value = "consumer0"
+        consumer.get_read_writes.return_value.reads = []
+        consumer._read_copy_elision_record = ReadCopyElisionRecord(
+            consumer_name="consumer0",
+            copy_name="copy0",
+            source_name="input0",
+            direct_inner_fn=lambda: None,
+        )
+        star_reader = MagicMock()
+        star_reader.get_read_writes.return_value.reads = [StarDep("copy0")]
+        graph = SimpleNamespace(
+            operations=[copy_op, consumer, star_reader],
+            get_output_names=lambda: [],
+            removed_buffers=set(),
+        )
+
+        with patch(
+            "torch_spyre._inductor.read_copy_elision._prove_matmul_direct_read"
+        ) as prove:
+            elide_proven_read_copies(graph)
+
+        prove.assert_not_called()
+        self.assertEqual(graph.operations, [copy_op, consumer, star_reader])
 
     def test_local_bounds_are_measured_in_source_elements(self):
         from torch._inductor.dependencies import MemoryDep

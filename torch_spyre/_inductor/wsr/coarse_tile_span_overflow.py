@@ -43,7 +43,7 @@ from .span_overflow_hint_analysis import (
     plan_span_overflow_tile,
 )
 
-logger = get_inductor_logger("coarse_tile")
+logger = get_inductor_logger("wsr.coarse_tile")
 
 _SPAN_OVERFLOW_HINT_ID = 10000
 

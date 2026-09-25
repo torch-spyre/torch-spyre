@@ -185,9 +185,9 @@ class TestRunMetadata:
         assert timing_recorder._git_sha(os.fspath(tmp_path)) == ""
 
     def test_git_sha_of_this_checkout(self):
-        from torch_spyre import version
+        from torch_spyre import _version
 
-        sha = timing_recorder._git_sha(os.path.dirname(version.__file__))
+        sha = timing_recorder._git_sha(os.path.dirname(_version.__file__))
         # Empty for a wheel install; a short sha for a source checkout.
         assert sha == "" or sha.isalnum()
 
