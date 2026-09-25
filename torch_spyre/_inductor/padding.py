@@ -822,6 +822,45 @@ def _staggered_ea(op: Operation) -> ElementArrangement | None:
     return ea if ea in STAGGERED_EAS else None
 
 
+def _widens_to_the_fp32_grid(op: Operation, graph: GraphLowering) -> bool:
+    """Whether ``op`` converts a value from the FP16 stick grid onto the FP32 one.
+
+    Identified by comparing the stick depth of the single value ``op`` reads
+    against the depth it writes, rather than by the arrangement its output
+    carries.  A widening conversion's output may come back ``STANDARD``, holding
+    densely packed FP32 elements, yet codegen still iterates the coarser FP16
+    grid for it: ``_iterates_on_the_fp16_grid`` in superdsc names both conversions
+    outright for exactly this reason.  Keying on the arrangement here would leave
+    such an output a stick short of what that iteration writes.
+    """
+    if not isinstance(op, ComputedBuffer):
+        return False
+    out_layout = op.get_layout()
+    if not isinstance(out_layout, FixedTiledLayout):
+        return False
+
+    # A conversion is unary: one value in, one out.
+    reads = [r for r in op.get_read_writes().reads if hasattr(r, "name")]
+    if len(reads) != 1:
+        return False
+
+    in_buf = graph.get_buffer(reads[0].name)
+    if isinstance(in_buf, TensorBox):
+        in_buf = in_buf.data
+    if isinstance(in_buf, StorageBox):
+        in_buf = in_buf.data
+    if not isinstance(in_buf, Buffer):
+        return False
+    in_layout = in_buf.get_layout()
+    if not isinstance(in_layout, FixedTiledLayout):
+        return False
+
+    return (
+        in_layout.device_layout.device_size[-1]
+        > out_layout.device_layout.device_size[-1]
+    )
+
+
 def _assert_input_paddable(
     op: ComputedBuffer, in_dep, in_layout, out_stick_sym
 ) -> None:
@@ -1162,7 +1201,10 @@ def _pad_staggered_fp32_buffer(op: Operation) -> None:
     soon as its stick-dim extent passes the first 32 slots.  That is true of the
     conversion's own output and equally of any pointwise op downstream that keeps
     the arrangement: the op is ordinary by name and dtype, but its elements are
-    still split across the pair, so it needs the same capacity.
+    still split across the pair, so it needs the same capacity.  The conversion
+    output needs the pair even when it comes back ``STANDARD``, because codegen
+    iterates the coarse FP16 grid for the conversion whatever its output
+    arrangement says.
 
     ``rescale_stl_for_dtype`` sizes an output by the sticks its live elements
     occupy, which is the first stick alone whenever the extent is under half a
@@ -1257,12 +1299,14 @@ def insert_staggered_ea_padding(graph: GraphLowering) -> None:
     The buffer that needs room is always the one on the finer FP32 grid, which
     differs by direction:
 
-    - Narrowing (``FP32_TO_DL16``, ``_pad_fp32_to_dl16_input``): the conversion's
-      input.
-    - Widening (``DL16_TO_FP32``, ``_pad_staggered_fp32_buffer``): the buffer
-      itself.  Every buffer holding a staggered FP32 value needs the pair, not only
-      the conversion that produced it, so a pointwise op that keeps the arrangement
-      is padded on its own account.
+    - Narrowing (``_pad_fp32_to_dl16_input``): the conversion's input, reached from
+      the ``FP32_TO_DL16`` output that consumes it.
+    - Widening (``_pad_staggered_fp32_buffer``): the buffer itself.  Two kinds need
+      it.  A widening conversion is recognized by the grids it spans
+      (``_widens_to_the_fp32_grid``) because its output may be ``STANDARD`` while
+      codegen still iterates the coarse FP16 grid for it.  A pointwise op
+      downstream is recognized by the ``DL16_TO_FP32`` arrangement it carries,
+      which is the only signal its name and dtypes leave.
 
     Padding touches only ``device_size``, never the host size or ``stride_map``, so
     later passes see the tensor unchanged and codegen's backGap path covers the
@@ -1272,5 +1316,7 @@ def insert_staggered_ea_padding(graph: GraphLowering) -> None:
         ea = _staggered_ea(op)
         if ea == ElementArrangement.FP32_TO_DL16:
             _pad_fp32_to_dl16_input(op, graph)
-        elif ea == ElementArrangement.DL16_TO_FP32:
+        elif ea == ElementArrangement.DL16_TO_FP32 or _widens_to_the_fp32_grid(
+            op, graph
+        ):
             _pad_staggered_fp32_buffer(op)
