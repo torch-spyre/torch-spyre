@@ -69,7 +69,7 @@ from torch._inductor.ir import (
 from torch._inductor.ops_handler import WrapperHandler
 from torch._inductor.virtualized import V
 
-from .constants import BATCH_MATMUL_FP8_OP, BATCH_MATMUL_OP
+from .constants import BATCH_MATMUL_FP8_OP, BATCH_MATMUL_OP, STAGGERED_EAS
 from .errors import Unsupported
 from .ir import FixedTiledLayout
 from .logging_utils import get_inductor_logger
@@ -82,12 +82,17 @@ from .pass_utils import (
     is_restickify_coords,
     _is_compact_node,
     lower_pad_sequence,
-    num_sticks_dim,
+    _num_sticks_slot,
     redirect_computed_buffer_reads,
     replace_computed_buffer_body,
 )
 from .views import compute_coordinates
-from torch_spyre._C import ElementArrangement, SpyreTensorLayout, get_elem_in_stick
+from torch_spyre._C import (
+    DataFormats,
+    ElementArrangement,
+    SpyreTensorLayout,
+    get_elem_in_stick,
+)
 
 logger = get_inductor_logger("padding")
 
@@ -800,15 +805,21 @@ def _restickify_input_required_extent(coord, ranges, stick_sym, dtype) -> int:
     return concretize_expr(max_slice_start) + round_up_to_stick(stick_extent, dtype)
 
 
-def _is_fp32_to_dl16_op(op: Operation) -> bool:
+def _staggered_ea(op: Operation) -> ElementArrangement | None:
+    """The staggered arrangement ``op``'s output carries, or ``None`` for neither.
+
+    A buffer carries ``DL16_TO_FP32`` while it holds a value on the FP32 side of a
+    widening conversion, which includes pointwise ops downstream of the conversion
+    itself, and ``FP32_TO_DL16`` when it feeds a narrowing one.  The two need
+    padding on opposite sides, so callers dispatch on which one comes back.
+    """
     if not isinstance(op, ComputedBuffer):
-        return False
+        return None
     out_layout = op.get_layout()
     if not isinstance(out_layout, FixedTiledLayout):
-        return False
-    return (
-        out_layout.device_layout.element_arrangement == ElementArrangement.FP32_TO_DL16
-    )
+        return None
+    ea = out_layout.device_layout.element_arrangement
+    return ea if ea in STAGGERED_EAS else None
 
 
 def _assert_input_paddable(
@@ -1122,9 +1133,7 @@ def _pad_fp32_to_dl16_input(op: Operation, graph: GraphLowering) -> None:
         return
 
     in_stl = in_layout.device_layout
-    sticks_dim = num_sticks_dim(in_stl)
-    if sticks_dim is None:
-        return
+    sticks_dim = _num_sticks_slot(in_stl)
 
     in_eps = in_stl.device_size[-1]  # 32 for fp32
     # The output stick depth is the coarser of the two grids for this conversion,
@@ -1143,6 +1152,61 @@ def _pad_fp32_to_dl16_input(op: Operation, graph: GraphLowering) -> None:
         return
 
     in_buf.layout = _pad_device_dim(in_layout, sticks_dim, required_in_num_sticks)
+
+
+def _pad_staggered_fp32_buffer(op: Operation) -> None:
+    """Grow a staggered FP32 buffer to both sticks of the pair its elements span.
+
+    Widening FP16 to FP32 staggers one 64-element FP16 stick across a *pair* of
+    32-slot FP32 sticks, so every buffer holding such a value spans two sticks as
+    soon as its stick-dim extent passes the first 32 slots.  That is true of the
+    conversion's own output and equally of any pointwise op downstream that keeps
+    the arrangement: the op is ordinary by name and dtype, but its elements are
+    still split across the pair, so it needs the same capacity.
+
+    ``rescale_stl_for_dtype`` sizes an output by the sticks its live elements
+    occupy, which is the first stick alone whenever the extent is under half a
+    stick, so the room for the rest of the pair is added here.
+
+    Only ``device_size`` changes; the host size and ``stride_map`` are untouched,
+    which also preserves the sentinel ``-1`` marking a stick dim of host extent 1.
+    """
+    assert isinstance(op, ComputedBuffer)
+    layout = op.get_layout()
+    assert isinstance(layout, FixedTiledLayout)
+    stl = layout.device_layout
+
+    sticks_dim = _num_sticks_slot(stl)
+    out_eps = stl.device_size[-1]
+    # The stagger is defined against the FP16 grid: the pair holds one FP16 stick.
+    coarse_eps = DataFormats.SEN169_FP16.elems_per_stick()
+    if out_eps >= coarse_eps:
+        return
+    sticks_per_pair = -(-coarse_eps // out_eps)
+
+    # How far along the stick dim the value actually reaches.  A stick step counts
+    # whole sticks; a sub-stick dim (including the sentinel -1, host extent 1)
+    # carries a host extent instead, and its elements sit within the first pair.
+    stride = stl.stride_map[sticks_dim]
+    if stride >= out_eps:
+        pairs = -(-stl.device_size[sticks_dim] // sticks_per_pair)
+    else:
+        pairs = 1
+    required_num_sticks = pairs * sticks_per_pair
+
+    current_num_sticks = stl.device_size[sticks_dim]
+    if current_num_sticks >= required_num_sticks:
+        return
+
+    op.layout = _pad_device_dim(layout, sticks_dim, required_num_sticks)
+
+    logger.debug(
+        "insert_staggered_ea_padding: padded %s device dim %d %d -> %d",
+        op.get_name(),
+        sticks_dim,
+        current_num_sticks,
+        required_num_sticks,
+    )
 
 
 def insert_restickify_padding(graph: GraphLowering) -> None:
@@ -1182,7 +1246,31 @@ def insert_restickify_padding(graph: GraphLowering) -> None:
 
 
 def insert_staggered_ea_padding(graph: GraphLowering) -> None:
-    """Expand input capacity for staggered element-arrangement conversions."""
+    """Give a conversion between the FP16 and FP32 stick grids the capacity it needs.
+
+    One FP16 stick's elements stagger across a pair of FP32 sticks, so a conversion
+    either way has to reach both halves of that pair even when the live elements
+    fill only part of it.  ``rescale_stl_for_dtype`` sizes an output by the sticks
+    those live elements occupy, so the extra capacity is added here, on the one
+    buffer that needs it, rather than propagated into every downstream consumer.
+
+    The buffer that needs room is always the one on the finer FP32 grid, which
+    differs by direction:
+
+    - Narrowing (``FP32_TO_DL16``, ``_pad_fp32_to_dl16_input``): the conversion's
+      input.
+    - Widening (``DL16_TO_FP32``, ``_pad_staggered_fp32_buffer``): the buffer
+      itself.  Every buffer holding a staggered FP32 value needs the pair, not only
+      the conversion that produced it, so a pointwise op that keeps the arrangement
+      is padded on its own account.
+
+    Padding touches only ``device_size``, never the host size or ``stride_map``, so
+    later passes see the tensor unchanged and codegen's backGap path covers the
+    resulting gap.
+    """
     for op in list(graph.operations):
-        if _is_fp32_to_dl16_op(op):
+        ea = _staggered_ea(op)
+        if ea == ElementArrangement.FP32_TO_DL16:
             _pad_fp32_to_dl16_input(op, graph)
+        elif ea == ElementArrangement.DL16_TO_FP32:
+            _pad_staggered_fp32_buffer(op)

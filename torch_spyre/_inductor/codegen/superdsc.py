@@ -44,6 +44,7 @@ from torch_spyre._inductor.constants import (
     POOL_OPS,
     QUANTSCALEPERTOKENFP8_OP,
     RESTICKIFY_OP,
+    STAGGERED_EAS,
     TOPK_OPS,
     KEEP_BY_INDEX_OP,
 )
@@ -1856,26 +1857,45 @@ def _extend_restickify_to_padded(
         )
 
 
-def _extend_staggered_conversion_to_padded(
+# A conversion between the FP16 and FP32 stick grids, in either direction.  One
+# FP16 stick's elements span a pair of FP32 sticks, so the iteration follows the
+# coarser FP16 grid whichever way the conversion runs.
+_STAGGERING_CONVERSION_OPS = (DL16TOFP32_OP, FP32TODL16_OP)
+
+
+def _iterates_on_the_fp16_grid(op_spec: OpSpec) -> bool:
+    """Whether this op's iteration must follow the coarser FP16 stick grid.
+
+    True for the FP16<->FP32 conversions themselves, named by op, and for an op
+    reading a value one of them produced, recognized by the staggered
+    arrangement the value carries.  The arrangement is the only signal available
+    for the consumer: it is an ordinary pointwise op whose name and dtypes say
+    nothing about how its input's elements are laid out.
+    """
+    if op_spec.op in _STAGGERING_CONVERSION_OPS:
+        return True
+    return any(arg.element_arrangement in STAGGERED_EAS for arg in op_spec.args)
+
+
+def _extend_staggered_to_padded(
     op_spec: OpSpec,
     sdsc_iteration_space: dict,
     symbol_mapping: dict,
 ) -> None:
-    """Round sdsc_iteration_space[stick_sym] up to an fp16 stick for a staggered
-    FP16<->FP32 conversion.
+    """Round sdsc_iteration_space up to an FP16 stick for a staggering conversion.
 
-    The instruction moves one fp16 stick's worth of elements per step in either
-    direction, so the iteration runs over whole fp16 sticks even where the host
-    extent covers only part of one.  ``insert_staggered_ea_padding`` grows the
-    fp32 side's device dim to match; this extends the iteration to agree.
+    An FP16<->FP32 conversion spreads one FP16 stick's elements across two FP32
+    sticks, so the FP16 grid governs the iteration on both sides: an op reaching
+    only the first FP32 stick touches half the live elements, the halves
+    interleaving rather than falling in a tail.
+    ``insert_staggered_ea_padding`` grows the FP32 side's device dim to hold the
+    pair; this extends the iteration to match.
 
-    The fp16 grid governs both sides, so unlike ``_extend_restickify_to_padded``
-    the stick size is shared rather than taken per arg: it is the widest of the
-    two, the fp16 one, since fp16 packs more elements into a stick than fp32.
-    Both args index the stick dim with the same symbol, so extending once covers
-    the narrow and the wide side together.
+    Applies to a consumer of the wide value too, which derives its own window
+    from the same extent.  The FP16 stick is named outright rather than read off
+    an arg's own dtype, because the two sides of a conversion disagree and the
+    coarser grid is the one that governs.
     """
-    stick_size = max(arg.device_dtype.elems_per_stick() for arg in op_spec.args)
     for arg in op_spec.args:
         _, stick_sym = _get_device_dim_order(arg, symbol_mapping)
         if stick_sym is None or stick_sym not in sdsc_iteration_space:
@@ -1883,8 +1903,8 @@ def _extend_staggered_conversion_to_padded(
         _round_up_to_stick(
             sdsc_iteration_space,
             stick_sym,
-            stick_size,
-            "_extend_staggered_conversion_to_padded",
+            DataFormats.SEN169_FP16.elems_per_stick(),
+            "_extend_staggered_to_padded",
         )
 
 
@@ -1987,7 +2007,7 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
     is_conv2d = _is_conv(op_spec.op)
     is_relayout = is_lx_relayout_identity(op_spec.op, op_spec.args, op_spec.op_info)
     is_restickify = op_spec.op == RESTICKIFY_OP
-    is_staggered_conversion = op_spec.op in (DL16TOFP32_OP, FP32TODL16_OP)
+    on_fp16_grid = _iterates_on_the_fp16_grid(op_spec)
     is_pool = _is_pool(op_spec.op)
     is_conv = _is_conv(op_spec.op)
     ndim = len(op_spec.iteration_space)
@@ -2229,10 +2249,8 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
         _extend_matmul_k_to_padded(op_spec, sdsc_iteration_space, symbol_mapping)
     elif is_restickify:
         _extend_restickify_to_padded(op_spec, sdsc_iteration_space, symbol_mapping)
-    elif is_staggered_conversion:
-        _extend_staggered_conversion_to_padded(
-            op_spec, sdsc_iteration_space, symbol_mapping
-        )
+    elif on_fp16_grid:
+        _extend_staggered_to_padded(op_spec, sdsc_iteration_space, symbol_mapping)
 
     # Grow the index-entry iteration to the padded output device_size so a
     # partial-last-stick gather splits stick-aligned across cores. The output's

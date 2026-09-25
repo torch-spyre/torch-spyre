@@ -759,7 +759,10 @@ class TestSpyreTensorLayout(TestCase):
         shorter than one stick: the entry is the host extent, not a stick step,
         and the dim already counts the single stick that extent occupies.
         Rescaling it would claim stepping the host tensor does not have, which
-        the layout validator rejects, so only the stick depth changes.
+        the layout validator rejects, so only the stick depth changes. The extra
+        capacity a widening conversion needs is added by
+        ``insert_staggered_ea_padding``, which pads the one buffer that needs it
+        rather than sending a grown dim into every downstream consumer.
 
         A sentinel num-sticks slot (-1, a dim that is extent 1 by construction
         and never stepped) is left alone for the same reason. Needs no device.
@@ -944,6 +947,77 @@ class TestSpyreTensorLayout(TestCase):
         # stride_map and stick dim are unchanged.
         self.assertEqual(list(padded_layout.device_layout.stride_map), [32, 32, 1])
         self.assertEqual(padded_layout.device_layout.device_size[-1], 32)
+
+    def _staggered_fp32_op(self, device_size, stride_map, host_size):
+        """A mock ComputedBuffer holding a staggered fp32 value."""
+        import unittest.mock as mock
+        from torch_spyre._C import ElementArrangement
+        from torch_spyre._inductor.ir import FixedTiledLayout
+
+        stl = SpyreTensorLayout(
+            list(device_size),
+            list(stride_map),
+            get_device_dtype(torch.float32),
+            ElementArrangement.DL16_TO_FP32,
+        )
+        host_stride = [1] * len(host_size)
+        acc = 1
+        for i in reversed(range(len(host_size))):
+            host_stride[i] = acc
+            acc *= host_size[i]
+        layout = FixedTiledLayout(
+            torch.device("spyre"), torch.float32, list(host_size), host_stride, stl
+        )
+        op = mock.MagicMock()
+        op.__class__ = __import__(
+            "torch._inductor.ir", fromlist=["ComputedBuffer"]
+        ).ComputedBuffer
+        op.get_layout.return_value = layout
+        op.layout = layout
+        op.get_name.return_value = "buf_staggered"
+        return op
+
+    def test_pad_staggered_fp32_buffer_grows_a_sub_stick_dim_to_the_pair(self):
+        """A sub-stick staggered value still spans both FP32 sticks of its pair.
+
+        ``rescale_stl_for_dtype`` reports the one stick the live elements occupy, so
+        the second half of the pair is capacity this pass adds.
+        """
+        from torch_spyre._inductor.ir import FixedTiledLayout
+        from torch_spyre._inductor.padding import _pad_staggered_fp32_buffer
+
+        op = self._staggered_fp32_op([1, 1, 32], [5, -1, 1], [1, 5])
+        _pad_staggered_fp32_buffer(op)
+
+        padded = op.layout
+        self.assertIsInstance(padded, FixedTiledLayout)
+        self.assertEqual(list(padded.device_layout.device_size), [2, 1, 32])
+        # Only device_size grows: the sentinel -1 and the stick depth are untouched.
+        self.assertEqual(list(padded.device_layout.stride_map), [5, -1, 1])
+
+    def test_pad_staggered_fp32_buffer_covers_an_intermediate_consumer(self):
+        """An intermediate pointwise op inherits the arrangement, so it needs the pair.
+
+        Its elements are split across both sticks once the extent passes the first
+        32 slots, and its own name and dtypes say nothing about that, so the
+        arrangement it carries is what earns it the padding.
+        """
+        from torch_spyre._inductor.padding import _pad_staggered_fp32_buffer
+
+        op = self._staggered_fp32_op([1, 1, 32], [33, -1, 1], [1, 33])
+        _pad_staggered_fp32_buffer(op)
+
+        self.assertEqual(list(op.layout.device_layout.device_size), [2, 1, 32])
+
+    def test_pad_staggered_fp32_buffer_leaves_whole_pairs_alone(self):
+        """A stick-stepped dim already covering whole pairs needs no padding."""
+        from torch_spyre._inductor.padding import _pad_staggered_fp32_buffer
+
+        op = self._staggered_fp32_op([4, 1, 32], [32, -1, 1], [1, 96])
+        before = list(op.layout.device_layout.device_size)
+        _pad_staggered_fp32_buffer(op)
+
+        self.assertEqual(list(op.layout.device_layout.device_size), before)
 
 
 if __name__ == "__main__":
