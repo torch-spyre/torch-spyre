@@ -64,10 +64,10 @@ layouts, so excluding a layout during propagation means it cannot be chosen late
 optimal solution. Additional candidate STLs should be added if evidence shows they are needed, or if the optimizer
 improves to the point where the larger state space is manageable.
 
-### Cost node types
+### Stick Compatibility and Restickify Cost
 
-Three node types encode the different stick-compatibility rules and the cost
-to bring incompatibilities into compliance.
+Stick constraints across all ops reduce to three classes, each specifying how
+inputs and output must relate and the cost of a mismatch.
 
 **`AllSameNode`** — used for pointwise ops and most reductions. All inputs
 and the output must share a stick. The cost is the sum of per-input
@@ -82,6 +82,10 @@ different stick variables.
 **`AnyInNode`** — used for `clone`, no-ops, constants, and similar. Accepts
 any input at zero cost and introduces no optimization constraints.
 
+**Mutation ops.** Mutation ops create additional stick constraints: they have
+two output dependencies — their logical output and the target buffer they write
+into — and both must be committed to the same STL. The optimizer enforces this
+via a co-output edge: INF cost for any candidate where the two disagree.
 
 ### Candidate generation
 
