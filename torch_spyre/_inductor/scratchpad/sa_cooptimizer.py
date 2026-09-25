@@ -18,7 +18,7 @@
 substrate's CP-SAT and DFS solvers. It anneals the joint state ``(pi, W)``:
 
 * ``pi`` -- the layout permutation, held in a *composed* (not subclassed)
-  :class:`PermutationBasedLayoutSolver` packer, because this loop mixes move
+  :class:`NativePermutationLayoutSolver` packer, because this loop mixes move
   types and scores a richer objective than the packer's own ``quality()``.
 * ``W`` -- the work division, one ``chosen_division`` menu index per buffer.
 
@@ -46,7 +46,7 @@ import math
 import random as rnd
 import statistics
 from collections.abc import Sequence
-from typing import TYPE_CHECKING, Any, Optional, Union, cast
+from typing import TYPE_CHECKING, Any, Optional, cast
 
 import sympy
 
@@ -62,10 +62,6 @@ from torch_spyre._inductor.scratchpad.plan_solver import (
     ceil_div,
 )
 from torch_spyre._C import NativePermutationLayoutSolver
-from torch_spyre._inductor.scratchpad.permutation_layout import (
-    PermutationBasedLayoutSolver,
-    make_permutation_packer,
-)
 from torch_spyre._inductor.scratchpad import utils
 from torch_spyre._inductor.logging_utils import get_inductor_logger
 from torch_spyre._inductor.pass_utils import iteration_space_from_op
@@ -97,11 +93,6 @@ _BURST_FRACTION = 0.1
 
 # The geometric cool spans t0 down to t0 / _COOLING_SPAN.
 _COOLING_SPAN = 1000.0
-
-# ``make_permutation_packer`` returns either the pure-Python or the native C++
-# packer. Use ``.quality()`` (not the Python-only ``total_quality`` attribute) so
-# both work.
-Packer = Union[PermutationBasedLayoutSolver, NativePermutationLayoutSolver]
 
 # Cause recorded for a buffer the SA engine left out of LX.
 _SOLVER_CHOSE_SPILL = "spilled by solver (no residency benefit / no room)"
@@ -159,7 +150,7 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         # Best-seen over the anneal (set in _anneal, read in _step); declared for
         # the types.
         self._best_score: int
-        self._best_snap: tuple[Packer, list[int], int]
+        self._best_snap: tuple[NativePermutationLayoutSolver, list[int], int]
         # Number of buffers passing :meth:`_eligible` under the live ``W``. Kept
         # as a count, not a mask: the two ripple sites already evaluate
         # ``_eligible`` over the buffers a move can change, so they carry the
@@ -409,7 +400,7 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
             )
         return out
 
-    def _build_seed_packer(self) -> Packer:
+    def _build_seed_packer(self) -> NativePermutationLayoutSolver:
         """Build the packer for the seed state: per-core sizes at index 0, a
         FirstFit-derived ``pi``, and the seed eligibility mask."""
         n = len(self._bufs)
@@ -431,12 +422,12 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
             FirstFitLayoutSolver(copy.deepcopy(ff_bufs), self.limit, self.alignment)
         ).permutation(ff_bufs)
 
-        return make_permutation_packer(
+        return NativePermutationLayoutSolver(
             self._lifetime_buffers(sizes),
             pi,
             self.limit,
             self.alignment,
-            eligible=eligible,
+            eligible,
         )
 
     # -- scoring (lower is better) -------------------------------------------
@@ -604,14 +595,16 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
 
     # -- state snapshots -----------------------------------------------------
 
-    def _snapshot(self) -> tuple[Packer, list[int], int]:
+    def _snapshot(self) -> tuple[NativePermutationLayoutSolver, list[int], int]:
         """An independent copy of the joint state ``(pi, W)``: the packer's
         dynamic layout (``copy`` shares only plan-lifetime structures) plus the
         division vector, and the eligible count ``W`` implies -- rebuilding that
         from ``W`` would cost an O(n) pass the restore does not otherwise need."""
         return (self.packer.copy(), list(self.chosen), self._n_eligible)
 
-    def _adopt(self, snap: tuple[Packer, list[int], int]) -> None:
+    def _adopt(
+        self, snap: tuple[NativePermutationLayoutSolver, list[int], int]
+    ) -> None:
         """Install ``snap`` as the live state by *taking ownership* of it -- no
         copy, so the engine goes on mutating those objects and the caller must
         treat ``snap`` as dead from here on. Zero-copy because a step already pays
