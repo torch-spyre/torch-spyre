@@ -34,68 +34,6 @@ if TYPE_CHECKING:
 _UNSET = object()
 
 
-def _add_ea(src_tensor, res_tensor) -> None:
-    """Update the EA tag after an eager transfer handled by ``orig_to``.
-
-    Same-device dtype-changing casts return through ``to_dtype_d2d`` before
-    this helper is reached; their EA is propagated by the compiled graph.
-    """
-    if res_tensor.dtype == src_tensor.dtype:
-        return
-
-    import torch
-    from torch_spyre._inductor.dtype_ops import DtypeOpTable
-    from torch_spyre._inductor.constants import STAGGERED_EAS
-    from torch_spyre._inductor.pass_utils import rescale_stl_for_dtype
-
-    # Skip FakeTensor tracing contexts during torch.compile
-    if (
-        torch.compiler.is_compiling()
-        or isinstance(src_tensor, torch._subclasses.FakeTensor)
-        or isinstance(res_tensor, torch._subclasses.FakeTensor)
-    ):
-        return
-
-    from torch_spyre._C import (
-        get_spyre_tensor_layout,
-        set_spyre_tensor_layout,
-    )
-
-    # TODO EA torch.bool as it can be fp16 or fp32
-
-    try:
-        src_layout = get_spyre_tensor_layout(src_tensor)
-    except RuntimeError:
-        return
-
-    if src_layout is None:
-        return
-
-    input_ea = src_layout.element_arrangement
-    fmt = DtypeOpTable.ea_map(src_tensor.dtype, res_tensor.dtype, input_ea)
-
-    try:
-        res_layout = get_spyre_tensor_layout(res_tensor)
-    except RuntimeError:
-        return
-
-    if res_layout is None:
-        return
-
-    stl = res_layout.with_element_arrangement(fmt)
-    is_staggered_ea = fmt in STAGGERED_EAS or input_ea in STAGGERED_EAS
-    if src_tensor.dtype != torch.float32 and is_staggered_ea:
-        stl = rescale_stl_for_dtype(
-            src_layout,
-            res_tensor.dtype,
-            fmt,
-            list(src_tensor.size()),
-            list(src_tensor.stride()),
-        )
-
-    set_spyre_tensor_layout(res_tensor, stl)
-
-
 def _patch_tensor_for_spyre():
     import torch
 
@@ -191,10 +129,7 @@ def _patch_tensor_for_spyre():
                 # function entry), so this dtype-only op drops no layout request.
                 return torch.ops.spyre.to_dtype_d2d(self, _dtype, self.storage_offset())
 
-            res = orig_to(self, *args, **kwargs)
-            if res.device.type == DEVICE_NAME:
-                _add_ea(self, res)
-            return res
+            return orig_to(self, *args, **kwargs)
         else:
             # Check if copy kwarg is explicitly set
             copy = kwargs.get("copy")
