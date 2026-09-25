@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import dataclasses
 import json
 import os
 import shutil
@@ -24,15 +25,18 @@ import torch
 from torch._inductor.codecache import code_hash
 from torch._inductor.runtime.runtime_utils import cache_dir
 
+from torch_spyre._inductor.codegen.compute_ops import SymbolKind
 from torch_spyre._inductor.logging_utils import get_inductor_logger
 
 
 logger = get_inductor_logger("kernel_cache")
 
-# All artifacts that dxp_standalone must produce for a valid compiled kernel.
+# All artifacts the backend compiler must produce for a valid compiled kernel.
 # A cache entry is only considered a hit if every one of these is present.
+_SYMBOL_KINDS_FILE = "symbol_kinds.json"
 _REQUIRED_ARTIFACTS = [
     "bundle.mlir",
+    _SYMBOL_KINDS_FILE,
     os.path.join("spyreCodeDir", "init_binary.bin"),
     os.path.join("spyreCodeDir", "spyrecode.json"),
 ]
@@ -142,7 +146,7 @@ def get_kernel_registry() -> _KernelHashRegistry:
 
 
 @lru_cache(maxsize=1)
-def _get_dxp_version() -> str:
+def _get_backend_compiler_version() -> str:
     """Return a combined deeptools+flex version string from the Spyre components file.
 
     Reads the path given by the ``LIB_VERSION_FILE`` environment variable
@@ -212,7 +216,7 @@ def _strip_debug_handles(obj):
     debug_handle_ carries Inductor-assigned buffer names and source file paths
     that are process/run-specific. Including them in the cache key causes false
     misses (identical graphs with different buffer names hash differently) and
-    does not affect compilation correctness — dxp_standalone ignores the field.
+    does not affect compilation correctness — the backend ignores the field.
     """
     if isinstance(obj, dict):
         return {
@@ -231,8 +235,9 @@ def compute_specs_hash(
     The key is a SHA-256 hash covering: the JSON of every sdsc_N.json dict
     (op structure, iteration space, tiling, shapes, dtypes), the trip count of
     every LoopSpec, all baked symbol offsets (pool, kernel_slice, derived),
-    the total pool allocation size, and the versions of torch, torch_spyre,
-    dxp_standalone, and the active compile config.
+    the total pool allocation size, the versions of torch, torch_spyre and
+    the deeptools/flex toolchain, the backend compiler in use, and the active
+    compile config.
 
     Args:
         specs:       The OpSpec/LoopSpec tree to hash.
@@ -364,12 +369,29 @@ def compute_specs_hash(
     # sdscbundle.device_mem_allocate <pool_size> bytes in bundle.mlir.
     content_parts.append(f"pool_size:{pool_size}".encode())
 
+    # Include frontend_pool_allocation: this flag changes both the bundle
+    # signature (adds a pool base-address parameter as the first MLIR input)
+    # and the .run() argument ABI (tensor_id indices are offset by 1 when the
+    # pool param is present).  A cached kernel compiled without it must never
+    # be reused when the flag is on, and vice-versa.
+    content_parts.append(
+        f"frontend_pool_allocation:{int(_spyre_config.frontend_pool_allocation)}".encode()
+    )
+
     content = b"||".join(content_parts)
     extra = "||".join(
         [
             torch.__version__,
             _get_torch_spyre_version(),
-            _get_dxp_version(),
+            _get_backend_compiler_version(),
+            # Bundles are compiled by dbo-opt, not dxp_standalone.
+            # _get_backend_compiler_version() reports the deeptools package
+            # version, which ships both binaries and so does not change when
+            # the backend does.
+            # Without this tag, entries produced by dxp_standalone stay
+            # indistinguishable -- _REQUIRED_ARTIFACTS are the same filenames --
+            # and would be served as hits, so dbo-opt would never run.
+            "backend=dbo-opt",
         ]
     )
 
@@ -447,6 +469,16 @@ def get_cached_kernel_dir(cache_key: str) -> Optional[str]:
     return cached_dir
 
 
+def save_symbol_kinds(compile_dir: str, symbol_kinds: list[SymbolKind]) -> None:
+    with open(os.path.join(compile_dir, _SYMBOL_KINDS_FILE), "w") as f:
+        json.dump([dataclasses.asdict(kind) for kind in symbol_kinds], f)
+
+
+def load_symbol_kinds(cached_dir: str) -> list[SymbolKind]:
+    with open(os.path.join(cached_dir, _SYMBOL_KINDS_FILE)) as f:
+        return [SymbolKind(**kind) for kind in json.load(f)]
+
+
 def allocate_compile_dir(cache_key: str) -> str:
     """Reserve a unique temp directory inside the cache root for compilation.
 
@@ -488,8 +520,9 @@ def _move_to_failed_dir(compile_dir: str) -> None:
     """Move a failed compile dir into a ``failed/`` subdirectory of the cache root.
 
     Keeps the cache root clean while still retaining failed artifacts for
-    manual debugging (``dxp_standalone -d <path>``).  If the rename itself
-    fails (e.g. cross-device move), the original path is kept and logged.
+    manual debugging (re-run dbo-opt over the dir's ``bundle.mlir``).  If the
+    rename itself fails (e.g. cross-device move), the original path is kept and
+    logged.
     """
     cache_root = get_cache_root_dir()
     failed_root = os.path.join(cache_root, "failed")

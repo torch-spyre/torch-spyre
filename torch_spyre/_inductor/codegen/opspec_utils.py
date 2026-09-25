@@ -243,6 +243,88 @@ def align_reshape_plan(
     return (reshape_to, broadcast_to)
 
 
+def operand_indexing(
+    in_coords: Sequence[sympy.Expr],
+    in_extent: Sequence[int],
+    out_coords: Sequence[sympy.Expr],
+    out_extent: Sequence[int],
+) -> tuple[int | None, ...]:
+    """One pointwise operand's map row against the output's axes.
+
+    The parallel counterpart of ``reduction_indexing``, and the same shape of
+    answer: one entry per *operand* axis, being the axis of the OUTPUT that axis
+    walks -- so the row is a projection of the output's iteration nest, which is
+    what an all-parallel ``linalg.generic``'s ``indexing_maps`` states.  The
+    iteration dims are the output's own axes, in order, because a pointwise op
+    writes every element of its output exactly once.
+
+    ``None`` is an axis the operand does not walk at all: its coordinate carries
+    no iteration symbol and its extent is one element, so every iteration reads
+    that one element and the map's result position is the CONSTANT 0.  That is the
+    statistic read (``(d0,d1,d2) -> (d1, 0)``), the splat (``(d0,d1) -> (d0, 0)``)
+    and the row broadcast (``(d0,d1,d2) -> (d0, 0, d2)``) -- three forms, one rule.
+
+    Axes are matched by ``_dim_info`` classification, not by expression equality,
+    so an outer-stick ``sym // 64`` matches an outer-stick ``sym // 64`` whatever
+    it is spelled as, exactly as ``align_reshape_plan`` matches them.
+
+    Refuses, rather than guessing, three shapes that would otherwise read the
+    wrong elements silently:
+
+    * an operand axis matching no output axis -- there is no dim for it to walk;
+    * a matched axis whose extent differs from the output's -- that is a stretch
+      or a shrink, and a map cannot say either;
+    * matched axes out of increasing order -- a permutation, which needs a
+      transpose (restickify) rather than a map, the same refusal
+      ``reduction_indexing`` makes.
+
+    ``in_extent``/``out_extent`` are the TILE extents, not the buffer's: a
+    ``linalg`` operand's shape is the tile that was loaded, and a broadcast
+    operand is loaded at one element on the axis it does not walk.
+    """
+    out_info = [_dim_info(coord) for coord in out_coords]
+    row: list[int | None] = []
+    matched: list[int] = []
+    used: set[int] = set()
+    for axis, coord in enumerate(in_coords):
+        info = _dim_info(coord)
+        size = int(in_extent[axis])
+        if info == (_DIM_CONST, None):
+            if size != 1:
+                raise NotImplementedError(
+                    f"OpSpec alignment: operand device axis {axis} is a constant "
+                    f"coordinate over {size} elements, so it walks no iteration "
+                    "dim and yet carries more than the one element a constant map "
+                    "position reads"
+                )
+            row.append(None)
+            continue
+        candidates = [o for o in range(len(out_coords)) if o not in used]
+        found = next((o for o in candidates if out_info[o] == info), None)
+        if found is None:
+            raise NotImplementedError(
+                f"OpSpec alignment: operand device axis {axis} ({coord!r}) matches "
+                "no output device axis, so there is no iteration dim for it to "
+                "walk; aligning it needs a transpose (restickify)"
+            )
+        if int(out_extent[found]) != size:
+            raise NotImplementedError(
+                f"OpSpec alignment: operand device axis {axis} runs {size} "
+                f"elements against the output axis {found}'s "
+                f"{int(out_extent[found])}; a broadcast map reads one element or "
+                "the whole axis, not a stretch of it"
+            )
+        used.add(found)
+        matched.append(found)
+        row.append(found)
+    if any(matched[i] >= matched[i + 1] for i in range(len(matched) - 1)):
+        raise NotImplementedError(
+            "OpSpec alignment: the operand's device axes are permuted against the "
+            "output's, which needs a transpose (restickify) rather than a map"
+        )
+    return tuple(row)
+
+
 def placeholder_axes(
     coords: Sequence[sympy.Expr], extent: Sequence[int]
 ) -> tuple[int, ...]:

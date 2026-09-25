@@ -33,6 +33,12 @@ INGEST_PATH = (
     Path(__file__).resolve().parents[1] / ".github" / "scripts" / "ingest_xml.py"
 )
 
+# The ingest imports the shared library from extensions/; it is in this repo, so put it on
+# sys.path rather than requiring an install for a parse-only test.
+_CHLIB = Path(__file__).resolve().parents[1] / "extensions" / "clickhouse-ingest"
+if str(_CHLIB) not in sys.path:
+    sys.path.insert(0, str(_CHLIB))
+
 KERNEL_CLASSNAME = "spyre_perf_suite.kernel_benchmark"
 OP_CLASSNAME = "spyre_perf_suite.benchmark"
 
@@ -62,9 +68,11 @@ class _Result:
 class FakeClient:
     """Answers system.columns / system.tables from a declared schema."""
 
-    def __init__(self, tables=None, already_ingested=0):
+    def __init__(self, tables=None, already_ingested=0, database="spyre"):
         # {table: [column, ...]}
         self.tables = tables if tables is not None else {}
+        # _table_exists reads client.database when no explicit db is passed.
+        self.database = database
         self.already_ingested = already_ingested
         self.inserts = []
         self.commands = []
@@ -82,7 +90,7 @@ class FakeClient:
     def command(self, sql):
         self.commands.append(sql)
 
-    def insert(self, table, rows, column_names=None):
+    def insert(self, table, rows, column_names=None, database=None):
         self.inserts.append((table, rows, column_names))
 
 

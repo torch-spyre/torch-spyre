@@ -32,7 +32,7 @@ from ..ir import SpyreConstantFallback
 from ..logging_utils import get_inductor_logger
 from ..propagate_hints import DimHint
 
-hints_logger = get_inductor_logger("assign_dim_hints")
+hints_logger = get_inductor_logger("wsr.assign_dim_hints")
 
 
 def _hints_levels(ops: list[Operation]) -> list[tuple]:

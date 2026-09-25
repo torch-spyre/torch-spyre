@@ -17,12 +17,79 @@ from torch_spyre._C import fill_tensor, copy_tensor, SpyreTensorLayout
 import torch_spyre.ops.fallbacks  # noqa: F401
 from .fallbacks import _get_op_overloads
 import warnings
+import contextlib
 import functools
 import inspect
 import operator
+import threading
 
 
 aten = torch.ops.aten
+
+
+# Ops whose compiled kernel is running on this thread; see ``_guard_reentry``.
+_in_flight = threading.local()
+
+
+def _op_frame(op):
+    """Wrap ``op`` in a plain function that owns its dynamo cache line.
+
+    ``torch.compile`` on an ``OpOverload`` routes it through
+    ``torch._dynamo.external_utils.wrap_inline``, whose ``inner`` is one
+    module-level code object -- and dynamo caches per code object, so every
+    compiled op would otherwise share a single cache and recompile budget.
+    ``code.replace`` mints a distinct code object per op; the unchanged fields
+    are deliberate (upstream does the same for
+    ``config.debug_force_nested_calls``). CPython never interns code objects
+    by content the way it does small ints/strings, so this doesn't rely on an
+    accident of the current implementation -- and if that ever changed,
+    upstream's own ``debug_force_nested_calls`` use of the identical trick
+    would break the same way, not just this one.
+    """
+
+    def call_op(*args, **kwargs):
+        return op(*args, **kwargs)
+
+    call_op.__code__ = call_op.__code__.replace(
+        co_varnames=call_op.__code__.co_varnames
+    )
+    # Distinct __qualname__ per op so dynamo's recompile-limit log messages
+    # ("function: '<name>' ...") name the op that hit its budget, instead of
+    # every op showing up as the same generic 'call_op'. str(), not .name():
+    # a single-overload custom op (e.g. spyre.quantize_weight_fp8_with_scale)
+    # resolves to an OpOverloadPacket, not an OpOverload, and
+    # OpOverloadPacket has no .name() -- attribute access falls through to
+    # __getattr__, which tries to resolve "name" as an overload and raises
+    # AttributeError. __str__ is defined on both and needs no such dispatch.
+    call_op.__qualname__ = f"_op_frame.<locals>.{op}"
+    return call_op
+
+
+@contextlib.contextmanager
+def _guard_reentry(op):
+    """Raise if ``op``'s compiled kernel re-dispatches to itself.
+
+    Only reachable when dynamo runs the frame eagerly instead of tracing it, so
+    the call loops back through this kernel. Unguarded it surfaces as an opaque
+    ``RecursionError`` in whatever ran out of stack first.
+    """
+    active = getattr(_in_flight, "ops", None)
+    if active is None:
+        active = set()
+        _in_flight.ops = active
+    if op in active:
+        raise RuntimeError(
+            f"the compiled Spyre kernel for {op} re-entered itself: dynamo "
+            "ran the op eagerly instead of tracing it, so it dispatched back "
+            "into this kernel. Check the log for 'torch._dynamo hit "
+            "config.accumulated_recompile_limit' and whether dynamo is "
+            "disabled (TORCHDYNAMO_DISABLE)."
+        )
+    active.add(op)
+    try:
+        yield
+    finally:
+        active.discard(op)
 
 
 # Decorator to keep track of compiled variant
@@ -37,8 +104,9 @@ def compile_once(op, **compile_kwargs):
             if compiled is None:
                 if isinstance(op, str):
                     op = operator.attrgetter(op)(torch.ops)
-                compiled = torch.compile(op, **compile_kwargs)
-            return fn(*args, compiled=compiled, **kwargs)
+                compiled = torch.compile(_op_frame(op), **compile_kwargs)
+            with _guard_reentry(op):
+                return fn(*args, compiled=compiled, **kwargs)
 
         # We remove the `compiled` arg from the signature to have
         # a clean signature.
@@ -97,6 +165,37 @@ class RetileWarning(UserWarning):
 warnings.simplefilter("once", RetileWarning)
 
 
+_compiled_fallback_state = threading.local()
+
+
+def _run_compiled_fallback(op, *args, **kwargs):
+    """Invoke an eager op on behalf of an Inductor ``FallbackKernel``.
+
+    Direct eager calls are device-layout boundaries: their returned tensor
+    carries its real ``SpyreTensorLayout``, and a later compiled graph reads
+    that layout from the real graph input.  A fallback *inside* a compiled
+    graph is different: layout propagation currently assigns its output the
+    canonical, size-derived layout without observing the eager result.  Mark
+    just those calls so ``_make_offset_safe_dispatch`` can make that assumed
+    layout true without canonicalizing ordinary eager-boundary results.
+
+    A depth rather than a boolean keeps nested composite fallbacks balanced.
+    The state is thread-local because generated graph wrappers can run from
+    independent application threads.
+    """
+
+    previous_depth = getattr(_compiled_fallback_state, "depth", 0)
+    _compiled_fallback_state.depth = previous_depth + 1
+    try:
+        return op(*args, **kwargs)
+    finally:
+        _compiled_fallback_state.depth = previous_depth
+
+
+def _in_compiled_fallback():
+    return bool(getattr(_compiled_fallback_state, "depth", 0))
+
+
 def _normalize_result_layout(x):
     """Return a copy of a Spyre tensor whose device layout is the *canonical* one
     for its logical shape.
@@ -106,6 +205,10 @@ def _normalize_result_layout(x):
     restickify to make that assumption true — so an eager kernel returning a
     differently-tiled buffer is read by the wrong tiling, silently. Rebuilding
     the result here makes the assumption hold.
+
+    This helper is only called while a generated compiled graph is executing a
+    fallback.  Direct eager results deliberately retain their real layout so a
+    subsequent compilation can accept it at the graph boundary.
 
     Only whole buffers are considered. ``device_tensor_layout()`` describes the
     tensor's BASE allocation, not the view, so for any view it reports a layout
@@ -315,7 +418,7 @@ def _make_offset_safe_dispatch(op):
 
         result = compiled(*args, **kwargs)
 
-        if normalize_results:
+        if normalize_results and _in_compiled_fallback():
             result = _map_result(result, _normalize_result_layout)
 
         if write_back:
@@ -397,6 +500,7 @@ COMPILED_OPS = [
     aten.where.self_out,
     aten.clamp,
     aten.constant_pad_nd,
+    aten._scaled_mm,
     aten.embedding.default,
     aten.any.default,
     aten.any.dim,
@@ -425,8 +529,9 @@ def _functional_sibling(inplace_op):
     ``other ** self``. The signature check rejects that pair.
 
     Matching on signature alone would instead reach ``pow.Tensor_Scalar``, which
-    is operand-correct, but the device's functional ``pow`` is itself wrong
-    today, so the conservative name requirement stays.
+    is operand-correct, but the other functional overloads are not usable:
+    ``pow.Scalar`` computes ``other ** self`` and ``pow.Tensor_Tensor`` raises
+    "unimplemented operation pow" -- so the conservative name requirement stays.
 
     ``None`` means the pair is not a safe functional/in-place match and the
     caller must skip it.

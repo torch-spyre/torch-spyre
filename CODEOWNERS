@@ -51,6 +51,8 @@
 /pytest_models.ini        @ashokponkumar @jabostian @anubhavjana @n-marion
 /Makefile                 @ashokponkumar @jabostian @anubhavjana @n-marion
 
+/extensions/clickhouse-ingest/  @ashokponkumar @jabostian @anubhavjana @n-marion
+
 # ktir-mlir-frontend pin and its installer.  Two files rather than /tools/, which
 # is otherwise CI's: which frontend revision the OpSpec->KTIR emitter is tested
 # against is a fact about /torch_spyre/_inductor/.

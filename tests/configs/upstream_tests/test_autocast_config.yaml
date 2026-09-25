@@ -1,0 +1,24 @@
+test_suite_config:
+  files:
+    - path: ${TORCH_ROOT}/test/test_autocast.py
+      unlisted_test_mode: skip
+      tests:
+        - names:
+            - TestAutocastCPU::test_autocast_torch_expect_builtin_promote
+            - TestAutocastCPU::test_autocast_torch_16
+            - TestAutocastCPU::test_autocast_nn_16
+            - TestAutocastCPU::test_autocast_disabled_with_fp32_dtype
+            - TestAutocastCPU::test_generic_autocast
+          mode: mandatory_success
+          edits:
+            functions:
+              cpu_move:
+                - name: assertEqual
+                - name: assertTrue
+                - name: assertNotEqual
+
+  global:
+    supported_dtypes:
+      - name: float16
+      - name: bfloat16
+      - name: float32

@@ -77,6 +77,15 @@ on:
         required: false
         type: boolean
         default: true
+      enable_tier_delta:
+        description: >
+          Skip configs whose tiers already have results for this commit+arch, so a
+          regression run after an integration run executes only what regression adds.
+          Off by default: a delta must be asked for. Degrades to the full tier on any
+          ClickHouse error, so it can never under-test silently.
+        type: boolean
+        default: false
+        required: false
       test_type:
         description: >-
           Suite subset to run: smoke | unit | integration | regression |
@@ -85,7 +94,7 @@ on:
           (for suite_<group>) whose path sits under that directory -- there
           is no catch-all value that ignores a config's labels.
           integration covers the device-layer surfaces flex and
-          deeptools/dxp_standalone exercise most (streams, job launch
+          deeptools exercise most (streams, job launch
           plans, codegen, LX/scratchpad planning, tensor layout,
           allocator/GC, D2D copies). Default: regression (every config
           labeled for full functional coverage) -- callers that want the
@@ -103,6 +112,23 @@ on:
       # checkout, the build_torch_spyre wheel job, and install-prebuilt-torch-spyre;
       # run the suite against the baked dir. DEFAULT false → the normal PR/nightly
       # callers (tests.yml / tests-nightly.yml) are byte-for-byte unchanged.
+      component:
+        description: >
+          Component to stamp on v2 ingest rows. Defaults to this repo's own product; set it
+          when this matrix runs ANOTHER component's suite, so the rows (and the test_case_id
+          they hash into) name the suite's real owner.
+        required: false
+        type: string
+        default: torch-spyre
+      run_id:
+        description: >
+          UUID identifying this TEST RUN, minted by the dispatching orchestrator above the
+          CI split and threaded through so artifact_results (written by Jenkins) and
+          test_case_runs (written by the ingest below) carry ONE identity. Empty on a
+          GHA-initiated run, which then derives its own from the run coordinate.
+        required: false
+        type: string
+        default: ''
       prebaked_image:
         description: Test the pre-baked torch-spyre-dev image (no checkout/build). Integration path only.
         required: false
@@ -153,6 +179,10 @@ on:
         required: false
       CLICKHOUSE_DB:
         required: false
+      # The v2 database for the covered-tier lookup. The other four CLICKHOUSE_* secrets
+      # above already serve it -- one instance, one naming scheme.
+      CLICKHOUSE_DB_V2:
+        required: false
 
 defaults:
   run:
@@ -197,6 +227,10 @@ jobs:
     outputs:
       matrix: ${{ steps.filter.outputs.matrix }}
       resolved_test_type: ${{ steps.filter.outputs.resolved_test_type }}
+      # [{tier, covering_run}, ...] for the tiers this run SKIPS. The ingest copies those
+      # runs' case rows in, so a delta run reports its whole tier rather than only the part
+      # it executed. Empty ([] or "") whenever the delta is off or the lookup fails.
+      covered_runs: ${{ steps.filter.outputs.covered_runs }}
     steps:
       # NORMAL: sparse-checkout the configs from github.com at the requested ref.
       - if: ${{ !inputs.prebaked_image }}
@@ -209,6 +243,7 @@ jobs:
           sparse-checkout: |
             ${{ (inputs.test_type || 'regression') == 'trunk' && 'tests/configs' || 'tests/configs/torch_spyre_tests' }}
             tests/oot_framework/utils/filter_configs.py
+            .github/scripts/resolve_covered_tiers.py
             .github/runner_overrides.yaml
           sparse-checkout-cone-mode: false
 
@@ -216,6 +251,18 @@ jobs:
         id: filter
         env:
           RAW_TEST_TYPE: ${{ inputs.test_type || 'regression' }}
+          ENABLE_TIER_DELTA: ${{ inputs.enable_tier_delta }}
+          DELTA_SHA: ${{ inputs.ref || github.event.pull_request.head.sha || github.sha }}
+          DELTA_ARCH: ${{ inputs.runner_label }}
+          # Same secrets the ingest path uses. Previously these read a SPYRE_CH_* set of
+          # vars/secrets that was never configured in any repo or org, so the lookup always
+          # took its unset branch and every run silently ran the FULL tier -- the delta could
+          # not fire at all. Absent secrets still fail open, by design.
+          CLICKHOUSE_HOST: ${{ secrets.CLICKHOUSE_HOST }}
+          CLICKHOUSE_PORT: ${{ secrets.CLICKHOUSE_PORT }}
+          CLICKHOUSE_USER: ${{ secrets.CLICKHOUSE_USER }}
+          CLICKHOUSE_PASS: ${{ secrets.CLICKHOUSE_PASS }}
+          CLICKHOUSE_DB_V2: ${{ secrets.CLICKHOUSE_DB_V2 }}
         run: |
           # Prebaked: read the configs baked in the dev image; else the checkout cwd.
           # cd into the source root so every path below stays repo-relative and
@@ -240,6 +287,17 @@ jobs:
             exit 0
           fi
 
+          # capability is the same kind of exception as perf: the model-ops suites carry no
+          # test_suite_config.labels either, so the config filter would return an empty matrix.
+          # Unlike perf it IS a matrix -- one job per model config -- so the suite list is
+          # declared in the `model_ops` job's own strategy rather than emitted here, and this
+          # only pins the tier so that job's gate fires and the label-driven `test` matrix skips.
+          if [ "${RAW_TEST_TYPE}" = "capability" ]; then
+            echo "matrix={\"suite\":[]}" >> "$GITHUB_OUTPUT"
+            echo "resolved_test_type=capability" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
           # trunk covers everything torch-spyre's push-to-main workflows
           # exercise across tests/configs/, not just torch_spyre_tests (see
           # Makefile's TEST_TYPE=trunk docs). Every other tier keeps the
@@ -248,16 +306,49 @@ jobs:
           # tests/scripts/check_test_coverage.sh greps workflow YAMLs for a
           # literal `--config-dir <path>` token to detect dynamic coverage,
           # and can't resolve a variable.
+          # Tiers already covered for this commit+arch. Empty unless the delta is
+          # enabled AND the lookup succeeds -- the script prints nothing and exits 0
+          # on any failure, so an unreachable ClickHouse runs the full tier.
+          # ONE lookup for both consumers: --format both prints the bare tier CSV on line 1
+          # (what filter_configs matches) and the json with covering run ids on line 2 (what
+          # the ingest copies from). head/tail rather than a shell json parser -- an embedded
+          # python -c here would need every line indented or its unindented lines terminate
+          # this block scalar and break the workflow.
+          EXCLUDE_TIERS=""
+          COVERED_RUNS="[]"
+          # Guard on the HOST, which is what the resolver needs; SPYRE_CH_URL was never set
+          # by anything, so this condition could never be true and the delta never ran.
+          if [ "${ENABLE_TIER_DELTA}" = "true" ] && [ -n "${CLICKHOUSE_HOST:-}" ]; then
+            _delta_out=$(python3 .github/scripts/resolve_covered_tiers.py \
+              --commit-sha "${DELTA_SHA}" \
+              --arch "${DELTA_ARCH}" \
+              --test-type "${RAW_TEST_TYPE}" \
+              --format both || true)
+            EXCLUDE_TIERS=$(printf '%s\n' "${_delta_out}" | head -1)
+            COVERED_RUNS=$(printf '%s\n' "${_delta_out}" | tail -1)
+            [ -n "${COVERED_RUNS}" ] || COVERED_RUNS="[]"
+          fi
+          echo "covered_runs=${COVERED_RUNS}" >> "$GITHUB_OUTPUT"
+          # Array, not a string: expands to zero words when empty, so no unquoted
+          # word-splitting is needed to pass 0-or-2 args.
+          _delta_args=()
+          if [ -n "${EXCLUDE_TIERS}" ]; then
+            _delta_args=(--exclude-tiers "${EXCLUDE_TIERS}")
+            echo "tier delta: skipping configs already covered by ${EXCLUDE_TIERS}"
+          fi
+
           if [ "${RAW_TEST_TYPE}" = "trunk" ]; then
             matrix=$(python3 tests/oot_framework/utils/filter_configs.py \
               --config-dir tests/configs \
               --test-type "${RAW_TEST_TYPE}" \
+              "${_delta_args[@]}" \
               --runner-map .github/runner_overrides.yaml \
               --format matrix-json)
           else
             matrix=$(python3 tests/oot_framework/utils/filter_configs.py \
               --config-dir tests/configs/torch_spyre_tests \
               --test-type "${RAW_TEST_TYPE}" \
+              "${_delta_args[@]}" \
               --runner-map .github/runner_overrides.yaml \
               --format matrix-json)
           fi
@@ -284,6 +375,109 @@ jobs:
           # trimmed raw input directly.
           resolved=$(echo "${RAW_TEST_TYPE}" | xargs)
           echo "resolved_test_type=$resolved" >> "$GITHUB_OUTPUT"
+
+      # The threaded run_id has to reach push-to-clickhouse.yaml, which already looks for this
+      # artifact (see its "Recover threaded run_id" step). That workflow runs on workflow_run
+      # AFTER this one, so it cannot receive a dispatch input -- and an artifact is the channel
+      # it ALREADY enumerates to find the junit XML, so the uuid rides it rather than needing a
+      # new transport or a uuid in the user-facing run-name.
+      #
+      # Without this the chain is half-built: artifact_results carries the orchestrator's uuid
+      # while the ingest derives its own, so the two never share a run_id and the
+      # artifacts -> artifact_results -> test_case_runs join stays empty. Observed exactly that
+      # -- 27 threaded rows on the Jenkins side, `Threaded run_id: <none, ingest will derive>`
+      # in every ingest log.
+      #
+      # Skipped when empty, so a GHA-initiated run uploads nothing and the ingest derives its
+      # own id, as before.
+      - name: Record threaded run_id for the ingest
+        if: ${{ inputs.run_id != '' }}
+        env:
+          THREADED_RUN_ID: ${{ inputs.run_id }}
+        run: printf '%s' "${THREADED_RUN_ID}" > run-id.txt
+      - name: Upload threaded run_id
+        if: ${{ inputs.run_id != '' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: run-id
+          path: run-id.txt
+          retention-days: 1
+
+  # ---------------------------------------------------------------------------
+  # Job 0a: derive THIS LEG'S artifact identity
+  #
+  # A GHA leg installs this PR's build on top of a prebaked image, so what it runs is a
+  # DIFFERENT artifact from the image Jenkins published -- and had no identity, which is the
+  # whole of the artifact_results coverage gap. spyre-frameworks #1782 stamps the image with
+  # its own artifact_id; gha_artifact_id() chains this leg's delta onto it.
+  #
+  # Its OWN job: the identity is per RUN, not per suite, so deriving it in the ~90-cell matrix
+  # would mint 90 copies of one fact. Cardless spyre_pf_x0, and it cannot run on ubuntu-latest
+  # -- the base id lives in the image's filesystem. No `needs`, so it never gates the run.
+  # ---------------------------------------------------------------------------
+  artifact_identity:
+    name: Derive artifact identity
+    runs-on:
+      - x86_64
+      - spyre_pf_x0
+      - ${{ inputs.runner_label }}
+      - ${{ inputs.image_label }}
+    timeout-minutes: 10
+    # Belt and braces with the action's degrade-to-empty: telemetry never reddens a run.
+    continue-on-error: true
+    steps:
+      # Action, script and library together, so the action finds them in $GITHUB_WORKSPACE.
+      # At THIS ref, like every other job -- one definition of the id formula per commit.
+      - name: Checkout the identity action, script and library
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ inputs.ref || github.event.pull_request.head.sha || github.sha }}
+          repository: ${{ inputs.repository || github.event.pull_request.head.repo.full_name || github.repository }}
+          sparse-checkout: |
+            .github/actions/derive-gha-artifact-id
+            .github/scripts/derive_artifact_id.py
+            extensions/clickhouse-ingest
+          sparse-checkout-cone-mode: false
+
+      # Run-level facts only: a per-job `uv pip freeze` describes one cell, not the run.
+      # EMPTY on the prebaked path, deliberately -- that path tests the image UNCHANGED, so
+      # its artifact IS the image and a derived id would invent one that never existed.
+      - name: Describe what this leg installs on top of the image
+        id: delta
+        env:
+          PREBAKED: ${{ inputs.prebaked_image }}
+          HEAD_SHA: ${{ inputs.ref || github.event.pull_request.head.sha || github.sha }}
+          RPM_NAMES: ${{ inputs.rpm_names }}
+          TS_WHEEL: ${{ inputs.torch_spyre_wheel_artifact_name }}
+          PT_WHEEL: ${{ inputs.pytorch_wheel_artifact_name }}
+        run: |
+          set -euo pipefail
+          TOKENS=""
+          if [ "${PREBAKED}" = "true" ]; then
+            echo "prebaked image: tested unchanged, so its own id is this leg's id."
+          else
+            # The sha, not the wheel filename -- that version does not move per commit.
+            TOKENS="torch-spyre@${HEAD_SHA:0:12}"
+            if [ -n "${RPM_NAMES}" ]; then
+              TOKENS="${TOKENS} ${RPM_NAMES}"
+            fi
+            if [ -n "${TS_WHEEL}" ]; then
+              TOKENS="${TOKENS} torch-spyre-wheel@${TS_WHEEL}"
+            fi
+            if [ -n "${PT_WHEEL}" ]; then
+              TOKENS="${TOKENS} pytorch-wheel@${PT_WHEEL}"
+            fi
+            echo "installed on top: ${TOKENS}"
+          fi
+          echo "installed=${TOKENS}" >> "$GITHUB_OUTPUT"
+
+      - name: Derive and upload the artifact identity
+        id: derive
+        uses: ./.github/actions/derive-gha-artifact-id
+        with:
+          component: ${{ inputs.component }}
+          arch: x86_64
+          installed: ${{ steps.delta.outputs.installed }}
 
   # ---------------------------------------------------------------------------
   # Job 0b: build torch-spyre ONCE
@@ -601,7 +795,11 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.event.pull_request.head.sha || github.sha }}
           repository: ${{ inputs.repository || github.event.pull_request.head.repo.full_name || github.repository }}
-          sparse-checkout: .github
+          # extensions/ too: the ingest action installs the library from this checkout,
+          # and .github alone yields the script without it.
+          sparse-checkout: |
+            .github
+            extensions/clickhouse-ingest
           sparse-checkout-cone-mode: false
 
       - if: ${{ !inputs.prebaked_image }}
@@ -636,6 +834,7 @@ jobs:
           artifact_name: ${{ inputs.pytorch_wheel_artifact_name }}
 
       - name: Run perf benchmark (make tests TEST_TYPE=perf)
+        id: run-perf
         run: |
           # Prebaked: run FROM the baked source dir + its SHARED venv at
           # $HOME/.venv; normal: the checkout ('torch-spyre') + local '.venv'.
@@ -662,6 +861,7 @@ jobs:
       # The benchmark reports are not uploaded as workflow artifacts; the
       # results are consumed only by the ClickHouse ingest path.
       - name: Confirm perf report was produced
+        id: confirm-report
         run: |
           # Fail if the benchmark did not write its report. Do not echo the
           # report contents to the build log.
@@ -676,8 +876,10 @@ jobs:
       # matrix suites use. The composite action is the SAME ingest
       # implementation that workflow reuses, so there is one code path, not two.
       # Gated on CLICKHOUSE_HOST: a caller that passes no ClickHouse secrets
-      # skips the push and the perf run still succeeds.
+      # skips the push and the perf run still succeeds. Nightly has secrets, so
+      # --trigger-type perf + 0 parsed records fails the ingest step.
       - name: Ingest perf report into ClickHouse (inline, no artifact)
+        id: ingest
         if: ${{ env.CLICKHOUSE_HOST != '' }}
         uses: ./.github/actions/ingest-xml-to-clickhouse
         with:
@@ -686,6 +888,10 @@ jobs:
           branch: ${{ inputs.ref || github.event.pull_request.head.sha || github.ref_name }}
           sha: ${{ inputs.ref || github.event.pull_request.head.sha || github.sha }}
           gha-run-id: ${{ github.run_id }}
+          component: ${{ inputs.component || 'torch-spyre' }}
+          # The orchestrator's uuid when this run was Jenkins-dispatched; empty otherwise,
+          # and the ingest then falls back to hashing its own run coordinate.
+          run-id: ${{ inputs.run_id }}
           triggered-at: ''
           # perf never runs on pull_request (see the job `if:` above), so there
           # is no PR to associate; leave empty.
@@ -693,12 +899,215 @@ jobs:
           trigger-type: perf
           # perf runs on x86 GitHub-hosted runners, so the rows are x86_64.
           platform: x86_64
-          torch-spyre-dir: ${{ inputs.prebaked_image && env.PREBAKED_TORCH_SPYRE_DIR || 'torch-spyre' }}
+          # Workspace sparse-checkout of this ref's .github — not the baked
+          # tree. The benchmark still runs from PREBAKED_TORCH_SPYRE_DIR.
+          torch-spyre-dir: ${{ github.workspace }}
           clickhouse-host: ${{ secrets.CLICKHOUSE_HOST }}
           clickhouse-port: ${{ secrets.CLICKHOUSE_PORT }}
           clickhouse-user: ${{ secrets.CLICKHOUSE_USER }}
           clickhouse-pass: ${{ secrets.CLICKHOUSE_PASS }}
           clickhouse-db: ${{ secrets.CLICKHOUSE_DB }}
+          # Without these two the v2 write is a no-op, so benchmark_runs stays empty and the
+          # benchmark path is unreachable -- the perf job is its only producer.
+          clickhouse-db-v2: ${{ secrets.CLICKHOUSE_DB_V2 }}
+          schema: both
+
+      # Four honesty lines. Echo only — never upload report.xml (public
+      # artifacts would leak benchmark numbers).
+      - name: Perf ingest banners
+        if: always()
+        env:
+          EXEC_OUTCOME: ${{ steps.run-perf.outcome }}
+          REPORT_OUTCOME: ${{ steps.confirm-report.outcome }}
+          INGEST_OUTCOME: ${{ steps.ingest.outcome }}
+        run: |
+          if [ "${EXEC_OUTCOME}" = "success" ]; then
+            EXEC=PASS
+          else
+            EXEC=FAIL
+          fi
+          if [ "${REPORT_OUTCOME}" = "success" ]; then
+            VALIDATION=PASS
+          else
+            VALIDATION=FAIL
+          fi
+          if [ "${INGEST_OUTCOME}" = "success" ]; then
+            INGEST=SUCCESS
+          elif [ "${INGEST_OUTCOME}" = "failure" ]; then
+            INGEST=FAILED
+          else
+            INGEST=SKIPPED
+          fi
+          if [ "${REPORT_OUTCOME}" != "success" ]; then
+            REASON="required result file missing/empty"
+          elif [ "${INGEST_OUTCOME}" = "failure" ]; then
+            REASON="ingest failed"
+          elif [ "${INGEST_OUTCOME}" = "skipped" ] || [ -z "${INGEST_OUTCOME}" ]; then
+            REASON="ingest not reached"
+          else
+            REASON="ok"
+          fi
+          echo "benchmark execution: ${EXEC}"
+          echo "report validation: ${VALIDATION}"
+          echo "ClickHouse ingest: ${INGEST}"
+          echo "reason: ${REASON}"
+
+  # ---------------------------------------------------------------------------
+  # Job 1c: model-ops capability suites  (test_type=capability only)
+  #
+  # Which torch operations a model exercises, and whether each runs on Spyre or
+  # falls back to the CPU. Like perf, these suites carry no
+  # test_suite_config.labels, so generate_matrix emits an empty matrix and pins
+  # resolved_test_type=capability to reach this job instead. Unlike perf this IS
+  # a matrix -- one job per model config -- so the suite list lives here.
+  #
+  # Folded in from the standalone model_ops_tests_nightly.yaml, which ran its own
+  # cron at the SAME 0 2 * * * as tests-nightly and duplicated the wheel build.
+  # Running under _test_matrix means one nightly, one wheel, and a run_id that is
+  # threaded rather than minted -- which is what lets these results join
+  # artifact_results instead of orphaning.
+  #
+  # POLICY: never on a per-PR trigger. Ten model suites each holding a card
+  # runner is a nightly cost, and the guard below is the hard stop even if a
+  # pull_request path forwarded test_type=capability.
+  # ---------------------------------------------------------------------------
+  model_ops:
+    # The " Spyre" suffix is REQUIRED, not decoration: parse_model_ops_logs.py derives
+    # suite_name from the downloaded log's filename, which is the job name, and skips any
+    # file whose name lacks a \bSpyre\b token. The standalone workflow's jobs were bare
+    # ("GPT OSS 20B"), so every log was skipped and nothing has been ingested since
+    # 2026-09-10 -- 10 days of silent zero-row runs. Renaming a job here is what un-breaks
+    # it; the stored suite_names ("GPT OSS 20B Spyre") show this is the shape the parser
+    # always expected.
+    name: ${{ matrix.suite.name }} Spyre
+    needs: [generate_matrix, build_torch_spyre]
+    if: >-
+      !cancelled() &&
+      github.event_name != 'pull_request' &&
+      needs.generate_matrix.outputs.resolved_test_type == 'capability' &&
+      (needs.build_torch_spyre.result == 'success' ||
+       needs.build_torch_spyre.result == 'skipped')
+    runs-on:
+      - x86_64
+      - spyre_pf_x1
+      - ${{ inputs.runner_label }}
+      - ${{ inputs.image_label }}
+    timeout-minutes: 60
+    env:
+      # GitHub Actions sets CI=true, which makes the pytest inductor tests fail on
+      # a mix of fallbacks and decompositions. Blanked, as the other suites do.
+      CI: ''
+    strategy:
+      fail-fast: false   # one model's failure must not hide the other nine
+      # -----------------------------------------------------------------------
+      # To add a suite: append an entry here.
+      #   - name: <label shown in the GHA UI>
+      #     config: <filename inside tests/configs/model_ops_tests/>
+      # The JUnit report is named after the config (granite-4.1-8b.yaml ->
+      # granite-4.1-8b.xml).
+      # -----------------------------------------------------------------------
+      matrix:
+        suite:
+          - name: GPT OSS 20B
+            config: gpt-oss-20b.yaml
+          - name: Granite 3.3 8B Instruct FMS
+            config: granite-3.3-8b-instruct-fms.yaml
+          - name: Granite 3.3 8B Instruct
+            config: granite-3.3-8b-instruct.yaml
+          - name: Granite 4.1 8B
+            config: granite-4.1-8b.yaml
+          - name: Meta Llama 3.1 8B Instruct
+            config: Meta-Llama-3.1-8B-Instruct.yaml
+          - name: Ministral 3 14B Instruct 2512
+            config: Ministral-3-14B-Instruct-2512.yaml
+          - name: Mistral Small 3.2 24B Instruct 2506
+            config: Mistral-Small-3.2-24B-Instruct-2506.yaml
+          - name: Gemma 4 26B A4B IT
+            config: gemma-4-26B-A4B-it.yaml
+          - name: Gemma 4 12B Instruct
+            config: gemma-4-12B-it.yaml
+          # "7B" kept: suite_name is derived from the job name, and prod's 3,096 rows for this
+          # config are all under 'Qwen 2.5 7B Spyre'. Dropping it would fork the series.
+          - name: Qwen 2.5 7B
+            config: Qwen2.5-7B-Instruct.yaml
+    steps:
+      # Same reasoning as the perf job: the action DEFINITIONS must be in the
+      # workspace even in prebaked mode, so .github is always checked out fresh.
+      - name: Checkout composite actions
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ inputs.ref || github.event.pull_request.head.sha || github.sha }}
+          repository: ${{ inputs.repository || github.event.pull_request.head.repo.full_name || github.repository }}
+          sparse-checkout: .github
+          sparse-checkout-cone-mode: false
+
+      - if: ${{ !inputs.prebaked_image }}
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          path: torch-spyre
+          ref: ${{ inputs.ref || github.event.pull_request.head.sha || github.sha }}
+          repository: ${{ inputs.repository || github.event.pull_request.head.repo.full_name || github.repository }}
+
+      - if: ${{ inputs.checkout_pytorch }}
+        uses: ./.github/actions/checkout-pytorch
+
+      - uses: ./.github/actions/gather-runner-info
+        with:
+          verbose: 'true'
+          torch_spyre_dir: ${{ inputs.prebaked_image && env.PREBAKED_TORCH_SPYRE_DIR || 'torch-spyre' }}
+
+      - name: Install prebuilt torch-spyre
+        if: >-
+          ${{ !inputs.prebaked_image &&
+          (needs.build_torch_spyre.result == 'success' || inputs.torch_spyre_wheel_artifact_name != '') }}
+        uses: ./.github/actions/install-prebuilt-torch-spyre
+        with:
+          artifact_name: ${{ inputs.torch_spyre_wheel_artifact_name || 'torch-spyre-wheel' }}
+
+      - name: Derive report paths
+        run: |
+          REPORT_NAME="${{ matrix.suite.config }}"; REPORT_NAME="${REPORT_NAME%.yaml}.xml"
+          echo "REPORT_NAME=${REPORT_NAME}" >> "$GITHUB_ENV"
+          echo "REPORT_PATH=${GITHUB_WORKSPACE}/${REPORT_NAME}" >> "$GITHUB_ENV"
+
+      - name: Run ${{ matrix.suite.name }} model ops test suite
+        uses: ./.github/actions/run-test-suite
+        with:
+          suite_name: ${{ matrix.suite.name }}
+          config: tests/configs/model_ops_tests/${{ matrix.suite.config }}
+          extra_test_flags: -v
+          junit_xml_path: ${{ env.REPORT_PATH }}
+          report_name: ${{ env.REPORT_NAME }}
+          pre_run: |
+            # Clear the cached AIU setup guard and stale topo.json before every
+            # attempt, so a card left bad by a killed attempt is re-discovered
+            # rather than carrying stale state into the retry.
+            unset _IBM_AIU_SETUP
+            rm -rf /tmp/etc/ibm/spyre/topo.json
+            source /etc/profile.d/ibm-aiu-setup.sh
+
+      # Uploaded even on failure -- a failed run is when the report matters most.
+      # The artifact name is the report filename so ten matrix jobs do not
+      # overwrite one another.
+      - name: Upload JUnit XML report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ env.REPORT_NAME }}
+          path: ${{ env.REPORT_PATH }}
+          if-no-files-found: warn   # warn, not fail, if pytest itself crashed
+          retention-days: 10
+
+      - name: Annotate job with suite metadata
+        if: always()
+        run: |
+          {
+            echo "### Model-ops suite: ${{ matrix.suite.name }}"
+            echo "| Key | Value |"
+            echo "|---|---|"
+            echo "| Config | \`${{ matrix.suite.config }}\` |"
+            echo "| Report | \`${{ env.REPORT_NAME }}\` |"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
 
   # ---------------------------------------------------------------------------
   # Job 2: Multi-Spyre test matrix

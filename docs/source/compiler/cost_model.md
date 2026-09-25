@@ -281,6 +281,22 @@ once rather than once each, and the turnaround and overlap terms are taken over 
 totals. Per-operation prices do not sum to the kernel price, which is why the per-operation
 column is an attribution.
 
+A matmul input can be loaded separately by each consumer core or loaded once and shared.
+The extractor records the consumer count as `replication` and shared loads as `broadcast`.
+For separate loads, an M split repeats the right-hand input and an N split repeats the
+left-hand input. The HBM bytes scale by the consumer count, and those reads use the measured
+per-core rate (`mm_replicated_read_gbps_per_core`, about 2.3 GB/s).
+For a shared load, count the physical HBM bytes once, then charge extra delivery time using
+the existing estimate for the number of consumers. Do not turn that delivery into extra
+HBM bytes. The feature rule treats a single batch or an input with a broadcast tag as shared;
+it is not the standalone work chooser's dependency-based test.
+
+Keeping an input in LX removes these HBM reads; a graph input still needs its one copy into LX.
+Both matmul models use this input accounting. The bundled model keeps a separate estimate
+for rereading inputs when large output tiles are split across many cores. That fitted term
+has not been recalibrated together with shared-input delivery; their combined accuracy is
+not established for all shapes. Pointwise broadcast inputs retain their existing one-load rule.
+
 `spyre_fuse_nodes` fuses everything it can — contiguous Spyre nodes accumulate in order, and
 only a node that is not on the device starts a new bundle. No size limit, no cost heuristic,
 no reordering. The pass applies that same rule, with two differences:

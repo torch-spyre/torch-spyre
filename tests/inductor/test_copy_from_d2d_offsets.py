@@ -39,15 +39,19 @@ surfaces this rejection early with an actionable message; see
 test_unaligned_offset_raises{,_select} and
 test_stick_multiple_offset_unaligned_inner_dim_ok.
 
-The one remaining silent-wrong-data case is an offset that falls INSIDE the
-stick dim (a column narrow) — see test_column_slice_inner_offset, a documented
-known limitation tracked for the follow-up PR.
+An offset that falls INSIDE the stick dim (a column narrow at a stick-aligned
+offset) used to be a silent-wrong-data case: the copy reads the source as a
+flat [sticks, 64] layout whose stick-tile coordinate is a strided term with a
+residual offset (2*c0 + 1), and tensor alignment inflated that dim and
+dropped the offset (issue #4050). It is covered by
+test_column_slice_inner_offset and now passes.
 
 The transpose / permute / strided cases below deliberately exercise
 NON-contiguous views (see TestCopyFromD2DStridedViews). permute / select at
-stick-aligned offsets are carried by the offset fix; transpose / stepped-slice
-fail in the restickify layout pass (a pre-existing backend limitation, not a
-regression from this fix).
+stick-aligned offsets are carried by the offset fix; a stepped slice is the
+same strided-coordinate shape as the column narrow above and passes since
+issue #4050; transpose still fails in the restickify layout pass (a
+pre-existing backend limitation, not a regression from this fix).
 """
 
 import unittest
@@ -99,20 +103,17 @@ class TestCopyFromD2DContiguousOffsets(unittest.TestCase):
         torch.testing.assert_close(out[1:2], torch.full((1, 64), -1.0, dtype=DTYPE))
         torch.testing.assert_close(out[3:4], torch.full((1, 64), -1.0, dtype=DTYPE))
 
-    @unittest.expectedFailure
     def test_column_slice_inner_offset(self):
         """Offset along the last (stick) dim: narrow columns at an offset.
 
-        KNOWN LIMITATION — the SOLE remaining silent-wrong-data case. Here the
-        offset (64) IS a stick multiple, so _validate_reoffset_supported accepts
-        it, but it falls inside the stick DIMENSION: superdsc decomposes per-dim
-        offsets against device_size and does not split a stick-dim offset
-        correctly, so the read is off by the stick-dim component (measured WRONG
-        in sweep_d2d_offsets.py: got 0.0, expected 64.0). The offset%eps guard
-        cannot catch this (the offset is aligned); detecting it needs the
-        base-storage layout, which is unavailable at lowering. Tracked for the
-        follow-up PR (stick-dim offset handling), distinct from the row-offset
-        bug fixed here."""
+        The offset (64) IS a stick multiple, so _validate_reoffset_supported
+        accepts it, but it falls inside the stick DIMENSION. The copy reads the
+        source as a flat [4 sticks, 64] layout whose stick-tile coordinate is
+        ``2*c0 + 1``: a strided term with a residual offset. Tensor alignment
+        used to count that dim in device units and then add a gap dim (16
+        sticks for 4) and to drop the ``+1``, so the read landed on sticks 0
+        and 2 (measured in sweep_d2d_offsets.py: got 0.0, expected 64.0).
+        Fixed with issue #4050 in normalize_coordinates."""
         x = torch.arange(2 * 128, dtype=DTYPE, device=DEVICE).reshape(2, 128)
         # columns [64:128) -> nonzero offset within a row
         out = x.narrow(1, 64, 64).clone()
@@ -175,8 +176,9 @@ class TestCopyFromD2DContiguousOffsets(unittest.TestCase):
 class TestCopyFromD2DStridedViews(unittest.TestCase):
     """Non-contiguous views: transpose / permute / step slices / select.
 
-    permute and select work (the offset fix carries them). transpose and
-    stepped-slice cases are marked expectedFailure: they fail in the Spyre
+    permute and select work (the offset fix carries them), and so does a
+    stepped slice since issue #4050 fixed strided stick-tile coordinates.
+    transpose cases are marked expectedFailure: they fail in the Spyre
     restickify layout pass ("no mechanism to resolve stick incompatibility" /
     "scatter elements from one stick to multiple sticks"), NOT in offset
     handling. Verified to fail identically on the pre-fix baseline (offset==0
@@ -217,9 +219,12 @@ class TestCopyFromD2DStridedViews(unittest.TestCase):
         out = x.select(0, 2).clone()  # row 2 as 1-D (64,), storage_offset=128
         torch.testing.assert_close(out.cpu(), x.cpu()[2])
 
-    @unittest.expectedFailure
     def test_stepped_slice_clone(self):
-        """Strided (step>1) slice — non-unit stride plus offset."""
+        """Strided (step>1) slice — non-unit stride plus offset.
+
+        Reads rows 1, 3, 5, 7 as stick-tile coordinate ``2*c0 + 1``; the
+        stride and the residual offset are realized as an inner gap dim
+        (issue #4050)."""
         x = torch.arange(8 * 64, dtype=DTYPE, device=DEVICE).reshape(8, 64)
         out = x[1::2].clone()  # rows 1,3,5,7 ; offset=64, stride[0]=128
         torch.testing.assert_close(out.cpu(), x.cpu()[1::2])

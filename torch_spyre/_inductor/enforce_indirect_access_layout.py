@@ -47,6 +47,7 @@ from .insert_restickify import (
     _create_restickify_node,
     _fixed_tiled,
     insert_restickify_on_node_inputs,
+    RestickifyArgInfo,
 )
 from .ir import FixedTiledLayout
 from .logging_utils import get_inductor_logger
@@ -61,6 +62,7 @@ from .pass_utils import (
     indirect_info_from_op,
     iteration_space_from_op,
     iteration_space_with_splits,
+    loop_var_ranges_from_dim_hints,
     padded_entry_output_stl,
 )
 from .views import AlignmentInputs, UnalignedStickSplit, align_tensors_pure
@@ -277,7 +279,14 @@ def _insert_relayout_copy(
     consumer_name = consumer_op.get_name()
     insert_restickify_on_node_inputs(
         consumer_op,
-        [{"arg_name": arg_name, "target_layout": required_layout}],
+        [
+            RestickifyArgInfo(
+                arg_name=arg_name,
+                dep_index=None,
+                occurrence=0,
+                target_layout=required_layout,
+            )
+        ],
         operations,
     )
     logger.info(
@@ -501,7 +510,7 @@ def _value_bufs_for_op(
             continue
         coords = [
             c.xreplace(access_subs)
-            for c in device_coordinates(layout.device_layout, dep, sizes)
+            for c in device_coordinates(layout.device_layout, dep, sizes, op=op)
         ]
         if any(hasattr(c, "has") and c.has(IndirectAccess) for c in coords):
             value_bufs.append(buf)
@@ -599,7 +608,13 @@ def _insert_mutation_relayout_copy(
 
     # Step 1: copy-in: target (current layout) -> buf_tmp (required_stl).
     _, buf_tmp = _create_restickify_node(
-        {"arg_name": target_name, "target_layout": buf_tmp_layout}, mutation_op
+        RestickifyArgInfo(
+            arg_name=target_name,
+            dep_index=None,
+            occurrence=0,
+            target_layout=buf_tmp_layout,
+        ),
+        mutation_op,
     )
     buf_tmp_name = buf_tmp.get_name()
     buf_tmp._input_layout_overrides = {target_name: orig_stl_layout}
@@ -626,7 +641,12 @@ def _insert_mutation_relayout_copy(
     # For scatter, use buf_tmp as metadata source to avoid inheriting index tensor dependency
     copyback_metadata_op = buf_tmp if is_scatter_op else mutation_op
     _, buf_copyback = _create_restickify_node(
-        {"arg_name": buf_tmp_name, "target_layout": buf_copyback_layout},
+        RestickifyArgInfo(
+            arg_name=buf_tmp_name,
+            dep_index=None,
+            occurrence=0,
+            target_layout=buf_copyback_layout,
+        ),
         copyback_metadata_op,
     )
     buf_copyback.layout = MutationLayoutSHOULDREMOVE(target_buf)
@@ -731,8 +751,21 @@ def _enforce_scatter_destination_layout(
 
     # Check scatter destination compliance: scatter index dimensions must be outermost.
     # Detect scatter index symbols (non-loop symbols in write_dep.index).
+    #
+    # A WhileLoop-splice per-iteration loop_var (e.g. u0, see
+    # wsr/for_each_tile_lowering.py's _synthesize_dim_hints_for_group) is
+    # deliberately folded into write_dep.index without ever being a
+    # write_dep.ranges key -- see pass_utils.py's
+    # loop_var_ranges_from_dim_hints -- so it looks exactly like a scatter
+    # index symbol by this "not a loop range key" test alone. Excluding it
+    # explicitly matches _build_indirect_store_subs's identical exclusion
+    # for the read-side version of this same inference; without it, a
+    # scatter nested inside a spliced WhileLoop body would misclassify its
+    # own tile-advancing loop_var as a scatter index and corrupt the
+    # dim-order compliance check below.
     all_write_syms = write_dep.index.free_symbols
     loop_syms = set(write_dep.ranges.keys())
+    loop_syms |= set(loop_var_ranges_from_dim_hints(scatter_op))
     scatter_syms = all_write_syms - loop_syms
 
     if not scatter_syms:

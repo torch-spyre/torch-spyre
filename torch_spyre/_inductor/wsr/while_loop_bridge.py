@@ -20,19 +20,62 @@ Deliberately knows nothing about for_each_tile's own frontend contract
 wsr/for_each_tile_lowering.py, which is this module's only caller. Anything
 here should stay reusable by a future, differently-shaped while_loop
 producer.
+
+Overall algorithm: ``splice_while_loop`` replaces a WhileLoop op with its
+body subgraph's own ops spliced directly into the outer graph -- the loop
+structure itself is discarded, with iteration folded into DimHints/levels by
+the caller (wsr/for_each_tile_lowering.py). Splicing this single body copy
+in once means every carry (one per position in ``while_op.carried_inputs``,
+see ``CarryBinding``) needs its reads and writes rewired so this one copy
+behaves like every trip at once. Three carry shapes exist, each rewired
+differently:
+
+  pass-through  the body never rewrites this carry (body_output IS the
+                placeholder object). Its read is aliased straight to the
+                real ``while_op.carried_inputs[i]`` object; nothing else is
+                needed.
+  accumulator   the body computes a new value each iteration, in place,
+                read once at the end. Rewired via fill/rewrite/drain:
+
+                  fill    the carry's own real initial buffer's pre-loop
+                          producer seeds it
+                  rewrite the single spliced copy of the body op that wrote
+                          this carry is redirected (via
+                          ``_rewire_accumulator_output``) to read and write
+                          that same real initial buffer in place, standing
+                          in for every trip
+                  drain   the buffer itself IS the final value after the
+                          last trip, so outside consumers read it directly
+
+  stacking      each iteration writes a DIFFERENT SLICE of one larger
+                result (e.g. ``scan``'s ``ys``). There is no intermediate
+                per-iteration state to thread, so no scratch buffer is
+                needed at all -- instead the destination buffer's own
+                layout is folded from ``[trip_count, *tile]`` to the flat
+                result shape via ``fold_stacked_carry_layout``, and the
+                per-iteration write becomes an ordinary tile-advancing
+                write into it.
+
+See ``CarryBinding``'s own docstring for the accumulator/stacking split in
+more detail, and ``splice_while_loop``'s docstring for how reads (two
+distinct shapes: name-based ``ops.load`` calls vs. direct object references
+held in ``.inputs``) and writes are actually redirected.
 """
 
 from __future__ import annotations
 
 import dataclasses
-import logging
 from typing import TYPE_CHECKING, Any
+
+from ..errors import Unsupported
+from ..logging_utils import get_inductor_logger
+from ..loop_info import LoopCarryRecord
 
 if TYPE_CHECKING:
     from torch._inductor import ir
     from torch._inductor.graph import GraphLowering
 
-logger = logging.getLogger(__name__)
+logger = get_inductor_logger("wsr.while_loop_bridge")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -113,6 +156,43 @@ def carry_bindings_for(
     ]
 
 
+def _body_fx_carry_is_passthrough(while_op: "ir.WhileLoop", carry_index: int) -> bool:
+    """Return whether the original body returns this carry placeholder unchanged.
+
+    ``WhileLoop.create`` applies ``require_exact_strides`` to every lowered IR
+    body output after tracing the body FX graph.  For a scan ``xs`` carry that
+    is semantically pass-through, that stride repair can introduce a copy and
+    make the IR output's buffer name differ from the placeholder name.  The FX
+    graph still retains the semantic identity: output ``i`` is placeholder
+    ``i``.  Consult it so the copy is not mistaken for an accumulator update
+    and rewritten in place onto a differently-ranked input view.
+    """
+    from torch.utils._pytree import tree_leaves
+
+    body_graph = getattr(getattr(while_op, "body_subgraph", None), "graph", None)
+    module = getattr(body_graph, "module", None)
+    fx_graph = getattr(module, "graph", None)
+    if fx_graph is None:
+        logger.debug(
+            "cannot inspect FX pass-through identity for carry %d: "
+            "body_subgraph.graph.module.graph is unavailable",
+            carry_index,
+        )
+        return False
+
+    placeholders = [node for node in fx_graph.nodes if node.op == "placeholder"]
+    output = next((node for node in fx_graph.nodes if node.op == "output"), None)
+    if output is None or not output.args:
+        return False
+
+    outputs = tree_leaves(output.args[0])
+    return (
+        carry_index < len(placeholders)
+        and carry_index < len(outputs)
+        and outputs[carry_index] is placeholders[carry_index]
+    )
+
+
 def fold_stacked_carry_layout(node: Any, trip_count: Any) -> bool:
     """Collapse a stacking carry's buffer from [trip, *tile] to the folded shape.
 
@@ -171,14 +251,24 @@ def fold_stacked_carry_layout(node: Any, trip_count: Any) -> bool:
     # The stacked axis must be the leading one, with exactly the trip count
     # as its extent, and the fold must be a pure reshape: axis 0's stride has
     # to be exactly axis 1's extent times axis 1's stride, or the merged axis
-    # cannot be described by a single stride.
+    # cannot be described by a single stride. Skip that check when axis 1
+    # has extent 1: a size-1 axis never advances, so its stride is moot for
+    # addressing purposes and Spyre's own device-layout assignment leaves it
+    # as a degenerate 0 rather than the "natural" contiguous value -- e.g. a
+    # tile_size=1 inner for_each_tile's stacking carry folds [trip, 1, *rest]
+    # with stride=[row_stride, 0, ...], which is still a pure reshape (the
+    # merged axis's extent is trip_count * 1 == trip_count) even though
+    # stride[0] != size[1] * stride[1] literally (row_stride != 1 * 0).
     if sympy.simplify(sympy.sympify(size[0]) - sympy.sympify(trip_count)) != 0:
         return False
-    if sympy.simplify(stride[0] - size[1] * stride[1]) != 0:
+    if size[1] != 1 and sympy.simplify(stride[0] - size[1] * stride[1]) != 0:
         return False
 
     new_size = [size[0] * size[1], *size[2:]]
-    new_stride = [stride[1], *stride[2:]]
+    # When axis 1 has extent 1, stride[1] is the degenerate placeholder (see
+    # above) rather than the real per-step stride -- the merged axis must
+    # step by stride[0] (how far one trip moves) instead.
+    new_stride = [stride[0] if size[1] == 1 else stride[1], *stride[2:]]
     node.layout = FixedLayout(
         layout.device, layout.dtype, new_size, new_stride, layout.offset
     )
@@ -219,10 +309,7 @@ def _transplant_buffer_registrations(
     does not delegate lookups to its .parent, so leaving this unpatched
     means every downstream V.graph.get_buffer(name)/get_operation(name) call
     against the spliced ops (e.g. coarse_tile.py's read-copy planning) fails
-    with "Failed to find buffer/operation matching name ...", confirmed
-    empirically: splicing alone (without this) raises exactly that
-    RuntimeError from _full_buffer_read_deps the first time
-    coarse_tile_pre_stickify inspects a spliced op's reads.
+    with "Failed to find buffer/operation matching name ...".
 
     Only copies the dict/list entries this bridge and its callers are known
     to read (name_to_buffer/buffers/name_to_op) -- not a general graph
@@ -248,8 +335,7 @@ def _substitute_direct_input_refs(
 
     Ops without an `inner_fn` (DynamicScalar, ExternKernelOut, ...) hold
     their reads as direct Python object references in `.inputs`, not as
-    named index-expression loads -- confirmed empirically for both
-    split_m_fn and split_k_fn: DynamicScalar.inputs[0] is always the
+    named index-expression loads: DynamicScalar.inputs[0] is always the
     body's own iteration-carry placeholder object, and ExternKernelOut's
     per-tile operand input is either the placeholder object itself or a
     frozen ReinterpretView/mutable StorageBox wrapping it. Renaming a dict
@@ -260,17 +346,15 @@ def _substitute_direct_input_refs(
     ComputedBuffer with a MutationLayoutSHOULDREMOVE layout holds its
     mutation target as a direct object reference on `op.layout.target`
     (set once in Layout.__init__ and never renamed) -- not in `.inputs`,
-    not a named ops.load. Confirmed via test_map_mode_split_m
-    (issue #3965): a body-internal constant_pad_nd/copy pair targets the
-    body's own per-tile-invariant operand placeholder
-    (while_loop_body_graph_0_0_arg1_1, Y's map-mode carry), which after
-    splicing is never registered in the outer graph's buffer namespace --
-    V.graph.get_buffer(target_name) in propagate_layouts.py's mutation-op
-    handling then raises "Failed to find buffer matching name ...". Patch
-    op.layout.target in place the same way as an `.inputs` entry (one level
-    of StorageBox unwrapping included) so it resolves to the real
-    outer-graph object splice_while_loop already computed, exactly as
-    `.inputs` entries do.
+    not a named ops.load. E.g. a body-internal constant_pad_nd/copy pair
+    can target the body's own per-tile-invariant operand placeholder (a
+    map-mode carry), which after splicing is never registered in the outer
+    graph's buffer namespace -- V.graph.get_buffer(target_name) in
+    propagate_layouts.py's mutation-op handling then raises "Failed to find
+    buffer matching name ...". Patch op.layout.target in place the same way
+    as an `.inputs` entry (one level of StorageBox unwrapping included) so
+    it resolves to the real outer-graph object splice_while_loop already
+    computed, exactly as `.inputs` entries do.
 
     ref_map maps a placeholder buffer's own name to the real object it
     should resolve to (a carry's scratch buffer, or the real outer-graph
@@ -281,6 +365,23 @@ def _substitute_direct_input_refs(
     frozen dataclass -- ReinterpretView.data is looked up dynamically by
     every consumer, so the wrapped StorageBox's identity does not need to
     change, only what it points at.
+
+    A fourth read shape exists for a NESTED for_each_tile: a nested
+    `ir.WhileLoop` op (the inner loop, still an ordinary entry of `body_ops`
+    until it is itself spliced on a later fixed-point pass) holds its own
+    reads as direct object references on `.carried_inputs`/
+    `.additional_inputs` -- separate list attributes from `.inputs`
+    (`WhileLoop.__init__` assigns `self.carried_inputs = carried_inputs`
+    directly, while `.inputs` is a distinct, repacked tensor-only list built
+    by `ExternKernel.__init__` via `_split_by_sym_type`). Patching `.inputs`
+    alone leaves `.carried_inputs`/`.additional_inputs` pointing at this
+    (outer) body's own placeholder objects, which are never registered in
+    the outer graph's buffer namespace once this splice completes -- so
+    `carry_bindings_for`/`splice_while_loop`, run against the inner loop on
+    the next fixed-point pass, would resolve a stale placeholder name and
+    crash downstream (`Failed to find buffer matching name ...`), same as
+    the `.inputs`/`.layout.target` shapes above. Patch both lists in place,
+    same substitution rule as `.inputs`.
 
     Whole-object substitution (rebinding a list slot or `.layout.target`
     directly to the resolved replacement) is only correct when the node
@@ -295,18 +396,15 @@ def _substitute_direct_input_refs(
     Substituting the whole `ReinterpretView` object away, as a naive
     `resolve(node) is not None` check would do, silently discards that
     slice/offset and hands consumers the placeholder's raw, untiled layout
-    instead -- confirmed empirically via test_map_mode_split_m: doing so
-    produces a MutationLayoutSHOULDREMOVE target whose real_layout() delivers
-    the untiled buffer's layout while the mutation op's own store still
-    computes indices against the tile's small `[2, 6]` iteration domain,
-    which resolves handles fine (real_layout()/stride still work -- the
-    layout is well-formed) but is simply the wrong slice; the *actual*
-    crash this produces downstream is even more direct: some other
-    call reads `layout.target`'s stride expecting the tile's own FixedLayout
-    and instead unwraps all the way down to the InputBuffer, whose
-    FixedLayout's stride/size mismatches what `_fixed_indexer` was closed
-    over. So: only replace whole-node when the node has no distinguishing
-    layout of its own (a bare StorageBox/InputBuffer/TensorBox pass-through);
+    instead: a MutationLayoutSHOULDREMOVE target's real_layout() would then
+    deliver the untiled buffer's layout while the mutation op's own store
+    still computes indices against the tile's own small iteration domain --
+    a well-formed but wrong-slice layout, which surfaces downstream as a
+    stride/size mismatch wherever a consumer's `_fixed_indexer` was closed
+    over the tile's own FixedLayout but the unwrap chain now bottoms out at
+    the InputBuffer's untiled one instead. So: only replace whole-node when
+    the node has no distinguishing layout of its own (a bare
+    StorageBox/InputBuffer/TensorBox pass-through);
     for a ReinterpretView (or any node whose own `.data` is a StorageBox
     still pointing at the placeholder), unwrap one level and patch the
     inner StorageBox's `.data` in place instead, leaving the ReinterpretView
@@ -334,11 +432,11 @@ def _substitute_direct_input_refs(
             if inner_replacement is not None:
                 # inner_replacement resolves from ref_map, whose values are
                 # whatever object shape while_op.carried_inputs/inputs held
-                # (confirmed empirically: a TensorBox(StorageBox(...))
-                # MutableBox, same as any other real graph value) -- but
-                # StorageBox.data must hold the innermost real node (a
-                # Buffer/View/Loops), never another MutableBox, or
-                # consumers that expect exactly one level of box
+                # -- typically a TensorBox(StorageBox(...)) MutableBox, same
+                # as any other real graph value -- but StorageBox.data must
+                # hold the innermost real node (a Buffer/View/Loops), never
+                # another MutableBox, or consumers that expect exactly one
+                # level of box
                 # (unwrap_views's own MutableBox arm recurses fine, but
                 # make_indexer()/get_layout() chains built before this
                 # point were not written expecting a double-boxed shape).
@@ -361,6 +459,16 @@ def _substitute_direct_input_refs(
         if inputs:
             for i, inp in enumerate(inputs):
                 substitute(inp, lambda r, i=i: inputs.__setitem__(i, r))
+
+        if isinstance(op, ir.WhileLoop):
+            for attr in ("carried_inputs", "additional_inputs"):
+                nested_inputs = getattr(op, attr, None)
+                if not nested_inputs:
+                    continue
+                for i, inp in enumerate(nested_inputs):
+                    substitute(
+                        inp, lambda r, lst=nested_inputs, i=i: lst.__setitem__(i, r)
+                    )
 
         layout = getattr(op, "layout", None)
         if not isinstance(layout, ir.MutationLayoutSHOULDREMOVE):
@@ -406,10 +514,19 @@ def _extra_readers_of_placeholder(
     in body_ops's topological order and still read placeholder_name are
     real hazards.
 
-    Uses op.get_read_writes() rather than hand-parsing inner_fn/.inputs --
-    confirmed to correctly surface both read shapes (named ops.load calls
-    and DynamicScalar/ExternKernelOut's direct object-reference inputs)
-    uniformly for every op kind seen in every fixture so far.
+    Uses op.get_read_writes() rather than hand-parsing inner_fn/.inputs, so
+    both read shapes (named ops.load calls and DynamicScalar/
+    ExternKernelOut's direct object-reference inputs) surface uniformly
+    regardless of op kind.
+
+    get_read_writes() is not guaranteed to succeed for every Operation
+    subclass that can appear in a spliced while-loop body -- e.g.
+    ComputedBuffer's implementation traces inner_fn symbolically via
+    extract_read_writes(), which can raise for reasons that are hard to
+    enumerate exhaustively (unhandled ops, symbolic-shape edge cases). A
+    failure here means this function cannot determine whether op reads
+    placeholder_name, so treating it as "no read" would risk silently
+    missing a real write-after-read hazard. Raise instead of guessing.
     """
 
     def _matches_body_output(op: "ir.Operation") -> bool:
@@ -433,17 +550,147 @@ def _extra_readers_of_placeholder(
         op_name = getattr(op, "get_operation_name", lambda: None)()
         try:
             rw = op.get_read_writes()
-        except Exception as e:  # noqa: BLE001 -- best-effort; see docstring
-            logger.debug(
-                "_extra_readers_of_placeholder: get_read_writes() raised for %s: %s",
-                op_name,
-                e,
-            )
-            continue
+        except Exception as e:
+            raise Unsupported(
+                "_extra_readers_of_placeholder: get_read_writes() raised for"
+                f" {op_name}, so the write-after-read hazard check for"
+                f" placeholder {placeholder_name!r} cannot be completed: {e}"
+            ) from e
         read_names = {getattr(d, "name", None) for d in rw.reads}
         if placeholder_name in read_names:
             extra_readers.append(op)
     return extra_readers
+
+
+def _is_full_span_relayout(view_layout: Any, storage_layout: Any) -> bool:
+    """Zero-offset, same-rank view that addresses a whole dense backing once.
+
+    Requires, for BOTH the view and the backing storage: zero offset and
+    non-overlapping dense strides (torch's existing
+    ``_is_non_overlapping_and_dense_or_false`` -- no new stride logic), equal
+    element counts, and equal rank. Equal numel + a dense view alone is
+    insufficient: ``[2, 2]/[1, 1]`` overlaps, and a dense view over a holed
+    backing (``storage [2, 2]/[3, 1]``, ``view [2, 2]/[2, 1]``) would read
+    addresses the logical element copy never wrote. Under this proof a storage
+    copy costs exactly the view's own size (no amplification) and re-applying
+    the view preserves addressing. Symbolic or non-integer layout values are
+    unprovable; malformed layouts raise rather than hiding a compiler defect.
+    """
+    import sympy
+    from torch._prims_common import _is_non_overlapping_and_dense_or_false
+
+    def _concrete(vals):
+        """Python ints, or None for symbolic, non-integer or non-finite values."""
+        out = []
+        for v in vals:
+            e = sympy.sympify(v)
+            if e.free_symbols or e.is_integer is not True:
+                return None
+            out.append(int(e))
+        return out
+
+    if len(view_layout.size) != len(storage_layout.size):
+        return False
+    # Real Inductor layouts carry sympy.Integer; torch's density predicate
+    # runs its comparisons through guard_or_false, which asserts a Python
+    # bool and rejects sympy Boolean*. Concretize first.
+    for layout in (view_layout, storage_layout):
+        if _concrete([layout.offset]) != [0]:
+            return False
+        size = _concrete(layout.size)
+        stride = _concrete(layout.stride)
+        if size is None or stride is None:
+            return False
+        if not _is_non_overlapping_and_dense_or_false(size, stride):
+            return False
+    view_numel = _concrete([sympy.prod(view_layout.size)])
+    storage_numel = _concrete([sympy.prod(storage_layout.size)])
+    return view_numel is not None and view_numel == storage_numel
+
+
+def _copy_source_and_view(source: Any) -> "tuple[Any, Any]":
+    """Resolve what to copy and the view to re-apply over the copy.
+
+    Returns ``(storage, view_layout_or_None)``. A plain buffer copies itself.
+    A ``ReinterpretView`` passing ``_is_full_span_relayout`` copies its backing
+    storage and re-applies the view. Any other view is refused with a precise
+    ``Unsupported``: the previous "copy the view as-is" form builds an
+    origins-less non-identity op that ``propagate_layouts``' #4458 guard
+    rejects far downstream with a misleading message.
+    """
+    from torch._inductor import ir
+
+    target = source
+    while isinstance(target, (ir.MutableBox, ir.TensorBox, ir.StorageBox)):
+        target = target.data
+    if not isinstance(target, ir.ReinterpretView):
+        if isinstance(target, ir.BaseView):
+            # A lazy transform (PermuteView/SliceView) reports the BACKING
+            # layout from get_layout(), so treating it as a backing identity
+            # would silently drop the transform. Refuse precisely.
+            raise Unsupported(
+                "while_loop carry copy of a "
+                f"{type(target).__name__} is not supported; only a "
+                "ReinterpretView over a Buffer is"
+            )
+        return target, None
+
+    view_layout = target.get_layout()
+    storage = _storage_buffer(target)
+    if not isinstance(storage, ir.Buffer):
+        raise Unsupported(
+            "while_loop carry copy: ReinterpretView backing is a "
+            f"{type(storage).__name__}, not a Buffer"
+        )
+    if _is_full_span_relayout(view_layout, storage.layout):
+        return storage, view_layout
+    raise Unsupported(
+        "while_loop carry copy of a view needs a zero-offset, dense, "
+        "equal-numel, same-rank relayout of the backing storage; got view "
+        f"size={list(view_layout.size)} stride={list(view_layout.stride)} "
+        f"offset={view_layout.offset} over backing "
+        f"size={list(storage.layout.size)} stride={list(storage.layout.stride)}"
+    )
+
+
+def _make_copying_buffer(graph: "GraphLowering", source: Any, name: str) -> Any:
+    """Build and register an identity copy of the plain buffer ``source``.
+
+    Shared by the in-loop WAR snapshot and the pre-loop carry-ownership copy
+    (both resolve any view via ``_copy_source_and_view`` first); they differ
+    only in where the result is inserted. The copy has **empty origins**: it
+    has no FX producer, and ``compute_layouts`` dispatches on origins (a
+    borrowed origin would make it lay out as the source's producer). The #4458
+    identity-access branch accepts an origins-less identity copy by design.
+    """
+    from torch._inductor import ir
+    from torch._inductor.ir import ComputedBuffer, FixedLayout, Pointwise
+
+    layout = source.layout
+    buf_layout = FixedLayout(
+        layout.device,
+        layout.dtype,
+        list(layout.size),
+        list(layout.stride),
+    )
+    data = Pointwise(
+        device=layout.device,
+        dtype=layout.dtype,
+        inner_fn=source.make_loader(),
+        ranges=list(layout.size),
+    )
+    buf = ComputedBuffer(name=name, layout=buf_layout, data=data)
+    buf.operation_name = name
+    buf.origins = ir.OrderedSet()
+
+    # Built outside any SubgraphLowering context, so it never self-registered
+    # (see _transplant_buffer_registrations) -- register it directly on the
+    # outer graph so get_buffer/get_operation lookups succeed.
+    graph.name_to_op[name] = buf
+    graph.name_to_buffer[name] = buf
+    if buf not in graph.buffers:
+        graph.buffers.append(buf)
+    return buf
 
 
 def _snapshot_carry_placeholder(
@@ -478,45 +725,16 @@ def _snapshot_carry_placeholder(
     global name_map rewrite does for every other redirected read.
     """
     from torch._inductor import ir
-    from torch._inductor.ir import ComputedBuffer, FixedLayout, Pointwise
     from torch_spyre._inductor.pass_utils import redirect_computed_buffer_reads
 
-    target = real_input
-    while isinstance(target, ir.MutableBox):
-        target = target.data
-    target_layout = target.layout
-
+    storage, view_layout = _copy_source_and_view(real_input)
     snapshot_name = graph.qualify_name(f"while_loop_carry_snapshot_{placeholder_name}")
-    snapshot_layout = FixedLayout(
-        target_layout.device,
-        target_layout.dtype,
-        list(target_layout.size),
-        list(target_layout.stride),
+    snapshot_buf = _make_copying_buffer(graph, storage, snapshot_name)
+    snapshot_value = (
+        ir.ReinterpretView(data=ir.StorageBox(snapshot_buf), layout=view_layout)
+        if view_layout is not None
+        else snapshot_buf
     )
-    snapshot_data = Pointwise(
-        device=target_layout.device,
-        dtype=target_layout.dtype,
-        inner_fn=target.make_loader(),
-        ranges=list(target_layout.size),
-    )
-    snapshot_buf = ComputedBuffer(
-        name=snapshot_name,
-        layout=snapshot_layout,
-        data=snapshot_data,
-    )
-    snapshot_buf.operation_name = snapshot_name
-    snapshot_buf.origins = getattr(target, "origins", None) or ir.OrderedSet()
-
-    # snapshot_buf is constructed here, not under the inner body subgraph's
-    # SubgraphLowering context, so it never self-registered anywhere (see
-    # _transplant_buffer_registrations's docstring on why ordinary spliced
-    # ops need that transplant at all) -- register it directly into the
-    # outer graph so later get_buffer(snapshot_name)/get_operation(...)
-    # lookups (e.g. coarse_tile.py's read-copy planning) succeed.
-    graph.name_to_op[snapshot_name] = snapshot_buf
-    graph.name_to_buffer[snapshot_name] = snapshot_buf
-    if snapshot_buf not in graph.buffers:
-        graph.buffers.append(snapshot_buf)
 
     # The producer isn't always a ComputedBuffer -- e.g. online-softmax's
     # `p @ v_tile` term makes it a FallbackKernel/MultiOutput pair, with the
@@ -550,9 +768,173 @@ def _snapshot_carry_placeholder(
                 reason="preserve a WAR-hazardous carry's pre-iteration value",
             )
         else:
-            _substitute_direct_input_refs([reader], {placeholder_name: snapshot_buf})
+            _substitute_direct_input_refs([reader], {placeholder_name: snapshot_value})
 
     return body_ops
+
+
+def _carry_real_input_is_private(
+    graph: "GraphLowering",
+    while_op: "ir.WhileLoop",
+    real_input: Any,
+    carry_index: int,
+) -> bool:
+    """Whether an accumulator may write its carry's initial STORAGE in place.
+
+    Ownership is judged on the underlying storage, not the wrapper: the write
+    side already names that storage (``_rewire_accumulator_output`` uses
+    ``MutationLayoutSHOULDREMOVE(target).get_buffer()``), and a caller's
+    permuted view of compiler scratch must stay zero-copy. ``_storage_buffer``
+    is the side-effect-free twin of that unwrap (constructing a
+    ``MutationLayoutSHOULDREMOVE`` here would call ``mark_buffer_mutated``).
+
+    Guard is **positively** owned: the storage must be a compiler-created
+    ``ComputedBuffer``, not a graph input or output, not in
+    ``graph.never_reuse_buffers``, not alias another buffer, and have no other
+    parent-graph reader. This loop may use the storage only through this
+    carry's own slot -- another carried slot or an ``additional_inputs`` entry
+    on the same storage makes it not private. Any reader whose
+    ``get_read_writes`` cannot be read is treated as **unknown -> not private**.
+    Anything not positively proven private returns False (caller copies).
+    """
+    from torch._inductor import ir
+
+    storage = _storage_buffer(real_input)
+    if not isinstance(storage, ir.ComputedBuffer):
+        return False
+    name = storage.get_name()
+
+    if name in graph.graph_inputs:
+        return False
+    if name in set(graph.get_output_names()):
+        return False
+    if name in graph.never_reuse_buffers:
+        return False
+
+    try:
+        if storage.get_inputs_that_alias_output() or storage.get_mutation_names():
+            return False
+    except NotImplementedError:
+        return False  # alias status unknown -> copy
+
+    # This loop may touch the storage only through this carry's own slot.
+    for i, x in enumerate(getattr(while_op, "carried_inputs", None) or []):
+        if i != carry_index and _storage_name(x) == name:
+            return False
+    for x in getattr(while_op, "additional_inputs", None) or []:
+        if _storage_name(x) == name:
+            return False
+
+    # Graph outputs that alias this storage (directly or through a view) must
+    # not be mutated in place.
+    for out in getattr(graph, "graph_outputs", None) or []:
+        if _storage_name(out) == name:
+            return False
+
+    for op in graph.operations:
+        if op is while_op:
+            continue  # this loop's own slots were checked just above
+        reads = _operation_reads_buffer(op, name)
+        if reads is None or reads:  # unknown -> conservatively not private
+            return False
+    return True
+
+
+def _storage_buffer(x: Any) -> Any:
+    """Underlying Buffer under any view/box wrapper.
+
+    Mirrors Inductor's own ``MutationLayoutSHOULDREMOVE.get_buffer`` unwrap:
+    ``BaseView`` goes through ``unwrap_view()``, the boxes through ``.data``.
+    Each step unwraps to a strictly lower wrapper, so the loop terminates at a
+    ``Buffer`` with no fixed depth limit.
+    """
+    from torch._inductor import ir
+
+    while True:
+        if isinstance(x, ir.MutableBox):
+            x = x.data
+        elif isinstance(x, ir.BaseView):
+            x = x.unwrap_view()
+        elif isinstance(x, ir.TensorBox):
+            x = x.data
+        elif isinstance(x, ir.StorageBox):
+            x = x.data
+        else:
+            break
+    return x
+
+
+def _storage_name(x: Any) -> "str | None":
+    """Buffer name under any view/box wrapper, or None for a non-Buffer.
+
+    ``ShapeAsConstantBuffer``/``NoneAsConstantBuffer`` subclass ``IRNode`` (not
+    ``Buffer``) and inherit a ``get_name()`` that raises; a scalar
+    ``additional_inputs`` entry must yield None here, not crash the loop scan.
+    """
+    from torch._inductor import ir
+
+    buffer = _storage_buffer(x)
+    return buffer.get_name() if isinstance(buffer, ir.Buffer) else None
+
+
+def _operation_reads_buffer(op: Any, name: str) -> "bool | None":
+    """Whether ``op`` reads buffer ``name``; None when it cannot be proven.
+
+    Declared object inputs (``inputs``/``carried_inputs``) are checked first,
+    so a SECOND WhileLoop sharing the same init is caught rather than skipped.
+    When ``get_read_writes`` fails, a structural wrapper of some loop
+    (``MultiOutput``/``WhileLoop``) is not a direct buffer reader, so it is
+    provably-not-read; anything else unreadable is unknown (caller copies).
+    """
+    from torch._inductor import ir
+
+    for attr in ("inputs", "carried_inputs"):
+        val = getattr(op, attr, None)
+        if not val:
+            continue
+        for x in val:
+            if _storage_name(x) == name:
+                return True
+
+    try:
+        for dep in op.get_read_writes().reads:
+            if getattr(dep, "name", None) == name:
+                return True
+        return False
+    except Exception:  # noqa: BLE001
+        if isinstance(op, (ir.MultiOutput, ir.WhileLoop)):
+            return False
+        return None
+
+
+def _materialize_carry_copy(
+    graph: "GraphLowering",
+    while_op: "ir.WhileLoop",
+    real_input: Any,
+    binding: CarryBinding,
+) -> Any:
+    """Insert one pre-loop copy of a caller-owned carry's initial value.
+
+    ``_copy_source_and_view`` resolves a plain buffer (copied as-is) or a
+    provable full-span view (its backing storage copied, the view re-applied
+    over the copy). Placed in ``graph.operations`` immediately before the loop
+    (once), so the accumulator's in-place write lands in a compiler-owned
+    buffer and the caller's tensor is left untouched. Reads ``real_input``'s
+    final pre-loop value; returns the copy, or the re-applied view over it.
+    """
+    from torch._inductor import ir
+
+    storage, view_layout = _copy_source_and_view(real_input)
+    copy_name = graph.qualify_name(f"while_loop_carry_copy_{binding.scratch_name}")
+    copy_buf = _make_copying_buffer(graph, storage, copy_name)
+    # Insertion point: the copy runs once, after the init's pre-loop producer
+    # and before the loop -- unlike the in-body WAR snapshot that lands
+    # immediately before the carry's producer op.
+    idx = graph.operations.index(while_op)
+    graph.operations.insert(idx, copy_buf)
+    if view_layout is not None:
+        return ir.ReinterpretView(data=ir.StorageBox(copy_buf), layout=view_layout)
+    return copy_buf
 
 
 def _rewire_accumulator_output(
@@ -582,10 +964,9 @@ def _rewire_accumulator_output(
     ``graph.graph_outputs`` (or any downstream op) actually holds, since the
     ``WhileLoop`` itself has a ``MultiOutputLayout`` and is never read
     directly. ``splice_while_loop`` drops those children right after this
-    runs, so anything still pointing at one would dangle: for
-    ``split_k_fn``, that is precisely how ``graph_outputs`` ended up naming
-    a removed ``buf9``, producing a wrapper with an empty body and a
-    ``NameError`` at runtime.
+    runs, so anything still pointing at one would dangle: a
+    ``graph_outputs`` entry naming a removed buffer produces a wrapper with
+    an empty body and a ``NameError`` at runtime.
 
     Returns ``body_ops`` (possibly with the rewritten op substituted in
     place, preserving order).
@@ -624,7 +1005,22 @@ def _rewire_accumulator_output(
     target = real_input
     while isinstance(target, ir.MutableBox):
         target = target.data
-    producer.layout = ir.MutationLayoutSHOULDREMOVE(target)
+    mutation_layout = ir.MutationLayoutSHOULDREMOVE(target)
+    producer.layout = mutation_layout
+
+    # ``target`` may be a frozen ReinterpretView (for example, an SDPA
+    # accumulator whose initial value is a view).  The carry contract belongs
+    # to the mutable backing Buffer that the allocator sees in graph.operations,
+    # not to that view.  MutationLayoutSHOULDREMOVE.get_buffer() performs the
+    # same recursive view/box unwrapping used when resolving mutation storage.
+    storage = mutation_layout.get_buffer()
+    storage_name = storage.get_name()
+    record = LoopCarryRecord(
+        storage_name=storage_name,
+        update_name=producer.get_name(),
+    )
+    storage._loop_carry_record = record
+    producer._loop_carry_record = record
 
     if while_out_name is not None:
         _repoint_refs_to_buffer(graph, while_out_name, target)
@@ -632,7 +1028,9 @@ def _rewire_accumulator_output(
 
 
 def _repoint_refs_to_buffer(
-    graph: "GraphLowering", old_name: str, new_buf: Any
+    graph: "GraphLowering",
+    old_name: str,
+    new_buf: Any,
 ) -> None:
     """Point graph outputs (and any op input) naming old_name at new_buf.
 
@@ -736,7 +1134,7 @@ def splice_while_loop(
     redirect that no buffer was ever materialized under).
 
     So the read side is handled per carry shape, distinguishing two cases by
-    identity (confirmed against both split_m_fn and split_k_fn):
+    identity:
 
     - Pass-through carry: body_output IS the placeholder object itself
       (the body never rewrites this carry -- e.g. a per-tile xs leaf
@@ -763,12 +1161,13 @@ def splice_while_loop(
     ExternKernelOut hold direct Python object references to the
     placeholder buffer in `.inputs` (object-based -- handled by
     _substitute_direct_input_refs, since no name_map rename can reach a
-    held object reference). Confirmed empirically (both fixtures): every
-    mutated-carry placeholder is read exclusively via inner_fn/ops.load;
-    direct .inputs references only ever target pass-through carries (and,
-    for split_k_fn's counter carry, both shapes read the same placeholder
-    simultaneously) -- so both maps are populated for every carry
-    regardless of shape, rather than assuming shape predicts read kind.
+    held object reference). A mutated-carry placeholder is read exclusively
+    via inner_fn/ops.load; direct .inputs references only ever target
+    pass-through carries, and a single carry can be read by both shapes at
+    once (e.g. a counter carry read both by an inner_fn load and by a
+    DynamicScalar's direct input) -- so both maps are populated for every
+    carry regardless of shape, rather than assuming shape predicts read
+    kind.
 
     Returns the spliced body ops (graph.operations, still in topological
     order) so the caller can build a coarse-tile (ops, levels) group from
@@ -786,6 +1185,9 @@ def splice_while_loop(
         placeholder_name = body_graph_input_names[binding.carry_index]
         real_input = while_op.carried_inputs[binding.carry_index]
         real_name = real_input.get_name()
+        # Read side target; overridden below to a private copy when the
+        # accumulator may not reuse the initial buffer in place.
+        read_target = real_input
 
         if binding.stacking:
             # Stacking carry: fold its destination to the flat result shape
@@ -793,9 +1195,20 @@ def splice_while_loop(
             # this function's docstring. The read side still resolves to the
             # real buffer below, exactly as for a pass-through carry, since
             # the spliced body reads the same object it writes.
-            if trip_count is not None and not fold_stacked_carry_layout(
-                real_input, trip_count
-            ):
+            #
+            # A caller can mark a carry stacking (carry_bindings_for's
+            # stacking_indices) independently of what trip_count it passes
+            # here -- the two APIs don't couple them. Without trip_count the
+            # fold can't even be attempted, so the destination is left in its
+            # unfolded [trip, *tile] shape with no fold and no diagnostic:
+            # any outside consumer expecting the flat shape silently reads
+            # a wrong-shaped buffer. Raise instead of letting that happen.
+            if trip_count is None:
+                raise Unsupported(
+                    f"stacking carry {binding.carry_index} ({real_name}) "
+                    f"requires a trip_count to fold its layout; got None"
+                )
+            if not fold_stacked_carry_layout(real_input, trip_count):
                 logger.debug(
                     "splice_while_loop: carry %d (%s) marked stacking but its "
                     "layout is not a foldable [trip, *tile] shape; leaving it "
@@ -808,7 +1221,9 @@ def splice_while_loop(
             continue
 
         body_output_name = getattr(binding.body_output, "get_name", lambda: None)()
-        is_passthrough = body_output_name == placeholder_name
+        is_passthrough = body_output_name == placeholder_name or (
+            _body_fx_carry_is_passthrough(while_op, binding.carry_index)
+        )
         if body_output_name is not None and not is_passthrough:
             # Real per-iteration rewrite of an ACCUMULATOR carry. Redirect
             # its write in place into the carry's own initial buffer, so the
@@ -823,13 +1238,10 @@ def splice_while_loop(
             #           trip, so outside consumers read it directly (see
             #           _rewire_accumulator_output's graph-output patching)
             #
-            # This replaces an earlier redirect to `scratch_name`, a name no
-            # buffer was ever materialized under: the write kept its own
-            # (now unread) name, nothing consumed it, and the whole group
-            # DCE'd away leaving a wrapper whose `return (buf9,)` named a
-            # buffer that no longer existed. scratch_name is retained on
-            # CarryBinding as the identity a future multi-buffer carry
-            # scheme can build on, but is no longer what the rewrite targets.
+            # scratch_name is retained on CarryBinding as the identity a
+            # future multi-buffer carry scheme can build on, but is not
+            # what the rewrite below targets -- the write goes straight
+            # into the carry's own initial buffer instead.
             #
             # The in-place write below aliases this carry's new value onto
             # its own initial buffer -- correct for PyTorch's while_loop
@@ -843,6 +1255,18 @@ def splice_while_loop(
             # (e.g. split_k_fn's `acc + x @ y`, which reads the carry
             # exactly once, in the producer itself) keeps today's single-
             # buffer in-place path with no extra copy.
+            # In-place reuse of the initial buffer is legal only when that
+            # buffer is private to this subgraph. Otherwise materialise ONE
+            # pre-loop copy and write into it, leaving the caller's tensor
+            # (a graph input) or any other surviving reader untouched. The
+            # copy is built like _snapshot_carry_placeholder's copying
+            # ComputedBuffer, but inserted before the loop, not per trip.
+            if not _carry_real_input_is_private(
+                graph, while_op, real_input, binding.carry_index
+            ):
+                read_target = _materialize_carry_copy(
+                    graph, while_op, real_input, binding
+                )
             extra_readers = _extra_readers_of_placeholder(
                 placeholder_name, body_output_name, body_ops
             )
@@ -851,19 +1275,24 @@ def splice_while_loop(
                     graph,
                     placeholder_name,
                     body_output_name,
-                    real_input,
+                    read_target,
                     extra_readers,
                     body_ops,
                 )
             body_ops = _rewire_accumulator_output(
-                graph, while_op, binding, body_ops, real_input
+                graph,
+                while_op,
+                binding,
+                body_ops,
+                read_target,
             )
 
-        # Read side always resolves to the real, already-registered initial
-        # value -- see docstring above for why this holds for both
-        # pass-through and mutated carries at this stage of the pipeline.
-        name_map[placeholder_name] = real_name
-        ref_map[placeholder_name] = real_input
+        # Read side resolves to the real initial value, or to the private
+        # pre-loop copy materialised above when in-place reuse of the initial
+        # buffer is not provably safe (caller input / graph output /
+        # never-reuse / aliased survivor). See _carry_real_input_is_private.
+        name_map[placeholder_name] = read_target.get_name()
+        ref_map[placeholder_name] = read_target
 
     for i in range(len(carries), len(body_graph_input_names)):
         placeholder_name = body_graph_input_names[i]
@@ -904,14 +1333,11 @@ def splice_while_loop(
     # place -- its ReinterpretView is already correct with no patching
     # needed (see this docstring's opening paragraph).
     #
-    # Verified against a live compiled graph (split_k_fn, which has a real
-    # carry): each such child is an ir.MultiOutput ExternKernel whose own
-    # `.inputs[0] is while_op` -- that is the real linkage, confirmed by
-    # object identity, not by any `_while_loop_parent` attribute (no such
-    # attribute exists anywhere on the real IR; the placeholder predicate
-    # this replaced was therefore a no-op that removed nothing). MutationOutput
-    # is a Buffer, not an Operation, and so can never appear in
-    # graph.operations at all -- only MultiOutput needs handling here.
+    # Each such child is an ir.MultiOutput ExternKernel whose own
+    # `.inputs[0] is while_op` -- that object identity is the real linkage;
+    # no `_while_loop_parent` attribute exists anywhere on the real IR.
+    # MutationOutput is a Buffer, not an Operation, and so can never appear
+    # in graph.operations at all -- only MultiOutput needs handling here.
     graph.operations = [
         op
         for op in graph.operations

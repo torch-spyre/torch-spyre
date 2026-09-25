@@ -83,8 +83,8 @@ on:
           trunk | suite_<group> | <label>. These tier names ARE the
           test_suite_config.labels vocabulary directly (no alias layer).
           Default: integration (configs whose test_suite_config.labels cover
-          the device-layer surfaces flex and deeptools/dxp_standalone
-          exercise most -- streams, job launch plans, codegen,
+          the device-layer surfaces flex and deeptools exercise most
+          -- streams, job launch plans, codegen,
           LX/scratchpad planning, tensor layout, allocator/GC, D2D copies).
           Pass "regression" to run every config.
         required: false
@@ -99,6 +99,23 @@ on:
         required: false
         type: boolean
         default: true
+      run_id:
+        description: >-
+          UUID for this TEST RUN, minted by the dispatching orchestrator above the CI split.
+          Threaded so artifact_results (Jenkins-written) and test_case_runs (ingest-written)
+          share ONE identity instead of each hashing its own run coordinate. Empty on a
+          GHA-initiated run, which derives its own.
+        required: false
+        type: string
+        default: ''
+      component:
+        description: >-
+          Component to stamp on v2 ingest rows. Defaults to this repo's own product; set it
+          when this run executes ANOTHER component's suite, so the rows (and the test_case_id
+          they hash into) name the suite's real owner.
+        required: false
+        type: string
+        default: torch-spyre
       clickhouse_env:
         description: >-
           Which ClickHouse instance the perf job's inline ingest writes to:
@@ -171,6 +188,8 @@ jobs:
     uses: ./.github/workflows/_test_matrix.yaml
     with:
       runner_label: linux
+      component: ${{ inputs.component || 'torch-spyre' }}
+      run_id: ${{ inputs.run_id }}
       image_label: ${{ inputs.runner_label || 'image_spyre_backend' }}
       extra_test_flags: -v
       checkout_pytorch: false

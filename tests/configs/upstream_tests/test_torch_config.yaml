@@ -1,0 +1,40 @@
+test_suite_config:
+  files:
+    - path: ${TORCH_ROOT}/test/test_torch.py
+      unlisted_test_mode: skip
+      tests:
+        # ---- Explicit dtype conversion ----
+        - names:
+            - TestTorch::test_to
+            - TestTorch::test_type
+            - TestTorch::test_type_conversion_via_dtype_name
+            - TestTorch::test_copy_float16
+          mode: mandatory_success
+          edits:
+            functions:
+              cpu_move:
+                - name: assertEqual
+                - name: assertTrue
+                - name: assertNotEqual
+
+        # ---- Implicit type promotion ----
+        - names:
+            - TestTorchDeviceType::test_bfloat16_neg_abs
+          mode: mandatory_success
+          edits:
+            dtypes:
+              include:
+                - name: float16
+                - name: bfloat16
+                - name: float32
+            functions:
+              cpu_move:
+                - name: assertEqual
+                - name: assertTrue
+                - name: assertNotEqual
+
+  global:
+    supported_dtypes:
+      - name: float16
+      - name: bfloat16
+      - name: float32

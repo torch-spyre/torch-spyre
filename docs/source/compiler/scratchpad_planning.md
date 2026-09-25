@@ -13,9 +13,9 @@ default. Greedy, first-fit, and best-fit are available as opt-ins;
 `layout_solver` can also be set from the `LAYOUT_SOLVER` environment
 variable.
 
-Co-optimization with work distribution is opt-in.
-`config.co_optimizing_lx_planning` (`CO_OPTIMIZING_LX_PLANNING=1`)
-defaults to off. It enlarges each op's set of candidate splits — pointwise
+Co-optimization with work distribution is on by default.
+`config.co_optimizing_lx_planning` (`CO_OPTIMIZING_LX_PLANNING=0` to opt
+out) enlarges each op's set of candidate splits — pointwise
 dim-flips, the matmuls' tilings offered to neighbours, cross-matmul split
 transfer, a shared batch-major `B/M` tiling for matmuls and reductions —
 then searches the cross-product for the assignment that minimizes HBM
@@ -341,6 +341,7 @@ The checks, in evaluation order (the first failure is the reason reported):
 | `mutation target` | filled by offset writes, so one LX base mis-addresses it |
 | `tiled (advancing)` | LX addresses cannot be `affine.apply` symbols; the advancing-tile check reads `loop_info` (the sole source of truth for per-tile geometry) |
 | `read by restickify (cross-frame barrier)` | the read and write frames are transposes, so a per-core LX slice is not self-sufficient (the buffer a restickify reads; its own output is safe and is not barred) |
+| `read by restickify (local-read proof failed)` | Relayout is enabled, but exact physical ownership could not prove that every restickify read stays on the same core |
 | `extern kernel user` | extern ops read from HBM |
 | `index tensor or indirectly accessed` | index tensors and the value tensors they index into are read via data-dependent addressing, so they must stay in HBM |
 | `graph output (no clone)` / `graph input (no clone)` | without boundary cloning there is nothing to redirect |
@@ -454,11 +455,14 @@ in-place child legally share its slot.
 It requires the optional `ortools` package
 (`pip install torch-spyre[cpsat]`); when it is missing, the allocator logs
 a warning and falls back to the greedy solver, so a `"cpsat"` request
-always degrades to a correct plan. Without co-optimization the CP-SAT
-solver only *places* buffers on each op's pre-determined core division;
-with `co_optimizing_lx_planning` it is driven by the joint
-`CoOptimizingAllocator` (below), which additionally chooses each op's core
-division.
+without co-optimization always degrades to a correct plan. Without
+co-optimization the CP-SAT solver only *places* buffers on each op's
+pre-determined core division; with `co_optimizing_lx_planning` it is driven
+by the joint `CoOptimizingAllocator` (below), which additionally chooses
+each op's core division -- see
+[Joint CP-SAT co-optimization](#joint-cp-sat-co-optimization) for what
+happens to that fallback when `ortools` is missing *and* co-optimization is
+requested.
 
 ### SimulatedAnnealingLayoutSolver
 
@@ -484,8 +488,8 @@ ops sharing a buffer can get different splits (different shapes mean
 different optimal decompositions), which triggers `core_div_mismatch`
 and disqualifies the shared buffer from LX even when it would have fit.
 
-`CoOptimizingAllocator` (gated by
-`config.co_optimizing_lx_planning`, env var `CO_OPTIMIZING_LX_PLANNING=1`)
+`CoOptimizingAllocator` (the default; gated by
+`config.co_optimizing_lx_planning`, env var `CO_OPTIMIZING_LX_PLANNING`)
 treats split choices and LX placement jointly:
 
 :::{figure} ../_static/images/lx/co-optimization.svg
@@ -576,8 +580,19 @@ enumerating split variants and scoring leaves, it hands every op's
 candidate core divisions (from `enumerate_work_division_candidates`) and
 the producer/consumer slicing-match constraints to the CP-SAT solver,
 which chooses the core divisions and LX placements jointly in one
-constraint model. It falls back to the greedy allocator when `ortools`
-is unavailable.
+constraint model.
+
+When `ortools` is unavailable, the underlying `cpsat` factory itself
+degrades to the greedy solver -- but greedy has no core-division-capable
+solver to co-optimize with, so `select_allocator` cannot proceed by simply
+handing it to `CoOptimizingAllocator`. The only way to still get a plan is
+to fall back further, wrapping that greedy solver in `ExhaustiveSearchSolver`
+(an expensive DFS over core-division candidates per op). That extra
+fallback is opt-in: it raises `ValueError` unless
+`config.allow_exhaustive_search` (env var `ALLOW_EXHAUSTIVE_SEARCH`) is set.
+The same gate applies to `layout_solver` values of `"greedy"`, `"bestfit"`,
+or `"firstfit"` combined with `co_optimizing_lx_planning`, since none of
+those solvers is core-division-capable either.
 
 ### Joint SA co-optimization
 
