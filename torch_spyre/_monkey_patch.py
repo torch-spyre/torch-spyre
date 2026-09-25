@@ -85,7 +85,13 @@ def _add_ea(src_tensor, res_tensor) -> None:
     stl = res_layout.with_element_arrangement(fmt)
     is_staggered_ea = fmt in STAGGERED_EAS or input_ea in STAGGERED_EAS
     if src_tensor.dtype != torch.float32 and is_staggered_ea:
-        stl = rescale_stl_for_dtype(src_layout, res_tensor.dtype, fmt)
+        stl = rescale_stl_for_dtype(
+            src_layout,
+            res_tensor.dtype,
+            fmt,
+            list(src_tensor.size()),
+            list(src_tensor.stride()),
+        )
 
     set_spyre_tensor_layout(res_tensor, stl)
 

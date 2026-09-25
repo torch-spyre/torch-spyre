@@ -579,7 +579,13 @@ def _single_arg_op_layout(
             if staggered and _convert_reads_whole_input(
                 in_layout, output, dep, output_dep
             ):
-                layouts = [rescale_stl_for_dtype(stl, output.dtype, fmt)]
+                host_size = [concretize_expr(v) for v in in_layout.size]
+                host_stride = [concretize_expr(v) for v in in_layout.stride]
+                layouts = [
+                    rescale_stl_for_dtype(
+                        stl, output.dtype, fmt, host_size, host_stride
+                    )
+                ]
 
                 # A conversion that creates a staggered EA must also expose
                 # outputs reachable by restickifying its STANDARD input first.
@@ -603,7 +609,9 @@ def _single_arg_op_layout(
                         )
                         if target_stl is None:
                             continue
-                        candidate = rescale_stl_for_dtype(target_stl, output.dtype, fmt)
+                        candidate = rescale_stl_for_dtype(
+                            target_stl, output.dtype, fmt, host_size, host_stride
+                        )
                         if candidate not in layouts:
                             layouts.append(candidate)
 
@@ -632,7 +640,15 @@ def _single_arg_op_layout(
             # fp16 (64 elems/stick) -> fp8 (128 elems/stick) quantization: an
             # fp16 tensor with an odd stick count ends in a partially filled
             # fp8 stick.
-            return [rescale_stl_for_dtype(stl, output.dtype, ElementArrangement.QFP8CH)]
+            return [
+                rescale_stl_for_dtype(
+                    stl,
+                    output.dtype,
+                    ElementArrangement.QFP8CH,
+                    [concretize_expr(v) for v in in_layout.size],
+                    [concretize_expr(v) for v in in_layout.stride],
+                )
+            ]
 
         case spyreop.qfp8wt.default:
             # fp16 -> fp8 weight quantization with 2D-stick layout [2, 64].
