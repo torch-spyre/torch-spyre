@@ -109,42 +109,51 @@ def calculate_liveness(graph: GraphLowering) -> dict[str, list[int]]:
     return liveness
 
 
-def counted_loop_lifetime_end_overrides(graph: GraphLowering) -> dict[str, int]:
-    """Return exclusive lifetime ends for values reused by counted loops.
+def counted_loop_lifetime_overrides(
+    graph: GraphLowering,
+) -> tuple[dict[str, int], dict[str, int]]:
+    """Return lifetime bounds for values reused by counted loops.
 
     The graph contains one textual copy of a loop body.  Ordinary liveness
     therefore sees only the first runtime iteration and may reuse a value's LX
     address later in that body, even though the next iteration reads it again.
     A value born outside a loop and read inside it must stay alive through that
-    loop.  This records that storage fact without adding a fake read to
-    :func:`calculate_liveness`.
+    loop, including the backedge from its last textual read to its first read in
+    the next iteration. Model it as live for the loop's full textual interval.
+    This records that storage fact without adding fake reads to
+    :func:`calculate_liveness`, while unrelated loop-local temporaries retain
+    their ordinary per-iteration lifetimes.
     """
 
     def group_path(op: Operation) -> tuple[int, ...]:
         return tuple(getattr(getattr(op, "loop_info", None), "loop_group_id", ()) or ())
 
+    loop_start: dict[tuple[int, ...], int] = {}
     loop_end: dict[tuple[int, ...], int] = {}
     birth_group: dict[str, tuple[int, ...]] = {
         name: () for name in graph.graph_input_names
     }
+    first_access: dict[str, int] = {}
     last_access: dict[str, int] = {}
-    last_read: dict[str, int] = {}
 
     for index, op in enumerate(graph.operations):
         path = group_path(op)
         for depth in range(1, len(path) + 1):
-            loop_end[path[:depth]] = index
+            loop = path[:depth]
+            loop_start.setdefault(loop, index)
+            loop_end[loop] = index
         rw = op_read_writes(op)
         for dep in rw.writes:
             birth_group.setdefault(dep.name, path)
+            first_access.setdefault(dep.name, index)
             last_access[dep.name] = index
         for dep in rw.reads:
             birth_group.setdefault(dep.name, ())
+            first_access.setdefault(dep.name, index)
             last_access[dep.name] = index
-            last_read[dep.name] = index
 
-    overrides: dict[str, int] = {}
-    crossed_loops: set[tuple[int, ...]] = set()
+    start_overrides: dict[str, int] = {}
+    end_overrides: dict[str, int] = {}
     for index, op in enumerate(graph.operations):
         consumer_path = group_path(op)
         if not consumer_path:
@@ -161,38 +170,27 @@ def counted_loop_lifetime_end_overrides(graph: GraphLowering) -> dict[str, int]:
             if common == len(consumer_path):
                 continue
             enclosing_loop = consumer_path[: common + 1]
+            start = loop_start[enclosing_loop]
             end = loop_end[enclosing_loop] + 1
+            # Each bound is decided on its own, for every crossing value and not
+            # only tagged carries. A loop-invariant read inside the body is also
+            # read on every iteration, so a loop-local that dies before its first
+            # in-loop read can share its address and clobber it across the
+            # backedge; and gating the start on the end's condition skips it
+            # entirely for a value that is also read after the loop.
+            if start < first_access.get(dep.name, index):
+                start_overrides[dep.name] = min(
+                    start_overrides.get(dep.name, start), start
+                )
             if end > last_access.get(dep.name, index) + 1:
-                overrides[dep.name] = max(overrides.get(dep.name, 0), end)
-                crossed_loops.add(enclosing_loop)
+                end_overrides[dep.name] = max(end_overrides.get(dep.name, 0), end)
+    return start_overrides, end_overrides
 
-    # A value that crosses `enclosing_loop`'s boundary (above) must stay valid
-    # across every runtime iteration of that loop. But the graph holds only one
-    # textual copy of the loop body, so any OTHER value that is born and fully
-    # consumed entirely inside that same loop looks, under plain liveness, like
-    # it occupies a short, disjoint tick range that never overlaps the
-    # crossing value's -- even though that loop-local value is actually
-    # rewritten fresh on every iteration, including iterations after the one
-    # the crossing value's own reads happen to fall in. Sharing an LX address
-    # between the two is therefore unsafe: a later iteration's rewrite of the
-    # loop-local value can land between two of the crossing value's reads and
-    # clobber it. Extending the loop-local value's own end_time to also cover
-    # the whole loop forces `overlaps_in_time` to see the conflict for every
-    # solver, instead of leaving it to placement-order luck. A value that is
-    # never read again by anything (write-only) cannot be clobbered before its
-    # next read -- it has none -- so only values with at least one recorded
-    # read are candidates here; `last_read`, not `last_access`, decides
-    # whether that read already falls before the loop's end.
-    if crossed_loops:
-        for name, path in birth_group.items():
-            if name not in last_read:
-                continue
-            for loop in crossed_loops:
-                if path[: len(loop)] == loop:
-                    end = loop_end[loop] + 1
-                    if end > last_read[name] + 1:
-                        overrides[name] = max(overrides.get(name, 0), end)
-    return overrides
+
+def counted_loop_lifetime_end_overrides(graph: GraphLowering) -> dict[str, int]:
+    """Compatibility wrapper returning only counted-loop lifetime ends."""
+
+    return counted_loop_lifetime_overrides(graph)[1]
 
 
 def mem_usage_by_buf(

@@ -80,7 +80,8 @@ jobs:
   #
   # Runs on every PR and merge-queue check. Delegates to the shared
   # detect-doc-only-change composite action, which checks if any file outside
-  # tests/docs/, docs/, README.md, or CODEOWNERS was modified.
+  # tests/docs/, docs/, extensions/clickhouse-ingest/docs/, README.md,
+  # extensions/clickhouse-ingest/README.md, or CODEOWNERS was modified.
   #
   # code_changed=true  --> non-doc files changed  --> run tests
   # code_changed=false --> only doc/CODEOWNERS files changed --> skip tests

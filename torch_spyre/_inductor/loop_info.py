@@ -281,6 +281,9 @@ class ReadCopyElisionRecord:
     direct_squeezed_advance_per_level: (
         tuple[tuple[tuple[sympy.Expr, sympy.Expr], ...], ...] | None
     ) = None
+    # Intermediate copies that become dead only if the deferred proposal is
+    # accepted, ordered from the replacement consumer back toward the source.
+    orphaned_copy_names: tuple[str, ...] = ()
 
 
 @dataclass

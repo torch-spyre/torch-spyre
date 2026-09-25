@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import copy
+import dataclasses
 import logging
 from collections import defaultdict
 from dataclasses import dataclass
@@ -25,6 +26,7 @@ import torch
 from .constants import ELIDED_COPY_BACK_ATTR
 from .errors import Unsupported
 from .ir import FixedTiledLayout, SpyreEmptyFallback
+from .loop_info import ReadCopyElisionRecord
 from .optimize_restickify import AnyInNode, EdgeCostMap
 from .logging_utils import get_inductor_logger
 from torch._inductor.dependencies import MemoryDep, index_vars_squeeze
@@ -304,6 +306,7 @@ def insert_restickify_on_node_inputs(
     to read the new buffer names, and reconstruct the consumer ComputedBuffer to
     invalidate its sizes cache.
     """
+    existing_record = getattr(op, "_read_copy_elision_record", None)
     edge_swaps: list[tuple] = []
     name_map: dict[str, str] = {}
     try:
@@ -315,6 +318,8 @@ def insert_restickify_on_node_inputs(
 
     for restick_arg_info in resticks_needed:
         old_name, restick_buff = _create_restickify_node(restick_arg_info, op)
+        old_name_buf = V.graph.try_get_buffer(old_name)
+        source_record = getattr(old_name_buf, "_read_copy_elision_record", None)
         new_name = restick_buff.get_name()
         if restick_arg_info.dep_index is not None:
             edge_swaps.append(
@@ -355,7 +360,6 @@ def insert_restickify_on_node_inputs(
         # the Lk advance to the full-K restickify pins the matmul itself to K
         # tile zero. A graph input has no shared levels and follows this same
         # fixed-full-buffer path at every level.
-        old_name_buf = V.graph.try_get_buffer(old_name)
         source_li = getattr(old_name_buf, "loop_info", None)
         consumer_li = getattr(op, "loop_info", None)
         source_group_id = getattr(source_li, "loop_group_id", ())
@@ -458,6 +462,31 @@ def insert_restickify_on_node_inputs(
             restick_li.output_tiled_dims = [[] for _ in range(n_levels)]
             restick_buff.loop_info = restick_li
 
+        # A saved direct-read form can sit on an identity whose committed
+        # layout is incompatible with its consumer.  The deferred restickify
+        # then becomes the real copy point, so move the proposal to it and
+        # inline the identity's direct body.  Both pointwise buffers iterate
+        # the same logical tensor; only their physical output layouts differ.
+        # This only transfers the proposal: the post-layout direct-read proof
+        # remains responsible for validating storage, bounds, and ownership.
+        if (
+            isinstance(source_record, ReadCopyElisionRecord)
+            and isinstance(old_name_buf, ComputedBuffer)
+            and old_name_buf.data.get_pointwise_size()
+            == restick_buff.data.get_pointwise_size()
+        ):
+            restick_buff._read_copy_elision_record = dataclasses.replace(  # type: ignore[attr-defined]
+                source_record,
+                consumer_name=new_name,
+                copy_name=old_name,
+                direct_inner_fn=source_record.direct_inner_fn,
+                orphaned_copy_names=(
+                    source_record.copy_name,
+                    *source_record.orphaned_copy_names,
+                ),
+            )
+            del old_name_buf._read_copy_elision_record  # type: ignore[attr-defined]
+
     # Wrap inner_fn with InputEdgeSwapHandler so each load is redirected to
     # the correct per-edge restickified buffer via index-matched routing.
     # Then call redirect_computed_buffer_reads with an empty name_map solely for
@@ -508,6 +537,40 @@ def insert_restickify_on_node_inputs(
             return _orig(*args)
 
     object.__setattr__(op.data, "inner_fn", new_inner_fn)
+
+    if isinstance(existing_record, ReadCopyElisionRecord):
+
+        def direct_inner_fn(
+            *args,
+            _swaps=edge_swaps,
+            _map=name_map,
+            _direct_inner=existing_record.direct_inner_fn,
+            _canonical=canonical_args,
+        ):
+            assert len(args) == len(_canonical)
+            index_replacements = {}
+            for actual_group, canonical_group in zip(args, _canonical, strict=True):
+                for actual, canonical in zip(
+                    actual_group, canonical_group, strict=True
+                ):
+                    if actual != sympy.S.Zero:
+                        index_replacements[actual] = canonical
+            with V.set_ops_handler(
+                InputEdgeSwapHandler(V.ops, _swaps, _map, index_replacements)
+            ):
+                return _direct_inner(*args)
+
+        copy_name = existing_record.copy_name
+        for old_name, _dep_index, _occurrence, new_name in edge_swaps:
+            if old_name == copy_name:
+                copy_name = new_name
+                break
+        copy_name = name_map.get(copy_name, copy_name)
+        op._read_copy_elision_record = dataclasses.replace(  # type: ignore[attr-defined]
+            existing_record,
+            copy_name=copy_name,
+            direct_inner_fn=direct_inner_fn,
+        )
 
 
 def insert_restickify(graph: GraphLowering) -> None:

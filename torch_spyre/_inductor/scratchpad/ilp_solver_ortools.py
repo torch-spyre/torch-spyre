@@ -99,14 +99,17 @@ below are written once against whichever wrapper ``_wrap`` chose.
 
 from __future__ import annotations
 
+from collections import Counter
 import logging
 import math
 import operator
 import os
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
+from fractions import Fraction
 from functools import cache
 from typing import TYPE_CHECKING, Any, Generic, Optional, TypeVar, cast
+import numpy as np
 import sympy
 from sympy.printing.printer import Printer
 import torch
@@ -150,9 +153,9 @@ _BufT = TypeVar("_BufT", bound=LifetimeBoundBuffer)
 
 # constant to scale log of core split. error ~0.5%
 _CORE_LOG_SCALE = 32.0
-# fallback scale for the inverse of a core split, used when the LCM of the
-# split's candidate values (see _SympyExprToCpSat._inv_scale) exceeds it.
-# error <= ~2.5%
+# cap on the scale for the inverse of a core split, and the scale itself when
+# the split has no candidate values (see _SympyExprToCpSat._inv_scale).
+# error <= ~4%
 _CORE_INV_SCALE = 1024
 # constant limit on product terms to avoid int32 overflow in CP-SAT
 _MAX_PRODUCT_BOUND = 2**30
@@ -646,11 +649,44 @@ class _SympyExprToCpSat(Printer):
         """Fixed-point scale of ``inv_<name>``: the LCM of ``name``'s values
         across the candidate divisions, so every ``scale // v`` is exact and the
         variable spans only the bits it needs. ``_CORE_INV_SCALE`` when there
-        are no values or their LCM exceeds it."""
+        are no values, or a value with many divisors if the LCM exceeds it."""
         _, raw = self._buffer_map.get(name, (None, ()))
         if not raw or min(raw) < 1:
             return _CORE_INV_SCALE
-        return min(math.lcm(*map(int, raw)), _CORE_INV_SCALE)
+
+        ints = [int(r) for r in raw]
+        lcm = math.lcm(*ints)
+        if lcm <= _CORE_INV_SCALE:
+            return lcm
+
+        # Otherwise: find the highest power of 2 in ints; among its multiples,
+        # find which has the most entries of ints as divisors, and use that.
+        # (We weight entries of ints by multiplicity.)
+        cnt = Counter(ints)
+        pow2 = max((a for a in cnt if a & (a - 1) == 0), default=1)
+        assert pow2 < _CORE_INV_SCALE, (
+            f"expected _CORE_INV_SCALE={_CORE_INV_SCALE} to be greater than any "
+            f"power of 2 that might occur as a core division, but found {pow2}"
+        )
+        scaled_core_inv_scale = _CORE_INV_SCALE // pow2
+        counts = np.zeros(scaled_core_inv_scale + 1, dtype=np.int64)
+        for a, mult in cnt.items():
+            step = a // math.gcd(a, pow2)
+            if step <= scaled_core_inv_scale:
+                counts[step::step] += mult
+
+        # Among those, the one whose worst-rounded entry rounds best: the error
+        # of an inexact v is (scale % v) / scale, so width is what buys
+        # accuracy. A worst case does not accumulate, so unlike the count above
+        # this weighs each value once. Ties -- frequent, since a scale and its
+        # multiples often round alike -- go to the narrowest, keeping the
+        # products in _print_multiply clear of _MAX_PRODUCT_BOUND.
+        candidates = pow2 * (np.flatnonzero(counts[1:] == counts[1:].max()) + 1)
+        values = sorted(cnt)
+        return min(
+            (int(c) for c in candidates),
+            key=lambda s: (Fraction(max(s % v for v in values), s), s),
+        )
 
     def _inv_log_sym(self, expr):
         # replaces log(sym) with log2_sym and 1/sym with inv_sym
@@ -928,7 +964,7 @@ class _SympyExprToCpSat(Printer):
             scale = self._inv_scale(name)
             values = [scale // v for v in raw]
             cp_var = self._model.new_int_var(min(values), max(values), expr.name)
-            self._model.AddDivisionEquality(cp_var, scale, self._sym_map[name])
+            self._model.add_division_equality(cp_var, scale, self._sym_map[name])
         self._sym_map[expr.name] = cp_var
         return cp_var
 
