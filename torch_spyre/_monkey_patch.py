@@ -484,6 +484,19 @@ def _patch_tensor_for_spyre():
 
         warnings.warn(f"Failed to install safetensors Spyre patches: {e}")
 
+    # Interim HF open-target monkey-patch (until transformers opens
+    # checkpoints on a custom device itself). Forces from_pretrained to
+    # call safe_open(device="spyre") when device_map is a uniform Spyre
+    # map, so  safetensors dispatcher actually runs.
+    try:
+        _patch_transformers_safe_open_for_spyre()
+    except Exception as e:  # pragma: no cover - transformers may not be installed
+        import warnings
+
+        warnings.warn(
+            f"Failed to install transformers Spyre open-target patch: {e}"
+        )
+
 
 def _patch_invoke_subgraph_decompositions():
     """Thread the Spyre decomp table into invoke_subgraph subgraph re-traces.
@@ -1126,6 +1139,139 @@ def _patch_safetensors_for_spyre() -> None:
 
         _spyre_load_model._spyre_patched = True  # type: ignore[attr-defined]
         _st_torch.load_model = _spyre_load_model
+
+
+def _resolve_checkpoint_open_target(device_map) -> tuple:
+    """Return ``(backend, device)`` for opening a safetensors checkpoint.
+
+    Same policy as the proposed transformers patch
+    (``hf_safe_open_custom_device.patch``):
+
+      * ``None`` / mixed / cpu / meta / disk → ``("mmap", "cpu")``
+      * uniform ``mps`` → ``("pread", "mps")``
+      * one custom device advertised by ``safetensors._is_custom_device``
+        → ``("mmap", that_device)``  (Spyre, after the stub or #804)
+    """
+    import torch
+
+    if device_map is None:
+        return ("mmap", "cpu")
+    dev_types = {
+        (d.type if isinstance(d, torch.device) else str(d).split(":")[0])
+        for d in device_map.values()
+    }
+    if dev_types == {"mps"}:
+        return ("pread", "mps")
+    if len(dev_types) == 1:
+        (dev_type,) = dev_types
+        if dev_type not in ("cpu", "meta", "disk"):
+            try:
+                from safetensors import _is_custom_device
+            except ImportError:
+                return ("mmap", "cpu")
+            if _is_custom_device(dev_type):
+                return ("mmap", dev_type)
+    return ("mmap", "cpu")
+
+
+def _ensure_safetensors_custom_device_stubs() -> None:
+    """Provide ``_is_custom_device`` when safetensors#804 is not installed.
+
+     Python safe_open  monkey-patch wraps ``safe_open`` but does not add the
+    safetensor PR #804 registry API. The HF resolver (and the upstream HF PR) call
+    ``_is_custom_device``; without a stub it always falls back to CPU.
+    Real #804 wheels keep their own implementations.
+    """
+    try:
+        import safetensors as st
+    except ImportError:
+        return
+
+    has_real_804 = (
+        hasattr(st, "_is_custom_device")
+        and hasattr(st, "_register_device_transfer_hook")
+        and not getattr(st._is_custom_device, "_spyre_monkeypatched", False)
+    )
+    if has_real_804:
+        return
+
+    custom = {DEVICE_NAME}
+
+    def _is_custom_device(device_type: str) -> bool:
+        return str(device_type).split(":")[0] in custom
+
+    def _register_device_transfer_hook(device_type, hook, overwrite=False):
+        _ = hook, overwrite
+        custom.add(str(device_type).split(":")[0])
+
+    _is_custom_device._spyre_monkeypatched = True  # type: ignore[attr-defined]
+    _register_device_transfer_hook._spyre_monkeypatched = True  # type: ignore[attr-defined]
+    st._is_custom_device = _is_custom_device
+    st._register_device_transfer_hook = _register_device_transfer_hook
+
+
+def _patch_transformers_safe_open_for_spyre() -> None:
+    """Monkey-patch transformers so from_pretrained opens on Spyre when safe.
+
+    Companion to ``_patch_safetensors_for_spyre()``. Stock HF hardcodes
+    ``("mmap", "cpu")`` at the ``safe_open`` site (except mps). Without this
+    patch, safetensors Spyre wrapper never sees ``device="spyre"`` during
+    ``from_pretrained``.
+
+    Removal note — when the HF ``safe_open`` custom-device PR merges and
+    safetensors#804 is released, delete this function and its call.
+    """
+    try:
+        import safetensors as st
+        import transformers.modeling_utils as mu
+    except ImportError:
+        return
+
+    _ensure_safetensors_custom_device_stubs()
+    mu._resolve_checkpoint_open_target = _resolve_checkpoint_open_target
+
+    existing = mu.PreTrainedModel._load_pretrained_model
+    if getattr(existing, "_spyre_hf_open_patched", False):
+        return
+
+    _orig = existing
+
+    def _spyre_load_pretrained_model(*args, **kwargs):
+        load_config = kwargs.get("load_config")
+        if load_config is None and len(args) >= 4:
+            load_config = args[3]
+        device_map = getattr(load_config, "device_map", None)
+        backend_resolved, device_resolved = _resolve_checkpoint_open_target(
+            device_map
+        )
+        live_safe_open = st.safe_open
+
+        def _forced_safe_open(
+            filename, framework="pt", device=None, backend="mmap", **open_kw
+        ):
+            _ = device, backend
+            return live_safe_open(
+                filename,
+                framework=framework,
+                device=device_resolved,
+                backend=backend_resolved,
+                **open_kw,
+            )
+
+        prev = getattr(mu, "safe_open", live_safe_open)
+        mu.safe_open = _forced_safe_open
+        try:
+            # Read via the attribute so tests (and later rebinds) can
+            # replace ``_original`` without rebuilding the wrapper.
+            return _spyre_load_pretrained_model._original(*args, **kwargs)
+        finally:
+            mu.safe_open = prev
+
+    _spyre_load_pretrained_model._spyre_hf_open_patched = True  # type: ignore[attr-defined]
+    _spyre_load_pretrained_model._original = _orig  # type: ignore[attr-defined]
+    mu.PreTrainedModel._load_pretrained_model = staticmethod(
+        _spyre_load_pretrained_model
+    )
 
 
 def _patch_fx_graph_hash():
