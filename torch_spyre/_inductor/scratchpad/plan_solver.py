@@ -229,6 +229,18 @@ class TileSpec:
         return math.prod(a.count for a in self.axes if not a.is_reduction)
 
     @property
+    def is_clean(self) -> bool:
+        """True when no reduction axis is tiled, so every tile produces a
+        finished slice of the output rather than a partial accumulation.
+
+        Landed with stage 1 and removed again by #4519 as unused; the
+        solver-driven tiling path in ``CoOptimizingAllocator._tiling_candidates``
+        is the caller that makes it live, and it is the single filter that keeps
+        reduction tilings (numerically fragile on e.g. softmax's max/sum) out of
+        the candidate menu."""
+        return not any(a.is_reduction for a in self.axes)
+
+    @property
     def label(self) -> str:
         if not self.axes:
             return "untiled"

@@ -3291,6 +3291,9 @@ def _prepare_per_core_view(
     op: Operation,
     dep: MemoryDep,
     buf_name: str,
+    *,
+    parts: "Optional[tuple[dict, sympy.Expr, sympy.Expr]]" = None,
+    buf_layout: "Optional[FixedTiledLayout]" = None,
 ) -> Optional[_ViewPrep]:
     """Compute the candidate-invariant pieces of a per-core view once.
 
@@ -3302,15 +3305,32 @@ def _prepare_per_core_view(
     The inputs come from the pre-scheduler operation. Post-scheduler ownership
     is validated by projecting the committed physical view through the final
     access; this builder no longer has a second scheduler-derived mode.
-    """
-    # The op-level write index bridges stride-keyed split counts back to
-    # operation symbols, independently of the target buffer's access.
-    rw = op_read_writes(op)
-    write_index = next(iter(rw.writes)).index
-    iter_space = iteration_space_from_op(op)
 
-    buf_op = V.graph.get_buffer(buf_name)
-    buf_layout = buf_op.layout
+    ``parts`` is *not* that mode returning. It supplies ``(iter_space,
+    write_index, read_index)`` for a frame that does not exist on ``op`` yet:
+    ``wsr.tile_prediction`` prices a coarse-tiling candidate the planner has not
+    committed to, so reading the iteration space off ``op`` would price every
+    tiled candidate on the untiled frame. Only the first two entries are used --
+    the prep no longer carries a read index, because the target dep is projected
+    into physical coordinates directly (``dep_device_coordinates``). Default
+    (None) reads both off ``op`` as before.
+
+    ``buf_layout`` overrides ``buf_name``'s committed layout, for the same
+    reason and the same caller: at solve time ``buf_name``'s committed layout is
+    still the untiled one, so the view would otherwise be taken on the wrong
+    frame. Default (None) reads the committed layout as before.
+    """
+    if parts is not None:
+        iter_space, write_index = parts[0], parts[1]
+    else:
+        # The op-level write index bridges stride-keyed split counts back to
+        # operation symbols, independently of the target buffer's access.
+        rw = op_read_writes(op)
+        write_index = next(iter(rw.writes)).index
+        iter_space = iteration_space_from_op(op)
+
+    if buf_layout is None:
+        buf_layout = V.graph.get_buffer(buf_name).layout
     if not isinstance(buf_layout, FixedTiledLayout):
         return None
 

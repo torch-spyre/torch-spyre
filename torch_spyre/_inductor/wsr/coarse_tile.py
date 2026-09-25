@@ -2771,6 +2771,11 @@ def _divide_ranges(
     # get_read_writes() result (pass_utils.op_read_writes) is stale
     # regardless of which capture path (if any) runs below -- invalidate
     # unconditionally rather than only inside the symbol-remap branch.
+    # That disagreement is unreachable when coarse tiling runs
+    # pre-stickification (nothing has populated the memo yet), but the
+    # solver-driven path applies tilings *during* scratchpad planning, after
+    # the first solve has memoized every op -- where it surfaced as
+    # ``coarse_tile_local_dim_split_domains``'s extent assertion.
     invalidate_op_read_writes(op)
 
     symbol_remap = None
@@ -2951,6 +2956,21 @@ def _apply_plan(
         return {}
 
     _validate_contiguous(ops, op_to_position, stamped_group_id)
+
+    # The stamp below replaces loop_info wholesale, so an op some earlier tiling
+    # already stamped (a for_each_tile loop, above all) would silently lose it.
+    already_tiled = [
+        op.get_operation_name()
+        for op in ops
+        if isinstance(op, ComputedBuffer)
+        and id(op) in plan
+        and getattr(op, "loop_info", None) is not None
+    ]
+    if already_tiled:
+        raise Unsupported(
+            f"coarse_tile: group {stamped_group_id} would overwrite the existing "
+            f"loop_info of {', '.join(already_tiled)}."
+        )
 
     retiled_infos: dict[str, _RetiledBufferInfo] = {}
     for op in ops:
