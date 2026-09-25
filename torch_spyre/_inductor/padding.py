@@ -566,6 +566,64 @@ def _pad_device_dim(
     )
 
 
+def _grown_dim_step_is_unique(stl: SpyreTensorLayout, sticks_dim: int) -> bool:
+    """Whether sizing up ``sticks_dim`` leaves its ``stride_map`` entry unambiguous.
+
+    A dim already holding the sentinel -1 is never stepped, so growing it cannot
+    collide with anything.  Otherwise the entry has to differ from every other dim
+    that would also be larger than one.
+    """
+    step = stl.stride_map[sticks_dim]
+    if step <= 0:
+        return True
+    return not any(
+        other != sticks_dim
+        and stl.stride_map[other] == step
+        and stl.device_size[other] > 1
+        for other in range(len(stl.device_size) - 1)
+    )
+
+
+def _grow_num_sticks_capacity(
+    layout: FixedTiledLayout, sticks_dim: int, required_num_sticks: int
+) -> FixedTiledLayout:
+    """Give ``layout`` room for ``required_num_sticks`` sticks on ``sticks_dim``.
+
+    Sizing the dim up is the direct way, and is what happens whenever the dim's own
+    step is distinguishable from its neighbours'.  It stops being available once the
+    stick dim spans no more than a single stick: the num-sticks dim then steps the
+    same host distance as the dim outside it, since a row shorter than a stick puts
+    the next row less than a stick away.  Two dims of size over one cannot share a
+    ``stride_map`` value -- there would be no way to tell which dim a step belongs
+    to -- so ``spyre_mem.cpp`` rejects the result on the first host copy.
+
+    The room comes from an outermost gap dim instead.  Carrying ``stride_map == -1``
+    it names no host step, so it stays clear of that rule while still multiplying
+    the allocation, the same device ``_pad_elided_dim`` uses for an elided dim.  The
+    capacity is what this padding is after in the first place: one 64-element FP16
+    stick is physically a pair of 32-slot FP32 sticks, so the narrow side needs both
+    even while the live elements sit in the first.
+    """
+    stl = layout.device_layout
+    if _grown_dim_step_is_unique(stl, sticks_dim):
+        return _pad_device_dim(layout, sticks_dim, required_num_sticks)
+
+    factor = -(-required_num_sticks // stl.device_size[sticks_dim])
+    grown_stl = SpyreTensorLayout(
+        [factor, *stl.device_size],
+        [-1, *stl.stride_map],
+        stl.device_dtype,
+        stl.element_arrangement,
+    )
+    return FixedTiledLayout(
+        layout.device,
+        layout.dtype,
+        [concretize_expr(s) for s in layout.size],
+        [concretize_expr(s) for s in layout.stride],
+        grown_stl,
+    )
+
+
 def _pad_elided_dim(buf: ComputedBuffer) -> None:
     """Pad ``buf``'s allocation by prepending an outermost size-64 gap dim, for a
     restickify whose transposed dim was elided to a size-1 device dim.
@@ -1108,8 +1166,9 @@ def _pad_fp32_to_dl16_input(op: Operation, graph: GraphLowering) -> None:
     3 fp32 sticks (96 elements) to 4 fp32 sticks (96 elements in 128-element capacity).
 
 
-    Only touches the device layout (``device_size``); host size and
-    ``stride_map`` are unchanged.
+    Only the device layout changes, and the host size stays put.  The room lands on
+    the num-sticks dim where its step stays unambiguous, and on an outermost gap dim
+    otherwise; see ``_grow_num_sticks_capacity``.
     """
     assert isinstance(op, ComputedBuffer)
     out_layout = op.get_layout()
@@ -1190,7 +1249,9 @@ def _pad_fp32_to_dl16_input(op: Operation, graph: GraphLowering) -> None:
     if current_in_num_sticks >= required_in_num_sticks:
         return
 
-    in_buf.layout = _pad_device_dim(in_layout, sticks_dim, required_in_num_sticks)
+    in_buf.layout = _grow_num_sticks_capacity(
+        in_layout, sticks_dim, required_in_num_sticks
+    )
 
 
 def _pad_staggered_fp32_buffer(op: Operation) -> None:
@@ -1210,8 +1271,9 @@ def _pad_staggered_fp32_buffer(op: Operation) -> None:
     occupy, which is the first stick alone whenever the extent is under half a
     stick, so the room for the rest of the pair is added here.
 
-    Only ``device_size`` changes; the host size and ``stride_map`` are untouched,
-    which also preserves the sentinel ``-1`` marking a stick dim of host extent 1.
+    Only the device layout changes, and the host size stays put.  The room lands on
+    the num-sticks dim where its step stays unambiguous, and on an outermost gap dim
+    otherwise; see ``_grow_num_sticks_capacity``.
     """
     assert isinstance(op, ComputedBuffer)
     layout = op.get_layout()
@@ -1240,7 +1302,7 @@ def _pad_staggered_fp32_buffer(op: Operation) -> None:
     if current_num_sticks >= required_num_sticks:
         return
 
-    op.layout = _pad_device_dim(layout, sticks_dim, required_num_sticks)
+    op.layout = _grow_num_sticks_capacity(layout, sticks_dim, required_num_sticks)
 
     logger.debug(
         "insert_staggered_ea_padding: padded %s device dim %d %d -> %d",
