@@ -151,10 +151,17 @@ std::vector<int64_t> JobPlanStepHostCompute::resolveSymbolicArgs(
             static_cast<int64_t>(allocator.compositeAddressToDeviceAddress(
                 *get_composite_address(tensors[arg.tensor_id])));
         break;
-      case SymbolicArgKind::kDimension:
+      case SymbolicArgKind::kDimension: {
         TORCH_CHECK(false,
                     "SymbolicArgKind::kDimension is not yet implemented");
         break;
+        const at::Tensor& t = tensors[arg.tensor_id];
+        TORCH_CHECK(arg.dim_index >= 0 && arg.dim_index < t.dim(),
+                    "SymbolicArg[", i, "].dim_index=", arg.dim_index,
+                    " out of range for tensor with ", t.dim(), " dims");
+        resolved[i] = t.size(arg.dim_index);
+        break;
+      }
       default:
         TORCH_CHECK(false, "Unknown SymbolicArgKind value: ",
                     static_cast<int32_t>(arg.kind));

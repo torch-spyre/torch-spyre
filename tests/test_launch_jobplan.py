@@ -265,18 +265,15 @@ class TestSymbolicArg(TestCase):
         self.assertEqual(addr_arg.kind, torch_spyre._C.SymbolicArgKind.kAddress)
         self.assertEqual(addr_arg.tensor_id, 1)
         self.assertEqual(addr_arg.dim_index, -1)
-        self.assertEqual(addr_arg.value, -1)
 
         dim_arg = torch_spyre._C.SymbolicArg(
             kind=torch_spyre._C.SymbolicArgKind.kDimension,
             tensor_id=0,
             dim_index=2,
-            value=48,
         )
         self.assertEqual(dim_arg.kind, torch_spyre._C.SymbolicArgKind.kDimension)
         self.assertEqual(dim_arg.tensor_id, 0)
         self.assertEqual(dim_arg.dim_index, 2)
-        self.assertEqual(dim_arg.value, 48)
 
         r = repr(addr_arg)
         self.assertIn("tensor_id=1", r)

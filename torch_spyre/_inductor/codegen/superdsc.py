@@ -130,8 +130,8 @@ class SDSCSpec:
     constants: dict[str, Any]
     coordinate_masking: dict[Symbol, Any]
     conv_params: dict[str, Any] = dataclasses.field(default_factory=dict)
-    # maps SDSC dim name -> (pytorch_sym_name, granularity, max_val)
-    symbolic_dims: dict[str, tuple[str, int, int]] = dataclasses.field(
+    # maps SDSC dim name -> (pytorch_sym_name, granularity, max_val, arg_index, dim_index)
+    symbolic_dims: dict[str, tuple[str, int, int, int, int]] = dataclasses.field(
         default_factory=dict
     )
     indirect_access_indices: list[int] = dataclasses.field(default_factory=list)
@@ -2028,17 +2028,6 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
         for sym, (size, _) in op_spec.iteration_space.items()
     }
 
-    # Build the SDSC dim name -> (pytorch_sym_name, granularity, max_val) map
-    # for any iteration-space dims.
-    # This drives symbolicDimInfo_ and dimToSymbolMapping_ in the generated JSON.
-    symbolic_dims: dict[str, tuple[str, int, int]] = {}
-    for sym, (size_expr, _) in op_spec.iteration_space.items():
-        sdsc_dim_name = str(symbol_mapping[sym])
-        sym_str = str(size_expr)
-        if sym_str in op_spec.symbolic_dim_bounds:
-            max_val, granularity = op_spec.symbolic_dim_bounds[sym_str]
-            symbolic_dims[sdsc_dim_name] = (sym_str, granularity, max_val)
-
     dim_splits = {
         symbol_mapping[dim]: value[-1] for dim, value in op_spec.iteration_space.items()
     }
@@ -2276,6 +2265,30 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
         # A dimension was added to the iteration space, update splits and work slices
         dim_splits[missing_dim] = 1
         work_slices[missing_dim] = 1
+
+    # Build symbolic_dims after args so SDSCArgs.dim_order is available to resolve
+    # arg_index/dim_index. dim_location is built in one pass; then the iteration_space
+    # loop (same as before) populates symbolic_dims using a direct lookup.
+    dim_location: dict[str, tuple[int, int]] = {}
+    for arg in args:
+        for d_i, dim_sym in enumerate(arg.dim_order):
+            name = str(dim_sym)
+            if name not in dim_location:
+                dim_location[name] = (arg.arg_index, d_i)
+    symbolic_dims: dict[str, tuple[str, int, int, int, int]] = {}
+    for sym, (size_expr, _) in op_spec.iteration_space.items():
+        sdsc_dim_name = str(symbol_mapping[sym])
+        sym_str = str(size_expr)
+        if sym_str in op_spec.symbolic_dim_bounds:
+            max_val, granularity = op_spec.symbolic_dim_bounds[sym_str]
+            arg_index, dim_index = dim_location[sdsc_dim_name]
+            symbolic_dims[sdsc_dim_name] = (
+                sym_str,
+                granularity,
+                max_val,
+                arg_index,
+                dim_index,
+            )
 
     # In case of same type conversion (identity op) user gets compile time error & avoid
     # changing the padding logic here to fix errors with torch.split() for 3d shapes.

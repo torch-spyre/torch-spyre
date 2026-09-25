@@ -94,27 +94,26 @@ class SpyreSDSCKernelRunner:
         # (when frontend_pool_allocation is active), then kernel tensor
         # args in arg_index order. The payload is invariant across launches.
         if self.symbol_kinds:
-            if self.symbol_kinds[0].is_pool:
-                # call_kernel prepends the pool tensor to args, so it sits at
-                # args[0].  Kernel tensor arg_indices are 0-based among kernel
-                # tensors only, so add 1 to account for the pool.
-                self._symbolic_args: list[SymbolicArg] | None = (
-                    [SymbolicArg(kind=SymbolicArgKind.kAddress, tensor_id=0)]
-                ) + (
-                    [
-                        SymbolicArg(
-                            kind=SymbolicArgKind.kAddress,
-                            tensor_id=sk.arg_index + 1,
-                        )
-                        for sk in self.symbol_kinds[1:]
-                    ]
+            pool_offset = 1 if self.symbol_kinds[0].is_pool else 0
+
+            def _make_arg(sk: SymbolKind, pool_offset: int) -> SymbolicArg:
+                if sk.is_pool:
+                    return SymbolicArg(kind=SymbolicArgKind.kAddress, tensor_id=0)
+                if sk.is_dimension:
+                    return SymbolicArg(
+                        kind=SymbolicArgKind.kDimension,
+                        tensor_id=sk.arg_index + pool_offset,
+                        dim_index=sk.dim_index,
+                    )
+                # kAddress: kernel tensor arg
+                return SymbolicArg(
+                    kind=SymbolicArgKind.kAddress,
+                    tensor_id=sk.arg_index + pool_offset,
                 )
-            else:
-                # No pool param — arg_index maps directly to args position.
-                self._symbolic_args = [
-                    SymbolicArg(kind=SymbolicArgKind.kAddress, tensor_id=sk.arg_index)
-                    for sk in self.symbol_kinds
-                ]
+
+            self._symbolic_args: list[SymbolicArg] | None = [
+                _make_arg(sk, pool_offset) for sk in self.symbol_kinds
+            ]
         else:
             self._symbolic_args = None
 

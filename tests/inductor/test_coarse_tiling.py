@@ -3823,7 +3823,7 @@ class TestCompileOpSpecSymbolMapping(unittest.TestCase):
             args=[tensor],
             constants={},
             coordinate_masking={},
-            symbolic_dims={"mb": ("s0", 64, 1024)},
+            symbolic_dims={"mb": ("s0", 64, 1024, 0, 0)},
         )
         symbols: list[int] = []
         with self.assertRaises(Unsupported):
@@ -3891,7 +3891,7 @@ class TestCompileOpSpecSymbolMapping(unittest.TestCase):
             args=[tensor],
             constants={},
             coordinate_masking={},
-            symbolic_dims={"mb": ("s0", 64, 1024)},
+            symbolic_dims={"mb": ("s0", 64, 1024, 0, 0)},
         )
         symbols: list[int] = []
         with self.assertRaises(Unsupported):
@@ -3960,7 +3960,7 @@ class TestCompileOpSpecSymbolMapping(unittest.TestCase):
             args=[tensor],
             constants={},
             coordinate_masking={},
-            symbolic_dims={"mb": ("s0", 64, 1024)},
+            symbolic_dims={"mb": ("s0", 64, 1024, 0, 0)},
         )
         symbols: list[int] = []
         # Must not raise: mb (the split dim) is active but not the dim this

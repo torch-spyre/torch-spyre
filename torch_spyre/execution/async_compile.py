@@ -130,36 +130,6 @@ def get_output_dir(kernel_name: str):
     return kernel_output_dir
 
 
-def _compile_to_dir(
-    kernel_name: str,
-    compile_dir: str,
-    specs,
-    pool_size: int,
-):
-    """Run generate_bundle for ``specs`` into ``compile_dir``.
-
-    Shared by the cache-miss path and the no-cache path so that any change to
-    the compilation sequence is applied in both places automatically.
-
-    Returns:
-        The list of ``SymbolKind`` values produced by ``generate_bundle``,
-        describing the kind (address symbol vs. dimension argument) of each
-        symbol in the compiled bundle.
-
-    Raises:
-        NotImplementedError: if any dimension symbol is present, because the
-            runtime kDimension payload is not yet implemented and submitting
-            such a bundle to the backend compiler would produce a mismatched
-            inputSym_ slot count.
-    """
-    symbol_kinds = generate_bundle(kernel_name, compile_dir, specs, pool_size=pool_size)
-    if any(sk.is_dimension for sk in symbol_kinds):
-        raise NotImplementedError(
-            "SDSC bundle dimension symbols require runtime kDimension support"
-        )
-    return symbol_kinds
-
-
 def _run_backend_compiler(
     kernel_name: str, compile_dir: str, env: dict[str, str]
 ) -> str:
@@ -456,8 +426,8 @@ class SpyreAsyncCompile(AsyncCompile):
                 # so the rename in commit_compile_dir is atomic on POSIX.
                 compile_dir: str = allocate_compile_dir(cache_key)
                 try:
-                    symbol_kinds = _compile_to_dir(
-                        kernel_name, compile_dir, specs, pool_size
+                    symbol_kinds = generate_bundle(
+                        kernel_name, compile_dir, specs, pool_size=pool_size
                     )
                     save_symbol_kinds(compile_dir, symbol_kinds)
                     task = self._submit_backend_compile(kernel_name, compile_dir)
@@ -487,7 +457,9 @@ class SpyreAsyncCompile(AsyncCompile):
         # Caching disabled (SPYRE_KERNEL_CACHE=0 or force_disable_caches).
         # Compile into a throw-away temp dir that lives for this process only.
         output_dir = get_output_dir(kernel_name)
-        symbol_kinds = _compile_to_dir(kernel_name, output_dir, specs, pool_size)
+        symbol_kinds = generate_bundle(
+            kernel_name, output_dir, specs, pool_size=pool_size
+        )
         task = self._submit_backend_compile(kernel_name, output_dir)
         if task is not None:
             return self._compile_future(

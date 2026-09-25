@@ -190,7 +190,9 @@ class TestGenerateBundleDimensionSymbols(InductorTestCase):
 
     def test_single_dim_sym_function_signature(self):
         """Dimension symbol always produces an input_arg param."""
-        dim_kind = SymbolKind.dimension(granularity=56, max_value=616, pytorch_sym="s0")
+        dim_kind = SymbolKind.dimension(
+            granularity=56, max_value=616, pytorch_sym="s0", arg_index=0, dim_index=0
+        )
         entry = (_make_sdsc_json(dim_sym_ids={"mb": [-1]}), [0], [], [dim_kind])
 
         bundle = self._run_bundle([entry])
@@ -202,7 +204,9 @@ class TestGenerateBundleDimensionSymbols(InductorTestCase):
 
     def test_single_dim_sym_extract_op(self):
         """input_arg_extract unpacks %sym_0_1_base into plain index %sym_0_1."""
-        dim_kind = SymbolKind.dimension(granularity=56, max_value=616, pytorch_sym="s0")
+        dim_kind = SymbolKind.dimension(
+            granularity=56, max_value=616, pytorch_sym="s0", arg_index=0, dim_index=0
+        )
         entry = (_make_sdsc_json(dim_sym_ids={"mb": [-1]}), [0], [], [dim_kind])
 
         bundle = self._run_bundle([entry])
@@ -215,7 +219,9 @@ class TestGenerateBundleDimensionSymbols(InductorTestCase):
 
     def test_single_dim_sym_sdsc_execute_operand(self):
         """sdsc_execute passes %sym_0_1 as operand with symbol_id=-1."""
-        dim_kind = SymbolKind.dimension(granularity=56, max_value=616, pytorch_sym="s0")
+        dim_kind = SymbolKind.dimension(
+            granularity=56, max_value=616, pytorch_sym="s0", arg_index=0, dim_index=0
+        )
         entry = (_make_sdsc_json(dim_sym_ids={"mb": [-1]}), [0], [], [dim_kind])
 
         bundle = self._run_bundle([entry])
@@ -226,10 +232,10 @@ class TestGenerateBundleDimensionSymbols(InductorTestCase):
     def test_duplicate_pytorch_sym_single_param(self):
         """Two SDSCs with the same pytorch_sym share one param; both resolve to %sym_0_1."""
         dim_kind_0 = SymbolKind.dimension(
-            granularity=56, max_value=616, pytorch_sym="s0"
+            granularity=56, max_value=616, pytorch_sym="s0", arg_index=0, dim_index=0
         )
         dim_kind_1 = SymbolKind.dimension(
-            granularity=56, max_value=616, pytorch_sym="s0"
+            granularity=56, max_value=616, pytorch_sym="s0", arg_index=0, dim_index=0
         )
         entry_0 = (
             _make_sdsc_json(sdsc_idx=0, dim_sym_ids={"mb": [-1]}),
@@ -255,8 +261,12 @@ class TestGenerateBundleDimensionSymbols(InductorTestCase):
 
     def test_two_distinct_pytorch_syms_two_params(self):
         """Two distinct pytorch_syms produce two independent params and extract ops."""
-        dim_s0 = SymbolKind.dimension(granularity=56, max_value=616, pytorch_sym="s0")
-        dim_s1 = SymbolKind.dimension(granularity=32, max_value=256, pytorch_sym="s1")
+        dim_s0 = SymbolKind.dimension(
+            granularity=56, max_value=616, pytorch_sym="s0", arg_index=0, dim_index=0
+        )
+        dim_s1 = SymbolKind.dimension(
+            granularity=32, max_value=256, pytorch_sym="s1", arg_index=0, dim_index=1
+        )
         entry = (
             _make_sdsc_json(dim_sym_ids={"mb": [-1], "nb": [-2]}),
             [0, 0],
@@ -283,7 +293,9 @@ class TestGenerateBundleDimensionSymbols(InductorTestCase):
 
         Both kinds must appear side by side, in the correct param/operand order.
         """
-        dim_kind = SymbolKind.dimension(granularity=56, max_value=616, pytorch_sym="s0")
+        dim_kind = SymbolKind.dimension(
+            granularity=56, max_value=616, pytorch_sym="s0", arg_index=0, dim_index=0
+        )
         kernel_kind = SymbolKind.kernel(arg_index=0)
         entry = (
             _make_sdsc_json(
@@ -397,7 +409,9 @@ class TestGenerateBundleDimensionSymbols(InductorTestCase):
     def test_pool_absent_when_no_pool_symbols(self):
         """A bundle with no pool symbols emits no device_mem_allocate at all,
         regardless of the pool_size argument passed in."""
-        dim_kind = SymbolKind.dimension(granularity=56, max_value=616, pytorch_sym="s0")
+        dim_kind = SymbolKind.dimension(
+            granularity=56, max_value=616, pytorch_sym="s0", arg_index=0, dim_index=0
+        )
         entry = (_make_sdsc_json(dim_sym_ids={"mb": [-1]}), [0], [], [dim_kind])
 
         bundle = self._run_bundle([entry], pool_size=65536)

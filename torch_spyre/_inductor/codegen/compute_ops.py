@@ -87,17 +87,22 @@ class SymbolKind:
                                              ``input_arg`` params directly; LX addresses
                                              are baked constants, never symbols).
                                              Emitted as ``arith.addi %pool, value``.
-      - ``dimension(gran, max, sym)``:       dynamic iteration-space dim size from
+      - ``dimension(gran, max, sym, arg_index, dim_index)``:
+                                             dynamic iteration-space dim size from
                                              mark_dynamic; carried in SDSC JSON as a
                                              ``dimToSymbolMapping_`` entry.  Registered
                                              before address symbols so their negative IDs
                                              never collide with address symbol IDs.
+                                             ``arg_index`` is the positional index of the
+                                             kernel tensor arg whose shape carries this dim;
+                                             ``dim_index`` is the axis of that tensor.
     """
 
     kind: str
     base_sym_idx: int = -1
     offset: int = 0
     arg_index: int = -1
+    dim_index: int = -1  # Only meaningful for the dimension variant.
     granularity: int = 0
     max_value: int = 0
     pytorch_sym: str = ""
@@ -155,13 +160,20 @@ class SymbolKind:
 
     @classmethod
     def dimension(
-        cls, granularity: int, max_value: int, pytorch_sym: str
+        cls,
+        granularity: int,
+        max_value: int,
+        pytorch_sym: str,
+        arg_index: int,
+        dim_index: int,
     ) -> "SymbolKind":
         return cls(
             kind="dimension",
             granularity=granularity,
             max_value=max_value,
             pytorch_sym=pytorch_sym,
+            arg_index=arg_index,
+            dim_index=dim_index,
         )
 
     @property
@@ -538,7 +550,7 @@ def _symbolic_split_info(
     """
     if tensor.arg_index < 0:
         return None
-    for sdsc_dim, (pytorch_sym, _granularity, _max_val) in symbolic_dims.items():
+    for sdsc_dim, (pytorch_sym, _granularity, _max_val, *_) in symbolic_dims.items():
         dim_sym = Symbol(sdsc_dim)
         split = work_slices.get(dim_sym)
         if split is None or split <= 1:
@@ -569,7 +581,7 @@ def _per_core_symbolic_dim_info(symbolic_dims: dict, work_slices: dict) -> dict:
     must stay byte-for-byte identical -- factored out so the two never drift.
     """
     info = {}
-    for dim_name, (_, granularity, max_val) in symbolic_dims.items():
+    for dim_name, (_, granularity, max_val, *_) in symbolic_dims.items():
         wk_slices = work_slices[Symbol(dim_name)]
         info[dim_name] = {
             "maxSize_": max_val // wk_slices,
@@ -735,12 +747,20 @@ def generate_sdsc(
     # Dim symbols carry no HBM byte value; 0 is appended to `symbols` as a placeholder.
     dim_local_symbols: dict[str, int] = {}  # pytorch_sym_name -> negative symbol ID
     dim_symbol_kinds: list[SymbolKind] = []
-    for sdsc_dim, (pytorch_sym, granularity, max_value) in symbolic_dims.items():
+    for sdsc_dim, (
+        pytorch_sym,
+        granularity,
+        max_value,
+        arg_index,
+        dim_index,
+    ) in symbolic_dims.items():
         if pytorch_sym not in dim_local_symbols:
             sym_id = -(symbol_id_offset + len(dim_symbol_kinds) + 1)
             dim_local_symbols[pytorch_sym] = sym_id
             dim_symbol_kinds.append(
-                SymbolKind.dimension(granularity, max_value, pytorch_sym)
+                SymbolKind.dimension(
+                    granularity, max_value, pytorch_sym, arg_index, dim_index
+                )
             )
             symbols.append(0)  # placeholder: dim symbols have no HBM byte value
     n_dim_syms = len(dim_symbol_kinds)
@@ -1407,8 +1427,7 @@ def generate_sdsc(
                                         sdsc_dim: [dim_local_symbols[pytorch_sym]]
                                         for sdsc_dim, (
                                             pytorch_sym,
-                                            granularity,
-                                            max_value,
+                                            *_,
                                         ) in symbolic_dims.items()
                                         if pytorch_sym in dim_local_symbols
                                     },

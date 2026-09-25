@@ -380,7 +380,6 @@ class SymbolicArgKind:
 
 class SymbolicArg:
     kind: SymbolicArgKind
-    value: int
     tensor_id: int
     dim_index: int
     def __init__(
@@ -388,7 +387,6 @@ class SymbolicArg:
         kind: SymbolicArgKind,
         tensor_id: int,
         dim_index: int = -1,
-        value: int = -1,
     ) -> None: ...
     def __repr__(self) -> str: ...
 

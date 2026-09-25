@@ -601,13 +601,12 @@ PYBIND11_MODULE(_C, m) {
 
   py::class_<spyre::SymbolicArg>(m, "SymbolicArg")
       .def(py::init([](spyre::SymbolicArgKind kind, int64_t tensor_id,
-                       int64_t dim_index, int64_t value) {
-             return spyre::SymbolicArg{kind, tensor_id, dim_index, value};
+                       int64_t dim_index) {
+             return spyre::SymbolicArg{kind, tensor_id, dim_index};
            }),
            py::arg("kind"), py::arg("tensor_id"),
-           py::arg("dim_index") = int64_t{-1}, py::arg("value") = int64_t{-1})
+           py::arg("dim_index") = int64_t{-1})
       .def_readwrite("kind", &spyre::SymbolicArg::kind)
-      .def_readwrite("value", &spyre::SymbolicArg::value)
       .def_readwrite("tensor_id", &spyre::SymbolicArg::tensor_id)
       .def_readwrite("dim_index", &spyre::SymbolicArg::dim_index)
       .def("__repr__", [](const spyre::SymbolicArg& a) {
