@@ -182,14 +182,15 @@ void JobPlanStepHostCompute::construct(LaunchContext& ctx,
     producer = [this, kAlign]() -> std::shared_ptr<flex::RaiiBuffer> {
       auto buf = std::make_shared<flex::RaiiBuffer>(correction_size_, kAlign);
       deeptools::processComputeOnHostCommand(*hcm_, buf->Pointer(),
-                                             input_buffer_);
+                                             buf->SizeBytes(), input_buffer_);
       return buf;
     };
   } else if (ishape_.size() == 1 && ishape_[0] == 0) {
     // Case 2: fake symbols (ishape_ is {0}) — nullptr src argument.
     producer = [this, kAlign]() -> std::shared_ptr<flex::RaiiBuffer> {
       auto buf = std::make_shared<flex::RaiiBuffer>(correction_size_, kAlign);
-      deeptools::processComputeOnHostCommand(*hcm_, buf->Pointer(), nullptr);
+      deeptools::processComputeOnHostCommand(*hcm_, buf->Pointer(),
+                                             buf->SizeBytes(), nullptr);
       return buf;
     };
   } else if (!ctx.symbolic_args.empty()) {
@@ -207,8 +208,8 @@ void JobPlanStepHostCompute::construct(LaunchContext& ctx,
     producer = [this, kAlign,
                 resolved_addresses]() -> std::shared_ptr<flex::RaiiBuffer> {
       auto buf = std::make_shared<flex::RaiiBuffer>(correction_size_, kAlign);
-      deeptools::processComputeOnHostCommand(*hcm_, buf->Pointer(),
-                                             &resolved_addresses);
+      deeptools::processComputeOnHostCommand(
+          *hcm_, buf->Pointer(), buf->SizeBytes(), &resolved_addresses);
       return buf;
     };
   } else {
@@ -232,7 +233,7 @@ void JobPlanStepHostCompute::construct(LaunchContext& ctx,
       auto buf = std::make_shared<flex::RaiiBuffer>(correction_size_, kAlign);
       // Use fast path with all tensor addresses.
       deeptools::processComputeOnHostCommandFast(
-          fast_plan_, *hcm_, buf->Pointer(), addresses.data(),
+          fast_plan_, *hcm_, buf->Pointer(), buf->SizeBytes(), addresses.data(),
           addresses.size());
       return buf;
     };
