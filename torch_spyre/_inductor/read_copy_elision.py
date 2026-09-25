@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import dataclasses
+import copy
 
 import sympy
 from torch._inductor.dependencies import MemoryDep
@@ -39,6 +40,7 @@ from .logging_utils import get_inductor_logger
 from .loop_info import CoarseTileInfo, ReadCopyElisionRecord, copy_op_metadata
 from .pass_utils import (
     _per_core_view_on_buf,
+    commit_iteration_space_ownership,
     device_coordinates,
     find_matmul_generated_var,
     identify_matmul_inputs,
@@ -516,6 +518,63 @@ def _validate_proposal(
     except Exception as exc:
         return f"coarse-tile validation failed: {exc}"
     return None
+
+
+def project_transport_read_copies(graph, division_splits, *, relayout_sources=()):
+    """Non-mutating cost view of transport copies removable for every candidate.
+
+    The allocator still plans the original buffers, and the normal late pass
+    still validates and performs removal. Pricing a removable staging copy's
+    own division is misleading: the executed direct read uses its consumer's
+    division instead. Reuse the full address/ownership/loop proof for *every*
+    candidate, declining the projection if any candidate or graph check fails.
+    No assumption about a preferred split or final LX placement is needed.
+    """
+    operations = list(graph.operations)
+    if not config.read_copy_elision:
+        return operations
+    for consumer in list(operations):
+        record = getattr(consumer, "_read_copy_elision_record", None)
+        if (
+            not isinstance(consumer, ComputedBuffer)
+            or not isinstance(record, ReadCopyElisionRecord)
+            or not isinstance(consumer.data, Pointwise)
+            or set(consumer.data.inner_fn_opcount().used_ops) != {"load"}
+        ):
+            continue
+        candidates = division_splits.get(consumer.get_name(), ())
+        # A later input clone or LX relayout can redirect this read and invalidate
+        # its saved record. Keep those allocation-dependent cases authoritative.
+        if (
+            not candidates
+            or record.source_name in division_splits
+            or record.copy_name in relayout_sources
+        ):
+            continue
+        copy_op = next(
+            (op for op in operations if op.get_name() == record.copy_name), None
+        )
+        if not isinstance(copy_op, ComputedBuffer):
+            continue
+        if _copy_readers(operations, record.copy_name) != [consumer]:
+            continue
+        direct_op = None
+        for splits in candidates:
+            candidate = copy.copy(consumer)
+            commit_iteration_space_ownership(candidate, splits)
+            direct_op, _ = _prove_matmul_direct_read(candidate, copy_op, record)
+            if direct_op is None:
+                break
+            if _validate_proposal(operations, consumer, direct_op, copy_op) is not None:
+                direct_op = None
+                break
+        if direct_op is not None:
+            operations = [
+                direct_op if op is consumer else op
+                for op in operations
+                if op is not copy_op
+            ]
+    return operations
 
 
 def elide_proven_read_copies(graph: GraphLowering) -> None:

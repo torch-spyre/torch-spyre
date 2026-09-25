@@ -55,11 +55,16 @@ from for_each_tile_fixtures import (
     matmul_inputs,
     nested_split_m_then_k_fn,
     nested_split_m_then_k_reference,
+    nested_two_inner_loops_shared_init_fn,
     paged_gather_inputs,
     paged_gather_reference,
+    split_k_caller_init_fn,
     split_k_fn,
+    split_k_private_transposed_init_fn,
+    split_k_transposed_caller_init_fn,
     split_m_elementwise_fn,
     split_m_fn,
+    two_loops_shared_init_fn,
 )
 from torch_spyre._inductor.wsr.for_each_tile_lowering import (
     try_prove_for_each_tile,
@@ -628,6 +633,439 @@ def _find_while_loop_ir_op(fn, args):
     return while_ops[0]
 
 
+class TestCarryRealInputOwnership(unittest.TestCase):
+    """The in-place-guard predicate on real IR buffers (no device)."""
+
+    def _computed(self, name, size=(2, 3), stride=(3, 1)):
+        from torch._inductor import ir
+
+        data = mock.MagicMock(spec=ir.Pointwise)
+        data.ranges = list(size)
+        op = ir.ComputedBuffer(
+            name=name,
+            layout=ir.FixedLayout(
+                torch.device("cpu"), torch.float32, list(size), list(stride)
+            ),
+            data=data,
+        )
+        op.operation_name = name
+        return op
+
+    def _graph(self, ops, inputs=(), outputs=(), never_reuse=()):
+        class _G:
+            def __init__(self):
+                self.operations = list(ops)
+                self.graph_inputs = {n: None for n in inputs}
+                self.never_reuse_buffers = set(never_reuse)
+
+            def get_output_names(self):
+                return list(outputs)
+
+        return _G()
+
+    def test_private_in_graph_buffer_is_owned(self):
+        import torch_spyre._inductor.wsr.while_loop_bridge as bridge
+
+        buf = self._computed("carry_buf")
+        self.assertTrue(
+            bridge._carry_real_input_is_private(self._graph([buf]), object(), buf, 0)
+        )
+
+    def test_graph_input_is_not_owned(self):
+        import torch_spyre._inductor.wsr.while_loop_bridge as bridge
+
+        buf = self._computed("carry_buf")
+        self.assertFalse(
+            bridge._carry_real_input_is_private(
+                self._graph([buf], inputs=["carry_buf"]), object(), buf, 0
+            )
+        )
+
+    def _view(self, storage, size, stride, offset=0):
+        from torch._inductor import ir
+
+        return ir.ReinterpretView(
+            data=ir.StorageBox(storage),
+            layout=ir.FixedLayout(
+                torch.device("cpu"), torch.float32, list(size), list(stride), offset
+            ),
+        )
+
+    def test_aliased_view_of_graph_input_is_not_owned(self):
+        """Ownership resolves the storage; a view of a graph input is not."""
+        import torch_spyre._inductor.wsr.while_loop_bridge as bridge
+        from torch._inductor import ir
+
+        storage = self._computed("carry_storage")
+        view = self._view(storage, [3, 2], [1, 3])
+        self.assertFalse(
+            bridge._carry_real_input_is_private(
+                self._graph([storage], inputs=["carry_storage"]),
+                object(),
+                ir.TensorBox(view),
+                0,
+            )
+        )
+
+    def test_view_of_private_storage_is_owned(self):
+        """A view of compiler-created scratch is owned (zero-copy), not copied
+        (the #4838 SDPA case)."""
+        import torch_spyre._inductor.wsr.while_loop_bridge as bridge
+        from torch._inductor import ir
+
+        storage = self._computed("carry_storage")
+        view = self._view(storage, [3, 2], [1, 3])
+        self.assertTrue(
+            bridge._carry_real_input_is_private(
+                self._graph([storage]), object(), ir.TensorBox(view), 0
+            )
+        )
+
+    def test_storage_shared_with_loop_operand_is_not_owned(self):
+        """This loop may use the storage only through this carry's own slot."""
+        import torch_spyre._inductor.wsr.while_loop_bridge as bridge
+
+        storage = self._computed("carry_buf")
+
+        class _While:
+            carried_inputs = [storage]
+            additional_inputs = [storage]
+
+        self.assertFalse(
+            bridge._carry_real_input_is_private(
+                self._graph([storage]), _While(), storage, 0
+            )
+        )
+
+    def test_full_span_relayout_accepts_dense_permutation(self):
+        import torch_spyre._inductor.wsr.while_loop_bridge as bridge
+
+        storage = self._computed("carry_storage", size=(2, 3), stride=(3, 1))
+        view = self._view(storage, [3, 2], [1, 3])
+        self.assertTrue(bridge._is_full_span_relayout(view.layout, storage.layout))
+
+    def test_full_span_relayout_accepts_sympy_integer_layouts(self):
+        """Real Inductor layouts use sympy.Integer; the predicate needs Python
+        ints, so the proof must concretize before calling it."""
+        import sympy
+
+        import torch_spyre._inductor.wsr.while_loop_bridge as bridge
+        from torch._inductor import ir
+
+        storage = ir.FixedLayout(
+            torch.device("cpu"),
+            torch.float32,
+            [sympy.Integer(64), sympy.Integer(256)],
+            [sympy.Integer(256), sympy.Integer(1)],
+            sympy.Integer(0),
+        )
+        view = ir.FixedLayout(
+            torch.device("cpu"),
+            torch.float32,
+            [sympy.Integer(256), sympy.Integer(64)],
+            [sympy.Integer(1), sympy.Integer(256)],
+            sympy.Integer(0),
+        )
+        self.assertTrue(bridge._is_full_span_relayout(view, storage))
+
+    def test_symbolic_layout_values_are_not_full_span(self):
+        import sympy
+
+        import torch_spyre._inductor.wsr.while_loop_bridge as bridge
+
+        storage = self._computed("carry_storage", size=(2, 3), stride=(3, 1))
+        symbol = sympy.Symbol("s0", integer=True, positive=True)
+        for field, value in (
+            ("size", [symbol, 2]),
+            ("stride", [1, symbol]),
+            ("offset", 64 * symbol),
+        ):
+            with self.subTest(field=field):
+                view = self._view(storage, [3, 2], [1, 3])
+                setattr(view.layout, field, value)
+                self.assertFalse(
+                    bridge._is_full_span_relayout(view.layout, storage.layout)
+                )
+
+    def test_non_integer_layout_values_are_not_full_span(self):
+        import sympy
+
+        import torch_spyre._inductor.wsr.while_loop_bridge as bridge
+
+        storage = self._computed("carry_storage", size=(2, 3), stride=(3, 1))
+        for value in (sympy.Rational(13, 4), sympy.oo, sympy.nan):
+            with self.subTest(value=value):
+                view = self._view(storage, [3, 2], [1, 3])
+                view.layout.size[0] = value
+                self.assertFalse(
+                    bridge._is_full_span_relayout(view.layout, storage.layout)
+                )
+
+    def test_malformed_layout_raises(self):
+        import sympy
+
+        import torch_spyre._inductor.wsr.while_loop_bridge as bridge
+
+        storage = self._computed("carry_storage", size=(2, 3), stride=(3, 1))
+        with self.assertRaises(AttributeError):
+            bridge._is_full_span_relayout(object(), storage.layout)
+        view = self._view(storage, [3, 2], [1, 3])
+        view.layout.offset = object()
+        with self.assertRaises(sympy.SympifyError):
+            bridge._is_full_span_relayout(view.layout, storage.layout)
+
+    def test_full_span_relayout_surfaces_density_check_errors(self):
+        import torch_spyre._inductor.wsr.while_loop_bridge as bridge
+
+        storage = self._computed("carry_storage", size=(2, 3), stride=(3, 1))
+        view = self._view(storage, [3, 2], [1, 3])
+        for error in (AssertionError, RuntimeError, TypeError, ValueError):
+            with (
+                self.subTest(error=error),
+                mock.patch(
+                    "torch._prims_common._is_non_overlapping_and_dense_or_false",
+                    side_effect=error("density proof defect"),
+                ),
+            ):
+                with self.assertRaisesRegex(error, "density proof defect"):
+                    bridge._is_full_span_relayout(view.layout, storage.layout)
+
+    def test_offset_view_is_not_full_span(self):
+        import torch_spyre._inductor.wsr.while_loop_bridge as bridge
+
+        storage = self._computed("carry_storage", size=(2, 4), stride=(4, 1))
+        view = self._view(storage, [2, 4], [4, 1], offset=1)
+        self.assertFalse(bridge._is_full_span_relayout(view.layout, storage.layout))
+
+    def test_overlapping_view_is_not_full_span(self):
+        import torch_spyre._inductor.wsr.while_loop_bridge as bridge
+
+        storage = self._computed("carry_storage", size=(2, 2), stride=(2, 1))
+        view = self._view(storage, [2, 2], [1, 1])
+        self.assertFalse(bridge._is_full_span_relayout(view.layout, storage.layout))
+
+    def test_zero_stride_view_is_not_full_span(self):
+        import torch_spyre._inductor.wsr.while_loop_bridge as bridge
+
+        storage = self._computed("carry_storage", size=(2, 4), stride=(4, 1))
+        view = self._view(storage, [2, 4], [1, 0])
+        self.assertFalse(bridge._is_full_span_relayout(view.layout, storage.layout))
+
+    def test_holed_backing_is_not_full_span(self):
+        """A dense view over a holed/overlapping backing must not qualify:
+        the logical element copy never writes the hole addresses the view
+        would read."""
+        import torch_spyre._inductor.wsr.while_loop_bridge as bridge
+
+        storage = self._computed("carry_storage", size=(2, 2), stride=(3, 1))
+        view = self._view(storage, [2, 2], [2, 1])
+        self.assertFalse(bridge._is_full_span_relayout(view.layout, storage.layout))
+
+    def test_offset_backing_is_not_full_span(self):
+        import torch_spyre._inductor.wsr.while_loop_bridge as bridge
+
+        storage = self._computed("carry_storage", size=(2, 2), stride=(2, 1))
+        storage.layout.offset = 1
+        view = self._view(storage, [2, 2], [2, 1])
+        self.assertFalse(bridge._is_full_span_relayout(view.layout, storage.layout))
+
+    def test_rank_changing_view_is_not_full_span(self):
+        import torch_spyre._inductor.wsr.while_loop_bridge as bridge
+
+        storage = self._computed("carry_storage", size=(6,), stride=(1,))
+        view = self._view(storage, [2, 3], [3, 1])
+        self.assertFalse(bridge._is_full_span_relayout(view.layout, storage.layout))
+
+    def test_copy_source_resolves_full_span_view_and_plain_buffer(self):
+        import torch_spyre._inductor.wsr.while_loop_bridge as bridge
+        from torch._inductor import ir
+
+        storage = self._computed("carry_storage", size=(2, 3), stride=(3, 1))
+        view = self._view(storage, [3, 2], [1, 3])
+        got_storage, got_layout = bridge._copy_source_and_view(ir.TensorBox(view))
+        self.assertIs(got_storage, storage)
+        self.assertEqual(list(got_layout.size), [3, 2])
+        got_storage2, got_layout2 = bridge._copy_source_and_view(storage)
+        self.assertIs(got_storage2, storage)
+        self.assertIsNone(got_layout2)
+
+    def test_materialize_carry_copy_of_view_is_identity_plus_view(self):
+        """The caller-view copy is one identity copy of the storage, the carry
+        target a view over it, with empty origins and the input untouched."""
+        import types
+
+        import torch_spyre._inductor.wsr.while_loop_bridge as bridge
+        from torch._inductor import ir
+
+        storage = self._computed("carry_storage", size=(2, 3), stride=(3, 1))
+        view = self._view(storage, [3, 2], [1, 3])
+        while_op = types.SimpleNamespace(get_name=lambda: "while_op")
+        graph = self._graph([while_op])
+        graph.name_to_op = {}
+        graph.name_to_buffer = {}
+        graph.buffers = []
+        graph.qualify_name = lambda n: n
+        binding = types.SimpleNamespace(scratch_name="carry0", carry_index=0)
+
+        class _SizeVars:
+            def statically_known_true(self, expr):
+                return False
+
+            def statically_known_equals(self, a, b):
+                return a == b
+
+            def guard_or_false(self, expr):
+                return False
+
+        class _Graph:
+            sizevars = _SizeVars()
+
+        with V.set_graph_handler(_Graph()):
+            target = bridge._materialize_carry_copy(
+                graph, while_op, ir.TensorBox(view), binding
+            )
+        self.assertIsInstance(target, ir.ReinterpretView)
+        self.assertEqual(list(target.layout.size), [3, 2])
+        self.assertEqual(list(target.layout.stride), [1, 3])
+        copies = [
+            op
+            for op in graph.operations
+            if "while_loop_carry_copy_" in (op.get_name() or "")
+        ]
+        self.assertEqual(len(copies), 1)
+        # identity copy of the backing storage (nonsquare, same size/stride),
+        # empty origins
+        self.assertEqual(list(copies[0].layout.size), [2, 3])
+        self.assertEqual(list(copies[0].layout.stride), [3, 1])
+        self.assertEqual(list(copies[0].data.ranges), [2, 3])
+        self.assertFalse(copies[0].origins)
+
+    def test_copy_source_refuses_unprovable_view(self):
+        import torch_spyre._inductor.wsr.while_loop_bridge as bridge
+        from torch._inductor import ir
+
+        storage = self._computed("carry_storage", size=(2, 4), stride=(4, 1))
+        view = self._view(storage, [2, 2], [4, 1], offset=1)
+        with self.assertRaises(bridge.Unsupported):
+            bridge._copy_source_and_view(ir.TensorBox(view))
+
+    def test_snapshot_of_view_copies_storage_and_preserves_direct_view(self):
+        import types
+
+        import torch_spyre._inductor.wsr.while_loop_bridge as bridge
+        from torch._inductor import ir
+
+        storage = self._computed("carry_storage", size=(2, 3), stride=(3, 1))
+        view = self._view(storage, [3, 2], [1, 3])
+        placeholder = ir.InputBuffer(name="carry_placeholder", layout=view.layout)
+        producer = self._computed("carry_update", size=(3, 2), stride=(1, 3))
+        reader = types.SimpleNamespace(inputs=[placeholder])
+        graph = self._graph([])
+        graph.name_to_op = {}
+        graph.name_to_buffer = {}
+        graph.buffers = []
+        graph.qualify_name = lambda name: name
+        graph.sizevars = types.SimpleNamespace(
+            statically_known_true=lambda expr: False,
+            statically_known_equals=lambda a, b: a == b,
+            guard_or_false=lambda expr: False,
+        )
+        with V.set_graph_handler(graph):
+            body = bridge._snapshot_carry_placeholder(
+                graph,
+                "carry_placeholder",
+                "carry_update",
+                ir.TensorBox(view),
+                [reader],
+                [producer, reader],
+            )
+
+        snapshot = body[0]
+        self.assertEqual(body[1:], [producer, reader])
+        self.assertEqual(list(snapshot.layout.size), [2, 3])
+        self.assertEqual(list(snapshot.layout.stride), [3, 1])
+        self.assertFalse(snapshot.origins)
+        target = reader.inputs[0]
+        self.assertIsInstance(target, ir.ReinterpretView)
+        self.assertEqual(list(target.layout.size), [3, 2])
+        self.assertEqual(list(target.layout.stride), [1, 3])
+        self.assertIs(bridge._storage_buffer(target), snapshot)
+
+    def test_copy_source_refuses_lazy_view(self):
+        """A lazy PermuteView/SliceView reports the BACKING layout from
+        get_layout(), so accepting it as backing identity would drop the
+        transform; only a ReinterpretView is accepted."""
+        import torch_spyre._inductor.wsr.while_loop_bridge as bridge
+        from torch._inductor import ir
+
+        lazy = mock.MagicMock(spec=ir.BaseView)
+        self.assertFalse(isinstance(lazy, ir.ReinterpretView))
+        with self.assertRaises(bridge.Unsupported):
+            bridge._copy_source_and_view(lazy)
+
+    def test_storage_name_of_scalar_constant_is_none(self):
+        """ShapeAsConstantBuffer/NoneAsConstantBuffer are IRNodes, not Buffers,
+        and their get_name() raises; scalars must yield None, not crash."""
+        import torch_spyre._inductor.wsr.while_loop_bridge as bridge
+        from torch._inductor import ir
+
+        self.assertIsNone(bridge._storage_name(ir.NoneAsConstantBuffer()))
+        self.assertIsNone(bridge._storage_name(ir.ShapeAsConstantBuffer(expr=1)))
+
+    def test_scalar_additional_input_does_not_crash_scan(self):
+        import torch_spyre._inductor.wsr.while_loop_bridge as bridge
+        from torch._inductor import ir
+
+        storage = self._computed("carry_buf")
+
+        class _While:
+            carried_inputs = [storage]
+            additional_inputs = [ir.NoneAsConstantBuffer()]
+
+        self.assertTrue(
+            bridge._carry_real_input_is_private(
+                self._graph([storage]), _While(), storage, 0
+            )
+        )
+
+    def test_unknown_reader_is_not_owned(self):
+        import torch_spyre._inductor.wsr.while_loop_bridge as bridge
+
+        buf = self._computed("carry_buf")
+
+        class _BadReader:
+            def get_read_writes(self):
+                raise RuntimeError("cannot statically read this op")
+
+        self.assertFalse(
+            bridge._carry_real_input_is_private(
+                self._graph([buf, _BadReader()]), object(), buf, 0
+            )
+        )
+
+    def test_other_reader_is_not_owned(self):
+        import sympy
+
+        import torch_spyre._inductor.wsr.while_loop_bridge as bridge
+        from torch._inductor.dependencies import MemoryDep
+
+        buf = self._computed("carry_buf")
+
+        class _Reader:
+            def __init__(self, dep):
+                self._dep = dep
+
+            def get_read_writes(self):
+                return mock.Mock(reads=[self._dep], writes=set())
+
+        dep = MemoryDep("carry_buf", sympy.Symbol("d0"), (2,), ())
+        self.assertFalse(
+            bridge._carry_real_input_is_private(
+                self._graph([buf, _Reader(dep)]), object(), buf, 0
+            )
+        )
+
+
 class TestSpliceWhileLoops(unittest.TestCase):
     def _run_graph(self, fn, args):
         """Lower fn(*args) through a fresh GraphLowering and return it.
@@ -652,11 +1090,21 @@ class TestSpliceWhileLoops(unittest.TestCase):
                 break
         assert fake_mode is not None, "could not recover a fake_mode from gm node.meta"
 
+        # Lowered on the captured graph's OWN placeholders, not on `args`:
+        # dynamo/AOT order the post-grad graph's placeholders by nothing the
+        # caller controls (e.g. a fixture that visits acc0.t() before the tiled
+        # operands gets arg0=acc0), so feeding `args` positionally binds inputs
+        # to the wrong placeholders and blows up in lowering on a shape
+        # mismatch. Fake tensors are what the real Inductor pipeline runs
+        # GraphLowering on anyway (same pattern as TestConsumeTileDimMarkers).
+        placeholders = [
+            node.meta["val"] for node in gm.graph.nodes if node.op == "placeholder"
+        ]
         graph = GraphLowering(
-            gm, example_inputs=list(args), shape_env=fake_mode.shape_env
+            gm, example_inputs=placeholders, shape_env=fake_mode.shape_env
         )
         with V.set_graph_handler(graph), V.set_fake_mode(fake_mode):
-            graph.run(*args)
+            graph.run(*placeholders)
         return graph
 
     def test_map_mode_group_gets_loop_info(self):
@@ -689,6 +1137,166 @@ class TestSpliceWhileLoops(unittest.TestCase):
                 info = op.loop_info
                 self.assertEqual(info.loop_group_id, (0,))
                 self.assertIsNone(info.propagation)
+
+    def test_private_in_graph_fill_keeps_single_buffer(self):
+        """A compiler-owned in-graph `torch.zeros` fill is not copied."""
+        from torch._inductor.virtualized import V
+
+        from torch_spyre._inductor.wsr.for_each_tile_lowering import (
+            splice_while_loops,
+        )
+
+        (X, Y), _ref = matmul_inputs()
+        graph = self._run_graph(split_k_fn, (X, Y))
+        with V.set_graph_handler(graph):
+            splice_while_loops(graph)
+        copies = [
+            op
+            for op in graph.operations
+            if "while_loop_carry_copy_" in (op.get_name() or "")
+        ]
+        self.assertFalse(
+            copies, "a private in-graph fill must keep the single-buffer path"
+        )
+
+    def test_caller_init_gets_private_pre_loop_copy(self):
+        """A caller tensor used as init gets one private pre-loop copy, and no
+        graph input is left as an in-place mutation target."""
+        from torch._inductor import ir
+        from torch._inductor.virtualized import V
+
+        from torch_spyre._inductor.wsr.for_each_tile_lowering import (
+            splice_while_loops,
+        )
+
+        (X, Y), ref = matmul_inputs()
+        acc0 = torch.zeros_like(ref)
+        graph = self._run_graph(split_k_caller_init_fn, (X, Y, acc0))
+        input_names = set(graph.graph_inputs.keys())
+        with V.set_graph_handler(graph):
+            splice_while_loops(graph)
+        copies = [
+            op
+            for op in graph.operations
+            if "while_loop_carry_copy_" in (op.get_name() or "")
+        ]
+        self.assertEqual(
+            len(copies), 1, "caller-owned init must get exactly one pre-loop copy"
+        )
+        mutators = [
+            op
+            for op in graph.operations
+            if isinstance(getattr(op, "layout", None), ir.MutationLayoutSHOULDREMOVE)
+        ]
+        self.assertTrue(mutators, "expected an in-place accumulator")
+        copy_idx = graph.operations.index(copies[0])
+        for op in mutators:
+            self.assertLess(
+                copy_idx,
+                graph.operations.index(op),
+                "the pre-loop copy must precede the in-place accumulator",
+            )
+            self.assertNotIn(
+                op.layout.get_buffer().get_name(),
+                input_names,
+                "no graph input may be used as an in-place mutation target",
+            )
+
+    def test_private_transposed_init_keeps_single_buffer(self):
+        """A permuted view of compiler-created scratch must not be copied
+        (#4838: private storage stays zero-copy)."""
+        from torch._inductor.virtualized import V
+
+        from torch_spyre._inductor.wsr.for_each_tile_lowering import (
+            splice_while_loops,
+        )
+
+        (X, Y), _ref = matmul_inputs()
+        graph = self._run_graph(split_k_private_transposed_init_fn, (X, Y))
+        with V.set_graph_handler(graph):
+            splice_while_loops(graph)
+        copies = [
+            op
+            for op in graph.operations
+            if "while_loop_carry_copy_" in (op.get_name() or "")
+        ]
+        self.assertFalse(
+            copies, "a private permuted-view init must keep the single-buffer path"
+        )
+
+    def test_transposed_caller_init_gets_private_view_copy(self):
+        """A transposed view init must splice via one identity storage copy and
+        leave the caller's graph input unmutated (regression: #4838)."""
+        from torch._inductor import ir
+        from torch._inductor.virtualized import V
+
+        from torch_spyre._inductor.wsr.for_each_tile_lowering import (
+            splice_while_loops,
+        )
+
+        (X, Y), ref = matmul_inputs()
+        acc0 = torch.randn(ref.shape[1], ref.shape[0])  # [N, M], nonzero
+        graph = self._run_graph(split_k_transposed_caller_init_fn, (X, Y, acc0))
+        input_names = set(graph.graph_inputs.keys())
+        with V.set_graph_handler(graph):
+            splice_while_loops(graph)  # must not raise
+        copies = [
+            op
+            for op in graph.operations
+            if "while_loop_carry_copy_" in (op.get_name() or "")
+        ]
+        self.assertEqual(
+            len(copies), 1, "transposed caller init must get one pre-loop copy"
+        )
+        # the copy is an identity copy of the backing storage (acc0 [N, M]),
+        # with empty origins
+        self.assertEqual(list(copies[0].layout.size), [64, 256])
+        self.assertEqual(list(copies[0].layout.stride), [256, 1])
+        self.assertFalse(copies[0].origins)
+        mutators = [
+            op
+            for op in graph.operations
+            if isinstance(getattr(op, "layout", None), ir.MutationLayoutSHOULDREMOVE)
+        ]
+        self.assertTrue(mutators, "expected an in-place accumulator")
+        for op in mutators:
+            self.assertNotIn(
+                op.layout.get_buffer().get_name(),
+                input_names,
+                "no graph input may be used as an in-place mutation target",
+            )
+
+    def test_two_loops_sharing_init_get_independent_buffers(self):
+        """Two loops sharing one in-graph init must not write the same buffer."""
+        from torch._inductor import ir
+        from torch._inductor.virtualized import V
+
+        from torch_spyre._inductor.wsr.for_each_tile_lowering import (
+            splice_while_loops,
+        )
+
+        (X, Y), _ref = matmul_inputs()
+        graph = self._run_graph(two_loops_shared_init_fn, (X, Y))
+        with V.set_graph_handler(graph):
+            splice_while_loops(graph)
+        copies = [
+            op
+            for op in graph.operations
+            if "while_loop_carry_copy_" in (op.get_name() or "")
+        ]
+        self.assertGreaterEqual(
+            len(copies), 1, "a shared init must be copied for the second loop"
+        )
+        targets = {
+            op.layout.get_buffer().get_name()
+            for op in graph.operations
+            if isinstance(getattr(op, "layout", None), ir.MutationLayoutSHOULDREMOVE)
+        }
+        self.assertGreaterEqual(
+            len(targets),
+            2,
+            "the two loops must accumulate into distinct buffers (independent init)",
+        )
 
     def test_carry_mode_group_gets_loop_info(self):
         from torch._inductor import ir
@@ -876,6 +1484,39 @@ class TestSpliceWhileLoops(unittest.TestCase):
                     for op, _identity in identities
                 ),
                 "the full-cache exact-stride copy remained inside the loop",
+            )
+
+    def test_inner_pre_loop_copy_belongs_to_enclosing_loop_only(self):
+        """Reset the inner carry once per enclosing trip, outside the inner loop."""
+        from torch_spyre._inductor.wsr.for_each_tile_lowering import (
+            splice_while_loops,
+        )
+
+        (X, Y), _ref = matmul_inputs()
+        graph = self._run_graph(nested_two_inner_loops_shared_init_fn, (X, Y))
+        with V.set_graph_handler(graph):
+            splice_while_loops(graph)
+
+        copies = [
+            op for op in graph.operations if "while_loop_carry_copy_" in op.get_name()
+        ]
+        # The first inner loop spliced copies the shared fill. The second may
+        # then own the fill outright: a copy of a pure fill inlines the fill
+        # rather than reading it, so the copy is not a second reader.
+        self.assertTrue(
+            [op for op in copies if len(op.get_size()) == 2],
+            "the shared fill must be copied before an inner loop",
+        )
+        for op in copies:
+            info = getattr(op, "loop_info", None)
+            self.assertIsNotNone(
+                info, f"{op.get_name()} is not a member of the enclosing loop"
+            )
+            self.assertEqual(
+                info.loop_group_id,
+                (0,),
+                f"{op.get_name()} must run once per outer trip, "
+                "not inside the inner loop",
             )
 
 

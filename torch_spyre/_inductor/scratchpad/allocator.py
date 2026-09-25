@@ -2223,6 +2223,24 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         # turns an O(buffers) cost into O(ops * buffers) on the full graph.
         default_is_lx = {name: buf.sym_is_lx for name, buf in bufmap.items()}
 
+        from torch_spyre._inductor.read_copy_elision import (
+            project_transport_read_copies,
+        )
+
+        pricing_ops = project_transport_read_copies(
+            graph,
+            {
+                name: [cd.splits for cd in buf.core_divisions]
+                for name, buf in bufmap.items()
+            },
+            relayout_sources={
+                buf.relayout_parent
+                for buf in solver.buffers
+                if isinstance(buf, RelayoutCopyBuffer)
+            },
+        )
+        pricing_by_name = {op.get_name(): op for op in pricing_ops}
+
         # Keyed by buffer name, which is what ``predict_by_bundle`` needs to match
         # features to the ops in each estimated bundle. ``mem_usage_by_buf`` keys
         # on ``op.name`` over ``graph.operations``, so every feature here belongs
@@ -2235,8 +2253,14 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                 continue
             if output_name not in bufmap:
                 continue
+            if output_name not in pricing_by_name:
+                continue
             op_features[output_name] = self._extract_op_features(
-                graph, output_name, bufmap, default_is_lx
+                graph,
+                output_name,
+                bufmap,
+                default_is_lx,
+                op=pricing_by_name[output_name],
             )
 
         from torch_spyre._inductor.cost_model import predict_bundles
@@ -2275,7 +2299,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         bundle_terms: list = []
         try:
             bundle_terms = predict_bundles(
-                graph.operations, op_features, params=_COST_PARAMS
+                pricing_ops, op_features, params=_COST_PARAMS
             )
             cost_expr = sympy.sympify(sum(term for _, term in bundle_terms))
         except (ValueError, RuntimeError, TypeError) as e:
@@ -2360,7 +2384,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             )
         return result
 
-    def _extract_op_features(self, graph, output_name, buffers, is_lx):
+    def _extract_op_features(self, graph, output_name, buffers, is_lx, *, op=None):
         """Build symbolic OpFeatures for one ComputedBuffer op (best-effort).
 
         Same extraction as dump_cost_model.extract_op_features, but keyed off
@@ -2374,7 +2398,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         from torch_spyre._inductor.dump_cost_model import extract_op_features
         from torch_spyre._inductor.scratchpad.sa_cooptimizer import _work_slices
 
-        op = graph.get_buffer(output_name)
+        op = graph.get_buffer(output_name) if op is None else op
         buffer = buffers[output_name]
         division = CoreDivision(splits=buffer.sym_core_divs)
         ws = _work_slices(op, division)

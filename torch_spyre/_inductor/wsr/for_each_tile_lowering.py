@@ -86,6 +86,7 @@ from __future__ import annotations
 import copy
 import dataclasses
 import enum
+import logging
 from typing import TYPE_CHECKING, Any
 
 import sympy
@@ -94,9 +95,16 @@ import torch
 from torch._inductor.ops_handler import DefaultHandler, WrapperHandler
 from torch._inductor.virtualized import V
 
+from .. import timing_recorder
+from ..deadcode_elimination import deadcode_elimination
+from ..logging_utils import get_inductor_logger
+from ..pass_utils import format_operations
+
 if TYPE_CHECKING:
     from torch._inductor import ir
     from torch._inductor.dependencies import Dep
+
+logger = get_inductor_logger("wsr.for_each_tile_lowering")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -2383,7 +2391,9 @@ def splice_while_loops(graph) -> None:
     that loop is later spliced, its final recordable names are appended to
     every ancestor's pending name list. This makes those late-created ops
     members of the complete loop nest instead of a sibling group containing
-    only their immediate level.
+    only their immediate level. A pre-loop carry copy that the splice
+    inserts before the loop (carry ownership, #4838) is appended to the
+    ancestors only: it runs once per enclosing trip, outside its own loop.
 
     Stamping itself still proceeds level-0-first (outermost first) within
     the single final phase: level 0's call stamps first (existing=None,
@@ -2400,6 +2410,12 @@ def splice_while_loops(graph) -> None:
         carry_bindings_for,
         splice_while_loop,
     )
+
+    if logger.isEnabledFor(logging.INFO):
+        with timing_recorder.stage("stage:splice_while_loops:log_before"):
+            logger.info(
+                "BEFORE SPLICE_WHILE_LOOPS\n%s", format_operations(graph.operations)
+            )
 
     group_idx = 0
     pending_levels: list[tuple[sympy.Symbol, sympy.Expr, int, list[str]]] = []
@@ -2433,12 +2449,24 @@ def splice_while_loops(graph) -> None:
                 while_op,
                 _stacking_carry_indices(while_op, loop_var, result.trip_count),
             )
+            names_before_splice = {op.get_name() for op in graph.operations}
             group_ops = splice_while_loop(
                 graph,
                 while_op,
                 carries,
                 trip_count=result.trip_count,
             )
+            # The splice can also add an op OUTSIDE this loop's body: a
+            # carry's pre-loop ownership copy. It runs once per trip of every
+            # enclosing level, never per trip of this one, so it joins the
+            # ancestors' names below but not this level's.
+            group_names = {op.get_name() for op in group_ops}
+            pre_loop_names = [
+                op.get_name()
+                for op in graph.operations
+                if op.get_name() not in names_before_splice
+                and op.get_name() not in group_names
+            ]
 
             _consume_tile_dim_markers(group_ops, graph.operations)
 
@@ -2446,7 +2474,7 @@ def splice_while_loops(graph) -> None:
             for ancestor_idx in ancestor_level_indices:
                 ancestor_names = pending_levels[ancestor_idx][3]
                 ancestor_name_set = set(ancestor_names)
-                for name in recordable_names:
+                for name in (*pre_loop_names, *recordable_names):
                     if name not in ancestor_name_set:
                         ancestor_names.append(name)
                         ancestor_name_set.add(name)
@@ -2517,3 +2545,21 @@ def splice_while_loops(graph) -> None:
     # merged in above, so squeezed_advance_per_read reflects each op's final,
     # fully-merged state rather than a partially-stamped intermediate.
     _rebase_point_splice_reads(graph.operations)
+
+    if pending_levels:
+        # Splicing/unrolling leaves dead carry-snapshot and marker scaffolding
+        # behind. The pipeline's deadcode_elimination pass runs before this one,
+        # so nothing downstream would otherwise clean this up until scheduling --
+        # run it here too so the AFTER dump below reflects the IR later passes
+        # actually see, not transient splice debris. Idempotent: a later
+        # deadcode_elimination call finds nothing new to remove.
+        deadcode_elimination(graph)
+
+    if logger.isEnabledFor(logging.INFO):
+        if pending_levels:
+            with timing_recorder.stage("stage:splice_while_loops:log_after"):
+                logger.info(
+                    "AFTER SPLICE_WHILE_LOOPS\n%s", format_operations(graph.operations)
+                )
+        else:
+            logger.info("SPLICE_WHILE_LOOPS: no while_loops spliced")
