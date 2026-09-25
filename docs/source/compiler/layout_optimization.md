@@ -1,4 +1,3 @@
-# Spyre Tensor Layout Selection and Optimization
 
 This document describes how the Spyre compiler assigns on-device memory layouts
 to tensors and ensures hardware stick-compatibility constraints are met across
