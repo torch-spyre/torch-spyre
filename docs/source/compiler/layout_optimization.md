@@ -9,6 +9,7 @@ the op graph.
 ## Terminology
 
 - **Stick** — a 128-byte aligned chunk of contiguous elements; the stick dimension is always the innermost device dimension.
+- **Stick variable** — an iteration variable (from an op's `var_ranges`) that indexes the stick dimension — i.e. the variable that appears in the last dimension of `device_coordinates` for an op's memory access.
 - **SpyreTensorLayout** (STL) — fully describes a tensor's on-device storage, including its stick.
 - **Restickify** — a data-movement op that copies a tensor to achieve a  different stick arrangement.
 - **Stick compatibility** — each op imposes stick constraints on its inputs and output. When a constraint is not met, a restickify is required to resolve it.
@@ -47,7 +48,7 @@ improves to the point where the larger state space is manageable.
 ### Stick Compatibility and Restickify Cost
 
 Three node types encode the different classes stick-compatibility constraints and the cost
-to bring incompatibilities into compliance vi restickify.
+to bring incompatibilities into compliance via restickify.
 
 **`AllSameNode`** — used for pointwise ops and most reductions. All inputs
 and the output must share a stick. The cost is the sum of per-input
@@ -136,7 +137,7 @@ total restickify cost.
 ### STL candidates as stick-dimension proxies
 
 An important subtlety: the candidate STLs produced by propagation based only
-on **which host dimension is mapped to the stick**. The non-stick dimension
+on **which device dimension is mapped to the stick**. The non-stick dimension
 ordering in a candidate STL is not something the
 optimizer reasons about or optimizes over. Each STL candidate is a
 proxy for the set of all valid layouts that place the stick on a particular
@@ -146,7 +147,7 @@ The optimizer works correctly under this interpretation because the cost
 function it calls — `compute_restickify_needed` / `stick_compatible` in
 `pass_utils.py` — only checks **stick compatibility**, not full STL equality.
 `stick_compatible()` returns true when all tensors' stick expressions share at
-most one loop variable and that variable doesn't appear in any non-stick
+most one iteration variable and that variable doesn't appear in any non-stick
 coordinate. Two STLs with different non-stick orderings but the same stick
 variable are therefore judged compatible and assigned cost 0, even though they
 are not identical layouts.
