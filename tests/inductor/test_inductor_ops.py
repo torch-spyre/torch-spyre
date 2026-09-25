@@ -5690,6 +5690,30 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     [[128, 128, 1, 1, 64], [5, 5, 1, 1, 64]],
                     [[1, 128, -1, 49152, 16384], [1, 5, -1, 25, 25]],
                 ),
+                # With bias, conv2d_with_bias decomposes to spyre.conv2d + add, so
+                # the depthwise output is an intermediate the add reads rather than
+                # the graph output -- the path on which LX planning can pin it.
+                # Every case above has bias=None, so none of them exercise it.
+                "1x64_ksize3_bias": (
+                    cached_randn((1, 64, 32, 32)),
+                    cached_randn((64, 1, 3, 3)),
+                    cached_randn((64,)),
+                    (0, 0),
+                    (1, 1),
+                    64,
+                    [[32, 32, 1, 1, 64], [3, 3, 1, 1, 64]],
+                    [[1, 32, -1, 65536, 1024], [1, 3, -1, 9, 9]],
+                ),
+                "2x32_ksize1_stride2_bias": (
+                    cached_randn((2, 32, 64, 64)),
+                    cached_randn((32, 1, 1, 1)),
+                    cached_randn((32,)),
+                    (0, 0),
+                    (2, 2),
+                    32,
+                    [[64, 64, 1, 2, 64], [1, 1, 1, 1, 64]],
+                    [[1, 64, -1, 131072, 4096], [1, 1, -1, 1, 1]],
+                ),
             },
         },
         # conv2d exercising the native conv2d SDSC path (lower_convolution) with
@@ -8912,6 +8936,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
         x_dev = x.to(device_layout=x_layout)
         weight_dev = weight.to(device_layout=weight_layout)
+        bias_dev = None if bias is None else bias.to("spyre")
 
         def fn(x, weight, bias, padding, stride, groups):
             return torch.conv2d(
@@ -8921,9 +8946,9 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         cpu_result = fn(x, weight, bias, padding, stride, groups)
 
         spyre_compiled = torch.compile(fn)(
-            x_dev, weight_dev, bias, padding, stride, groups
+            x_dev, weight_dev, bias_dev, padding, stride, groups
         ).cpu()
-        spyre_eager = fn(x_dev, weight_dev, bias, padding, stride, groups).cpu()
+        spyre_eager = fn(x_dev, weight_dev, bias_dev, padding, stride, groups).cpu()
         torch.testing.assert_close(
             spyre_compiled,
             cpu_result,
