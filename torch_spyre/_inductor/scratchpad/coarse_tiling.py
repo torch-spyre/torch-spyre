@@ -26,6 +26,10 @@ hint-driven group already stamped pre-stickification at pass 430. It reuses the
 existing ``coarse_tile`` machinery verbatim; the only new work is lowering a
 ``TileSpec`` to per-op ``DimHint``s and deriving groups as consecutive runs of
 ops that share a spec.
+
+The reverse direction lives here too: :func:`dim_hints_to_tile_spec` lifts the
+``DimHint``s an op already carries back into the ``TileSpec`` they describe, so
+a caller's hint can be stated in the same terms as a tiling this pass applies.
 """
 
 from __future__ import annotations
@@ -41,12 +45,13 @@ from ..errors import Unsupported
 from ..pass_utils import op_out_coords
 from ..propagate_hints import DimHint
 from ..wsr.coarse_tile import (
+    _hint_ranges_pos,
     coarse_tile_post_stickify,
     reduction_loop_vars,
     validate_coarse_tile_groups,
 )
 from .allocator import ScratchpadOptimizationPass
-from .plan_solver import TileSpec
+from .plan_solver import TileAxis, TileSpec
 
 
 def tile_spec_to_dim_hints(
@@ -115,6 +120,90 @@ def tile_spec_to_dim_hints(
             )
         )
     return hints
+
+
+def dim_hints_to_tile_spec(
+    op: ComputedBuffer,
+    dim_hints: Sequence[DimHint],
+) -> TileSpec:
+    """The :class:`TileSpec` that ``op``'s ``dim_hints`` describe.
+
+    The inverse of :func:`tile_spec_to_dim_hints`: where that resolves each
+    :class:`TileAxis` to the loop variable it tiles, this recovers each hint's
+    positional ``host_dim`` from its ``loop_var``.
+
+    Which hints become axes follows ``_hints_levels``, the hint path's own rule.
+    A hint ``op`` is broadcast against (``loop_var is None``) and a split of 1
+    tile nothing, so neither contributes an axis; with no hint left the result
+    is the untiled spec. The rest are ordered outermost-first by ``hint_id`` --
+    ``spyre_hint``'s counter grows inwards -- which is the order a ``TileSpec``
+    nests its axes in.
+
+    Each hint is placed with ``_hint_ranges_pos``, the resolution
+    ``coarse_tile`` itself plans and divides a hint at, so an axis names the dim
+    the hint path would tile: an ``op_out_coords`` position for an output hint,
+    a position among the op's ordered reduction loop variables for a reduction
+    hint -- the frames :class:`TileAxis` documents. The spec is then checked
+    against the lowering: :func:`tile_spec_to_dim_hints` must resolve every axis
+    back to its own hint's ``loop_var``. So lowering the result reproduces the
+    hints' loop variables, split counts and reduction flags, in order, by
+    construction.
+
+    ``hint_id`` and ``dim_names`` are not carried: ``TileAxis`` has no field for
+    either. Axis order keeps the ids positionally, so a caller that must re-stamp
+    them can pair the sorted hints back against ``spec.axes``.
+
+    Raises ``Unsupported`` for a level-producing hint the spec cannot express,
+    since dropping it would understate the op's nest:
+
+    * a WhileLoop-splice hint (``loop_var_range`` set) -- a ``for_each_tile``
+      level whose trip count is ``loop_var_range``, not a split of a dim of
+      ``op``;
+    * a hint whose ``loop_var`` is not an output or reduction dim of ``op``, as
+      its ``is_reduction`` says;
+    * a hint whose axis the lowering would resolve to a different loop
+      variable, or reject outright.
+    """
+    leveled = sorted(
+        (
+            h
+            for h in dim_hints
+            if h.loop_var is not None
+            and (h.split_count != 1 or h.loop_var_range is not None)
+        ),
+        key=lambda h: h.hint_id,
+    )
+    if not leveled:
+        return TileSpec()
+    out_coords = op_out_coords(op)
+    axes: list[TileAxis] = []
+    for h in leveled:
+        if h.loop_var_range is not None:
+            raise Unsupported(
+                f"coarse tiling: hint_{h.hint_id} on {op.get_name()} is a "
+                f"WhileLoop-splice level (loop_var_range={h.loop_var_range}), "
+                "which a TileSpec cannot express."
+            )
+        host_dim, is_reduction = _hint_ranges_pos(op, h, out_coords)
+        if host_dim is None:
+            kind = "a reduction" if h.is_reduction else "an output"
+            raise Unsupported(
+                f"coarse tiling: hint_{h.hint_id}'s loop var {h.loop_var} is not "
+                f"{kind} dim of {op.get_name()}."
+            )
+        axes.append(
+            TileAxis(host_dim=host_dim, count=h.split_count, is_reduction=is_reduction)
+        )
+    spec = TileSpec(tuple(axes))
+    lowered = tile_spec_to_dim_hints(op, spec, [h.hint_id for h in leveled])
+    for h, back in zip(leveled, lowered):
+        if back.loop_var != h.loop_var:
+            raise Unsupported(
+                f"coarse tiling: hint_{h.hint_id} tiles {h.loop_var} on "
+                f"{op.get_name()}, but its TileSpec axis lowers to "
+                f"{back.loop_var}."
+            )
+    return spec
 
 
 def derive_tiling_groups(

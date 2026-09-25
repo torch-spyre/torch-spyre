@@ -99,6 +99,7 @@ from torch_spyre._inductor.scratchpad.coarse_tiling import (
     _derive_group_idx_offset,
     _derive_hint_id_base,
     derive_tiling_groups,
+    dim_hints_to_tile_spec,
     tile_spec_to_dim_hints,
 )
 from torch_spyre._inductor.scratchpad.plan_solver import (
@@ -9561,6 +9562,162 @@ class TestTileSpecLoweringReduction(unittest.TestCase):
         spec = TileSpec((TileAxis(0, 4, is_reduction=True),))
         with self.assertRaises(Unsupported):
             tile_spec_to_dim_hints(op, spec, [0])
+
+
+class TestDimHintsToTileSpec(unittest.TestCase):
+    """``dim_hints_to_tile_spec`` lifts an op's hints into the spec that lowers
+    back to them.
+
+    Real IR throughout, with no MagicMock: ops come from ``Pointwise.create`` and
+    ``Reduction.create``, so loop variables are squeezed exactly as Inductor
+    squeezes them. Each hint names a real loop variable picked by its extent,
+    independently of the lowering being inverted.
+    """
+
+    def setUp(self):
+        gm = fx.symbolic_trace(lambda: None)
+        self._graph_ctx = V.set_graph_handler(GraphLowering(gm))
+        self._graph_ctx.__enter__()
+        self.addCleanup(self._graph_ctx.__exit__, None, None, None)
+
+    @staticmethod
+    def _pointwise(ranges, name):
+        import math
+
+        stride = [math.prod(ranges[i + 1 :]) for i in range(len(ranges))]
+        return _make_real_pointwise_op(
+            [Integer(r) for r in ranges], [(list(ranges), stride)], name, hints=()
+        )
+
+    @staticmethod
+    def _sum(reduction_ranges, name):
+        """``out[d0] = sum(in[d0, *red])``, with an output extent of 6."""
+        import math
+
+        shape = [6, *reduction_ranges]
+        stride = [math.prod(shape[i + 1 :]) for i in range(len(shape))]
+        return _make_real_reduction_op(
+            ranges=[Integer(6)],
+            reduction_ranges=[Integer(r) for r in reduction_ranges],
+            input_shape_stride=(shape, stride),
+            name=name,
+            hints=(),
+        )
+
+    @staticmethod
+    def _var(op, extent):
+        """``op``'s one loop variable that ranges over ``extent``."""
+        from torch_spyre._inductor.pass_utils import iteration_space_from_op
+
+        (sym,) = [s for s, n in iteration_space_from_op(op).items() if n == extent]
+        return sym
+
+    @staticmethod
+    def _hint(loop_var, split_count, hint_id, is_reduction=False, **kwargs):
+        return DimHint(
+            dim_names=[f"dim{hint_id}"],
+            split_count=split_count,
+            loop_var=loop_var,
+            is_reduction=is_reduction,
+            hint_id=hint_id,
+            **kwargs,
+        )
+
+    def test_output_hints_lift_to_the_dims_they_tile(self):
+        # The unit dim carries no loop variable, so the extent-4 dim's variable
+        # is the op's second one but its position is 2.
+        op = self._pointwise([6, 1, 4, 128], "pw")
+        hints = [self._hint(self._var(op, 6), 3, 0), self._hint(self._var(op, 4), 2, 1)]
+        self.assertEqual(
+            dim_hints_to_tile_spec(op, hints),
+            TileSpec((TileAxis(0, 3), TileAxis(2, 2))),
+        )
+
+    def test_reduction_hint_lifts_to_its_loop_var_position(self):
+        # A reduction host_dim counts the op's reduction loop variables, which
+        # skip unit dims: the extent-16 dim is at reduction_ranges position 3
+        # but is the second loop variable.
+        op = self._sum([1, 8, 1, 16], "red")
+        hint = self._hint(self._var(op, 16), 4, 0, is_reduction=True)
+        self.assertEqual(
+            dim_hints_to_tile_spec(op, [hint]),
+            TileSpec((TileAxis(1, 4, is_reduction=True),)),
+        )
+
+    def test_axes_nest_by_hint_id_not_list_order(self):
+        op = self._pointwise([6, 4, 128], "pw_order")
+        inner = self._hint(self._var(op, 4), 2, 7)
+        outer = self._hint(self._var(op, 6), 3, 5)
+        self.assertEqual(
+            dim_hints_to_tile_spec(op, [inner, outer]),
+            TileSpec((TileAxis(0, 3), TileAxis(1, 2))),
+        )
+
+    def test_hints_that_tile_nothing_contribute_no_axis(self):
+        # The same two filters _hints_levels applies to the hint path.
+        op = self._pointwise([6, 4, 128], "pw_noop")
+        broadcast = self._hint(None, 4, 0)
+        unit_split = self._hint(self._var(op, 4), 1, 1)
+        real = self._hint(self._var(op, 6), 2, 2)
+        self.assertTrue(dim_hints_to_tile_spec(op, []).is_untiled)
+        self.assertTrue(dim_hints_to_tile_spec(op, [broadcast, unit_split]).is_untiled)
+        self.assertEqual(
+            dim_hints_to_tile_spec(op, [broadcast, unit_split, real]),
+            TileSpec((TileAxis(0, 2),)),
+        )
+
+    def test_round_trips_through_the_lowering(self):
+        pw = self._pointwise([6, 1, 4, 128], "pw_rt")
+        red = self._sum([1, 8, 1, 16], "red_rt")
+        # spec -> hints -> spec is the identity.
+        for op, spec in [
+            (pw, TileSpec((TileAxis(0, 3),))),
+            (pw, TileSpec((TileAxis(0, 2), TileAxis(2, 4)))),
+            (red, TileSpec((TileAxis(0, 4, is_reduction=True),))),
+            (red, TileSpec((TileAxis(1, 2, is_reduction=True),))),
+        ]:
+            with self.subTest(op=op.get_name(), spec=spec):
+                hints = tile_spec_to_dim_hints(op, spec, range(len(spec.axes)))
+                self.assertEqual(dim_hints_to_tile_spec(op, hints), spec)
+        # hints -> spec -> hints keeps every loop variable, split count and
+        # reduction flag, in hint_id order; only ids and dim names are left to
+        # the caller.
+        for op, hints in [
+            (
+                pw,
+                [
+                    self._hint(self._var(pw, 4), 2, 9),
+                    self._hint(self._var(pw, 6), 3, 4),
+                ],
+            ),
+            (red, [self._hint(self._var(red, 8), 2, 3, is_reduction=True)]),
+        ]:
+            with self.subTest(op=op.get_name()):
+                ordered = sorted(hints, key=lambda h: h.hint_id)
+                lowered = tile_spec_to_dim_hints(
+                    op,
+                    dim_hints_to_tile_spec(op, hints),
+                    [h.hint_id for h in ordered],
+                )
+                self.assertEqual(
+                    [(h.loop_var, h.split_count, h.is_reduction) for h in lowered],
+                    [(h.loop_var, h.split_count, h.is_reduction) for h in ordered],
+                )
+
+    def test_hints_a_spec_cannot_express_are_rejected(self):
+        op = self._pointwise([6, 4, 128], "pw_rej")
+        cases = {
+            "while-loop splice level": self._hint(
+                sympy.Symbol("u0"), 1, 0, loop_var_range=4
+            ),
+            "loop var not on the op": self._hint(sympy.Symbol("zz"), 2, 0),
+            "reduction hint on a pointwise op": self._hint(
+                self._var(op, 6), 2, 0, is_reduction=True
+            ),
+        }
+        for label, hint in cases.items():
+            with self.subTest(label), self.assertRaises(Unsupported):
+                dim_hints_to_tile_spec(op, [hint])
 
 
 def _loop_var_to_reduction_ranges_pos_public(op, sym):
