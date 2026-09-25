@@ -540,7 +540,12 @@ class JobPlanStepHostCompute final : public JobPlanStep {
         device_address_(std::move(device_address)),
         input_buffer_(input_buffer),
         ishape_(std::move(ishape)) {
-    pipeline_barrier_ = false;  // host-produce is overlap-eligible
+    // Inherits pipeline_barrier_ = true from the base. HostCompute keeps strict
+    // per-stream FIFO like every other op; overlap with device compute comes
+    // from placing HostCompute on the prep stream (S_prep), NOT from relaxing
+    // its barrier. The inline synchronize() it triggers only drains S_prep, so
+    // it never blocks device compute on S_dev.
+    role_ = StreamRole::Prep;
 
     // Try to build fast plan at construction time (prepare time)
     if (hcm_) {
