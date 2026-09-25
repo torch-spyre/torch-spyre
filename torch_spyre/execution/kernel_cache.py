@@ -31,7 +31,7 @@ from torch_spyre._inductor.logging_utils import get_inductor_logger
 
 logger = get_inductor_logger("kernel_cache")
 
-# All artifacts the backend compiler must produce for a valid compiled kernel.
+# All artifacts that dbo-opt must produce for a valid compiled kernel.
 # A cache entry is only considered a hit if every one of these is present.
 _SYMBOL_KINDS_FILE = "symbol_kinds.json"
 _REQUIRED_ARTIFACTS = [
@@ -198,8 +198,14 @@ def _get_backend_compiler_version() -> str:
 @lru_cache(maxsize=1)
 def _get_torch_spyre_version() -> str:
     """Return the torch_spyre package version string."""
-    from torch_spyre.version import __version__
-
+    try:
+        from torch_spyre._version import __version__
+    except ImportError as exc:
+        raise RuntimeError(
+            "torch_spyre._version is missing; cannot determine the torch_spyre "
+            "version for the cache key. The wheel was built without "
+            "setuptools_scm. Set SPYRE_KERNEL_CACHE=0 to run without caching."
+        ) from exc
     return __version__
 
 
