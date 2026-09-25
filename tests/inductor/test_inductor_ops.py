@@ -536,37 +536,20 @@ FP16_EPS = torch.finfo(torch.float16).eps  # 0.0009765625
 # DLFloat16's largest finite.  0x7FFF is the NaN-Infinity symbol, so the largest
 # finite is 0x7FFE -- mantissa 0x1FE, not 0x1FF.
 DLFLOAT16_MAX = (1.0 + 510.0 / 512.0) * float(2**32)  # 0x7FFE, ~8.573e9
-
-# Ops that can leave DLFloat16's range for an in-range fp16 input.  exp crosses
-# 8.57e9 at x > 22.87, well inside fp16's own range.
-_DLFLOAT16_OVERFLOW_OPS = (torch.exp,)
+DLFLOAT16_INF_SENTINEL = float(2**32)  # 0x7E00; finite on device
 
 
-def _result_can_overflow_dlfloat16(op, x):
-    """True when ``op(x)`` leaves DLFloat16's range for at least one element.
+def _dlfloat16_saturating_ref(result):
+    """Model arithmetic overflow for the explicit DLFloat16 references below.
 
-    fp16 only: the fp32 path does not go through DLFloat16, so it holds results
-    like exp(88) = 1.7e38 exactly and has nothing to relax.
+    Keep the reference in fp64 until all LX wrapper operations have run: an
+    fp16 cast would lose the distinction between fp16 and DLFloat16 overflow.
+    This models the range, not DLFloat16 mantissa rounding or underflow.
     """
-    if op not in _DLFLOAT16_OVERFLOW_OPS or x.dtype != torch.float16:
-        return False
-    # fp64, not fp16: in fp16 every overflowing input is already inf and they
-    # cannot be told apart.
-    ref = op(x.to(torch.float64))
-    return bool((~torch.isfinite(ref) | (ref.abs() > DLFLOAT16_MAX)).any())
-
-
-def _dlfloat16_saturating_ref(op, x):
-    """CPU reference with DLFloat16-overflowing elements replaced by NaN.
-
-    ``equal_nan=True`` makes those elements accept the device's NaN; everything
-    else, including values that overflow fp16 but fit DLFloat16, is still
-    compared exactly.
-    """
-    ref = op(x)
-    exact = op(x.to(torch.float64))
-    overflowed = ~torch.isfinite(exact) | (exact.abs() > DLFLOAT16_MAX)
-    return ref.masked_fill(overflowed, float("nan"))
+    # Device arithmetic overflows to NINF (0x7FFF), decoded as NaN. Host INF
+    # conversion instead uses the finite 0x7E00 sentinel; callers model that
+    # separately. Only explicitly opted-in tests use this reference.
+    return result.masked_fill(result.abs() > DLFLOAT16_MAX, float("nan"))
 
 
 def _attention_fn(q, k, v, scale=True):
@@ -3194,6 +3177,15 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "2d_beta_0p5": (cached_randn((256, 128), dtype=torch.float16), 0.5),
                 "2d_beta_50": (cached_randn((256, 128), dtype=torch.float16), 50.0),
                 "2d_beta_0": (cached_randn((256, 128), dtype=torch.float16), 0.0),
+                # One/two softplus(0) * 2^32 values fit DLFloat16; three do
+                # not. Exercise both sides of the LX reduction boundary.
+                **{
+                    f"{rows}x64_beta_0": (
+                        cached_randn((rows, 64), dtype=torch.float16),
+                        0.0,
+                    )
+                    for rows in (1, 2, 3)
+                },
                 "5d_beta_0p5": (
                     cached_randn((1, 1, 7, 13, 19), dtype=torch.float16),
                     0.5,
@@ -3441,6 +3433,10 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "4d_unaligned": (cached_randn((2, 4, 65, 70)), 1),
                 "nonfinite": (
                     torch.full((64, 64), float("-inf"), dtype=torch.float16),
+                    1,
+                ),
+                "nonfinite_positive": (
+                    torch.full((64, 64), float("inf"), dtype=torch.float16),
                     1,
                 ),
             }
@@ -5016,6 +5012,11 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
                 "nearmax": (torch.tensor([[10.0, 10.5, 11.0]], dtype=torch.float16),),
                 "overflow": (torch.tensor([[15.0, 20.0, 50.0]], dtype=torch.float16),),
+                # Only exp(23) overflows DLFloat16 itself. The LX pointwise
+                # wrapper's addition also overflows for exp(22.25).
+                "dlfloat16_boundary": (
+                    torch.tensor([[22.0, 22.25, 23.0]], dtype=torch.float16),
+                ),
                 "underflow": (
                     torch.tensor([[-50.0, -100.0, -200.0]], dtype=torch.float16),
                 ),
@@ -6165,7 +6166,12 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
-    def compare_with_cpu(self, *args, **kwargs):
+    def compare_with_cpu(self, *args, dlfloat16_reference=None, **kwargs):
+        if dlfloat16_reference is not None:
+            ref = _dlfloat16_saturating_ref(dlfloat16_reference).to(torch.float16)
+            kwargs["cpu_eager_result"] = ref
+            # IEEE CPU compilation cannot reproduce DLFloat16 overflow either.
+            kwargs["cpu_compile_result"] = ref
         return utils_inductor.compare_with_cpu(*args, **kwargs)
 
     def compare(self, *args, **kwargs):
@@ -6237,18 +6243,10 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             # To avoid cpu mismatch due to a negative fp16 having a fraction 0b0000000001
             x = x.to("spyre").cpu()
 
-        if _result_can_overflow_dlfloat16(op, x):
-            # Spyre computes in DLFloat16 (max 8.57e9).  Overflowing that
-            # saturates onto 0x7FFF, which is also its NaN-Infinity symbol, so
-            # the element returns NaN where CPU says inf.  Relax only those
-            # elements.
-            #
-            # TODO(dlfloat16-overflow-ninf): the device should saturate to a
-            # finite or to 0x7E00, not onto the NaN symbol -- a NaN here poisons
-            # a whole softmax row.  Tighten back to inf once it does.
-            self.compare_with_cpu(
-                op, x, cpu_eager_result=_dlfloat16_saturating_ref(op, x)
-            )
+        if op == torch.exp and x.dtype == torch.float16:
+            # exp(15/20) exceeds fp16 but fits DLFloat16; exp(50) overflows
+            # DLFloat16 to NINF. Preserve this distinction for LX wrappers too.
+            self.compare_with_cpu(op, x, dlfloat16_reference=op(x.to(torch.float64)))
         else:
             self.compare_with_cpu(op, x)
 
@@ -7760,7 +7758,18 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         def fn(input):
             return torch.nn.functional.softplus(input, beta, threshold)
 
-        self.compare_with_cpu(fn, x)
+        if beta == 0.0 and x.dtype == torch.float16:
+            # The decomposition multiplies softplus(0) by 1/beta. Its infinite
+            # scalar is encoded as the finite DLFloat16 sentinel, so the
+            # result fits DLFloat16, but summing a row of these can overflow.
+            ref = torch.full_like(
+                x,
+                math.log(2) * math.copysign(DLFLOAT16_INF_SENTINEL, beta),
+                dtype=torch.float64,
+            )
+            self.compare_with_cpu(fn, x, dlfloat16_reference=ref)
+        else:
+            self.compare_with_cpu(fn, x)
 
     @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_layernorm_functional_cpu(self, x, residual, weight, bias, eps):
@@ -8045,7 +8054,20 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         def fn(input, diagonal):
             return torch.triu(input, diagonal)
 
-        self.compare_with_cpu(fn, x, diagonal)
+        if x.dtype == torch.float16 and torch.isinf(x).any():
+            # Host infinities are finite +/-2^32 on device. triu preserves
+            # them, but the additional LX arithmetic may overflow to NINF.
+            ref_input = x.to(torch.float64)
+            ref_input = torch.where(
+                torch.isinf(ref_input),
+                ref_input.sign() * DLFLOAT16_INF_SENTINEL,
+                ref_input,
+            )
+            self.compare_with_cpu(
+                fn, x, diagonal, dlfloat16_reference=fn(ref_input, diagonal)
+            )
+        else:
+            self.compare_with_cpu(fn, x, diagonal)
 
     @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_triu_int_cpu(self, x, diagonal):
