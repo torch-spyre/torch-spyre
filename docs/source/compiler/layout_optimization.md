@@ -1,3 +1,4 @@
+# Spyre Tensor Layout Assignment and Optimization
 
 This document describes how the Spyre compiler assigns on-device memory layouts
 to tensors and ensures hardware stick-compatibility constraints are met across
@@ -25,13 +26,11 @@ The following passes implement the layout assignment pipeline, in order:
 | `optimize_restickify_locations` | `optimize_restickify.py` | Layout selection: reduce each candidate set to one committed STL, minimizing total restickify cost |
 | `finalize_layouts` | `insert_restickify.py` | Convert committed STLs to `FixedTiledLayout` and build the restickify insertion plan |
 | `insert_restickify` | `insert_restickify.py` | Insert restickify ops into the graph |
-| `reorder_nonstick_dims` | `nonstick_dim_order.py` | Reorder non-stick device dimensions on matmul inputs for better work division |
+| `reorder_nonstick_dims` | `nonstick_dim_order.py` | Reorder non-stick device dimensions for performance (independent of stick compatibility) |
 
 ---
 
 ## Pass 1 — Layout Propagation (`propagate_spyre_tensor_layouts`)
-
-### What it does
 
 Layout propagation is a forward data-flow pass over the op graph. At each node
 it takes candidate STL sets of its inputs and
@@ -129,8 +128,6 @@ optimizer to choose:
 ---
 
 ## Pass 2 — Restickify Optimization (`optimize_restickify_locations`)
-
-### What it does
 
 Given the candidate STL sets and cost nodes established during propagation, the beam
 optimizer commits one STL per op (written to `op.committed_stl`) with the goal of minimizing
@@ -284,7 +281,7 @@ insert_post_mutation_restickify(graph)
     → inserts pre/post ops for offset-mutation edge cases
 
 reorder_nonstick_dims(graph)
-    → rewrites candidate STLs for matmul inputs to improve work division
+    → rewrites non-stick dimensions - no impact on stick compatibility
 ```
 
 ---
