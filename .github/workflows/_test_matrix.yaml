@@ -234,7 +234,7 @@ jobs:
     steps:
       # NORMAL: sparse-checkout the configs from github.com at the requested ref.
       - if: ${{ !inputs.prebaked_image }}
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.ref || github.event.pull_request.head.sha || github.sha }}
           repository: ${{ inputs.repository || github.event.pull_request.head.repo.full_name || github.repository }}
@@ -429,7 +429,7 @@ jobs:
       # Action, script and library together, so the action finds them in $GITHUB_WORKSPACE.
       # At THIS ref, like every other job -- one definition of the id formula per commit.
       - name: Checkout the identity action, script and library
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.ref || github.event.pull_request.head.sha || github.sha }}
           repository: ${{ inputs.repository || github.event.pull_request.head.repo.full_name || github.repository }}
@@ -509,12 +509,12 @@ jobs:
       wheel_name: ${{ steps.build.outputs.wheel_name }}
     steps:
       - name: Checkout composite actions
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           sparse-checkout: .github/actions
           sparse-checkout-cone-mode: false
 
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           path: torch-spyre
           ref: ${{ inputs.ref || github.event.pull_request.head.sha || github.sha }}
@@ -605,7 +605,7 @@ jobs:
       # disposable workspace, so the baked tree is only referenced, never mutated.
       - name: Checkout composite actions
         if: ${{ !inputs.prebaked_image }}
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           sparse-checkout: .github/actions
           sparse-checkout-cone-mode: false
@@ -618,7 +618,7 @@ jobs:
       # baked /home/senuser/torch-spyre (source + editable venv already in image)
       # → no checkout, no runtime mkdir under $HOME (this was the collision).
       - if: ${{ !inputs.prebaked_image }}
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           path: torch-spyre
           ref: ${{ inputs.ref || github.event.pull_request.head.sha || github.sha }}
@@ -797,7 +797,7 @@ jobs:
       # (PREBAKED_TORCH_SPYRE_DIR) below, so prebaked provenance for the RUN is
       # unchanged.
       - name: Checkout composite actions
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.ref || github.event.pull_request.head.sha || github.sha }}
           repository: ${{ inputs.repository || github.event.pull_request.head.repo.full_name || github.repository }}
@@ -809,7 +809,7 @@ jobs:
           sparse-checkout-cone-mode: false
 
       - if: ${{ !inputs.prebaked_image }}
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           path: torch-spyre
           ref: ${{ inputs.ref || github.event.pull_request.head.sha || github.sha }}
@@ -1040,7 +1040,7 @@ jobs:
       # Same reasoning as the perf job: the action DEFINITIONS must be in the
       # workspace even in prebaked mode, so .github is always checked out fresh.
       - name: Checkout composite actions
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.ref || github.event.pull_request.head.sha || github.sha }}
           repository: ${{ inputs.repository || github.event.pull_request.head.repo.full_name || github.repository }}
@@ -1048,7 +1048,7 @@ jobs:
           sparse-checkout-cone-mode: false
 
       - if: ${{ !inputs.prebaked_image }}
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           path: torch-spyre
           ref: ${{ inputs.ref || github.event.pull_request.head.sha || github.sha }}
@@ -1194,7 +1194,7 @@ jobs:
       # harness (no fetch); normal path sparse-checks-out .github/actions.
       - name: Checkout composite actions
         if: ${{ !inputs.prebaked_image }}
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           sparse-checkout: .github/actions
           sparse-checkout-cone-mode: false
@@ -1204,7 +1204,7 @@ jobs:
         run: ln -sfn "${PREBAKED_TORCH_SPYRE_DIR}/.github" "${GITHUB_WORKSPACE}/.github"
 
       - if: ${{ !inputs.prebaked_image }}
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           path: torch-spyre
           ref: ${{ inputs.ref || github.event.pull_request.head.sha || github.sha }}
@@ -1423,7 +1423,7 @@ jobs:
     steps:
       - name: Checkout composite actions
         if: ${{ !inputs.prebaked_image }}
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           sparse-checkout: .github/actions
           sparse-checkout-cone-mode: false
@@ -1433,7 +1433,7 @@ jobs:
         run: ln -sfn "${PREBAKED_TORCH_SPYRE_DIR}/.github" "${GITHUB_WORKSPACE}/.github"
 
       - if: ${{ !inputs.prebaked_image }}
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           path: torch-spyre
           ref: ${{ inputs.ref || github.event.pull_request.head.sha || github.sha }}
@@ -1532,7 +1532,7 @@ jobs:
     steps:
       - name: Checkout composite actions
         if: ${{ !inputs.prebaked_image }}
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           sparse-checkout: .github/actions
           sparse-checkout-cone-mode: false
@@ -1542,7 +1542,7 @@ jobs:
         run: ln -sfn "${PREBAKED_TORCH_SPYRE_DIR}/.github" "${GITHUB_WORKSPACE}/.github"
 
       - if: ${{ !inputs.prebaked_image }}
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           path: torch-spyre
           ref: ${{ inputs.ref || github.event.pull_request.head.sha || github.sha }}
