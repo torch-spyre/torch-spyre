@@ -174,8 +174,8 @@ def get_mem_deps(n: SchedulerNode) -> list[SchedNodeArg]:
     return res
 
 
-def num_sticks_dim(stl: SpyreTensorLayout) -> int | None:
-    """Return the device dim that counts sticks, or None if there is no such dim.
+def _num_sticks_slot(stl: SpyreTensorLayout) -> int:
+    """Return the device dim that counts sticks.
 
     The last device dim is the stick depth; exactly one other dim counts how many
     sticks the tensor holds. Its position is fixed by the device layout
@@ -191,15 +191,17 @@ def num_sticks_dim(stl: SpyreTensorLayout) -> int | None:
     layout whose batch stride happens to equal the depth it matches the batch dim
     instead.
 
-    Returns None for a layout whose num-sticks slot holds the sentinel -1, which
-    marks a dim that is extent 1 by construction and never stepped (a scalar is
-    ``[1, 64]`` / ``[-1, -1]``). Such a dim counts no sticks, so a caller
-    rescaling stick depth leaves it alone.
+    The entry at the returned slot may be the sentinel -1, which marks a stick dim
+    of host extent 1: such a dim is never stepped, yet it still counts the one
+    stick that element occupies. The slot a caller gets back therefore says where
+    the stick count lives, not that the entry there is a stick step, so a caller
+    rescaling it reads the stride first to tell the two apart.
     """
     if len(stl.device_size) < 2:
-        return None
-    dim = len(stl.device_size) - 3 if len(stl.device_size) > 2 else 0
-    return None if stl.stride_map[dim] <= 0 else dim
+        # TODO: support rank-1 device layouts; they have no dim to count sticks
+        # and every caller here needs one.
+        raise ValueError(f"device layout has no num-sticks dim: {stl.device_size}")
+    return len(stl.device_size) - 3 if len(stl.device_size) > 2 else 0
 
 
 def rescale_stl_for_dtype(
@@ -234,6 +236,13 @@ def rescale_stl_for_dtype(
     ``insert_staggered_ea_padding``'s job, and it sizes the padding from the
     layout returned here (issue #3999).
 
+    A sub-stick num-sticks dim carries a host extent rather than a stick step, so
+    it has no stick count to rescale and is copied through unchanged. Widening it
+    to the capacity a conversion needs is left to that same later pass because
+    ``propagate_spyre_tensor_layouts`` hands a pointwise output its input's STL
+    directly: a dim grown here would follow the value into every consumer, which
+    sees only the live elements.
+
     Args:
         stl: Input device layout to rescale.
         out_dtype: Torch dtype of the conversion output.
@@ -244,13 +253,10 @@ def rescale_stl_for_dtype(
     out_device_size = list(stl.device_size)
     out_stride_map = list(stl.stride_map)
     out_device_size[-1] = out_eps
-    dim = num_sticks_dim(stl)
-    # A num-sticks stride below the input stick depth means the stick dim is
-    # shorter than one stick: the entry is the host extent, not a stick step, and
-    # the dim already counts the single stick that extent occupies. Rescaling it
-    # would claim stepping the host tensor does not have, so only the depth
-    # changes there.
-    if dim is not None and stl.stride_map[dim] >= in_eps:
+    dim = _num_sticks_slot(stl)
+    if stl.stride_map[dim] >= in_eps:
+        # A full stick step: the dim counts whole sticks, so the same live
+        # elements redistribute over a different number of them.
         total_elems = stl.device_size[dim] * in_eps
         out_device_size[dim] = -(-total_elems // out_eps)
         out_stride_map[dim] = out_eps * stl.stride_map[-1]
