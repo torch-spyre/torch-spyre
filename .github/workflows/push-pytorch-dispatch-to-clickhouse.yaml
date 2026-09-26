@@ -105,7 +105,7 @@ jobs:
       # Checkout so ./.github/actions/... resolves; the action itself locates or
       # sparse-checks-out the script and library it actually needs.
       - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           sparse-checkout: |
             .github/actions
@@ -148,7 +148,7 @@ jobs:
 
     steps:
       - name: Checkout pyproject.toml
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           sparse-checkout: |
             pyproject.toml
@@ -282,7 +282,7 @@ jobs:
       # sparse-checks-out the script and library it actually needs.
       - name: Checkout
         if: steps.extract.outputs.should_build == 'false'
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           sparse-checkout: |
             .github/actions
