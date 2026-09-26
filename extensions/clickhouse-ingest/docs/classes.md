@@ -373,29 +373,19 @@ parsing it.
 
 ## apply_schema.py
 
-The CLI that turns [`schema/*.sql`](../schema/README.md) into a live
-database — the only thing in *this* repo that actually creates the tables
-`schema.py` models (the canonical DDL source is
-`spyre-frameworks/pipelines/clickhouse/`; see
-[Jenkins shared library](jenkins-shared-library.md)).
+The CLI that converges a database on [`schema/*.sql`](../schema/README.md) and
+`schema/migrations/*.sql`. This directory is the canonical v2 DDL; the rules an apply
+enforces are in the schema README.
 
 ```python
-SchemaApplier.schema_dir()                          # sibling schema/, else the installed copy
-SchemaApplier.sql_files(schema_dir)                  # apply order = filename order
-SchemaApplier.statements(text)                       # one file -> executable statements
-SchemaApplier.required_version(text)                 # "-- NEEDS CLICKHOUSE >= X.Y" floor, if any
-SchemaApplier.apply_file(client, path, dry_run, text)
-SchemaApplier.apply_all(client, schema_dir, dry_run)  # skips files whose version floor is unmet
+SchemaApplier.selected_files(schema_dir, include, server)  # skips APPLY: explicit / version floor
+SchemaApplier.objects(path, text)                  # CREATE statements only, else ValueError
+SchemaApplier.plan(client, db, files, migrations)  # [(action, name, detail)], no side effects
+SchemaApplier.apply(client, db, files, migrations) # raises SchemaDrift on a changed table/MV
 ```
 
 ```bash
-python3 -m spyre_clickhouse_ingest.apply_schema --dry-run
-python3 -m spyre_clickhouse_ingest.apply_schema   # applies against $CLICKHOUSE_HOST
+python3 -m spyre_clickhouse_ingest.apply_schema --dry-run              # offline listing
+python3 -m spyre_clickhouse_ingest.apply_schema --database spyre_v2 --check
+python3 -m spyre_clickhouse_ingest.apply_schema --database spyre_v2_next
 ```
-
-> **Nothing runs this automatically.** There is no migration runner and no
-> `schema_migrations` ledger for the v2 databases — every statement has been
-> applied by hand. Before writing to a v2 table, `DESCRIBE TABLE` it on the
-> target server rather than trusting this directory or `schema.py`.
-
-[← Back to index](README.md) · [Next: GitHub Actions →](github-actions.md)

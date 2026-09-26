@@ -30,14 +30,25 @@ SELECT
     max(t.ts)                      AS last_ts,
     count()                        AS promotion_count,
     uniqExact(t.artifact_id)       AS artifact_count,
-    uniqExact(t.component)         AS component_count,
-    arraySort(groupUniqArray(if(t.arch IN ('amd64', 'x86', 'x86-64'), 'x86_64', t.arch))) AS arch_list,
+    uniqExactIf(t.component, t.component != '') AS component_count,
+    arraySort(groupUniqArrayIf(if(t.arch IN ('amd64', 'x86', 'x86-64'), 'x86_64', t.arch),
+                               t.arch != ''))   AS arch_list,
     max(slot_artifacts) > 1        AS is_rolling
 FROM
 (
+    -- ifNull: an unjoined row is NULL under a reader's join_use_nulls=1, and a NULL slot key
+    -- would pool every unjoined row into one slot.
     SELECT at.tag AS tag, at.tag_family AS tag_family, at.artifact_id AS artifact_id,
-           at.ts AS ts, a.component AS component, a.arch AS arch,
-           uniqExact(at.artifact_id) OVER (PARTITION BY at.tag, a.component, a.arch)
+           at.ts AS ts,
+           ifNull(a.component, '') AS component,
+           ifNull(a.arch, '')      AS arch,
+           uniqExact(at.artifact_id) OVER (
+               PARTITION BY at.tag,
+                            -- (component, arch) when joined, else the artifact itself.
+                            if(ifNull(a.component, '') = '',
+                               toString(at.artifact_id),
+                               ifNull(a.component, '')),
+                            ifNull(a.arch, ''))
                AS slot_artifacts
     FROM artifact_tags AS at
     LEFT JOIN artifacts AS a ON a.artifact_id = at.artifact_id

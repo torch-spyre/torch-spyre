@@ -1,0 +1,53 @@
+name: clickhouse-schema
+
+# Applies extensions/clickhouse-ingest/schema/ to an empty throwaway server twice; the second
+# pass must change nothing. Live databases are applied by the spyre-frameworks Jenkins job
+# Spyre/ops/clickhouse-schema, never from here.
+on:
+  pull_request:
+    paths:
+      - extensions/clickhouse-ingest/schema/**
+      - extensions/clickhouse-ingest/spyre_clickhouse_ingest/apply_schema.py
+      - .github/workflows/clickhouse-schema.yaml
+
+concurrency:
+  group: clickhouse-schema-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  fresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      clickhouse:
+        # Match prod's major.minor: the formatter output the drift check compares is versioned.
+        image: clickhouse/clickhouse-server:26.3
+        env:
+          CLICKHOUSE_SKIP_USER_SETUP: '1'
+        ports: [8123:8123]
+        options: >-
+          --health-cmd "wget -qO- http://localhost:8123/ping"
+          --health-interval 5s --health-retries 20
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+      - name: Unit tests
+        working-directory: extensions/clickhouse-ingest
+        run: uv run --with pytest python -m pytest -q tests
+      - name: Apply to an empty database, then prove it converged
+        working-directory: extensions/clickhouse-ingest
+        # Scoped to this step: the unit tests assert on these variables being unset.
+        env:
+          CLICKHOUSE_HOST: localhost
+          CLICKHOUSE_PORT: '8123'
+          CLICKHOUSE_SECURE: '0'
+          CLICKHOUSE_DB: default
+        run: |
+          set -euo pipefail
+          curl -sf localhost:8123 --data-binary 'CREATE DATABASE v2'
+          uv run python -m spyre_clickhouse_ingest.apply_schema --database v2
+          uv run python -m spyre_clickhouse_ingest.apply_schema --database v2 --check
+
