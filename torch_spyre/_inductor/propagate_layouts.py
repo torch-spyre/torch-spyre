@@ -239,6 +239,8 @@ def _project_pointwise_dim_order(
     # buffer. Its extra leading axes are fixed by the loop, while the body
     # operates on the trailing axes. Keep those backing axes in the layout
     # permutation and shift the body's order onto the trailing dimensions.
+    # The trailing -1 is the sparse-stick marker and must be preserved as-is,
+    # not shifted (it is not a dimension index).
     leading = list(range(-rank_diff))
     return leading + [(d - rank_diff if d != -1 else d) for d in dim_order]
 
@@ -1088,7 +1090,19 @@ def find_stick_compatible_input_layout(
     # so return immediately without checking the stick.
     for stl, dev_coords in candidates:
         if stl.element_arrangement != ElementArrangement.STANDARD:
-            return stl
+            # Non-STANDARD arrangements (QFP8WT etc.) carry their own contraction
+            # structure and are normally returned immediately.  However for
+            # batchmatmulfp8 the activation input (QFP8CH) must have
+            # reduction_var on its stick.  A sparse QFP8CH candidate has
+            # reduction_var on an outer dim, not the stick — returning it here
+            # would propagate an incompatible layout and crash downstream.
+            # Skip it so the loop continues to the next candidate (typically a
+            # dense QFP8CH where K is already on the stick).
+            if reduction_type != BATCH_MATMUL_FP8_OP or (
+                reduction_var in dev_coords[-1].free_symbols
+            ):
+                return stl
+            continue
         if reduction_var not in dev_coords[-1].free_symbols:
             continue
         if reduction_type == BATCH_MATMUL_OP and any(

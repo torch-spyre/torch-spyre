@@ -2422,7 +2422,7 @@ def compute_restickify_needed(
     ):
         return False, None
 
-    # ReStickifyOpHBM currently supports only the native FP16 device format
+    # ReStickifyOpHBM supports only the native FP16 device format
     # (both logical float16 and bfloat16 map to SEN169_FP16).
     # Do not advertise an edge as feasible when codegen cannot lower it: this
     # is especially important for fp32-upcast graphs, where a later IEEE_FP32
