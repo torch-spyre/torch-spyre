@@ -1,5 +1,5 @@
 -- Views over test_cases / test_case_runs: per-case history, and the per-run tier counters v2
--- dropped as stored columns. Apply after 10-functional-tests.sql.
+-- dropped as stored columns, whose tier comes from artifact_results. Apply after 10- and 20-.
 
 -- Per-case detail for one run, the artifact drill-down's expanded row. ALWAYS filter by run_id;
 -- unfiltered this joins both tables in full. To select runs by artifact, filter
@@ -42,15 +42,14 @@ INNER JOIN test_cases AS c
         ON c.test_case_id = cr.test_case_id AND c.component = cr.component
 GROUP BY component, classname, name, day;
 
--- Per-tier counters for one run, so the UI renders integration/regression/trunk from a single
--- execution -- each tier counted by its own tag, since the tier relation is not transitive. The
--- tier list is fixed, not derived from tags present, so a tier with zero matches still returns
--- a zero row rather than being indistinguishable from "absent from the picker".
+-- Per-tier counters for one run. The tier is the one its leg was dispatched for
+-- (artifact_results.test_type), not the cases' testtype__ tags: a case tagged for five tiers still
+-- ran under one. A run with no functional leg has no known tier and is absent.
 CREATE VIEW IF NOT EXISTS v_run_tier_counters AS
 SELECT
     cr.run_id AS run_id,
     cr.component AS component,
-    tier,
+    leg.tier AS tier,
     countIf(cr.status = 'passed')  AS passed,
     countIf(cr.status = 'failed')  AS failed,
     countIf(cr.status = 'error')   AS errors,
@@ -63,35 +62,50 @@ SELECT
     if(count() > 0, countIf(cr.status = 'passed') / count(), NULL) AS pass_rate,
     sum(cr.duration_s) AS duration_s
 FROM test_case_runs AS cr
-INNER JOIN test_cases AS c
-        ON c.test_case_id = cr.test_case_id AND c.component = cr.component
-ARRAY JOIN ['integration', 'regression', 'trunk', 'unit', 'smoke'] AS tier
-WHERE has(c.tags, concat('testtype__', tier))
+INNER JOIN
+(
+    -- One tier per run: artifact_results holds a row per build/reuse of a leg, and a perf leg
+    -- can share a functional leg's run_id.
+    SELECT run_id, argMax(test_type, ts) AS tier
+    FROM artifact_results
+    WHERE result_kind = 'functional'
+    GROUP BY run_id
+) AS leg ON leg.run_id = cr.run_id
 GROUP BY run_id, component, tier;
 
--- Completeness of a derived tier report: of the cases tagged for the tier, how many did this
--- run actually execute (needed since the tier relation is not transitive -- a trunk run does
--- not necessarily cover every integration case). If not_covered > 0 it is PARTIAL. Grain is
--- (run_id, component, tier); filter by run_id.
+-- Completeness of a run against its leg's tier: of the cases tagged for that tier, how many
+-- this run executed (the tiers do not nest, so a run need not cover its tier's population).
+-- not_covered > 0 means PARTIAL. Grain is (run_id, component, tier); filter by run_id.
 CREATE VIEW IF NOT EXISTS v_tier_report_completeness AS
 SELECT
-    ran.run_id   AS run_id,
-    c.component   AS component,
-    tier,
-    uniqExact(c.test_case_id)                            AS want_total,
-    uniqExactIf(c.test_case_id, has(ran.ids, c.test_case_id)) AS ran_total,
-    want_total - ran_total                               AS not_covered,
-    if(want_total > 0, ran_total / want_total, NULL)      AS completeness
-FROM test_cases AS c
-ARRAY JOIN ['integration', 'regression', 'trunk', 'unit', 'smoke'] AS tier
--- The cases each run executed, folded to one row per run, so the per-tier comparison is a set
--- membership test rather than a second pass over the fact table.
-CROSS JOIN
+    ran.run_id    AS run_id,
+    ran.component AS component,
+    ran.tier      AS tier,
+    want.want_total                                   AS want_total,
+    ran.ran_total                                     AS ran_total,
+    want_total - ran_total                            AS not_covered,
+    if(want_total > 0, ran_total / want_total, NULL)  AS completeness
+FROM
 (
-    SELECT run_id, component, groupUniqArray(test_case_id) AS ids
-    FROM test_case_runs
-    GROUP BY run_id, component
+    SELECT cr.run_id AS run_id, cr.component AS component, leg.tier AS tier,
+           uniqExactIf(cr.test_case_id, has(c.tags, concat('testtype__', leg.tier))) AS ran_total
+    FROM test_case_runs AS cr
+    INNER JOIN
+    (
+        SELECT run_id, argMax(test_type, ts) AS tier
+        FROM artifact_results
+        WHERE result_kind = 'functional'
+        GROUP BY run_id
+    ) AS leg ON leg.run_id = cr.run_id
+    LEFT JOIN test_cases AS c
+           ON c.test_case_id = cr.test_case_id AND c.component = cr.component
+    GROUP BY run_id, component, tier
 ) AS ran
-WHERE has(c.tags, concat('testtype__', tier))
-  AND c.component = ran.component
-GROUP BY run_id, component, tier;
+INNER JOIN
+(
+    SELECT component, substring(tag, 11) AS tier, uniqExact(test_case_id) AS want_total
+    FROM test_cases
+    ARRAY JOIN tags AS tag
+    WHERE startsWith(tag, 'testtype__')
+    GROUP BY component, tier
+) AS want ON want.component = ran.component AND want.tier = ran.tier;
