@@ -29,6 +29,7 @@
 #include <cstdlib>     // std::getenv
 #include <filesystem>  // NOLINT(build/c++17)
 #include <flex/flex.hpp>
+#include <flex/memory_interface/shared_host_pool.hpp>
 #include <iostream>
 #include <memory>
 #include <optional>
@@ -285,6 +286,32 @@ PYBIND11_MODULE(_C, m) {
       .value("QFP8WT", spyre::ElementArrangement::QFP8WT);
 
   py::class_<spyre::SpyreTensorLayout> dci_cls(m, "SpyreTensorLayout");
+
+  py::class_<flex::SharedPool>(m, "SharedPool")
+      .def("slot_count", &flex::SharedPool::SlotCount)
+      .def("slot_bytes", &flex::SharedPool::SlotBytes)
+      .def("name", &flex::SharedPool::Name)
+      .def("total_bytes", &flex::SharedPool::TotalBytes);
+
+  py::class_<flex::SharedHostPool, flex::SharedPool>(m, "SharedHostPool")
+      .def_static(
+          "create_or_attach",
+          [](const std::string& name, size_t num_slots, size_t slot_bytes) {
+            spyre::startRuntime();
+            return flex::SharedHostPool::CreateOrAttach(
+                spyre::GlobalRuntime::get(), name, num_slots, slot_bytes);
+          },
+          py::arg("name"), py::arg("num_slots"), py::arg("slot_bytes"))
+      .def_static(
+          "unlink_by_name", &flex::SharedHostPool::UnlinkByName,
+          "Unlink the named pool's shm names, both the data segment and "
+          "its .ctl segment. The memory itself survives until the last "
+          "attacher closes it, and this ignores the attach refcount, so "
+          "it is only for test cleanup or recovering from a crashed "
+          "owner. Do not call it while a live pool with the same name "
+          "may exist, or later attachers will create and join a "
+          "different backing segment.",
+          py::arg("name"));
 
   dci_cls.def_readonly("device_size", &spyre::SpyreTensorLayout::device_size)
       .def_readonly("stride_map", &spyre::SpyreTensorLayout::stride_map)
