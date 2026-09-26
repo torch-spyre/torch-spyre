@@ -29,6 +29,7 @@ from .ir import FixedTiledLayout, SpyreEmptyFallback
 from .loop_info import ReadCopyElisionRecord
 from .optimize_restickify import AnyInNode, EdgeCostMap
 from .logging_utils import get_inductor_logger
+from .pass_utils import patch_env
 from torch._inductor.dependencies import MemoryDep, index_vars_squeeze
 from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import (
@@ -229,18 +230,7 @@ def _create_restickify_node(
 
     graph_lowering = V.graph
     fx_graph = graph_lowering.graph
-
-    # View ops (e.g. permute) lower to ReinterpretView with no buffer name and
-    # are absent from env. Patch env from name_to_users so the search below can
-    # resolve them.
-    env = {}
-    for tbs in graph_lowering.name_to_users.values():
-        for tb in tbs:
-            if not tb.data.origins:
-                continue
-            tb_fx_node = list(tb.data.origins)[0]
-            env[tb_fx_node] = tb
-    graph_lowering.env.update(env)
+    patch_env(graph_lowering)
 
     # Search env by buffer name to find the FX node to pass to restickify.
     fx_arg_node = next(

@@ -535,6 +535,78 @@ def get_mem_deps_from_rw(read_writes: ReadWrites) -> list[SchedNodeArg]:
     return res
 
 
+def origin_in_graph(origins, g: "torch.fx.Graph") -> "torch.fx.Node | None":
+    """Pick the origin fx.Node that belongs to graph ``g``.
+
+    A buffer lowered inside an ``invoke_subgraph`` HOP (e.g. a
+    ``nested_compile_region`` block reused across layers) inherits origins that
+    span BOTH the parent graph (the ``invoke_subgraph`` call / ``get_attr``
+    nodes) AND the subgraph's own compute nodes. FX insertion
+    (``inserting_before``) requires an anchor in the *current* lowering graph,
+    and ``next(iter(origins))`` may return a foreign parent-graph node — whose
+    ``.graph is not g`` — which asserts. Filter to the graph being lowered.
+    Returns ``None`` if no origin lives in ``g``.
+    """
+    return next(
+        (n for n in origins if isinstance(n, torch.fx.Node) and n.graph is g),
+        None,
+    )
+
+
+def patch_env(gl: GraphLowering):
+    """Patch env from name_to_users with view names
+
+    View ops (e.g. permute) lower to ReinterpretView with no buffer name and
+    are absent from env. Patch env from name_to_users so they can be found.
+
+    Prefer the origin in the current lowering graph so subgraph buffers key on
+    their subgraph-local node rather than a foreign parent-graph invoke_subgraph node.
+    """
+    env = {}
+    for tbs in gl.name_to_users.values():
+        for tb in tbs:
+            if tb.data.origins:
+                fx_node = origin_in_graph(tb.data.origins, gl.graph)
+                if fx_node is None:
+                    # This fallback is OK because before refactoring, getting
+                    # the first node regardless of origin was the norm in all
+                    # but one call sites.
+                    fx_node = next(iter(tb.data.origins))
+                env[fx_node] = tb
+    gl.env.update(env)
+
+
+def find_fx_node(arg_name: str, graph_lowering: GraphLowering) -> torch.fx.Node | None:
+    """Return the FX node whose lowered TensorBox has the given buffer name.
+
+    Buffer names are unique, but a single buffer can be reached through
+    multiple FX nodes that present it at different sizes.  For example,
+    mm_to_bmm_pass inserts an unsqueeze/reshape so the matmul inner_fn
+    indexes x as 3D [1, M, K] even though the underlying buffer is 2D
+    [M, K].  Both FX nodes lower to a TensorBox whose get_name() returns
+    the same buffer name, but with different get_size() results.
+
+    Returns the first candidate (the base buffer, with no view applied), or
+    None if no candidate exists -- e.g. a coarse_tile read-copy buffer (see
+    coarse_tile.py's _insert_one_read_copy), which is synthesized purely at
+    the IR level after FX lowering completed and so has no FX-graph
+    counterpart at all.
+    """
+    candidates = [
+        fx_node
+        for fx_node, tb in graph_lowering.env.items()
+        if isinstance(fx_node, torch.fx.Node)
+        and isinstance(tb, TensorBox)
+        and tb.get_name() == arg_name
+    ]
+    if candidates:
+        return candidates[0]
+    for n in graph_lowering.graph.nodes:
+        if n.op == "placeholder" and n.name == arg_name:
+            return n
+    return None
+
+
 def _effective_output_layout(op: ComputedBuffer) -> "Layout":
     """Return a layout whose .size and .stride are consistent for op's own write.
 
@@ -1385,8 +1457,9 @@ def _check_stick_expr_supported(stick_expr: sympy.Expr, elems_per_stick: int) ->
 def device_coordinates(
     stl: SpyreTensorLayout,
     dep: MemoryDep,
-    indirect_sizes: "dict[sympy.Symbol, int] | None",
+    indirect_sizes: "dict[sympy.Symbol, int] | None" = None,
     *,
+    check_stick_expr: bool = True,
     op: "Operation | None" = None,
 ) -> list[sympy.Expr]:
     """Compute device-space coordinate expressions for a tensor access.
@@ -1406,7 +1479,8 @@ def device_coordinates(
     """
     index = per_trip_index(op, dep.index) if op is not None else dep.index
     coords = alignment_coordinates(stl, index, dep.ranges, indirect_sizes)
-    _check_stick_expr_supported(coords[-1], stl.elems_per_stick())
+    if check_stick_expr:
+        _check_stick_expr_supported(coords[-1], stl.elems_per_stick())
     return coords
 
 

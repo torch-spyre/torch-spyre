@@ -33,7 +33,12 @@ from torch.utils._ordered_set import OrderedSet
 from .logging_utils import get_inductor_logger
 from .loop_info import ReadCopyElisionRecord
 from .errors import Unsupported
-from .pass_utils import replace_computed_buffer_body
+from .pass_utils import (
+    replace_computed_buffer_body,
+    origin_in_graph,
+    patch_env,
+    find_fx_node,
+)
 from .constants import is_ea_compatible
 from .provenance import decompose_provenance
 from torch_spyre._C import SpyreTensorLayout, ElementArrangement
@@ -440,31 +445,6 @@ def _init_vid_to_bufname(trace):
     return {vid: kwargs["_name"] for op, vid, _, kwargs in trace if op == "load"}
 
 
-def _find_fx_node(name, gl):
-    """Find an FX node by buffer name in the graph.
-
-    Searches both gl.env and placeholder nodes
-
-    Args:
-        name: Buffer name to search for
-        gl: GraphLowering instance
-
-    Returns:
-        FX Node corresponding to the buffer name
-
-    Raises:
-        KeyError: If no FX node is found for the given name
-    """
-    for n, tb in gl.env.items():
-        if isinstance(n, fx.Node) and tb is not None:
-            if tb.get_name() == name:
-                return n
-    for n in gl.graph.nodes:
-        if n.op == "placeholder" and n.name == name:
-            return n
-    raise KeyError(f"No FX node for {name}")
-
-
 def _lower_fx_node(node, gl, ops, idx):
     """Lower an FX node to a buffer and insert it into operations list.
 
@@ -583,7 +563,12 @@ def _make_intermediate_bufs(
             insert_idx += 1
             continue
 
-        input_nodes = [_find_fx_node(vid_to_bufname[v], gl) for v in inputs]
+        def assert_fx_node(v):
+            if (_node := find_fx_node(vid_to_bufname[v], gl)) is not None:
+                return _node
+            raise KeyError(f"No FX node for {vid_to_bufname[v]}")
+
+        input_nodes = [assert_fx_node(v) for v in inputs]
         target = _resolve_fx_target(op_name)
         if target is None:
             raise RuntimeError(f"Cannot resolve target for '{op_name}'")
@@ -709,24 +694,6 @@ def _patch_original_buf(
     V.graph.name_to_buffer[new_op.get_name()] = new_op
 
 
-def _origin_in_graph(origins, g: "fx.Graph") -> "fx.Node | None":
-    """Pick the origin fx.Node that belongs to graph ``g``.
-
-    A buffer lowered inside an ``invoke_subgraph`` HOP (e.g. a
-    ``nested_compile_region`` block reused across layers) inherits origins that
-    span BOTH the parent graph (the ``invoke_subgraph`` call / ``get_attr``
-    nodes) AND the subgraph's own compute nodes. FX insertion
-    (``inserting_before``) requires an anchor in the *current* lowering graph,
-    and ``next(iter(origins))`` may return a foreign parent-graph node — whose
-    ``.graph is not g`` — which asserts. Filter to the graph being lowered.
-    Returns ``None`` if no origin lives in ``g``.
-    """
-    return next(
-        (n for n in origins if isinstance(n, fx.Node) and n.graph is g),
-        None,
-    )
-
-
 def _get_op_name(op) -> str:
     """Extract the operation name from a node for validation."""
     if not hasattr(op.data, "origins") or not op.data.origins:
@@ -740,7 +707,7 @@ def _get_op_name(op) -> str:
     gl = V.graph
     origin_node = None
     if hasattr(gl, "graph"):
-        origin_node = _origin_in_graph(op.data.origins, gl.graph)
+        origin_node = origin_in_graph(op.data.origins, gl.graph)
     if origin_node is None:
         origin_node = next(iter(op.data.origins))
 
@@ -848,18 +815,7 @@ def split_multi_ops(graph: GraphLowering):
     if not (hasattr(gl, "graph") and hasattr(gl, "run_node")):
         return
 
-    # Build environment mapping FX nodes to TensorBox for node lookup. Prefer
-    # the origin in the current lowering graph so subgraph buffers key on their
-    # subgraph-local node rather than a foreign parent-graph invoke_subgraph node.
-    env = {}
-    for tbs in gl.name_to_users.values():
-        for tb in tbs:
-            if tb.data.origins:
-                fx_node = _origin_in_graph(tb.data.origins, gl.graph)
-                if fx_node is None:
-                    fx_node = next(iter(tb.data.origins))
-                env[fx_node] = tb
-    gl.env.update(env)
+    patch_env(gl)
 
     operations = graph.operations
     for op in list(operations):
@@ -892,9 +848,9 @@ def split_multi_ops(graph: GraphLowering):
         # Skip if no FX graph origin node in the current (sub)graph. A buffer
         # lowered inside an invoke_subgraph HOP carries origins from both the
         # parent graph and the subgraph; only the subgraph-local origin is a
-        # valid inserting_before anchor here. _origin_in_graph already enforces
+        # valid inserting_before anchor here. origin_in_graph already enforces
         # node-ness and current-graph membership.
-        orig_node = _origin_in_graph(op.origins, gl.graph)
+        orig_node = origin_in_graph(op.origins, gl.graph)
         if orig_node is None:
             continue
 

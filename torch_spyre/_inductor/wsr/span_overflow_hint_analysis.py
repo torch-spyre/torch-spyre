@@ -33,13 +33,12 @@ from ..errors import Unsupported
 from ..ir import FixedTiledLayout, _resize_device_layout
 from ..logging_utils import get_inductor_logger
 from ..pass_utils import (
+    device_coordinates,
     _fixed_read_layout,
-    concretize_index,
     host_coordinates,
     indirect_info_from_op,
     op_out_coords,
 )
-from ..views import compute_coordinates
 from ..work_division import MAX_SPAN_BYTES
 
 
@@ -717,28 +716,6 @@ def _tile_aware_inner_stride_elems(
     return stride_elems
 
 
-def _device_coordinates_for_span(
-    layout: FixedTiledLayout,
-    dep: MemoryDep,
-) -> list[sympy.Expr]:
-    """Return physical coordinates for span planning.
-
-    This pass analyzes only non-stick coordinates and all callers ignore
-    ``coords[-1]``.  Use the same index concretization and coordinate
-    decomposition as ``device_coordinates()``, but skip its final stick-expression
-    validation so an unsupported stick form does not reject an otherwise valid
-    non-stick span candidate.
-    """
-    index = concretize_index(dep.index, set(dep.ranges.keys()))
-    return compute_coordinates(
-        layout.device_layout.device_size,
-        layout.device_layout.stride_map,
-        dep.ranges,
-        index,
-        None,
-    )
-
-
 def _input_span_infos_controlled_by_output_dims(
     op: ComputedBuffer,
     max_cores: int,
@@ -783,7 +760,9 @@ def _input_span_infos_controlled_by_output_dims(
         itemsize = layout.dtype.itemsize
         stick_elems = layout.device_layout.elems_per_stick()
         try:
-            device_coords = _device_coordinates_for_span(layout, dep)
+            device_coords = device_coordinates(
+                layout.device_layout, dep, check_stick_expr=False
+            )
         except (TypeError, ValueError, RuntimeError, Unsupported):
             continue
 
@@ -910,7 +889,9 @@ def _bmm_k_span_infos(
         if not _layout_has_static_span_metadata(layout):
             continue
         try:
-            device_coords = _device_coordinates_for_span(layout, dep)
+            device_coords = device_coordinates(
+                layout.device_layout, dep, check_stick_expr=False
+            )
         except (TypeError, ValueError, RuntimeError, Unsupported):
             continue
         device_size = [int(s) for s in layout.device_layout.device_size]
@@ -1082,7 +1063,9 @@ def _has_untileable_reduction_span(op: ComputedBuffer, max_cores: int) -> bool:
         if not _layout_has_static_span_metadata(layout):
             continue
         try:
-            device_coords = _device_coordinates_for_span(layout, dep)
+            device_coords = device_coordinates(
+                layout.device_layout, dep, check_stick_expr=False
+            )
         except (TypeError, ValueError, RuntimeError, Unsupported):
             continue
         device_size = [int(s) for s in layout.device_layout.device_size]
@@ -1267,7 +1250,9 @@ def _output_span_candidates_from_op(
         return []
 
     try:
-        device_coords = _device_coordinates_for_span(layout, out_dep)
+        device_coords = device_coordinates(
+            layout.device_layout, out_dep, check_stick_expr=False
+        )
     except (TypeError, ValueError, RuntimeError, Unsupported) as exc:
         logger.debug(
             "span_overflow_output: op=%s skipped; device-coordinate analysis failed: %s",
