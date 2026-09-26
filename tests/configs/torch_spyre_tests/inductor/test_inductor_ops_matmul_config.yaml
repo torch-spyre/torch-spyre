@@ -18,3 +18,8 @@ test_suite_config:
           mode: mandatory_success
           tags:
             - ops__inductor-matmul
+        - names:
+            - TestOps::test_grouped_mm.*
+          mode: mandatory_success
+          tags:
+            - ops__inductor-matmul

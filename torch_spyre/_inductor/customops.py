@@ -1348,6 +1348,70 @@ def _(input: torch.Tensor, dim: int, keepdim: bool = False) -> torch.Tensor:
     return torch.empty(out_shape, dtype=input.dtype, device=input.device)
 
 
+@torch.library.custom_op(
+    "spyre::compute_grouped_mm_routing_tables",
+    mutates_args=(),
+    device_types="spyre",
+)
+def compute_grouped_mm_routing_tables(
+    offs: torch.Tensor,
+    total_tokens: int,
+    num_experts: int,
+    t_max: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute lightweight index tables on CPU for on-device direct bmm grouped_mm.
+
+    t_max must be >= the longest expert segment in offs; the caller
+    (decompositions._grouped_mm_t_max) is responsible for computing it and
+    passing it here.  Every row/reduction term is mapped; no segment is
+    truncated.
+
+    Returns:
+      src_indices: [num_experts * t_max], int32 — maps each slot in padded_a
+                   [E, t_max, K] to a row in mat_a, or to total_tokens for
+                   zero-padding slots.
+      dst_indices: [total_tokens], int32 — maps each output token to its row
+                   in flat padded_out [E * t_max, ...].
+    """
+    offs_cpu = offs.to("cpu", dtype=torch.int32).tolist()
+    dummy_zero_row = total_tokens
+
+    src_indices = torch.full((num_experts * t_max,), dummy_zero_row, dtype=torch.int32)
+    dst_indices = torch.zeros(total_tokens, dtype=torch.int32)
+
+    start = 0
+    for e in range(num_experts):
+        end = offs_cpu[e]
+        count = end - start
+        if count > 0:
+            slot_start = e * t_max
+            src_indices[slot_start : slot_start + count] = torch.arange(
+                start, end, dtype=torch.int32
+            )
+            dst_indices[start:end] = torch.arange(
+                slot_start, slot_start + count, dtype=torch.int32
+            )
+        start = end
+
+    return (
+        src_indices.to(device=offs.device),
+        dst_indices.to(device=offs.device),
+    )
+
+
+@compute_grouped_mm_routing_tables.register_fake
+def _(
+    offs: torch.Tensor,
+    total_tokens: int,
+    num_experts: int,
+    t_max: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return (
+        torch.empty(num_experts * t_max, dtype=torch.int32, device=offs.device),
+        torch.empty(total_tokens, dtype=torch.int32, device=offs.device),
+    )
+
+
 # LX-safe means: this op's eager body generates no intermediate buffer that
 # could get pinned to LX (today, that requires a nested torch.compile; plain
 # CPU work or a body that never touches a spyre tensor has nothing to plan).
@@ -1359,6 +1423,7 @@ def _(input: torch.Tensor, dim: int, keepdim: bool = False) -> torch.Tensor:
 mark_lx_safe(torch.ops.spyre.to_dtype_cpu.default)
 mark_lx_safe(torch.ops.spyre.unfold.default)
 mark_lx_safe(torch.ops.spyre.causal_mask.default)
+mark_lx_safe(torch.ops.spyre.compute_grouped_mm_routing_tables.default)
 mark_lx_safe(torch.ops.spyre.triu_mask.default)
 # max_dim_int64_fallback/min_dim_int64_fallback/max_default_int64_fallback are
 # registered via ops/fallbacks.py's register_fallback, which already appends
