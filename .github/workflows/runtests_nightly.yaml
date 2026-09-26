@@ -59,6 +59,7 @@ jobs:
       CLICKHOUSE_USER: ${{ secrets.CLICKHOUSE_USER }}
       CLICKHOUSE_PASS: ${{ secrets.CLICKHOUSE_PASS }}
       CLICKHOUSE_DB: ${{ secrets.CLICKHOUSE_DB }}
+      CLICKHOUSE_DB_V2: ${{ secrets.CLICKHOUSE_DB_V2 }}
 
   # ---------------------------------------------------------------------------
   # Model-ops capability suites, as a tier of THIS nightly rather than a cron of
@@ -100,6 +101,7 @@ jobs:
       CLICKHOUSE_USER: ${{ secrets.CLICKHOUSE_USER }}
       CLICKHOUSE_PASS: ${{ secrets.CLICKHOUSE_PASS }}
       CLICKHOUSE_DB: ${{ secrets.CLICKHOUSE_DB }}
+      CLICKHOUSE_DB_V2: ${{ secrets.CLICKHOUSE_DB_V2 }}
 
   # ---------------------------------------------------------------------------
   # Job 2: run-spyre-unit-tests (fan-in gate)
