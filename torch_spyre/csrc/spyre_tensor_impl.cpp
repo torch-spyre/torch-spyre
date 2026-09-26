@@ -217,6 +217,21 @@ std::string SpyreTensorLayout::toString() const {
     ss << ", element_arrangement=ElementArrangement.";
     ss << spyre::elementArrangementToString(this->element_arrangement);
   }
+  if (!this->tile_size.empty()) {
+    ss << ", tile_size={";
+    bool first = true;
+    for (const auto& [dims, size] : this->tile_size) {
+      if (!first) ss << ", ";
+      first = false;
+      ss << "[";
+      for (size_t i = 0; i < dims.size(); i++) {
+        ss << dims[i];
+        if (i + 1 < dims.size()) ss << ", ";
+      }
+      ss << "]: " << size;
+    }
+    ss << "}";
+  }
   ss << ")";
   return ss.str();
 }

@@ -30,6 +30,7 @@
 #include <filesystem>  // NOLINT(build/c++17)
 #include <flex/flex.hpp>
 #include <iostream>
+#include <map>
 #include <memory>
 #include <optional>
 #include <string>
@@ -66,7 +67,7 @@ namespace fs = std::filesystem;
 
 namespace spyre {
 
-static constexpr int32_t kSpyreTensorLayoutPickleVersion = 3;
+static constexpr int32_t kSpyreTensorLayoutPickleVersion = 4;
 
 std::atomic<bool> g_downcast_warn_enabled{true};
 
@@ -291,6 +292,7 @@ PYBIND11_MODULE(_C, m) {
       .def_readonly("device_dtype", &spyre::SpyreTensorLayout::device_dtype)
       .def_readonly("element_arrangement",
                     &spyre::SpyreTensorLayout::element_arrangement)
+      .def_readonly("tile_size", &spyre::SpyreTensorLayout::tile_size)
       .def("with_element_arrangement",
            &spyre::SpyreTensorLayout::with_element_arrangement,
            py::arg("element_arrangement"))
@@ -312,10 +314,12 @@ PYBIND11_MODULE(_C, m) {
            py::arg("dim_order"),
            py::arg("element_arrangement") = spyre::ElementArrangement::STANDARD)
       .def(py::init<std::vector<int64_t>, std::vector<int64_t>, DataFormats,
-                    spyre::ElementArrangement>(),
+                    spyre::ElementArrangement,
+                    std::map<std::vector<int64_t>, int64_t>>(),
            py::arg("device_size"), py::arg("stride_map"),
            py::arg("device_dtype"),
-           py::arg("element_arrangement") = spyre::ElementArrangement::STANDARD)
+           py::arg("element_arrangement") = spyre::ElementArrangement::STANDARD,
+           py::arg("tile_size") = std::map<std::vector<int64_t>, int64_t>{})
       .def(py::pickle(
           [](const spyre::SpyreTensorLayout& p) {  // __getstate__
             // Return a tuple that fully encodes the state of the object
@@ -325,7 +329,7 @@ PYBIND11_MODULE(_C, m) {
             // kSpyreTensorLayoutPickleVersion
             return py::make_tuple(spyre::kSpyreTensorLayoutPickleVersion,
                                   p.device_size, p.stride_map, p.device_dtype,
-                                  p.element_arrangement);
+                                  p.element_arrangement, p.tile_size);
           },
           [](py::tuple t) {  // __setstate__
             int32_t version = t[0].cast<int32_t>();
@@ -359,6 +363,18 @@ PYBIND11_MODULE(_C, m) {
                   t[1].cast<std::vector<int64_t>>(),
                   t[2].cast<std::vector<int64_t>>(), t[3].cast<DataFormats>(),
                   t[4].cast<spyre::ElementArrangement>());
+            } else if (version == 4) {
+              // Version 4: (version, device_size, stride_map, device_dtype,
+              // element_arrangement, tile_size)
+              if (t.size() != 6) {
+                throw py::value_error(
+                    "Invalid SpyreTensorLayout pickle v4: wrong tuple size");
+              }
+              return spyre::SpyreTensorLayout(
+                  t[1].cast<std::vector<int64_t>>(),
+                  t[2].cast<std::vector<int64_t>>(), t[3].cast<DataFormats>(),
+                  t[4].cast<spyre::ElementArrangement>(),
+                  t[5].cast<std::map<std::vector<int64_t>, int64_t>>());
             } else {
               throw py::value_error(
                   "Unsupported SpyreTensorLayout pickle version: " +
