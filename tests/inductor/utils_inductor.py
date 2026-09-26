@@ -503,6 +503,7 @@ class ParameterizedTestMeta(type):
             ops_dict = cases["ops_dict"] if "ops_dict" in cases else None
             param_sets = cases["param_sets"]
             expect_fail = cases.get("expect_fail", [])
+            skip_list = cases.get("skip", [])
 
             for test_case, params in param_sets.items():
                 if ops_dict:
@@ -529,18 +530,25 @@ class ParameterizedTestMeta(type):
                             f"Test name conflict: {test_name}"
                         )
                         namespace[test_name] = make_test(base_func, op, params)
-                        # An expect_fail entry may target either the bare param
-                        # key (xfails every op for that shape) or the specific
-                        # ``{op_name}_{test_case}`` combination (xfails just that
-                        # op), so a single op can be marked without affecting the
-                        # others sharing the shape.
                         op_case = f"{op_name}_{test_case}"
-                        op_case_match = op_case in expect_fail
-                        if test_case in expect_fail or op_case_match:
-                            marked = op_case if op_case_match else test_case
-                            namespace[test_name] = pytest.mark.xfail(
-                                reason=f"Expected fail for {marked}", strict=True
+                        op_case_skip = op_case in skip_list
+                        if test_case in skip_list or op_case_skip:
+                            marked = op_case if op_case_skip else test_case
+                            namespace[test_name] = pytest.mark.skip(
+                                reason=f"Skipped for {marked}"
                             )(namespace[test_name])
+                        else:
+                            # An expect_fail entry may target either the bare param
+                            # key (xfails every op for that shape) or the specific
+                            # ``{op_name}_{test_case}`` combination (xfails just that
+                            # op), so a single op can be marked without affecting the
+                            # others sharing the shape.
+                            op_case_match = op_case in expect_fail
+                            if test_case in expect_fail or op_case_match:
+                                marked = op_case if op_case_match else test_case
+                                namespace[test_name] = pytest.mark.xfail(
+                                    reason=f"Expected fail for {marked}", strict=True
+                                )(namespace[test_name])
                 else:
                     # ---- Original per-case expansion ----
                     def make_test(_base_func, _params):
@@ -562,7 +570,11 @@ class ParameterizedTestMeta(type):
                         f"Test name conflict: {test_name}"
                     )
                     namespace[test_name] = make_test(base_func, params)
-                    if test_case in expect_fail:
+                    if test_case in skip_list:
+                        namespace[test_name] = pytest.mark.skip(
+                            reason=f"Skipped for {test_case}"
+                        )(namespace[test_name])
+                    elif test_case in expect_fail:
                         namespace[test_name] = pytest.mark.xfail(
                             reason=f"Expected fail for {test_case}", strict=True
                         )(namespace[test_name])
