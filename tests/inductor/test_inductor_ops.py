@@ -432,12 +432,39 @@ TO_DTYPE_OP_ROUND_TRIP_PARAMS_SETS = {
     for shape in TO_DTYPE_OP_SHAPES
 }
 
+# Only the shapes that fail for every op still xfail here: (68,) fails to compile
+# (dxp_standalone returns 1) and (4,68) is numerically wrong. The other unaligned
+# shapes -- (4,16), (4,32), (4,63) -- xfailed because rescale_stl_for_dtype derived
+# the stick count from the input's padded stick *capacity* (issue #4392), which is
+# inexact for them: it floored to a zero-sized dim before #3809 and is refused as
+# unknowable after it. The count now comes from the logical stick extent, which is
+# exact, so they pass.
 TO_DTYPE_OP_ROUND_TRIP_EXPECT_FAIL = [
     f"{_dtype_name(src)}_to_{_dtype_name(dst)}_{shapes2key((shape,))}"
     for src in [torch.float16, torch.bfloat16, torch.float32]
     for dst in [torch.float16, torch.float32]
     if src != dst
     for shape in TO_DTYPE_OP_SHAPES_UNALIGNED
+    if shape in _DTYPE_OP_ALL_OPS_FAIL_SHAPES
+]
+
+# The round-trip families that feed the converted tensor to an *op* (rather than
+# copying it straight back) additionally mismatch on fp16 -> fp32 when the widened
+# result is a single fp32 stick. These are numeric, not layout, failures: the stick
+# count is correct after #4392, yet ~45-48% of elements differ, which is the
+# signature of a staggered-EA readback rather than a mis-sized dim. (4,63) widens
+# to two fp32 sticks and passes, so the boundary is shape[-1] <= 32.
+_ROUND_TRIP_ADD_WIDEN_FAIL_SHAPES = {
+    shape
+    for shape in TO_DTYPE_OP_SHAPES_UNALIGNED
+    if shape not in _DTYPE_OP_ALL_OPS_FAIL_SHAPES and shape[-1] <= 32
+}
+
+TO_DTYPE_OP_ROUND_TRIP_ADD_EXPECT_FAIL = TO_DTYPE_OP_ROUND_TRIP_EXPECT_FAIL + [
+    f"{_dtype_name(torch.float16)}_to_{_dtype_name(torch.float32)}"
+    f"_{shapes2key((shape,))}"
+    for shape in TO_DTYPE_OP_SHAPES_UNALIGNED
+    if shape in _ROUND_TRIP_ADD_WIDEN_FAIL_SHAPES
 ]
 
 TO_DTYPE_REDUCTION_DTYPES = [torch.float16, torch.float32]
@@ -5210,7 +5237,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         ("test_round_trip_to_dtype", "test_round_trip_to_dtype_cpu"): {
             "ops_dict": {"add": torch.add},
             "param_sets": TO_DTYPE_OP_ROUND_TRIP_PARAMS_SETS,
-            "expect_fail": TO_DTYPE_OP_ROUND_TRIP_EXPECT_FAIL,
+            "expect_fail": TO_DTYPE_OP_ROUND_TRIP_ADD_EXPECT_FAIL,
         },
         # storage_offset support for graph-input placeholders, non-stick dims.
         # `slicer` runs after .to("spyre") and before compile, so the offset
@@ -5435,7 +5462,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         ): {
             "ops_dict": {"add": torch.add},
             "param_sets": TO_DTYPE_OP_ROUND_TRIP_PARAMS_SETS,
-            "expect_fail": TO_DTYPE_OP_ROUND_TRIP_EXPECT_FAIL,
+            "expect_fail": TO_DTYPE_OP_ROUND_TRIP_ADD_EXPECT_FAIL,
         },
         (
             "test_reduction_with_to_dtype",

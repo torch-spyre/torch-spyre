@@ -97,6 +97,7 @@ from .pass_utils import (
     is_topk,
     iter_var_id,
     rescale_stl_for_dtype,
+    stick_extent_from_coords,
 )
 from .optimize_restickify import AllSameNode, AnyInNode, FixedInOutNode
 from .views import compute_coordinates, matching_dim
@@ -403,36 +404,6 @@ def _convert_reads_whole_input(
     )
 
 
-def _qfp8ch_stl(stl: SpyreTensorLayout, out_dtype: torch.dtype) -> SpyreTensorLayout:
-    """Output layout of ``qfp8ch``: fp16 (64/stick) -> fp8 (128/stick) quantization.
-
-    Propagates the input device layout, preserving any padding, and rescales
-    the stick depth the way ``rescale_stl_for_dtype`` does, except that the
-    num-sticks dim rounds UP: an fp16 tensor whose stick-indexing dim holds an
-    odd number of 64-element sticks ends in one partially filled 128-element
-    fp8 stick. That is a legitimate layout for this op -- the fp8->fp16
-    conversion that consumes it rebuilds a dense layout from the host size,
-    treating the partial stick exactly like any other unaligned stick dim --
-    so it must never floor to a size-0 dim (issue #3604).
-    """
-    in_eps = stl.device_size[-1]
-    out_eps = get_elem_in_stick(out_dtype)
-    out_device_size = list(stl.device_size)
-    out_stride_map = list(stl.stride_map)
-    out_device_size[-1] = out_eps
-    for i, s in enumerate(stl.stride_map):
-        if s == in_eps:
-            out_device_size[i] = -(-(stl.device_size[i] * in_eps) // out_eps)
-            out_stride_map[i] = out_eps
-            break
-    return SpyreTensorLayout(
-        out_device_size,
-        out_stride_map,
-        get_device_dtype(out_dtype),
-        ElementArrangement.QFP8CH,
-    )
-
-
 def _qfp8wt_stl(
     output: FixedLayout,
     in_layout: FixedLayout,
@@ -598,18 +569,39 @@ def _single_arg_op_layout(
             #    _convert_reads_whole_input; a sliced read falls through to (2),
             #    which still stamps the staggered EA.
             #
-            # 2. Plain conversions (e.g. fp8->fp16 after qfp8ch). Here the input
-            #    device layout can be degenerate — qfp8ch rescales a size-1
-            #    num-sticks dim to 0 (1*64//128), leaving a size-0 dim — and
-            #    rescale_stl_for_dtype would faithfully propagate that garbage,
-            #    changing the layout rank and downstream graph partitioning.
-            #    Rebuild a clean dense layout from the output host size instead,
-            #    as the general (non-EA) convert path does.
+            # 2. Plain conversions (e.g. fp8->fp16 after qfp8ch) and sliced
+            #    staggered reads. A plain conversion has no staggered element
+            #    ordering to preserve, so there is nothing to inherit and the
+            #    output host size describes the result exactly; rebuild a clean
+            #    dense layout from it, as the general (non-EA) convert path does.
+            #    This branch used to be load-bearing for a second reason -- qfp8ch
+            #    could rescale a size-1 num-sticks dim to 0 (1*64//128) and
+            #    propagating that garbage changed the layout rank -- which the
+            #    #4392 fix removes; a zero is no longer reachable from either
+            #    branch. The sliced-read case (_convert_reads_whole_input) remains.
             staggered = fmt in STAGGERED_EAS or input_ea in STAGGERED_EAS
             if staggered and _convert_reads_whole_input(
                 in_layout, output, dep, output_dep
             ):
-                layouts = [rescale_stl_for_dtype(stl, output.dtype, fmt)]
+                # Give the helper both ways to reach the stick axis: coordinate
+                # identity, which is authoritative but returns None when it cannot
+                # pin the axis, and the host size/strides, which pin it from the
+                # layout instead. The strides are the *input* layout's, since it is
+                # the input STL being rescaled. Both routes are exact; only if both
+                # fail does the capacity fallback apply. See rescale_stl_for_dtype
+                # for why capacity alone is not enough (issue #4392).
+                layouts = [
+                    rescale_stl_for_dtype(
+                        stl,
+                        output.dtype,
+                        fmt,
+                        stick_extent=stick_extent_from_coords(
+                            stl, in_layout, dep, output.size
+                        ),
+                        host_size=output.size,
+                        host_stride=in_layout.stride,
+                    )
+                ]
 
                 # A conversion that creates a staggered EA must also expose
                 # outputs reachable by restickifying its STANDARD input first.
@@ -621,7 +613,7 @@ def _single_arg_op_layout(
                 if fmt in STAGGERED_EAS and input_ea == ElementArrangement.STANDARD:
                     in_coords = host_coordinates(in_layout, dep, None)
                     source_device_coords = device_coordinates(stl, dep, None)
-                    for target_stick_expr in in_coords:
+                    for target_hd, target_stick_expr in enumerate(in_coords):
                         if not target_stick_expr.free_symbols:
                             continue
                         target_stl = compute_restickify_target_layout(
@@ -633,7 +625,14 @@ def _single_arg_op_layout(
                         )
                         if target_stl is None:
                             continue
-                        candidate = rescale_stl_for_dtype(target_stl, output.dtype, fmt)
+                        # This candidate sticks host dim target_hd, not the input's
+                        # stick dim, so its extent comes from that axis.
+                        candidate = rescale_stl_for_dtype(
+                            target_stl,
+                            output.dtype,
+                            fmt,
+                            stick_extent=concretize_expr(output.size[target_hd]),
+                        )
                         if candidate not in layouts:
                             layouts.append(candidate)
 
@@ -661,10 +660,31 @@ def _single_arg_op_layout(
         case spyreop.qfp8ch.default:
             # fp16 (64 elems/stick) -> fp8 (128 elems/stick) quantization.
             # Propagate the input device layout and rescale for the dtype change,
-            # preserving any padding present in the input STL. Not
-            # rescale_stl_for_dtype: an fp16 tensor with an odd stick count
-            # ends in a partially filled fp8 stick, which that helper rejects.
-            return [_qfp8ch_stl(stl, output.dtype)]
+            # preserving any padding present in the input STL. The stick count
+            # comes from the logical stick-axis extent so a single fp16 stick does
+            # not floor to zero sticks at fp8 (issue #4392). An fp16 tensor with an
+            # odd stick count legitimately ends in a partially filled fp8 stick;
+            # ceil on the extent rounds it up, so this needs no separate builder --
+            # only the capacity-based fallback has to refuse an inexact rescale.
+            # This replaces #3809's _qfp8ch_stl, which existed only to sidestep that
+            # refusal, and cannot disagree with it on the count: for this direction
+            # ceil on the capacity and ceil on the extent are the same function,
+            # since ceil(ceil(e / 64) / 2) == ceil(e / 128) for every extent. The
+            # stride does differ -- stride_map[-1] * out_eps rather than a flat
+            # out_eps -- and only where the stick axis is not host-contiguous, i.e.
+            # where the flat value was wrong.
+            return [
+                rescale_stl_for_dtype(
+                    stl,
+                    output.dtype,
+                    ElementArrangement.QFP8CH,
+                    stick_extent=stick_extent_from_coords(
+                        stl, in_layout, dep, output.size
+                    ),
+                    host_size=output.size,
+                    host_stride=in_layout.stride,
+                )
+            ]
 
         case spyreop.qfp8wt.default:
             # fp16 -> fp8 weight quantization with 2D-stick layout [2, 64].
@@ -1537,10 +1557,36 @@ def _multi_arg_pointwise_layouts(
     #       3.2 every staggered operand can broadcast  -> STANDARD output
     #       3.3 otherwise (a STANDARD and a staggered full operand coexist)
     #                                                  -> unsupported (raise)
-    # In the overlap, prefer the direction whose broadcast condition holds for
-    # every candidate of the opposite-EA inputs. That choice remains valid no
-    # matter which producer layouts the optimizer can actually reach. If both
-    # directions are equally stable (or unstable), retain the 3.1 preference.
+    # Cases 3.1 and 3.2 overlap when both groups have a broadcast-capable
+    # candidate, and both are sound -- the choice governs *reachability*, not
+    # correctness, and it is read off candidate *lists*, so any pass that widens
+    # one can flip it (deriving the stick count from the host extent did, #4392).
+    # Take 3.1 only when it prunes nothing -- the STANDARD group broadcasts
+    # unconditionally -- or when 3.2 is unavailable because the staggered group has
+    # no broadcast candidate at all; otherwise take 3.2. 3.2's prune is the safe
+    # default because the stagger it discards is unobservable on the sparse stick
+    # every retained candidate has (see case 3.2 below), whereas 3.1 prunes the
+    # STANDARD operands and can strand a *full-extent* one holding only a
+    # replicating candidate -- a stick carrying a single host element, which the
+    # stick solver cannot pair with the staggered operand's. Gemma 4 vision RMSNorm
+    # reaches exactly that at its closing `(x - mean) * inv`, where both operands
+    # are bf16 and only the mean is genuinely broadcast-shaped; pruning the
+    # activation instead of the mean makes the join infeasible. See
+    # test_mixed_ea_noncanonical_staggered_broadcaster_fp16.
+    #
+    # The sparse half of that argument is now settled before control reaches here:
+    # ``rescale_stl_for_dtype`` stops labelling a convert whose stick holds a single
+    # host element as staggered, because no within-stick order exists there to
+    # stagger. So an operand all of whose candidates are sparse never joins the
+    # staggered group at all, and case 3 arises only where the staggered operand has
+    # a genuinely non-sparse candidate. That correction on its own also resolves the
+    # RMSNorm regression -- with it in place, the six ``mixed_ea`` building-block
+    # tests and the RMSNorm reproducer all pass under *either* branch of the
+    # condition below, and commit the same layouts. This tie-break is kept anyway:
+    # the stranding it avoids follows from an operand's *extent*, not from how a
+    # sparse stick happens to be labelled, and ``layouts[0]`` hands this code one EA
+    # per operand while the candidate list behind it may mix them (a list spans
+    # stick axes, and sparsity follows the axis).
     # A future extension may admit 2a/3.3 by inserting an explicit EA conversion
     # at extra cost.
     staggered_inputs = input_eas & STAGGERED_EAS
@@ -1596,11 +1642,8 @@ def _multi_arg_pointwise_layouts(
         std_always_broadcasts = all(
             not non_broadcast for _, _, non_broadcast in std_split
         )
-        stag_always_broadcasts = all(
-            not non_broadcast for _, _, non_broadcast in stag_split
-        )
 
-        if std_can_broadcast and (std_always_broadcasts or not stag_always_broadcasts):
+        if std_can_broadcast and (std_always_broadcasts or not stag_can_broadcast):
             # Case 3.1 (and case 2b with no STANDARD operands): preserve the
             # staggered arrangement and keep only broadcast-compatible STANDARD
             # candidates.

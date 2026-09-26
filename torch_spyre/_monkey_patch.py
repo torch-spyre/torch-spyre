@@ -85,7 +85,22 @@ def _add_ea(src_tensor, res_tensor) -> None:
     stl = res_layout.with_element_arrangement(fmt)
     is_staggered_ea = fmt in STAGGERED_EAS or input_ea in STAGGERED_EAS
     if src_tensor.dtype != torch.float32 and is_staggered_ea:
-        stl = rescale_stl_for_dtype(src_layout, res_tensor.dtype, fmt)
+        # Derive the stick count from the logical shape rather than the source's
+        # padded stick capacity (issue #4392). This runs in eager dispatch, so
+        # there is no MemoryDep and no FixedLayout to resolve the stick axis with
+        # stick_extent_from_coords -- but a real Tensor knows its own strides, and
+        # stride_map[-1] is host_stride[stick_dim], so the shape and strides
+        # together pin the stick axis exactly. Both come from src_tensor: it is
+        # src_layout that is being rescaled, so the strides must be the ones that
+        # layout was built from (a conversion is same-shape, but .to() is free to
+        # hand back a contiguous result for a non-dense input).
+        stl = rescale_stl_for_dtype(
+            src_layout,
+            res_tensor.dtype,
+            fmt,
+            host_size=list(src_tensor.shape),
+            host_stride=list(src_tensor.stride()),
+        )
 
     set_spyre_tensor_layout(res_tensor, stl)
 
