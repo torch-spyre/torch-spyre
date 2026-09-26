@@ -738,11 +738,14 @@ def _scatter_index_buf_names_ordered(op: ComputedBuffer) -> list[str]:
     for idx_tensor in indices:
         if idx_tensor is None:
             continue
-        # Unwrap TensorBox -> StorageBox -> Buffer to get the name
+        # Unwrap TensorBox -> StorageBox -> Buffer, stopping at the first node
+        # carrying a name. A ComputedBuffer holds its recipe in .data, so an
+        # unconditional walk steps past its name into a Pointwise, which has
+        # none, and the index is dropped from every index-role exemption.
         node = idx_tensor
-        while hasattr(node, "data"):
+        while getattr(node, "name", None) is None and hasattr(node, "data"):
             node = node.data
-        if hasattr(node, "name") and node.name is not None:
+        if getattr(node, "name", None) is not None:
             names.append(node.name)
     return names
 

@@ -105,6 +105,10 @@ def resolve_output_formats(
 
 class DtypeOpTable:
     _IDENTITY_DTYPES = [
+        # Both are IEEE_INT32 on device, so the cast is a byte copy. Without
+        # this the lookup misses and the conversion falls back to the host.
+        (torch.int64, torch.int32),
+        (torch.int32, torch.int64),
         (torch.float16, torch.bfloat16),
         (torch.bfloat16, torch.float16),
         (torch.float16, torch.bool),
