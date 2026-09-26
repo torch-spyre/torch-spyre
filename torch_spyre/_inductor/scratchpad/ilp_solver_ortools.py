@@ -104,6 +104,8 @@ import logging
 import math
 import operator
 import os
+import threading
+import time
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from fractions import Fraction
@@ -519,6 +521,78 @@ def get_cpu_count() -> int:
     except ImportError:
         pass
     return os.cpu_count() or 1
+
+
+if TYPE_CHECKING:
+    from ortools.sat.python.cp_model import CpSolverSolutionCallback as _CallbackBase
+else:
+    # ortools is optional at import time (see the guarded import above); a
+    # module without it never constructs a _StallStop.
+    _CallbackBase = cp_model.CpSolverSolutionCallback if cp_model else object
+
+
+class _StallStop(_CallbackBase):
+    """Stop a CP-SAT solve once the incumbent has not improved for ``stall_s``.
+
+    CP-SAT runs its search and its optimality proof as one process; a time
+    limit is the only stock way to give up on the proof, and it also gives up
+    on the search. This callback notes when the objective last improved, and
+    :meth:`watch` runs a thread that calls ``stop_search`` once ``stall_s`` of
+    wall time pass after that with no better plan. Nothing stops before the
+    first solution: the caller needs a plan. The solver's own time limit
+    remains the hard cap. ``clock`` is injectable for tests."""
+
+    def __init__(self, solver, stall_s: float, clock=time.monotonic, poll_s=0.25):
+        super().__init__()
+        self._solver = solver
+        self._stall_s = stall_s
+        self._clock = clock
+        self._poll_s = poll_s
+        self._best: float | None = None
+        self._last_improvement: float | None = None
+        self._done = threading.Event()
+        self.fired = False
+        self.solutions = 0
+
+    def on_solution_callback(self) -> None:
+        self.note(self.objective_value)
+
+    def note(self, value: float) -> None:
+        """Record a reported solution; an improvement resets the stall clock."""
+        self.solutions += 1
+        if self._best is None or value < self._best - 1e-9:
+            self._best = value
+            self._last_improvement = self._clock()
+
+    def should_stop(self) -> bool:
+        return (
+            self._last_improvement is not None
+            and self._clock() - self._last_improvement >= self._stall_s
+        )
+
+    def _watch(self) -> None:
+        while not self._done.wait(self._poll_s):
+            if self.should_stop():
+                self.fired = True
+                self._solver.stop_search()
+                return
+
+    def watch(self):
+        """Run ``solve`` under the watchdog: ``with stall.watch(): solve()``."""
+        stop = self
+
+        class _Guard:
+            def __enter__(self_):
+                stop._thread = threading.Thread(target=stop._watch, daemon=True)
+                stop._thread.start()
+                return stop
+
+            def __exit__(self_, *exc):
+                stop._done.set()
+                stop._thread.join()
+                return False
+
+        return _Guard()
 
 
 class _LazyMin(sympy.Min):
@@ -1392,7 +1466,24 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         Nothing else in the pipeline records this, so "why was that compile
         slow" currently has no artifact behind it.
         """
-        status = solver.Solve(model)
+        # The stall stop applies to the priced objective solve only; the
+        # lexicographic fallbacks keep plain time limits.
+        stall_s = config.cpsat_stall_seconds if objective else 0.0
+        stall: _StallStop | None = None
+        if stall_s > 0 and model.has_objective():
+            stall = _StallStop(solver, float(stall_s))
+            with stall.watch():
+                status = solver.solve(model, stall)
+            if stall.fired:
+                logger.info(
+                    "[CP-SAT layout solver] stopped after %.0f s without a better "
+                    "plan (%d solutions, %.1f s total); taking the incumbent",
+                    stall_s,
+                    stall.solutions,
+                    solver.wall_time,
+                )
+        else:
+            status = solver.Solve(model)
         self.last_solve_stats = {
             "status": solver.StatusName(status),
             "solve_s": round(solver.WallTime(), 3),
@@ -1400,6 +1491,8 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
             "constraints": len(model.proto.constraints),
             "limit_s": solver.parameters.max_time_in_seconds or None,
             "objective_used": objective,
+            "stall_s": stall_s or None,
+            "stopped_on_stall": bool(stall and stall.fired),
         }
         return status
 
