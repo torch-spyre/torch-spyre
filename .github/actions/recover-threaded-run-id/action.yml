@@ -12,10 +12,11 @@ description: |
   triggering run's inputs, so the producing workflow uploads the id as a one-file artifact
   and this reads it back.
 
-  Empty output is a normal outcome, not a failure: a GHA-initiated run has no orchestrator
-  uuid to thread, and the ingest then derives its own id from the run coordinate. Every
-  failure path here degrades to empty for the same reason -- an ingest that refused to run
-  because it could not find an optional id would lose the rows entirely.
+  Empty output is normal when the producer uploaded nothing (a GHA-initiated run has no
+  orchestrator uuid, and the ingest derives its own id). An artifact that EXISTS but cannot be
+  read fails the step instead: proceeding would write rows under a derived id that joins
+  nothing, while a re-run recovers the real one. An expired artifact cannot be recovered by a
+  re-run, so it warns and yields empty.
 
   Read the result from the `value` output. `run_id` is kept as an alias for the original
   caller and returns the same string.
@@ -25,7 +26,7 @@ description: |
       - run: printf '%s' "$ {{ inputs.run_id }}" > run-id.txt
       - uses: actions/upload-artifact@<pinned>
         if: $ {{ inputs.run_id != '' }}
-        with: { name: run-id, path: run-id.txt, retention-days: 1 }
+        with: { name: run-id, path: run-id.txt, retention-days: 7 }
 
 inputs:
   triggering-run-id:
@@ -70,26 +71,61 @@ runs:
         ART_NAME: ${{ inputs.artifact-name }}
         LABEL: ${{ inputs.label }}
       run: |
-        # No `set -e`: every step below is allowed to fail into an empty id.
-        RID=""
+        set -uo pipefail
+        warn() {
+          echo "::warning title=${LABEL} not recovered::$1"
+          echo "- :warning: **${LABEL} not recovered:** $1" >> "$GITHUB_STEP_SUMMARY"
+        }
+        fail() {
+          echo "::error title=${LABEL} not recovered::$1"
+          echo "- :x: **${LABEL} not recovered:** $1" >> "$GITHUB_STEP_SUMMARY"
+          exit 1
+        }
+        retry() {
+          local i
+          for i in 1 2 3; do
+            "$@" && return 0
+            [ "$i" -lt 3 ] && sleep $((i * 5))
+          done
+          return 1
+        }
+        list_artifacts() {
+          gh api --paginate \
+            "/repos/${REPO}/actions/runs/${TRIGGERING_RUN_ID}/artifacts?per_page=100" \
+            --jq ".artifacts[] | select(.name == \"${ART_NAME}\") | \"\(.id) \(.expired)\"" \
+            > "${workdir}/list"
+        }
+        fetch_artifact() {
+          rm -rf "${workdir}/out"
+          gh api "/repos/${REPO}/actions/artifacts/${AID}/zip" > "${workdir}/a.zip" \
+            && unzip -o -q "${workdir}/a.zip" -d "${workdir}/out"
+        }
         if [ -z "${TRIGGERING_RUN_ID}" ]; then
           echo "No triggering run id given — nothing to recover for ${ART_NAME}."
           echo "run_id=" >> "$GITHUB_OUTPUT"
           exit 0
         fi
-        AID=$(gh api --paginate \
-          "/repos/${REPO}/actions/runs/${TRIGGERING_RUN_ID}/artifacts?per_page=100" \
-          --jq ".artifacts[] | select(.name == \"${ART_NAME}\") | .id" 2>/dev/null | head -1)
-        if [ -n "${AID}" ]; then
-          workdir=$(mktemp -d)
-          if gh api "/repos/${REPO}/actions/artifacts/${AID}/zip" > "${workdir}/a.zip" 2>/dev/null \
-             && unzip -o -q "${workdir}/a.zip" -d "${workdir}" 2>/dev/null; then
-            # The artifact holds one file, but its name is the producer's choice, so take
-            # whichever single file is there rather than assuming run-id.txt.
-            f=$(find "${workdir}" -type f ! -name 'a.zip' | head -1)
-            [ -n "${f}" ] && RID=$(tr -d '[:space:]' < "${f}" 2>/dev/null || echo "")
+        workdir=$(mktemp -d)
+        trap 'rm -rf "${workdir}"' EXIT
+        retry list_artifacts || fail "listing artifacts of run ${TRIGGERING_RUN_ID} failed; re-run this job."
+        read -r AID EXPIRED < "${workdir}/list" || true
+        RID=""
+        if [ -z "${AID:-}" ]; then
+          # Only a dispatched run can carry an id, and an expired artifact drops out of the listing.
+          EVENT=$(gh api "/repos/${REPO}/actions/runs/${TRIGGERING_RUN_ID}" --jq .event 2>/dev/null || echo unknown)
+          if [ "${EVENT}" = "workflow_dispatch" ]; then
+            warn "dispatched run ${TRIGGERING_RUN_ID} has no ${ART_NAME} artifact (expired, or dispatched without one); the ingest derives an id that joins no orchestrator row."
+          else
+            echo "${ART_NAME} not uploaded by ${EVENT} run ${TRIGGERING_RUN_ID} — the ingest derives its own id."
           fi
-          rm -rf "${workdir}"
+        elif [ "${EXPIRED}" = "true" ]; then
+          warn "artifact ${ART_NAME} of run ${TRIGGERING_RUN_ID} expired; the ingest derives an id that joins no orchestrator row."
+        else
+          retry fetch_artifact || fail "downloading artifact ${ART_NAME} (id ${AID}) failed; re-run this job."
+          # One file, but its name is the producer's choice.
+          f=$(find "${workdir}/out" -type f | head -1)
+          [ -n "${f}" ] && RID=$(tr -d '[:space:]' < "${f}")
+          [ -n "${RID}" ] || fail "artifact ${ART_NAME} (id ${AID}) holds no id."
         fi
         echo "${LABEL}: ${RID:-<none>}"
         echo "run_id=${RID}" >> "$GITHUB_OUTPUT"

@@ -133,4 +133,4 @@ runs:
         name: artifact-id
         path: ${{ inputs.output-file }}
         if-no-files-found: error
-        retention-days: 1
+        retention-days: 7
