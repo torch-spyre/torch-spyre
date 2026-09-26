@@ -7,6 +7,8 @@
 -- (day, arch), since coverage varies by platform and over time. Both gaps are reported since
 -- they differ: cases with no junction row are invisible to every artifact page, while a
 -- junction row with no cases is a suite that never reported (a silent zero otherwise).
+-- A smoke-only run is an import probe that writes no JUnit by design, so it is counted apart
+-- (runs_no_case_output) and left out of both runs_missing_cases and the coverage denominator.
 CREATE VIEW IF NOT EXISTS v_run_coverage AS
 SELECT
     day,
@@ -14,10 +16,9 @@ SELECT
     uniqExact(run_id)                              AS runs,
     uniqExactIf(run_id, in_results AND in_cases)   AS runs_linked,
     uniqExactIf(run_id, NOT in_results)            AS runs_missing_result,
-    uniqExactIf(run_id, NOT in_cases)              AS runs_missing_cases,
-    if(uniqExact(run_id) > 0,
-       uniqExactIf(run_id, in_results AND in_cases) / uniqExact(run_id),
-       NULL)                                        AS coverage
+    uniqExactIf(run_id, NOT in_cases AND NOT smoke_only) AS runs_missing_cases,
+    uniqExactIf(run_id, NOT in_cases AND smoke_only)     AS runs_no_case_output,
+    runs_linked / nullIf(runs - runs_no_case_output, 0) AS coverage
 FROM
 (
     -- Every run known from either side: a run in only one table is the gap being measured, so
@@ -27,16 +28,18 @@ FROM
         argMax(arch, arch != '') AS arch,
         run_id,
         max(in_results) AS in_results,
-        max(in_cases)   AS in_cases
+        max(in_cases)   AS in_cases,
+        in_results AND NOT max(non_smoke) AS smoke_only
     FROM
     (
         -- state='running' excluded: a crashed run's stale row would count as covered.
         SELECT toDate(ts) AS day, if(arch IN ('amd64', 'x86', 'x86-64'), 'x86_64', arch) AS arch,
-               run_id, 1 AS in_results, 0 AS in_cases
+               run_id, 1 AS in_results, 0 AS in_cases, test_type != 'smoke' AS non_smoke
         FROM artifact_results
         WHERE state != 'running'
         UNION ALL
-        SELECT toDate(min(ts)) AS day, '' AS arch, run_id, 0 AS in_results, 1 AS in_cases
+        SELECT toDate(min(ts)) AS day, '' AS arch, run_id, 0 AS in_results, 1 AS in_cases,
+               0 AS non_smoke
         FROM test_case_runs
         GROUP BY run_id
     )
