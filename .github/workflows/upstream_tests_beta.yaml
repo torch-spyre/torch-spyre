@@ -50,6 +50,12 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           path: torch-spyre
+          # setuptools_scm derives the version from git history, so the wheel
+          # build needs the tags and the commits back to the last one. The
+          # default fetch-depth 1 (with fetch-tags false) leaves zero tags
+          # visible, which silently yields a 0.1.devN version instead of one
+          # based on the latest release tag.
+          fetch-depth: 0
 
       - uses: ./.github/actions/gather-runner-info
         with:

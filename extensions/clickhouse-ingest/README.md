@@ -2,6 +2,10 @@
 
 The schema-v2 ClickHouse schema, derived identity and write path, shared by the Spyre CI ingests.
 
+> **Full reference:** class-by-class docs, every GitHub Actions and Jenkins consumer across
+> torch-spyre/spyre-inference/hf-adapters/spyre-frameworks, and getting-started guides live in
+> [`docs/`](docs/README.md).
+
 ## Why it is a library
 
 Every id here is **derived, never minted**: the product ingests and the Jenkins-side writer must

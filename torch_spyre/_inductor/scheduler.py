@@ -533,6 +533,17 @@ def verify_carried_reduction_ownership(
 
 
 class SuperDSCScheduling(BaseScheduling):
+    """Inductor scheduling backend for Spyre.
+
+    Inductor's own node-pairwise fusion (`can_fuse_vertical`/
+    `can_fuse_horizontal` below) is permanently disabled, not merely
+    unimplemented. Spyre does its own op-to-kernel grouping in a later,
+    separate stage: `spyre_fuse_nodes` in `fusion.py` bundles
+    `BaseSchedulerNode`s into `SuperDSCBundle`s, and each bundle maps
+    one-to-one to a `SpyreKernel` device launch. See
+    `docs/source/compiler/inductor_frontend.md` for the full pipeline.
+    """
+
     def group_fn(self, sizes):
         """
         Process the iteration sizes in case a transformation needs to be applied.
@@ -559,18 +570,20 @@ class SuperDSCScheduling(BaseScheduling):
         self, node1: BaseSchedulerNode, node2: BaseSchedulerNode
     ) -> bool:
         """
-        Check whether node1 and node2 can be vertically fused or not.
+        Always False: Inductor-level fusion is disabled by design. Spyre's
+        real op-to-kernel grouping happens later, in `spyre_fuse_nodes`
+        (see the class docstring above).
         """
-        # TODO: Revisit this as part of https://github.com/torch-spyre/torch-spyre/issues/826
         return False
 
     def can_fuse_horizontal(
         self, node1: BaseSchedulerNode, node2: BaseSchedulerNode
     ) -> bool:
         """
-        Check whether node1 and node2 can be horizontally fused or not.
+        Always False: Inductor-level fusion is disabled by design. Spyre's
+        real op-to-kernel grouping happens later, in `spyre_fuse_nodes`
+        (see the class docstring above).
         """
-        # TODO: Revisit this as part of https://github.com/torch-spyre/torch-spyre/issues/826
         return False
 
     def generate_node_schedule(self, nodes: Sequence[BaseSchedulerNode]):

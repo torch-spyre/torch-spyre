@@ -58,7 +58,9 @@ test coverage, bug classification), see :doc:`/contributing/op_enablement`.
    working_set_reduction
    coarse_tiling_loops
    marker_resolution
+   layout_optimization
    cost_model
+   restickify_cost_model
    span_overflow_hint_analysis
    work_division_planning
    scratchpad_planning

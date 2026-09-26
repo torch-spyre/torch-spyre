@@ -647,19 +647,6 @@ PYBIND11_MODULE(_C, m) {
       "        rather than blindly iterating tensors. Empty (default)\n"
       "        preserves today's legacy behavior.");
 
-  // Test-only seam: exposes JobPlanStepHostCompute::resolveSymbolicArgs so
-  // that Python tests can assert on the ordered int64 vector that would be
-  // handed to deeptools, without needing a live HCM or device execution.
-  // The "_" prefix signals this is not part of the stable public API.
-  m.def("_resolve_symbolic_args",
-        &spyre::JobPlanStepHostCompute::resolveSymbolicArgs, py::arg("tensors"),
-        py::arg("symbolic_args"),
-        "Test-only: resolve a symbolic_args payload to a list of int64 DMVA "
-        "addresses.\n\n"
-        "Calls JobPlanStepHostCompute::resolveSymbolicArgs — the same function "
-        "used by the typed-payload resolution path at launch time — so the "
-        "result is identical to what would be passed to deeptools.");
-
   // ── Two-stream overlap: step-ordering validator + test hooks ──
 
   // Direct binding of the pure P2-14 ordering checker so a role-misplacement

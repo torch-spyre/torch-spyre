@@ -25,7 +25,6 @@ test_suite_config:
             # once a fused LX consumer pins the layout. Fine standalone (free
             # output layout); the standalone test_conv2d case validates the fix.
             - LxPlanning.*::test_conv2d_1x6x128_patch16_bias_lx_planning_(pointwise|reduction)
-            - LxPlanning.*::test_dwise_conv2d_1x64_ksize3_depthwise_lx_planning_(pointwise|reduction)
             - LxPlanning.*::test_conv2d_2x32_ksize1_stride2_lx_planning_(pointwise|reduction)
             - LxPlanning.*::test_conv2d_2x3x32_ksize1_lx_planning_(pointwise|reduction)
             - LxPlanning.*::test_conv2d_mistral_model_lx_planning_(pointwise|reduction)
@@ -35,7 +34,7 @@ test_suite_config:
             # identity copy reads the strided-conv output buffer densely and the
             # spatial elements shuffle). Non-strided direct convs are correct
             # under LX (all 16 stride-1 direct cases pass). Production never
-            # pins conv output -- "convolution"/"conv2d" are in
+            # pins direct-conv output -- "convolution" is in
             # OP_OUTPUT_NOT_GOOD_FOR_LX_REUSE -- so this is a test-only path
             # (backend follow-up on PR #3284).
             - LxPlanning.*::test_conv2d_direct_.*_s2_lx_planning_(pointwise|reduction)

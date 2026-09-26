@@ -58,6 +58,7 @@ from torch._inductor.ir import ComputedBuffer, Reduction
 
 from .. import config
 from ..errors import Unsupported
+from ..logging_utils import get_inductor_logger
 from ..pass_utils import host_coordinates
 from ..scratchpad.plan_solver import TileAxis, TileSpec
 from .coarse_tile import _stick_host_dim, reduction_loop_vars
@@ -70,6 +71,8 @@ from .span_overflow_hint_analysis import (
     _split_candidates_for_host_dim,
     _within_stick_host_dim,
 )
+
+logger = get_inductor_logger("wsr.enumerate_tilings")
 
 # Default caps for the enumerator. Split counts stay bounded by
 # ``_MAX_AUTO_TILE_SPLIT_COUNT`` (imported, NOT migrated to config.py);

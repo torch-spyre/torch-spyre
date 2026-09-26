@@ -43,7 +43,7 @@ from ..views import compute_coordinates
 from ..work_division import MAX_SPAN_BYTES
 
 
-logger = get_inductor_logger("span_overflow_hint_analysis")
+logger = get_inductor_logger("wsr.span_overflow_hint_analysis")
 
 
 @dataclass(frozen=True)

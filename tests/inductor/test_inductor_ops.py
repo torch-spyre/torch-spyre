@@ -533,6 +533,24 @@ SCALED_MM_TESTS = {
 FP32_EPS = torch.finfo(torch.float32).eps  # 1.1920928955078125e-07
 FP16_EPS = torch.finfo(torch.float16).eps  # 0.0009765625
 
+# DLFloat16's largest finite.  0x7FFF is the NaN-Infinity symbol, so the largest
+# finite is 0x7FFE -- mantissa 0x1FE, not 0x1FF.
+DLFLOAT16_MAX = (1.0 + 510.0 / 512.0) * float(2**32)  # 0x7FFE, ~8.573e9
+DLFLOAT16_INF_SENTINEL = float(2**32)  # 0x7E00; finite on device
+
+
+def _dlfloat16_saturating_ref(result):
+    """Model arithmetic overflow for the explicit DLFloat16 references below.
+
+    Keep the reference in fp64 until all LX wrapper operations have run: an
+    fp16 cast would lose the distinction between fp16 and DLFloat16 overflow.
+    This models the range, not DLFloat16 mantissa rounding or underflow.
+    """
+    # Device arithmetic overflows to NINF (0x7FFF), decoded as NaN. Host INF
+    # conversion instead uses the finite 0x7E00 sentinel; callers model that
+    # separately. Only explicitly opted-in tests use this reference.
+    return result.masked_fill(result.abs() > DLFLOAT16_MAX, float("nan"))
+
 
 def _attention_fn(q, k, v, scale=True):
     d_k = q.size(-1)
@@ -3159,6 +3177,15 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "2d_beta_0p5": (cached_randn((256, 128), dtype=torch.float16), 0.5),
                 "2d_beta_50": (cached_randn((256, 128), dtype=torch.float16), 50.0),
                 "2d_beta_0": (cached_randn((256, 128), dtype=torch.float16), 0.0),
+                # One/two softplus(0) * 2^32 values fit DLFloat16; three do
+                # not. Exercise both sides of the LX reduction boundary.
+                **{
+                    f"{rows}x64_beta_0": (
+                        cached_randn((rows, 64), dtype=torch.float16),
+                        0.0,
+                    )
+                    for rows in (1, 2, 3)
+                },
                 "5d_beta_0p5": (
                     cached_randn((1, 1, 7, 13, 19), dtype=torch.float16),
                     0.5,
@@ -3395,14 +3422,28 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         },
         ("test_triu", "test_triu_cpu"): {
             "param_sets": {
-                "2d": (
-                    cached_randn((64, 64)),
+                "2d_diag0": (cached_randn((64, 64)), 0),
+                "2d_diag1": (cached_randn((64, 64)), 1),
+                "2d_diag_neg1": (cached_randn((64, 64)), -1),
+                "2d_unaligned": (cached_randn((65, 70)), 0),
+                "3d_diag0": (cached_randn((32, 64, 64)), 0),
+                "3d_diag1": (cached_randn((32, 64, 64)), 1),
+                "4d_diag0": (cached_randn((2, 4, 64, 64)), 0),
+                "4d_diag1": (cached_randn((2, 4, 64, 64)), 1),
+                "4d_unaligned": (cached_randn((2, 4, 65, 70)), 1),
+                "nonfinite": (
+                    torch.full((64, 64), float("-inf"), dtype=torch.float16),
                     1,
                 ),
-                "3d": (
-                    cached_randn((32, 64, 64)),
+                "nonfinite_positive": (
+                    torch.full((64, 64), float("inf"), dtype=torch.float16),
                     1,
                 ),
+            }
+        },
+        ("test_triu_int", "test_triu_int_cpu"): {
+            "param_sets": {
+                "int32_2d": (torch.randint(0, 100, (64, 64), dtype=torch.int32), 1),
             }
         },
         ("test_item", "test_item_cpu"): {
@@ -4971,6 +5012,11 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
                 "nearmax": (torch.tensor([[10.0, 10.5, 11.0]], dtype=torch.float16),),
                 "overflow": (torch.tensor([[15.0, 20.0, 50.0]], dtype=torch.float16),),
+                # Only exp(23) overflows DLFloat16 itself. The LX pointwise
+                # wrapper's addition also overflows for exp(22.25).
+                "dlfloat16_boundary": (
+                    torch.tensor([[22.0, 22.25, 23.0]], dtype=torch.float16),
+                ),
                 "underflow": (
                     torch.tensor([[-50.0, -100.0, -200.0]], dtype=torch.float16),
                 ),
@@ -5644,6 +5690,30 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     [[128, 128, 1, 1, 64], [5, 5, 1, 1, 64]],
                     [[1, 128, -1, 49152, 16384], [1, 5, -1, 25, 25]],
                 ),
+                # With bias, conv2d_with_bias decomposes to spyre.conv2d + add, so
+                # the depthwise output is an intermediate the add reads rather than
+                # the graph output -- the path on which LX planning can pin it.
+                # Every case above has bias=None, so none of them exercise it.
+                "1x64_ksize3_bias": (
+                    cached_randn((1, 64, 32, 32)),
+                    cached_randn((64, 1, 3, 3)),
+                    cached_randn((64,)),
+                    (0, 0),
+                    (1, 1),
+                    64,
+                    [[32, 32, 1, 1, 64], [3, 3, 1, 1, 64]],
+                    [[1, 32, -1, 65536, 1024], [1, 3, -1, 9, 9]],
+                ),
+                "2x32_ksize1_stride2_bias": (
+                    cached_randn((2, 32, 64, 64)),
+                    cached_randn((32, 1, 1, 1)),
+                    cached_randn((32,)),
+                    (0, 0),
+                    (2, 2),
+                    32,
+                    [[64, 64, 1, 2, 64], [1, 1, 1, 1, 64]],
+                    [[1, 64, -1, 131072, 4096], [1, 1, -1, 1, 1]],
+                ),
             },
         },
         # conv2d exercising the native conv2d SDSC path (lower_convolution) with
@@ -6120,7 +6190,12 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
-    def compare_with_cpu(self, *args, **kwargs):
+    def compare_with_cpu(self, *args, dlfloat16_reference=None, **kwargs):
+        if dlfloat16_reference is not None:
+            ref = _dlfloat16_saturating_ref(dlfloat16_reference).to(torch.float16)
+            kwargs["cpu_eager_result"] = ref
+            # IEEE CPU compilation cannot reproduce DLFloat16 overflow either.
+            kwargs["cpu_compile_result"] = ref
         return utils_inductor.compare_with_cpu(*args, **kwargs)
 
     def compare(self, *args, **kwargs):
@@ -6192,7 +6267,12 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             # To avoid cpu mismatch due to a negative fp16 having a fraction 0b0000000001
             x = x.to("spyre").cpu()
 
-        self.compare_with_cpu(op, x)
+        if op == torch.exp and x.dtype == torch.float16:
+            # exp(15/20) exceeds fp16 but fits DLFloat16; exp(50) overflows
+            # DLFloat16 to NINF. Preserve this distinction for LX wrappers too.
+            self.compare_with_cpu(op, x, dlfloat16_reference=op(x.to(torch.float64)))
+        else:
+            self.compare_with_cpu(op, x)
 
     def test_bool(self):
         dtype = torch.bool
@@ -7702,7 +7782,18 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         def fn(input):
             return torch.nn.functional.softplus(input, beta, threshold)
 
-        self.compare_with_cpu(fn, x)
+        if beta == 0.0 and x.dtype == torch.float16:
+            # The decomposition multiplies softplus(0) by 1/beta. Its infinite
+            # scalar is encoded as the finite DLFloat16 sentinel, so the
+            # result fits DLFloat16, but summing a row of these can overflow.
+            ref = torch.full_like(
+                x,
+                math.log(2) * math.copysign(DLFLOAT16_INF_SENTINEL, beta),
+                dtype=torch.float64,
+            )
+            self.compare_with_cpu(fn, x, dlfloat16_reference=ref)
+        else:
+            self.compare_with_cpu(fn, x)
 
     @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_layernorm_functional_cpu(self, x, residual, weight, bias, eps):
@@ -7982,8 +8073,28 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
         self.compare_with_cpu(fn, x)
 
-    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+    @pytest.mark.filterwarnings("error::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_triu_cpu(self, x, diagonal):
+        def fn(input, diagonal):
+            return torch.triu(input, diagonal)
+
+        if x.dtype == torch.float16 and torch.isinf(x).any():
+            # Host infinities are finite +/-2^32 on device. triu preserves
+            # them, but the additional LX arithmetic may overflow to NINF.
+            ref_input = x.to(torch.float64)
+            ref_input = torch.where(
+                torch.isinf(ref_input),
+                ref_input.sign() * DLFLOAT16_INF_SENTINEL,
+                ref_input,
+            )
+            self.compare_with_cpu(
+                fn, x, diagonal, dlfloat16_reference=fn(ref_input, diagonal)
+            )
+        else:
+            self.compare_with_cpu(fn, x, diagonal)
+
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+    def test_triu_int_cpu(self, x, diagonal):
         def fn(input, diagonal):
             return torch.triu(input, diagonal)
 
@@ -8825,6 +8936,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
         x_dev = x.to(device_layout=x_layout)
         weight_dev = weight.to(device_layout=weight_layout)
+        bias_dev = None if bias is None else bias.to("spyre")
 
         def fn(x, weight, bias, padding, stride, groups):
             return torch.conv2d(
@@ -8834,9 +8946,9 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         cpu_result = fn(x, weight, bias, padding, stride, groups)
 
         spyre_compiled = torch.compile(fn)(
-            x_dev, weight_dev, bias, padding, stride, groups
+            x_dev, weight_dev, bias_dev, padding, stride, groups
         ).cpu()
-        spyre_eager = fn(x_dev, weight_dev, bias, padding, stride, groups).cpu()
+        spyre_eager = fn(x_dev, weight_dev, bias_dev, padding, stride, groups).cpu()
         torch.testing.assert_close(
             spyre_compiled,
             cpu_result,

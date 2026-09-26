@@ -148,12 +148,12 @@ directory created with `tempfile.mkdtemp` under `<cache_dir>/inductor-spyre`,
 so the bundles are stored separately from Inductor's content-addressed
 Python/Triton cache.
 
-Setting `SPYRE_ASYNC_DXP_COMPILE=1` submits each `dxp_standalone` run to
-Inductor's compile-worker process pool instead of running it inline, so the
-`dxp_standalone` invocations for separate kernels compile in parallel. The
-flag takes effect only when more than one compile thread is configured.
-With a single thread, or when it is left at its default of `0`, each kernel
-compiles synchronously.
+Independent kernels compile in parallel through Inductor's compile-worker
+process pool whenever `TORCHINDUCTOR_COMPILE_THREADS` is greater than `1`.
+Bundle generation stays in the parent process; workers invoke `dbo-opt`, and
+the generated wrapper resolves their results at `async_compile.wait()` before
+execution. Set `TORCHINDUCTOR_COMPILE_THREADS=1` to compile inline. There is no
+separate Spyre feature flag.
 
 ## Further Reading
 

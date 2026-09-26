@@ -94,7 +94,7 @@ on:
           (for suite_<group>) whose path sits under that directory -- there
           is no catch-all value that ignores a config's labels.
           integration covers the device-layer surfaces flex and
-          deeptools exercise most (streams, job launch
+          deeptools/dbo-opt exercise most (streams, job launch
           plans, codegen, LX/scratchpad planning, tensor layout,
           allocator/GC, D2D copies). Default: regression (every config
           labeled for full functional coverage) -- callers that want the
@@ -522,6 +522,12 @@ jobs:
           path: torch-spyre
           ref: ${{ inputs.ref || github.event.pull_request.head.sha || github.sha }}
           repository: ${{ inputs.repository || github.event.pull_request.head.repo.full_name || github.repository }}
+          # setuptools_scm derives the version from git history, so the wheel
+          # build needs the tags and the commits back to the last one. The
+          # default fetch-depth 1 (with fetch-tags false) leaves zero tags
+          # visible, which silently yields a 0.1.devN version instead of one
+          # based on the latest release tag.
+          fetch-depth: 0
 
       # No checkout-pytorch: the C++ build compiles against the installed torch
       # wheel headers; the pytorch source tree (TORCH_ROOT) is only used by the
@@ -1085,9 +1091,14 @@ jobs:
             # Clear the cached AIU setup guard and stale topo.json before every
             # attempt, so a card left bad by a killed attempt is re-discovered
             # rather than carrying stale state into the retry.
+            # set +u because ibm-aiu-setup.sh reads its own guard variable,
+            # which the unset just removed; || exit 1 because run-test-suite
+            # runs with set +e and a failed refresh must not let tests run
+            # against stale topology.
+            set +u
             unset _IBM_AIU_SETUP
             rm -rf /tmp/etc/ibm/spyre/topo.json
-            source /etc/profile.d/ibm-aiu-setup.sh
+            source /etc/profile.d/ibm-aiu-setup.sh || exit 1
 
       # Uploaded even on failure -- a failed run is when the report matters most.
       # The artifact name is the report filename so ten matrix jobs do not

@@ -29,7 +29,6 @@
 #include <variant>
 #include <vector>
 
-#include "spyrecode-host-functions/fast_process_hcm.h"
 #include "spyrecode-host-functions/spyrecode.h"
 
 namespace spyre {
@@ -535,58 +534,27 @@ class JobPlanStepHostCompute final : public JobPlanStep {
   JobPlanStepHostCompute(std::unique_ptr<Hcm> hcm, size_t correction_size,
                          flex::CompositeAddress device_address,
                          const void* input_buffer, std::vector<int64_t> ishape)
-      : hcm_(std::move(hcm)),
-        correction_size_(correction_size),
+      : correction_size_(correction_size),
         device_address_(std::move(device_address)),
         input_buffer_(input_buffer),
         ishape_(std::move(ishape)) {
-    pipeline_barrier_ = false;  // host-produce is overlap-eligible
-
-    // Try to build fast plan at construction time (prepare time)
-    if (hcm_) {
-      fast_plan_.valid = deeptools::buildFastHcmPatchPlan(fast_plan_, *hcm_);
-      if (!fast_plan_.valid) {
-        // Mark as permanently invalid so we don't retry
-        fast_plan_.output_size = UINT32_MAX;
-      }
-    }
+    pipeline_barrier_ = false;  // host-compute is overlap-eligible
+    // Create the host compute handle at construction time.
+    // This will internally create the fast_plan for deeptools.
+    handle_ = flex::createHostComputeHandle(std::move(hcm));
   }
 
   void construct(LaunchContext& ctx, const SpyreStream& stream) const override;
 
   void write(std::ostream& os) const override;
 
-  /**
-   * @brief Resolve a symbolic_args payload to a vector of int64 values.
-   *
-   * Each entry is resolved according to its kind: kAddress entries yield the
-   * HBM device address of the corresponding tensor; kDimension entries yield
-   * the pre-resolved dimension size stored in SymbolicArg::value.
-   *
-   * Extracted from the typed-payload resolution path in construct() so that
-   * the resolution logic has a single definition shared by both the hot path
-   * and the _C._resolve_symbolic_args test seam. Keeping it as a static
-   * member of this class makes the ownership clear without exposing it as a
-   * top-level public symbol.
-   *
-   * Preconditions (enforced via TORCH_CHECK):
-   *   - Every symbolic_args[i].tensor_id is a valid index into tensors.
-   *   - Every symbolic_args[i].kind is kAddress (kDimension not yet
-   *     implemented).
-   */
-  static std::vector<int64_t> resolveSymbolicArgs(
-      const std::vector<at::Tensor>& tensors,
-      const std::vector<SymbolicArg>& symbolic_args);
-
  private:
-  std::unique_ptr<Hcm> hcm_;
   size_t correction_size_;  ///< byte count of the correction blob
   flex::CompositeAddress device_address_;  ///< device destination for H2D
   const void* input_buffer_;  // Non-owning pointer (JobPlan owns the buffer)
   std::vector<int64_t> ishape_;
-
-  // Pre-compiled patch plan for fast execution
-  mutable deeptools::FastHcmPatchPlan fast_plan_;
+  std::unique_ptr<flex::HostComputeHandle>
+      handle_;  ///< handle to the host compute operation
 };
 
 /**

@@ -843,6 +843,8 @@ def mock_backend_compiler():
         return subprocess.CompletedProcess(cmd, 0, "", "")
 
     with (
+        # These process-local mocks cannot run in Inductor's compile workers.
+        torch._inductor.config.patch({"compile_threads": 1}),
         mock_patch("subprocess.run", side_effect=fake_run) as m,
         mock_patch.object(async_compile_module.subprocess, "run", side_effect=fake_run),
     ):

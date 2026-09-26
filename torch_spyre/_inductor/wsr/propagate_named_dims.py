@@ -45,8 +45,8 @@ from ..propagate_hints import DimHint, get_op_hints
 from torch_spyre._C import SpyreTensorLayout
 from torch.utils.weak import WeakTensorKeyDictionary
 
-logger = get_inductor_logger("propagate_named_dims")
-hints_logger = get_inductor_logger("assign_dim_hints")
+logger = get_inductor_logger("wsr.propagate_named_dims")
+hints_logger = get_inductor_logger("wsr.assign_dim_hints")
 
 
 # Used for propagation of named dims if this pass runs.
@@ -703,14 +703,14 @@ def _assign_dim_hints_impl(operations: list[Operation]) -> None:
         # Clean up temp intermediates — only dim_hints persists.
         del op._dim_prop_info  # type: ignore[attr-defined]
 
-    if hints_logger.isEnabledFor(logging.INFO):
+    if hints_logger.isEnabledFor(logging.DEBUG):
         ops = [
             op
             for op in operations
             if isinstance(op, ComputedBuffer) and getattr(op, "dim_hints", None)
         ]
         if ops:
-            hints_logger.info("=== assign_dim_hints ===")
+            hints_logger.debug("=== assign_dim_hints ===")
             for op in ops:
                 rw = op.get_read_writes()
                 all_ranges = {
@@ -718,12 +718,12 @@ def _assign_dim_hints_impl(operations: list[Operation]) -> None:
                     for dep in [*rw.reads, *rw.writes]
                     for s, v in dep.ranges.items()
                 }
-                hints_logger.info(f"{op.get_operation_name()}:")
+                hints_logger.debug(f"{op.get_operation_name()}:")
                 for h in op.dim_hints:
                     r = all_ranges.get(h.loop_var, 0) if h.loop_var else 0
                     per_tile = r // h.split_count if r else "?"
                     reduction_tag = "  [reduction]" if h.is_reduction else ""
-                    hints_logger.info(
+                    hints_logger.debug(
                         f"  {h.dim_names}  range={r}"
                         f"  split_count={h.split_count}  -> {per_tile} per tile"
                         f"  loop_var={h.loop_var}{reduction_tag}"

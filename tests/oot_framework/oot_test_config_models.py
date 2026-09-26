@@ -1089,7 +1089,10 @@ class InputsEdits(BaseModel):
         3. ast.literal_eval fallback                 -> Python literal (tuple, int, etc.)
         4. pass through as-is
 
-        None, bool, and numeric values pass through unchanged.
+        None, bool, and numeric values pass through unchanged. A scalar wrapped
+        in the ``{value: X}`` spec form (``position_ids: {value: null}``,
+        ``use_cache: {value: true}``) is unwrapped to bare ``X``, matching how
+        ``build_cpu_args`` treats the same spec positionally.
 
         A bare ``device_layout`` dict with no ``tensor`` wrapper isn't a shape
         _parse_input_arg understands (device_layout only exists nested inside
@@ -1108,6 +1111,7 @@ class InputsEdits(BaseModel):
             "model_id",
             "cache",
             "py",
+            "value",
         }
 
         out: Dict[str, Any] = {}
@@ -1143,6 +1147,15 @@ class InputsEdits(BaseModel):
                     out[k] = _build_cache(arg, seed=inp_seed, test_device=test_device)
                 elif isinstance(arg, InputArgPy):
                     out[k] = _eval_py_literal(arg.py)
+                elif isinstance(arg, InputArgValue):
+                    # A plain scalar / None / bool wrapper, the kwarg spelling of
+                    # the positional {'value': X} form. Unwrapped here so that
+                    # e.g. ``position_ids: {value: null}`` reaches forward() as
+                    # None rather than as the literal dict {'value': None} --
+                    # which a module would take as a real (truthy) argument and
+                    # then fail on, or silently mis-handle in the case of
+                    # ``use_cache: {value: true}``.
+                    out[k] = arg.value
                 continue
 
             if isinstance(v, dict) and "device_layout" in v:
