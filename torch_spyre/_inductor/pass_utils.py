@@ -454,7 +454,7 @@ def concretize_index(index: sympy.Expr, loop_vars: set) -> sympy.Expr:
     size_syms = {
         s
         for s in (index.free_symbols - loop_vars)
-        if not is_indirect(s.name) and s not in unbacked_syms
+        if s not in unbacked_syms and not is_indirect(s.name)
     }
     if not size_syms:
         return index
@@ -2280,11 +2280,12 @@ def is_sparse_stl(stl) -> bool:
     """
     dev_stride = 1
     sparse = False
+    elems_per_stick = stl.elems_per_stick()
     for dev_size, host_stride in zip(
         reversed(stl.device_size), reversed(stl.stride_map)
     ):
         if dev_size != 1:
-            if dev_stride % stl.elems_per_stick() != 0:
+            if dev_stride % elems_per_stick != 0:
                 if host_stride > 0:
                     return False
                 else:
@@ -2382,9 +2383,8 @@ def compute_restickify_needed(
     if in_dep.name in ind_names:
         return False, None
     idc = try_device_coordinates(in_stl, in_dep, ind_sizes, op=op)
-    out_idc = try_device_coordinates(out_stl, out_dep, ind_sizes, op=op)
-    if idc is None or out_idc is None:
-        # One of the layouts has a stick expression the backend cannot
+    if idc is None:
+        # The layouts has a stick expression the backend cannot
         # represent (e.g. floor(var/N) from a cross-stick access). Such a
         # candidate can never be a feasible restickify source/target.
         #
@@ -2393,6 +2393,10 @@ def compute_restickify_needed(
         # search maps it to INF cost and discards the candidate — see
         # EdgeCostMap._compute_and_cache_cost in optimize_restickify.py. This is
         # preferable to aborting the whole pass when another candidate is valid.
+        return True, None
+    out_idc = try_device_coordinates(out_stl, out_dep, ind_sizes, op=op)
+    if idc is None or out_idc is None:
+        # Same as above
         return True, None
     assert idc, "device_coordinates returned empty list for input"
     assert out_idc, "device_coordinates returned empty list for output"
@@ -2412,8 +2416,9 @@ def compute_restickify_needed(
         and bool(stick_syms)
         and len(outer_axes_with_stick_var) > 1
     )
-    factorized_layout_mismatch = is_factorized and in_stl != out_stl
-    exact_layout_mismatch = require_exact and in_stl != out_stl
+    layouts_differ = in_stl != out_stl
+    factorized_layout_mismatch = is_factorized and layouts_differ
+    exact_layout_mismatch = require_exact and layouts_differ
     if (
         not factorized_layout_mismatch
         and not exact_layout_mismatch
@@ -3173,26 +3178,34 @@ class PerCoreView:
 
     work_slice_dims: tuple[tuple[int, int], ...]
     core_to_slot: tuple[tuple[int, Expr], ...]
+    split_product: int
     num_cores: int | None = None
 
-    def same_partition(self, other: object) -> bool:
+    def __init__(
+        self,
+        work_slice_dims: tuple[tuple[int, int], ...],
+        core_to_slot: tuple[tuple[int, Expr], ...],
+        num_cores: int | None = None,
+        *,
+        split_product: int = 0,  # dummy arg to absorb automatically copied args
+    ):
+        object.__setattr__(self, "work_slice_dims", work_slice_dims)
+        object.__setattr__(self, "core_to_slot", core_to_slot)
+        object.__setattr__(
+            self, "split_product", math.prod(split for _, split in work_slice_dims)
+        )
+        object.__setattr__(self, "num_cores", num_cores)
+
+    def same_partition(self, other: "PerCoreView") -> bool:
         """Whether both views assign every physical core the same buffer slice."""
-
-        if not isinstance(other, PerCoreView):
-            return False
-
-        def cores(view: PerCoreView) -> int:
-            if view.num_cores is not None:
-                return view.num_cores
-            return math.prod(split for _, split in view.work_slice_dims)
 
         return same_owner_maps(
             dict(self.work_slice_dims),
             dict(self.core_to_slot),
-            cores(self),
+            self.num_cores if self.num_cores is not None else self.split_product,
             dict(other.work_slice_dims),
             dict(other.core_to_slot),
-            cores(other),
+            other.num_cores if other.num_cores is not None else other.split_product,
         )
 
 
@@ -3400,7 +3413,6 @@ def _per_core_view_from_prep(
     if prep is None:
         return unrepresentable
     per_sym = {sym: int(splits.get(sym, 1)) for sym in prep.iter_space}
-    has_partial_reduction = any(n > 1 for n in (reduction_splits or {}).values())
 
     # Step 2: keep splits that actually slice this buffer, keyed by their host
     # stride on buf (precomputed in ``dep_coeff``). host_stride == 0 means the
@@ -3674,6 +3686,7 @@ def _per_core_view_from_prep(
         core_to_slot=tuple(pruned_core_to_slot),
         num_cores=num_cores,
     )
+    has_partial_reduction = any(n > 1 for n in (reduction_splits or {}).values())
     return (view, has_partial_reduction, True)
 
 

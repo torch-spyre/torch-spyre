@@ -1272,7 +1272,6 @@ def relayout_ns(o: "OpFeatures", params: "CostParams | None" = None) -> float:
     the law over-predicts by 12-40% (measured at split 16), so the clamp bounds the
     error instead of extrapolating an unmeasured log2.
     """
-    p = params or CostParams()
     if not o.is_lx_relayout or o.out_elems <= 0:
         return 0.0
     if o.relayout_run_elems <= 0 or o.cores <= 0:
@@ -1282,6 +1281,7 @@ def relayout_ns(o: "OpFeatures", params: "CostParams | None" = None) -> float:
     run_bytes = o.relayout_run_elems * o.dtype_bytes
     split = min(8, max(2, o.relayout_split))
     runs = per_core / run_bytes
+    p = params or CostParams()
     return (
         runs * (p.relayout_run_a_ns + p.relayout_run_b_ns * math.log2(split))
         + per_core * split / p.relayout_span_gbps

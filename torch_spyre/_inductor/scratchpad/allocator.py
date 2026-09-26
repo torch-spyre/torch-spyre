@@ -3570,6 +3570,13 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                         is not None
                     ):
                         continue
+                    source_span, destination_span = _span(pv), _span(cv)
+                    if (
+                        source_span is None
+                        or destination_span is None
+                        or destination_span > self.size
+                    ):
+                        continue
                     key = (
                         pv,
                         cv,
@@ -3591,13 +3598,6 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                         )
                     cost = pair_cost[key]
                     if cost is None:
-                        continue
-                    source_span, destination_span = _span(pv), _span(cv)
-                    if (
-                        source_span is None
-                        or destination_span is None
-                        or destination_span > self.size
-                    ):
                         continue
                     candidates.append(
                         RelayoutCandidate(
