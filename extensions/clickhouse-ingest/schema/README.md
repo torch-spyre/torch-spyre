@@ -15,14 +15,15 @@ Applying them in filename order works from an empty database.
 | `30-benchmarks.sql` | `benchmarks`, `benchmark_runs` | — |
 | `40-jenkins-agents.sql` | `jenkins_agents` | — |
 | `50-artifact-views.sql` | 6 `v_tag_*` / `v_artifact_*` / `v_tier_trend` views | 10, 20 |
-| `51-functional-views.sql` | 4 `v_case_*` / `v_run_tier_counters` / `v_tier_report_completeness` views | 10 |
+| `51-functional-views.sql` | 4 `v_case_*` / `v_run_tier_counters` / `v_tier_report_completeness` views | 10, 20 |
 | `52-cross-views.sql` | `v_run_coverage` | 10, 20 |
 | `60-benchmark-views.sql` | 5 `v_benchmark_*` views | 20, 30 |
 | `70-vllm-hud-projection.sql` | `oss_ci_benchmark_v3`, `oss_ci_benchmark_metadata` + their MVs | 30 |
 
 The `50`/`51`/`52` split is by what a view reads, not by taste: the artifact and functional view
-families are independent, and `v_run_coverage` is separate because it is the one view spanning
-both (it joins `artifact_results` to `test_case_runs`).
+families are independent, and `v_run_coverage` is separate because it measures the join between
+them (`artifact_results` to `test_case_runs`). The `51` tier views read `artifact_results` only
+to learn which tier a run's leg was dispatched for.
 
 `70-` is named for what it is — a projection of `benchmark_runs` into the shape the PyTorch HUD
 reads — rather than for a table, because the tables it declares carry upstream's names
