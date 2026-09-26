@@ -120,6 +120,8 @@ def _resize_device_layout(
     old_host_size: list[int],
     new_host_size: list[int],
     stick_host_dim: int | None = None,
+    old_host_stride: Sequence[int] | None = None,
+    new_host_stride: Sequence[int] | None = None,
 ):
     """Derive a new SpyreTensorLayout for a resized host buffer.
 
@@ -138,9 +140,10 @@ def _resize_device_layout(
     ``stride_map`` semantics: a value of ``-1`` means "this device dimension has
     extent 1 and is never stepped through; its stride is undefined."  When
     growing back from a singleton (``orig_sm[j] == -1``), the stride is
-    recomputed from the new host stride (the rescue arm in Passes 2–4).  For
-    non-contiguous (transposed / col-major) dims, the *physical* stride on
-    device is invariant to resizing, so it is left unchanged.
+    recomputed from the new host stride (the rescue arm in Passes 2–4).  A
+    non-contiguous (transposed / col-major) dim follows ``new_host_stride``
+    when the caller supplies the actual strides, and is left unchanged
+    otherwise.
 
     Device-dim classification (as produced by ``get_generic_stick_layout``):
 
@@ -174,6 +177,18 @@ def _resize_device_layout(
     dims share a size, e.g. flash-attention QK^T with ``Sq == Skv`` — issue
     #3116) without relying on the ambiguous size-elimination + contiguous-stride
     tiebreak.  When ``None`` (all current callers), behaviour is unchanged.
+
+    ``old_host_stride`` (optional): the buffer's actual host strides at
+    ``old_host_size``.  A non-stick device dim's ``stride_map`` entry is its host
+    dim's stride, so on a permuted layout (e.g. attention scores with two size-8
+    head dims) it breaks a size tie the contiguous strides cannot, which would
+    otherwise leave that dim unresized.  Tried before the contiguous strides.
+
+    ``new_host_stride`` (optional, with ``old_host_stride``): the resized
+    buffer's host strides.  A device dim that stepped its host dim at the old
+    actual stride steps it at the new one, so a permuted per-tile buffer gets a
+    ``stride_map`` that agrees with its host layout.  Without both, a
+    non-contiguous stride is left unchanged, as before.
 
     Multi-pass algorithm:
 
@@ -221,10 +236,24 @@ def _resize_device_layout(
                 stick_host_dim = None
 
     old_hs = [int(s) for s in FlexibleLayout.contiguous_strides(old_host_size)]
+    tiebreak_strides = [old_hs]
+    if old_host_stride is not None:
+        tiebreak_strides.insert(0, [int(s) for s in old_host_stride])
     new_hs = [int(s) for s in FlexibleLayout.contiguous_strides(new_host_size)]
 
     new_ds = list(orig_ds)
     new_sm = list(orig_sm)
+
+    def _restride(j: int, p: int, scale: int = 1) -> None:
+        # ``scale`` is ``eps`` for a stick tile-count dim, which steps a whole
+        # stick of its host dim at a time.
+        if old_host_stride is not None and new_host_stride is not None:
+            if orig_sm[j] == scale * int(old_host_stride[p]):
+                new_sm[j] = scale * int(new_host_stride[p])
+                return
+        if orig_sm[j] == scale * old_hs[p] or orig_sm[j] == -1:
+            new_sm[j] = scale * new_hs[p]
+        # else: non-contiguous stride with no actual strides to follow; leave it.
 
     # Pass 1: see docstring.
     matched_host = {}  # j → p (non-stick matches, provisional for size>1)
@@ -252,9 +281,11 @@ def _resize_device_layout(
                 # provisional; may be reclassified as tile-count in Pass 1b
                 matched_host[j] = size_cands[0]
             elif len(size_cands) > 1:
-                stride_cands = [p for p in size_cands if old_hs[p] == orig_sm[j]]
-                if len(stride_cands) == 1:
-                    matched_host[j] = stride_cands[0]
+                for strides in tiebreak_strides:
+                    stride_cands = [p for p in size_cands if strides[p] == orig_sm[j]]
+                    if len(stride_cands) == 1:
+                        matched_host[j] = stride_cands[0]
+                        break
                 else:
                     unmatched_j.append(j)
             else:
@@ -280,7 +311,11 @@ def _resize_device_layout(
         expected_tc = -(-old_host_size[pstar_provisional] // eps)
         for j in list(matched_host):
             p = matched_host[j]
-            if orig_ds[j] > 1 and orig_sm[j] != old_hs[p] and orig_ds[j] == expected_tc:
+            if (
+                orig_ds[j] > 1
+                and all(orig_sm[j] != strides[p] for strides in tiebreak_strides)
+                and orig_ds[j] == expected_tc
+            ):
                 del matched_host[j]
                 unmatched_j.append(j)
 
@@ -330,42 +365,48 @@ def _resize_device_layout(
         new_ds[j] = new_host_size[p]
         if new_host_size[p] == 1:
             new_sm[j] = -1
-        elif orig_sm[j] == old_hs[p] or orig_sm[j] == -1:
-            new_sm[j] = new_hs[p]
-        # else: non-contiguous stride; physical layout is invariant — leave unchanged.
+        else:
+            _restride(j, p)
 
     if pstar is None:  # reduction output: tile-count / inner-stick entries frozen
         return SpyreTensorLayout(
             new_ds, new_sm, orig_stl.device_dtype, orig_stl.element_arrangement
         )
 
-    # Pass 3: update tile-count dims (unmatched_j — all must equal expected tile-count).
+    # Pass 3: update tile-count dims (unmatched_j — all must equal expected
+    # tile-count). Where a non-stick host dim Pass 1 left unmatched has that
+    # size too, the dim may be that host dim's instead, which resizing it as
+    # the tile count would leave at full size: only the stride tells them
+    # apart.
+    expected_tc = -(-old_host_size[pstar] // eps)  # ceil division
+    tc_strides = {eps * strides[pstar] for strides in tiebreak_strides}
     for j in unmatched_j:
-        expected_tc = -(-old_host_size[pstar] // eps)  # ceil division
-        if orig_ds[j] != expected_tc:
+        ambiguous = any(
+            p != pstar and p not in matched_p and old_host_size[p] == orig_ds[j]
+            for p in range(ndim)
+        )
+        if orig_ds[j] != expected_tc or (ambiguous and orig_sm[j] not in tc_strides):
             raise RuntimeError(
                 f"_resize_device_layout: device dim {j} "
                 f"(stride_map={orig_sm[j]}, device_size={orig_ds[j]}) was not "
-                f"matched as a non-stick dim and does not equal the expected "
-                f"tile-count {expected_tc} for stick host dim {pstar} "
+                f"matched as a non-stick dim and is not the tile-count dim "
+                f"(size {expected_tc}, stride_map in {sorted(tc_strides)}) of "
+                f"stick host dim {pstar} "
                 f"(old_host_size={old_host_size}) in {orig_stl!r}. "
                 f"This layout is not supported by the device-native reconstruction."
             )
         new_ds[j] = -(-new_host_size[pstar] // eps)  # ceil division
         if new_host_size[pstar] == 1:
             new_sm[j] = -1
-        elif orig_sm[j] == eps * old_hs[pstar] or orig_sm[j] == -1:
-            # tile-count stride = eps * contiguous stride of the stick host dim
-            new_sm[j] = eps * new_hs[pstar]
-        # else: non-contiguous stick; physical stride invariant.
+        else:
+            _restride(j, pstar, eps)
 
     # Pass 4: inner stick (j == ndev-1) — device_size is always eps, update stride only.
     j = ndev - 1
     if new_host_size[pstar] == 1:
         new_sm[j] = -1
-    elif orig_sm[j] == old_hs[pstar] or orig_sm[j] == -1:
-        new_sm[j] = new_hs[pstar]
-    # else: non-contiguous stick; physical stride invariant.
+    else:
+        _restride(j, pstar)
 
     return SpyreTensorLayout(
         new_ds, new_sm, orig_stl.device_dtype, orig_stl.element_arrangement

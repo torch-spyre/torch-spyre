@@ -7228,3 +7228,36 @@ class TestSpanOverflowNumericValidation(InductorTestCase):
                 mock_backend_compiler(),
             ):
                 run_and_get_code(cfn, x)
+
+    @config.patch({"sencores": 4, "ignore_span_overflow_hints": False})
+    @patch(
+        "torch_spyre._inductor.wsr.span_overflow_hint_analysis.MAX_SPAN_BYTES",
+        64 * 1024,
+    )
+    def test_permuted_same_size_dims_tile_numeric(self):
+        """Span-overflow tiling of a permuted buffer whose two leading dims have
+        the same size, which the stick tile count ceil(512/64) = 8 also equals.
+
+        Host strides (32768, 262144, 512, 1): neither size-8 dim has its
+        contiguous stride, so the device layout can only be resized by the
+        buffer's own strides.  Resizing by contiguous strides shrank the wrong
+        device dim and gave wrong results.
+        """
+        torch.manual_seed(0xAFFE)
+        x = torch.randn(8, 8, 64, 512, dtype=torch.float16).permute(1, 0, 2, 3)
+
+        def fn(x):
+            return torch.abs(x) + 1
+
+        def assert_tiled(src):
+            self.assertIn("LoopSpec(", src)
+
+        compare_with_cpu(
+            fn,
+            x,
+            run_compile=True,
+            run_eager=False,
+            source_check=assert_tiled,
+            atol=0.05,
+            rtol=0.05,
+        )

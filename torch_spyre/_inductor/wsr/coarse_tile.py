@@ -2830,7 +2830,12 @@ def _divide_ranges(
     # transposed same-size dims — issue #3116). Tiling-invariant, so safe here.
     stick_hd = _stick_host_dim(op, layout.device_layout)
     layout.device_layout = _resize_device_layout(
-        layout.device_layout, old_host_size, new_size_ints, stick_host_dim=stick_hd
+        layout.device_layout,
+        old_host_size,
+        new_size_ints,
+        stick_host_dim=stick_hd,
+        old_host_stride=old_stride,
+        new_host_stride=layout.stride,
     )
     return _DivideRangesResult(retiled_info, symbol_remap)
 
@@ -4160,6 +4165,8 @@ def _allocate_full_buffer(
                 tile_size_ints,
                 full_size_ints,
                 stick_host_dim=stick_hd,
+                old_host_stride=orig_layout.stride,
+                new_host_stride=strides,
             )
         except RuntimeError:
             # Non-standard device layout (e.g. post-restickify HBM strides that
@@ -5158,13 +5165,19 @@ def _insert_one_read_copy(
         # The guard above has established that the non-unit dims and
         # tile_ranges are the same length, so this walk cannot run off the
         # end.
+        # The copy's strides ride along the same walk: on a permuted source
+        # only they tell the resize which device dim steps which host dim.
+        # A unit dim's stride is never read.
         tile_size_ints = []
+        tile_stride_ints = []
         it_idx = 0
         for s in full_size_ints:
             if s == 1:
                 tile_size_ints.append(1)
+                tile_stride_ints.append(1)
             else:
                 tile_size_ints.append(int(tile_ranges[it_idx]))
+                tile_stride_ints.append(int(tile_strides[it_idx]))
                 it_idx += 1
         # Authoritative stick host dim from coordinate identity (issue
         # #3116); None falls back to size-based inference inside
@@ -5176,6 +5189,8 @@ def _insert_one_read_copy(
                 full_size_ints,
                 tile_size_ints,
                 stick_host_dim=stick_hd,
+                old_host_stride=[int(st) for st in full_layout.stride],
+                new_host_stride=tile_stride_ints,
             )
         except RuntimeError:
             # Non-standard device layout (e.g. post-restickify HBM strides
