@@ -186,7 +186,10 @@ void JobPlanStepHostCompute::construct(LaunchContext& ctx,
       return buf;
     };
   } else if (ishape_.size() == 1 && ishape_[0] == 0) {
-    // Case 2: fake symbols (ishape_ is {0}) — nullptr src argument.
+    // Case 2: zero host-supplied symbols (ishape_ == {0})
+    // nullptr is the documented zero-symbol input — DataConvertInfoGenerate
+    // branches on it (DataConvertInfoGenerate.cpp:148) and runs with an empty
+    // symbol set. output_buffer_ must still be filled before the H2D DMA.
     producer = [this, kAlign]() -> std::shared_ptr<flex::RaiiBuffer> {
       auto buf = std::make_shared<flex::RaiiBuffer>(correction_size_, kAlign);
       deeptools::processComputeOnHostCommand(*hcm_, buf->Pointer(), nullptr);

@@ -28,6 +28,56 @@ import torch_spyre
 from test_prepare_kernel import TestPrepareKernel as tpk
 
 
+def _zero_symbol_hcm() -> dict:
+    """Return a valid HCM that produces a fixed 1024-byte payload without runtime symbols."""
+    return {
+        "vdci": {
+            "dsName_": "zero_symbol",
+            "isMarker_": 0,
+            "data_conversion_info_group_": [
+                {
+                    "key": [],
+                    "dci": {
+                        "dsName_": "zero_symbol",
+                        "isHostToSen_": 1,
+                        "dataformat_src_": 8,  # DataFormats::SENINT8
+                        "dataformat_dst_": 8,  # DataFormats::SENINT8
+                        "dcOpName_": 6,  # DataConvertOpFuncs::SYMBOL_SUBSTITUTE
+                        "pre_expand_dcsi_": [],
+                        "pre_input_shape_": [],
+                        "dcsi_": [],
+                        # hostCorrectionBytes() = product(input_shape_); must match the 1024-byte payload.
+                        "input_shape_": [1024],
+                        # SymbolSubstituteOutputWords sizes its write from output_shape_.
+                        "output_shape_": [1024],
+                        "post_slice_dcsi_": [],
+                        "post_output_shape_": [],
+                        "input_dimwise_ea_": [],
+                        "output_dimwise_ea_": [],
+                        "useSpi_": 0,
+                        "usePca_": 0,
+                        "usePadVal_": 0,
+                        "inputPadVal_": 0,
+                        "useWli_": 0,
+                        "dmdi_": {"perTensorInfo": []},
+                        "ssi_": {
+                            "value_and_locs_": [],
+                            "inputSym_": [],
+                            "unSubstitutedFlitStartOffset_": 0,
+                        },
+                    },
+                }
+            ],
+            "group_tags_": [],
+            "inputSym_": [],
+            "dciIdxSym_": [],
+            "variableDefs_": [],
+        },
+        # Non-zero payload constant (1024 0xAB bytes) + required trailer constant.
+        "senConstants": [{"senconst_": "ab" * 1024}, {"senconst_": ""}],
+    }
+
+
 def _run_compiled_op(op_name: str) -> None:
     """
     Compile an op with SpyreCode and run it on Spyre, comparing to CPU.
@@ -114,6 +164,22 @@ class TestLaunchJobPlan(TestCase):
             with stream:
                 with pytest.raises(RuntimeError, match="Expect one DCI"):
                     torch_spyre._C.launch_jobplan(job_plan, [])
+
+    def test_zero_symbol_host_compute_does_not_raise(self):
+        """A zero-symbol HCM (ishape=["0"]) must execute and produce expected bytes.
+
+        Exercises the nullptr branch in processComputeOnHostCommand
+        (DataConvertInfoGenerate.cpp:148) via the _process_hcm_zero_symbols test
+        seam. Verifies that the host compute step executes properly without
+        symbols and outputs the expected non-zero 1024-byte payload.
+        """
+        hcm_dict = _zero_symbol_hcm()
+        hcm_json_str = json.dumps(hcm_dict)
+        output_bytes = torch_spyre._C._process_hcm_zero_symbols(hcm_json_str)
+
+        self.assertEqual(len(output_bytes), 1024)
+        # Assert non-zero output bytes matching the constant in _zero_symbol_hcm()
+        self.assertEqual(output_bytes, b"\xab" * 1024)
 
 
 def _build_d2h_jobplan(tmpdir: str, dev_ptr: int, size_bytes: int):
