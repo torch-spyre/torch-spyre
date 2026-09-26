@@ -1011,14 +1011,13 @@ _cleanup_wrappers() {
         rm -f "$YAML_CONFIG"
         echo "[torch_oot_device_tests_run] Removed merged temp config: $YAML_CONFIG"
     fi
-    # Remove marker sidecar JSON written by TorchTestBase.instantiate_test.
-    # Normally deleted by _XML_INJECT_PY after injection, but when --junit-xml
-    # is not supplied _XML_INJECT_PY never runs
-    local _sidecar="${YAML_CONFIG}.markers.json"
-    if [[ -f "$_sidecar" ]]; then
+    # Remove the per-process marker sidecars written by TorchTestBase.instantiate_test.
+    local _sidecar
+    for _sidecar in "${YAML_CONFIG:-}".markers.*.json; do
+        [[ -f "$_sidecar" ]] || continue
         rm -f "$_sidecar"
         echo "[torch_oot_device_tests_run] Cleaned up marker sidecar: $_sidecar"
-    fi
+    done
 }
 trap _cleanup_wrappers EXIT
 
@@ -1473,16 +1472,14 @@ echo ""
 # 12. Run pytest for each file - original / wrapper depending on TestClass
 #
 # After pytest writes the JUnit XML, a Python post-processor injects YAML
-# tags as <properties> elements directly into the XML.
-#
-# Two regex fixes make matching robust:
-#   1. (?<![a-z])name="..."  avoids matching 'name' inside 'classname="..."'
-#   2. yaml_class in classname  handles dotted XML classnames like
-#      "test.test_binary_ufuncs.TestBinaryUfuncsPRIVATEUSE1"
+# tags as <properties> elements directly into the XML. Tests the OOT
+# instantiation never marks (plain pytest files) get their file's
+# testtype__<label> tags here, so every case names the tiers it ran under.
 # ---------------------------------------------------------------------------
 
 _XML_INJECT_PY='
-import sys, re, json, os
+import sys, re, json, os, fnmatch
+import xml.etree.ElementTree as ET
 from pathlib import Path
 try:
     import yaml
@@ -1491,21 +1488,43 @@ except ImportError:
 
 xml_path, yaml_path = sys.argv[1], sys.argv[2]
 
-# Load sidecar written by TorchTestBase.instantiate_test.
+# Sidecars written by TorchTestBase.instantiate_test, one per pytest process.
 # Keys are bare method names matching the XML `name=` attribute exactly.
 # Values are already-merged lists of all tags (YAML tests tags + op__ + dtype__ + module__ markers).
+# Left in place for later shards of the same config; the EXIT trap removes them.
 _sidecar: dict = {}
-_sidecar_path = yaml_path + ".markers.json"
-try:
-    with open(_sidecar_path) as _f:
-        _sidecar = json.load(_f)
-except Exception:
-    pass
+for _sidecar_path in sorted(Path(yaml_path).parent.glob(Path(yaml_path).name + ".markers.*.json")):
+    try:
+        with open(_sidecar_path) as _f:
+            _sidecar.update(json.load(_f))
+    except Exception:
+        pass
 
 # Fallback YAML-only tag_map for tests not in sidecar
 data = yaml.safe_load(open(yaml_path)) or {}
+suite_cfg = data.get("test_suite_config", {}) or {}
+
+def _testtype_tags(labels):
+    safe = (re.sub(r"[^a-zA-Z0-9_]", "_", str(l)).strip("_") for l in labels or [])
+    return {f"testtype__{l}" for l in safe if l}
+
+# Same precedence as TEST_SUITE_LABELS: a merged config carries labels per file.
+suite_testtypes = _testtype_tags(suite_cfg.get("labels"))
+file_testtypes = {}
+for fe in suite_cfg.get("files", []) or []:
+    stem = Path(str(fe.get("path", ""))).stem
+    if stem and fe.get("labels"):
+        file_testtypes[stem] = _testtype_tags(fe["labels"])
+
+def _file_testtypes(classname):
+    for part in classname.split("."):
+        for stem, tags in file_testtypes.items():
+            if part == stem or part.startswith(stem + "__"):
+                return tags
+    return suite_testtypes
+
 tag_map: dict = {}
-for fe in data.get("test_suite_config", {}).get("files", []):
+for fe in suite_cfg.get("files", []):
     for te in fe.get("tests", []):
         tags = sorted(set(te.get("tags", []) or []))
         if not tags:
@@ -1514,6 +1533,18 @@ for fe in data.get("test_suite_config", {}).get("files", []):
             name = name.strip()
             if name:
                 tag_map.setdefault(name, set()).update(tags)
+
+# YAML names are literal, regex (LxPlanning.*) or glob (*TestModule*). The XML name
+# carries variant suffixes, so a method pattern need only match its start.
+def _matches(pattern, value, prefix=False):
+    if value.startswith(pattern) if prefix else value == pattern:
+        return True
+    if fnmatch.fnmatchcase(value, pattern + "*" if prefix else pattern):
+        return True
+    try:
+        return bool((re.match if prefix else re.fullmatch)(pattern, value))
+    except re.error:
+        return False
 
 def _all_tags(classname, testname):
     # Sidecar has the full merged tag list -- use it when available.
@@ -1526,60 +1557,30 @@ def _all_tags(classname, testname):
             yaml_class, yaml_method = yaml_name.split("::", 1)
         else:
             yaml_class, yaml_method = "", yaml_name
-        if ((yaml_class and yaml_method
-                and yaml_class in classname
-                and testname.startswith(yaml_method))
-                or (yaml_method and not yaml_class
-                    and testname.startswith(yaml_method))):
+        if yaml_method and _matches(yaml_method, testname, prefix=True) and (
+                not yaml_class or yaml_class in classname
+                or any(_matches(yaml_class, part) for part in classname.split("."))):
             matched.update(tags)
     return sorted(matched)
 
-def build_props(tags):
-    return "<properties>" + "".join(
-        f"<property name=\"tag\" value=\"{t}\"/>" for t in tags
-    ) + "</properties>"
-
-def inject_full(m):
-    attrs, content = m.group(1), m.group(2)
-    cn = re.search(r"classname=\"([^\"]*)\"", attrs)
-    tn = re.search(r"(?<![a-z])name=\"([^\"]*)\"", attrs)
-    if not cn or not tn:
-        return m.group(0)
-    tags = _all_tags(cn.group(1), tn.group(1))
+tree = ET.parse(xml_path)
+for tc in tree.getroot().iter("testcase"):
+    cn, tn = tc.get("classname", ""), tc.get("name", "")
+    if not tn:
+        continue
+    tags = set(_all_tags(cn, tn))
+    if not any(t.startswith("testtype__") for t in tags):
+        tags |= _file_testtypes(cn)
     if not tags:
-        return m.group(0)
-    if "<properties>" in content:
-        existing = set(re.findall(r"<property name=\"tag\" value=\"([^\"]*)\"/>", content))
-        new_props = "".join(
-            f"<property name=\"tag\" value=\"{t}\"/>"
-            for t in tags if t not in existing
-        )
-        if not new_props:
-            return m.group(0)
-        content = content.replace("</properties>", new_props + "</properties>", 1)
-        return f"<testcase{attrs}>{content}</testcase>"
-    return f"<testcase{attrs}>{build_props(tags)}{content}</testcase>"
-
-def inject_self_closing(m):
-    attrs = m.group(1)
-    cn = re.search(r"classname=\"([^\"]*)\"", attrs)
-    tn = re.search(r"(?<![a-z])name=\"([^\"]*)\"", attrs)
-    if not cn or not tn:
-        return m.group(0)
-    tags = _all_tags(cn.group(1), tn.group(1))
-    if not tags:
-        return m.group(0)
-    return f"<testcase{attrs}>{build_props(tags)}</testcase>"
-
-xml = Path(xml_path).read_text()
-xml = re.sub(r"<testcase([^>]*)>(.*?)</testcase>", inject_full,        xml, flags=re.DOTALL)
-xml = re.sub(r"<testcase([^>]*?)/>",               inject_self_closing, xml)
-Path(xml_path).write_text(xml)
-
-try:
-    os.remove(_sidecar_path)
-except OSError:
-    pass
+        continue
+    props = tc.find("properties")
+    if props is None:
+        props = ET.Element("properties")
+        tc.insert(0, props)
+    existing = {p.get("value") for p in props.findall("property") if p.get("name") == "tag"}
+    for t in sorted(tags - existing):
+        ET.SubElement(props, "property", name="tag", value=t)
+tree.write(xml_path, encoding="utf-8", xml_declaration=True)
 
 print(f"[torch_oot_device_tests_run] Tags injected into XML: {xml_path}", flush=True)
 '
