@@ -11,6 +11,8 @@ test_suite_config:
             - TestOps::test_binary_op_stick_crossing_last_dim
             - TestOps::test_exp_fp16.*
             - TestOps::test_exp_fp32.*
+            - TestOps::test_5d_neg.*
+            - TestOps::test_cos_sin.*
           mode: mandatory_success
           tags:
             - ops__inductor-pointwise

@@ -89,25 +89,24 @@ def pytest_runtest_makereport(item, call):
         if shapes:
             rep._spyre_shapes = shapes
 
-        # Rewrite SKIPPED/FAILED -> XFAIL for unittest.TestCase methods marked
-        # xfail by OOT config. pytest.mark.xfail is ignored by the unittest runner
-        # when the outcome is SKIPPED (e.g. pytest.skip() called inside the body or
-        # by PyTorch's test_wrapper). We detect the xfail mark directly from
-        # fn.pytestmark and rewrite the report here.
+        # Rewrite test outcomes for unittest.TestCase methods marked with
+        # pytest.mark.xfail. pytest only honours xfail for FAILED outcomes on
+        # unittest.TestCase, silently ignoring SKIPPED (e.g. from pytest.skip()
+        # or PyTorch's test_wrapper). We rewrite all three outcomes via
+        # fn.pytestmark:
+        #   FAILED/SKIPPED -> XFAIL
+        #   PASSED         -> XPASS (non-strict) or FAILED (strict)
+        # strict only affects the PASSED branch.
         xfail_mark = next(
             (m for m in getattr(fn, "pytestmark", []) if m.name == "xfail"),
             None,
         )
         if xfail_mark is not None:
             strict = xfail_mark.kwargs.get("strict", False)
+            reason = xfail_mark.kwargs.get("reason", "OOT xfail")
             if rep.skipped or rep.failed:
-                reason = _extract_failure_message(rep)
                 rep.outcome = "skipped"
-                rep.wasxfail = (
-                    f"expected failure (OOT xfail): {reason}"
-                    if reason
-                    else "expected failure (OOT xfail)"
-                )
+                rep.wasxfail = reason
             elif rep.passed:
                 if strict:
                     # Strict XPASS: test passed but was required to fail.
@@ -118,7 +117,7 @@ def pytest_runtest_makereport(item, call):
                 else:
                     # Non-strict XPASS: test passed but was expected to fail.
                     # wasxfail set so pytest_report_teststatus displays "XPASS".
-                    rep.wasxfail = "expected failure (OOT xfail)"
+                    rep.wasxfail = reason
 
 
 # Prints [TAGS = ...] for every test alongside the result line.
