@@ -495,10 +495,15 @@ _V2_BENCH_METRIC_KEYS = (
     "mem_size_mb",
     "pt_util_percent",
     "duration_ms",
-    "torch_spyre_ms",
     "sendnn_ms",
     "ratio",
 )
+# Not stored: torch_spyre_ms is the tsp time of the case whose tags were read, so it only
+# ever repeats duration_ms (kernel rows) or total_duration_ms (report rows).
+
+# The harness writes 0.0 for these when it did not capture them (no trace, no compile or
+# launch timing), so a report where every record has 0 carries no measurement of them.
+_ZERO_WHEN_UNCAPTURED = ("pt_util_percent", "compile_ms", "runtime_ms")
 
 
 # In the benchmark_id hash, not merely in props: one operation_name occurs at more
@@ -513,13 +518,6 @@ _V2_BENCH_ID_KEYS = (
     "kernel_name",
     "is_total",
 )
-
-
-# Segregates this producer's benchmarks from every other one: in the identity hash and
-# leading both perf sort keys, exactly as component is for test_cases/test_case_runs.
-# Defined here rather than beside COMPONENT_DEFAULT so it precedes its first use -- a later
-# definition raises only at call time, which no import-level check would catch.
-BENCH_COMPONENT = "torch-spyre"
 
 
 _BENCH_TABLES = (schema_model.BENCHMARKS, schema_model.BENCHMARK_RUNS)
@@ -576,7 +574,8 @@ def _bench_backend(rec: dict) -> str:
         return _BACKEND_BY_METRIC[metric]
     if rec.get("sendnn_ms") is not None and rec.get("torch_spyre_ms") is None:
         return "sendnn"
-    return "torch-spyre"
+    # report.xml records are torch-spyre's own run on the card.
+    return "spyre"
 
 
 def _bench_entries(records: list) -> list:
@@ -590,6 +589,11 @@ def _bench_entries(records: list) -> list:
     baseline -- derived in v_benchmark_regression / v_benchmark_backend_compare instead), and
     every run-context column (reached through run_id).
     """
+    uncaptured = {
+        k
+        for k in _ZERO_WHEN_UNCAPTURED
+        if all(rec[k] == 0 for rec in records if rec.get(k) is not None)
+    }
     entries = []
     for rec in records:
         num_runs = rec.get("num_runs")
@@ -606,7 +610,7 @@ def _bench_entries(records: list) -> list:
                 "measurements": {
                     k: [float(rec[k])]
                     for k in _V2_BENCH_METRIC_KEYS
-                    if rec.get(k) is not None
+                    if rec.get(k) is not None and k not in uncaptured
                 },
                 "iterations": int(num_runs) if num_runs is not None else 0,
                 "disc": rec,
@@ -1465,7 +1469,7 @@ def main():
                     client,
                     v2db,
                     _v2_run_id,
-                    BENCH_COMPONENT,
+                    component_of(args, COMPONENT_DEFAULT),
                     "kernel",
                     run_meta["source_file"],
                 ):
@@ -1477,7 +1481,7 @@ def main():
                     _n = insert_benchmarks(
                         client,
                         v2db,
-                        BENCH_COMPONENT,
+                        component_of(args, COMPONENT_DEFAULT),
                         _v2_run_id,
                         _bench_entries(kernels),
                         report_kind="kernel",
@@ -1546,7 +1550,7 @@ def main():
                     client,
                     v2db,
                     _v2_run_id,
-                    BENCH_COMPONENT,
+                    component_of(args, COMPONENT_DEFAULT),
                     "benchmark",
                     run_meta["source_file"],
                 ):
@@ -1558,7 +1562,7 @@ def main():
                     _n = insert_benchmarks(
                         client,
                         v2db,
-                        BENCH_COMPONENT,
+                        component_of(args, COMPONENT_DEFAULT),
                         _v2_run_id,
                         _bench_entries(benchmarks),
                         report_kind="benchmark",
