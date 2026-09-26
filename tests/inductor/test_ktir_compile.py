@@ -48,6 +48,10 @@ def _prereqs_met():
     """Patches under which every device prerequisite is satisfied.
 
     Each test then unsatisfies exactly the one it is about.
+
+    ``ktir_device_mlir`` is no longer a prerequisite, but is set here so the
+    default case carries the ``--device`` override: the command-line assertions
+    below would otherwise be testing the flag's absence by accident.
     """
     settings = {
         "bundle_symbolic_args": False,
@@ -87,15 +91,18 @@ class _PrereqCase(unittest.TestCase):
 class TestKtirPrerequisites(_PrereqCase):
     """Every unmet prerequisite is named, and named before dbo-opt is run."""
 
-    def test_missing_device_mlir_fails_fast(self):
-        with (
-            mock.patch(f"{_CONFIG}.ktir_device_mlir", ""),
-            mock.patch(f"{_MODULE}.subprocess.run") as run,
-        ):
-            with self.assertRaises(RuntimeError) as ctx:
-                self.compile()
-        self.assertIn("KTIR_DEVICE_MLIR", str(ctx.exception))
-        run.assert_not_called()
+    def test_missing_device_mlir_is_not_a_prerequisite_failure(self):
+        """An unset device .mlir is compiled, not refused.
+
+        This check used to demand ``KTIR_DEVICE_MLIR``, which duplicated a
+        default dbo-opt already has: unset, it takes
+        ``sys-arch-spec/KTDFArchGraphDevice/spyre_dd2_basic.mlir`` from under
+        ``DEEPTOOLS_PATH``.  As with the symbolic-args prerequisite below, the
+        thing worth pinning is the reverse of what was pinned before -- that the
+        check stays quiet and dbo-opt is reached.
+        """
+        with mock.patch(f"{_CONFIG}.ktir_device_mlir", ""):
+            ac._check_ktir_device_prerequisites()  # does not raise
 
     def test_symbolic_args_are_not_a_prerequisite_failure(self):
         """A symbolic base address is compiled, not refused.
@@ -110,8 +117,15 @@ class TestKtirPrerequisites(_PrereqCase):
         with mock.patch(f"{_CONFIG}.bundle_symbolic_args", True):
             ac._check_ktir_device_prerequisites()  # does not raise
 
-    def test_all_unmet_prerequisites_reported_at_once(self):
-        """One error naming every unmet prerequisite, not the first one found."""
+    def test_dbo_opt_on_path_is_the_only_prerequisite(self):
+        """One entry, and KTIR_DEVICE_MLIR is not it.
+
+        The message keeps its list shape so a future prerequisite reads the same
+        way, but the device .mlir must not reappear in it: naming an optional
+        setting in a "cannot compile" error sends the reader to configure
+        something that was never the problem.  One rather than three now that
+        both the symbolic-args and device-.mlir prerequisites are lifted.
+        """
         with (
             mock.patch(f"{_CONFIG}.ktir_device_mlir", ""),
             mock.patch(f"{_MODULE}.shutil.which", return_value=None),
@@ -119,11 +133,9 @@ class TestKtirPrerequisites(_PrereqCase):
             with self.assertRaises(RuntimeError) as ctx:
                 ac._check_ktir_device_prerequisites()
         message = str(ctx.exception)
-        for expected in ("KTIR_DEVICE_MLIR", "dbo-opt"):
-            self.assertIn(expected, message)
-        # Both, not just the first one found.  Two rather than three since the
-        # symbolic-args prerequisite was lifted.
-        self.assertEqual(message.count("\n  - "), 2)
+        self.assertIn("dbo-opt", message)
+        self.assertNotIn("KTIR_DEVICE_MLIR", message)
+        self.assertEqual(message.count("\n  - "), 1)
 
 
 class TestKtirDboFailures(_PrereqCase):
@@ -169,6 +181,40 @@ class TestKtirDboSuccess(_PrereqCase):
         return subprocess.CompletedProcess(
             args=["dbo-opt"], returncode=0, stdout="", stderr=""
         )
+
+    def test_unset_device_mlir_omits_the_flag_entirely(self):
+        """No ``--device`` argument at all, rather than an empty one.
+
+        ``--device=`` would override dbo-opt's default with the empty string
+        instead of leaving it alone, so the absence of the argument is the
+        behaviour, not just the absence of a path.
+        """
+        with (
+            mock.patch(f"{_CONFIG}.ktir_device_mlir", ""),
+            mock.patch(f"{_MODULE}.SpyreSDSCKernelRunner"),
+            mock.patch(
+                f"{_MODULE}.subprocess.run", side_effect=lambda *a, **k: self._run_ok()
+            ) as run,
+        ):
+            self.compile()
+        cmd = run.call_args[0][0]
+        self.assertFalse([a for a in cmd if a.startswith("--device")])
+        # The rest of the command is unaffected by the omission.
+        self.assertEqual(cmd[:2], ["dbo-opt", "--from-ktir"])
+        self.assertIn("--kEmitSpyreCode", cmd)
+        self.assertEqual(cmd[-1], self.ktir_path)
+
+    def test_set_device_mlir_is_passed_through(self):
+        """The override still reaches dbo-opt when config names a path."""
+        with (
+            mock.patch(f"{_CONFIG}.ktir_device_mlir", "/some/device.mlir"),
+            mock.patch(f"{_MODULE}.SpyreSDSCKernelRunner"),
+            mock.patch(
+                f"{_MODULE}.subprocess.run", side_effect=lambda *a, **k: self._run_ok()
+            ) as run,
+        ):
+            self.compile()
+        self.assertIn("--device=/some/device.mlir", run.call_args[0][0])
 
     def test_dbo_opt_inherits_this_process_environment(self):
         """dbo-opt is spawned with no ``env`` override, so it inherits ours.
