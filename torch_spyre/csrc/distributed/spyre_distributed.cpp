@@ -55,6 +55,13 @@ static std::unordered_map<spyre::SharedOwnerCtx*, PendingWork>
     pending_work_map_;
 static std::mutex work_map_mutex_;
 
+// Batch accumulator for broadcast WorkSchedules.
+// broadcast_run appends here; the first wait_work in the same execution step
+// performs a combined start()+wait() that covers all appended broadcasts in
+// a single HDMA OOB exchange (see spyre_comms::WorkSchedule::append docs).
+static std::vector<std::unique_ptr<spyre_comms::WorkSchedule>>
+    pending_broadcast_batch_;
+
 // Compile-time plan cache.
 enum class PlanKind { Broadcast, AllReduce, AllGather };
 
@@ -323,7 +330,12 @@ at::Tensor spyre_broadcast_run_impl(const at::Tensor& input,
   TORCH_CHECK(work_schedule != nullptr,
               "broadcast_applyTensor operation failed to create WorkSchedule");
 
-  work_schedule->start();
+  // Defer start — append to the broadcast batch so all broadcasts in this
+  // execution step are combined into one WorkSchedule before start().
+  // Independently started WorkSchedules from same-shape WSIs trigger
+  // separate HDMA OOB exchanges that produce wrong results when peer ranks
+  // do not reach them in identical order.
+  pending_broadcast_batch_.push_back(std::move(work_schedule));
 
   // Store pending work
   {
@@ -331,9 +343,8 @@ at::Tensor spyre_broadcast_run_impl(const at::Tensor& input,
     TORCH_CHECK(pending_work_map_.find(ctx) == pending_work_map_.end(),
                 "broadcast_run called twice on the same allocation without "
                 "intervening wait_work");
-    pending_work_map_.emplace(ctx, PendingWork{CollectiveKind::Broadcast,
-                                               std::move(work_schedule),
-                                               {output}});
+    pending_work_map_.emplace(
+        ctx, PendingWork{CollectiveKind::Broadcast, nullptr, {output}});
   }
 
   return output;
@@ -466,6 +477,30 @@ at::Tensor spyre_allgather_run_impl(const at::Tensor& input,
 at::Tensor spyre_wait_work_impl(const at::Tensor& tensor) {
   SPYRE_RUNTIME_DEBUG() << "called";
 
+  // Flush pending broadcast batch. All broadcast_run calls in this
+  // execution step have appended their WorkSchedules; combining them into
+  // a single schedule ensures exactly one HDMA OOB exchange covers all
+  // broadcasts (required for correctness on HDMA topologies).
+  if (!pending_broadcast_batch_.empty()) {
+    // Ensure device-side compute (e.g. source-rank copy in broadcast_run)
+    // is visible to the DMA fabric before starting the collective.
+    spyre::getDefaultStream(tensor.device()).synchronize();
+
+    auto ctx_ptr = ensure_context();
+    size_t batch_size = pending_broadcast_batch_.size();
+    auto combined = ctx_ptr->create_empty_work_schedule();
+    for (auto& ws : pending_broadcast_batch_) {
+      combined->append(std::move(ws));
+    }
+    pending_broadcast_batch_.clear();
+
+    combined->start();
+    combined->wait();
+    combined->reset();
+    SPYRE_RUNTIME_DEBUG() << "Broadcast batch executed: combined " << batch_size
+                          << " schedules";
+  }
+
   // Get SharedOwnerCtx for map lookup
   auto* ctx = static_cast<spyre::SharedOwnerCtx*>(
       tensor.storage().data_ptr().get_context());
@@ -488,8 +523,15 @@ at::Tensor spyre_wait_work_impl(const at::Tensor& tensor) {
 
   // Lock released — concurrent wait_work and run ops can now proceed
   if (pending.work) {
+    // wait() calls WaitAll() which calls default_runtime_stream->synchronize()
+    // internally, so the stream is already drained on return.
     pending.work->wait();
     SPYRE_RUNTIME_DEBUG() << "WorkSchedule wait completed";
+  } else {
+    // Broadcast batch path: the combined schedule was already waited in the
+    // batch flush above. pending.work is nullptr but the stream still needs
+    // to be drained so subsequent compute sees the DMA results.
+    spyre::getDefaultStream(tensor.device()).synchronize();
   }
 
   if (pending.kind == CollectiveKind::AllGather) {

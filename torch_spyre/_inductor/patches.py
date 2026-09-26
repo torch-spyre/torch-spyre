@@ -224,6 +224,35 @@ def enable_spyre_context(example_inputs: list[InputType]):
 
     SchedulerNode.has_side_effects = _spyre_scheduler_node_has_side_effects  # type: ignore[method-assign]
 
+    import torch._inductor.utils as _inductor_utils
+    from torch_spyre._inductor.ir import (
+        AllGatherAsyncFallback,
+        AllReduceAsyncFallback,
+        BroadcastAsyncFallback,
+        WaitWorkFallback,
+    )
+
+    _SPYRE_COLLECTIVE_TYPES = (
+        BroadcastAsyncFallback,
+        AllGatherAsyncFallback,
+        AllReduceAsyncFallback,
+    )
+    old_is_collective = _inductor_utils.is_collective
+    old_is_wait = _inductor_utils.is_wait
+
+    def _spyre_is_collective(node, op=None):
+        if isinstance(node, _SPYRE_COLLECTIVE_TYPES):
+            return op is None or node.op_overload is op
+        return old_is_collective(node, op)
+
+    def _spyre_is_wait(node):
+        if isinstance(node, WaitWorkFallback):
+            return True
+        return old_is_wait(node)
+
+    _inductor_utils.is_collective = _spyre_is_collective
+    _inductor_utils.is_wait = _spyre_is_wait
+
     with (
         spyre_data_types(),
         _preserve_spyre_input_storage_offsets(),
@@ -239,6 +268,8 @@ def enable_spyre_context(example_inputs: list[InputType]):
             Loops.has_large_inner_fn = old_loop
             GraphLowering._update_scheduler = old_update_scheduler  # type: ignore[method-assign]
             SchedulerNode.has_side_effects = old_scheduler_node_has_side_effects  # type: ignore[method-assign]
+            _inductor_utils.is_collective = old_is_collective
+            _inductor_utils.is_wait = old_is_wait
 
 
 OBSERVER_HOOKS_KEY = "__spyre_hooks_meta"
