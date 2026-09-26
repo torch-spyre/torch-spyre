@@ -40,7 +40,7 @@ from torch._inductor.ir import ComputedBuffer, Operation, Reduction
 
 from ..errors import Unsupported
 from ..logging_utils import get_inductor_logger
-from ..pass_utils import op_out_coords
+from ..pass_utils import iteration_space_from_op, op_out_coords
 from ..propagate_hints import DimHint
 from ..wsr.coarse_tile import (
     coarse_tile_post_stickify,
@@ -51,6 +51,140 @@ from .allocator import ScratchpadOptimizationPass
 from .plan_solver import TileSpec
 
 logger = get_inductor_logger("scratchpad.coarse_tiling")
+
+
+def _get_out_var(
+    op: ComputedBuffer,
+    out_coords: list[sympy.Expr],
+    iter_space: Mapping[sympy.Symbol, sympy.Expr],
+    host_dim: int,
+) -> tuple[sympy.Symbol | None, str | None]:
+    """``(loop_var, None)`` for output ``host_dim``, or ``(None, reason)``.
+
+    The output-axis step of :func:`try_resolve_tile_axis_loop_vars`.
+    ``host_dim`` indexes ``out_coords``, the ``op_out_coords(op)`` the caller
+    computes once for all of a spec's axes -- exactly ``_dims_to_hints`` (span
+    overflow). Rejects a ``host_dim`` past the end of ``out_coords``, and a
+    coordinate that is not a function of exactly one loop variable -- a
+    constant, or several vars folded into one host dim -- since there is then no
+    single loop to tile.
+
+    Also rejects a coordinate whose one free symbol is not in ``iter_space``,
+    the op's own iteration variables. ``op_out_coords`` evaluates the write
+    index against indirect-index sizes and enclosing ``for_each_tile`` loop
+    ranges, so a coordinate can be an indirect-index symbol or an enclosing
+    loop's variable -- a symbol the op does not loop over, so there is no loop
+    of its own to tile.
+    """
+    if host_dim >= len(out_coords):
+        return None, (
+            f"coarse tiling: host_dim={host_dim} is out of bounds "
+            f"for {len(out_coords)} output coordinates on {op.get_name()}."
+        )
+    coord = out_coords[host_dim]
+    free_symbols = coord.free_symbols
+    if len(free_symbols) != 1:
+        return None, (
+            f"coarse tiling: host_dim={host_dim} output coordinate "
+            f"{coord} on {op.get_name()} has {len(free_symbols)} free "
+            "symbols; expected exactly one loop var."
+        )
+    loop_var = next(iter(free_symbols))
+    if loop_var not in iter_space:
+        return None, (
+            f"coarse tiling: host_dim={host_dim} output coordinate {coord} on "
+            f"{op.get_name()} is not one of its iteration variables "
+            f"{list(iter_space)}."
+        )
+    return loop_var, None
+
+
+def _get_red_var(
+    op: ComputedBuffer, host_dim: int
+) -> tuple[sympy.Symbol | None, str | None]:
+    """``(loop_var, None)`` for reduction ``host_dim``, or ``(None, reason)``.
+
+    The reduction-axis step of :func:`try_resolve_tile_axis_loop_vars`, the
+    inverse of :func:`reduction_loop_vars`: ``host_dim`` positionally indexes
+    the op's ordered reduction loop variables, which Inductor *squeezes* -- a
+    size-1 reduction dim carries no loop variable and has no position.
+
+    Rejects, in order: an op that is not a ``Reduction``; one with no write dep
+    or indexed read dep to derive loop variables from; one whose loop variables
+    do not line up one-to-one with ``reduction_ranges``; and a ``host_dim`` past
+    the end of its loop variables.
+
+    The third is not a lowering limit but an applier one. The applier picks the
+    ``reduction_ranges`` entry to divide with
+    ``_loop_var_to_reduction_ranges_pos``, which returns the loop variable's
+    *squeezed* position, so once a size-1 dim is squeezed out (or a broadcast
+    symbol leaks into the loop variables) it divides a different entry than the
+    dim this loop variable tiles. Refusing here keeps every consumer --
+    lowering, enumeration and prediction -- from offering a tiling the applier
+    would misapply.
+    """
+    if not isinstance(op.data, Reduction):
+        return None, (
+            f"coarse tiling: reduction axis host_dim={host_dim} "
+            f"requested on non-Reduction op {op.get_name()}."
+        )
+    try:
+        red_vars = reduction_loop_vars(op)
+    except StopIteration:
+        return None, (
+            f"coarse tiling: {op.get_name()} has no write dep or no indexed "
+            "read dep to derive reduction loop variables from."
+        )
+    reduction_ranges = list(op.data.reduction_ranges)
+    if len(red_vars) != len(reduction_ranges):
+        return None, (
+            f"coarse tiling: reduction host_dim={host_dim} on {op.get_name()}: "
+            f"{len(red_vars)} reduction loop variables for reduction ranges "
+            f"{reduction_ranges}, so a loop variable's position is not its "
+            "reduction_ranges position and the applier would divide a different "
+            "entry than the tiled dim."
+        )
+    if host_dim >= len(red_vars):
+        return None, (
+            f"coarse tiling: reduction host_dim={host_dim} is out "
+            f"of bounds for {len(red_vars)} reduction loop variables on "
+            f"{op.get_name()}."
+        )
+    return red_vars[host_dim], None
+
+
+def try_resolve_tile_axis_loop_vars(
+    op: ComputedBuffer, spec: TileSpec
+) -> tuple[list[sympy.Symbol] | None, str | None]:
+    """``(loop_vars, None)``, one per axis of ``spec``, or ``(None, reason)``.
+
+    The single authority on which loop variable each :class:`TileAxis` names on
+    ``op`` and on whether ``spec`` can be applied at all. It reports rather than
+    raises because its consumers need the answer in different forms:
+    :func:`tile_spec_to_dim_hints` lowers a spec the planner has committed to,
+    so it raises ``Unsupported`` with the ``reason``; the enumerator
+    (``wsr.enumerate_tilings``) and the predictor (``wsr.tile_prediction``)
+    weigh candidates nobody has committed to, so a rejection there is ordinary
+    pruning. Going through one resolver is what keeps the three from disagreeing
+    about which specs exist.
+
+    ``host_dim`` is positional within one of two frames, selected by
+    ``is_reduction``: ``op_out_coords(op)`` for an output axis
+    (:func:`_get_out_var`), the squeezed reduction loop variables for a
+    reduction axis (:func:`_get_red_var`).
+    """
+    out_coords = op_out_coords(op)
+    iter_space = iteration_space_from_op(op)
+    loop_vars: list[sympy.Symbol] = []
+    for axis in spec.axes:
+        if axis.is_reduction:
+            loop_var, reason = _get_red_var(op, axis.host_dim)
+        else:
+            loop_var, reason = _get_out_var(op, out_coords, iter_space, axis.host_dim)
+        if loop_var is None:
+            return None, reason
+        loop_vars.append(loop_var)
+    return loop_vars, None
 
 
 def tile_spec_to_dim_hints(
@@ -65,60 +199,28 @@ def tile_spec_to_dim_hints(
     ``hint_id`` for that level. ``hint_ids`` has one entry per axis, outermost
     first, matching the group's ``levels``.
 
-    The output-axis case is exactly ``_dims_to_hints`` (span overflow): resolve
-    the loop var from ``op_out_coords(op)[host_dim]``. The reduction-axis case is
-    the inverse of :func:`reduction_loop_vars` -- ``host_dim`` positionally
-    indexes the op's ordered reduction loop variables.
+    Which loop variable an axis names, and every ``Unsupported`` a spec can earn,
+    belongs to :func:`try_resolve_tile_axis_loop_vars`; only the ``hint_ids``
+    pairing lives here.
     """
     if len(hint_ids) != len(spec.axes):
         raise ValueError(
             f"tile_spec_to_dim_hints: {len(hint_ids)} hint_ids for "
             f"{len(spec.axes)} axes on {op.get_name()}"
         )
-    out_coords = op_out_coords(op)
-    red_vars: list[sympy.Symbol] | None = None
-    hints: list[DimHint] = []
-    for axis, hint_id in zip(spec.axes, hint_ids):
-        if axis.is_reduction:
-            if not isinstance(op.data, Reduction):
-                raise Unsupported(
-                    f"coarse tiling: reduction axis host_dim={axis.host_dim} "
-                    f"requested on non-Reduction op {op.get_name()}."
-                )
-            if red_vars is None:
-                red_vars = reduction_loop_vars(op)
-            if axis.host_dim >= len(red_vars):
-                raise Unsupported(
-                    f"coarse tiling: reduction host_dim={axis.host_dim} is out "
-                    f"of bounds for {len(red_vars)} reduction loop variables on "
-                    f"{op.get_name()}."
-                )
-            loop_var = red_vars[axis.host_dim]
-        else:
-            if axis.host_dim >= len(out_coords):
-                raise Unsupported(
-                    f"coarse tiling: host_dim={axis.host_dim} is out of bounds "
-                    f"for {len(out_coords)} output coordinates on {op.get_name()}."
-                )
-            coord = out_coords[axis.host_dim]
-            free_symbols = coord.free_symbols
-            if len(free_symbols) != 1:
-                raise Unsupported(
-                    f"coarse tiling: host_dim={axis.host_dim} output coordinate "
-                    f"{coord} on {op.get_name()} has {len(free_symbols)} free "
-                    "symbols; expected exactly one loop var."
-                )
-            loop_var = next(iter(free_symbols))
-        hints.append(
-            DimHint(
-                dim_names=["_coarse_tile"],
-                split_count=axis.count,
-                loop_var=loop_var,
-                is_reduction=axis.is_reduction,
-                hint_id=hint_id,
-            )
+    loop_vars, reason = try_resolve_tile_axis_loop_vars(op, spec)
+    if loop_vars is None:
+        raise Unsupported(reason)
+    return [
+        DimHint(
+            dim_names=["_coarse_tile"],
+            split_count=axis.count,
+            loop_var=loop_var,
+            is_reduction=axis.is_reduction,
+            hint_id=hint_id,
         )
-    return hints
+        for axis, loop_var, hint_id in zip(spec.axes, loop_vars, hint_ids)
+    ]
 
 
 @dataclasses.dataclass(frozen=True)
