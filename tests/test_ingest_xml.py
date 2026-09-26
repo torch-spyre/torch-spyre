@@ -166,6 +166,13 @@ FULL_PROVENANCE = {
     "spyre-comms": {"commit": "bbb222", "branch": "main"},
 }
 
+RPM_PROVENANCE = {
+    "torch-spyre": {"commit": "abc1234", "branch": "main", "version": None},
+    "flex/ibm-flex": {"commit": "def5678", "branch": "main"},
+    "deeptools/ibm-deeptools": {"commit": "aaa111", "branch": "master"},
+    "spyre-comms/ibm-spyre-comms": {"commit": "bbb222", "branch": "main"},
+}
+
 
 class _Result:
     def __init__(self, rows):
@@ -340,6 +347,33 @@ def test_full_provenance_is_valid_and_regression_eligible(ingest):
     quality, eligible = ingest.classify_run_quality(json.dumps(FULL_PROVENANCE))
     assert quality == "valid"
     assert eligible == 1
+
+
+def test_rpm_provenance_keys_are_valid_and_regression_eligible(ingest):
+    """Prod version_info uses flex/ibm-flex etc.; must not classify incomplete."""
+    quality, eligible = ingest.classify_run_quality(json.dumps(RPM_PROVENANCE))
+    assert quality == "valid"
+    assert eligible == 1
+
+
+def test_rpm_provenance_missing_commit_is_incomplete(ingest):
+    missing = dict(RPM_PROVENANCE)
+    missing["flex/ibm-flex"] = {"commit": "N/A"}
+    assert ingest.classify_run_quality(json.dumps(missing)) == ("incomplete", 0)
+    empty = dict(RPM_PROVENANCE)
+    empty["deeptools/ibm-deeptools"] = {"commit": ""}
+    assert ingest.classify_run_quality(json.dumps(empty)) == ("incomplete", 0)
+    absent = dict(RPM_PROVENANCE)
+    del absent["spyre-comms/ibm-spyre-comms"]
+    assert ingest.classify_run_quality(json.dumps(absent)) == ("incomplete", 0)
+
+
+def test_bare_bad_commit_falls_through_to_rpm_alias(ingest):
+    """OR semantics: bare N/A must not block a good RPM commit (#4896)."""
+    payload = dict(FULL_PROVENANCE)
+    payload["flex"] = {"commit": "N/A"}
+    payload["flex/ibm-flex"] = {"commit": "def5678"}
+    assert ingest.classify_run_quality(json.dumps(payload)) == ("valid", 1)
 
 
 def test_incomplete_version_info_is_visible_not_regression_eligible(ingest):
