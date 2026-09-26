@@ -469,7 +469,7 @@ class JobPlanStepCompute final : public JobPlanStep {
    *
    * @param program_address The program's FULL device allocation. flex bounds
    * the segment-7 translation to its total_size() (the real Allocate
-   * footprint), never SEGMENT_SIZE.
+   * footprint).
    * @param bind_io_addresses Whether to bind the compute operation with inputs
    * and outputs addresses
    * @param bootstrap_offset Offset within the program allocation where
