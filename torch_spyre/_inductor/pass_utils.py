@@ -2358,7 +2358,6 @@ def compute_restickify_needed(
     out_stl: SpyreTensorLayout,
     out_dep: MemoryDep,
     op: "ComputedBuffer | None" = None,
-    require_exact: bool = False,
 ) -> "tuple[bool, SpyreTensorLayout | None]":
     """Determine whether a restickify is needed for one (in_stl, out_stl) pair.
 
@@ -2372,11 +2371,6 @@ def compute_restickify_needed(
       (False, None)   — stick-compatible: no restickify needed
       (True, stl)     — restickify needed, stl is the target STL for the restickified input
       (True, None)    — restickify needed but infeasible
-
-    require_exact: when true, stick compatibility is insufficient; the input
-    must physically match ``out_stl``.  Fixed-layout consumers use this for
-    cases where the backend representation depends on the complete outer
-    layout, not only on the stick variable (for example a flat-M projection).
     """
     ind_names, _, ind_sizes = indirect_info_from_op(op)
     if in_dep.name in ind_names:
@@ -2413,10 +2407,8 @@ def compute_restickify_needed(
         and len(outer_axes_with_stick_var) > 1
     )
     factorized_layout_mismatch = is_factorized and in_stl != out_stl
-    exact_layout_mismatch = require_exact and in_stl != out_stl
     if (
         not factorized_layout_mismatch
-        and not exact_layout_mismatch
         and in_stick_offset_free
         and stick_compatible([idc, out_idc])
     ):
@@ -2432,11 +2424,9 @@ def compute_restickify_needed(
     if in_stl.device_dtype != DataFormats.SEN169_FP16:
         return True, None
 
-    if factorized_layout_mismatch or exact_layout_mismatch:
+    if factorized_layout_mismatch:
         # A factorized input places the contraction variable on outer axes AND
-        # the stick, while an exact-layout edge has a consumer whose backend
-        # representation depends on the complete physical ordering.  In both
-        # cases stick_compatible would incorrectly accept the input.  out_stl is
+        # the stick; stick_compatible would incorrectly accept it.  out_stl is
         # the concrete fixed-layout target selected by the consumer.
         return True, out_stl
     ic = host_coordinates(in_host, in_dep, ind_sizes, op=op)

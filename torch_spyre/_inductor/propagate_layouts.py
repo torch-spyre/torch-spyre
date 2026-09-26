@@ -14,10 +14,9 @@
 
 
 from collections import Counter
-from typing import NamedTuple
-
 import logging
 import math
+from typing import NamedTuple
 
 import sympy
 import torch
@@ -1155,102 +1154,6 @@ def find_stick_compatible_input_layout(
     )
 
 
-def _flat_dense_projection_x_layout(
-    x: PropArg,
-    y: PropArg,
-    output: FixedLayout,
-    output_dep: MemoryDep,
-    reduction_var: sympy.Symbol,
-    m_size: int,
-    n_size: int,
-) -> SpyreTensorLayout | None:
-    """Return a canonical flat-M layout for a logically 2-D dense projection.
-
-    A fused attention producer can retain a higher-rank contiguous host view
-    such as ``[B, L, H, D]`` even though the projection reads it as the logical
-    matrix ``[B*L, H*D]``.  Preserving those physical outer axes makes the
-    backend encode the shared-weight projection as a BMM, which is much slower
-    than the equivalent flat MM.  Collapse only when the complete access is
-    provably one dense row-major 2-D matrix and the weight is shared (rank 2).
-
-    Genuine BMMs retain a rank-3 output and/or a batched weight and therefore do
-    not enter this path.
-    """
-
-    if (
-        m_size <= 1
-        or n_size <= 1
-        or len(output.size) != 2
-        or len(x.layout.size) <= 2
-        or len(y.layout.size) != 2
-        or x.layouts[0].element_arrangement != ElementArrangement.STANDARD
-        or x.layouts[0].device_dtype != DataFormats.SEN169_FP16
-    ):
-        return None
-
-    x_size = [concretize_expr(size) for size in x.layout.size]
-    x_stride = [concretize_expr(stride) for stride in x.layout.stride]
-    y_size = [concretize_expr(size) for size in y.layout.size]
-    out_size = [concretize_expr(size) for size in output.size]
-    out_stride = [concretize_expr(stride) for stride in output.stride]
-
-    def is_dense_contiguous(size: list[int], stride: list[int]) -> bool:
-        expected = 1
-        for dim_size, dim_stride in zip(reversed(size), reversed(stride)):
-            if dim_size != 1 and dim_stride != expected:
-                return False
-            expected *= dim_size
-        return True
-
-    if not is_dense_contiguous(x_size, x_stride) or not is_dense_contiguous(
-        out_size, out_stride
-    ):
-        return None
-
-    active_x_vars = set(x.dep.index.free_symbols) & set(x.dep.ranges)
-    row_vars = active_x_vars - {reduction_var}
-    if reduction_var not in active_x_vars or len(row_vars) != 1:
-        return None
-    (row_var,) = row_vars
-
-    row_size = concretize_expr(x.dep.ranges[row_var])
-    reduction_size = concretize_expr(x.dep.ranges[reduction_var])
-    active_out_vars = set(output_dep.index.free_symbols) & set(output_dep.ranges)
-    generated_vars = active_out_vars - {row_var}
-    if row_var not in active_out_vars or len(generated_vars) != 1:
-        return None
-    (generated_var,) = generated_vars
-    generated_size = concretize_expr(output_dep.ranges[generated_var])
-
-    if (
-        row_size != m_size
-        or generated_size != n_size
-        or math.prod(x_size) != row_size * reduction_size
-        or math.prod(y_size) != reduction_size * generated_size
-        or math.prod(out_size) != m_size * n_size
-        or row_var in y.dep.index.free_symbols
-        or {reduction_var, generated_var}
-        != (set(y.dep.index.free_symbols) & set(y.dep.ranges))
-    ):
-        return None
-
-    expected_index = reduction_size * row_var + reduction_var
-    expected_output_index = generated_size * row_var + generated_var
-    if (
-        sympy.simplify(x.dep.index - expected_index) != 0
-        or sympy.simplify(output_dep.index - expected_output_index) != 0
-    ):
-        return None
-
-    return SpyreTensorLayout(
-        [row_size, reduction_size],
-        [reduction_size, 1],
-        x.layout.dtype,
-        [0, 1],
-        ElementArrangement.STANDARD,
-    )
-
-
 def _matmul_layouts(
     op: Operation,
     output: FixedLayout,
@@ -1325,8 +1228,6 @@ def _matmul_layouts(
     reduction_var = find_reduction_var((x.dep,), output_dep)
     n_size = get_matmul_n_size(op)
     m_size = get_matmul_m_size(op)
-    exact_input_indices: set[int] = set()
-
     if n_size == 1:
         # N has no loop symbol after size-one simplification, so there is no
         # generated_var to discover.  Build an explicit sparse-stick layout for y
@@ -1385,13 +1286,13 @@ def _matmul_layouts(
         out_dims = len(output.size)
         out_stick_dim = _out_stick_dim
 
-    if data.reduction_type == BATCH_MATMUL_OP:
-        flat_x_stl = _flat_dense_projection_x_layout(
-            x, y, output, output_dep, reduction_var, m_size, n_size
-        )
-        if flat_x_stl is not None:
-            x_req_stl = flat_x_stl
-            exact_input_indices.add(0)
+    # TODO: remove — NDO handles flat-M reshaping post-beam; stick is unchanged
+    # if data.reduction_type == BATCH_MATMUL_OP:
+    #     flat_x_stl = flat_dense_projection_x_layout(
+    #         x, y, output, output_dep, reduction_var, m_size, n_size
+    #     )
+    #     if flat_x_stl is not None:
+    #         x_req_stl = flat_x_stl
 
     out_dim_order = list(range(out_dims - 2))
     if out_stick_dim == out_dims - 1:
@@ -1410,7 +1311,6 @@ def _matmul_layouts(
         [x_req_stl, y_req_stl],
         op,
         output_dep,
-        exact_input_indices=exact_input_indices,
     )
     return [out_stl]
 
