@@ -1478,7 +1478,7 @@ echo ""
 # ---------------------------------------------------------------------------
 
 _XML_INJECT_PY='
-import sys, re, json, os
+import sys, re, json, os, fnmatch
 import xml.etree.ElementTree as ET
 from pathlib import Path
 try:
@@ -1534,6 +1534,18 @@ for fe in suite_cfg.get("files", []):
             if name:
                 tag_map.setdefault(name, set()).update(tags)
 
+# YAML names are literal, regex (LxPlanning.*) or glob (*TestModule*). The XML name
+# carries variant suffixes, so a method pattern need only match its start.
+def _matches(pattern, value, prefix=False):
+    if value.startswith(pattern) if prefix else value == pattern:
+        return True
+    if fnmatch.fnmatchcase(value, pattern + "*" if prefix else pattern):
+        return True
+    try:
+        return bool((re.match if prefix else re.fullmatch)(pattern, value))
+    except re.error:
+        return False
+
 def _all_tags(classname, testname):
     # Sidecar has the full merged tag list -- use it when available.
     if testname in _sidecar:
@@ -1545,11 +1557,9 @@ def _all_tags(classname, testname):
             yaml_class, yaml_method = yaml_name.split("::", 1)
         else:
             yaml_class, yaml_method = "", yaml_name
-        if ((yaml_class and yaml_method
-                and yaml_class in classname
-                and testname.startswith(yaml_method))
-                or (yaml_method and not yaml_class
-                    and testname.startswith(yaml_method))):
+        if yaml_method and _matches(yaml_method, testname, prefix=True) and (
+                not yaml_class or yaml_class in classname
+                or any(_matches(yaml_class, part) for part in classname.split("."))):
             matched.update(tags)
     return sorted(matched)
 
