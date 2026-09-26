@@ -7070,6 +7070,43 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         assert out.shape == (T, E)
         torch.testing.assert_close(out_c.float(), ref.float(), atol=1e-2, rtol=1e-2)
 
+    @inductor_config.patch(
+        {
+            "lx_planning": True,
+            "co_optimizing_lx_planning": True,
+            "layout_solver": "cpsat",
+        }
+    )
+    def test_keep_by_index_expand_bmm_layout(self):
+        """Keep-by-index layout remains compatible through expand into BMM."""
+        T, E, K, stick_size = 64, 64, 8, 64
+
+        torch.manual_seed(0)
+        probabilities = torch.softmax(torch.randn(T, E, dtype=torch.bfloat16), dim=-1)
+        _, indices = torch.topk(probabilities, K, dim=-1)
+        identity = torch.eye(stick_size, dtype=torch.bfloat16)
+
+        expected_route = torch.zeros_like(probabilities).scatter(
+            -1, indices, probabilities.gather(-1, indices)
+        )
+        expected = (
+            torch.relu(expected_route.unsqueeze(-1).expand(-1, -1, stick_size))
+            @ identity
+        )[..., :1]
+
+        def keep_and_pack(values, selected, eye):
+            route = torch.ops.spyre.keep_by_index(values, selected, -1, 0.0)
+            packed = torch.relu(route.unsqueeze(-1).expand(-1, -1, stick_size))
+            return (packed @ eye)[..., :1]
+
+        actual = torch.compile(keep_and_pack, dynamic=False, fullgraph=True)(
+            probabilities.to("spyre"),
+            indices.to(torch.int32).to("spyre"),
+            identity.to("spyre"),
+        ).cpu()
+
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
     def test_topk_keep_by_index_moe_router(self):
         T, E, K = 64, 128, 8
 

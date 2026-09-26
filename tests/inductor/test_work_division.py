@@ -55,6 +55,7 @@ from torch_spyre._inductor.scratchpad.allocator import (
     CoOptimizingAllocator,
     CoreDivision,
     ScratchpadAllocator,
+    _fused_layout_group_ops,
 )
 from torch_spyre._inductor.scratchpad.greedy_solver import GreedyLayoutSolver
 from torch_spyre._inductor.scratchpad.plan_solver import (
@@ -2260,6 +2261,64 @@ class TestCloneDivisionMatching(unittest.TestCase):
             [cd.splits for cd in divs], [{_isym("x"): split} for split in (4, 2)]
         )
         self.assertEqual(matches, {"consumer": [(0, 0), (1, 2)]})
+
+
+class TestFusedLayoutGroupOps(unittest.TestCase):
+    @staticmethod
+    def _op(name, data, reads=()):
+        op = MagicMock(spec=ComputedBuffer)
+        op.name = name
+        op.data = data
+        op._test_reads = [MemoryDep(parent, 0, (), ()) for parent in reads]
+        return op
+
+    def _groups(self, ops, seed_reasons):
+        graph = MagicMock(operations=ops)
+        with patch(
+            "torch_spyre._inductor.scratchpad.allocator.op_read_writes",
+            side_effect=lambda op: MagicMock(reads=op._test_reads),
+        ):
+            return _fused_layout_group_ops(graph, seed_reasons)
+
+    def test_keep_by_index_reaches_first_sensitive_consumer(self):
+        from torch_spyre._inductor.constants import (
+            BATCH_MATMUL_OP,
+            KEEP_BY_INDEX_OP,
+        )
+
+        keep_data = MagicMock(spec=Reduction)
+        keep_data.reduction_type = KEEP_BY_INDEX_OP
+        bmm_data = MagicMock(spec=Reduction)
+        bmm_data.reduction_type = BATCH_MATMUL_OP
+        keep = self._op("keep", keep_data)
+        bridge = self._op("bridge", MagicMock(spec=Pointwise), ("keep",))
+        identity = self._op("identity", MagicMock(spec=Pointwise), ("bridge",))
+        bmm = self._op("bmm", bmm_data, ("identity", "weight"))
+        tail = self._op("tail", MagicMock(spec=Pointwise), ("bmm",))
+
+        groups = self._groups(
+            [keep, bridge, identity, bmm, tail],
+            {KEEP_BY_INDEX_OP: "keep_by_index layout group"},
+        )
+
+        self.assertEqual(set(groups), {"keep", "bridge", "identity", "bmm"})
+
+    def test_keep_by_index_stops_at_multi_input_pointwise(self):
+        from torch_spyre._inductor.constants import KEEP_BY_INDEX_OP
+
+        keep_data = MagicMock(spec=Reduction)
+        keep_data.reduction_type = KEEP_BY_INDEX_OP
+        keep = self._op("keep", keep_data)
+        bridge = self._op("bridge", MagicMock(spec=Pointwise), ("keep",))
+        add = self._op("add", MagicMock(spec=Pointwise), ("bridge", "other"))
+        tail = self._op("tail", MagicMock(spec=Pointwise), ("add",))
+
+        groups = self._groups(
+            [keep, bridge, add, tail],
+            {KEEP_BY_INDEX_OP: "keep_by_index layout group"},
+        )
+
+        self.assertEqual(set(groups), {"keep", "bridge", "add"})
 
 
 class TestCoOptimizingAllocator(unittest.TestCase):
