@@ -896,8 +896,12 @@ def parse_test_xml(xml_path: Path):
     except ValueError:
         triggered_at = datetime.now(UTC)
 
-    raw_cases = []
+    # One row per exact (classname, name); a repeat is a re-run, so the last attempt wins.
+    by_key = {}
     for tc in suite.findall(".//testcase"):
+        by_key[(tc.get("classname", ""), tc.get("name", ""))] = tc
+    raw_cases = []
+    for tc in by_key.values():
         status, fail_msg = classify_testcase(tc)
         properties = extract_properties(tc)
         op_name, dtype, platform = extract_op_dtype_platform(
