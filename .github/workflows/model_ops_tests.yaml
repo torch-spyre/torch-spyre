@@ -116,6 +116,8 @@ jobs:
             config: granite-3.3-8b-instruct.yaml
           - name: Granite 4.1 8B
             config: granite-4.1-8b.yaml
+          - name: Granite Embedding 278M Multilingual
+            config: granite-embedding-278m-multilingual.yaml
           - name: Meta Llama 3.1 8B Instruct
             config: Meta-Llama-3.1-8B-Instruct.yaml
           - name: Ministral 3 14B Instruct 2512
@@ -128,6 +130,7 @@ jobs:
             config: gemma-4-12B-it.yaml
           - name: Qwen 2.5
             config: Qwen2.5-7B-Instruct.yaml
+
 
     steps:
       # Sparse checkout into the GHA workspace so the local composite
