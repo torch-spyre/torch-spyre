@@ -159,6 +159,9 @@ void SpyreTensorLayout::init(std::vector<int64_t> host_size,
       stringToDTDataFormatPair(str_type);
   this->device_dtype = sen_dtype_dev;
 
+  TORCH_CHECK(is_supported_dtype(dtype),
+              "Spyre backend does not support dtype ", dtype);
+
   if (host_size.size() == 0) {
     // Degenerate case of 0-dimension tensor (ie, a scalar)
     this->device_size.resize(2);
