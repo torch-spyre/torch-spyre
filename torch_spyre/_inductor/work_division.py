@@ -445,7 +445,15 @@ def adjust_it_space_for_sticks(
                 f"(tensor {td.dep.name}); symbolic dims must be non-stick "
                 f"(e.g. the leading batch dim)."
             )
-        elems_per_stick = td.layout.device_layout.elems_per_stick()
+        output_ea = tensor_deps[-1].layout.device_layout.element_arrangement
+        if output_ea == ElementArrangement.DL16_TO_FP32:
+            # DL16_TO_FP32 tensors use paired FP32 sticks (64 elements).
+            # This override is only required for DL16_TO_FP32 -> DL16_TO_FP32
+            # pointwise operations, where all participating tensors are FP32 and
+            # would otherwise contribute elems_per_stick() == 32.
+            elems_per_stick = 32 * 2
+        else:
+            elems_per_stick = td.layout.device_layout.elems_per_stick()
         if stick_var not in max_elems or elems_per_stick > max_elems[stick_var]:
             max_elems[stick_var] = elems_per_stick
 

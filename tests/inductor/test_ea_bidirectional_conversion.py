@@ -24,6 +24,8 @@ Tests all 4 conversion cases:
 4. FP32→FP16 with DL16_TO_FP32 → STANDARD
 """
 
+import math
+
 import pytest
 import torch
 from torch_spyre._C import ElementArrangement, get_spyre_tensor_layout
@@ -193,14 +195,33 @@ def test_fp32_to_fp16_restoration(device, fp16):
     print("✓ FP32→FP16 restoration (DL16_TO_FP32 → STANDARD) works")
 
 
+# Shapes used by both bidirectional roundtrip tests.
+# [4, 128]: stick-aligned (128 = 2 fp16 sticks of 64).
+# [4, 96]:  sub-stick (96 = 1.5 fp16 sticks; last stick is partially filled).
+# [5, 4, 96]:  sub-stick (96 = 1.5 fp16 sticks; last stick is partially filled).
+# [2, 3, 5] and [2, 3, 1]: extents inside the first half-stick, where the live
+# elements fit one FP32 stick but the stagger still reaches the pair, so the
+# widening conversion's capacity comes from insert_staggered_ea_padding rather
+# than from the extent itself.  [2, 3, 1] also exercises the sentinel stick dim.
+_ROUNDTRIP_SHAPES = [
+    pytest.param((4, 128), id="aligned_4x128"),
+    pytest.param((4, 96), id="substick_4x96"),
+    pytest.param((5, 4, 96), id="substick_5x4x96"),
+    pytest.param((2, 3, 5), id="substick_2x3x5"),
+    pytest.param((2, 3, 1), id="substick_2x3x1"),
+]
+
+
 @pytest.mark.parametrize("device", ["spyre"])
+@pytest.mark.parametrize("shape", _ROUNDTRIP_SHAPES)
 @pytest.mark.parametrize(
     "fp16",
     DtypeOpTable.fp16_types(),
     ids=lambda dt: str(dt).replace("torch.", ""),
 )
-def test_bidirectional_roundtrip_fp16_start(device, fp16):
-    """Test FP16→FP32→FP16 roundtrip."""
+def test_bidirectional_roundtrip_fp16_start(device, shape, fp16):
+    """Test FP16→FP32→FP16 roundtrip for stick-aligned and sub-stick shapes."""
+    torch._dynamo.reset()
 
     @torch.compile
     def fn(x):
@@ -208,7 +229,7 @@ def test_bidirectional_roundtrip_fp16_start(device, fp16):
         x_fp32 = x.to(torch.float32)
         return x_fp32.to(dtype=fp16)
 
-    x = torch.randn(4, 128, device=device, dtype=fp16)
+    x = torch.randn(shape, device=device, dtype=fp16)
     result = fn(x)
 
     # Verify final EA is STANDARD
@@ -221,13 +242,15 @@ def test_bidirectional_roundtrip_fp16_start(device, fp16):
 
 
 @pytest.mark.parametrize("device", ["spyre"])
+@pytest.mark.parametrize("shape", _ROUNDTRIP_SHAPES)
 @pytest.mark.parametrize(
     "fp16",
     DtypeOpTable.fp16_types(),
     ids=lambda dt: str(dt).replace("torch.", ""),
 )
-def test_bidirectional_roundtrip_fp32_start(device, fp16):
-    """Test FP32→FP16→FP32 roundtrip."""
+def test_bidirectional_roundtrip_fp32_start(device, shape, fp16):
+    """Test FP32→FP16→FP32 roundtrip for stick-aligned and sub-stick shapes."""
+    torch._dynamo.reset()
 
     @torch.compile
     def fn(x):
@@ -235,7 +258,7 @@ def test_bidirectional_roundtrip_fp32_start(device, fp16):
         x_fp16 = x.to(dtype=fp16)
         return x_fp16.to(torch.float32)
 
-    x = torch.randn(4, 128, device=device, dtype=torch.float32)
+    x = torch.randn(shape, device=device, dtype=torch.float32)
     result = fn(x)
 
     # Verify final EA is STANDARD
@@ -245,6 +268,93 @@ def test_bidirectional_roundtrip_fp32_start(device, fp16):
     assert_val(fn, x, result)
 
     print("✓ FP32→FP16→FP32 roundtrip works")
+
+
+# A staggered FP32 value spans two sticks per FP16 stick, so an extent that is
+# not a whole FP16 stick leaves the second one partly live.  Cover the sub-stick
+# extents (below one FP16 stick) and the half-stick multiples, where the wide
+# side needs an odd number of FP32 sticks rounded up to the pair.
+_CONSUMED_WIDE_EXTENTS = [1, 5, 31, 32, 33, 63, 96]
+
+
+@pytest.mark.parametrize("device", ["spyre"])
+@pytest.mark.parametrize("extent", _CONSUMED_WIDE_EXTENTS, ids=lambda n: f"n{n}")
+@pytest.mark.parametrize(
+    "fp16",
+    DtypeOpTable.fp16_types(),
+    ids=lambda dt: str(dt).replace("torch.", ""),
+)
+def test_consumed_wide_value_keeps_both_staggered_sticks(device, extent, fp16):
+    """A consumer between two conversions covers both sticks of a staggered pair.
+
+    Unlike the roundtrips above, the wide value is read by an op rather than
+    converted straight back, so the pair of FP32 sticks holding one FP16 stick
+    has to survive into that op's own iteration.  An op reaching only the first
+    stick drops half the elements, interleaved through the extent rather than
+    left in a tail, which a bare roundtrip cannot show: with nothing consuming
+    the wide value the pair of casts folds to an identity and no conversion
+    reaches the device at all.
+    """
+    torch._dynamo.reset()
+
+    def fn(x):
+        return (x.to(torch.float32) * 2.0).to(dtype=fp16)
+
+    x = torch.randn(2, 3, extent, device=device, dtype=fp16)
+    result = torch.compile(fn)(x)
+
+    assert_ea(result, ElementArrangement.STANDARD)
+    assert_val(fn, x, result)
+
+
+# Extents a single FP16 stick holds but a single FP32 stick does not, bracketed by
+# the ones on either side that fit (32) or fill (64) the FP16 stick.
+_NARROWED_EXTENTS = [5, 32, 33, 48, 63, 64, 96]
+
+
+def _narrow_then_widen_eager(x, fp16):
+    return x.to(dtype=fp16).to(torch.float32)
+
+
+def _narrow_consume_widen(x, fp16):
+    return (x.to(dtype=fp16) * 2.0).to(torch.float32)
+
+
+@pytest.mark.parametrize("device", ["spyre"])
+@pytest.mark.parametrize("shape_prefix", [(4,), (2, 3)], ids=["4xn", "2x3xn"])
+@pytest.mark.parametrize("extent", _NARROWED_EXTENTS, ids=lambda n: f"n{n}")
+@pytest.mark.parametrize(
+    "fn, mode",
+    [
+        pytest.param(_narrow_then_widen_eager, "eager", id="eager"),
+        pytest.param(_narrow_consume_widen, "compile", id="compile_consumed"),
+    ],
+)
+@pytest.mark.parametrize(
+    "fp16",
+    DtypeOpTable.fp16_types(),
+    ids=lambda dt: str(dt).replace("torch.", ""),
+)
+def test_narrowed_value_widens_into_every_fp32_stick(
+    device, shape_prefix, extent, fn, mode, fp16
+):
+    """Widening a narrowed value returns the elements past the first FP32 stick.
+
+    An FP16 stick holding more than 32 elements widens into two FP32 sticks, both
+    holding host elements, so the STANDARD result has to map the second one to
+    the host rather than leave it as unaddressed capacity.  Eager casts run as
+    separate conversions, and a compiled pair needs an op between them to reach
+    the device at all.  The values are integers exact in every format involved,
+    so a dropped element shows as a mismatch instead of hiding in the tolerance.
+    """
+    torch._dynamo.reset()
+    shape = (*shape_prefix, extent)
+    host = (torch.arange(math.prod(shape)) % 257).reshape(shape).to(torch.float32)
+
+    result = _run(fn, host.to(device), fp16, mode=mode)
+
+    assert_ea(result, ElementArrangement.STANDARD)
+    torch.testing.assert_close(result.cpu(), fn(host, fp16), rtol=0, atol=0)
 
 
 def _stagger_fn(x, fp16):

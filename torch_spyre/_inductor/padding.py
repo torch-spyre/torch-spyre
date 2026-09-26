@@ -63,16 +63,18 @@ from torch._inductor.ir import (
     Operation,
     Pointwise,
     Reduction,
+    StorageBox,
     TensorBox,
 )
 from torch._inductor.ops_handler import WrapperHandler
 from torch._inductor.virtualized import V
 
-from .constants import BATCH_MATMUL_FP8_OP, BATCH_MATMUL_OP
+from .constants import BATCH_MATMUL_FP8_OP, BATCH_MATMUL_OP, STAGGERED_EAS
 from .errors import Unsupported
 from .ir import FixedTiledLayout
 from .logging_utils import get_inductor_logger
 from .pass_utils import (
+    access_stick_dims,
     concretize_expr,
     concretize_index,
     find_reduction_var,
@@ -85,7 +87,12 @@ from .pass_utils import (
     replace_computed_buffer_body,
 )
 from .views import compute_coordinates
-from torch_spyre._C import SpyreTensorLayout, get_elem_in_stick
+from torch_spyre._C import (
+    DataFormats,
+    ElementArrangement,
+    SpyreTensorLayout,
+    get_elem_in_stick,
+)
 
 logger = get_inductor_logger("padding")
 
@@ -559,6 +566,40 @@ def _pad_device_dim(
     )
 
 
+def _grow_num_sticks(
+    layout: FixedTiledLayout, num_sticks_dim: int, new_num_sticks: int
+) -> FixedTiledLayout:
+    """Grow ``layout`` to ``new_num_sticks`` sticks of capacity along its stick dim.
+
+    A num-sticks dim that already spans several sticks is sized up in place: the
+    stick variable's count lands on it, so its step stays live.
+
+    A single stick has no count dim to grow.  Its num-sticks dim steps the same
+    host distance as the dim outside it -- a row shorter than a stick puts the next
+    row less than a stick away -- and several outer dims may equally have
+    coordinate 0.  The capacity therefore comes from a prepended outermost gap dim
+    with ``stride_map`` -1, the device ``_pad_elided_dim`` uses: it names no host
+    step, so the runtime's unique-step rule never sees it, and being outermost it
+    is unambiguous to codegen, which binds the stick variable's count to it before
+    alignment (``_restore_stick_pair_dim`` in spyre_kernel).
+    """
+    stl = layout.device_layout
+    if stl.device_size[num_sticks_dim] != 1:
+        return _pad_device_dim(layout, num_sticks_dim, new_num_sticks)
+    return FixedTiledLayout(
+        layout.device,
+        layout.dtype,
+        [concretize_expr(s) for s in layout.size],
+        [concretize_expr(s) for s in layout.stride],
+        SpyreTensorLayout(
+            [new_num_sticks, *stl.device_size],
+            [-1, *stl.stride_map],
+            stl.device_dtype,
+            stl.element_arrangement,
+        ),
+    )
+
+
 def _pad_elided_dim(buf: ComputedBuffer) -> None:
     """Pad ``buf``'s allocation by prepending an outermost size-64 gap dim, for a
     restickify whose transposed dim was elided to a size-1 device dim.
@@ -798,6 +839,62 @@ def _restickify_input_required_extent(coord, ranges, stick_sym, dtype) -> int:
     return concretize_expr(max_slice_start) + round_up_to_stick(stick_extent, dtype)
 
 
+def _staggered_ea(op: Operation) -> ElementArrangement | None:
+    """The staggered arrangement ``op``'s output carries, or ``None`` for neither.
+
+    A buffer carries ``DL16_TO_FP32`` while it holds a value on the FP32 side of a
+    widening conversion, which includes pointwise ops downstream of the conversion
+    itself, and ``FP32_TO_DL16`` when it feeds a narrowing one.  The two need
+    padding on opposite sides, so callers dispatch on which one comes back.
+    """
+    if not isinstance(op, ComputedBuffer):
+        return None
+    out_layout = op.get_layout()
+    if not isinstance(out_layout, FixedTiledLayout):
+        return None
+    ea = out_layout.device_layout.element_arrangement
+    return ea if ea in STAGGERED_EAS else None
+
+
+def _widens_to_the_fp32_grid(op: Operation, graph: GraphLowering) -> bool:
+    """Whether ``op`` converts a value from the FP16 stick grid onto the FP32 one.
+
+    Identified by comparing the stick depth of the single value ``op`` reads
+    against the depth it writes, rather than by the arrangement its output
+    carries.  A widening conversion's output may come back ``STANDARD``, holding
+    densely packed FP32 elements, yet codegen still iterates the coarser FP16
+    grid for it: ``iterates_on_the_fp16_grid`` in op_spec names both conversions
+    outright for exactly this reason.  Keying on the arrangement here would leave
+    such an output a stick short of what that iteration writes.
+    """
+    if not isinstance(op, ComputedBuffer):
+        return False
+    out_layout = op.get_layout()
+    if not isinstance(out_layout, FixedTiledLayout):
+        return False
+
+    # A conversion is unary: one value in, one out.
+    reads = [r for r in op.get_read_writes().reads if hasattr(r, "name")]
+    if len(reads) != 1:
+        return False
+
+    in_buf = graph.get_buffer(reads[0].name)
+    if isinstance(in_buf, TensorBox):
+        in_buf = in_buf.data
+    if isinstance(in_buf, StorageBox):
+        in_buf = in_buf.data
+    if not isinstance(in_buf, Buffer):
+        return False
+    in_layout = in_buf.get_layout()
+    if not isinstance(in_layout, FixedTiledLayout):
+        return False
+
+    return (
+        in_layout.device_layout.device_size[-1]
+        > out_layout.device_layout.device_size[-1]
+    )
+
+
 def _assert_input_paddable(
     op: ComputedBuffer, in_dep, in_layout, out_stick_sym
 ) -> None:
@@ -1031,6 +1128,164 @@ def _pad_restickify_input(op: Operation, graph: GraphLowering) -> None:
     )
 
 
+def _pad_fp32_to_dl16_input(op: Operation, graph: GraphLowering) -> None:
+    """Expand odd fp32 input stick counts to the next even count for FP32->FP16 conversion.
+    When converting fp32 sticks (32 elems/stick) into fp16 sticks (64 elems/stick),
+    an odd number of fp32 sticks produces a partially filled fp16 stick (Issue #3999).
+    For example:
+
+    3 fp32 sticks (96 elements)
+      ->
+    2 fp16 sticks (96 elements in 128-element capacity)
+
+    To match the output capacity, the fp32 input must be expanded as well, from
+    3 fp32 sticks (96 elements) to 4 fp32 sticks (96 elements in 128-element capacity).
+
+
+    Only the device layout changes, and the host size stays put: the input's
+    num-sticks dim, found from its coordinates by ``stick_dims``, grows, or a
+    gap dim is prepended when it holds one stick (``_grow_num_sticks``).
+    """
+    assert isinstance(op, ComputedBuffer)
+    out_layout = op.get_layout()
+    assert isinstance(out_layout, FixedTiledLayout)
+    out_stl = out_layout.device_layout
+
+    # fp32-to-fp16 conversion is expected to be a unary op: it reads exactly one input buffer.
+    reads = [r for r in op.get_read_writes().reads if hasattr(r, "name")]
+    if len(reads) != 1:
+        return
+
+    in_dep = reads[0]
+    raw_buf = graph.get_buffer(in_dep.name)
+    assert raw_buf is not None, in_dep.name
+    # Resolve the underlying buffer that owns the layout.
+    if isinstance(raw_buf, TensorBox):
+        # TensorBox -> StorageBox -> InputBuffer
+        inner = raw_buf.data
+        if isinstance(inner, StorageBox):
+            inner = inner.data
+        assert isinstance(inner, Buffer), type(inner)
+        in_buf: Buffer = inner
+    elif isinstance(raw_buf, ComputedBuffer):
+        in_buf = raw_buf
+    else:
+        return
+
+    if not isinstance(in_buf, ComputedBuffer):
+        # A graph input has no producer output to pad: insert an identity clone
+        # ahead of the type conversion, move it into place, redirect the read to it,
+        # then pad the clone.
+        device = in_buf.get_device()
+        in_layout = in_buf.get_layout()
+        if device is None:
+            return
+        in_fx_node = _find_arg_fx_node(in_dep.name)
+        if in_fx_node is None:
+            raise RuntimeError(f"no FX node found for buffer {in_dep.name!r}")
+        clone_buf, new_ops = lower_identity_clone(
+            in_fx_node,
+            host_size=[concretize_expr(s) for s in in_layout.size],
+            host_stride=[concretize_expr(s) for s in in_layout.stride],
+            device=device,
+            dtype=in_layout.dtype,
+            orig_stl=in_layout.device_layout,
+            insert_before=next(iter(op.origins)),
+        )
+        _move_ops_before(graph.operations, new_ops, op)
+        redirect_computed_buffer_reads(
+            op,
+            {in_dep.name: clone_buf.get_name()},
+            graph.operations,
+            pass_name="insert_staggered_ea_padding",
+            reason="redirect consumer to padded input",
+        )
+        in_buf = clone_buf
+
+    in_layout = in_buf.get_layout()
+    if not isinstance(in_layout, FixedTiledLayout):
+        return
+
+    in_stl = in_layout.device_layout
+    in_dims = access_stick_dims(in_stl, in_layout, in_dep)
+    out_dims = access_stick_dims(out_stl, out_layout, _write_dep(op))
+    if in_dims is None or out_dims is None:
+        return
+
+    in_eps = in_stl.device_size[-1]  # 32 for fp32
+    # The output stick depth is the coarser of the two grids for this conversion,
+    # which is what the round-up must be taken against (issue #3999). A
+    # conversion whose output is the finer grid would have to read the input's
+    # depth instead; this pass is gated on FP32_TO_DL16, so it never is.
+    out_eps = out_stl.device_size[-1]  # 64 for fp16
+    out_num_sticks = out_stl.device_size[out_dims.num_sticks]
+
+    # Input capacity that the output's sticks span. The output num-sticks count
+    # is already rounded up, so this covers the padding stick.
+    required_in_num_sticks = -(-out_num_sticks * out_eps // in_eps)
+    current_in_num_sticks = in_stl.device_size[in_dims.num_sticks]
+
+    if current_in_num_sticks >= required_in_num_sticks:
+        return
+
+    in_buf.layout = _grow_num_sticks(
+        in_layout, in_dims.num_sticks, required_in_num_sticks
+    )
+
+
+def _pad_staggered_fp32_buffer(op: Operation) -> None:
+    """Grow a staggered FP32 buffer to both sticks of the pair its elements span.
+
+    Widening FP16 to FP32 staggers one 64-element FP16 stick across a *pair* of
+    32-slot FP32 sticks, so every buffer holding such a value spans two sticks as
+    soon as its stick-dim extent passes the first 32 slots.  That is true of the
+    conversion's own output and equally of any pointwise op downstream that keeps
+    the arrangement: the op is ordinary by name and dtype, but its elements are
+    still split across the pair, so it needs the same capacity.  The conversion
+    output needs the pair even when it comes back ``STANDARD``, because codegen
+    iterates the coarse FP16 grid for the conversion whatever its output
+    arrangement says.
+
+    ``rescale_stl_for_dtype`` sizes an output by the sticks its live elements
+    occupy, which is the first stick alone whenever the extent is under half a
+    stick, so the room for the rest of the pair is added here.
+
+    Only the device layout changes, and the host size stays put: the num-sticks
+    dim, found from the op's write coordinates by ``stick_dims``, grows, or a gap
+    dim is prepended when it holds one stick (``_grow_num_sticks``).
+    """
+    assert isinstance(op, ComputedBuffer)
+    layout = op.get_layout()
+    assert isinstance(layout, FixedTiledLayout)
+    stl = layout.device_layout
+
+    dims = access_stick_dims(stl, layout, _write_dep(op))
+    if dims is None:
+        return
+    sticks_dim = dims.num_sticks
+    out_eps = stl.device_size[-1]
+    # The stagger is defined against the FP16 grid: the pair holds one FP16 stick.
+    coarse_eps = DataFormats.SEN169_FP16.elems_per_stick()
+    if out_eps >= coarse_eps:
+        return
+    sticks_per_pair = -(-coarse_eps // out_eps)
+
+    current_num_sticks = stl.device_size[sticks_dim]
+    required_num_sticks = -(-current_num_sticks // sticks_per_pair) * sticks_per_pair
+    if current_num_sticks >= required_num_sticks:
+        return
+
+    op.layout = _grow_num_sticks(layout, sticks_dim, required_num_sticks)
+
+    logger.debug(
+        "insert_staggered_ea_padding: padded %s device dim %d %d -> %d",
+        op.get_name(),
+        sticks_dim,
+        current_num_sticks,
+        required_num_sticks,
+    )
+
+
 def insert_restickify_padding(graph: GraphLowering) -> None:
     """Pad a restickify's buffers so both are stick-aligned.
 
@@ -1065,3 +1320,38 @@ def insert_restickify_padding(graph: GraphLowering) -> None:
         if is_restickify_op(op, graph):
             _pad_restickify_output(op, graph)
             _pad_restickify_input(op, graph)
+
+
+def insert_staggered_ea_padding(graph: GraphLowering) -> None:
+    """Give a conversion between the FP16 and FP32 stick grids the capacity it needs.
+
+    One FP16 stick's elements stagger across a pair of FP32 sticks, so a conversion
+    either way has to reach both halves of that pair even when the live elements
+    fill only part of it.  ``rescale_stl_for_dtype`` sizes an output by the sticks
+    those live elements occupy, so the extra capacity is added here, on the one
+    buffer that needs it, rather than propagated into every downstream consumer.
+
+    The buffer that needs room is always the one on the finer FP32 grid, which
+    differs by direction:
+
+    - Narrowing (``_pad_fp32_to_dl16_input``): the conversion's input, reached from
+      the ``FP32_TO_DL16`` output that consumes it.
+    - Widening (``_pad_staggered_fp32_buffer``): the buffer itself.  Two kinds need
+      it.  A widening conversion is recognized by the grids it spans
+      (``_widens_to_the_fp32_grid``) because its output may be ``STANDARD`` while
+      codegen still iterates the coarse FP16 grid for it.  A pointwise op
+      downstream is recognized by the ``DL16_TO_FP32`` arrangement it carries,
+      which is the only signal its name and dtypes leave.
+
+    Padding touches only ``device_size``, never the host size or ``stride_map``, so
+    later passes see the tensor unchanged and codegen's backGap path covers the
+    resulting gap.
+    """
+    for op in list(graph.operations):
+        ea = _staggered_ea(op)
+        if ea == ElementArrangement.FP32_TO_DL16:
+            _pad_fp32_to_dl16_input(op, graph)
+        elif ea == ElementArrangement.DL16_TO_FP32 or _widens_to_the_fp32_grid(
+            op, graph
+        ):
+            _pad_staggered_fp32_buffer(op)
