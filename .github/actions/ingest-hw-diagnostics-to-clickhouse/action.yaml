@@ -13,11 +13,15 @@ inputs:
     description: Numeric GitHub Actions run ID of the run whose job logs are analysed.
     required: true
   workflow-name:
-    description: >
-      Name of the triggering workflow, recorded as the run's test tier (a run_id hash
-      input) -- e.g. 'tests'.
+    description: Name of the triggering workflow, e.g. 'tests'. The tier when trigger-type is empty.
     required: false
     default: tests
+  trigger-type:
+    description: >
+      Test tier of the analysed run, a run_id hash input: pass the value the case ingest used,
+      so the two writers derive one id. Empty falls back to workflow-name.
+    required: false
+    default: ''
   run-url:
     description: URL of the analysed run. Empty computes it from repository + gha-run-id.
     required: false
@@ -42,7 +46,9 @@ inputs:
     required: false
     default: ''
   artifact-id:
-    description: artifact_id of the image this leg ran, when known.
+    description: >
+      artifact_id of what this leg ran, when known; a derive-gha-artifact-id record
+      ("id|base|installed") is accepted as is.
     required: false
     default: ''
   table:
@@ -246,7 +252,7 @@ runs:
           --arch           "${{ inputs.arch }}" \
           --gha-run-id     "${RUN_ID}" \
           --jenkins-run-key "${{ inputs.jenkins-run-key }}" \
-          --trigger-type   "${{ inputs.workflow-name }}" \
+          --trigger-type   "${{ inputs.trigger-type || inputs.workflow-name }}" \
           --run-url        "${RUN_URL}" \
           --artifact-id    "${{ inputs.artifact-id }}" \
           "${TABLE_ARGS[@]}"
