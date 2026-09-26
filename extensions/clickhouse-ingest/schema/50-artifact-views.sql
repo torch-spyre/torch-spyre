@@ -2,6 +2,30 @@
 -- artifact to the verdicts recorded against it. Apply after 20-artifacts.sql and
 -- 10-functional-tests.sql -- later views select from earlier ones, so file order matters.
 
+-- One row per artifact. The table gets a row on every build, reuse and sources write for the
+-- same id, so joining it raw multiplies every downstream count by that artifact's row count.
+-- Record rows carry run_url/ref but no sources or deps, so those take the latest NON-EMPTY
+-- value, and props merge key-wise with later rows winning.
+CREATE VIEW IF NOT EXISTS v_artifacts AS
+SELECT
+    -- Every source column is qualified: an output alias sharing its name would shadow it.
+    r.artifact_id AS artifact_id,
+    argMax(r.component, r.ts)                                   AS component,
+    argMax(r.arch, r.ts)                                        AS arch,
+    argMax(r.kind, r.ts)                                        AS kind,
+    argMax(r.artifact_name, r.ts)                               AS artifact_name,
+    argMin(r.origin, r.ts)                                      AS origin,
+    argMaxIf(r.identity_deps, r.ts, notEmpty(r.identity_deps))    AS identity_deps,
+    argMaxIf(r.context_deps, r.ts, notEmpty(r.context_deps))      AS context_deps,
+    argMaxIf(r.sources, r.ts, notEmpty(r.sources))                AS sources,
+    arrayFold((acc, x) -> mapUpdate(acc, x.2), arraySort(groupArray((r.ts, r.props))),
+              CAST(map(), 'Map(String, String)')) AS props,
+    min(r.ts)                                                 AS first_ts,
+    max(r.ts)                                                 AS ts,
+    count()                                                 AS writes
+FROM artifacts AS r
+GROUP BY r.artifact_id;
+
 -- Tag -> the artifact it points at NOW, one row per (tag, component, arch). is_rolling is
 -- emergent (ever pointed at more than one artifact), never stored.
 CREATE VIEW IF NOT EXISTS v_tag_resolution AS
@@ -15,7 +39,7 @@ SELECT
     count()                            AS promotion_count,
     uniqExact(t.artifact_id) > 1       AS is_rolling  -- within this (component, arch) slot
 FROM artifact_tags AS t
-INNER JOIN artifacts AS a ON a.artifact_id = t.artifact_id
+INNER JOIN v_artifacts AS a ON a.artifact_id = t.artifact_id
 GROUP BY tag, component, arch;
 
 -- The tag picker: one row per tag, so the UI lists channels without resolving each. arch_list
@@ -30,17 +54,28 @@ SELECT
     max(t.ts)                      AS last_ts,
     count()                        AS promotion_count,
     uniqExact(t.artifact_id)       AS artifact_count,
-    uniqExact(t.component)         AS component_count,
-    arraySort(groupUniqArray(if(t.arch IN ('amd64', 'x86', 'x86-64'), 'x86_64', t.arch))) AS arch_list,
+    uniqExactIf(t.component, t.component != '') AS component_count,
+    arraySort(groupUniqArrayIf(if(t.arch IN ('amd64', 'x86', 'x86-64'), 'x86_64', t.arch),
+                               t.arch != ''))   AS arch_list,
     max(slot_artifacts) > 1        AS is_rolling
 FROM
 (
+    -- ifNull: an unjoined row is NULL under a reader's join_use_nulls=1, and a NULL slot key
+    -- would pool every unjoined row into one slot.
     SELECT at.tag AS tag, at.tag_family AS tag_family, at.artifact_id AS artifact_id,
-           at.ts AS ts, a.component AS component, a.arch AS arch,
-           uniqExact(at.artifact_id) OVER (PARTITION BY at.tag, a.component, a.arch)
+           at.ts AS ts,
+           ifNull(a.component, '') AS component,
+           ifNull(a.arch, '')      AS arch,
+           uniqExact(at.artifact_id) OVER (
+               PARTITION BY at.tag,
+                            -- (component, arch) when joined, else the artifact itself.
+                            if(ifNull(a.component, '') = '',
+                               toString(at.artifact_id),
+                               ifNull(a.component, '')),
+                            ifNull(a.arch, ''))
                AS slot_artifacts
     FROM artifact_tags AS at
-    LEFT JOIN artifacts AS a ON a.artifact_id = at.artifact_id
+    LEFT JOIN v_artifacts AS a ON a.artifact_id = at.artifact_id
 ) AS t
 GROUP BY tag;
 
@@ -83,7 +118,7 @@ SELECT
     -- here for the drill-down, but aggregating callers must exclude it (see v_tier_trend).
     CAST(r.state = 'running' AS UInt8) AS is_advisory
 FROM artifact_results AS r
-LEFT JOIN artifacts AS a ON a.artifact_id = r.artifact_id
+LEFT JOIN v_artifacts AS a ON a.artifact_id = r.artifact_id
 -- LEFT JOIN, not INNER: a run with no case rows must still appear, with total_tests = 0.
 LEFT JOIN (
     -- run_case_counters, not test_case_runs: pre-aggregated, one row per run; sum() is still
@@ -144,9 +179,10 @@ SELECT
     a.origin        AS origin,
     a.props['id12'] AS id12,
     a.sources       AS sources,
-    groupArray(f.ref) AS refs
+    -- artifact_refs is ReplacingMergeTree, so unmerged duplicates read back until a merge.
+    arrayDistinct(groupArray(f.ref)) AS refs
 FROM v_tag_resolution AS tr
-INNER JOIN artifacts AS a ON a.artifact_id = tr.artifact_id
+INNER JOIN v_artifacts AS a ON a.artifact_id = tr.artifact_id
 LEFT JOIN artifact_refs AS f ON f.artifact_id = tr.artifact_id
 GROUP BY tag, tag_family, component, arch, artifact_id, resolved_ts,
          artifact_name, kind, origin, id12, sources;

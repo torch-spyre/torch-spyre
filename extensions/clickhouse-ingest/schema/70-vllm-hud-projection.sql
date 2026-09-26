@@ -158,18 +158,18 @@ SELECT
     tupleElement(benchmark, 'mode')  AS benchmark_mode,
     tupleElement(model, 'name')      AS model_name,
     tupleElement(model, 'backend')   AS model_backend,
-    IF(
+    if(
         empty(tupleElement(runners[1], 'name')),
-        IF(
+        if(
             empty(tupleElement(benchmark, 'extra_info')['device']),
             'cpu',
             tupleElement(benchmark, 'extra_info')['device']
         ),
         tupleElement(runners[1], 'name')
     ) AS device,
-    IF(
+    if(
         empty(tupleElement(runners[1], 'type')),
-        IF(
+        if(
             empty(tupleElement(benchmark, 'extra_info')['arch']),
             tupleElement(runners[1], 'cpu_info'),
             tupleElement(benchmark, 'extra_info')['arch']

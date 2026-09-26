@@ -37,4 +37,4 @@ packages = ["spyre_clickhouse_ingest", "spyre_clickhouse_ingest.schema"]
 "spyre_clickhouse_ingest.schema" = "schema"
 
 [tool.setuptools.package-data]
-"spyre_clickhouse_ingest.schema" = ["*.sql"]
+"spyre_clickhouse_ingest.schema" = ["*.sql", "migrations/*.sql"]

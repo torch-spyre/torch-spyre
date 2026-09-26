@@ -1,3 +1,4 @@
+-- APPLY: explicit -- these tables live in the v1 `spyre` database beside the exporter, not in v2.
 -- OpenTelemetry telemetry from Jenkins, captured verbatim from the exporter's own schema.
 --
 -- NOT OURS TO DESIGN: the Jenkins OTel plugin's ClickHouse exporter owns the column set, CODECs

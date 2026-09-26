@@ -43,16 +43,3 @@ FROM
     GROUP BY run_id
 )
 GROUP BY day, arch;
-
--- Indexes. One only, and it is measured; see docs/clickhouse_v2_views.md.
-
--- test_case_runs is ORDER BY (component, run_id, test_case_id), so a run_id-only lookup prunes
--- to parts, not granules; retained only for a measured 5-6x row-read reduction, not a latency
--- win. Prunes only because one run belongs to one component (true by construction, verified on
--- prod, and silently ineffective rather than erroring if ever violated). Do not add `component`
--- to a run_id predicate as tuning -- it carries no information the index hasn't already used.
--- No index on artifact_results or test_cases -- both scan fully in a few ms. ADD INDEX covers
--- only parts written after it, so MATERIALIZE must follow (mutations_sync=2 waits for it).
-ALTER TABLE test_case_runs
-    ADD INDEX IF NOT EXISTS idx_run_id run_id TYPE bloom_filter(0.01) GRANULARITY 1;
-ALTER TABLE test_case_runs MATERIALIZE INDEX idx_run_id SETTINGS mutations_sync = 2;
