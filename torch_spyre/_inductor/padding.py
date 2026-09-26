@@ -569,26 +569,33 @@ def _pad_device_dim(
 def _grow_num_sticks(
     layout: FixedTiledLayout, num_sticks_dim: int, new_num_sticks: int
 ) -> FixedTiledLayout:
-    """Grow ``layout``'s num-sticks dim to ``new_num_sticks`` sticks of capacity.
+    """Grow ``layout`` to ``new_num_sticks`` sticks of capacity along its stick dim.
 
-    A dim grown from a single stick gets ``stride_map`` -1: the added sticks
-    hold no host element, so the dim has no host step.  Keeping the host
-    extent there would repeat a live row step, which the runtime rejects
-    because it splits slicing offsets by unique ``stride_map`` values.
+    A num-sticks dim that already spans several sticks is sized up in place: the
+    stick variable's count lands on it, so its step stays live.
+
+    A single stick has no count dim to grow.  Its num-sticks dim steps the same
+    host distance as the dim outside it -- a row shorter than a stick puts the next
+    row less than a stick away -- and several outer dims may equally have
+    coordinate 0.  The capacity therefore comes from a prepended outermost gap dim
+    with ``stride_map`` -1, the device ``_pad_elided_dim`` uses: it names no host
+    step, so the runtime's unique-step rule never sees it, and being outermost it
+    is unambiguous to codegen, which binds the stick variable's count to it before
+    alignment (``_restore_stick_pair_dim`` in spyre_kernel).
     """
-    padded = _pad_device_dim(layout, num_sticks_dim, new_num_sticks)
-    stl = padded.device_layout
-    if layout.device_layout.device_size[num_sticks_dim] != 1:
-        return padded
-    stride_map = list(stl.stride_map)
-    stride_map[num_sticks_dim] = -1
+    stl = layout.device_layout
+    if stl.device_size[num_sticks_dim] != 1:
+        return _pad_device_dim(layout, num_sticks_dim, new_num_sticks)
     return FixedTiledLayout(
-        padded.device,
-        padded.dtype,
-        list(padded.size),
-        list(padded.stride),
+        layout.device,
+        layout.dtype,
+        [concretize_expr(s) for s in layout.size],
+        [concretize_expr(s) for s in layout.stride],
         SpyreTensorLayout(
-            list(stl.device_size), stride_map, stl.device_dtype, stl.element_arrangement
+            [new_num_sticks, *stl.device_size],
+            [-1, *stl.stride_map],
+            stl.device_dtype,
+            stl.element_arrangement,
         ),
     )
 
@@ -856,7 +863,7 @@ def _widens_to_the_fp32_grid(op: Operation, graph: GraphLowering) -> bool:
     against the depth it writes, rather than by the arrangement its output
     carries.  A widening conversion's output may come back ``STANDARD``, holding
     densely packed FP32 elements, yet codegen still iterates the coarser FP16
-    grid for it: ``_iterates_on_the_fp16_grid`` in superdsc names both conversions
+    grid for it: ``iterates_on_the_fp16_grid`` in op_spec names both conversions
     outright for exactly this reason.  Keying on the arrangement here would leave
     such an output a stick short of what that iteration writes.
     """
@@ -1136,7 +1143,8 @@ def _pad_fp32_to_dl16_input(op: Operation, graph: GraphLowering) -> None:
 
 
     Only the device layout changes, and the host size stays put: the input's
-    num-sticks dim, found from its coordinates by ``stick_dims``, grows.
+    num-sticks dim, found from its coordinates by ``stick_dims``, grows, or a
+    gap dim is prepended when it holds one stick (``_grow_num_sticks``).
     """
     assert isinstance(op, ComputedBuffer)
     out_layout = op.get_layout()
@@ -1243,7 +1251,8 @@ def _pad_staggered_fp32_buffer(op: Operation) -> None:
     stick, so the room for the rest of the pair is added here.
 
     Only the device layout changes, and the host size stays put: the num-sticks
-    dim, found from the op's write coordinates by ``stick_dims``, grows.
+    dim, found from the op's write coordinates by ``stick_dims``, grows, or a gap
+    dim is prepended when it holds one stick (``_grow_num_sticks``).
     """
     assert isinstance(op, ComputedBuffer)
     layout = op.get_layout()

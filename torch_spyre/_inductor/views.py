@@ -1061,6 +1061,13 @@ def align_tensors_pure(
                 size.append(dim_size)
                 coordinates.append(offset)
                 continue
+            if var == stick_dim[j] and den == stick_size[j] and mod <= den:
+                # An outer-stick term over a range one stick holds, such as a
+                # stick pair's count dim on the fp16 grid, has no split to
+                # decompose; keep it whole as the ranges past one stick do.
+                size.append(dim_size)
+                coordinates.append(var // den + offset)
+                continue
             # decompose dimension according to splits and tiling of stick dim
             low = (
                 0

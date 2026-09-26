@@ -29,8 +29,6 @@ from torch_spyre._inductor.constants import (
     CONV_DIM_LABELS,
     CONV_OPS,
     DEPTHWISE_CONV2D_OP,
-    DL16TOFP32_OP,
-    FP32TODL16_OP,
     FP32TOINT32_OP,
     IDENTITY_OP,
     INPUT_DIM_LABELS,
@@ -44,7 +42,6 @@ from torch_spyre._inductor.constants import (
     POOL_OPS,
     QUANTSCALEPERTOKENFP8_OP,
     RESTICKIFY_OP,
-    STAGGERED_EAS,
     TOPK_OPS,
     KEEP_BY_INDEX_OP,
 )
@@ -66,6 +63,7 @@ from torch_spyre._inductor.op_spec import (
     TensorArg,
     TensorWorkDivision,
     is_lx_relayout_identity,
+    iterates_on_the_fp16_grid,
 )
 from torch_spyre._inductor.pass_utils import coeff_through_floor
 
@@ -1857,26 +1855,6 @@ def _extend_restickify_to_padded(
         )
 
 
-# A conversion between the FP16 and FP32 stick grids, in either direction.  One
-# FP16 stick's elements span a pair of FP32 sticks, so the iteration follows the
-# coarser FP16 grid whichever way the conversion runs.
-_STAGGERING_CONVERSION_OPS = (DL16TOFP32_OP, FP32TODL16_OP)
-
-
-def _iterates_on_the_fp16_grid(op_spec: OpSpec) -> bool:
-    """Whether this op's iteration must follow the coarser FP16 stick grid.
-
-    True for the FP16<->FP32 conversions themselves, named by op, and for an op
-    reading a value one of them produced, recognized by the staggered
-    arrangement the value carries.  The arrangement is the only signal available
-    for the consumer: it is an ordinary pointwise op whose name and dtypes say
-    nothing about how its input's elements are laid out.
-    """
-    if op_spec.op in _STAGGERING_CONVERSION_OPS:
-        return True
-    return any(arg.element_arrangement in STAGGERED_EAS for arg in op_spec.args)
-
-
 def _extend_staggered_to_padded(
     op_spec: OpSpec,
     sdsc_iteration_space: dict,
@@ -1906,62 +1884,6 @@ def _extend_staggered_to_padded(
             DataFormats.SEN169_FP16.elems_per_stick(),
             "_extend_staggered_to_padded",
         )
-
-
-def _place_stick_pair_on_grown_slot(op_spec: OpSpec) -> OpSpec:
-    """Move a staggered stick pair's count coordinate onto its grown slot.
-
-    A sub-stick FP32 side of an FP16<->FP32 conversion holds one host stick, so
-    ``padding`` grows its standard num-sticks slot from 1 to 2 with no host step
-    (``stride_map`` -1).  Its coordinate is then a size-1 synthetic variable,
-    while the stick variable's count coordinate ``floor(s/32)`` lands on another
-    axis of size 1.  Read as is, the SDSC spans the pair through the stick dim
-    *and* gives the grown axis a separate backGap, declaring twice the
-    allocation.  Swapping the two coordinates makes the grown axis the stick
-    dim's second stick, as it already is for a multi-stick extent.
-    """
-    iteration_extents = {
-        sym: _try_static_int(size) for sym, (size, _) in op_spec.iteration_space.items()
-    }
-    fp16_stick = DataFormats.SEN169_FP16.elems_per_stick()
-    new_args = []
-    for arg in op_spec.args:
-        coordinates = list(arg.device_coordinates)
-        lane_vars = coordinates[-1].free_symbols if coordinates else set()
-        stick_var = next(iter(lane_vars)) if len(lane_vars) == 1 else None
-        extent = iteration_extents.get(stick_var)
-        count_axes = [
-            axis
-            for axis, coordinate in enumerate(coordinates[:-1])
-            if stick_var in coordinate.free_symbols
-        ]
-        if extent is None or len(count_axes) != 1:
-            new_args.append(arg)
-            continue
-        count_axis = count_axes[0]
-        padded_extent = math.ceil(extent / fp16_stick) * fp16_stick
-        sticks = math.ceil(padded_extent / arg.device_dtype.elems_per_stick())
-        if int(arg.device_size[count_axis]) >= sticks:
-            new_args.append(arg)
-            continue
-        grown_axes = [
-            axis
-            for axis, coordinate in enumerate(coordinates[:-1])
-            if axis != count_axis
-            and int(arg.device_size[axis]) == sticks
-            and isinstance(coordinate, Symbol)
-            and iteration_extents.get(coordinate) == 1
-        ]
-        if len(grown_axes) != 1:
-            new_args.append(arg)
-            continue
-        grown_axis = grown_axes[0]
-        coordinates[count_axis], coordinates[grown_axis] = (
-            coordinates[grown_axis],
-            coordinates[count_axis],
-        )
-        new_args.append(dataclasses.replace(arg, device_coordinates=coordinates))
-    return dataclasses.replace(op_spec, args=new_args)
 
 
 def _inject_implicit_conv_kernel_dims(
@@ -2063,9 +1985,7 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
     is_conv2d = _is_conv(op_spec.op)
     is_relayout = is_lx_relayout_identity(op_spec.op, op_spec.args, op_spec.op_info)
     is_restickify = op_spec.op == RESTICKIFY_OP
-    on_fp16_grid = _iterates_on_the_fp16_grid(op_spec)
-    if on_fp16_grid:
-        op_spec = _place_stick_pair_on_grown_slot(op_spec)
+    on_fp16_grid = iterates_on_the_fp16_grid(op_spec)
     is_pool = _is_pool(op_spec.op)
     is_conv = _is_conv(op_spec.op)
     ndim = len(op_spec.iteration_space)
