@@ -74,6 +74,7 @@ from .errors import Unsupported
 from .ir import FixedTiledLayout
 from .logging_utils import get_inductor_logger
 from .pass_utils import (
+    access_stick_dims,
     concretize_expr,
     concretize_index,
     find_reduction_var,
@@ -82,7 +83,6 @@ from .pass_utils import (
     is_restickify_coords,
     _is_compact_node,
     lower_pad_sequence,
-    _num_sticks_slot,
     redirect_computed_buffer_reads,
     replace_computed_buffer_body,
 )
@@ -566,61 +566,30 @@ def _pad_device_dim(
     )
 
 
-def _grown_dim_step_is_unique(stl: SpyreTensorLayout, sticks_dim: int) -> bool:
-    """Whether sizing up ``sticks_dim`` leaves its ``stride_map`` entry unambiguous.
-
-    A dim already holding the sentinel -1 is never stepped, so growing it cannot
-    collide with anything.  Otherwise the entry has to differ from every other dim
-    that would also be larger than one.
-    """
-    step = stl.stride_map[sticks_dim]
-    if step <= 0:
-        return True
-    return not any(
-        other != sticks_dim
-        and stl.stride_map[other] == step
-        and stl.device_size[other] > 1
-        for other in range(len(stl.device_size) - 1)
-    )
-
-
-def _grow_num_sticks_capacity(
-    layout: FixedTiledLayout, sticks_dim: int, required_num_sticks: int
+def _grow_num_sticks(
+    layout: FixedTiledLayout, num_sticks_dim: int, new_num_sticks: int
 ) -> FixedTiledLayout:
-    """Give ``layout`` room for ``required_num_sticks`` sticks on ``sticks_dim``.
+    """Grow ``layout``'s num-sticks dim to ``new_num_sticks`` sticks of capacity.
 
-    Sizing the dim up is the direct way, and is what happens whenever the dim's own
-    step is distinguishable from its neighbours'.  It stops being available once the
-    stick dim spans no more than a single stick: the num-sticks dim then steps the
-    same host distance as the dim outside it, since a row shorter than a stick puts
-    the next row less than a stick away.  Two dims of size over one cannot share a
-    ``stride_map`` value -- there would be no way to tell which dim a step belongs
-    to -- so ``spyre_mem.cpp`` rejects the result on the first host copy.
-
-    The room comes from an outermost gap dim instead.  Carrying ``stride_map == -1``
-    it names no host step, so it stays clear of that rule while still multiplying
-    the allocation, the same device ``_pad_elided_dim`` uses for an elided dim.  The
-    capacity is what this padding is after in the first place: one 64-element FP16
-    stick is physically a pair of 32-slot FP32 sticks, so the narrow side needs both
-    even while the live elements sit in the first.
+    A dim grown from a single stick gets ``stride_map`` -1: the added sticks
+    hold no host element, so the dim has no host step.  Keeping the host
+    extent there would repeat a live row step, which the runtime rejects
+    because it splits slicing offsets by unique ``stride_map`` values.
     """
-    stl = layout.device_layout
-    if _grown_dim_step_is_unique(stl, sticks_dim):
-        return _pad_device_dim(layout, sticks_dim, required_num_sticks)
-
-    factor = -(-required_num_sticks // stl.device_size[sticks_dim])
-    grown_stl = SpyreTensorLayout(
-        [factor, *stl.device_size],
-        [-1, *stl.stride_map],
-        stl.device_dtype,
-        stl.element_arrangement,
-    )
+    padded = _pad_device_dim(layout, num_sticks_dim, new_num_sticks)
+    stl = padded.device_layout
+    if layout.device_layout.device_size[num_sticks_dim] != 1:
+        return padded
+    stride_map = list(stl.stride_map)
+    stride_map[num_sticks_dim] = -1
     return FixedTiledLayout(
-        layout.device,
-        layout.dtype,
-        [concretize_expr(s) for s in layout.size],
-        [concretize_expr(s) for s in layout.stride],
-        grown_stl,
+        padded.device,
+        padded.dtype,
+        list(padded.size),
+        list(padded.stride),
+        SpyreTensorLayout(
+            list(stl.device_size), stride_map, stl.device_dtype, stl.element_arrangement
+        ),
     )
 
 
@@ -1166,9 +1135,8 @@ def _pad_fp32_to_dl16_input(op: Operation, graph: GraphLowering) -> None:
     3 fp32 sticks (96 elements) to 4 fp32 sticks (96 elements in 128-element capacity).
 
 
-    Only the device layout changes, and the host size stays put.  The room lands on
-    the num-sticks dim where its step stays unambiguous, and on an outermost gap dim
-    otherwise; see ``_grow_num_sticks_capacity``.
+    Only the device layout changes, and the host size stays put: the input's
+    num-sticks dim, found from its coordinates by ``stick_dims``, grows.
     """
     assert isinstance(op, ComputedBuffer)
     out_layout = op.get_layout()
@@ -1231,7 +1199,10 @@ def _pad_fp32_to_dl16_input(op: Operation, graph: GraphLowering) -> None:
         return
 
     in_stl = in_layout.device_layout
-    sticks_dim = _num_sticks_slot(in_stl)
+    in_dims = access_stick_dims(in_stl, in_layout, in_dep)
+    out_dims = access_stick_dims(out_stl, out_layout, _write_dep(op))
+    if in_dims is None or out_dims is None:
+        return
 
     in_eps = in_stl.device_size[-1]  # 32 for fp32
     # The output stick depth is the coarser of the two grids for this conversion,
@@ -1239,18 +1210,18 @@ def _pad_fp32_to_dl16_input(op: Operation, graph: GraphLowering) -> None:
     # conversion whose output is the finer grid would have to read the input's
     # depth instead; this pass is gated on FP32_TO_DL16, so it never is.
     out_eps = out_stl.device_size[-1]  # 64 for fp16
-    out_num_sticks = out_stl.device_size[sticks_dim]
+    out_num_sticks = out_stl.device_size[out_dims.num_sticks]
 
     # Input capacity that the output's sticks span. The output num-sticks count
     # is already rounded up, so this covers the padding stick.
     required_in_num_sticks = -(-out_num_sticks * out_eps // in_eps)
-    current_in_num_sticks = in_stl.device_size[sticks_dim]
+    current_in_num_sticks = in_stl.device_size[in_dims.num_sticks]
 
     if current_in_num_sticks >= required_in_num_sticks:
         return
 
-    in_buf.layout = _grow_num_sticks_capacity(
-        in_layout, sticks_dim, required_in_num_sticks
+    in_buf.layout = _grow_num_sticks(
+        in_layout, in_dims.num_sticks, required_in_num_sticks
     )
 
 
@@ -1271,16 +1242,18 @@ def _pad_staggered_fp32_buffer(op: Operation) -> None:
     occupy, which is the first stick alone whenever the extent is under half a
     stick, so the room for the rest of the pair is added here.
 
-    Only the device layout changes, and the host size stays put.  The room lands on
-    the num-sticks dim where its step stays unambiguous, and on an outermost gap dim
-    otherwise; see ``_grow_num_sticks_capacity``.
+    Only the device layout changes, and the host size stays put: the num-sticks
+    dim, found from the op's write coordinates by ``stick_dims``, grows.
     """
     assert isinstance(op, ComputedBuffer)
     layout = op.get_layout()
     assert isinstance(layout, FixedTiledLayout)
     stl = layout.device_layout
 
-    sticks_dim = _num_sticks_slot(stl)
+    dims = access_stick_dims(stl, layout, _write_dep(op))
+    if dims is None:
+        return
+    sticks_dim = dims.num_sticks
     out_eps = stl.device_size[-1]
     # The stagger is defined against the FP16 grid: the pair holds one FP16 stick.
     coarse_eps = DataFormats.SEN169_FP16.elems_per_stick()
@@ -1288,21 +1261,12 @@ def _pad_staggered_fp32_buffer(op: Operation) -> None:
         return
     sticks_per_pair = -(-coarse_eps // out_eps)
 
-    # How far along the stick dim the value actually reaches.  A stick step counts
-    # whole sticks; a sub-stick dim (including the sentinel -1, host extent 1)
-    # carries a host extent instead, and its elements sit within the first pair.
-    stride = stl.stride_map[sticks_dim]
-    if stride >= out_eps:
-        pairs = -(-stl.device_size[sticks_dim] // sticks_per_pair)
-    else:
-        pairs = 1
-    required_num_sticks = pairs * sticks_per_pair
-
     current_num_sticks = stl.device_size[sticks_dim]
+    required_num_sticks = -(-current_num_sticks // sticks_per_pair) * sticks_per_pair
     if current_num_sticks >= required_num_sticks:
         return
 
-    op.layout = _grow_num_sticks_capacity(layout, sticks_dim, required_num_sticks)
+    op.layout = _grow_num_sticks(layout, sticks_dim, required_num_sticks)
 
     logger.debug(
         "insert_staggered_ea_padding: padded %s device dim %d %d -> %d",

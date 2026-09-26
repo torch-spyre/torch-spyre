@@ -579,12 +579,8 @@ def _single_arg_op_layout(
             if staggered and _convert_reads_whole_input(
                 in_layout, output, dep, output_dep
             ):
-                host_size = [concretize_expr(v) for v in in_layout.size]
-                host_stride = [concretize_expr(v) for v in in_layout.stride]
                 layouts = [
-                    rescale_stl_for_dtype(
-                        stl, output.dtype, fmt, host_size, host_stride
-                    )
+                    rescale_stl_for_dtype(stl, output.dtype, fmt, in_layout, dep)
                 ]
 
                 # A conversion that creates a staggered EA must also expose
@@ -610,7 +606,7 @@ def _single_arg_op_layout(
                         if target_stl is None:
                             continue
                         candidate = rescale_stl_for_dtype(
-                            target_stl, output.dtype, fmt, host_size, host_stride
+                            target_stl, output.dtype, fmt, in_layout, dep
                         )
                         if candidate not in layouts:
                             layouts.append(candidate)
@@ -645,8 +641,8 @@ def _single_arg_op_layout(
                     stl,
                     output.dtype,
                     ElementArrangement.QFP8CH,
-                    [concretize_expr(v) for v in in_layout.size],
-                    [concretize_expr(v) for v in in_layout.stride],
+                    in_layout,
+                    dep,
                 )
             ]
 

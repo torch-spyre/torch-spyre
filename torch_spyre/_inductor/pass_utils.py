@@ -174,162 +174,129 @@ def get_mem_deps(n: SchedulerNode) -> list[SchedNodeArg]:
     return res
 
 
-def _num_sticks_slot(stl: SpyreTensorLayout) -> int:
-    """Return the device dim that counts sticks.
+class StickDims(NamedTuple):
+    """Where a tensor access keeps its sticks: see ``stick_dims``."""
 
-    The last device dim is the stick depth; exactly one other dim counts how many
-    sticks the tensor holds. Its position is fixed by the device layout
-    convention, matching ``stick_dim_index`` in ``csrc/spyre_mem.cpp``: the third
-    dim from the end for a rank 3 or higher layout, the first dim for rank 2.
+    num_sticks: int
+    """Device dim counting the sticks along the stick dim."""
+    within_stick: int | None
+    """Host dim the innermost device dim walks, or None for a stick holding one
+    element (a size-1 or sparse stick dim), whose coordinate has no variable."""
 
-    Identifying it by position rather than by matching ``stride_map`` against the
-    stick depth is what makes sub-stick tensors work. A ``stride_map`` entry is a
-    host-element step, and ``dim_map_to_stride_map`` writes
-    ``min(elems_per_stick, host_extent)``, so a tensor whose stick dim is shorter
-    than one stick carries its own extent there (5, 7, 32) and never the stick
-    depth. Matching on the depth misses those layouts entirely, and on an aligned
-    layout whose batch stride happens to equal the depth it matches the batch dim
-    instead.
 
-    The entry at the returned slot may be the sentinel -1, which marks a stick dim
-    of host extent 1: such a dim is never stepped, yet it still counts the one
-    stick that element occupies. The slot a caller gets back therefore says where
-    the stick count lives, not that the entry there is a stick step, so a caller
-    rescaling it reads the stride first to tell the two apart.
+def stick_dims(host_coords: list[Expr], device_coords: list[Expr]) -> StickDims | None:
+    """Identify the num-sticks device dim and the within-stick host dim of an access.
+
+    Both come from the access's coordinates rather than from positions or
+    ``stride_map`` values, because a layout ``compute_restickify_target_layout``
+    commits need not keep the num-sticks dim in its conventional slot, and a
+    ``stride_map`` entry cannot tell a stick pitch from a host extent that happens
+    to equal one.
+
+    The within-stick host dim is the one whose coordinate matches the stick
+    coordinate. The num-sticks dim is the outermost device dim whose coordinate
+    carries the stick variable; a stick dim no longer than one stick never wraps
+    into an outer dim, so the tensor is one stick deep and its count sits on the
+    outermost device dim with a zero coordinate.
+
+    Returns None when no device dim can hold the count, or when the stick
+    coordinate has a variable but no host dim matches it.
     """
-    if len(stl.device_size) < 2:
-        # TODO: support rank-1 device layouts; they have no dim to count sticks
-        # and every caller here needs one.
-        raise ValueError(f"device layout has no num-sticks dim: {stl.device_size}")
-    return len(stl.device_size) - 3 if len(stl.device_size) > 2 else 0
+    if not device_coords:
+        return None
+    stick_syms = device_coords[-1].free_symbols
+    within_stick = None
+    if stick_syms:
+        within_stick = matching_dim(host_coords, device_coords[-1])
+        if within_stick is None:
+            return None
+    outer = range(len(device_coords) - 1)
+    num_sticks = next(
+        (j for j in outer if stick_syms & device_coords[j].free_symbols),
+        next((j for j in outer if device_coords[j] == sympy.S.Zero), None),
+    )
+    if num_sticks is None:
+        return None
+    return StickDims(num_sticks, within_stick)
 
 
-def _stick_host_dim(
-    inner_stride: int,
-    host_size: Sequence[int],
-    host_stride: Sequence[int],
-) -> int | None:
-    """Host dim the innermost device dim walks, or None if no dim matches.
+def access_stick_dims(
+    stl: SpyreTensorLayout, host_layout: FixedLayout, dep: MemoryDep
+) -> StickDims | None:
+    """``stick_dims`` of ``dep`` reading or writing a tensor laid out as given.
 
-    ``stride_map[-1]`` is that dim's host stride, an identity
-    ``dim_map_to_stride_map`` establishes and ``propagate_layouts`` also relies
-    on. Recovering the dim gives access to its extent, which is the clamp bound
-    ``min(stride_map[j] * device_size[j], host_stride[d] * host_size[d])`` needs.
-
-    A size-1 host dim shares its inner neighbour's stride yet carries the -1
-    sentinel rather than becoming a stick dim, so the extent filter is required
-    and is not implied by a sentinel in the num-sticks slot: the shadowing dim can
-    be a different one, as host (1, 3, 1) shows, where that slot holds a positive
-    3 while the sentinels sit on the dims either side. The outermost match wins,
-    matching the constructor's own dim walk.
+    Returns None only for a stick holding one element with no zero-coordinate dim
+    to count it; its elements each sit on their own device row, so there is no
+    stick count to rescale or pad.
     """
-    matches = [
-        d
-        for d in range(len(host_size))
-        if host_stride[d] == inner_stride and host_size[d] > 1
-    ]
-    return matches[-1] if matches else None
+    device_coords = device_coordinates(stl, dep, None)
+    dims = stick_dims(host_coordinates(host_layout, dep, None), device_coords)
+    if dims is None and device_coords and device_coords[-1].free_symbols:
+        # TODO: a stick coordinate with a variable but no dim to count its sticks
+        # has not been seen; resizing the stick alone could drop elements.
+        raise Unsupported(
+            f"no num-sticks dim in {list(stl.device_size)} {list(stl.stride_map)} "
+            f"for {dep}"
+        )
+    return dims
 
 
 def rescale_stl_for_dtype(
     stl: SpyreTensorLayout,
     out_dtype: torch.dtype,
     ea: ElementArrangement,
-    host_size: Optional[Sequence[int]] = None,
-    host_stride: Optional[Sequence[int]] = None,
+    host_layout: FixedLayout,
+    dep: MemoryDep,
 ) -> SpyreTensorLayout:
     """Propagate a device layout across a same-shape, differing-stick-depth dtype conversion.
 
     Copies the input STL's ``device_size``/``stride_map`` and rescales the stick
-    depth (the last device dim) plus the num-sticks dim. This preserves any
-    non-canonical layout or padding present in the input STL instead of
-    reconstructing a dense layout from the logical size/stride.
+    depth (the last device dim) plus the num-sticks dim, both found from ``dep``'s
+    coordinates by ``stick_dims``. This preserves any non-canonical layout or
+    padding present in the input STL instead of reconstructing a dense layout from
+    the logical size/stride.
 
-    The input elements-per-stick is read from ``stl.device_size[-1]`` (the stick
-    dimension is always full, so it equals ``get_elem_in_stick(in_dtype)``); the
-    output count comes from ``out_dtype``.
+    The num-sticks count is the live host extent of the stick dim rounded up to
+    whole output sticks. Rounding the input's padded capacity instead would
+    re-pad it on a widening conversion: 65 fp16 elements occupy two sticks holding
+    128, and rounding 128 up gives four fp32 sticks where three hold the 65.
+    Rounding up at all keeps a single input stick from flooring to a size-0 dim,
+    which reached ``get_device_stride_infos`` to divide by it and kill the process
+    with SIGFPE (issue #3604).
 
-    The num-sticks count rounds UP, which keeps a single input stick from flooring
-    to a size-0 dim: that described no tensor and reached
-    ``get_device_stride_infos`` to divide by it and kill the process with SIGFPE
-    (issue #3604).
+    The stride takes the clamp ``dim_map_to_stride_map`` applies: a dim left
+    holding one stick carries its host extent rather than the pitch a second stick
+    would step by. A stick dim within one output stick therefore keeps its entry,
+    and one that widens past it becomes a real stick step.
 
-    What it rounds up is the live element count, which is why the host shape is
-    worth passing. ``device_size[dim] * in_eps`` is the input's padded capacity
-    instead, and re-padding a capacity inflates the count on a widening
-    conversion: 65 fp16 elements occupy two sticks holding 128, and rounding 128
-    up gives four fp32 sticks where three hold the 65. Rounding the host extent
-    instead is exact in both directions. Without the host shape the capacity
-    arithmetic still applies, which is sound when narrowing, since a padded
-    wide-side count always floors back to the right narrow count.
-
-    A narrowing output may therefore end in a partially filled stick, carrying
-    capacity the input does not yet cover. That is a legitimate layout: the
-    widening conversion that consumes it rebuilds a dense layout from the host
-    size, treating the partial stick like any other unaligned stick dim. Giving
-    that stick real storage on the wide-dtype side is
-    ``insert_staggered_ea_padding``'s job, and it sizes the padding from the
-    layout returned here (issue #3999).
-
-    A sub-stick num-sticks dim carries a host extent rather than a stick step, so
-    it is copied through unchanged while that extent fits one output stick. Past
-    that, a widening conversion has live elements in a second output stick, and
-    the dim is recounted from the extent into a real stick step; a gap dim would
-    give that stick no host step, so its elements would never reach the host.
-    Widening it further, to the capacity a conversion needs beyond its live
-    elements, is left to that same later pass because
-    ``propagate_spyre_tensor_layouts`` hands a pointwise output its input's STL
-    directly: a dim grown here would follow the value into every consumer, which
-    sees only the live elements.
+    A narrowing output may end in a partially filled stick, and a widening one
+    counts only the sticks its live elements reach. Giving the rest of the stick
+    capacity real storage is ``insert_staggered_ea_padding``'s job, and it sizes
+    that padding from the layout returned here (issue #3999). Growing it here would
+    follow the value into every consumer, since ``propagate_spyre_tensor_layouts``
+    hands a pointwise output its input's STL directly.
 
     Args:
         stl: Input device layout to rescale.
         out_dtype: Torch dtype of the conversion output.
         ea: ElementArrangement to stamp on the returned layout.
-        host_size: Logical size of the tensor ``stl`` describes. Optional, and
-            supplying it is what makes the num-sticks count and stride exact; see
-            the rounding note above for what is lost without it.
-        host_stride: Logical stride matching ``host_size``. Ignored unless
-            ``host_size`` is given as well.
+        host_layout: Host layout of the tensor ``stl`` describes.
+        dep: The conversion's access to that tensor.
     """
-    in_eps = stl.device_size[-1]
     out_eps = get_elem_in_stick(out_dtype)
     out_device_size = list(stl.device_size)
     out_stride_map = list(stl.stride_map)
     out_device_size[-1] = out_eps
-    dim = _num_sticks_slot(stl)
-    if stl.stride_map[dim] >= in_eps:
-        # A full stick step: the dim counts whole sticks, so the same live
-        # elements redistribute over a different number of them.
-        stick_dim = (
-            _stick_host_dim(stl.stride_map[-1], host_size, host_stride)
-            if host_size is not None and host_stride is not None
-            else None
+    dims = access_stick_dims(stl, host_layout, dep)
+    # A stick holding one element (a size-1 or sparse stick dim) has as many
+    # sticks at any depth.
+    if dims is not None and dims.within_stick is not None:
+        extent = concretize_expr(host_layout.size[dims.within_stick])
+        host_stride = concretize_expr(host_layout.stride[dims.within_stick])
+        out_device_size[dims.num_sticks] = -(-extent // out_eps)
+        out_stride_map[dims.num_sticks] = min(
+            out_eps * stl.stride_map[-1], host_stride * extent
         )
-        if host_size is None or host_stride is None or stick_dim is None:
-            total_elems = stl.device_size[dim] * in_eps
-            out_device_size[dim] = -(-total_elems // out_eps)
-            out_stride_map[dim] = out_eps * stl.stride_map[-1]
-        else:
-            # The host extent, not device_size[dim] * in_eps: that product is the
-            # input's padded capacity, and rounding a capacity up re-pads it, so a
-            # widening conversion would claim a stick more than the live elements
-            # occupy. The stride takes the same clamp dim_map_to_stride_map applies,
-            # because a dim left holding one stick carries its extent rather than
-            # the pitch the stick would step by.
-            extent = host_size[stick_dim]
-            out_device_size[dim] = -(-extent // out_eps)
-            out_stride_map[dim] = min(
-                out_eps * stl.stride_map[-1], host_stride[stick_dim] * extent
-            )
-    elif stl.stride_map[dim] > 0 and stl.stride_map[-1] > 0:
-        # A sub-stick dim holds its host extent as a step, one input stick long.
-        # Widening splits that stick, and an extent past one output stick has
-        # live elements in the next, so the dim becomes a real stick step.
-        extent = stl.stride_map[dim] // stl.stride_map[-1]
-        if extent > out_eps:
-            out_device_size[dim] = -(-extent // out_eps)
-            out_stride_map[dim] = out_eps * stl.stride_map[-1]
     return SpyreTensorLayout(
         out_device_size,
         out_stride_map,
@@ -2305,20 +2272,14 @@ def compute_restickify_target_layout(
         return None
     host_size = [concretize_expr(s) for s in host_layout.size]
     host_stride = [concretize_expr(s) for s in host_layout.stride]
-    old_sd = matching_dim(ic, idc[-1])
-    if old_sd is None:
+    old_dims = stick_dims(ic, idc)
+    if old_dims is None or old_dims.within_stick is None:
         return None
-    old_stick_expr = idc[-1]
+    old_sd = old_dims.within_stick
+    old_sd_outer_dim = old_dims.num_sticks
     old_stride_map = list(stl.stride_map)
-    old_var = next(iter(old_stick_expr.free_symbols))
     new_var = next(iter(target_stick_expr.free_symbols))
     stick_size = get_elem_in_stick(host_layout.dtype)
-    old_sd_outer_dim = next(
-        (j for j in range(len(idc) - 1) if old_var in idc[j].free_symbols),
-        next((j for j in range(len(idc) - 1) if idc[j] == sympy.S.Zero), None),
-    )
-    if old_sd_outer_dim is None:
-        return None
     candidates = [j for j in range(len(idc) - 1) if new_var in idc[j].free_symbols]
     if not candidates:
         return None
