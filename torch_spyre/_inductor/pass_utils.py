@@ -272,8 +272,12 @@ def rescale_stl_for_dtype(
     layout returned here (issue #3999).
 
     A sub-stick num-sticks dim carries a host extent rather than a stick step, so
-    it has no stick count to rescale and is copied through unchanged. Widening it
-    to the capacity a conversion needs is left to that same later pass because
+    it is copied through unchanged while that extent fits one output stick. Past
+    that, a widening conversion has live elements in a second output stick, and
+    the dim is recounted from the extent into a real stick step; a gap dim would
+    give that stick no host step, so its elements would never reach the host.
+    Widening it further, to the capacity a conversion needs beyond its live
+    elements, is left to that same later pass because
     ``propagate_spyre_tensor_layouts`` hands a pointwise output its input's STL
     directly: a dim grown here would follow the value into every consumer, which
     sees only the live elements.
@@ -318,6 +322,14 @@ def rescale_stl_for_dtype(
             out_stride_map[dim] = min(
                 out_eps * stl.stride_map[-1], host_stride[stick_dim] * extent
             )
+    elif stl.stride_map[dim] > 0 and stl.stride_map[-1] > 0:
+        # A sub-stick dim holds its host extent as a step, one input stick long.
+        # Widening splits that stick, and an extent past one output stick has
+        # live elements in the next, so the dim becomes a real stick step.
+        extent = stl.stride_map[dim] // stl.stride_map[-1]
+        if extent > out_eps:
+            out_device_size[dim] = -(-extent // out_eps)
+            out_stride_map[dim] = out_eps * stl.stride_map[-1]
     return SpyreTensorLayout(
         out_device_size,
         out_stride_map,

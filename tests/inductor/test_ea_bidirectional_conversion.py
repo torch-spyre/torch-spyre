@@ -24,6 +24,8 @@ Tests all 4 conversion cases:
 4. FP32→FP16 with DL16_TO_FP32 → STANDARD
 """
 
+import math
+
 import pytest
 import torch
 from torch_spyre._C import ElementArrangement, get_spyre_tensor_layout
@@ -303,6 +305,56 @@ def test_consumed_wide_value_keeps_both_staggered_sticks(device, extent, fp16):
 
     assert_ea(result, ElementArrangement.STANDARD)
     assert_val(fn, x, result)
+
+
+# Extents a single FP16 stick holds but a single FP32 stick does not, bracketed by
+# the ones on either side that fit (32) or fill (64) the FP16 stick.
+_NARROWED_EXTENTS = [5, 32, 33, 48, 63, 64, 96]
+
+
+def _narrow_then_widen_eager(x, fp16):
+    return x.to(dtype=fp16).to(torch.float32)
+
+
+def _narrow_consume_widen(x, fp16):
+    return (x.to(dtype=fp16) * 2.0).to(torch.float32)
+
+
+@pytest.mark.parametrize("device", ["spyre"])
+@pytest.mark.parametrize("shape_prefix", [(4,), (2, 3)], ids=["4xn", "2x3xn"])
+@pytest.mark.parametrize("extent", _NARROWED_EXTENTS, ids=lambda n: f"n{n}")
+@pytest.mark.parametrize(
+    "fn, mode",
+    [
+        pytest.param(_narrow_then_widen_eager, "eager", id="eager"),
+        pytest.param(_narrow_consume_widen, "compile", id="compile_consumed"),
+    ],
+)
+@pytest.mark.parametrize(
+    "fp16",
+    DtypeOpTable.fp16_types(),
+    ids=lambda dt: str(dt).replace("torch.", ""),
+)
+def test_narrowed_value_widens_into_every_fp32_stick(
+    device, shape_prefix, extent, fn, mode, fp16
+):
+    """Widening a narrowed value returns the elements past the first FP32 stick.
+
+    An FP16 stick holding more than 32 elements widens into two FP32 sticks, both
+    holding host elements, so the STANDARD result has to map the second one to
+    the host rather than leave it as unaddressed capacity.  Eager casts run as
+    separate conversions, and a compiled pair needs an op between them to reach
+    the device at all.  The values are integers exact in every format involved,
+    so a dropped element shows as a mismatch instead of hiding in the tolerance.
+    """
+    torch._dynamo.reset()
+    shape = (*shape_prefix, extent)
+    host = (torch.arange(math.prod(shape)) % 257).reshape(shape).to(torch.float32)
+
+    result = _run(fn, host.to(device), fp16, mode=mode)
+
+    assert_ea(result, ElementArrangement.STANDARD)
+    torch.testing.assert_close(result.cpu(), fn(host, fp16), rtol=0, atol=0)
 
 
 def _stagger_fn(x, fp16):
