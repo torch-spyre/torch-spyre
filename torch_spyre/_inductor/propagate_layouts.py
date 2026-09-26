@@ -583,7 +583,23 @@ def _single_arg_op_layout(
 
             input_ea = stl.element_arrangement
 
-            fmt = DtypeOpTable.ea_map(in_layout.dtype, output.dtype, input_ea)
+            # For bool inputs, ea_map must resolve from the physical backing
+            # dtype (e.g. IEEE_FP32 for a fp32-backed bool) rather than the
+            # logical torch.bool, which is not in the EA map. Use the
+            # bool-equivalent dtype of the STL's device_dtype as the source.
+            ea_src_dtype = in_layout.dtype
+            if ea_src_dtype == torch.bool:
+                resolved_dtype = bool_equivalent_dtype(stl.device_dtype)
+                if resolved_dtype is not None:
+                    ea_src_dtype = resolved_dtype
+                else:
+                    logger.warning(
+                        "bool input has unrecognised device_dtype %s; "
+                        "falling back to torch.bool for EA map lookup",
+                        stl.device_dtype,
+                    )
+
+            fmt = DtypeOpTable.ea_map(ea_src_dtype, output.dtype, input_ea)
 
             # Two strategies, chosen by whether a staggered EA is involved:
             #

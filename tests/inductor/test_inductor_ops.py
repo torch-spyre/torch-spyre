@@ -5115,6 +5115,28 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     cached_randn((5, 10), dtype=torch.float16),
                     cached_randn((5, 10), dtype=torch.float16),
                 ),
+                # Matches Mistral-Small-3.2 masked_scatter pattern (bool, fp16, fp16)
+                "fp16_col_broadcast_3d": (
+                    torch.zeros(1, 855, 1, dtype=torch.bool),
+                    cached_randn((1, 855, 5120), dtype=torch.float16),
+                    cached_randn((1, 855, 5120), dtype=torch.float16),
+                ),
+                "fp16_col_broadcast_3d_mixed": (
+                    cached_randn((2, 16, 1), dtype=torch.float16) > 0,
+                    cached_randn((2, 16, 64), dtype=torch.float16),
+                    cached_randn((2, 16, 64), dtype=torch.float16),
+                ),
+                # int32: INT32TOFP32 on Spyre; result cast back to int32
+                "int32_2d": (
+                    torch.zeros(4, 32, dtype=torch.bool),
+                    torch.randint(0, 1000, (4, 32), dtype=torch.int32),
+                    torch.randint(0, 1000, (4, 32), dtype=torch.int32),
+                ),
+                "int32_3d": (
+                    torch.zeros(2, 8, 64, dtype=torch.bool),
+                    torch.randint(0, 1000, (2, 8, 64), dtype=torch.int32),
+                    torch.randint(0, 1000, (2, 8, 64), dtype=torch.int32),
+                ),
             },
         },
         ("test_where_scalarother", "test_where_eager"): {
@@ -5154,6 +5176,17 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     cached_randn((10,), dtype=torch.float16) > 1,
                     0,
                     cached_randn((5, 10), dtype=torch.float16),
+                ),
+                # Matches gemma-4 model pattern: bool condition, scalar fill, int64 tensor
+                "int64_1x1": (
+                    torch.zeros(1, 1, dtype=torch.bool),
+                    0,
+                    torch.randint(0, 1000, (1, 1), dtype=torch.int64),
+                ),
+                "int64_1x24": (
+                    torch.zeros(1, 24, dtype=torch.bool),
+                    0,
+                    torch.randint(0, 1000, (1, 24), dtype=torch.int64),
                 ),
             },
         },
