@@ -63,9 +63,7 @@ The following environment variables control the level of diagnostic output:
 | `TORCH_SPYRE_DEBUG=1` | Logs all CPU↔Spyre data transfers, including tensor shapes, layouts, and raw values |
 | `TORCH_COMPILE_DEBUG=1` | Writes intermediate compiler artifacts to a local directory for offline inspection |
 | `TORCH_SPYRE_FFDC=1` | Captures an [FFDC](../profiling/ffdc.md) JSON report on frontend-compile / backend-compile / runtime / unimplemented failures. Separate from `USE_SPYRE_PROFILER` (profiler build flag); not set by default on pods. |
-| `SPYRE_INDUCTOR_LOG=1` | *Deprecated.* Use `TORCH_LOGS="torch_spyre.inductor"` instead (INFO level) |
-| `SPYRE_INDUCTOR_LOG_LEVEL=DEBUG` | *Deprecated.* Use `TORCH_LOGS="+torch_spyre.inductor"` instead (DEBUG level) |
-| `SPYRE_LOG_FILE=path/to/file.log` | Redirect Spyre Inductor log output to a file |
+| `SPYRE_LOG_FILE=path/to/file.log` | *Deprecated.* Mapped to the top-level `spyre` logger file handler. Redirect Spyre Inductor log output to a file |
 | `TORCH_SPYRE_DOWNCAST_WARN=0` | Suppress int64→int32 warnings |
 | `SPYRE_VALIDATE_OP_SPECS` | OpSpec invariant checking at each pipeline stage boundary (after creation, simplification, and before bundle generation). Enabled by default; set to `0` to disable. Catches invalid specs early with descriptive errors |
 | `TORCH_LOGS="+inductor"` | PyTorch provided tool to selectively enable Inductor or other parts of the `torch.compile` to the log |

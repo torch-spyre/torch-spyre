@@ -8,7 +8,7 @@
   - [Table of Contents](#table-of-contents)
   - [Quick Start](#quick-start)
   - [1. Overview](#1-overview)
-    - [Migrating from Legacy Variables](#migrating-from-legacy-variables)
+    - [Deprecated Environment Variables](#deprecated-environment-variables)
   - [2. TORCH\_LOGS Syntax for Spyre Components](#2-torch_logs-syntax-for-spyre-components)
     - [Syntax Forms](#syntax-forms)
     - [Namespace Normalization](#namespace-normalization)
@@ -86,10 +86,8 @@ See [Common Recipes](#common-recipes) for more configuration patterns.
 
 The **Unified Logging Framework (ULF)** consolidates all torch-spyre logging
 (Python and C++) behind a hierarchical component system configured via the
-`TORCH_LOGS` environment variable. ULF replaces the legacy
-`SPYRE_INDUCTOR_LOG`, `SPYRE_INDUCTOR_LOG_LEVEL`, and `TORCH_SPYRE_DEBUG`
-variables with a single, per-component configuration that is consistent
-across Python and C++ code paths.
+`TORCH_LOGS` environment variable with a single, per-component configuration
+that is consistent across Python and C++ code paths.
 
 A **component** is a dot-separated identifier (e.g.,
 `spyre.inductor.lowering`) that names a logical subsystem within
@@ -105,19 +103,17 @@ logging system; `torch_spyre.*` entries are intercepted, normalized to
 Configuration priority (highest wins):
 
 1. `TORCH_LOGS` environment variable (primary, recommended)
-2. Legacy env vars (deprecated, emit warnings)
+2. Deprecated env vars (`TORCH_SPYRE_DEBUG`, `SPYRE_LOG_FILE` — emit warnings)
 3. Programmatic API (`logging_config.set_log_level(...)`)
 4. Defaults (all components at WARNING)
 
-### Migrating from Legacy Variables
+### Deprecated Environment Variables
 
-The following legacy environment variables are deprecated and emit warnings
+The following environment variables are deprecated and emit warnings
 on use. Migrate to their `TORCH_LOGS` equivalents:
 
-| Old variable | New equivalent |
+| Deprecated variable | Replacement |
 | --- | --- |
-| `SPYRE_INDUCTOR_LOG=1` | `TORCH_LOGS="torch_spyre.inductor"` (INFO) |
-| `SPYRE_INDUCTOR_LOG_LEVEL=DEBUG` | `TORCH_LOGS="+torch_spyre.inductor"` (DEBUG) |
 | `TORCH_SPYRE_DEBUG=1` | `TORCH_LOGS="+torch_spyre"` (DEBUG) |
 | `SPYRE_LOG_FILE=/path` | `logging_config.set_log_file("/path")` |
 
@@ -642,7 +638,7 @@ itself. Instead, Python drives all configuration:
 ```text
 torch_spyre import
     → logging_config.py module executes initialize()
-        → _resolve_config() parses TORCH_LOGS + legacy vars
+        → _resolve_config() parses TORCH_LOGS + deprecated env vars
         → configure_python_logging() sets up Python loggers
     → _lazy_init() (first device op or explicit init)
         → imports torch_spyre._C (loads the pybind11 extension)
@@ -727,9 +723,9 @@ no locking, no memory allocation.
   an exception at import time. Use the parent component or the
   programmatic API instead.
 
-**Legacy env var deprecation warnings:**
+**Deprecated env var warnings:**
 
-- See [Migrating from Legacy Variables](#migrating-from-legacy-variables) in
+- See [Deprecated Environment Variables](#deprecated-environment-variables) in
   section 1 for the equivalent `TORCH_LOGS` settings.
 
 **File output not working:**
@@ -810,7 +806,7 @@ logging_config.get_effective_config()
 
 # Get source of a component's config
 logging_config.get_config_source("spyre.inductor")
-# → "TORCH_LOGS" | "legacy:SPYRE_INDUCTOR_LOG" | "legacy:TORCH_SPYRE_DEBUG" | "programmatic" | "default"
+# → "TORCH_LOGS" | "env:TORCH_SPYRE_DEBUG" | "env:SPYRE_LOG_FILE" | "programmatic" | "default"
 
 # List all predefined components
 logging_config.list_components()
