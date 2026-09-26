@@ -128,10 +128,10 @@ lx_solver_relayout_groups_per_edge: int = int(
 # 0 (the default) never skips it, priced or not. Presolve once scaled
 # super-linearly in the number of free copy residency literals (measured on the
 # spyre_attn decode graph: 16 copies 5 s, 64 copies 13 s, 160 copies 40 s, 312
-# copies past the 120 s limit). Constant-binding single-division copies and the
-# cost printer's lin_max proxy variables removed that cost, and a priced model
-# searched without presolve can exhaust memory in the LNS workers. Kept as an
-# escape hatch for a graph where presolve still outlives the time limit.
+# copies past the solve budget). Constant-binding single-division copies and
+# the cost printer's lin_max proxy variables removed that cost, and a priced
+# model searched without presolve can exhaust memory in the LNS workers. Kept
+# as an escape hatch for a graph where presolve still outlives the time limit.
 lx_solver_relayout_presolve_max_copies: int = int(
     os.getenv("SPYRE_LX_SOLVER_RELAYOUT_PRESOLVE_MAX_COPIES", "0")
 )
@@ -300,8 +300,6 @@ allow_exhaustive_search: bool = os.environ.get("ALLOW_EXHAUSTIVE_SEARCH", "0") =
 # budget without an incumbent raises SolveError, and scratchpad_planning falls
 # back to greedy placement (correct, but co-optimization is lost for that
 # graph). Raise it if large graphs are falling back; 0 disables the limit.
-# The default matches the budget CpSatLayoutSolver hard-coded before this knob
-# existed, so exposing it does not change how long any solve is allowed to run.
 cpsat_time_limit_seconds: float = float(
     os.environ.get("CPSAT_TIME_LIMIT_SECONDS", "30")
 )
