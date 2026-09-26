@@ -429,14 +429,38 @@ def classify_run_quality(version_info: str | None) -> tuple[str, int]:
         return "incomplete", 0
     if not isinstance(info, dict):
         return "incomplete", 0
+    # The perf suite emits either the components mapping alone or wrapped as
+    # {"components": ..., "system": ...}; both shapes reach this table.
+    components = info.get("components")
+    if isinstance(components, dict):
+        info = components
     for key in _REQUIRED_PROVENANCE_KEYS:
-        comp = info.get(key)
+        comp = _lookup_component(info, key)
         if not isinstance(comp, dict):
             return "incomplete", 0
         commit = comp.get("commit")
         if not isinstance(commit, str) or commit.strip() in _MISSING_COMMIT:
             return "incomplete", 0
     return "valid", 1
+
+
+def _lookup_component(info: dict, key: str):
+    """Component entry for `key`, tolerating an RPM-qualified name.
+
+    An RPM-backed component is keyed "<component>/<package>" ("flex/ibm-flex"), so an
+    exact lookup of "flex" finds nothing and every run reads as incomplete. Prefer the
+    exact key, then the shortest "<key>/..." match, which is the base package rather
+    than a "-devel" or "-headers" sibling.
+    """
+    comp = info.get(key)
+    if isinstance(comp, dict):
+        return comp
+    prefix = key + "/"
+    qualified = sorted(k for k in info if k.startswith(prefix))
+    for name in qualified:
+        if isinstance(info.get(name), dict):
+            return info[name]
+    return None
 
 
 def _exit_if_perf_zero(trigger_type: str, parsed_benchmarks: int) -> None:
