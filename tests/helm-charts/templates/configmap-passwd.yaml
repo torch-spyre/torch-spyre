@@ -1,0 +1,111 @@
+# ──────────────────────────────────────────────────────────────────────────────
+#  ConfigMap: passwd
+#  Provides /etc/passwd with the anubhavjana UID entry so tools that do
+#  user lookups (e.g. git, ssh) don't fail under the OpenShift-assigned UID.
+# ──────────────────────────────────────────────────────────────────────────────
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "spyre-dashboard.fullname" . }}-passwd
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "spyre-dashboard.labels" . | nindent 4 }}
+immutable: false
+data:
+  passwd: |-
+    root:x:0:0:root:/root:/bin/bash
+    bin:x:1:1:bin:/bin:/sbin/nologin
+    daemon:x:2:2:daemon:/sbin:/sbin/nologin
+    adm:x:3:4:adm:/var/adm:/sbin/nologin
+    lp:x:4:7:lp:/var/spool/lpd:/sbin/nologin
+    sync:x:5:0:sync:/sbin:/bin/sync
+    shutdown:x:6:0:shutdown:/sbin:/sbin/shutdown
+    halt:x:7:0:halt:/sbin:/sbin/halt
+    mail:x:8:12:mail:/var/spool/mail:/sbin/nologin
+    operator:x:11:0:operator:/root:/sbin/nologin
+    games:x:12:100:games:/usr/games:/sbin/nologin
+    ftp:x:14:50:FTP User:/var/ftp:/sbin/nologin
+    nobody:x:65534:65534:Kernel Overflow User:/:/sbin/nologin
+    systemd-coredump:x:999:997:systemd Core Dumper:/:/sbin/nologin
+    dbus:x:81:81:System message bus:/:/sbin/nologin
+    tss:x:59:59:Account used for TPM access:/:/usr/sbin/nologin
+    senuser:x:1234:1234::/home/senuser:/bin/bash
+    anubhavjana:x:1000840000:0:1000840000 user:/home/anubhavjana:/bin/bash
+    dashboard:x:1000:1000:dashboard user:/tmp:/sbin/nologin
+  
+---
+# ──────────────────────────────────────────────────────────────────────────────
+#  ConfigMap: clickhouse-config
+#  Two data keys consumed by the patch-dashboard initContainer and nginx:
+#
+#  patch-dashboard.sh — injects ClickHouse <meta> config tags and the
+#                       spyre-clickhouse.js <script> tag into dashboard.html.
+#                       Runs after git-clone so the file already exists.
+#                       (skips if already patched).
+#
+#  nginx-ch.conf      — nginx location block that proxies /clickhouse/ to the
+#                       ClickHouse HTTP interface, avoiding browser CORS.
+#                       Included inside the server{} block at runtime.
+# ──────────────────────────────────────────────────────────────────────────────
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "spyre-dashboard.fullname" . }}-clickhouse-config
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "spyre-dashboard.labels" . | nindent 4 }}
+immutable: false
+data:
+  patch-dashboard.sh: |
+    #!/bin/sh
+    set -e
+
+    DASH=/html/repo/{{ .Values.git.dashboardPath }}/dashboard.html
+
+    if [ ! -f "$DASH" ]; then
+      echo "[patch-dashboard] ERROR: $DASH not found — git-clone may have failed."
+      exit 1
+    fi
+
+    # Idempotency guard
+    if grep -q 'src="/spyre-clickhouse.js"' "$DASH"; then
+      echo "[patch-dashboard] Already patched — skipping."
+      exit 0
+    fi
+
+    # Build the body inject block
+    BODY_INJECT=""
+    if [ "${SPYRE_CH_AUTOLOAD}" = "true" ]; then
+      BODY_INJECT="${BODY_INJECT}<script>window.SPYRE_CH_AUTOLOAD=true;<\/script>"
+    fi
+    BODY_INJECT="${BODY_INJECT}<script src=\"\/spyre-clickhouse.js\"><\/script>"
+
+    # Inject before the LAST </body>
+    awk -v inject="${BODY_INJECT}" '
+      /<\/body>/ { last_line=NR; last_content=$0 }
+      { lines[NR]=$0 }
+      END {
+        for (i=1; i<=NR; i++) {
+          if (i==last_line) {
+            sub(/<\/body>/, inject "</body>", lines[i])
+          }
+          print lines[i]
+        }
+      }
+    ' "$DASH" > /tmp/dash.tmp && mv /tmp/dash.tmp "$DASH"
+
+    echo "[patch-dashboard] Patched successfully."
+
+
+  nginx-ch.conf.tmpl: |
+    location /clickhouse/ {
+      proxy_pass         https://{{ .Values.clickhouse.internalServiceHost }}:{{ .Values.clickhouse.internalServicePort }}/;
+      proxy_set_header   Host              {{ .Values.clickhouse.internalServiceHost }};
+      proxy_set_header   X-ClickHouse-User "{{ .Values.clickhouse.user }}";
+      proxy_set_header   X-ClickHouse-Key  "${CH_TOKEN}";
+      proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
+      proxy_set_header   Authorization     "";
+      proxy_read_timeout 120s;
+      rewrite ^/clickhouse/(.*) /$1 break;
+    }
+ 
