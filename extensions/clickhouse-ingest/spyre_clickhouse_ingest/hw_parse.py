@@ -27,9 +27,13 @@ import regex as re
 # ----------------------------
 
 # Attempt banners
+# A stall retry annotates its banner: "=== Attempt 2/2 (stall retry, ...): Suite ===".
 RE_ATTEMPT_START = re.compile(
-    r"=== Attempt (?P<attempt>\d+)/(?P<total>\d+):\s*(?P<suite>.+?)\s*==="
+    r"=== Attempt (?P<attempt>\d+)/(?P<total>\d+)(?: \([^)]*\))?:\s*(?P<suite>.+?)\s*==="
 )
+# GHA echoes a step's script before running it, colored like this; its templated banners
+# carry literal numbers and suite names, so they would open a phantom attempt.
+GHA_SCRIPT_ECHO = "\x1b[36;1m"
 RE_ATTEMPT_FAILED = re.compile(r"=== Attempt \d+ FAILED \(exit=(?P<exit_code>\d+)\)")
 RE_ATTEMPT_PASSED = re.compile(r"=== Attempt \d+ PASSED")
 
@@ -232,7 +236,10 @@ _RE_CTRL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]+")
 _SKIP_JOB_NAMES = re.compile(
     r"^(detect changed files|run spyre unit tests|ingest|push.*(clickhouse|diagnostics)"
     r"|collect suites for|build torch-spyre wheel|generate test matrix"
-    r"|test matrix result|report empty test suites)",
+    r"|test matrix result|report empty test suites|detect integration-test label"
+    r"|derive artifact identity|resolve test (type|durations pin)"
+    r"|aggregate (test report|test durations|coverage)|integration test result"
+    r"|log upstream dependant tool regression trigger)",
     re.IGNORECASE,
 )
 
@@ -445,7 +452,7 @@ class LogParser:
         # Find attempt banners and slice the log into per-attempt chunks
         slices: list[tuple[int, int, int, int, str]] = []
         for i, line in enumerate(lines):
-            m = RE_ATTEMPT_START.search(line)
+            m = GHA_SCRIPT_ECHO not in line and RE_ATTEMPT_START.search(line)
             if m:
                 slices.append(
                     (
@@ -738,10 +745,12 @@ class SuiteFilenames:
         if is_pod_level_retry:
             stem = RE_POD_LEVEL_RETRY_SUFFIX.sub("", stem).strip()
 
-        # Strip a leading "run-tests" caller-job prefix before the skip check below,
+        # Strip a leading "run-tests" / "test" caller-job prefix before the skip check below,
         # however its separator survived filename sanitization: a literal "_" when the
         # original name used "/" with spaces, or whitespace when "/" was stripped bare.
-        m = re.match(r"^run-tests[\s_]+(.+)$", stem, re.IGNORECASE)
+        m = re.match(r"^run-tests[\s_]+(.+)$", stem, re.IGNORECASE) or re.match(
+            r"^test(?: _ |\s{2,})(.+)$", stem
+        )
         if m:
             stem = m.group(1).strip()
 

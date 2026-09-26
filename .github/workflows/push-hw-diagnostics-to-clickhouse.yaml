@@ -35,6 +35,7 @@ jobs:
     env:
       TRIGGERING_RUN_ID: ${{ github.event.workflow_run.id        || inputs.gha_run_id }}
       TRIGGERING_WORKFLOW: ${{ github.event.workflow_run.name       || 'tests' }}
+      TRIGGERING_DISPLAY_TITLE: ${{ github.event.workflow_run.display_title || '' }}
 
       INGEST_COMPONENT: torch-spyre
       # The arch of the ANALYSED legs, not of this ingest job -- so never $(uname -m), which
@@ -60,12 +61,33 @@ jobs:
             .github/actions
           sparse-checkout-cone-mode: false
 
+      # tier is a run_id hash input, so it must be push-to-clickhouse.yaml's "Extract suite tier"
+      # rule verbatim or these rows never join that run's cases. Empty there means the case
+      # ingest wrote no v2 rows, so the workflow name keeps these rows writable.
+      - name: Extract suite tier from display title
+        id: extract-tier
+        run: |
+          TIER=$(echo "${TRIGGERING_DISPLAY_TITLE}" | sed -n 's/.*(\(.*\))\s*$/\1/p')
+          echo "Resolved tier: ${TIER:-<none>, using ${TRIGGERING_WORKFLOW}}"
+          echo "tier=${TIER:-${TRIGGERING_WORKFLOW}}" >> "${GITHUB_OUTPUT}"
+
+      - name: Recover this leg's artifact_id
+        id: leg-artifact-id
+        uses: ./.github/actions/recover-threaded-run-id
+        with:
+          triggering-run-id: ${{ env.TRIGGERING_RUN_ID }}
+          artifact-name: artifact-id
+          label: Leg artifact_id
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Ingest hardware-failure diagnostics into ClickHouse
         id: ingest
         uses: ./.github/actions/ingest-hw-diagnostics-to-clickhouse
         with:
           gha-run-id: ${{ env.TRIGGERING_RUN_ID }}
           workflow-name: ${{ env.TRIGGERING_WORKFLOW }}
+          trigger-type: ${{ steps.extract-tier.outputs.tier }}
+          artifact-id: ${{ steps.leg-artifact-id.outputs.value }}
           component: ${{ env.INGEST_COMPONENT }}
           arch: ${{ env.LEG_ARCH }}
           gh-token: ${{ secrets.GITHUB_TOKEN }}

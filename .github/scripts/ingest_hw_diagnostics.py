@@ -166,7 +166,8 @@ def main() -> None:
 
     ctx = RunContext(
         run_id=run_id,
-        artifact_id=_str(args.artifact_id) or NIL_UUID,
+        # The first field of a derive-gha-artifact-id record, or a bare id.
+        artifact_id=_str(args.artifact_id).split("|", 1)[0].strip() or NIL_UUID,
         component=component,
         arch=arch,
         external_run_id=external_run_id,
