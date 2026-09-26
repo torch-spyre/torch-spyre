@@ -165,19 +165,26 @@ class ArtifactId(DerivedId):
     def from_image(cls, path: str = "") -> str:
         """The prebaked image's own artifact_id, read from inside it; '' when absent.
 
-        Tries the JSON record first, falling back to the pre-rollout bare-id file so an
-        image built before every component stamped its own JSON still derives something.
-        `path`, when given, overrides both attempts (it names the caller's single test file).
+        Without `path`, tries the JSON record then the pre-rollout bare-id file. `path` names
+        one file in either format. Only a uuid is returned, so a corrupt file yields ''.
         """
-        meta = cls.metadata_from_image(path or cls.JSON_FILE)
-        aid = cls.norm(meta.get("artifact_id")) if meta else ""
-        if aid:
+        for p in [path] if path else [cls.JSON_FILE, cls.FILE]:
+            try:
+                with open(p) as fh:
+                    text = fh.read()
+            except OSError:
+                continue
+            try:
+                data = json.loads(text)
+            except ValueError:
+                data = text
+            aid = cls.norm(data.get("artifact_id") if isinstance(data, dict) else data)
+            try:
+                uuid.UUID(aid)
+            except ValueError:
+                continue
             return aid
-        try:
-            with open(path or cls.FILE) as fh:
-                return cls.norm(fh.read())
-        except OSError:
-            return ""
+        return ""
 
 
 class GhaArtifactId(ArtifactId):

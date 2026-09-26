@@ -126,6 +126,22 @@ def test_an_unstamped_image_derives_nothing(derive_mod, tmp_path):
     )
 
 
+def test_no_override_reaches_the_librarys_json_first_default(derive_mod, monkeypatch):
+    # An empty --base-id-file must reach the library as '', not as the bare-id path, or the
+    # JSON record is never read once images stop shipping the bare file.
+    seen = []
+
+    def read(path=""):
+        seen.append(path)
+        return BASE
+
+    monkeypatch.setattr(
+        derive_mod, "_identity", lambda _dir: (read, lambda *a: "derived")
+    )
+    assert derive_mod.derive("torch-spyre", "amd64", "", "", str(LIB))[1] == "derived"
+    assert seen == [""]
+
+
 def test_a_blank_component_refuses_rather_than_colliding(derive_mod, base_file):
     # A blank hash input mints a uuid every incomplete artifact would share.
     record, aid, base = derive_mod.derive("", "amd64", "x", base_file, str(LIB))
@@ -214,7 +230,7 @@ def test_the_script_uses_the_shared_library_not_a_local_copy(derive_mod):
     # The point of extensions/clickhouse-ingest is that ONE definition runs everywhere.
     # Asserted on the FILE, not object identity: the script binds the module under a private
     # package name (see below), so it is the same source loaded twice, not a copy.
-    _, _, derive_id = derive_mod._identity(str(LIB))
+    _, derive_id = derive_mod._identity(str(LIB))
     assert derive_id.__module__.endswith(".identity")
     assert sys.modules[derive_id.__module__].__file__ == str(
         LIB / "spyre_clickhouse_ingest" / "identity.py"
@@ -258,7 +274,7 @@ def test_it_derives_with_no_clickhouse_driver_installed(tmp_path):
 def test_a_second_call_honours_a_different_library_dir(derive_mod, tmp_path):
     # The private package name is rebound per call; caching it would serve the first dir
     # forever, which is how a bogus --library-dir came back as a working import.
-    assert derive_mod._identity(str(LIB))[0].endswith("spyre_artifact_id.txt")
+    assert derive_mod._identity(str(LIB))[0].__module__ == f"{derive_mod._PKG}.identity"
     with pytest.raises(ModuleNotFoundError):
         derive_mod._identity(str(tmp_path / "nowhere"))
-    assert derive_mod._identity(str(LIB))[0].endswith("spyre_artifact_id.txt")
+    assert derive_mod._identity(str(LIB))[0].__module__ == f"{derive_mod._PKG}.identity"

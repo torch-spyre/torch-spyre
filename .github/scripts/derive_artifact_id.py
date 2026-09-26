@@ -37,7 +37,7 @@ def _identity(library_dir: str):
     for name in [n for n in sys.modules if n.startswith(f"{_PKG}.")]:
         del sys.modules[name]
     mod = importlib.import_module(f"{_PKG}.identity")
-    return mod.BASE_ARTIFACT_ID_FILE, mod.base_artifact_id, mod.gha_artifact_id
+    return mod.base_artifact_id, mod.gha_artifact_id
 
 
 def derive(
@@ -48,8 +48,9 @@ def derive(
     library_dir: str = "",
 ) -> tuple[str, str, str]:
     """-> (record, artifact_id, base_artifact_id), each '' when not derivable."""
-    default_file, read_base, derive_id = _identity(library_dir)
-    base = read_base(base_id_file or default_file)
+    read_base, derive_id = _identity(library_dir)
+    # '' lets the library try its JSON record before the pre-rollout bare-id file.
+    base = read_base(base_id_file)
     # Comma-joined to survive the recovery's whitespace strip; the library splits on both.
     installed = ",".join((installed or "").replace(",", " ").split())
     if not base:
@@ -124,7 +125,7 @@ def main(argv=None) -> int:
     else:
         print("artifact_id: <none — this leg's rows will carry no artifact>")
         print(
-            f"  base id read from: {args.base_id_file or '<library default>'} -> {base or '<absent>'}"
+            f"  base id read from: {args.base_id_file or '<library defaults>'} -> {base or '<absent>'}"
         )
 
     if record and args.output_file:

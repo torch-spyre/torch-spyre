@@ -228,13 +228,29 @@ def test_base_artifact_id_falls_back_to_bare_string_when_json_absent(tmp_path):
     assert base_artifact_id(str(f)) == "2b397099-6200-52fb-98c4-b603961a0582"
 
 
-def test_base_artifact_id_falls_back_on_malformed_json(tmp_path):
-    # Malformed JSON must not raise -- it degrades to the bare-string fallback read, at the
-    # library's own default path (a real deployment never points both formats at one file).
+def test_base_artifact_id_is_blank_for_a_corrupt_file(tmp_path):
+    # Corrupt content must not come back as an id: only a uuid is ever returned.
     bad = tmp_path / "spyre_artifact.json"
     bad.write_text("{not valid json")
     assert ArtifactId.metadata_from_image(str(bad)) == {}
-    assert base_artifact_id(str(tmp_path / "nope.txt")) == ""
+    assert base_artifact_id(str(bad)) == ""
+    no_id = tmp_path / "no_id.json"
+    no_id.write_text(json.dumps({"component": "torch-spyre"}))
+    assert base_artifact_id(str(no_id)) == ""
+
+
+def test_base_artifact_id_default_prefers_json_then_bare_file(tmp_path, monkeypatch):
+    # No path: the JSON record is tried first, and a corrupt one falls back to the bare file.
+    js, bare = tmp_path / "spyre_artifact.json", tmp_path / "spyre_artifact_id.txt"
+    monkeypatch.setattr(ArtifactId, "JSON_FILE", str(js))
+    monkeypatch.setattr(ArtifactId, "FILE", str(bare))
+    assert base_artifact_id() == ""
+    bare.write_text("11111111-1111-5111-8111-111111111111\n")
+    assert base_artifact_id() == "11111111-1111-5111-8111-111111111111"
+    js.write_text(json.dumps({"artifact_id": "2b397099-6200-52fb-98c4-b603961a0582"}))
+    assert base_artifact_id() == "2b397099-6200-52fb-98c4-b603961a0582"
+    js.write_text("{corrupt")
+    assert base_artifact_id() == "11111111-1111-5111-8111-111111111111"
 
 
 def test_metadata_from_image_returns_the_full_record(tmp_path):
