@@ -292,6 +292,7 @@ def _make_output_stl(
     Returns None if the resulting stick expression has an offset.
     """
     stick_size = get_elem_in_stick(dtype)
+    out_coords = host_coordinates(output, output_dep, None)
     if stick_dim >= 0 and c_size[stick_dim] == 1:
         return None
     dim_order = _compute_dim_order(stick_dim, c_size, out_coords)
