@@ -16,11 +16,11 @@
 import builtins
 import dataclasses
 import itertools
-import sympy
 import logging
 import math
 from collections.abc import Callable
 
+import sympy
 from sympy import Expr, Integer, Symbol, divisors
 from torch._inductor.dependencies import MemoryDep
 from torch._inductor.graph import GraphLowering
@@ -54,6 +54,7 @@ from .logging_utils import get_inductor_logger
 from .op_spec import IndirectAccess
 from .pass_utils import (
     SchedNodeArg,
+    commit_iteration_space_ownership,
     compute_granularity,
     compute_max_size,
     concretize_expr,
@@ -62,7 +63,6 @@ from .pass_utils import (
     get_mem_deps_from_rw,
     input_layout_for_operation,
     iteration_space_from_op,
-    commit_iteration_space_ownership,
     op_read_writes,
 )
 from .propagate_hints import get_op_hints
@@ -1533,6 +1533,10 @@ _LARGE_M_TILE_SHAPE_PENALTY_US = 20.0
 _SHARED_DOWN_N_SPLIT_PENALTY_US = 10.0
 _SHARED_NARROW_OUTPUT_REF = _TARGET_N_TILE_ELEMS * _COHORT_LIMIT
 _SHARED_N_TILE_TARGET = _TARGET_N_TILE_ELEMS // 4
+# Required n_dim split for batchmatmulfp8: pins core_fold=4 in the KERNEL tensor
+# coordInfo emitted by compute_ops.py (alpha = N//4, factor = 4). For shapes where
+# n_sticks < 4, the split is clamped to n_sticks (the largest available divisor).
+_FP8_BMM_N_SPLIT = 4
 
 
 def _matmul_multicast_penalty(consumers):
@@ -1580,8 +1584,12 @@ def _matmul_execution_cost(
     """
     (B, b), (M, m), (N, n), (K, k) = b_axis, m_axis, n_axis, k_axis
     cores_used = b * m * n * k
-    # Symbolic splits rely on the caller's enumerated candidate menu to enforce
-    # the core budget; a symbolic expression cannot take this Python branch.
+    # SYMBOLIC SPLITS SKIP THE BUDGET CHECK (`isinstance` is False for a sympy
+    # expression), and the fall-through cost is not merely mispriced but NEGATIVE
+    # outside the budget -- what a minimizing objective seeks. Valid only within
+    # `max_cores`, therefore, and it is the CALLER that has to hold that: the symbolic
+    # expression is built over one enumerated CoreDivision per op, which
+    # `CoOptimizingAllocator._division_map` asserts is within budget (issue #4387).
     if cores_used == 0 or (isinstance(cores_used, int) and cores_used > max_cores):
         return math.inf
 
@@ -1599,11 +1607,6 @@ def _matmul_execution_cost(
             True,
         ),
     )
-    # The peak includes both corelets. DXP's doCoreletSplitSdsc leaves an op
-    # requiring cross-core reduction on one corelet, so a K-split has half
-    # that compute throughput. This is separate from moving the partial sums.
-    # Keep the existing unsplit estimate; small/unaligned output tiles may
-    # also prevent the backend from using both corelets.
     compute_us = pt_eff_inv * (num_elems / cores_used) / _PEAK_MACS_US_CORE
     compute_us = piecewise((2 * compute_us, k > 1), (compute_us, True))
 
@@ -1869,12 +1872,24 @@ def _cost_model_matmul_planner(
     n_divs = factors(n_dim, n_sticks)
     k_divs = factors(k_dim, k_sticks)
 
+    is_fp8_bmm = op.data.reduction_type == BATCH_MATMUL_FP8_OP
+    # Pin n_dim split to _FP8_BMM_N_SPLIT when enough sticks are available, or to
+    # n_sticks itself for small shapes (e.g. n_sticks=2 → split=2), so the emitted
+    # core_fold is always a valid divisor of n_sticks.
+    fp8_bmm_n_split = (
+        min(_FP8_BMM_N_SPLIT, n_sticks) if is_fp8_bmm else _FP8_BMM_N_SPLIT
+    )
+
     best = None
     best_cost = math.inf
     for b_combo in b_combos:
         b_prod = math.prod(b_combo)
+        if is_fp8_bmm and b_prod != 1:
+            continue
         for mm in m_divs:
             for nn in n_divs:
+                if is_fp8_bmm and nn != fp8_bmm_n_split:
+                    continue
                 for kk in k_divs:
                     if b_prod * mm * nn * kk > max_cores:
                         continue
@@ -1912,6 +1927,8 @@ def _cost_model_matmul_planner(
         # always a multiple of 64 — satisfying the hardware alignment
         # requirement enforced at codegen time.
         new_splits[k_dim] = 1
+        if is_fp8_bmm:
+            new_splits[n_dim] = fp8_bmm_n_split
 
     logger.debug(
         f"cost_model work_division {op.get_name()}: "

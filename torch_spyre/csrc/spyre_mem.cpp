@@ -763,15 +763,67 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
       cpu_strides = dma_strides;
     }
   }
+  // FP8 multi-dim stick layout uses specialized DCI generation
+  if (stl.element_arrangement == ElementArrangement::QFP8WT) {
+    // Reverse PyTorch ordering before reading N/K from cpu_sizes.
+    std::reverse(cpu_sizes.begin(), cpu_sizes.end());
+    std::reverse(device_sizes.begin(), device_sizes.end());
 
-  dci.dcsi_ = get_device_stride_infos(cpu_sizes, cpu_strides, cpu_offset,
-                                      device_offset, stl, host2device);
+    const int64_t eps = stl.elems_per_stick();
+    const int64_t si = 2;
+    const int64_t so = eps / si;
+    // cpu_sizes is reversed from PyTorch ordering [K, N] → [N, K], so
+    // cpu_sizes[0] = N (columns) and cpu_sizes[1] = K (rows).
+    const int64_t N = cpu_sizes[0];
+    const int64_t K = cpu_sizes[1];
 
-  // Reverse PyTorch ordering
-  std::reverse(cpu_sizes.begin(), cpu_sizes.end());
-  std::reverse(device_sizes.begin(), device_sizes.end());
-  dci.input_shape_ = host2device ? cpu_sizes : device_sizes;
-  dci.output_shape_ = host2device ? device_sizes : cpu_sizes;
+    // Expanded device shape: [si, so, K/si, N/so]
+    TORCH_CHECK(K % si == 0, "QFP8WT K=", K, " must be divisible by si=", si);
+    TORCH_CHECK(N % so == 0, "QFP8WT N=", N, " must be divisible by so=", so);
+    const int64_t dim2 = K / si;
+    const int64_t dim3 = N / so;
+
+    // Host strides for the expanded layout
+    const int64_t dst2 = si * so;  // = eps = 128 (one full [2,64] stick)
+    const int64_t dst3 =
+        dim2 * eps;  // = (K/si) * si * so = K * so (one N-strip of sticks)
+
+    // Host (row-major) strides in the expanded 4D index space [si, so, dim2,
+    // dim3]:
+    //   element [k,n]: k = d2*si + a,  n = d3*so + b
+    //   host byte = k*N + n = (d2*si + a)*N + (d3*so + b)
+    //             = a*N + b*1 + d2*(si*N) + d3*so
+    //   → stride_src = [N, 1, si*N, so]
+    const std::vector<int64_t> host_strides = {N, 1, si * N, so};
+
+    // Device (QFP8WT [2,64] stick) strides in the expanded 4D index space:
+    //   physical byte = a*1 + b*si + d2*dst2 + d3*dst3
+    //   (within a stick: si dimension innermost at stride=1, so dimension at
+    //   stride=si) → stride = [1, si, dst2, dst3]
+    const std::vector<int64_t> device_strides = {1, si, dst2, dst3};
+
+    DataConversionStrideInfo dcsi;
+    dcsi.size_ = {si, so, dim2, dim3};
+    dcsi.stride_src_ = host2device ? host_strides : device_strides;
+    dcsi.stride_dst_ = host2device ? device_strides : host_strides;
+    dcsi.offset_src_ = host2device ? cpu_offset : 0;
+    dcsi.offset_dst_ = host2device ? 0 : cpu_offset;
+    dci.dcsi_ = {dcsi};
+    // For H2D, output (device) shape is the expanded 4D form.
+    // For D2H, output (host) shape is the original 2D cpu_sizes.
+    const std::vector<int64_t> expanded_dev_shape = {si, so, dim2, dim3};
+    dci.output_shape_ = host2device ? expanded_dev_shape : cpu_sizes;
+    dci.input_shape_ = host2device ? cpu_sizes : device_sizes;
+  } else {
+    dci.dcsi_ = get_device_stride_infos(cpu_sizes, cpu_strides, cpu_offset,
+                                        device_offset, stl, host2device);
+
+    // Reverse PyTorch ordering
+    std::reverse(cpu_sizes.begin(), cpu_sizes.end());
+    std::reverse(device_sizes.begin(), device_sizes.end());
+    dci.input_shape_ = host2device ? cpu_sizes : device_sizes;
+    dci.output_shape_ = host2device ? device_sizes : cpu_sizes;
+  }
   if (SPYRE_LOG_ENABLED("spyre.runtime",
                         torch_spyre::logging::LogLevel::DEBUG)) {
     std::stringstream s;
