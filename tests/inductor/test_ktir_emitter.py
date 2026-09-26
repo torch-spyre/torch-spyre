@@ -32,10 +32,11 @@ from test_ktir_validate import (
     make_onstick_sum_specs,
     make_op_spec,
     make_pooled_chain,
+    make_scalar_operand_op_spec,
     make_statistic_reader_specs,
     make_two_element_type_specs,
 )
-from torch_spyre._C import ElementArrangement
+from torch_spyre._C import DataFormats, ElementArrangement
 
 
 def _mlir_ktdp_available() -> bool:
@@ -908,6 +909,65 @@ class TestBroadcastOperandEmission(unittest.TestCase):
 
         emitted = generate_ktir("ktir_fused_add_0", [make_op_spec()])
         self.assertEqual(emitted, TestKtirEmitter.EXPECTED_ADD_KTIR)
+
+
+@unittest.skipUnless(
+    _mlir_ktdp_available(),
+    "mlir_ktdp with the func/arith/linalg/scf/tensor dialect bindings is not installed",
+)
+class TestReplicatedScalarOperandEmission(unittest.TestCase):
+    """A degenerate ``spyre.constant`` operand, read as a whole lane-walking stick."""
+
+    def test_the_scalar_is_read_as_its_whole_stick_at_both_formats(self):
+        """The one form dbo-opt lowers: full rank, full stick, lane axis walking.
+
+        The refused form is rank 1 at one element with an all-constant row -- and
+        so is the form that only raises the rank, ``1x1x1`` at ``(0, 0, 0)``.  Both
+        numbers here are therefore load-bearing: the STICK on the operand's
+        innermost axis, and a ``d`` (not a ``0``) in the map's last position.
+        """
+        from torch_spyre._inductor.codegen.ktir import generate_ktir
+
+        for dtype, stick, out in (
+            (DataFormats.SEN169_FP16, 64, "1x256x64"),
+            (DataFormats.IEEE_FP32, 32, "2x256x32"),
+        ):
+            with self.subTest(dtype=dtype):
+                emitted = generate_ktir(
+                    "k_scalar", [make_scalar_operand_op_spec(dtype)]
+                )
+                elem = "f16" if stick == 64 else "f32"
+                self.assertIn(
+                    f"ktdp.construct_memory_view %arg1, sizes: [1, 1, {stick}], "
+                    f"strides: [{stick}, {stick}, 1]",
+                    emitted,
+                )
+                self.assertIn(f"-> !ktdp.access_tile<1x1x{stick}xindex>", emitted)
+                self.assertIn(f"tensor<1x1x{stick}x{elem}>", emitted)
+                self.assertIn("affine_map<(d0, d1, d2) -> (0, 0, d2)>", emitted)
+                self.assertIn(
+                    f"ins(%2, %5 : tensor<{out}x{elem}>, tensor<1x1x{stick}x{elem}>)",
+                    emitted,
+                )
+
+    def test_the_producers_claim_and_not_the_shape_is_what_widens_the_read(self):
+        """Without ``replicated_scalar`` the identical shape keeps the old read.
+
+        The shape cannot answer whether the padding holds the value -- a full
+        reduction's 0-dim output has this exact description and holds the answer at
+        lane 0 only -- so the same spec minus the producer's claim must take the
+        stick-head route it always took, and reach the refusal rather than read
+        lanes nobody vouched for.
+        """
+        from torch_spyre._inductor.codegen.ktir import generate_ktir
+
+        emitted = generate_ktir(
+            "k_scalar_unclaimed",
+            [make_scalar_operand_op_spec(replicated=False)],
+        )
+        self.assertIn("ktdp.load %4 : <1xindex> -> tensor<1xf16>", emitted)
+        self.assertIn("affine_map<(d0, d1, d2) -> (0)>", emitted)
+        self.assertNotIn("affine_map<(d0, d1, d2) -> (0, 0, d2)>", emitted)
 
 
 @unittest.skipUnless(

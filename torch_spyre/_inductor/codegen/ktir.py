@@ -868,11 +868,98 @@ def _reads_stick_head(arg: TensorArg) -> bool:
     A COARSE-TILED arg carries no coordinates at all (it addresses through
     ``device_tile_advance_expr``), so there is nothing here to read and it is not
     one of these: the question is about a coordinate, not about an extent.
+
+    A replicated scalar answers this question the same way and must NOT be read
+    the same way, which is what ``_reads_every_lane`` separates out: narrowing to
+    the head is sound only because SOMETHING ELSE walks, and for a scalar nothing
+    does.  It is asked first, so this one never sees one.
     """
     if not arg.is_input or not len(arg.device_coordinates):
         return False
     coord = arg.device_coordinates[-1]
     return not getattr(coord, "free_symbols", None) and int(arg.device_size[-1]) > 1
+
+
+def _reads_every_lane(arg: TensorArg, out: TensorArg) -> bool:
+    """Whether this INPUT is a scalar the op should read a whole STICK of.
+
+    A ``spyre.constant`` operand -- ``a == 0.0`` -- is one stick at a constant
+    coordinate on every axis, so the shape it is described in walks nothing at
+    all.  Squeezing it the way a statistic read is squeezed (``_reads_stick_head``
+    fires on it too: constant innermost coordinate over a whole stick) leaves
+    rank 1 at extent 1, and ``operand_indexing`` then renders the only row such an
+    operand can have, ``(d0, d1, d2) -> (0)``.  dbo-opt refuses that:
+
+        error: no tensor.extract_slice user found; cannot determine the
+        per-operand tile type for ktdf.read_from_fifo
+
+    Raising the rank alone does not help -- ``tensor<1x1x1xf16>`` with an
+    all-pinned ``(0, 0, 0)`` row is refused with the same message.  What lowers is
+    the whole stick with the lane axis WALKING, ``tensor<1x1x64xf16>`` with
+    ``(0, 0, d2)``, measured at fp16 and at fp32 (``1x1x32``, a stick being 32
+    lanes at four bytes).  That is also the third of the three broadcast forms
+    ``operand_indexing`` documents, and the form the emitter already produces for
+    a real ``(256, 1)`` operand -- so this is a scalar taking the route a tensor
+    operand already takes, not a new shape.
+
+    Reading lanes the scalar was never asked for is only sound if they hold the
+    scalar, which is why the answer hangs on ``replicated_scalar`` and not on the
+    shape: the shape of a full reduction's 0-dim output is identical and its other
+    lanes hold partial sums.  Everything else asked here is a coherence check on
+    the rewrite ``_lane_walking`` performs, and a no leaves the operand exactly as
+    it arrived -- so a shape this has not been measured against reaches the old
+    refusal rather than a silent misread:
+
+    * equal rank, because the accepted form was measured at the output's rank;
+    * the output's own innermost axis must WALK, or there is no lane axis for the
+      operand's to follow;
+    * the two innermost extents must agree, because the operand covers that axis
+      whole rather than being stretched over it;
+    * every other operand axis is one element at a constant coordinate, i.e. the
+      operand really does walk nothing before the rewrite.
+    """
+    if not arg.replicated_scalar:
+        return False
+    coords = list(arg.device_coordinates)
+    out_coords = list(out.device_coordinates)
+    if not coords or len(coords) != len(out_coords):
+        return False
+    if len(arg.device_size) != len(out.device_size):
+        return False
+    if not getattr(out_coords[-1], "free_symbols", None):
+        return False
+    if int(arg.device_size[-1]) != int(out.device_size[-1]):
+        return False
+    if getattr(coords[-1], "free_symbols", None):
+        return False
+    return all(
+        not getattr(coord, "free_symbols", None) and int(arg.device_size[axis]) == 1
+        for axis, coord in enumerate(coords[:-1])
+    )
+
+
+def _lane_walking(arg: TensorArg, out: TensorArg) -> TensorArg:
+    """``arg`` re-described as reading one lane of its stick per output lane.
+
+    The whole rewrite is the innermost coordinate: the operand keeps its buffer,
+    its rank and its extents -- one stick, one element on every other axis -- and
+    its lane axis stops being pinned and starts following the output's.  Every
+    later derivation then reads a plain broadcast operand: ``_reads_stick_head``
+    no longer recognises it (its innermost coordinate now carries a symbol, so
+    nothing narrows the tile), ``align_reshape_plan`` still says broadcast, and
+    ``operand_indexing`` renders ``(0, .., d_last)`` from the coordinates as they
+    now stand rather than from a shape it has to be taught to invent.
+
+    Sound only under ``_reads_every_lane``'s conditions, which is where the
+    reasoning for it lives.
+    """
+    return dataclasses.replace(
+        arg,
+        device_coordinates=[
+            *arg.device_coordinates[:-1],
+            out.device_coordinates[-1],
+        ],
+    )
 
 
 def _reduce_surface(
@@ -1679,17 +1766,32 @@ class KernelPlan:
             # INPUT's coordinates straight off the spec to derive ``in_map``, so
             # squeezing a reduction's input here would leave the map describing a
             # rank the loaded tensor no longer has.
-            inputs = [
-                _squeezed(
-                    arg,
-                    placeholder_axes(
-                        arg.device_coordinates, [int(s) for s in arg.device_size]
-                    ),
-                )
-                if _reads_stick_head(arg)
-                else arg
-                for arg in inputs
-            ]
+            #
+            # The scalar case is asked FIRST, because it presents as a statistic
+            # read (``_reads_stick_head``) and is the opposite of one: a statistic
+            # is narrowed to the head of its stick and a scalar is widened to the
+            # whole of it, and only the scalar's producer can say that widening
+            # reads the value rather than padding (``_reads_every_lane``).  Both
+            # rewrite the operand rather than the map -- ``operand_indexing``
+            # renders whatever arrives, faithfully, so what has to be right is
+            # what arrives.
+            read: list[TensorArg] = []
+            for arg in inputs:
+                if _reads_every_lane(arg, out):
+                    read.append(_lane_walking(arg, out))
+                elif _reads_stick_head(arg):
+                    read.append(
+                        _squeezed(
+                            arg,
+                            placeholder_axes(
+                                arg.device_coordinates,
+                                [int(s) for s in arg.device_size],
+                            ),
+                        )
+                    )
+                else:
+                    read.append(arg)
+            inputs = read
             # ``align_reshape_plan`` is the SWITCH, not a refusal (see
             # ``_broadcast_surface``).  Asked of every operand, because it is a
             # property of the whole op: one broadcast operand makes the op a
@@ -3157,6 +3259,96 @@ class KtirBuilder:
             arms=(
                 Arm(kind=BindingKind.NAMED, binding=lambda: linalg.sub),
                 Arm(kind=BindingKind.PAYLOAD, binding=lambda: arith.subf),
+            ),
+        ),
+        # spyreop.compare is one op, not cmpf+select: it already returns the width
+        # compared (1.0/0.0), not a boolean.  Every predicate is ordered in the
+        # IEEE-754 sense (SpyreOp.td), so a NaN operand gives 0.0, notequal
+        # included -- the device's definition, not Python's, and a divergence worth
+        # knowing rather than papering over with a software-emulated arith.cmpf.
+        # Written out rather than comprehended over the six names, so each recipe
+        # names its predicate as a ``ComparePredicate`` member.  A comprehension
+        # would key both the dict and the predicate on one string, but those are
+        # two facts: the key is this repo's op name (``SpyreOpFuncs.ge`` emits
+        # ``PointwiseOp("greaterequal", ...)``) and the member is the dialect's
+        # spelling.  Equal today, so keying on one hides a future rename.  The
+        # member is reached inside the lambda because ``spyreop`` is ``None`` until
+        # ``_load_dialects`` runs -- the deferral every binding here uses.
+        "equal": Recipe(
+            arity=2,
+            arms=Arm(
+                kind=BindingKind.PAYLOAD,
+                binding=_written_here(
+                    lambda a, b: spyreop.compare(a, b, spyreop.ComparePredicate.Equal)
+                ),
+            ),
+        ),
+        "notequal": Recipe(
+            arity=2,
+            arms=Arm(
+                kind=BindingKind.PAYLOAD,
+                binding=_written_here(
+                    lambda a, b: spyreop.compare(
+                        a, b, spyreop.ComparePredicate.NotEqual
+                    )
+                ),
+            ),
+        ),
+        "greaterthan": Recipe(
+            arity=2,
+            arms=Arm(
+                kind=BindingKind.PAYLOAD,
+                binding=_written_here(
+                    lambda a, b: spyreop.compare(
+                        a, b, spyreop.ComparePredicate.GreaterThan
+                    )
+                ),
+            ),
+        ),
+        "greaterequal": Recipe(
+            arity=2,
+            arms=Arm(
+                kind=BindingKind.PAYLOAD,
+                binding=_written_here(
+                    lambda a, b: spyreop.compare(
+                        a, b, spyreop.ComparePredicate.GreaterEqual
+                    )
+                ),
+            ),
+        ),
+        "lesserthan": Recipe(
+            arity=2,
+            arms=Arm(
+                kind=BindingKind.PAYLOAD,
+                binding=_written_here(
+                    lambda a, b: spyreop.compare(
+                        a, b, spyreop.ComparePredicate.LesserThan
+                    )
+                ),
+            ),
+        ),
+        "lesserequal": Recipe(
+            arity=2,
+            arms=Arm(
+                kind=BindingKind.PAYLOAD,
+                binding=_written_here(
+                    lambda a, b: spyreop.compare(
+                        a, b, spyreop.ComparePredicate.LesserEqual
+                    )
+                ),
+            ),
+        ),
+        # torch.where(mask, a, b): mask first, matching aten's own order
+        # (SpyreOpFuncs.where(x, y, z) -> PointwiseOp("where3", [x, y, z])).
+        # spyreop.select's condition is "an ordinary value of the width being
+        # selected, not a boolean" (SpyreOp.td) -- exactly the float-encoded
+        # mask a comparison recipe above already produces, so it is passed
+        # straight through with no recovery step.
+        "where3": Recipe(
+            arity=3,
+            arms=Arm(
+                kind=BindingKind.PAYLOAD,
+                binding=_written_here(lambda mask, a, b: spyreop.select(mask, a, b)),
             ),
         ),
         "sum": Recipe(
