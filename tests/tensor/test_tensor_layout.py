@@ -888,6 +888,11 @@ class TestSpyreTensorLayout(TestCase):
         After finalize_layouts, the fp32 input has device_size=[3,2,32] but the
         FP32_TO_DL16 output requires 2*64/32=4 fp32 sticks of physical capacity.
         _pad_fp32_to_dl16_input must grow device_size[0] from 3 to 4.
+
+        The stride_map values are the ones a real [2, 96] tensor carries: the row
+        dim steps a whole host row, 96, not the stick width. Giving it 32 would
+        make it share dim 0's step, which spyre_mem.cpp rejects, and the padding
+        then has to take its room from a gap dim instead of this dim.
         """
         import unittest.mock as mock
         from torch_spyre._C import ElementArrangement
@@ -899,7 +904,7 @@ class TestSpyreTensorLayout(TestCase):
 
         # Build a fake input ComputedBuffer with a 3-stick fp32 FixedTiledLayout.
         in_stl = SpyreTensorLayout(
-            [3, 2, 32], [32, 32, 1], fp32, ElementArrangement.STANDARD
+            [3, 2, 32], [32, 96, 1], fp32, ElementArrangement.STANDARD
         )
         in_layout = FixedTiledLayout(
             torch.device("spyre"), torch.float32, [2, 96], [96, 1], in_stl
@@ -913,7 +918,7 @@ class TestSpyreTensorLayout(TestCase):
 
         # Build a fake FP32->DL16 output op with device_size=[2,2,64].
         out_stl = SpyreTensorLayout(
-            [2, 2, 64], [64, 32, 1], fp16, ElementArrangement.FP32_TO_DL16
+            [2, 2, 64], [64, 96, 1], fp16, ElementArrangement.FP32_TO_DL16
         )
         out_layout = FixedTiledLayout(
             torch.device("spyre"), torch.float16, [2, 96], [96, 1], out_stl
@@ -945,7 +950,7 @@ class TestSpyreTensorLayout(TestCase):
         self.assertIsInstance(padded_layout, FixedTiledLayout)
         self.assertEqual(list(padded_layout.device_layout.device_size), [4, 2, 32])
         # stride_map and stick dim are unchanged.
-        self.assertEqual(list(padded_layout.device_layout.stride_map), [32, 32, 1])
+        self.assertEqual(list(padded_layout.device_layout.stride_map), [32, 96, 1])
         self.assertEqual(padded_layout.device_layout.device_size[-1], 32)
 
     def _staggered_fp32_op(self, device_size, stride_map, host_size):
