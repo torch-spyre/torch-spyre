@@ -326,6 +326,7 @@ void AiuptiActivityProfilerSession::handleRuntimeActivity(
 
 void AiuptiActivityProfilerSession::handleKernelActivity(
     const AIUpti_ActivityCompute* activity, libkineto::ActivityLogger* logger) {
+  observedDeviceIds_.insert(activity->device_id);
   traceBuffer_.span.opCount += 1;
   traceBuffer_.gpuOpCount += 1;
   cpuCorrelationMap_[activity->correlation_id] = 0;  // fake add correlation
@@ -338,17 +339,37 @@ void AiuptiActivityProfilerSession::handleKernelActivity(
   kernel_activity->startTime = activity->start;
   kernel_activity->endTime = activity->end;
   kernel_activity->id = activity->correlation_id;
-  kernel_activity->device = activity->device_id;
-  kernel_activity->resource = activity->stream_id;
-  kernel_activity->threadId = activity->stream_id;
+  kernel_activity->device =
+      static_cast<int32_t>(activity->device_id) + libkineto::kExceedMaxPid;
+
+  // Route to the per-stream lane based on operation_kind:
+  //   DMI -> H2D lane  (host-to-device DMA in)
+  //   DMO -> D2H lane  (device-to-host DMA out)
+  //   EXEC/PREP and everything else -> Compute lane
+  StreamLane lane;
+  switch ((AIUpti_ActivityCmptKind)activity->operation_kind) {
+    case AIUPTI_ACTIVITY_KIND_DMI:
+      lane = StreamLane::H2D;
+      break;
+    case AIUPTI_ACTIVITY_KIND_DMO:
+      lane = StreamLane::D2H;
+      break;
+    default:
+      lane = StreamLane::Compute;
+      break;
+  }
+
+  const uint32_t resource = streamLaneResourceId(activity->stream_id, lane);
+  kernel_activity->resource = resource;
+  kernel_activity->threadId = resource;
   kernel_activity->flow.id = activity->correlation_id;
   kernel_activity->flow.type = libkineto::kLinkAsyncCpuGpu;
   kernel_activity->flow.start = 0;
   kernel_activity->linked = linked;
   kernel_activity->addMetadata("queued", activity->queued);
   kernel_activity->addMetadata("submitted", activity->submitted);
-  kernel_activity->addMetadata("device", kernel_activity->deviceId());
-  kernel_activity->addMetadata("stream", 1);
+  kernel_activity->addMetadata("device", activity->device_id);
+  kernel_activity->addMetadata("stream", activity->stream_id);
   kernel_activity->addMetadataQuoted("context",
                                      std::to_string(activity->context_id));
   kernel_activity->addMetadata("correlation", activity->correlation_id);
@@ -360,7 +381,7 @@ void AiuptiActivityProfilerSession::handleKernelActivity(
     }
   }
 
-  recordStream(kernel_activity->device, kernel_activity->resource);
+  recordStream(kernel_activity->device, activity->stream_id, lane);
 
   // checkTimestampOrder(&*kernel_activity);
   // if (outOfRange(*kernel_activity)) {
@@ -394,16 +415,19 @@ inline std::string memoryCopyOperationName(uint8_t kind) {
   return "<unknown>";
 }
 
+// For PtoP and unknown copy kinds there is no typed H2D/D2H lane; route to
+// the Unknown lane so the resource ID stays within the stream_id * kLaneCount
+// scheme and cannot collide with IDs from another stream.
 inline uint32_t getBaseResourceId(const AIUpti_ActivityMemcpy* activity) {
-  return activity->copy_kind * 100;
+  return streamLaneResourceId(activity->stream_id, StreamLane::Unknown);
 }
 
 inline uint32_t getBaseResourceId(const AIUpti_ActivityMemory* activity) {
-  return 400;
+  return streamLaneResourceId(activity->stream_id, StreamLane::MemMgmt);
 }
 
 inline uint32_t getBaseResourceId(const AIUpti_ActivityMemset* activity) {
-  return 400;  // put memset and memory release on the same PID
+  return streamLaneResourceId(activity->stream_id, StreamLane::MemMgmt);
 }
 
 template <class memory_activity_type>
@@ -445,6 +469,7 @@ template uint32_t AiuptiActivityProfilerSession::getResourceId<
 
 void AiuptiActivityProfilerSession::handleMemcpyActivity(
     const AIUpti_ActivityMemcpy* activity, libkineto::ActivityLogger* logger) {
+  observedDeviceIds_.insert(activity->device_id);
   traceBuffer_.span.opCount += 1;
   traceBuffer_.gpuOpCount += 1;
   cpuCorrelationMap_[activity->correlation_id] = 0;  // fake add correlation
@@ -457,30 +482,47 @@ void AiuptiActivityProfilerSession::handleMemcpyActivity(
   memcpy_activity->startTime = activity->start;
   memcpy_activity->endTime = activity->end;
   memcpy_activity->id = activity->correlation_id;
-  memcpy_activity->device = activity->device_id;
-  memcpy_activity->resource = getResourceId(activity);
-  memcpy_activity->threadId = activity->stream_id;
+  memcpy_activity->device =
+      static_cast<int32_t>(activity->device_id) + libkineto::kExceedMaxPid;
+
+  // Route to the per-stream lane based on copy direction.
+  // PtoP and unknown kinds fall back to the Unknown lane.
+  StreamLane lane;
+  switch ((AIUpti_ActivityMemcpyKind)activity->copy_kind) {
+    case AIUPTI_ACTIVITY_MEMCPY_KIND_HTOD:
+      lane = StreamLane::H2D;
+      break;
+    case AIUPTI_ACTIVITY_MEMCPY_KIND_DTOH:
+      lane = StreamLane::D2H;
+      break;
+    default:
+      lane = StreamLane::Unknown;
+      break;
+  }
+
+  uint32_t memcpy_resource =
+      (lane != StreamLane::Unknown)
+          ? streamLaneResourceId(activity->stream_id, lane)
+          : getResourceId(activity);
+  memcpy_activity->resource = memcpy_resource;
+  memcpy_activity->threadId = memcpy_resource;
   memcpy_activity->flow.id = 0;
   memcpy_activity->flow.type = libkineto::kLinkAsyncCpuGpu;
   memcpy_activity->flow.start = 0;
   memcpy_activity->linked = linked;
   memcpy_activity->addMetadataQuoted(
       "call", memoryCopyOperationName(activity->copy_kind));
-  memcpy_activity->addMetadata("device", memcpy_activity->deviceId());
+  memcpy_activity->addMetadata("device", activity->device_id);
   memcpy_activity->addMetadataQuoted("context",
                                      std::to_string(activity->context_id));
   memcpy_activity->addMetadata("correlation", activity->correlation_id);
   memcpy_activity->addMetadata("memory operation id", activity->copy_kind);
   memcpy_activity->addMetadata("bytes", activity->bytes);
   memcpy_activity->addMetadata("memory bandwidth (GB/s)", bandwidth(activity));
+  memcpy_activity->addMetadata("stream", activity->stream_id);
 
-  if (memcpy_activity->resource == getBaseResourceId(activity)) {
-    recordMemoryStream(memcpy_activity->device, memcpy_activity->resource,
-                       fmt::format("Memcpy ({}):", memoryCopyOperationName(
-                                                       activity->copy_kind)));
-  } else {
-    recordMemoryStream(memcpy_activity->device, memcpy_activity->resource, " ");
-  }
+  // Register the named lane for this memcpy direction.
+  recordMemoryStream(memcpy_activity->device, activity->stream_id, lane);
   // TODO(mamaral): verify if we can enable this
   // checkTimestampOrder(&*memcpy_activity);
   // if (outOfRange(*memcpy_activity)) {
@@ -524,16 +566,16 @@ void AiuptiActivityProfilerSession::handleMemoryActivity(
     mem_activity->startTime = activity->start;
     mem_activity->endTime = activity->end;
     mem_activity->id = activity->correlation_id;
-    mem_activity->device = activity->device_id;
+    mem_activity->device = kHostComputePid;
     mem_activity->resource = getResourceId(activity);
-    mem_activity->threadId = activity->stream_id;
+    mem_activity->threadId = mem_activity->resource;
     mem_activity->flow.id = 0;
     mem_activity->flow.type = libkineto::kLinkAsyncCpuGpu;
     mem_activity->flow.start = 0;
     mem_activity->linked = linked;
     mem_activity->addMetadataQuoted(
         "call", memoryOperationName(activity->memory_operation_type));
-    mem_activity->addMetadata("device", mem_activity->deviceId());
+    mem_activity->addMetadata("device", activity->device_id);
     mem_activity->addMetadataQuoted("context",
                                     std::to_string(activity->process_id));
     mem_activity->addMetadata("correlation", activity->correlation_id);
@@ -541,13 +583,10 @@ void AiuptiActivityProfilerSession::handleMemoryActivity(
                               activity->memory_operation_type);
     mem_activity->addMetadata("bytes", activity->bytes);
     mem_activity->addMetadata("memory bandwidth (GB/s)", bandwidth(activity));
+    // mem_activity->addMetadata("stream", activity->stream_id);
 
-    if (mem_activity->resource == getBaseResourceId(activity)) {
-      recordMemoryStream(mem_activity->device, mem_activity->resource,
-                         "Memory management:");
-    } else {
-      recordMemoryStream(mem_activity->device, mem_activity->resource, " ");
-    }
+    recordMemoryStream(kHostComputePid, activity->stream_id,
+                       StreamLane::MemMgmt);
     // checkTimestampOrder(&*mem_activity);
     // if (outOfRange(*mem_activity)) {
     //   traceBuffer_.span.opCount -= 1;
@@ -605,29 +644,25 @@ void AiuptiActivityProfilerSession::handleMemsetActivity(
   memset_activity->startTime = activity->start;
   memset_activity->endTime = activity->end;
   memset_activity->id = activity->correlation_id;
-  memset_activity->device = activity->device_id;
+  memset_activity->device = kHostComputePid;
   // TODO(mcalman): investigate why memset activities are being processed out
   // of order This prevents us from using getResourceId which handles overlap
   memset_activity->resource = getBaseResourceId(activity);
-  memset_activity->threadId = activity->stream_id;
+  memset_activity->threadId = memset_activity->resource;
   memset_activity->flow.id = 0;
   memset_activity->flow.type = libkineto::kLinkAsyncCpuGpu;
   memset_activity->flow.start = 0;
   memset_activity->linked = linked;
   memset_activity->addMetadataQuoted("call", "Memset");
-  memset_activity->addMetadata("device", memset_activity->deviceId());
+  memset_activity->addMetadata("device", activity->device_id);
   memset_activity->addMetadataQuoted("context",
                                      std::to_string(activity->context_id));
   memset_activity->addMetadata("correlation", activity->correlation_id);
   memset_activity->addMetadata("bytes", activity->bytes);
   memset_activity->addMetadata("memory bandwidth (GB/s)", bandwidth(activity));
+  // memset_activity->addMetadata("stream", activity->stream_id);
 
-  if (memset_activity->resource == getBaseResourceId(activity)) {
-    recordMemoryStream(memset_activity->device, memset_activity->resource,
-                       "Memory management:");
-  } else {
-    recordMemoryStream(memset_activity->device, memset_activity->resource, " ");
-  }
+  recordMemoryStream(kHostComputePid, activity->stream_id, StreamLane::MemMgmt);
 
   // TODO(mamaral): verify if we can enable this
   // checkTimestampOrder(&*memset_activity);

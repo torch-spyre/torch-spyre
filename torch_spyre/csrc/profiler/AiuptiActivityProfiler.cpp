@@ -73,6 +73,32 @@ void AiuptiActivityProfilerSession::processTrace(
         *aiuBuffer, std::bind(&AiuptiActivityProfilerSession::handlePtiActivity,
                               this, std::placeholders::_1, &logger));
   }
+
+  // Emit one DeviceInfo (PID) per observed AIU device. Use
+  // device_id + kExceedMaxPid as both the pid and the sort index so that:
+  //   - AIU rows appear below CPU rows (kExceedMaxPid pushes them down)
+  //   - device 0 pid != CPU process 0
+  for (uint32_t device_id : observedDeviceIds_) {
+    const int64_t aiu_pid =
+        static_cast<int64_t>(device_id) + libkineto::kExceedMaxPid;
+    logger.handleDeviceInfo(
+        libkineto::DeviceInfo(aiu_pid, aiu_pid,
+                              fmt::format("AIU {}", device_id),
+                              fmt::format("AIU {}", device_id)),
+        profilerStartTs_);
+  }
+
+  // Emit the "Host Compute" PID only if at least one memset or memory-release
+  // activity was recorded (i.e. a resource on kHostComputePid was registered).
+  const bool has_host_resources =
+      resourceInfo_.lower_bound({kHostComputePid, 0}) !=
+      resourceInfo_.lower_bound({kHostComputePid + 1, 0});
+  if (has_host_resources) {
+    logger.handleDeviceInfo(
+        libkineto::DeviceInfo(kHostComputePid, kHostComputePid, "Host Compute",
+                              "Host Compute"),
+        profilerStartTs_);
+  }
 }
 
 void AiuptiActivityProfilerSession::processTrace(
@@ -85,15 +111,21 @@ void AiuptiActivityProfilerSession::processTrace(
   processTrace(logger);
 }
 
-// TODO(mcalman): support multi-AIU
 std::unique_ptr<libkineto::DeviceInfo>
 AiuptiActivityProfilerSession::getDeviceInfo() {
-  int32_t pid = libkineto::processId();
-  std::string process_name = libkineto::processName(pid);
-  int aiu = 0;
+  // All DeviceInfo entries are emitted directly in processTrace().
+  // Return a non-null sentinel so that CuptiActivityProfiler::finalizeTrace
+  // sets use_default_device_info=false and skips the generic "GPU 0–15"
+  // fallback that would overwrite our "AIU {N}" / "Host Compute" labels.
+  if (observedDeviceIds_.empty()) {
+    return nullptr;
+  }
+  uint32_t first_id = *observedDeviceIds_.begin();
+  const int64_t aiu_pid =
+      static_cast<int64_t>(first_id) + libkineto::kExceedMaxPid;
   return std::make_unique<libkineto::DeviceInfo>(
-      aiu, aiu + libkineto::kExceedMaxPid, process_name,
-      fmt::format("AIU {}", 0));
+      aiu_pid, aiu_pid, fmt::format("AIU {}", first_id),
+      fmt::format("AIU {}", first_id));
 }
 
 std::vector<libkineto::ResourceInfo>
@@ -110,22 +142,28 @@ bool AiuptiActivityProfilerSession::hasDeviceResource(uint32_t device,
   return resourceInfo_.find({device, id}) != resourceInfo_.end();
 }
 
-void AiuptiActivityProfilerSession::recordStream(uint32_t device, uint32_t id) {
-  if (!hasDeviceResource(device, id)) {
+void AiuptiActivityProfilerSession::ensureResource(uint32_t device,
+                                                   uint32_t stream_id,
+                                                   StreamLane lane) {
+  const uint32_t resource = streamLaneResourceId(stream_id, lane);
+  const std::string label = streamLaneLabel(stream_id, lane);
+  if (!hasDeviceResource(device, resource)) {
     resourceInfo_.emplace(
-        std::make_pair(device, id),
-        libkineto::ResourceInfo(device, id, kExceedMaxTid + id,
-                                fmt::format("Stream {}", id)));
+        std::make_pair(device, resource),
+        libkineto::ResourceInfo(resource, resource, device, label));
   }
 }
 
+void AiuptiActivityProfilerSession::recordStream(uint32_t device,
+                                                 uint32_t stream_id,
+                                                 StreamLane lane) {
+  ensureResource(device, stream_id, lane);
+}
+
 void AiuptiActivityProfilerSession::recordMemoryStream(uint32_t device,
-                                                       uint32_t id,
-                                                       std::string name) {
-  if (!hasDeviceResource(device, id)) {
-    resourceInfo_.emplace(std::make_pair(device, id),
-                          libkineto::ResourceInfo(device, id, id, name));
-  }
+                                                       uint32_t stream_id,
+                                                       StreamLane lane) {
+  ensureResource(device, stream_id, lane);
 }
 
 std::unique_ptr<libkineto::CpuTraceBuffer>
