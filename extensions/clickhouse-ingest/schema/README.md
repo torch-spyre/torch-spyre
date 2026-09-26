@@ -42,38 +42,39 @@ DDL with the model means a column added to one is reviewed beside the other.
 
 ## Applying it
 
-**Nothing applies these files automatically.** There is no migration runner and no
-`schema_migrations` ledger for the v2 databases — every statement here has been applied by hand.
-So before writing to a v2 table, `DESCRIBE TABLE` it on the target server rather than trusting
-this directory or `schema.py`.
+`python -m spyre_clickhouse_ingest.apply_schema --database <db>` converges a database on these
+files. The `clickhouse-schema` workflow proves every PR against an empty server (apply twice; the
+second pass must change nothing). Live databases are applied by the spyre-frameworks Jenkins job
+`Spyre/ops/clickhouse-schema`: staging `spyre_v2_next` first, then prod `spyre_v2` behind an
+approval. `--check` prints the pending changes and exits 1 if there are any.
 
-Four mechanical gotchas, all hit while applying these:
+What an apply does, in order:
 
-- A `MergeTree` `ORDER BY` is fixed at creation, so adding a column to a sort key means
-  DROP+CREATE, not `ALTER`.
-- `MODIFY COLUMN` cannot convert `Float64` to `Array(Float64)` (Code 53, "same-dimensional Array,
-  Map or String types") — that change is also a DROP+CREATE, or a rewrite through a temp table on
-  a populated one.
-- Views must be dropped and recreated, not `CREATE OR REPLACE`d (the server rejects it:
-  `renameat2() is not supported`). Dropping a base table silently drops its views, so recreate
-  them explicitly, base view first — `v_benchmark_results_enriched` before the four that select
-  from it.
-- Materialized views fire **on insert only**. They cannot be backfilled from rows already in
-  their source table, so a definition change means re-inserting, and the MV must exist before
-  the data lands. Upstream ships a backfill `INSERT` beside its own MV for this reason.
+1. Creates any missing table or materialized view.
+2. Runs each `migrations/NNN_*.sql` not yet in the database's `schema_migrations` ledger, once.
+3. Compares every existing table and MV with its file, in the server's own formatting. A
+   difference **fails the run** — it never ALTERs. Change a live table with a migration, then
+   update its `CREATE` here to the resulting shape.
+4. Creates missing views and drops+recreates changed ones (a plain view holds no data).
+
+Rules this implies:
+
+- `schema/*.sql` holds only `CREATE` statements; an `ALTER`, `INSERT` or backfill goes in
+  `migrations/`.
+- A new MV needs a backfill migration for the rows already in its source (MVs fire on insert
+  only); cut off at the MV's own `metadata_modification_time` so no row is counted twice — see
+  `migrations/002_*`.
+- A file marked `-- APPLY: explicit` (`80-otel.sql`, which lives in the v1 `spyre` database)
+  applies only with `--include <file>`.
+
+Mechanical constraints behind those rules:
+
+- A `MergeTree` `ORDER BY` is fixed at creation, so adding a column to a sort key means a
+  rebuild migration, not `ALTER`.
+- `MODIFY COLUMN` cannot convert `Float64` to `Array(Float64)` (Code 53) — also a rebuild.
+- The server rejects `CREATE OR REPLACE VIEW` (`renameat2() is not supported`), and dropping a
+  base table silently drops its views.
 
 Several comments in these files cite row counts and percentages measured when the statement was
 written. They are evidence for a design decision, not live figures; re-measure before relying on
 one.
-
-## State
-
-On the **prod** server, `spyre_v2` matches these files for every table except the HUD
-projection, verified column-for-column (including view signatures for the benchmark views):
-
-- The `oss_ci_benchmark_*` pair in `70-` **does not exist in prod** — that file is the intended
-  shape, not a deployed one. It was verified on the dev server: applying it and inserting one
-  `benchmark_runs` row propagated through both materialized views, and a live HUD read the result
-  with upstream's own queries unmodified.
-- Staging `spyre_v2_next` has `component` but **not** the widened `measurements` or the `samples`
-  column, so staging and prod differ on the benchmark pair.
