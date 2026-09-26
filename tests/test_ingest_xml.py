@@ -684,3 +684,24 @@ def test_a_write_failure_never_propagates(ingest):
 
     legs = {(_RUN_ID, "regression"): {"failed": 0, "total": 1, "duration_s": 1.0}}
     ingest._write_artifact_verdicts(Boom(), "db", _args(), legs)
+
+
+def test_a_repeated_testcase_is_one_row_and_the_last_attempt_wins(ingest, tmp_path):
+    path = tmp_path / "suite.xml"
+    path.write_text(
+        "<testsuites><testsuite name='pytest'>"
+        "<testcase classname='c' name='test_a' time='1'><failure message='x'/></testcase>"
+        "<testcase classname='c' name='test_b' time='2'/>"
+        "<testcase classname='c' name='test_a' time='3'/>"
+        "<testcase classname='c' name='test_B' time='4'/>"
+        "</testsuite></testsuites>",
+        encoding="utf-8",
+    )
+    run, cases = ingest.parse_test_xml(path)
+    by_name = {c["name"]: c for c in cases}
+    # Exact match only: test_b and test_B are different tests.
+    assert sorted(by_name) == ["test_B", "test_a", "test_b"]
+    assert by_name["test_a"]["status"] == "passed"
+    assert by_name["test_a"]["duration_s"] == 3.0
+    assert run["total_tests"] == 3
+    assert run["failed"] == 0

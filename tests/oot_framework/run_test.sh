@@ -1716,53 +1716,44 @@ _parse_pytest_summary_line() {
 # XML shard merger: combines N JUnit XML files (each produced by a separate
 # pytest run) into one, summing suite-level counters and concatenating all
 # <testcase> elements (which already carry their injected <properties> tags).
+# Parsed, not regex-matched: a self-closing <testcase/> followed by a full one
+# otherwise matches both patterns and lands in the output twice.
 # ---------------------------------------------------------------------------
 _XML_MERGE_PY='
-import sys, re
-from pathlib import Path
+import sys
+import xml.etree.ElementTree as ET
 
 out_path    = sys.argv[1]
 shard_paths = sys.argv[2:]
 
-all_cases   = []
-total_tests = 0
-total_err   = 0
-total_fail  = 0
-total_skip  = 0
-total_time  = 0.0
-
-def _attr(xml, name, default="0"):
-    m = re.search(rf"{name}=\"([^\"]*)\"", xml)
-    return m.group(1) if m else default
+counters = {"tests": 0, "errors": 0, "failures": 0, "skipped": 0}
+total_time = 0.0
+merged_suite = ET.Element("testsuite", name="pytest")
 
 for sp in shard_paths:
-    txt = Path(sp).read_text()
-    suite_m = re.search(r"<testsuite([^>]*)>", txt)
-    if suite_m:
-        attrs = suite_m.group(1)
-        total_tests += int(_attr(attrs, "tests"))
-        total_err   += int(_attr(attrs, "errors"))
-        total_fail  += int(_attr(attrs, "failures"))
-        total_skip  += int(_attr(attrs, "skipped"))
+    try:
+        root = ET.parse(sp).getroot()
+    except ET.ParseError as e:
+        print(f"[torch_oot_device_tests_run] WARNING: skipping unparsable shard {sp}: {e}", file=sys.stderr)
+        continue
+    for suite in root.iter("testsuite"):
+        for k in counters:
+            counters[k] += int(suite.get(k, "0") or 0)
         try:
-            total_time += float(_attr(attrs, "time", "0"))
+            total_time += float(suite.get("time", "0") or 0)
         except ValueError:
             pass
-    # Collect full and self-closing <testcase> blocks.
-    blocks  = re.findall(r"<testcase[^>]*>.*?</testcase>", txt, re.DOTALL)
-    blocks += re.findall(r"<testcase[^>]*/>",              txt)
-    all_cases.extend(blocks)
+        for k in ("timestamp", "hostname"):
+            if suite.get(k) and merged_suite.get(k) is None:
+                merged_suite.set(k, suite.get(k))
+        merged_suite.extend(suite.findall("testcase"))
 
-merged = (
-    "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n"
-    "<testsuites>"
-    f"<testsuite name=\"pytest\" tests=\"{total_tests}\" "
-    f"errors=\"{total_err}\" failures=\"{total_fail}\" "
-    f"skipped=\"{total_skip}\" time=\"{total_time:.3f}\">"
-    + "\n".join(all_cases)
-    + "</testsuite></testsuites>"
-)
-Path(out_path).write_text(merged)
+for k, v in counters.items():
+    merged_suite.set(k, str(v))
+merged_suite.set("time", f"{total_time:.3f}")
+root = ET.Element("testsuites")
+root.append(merged_suite)
+ET.ElementTree(root).write(out_path, encoding="utf-8", xml_declaration=True)
 print(f"[torch_oot_device_tests_run] Merged {len(shard_paths)} XML shard(s) -> {out_path}", flush=True)
 '
 
