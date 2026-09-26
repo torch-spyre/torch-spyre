@@ -155,9 +155,26 @@ runs:
         source .venv/bin/activate
         mkdir -p raw_logs
 
-        gh api \
+        # A nightly lists hundreds of jobs, and a transient 502 here dropped whole nights.
+        retry() {
+          local max_attempts=5 attempt=1 delay=2
+          until "$@"; do
+            if [ "${attempt}" -ge "${max_attempts}" ]; then
+              echo "::error::command failed after ${attempt} attempts: $*" >&2
+              return 1
+            fi
+            echo "[retry] attempt ${attempt} failed, retrying in ${delay}s: $*" >&2
+            sleep "${delay}"
+            attempt=$((attempt + 1))
+            delay=$((delay * 2))
+          done
+        }
+
+        retry gh api \
+          --method GET \
           "/repos/${REPO}/actions/runs/${RUN_ID}/jobs" \
           --paginate \
+          -f per_page=100 \
           --jq '.jobs[]
                 | select(.name | startswith("model-ops / "))
                 | {id: .id, name: (.name | sub("^model-ops / "; ""))}' \
