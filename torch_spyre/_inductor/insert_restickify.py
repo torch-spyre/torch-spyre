@@ -37,6 +37,7 @@ from torch._inductor.ir import (
     ComputedBuffer,
     FixedLayout,
     InputBuffer,
+    InvokeSubgraph,
     IRNode,
     MutableBox,
     MutationLayoutSHOULDREMOVE,
@@ -207,7 +208,7 @@ def _record_restickify(
 
 
 def _create_restickify_node(
-    restick_arg_info: RestickifyArgInfo, op: ComputedBuffer
+    restick_arg_info: RestickifyArgInfo, op: Operation
 ) -> tuple[str, ComputedBuffer]:
     """
     Lower a restickify FX node for the given incompatible input arg.
@@ -573,6 +574,89 @@ def insert_restickify_on_node_inputs(
         )
 
 
+def insert_restickify_on_subgraph_operands(
+    op: InvokeSubgraph,
+    resticks_needed: list[RestickifyArgInfo],
+    operations: list[Operation],
+) -> None:
+    """Insert restickify nodes before an InvokeSubgraph and repoint its operands.
+
+    Same plan and same node builder as the ComputedBuffer path; only the
+    attachment differs. A ComputedBuffer consumes inputs through ``ops.load``
+    calls in ``inner_fn``, so that path redirects by wrapping ``inner_fn`` with
+    InputEdgeSwapHandler. An InvokeSubgraph is an ExternKernel: no ``inner_fn``,
+    no loads to intercept -- it names its operands by node reference in
+    ``self.inputs``, rendered at codegen via ``codegen_reference()``. So the
+    redirect is a reference swap.
+
+    Only ``inputs`` is repointed. ``InvokeSubgraph`` declares an ``operands``
+    dataclass field, but ``__init__`` never assigns it -- it forwards its
+    ``operands`` argument to ``super().__init__(inputs=operands)`` and sets only
+    ``subgraph`` and ``name`` -- so the field stays ``None`` on every instance,
+    and nothing reads it (``codegen_invoke_subgraph`` and this backend's layout
+    seeding both go through ``.inputs``). Writing a partially-repointed list into
+    it would manufacture the very divergence there is none of today.
+
+    A restickify preserves host size/stride and changes only the device layout
+    (see ``_fixed_tiled``), which is what makes a bare reference repoint safe
+    here: ``InvokeSubgraph.create`` ran ``constrain_to_fake_tensor`` to force each
+    operand to the subgraph placeholder's strides, and that constraint still
+    holds. Asserted rather than assumed.
+    """
+    try:
+        op_index = operations.index(op)
+    except ValueError:
+        raise AssertionError(
+            f"InvokeSubgraph {op.get_name()} not found in operations list"
+        ) from None
+
+    for restick_arg_info in resticks_needed:
+        arg_name = restick_arg_info.arg_name
+        old_layout = V.graph.get_buffer(arg_name).get_layout()
+
+        _, restick_buff = _create_restickify_node(restick_arg_info, op)
+        new_layout = restick_buff.get_layout()
+        assert tuple(new_layout.size) == tuple(old_layout.size) and tuple(
+            new_layout.stride
+        ) == tuple(old_layout.stride), (
+            f"restickify of invoke_subgraph operand {arg_name!r} changed the host "
+            f"layout ({tuple(old_layout.size)}/{tuple(old_layout.stride)} -> "
+            f"{tuple(new_layout.size)}/{tuple(new_layout.stride)}); the operand is "
+            f"constrained to the subgraph placeholder's strides, so only the "
+            f"device layout may change"
+        )
+
+        # Repoint every operand slot naming the old buffer, by position rather
+        # than rebuilding -- so a buffer passed twice is handled and non-buffer
+        # operands (ShapeAsConstantBuffer) are left alone. maybe_get_name is
+        # defined on IRNode, so it is total over every operand type and returns
+        # None for the ones that carry no buffer.
+        swapped = 0
+        new_inputs = list(op.inputs)
+        for i, operand in enumerate(new_inputs):
+            if operand.maybe_get_name() == arg_name:
+                new_inputs[i] = restick_buff
+                swapped += 1
+        op.inputs = new_inputs
+        assert swapped, (
+            f"restickify planned for invoke_subgraph {op.get_name()} operand "
+            f"{arg_name!r}, but no operand slot names that buffer"
+        )
+
+        # lower_restickify's realize() appended the node at the end; move it just
+        # before the consumer to preserve topological order.
+        operations.remove(restick_buff)
+        operations.insert(op_index, restick_buff)
+        op_index += 1  # consumer shifted right by 1
+
+        logger.info(
+            "restickified invoke_subgraph %s operand %s -> %s",
+            op.get_name(),
+            arg_name,
+            restick_buff.get_name(),
+        )
+
+
 def insert_restickify(graph: GraphLowering) -> None:
     """Insert restickify operations before all nodes in restickify_plan.
 
@@ -588,8 +672,14 @@ def insert_restickify(graph: GraphLowering) -> None:
     for op in list(
         operations
     ):  # copy since insert_restickify_on_node_inputs mutates operations
-        if isinstance(op, ComputedBuffer) and op.get_name() in restickify_plan:
+        if op.get_name() not in restickify_plan:
+            continue
+        if isinstance(op, ComputedBuffer):
             insert_restickify_on_node_inputs(
+                op, restickify_plan[op.get_name()], operations
+            )
+        elif isinstance(op, InvokeSubgraph):
+            insert_restickify_on_subgraph_operands(
                 op, restickify_plan[op.get_name()], operations
             )
 
@@ -634,8 +724,16 @@ def finalize_layouts(graph: GraphLowering) -> None:
 
         # Commit the chosen STL and wrap in a FixedTiledLayout
         # Exclude mutation ops because their op.layout must not be set
-        # until after the scheduler runs
-        if op_layouts and not isinstance(op.layout, MutationLayoutSHOULDREMOVE):
+        # until after the scheduler runs.
+        # Exclude InvokeSubgraph: it carries MultiOutputLayout and has no tensor
+        # layout of its own (its results' layouts live on the trailing
+        # MultiOutputs), so there is nothing to wrap -- but it still needs the
+        # operand restickify planning below.
+        if (
+            op_layouts
+            and not isinstance(op.layout, MutationLayoutSHOULDREMOVE)
+            and not isinstance(op, InvokeSubgraph)
+        ):
             stl = committed if cost_fn else op_layouts[0]
             op.layout = _fixed_tiled(op.layout, cast(SpyreTensorLayout, stl))
             # Tiled-reduction scratch: propagate the reduction op's device

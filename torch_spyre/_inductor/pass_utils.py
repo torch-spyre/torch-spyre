@@ -879,6 +879,12 @@ def indirect_info_from_op(
     if op is None:
         return set(), {}, None
 
+    # An ExternKernel consumer (e.g. InvokeSubgraph, whose operands carry layout
+    # edges) has no ``.data`` and no inner_fn to walk, so it can hold no indirect
+    # reads. Treat it like op=None rather than AttributeError-ing on op.data.
+    if not isinstance(op, ComputedBuffer):
+        return set(), {}, None
+
     from torch._inductor.ir import Scatter
 
     # For scatter ops, extract info from the write side instead of reads.
@@ -2357,7 +2363,7 @@ def compute_restickify_needed(
     in_dep: MemoryDep,
     out_stl: SpyreTensorLayout,
     out_dep: MemoryDep,
-    op: "ComputedBuffer | None" = None,
+    op: "Operation | None" = None,
     require_exact: bool = False,
 ) -> "tuple[bool, SpyreTensorLayout | None]":
     """Determine whether a restickify is needed for one (in_stl, out_stl) pair.
@@ -2513,6 +2519,24 @@ def copy_fx_custom_meta(src: "torch.fx.Node", dst: "torch.fx.Node") -> None:
     """
     if "custom" in src.meta:
         dst.meta["custom"] = src.meta["custom"]
+
+
+def origin_in_graph(origins, g: "torch.fx.Graph") -> "torch.fx.Node | None":
+    """Pick the origin fx.Node that belongs to graph ``g``.
+
+    A buffer lowered inside an ``invoke_subgraph`` HOP (e.g. a
+    ``nested_compile_region`` block reused across layers) inherits origins that
+    span BOTH the parent graph (the ``invoke_subgraph`` call / ``get_attr``
+    nodes) AND the subgraph's own compute nodes. ``IRNode.current_origins``
+    unions as ``old | origins`` into an insertion-ordered ``OrderedSet``, so the
+    PARENT nodes come first and a bare ``next(iter(origins))`` returns a foreign
+    parent-graph node. Filter to the graph being lowered. Returns ``None`` if no
+    origin lives in ``g``.
+    """
+    return next(
+        (n for n in origins if isinstance(n, torch.fx.Node) and n.graph is g),
+        None,
+    )
 
 
 def _repoint_mutation_targets(

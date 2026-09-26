@@ -33,7 +33,7 @@ from torch.utils._ordered_set import OrderedSet
 from .logging_utils import get_inductor_logger
 from .loop_info import ReadCopyElisionRecord
 from .errors import Unsupported
-from .pass_utils import replace_computed_buffer_body
+from .pass_utils import origin_in_graph, replace_computed_buffer_body
 from .constants import is_ea_compatible
 from .provenance import decompose_provenance
 from torch_spyre._C import SpyreTensorLayout, ElementArrangement
@@ -709,24 +709,6 @@ def _patch_original_buf(
     V.graph.name_to_buffer[new_op.get_name()] = new_op
 
 
-def _origin_in_graph(origins, g: "fx.Graph") -> "fx.Node | None":
-    """Pick the origin fx.Node that belongs to graph ``g``.
-
-    A buffer lowered inside an ``invoke_subgraph`` HOP (e.g. a
-    ``nested_compile_region`` block reused across layers) inherits origins that
-    span BOTH the parent graph (the ``invoke_subgraph`` call / ``get_attr``
-    nodes) AND the subgraph's own compute nodes. FX insertion
-    (``inserting_before``) requires an anchor in the *current* lowering graph,
-    and ``next(iter(origins))`` may return a foreign parent-graph node — whose
-    ``.graph is not g`` — which asserts. Filter to the graph being lowered.
-    Returns ``None`` if no origin lives in ``g``.
-    """
-    return next(
-        (n for n in origins if isinstance(n, fx.Node) and n.graph is g),
-        None,
-    )
-
-
 def _get_op_name(op) -> str:
     """Extract the operation name from a node for validation."""
     if not hasattr(op.data, "origins") or not op.data.origins:
@@ -740,7 +722,7 @@ def _get_op_name(op) -> str:
     gl = V.graph
     origin_node = None
     if hasattr(gl, "graph"):
-        origin_node = _origin_in_graph(op.data.origins, gl.graph)
+        origin_node = origin_in_graph(op.data.origins, gl.graph)
     if origin_node is None:
         origin_node = next(iter(op.data.origins))
 
@@ -855,7 +837,7 @@ def split_multi_ops(graph: GraphLowering):
     for tbs in gl.name_to_users.values():
         for tb in tbs:
             if tb.data.origins:
-                fx_node = _origin_in_graph(tb.data.origins, gl.graph)
+                fx_node = origin_in_graph(tb.data.origins, gl.graph)
                 if fx_node is None:
                     fx_node = next(iter(tb.data.origins))
                 env[fx_node] = tb
@@ -892,9 +874,9 @@ def split_multi_ops(graph: GraphLowering):
         # Skip if no FX graph origin node in the current (sub)graph. A buffer
         # lowered inside an invoke_subgraph HOP carries origins from both the
         # parent graph and the subgraph; only the subgraph-local origin is a
-        # valid inserting_before anchor here. _origin_in_graph already enforces
+        # valid inserting_before anchor here. origin_in_graph already enforces
         # node-ness and current-graph membership.
-        orig_node = _origin_in_graph(op.origins, gl.graph)
+        orig_node = origin_in_graph(op.origins, gl.graph)
         if orig_node is None:
             continue
 
