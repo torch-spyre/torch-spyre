@@ -23,20 +23,22 @@ SELECT
     r.iterations AS iterations,
     r.props AS run_props,
     ar.artifact_id,
-    -- Where it ran: the leg's arch, else whatever the producer stamped (props arch/platform, or
-    -- the `<job>-perf-<arch>/` segment of source_file). Folded to one spelling, as identity.py's
-    -- canonical_arch folds it for the hash (Jenkins says 'amd64', GHA 'x86_64').
-    if((multiIf(ar.arch != '', ar.arch,
-                r.props['arch'] != '', r.props['arch'],
+    -- Where it ran: the producer's props arch/platform, else the leg's arch. Folded to one
+    -- spelling, as identity.py's canonical_arch folds it (Jenkins 'amd64', GHA 'x86_64').
+    if((multiIf(r.props['arch'] != '', r.props['arch'],
                 r.props['platform'] != '', r.props['platform'],
+                ar.arch != '', ar.arch,
+                -- Fallback only: parses the `<job>-perf-<arch>/` segment of source_file, a
+                -- path convention rather than a recorded field.
                 extract(r.props['source_file'], '^[^/]*-perf-([A-Za-z0-9_]+)/')) AS raw_arch)
            IN ('amd64', 'x86', 'x86-64'), 'x86_64', raw_arch) AS arch,
     -- The producing job, which separates suites the stored component does not (hf-adapters' perf
     -- job files its rows as torch-spyre).
     extract(r.props['source_file'], '^([^/]+)/') AS source_job,
-    -- When the run happened; `ts` is ingest time (DEFAULT now()), used only when the producer
-    -- stamps no run_utc.
+    -- When the run happened: run_utc when stamped, else ingest `ts` (DEFAULT now()), which
+    -- ts_source names so a reader can tell a run time from an ingest time.
     ifNull(parseDateTimeBestEffortOrNull(r.props['run_utc'], 'UTC')::Nullable(DateTime), r.ts) AS run_ts,
+    if(isNull(parseDateTimeBestEffortOrNull(r.props['run_utc'], 'UTC')), 'ingest', 'run_utc') AS ts_source,
     ar.test_type, ar.state
 FROM benchmark_runs AS r
 INNER JOIN benchmarks AS b USING (benchmark_id)
@@ -75,13 +77,17 @@ FROM v_benchmark_results_enriched;
 -- Replaces perf_kernels.ratio, which v1 stored beside the two values it divides. Two pairings,
 -- ratio = value / baseline_value:
 --   in_row    - one row's own spyre_ms against its cpu_ms (the harness times both per op).
---   cross_run - torch-spyre against sendnn on the same benchmark_id and arch. They never share a
---               run, so each row pairs with the latest sendnn run at or before it (ASOF).
+--   cross_run - torch-spyre against sendnn: same component, benchmark_id, arch and metric. They
+--               never share a run, so each row pairs with the latest sendnn run at or before it
+--               (ASOF), and only within 7 days (gap_hours) -- older than that the baseline no
+--               longer describes the same toolchain.
 -- Zeros are dropped: producers write 0 for a metric they did not measure.
 CREATE VIEW IF NOT EXISTS v_benchmark_backend_compare AS
 SELECT
     run_id, benchmark_id, component, name, arch, record_type, kernel_name,
-    backend, 'cpu' AS baseline_backend, run_id AS baseline_run_id, 'in_row' AS pairing,
+    backend, 'cpu' AS baseline_backend, 'in_row' AS pairing,
+    run_ts AS ts, ts_source, run_id AS baseline_run_id, run_ts AS baseline_ts,
+    ts_source AS baseline_ts_source, 0 AS gap_hours,
     'spyre_ms' AS metric,
     measurements['spyre_ms'] AS value,
     measurements['cpu_ms']   AS baseline_value,
@@ -91,25 +97,28 @@ WHERE measurements['spyre_ms'] != 0 AND measurements['cpu_ms'] != 0
 UNION ALL
 SELECT
     t.run_id, t.benchmark_id, t.component, t.name, t.arch, t.record_type, t.kernel_name,
-    t.backend, 'sendnn', s.run_id, 'cross_run',
+    t.backend, 'sendnn', 'cross_run',
+    t.run_ts, t.ts_source, s.run_id, s.run_ts, s.ts_source,
+    dateDiff('hour', s.run_ts, t.run_ts),
     t.metric, t.value, s.value, t.value / s.value
 FROM
 (
     SELECT run_id, benchmark_id, component, name, arch, record_type, kernel_name, backend,
-           run_ts, m.1 AS metric, m.2 AS value
+           run_ts, ts_source, m.1 AS metric, m.2 AS value
     FROM v_benchmark_results_enriched
     ARRAY JOIN CAST(measurements, 'Array(Tuple(String, Float64))') AS m
     WHERE backend != 'sendnn' AND m.2 != 0
 ) AS t
 ASOF INNER JOIN
 (
-    SELECT run_id, benchmark_id, arch, run_ts, m.1 AS metric, m.2 AS value
+    SELECT run_id, benchmark_id, component, arch, run_ts, ts_source, m.1 AS metric, m.2 AS value
     FROM v_benchmark_results_enriched
     ARRAY JOIN CAST(measurements, 'Array(Tuple(String, Float64))') AS m
     WHERE backend = 'sendnn' AND m.2 != 0
 ) AS s
-ON t.benchmark_id = s.benchmark_id AND t.arch = s.arch AND t.metric = s.metric
-   AND t.run_ts >= s.run_ts;
+ON t.component = s.component AND t.benchmark_id = s.benchmark_id AND t.arch = s.arch
+   AND t.metric = s.metric AND t.run_ts >= s.run_ts
+WHERE t.run_ts - s.run_ts <= 7 * 86400;
 
 -- Replaces perf_benchmarks.regression_status with a verdict against the previous run of the same
 -- benchmark, backend, arch and producing job, in run time, via a window function (an all-pairs
@@ -119,8 +128,8 @@ CREATE VIEW IF NOT EXISTS v_benchmark_regression AS
 SELECT
     run_id, benchmark_id, component, backend, name, arch, source_job,
     record_type, config_name, input_shapes,
-    run_ts AS ts,
-    baseline_run_id,
+    run_ts AS ts, ts_source,
+    baseline_run_id, baseline_ts,
     metric, higher_is_better, new_value, baseline_value,
     round((new_value - baseline_value) / abs(baseline_value) * 100 AS change_pct, 1) AS delta_pct,
     multiIf(baseline_value IS NULL, 'no_baseline',
@@ -132,14 +141,15 @@ FROM (
         *,
         match(metric, 'throughput|_per_second$') OR metric = 'pt_util_percent' AS higher_is_better,
         lagInFrame(toNullable(new_value)) OVER w AS baseline_value,
-        lagInFrame(toNullable(run_id))    OVER w AS baseline_run_id
+        lagInFrame(toNullable(run_id))    OVER w AS baseline_run_id,
+        lagInFrame(toNullable(run_ts))    OVER w AS baseline_ts
     FROM (
         -- One value per run and metric, so a re-ingested run is never its own baseline. Zeros
         -- are dropped: producers write 0 for a metric they did not measure.
         SELECT run_id, benchmark_id, component, backend, arch, source_job,
                any(name) AS name, any(record_type) AS record_type,
                any(config_name) AS config_name, any(input_shapes) AS input_shapes,
-               min(run_ts) AS run_ts,
+               min(run_ts) AS run_ts, any(ts_source) AS ts_source,
                m.1 AS metric, avg(m.2) AS new_value
         FROM v_benchmark_results_enriched
         ARRAY JOIN CAST(measurements, 'Array(Tuple(String, Float64))') AS m
