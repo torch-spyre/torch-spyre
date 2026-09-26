@@ -129,7 +129,10 @@ def _build_d2h_jobplan(tmpdir: str, dev_ptr: int, size_bytes: int):
 
     spyrecode_json = {
         "JobPreparationPlan": [
-            {"command": "Allocate", "properties": {"size": "1024"}},
+            {
+                "command": "Allocate",
+                "properties": {"static_size": "1024", "dynamic_size": "0"},
+            },
             {
                 "command": "InitTransfer",
                 "properties": {
