@@ -9,20 +9,23 @@
 CREATE VIEW IF NOT EXISTS v_artifacts AS
 SELECT
     -- Every source column is qualified: an output alias sharing its name would shadow it.
-    r.artifact_id AS artifact_id,
-    argMax(r.component, r.ts)                                   AS component,
-    argMax(r.arch, r.ts)                                        AS arch,
-    argMax(r.kind, r.ts)                                        AS kind,
-    argMax(r.artifact_name, r.ts)                               AS artifact_name,
-    argMin(r.origin, r.ts)                                      AS origin,
-    argMaxIf(r.identity_deps, r.ts, notEmpty(r.identity_deps))    AS identity_deps,
-    argMaxIf(r.context_deps, r.ts, notEmpty(r.context_deps))      AS context_deps,
-    argMaxIf(r.sources, r.ts, notEmpty(r.sources))                AS sources,
-    arrayFold((acc, x) -> mapUpdate(acc, x.2), arraySort(groupArray((r.ts, r.props))),
-              CAST(map(), 'Map(String, String)')) AS props,
-    min(r.ts)                                                 AS first_ts,
-    max(r.ts)                                                 AS ts,
-    count()                                                 AS writes
+    -- (ts, audit_timestamp) orders writes: ts is second-resolution, so same-second rows tie.
+    r.artifact_id                                                                        AS artifact_id,
+    argMax(r.component, (r.ts, r.audit_timestamp))                                       AS component,
+    argMax(r.arch, (r.ts, r.audit_timestamp))                                            AS arch,
+    argMax(r.kind, (r.ts, r.audit_timestamp))                                            AS kind,
+    argMax(r.artifact_name, (r.ts, r.audit_timestamp))                                   AS artifact_name,
+    argMin(r.origin, (r.ts, r.audit_timestamp))                                          AS origin,
+    argMaxIf(r.identity_deps, (r.ts, r.audit_timestamp), notEmpty(r.identity_deps))      AS identity_deps,
+    argMaxIf(r.context_deps, (r.ts, r.audit_timestamp), notEmpty(r.context_deps))        AS context_deps,
+    argMaxIf(r.sources, (r.ts, r.audit_timestamp), notEmpty(r.sources))                  AS sources,
+    arrayFold((acc, x) -> mapUpdate(acc, x.3),
+              arraySort(x -> (x.1, x.2), groupArray((r.ts, r.audit_timestamp, r.props))),
+              CAST(map(), 'Map(String, String)'))                                        AS props,
+    -- ts is the first write (when it was built), as min(ts) over the raw table would give.
+    min(r.ts)                                                                            AS ts,
+    max(r.ts)                                                                            AS last_ts,
+    count()                                                                              AS writes
 FROM artifacts AS r
 GROUP BY r.artifact_id;
 
