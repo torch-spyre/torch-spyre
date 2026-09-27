@@ -26,7 +26,7 @@ from torch_spyre._C import DataFormats, ElementArrangement
 import torch
 from torch_spyre import _C
 
-from .constants import IDENTITY_OP
+from .constants import DL16TOFP32_OP, FP32TODL16_OP, IDENTITY_OP, STAGGERED_EAS
 
 
 LX_RELAYOUT_INFO_KEY = "lx_relayout_certified"
@@ -400,6 +400,35 @@ def clear_constant_tensor_cache():
         >>> clear_constant_tensor_cache()  # Clear Spyre constants
     """
     _CONSTANT_TENSOR_CACHE.clear()
+
+
+# A conversion between the FP16 and FP32 stick grids, in either direction.  One
+# FP16 stick's elements span a pair of FP32 sticks, so the iteration follows the
+# coarser FP16 grid whichever way the conversion runs.
+STAGGERING_CONVERSION_OPS = (DL16TOFP32_OP, FP32TODL16_OP)
+
+
+def iterates_on_the_fp16_grid(op_spec: OpSpec) -> bool:
+    """Whether this op's iteration must follow the coarser FP16 stick grid.
+
+    True for the FP16<->FP32 conversions themselves, named by op, and for an op
+    that carries a value one of them produced into its own output, recognized by
+    the staggered arrangement that output holds.  The arrangement is the only
+    signal available for such an op: it is an ordinary pointwise op whose name
+    and dtypes say nothing about how its elements are laid out.
+
+    The output decides, not the inputs: ``insert_staggered_ea_padding`` gives
+    the pair's second stick only to a buffer that carries the arrangement, so an
+    op reading a staggered value into an unstaggered output (e.g. an FP32->INT32
+    cast) has one stick per row to write, and a 64-lane iteration would spill
+    each row into the next.
+    """
+    if op_spec.op in STAGGERING_CONVERSION_OPS:
+        return True
+    outputs = [arg for arg in op_spec.args if not arg.is_input]
+    return bool(outputs) and all(
+        arg.element_arrangement in STAGGERED_EAS for arg in outputs
+    )
 
 
 @dataclasses.dataclass

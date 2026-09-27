@@ -85,6 +85,7 @@ from .op_spec import (
     UnimplementedOp as OpSpecUnimplementedOp,
     format_op_spec_list,
     is_lx_relayout_identity,
+    iterates_on_the_fp16_grid,
 )
 from .op_spec_validation import validate_op_specs
 from torch_spyre._inductor.provenance import build_debug_handle
@@ -1849,6 +1850,34 @@ def _check_relayout_boundary(
         )
 
 
+def _restore_stick_pair_dim(op_spec) -> None:
+    """Bind a sub-stick lane's stick index to its gap dim before align_tensors.
+
+    On the fp16 grid a sub-stick (e.g. fp32) operand spans a stick pair per
+    64-lane fp16 stick. When its count dim held one stick, padding prepends an
+    outermost gap dim of ``64 // elems_per_stick`` sticks with coordinate 0
+    (``_grow_num_sticks``). Left alone, align_tensors splits the lane into
+    ``floor(s/eps)`` and ``Mod(s, eps)`` on a new size-1 outer axis, and the gap
+    dim becomes a separate zero-coordinate dim with a back gap, so the SDSC
+    counts the pair's second stick twice. Writing the split onto the gap dim
+    here gives align the same structure as a multi-stick count dim.
+    """
+    for arg in op_spec.args:
+        coords = list(arg.device_coordinates)
+        lane = coords[-1]
+        eps = arg.device_dtype.elems_per_stick()
+        if eps >= 64 or len(lane.free_symbols) != 1:
+            continue
+        (sym,) = lane.free_symbols
+        if any(sym in sympy.sympify(c).free_symbols for c in coords[:-1]):
+            continue
+        if coords[0] != 0 or arg.device_size[0] != 64 // eps:
+            continue
+        coords[0] = sympy.floor(lane / eps)
+        coords[-1] = sympy.Mod(lane, eps)
+        arg.device_coordinates = coords
+
+
 def simplify_op_spec(
     op_spec,
     indirect_sizes=None,
@@ -1863,6 +1892,8 @@ def simplify_op_spec(
         # Restore a restickify's elided size-1 stick, creating a shared iteration
         # symbol on both operands, so align_tensors matches them by that symbol.
         _restickify_restore_elided_dim(op_spec)
+    if iterates_on_the_fp16_grid(op_spec):
+        _restore_stick_pair_dim(op_spec)
 
     new_op_space_splits, new_tensors, work_division_remap = align_tensors(
         op_spec.iteration_space,
