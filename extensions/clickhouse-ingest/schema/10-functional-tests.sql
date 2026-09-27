@@ -18,6 +18,9 @@ CREATE TABLE IF NOT EXISTS test_cases
 
     -- Replaces the run_properties EAV table. Array, not Map: a namespace (e.g. testtype) repeats.
     tags         Array(LowCardinality(String)),
+    audit_uuid      UUID DEFAULT generateUUIDv7(),
+    audit_timestamp DateTime64(3) DEFAULT now64(3),
+
 
     CONSTRAINT chk_component CHECK component != '',
     CONSTRAINT chk_name      CHECK name != ''
@@ -43,6 +46,13 @@ CREATE TABLE IF NOT EXISTS test_case_runs
 
     -- Per-execution incidentals; run-scoped data belongs on artifact_results, test-scoped on test_cases.tags.
     props        Map(LowCardinality(String), String),
+    audit_uuid      UUID DEFAULT generateUUIDv7(),
+    audit_timestamp DateTime64(3) DEFAULT now64(3),
+
+
+    -- The sort key prunes a run_id-only lookup to parts, not granules; this measured a 5-6x
+    -- row-read cut (docs/clickhouse_v2_views.md). Relies on one run belonging to one component.
+    INDEX idx_run_id run_id TYPE bloom_filter(0.01) GRANULARITY 1,
 
     CONSTRAINT chk_status CHECK status IN
         ('passed','failed','error','skipped','xfail','xpass')
@@ -85,9 +95,4 @@ SELECT
 FROM test_case_runs
 GROUP BY run_id, component;
 
--- Backfill once after creating the MV -- it fires on INSERT only, so the table starts empty:
---   INSERT INTO run_case_counters
---   SELECT run_id, component, count(), countIf(status='passed'), countIf(status='failed'),
---          countIf(status='error'), countIf(status='skipped'), countIf(status='xfail'),
---          countIf(status='xpass')
---   FROM test_case_runs GROUP BY run_id, component;
+-- The MV fires on INSERT only; migrations/002 backfills rows written before it existed.

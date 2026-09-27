@@ -440,8 +440,10 @@ jobs:
           sparse-checkout-cone-mode: false
 
       # Run-level facts only: a per-job `uv pip freeze` describes one cell, not the run.
-      # EMPTY on the prebaked path, deliberately -- that path tests the image UNCHANGED, so
-      # its artifact IS the image and a derived id would invent one that never existed.
+      # EMPTY on the prebaked path, deliberately -- that path tests the image's own bytes
+      # UNCHANGED. derive_artifact_id.py still mints this leg's own id through `component`
+      # even with installed="", since the base image's stamped id was minted under whichever
+      # component built it (e.g. spyre-backend), not necessarily this leg's own.
       - name: Describe what this leg installs on top of the image
         id: delta
         env:
@@ -454,7 +456,8 @@ jobs:
           set -euo pipefail
           TOKENS=""
           if [ "${PREBAKED}" = "true" ]; then
-            echo "prebaked image: tested unchanged, so its own id is this leg's id."
+            echo "prebaked image: tested unchanged, so this leg's id is minted from the base"
+            echo "id + component alone (see derive_artifact_id.py)."
           else
             # The sha, not the wheel filename -- that version does not move per commit.
             TOKENS="torch-spyre@${HEAD_SHA:0:12}"

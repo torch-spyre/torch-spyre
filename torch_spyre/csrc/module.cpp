@@ -22,7 +22,6 @@
 #include <pybind11/operators.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
-#include <spyrecode-host-functions/processSpyreCodeArtifacts.h>
 #include <spyrecode-host-functions/sendataconvert/sen_data_convert.h>
 #include <util/sendefs/sendefs.h>
 
@@ -647,39 +646,6 @@ PYBIND11_MODULE(_C, m) {
       "        JobPlanStepHostCompute resolves each correction slot by kind\n"
       "        rather than blindly iterating tensors. Empty (default)\n"
       "        preserves today's legacy behavior.");
-
-  // Test-only seam: exposes JobPlanStepHostCompute::resolveSymbolicArgs so
-  // that Python tests can assert on the ordered int64 vector that would be
-  // handed to deeptools, without needing a live HCM or device execution.
-  // The "_" prefix signals this is not part of the stable public API.
-  m.def("_resolve_symbolic_args",
-        &spyre::JobPlanStepHostCompute::resolveSymbolicArgs, py::arg("tensors"),
-        py::arg("symbolic_args"),
-        "Test-only: resolve a symbolic_args payload to a list of int64 DMVA "
-        "addresses.\n\n"
-        "Calls JobPlanStepHostCompute::resolveSymbolicArgs — the same function "
-        "used by the typed-payload resolution path at launch time — so the "
-        "result is identical to what would be passed to deeptools.");
-
-  // Test-only seam: executes deeptools::processComputeOnHostCommand directly
-  // with zero symbols (nullptr) and returns the generated output bytes.
-  m.def(
-      "_process_hcm_zero_symbols",
-      [](const std::string& hcm_json_str) -> py::bytes {
-        Hcm hcm;
-        TORCH_CHECK(hcm.importJsonStr(hcm_json_str),
-                    "Failed to parse HCM JSON string");
-        TORCH_CHECK(!hcm.senConstants.empty(),
-                    "HCM must contain at least one senConstant");
-        size_t output_size = hcm.senConstants[0].sizeInBytes();
-        std::vector<uint8_t> out_buf(output_size, 0);
-        deeptools::processComputeOnHostCommand(hcm, out_buf.data(), nullptr);
-        return py::bytes(reinterpret_cast<const char*>(out_buf.data()),
-                         out_buf.size());
-      },
-      py::arg("hcm_json_str"),
-      "Test-only: execute deeptools::processComputeOnHostCommand with zero "
-      "symbols (nullptr input) and return the output bytes.");
 
   // ── Two-stream overlap: step-ordering validator + test hooks ──
 

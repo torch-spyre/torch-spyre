@@ -45,7 +45,9 @@ CREATE TABLE IF NOT EXISTS jenkins_agents
     -- Non-empty when the per-agent request failed; the row still lands as the health signal.
     sample_error        String DEFAULT '',
 
-    props               Map(LowCardinality(String), String)
+    props               Map(LowCardinality(String), String),
+    audit_uuid      UUID DEFAULT generateUUIDv7(),
+    audit_timestamp DateTime64(3) DEFAULT now64(3)
 )
 ENGINE = MergeTree()
 PARTITION BY toYYYYMM(ts)
