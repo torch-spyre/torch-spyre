@@ -307,6 +307,32 @@ def test_consumed_wide_value_keeps_both_staggered_sticks(device, extent, fp16):
     assert_val(fn, x, result)
 
 
+@pytest.mark.parametrize("rows", [4, 8], ids=lambda n: f"rows{n}")
+def test_widened_slice_cast_to_int32_gathers_rows(rows):
+    """A one-stick slice of a widened value, cast to INT32, indexes a gather.
+
+    This is how MoE expert routing builds its gather indices: each expert id is
+    broadcast across an FP16 stick, widened, and sliced to one FP32 stick.  The
+    INT32 cast reads the staggered FP32 value but writes an unstaggered output,
+    one stick per row, which it must fill without reaching into the next row.
+    ``TestStaggeredFp32Consumer`` in test_codegen pins the iteration itself.
+    """
+    torch._dynamo.reset()
+
+    def fn(widened, table):
+        index = widened.to(torch.float32)[..., :32].to(torch.int32)[..., 0]
+        return table[index]
+
+    ids = (torch.arange(rows) * 7 + 3) % 64
+    widened = ids.to(torch.float16)[None, :, None].expand(1, rows, 64).contiguous()
+    table = (torch.arange(64 * 128) % 257).reshape(64, 128).to(torch.float16)
+    result = torch.compile(fn, dynamic=False)(
+        widened.to(DEVICE_NAME), table.to(DEVICE_NAME)
+    )
+
+    torch.testing.assert_close(result.cpu(), table[ids][None], rtol=0, atol=0)
+
+
 # Extents a single FP16 stick holds but a single FP32 stick does not, bracketed by
 # the ones on either side that fit (32) or fill (64) the FP16 stick.
 _NARROWED_EXTENTS = [5, 32, 33, 48, 63, 64, 96]

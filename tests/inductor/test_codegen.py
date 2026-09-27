@@ -28,6 +28,7 @@ from torch.testing import FileCheck
 
 from torch_spyre._C import (
     DataFormats,
+    ElementArrangement,
 )
 from torch_spyre._inductor import config
 from torch_spyre._inductor.codegen.compute_ops import (
@@ -955,3 +956,61 @@ class TestMaskingConstId(InductorTestCase):
             self.assertEqual(
                 self._ids_to_names(constants)[str(recorded)], "samv-maskvalue"
             )
+
+
+class TestStaggeredFp32Consumer(InductorTestCase):
+    """Only an op that keeps the staggered arrangement iterates the FP16 grid.
+
+    A widened FP32 value spans a pair of FP32 sticks per FP16 stick, and padding
+    gives the pair's second stick only to a buffer that carries the arrangement.
+    Modeled on MoE expert routing, which casts a one-stick slice of a widened
+    value to INT32 to use it as gather indices: the INT32 output holds one stick
+    per row, so a 64-lane iteration would write each row over the next.
+    """
+
+    def _parse_consumer(self, op, out_dtype, out_ea):
+        row, lane = sympy.symbols("c0 c1")
+        coords = [sympy.floor(lane / 32), row, sympy.Mod(lane, 32)]
+        iteration_space = {row: (sympy.Integer(4), 1), lane: (sympy.Integer(32), 1)}
+        spec = OpSpec(
+            op=op,
+            is_reduction=False,
+            iteration_space=iteration_space,
+            core_id_to_work_slice=derive_operation_mapping(iteration_space),
+            args=[
+                TensorArg(
+                    is_input=True,
+                    arg_index=0,
+                    device_dtype=DataFormats.IEEE_FP32,
+                    device_size=[2, 4, 32],
+                    device_coordinates=coords,
+                    allocation={"hbm": 0},
+                    element_arrangement=ElementArrangement.DL16_TO_FP32,
+                ),
+                TensorArg(
+                    is_input=False,
+                    arg_index=1,
+                    device_dtype=out_dtype,
+                    device_size=[2 if out_ea != ElementArrangement.STANDARD else 1]
+                    + [4, 32],
+                    device_coordinates=coords,
+                    allocation={"hbm": 0x100000},
+                    element_arrangement=out_ea,
+                ),
+            ],
+            op_info={},
+        )
+        sdsc_spec, _ = parse_op_spec(spec)
+        return sorted(int(size) for size in sdsc_spec.iteration_space.values())
+
+    def test_unstaggered_output_keeps_one_fp32_stick(self):
+        sizes = self._parse_consumer(
+            "fp32toint32", DataFormats.IEEE_INT32, ElementArrangement.STANDARD
+        )
+        self.assertEqual(sizes, [4, 32])
+
+    def test_staggered_output_covers_the_stick_pair(self):
+        sizes = self._parse_consumer(
+            "identity", DataFormats.IEEE_FP32, ElementArrangement.DL16_TO_FP32
+        )
+        self.assertEqual(sizes, [4, 64])
