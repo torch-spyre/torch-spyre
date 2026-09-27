@@ -2,8 +2,8 @@
 -- Read 10-functional-tests.sql first -- identity rules, props/tags and run_id are stated there.
 --
 -- Scope: torch-spyre op/kernel/model benchmarks (spyre-perf-suite, plus sendnn and CPU baselines
--- it measures against -- see `backend`). vLLM/spyre-inference perf stays in results_v3 +
--- run_metadata (the schema upstream PyTorch HUD reads) and joins in via run_id/artifact_results.
+-- it measures against -- see `backend`) and spyre-inference vLLM benchmarks, which
+-- 70-vllm-hud-projection.sql projects into the upstream HUD shape.
 --
 -- Replaces v1's benchmark_runs + perf_benchmarks + perf_kernels, sendnn_runs +
 -- sendnn_benchmarks, and loz_system_performance_vllm.
