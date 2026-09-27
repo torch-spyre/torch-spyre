@@ -63,6 +63,7 @@ class SchemaApplier:
         r"^(CREATE (?:MATERIALIZED )?VIEW \S+(?: TO \S+)?) \(.*?\) AS (SELECT|WITH)\b"
     )
     SERVER_DEFAULTS = (" SETTINGS index_granularity = 8192",)
+    ALTER = re.compile(r"\bALTER\s+TABLE\s+(?:\w+\.)?(\w+)", re.IGNORECASE)
     LEDGER = "schema_migrations"
     LEDGER_DDL = (
         "CREATE TABLE IF NOT EXISTS schema_migrations (migration_id String, "
@@ -192,6 +193,13 @@ class SchemaApplier:
         live = cls.live(client, db)
         done = cls.applied(client, db)
         objs = [o for path, text in files for o in cls.objects(path, text)]
+        pending = [p for p in migrations if p.name not in done]
+        # A difference a pending migration ALTERs is expected; apply re-checks after migrating.
+        altered = {
+            m.group(1)
+            for p in pending
+            for m in cls.ALTER.finditer(cls.LINE_COMMENT.sub("", p.read_text()))
+        }
         steps = []
         for o in objs:
             if o.kind == "view":
@@ -201,8 +209,9 @@ class SchemaApplier:
             else:
                 diff = cls.differs(client, o, live[o.name], db)
                 if diff:
-                    steps.append(("drift", o.name, diff))
-        steps += [("migrate", p.name, "") for p in migrations if p.name not in done]
+                    kind = "migrates" if o.name in altered else "drift"
+                    steps.append((kind, o.name, diff))
+        steps += [("migrate", p.name, "") for p in pending]
         for o in objs:
             if o.kind != "view":
                 continue
@@ -297,7 +306,7 @@ def main() -> None:
     mode.add_argument(
         "--check",
         action="store_true",
-        help="Print what an apply would change; exit 1 if anything would",
+        help="Print what an apply would change; exit 1 if anything would, 2 on drift",
     )
     args = parser.parse_args()
 
@@ -328,6 +337,8 @@ def main() -> None:
         for action, name, detail in steps:
             print(f"  {action:8} {name}" + (f"\n{detail}" if action == "drift" else ""))
         print(f"[check] {len(steps)} change(s) pending")
+        if any(action == "drift" for action, _, _ in steps):
+            sys.exit(2)
         sys.exit(1 if steps else 0)
 
     try:

@@ -154,6 +154,23 @@ def test_migration_can_resolve_drift_before_the_check(tmp_path):
     assert ("migrate", "001_widen.sql") in [(a, n) for a, n, _ in steps]
 
 
+def test_plan_labels_a_difference_a_pending_migration_alters(tmp_path):
+    d = _schema(
+        tmp_path,
+        {"10-t.sql": TABLE, "20-u.sql": TABLE.replace(" t ", " u ")},
+        {"001_add.sql": "ALTER TABLE t ADD COLUMN IF NOT EXISTS a UInt8"},
+    )
+    narrow = "CREATE TABLE {} (a UInt16) ENGINE = MergeTree ORDER BY a"
+    server = FakeServer({"t": narrow.format("t"), "u": narrow.format("u")})
+    files = SchemaApplier.selected_files(d)
+    steps = SchemaApplier.plan(server, DB, files, SchemaApplier.migration_files(d))
+    assert [(a, n) for a, n, _ in steps] == [
+        ("migrates", "t"),
+        ("drift", "u"),
+        ("migrate", "001_add.sql"),
+    ]
+
+
 def test_non_create_statement_in_schema_is_rejected(tmp_path):
     d = _schema(tmp_path, {"10-t.sql": TABLE + ";\nALTER TABLE t ADD COLUMN b UInt8"})
     with pytest.raises(ValueError, match="migrations/"):

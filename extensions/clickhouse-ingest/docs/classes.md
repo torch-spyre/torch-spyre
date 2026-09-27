@@ -387,5 +387,5 @@ SchemaApplier.apply(client, db, files, migrations) # raises SchemaDrift on a cha
 ```bash
 python3 -m spyre_clickhouse_ingest.apply_schema --dry-run              # offline listing
 python3 -m spyre_clickhouse_ingest.apply_schema --database spyre_v2 --check
-python3 -m spyre_clickhouse_ingest.apply_schema --database spyre_v2_next
+python3 -m spyre_clickhouse_ingest.apply_schema --database <db>          # converge one database
 ```
