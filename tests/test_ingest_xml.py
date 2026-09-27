@@ -363,6 +363,91 @@ def test_incomplete_version_info_is_visible_not_regression_eligible(ingest):
     )
 
 
+#: The shape the perf suite actually emits: RPM-backed components are keyed
+#: "<component>/<package>", and only torch-spyre is a bare name. Captured from
+#: spyre.benchmark_runs.version_info on a live x86 integration-tests run.
+REAL_PROVENANCE = {
+    "spyre-perf-suite": {
+        "version": "0.1.0+cd9f29c70c80",
+        "branch": None,
+        "commit": None,
+    },
+    "torch-spyre": {"version": "0.0.1", "branch": "HEAD", "commit": "ccf509d2"},
+    "deeptools/ibm-deeptools": {
+        "version": "2.0.0-0",
+        "branch": "master",
+        "commit": "ae70518e",
+    },
+    "deeptools/ibm-deeptools-devel": {
+        "version": "2.0.0-0",
+        "branch": "master",
+        "commit": "ae70518e",
+    },
+    "flex/ibm-flex": {"version": "2.0.0-0", "branch": "main", "commit": "898f9966"},
+    "flex/ibm-flex-devel": {
+        "version": "2.0.0-0",
+        "branch": "main",
+        "commit": "898f9966",
+    },
+    "libaiupti/ibm-libaiupti": {
+        "version": "2.0.0-0",
+        "branch": "main",
+        "commit": "ef4e6226",
+    },
+    "spyre-comms/ibm-spyre-comms": {
+        "version": "1.0.0-0",
+        "branch": "main",
+        "commit": "45f9d642",
+    },
+    "senlib/ibm-senlib-core": {
+        "version": "2.0.0-0",
+        "branch": "main",
+        "commit": "d5baf74",
+    },
+}
+
+
+def test_rpm_qualified_component_keys_are_valid(ingest):
+    """flex/deeptools/spyre-comms arrive as "<component>/<package>", not bare names.
+
+    An exact lookup of "flex" finds nothing in real data, so every perf run read as
+    incomplete and no row was ever regression-eligible.
+    """
+    assert ingest.classify_run_quality(json.dumps(REAL_PROVENANCE)) == ("valid", 1)
+
+
+def test_components_wrapper_is_unwrapped(ingest):
+    """Two of the three rows per run wrap the mapping as {"components", "system"}."""
+    wrapped = {
+        "components": REAL_PROVENANCE,
+        "system": {"architecture": "x86_64", "flex_device": "PF"},
+    }
+    assert ingest.classify_run_quality(json.dumps(wrapped)) == ("valid", 1)
+
+
+def test_qualified_key_still_requires_a_real_commit(ingest):
+    """The prefix match must not become a way to pass with a missing commit."""
+    for bad in (None, "", "   ", "N/A", "null", "None"):
+        payload = json.loads(json.dumps(REAL_PROVENANCE))
+        payload["flex/ibm-flex"]["commit"] = bad
+        payload["flex/ibm-flex-devel"]["commit"] = bad
+        assert ingest.classify_run_quality(json.dumps(payload)) == ("incomplete", 0)
+
+
+def test_missing_torch_spyre_commit_is_incomplete(ingest):
+    """The bare-key component still gates: a commit-less torch-spyre is incomplete."""
+    payload = json.loads(json.dumps(REAL_PROVENANCE))
+    payload["torch-spyre"]["commit"] = None
+    assert ingest.classify_run_quality(json.dumps(payload)) == ("incomplete", 0)
+
+
+def test_devel_sibling_alone_still_satisfies_the_component(ingest):
+    """Only a -devel package present: still that component's provenance."""
+    payload = json.loads(json.dumps(REAL_PROVENANCE))
+    del payload["flex/ibm-flex"]
+    assert ingest.classify_run_quality(json.dumps(payload)) == ("valid", 1)
+
+
 def test_non_string_commit_is_incomplete(ingest):
     for bad in (True, 123, {"sha": "abc"}, ["abc"]):
         payload = dict(FULL_PROVENANCE)
