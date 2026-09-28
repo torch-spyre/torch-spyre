@@ -44,7 +44,6 @@ from torch._inductor.dependencies import MemoryDep
 from torch._inductor.graph import GraphLowering
 from torch._inductor.scheduler import SchedulerNode
 from torch._inductor.virtualized import V
-from torch.utils._sympy.value_ranges import ValueRanges, bound_sympy
 
 from . import config
 from torch_spyre._C import (
@@ -83,7 +82,6 @@ from .ir import (
 from .pass_utils import (
     compute_restickify_target_layout,
     concretize_expr,
-    concretize_index,
     expand_sparse,
     find_matmul_generated_var,
     find_reduction_var,
@@ -383,190 +381,34 @@ def _check_supported_input_sticks(args: list[PropArg], op_label: str) -> None:
             )
 
 
-def _affine_coefficients(
-    index: sympy.Expr, variables: list[sympy.Symbol]
-) -> dict[sympy.Symbol, sympy.Expr] | None:
-    """Each loop variable's coefficient in an affine index, or None if it is not affine."""
-    index = sympy.expand(concretize_index(index, set(variables)))
-    if not index.is_polynomial(*variables):
-        return None
-    poly = sympy.Poly(index, *variables)
-    if poly.total_degree() > 1:
-        return None
-    return {v: poly.coeff_monomial(v) for v in variables}
-
-
-def _coordinate_count(coord: sympy.Expr, dep: MemoryDep) -> int:
-    """How many values a device coordinate takes over an access's iteration space."""
-    ranges = {v: ValueRanges(0, concretize_expr(n) - 1) for v, n in dep.ranges.items()}
-    bounds = bound_sympy(coord, ranges)
-    return int(bounds.upper - bounds.lower) + 1
-
-
-def _whole_access(layout: FixedLayout) -> MemoryDep:
-    """An access that walks every element of ``layout`` once, in host order."""
-    sizes = [concretize_expr(n) for n in layout.size]
-    strides = [concretize_expr(n) for n in layout.stride]
-    variables = sympy.symbols(f"w0:{len(sizes)}", integer=True, nonnegative=True)
-    index = sum((st * v for st, v in zip(strides, variables)), sympy.Integer(0))
-    return MemoryDep("whole", index, tuple(variables), tuple(sizes))
-
-
-def _split_reshaped_coordinate(
-    coord: sympy.Expr,
-    read_vars: set[sympy.Symbol],
-    in_coeffs: dict[sympy.Symbol, sympy.Expr],
-    dep: MemoryDep,
-) -> list[tuple[sympy.Symbol, sympy.Expr, int, int]] | None:
-    """Split a device coordinate walking several loop variables into digits.
-
-    ``4*c1 + floor(c2/64)`` over ``c1 < 4, c2 < 256`` becomes the digits ``c1``
-    (4 values, radix 4) and ``floor(c2/64)`` (4 values, radix 1). Returns
-    ``(variable, digit, count, radix)`` per variable, outermost first, the
-    coordinate's constant offset folded into the outermost digit; None when the
-    coordinate is not a sum of one term per variable, or the offset is not a
-    whole number of outermost digits. The digits are not proved to nest
-    exactly; the caller checks the layout they build.
-    """
-    base = coord.subs({v: 0 for v in read_vars})
-    terms = {
-        v: coord.subs({u: 0 for u in read_vars if u != v}) - base for v in read_vars
-    }
-    if sympy.simplify(coord - base - sum(terms.values())) != 0:
-        return None
-    ranges = {v: ValueRanges(0, concretize_expr(n) - 1) for v, n in dep.ranges.items()}
-    digits = []
-    radix = 1
-    for v in sorted(read_vars, key=lambda v: in_coeffs[v]):
-        digit = sympy.simplify(terms[v] / radix)
-        bounds = bound_sympy(digit, ranges)
-        if bounds.lower != 0 or not bounds.upper.is_Integer:
-            return None
-        count = int(bounds.upper) + 1
-        digits.append((v, digit, count, radix))
-        radix *= count
-    v, digit, count, radix = digits[-1]
-    offset = base / radix
-    if not offset.is_Integer:
-        return None
-    digits[-1] = (v, digit + offset, count, radix)
-    return digits[::-1]
-
-
-def carry_stl_to_output(
-    stl: SpyreTensorLayout,
+def _convert_reads_whole_input(
     in_layout: FixedLayout,
+    output: FixedLayout,
     dep: MemoryDep,
-    out_layout: FixedLayout,
     output_dep: MemoryDep,
-) -> SpyreTensorLayout | None:
-    """Re-express an input's device layout over the buffer a pointwise op writes.
+) -> bool:
+    """Whether a dtype conversion traverses its input exactly as it writes its output.
 
-    A ``stride_map`` entry is a step in the input buffer's host elements, so a
-    layout copied onto a buffer with other strides misaddresses it: an upcast of
-    ``qkv[:, 1024:1280]`` from a ``[8, 1536]`` buffer into a fresh ``[8, 1, 256]``
-    one would keep the 1536-element row step and 24 sticks per row. The carried
-    layout keeps the device dims of the input, in order, with the stick choice,
-    folds and ``-1`` entries, and steps and sizes each dim for the output buffer:
-
-    - A dim's step scales by how much further the write moves than the read for
-      the loop variables its coordinate walks. Those variables must agree on
-      that ratio, which a fold walking several host dims requires of each.
-    - A dim the access reshapes, one whose read walks more loop variables than
-      a whole-input read does (``qkv[:, :1024]`` read as ``[8, 4, 256]``),
-      splits into one dim per variable, so each output dim has a step of its
-      own for work division to place a split on. A dim that does not split
-      into one digit per variable stays folded.
-    - A dim keeps its size where the read reaches every value it takes over the
-      whole input, so padding survives, and otherwise takes the count of values
-      the read reaches. The stick dim keeps its size.
-
-    Dtype and stick depth are unchanged; ``rescale_stl_for_dtype`` rescales the
-    result against ``out_layout`` and ``output_dep``. A read that walks the whole
-    input exactly as the write walks the output carries the layout unchanged.
-
-    Returns None where the layout cannot be carried: a non-affine access, a
-    variable only one side walks, dims disagreeing on their ratio, a
-    non-integer step, or a read offset that is not a whole number of steps of
-    each device dim. The carried layout is checked rather than trusted: the
-    write's device coordinates must equal the read's, up to a constant on each
-    outer dim.
+    Only then may the conversion inherit the input buffer's
+    ``device_size``/``stride_map`` (rescaled for the new stick depth). When the
+    read is a *slice* of a wider buffer -- Gemma's ``q_norm``/``k_norm`` upcast
+    part of the fused QKV projection into a fresh, narrower per-head buffer --
+    the inherited row span belongs to the input buffer while the elements land
+    in a buffer with a different row stride. ``compute_coordinates`` then folds
+    that mismatch into the outer coordinate as ``Mod(a*var, b)`` with
+    ``a/b = row_out/row_in`` in lowest terms, which either falls outside the
+    normalization grammar (``a != 1``, a codegen-time hard error) or, worse, is
+    representable but addresses the wrong sticks (``a == 1``, silently wrong
+    results). Mirrors the identical-access test the general convert path uses,
+    minus the element-width condition -- rescaling the stick depth is exactly
+    what this path is for.
     """
-    if dict(dep.ranges) != dict(output_dep.ranges):
-        return None
-    variables = list(dep.ranges)
-    in_coeffs = _affine_coefficients(dep.index, variables)
-    out_coeffs = _affine_coefficients(output_dep.index, variables)
-    if in_coeffs is None or out_coeffs is None:
-        return None
-    if any((in_coeffs[v] == 0) != (out_coeffs[v] == 0) for v in variables):
-        return None
-    try:
-        in_coords = device_coordinates(stl, dep, None)
-        whole = _whole_access(in_layout)
-        whole_coords = device_coordinates(stl, whole, None)
-    except Unsupported:
-        return None
-
-    last = len(in_coords) - 1
-    device_size, stride_map, read_coords = [], [], []
-    for dim, (size, step, coord) in enumerate(
-        zip(stl.device_size, stl.stride_map, in_coords)
-    ):
-        read_vars = coord.free_symbols & set(variables)
-        if step <= 0:
-            device_size.append(size)
-            stride_map.append(step)
-            read_coords.append(coord)
-            continue
-        if not read_vars:
-            # The read touches one position of this dim.
-            device_size.append(1 if dim != last else size)
-            stride_map.append(step)
-            read_coords.append(coord)
-            continue
-        count = _coordinate_count(coord, dep)
-        partial = dim != last and count != _coordinate_count(whole_coords[dim], whole)
-        digits = None
-        if partial and len(read_vars) > len(whole_coords[dim].free_symbols):
-            # The access reshapes part of this dim, e.g. a row of heads read as
-            # [heads, head_dim]. Work division places a split by its step, so
-            # each output dim gets a device dim of its own where the dim splits.
-            # A read of the whole dim keeps the input's fold.
-            digits = _split_reshaped_coordinate(coord, read_vars, in_coeffs, dep)
-        if digits is not None:
-            for v, digit, count, radix in digits:
-                new_step = step * radix * out_coeffs[v] / in_coeffs[v]
-                if not (new_step.is_integer and new_step > 0):
-                    return None
-                device_size.append(count)
-                stride_map.append(int(new_step))
-                read_coords.append(digit)
-            continue
-        read_coords.append(coord)
-        ratios = {out_coeffs[v] / in_coeffs[v] for v in read_vars}
-        if len(ratios) != 1:
-            return None
-        new_step = step * ratios.pop()
-        if not (new_step.is_integer and new_step > 0):
-            return None
-        device_size.append(count if partial else size)
-        stride_map.append(int(new_step))
-
-    carried = SpyreTensorLayout(
-        device_size, stride_map, stl.device_dtype, stl.element_arrangement
+    return (
+        list(in_layout.size) == list(output.size)
+        and dep.index == output_dep.index
+        and host_coordinates(in_layout, dep, None)
+        == host_coordinates(output, output_dep, None)
     )
-    try:
-        out_coords = device_coordinates(carried, output_dep, None)
-    except Unsupported:
-        return None
-    if len(out_coords) != len(read_coords) or out_coords[-1] != read_coords[-1]:
-        return None
-    for read_coord, write_coord in zip(read_coords, out_coords):
-        offset = sympy.simplify(read_coord - write_coord)
-        if not (offset.is_Integer and offset >= 0):
-            return None
-    return carried
 
 
 def rescale_stl_for_dtype(
@@ -684,14 +526,18 @@ def _conversion_layouts(
     the host dim walking the same variable, so each input stick maps onto
     output sticks without a restickify:
 
-    - The output takes the input's device layout, carried over to the output
-      buffer (``carry_stl_to_output``) and rescaled for the new stick depth. That
-      layout can carry a stick choice or a fold its host size cannot express, and
-      a read of a slice of a wider buffer (Gemma's ``q_norm``/``k_norm`` upcast
-      part of the fused QKV projection) gets it stepped for the narrower output.
-    - A conversion creating the stagger also offers the layouts a restickify of
-      its STANDARD input would reach, so a downstream reduction can ask for the
+    - Reading the input exactly as it writes the output, the conversion
+      inherits the input's device layout, rescaled for the new stick depth. That
+      layout can carry a stick choice or a fold its host size cannot express. A
+      conversion creating the stagger also offers the layouts a restickify of its
+      STANDARD input would reach, so a downstream reduction can ask for the
       normalized dim as the stick (Gemma 4: an embedding entering RMSNorm).
+    - Reading a slice of a wider buffer (Gemma's ``q_norm``/``k_norm`` upcast
+      part of the fused QKV projection into a narrower per-head buffer), the
+      conversion builds its layout from the output's host size. The input's
+      outer device dims describe the wider buffer's rows, so inheriting them
+      would misaddress the output. It offers no restickify alternatives, so the
+      output keeps the input's stick.
 
     Any other conversion (e.g. fp8->fp16 after qfp8ch) rebuilds a dense layout
     from the output host size with the stick on the last dim.  It holds only the
@@ -719,11 +565,12 @@ def _conversion_layouts(
             )
         ]
 
-    carried = carry_stl_to_output(stl, in_layout, dep, output, output_dep)
-    if carried is None:
-        # TODO: carry declines a non-affine access, a slice starting inside a
-        # stick, and a write reordering variables that share an input dim; build
-        # from the output's host size instead.
+    if not _convert_reads_whole_input(in_layout, output, dep, output_dep):
+        # TODO: offer the restickify candidates a whole read gets, so a consumer
+        # can ask a sliced conversion for another stick dim; needs the input
+        # layout carried over to the output buffer, and
+        # compute_restickify_target_layout to match sliced and reshaped
+        # coordinates.
         out_coords = host_coordinates(output, output_dep, None)
         stick_dim = _pick_stick_dim(in_stick_expr, out_coords)
         if in_stick_expr.free_symbols and stick_dim < 0:
@@ -733,7 +580,7 @@ def _conversion_layouts(
         )
         return [] if out_stl is None else [out_stl]
 
-    layouts = [rescale_stl_for_dtype(carried, output.dtype, out_ea, output, output_dep)]
+    layouts = [rescale_stl_for_dtype(stl, output.dtype, out_ea, in_layout, dep)]
     # Only a STANDARD input maps to a staggered output. A staggered input is the
     # reverse restoration, which keeps the stick selected before the upcast.
     if out_ea in STAGGERED_EAS:
@@ -751,13 +598,8 @@ def _conversion_layouts(
             )
             if target_stl is None:
                 continue
-            carried_target = carry_stl_to_output(
-                target_stl, in_layout, dep, output, output_dep
-            )
-            if carried_target is None:
-                continue
             candidate = rescale_stl_for_dtype(
-                carried_target, output.dtype, out_ea, output, output_dep
+                target_stl, output.dtype, out_ea, in_layout, dep
             )
             if candidate not in layouts:
                 layouts.append(candidate)
