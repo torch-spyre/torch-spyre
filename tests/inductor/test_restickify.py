@@ -121,7 +121,7 @@ def _strict_size1_input_arm(fn, x, expected_arm):
     orig = _padding._pad_restickify_input
 
     def capturing(op, graph):
-        _in_dep, in_buf, _in_layout = _padding._restickify_input(op, graph)
+        _in_dep, in_buf, _in_layout = _padding._unary_input(op, graph)
         arms.append("producer" if isinstance(in_buf, ComputedBuffer) else "clone")
         return orig(op, graph)
 

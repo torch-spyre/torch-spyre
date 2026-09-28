@@ -61,8 +61,6 @@ from torch._inductor.ir import (
     Operation,
     Pointwise,
     Reduction,
-    StorageBox,
-    TensorBox,
 )
 from torch._inductor.ops_handler import WrapperHandler
 from torch._inductor.virtualized import V
@@ -399,10 +397,10 @@ def _write_dep(op):
     return writes[0]
 
 
-def _restickify_input(op, graph: GraphLowering):
-    """Return ``(in_dep, in_buf, in_layout)`` for a restickify's single input, or
-    ``(None, None, None)`` if ``op`` cannot be one: it must have exactly one
-    named read whose buffer has a FixedTiledLayout.
+def _unary_input(op, graph: GraphLowering):
+    """Return ``(in_dep, in_buf, in_layout)`` for a unary op's single input, such
+    as a restickify's or a dtype conversion's, or ``(None, None, None)`` unless
+    ``op`` has exactly one named read whose buffer has a FixedTiledLayout.
     """
     # Callers that already know op is a confirmed restickify can assume this
     # succeeds.
@@ -480,7 +478,7 @@ def is_restickify_op(op: Operation, graph: GraphLowering) -> bool:
     if _is_compact_node(op):
         return False
 
-    in_dep, _in_buf, in_layout = _restickify_input(op, graph)
+    in_dep, _in_buf, in_layout = _unary_input(op, graph)
     if in_dep is None:
         return False
 
@@ -605,7 +603,7 @@ def _pad_restickify_output(op: Operation, graph: GraphLowering) -> None:
     no room to widen the dim (see the TODO below for how it could be supported).
     """
     assert isinstance(op, ComputedBuffer)
-    in_dep, _in_buf, in_layout = _restickify_input(op, graph)
+    in_dep, _in_buf, in_layout = _unary_input(op, graph)
     assert in_dep is not None  # op is a confirmed restickify
     # The old stick is the INPUT's own stick symbol (None when it collapsed to a
     # size-1 device dim).
@@ -820,23 +818,10 @@ def _widens_to_the_fp32_grid(op: Operation, graph: GraphLowering) -> bool:
     out_layout = op.get_layout()
     if not isinstance(out_layout, FixedTiledLayout):
         return False
-
     # A conversion is unary: one value in, one out.
-    reads = [r for r in op.get_read_writes().reads if hasattr(r, "name")]
-    if len(reads) != 1:
+    in_dep, _in_buf, in_layout = _unary_input(op, graph)
+    if in_dep is None:
         return False
-
-    in_buf = graph.get_buffer(reads[0].name)
-    if isinstance(in_buf, TensorBox):
-        in_buf = in_buf.data
-    if isinstance(in_buf, StorageBox):
-        in_buf = in_buf.data
-    if not isinstance(in_buf, Buffer):
-        return False
-    in_layout = in_buf.get_layout()
-    if not isinstance(in_layout, FixedTiledLayout):
-        return False
-
     return (
         in_layout.device_layout.device_size[-1]
         > out_layout.device_layout.device_size[-1]
@@ -955,6 +940,50 @@ def lower_identity_clone(
     return clone_buf, new_ops
 
 
+def _clone_input_for_padding(
+    op: ComputedBuffer, in_dep, in_buf, graph: GraphLowering, pass_name: str
+) -> ComputedBuffer | None:
+    """Give ``op`` a paddable copy of the graph input ``in_buf`` it reads.
+
+    A graph input has no producer output to pad, so insert an identity clone
+    ahead of ``op``, redirect ``op``'s read to it, and return the clone for the
+    caller to pad.  Returns ``None`` when the input has no device.  Callers decide
+    that padding is needed first, so no clone is stranded for an input they skip.
+    """
+    device = in_buf.get_device()
+    if device is None:
+        return None
+    in_layout = in_buf.get_layout()
+    patch_env(V.graph)
+    in_fx_node = find_fx_node(in_dep.name, V.graph)
+    if in_fx_node is None:
+        raise RuntimeError(f"no FX node found for buffer {in_dep.name!r}")
+    clone_buf, new_ops = lower_identity_clone(
+        in_fx_node,
+        host_size=[concretize_expr(s) for s in in_layout.size],
+        host_stride=[concretize_expr(s) for s in in_layout.stride],
+        device=device,
+        dtype=in_layout.dtype,
+        orig_stl=in_layout.device_layout,
+        insert_before=next(iter(op.origins)),
+    )
+    _move_ops_before(graph.operations, new_ops, op)
+    redirect_computed_buffer_reads(
+        op,
+        {in_dep.name: clone_buf.get_name()},
+        graph.operations,
+        pass_name=pass_name,
+        reason="redirect consumer to padded input",
+    )
+    logger.debug(
+        "%s: inserted clone %s for input of %s",
+        pass_name,
+        clone_buf.get_name(),
+        op.get_name(),
+    )
+    return clone_buf
+
+
 def _pad_restickify_input(op: Operation, graph: GraphLowering) -> None:
     """Pad a restickify input's non-stick dim to cover codegen's stick-boundary
     read window.
@@ -979,7 +1008,7 @@ def _pad_restickify_input(op: Operation, graph: GraphLowering) -> None:
     has no device.
     """
     assert isinstance(op, ComputedBuffer)
-    in_dep, in_buf, in_layout = _restickify_input(op, graph)
+    in_dep, in_buf, in_layout = _unary_input(op, graph)
     assert in_dep is not None  # op is a confirmed restickify
 
     # --- Gates: decide whether (and how) to pad BEFORE mutating the graph. ---
@@ -1011,40 +1040,12 @@ def _pad_restickify_input(op: Operation, graph: GraphLowering) -> None:
     # Run AFTER the gate: cloning mutates the graph (insert + redirect), so
     # cloning for an input we then skip would strand a redundant clone.
     if not isinstance(in_buf, ComputedBuffer):
-        # A graph input has no producer output to pad: insert an identity clone
-        # ahead of the restickify, move it into place, redirect the read to it,
-        # then pad the clone.
-        device = in_buf.get_device()
-        if device is None:
+        clone_buf = _clone_input_for_padding(
+            op, in_dep, in_buf, graph, "insert_restickify_padding"
+        )
+        if clone_buf is None:
             return
-        patch_env(V.graph)
-        in_fx_node = find_fx_node(in_dep.name, V.graph)
-        if in_fx_node is None:
-            raise RuntimeError(f"no FX node found for buffer {in_dep.name!r}")
-        clone_buf, new_ops = lower_identity_clone(
-            in_fx_node,
-            host_size=[concretize_expr(s) for s in in_layout.size],
-            host_stride=[concretize_expr(s) for s in in_layout.stride],
-            device=device,
-            dtype=in_layout.dtype,
-            orig_stl=in_layout.device_layout,
-            insert_before=next(iter(op.origins)),
-        )
-        _move_ops_before(graph.operations, new_ops, op)
-        redirect_computed_buffer_reads(
-            op,
-            {in_dep.name: clone_buf.get_name()},
-            graph.operations,
-            pass_name="insert_restickify_padding",
-            reason="redirect consumer to padded input",
-        )
         in_buf = clone_buf
-
-        logger.debug(
-            "insert_restickify_padding: inserted clone %s for input of %s",
-            clone_buf.get_name(),
-            op.get_name(),
-        )
 
     # --- Pad the input. ---
     if size1:
@@ -1079,107 +1080,62 @@ def _pad_restickify_input(op: Operation, graph: GraphLowering) -> None:
 
 
 def _pad_fp32_to_dl16_input(op: Operation, graph: GraphLowering) -> None:
-    """Expand odd fp32 input stick counts to the next even count for FP32->FP16 conversion.
-    When converting fp32 sticks (32 elems/stick) into fp16 sticks (64 elems/stick),
-    an odd number of fp32 sticks produces a partially filled fp16 stick (Issue #3999).
-    For example:
+    """Grow a narrowing conversion's FP32 input to the capacity its output spans.
 
-    3 fp32 sticks (96 elements)
-      ->
-    2 fp16 sticks (96 elements in 128-element capacity)
+    Narrowing FP32 to FP16 gathers each pair of 32-slot FP32 sticks into one
+    64-element FP16 stick, and the output is sized in whole FP16 sticks.  An input
+    whose live elements end inside a pair would leave the last output stick
+    reading past the input's allocation: 96 elements occupy 3 FP32 sticks but 2
+    FP16 sticks, whose 128 slots need 4 FP32 sticks behind them.
 
-    To match the output capacity, the fp32 input must be expanded as well, from
-    3 fp32 sticks (96 elements) to 4 fp32 sticks (96 elements in 128-element capacity).
-
-
-    Only the device layout changes, and the host size stays put: the input's
-    num-sticks dim, found from its coordinates by ``stick_dims``, grows, or a
-    gap dim is prepended when it holds one stick (``_grow_num_sticks``).
+    The producer's output is padded in place; a graph input has no producer, so
+    it is cloned and the clone padded (``_clone_input_for_padding``).  Only the
+    device layout changes, and the host size stays put: the input's num-sticks
+    dim, found from its coordinates by ``stick_dims``, grows, or a gap dim is
+    prepended when it holds one stick (``_grow_num_sticks``).
     """
     assert isinstance(op, ComputedBuffer)
     out_layout = op.get_layout()
     assert isinstance(out_layout, FixedTiledLayout)
-    out_stl = out_layout.device_layout
-
-    # fp32-to-fp16 conversion is expected to be a unary op: it reads exactly one input buffer.
-    reads = [r for r in op.get_read_writes().reads if hasattr(r, "name")]
-    if len(reads) != 1:
-        return
-
-    in_dep = reads[0]
-    raw_buf = graph.get_buffer(in_dep.name)
-    assert raw_buf is not None, in_dep.name
-    # Resolve the underlying buffer that owns the layout.
-    if isinstance(raw_buf, TensorBox):
-        # TensorBox -> StorageBox -> InputBuffer
-        inner = raw_buf.data
-        if isinstance(inner, StorageBox):
-            inner = inner.data
-        assert isinstance(inner, Buffer), type(inner)
-        in_buf: Buffer = inner
-    elif isinstance(raw_buf, ComputedBuffer):
-        in_buf = raw_buf
-    else:
-        return
-
-    if not isinstance(in_buf, ComputedBuffer):
-        # A graph input has no producer output to pad: insert an identity clone
-        # ahead of the type conversion, move it into place, redirect the read to it,
-        # then pad the clone.
-        device = in_buf.get_device()
-        in_layout = in_buf.get_layout()
-        if device is None:
-            return
-        in_fx_node = _find_arg_fx_node(in_dep.name)
-        if in_fx_node is None:
-            raise RuntimeError(f"no FX node found for buffer {in_dep.name!r}")
-        clone_buf, new_ops = lower_identity_clone(
-            in_fx_node,
-            host_size=[concretize_expr(s) for s in in_layout.size],
-            host_stride=[concretize_expr(s) for s in in_layout.stride],
-            device=device,
-            dtype=in_layout.dtype,
-            orig_stl=in_layout.device_layout,
-            insert_before=next(iter(op.origins)),
-        )
-        _move_ops_before(graph.operations, new_ops, op)
-        redirect_computed_buffer_reads(
-            op,
-            {in_dep.name: clone_buf.get_name()},
-            graph.operations,
-            pass_name="insert_staggered_ea_padding",
-            reason="redirect consumer to padded input",
-        )
-        in_buf = clone_buf
-
-    in_layout = in_buf.get_layout()
-    if not isinstance(in_layout, FixedTiledLayout):
+    in_dep, in_buf, in_layout = _unary_input(op, graph)
+    if in_dep is None:
         return
 
     in_stl = in_layout.device_layout
+    out_stl = out_layout.device_layout
     in_dims = access_stick_dims(in_stl, in_layout, in_dep)
     out_dims = access_stick_dims(out_stl, out_layout, _write_dep(op))
     if in_dims is None or out_dims is None:
         return
 
-    in_eps = in_stl.device_size[-1]  # 32 for fp32
-    # The output stick depth is the coarser of the two grids for this conversion,
-    # which is what the round-up must be taken against (issue #3999). A
-    # conversion whose output is the finer grid would have to read the input's
-    # depth instead; this pass is gated on FP32_TO_DL16, so it never is.
-    out_eps = out_stl.device_size[-1]  # 64 for fp16
+    # The FP16 output is the coarser grid, and its num-sticks count is already
+    # rounded up to whole sticks, so its capacity bounds what the input must hold.
+    in_eps = in_stl.device_size[-1]
+    out_eps = out_stl.device_size[-1]
     out_num_sticks = out_stl.device_size[out_dims.num_sticks]
-
-    # Input capacity that the output's sticks span. The output num-sticks count
-    # is already rounded up, so this covers the padding stick.
-    required_in_num_sticks = -(-out_num_sticks * out_eps // in_eps)
-    current_in_num_sticks = in_stl.device_size[in_dims.num_sticks]
-
-    if current_in_num_sticks >= required_in_num_sticks:
+    required_num_sticks = -(-out_num_sticks * out_eps // in_eps)
+    current_num_sticks = in_stl.device_size[in_dims.num_sticks]
+    if current_num_sticks >= required_num_sticks:
         return
 
+    if not isinstance(in_buf, ComputedBuffer):
+        clone_buf = _clone_input_for_padding(
+            op, in_dep, in_buf, graph, "insert_staggered_ea_padding"
+        )
+        if clone_buf is None:
+            return
+        in_buf = clone_buf
+
     in_buf.layout = _grow_num_sticks(
-        in_layout, in_dims.num_sticks, required_in_num_sticks
+        in_buf.get_layout(), in_dims.num_sticks, required_num_sticks
+    )
+
+    logger.debug(
+        "insert_staggered_ea_padding: padded input %s device dim %d %d -> %d",
+        in_buf.get_name(),
+        in_dims.num_sticks,
+        current_num_sticks,
+        required_num_sticks,
     )
 
 
