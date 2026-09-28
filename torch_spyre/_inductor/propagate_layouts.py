@@ -44,6 +44,7 @@ from torch._inductor.dependencies import MemoryDep
 from torch._inductor.graph import GraphLowering
 from torch._inductor.scheduler import SchedulerNode
 from torch._inductor.virtualized import V
+from torch.utils._sympy.value_ranges import ValueRanges, bound_sympy
 
 from . import config
 from torch_spyre._C import (
@@ -82,6 +83,7 @@ from .ir import (
 from .pass_utils import (
     compute_restickify_target_layout,
     concretize_expr,
+    concretize_index,
     expand_sparse,
     find_matmul_generated_var,
     find_reduction_var,
@@ -409,6 +411,128 @@ def _convert_reads_whole_input(
         and host_coordinates(in_layout, dep, None)
         == host_coordinates(output, output_dep, None)
     )
+
+
+def _affine_coefficients(
+    index: sympy.Expr, variables: list[sympy.Symbol]
+) -> dict[sympy.Symbol, sympy.Expr] | None:
+    """Each loop variable's coefficient in an affine index, or None if it is not affine."""
+    index = sympy.expand(concretize_index(index, set(variables)))
+    if not index.is_polynomial(*variables):
+        return None
+    poly = sympy.Poly(index, *variables)
+    if poly.total_degree() > 1:
+        return None
+    return {v: poly.coeff_monomial(v) for v in variables}
+
+
+def _coordinate_count(coord: sympy.Expr, dep: MemoryDep) -> int:
+    """How many values a device coordinate takes over an access's iteration space."""
+    ranges = {v: ValueRanges(0, concretize_expr(n) - 1) for v, n in dep.ranges.items()}
+    bounds = bound_sympy(coord, ranges)
+    return int(bounds.upper - bounds.lower) + 1
+
+
+def _whole_access(layout: FixedLayout) -> MemoryDep:
+    """An access that walks every element of ``layout`` once, in host order."""
+    sizes = [concretize_expr(n) for n in layout.size]
+    strides = [concretize_expr(n) for n in layout.stride]
+    variables = sympy.symbols(f"w0:{len(sizes)}", integer=True, nonnegative=True)
+    index = sum((st * v for st, v in zip(strides, variables)), sympy.Integer(0))
+    return MemoryDep("whole", index, tuple(variables), tuple(sizes))
+
+
+def carry_stl_to_output(
+    stl: SpyreTensorLayout,
+    in_layout: FixedLayout,
+    dep: MemoryDep,
+    out_layout: FixedLayout,
+    output_dep: MemoryDep,
+) -> SpyreTensorLayout | None:
+    """Re-express an input's device layout over the buffer a pointwise op writes.
+
+    A ``stride_map`` entry is a step in the input buffer's host elements, so a
+    layout copied onto a buffer with other strides misaddresses it: an upcast of
+    ``qkv[:, 1024:1280]`` from a ``[8, 1536]`` buffer into a fresh ``[8, 1, 256]``
+    one would keep the 1536-element row step and 24 sticks per row. The carried
+    layout keeps every device dim of the input, in order, with the stick choice,
+    folds and ``-1`` entries, and steps and sizes each dim for the output buffer:
+
+    - A dim's step scales by how much further the write moves than the read for
+      the loop variables its coordinate walks. Those variables must agree on
+      that ratio, which a fold walking several host dims requires of each.
+    - A dim keeps its size where the read reaches every value it takes over the
+      whole input, so padding survives, and otherwise takes the count of values
+      the read reaches. The stick dim keeps its size.
+
+    Dtype and stick depth are unchanged; ``rescale_stl_for_dtype`` rescales the
+    result against ``out_layout`` and ``output_dep``. A read that walks the whole
+    input exactly as the write walks the output carries the layout unchanged.
+
+    Returns None where the layout cannot be carried: a non-affine access, a
+    variable only one side walks, dims disagreeing on their ratio, a
+    non-integer step, or a read offset that is not a whole number of steps of
+    each device dim. The carried layout is checked rather than trusted: the
+    write's device coordinates must equal the read's, up to a constant on each
+    outer dim.
+    """
+    if dict(dep.ranges) != dict(output_dep.ranges):
+        return None
+    variables = list(dep.ranges)
+    in_coeffs = _affine_coefficients(dep.index, variables)
+    out_coeffs = _affine_coefficients(output_dep.index, variables)
+    if in_coeffs is None or out_coeffs is None:
+        return None
+    if any((in_coeffs[v] == 0) != (out_coeffs[v] == 0) for v in variables):
+        return None
+    try:
+        in_coords = device_coordinates(stl, dep, None)
+        whole = _whole_access(in_layout)
+        whole_coords = device_coordinates(stl, whole, None)
+    except Unsupported:
+        return None
+
+    last = len(in_coords) - 1
+    device_size, stride_map = [], []
+    for dim, (size, step, coord) in enumerate(
+        zip(stl.device_size, stl.stride_map, in_coords)
+    ):
+        read_vars = coord.free_symbols & set(variables)
+        if step <= 0:
+            device_size.append(size)
+            stride_map.append(step)
+            continue
+        if not read_vars:
+            # The read touches one position of this dim.
+            device_size.append(1 if dim != last else size)
+            stride_map.append(step)
+            continue
+        ratios = {out_coeffs[v] / in_coeffs[v] for v in read_vars}
+        if len(ratios) != 1:
+            return None
+        new_step = step * ratios.pop()
+        if not (new_step.is_integer and new_step > 0):
+            return None
+        count = _coordinate_count(coord, dep)
+        if dim != last and count != _coordinate_count(whole_coords[dim], whole):
+            size = count
+        device_size.append(size)
+        stride_map.append(int(new_step))
+
+    carried = SpyreTensorLayout(
+        device_size, stride_map, stl.device_dtype, stl.element_arrangement
+    )
+    try:
+        out_coords = device_coordinates(carried, output_dep, None)
+    except Unsupported:
+        return None
+    if len(out_coords) != len(in_coords) or out_coords[-1] != in_coords[-1]:
+        return None
+    for read_coord, write_coord in zip(in_coords, out_coords):
+        offset = sympy.simplify(read_coord - write_coord)
+        if not (offset.is_Integer and offset >= 0):
+            return None
+    return carried
 
 
 def rescale_stl_for_dtype(

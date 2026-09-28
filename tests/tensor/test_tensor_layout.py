@@ -64,6 +64,15 @@ def _dep(name, host_size):
     return MemoryDep(name, index, var_names, tuple(host_size[i] for i in live))
 
 
+def _carry_vars():
+    import sympy
+
+    return sympy.symbols("c0:3", integer=True, nonnegative=True)
+
+
+_CARRY_VARS = _carry_vars()
+
+
 @instantiate_parametrized_tests
 class TestSpyreTensorLayout(TestCase):
     def setUp(self):
@@ -862,6 +871,120 @@ class TestSpyreTensorLayout(TestCase):
         )
         self.assertEqual(list(out.device_size), [24, 1, 32])
         self.assertEqual(list(out.stride_map), [32, -1, 1])
+
+    def _carry_qkv_read(self, read_index, ranges, out_size, write_index):
+        """Carry a fp16 ``[8, 1536]`` buffer's layout to a fp32 output of it."""
+        from torch._inductor.dependencies import MemoryDep
+        from torch_spyre._inductor.propagate_layouts import carry_stl_to_output
+
+        fp16 = get_device_dtype(torch.float16)
+        stl = SpyreTensorLayout(
+            [24, 8, 64], [64, 1536, 1], fp16, ElementArrangement.STANDARD
+        )
+        variables = tuple(_CARRY_VARS[: len(ranges)])
+        return carry_stl_to_output(
+            stl,
+            _host_layout(torch.float16, [8, 1536]),
+            MemoryDep("qkv", read_index, variables, tuple(ranges)),
+            _host_layout(torch.float32, out_size),
+            MemoryDep("out", write_index, variables, tuple(ranges)),
+        )
+
+    def test_carry_stl_to_output_keeps_a_whole_read_as_is(self):
+        """A read walking the whole input as the write walks the output keeps
+        its layout, including a fold over the storage beyond a view: two heads
+        of a ``[1, 768]`` buffer read as ``[2, 128]`` keep all twelve sticks, so
+        the rescale that follows still sees the fold. Needs no device.
+        """
+        from torch._inductor.dependencies import MemoryDep
+        from torch._inductor.ir import FixedLayout
+        from torch_spyre._inductor.propagate_layouts import carry_stl_to_output
+
+        c0, c1 = _CARRY_VARS[:2]
+        whole = self._carry_qkv_read(
+            1536 * c0 + c1, [8, 1536], [8, 1536], 1536 * c0 + c1
+        )
+        self.assertEqual(list(whole.device_size), [24, 8, 64])
+        self.assertEqual(list(whole.stride_map), [64, 1536, 1])
+
+        fp16 = get_device_dtype(torch.float16)
+        storage = SpyreTensorLayout(
+            [12, 1, 64], [64, -1, 1], fp16, ElementArrangement.STANDARD
+        )
+        view = FixedLayout(torch.device("spyre"), torch.float16, [2, 128], [128, 1])
+        access = (128 * c0 + c1, (c0, c1), (2, 128))
+        folded = carry_stl_to_output(
+            storage,
+            view,
+            MemoryDep("x", *access),
+            _host_layout(torch.float32, [2, 128]),
+            MemoryDep("y", *access),
+        )
+        self.assertEqual(list(folded.device_size), [12, 1, 64])
+        self.assertEqual(list(folded.stride_map), [64, -1, 1])
+
+    def test_carry_stl_to_output_restrides_a_slice_for_its_output(self):
+        """A slice of a wider buffer keeps the input's device dims and stick,
+        steps them by the output's strides, and counts only the sticks it reads.
+        Gemma's k upcast, ``qkv[:, 1024:1280]`` of a ``[8, 1536]`` buffer into
+        ``[8, 1, 256]``: four of the 24 sticks per row, rows 256 apart. The
+        rescale against the output then lays out exactly that buffer. Read
+        transposed, the same slice keeps its stick on output dim 0. Needs no
+        device.
+        """
+        from torch._inductor.dependencies import MemoryDep
+        from torch_spyre._inductor.propagate_layouts import rescale_stl_for_dtype
+
+        c0, c1, c2 = _CARRY_VARS
+        k = self._carry_qkv_read(
+            1536 * c0 + 1024 + 256 * c1 + c2,
+            [8, 1, 256],
+            [8, 1, 256],
+            256 * c0 + 256 * c1 + c2,
+        )
+        self.assertEqual(list(k.device_size), [4, 8, 64])
+        self.assertEqual(list(k.stride_map), [64, 256, 1])
+        k32 = rescale_stl_for_dtype(
+            k,
+            torch.float32,
+            ElementArrangement.DL16_TO_FP32,
+            _host_layout(torch.float32, [8, 1, 256]),
+            MemoryDep("out", 256 * c0 + 256 * c1 + c2, (c0, c1, c2), (8, 1, 256)),
+        )
+        self.assertEqual(list(k32.device_size), [8, 8, 32])
+        self.assertEqual(list(k32.stride_map), [32, 256, 1])
+
+        transposed = self._carry_qkv_read(
+            1536 * c1 + 1024 + c0, [256, 8], [256, 8], 8 * c0 + c1
+        )
+        self.assertEqual(list(transposed.device_size), [4, 8, 64])
+        self.assertEqual(list(transposed.stride_map), [512, 1, 8])
+
+    def test_carry_stl_to_output_declines_what_it_cannot_express(self):
+        """Carrying declines rather than miscompiles: a slice starting inside a
+        stick (the output's stick would start elsewhere), a write that reorders
+        the variables one input dim walks (no single step fits the dim), and a
+        variable only the write walks (a broadcast read). Needs no device.
+        """
+        c0, c1, c2 = _CARRY_VARS
+        self.assertIsNone(
+            self._carry_qkv_read(
+                1536 * c0 + 1000 + c1, [8, 256], [8, 256], 256 * c0 + c1
+            )
+        )
+        self.assertIsNone(
+            self._carry_qkv_read(
+                1536 * c0 + 256 * c1 + c2,
+                [8, 4, 256],
+                [8, 256, 4],
+                1024 * c0 + c1 + 4 * c2,
+            )
+        )
+        self.assertIsNone(
+            self._carry_qkv_read(
+                1536 * c0 + c2, [8, 4, 64], [8, 4, 64], 256 * c0 + 64 * c1 + c2
+            )
+        )
 
     def test_qfp8ch_layout_rounds_a_partial_stick_up(self):
         """qfp8ch's fp16 -> fp8 output may end in a partially filled fp8 stick:
