@@ -960,11 +960,57 @@ class TestSpyreTensorLayout(TestCase):
         self.assertEqual(list(transposed.device_size), [4, 8, 64])
         self.assertEqual(list(transposed.stride_map), [512, 1, 8])
 
+    def test_carry_stl_to_output_splits_a_dim_the_access_reshapes(self):
+        """A row of heads read as ``[heads, head_dim]`` gives the heads a device
+        dim of their own, stepped like the output's heads dim, so work division
+        can place a heads split. Gemma's q upcast, ``qkv[:, :1024]`` into
+        ``[8, 4, 256]``, keeps the rows and stick and splits the 16 sticks into
+        4 heads of 4; the rescale then gives the layout of the output's host
+        shape. A slice starting past the q heads carries its offset in whole
+        heads. A read of all six heads reshapes no part of the dim, so it keeps
+        the input's fold. Needs no device.
+        """
+        from torch._inductor.dependencies import MemoryDep
+        from torch_spyre._inductor.propagate_layouts import rescale_stl_for_dtype
+
+        c0, c1, c2 = _CARRY_VARS
+        q_write = 1024 * c0 + 256 * c1 + c2
+        q = self._carry_qkv_read(
+            1536 * c0 + 256 * c1 + c2, [8, 4, 256], [8, 4, 256], q_write
+        )
+        self.assertEqual(list(q.device_size), [4, 4, 8, 64])
+        self.assertEqual(list(q.stride_map), [256, 64, 1024, 1])
+        q32 = rescale_stl_for_dtype(
+            q,
+            torch.float32,
+            ElementArrangement.DL16_TO_FP32,
+            _host_layout(torch.float32, [8, 4, 256]),
+            MemoryDep("out", q_write, (c0, c1, c2), (8, 4, 256)),
+        )
+        self.assertEqual(list(q32.device_size), [4, 8, 8, 32])
+        self.assertEqual(list(q32.stride_map), [256, 32, 1024, 1])
+
+        k = self._carry_qkv_read(
+            1536 * c0 + 1024 + 128 * c1 + c2,
+            [8, 2, 128],
+            [8, 2, 128],
+            256 * c0 + 128 * c1 + c2,
+        )
+        self.assertEqual(list(k.device_size), [2, 2, 8, 64])
+        self.assertEqual(list(k.stride_map), [128, 64, 256, 1])
+
+        heads = 1536 * c0 + 256 * c1 + c2
+        whole = self._carry_qkv_read(heads, [8, 6, 256], [8, 6, 256], heads)
+        self.assertEqual(list(whole.device_size), [24, 8, 64])
+        self.assertEqual(list(whole.stride_map), [64, 1536, 1])
+
     def test_carry_stl_to_output_declines_what_it_cannot_express(self):
         """Carrying declines rather than miscompiles: a slice starting inside a
         stick (the output's stick would start elsewhere), a write that reorders
-        the variables one input dim walks (no single step fits the dim), and a
-        variable only the write walks (a broadcast read). Needs no device.
+        the variables one input dim walks where they do not split into a digit
+        each (heads of 96 elements straddle sticks, so no single step fits the
+        dim), and a variable only the write walks (a broadcast read). Needs no
+        device.
         """
         c0, c1, c2 = _CARRY_VARS
         self.assertIsNone(
@@ -974,10 +1020,10 @@ class TestSpyreTensorLayout(TestCase):
         )
         self.assertIsNone(
             self._carry_qkv_read(
-                1536 * c0 + 256 * c1 + c2,
-                [8, 4, 256],
-                [8, 256, 4],
-                1024 * c0 + c1 + 4 * c2,
+                1536 * c0 + 96 * c1 + c2,
+                [8, 2, 96],
+                [8, 96, 2],
+                192 * c0 + c1 + 2 * c2,
             )
         )
         self.assertIsNone(
