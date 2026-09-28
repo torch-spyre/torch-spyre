@@ -203,29 +203,42 @@ def stick_dims(host_coords: list[Expr], device_coords: list[Expr]) -> StickDims 
 
     The within-stick host dim is the one whose coordinate matches the stick
     coordinate. The num-sticks dim is the outermost device dim whose coordinate
-    carries the stick variable; a stick dim no longer than one stick never wraps
-    into an outer dim, so the tensor is one stick deep and its count sits on the
-    outermost device dim with a zero coordinate.
+    carries the stick variable. A stick dim no longer than one stick never wraps
+    into an outer dim, and then the coordinates cannot identify its count dim:
+    every size-1 host dim has a zero coordinate too. The outermost zero-coordinate
+    dim is taken instead, which is where ``compute_restickify_target_layout``
+    places the count of such a stick and where ``_grow_num_sticks`` prepends one.
 
     Returns None when no device dim can hold the count, or when the stick
     coordinate has a variable but no host dim matches it.
     """
     if not device_coords:
         return None
-    stick_syms = device_coords[-1].free_symbols
+    stick_coord = device_coords[-1]
+    outer_coords = device_coords[:-1]
+    stick_vars = stick_coord.free_symbols
+
     within_stick = None
-    if stick_syms:
-        within_stick = matching_dim(host_coords, device_coords[-1])
+    if stick_vars:
+        within_stick = matching_dim(host_coords, stick_coord)
         if within_stick is None:
             return None
-    outer = range(len(device_coords) - 1)
-    num_sticks = next(
-        (j for j in outer if stick_syms & device_coords[j].free_symbols),
-        next((j for j in outer if device_coords[j] == sympy.S.Zero), None),
-    )
+
+    num_sticks = None
+    for dim, coord in enumerate(outer_coords):
+        if coord.free_symbols & stick_vars:
+            num_sticks = dim
+            break
+    if num_sticks is None:
+        # One stick deep: see the docstring for why the outermost zero wins.
+        for dim, coord in enumerate(outer_coords):
+            if coord == sympy.S.Zero:
+                num_sticks = dim
+                break
     if num_sticks is None:
         return None
-    folds_outer_dims = bool(device_coords[num_sticks].free_symbols - stick_syms)
+
+    folds_outer_dims = bool(outer_coords[num_sticks].free_symbols - stick_vars)
     return StickDims(num_sticks, within_stick, folds_outer_dims)
 
 
@@ -278,10 +291,14 @@ def rescale_stl_for_dtype(
       three FP32 sticks, not four. A dim that folds in outer host dims
       (``StickDims.folds_outer_dims``) is the exception; it steps only whole
       input sticks, so its capacity splits exactly.
-    - A single output stick carries the extent in its entry. The input entry
-      cannot supply it: a pitch entry keeps only a stick count, and a one-stick
-      entry never enters an address, so not every layout producer writes the
-      extent there.
+    - Sticks that merge into a single output stick, as FP32 into FP16, leave an
+      entry that carries the extent; the input's pitch entry keeps only a stick
+      count.
+
+    A single input stick that stays a single stick keeps its dim as is. Its
+    num-sticks dim is one of possibly several zero-coordinate dims
+    (``stick_dims``), and its entry never enters an address, so rewriting it
+    could only change a dim the tensor does not use.
 
     A narrowing output may end in a partially filled stick, and a widening one
     counts only the sticks its live elements reach. Giving the rest of the stick
@@ -306,13 +323,14 @@ def rescale_stl_for_dtype(
     # sticks at any depth.
     if dims is not None and dims.within_stick is not None:
         dim = dims.num_sticks
+        in_sticks = stl.device_size[dim]
         in_eps = stl.device_size[-1]
         elem_step = stl.stride_map[-1]
         host_extent = concretize_expr(host_layout.size[dims.within_stick])
 
         # General case: the input sticks redistribute into output sticks, which
         # the dim steps by the output pitch.
-        in_elems = stl.device_size[dim] * in_eps
+        in_elems = in_sticks * in_eps
         out_device_size[dim] = (in_elems + out_eps - 1) // out_eps
         out_stride_map[dim] = out_eps * elem_step
 
@@ -320,8 +338,11 @@ def rescale_stl_for_dtype(
             # Splitting sticks: the last input stick may fill only part of them.
             out_device_size[dim] = (host_extent + out_eps - 1) // out_eps
         if out_device_size[dim] == 1:
-            # A single output stick carries the host extent instead of a pitch.
-            out_stride_map[dim] = host_extent * elem_step
+            if in_sticks == 1:
+                out_stride_map[dim] = stl.stride_map[dim]
+            else:
+                # Merged into a single output stick: the host extent, not a pitch.
+                out_stride_map[dim] = host_extent * elem_step
     return SpyreTensorLayout(
         out_device_size,
         out_stride_map,
